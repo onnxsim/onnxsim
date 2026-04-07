@@ -9,6 +9,7 @@ from typing import List, Literal, Dict, Union, Optional, Tuple, Sequence
 from rich.text import Text
 from rich import print
 import numpy as np
+from google.protobuf.message import EncodeError
 
 import onnx  # type: ignore
 import onnx.checker  # type: ignore
@@ -216,7 +217,7 @@ def simplify(
         check_ok = model_checking.compare(
             model_opt, model, check_n, test_input_shapes, input_data, custom_lib
         )
-    except (ValueError, onnx.onnx_cpp2py_export.checker.ValidationError):
+    except (EncodeError, ValueError, onnx.onnx_cpp2py_export.checker.ValidationError):
         print("[bold magenta]Simplified model larger than 2GB. Trying to save as external data...[/bold magenta]")
         # large models try to convert through a temporary file
         with tempfile.TemporaryDirectory() as tmpdirname:
