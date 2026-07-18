@@ -34,6 +34,12 @@ ONNX_OPT_USE_SYSTEM_PROTOBUF = bool(os.getenv('ONNX_OPT_USE_SYSTEM_PROTOBUF', '0
 
 DEBUG = bool(os.getenv('DEBUG'))
 COVERAGE = bool(os.getenv('COVERAGE'))
+# Free-threaded (GIL-disabled) interpreters do not provide the stable ABI, so
+# the bundled onnx submodule's `find_package(... Development.SABIModule REQUIRED)`
+# (triggered by ONNX_BUILD_PYTHON) fails to configure. onnxsim ships its own
+# bindings and uses the pip-installed onnx at runtime, so onnx's Python bindings
+# are not needed here.
+FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 VERSION_FILE = os.path.join(TOP_DIR, 'VERSION')
 
 try:
@@ -146,7 +152,8 @@ class cmake_build(setuptools.Command):
                 CMAKE,
                 '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
-                '-DONNX_BUILD_PYTHON=ON',
+                '-DONNX_BUILD_PYTHON={}'.format(
+                    'OFF' if FREE_THREADED else 'ON'),
                 "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
                 '-DONNXSIM_BUILTIN_ORT=OFF',
