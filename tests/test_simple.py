@@ -204,3 +204,33 @@ def test_unfoldable_const_node_keeps_topological_order():
     onnx.checker.check_model(sim_model)
     op_types = [n.op_type for n in sim_model.graph.node]
     assert op_types.index("SequenceEmpty") < op_types.index("SequenceInsert")
+
+
+def test_if_with_const_cond_does_not_segfault():
+    # An `If` whose condition is a constant, with branches that each just
+    # produce a constant, used to crash simplify() with a segfault (exit 139).
+    # onnxsim's constant folding turns the branch `Constant` nodes into subgraph
+    # initializers, and the onnxoptimizer "eliminate_if_with_const_cond" pass
+    # then dereferenced a null value while inlining the taken branch. simplify()
+    # must instead complete and return a valid model (GitHub issue #452).
+    tv = helper.make_tensor("tv", TensorProto.FLOAT, [2], [1.0, 2.0])
+    fv = helper.make_tensor("fv", TensorProto.FLOAT, [2], [3.0, 4.0])
+    then_b = helper.make_graph(
+        [helper.make_node("Constant", [], ["to"], value=tv)], "tb", [],
+        [helper.make_tensor_value_info("to", TensorProto.FLOAT, [2])])
+    else_b = helper.make_graph(
+        [helper.make_node("Constant", [], ["fo"], value=fv)], "fb", [],
+        [helper.make_tensor_value_info("fo", TensorProto.FLOAT, [2])])
+    if_node = helper.make_node(
+        "If", ["c"], ["Y"], then_branch=then_b, else_branch=else_b)
+    graph = helper.make_graph(
+        [if_node], "g", [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2])],
+        [helper.make_tensor("c", TensorProto.BOOL, [], [True])])
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)

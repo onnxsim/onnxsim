@@ -543,12 +543,28 @@ onnx::ModelProto Simplify(
 
   config.tensor_size_threshold = tensor_size_threshold;
   config.optimizer_passes.clear();
+  // The onnxoptimizer pass "eliminate_if_with_const_cond" folds an `If` whose
+  // condition is a compile-time constant by inlining the taken branch. It
+  // segfaults when that branch's output is produced by an initializer instead
+  // of a node -- a state onnxsim itself reaches when the earlier
+  // "extract_constant_to_initializer" pass turns a subgraph `Constant` into a
+  // subgraph initializer. The pass builds its output map only from subgraph
+  // node outputs, so the branch output is missing and it dereferences a null
+  // Value. Always skip it so simplification degrades to leaving the `If` in
+  // place rather than aborting the whole process. Actually folding a
+  // constant-condition `If` is tracked separately (GitHub issue #275).
+  // See GitHub issue #452.
+  static const std::set<std::string> always_skip_passes = {
+      "eliminate_if_with_const_cond"};
   // skip_optimizers == nullopt means skiping all optimizers, so
   // config.optimizer_passes is empty
   if (skip_optimizers) {
     std::vector<std::string> passes;
     const auto all_passes = onnx::optimization::GetFuseAndEliminationPass();
     for (const auto& pass : all_passes) {
+      if (always_skip_passes.count(pass) > 0) {
+        continue;
+      }
       if (std::find(skip_optimizers->begin(), skip_optimizers->end(), pass) ==
           skip_optimizers->end()) {
         passes.push_back(pass);
