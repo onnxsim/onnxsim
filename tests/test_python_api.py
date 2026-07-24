@@ -931,3 +931,103 @@ def test_perform_optimization_false():
     simple_model, _ = onnxsim.simplify(onnx_model, perform_optimization=False, skip_shape_inference=True)
     assert simple_model is not None
 
+
+
+def _value_info(name, elem_type, shape):
+    return onnx.helper.make_tensor_value_info(name, elem_type, shape)
+
+
+def test_get_dynamic_input_dims():
+    from onnxsim.onnx_simplifier import get_dynamic_input_dims
+
+    # x has symbolic batch/height/width; y is fully static; z uses the
+    # non-positive "unknown" convention some exporters emit.
+    x = _value_info("x", onnx.TensorProto.FLOAT, ["batch", 3, "H", "W"])
+    y = _value_info("y", onnx.TensorProto.FLOAT, [1, 3, 224, 224])
+    z = _value_info("z", onnx.TensorProto.FLOAT, [0, 3])
+    graph = onnx.helper.make_graph([], "g", [x, y, z], [])
+    model = onnx.helper.make_model(graph)
+
+    assert get_dynamic_input_dims(model) == {"x": [0, 2, 3], "z": [0]}
+
+
+def test_get_dynamic_input_dims_ignores_initializer_inputs():
+    from onnxsim.onnx_simplifier import get_dynamic_input_dims
+
+    # An initializer that is also listed as an input is a constant, not a real
+    # dynamic input, so it must be ignored even if its shape looks dynamic.
+    w = _value_info("w", onnx.TensorProto.FLOAT, ["k"])
+    init = onnx.numpy_helper.from_array(np.zeros((2,), dtype=np.float32), name="w")
+    graph = onnx.helper.make_graph([], "g", [w], [], initializer=[init])
+    model = onnx.helper.make_model(graph)
+
+    assert get_dynamic_input_dims(model) == {}
+
+
+def test_warn_if_shape_ops_remain_hints_overwrite(capsys):
+    from onnxsim.onnx_simplifier import _warn_if_shape_ops_remain
+
+    # A model with a dynamic input and a leftover Shape op should trigger the
+    # actionable hint pointing at --overwrite-input-shape (GitHub issue #314).
+    x = _value_info("x", onnx.TensorProto.FLOAT, ["batch", 3, "H", "W"])
+    shape_out = _value_info("s", onnx.TensorProto.INT64, [4])
+    node = onnx.helper.make_node("Shape", ["x"], ["s"])
+    graph = onnx.helper.make_graph([node], "g", [x], [shape_out])
+    model = onnx.helper.make_model(graph)
+
+    _warn_if_shape_ops_remain(model)
+    out = capsys.readouterr().out
+    assert "--overwrite-input-shape" in out
+    assert "x:batch,3,H,W" in out
+
+
+def test_warn_if_shape_ops_remain_silent_when_static(capsys):
+    from onnxsim.onnx_simplifier import _warn_if_shape_ops_remain
+
+    # No warning when the input is fully static, even with a Shape op present.
+    x = _value_info("x", onnx.TensorProto.FLOAT, [1, 3, 4, 5])
+    shape_out = _value_info("s", onnx.TensorProto.INT64, [4])
+    node = onnx.helper.make_node("Shape", ["x"], ["s"])
+    graph = onnx.helper.make_graph([node], "g", [x], [shape_out])
+    model = onnx.helper.make_model(graph)
+
+    _warn_if_shape_ops_remain(model)
+    assert "--overwrite-input-shape" not in capsys.readouterr().out
+
+
+def test_dynamic_reshape_shape_ops_removed_by_overwrite(capsys):
+    # Reproduces the shape of GitHub issue #314: a reshape whose target depends
+    # on the (dynamic) input dimensions keeps Shape ops that onnxsim cannot fold
+    # away -- until the input shape is fixed via overwrite_input_shapes.
+    class DynReshape(torch.nn.Module):
+        def forward(self, x):
+            n, c, h, w = x.shape
+            return x.reshape(n, c, h * w)
+
+    net = DynReshape()
+    dummy = torch.randn(1, 3, 4, 5)
+    buf = io.BytesIO()
+    torch.onnx.export(
+        net,
+        dummy,
+        buf,
+        input_names=["x"],
+        output_names=["y"],
+        dynamic_axes={"x": {0: "n", 2: "h", 3: "w"}},
+        do_constant_folding=False,
+        dynamo=False,
+    )
+    model = onnx.load_from_string(buf.getvalue())
+
+    # Dynamic input: Shape ops survive and the user is told how to fix it.
+    sim, ok = onnxsim.simplify(model)
+    assert ok
+    assert any(n.op_type == "Shape" for n in sim.graph.node)
+    assert "--overwrite-input-shape" in capsys.readouterr().out
+
+    # Fixing every input dimension lets constant folding remove the Shape ops.
+    sim_static, ok_static = onnxsim.simplify(
+        model, overwrite_input_shapes={"x": [1, 3, 4, 5]}
+    )
+    assert ok_static
+    assert all(n.op_type != "Shape" for n in sim_static.graph.node)

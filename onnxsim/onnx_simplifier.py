@@ -41,6 +41,90 @@ def get_output_names(model: onnx.ModelProto) -> List[str]:
     return output_names
 
 
+def get_dynamic_input_dims(model: onnx.ModelProto) -> Dict[str, List[int]]:
+    """Return, for each real graph input, the axis indices that are dynamic.
+
+    A dimension is *dynamic* when its size is not a fixed positive integer --
+    i.e. it carries a symbolic ``dim_param`` (such as "batch" or "width") or a
+    non-positive ``dim_value`` (0 or -1, which some exporters use to mean
+    "unknown"). Initializers that also appear in ``graph.input`` are skipped:
+    they are constants, not inputs. Only inputs with at least one dynamic axis
+    appear in the returned mapping.
+    """
+    initializer_names = {x.name for x in model.graph.initializer}
+    dynamic: Dict[str, List[int]] = {}
+    for ipt in model.graph.input:
+        if ipt.name in initializer_names:
+            continue
+        tensor_type = ipt.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        axes = [
+            i
+            for i, dim in enumerate(tensor_type.shape.dim)
+            if not (dim.HasField("dim_value") and dim.dim_value > 0)
+        ]
+        if axes:
+            dynamic[ipt.name] = axes
+    return dynamic
+
+
+def _format_input_shape_hint(
+    model: onnx.ModelProto, name: str, dynamic_axes: Sequence[int]
+) -> str:
+    """Render an input's shape as an ``--overwrite-input-shape`` suggestion.
+
+    Static axes keep their concrete size; dynamic axes show their symbolic name
+    (or ``?`` when anonymous) as a placeholder the user must replace with a
+    concrete size, e.g. ``x:batch,3,H,W``.
+    """
+    for ipt in model.graph.input:
+        if ipt.name == name:
+            dims = []
+            for i, dim in enumerate(ipt.type.tensor_type.shape.dim):
+                if i in dynamic_axes:
+                    dims.append(dim.dim_param or "?")
+                else:
+                    dims.append(str(dim.dim_value))
+            return "{}:{}".format(name, ",".join(dims))
+    return name
+
+
+def _warn_if_shape_ops_remain(model_opt: onnx.ModelProto) -> None:
+    """Explain leftover ``Shape`` ops caused by dynamic input dimensions.
+
+    onnxsim removes shape-related ops (``Shape``, ``Reshape``, ...) by
+    constant-folding them, which is only possible when the dimensions they read
+    are statically known. When an input keeps a dynamic dimension, the ``Shape``
+    ops that read it genuinely depend on runtime values and cannot be folded, so
+    they remain in the output -- which then breaks converters that do not support
+    dynamic shapes (e.g. ncnn's ``onnx2ncnn``, see GitHub issue #314). Point the
+    user at ``--overwrite-input-shape`` so they can make the model fully static.
+    """
+    remaining_shape_ops = sum(
+        1 for node in model_opt.graph.node if node.op_type == "Shape"
+    )
+    dynamic_inputs = get_dynamic_input_dims(model_opt)
+    if not remaining_shape_ops or not dynamic_inputs:
+        return
+    hints = " ".join(
+        '"{}"'.format(_format_input_shape_hint(model_opt, name, axes))
+        for name, axes in dynamic_inputs.items()
+    )
+    print(
+        Text(
+            f'The simplified model still contains {remaining_shape_ops} "Shape" '
+            "op(s). They read input dimensions that are dynamic "
+            f"({', '.join(dynamic_inputs)}), so onnxsim cannot constant-fold "
+            "them away. If you need a fully static model (for example for "
+            "converters like onnx2ncnn that do not support dynamic shapes), "
+            "re-run with a fixed input shape, e.g. --overwrite-input-shape "
+            f"{hints} (replace each symbolic/? dimension with a concrete size).",
+            style="bold magenta",
+        )
+    )
+
+
 def remove_unused_output(
     model: onnx.ModelProto, unused_output: Sequence[str]
 ) -> onnx.ModelProto:
@@ -518,6 +602,7 @@ def simplify(
             )
             model_opt = onnx.load(os.path.join(tmpdirname, 'opt.onnx'))
     _restore_doc_strings(model_opt, doc_strings)
+    _warn_if_shape_ops_remain(model_opt)
     return model_opt, check_ok
 
 

@@ -135,6 +135,31 @@ during simplification, so the custom operator's output shapes are inferred too.
 Custom operators without an inference function are still imported; shape
 inference simply flows past them.
 
+## Dynamic input shapes
+
+onnxsim removes `Shape`, `Reshape` and similar shape-manipulation ops by
+constant-folding them, which only works when the dimensions they read are
+statically known. When a model keeps a **dynamic** input dimension (a symbolic
+axis such as `batch`/`height`/`width`, or a `-1`/`0` "unknown" size), the
+`Shape` ops that read those dimensions genuinely depend on runtime values and
+therefore cannot be folded away — so they remain in the simplified model. This
+is expected, but it breaks downstream converters that do not support dynamic
+shapes, for example ncnn's `onnx2ncnn` (`Shape not supported yet!`, see issue
+[#314](https://github.com/onnxsim/onnxsim/issues/314)).
+
+If you need a fully static model, give onnxsim a fixed input shape so those ops
+become foldable:
+
+```
+onnxsim input.onnx output.onnx --overwrite-input-shape x:1,3,48,320
+```
+
+(replace the numbers with the shape you actually want, and use
+`name:d0,d1,...` for each input when the model has more than one). When a
+simplified model still contains `Shape` ops caused by a dynamic input, onnxsim
+now prints a hint telling you which input dimensions are dynamic and how to fix
+them with `--overwrite-input-shape`.
+
 ## Projects Using ONNX Simplifier
 
 * [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)
