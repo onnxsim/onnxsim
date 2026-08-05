@@ -23,6 +23,10 @@ CPUExecutionProvider, `--preset tiny` (2 layers, hidden 256, 4 heads, seq 128),
 onnxsim built from this branch (`claude/operator-refusion-survey-ve7ee6`, at
 `5db7370`) and, where noted, onnxsim 0.7.0 from PyPI for comparison.
 
+Findings 1–6 are graph-level and come from that CPU run.  Finding 7 is the
+latency measurement, from a GeForce RTX 2060 at the `bert-base` preset; it is
+what turns the fused-op censuses below into milliseconds.
+
 ## How it is measured
 
 Each fixture is a hand-built ONNX graph with the topology real exporters emit
@@ -272,19 +276,67 @@ Python rewriter or a matcher extension.
    `RMSNormalization`) and measuring the payoff with this harness before
    attempting `Attention`.
 
-## What the GPU run adds
+## Finding 7 — on a GPU, the lost Attention fusion costs 23 % of inference time
 
-Everything above is a *graph* measurement; on a CPU the fused kernels are worth
-little, and the latency column in the CPU survey is dominated by noise (a shared
-container, ±40 % between repeats).  On an NVIDIA GPU the same census turns into
-real time: the CUDA EP's fused attention kernels (and, in fp16 on Turing, the
-TensorRT fused-attention path) are the reason `com.microsoft.Attention` exists.
+Measured on a **GeForce RTX 2060** (Turing, sm75, 6 GB, driver 610.57.04),
+CUDAExecutionProvider, onnxruntime 1.28.0, `--preset bert-base` (12 layers,
+hidden 768, 12 heads, seq 384, batch 1), median of 100 runs:
 
-`bench/refusion_gpu_bench.py` times every variant on the CUDA EP in fp32 and
-fp16, and dumps the session-level fused-op census per variant, so the cost of
-Finding 2 can be read directly as milliseconds.  See "Running it on a GPU" in
-`bench/refusion_gpu_run.sh` — on an RTX 2060 (Turing, sm75, 6 GB) the
-`bert-base` preset fits comfortably.
+| variant | nodes | fused ops ORT runs | median ms | vs `raw` |
+| --- | --- | --- | --- | --- |
+| `raw` | 414 | `Gemm=72, FusedMatMul=12, SkipLayerNormalization=24, Gelu=12` | 7.07 | 1.00× |
+| `sim` (default) | 388 | *does not load* | — | — |
+| `sim_nogemm` | 412 | same as `raw` | 7.14 | 0.99× |
+| `sim_safe` | 413 | same as `raw` | 7.11 | 0.99× |
+| `ort(raw)` | 87 | **`Attention=12`**`, SkipLayerNormalization=24, BiasGelu=12` | **5.54** | **1.28×** |
+| `ort(sim)` | 340 | *does not load* | — | — |
+| `ort(sim_nogemm)` | 304 | `SkipLayerNormalization=24, BiasGelu=12` (no Attention) | 6.83 | 1.04× |
+| `ort(sim_safe)` | 88 | **`Attention=12`**`, SkipLayerNormalization=24, BiasGelu=12` | **5.57** | 1.27× |
 
-Results from that run are not included here — this survey was produced on a
-CPU-only machine.
+Reading the two middle rows against each other isolates the cost of Finding 2:
+`ort(sim_nogemm)` and `ort(sim_safe)` differ only in whether
+`fuse_consecutive_unsqueezes` merged the mask's `Unsqueeze` pair, and that is
+**6.83 ms vs 5.57 ms — a 1.23× slowdown, 18 % of total inference time** given
+away to save one node.  On the CPU leg of the same run the same pair is 52.3 ms
+vs 50.2 ms (1.04×), which is why this has to be measured on an accelerator: the
+fused attention kernel is worth ~5× more on the GPU than on the CPU.
+
+Note also what the `raw` row shows: ORT's **session-level** optimizer never
+produces `Attention` on its own, on either provider.  Only the Python
+`onnxruntime.transformers.optimizer` pass does.  So the fusion at stake is one
+users have to opt into — and one onnxsim can silently make impossible.
+
+The decoder fixture behaves as on the CPU: no attention fusion exists to lose,
+onnxsim is a small win (`raw` 9.23 ms, `sim` 9.00 ms, `ort(sim)` 8.86 ms), and
+the norm fusions survive simplification intact.  The two already-fused fixtures
+stay fused end to end, with latencies flat inside noise (1.7–1.9 ms, dominated
+by launch overhead at that size).
+
+### Caveat on precision in this run
+
+The RTX 2060 numbers above were produced by
+`bench/refusion_gpu_bench.py` before a bug in its fp16 leg was fixed:
+`OnnxModel` wraps a ModelProto *by reference*, so `to_fp16()` converted each
+variant in place before the "fp32" row was timed, and **every row in that run is
+the fp16 graph** (visible in the JSON as 416 nodes for `bert_layer` where the
+fp32 fixture has 414 — the two extra `Cast` nodes fp16 conversion inserts).  The
+comparison between variants is unaffected, since every variant got the same
+treatment, so the 1.23× above stands as an fp16 measurement on Turing.  A true
+fp32-vs-fp16 split needs a re-run with the fixed script, which now also records
+`fp16_initializers` per row so the leg cannot silently mislabel itself again.
+
+The same aliasing explains the `max_abs_diff` values in that run: `ort(raw)`
+differs from the reference by 0.63 max-abs, which is fp16 accumulated across 12
+layers of random (untrained) weights along a different kernel path, not an fp32
+accuracy claim.  The CPU leg of the same run, in fp32, shows 4.3e-06 for the
+same comparison.
+
+## Running it yourself
+
+```bash
+bash bench/refusion_gpu_run.sh            # setup + CPU survey (--bisect) + CUDA run
+bash bench/refusion_gpu_run.sh --quick    # tiny model, fast smoke test
+```
+
+It writes `refusion_cpu_<host>.json` and `refusion_gpu_<host>.json` with every
+number above.

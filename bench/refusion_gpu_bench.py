@@ -79,11 +79,18 @@ def gpu_info() -> Dict[str, str]:
 
 
 def to_fp16(model: onnx.ModelProto) -> Optional[onnx.ModelProto]:
-    """fp16 cast with fp32 graph I/O (what ORT's transformer optimizer emits)."""
+    """fp16 cast with fp32 graph I/O (what ORT's transformer optimizer emits).
+
+    ``OnnxModel`` wraps the ModelProto **by reference** and converts it in
+    place, so the caller's fp32 model must be copied first -- otherwise the
+    fp32 leg silently ends up timing the fp16 graph too.
+    """
     try:
         from onnxruntime.transformers.onnx_model import OnnxModel
 
-        wrapper = OnnxModel(model)
+        clone = onnx.ModelProto()
+        clone.CopyFrom(model)
+        wrapper = OnnxModel(clone)
         wrapper.convert_float_to_float16(keep_io_types=True)
         return wrapper.model
     except Exception as exc:  # pragma: no cover - version dependent
@@ -266,6 +273,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "precision": precision,
                             "ep": leg_name,
                             "nodes": len(variant_model.graph.node),
+                            # Guard against a silently-not-converted fp16 leg:
+                            # a genuine fp16 graph has fp16 (dtype 10) weights.
+                            "fp16_initializers": sum(
+                                1
+                                for init in variant_model.graph.initializer
+                                if init.data_type == onnx.TensorProto.FLOAT16
+                            ),
                             "fused": survey.fused_census(variant_model),
                             "session_fused": {
                                 k: v

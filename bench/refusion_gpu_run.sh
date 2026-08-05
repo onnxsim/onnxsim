@@ -50,8 +50,11 @@ else
 fi
 
 echo "==> CPU / pattern survey (preset=$PRESET)"
+# --bisect names the optimizer pass behind any fusion the simplified model lost;
+# it re-runs simplify once per default pass, so it is the slow part of this run.
 python bench/refusion_survey.py \
   --preset "$PRESET" \
+  --bisect \
   --json "refusion_cpu_${HOST}.json"
 
 echo "==> GPU survey on the CUDA execution provider (preset=$PRESET)"
