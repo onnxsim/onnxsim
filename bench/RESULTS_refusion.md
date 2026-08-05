@@ -24,8 +24,10 @@ onnxsim built from this branch (`claude/operator-refusion-survey-ve7ee6`, at
 `5db7370`) and, where noted, onnxsim 0.7.0 from PyPI for comparison.
 
 Findings 1–6 are graph-level and come from that CPU run.  Finding 7 is the
-latency measurement, from a GeForce RTX 2060 at the `bert-base` preset; it is
-what turns the fused-op censuses below into milliseconds.
+latency measurement, from a GeForce RTX 2060 (Turing) and a GeForce RTX 5050
+(Blackwell) at the `bert-base` preset; it is what turns the fused-op censuses
+below into milliseconds — and shows that the milliseconds do not point the same
+way on both cards.
 
 ## How it is measured
 
@@ -262,11 +264,14 @@ Python rewriter or a matcher extension.
    `bench/refusion_survey.py` already computes it; wiring "ORT recovers the same
    fused-op census before and after `simplify`" into CI would have caught
    Finding 2 the day the pass landed.  The census — not a timing — has to be the
-   check: Finding 7 shows the regression is invisible in fp32 and nearly
-   invisible on a CPU, so a wall-clock guard on CI hardware would never fire.
+   check, and Finding 7 is why: the wall-clock consequence of the same graph
+   change is +18 % on one GPU, −8 % on another and inside the noise on a CPU, so
+   no timing-based guard on CI hardware could encode it.
 4. **Reconsider `fuse_consecutive_unsqueezes` (and the batched-Gemm pass) in the
-   default set.**  Both trade a node or two for a rewrite the runtime would
-   rather do itself — ORT does its own `MatMul+Add → Gemm` at session level
+   default set.**  Note the argument is predictability, not a guaranteed speedup
+   — Finding 7 shows the fused path is the faster one on Turing and the slower
+   one on Blackwell.  Both passes trade a node or two for a rewrite the runtime
+   would rather do itself — ORT does its own `MatMul+Add → Gemm` at session level
    anyway (`Gemm=12` appears in the session-level census of the *raw* model).
    Either drop them from the defaults, or gate them behind a
    `--target-runtime`-style switch for users who really want a Gemm-centric
@@ -278,64 +283,75 @@ Python rewriter or a matcher extension.
    `RMSNormalization`) and measuring the payoff with this harness before
    attempting `Attention`.
 
-## Finding 7 — the lost Attention fusion costs 18 % of GPU inference time, but only in fp16
+## Finding 7 — the fusion's *value* is hardware-dependent; on Blackwell it is currently negative
 
-Measured on a **GeForce RTX 2060** (Turing, sm75, 6 GB, driver 610.57.04),
-CUDAExecutionProvider, onnxruntime 1.28.0, `--preset bert-base` (12 layers,
-hidden 768, 12 heads, seq 384, batch 1), median of 100 runs.  fp16 rows are the
-same graph converted with fp32 graph I/O; each row's `fp16_initializers` count
-in the JSON confirms the conversion actually happened.
+Measured at `--preset bert-base` (12 layers, hidden 768, 12 heads, seq 384,
+batch 1), CUDAExecutionProvider, onnxruntime 1.28.0, median of 100 runs, on two
+cards:
 
-| variant | fused ops ORT runs | fp32 ms | fp16 ms |
-| --- | --- | --- | --- |
-| `raw` | `Gemm=72, FusedMatMul=12, SkipLayerNormalization=24, Gelu=12` | 16.73 | 7.07 |
-| `sim` (default) | *does not load* | — | — |
-| `sim_nogemm` | same as `raw` | 16.71 | 7.14 |
-| `sim_safe` | same as `raw` | 16.85 | 7.14 |
-| `ort(raw)` | **`Attention=12`**`, SkipLayerNormalization=24, BiasGelu=12` | 16.87 | **5.55** |
-| `ort(sim)` | *does not load* | — | — |
-| `ort(sim_nogemm)` | `SkipLayerNormalization=24, BiasGelu=12` (no Attention) | 16.47 | 6.84 |
-| `ort(sim_safe)` | **`Attention=12`**`, SkipLayerNormalization=24, BiasGelu=12` | 16.87 | **5.59** |
+| | RTX 2060 (Turing sm75) | RTX 5050 (Blackwell sm120) |
+| --- | --- | --- |
+| `raw` | 16.73 / 7.07 | 7.97 / 5.22 |
+| `sim` (default) | *does not load* | *does not load* |
+| `sim_nogemm` | 16.71 / 7.14 | 7.96 / 5.22 |
+| `sim_safe` | 16.85 / 7.14 | 7.97 / 5.22 |
+| `ort(raw)` — `Attention=12` | 16.87 / **5.55** | 8.09 / 5.38 |
+| `ort(sim_nogemm)` — no Attention | 16.47 / 6.84 | 7.82 / **4.97** |
+| `ort(sim_safe)` — `Attention=12` | 16.87 / **5.59** | 8.09 / 5.38 |
 
-`ort(sim_nogemm)` and `ort(sim_safe)` differ only in whether
-`fuse_consecutive_unsqueezes` merged the mask's `Unsqueeze` pair, so that pair
-isolates the cost of Finding 2:
+(fp32 ms / fp16 ms.  The 5050 fp32 column is TF32 — ORT's default on Ampere and
+newer — while the 2060 has no TF32 at all, so the fp32 columns are *not* the same
+arithmetic across cards.  The fp16 columns are directly comparable.)
 
-* **fp16: 6.84 ms → 5.59 ms, a 1.22× slowdown — 18 % of inference time** given
-  away to save one node out of 414.
-* **fp32: 16.47 ms → 16.87 ms — the fused model is 2 % *slower*.**
-* CPU (same machine, same preset): 49.7 ms → 47.5 ms, 1.05×.
+`ort(sim_nogemm)` vs `ort(sim_safe)` again isolates exactly one pass
+(`fuse_consecutive_unsqueezes`, i.e. whether ORT could build `Attention=12`):
 
-The precision split is the interesting part.  ONNX Runtime's fast fused-attention
-kernels on Turing are fp16 tensor-core paths (the TRT fused attention and
-memory-efficient attention kernels); in fp32 the CUDA EP falls back to an
-implementation that is no better than the unfused graph, so `Attention=12` buys
-nothing.  Two consequences:
+| | fp32 | fp16 |
+| --- | --- | --- |
+| RTX 2060 | Attention 1.02× the time (no gain) | Attention **0.82×** — the fusion saves 18 % |
+| RTX 5050 | Attention 1.03× the time | Attention **1.08×** — the fusion *costs* 8 % |
+| CPU (same host) | 0.95×–1.05× across two runs — inside the noise | — |
 
-* **The fusion is only worth fighting for in fp16** — which is how transformers
-  are actually deployed on this class of card.  fp16 alone is 2.4× over fp32
-  (`raw` 16.73 → 7.07 ms); fp16 *plus* the attention fusion is 3.0×
-  (16.73 → 5.55 ms).  Breaking the fusion throws away the last third of that.
-* **A CPU-only or fp32-only benchmark cannot see this regression at all.**  Any
-  CI guard against it has to look at the fused-op census (which the survey
-  script reports) rather than at wall-clock on the machine running the tests.
+**The sign of the effect is not a property of the graph; it is a property of the
+card.**  On Turing, `com.microsoft.Attention` in fp16 is the fast path and losing
+it costs 18 % of inference time.  On Blackwell with ORT 1.28 the same fused node
+is *slower* than letting the unfused graph run — the fastest configuration
+measured on the 5050 is `ort(sim_nogemm)` fp16 at 4.97 ms, a model with **no**
+attention fusion at all, beating the fused `ort(raw)` at 5.38 ms.  The likely
+cause is fused-attention kernel coverage for sm120 in this ORT version, but that
+is unverified here; what the data supports is the observation, not the mechanism.
 
-The decoder fixture has no attention fusion to lose, and onnxsim is a small win
-in fp16 (`raw` 9.28 ms → `sim` 9.05 ms, 2.5 %) and neutral in fp32 (22.0 vs
-22.2 ms).  Both already-fused fixtures stay fused end to end in both precisions.
+What this does *not* change: onnxsim still silently removes the runtime's
+*ability* to fuse, on every card, and it still emits a model that does not load
+(Finding 1) on both.  What it does change is the argument for fixing it.  The
+case is not "the fusion is always faster" — it plainly is not.  The case is:
 
-Running `--bisect` on that machine reproduced the two culprit passes exactly, at
-12-layer scale, for both BERT fixtures:
+* **Predictability.** A one-node rewrite that saves nothing measurable should not
+  decide, silently and per-architecture, which kernel the runtime gets to use.
+  Users who want the Gemm-centric or unfused shape can ask for it.
+* **The user is the one who can measure.**  onnxsim cannot know the deployment
+  target; ORT's own optimizer, run by the user on their hardware, can be
+  benchmarked both ways.  Foreclosing that choice at simplification time is the
+  problem, not the direction of today's benchmark on today's driver.
+
+Both cards agree on everything else: fp16 is the large, reliable win (2.4× on the
+2060, 1.5× on the 5050 over its own TF32 baseline); the decoder fixture has no
+attention fusion to lose and onnxsim is neutral-to-slightly-positive on it
+(5050: `raw` 6.68 ms → `ort(sim_safe)` 6.52 ms in fp16); and both already-fused
+fixtures stay fused end to end in both precisions on both cards.
+
+`--bisect` on both machines named the same two culprit passes at 12-layer scale,
+for both BERT fixtures:
 
 ```
 fuse_matmul_add_bias_into_gemm_batched  recovers SkipLayerNormalization=24, BiasGelu=12
 fuse_consecutive_unsqueezes             recovers Attention=12
 ```
 
-One caveat on the CPU latency column of that run: it is noisy (the
-`llama_layer_gqa` variants range 58–129 ms across variants that produce
-identical graphs). Read the CPU numbers as fusion censuses, not timings; the GPU
-timings are tight, with p90 within ~1 % of the median.
+One caveat on the CPU latency columns: they are noisy on this host (`ort(sim_safe)`
+came in at 47.5 ms in one run and 50.0 ms in the next, and `llama_layer_gqa`
+variants with identical graphs ranged 58–129 ms). Read the CPU numbers as fusion
+censuses, not timings; the GPU timings are tight, with p90 within ~1 % of median.
 
 ## Running it yourself
 
