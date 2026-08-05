@@ -201,6 +201,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-fp16", action="store_true", help="skip the fp16 leg")
     parser.add_argument("--trt", action="store_true", help="also time the TensorRT EP")
     parser.add_argument("--cpu", action="store_true", help="run on CPU (debugging)")
+    parser.add_argument(
+        "--tf32",
+        choices=["on", "off"],
+        default="on",
+        help="CUDA EP use_tf32 setting for the fp32 leg (default 'on', which is "
+        "also ORT's default). Only affects Ampere and newer -- on those cards "
+        "'fp32' silently means TF32, so pass 'off' for a true fp32 comparison "
+        "against a pre-Ampere card.",
+    )
     parser.add_argument("--json", help="write all measurements here")
     args = parser.parse_args(argv)
 
@@ -219,8 +228,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "(or pass --cpu to run this script on the CPU)"
             )
             return 2
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    use_gpu = "CUDAExecutionProvider" in providers
+        providers = [
+            ("CUDAExecutionProvider", {"use_tf32": 1 if args.tf32 == "on" else 0}),
+            "CPUExecutionProvider",
+        ]
+    use_gpu = not args.cpu
 
     fixtures.configure(
         preset=args.preset,
@@ -232,7 +244,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     env = gpu_info()
-    env.update({"onnx": onnx.__version__, "onnxruntime": ort.__version__})
+    env.update(
+        {
+            "onnx": onnx.__version__,
+            "onnxruntime": ort.__version__,
+            # On Ampere and newer the CUDA EP runs fp32 matmuls as TF32 unless
+            # this is off, so the fp32 leg is only comparable across cards when
+            # this value is known.
+            "use_tf32": args.tf32,
+            "preset": args.preset,
+        }
+    )
     print(json.dumps(env, indent=2))
     print(f"model size: {fixtures.describe()}")
     print(f"providers: {providers}")
