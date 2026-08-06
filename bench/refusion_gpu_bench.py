@@ -1,11 +1,11 @@
-"""GPU leg of the operator re-fusion survey (NVIDIA / CUDA execution provider).
+"""GPU leg of the operator re-fusion survey (CUDA by default; see ``--ep``).
 
 The CPU survey (``bench/refusion_survey.py``) answers *"is the attention pattern
 still recognisable after onnxsim?"*.  This script answers the question that
 actually matters on an accelerator: **what does it cost in milliseconds?**
 
-It builds the same variants, runs each one on the CUDA execution provider in
-fp32 and fp16, and reports:
+It builds the same variants, runs each one on the selected execution provider
+(``--ep cuda|rocm|migraphx|dml|webgpu``) in fp32 and fp16, and reports:
 
 * median / p90 latency and speed-up versus the un-simplified export,
 * the fused-operator census of the graph as *ONNX Runtime runs it* -- the CUDA
@@ -34,6 +34,10 @@ Run::
     # add the TensorRT EP too, if the wheel has it
     python bench/refusion_gpu_bench.py --preset bert-base --trt
 
+    # a non-NVIDIA EP; --strict-ep turns a silent per-node CPU fallback (for a
+    # com.microsoft op the EP has no kernel for) into a visible session error
+    python bench/refusion_gpu_bench.py --ep rocm --preset bert-base --strict-ep
+
 ``--json`` writes every number this prints; that file is the thing worth sharing.
 """
 
@@ -57,6 +61,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import refusion_fixtures as fixtures  # noqa: E402
 import refusion_survey as survey  # noqa: E402
 
+# Accelerator execution providers this benchmark knows how to drive.  Which of
+# them exist depends entirely on which onnxruntime build is installed.
+EP_PROVIDERS = {
+    "cuda": "CUDAExecutionProvider",
+    "rocm": "ROCMExecutionProvider",
+    "migraphx": "MIGraphXExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "webgpu": "WebGpuExecutionProvider",
+    "cpu": "CPUExecutionProvider",
+}
+
+EP_INSTALL_HINT = {
+    "cuda": "Install the GPU build:  pip install onnxruntime-gpu",
+    "rocm": "Needs a ROCm build of onnxruntime (AMD publishes wheels; not on PyPI).",
+    "migraphx": "Needs a ROCm/MIGraphX build of onnxruntime.",
+    "dml": "Needs onnxruntime-directml (Windows only).",
+    "webgpu": "Needs an onnxruntime build with the WebGPU EP enabled.",
+}
+
 
 def gpu_info() -> Dict[str, str]:
     info = {"platform": platform.platform(), "python": sys.version.split()[0]}
@@ -75,6 +98,18 @@ def gpu_info() -> Dict[str, str]:
             info["gpu"] = out.stdout.strip()
     except Exception:
         pass
+    if "gpu" not in info:
+        try:
+            out = subprocess.run(
+                ["rocm-smi", "--showproductname", "--csv"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if out.returncode == 0:
+                info["gpu"] = " | ".join(out.stdout.split())[:200]
+        except Exception:
+            pass
     return info
 
 
@@ -200,6 +235,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--no-fp16", action="store_true", help="skip the fp16 leg")
     parser.add_argument("--trt", action="store_true", help="also time the TensorRT EP")
+    parser.add_argument(
+        "--ep",
+        choices=list(EP_PROVIDERS),
+        default="cuda",
+        help="execution provider to benchmark (default cuda). Use 'rocm' or "
+        "'migraphx' for AMD, 'dml' for DirectML on Windows, 'webgpu' for the "
+        "WebGPU EP. Whether the fused com.microsoft ops have kernels on the "
+        "chosen EP is exactly what this measures: ops the EP cannot run fall "
+        "back to the CPU EP, which shows up as a large slowdown.",
+    )
+    parser.add_argument(
+        "--strict-ep",
+        action="store_true",
+        help="do not append the CPU EP as a fallback. Session creation then "
+        "fails outright for any op the chosen EP cannot run, which turns a "
+        "silent per-node CPU fallback into a visible error.",
+    )
     parser.add_argument("--cpu", action="store_true", help="run on CPU (debugging)")
     parser.add_argument(
         "--tf32",
@@ -217,22 +269,31 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     ort.set_default_logger_severity(3)
     available = ort.get_available_providers()
+    ep_name = EP_PROVIDERS[args.ep]
     if args.cpu:
+        args.ep = "cpu"
+        ep_name = "CPUExecutionProvider"
+    if ep_name not in available:
+        print(
+            f"{ep_name} is not available.\n"
+            f"available: {available}\n"
+            f"{EP_INSTALL_HINT.get(args.ep, '')}\n"
+            "(or pass --cpu to run this script on the CPU)"
+        )
+        return 2
+    if args.ep == "cpu":
         providers = ["CPUExecutionProvider"]
-    else:
-        if "CUDAExecutionProvider" not in available:
-            print(
-                "CUDAExecutionProvider is not available.\n"
-                f"available: {available}\n"
-                "Install the GPU build:  pip install onnxruntime-gpu\n"
-                "(or pass --cpu to run this script on the CPU)"
-            )
-            return 2
+    elif args.ep == "cuda":
+        # use_tf32 is a CUDA-only provider option.
         providers = [
-            ("CUDAExecutionProvider", {"use_tf32": 1 if args.tf32 == "on" else 0}),
+            (ep_name, {"use_tf32": 1 if args.tf32 == "on" else 0}),
             "CPUExecutionProvider",
         ]
-    use_gpu = not args.cpu
+    else:
+        providers = [ep_name, "CPUExecutionProvider"]
+    if args.strict_ep and args.ep != "cpu":
+        providers = [providers[0]]
+    use_gpu = args.ep != "cpu"
 
     fixtures.configure(
         preset=args.preset,
@@ -251,7 +312,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             # On Ampere and newer the CUDA EP runs fp32 matmuls as TF32 unless
             # this is off, so the fp32 leg is only comparable across cards when
             # this value is known.
-            "use_tf32": args.tf32,
+            "use_tf32": args.tf32 if args.ep == "cuda" else "n/a",
+            "ep": args.ep,
+            "strict_ep": bool(args.strict_ep),
             "preset": args.preset,
         }
     )
