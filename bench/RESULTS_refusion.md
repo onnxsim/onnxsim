@@ -348,6 +348,11 @@ fuse_matmul_add_bias_into_gemm_batched  recovers SkipLayerNormalization=24, Bias
 fuse_consecutive_unsqueezes             recovers Attention=12
 ```
 
+The 5050 numbers above were reproduced by a second full run on the same host:
+every variant landed within 0.5 % of the table (e.g. `ort(sim_nogemm)` fp16
+4.975 → 4.986 ms, `ort(sim_safe)` fp16 5.381 → 5.381 ms), so the sign flip is
+not run-to-run noise.
+
 One caveat on the CPU latency columns: they are noisy on this host (`ort(sim_safe)`
 came in at 47.5 ms in one run and 50.0 ms in the next, and `llama_layer_gqa`
 variants with identical graphs ranged 58–129 ms). Read the CPU numbers as fusion

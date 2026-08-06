@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run the re-fusion survey on an NVIDIA GPU (developed against an RTX 2060).
 #
-#   bash bench/refusion_gpu_run.sh            # set up + run everything
-#   bash bench/refusion_gpu_run.sh --quick    # tiny model, fast smoke test
+#   bash bench/refusion_gpu_run.sh                 # set up + run everything
+#   bash bench/refusion_gpu_run.sh --quick         # tiny model, fast smoke test
+#   bash bench/refusion_gpu_run.sh --tf32 off      # any other flag is forwarded
+#                                                  # to refusion_gpu_bench.py
 #
 # It creates .venv-refusion/, installs onnxruntime-gpu and builds onnxsim from
 # this checkout, then writes two JSON files in the repo root:
@@ -14,7 +16,17 @@
 set -euo pipefail
 
 QUICK=0
-[[ "${1:-}" == "--quick" ]] && QUICK=1
+# --quick is handled here; every other argument is passed through to
+# refusion_gpu_bench.py, so flags like `--tf32 off`, `--ep rocm` or
+# `--strict-ep` work from this wrapper instead of being silently dropped.
+GPU_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quick) QUICK=1 ;;
+    *) GPU_ARGS+=("$1") ;;
+  esac
+  shift
+done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -57,11 +69,12 @@ python bench/refusion_survey.py \
   --bisect \
   --json "refusion_cpu_${HOST}.json"
 
-echo "==> GPU survey on the CUDA execution provider (preset=$PRESET)"
+echo "==> GPU survey (preset=$PRESET)${GPU_ARGS[0]+, extra args: ${GPU_ARGS[*]}}"
 python bench/refusion_gpu_bench.py \
   --preset "$PRESET" \
   --iters "$ITERS" \
-  --json "refusion_gpu_${HOST}.json"
+  --json "refusion_gpu_${HOST}.json" \
+  ${GPU_ARGS[0]+"${GPU_ARGS[@]}"}
 
 echo
 echo "done -- share these two files:"
