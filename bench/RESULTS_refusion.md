@@ -300,8 +300,34 @@ cards:
 | `ort(sim_safe)` — `Attention=12` | 16.87 / **5.59** | 8.09 / 5.38 |
 
 (fp32 ms / fp16 ms.  The 5050 fp32 column is TF32 — ORT's default on Ampere and
-newer — while the 2060 has no TF32 at all, so the fp32 columns are *not* the same
-arithmetic across cards.  The fp16 columns are directly comparable.)
+newer — while the 2060 has no TF32 at all.  A separate `--tf32 off` run pins that
+down; see below.)
+
+Re-running the 5050 with `--tf32 off` gives the true-fp32 column and makes the
+two cards comparable:
+
+| RTX 5050 | fp32 (TF32, ORT default) | fp32 (`--tf32 off`) | fp16 |
+| --- | --- | --- | --- |
+| `raw` | 7.97 | 12.91 | 5.22 |
+| `ort(sim_nogemm)` — no Attention | 7.82 | 12.72 | **4.98** |
+| `ort(sim_safe)` — `Attention=12` | 8.09 | 12.96 | 5.39 |
+
+Three things fall out of that column:
+
+* **TF32 is worth 1.62× on this card** (12.91 → 7.97 ms), and it is on by
+  default.  That, not the architecture's raw speed, is most of why the 5050's
+  fp32 row looked so much faster than the 2060's.  In true fp32 the 5050 is only
+  1.30× the 2060 (12.91 vs 16.73 ms); in fp16 both cards gain about the same
+  multiple over their own true-fp32 baseline (2.5× and 2.4×).
+* **The sign of the attention-fusion effect does not depend on TF32.**  On the
+  5050 the fused model is 1.02× the time in true fp32 and 1.03× with TF32 — the
+  same small penalty either way — while in fp16 it is 1.08×.  So Finding 7's
+  fp32 line is a property of the fused kernel selection, not an artefact of
+  Ampere-and-newer default arithmetic.
+* The harness's numerical check sees TF32 plainly: `ort(raw)` fp32 differs from
+  the unfused fp32 reference by 2.2e-03 with TF32 on and 3.2e-06 with it off.
+  Worth knowing before reading any `max_abs_diff` from an Ampere-or-newer card as
+  an accuracy statement about the graph rewrite.
 
 `ort(sim_nogemm)` vs `ort(sim_safe)` again isolates exactly one pass
 (`fuse_consecutive_unsqueezes`, i.e. whether ORT could build `Attention=12`):
@@ -309,7 +335,7 @@ arithmetic across cards.  The fp16 columns are directly comparable.)
 | | fp32 | fp16 |
 | --- | --- | --- |
 | RTX 2060 | Attention 1.02× the time (no gain) | Attention **0.82×** — the fusion saves 18 % |
-| RTX 5050 | Attention 1.03× the time | Attention **1.08×** — the fusion *costs* 8 % |
+| RTX 5050 | Attention 1.03× (TF32) / 1.02× (true fp32) | Attention **1.08×** — the fusion *costs* 8 % |
 | CPU (same host) | 0.95×–1.05× across two runs — inside the noise | — |
 
 **The sign of the effect is not a property of the graph; it is a property of the
