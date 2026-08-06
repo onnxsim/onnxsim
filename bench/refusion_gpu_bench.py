@@ -35,8 +35,10 @@ Run::
     python bench/refusion_gpu_bench.py --preset bert-base --trt
 
     # a non-NVIDIA EP; --strict-ep turns a silent per-node CPU fallback (for a
-    # com.microsoft op the EP has no kernel for) into a visible session error
-    python bench/refusion_gpu_bench.py --ep rocm --preset bert-base --strict-ep
+    # com.microsoft op the EP has no kernel for) into a visible session error.
+    # NOTE for AMD: the ROCm EP was removed from onnxruntime in 1.23, so on any
+    # current release the AMD path is --ep migraphx with an AMD-built wheel.
+    python bench/refusion_gpu_bench.py --ep migraphx --preset bert-base --strict-ep
 
 ``--json`` writes every number this prints; that file is the thing worth sharing.
 """
@@ -74,8 +76,17 @@ EP_PROVIDERS = {
 
 EP_INSTALL_HINT = {
     "cuda": "Install the GPU build:  pip install onnxruntime-gpu",
-    "rocm": "Needs a ROCm build of onnxruntime (AMD publishes wheels; not on PyPI).",
-    "migraphx": "Needs a ROCm/MIGraphX build of onnxruntime.",
+    "rocm": (
+        "The ROCm EP was REMOVED from onnxruntime in 1.23 -- no 1.23+ build has "
+        "it, whatever wheel you install. Use --ep migraphx (AMD's replacement), "
+        "or an onnxruntime <= 1.22 ROCm wheel from "
+        "https://repo.radeon.com/rocm/manylinux/ ."
+    ),
+    "migraphx": (
+        "Needs an AMD-built onnxruntime with the MIGraphX EP -- wheels live at "
+        "https://repo.radeon.com/rocm/manylinux/ (pip install onnxruntime-rocm "
+        "-f <that index>) or in the rocm/onnxruntime container. Not on PyPI."
+    ),
     "dml": "Needs onnxruntime-directml (Windows only).",
     "webgpu": "Needs an onnxruntime build with the WebGPU EP enabled.",
 }
@@ -277,9 +288,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(
             f"{ep_name} is not available.\n"
             f"available: {available}\n"
+            f"onnxruntime {ort.__version__}\n"
             f"{EP_INSTALL_HINT.get(args.ep, '')}\n"
             "(or pass --cpu to run this script on the CPU)"
         )
+        if args.ep == "rocm" and tuple(
+            int(part) for part in ort.__version__.split(".")[:2]
+        ) >= (1, 23):
+            print(
+                "\nThis onnxruntime is 1.23 or newer, so the ROCm EP does not "
+                "exist in it at all -- installing a different 1.23+ wheel cannot "
+                "help. Try --ep migraphx."
+            )
         return 2
     if args.ep == "cpu":
         providers = ["CPUExecutionProvider"]
