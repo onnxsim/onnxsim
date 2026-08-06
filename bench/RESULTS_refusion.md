@@ -348,6 +348,17 @@ fuse_matmul_add_bias_into_gemm_batched  recovers SkipLayerNormalization=24, Bias
 fuse_consecutive_unsqueezes             recovers Attention=12
 ```
 
+A third vendor was attempted and is worth recording as a negative result.  On a
+**Radeon 8060S** (RDNA 3.5, gfx1151) there is currently no ONNX Runtime GPU path
+to measure at all: the ROCm EP was removed from onnxruntime in 1.23, AMD's
+replacement MIGraphX EP needs a wheel that is not on PyPI, and the ONNX Runtime
++ MIGraphX combination on gfx1151 is reported broken in current ROCm.  A machine
+of that class runs these models on the CPU EP today.  That is the same lesson
+the two NVIDIA cards teach, in a starker form -- whether a fused contrib op is a
+good idea depends on a runtime-and-hardware combination that onnxsim cannot see
+at simplification time, and here there is not even a fused path to have an
+opinion about.
+
 The 5050 numbers above were reproduced by a second full run on the same host:
 every variant landed within 0.5 % of the table (e.g. `ort(sim_nogemm)` fp16
 4.975 → 4.986 ms, `ort(sim_safe)` fp16 5.381 → 5.381 ms), so the sign flip is
