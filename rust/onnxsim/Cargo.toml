@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-readme = "README.md"
+readme = "../../README.md"
 categories = ["api-bindings", "science"]
 keywords = ["onnx", "onnxsim", "simplifier", "machine-learning", "inference"]
 
