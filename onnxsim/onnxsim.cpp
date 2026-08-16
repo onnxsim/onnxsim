@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -33,6 +34,7 @@
 #include "contrib_schemas.h"
 #include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
+#include "incremental_shape_infer.h"
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
@@ -2083,7 +2085,31 @@ onnx::ModelProto Simplify(
   } else {
     FoldConstant = Identity;
   }
-  ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
+  // The incremental driver (issue: partial per-node shape inference) caches
+  // each node's inferred type keyed by its op/attributes/input types/input
+  // values, so an unchanged node across fixed-point rounds is a hash-map
+  // lookup instead of a re-invocation of the operator's inference function.
+  // It falls back to the exact, full ``onnx::shape_inference::InferShapes``
+  // for the rare graphs it doesn't model (control-flow ops, model-local
+  // functions, sparse initializers -- see incremental_shape_infer.h), so this
+  // is a performance-only change; ``ONNXSIM_DISABLE_INCREMENTAL_SHAPE_INFERENCE``
+  // reverts to always calling the full driver, for bisecting a regression.
+  ModelFn InferShapes;
+  if (shape_inference) {
+    bool disable_incremental = false;
+    if (const char* env = std::getenv("ONNXSIM_DISABLE_INCREMENTAL_SHAPE_INFERENCE")) {
+      std::string v = env;
+      disable_incremental = !v.empty() && v != "0" && v != "false" && v != "off" && v != "no";
+    }
+    if (disable_incremental) {
+      InferShapes = _InferShapes;
+    } else {
+      auto inferer = std::make_shared<onnxsim::IncrementalShapeInferer>();
+      InferShapes = [inferer](onnx::ModelProto& model) { inferer->Run(model); };
+    }
+  } else {
+    InferShapes = Identity;
+  }
   // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
   // so wrap it as an in-place transform that move-assigns the result back.
   // ``perform_optimization=False`` (skip_optimizers == nullopt) means the

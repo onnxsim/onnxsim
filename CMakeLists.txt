@@ -125,7 +125,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/incremental_shape_infer.cpp onnxsim/model_metrics.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
   if (ONNXSIM_PREBUILT_ORT)
@@ -415,4 +415,13 @@ if (ONNXSIM_TESTS)
   add_executable(dlpack_dtype_test onnxsim/dlpack_dtype_test.cpp)
   target_include_directories(dlpack_dtype_test PRIVATE onnxsim third_party)
   add_test(NAME dlpack_dtype_test COMMAND dlpack_dtype_test)
+
+  # The incremental (per-node, memoized) shape inference driver exercises real
+  # ONNX schemas and inference functions, so -- unlike the dependency-free
+  # tests above -- it links against onnx.
+  add_executable(incremental_shape_infer_test onnxsim/incremental_shape_infer_test.cpp
+                                              onnxsim/incremental_shape_infer.cpp)
+  target_include_directories(incremental_shape_infer_test PRIVATE onnxsim third_party)
+  target_link_libraries(incremental_shape_infer_test PRIVATE onnx)
+  add_test(NAME incremental_shape_infer_test COMMAND incremental_shape_infer_test)
 endif()
