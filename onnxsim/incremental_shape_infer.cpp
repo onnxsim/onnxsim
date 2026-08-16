@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cstring>
 #include <list>
-#include <unordered_set>
 #include <vector>
 
 #include "onnx/common/constants.h"
@@ -279,12 +278,17 @@ void IncrementalShapeInferer::Run(ModelProto& model) {
   // reads (only its type/shape, which the key already carries separately).
   constexpr size_t kMaxCachedValueBytes = 4096;
 
-  const std::unordered_set<std::string> empty_unbound;
   auto invoke_inference = [&](NodeProto& node, const OpSchema& schema) {
     std::vector<TypeProto> out_types(static_cast<size_t>(node.output_size()));
+    // Omits the trailing `unboundValueNames` argument (defaults to nullptr,
+    // meaning "no unbound names" -- correct here since this fast path never
+    // processes a function body, only top-level graph nodes): the onnx
+    // version vendored by the built-in ONNX Runtime build predates that
+    // parameter's addition, so passing it explicitly would fail to compile
+    // there even though it's optional on newer onnx.
     InferenceContextImpl ctx(node, value_types_by_name, input_data_by_name, {},
                              options, &generated_shape_data,
-                             /*graphInferenceContext=*/nullptr, &empty_unbound);
+                             /*graphInferenceContext=*/nullptr);
     try {
       schema.GetTypeAndShapeInferenceFunction()(ctx);
       for (int i = 0; i < node.output_size(); ++i) {
