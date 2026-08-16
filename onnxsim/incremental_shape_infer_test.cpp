@@ -54,7 +54,8 @@ ValueInfoProto UntypedValueInfo(const std::string& name) {
   return vi;
 }
 
-NodeProto Node(std::string op_type, std::vector<std::string> inputs, std::vector<std::string> outputs) {
+NodeProto Node(std::string op_type, std::vector<std::string> inputs,
+               std::vector<std::string> outputs) {
   NodeProto n;
   n.set_op_type(std::move(op_type));
   for (auto& i : inputs) n.add_input(i);
@@ -106,7 +107,8 @@ const TypeProto* FindType(const ModelProto& m, const std::string& name) {
   return nullptr;
 }
 
-bool TypesEqual(const ModelProto& a, const ModelProto& b, const std::string& name) {
+bool TypesEqual(const ModelProto& a, const ModelProto& b,
+                const std::string& name) {
   const TypeProto* ta = FindType(a, name);
   const TypeProto* tb = FindType(b, name);
   if (!ta || !tb) return ta == tb;  // both-absent counts as equal
@@ -114,19 +116,21 @@ bool TypesEqual(const ModelProto& a, const ModelProto& b, const std::string& nam
 }
 
 int g_failures = 0;
-#define CHECK(cond)                                                                \
-  do {                                                                             \
-    if (!(cond)) {                                                                 \
-      std::cerr << "CHECK failed at " << __FILE__ << ":" << __LINE__ << ": " << #cond << "\n"; \
-      ++g_failures;                                                                \
-    }                                                                              \
+#define CHECK(cond)                                                          \
+  do {                                                                       \
+    if (!(cond)) {                                                           \
+      std::cerr << "CHECK failed at " << __FILE__ << ":" << __LINE__ << ": " \
+                << #cond << "\n";                                            \
+      ++g_failures;                                                          \
+    }                                                                        \
   } while (0)
 
 // A [1,3,8,8] input through Conv(W: [4,3,3,3]) -> Relu, output untyped.
 ModelProto ConvReluModel() {
   ModelProto m = BaseModel();
   GraphProto* g = m.mutable_graph();
-  *g->add_input() = ValueInfo("X", TensorType(TensorProto::FLOAT, {1, 3, 8, 8}));
+  *g->add_input() =
+      ValueInfo("X", TensorType(TensorProto::FLOAT, {1, 3, 8, 8}));
   *g->add_initializer() = [] {
     TensorProto w;
     w.set_name("W");
@@ -226,12 +230,14 @@ void TestReshapeViaInitializer() {
 void TestLargeWeightBypassesCache() {
   ModelProto m = BaseModel();
   GraphProto* g = m.mutable_graph();
-  *g->add_input() = ValueInfo("X", TensorType(TensorProto::FLOAT, {1, 3, 40, 40}));
+  *g->add_input() =
+      ValueInfo("X", TensorType(TensorProto::FLOAT, {1, 3, 40, 40}));
   *g->add_initializer() = [] {
     TensorProto w;
     w.set_name("W");
     w.set_data_type(TensorProto::FLOAT);
-    for (int64_t d : {8, 3, 20, 20}) w.add_dims(d);  // 8*3*20*20*4B ~= 38KB, well over 4KB
+    for (int64_t d : {8, 3, 20, 20})
+      w.add_dims(d);  // 8*3*20*20*4B ~= 38KB, well over 4KB
     for (int i = 0; i < 8 * 3 * 20 * 20; ++i) w.add_float_data(0.f);
     return w;
   }();
@@ -246,7 +252,8 @@ void TestLargeWeightBypassesCache() {
 
   CHECK(TypesEqual(m, reference, "conv_out"));
   CHECK(TypesEqual(m, reference, "relu_out"));
-  CHECK(inferer.CacheSize() == 1);  // Relu only; Conv's large weight bypassed caching
+  CHECK(inferer.CacheSize() ==
+        1);  // Relu only; Conv's large weight bypassed caching
 }
 
 // An op with no registered schema: both the driver and the real onnx
@@ -305,7 +312,8 @@ void TestCacheReuseAndInvalidationBySignature() {
     if (n.op_type() == "Conv") *n.add_attribute() = IntsAttr("strides", {2, 2});
   }
   inferer.Run(round3);
-  CHECK(inferer.CacheSize() == size_after_round1 + 2);  // strided Conv + Relu-on-new-input-shape
+  CHECK(inferer.CacheSize() ==
+        size_after_round1 + 2);  // strided Conv + Relu-on-new-input-shape
 
   ModelProto reference3 = ConvReluModel();
   for (NodeProto& n : *reference3.mutable_graph()->mutable_node()) {
@@ -336,6 +344,7 @@ int main() {
     std::cout << "incremental_shape_infer_test: all checks passed\n";
     return 0;
   }
-  std::cerr << "incremental_shape_infer_test: " << g_failures << " check(s) failed\n";
+  std::cerr << "incremental_shape_infer_test: " << g_failures
+            << " check(s) failed\n";
   return 1;
 }

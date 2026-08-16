@@ -20,6 +20,7 @@ using onnx::ModelProto;
 using onnx::NodeProto;
 using onnx::OpSchema;
 using onnx::OpSchemaRegistry;
+using onnx::ShapeInferenceOptions;
 using onnx::SparseTensorProto;
 using onnx::TensorProto;
 using onnx::TypeProto;
@@ -29,7 +30,6 @@ using onnx::shape_inference::InferenceContextImpl;
 using onnx::shape_inference::MaterializeSymbolicShape;
 using onnx::shape_inference::mergeShapesAndTypes;
 using onnx::shape_inference::SymbolTableImpl;
-using onnx::ShapeInferenceOptions;
 using onnx::shape_inference::TraverseGraphsToAddExistingSymbols;
 
 // Appends `s` to `out` preceded by its byte length (8 raw bytes, native
@@ -58,15 +58,20 @@ std::string ReadLP(const std::string& bytes, size_t* pos) {
 
 bool HasGraphAttribute(const NodeProto& node) {
   for (const auto& attr : node.attribute()) {
-    if (attr.type() == AttributeProto::GRAPH || attr.type() == AttributeProto::GRAPHS) return true;
+    if (attr.type() == AttributeProto::GRAPH ||
+        attr.type() == AttributeProto::GRAPHS)
+      return true;
   }
   return false;
 }
 
 bool IsConstantWithSparseValue(const NodeProto& node) {
-  if (node.op_type() != "Constant" || !(node.domain().empty() || node.domain() == "ai.onnx")) return false;
+  if (node.op_type() != "Constant" ||
+      !(node.domain().empty() || node.domain() == "ai.onnx"))
+    return false;
   for (const auto& attr : node.attribute()) {
-    if (attr.name() == "value" && attr.type() == AttributeProto::SPARSE_TENSOR) return true;
+    if (attr.name() == "value" && attr.type() == AttributeProto::SPARSE_TENSOR)
+      return true;
   }
   return false;
 }
@@ -83,18 +88,22 @@ bool IsConstantWithSparseValue(const NodeProto& node) {
 // driver before this is used whenever a Constant carries one, via
 // IsConstantWithSparseValue.)
 template <typename T>
-void AddTemporaryConstant(const std::string& name, const std::vector<T>& v, bool scalar,
-                          std::unordered_map<std::string, TensorProto>& owned,
-                          std::unordered_map<std::string, const TensorProto*>& input_data_by_name) {
+void AddTemporaryConstant(
+    const std::string& name, const std::vector<T>& v, bool scalar,
+    std::unordered_map<std::string, TensorProto>& owned,
+    std::unordered_map<std::string, const TensorProto*>& input_data_by_name) {
   TensorProto t = onnx::ToTensor(v);
   if (!scalar) t.add_dims(static_cast<int64_t>(v.size()));
   owned[name] = std::move(t);
   input_data_by_name[name] = &owned[name];
 }
 
-void ProcessConstantNode(const NodeProto& n, std::unordered_map<std::string, TensorProto>& owned,
-                         std::unordered_map<std::string, const TensorProto*>& input_data_by_name) {
-  if (n.op_type() != "Constant" || !(n.domain().empty() || n.domain() == "ai.onnx") || n.output_size() != 1) return;
+void ProcessConstantNode(
+    const NodeProto& n, std::unordered_map<std::string, TensorProto>& owned,
+    std::unordered_map<std::string, const TensorProto*>& input_data_by_name) {
+  if (n.op_type() != "Constant" ||
+      !(n.domain().empty() || n.domain() == "ai.onnx") || n.output_size() != 1)
+    return;
   const std::string& output_name = n.output(0);
   for (const auto& attr : n.attribute()) {
     if (attr.name() == "value") {
@@ -106,18 +115,24 @@ void ProcessConstantNode(const NodeProto& n, std::unordered_map<std::string, Ten
     } else {
       switch (attr.type()) {
         case AttributeProto::INTS:
-          AddTemporaryConstant(output_name, std::vector<int64_t>(attr.ints().begin(), attr.ints().end()), false,
-                               owned, input_data_by_name);
+          AddTemporaryConstant(
+              output_name,
+              std::vector<int64_t>(attr.ints().begin(), attr.ints().end()),
+              false, owned, input_data_by_name);
           break;
         case AttributeProto::INT:
-          AddTemporaryConstant(output_name, std::vector<int64_t>{attr.i()}, true, owned, input_data_by_name);
+          AddTemporaryConstant(output_name, std::vector<int64_t>{attr.i()},
+                               true, owned, input_data_by_name);
           break;
         case AttributeProto::FLOATS:
-          AddTemporaryConstant(output_name, std::vector<float>(attr.floats().begin(), attr.floats().end()), false,
-                               owned, input_data_by_name);
+          AddTemporaryConstant(
+              output_name,
+              std::vector<float>(attr.floats().begin(), attr.floats().end()),
+              false, owned, input_data_by_name);
           break;
         case AttributeProto::FLOAT:
-          AddTemporaryConstant(output_name, std::vector<float>{attr.f()}, true, owned, input_data_by_name);
+          AddTemporaryConstant(output_name, std::vector<float>{attr.f()}, true,
+                               owned, input_data_by_name);
           break;
         default:
           break;
@@ -134,7 +149,9 @@ void ProcessConstantNode(const NodeProto& n, std::unordered_map<std::string, Ten
 // RegisterCustomDefaultDomainOpSchemas -- run before Simplify's fixed point
 // -- already give onnxsim's own ops and ORT's contrib ops direct C++
 // inference functions).
-bool HasUnmodeledNode(const GraphProto& graph, const std::unordered_map<std::string, int>& opset_imports) {
+bool HasUnmodeledNode(
+    const GraphProto& graph,
+    const std::unordered_map<std::string, int>& opset_imports) {
   if (graph.sparse_initializer_size() > 0) return true;
   for (const auto& n : graph.node()) {
     if (HasGraphAttribute(n) || IsConstantWithSparseValue(n)) return true;
@@ -142,9 +159,13 @@ bool HasUnmodeledNode(const GraphProto& graph, const std::unordered_map<std::str
     if (dit == opset_imports.end() && n.domain() == onnx::ONNX_DOMAIN) {
       dit = opset_imports.find(onnx::AI_ONNX_DOMAIN);
     }
-    if (dit == opset_imports.end()) continue;  // left to InferenceContextImpl below: no import, no inference.
-    const OpSchema* schema = OpSchemaRegistry::Instance()->GetSchema(n.op_type(), dit->second, n.domain());
-    if (schema && !schema->has_type_and_shape_inference_function() && schema->HasFunction()) return true;
+    if (dit == opset_imports.end())
+      continue;  // left to InferenceContextImpl below: no import, no inference.
+    const OpSchema* schema = OpSchemaRegistry::Instance()->GetSchema(
+        n.op_type(), dit->second, n.domain());
+    if (schema && !schema->has_type_and_shape_inference_function() &&
+        schema->HasFunction())
+      return true;
   }
   return false;
 }
@@ -155,14 +176,16 @@ void IncrementalShapeInferer::Run(ModelProto& model) {
   GraphProto& graph = *model.mutable_graph();
 
   std::unordered_map<std::string, int> opset_imports;
-  for (const auto& opset : model.opset_import()) opset_imports[opset.domain()] = static_cast<int>(opset.version());
+  for (const auto& opset : model.opset_import())
+    opset_imports[opset.domain()] = static_cast<int>(opset.version());
 
   if (model.functions_size() > 0 || HasUnmodeledNode(graph, opset_imports)) {
     onnx::shape_inference::InferShapes(model);
     return;
   }
 
-  const ShapeInferenceOptions options(/*check_type=*/false, /*error_mode=*/0, /*enable_data_propagation=*/false);
+  const ShapeInferenceOptions options(/*check_type=*/false, /*error_mode=*/0,
+                                      /*enable_data_propagation=*/false);
   SymbolTableImpl symbol_table;
   TraverseGraphsToAddExistingSymbols(graph, symbol_table);
   // Data propagation is off (`options.enable_data_propagation == false`), so
@@ -259,12 +282,15 @@ void IncrementalShapeInferer::Run(ModelProto& model) {
   const std::unordered_set<std::string> empty_unbound;
   auto invoke_inference = [&](NodeProto& node, const OpSchema& schema) {
     std::vector<TypeProto> out_types(static_cast<size_t>(node.output_size()));
-    InferenceContextImpl ctx(node, value_types_by_name, input_data_by_name, {}, options, &generated_shape_data,
+    InferenceContextImpl ctx(node, value_types_by_name, input_data_by_name, {},
+                             options, &generated_shape_data,
                              /*graphInferenceContext=*/nullptr, &empty_unbound);
     try {
       schema.GetTypeAndShapeInferenceFunction()(ctx);
       for (int i = 0; i < node.output_size(); ++i) {
-        if (!node.output(i).empty()) out_types[static_cast<size_t>(i)] = *ctx.getOutputType(static_cast<size_t>(i));
+        if (!node.output(i).empty())
+          out_types[static_cast<size_t>(i)] =
+              *ctx.getOutputType(static_cast<size_t>(i));
       }
     } catch (const std::exception&) {
       // error_mode == 0: onnx's own driver swallows node-level inference
@@ -280,7 +306,8 @@ void IncrementalShapeInferer::Run(ModelProto& model) {
       dit = opset_imports.find(onnx::AI_ONNX_DOMAIN);
     }
     const OpSchema* schema = dit != opset_imports.end()
-                                 ? OpSchemaRegistry::Instance()->GetSchema(n.op_type(), dit->second, n.domain())
+                                 ? OpSchemaRegistry::Instance()->GetSchema(
+                                       n.op_type(), dit->second, n.domain())
                                  : nullptr;
     if (!schema || !schema->has_type_and_shape_inference_function()) {
       // No opset import for the node's domain, or a genuinely unsupported
@@ -303,19 +330,27 @@ void IncrementalShapeInferer::Run(ModelProto& model) {
     AppendLP(key, n.domain());
     AppendLP(key, n.op_type());
     AppendLP(key, std::to_string(dit->second));
-    for (const auto& attr : n.attribute()) AppendLP(key, attr.SerializeAsString());
+    for (const auto& attr : n.attribute())
+      AppendLP(key, attr.SerializeAsString());
     for (const auto& input : n.input()) {
       if (input.empty()) {
-        AppendLP(key, "\x01" "absent");
+        AppendLP(key,
+                 "\x01"
+                 "absent");
         continue;
       }
       auto tit = value_types_by_name.find(input);
-      AppendLP(key, tit != value_types_by_name.end() ? tit->second->SerializeAsString()
-                                                     : std::string("\x01" "notype"));
+      AppendLP(key, tit != value_types_by_name.end()
+                        ? tit->second->SerializeAsString()
+                        : std::string("\x01"
+                                      "notype"));
       auto dit2 = input_data_by_name.find(input);
       if (dit2 == input_data_by_name.end()) {
-        AppendLP(key, "\x01" "novalue");
-      } else if (static_cast<size_t>(dit2->second->ByteSizeLong()) > kMaxCachedValueBytes) {
+        AppendLP(key,
+                 "\x01"
+                 "novalue");
+      } else if (static_cast<size_t>(dit2->second->ByteSizeLong()) >
+                 kMaxCachedValueBytes) {
         cacheable = false;
         break;
       } else {
@@ -333,12 +368,14 @@ void IncrementalShapeInferer::Run(ModelProto& model) {
     } else {
       out_types = invoke_inference(n, *schema);
       std::string serialized;
-      for (const auto& t : out_types) AppendLP(serialized, t.SerializeAsString());
+      for (const auto& t : out_types)
+        AppendLP(serialized, t.SerializeAsString());
       cache_.emplace(std::move(key), std::move(serialized));
     }
 
     for (int i = 0; i < n.output_size(); ++i) {
-      if (!n.output(i).empty()) update_type(n.output(i), &out_types[static_cast<size_t>(i)]);
+      if (!n.output(i).empty())
+        update_type(n.output(i), &out_types[static_cast<size_t>(i)]);
     }
     ProcessConstantNode(n, owned_constants, input_data_by_name);
   }

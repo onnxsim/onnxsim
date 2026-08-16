@@ -2092,14 +2092,17 @@ onnx::ModelProto Simplify(
   // It falls back to the exact, full ``onnx::shape_inference::InferShapes``
   // for the rare graphs it doesn't model (control-flow ops, model-local
   // functions, sparse initializers -- see incremental_shape_infer.h), so this
-  // is a performance-only change; ``ONNXSIM_DISABLE_INCREMENTAL_SHAPE_INFERENCE``
-  // reverts to always calling the full driver, for bisecting a regression.
+  // is a performance-only change;
+  // ``ONNXSIM_DISABLE_INCREMENTAL_SHAPE_INFERENCE`` reverts to always calling
+  // the full driver, for bisecting a regression.
   ModelFn InferShapes;
   if (shape_inference) {
     bool disable_incremental = false;
-    if (const char* env = std::getenv("ONNXSIM_DISABLE_INCREMENTAL_SHAPE_INFERENCE")) {
+    if (const char* env =
+            std::getenv("ONNXSIM_DISABLE_INCREMENTAL_SHAPE_INFERENCE")) {
       std::string v = env;
-      disable_incremental = !v.empty() && v != "0" && v != "false" && v != "off" && v != "no";
+      disable_incremental =
+          !v.empty() && v != "0" && v != "false" && v != "off" && v != "no";
     }
     if (disable_incremental) {
       InferShapes = _InferShapes;
