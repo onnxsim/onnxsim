@@ -36,6 +36,7 @@ for the command-line driver and ``README.md`` for the measured results.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -423,6 +424,67 @@ def _replacement_weight_bytes(
     """Serialized size of the initializers the replacement nodes introduced."""
     produced = {inp for node in replacement for inp in node.input}
     return sum(init.ByteSize() for init in graph.initializer if init.name in produced)
+
+
+@functools.lru_cache(maxsize=None)
+def matmul_nbits_supported(bits: int = 2) -> bool:
+    """Whether the installed onnxruntime has a MatMulNBits kernel for ``bits``.
+
+    2-bit support is recent. Older builds accept only 4 and 8 ("Only 4b and 8b
+    quantization is supported for MatMulNBits op, additional bits support is
+    planned") and raise at *session creation*, not at graph construction -- so a
+    2-bit model converts fine and then fails to load. Probe with a throwaway
+    session rather than guessing from ``onnxruntime.__version__``, which says
+    nothing about how a given wheel was built.
+    """
+    try:
+        import onnxruntime
+    except ImportError:
+        return False
+
+    k, n, block = 64, 4, 32
+    n_blocks = k // block
+    node = helper.make_node(
+        "MatMulNBits",
+        ["A", "B", "scales", "zero_points"],
+        ["Y"],
+        domain="com.microsoft",
+        K=k,
+        N=n,
+        bits=bits,
+        block_size=block,
+    )
+    graph = helper.make_graph(
+        [node],
+        "probe",
+        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, k])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, n])],
+        [
+            numpy_helper.from_array(
+                np.zeros((n, n_blocks, block * bits // 8), np.uint8), "B"
+            ),
+            numpy_helper.from_array(np.ones(n * n_blocks, np.float32), "scales"),
+            numpy_helper.from_array(
+                np.zeros((n, -(-n_blocks // (8 // bits))), np.uint8), "zero_points"
+            ),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 21),
+            helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    options = onnxruntime.SessionOptions()
+    options.log_severity_level = 4
+    try:
+        onnxruntime.InferenceSession(
+            model.SerializeToString(), options, providers=["CPUExecutionProvider"]
+        )
+    except Exception:
+        return False
+    return True
 
 
 def infer_vocab_size(model: onnx.ModelProto) -> Optional[int]:

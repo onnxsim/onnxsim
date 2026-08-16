@@ -56,6 +56,15 @@ onnxruntime = pytest.importorskip("onnxruntime")
 BITLINEARS_PER_LAYER = 7
 LAYERS = 2
 
+# 2-bit MatMulNBits is only in recent onnxruntime builds; older ones accept just
+# 4 and 8 bits and raise when the session is created ("additional bits support
+# is planned"). Conversion still works there -- the model is simply not loadable
+# locally -- so only the cases that *execute* a 2-bit graph are gated.
+requires_2bit = pytest.mark.skipif(
+    not bitnet_ort.matmul_nbits_supported(2),
+    reason="onnxruntime build has no 2-bit MatMulNBits kernel",
+)
+
 
 @pytest.fixture(scope="module")
 def exported(tmp_path_factory):
@@ -152,7 +161,7 @@ def test_simplify_exposes_transposed_weights(tmp_path):
     assert after.converted == BITLINEARS_PER_LAYER * LAYERS
 
 
-@pytest.mark.parametrize("mode", ["nbits", "int8"])
+@pytest.mark.parametrize("mode", [pytest.param("nbits", marks=requires_2bit), "int8"])
 def test_convert_runs_in_onnxruntime(exported, simplified, mode):
     _, feeds, reference = exported
     converted, stats = bitnet_ort.convert(simplified, mode=mode)
@@ -174,15 +183,23 @@ def test_convert_runs_in_onnxruntime(exported, simplified, mode):
     assert np.mean(predicted == expected) >= 0.9
 
 
+def test_nbits_shrinks_the_weights(simplified):
+    """Ternary float32 -> 2 bits is a 16x saving before per-block scales.
+
+    Packing needs no onnxruntime kernel, so this holds even where the 2-bit
+    kernel is missing.
+    """
+    _, stats = bitnet_ort.convert(simplified)
+    assert stats.compression > 8.0
+
+
+@requires_2bit
 def test_nbits_weights_are_losslessly_packed(exported, simplified):
     """2-bit packing is exact: only the compute type costs accuracy."""
     _, feeds, reference = exported
-    converted, stats = bitnet_ort.convert(
+    converted, _ = bitnet_ort.convert(
         simplified, accuracy_level=bitnet_ort.ACCURACY_LEVEL_FP32
     )
-    # Ternary in float32 -> 2 bits is a 16x saving before per-block scales.
-    assert stats.compression > 8.0
-
     actual = bitnet_ort.run(converted, feeds)
     assert bitnet_ort.max_relative_error(reference, actual) < 1e-5
 
@@ -206,7 +223,7 @@ def test_block_size_avoids_the_unvectorized_kernels(exported, simplified):
     assert blocks <= {32, 64, 128}
 
 
-@pytest.mark.parametrize("mode", ["nbits", "int8"])
+@pytest.mark.parametrize("mode", [pytest.param("nbits", marks=requires_2bit), "int8"])
 def test_onnxsim_simplifies_the_converted_model(exported, simplified, mode):
     _, feeds, reference = exported
     converted, _ = bitnet_ort.convert(simplified, mode=mode)

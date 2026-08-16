@@ -102,15 +102,25 @@ def convert_model(
     report["weight_bytes_after"] = stats.weight_bytes_after
     report["weight_compression"] = round(stats.compression, 2)
 
+    # A 2-bit model converts on any onnxruntime but only *loads* on a build with
+    # the 2-bit MatMulNBits kernel. Where it is missing, still write the model
+    # (it is valid, and the target runtime may differ from this machine) but skip
+    # everything that would need to execute it.
+    runnable = mode != "nbits" or bitnet_ort.matmul_nbits_supported(2)
+    report["runnable_here"] = runnable
+
     if simplify and stats.converted:
-        converted, ok = _simplify(converted, feeds, check)
-        report["post_simplify_check_ok"] = bool(ok)
+        converted, ok = _simplify(converted, feeds, check if runnable else 0)
+        if runnable:
+            report["post_simplify_check_ok"] = bool(ok)
 
     report["nodes_converted"] = len(converted.graph.node)
     report["bytes_converted"] = _model_bytes(converted)
     report["model_compression"] = round(
         report["bytes_exported"] / max(report["bytes_converted"], 1), 2
     )
+    if not runnable:
+        return converted, report
 
     actual = bitnet_ort.run(converted, feeds)
     report["max_relative_error"] = float(
@@ -226,6 +236,13 @@ def main() -> int:
         report["output"] = args.output
 
     print(json.dumps(report, indent=2))
+    if not report.get("runnable_here", True):
+        print(
+            "\nThis onnxruntime build has no 2-bit MatMulNBits kernel, so the "
+            "converted model was written but not verified or benchmarked here. "
+            "Upgrade onnxruntime, or use --mode int8 (standard ops only).",
+            file=sys.stderr,
+        )
     if not report["bitlinear_converted"]:
         print(
             "\nNo ternary weights found. Is this a BitNet export? Weights must be "

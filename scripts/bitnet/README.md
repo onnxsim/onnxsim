@@ -49,8 +49,19 @@ Ternary maps exactly onto 2-bit codes `{0,1,2}` with zero-point `1`, so the
 weight *representation* is lossless — a `--accuracy-level 1` conversion
 reproduces the float model to ~1e-7.
 
-Two details decide whether this is fast or catastrophically slow, and both are
-easy to get wrong:
+**Requires a recent onnxruntime.** 2-bit MatMulNBits is new; older builds accept
+only 4 and 8 bits and fail at *session creation* with "Only 4b and 8b
+quantization is supported for MatMulNBits op, additional bits support is
+planned". Conversion still succeeds there — the model is valid and may target a
+different runtime — but it will not load locally. `bitnet_ort.matmul_nbits_supported(2)`
+probes the installed build (a throwaway session, not a version string, since a
+wheel's version does not say how it was compiled); `convert_bitnet.py` reports
+`"runnable_here": false` and skips verification rather than crashing. Verified
+present on onnxruntime 1.28 (x86-64 Linux) and absent from the wheels installed
+for Python 3.10 in this repo's CI. `--mode int8` has no such requirement.
+
+Two further details decide whether this is fast or catastrophically slow, and
+both are easy to get wrong:
 
 * **`accuracy_level=4`** (int8 compute, the default here). onnxruntime's 2-bit
   float compute path is unvectorized; at `accuracy_level=1` it runs ~35× *slower*
@@ -132,6 +143,10 @@ modes run in onnxruntime and preserve the predictions, block-size selection stay
 on the kernels that actually have an int8 path, and onnxsim simplifies the
 converted graph with its numerical check passing.
 
+Cases that *execute* a 2-bit graph are skipped where the installed onnxruntime
+lacks the kernel; detection, packing, compression and block-size selection need
+no kernel and always run.
+
 `torch` is only needed for the export leg — the converter itself is onnx+numpy —
 so the packing and detection cases run even without it. To run the file locally:
 
@@ -143,6 +158,8 @@ pytest tests/test_bitnet.py -v
 
 ## Limitations
 
+- `--mode nbits` output needs an onnxruntime with the 2-bit MatMulNBits kernel
+  (see above); `--mode int8` runs anywhere.
 - Only `MatMul` nodes whose weight is a top-level graph initializer are
   rewritten; weights inside `If`/`Loop` subgraphs are left alone.
 - float32 graphs only — a float16 export is not rewritten.
