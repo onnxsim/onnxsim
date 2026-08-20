@@ -755,9 +755,7 @@ def simplify(
     # ``onnx.load_external_data_for_model``'s buffered read.
     if external_data_dir is not None:
         model.ParseFromString(
-            C.hydrate_external_data_pooled(
-                model.SerializeToString(), external_data_dir
-            )
+            C.hydrate_external_data_pooled(model.SerializeToString(), external_data_dir)
         )
 
     # Merging onnxruntime's profile into onnxsim's trace requires an onnxsim
