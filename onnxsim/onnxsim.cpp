@@ -3016,13 +3016,26 @@ onnx::ModelProto Simplify(
 
 size_t LoadModelPooled(const std::string& path, onnx::ModelProto* model,
                        onnxsim::tensor_pool::TensorPool& pool,
-                       bool hydrate_all) {
+                       uint64_t hydrate_threshold_bytes) {
   onnx::optimization::loadModel(model, path, /*load_external_data=*/false);
   const std::string base_dir =
       std::filesystem::path(path).parent_path().string();
   return onnxsim::tensor_pool::PoolExternalData(*model, base_dir, pool,
-                                                hydrate_all);
+                                                hydrate_threshold_bytes);
 }
+
+// Tensors at or under this size are hydrated eagerly on load (see
+// LoadModelPooled below); larger ones stay lazy, pool-only references for as
+// long as Simplify()'s fixed point never actually needs their bytes (every
+// value-reading onnxsim/onnx-optimizer pass treats an EXTERNAL tensor as
+// unavailable rather than misreading its absent data -- see
+// PoolExternalData's own comment). Matches onnx_simplifier.py's
+// DEFAULT_TENSOR_SIZE_THRESHOLDHOLD ("a very very large threshold"): both
+// exist to draw the same "this single tensor is unusually huge" line, just
+// for two different decisions (there: whether to keep a constant-folded
+// output; here: whether to eagerly materialize an input weight).
+constexpr uint64_t kSimplifyPathHydrateThresholdBytes =
+    1536ULL * 1024 * 1024;  // 1.5GB
 
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
@@ -3042,19 +3055,22 @@ void SimplifyPath(
   };
 
   onnx::ModelProto model;
+  // Declared here, not inside the load block below, so it stays alive
+  // (keeping every mmap'd tensor's mapping alive) across the Simplify() call
+  // -- a tensor PoolExternalData left EXTERNAL for being over
+  // kSimplifyPathHydrateThresholdBytes is hydrated from *this* pool, on
+  // demand, right before saveModel below, not eagerly here.
+  onnxsim::tensor_pool::TensorPool pool;
   {
     const auto t0 = now();
     // The default model-loading step for onnxsim's primary path-based entry
     // point: reads the graph structure without materializing external data,
     // then memory-maps every classic-EXTERNAL tensor's data file straight
     // into a TensorPool instead of onnx-optimizer's own external-data loader
-    // reading each tensor's slice into a fresh heap buffer. hydrate_all
-    // defaults to true here -- Simplify()'s passes below still need
-    // ordinary in-memory tensors (see tensor_pool_bridge.h's file comment on
-    // what is not yet pool-aware) -- so `pool` itself is discarded once this
-    // block ends; only the mmap'd load avoids the extra buffered-read copy.
-    onnxsim::tensor_pool::TensorPool pool;
-    LoadModelPooled(in_path, &model, pool, /*hydrate_all=*/true);
+    // reading each tensor's slice into a fresh heap buffer. Tensors at or
+    // under kSimplifyPathHydrateThresholdBytes are hydrated eagerly here;
+    // larger ones stay lazy through the Simplify() call below.
+    LoadModelPooled(in_path, &model, pool, kSimplifyPathHydrateThresholdBytes);
     if (debug_timing) {
       std::cerr << "SimplifyPath: loadModel " << elapsed_ms(t0, now())
                 << "ms\n";
@@ -3070,6 +3086,22 @@ void SimplifyPath(
                  mutable_initializer, overwrite_input_shapes, unused_output);
     if (debug_timing) {
       std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
+    }
+  }
+
+  {
+    const auto t0 = now();
+    // Flush any tensor LoadModelPooled left EXTERNAL (too large to
+    // materialize eagerly, and never touched -- or already dropped by dead-
+    // initializer elimination -- during Simplify()) back into ordinary
+    // in-memory form, so the saved output below is always fully self-
+    // contained no matter whether out_path's directory matches in_path's
+    // (an EXTERNAL tensor's external_data location is relative to where it
+    // was originally loaded from). See HydrateAllFromPool's own comment.
+    onnxsim::tensor_pool::HydrateAllFromPool(model, pool);
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: HydrateAllFromPool " << elapsed_ms(t0, now())
+                << "ms\n";
     }
   }
 

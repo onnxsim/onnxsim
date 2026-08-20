@@ -234,27 +234,41 @@ inline bool HydrateTensorProto(const std::string& name,
 // onnx's own loader (join, don't reinterpret) -- pass the directory the
 // model's own .onnx file lives in.
 //
-// hydrate_all (default true, matching plain onnx.load / onnx's own external-
-// data loader) copies each pooled tensor's bytes back into its own raw_data
-// before returning (via HydrateTensorProto) -- with this default, every
-// pooled tensor in `model` ends up an ordinary, self-contained in-memory
-// tensor, functionally identical to what onnx's own external-data loader
-// produces, and `pool` is populated but not required by the caller
-// afterwards. With hydrate_all=false, a pooled tensor is left EXTERNAL, its
-// external_data untouched (so it still names the real on-disk
-// file/offset/length onnx's own loader would use) -- `model` never carries
-// that tensor's bytes at all (no large raw_data), but `pool` now holds a
-// zero-copy Entry for it too, addressable by name, for a caller that knows
-// how to consume one (see this header's top comment for which onnxsim call
-// sites do not, yet).
+// hydrate_threshold_bytes (default kHydrateAll, matching plain onnx.load /
+// onnx's own external-data loader) copies a pooled tensor's bytes back into
+// its own raw_data before returning (via HydrateTensorProto) whenever that
+// tensor's byte size is <= hydrate_threshold_bytes -- with the kHydrateAll
+// default, every pooled tensor in `model` ends up an ordinary, self-
+// contained in-memory tensor, functionally identical to what onnx's own
+// external-data loader produces, and `pool` is populated but not required by
+// the caller afterwards. A tensor whose size exceeds the threshold is left
+// EXTERNAL instead, its external_data untouched (so it still names the real
+// on-disk file/offset/length onnx's own loader would use) -- `model` never
+// carries that tensor's bytes at all (no large raw_data), but `pool` now
+// holds a zero-copy Entry for it too, addressable by name, for a caller that
+// knows how to consume one. Passing 0 leaves every pooled tensor EXTERNAL
+// (matching the old hydrate_all=false).
 //
-// Hydration, when requested, is a distinct final pass over every tensor this
-// call pooled -- run only after every one of them has been mapped/read into
-// `pool` successfully, never interleaved into the mapping loop itself. That
-// makes this call atomic with respect to `model`: if pooling fails partway
-// (a later tensor's file is missing, say), no earlier tensor has been
-// mutated either -- `model` is left exactly as it was passed in, not a mix
-// of already-hydrated and still-EXTERNAL tensors depending on graph
+// Every onnxsim pass that reads a constant tensor's *value* (as opposed to
+// just its declared shape/dtype, always available regardless of hydration)
+// goes through FetchConstantTensor/IsConstantTensor (onnx-optimizer's
+// pass_util.h) or CSETensorHash/CSETensorCompare (cse_util.h), both of which
+// treat an EXTERNAL tensor as unavailable rather than reading its absent
+// data as if it were zero/empty -- so leaving a tensor EXTERNAL here is safe
+// to hand to Simplify(): it just means that tensor's value-dependent
+// optimizations (constant folding, BN fusion, CSE dedup, ...) are skipped
+// for it, not that they run on wrong data. See LoadModelPooled's caller
+// (SimplifyPath) for how a model with leftover EXTERNAL tensors is still
+// fully materialized again -- via HydrateAllFromPool below -- before it is
+// ever serialized out.
+//
+// Hydration, when it happens, is a distinct final pass over every tensor
+// this call pooled -- run only after every one of them has been mapped/read
+// into `pool` successfully, never interleaved into the mapping loop itself.
+// That makes this call atomic with respect to `model`: if pooling fails
+// partway (a later tensor's file is missing, say), no earlier tensor has
+// been mutated either -- `model` is left exactly as it was passed in, not a
+// mix of already-hydrated and still-EXTERNAL tensors depending on graph
 // traversal order.
 //
 // A file that fails to memory-map (no mmap support on this platform, or the
@@ -263,12 +277,12 @@ inline bool HydrateTensorProto(const std::string& name,
 // onnx's own external-data loader's behavior exactly, just without the mmap
 // benefit for that one file.
 //
-// Returns the number of tensors pooled. Throws std::runtime_error if a
-// referenced file cannot be opened at all (mapped or not), or if a tensor's
-// offset/length range falls outside its file.
+// Returns the number of tensors pooled (hydrated or not). Throws
+// std::runtime_error if a referenced file cannot be opened at all (mapped or
+// not), or if a tensor's offset/length range falls outside its file.
 inline size_t PoolExternalData(onnx::ModelProto& model,
                                const std::string& base_dir, TensorPool& pool,
-                               bool hydrate_all = true) {
+                               uint64_t hydrate_threshold_bytes = kHydrateAll) {
   // Keyed by the resolved absolute path, so tensors sharing one data file
   // (the common case) share one mapping/read instead of one per tensor.
   std::map<std::string, std::pair<std::shared_ptr<const char[]>, uint64_t>>
@@ -335,16 +349,44 @@ inline size_t PoolExternalData(onnx::ModelProto& model,
   });
 
   // Final phase: every tensor above pooled successfully (no throw reached
-  // here otherwise), so it is now safe to hydrate them all -- or, with
-  // hydrate_all=false, to leave every one of them exactly as pooling found
-  // it (still EXTERNAL, no raw_data), never partially mutated.
-  if (hydrate_all) {
-    for (auto& [name, t] : pooled_tensors) {
+  // here otherwise), so it is now safe to hydrate the ones at or under the
+  // threshold -- larger ones are left exactly as pooling found them (still
+  // EXTERNAL, no raw_data), never partially mutated.
+  for (auto& [name, t] : pooled_tensors) {
+    const Entry* entry = pool.Find(name);
+    if (entry != nullptr && entry->nbytes() <= hydrate_threshold_bytes) {
       HydrateTensorProto(name, *t, pool);
     }
   }
 
   return pooled_tensors.size();
+}
+
+// Hydrate every remaining EXTERNAL tensor in `model` that has a matching
+// entry in `pool` -- the "make it fully self-contained again" counterpart to
+// PoolExternalData's threshold-based partial hydration above. Intended use:
+// a caller runs Simplify() on a model PoolExternalData left partially
+// EXTERNAL (large tensors skipped for lower peak memory during the fixed
+// point -- see PoolExternalData's own comment on why that is safe), then
+// calls this right before serializing/saving the result, so the OUTPUT is
+// always a plain, fully self-contained model regardless of whether the
+// output path's directory matches the input's (an EXTERNAL tensor's
+// external_data location is relative to wherever it was originally loaded
+// from, so leaving one EXTERNAL in a model saved to a different directory
+// would silently produce a file whose data reference no longer resolves).
+// A tensor that is EXTERNAL but has no matching entry in `pool` (not
+// something this pool loaded) is left untouched. Returns the number
+// hydrated.
+inline size_t HydrateAllFromPool(onnx::ModelProto& model,
+                                 const TensorPool& pool) {
+  size_t hydrated = 0;
+  detail::ForEachTensor(*model.mutable_graph(),
+                        [&](const std::string& name, onnx::TensorProto& t) {
+                          if (t.data_location() != onnx::TensorProto::EXTERNAL)
+                            return;
+                          if (HydrateTensorProto(name, t, pool)) ++hydrated;
+                        });
+  return hydrated;
 }
 
 // Rewrite `model` so every eligible tensor (graph initializers and node-

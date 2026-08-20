@@ -162,20 +162,21 @@ void SimplifyPath(
 // which memory-maps the referenced data file(s) instead of reading them into
 // a heap buffer.
 //
-// `hydrate_all` (default true) copies every pooled tensor's bytes back into
-// `model`'s own raw_data before returning, via `PoolExternalData`'s own
-// `hydrate_all` -- with the default, `model` comes back functionally
-// identical to `onnx::optimization::loadModel(model, path, true)` (an
-// ordinary, fully self-contained ModelProto), just without the extra
-// buffered read: the mapped pages are copied directly into raw_data instead
-// of first being read into a throwaway std::string. `pool` is populated but
-// not required by the caller in that case. With `hydrate_all=false`, `model`
-// never carries the pooled tensors' bytes at all -- no large raw_data -- and
-// they stay reachable only through `pool`; see PoolExternalData's own
-// comment for which onnxsim call sites can (and, today, mostly cannot yet)
-// consume such a reference directly.
+// `hydrate_threshold_bytes` (default onnxsim::tensor_pool::kHydrateAll)
+// copies a pooled tensor's bytes back into `model`'s own raw_data before
+// returning whenever that tensor's size is <= the threshold, via
+// `PoolExternalData`'s own threshold parameter -- with the kHydrateAll
+// default, `model` comes back functionally identical to
+// `onnx::optimization::loadModel(model, path, true)` (an ordinary, fully
+// self-contained ModelProto), just without the extra buffered read: the
+// mapped pages are copied directly into raw_data instead of first being read
+// into a throwaway std::string. `pool` is populated but not required by the
+// caller in that case. A tensor above the threshold is left EXTERNAL --
+// `model` never carries its bytes -- reachable only through `pool`; see
+// PoolExternalData's own comment for why that is safe to hand to Simplify().
 //
 // Returns the number of tensors pooled.
-size_t LoadModelPooled(const std::string& path, onnx::ModelProto* model,
-                       onnxsim::tensor_pool::TensorPool& pool,
-                       bool hydrate_all = true);
+size_t LoadModelPooled(
+    const std::string& path, onnx::ModelProto* model,
+    onnxsim::tensor_pool::TensorPool& pool,
+    uint64_t hydrate_threshold_bytes = onnxsim::tensor_pool::kHydrateAll);

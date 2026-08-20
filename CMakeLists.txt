@@ -501,6 +501,17 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(tensor_pool_bridge_test)
   add_test(NAME tensor_pool_bridge_test COMMAND tensor_pool_bridge_test)
 
+  # Regression coverage for the EXTERNAL-tensor safety fixes in onnx-
+  # optimizer's pass_util.h/cse_util.h (see that test's file comment): needs
+  # the fully-configured `onnxsim` target both for onnx-optimizer's own
+  # OptimizeFixed and for onnxsim::RegisterCustomOptimizerPasses.
+  add_executable(external_tensor_pass_safety_test
+                 onnxsim/external_tensor_pass_safety_test.cpp)
+  target_link_libraries(external_tensor_pass_safety_test onnxsim)
+  onnxsim_add_ort_rpath(external_tensor_pass_safety_test)
+  add_test(NAME external_tensor_pass_safety_test
+          COMMAND external_tensor_pass_safety_test)
+
   # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
   # tensor_pool_dtype_test.cpp above for the same reason.
   add_executable(gguf_dtype_test onnxsim/gguf_dtype_test.cpp)

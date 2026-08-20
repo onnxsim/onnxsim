@@ -71,6 +71,7 @@
 #define ONNXSIM_TENSOR_POOL_H_
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -82,6 +83,14 @@
 
 namespace onnxsim {
 namespace tensor_pool {
+
+// Sentinel "byte size threshold" meaning "hydrate every tensor, regardless
+// of size" -- the value a caller of PoolExternalData/LoadModelPooled
+// (tensor_pool_bridge.h / onnxsim.h) passes for the old hydrate_all=true
+// behavior; a real (finite) threshold instead hydrates only tensors at or
+// under it, leaving larger ones as lazy pool-only references. Passing 0
+// leaves every tensor un-hydrated (the old hydrate_all=false).
+inline constexpr uint64_t kHydrateAll = std::numeric_limits<uint64_t>::max();
 
 // A named tensor's data as a zero-copy view into whatever storage TensorPool
 // keeps alive on its behalf. `owner` keeps `data` alive (it may be an

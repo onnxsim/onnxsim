@@ -695,6 +695,19 @@ a fully self-contained `ModelProto`, with no `TensorPool` or lazy state for
 the caller to manage — just with fewer copies of the weights along the way
 for a model that uses external data.
 
+`simplify(path)` itself goes further: any single external-data tensor over
+1.5GB is left un-hydrated (a lazy, memory-mapped reference, not resident in
+memory) for as long as the simplification fixed point never actually needs
+its value — every onnxsim/onnx-optimizer pass that reads a constant tensor's
+value already treats such a tensor as unavailable rather than misreading its
+absent bytes as zero, so this only ever costs that one tensor's
+value-dependent optimizations (constant folding, BatchNorm fusion, duplicate-
+initializer dedup, ...), never correctness. A tensor dropped by dead-code
+elimination before ever being read pays no hydration cost at all. Whatever
+is still un-hydrated when simplification finishes is fully materialized
+before the result is saved, so the output file is always an ordinary,
+self-contained model either way.
+
 ## Safetensors / GGUF archives
 
 Besides plain `.onnx`, a model can be exported to (and imported back from) a

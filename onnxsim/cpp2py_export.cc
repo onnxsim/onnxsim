@@ -570,8 +570,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         onnx::ModelProto model;
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
         onnxsim::tensor_pool::TensorPool pool;
-        onnxsim::tensor_pool::PoolExternalData(model, base_dir, pool,
-                                               /*hydrate_all=*/true);
+        onnxsim::tensor_pool::PoolExternalData(
+            model, base_dir, pool, onnxsim::tensor_pool::kHydrateAll);
         const std::string out = model.SerializeAsString();
         return py::bytes(out.data(), out.size());
       },

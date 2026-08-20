@@ -323,7 +323,7 @@ void TestPoolExternalDataHydrateAll() {
   SetExternalData(*w, data_file, /*offset=*/0, /*length=*/8);
 
   TensorPool pool;
-  size_t n = PoolExternalData(model, dir, pool, /*hydrate_all=*/true);
+  size_t n = PoolExternalData(model, dir, pool, kHydrateAll);
   Check(n == 1, "one tensor pooled");
   Check(g->initializer(0).has_raw_data() &&
             g->initializer(0).raw_data() == payload,
@@ -354,7 +354,7 @@ void TestPoolExternalDataLazy() {
   SetExternalData(*w, data_file, /*offset=*/0, /*length=*/4);
 
   TensorPool pool;
-  size_t n = PoolExternalData(model, dir, pool, /*hydrate_all=*/false);
+  size_t n = PoolExternalData(model, dir, pool, /*hydrate_threshold_bytes=*/0);
   Check(n == 1, "lazy pooling still reports the match");
   Check(!g->initializer(0).has_raw_data(),
         "lazy pooling leaves raw_data unset");
@@ -372,6 +372,102 @@ void TestPoolExternalDataLazy() {
   Check(hydrated && g->initializer(0).raw_data() == payload,
         "on-demand HydrateTensorProto recovers the bytes from the pool, no "
         "second file read");
+
+  std::remove(data_path.c_str());
+}
+
+void TestPoolExternalDataPartialThreshold() {
+  // Two tensors, one small (4 bytes) and one larger (8 bytes), pooled with a
+  // threshold that admits only the small one -- exercises the actual
+  // "some tensors hydrate, some don't" mixed case, not just the
+  // kHydrateAll/0 all-or-nothing extremes the other tests use.
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_pool_ext_" + std::to_string(::getpid()) + "_partial.data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string small_payload = std::string(4, '\x11');
+  const std::string large_payload = std::string(8, '\x22');
+  WriteFile(data_path, small_payload + large_payload);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  auto* small = g->add_initializer();
+  small->set_name("small");
+  small->set_data_type(onnx::TensorProto::UINT8);
+  small->add_dims(4);
+  SetExternalData(*small, data_file, /*offset=*/0, /*length=*/4);
+  auto* large = g->add_initializer();
+  large->set_name("large");
+  large->set_data_type(onnx::TensorProto::UINT8);
+  large->add_dims(8);
+  SetExternalData(*large, data_file, /*offset=*/4, /*length=*/8);
+
+  TensorPool pool;
+  size_t n = PoolExternalData(model, dir, pool, /*hydrate_threshold_bytes=*/4);
+  Check(n == 2, "both tensors are pooled regardless of the threshold");
+  Check(g->initializer(0).has_raw_data() &&
+            g->initializer(0).raw_data() == small_payload &&
+            g->initializer(0).data_location() == onnx::TensorProto::DEFAULT,
+        "the tensor at the threshold is hydrated");
+  Check(!g->initializer(1).has_raw_data() &&
+            g->initializer(1).data_location() == onnx::TensorProto::EXTERNAL,
+        "the tensor over the threshold is left EXTERNAL, not hydrated");
+  const Entry* e = pool.Find("large");
+  Check(e != nullptr && e->data == large_payload,
+        "the over-threshold tensor's bytes are still reachable via the pool");
+
+  std::remove(data_path.c_str());
+}
+
+void TestHydrateAllFromPool() {
+  // The "flush before save" counterpart: after PoolExternalData leaves a
+  // tensor EXTERNAL (over threshold), HydrateAllFromPool must be able to
+  // fully materialize it later from the same pool, with no second file read.
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_pool_ext_" + std::to_string(::getpid()) + "_flush.data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string payload = std::string(8, '\x33');
+  WriteFile(data_path, payload);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  auto* w = g->add_initializer();
+  w->set_name("big");
+  w->set_data_type(onnx::TensorProto::UINT8);
+  w->add_dims(8);
+  SetExternalData(*w, data_file, /*offset=*/0, /*length=*/8);
+
+  TensorPool pool;
+  size_t n = PoolExternalData(model, dir, pool, /*hydrate_threshold_bytes=*/0);
+  Check(n == 1, "the tensor is pooled");
+  Check(g->initializer(0).data_location() == onnx::TensorProto::EXTERNAL,
+        "still EXTERNAL before the flush");
+
+  // Added AFTER pooling, so PoolExternalData/this pool never touched it --
+  // a stand-in for a tensor that's EXTERNAL for some unrelated reason (a
+  // different loader, a hand-built model, ...). HydrateAllFromPool must
+  // leave it alone rather than crash trying to resolve a name the pool
+  // never saw.
+  auto* untracked = g->add_initializer();
+  untracked->set_name("untracked");
+  untracked->set_data_type(onnx::TensorProto::UINT8);
+  untracked->add_dims(1);
+  untracked->set_data_location(onnx::TensorProto::EXTERNAL);
+  auto* loc = untracked->add_external_data();
+  loc->set_key("location");
+  loc->set_value("nowhere");
+
+  size_t hydrated = HydrateAllFromPool(model, pool);
+  Check(hydrated == 1,
+        "HydrateAllFromPool hydrates exactly the one pooled "
+        "tensor");
+  Check(g->initializer(0).raw_data() == payload &&
+            g->initializer(0).data_location() == onnx::TensorProto::DEFAULT,
+        "the tensor is fully materialized from the pool, no second read");
+  Check(g->initializer(1).data_location() == onnx::TensorProto::EXTERNAL,
+        "a tensor with no matching pool entry is left untouched, not "
+        "crashed on");
 
   std::remove(data_path.c_str());
 }
@@ -403,7 +499,7 @@ void TestPoolExternalDataSharedFile() {
   SetExternalData(*b, data_file, /*offset=*/4, /*length=*/4);
 
   TensorPool pool;
-  size_t n = PoolExternalData(model, dir, pool, /*hydrate_all=*/true);
+  size_t n = PoolExternalData(model, dir, pool, kHydrateAll);
   Check(n == 2, "both tensors sharing one file are pooled");
   Check(g->initializer(0).raw_data() == first, "tensor 'a' gets its own slice");
   Check(g->initializer(1).raw_data() == second,
@@ -424,7 +520,7 @@ void TestPoolExternalDataMissingFileThrows() {
   TensorPool pool;
   bool threw = false;
   try {
-    PoolExternalData(model, "/tmp", pool, /*hydrate_all=*/true);
+    PoolExternalData(model, "/tmp", pool, kHydrateAll);
   } catch (const std::runtime_error&) {
     threw = true;
   }
@@ -464,7 +560,7 @@ void TestPoolExternalDataThrowLeavesEarlierTensorsUntouched() {
   TensorPool pool;
   bool threw = false;
   try {
-    PoolExternalData(model, dir, pool, /*hydrate_all=*/true);
+    PoolExternalData(model, dir, pool, kHydrateAll);
   } catch (const std::runtime_error&) {
     threw = true;
   }
@@ -506,7 +602,7 @@ void TestLoadModelPooled() {
 
   onnx::ModelProto loaded;
   TensorPool pool;
-  size_t n = LoadModelPooled(model_path, &loaded, pool, /*hydrate_all=*/true);
+  size_t n = LoadModelPooled(model_path, &loaded, pool, kHydrateAll);
   Check(n == 1, "the model's one external tensor is pooled");
   Check(loaded.graph().initializer_size() == 1 &&
             loaded.graph().initializer(0).name() == "w",
@@ -516,7 +612,7 @@ void TestLoadModelPooled() {
         "bytes");
   Check(loaded.graph().initializer(0).data_location() ==
             onnx::TensorProto::DEFAULT,
-        "hydrate_all=true leaves no EXTERNAL tensors behind");
+        "kHydrateAll leaves no EXTERNAL tensors behind");
 
   std::remove(data_path.c_str());
   std::remove(model_path.c_str());
@@ -591,6 +687,8 @@ int main() {
   TestImportModelWithSafetensorsLazy();
   TestPoolExternalDataHydrateAll();
   TestPoolExternalDataLazy();
+  TestPoolExternalDataPartialThreshold();
+  TestHydrateAllFromPool();
   TestPoolExternalDataSharedFile();
   TestPoolExternalDataMissingFileThrows();
   TestPoolExternalDataThrowLeavesEarlierTensorsUntouched();
