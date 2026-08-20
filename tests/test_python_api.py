@@ -996,6 +996,48 @@ def test_simplify_path_with_external_data():
     np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
+def test_load_model_hydrates_external_data():
+    # ``onnxsim.load_model`` must produce a ModelProto functionally identical
+    # to ``onnx.load`` -- including for a model whose weights live in a
+    # separate classic external-data file -- even though it hydrates that
+    # data via onnxsim's memory-mapped TensorPool loader internally instead
+    # of ``onnx.load_external_data_for_model``.
+    a = np.random.rand(8, 8).astype(np.float32)
+    initializer = onnx.numpy_helper.from_array(a, "a")
+    node = onnx.helper.make_node("Identity", ["a"], ["y"])
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (8, 8))
+    graph_def = onnx.helper.make_graph(
+        [node],
+        "test_load_model_hydrates_external_data",
+        [],
+        [out],
+        initializer=[initializer],
+    )
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model,
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.data",
+        )
+        assert os.path.exists(os.path.join(tmpdir, "model.data"))
+
+        loaded = onnxsim.load_model(model_path)
+        expected = onnx.load(model_path)
+
+    assert len(loaded.graph.initializer) == 1
+    assert loaded.graph.initializer[0].data_location == onnx.TensorProto.DEFAULT
+    loaded_array = onnx.numpy_helper.to_array(loaded.graph.initializer[0])
+    np.testing.assert_array_equal(loaded_array, a)
+    assert loaded.SerializeToString() == expected.SerializeToString()
+
+
 def test_model_info_size_counts_external_data_without_loading():
     # ModelInfo must report a model's size from external-data metadata, so a
     # model whose weights live on disk can be measured without loading them --

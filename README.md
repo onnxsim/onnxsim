@@ -667,6 +667,34 @@ commutative permutations, or evaluate attribute *predicates* — for those, the
 Python-only `onnxscript.rewriter` via `custom_rewriter` remains the richer
 option.
 
+## Loading large models
+
+Passing `simplify()` a **file path** (rather than an already-loaded
+`ModelProto`) is the recommended way to simplify a large model: it lets
+onnxsim defer loading a model's (potentially huge) weights for as long as
+possible, and is the input this project's own tooling and tests default to.
+When the model's weights live in a separate classic external-data file (the
+`<name>.onnx` + `<name>.data` pair `onnx.save(..., save_as_external_data=True)`
+produces), that file is memory-mapped straight into onnxsim's C++
+`TensorPool` rather than being read into a heap buffer first, avoiding an
+extra buffered copy of the weights on the way in.
+
+The same loading path is available directly as `onnxsim.load_model`, for
+when you want the loaded `ModelProto` itself rather than passing a path
+straight to `simplify()`:
+
+```python
+import onnxsim
+
+model = onnxsim.load_model("model.onnx")  # instead of onnx.load("model.onnx")
+sim_model, check_ok = onnxsim.simplify(model)
+```
+
+`onnxsim.load_model(path)` is functionally identical to `onnx.load(path)` —
+a fully self-contained `ModelProto`, with no `TensorPool` or lazy state for
+the caller to manage — just with fewer copies of the weights along the way
+for a model that uses external data.
+
 ## Safetensors / GGUF archives
 
 Besides plain `.onnx`, a model can be exported to (and imported back from) a

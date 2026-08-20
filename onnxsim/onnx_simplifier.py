@@ -337,6 +337,29 @@ def import_onnx_schemas() -> int:
     return imported
 
 
+def load_model(path: str) -> onnx.ModelProto:
+    """Load an ``.onnx`` model from ``path``, the same way :func:`simplify`
+    loads a path by default.
+
+    Structurally identical to ``onnx.load(path)`` -- the returned
+    ``ModelProto`` is fully self-contained, with every tensor's data inline
+    -- but any classic external data (the ``<name>.onnx`` + ``<name>.data``
+    pair ``onnx.save(..., save_as_external_data=True)`` produces) is
+    memory-mapped straight into onnxsim's C++ ``TensorPool`` and copied once
+    from there into ``raw_data``, rather than first being read into a
+    throwaway buffer the way ``onnx.load_external_data_for_model`` does.
+    Models with no external data (or none large enough to matter) pay no
+    extra cost either way.
+    """
+    model = onnx.load(path, load_external_data=False)
+    model.ParseFromString(
+        C.hydrate_external_data_pooled(
+            model.SerializeToString(), os.path.dirname(os.path.abspath(path))
+        )
+    )
+    return model
+
+
 def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
     """Export ``model`` to a standalone safetensors archive at ``out_path``.
 
@@ -727,8 +750,15 @@ def simplify(
     # over and the full model is about to be serialized for the C++ simplifier.
     # This is a no-op unless we loaded from a path above (and therefore deferred
     # it); a caller-provided ``ModelProto`` already carries its data inline.
+    # Uses the same TensorPool-backed, memory-mapped loading path as
+    # ``load_model`` and the fast path's ``C.simplify_path`` below, rather than
+    # ``onnx.load_external_data_for_model``'s buffered read.
     if external_data_dir is not None:
-        onnx.load_external_data_for_model(model, external_data_dir)
+        model.ParseFromString(
+            C.hydrate_external_data_pooled(
+                model.SerializeToString(), external_data_dir
+            )
+        )
 
     # Merging onnxruntime's profile into onnxsim's trace requires an onnxsim
     # trace to merge into, so it implies profiling.

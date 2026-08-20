@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -51,6 +52,7 @@
 #include "profiler.h"
 #include "sym_shape_infer.h"
 #include "sym_value_eval.h"
+#include "tensor_pool_bridge.h"
 
 struct Config {
   std::vector<std::string> optimizer_passes;
@@ -3012,6 +3014,16 @@ onnx::ModelProto Simplify(
   return sim_model;
 }
 
+size_t LoadModelPooled(const std::string& path, onnx::ModelProto* model,
+                       onnxsim::tensor_pool::TensorPool& pool,
+                       bool hydrate_all) {
+  onnx::optimization::loadModel(model, path, /*load_external_data=*/false);
+  const std::string base_dir =
+      std::filesystem::path(path).parent_path().string();
+  return onnxsim::tensor_pool::PoolExternalData(*model, base_dir, pool,
+                                                hydrate_all);
+}
+
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
     const std::string& out_path,
@@ -3032,7 +3044,17 @@ void SimplifyPath(
   onnx::ModelProto model;
   {
     const auto t0 = now();
-    onnx::optimization::loadModel(&model, in_path, true);
+    // The default model-loading step for onnxsim's primary path-based entry
+    // point: reads the graph structure without materializing external data,
+    // then memory-maps every classic-EXTERNAL tensor's data file straight
+    // into a TensorPool instead of onnx-optimizer's own external-data loader
+    // reading each tensor's slice into a fresh heap buffer. hydrate_all
+    // defaults to true here -- Simplify()'s passes below still need
+    // ordinary in-memory tensors (see tensor_pool_bridge.h's file comment on
+    // what is not yet pool-aware) -- so `pool` itself is discarded once this
+    // block ends; only the mmap'd load avoids the extra buffered-read copy.
+    onnxsim::tensor_pool::TensorPool pool;
+    LoadModelPooled(in_path, &model, pool, /*hydrate_all=*/true);
     if (debug_timing) {
       std::cerr << "SimplifyPath: loadModel " << elapsed_ms(t0, now())
                 << "ms\n";

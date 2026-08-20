@@ -551,6 +551,32 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "rules"_a);
 
+  // Materialize every classic-EXTERNAL tensor in ``model_bytes`` (initializers
+  // and node-attribute tensors, recursing into subgraphs) by memory-mapping
+  // its data file under ``base_dir`` (onnxsim::tensor_pool::PoolExternalData,
+  // see tensor_pool_bridge.h) instead of reading it into a heap buffer the
+  // way ``onnx.load_external_data_for_model`` does. Used by
+  // ``onnxsim.load_model`` and by ``simplify()``'s own slow path (see
+  // onnx_simplifier.py) -- both already have a metadata-only ``ModelProto``
+  // in hand (from ``onnx.load(path, load_external_data=False)``) and just
+  // need its external data filled in, which is exactly onnxsim's own
+  // path-based entry point's (``simplify_path``) default loading step too
+  // (LoadModelPooled, onnxsim.cpp), just operating on an already-parsed
+  // model instead of a fresh path.
+  m.def(
+      "hydrate_external_data_pooled",
+      [](const py::bytes& model_bytes, const std::string& base_dir)
+          -> py::bytes {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::PoolExternalData(model, base_dir, pool,
+                                               /*hydrate_all=*/true);
+        const std::string out = model.SerializeAsString();
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "base_dir"_a);
+
   // Standalone safetensors/GGUF archive export/import: a model's graph and
   // weights packaged together in one ecosystem-standard file (see
   // onnxsim/tensor_pool_bridge.h and tensor_pool_gguf_bridge.h's *Standalone

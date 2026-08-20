@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "dlpack/dlpack.h"
+#include "tensor_pool.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
 // DLPack deleter exactly once (per the DLPack contract), which frees whatever
@@ -151,3 +152,30 @@ void SimplifyPath(
         overwrite_input_shapes = std::nullopt,
     const std::optional<std::vector<std::string>>& unused_output =
         std::nullopt);
+
+// Load `path` -- an ordinary .onnx file, whose weights may be inline or
+// stored as classic external data (or a mix) -- the way `SimplifyPath` above
+// does by default: onnx-optimizer's own `loadModel` reads the graph
+// structure without materializing external data
+// (`load_external_data=false`), then every classic-EXTERNAL tensor is pooled
+// via `onnxsim::tensor_pool::PoolExternalData` (see tensor_pool_bridge.h),
+// which memory-maps the referenced data file(s) instead of reading them into
+// a heap buffer.
+//
+// `hydrate_all` (default true) copies every pooled tensor's bytes back into
+// `model`'s own raw_data before returning, via `PoolExternalData`'s own
+// `hydrate_all` -- with the default, `model` comes back functionally
+// identical to `onnx::optimization::loadModel(model, path, true)` (an
+// ordinary, fully self-contained ModelProto), just without the extra
+// buffered read: the mapped pages are copied directly into raw_data instead
+// of first being read into a throwaway std::string. `pool` is populated but
+// not required by the caller in that case. With `hydrate_all=false`, `model`
+// never carries the pooled tensors' bytes at all -- no large raw_data -- and
+// they stay reachable only through `pool`; see PoolExternalData's own
+// comment for which onnxsim call sites can (and, today, mostly cannot yet)
+// consume such a reference directly.
+//
+// Returns the number of tensors pooled.
+size_t LoadModelPooled(const std::string& path, onnx::ModelProto* model,
+                       onnxsim::tensor_pool::TensorPool& pool,
+                       bool hydrate_all = true);

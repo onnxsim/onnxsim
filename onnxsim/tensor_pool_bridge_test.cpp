@@ -16,6 +16,8 @@
 #include <map>
 #include <string>
 
+#include "onnxsim.h"
+
 using namespace onnxsim::tensor_pool;
 
 namespace {
@@ -285,6 +287,197 @@ void TestImportModelWithSafetensorsLazy() {
   std::remove(path.c_str());
 }
 
+void WriteFile(const std::string& path, const std::string& contents) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+}
+
+void SetExternalData(onnx::TensorProto& t, const std::string& location,
+                     int64_t offset, int64_t length) {
+  t.set_data_location(onnx::TensorProto::EXTERNAL);
+  t.clear_external_data();
+  auto set_kv = [&](const std::string& k, const std::string& v) {
+    auto* e = t.add_external_data();
+    e->set_key(k);
+    e->set_value(v);
+  };
+  set_kv("location", location);
+  set_kv("offset", std::to_string(offset));
+  set_kv("length", std::to_string(length));
+}
+
+void TestPoolExternalDataHydrateAll() {
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_pool_ext_" + std::to_string(::getpid()) + "_a.data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string payload = std::string(8, '\xAB');
+  WriteFile(data_path, payload);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  auto* w = g->add_initializer();
+  w->set_name("w");
+  w->set_data_type(onnx::TensorProto::FLOAT);
+  w->add_dims(2);
+  SetExternalData(*w, data_file, /*offset=*/0, /*length=*/8);
+
+  TensorPool pool;
+  size_t n = PoolExternalData(model, dir, pool, /*hydrate_all=*/true);
+  Check(n == 1, "one tensor pooled");
+  Check(g->initializer(0).has_raw_data() &&
+            g->initializer(0).raw_data() == payload,
+        "hydrated raw_data matches the external file's bytes");
+  Check(g->initializer(0).data_location() == onnx::TensorProto::DEFAULT,
+        "hydrated tensor is DEFAULT-located, not EXTERNAL");
+  const Entry* e = pool.Find("w");
+  Check(e != nullptr && e->data == payload,
+        "pool holds an entry with the matching bytes too");
+
+  std::remove(data_path.c_str());
+}
+
+void TestPoolExternalDataLazy() {
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_pool_ext_" + std::to_string(::getpid()) + "_b.data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string payload = std::string(4, '\xCD');
+  WriteFile(data_path, payload);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  auto* w = g->add_initializer();
+  w->set_name("lazy");
+  w->set_data_type(onnx::TensorProto::UINT8);
+  w->add_dims(4);
+  SetExternalData(*w, data_file, /*offset=*/0, /*length=*/4);
+
+  TensorPool pool;
+  size_t n = PoolExternalData(model, dir, pool, /*hydrate_all=*/false);
+  Check(n == 1, "lazy pooling still reports the match");
+  Check(!g->initializer(0).has_raw_data(),
+        "lazy pooling leaves raw_data unset");
+  Check(g->initializer(0).data_location() == onnx::TensorProto::EXTERNAL,
+        "lazy pooling leaves the tensor EXTERNAL");
+  Check(g->initializer(0).external_data_size() == 3,
+        "lazy pooling does not touch the original external_data entries");
+
+  const Entry* e = pool.Find("lazy");
+  Check(e != nullptr && e->data == payload,
+        "pool holds the bytes even though the tensor itself was not "
+        "hydrated");
+
+  bool hydrated =
+      HydrateTensorProto("lazy", *g->mutable_initializer(0), pool);
+  Check(hydrated && g->initializer(0).raw_data() == payload,
+        "on-demand HydrateTensorProto recovers the bytes from the pool, no "
+        "second file read");
+
+  std::remove(data_path.c_str());
+}
+
+void TestPoolExternalDataSharedFile() {
+  // Two tensors backed by different byte ranges of the SAME data file (the
+  // common `all_tensors_to_one_file=True` layout) -- exercises the mapping
+  // dedup: PoolExternalData must memory-map the file once, not once per
+  // tensor, and still resolve each tensor's own slice correctly.
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_pool_ext_" + std::to_string(::getpid()) + "_shared.data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string first = std::string(4, '\x01');
+  const std::string second = std::string(4, '\x02');
+  WriteFile(data_path, first + second);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  auto* a = g->add_initializer();
+  a->set_name("a");
+  a->set_data_type(onnx::TensorProto::FLOAT);
+  a->add_dims(1);
+  SetExternalData(*a, data_file, /*offset=*/0, /*length=*/4);
+  auto* b = g->add_initializer();
+  b->set_name("b");
+  b->set_data_type(onnx::TensorProto::FLOAT);
+  b->add_dims(1);
+  SetExternalData(*b, data_file, /*offset=*/4, /*length=*/4);
+
+  TensorPool pool;
+  size_t n = PoolExternalData(model, dir, pool, /*hydrate_all=*/true);
+  Check(n == 2, "both tensors sharing one file are pooled");
+  Check(g->initializer(0).raw_data() == first, "tensor 'a' gets its own slice");
+  Check(g->initializer(1).raw_data() == second,
+        "tensor 'b' gets its own (different) slice of the same file");
+
+  std::remove(data_path.c_str());
+}
+
+void TestPoolExternalDataMissingFileThrows() {
+  onnx::ModelProto model;
+  auto* w = model.mutable_graph()->add_initializer();
+  w->set_name("missing");
+  w->set_data_type(onnx::TensorProto::FLOAT);
+  w->add_dims(1);
+  SetExternalData(*w, "does_not_exist_" + std::to_string(::getpid()) + ".data",
+                  0, 4);
+
+  TensorPool pool;
+  bool threw = false;
+  try {
+    PoolExternalData(model, "/tmp", pool, /*hydrate_all=*/true);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "a missing external-data file raises rather than silently "
+               "skipping the tensor");
+}
+
+void TestLoadModelPooled() {
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_load_model_pooled_" + std::to_string(::getpid()) + ".data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string payload = std::string(12, '\x42');
+  WriteFile(data_path, payload);
+
+  onnx::ModelProto model;
+  model.set_ir_version(10);
+  auto* opset = model.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(14);
+  auto* g = model.mutable_graph();
+  g->set_name("TestLoadModelPooled");
+  auto* w = g->add_initializer();
+  w->set_name("w");
+  w->set_data_type(onnx::TensorProto::FLOAT);
+  w->add_dims(3);
+  SetExternalData(*w, data_file, /*offset=*/0, /*length=*/12);
+
+  const std::string model_path =
+      dir + "/onnxsim_load_model_pooled_" + std::to_string(::getpid()) + ".onnx";
+  std::string serialized;
+  model.SerializeToString(&serialized);
+  WriteFile(model_path, serialized);
+
+  onnx::ModelProto loaded;
+  TensorPool pool;
+  size_t n = LoadModelPooled(model_path, &loaded, pool, /*hydrate_all=*/true);
+  Check(n == 1, "the model's one external tensor is pooled");
+  Check(loaded.graph().initializer_size() == 1 &&
+            loaded.graph().initializer(0).name() == "w",
+        "the loaded model has the same graph structure");
+  Check(loaded.graph().initializer(0).raw_data() == payload,
+        "the loaded model's tensor is hydrated with the external file's "
+        "bytes");
+  Check(loaded.graph().initializer(0).data_location() ==
+            onnx::TensorProto::DEFAULT,
+        "hydrate_all=true leaves no EXTERNAL tensors behind");
+
+  std::remove(data_path.c_str());
+  std::remove(model_path.c_str());
+}
+
 void TestAttachContentHashMetadata() {
   onnx::ModelProto model;
   auto* graph = model.mutable_graph();
@@ -352,6 +545,11 @@ int main() {
   TestUnnamedAttributeTensor();
   TestImportModelWithSafetensorsHydrateAll();
   TestImportModelWithSafetensorsLazy();
+  TestPoolExternalDataHydrateAll();
+  TestPoolExternalDataLazy();
+  TestPoolExternalDataSharedFile();
+  TestPoolExternalDataMissingFileThrows();
+  TestLoadModelPooled();
   TestAttachContentHashMetadata();
 
   if (g_failures == 0) {
