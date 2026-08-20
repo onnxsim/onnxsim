@@ -1002,10 +1002,14 @@ def test_load_model_hydrates_external_data():
     # separate classic external-data file -- even though it hydrates that
     # data via onnxsim's memory-mapped TensorPool loader internally instead
     # of ``onnx.load_external_data_for_model``.
-    a = np.random.rand(8, 8).astype(np.float32)
+    # 64x64 (16KiB), like test_simplify_path_with_external_data below --
+    # comfortably over onnx.save's default 1024-byte externalization
+    # threshold, so this tensor actually ends up in model.data rather than
+    # staying inline (which would make the whole test a no-op).
+    a = np.random.rand(64, 64).astype(np.float32)
     initializer = onnx.numpy_helper.from_array(a, "a")
     node = onnx.helper.make_node("Identity", ["a"], ["y"])
-    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (8, 8))
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (64, 64))
     graph_def = onnx.helper.make_graph(
         [node],
         "test_load_model_hydrates_external_data",
