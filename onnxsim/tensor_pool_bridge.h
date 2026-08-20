@@ -248,6 +248,15 @@ inline bool HydrateTensorProto(const std::string& name,
 // how to consume one (see this header's top comment for which onnxsim call
 // sites do not, yet).
 //
+// Hydration, when requested, is a distinct final pass over every tensor this
+// call pooled -- run only after every one of them has been mapped/read into
+// `pool` successfully, never interleaved into the mapping loop itself. That
+// makes this call atomic with respect to `model`: if pooling fails partway
+// (a later tensor's file is missing, say), no earlier tensor has been
+// mutated either -- `model` is left exactly as it was passed in, not a mix
+// of already-hydrated and still-EXTERNAL tensors depending on graph
+// traversal order.
+//
 // A file that fails to memory-map (no mmap support on this platform, or the
 // mmap()/MapViewOfFile() call itself fails -- see TryMmapFile) falls back to
 // an ordinary seek+read for just the tensors that file backs, matching
@@ -264,7 +273,11 @@ inline size_t PoolExternalData(onnx::ModelProto& model,
   // (the common case) share one mapping/read instead of one per tensor.
   std::map<std::string, std::pair<std::shared_ptr<const char[]>, uint64_t>>
       mapped_files;
-  size_t pooled = 0;
+  // Pooled this call, kept alongside each TensorProto* so the hydration pass
+  // below need not re-walk (or re-match by name against) the graph -- same
+  // bookkeeping ExportModelWithSafetensors and
+  // AdoptAllWithPlaceholderOffsets use for their own two-phase sequences.
+  std::vector<std::pair<std::string, onnx::TensorProto*>> pooled_tensors;
 
   detail::ForEachTensor(*model.mutable_graph(), [&](const std::string& name,
                                                     onnx::TensorProto& t) {
@@ -318,14 +331,20 @@ inline size_t PoolExternalData(onnx::ModelProto& model,
       }
       pool.Add(name, t.data_type(), shape, std::move(bytes));
     }
-    ++pooled;
-
-    if (hydrate_all) {
-      HydrateTensorProto(name, t, pool);
-    }
+    pooled_tensors.emplace_back(name, &t);
   });
 
-  return pooled;
+  // Final phase: every tensor above pooled successfully (no throw reached
+  // here otherwise), so it is now safe to hydrate them all -- or, with
+  // hydrate_all=false, to leave every one of them exactly as pooling found
+  // it (still EXTERNAL, no raw_data), never partially mutated.
+  if (hydrate_all) {
+    for (auto& [name, t] : pooled_tensors) {
+      HydrateTensorProto(name, *t, pool);
+    }
+  }
+
+  return pooled_tensors.size();
 }
 
 // Rewrite `model` so every eligible tensor (graph initializers and node-

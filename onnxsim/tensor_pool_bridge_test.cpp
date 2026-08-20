@@ -433,6 +433,50 @@ void TestPoolExternalDataMissingFileThrows() {
         "skipping the tensor");
 }
 
+void TestPoolExternalDataThrowLeavesEarlierTensorsUntouched() {
+  // Regression test for the hydration-is-a-final-pass invariant: a tensor
+  // that pools successfully must not be mutated (hydrated) if a LATER
+  // tensor (in graph traversal order) then fails to pool. Interleaving
+  // mmap/read with hydration per tensor would leave 'ok' hydrated and
+  // 'missing' not, an inconsistent half-mutated model on exception.
+  const std::string dir = "/tmp";
+  const std::string data_file =
+      "onnxsim_pool_ext_" + std::to_string(::getpid()) + "_ok.data";
+  const std::string data_path = dir + "/" + data_file;
+  const std::string payload = std::string(4, '\x09');
+  WriteFile(data_path, payload);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  auto* ok = g->add_initializer();
+  ok->set_name("ok");
+  ok->set_data_type(onnx::TensorProto::FLOAT);
+  ok->add_dims(1);
+  SetExternalData(*ok, data_file, /*offset=*/0, /*length=*/4);
+
+  auto* missing = g->add_initializer();
+  missing->set_name("missing");
+  missing->set_data_type(onnx::TensorProto::FLOAT);
+  missing->add_dims(1);
+  SetExternalData(
+      *missing, "does_not_exist_" + std::to_string(::getpid()) + ".data", 0, 4);
+
+  TensorPool pool;
+  bool threw = false;
+  try {
+    PoolExternalData(model, dir, pool, /*hydrate_all=*/true);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "pooling still fails overall when a later tensor is missing");
+  Check(!g->initializer(0).has_raw_data() &&
+            g->initializer(0).data_location() == onnx::TensorProto::EXTERNAL,
+        "the earlier, successfully-pooled tensor is left untouched -- not "
+        "hydrated -- rather than half-mutated");
+
+  std::remove(data_path.c_str());
+}
+
 void TestLoadModelPooled() {
   const std::string dir = "/tmp";
   const std::string data_file =
@@ -549,6 +593,7 @@ int main() {
   TestPoolExternalDataLazy();
   TestPoolExternalDataSharedFile();
   TestPoolExternalDataMissingFileThrows();
+  TestPoolExternalDataThrowLeavesEarlierTensorsUntouched();
   TestLoadModelPooled();
   TestAttachContentHashMetadata();
 
