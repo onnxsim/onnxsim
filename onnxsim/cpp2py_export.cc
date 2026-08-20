@@ -565,8 +565,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // model instead of a fresh path.
   m.def(
       "hydrate_external_data_pooled",
-      [](const py::bytes& model_bytes, const std::string& base_dir)
-          -> py::bytes {
+      [](const py::bytes& model_bytes,
+         const std::string& base_dir) -> py::bytes {
         onnx::ModelProto model;
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
         onnxsim::tensor_pool::TensorPool pool;

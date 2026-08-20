@@ -368,8 +368,7 @@ void TestPoolExternalDataLazy() {
         "pool holds the bytes even though the tensor itself was not "
         "hydrated");
 
-  bool hydrated =
-      HydrateTensorProto("lazy", *g->mutable_initializer(0), pool);
+  bool hydrated = HydrateTensorProto("lazy", *g->mutable_initializer(0), pool);
   Check(hydrated && g->initializer(0).raw_data() == payload,
         "on-demand HydrateTensorProto recovers the bytes from the pool, no "
         "second file read");
@@ -429,8 +428,9 @@ void TestPoolExternalDataMissingFileThrows() {
   } catch (const std::runtime_error&) {
     threw = true;
   }
-  Check(threw, "a missing external-data file raises rather than silently "
-               "skipping the tensor");
+  Check(threw,
+        "a missing external-data file raises rather than silently "
+        "skipping the tensor");
 }
 
 void TestLoadModelPooled() {
@@ -454,8 +454,8 @@ void TestLoadModelPooled() {
   w->add_dims(3);
   SetExternalData(*w, data_file, /*offset=*/0, /*length=*/12);
 
-  const std::string model_path =
-      dir + "/onnxsim_load_model_pooled_" + std::to_string(::getpid()) + ".onnx";
+  const std::string model_path = dir + "/onnxsim_load_model_pooled_" +
+                                 std::to_string(::getpid()) + ".onnx";
   std::string serialized;
   model.SerializeToString(&serialized);
   WriteFile(model_path, serialized);

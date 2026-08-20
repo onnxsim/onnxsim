@@ -266,69 +266,64 @@ inline size_t PoolExternalData(onnx::ModelProto& model,
       mapped_files;
   size_t pooled = 0;
 
-  detail::ForEachTensor(
-      *model.mutable_graph(), [&](const std::string& name,
-                                  onnx::TensorProto& t) {
-        if (t.data_location() != onnx::TensorProto::EXTERNAL) return;
-        detail::ExternalDataRef ref(t);
-        if (ref.location.empty()) return;  // nothing to pool
+  detail::ForEachTensor(*model.mutable_graph(), [&](const std::string& name,
+                                                    onnx::TensorProto& t) {
+    if (t.data_location() != onnx::TensorProto::EXTERNAL) return;
+    detail::ExternalDataRef ref(t);
+    if (ref.location.empty()) return;  // nothing to pool
 
-        const std::string resolved =
-            (std::filesystem::path(base_dir) / ref.location).string();
+    const std::string resolved =
+        (std::filesystem::path(base_dir) / ref.location).string();
 
-        auto it = mapped_files.find(resolved);
-        if (it == mapped_files.end()) {
-          it = mapped_files.emplace(resolved, TryMmapFile(resolved)).first;
-        }
-        auto& [mapping, file_size] = it->second;
+    auto it = mapped_files.find(resolved);
+    if (it == mapped_files.end()) {
+      it = mapped_files.emplace(resolved, TryMmapFile(resolved)).first;
+    }
+    auto& [mapping, file_size] = it->second;
 
-        std::vector<int64_t> shape(t.dims().begin(), t.dims().end());
+    std::vector<int64_t> shape(t.dims().begin(), t.dims().end());
 
-        if (mapping) {
-          const uint64_t begin =
-              ref.offset >= 0 ? static_cast<uint64_t>(ref.offset) : 0;
-          const uint64_t len = ref.length >= 0
-                                   ? static_cast<uint64_t>(ref.length)
-                                   : file_size - begin;
-          if (begin > file_size || len > file_size - begin) {
-            throw std::runtime_error(
-                "PoolExternalData: '" + resolved + "' tensor '" + name +
-                "' external_data range exceeds the file's size");
-          }
-          std::shared_ptr<const char[]> owner(mapping,
-                                              mapping.get() + begin);
-          pool.Add(name, t.data_type(), shape, std::move(owner),
-                   std::string_view(mapping.get() + begin, len));
-        } else {
-          // No mmap support / mmap failed: fall back to an ordinary
-          // seek+read, matching onnx's own external-data loader
-          // (loadExternalDataForTensor) exactly for just this tensor.
-          std::ifstream in(resolved, std::ios::binary);
-          if (!in) {
-            throw std::runtime_error("PoolExternalData: cannot open '" +
-                                     resolved + "'");
-          }
-          in.seekg(0, std::ios::end);
-          const int64_t full_size = static_cast<int64_t>(in.tellg());
-          const int64_t begin = ref.offset >= 0 ? ref.offset : 0;
-          const int64_t len =
-              ref.length >= 0 ? ref.length : full_size - begin;
-          in.seekg(begin, std::ios::beg);
-          std::string bytes(static_cast<size_t>(len), '\0');
-          in.read(bytes.data(), static_cast<std::streamsize>(len));
-          if (!in) {
-            throw std::runtime_error("PoolExternalData: failed to read '" +
-                                     resolved + "' for tensor '" + name +
-                                     "'");
-          }
-          pool.Add(name, t.data_type(), shape, std::move(bytes));
-        }
-        ++pooled;
+    if (mapping) {
+      const uint64_t begin =
+          ref.offset >= 0 ? static_cast<uint64_t>(ref.offset) : 0;
+      const uint64_t len = ref.length >= 0 ? static_cast<uint64_t>(ref.length)
+                                           : file_size - begin;
+      if (begin > file_size || len > file_size - begin) {
+        throw std::runtime_error(
+            "PoolExternalData: '" + resolved + "' tensor '" + name +
+            "' external_data range exceeds the file's size");
+      }
+      std::shared_ptr<const char[]> owner(mapping, mapping.get() + begin);
+      pool.Add(name, t.data_type(), shape, std::move(owner),
+               std::string_view(mapping.get() + begin, len));
+    } else {
+      // No mmap support / mmap failed: fall back to an ordinary
+      // seek+read, matching onnx's own external-data loader
+      // (loadExternalDataForTensor) exactly for just this tensor.
+      std::ifstream in(resolved, std::ios::binary);
+      if (!in) {
+        throw std::runtime_error("PoolExternalData: cannot open '" + resolved +
+                                 "'");
+      }
+      in.seekg(0, std::ios::end);
+      const int64_t full_size = static_cast<int64_t>(in.tellg());
+      const int64_t begin = ref.offset >= 0 ? ref.offset : 0;
+      const int64_t len = ref.length >= 0 ? ref.length : full_size - begin;
+      in.seekg(begin, std::ios::beg);
+      std::string bytes(static_cast<size_t>(len), '\0');
+      in.read(bytes.data(), static_cast<std::streamsize>(len));
+      if (!in) {
+        throw std::runtime_error("PoolExternalData: failed to read '" +
+                                 resolved + "' for tensor '" + name + "'");
+      }
+      pool.Add(name, t.data_type(), shape, std::move(bytes));
+    }
+    ++pooled;
 
-        if (hydrate_all) {
-          HydrateTensorProto(name, t, pool);
-        }
-      });
+    if (hydrate_all) {
+      HydrateTensorProto(name, t, pool);
+    }
+  });
 
   return pooled;
 }
