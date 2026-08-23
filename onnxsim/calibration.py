@@ -983,3 +983,68 @@ def quantize_qoperator_pool(
         extra_tensor_names=extra_names,
     )
     return onnx.load_from_string(C.quantize_qoperator_pool(model_bytes, ranges))
+
+
+def quantize_qoperator_where(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_calibration_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+) -> onnx.ModelProto:
+    """
+    Statically (calibration-based) quantize every ``Where`` node whose two
+    data operands (the second and third inputs -- the condition is always
+    boolean and never quantized) are both non-constant float32 tensors into
+    ONNX Runtime's "com.microsoft" contrib op ``QLinearWhere`` -- the
+    ternary-select analogue of :func:`quantize_qoperator_elementwise`'s
+    ``QLinearAdd``/``QLinearMul`` rewrite.
+
+    Like :func:`quantize_qoperator_elementwise`, the result is **not**
+    portable standard ONNX -- ``QLinearWhere`` is an ONNX Runtime contrib
+    op, so the quantized model needs a "com.microsoft"-aware runtime to
+    execute -- and every operand needs a calibrated range on top of the
+    node's *output*, since ``QLinearWhere`` computes directly in int8 with
+    no float intermediate (:func:`calibrate` is called with
+    ``extra_tensor_names`` set to
+    ``onnxsim_cpp2py_export.list_qoperator_where_quantizable_tensors``'s
+    result for this reason). A node with a constant operand is left alone --
+    that operand is better quantized from its own static values than
+    force-fed through calibration as if it varied at inference time.
+
+    :param model: onnx ModelProto object or file path
+    :param calibration_data: representative input batches to calibrate
+            operand/output ranges from. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching the model's graph
+            inputs -- see :func:`generate_random_calibration_data` (the
+            default, a quick smoke test) and
+            :func:`load_huggingface_calibration_data` (real data, a much
+            better calibration source for real deployment).
+    :param num_calibration_samples: number of random batches to generate when
+            ``calibration_data`` is not supplied
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run calibration on
+    :param method: calibration range method, passed through to
+            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
+            (KL-divergence calibration; see that function for the tradeoff
+            and its extra data requirement).
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_calibration_samples, seed=seed
+        )
+    model_bytes = model.SerializeToString()
+    extra_names = C.list_qoperator_where_quantizable_tensors(model_bytes)
+    ranges = calibrate(
+        model,
+        calibration_data,
+        providers=providers,
+        method=method,
+        extra_tensor_names=extra_names,
+    )
+    return onnx.load_from_string(C.quantize_qoperator_where(model_bytes, ranges))

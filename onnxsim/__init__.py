@@ -8,6 +8,7 @@ from onnxsim.calibration import (
     quantize_qoperator_elementwise,
     quantize_qoperator_pool,
     quantize_qoperator_softmax,
+    quantize_qoperator_where,
     quantize_static,
     quantize_static_int16,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "quantize_qoperator_concat",
     "quantize_qoperator_softmax",
     "quantize_qoperator_pool",
+    "quantize_qoperator_where",
     "quantize_fp16",
     "quantize_bf16",
     "quantize_fp8",

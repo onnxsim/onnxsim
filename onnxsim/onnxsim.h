@@ -578,6 +578,42 @@ onnx::ModelProto QuantizeQOperatorPool(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Lists the tensor names ``QuantizeQOperatorWhere`` could quantize in
+// ``model``: for every ``Where`` node whose two data operands (inputs 1
+// and 2) are both non-constant float32 tensors, the operands' names plus
+// the node's own output name (three entries per qualifying node), mirroring
+// ``ListQOperatorElementwiseQuantizableTensors``'s convention (no "weight"
+// role to distinguish, since neither operand is pre-quantized from its own
+// static values).
+std::vector<std::string> ListQOperatorWhereQuantizableTensors(
+    const onnx::ModelProto& model);
+
+// Statically (calibration-based) quantizes every ``Where`` node whose two
+// data operands are both non-constant float32 tensors, and whose two
+// operand names *and* whose own output name are all keys of
+// ``activation_ranges``, into ONNX Runtime's "com.microsoft" contrib op
+// ``QLinearWhere`` -- the ternary-select analogue of
+// ``QuantizeQOperatorElementwise``'s ``QLinearAdd``/``QLinearMul`` rewrite
+// (see that function's doc comment for why these are contrib, not
+// standard, ONNX ops, and why every operand needs a calibrated range on top
+// of the output's). The boolean condition operand is never quantized --
+// ``QLinearWhere``'s schema passes it straight through as `tensor(bool)`.
+// This function adds "com.microsoft" (version 1) to the model's opset
+// imports the first time it rewrites a node. See
+// ``ListQOperatorWhereQuantizableTensors`` to discover which tensors to
+// calibrate, and ``passes/qoperator_quantize_where.h`` for the rewrite
+// itself and its doc comment on why a constant operand is left alone.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass -- it applies exactly this rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match, or whose operands/output have no entry in
+// ``activation_ranges``, are left as-is.
+onnx::ModelProto QuantizeQOperatorWhere(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
 // other ``Quantize*`` function here: float16 is still a floating-point

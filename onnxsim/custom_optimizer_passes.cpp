@@ -31,6 +31,7 @@
 #include "passes/qoperator_quantize_matmul.h"
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
+#include "passes/qoperator_quantize_where.h"
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
@@ -97,6 +98,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QOperatorQuantizeMatMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizePool>(registry);
     RegisterOrReplace<p::QOperatorQuantizeSoftmax>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeWhere>(registry);
     RegisterOrReplace<p::QuantizeBf16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);

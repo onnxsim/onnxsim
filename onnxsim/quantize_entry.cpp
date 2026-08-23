@@ -12,6 +12,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
+#include "passes/qoperator_quantize_where.h"
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_conv_common.h"
 #include "passes/quantize_fp16.h"
@@ -539,6 +540,64 @@ onnx::ModelProto QuantizeQOperatorPool(
       activation_ranges;
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"qoperator_quantize_pool"});
+}
+
+std::vector<std::string> ListQOperatorWhereQuantizableTensors(
+    const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+  if (g.get() == nullptr) {
+    return {};
+  }
+  std::vector<std::string> names;
+  std::unordered_set<std::string> seen;
+  auto add_name = [&](const std::string& name) {
+    if (seen.insert(name).second) {
+      names.push_back(name);
+    }
+  };
+  for (auto* node : g->nodes()) {
+    if (node->kind() != onnx::Symbol("Where")) {
+      continue;
+    }
+    if (node->inputs().size() != 3) {
+      continue;
+    }
+    onnx::Value* x = node->inputs()[1];
+    onnx::Value* y = node->inputs()[2];
+    if (x->elemType() != onnx::TensorProto_DataType_FLOAT ||
+        y->elemType() != onnx::TensorProto_DataType_FLOAT) {
+      continue;
+    }
+    if (onnx::optimization::FetchConstantTensor(x) != nullptr ||
+        onnx::optimization::FetchConstantTensor(y) != nullptr) {
+      continue;
+    }
+    add_name(x->uniqueName());
+    add_name(y->uniqueName());
+    add_name(node->output()->uniqueName());
+  }
+  return names;
+}
+
+onnx::ModelProto QuantizeQOperatorWhere(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges) {
+  PrepareSchemasForDebug(model);
+  // Registers qoperator_quantize_where (idempotent) into onnxoptimizer's
+  // registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // qoperator_quantize_where reads the same calibration-ranges global every
+  // other static/QOperator pass does (see
+  // StaticQuantizationCalibrationRanges's doc comment) -- keyed by tensor
+  // name, both operands' and the output's, so sharing the map is safe as
+  // long as only one Quantize* entry point runs per call, which
+  // OptimizeFixed's single pass-name list here ensures.
+  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
+      activation_ranges;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"qoperator_quantize_where"});
 }
 
 onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,

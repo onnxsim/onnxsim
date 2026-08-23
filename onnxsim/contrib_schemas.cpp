@@ -191,6 +191,25 @@ void QLinearGlobalAveragePoolShapeInference(InferenceContext& ctx) {
   }
 }
 
+// Shape/type inference for QLinearWhere. Inputs are laid out as
+//   condition, X, x_scale, x_zero_point, Y, y_scale, y_zero_point,
+//   z_scale, z_zero_point
+// so the output's element type follows X (input 1) and its shape is the
+// 3-way broadcast of condition (0), X (1), and Y (4) -- exactly mirroring
+// ONNX Runtime's own QLinearWhere inference function.
+void QLinearWhereShapeInference(InferenceContext& ctx) {
+  onnx::propagateElemTypeFromInputToOutput(ctx, 1, 0);
+  if (!onnx::hasNInputShapes(ctx, 9)) {
+    return;
+  }
+  std::vector<const onnx::TensorShapeProto*> shapes;
+  shapes.push_back(&ctx.getInputType(0)->tensor_type().shape());
+  shapes.push_back(&ctx.getInputType(1)->tensor_type().shape());
+  shapes.push_back(&ctx.getInputType(4)->tensor_type().shape());
+  onnx::multidirectionalBroadcastShapeInference(
+      shapes, *ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape());
+}
+
 // Registers `schema` unless an equivalent schema is already known. Duplicate
 // registration is turned into a no-op instead of an error so the function stays
 // safe to run alongside a build that already provides these schemas.
@@ -416,6 +435,41 @@ OpSchema MakeQLinearGlobalAveragePoolSchema() {
       .TypeAndShapeInferenceFunction(QLinearGlobalAveragePoolShapeInference);
 }
 
+// Same layout ONNX Runtime itself registers for "com.microsoft"
+// QLinearWhere: unlike every other schema in this file, every input is
+// required (no OpSchema::Optional anywhere) -- ONNX Runtime's own doc
+// strings for a couple of these inputs are copy-paste typos ("X" is
+// documented as "Y's zero point.", verbatim, in ORT's own source); this
+// registration keeps the exact same names/types/order but writes correct
+// descriptions.
+OpSchema MakeQLinearWhereSchema() {
+  return OpSchema()
+      .SetName("QLinearWhere")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc("Return elements, either from X or Y, depending on condition.")
+      .Input(0, "condition", "When True (nonzero), yield X, otherwise yield Y.",
+             "B")
+      .Input(1, "X", "First quantized operand.", "T")
+      .Input(2, "x_scale", "Scale of X.", "TF")
+      .Input(3, "x_zero_point", "Zero point of X.", "T")
+      .Input(4, "Y", "Second quantized operand.", "T")
+      .Input(5, "y_scale", "Scale of Y.", "TF")
+      .Input(6, "y_zero_point", "Zero point of Y.", "T")
+      .Input(7, "z_scale", "Scale of the output Z.", "TF")
+      .Input(8, "z_zero_point", "Zero point of the output Z.", "T")
+      .Output(0, "Z",
+              "Tensor of shape equal to the broadcasted shape of "
+              "condition, X, and Y.",
+              "T")
+      .TypeConstraint("B", {"tensor(bool)"}, "Constrain condition to bool.")
+      .TypeConstraint("TF", {"tensor(float)"}, "Constrain scales to float.")
+      .TypeConstraint("T", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain input and output to 8-bit integer "
+                      "tensors.")
+      .TypeAndShapeInferenceFunction(QLinearWhereShapeInference);
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -435,6 +489,7 @@ void RegisterAll() {
   RegisterIfAbsent(MakeQLinearSoftmaxSchema());
   RegisterIfAbsent(MakeQLinearAveragePoolSchema());
   RegisterIfAbsent(MakeQLinearGlobalAveragePoolSchema());
+  RegisterIfAbsent(MakeQLinearWhereSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.

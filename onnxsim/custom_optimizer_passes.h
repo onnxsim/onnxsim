@@ -46,6 +46,7 @@ namespace onnxsim {
 //   - qoperator_quantize_concat
 //   - qoperator_quantize_softmax
 //   - qoperator_quantize_pool
+//   - qoperator_quantize_where
 //   - quantize_fp16
 //   - quantize_bf16
 //   - quantize_fp8
