@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -405,6 +406,95 @@ void TestRejectsUnrepresentableDtype() {
   Check(threw, "saving a dtype with no raw ggml_type throws");
 }
 
+void TestKQuantRoundTripAndDecode() {
+  // A Q8_0 block: d = 2.0 (fp16 0x4000 -- sign 0, biased exponent 16, zero
+  // mantissa), qs[i] = i - 16 -- same vector ggml_kquant_test.cpp
+  // hand-verifies, reused here to check TensorPool's own plumbing (pooling,
+  // SaveGGUF/LoadGGUF byte-exact round trip, DequantizeToFloat), not the
+  // decode math itself.
+  const uint16_t d_bits = 0x4000;
+  std::string block(34, '\0');
+  block[0] = static_cast<char>(d_bits & 0xFF);
+  block[1] = static_cast<char>((d_bits >> 8) & 0xFF);
+  for (int i = 0; i < 32; ++i) {
+    block[2 + i] = static_cast<char>(static_cast<int8_t>(i - 16));
+  }
+
+  TensorPool pool;
+  pool.Add("w", ONNXSIM_GGML_Q8_0, {32}, std::string(block));
+
+  std::string path = TempPath("_kquant.gguf");
+  pool.SaveGGUF(path);
+
+  TensorPool loaded;
+  auto skipped = loaded.LoadGGUF(path);
+  Check(skipped.empty(), "K-quant tensor is not skipped");
+  const Entry* w = loaded.Find("w");
+  Check(w != nullptr, "K-quant tensor is present");
+  if (w != nullptr) {
+    Check(w->dtype == ONNXSIM_GGML_Q8_0, "K-quant dtype round-trips");
+    Check(w->shape == std::vector<int64_t>({32}), "K-quant shape round-trips");
+    Check(w->data == block, "K-quant native block bytes round-trip bit-exact");
+
+    std::vector<float> decoded;
+    Check(loaded.DequantizeToFloat("w", &decoded),
+          "DequantizeToFloat succeeds for a K-quant entry");
+    Check(decoded.size() == 32, "DequantizeToFloat output size");
+    bool values_ok = decoded.size() == 32;
+    for (size_t i = 0; values_ok && i < 32; ++i) {
+      values_ok =
+          std::fabs(decoded[i] - static_cast<float>(static_cast<int>(i) - 16) *
+                                     2.0f) < 1e-4f;
+    }
+    Check(values_ok, "DequantizeToFloat decodes to (i - 16) * 2.0");
+  }
+
+  // DequantizeToFloat is specifically for K-quant entries -- false (not a
+  // silent raw copy) for an ordinary raw-dtype one.
+  std::vector<float> not_kquant;
+  pool.Add("raw", ONNX_FLOAT, {1}, std::string(4, '\0'));
+  Check(!pool.DequantizeToFloat("raw", &not_kquant),
+        "DequantizeToFloat rejects a raw-dtype entry");
+  Check(!loaded.DequantizeToFloat("missing", &not_kquant),
+        "DequantizeToFloat rejects a name not in the pool");
+
+  std::remove(path.c_str());
+}
+
+void TestLoadGGUFRejectsMisalignedKQuantTensor() {
+  // A Q8_0 tensor whose element count (5) is not a multiple of its block
+  // size (32) -- malformed; must throw rather than silently truncate or
+  // misread the following tensor's bytes.
+  std::string path = TempPath("_kquant_misaligned.gguf");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    auto write_string = [&](const std::string& s) {
+      WriteLE<uint64_t>(out, s.size());
+      out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    };
+    WriteLE<uint32_t>(out, kMagic);
+    WriteLE<uint32_t>(out, kSupportedVersion);
+    WriteLE<uint64_t>(out, 1);  // tensor_count
+    WriteLE<uint64_t>(out, 0);  // metadata_kv_count
+
+    write_string("bad");
+    WriteLE<uint32_t>(out, 1);
+    WriteLE<uint64_t>(out, 5);  // ne[0] -- not a multiple of 32
+    WriteLE<uint32_t>(out, GGML_TYPE_Q8_0);
+    WriteLE<uint64_t>(out, 0);  // offset
+  }
+
+  TensorPool pool;
+  bool threw = false;
+  try {
+    pool.LoadGGUF(path);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "loading a non-block-aligned K-quant tensor throws");
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -418,6 +508,8 @@ int main() {
   TestLoadGGUFMmapSkipsUnsupportedDtype();
   TestLoadGGUFMmapRejectsBadMagic();
   TestLoadGGUFMmapMissingFileFallsBackAndThrows();
+  TestKQuantRoundTripAndDecode();
+  TestLoadGGUFRejectsMisalignedKQuantTensor();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_gguf_test: all checks passed\n");

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -316,6 +317,74 @@ void TestImportModelWithGGUFSkipsQuantized() {
   std::remove(path.c_str());
 }
 
+// Hand-builds a GGUF file with one Q8_0 tensor (d = 2.0, qs[i] = i - 16 --
+// the same hand-verified vector ggml_kquant_test.cpp/tensor_pool_gguf_test.cpp
+// use), imported against a model whose matching initializer is declared as
+// INT32 -- deliberately the WRONG dtype, to confirm HydrateTensorProtoFromGGUF
+// forces it to FLOAT (the only meaningful type for a dequantized result)
+// rather than leaving whatever the caller's graph happened to declare.
+void TestImportModelWithGGUFDecodesKQuant() {
+  std::string path = TempPath("_kquant_import.gguf");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    auto write_string = [&](const std::string& s) {
+      WriteLE<uint64_t>(out, s.size());
+      out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    };
+    WriteLE<uint32_t>(out, kMagic);
+    WriteLE<uint32_t>(out, kSupportedVersion);
+    WriteLE<uint64_t>(out, 1);  // tensor_count
+    WriteLE<uint64_t>(out, 0);  // metadata_kv_count
+
+    write_string("w");
+    WriteLE<uint32_t>(out, 1);
+    WriteLE<uint64_t>(out, 32);  // ne[0]
+    WriteLE<uint32_t>(out, GGML_TYPE_Q8_0);
+    WriteLE<uint64_t>(out, 0);  // offset
+
+    uint64_t header_end = static_cast<uint64_t>(out.tellp());
+    uint64_t data_start = (header_end + kDefaultAlignment - 1) /
+                          kDefaultAlignment * kDefaultAlignment;
+    for (uint64_t i = header_end; i < data_start; ++i) out.put('\0');
+    WriteLE<uint16_t>(out, 0x4000);  // d = 2.0 (fp16)
+    for (int i = 0; i < 32; ++i) {
+      out.put(static_cast<char>(static_cast<int8_t>(i - 16)));  // qs[i]
+    }
+  }
+
+  onnx::ModelProto model;
+  auto* w = model.mutable_graph()->add_initializer();
+  w->set_name("w");
+  w->set_data_type(onnx::TensorProto::INT32);  // deliberately wrong
+  w->add_dims(32);
+
+  TensorPool pool;
+  std::vector<std::string> skipped;
+  size_t matched = ImportModelWithGGUF(model, path, pool, true, &skipped);
+  Check(matched == 1, "the K-quant tensor is matched");
+  Check(skipped.empty(), "nothing skipped -- Q8_0 is a supported K-quant type");
+
+  const auto& hydrated = model.graph().initializer(0);
+  Check(hydrated.data_type() == onnx::TensorProto::FLOAT,
+        "K-quant hydration forces data_type to FLOAT, overriding the "
+        "caller's (wrong) declared INT32");
+  Check(hydrated.has_raw_data() &&
+            hydrated.raw_data().size() == 32 * sizeof(float),
+        "hydrated raw_data is 32 float32 values");
+  bool values_ok = hydrated.raw_data().size() == 32 * sizeof(float);
+  if (values_ok) {
+    float floats[32];
+    std::memcpy(floats, hydrated.raw_data().data(), sizeof(floats));
+    for (int i = 0; i < 32 && values_ok; ++i) {
+      float want = static_cast<float>(i - 16) * 2.0f;
+      values_ok = std::fabs(floats[i] - want) < 1e-4f;
+    }
+  }
+  Check(values_ok, "hydrated values decode to (i - 16) * 2.0");
+
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -324,6 +393,7 @@ int main() {
   TestImportModelWithGGUFHydrateAll();
   TestImportModelWithGGUFLazy();
   TestImportModelWithGGUFSkipsQuantized();
+  TestImportModelWithGGUFDecodesKQuant();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_gguf_bridge_test: all checks passed\n");

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <streambuf>
 
+#include "ggml_kquant.h"
 #include "gguf_dtype.h"
 #include "mmap_file.h"
 #include "tensor_pool.h"
@@ -423,10 +424,17 @@ std::vector<std::string> TensorPool::LoadGGUF(const std::string& path) {
       skipped.push_back(info.name);
       continue;
     }
-    size_t elem_size = gguf::ElementSize(info.ggml_type);
     uint64_t nelems = 1;
     for (uint64_t d : info.ne) nelems *= d;
-    uint64_t nbytes = nelems * elem_size;
+    uint64_t nbytes;
+    if (!gguf::TryTotalBytes(info.ggml_type, nelems, &nbytes)) {
+      // A K-quant tensor whose element count isn't block-aligned -- a
+      // malformed/truncated file, since GGML itself requires block
+      // alignment for every real tensor of this type.
+      FailRead(path, "tensor '" + info.name +
+                         "' element count is not a multiple of its "
+                         "quantization block size");
+    }
     uint64_t abs_offset = data_section_start + info.offset;
     if (abs_offset > file_size || nbytes > file_size - abs_offset) {
       FailRead(path, "tensor '" + info.name +
@@ -523,10 +531,14 @@ std::vector<std::string> TensorPool::LoadGGUFMmap(const std::string& path) {
       skipped.push_back(info.name);
       continue;
     }
-    size_t elem_size = gguf::ElementSize(info.ggml_type);
     uint64_t nelems = 1;
     for (uint64_t d : info.ne) nelems *= d;
-    uint64_t nbytes = nelems * elem_size;
+    uint64_t nbytes;
+    if (!gguf::TryTotalBytes(info.ggml_type, nelems, &nbytes)) {
+      FailRead(path, "tensor '" + info.name +
+                         "' element count is not a multiple of its "
+                         "quantization block size");
+    }
     uint64_t abs_offset = data_section_start + info.offset;
     if (abs_offset > file_size || nbytes > file_size - abs_offset) {
       FailRead(path, "tensor '" + info.name +
@@ -543,6 +555,23 @@ std::vector<std::string> TensorPool::LoadGGUFMmap(const std::string& path) {
     Add(info.name, onnx_dtype, std::move(shape), std::move(owner), data);
   }
   return skipped;
+}
+
+bool TensorPool::DequantizeToFloat(const std::string& name,
+                                   std::vector<float>* out) const {
+  const Entry* entry = Find(name);
+  if (entry == nullptr) {
+    return false;
+  }
+  uint32_t ggml_type;
+  if (!FromOnnx(entry->dtype, &ggml_type) || !IsKQuant(ggml_type)) {
+    return false;
+  }
+  int64_t numel = 1;
+  for (int64_t d : entry->shape) numel *= d;
+  return DequantizeGgmlKQuant(
+      reinterpret_cast<const uint8_t*>(entry->data.data()), entry->data.size(),
+      ggml_type, numel, out);
 }
 
 }  // namespace tensor_pool

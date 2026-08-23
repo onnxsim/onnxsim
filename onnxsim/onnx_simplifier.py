@@ -375,6 +375,47 @@ def import_gguf(in_path: str) -> onnx.ModelProto:
     return model
 
 
+def import_gguf_weights(
+    model: Union[str, onnx.ModelProto], gguf_path: str
+) -> Tuple[onnx.ModelProto, List[str]]:
+    """
+    Hydrate ``model``'s initializers, by name, from ``gguf_path`` -- unlike
+    :func:`import_gguf`, this works on any GGUF file, including a plain
+    third-party weights-only checkpoint (e.g. a Hugging Face GGUF export)
+    with no embedded onnxsim model: bring your own graph (e.g. exported by
+    another tool for the same architecture) with initializers named to
+    match the checkpoint's own tensor names, and this fills in their
+    values.
+
+    A K-quant tensor (``Q4_K``/``Q5_K``/``Q6_K``/``Q8_0`` -- the block
+    format most real quantized checkpoints, e.g. Unsloth's GGUF exports,
+    actually use for the bulk of their weights) is dequantized to float32
+    in the process; every other quantized GGML format (the legacy ``Q4_0``
+    family, every ``IQ*`` variant, ...) has no decoder here and is skipped
+    -- see the second return value.
+
+    :param model: onnx ModelProto object or file path -- the graph to
+            hydrate. Its initializers' own declared dtype/shape are left
+            alone except for a matched K-quant tensor, whose data_type is
+            forced to FLOAT (the only meaningful type for a dequantized
+            result) regardless of what the initializer previously declared.
+    :param gguf_path: path to the GGUF file to pull weight values from
+    :returns: ``(model, skipped)`` -- the hydrated model, and the names of
+            GGUF tensors present in the file but skipped because their
+            quantized format has no decoder here (the legacy ``Q4_0``
+            family, every ``IQ*`` variant, ...). A GGUF tensor with no
+            matching initializer name in ``model`` is simply not brought
+            in -- it does NOT appear in ``skipped``, which reports only
+            unsupported *formats*, not name mismatches.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    model_bytes, skipped = C.import_gguf_weights(model.SerializeToString(), gguf_path)
+    result = onnx.ModelProto()
+    result.ParseFromString(model_bytes)
+    return result, skipped
+
+
 def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
     Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,

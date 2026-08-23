@@ -541,6 +541,12 @@ if (ONNXSIM_TESTS)
   target_include_directories(gguf_dtype_test PRIVATE onnxsim)
   add_test(NAME gguf_dtype_test COMMAND gguf_dtype_test)
 
+  # GGML K-quant dequantization (ggml_kquant.h) depends only on gguf_dtype.h,
+  # so it too builds and runs standalone -- mirroring gguf_dtype_test.cpp.
+  add_executable(ggml_kquant_test onnxsim/ggml_kquant_test.cpp)
+  target_include_directories(ggml_kquant_test PRIVATE onnxsim)
+  add_test(NAME ggml_kquant_test COMMAND ggml_kquant_test)
+
   # TensorPool's GGUF read/write (tensor_pool_gguf.cpp) depends only on
   # tensor_pool.{h,cpp} and gguf_dtype.h, so it too builds and runs
   # standalone without ONNX / ONNX Runtime configured.

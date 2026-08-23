@@ -982,4 +982,32 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "in_path"_a);
+
+  // Hydrates `model`'s initializers, by name, from any GGUF file --
+  // including a plain third-party weights-only checkpoint with no embedded
+  // onnxsim model (unlike import_gguf, which requires one). A K-quant
+  // tensor (Q4_K/Q5_K/Q6_K/Q8_0 -- what most real quantized checkpoints,
+  // e.g. Unsloth's GGUF exports, actually use for the bulk of their
+  // weights) is decoded to float32; see
+  // ImportModelWithGGUF/HydrateTensorProtoFromGGUF in
+  // tensor_pool_gguf_bridge.h. Returns (updated model bytes, names of GGUF
+  // tensors present in the file but skipped because their ggml_type has no
+  // representation TensorPool can hold at all, e.g. a legacy Q4_0 or IQ*-
+  // family tensor -- NOT tensors simply absent from `model`'s
+  // initializers, which this silently leaves alone rather than reporting).
+  m.def(
+      "import_gguf_weights",
+      [](const py::bytes& model_bytes, const std::string& gguf_path)
+          -> std::tuple<py::bytes, std::vector<std::string>> {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        std::vector<std::string> skipped;
+        onnxsim::tensor_pool::ImportModelWithGGUF(model, gguf_path, pool,
+                                                  /*hydrate_all=*/true,
+                                                  &skipped);
+        const std::string out = model.SerializeAsString();
+        return {py::bytes(out.data(), out.size()), std::move(skipped)};
+      },
+      "model_bytes"_a, "gguf_path"_a);
 }
