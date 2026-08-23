@@ -22,6 +22,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "dlpack_dtype.h"
 #include "gguf_dtype.h"
 
 using namespace onnxsim::tensor_pool;
@@ -373,8 +374,20 @@ void TestImportModelWithGGUFDecodesKQuant() {
         "hydrated raw_data is 32 float32 values");
   bool values_ok = hydrated.raw_data().size() == 32 * sizeof(float);
   if (values_ok) {
+    // raw_data is always little-endian on the wire (see tensor_pool.h's file
+    // comment) -- swap back to host order before interpreting as float,
+    // exactly the ReadRawDataHostOrder pattern passes/endian_read.h uses.
+    // Skipping this on a little-endian host is a silent no-op (LE already
+    // equals host order there), which is exactly why this needs a
+    // big-endian run (see docs/big-endian.md) to catch if it's wrong.
+    std::string bytes = hydrated.raw_data();
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(
+          reinterpret_cast<uint8_t*>(bytes.data()), bytes.size(),
+          sizeof(float));
+    }
     float floats[32];
-    std::memcpy(floats, hydrated.raw_data().data(), sizeof(floats));
+    std::memcpy(floats, bytes.data(), sizeof(floats));
     for (int i = 0; i < 32 && values_ok; ++i) {
       float want = static_cast<float>(i - 16) * 2.0f;
       values_ok = std::fabs(floats[i] - want) < 1e-4f;

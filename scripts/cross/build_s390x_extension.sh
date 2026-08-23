@@ -205,16 +205,20 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # gguf_dtype_test/tensor_pool_gguf_test (GGUF) are likewise dependency-free
 # (each format's own byte-order handling; see tensor_pool.h's "Byte order"
 # note and tensor_pool_gguf.cpp's mirror of it) and belong in this list for
-# the same reason. tensor_pool_hash_test (TensorPool::ContentHash's BLAKE3 /
-# SHA-256 backends) is dependency-free too and belongs here for the same
-# reason -- CMake still registers it as a ctest target even if it's left off
-# this list, so omitting it here doesn't skip the test, it makes ctest try to
-# exec a binary that was never built: an instant, silent "Failed 0.00 sec"
-# with no output, indistinguishable at a glance from a real crash.
+# the same reason. ggml_kquant_test (the GGML K-quant dequantization
+# ggml_kquant.h implements -- decoded values are real numeric output, not
+# just copied bytes, so this is exactly the kind of logic a big-endian run
+# needs to check) is dependency-free too, for the same reason.
+# tensor_pool_hash_test (TensorPool::ContentHash's BLAKE3 / SHA-256
+# backends) is dependency-free too and belongs here for the same reason --
+# CMake still registers each of these as a ctest target even if left off
+# this list, so omitting one here doesn't skip its test, it makes ctest try
+# to exec a binary that was never built: an instant, silent "Failed 0.00
+# sec" with no output, indistinguishable at a glance from a real crash.
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
-  gguf_dtype_test tensor_pool_gguf_test -j "${JOBS}"
+  gguf_dtype_test ggml_kquant_test tensor_pool_gguf_test -j "${JOBS}"
 # tensor_pool_bridge_test, tensor_pool_gguf_bridge_test, and
 # tensor_pool_archive_test are NOT dependency-free (they exercise the
 # onnx::TensorProto <-> TensorPool bridges), but the onnx/onnx-optimizer
