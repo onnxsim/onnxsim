@@ -1048,3 +1048,81 @@ def quantize_qoperator_where(
         extra_tensor_names=extra_names,
     )
     return onnx.load_from_string(C.quantize_qoperator_where(model_bytes, ranges))
+
+
+def quantize_qoperator_gemm(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_calibration_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+) -> onnx.ModelProto:
+    """
+    Statically (calibration-based) quantize every ``Gemm`` node whose weight
+    ``B`` is a constant 2-D float32 tensor into ONNX Runtime's
+    "com.microsoft" contrib op ``QGemm`` -- the fully-general analogue of
+    :func:`quantize_qoperator`'s ``QLinearMatMul`` rewrite, which only
+    handles "vanilla" Gemm (``transA=0``, ``alpha=1``) because
+    ``QLinearMatMul`` has no transpose/scale attributes of its own.
+    ``QGemm`` keeps ``transA``/``transB``/``alpha`` as attributes, so this
+    function handles any ``transA``, ``transB``, or ``alpha`` value
+    :func:`quantize_qoperator` cannot.
+
+    ``B`` is quantized per output channel (INT8, symmetric) in its own
+    storage layout -- no forced transpose, since ``QGemm`` keeps ``transB``
+    as its own attribute. A bias ``C``, when present, is quantized ahead of
+    time into INT32 with zero point 0 and a per-column scale of
+    ``alpha * a_scale * b_scale[n]`` (``QGemm``'s own documented bias
+    convention) and accumulated directly in the quantized compute -- unlike
+    :func:`quantize_qoperator`'s vanilla-Gemm handling, which adds the bias
+    back in float *after* dequantizing. Only a 1-D ``C`` of exactly ``N``
+    elements (the common per-column-bias case) with ``beta == 1`` is
+    handled; any other ``C`` shape or a non-default ``beta`` is left alone,
+    since ``QGemm`` has no ``beta`` attribute of its own to carry a
+    different value through.
+
+    Like :func:`quantize_qoperator_elementwise`, the result is **not**
+    portable standard ONNX -- ``QGemm`` is an ONNX Runtime contrib op, so
+    the quantized model needs a "com.microsoft"-aware runtime to execute --
+    and needs a calibrated range for the node's *output* on top of the
+    activation's, since it computes directly in int8 with no float
+    intermediate (:func:`calibrate` is called with ``extra_tensor_names``
+    set to ``onnxsim_cpp2py_export.list_qoperator_gemm_quantizable_tensors``'s
+    result for this reason).
+
+    :param model: onnx ModelProto object or file path
+    :param calibration_data: representative input batches to calibrate
+            activation/output ranges from. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching the model's graph
+            inputs -- see :func:`generate_random_calibration_data` (the
+            default, a quick smoke test) and
+            :func:`load_huggingface_calibration_data` (real data, a much
+            better calibration source for real deployment).
+    :param num_calibration_samples: number of random batches to generate when
+            ``calibration_data`` is not supplied
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run calibration on
+    :param method: calibration range method, passed through to
+            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
+            (KL-divergence calibration; see that function for the tradeoff
+            and its extra data requirement).
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_calibration_samples, seed=seed
+        )
+    model_bytes = model.SerializeToString()
+    extra_names = C.list_qoperator_gemm_quantizable_tensors(model_bytes)
+    ranges = calibrate(
+        model,
+        calibration_data,
+        providers=providers,
+        method=method,
+        extra_tensor_names=extra_names,
+    )
+    return onnx.load_from_string(C.quantize_qoperator_gemm(model_bytes, ranges))

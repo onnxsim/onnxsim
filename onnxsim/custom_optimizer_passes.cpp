@@ -28,6 +28,7 @@
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
 #include "passes/qoperator_quantize_elementwise.h"
+#include "passes/qoperator_quantize_gemm.h"
 #include "passes/qoperator_quantize_matmul.h"
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
@@ -95,6 +96,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
     RegisterOrReplace<p::QOperatorQuantizeElementwise>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeGemm>(registry);
     RegisterOrReplace<p::QOperatorQuantizeMatMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizePool>(registry);
     RegisterOrReplace<p::QOperatorQuantizeSoftmax>(registry);

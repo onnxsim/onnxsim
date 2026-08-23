@@ -614,6 +614,49 @@ onnx::ModelProto QuantizeQOperatorWhere(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Lists the tensor names ``QuantizeQOperatorGemm`` could quantize in
+// ``model``: for every ``Gemm`` node whose weight B is a constant 2-D
+// float32 tensor (and, if present, whose bias C is a constant 1-D float32
+// tensor of length N with beta == 1), the activation A's name plus the
+// node's own output name (two entries per qualifying node -- B and C are
+// quantized from their own static values, not calibrated, the same
+// "weight" role ``ListQuantizableActivations`` already treats Gemm/MatMul's
+// weight as elsewhere).
+std::vector<std::string> ListQOperatorGemmQuantizableTensors(
+    const onnx::ModelProto& model);
+
+// Statically (calibration-based) quantizes every ``Gemm`` node whose weight
+// B is a constant 2-D float32 tensor, whose bias C (if present) is a
+// constant 1-D float32 tensor of length N with beta == 1, and whose
+// activation A's name *and* whose own output name are both keys of
+// ``activation_ranges``, into ONNX Runtime's "com.microsoft" contrib op
+// ``QGemm`` -- the fully-general analogue of ``QuantizeQOperator``'s
+// ``QLinearMatMul`` rewrite, which only handles "vanilla" Gemm (transA=0,
+// alpha=1) because ``QLinearMatMul`` has no transpose/scale attributes of
+// its own. ``QGemm`` keeps ``transA``/``transB``/``alpha`` as attributes,
+// so this function handles any transA, transB, or alpha value
+// ``QuantizeQOperator`` cannot. B is quantized per output channel (INT8,
+// symmetric) in its own storage layout (no forced transpose); C, when
+// present, is quantized into INT32 with zero_point 0 and a per-column
+// scale of ``alpha * a_scale * b_scale[n]`` -- QGemm's own documented bias
+// convention -- and accumulated directly in the quantized compute, unlike
+// ``QuantizeQOperator``'s vanilla-Gemm handling, which adds the bias back
+// in float after dequantizing. This function adds "com.microsoft" (version
+// 1) to the model's opset imports the first time it rewrites a node. See
+// ``ListQOperatorGemmQuantizableTensors`` to discover which tensors to
+// calibrate, and ``passes/qoperator_quantize_gemm.h`` for the rewrite
+// itself and its doc comment on the scope of C shapes/beta values handled.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass -- it applies exactly this rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match, or whose activation/output have no entry in
+// ``activation_ranges``, are left as-is.
+onnx::ModelProto QuantizeQOperatorGemm(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
 // other ``Quantize*`` function here: float16 is still a floating-point

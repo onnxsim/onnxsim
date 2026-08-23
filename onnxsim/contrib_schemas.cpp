@@ -210,6 +210,45 @@ void QLinearWhereShapeInference(InferenceContext& ctx) {
       shapes, *ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape());
 }
 
+// Shape/type inference for QGemm. The output's element type follows
+// `y_zero_point` (input 8) when present -- meaning the output is itself
+// quantized -- else it is plain float32 (QGemm's schema allows an
+// unquantized float output when `y_scale`/`y_zero_point` are omitted; this
+// onnxsim pass never omits them, always producing the quantized-output
+// form, but the schema itself supports both). The output shape is the
+// standard Gemm (M, N) computed from A's and B's 2-D shapes and the
+// transA/transB attributes.
+void QGemmShapeInference(InferenceContext& ctx) {
+  if (ctx.getNumInputs() == 9 && ctx.getInputType(8) != nullptr) {
+    onnx::propagateElemTypeFromInputToOutput(ctx, 8, 0);
+  } else {
+    onnx::updateOutputElemType(ctx, 0, onnx::TensorProto::FLOAT);
+  }
+  if (!onnx::hasInputShape(ctx, 0) || !onnx::hasInputShape(ctx, 3)) {
+    return;
+  }
+  const auto& a_shape = ctx.getInputType(0)->tensor_type().shape();
+  const auto& b_shape = ctx.getInputType(3)->tensor_type().shape();
+  if (a_shape.dim_size() != 2 || b_shape.dim_size() != 2) {
+    return;
+  }
+  int64_t trans_a = 0;
+  const auto* trans_a_attr = ctx.getAttribute("transA");
+  if (trans_a_attr != nullptr && trans_a_attr->has_i()) {
+    trans_a = trans_a_attr->i();
+  }
+  int64_t trans_b = 0;
+  const auto* trans_b_attr = ctx.getAttribute("transB");
+  if (trans_b_attr != nullptr && trans_b_attr->has_i()) {
+    trans_b = trans_b_attr->i();
+  }
+  auto* output_shape =
+      ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
+  output_shape->clear_dim();
+  *output_shape->add_dim() = a_shape.dim(trans_a != 0 ? 1 : 0);
+  *output_shape->add_dim() = b_shape.dim(trans_b != 0 ? 0 : 1);
+}
+
 // Registers `schema` unless an equivalent schema is already known. Duplicate
 // registration is turned into a no-op instead of an error so the function stays
 // safe to run alongside a build that already provides these schemas.
@@ -470,6 +509,68 @@ OpSchema MakeQLinearWhereSchema() {
       .TypeAndShapeInferenceFunction(QLinearWhereShapeInference);
 }
 
+// Same layout ONNX Runtime itself registers for "com.microsoft" QGemm --
+// the fully-general quantized Gemm: unlike QLinearMatMul (used by
+// qoperator_quantize_matmul.h for the "vanilla" transA=0/alpha=1 case),
+// QGemm keeps `transA`/`transB`/`alpha` as attributes of its own, so it
+// needs no forced weight-transpose or activation restriction the way
+// QLinearMatMul does. `C` (bias), `y_scale`, and `y_zero_point` are all
+// optional -- an omitted `C` means "as if C is a scalar 0", and omitted
+// `y_scale`/`y_zero_point` means the output stays float32; onnxsim's own
+// qoperator_quantize_gemm.h rewrite always supplies all three (matching
+// every other pass in this family's "always fully quantize" convention),
+// but the schema itself supports the leaner cases too.
+OpSchema MakeQGemmSchema() {
+  return OpSchema()
+      .SetName("QGemm")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc("Quantized Gemm.")
+      .Attr("transA", "Whether A should be transposed.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("transB", "Whether B should be transposed.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("alpha", "Scalar multiplier for the product of A and B.",
+            onnx::AttributeProto::FLOAT, 1.0f)
+      .Input(0, "A",
+             "Input tensor A. Shape (M, K) if transA is 0, else (K, M).", "TA")
+      .Input(1, "a_scale", "Scale of quantized input A. Must be a scalar.", "T")
+      .Input(2, "a_zero_point", "Zero point of quantized input A.", "TA")
+      .Input(3, "B",
+             "Input tensor B. Shape (K, N) if transB is 0, else (N, K).", "TB")
+      .Input(4, "b_scale",
+             "Scale of quantized input B. A scalar (per-tensor) or 1-D "
+             "tensor of N elements (per-column).",
+             "T")
+      .Input(5, "b_zero_point",
+             "Zero point of quantized input B. Same shape as b_scale.", "TB")
+      .Input(6, "C",
+             "Optional bias tensor, unidirectionally broadcastable to "
+             "(M, N). Its type is int32 and must already be quantized "
+             "with zero_point = 0 and scale = alpha * a_scale * b_scale.",
+             "TC", OpSchema::Optional)
+      .Input(7, "y_scale",
+             "Scale of quantized output Y. Must be a scalar. If omitted "
+             "(along with y_zero_point), the output is float32.",
+             "T", OpSchema::Optional)
+      .Input(8, "y_zero_point",
+             "Zero point of quantized output Y. Must be a scalar.", "TYZ",
+             OpSchema::Optional)
+      .Output(0, "Y", "Output tensor of shape (M, N).", "TY")
+      .TypeConstraint("T", {"tensor(float)"}, "Constrain scales to float.")
+      .TypeConstraint("TA", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain A and its zero point to 8-bit tensors.")
+      .TypeConstraint("TB", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain B and its zero point to 8-bit tensors.")
+      .TypeConstraint("TC", {"tensor(int32)"},
+                      "Constrain C to 32-bit integer tensors.")
+      .TypeConstraint("TYZ", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain the output zero point to 8-bit tensors.")
+      .TypeConstraint("TY", {"tensor(float)", "tensor(uint8)", "tensor(int8)"},
+                      "Constrain the output to float32 or 8-bit tensors.")
+      .TypeAndShapeInferenceFunction(QGemmShapeInference);
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -490,6 +591,7 @@ void RegisterAll() {
   RegisterIfAbsent(MakeQLinearAveragePoolSchema());
   RegisterIfAbsent(MakeQLinearGlobalAveragePoolSchema());
   RegisterIfAbsent(MakeQLinearWhereSchema());
+  RegisterIfAbsent(MakeQGemmSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.
