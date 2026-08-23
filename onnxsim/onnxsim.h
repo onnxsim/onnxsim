@@ -503,6 +503,43 @@ onnx::ModelProto QuantizeQOperatorConcat(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Lists the tensor names ``QuantizeQOperatorSoftmax`` could quantize in
+// ``model``: for every standalone Softmax node with exactly 1 float32 input
+// and a resolvable default-domain opset import, both the input's and the
+// node's own output's tensor names (two entries per qualifying node).
+std::vector<std::string> ListQOperatorSoftmaxQuantizableTensors(
+    const onnx::ModelProto& model);
+
+// Statically (calibration-based) quantizes every standalone Softmax node
+// whose input is float32, whose input name *and* whose own output name are
+// both keys of ``activation_ranges``, and whose model has a resolvable
+// default-domain ("" / "ai.onnx") opset import, into ONNX Runtime's
+// "com.microsoft" contrib op ``QLinearSoftmax`` -- the reduction-axis
+// analogue of ``QuantizeQOperatorActivation``'s ``QLinearSigmoid``/
+// ``QLinearLeakyRelu`` rewrite (see that function's doc comment for why
+// these are contrib, not standard, ONNX ops, and why the output needs a
+// calibrated range on top of the input's). The ``axis`` attribute is carried
+// over unchanged (defaulting to -1 when absent); the model's own
+// default-domain opset version is threaded through as ``QLinearSoftmax``'s
+// required ``opset`` attribute, so the rewritten node reproduces standard
+// ONNX Softmax's exact axis semantics for that opset (pre-13 flattened
+// reduction vs. 13+ in-place per-axis reduction) rather than guessing one.
+// This function adds "com.microsoft" (version 1) to the model's opset
+// imports the first time it rewrites a node. See
+// ``ListQOperatorSoftmaxQuantizableTensors`` to discover which tensors to
+// calibrate, and ``passes/qoperator_quantize_softmax.h`` for the rewrite
+// itself.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass -- it applies exactly this rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match, or whose input/output have no entry in
+// ``activation_ranges``, are left as-is.
+onnx::ModelProto QuantizeQOperatorSoftmax(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
 // other ``Quantize*`` function here: float16 is still a floating-point

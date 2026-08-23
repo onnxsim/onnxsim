@@ -842,3 +842,74 @@ def quantize_qoperator_concat(
         extra_tensor_names=extra_names,
     )
     return onnx.load_from_string(C.quantize_qoperator_concat(model_bytes, ranges))
+
+
+def quantize_qoperator_softmax(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_calibration_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+) -> onnx.ModelProto:
+    """
+    Statically (calibration-based) quantize every standalone ``Softmax`` node
+    whose input is a float32 tensor into ONNX Runtime's "com.microsoft"
+    contrib op ``QLinearSoftmax`` -- the reduction-axis analogue of
+    :func:`quantize_qoperator_activation`'s ``QLinearSigmoid``/
+    ``QLinearLeakyRelu`` rewrite. ``Softmax``'s ``axis`` attribute is carried
+    over unchanged (defaulting to -1 when absent).
+
+    Like :func:`quantize_qoperator_activation`, the result is **not**
+    portable standard ONNX -- ``QLinearSoftmax`` is an ONNX Runtime contrib
+    op, so the quantized model needs a "com.microsoft"-aware runtime to
+    execute -- and needs a calibrated range for the node's *output* on top of
+    its input, since it computes directly in int8 with no float intermediate
+    (:func:`calibrate` is called with ``extra_tensor_names`` set to
+    ``onnxsim_cpp2py_export.list_qoperator_softmax_quantizable_tensors``'s
+    result for this reason).
+
+    ``QLinearSoftmax`` additionally needs to know which of standard ONNX's
+    two incompatible ``Softmax`` axis semantics to replicate (pre-opset-13
+    flattens the tensor at ``axis`` and reduces the trailing dimension;
+    opset-13+ reduces over ``axis`` in place). This is resolved from
+    ``model``'s own default-domain opset import, not guessed -- a model with
+    no resolvable default-domain opset import is left untouched (no
+    ``Softmax`` node is quantizable in it, so :func:`calibrate` has nothing
+    extra to calibrate for it either).
+
+    :param model: onnx ModelProto object or file path
+    :param calibration_data: representative input batches to calibrate
+            input/output ranges from. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching the model's graph
+            inputs -- see :func:`generate_random_calibration_data` (the
+            default, a quick smoke test) and
+            :func:`load_huggingface_calibration_data` (real data, a much
+            better calibration source for real deployment).
+    :param num_calibration_samples: number of random batches to generate when
+            ``calibration_data`` is not supplied
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run calibration on
+    :param method: calibration range method, passed through to
+            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
+            (KL-divergence calibration; see that function for the tradeoff
+            and its extra data requirement).
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_calibration_samples, seed=seed
+        )
+    model_bytes = model.SerializeToString()
+    extra_names = C.list_qoperator_softmax_quantizable_tensors(model_bytes)
+    ranges = calibrate(
+        model,
+        calibration_data,
+        providers=providers,
+        method=method,
+        extra_tensor_names=extra_names,
+    )
+    return onnx.load_from_string(C.quantize_qoperator_softmax(model_bytes, ranges))

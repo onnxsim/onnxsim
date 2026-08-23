@@ -234,6 +234,48 @@ OpSchema MakeQLinearConcatSchema() {
       .TypeAndShapeInferenceFunction(QLinearConcatShapeInference);
 }
 
+// Same layout/attribute set ONNX Runtime itself registers for
+// "com.microsoft" QLinearSoftmax: `X`/`Y` share a single `T` type constraint
+// (8-bit signed or unsigned), the output's shape and element type simply
+// follow the input's (Softmax never changes shape), and the `opset`
+// attribute is required -- it tells the runtime kernel which of standard
+// ONNX's two incompatible `Softmax` axis semantics (pre-13 flattening vs.
+// 13+ in-place per-axis reduction) to replicate. Unlike
+// MakeQLinearUnarySchema's `Y_zero_point` (optional, since QLinearSigmoid/
+// QLinearLeakyRelu allow a runtime-implied default), QLinearSoftmax's
+// `y_zero_point` is required.
+OpSchema MakeQLinearSoftmaxSchema() {
+  return OpSchema()
+      .SetName("QLinearSoftmax")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "QLinearSoftmax computes the normalized exponential values for "
+          "the given input: Softmax(input, axis) = Exp(input) / "
+          "ReduceSum(Exp(input), axis=axis, keepdims=1).")
+      .Attr("axis", "Apply softmax to elements for dimensions axis.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(-1))
+      .Attr("opset",
+            "Opset version of the standard-ONNX Softmax whose axis "
+            "semantics this node replicates.",
+            onnx::AttributeProto::INT)
+      .Input(0, "X", "The input tensor.", "T")
+      .Input(1, "X_scale", "Scale of quantized input X. Must be a scalar.",
+             "tensor(float)")
+      .Input(2, "x_zero_point",
+             "Zero point of quantized input X. Must be a scalar.", "T",
+             OpSchema::Optional)
+      .Input(3, "y_scale", "Scale of quantized output Y. Must be a scalar.",
+             "tensor(float)")
+      .Input(4, "y_zero_point",
+             "Zero point of quantized output Y. Must be a scalar.", "T")
+      .Output(0, "Y", "Output data tensor.", "T")
+      .TypeConstraint("T", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain input and output types to 8-bit integer "
+                      "tensors.")
+      .TypeAndShapeInferenceFunction(onnx::propagateShapeAndTypeFromFirstInput);
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -250,6 +292,7 @@ void RegisterAll() {
   RegisterIfAbsent(
       MakeQLinearUnarySchema("QLinearLeakyRelu", /*has_alpha=*/true));
   RegisterIfAbsent(MakeQLinearConcatSchema());
+  RegisterIfAbsent(MakeQLinearSoftmaxSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.
