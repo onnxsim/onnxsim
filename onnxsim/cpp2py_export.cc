@@ -693,6 +693,43 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "activation_ranges"_a);
 
+  // Lists the tensor names quantize_qoperator_pool could quantize -- the
+  // input and output of every qualifying AveragePool/GlobalAveragePool node
+  // -- see ListQOperatorPoolQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_pool_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorPoolQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes standalone AveragePool/
+  // GlobalAveragePool into ONNX Runtime's "com.microsoft"
+  // QLinearAveragePool/QLinearGlobalAveragePool contrib ops -- needs a
+  // calibrated range for both the input and the node's own output (see
+  // list_qoperator_pool_quantizable_tensors) since these compute directly
+  // in int8, with no float intermediate -- see QuantizeQOperatorPool in
+  // onnxsim.h.
+  m.def(
+      "quantize_qoperator_pool",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorPool(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
   // Converts every float32 weight (and, by default, every internal
   // activation) to float16 -- no calibration data needed, since float16 is
   // still a floating-point format, not an integer scheme. With

@@ -10,6 +10,7 @@
 #include "model_prep.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnxoptimizer/optimize.h"
+#include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_conv_common.h"
@@ -483,6 +484,61 @@ onnx::ModelProto QuantizeQOperatorSoftmax(
       activation_ranges;
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"qoperator_quantize_softmax"});
+}
+
+std::vector<std::string> ListQOperatorPoolQuantizableTensors(
+    const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+  if (g.get() == nullptr) {
+    return {};
+  }
+  std::vector<std::string> names;
+  std::unordered_set<std::string> seen;
+  auto add_name = [&](const std::string& name) {
+    if (seen.insert(name).second) {
+      names.push_back(name);
+    }
+  };
+  for (auto* node : g->nodes()) {
+    if (node->kind() != onnx::Symbol("AveragePool") &&
+        node->kind() != onnx::Symbol("GlobalAveragePool")) {
+      continue;
+    }
+    if (node->inputs().size() != 1) {
+      continue;
+    }
+    if (node->hasAttribute(onnx::Symbol("dilations"))) {
+      continue;
+    }
+    onnx::Value* x = node->inputs()[0];
+    if (x->elemType() != onnx::TensorProto_DataType_FLOAT) {
+      continue;
+    }
+    add_name(x->uniqueName());
+    add_name(node->output()->uniqueName());
+  }
+  return names;
+}
+
+onnx::ModelProto QuantizeQOperatorPool(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges) {
+  PrepareSchemasForDebug(model);
+  // Registers qoperator_quantize_pool (idempotent) into onnxoptimizer's
+  // registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // qoperator_quantize_pool reads the same calibration-ranges global every
+  // other static/QOperator pass does (see
+  // StaticQuantizationCalibrationRanges's doc comment) -- keyed by tensor
+  // name, so sharing the map is safe as long as only one Quantize* entry
+  // point runs per call, which OptimizeFixed's single pass-name list here
+  // ensures.
+  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
+      activation_ranges;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"qoperator_quantize_pool"});
 }
 
 onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,

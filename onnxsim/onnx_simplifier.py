@@ -1876,14 +1876,27 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--qoperator-quantize-pool",
+        help="After simplifying, statically (calibration-based) quantize "
+        "standalone AveragePool/GlobalAveragePool nodes into ONNX Runtime's "
+        "'com.microsoft' contrib ops QLinearAveragePool/"
+        "QLinearGlobalAveragePool, with a fixed scale/zero-point calibrated "
+        "from --calibration-dataset if given, else from random data. "
+        "Unlike the other --*-quantize flags (except "
+        "--qoperator-quantize-elementwise/-activation/-concat/-softmax), "
+        "the result needs a com.microsoft-aware runtime (e.g. ONNX "
+        "Runtime) to execute -- see onnxsim.quantize_qoperator_pool.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--calibration-dataset",
         help="Hugging Face Hub dataset id (e.g. 'mnist') to pull "
         "--calibration-samples real examples from for --static-quantize's, "
         "--static-quantize-int16's, --qoperator-quantize's, "
         "--qoperator-quantize-elementwise's, --qoperator-quantize-activation's, "
-        "--qoperator-quantize-concat's, or --qoperator-quantize-softmax's "
-        "calibration, instead of random data. See "
-        "onnxsim.load_huggingface_calibration_data (needs the optional "
+        "--qoperator-quantize-concat's, --qoperator-quantize-softmax's, or "
+        "--qoperator-quantize-pool's calibration, instead of random data. "
+        "See onnxsim.load_huggingface_calibration_data (needs the optional "
         "'datasets' package: pip install datasets).",
         type=str,
         default=None,
@@ -1892,8 +1905,9 @@ def main():
         "--calibration-samples",
         help="Number of calibration batches/examples for --static-quantize, "
         "--qoperator-quantize, --qoperator-quantize-elementwise, "
-        "--qoperator-quantize-activation, --qoperator-quantize-concat, or "
-        "--qoperator-quantize-softmax (default: 8).",
+        "--qoperator-quantize-activation, --qoperator-quantize-concat, "
+        "--qoperator-quantize-softmax, or --qoperator-quantize-pool "
+        "(default: 8).",
         type=int,
         default=8,
     )
@@ -1901,8 +1915,8 @@ def main():
         "--calibration-method",
         help="Calibration range method for --static-quantize, "
         "--qoperator-quantize, --qoperator-quantize-elementwise, "
-        "--qoperator-quantize-activation, --qoperator-quantize-concat, or "
-        "--qoperator-quantize-softmax: "
+        "--qoperator-quantize-activation, --qoperator-quantize-concat, "
+        "--qoperator-quantize-softmax, or --qoperator-quantize-pool: "
         "'minmax' "
         "(default) uses each tensor's observed min/max directly; 'entropy' "
         "instead searches for the clip threshold minimizing KL divergence "
@@ -2338,6 +2352,31 @@ def main():
             "com.microsoft contrib ops)..."
         )
         model_opt = calibration.quantize_qoperator_softmax(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_pool:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing AveragePool/GlobalAveragePool nodes "
+            "(QOperator format, com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_pool(
             model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 

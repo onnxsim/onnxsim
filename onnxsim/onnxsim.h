@@ -540,6 +540,44 @@ onnx::ModelProto QuantizeQOperatorSoftmax(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Lists the tensor names ``QuantizeQOperatorPool`` could quantize in
+// ``model``: for every standalone AveragePool/GlobalAveragePool node with
+// exactly 1 float32 input and (for AveragePool) no ``dilations`` attribute,
+// both the input's and the node's own output's tensor names (two entries
+// per qualifying node).
+std::vector<std::string> ListQOperatorPoolQuantizableTensors(
+    const onnx::ModelProto& model);
+
+// Statically (calibration-based) quantizes every standalone AveragePool or
+// GlobalAveragePool node whose input is float32, whose input name *and*
+// whose own output name are both keys of ``activation_ranges``, into ONNX
+// Runtime's "com.microsoft" contrib ops ``QLinearAveragePool``/
+// ``QLinearGlobalAveragePool`` -- the pooling analogue of
+// ``QuantizeQOperatorActivation``'s ``QLinearSigmoid``/``QLinearLeakyRelu``
+// rewrite (see that function's doc comment for why these are contrib, not
+// standard, ONNX ops, and why the output needs a calibrated range on top of
+// the input's). Every attribute the original AveragePool node has
+// (kernel_shape, pads, strides, ceil_mode, count_include_pad, auto_pad) is
+// carried over unchanged; both ops additionally get a ``channels_last``
+// attribute set to 0 (onnxsim only ever produces NCHW-layout graphs). An
+// AveragePool node with a ``dilations`` attribute (standard ONNX opset 19+)
+// is left untouched -- ONNX Runtime's QLinearAveragePool kernel does not
+// accept that attribute. This function adds "com.microsoft" (version 1) to
+// the model's opset imports the first time it rewrites a node. See
+// ``ListQOperatorPoolQuantizableTensors`` to discover which tensors to
+// calibrate, and ``passes/qoperator_quantize_pool.h`` for the rewrite
+// itself.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass -- it applies exactly this rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match, or whose input/output have no entry in
+// ``activation_ranges``, are left as-is.
+onnx::ModelProto QuantizeQOperatorPool(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
 // other ``Quantize*`` function here: float16 is still a floating-point

@@ -913,3 +913,73 @@ def quantize_qoperator_softmax(
         extra_tensor_names=extra_names,
     )
     return onnx.load_from_string(C.quantize_qoperator_softmax(model_bytes, ranges))
+
+
+def quantize_qoperator_pool(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_calibration_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+) -> onnx.ModelProto:
+    """
+    Statically (calibration-based) quantize every standalone ``AveragePool``
+    or ``GlobalAveragePool`` node whose input is a float32 tensor into ONNX
+    Runtime's "com.microsoft" contrib ops ``QLinearAveragePool``/
+    ``QLinearGlobalAveragePool`` -- the pooling analogue of
+    :func:`quantize_qoperator_activation`'s ``QLinearSigmoid``/
+    ``QLinearLeakyRelu`` rewrite. Every attribute the original
+    ``AveragePool`` node has (``kernel_shape``, ``pads``, ``strides``,
+    ``ceil_mode``, ``count_include_pad``, ``auto_pad``) is carried over
+    unchanged; both ops additionally get a ``channels_last`` attribute set
+    to 0, since onnxsim only ever produces NCHW-layout graphs.
+
+    Like :func:`quantize_qoperator_activation`, the result is **not**
+    portable standard ONNX -- these are ONNX Runtime contrib ops, so the
+    quantized model needs a "com.microsoft"-aware runtime to execute -- and
+    need a calibrated range for the node's *output* on top of its input,
+    since they compute directly in int8 with no float intermediate
+    (:func:`calibrate` is called with ``extra_tensor_names`` set to
+    ``onnxsim_cpp2py_export.list_qoperator_pool_quantizable_tensors``'s
+    result for this reason).
+
+    An ``AveragePool`` node with a ``dilations`` attribute (standard ONNX
+    opset 19+) is left untouched: ONNX Runtime's ``QLinearAveragePool``
+    kernel does not accept that attribute.
+
+    :param model: onnx ModelProto object or file path
+    :param calibration_data: representative input batches to calibrate
+            input/output ranges from. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching the model's graph
+            inputs -- see :func:`generate_random_calibration_data` (the
+            default, a quick smoke test) and
+            :func:`load_huggingface_calibration_data` (real data, a much
+            better calibration source for real deployment).
+    :param num_calibration_samples: number of random batches to generate when
+            ``calibration_data`` is not supplied
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run calibration on
+    :param method: calibration range method, passed through to
+            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
+            (KL-divergence calibration; see that function for the tradeoff
+            and its extra data requirement).
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_calibration_samples, seed=seed
+        )
+    model_bytes = model.SerializeToString()
+    extra_names = C.list_qoperator_pool_quantizable_tensors(model_bytes)
+    ranges = calibrate(
+        model,
+        calibration_data,
+        providers=providers,
+        method=method,
+        extra_tensor_names=extra_names,
+    )
+    return onnx.load_from_string(C.quantize_qoperator_pool(model_bytes, ranges))

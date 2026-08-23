@@ -155,6 +155,42 @@ void QLinearConcatShapeInference(InferenceContext& ctx) {
   }
 }
 
+// Shape/type inference for QLinearGlobalAveragePool. Per ONNX Runtime's own
+// doc ("the output tensor has the same rank as the input, with the N and C
+// value keep[ing] its value, while the other dimensions are all 1"), the
+// output shape is fully determined by the input shape and rank -- unlike
+// QLinearAveragePool below, whose true output shape additionally depends on
+// kernel_shape/strides/pads/ceil_mode/auto_pad arithmetic this function
+// does not replicate.
+void QLinearGlobalAveragePoolShapeInference(InferenceContext& ctx) {
+  onnx::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+  if (!onnx::hasInputShape(ctx, 0)) {
+    return;
+  }
+  const auto& input_shape = ctx.getInputType(0)->tensor_type().shape();
+  const int rank = input_shape.dim_size();
+  if (rank < 2) {
+    return;
+  }
+  int64_t channels_last = 0;
+  const auto* channels_last_attr = ctx.getAttribute("channels_last");
+  if (channels_last_attr != nullptr && channels_last_attr->has_i()) {
+    channels_last = channels_last_attr->i();
+  }
+  const int channel_dim = channels_last != 0 ? rank - 1 : 1;
+
+  auto* output_shape =
+      ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
+  output_shape->clear_dim();
+  for (int i = 0; i < rank; ++i) {
+    if (i == 0 || i == channel_dim) {
+      *output_shape->add_dim() = input_shape.dim(i);
+    } else {
+      output_shape->add_dim()->set_dim_value(1);
+    }
+  }
+}
+
 // Registers `schema` unless an equivalent schema is already known. Duplicate
 // registration is turned into a no-op instead of an error so the function stays
 // safe to run alongside a build that already provides these schemas.
@@ -276,6 +312,110 @@ OpSchema MakeQLinearSoftmaxSchema() {
       .TypeAndShapeInferenceFunction(onnx::propagateShapeAndTypeFromFirstInput);
 }
 
+// Same layout/attribute set ONNX Runtime itself registers for
+// "com.microsoft" QLinearAveragePool: every attribute standard ONNX
+// AveragePool has (kernel_shape required; auto_pad/ceil_mode/
+// count_include_pad/pads/strides optional, matching AveragePool's own
+// defaults), plus a `channels_last` attribute AveragePool itself doesn't
+// have. Type/shape inference only propagates the element type -- the true
+// output shape depends on the same kernel/stride/pad arithmetic standard
+// AveragePool's own inference function implements, which this schema does
+// not replicate (qoperator_quantize_pool.h's rewrite doesn't need it either:
+// it copies the original node's already-known output shape onto the
+// trailing DequantizeLinear directly).
+OpSchema MakeQLinearAveragePoolSchema() {
+  return OpSchema()
+      .SetName("QLinearAveragePool")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "QLinearAveragePool consumes an input tensor X and applies "
+          "average pooling across the tensor according to kernel sizes, "
+          "stride sizes and pad lengths, computing on dequantized values "
+          "and requantizing the result.")
+      .Attr("auto_pad",
+            "auto_pad must be either NOTSET, SAME_UPPER, SAME_LOWER or "
+            "VALID (deprecated, kept for parity with standard ONNX "
+            "AveragePool).",
+            onnx::AttributeProto::STRING, "NOTSET")
+      .Attr("ceil_mode",
+            "Whether to use ceil or floor (default) to compute the output "
+            "shape.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("channels_last", "Works on NHWC layout or not. Default not.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("count_include_pad",
+            "Whether to include pad pixels when calculating values for "
+            "the edges. Default 0, doesn't count include pad.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("kernel_shape", "The size of the kernel along each axis.",
+            onnx::AttributeProto::INTS, /*required=*/true)
+      .Attr("pads",
+            "Padding for the beginning and ending along each spatial "
+            "axis. Defaults to 0 along start and end of each spatial axis "
+            "when absent.",
+            onnx::AttributeProto::INTS, /*required=*/false)
+      .Attr("strides",
+            "Stride along each spatial axis. Defaults to 1 along each "
+            "spatial axis when absent.",
+            onnx::AttributeProto::INTS, /*required=*/false)
+      .Input(0, "X", "Input data tensor from the previous operator.", "T")
+      .Input(1, "x_scale", "Scale of quantized input X. Must be a scalar.",
+             "tensor(float)")
+      .Input(2, "x_zero_point",
+             "Zero point of quantized input X. Must be a scalar.", "T",
+             OpSchema::Optional)
+      .Input(3, "y_scale", "Scale of quantized output Y. Must be a scalar.",
+             "tensor(float)")
+      .Input(4, "y_zero_point",
+             "Zero point of quantized output Y. Must be a scalar.", "T",
+             OpSchema::Optional)
+      .Output(0, "Y", "Output data tensor from average pooling.", "T")
+      .TypeConstraint("T", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain input and output to 8-bit integer "
+                      "tensors.")
+      .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+        onnx::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+      });
+}
+
+// Same layout ONNX Runtime itself registers for "com.microsoft"
+// QLinearGlobalAveragePool: unlike QLinearAveragePool, both zero-points are
+// required (not optional), there are no kernel_shape/strides/pads/etc.
+// attributes (it always pools over every spatial position), and the output
+// shape is simple enough (same rank, N/C kept, every other dim collapsed to
+// 1) that QLinearGlobalAveragePoolShapeInference computes it exactly.
+OpSchema MakeQLinearGlobalAveragePoolSchema() {
+  return OpSchema()
+      .SetName("QLinearGlobalAveragePool")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "QLinearGlobalAveragePool consumes an input tensor X and applies "
+          "average pooling across the values in the same channel. This is "
+          "equivalent to AveragePool with kernel size equal to the "
+          "spatial dimensions of the input tensor.")
+      .Attr("channels_last", "Works on NHWC layout or not. Default not.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Input(0, "X", "Input data tensor from the previous operator.", "T")
+      .Input(1, "x_scale", "Scale of quantized input X. Must be a scalar.",
+             "tensor(float)")
+      .Input(2, "x_zero_point",
+             "Zero point of quantized input X. Must be a scalar.", "T")
+      .Input(3, "y_scale", "Scale of quantized output Y. Must be a scalar.",
+             "tensor(float)")
+      .Input(4, "y_zero_point",
+             "Zero point of quantized output Y. Must be a scalar.", "T")
+      .Output(0, "Y",
+              "Output data tensor from pooling across the input "
+              "tensor.",
+              "T")
+      .TypeConstraint("T", {"tensor(uint8)", "tensor(int8)"},
+                      "Constrain input and output to 8-bit integer "
+                      "tensors.")
+      .TypeAndShapeInferenceFunction(QLinearGlobalAveragePoolShapeInference);
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -293,6 +433,8 @@ void RegisterAll() {
       MakeQLinearUnarySchema("QLinearLeakyRelu", /*has_alpha=*/true));
   RegisterIfAbsent(MakeQLinearConcatSchema());
   RegisterIfAbsent(MakeQLinearSoftmaxSchema());
+  RegisterIfAbsent(MakeQLinearAveragePoolSchema());
+  RegisterIfAbsent(MakeQLinearGlobalAveragePoolSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.
