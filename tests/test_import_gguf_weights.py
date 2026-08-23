@@ -235,7 +235,8 @@ def test_import_raw_dtype_passthrough(tmp_path):
     rng = np.random.default_rng(4)
     values = rng.standard_normal(8).astype(np.float32)
     gguf_path = str(tmp_path / "model.gguf")
-    _write_gguf(gguf_path, [("W", GGML_TYPE_F32, [8], values.tobytes())])
+    # GGUF is always little-endian on disk, regardless of host byte order.
+    _write_gguf(gguf_path, [("W", GGML_TYPE_F32, [8], values.astype("<f4").tobytes())])
 
     model = _identity_model("W", [8])
     result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
