@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "onnx/defs/data_propagators.h"
+#include "onnx/defs/math/utils.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
 
@@ -571,6 +572,53 @@ OpSchema MakeQGemmSchema() {
       .TypeAndShapeInferenceFunction(QGemmShapeInference);
 }
 
+// Same layout ONNX Runtime itself registers for "com.microsoft"
+// MatMulIntegerToFloat: unlike MatMulInteger (no dequantization step of its
+// own -- callers Cast+Mul the int32 result themselves) or QLinearMatMul
+// (fully re-quantizes its float result back to int8), this op dequantizes
+// directly to float/float16 and optionally adds a bias in the same op, with
+// no re-quantization step at all -- exactly the fused replacement for
+// dynamic_quantize_matmul.h's own MatMulInteger+Cast+Mul(+Add) node chain.
+OpSchema MakeMatMulIntegerToFloatSchema() {
+  return OpSchema()
+      .SetName("MatMulIntegerToFloat")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "Matrix product of dequantized 8-bit integer matrices A and B, "
+          "producing a float result directly (no further re-quantization), "
+          "with an optional bias added in the same op.")
+      .Input(0, "A", "N-dimensional matrix A.", "T1")
+      .Input(1, "B", "N-dimensional matrix B.", "T2")
+      .Input(2, "a_scale",
+             "Scale of quantized input A. A scalar (per-tensor) or 1-D "
+             "tensor (per-column).",
+             "T3")
+      .Input(3, "b_scale",
+             "Scale of quantized input B. A scalar (per-tensor) or 1-D "
+             "tensor (per-column).",
+             "T3")
+      .Input(4, "a_zero_point", "Zero point of quantized input A.", "T1",
+             OpSchema::Optional)
+      .Input(5, "b_zero_point", "Zero point of quantized input B.", "T2",
+             OpSchema::Optional)
+      .Input(6, "bias",
+             "Optional 1-D bias, matching B's last dimension, added after "
+             "dequantization.",
+             "T3", OpSchema::Optional)
+      .Output(0, "Y", "Matrix multiply result of dequantized A and B.", "T3")
+      .TypeConstraint("T1", {"tensor(int8)", "tensor(uint8)"},
+                      "Constrain A to 8-bit integer tensors.")
+      .TypeConstraint("T2", {"tensor(int8)", "tensor(uint8)"},
+                      "Constrain B to 8-bit integer tensors.")
+      .TypeConstraint("T3", {"tensor(float)", "tensor(float16)"},
+                      "Constrain scales, bias, and output to float tensors.")
+      .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+        onnx::propagateElemTypeFromInputToOutput(ctx, 2, 0);
+        onnx::defs::math::utils::MatMulShapeInference(ctx, 0, 1);
+      });
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -592,6 +640,7 @@ void RegisterAll() {
   RegisterIfAbsent(MakeQLinearGlobalAveragePoolSchema());
   RegisterIfAbsent(MakeQLinearWhereSchema());
   RegisterIfAbsent(MakeQGemmSchema());
+  RegisterIfAbsent(MakeMatMulIntegerToFloatSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.

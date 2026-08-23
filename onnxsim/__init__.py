@@ -23,6 +23,7 @@ from onnxsim.onnx_simplifier import (
     main,
     quantize_bf16,
     quantize_dynamic,
+    quantize_dynamic_matmul_integer_to_float,
     quantize_fp8,
     quantize_fp16,
     quantize_ternary,
@@ -39,6 +40,7 @@ from .version import version as __version__
 __all__ = [
     "simplify",
     "quantize_dynamic",
+    "quantize_dynamic_matmul_integer_to_float",
     "quantize_ternary",
     "quantize_weight_only",
     "quantize_weight_only_int4",

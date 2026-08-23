@@ -156,6 +156,28 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
 
+// Same rewrite as ``QuantizeDynamic`` -- same matching rules, same weight
+// quantization, same runtime ``DynamicQuantizeLinear`` activation
+// quantization -- but the dequantize step is a single ONNX Runtime
+// "com.microsoft" contrib op, ``MatMulIntegerToFloat``, instead of
+// ``QuantizeDynamic``'s three-to-four separate standard-ONNX nodes
+// (``MatMulInteger`` + ``Cast`` + two ``Mul``s + an optional ``Add``):
+// ``MatMulIntegerToFloat``'s own schema dequantizes and adds an optional
+// bias directly, so this needs only ``DynamicQuantizeLinear`` plus the one
+// contrib op. This adds "com.microsoft" (version 1) to the model's opset
+// imports the first time it rewrites a node -- the one respect in which the
+// result is less portable than ``QuantizeDynamic``'s pure-standard-ONNX
+// output. See ``passes/dynamic_quantize_matmul_integer_to_float.h`` for the
+// rewrite itself.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+// attributes, non-float32 operands, an opset older than 11) are left as-is.
+onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
+    const onnx::ModelProto& model);
+
 // Dynamically quantizes every MatMul/"vanilla" Gemm whose constant weight is
 // *structurally ternary* -- every element of every output column is one of
 // {-s, 0, +s} for that column's own scale ``s``, the representation BitNet

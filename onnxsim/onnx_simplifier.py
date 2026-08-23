@@ -443,6 +443,42 @@ def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     return onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
 
 
+def quantize_dynamic_matmul_integer_to_float(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Same rewrite as :func:`quantize_dynamic` -- same matching rules, same
+    per-output-channel weight quantization, same runtime
+    ``DynamicQuantizeLinear`` activation quantization -- but the dequantize
+    step is a single ONNX Runtime "com.microsoft" contrib op,
+    ``MatMulIntegerToFloat``, instead of :func:`quantize_dynamic`'s
+    three-to-four separate standard-ONNX nodes (``MatMulInteger`` + ``Cast``
+    + two ``Mul``s + an optional ``Add``): ``MatMulIntegerToFloat``'s own
+    schema dequantizes and adds an optional bias directly, so this needs
+    only ``DynamicQuantizeLinear`` plus the one contrib op.
+
+    Unlike :func:`quantize_dynamic`, the result is **not** portable standard
+    ONNX -- ``MatMulIntegerToFloat`` is an ONNX Runtime contrib op, so the
+    quantized model needs a "com.microsoft"-aware runtime to execute. No
+    calibration data is needed either way.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands, an opset older than 11 -- which
+    ``DynamicQuantizeLinear`` requires) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_dynamic_matmul_integer_to_float(model.SerializeToString())
+    )
+
+
 def quantize_ternary(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
     Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
@@ -1702,6 +1738,16 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--dynamic-quantize-matmul-integer-to-float",
+        help="Same as --dynamic-quantize, but the dequantize step is a "
+        "single ONNX Runtime 'com.microsoft' contrib op "
+        "(MatMulIntegerToFloat) instead of a MatMulInteger+Cast+Mul(+Add) "
+        "node chain. Unlike --dynamic-quantize, the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute. See "
+        "onnxsim.quantize_dynamic_matmul_integer_to_float.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--ternary-quantize",
         help="After simplifying, dynamically quantize MatMul/Gemm nodes "
         "whose constant weight is structurally ternary ({-s, 0, +s} per "
@@ -2178,6 +2224,13 @@ def main():
     if args.dynamic_quantize:
         print("Dynamically quantizing MatMul/Gemm weights to INT8...")
         model_opt = quantize_dynamic(model_opt)
+
+    if args.dynamic_quantize_matmul_integer_to_float:
+        print(
+            "Dynamically quantizing MatMul/Gemm weights to INT8 "
+            "(com.microsoft MatMulIntegerToFloat)..."
+        )
+        model_opt = quantize_dynamic_matmul_integer_to_float(model_opt)
 
     if args.ternary_quantize:
         print("Dynamically quantizing structurally-ternary MatMul/Gemm weights...")

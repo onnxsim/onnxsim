@@ -10,6 +10,7 @@
 
 #include "onnxoptimizer/optimize.h"
 #include "passes/dynamic_quantize_matmul.h"
+#include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
@@ -83,6 +84,7 @@ void RegisterCustomOptimizerPasses() {
 
     // onnxsim-only rewrites (no built-in of the same name today).
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
+    RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);

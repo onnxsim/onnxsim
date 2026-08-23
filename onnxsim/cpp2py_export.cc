@@ -362,6 +362,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Same rewrite as quantize_dynamic, but the dequantize step is a single
+  // ONNX Runtime "com.microsoft" contrib op (MatMulIntegerToFloat) instead
+  // of quantize_dynamic's separate MatMulInteger+Cast+Mul(+Add) node chain
+  // -- see QuantizeDynamicMatMulIntegerToFloat in onnxsim.h. Pure graph
+  // rewrite: no ModelExecutor or calibration data needed.
+  m.def(
+      "quantize_dynamic_matmul_integer_to_float",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeDynamicMatMulIntegerToFloat(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Dynamically quantizes MatMul/Gemm nodes whose weight is structurally
   // ternary ({-s, 0, +s} per output column, e.g. BitNet b1.58) into the same
   // DynamicQuantizeLinear/MatMulInteger shape as quantize_dynamic, but with a

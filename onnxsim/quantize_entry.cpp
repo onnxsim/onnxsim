@@ -10,6 +10,7 @@
 #include "model_prep.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnxoptimizer/optimize.h"
+#include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/qoperator_quantize_gemm.h"
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
@@ -28,6 +29,17 @@ onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
   onnxsim::RegisterCustomOptimizerPasses();
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"dynamic_quantize_matmul"});
+}
+
+onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
+    const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers dynamic_quantize_matmul_integer_to_float (idempotent) into
+  // onnxoptimizer's registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model,
+      std::vector<std::string>{"dynamic_quantize_matmul_integer_to_float"});
 }
 
 onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model) {
