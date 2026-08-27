@@ -184,3 +184,33 @@ def test_workaround_applies_transparently_to_awq_refined_model():
         rtol=0,
         atol=1e-4,
     )
+
+
+def test_workaround_applies_transparently_to_omniquant_refined_model():
+    # OmniQuant also only rewrites Wq/Ws' own values (plus, when its LET
+    # transform helps, inserting Sub/Mul/Add nodes around the matched
+    # MatMul, never touching the DequantizeLinear's own axis) -- confirm
+    # the workaround still finds and fixes it downstream.
+    K, N = 64, 16
+    model = _matmul_model(K=K, N=N, seed=8)
+    rng = np.random.default_rng(9)
+    x = rng.standard_normal((32, K)).astype(np.float32) + 2.0
+    for c in (3, 7):
+        x[:, c] *= 20.0
+    calibration_data = [{"X": x}]
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    oq_model = onnxsim.apply_omniquant(model, quant, calibration_data=calibration_data)
+
+    (y_buggy_default,) = _run(oq_model, {"X": x})
+    (y_correct_reference,) = _run(oq_model, {"X": x}, disable_optimizations=True)
+
+    fixed = onnxsim.workaround_ort_matmul_nbits_axis0_bug(oq_model)
+    onnx.checker.check_model(fixed)
+    (y_fixed_default,) = _run(fixed, {"X": x})
+    assert np.allclose(
+        y_fixed_default.astype(np.float64),
+        y_correct_reference.astype(np.float64),
+        rtol=0,
+        atol=1e-4,
+    )

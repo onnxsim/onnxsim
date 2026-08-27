@@ -38,6 +38,7 @@ from onnxsim.hqq import quantize_weight_only_int4_hqq
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
+from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
     cross_layer_equalize,
     export_gguf,
@@ -95,6 +96,7 @@ __all__ = [
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_quip_sharp",
+    "apply_omniquant",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
