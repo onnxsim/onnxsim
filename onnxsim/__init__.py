@@ -36,6 +36,7 @@ from onnxsim.gguf_reconstruct import (
 )
 from onnxsim.gptq import apply_gptq
 from onnxsim.hqq import quantize_weight_only_int4_hqq
+from onnxsim.kv_cache_quantization import quantize_kv_cache
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
@@ -110,6 +111,7 @@ __all__ = [
     "NF4_CODEBOOK",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
+    "quantize_kv_cache",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
