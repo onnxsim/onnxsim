@@ -134,9 +134,12 @@ inline std::vector<const char*> AsCStrs(const std::vector<std::string>& v) {
 // onnxsim/dlpack_bridge.h's BorrowAsOrtValue, just against an existing
 // Ort::Value instead of a DLManagedTensor.
 //
-// Sketch-level limitation: only fp32/int64 tensors are handled, since that
-// covers a plain (non-fp16) optimum-onnx export. A real deployment of an
-// fp16-weight model needs this switch extended.
+// Sketch-level limitation: only fp32/int64/int8 tensors are handled -- fp32
+// and int64 cover a plain (non-fp16) optimum-onnx export, and int8 covers a
+// KV cache quantized by onnxsim.quantize_kv_cache
+// (onnxsim/kv_cache_quantization.py), whose past_key_values.*/present.*
+// tensors are INT8 by construction. A real deployment of an fp16-weight
+// model needs this switch extended further.
 inline Ort::Value BorrowView(const Ort::Value& src) {
   auto info = src.GetTensorTypeAndShapeInfo();
   std::vector<int64_t> shape = info.GetShape();
@@ -149,6 +152,10 @@ inline Ort::Value BorrowView(const Ort::Value& src) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
       auto* data = const_cast<int64_t*>(src.GetTensorData<int64_t>());
       return Ort::Value::CreateTensor<int64_t>(mem_info, data, info.GetElementCount(), shape.data(), shape.size());
+    }
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8: {
+      auto* data = const_cast<int8_t*>(src.GetTensorData<int8_t>());
+      return Ort::Value::CreateTensor<int8_t>(mem_info, data, info.GetElementCount(), shape.data(), shape.size());
     }
     default:
       throw std::runtime_error("BorrowView: unsupported dtype (extend for fp16/bf16 models)");

@@ -126,10 +126,21 @@ KVQuant's own finding says matter most.
 A model quantized this way needs a caller that actually stores its
 `past_*`/`present_*` tensors as INT8 across decode steps to see any real
 memory benefit -- `tools/onnx-deploy`'s `KvCachePipeline`
-(`include/onnx_deploy/kv_cache_pipeline.h`) does not yet do this
-(`BorrowView` there currently only handles fp32/int64 tensors), so wiring
-this quantizer's output through that pipeline end-to-end is a natural
-follow-up, not something this module does on its own.
+(`include/onnx_deploy/kv_cache_pipeline.h`) supports this:
+`detail::BorrowView` handles INT8 tensors (alongside the original fp32/
+int64) and threads them through `Generate()`'s decode loop exactly like any
+other cache dtype, verified end-to-end by
+`tools/onnx-deploy/scripts/make_toy_int8_kv_decoder.py` and
+`.github/workflows/onnx-deploy.yml` against a real, growing INT8 cache
+across many steps and two different ONNX Runtime releases. Note that a real
+multi-file `optimum-onnx`-style export needs `decoder_model.onnx` (the
+"no past" first step) quantized consistently with `decoder_with_past_model.onnx`
+for the same cache stream too, since both files share the same
+`present.*`/`past_key_values.*` dtype contract; `quantize_kv_cache` only
+matches graphs with a `Concat(past, new)` pattern (present in the "with
+past" file, absent in the first-step file, which has no past to concat),
+so quantizing both files of a real pipeline consistently is left to the
+caller for now.
 
 `tests/test_kv_cache_quantization.py` verifies this end-to-end with a
 genuine two-step round trip (an empty starting cache, then feeding the

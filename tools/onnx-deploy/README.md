@@ -309,9 +309,20 @@ checkout, on every change under `tools/onnx-deploy/`:
    just a design note.
 6. Repeats the same swap test through `onnx_deploy_py` (fresh Python
    process per ORT build).
-7. Checks that a bad model directory and a bad `--libort` path both fail
+7. Generates a second toy export, `scripts/make_toy_int8_kv_decoder.py`
+   (decoder-only, no encoder): its `past_key_values.0.key`/`present.0.key`
+   are INT8 from the start -- the same graph shape
+   `onnxsim.quantize_kv_cache` produces (see
+   `docs/kv-cache-quantization.md` in the main package) -- and its `Concat`
+   genuinely grows the cache every step rather than overwriting a single
+   slot, so `logits` at each step is a function of the *whole* cache
+   history, not just the latest token. Runs it against both ORT releases
+   the same way as steps 4-5, proving `detail::BorrowView`'s INT8 case
+   (`kv_cache_pipeline.h`) threads a quantized cache through `Generate()`
+   correctly across many steps, not just fp32/int64.
+8. Checks that a bad model directory and a bad `--libort` path both fail
    cleanly (`ONNX_DEPLOY_ERROR` / exit 1 with a message), not a crash.
-8. Checks that `--execution-provider cuda`, `--execution-provider webgpu`
+9. Checks that `--execution-provider cuda`, `--execution-provider webgpu`
    (ORT's native EP -- no GPU/CUDA- or WebGPU-enabled ORT build on this
    runner), and an unknown provider name all fail cleanly the same way --
    see "Execution providers" above for what this does and doesn't prove.

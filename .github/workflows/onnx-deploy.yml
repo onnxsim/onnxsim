@@ -15,7 +15,11 @@ name: onnx-deploy
 # generated token sequence is exactly right and identical either way. See
 # that script's docstring for why the toy model's output is a direct
 # witness of the KV-cache threading being correct, not just "did it not
-# crash".
+# crash". A second toy export (scripts/make_toy_int8_kv_decoder.py) repeats
+# this against an INT8 KV cache -- the same graph shape
+# onnxsim.quantize_kv_cache produces -- proving detail::BorrowView's INT8
+# case in kv_cache_pipeline.h threads a quantized cache across many decode
+# steps, not just the original fp32/int64 tensors.
 #
 # Also checks execution-provider selection fails cleanly on this GPU-less
 # runner, rather than crashing: native --execution-provider cuda/webgpu
@@ -126,6 +130,32 @@ jobs:
           out=$(./build/onnx-deploy --libort "${{ env.ORT_NEWER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --max-new-tokens 8)
           echo "$out"
           echo "$out" | grep -qF "generated 8 token(s): 0 1 2 3 4 5 6 0"
+
+      - name: Generate the toy INT8 KV-cache decoder export and compute the expected sequence
+        working-directory: tools/onnx-deploy
+        run: |
+          python3 scripts/make_toy_int8_kv_decoder.py -o /tmp/toy_int8_kv --vocab-size 7 --decoder-start-token-id 2
+          python3 -c "
+          import sys; sys.path.insert(0, 'scripts')
+          from make_toy_int8_kv_decoder import compute_expected_ids
+          expected = compute_expected_ids(2, 7, 10)
+          print('expected:', expected)
+          assert expected == [2, 4, 1, 2, 4, 1, 2, 4, 1, 2], expected
+          "
+
+      - name: Run the CLI against the INT8 KV-cache export (${{ env.ORT_VERSION_OLDER }}) -- proves detail::BorrowView's INT8 case (onnxsim.quantize_kv_cache's output shape) threads through Generate() across many steps
+        working-directory: tools/onnx-deploy
+        run: |
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/toy_int8_kv 2 --max-new-tokens 10)
+          echo "$out"
+          echo "$out" | grep -qF "generated 10 token(s): 2 4 1 2 4 1 2 4 1 2"
+
+      - name: Swap the INT8 KV-cache export to ORT ${{ env.ORT_VERSION_NEWER }} at runtime -- same binary, no rebuild
+        working-directory: tools/onnx-deploy
+        run: |
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_NEWER_HOME }}/lib/libonnxruntime.so" /tmp/toy_int8_kv 2 --max-new-tokens 10)
+          echo "$out"
+          echo "$out" | grep -qF "generated 10 token(s): 2 4 1 2 4 1 2 4 1 2"
 
       - name: Early-stop at eos_token_id
         working-directory: tools/onnx-deploy
