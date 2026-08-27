@@ -10,6 +10,7 @@ from onnxsim.accuracy import (
     recommend_quantization,
 )
 from onnxsim.adaround import apply_adaround
+from onnxsim.aqlm import quantize_weight_only_aqlm
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
 from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
@@ -106,6 +107,7 @@ __all__ = [
     "quantize_weight_only_nf4",
     "NF4_CODEBOOK",
     "quantize_weight_only_squeezellm",
+    "quantize_weight_only_aqlm",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
