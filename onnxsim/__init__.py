@@ -30,6 +30,10 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.embedding_quantization import (
+    quantize_embedding_binary,
+    quantize_embedding_int8,
+)
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -122,6 +126,8 @@ __all__ = [
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
     "quantize_kv_cache",
+    "quantize_embedding_binary",
+    "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
