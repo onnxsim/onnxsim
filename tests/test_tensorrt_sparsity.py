@@ -5,30 +5,31 @@ TensorRT execution provider sparse math, see ``onnxsim/tensorrt_sparsity.py``.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=21, ir_version=10):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph,
-        opset_imports=[onnx.helper.make_opsetid("", opset)],
-        ir_version=ir_version,
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _run(model, feeds):
@@ -46,9 +47,14 @@ def test_2d_input_is_a_direct_swap_no_scaffold():
     K, N = 8, 4
     rng = np.random.default_rng(0)
     w = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(w, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
     )
 
     out = onnxsim.convert_matmul_to_gemm(model)
@@ -65,12 +71,14 @@ def test_3d_batched_input_gets_flatten_unflatten_scaffold():
     K, N = 8, 4
     rng = np.random.default_rng(1)
     w = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", "seq", K])],
-        [_vi("Y", ["batch", "seq", N])],
-        [_f32(w, "W")],
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
     )
 
     out = onnxsim.convert_matmul_to_gemm(model)
@@ -92,8 +100,15 @@ def test_1d_input_matches_matmuls_vector_promotion_semantics():
     K, N = 8, 4
     rng = np.random.default_rng(2)
     w = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [K])], [_vi("Y", [N])], [_f32(w, "W")])
+    model = _model(
+        f"""
+        g (float[{K}] X) => (float[{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
+    )
 
     out = onnxsim.convert_matmul_to_gemm(model)
     onnx.checker.check_model(out)
@@ -112,14 +127,19 @@ def test_unknown_rank_input_still_uses_correct_scaffold():
     K, N = 8, 4
     rng = np.random.default_rng(3)
     w = rng.standard_normal((K, N)).astype(np.float32)
-    x_vi = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [x_vi], [_vi("Y", ["batch", "seq", N])], [_f32(w, "W")]
+    model = _model(
+        f"""
+        g (float[1] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
     )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 21)], ir_version=10
-    )
+    # The text parser always sets a (possibly empty) shape; clear it entirely
+    # to reproduce make_tensor_value_info(..., shape=None)'s "rank not
+    # statically known" value info, which is what this test exercises.
+    model.graph.input[0].type.tensor_type.ClearField("shape")
 
     out = onnxsim.convert_matmul_to_gemm(model)
     assert "MatMul" not in _op_types(out)
@@ -135,12 +155,16 @@ def test_opset_below_13_is_a_no_op():
     K, N = 8, 4
     rng = np.random.default_rng(4)
     w = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(w, "W")]
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 12)], ir_version=8
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
+        opset=12,
+        ir_version=8,
     )
 
     out = onnxsim.convert_matmul_to_gemm(model)
@@ -149,12 +173,13 @@ def test_opset_below_13_is_a_no_op():
 
 def test_non_constant_weight_is_left_untouched():
     K, N = 8, 4
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W_dyn"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K]), _vi("W_dyn", [K, N])],
-        [_vi("Y", ["batch", N])],
-        [],
+        f"""
+        g (float[batch,{K}] X, float[{K},{N}] W_dyn) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W_dyn)
+        }}
+        """
     )
 
     out = onnxsim.convert_matmul_to_gemm(model)
@@ -164,12 +189,14 @@ def test_non_constant_weight_is_left_untouched():
 def test_non_2d_weight_is_left_untouched():
     rng = np.random.default_rng(5)
     w = rng.standard_normal((2, 8, 4)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", 2, 8])],
-        [_vi("Y", ["batch", 2, 4])],
-        [_f32(w, "W")],
+        """
+        g (float[batch,2,8] X) => (float[batch,2,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[_f32(w, "W")],
     )
 
     out = onnxsim.convert_matmul_to_gemm(model)
@@ -180,9 +207,14 @@ def test_existing_gemm_nodes_are_left_alone():
     K, N = 8, 4
     rng = np.random.default_rng(6)
     w = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(w, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
     )
 
     out = onnxsim.convert_matmul_to_gemm(model)
@@ -201,16 +233,16 @@ def test_composes_with_nm_pruning_weight_untouched_by_conversion():
     rng = np.random.default_rng(7)
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     w2 = rng.standard_normal((H, N)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
-        onnx.helper.make_node("Relu", ["h"], ["a"]),
-        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", "seq", K])],
-        [_vi("Y", ["batch", "seq", N])],
-        [_f32(w1, "W1"), _f32(w2, "W2")],
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
     )
 
     pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
@@ -234,14 +266,13 @@ def test_composes_with_nm_pruning_weight_untouched_by_conversion():
 
 
 def test_no_matmul_nodes_is_a_no_op():
-    graph = onnx.helper.make_graph(
-        [onnx.helper.make_node("Relu", ["X"], ["Y"])],
-        "g",
-        [_vi("X", [4])],
-        [_vi("Y", [4])],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 21)], ir_version=10
+    model = _model(
+        """
+        g (float[4] X) => (float[4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
     )
     out = onnxsim.convert_matmul_to_gemm(model)
     assert _op_types(out) == ["Relu"]
