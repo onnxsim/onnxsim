@@ -14,6 +14,10 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
+def _vi(name, shape):
+    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+
+
 def _model(body, opset=13, ir_version=8):
     return parser.parse_model(
         f"""
