@@ -1182,6 +1182,184 @@ def _oracle_keep_indices_conv(w, keep_count):
     return np.sort(np.argsort(-importance)[:keep_count])
 
 
+def _depthwise_pair_model(w1, dw_hops, w2, b1=None, spatial=10, activation="Relu"):
+    """The Conv-chain oracle builder, extended with zero or more depthwise
+    pass-through hops between producer and consumer: `dw_hops` is a list of
+    ``(weight[C1, 1, kH, kW], bias_or_None)`` depthwise Convs (``group`` is
+    always `weight.shape[0]`, so slicing `w1`/`dw_hops`/`w2` down together
+    -- as every test below does for its own "oracle" call -- keeps every
+    depthwise hop's `group` attribute consistent with its sliced weight for
+    free). Each hop, like the producer, is followed by `activation`.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        lines = ["h0 = Conv<kernel_shape=[3,3]>(X, W1, B1)"]
+        initializer.append(_f32(b1, "B1"))
+    else:
+        lines = ["h0 = Conv<kernel_shape=[3,3]>(X, W1)"]
+    lines.append(f"a0 = {activation}(h0)")
+    cur = "a0"
+    n_convs = 1
+    for i, (wd, bd) in enumerate(dw_hops):
+        group = wd.shape[0]
+        w_name, b_name = f"WD{i}", f"BD{i}"
+        initializer.append(_f32(wd, w_name))
+        if bd is not None:
+            initializer.append(_f32(bd, b_name))
+            lines.append(
+                f"hd{i} = Conv<kernel_shape=[3,3], group={group}>"
+                f"({cur}, {w_name}, {b_name})"
+            )
+        else:
+            lines.append(
+                f"hd{i} = Conv<kernel_shape=[3,3], group={group}>({cur}, {w_name})"
+            )
+        lines.append(f"ad{i} = {activation}(hd{i})")
+        cur = f"ad{i}"
+        n_convs += 1
+    lines.append(f"Y = Conv<kernel_shape=[3,3]>({cur}, W2)")
+    n_convs += 1
+    out_spatial = spatial - 2 * n_convs  # each 3x3 valid conv shrinks by 2
+    body = "\n          ".join(lines)
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_depthwise_pass_through_matches_manual_channel_deletion_exactly():
+    # A MobileNet/EfficientNet-style inverted-residual block:
+    # Conv(group=1) -> Relu -> DepthwiseConv(group=C1) -> Relu ->
+    # Conv(group=1). The depthwise layer mixes no channels at all -- output
+    # channel i depends only on input channel i -- so the chain walk must
+    # cross it transparently: the same channel-index set the real
+    # producer/consumer pair is pruned to also slices the depthwise layer's
+    # own weight and bias, and shrinks its `group` attribute to match.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(50)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wd = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)
+    bd = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _depthwise_pair_model(w1, [(wd, bd)], w2, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["WD0"].shape == (C1 // 2, 1, 3, 3)
+    assert inits["BD0"].shape == (C1 // 2,)
+    dw_node = next(n for n in pruned.graph.node if "WD0" in n.input)
+    group_attr = next(a for a in dw_node.attribute if a.name == "group")
+    assert group_attr.i == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _depthwise_pair_model(
+        w1[keep], [(wd[keep], bd[keep])], w2[:, keep], b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(51)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_multiple_consecutive_depthwise_pass_through_hops_matches_oracle():
+    # Two depthwise Convs back to back (e.g. a wider spatial receptive
+    # field built from stacked depthwise layers) -- both must be crossed
+    # transparently by the same channel-index set, each sliced and
+    # re-grouped independently. The second hop also has no bias, folding in
+    # that case too.
+    Cin, C1, C2 = 3, 12, 6
+    rng = np.random.default_rng(52)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    wd1 = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)
+    bd1 = rng.standard_normal((C1,)).astype(np.float32)
+    wd2 = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _depthwise_pair_model(w1, [(wd1, bd1), (wd2, None)], w2, spatial=14)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.25)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 - round(C1 * 0.25))
+    oracle = _depthwise_pair_model(
+        w1[keep], [(wd1[keep], bd1[keep]), (wd2[keep], None)], w2[:, keep], spatial=14
+    )
+
+    rng_x = np.random.default_rng(53)
+    x = rng_x.standard_normal((2, Cin, 14, 14)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_depthwise_pass_through_no_bias_matches_oracle():
+    # A depthwise hop with no bias at all -- its own [C1, 1, kH, kW] weight
+    # is the only thing that needs slicing for it.
+    Cin, C1, C2 = 4, 10, 5
+    rng = np.random.default_rng(54)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    wd = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _depthwise_pair_model(w1, [(wd, None)], w2, activation="Sigmoid")
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.3)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 - round(C1 * 0.3))
+    oracle = _depthwise_pair_model(
+        w1[keep], [(wd[keep], None)], w2[:, keep], activation="Sigmoid"
+    )
+
+    rng_x = np.random.default_rng(55)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_depthwise_pass_through_branch_is_left_untouched():
+    # A depthwise Conv whose output feeds more than one consumer (a
+    # branch) can't be crossed transparently either -- doing so would mean
+    # picking one branch to carry the chain forward while silently leaving
+    # the other reading a now-stale channel count. Left untouched, same as
+    # any other branching point this pass declines to guess at (the same
+    # single-consumer requirement every other hop in this pass already
+    # holds every intermediate tensor to).
+    Cin, C1 = 3, 8
+    rng = np.random.default_rng(56)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    wd = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C1},4,4] Y1, float[N,{C1},6,6] Y2)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          d = Conv<kernel_shape=[3,3], group={C1}>(a, WD)
+          Y1 = Conv<kernel_shape=[3,3]>(d, W2)
+          Y2 = Relu(d)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(wd, "WD"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["WD"], wd)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
 def test_structured_pruning_conv_chain_shrinks_matched_layers():
     Cin, C1, C2 = 3, 16, 8
     model = _conv_model(Cin=Cin, C1=C1, C2=C2, bias=True)
@@ -1244,11 +1422,13 @@ def test_structured_pruning_conv_only_chain_matches_oracle_no_bias():
 
 
 def test_structured_pruning_skips_grouped_producer_conv():
-    # A depthwise Conv (group == in_channels == out_channels) has its
-    # output and input channels tied 1:1 through its own weight -- not the
-    # independent per-index relationship this pass's cut assumes -- so it
-    # must be left completely untouched as a producer, even though the
-    # topology otherwise looks identical to a matched pair.
+    # A depthwise Conv (group == in_channels == out_channels) is never
+    # itself matched as a producer -- it's only ever a transparent
+    # pass-through hop the chain walk may cross between two real
+    # producer/consumer boundaries (see the "depthwise_pass_through" tests
+    # above). With nothing upstream of it here, there's no real producer to
+    # anchor a chain at all, so both layers stay completely untouched, even
+    # though the topology otherwise looks identical to a matched pair.
     C = 8
     rng = np.random.default_rng(34)
     w1 = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
@@ -1271,6 +1451,12 @@ def test_structured_pruning_skips_grouped_producer_conv():
 
 
 def test_structured_pruning_skips_grouped_consumer_conv():
+    # A depthwise Conv is likewise never matched as a *consumer* -- when
+    # its own output feeds a graph output (as here) rather than a further
+    # real Conv, crossing it as a pass-through hop simply runs out of chain
+    # to walk (see "depthwise Conv ... last node before a graph output" in
+    # this module's own docstring), so the walk finds no real consumer and
+    # the whole chain -- producer included -- is left untouched.
     Cin, C1 = 3, 8
     rng = np.random.default_rng(35)
     w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
@@ -1290,6 +1476,63 @@ def test_structured_pruning_skips_grouped_consumer_conv():
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["W1"], w1)
     np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_skips_general_grouped_producer_conv():
+    # A *general* grouped Conv (group=2, neither 1 nor equal to its own
+    # channel count) is not the depthwise special case above -- it stays
+    # completely out of scope, exactly as before this pass learned to cross
+    # depthwise Convs transparently.
+    C = 8
+    rng = np.random.default_rng(57)
+    w1 = rng.standard_normal((C, C // 2, 3, 3)).astype(np.float32)  # group=2
+    w2 = rng.standard_normal((C, C, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{C},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], group=2>(X, W1)
+          a = Relu(h)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_skips_general_grouped_consumer_conv():
+    # A general group=2 Conv sitting *between* a real producer and a real
+    # further consumer must also stay a hard stop, not a transparent hop --
+    # only the depthwise case (group == channel count, weight [C, 1, kH,
+    # kW]) is safe to cross, since only there is every output channel tied
+    # 1:1 to a single input channel with no cross-channel mixing at all.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(58)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, C1 // 2, 3, 3)).astype(np.float32)  # group=2
+    w3 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},14,14] X) => (float[N,{C2},8,8] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          m = Conv<kernel_shape=[3,3], group=2>(a, W2)
+          b = Relu(m)
+          Y = Conv<kernel_shape=[3,3]>(b, W3)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["W3"], w3)
 
 
 def test_structured_pruning_conv_into_non_pass_through_op_is_left_untouched():
@@ -1385,6 +1628,50 @@ def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
 
     oracle = _conv_pair_model(w1[keep], w2[:, keep])
     rng_x = np.random.default_rng(42)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_depthwise_pass_through_matches_oracle_exactly():
+    # Same oracle bar with a depthwise hop in the middle: the calibrated
+    # activation norm is captured right where the chain feeds its *real*
+    # consumer -- i.e. downstream of the (transparent) depthwise hop, not
+    # at the real producer's own raw output -- since a depthwise Conv
+    # contributes no importance of its own to the ranking.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(70)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    wd = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)
+    bd = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _depthwise_pair_model(w1, [(wd, bd)], w2)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("ad0", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(71)
+    x_cal = rng_cal.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    _, ad0_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ad0_cal.astype(np.float64)), axis=(0, 2, 3)))
+    importance = np.linalg.norm(
+        w1.reshape(C1, -1).astype(np.float64), axis=1
+    ) * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C1 // 2])
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = _depthwise_pair_model(w1[keep], [(wd[keep], bd[keep])], w2[:, keep])
+    rng_x = np.random.default_rng(72)
     x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})

@@ -123,9 +123,31 @@ already carries any bias in its own optional third input, and
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
 per-channel affine between two Convs isn't a shape this pass special-cases.
-A grouped or depthwise Conv (``group != 1``) is left untouched entirely:
-its output and input channels aren't independent per-index the way this
-pass's single producer/consumer cut assumes.
+A *general* grouped Conv (``group`` neither 1 nor equal to its channel
+count) is left untouched entirely: its output and input channels aren't
+independent per-index the way this pass's single producer/consumer cut
+assumes, and safely cutting a shared group's channels needs real
+group-aware bookkeeping this pass does not attempt (the same boundary
+attention-head pruning below draws around GroupQueryAttention). The
+*depthwise* special case (``group == in_channels == out_channels``,
+weight ``[C, 1, kH, kW]``) is different: with one filter per channel and
+no cross-channel mixing at all, output channel ``i`` depends only on
+input channel ``i``, so a depthwise Conv sitting between a chain's real
+producer and real consumer needs no independent importance of its own --
+the chain walk (:func:`_walk_to_conv_consumer`) crosses it transparently,
+like one more shape-preserving activation hop, carrying whatever
+channel-index set survives upstream straight through unchanged, while
+still slicing that depthwise layer's own weight/bias by the same indices
+and shrinking its ``group`` attribute to match. This is exactly the
+``Conv(1x1, group=1) -> DepthwiseConv(3x3, group=C) -> Conv(1x1,
+group=1)`` "inverted residual" block MobileNet/EfficientNet-style
+efficient CNN backbones use throughout, so it's worth the special case; a
+depthwise Conv is never itself matched as a producer or consumer (see
+:func:`_match_conv_producer`/:func:`_match_conv_consumer`), only ever a
+transparent hop between two real ``group=1`` Conv boundaries -- one
+sitting last before a graph output or an unhandled branch simply ends the
+chain unmatched, same as any other topology this pass declines to guess
+at.
 :func:`apply_structured_wanda_pruning` is the calibrated upgrade of that
 same technique -- ``||W_row||_2 * ||X||_2`` per channel instead of weight
 magnitude alone -- exactly the same relationship Wanda has to plain
@@ -934,6 +956,25 @@ class _Producer:
 
 
 @dataclass(frozen=True)
+class _ConvPassThrough:
+    """A depthwise Conv (``group == in_channels == out_channels``) the chain
+    walk crossed transparently between a Conv chain's real producer and real
+    consumer. A depthwise Conv mixes no channels at all -- output channel
+    ``i`` depends only on input channel ``i`` -- so it needs no independent
+    importance of its own the way a producer/consumer boundary does; it is
+    carried on the matched :class:`_Chain` purely so :func:`_apply_chains`
+    can slice its own ``[C, 1, kH, kW]`` weight (and bias, if present) by
+    the *same* `keep` index set as the chain's real producer, and update its
+    ``group`` attribute to the new channel count. See
+    :func:`_walk_to_conv_consumer`.
+    """
+
+    node: onnx.NodeProto
+    weight: str
+    bias: Optional[str]
+
+
+@dataclass(frozen=True)
 class _Chain:
     # One producer for a plain chain; two for a gated (elementwise-product)
     # pair, where both branches must agree on which channels survive.
@@ -947,6 +988,10 @@ class _Chain:
     # ``[out_channels, in_channels, kH, kW]`` weight, regardless of
     # `consumer_weight_transposed` (unused then).
     consumer_is_conv: bool = False
+    # Depthwise Conv hops the chain walk crossed transparently between the
+    # real producer and the real consumer (Conv chains only -- see
+    # :class:`_ConvPassThrough`; always empty for a MatMul/Gemm chain).
+    conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
 
 
 def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
@@ -1121,7 +1166,13 @@ def _match_conv_producer(
     ``(weight_name, bias_name_or_None, out_channels)``. A grouped or
     depthwise Conv (``group != 1``) never matches: its output and input
     channels aren't independent per-index the way this pass's single
-    producer/consumer cut assumes.
+    producer/consumer cut assumes -- true here too for the depthwise case,
+    even though a depthwise Conv *is* given a narrower exception elsewhere
+    in this pass, as a transparent pass-through hop the chain walk may
+    cross between two real producer/consumer boundaries (see
+    :func:`_match_depthwise_conv_pass_through`,
+    :func:`_walk_to_conv_consumer`) -- it is never itself matched as a
+    producer.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -1146,7 +1197,11 @@ def _match_conv_consumer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, int]]:
     """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
-    4-D float32 weight, returns ``(weight_name, in_channels)``.
+    4-D float32 weight, returns ``(weight_name, in_channels)``. Like
+    :func:`_match_conv_producer`, a depthwise Conv never matches here
+    either -- it's only ever a transparent pass-through hop the chain walk
+    crosses en route to a *real* ``group=1`` consumer, never a consumer
+    itself (see :func:`_match_depthwise_conv_pass_through`).
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -1162,6 +1217,47 @@ def _match_conv_consumer(
     return w_name, w_init.dims[1]
 
 
+def _match_depthwise_conv_pass_through(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    n_channels: int,
+) -> Optional[Tuple[str, Optional[str]]]:
+    """If `node` is a depthwise 2-D ``Conv`` (``group == in_channels ==
+    out_channels == n_channels``) with a constant ``[n_channels, 1, kH,
+    kW]`` float32 weight (and, if present, a constant bias), returns
+    ``(weight_name, bias_name_or_None)``. A depthwise Conv mixes no channels
+    at all -- output channel ``i`` depends only on input channel ``i`` --
+    unlike a general grouped Conv (``group`` neither 1 nor `n_channels`),
+    which is not matched here and stays out of scope for this pass entirely
+    (see :func:`_match_conv_producer`/:func:`_match_conv_consumer`'s own
+    docstrings): only in the depthwise case is every output channel tied
+    1:1 to the same-index input channel, which is what lets the chain walk
+    (:func:`_walk_to_conv_consumer`) treat it as a transparent pass-through
+    hop -- carrying whatever channel-index set survives upstream straight
+    through, unchanged -- rather than a producer or consumer of its own.
+    """
+    if node.op_type != "Conv" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 4
+        or w_init.dims[0] != n_channels
+        or w_init.dims[1] != 1
+        or _conv_group(node) != n_channels
+    ):
+        return None
+    bias_name = None
+    if len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        b_init = initializer_map.get(bias_name)
+        if b_init is None or b_init.data_type != onnx.TensorProto.FLOAT:
+            return None  # non-constant bias -- can't safely prune it
+    return w_name, bias_name
+
+
 def _walk_to_conv_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -1170,17 +1266,28 @@ def _walk_to_conv_consumer(
     n_channels: int,
     max_hops: int,
 ) -> Tuple[
-    Optional[Tuple[onnx.NodeProto, str]], Tuple[Tuple[onnx.NodeProto, None], ...]
+    Optional[Tuple[onnx.NodeProto, str]],
+    Tuple[Tuple[onnx.NodeProto, None], ...],
+    Tuple[_ConvPassThrough, ...],
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
-    `_UNARY_PASS_THROUGH`) with no other consumer anywhere along the way,
-    until an ordinary Conv consumer is found whose input channel count
-    matches `n_channels`. Unlike the MatMul/Gemm walk, no per-channel
+    `_UNARY_PASS_THROUGH`) and depthwise Conv hops (see
+    :func:`_match_depthwise_conv_pass_through` -- transparent to the
+    channel-index mapping, but each still needs its own weight/bias sliced
+    and its ``group`` attribute updated, so they're returned separately as
+    `conv_pass_through` rather than folded into `chain_ops`) with no other
+    consumer anywhere along the way, until an ordinary (``group=1``) Conv
+    consumer is found whose input channel count matches `n_channels`. A
+    depthwise Conv is only ever a transparent hop, never a match for the
+    consumer role itself -- one sitting last before a graph output or a
+    branch simply ends the walk with no consumer found, same as any other
+    unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
     ``Add``/``Mul`` op is recognized -- see this module's own docstring for
     why that's out of scope for Conv chains.
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
+    conv_pass_through: List[_ConvPassThrough] = []
     consumer = None
     cur = start
     for _hop in range(max_hops):
@@ -1190,6 +1297,18 @@ def _walk_to_conv_consumer(
         nxt = candidates[0]
 
         if nxt.op_type == "Conv" and nxt.input[0] == cur:
+            depthwise = _match_depthwise_conv_pass_through(
+                nxt, initializer_map, n_channels
+            )
+            if depthwise is not None:
+                out2 = nxt.output[0]
+                if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                    break
+                dw_weight, dw_bias = depthwise
+                conv_pass_through.append(_ConvPassThrough(nxt, dw_weight, dw_bias))
+                cur = out2
+                continue
+
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
                 consumer = (nxt, match[0])
@@ -1208,7 +1327,7 @@ def _walk_to_conv_consumer(
         chain_ops.append((nxt, None))
         cur = out2
 
-    return consumer, tuple(chain_ops)
+    return consumer, tuple(chain_ops), tuple(conv_pass_through)
 
 
 def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
@@ -1230,7 +1349,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if not _is_internal(out_name):
             continue
 
-        consumer, chain_ops = _walk_to_conv_consumer(
+        consumer, chain_ops, conv_pass_through = _walk_to_conv_consumer(
             out_name,
             initializer_map,
             consumers_of,
@@ -1250,6 +1369,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 consumer_weight_transposed=False,
                 n_channels=n_channels,
                 consumer_is_conv=True,
+                conv_pass_through=conv_pass_through,
             )
         )
     return chains
@@ -1499,12 +1619,17 @@ def _apply_chains(
     producer_touched: Set[str] = set()
     consumer_touched: Set[str] = set()
     const_touched: Set[str] = set()
+    conv_hop_touched: Set[str] = set()
     stale_value_info: Set[str] = set()
 
     for chain in chains:
         producer_weights = {p.weight for p in chain.producers}
         if len(producer_weights) != len(chain.producers):
             continue  # degenerate (a gated pair naming the same weight twice)
+
+        conv_hop_weights = {h.weight for h in chain.conv_pass_through}
+        if len(conv_hop_weights) != len(chain.conv_pass_through):
+            continue  # degenerate (the same depthwise weight named twice)
 
         consts = {p.bias for p in chain.producers if p.bias is not None}
         consts.update(
@@ -1514,6 +1639,7 @@ def _apply_chains(
             (producer_weights & producer_touched)
             or chain.consumer_weight in consumer_touched
             or (consts & const_touched)
+            or (conv_hop_weights & conv_hop_touched)
         ):
             continue  # a shared/tied initializer another chain already resized
 
@@ -1542,6 +1668,28 @@ def _apply_chains(
         for _, const_name in chain.chain_ops:
             if const_name is not None:
                 _slice_last_axis(initializer_map[const_name], keep)
+        for hop in chain.conv_pass_through:
+            # Same `keep` index set as the real producer -- a depthwise
+            # Conv's own channel i is exactly upstream channel i, so its
+            # weight (output-channel axis 0, like any Conv producer) and
+            # bias slice identically, and `group` (== in_channels ==
+            # out_channels for a depthwise Conv) drops to the new count
+            # right alongside them.
+            _slice_producer_weight(
+                initializer_map[hop.weight], False, keep, is_conv=True
+            )
+            if hop.bias is not None:
+                _slice_last_axis(initializer_map[hop.bias], keep)
+            found_group = False
+            for attr in hop.node.attribute:
+                if attr.name == "group":
+                    attr.i = keep_count
+                    found_group = True
+                    break
+            if not found_group:
+                hop.node.attribute.append(
+                    onnx.helper.make_attribute("group", keep_count)
+                )
         _slice_consumer_weight(
             initializer_map[chain.consumer_weight],
             chain.consumer_weight_transposed,
@@ -1552,12 +1700,14 @@ def _apply_chains(
         producer_touched.update(producer_weights)
         consumer_touched.add(chain.consumer_weight)
         const_touched.update(consts)
+        conv_hop_touched.update(conv_hop_weights)
         for p in chain.producers:
             stale_value_info.add(p.node.output[0])
             stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
         stale_value_info.update(
             chain_node.output[0] for chain_node, _ in chain.chain_ops
         )
+        stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
 
     if stale_value_info:
         kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
@@ -1596,10 +1746,17 @@ def apply_structured_pruning(
     The same cut applies to ordinary (``group=1``) 2-D ``Conv`` producer ->
     consumer pairs -- each output filter's whole ``[in_channels, kH, kW]``
     kernel ranked by its own L2 norm, exactly Li et al.'s original filter-
-    pruning criterion -- joined only by unary activations (no per-channel
-    Add/Mul: a Conv already carries its own bias, and ``BatchNormalization``
-    is expected to already be fused into the preceding Conv by the time this
-    pass runs). A grouped or depthwise Conv is left untouched.
+    pruning criterion -- joined by unary activations and/or depthwise Conv
+    hops (``group == in_channels == out_channels``: one filter per channel,
+    no cross-channel mixing, so it's crossed transparently -- its own
+    weight/bias sliced by the producer's channel indices and its ``group``
+    attribute shrunk to match, but it contributes no importance of its own
+    and can't itself be the producer or consumer -- see this module's own
+    docstring). No per-channel Add/Mul between two Convs (a Conv already
+    carries its own bias, and ``BatchNormalization`` is expected to already
+    be fused into the preceding Conv by the time this pass runs). A
+    *general* grouped Conv (``group`` neither 1 nor its channel count) is
+    left untouched.
 
     Also handles the gated FFN pattern most current LLMs use in place of a
     plain two-layer MLP (SwiGLU/GeGLU: ``down(act(gate(x)) * up(x))``, see
@@ -1646,8 +1803,13 @@ def apply_structured_wanda_pruning(
     as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
     same real structural channel removal, same topology matching (a single
     producer or a gated pair -> zero or more shape-preserving elementwise
-    ops -> one consumer, MatMul/Gemm or Conv, see
-    :func:`apply_structured_pruning`'s own docstring), but each chain's
+    ops and, for a Conv chain, depthwise Conv hops -> one consumer,
+    MatMul/Gemm or Conv, see :func:`apply_structured_pruning`'s own
+    docstring) including the same depthwise-Conv pass-through sliced by the
+    producer's channel indices alone -- it contributes no activation norm
+    of its own to the ranking either, being transparent to the chain's
+    channel-index mapping just as it is to plain L2-norm importance -- but
+    each chain's
     output channels are ranked by ``||W_row||_2 * ||X||_2`` -- L2 norm of
     that channel's own weight row (or, for Conv, whole filter), times the
     L2 norm of the *activation* actually flowing through that channel over

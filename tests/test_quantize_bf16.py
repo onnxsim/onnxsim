@@ -30,6 +30,7 @@ import onnx.helper
 import onnx.numpy_helper
 import onnx.shape_inference
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -39,15 +40,18 @@ ort = pytest.importorskip("onnxruntime")
 ml_dtypes = pytest.importorskip("ml_dtypes")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape, elem_type=onnx.TensorProto.FLOAT):
-    return onnx.helper.make_tensor_value_info(name, elem_type, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -94,12 +98,17 @@ def _two_matmul_model():
     k, n1, n2 = 16, 12, 8
     w1 = _f32(rng.standard_normal((k, n1)) * 0.5, "W1")
     w2 = _f32(rng.standard_normal((n1, n2)) * 0.5, "W2")
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["H"]),
-        onnx.helper.make_node("Relu", ["H"], ["Hr"]),
-        onnx.helper.make_node("MatMul", ["Hr", "W2"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, k])], [_vi("Y", [4, n2])], [w1, w2])
+    model = _model(
+        f"""
+        g (float[4,{k}] X) => (float[4,{n2}] Y)
+        {{
+          H = MatMul(X, W1)
+          Hr = Relu(H)
+          Y = MatMul(Hr, W2)
+        }}
+        """,
+        initializer=[w1, w2],
+    )
     return model, rng, k, n2
 
 
@@ -147,7 +156,9 @@ def test_quantize_bf16_no_keep_io_types():
 def test_quantize_bf16_converts_constant_node():
     # A Constant node's embedded value is a float32 "inline initializer" --
     # FetchConstantTensor covers it the same way as a true graph
-    # initializer, so it should be converted too.
+    # initializer, so it should be converted too. The weight is built as a
+    # real Constant node (kept on onnx.helper rather than a parsed
+    # initializer) because that's specifically what this test exercises.
     rng = np.random.default_rng(1)
     k, n = 8, 4
     w = rng.standard_normal((k, n)).astype(np.float32)
@@ -157,10 +168,15 @@ def test_quantize_bf16_converts_constant_node():
         ["W"],
         value=onnx.numpy_helper.from_array(w, "W"),
     )
-    matmul_node = onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])
     model = _model(
-        [const_node, matmul_node], [_vi("X", [3, k])], [_vi("Y", [3, n])], []
+        f"""
+        g (float[3,{k}] X) => (float[3,{n}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """
     )
+    model.graph.node.insert(0, const_node)
 
     quant = onnxsim.quantize_bf16(model)
     onnx.checker.check_model(quant)
@@ -177,8 +193,15 @@ def test_quantize_bf16_no_clamping_needed_for_large_values():
     # stays finite, and NaN stays NaN, with no special-casing in the pass.
     w = np.array([[1.0e10, -1.0e10, 3.0, float("nan")]], dtype=np.float32)
     weight = _f32(w, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 1])], [_vi("Y", [2, 4])], [weight])
+    model = _model(
+        """
+        g (float[2,1] X) => (float[2,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_bf16(model)
     onnx.checker.check_model(quant)
@@ -195,12 +218,14 @@ def test_quantize_bf16_skips_optional_input_default_initializer():
     # input with a default value" convention) is left alone entirely -- see
     # quantize_bf16.h's doc comment.
     w = _f32(np.random.randn(4, 2).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", [3, 4]), _vi("W", [4, 2])],
-        [_vi("Y", [3, 2])],
-        [w],
+        """
+        g (float[3,4] X, float[4,2] W) => (float[3,2] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[w],
     )
 
     quant = onnxsim.quantize_bf16(model)
@@ -238,8 +263,14 @@ def test_quantize_bf16_boundary_casts_execute():
     # onnxruntime 1.29) CPUExecutionProvider has a bfloat16 Cast/Identity
     # kernel but no bfloat16 MatMul/Relu/Add kernel -- see this file's
     # module docstring.
-    nodes = [onnx.helper.make_node("Identity", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 3])], [_vi("Y", [2, 3])], [])
+    model = _model(
+        """
+        g (float[2,3] X) => (float[2,3] Y)
+        {
+          Y = Identity(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_bf16(model)
     onnx.checker.check_model(quant)

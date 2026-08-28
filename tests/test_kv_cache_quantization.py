@@ -30,6 +30,14 @@ def _model(body, opset=13, ir_version=8):
     )
 
 
+def _vi(name, shape):
+    # Value-info builder for the handful of tests below that use dotted
+    # tensor names (e.g. "past_key_values.0.value") -- onnx.parser's text
+    # format has no syntax for identifiers containing ".", so those graphs
+    # stay on onnx.helper.make_graph/make_model construction.
+    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+
+
 def _kv_cache_model(batch=1, heads=2, head_dim=4, opset=13, symbolic_seq=True):
     # new_key is deliberately routed through an Identity node rather than
     # being a bare graph input: a real exported decoder's "new" K/V is
