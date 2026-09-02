@@ -17540,6 +17540,77 @@ def test_analyze_structured_pruning_matmul_nbits_matches_real_call():
     assert inits["B2"].dims[1] == kept // block_size  # consumer's block axis
 
 
+def test_analyze_structured_pruning_matmul_nbits_mixed_plain_float_consumer_matches_real_call():
+    # onnxsim/onnxsim#969 generalized `_MatMulNBitsChain.producer`/`.consumer`
+    # to a `_MatMulNBitsWeight | _PlainMatMulNBitsPeer` union (mixed
+    # MatMulNBits/plain-float chains) -- this dry-run mirror must handle a
+    # plain-float CONSUMER exactly like the real call does: no block
+    # structure at all, so the producer's own top-keep_count-by-norm
+    # keep-set applies directly, would_drop/margin computed the same way
+    # a MatMulNBits-to-MatMulNBits chain's would be, never declined for
+    # "non-block-aligned" (that check doesn't even apply here). Same shape
+    # as test_matmul_nbits_pruning_mixed_matmulnbits_producer_then_plain_float_consumer_matches_oracle.
+    N1, K1, Out, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(120)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0  # rows 0-15: large magnitude (kept); 16-31: small (dropped)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
+    ZP1 = _nbits_pack_codes(zp1, 4)
+
+    W2 = rng.standard_normal((N1, Out)).astype(np.float32) * 0.3  # [K, N] storage
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", "bias1", N1, K1, block_size
+    )
+    act = onnx.helper.make_node("Relu", ["h1"], ["h1_act"])
+    node2 = onnx.helper.make_node("MatMul", ["h1_act", "W2"], ["Y"], name="mm2")
+    graph = onnx.helper.make_graph(
+        [node1, act, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, Out])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(scales1, name="scales1"),
+            onnx.numpy_helper.from_array(ZP1, name="zp1"),
+            onnx.numpy_helper.from_array(bias1, name="bias1"),
+            onnx.numpy_helper.from_array(W2, name="W2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_nbits"
+    assert layer.total == N1
+    assert layer.would_drop == 16
+    assert layer.margin is not None and layer.margin > 0.5
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = N1 - layer.would_drop
+    assert inits["B1"].dims[0] == kept
+    assert inits["W2"].dims[0] == kept  # plain-float consumer -- no block axis
+
+
 def test_analyze_structured_pruning_matmul_nbits_not_eligible_lists_unmatched_nodes():
     # Mirrors test_analyze_structured_pruning_qdq_not_eligible_lists_unmatched_nodes
     # for the MatMulNBits family: a third, orphan MatMulNBits node reading

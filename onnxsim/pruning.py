@@ -17684,7 +17684,8 @@ def _analyze_structured_pruning_matmul_nbits(
 
     for chain in chains:
         p, c = chain.producer, chain.consumer
-        p_key, c_key = p.b_init.name, c.b_init.name
+        p_key = _matmul_nbits_chain_side_key(p)
+        c_key = _matmul_nbits_chain_side_key(c)
         if p_key == c_key:
             continue  # degenerate (the same weight in both roles) -- no report row
 
@@ -17721,7 +17722,7 @@ def _analyze_structured_pruning_matmul_nbits(
             )
             continue  # rounds down to nothing for this chain -- no-op
 
-        w_nk = _matmul_nbits_dequantized(p)
+        w_nk = _matmul_nbits_chain_producer_weight_nk(p)
         importance = _qdq_channel_importance(w_nk, importance_norm)
         # `kind="stable"` to match `apply_structured_pruning_matmul_nbits`'s
         # own tie-break exactly (see that function's own comment on this
@@ -17730,24 +17731,31 @@ def _analyze_structured_pruning_matmul_nbits(
         # the real call's, platform-dependently.
         keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-            keep, c.k_blocks, c.block_size
-        )
-        if keep_blocks is None:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
+        # Block-alignment only applies when the CONSUMER is itself a
+        # `MatMulNBits` node (see `apply_structured_pruning_matmul_nbits`'s
+        # own identical branch): a plain-float consumer (mixed-chain support,
+        # onnxsim/onnxsim#969) has no block structure at all, so any keep-set
+        # applies directly there -- mirrored here so this dry-run's
+        # would_drop/margin never diverges from what the real call decides.
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
             )
-            continue  # non-block-aligned keep-set for this consumer -- the
-            # real call declines this chain entirely too, see this
-            # function's own docstring
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # non-block-aligned keep-set for this consumer --
+                # the real call declines this chain entirely too, see this
+                # function's own docstring
 
         keep_mask = np.zeros(n, dtype=bool)
         keep_mask[keep] = True
