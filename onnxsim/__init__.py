@@ -35,6 +35,7 @@ from onnxsim.calibration import (
     quantize_static_int16,
 )
 from onnxsim.coreml_export import export_coreml
+from onnxsim.d2quant import apply_dac, apply_dsq
 from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.duquant import apply_duquant
 from onnxsim.embedding_quantization import (
@@ -192,6 +193,8 @@ __all__ = [
     "apply_rptq_reorder",
     "apply_outlier_suppression_plus",
     "apply_outlier_suppression",
+    "apply_dsq",
+    "apply_dac",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_mixed_precision_quantization",
