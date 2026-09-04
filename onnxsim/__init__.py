@@ -160,6 +160,7 @@ from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.quantease import apply_quantease
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
+from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
 from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
@@ -223,6 +224,7 @@ __all__ = [
     "apply_duquant",
     "apply_zeroquant",
     "apply_spinquant",
+    "apply_rotatekv",
     "apply_omniquant",
     "apply_affinequant",
     "apply_magnitude_pruning",
