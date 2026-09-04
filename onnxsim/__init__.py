@@ -19,6 +19,7 @@ from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
 from onnxsim.bias_correction import correct_bias
 from onnxsim.billm import quantize_weight_only_billm
+from onnxsim.bwa_ptq import apply_bwa_ptq
 from onnxsim.calibration import (
     calibrate,
     generate_random_calibration_data,
@@ -66,11 +67,14 @@ from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
     apply_attention_head_pruning_cpp,
+    apply_attention_head_wanda_pruning_cpp,
     apply_double_quantization_cpp,
     apply_embedding_vocab_magnitude_pruning_cpp,
     apply_embedding_vocab_pruning_cpp,
     apply_moe_expert_channel_pruning_cpp,
+    apply_moe_whole_expert_pruning_cpp,
     apply_qmoe_expert_channel_pruning_cpp,
+    apply_qmoe_whole_expert_pruning_cpp,
     apply_quarot_cpp,
     apply_structured_pruning_cpp,
     apply_structured_wanda_pruning_cpp,
@@ -188,6 +192,7 @@ __all__ = [
     "apply_flexround",
     "apply_fptq",
     "apply_owq",
+    "apply_bwa_ptq",
     "quantize_with_ppq",
     "apply_smoothquant",
     "apply_rptq_reorder",
@@ -225,12 +230,15 @@ __all__ = [
     "apply_attention_head_pruning",
     "apply_attention_head_pruning_cpp",
     "apply_attention_head_wanda_pruning",
+    "apply_attention_head_wanda_pruning_cpp",
     "apply_moe_expert_channel_pruning",
     "apply_moe_expert_channel_pruning_cpp",
     "apply_moe_whole_expert_pruning",
+    "apply_moe_whole_expert_pruning_cpp",
     "apply_qmoe_expert_channel_pruning",
     "apply_qmoe_expert_channel_pruning_cpp",
     "apply_qmoe_whole_expert_pruning",
+    "apply_qmoe_whole_expert_pruning_cpp",
     "apply_embedding_vocab_pruning",
     "apply_embedding_vocab_pruning_cpp",
     "apply_embedding_vocab_magnitude_pruning",

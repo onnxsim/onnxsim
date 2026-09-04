@@ -207,6 +207,20 @@ def _read_tensor(entry: _SafetensorsEntry, name: str) -> onnx.TensorProto:
         )
     onnx_dtype, np_dtype = _SAFETENSORS_DTYPE_TO_ONNX[entry.dtype]
     arr = np.frombuffer(raw, dtype=np_dtype).reshape(entry.shape)
+    # safetensors is always little-endian on disk, so np_dtype above is
+    # explicitly "<..." regardless of host order -- correct for *decoding*
+    # `raw` (frombuffer reinterprets those bytes as little-endian
+    # regardless of host order), but on a big-endian host the resulting
+    # array's own dtype object stays tagged "<..." too, and
+    # onnx.numpy_helper.from_array's dtype->TensorProto lookup only
+    # recognizes a *native*-order dtype (np.dtype("f4") is "<f4" on a
+    # little-endian host, so this was never visible there) -- confirmed via
+    # this module's own big-endian CI. astype() to the platform's native
+    # byte order both fixes that lookup and -- unlike a bare view/reinterpret
+    # -- correctly byte-swaps the underlying bytes so the decoded values
+    # themselves are unchanged (a single-byte dtype like I8/U8/BOOL has no
+    # byte order to normalize, so this is a harmless no-op copy for those).
+    arr = arr.astype(arr.dtype.newbyteorder("="))
     return onnx.numpy_helper.from_array(arr, name=name)
 
 

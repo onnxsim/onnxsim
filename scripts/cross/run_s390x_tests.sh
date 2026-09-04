@@ -100,6 +100,10 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # scripts/apple/run_quality_eval and scripts/apple/aggregate_quality_trend the
 # same way. test_rtdetrv4.py imports onnxruntime directly at module scope for
 # the same "no s390x build" reason as test_qnn_compat.py and friends above.
+# test_pulsar2_compat.py and test_pulsar2_simulator.py import pulsar2_backend/
+# pulsar2_simulator from scripts/axera/ at module scope, the identical "vendor
+# module not copied into the chroot" reason as the four vendor-compat tests
+# above.
 #
 # The three deselected BN-fusion tests fail onnxsim's own check_n equivalence
 # check whenever onnxruntime is absent and the reference evaluator is used
@@ -131,6 +135,7 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_openvino_compat.py --ignore=tests/test_check_decode_parity.py \
   --ignore=tests/test_compute_retention.py --ignore=tests/test_rtdetrv4.py \
   --ignore=tests/test_run_quality_eval.py --ignore=tests/test_aggregate_quality_trend.py \
+  --ignore=tests/test_pulsar2_compat.py --ignore=tests/test_pulsar2_simulator.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
   --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_with_bias_bn_into_conv ${PYTEST_ARGS:-}"

@@ -4556,12 +4556,16 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
 // _match_attention_producer/_walk_to_attention_consumer/
 // _find_attention_chains, _match_gqa_producer/_match_onnx_attention_producer/
 // _find_separate_qkv_chains, and _apply_one_plain_attention_chain/
-// _apply_one_gqa_chain/_apply_attention_chains. Data-free (magnitude/
-// Frobenius-norm) only -- pruning.py's own calibration-driven
-// apply_attention_head_wanda_pruning is not ported, matching this codebase's
-// established C++-port scope decision (data-free/closed-form techniques
-// only). Three fused self-attention ops are matched, each at the
-// granularity its own kernel contract allows -- see pruning.py's own
+// _apply_one_gqa_chain/_apply_attention_chains. The plain (data-free,
+// magnitude/Frobenius-norm) ranking below is shared, via
+// ApplyOnePlainAttentionChain/ApplyOneGqaChain's own optional trailing
+// `act_norm`/`epsilon` parameters, with the calibration-driven Wanda
+// upgrade (ApplyAttentionHeadWandaPruning, see this file's own "Wanda
+// calibration" section and structured_pruning_entry.h's own declaration
+// comment) -- mirroring pruning.py's own apply_attention_head_wanda_pruning,
+// the calibrated upgrade of apply_attention_head_pruning below it. Three
+// fused self-attention ops are matched, each at the granularity its own
+// kernel contract allows -- see pruning.py's own
 // "Attention-head pruning" section comment for the full rationale (packed-
 // QKV vs. separate-Q/K/V weight layout, individual-head vs. whole-KV-group
 // pruning unit, and why the plain ai.onnx::Attention op reuses the
@@ -5063,12 +5067,27 @@ struct AppliedAttn {
 };
 
 // Applies whole-head pruning to one matched com.microsoft::Attention block
-// in place -- mirrors pruning.py's own _apply_one_plain_attention_chain
-// (data-free/magnitude importance only; the Wanda variant's importance
-// callback indirection is not ported, see this section's own scope note).
+// in place -- mirrors pruning.py's own _apply_one_plain_attention_chain.
+// `act_norm`/`epsilon` mirror ApplyChains' own trailing parameters of the
+// same name exactly (see that function's own doc comment): when `act_norm`
+// is non-null and holds an entry for `chain.consumer_node->input(0)` (the
+// output projection's own input -- the same probe point
+// ApplyAttentionHeadWandaPruning's own `probe_axis` map uses) whose length
+// matches `chain.nv` (the merged QKV weight's own V-width, i.e. this
+// activation's own channel count), each head's plain Frobenius-norm weight
+// importance is multiplied by that head's own combined (root-sum-square)
+// activation norm -- mirrors pruning.py's own
+// `_wanda_attention_head_importance` exactly, including its fallback to
+// plain `base` (left untouched) whenever no matching activation was
+// observed. `nullptr` (the default, and every plain ApplyAttentionChains
+// call site's own unchanged argument count) keeps this identically the
+// plain ``||W||_F``-only ranking it always was.
 std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
-    AttnChain& chain, double sparsity) {
+    AttnChain& chain, double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   const int64_t h = chain.num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5101,6 +5120,26 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
       }
     }
     importance[static_cast<size_t>(hh)] = std::sqrt(sq);
+  }
+
+  // Wanda upgrade: multiply each head's plain ||W||_F by its own combined
+  // (root-sum-square) V-width-wide slice of the calibrated output-
+  // projection input activation -- mirrors pruning.py's own
+  // `_wanda_attention_head_importance` exactly (see this function's own
+  // doc comment above).
+  if (act_norm != nullptr) {
+    auto it = act_norm->find(chain.consumer_node->input(0));
+    if (it != act_norm->end() &&
+        it->second.size() == static_cast<size_t>(chain.nv)) {
+      for (int64_t hh = 0; hh < h; ++hh) {
+        double sq = 0.0;
+        for (int64_t c = hh * dv; c < (hh + 1) * dv; ++c) {
+          const double v = it->second[static_cast<size_t>(c)];
+          sq += v * v;
+        }
+        importance[static_cast<size_t>(hh)] *= std::max(std::sqrt(sq), epsilon);
+      }
+    }
   }
 
   std::vector<int64_t> keep_heads =
@@ -5170,10 +5209,30 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
 
 // Applies whole-KV-group pruning to one matched GroupQueryAttention or
 // plain ai.onnx::Attention block in place -- mirrors pruning.py's own
-// _apply_one_gqa_chain (data-free/magnitude importance only).
+// _apply_one_gqa_chain. `act_norm`/`epsilon` mirror
+// ApplyOnePlainAttentionChain's own trailing parameters of the same name
+// exactly (see that function's own doc comment): when `act_norm` is
+// non-null and holds an entry for `chain.consumer_node->input(0)` whose
+// length matches `chain.num_heads * chain.head_size` (this C++ port's
+// Q/K/V-uniform-head_size scope, see AttnChain's own `head_size` field --
+// the output projection's own input width, laid out per *query* head),
+// each KV group's plain Frobenius-norm weight importance is multiplied by
+// that group's own combined (root-sum-square) activation norm, summed
+// over every query head the group owns -- mirrors pruning.py's own
+// `_wanda_gqa_group_importance` exactly (there keyed by `chain.v_head_size`,
+// which pruning.py's own separate Q/K vs. V head-size support can genuinely
+// differ from `chain.head_size`; this port declines that shape entirely,
+// see FindGqaChains'/FindOnnxAttentionChains' own uniform-head_size
+// requirement, so `chain.head_size` alone is exact here), including its
+// fallback to plain `base` (left untouched) whenever no matching activation
+// was observed. `nullptr` (the default) keeps this identically the plain
+// ``||W||_F``-only ranking it always was.
 std::optional<AppliedAttn> ApplyOneGqaChain(
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
-    AttnChain& chain, double sparsity) {
+    AttnChain& chain, double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5236,6 +5295,27 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     importance[static_cast<size_t>(kv)] = std::sqrt(sq);
   }
 
+  // Wanda upgrade: multiply each KV group's plain ||W||_F by its own
+  // combined (root-sum-square) slice of the calibrated output-projection
+  // input activation, summed over every query head the group owns --
+  // mirrors pruning.py's own `_wanda_gqa_group_importance` exactly (see
+  // this function's own doc comment above).
+  if (act_norm != nullptr) {
+    auto it = act_norm->find(chain.consumer_node->input(0));
+    if (it != act_norm->end() &&
+        it->second.size() == static_cast<size_t>(chain.num_heads * d)) {
+      for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+        double sq = 0.0;
+        for (int64_t c = kv * group_size * d; c < (kv + 1) * group_size * d;
+             ++c) {
+          const double v = it->second[static_cast<size_t>(c)];
+          sq += v * v;
+        }
+        importance[static_cast<size_t>(kv)] *= std::max(std::sqrt(sq), epsilon);
+      }
+    }
+  }
+
   std::vector<int64_t> keep_groups =
       TopKIndicesAscending(importance, keep_count);
   std::vector<int64_t> keep_q_heads;
@@ -5293,8 +5373,15 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
 // Shared body dispatching each chain to ApplyOnePlainAttentionChain or
 // ApplyOneGqaChain, mirroring pruning.py's own _apply_attention_chains
 // (cross-chain touched-role bookkeeping, stale value_info cleanup).
-void ApplyAttentionChains(onnx::GraphProto* graph,
-                          std::vector<AttnChain>& chains, double sparsity) {
+// `act_norm`/`epsilon`, defaulted to nullptr/1e-8 so every plain
+// ApplyAttentionHeadPruning call site is unchanged, are threaded straight
+// through to both -- see either's own doc comment for what they do; this
+// dispatcher itself has no importance computation of its own to touch.
+void ApplyAttentionChains(
+    onnx::GraphProto* graph, std::vector<AttnChain>& chains, double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -5322,8 +5409,9 @@ void ApplyAttentionChains(onnx::GraphProto* graph,
 
     std::optional<AppliedAttn> applied =
         chain.kind == AttnChainKind::kGqaLike
-            ? ApplyOneGqaChain(init_map, chain, sparsity)
-            : ApplyOnePlainAttentionChain(init_map, chain, sparsity);
+            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon)
+            : ApplyOnePlainAttentionChain(init_map, chain, sparsity, act_norm,
+                                          epsilon);
     if (!applied) {
       continue;
     }
@@ -11520,12 +11608,17 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
 //     `swiglu_fusion`).
 //   * Whole-expert pruning (shrinking `num_experts` itself, pruning.py's own
 //     separate "MoE whole-expert pruning" section right after this one) is
-//     NOT ported here -- it needs runtime calibration data (an
-//     `onnxruntime.InferenceSession` observing router activations over a
-//     representative batch) to rank experts by usage, and this C++ port has
-//     no ONNX Runtime linked into it at all (see CLAUDE.md: the wheel build
-//     always passes `-DONNXSIM_BUILTIN_ORT=OFF`). This section stays
-//     entirely within the data-free, fully structural `inter_size` slice.
+//     NOT handled by THIS section -- it needs runtime calibration data (a
+//     representative batch run through the model to observe router
+//     activations) to rank experts by usage. This section stays entirely
+//     within the data-free, fully structural `inter_size` slice; the
+//     calibration-driven whole-expert analogue is ported separately, right
+//     after ApplyQMoEExpertChannelPruning below, via the same DLPack
+//     ModelExecutor-bridge pattern ApplyStructuredWandaPruning established
+//     (see this file's own "MoE whole-expert pruning" section comment) --
+//     the C++ core still links no ONNX Runtime of its own (see CLAUDE.md:
+//     the wheel build always passes `-DONNXSIM_BUILTIN_ORT=OFF`); the
+//     caller supplies whatever executor actually runs the model.
 //
 // `fc1_experts_weights`/`fc2_experts_weights`/`fc1_experts_bias` are
 // admitted only as plain FLOAT (float32) tensors here -- this file's own
@@ -11830,6 +11923,328 @@ void ApplyMoeChains(onnx::GraphProto* graph, std::vector<MoEChain>& chains,
     // fc2_experts_bias indexes hidden_size, fc2's own *output* axis --
     // unaffected by an inter_size cut, so it is never sliced here.
   }
+}
+
+// --- MoE whole-expert pruning, mirroring pruning.py's own "MoE whole-expert
+// pruning" section (_MoEExpertChain through apply_moe_whole_expert_pruning)
+// -------------------------------------------------------------------------
+//
+// The complementary technique to the "MoE expert-intermediate-channel
+// pruning" section just above: instead of narrowing every expert's own
+// `inter_size` identically, this drops whole experts outright -- shrinking
+// the shared `[num_experts, ...]` leading axis of `fc1_experts_weights`/
+// `fc2_experts_weights`(/`fc1_experts_bias`) AND the matching output column
+// of the upstream router projection feeding `router_probs`, together, for
+// the lowest-ranked experts. See pruning.py's own section comment (right
+// above `class _MoEExpertChain`) for the full, empirically-verified safety
+// argument this C++ port simply carries over unchanged -- summarized:
+//   1. Shrinking `router_probs`' own width is confirmed, to 0.0 max-abs-diff
+//      against a real onnxruntime CPU MoE session, EXACTLY equivalent to
+//      forcing the dropped experts' routing logits to `-inf` in a same-shape
+//      model (excludes them from top-k selection AND from any
+//      `normalize_routing_weights` renormalization) -- so dropping a
+//      low-usage expert changes nothing about how the *kept* experts are
+//      combined, only removes a combination term that was already ~0.
+//   2. `k` (the node's own top-k attribute) is FLOORED, never modified: the
+//      node's own `k` experts must always be selectable, or onnxruntime's
+//      CPU MoE kernel fails execution outright (confirmed empirically) --
+//      `num_experts_to_keep` is clamped to `max(k, ...)`, so a
+//      too-aggressive `sparsity` silently prunes fewer experts than
+//      requested rather than ever going below `k`.
+//   3. The router match (MatchProducer, reused outright from this file's
+//      own MatMul/Gemm chain-matching machinery) requires `router_probs` to
+//      be produced by exactly ONE plain, untied MatMul/vanilla-Gemm node
+//      (mirroring pruning.py's own `_match_producer`) with no other
+//      consumer -- a router expressed as more than one node (a separate
+//      bias Add, an intervening Reshape/Cast, ...), a tied/shared router
+//      weight, or a `router_probs` with more than one consumer, is left
+//      completely untouched rather than guessed at.
+// `use_sparse_mixer=1` (a different, jitter-named top-2-only routing path)
+// is declined outright -- its own tie-break logic was never independently
+// re-derived against the same `-inf`-masking oracle point 1 relies on.
+//
+// Ranking: every matched TOP-LEVEL chain's `router_probs` is probed and run
+// over `calibration_data` via MoeRouterGateCalibrationStats (see that
+// function's own comment, right before ApplyStructuredWandaPruning below,
+// for the calibration-crossing/probe-injection mechanics reused from
+// WandaCalibrationStats) to get each expert's own mean post-Softmax gate
+// weight. A chain whose `router_probs` was never observed (empty
+// `calibration_data`, or the chain was matched only inside a nested
+// subgraph -- see this file's own "Subgraph recursion" section and
+// structured_pruning_entry.h's own ApplyMoeWholeExpertPruning declaration
+// comment) falls back to MoeExpertWeightImportance, the same "no matching
+// activation observed -> weight norm" fallback ApplyChains/ApplyConcatChains
+// already use for Wanda.
+
+// Mirrors pruning.py's own `_MoEExpertChain` dataclass: everything
+// MatchMoeProducer's own MoEChain already carries (fc1/fc2 weight+bias,
+// num_experts), plus the router projection's own weight/bias/orientation,
+// `router_probs`' own tensor name (the probe point), and the node's own
+// `k` (the floor ApplyMoeWholeExpertChains must never prune below).
+struct MoEExpertChain {
+  onnx::NodeProto* node = nullptr;
+  std::string fc1_w;
+  std::optional<std::string> fc1_b;
+  std::string fc2_w;
+  std::optional<std::string> fc2_b;
+  int64_t num_experts = 0;
+  int64_t k = 0;
+  std::string router_probs;
+  std::string router_w;
+  bool router_w_transposed = false;
+  std::optional<std::string> router_b;
+};
+
+// If `node` is a `com.microsoft::MoE` node this pass can safely prune whole
+// experts from, returns the matched MoEExpertChain -- mirrors pruning.py's
+// own `_match_moe_whole_expert_producer` exactly: reuses MatchMoeProducer's
+// own fc1/fc2/fc3/activation_type checks outright (direct call), then adds
+// the `k`/`use_sparse_mixer` checks and the `router_probs` producer match
+// this section's own top comment describes. `node_by_output`/`graph_outputs`
+// are precomputed once per FindMoeWholeExpertChains call (not per node),
+// mirroring pruning.py's own dict/set comprehensions built once per
+// `_find_moe_whole_expert_chains` call.
+std::optional<MoEExpertChain> MatchMoeWholeExpertProducer(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const std::unordered_set<std::string>& graph_outputs) {
+  auto base = MatchMoeProducer(node, init_map, consumers_of);
+  if (!base) {
+    return std::nullopt;
+  }
+
+  std::optional<int64_t> k;
+  int64_t use_sparse_mixer = 0;
+  for (const auto& attr : node->attribute()) {
+    if (attr.name() == "k") {
+      k = attr.i();
+    } else if (attr.name() == "use_sparse_mixer") {
+      use_sparse_mixer = attr.i();
+    }
+  }
+  if (!k || *k < 1 || *k > base->num_experts || use_sparse_mixer != 0) {
+    return std::nullopt;
+  }
+
+  if (node->input_size() < 2 || node->input(1).empty()) {
+    return std::nullopt;
+  }
+  const std::string& router_probs = node->input(1);
+  if (graph_outputs.count(router_probs) ||
+      ConsumerCount(consumers_of, router_probs) != 1) {
+    return std::nullopt;
+  }
+  auto rit = node_by_output.find(router_probs);
+  if (rit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  auto router_info = MatchProducer(*rit->second, init_map);
+  if (!router_info) {
+    return std::nullopt;
+  }
+  if (router_info->n_channels != base->num_experts ||
+      ConsumerCount(consumers_of, router_info->weight) != 1) {
+    return std::nullopt;
+  }
+  if (router_info->bias &&
+      ConsumerCount(consumers_of, *router_info->bias) != 1) {
+    return std::nullopt;
+  }
+
+  return MoEExpertChain{node,
+                        base->fc1_w,
+                        base->fc1_b,
+                        base->fc2_w,
+                        base->fc2_b,
+                        base->num_experts,
+                        *k,
+                        router_probs,
+                        router_info->weight,
+                        router_info->weight_transposed,
+                        router_info->bias};
+}
+
+std::vector<MoEExpertChain> FindMoeWholeExpertChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+
+  std::vector<MoEExpertChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto chain = MatchMoeWholeExpertProducer(node, init_map, consumers_of,
+                                             node_by_output, graph_outputs);
+    if (chain) {
+      chains.push_back(std::move(*chain));
+    }
+  }
+  return chains;
+}
+
+// Combined (root-sum-square) L2-norm importance per *expert* -- the
+// weight-magnitude-only fallback used when no calibration data was observed
+// for a chain's `router_probs`. Mirrors pruning.py's own
+// `_moe_expert_weight_importance` exactly: each expert `e` owns one whole
+// `fc1_experts_weights[e]`/`fc2_experts_weights[e]`(/`fc1_experts_bias[e]`)
+// slice -- unlike MoeImportance above (which reduces *across* the expert
+// axis to rank `inter_size`), this reduces *within* each expert's own slice
+// (every axis but axis 0) to rank experts themselves. No `inter_size`/
+// `hidden_size` needed from the chain itself -- each tensor's own `dims()`
+// already say how many elements make up one expert's slice.
+std::vector<double> MoeExpertWeightImportance(const MoEExpertChain& chain,
+                                              const MutInitMap& init_map) {
+  const int64_t e_n = chain.num_experts;
+  std::vector<double> squared(static_cast<size_t>(e_n), 0.0);
+
+  auto accumulate = [&](const std::string& name) {
+    const onnx::TensorProto* t = init_map.at(name);
+    const std::vector<float> data = ReadFloatTensor(*t);
+    const int64_t inner = static_cast<int64_t>(data.size()) / e_n;
+    for (int64_t e = 0; e < e_n; ++e) {
+      const float* row = data.data() + e * inner;
+      double sq = 0.0;
+      for (int64_t j = 0; j < inner; ++j) {
+        sq += static_cast<double>(row[j]) * static_cast<double>(row[j]);
+      }
+      squared[static_cast<size_t>(e)] += sq;
+    }
+  };
+  accumulate(chain.fc1_w);
+  accumulate(chain.fc2_w);
+  if (chain.fc1_b) {
+    accumulate(*chain.fc1_b);
+  }
+
+  std::vector<double> importance(squared.size());
+  for (size_t i = 0; i < squared.size(); ++i) {
+    importance[i] = std::sqrt(squared[i]);
+  }
+  return importance;
+}
+
+// The actual apply step, mirroring pruning.py's own
+// `_apply_moe_whole_expert_chains`: ranks every expert by `compute_importance`
+// (either the calibrated mean-gate-weight map or MoeExpertWeightImportance's
+// own fallback -- the caller decides, exactly like pruning.py's own
+// `_importance` closure), drops the lowest-`sparsity`-fraction (floored at
+// `max(1, min(chain.k, num_experts))`), and removes the matching row from
+// fc1_experts_weights/fc1_experts_bias and fc2_experts_weights (axis 0 for
+// all three -- `num_experts` is always the shared leading axis, unlike
+// ApplyMoeChains' own `inter_size` slice), plus the matching output column
+// of the router projection weight(/bias). Returns the set of `router_probs`
+// names gone stale (their own shape info, if cached in `graph.value_info`,
+// no longer matches -- the caller flushes these exactly like
+// ApplyStructuredWandaPruning does for its own probe points).
+//
+// `touched` guards against another MoE node in this SAME graph sharing one
+// of these weights (including the router projection) -- a fresh, empty set
+// per call, mirroring pruning.py's own local `touched: Set[str]` inside
+// `_apply_moe_whole_expert_chains`.
+std::unordered_set<std::string> ApplyMoeWholeExpertChains(
+    onnx::GraphProto* graph, const std::vector<MoEExpertChain>& chains,
+    double sparsity,
+    const std::function<std::vector<double>(
+        const MoEExpertChain&, const MutInitMap&)>& compute_importance) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  std::unordered_set<std::string> touched;
+  std::unordered_set<std::string> stale_value_info;
+
+  for (const auto& chain : chains) {
+    std::unordered_set<std::string> weight_names{chain.fc1_w, chain.fc2_w,
+                                                 chain.router_w};
+    if (chain.fc1_b) {
+      weight_names.insert(*chain.fc1_b);
+    }
+    if (chain.router_b) {
+      weight_names.insert(*chain.router_b);
+    }
+    bool conflict = false;
+    for (const auto& w : weight_names) {
+      if (touched.count(w)) {
+        conflict = true;
+        break;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another MoE node already resized.
+    }
+    touched.insert(weight_names.begin(), weight_names.end());
+
+    const int64_t n = chain.num_experts;
+    const int64_t floor = std::max<int64_t>(1, std::min<int64_t>(chain.k, n));
+    const int64_t keep_count = std::max<int64_t>(
+        floor, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing (or below k) for this layer -- no-op.
+    }
+
+    const std::vector<double> importance = compute_importance(chain, init_map);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+    const int64_t kc = static_cast<int64_t>(keep.size());
+
+    // fc1_experts_weights: [num_experts, inter_size, hidden_size] -- plain
+    // leading-axis (expert) index-select.
+    {
+      onnx::TensorProto* fc1_w = init_map.at(chain.fc1_w);
+      std::vector<int64_t> dims(fc1_w->dims().begin(), fc1_w->dims().end());
+      const int64_t inner = dims[1] * dims[2];
+      const std::vector<float> data = ReadFloatTensor(*fc1_w);
+      const std::vector<float> out = SliceAxis0(data, n, inner, keep);
+      SetFloatTensorData(fc1_w, {kc, dims[1], dims[2]}, out);
+    }
+    // fc2_experts_weights: [num_experts, hidden_size, inter_size] -- same
+    // plain leading-axis index-select (unlike ApplyMoeChains' own
+    // trailing-axis `inter_size` slice, `num_experts` is axis 0 here too).
+    {
+      onnx::TensorProto* fc2_w = init_map.at(chain.fc2_w);
+      std::vector<int64_t> dims(fc2_w->dims().begin(), fc2_w->dims().end());
+      const int64_t inner = dims[1] * dims[2];
+      const std::vector<float> data = ReadFloatTensor(*fc2_w);
+      const std::vector<float> out = SliceAxis0(data, n, inner, keep);
+      SetFloatTensorData(fc2_w, {kc, dims[1], dims[2]}, out);
+    }
+    if (chain.fc1_b) {
+      // fc1_experts_bias: [num_experts, inter_size] -- same leading-axis
+      // index-select.
+      onnx::TensorProto* fc1_b = init_map.at(*chain.fc1_b);
+      std::vector<int64_t> dims(fc1_b->dims().begin(), fc1_b->dims().end());
+      const int64_t inner = dims[1];
+      const std::vector<float> data = ReadFloatTensor(*fc1_b);
+      const std::vector<float> out = SliceAxis0(data, n, inner, keep);
+      SetFloatTensorData(fc1_b, {kc, dims[1]}, out);
+    }
+    // fc2_experts_bias indexes hidden_size (fc2's own *output* axis),
+    // unaffected by an expert-count cut -- never sliced here, same
+    // reasoning as ApplyMoeChains' own inter_size pruning.
+
+    // Router projection: the matching OUTPUT COLUMN (the router's own
+    // `num_experts`-wide channel axis) is dropped from its weight (and
+    // bias, if present) -- SliceProducerWeight/SliceLastAxis, the exact
+    // same helpers this file's own plain-chain producer pruning uses.
+    SliceProducerWeight(init_map.at(chain.router_w), chain.router_w_transposed,
+                        keep, false);
+    if (chain.router_b) {
+      SliceLastAxis(init_map.at(*chain.router_b), keep);
+    }
+
+    stale_value_info.insert(chain.router_probs);
+  }
+  return stale_value_info;
 }
 
 // --- QMoE (com.microsoft, quantized-weight Mixture-of-Experts) expert-
@@ -13098,6 +13513,406 @@ void ApplyQMoEChannelChains(onnx::GraphProto* graph,
     // the same "indexes hidden_size only" shape and are likewise never
     // sliced.
   }
+}
+
+// --- QMoE whole-expert pruning, mirroring pruning.py's own
+// _QMoEExpertChain/_match_qmoe_whole_expert_producer/
+// _apply_qmoe_whole_expert_chains -----------------------------------------
+//
+// The quantized-weight counterpart of the plain-`MoE` "MoE whole-expert
+// pruning" section above -- see that section's own top comment for the full
+// masking-equivalence safety argument (re-derived and re-verified
+// specifically against a real `QMoE` node in pruning.py's own test suite;
+// in particular QMoE's own surprising point 6 finding -- it always
+// renormalizes top-k gate weights regardless of `normalize_routing_weights`
+// -- does not change that argument's own conclusion, only how it had to be
+// re-checked). `k`/`use_sparse_mixer`/router-match reuse the identical
+// checks unchanged.
+//
+// Unlike ApplyQMoEChannelChains' own `inter_size` slice (which needs the
+// full packed-axis unpack/select/repack machinery -- QMoESliceUint8Axis1/
+// QMoEBlockAlignedKeep/etc. -- because `inter_size` sometimes falls on a
+// SUB-BYTE-PACKED axis), whole-expert pruning is the "comparatively
+// simpler" of QMoE's own two pruning techniques: `num_experts` is *every*
+// per-expert tensor's own LEADING axis (fc1/fc2 weights, scales, biases,
+// zero_points, and -- `quant_type='nvfp4'` only -- global_scale), and
+// packing always lives on a *later* axis (confirmed from the schema), so
+// every one of them is a plain, unpack-free axis-0 index-select --
+// QMoESliceExpertAxis0 below, dtype-dispatched (FLOAT/UINT8/FLOAT8E4M3FN)
+// but otherwise identical for every quant_type/block_size combination. No
+// block-alignment concern either: whole-expert pruning never touches
+// `inter_size`/`hidden_size` at all, so `block_size`'s own grouping (along
+// whichever of those two axes) is completely undisturbed.
+
+// Mirrors pruning.py's own `_QMoEExpertChain` dataclass: everything
+// MatchQMoEProducer's own QMoEChannelChain already carries, plus the router
+// projection's own weight/bias/orientation, `router_probs`' own tensor
+// name, and the node's own `k`.
+struct QMoEExpertChain {
+  onnx::NodeProto* node = nullptr;
+  std::string fc1_w;
+  std::string fc1_scale;
+  std::optional<std::string> fc1_bias;
+  std::optional<std::string> fc1_zp;
+  std::string fc2_w;
+  std::string fc2_scale;
+  std::optional<std::string> fc2_bias;
+  std::optional<std::string> fc2_zp;
+  int64_t num_experts = 0;
+  int64_t inter_size = 0;
+  int64_t hidden_size = 0;
+  int64_t bits = 4;
+  int64_t block_size = 0;
+  int64_t k = 0;
+  std::string router_probs;
+  std::string router_w;
+  bool router_w_transposed = false;
+  std::optional<std::string> router_b;
+  QMoEQuantType quant_type = QMoEQuantType::kInt;
+  std::optional<std::string> fc1_global_scale;
+  std::optional<std::string> fc2_global_scale;
+};
+
+// If `node` is a `com.microsoft::QMoE` node this pass can safely prune
+// whole experts from, returns the matched QMoEExpertChain -- mirrors
+// pruning.py's own `_match_qmoe_whole_expert_producer` exactly: reuses
+// MatchQMoEProducer's own checks outright (block_size and all), then adds
+// the identical `k`/`use_sparse_mixer` checks and `router_probs` producer
+// match MatchMoeWholeExpertProducer above already uses (the router match
+// itself is quant_type-oblivious -- `router_probs` is always a plain FLOAT
+// tensor produced upstream of QMoE's own quantized machinery).
+std::optional<QMoEExpertChain> MatchQMoEWholeExpertProducer(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const std::unordered_set<std::string>& graph_outputs) {
+  auto base = MatchQMoEProducer(node, init_map, consumers_of);
+  if (!base) {
+    return std::nullopt;
+  }
+
+  std::optional<int64_t> k;
+  int64_t use_sparse_mixer = 0;
+  for (const auto& attr : node->attribute()) {
+    if (attr.name() == "k") {
+      k = attr.i();
+    } else if (attr.name() == "use_sparse_mixer") {
+      use_sparse_mixer = attr.i();
+    }
+  }
+  if (!k || *k < 1 || *k > base->num_experts || use_sparse_mixer != 0) {
+    return std::nullopt;
+  }
+
+  if (node->input_size() < 2 || node->input(1).empty()) {
+    return std::nullopt;
+  }
+  const std::string& router_probs = node->input(1);
+  if (graph_outputs.count(router_probs) ||
+      ConsumerCount(consumers_of, router_probs) != 1) {
+    return std::nullopt;
+  }
+  auto rit = node_by_output.find(router_probs);
+  if (rit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  auto router_info = MatchProducer(*rit->second, init_map);
+  if (!router_info) {
+    return std::nullopt;
+  }
+  if (router_info->n_channels != base->num_experts ||
+      ConsumerCount(consumers_of, router_info->weight) != 1) {
+    return std::nullopt;
+  }
+  if (router_info->bias &&
+      ConsumerCount(consumers_of, *router_info->bias) != 1) {
+    return std::nullopt;
+  }
+
+  QMoEExpertChain chain;
+  chain.node = node;
+  chain.fc1_w = base->fc1_w;
+  chain.fc1_scale = base->fc1_scale;
+  chain.fc1_bias = base->fc1_bias;
+  chain.fc1_zp = base->fc1_zp;
+  chain.fc2_w = base->fc2_w;
+  chain.fc2_scale = base->fc2_scale;
+  chain.fc2_bias = base->fc2_bias;
+  chain.fc2_zp = base->fc2_zp;
+  chain.num_experts = base->num_experts;
+  chain.inter_size = base->inter_size;
+  chain.hidden_size = base->hidden_size;
+  chain.bits = base->bits;
+  chain.block_size = base->block_size;
+  chain.k = *k;
+  chain.router_probs = router_probs;
+  chain.router_w = router_info->weight;
+  chain.router_w_transposed = router_info->weight_transposed;
+  chain.router_b = router_info->bias;
+  chain.quant_type = base->quant_type;
+  chain.fc1_global_scale = base->fc1_global_scale;
+  chain.fc2_global_scale = base->fc2_global_scale;
+  return chain;
+}
+
+std::vector<QMoEExpertChain> FindQMoEWholeExpertChains(
+    onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+
+  std::vector<QMoEExpertChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto chain = MatchQMoEWholeExpertProducer(node, init_map, consumers_of,
+                                              node_by_output, graph_outputs);
+    if (chain) {
+      chains.push_back(std::move(*chain));
+    }
+  }
+  return chains;
+}
+
+// Generic per-expert (axis-0) index-select for any QMoE per-expert tensor's
+// own leading `num_experts` axis, dtype-dispatched over every element dtype
+// this pass' matched tensors can carry (FLOAT -- `fc1`/`fc2_scale` for
+// `quant_type='int'`, biases, `quant_type='nvfp4'`'s own `global_scale`;
+// UINT8 -- `fc1`/`fc2` packed weights and `quant_type='int'` zero_points;
+// FLOAT8E4M3FN -- `fc1`/`fc2_scale` for `quant_type='nvfp4'`). Mirrors
+// pruning.py's own `_slice_axis(init, keep, axis=0)` used throughout
+// `_apply_qmoe_whole_expert_chains`. Never touches packing -- this pass'
+// own pruned axis (`num_experts`) is never the packed one for ANY of these
+// tensors (see this section's own top comment) -- so this is always a
+// plain raw-element index-select, unlike ApplyQMoEChannelChains' own
+// per-tensor packing-aware slicing (QMoESliceUint8Axis1/QMoESliceFloatAxis2/
+// etc.).
+void QMoESliceExpertAxis0(onnx::TensorProto* t,
+                          const std::vector<int64_t>& keep) {
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  int64_t inner = 1;
+  for (size_t i = 1; i < dims.size(); ++i) {
+    inner *= dims[i];
+  }
+  std::vector<int64_t> new_dims = dims;
+  if (!new_dims.empty()) {
+    new_dims[0] = static_cast<int64_t>(keep.size());
+  }
+  switch (t->data_type()) {
+    case onnx::TensorProto::FLOAT: {
+      const std::vector<float> data = ReadFloatTensor(*t);
+      const std::vector<float> out = SliceAxis0(data, dims[0], inner, keep);
+      SetFloatTensorData(t, new_dims, out);
+      break;
+    }
+    case onnx::TensorProto::UINT8: {
+      const std::vector<uint8_t> data = ReadUint8Tensor(*t);
+      std::vector<uint8_t> out(keep.size() * static_cast<size_t>(inner));
+      for (size_t i = 0; i < keep.size(); ++i) {
+        std::memcpy(out.data() + i * static_cast<size_t>(inner),
+                    data.data() + static_cast<size_t>(keep[i] * inner),
+                    static_cast<size_t>(inner));
+      }
+      SetUint8TensorData(t, new_dims, out);
+      break;
+    }
+    case onnx::TensorProto::FLOAT8E4M3FN: {
+      // Raw-byte slice, same "1-byte dtype, no endianness concern, read via
+      // ReadUint8Tensor regardless of the dtype tag" convention
+      // QMoESliceFloat8Axis1/QMoESliceFloat8Axis2 already establish above.
+      const std::vector<uint8_t> data = ReadUint8Tensor(*t);
+      std::vector<uint8_t> out(keep.size() * static_cast<size_t>(inner));
+      for (size_t i = 0; i < keep.size(); ++i) {
+        std::memcpy(out.data() + i * static_cast<size_t>(inner),
+                    data.data() + static_cast<size_t>(keep[i] * inner),
+                    static_cast<size_t>(inner));
+      }
+      SetFloat8E4M3TensorData(t, new_dims, out);
+      break;
+    }
+    default:
+      throw std::runtime_error(
+          "ApplyQMoEWholeExpertPruning: unsupported per-expert tensor "
+          "dtype " +
+          std::to_string(static_cast<int>(t->data_type())));
+  }
+}
+
+// Combined (root-sum-square) L2-norm importance per *expert*, mirroring
+// `_qmoe_expert_weight_importance` -- the weight-magnitude-only fallback
+// used when no calibration data was observed for a chain's `router_probs`.
+// Computed over each weight's own DEQUANTIZED value (QMoEDequantizeInt/
+// QMoEDequantizeNvfp4 -- the SAME codec helpers ApplyQMoEChannelChains'
+// own QMoEChannelImportance already calls via QMoEDequantizeFc, called
+// here directly rather than through QMoEDequantizeFc since that helper
+// takes a QMoEChannelChain, not this section's own QMoEExpertChain -- no
+// quantization codec logic is reimplemented, only the dispatch is
+// inlined), reduced *within* each expert's own slice (mirrors
+// MoeExpertWeightImportance's identical "within, not across" reduction for
+// plain MoE above) rather than *across* experts the way
+// QMoEChannelImportance is.
+std::vector<double> QMoEExpertWeightImportance(const QMoEExpertChain& chain,
+                                               const MutInitMap& init_map) {
+  const int64_t e = chain.num_experts;
+  const int64_t inter = chain.inter_size;
+  const int64_t hidden = chain.hidden_size;
+
+  std::vector<double> fc1_dq;  // [E, inter, hidden]
+  std::vector<double> fc2_dq;  // [E, hidden, inter]
+  if (chain.quant_type == QMoEQuantType::kNvfp4) {
+    fc1_dq = QMoEDequantizeNvfp4(*init_map.at(chain.fc1_w),
+                                 *init_map.at(chain.fc1_scale),
+                                 *init_map.at(*chain.fc1_global_scale), hidden);
+    fc2_dq = QMoEDequantizeNvfp4(*init_map.at(chain.fc2_w),
+                                 *init_map.at(chain.fc2_scale),
+                                 *init_map.at(*chain.fc2_global_scale), inter);
+  } else {
+    const onnx::TensorProto* zp1 =
+        chain.fc1_zp ? init_map.at(*chain.fc1_zp) : nullptr;
+    const onnx::TensorProto* zp2 =
+        chain.fc2_zp ? init_map.at(*chain.fc2_zp) : nullptr;
+    fc1_dq = QMoEDequantizeInt(*init_map.at(chain.fc1_w),
+                               *init_map.at(chain.fc1_scale), zp1, chain.bits,
+                               hidden, chain.block_size);
+    fc2_dq = QMoEDequantizeInt(*init_map.at(chain.fc2_w),
+                               *init_map.at(chain.fc2_scale), zp2, chain.bits,
+                               inter, chain.block_size);
+  }
+
+  std::vector<double> squared(static_cast<size_t>(e), 0.0);
+  for (int64_t ei = 0; ei < e; ++ei) {
+    double sq = 0.0;
+    const double* row1 =
+        fc1_dq.data() + static_cast<size_t>(ei * inter * hidden);
+    for (int64_t x = 0; x < inter * hidden; ++x) {
+      sq += row1[x] * row1[x];
+    }
+    const double* row2 =
+        fc2_dq.data() + static_cast<size_t>(ei * hidden * inter);
+    for (int64_t x = 0; x < hidden * inter; ++x) {
+      sq += row2[x] * row2[x];
+    }
+    squared[static_cast<size_t>(ei)] = sq;
+  }
+  if (chain.fc1_bias) {
+    const std::vector<float> b = ReadFloatTensor(*init_map.at(*chain.fc1_bias));
+    for (int64_t ei = 0; ei < e; ++ei) {
+      double sq = 0.0;
+      for (int64_t j = 0; j < inter; ++j) {
+        const double v = b[static_cast<size_t>(ei * inter + j)];
+        sq += v * v;
+      }
+      squared[static_cast<size_t>(ei)] += sq;
+    }
+  }
+
+  std::vector<double> importance(squared.size());
+  for (size_t i = 0; i < squared.size(); ++i) {
+    importance[i] = std::sqrt(squared[i]);
+  }
+  return importance;
+}
+
+// The actual apply step -- mirrors pruning.py's own
+// `_apply_qmoe_whole_expert_chains` exactly: every one of fc1/fc2's own
+// weight/scale(/bias/zero_point, plus -- `quant_type='nvfp4'` -- own
+// `global_scale`) is a plain QMoESliceExpertAxis0 leading-axis select, no
+// unpack/repack anywhere (see this section's own top comment), plus the
+// router projection's own weight/bias slice -- identical mechanics to
+// ApplyMoeWholeExpertChains above, just over QMoE's own wider tensor set.
+std::unordered_set<std::string> ApplyQMoEWholeExpertChains(
+    onnx::GraphProto* graph, const std::vector<QMoEExpertChain>& chains,
+    double sparsity,
+    const std::function<std::vector<double>(
+        const QMoEExpertChain&, const MutInitMap&)>& compute_importance) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  std::unordered_set<std::string> touched;
+  std::unordered_set<std::string> stale_value_info;
+
+  for (const auto& chain : chains) {
+    std::unordered_set<std::string> weight_names{
+        chain.fc1_w, chain.fc2_w, chain.fc1_scale, chain.fc2_scale,
+        chain.router_w};
+    if (chain.fc1_bias) {
+      weight_names.insert(*chain.fc1_bias);
+    }
+    if (chain.fc2_bias) {
+      weight_names.insert(*chain.fc2_bias);
+    }
+    if (chain.fc1_zp) {
+      weight_names.insert(*chain.fc1_zp);
+    }
+    if (chain.fc2_zp) {
+      weight_names.insert(*chain.fc2_zp);
+    }
+    if (chain.fc1_global_scale) {
+      weight_names.insert(*chain.fc1_global_scale);
+    }
+    if (chain.fc2_global_scale) {
+      weight_names.insert(*chain.fc2_global_scale);
+    }
+    if (chain.router_b) {
+      weight_names.insert(*chain.router_b);
+    }
+
+    bool conflict = false;
+    for (const auto& w : weight_names) {
+      if (touched.count(w)) {
+        conflict = true;
+        break;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another MoE/QMoE node already
+                 // resized.
+    }
+    touched.insert(weight_names.begin(), weight_names.end());
+
+    const int64_t n = chain.num_experts;
+    const int64_t floor = std::max<int64_t>(1, std::min<int64_t>(chain.k, n));
+    const int64_t keep_count = std::max<int64_t>(
+        floor, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing (or below k) for this layer.
+    }
+
+    const std::vector<double> importance = compute_importance(chain, init_map);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+
+    for (const std::string& name :
+         {chain.fc1_w, chain.fc2_w, chain.fc1_scale, chain.fc2_scale}) {
+      QMoESliceExpertAxis0(init_map.at(name), keep);
+    }
+    for (const auto& opt_name :
+         {chain.fc1_bias, chain.fc2_bias, chain.fc1_zp, chain.fc2_zp,
+          chain.fc1_global_scale, chain.fc2_global_scale}) {
+      if (opt_name) {
+        QMoESliceExpertAxis0(init_map.at(*opt_name), keep);
+      }
+    }
+
+    SliceProducerWeight(init_map.at(chain.router_w), chain.router_w_transposed,
+                        keep, false);
+    if (chain.router_b) {
+      SliceLastAxis(init_map.at(*chain.router_b), keep);
+    }
+
+    stale_value_info.insert(chain.router_probs);
+  }
+  return stale_value_info;
 }
 
 // --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight
@@ -16810,6 +17625,167 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
   return result;
 }
 
+// --- MoE/QMoE router-gate calibration, shared by ApplyMoeWholeExpertPruning
+// and ApplyQMoEWholeExpertPruning ----------------------------------------
+//
+// C++ mirror of pruning.py's own `_moe_router_gate_calibration_stats`:
+// reuses WandaCalibrationStats' own probe-injection/batch-iteration
+// plumbing (append one bare graph output per probe name via
+// `_add_probe_outputs`'s own mirrored logic, reorder each batch's
+// `{name: TensorProto}` map into ModelExecutor::Run's positional contract
+// -- see WandaCalibrationStats' own top comment for the full
+// calibration-crossing design this reuses unchanged), but accumulates a
+// GENUINELY DIFFERENT statistic: not RMS-over-non-channel-axes per
+// activation channel, but mean POST-SOFTMAX gate weight per EXPERT,
+// averaged over every calibration token -- so this is its own function
+// rather than a forced reuse of WandaCalibrationStats' own accumulator
+// shape (which has no Softmax step, and reduces over every axis but one
+// declared channel axis rather than over axis 0/"tokens" specifically).
+//
+// `probe_names` is every distinct `router_probs` tensor name across the
+// caller's own matched (TOP-LEVEL-graph-only, per
+// ApplyMoeWholeExpertPruning/ApplyQMoEWholeExpertPruning's own header
+// comment) chains -- oblivious to whether the node consuming that
+// `router_probs` is `MoE` or `QMoE`, exactly like pruning.py's own
+// `_HasRouterProbs` structural-typing trick (`router_probs` is always a
+// plain 2-D `[tokens, num_experts]` FLOAT tensor produced upstream of
+// either node's own family-specific machinery).
+//
+// For each batch: `shifted = logits - logits.max(axis=-1, keepdims=True);
+// probs = softmax(shifted); sum_prob[name] += probs.sum(axis=0)` -- the
+// numerically-stable Softmax MoE/QMoE's own kernel applies internally,
+// summed (not just accumulated per-token) so the final division by total
+// token count gives the TRUE mean over every token across every batch, not
+// an average-of-per-batch-averages (differs whenever batches have unequal
+// token counts). A probe never observed with rank exactly 2 (calibration_
+// data=[], or an unexpected activation rank) is simply absent from the
+// result, mirroring pruning.py's own `if logits.ndim != 2: continue` --
+// exactly the "no matching activation observed" condition
+// ApplyMoeWholeExpertChains/ApplyQMoEWholeExpertChains' own caller-supplied
+// `compute_importance` closure falls back to weight-norm importance on.
+std::unordered_map<std::string, std::vector<double>>
+MoeRouterGateCalibrationStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<std::string>& probe_names,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, std::vector<double>> result;
+  if (probe_names.empty()) {
+    return result;
+  }
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& name : probe_names) {
+    if (existing_outputs.insert(name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(name);
+    }
+  }
+
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  std::unordered_map<std::string, std::vector<double>> sum_prob;
+  std::unordered_map<std::string, int64_t> count;
+
+  for (const auto& batch : calibration_data) {
+    // Reorder this batch's own {name: TensorProto} map into
+    // ModelExecutor::Run's positional contract -- see WandaCalibrationStats'
+    // own top comment, design decision (2).
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplyMoeWholeExpertPruning: calibration batch is missing "
+            "required graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    for (const auto& name : probe_names) {
+      auto oit = output_index.find(name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;  // Defensive -- every probe name was added as an output
+                   // above.
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (tp.data_type() != onnx::TensorProto::FLOAT) {
+        continue;  // Scope decision mirroring WandaCalibrationStats' own --
+                   // every chain this pass matches has a plain FLOAT
+                   // router_probs whenever the executor runs the real graph
+                   // ops faithfully.
+      }
+      if (tp.dims_size() != 2) {
+        continue;  // router_probs is always documented 2-D; skip if not.
+      }
+      const int64_t tokens = tp.dims(0);
+      const int64_t experts = tp.dims(1);
+      if (tokens <= 0 || experts <= 0) {
+        continue;
+      }
+
+      std::vector<float> data = ReadFloatTensor(tp);
+      auto& acc = sum_prob[name];
+      if (acc.empty()) {
+        acc.assign(static_cast<size_t>(experts), 0.0);
+      }
+      if (static_cast<int64_t>(acc.size()) != experts) {
+        continue;  // Defensive: a probe whose own expert-axis width somehow
+                   // changed between batches (shouldn't happen for a fixed
+                   // model) is skipped for this batch rather than read out
+                   // of bounds.
+      }
+      for (int64_t t = 0; t < tokens; ++t) {
+        const float* row = data.data() + t * experts;
+        double max_v = static_cast<double>(row[0]);
+        for (int64_t x = 1; x < experts; ++x) {
+          max_v = std::max(max_v, static_cast<double>(row[x]));
+        }
+        double sum_exp = 0.0;
+        std::vector<double> exp_row(static_cast<size_t>(experts));
+        for (int64_t x = 0; x < experts; ++x) {
+          const double e = std::exp(static_cast<double>(row[x]) - max_v);
+          exp_row[static_cast<size_t>(x)] = e;
+          sum_exp += e;
+        }
+        for (int64_t x = 0; x < experts; ++x) {
+          acc[static_cast<size_t>(x)] +=
+              exp_row[static_cast<size_t>(x)] / sum_exp;
+        }
+      }
+      count[name] += tokens;
+    }
+  }
+
+  result.reserve(sum_prob.size());
+  for (auto& [name, acc] : sum_prob) {
+    const int64_t cnt = std::max<int64_t>(count[name], 1);
+    for (double& v : acc) {
+      v /= static_cast<double>(cnt);
+    }
+    result.emplace(name, std::move(acc));
+  }
+  return result;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -17138,6 +18114,71 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
   return out;
 }
 
+// The calibration-driven (Wanda-style) upgrade of ApplyAttentionHeadPruning
+// -- see structured_pruning_entry.h's own ApplyAttentionHeadWandaPruning
+// declaration comment for the full design (chain-finding scope, the
+// calibration-crossing convention shared with ApplyStructuredWandaPruning,
+// and how the resulting `act_norm` map threads into
+// ApplyOnePlainAttentionChain/ApplyOneGqaChain's own existing importance
+// computation). Mirrors pruning.py's own apply_attention_head_wanda_pruning.
+onnx::ModelProto ApplyAttentionHeadWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, double epsilon) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyAttentionHeadWandaPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // NOT subgraph-aware -- mirrors pruning.py's own
+  // apply_attention_head_wanda_pruning, which likewise only ever matches
+  // and prunes `out.graph` directly, never `_iter_subgraphs` (see
+  // structured_pruning_entry.h's own declaration comment, and
+  // ApplyStructuredWandaPruning's own identical scope decision above, for
+  // why: calibration_data batches are keyed to the top-level graph's own
+  // inputs).
+  onnx::GraphProto* graph = out.mutable_graph();
+
+  // Same chain-finding as ApplyAttentionHeadPruning's own three matched
+  // families -- deliberately excluding the fused `MatMulNBitsQkv` variant
+  // that function additionally handles, since pruning.py's own
+  // apply_attention_head_wanda_pruning has no quantized-weight counterpart
+  // either (see structured_pruning_entry.h's own declaration comment).
+  std::vector<AttnChain> chains = FindAttentionChains(graph);
+  std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
+  std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+  chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
+                std::make_move_iterator(gqa_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(onnx_attn_chains.begin()),
+                std::make_move_iterator(onnx_attn_chains.end()));
+
+  if (chains.empty()) {
+    return out;  // Mirrors pruning.py's own early return.
+  }
+
+  // Every chain's own output-projection probe point -- always axis -1
+  // (never a Conv channel axis 1, unlike ApplyStructuredWandaPruning's own
+  // `probe_axis`): WalkToAttentionConsumer only ever matches a
+  // MatMul/vanilla-Gemm consumer (MatchMatMulLikeRaw), never a Conv, for
+  // every one of the three attention chain families above. Mirrors
+  // pruning.py's own `probe_names = {chain.consumer_node.input[0] for
+  // chain in chains}` in `_wanda_attention_calibration_stats` (there
+  // implicitly axis -1 too, via `reduce_axes = range(x.ndim - 1)`).
+  std::unordered_map<std::string, int64_t> probe_axis;
+  for (const auto& chain : chains) {
+    probe_axis[chain.consumer_node->input(0)] = -1;
+  }
+
+  const std::unordered_map<std::string, std::vector<double>> act_norm =
+      WandaCalibrationStats(executor, out, probe_axis, calibration_data);
+
+  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon);
+  return out;
+}
+
 onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
                                               double sparsity) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
@@ -17169,6 +18210,93 @@ onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
   return out;
 }
 
+// MoE whole-expert pruning: removes whole experts (shrinks `num_experts`
+// itself) from a matched `com.microsoft::MoE` node and its upstream router
+// projection at once -- the complementary technique to
+// ApplyMoeExpertChannelPruning's own `inter_size` pruning above. See this
+// file's own "MoE whole-expert pruning" section comment (MoEExpertChain
+// through ApplyMoeWholeExpertChains) and structured_pruning_entry.h's own
+// declaration comment for the full safety argument and scope.
+onnx::ModelProto ApplyMoeWholeExpertPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyMoeWholeExpertPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+  onnx::GraphProto* top_level_graph = out.mutable_graph();
+
+  // Matching (top-level graph only, for calibration purposes -- see this
+  // file's own "MoE whole-expert pruning" section comment and
+  // structured_pruning_entry.h's own declaration comment for why) and
+  // calibration happen once, up front, exactly mirroring pruning.py's own
+  // `apply_moe_whole_expert_pruning`: `top_chains` is reused verbatim for
+  // the top-level graph's own ApplyMoeWholeExpertChains call below (never
+  // re-matched), so the same MoEExpertChain objects the calibration run was
+  // keyed against are the ones actually pruned.
+  std::vector<MoEExpertChain> top_chains =
+      FindMoeWholeExpertChains(top_level_graph);
+  std::unordered_map<std::string, std::vector<double>> mean_gate_weight;
+  if (!top_chains.empty()) {
+    std::set<std::string> uniq_probe_names;
+    for (const auto& chain : top_chains) {
+      uniq_probe_names.insert(chain.router_probs);
+    }
+    const std::vector<std::string> probe_names(uniq_probe_names.begin(),
+                                               uniq_probe_names.end());
+    mean_gate_weight = MoeRouterGateCalibrationStats(executor, out, probe_names,
+                                                     calibration_data);
+  }
+
+  // Mirrors pruning.py's own `_importance` closure: prefer the calibrated
+  // mean gate weight when this chain's own `router_probs` was actually
+  // observed (and its width matches `num_experts` -- defensive, mirrors the
+  // Python original's own `gate.shape[0] != chain.num_experts` check),
+  // falling back to plain weight-norm importance otherwise (uncalibrated,
+  // or a nested-subgraph chain never in `mean_gate_weight` at all).
+  const auto importance_fn = [&](const MoEExpertChain& chain,
+                                 const MutInitMap& init_map) {
+    auto it = mean_gate_weight.find(chain.router_probs);
+    if (it == mean_gate_weight.end() ||
+        static_cast<int64_t>(it->second.size()) != chain.num_experts) {
+      return MoeExpertWeightImportance(chain, init_map);
+    }
+    return it->second;
+  };
+
+  // Subgraph-aware (IterSubgraphs) for matching/slicing, mirroring
+  // pruning.py's own loop over `_iter_subgraphs(out.graph)` -- but only the
+  // top-level graph's own chains (`top_chains`, matched above) ever take
+  // part in calibration; a nested subgraph gets its own fresh
+  // FindMoeWholeExpertChains call, always falling back to
+  // MoeExpertWeightImportance since `mean_gate_weight` was never keyed by
+  // any of its chains' `router_probs`.
+  for (onnx::GraphProto* graph : IterSubgraphs(top_level_graph)) {
+    std::vector<MoEExpertChain> chains = (graph == top_level_graph)
+                                             ? top_chains
+                                             : FindMoeWholeExpertChains(graph);
+    if (chains.empty()) {
+      continue;
+    }
+    std::unordered_set<std::string> stale_value_info =
+        ApplyMoeWholeExpertChains(graph, chains, sparsity, importance_fn);
+    if (!stale_value_info.empty()) {
+      google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+      for (const auto& vi : graph->value_info()) {
+        if (!stale_value_info.count(vi.name())) {
+          *kept.Add() = vi;
+        }
+      }
+      graph->mutable_value_info()->Swap(&kept);
+    }
+  }
+  return out;
+}
+
 // QMoE expert-channel pruning: removes intermediate (`inter_size`) channels
 // from every expert of a matched `com.microsoft::QMoE` node at once -- the
 // quantized-weight counterpart of ApplyStructuredPruning's own plain-float
@@ -17177,9 +18305,9 @@ onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
 // instead of plain floats. See this file's own "QMoE (com.microsoft,
 // quantized-weight Mixture-of-Experts) expert-channel structured pruning"
 // section comment above (MatchQMoEProducer/ApplyQMoEChannelChains) for the
-// exact matched topology, every empirically-confirmed decline, and why
-// whole-expert removal (needing runtime calibration data this C++ port has
-// no ONNX Runtime linked in to gather) stays out of scope. A standalone
+// exact matched topology and every empirically-confirmed decline --
+// whole-expert removal is a separate, standalone entry point,
+// ApplyQMoEWholeExpertPruning, right after this one. A standalone
 // entry point -- unlike MatMulNBits/MatMulBnb4/QDQ above, QMoE is not
 // folded into ApplyStructuredPruning's own combined pass, since it targets
 // a wholly disjoint node type (`com.microsoft::QMoE`) that can never
@@ -17206,6 +18334,75 @@ onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
     std::vector<QMoEChannelChain> chains = FindQMoEChains(graph);
     if (!chains.empty()) {
       ApplyQMoEChannelChains(graph, chains, sparsity);
+    }
+  }
+  return out;
+}
+
+// QMoE whole-expert pruning: the quantized-weight counterpart of
+// ApplyMoeWholeExpertPruning above -- see this file's own "QMoE
+// whole-expert pruning" section comment (QMoEExpertChain through
+// ApplyQMoEWholeExpertChains) and structured_pruning_entry.h's own
+// declaration comment for the full scope. Structurally identical driver to
+// ApplyMoeWholeExpertPruning (top-level-only calibration via the same
+// MoeRouterGateCalibrationStats helper, subgraph-aware matching/slicing,
+// weight-norm fallback for an uncalibrated or nested-subgraph chain) --
+// only the per-chain type (QMoEExpertChain vs. MoEExpertChain) and the
+// apply/importance functions it calls differ.
+onnx::ModelProto ApplyQMoEWholeExpertPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyQMoEWholeExpertPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+  onnx::GraphProto* top_level_graph = out.mutable_graph();
+
+  std::vector<QMoEExpertChain> top_chains =
+      FindQMoEWholeExpertChains(top_level_graph);
+  std::unordered_map<std::string, std::vector<double>> mean_gate_weight;
+  if (!top_chains.empty()) {
+    std::set<std::string> uniq_probe_names;
+    for (const auto& chain : top_chains) {
+      uniq_probe_names.insert(chain.router_probs);
+    }
+    const std::vector<std::string> probe_names(uniq_probe_names.begin(),
+                                               uniq_probe_names.end());
+    mean_gate_weight = MoeRouterGateCalibrationStats(executor, out, probe_names,
+                                                     calibration_data);
+  }
+
+  const auto importance_fn = [&](const QMoEExpertChain& chain,
+                                 const MutInitMap& init_map) {
+    auto it = mean_gate_weight.find(chain.router_probs);
+    if (it == mean_gate_weight.end() ||
+        static_cast<int64_t>(it->second.size()) != chain.num_experts) {
+      return QMoEExpertWeightImportance(chain, init_map);
+    }
+    return it->second;
+  };
+
+  for (onnx::GraphProto* graph : IterSubgraphs(top_level_graph)) {
+    std::vector<QMoEExpertChain> chains =
+        (graph == top_level_graph) ? top_chains
+                                   : FindQMoEWholeExpertChains(graph);
+    if (chains.empty()) {
+      continue;
+    }
+    std::unordered_set<std::string> stale_value_info =
+        ApplyQMoEWholeExpertChains(graph, chains, sparsity, importance_fn);
+    if (!stale_value_info.empty()) {
+      google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+      for (const auto& vi : graph->value_info()) {
+        if (!stale_value_info.count(vi.name())) {
+          *kept.Add() = vi;
+        }
+      }
+      graph->mutable_value_info()->Swap(&kept);
     }
   }
   return out;

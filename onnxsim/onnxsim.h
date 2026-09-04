@@ -645,11 +645,15 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
 // past-KV-cache or attention-mask input, an ai.onnx Attention node with
 // differing Q/K/V head sizes or without explicit
 // ``q_num_heads``/``kv_num_heads`` attributes, a consumer whose reduction
-// dimension doesn't line up, ...) is left completely untouched. Unlike the
-// pure-Python ``onnxsim.apply_attention_head_pruning``, this port does not
-// include the calibration-driven Wanda variant
-// (``onnxsim.apply_attention_head_wanda_pruning``) -- data-free/magnitude
-// importance only, matching this codebase's C++-port scope decision.
+// dimension doesn't line up, ...) is left completely untouched. The
+// calibration-driven Wanda upgrade of this same matching/ranking machinery
+// (mirroring the pure-Python ``onnxsim.apply_attention_head_wanda_pruning``)
+// is ``ApplyAttentionHeadWandaPruning`` in structured_pruning_entry.h --
+// declared there rather than duplicated here, alongside
+// ``ApplyStructuredWandaPruning``, since both take a ``ModelExecutor&``
+// (only forward-declared in this header, see this header's own top comment)
+// and this header's own duplicated-prototype convention is otherwise
+// reserved for the plain, executor-free entry points.
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                                            double sparsity);
 
