@@ -1083,6 +1083,72 @@ same-length localization in favor of mining un-localized diffs directly
 (as the resnet18d self-similarity scan above did, successfully, without
 needing localization at all).
 
+### Chaining two real convs: genuine inter-op data transfer, and a real cross-op coupling finding
+
+Every experiment up to this point used a *single* op -- no genuine
+inter-op data transfer, since the one op's input/output are both graph
+boundaries, addressed through the tensor I/O offset table this README
+already decoded. Chaining two ops introduces a real, so-far-unexamined
+piece: the intermediate activation between them lives entirely inside the
+compiled program's own OCM/DDR addressing, with no external name to look
+up. Testing this directly: two chained `Conv`s (`cin=cout=mid=4`, the one
+shape combination confirmed to give same-length pairs) with data
+genuinely flowing from the first op's output into the second op's input.
+
+**The same-length trick survives the jump from one op to two, at this
+shape.** Varying only the first `Conv`'s dilation (2 vs 3, padding
+compensated to hold every shape downstream constant) gave two builds at
+an identical 3,920 bytes; varying only the *second* `Conv`'s dilation
+(first held completely fixed) gave two builds at an identical 3,952
+bytes. Both diffs are real and structured, not wholesale rewrites --
+confirming the technique generalizes past a single op, at least for this
+shape.
+
+**Real, new content shows up that the one-op case never had.** Comparing
+the "vary conv1" diff against the earlier single-`Conv` dilation diff
+(same shape, same technique): the familiar 94-byte/60-byte
+per-engine-template blocks and the periodic 4-repeats/7-byte-stride field
+are both still present, structurally unchanged -- but a *new* diff
+pattern shows up around byte offset 858-876 (four single-byte changes at
+a regular 6-byte stride) that has no counterpart at all in the one-op
+mcode. This is a real, plausible candidate for exactly the thing this
+experiment was designed to find: addressing or sizing information for the
+intermediate buffer conv1 hands to conv2, which only exists to encode at
+all once there's a second, real downstream consumer.
+
+**An unexpected, genuinely new finding: an op's own command bytes are not
+independent of *downstream* ops.** Varying the *second* conv's dilation
+while leaving the first conv's own attributes completely untouched still
+changes bytes in the region corresponding to the *first* conv's own
+per-op command (the same relative area the 94-byte/60-byte templates
+occupy) -- not just adding new bytes near the second conv. An op that
+didn't itself change still gets re-encoded because something later in the
+graph did. This sharpens (and partly explains) the earlier "mcode isn't
+append-only" finding: it's not only that changing a graph's *topology*
+forces a wholesale re-serialization -- even within a fixed, matching-size
+two-op program, one op's encoding depends on what happens after it, not
+just on its own attributes and its own inputs.
+
+**The periodic field looks genuinely global, not per-op.** The same
+4-repeats/7-byte-stride signature appears in *both* experiments --
+varying conv1's dilation and varying conv2's -- landing at different
+absolute offsets (2727 vs 2759) simply because the two builds have
+different overall sizes, but with the identical shape otherwise. A field
+that reacts to a dilation change no matter which of the two convs it
+belongs to is further, independent evidence for this being a shared,
+graph-wide resource (plausibly the 4-way spatial-tiling table this
+README's `resnet18d` profiling already found evidence for) rather than
+something scoped to one specific op's own command.
+
+None of this newly-isolated content is decoded at the bit level yet --
+these are real, precisely-located regions for future work, in the same
+spirit as the single-op periodic field above, not solved encodings. But
+the experiment answers its own motivating question directly: yes,
+connecting two ops surfaces genuinely new mcode content tied to real data
+transfer between them, distinguishable by comparing against the
+already-characterized single-op case, and it surfaces a real,
+previously-unknown cross-op dependency in mcode's encoding along the way.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

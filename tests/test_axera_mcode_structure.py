@@ -116,6 +116,48 @@ def _dilation_conv_model(dilation, pad, cin=4, cout=4, k=3, insz=16):
     return model
 
 
+def _two_conv_model(vary_first, dilation, pad, cin=4, mid=4, cout=4, k=3, insz=16):
+    """Two chained `Conv`s with a real intermediate activation flowing
+    between them (not a graph-boundary tensor) -- `vary_first` selects
+    which of the two gets the dilation/padding override, the other stays
+    fixed at dilation=1/pad=1."""
+    rng = np.random.RandomState(0)
+    w1 = (rng.randn(mid, cin, k, k) * 0.1).astype(np.float32)
+    w2 = (rng.randn(cout, mid, k, k) * 0.1).astype(np.float32)
+    d1, p1 = (dilation, pad) if vary_first else (1, 1)
+    d2, p2 = (1, 1) if vary_first else (dilation, pad)
+    mid_sz = insz + 2 * p1 - d1 * (k - 1) - 1 + 1
+    out_sz = mid_sz + 2 * p2 - d2 * (k - 1) - 1 + 1
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv", ["x", "w1"], ["mid"], dilations=[d1, d1], pads=[p1, p1, p1, p1]
+            ),
+            helper.make_node(
+                "Conv", ["mid", "w2"], ["y"], dilations=[d2, d2], pads=[p2, p2, p2, p2]
+            ),
+        ],
+        f"g_two_conv_vary{'1' if vary_first else '2'}_{dilation}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cout, out_sz, out_sz]
+            )
+        ],
+        initializer=[
+            numpy_helper.from_array(w1, name="w1"),
+            numpy_helper.from_array(w2, name="w2"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
 def _build_and_get_mcode_bytes(work_dir, model, input_shape):
     os.makedirs(work_dir, exist_ok=True)
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
@@ -331,3 +373,36 @@ def test_axquantizedconv_command_has_a_real_periodic_4x_field(tmp_path):
         "expected exactly 4 repeats",
     )
     assert all(s == 7 for s in strides), (strides, "expected a constant 7-byte stride")
+
+
+def test_downstream_conv_dilation_perturbs_upstream_conv_bytes(tmp_path):
+    """Confirmed real (see the README's "Chaining two real convs" section):
+    a genuinely new, previously-unknown cross-op coupling. Two chained
+    `Conv`s at the one shape (cin=cout=mid=4) confirmed to give
+    same-length pairs; varying only the *second* conv's dilation, with the
+    *first* conv's own attributes completely untouched, still perturbs
+    bytes within the first ~800 bytes of mcode -- the same relative region
+    the single-op experiments already showed holds the first conv's own
+    per-op command template. An op's encoding is not independent of what
+    happens downstream of it, even at fixed total mcode length.
+    """
+    a = _build_and_get_mcode_bytes(
+        os.path.join(str(tmp_path), "vary2_d2"),
+        _two_conv_model(vary_first=False, dilation=2, pad=2),
+        (1, 4, 16, 16),
+    )
+    b = _build_and_get_mcode_bytes(
+        os.path.join(str(tmp_path), "vary2_d3"),
+        _two_conv_model(vary_first=False, dilation=3, pad=3),
+        (1, 4, 16, 16),
+    )
+    assert len(a) == len(b), (
+        "this dilation/padding pair should serialize to the same length"
+    )
+
+    UPSTREAM_REGION = 800
+    upstream_diffs = sum(1 for i in range(UPSTREAM_REGION) if a[i] != b[i])
+    assert upstream_diffs > 0, (
+        "expected the unchanged first Conv's own bytes to still be perturbed "
+        "by a downstream-only dilation change"
+    )
