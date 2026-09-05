@@ -40186,6 +40186,436 @@ def test_apply_structured_pruning_qoperator_registered_in_sensitivity_analyzers(
     )
 
 
+# --- QLinearConv -> QLinearGlobalAveragePool -> classifier head -----------
+#
+# The classifier-head hop `_walk_to_qop_consumer` gained, mirroring the
+# plain-float Conv chain's own `recognize_gap_flatten_matmul_consumer` hop
+# and the `ConvInteger` section's own analogous one: a `QLinearConv`
+# producer's logical output feeding
+# `com.microsoft::QLinearGlobalAveragePool -> {Flatten(axis=1), Reshape to
+# [batch, -1], Squeeze-of-trailing-axes} -> {QLinearMatMul, QGemm}` directly
+# is now matched and pruned. Unlike the `ConvInteger` section's identical
+# hop (whose matched classifier consumer is always plain float, since that
+# section's own rescale `Mul`/`Cast` pair already produced a plain float
+# logical output before this point), the tensor reaching
+# `QLinearGlobalAveragePool` here is still quantized int8/uint8 throughout,
+# so the matched consumer is a real `QLinearMatMul`/`QGemm` -- a `_QOpWeight`
+# exactly like this section's own ordinary same-family consumer, needing no
+# dedicated side-channel field on `_QOpChain` at all.
+
+
+def _qlinear_gap_node(x, x_scale, x_zp, y_scale, y_zp, y, name="gap", **attrs):
+    return onnx.helper.make_node(
+        "QLinearGlobalAveragePool",
+        [x, x_scale, x_zp, y_scale, y_zp],
+        [y],
+        domain="com.microsoft",
+        name=name,
+        **attrs,
+    )
+
+
+def _qlinearconv_gap_flatten_qgemm_model(
+    N1=6, C1=3, N2=4, Out=5, kh=3, kw=3, spatial=8, seed=0
+):
+    """Builds ``QLinearConv(n1) -> QLinearConv(n2) ->
+    QLinearGlobalAveragePool -> Flatten(axis=1) -> QGemm`` -- the real shape
+    ``onnxruntime.quantization.quantize_static(quant_format=QuantFormat
+    .QOperator)`` emits for a ``Conv -> Conv -> GlobalAveragePool ->
+    Flatten -> Gemm`` classifier head (confirmed live -- see this section's
+    own top comment). `n2`'s own logical output (`y2_q`) feeds
+    `QLinearGlobalAveragePool` directly, whose own `x_scale`/`x_zero_point`
+    are the SAME `y2_scale`/`y2_zero_point` initializers `n2` itself
+    produces -- exactly the tied-initializer shape a real exporter emits
+    (`QGlobalAveragePool`'s own quantizer source just reuses its input's
+    existing quantized-value scale/zero-point when none is calibrated
+    separately for the pooled output)."""
+    rng = np.random.default_rng(seed)
+    W1 = rng.standard_normal((N1, C1, kh, kw)).astype(np.float32) * 0.3
+    W2 = rng.standard_normal((N2, N1, 1, 1)).astype(np.float32) * 0.3
+    Wfc = rng.standard_normal((Out, N2)).astype(np.float32) * 0.3
+    Bfc = rng.standard_normal(Out).astype(np.float32) * 0.05
+
+    x_scale = np.float32(0.02)
+    x_zp = np.uint8(120)
+    W1q, W1s, W1zp = _qop_quantize_per_channel_i8(W1, axis=0)
+    W2q, W2s, W2zp = _qop_quantize_per_channel_i8(W2, axis=0)
+    y1_scale = np.float32(0.03)
+    y1_zp = np.uint8(120)
+    y2_scale = np.float32(0.04)
+    y2_zp = np.uint8(120)
+    gap_scale = np.float32(0.05)
+    gap_zp = np.uint8(118)
+    y_scale = np.float32(0.06)
+    y_zp = np.uint8(120)
+
+    # QGemm's own `B` is stored `[K, N]` here (transB=0), matching this
+    # section's own `_qgemm_chain_model` default convention.
+    WfcT = Wfc.T  # (N2, Out) == (K, Out)
+    Wfcq, Wfcs, Wfczp = _qop_quantize_per_channel_i8(WfcT, axis=1)
+    Cfc_dequant_scale = gap_scale.astype(np.float64) * Wfcs.astype(np.float64)
+    Cfcq = np.round(Bfc.astype(np.float64) / Cfc_dequant_scale).astype(np.int32)
+
+    inits = [
+        _f32(np.array(x_scale), "x_scale"),
+        _u8(np.array(x_zp), "x_zp"),
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        _f32(np.atleast_1d(W1s), "W1_scale"),
+        _i8(np.atleast_1d(W1zp), "W1_zp"),
+        _f32(np.array(y1_scale), "y1_scale"),
+        _u8(np.array(y1_zp), "y1_zp"),
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        _f32(np.atleast_1d(W2s), "W2_scale"),
+        _i8(np.atleast_1d(W2zp), "W2_zp"),
+        _f32(np.array(y2_scale), "y2_scale"),
+        _u8(np.array(y2_zp), "y2_zp"),
+        _f32(np.array(gap_scale), "gap_scale"),
+        _u8(np.array(gap_zp), "gap_zp"),
+        onnx.numpy_helper.from_array(Wfcq, "Wfc"),
+        _f32(Wfcs, "Wfc_scale"),
+        _i8(Wfczp, "Wfc_zp"),
+        _i32(Cfcq, "Cfc"),
+        _f32(np.array(y_scale), "y_scale"),
+        _u8(np.array(y_zp), "y_zp"),
+    ]
+    n1 = _qlinearconv_node(
+        "n1",
+        "x_q",
+        "y1_q",
+        "W1",
+        "W1_scale",
+        "W1_zp",
+        "y1_scale",
+        "y1_zp",
+        None,
+        kernel_shape=[kh, kw],
+        pads=[0, 0, 0, 0],
+    )
+    n2 = _qlinearconv_node(
+        "n2",
+        "y1_q",
+        "y2_q",
+        "W2",
+        "W2_scale",
+        "W2_zp",
+        "y2_scale",
+        "y2_zp",
+        None,
+        x_scale="y1_scale",
+        x_zp="y1_zp",
+        kernel_shape=[1, 1],
+        pads=[0, 0, 0, 0],
+    )
+    gap = _qlinear_gap_node("y2_q", "y2_scale", "y2_zp", "gap_scale", "gap_zp", "gap_q")
+    flatten = onnx.helper.make_node("Flatten", ["gap_q"], ["flat_q"], axis=1)
+    gemm = _qgemm_node(
+        "mm", "flat_q", "y_q", "Wfc", "Wfc_scale", "Wfc_zp", "Cfc", "y_scale", "y_zp"
+    )
+    # `_qgemm_node` hardcodes its own `a_scale`/`a_zero_point` inputs to the
+    # literal names ``"a_scale"``/``"a_zp"`` -- overridden here to this
+    # consumer's real `a` operand's own scale/zero-point (`gap_scale`/
+    # `gap_zp`, the `QLinearGlobalAveragePool`'s own output pair), mirroring
+    # `_qgemm_chain_model`'s own identical post-hoc override for its second
+    # `QGemm` node.
+    gemm.input[1] = "gap_scale"
+    gemm.input[2] = "gap_zp"
+    graph = onnx.helper.make_graph(
+        [n1, n2, gap, flatten, gemm],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "x_q", onnx.TensorProto.UINT8, [1, C1, spatial, spatial]
+            )
+        ],
+        [onnx.helper.make_tensor_value_info("y_q", onnx.TensorProto.UINT8, [1, Out])],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, {
+        "W1": W1q,
+        "W1_scale": W1s,
+        "W1_zp": W1zp,
+        "W2": W2q,
+        "W2_scale": W2s,
+        "W2_zp": W2zp,
+        "Wfc": Wfcq,
+        "Wfc_scale": Wfcs,
+        "Wfc_zp": Wfczp,
+        "Cfc": Cfcq,
+        "spatial": spatial,
+        "C1": C1,
+        "N1": N1,
+        "N2": N2,
+        "Out": Out,
+    }
+
+
+def test_qlinear_gap_flatten_qgemm_is_matched_and_prunes():
+    N1, C1, N2, Out = 6, 3, 8, 5
+    model, info = _qlinearconv_gap_flatten_qgemm_model(
+        N1=N1, C1=C1, N2=N2, Out=Out, seed=60
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if ch.consumer.op_kind == "gemm")
+    assert gap_chain.producer.node.name == "n2"
+    assert gap_chain.n_channels == N2
+    assert [n.op_type for n in gap_chain.chain_ops] == [
+        "QLinearGlobalAveragePool",
+        "Flatten",
+    ]
+
+    # `n2` legitimately plays BOTH roles across the two chains -- consumer
+    # (its own `K`/`N1` axis, sliced first, in `graph.node` order) of the
+    # `n1` producer chain, then producer (its own `N`/`N2` axis, importance
+    # ranked on the ALREADY consumer-sliced array) of this new classifier-
+    # head chain -- exactly the same sequential mutation order this
+    # section's `ConvInteger` analogue's own identical test documents.
+    w1_dequant = _qop_dequant(info["W1"], info["W1_scale"], info["W1_zp"], axis=0)
+    keep1 = np.sort(
+        np.argsort(-np.linalg.norm(w1_dequant.reshape(N1, -1), axis=1))[: N1 // 2]
+    )
+    w2_after_consumer_slice = info["W2"][:, keep1]
+    w2_dequant = _qop_dequant(
+        w2_after_consumer_slice, info["W2_scale"], info["W2_zp"], axis=0
+    )
+    keep2 = np.sort(
+        np.argsort(-np.linalg.norm(w2_dequant.reshape(N2, -1), axis=1))[: N2 // 2]
+    )
+    w2_final = w2_after_consumer_slice[keep2]
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # byte-identity: "slice, don't recompute" -- the second QLinearConv's own
+    # output-channel axis and the QGemm's own matching input (reduction)
+    # axis are both an exact hand-slice of the originals.
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W2"]), w2_final)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2_scale"]), info["W2_scale"][keep2]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2_zp"]), info["W2_zp"][keep2]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wfc"]), info["Wfc"][keep2, :]
+    )
+    # QGemm's own consumer-role slicing never touches scale/zero-point/bias
+    # -- none of them are indexed by the reduction axis (see this module's
+    # own "QOperator" section top comment).
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wfc_scale"]), info["Wfc_scale"]
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Cfc"]), info["Cfc"])
+
+    # Independently reconstructed "already pruned" reference model, run
+    # through a real InferenceSession alongside the pruned one -- mirrors
+    # `test_qlinearconv_producer_matches_independent_oracle_via_real_inference_session`'s
+    # own identical pattern.
+    ref_model, _ = _qlinearconv_gap_flatten_qgemm_model(
+        N1=len(keep1), C1=C1, N2=len(keep2), Out=Out, seed=999
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W1"].CopyFrom(onnx.numpy_helper.from_array(info["W1"][keep1], "W1"))
+    ref_inits["W1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_scale"][keep1], "W1_scale")
+    )
+    ref_inits["W1_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_zp"][keep1], "W1_zp")
+    )
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(w2_final, "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2_scale"][keep2], "W2_scale")
+    )
+    ref_inits["W2_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2_zp"][keep2], "W2_zp")
+    )
+    ref_inits["Wfc"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wfc"][keep2, :], "Wfc")
+    )
+    ref_inits["Wfc_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wfc_scale"], "Wfc_scale")
+    )
+    ref_inits["Wfc_zp"].CopyFrom(onnx.numpy_helper.from_array(info["Wfc_zp"], "Wfc_zp"))
+    ref_inits["Cfc"].CopyFrom(onnx.numpy_helper.from_array(info["Cfc"], "Cfc"))
+
+    rng = np.random.default_rng(61)
+    xq = rng.integers(0, 255, size=(1, C1, info["spatial"], info["spatial"])).astype(
+        np.uint8
+    )
+    (y_pruned,) = _run(pruned, {"x_q": xq})
+    (y_ref,) = _run(ref_model, {"x_q": xq})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_qlinear_gap_non_scalar_activation_scale_is_declined():
+    # A non-scalar `x_scale` on `QLinearGlobalAveragePool` -- never confirmed
+    # emitted by any real exporter (see this section's own top comment) --
+    # is declined outright, ending that hop's own chain unmatched rather
+    # than guessed at.
+    N1, C1, N2, Out = 6, 3, 4, 5
+    model, _info = _qlinearconv_gap_flatten_qgemm_model(N1=N1, C1=C1, N2=N2, Out=Out)
+    gap_node = next(n for n in model.graph.node if n.name == "gap")
+    bad_scale = onnx.numpy_helper.from_array(
+        np.array([0.05, 0.05], dtype=np.float32), "y2_scale_bad"
+    )
+    model.graph.initializer.append(bad_scale)
+    gap_node.input[1] = "y2_scale_bad"
+
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert len(chains) == 1  # only the ordinary QLinearConv->QLinearConv chain
+    assert chains[0].producer.node.name == "n1"
+
+
+def test_qlinear_gap_channels_last_nonzero_is_declined():
+    # `channels_last=1` (NHWC) is never confirmed emitted by any real
+    # exporter -- declined outright rather than assumed safe.
+    N1, C1, N2, Out = 6, 3, 4, 5
+    model, _info = _qlinearconv_gap_flatten_qgemm_model(N1=N1, C1=C1, N2=N2, Out=Out)
+    gap_node = next(n for n in model.graph.node if n.name == "gap")
+    gap_node.attribute.append(onnx.helper.make_attribute("channels_last", 1))
+
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].producer.node.name == "n1"
+
+
+def test_qlinear_gap_flatten_wrong_axis_is_declined():
+    # `Flatten` with a non-default `axis` merges more than one non-batch
+    # axis (or part of the batch axis) into the channel one -- the *general*
+    # Flatten problem this hop doesn't attempt (mirrors the plain-float/
+    # ConvInteger sections' own identical decline).
+    N1, C1, N2, Out = 6, 3, 4, 5
+    model, _info = _qlinearconv_gap_flatten_qgemm_model(N1=N1, C1=C1, N2=N2, Out=Out)
+    flatten_node = next(n for n in model.graph.node if n.op_type == "Flatten")
+    for attr in list(flatten_node.attribute):
+        flatten_node.attribute.remove(attr)
+    flatten_node.attribute.append(onnx.helper.make_attribute("axis", 0))
+
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].producer.node.name == "n1"
+
+
+def test_qlinear_gap_flatten_qgemm_real_quantize_static_pipeline_end_to_end():
+    # The full end-to-end pipeline: runs the REAL
+    # ``onnxruntime.quantization.quantize_static(quant_format=QuantFormat
+    # .QOperator)`` tool on a plain float `Conv -> Relu -> Conv -> Relu ->
+    # GlobalAveragePool -> Flatten(axis=1) -> Gemm` model, then confirms the
+    # SECOND (widest) Conv layer -- the one feeding the classifier head
+    # through `QLinearGlobalAveragePool` -- is matched and prunable, together
+    # with the QGemm classifier consumer's matching input channels. This is
+    # the exact real-world gap this round's task fixes: before this change,
+    # `_find_qop_chains` matched only the FIRST QLinearConv->QLinearConv
+    # chain, leaving the last, widest backbone layer completely untouched.
+    from onnxruntime.quantization import (
+        CalibrationDataReader,
+        QuantFormat,
+        QuantType,
+        quantize_static,
+    )
+
+    N, c, spatial = 1, 3, 8
+    m1, m2, out = 6, 8, 5
+    rng = np.random.default_rng(70)
+    w0 = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w1 = (rng.standard_normal((m2, m1, 3, 3)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((out, m2)) * 0.3).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[{N},{c},{spatial},{spatial}] x) => (float[{N},{out}] y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, W0)
+          h0a = Relu(h0)
+          h1 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, W1)
+          h1a = Relu(h1)
+          p = GlobalAveragePool(h1a)
+          f = Flatten<axis=1>(p)
+          y = Gemm<transB=1>(f, W2)
+        }}
+        """,
+        initializer=[_f32(w0, "W0"), _f32(w1, "W1"), _f32(w2, "W2")],
+        opset=17,
+    )
+
+    class _CDR(CalibrationDataReader):
+        def __init__(self):
+            rng2 = np.random.default_rng(71)
+            self._data = iter(
+                [
+                    {
+                        "x": rng2.standard_normal((N, c, spatial, spatial)).astype(
+                            np.float32
+                        )
+                    }
+                    for _ in range(5)
+                ]
+            )
+
+        def get_next(self):
+            return next(self._data, None)
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        onnx.save(float_model, src_path)
+        quantize_static(
+            src_path,
+            quant_path,
+            _CDR(),
+            quant_format=QuantFormat.QOperator,
+            weight_type=QuantType.QInt8,
+            activation_type=QuantType.QUInt8,
+        )
+        quantized = onnx.load(quant_path)
+
+    op_types = [n.op_type for n in quantized.graph.node]
+    assert op_types.count("QLinearConv") == 2
+    assert "QLinearGlobalAveragePool" in op_types
+    assert op_types.count("QGemm") == 1
+
+    chains = onnxsim.pruning._find_qop_chains(quantized.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if ch.consumer.op_kind == "gemm")
+    assert gap_chain.n_channels == m2
+    assert [n.op_type for n in gap_chain.chain_ops] == [
+        "QLinearGlobalAveragePool",
+        "Flatten",
+    ]
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(quantized, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_inits = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    conv_nodes = [n for n in pruned.graph.node if n.op_type == "QLinearConv"]
+    # The SECOND (widest) QLinearConv's own output-channel axis is pruned --
+    # the last, widest backbone layer a human would most want prunable.
+    last_conv_weight = conv_nodes[-1].input[3]
+    assert pruned_inits[last_conv_weight][0] == m2 - round(m2 * 0.5)
+    gemm_node = next(n for n in pruned.graph.node if n.op_type == "QGemm")
+    gemm_weight = gemm_node.input[3]
+    trans_b = any(a.name == "transB" and a.i for a in gemm_node.attribute)
+    k_axis = 1 if trans_b else 0  # QGemm stores B [N, K] when transB else [K, N]
+    assert pruned_inits[gemm_weight][k_axis] == m2 - round(m2 * 0.5)
+
+    # The pruned graph's own top-level input is still the original float
+    # graph input `x` (`QuantizeLinear`'s own first input) -- a real
+    # end-to-end numeric sanity check through the full quantized pipeline.
+    x = rng.standard_normal((N, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    assert y_pruned.shape == (N, out)
+    assert np.all(np.isfinite(y_pruned))
+
+
 # --- DynamicQuantizeMatMul / MatMulIntegerToFloat --------------------------
 #
 # ``com.microsoft::DynamicQuantizeMatMul``/``MatMulIntegerToFloat`` are ONNX

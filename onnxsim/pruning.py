@@ -33047,27 +33047,62 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
 # a ``QLinearMatMul``/``QGemm`` producer only ever pairs with a
 # ``QLinearMatMul``/``QGemm`` consumer, either combination) whose `K`
 # matches the producer's own `N`. This is a REAL, confirmed gap, not an
-# oversight: the empirical ``quantize_static(quant_format=QOperator)`` round
-# trip this section's own top comment quotes verbatim
+# oversight, for the *general* case: the empirical
+# ``quantize_static(quant_format=QOperator)`` round trip this section's own
+# top comment quotes verbatim
 # (``QuantizeLinear -> QLinearConv -> Flatten -> QLinearMatMul ->
 # DequantizeLinear``) is EXACTLY the cross-family (Conv-then-MatMul, via a
-# `Flatten` reshape) shape this section does NOT match -- the same real,
-# common CNN-classifier-head topology the QDQ section's own identical
-# same-family-only walk already declines for the QDQ pattern (neither
-# walker recognizes `Flatten`/`Reshape` as a hop at all, unlike the
-# plain-float :func:`_walk_to_conv_consumer`'s own pooling/`Resize`/`Pad`
-# hops, none of which apply here either since they're never emitted between
-# two QOperator-format compute nodes by anything this investigation found).
+# `Flatten` reshape reading real, un-pooled spatial extent) shape this
+# section does NOT match -- the same real, common CNN-classifier-head
+# topology the QDQ section's own identical same-family-only walk already
+# declines for the QDQ pattern (neither walker recognizes an arbitrary
+# `Flatten`/`Reshape` as a hop, unlike the plain-float
+# :func:`_walk_to_conv_consumer`'s own pooling/`Resize`/`Pad` hops, none of
+# which apply here either since they're never emitted between two
+# QOperator-format compute nodes by anything this investigation found).
 # Extending either walker to cross the Conv/MatMul family boundary through a
-# `Flatten`/`Reshape` reinterpretation is a real, tractable-looking follow-up
-# this section deliberately leaves out of scope rather than bolt onto a
-# same-family walker that was never designed for it -- consistent with, not
-# a new gap beyond, this module's own existing QDQ precedent. What IS
-# reached: a real multi-layer QOperator MLP/attention-projection stack (every
+# GENERAL `Flatten`/`Reshape` reinterpretation -- one reading a Conv's own
+# real, un-pooled spatial output, where a surviving channel set would need
+# to be re-derived through the reshape's exact memory layout -- is a real,
+# tractable-looking follow-up this section deliberately leaves out of scope
+# rather than bolt onto a same-family walker that was never designed for
+# it, consistent with, not a new gap beyond, this module's own existing QDQ
+# precedent.
+#
+# One NARROW exception to that same-family-only restriction IS matched,
+# though -- mirroring this module's own plain-float Conv chain's identical
+# carve-out (see this module's own top docstring's
+# ``GlobalAveragePool -> Flatten -> Gemm`` paragraph and
+# :func:`_match_gap_flatten_matmul_consumer`'s own docstring) and the
+# ``ConvInteger`` section's own analogous hop (:func:`_walk_to_conv_integer_consumer`):
+# a ``QLinearConv`` producer's logical output feeding
+# ``com.microsoft::QLinearGlobalAveragePool -> {Flatten(axis=1), Reshape to
+# [batch, -1], Squeeze-of-trailing-axes} -> {QLinearMatMul, QGemm}``
+# directly -- confirmed live as the REAL shape
+# ``quantize_static(quant_format=QOperator)`` emits for exactly this
+# topology (a `Conv -> ... -> Conv -> GlobalAveragePool -> Flatten ->
+# Gemm` classifier head): ORT's own QOperator quantizer replaces the plain
+# `GlobalAveragePool` with `QLinearGlobalAveragePool`
+# (``X, x_scale, x_zero_point, y_scale, y_zero_point -> Y``, plus a
+# `channels_last` attribute this investigation's own real round trip
+# confirms is always emitted `0`), never leaving a plain, unquantized
+# `GlobalAveragePool` node behind. See :func:`_match_qlinear_gap_pass_through`/
+# :func:`_match_qop_gap_flatten_consumer` for the exact match and why it's
+# safe: `GlobalAveragePool`'s own per-channel-independent reduction to size
+# 1 (unchanged by quantization -- confirmed against
+# `QLinearGlobalAveragePool`'s own live schema/doc text, which describes the
+# identical "average pooling across the values in the same channel"
+# computation) makes the `Flatten`/`Reshape`/`Squeeze` that follows a
+# *trivial* 1:1 channel relabeling, not a real memory-layout re-derivation
+# -- the exact same proof this module's plain-float family already
+# established, just applied to the quantized op. What IS reached, in total:
+# a real multi-layer QOperator MLP/attention-projection stack (every
 # ``QLinearMatMul``/``QGemm`` layer feeding the next directly or through an
-# activation), and a multi-layer QOperator CNN backbone (every ``QLinearConv``
-# feeding the next the same way) -- just not the point where a CNN backbone's
-# spatial output gets flattened into its classifier head's first ``MatMul``.
+# activation), a multi-layer QOperator CNN backbone (every ``QLinearConv``
+# feeding the next the same way), and now a CNN backbone's LAST Conv layer
+# feeding its classifier head through a global-average-pool -- just not the
+# general case of a CNN backbone's real, un-pooled spatial output getting
+# flattened directly into a classifier head's first ``MatMul``.
 #
 # What's declined, deliberately, rather than guessed at (mirroring this
 # module's own conservative "decline anything ambiguous" bar everywhere
@@ -33145,6 +33180,17 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
 #     `MatMulNBits` mixing) -- so a QOperator node feeding, or fed by, any of
 #     those is simply never matched as either role here (its own producer or
 #     consumer search only ever tries the other two QOperator ops).
+#   * A ``com.microsoft::QLinearGlobalAveragePool`` with `channels_last != 0`
+#     (NHWC -- never confirmed emitted by any real exporter, see
+#     :func:`_match_qlinear_gap_pass_through`), a non-scalar `x_scale`/
+#     `x_zero_point`/`y_scale`/`y_zero_point`, more than one non-`Shape`
+#     consumer of its own output, or a `Flatten`/`Reshape`/`Squeeze` right
+#     after it that doesn't match one of the three narrow shapes
+#     :func:`_match_qop_gap_flatten_consumer` recognizes (the general
+#     `Flatten`-off-real-spatial-extent case above) -- any of these simply
+#     ends that hop's own chain unmatched, the same "no other unconditional
+#     use for a pooling hop" bar the `ConvInteger` section's own identical
+#     hop already holds.
 #
 # Sensitivity-report family strings: ``"qoperator_conv"`` for a
 # ``QLinearConv`` producer, ``"qoperator_matmul"`` for a ``QLinearMatMul``/
@@ -33548,6 +33594,194 @@ def _slice_qop_consumer(w: _QOpWeight, keep: np.ndarray) -> None:
     )
 
 
+def _match_qlinear_gap_pass_through(
+    node: onnx.NodeProto,
+    cur: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> bool:
+    """True iff `node` is a ``com.microsoft::QLinearGlobalAveragePool``
+    reading `cur` as its own `X` input, with `channels_last == 0` (the only
+    layout value any real exporter this investigation found ever emits --
+    confirmed live: `onnxruntime.quantization`'s own quantizer for
+    `GlobalAveragePool` always hardcodes `channels_last=0` on the emitted
+    `QLinearGlobalAveragePool`, regardless of the source node's own
+    attributes) and every one of its four activation scale/zero-point
+    operands (`x_scale`/`x_zero_point`/`y_scale`/`y_zero_point`) a constant
+    scalar -- the same scalar-activation-only bar this section's own top
+    comment already holds every other QOperator activation input to.
+
+    `x_scale`/`x_zero_point` are never checked against the producing
+    ``QLinearConv``'s own `y_scale`/`y_zero_point` -- confirmed unnecessary,
+    not merely unchecked (a real exporter round trip does tie them to the
+    exact same initializers, but nothing here depends on that): like every
+    other hop this module's QOperator section matches, channel-slicing
+    safety rests entirely on the op treating every channel completely
+    independently (`QLinearGlobalAveragePool`'s own doc text: "applies
+    Average pooling across the values in the same channel", the identical
+    per-channel reduction plain `GlobalAveragePool` performs, confirmed live
+    via `onnxruntime`'s own operator schema registry), which holds
+    regardless of what `x_scale`/`x_zero_point`/`y_scale`/`y_zero_point`
+    actually equal -- exactly the same "never touched by either role, so
+    never needing to match anything" reasoning this section's own top
+    comment already gives for every other QOperator activation scale/
+    zero-point pair.
+    """
+    if node.op_type != "QLinearGlobalAveragePool" or node.domain != "com.microsoft":
+        return False
+    if len(node.input) != 5 or len(node.output) != 1:
+        return False
+    if node.input[0] != cur:
+        return False
+    channels_last = _matmul_nbits_int_attr(node, "channels_last", 0)
+    if channels_last != 0:
+        return False  # NHWC layout -- axis 1 wouldn't be the channel axis;
+        # never confirmed emitted by any real exporter, declined outright
+        # rather than guessed at, see this function's own docstring
+    for name in node.input[1:]:
+        if not name:
+            return False
+        t = initializer_map.get(name)
+        if t is None or not _qop_scalar_dims_ok(t.dims):
+            return False
+    return True
+
+
+def _match_qop_gap_flatten_consumer(
+    gap_out: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+    producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], _QOpWeight]]:
+    """The QOperator analogue of the plain-float chain's own
+    :func:`_match_gap_flatten_matmul_consumer`, for the
+    ``QLinearGlobalAveragePool -> {Flatten(axis=1), Reshape to [batch, -1],
+    Squeeze-of-trailing-axes} -> {QLinearMatMul, QGemm}`` classifier-head
+    shape. Reuses that function's own reshape/Squeeze matchers verbatim --
+    :func:`_match_flatten_axis1_pass_through`,
+    :func:`_match_reshape_batch_neg1_pass_through`,
+    :func:`_gap_squeeze_axes`/:func:`_squeeze_axis_is_trailing_spatial` --
+    since every one of those looks only at the `Flatten`/`Reshape`/
+    `Squeeze` node's own shape, never at what feeds or consumes it, so the
+    identical trivial 1:1 channel-relabeling proof
+    `_match_gap_flatten_matmul_consumer`'s own docstring gives for a
+    plain-float `GlobalAveragePool`'s ``[N, C, 1, ..., 1]`` output applies
+    UNCHANGED to `QLinearGlobalAveragePool`'s own identically-shaped
+    quantized output (same per-channel reduction, `channels_last=0`
+    unconditionally so axis 1 is always the channel axis -- see
+    :func:`_match_qlinear_gap_pass_through`).
+
+    Only the FINAL consumer match differs from the plain-float function:
+    `QLinearMatMul`/`QGemm` (:func:`_match_qlinearmatmul`/
+    :func:`_match_qgemm`) instead of a plain float `MatMul`/vanilla `Gemm`
+    (`_match_matmul_like`), since the tensor reaching it is still quantized
+    int8/uint8 throughout here -- unlike the `ConvInteger` section's own
+    identical hop (which reuses `_match_gap_flatten_matmul_consumer`
+    verbatim, because that section's own producer chain is always rescaled
+    back to plain float before this point), a QOperator producer's logical
+    output never is (see :func:`_walk_to_qop_consumer`'s own docstring for
+    why). Returns ``(reshape_chain, consumer)`` -- `consumer` a
+    `_QOpWeight`, exactly the shape :func:`_match_qlinearmatmul`/
+    :func:`_match_qgemm` already return for an ordinary same-family
+    consumer, so callers need no dedicated `matmul_consumer`-style side
+    channel the way the `ConvInteger` section's own :class:`_ConvIntegerChain`
+    does -- or ``None`` for the identical reasons
+    `_match_gap_flatten_matmul_consumer` documents (no exactly-one consumer
+    off `gap_out`, none of the three reshape shapes matches, the final 2-D
+    tensor isn't singly-consumed or is itself a graph output, that consumer
+    isn't a same-family `QLinearMatMul`/`QGemm` node reading it directly, or
+    its own match's `K` doesn't equal `n_channels`).
+
+    `producers_of`, when given, is threaded straight through to
+    :func:`_match_reshape_batch_neg1_pass_through` to resolve a
+    ``Concat``-produced ``Reshape`` shape, mirroring that function's own
+    optional parameter exactly.
+    """
+    if gap_out in graph_outputs:
+        return None
+    gap_consumers = consumers_of.get(gap_out, [])
+    first: onnx.NodeProto
+    if len(gap_consumers) == 1:
+        first = gap_consumers[0]
+    elif len(gap_consumers) == 2:
+        # The `x.view(x.size(0), -1)`/`x.reshape(x.shape[0], -1)` shape's own
+        # root tensor read twice (once as `Reshape` data, once by a `Shape`
+        # feeding the dynamic batch-size computation) -- mirrors
+        # `_match_gap_flatten_matmul_consumer`'s own identical carve-out, see
+        # that function's own docstring for why.
+        reshape_candidates = [c for c in gap_consumers if c.op_type == "Reshape"]
+        shape_candidates = [
+            c for c in gap_consumers if c.op_type == "Shape" and c.domain == ""
+        ]
+        if len(reshape_candidates) != 1 or len(shape_candidates) != 1:
+            return None
+        first = reshape_candidates[0]
+    else:
+        return None
+
+    reshape_chain: Tuple[onnx.NodeProto, ...]
+    final_out: str
+
+    if _match_flatten_axis1_pass_through(first, gap_out):
+        reshape_chain = (first,)
+        final_out = first.output[0]
+    elif _match_reshape_batch_neg1_pass_through(
+        first, gap_out, initializer_map, producers_of
+    ):
+        reshape_chain = (first,)
+        final_out = first.output[0]
+    else:
+        squeeze_chain: List[onnx.NodeProto] = []
+        cand: Optional[onnx.NodeProto] = first
+        cur = gap_out
+        while cand is not None:
+            if (
+                cand.op_type != "Squeeze"
+                or cand.domain != ""
+                or not cand.input
+                or cand.input[0] != cur
+                or len(cand.output) != 1
+            ):
+                break
+            axes = _gap_squeeze_axes(cand, initializer_map)
+            if not axes or not all(
+                _squeeze_axis_is_trailing_spatial(a, n_channels) for a in axes
+            ):
+                break
+            out2 = cand.output[0]
+            if out2 in graph_outputs:
+                break
+            squeeze_chain.append(cand)
+            cur = out2
+            next_consumers = consumers_of.get(cur, [])
+            cand = next_consumers[0] if len(next_consumers) == 1 else None
+        if not squeeze_chain:
+            return None
+        reshape_chain = tuple(squeeze_chain)
+        final_out = cur
+
+    if final_out in graph_outputs:
+        return None
+    final_consumers = consumers_of.get(final_out, [])
+    if len(final_consumers) != 1:
+        return None
+    mm_node = final_consumers[0]
+
+    m: Optional[_QOpWeight] = None
+    if (
+        mm_node.op_type == "QLinearMatMul"
+        and mm_node.input
+        and mm_node.input[0] == final_out
+    ):
+        m = _match_qlinearmatmul(mm_node, initializer_map, consumers_of)
+    elif mm_node.op_type == "QGemm" and mm_node.input and mm_node.input[0] == final_out:
+        m = _match_qgemm(mm_node, initializer_map, consumers_of)
+    if m is None or m.K != n_channels:
+        return None
+    return reshape_chain, m
+
+
 @dataclass(frozen=True)
 class _QOpChain:
     producer: _QOpWeight
@@ -33564,15 +33798,41 @@ def _walk_to_qop_consumer(
     graph_outputs: Set[str],
     n_channels: int,
     max_hops: int,
+    producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Optional[Tuple[_QOpWeight, Tuple[onnx.NodeProto, ...]]]:
     """From tensor `start`, walks forward through shape-preserving unary
     activations (`_UNARY_PASS_THROUGH`) with no other consumer anywhere
     along the way, until a same-family (``QLinearConv``-only when `is_conv`,
     ``QLinearMatMul``/``QGemm``-only otherwise) consumer is found whose own
     `K` matches `n_channels`. Mirrors :func:`_walk_to_consumer_qdq` closely
-    -- see this section's own top comment for why no `Flatten`/`Reshape`
-    cross-family hop is recognized. Returns ``None`` if the walk runs out of
-    hops, hits a branch, or never reaches such a consumer.
+    -- see this section's own top comment for why no GENERAL `Flatten`/
+    `Reshape` cross-family hop is recognized. Returns ``None`` if the walk
+    runs out of hops, hits a branch, or never reaches such a consumer.
+
+    One NARROW exception to the same-family-only restriction, only on the
+    Conv side (`is_conv`) -- mirroring the `ConvInteger` section's own
+    analogous hop (:func:`_walk_to_conv_integer_consumer`'s own
+    `GlobalAveragePool` branch) and this module's plain-float Conv chain's
+    own `recognize_gap_flatten_matmul_consumer` hop: a
+    ``com.microsoft::QLinearGlobalAveragePool`` hit mid-walk
+    (:func:`_match_qlinear_gap_pass_through`) is additionally checked for
+    the ``-> {Flatten(axis=1), Reshape to [batch, -1],
+    Squeeze-of-trailing-axes} -> {QLinearMatMul, QGemm}`` shape
+    :func:`_match_qop_gap_flatten_consumer` describes. A match ends the walk
+    there, returning that function's own matched `_QOpWeight` consumer
+    directly -- unlike the `ConvInteger` section's own `matmul_consumer`
+    side channel, no dedicated return shape is needed here, since the
+    classifier-head consumer this narrow shape reaches is itself always a
+    `_QOpWeight` (`QLinearMatMul`/`QGemm`), exactly like the ordinary
+    same-family case above. A `QLinearGlobalAveragePool` feeding anything
+    else (no recognized `Flatten`/`Reshape`/`Squeeze`-then-matmul-consumer
+    shape right after it) simply ends the walk undeclined -- this walker
+    has no other, unconditional use for a pooling hop the way the
+    plain-float Conv-chain walker does. `producers_of`, when given, is
+    threaded straight through to :func:`_match_qop_gap_flatten_consumer` to
+    resolve a ``Concat``-produced ``Reshape`` shape; left ``None`` (the
+    default), only the whole-constant-initializer `Reshape` shape is
+    matched, never a hard failure.
 
     UNLIKE :func:`_walk_to_consumer_qdq`/:func:`_walk_to_dynquant_consumer`/
     :func:`_walk_to_matmul_nbits_consumer`, this walker deliberately does
@@ -33620,6 +33880,22 @@ def _walk_to_qop_consumer(
                 if m is None or m.K != n_channels:
                     return None
                 return m, tuple(chain_ops)
+            if _match_qlinear_gap_pass_through(nxt, cur, initializer_map):
+                gap_match = _match_qop_gap_flatten_consumer(
+                    nxt.output[0],
+                    consumers_of,
+                    initializer_map,
+                    graph_outputs,
+                    n_channels,
+                    producers_of,
+                )
+                if gap_match is None:
+                    return None  # no other unconditional use for a pooling
+                    # hop here -- see this function's own docstring
+                reshape_chain, consumer_match = gap_match
+                chain_ops.append(nxt)
+                chain_ops.extend(reshape_chain)
+                return consumer_match, tuple(chain_ops)
         else:
             if nxt.op_type == "QLinearMatMul" and nxt.input and nxt.input[0] == cur:
                 m = _match_qlinearmatmul(nxt, initializer_map, consumers_of)
@@ -33649,13 +33925,19 @@ def _walk_to_qop_consumer(
 def _find_qop_chains(graph: onnx.GraphProto) -> List[_QOpChain]:
     """The QOperator analogue of :func:`_find_qdq_chains`, restricted to the
     single-producer/single-consumer/unary-hops-only, same-family-only
-    topology :func:`_walk_to_qop_consumer` matches. Tries a ``QLinearConv``
+    topology :func:`_walk_to_qop_consumer` matches -- with one narrow
+    exception on the Conv side: a ``QLinearConv`` producer whose logical
+    output reaches the classifier-head ``QLinearGlobalAveragePool ->
+    {Flatten(axis=1), Reshape to [batch, -1], Squeeze-of-trailing-axes} ->
+    {QLinearMatMul, QGemm}`` shape is also matched (see
+    :func:`_walk_to_qop_consumer`'s own docstring). Tries a ``QLinearConv``
     producer, then a ``QLinearMatMul`` producer, then a ``QGemm`` producer --
     the three matchers' own `op_type` checks are mutually exclusive, so this
     is never ambiguous.
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
+    producers_of = _producers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
     def _is_internal(name: str) -> bool:
@@ -33689,6 +33971,7 @@ def _find_qop_chains(graph: onnx.GraphProto) -> List[_QOpChain]:
             graph_outputs,
             m.N,
             _MAX_CHAIN_HOPS,
+            producers_of,
         )
         if found is None:
             continue
@@ -33740,10 +34023,30 @@ def apply_structured_pruning_qoperator(
     is matched -- only the plain single-producer/single-consumer topology
     above (see this module's own "QOperator" section comment for the full
     scope-boundary list, including why a `QLinearConv` producer feeding a
-    `QLinearMatMul`/`QGemm` consumer through a `Flatten` reshape -- the real
-    shape a Conv-backbone classifier head takes -- is declined outright, the
-    same known gap the QDQ section's own identical same-family-only walk
-    already has).
+    `QLinearMatMul`/`QGemm` consumer through a GENERAL `Flatten`/`Reshape`
+    reading real, un-pooled spatial extent is declined outright, the same
+    known gap the QDQ section's own identical same-family-only walk already
+    has).
+
+    One narrow exception to the same-family-only consumer rule IS matched,
+    though: a ``QLinearConv`` producer's logical output feeding
+    ``com.microsoft::QLinearGlobalAveragePool -> {Flatten(axis=1), Reshape
+    to [batch, -1], Squeeze-of-trailing-axes} -> {QLinearMatMul, QGemm}``
+    directly (the canonical statically-quantized CNN classifier head --
+    confirmed live as the real shape
+    ``quantize_static(quant_format=QuantFormat.QOperator)`` emits for a
+    ``Conv -> ... -> GlobalAveragePool -> Flatten -> Gemm`` model) is also
+    matched (:func:`_match_qlinear_gap_pass_through`/
+    :func:`_match_qop_gap_flatten_consumer`), pruning the producer's output
+    channels together with the matching input channels of that
+    ``QLinearMatMul``/``QGemm`` consumer's own quantized weight -- mirroring
+    the plain-float Conv chain's own identical
+    `recognize_gap_flatten_matmul_consumer` hop and the ``ConvInteger``
+    section's own analogous one. `GlobalAveragePool`'s per-channel-
+    independent reduction to size 1 (unchanged by quantization) makes the
+    reshape in between a *trivial* 1:1 channel relabeling, not the real
+    memory-layout re-derivation the general `Flatten`/`Reshape` case above
+    still declines.
 
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
