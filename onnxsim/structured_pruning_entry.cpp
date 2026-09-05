@@ -22142,7 +22142,7 @@ bool ScalarFloatConstEquals(const std::string& name, const InitMap& init_map,
 // on the returned root) is known.
 struct DecomposedRopePassThrough {
   std::vector<onnx::NodeProto*> nodes;  // add, mul_direct, mul_rotated,
-                                         // concat, neg, slice1, slice2
+                                        // concat, neg, slice1, slice2
   int64_t half = 0;
 };
 
@@ -22205,9 +22205,9 @@ std::optional<RotateHalfSliceMatch> MatchDecomposedRotateHalfSlice(
     return std::nullopt;
   }
   onnx::NodeProto* neg = nit->second;
-  if (neg->domain() != "" || neg->op_type() != "Neg" || neg->input_size() != 1 ||
-      neg->input(0).empty() || neg->output_size() != 1 ||
-      neg->output(0) != neg_out) {
+  if (neg->domain() != "" || neg->op_type() != "Neg" ||
+      neg->input_size() != 1 || neg->input(0).empty() ||
+      neg->output_size() != 1 || neg->output(0) != neg_out) {
     return std::nullopt;
   }
   const std::string x2_out = neg->input(0);
@@ -22215,9 +22215,9 @@ std::optional<RotateHalfSliceMatch> MatchDecomposedRotateHalfSlice(
     return std::nullopt;
   }
 
-  auto match_half_slice =
-      [&](const std::string& out_name)
-      -> std::optional<std::tuple<onnx::NodeProto*, std::string, int64_t, int64_t>> {
+  auto match_half_slice = [&](const std::string& out_name)
+      -> std::optional<
+          std::tuple<onnx::NodeProto*, std::string, int64_t, int64_t>> {
     auto sit = node_by_output.find(out_name);
     if (sit == node_by_output.end()) {
       return std::nullopt;
@@ -22271,8 +22271,8 @@ std::optional<RotateHalfSliceMatch> MatchDecomposedRotateHalfSlice(
     return std::nullopt;
   }
 
-  return RotateHalfSliceMatch{concat, neg, slice1_node, slice2_node, root1,
-                              end1};
+  return RotateHalfSliceMatch{concat,      neg,   slice1_node,
+                              slice2_node, root1, end1};
 }
 
 struct RopePassThroughMatch {
@@ -22303,9 +22303,10 @@ std::optional<RopePassThroughMatch> MatchDecomposedRopePassThrough(
     return std::nullopt;
   }
   onnx::NodeProto* add = ait->second;
-  if (add->domain() != "" || add->op_type() != "Add" || add->input_size() != 2 ||
-      add->input(0).empty() || add->input(1).empty() ||
-      add->output_size() != 1 || add->output(0) != name) {
+  if (add->domain() != "" || add->op_type() != "Add" ||
+      add->input_size() != 2 || add->input(0).empty() ||
+      add->input(1).empty() || add->output_size() != 1 ||
+      add->output(0) != name) {
     return std::nullopt;
   }
   const std::string a_name = add->input(0);
@@ -22314,9 +22315,9 @@ std::optional<RopePassThroughMatch> MatchDecomposedRopePassThrough(
     return std::nullopt;
   }
 
-  auto try_order =
-      [&](const std::string& direct_name,
-          const std::string& rotated_name) -> std::optional<RopePassThroughMatch> {
+  auto try_order = [&](const std::string& direct_name,
+                       const std::string& rotated_name)
+      -> std::optional<RopePassThroughMatch> {
     if (!is_internal(direct_name) || !is_internal(rotated_name)) {
       return std::nullopt;
     }
@@ -22341,8 +22342,8 @@ std::optional<RopePassThroughMatch> MatchDecomposedRopePassThrough(
 
     const std::string rot_a = mul_rotated->input(0);
     const std::string rot_b = mul_rotated->input(1);
-    const std::pair<std::string, std::string> rot_orders[2] = {
-        {rot_a, rot_b}, {rot_b, rot_a}};
+    const std::pair<std::string, std::string> rot_orders[2] = {{rot_a, rot_b},
+                                                               {rot_b, rot_a}};
     for (const auto& [concat_name, sin_operand] : rot_orders) {
       if (concat_name == sin_operand || !is_internal(concat_name)) {
         continue;
@@ -22356,7 +22357,7 @@ std::optional<RopePassThroughMatch> MatchDecomposedRopePassThrough(
       const std::string d_a = mul_direct->input(0);
       const std::string d_b = mul_direct->input(1);
       const std::pair<std::string, std::string> d_orders[2] = {{d_a, d_b},
-                                                                {d_b, d_a}};
+                                                               {d_b, d_a}};
       for (const auto& [root_cand, cos_operand] : d_orders) {
         if (root_cand != rotate_half->root_name || root_cand == cos_operand) {
           continue;
@@ -22397,9 +22398,8 @@ WalkBackThroughDecomposedRope(
     const std::unordered_set<std::string>& graph_outputs,
     const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
     const InitMap& init_map) {
-  auto matched = MatchDecomposedRopePassThrough(name, consumers_of,
-                                                graph_outputs, node_by_output,
-                                                init_map);
+  auto matched = MatchDecomposedRopePassThrough(
+      name, consumers_of, graph_outputs, node_by_output, init_map);
   if (!matched) {
     return {name, std::nullopt};
   }
@@ -22439,8 +22439,8 @@ bool DecomposedRopeHopIsConsistent(
 // `weight_last_dim == head_size` check.
 struct DecomposedQKNormPassThrough {
   std::vector<onnx::NodeProto*> nodes;  // final_mul, mul_node, inv_node,
-                                         // sqrt_node, add_eps, reduce_mean,
-                                         // pow_node
+                                        // sqrt_node, add_eps, reduce_mean,
+                                        // pow_node
   int64_t weight_last_dim = 0;
 };
 
@@ -22487,7 +22487,7 @@ std::optional<QkNormPassThroughMatch> MatchDecomposedQkNormPassThrough(
   const std::string fa = final_mul->input(0);
   const std::string fb = final_mul->input(1);
   const std::pair<std::string, std::string> final_orders[2] = {{fa, fb},
-                                                                {fb, fa}};
+                                                               {fb, fa}};
   for (const auto& [weight_name, scaled_name] : final_orders) {
     if (weight_name == scaled_name || !is_internal(scaled_name)) {
       continue;
@@ -22509,7 +22509,7 @@ std::optional<QkNormPassThroughMatch> MatchDecomposedQkNormPassThrough(
     const std::string ma = mul_node->input(0);
     const std::string mb = mul_node->input(1);
     const std::pair<std::string, std::string> mul_orders[2] = {{ma, mb},
-                                                                {mb, ma}};
+                                                               {mb, ma}};
     for (const auto& [x_name, inv_std_name] : mul_orders) {
       if (x_name == inv_std_name || !is_internal(inv_std_name)) {
         continue;
@@ -22574,7 +22574,7 @@ std::optional<QkNormPassThroughMatch> MatchDecomposedQkNormPassThrough(
       const std::string aa = add_eps->input(0);
       const std::string ab = add_eps->input(1);
       const std::pair<std::string, std::string> add_orders[2] = {{aa, ab},
-                                                                  {ab, aa}};
+                                                                 {ab, aa}};
       for (const auto& [var_name, eps_name] : add_orders) {
         if (var_name == eps_name || !is_internal(var_name)) {
           continue;
@@ -22621,9 +22621,8 @@ std::optional<QkNormPassThroughMatch> MatchDecomposedQkNormPassThrough(
         }
 
         DecomposedQKNormPassThrough hop;
-        hop.nodes = {final_mul,  mul_node, inv_node,
-                     sqrt_node, add_eps,  reduce_mean,
-                     pow_node};
+        hop.nodes = {final_mul, mul_node,    inv_node, sqrt_node,
+                     add_eps,   reduce_mean, pow_node};
         hop.weight_last_dim =
             init_map.at(weight_name)
                 ->dims(init_map.at(weight_name)->dims_size() - 1);
@@ -22873,7 +22872,7 @@ std::optional<HeadSplitMatch> MatchDecomposedHeadSplit(
     return std::nullopt;
   }
 
-  return HeadSplitMatch{transpose,          reshape,  num_heads, head_size,
+  return HeadSplitMatch{transpose,         reshape,  num_heads,  head_size,
                         reshape->input(1), proj_out, qk_norm_hop};
 }
 
