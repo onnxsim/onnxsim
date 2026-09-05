@@ -32,7 +32,15 @@ across the six newer fused-op families (no dynamic-attention-bias-Gather-
 insertion machinery) and across the decomposed-GQA family (no mask/RoPE/
 Q-K-norm/Einsum/packed-QKV, no true-MQA fast path) -- every one of those
 narrowings means ``apply_attention_head_wanda_pruning`` is NOT yet aliased
-to this port either.
+to this port either -- EXCEPT the additive-mask branch of the decomposed-GQA
+family, which this port's ``ApplyAttentionHeadWandaPruning`` now shares with
+``ApplyAttentionHeadPruning`` (both dispatch through the same
+``FindDecomposedGqaChains``/``ApplyOneDecomposedGqaChain``/
+``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias`` machinery): a constant or
+genuinely dynamic additive mask before ``Softmax`` is matched and pruned
+here too, exactly mirroring pruning.py's own
+``_head_bias_input_is_safe``/``_slice_or_gather_head_bias`` for this one
+chain family.
 """
 
 import os
@@ -1630,15 +1638,20 @@ def test_cpp_decomposed_gqa_wanda_pruning_clones_shape_constant_shared_with_fore
     assert "Sq_pruned" in inits
 
 
-def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_is_declined_but_python_still_prunes():
-    # Mirrors test_attention_head_pruning_cpp.py's own identical (data-free)
-    # test -- this C++ port never recognizes an additive mask at all, so the
-    # whole chain declines to match here regardless of whether calibration
-    # data is supplied, while pruning.py's own pure-Python
-    # apply_attention_head_wanda_pruning still prunes it.
+def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_matches_python_reference_exactly():
+    # An additive mask `Add` before `Softmax`, a constant of the
+    # schema-documented per-head-broadcastable shape -- `ApplyAttentionHead
+    # WandaPruning` shares `FindDecomposedGqaChains`/`ApplyOneDecomposedGqaChain`
+    # with the data-free entry point above, so it now matches and correctly
+    # leaves this broadcast mask untouched here too (see
+    # test_attention_head_pruning_cpp.py's own identical, more thorough
+    # coverage of this branch for the full reasoning) -- both ports must
+    # agree byte-for-byte, whether or not calibration data is supplied.
     model, cfg = _decomposed_gqa_model(
         K=32, H=8, KVH=2, D=8, Out=16, seed=107, masked=True
     )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
     rng = np.random.default_rng(108)
     calibration_data = [
         {
@@ -1651,12 +1664,12 @@ def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_is_declined_but_pyt
         model, calibration_data=calibration_data, sparsity=0.5
     )
     pruned_py = onnxsim.apply_attention_head_wanda_pruning(
-        model, calibration_data=calibration_data, sparsity=0.5
+        model_for_py, calibration_data=calibration_data, sparsity=0.5
     )
     onnx.checker.check_model(pruned_cpp)
     onnx.checker.check_model(pruned_py)
-    assert pruned_cpp.SerializeToString() == model.SerializeToString()
-    assert pruned_py.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
 
 
 def test_cpp_decomposed_mqa_wanda_pruning_is_a_permanent_no_op_unlike_python():

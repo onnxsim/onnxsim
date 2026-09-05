@@ -21990,14 +21990,36 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 // declining rather than reproducing pruning.py's own dynamic-bias slicing,
 // and ApplyOneGqaChain's own comment on having no MQA fast path at all):
 //
-//   - No additive mask (`attn_mask`/causal bias) of any kind is recognized
-//     here -- pruning.py's own `_resolve_decomposed_qk_root` matches an
-//     optional `Add(mask) -> [Mul/Div(scale) ->] MatMul` prefix; this port's
-//     `ResolveDecomposedQkRoot` only ever matches `[Mul/Div(scale) ->]
-//     MatMul`, so a graph with a real mask `Add` node between the QK^T
-//     product and Softmax simply fails to match at all here (the `Add`
-//     node's own op_type is never `Mul`/`Div`/`MatMul`) -- a decline, never
-//     a mis-slice.
+//   - An additive mask (`attn_mask`/causal bias), when present, IS matched
+//     and pruned -- `ResolveDecomposedQkRoot` recognizes the identical
+//     optional `Add(mask) -> [Mul/Div(scale) ->] MatMul` prefix pruning.py's
+//     own `_resolve_decomposed_qk_root` does, and HeadBiasInputIsSafe/
+//     SliceOrGatherHeadBias mirror pruning.py's own `_head_bias_input_is_safe`/
+//     `_slice_or_gather_head_bias` exactly (constant per-head axis sliced in
+//     place; a genuinely dynamic per-head tensor gets a new `Gather` spliced
+//     in ahead of it via InsertDynamicHeadBiasGather; an unresolvable shape
+//     declines the WHOLE chain, same as an unresolvable constant does) --
+//     see HeadBiasInputIsSafe's own comment for this port's one narrower-
+//     than-pruning.py scope point within this (a constant mask that DOES
+//     resolve to a genuine per-head axis, but isn't FLOAT/FLOAT16/BFLOAT16,
+//     is declined rather than sliced, since SliceAxisGeneric -- unlike
+//     pruning.py's own dtype-agnostic `_slice_axis` -- only handles those
+//     three encodings, the same widened-but-still-bounded dtype scope this
+//     file's own MoE/QMoE section already established via
+//     IsSupportedFloatDtype/ReadTensorAsF64/WriteF64TensorAs). `value_info_
+//     by_name` here is always the graph's own AS-DECLARED `input`/`output`/
+//     `value_info` (`ValueInfoByName`, this file's own pre-existing helper)
+//     -- unlike pruning.py's own top-level-graph case, no real
+//     `onnx::shape_inference` pass backs it (mirrors pruning.py's own
+//     nested-subgraph fallback, applied here uniformly to every graph, top-
+//     level included, to avoid adding a whole new shape-inference dependency
+//     to this section for what is already a conservative, "decline rather
+//     than guess" fallback either way): a dynamic mask/`attn_mask` input
+//     whose per-head shape is only resolvable via real inference (rather
+//     than already declared outright) is left unsliced -- the identical,
+//     already-documented conservative gap pruning.py's own nested-subgraph
+//     path itself carries, never a correctness risk (an unresolvable dynamic
+//     shape always declines the whole chain, never guesses).
 //   - No decomposed RoPE (`_DecomposedRopePassThrough`) or decomposed
 //     Q/K-norm (`_DecomposedQKNormPassThrough`) pass-through is recognized
 //     between a branch's own head-split `Reshape`/`Transpose` and the QK^T
@@ -22082,6 +22104,14 @@ struct DecomposedGqaChain {
 
   onnx::NodeProto* qk_matmul = nullptr;
   onnx::NodeProto* scale_node = nullptr;
+  // `mask_node`/`mask_idx` are both unset when no additive mask was
+  // matched; otherwise `mask_idx` is the index within `mask_node->input()`
+  // of the mask operand itself (the *other* index resolves back toward the
+  // QK^T product) -- mirrors pruning.py's own `_DecomposedGQAChain.mask_node`/
+  // `.mask_idx`, the exact `(node, idx)` shape SliceOrGatherHeadBias already
+  // expects.
+  onnx::NodeProto* mask_node = nullptr;
+  std::optional<int> mask_idx;
   onnx::NodeProto* softmax_node = nullptr;
   onnx::NodeProto* av_matmul = nullptr;
   onnx::NodeProto* out_transpose = nullptr;
@@ -22298,12 +22328,21 @@ std::optional<RepeatKvMatch> MatchDecomposedRepeatKv(
   return m;
 }
 
-// Resolves a Softmax's own input backward through the optional
-// `[Mul/Div(scalar scale) ->] MatMul` prefix -- mirrors pruning.py's own
-// `_resolve_decomposed_qk_root`, narrowed to this port's own scope (no mask
-// `Add`, no `Einsum` -- see this section's own top comment).
+// Resolves a Softmax's own input backward through the fixed, optional
+// `[Add(mask) ->] [Mul/Div(scale) ->] MatMul` prefix -- mirrors pruning.py's
+// own `_resolve_decomposed_qk_root` exactly (this port's own remaining scope
+// narrowing: no `Einsum` -- see this section's own top comment). The mask
+// `Add`'s own two operands are tried in both orders (`mask_operand` is
+// whichever one is NOT itself resolved by a further `MatMul`/`Mul`/`Div` --
+// the other operand is the mask itself); an `Add` sitting there that isn't
+// this shape declines the WHOLE match outright, never falls through to
+// treat it as an ordinary (non-mask) node instead.
 struct QkRootMatch {
   onnx::NodeProto* qk_matmul;
+  // nullptr when no additive mask was matched -- `mask_operand` is only
+  // meaningful when this is non-null.
+  onnx::NodeProto* mask_node = nullptr;
+  std::string mask_operand;
   onnx::NodeProto* scale_node;  // nullptr when absent.
 };
 
@@ -22328,6 +22367,48 @@ std::optional<QkRootMatch> ResolveDecomposedQkRoot(
   };
 
   std::string cur = smax_input;
+  onnx::NodeProto* mask_node = nullptr;
+  std::string mask_operand;
+  if (is_internal(cur)) {
+    auto cand_it = node_by_output.find(cur);
+    if (cand_it != node_by_output.end()) {
+      onnx::NodeProto* cand = cand_it->second;
+      if (cand->op_type() == "Add" && cand->domain() == "" &&
+          cand->input_size() == 2 && cand->output_size() == 1 &&
+          cand->output(0) == cur) {
+        const std::string& a = cand->input(0);
+        const std::string& b = cand->input(1);
+        const std::pair<std::string, std::string> orderings[2] = {{a, b},
+                                                                  {b, a}};
+        for (const auto& ordering : orderings) {
+          const std::string& root_name = ordering.first;
+          const std::string& other_name = ordering.second;
+          if (root_name.empty() || other_name.empty() ||
+              root_name == other_name) {
+            continue;
+          }
+          if (!is_internal(root_name)) {
+            continue;
+          }
+          auto probe_it = node_by_output.find(root_name);
+          if (probe_it != node_by_output.end() &&
+              probe_it->second->domain() == "" &&
+              (probe_it->second->op_type() == "MatMul" ||
+               probe_it->second->op_type() == "Mul" ||
+               probe_it->second->op_type() == "Div")) {
+            mask_node = cand;
+            mask_operand = other_name;
+            cur = root_name;
+            break;
+          }
+        }
+        if (mask_node == nullptr) {
+          return std::nullopt;  // an Add here that isn't our mask -- decline.
+        }
+      }
+    }
+  }
+
   onnx::NodeProto* scale_node = nullptr;
   if (is_internal(cur)) {
     auto pit = node_by_output.find(cur);
@@ -22363,7 +22444,7 @@ std::optional<QkRootMatch> ResolveDecomposedQkRoot(
       qk_matmul->output(0) != cur) {
     return std::nullopt;
   }
-  return QkRootMatch{qk_matmul, scale_node};
+  return QkRootMatch{qk_matmul, mask_node, mask_operand, scale_node};
 }
 
 // Every tensor/node name already live in `graph` -- mirrors pruning.py's own
@@ -22418,12 +22499,308 @@ std::string MintUniqueName(const std::string& base,
   return name;
 }
 
+// `_head_bias_input_is_safe`/`_slice_or_gather_head_bias`'s own match-time
+// safety net for the decomposed chain's own additive-mask operand -- mirrors
+// pruning.py's own `_head_bias_axis` through `_slice_or_gather_head_bias`
+// (this module's own "Attention-head pruning" section comment there has the
+// full narrative). `dims` is tagged int-or-symbolic (`ShapeDimEntry`, already
+// defined above for TransformerBlockTensorShapeDims's own identical need) so
+// HeadBiasAxis serves both a constant's own always-concrete `TensorProto
+// .dims()` (ConstShapeDims) and a dynamic tensor's own declared shape, which
+// may mix concrete sizes and named `dim_param`s
+// (DecomposedHeadBiasTensorShapeDims/ DynamicHeadBiasAxis) -- the identical
+// dual-use pruning.py's own `Sequence[Union[int, str]]` typing gives
+// `_head_bias_axis`.
+//
+// Classifies a broadcastable per-head mask/bias tensor's shape against the
+// schema-documented rank-4 `(batch_size or 1, num_heads or 1, q_seq, kv_seq)`
+// layout (or any rank up to 4, right-aligned/broadcast the standard ONNX
+// way) -- returns the position of the num_heads-aligned axis when its size
+// is exactly `num_heads` (a genuine per-head tensor), `-1` when no axis of
+// `dims` can ever land on that target position, or it does but is size 1 (an
+// ordinary broadcast -- already correct for any head count), or `nullopt`
+// when the shape doesn't cleanly resolve to either (rank > 4, or the axis
+// lands somewhere but is neither 1 nor `num_heads`) -- for the caller to
+// decline the whole chain on rather than guess.
+std::optional<int64_t> HeadBiasAxis(const std::vector<ShapeDimEntry>& dims,
+                                    int64_t num_heads) {
+  const int64_t rank = static_cast<int64_t>(dims.size());
+  if (rank > 4) {
+    return std::nullopt;
+  }
+  const int64_t axis = rank - 3;
+  if (axis < 0) {
+    return -1;  // No axis of `dims` can ever align with the target's own
+                // num_heads slot.
+  }
+  const ShapeDimEntry& d = dims[static_cast<size_t>(axis)];
+  if (!d.has_param && d.value == num_heads) {
+    return axis;
+  }
+  if (!d.has_param && d.value == 1) {
+    return -1;
+  }
+  return std::nullopt;
+}
+
+// A constant tensor's own `.dims()`, wrapped as `ShapeDimEntry` (always
+// concrete, never symbolic) for HeadBiasAxis.
+std::vector<ShapeDimEntry> ConstShapeDims(const onnx::TensorProto& t) {
+  std::vector<ShapeDimEntry> dims;
+  dims.reserve(static_cast<size_t>(t.dims_size()));
+  for (int64_t d : t.dims()) {
+    dims.push_back(ShapeDimEntry{false, d, ""});
+  }
+  return dims;
+}
+
+// The `ValueInfoByName`-keyed analogue of TransformerBlockTensorShapeDims
+// (that one is keyed by `TypeProto*`; this section's own `value_info_by_name`
+// -- built by the pre-existing `ValueInfoByName` helper -- is keyed by
+// `ValueInfoProto*` instead, purely a different map shape for the identical
+// underlying data). `name`'s own fully-known shape -- one entry per
+// dimension -- or `nullopt` if not every dimension is stated (rank unknown,
+// or any one dimension neither a fixed value nor a named symbolic one).
+std::optional<std::vector<ShapeDimEntry>> DecomposedHeadBiasTensorShapeDims(
+    const std::string& name,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name) {
+  auto it = value_info_by_name.find(name);
+  if (it == value_info_by_name.end() || !it->second->has_type() ||
+      !it->second->type().has_tensor_type()) {
+    return std::nullopt;
+  }
+  const auto& tensor_type = it->second->type().tensor_type();
+  if (!tensor_type.has_shape()) {
+    return std::nullopt;
+  }
+  std::vector<ShapeDimEntry> dims;
+  for (const auto& d : tensor_type.shape().dim()) {
+    if (d.has_dim_value()) {
+      dims.push_back(ShapeDimEntry{false, d.dim_value(), ""});
+    } else if (d.has_dim_param() && !d.dim_param().empty()) {
+      dims.push_back(ShapeDimEntry{true, 0, d.dim_param()});
+    } else {
+      return std::nullopt;
+    }
+  }
+  return dims;
+}
+
+// The HeadBiasAxis analogue for a *dynamic* (non-constant) mask/bias tensor
+// `name` -- mirrors pruning.py's own `_dynamic_head_bias_axis` exactly.
+std::optional<int64_t> DynamicHeadBiasAxis(
+    const std::string& name,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name,
+    int64_t num_heads) {
+  auto dims = DecomposedHeadBiasTensorShapeDims(name, value_info_by_name);
+  if (!dims) {
+    return std::nullopt;
+  }
+  return HeadBiasAxis(*dims, num_heads);
+}
+
+// Match-time safety gate for `node.input(idx)` -- an additive-mask operand
+// already confirmed non-empty by the caller -- mirrors pruning.py's own
+// `_head_bias_input_is_safe` exactly, with one deliberate additional scope
+// narrowing beyond it: a constant that DOES resolve to a genuine per-head
+// axis (`axis >= 0`) is only accepted here when it is FLOAT/FLOAT16/BFLOAT16
+// (IsSupportedFloatDtype) -- SliceAxisGeneric, this port's own apply-time
+// rewrite for that case, only handles those three encodings (reusing this
+// file's own pre-existing MoE/QMoE-section ReadTensorAsF64/WriteF64TensorAs),
+// unlike pruning.py's own dtype-agnostic `_slice_axis` (`onnx.numpy_helper
+// .to_array`/`np.take` handle any dtype). A broadcast (`axis == -1`) or
+// absent mask needs no dtype check at all, regardless -- nothing is ever
+// sliced there either way.
+bool HeadBiasInputIsSafe(
+    const onnx::NodeProto& node, int idx, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name,
+    int64_t num_heads) {
+  const std::string& name = node.input(idx);
+  auto bias_it = init_map.find(name);
+  if (bias_it != init_map.end()) {
+    int64_t prod = 1;
+    for (int64_t d : bias_it->second->dims()) {
+      prod *= d;
+    }
+    if (prod == 0) {
+      return true;  // empty tensor -- schema-degenerate, nothing to slice.
+    }
+    auto axis = HeadBiasAxis(ConstShapeDims(*bias_it->second), num_heads);
+    if (!axis) {
+      return false;
+    }
+    if (*axis >= 0 && !IsSupportedFloatDtype(bias_it->second->data_type())) {
+      return false;  // see this function's own comment above.
+    }
+    return true;
+  }
+  return DynamicHeadBiasAxis(name, value_info_by_name, num_heads).has_value();
+}
+
+// Generic arbitrary-axis, arbitrary-rank slice of a FLOAT/FLOAT16/BFLOAT16
+// constant tensor `t` by `keep` (an ascending index set) along `axis` --
+// mirrors pruning.py's own `_slice_axis` (`onnx.numpy_helper.to_array`/
+// `np.take(..., axis=axis)`/`from_array`), generalized beyond this file's
+// own existing axis-0/axis-(-1) SliceProducerWeight/SliceLastAxis helpers
+// purely for this section's own additive-mask constant, whose per-head axis
+// position (HeadBiasAxis) depends on its own rank rather than being fixed at
+// 0 or -1 the way every other slice target in this file already is. Reuses
+// this file's own pre-existing MoE/QMoE-section ReadTensorAsF64/
+// WriteF64TensorAs (FLOAT/FLOAT16/BFLOAT16, preserving `t`'s own original
+// dtype) rather than adding yet another dtype-specific read/write pair --
+// HeadBiasInputIsSafe already confirmed `axis` is in range and `t`'s own
+// dtype is one of those three before this is ever called.
+void SliceAxisGeneric(onnx::TensorProto* t, const std::vector<int64_t>& keep,
+                      int64_t axis) {
+  const std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  const int64_t rank = static_cast<int64_t>(dims.size());
+  int64_t outer = 1;
+  for (int64_t i = 0; i < axis; ++i) {
+    outer *= dims[static_cast<size_t>(i)];
+  }
+  int64_t inner = 1;
+  for (int64_t i = axis + 1; i < rank; ++i) {
+    inner *= dims[static_cast<size_t>(i)];
+  }
+  const int64_t axis_len = dims[static_cast<size_t>(axis)];
+  const int32_t dtype = t->data_type();
+  const std::vector<double> data = ReadTensorAsF64(*t);
+  std::vector<double> out;
+  out.reserve(static_cast<size_t>(outer) * keep.size() *
+              static_cast<size_t>(inner));
+  for (int64_t o = 0; o < outer; ++o) {
+    for (int64_t k : keep) {
+      const int64_t base = (o * axis_len + k) * inner;
+      for (int64_t in = 0; in < inner; ++in) {
+        out.push_back(data[static_cast<size_t>(base + in)]);
+      }
+    }
+  }
+  std::vector<int64_t> new_dims = dims;
+  new_dims[static_cast<size_t>(axis)] = static_cast<int64_t>(keep.size());
+  WriteF64TensorAs(t, dtype, new_dims, out);
+}
+
+// Splices a new `Gather(axis=axis, indices=keep)` node ahead of `consumer`
+// (the node about to be rewired onto its own output, by the caller's own
+// job, not this function's), reading from the dynamic tensor `tensor_name` --
+// mirrors pruning.py's own `_insert_dynamic_head_bias_gather`: still an EXACT
+// slice of `tensor_name`'s own per-head axis, just expressed as a new graph
+// node instead of pre-baked into a constant, since `tensor_name`'s own
+// actual values aren't available at prune time. Returns the new node's own
+// output name.
+//
+// `google::protobuf::RepeatedPtrField` has no direct positional insert, so
+// the new node is appended (`graph->add_node()`, landing at the last index)
+// and then bubbled backward, one adjacent `SwapElements` at a time, into
+// position immediately ahead of `consumer` -- `SwapElements` exchanges the
+// two index slots' own stored pointers, never the pointee `NodeProto`
+// objects' own memory, so every `NodeProto*` this file already holds
+// (`consumer` itself, and every other chain's own matched nodes) stays valid
+// and keeps pointing at the exact same node throughout. Every node originally
+// between the new node's own insertion point and the end keeps its own
+// relative order (an ordinary "rotate one element into place" bubble, not a
+// shuffle), so the graph -- already topologically valid before this
+// insertion -- stays valid after it: `tensor_name` (an existing graph input/
+// initializer/intermediate output, already produced strictly before
+// `consumer` since `consumer` already reads it today) and the freshly
+// appended indices initializer (which, being an initializer rather than a
+// node, has no position of its own to respect at all) are both already
+// available wherever the new node lands.
+std::string InsertDynamicHeadBiasGather(
+    onnx::GraphProto* graph, std::unordered_set<std::string>& used_names,
+    const std::string& tensor_name, int64_t axis,
+    const std::vector<int64_t>& keep, onnx::NodeProto* consumer) {
+  const std::string indices_name = MintUniqueName(
+      tensor_name + "/attention_head_pruning_gather_indices", used_names);
+  onnx::TensorProto* indices_init = graph->add_initializer();
+  indices_init->set_name(indices_name);
+  SetInt64TensorData(indices_init, {static_cast<int64_t>(keep.size())}, keep);
+
+  const std::string node_name = MintUniqueName(
+      tensor_name + "/attention_head_pruning_gather", used_names);
+  const std::string out_name = MintUniqueName(
+      tensor_name + "/attention_head_pruning_gathered", used_names);
+
+  onnx::NodeProto* gather = graph->add_node();
+  gather->set_op_type("Gather");
+  gather->set_name(node_name);
+  gather->add_input(tensor_name);
+  gather->add_input(indices_name);
+  gather->add_output(out_name);
+  onnx::AttributeProto* axis_attr = gather->add_attribute();
+  axis_attr->set_name("axis");
+  axis_attr->set_type(onnx::AttributeProto::INT);
+  axis_attr->set_i(axis);
+
+  int consumer_idx = -1;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    if (graph->mutable_node(i) == consumer) {
+      consumer_idx = i;
+      break;
+    }
+  }
+  if (consumer_idx >= 0) {
+    for (int i = graph->node_size() - 1; i > consumer_idx; --i) {
+      graph->mutable_node()->SwapElements(i, i - 1);
+    }
+  }
+  return out_name;
+}
+
+// Applies the actual per-head handling of `node->input(idx)` -- an
+// additive-mask operand already confirmed, at match time
+// (HeadBiasInputIsSafe), to resolve cleanly one way or another -- once a
+// chain's own `keep` (kept-head index set, already sorted ascending) is
+// known. Mirrors pruning.py's own `_slice_or_gather_head_bias` exactly: a
+// connected constant is sliced in place (HeadBiasAxis/SliceAxisGeneric); a
+// connected dynamic tensor gets a new `Gather` node spliced in ahead of it
+// (DynamicHeadBiasAxis/InsertDynamicHeadBiasGather) when it resolves to a
+// genuine per-head axis, and `node`'s own input is rewritten in place to the
+// new `Gather`'s own output -- or is left completely untouched, the same as
+// a constant broadcast already is, when it resolves to a broadcast instead.
+// An absent input is a no-op either way.
+void SliceOrGatherHeadBias(
+    onnx::NodeProto* node, int idx,
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    int64_t num_heads, const std::vector<int64_t>& keep,
+    onnx::GraphProto* graph, std::unordered_set<std::string>& used_names,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name) {
+  if (node->input_size() <= idx || node->input(idx).empty()) {
+    return;
+  }
+  const std::string name = node->input(idx);
+  auto bias_it = init_map.find(name);
+  if (bias_it != init_map.end()) {
+    auto axis = HeadBiasAxis(ConstShapeDims(*bias_it->second), num_heads);
+    if (axis && *axis >= 0) {
+      SliceAxisGeneric(bias_it->second, keep, *axis);
+    }
+    return;
+  }
+  auto axis = DynamicHeadBiasAxis(name, value_info_by_name, num_heads);
+  if (axis && *axis >= 0) {
+    const std::string new_name =
+        InsertDynamicHeadBiasGather(graph, used_names, name, *axis, keep, node);
+    node->set_input(idx, new_name);
+  }
+  // else: broadcast, or unresolvable (shouldn't reach here -- already
+  // declined at match time -- but left alone defensively rather than
+  // guessed at either way) -- nothing to do.
+}
+
 // Anchored on each plain (default-domain) `Softmax(axis=-1)` node in `graph`
 // -- a far rarer, more specific anchor than a MatMul/Gemm -- mirrors
 // pruning.py's own `_find_decomposed_gqa_chains` (this port's own narrower
 // scope: see this section's own top comment).
 std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
-    onnx::GraphProto* graph) {
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   InitMap init_map;
   for (const auto& t : graph->initializer()) {
     init_map[t.name()] = &t;
@@ -22481,6 +22858,8 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       continue;
     }
     onnx::NodeProto* qk_matmul = root->qk_matmul;
+    onnx::NodeProto* mask_node = root->mask_node;
+    const std::string mask_operand = root->mask_operand;
     onnx::NodeProto* scale_node = root->scale_node;
 
     const std::string q_bhsd_name = qk_matmul->input(0);
@@ -22756,6 +23135,23 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       continue;
     }
 
+    // ---- mask safety (constant or dynamic), match-time only ----
+    std::optional<int> mask_idx;
+    if (mask_node != nullptr && !mask_operand.empty()) {
+      mask_idx = -1;
+      for (int i = 0; i < mask_node->input_size(); ++i) {
+        if (mask_node->input(i) == mask_operand) {
+          mask_idx = i;
+          break;
+        }
+      }
+      if (*mask_idx < 0 ||
+          !HeadBiasInputIsSafe(*mask_node, *mask_idx, init_map,
+                               value_info_by_name, num_heads)) {
+        continue;
+      }
+    }
+
     const std::optional<std::string> out_reshape_shape_opt =
         out_last > 0 ? std::optional<std::string>(out_reshape->input(1))
                      : std::nullopt;
@@ -22788,6 +23184,8 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     chain.v_repeat_kv = v_repeat_kv;
     chain.qk_matmul = qk_matmul;
     chain.scale_node = scale_node;
+    chain.mask_node = mask_node;
+    chain.mask_idx = mask_idx;
     chain.softmax_node = node;
     chain.av_matmul = av_matmul;
     chain.out_transpose = out_transpose;
@@ -22809,17 +23207,22 @@ struct AppliedDecomposedGqa {
 
 // Applies whole-KV-group pruning to one matched decomposed attention block
 // in place -- mirrors pruning.py's own `_apply_one_decomposed_gqa_chain`
-// (this port's own scope: no MQA fast path, no packed-QKV branch, no mask
-// rewrite -- see this section's own top comment). `graph`/`init_map`/
-// `used_names` are mutated directly: `init_map` gains an entry for every
-// freshly cloned shape constant, `used_names` for every freshly minted name.
+// (this port's own scope: no MQA fast path, no packed-QKV branch -- see this
+// section's own top comment; the additive-mask rewrite IS ported, via
+// SliceOrGatherHeadBias). `graph`/`init_map`/`used_names` are mutated
+// directly: `init_map` gains an entry for every freshly cloned shape
+// constant, `used_names` for every freshly minted name (a rewritten shape
+// constant's own clone, or a freshly spliced-in dynamic-mask `Gather`'s own
+// node/indices-initializer/output names alike).
 std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
     onnx::GraphProto* graph,
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
     std::unordered_set<std::string>& used_names, DecomposedGqaChain& chain,
     double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm,
-    double epsilon, ImportanceNorm importance_norm) {
+    double epsilon, ImportanceNorm importance_norm,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -23057,14 +23460,21 @@ std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
                       {{-1, new_num_heads * dv}});
   }
 
+  if (chain.mask_node != nullptr && chain.mask_idx) {
+    SliceOrGatherHeadBias(chain.mask_node, *chain.mask_idx, init_map,
+                          chain.num_heads, keep_q_heads, graph, used_names,
+                          value_info_by_name);
+  }
+
   AppliedDecomposedGqa out;
   out.producer_weights = {chain.q_weight, chain.k_weight, chain.v_weight};
   out.consumer_weight = chain.consumer_weight;
   for (onnx::NodeProto* n :
        {chain.q_transpose, chain.q_reshape, chain.k_transpose,
         chain.k_headsplit_transpose, chain.k_reshape, chain.v_transpose,
-        chain.v_reshape, chain.qk_matmul, chain.scale_node, chain.softmax_node,
-        chain.av_matmul, chain.out_transpose, chain.out_reshape}) {
+        chain.v_reshape, chain.qk_matmul, chain.scale_node, chain.mask_node,
+        chain.softmax_node, chain.av_matmul, chain.out_transpose,
+        chain.out_reshape}) {
     if (n != nullptr) {
       for (const auto& o : n->output()) {
         out.stale.insert(o);
@@ -23103,8 +23513,9 @@ void ApplyDecomposedGqaChains(
     double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8,
-    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
+    double epsilon = 1e-8, ImportanceNorm importance_norm = ImportanceNorm::kL2,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -23126,9 +23537,9 @@ void ApplyDecomposedGqaChains(
       continue;
     }
 
-    std::optional<AppliedDecomposedGqa> applied =
-        ApplyOneDecomposedGqaChain(graph, init_map, used_names, chain, sparsity,
-                                   act_norm, epsilon, importance_norm);
+    std::optional<AppliedDecomposedGqa> applied = ApplyOneDecomposedGqaChain(
+        graph, init_map, used_names, chain, sparsity, act_norm, epsilon,
+        importance_norm, value_info_by_name);
     if (!applied) {
       continue;
     }
@@ -23223,20 +23634,26 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
     // pruning.py's own `_find_decomposed_gqa_chains` additionally matches --
     // see the "Decomposed (un-fused) GQA/MQA/plain-MHA attention head
     // pruning" section comment above FindDecomposedGqaChains for this port's
-    // own scope (deliberately narrower than pruning.py's: no mask/RoPE/
-    // Q-K-norm/Einsum/packed-QKV/MQA-fast-path support yet -- every one of
-    // those shapes declines to match here, rather than being mis-sliced,
-    // and is still pruned by pruning.py's own pure-Python
-    // apply_attention_head_pruning). Its own dedicated producer/consumer-
+    // own scope (deliberately narrower than pruning.py's: no RoPE/Q-K-norm/
+    // Einsum/packed-QKV/MQA-fast-path support yet -- every one of those
+    // shapes declines to match here, rather than being mis-sliced, and is
+    // still pruned by pruning.py's own pure-Python
+    // apply_attention_head_pruning; the additive-mask branch IS ported --
+    // see that same section comment). Its own dedicated producer/consumer-
     // touched bookkeeping (inside ApplyDecomposedGqaChains) is never shared
     // with ApplyAttentionChains's own above, the same "structurally
     // different node/weight shapes, always safe" reasoning this section's
-    // own MatMulNBitsQkv handling below already documents.
+    // own MatMulNBitsQkv handling below already documents. `value_info_by_
+    // name` here is this graph's own AS-DECLARED input/output/value_info
+    // (ValueInfoByName) -- see FindDecomposedGqaChains' own section comment
+    // for why no real shape-inference pass backs it, here or at the top
+    // level, unlike pruning.py's own top-level-graph case.
+    auto decomposed_value_info_by_name = ValueInfoByName(*graph);
     std::vector<DecomposedGqaChain> decomposed_gqa_chains =
-        FindDecomposedGqaChains(graph);
+        FindDecomposedGqaChains(graph, decomposed_value_info_by_name);
     if (!decomposed_gqa_chains.empty()) {
       ApplyDecomposedGqaChains(graph, decomposed_gqa_chains, sparsity, nullptr,
-                               1e-8, norm);
+                               1e-8, norm, decomposed_value_info_by_name);
     }
     // The fused `com.microsoft::MatMulNBitsQkv` variant -- see the
     // "MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
@@ -23333,8 +23750,9 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   // ranked/sliced/probed entirely separately below, mirroring pruning.py's
   // own `chains: List[_AttnLikeChain]` union, which this port instead keeps
   // as two differently-typed collections threaded through in parallel.
+  auto decomposed_value_info_by_name = ValueInfoByName(*graph);
   std::vector<DecomposedGqaChain> decomposed_gqa_chains =
-      FindDecomposedGqaChains(graph);
+      FindDecomposedGqaChains(graph, decomposed_value_info_by_name);
 
   if (chains.empty() && decomposed_gqa_chains.empty()) {
     return out;  // Mirrors pruning.py's own early return.
@@ -23368,7 +23786,7 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   }
   if (!decomposed_gqa_chains.empty()) {
     ApplyDecomposedGqaChains(graph, decomposed_gqa_chains, sparsity, &act_norm,
-                             epsilon, norm);
+                             epsilon, norm, decomposed_value_info_by_name);
   }
   return out;
 }
