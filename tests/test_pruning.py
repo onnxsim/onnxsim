@@ -35326,6 +35326,231 @@ def test_matmul_bnb4_dequantized_matches_real_inference_session(quant_type):
     np.testing.assert_allclose(dequant_mine.T, dequant_ort, atol=1e-6)
 
 
+# --- apply_structured_pruning_matmul_bnb4: gated (SwiGLU/GeGLU) FFN pair ---
+#
+# The ``MatMulBnb4`` analogue of the ``MatMulNBits`` section's own
+# ``test_matmul_nbits_pruning_gated_ffn_matches_oracle`` and friends (see
+# ``onnxsim/pruning.py``'s own ``_find_matmul_bnb4_gated_chains``): a
+# gate_proj/up_proj pair -- each independently either a real, quantizer-
+# produced ``MatMulBnb4`` node or a plain-float peer -- combined by an
+# elementwise ``Mul`` (gate_proj through one activation first), feeding a
+# plain-float down_proj consumer. Unlike the ``MatMulNBits`` gated case,
+# down_proj is always plain-float here (a ``MatMulBnb4`` node is never
+# matched as a chain's CONSUMER at all -- see this module's own section
+# comment), so there is no block-alignment question on the consumer side.
+
+
+def _bnb4_gated_model(
+    K, H, Out, block_size, quant_type, W_gate, W_up, W_down, gate_activation="Sigmoid"
+):
+    """Builds ``X -> gate=MatMulBnb4(Bg) -[gate_activation]-> gate_act,
+    up=MatMulBnb4(Bu) -> Mul(gate_act, up) -> Y=MatMul(W_down)`` -- the real
+    ``com.microsoft::MatMulBnb4`` gated (SwiGLU/GeGLU) FFN pair, both
+    producers quantized via the REAL
+    ``onnxruntime.quantization.matmul_bnb4_quantizer.MatMulBnb4Quantizer``
+    (:func:`_bnb4_quantize`), feeding a plain-float down_proj consumer.
+    """
+    Bg, absmax_g = _bnb4_quantize(W_gate, quant_type, block_size)
+    Bu, absmax_u = _bnb4_quantize(W_up, quant_type, block_size)
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{Out}] Y)
+        {{
+          gate = com.microsoft.MatMulBnb4 <K={K}, N={H}, block_size={block_size}, quant_type={quant_type}> (X, Bg, absmax_g)
+          gate_act = {gate_activation}(gate)
+          up = com.microsoft.MatMulBnb4 <K={K}, N={H}, block_size={block_size}, quant_type={quant_type}> (X, Bu, absmax_u)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, W_down)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(Bg, name="Bg"),
+            onnx.numpy_helper.from_array(absmax_g, name="absmax_g"),
+            onnx.numpy_helper.from_array(Bu, name="Bu"),
+            onnx.numpy_helper.from_array(absmax_u, name="absmax_u"),
+            _f32(W_down, "W_down"),
+        ],
+        opset=21,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def test_matmul_bnb4_pruning_gated_ffn_matches_oracle():
+    # Both gate_proj/up_proj are real MatMulBnb4 nodes -- the exact topology
+    # the confirmed gap's repro script built (gate -> Sigmoid -> Mul(with
+    # up) -> plain-float down_proj), quantized via the real
+    # MatMulBnb4Quantizer. Front 16-of-32 channels scaled up so the combined
+    # (root-sum-square) L2 importance keep-set is unambiguous.
+    K, H, Out, block_size = 64, 32, 8, 16
+    quant_type = 1  # NF4
+    rng = np.random.default_rng(300)
+    W_gate = (rng.standard_normal((K, H)) * 0.2).astype(np.float32)
+    W_gate[:, :16] *= 10.0
+    W_up = (rng.standard_normal((K, H)) * 0.2).astype(np.float32)
+    W_up[:, :16] *= 10.0
+    W_down = (rng.standard_normal((H, Out)) * 0.2).astype(np.float32)
+
+    model = _bnb4_gated_model(K, H, Out, block_size, quant_type, W_gate, W_up, W_down)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_bnb4_gated_chains(model.graph)
+    assert len(chains) == 1
+    # The plain single-producer finder must never also match either half of
+    # a gated pair (mirrors the MatMulNBits section's own identical
+    # non-overlap invariant).
+    assert onnxsim.pruning._find_matmul_bnb4_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)
+    mm_gate = next(n for n in pruned.graph.node if n.output[0] == "gate")
+    mm_up = next(n for n in pruned.graph.node if n.output[0] == "up")
+    assert next(a.i for a in mm_gate.attribute if a.name == "N") == 16
+    assert next(a.i for a in mm_up.attribute if a.name == "N") == 16
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W_down"].dims) == [16, Out]
+
+    # "Slice, don't recompute": each pruned producer's own packed bytes must
+    # be byte-identical to independently re-quantizing that row subset
+    # directly (the same invariant the non-gated section's own
+    # ``test_matmul_bnb4_pruning_producer_bytes_are_byte_identical_to_requantized_subset``
+    # establishes).
+    Bg_ref, absmax_g_ref = _bnb4_quantize(W_gate[:, keep], quant_type, block_size)
+    Bu_ref, absmax_u_ref = _bnb4_quantize(W_up[:, keep], quant_type, block_size)
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Bg"]), Bg_ref)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["absmax_g"]), absmax_g_ref
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Bu"]), Bu_ref)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["absmax_u"]), absmax_u_ref
+    )
+
+    # End-to-end: the pruned model's real output must match a reference
+    # built by independently re-quantizing/re-slicing each side directly --
+    # exact byte-level equality, not float tolerance (mirrors the non-gated
+    # section's own identical-strength check).
+    ref_model = _bnb4_gated_model(
+        K,
+        len(keep),
+        Out,
+        block_size,
+        quant_type,
+        W_gate[:, keep],
+        W_up[:, keep],
+        W_down[keep, :],
+    )
+    X = rng.uniform(-1, 1, size=(3, K)).astype(np.float32)
+    pruned_out = _run(pruned, {"X": X})[0]
+    ref_out = _run(ref_model, {"X": X})[0]
+    np.testing.assert_array_equal(pruned_out, ref_out)
+
+
+def test_matmul_bnb4_pruning_gated_ffn_mixed_plain_float_peer_matches_oracle():
+    # gate_proj is a real MatMulBnb4 node, up_proj is a plain-float peer --
+    # the "at least one side MatMulBnb4" mixed case
+    # _find_matmul_bnb4_gated_chains must also recognize (mirrors
+    # MatMulNBits's own identical either/or gated-producer flexibility).
+    K, H, Out, block_size = 64, 32, 8, 16
+    quant_type = 0  # FP4
+    rng = np.random.default_rng(302)
+    W_gate = (rng.standard_normal((K, H)) * 0.2).astype(np.float32)
+    W_gate[:, :16] *= 10.0
+    W_up = (rng.standard_normal((K, H)) * 0.2).astype(np.float32)
+    W_up[:, :16] *= 10.0
+    W_down = (rng.standard_normal((H, Out)) * 0.2).astype(np.float32)
+
+    Bg, absmax_g = _bnb4_quantize(W_gate, quant_type, block_size)
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{Out}] Y)
+        {{
+          gate = com.microsoft.MatMulBnb4 <K={K}, N={H}, block_size={block_size}, quant_type={quant_type}> (X, Bg, absmax_g)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, W_up)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, W_down)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(Bg, name="Bg"),
+            onnx.numpy_helper.from_array(absmax_g, name="absmax_g"),
+            _f32(W_up, "W_up"),
+            _f32(W_down, "W_down"),
+        ],
+        opset=21,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_bnb4_gated_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)
+    mm_gate = next(n for n in pruned.graph.node if n.output[0] == "gate")
+    assert next(a.i for a in mm_gate.attribute if a.name == "N") == 16
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W_up"].dims) == [K, 16]
+    assert list(inits["W_down"].dims) == [16, Out]
+
+    Bg_ref, absmax_g_ref = _bnb4_quantize(W_gate[:, keep], quant_type, block_size)
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Bg"]), Bg_ref)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["absmax_g"]), absmax_g_ref
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W_up"]), W_up[:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W_down"]), W_down[keep, :]
+    )
+
+
+def test_matmul_bnb4_pruning_gated_ffn_declines_shared_weight():
+    # gate_proj/up_proj sharing the identical B/absmax tensor pair -- the
+    # matcher itself (_match_matmul_bnb4_producer's own shared/tied-tensor
+    # bar) must decline BOTH nodes as producers, so no gated chain is found
+    # at all and the whole model is left byte-unchanged. Mirrors the
+    # non-gated section's own ``test_matmul_bnb4_pruning_declines_shared_weight``.
+    K, H, Out, block_size = 64, 32, 8, 16
+    quant_type = 1
+    rng = np.random.default_rng(301)
+    W_gate = rng.uniform(-1, 1, size=(K, H)).astype(np.float32)
+    W_down = rng.uniform(-1, 1, size=(H, Out)).astype(np.float32)
+    Bg, absmax_g = _bnb4_quantize(W_gate, quant_type, block_size)
+
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{Out}] Y)
+        {{
+          gate = com.microsoft.MatMulBnb4 <K={K}, N={H}, block_size={block_size}, quant_type={quant_type}> (X, Bg, absmax_g)
+          gate_act = Sigmoid(gate)
+          up = com.microsoft.MatMulBnb4 <K={K}, N={H}, block_size={block_size}, quant_type={quant_type}> (X, Bg, absmax_g)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, W_down)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(Bg, name="Bg"),
+            onnx.numpy_helper.from_array(absmax_g, name="absmax_g"),
+            _f32(W_down, "W_down"),
+        ],
+        opset=21,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    assert onnxsim.pruning._find_matmul_bnb4_gated_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def test_analyze_structured_pruning_matmul_bnb4_matches_real_call():
     K, N1, N2, block_size = 64, 32, 8, 16
     rng = np.random.default_rng(21)
