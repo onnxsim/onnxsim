@@ -33452,6 +33452,214 @@ def test_matmul_nbits_rms_norm_pass_through_is_matched_and_prunes():
     np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
 
 
+# --- MatMulNBits: mid-chain separate trailing bias Add pass-through -------
+#
+# `_walk_to_matmul_nbits_consumer` previously recognized only
+# `_UNARY_PASS_THROUGH` activations and `_NORM_PASS_THROUGH_OPS` as
+# mid-chain hops, never a per-channel bias/scale `Add`/`Mul` against a flat
+# constant (`_BINARY_CHANNEL_OPS` -- the hop `_walk_to_consumer`'s own plain-
+# float walker already recognizes, see
+# `test_structured_pruning_bias_add_between_matmuls_matches_oracle`). A real
+# ``onnxruntime.quantization.matmul_nbits_quantizer.MatMulNBitsQuantizer``
+# round trip emits exactly this shape by default -- ``MatMulNBits ->
+# Add(bias) -> Relu -> MatMulNBits`` -- since bias-folding into MatMulNBits's
+# own optional 6th input is a LATER, separate ORT graph-optimizer pass, not
+# something the quantizer itself does. Before this fix, `analyze_
+# pruning_sensitivity` found 0 layers and `apply_structured_pruning_
+# matmul_nbits` pruned nothing at all for a graph shaped this way. Uses
+# `onnx.helper` (`_nbits_chain_bias_add_model`, mirroring `_nbits_chain_
+# norm_model` above), for the same reason that section gives: the packed
+# int4 ``B``/``scales``/``zero_points`` tensors need real array data a
+# parser text literal can't spell out.
+
+
+def _nbits_chain_bias_add_model(
+    N1, K1, N2, block_size, W1, W2, bias1, activation="Relu"
+):
+    """Builds ``A -> MatMulNBits(mm1) -> Add(Bias1) -> activation ->
+    MatMulNBits(mm2) -> Y`` -- `bias1` as a SEPARATE trailing `Add` node,
+    never MatMulNBits's own optional 6th (bias) input -- the real shape a
+    ``MatMulNBitsQuantizer`` round trip emits by default. Otherwise mirrors
+    :func:`_nbits_chain_model` exactly (bits=4, packed zero_points, neither
+    MatMulNBits node given its own native bias). Returns ``(model, info)``
+    the same shape :func:`_nbits_chain_model` does.
+    """
+    bits = 4
+    K2 = N1
+    assert K2 % block_size == 0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size, bits)
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size, bits)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size, bits)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(B1, name="B1"),
+        onnx.numpy_helper.from_array(scales1, name="scales1"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp1, bits), name="zp1"),
+        onnx.numpy_helper.from_array(B2, name="B2"),
+        onnx.numpy_helper.from_array(scales2, name="scales2"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp2, bits), name="zp2"),
+        onnx.numpy_helper.from_array(bias1, name="Bias1"),
+    ]
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size, bits
+    )
+    bias_add = onnx.helper.make_node("Add", ["h1", "Bias1"], ["h1b"], name="bias_add1")
+    act = onnx.helper.make_node(activation, ["h1b"], ["h1_act"])
+    node2 = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2, K2, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node1, bias_add, act, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [M, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes1=qcodes1,
+        scales1=scales1,
+        zp1=zp1,
+        kb1=kb1,
+        qcodes2=qcodes2,
+        scales2=scales2,
+        zp2=zp2,
+        kb2=kb2,
+        K2=K2,
+    )
+
+
+def test_matmul_nbits_separate_trailing_bias_add_is_matched_and_prunes():
+    # Same block-aligned engineered-magnitude setup as
+    # `test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_oracle`:
+    # rows 0-15 large-magnitude (kept), 16-31 small (dropped).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(310)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    model, info = _nbits_chain_bias_add_model(N1, K1, N2, block_size, W1, W2, bias1)
+    onnx.checker.check_model(model)
+
+    # Before this section's own fix, this returned 0 chains.
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * 4 // 8]
+    assert list(inits["Bias1"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * 4 // 8]
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["Bias1"]), bias1[keep])
+
+    # Independently-constructed, ALREADY-PRUNED reference model, mirroring
+    # this section's own oracle tests above.
+    ref_model, _ = _nbits_chain_bias_add_model(
+        16, K1, N2, block_size, W1[keep], W2[:, keep], bias1[keep]
+    )
+    onnx.checker.check_model(ref_model)
+
+    rng2 = np.random.default_rng(311)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    (y_ref,) = _run(ref_model, {"A": x})
+    np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
+
+    # And matches a pure-float64 dequantize-then-matmul oracle built
+    # directly from the pass's own (unmodified) quantized codes.
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T + bias1[keep], 0.0)
+    y_oracle = h1 @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_separate_trailing_bias_add_declines_shared_bias():
+    # The same trailing `Bias1` tensor read by two INDEPENDENT MatMulNBits
+    # producer chains' own `Add` nodes -- slicing it to fit one chain's own
+    # keep-set would leave the other (declined, left untouched) chain's own
+    # consumer fed a wrong-sized tensor. Mirrors
+    # `test_matmul_nbits_pruning_declines_shared_weight`'s own identical
+    # tied-tensor concern, but for a mid-chain hop's own constant rather
+    # than a producer's own weight -- the `consumers_of` check this fix
+    # itself adds right alongside the new `_BINARY_CHANNEL_OPS` branch (see
+    # `onnxsim/pruning.py`'s own comment there) is what this test actually
+    # exercises: both chains must come back declined, and the model must be
+    # left completely byte-unchanged, not partially (and therefore
+    # inconsistently) pruned.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(320)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias = rng.standard_normal(N1).astype(np.float32)
+    model, _info = _nbits_chain_bias_add_model(N1, K1, N2, block_size, W1, W2, bias)
+
+    # A second, wholly independent MatMulNBits producer/consumer chain --
+    # every one of its own weights/scales/zero_points is its own private
+    # tensor -- whose own trailing bias `Add` reuses the exact same `Bias1`
+    # initializer as the first chain above.
+    N3, K3, N4 = 32, 48, 6
+    W3 = rng.standard_normal((N3, K3)).astype(np.float32) * 0.2
+    W4 = rng.standard_normal((N4, N3)).astype(np.float32) * 0.2
+    model2, _info2 = _nbits_chain_bias_add_model(N3, K3, N4, block_size, W3, W4, bias)
+    # Every name in `model2` is renamed with a "_b" suffix EXCEPT "Bias1"
+    # itself, so it collides -- deliberately -- with the first model's own
+    # "Bias1" initializer once the two graphs are merged below.
+    for n in model2.graph.node:
+        n.name += "_b"
+        for i in range(len(n.input)):
+            if n.input[i] and n.input[i] != "Bias1":
+                n.input[i] += "_b"
+        for i in range(len(n.output)):
+            n.output[i] += "_b"
+    for t in model2.graph.initializer:
+        if t.name != "Bias1":
+            t.name += "_b"
+    model2.graph.input[0].name += "_b"
+    model2.graph.output[0].name += "_b"
+
+    model.graph.node.extend(model2.graph.node)
+    model.graph.initializer.extend(
+        t for t in model2.graph.initializer if t.name != "Bias1"
+    )
+    model.graph.input.extend(model2.graph.input)
+    model.graph.output.extend(model2.graph.output)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 0  # both declined -- the shared Bias1 blocks both
+
+    before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert before == after
+
+
 def test_matmul_nbits_pruning_producer_odd_kept_row_count_zero_points_has_no_repack_hazard():
     # This directly tests :func:`onnxsim.pruning._slice_matmul_nbits_producer_rows`
     # (rather than the public ``apply_structured_pruning_matmul_nbits``,
@@ -34937,6 +35145,145 @@ def test_matmul_bnb4_rms_norm_pass_through_is_matched_and_prunes():
     np.testing.assert_array_equal(pruned_out, ref_out)
 
 
+# --- MatMulBnb4: mid-chain separate trailing bias Add pass-through ---------
+#
+# ``MatMulBnb4``'s own live 3-input schema (`A, B, absmax`) has no bias slot
+# at all -- unlike ``MatMulNBits``'s own optional 6th input -- so a separate
+# trailing `Add` node is the ONLY way a biased ``MatMulBnb4`` layer is EVER
+# representable, and a real
+# ``onnxruntime.quantization.matmul_bnb4_quantizer.MatMulBnb4Quantizer``
+# round trip always emits it this way. `_walk_to_matmul_bnb4_consumer`
+# previously recognized only `_UNARY_PASS_THROUGH` activations and
+# `_NORM_PASS_THROUGH_OPS` as mid-chain hops, never this per-channel
+# bias `Add` (`_BINARY_CHANNEL_OPS`), so a real quantized+biased MatMulBnb4
+# layer was silently left completely unpruned.
+
+
+def _bnb4_chain_bias_add_model(
+    K, N1, N2, block_size, quant_type, W1, W2, bias1, activation="Relu"
+):
+    """Like :func:`_bnb4_chain_model`, but with a separate trailing
+    `Add(Bias1)` node between ``MatMulBnb4`` and the following activation --
+    the only representation a biased ``MatMulBnb4`` layer can ever take.
+    """
+    B1, absmax1 = _bnb4_quantize(W1, quant_type, block_size)
+    model = _model(
+        f"""
+        g (float[3,{K}] A) => (float[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBnb4 <K={K}, N={N1}, block_size={block_size}, quant_type={quant_type}> (A, B1, absmax1)
+          h1b = Add(h1, Bias1)
+          h1_act = {activation}(h1b)
+          Y = MatMul(h1_act, W2)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(absmax1, name="absmax1"),
+            _f32(W2, "W2"),
+            _f32(bias1, "Bias1"),
+        ],
+        opset=21,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def test_matmul_bnb4_separate_trailing_bias_add_is_matched_and_prunes():
+    K, N1, N2, block_size = 64, 32, 8, 16
+    quant_type = 1  # NF4
+    rng = np.random.default_rng(2050)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W1 = W1 * np.linspace(0.1, 3.0, N1, dtype=np.float32)[None, :]
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    model = _bnb4_chain_bias_add_model(K, N1, N2, block_size, quant_type, W1, W2, bias1)
+    onnx.checker.check_model(model)
+
+    # Before this section's own fix, this returned 0 chains.
+    chains = onnxsim.pruning._find_matmul_bnb4_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    mm1 = next(n for n in pruned.graph.node if n.op_type == "MatMulBnb4")
+    assert {a.name: a.i for a in mm1.attribute}["N"] == 16
+
+    col_norms = np.linalg.norm(W1, axis=0)
+    keep = np.sort(np.argsort(-col_norms, kind="stable")[:16])
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias1"].dims) == [16]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bias1"]), bias1[keep]
+    )
+
+    ref_model = _bnb4_chain_bias_add_model(
+        K, len(keep), N2, block_size, quant_type, W1[:, keep], W2[keep, :], bias1[keep]
+    )
+    onnx.checker.check_model(ref_model)
+
+    A = rng.uniform(-1, 1, size=(3, K)).astype(np.float32)
+    pruned_out = _run(pruned, {"A": A})[0]
+    ref_out = _run(ref_model, {"A": A})[0]
+    np.testing.assert_array_equal(pruned_out, ref_out)
+
+
+def test_matmul_bnb4_separate_trailing_bias_add_declines_shared_bias():
+    # The same trailing `Bias1` tensor read by two INDEPENDENT MatMulBnb4
+    # producer chains' own `Add` nodes -- slicing it to fit one chain's own
+    # keep-set would leave the other (declined, left untouched) chain's own
+    # consumer fed a wrong-sized tensor. Mirrors
+    # `test_matmul_bnb4_pruning_declines_shared_weight`'s own identical
+    # tied-tensor concern, but for a mid-chain hop's own constant rather
+    # than a producer's own weight -- exercises the `consumers_of` check
+    # this fix adds right alongside the new `_BINARY_CHANNEL_OPS` branch.
+    K, N1, N2, block_size = 64, 32, 8, 16
+    quant_type = 1
+    rng = np.random.default_rng(2060)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    bias = rng.standard_normal(N1).astype(np.float32)
+    model = _bnb4_chain_bias_add_model(K, N1, N2, block_size, quant_type, W1, W2, bias)
+
+    # A second, wholly independent MatMulBnb4 producer/consumer chain whose
+    # own trailing bias `Add` reuses the exact same `Bias1` initializer.
+    K2, N3, N4 = 48, 32, 6
+    W3 = rng.uniform(-1, 1, size=(K2, N3)).astype(np.float32)
+    W4 = rng.uniform(-1, 1, size=(N3, N4)).astype(np.float32)
+    model2 = _bnb4_chain_bias_add_model(
+        K2, N3, N4, block_size, quant_type, W3, W4, bias
+    )
+    for n in model2.graph.node:
+        n.name += "_b"
+        for i in range(len(n.input)):
+            if n.input[i] and n.input[i] != "Bias1":
+                n.input[i] += "_b"
+        for i in range(len(n.output)):
+            n.output[i] += "_b"
+    for t in model2.graph.initializer:
+        if t.name != "Bias1":
+            t.name += "_b"
+    model2.graph.input[0].name += "_b"
+    model2.graph.output[0].name += "_b"
+
+    model.graph.node.extend(model2.graph.node)
+    model.graph.initializer.extend(
+        t for t in model2.graph.initializer if t.name != "Bias1"
+    )
+    model.graph.input.extend(model2.graph.input)
+    model.graph.output.extend(model2.graph.output)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_bnb4_chains(model.graph)
+    assert len(chains) == 0  # both declined -- the shared Bias1 blocks both
+
+    pruned = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 @pytest.mark.parametrize("quant_type", [0, 1])
 def test_matmul_bnb4_dequantized_matches_real_inference_session(quant_type):
     # Independently re-derives this section's own top-comment round-trip as
@@ -35857,6 +36204,129 @@ def test_analyze_block_quantized_fp8_pruning_reports_not_eligible():
     assert "MatMulBlockQuantizedFp8Weight" in report.not_eligible[0]
 
 
+def test_block_quantized_fp8_separate_trailing_bias_add_is_matched_and_prunes():
+    # Lightweight regression coverage for the `_BINARY_CHANNEL_OPS`
+    # (separate trailing bias `Add`) hop mirrored onto
+    # `_walk_to_fp8_consumer` alongside the MatMulNBits/Bnb4 fix -- NOT
+    # independently verified against a live FP8 quantizer (none was
+    # installable to check against); this is a structural mirror of the
+    # verified MatMulNBits/Bnb4 fix and the existing `_walk_to_consumer`
+    # precedent only.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(510)
+    w1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    w1[:8] *= 6.0  # first half of rows clearly more important
+    w2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    b1_f8, s1, dq1 = _fp8bw_quantize(w1, block_size)
+    b2_f8, s2, dq2 = _fp8bw_quantize(w2, block_size)
+    node1 = _fp8bw_node("mm1", "A", "T", "B1", "S1", None, None, block_size)
+    bias_add = onnx.helper.make_node("Add", ["T", "Bias1"], ["Tb"], name="bias_add1")
+    relu = onnx.helper.make_node("Relu", ["Tb"], ["R"])
+    node2 = _fp8bw_node("mm2", "R", "Y", "B2", "S2", None, None, block_size)
+    graph = onnx.helper.make_graph(
+        [node1, bias_add, relu, node2],
+        "g",
+        [onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT16, [2, K1])],
+        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [2, N2])],
+        initializer=[
+            onnx.numpy_helper.from_array(b1_f8, name="B1"),
+            _f32(s1, "S1"),
+            _f16(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(b2_f8, name="B2"),
+            _f32(s2, "S2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    # Before this fix, this returned 0 chains.
+    chains = onnxsim.pruning._find_fp8_block_quantized_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_block_quantized_fp8(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(8)  # expected keep-set: rows 0-7 (engineered important)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [8, K1]
+    assert list(inits["Bias1"].dims) == [8]
+    assert list(inits["B2"].dims) == [N2, 8]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bias1"]), bias1[keep].astype(np.float16)
+    )
+
+
+def test_block_quantized_fp8_separate_trailing_bias_add_declines_shared_bias():
+    # Same tied-tensor concern as `test_matmul_nbits_separate_trailing_
+    # bias_add_declines_shared_bias`/`test_matmul_bnb4_separate_trailing_
+    # bias_add_declines_shared_bias`, mirrored here for FP8's own
+    # `_BINARY_CHANNEL_OPS` hop.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(511)
+    w1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    w2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    b1_f8, s1, _dq1 = _fp8bw_quantize(w1, block_size)
+    b2_f8, s2, _dq2 = _fp8bw_quantize(w2, block_size)
+    node1 = _fp8bw_node("mm1", "A", "T", "B1", "S1", None, None, block_size)
+    bias_add = onnx.helper.make_node("Add", ["T", "Bias1"], ["Tb"], name="bias_add1")
+    relu = onnx.helper.make_node("Relu", ["Tb"], ["R"])
+    node2 = _fp8bw_node("mm2", "R", "Y", "B2", "S2", None, None, block_size)
+
+    # A second, unrelated node that also reads Bias1 -- the tied/shared
+    # constant that must block this chain from being matched at all.
+    extra = onnx.helper.make_node("Identity", ["Bias1"], ["Bias1Copy"], name="extra")
+
+    graph = onnx.helper.make_graph(
+        [node1, bias_add, relu, node2, extra],
+        "g",
+        [onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT16, [2, K1])],
+        [
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [2, N2]),
+            onnx.helper.make_tensor_value_info(
+                "Bias1Copy", onnx.TensorProto.FLOAT16, [N1]
+            ),
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(b1_f8, name="B1"),
+            _f32(s1, "S1"),
+            _f16(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(b2_f8, name="B2"),
+            _f32(s2, "S2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_fp8_block_quantized_chains(model.graph)
+    assert len(chains) == 0  # declined -- Bias1 is read by a second node too
+
+    pruned = onnxsim.apply_structured_pruning_matmul_block_quantized_fp8(
+        model, sparsity=0.5
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 # --- apply_structured_pruning_matmul_block_quantized_fp4 --------------------
 
 
@@ -36372,6 +36842,126 @@ def test_block_quantized_fp4_pruning_invalid_sparsity_raises():
     model, _info = _fp4bw_chain_model(N1, K1, N2, block_size, w1, 1.0, w2, 1.0)
     with pytest.raises(ValueError):
         onnxsim.apply_structured_pruning_matmul_block_quantized_fp4(model, sparsity=1.0)
+
+
+def test_block_quantized_fp4_separate_trailing_bias_add_is_matched_and_prunes():
+    # Lightweight regression coverage for the `_BINARY_CHANNEL_OPS`
+    # (separate trailing bias `Add`) hop mirrored onto
+    # `_walk_to_fp4_consumer` alongside the MatMulNBits/Bnb4 fix -- NOT
+    # independently verified against a live FP4 quantizer (none was
+    # installable to check against); this is a structural mirror of the
+    # verified MatMulNBits/Bnb4 fix and the existing `_walk_to_consumer`
+    # precedent only.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(540)
+    w1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    w1[:8] *= 6.0
+    w2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    p1, bs1, _dq1 = _qmoe_nvfp4_quantize_channel_blockwise(w1, 1.0, block_size)
+    p2, bs2, _dq2 = _qmoe_nvfp4_quantize_channel_blockwise(w2, 1.0, block_size)
+    node1 = _fp4bw_node("mm1", "A", "T", "B1", "WS1", "WS21", None, None, block_size)
+    bias_add = onnx.helper.make_node("Add", ["T", "Bias1"], ["Tb"], name="bias_add1")
+    relu = onnx.helper.make_node("Relu", ["Tb"], ["R"])
+    node2 = _fp4bw_node("mm2", "R", "Y", "B2", "WS2", "WS22", None, None, block_size)
+    graph = onnx.helper.make_graph(
+        [node1, bias_add, relu, node2],
+        "g",
+        [onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT16, [2, K1])],
+        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [2, N2])],
+        initializer=[
+            onnx.numpy_helper.from_array(p1, name="B1"),
+            _u8(_e4m3_view_u8(bs1), "WS1"),
+            _f32(np.array([1.0], dtype=np.float32), "WS21"),
+            _f16(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(p2, name="B2"),
+            _u8(_e4m3_view_u8(bs2), "WS2"),
+            _f32(np.array([1.0], dtype=np.float32), "WS22"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    # Before this fix, this returned 0 chains.
+    chains = onnxsim.pruning._find_fp4_block_quantized_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_block_quantized_fp4(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(8)  # expected keep-set: rows 0-7 (engineered important)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias1"].dims) == [8]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bias1"]), bias1[keep].astype(np.float16)
+    )
+
+
+def test_block_quantized_fp4_separate_trailing_bias_add_declines_shared_bias():
+    # Same tied-tensor concern as the FP8/MatMulNBits/Bnb4 analogues above,
+    # mirrored here for FP4's own `_BINARY_CHANNEL_OPS` hop.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(541)
+    w1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    w2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    p1, bs1, _dq1 = _qmoe_nvfp4_quantize_channel_blockwise(w1, 1.0, block_size)
+    p2, bs2, _dq2 = _qmoe_nvfp4_quantize_channel_blockwise(w2, 1.0, block_size)
+    node1 = _fp4bw_node("mm1", "A", "T", "B1", "WS1", "WS21", None, None, block_size)
+    bias_add = onnx.helper.make_node("Add", ["T", "Bias1"], ["Tb"], name="bias_add1")
+    relu = onnx.helper.make_node("Relu", ["Tb"], ["R"])
+    node2 = _fp4bw_node("mm2", "R", "Y", "B2", "WS2", "WS22", None, None, block_size)
+    extra = onnx.helper.make_node("Identity", ["Bias1"], ["Bias1Copy"], name="extra")
+
+    graph = onnx.helper.make_graph(
+        [node1, bias_add, relu, node2, extra],
+        "g",
+        [onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT16, [2, K1])],
+        [
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [2, N2]),
+            onnx.helper.make_tensor_value_info(
+                "Bias1Copy", onnx.TensorProto.FLOAT16, [N1]
+            ),
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(p1, name="B1"),
+            _u8(_e4m3_view_u8(bs1), "WS1"),
+            _f32(np.array([1.0], dtype=np.float32), "WS21"),
+            _f16(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(p2, name="B2"),
+            _u8(_e4m3_view_u8(bs2), "WS2"),
+            _f32(np.array([1.0], dtype=np.float32), "WS22"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_fp4_block_quantized_chains(model.graph)
+    assert len(chains) == 0  # declined -- Bias1 is read by a second node too
+
+    pruned = onnxsim.apply_structured_pruning_matmul_block_quantized_fp4(
+        model, sparsity=0.5
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
 
 
 # --- apply_structured_pruning_matmul_nbits: gated (SwiGLU/GeGLU) pair -------

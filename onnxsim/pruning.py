@@ -17943,8 +17943,14 @@ def _walk_to_matmul_nbits_consumer(
 ]:
     """From tensor `start` (a ``MatMulNBits`` OR plain-float MatMul/Gemm
     producer's own output), walks forward through shape-preserving unary
-    activations (`_UNARY_PASS_THROUGH`), a plain `_NORM_PASS_THROUGH_OPS`
-    node whose own `axis` normalizes exactly `cur`'s last axis (see that
+    activations (`_UNARY_PASS_THROUGH`), a per-channel bias/scale
+    `Add`/`Mul` against a flat constant whose last dim equals `n_channels`
+    (`_BINARY_CHANNEL_OPS`, mirrors :func:`_walk_to_consumer`'s own
+    identical hop -- the real shape a ``MatMulNBitsQuantizer`` round trip
+    commonly emits as a separate trailing bias node, before any later ORT
+    graph-optimizer bias-folding pass, since ``MatMulNBits``'s own schema
+    has no bias input of its own), a plain `_NORM_PASS_THROUGH_OPS` node
+    whose own `axis` normalizes exactly `cur`'s last axis (see that
     constant's own comment, :func:`_norm_axis_is_last`, and
     :func:`_norm_pass_through_const_names` -- mirrors
     :func:`_walk_to_consumer`'s own identical single-node norm hop), or
@@ -17961,11 +17967,11 @@ def _walk_to_matmul_nbits_consumer(
     :func:`_walk_to_consumer_qdq`'s own float/QDQ union but restricted to
     ``MatMulNBits``/plain-float (never QDQ). No gated pair (self-gated
     activation/tanh-GELU), no branch, no ``PRelu``/``Clip``/fused-bias-GELU
-    hop -- unlike :func:`_walk_to_consumer`, only the norm hop above is
-    added here. Returns ``None`` if the walk runs out of hops, hits a
-    branch, or never reaches such a consumer. The caller
-    (:func:`_find_matmul_nbits_chains`) is responsible for discarding a
-    plain-float-to-plain-float result -- that pairing is
+    hop -- unlike :func:`_walk_to_consumer`, only the norm and
+    `_BINARY_CHANNEL_OPS` hops above are added here. Returns ``None`` if the
+    walk runs out of hops, hits a branch, or never reaches such a consumer.
+    The caller (:func:`_find_matmul_nbits_chains`) is responsible for
+    discarding a plain-float-to-plain-float result -- that pairing is
     :func:`apply_structured_pruning`'s own job, not duplicated here.
 
     `value_info_by_name`, when given, lets a positive-`axis`
@@ -18032,6 +18038,40 @@ def _walk_to_matmul_nbits_consumer(
             and len(nxt.output) == 1
         ):
             pass
+        elif (
+            nxt.op_type in _BINARY_CHANNEL_OPS
+            and len(nxt.input) == 2
+            and cur in nxt.input
+            and len(nxt.output) == 1
+        ):
+            # A separate trailing bias/scale `Add`/`Mul` against a flat
+            # per-channel constant -- mirrors :func:`_walk_to_consumer`'s own
+            # identical `_BINARY_CHANNEL_OPS` hop. This is the real shape a
+            # ``MatMulNBitsQuantizer`` round trip commonly emits (before any
+            # later ORT graph-optimizer bias-folding pass), since
+            # ``MatMulNBits``'s own schema has no bias input of its own.
+            other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+            const_init = initializer_map.get(other)
+            if (
+                const_init is not None
+                and _is_supported_float_dtype(const_init.data_type)
+                and list(const_init.dims)
+                and const_init.dims[-1] == n_channels
+                and int(np.prod(const_init.dims)) == n_channels
+                # Tied/shared-tensor bar -- unlike a MatMulNBits/plain-Gemm
+                # producer's own bias (checked once, at match time, by
+                # :func:`_match_matmul_nbits`/:func:`_match_plain_matmul_nbits_peer`
+                # via this same `consumers_of`), a mid-chain hop's constant
+                # isn't tied to any single node's match, so it's checked
+                # here instead: a bias/scale read by more than one node
+                # would have a second reader silently left with a
+                # wrong-sized tensor once this chain's own keep-set slices
+                # it in place.
+                and len(consumers_of.get(other, [])) == 1
+            ):
+                const_name = other
+            else:
+                return None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -19102,13 +19142,20 @@ def _walk_to_matmul_bnb4_consumer(
 ]:
     """From tensor `start` (a ``MatMulBnb4`` producer's own output), walks
     forward through shape-preserving unary activations (`_UNARY_PASS_THROUGH`),
-    a plain `_NORM_PASS_THROUGH_OPS` node whose own `axis` normalizes exactly
-    `cur`'s last axis (see that constant's own comment,
-    :func:`_norm_axis_is_last`, and :func:`_norm_pass_through_const_names`
-    -- mirrors :func:`_walk_to_consumer`'s own identical single-node norm
-    hop), or either of the two *decomposed* pre-opset-17 LayerNorm/RMSNorm
-    node sequences a raw export emits instead of a fused
-    `_NORM_PASS_THROUGH_OPS` node (:func:`_match_decomposed_layer_norm_pass_through`/
+    a per-channel bias/scale `Add`/`Mul` against a flat constant whose last
+    dim equals `n_channels` (`_BINARY_CHANNEL_OPS`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop) -- ``MatMulBnb4``'s own
+    live 3-input schema (`A, B, absmax`) has no bias slot at all, so this
+    separate-`Add` shape is the ONLY way a biased ``MatMulBnb4`` layer is
+    ever representable, and a real ``MatMulBnb4Quantizer`` round trip
+    commonly emits exactly this -- a plain `_NORM_PASS_THROUGH_OPS` node
+    whose own `axis` normalizes exactly `cur`'s last axis (see that constant's
+    own comment, :func:`_norm_axis_is_last`, and
+    :func:`_norm_pass_through_const_names` -- mirrors
+    :func:`_walk_to_consumer`'s own identical single-node norm hop), or either
+    of the two *decomposed* pre-opset-17 LayerNorm/RMSNorm node sequences a
+    raw export emits instead of a fused `_NORM_PASS_THROUGH_OPS` node
+    (:func:`_match_decomposed_layer_norm_pass_through`/
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim -- the
     identical two matchers :func:`_walk_to_matmul_nbits_consumer`/
     :func:`_walk_to_dynquant_consumer` try, sound here for the identical
@@ -19183,6 +19230,36 @@ def _walk_to_matmul_bnb4_consumer(
             and len(nxt.output) == 1
         ):
             pass
+        elif (
+            nxt.op_type in _BINARY_CHANNEL_OPS
+            and len(nxt.input) == 2
+            and cur in nxt.input
+            and len(nxt.output) == 1
+        ):
+            # A separate trailing bias/scale `Add`/`Mul` against a flat
+            # per-channel constant -- mirrors :func:`_walk_to_consumer`'s own
+            # identical `_BINARY_CHANNEL_OPS` hop. ``MatMulBnb4``'s own live
+            # 3-input schema (`A, B, absmax`) has no bias slot at all, so
+            # this separate-`Add` shape is the ONLY way a biased
+            # ``MatMulBnb4`` layer is ever representable.
+            other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+            const_init = initializer_map.get(other)
+            if (
+                const_init is not None
+                and _is_supported_float_dtype(const_init.data_type)
+                and list(const_init.dims)
+                and const_init.dims[-1] == n_channels
+                and int(np.prod(const_init.dims)) == n_channels
+                # Tied/shared-tensor bar -- see
+                # :func:`_walk_to_matmul_nbits_consumer`'s own identical
+                # check on this same hop for why a mid-chain hop's constant
+                # needs this checked here, not left to a producer/consumer
+                # match.
+                and len(consumers_of.get(other, [])) == 1
+            ):
+                const_name = other
+            else:
+                return None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -32523,7 +32600,11 @@ def _walk_to_fp8_consumer(
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[_Fp8ChainSide, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
     """Mirrors :func:`_walk_to_matmul_nbits_consumer`: from tensor `start`,
-    walks forward through shape-preserving unary activations, a plain
+    walks forward through shape-preserving unary activations, a per-channel
+    bias/scale `Add`/`Mul` against a flat constant whose last dim equals
+    `n_channels` (`_BINARY_CHANNEL_OPS`, mirrors :func:`_walk_to_consumer`'s
+    own identical hop -- mechanically mirrored from the MatMulNBits/Bnb4
+    fix, not independently verified against a live FP8 quantizer), a plain
     `_NORM_PASS_THROUGH_OPS` node whose own `axis` normalizes exactly
     `cur`'s last axis (see that constant's own comment,
     :func:`_norm_axis_is_last`, and :func:`_norm_pass_through_const_names`
@@ -32614,6 +32695,35 @@ def _walk_to_fp8_consumer(
             and len(nxt.output) == 1
         ):
             pass
+        elif (
+            nxt.op_type in _BINARY_CHANNEL_OPS
+            and len(nxt.input) == 2
+            and cur in nxt.input
+            and len(nxt.output) == 1
+        ):
+            # A separate trailing bias/scale `Add`/`Mul` against a flat
+            # per-channel constant -- mirrors :func:`_walk_to_consumer`'s own
+            # identical `_BINARY_CHANNEL_OPS` hop (mechanically mirrored from
+            # the MatMulNBits/Bnb4 fix, not independently verified against a
+            # live FP8 quantizer).
+            other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+            const_init = initializer_map.get(other)
+            if (
+                const_init is not None
+                and _is_supported_float_dtype(const_init.data_type)
+                and list(const_init.dims)
+                and const_init.dims[-1] == n_channels
+                and int(np.prod(const_init.dims)) == n_channels
+                # Tied/shared-tensor bar -- see
+                # :func:`_walk_to_matmul_nbits_consumer`'s own identical
+                # check on this same hop for why a mid-chain hop's constant
+                # needs this checked here, not left to a producer/consumer
+                # match.
+                and len(consumers_of.get(other, [])) == 1
+            ):
+                const_name = other
+            else:
+                return None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -32695,8 +32805,9 @@ def _walk_to_fp4_consumer(
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[_Fp4ChainSide, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
     """``Fp4Weight`` analogue of :func:`_walk_to_fp8_consumer` -- see that
-    function's own docstring, including its identical norm-hop recognition
-    and `value_info_by_name` parameter.
+    function's own docstring, including its identical norm-hop and
+    per-channel bias/scale `Add`/`Mul` (`_BINARY_CHANNEL_OPS`) hop
+    recognition, and `value_info_by_name` parameter.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
@@ -32755,6 +32866,35 @@ def _walk_to_fp4_consumer(
             and len(nxt.output) == 1
         ):
             pass
+        elif (
+            nxt.op_type in _BINARY_CHANNEL_OPS
+            and len(nxt.input) == 2
+            and cur in nxt.input
+            and len(nxt.output) == 1
+        ):
+            # A separate trailing bias/scale `Add`/`Mul` against a flat
+            # per-channel constant -- mirrors :func:`_walk_to_consumer`'s own
+            # identical `_BINARY_CHANNEL_OPS` hop (mechanically mirrored from
+            # the MatMulNBits/Bnb4 fix, not independently verified against a
+            # live FP4 quantizer).
+            other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+            const_init = initializer_map.get(other)
+            if (
+                const_init is not None
+                and _is_supported_float_dtype(const_init.data_type)
+                and list(const_init.dims)
+                and const_init.dims[-1] == n_channels
+                and int(np.prod(const_init.dims)) == n_channels
+                # Tied/shared-tensor bar -- see
+                # :func:`_walk_to_matmul_nbits_consumer`'s own identical
+                # check on this same hop for why a mid-chain hop's constant
+                # needs this checked here, not left to a producer/consumer
+                # match.
+                and len(consumers_of.get(other, [])) == 1
+            ):
+                const_name = other
+            else:
+                return None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
