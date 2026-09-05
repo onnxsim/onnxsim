@@ -18,24 +18,30 @@ pruning.py's own ``_find_decomposed_gqa_chains`` matches, now HAS a C++ port
 (``FindDecomposedGqaChains``/``ApplyOneDecomposedGqaChain`` in
 ``structured_pruning_entry.cpp`` -- see that section's own comment) --
 covered by its own dedicated "Decomposed (un-fused) GQA/MQA/plain-MHA
-attention head pruning" test section below -- but DELIBERATELY NARROWER in
-scope than pruning.py's own matcher: no additive mask, no decomposed
-RoPE/Q-K-norm pass-through, no packed-QKV-then-``Split`` producer, and no
-true-MQA fast path. (An ``Einsum``-based QK^T/AV product IS now recognized,
-in place of a plain ``MatMul``, for both products -- see the dedicated
-``Einsum`` tests in that same section.) Every one of those remaining shapes
-still declines to match in this C++ port (never mis-sliced),
-so ``apply_attention_head_pruning``/``apply_attention_head_wanda_pruning``
-remain pure-Python (NOT yet aliased to this port) -- see that section's own
-tests for the exact, explicit divergence each narrowing produces. The six
-newer fused-op families (everything past plain ``Attention``/
-``GroupQueryAttention``/the plain ``ai.onnx::Attention`` op) share one more
-deliberate, narrower-than-pruning.py scope choice throughout: this port has
-no analogue of pruning.py's
-own dynamic-attention-bias-Gather-insertion machinery
-(``_head_bias_input_is_safe``/``_slice_or_gather_head_bias``) at all -- a
-pre-existing, already-accepted gap for the three original families too -- so
-every new matcher declines the whole chain outright whenever an optional
+attention head pruning" test section below. An additive mask (`attn_mask`/
+causal bias) before ``Softmax``, constant or genuinely dynamic, IS now
+recognized and pruned there too (``ResolveDecomposedQkRoot``'s own mask
+detection, ``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias`` -- this port's
+own analogue of pruning.py's ``_head_bias_input_is_safe``/
+``_slice_or_gather_head_bias`` for this one chain family), and an
+``Einsum``-based QK^T/AV product IS now recognized too, in place of a plain
+``MatMul``, for both products (see the dedicated ``Einsum`` tests in that same
+section) -- but this port remains DELIBERATELY NARROWER than pruning.py's own
+matcher in every other respect: no decomposed RoPE/Q-K-norm pass-through, no
+packed-QKV-then-``Split`` producer, and no true-MQA fast path. Every one of
+those remaining shapes still declines to match in this C++ port (never
+mis-sliced), so ``apply_attention_head_pruning``/
+``apply_attention_head_wanda_pruning`` remain pure-Python (NOT yet aliased to
+this port) -- see that section's own tests for the exact, explicit divergence
+each remaining narrowing produces. The six newer fused-op families
+(everything past plain ``Attention``/``GroupQueryAttention``/the plain
+``ai.onnx::Attention`` op) share one more deliberate, narrower-than-pruning.py
+scope choice throughout: this port has no analogue of pruning.py's own
+dynamic-attention-bias-Gather-insertion machinery (``_head_bias_input_is_safe``/
+``_slice_or_gather_head_bias``) at all for THOSE families -- a pre-existing,
+already-accepted gap for the three original fused-op families too (only the
+decomposed-GQA family above has that machinery ported) -- so every new
+fused-op matcher declines the whole chain outright whenever an optional
 per-head bias/mask/sink/norm/scale input resolves to a non-empty constant,
 rather than risk leaving one silently stale after ``num_heads``/
 ``kv_num_heads`` shrink underneath it. See each new family's own model
@@ -2697,18 +2703,27 @@ def test_cpp_sparse_attention_pruning_num_layout_divisibility_declined_matches_p
 # cloning a fresh tensor when some genuinely unrelated node also reads the
 # same (CSE-shared) constant. See structured_pruning_entry.cpp's own
 # "Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning" section
-# comment for the exact scope this port matches -- deliberately narrower
-# than pruning.py's own `_find_decomposed_gqa_chains`: no additive mask, no
-# decomposed RoPE/Q-K-norm pass-through, no packed-QKV-then-`Split` producer,
-# and no true-MQA fast path (mirrors ApplyOneGqaChain's own identical,
+# comment for the exact scope this port matches. An additive mask
+# (`attn_mask`/causal bias) before `Softmax` IS matched and pruned here now
+# -- `ResolveDecomposedQkRoot`'s own optional `Add(mask) -> [Mul/Div(scale)
+# ->] MatMul` prefix, and `HeadBiasInputIsSafe`/`SliceOrGatherHeadBias`, this
+# port's own analogue of pruning.py's `_head_bias_input_is_safe`/
+# `_slice_or_gather_head_bias` for this chain family: a constant per-head
+# mask is sliced in place, a genuinely dynamic one gets a new `Gather`
+# spliced in ahead of it, and an unresolvable shape declines the WHOLE chain
+# -- exactly mirroring pruning.py's own behavior. An `Einsum`-based QK^T/AV
+# product, in place of a plain `MatMul`, for either or both products IS also
+# recognized here (via `EinsumEquationIsBatchedMatmul`, a line-for-line port
+# of pruning.py's own `_einsum_equation_is_batched_matmul`) -- see
+# `_decomposed_einsum_gqa_model` and its own tests below, further down this
+# section. This port remains deliberately narrower than pruning.py's own
+# `_find_decomposed_gqa_chains` in every other respect: no decomposed
+# RoPE/Q-K-norm pass-through, no packed-QKV-then-`Split` producer, and no
+# true-MQA fast path (mirrors ApplyOneGqaChain's own identical,
 # already-accepted MQA gap) -- every one of those shapes simply declines to
 # match here (never mis-sliced) and is still fully handled by pruning.py's
 # own pure-Python `apply_attention_head_pruning`, so this tenth family is NOT
-# yet aliased. An `Einsum`-based QK^T/AV product, in place of a plain
-# `MatMul`, for either or both products IS recognized here (via
-# `EinsumEquationIsBatchedMatmul`, a line-for-line port of pruning.py's own
-# `_einsum_equation_is_batched_matmul`) -- see `_decomposed_einsum_gqa_model`
-# and its own tests below, further down this section.
+# yet aliased.
 
 
 def _decomposed_gqa_model(
@@ -2723,6 +2738,8 @@ def _decomposed_gqa_model(
     seed=0,
     bias=True,
     masked=False,
+    mask_dynamic=False,
+    mask=None,
     wq=None,
     wk=None,
     wv=None,
@@ -2751,13 +2768,19 @@ def _decomposed_gqa_model(
     ``perm=[0, 2, 1, 3]`` head-split followed later by its own ``perm=[0, 1,
     3, 2]`` swap when ``KVH < H`` (``repeat_kv`` present).
 
-    ``masked`` (default ``False``) adds a constant additive mask before
-    ``Softmax`` -- this port's own matcher never recognizes an additive mask
-    of any kind (see this section's own comment above), so this exists
-    purely to build a DECLINE test case: the whole chain fails to match,
-    leaving the block completely untouched by the C++ port, while
-    pruning.py's own pure-Python implementation still prunes it (a
-    documented, intentional divergence -- not a bug).
+    ``masked`` (default ``False``) adds an additive mask before ``Softmax``
+    -- this port's own matcher recognizes it exactly as pruning.py's own
+    `_resolve_decomposed_qk_root`/`_head_bias_input_is_safe`/
+    `_slice_or_gather_head_bias` do (see this section's own comment above),
+    so a per-head-shaped mask is pruned in lock-step with every other tensor
+    in the chain. ``mask_dynamic`` (default ``False``, only meaningful when
+    ``masked``) makes the mask a genuinely dynamic graph input (``Mask``,
+    declared shape ``[1, 1, seq, seq]``) instead of a constant -- exercising
+    ``SliceOrGatherHeadBias``'s own ``Gather``-insertion path
+    (``InsertDynamicHeadBiasGather``) rather than its in-place constant-slice
+    path. ``mask`` lets a caller (an oracle rebuild) pass the identical
+    pre-pruning mask array back in -- a causal upper-triangular ``-1e4``
+    mask, shape ``[1, 1, seq, seq]``, when left ``None``.
 
     ``extra_foreign_q_reshape_consumer``/``extra_foreign_repeat_kv_consumer``
     each add a second, wholly unrelated node reading the same shape constant
@@ -2784,6 +2807,7 @@ def _decomposed_gqa_model(
         return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
 
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    extra_inputs = ""
 
     # Gemm requires a rank-2 input -- flattening `X` to `[batch*seq, K]`
     # first, exactly the shape onnxsim's own `fuse_matmul_add_bias_into_gemm`
@@ -2887,10 +2911,14 @@ def _decomposed_gqa_model(
     lines += ["qk = MatMul(qt, kt)", "scaled = Mul(qk, Scale)"]
 
     if masked:
-        mask = np.triu(np.full((seq, seq), -1e4, dtype=np.float32), k=1)[
-            None, None, :, :
-        ]
-        initializer.append(_f32(mask, "Mask"))
+        if mask is None:
+            mask = np.triu(np.full((seq, seq), -1e4, dtype=np.float32), k=1)[
+                None, None, :, :
+            ]
+        if mask_dynamic:
+            extra_inputs += f", float[1,1,{seq},{seq}] Mask"
+        else:
+            initializer.append(_f32(np.asarray(mask), "Mask"))
         lines.append("premask = Add(scaled, Mask)")
         smax_in = "premask"
     else:
@@ -2915,7 +2943,7 @@ def _decomposed_gqa_model(
           ir_version: 10,
           opset_import: ["": 17]
         >
-        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        g (float[{batch},{seq},{K}] X{extra_inputs}) => (float[{batch},{seq},{Out}] Y)
         {{
           {body_lines}
         }}
@@ -2939,6 +2967,7 @@ def _decomposed_gqa_model(
         bk=bk,
         bv=bv,
         bout=bout,
+        mask=mask,
     )
 
 
@@ -3206,26 +3235,206 @@ def test_cpp_decomposed_gqa_pruning_unsupported_transpose_perm_is_declined_match
     assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
-def test_cpp_decomposed_gqa_pruning_with_constant_mask_is_declined_but_python_still_prunes():
-    # This C++ port's own documented, accepted scope gap (see this section's
-    # own comment above `_decomposed_gqa_model`): an additive mask `Add`
-    # before `Softmax` is never recognized here at all -- `ResolveDecomposed
-    # QkRoot` only ever matches `[Mul/Div(scale) ->] MatMul`, so the `Add`
-    # node (whose own op_type is never `Mul`/`Div`/`MatMul`) makes the whole
-    # chain fail to match -- a decline, not a mis-slice. pruning.py's own
-    # pure-Python `apply_attention_head_pruning` DOES recognize a constant
-    # mask (`_head_bias_input_is_safe`) and still prunes this block, so the
-    # two ports intentionally diverge here -- this is exactly why the family
-    # is not aliased yet, not a bug in either.
-    model, _ = _decomposed_gqa_model(
+def test_cpp_decomposed_gqa_pruning_with_constant_mask_matches_python_reference_exactly():
+    # An additive mask `Add` before `Softmax`, a constant of the
+    # schema-documented per-head-broadcastable shape (`[1, 1, seq, seq]`,
+    # rank-4 with the num_heads-aligned axis broadcast-sized) -- now matched
+    # by `ResolveDecomposedQkRoot`'s own mask detection and left correctly
+    # untouched (a broadcast, already correct for any head count) in lock
+    # step with pruning.py's own pure-Python `apply_attention_head_pruning`.
+    # Both ports must agree byte-for-byte, the strongest possible parity
+    # check.
+    model, cfg = _decomposed_gqa_model(
         K=32, H=8, KVH=2, D=8, Out=16, seed=21, masked=True
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    # The mask is rank-4 `[1, 1, seq, seq]` -- axis 1 (the num_heads-aligned
+    # slot) is a broadcast (size 1), so HeadBiasAxis resolves to `-1` and
+    # SliceOrGatherHeadBias leaves it completely untouched, exactly as
+    # pruning.py's own `_head_bias_axis`/`_slice_or_gather_head_bias` do.
+    mask_after = next(
+        onnx.numpy_helper.to_array(t)
+        for t in pruned_cpp.graph.initializer
+        if t.name == "Mask"
+    )
+    np.testing.assert_array_equal(mask_after, cfg["mask"])
+
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned_cpp, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+    assert np.all(np.isfinite(y))
+
+
+def test_cpp_decomposed_gqa_pruning_with_dynamic_mask_matches_python_reference_exactly():
+    # The genuinely dynamic (graph-input, non-constant) analogue of the test
+    # above -- `SliceOrGatherHeadBias`'s own "leave a confirmed broadcast
+    # alone" path applies identically whether the mask is a constant or a
+    # dynamic tensor (DynamicHeadBiasAxis resolves the SAME `-1` from the
+    # graph input's own declared `[1, 1, seq, seq]` shape, via
+    # `ValueInfoByName`), so no `Gather` is ever inserted here either -- both
+    # ports must still agree byte-for-byte.
+    model, cfg = _decomposed_gqa_model(
+        K=32, H=8, KVH=2, D=8, Out=16, seed=23, masked=True, mask_dynamic=True
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    # No new `Gather` node is expected for a broadcast mask -- confirms this
+    # test genuinely exercises "already correct, leave alone", not a
+    # trivially-always-passing insertion.
+    assert not any(n.op_type == "Gather" for n in pruned_cpp.graph.node)
+
+    rng = np.random.default_rng(24)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned_cpp, {"X": x, "Mask": cfg["mask"]})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+    assert np.all(np.isfinite(y))
+
+
+def test_cpp_decomposed_gqa_pruning_with_per_head_dynamic_mask_gathers_matches_python():
+    # A genuinely PER-HEAD (not broadcast) dynamic mask -- rank-4
+    # `[1, num_heads, seq, seq]`, axis 1 sized exactly `num_heads` -- the one
+    # case that actually needs SliceOrGatherHeadBias's own `Gather`-insertion
+    # path (InsertDynamicHeadBiasGather), since the mask's own real values
+    # aren't available to slice in place at prune time the way a constant's
+    # are. Both ports must still agree byte-for-byte, and the pruned graph's
+    # own newly-spliced `Gather` must select exactly the kept query heads.
+    H, KVH, D, seq = 8, 2, 8, 4
+    rng = np.random.default_rng(25)
+    mask = rng.standard_normal((1, H, seq, seq)).astype(np.float32)
+    model, cfg = _decomposed_gqa_model(
+        K=32,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=16,
+        seq=seq,
+        seed=25,
+        masked=True,
+        mask_dynamic=True,
+        mask=mask,
+    )
+    # `_decomposed_gqa_model` only ever declares a broadcast `[1, 1, seq,
+    # seq]` dynamic mask input -- widen it here to the genuine per-head shape
+    # this test needs (the model's own `Add(scaled, Mask)` node is agnostic
+    # to Mask's exact declared shape; only the graph's own declared
+    # ValueInfo, which HeadBiasInputIsSafe/SliceOrGatherHeadBias consult, and
+    # the runtime feed need to agree).
+    for vi in model.graph.input:
+        if vi.name == "Mask":
+            vi.type.tensor_type.shape.dim[1].dim_value = H
+
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    gather_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    gather = gather_nodes[0]
+    assert gather.input[0] == "Mask"
+    axis = next(a.i for a in gather.attribute if a.name == "axis")
+    assert axis == 1
+    indices_init = next(
+        t for t in pruned_cpp.graph.initializer if t.name == gather.input[1]
+    )
+    indices = onnx.numpy_helper.to_array(indices_init)
+
+    group_size = H // KVH
+    new_kv = KVH - round(KVH * 0.5)
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, KVH, D, new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    np.testing.assert_array_equal(indices, np.sort(keep_q_heads))
+
+    # The pruned graph's own "Mask" graph INPUT keeps its ORIGINAL declared
+    # shape (`[1, H, seq, seq]`) -- SliceOrGatherHeadBias only ever rewires
+    # the mask consumer's own edge onto the new Gather's output, it never
+    # touches `graph.input` itself (the real dynamic tensor is still
+    # supplied, at its original shape, by whatever produces it at
+    # inference); the freshly spliced `Gather` performs the actual
+    # per-head selection at runtime. So the full, ORIGINAL-shaped mask is
+    # fed here -- not a pre-sliced one -- exactly as a real caller would
+    # still supply it, unaware the model was pruned underneath it.
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=D,
+        Out=cfg["Out"],
+        seq=seq,
+        seed=25,
+        masked=True,
+        mask_dynamic=True,
+        mask=mask[:, keep_q_heads, :, :],
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+    )
+    # Same fixup as the pruned-under-test model above: `_decomposed_gqa_model`
+    # always declares a broadcast `[1, 1, seq, seq]` dynamic mask input --
+    # widen it to match the actual (post-pruning) per-head array being fed.
+    for vi in oracle.graph.input:
+        if vi.name == "Mask":
+            vi.type.tensor_type.shape.dim[1].dim_value = len(keep_q_heads)
+
+    rng = np.random.default_rng(26)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_cpp,) = _run(pruned_cpp, {"X": x, "Mask": mask})
+    (y_oracle,) = _run(oracle, {"X": x, "Mask": mask[:, keep_q_heads, :, :]})
+    np.testing.assert_allclose(y_cpp, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_decomposed_gqa_pruning_with_unresolvable_mask_shape_declines_matches_python():
+    # A mask whose own per-head axis is neither a genuine broadcast (size 1)
+    # nor the pre-pruning head count -- HeadBiasAxis/`_head_bias_axis`
+    # decline to classify it either way, so BOTH ports must decline the
+    # WHOLE chain rather than guess (never a mis-slice). A genuinely invalid
+    # topology, so this is a true agreement check, not a documented
+    # divergence.
+    H, KVH, D, seq = 8, 2, 8, 4
+    bad_mask = np.zeros((1, H + 1, seq, seq), dtype=np.float32)
+    model, _ = _decomposed_gqa_model(
+        K=32,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=16,
+        seq=seq,
+        seed=27,
+        masked=True,
+        mask=bad_mask,
     )
     pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
     pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
-    onnx.checker.check_model(pruned_cpp)
-    onnx.checker.check_model(pruned_py)
     assert pruned_cpp.SerializeToString() == model.SerializeToString()
-    assert pruned_py.SerializeToString() != model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
 def test_cpp_decomposed_mqa_pruning_is_a_permanent_no_op_unlike_python():
