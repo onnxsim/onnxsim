@@ -25,16 +25,17 @@ detection, ``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias`` -- this port's
 own analogue of pruning.py's ``_head_bias_input_is_safe``/
 ``_slice_or_gather_head_bias`` for this one chain family); an ``Einsum``-based
 QK^T/AV product IS now recognized too, in place of a plain ``MatMul``, for
-both products (see the dedicated ``Einsum`` tests in that same section); and
+both products (see the dedicated ``Einsum`` tests in that same section);
 decomposed RoPE and decomposed Q/K-norm pass-through ARE now recognized as
 well, in the narrower sub-scope structured_pruning_entry.cpp's own section
 comment documents (Q's own branch and K's separate-``perm=[0,1,3,2]`` swap
 branch only -- never K's combined-perm branch, never combined with the
-``Einsum`` case, never on V's own branch) -- but this port remains
-DELIBERATELY NARROWER than pruning.py's own matcher in every other respect:
-no packed-QKV-then-``Split`` producer, and no true-MQA fast path. Every one of
-those remaining shapes still declines to match in this C++ port (never
-mis-sliced), so ``apply_attention_head_pruning``/
+``Einsum`` case, never on V's own branch); and a packed-QKV-then-``Split``
+producer (``MatchDecomposedPackedQkvProducer``) and a true-MQA fast path
+(individual query-head-granularity ranking/pruning when ``kv_num_heads == 1``)
+are ALSO now recognized -- see the dedicated tests for each below. Every
+remaining shape not covered by one of those still declines to match in this
+C++ port (never mis-sliced), so ``apply_attention_head_pruning``/
 ``apply_attention_head_wanda_pruning`` remain pure-Python (NOT yet aliased to
 this port) -- see that section's own tests for the exact, explicit divergence
 each remaining narrowing produces. The six newer fused-op families
@@ -2724,12 +2725,13 @@ def test_cpp_sparse_attention_pruning_num_layout_divisibility_declined_matches_p
 # recognized too (see the dedicated tests below and structured_pruning_entry.
 # cpp's own section comment for that narrower-still sub-scope: only Q's own
 # branch and K's separate-`perm=[0,1,3,2]` swap branch, never K's
-# combined-perm shape, an `Einsum` QK^T product, or V's own branch). This
-# port remains deliberately narrower than pruning.py's own
-# `_find_decomposed_gqa_chains` in every other respect: no
-# packed-QKV-then-`Split` producer, and no true-MQA fast path (mirrors
-# ApplyOneGqaChain's own identical,
-# already-accepted MQA gap) -- every one of those shapes simply declines to
+# combined-perm shape, an `Einsum` QK^T product, or V's own branch). A
+# packed-QKV-then-`Split` producer (MatchDecomposedPackedQkvProducer) AND a
+# true-MQA fast path (ApplyOneDecomposedGqaChain's own `is_mqa` handling) ARE
+# both matched/applied here now too, mirroring pruning.py's own
+# `_match_decomposed_packed_qkv_producer`/`is_mqa` handling exactly -- see
+# each's own comment in structured_pruning_entry.cpp and the dedicated tests
+# below. Every remaining shape not covered by one of those still declines to
 # match here (never mis-sliced) and is still fully handled by pruning.py's
 # own pure-Python `apply_attention_head_pruning`, so this tenth family is NOT
 # yet aliased.
@@ -3565,24 +3567,364 @@ def test_cpp_decomposed_gqa_pruning_with_unresolvable_mask_shape_declines_matche
     assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
-def test_cpp_decomposed_mqa_pruning_is_a_permanent_no_op_unlike_python():
-    # True decomposed MQA (kv_num_heads == 1): this C++ port has no MQA
-    # fast path (mirrors ApplyOneGqaChain's own identical, already-accepted
-    # gap for every fused-op family) -- with only one KV group, the
-    # ordinary group-granularity formula (`max(1, 1 - round(1*sparsity))`)
-    # is always `1 == kv_num_heads`, so `ApplyOneDecomposedGqaChain` always
-    # declines as a no-op for this block, no matter how many query heads
-    # share the one KV head. pruning.py's own pure-Python implementation
-    # DOES have this fast path (individual query heads ranked/dropped
-    # directly, KV head untouched) and so still prunes something here -- an
-    # intentional, documented divergence.
-    model, _ = _decomposed_gqa_model(K=32, H=8, KVH=1, D=8, Out=16, seed=201)
+def _oracle_keep_query_heads(wq, d, num_heads, keep_count):
+    # Mirrors pruning.py's own `_gqa_query_head_importance`: each query
+    # head ranked directly by its own Q weight block alone (the shared K/V
+    # block deliberately omitted -- see that function's own docstring for
+    # why it cannot change which heads rank highest).
+    importance = np.array(
+        [np.linalg.norm(wq[:, h * d : (h + 1) * d]) for h in range(num_heads)]
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_cpp_decomposed_mqa_pruning_matches_python_reference_exactly():
+    # True decomposed MQA (kv_num_heads == 1, more than one query head):
+    # ApplyOneDecomposedGqaChain's own `is_mqa` fast path -- mirrors
+    # pruning.py's own `_apply_one_decomposed_gqa_chain` docstring exactly.
+    # The ordinary group-granularity formula (`max(1, 1 - round(1*
+    # sparsity))`) is always `1 == kv_num_heads`, so it can never drop
+    # anything no matter how many query heads share the one KV head; this
+    # path instead ranks and drops individual query heads directly, leaving
+    # the single shared KV head -- and both its own K/V producer weights --
+    # completely untouched. Both ports must now agree byte-for-byte.
+    K, H, KVH, D, Out = 32, 8, 1, 8, 16
+    model, cfg = _decomposed_gqa_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=201)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
     pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
-    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
     onnx.checker.check_model(pruned_cpp)
     onnx.checker.check_model(pruned_py)
-    assert pruned_cpp.SerializeToString() == model.SerializeToString()
-    assert pruned_py.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned_cpp)
+    q_keep_count = max(1, H - round(H * 0.5))
+    assert q_keep_count < H
+    assert wq_new.shape[1] == q_keep_count * D
+    # K/V (and their own biases) are completely untouched by the MQA fast
+    # path -- byte-for-byte identical to the pre-pruning tensors.
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+
+    keep_q_heads = _oracle_keep_query_heads(cfg["wq"], D, H, q_keep_count)
+    q_idx = _head_idx(keep_q_heads, D)
+    np.testing.assert_array_equal(wq_new, cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(wo_new, cfg["wout"][q_idx, :])
+
+    oracle, _ = _decomposed_gqa_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=201,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"],
+        bv=cfg["bv"],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_decomposed_mqa_pruning_zero_sparsity_is_a_no_op():
+    model, _ = _decomposed_gqa_model(K=32, H=8, KVH=1, D=8, Out=16, seed=203)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+# --- Packed-QKV-then-Split producer, decomposed shape --------------------
+#
+# Q's/K's/V's own raw projection output all trace back to ONE combined
+# MatMul/vanilla-Gemm projection (optionally biased) whose wide
+# `[..., nq+nk+nv]` output is split, by a plain `Split(axis=-1)` node, into
+# exactly three column ranges in Q-then-K-then-V order -- mirrors
+# pruning.py's own `_match_decomposed_packed_qkv_producer`/
+# `_match_packed_qkv_split` (see MatchDecomposedPackedQkvProducer's own
+# comment in structured_pruning_entry.cpp for the exact topology).
+
+
+def _decomposed_packed_qkv_model(
+    K=32,
+    H=4,
+    KVH=2,
+    D=8,
+    Dv=None,
+    Out=16,
+    batch=1,
+    seq=4,
+    seed=0,
+    bias=True,
+    with_flatten_reshape=False,
+):
+    """Builds the same decomposed-attention graph `_decomposed_gqa_model`
+    does, EXCEPT Q's/K's/V's raw projections are produced by ONE packed
+    MatMul/Gemm projection feeding a `Split(axis=-1)` node into
+    Q-then-K-then-V column ranges, rather than three independent
+    producers -- the shape MatchDecomposedPackedQkvProducer recognizes.
+
+    `with_flatten_reshape=True` additionally inserts a pass-through
+    `Reshape` between the packed projection and the `Split` -- the real
+    `fuse_matmul_add_bias_into_gemm`-produced artifact
+    MatchDecomposedPackedQkvProducer's own one-hop resolution handles (see
+    that function's own comment).
+    """
+    if Dv is None:
+        Dv = D
+    rng = np.random.default_rng(seed)
+    Nq, Nk, Nv = H * D, KVH * D, KVH * Dv
+    N = Nq + Nk + Nv
+    w = rng.standard_normal((K, N)).astype(np.float32)
+    wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+
+    def _i64(arr, name):
+        return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    initializer = [_f32(w, "W"), _f32(wout, "Wout")]
+    initializer.append(_i64([batch * seq, K], "XFlatShape"))
+    initializer.append(_i64([Nq, Nk, Nv], "SplitSizes"))
+    lines = ["xf = Reshape(X, XFlatShape)"]
+
+    b = None
+    bout = None
+    if bias:
+        b = rng.standard_normal((N,)).astype(np.float32)
+        bout = rng.standard_normal((Out,)).astype(np.float32)
+        initializer += [_f32(b, "B"), _f32(bout, "Bout")]
+        proj_op, o_op = "Gemm(xf, W, B)", "Gemm(ctx2, Wout, Bout)"
+    else:
+        proj_op, o_op = "MatMul(xf, W)", "MatMul(ctx2, Wout)"
+
+    lines.append("packed = " + proj_op)
+    split_src = "packed"
+    if with_flatten_reshape:
+        initializer.append(_i64([batch, seq, N], "PackedShape"))
+        lines.append("packed_r = Reshape(packed, PackedShape)")
+        split_src = "packed_r"
+    lines.append(f"q0, k0, v0 = Split <axis = -1> ({split_src}, SplitSizes)")
+
+    initializer.append(_i64([batch, seq, H, D], "Sq"))
+    lines.append("qr = Reshape(q0, Sq)")
+    lines.append("qt = Transpose<perm=[0,2,1,3]>(qr)")
+
+    kv_shape_name = "Skv" if Dv == D else None
+    if kv_shape_name:
+        initializer.append(_i64([batch, seq, KVH, D], kv_shape_name))
+        sk_name = sv_name = kv_shape_name
+    else:
+        initializer.append(_i64([batch, seq, KVH, D], "Sk"))
+        initializer.append(_i64([batch, seq, KVH, Dv], "Sv"))
+        sk_name, sv_name = "Sk", "Sv"
+    lines.append(f"kr = Reshape(k0, {sk_name})")
+    lines.append(f"vr = Reshape(v0, {sv_name})")
+
+    n_rep = H // KVH
+    needs_repeat_kv = KVH < H
+    if needs_repeat_kv:
+        assert H % KVH == 0
+        initializer.append(_i64([2], "Ax2"))
+        initializer.append(_i64([batch, KVH, n_rep, seq, D], "KExpandShape"))
+        initializer.append(_i64([batch, H, seq, D], "KMergeShape"))
+        initializer.append(_i64([batch, KVH, n_rep, seq, Dv], "VExpandShape"))
+        initializer.append(_i64([batch, H, seq, Dv], "VMergeShape"))
+        lines.append("kt0 = Transpose<perm=[0,2,1,3]>(kr)")
+        lines += [
+            "ku = Unsqueeze(kt0, Ax2)",
+            "ke = Expand(ku, KExpandShape)",
+            "kre = Reshape(ke, KMergeShape)",
+            "kt = Transpose<perm=[0,1,3,2]>(kre)",
+        ]
+        lines += [
+            "vt0 = Transpose<perm=[0,2,1,3]>(vr)",
+            "vu = Unsqueeze(vt0, Ax2)",
+            "ve = Expand(vu, VExpandShape)",
+            "vt = Reshape(ve, VMergeShape)",
+        ]
+    else:
+        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
+        lines.append("vt = Transpose<perm=[0,2,1,3]>(vr)")
+
+    initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
+    lines += ["qk = MatMul(qt, kt)", "scaled = Mul(qk, Scale)"]
+    lines.append("attn = Softmax<axis=-1>(scaled)")
+    lines.append("ctx0 = MatMul(attn, vt)")
+    lines.append("ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)")
+
+    initializer.append(_i64([batch * seq, H * Dv], "OutShape"))
+    initializer.append(_i64([batch, seq, Out], "YShape"))
+    lines.append("ctx2 = Reshape(ctx1, OutShape)")
+    lines.append("y0 = " + o_op)
+    lines.append("Y = Reshape(y0, YShape)")
+
+    body_lines = "\n          ".join(lines)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {body_lines}
+        }}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Dv=Dv,
+        Out=Out,
+        batch=batch,
+        seq=seq,
+        w=w,
+        wout=wout,
+        b=b,
+        bout=bout,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+    )
+
+
+def test_cpp_decomposed_packed_qkv_pruning_matches_python_reference_exactly():
+    # Q's/K's/V's "own weight" is really one shared packed tensor here,
+    # sliced once by a combined index set, with the `Split`'s own
+    # split-sizes constant shrunk to match -- mirrors pruning.py's own
+    # `_apply_one_decomposed_gqa_chain` packed branch exactly (see
+    # ApplyOneDecomposedGqaChain's own comment). Genuine GQA (KVH < H), so
+    # no MQA fast path involved -- isolates the packed-weight column-index
+    # arithmetic on its own.
+    K, H, KVH, D, Out = 32, 8, 2, 8, 16
+    model, cfg = _decomposed_packed_qkv_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=11, bias=True
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    Nq, Nk = cfg["Nq"], cfg["Nk"]
+    w, b = cfg["w"], cfg["b"]
+    wq, wk, wv = w[:, :Nq], w[:, Nq : Nq + Nk], w[:, Nq + Nk :]
+    bq, bk, bv = b[:Nq], b[Nq : Nq + Nk], b[Nq + Nk :]
+
+    group_size = H // KVH
+    new_kv = max(1, KVH - round(KVH * 0.5))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, new_kv)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    expected_w = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    expected_b = np.concatenate([bq[q_idx], bk[kv_idx], bv[kv_idx]])
+    np.testing.assert_array_equal(inits["W"], expected_w)
+    np.testing.assert_array_equal(inits["B"], expected_b)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+    oracle, _ = _decomposed_gqa_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=bq[q_idx],
+        bk=bk[kv_idx],
+        bv=bv[kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_decomposed_packed_qkv_pruning_through_flatten_reshape_matches_python():
+    # The genuinely different, ALSO real export artifact
+    # MatchDecomposedPackedQkvProducer's own one-hop resolution handles: a
+    # pass-through `Reshape` sitting directly between the packed
+    # MatMul/Gemm projection and the `Split` node (onnxsim's own
+    # `fuse_matmul_add_bias_into_gemm` optimizer pass flattening a packed
+    # projection's rank-3 `MatMul`/`Add` into a rank-2 `Gemm`, then
+    # reshaping back to rank-3 since `Split` isn't a `Reshape` it can
+    # trivially absorb).
+    K, H, KVH, D, Out = 32, 4, 2, 8, 16
+    model, cfg = _decomposed_packed_qkv_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=17,
+        bias=False,
+        with_flatten_reshape=True,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    # The pass-through Reshape's own target shape's last entry (the packed
+    # weight's own real output width) must shrink in lock-step with the
+    # packed weight's own combined slice.
+    reshape = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "Reshape" and n.output and n.output[0] == "packed_r"
+    )
+    shape_init = next(
+        t for t in pruned_cpp.graph.initializer if t.name == reshape.input[1]
+    )
+    new_kv = max(1, KVH - round(KVH * 0.5))
+    group_size = H // KVH
+    new_num_heads = new_kv * group_size
+    expected_last = new_num_heads * D + 2 * new_kv * D
+    assert onnx.numpy_helper.to_array(shape_init)[-1] == expected_last
+
+
+def test_cpp_decomposed_packed_qkv_pruning_zero_sparsity_is_a_no_op():
+    model, _ = _decomposed_packed_qkv_model(
+        K=32, H=8, KVH=2, D=8, Out=16, seed=23, bias=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
 
 
 # --- Decomposed attention with an `Einsum`-based QK^T/AV product -----------
