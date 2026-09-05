@@ -23,12 +23,16 @@ causal bias) before ``Softmax``, constant or genuinely dynamic, IS now
 recognized and pruned there too (``ResolveDecomposedQkRoot``'s own mask
 detection, ``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias`` -- this port's
 own analogue of pruning.py's ``_head_bias_input_is_safe``/
-``_slice_or_gather_head_bias`` for this one chain family), and an
-``Einsum``-based QK^T/AV product IS now recognized too, in place of a plain
-``MatMul``, for both products (see the dedicated ``Einsum`` tests in that same
-section) -- but this port remains DELIBERATELY NARROWER than pruning.py's own
-matcher in every other respect: no decomposed RoPE/Q-K-norm pass-through, no
-packed-QKV-then-``Split`` producer, and no true-MQA fast path. Every one of
+``_slice_or_gather_head_bias`` for this one chain family); an ``Einsum``-based
+QK^T/AV product IS now recognized too, in place of a plain ``MatMul``, for
+both products (see the dedicated ``Einsum`` tests in that same section); and
+decomposed RoPE and decomposed Q/K-norm pass-through ARE now recognized as
+well, in the narrower sub-scope structured_pruning_entry.cpp's own section
+comment documents (Q's own branch and K's separate-``perm=[0,1,3,2]`` swap
+branch only -- never K's combined-perm branch, never combined with the
+``Einsum`` case, never on V's own branch) -- but this port remains
+DELIBERATELY NARROWER than pruning.py's own matcher in every other respect:
+no packed-QKV-then-``Split`` producer, and no true-MQA fast path. Every one of
 those remaining shapes still declines to match in this C++ port (never
 mis-sliced), so ``apply_attention_head_pruning``/
 ``apply_attention_head_wanda_pruning`` remain pure-Python (NOT yet aliased to
@@ -2716,10 +2720,15 @@ def test_cpp_sparse_attention_pruning_num_layout_divisibility_declined_matches_p
 # recognized here (via `EinsumEquationIsBatchedMatmul`, a line-for-line port
 # of pruning.py's own `_einsum_equation_is_batched_matmul`) -- see
 # `_decomposed_einsum_gqa_model` and its own tests below, further down this
-# section. This port remains deliberately narrower than pruning.py's own
-# `_find_decomposed_gqa_chains` in every other respect: no decomposed
-# RoPE/Q-K-norm pass-through, no packed-QKV-then-`Split` producer, and no
-# true-MQA fast path (mirrors ApplyOneGqaChain's own identical,
+# section. Decomposed RoPE and decomposed Q/K-norm pass-through ARE now
+# recognized too (see the dedicated tests below and structured_pruning_entry.
+# cpp's own section comment for that narrower-still sub-scope: only Q's own
+# branch and K's separate-`perm=[0,1,3,2]` swap branch, never K's
+# combined-perm shape, an `Einsum` QK^T product, or V's own branch). This
+# port remains deliberately narrower than pruning.py's own
+# `_find_decomposed_gqa_chains` in every other respect: no
+# packed-QKV-then-`Split` producer, and no true-MQA fast path (mirrors
+# ApplyOneGqaChain's own identical,
 # already-accepted MQA gap) -- every one of those shapes simply declines to
 # match here (never mis-sliced) and is still fully handled by pruning.py's
 # own pure-Python `apply_attention_head_pruning`, so this tenth family is NOT
@@ -2752,21 +2761,29 @@ def _decomposed_gqa_model(
     share_kv_reshape_shape=True,
     extra_foreign_q_reshape_consumer=False,
     extra_foreign_repeat_kv_consumer=False,
+    rope=False,
+    qk_norm=False,
+    q_norm_weight=None,
+    k_norm_weight=None,
+    qk_norm_eps=1e-6,
 ):
     """Builds the decomposed-attention graph FindDecomposedGqaChains matches:
     ``Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to BHSD) -> [repeat_kv:
     Unsqueeze -> Expand -> Reshape, only when KVH < H] -> MatMul(Q, K^T) ->
     scale -> [+mask] -> Softmax -> MatMul(., V) -> Transpose(back) ->
     Reshape(back to hidden) -> Linear(O)`` -- mirrors
-    ``tests/test_pruning.py``'s own ``_decomposed_gqa_model`` (trimmed to
-    this port's own scope: no ``rope``/``qk_norm`` params at all, since this
-    C++ port never matches either -- see this section's own comment above).
+    ``tests/test_pruning.py``'s own ``_decomposed_gqa_model``.
 
     K's own dot-product transpose is built in whichever of the two real
     shapes a real export uses: the single, pre-composed ``perm=[0, 2, 3,
-    1]`` form when ``KVH == H`` (no ``repeat_kv``), or the ordinary separate
-    ``perm=[0, 2, 1, 3]`` head-split followed later by its own ``perm=[0, 1,
-    3, 2]`` swap when ``KVH < H`` (``repeat_kv`` present).
+    1]`` form when ``KVH == H`` (no ``repeat_kv``) and neither ``rope`` nor
+    ``qk_norm`` is set, or the ordinary separate ``perm=[0, 2, 1, 3]``
+    head-split followed later by its own ``perm=[0, 1, 3, 2]`` swap when
+    ``KVH < H`` (``repeat_kv`` present) or either of ``rope``/``qk_norm`` is
+    set (both hops' own nodes always break the head-split/swap-transpose
+    adjacency the combined form requires -- see
+    ``structured_pruning_entry.cpp``'s own comment above
+    ``DecomposedRopePassThrough``).
 
     ``masked`` (default ``False``) adds an additive mask before ``Softmax``
     -- this port's own matcher recognizes it exactly as pruning.py's own
@@ -2789,6 +2806,24 @@ def _decomposed_gqa_model(
     ``ApplyOneDecomposedGqaChain``'s own clone-rather-than-edit-in-place
     path (``RewriteDecomposedShapeDim``'s C++ mirror of pruning.py's own
     ``_rewrite_shape_dim``).
+
+    ``rope`` (default ``False``) additionally applies the decomposed
+    Llama/HF-style RoPE hop (``MatchDecomposedRopePassThrough`` in
+    ``structured_pruning_entry.cpp``, mirroring pruning.py's own
+    ``_match_decomposed_rope_pass_through``) to Q's and K's own branch, each
+    independently, right after that branch's own head-split ``Transpose``
+    and before (for K) ``repeat_kv``/the dot-product "swap" transpose -- two
+    new graph inputs, ``Cos``/``Sin`` (``[batch, seq, D]``), feed both hops
+    identically. ``qk_norm`` (default ``False``) additionally applies the
+    decomposed per-head Q/K-norm hop (``MatchDecomposedQkNormPassThrough``,
+    mirroring pruning.py's own ``_match_decomposed_qk_norm_pass_through``)
+    to Q's and K's own branch, each independently, sitting between that
+    branch's own head-split ``Reshape`` output and its own head-split
+    ``Transpose`` -- the opposite side of that ``Transpose`` from where
+    ``rope``'s own hop is rooted. ``q_norm_weight``/``k_norm_weight`` (each
+    ``[D]``, random when left ``None``) let a caller (an oracle rebuild)
+    pass the identical pre-pruning weight back in, since this hop's own
+    weight is never sliced.
     """
     if Dv is None:
         Dv = D
@@ -2802,12 +2837,69 @@ def _decomposed_gqa_model(
         wv = rng.standard_normal((K, Nv)).astype(np.float32)
     if wout is None:
         wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+    if qk_norm and q_norm_weight is None:
+        q_norm_weight = rng.standard_normal((D,)).astype(np.float32)
+    if qk_norm and k_norm_weight is None:
+        k_norm_weight = rng.standard_normal((D,)).astype(np.float32)
 
     def _i64(arr, name):
         return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
 
+    def _rope_lines(prefix, src, out_name):
+        # `x * cos + rotate_half(x) * sin`, HuggingFace's own fixed formula
+        # -- see structured_pruning_entry.cpp's own comment above
+        # `DecomposedRopePassThrough` for the exact confirmed shape this
+        # mirrors, node for node.
+        return [
+            f"{prefix}direct = Mul({src}, CosU)",
+            f"{prefix}x1 = Slice({src}, SliceStart0, SliceHalf, SliceAxis3, SliceStep1)",
+            f"{prefix}x2 = Slice({src}, SliceHalf, SliceEnd, SliceAxis3, SliceStep1)",
+            f"{prefix}neg = Neg({prefix}x2)",
+            f"{prefix}rot = Concat<axis=-1>({prefix}neg, {prefix}x1)",
+            f"{prefix}rotated = Mul({prefix}rot, SinU)",
+            f"{out_name} = Add({prefix}direct, {prefix}rotated)",
+        ]
+
+    def _qk_norm_lines(prefix, src, out_name, weight_name):
+        # `weight * (x * rsqrt(mean(x**2, axis=-1) + eps))` -- see
+        # structured_pruning_entry.cpp's own comment above
+        # `DecomposedQKNormPassThrough` for the exact confirmed shape this
+        # mirrors, node for node (a real export's own `Div(One, Sqrt(...))`
+        # reciprocal, never `Reciprocal` for this project's own torch/opset
+        # combination).
+        return [
+            f"{prefix}sq = Pow({src}, QKNormTwo)",
+            f"{prefix}var = ReduceMean<axes=[-1],keepdims=1>({prefix}sq)",
+            f"{prefix}var_eps = Add({prefix}var, QKNormEps)",
+            f"{prefix}std = Sqrt({prefix}var_eps)",
+            f"{prefix}inv_std = Div(QKNormOne, {prefix}std)",
+            f"{prefix}scaled = Mul({src}, {prefix}inv_std)",
+            f"{out_name} = Mul({weight_name}, {prefix}scaled)",
+        ]
+
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
     extra_inputs = ""
+
+    if rope:
+        assert D % 2 == 0
+        initializer += [
+            _i64([0], "SliceStart0"),
+            _i64([D // 2], "SliceHalf"),
+            _i64([D], "SliceEnd"),
+            _i64([3], "SliceAxis3"),
+            _i64([1], "SliceStep1"),
+            _i64([1], "Ax1"),
+        ]
+        extra_inputs += f", float[{batch},{seq},{D}] Cos, float[{batch},{seq},{D}] Sin"
+
+    if qk_norm:
+        initializer += [
+            _f32(np.array(2.0), "QKNormTwo"),
+            _f32(np.array(qk_norm_eps), "QKNormEps"),
+            _f32(np.array(1.0), "QKNormOne"),
+            _f32(q_norm_weight, "QNormWeight"),
+            _f32(k_norm_weight, "KNormWeight"),
+        ]
 
     # Gemm requires a rank-2 input -- flattening `X` to `[batch*seq, K]`
     # first, exactly the shape onnxsim's own `fuse_matmul_add_bias_into_gemm`
@@ -2817,6 +2909,8 @@ def _decomposed_gqa_model(
     # ``onnxruntime.InferenceSession`` regardless of ``bias``.
     initializer.append(_i64([batch * seq, K], "XFlatShape"))
     lines = ["xf = Reshape(X, XFlatShape)"]
+    if rope:
+        lines += ["CosU = Unsqueeze(Cos, Ax1)", "SinU = Unsqueeze(Sin, Ax1)"]
     q_op, k_op, v_op, o_op = (
         "MatMul(xf, Wq)",
         "MatMul(xf, Wk)",
@@ -2842,11 +2936,20 @@ def _decomposed_gqa_model(
         o_op = "Gemm(ctx2, Wout, Bout)"
 
     initializer.append(_i64([batch, seq, H, D], "Sq"))
+    q_transpose_src = "qr"
+    if qk_norm:
+        q_transpose_src = "qnout"
     lines += [
         "q0 = " + q_op,
         "qr = Reshape(q0, Sq)",
-        "qt = Transpose<perm=[0,2,1,3]>(qr)",
     ]
+    if qk_norm:
+        lines += _qk_norm_lines("qn", "qr", "qnout", "QNormWeight")
+    lines.append(
+        ("qt0" if rope else "qt") + f" = Transpose<perm=[0,2,1,3]>({q_transpose_src})"
+    )
+    if rope:
+        lines += _rope_lines("q", "qt0", "qt")
 
     if extra_foreign_q_reshape_consumer:
         # A second, wholly unrelated Reshape reading the SAME shape
@@ -2871,6 +2974,10 @@ def _decomposed_gqa_model(
 
     n_rep = H // KVH
     needs_repeat_kv = KVH < H
+    # RoPE/Q-K-norm each force the separate head-split-then-swap form for
+    # K's own dot-product transpose, even when `KVH == H` leaves no genuine
+    # `repeat_kv` to also force it -- see this function's own docstring.
+    needs_separate_k_transpose = needs_repeat_kv or rope or qk_norm
     if needs_repeat_kv:
         assert H % KVH == 0
         initializer.append(_i64([2], "Ax2"))
@@ -2878,25 +2985,44 @@ def _decomposed_gqa_model(
         initializer.append(_i64([batch, H, seq, D], "KMergeShape"))
         initializer.append(_i64([batch, KVH, n_rep, seq, Dv], "VExpandShape"))
         initializer.append(_i64([batch, H, seq, Dv], "VMergeShape"))
-        lines.append("kt0 = Transpose<perm=[0,2,1,3]>(kr)")
-        lines += [
-            "ku = Unsqueeze(kt0, Ax2)",
-            "ke = Expand(ku, KExpandShape)",
-            "kre = Reshape(ke, KMergeShape)",
-            "kt = Transpose<perm=[0,1,3,2]>(kre)",
-        ]
-        if extra_foreign_repeat_kv_consumer:
-            # A second, wholly unrelated Expand reading the SAME
-            # `KExpandShape` constant as K's own `repeat_kv` broadcast --
-            # simulates cross-layer CSE merging two textually-identical
-            # 5-D expand targets. A fresh size-[1] data operand (rather
-            # than reusing any real tensor) trivially broadcasts to any
-            # target shape, so this stays a valid, runnable (if unused)
-            # node.
-            initializer.append(
-                _f32(np.zeros((1,), dtype=np.float32), "ForeignExpandData")
-            )
-            lines.append("foreign_expand_out = Expand(ForeignExpandData, KExpandShape)")
+
+    if needs_separate_k_transpose:
+        k_headsplit_src = "kr"
+        if qk_norm:
+            lines += _qk_norm_lines("kn", "kr", "knout", "KNormWeight")
+            k_headsplit_src = "knout"
+        lines.append(f"kt0 = Transpose<perm=[0,2,1,3]>({k_headsplit_src})")
+        k_src = "kt0"
+        if rope:
+            lines += _rope_lines("k", "kt0", "krope")
+            k_src = "krope"
+        if needs_repeat_kv:
+            lines += [
+                f"ku = Unsqueeze({k_src}, Ax2)",
+                "ke = Expand(ku, KExpandShape)",
+                "kre = Reshape(ke, KMergeShape)",
+                "kt = Transpose<perm=[0,1,3,2]>(kre)",
+            ]
+            if extra_foreign_repeat_kv_consumer:
+                # A second, wholly unrelated Expand reading the SAME
+                # `KExpandShape` constant as K's own `repeat_kv` broadcast --
+                # simulates cross-layer CSE merging two textually-identical
+                # 5-D expand targets. A fresh size-[1] data operand (rather
+                # than reusing any real tensor) trivially broadcasts to any
+                # target shape, so this stays a valid, runnable (if unused)
+                # node.
+                initializer.append(
+                    _f32(np.zeros((1,), dtype=np.float32), "ForeignExpandData")
+                )
+                lines.append(
+                    "foreign_expand_out = Expand(ForeignExpandData, KExpandShape)"
+                )
+        else:
+            lines.append(f"kt = Transpose<perm=[0,1,3,2]>({k_src})")
+    else:
+        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
+
+    if needs_repeat_kv:
         lines += [
             "vt0 = Transpose<perm=[0,2,1,3]>(vr)",
             "vu = Unsqueeze(vt0, Ax2)",
@@ -2904,7 +3030,6 @@ def _decomposed_gqa_model(
             "vt = Reshape(ve, VMergeShape)",
         ]
     else:
-        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
         lines.append("vt = Transpose<perm=[0,2,1,3]>(vr)")
 
     initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
@@ -2968,6 +3093,9 @@ def _decomposed_gqa_model(
         bv=bv,
         bout=bout,
         mask=mask,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        qk_norm_eps=qk_norm_eps,
     )
 
 
@@ -3738,3 +3866,161 @@ def test_cpp_decomposed_einsum_plain_attention_pruning_alternate_equation_spelli
     (y_pruned,) = _run(pruned_cpp, {"X": x})
     (y_unpruned,) = _run(model_for_py, {"X": x})
     assert y_pruned.shape == y_unpruned.shape
+
+
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention -- RoPE / Q-K-norm pass-through
+# ---------------------------------------------------------------------------
+# `FindDecomposedGqaChains`/`ApplyOneDecomposedGqaChain` now also recognize
+# the two "pass through an intermediate op between the Q/K head-split and the
+# QK^T matmul" hops pruning.py's own `_find_decomposed_gqa_chains` matches:
+# decomposed RoPE (`MatchDecomposedRopePassThrough`, mirroring pruning.py's
+# own `_match_decomposed_rope_pass_through`/`_DecomposedRopePassThrough`) and
+# decomposed per-head Q/K-norm (`MatchDecomposedQkNormPassThrough`, mirroring
+# pruning.py's own `_match_decomposed_qk_norm_pass_through`/
+# `_DecomposedQKNormPassThrough`) -- see structured_pruning_entry.cpp's own
+# "Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning" section
+# comment for the exact (still narrower-than-pruning.py) scope: both hops are
+# only ever tried for Q's own branch and K's separate-`perm=[0,1,3,2]` swap
+# branch, never for K's combined-`perm=[0,2,3,1]` shape or an `Einsum`-based
+# QK^T product (see the dedicated `Einsum` section below -- this port DOES
+# recognize `Einsum`-based QK^T/AV products, just never combined with either
+# hop here), and Q/K-norm is never tried on V's own branch. Neither hop's own
+# matched nodes are ever rewritten -- both are recognized purely so the
+# surrounding chain still matches and prunes correctly, exactly mirroring
+# pruning.py's own "passed through untouched" treatment.
+
+
+def test_cpp_decomposed_gqa_rope_pruning_matches_oracle_and_python_reference_exactly():
+    model, cfg = _decomposed_gqa_model(K=32, H=8, KVH=2, D=8, Out=16, seed=1, rope=True)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    rng = np.random.default_rng(7)
+    cos = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["D"])).astype(np.float32)
+    sin = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["D"])).astype(np.float32)
+
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    # RoPE pass-through is fully within this C++ port's own scope for this
+    # shape (separate-transpose K, no mask/Einsum/packed-QKV, genuine GQA so
+    # no MQA fast-path gap) -- both ports must agree byte-for-byte.
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned_cpp)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    np.testing.assert_array_equal(wq_new, cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(wk_new, cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(wv_new, cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(wo_new, cfg["wout"][q_idx, :])
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        rope=True,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+    rng2 = np.random.default_rng(2)
+    x = rng2.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    feed = {"X": x, "Cos": cos, "Sin": sin}
+    (y_pruned,) = _run(pruned_cpp, feed)
+    (y_oracle,) = _run(oracle, feed)
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_decomposed_gqa_qk_norm_pruning_matches_oracle_and_python_reference_exactly():
+    # `qk_norm=True`, `rope=False` -- exercises the Q/K-norm pass-through in
+    # isolation (KVH < H already forces K's own separate-transpose form, so
+    # this doesn't rely on `qk_norm` alone to force it).
+    model, cfg = _decomposed_gqa_model(
+        K=32, H=8, KVH=2, D=8, Out=16, seed=1, qk_norm=True
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned_cpp)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    np.testing.assert_array_equal(wq_new, cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(wk_new, cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(wv_new, cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(wo_new, cfg["wout"][q_idx, :])
+
+    # The Q/K-norm hop's own `weight` is never sliced -- whole-head/KV-group
+    # pruning never touches `head_size`, the axis it normalizes over (see
+    # `DecomposedQKNormPassThrough`'s own comment). Confirm it survives
+    # byte-for-byte.
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["QNormWeight"]), cfg["q_norm_weight"]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["KNormWeight"]), cfg["k_norm_weight"]
+    )
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        qk_norm=True,
+        q_norm_weight=cfg["q_norm_weight"],
+        k_norm_weight=cfg["k_norm_weight"],
+        qk_norm_eps=cfg["qk_norm_eps"],
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
