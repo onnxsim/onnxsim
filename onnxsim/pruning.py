@@ -15539,11 +15539,248 @@ def _slice_consumer_weight_qdq_block(
         )
 
 
+# -- Quantized (int32) bias -------------------------------------------------
+#
+# A real static QDQ quantization run (``onnxruntime.quantization
+# .quantize_static(..., quant_format=QuantFormat.QDQ)``) NEVER leaves a
+# biased Conv/Gemm's own bias as a literal float initializer, unlike this
+# repo's own internal ``onnxsim.calibration.quantize_static`` (weight-only,
+# never touching activations or biases) -- it quantizes the bias too,
+# emitting ``DequantizeLinear(bias_quantized, bias_scale, bias_zero_point)
+# -> bias`` (``bias_scale = input_scale * weight_scale``, ``bias_zero_point``
+# always 0, but represented as an ordinary explicit ``DequantizeLinear`` node
+# like any other quantized tensor, not a special "known zero" convention),
+# confirmed empirically via a real ``quantize_static(per_channel=True)`` round
+# trip on a biased two-layer Conv model (see this repo's own
+# ``test_qdq_structured_pruning_conv_producer_with_quantized_bias_matches_oracle``-
+# style tests). Before this section, :func:`_match_conv_qdq`/
+# :func:`_match_conv_transpose_qdq`/:func:`_match_matmul_qdq` all did a plain
+# ``initializer_map.get(bias_name)`` lookup requiring a literal float
+# initializer, declining (``None``) the WHOLE node match -- not just the
+# bias -- whenever it wasn't one; since a biased layer is the overwhelmingly
+# common case for any real quantized model, this meant essentially no real
+# ORT-quantized biased Conv/Gemm ever matched at all.
+#
+# :class:`_QDQBias`/:func:`_match_dequantize_linear_bias`/:class:`_BiasRef`/
+# :func:`_resolve_bias_ref` mirror :class:`_QDQWeight`/
+# :func:`_match_dequantize_linear_weight`/:class:`_WeightRef`/
+# :func:`_resolve_weight_ref` exactly, just for a rank-1 (``[n_channels]``)
+# INT32 tensor rather than a rank-4/2 INT8/UINT8 one -- a bias is always
+# per-OUTPUT-channel (there is no reduction/input-channel role for a bias at
+# all, since it is only ever read by the producer side of a chain), so
+# pruning it is *simpler* than the weight case, not just differently shaped:
+# it is always the "producer" co-slicing story (:func:`_slice_bias_qdq`
+# mirrors :func:`_slice_producer_weight_qdq`'s own per-channel branch
+# exactly -- int32 codes AND, when per-channel, scale/zero-point all sliced
+# together by the same `keep`; a per-tensor bias only slices the int32
+# codes), never the consumer one.
+
+
+@dataclass(frozen=True)
+class _QDQBias:
+    """A Conv/ConvTranspose/Gemm bias fed through a ``DequantizeLinear`` node
+    from a constant INT32 initializer -- the shape a real ORT static QDQ
+    quantization run emits for EVERY biased layer it quantizes, matched by
+    :func:`_match_dequantize_linear_bias`. There is no separate `axis` field
+    to carry, unlike :class:`_QDQWeight`: a rank-1 tensor has only one axis
+    to be per-channel along (0), always this bias's own -- and its owning
+    layer's own weight's own -- output-channel axis.
+    """
+
+    dq_node: onnx.NodeProto
+    q_init: onnx.TensorProto
+    scale_init: onnx.TensorProto
+    zero_point_init: Optional[onnx.TensorProto]
+    per_channel: bool
+
+
+def _match_dequantize_linear_bias(
+    bias_name: str,
+    n_channels: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_QDQBias]:
+    """The bias analogue of :func:`_match_dequantize_linear_weight`: if
+    `bias_name` is fed by a ``DequantizeLinear`` node from a constant INT32
+    initializer of shape ``[n_channels]``, with a constant FLOAT32 scale
+    that is either a scalar (per-tensor) or a 1-D vector of length
+    `n_channels` (per-channel, on this bias's own -- only -- axis, 0) with a
+    matching ``axis`` attribute, returns the match. This is exactly the
+    shape a real ``onnxruntime.quantization.quantize_static(...,
+    quant_format=QuantFormat.QDQ)`` run emits for a biased Conv/Gemm's own
+    bias (``bias_scale = input_scale * weight_scale``, per-channel whenever
+    the layer's own weight is; `bias_zero_point` always 0) -- see this
+    section's own top-of-section comment for the empirical confirmation and
+    the bug this fixes.
+
+    Declines (``None``) whenever anything is ambiguous rather than guessing,
+    mirroring :func:`_match_dequantize_linear_weight`'s own bar exactly: a
+    non-constant ``x``/``x_scale``/``x_zero_point``, a dtype other than
+    INT32 for the bias (or a ``zero_point`` not matching it), a shape other
+    than exactly ``[n_channels]``, a scale shaped for anything other than
+    scalar/``[n_channels]``, a per-channel scale on any axis other than 0
+    (the only axis a rank-1 tensor has), a non-default ``block_size``/
+    ``output_dtype`` attribute, a ``DequantizeLinear`` output read by more
+    than one consumer, or any of ``x``/``x_scale``/``x_zero_point`` read by
+    more than one node (a shared/tied quantized tensor this bias's own
+    slicing would otherwise silently corrupt for that other reader).
+    """
+    dq = dq_of.get(bias_name)
+    if dq is None or dq.op_type != "DequantizeLinear" or len(dq.output) != 1:
+        return None
+    if len(consumers_of.get(bias_name, [])) != 1:
+        return None  # DQ output must feed only this one bias use
+    if len(dq.input) not in (2, 3):
+        return None
+    q_name, scale_name = dq.input[0], dq.input[1]
+    zp_name = dq.input[2] if len(dq.input) == 3 and dq.input[2] else None
+    if not q_name or not scale_name:
+        return None
+
+    q_init = initializer_map.get(q_name)
+    scale_init = initializer_map.get(scale_name)
+    if q_init is None or scale_init is None:
+        return None  # non-constant q/scale -- can't safely slice it
+    if q_init.data_type != onnx.TensorProto.INT32:
+        return None  # the dtype a real static QDQ quantizer always emits
+        # for a quantized bias -- see this section's own top comment
+    if scale_init.data_type != onnx.TensorProto.FLOAT:
+        return None
+    if list(q_init.dims) != [n_channels]:
+        return None
+
+    zp_init = None
+    if zp_name is not None:
+        zp_init = initializer_map.get(zp_name)
+        if zp_init is None or zp_init.data_type != q_init.data_type:
+            return None  # schema: x_zero_point and x must have the same type
+        if list(zp_init.dims) != list(scale_init.dims):
+            return None  # schema: x_scale and x_zero_point must have the
+            # same shape
+
+    for nm in (q_name, scale_name) + ((zp_name,) if zp_name else ()):
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied quantized tensor -- another node
+            # reads it too, so it can't be sliced only for this one
+
+    for attr in dq.attribute:
+        if attr.name == "block_size" and attr.i != 0:
+            return None  # blocked quantization -- not the shape a bias is
+            # ever quantized with, see this section's own top comment
+        if attr.name == "output_dtype" and attr.i != 0:
+            return None  # non-default output dtype -- out of scope
+
+    axis = 1  # DequantizeLinear's own schema default
+    for attr in dq.attribute:
+        if attr.name == "axis":
+            axis = attr.i
+            break
+    if axis < 0:
+        axis += 1  # rank 1
+
+    scale_dims = list(scale_init.dims)
+    numel = int(np.prod(scale_dims)) if scale_dims else 1
+    if numel == 1:
+        per_channel = False  # per-tensor: a scalar broadcasts to every
+        # channel identically regardless
+    elif len(scale_dims) == 1 and scale_dims[0] == n_channels:
+        if axis != 0:
+            return None  # per-channel scale on the only axis a rank-1
+            # tensor has must be axis 0 -- decline rather than guess
+        per_channel = True
+    else:
+        return None  # anything else -- out of scope
+
+    return _QDQBias(
+        dq_node=dq,
+        q_init=q_init,
+        scale_init=scale_init,
+        zero_point_init=zp_init,
+        per_channel=per_channel,
+    )
+
+
+@dataclass(frozen=True)
+class _BiasRef:
+    """A Conv/ConvTranspose/Gemm bias resolved from one of the two sources
+    :func:`_resolve_bias_ref` distinguishes: a direct float32/float16/
+    bfloat16 initializer (`float_init`, what every matcher required before
+    this section existed) or a QDQ ``DequantizeLinear``-fed INT32 one
+    (`qdq`, matched by :func:`_match_dequantize_linear_bias`). Exactly one
+    of the two is set. Mirrors :class:`_WeightRef` exactly, minus the
+    blockwise case -- a real bias is never blockwise-quantized (see this
+    section's own top comment).
+    """
+
+    float_init: Optional[onnx.TensorProto] = None
+    qdq: Optional[_QDQBias] = None
+
+
+def _resolve_bias_ref(
+    bias_name: str,
+    n_channels: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_BiasRef]:
+    """Resolves `bias_name` to a :class:`_BiasRef`, trying a direct
+    float32/float16/bfloat16 initializer first (exactly the check every
+    matcher already made before this section existed), then a QDQ
+    ``DequantizeLinear``-fed INT32 one (:func:`_match_dequantize_linear_bias`)
+    -- the bias analogue of :func:`_resolve_weight_ref`. ``None`` when
+    neither matches (a non-constant bias, or one of an unrecognized dtype).
+    """
+    b_init = initializer_map.get(bias_name)
+    if b_init is not None:
+        if _is_supported_float_dtype(b_init.data_type):
+            return _BiasRef(float_init=b_init)
+        return None  # non-constant-shaped/unsupported-dtype bias -- can't
+        # safely slice it, exactly the pre-existing float-only bar
+    qdq = _match_dequantize_linear_bias(
+        bias_name, n_channels, initializer_map, dq_of, consumers_of
+    )
+    if qdq is not None:
+        return _BiasRef(qdq=qdq)
+    return None
+
+
+def _slice_bias_qdq(ref: _BiasRef, keep: np.ndarray) -> None:
+    """Slices `ref`'s own channels to `keep` (ascending indices) -- always
+    the producer role (a bias has no consumer/reduction-axis role at all).
+    For a plain float bias, delegates to :func:`_slice_last_axis` exactly as
+    before this section existed. For a QDQ (INT32) bias, mirrors
+    :func:`_slice_producer_weight_qdq`'s own per-channel weight handling:
+    the int32 codes AND (when `per_channel`) the scale/zero-point are all
+    sliced together by the same `keep`, in lockstep; a per-tensor bias only
+    slices the int32 codes -- its scalar scale/zero-point apply uniformly to
+    every channel regardless of how many survive.
+    """
+    if ref.float_init is not None:
+        _slice_last_axis(ref.float_init, keep)
+        return
+    qdq = ref.qdq
+    assert qdq is not None
+    q = onnx.numpy_helper.to_array(qdq.q_init)
+    q_new = q[keep]
+    qdq.q_init.CopyFrom(onnx.numpy_helper.from_array(q_new, name=qdq.q_init.name))
+    if qdq.per_channel:
+        scale = onnx.numpy_helper.to_array(qdq.scale_init)
+        qdq.scale_init.CopyFrom(
+            onnx.numpy_helper.from_array(scale[keep], name=qdq.scale_init.name)
+        )
+        if qdq.zero_point_init is not None:
+            zp = onnx.numpy_helper.to_array(qdq.zero_point_init)
+            qdq.zero_point_init.CopyFrom(
+                onnx.numpy_helper.from_array(zp[keep], name=qdq.zero_point_init.name)
+            )
+
+
 @dataclass(frozen=True)
 class _QDQProducer:
     node: onnx.NodeProto
     ref: _WeightRef
-    bias: Optional[str]
+    bias: Optional[_BiasRef]
     weight_transposed: bool
     is_conv: bool
     # Activation nodes between this producer's raw output and the point it
@@ -15599,13 +15836,16 @@ def _match_conv_qdq(
     initializer_map: Dict[str, onnx.TensorProto],
     dq_of: Dict[str, onnx.NodeProto],
     consumers_of: Dict[str, List[onnx.NodeProto]],
-) -> Optional[Tuple[_WeightRef, Optional[str], int, int]]:
+) -> Optional[Tuple[_WeightRef, Optional[_BiasRef], int, int]]:
     """If `node` is an ordinary (``group=1``) 2-D ``Conv`` whose weight
     resolves (:func:`_resolve_weight_ref`) to either a direct float
-    initializer or a QDQ one, returns ``(ref, bias_name_or_None,
+    initializer or a QDQ one, returns ``(ref, bias_ref_or_None,
     out_channels, in_channels)``. A grouped or depthwise Conv is never
     matched here -- see this section's own top-of-section comment for why
-    that composition is out of scope.
+    that composition is out of scope. `bias_ref` (:func:`_resolve_bias_ref`)
+    is either a direct float initializer or a QDQ ``DequantizeLinear``-fed
+    INT32 one -- see this section's own "Quantized (int32) bias" comment for
+    why the latter is essential for matching a real ORT-quantized model.
     """
     if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
@@ -15617,13 +15857,15 @@ def _match_conv_qdq(
         return None
     dims = _weight_ref_dims(ref)
     out_channels, in_channels = dims[0], dims[1]
-    bias_name = None
+    bias_ref = None
     if len(node.input) == 3 and node.input[2]:
-        bias_name = node.input[2]
-        b_init = initializer_map.get(bias_name)
-        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
-            return None  # non-constant bias -- can't safely slice it
-    return ref, bias_name, out_channels, in_channels
+        bias_ref = _resolve_bias_ref(
+            node.input[2], out_channels, initializer_map, dq_of, consumers_of
+        )
+        if bias_ref is None:
+            return None  # non-constant, or unrecognized-QDQ, bias -- can't
+            # safely slice it
+    return ref, bias_ref, out_channels, in_channels
 
 
 def _match_conv_transpose_qdq(
@@ -15631,7 +15873,7 @@ def _match_conv_transpose_qdq(
     initializer_map: Dict[str, onnx.TensorProto],
     dq_of: Dict[str, onnx.NodeProto],
     consumers_of: Dict[str, List[onnx.NodeProto]],
-) -> Optional[Tuple[_WeightRef, Optional[str], int, int]]:
+) -> Optional[Tuple[_WeightRef, Optional[_BiasRef], int, int]]:
     """The ``ConvTranspose`` analogue of :func:`_match_conv_qdq` -- see this
     section's own top-of-section "ConvTranspose" paragraph for the
     ``onnxruntime.quantization`` registry/``quantize_static`` round-trip
@@ -15671,13 +15913,15 @@ def _match_conv_transpose_qdq(
         return None
     dims = _weight_ref_dims(ref)
     in_channels, out_channels = dims[0], dims[1]
-    bias_name = None
+    bias_ref = None
     if len(node.input) == 3 and node.input[2]:
-        bias_name = node.input[2]
-        b_init = initializer_map.get(bias_name)
-        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
-            return None  # non-constant bias -- can't safely slice it
-    return ref, bias_name, out_channels, in_channels
+        bias_ref = _resolve_bias_ref(
+            node.input[2], out_channels, initializer_map, dq_of, consumers_of
+        )
+        if bias_ref is None:
+            return None  # non-constant, or unrecognized-QDQ, bias -- can't
+            # safely slice it
+    return ref, bias_ref, out_channels, in_channels
 
 
 def _match_matmul_qdq(
@@ -15685,11 +15929,13 @@ def _match_matmul_qdq(
     initializer_map: Dict[str, onnx.TensorProto],
     dq_of: Dict[str, onnx.NodeProto],
     consumers_of: Dict[str, List[onnx.NodeProto]],
-) -> Optional[Tuple[str, _WeightRef, bool, Optional[str], int, int]]:
+) -> Optional[Tuple[str, _WeightRef, bool, Optional[_BiasRef], int, int]]:
     """If `node` is a MatMul/vanilla-Gemm whose weight resolves
     (:func:`_resolve_weight_ref`) to either a direct float initializer or a
-    QDQ one, returns ``(x_name, ref, weight_transposed, bias_name_or_None,
-    out_channels, in_channels)``.
+    QDQ one, returns ``(x_name, ref, weight_transposed, bias_ref_or_None,
+    out_channels, in_channels)``. `bias_ref` (:func:`_resolve_bias_ref`) is
+    either a direct float initializer or a QDQ ``DequantizeLinear``-fed
+    INT32 one.
     """
     match = _match_matmul_like(node)
     if match is None:
@@ -15701,17 +15947,127 @@ def _match_matmul_qdq(
         return None
     dims = _weight_ref_dims(ref)
     out_channels, in_channels = dims[axis], dims[1 - axis]
-    bias_name = None
+    bias_ref = None
     if (
         node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")
         and len(node.input) == 3
         and node.input[2]
     ):
-        bias_name = node.input[2]
-        b_init = initializer_map.get(bias_name)
-        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
-            return None  # non-constant bias -- can't safely slice it
-    return x_name, ref, weight_transposed, bias_name, out_channels, in_channels
+        bias_ref = _resolve_bias_ref(
+            node.input[2], out_channels, initializer_map, dq_of, consumers_of
+        )
+        if bias_ref is None:
+            return None  # non-constant, or unrecognized-QDQ, bias -- can't
+            # safely slice it
+    return x_name, ref, weight_transposed, bias_ref, out_channels, in_channels
+
+
+def _match_qdq_requant_pass_through(
+    q_node: onnx.NodeProto,
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[onnx.NodeProto, str]]:
+    """Recognizes ``cur -> QuantizeLinear(cur, scale, zero_point) ->
+    DequantizeLinear(., scale_matching, zero_point_matching)`` -- the
+    standard "full" QDQ format's own activation-requantization round trip,
+    which a real ORT static QDQ quantizer
+    (``onnxruntime.quantization.quantize_static(...,
+    quant_format=QuantFormat.QDQ)``) inserts on EVERY quantized op's own
+    output activation, not just at weight boundaries (confirmed empirically:
+    the ``h0a`` activation between two biased ``Conv`` layers in a real
+    ``quantize_static(per_channel=True)`` round trip comes out exactly as
+    ``QuantizeLinear(h0a, h0a_scale, h0a_zero_point) -> DequantizeLinear(.,
+    h0a_scale, h0a_zero_point)``, the SAME `h0a_scale`/`h0a_zero_point`
+    names feeding both nodes). Before this hop existed,
+    :func:`_walk_to_consumer_qdq` had no case recognizing this shape at all
+    -- an unrecognized ``QuantizeLinear`` mid-walk fell to this walker's own
+    ordinary "decline anything unrecognized" bar -- so the walk could never
+    step from one quantized op to the next through a real model's own
+    activation boundary, and every multi-layer real-quantized chain
+    (Conv->ReLU->Conv and similar) failed to match at all.
+
+    Treated as a transparent, value-preserving pass-through exactly like an
+    ordinary `_UNARY_PASS_THROUGH` activation -- both `q_node` and the
+    paired ``DequantizeLinear`` are folded into `chain_ops` with
+    `const_name=None` (nothing to slice) by the caller, and the walk simply
+    continues past them. This is only sound because the SAME `scale`/
+    `zero_point` tensor NAMES feed both nodes (a genuine round trip,
+    ``dequantize(quantize(cur)) == cur`` up to quantization error, not two
+    independently-chosen quantization points) AND both are per-tensor
+    (scalar) -- the shape a real quantizer always emits for an ACTIVATION
+    (unlike a WEIGHT, which :func:`_match_dequantize_linear_weight` already
+    handles separately and does allow per-channel): a per-channel
+    requantization scale/zero-point indexed along the very channel axis
+    this module prunes would need co-slicing this hop never performs (an
+    activation tensor has no owning initializer of its own to slice, unlike
+    a weight/bias), so that shape is declined rather than guessed at, per
+    this module's own "decline anything ambiguous" convention.
+
+    Returns ``(dq_node, dq_node.output[0])`` on a match. ``None`` whenever
+    anything about the shape isn't exactly this -- a ``QuantizeLinear`` not
+    reading `cur` as ``x``, one read by more than one consumer or feeding a
+    graph output, a consumer other than a lone ``DequantizeLinear``,
+    mismatched `scale`/`zero_point` names between the two, a per-channel
+    (non-scalar) `scale`/`zero_point`, or the ``DequantizeLinear``'s own
+    output feeding a graph output.
+    """
+    if (
+        q_node.domain != ""
+        or not q_node.input
+        or q_node.input[0] != cur
+        or len(q_node.input) not in (2, 3)
+        or len(q_node.output) != 1
+    ):
+        return None
+    q_out = q_node.output[0]
+    if q_out in graph_outputs:
+        return None
+    dq_candidates = consumers_of.get(q_out, [])
+    if len(dq_candidates) != 1:
+        return None
+    dq_node = dq_candidates[0]
+    if (
+        dq_node.op_type != "DequantizeLinear"
+        or dq_node.domain != ""
+        or not dq_node.input
+        or dq_node.input[0] != q_out
+        or len(dq_node.input) not in (2, 3)
+        or len(dq_node.output) != 1
+    ):
+        return None
+
+    q_scale = q_node.input[1]
+    q_zp = q_node.input[2] if len(q_node.input) == 3 and q_node.input[2] else None
+    dq_scale = dq_node.input[1]
+    dq_zp = dq_node.input[2] if len(dq_node.input) == 3 and dq_node.input[2] else None
+    if not q_scale or q_scale != dq_scale or q_zp != dq_zp:
+        return None  # not the same scale/zero_point feeding both -- not a
+        # value-preserving round trip
+
+    scale_init = initializer_map.get(q_scale)
+    if scale_init is None:
+        return None  # non-constant scale -- can't safely recognize this as
+        # a fixed round trip
+    scale_dims = list(scale_init.dims)
+    if (int(np.prod(scale_dims)) if scale_dims else 1) != 1:
+        return None  # per-channel requant scale -- declined, see this
+        # function's own docstring
+
+    if q_zp is not None:
+        zp_init = initializer_map.get(q_zp)
+        if zp_init is None:
+            return None
+        zp_dims = list(zp_init.dims)
+        if (int(np.prod(zp_dims)) if zp_dims else 1) != 1:
+            return None  # per-channel requant zero_point -- declined, see
+            # this function's own docstring
+
+    dq_out = dq_node.output[0]
+    if dq_out in graph_outputs:
+        return None
+    return dq_node, dq_out
 
 
 def _walk_to_consumer_qdq(
@@ -15741,7 +16097,11 @@ def _walk_to_consumer_qdq(
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim -- the
     identical two matchers :func:`_walk_to_consumer`/
     :func:`_walk_to_matmul_nbits_consumer`/:func:`_walk_to_dynquant_consumer`
-    try) -- with no other consumer anywhere along the way, until a
+    try), or a same-scale/zero_point ``QuantizeLinear -> DequantizeLinear``
+    activation-requantization round trip (:func:`_match_qdq_requant_pass_through`
+    -- the standard "full" QDQ format's own per-op activation boundary,
+    treated as a free pass-through exactly like a plain unary activation) --
+    with no other consumer anywhere along the way, until a
     same-family (Conv/ConvTranspose-only or MatMul/Gemm-only, matching
     `is_conv`) consumer is found whose input-channel count matches
     `n_channels`. No per-channel Add/Mul bias/scale hop, no depthwise Conv
@@ -15897,6 +16257,26 @@ def _walk_to_consumer_qdq(
                     chain_ops
                 )
 
+        if nxt.op_type == "QuantizeLinear":
+            # The activation-requantization round trip a real ORT static
+            # QDQ quantizer inserts on every quantized op's own output --
+            # see :func:`_match_qdq_requant_pass_through`'s own docstring.
+            # An unrecognized shape here declines the whole walk (`None`),
+            # exactly this walker's own bar for any other unrecognized
+            # `nxt.op_type` -- there is no other consumer to fall back to
+            # (single-consumer topology only, see this function's own
+            # docstring).
+            requant = _match_qdq_requant_pass_through(
+                nxt, cur, consumers_of, initializer_map, graph_outputs
+            )
+            if requant is None:
+                return None
+            dq_node, dq_out = requant
+            chain_ops.append((nxt, None))
+            chain_ops.append((dq_node, None))
+            cur = dq_out
+            continue
+
         const_name: Optional[str] = None
         extra_const_name: Optional[str] = None
         if (
@@ -16019,14 +16399,14 @@ def _find_qdq_chains(
             m = _match_conv_qdq(node, initializer_map, dq_of, consumers_of)
             if m is None:
                 continue
-            ref, bias_name, out_channels, _in_channels = m
+            ref, bias_ref, out_channels, _in_channels = m
             weight_transposed = False
             is_conv = True
         elif node.op_type == "ConvTranspose":
             m = _match_conv_transpose_qdq(node, initializer_map, dq_of, consumers_of)
             if m is None:
                 continue
-            ref, bias_name, out_channels, _in_channels = m
+            ref, bias_ref, out_channels, _in_channels = m
             weight_transposed = False
             is_conv = True
             is_conv_transpose = True
@@ -16034,7 +16414,7 @@ def _find_qdq_chains(
             mm = _match_matmul_qdq(node, initializer_map, dq_of, consumers_of)
             if mm is None:
                 continue
-            _x_name, ref, weight_transposed, bias_name, out_channels, _in_channels = mm
+            _x_name, ref, weight_transposed, bias_ref, out_channels, _in_channels = mm
             is_conv = False
 
         out_name = node.output[0]
@@ -16064,7 +16444,7 @@ def _find_qdq_chains(
                 producer=_QDQProducer(
                     node,
                     ref,
-                    bias_name,
+                    bias_ref,
                     weight_transposed,
                     is_conv,
                     is_conv_transpose=is_conv_transpose,
@@ -16081,14 +16461,14 @@ def _trace_gate_producer_backward_qdq(
     tensor_name: str,
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[
-        str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[str], int]
+        str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[_BiasRef], int]
     ],
     consumers_of: Dict[str, List[onnx.NodeProto]],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
     Tuple[
-        Tuple[onnx.NodeProto, _WeightRef, bool, Optional[str], int],
+        Tuple[onnx.NodeProto, _WeightRef, bool, Optional[_BiasRef], int],
         Tuple[onnx.NodeProto, ...],
     ]
 ]:
@@ -16188,23 +16568,23 @@ def _find_qdq_gated_chains(
         return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
 
     producer_infos: Dict[
-        str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[str], int]
+        str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[_BiasRef], int]
     ] = {}
     for node in graph.node:
         mm = _match_matmul_qdq(node, initializer_map, dq_of, consumers_of)
         if mm is not None:
-            _x_name, ref, weight_transposed, bias_name, out_channels, _in_channels = mm
+            _x_name, ref, weight_transposed, bias_ref, out_channels, _in_channels = mm
             producer_infos[node.output[0]] = (
                 node,
                 ref,
                 weight_transposed,
-                bias_name,
+                bias_ref,
                 out_channels,
             )
 
     def _producer(info, pre_ops) -> _QDQProducer:
-        node, ref, weight_transposed, bias_name, _n = info
-        return _QDQProducer(node, ref, bias_name, weight_transposed, False, pre_ops)
+        node, ref, weight_transposed, bias_ref, _n = info
+        return _QDQProducer(node, ref, bias_ref, weight_transposed, False, pre_ops)
 
     chains: List[_QDQGatedChain] = []
     for node in graph.node:
@@ -16347,10 +16727,13 @@ def apply_structured_pruning_qdq(
     the producer's output channels by L1/L2 norm of their own dequantized
     weight row (:func:`_qdq_channel_importance` -- dequantized for ranking
     only, never for the actual rewrite), drops the lowest-``sparsity``-
-    fraction of them, and slices the producer's weight and bias (if it has
-    a constant float one -- bias is never itself quantized by this repo's
-    own QDQ tooling) together with the matching input channels from the
-    consumer's weight. The producer's own int8/int4 codes are always
+    fraction of them, and slices the producer's weight and bias (a constant
+    float one, or a QDQ ``DequantizeLinear``-fed INT32 one --
+    :func:`_resolve_bias_ref`/:func:`_slice_bias_qdq` -- the shape a real
+    ORT static QDQ quantizer emits for every biased layer, even though this
+    repo's own internal QDQ tooling never itself quantizes a bias) together
+    with the matching input channels from the consumer's weight. The
+    producer's own int8/int4 codes are always
     co-sliced with its own scale/zero-point in lockstep, whichever source
     it is (per-tensor: scale/zero-point untouched; per-channel or
     blockwise: co-sliced by the same output-channel-axis `keep` -- see this
@@ -16539,7 +16922,7 @@ def apply_structured_pruning_qdq(
                 p.ref, p.weight_transposed, keep, p.is_conv, p.is_conv_transpose
             )
             if p.bias is not None:
-                _slice_last_axis(initializer_map[p.bias], keep)
+                _slice_bias_qdq(p.bias, keep)
             if keep_blocks is not None:
                 assert c.ref.qdq_block is not None
                 _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
@@ -16560,6 +16943,8 @@ def apply_structured_pruning_qdq(
                 stale_value_info.add(p.ref.qdq.dq_node.output[0])
             elif p.ref.qdq_block is not None:
                 stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
+            if p.bias is not None and p.bias.qdq is not None:
+                stale_value_info.add(p.bias.qdq.dq_node.output[0])
             if c.ref.qdq is not None:
                 stale_value_info.add(c.ref.qdq.dq_node.output[0])
             elif c.ref.qdq_block is not None:
@@ -16613,10 +16998,10 @@ def apply_structured_pruning_qdq(
 
             _slice_producer_weight_qdq(pa.ref, pa.weight_transposed, keep, False)
             if pa.bias is not None:
-                _slice_last_axis(initializer_map[pa.bias], keep)
+                _slice_bias_qdq(pa.bias, keep)
             _slice_producer_weight_qdq(pb.ref, pb.weight_transposed, keep, False)
             if pb.bias is not None:
-                _slice_last_axis(initializer_map[pb.bias], keep)
+                _slice_bias_qdq(pb.bias, keep)
             if keep_blocks is not None:
                 assert c.ref.qdq_block is not None
                 _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
@@ -16640,6 +17025,8 @@ def apply_structured_pruning_qdq(
                     stale_value_info.add(p.ref.qdq.dq_node.output[0])
                 elif p.ref.qdq_block is not None:
                     stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
+                if p.bias is not None and p.bias.qdq is not None:
+                    stale_value_info.add(p.bias.qdq.dq_node.output[0])
             if c.ref.qdq is not None:
                 stale_value_info.add(c.ref.qdq.dq_node.output[0])
             elif c.ref.qdq_block is not None:
