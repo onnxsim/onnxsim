@@ -20,9 +20,11 @@ pruning.py's own ``_find_decomposed_gqa_chains`` matches, now HAS a C++ port
 covered by its own dedicated "Decomposed (un-fused) GQA/MQA/plain-MHA
 attention head pruning" test section below -- but DELIBERATELY NARROWER in
 scope than pruning.py's own matcher: no additive mask, no decomposed
-RoPE/Q-K-norm pass-through, no ``Einsum``-based QK^T/AV product, no
-packed-QKV-then-``Split`` producer, and no true-MQA fast path. Every one of
-those shapes still declines to match in this C++ port (never mis-sliced),
+RoPE/Q-K-norm pass-through, no packed-QKV-then-``Split`` producer, and no
+true-MQA fast path. (An ``Einsum``-based QK^T/AV product IS now recognized,
+in place of a plain ``MatMul``, for both products -- see the dedicated
+``Einsum`` tests in that same section.) Every one of those remaining shapes
+still declines to match in this C++ port (never mis-sliced),
 so ``apply_attention_head_pruning``/``apply_attention_head_wanda_pruning``
 remain pure-Python (NOT yet aliased to this port) -- see that section's own
 tests for the exact, explicit divergence each narrowing produces. The six
@@ -2697,12 +2699,16 @@ def test_cpp_sparse_attention_pruning_num_layout_divisibility_declined_matches_p
 # "Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning" section
 # comment for the exact scope this port matches -- deliberately narrower
 # than pruning.py's own `_find_decomposed_gqa_chains`: no additive mask, no
-# decomposed RoPE/Q-K-norm pass-through, no `Einsum`-based QK^T/AV product,
-# no packed-QKV-then-`Split` producer, and no true-MQA fast path (mirrors
-# ApplyOneGqaChain's own identical, already-accepted MQA gap) -- every one
-# of those shapes simply declines to match here (never mis-sliced) and is
-# still fully handled by pruning.py's own pure-Python
-# `apply_attention_head_pruning`, so this tenth family is NOT yet aliased.
+# decomposed RoPE/Q-K-norm pass-through, no packed-QKV-then-`Split` producer,
+# and no true-MQA fast path (mirrors ApplyOneGqaChain's own identical,
+# already-accepted MQA gap) -- every one of those shapes simply declines to
+# match here (never mis-sliced) and is still fully handled by pruning.py's
+# own pure-Python `apply_attention_head_pruning`, so this tenth family is NOT
+# yet aliased. An `Einsum`-based QK^T/AV product, in place of a plain
+# `MatMul`, for either or both products IS recognized here (via
+# `EinsumEquationIsBatchedMatmul`, a line-for-line port of pruning.py's own
+# `_einsum_equation_is_batched_matmul`) -- see `_decomposed_einsum_gqa_model`
+# and its own tests below, further down this section.
 
 
 def _decomposed_gqa_model(
@@ -3240,3 +3246,286 @@ def test_cpp_decomposed_mqa_pruning_is_a_permanent_no_op_unlike_python():
     onnx.checker.check_model(pruned_py)
     assert pruned_cpp.SerializeToString() == model.SerializeToString()
     assert pruned_py.SerializeToString() != model.SerializeToString()
+
+
+# --- Decomposed attention with an `Einsum`-based QK^T/AV product -----------
+#
+# A plain `torch.einsum`/`tf.einsum`-written attention block (common in
+# `x-transformers`/`vit-pytorch`/`performer-pytorch`-style reimplementations,
+# and `tf2onnx`-exported `tf.einsum` code) never emits the `MatMul` the model
+# above builds for either the QK^T score or the AV output product -- it uses
+# a literal `Einsum` node for each instead, with K's own natural
+# `[..., seq_k, head_size]` layout contracted directly (no separate
+# dot-product-transpose `Transpose` at all, unlike the `MatMul` shape above).
+# `EinsumEquationIsBatchedMatmul` (`structured_pruning_entry.cpp`, a
+# line-for-line port of pruning.py's own `_einsum_equation_is_batched_
+# matmul`) recognizes any equation string PROVABLY equivalent to that
+# specific batched matmul -- regardless of which letters name each axis, and
+# regardless of incidental whitespace -- so both `FindDecomposedGqaChains`'s
+# QK^T and AV matching accept an `Einsum` node here exactly where they'd
+# otherwise require `MatMul`.
+
+
+def _decomposed_einsum_gqa_model(
+    K=32,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=16,
+    batch=1,
+    seq=4,
+    seed=0,
+    qk_equation="bhid,bhjd->bhij",
+    av_equation="bhij,bhjd->bhid",
+    av_attn_first=True,
+):
+    """Builds the `Einsum`-based analogue of `_decomposed_gqa_model`:
+    ``Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to BHSD) -> [repeat_kv:
+    Unsqueeze -> Expand -> Reshape, only when KVH < H] -> Einsum(Q, K) ->
+    scale -> Softmax -> Einsum(., V) -> Transpose(back) -> Reshape(back to
+    hidden) -> Linear(O)``.
+
+    Unlike `_decomposed_gqa_model`, K's own branch is built EXACTLY like V's
+    own (plain head-split `Transpose(perm=[0, 2, 1, 3])`, then the identical
+    optional `repeat_kv` broadcast when `KVH < H`) -- there is no combined
+    `perm=[0, 2, 3, 1]` or separate `perm=[0, 1, 3, 2]` dot-product-transpose
+    `Transpose` at all, since a literal `Einsum` node contracts K's own
+    natural `[..., seq_k, head_size]` layout directly (that's the entire
+    reason a real export uses `Einsum` here instead of `MatMul` in the first
+    place) -- mirrors pruning.py's own identical `Einsum` branch in
+    `_find_decomposed_gqa_chains`/`_resolve_decomposed_qk_root`.
+
+    `qk_equation`/`av_equation` let callers exercise different (but
+    equivalent) equation-string spellings -- renamed axis letters, incidental
+    whitespace -- all of which `EinsumEquationIsBatchedMatmul` must accept
+    identically. `av_attn_first` selects which of the AV `Einsum` node's own
+    two input slots the attention-weights (`Softmax` output) operand lands
+    in -- `EinsumEquationIsBatchedMatmul`'s own `first_operand_index` must
+    track whichever slot it actually is, exactly as flexibly as the `MatMul`
+    shape already handles via `attn_is_first`.
+    """
+    rng = np.random.default_rng(seed)
+    Nq, Nk, Nv = H * D, KVH * D, KVH * D
+    wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    bq = rng.standard_normal((Nq,)).astype(np.float32)
+    bk = rng.standard_normal((Nk,)).astype(np.float32)
+    bv = rng.standard_normal((Nv,)).astype(np.float32)
+    bout = rng.standard_normal((Out,)).astype(np.float32)
+
+    def _i64(arr, name):
+        return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        _f32(bq, "Bq"),
+        _f32(bk, "Bk"),
+        _f32(bv, "Bv"),
+        _f32(bout, "Bout"),
+        _i64([batch * seq, K], "XFlatShape"),
+        _i64([batch, seq, H, D], "Sq"),
+        _i64([batch, seq, KVH, D], "Skv"),
+        _i64([batch * seq, H * D], "OutShape"),
+        _i64([batch, seq, Out], "YShape"),
+    ]
+
+    lines = [
+        "xf = Reshape(X, XFlatShape)",
+        "q0 = Gemm(xf, Wq, Bq)",
+        "qr = Reshape(q0, Sq)",
+        "qt = Transpose<perm=[0,2,1,3]>(qr)",
+        "k0 = Gemm(xf, Wk, Bk)",
+        "kr = Reshape(k0, Skv)",
+        "ktr = Transpose<perm=[0,2,1,3]>(kr)",
+        "v0 = Gemm(xf, Wv, Bv)",
+        "vr = Reshape(v0, Skv)",
+        "vtr = Transpose<perm=[0,2,1,3]>(vr)",
+    ]
+
+    needs_repeat_kv = KVH < H
+    if needs_repeat_kv:
+        assert H % KVH == 0
+        n_rep = H // KVH
+        initializer += [
+            _i64([2], "Ax2"),
+            _i64([batch, KVH, n_rep, seq, D], "KExpandShape"),
+            _i64([batch, H, seq, D], "KMergeShape"),
+            _i64([batch, KVH, n_rep, seq, D], "VExpandShape"),
+            _i64([batch, H, seq, D], "VMergeShape"),
+        ]
+        lines += [
+            "ku = Unsqueeze(ktr, Ax2)",
+            "ke = Expand(ku, KExpandShape)",
+            "kt = Reshape(ke, KMergeShape)",
+            "vu = Unsqueeze(vtr, Ax2)",
+            "ve = Expand(vu, VExpandShape)",
+            "vt = Reshape(ve, VMergeShape)",
+        ]
+        kt_name, vt_name = "kt", "vt"
+    else:
+        # No `repeat_kv` -- the `Einsum` node's own operand must be K's/V's
+        # own plain head-split `Transpose` output DIRECTLY (`ktr`/`vtr`), the
+        # same way `q_bhsd_name` (`qt`) already feeds `qk` directly above --
+        # any extra pass-through node here would break
+        # `MatchDecomposedHeadSplit`'s own fixed node-adjacency requirement.
+        kt_name, vt_name = "ktr", "vtr"
+
+    initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
+    lines += [
+        f'qk = Einsum<equation="{qk_equation}">(qt, {kt_name})',
+        "scaled = Mul(qk, Scale)",
+        "attn = Softmax<axis=-1>(scaled)",
+    ]
+    av_inputs = f"attn, {vt_name}" if av_attn_first else f"{vt_name}, attn"
+    lines += [
+        f'ctx0 = Einsum<equation="{av_equation}">({av_inputs})',
+        "ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)",
+        "ctx2 = Reshape(ctx1, OutShape)",
+        "y0 = Gemm(ctx2, Wout, Bout)",
+        "Y = Reshape(y0, YShape)",
+    ]
+
+    body_lines = "\n          ".join(lines)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {body_lines}
+        }}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        batch=batch,
+        seq=seq,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        bout=bout,
+    )
+
+
+def test_cpp_decomposed_einsum_gqa_pruning_matches_python_reference_exactly():
+    # Canonical equation spelling straight from `torch.onnx.export`'s own
+    # confirmed literal output (see `_einsum_equation_is_batched_matmul`'s
+    # own docstring): `"bhid,bhjd->bhij"` for QK^T, `"bhij,bhjd->bhid"` for
+    # AV, attention-weights as the AV `Einsum` node's own first input.
+    model, cfg = _decomposed_einsum_gqa_model(K=32, H=8, KVH=2, D=8, Out=16, seed=1)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    # Fully within this C++ port's own `Einsum` scope (no mask/RoPE/Q-K-norm,
+    # genuine GQA so no MQA fast-path gap either) -- both ports must agree
+    # byte-for-byte, the strongest possible parity check.
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned_cpp)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    np.testing.assert_array_equal(wq_new, cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(wk_new, cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(wv_new, cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(wo_new, cfg["wout"][q_idx, :])
+
+    # The pruned graph must still actually run and produce the same result
+    # as an independently-built, already-pruned-shape oracle model -- proof
+    # the `Einsum` QK^T/AV nodes were left semantically intact (never
+    # mis-sliced) by the pruning rewrite.
+    oracle, _ = _decomposed_einsum_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+    )
+    oracle_inits = {t.name: t for t in oracle.graph.initializer}
+    for name, arr in (
+        ("Wq", cfg["wq"][:, q_idx]),
+        ("Wk", cfg["wk"][:, kv_idx]),
+        ("Wv", cfg["wv"][:, kv_idx]),
+        ("Wout", cfg["wout"][q_idx, :]),
+        ("Bq", cfg["bq"][q_idx]),
+        ("Bk", cfg["bk"][kv_idx]),
+        ("Bv", cfg["bv"][kv_idx]),
+        ("Bout", cfg["bout"]),
+    ):
+        oracle_inits[name].CopyFrom(_f32(arr, name))
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_decomposed_einsum_plain_attention_pruning_alternate_equation_spelling_matches_python():
+    # A second, structurally-equivalent-but-differently-spelled pair of
+    # equations -- renamed axis letters (`n`/`q`/`k` rather than `b`/`i`/`j`),
+    # incidental whitespace around the commas/arrow, AND the AV `Einsum`
+    # node's own attention-weights operand in its SECOND input slot rather
+    # than its first (`av_attn_first=False`) -- exercising
+    # `EinsumEquationIsBatchedMatmul`'s own `first_operand_index=1` swap.
+    # `KVH == H` here (no `repeat_kv`) -- every "group" is exactly one query
+    # head wide, closing out this port's own `Einsum` coverage for the
+    # no-GQA shape too.
+    model, cfg = _decomposed_einsum_gqa_model(
+        K=32,
+        H=4,
+        KVH=4,
+        D=8,
+        Out=16,
+        seed=3,
+        qk_equation="nhqd, nhkd -> nhqk",
+        av_equation="nhkd,nhqk->nhqd",
+        av_attn_first=False,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    wq_new, wk_new, wv_new, _ = _decomposed_weight_shapes(pruned_cpp)
+    assert wq_new.shape[1] == 2 * cfg["D"]
+    assert wk_new.shape[1] == 2 * cfg["D"]
+    assert wv_new.shape[1] == 2 * cfg["D"]
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"X": x})
+    (y_unpruned,) = _run(model_for_py, {"X": x})
+    assert y_pruned.shape == y_unpruned.shape

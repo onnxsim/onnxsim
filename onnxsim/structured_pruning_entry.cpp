@@ -22004,9 +22004,17 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 //     product -- either one sitting there breaks this port's own fixed
 //     `Reshape -> Transpose` adjacency check, so the whole chain simply
 //     fails to match (declines), the same safe fallback.
-//   - No `Einsum`-based QK^T/AV product (`_einsum_equation_is_batched_
-//     matmul`) -- `MatMul` only, mirroring this port's existing
-//     Attention-family scope everywhere else.
+//   - An `Einsum`-based QK^T/AV product IS recognized (via
+//     `EinsumEquationIsBatchedMatmul`, a line-for-line port of pruning.py's
+//     own `_einsum_equation_is_batched_matmul`), in place of a plain
+//     `MatMul`, for both products -- see `ResolveDecomposedQkRoot`'s own
+//     comment (QK^T) and `FindDecomposedGqaChains`'s own AV-product handling
+//     below. An `Einsum` QK^T product combined with a decomposed RoPE or
+//     Q/K-norm pass-through is NOT recognized, though -- this port's own
+//     `MatchDecomposedHeadSplit` never takes an `allow_qk_norm` hop at all
+//     (see the bullet above), a strictly narrower scope than pruning.py's
+//     own `Einsum` branch already independently declines RoPE/Q/K-norm for
+//     regardless.
 //   - No packed-QKV-then-`Split` producer (`_match_decomposed_packed_qkv_
 //     producer`) -- Q's, K's, and V's own raw projection outputs must come
 //     from three independent MatMul/Gemm nodes; a shared producer declines
@@ -22298,10 +22306,124 @@ std::optional<RepeatKvMatch> MatchDecomposedRepeatKv(
   return m;
 }
 
+// Returns an `Einsum` node's own required `equation` string attribute, or
+// `nullopt` if absent/mistyped -- mirrors pruning.py's own
+// `_einsum_equation_attr`. The ONNX schema's own documented alphabet for
+// this attribute (lower-case letters, comma, `->`, space) is plain ASCII, so
+// unlike pruning.py's own `bytes.decode("ascii")` step this never needs an
+// explicit validation pass here: `EinsumEquationIsBatchedMatmul` below
+// already rejects any character outside `[a-z]` (after stripping spaces),
+// which non-ASCII bytes always are.
+std::optional<std::string> EinsumEquationAttr(const onnx::NodeProto& node) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "equation" &&
+        attr.type() == onnx::AttributeProto::STRING) {
+      return attr.s();
+    }
+  }
+  return std::nullopt;
+}
+
+// Returns whether `equation` -- an `Einsum` node's own `equation` attribute
+// -- is PROVABLY equivalent to a batched matrix multiplication of its own
+// two operands, contracting exactly one shared axis, with every other axis
+// (zero or more shared leading "batch" axes, plus exactly one "free" axis of
+// its own per operand) passed straight through, unchanged in position, from
+// operand to output. Mirrors pruning.py's own
+// `_einsum_equation_is_batched_matmul` exactly -- see that function's own
+// docstring for the full reasoning behind `transposed_second_operand`/
+// `first_operand_index` and the complete list of declined shapes; this is a
+// line-for-line port, not a reduced approximation.
+bool EinsumEquationIsBatchedMatmul(const std::string& equation,
+                                   bool transposed_second_operand,
+                                   int first_operand_index = 0) {
+  std::string eq;
+  eq.reserve(equation.size());
+  for (char c : equation) {
+    if (c != ' ') {
+      eq.push_back(c);
+    }
+  }
+  if (eq.find("...") != std::string::npos) {
+    return false;
+  }
+  const size_t arrow = eq.find("->");
+  if (arrow == std::string::npos) {
+    return false;
+  }
+  const std::string lhs = eq.substr(0, arrow);
+  const std::string rhs = eq.substr(arrow + 2);
+  if (rhs.find("->") != std::string::npos) {
+    return false;  // more than one "->" -- not a well-formed equation.
+  }
+  const size_t comma = lhs.find(',');
+  if (comma == std::string::npos ||
+      lhs.find(',', comma + 1) != std::string::npos) {
+    return false;  // not exactly two comma-separated operand terms.
+  }
+  std::string t1 = lhs.substr(0, comma);
+  std::string t2 = lhs.substr(comma + 1);
+  if (first_operand_index == 1) {
+    std::swap(t1, t2);
+  }
+  if (t1.empty() || t2.empty() || rhs.empty()) {
+    return false;
+  }
+  for (const std::string& term : {t1, t2, rhs}) {
+    for (char c : term) {
+      if (c < 'a' || c > 'z') {
+        return false;
+      }
+    }
+  }
+
+  const size_t rank = t1.size();
+  if ((rank != 3 && rank != 4) || t2.size() != rank || rhs.size() != rank) {
+    return false;
+  }
+  auto all_unique = [](const std::string& s) {
+    return std::unordered_set<char>(s.begin(), s.end()).size() == s.size();
+  };
+  if (!all_unique(t1) || !all_unique(t2) || !all_unique(rhs)) {
+    return false;  // a repeated label within one term -- diagonal, not matmul.
+  }
+
+  const std::string batch = t1.substr(0, rank - 2);
+  if (t2.substr(0, rank - 2) != batch || rhs.substr(0, rank - 2) != batch) {
+    return false;  // batch axes must pass through unchanged, same order.
+  }
+
+  const char free1 = t1[rank - 2];
+  const char c1 = t1[rank - 1];
+  char free2, c2;
+  if (transposed_second_operand) {
+    free2 = t2[rank - 2];
+    c2 = t2[rank - 1];
+  } else {
+    c2 = t2[rank - 2];
+    free2 = t2[rank - 1];
+  }
+
+  if (c1 != c2 || free1 == free2) {
+    return false;
+  }
+  if (t2.find(free1) != std::string::npos ||
+      t1.find(free2) != std::string::npos ||
+      rhs.find(c1) != std::string::npos) {
+    return false;  // contracted label must vanish; free axes must be unique.
+  }
+  return rhs.substr(rank - 2) == std::string(1, free1) + free2;
+}
+
 // Resolves a Softmax's own input backward through the optional
 // `[Mul/Div(scalar scale) ->] MatMul` prefix -- mirrors pruning.py's own
 // `_resolve_decomposed_qk_root`, narrowed to this port's own scope (no mask
-// `Add`, no `Einsum` -- see this section's own top comment).
+// `Add` -- see this section's own top comment). An `Einsum` node IS accepted
+// here in place of `MatMul` -- mirroring pruning.py's own identical
+// acceptance -- but only when its own `equation` is confirmed
+// (`EinsumEquationIsBatchedMatmul`, `transposed_second_operand=true`, Q
+// always `input[0]`) provably equivalent to the same Q @ K^T batched matmul
+// the `MatMul` branch already recognizes.
 struct QkRootMatch {
   onnx::NodeProto* qk_matmul;
   onnx::NodeProto* scale_node;  // nullptr when absent.
@@ -22358,10 +22480,18 @@ std::optional<QkRootMatch> ResolveDecomposedQkRoot(
     return std::nullopt;
   }
   onnx::NodeProto* qk_matmul = qit->second;
-  if (qk_matmul->domain() != "" || qk_matmul->op_type() != "MatMul" ||
+  if (qk_matmul->domain() != "" ||
+      (qk_matmul->op_type() != "MatMul" && qk_matmul->op_type() != "Einsum") ||
       qk_matmul->input_size() != 2 || qk_matmul->output_size() != 1 ||
       qk_matmul->output(0) != cur) {
     return std::nullopt;
+  }
+  if (qk_matmul->op_type() == "Einsum") {
+    const std::optional<std::string> equation = EinsumEquationAttr(*qk_matmul);
+    if (!equation || !EinsumEquationIsBatchedMatmul(
+                         *equation, /*transposed_second_operand=*/true)) {
+      return std::nullopt;
+    }
   }
   return QkRootMatch{qk_matmul, scale_node};
 }
@@ -22489,7 +22619,9 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       continue;
     }
 
-    // ---- K's own dot-product transpose: combined or separate form ----
+    // ---- K's own dot-product transpose: combined or separate `MatMul`
+    // form -- or, for an `Einsum` QK^T product, no separate dot-product
+    // transpose at all ----
     onnx::NodeProto* k_transpose = nullptr;
     onnx::NodeProto* k_headsplit_transpose = nullptr;
     onnx::NodeProto* k_reshape = nullptr;
@@ -22499,50 +22631,18 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     int64_t kv_num_heads = -1;
     int64_t head_size_k = -1;
 
-    auto kt_it = node_by_output.find(k_operand);
-    if (kt_it == node_by_output.end()) {
-      continue;
-    }
-    k_transpose = kt_it->second;
-    if (k_transpose->domain() != "" || k_transpose->op_type() != "Transpose") {
-      continue;
-    }
-    std::vector<int64_t> k_perm;
-    bool k_has_perm = false;
-    for (const auto& attr : k_transpose->attribute()) {
-      if (attr.name() == "perm") {
-        k_perm.assign(attr.ints().begin(), attr.ints().end());
-        k_has_perm = true;
-      }
-    }
-    if (!k_has_perm) {
-      continue;
-    }
-
-    if (k_perm == kPermCombined) {
-      auto k_split =
-          MatchDecomposedHeadSplit(k_operand, consumers_of, graph_outputs,
-                                   node_by_output, init_map, kPermCombined);
-      if (!k_split) {
-        continue;
-      }
-      k_reshape = k_split->reshape;
-      kv_num_heads = k_split->num_heads;
-      head_size_k = k_split->head_size;
-      k_reshape_shape = k_split->reshape_shape;
-      k_proj_out = k_split->proj_out;
-      k_headsplit_transpose = nullptr;
-    } else if (k_perm == kPermSwap) {
-      if (k_transpose->input_size() != 1 || k_transpose->input(0).empty()) {
-        continue;
-      }
-      const std::string k_bhsd_name = k_transpose->input(0);
-      if (!is_internal(k_bhsd_name)) {
-        continue;
-      }
-      std::string k_raw_name = k_bhsd_name;
+    if (qk_matmul->op_type() == "Einsum") {
+      // An `Einsum` QK^T product's own `equation` (already confirmed
+      // batched-matmul-equivalent by ResolveDecomposedQkRoot) contracts K's
+      // own natural `[..., seq_k, head_size]` layout directly -- that's the
+      // entire reason a real export uses `Einsum` here instead of `MatMul`
+      // in the first place. So `k_operand` is resolved exactly like
+      // `q_bhsd_name` below: optional `repeat_kv`, then a plain head-split
+      // -- mirrors pruning.py's own identical `Einsum` branch in
+      // `_find_decomposed_gqa_chains`.
+      std::string k_raw_name = k_operand;
       auto repeat = MatchDecomposedRepeatKv(
-          k_bhsd_name, consumers_of, graph_outputs, node_by_output, init_map);
+          k_operand, consumers_of, graph_outputs, node_by_output, init_map);
       if (repeat) {
         k_repeat_kv = repeat->branch;
         k_raw_name = repeat->raw_name;
@@ -22554,7 +22654,7 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       if (!k_split) {
         continue;
       }
-      k_headsplit_transpose = k_split->transpose;
+      k_transpose = k_split->transpose;
       k_reshape = k_split->reshape;
       const int64_t resolved_kv_heads = k_split->num_heads;
       head_size_k = k_split->head_size;
@@ -22565,8 +22665,78 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       } else if (kv_num_heads != resolved_kv_heads) {
         continue;
       }
+      k_headsplit_transpose = nullptr;
     } else {
-      continue;
+      auto kt_it = node_by_output.find(k_operand);
+      if (kt_it == node_by_output.end()) {
+        continue;
+      }
+      k_transpose = kt_it->second;
+      if (k_transpose->domain() != "" ||
+          k_transpose->op_type() != "Transpose") {
+        continue;
+      }
+      std::vector<int64_t> k_perm;
+      bool k_has_perm = false;
+      for (const auto& attr : k_transpose->attribute()) {
+        if (attr.name() == "perm") {
+          k_perm.assign(attr.ints().begin(), attr.ints().end());
+          k_has_perm = true;
+        }
+      }
+      if (!k_has_perm) {
+        continue;
+      }
+
+      if (k_perm == kPermCombined) {
+        auto k_split =
+            MatchDecomposedHeadSplit(k_operand, consumers_of, graph_outputs,
+                                     node_by_output, init_map, kPermCombined);
+        if (!k_split) {
+          continue;
+        }
+        k_reshape = k_split->reshape;
+        kv_num_heads = k_split->num_heads;
+        head_size_k = k_split->head_size;
+        k_reshape_shape = k_split->reshape_shape;
+        k_proj_out = k_split->proj_out;
+        k_headsplit_transpose = nullptr;
+      } else if (k_perm == kPermSwap) {
+        if (k_transpose->input_size() != 1 || k_transpose->input(0).empty()) {
+          continue;
+        }
+        const std::string k_bhsd_name = k_transpose->input(0);
+        if (!is_internal(k_bhsd_name)) {
+          continue;
+        }
+        std::string k_raw_name = k_bhsd_name;
+        auto repeat = MatchDecomposedRepeatKv(
+            k_bhsd_name, consumers_of, graph_outputs, node_by_output, init_map);
+        if (repeat) {
+          k_repeat_kv = repeat->branch;
+          k_raw_name = repeat->raw_name;
+          kv_num_heads = repeat->kv_num_heads;
+        }
+        auto k_split =
+            MatchDecomposedHeadSplit(k_raw_name, consumers_of, graph_outputs,
+                                     node_by_output, init_map, kPermBhsd);
+        if (!k_split) {
+          continue;
+        }
+        k_headsplit_transpose = k_split->transpose;
+        k_reshape = k_split->reshape;
+        const int64_t resolved_kv_heads = k_split->num_heads;
+        head_size_k = k_split->head_size;
+        k_reshape_shape = k_split->reshape_shape;
+        k_proj_out = k_split->proj_out;
+        if (kv_num_heads < 0) {
+          kv_num_heads = resolved_kv_heads;
+        } else if (kv_num_heads != resolved_kv_heads) {
+          continue;
+        }
+      } else {
+        continue;
+      }
     }
 
     // ---- Q's own branch: plain head-split, never repeat_kv ----
@@ -22589,19 +22759,40 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       continue;
     }
 
-    // ---- forward: AV MatMul, output Transpose, combine-back Reshape ----
+    // ---- forward: AV MatMul/Einsum, output Transpose, combine-back
+    // Reshape ----
     auto avit = consumers_of.find(smax_out);
     if (avit == consumers_of.end() || avit->second.size() != 1) {
       continue;
     }
     onnx::NodeProto* av_matmul = avit->second[0];
-    if (av_matmul->domain() != "" || av_matmul->op_type() != "MatMul" ||
+    if (av_matmul->domain() != "" ||
+        (av_matmul->op_type() != "MatMul" &&
+         av_matmul->op_type() != "Einsum") ||
         av_matmul->input_size() != 2 || av_matmul->output_size() != 1) {
       continue;
     }
     const bool attn_is_first = av_matmul->input(0) == smax_out;
     if (!attn_is_first && av_matmul->input(1) != smax_out) {
       continue;
+    }
+    if (av_matmul->op_type() == "Einsum") {
+      // Symmetric to the QK^T `Einsum` case above -- a real
+      // `torch.einsum`-written AV product (e.g. `"bhij,bhjd->bhid"`) never
+      // emits a `MatMul` either, so this closes the identical gap for the
+      // second product. Unlike the QK^T case, the attention-weights operand
+      // (`smax_out`) may legitimately land in EITHER input slot -- exactly
+      // as flexibly as the `MatMul` case already handles via
+      // `attn_is_first` -- so `first_operand_index` is passed through
+      // accordingly rather than assumed to be 0. Mirrors pruning.py's own
+      // identical `Einsum` branch in `_find_decomposed_gqa_chains`.
+      const std::optional<std::string> equation =
+          EinsumEquationAttr(*av_matmul);
+      if (!equation || !EinsumEquationIsBatchedMatmul(
+                           *equation, /*transposed_second_operand=*/false,
+                           attn_is_first ? 0 : 1)) {
+        continue;
+      }
     }
     const std::string v_bhsd_name =
         attn_is_first ? av_matmul->input(1) : av_matmul->input(0);
