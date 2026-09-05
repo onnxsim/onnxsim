@@ -485,3 +485,36 @@ def test_wbt_is_deterministic_mcode_has_small_bounded_nondeterminism(tmp_path):
         mcode_diff_count,
         "expected only a small, bounded amount of run-to-run mcode noise",
     )
+
+
+def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
+    """Confirmed real (see the README's "Where does the non-determinism
+    actually come from" section): the noisy positions found by rebuilding
+    an identical two-Conv model always carry the *same multiset* of
+    values across independent rebuilds -- only which position gets which
+    value changes. That's the signature of a small set of interchangeable
+    labels (plausibly per-tile job/resource IDs) being assigned to
+    equivalent slots in a non-deterministic order (e.g. unordered-
+    container iteration order), not embedded metadata like a timestamp or
+    build ID -- real metadata could never coincidentally reproduce the
+    exact same value set across independent builds run at different
+    times, only a fixed label set being reshuffled could.
+    """
+    model = _two_conv_model(vary_first=True, dilation=2, pad=2)
+    _, mcode_a = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run1"), model, (1, 4, 16, 16)
+    )
+    _, mcode_b = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run2"), model, (1, 4, 16, 16)
+    )
+    assert len(mcode_a) == len(mcode_b)
+
+    noisy = [i for i in range(len(mcode_a)) if mcode_a[i] != mcode_b[i]]
+    assert noisy, "expected the known small amount of run-to-run mcode noise"
+
+    multiset_a = sorted(mcode_a[i] for i in noisy)
+    multiset_b = sorted(mcode_b[i] for i in noisy)
+    assert multiset_a == multiset_b, (
+        (multiset_a, multiset_b),
+        "expected the same multiset of values at the noisy positions, just reordered",
+    )

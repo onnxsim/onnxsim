@@ -1200,6 +1200,44 @@ differential-analysis claim in this space: a same-length, structured-
 looking diff is not automatically signal, and this non-determinism is
 exactly the kind of thing that can masquerade as one.
 
+**Where does the non-determinism actually come from -- metadata, or the
+mcode generation algorithm itself?** Checked directly rather than
+guessed, by looking at *which* values appear at the noisy positions, not
+just that they differ. For the clean `two_conv_d2` case (four single-byte
+positions, offsets 858/864/870/876), the exact values seen across all
+three rebuilds are:
+
+```
+run1: 858=0x10  864=0x30  870=0x20  876=0x40
+run2: 858=0x30  864=0x20  870=0x40  876=0x10
+run3: 858=0x20  864=0x40  870=0x30  876=0x10
+```
+
+**Every single run has the identical multiset `{0x10, 0x20, 0x30,
+0x40}`** at these four positions -- only *which position gets which
+value* changes. This is decisive: it's the unmistakable signature of a
+fixed, small set of interchangeable labels (plausibly per-tile or
+per-job identifiers, given this project's other evidence for 4-way
+spatial tiling) being assigned to four equivalent slots in a
+non-deterministic *order* -- consistent with iteration over an unordered
+container (hash-map/hash-set bucket order depending on pointer values or
+ASLR) or parallel-task completion order in the compiler, not with
+embedded metadata. A real timestamp, build UUID, PID, or similar tracking
+value would need to reproduce the *exact same four values* across three
+independent builds run at different wall-clock times, just shuffled --
+astronomically unlikely for anything resembling real metadata, and
+trivially expected for a label-assignment race. The messier single-`Conv`
+case (a wider, ~24-byte noisy region rather than four isolated bytes)
+didn't resolve to as clean a single-byte permutation on inspection, but
+occupies the same narrow relative region and is consistent with the same
+underlying mechanism at a different granularity (e.g. multi-byte records
+being reordered rather than single label bytes) rather than a second,
+unrelated source. No timestamp-like field (a large, monotonically
+distinct value) was found anywhere in either the noisy region or the rest
+of the file across any of the rebuilds -- the file's own metadata-shaped
+fields (`version`, `neu_name`, the JSON attributes) were separately
+confirmed identical across every rebuild in this section.
+
 ### What a real, profiled two-conv chain's trace.json actually shows
 
 Following up on "does data transfer between the two convs show up as its
