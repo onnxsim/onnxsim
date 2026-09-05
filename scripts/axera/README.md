@@ -1287,6 +1287,83 @@ one of the two convs' own commands rather than existing as its own
 identifiable unit, which is a real, useful negative constraint on where
 to look next.
 
+### Following up on determinism: the label noise is functionally harmless, and stays small at real-model scale
+
+Two direct follow-ups to the determinism finding above, both confirmed
+rather than assumed.
+
+**Does the byte-level non-determinism actually change the computed
+result?** Ran all three of the earlier `two_conv_d2` rebuilds (same
+config, three different mcode blobs due to the label-permutation noise)
+on the real AX650N with the identical input. **All three produce
+bit-identical output** (`np.array_equal` `True` pairwise, max absolute
+difference `0.0`, across every element checked). The non-deterministic
+label reassignment this README already traced to a small set of
+interchangeable slot IDs really is cosmetic at the semantic level --
+whichever arbitrary label a slot gets, the hardware executes the same
+computation. This is reassuring for the toolchain generally (rebuilding
+a real model doesn't silently change its answers), and it sharpens what
+"non-determinism" means here: an internal bookkeeping artifact with a
+confirmed-zero behavioral footprint, not a source of real output
+variance.
+
+**Does the non-determinism stay this small at real-model scale, or could
+it explain the large size deltas found when decomposing `resnet18d`
+earlier?** This mattered directly: that earlier section's negative result
+rested on real dilation edits changing `resnet18d`'s mcode length by
+700-900+ bytes, and it's worth checking that isn't just inflated noise at
+a bigger scale. Rebuilding the real, *unmodified* `resnet18d` twice (no
+parameter changed) gives: **`Wbt` byte-identical** (as at small scale),
+and **mcode's total length exactly stable at 49,080 bytes both times**,
+with only **16 bytes of internal noise** out of 49,080 -- proportionally
+smaller, not larger, than the small synthetic models' noise. This
+confirms the earlier `resnet18d` decomposition experiments' 700-900-byte
+size deltas are real, parameter-driven effects, not an artifact of
+non-determinism growing with model size -- the negative result there
+stands.
+
+### Extending the periodic field across a wider dilation range: real values, no simple formula yet, and a new threshold effect
+
+With determinism now understood well enough to trust same-length diffs
+again, the periodic 4-repeats/7-byte-stride field was pushed further:
+built the single-`Conv` dilation model at dilation `{2,3,4,5,6}` (padding
+compensated each time). Four of the five (`2,3,4,6`) happened to
+serialize to the same 3,528-byte length, letting all six pairs be
+compared directly; `5` serialized to a different length (3,560) and was
+left out of this specific comparison.
+
+**The field's value is real and dilation-dependent across the whole
+range tested, but doesn't reduce to an obvious arithmetic function of
+dilation alone.** The confirmed field (still at the same relative
+position, offset 2561 in this build) takes a different 3-byte value for
+every dilation compared against the baseline (`d=2`: `1a3b80`; `d=3`:
+`4b186f`; `d=4`: `244082`; `d=6`: `550f5b`) -- real signal, not noise
+(this exact offset never appeared among the confirmed noisy positions in
+any determinism check above), but neither the full 3-byte value nor its
+individual bytes move monotonically or linearly with dilation. Consistent
+with this project's earlier finding that a structurally similar
+undecoded field (Add/Sub's non-trivial encoding) depends on
+*calibration-derived* values rather than the raw attribute directly, this
+field plausibly encodes something computed from the dilated receptive
+field's effect on quantization ranges, not the integer dilation value
+itself -- a real, motivated hypothesis, not yet confirmed.
+
+**A new, real, threshold-like effect**: comparing `d=4` and `d=6` against
+the `d=2` baseline (but *not* `d=3` vs `d=2`) surfaces a second pair of
+matching 3-byte runs at entirely different offsets (552/1160 for `d=4`;
+754/1362 for `d=6`) that don't exist at all in the `d=3`-vs-`d=2`
+comparison. Same shape as the already-known field -- a value repeated
+identically twice, at a fixed separation -- but a distinct location that
+only activates once dilation reaches 4. A plausible explanation: larger
+dilation values push the effective receptive field past some internal
+boundary (an OCM tile edge, or a maximum supported "trivial" receptive
+field size) that requires an extra encoded record once crossed --
+consistent with the general pattern this README has already found of
+Pulsar2's compiler behavior changing in threshold/tile-boundary ways
+rather than smoothly. Not chased further here, but a real, precisely
+reproducible lead (two exact offsets, two exact dilation thresholds) for
+future work.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

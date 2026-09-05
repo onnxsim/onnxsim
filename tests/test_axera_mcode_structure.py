@@ -518,3 +518,70 @@ def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
         (multiset_a, multiset_b),
         "expected the same multiset of values at the noisy positions, just reordered",
     )
+
+
+def _build_axmodel(work_dir, model, input_shape):
+    os.makedirs(work_dir, exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, "model.onnx"))
+    rng = np.random.RandomState(0)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    samples = [rng.randn(*input_shape).astype(np.float32) for _ in range(4)]
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib_x.tar"), samples
+    )
+    cfg = {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": {
+            "input_configs": [
+                {
+                    "tensor_name": "x",
+                    "calibration_dataset": "./dataset/calib_x.tar",
+                    "calibration_format": "Numpy",
+                    "calibration_size": 4,
+                }
+            ],
+            "calibration_method": "MinMax",
+            "precision_analysis": False,
+        },
+        "compiler": {"check": 0},
+    }
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    with open(os.path.join(work_dir, "config", "cfg.json"), "w") as f:
+        json.dump(cfg, f)
+    result = pulsar2_docker.build(
+        work_dir, "model.onnx", "output", config_path="config/cfg.json"
+    )
+    assert result.success, result.error
+    return result.axmodel_path
+
+
+def test_mcode_nondeterminism_does_not_change_real_device_output(tmp_path):
+    """Confirmed real (see the README's "Following up on determinism"
+    section): the mcode byte-level non-determinism above is functionally
+    harmless. Three independent rebuilds of the identical two-Conv model
+    (each with different mcode bytes, due to the confirmed label-
+    permutation noise) all produce bit-identical output on the real
+    AX650N for the same input -- whichever arbitrary label a slot gets
+    internally, the hardware executes the same computation.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    model = _two_conv_model(vary_first=True, dilation=2, pad=2)
+    paths = [
+        _build_axmodel(os.path.join(str(tmp_path), f"run{i}"), model, (1, 4, 16, 16))
+        for i in range(3)
+    ]
+
+    rng = np.random.RandomState(42)
+    x = rng.randn(1, 4, 16, 16).astype(np.float32)
+
+    outputs = []
+    for path in paths:
+        dev = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+        assert not dev.error, dev.error
+        outputs.append(np.frombuffer(dev.outputs[0], dtype=np.float32))
+
+    for out in outputs[1:]:
+        assert np.array_equal(outputs[0], out), "expected bit-identical device output"
