@@ -18860,17 +18860,20 @@ def apply_structured_pruning_matmul_nbits(
 #     ``MatMulNBits``'s own identical-shaped decline for its own analogous
 #     alignment failure. See
 #     ``test_matmul_bnb4_pruning_declines_k_not_multiple_of_block_size``.
-#   * No grouped/gated (SwiGLU/GeGLU) pair, residual/skip-connection merge,
-#     or Concat-merged branch group is matched -- only the plain single
-#     producer -> [zero or more shape-preserving unary activations,
-#     `_UNARY_PASS_THROUGH`] -> single plain-float consumer topology,
-#     mirroring ``MatMulNBits``'s own identical scope decision (and, in
-#     turn, the QDQ section's own ``_walk_to_consumer_qdq``) for the same
-#     reason: this module's existing gated-MLP detection
-#     (:func:`_find_gated_chains`) is plain-float-chain machinery that does
-#     not apply to a block-quantized producer's own packed operands without
-#     the same kind of dedicated extension ``MatMulNBits`` itself never
-#     attempted either.
+#   * The gated (SwiGLU/GeGLU) FFN pair IS matched
+#     (:func:`_find_matmul_bnb4_gated_chains`), mirroring ``MatMulNBits``'s
+#     own :func:`_find_matmul_nbits_gated_chains`: gate_proj/up_proj, each
+#     independently either a ``MatMulBnb4`` node or a plain-float
+#     MatMul/vanilla-Gemm peer, combined by an elementwise ``Mul`` (each
+#     branch optionally through one `_UNARY_PASS_THROUGH` activation first)
+#     or ONNX's native fused ``SwiGLU`` node, feeding one plain-float
+#     down_proj consumer -- with at least one of gate_proj/up_proj a
+#     ``MatMulBnb4`` node (an all-plain-float triple stays
+#     :func:`_find_gated_chains`'s own job). No residual/skip-connection
+#     merge or Concat-merged branch group is matched beyond that -- only the
+#     plain single producer -> [zero or more shape-preserving unary
+#     activations, `_UNARY_PASS_THROUGH`] -> single plain-float consumer
+#     topology, or the one gated-pair composition above.
 #   * A shared/tied ``B``/``absmax`` tensor (read by more than one node) is
 #     declined by the matcher itself, the same bar every other matcher in
 #     this module is held to.
@@ -18953,6 +18956,9 @@ class _MatMulBnb4Weight:
     quant_type: int
     blocks_per_row: int
     row_bytes: int
+
+
+_MatMulBnb4ChainSide = Union[_MatMulBnb4Weight, _PlainMatMulNBitsPeer]
 
 
 def _match_matmul_bnb4_producer(
@@ -19079,6 +19085,54 @@ def _slice_matmul_bnb4_producer_rows(w: _MatMulBnb4Weight, keep: np.ndarray) -> 
     )
 
     _set_matmul_nbits_int_attr(w.node, "N", len(keep))
+
+
+def _matmul_bnb4_chain_side_key(side: _MatMulBnb4ChainSide) -> str:
+    """A name uniquely identifying the underlying weight tensor `side`
+    resolves to -- ``b_init``'s own name for a ``MatMulBnb4`` side,
+    ``w_init``'s own name for a plain-float peer -- used by the gated-chain
+    application loop to detect a shared/tied weight playing the same role
+    (producer or consumer) in more than one chain. Mirrors
+    :func:`_matmul_nbits_chain_side_key`.
+    """
+    if isinstance(side, _MatMulBnb4Weight):
+        return side.b_init.name
+    return side.w_init.name
+
+
+def _matmul_bnb4_chain_producer_weight_nk(side: _MatMulBnb4ChainSide) -> np.ndarray:
+    """``[N, K]`` float64 view of one gated-chain PRODUCER's own weight, for
+    IMPORTANCE RANKING ONLY (:func:`_qdq_channel_importance`/
+    :func:`_matmul_bnb4_gated_channel_importance`) -- never written back to
+    the graph. A ``MatMulBnb4`` side dequantizes via
+    :func:`_matmul_bnb4_dequantized`; a plain-float peer is read directly,
+    transposed only when NOT already stored ``[N, K]``. Mirrors
+    :func:`_matmul_nbits_chain_producer_weight_nk`.
+    """
+    if isinstance(side, _MatMulBnb4Weight):
+        return _matmul_bnb4_dequantized(side)
+    w = _to_f64(side.w_init)
+    return w if side.weight_transposed else w.T
+
+
+def _slice_matmul_bnb4_chain_producer(
+    side: _MatMulBnb4ChainSide, keep: np.ndarray
+) -> None:
+    """Slices one gated-chain PRODUCER's own output channels to `keep`
+    (ascending indices) -- dispatches to
+    :func:`_slice_matmul_bnb4_producer_rows` for a ``MatMulBnb4`` side, or a
+    direct :func:`_slice_producer_weight` (plus its own bias, if present)
+    for a plain-float peer. Mirrors :func:`_slice_matmul_nbits_chain_producer`.
+    """
+    if isinstance(side, _MatMulBnb4Weight):
+        _slice_matmul_bnb4_producer_rows(side, keep)
+        return
+    _slice_producer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+    if side.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(side.bias_init)
+        side.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=side.bias_init.name)
+        )
 
 
 @dataclass(frozen=True)
@@ -19297,6 +19351,230 @@ def _find_matmul_bnb4_chains(
     return chains
 
 
+def _trace_gate_producer_backward_bnb4(
+    tensor_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulBnb4ChainSide, int]],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Optional[
+    Tuple[Tuple[onnx.NodeProto, _MatMulBnb4ChainSide, int], Tuple[onnx.NodeProto, ...]]
+]:
+    """The ``MatMulBnb4`` analogue of
+    :func:`_trace_gate_producer_backward_matmul_nbits` (itself the
+    ``MatMulNBits`` analogue of :func:`_trace_gate_producer_backward`/
+    :func:`_trace_gate_producer_backward_qdq`): walks backward from
+    `tensor_name` through unary activation ops until it resolves to a
+    ``MatMulBnb4``-or-plain-float MatMul/vanilla-Gemm producer's raw output
+    (`producer_infos`, built from :func:`_match_matmul_bnb4_producer`/
+    :func:`_match_plain_matmul_nbits_peer` -- see
+    :func:`_find_matmul_bnb4_gated_chains`). Duplicated rather than shared
+    with the ``MatMulNBits`` section's own walker, for the identical reason
+    that section gives its own duplicate of the QDQ section's walker
+    (structurally different `producer_infos` value types).
+    """
+    pre_ops: List[onnx.NodeProto] = []
+    cur = tensor_name
+    for _ in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return None
+        if cur in producer_infos:
+            return producer_infos[cur], tuple(reversed(pre_ops))
+        producer_node = node_by_output.get(cur)
+        if producer_node is None:
+            return None
+        if not (
+            producer_node.op_type in _UNARY_PASS_THROUGH
+            and len(producer_node.input) == 1
+            and len(producer_node.output) == 1
+        ):
+            return None
+        pre_ops.append(producer_node)
+        cur = producer_node.input[0]
+    return None
+
+
+def _matmul_bnb4_gated_channel_importance(
+    w_a_nk: np.ndarray, w_b_nk: np.ndarray, importance_norm: _ImportanceNorm
+) -> np.ndarray:
+    """Combined importance across a ``MatMulBnb4`` gated pair's two
+    producers -- root-sum-square (L2) or plain sum (L1) of each producer's
+    own per-channel dequantized-or-plain row norm, mirroring
+    :func:`_matmul_nbits_gated_channel_importance`'s own identical
+    combination (duplicated rather than shared for this section's own
+    established "self-contained" reason -- see its own top comment).
+    """
+    if importance_norm == "l1":
+        return _qdq_channel_importance(w_a_nk, "l1") + _qdq_channel_importance(
+            w_b_nk, "l1"
+        )
+    return np.sqrt(
+        np.square(_qdq_channel_importance(w_a_nk, "l2"))
+        + np.square(_qdq_channel_importance(w_b_nk, "l2"))
+    )
+
+
+@dataclass(frozen=True)
+class _MatMulBnb4GatedChain:
+    """The ``MatMulBnb4`` analogue of :class:`_MatMulNBitsGatedChain` -- two
+    producers (`producer_a`/`producer_b`, gate_proj/up_proj, each EITHER a
+    ``MatMulBnb4`` node OR a plain-float peer -- see
+    :data:`_MatMulBnb4ChainSide`) combined by an elementwise product,
+    feeding one `consumer` (down_proj), with at least one of `producer_a`/
+    `producer_b` a ``MatMulBnb4`` node. `consumer` is always a plain-float
+    peer -- unlike ``MatMulNBits``'s own bidirectional consumer matching, a
+    ``MatMulBnb4`` node is never matched as a chain's CONSUMER at all (see
+    this section's own top comment for why). `producer_a_pre_ops`/
+    `producer_b_pre_ops` carry each branch's own activation nodes between
+    its raw output and the combine point, mirroring
+    :attr:`_MatMulNBitsGatedChain.producer_a_pre_ops`/
+    :attr:`_MatMulNBitsGatedChain.producer_b_pre_ops`. See
+    :func:`_find_matmul_bnb4_gated_chains`.
+    """
+
+    producer_a: _MatMulBnb4ChainSide
+    producer_a_pre_ops: Tuple[onnx.NodeProto, ...]
+    producer_b: _MatMulBnb4ChainSide
+    producer_b_pre_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer: _PlainMatMulNBitsPeer
+    n_channels: int
+
+
+def _find_matmul_bnb4_gated_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_MatMulBnb4GatedChain]:
+    """The ``MatMulBnb4`` analogue of :func:`_find_matmul_nbits_gated_chains`
+    (and, ultimately, of :func:`_find_gated_chains` itself): recognizes the
+    same gated (SwiGLU/GeGLU) MatMul/vanilla-Gemm pair -- gate_proj/up_proj
+    sharing one input, combined via a plain elementwise ``Mul`` of two
+    non-constant operands (each optionally through its own
+    `_UNARY_PASS_THROUGH` activation) or ONNX's native fused ``SwiGLU``
+    node, feeding into exactly one downstream plain-float consumer whose
+    input-channel count matches (:func:`_walk_to_matmul_bnb4_consumer`) --
+    except gate_proj/up_proj may now each independently be EITHER a
+    ``MatMulBnb4`` node OR a plain-float MatMul/vanilla-Gemm peer
+    (:func:`_match_matmul_bnb4_producer`/:func:`_match_plain_matmul_nbits_peer`,
+    the exact same resolution :func:`_find_matmul_bnb4_chains`'s own
+    single-producer case uses), requiring at least one of the two to
+    actually be ``MatMulBnb4`` (an all-plain-float triple is
+    :func:`_find_gated_chains`'s own job, not duplicated here). down_proj
+    (the consumer) is always plain-float, exactly like the non-gated case
+    above -- see this section's own top comment for why a ``MatMulBnb4``
+    node is never matched as a chain's CONSUMER at all.
+
+    `value_info_by_name`, when given, is threaded straight through to
+    :func:`_walk_to_matmul_bnb4_consumer` -- see its own identical
+    parameter.
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulBnb4ChainSide, int]] = {}
+    for node in graph.node:
+        bnb4 = _match_matmul_bnb4_producer(node, initializer_map, consumers_of)
+        if bnb4 is not None:
+            producer_infos[node.output[0]] = (node, bnb4, bnb4.N)
+            continue
+        peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+        if peer is not None:
+            producer_infos[node.output[0]] = (node, peer, peer.out_channels)
+
+    chains: List[_MatMulBnb4GatedChain] = []
+    for node in graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2 and len(node.output) == 1:
+            a_name, b_name = node.input
+            if (
+                a_name == b_name
+                or a_name in initializer_map
+                or b_name in initializer_map
+            ):
+                continue
+            trace_a = _trace_gate_producer_backward_bnb4(
+                a_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            trace_b = _trace_gate_producer_backward_bnb4(
+                b_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if trace_a is None or trace_b is None:
+                continue
+            info_a, pre_a = trace_a
+            info_b, pre_b = trace_b
+        elif (
+            node.op_type == "SwiGLU" and len(node.input) == 2 and len(node.output) == 1
+        ):
+            a_name, b_name = node.input
+            if a_name in initializer_map or b_name in initializer_map:
+                continue
+            if not (_is_internal(a_name) and _is_internal(b_name)):
+                continue
+            info_a_lookup = producer_infos.get(a_name)
+            info_b_lookup = producer_infos.get(b_name)
+            if info_a_lookup is None or info_b_lookup is None:
+                continue
+            info_a, pre_a = info_a_lookup, ()
+            info_b, pre_b = info_b_lookup, ()
+        else:
+            continue
+
+        node_a, side_a, n_a = info_a
+        node_b, side_b, n_b = info_b
+        if node_a is node_b or n_a != n_b:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        found = _walk_to_matmul_bnb4_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_a,
+            _MAX_CHAIN_HOPS,
+            value_info_by_name,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+
+        if isinstance(side_a, _PlainMatMulNBitsPeer) and isinstance(
+            side_b, _PlainMatMulNBitsPeer
+        ):
+            continue  # all plain float -- _find_gated_chains's own job
+
+        chains.append(
+            _MatMulBnb4GatedChain(
+                producer_a=side_a,
+                producer_a_pre_ops=pre_a,
+                producer_b=side_b,
+                producer_b_pre_ops=pre_b,
+                chain_ops=chain_ops,
+                consumer=consumer,
+                n_channels=n_a,
+            )
+        )
+    return chains
+
+
 def apply_structured_pruning_matmul_bnb4(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -19333,6 +19611,27 @@ def apply_structured_pruning_matmul_bnb4(
     real quantizer round-trip both) and
     ``test_matmul_bnb4_pruning_declines_k_not_multiple_of_block_size``.
 
+    Also handles the gated (SwiGLU/GeGLU) FFN pair
+    (:func:`_find_matmul_bnb4_gated_chains`, the ``MatMulBnb4`` analogue of
+    :func:`_find_matmul_nbits_gated_chains`) -- gate_proj/up_proj (two
+    producers sharing one input, EACH independently either a ``MatMulBnb4``
+    node or a plain-float MatMul/vanilla-Gemm peer, combined by an
+    elementwise ``Mul`` with gate_proj's output optionally passed through
+    one of the same unary activations first, or ONNX's native fused
+    ``SwiGLU`` op) feeding one down_proj consumer -- always plain-float,
+    exactly like the non-gated case above -- with at least one of
+    gate_proj/up_proj a ``MatMulBnb4`` node. Both producers are ranked by
+    combined (root-sum-square, or plain sum for L1) importance of their own
+    dequantized-or-plain rows (:func:`_matmul_bnb4_gated_channel_importance`)
+    and cut to the *same* surviving channel-index set, since they're about
+    to be multiplied elementwise -- each producer sliced by the same
+    per-role helper an ordinary chain's producer already uses
+    (:func:`_slice_matmul_bnb4_chain_producer`). down_proj is sliced on its
+    input axis exactly like an ordinary consumer above, with no block
+    structure to worry about (it's always plain-float). Gated pairs are
+    MatMul/Gemm-only, mirroring :func:`_find_gated_chains`'s own
+    restriction.
+
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
             drop (rounded, at least one channel is always kept)
@@ -19362,7 +19661,8 @@ def apply_structured_pruning_matmul_bnb4(
         )
         initializer_map = _constant_map(graph)
         chains = _find_matmul_bnb4_chains(graph, value_info_by_name)
-        if not chains:
+        gated_chains = _find_matmul_bnb4_gated_chains(graph, value_info_by_name)
+        if not chains and not gated_chains:
             continue
 
         producer_touched: Set[str] = set()
@@ -19410,6 +19710,58 @@ def apply_structured_pruning_matmul_bnb4(
             const_touched.update(consts)
             stale_value_info.add(p.node.output[0])
             stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _matmul_bnb4_chain_side_key(pa)
+            pb_key = _matmul_bnb4_chain_side_key(pb)
+            c_key = c.w_init.name
+            gconsts = {
+                const_name
+                for _, const_name in gchain.chain_ops
+                if const_name is not None
+            }
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles)
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+                or (gconsts & const_touched)
+            ):
+                continue  # a shared/tied weight another chain already resized
+
+            n = gchain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_a_nk = _matmul_bnb4_chain_producer_weight_nk(pa)
+            w_b_nk = _matmul_bnb4_chain_producer_weight_nk(pb)
+            importance = _matmul_bnb4_gated_channel_importance(
+                w_a_nk, w_b_nk, importance_norm
+            )
+            # `kind="stable"` for the same cross-platform-determinism reason
+            # the single-producer loop above documents on its own identical
+            # line.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            _slice_matmul_bnb4_chain_producer(pa, keep)
+            _slice_matmul_bnb4_chain_producer(pb, keep)
+            _slice_consumer_weight(c.w_init, c.weight_transposed, keep, is_conv=False)
+            for _, const_name in gchain.chain_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
+            const_touched.update(gconsts)
+            stale_value_info.add(pa.node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.producer_a_pre_ops)
+            stale_value_info.add(pb.node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
+            stale_value_info.update(op.output[0] for op, _ in gchain.chain_ops)
 
         if stale_value_info:
             kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
