@@ -79,6 +79,63 @@ def _single_conv_model(cin, cout, k):
     return model
 
 
+def _asym_kernel_model(kh, kw, cin=4, cout=4, insz=16):
+    """One `Conv` with an asymmetric `kh x kw` kernel -- same total weight
+    count regardless of orientation (`kh * kw` is the same for `(3,1)` and
+    `(1,3)`), isolating orientation from raw weight data size."""
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin, kh, kw) * 0.1).astype(np.float32)
+    ph, pw = kh // 2, kw // 2
+    graph = helper.make_graph(
+        [helper.make_node("Conv", ["x", "w"], ["y"], pads=[ph, pw, ph, pw])],
+        f"g_kernel_{kh}x{kw}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cout, insz, insz]
+            )
+        ],
+        initializer=[numpy_helper.from_array(w, name="w")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _autopad_model(use_auto_pad, cin=4, cout=4, k=3, insz=16):
+    """One `Conv`, either using `auto_pad="SAME_UPPER"` or the numerically
+    equivalent explicit `pads` -- to check whether auto_pad leaves any
+    trace in mcode after normalization."""
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin, k, k) * 0.1).astype(np.float32)
+    if use_auto_pad:
+        node = helper.make_node("Conv", ["x", "w"], ["y"], auto_pad="SAME_UPPER")
+    else:
+        node = helper.make_node("Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1])
+    graph = helper.make_graph(
+        [node],
+        f"g_autopad_{use_auto_pad}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cout, insz, insz]
+            )
+        ],
+        initializer=[numpy_helper.from_array(w, name="w")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
 def _dilation_conv_model(dilation, pad, cin=4, cout=4, k=3, insz=16):
     """One `Conv` with a specific dilation/padding -- padding chosen by the
     caller so output shape (and thus mcode's total serialized length) stays
@@ -585,3 +642,66 @@ def test_mcode_nondeterminism_does_not_change_real_device_output(tmp_path):
 
     for out in outputs[1:]:
         assert np.array_equal(outputs[0], out), "expected bit-identical device output"
+
+
+def test_kernel_orientation_changes_mcode_size_despite_equal_weight_count(tmp_path):
+    """Confirmed real (see the README's "Two more Conv attributes tried"
+    section): a `3x1` and a `1x3` kernel hold the exact same number of
+    weight values (`cin*cout*3*1 == cin*cout*1*3`), so Wbt comes out the
+    same size either way -- but mcode does not. A real, new asymmetry:
+    the compiler encodes a "tall" and a "wide" kernel of identical size
+    differently, plausibly due to a real difference in how it scans/tiles
+    the input by row vs. column.
+    """
+    wbt_h, mcode_h = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "k3x1"), _asym_kernel_model(3, 1), (1, 4, 16, 16)
+    )
+    wbt_w, mcode_w = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "k1x3"), _asym_kernel_model(1, 3), (1, 4, 16, 16)
+    )
+    assert len(wbt_h) == len(wbt_w), "same weight count should give the same Wbt size"
+    assert len(mcode_h) != len(mcode_w), (
+        "expected kernel orientation to produce a real mcode size difference"
+    )
+
+
+def test_autopad_normalizes_with_no_signal_beyond_known_noise(tmp_path):
+    """Confirmed real (see the README's "Two more Conv attributes tried"
+    section): `auto_pad="SAME_UPPER"` vs. the numerically-equivalent
+    explicit `pads` first looked like a real signal (a same-length pair
+    with a 4-byte diff at a location not seen before), but rebuilding the
+    identical `auto_pad=NOTSET` config alone, twice, reproduced a nearly
+    identical diff -- confirming it was this project's second encounter
+    with non-deterministic label noise, not a real auto_pad-specific
+    encoding. auto_pad appears to fully normalize away before
+    quantization. This test locks in the *correct*, determinism-checked
+    conclusion: the auto_pad-vs-explicit diff should be no bigger than
+    what an identical rebuild alone already produces.
+    """
+    same_model = _autopad_model(use_auto_pad=True)
+    explicit_model = _autopad_model(use_auto_pad=False)
+
+    _, mcode_same = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "same"), same_model, (1, 4, 16, 16)
+    )
+    _, mcode_explicit_a = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "explicit_a"), explicit_model, (1, 4, 16, 16)
+    )
+    _, mcode_explicit_b = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "explicit_b"), explicit_model, (1, 4, 16, 16)
+    )
+    assert len(mcode_same) == len(mcode_explicit_a) == len(mcode_explicit_b)
+
+    cross_diff = sum(
+        1 for i in range(len(mcode_same)) if mcode_same[i] != mcode_explicit_a[i]
+    )
+    noise_diff = sum(
+        1
+        for i in range(len(mcode_explicit_a))
+        if mcode_explicit_a[i] != mcode_explicit_b[i]
+    )
+    assert cross_diff <= noise_diff + 2, (
+        (cross_diff, noise_diff),
+        "auto_pad-vs-explicit diff should not exceed identical-rebuild noise "
+        "by more than a token amount",
+    )

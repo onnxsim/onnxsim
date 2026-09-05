@@ -1402,6 +1402,50 @@ rather than smoothly. Not chased further here, but a real, precisely
 reproducible lead (two exact offsets, two exact dilation thresholds) for
 future work.
 
+### Two more Conv attributes tried: a real asymmetry, and a second non-determinism zone found by a false lead
+
+Continuing to work through Conv's remaining untested attributes:
+
+**Asymmetric kernel shape (`3x1` vs `1x3`) reveals a real, new asymmetry.**
+Same total weight count either way (`cin*cout*3*1 == cin*cout*1*3`), so
+`Wbt` came out byte-identical in size (1,320 bytes both) as expected --
+but mcode did *not*: 3,528 bytes for `3x1` vs 3,208 bytes for `1x3`, a
+real 320-byte (10-unit) difference driven by orientation alone, not by
+how much weight data there is. A genuine, real finding: the compiler
+treats a "tall" and a "wide" kernel of otherwise identical size
+differently, plausibly because how it scans/tiles the input differs by
+row vs. column direction. Not further decoded (no same-length pair here
+to diff cleanly), but a real, motivated target for whoever chases the
+scanning-order encoding next.
+
+**`auto_pad="SAME_UPPER"` vs. the numerically-equivalent explicit `pads`
+looked at first like a real, tiny signal -- and turned out to be a false
+lead that found something else useful instead.** Both compiled to the
+identical 2,984-byte mcode length, and diffing them found only 4 bytes
+different, at a location (offsets 301/303/323/325) never seen in any
+prior section of this README -- a plausible candidate for auto_pad
+leaving some small trace even after normalization. **Checked properly
+before believing it**: rebuilding the *`auto_pad="NOTSET"` config alone*,
+twice, with nothing changed, reproduced a nearly identical diff pattern
+(5 bytes, offsets 301/303/317/319/325, same multiset-of-values signature
+as the already-confirmed non-determinism elsewhere in this README). The
+"auto_pad signal" was never real -- it was this project's second
+encounter with the same class of non-deterministic label noise, just at
+a location not seen before. **Real, useful takeaway**: `auto_pad` appears
+to fully normalize to its explicit-padding equivalent before
+quantization, with no detectable functional difference in mcode --  a
+clean negative result, now that the false positive has been ruled out.
+
+**More importantly, methodologically**: this confirms mcode's
+non-determinism is not confined to the one zone (offsets ~858-882)
+characterized earlier -- there are at least two independent noisy
+regions (~301-325 as well), and likely more not yet stumbled into. Any
+future same-length-diff finding in this space needs its own determinism
+check (rebuild the *unchanged* config and confirm the observed diff
+isn't reproduced by noise alone) before being trusted, not just a check
+against the two zones already known -- this project got this exact kind
+of false positive twice now, at two different locations.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
