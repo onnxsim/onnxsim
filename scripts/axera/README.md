@@ -892,6 +892,44 @@ byte-diffing technique demonstrated for Conv's bias, scaled up to cover
 and critically, `AxQuantizedConv`'s dominant weight/compute payload itself
 -- each a real, well-scoped, but separately time-consuming target.
 
+**Update, after the further mcode-focused sections below**: the ~1% figure
+above is unchanged for raw "exact meaning known" bytes -- Conv's bias
+lives in Wbt, not mcode, so none of that work adds to mcode's own count --
+but the *map* of mcode is now materially more complete than "1% known,
+99% blank":
+
+- **Two distinct periodic fields are now precisely located inside a real
+  `AxQuantizedConv` command** (not just Wbt) -- the original 4-repeats/
+  7-byte-stride field, confirmed real and dilation/groups-sensitive across
+  six independent experiments, plus a second, similarly-shaped field that
+  only activates once dilation reaches 4. Neither is decoded at the bit
+  level, but both are now real, reproducible targets with exact byte
+  offsets, not part of the undifferentiated opaque mass.
+- **The confirmed non-deterministic region needs no further decoding at
+  all** -- it's understood to be a functionally-inert internal label
+  permutation (bit-identical real device output regardless of which
+  permutation a build lands on), not an encoded parameter. That's a small
+  but real subtraction from the "mystery" pile: bytes whose *role* is now
+  fully explained, even without knowing the exact label values' meaning.
+- **A real, quantified bound on how much of mcode is even distinct**: the
+  43.4%-of-bytes-are-exact-duplicates finding (from the self-similarity
+  scan elsewhere in this README) means the effective amount of *unique*
+  content to decode in a real model is well under its raw byte count --
+  most of what's left unexamined is copies of a smaller number of real
+  templates, not independent unique data.
+- **A negative result narrows where to keep looking**: profiling a real
+  two-op chain found no separately-scheduled "transfer" event for
+  inter-op data movement, meaning whatever addressing the intermediate
+  buffer needs is folded into the existing per-op command bytes rather
+  than existing as its own, separately-findable region -- ruling out one
+  plausible place further decoding might have focused on.
+
+None of this changes the honest headline (still roughly 1% exactly
+decoded, for a real model, and the dominant `AxQuantizedConv` payload
+itself still opaque) -- but "what's left to figure out" is now a
+materially smaller, better-characterized target than when this section
+was first written.
+
 ### A first real crack at `AxQuantizedConv`'s command encoding
 
 Taking up that target directly: since Conv's actual *weight values* live
