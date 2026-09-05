@@ -202,6 +202,52 @@ def _build_and_get_mcode_bytes(work_dir, model, input_shape):
     return bytes(inits[mcode_key].raw_data)
 
 
+def _build_and_get_wbt_and_mcode_bytes(work_dir, model, input_shape):
+    os.makedirs(work_dir, exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, "model.onnx"))
+    rng = np.random.RandomState(0)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    samples = [rng.randn(*input_shape).astype(np.float32) for _ in range(4)]
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib_x.tar"), samples
+    )
+    cfg = {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": {
+            "input_configs": [
+                {
+                    "tensor_name": "x",
+                    "calibration_dataset": "./dataset/calib_x.tar",
+                    "calibration_format": "Numpy",
+                    "calibration_size": 4,
+                }
+            ],
+            "calibration_method": "MinMax",
+            "precision_analysis": False,
+        },
+        "compiler": {"check": 0},
+    }
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    with open(os.path.join(work_dir, "config", "cfg.json"), "w") as f:
+        json.dump(cfg, f)
+    result = pulsar2_docker.build(
+        work_dir, "model.onnx", "output", config_path="config/cfg.json"
+    )
+    assert result.success, result.error
+    compiled = onnx.load(result.axmodel_path)
+    inits = {i.name: i for i in compiled.graph.initializer}
+    neu_node = next(nd for nd in compiled.graph.node if nd.op_type == "neu mode")
+    info = None
+    for attr in neu_node.attribute:
+        if attr.name == "npu_graph_info":
+            info = json.loads(attr.s.decode())
+    dotneu = info["dotneus"][0]
+    wbt_key = dotneu["extra_inputs"][0]["const_data_key"]
+    mcode_key = dotneu["neu_key"]
+    return bytes(inits[wbt_key].raw_data), bytes(inits[mcode_key].raw_data)
+
+
 def _build_and_get_blob_sizes_for_model(work_dir, model, input_name, input_shape):
     os.makedirs(work_dir, exist_ok=True)
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
@@ -405,4 +451,37 @@ def test_downstream_conv_dilation_perturbs_upstream_conv_bytes(tmp_path):
     assert upstream_diffs > 0, (
         "expected the unchanged first Conv's own bytes to still be perturbed "
         "by a downstream-only dilation change"
+    )
+
+
+def test_wbt_is_deterministic_mcode_has_small_bounded_nondeterminism(tmp_path):
+    """Confirmed real (see the README's "Is .axmodel deterministic?"
+    section): rebuilding the *identical* model/config is not fully
+    reproducible. Wbt (npu_params) is byte-identical across rebuilds every
+    time tested; mcode is not, but the non-determinism is small (a
+    handful of bytes) and bounded (same total length every time), not
+    pervasive. This underpins every other differential-analysis test in
+    this file -- a same-length pair with more than a token handful of
+    byte differences is real signal, not noise, but this test exists to
+    catch it if that ever stops being true (e.g. a toolchain regression
+    that makes mcode non-determinism much larger or Wbt non-deterministic
+    at all).
+    """
+    model = _dilation_conv_model(2, 2)
+    wbt_a, mcode_a = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run1"), model, (1, 4, 16, 16)
+    )
+    wbt_b, mcode_b = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run2"), model, (1, 4, 16, 16)
+    )
+
+    assert wbt_a == wbt_b, "Wbt should be byte-identical across identical rebuilds"
+
+    assert len(mcode_a) == len(mcode_b), (
+        "mcode should serialize to the same length across identical rebuilds"
+    )
+    mcode_diff_count = sum(1 for i in range(len(mcode_a)) if mcode_a[i] != mcode_b[i])
+    assert mcode_diff_count < 50, (
+        mcode_diff_count,
+        "expected only a small, bounded amount of run-to-run mcode noise",
     )
