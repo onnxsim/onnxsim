@@ -116,6 +116,48 @@ def _dilation_conv_model(dilation, pad, cin=4, cout=4, k=3, insz=16):
     return model
 
 
+def _two_conv_model(vary_first, dilation, pad, cin=4, mid=4, cout=4, k=3, insz=16):
+    """Two chained `Conv`s with a real intermediate activation flowing
+    between them (not a graph-boundary tensor) -- `vary_first` selects
+    which of the two gets the dilation/padding override, the other stays
+    fixed at dilation=1/pad=1."""
+    rng = np.random.RandomState(0)
+    w1 = (rng.randn(mid, cin, k, k) * 0.1).astype(np.float32)
+    w2 = (rng.randn(cout, mid, k, k) * 0.1).astype(np.float32)
+    d1, p1 = (dilation, pad) if vary_first else (1, 1)
+    d2, p2 = (1, 1) if vary_first else (dilation, pad)
+    mid_sz = insz + 2 * p1 - d1 * (k - 1) - 1 + 1
+    out_sz = mid_sz + 2 * p2 - d2 * (k - 1) - 1 + 1
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv", ["x", "w1"], ["mid"], dilations=[d1, d1], pads=[p1, p1, p1, p1]
+            ),
+            helper.make_node(
+                "Conv", ["mid", "w2"], ["y"], dilations=[d2, d2], pads=[p2, p2, p2, p2]
+            ),
+        ],
+        f"g_two_conv_vary{'1' if vary_first else '2'}_{dilation}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cout, out_sz, out_sz]
+            )
+        ],
+        initializer=[
+            numpy_helper.from_array(w1, name="w1"),
+            numpy_helper.from_array(w2, name="w2"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
 def _build_and_get_mcode_bytes(work_dir, model, input_shape):
     os.makedirs(work_dir, exist_ok=True)
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
@@ -158,6 +200,52 @@ def _build_and_get_mcode_bytes(work_dir, model, input_shape):
             info = json.loads(attr.s.decode())
     mcode_key = info["dotneus"][0]["neu_key"]
     return bytes(inits[mcode_key].raw_data)
+
+
+def _build_and_get_wbt_and_mcode_bytes(work_dir, model, input_shape):
+    os.makedirs(work_dir, exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, "model.onnx"))
+    rng = np.random.RandomState(0)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    samples = [rng.randn(*input_shape).astype(np.float32) for _ in range(4)]
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib_x.tar"), samples
+    )
+    cfg = {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": {
+            "input_configs": [
+                {
+                    "tensor_name": "x",
+                    "calibration_dataset": "./dataset/calib_x.tar",
+                    "calibration_format": "Numpy",
+                    "calibration_size": 4,
+                }
+            ],
+            "calibration_method": "MinMax",
+            "precision_analysis": False,
+        },
+        "compiler": {"check": 0},
+    }
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    with open(os.path.join(work_dir, "config", "cfg.json"), "w") as f:
+        json.dump(cfg, f)
+    result = pulsar2_docker.build(
+        work_dir, "model.onnx", "output", config_path="config/cfg.json"
+    )
+    assert result.success, result.error
+    compiled = onnx.load(result.axmodel_path)
+    inits = {i.name: i for i in compiled.graph.initializer}
+    neu_node = next(nd for nd in compiled.graph.node if nd.op_type == "neu mode")
+    info = None
+    for attr in neu_node.attribute:
+        if attr.name == "npu_graph_info":
+            info = json.loads(attr.s.decode())
+    dotneu = info["dotneus"][0]
+    wbt_key = dotneu["extra_inputs"][0]["const_data_key"]
+    mcode_key = dotneu["neu_key"]
+    return bytes(inits[wbt_key].raw_data), bytes(inits[mcode_key].raw_data)
 
 
 def _build_and_get_blob_sizes_for_model(work_dir, model, input_name, input_shape):
@@ -331,3 +419,102 @@ def test_axquantizedconv_command_has_a_real_periodic_4x_field(tmp_path):
         "expected exactly 4 repeats",
     )
     assert all(s == 7 for s in strides), (strides, "expected a constant 7-byte stride")
+
+
+def test_downstream_conv_dilation_perturbs_upstream_conv_bytes(tmp_path):
+    """Confirmed real (see the README's "Chaining two real convs" section):
+    a genuinely new, previously-unknown cross-op coupling. Two chained
+    `Conv`s at the one shape (cin=cout=mid=4) confirmed to give
+    same-length pairs; varying only the *second* conv's dilation, with the
+    *first* conv's own attributes completely untouched, still perturbs
+    bytes within the first ~800 bytes of mcode -- the same relative region
+    the single-op experiments already showed holds the first conv's own
+    per-op command template. An op's encoding is not independent of what
+    happens downstream of it, even at fixed total mcode length.
+    """
+    a = _build_and_get_mcode_bytes(
+        os.path.join(str(tmp_path), "vary2_d2"),
+        _two_conv_model(vary_first=False, dilation=2, pad=2),
+        (1, 4, 16, 16),
+    )
+    b = _build_and_get_mcode_bytes(
+        os.path.join(str(tmp_path), "vary2_d3"),
+        _two_conv_model(vary_first=False, dilation=3, pad=3),
+        (1, 4, 16, 16),
+    )
+    assert len(a) == len(b), (
+        "this dilation/padding pair should serialize to the same length"
+    )
+
+    UPSTREAM_REGION = 800
+    upstream_diffs = sum(1 for i in range(UPSTREAM_REGION) if a[i] != b[i])
+    assert upstream_diffs > 0, (
+        "expected the unchanged first Conv's own bytes to still be perturbed "
+        "by a downstream-only dilation change"
+    )
+
+
+def test_wbt_is_deterministic_mcode_has_small_bounded_nondeterminism(tmp_path):
+    """Confirmed real (see the README's "Is .axmodel deterministic?"
+    section): rebuilding the *identical* model/config is not fully
+    reproducible. Wbt (npu_params) is byte-identical across rebuilds every
+    time tested; mcode is not, but the non-determinism is small (a
+    handful of bytes) and bounded (same total length every time), not
+    pervasive. This underpins every other differential-analysis test in
+    this file -- a same-length pair with more than a token handful of
+    byte differences is real signal, not noise, but this test exists to
+    catch it if that ever stops being true (e.g. a toolchain regression
+    that makes mcode non-determinism much larger or Wbt non-deterministic
+    at all).
+    """
+    model = _dilation_conv_model(2, 2)
+    wbt_a, mcode_a = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run1"), model, (1, 4, 16, 16)
+    )
+    wbt_b, mcode_b = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run2"), model, (1, 4, 16, 16)
+    )
+
+    assert wbt_a == wbt_b, "Wbt should be byte-identical across identical rebuilds"
+
+    assert len(mcode_a) == len(mcode_b), (
+        "mcode should serialize to the same length across identical rebuilds"
+    )
+    mcode_diff_count = sum(1 for i in range(len(mcode_a)) if mcode_a[i] != mcode_b[i])
+    assert mcode_diff_count < 50, (
+        mcode_diff_count,
+        "expected only a small, bounded amount of run-to-run mcode noise",
+    )
+
+
+def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
+    """Confirmed real (see the README's "Where does the non-determinism
+    actually come from" section): the noisy positions found by rebuilding
+    an identical two-Conv model always carry the *same multiset* of
+    values across independent rebuilds -- only which position gets which
+    value changes. That's the signature of a small set of interchangeable
+    labels (plausibly per-tile job/resource IDs) being assigned to
+    equivalent slots in a non-deterministic order (e.g. unordered-
+    container iteration order), not embedded metadata like a timestamp or
+    build ID -- real metadata could never coincidentally reproduce the
+    exact same value set across independent builds run at different
+    times, only a fixed label set being reshuffled could.
+    """
+    model = _two_conv_model(vary_first=True, dilation=2, pad=2)
+    _, mcode_a = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run1"), model, (1, 4, 16, 16)
+    )
+    _, mcode_b = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "run2"), model, (1, 4, 16, 16)
+    )
+    assert len(mcode_a) == len(mcode_b)
+
+    noisy = [i for i in range(len(mcode_a)) if mcode_a[i] != mcode_b[i]]
+    assert noisy, "expected the known small amount of run-to-run mcode noise"
+
+    multiset_a = sorted(mcode_a[i] for i in noisy)
+    multiset_b = sorted(mcode_b[i] for i in noisy)
+    assert multiset_a == multiset_b, (
+        (multiset_a, multiset_b),
+        "expected the same multiset of values at the noisy positions, just reordered",
+    )

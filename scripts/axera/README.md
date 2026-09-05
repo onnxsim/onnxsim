@@ -1004,6 +1004,289 @@ amount of genuinely distinct content anyone would need to decode to cover
 the rest: on this evidence, well under 49,080 bytes' worth of *distinct*
 templates, not 49,080 bytes of independent unique data.
 
+### Decomposing a real model into a few real ops at a time: real extraction works, but doesn't restore localization on its own
+
+A natural idea, given the last section's negative result: rather than
+editing the whole 22-`Conv` `resnet18d` at once, cut *real* subgraphs
+(genuine topology and trained weights, via `onnx.utils.Extractor`) out of
+it -- small enough, hopefully, for the clean same-length diffing that
+worked on a synthetic single-`Conv` model to work again, while still using
+representative real weights and shapes instead of made-up ones.
+
+**Real subgraph extraction itself works cleanly**: `Extractor(model)
+.extract_model([input_name], [output_name])` on a shape-inferred
+`resnet18d` produces valid, checker-passing standalone ONNX graphs for any
+internal cut -- confirmed for a single real stem `Conv` alone
+(`/conv1/conv1.0/Conv`, real 3->32-channel trained weights) and a full real
+5-op residual block (`Conv`/`Relu`/`Conv`/`Add`/`Relu`, real 64-channel
+weights, real skip-connection `Add`) with only real, existing tensor names
+as new inputs/outputs. Both compile through the real toolchain
+unmodified.
+
+**But five separate attempts at reproducing the clean, same-length
+dilation trick on real-weight single-`Conv` slices all failed**, each
+ruling out one plausible cause: the real stem `Conv` (cin=3, cout=32) at
+its real 224x224 input size (4568 -> 4600 bytes, off by 32); the *same*
+real `Conv` resized down to 16x16 -- matching the earlier tractable
+synthetic test's spatial scale exactly -- to rule out spatial size (3632 ->
+3664, still off by 32, still a wholesale-rewrite-scale diff underneath);
+a different real layer's `Conv` (cin=cout=64, both powers of two, clear of
+the tiling-boundary behavior the `cout` sweep found near 32) to rule out
+channel-count "unfriendliness" (3440 -> 4152, off by 712); the same, with
+its bias input stripped entirely, to rule out bias presence (identical
+result, 3440 -> 4152); and the same cin=cout=64 slice compared at dilation
+2 vs 3 specifically (not 1 vs 2), to exactly match the earlier synthetic
+test's own dilation transition rather than assuming any transition is
+equivalent (4152 -> 4888, off by 736). **None matched.**
+
+**A sixth, decisive test ruled out weight values too, and points back to
+shape after all.** Before concluding it was about real-vs-random weight
+*values*, that was tested directly: the cin=cout=64 slice, same dilation
+2-vs-3 transition, but with its real trained weights replaced by i.i.d.
+random Gaussian weights (matching the one synthetic test that *did* work,
+same generation code, different shape). Result: **4152 -> 4888 bytes,
+byte-for-byte the same sizes as the real-weight version of the same
+shape.** Weight values -- real or random -- made no difference whatsoever
+at this shape. That rules out the weight-values explanation cleanly: it's
+the shape itself (cin=cout=64) that reliably produces a mismatched pair,
+independent of what's actually in the tensors.
+
+**So the honest conclusion is narrower than either single-cause story**:
+whether a same-length pair exists is a property of *shape* (channel
+counts, at least, since spatial size, bias presence, and weight values
+were all ruled out above) -- but not in a simple "friendly vs. unfriendly
+channel count" way either. Of the three distinct channel-count
+combinations tested for this exact question, only the original synthetic
+test's cin=cout=4 produced a match; cin=3/cout=32 and cin=cout=64 both did
+not, across six separate real dilation-pair experiments in this section
+alone. On the evidence gathered so far, a matching pair looks like a coincidental
+alignment of whatever tiling arithmetic the compiler runs for that
+specific shape, not a systematically reachable property -- there may be a
+real, discoverable rule underneath (the earlier `cout`/`cin`
+tiling-granularity sweeps found real structure in a related question, just
+not this one), but it wasn't found here.
+
+**Bottom line for "decompose into a few ops to expand coverage"**: the
+*technique* (real subgraph extraction) is validated and reusable --
+`Extractor` cleanly produces small, real, checker-valid, toolchain-
+buildable slices of any real model, letting future differential analysis
+target real ops with real weights instead of only synthetic ones. But "few
+ops" alone does not by itself restore the localized-diff property that
+made the earlier decoding progress possible -- across every real shape
+tried from `resnet18d` (six separate dilation-pair experiments), none
+reproduced a same-length pair the way the one tiny synthetic shape
+happened to. Making
+further progress this way would need either a systematic shape sweep large
+enough to find which specific `(cin, cout, ...)` combinations do produce
+matching pairs (if any beyond the one already found), or abandoning
+same-length localization in favor of mining un-localized diffs directly
+(as the resnet18d self-similarity scan above did, successfully, without
+needing localization at all).
+
+### Chaining two real convs: genuine inter-op data transfer, and a real cross-op coupling finding
+
+Every experiment up to this point used a *single* op -- no genuine
+inter-op data transfer, since the one op's input/output are both graph
+boundaries, addressed through the tensor I/O offset table this README
+already decoded. Chaining two ops introduces a real, so-far-unexamined
+piece: the intermediate activation between them lives entirely inside the
+compiled program's own OCM/DDR addressing, with no external name to look
+up. Testing this directly: two chained `Conv`s (`cin=cout=mid=4`, the one
+shape combination confirmed to give same-length pairs) with data
+genuinely flowing from the first op's output into the second op's input.
+
+**The same-length trick survives the jump from one op to two, at this
+shape.** Varying only the first `Conv`'s dilation (2 vs 3, padding
+compensated to hold every shape downstream constant) gave two builds at
+an identical 3,920 bytes; varying only the *second* `Conv`'s dilation
+(first held completely fixed) gave two builds at an identical 3,952
+bytes. Both diffs are real and structured, not wholesale rewrites --
+confirming the technique generalizes past a single op, at least for this
+shape.
+
+**Correction (see "Is mcode deterministic?" below): the offset-858-876
+claim originally made here was wrong.** This section first reported a
+"new" diff pattern at byte offset 858-876 (four single-byte changes at a
+6-byte stride) as a candidate for the intermediate buffer's own
+addressing. Directly rebuilding the *identical* config three times (no
+parameter changed at all) later confirmed that exact byte region is
+**non-deterministic noise**, not a dilation-dependent signal -- rebuilding
+the very same `two_conv_d2` model three times in a row produced three
+different mcode blobs, differing only at these same 4-6 byte positions
+each time. That fully explains the "new content" that seemed to appear
+here: it was never caused by chaining two ops, it was present (and just
+as spurious) even with nothing changed between builds. Left in place with
+this correction rather than silently rewritten, since it's a real example
+of a finding this project got wrong before checking determinism -- see
+below for what's actually confirmed stable.
+
+**An unexpected, genuinely new finding: an op's own command bytes are not
+independent of *downstream* ops.** Varying the *second* conv's dilation
+while leaving the first conv's own attributes completely untouched still
+changes bytes in the region corresponding to the *first* conv's own
+per-op command (the same relative area the 94-byte/60-byte templates
+occupy) -- not just adding new bytes near the second conv. An op that
+didn't itself change still gets re-encoded because something later in the
+graph did. This sharpens (and partly explains) the earlier "mcode isn't
+append-only" finding: it's not only that changing a graph's *topology*
+forces a wholesale re-serialization -- even within a fixed, matching-size
+two-op program, one op's encoding depends on what happens after it, not
+just on its own attributes and its own inputs.
+
+**The periodic field looks genuinely global, not per-op.** The same
+4-repeats/7-byte-stride signature appears in *both* experiments --
+varying conv1's dilation and varying conv2's -- landing at different
+absolute offsets (2727 vs 2759) simply because the two builds have
+different overall sizes, but with the identical shape otherwise. A field
+that reacts to a dilation change no matter which of the two convs it
+belongs to is further, independent evidence for this being a shared,
+graph-wide resource (plausibly the 4-way spatial-tiling table this
+README's `resnet18d` profiling already found evidence for) rather than
+something scoped to one specific op's own command.
+
+The periodic field and the cross-op coupling finding are both confirmed
+stable under repeated identical builds (see below) -- real, precisely-
+located targets for future work, not solved encodings, but not noise
+either. Whether connecting two ops surfaces genuinely *new* content tied
+specifically to the intermediate buffer's own addressing remains an open
+question -- the one candidate found here didn't hold up.
+
+### Is `.axmodel` deterministic? No -- and that correction above is why this matters
+
+Every differential-analysis finding in this whole investigation assumes
+that rebuilding the *same* model with the *same* config twice produces
+the *same* bytes, so any observed diff is caused by the one thing that
+changed. That assumption was never directly checked until it produced a
+wrong finding (immediately above). Checked properly now, by rebuilding
+one exact model/config three separate times with no changes at all:
+
+- **`Wbt` (`npu_params`) is fully deterministic**: byte-identical
+  (matching SHA-256) across three independent builds, every time tested.
+- **`mcode` is *not* fully deterministic**: three rebuilds of the
+  identical `two_conv_d2` model produced three different mcode blobs
+  (same length, 3,920 bytes, every time -- only the *content* differs).
+  The non-determinism is small and localized, not pervasive: 3-4 bytes
+  differ per pair of runs, always at the same handful of positions (byte
+  offsets 858/864/870/876 in that specific build), cycling through what
+  looks like a small fixed set of values (`0x10`/`0x20`/`0x30`/`0x40`) in
+  different orders each time -- consistent with a non-deterministic
+  assignment of interchangeable resource/job IDs (which of several
+  equivalent parallel slots gets which label) rather than genuinely
+  random data corruption. The same experiment on the single-`Conv`
+  dilation model (from earlier in this README) found the same thing, in
+  the same relative region (offsets ~859-882), plus one additional
+  isolated stray byte elsewhere (offset 3232, differing in only one of
+  two run-pairs) -- confirming the non-determinism isn't confined to one
+  specific model shape.
+- **The overall `.axmodel` file is never byte-identical across rebuilds**
+  even though `Wbt` alone is -- three rebuilds of the same config gave
+  three different file SHA-256 hashes at the same file size, entirely
+  because of `mcode`'s non-determinism above (nothing else in the file
+  differed).
+
+**Practical impact, checked directly rather than assumed**: the two
+already-committed regression tests that depend on comparing mcode across
+builds (the periodic 4-repeats/7-byte field, and the cross-op coupling
+finding) were both re-examined against the confirmed noisy byte ranges
+above and neither overlaps with them -- the periodic field sits at a
+completely different offset range in every build tested, and the cross-op
+coupling test only inspects the first 800 bytes, entirely below where the
+noise was ever observed to start (858+ in every model tested so far).
+Both findings hold up. The one finding that *did* turn out to be an
+artifact (the "new content at 858-876" claim above) is the one case where
+this wasn't checked before publishing it -- corrected in place rather
+than removed, as a real example of why this check matters for any future
+differential-analysis claim in this space: a same-length, structured-
+looking diff is not automatically signal, and this non-determinism is
+exactly the kind of thing that can masquerade as one.
+
+**Where does the non-determinism actually come from -- metadata, or the
+mcode generation algorithm itself?** Checked directly rather than
+guessed, by looking at *which* values appear at the noisy positions, not
+just that they differ. For the clean `two_conv_d2` case (four single-byte
+positions, offsets 858/864/870/876), the exact values seen across all
+three rebuilds are:
+
+```
+run1: 858=0x10  864=0x30  870=0x20  876=0x40
+run2: 858=0x30  864=0x20  870=0x40  876=0x10
+run3: 858=0x20  864=0x40  870=0x30  876=0x10
+```
+
+**Every single run has the identical multiset `{0x10, 0x20, 0x30,
+0x40}`** at these four positions -- only *which position gets which
+value* changes. This is decisive: it's the unmistakable signature of a
+fixed, small set of interchangeable labels (plausibly per-tile or
+per-job identifiers, given this project's other evidence for 4-way
+spatial tiling) being assigned to four equivalent slots in a
+non-deterministic *order* -- consistent with iteration over an unordered
+container (hash-map/hash-set bucket order depending on pointer values or
+ASLR) or parallel-task completion order in the compiler, not with
+embedded metadata. A real timestamp, build UUID, PID, or similar tracking
+value would need to reproduce the *exact same four values* across three
+independent builds run at different wall-clock times, just shuffled --
+astronomically unlikely for anything resembling real metadata, and
+trivially expected for a label-assignment race. The messier single-`Conv`
+case (a wider, ~24-byte noisy region rather than four isolated bytes)
+didn't resolve to as clean a single-byte permutation on inspection, but
+occupies the same narrow relative region and is consistent with the same
+underlying mechanism at a different granularity (e.g. multi-byte records
+being reordered rather than single label bytes) rather than a second,
+unrelated source. No timestamp-like field (a large, monotonically
+distinct value) was found anywhere in either the noisy region or the rest
+of the file across any of the rebuilds -- the file's own metadata-shaped
+fields (`version`, `neu_name`, the JSON attributes) were separately
+confirmed identical across every rebuild in this section.
+
+### What a real, profiled two-conv chain's trace.json actually shows
+
+Following up on "does data transfer between the two convs show up as its
+own event," the `two_conv_d2` model was rebuilt with `--profile` to check
+directly rather than infer from mcode bytes alone. The real trace (17
+events total, comparable in structure to the `resnet18d` profiling
+elsewhere in this README) shows:
+
+- **No separate event for the inter-op transfer at all.** The first
+  `Conv`'s last scheduled event on the `conv1` engine ends at the exact
+  timestamp the second `Conv`'s first event on `conv1` begins (`0.63475 +
+  0.575 = 1.20975`, matching to the fifth decimal place in the raw trace).
+  There is no gap, no separate "copy"/"transfer"/"sync" event between
+  them. The hand-off is either free (same engine, same OCM location,
+  nothing to move) or its cost is folded into one of the adjacent events
+  rather than broken out on its own.
+- **Asymmetric engine usage between the two convs**: the first `Conv` runs
+  on *both* `conv0` and `conv1` in parallel (matching pairs of events at
+  identical timestamps on each); the second `Conv` runs on `conv1` alone
+  -- `conv0` does nothing after the first `Conv` finishes. Not every op in
+  a chain gets the same 2-engine split this README's `resnet18d` profiling
+  showed for that model's convs; whether an op is split across both engines
+  or run on just one is itself a real scheduling decision with no
+  visible cost model exposed here. This asymmetry is also a plausible
+  partial explanation for the mcode size non-linearity this README's
+  op-count sweep found earlier (a 32-byte-unit delta per added op, but not
+  a *constant* one) -- not every op costs the same number of engine-command
+  copies.
+- **Both weight-load events happen up front, at `ts=0`**, one per real
+  weight tensor (`ld:xxh128:...` on `cv3` and `sdma4`) -- not interleaved
+  between the two convs' execution the way a naive "load weights right
+  before you need them" schedule might. Confirms weight loading is
+  planned globally ahead of compute, consistent with the content-addressed
+  weight-load-dominates-the-schedule finding from the `resnet18d`
+  profiling elsewhere in this README, just at a much smaller scale (2
+  distinct real tensors here, nothing to deduplicate against each other).
+- **RTV events fire for both the graph input and the graph output**
+  (`__rtv_x`, `__rtv_y`) -- consistent with, and now confirmed for a
+  genuinely multi-op graph (not just the single-op case checked
+  previously), the finding that RTV isn't scoped to ISP/CV use cases.
+
+Net effect: the profiler confirms there's no dedicated, separately-timed
+"transfer" step to go looking for in mcode -- if the intermediate buffer's
+address/size needs to be encoded anywhere (and it must, since the two
+ops' reads and writes have to agree on where it lives), it's folded into
+one of the two convs' own commands rather than existing as its own
+identifiable unit, which is a real, useful negative constraint on where
+to look next.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
