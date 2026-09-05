@@ -1004,6 +1004,85 @@ amount of genuinely distinct content anyone would need to decode to cover
 the rest: on this evidence, well under 49,080 bytes' worth of *distinct*
 templates, not 49,080 bytes of independent unique data.
 
+### Decomposing a real model into a few real ops at a time: real extraction works, but doesn't restore localization on its own
+
+A natural idea, given the last section's negative result: rather than
+editing the whole 22-`Conv` `resnet18d` at once, cut *real* subgraphs
+(genuine topology and trained weights, via `onnx.utils.Extractor`) out of
+it -- small enough, hopefully, for the clean same-length diffing that
+worked on a synthetic single-`Conv` model to work again, while still using
+representative real weights and shapes instead of made-up ones.
+
+**Real subgraph extraction itself works cleanly**: `Extractor(model)
+.extract_model([input_name], [output_name])` on a shape-inferred
+`resnet18d` produces valid, checker-passing standalone ONNX graphs for any
+internal cut -- confirmed for a single real stem `Conv` alone
+(`/conv1/conv1.0/Conv`, real 3->32-channel trained weights) and a full real
+5-op residual block (`Conv`/`Relu`/`Conv`/`Add`/`Relu`, real 64-channel
+weights, real skip-connection `Add`) with only real, existing tensor names
+as new inputs/outputs. Both compile through the real toolchain
+unmodified.
+
+**But five separate attempts at reproducing the clean, same-length
+dilation trick on real-weight single-`Conv` slices all failed**, each
+ruling out one plausible cause: the real stem `Conv` (cin=3, cout=32) at
+its real 224x224 input size (4568 -> 4600 bytes, off by 32); the *same*
+real `Conv` resized down to 16x16 -- matching the earlier tractable
+synthetic test's spatial scale exactly -- to rule out spatial size (3632 ->
+3664, still off by 32, still a wholesale-rewrite-scale diff underneath);
+a different real layer's `Conv` (cin=cout=64, both powers of two, clear of
+the tiling-boundary behavior the `cout` sweep found near 32) to rule out
+channel-count "unfriendliness" (3440 -> 4152, off by 712); the same, with
+its bias input stripped entirely, to rule out bias presence (identical
+result, 3440 -> 4152); and the same cin=cout=64 slice compared at dilation
+2 vs 3 specifically (not 1 vs 2), to exactly match the earlier synthetic
+test's own dilation transition rather than assuming any transition is
+equivalent (4152 -> 4888, off by 736). **None matched.**
+
+**A sixth, decisive test ruled out weight values too, and points back to
+shape after all.** Before concluding it was about real-vs-random weight
+*values*, that was tested directly: the cin=cout=64 slice, same dilation
+2-vs-3 transition, but with its real trained weights replaced by i.i.d.
+random Gaussian weights (matching the one synthetic test that *did* work,
+same generation code, different shape). Result: **4152 -> 4888 bytes,
+byte-for-byte the same sizes as the real-weight version of the same
+shape.** Weight values -- real or random -- made no difference whatsoever
+at this shape. That rules out the weight-values explanation cleanly: it's
+the shape itself (cin=cout=64) that reliably produces a mismatched pair,
+independent of what's actually in the tensors.
+
+**So the honest conclusion is narrower than either single-cause story**:
+whether a same-length pair exists is a property of *shape* (channel
+counts, at least, since spatial size, bias presence, and weight values
+were all ruled out above) -- but not in a simple "friendly vs. unfriendly
+channel count" way either. Of the three distinct channel-count
+combinations tested for this exact question, only the original synthetic
+test's cin=cout=4 produced a match; cin=3/cout=32 and cin=cout=64 both did
+not, across six separate real dilation-pair experiments in this section
+alone. On the evidence gathered so far, a matching pair looks like a coincidental
+alignment of whatever tiling arithmetic the compiler runs for that
+specific shape, not a systematically reachable property -- there may be a
+real, discoverable rule underneath (the earlier `cout`/`cin`
+tiling-granularity sweeps found real structure in a related question, just
+not this one), but it wasn't found here.
+
+**Bottom line for "decompose into a few ops to expand coverage"**: the
+*technique* (real subgraph extraction) is validated and reusable --
+`Extractor` cleanly produces small, real, checker-valid, toolchain-
+buildable slices of any real model, letting future differential analysis
+target real ops with real weights instead of only synthetic ones. But "few
+ops" alone does not by itself restore the localized-diff property that
+made the earlier decoding progress possible -- across every real shape
+tried from `resnet18d` (six separate dilation-pair experiments), none
+reproduced a same-length pair the way the one tiny synthetic shape
+happened to. Making
+further progress this way would need either a systematic shape sweep large
+enough to find which specific `(cin, cout, ...)` combinations do produce
+matching pairs (if any beyond the one already found), or abandoning
+same-length localization in favor of mining un-localized diffs directly
+(as the resnet18d self-similarity scan above did, successfully, without
+needing localization at all).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
