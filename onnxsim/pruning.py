@@ -34773,16 +34773,36 @@ def apply_structured_pruning_qoperator(
 #     investigation did not confirm composes safely, the same bar every
 #     other quantized-weight section in this module already holds (see the
 #     QOperator section's own identical bullet).
-#   * Any residual/skip-connection merge, `Concat`-merged branch group, or
-#     gated (SwiGLU/GeGLU) pair -- only the plain single-producer/single-
-#     consumer/unary-hops-only topology above is matched, mirroring the
-#     QOperator section's own identical scope (and, for the same reason,
-#     `MatMulNBits`'s own gated-pair support is NOT mirrored here either --
-#     a real, tractable-looking follow-up deliberately left out of scope).
+#   * Any residual/skip-connection merge or `Concat`-merged branch group --
+#     only the plain single-producer/single-consumer/unary-hops-only
+#     topology (plus the gated pair below) is matched, mirroring the
+#     QOperator section's own identical scope for these two shapes.
 #
-# Sensitivity-report family string: `"dynamic_quantize_matmul"` -- a single
-# family, unlike the QDQ/QOperator families' own Conv/MatMul split, since
-# neither op here has a Conv-shaped counterpart at all.
+# The gated (SwiGLU/GeGLU) FFN pair IS mirrored here, though, exactly the
+# way `MatMulNBits`'s own gated-pair support works
+# (:func:`_find_matmul_nbits_gated_chains`): gate_proj/up_proj (two
+# producers sharing one input, EACH independently either a
+# `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node or a plain-float
+# MatMul/vanilla-Gemm peer, combined by an elementwise `Mul` -- with either
+# operand optionally passed through one of the same unary activations first
+# -- or ONNX's native fused `SwiGLU` op) feeding one down_proj consumer
+# (same either/or), with at least one of the three one of this section's own
+# two ops (:func:`_find_dynquant_gated_chains`). Confirmed via a real
+# `quantize_dynamic` -> `InferenceSession`-optimize round trip on a genuine
+# SwiGLU-style FFN (`x -> gate_proj -> QuickGelu -> Mul(., up_proj) ->
+# down_proj -> y`): the real fusion collapses this into `x_quantized, ... =
+# DynamicQuantizeLinear(x)`, TWO `MatMulIntegerToFloat` nodes (gate/up,
+# sharing that one `DynamicQuantizeLinear`'s outputs -- the identical
+# shared-quantized-activation branch shape this section's own top comment
+# already confirms `MatMulIntegerToFloat` for), a `com.microsoft::QuickGelu`
+# on the gate branch, a plain `Mul`, and one `DynamicQuantizeMatMul` down_proj
+# consumer -- see this section's own test file for the exact reproduction.
+#
+# Sensitivity-report family string: `"dynamic_quantize_matmul"` for the plain
+# single-producer/single-consumer shape, `"dynamic_quantize_matmul_gated"`
+# for the gated pair -- unlike the QDQ/QOperator families' own Conv/MatMul
+# split (neither op here has a Conv-shaped counterpart at all), this section
+# splits on plain-vs-gated instead.
 
 
 def _dynquant_scalar_or_channel_bias_ok(bias_init: onnx.TensorProto, n: int) -> bool:
@@ -35328,6 +35348,235 @@ def _find_dynquant_chains(
     return chains
 
 
+def _trace_gate_producer_backward_dynquant(
+    tensor_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, _DynQuantMatMulChainSide, int]],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Optional[
+    Tuple[
+        Tuple[onnx.NodeProto, _DynQuantMatMulChainSide, int], Tuple[onnx.NodeProto, ...]
+    ]
+]:
+    """The `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` analogue of
+    :func:`_trace_gate_producer_backward_matmul_nbits` (and, ultimately,
+    :func:`_trace_gate_producer_backward`/:func:`_trace_gate_producer_backward_qdq`):
+    walks backward from `tensor_name` through unary activation ops until it
+    resolves to a `DynamicQuantizeMatMul`/`MatMulIntegerToFloat`-or-plain-
+    float MatMul/vanilla-Gemm producer's raw output (`producer_infos`, built
+    from :func:`_match_dynquant_producer`/:func:`_match_plain_matmul_nbits_peer`
+    -- see :func:`_find_dynquant_gated_chains`). Duplicated rather than
+    shared with the `MatMulNBits`/QDQ sections' own walkers, for the
+    identical reason those sections give (structurally different
+    `producer_infos` value types).
+    """
+    pre_ops: List[onnx.NodeProto] = []
+    cur = tensor_name
+    for _ in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return None
+        if cur in producer_infos:
+            return producer_infos[cur], tuple(reversed(pre_ops))
+        producer_node = node_by_output.get(cur)
+        if producer_node is None:
+            return None
+        if not (
+            producer_node.op_type in _UNARY_PASS_THROUGH
+            and len(producer_node.input) == 1
+            and len(producer_node.output) == 1
+        ):
+            return None
+        pre_ops.append(producer_node)
+        cur = producer_node.input[0]
+    return None
+
+
+def _dynquant_gated_channel_importance(
+    w_a_nk: np.ndarray, w_b_nk: np.ndarray, importance_norm: _ImportanceNorm
+) -> np.ndarray:
+    """Combined importance across a `DynamicQuantizeMatMul`/
+    `MatMulIntegerToFloat` gated pair's two producers -- root-sum-square
+    (L2) or plain sum (L1) of each producer's own per-channel dequantized-
+    or-plain row norm, mirroring :func:`_matmul_nbits_gated_channel_importance`'s
+    own identical combination (duplicated rather than shared for this
+    section's own established "self-contained" reason).
+    """
+    if importance_norm == "l1":
+        return _qdq_channel_importance(w_a_nk, "l1") + _qdq_channel_importance(
+            w_b_nk, "l1"
+        )
+    return np.sqrt(
+        np.square(_qdq_channel_importance(w_a_nk, "l2"))
+        + np.square(_qdq_channel_importance(w_b_nk, "l2"))
+    )
+
+
+@dataclass(frozen=True)
+class _DynQuantMatMulGatedChain:
+    """The `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` analogue of a gated
+    (SwiGLU/GeGLU) :class:`_Chain` -- two producers (`producer_a`/
+    `producer_b`, gate_proj/up_proj, each EITHER a
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node or a plain-float
+    peer -- see :data:`_DynQuantMatMulChainSide`) combined by an elementwise
+    product, feeding one `consumer` (down_proj, same either/or), with at
+    least one of the three one of this section's own two ops.
+    `producer_a_pre_ops`/`producer_b_pre_ops` carry each branch's own
+    activation nodes between its raw output and the combine point (mirrors
+    :attr:`_MatMulNBitsGatedChain`'s own identical fields -- kept on the
+    chain itself, rather than added as a field on
+    :data:`_DynQuantMatMulChainSide`, since that type is a bare `Union` of
+    two independently-defined weight-fact dataclasses shared with the
+    single-producer chain above, not a per-role wrapper). See
+    :func:`_find_dynquant_gated_chains`.
+    """
+
+    producer_a: _DynQuantMatMulChainSide
+    producer_a_pre_ops: Tuple[onnx.NodeProto, ...]
+    producer_b: _DynQuantMatMulChainSide
+    producer_b_pre_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer: _DynQuantMatMulChainSide
+    n_channels: int
+
+
+def _find_dynquant_gated_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_DynQuantMatMulGatedChain]:
+    """The `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` analogue of
+    :func:`_find_matmul_nbits_gated_chains` (and, ultimately, of
+    :func:`_find_gated_chains` itself): recognizes the same gated (SwiGLU/
+    GeGLU) MatMul/vanilla-Gemm pair -- gate_proj/up_proj sharing one input,
+    combined via a plain elementwise `Mul` of two non-constant operands
+    (each optionally through its own `_UNARY_PASS_THROUGH` activation -- the
+    real repro this section's own top comment describes uses
+    `com.microsoft::QuickGelu` on the gate branch, already a member of that
+    set) or ONNX's native fused `SwiGLU` node, feeding into exactly one
+    downstream consumer whose input-channel count matches
+    (:func:`_walk_to_dynquant_consumer`) -- except gate_proj/up_proj/
+    down_proj may now each independently be EITHER a
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node OR a plain-float
+    MatMul/vanilla-Gemm peer (:func:`_match_dynquant_producer`/
+    :func:`_match_plain_matmul_nbits_peer`, the exact same resolution
+    :func:`_find_dynquant_chains`'s own single-producer case uses),
+    requiring at least one of the three to actually be one of this
+    section's own two ops (an all-plain-float triple is
+    :func:`_find_gated_chains`'s own job, not duplicated here).
+
+    `value_info_by_name`, when given, is threaded straight through to
+    :func:`_walk_to_dynquant_consumer` -- see its own identical parameter.
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, _DynQuantMatMulChainSide, int]] = {}
+    for node in graph.node:
+        if node.op_type in ("DynamicQuantizeMatMul", "MatMulIntegerToFloat"):
+            w = _match_dynquant_producer(node, initializer_map, consumers_of)
+            if w is not None:
+                producer_infos[node.output[0]] = (node, w, w.N)
+        else:
+            peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+            if peer is not None:
+                producer_infos[node.output[0]] = (node, peer, peer.out_channels)
+
+    chains: List[_DynQuantMatMulGatedChain] = []
+    for node in graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2 and len(node.output) == 1:
+            a_name, b_name = node.input
+            if (
+                a_name == b_name
+                or a_name in initializer_map
+                or b_name in initializer_map
+            ):
+                continue
+            trace_a = _trace_gate_producer_backward_dynquant(
+                a_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            trace_b = _trace_gate_producer_backward_dynquant(
+                b_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if trace_a is None or trace_b is None:
+                continue
+            info_a, pre_a = trace_a
+            info_b, pre_b = trace_b
+        elif (
+            node.op_type == "SwiGLU" and len(node.input) == 2 and len(node.output) == 1
+        ):
+            a_name, b_name = node.input
+            if a_name in initializer_map or b_name in initializer_map:
+                continue
+            if not (_is_internal(a_name) and _is_internal(b_name)):
+                continue
+            info_a_lookup = producer_infos.get(a_name)
+            info_b_lookup = producer_infos.get(b_name)
+            if info_a_lookup is None or info_b_lookup is None:
+                continue
+            info_a, pre_a = info_a_lookup, ()
+            info_b, pre_b = info_b_lookup, ()
+        else:
+            continue
+
+        node_a, side_a, n_a = info_a
+        node_b, side_b, n_b = info_b
+        if node_a is node_b or n_a != n_b:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        found = _walk_to_dynquant_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_a,
+            _MAX_CHAIN_HOPS,
+            value_info_by_name,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+
+        if (
+            isinstance(side_a, _PlainMatMulNBitsPeer)
+            and isinstance(side_b, _PlainMatMulNBitsPeer)
+            and isinstance(consumer, _PlainMatMulNBitsPeer)
+        ):
+            continue  # all plain float -- _find_gated_chains's own job
+
+        chains.append(
+            _DynQuantMatMulGatedChain(
+                producer_a=side_a,
+                producer_a_pre_ops=pre_a,
+                producer_b=side_b,
+                producer_b_pre_ops=pre_b,
+                chain_ops=chain_ops,
+                consumer=consumer,
+                n_channels=n_a,
+            )
+        )
+    return chains
+
+
 def apply_structured_pruning_dynamic_quantize_matmul(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -35369,10 +35618,33 @@ def apply_structured_pruning_dynamic_quantize_matmul(
     plain-float pair is never matched here (that is
     :func:`apply_structured_pruning`'s own job).
 
-    No gated (SwiGLU/GeGLU) pair, residual/skip-connection merge, or
-    ``Concat``-merged branch group is matched -- only the plain single-
-    producer/single-consumer topology above (see this module's own section
-    comment for the full scope-boundary list).
+    Also handles the gated (SwiGLU/GeGLU) FFN pair
+    (:func:`_find_dynquant_gated_chains`, the `DynamicQuantizeMatMul`/
+    `MatMulIntegerToFloat` analogue of :func:`_find_gated_chains`) --
+    gate_proj/up_proj (two producers sharing one input, EACH independently
+    either one of this section's own two ops or a plain-float MatMul/
+    vanilla-Gemm peer, combined by an elementwise `Mul` with either operand
+    optionally passed through one of the same unary activations first, or
+    ONNX's native fused `SwiGLU` op) feeding one down_proj consumer (same
+    either/or), with at least one of the three one of this section's own two
+    ops. Both producers are ranked by combined (root-sum-square, or plain
+    sum for L1) importance of their own dequantized-or-plain rows
+    (:func:`_dynquant_gated_channel_importance`) and cut to the *same*
+    surviving channel-index set, since they're about to be multiplied
+    elementwise -- each producer sliced by the same per-role helper an
+    ordinary chain's producer already uses
+    (:func:`_slice_dynquant_chain_producer`). down_proj is sliced on its
+    input axis exactly like an ordinary consumer above
+    (:func:`_slice_dynquant_chain_consumer`) -- there is no block-alignment
+    precondition to check at all here, unlike `MatMulNBits`'s own gated
+    pair, since neither op's own weight codes are ever block-quantized (see
+    this module's own section comment). Gated pairs are MatMul/Gemm-only,
+    mirroring :func:`_find_gated_chains`'s own restriction.
+
+    No residual/skip-connection merge or ``Concat``-merged branch group is
+    matched -- only the plain single-producer/single-consumer topology and
+    the gated pair above (see this module's own section comment for the
+    full scope-boundary list).
 
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
@@ -35403,7 +35675,8 @@ def apply_structured_pruning_dynamic_quantize_matmul(
         )
         initializer_map = _constant_map(graph)
         chains = _find_dynquant_chains(graph, value_info_by_name)
-        if not chains:
+        gated_chains = _find_dynquant_gated_chains(graph, value_info_by_name)
+        if not chains and not gated_chains:
             continue
 
         producer_touched: Set[str] = set()
@@ -35453,6 +35726,57 @@ def apply_structured_pruning_dynamic_quantize_matmul(
             const_touched.update(consts)
             stale_value_info.add(p.node.output[0])
             stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _dynquant_chain_side_key(pa)
+            pb_key = _dynquant_chain_side_key(pb)
+            c_key = _dynquant_chain_side_key(c)
+            gconsts = {
+                const_name
+                for _, const_name in gchain.chain_ops
+                if const_name is not None
+            }
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles)
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+                or (gconsts & const_touched)
+            ):
+                continue  # a shared/tied weight another chain already resized
+
+            n = gchain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_a_nk = _dynquant_chain_producer_weight_nk(pa)
+            w_b_nk = _dynquant_chain_producer_weight_nk(pb)
+            importance = _dynquant_gated_channel_importance(
+                w_a_nk, w_b_nk, importance_norm
+            )
+            # `kind="stable"` for the identical determinism reason the
+            # single-producer loop above documents on this same line.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            _slice_dynquant_chain_producer(pa, keep)
+            _slice_dynquant_chain_producer(pb, keep)
+            _slice_dynquant_chain_consumer(c, keep)
+            for _, const_name in gchain.chain_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
+            const_touched.update(gconsts)
+            stale_value_info.add(pa.node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.producer_a_pre_ops)
+            stale_value_info.add(pb.node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
+            stale_value_info.update(op.output[0] for op, _ in gchain.chain_ops)
 
         if stale_value_info:
             kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
@@ -42626,12 +42950,23 @@ def _analyze_structured_pruning_qoperator(
 
 
 def _dynquant_not_eligible(
-    graph: onnx.GraphProto, chains: List[_DynQuantMatMulChain]
+    graph: onnx.GraphProto,
+    chains: List[_DynQuantMatMulChain],
+    gated_chains: List[_DynQuantMatMulGatedChain],
 ) -> List[str]:
+    """Extended, alongside :func:`apply_structured_pruning_dynamic_quantize_matmul`'s
+    own gated (SwiGLU/GeGLU) pair matching, to also mark a matched gated
+    pair's own producers/consumer ineligible -- mirroring
+    :func:`_matmul_nbits_not_eligible`'s own identical extension.
+    """
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
         matched_ids.add(id(chain.consumer.node))
+    for gchain in gated_chains:
+        matched_ids.add(id(gchain.producer_a.node))
+        matched_ids.add(id(gchain.producer_b.node))
+        matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
         if node.op_type not in ("DynamicQuantizeMatMul", "MatMulIntegerToFloat"):
@@ -42674,6 +43009,16 @@ def _analyze_structured_pruning_dynamic_quantize_matmul(
     and consumer role gets no report row at all, mirroring
     :func:`_analyze_structured_pruning_qoperator`'s own identical treatment.
 
+    Also mirrors the real call's own gated (SwiGLU/GeGLU) pair support
+    (:func:`_find_dynquant_gated_chains`, `family="dynamic_quantize_matmul_gated"`)
+    -- same touched-role/keep-count treatment as an ordinary chain above,
+    just against the combined (root-sum-square, or plain sum for L1)
+    importance of both producers (:func:`_dynquant_gated_channel_importance`),
+    and reported as one row per gated pair (`label` joining both producers'
+    own labels, mirroring :func:`_chain_label`'s own plain-float
+    convention). No block-alignment precondition applies here either,
+    exactly like the plain family's own dry-run mirror above.
+
     Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
     "Subgraph recursion" section comment), the dry-run mirror of
     :func:`apply_structured_pruning_dynamic_quantize_matmul`'s own subgraph
@@ -42697,8 +43042,9 @@ def _analyze_structured_pruning_dynamic_quantize_matmul(
             else _value_info_by_name(graph)
         )
         chains = _find_dynquant_chains(graph, value_info_by_name)
-        not_eligible.extend(_dynquant_not_eligible(graph, chains))
-        if not chains:
+        gated_chains = _find_dynquant_gated_chains(graph, value_info_by_name)
+        not_eligible.extend(_dynquant_not_eligible(graph, chains, gated_chains))
+        if not chains and not gated_chains:
             continue
 
         producer_touched: Set[str] = set()
@@ -42763,6 +43109,76 @@ def _analyze_structured_pruning_dynamic_quantize_matmul(
             )
 
             producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _dynquant_chain_side_key(pa)
+            pb_key = _dynquant_chain_side_key(pb)
+            c_key = _dynquant_chain_side_key(c)
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles) -- no report row
+
+            label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
+            family = "dynamic_quantize_matmul_gated"
+            n = gchain.n_channels
+
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_a_nk = _dynquant_chain_producer_weight_nk(pa)
+            w_b_nk = _dynquant_chain_producer_weight_nk(pb)
+            importance = _dynquant_gated_channel_importance(
+                w_a_nk, w_b_nk, importance_norm
+            )
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
+            )
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
             consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)

@@ -42364,6 +42364,345 @@ def test_apply_structured_pruning_dynamic_quantize_matmul_registered_in_sensitiv
     )
 
 
+# --- apply_structured_pruning_dynamic_quantize_matmul: gated (SwiGLU/GeGLU) --
+# --- pair ---------------------------------------------------------------
+#
+# The `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` analogue of the
+# `MatMulNBits` family's own gated-FFN tests (`_nbits_gated_model`) -- see
+# `onnxsim/pruning.py`'s own `_find_dynquant_gated_chains`/
+# `_dynquant_gated_channel_importance` docstrings. A real
+# `quantize_dynamic` -> `InferenceSession`-optimize round trip on a genuine
+# SwiGLU-style FFN (`x -> gate_proj -> QuickGelu -> Mul(., up_proj) ->
+# down_proj -> y`) confirmed the exact shape these tests build directly:
+# `x_quantized, x_scale, x_zero_point = DynamicQuantizeLinear(x)`, TWO
+# `com.microsoft::MatMulIntegerToFloat` nodes (gate/up, both reading that
+# one `DynamicQuantizeLinear`'s own outputs -- the identical shared-
+# quantized-activation branch shape this module's own section comment
+# already confirms `MatMulIntegerToFloat` for), a `com.microsoft::QuickGelu`
+# on the gate branch, a plain `Mul`, and one `com.microsoft::
+# DynamicQuantizeMatMul` down_proj consumer. Every weight below is
+# quantized via the REAL `onnxruntime.quantization.quantize_dynamic` tool
+# (:func:`_quantize_dynamic_weight`), never a hand-rolled re-implementation
+# -- the same "real quantizer for fixtures, parser for graph structure"
+# pattern this file's own plain `DynamicQuantizeMatMul` section above
+# establishes.
+
+
+def _dqmm_gated_model_from_weights(
+    K, H, N2, Wg_f, Wu_f, Wd_f, per_channel=True, gate_activation=None, seed=0
+):
+    """Builds ``gate = DynamicQuantizeMatMul(X, Wg) [-> gate_activation] ->
+    gate_act``, ``up = DynamicQuantizeMatMul(X, Wu)``, ``h = Mul(gate_act,
+    up)``, ``Y = DynamicQuantizeMatMul(h, Wd)`` -- the gated (SwiGLU/GeGLU)
+    FFN shape -- from explicit float weights, each independently quantized
+    via the real tool (:func:`_quantize_dynamic_weight`). `gate_activation`,
+    when given, is a node-call string (e.g. ``"com.microsoft.QuickGelu"``)
+    inserted between the gate producer and the combining ``Mul``; left
+    ``None``, the gate producer's own output feeds ``Mul`` directly.
+    Mirrors :func:`_dqmm_model_from_weights` exactly, just with two
+    producers combined by a gate instead of one straight chain.
+    """
+    Wgq, Wgs, Wgzp = _quantize_dynamic_weight(Wg_f, per_channel)
+    Wuq, Wus, Wuzp = _quantize_dynamic_weight(Wu_f, per_channel)
+    Wdq, Wds, Wdzp = _quantize_dynamic_weight(Wd_f, per_channel)
+
+    if gate_activation is None:
+        gate_act_line = ""
+        mul_gate_input = "gate"
+    else:
+        gate_act_line = f"gate_act = {gate_activation}(gate)\n      "
+        mul_gate_input = "gate_act"
+
+    body = f"""
+    g (float[1,{K}] X) => (float[1,{N2}] Y)
+    {{
+      gate = com.microsoft.DynamicQuantizeMatMul(X, Wg, Wg_scale, Wg_zero_point)
+      {gate_act_line}up = com.microsoft.DynamicQuantizeMatMul(X, Wu, Wu_scale, Wu_zero_point)
+      h = Mul({mul_gate_input}, up)
+      Y = com.microsoft.DynamicQuantizeMatMul(h, Wd, Wd_scale, Wd_zero_point)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(Wgq, "Wg"),
+        onnx.numpy_helper.from_array(Wgs, "Wg_scale"),
+        onnx.numpy_helper.from_array(Wgzp, "Wg_zero_point"),
+        onnx.numpy_helper.from_array(Wuq, "Wu"),
+        onnx.numpy_helper.from_array(Wus, "Wu_scale"),
+        onnx.numpy_helper.from_array(Wuzp, "Wu_zero_point"),
+        onnx.numpy_helper.from_array(Wdq, "Wd"),
+        onnx.numpy_helper.from_array(Wds, "Wd_scale"),
+        onnx.numpy_helper.from_array(Wdzp, "Wd_zero_point"),
+    ]
+    model = _model(body, initializer=inits, opset=21)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model, {
+        "Wg_f": Wg_f,
+        "Wu_f": Wu_f,
+        "Wd_f": Wd_f,
+        "Wgq": Wgq,
+        "Wgs": Wgs,
+        "Wgzp": Wgzp,
+        "Wuq": Wuq,
+        "Wus": Wus,
+        "Wuzp": Wuzp,
+        "Wdq": Wdq,
+        "Wds": Wds,
+        "Wdzp": Wdzp,
+    }
+
+
+def _dqmm_gated_importance_keep(info, keep_count):
+    # Mirrors `_dqmm_importance_keep`'s own per-producer per-column L2 norm,
+    # combined root-sum-square across gate/up -- the exact criterion
+    # `_dynquant_gated_channel_importance` computes (default "l2").
+    wg_dequant = (
+        info["Wgq"].astype(np.float64) - info["Wgzp"].astype(np.float64)[None, :]
+    ) * info["Wgs"].astype(np.float64)[None, :]
+    wu_dequant = (
+        info["Wuq"].astype(np.float64) - info["Wuzp"].astype(np.float64)[None, :]
+    ) * info["Wus"].astype(np.float64)[None, :]
+    importance = np.sqrt(
+        np.linalg.norm(wg_dequant, axis=0) ** 2
+        + np.linalg.norm(wu_dequant, axis=0) ** 2
+    )
+    return np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+
+def test_dynamic_quantize_matmul_gated_ffn_quick_gelu_matches_oracle():
+    # The real repro shape this feature closes the gap for: a SwiGLU-style
+    # FFN (gate_proj -> QuickGelu, up_proj, combined by Mul, down_proj) with
+    # every producer dynamically quantized via the real `quantize_dynamic`
+    # tool. Confirms both the match/prune wiring (item (a): a gated pair
+    # feeding a downstream consumer) AND that `com.microsoft::QuickGelu` is
+    # correctly recognized as a pass-through activation on the gate branch
+    # (item (c): already a member of `_UNARY_PASS_THROUGH`, confirmed here
+    # rather than assumed).
+    K, H, N2 = 16, 24, 12
+    rng = np.random.default_rng(700)
+    Wg_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd_f = (rng.standard_normal((H, N2)) * 0.3).astype(np.float32)
+    model, info = _dqmm_gated_model_from_weights(
+        K, H, N2, Wg_f, Wu_f, Wd_f, gate_activation="com.microsoft.QuickGelu", seed=700
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_dynquant_gated_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == H
+    assert len(chains[0].producer_a_pre_ops) == 1
+    assert chains[0].producer_a_pre_ops[0].op_type == "QuickGelu"
+    assert chains[0].producer_b_pre_ops == ()
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wg_scale"].dims) == [H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, N2]
+
+    keep = _dqmm_gated_importance_keep(info, H // 2)
+    # "slice, don't recompute": the pruned graph's own quantized codes/
+    # scale/zero_point are EXACTLY a hand-slice of the original ones.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wg"]), info["Wgq"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wg_scale"]), info["Wgs"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wu"]), info["Wuq"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wd"]), info["Wdq"][keep, :]
+    )
+
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_matmul_gated_plain_mul_matches_and_prunes():
+    # No activation at all between the gate producer and the combining
+    # `Mul` -- the plain SwiGLU/GeGLU shape without a fused gate activation.
+    K, H, N2 = 16, 24, 12
+    rng = np.random.default_rng(701)
+    Wg_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd_f = (rng.standard_normal((H, N2)) * 0.3).astype(np.float32)
+    model, info = _dqmm_gated_model_from_weights(K, H, N2, Wg_f, Wu_f, Wd_f, seed=701)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_dynquant_gated_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].producer_a_pre_ops == ()
+    assert chains[0].producer_b_pre_ops == ()
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep = _dqmm_gated_importance_keep(info, H // 2)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wg"]), info["Wgq"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wu"]), info["Wuq"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wd"]), info["Wdq"][keep, :]
+    )
+
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_matmul_gated_plain_float_down_proj_is_matched_and_pruned():
+    # down_proj as a plain-float peer instead of a quantized node -- the
+    # mixed-family union `_walk_to_dynquant_consumer` already supports for
+    # the non-gated case, mirrored here for the gated pair (per this task's
+    # own "consumer-side note": the gated finder must not arbitrarily
+    # restrict to plain-float-only, or to quantized-only, on the consumer
+    # side).
+    K, H, N2 = 16, 24, 12
+    rng = np.random.default_rng(702)
+    Wg_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd_f = (rng.standard_normal((H, N2)) * 0.3).astype(np.float32)
+    Wgq, Wgs, Wgzp = _quantize_dynamic_weight(Wg_f, per_channel=True)
+    Wuq, Wus, Wuzp = _quantize_dynamic_weight(Wu_f, per_channel=True)
+    body = f"""
+    g (float[1,{K}] X) => (float[1,{N2}] Y)
+    {{
+      gate = com.microsoft.DynamicQuantizeMatMul(X, Wg, Wg_scale, Wg_zero_point)
+      up = com.microsoft.DynamicQuantizeMatMul(X, Wu, Wu_scale, Wu_zero_point)
+      h = Mul(gate, up)
+      Y = MatMul(h, Wd)
+    }}
+    """
+    model = _model(
+        body,
+        initializer=[
+            onnx.numpy_helper.from_array(Wgq, "Wg"),
+            onnx.numpy_helper.from_array(Wgs, "Wg_scale"),
+            onnx.numpy_helper.from_array(Wgzp, "Wg_zero_point"),
+            onnx.numpy_helper.from_array(Wuq, "Wu"),
+            onnx.numpy_helper.from_array(Wus, "Wu_scale"),
+            onnx.numpy_helper.from_array(Wuzp, "Wu_zero_point"),
+            _f32(Wd_f, "Wd"),
+        ],
+        opset=21,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_dynquant_gated_chains(model.graph)
+    assert len(chains) == 1
+    assert isinstance(chains[0].producer_a, onnxsim.pruning._DynQuantMatMulWeight)
+    assert isinstance(chains[0].producer_b, onnxsim.pruning._DynQuantMatMulWeight)
+    assert isinstance(chains[0].consumer, onnxsim.pruning._PlainMatMulNBitsPeer)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, N2]
+
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_matmul_gated_tied_weight_is_declined():
+    # Mirrors `test_dynamic_quantize_matmul_tied_weight_is_declined`'s own
+    # precedent (item (b)): a second, unrelated node also reads the gate
+    # producer's own quantized weight -- shared/tied, so
+    # `_match_dynquant_producer` declines that node outright (never even
+    # entering `producer_infos`), and the whole gated pair goes unmatched.
+    K, H, N2 = 16, 24, 12
+    rng = np.random.default_rng(703)
+    Wg_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd_f = (rng.standard_normal((H, N2)) * 0.3).astype(np.float32)
+    model, _info = _dqmm_gated_model_from_weights(K, H, N2, Wg_f, Wu_f, Wd_f, seed=703)
+    extra = onnx.helper.make_node("Identity", ["Wg"], ["Wg_alias"], name="alias")
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Wg_alias", onnx.TensorProto.INT8, [K, H])
+    )
+    chains = onnxsim.pruning._find_dynquant_gated_chains(model.graph)
+    assert chains == []
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    inits_before = {t.name: list(t.dims) for t in model.graph.initializer}
+    inits_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    assert inits_after == inits_before  # left completely untouched
+
+
+def test_dynamic_quantize_matmul_gated_all_plain_float_is_not_matched_here():
+    # An all-plain-float gated triple is `_find_gated_chains`'s own job, not
+    # duplicated here -- mirrors `_find_matmul_nbits_gated_chains`'s
+    # identical bar.
+    K, H, N2 = 16, 24, 12
+    rng = np.random.default_rng(704)
+    Wg_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd_f = (rng.standard_normal((H, N2)) * 0.3).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N2}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          up = MatMul(X, Wu)
+          h = Mul(gate, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(Wg_f, "Wg"), _f32(Wu_f, "Wu"), _f32(Wd_f, "Wd")],
+        opset=21,
+    )
+    chains = onnxsim.pruning._find_dynquant_gated_chains(model.graph)
+    assert chains == []
+
+
+def test_analyze_structured_pruning_dynamic_quantize_matmul_gated_matches_real_call():
+    K, H, N2 = 16, 24, 12
+    rng = np.random.default_rng(705)
+    Wg_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu_f = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd_f = (rng.standard_normal((H, N2)) * 0.3).astype(np.float32)
+    model, _info = _dqmm_gated_model_from_weights(K, H, N2, Wg_f, Wu_f, Wd_f, seed=705)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_dynamic_quantize_matmul, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "dynamic_quantize_matmul_gated"
+    assert layer.total == H
+    assert layer.would_drop == H // 2
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    dims_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    assert dims_after["Wg"][1] == H - layer.would_drop
+
+
 # --- FusedConv/FusedGemm (com.microsoft, ConvActivationFusion/GemmActivationFusion) ---
 #
 # `com.microsoft::FusedConv`/`com.microsoft::FusedGemm` are ONNX Runtime's own
