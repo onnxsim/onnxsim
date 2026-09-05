@@ -21998,12 +21998,22 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 //     product and Softmax simply fails to match at all here (the `Add`
 //     node's own op_type is never `Mul`/`Div`/`MatMul`) -- a decline, never
 //     a mis-slice.
-//   - No decomposed RoPE (`_DecomposedRopePassThrough`) or decomposed
-//     Q/K-norm (`_DecomposedQKNormPassThrough`) pass-through is recognized
-//     between a branch's own head-split `Reshape`/`Transpose` and the QK^T
-//     product -- either one sitting there breaks this port's own fixed
-//     `Reshape -> Transpose` adjacency check, so the whole chain simply
-//     fails to match (declines), the same safe fallback.
+//   - Decomposed RoPE (`DecomposedRopePassThrough`, mirroring pruning.py's
+//     own `_DecomposedRopePassThrough`/`_match_decomposed_rope_pass_through`)
+//     and decomposed Q/K-norm (`DecomposedQKNormPassThrough`, mirroring
+//     pruning.py's own `_DecomposedQKNormPassThrough`/
+//     `_match_decomposed_qk_norm_pass_through`) pass-through ARE recognized
+//     now -- see this section's own comments directly above each struct for
+//     the exact topology -- but only for Q's own branch and K's separate-
+//     `perm=[0,1,3,2]` swap branch (`kPermSwap`), mirroring pruning.py's own
+//     identical narrowing: neither hop is ever matched for K's combined-
+//     `perm=[0,2,3,1]` shape (`kPermCombined`) or for an `Einsum`-based QK^T
+//     product -- this port has neither of those at all, so the gap is moot
+//     here -- and Q/K-norm is never matched on V's own branch (no analogous
+//     norm on V in any real export). Neither hop's own matched nodes are
+//     ever rewritten -- see `DecomposedRopePassThrough`'s/
+//     `DecomposedQKNormPassThrough`'s own comments for why -- only marked
+//     stale, the same treatment `RepeatKv`'s own branch nodes already get.
 //   - No `Einsum`-based QK^T/AV product (`_einsum_equation_is_batched_
 //     matmul`) -- `MatMul` only, mirroring this port's existing
 //     Attention-family scope everywhere else.
@@ -22041,6 +22051,571 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 // rewiring only this chain's own owning node(s) onto it -- see
 // RewriteDecomposedShapeDim's own comment below for the exact mechanism,
 // mirroring pruning.py's own `_rewrite_shape_dim` local helper.
+
+// True iff `name` names a constant FLOAT scalar (`ScalarFloatConst`) whose
+// value is exactly `value` -- mirrors pruning.py's own
+// `_flat_scalar_float_const_equals`, used here for a decomposed Q/K-norm's
+// own `Div(1.0, std)` numerator check (confirming the node genuinely
+// computes `1/std` rather than some other division entirely).
+bool ScalarFloatConstEquals(const std::string& name, const InitMap& init_map,
+                            float value) {
+  if (!ScalarFloatConst(name, init_map)) {
+    return false;
+  }
+  std::vector<float> values = ReadFloatTensor(*init_map.at(name));
+  return values.size() == 1 && values[0] == value;
+}
+
+// One matched Q- or K-branch decomposed RoPE application -- a real
+// `torch.onnx.export()` of a Llama/Mistral/Qwen/Gemma-style eager-attention
+// module applies HuggingFace's own `apply_rotary_pos_emb`/`rotate_half` --
+// genuinely decomposed math, no fused rotary op at all -- to Q's/K's own
+// post-head-split `(B, H, S, Dh)` tensor, between that branch's own
+// head-split `Transpose` output and (for Q) the QK^T `MatMul`'s own Q input
+// or (for K) wherever K's own dot-product-transpose resolution expects its
+// input (before `repeat_kv`, when both are present). Mirrors pruning.py's
+// own `_DecomposedRopePassThrough`/`_match_decomposed_rope_pass_through`
+// exactly: `result = direct + rotated = (x * cos) + (rotate_half(x) * sin)`,
+// `rotate_half(x) = Concat(Neg(x[..., half:]), x[..., :half], axis=-1)`.
+// Recognized and passed through untouched -- neither `cos`/`sin` nor
+// `rotate_half`'s own `Slice` bounds ever carry a `num_heads`/
+// `kv_num_heads`-sized axis (both are fixed in terms of `head_size` alone,
+// which whole-head/KV-group pruning never touches), so this hop needs ZERO
+// rewriting of any kind post-pruning; `nodes` exists purely for
+// ApplyOneDecomposedGqaChain's own stale-`value_info` bookkeeping. `half` is
+// the confirmed `rotate_half` split point (`x1`'s own `Slice`'s `ends[0]`),
+// threaded through purely for DecomposedRopeHopIsConsistent's own deferred
+// `half * 2 == head_size` check, run only once `head_size` itself (this
+// branch's own, resolved by the caller's own MatchDecomposedHeadSplit call
+// on the returned root) is known.
+struct DecomposedRopePassThrough {
+  std::vector<onnx::NodeProto*> nodes;  // add, mul_direct, mul_rotated,
+                                         // concat, neg, slice1, slice2
+  int64_t half = 0;
+};
+
+// Resolves `name` (already confirmed internal by the caller) backward
+// through the textbook HuggingFace `rotate_half` -- `Concat(Neg(Slice(x,
+// second_half)), Slice(x, first_half), axis=-1)` -- mirrors pruning.py's own
+// `_match_decomposed_rotate_half_slice` exactly. Both `Slice`s must share
+// the identical root `x` and resolve to a contiguous, non-overlapping,
+// `axes=[3]`-or-`[-1]`, `steps=[1]` split (first half starting at 0, second
+// half starting exactly where the first ends) -- the actual `half * 2 ==
+// head_size` cleanliness check is deferred to DecomposedRopeHopIsConsistent,
+// once `head_size` itself is known.
+struct RotateHalfSliceMatch {
+  onnx::NodeProto* concat;
+  onnx::NodeProto* neg;
+  onnx::NodeProto* slice1;  // x[..., :half]
+  onnx::NodeProto* slice2;  // x[..., half:]
+  std::string root_name;
+  int64_t half;
+};
+
+std::optional<RotateHalfSliceMatch> MatchDecomposedRotateHalfSlice(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+  auto cit = node_by_output.find(name);
+  if (cit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* concat = cit->second;
+  if (concat->domain() != "" || concat->op_type() != "Concat" ||
+      concat->input_size() != 2 || concat->input(0).empty() ||
+      concat->input(1).empty() || concat->output_size() != 1 ||
+      concat->output(0) != name) {
+    return std::nullopt;
+  }
+  int64_t concat_axis = 0;
+  bool has_axis = false;
+  for (const auto& attr : concat->attribute()) {
+    if (attr.name() == "axis") {
+      concat_axis = attr.i();
+      has_axis = true;
+    }
+  }
+  if (!has_axis || (concat_axis != -1 && concat_axis != 3)) {
+    return std::nullopt;
+  }
+
+  const std::string neg_out = concat->input(0);
+  const std::string x1_out = concat->input(1);
+  if (neg_out == x1_out || !is_internal(neg_out)) {
+    return std::nullopt;
+  }
+  auto nit = node_by_output.find(neg_out);
+  if (nit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* neg = nit->second;
+  if (neg->domain() != "" || neg->op_type() != "Neg" || neg->input_size() != 1 ||
+      neg->input(0).empty() || neg->output_size() != 1 ||
+      neg->output(0) != neg_out) {
+    return std::nullopt;
+  }
+  const std::string x2_out = neg->input(0);
+  if (x2_out.empty() || !is_internal(x2_out)) {
+    return std::nullopt;
+  }
+
+  auto match_half_slice =
+      [&](const std::string& out_name)
+      -> std::optional<std::tuple<onnx::NodeProto*, std::string, int64_t, int64_t>> {
+    auto sit = node_by_output.find(out_name);
+    if (sit == node_by_output.end()) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* s = sit->second;
+    if (s->domain() != "" || s->op_type() != "Slice" || s->input_size() != 5 ||
+        s->output_size() != 1 || s->output(0) != out_name) {
+      return std::nullopt;
+    }
+    for (const auto& in : s->input()) {
+      if (in.empty()) {
+        return std::nullopt;
+      }
+    }
+    const std::string data_name = s->input(0);
+    const onnx::TensorProto* consts[4];
+    for (int i = 0; i < 4; ++i) {
+      auto it = init_map.find(s->input(i + 1));
+      if (it == init_map.end() ||
+          it->second->data_type() != onnx::TensorProto::INT64 ||
+          it->second->dims_size() != 1 || it->second->dims(0) != 1) {
+        return std::nullopt;
+      }
+      consts[i] = it->second;
+    }
+    const int64_t start = ReadInt64Tensor(*consts[0])[0];
+    const int64_t end = ReadInt64Tensor(*consts[1])[0];
+    const int64_t axis = ReadInt64Tensor(*consts[2])[0];
+    const int64_t step = ReadInt64Tensor(*consts[3])[0];
+    if ((axis != -1 && axis != 3) || step != 1) {
+      return std::nullopt;
+    }
+    return std::make_tuple(s, data_name, start, end);
+  };
+
+  auto slice1 = match_half_slice(x1_out);  // expected: x[..., :half]
+  if (!slice1) {
+    return std::nullopt;
+  }
+  auto [slice1_node, root1, start1, end1] = *slice1;
+  auto slice2 = match_half_slice(x2_out);  // expected: x[..., half:]
+  if (!slice2) {
+    return std::nullopt;
+  }
+  auto [slice2_node, root2, start2, end2] = *slice2;
+
+  if (root1 != root2 || graph_outputs.count(root1)) {
+    return std::nullopt;
+  }
+  if (start1 != 0 || end1 <= 0 || start2 != end1 || end2 < end1) {
+    return std::nullopt;
+  }
+
+  return RotateHalfSliceMatch{concat, neg, slice1_node, slice2_node, root1,
+                              end1};
+}
+
+struct RopePassThroughMatch {
+  DecomposedRopePassThrough hop;
+  std::string root_name;
+};
+
+// Resolves `name` (already confirmed internal by the caller) backward
+// through the fixed 7-node decomposed-RoPE shape DecomposedRopePassThrough's
+// own comment above describes. Returns `(hop, root_name)` -- `root_name` the
+// tensor immediately upstream of every node crossed (expected, by the
+// caller, to be this branch's own head-split `Transpose` output) -- or
+// `nullopt` if `name` isn't produced by exactly this shape, INCLUDING simply
+// not being produced by an `Add` at all (the common case for a chain with no
+// RoPE -- the caller falls back to treating `name` itself as the pre-RoPE
+// root). Mirrors pruning.py's own `_match_decomposed_rope_pass_through`
+// exactly.
+std::optional<RopePassThroughMatch> MatchDecomposedRopePassThrough(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+  auto ait = node_by_output.find(name);
+  if (ait == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* add = ait->second;
+  if (add->domain() != "" || add->op_type() != "Add" || add->input_size() != 2 ||
+      add->input(0).empty() || add->input(1).empty() ||
+      add->output_size() != 1 || add->output(0) != name) {
+    return std::nullopt;
+  }
+  const std::string a_name = add->input(0);
+  const std::string b_name = add->input(1);
+  if (a_name == b_name) {
+    return std::nullopt;
+  }
+
+  auto try_order =
+      [&](const std::string& direct_name,
+          const std::string& rotated_name) -> std::optional<RopePassThroughMatch> {
+    if (!is_internal(direct_name) || !is_internal(rotated_name)) {
+      return std::nullopt;
+    }
+    auto dit = node_by_output.find(direct_name);
+    auto rit = node_by_output.find(rotated_name);
+    if (dit == node_by_output.end() || rit == node_by_output.end()) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* mul_direct = dit->second;
+    onnx::NodeProto* mul_rotated = rit->second;
+    for (onnx::NodeProto* mul : {mul_direct, mul_rotated}) {
+      if (mul->domain() != "" || mul->op_type() != "Mul" ||
+          mul->input_size() != 2 || mul->input(0).empty() ||
+          mul->input(1).empty() || mul->output_size() != 1) {
+        return std::nullopt;
+      }
+    }
+    if (mul_direct->output(0) != direct_name ||
+        mul_rotated->output(0) != rotated_name) {
+      return std::nullopt;
+    }
+
+    const std::string rot_a = mul_rotated->input(0);
+    const std::string rot_b = mul_rotated->input(1);
+    const std::pair<std::string, std::string> rot_orders[2] = {
+        {rot_a, rot_b}, {rot_b, rot_a}};
+    for (const auto& [concat_name, sin_operand] : rot_orders) {
+      if (concat_name == sin_operand || !is_internal(concat_name)) {
+        continue;
+      }
+      auto rotate_half = MatchDecomposedRotateHalfSlice(
+          concat_name, consumers_of, graph_outputs, node_by_output, init_map);
+      if (!rotate_half) {
+        continue;
+      }
+
+      const std::string d_a = mul_direct->input(0);
+      const std::string d_b = mul_direct->input(1);
+      const std::pair<std::string, std::string> d_orders[2] = {{d_a, d_b},
+                                                                {d_b, d_a}};
+      for (const auto& [root_cand, cos_operand] : d_orders) {
+        if (root_cand != rotate_half->root_name || root_cand == cos_operand) {
+          continue;
+        }
+        // `root_name` must be read by exactly the three consumers this hop
+        // itself accounts for (the direct `Mul` plus both `Slice`s).
+        if (ConsumerCount(consumers_of, rotate_half->root_name) != 3) {
+          continue;
+        }
+        DecomposedRopePassThrough hop;
+        hop.nodes = {add,
+                     mul_direct,
+                     mul_rotated,
+                     rotate_half->concat,
+                     rotate_half->neg,
+                     rotate_half->slice1,
+                     rotate_half->slice2};
+        hop.half = rotate_half->half;
+        return RopePassThroughMatch{hop, rotate_half->root_name};
+      }
+    }
+    return std::nullopt;
+  };
+
+  if (auto m = try_order(a_name, b_name)) {
+    return m;
+  }
+  return try_order(b_name, a_name);
+}
+
+// Thin wrapper mirroring pruning.py's own `_walk_back_through_decomposed_
+// rope`'s own `(root_name, hop)` return convention -- `(name, nullopt)` when
+// no RoPE hop was crossed, so the caller can call MatchDecomposedHeadSplit on
+// the result uniformly regardless of whether RoPE was present.
+std::pair<std::string, std::optional<DecomposedRopePassThrough>>
+WalkBackThroughDecomposedRope(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto matched = MatchDecomposedRopePassThrough(name, consumers_of,
+                                                graph_outputs, node_by_output,
+                                                init_map);
+  if (!matched) {
+    return {name, std::nullopt};
+  }
+  return {matched->root_name, matched->hop};
+}
+
+// Deferred correctness check for a WalkBackThroughDecomposedRope result, run
+// only once `head_size` (this branch's own, resolved by the caller's own
+// MatchDecomposedHeadSplit call on the returned root) is itself known. `true`
+// (nothing to check) when `hop` is `nullopt`. Otherwise requires the matched
+// `rotate_half`'s own split point to be an exact, clean half of `head_size`
+// -- declined, never guessed at, on any mismatch. Mirrors pruning.py's own
+// `_decomposed_rope_hop_is_consistent`.
+bool DecomposedRopeHopIsConsistent(
+    const std::optional<DecomposedRopePassThrough>& hop, int64_t head_size) {
+  if (!hop) {
+    return true;
+  }
+  return hop->half * 2 == head_size;
+}
+
+// One matched Q- or K-branch decomposed per-head RMSNorm ("Q/K-norm")
+// application, sitting between the head-split `Reshape`'s own output and the
+// head-split `Transpose` -- a real Qwen3/Gemma2-style eager-attention module
+// applies a per-head `RMSNorm` (over `head_size`) to Q's/K's own
+// pre-transpose `(B, S, H, Dh)` tensor. Mirrors pruning.py's own
+// `_DecomposedQKNormPassThrough`/`_match_decomposed_qk_norm_pass_through`
+// exactly: the fixed 7-node sequence `weight * (x * rsqrt(mean(x**2,
+// axis=-1) + eps))` (`Pow`, `ReduceMean`, `Add`, `Sqrt`, `Div`-or-
+// `Reciprocal`, `Mul`, `Mul`, in that -- backward walk -- order). Recognized
+// and passed through untouched -- the normalized axis is `head_size`, which
+// whole-head/KV-group pruning never slices, so the norm's own per-head
+// `weight` needs no slicing of any kind; `nodes` exists purely for
+// ApplyOneDecomposedGqaChain's own stale-`value_info` bookkeeping.
+// `weight_last_dim` is `weight`'s own confirmed (FlatChannelConst) last dim,
+// threaded through purely for DecomposedQkNormHopIsConsistent's own deferred
+// `weight_last_dim == head_size` check.
+struct DecomposedQKNormPassThrough {
+  std::vector<onnx::NodeProto*> nodes;  // final_mul, mul_node, inv_node,
+                                         // sqrt_node, add_eps, reduce_mean,
+                                         // pow_node
+  int64_t weight_last_dim = 0;
+};
+
+struct QkNormPassThroughMatch {
+  DecomposedQKNormPassThrough hop;
+  std::string root_name;
+};
+
+// Resolves `name` (already confirmed internal by the caller) backward
+// through the fixed 7-node decomposed Q/K-norm shape
+// DecomposedQKNormPassThrough's own comment above describes. Returns `(hop,
+// root_name)` -- `root_name` the tensor read by both `Pow` and the middle
+// `Mul` (expected, by the caller, to be the head-split `Reshape`'s own
+// output) -- or `nullopt` if `name` isn't produced by exactly this shape,
+// INCLUDING simply not being produced by a `Mul` at all (the common case for
+// a chain with no Q/K-norm -- the caller falls back to treating `name`
+// itself as the pre-norm root). Mirrors pruning.py's own
+// `_match_decomposed_qk_norm_pass_through` exactly, reusing FlatChannelConst/
+// ScalarFloatConst/ScalarFloatConstEquals/DecomposedLayerNormPowExponentIsTwo/
+// ReduceMeanAxisIsLast verbatim rather than duplicating any of them --
+// mirroring pruning.py's own identical reuse of
+// `_flat_channel_const`/`_flat_scalar_float_const`/
+// `_flat_scalar_float_const_equals`/`_decomposed_layer_norm_pow_exponent_is_two`/
+// `_reduce_mean_axis_is_last`.
+std::optional<QkNormPassThroughMatch> MatchDecomposedQkNormPassThrough(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+  auto fit = node_by_output.find(name);
+  if (fit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* final_mul = fit->second;
+  if (final_mul->domain() != "" || final_mul->op_type() != "Mul" ||
+      final_mul->input_size() != 2 || final_mul->input(0).empty() ||
+      final_mul->input(1).empty() || final_mul->output_size() != 1 ||
+      final_mul->output(0) != name) {
+    return std::nullopt;
+  }
+  const std::string fa = final_mul->input(0);
+  const std::string fb = final_mul->input(1);
+  const std::pair<std::string, std::string> final_orders[2] = {{fa, fb},
+                                                                {fb, fa}};
+  for (const auto& [weight_name, scaled_name] : final_orders) {
+    if (weight_name == scaled_name || !is_internal(scaled_name)) {
+      continue;
+    }
+    if (!FlatChannelConst(weight_name, init_map)) {
+      continue;
+    }
+    auto mit = node_by_output.find(scaled_name);
+    if (mit == node_by_output.end()) {
+      continue;
+    }
+    onnx::NodeProto* mul_node = mit->second;
+    if (mul_node->domain() != "" || mul_node->op_type() != "Mul" ||
+        mul_node->input_size() != 2 || mul_node->input(0).empty() ||
+        mul_node->input(1).empty() || mul_node->output_size() != 1 ||
+        mul_node->output(0) != scaled_name) {
+      continue;
+    }
+    const std::string ma = mul_node->input(0);
+    const std::string mb = mul_node->input(1);
+    const std::pair<std::string, std::string> mul_orders[2] = {{ma, mb},
+                                                                {mb, ma}};
+    for (const auto& [x_name, inv_std_name] : mul_orders) {
+      if (x_name == inv_std_name || !is_internal(inv_std_name)) {
+        continue;
+      }
+      auto iit = node_by_output.find(inv_std_name);
+      if (iit == node_by_output.end()) {
+        continue;
+      }
+      onnx::NodeProto* inv_node = iit->second;
+      if (inv_node->domain() != "" || inv_node->output_size() != 1 ||
+          inv_node->output(0) != inv_std_name) {
+        continue;
+      }
+      std::string std_name;
+      if (inv_node->op_type() == "Div") {
+        if (inv_node->input_size() != 2 || inv_node->input(0).empty() ||
+            inv_node->input(1).empty()) {
+          continue;
+        }
+        if (!ScalarFloatConstEquals(inv_node->input(0), init_map, 1.0f)) {
+          continue;
+        }
+        std_name = inv_node->input(1);
+      } else if (inv_node->op_type() == "Reciprocal") {
+        if (inv_node->input_size() != 1 || inv_node->input(0).empty()) {
+          continue;
+        }
+        std_name = inv_node->input(0);
+      } else {
+        continue;
+      }
+      if (std_name.empty() || !is_internal(std_name)) {
+        continue;
+      }
+
+      auto sit = node_by_output.find(std_name);
+      if (sit == node_by_output.end()) {
+        continue;
+      }
+      onnx::NodeProto* sqrt_node = sit->second;
+      if (sqrt_node->domain() != "" || sqrt_node->op_type() != "Sqrt" ||
+          sqrt_node->input_size() != 1 || sqrt_node->input(0).empty() ||
+          sqrt_node->output_size() != 1 || sqrt_node->output(0) != std_name) {
+        continue;
+      }
+      const std::string var_eps_name = sqrt_node->input(0);
+      if (!is_internal(var_eps_name)) {
+        continue;
+      }
+
+      auto eit = node_by_output.find(var_eps_name);
+      if (eit == node_by_output.end()) {
+        continue;
+      }
+      onnx::NodeProto* add_eps = eit->second;
+      if (add_eps->domain() != "" || add_eps->op_type() != "Add" ||
+          add_eps->input_size() != 2 || add_eps->input(0).empty() ||
+          add_eps->input(1).empty() || add_eps->output_size() != 1 ||
+          add_eps->output(0) != var_eps_name) {
+        continue;
+      }
+      const std::string aa = add_eps->input(0);
+      const std::string ab = add_eps->input(1);
+      const std::pair<std::string, std::string> add_orders[2] = {{aa, ab},
+                                                                  {ab, aa}};
+      for (const auto& [var_name, eps_name] : add_orders) {
+        if (var_name == eps_name || !is_internal(var_name)) {
+          continue;
+        }
+        if (!ScalarFloatConst(eps_name, init_map)) {
+          continue;
+        }
+
+        auto rit = node_by_output.find(var_name);
+        if (rit == node_by_output.end()) {
+          continue;
+        }
+        onnx::NodeProto* reduce_mean = rit->second;
+        if (reduce_mean->output_size() != 1 ||
+            reduce_mean->output(0) != var_name ||
+            reduce_mean->input_size() != 1 || reduce_mean->input(0).empty()) {
+          continue;
+        }
+        const std::string sq_name = reduce_mean->input(0);
+        if (!ReduceMeanAxisIsLast(*reduce_mean, sq_name)) {
+          continue;
+        }
+        if (!is_internal(sq_name)) {
+          continue;
+        }
+
+        auto pit = node_by_output.find(sq_name);
+        if (pit == node_by_output.end()) {
+          continue;
+        }
+        onnx::NodeProto* pow_node = pit->second;
+        if (pow_node->domain() != "" || pow_node->op_type() != "Pow" ||
+            pow_node->input_size() != 2 || pow_node->input(0) != x_name ||
+            pow_node->output_size() != 1 || pow_node->output(0) != sq_name ||
+            !DecomposedLayerNormPowExponentIsTwo(pow_node->input(1),
+                                                 init_map)) {
+          continue;
+        }
+        // `x_name` itself must be read by *exactly* the two consumers this
+        // hop accounts for (`pow_node` and `mul_node`).
+        if (ConsumerCount(consumers_of, x_name) != 2 ||
+            graph_outputs.count(x_name)) {
+          continue;
+        }
+
+        DecomposedQKNormPassThrough hop;
+        hop.nodes = {final_mul,  mul_node, inv_node,
+                     sqrt_node, add_eps,  reduce_mean,
+                     pow_node};
+        hop.weight_last_dim =
+            init_map.at(weight_name)
+                ->dims(init_map.at(weight_name)->dims_size() - 1);
+        return QkNormPassThroughMatch{hop, x_name};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Thin wrapper mirroring pruning.py's own `_walk_back_through_decomposed_qk_
+// norm`'s own `(root_name, hop)` return convention -- `(name, nullopt)` when
+// no Q/K-norm hop was crossed, so the caller (MatchDecomposedHeadSplit) can
+// resolve the head-split `Reshape` uniformly regardless of whether a Q/K-norm
+// was present.
+std::pair<std::string, std::optional<DecomposedQKNormPassThrough>>
+WalkBackThroughDecomposedQkNorm(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto matched = MatchDecomposedQkNormPassThrough(
+      name, consumers_of, graph_outputs, node_by_output, init_map);
+  if (!matched) {
+    return {name, std::nullopt};
+  }
+  return {matched->root_name, matched->hop};
+}
+
+// Deferred correctness check for a WalkBackThroughDecomposedQkNorm result,
+// run only once `head_size` (this branch's own, resolved by the caller's own
+// head-split `Reshape` match) is itself known. `true` (nothing to check)
+// when `hop` is `nullopt`. Otherwise requires the matched norm's own
+// `weight` to be exactly `head_size`-wide -- declined, never guessed at, on
+// any mismatch (e.g. a broadcast scalar `weight`, which FlatChannelConst
+// alone doesn't rule out). Mirrors pruning.py's own
+// `_decomposed_qk_norm_hop_is_consistent`.
+bool DecomposedQkNormHopIsConsistent(
+    const std::optional<DecomposedQKNormPassThrough>& hop, int64_t head_size) {
+  if (!hop) {
+    return true;
+  }
+  return hop->weight_last_dim == head_size;
+}
 
 struct DecomposedGqaChain {
   struct RepeatKv {
@@ -22094,12 +22669,38 @@ struct DecomposedGqaChain {
   onnx::NodeProto* consumer_node = nullptr;
   std::string consumer_weight;
   bool consumer_weight_transposed = false;
+
+  // Set exactly when WalkBackThroughDecomposedRope crossed a decomposed RoPE
+  // application on Q's/K's own branch -- see DecomposedRopePassThrough's own
+  // comment above for the exact topology and why it needs no slicing of any
+  // kind. Matched independently for Q and K (never required together).
+  // `k_rope` is always nullopt when `k_headsplit_transpose` is (the
+  // combined-perm=[0,2,3,1] shape) -- RoPE's own nodes always break the
+  // Transpose-Transpose adjacency that combined shape requires.
+  std::optional<DecomposedRopePassThrough> q_rope;
+  std::optional<DecomposedRopePassThrough> k_rope;
+  // Set exactly when MatchDecomposedHeadSplit (called with allow_qk_norm=true
+  // for Q's/K's own branches only) crossed a decomposed per-head Q/K-norm
+  // sitting between that branch's own head-split `Reshape` output and the
+  // head-split `Transpose` itself -- see DecomposedQKNormPassThrough's own
+  // comment above for the exact topology and why it needs no slicing of any
+  // kind. Matched independently for Q and K (never required together), and
+  // -- unlike `q_rope`/`k_rope` -- never matched at all (always nullopt) for
+  // K's own combined-perm=[0,2,3,1] shape (this port's own scope, see this
+  // section's own top comment).
+  std::optional<DecomposedQKNormPassThrough> q_norm;
+  std::optional<DecomposedQKNormPassThrough> k_norm;
 };
 
 // Resolves `name` (already confirmed internal by the caller) backward
 // through the fixed 2-node `Reshape -> Transpose(perm)` head-split sequence
-// -- mirrors pruning.py's own `_match_decomposed_head_split` (this port's
-// scope: no `allow_qk_norm` hop -- see this section's own top comment).
+// -- mirrors pruning.py's own `_match_decomposed_head_split`. When
+// `allow_qk_norm` is set (Q's and K's own callers only -- never V's), the
+// `Reshape`'s own output is allowed to feed the `Transpose` through a
+// decomposed Q/K-norm hop instead of directly -- tried via
+// WalkBackThroughDecomposedQkNorm on the ordinary `reshaped_name` candidate
+// first; falls back to the identical unchanged behavior whenever
+// `allow_qk_norm` is unset or no such hop matches.
 struct HeadSplitMatch {
   onnx::NodeProto* transpose;
   onnx::NodeProto* reshape;
@@ -22107,13 +22708,15 @@ struct HeadSplitMatch {
   int64_t head_size;
   std::string reshape_shape;
   std::string proj_out;
+  std::optional<DecomposedQKNormPassThrough> qk_norm_hop;
 };
 
 std::optional<HeadSplitMatch> MatchDecomposedHeadSplit(
     const std::string& name, const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs,
     const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
-    const InitMap& init_map, const std::vector<int64_t>& perm) {
+    const InitMap& init_map, const std::vector<int64_t>& perm,
+    bool allow_qk_norm = false) {
   auto is_internal = [&](const std::string& n) {
     return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
   };
@@ -22143,7 +22746,17 @@ std::optional<HeadSplitMatch> MatchDecomposedHeadSplit(
   if (!is_internal(reshaped_name)) {
     return std::nullopt;
   }
-  auto rit = node_by_output.find(reshaped_name);
+
+  std::string root_name = reshaped_name;
+  std::optional<DecomposedQKNormPassThrough> qk_norm_hop;
+  if (allow_qk_norm) {
+    auto walked = WalkBackThroughDecomposedQkNorm(
+        reshaped_name, consumers_of, graph_outputs, node_by_output, init_map);
+    root_name = walked.first;
+    qk_norm_hop = walked.second;
+  }
+
+  auto rit = node_by_output.find(root_name);
   if (rit == node_by_output.end()) {
     return std::nullopt;
   }
@@ -22151,7 +22764,7 @@ std::optional<HeadSplitMatch> MatchDecomposedHeadSplit(
   if (reshape->domain() != "" || reshape->op_type() != "Reshape" ||
       reshape->input_size() != 2 || reshape->input(0).empty() ||
       reshape->input(1).empty() || reshape->output_size() != 1 ||
-      reshape->output(0) != reshaped_name) {
+      reshape->output(0) != root_name) {
     return std::nullopt;
   }
   auto sit = init_map.find(reshape->input(1));
@@ -22169,14 +22782,17 @@ std::optional<HeadSplitMatch> MatchDecomposedHeadSplit(
   if (num_heads <= 0 || head_size <= 0) {
     return std::nullopt;
   }
+  if (!DecomposedQkNormHopIsConsistent(qk_norm_hop, head_size)) {
+    return std::nullopt;
+  }
 
   const std::string proj_out = reshape->input(0);
   if (!is_internal(proj_out)) {
     return std::nullopt;
   }
 
-  return HeadSplitMatch{transpose, reshape,           num_heads,
-                        head_size, reshape->input(1), proj_out};
+  return HeadSplitMatch{transpose,          reshape,  num_heads, head_size,
+                        reshape->input(1), proj_out, qk_norm_hop};
 }
 
 // Resolves `name` (already confirmed internal by the caller) backward
@@ -22496,6 +23112,8 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     std::string k_reshape_shape;
     std::string k_proj_out;
     std::optional<DecomposedGqaChain::RepeatKv> k_repeat_kv;
+    std::optional<DecomposedRopePassThrough> k_rope;
+    std::optional<DecomposedQKNormPassThrough> k_norm;
     int64_t kv_num_heads = -1;
     int64_t head_size_k = -1;
 
@@ -22548,9 +23166,15 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
         k_raw_name = repeat->raw_name;
         kv_num_heads = repeat->kv_num_heads;
       }
-      auto k_split =
-          MatchDecomposedHeadSplit(k_raw_name, consumers_of, graph_outputs,
-                                   node_by_output, init_map, kPermBhsd);
+      // RoPE, when present on K's own branch, always forces this
+      // separate-transpose form -- see DecomposedRopePassThrough's own
+      // comment above.
+      auto [k_rope_root, k_rope_hop] = WalkBackThroughDecomposedRope(
+          k_raw_name, consumers_of, graph_outputs, node_by_output, init_map);
+      k_rope = k_rope_hop;
+      auto k_split = MatchDecomposedHeadSplit(
+          k_rope_root, consumers_of, graph_outputs, node_by_output, init_map,
+          kPermBhsd, /*allow_qk_norm=*/true);
       if (!k_split) {
         continue;
       }
@@ -22560,6 +23184,10 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
       head_size_k = k_split->head_size;
       k_reshape_shape = k_split->reshape_shape;
       k_proj_out = k_split->proj_out;
+      k_norm = k_split->qk_norm_hop;
+      if (!DecomposedRopeHopIsConsistent(k_rope, head_size_k)) {
+        continue;
+      }
       if (kv_num_heads < 0) {
         kv_num_heads = resolved_kv_heads;
       } else if (kv_num_heads != resolved_kv_heads) {
@@ -22570,9 +23198,11 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     }
 
     // ---- Q's own branch: plain head-split, never repeat_kv ----
-    auto q_split =
-        MatchDecomposedHeadSplit(q_bhsd_name, consumers_of, graph_outputs,
-                                 node_by_output, init_map, kPermBhsd);
+    auto [q_rope_root, q_rope] = WalkBackThroughDecomposedRope(
+        q_bhsd_name, consumers_of, graph_outputs, node_by_output, init_map);
+    auto q_split = MatchDecomposedHeadSplit(
+        q_rope_root, consumers_of, graph_outputs, node_by_output, init_map,
+        kPermBhsd, /*allow_qk_norm=*/true);
     if (!q_split) {
       continue;
     }
@@ -22582,6 +23212,10 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     const int64_t head_size = q_split->head_size;
     const std::string q_reshape_shape = q_split->reshape_shape;
     const std::string q_proj_out = q_split->proj_out;
+    std::optional<DecomposedQKNormPassThrough> q_norm = q_split->qk_norm_hop;
+    if (!DecomposedRopeHopIsConsistent(q_rope, head_size)) {
+      continue;
+    }
     if (head_size != head_size_k || num_heads <= 0 || kv_num_heads <= 0) {
       continue;
     }
@@ -22796,6 +23430,10 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     chain.consumer_node = consumer_node;
     chain.consumer_weight = cm->w_name;
     chain.consumer_weight_transposed = cm->weight_transposed;
+    chain.q_rope = q_rope;
+    chain.k_rope = k_rope;
+    chain.q_norm = q_norm;
+    chain.k_norm = k_norm;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -23081,6 +23719,35 @@ std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
       }
       for (const auto& o : branch->merge_reshape->output()) {
         out.stale.insert(o);
+      }
+    }
+  }
+  // Q's/K's own decomposed RoPE pass-through, if either branch crossed one --
+  // see DecomposedRopePassThrough's own comment above for why none of its
+  // own nodes ever need editing, only marking stale (every one of their own
+  // outputs is narrower after pruning, the same "nothing to rewrite, still
+  // stale" treatment `k_repeat_kv`/`v_repeat_kv` get for their own
+  // `unsqueeze`'s `axes` input).
+  for (const auto& hop : {chain.q_rope, chain.k_rope}) {
+    if (hop) {
+      for (onnx::NodeProto* n : hop->nodes) {
+        for (const auto& o : n->output()) {
+          out.stale.insert(o);
+        }
+      }
+    }
+  }
+  // Q's/K's own decomposed Q/K-norm pass-through, if either branch crossed
+  // one -- see DecomposedQKNormPassThrough's own comment above for why none
+  // of its own nodes (including the final `Mul`'s own `weight` operand) ever
+  // need editing, only marking stale, the identical treatment `q_rope`/
+  // `k_rope` just above already get.
+  for (const auto& hop : {chain.q_norm, chain.k_norm}) {
+    if (hop) {
+      for (onnx::NodeProto* n : hop->nodes) {
+        for (const auto& o : n->output()) {
+          out.stale.insert(o);
+        }
       }
     }
   }
