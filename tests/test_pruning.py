@@ -30589,6 +30589,186 @@ def test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+def test_qdq_structured_pruning_conv_producer_plain_float_bias_matches_oracle():
+    # The pre-existing plain-float-bias case -- a literal float bias
+    # initializer, read directly by the Conv node and never itself fed
+    # through a `DequantizeLinear` -- must keep matching and pruning
+    # exactly as before now that `_match_conv_qdq`/
+    # `_match_conv_transpose_qdq`/`_match_matmul_qdq` all resolve bias via
+    # `_resolve_bias_ref` instead of a raw `initializer_map.get` lookup --
+    # see `onnxsim/pruning.py`'s own "Quantized (int32) bias" section
+    # comment for the two-sided scope this guards: a plain float bias and a
+    # QDQ int32 one (see
+    # `test_qdq_structured_pruning_conv_biased_real_quantize_static_pipeline_end_to_end`
+    # below) must both keep working, never one at the expense of the other.
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(9)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    B1 = (rng.standard_normal(Cmid) * 0.1).astype(np.float32)
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq, B1)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _f32(B1, "B1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].producer.bias is not None
+    assert chains[0].producer.bias.float_init is not None  # plain float, not QDQ
+    assert chains[0].producer.bias.qdq is None
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["B1"].dims) == [Cmid // 2]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["B1"]), B1[keep])
+
+    rng2 = np.random.default_rng(12)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1", "B1r"], ["h"]),
+                onnx.helper.make_node("Conv", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(B1[keep], name="B1r"),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_activation_requant_pass_through_matches_oracle():
+    # The activation-requantization round trip a real ORT static QDQ
+    # quantizer inserts on EVERY quantized op's own output activation --
+    # `cur -> QuantizeLinear(cur, scale, zero_point) ->
+    # DequantizeLinear(., scale_matching, zero_point_matching)` -- is now a
+    # recognized transparent pass-through hop in `_walk_to_consumer_qdq`
+    # (`_match_qdq_requant_pass_through`). Before this hop existed, an
+    # unrecognized `QuantizeLinear` mid-walk declined the whole chain (this
+    # walker's own ordinary bar for any unrecognized `nxt.op_type`) --
+    # confirmed empirically that `_find_qdq_chains` matched 0 chains for
+    # this exact topology before the hop was added.
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(21)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq)
+          hq = QuantizeLinear(h, Hscale)
+          hdq = DequantizeLinear(hq, Hscale)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(hdq, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _f32(np.array(0.05, dtype=np.float32), "Hscale"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 1
+    chain_op_types = [n.op_type for n, _ in chains[0].chain_ops]
+    assert chain_op_types == ["QuantizeLinear", "DequantizeLinear"]
+    assert all(const_name is None for _, const_name in chains[0].chain_ops)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+    assert list(inits["Hscale"].dims) == []  # per-tensor -- never sliced
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(22)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("QuantizeLinear", ["h", "Hscale"], ["hq"]),
+                onnx.helper.make_node("DequantizeLinear", ["hq", "Hscale"], ["hdq"]),
+                onnx.helper.make_node("Conv", ["hdq", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    np.array(0.05, dtype=np.float32), name="Hscale"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def _quantize_static_conv_weight(W, spatial=8):
     """Runs the REAL ``onnxsim.quantize_static`` tool on a minimal
     ``Y = Conv(X, W)`` wrapper model and returns the genuine per-channel
@@ -30908,6 +31088,138 @@ def test_qdq_structured_pruning_conv_global_average_pool_flatten_gemm_real_quant
     x = rng.standard_normal((1, Cin, 10, 10)).astype(np.float32)
     (y_pruned,) = _run_unfused(pruned, {"X": x})
     assert y_pruned.shape == (1, Out)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_qdq_structured_pruning_conv_biased_real_quantize_static_pipeline_end_to_end():
+    # THE primary repro this round's fix targets: runs the REAL
+    # ``onnxruntime.quantization.quantize_static(..., quant_format=
+    # QuantFormat.QDQ, per_channel=True)`` tool -- the industry-standard
+    # static QDQ quantizer HuggingFace Optimum, Microsoft Olive, and ORT's
+    # own tutorials all actually produce -- on a real, BIASED
+    # `Conv -> Relu -> Conv` model. Before this round's fix,
+    # `_find_qdq_chains` matched ZERO chains against this exact real-tool
+    # output (confirmed empirically): every biased Conv/Gemm the real
+    # quantizer touches gets its own bias quantized too
+    # (``DequantizeLinear(bias_quantized, bias_scale, bias_zero_point) ->
+    # bias``, see `_match_dequantize_linear_bias`'s own docstring), and
+    # EVERY quantized op's own output activation is wrapped in its own
+    # same-scale/zero_point ``QuantizeLinear -> DequantizeLinear`` round
+    # trip (see `_match_qdq_requant_pass_through`'s own docstring) -- two
+    # independent gaps, BOTH now fixed, needed together for this real
+    # repro to match at all (relaxing only one, as this round's own
+    # investigation confirmed, still yields 0 chains).
+    from onnxruntime.quantization import (
+        CalibrationDataReader,
+        QuantFormat,
+        quantize_static,
+    )
+
+    Cin, C1, C2, spatial = 3, 8, 6, 8
+    rng = np.random.default_rng(70)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(C1) * 0.1).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    b2f = (rng.standard_normal(C2) * 0.1).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[1,{Cin},{spatial},{spatial}] X) => (float[1,{C2},{spatial},{spatial}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          h0a = Relu(h0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1f, "W1"),
+            _f32(b1f, "B1"),
+            _f32(w2f, "W2"),
+            _f32(b2f, "B2"),
+        ],
+    )
+    onnx.checker.check_model(float_model)
+
+    class _CDR(CalibrationDataReader):
+        def __init__(self):
+            self._data = iter(
+                [
+                    {
+                        "X": rng.standard_normal((1, Cin, spatial, spatial)).astype(
+                            np.float32
+                        )
+                    }
+                    for _ in range(8)
+                ]
+            )
+
+        def get_next(self):
+            return next(self._data, None)
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        onnx.save(float_model, src_path)
+        quantize_static(
+            src_path,
+            quant_path,
+            calibration_data_reader=_CDR(),
+            quant_format=QuantFormat.QDQ,
+            per_channel=True,
+        )
+        quantized = onnx.load(quant_path)
+    onnx.checker.check_model(quantized)
+
+    # Confirm the two shapes this round's fix targets are genuinely present
+    # in the REAL tool's own output, not merely assumed.
+    int32_init_names = {
+        t.name
+        for t in quantized.graph.initializer
+        if t.data_type == onnx.TensorProto.INT32
+    }
+    bias_dqs = [
+        n
+        for n in quantized.graph.node
+        if n.op_type == "DequantizeLinear" and n.input[0] in int32_init_names
+    ]
+    assert len(bias_dqs) == 2  # both Conv layers' own biases are quantized
+    assert any(n.op_type == "QuantizeLinear" for n in quantized.graph.node)
+
+    chains = onnxsim.pruning._find_qdq_chains(quantized.graph)
+    assert len(chains) == 1
+    chain = chains[0]
+    assert chain.producer.bias is not None
+    assert chain.producer.bias.qdq is not None  # the real quantized-bias shape
+    assert [n.op_type for n, _ in chain.chain_ops] == [
+        "QuantizeLinear",
+        "DequantizeLinear",
+    ]
+
+    pruned = onnxsim.apply_structured_pruning_qdq(quantized, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    conv_nodes = [n for n in pruned.graph.node if n.op_type == "Conv"]
+    assert len(conv_nodes) == 2
+    keep_count1 = C1 - round(C1 * 0.5)
+
+    def _dq_source_dims(output_name):
+        dq = next(
+            n
+            for n in pruned.graph.node
+            if n.op_type == "DequantizeLinear" and n.output[0] == output_name
+        )
+        return list(inits[dq.input[0]].dims)
+
+    assert _dq_source_dims(conv_nodes[0].input[1])[0] == keep_count1  # W1 pruned
+    assert _dq_source_dims(conv_nodes[0].input[2]) == [keep_count1]  # B1 pruned
+    assert _dq_source_dims(conv_nodes[1].input[1])[1] == keep_count1  # W2 consumer
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = rng.standard_normal((1, Cin, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = sess.run(None, {"X": x})
+    assert y_pruned.shape == (1, C2, spatial, spatial)
     assert np.all(np.isfinite(y_pruned))
 
 
