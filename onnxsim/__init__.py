@@ -72,6 +72,7 @@ from onnxsim.memory_planning import (
 )
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.mlir_export import export_mlir
+from onnxsim.moequant import apply_moequant
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.olive import quantize_weight_only_olive
@@ -266,6 +267,7 @@ __all__ = [
     "apply_qmoe_expert_channel_pruning_cpp",
     "apply_qmoe_whole_expert_pruning",
     "apply_qmoe_whole_expert_pruning_cpp",
+    "apply_moequant",
     "apply_embedding_vocab_pruning",
     "apply_embedding_vocab_pruning_cpp",
     "apply_embedding_vocab_magnitude_pruning",
