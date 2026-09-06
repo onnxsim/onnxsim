@@ -38,16 +38,34 @@ remaining shape not covered by one of those still declines to match in this
 C++ port (never mis-sliced), so ``apply_attention_head_pruning``/
 ``apply_attention_head_wanda_pruning`` remain pure-Python (NOT yet aliased to
 this port) -- see that section's own tests for the exact, explicit divergence
-each remaining narrowing produces. The six newer fused-op families
-(everything past plain ``Attention``/``GroupQueryAttention``/the plain
-``ai.onnx::Attention`` op) share one more deliberate, narrower-than-pruning.py
-scope choice throughout: this port has no analogue of pruning.py's own
-dynamic-attention-bias-Gather-insertion machinery (``_head_bias_input_is_safe``/
-``_slice_or_gather_head_bias``) at all for THOSE families -- a pre-existing,
-already-accepted gap for the three original fused-op families too (only the
-decomposed-GQA family above has that machinery ported) -- so every new
-fused-op matcher declines the whole chain outright whenever an optional
-per-head bias/mask/sink/norm/scale input resolves to a non-empty constant,
+each remaining narrowing produces.
+
+``com.microsoft::MultiHeadAttention``/``com.microsoft::PackedMultiHeadAttention``
+now ALSO carry the dynamic-attention-bias-Gather-insertion machinery
+(``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias`` -- this port's own analogue
+of pruning.py's ``_head_bias_input_is_safe``/``_slice_or_gather_head_bias``),
+via the same shared helpers the decomposed-GQA family above uses: their own
+optional ``attention_bias`` input (index 5 for ``MultiHeadAttention``, 6 for
+``PackedMultiHeadAttention``) is validated and, if genuinely per-head, sliced
+in place (a constant) or Gather-spliced (dynamic) rather than declining the
+whole match outright -- see the dedicated tests in each family's own section
+below. ``MultiHeadAttention``'s own optional ``past_key``/``past_value``
+(indices 6/7) are similarly now validated (``PastKvConstantsAreSliceable``,
+this port's own analogue of pruning.py's ``_past_kv_constants_are_sliceable``,
+called with no ``scale_indices`` since this op has no ``k_scale``/``v_scale``)
+and sliced along their own BNSH ``kv_num_heads`` axis when a constant of that
+exact shape; ``PackedMultiHeadAttention`` has no ``past_key``/``past_value``
+inputs on its own schema at all (packing mode is encoder-only).
+
+The four remaining newer fused-op families
+(``DecoderMaskedMultiHeadAttention``/``PagedAttention``/``LinearAttention``/
+``SparseAttention``) keep the prior, narrower-than-pruning.py scope choice:
+this port has no analogue of pruning.py's own dynamic-attention-bias-Gather-
+insertion machinery for THOSE families yet -- a pre-existing, already-accepted
+gap shared with ``GroupQueryAttention``/the plain ``ai.onnx::Attention`` op's
+own ``attention_bias``/``attn_mask`` handling (out of scope here) -- so their
+own matchers decline the whole chain outright whenever an optional per-head
+bias/mask/sink/norm/scale/past-KV input resolves to a non-empty constant,
 rather than risk leaving one silently stale after ``num_heads``/
 ``kv_num_heads`` shrink underneath it. See each new family's own model
 builder/test section below, and each ``Match*Producer`` function's own
@@ -1746,16 +1764,21 @@ def test_cpp_gqa_pruning_importance_norm_l1_matches_python_reference_and_differs
 # the IDENTICAL input model -- not merely "both produce a valid model", but
 # the same keep-set and the same sliced values.
 #
-# One deliberate, narrower-than-pruning.py scope choice threads through all
-# six (see MatchMultiHeadAttentionProducer's own comment in
-# structured_pruning_entry.cpp for the full reasoning): this port has no
-# analogue of pruning.py's own dynamic-attention-bias-Gather-insertion
-# machinery (`_head_bias_input_is_safe`/`_slice_or_gather_head_bias`) at
-# all -- a pre-existing, already-accepted gap for the GQA/OnnxAttention
-# families above too -- so every new matcher here declines the whole chain
-# outright whenever an optional per-head bias/mask/sink/norm/scale input
-# resolves to a non-empty constant, rather than risk leaving one silently
-# stale after `num_heads`/`kv_num_heads` shrink underneath it.
+# `MultiHeadAttention`/`PackedMultiHeadAttention` (the next two sections) now
+# carry the same dynamic-attention-bias-Gather-insertion machinery
+# (`HeadBiasInputIsSafe`/`SliceOrGatherHeadBias`) the decomposed-GQA family
+# already has, plus (`MultiHeadAttention` only) `PastKvConstantsAreSliceable`
+# for its own optional `past_key`/`past_value` -- see
+# MatchMultiHeadAttentionProducer's/MatchPackedMultiHeadAttentionProducer's
+# own comments in structured_pruning_entry.cpp. The remaining four families
+# below (`DecoderMaskedMultiHeadAttention`/`PagedAttention`/`LinearAttention`/
+# `SparseAttention`) keep the prior, narrower-than-pruning.py scope choice: no
+# analogue of that machinery yet -- a pre-existing, already-accepted gap
+# shared with the GQA/OnnxAttention families above -- so their own matchers
+# decline the whole chain outright whenever an optional per-head bias/mask/
+# sink/norm/scale/past-KV input resolves to a non-empty constant, rather than
+# risk leaving one silently stale after `num_heads`/`kv_num_heads` shrink
+# underneath it.
 
 
 # --- com.microsoft::MultiHeadAttention (separate Q/K/V producers, no --------
@@ -1771,7 +1794,10 @@ def _mha_model(
     batch=2,
     seq=5,
     combined_bias=False,
-    attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    attention_bias=None,  # constant/declared-shape attention_bias array, or None
+    attention_bias_dynamic=False,  # declare AttentionBias as a graph INPUT instead
+    past_key=None,  # constant BNSH past_key array, or None (unconnected)
+    past_value=None,  # constant BNSH past_value array, or None (unconnected)
     wq=None,
     wk=None,
     wv=None,
@@ -1792,6 +1818,7 @@ def _mha_model(
         wout = rng.standard_normal((Nv, Out)).astype(np.float32)
 
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    extra_inputs = ""
     operands = ["q", "k", "v"]
     if combined_bias:
         if bq is None:
@@ -1806,16 +1833,34 @@ def _mha_model(
     else:
         operands.append("")
 
+    operands.append("")  # key_padding_mask (index 4) -- never touched by this pass
+
     if attention_bias is not None:
-        operands.append("")  # key_padding_mask -- never touched by this pass
-        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        if attention_bias_dynamic:
+            shape_str = ",".join(str(d) for d in np.asarray(attention_bias).shape)
+            extra_inputs += f", float[{shape_str}] AttentionBias"
+        else:
+            initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
         operands.append("AttentionBias")
+    else:
+        operands.append("")
+
+    if past_key is not None:
+        initializer.append(_f32(np.asarray(past_key), "PastKey"))
+        operands.append("PastKey")
+    else:
+        operands.append("")
+    if past_value is not None:
+        initializer.append(_f32(np.asarray(past_value), "PastValue"))
+        operands.append("PastValue")
+    else:
+        operands.append("")
 
     while operands and operands[-1] == "":
         operands.pop()
 
     body = f"""
-        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        g (float[{batch},{seq},{K}] X{extra_inputs}) => (float[{batch},{seq},{Out}] Y)
         {{
           q = MatMul(X, Wq)
           k = MatMul(X, Wk)
@@ -1916,24 +1961,188 @@ def test_cpp_mha_pruning_slices_combined_bias_matches_python_reference():
     assert list(inits["Bias"].dims) == [4 * 4 * 3]
 
 
-def test_cpp_mha_pruning_nonempty_attention_bias_constant_is_left_untouched():
-    model, _ = _mha_model(
-        K=8,
-        H=4,
-        D=4,
-        Out=6,
-        seed=24,
-        attention_bias=np.zeros((2, 4, 5, 5), dtype=np.float32),
-    )
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+def test_cpp_mha_pruning_broadcast_attention_bias_is_left_untouched():
+    # A genuinely BROADCAST attention_bias (dims[1] == 1, not num_heads) --
+    # HeadBiasAxis classifies this as "already correct for any head count",
+    # so the match succeeds (unlike the pre-fix behavior, which declined the
+    # whole chain outright for ANY non-empty constant here) and
+    # SliceOrGatherHeadBias leaves the tensor itself completely untouched
+    # while every other matched weight is still pruned normally.
+    bias = np.random.default_rng(24).standard_normal((1, 1, 5, 5)).astype(np.float32)
+    model, _ = _mha_model(K=8, H=4, D=4, Out=6, seed=24, attention_bias=bias)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    node = _mha_node(pruned_cpp)
+    assert _mha_num_heads(node) == 2
     inits_before = {
         t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
     }
     inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    np.testing.assert_array_equal(
+        inits_before["AttentionBias"], inits_after["AttentionBias"]
+    )
+
+
+def test_cpp_mha_pruning_per_head_attention_bias_is_sliced_matches_python():
+    # A genuinely PER-HEAD constant attention_bias (dims[1] == num_heads) --
+    # HeadBiasInputIsSafe confirms it's safe, so SliceOrGatherHeadBias slices
+    # it in place along its own head axis by the kept query heads, exactly
+    # like every other per-head weight in the chain.
+    H = 4
+    bias = np.random.default_rng(25).standard_normal((2, H, 5, 5)).astype(np.float32)
+    model, cfg = _mha_model(K=8, H=H, D=4, Out=6, seed=25, attention_bias=bias)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _mha_node(pruned_cpp)
+    num_heads = _mha_num_heads(node)
+    assert num_heads == 2
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, cfg["D"], num_heads
+    )
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert inits["AttentionBias"].shape == (2, num_heads, 5, 5)
+    np.testing.assert_array_equal(inits["AttentionBias"], bias[:, keep_heads, :, :])
+
+
+def test_cpp_mha_pruning_dynamic_per_head_attention_bias_gathers_matches_python():
+    # A genuinely PER-HEAD, but DYNAMIC (graph-input, not constant),
+    # attention_bias -- the one case that needs SliceOrGatherHeadBias's own
+    # Gather-insertion path (InsertDynamicHeadBiasGather), since the tensor's
+    # own real values aren't available at prune time.
+    H = 4
+    bias_shape = (1, H, 5, 5)
+    model, cfg = _mha_model(
+        K=8,
+        H=H,
+        D=4,
+        Out=6,
+        seed=27,
+        attention_bias=np.zeros(bias_shape, dtype=np.float32),
+        attention_bias_dynamic=True,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    gather_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    gather = gather_nodes[0]
+    assert gather.input[0] == "AttentionBias"
+    axis = next(a.i for a in gather.attribute if a.name == "axis")
+    assert axis == 1
+    indices_init = next(
+        t for t in pruned_cpp.graph.initializer if t.name == gather.input[1]
+    )
+    indices = onnx.numpy_helper.to_array(indices_init)
+
+    node = _mha_node(pruned_cpp)
+    num_heads = _mha_num_heads(node)
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, cfg["D"], num_heads
+    )
+    np.testing.assert_array_equal(indices, keep_heads)
+    # MHA's own attention_bias input (index 5) is rewired onto the new
+    # Gather's own output, not left pointing directly at "AttentionBias".
+    assert node.input[5] == gather.output[0]
+
+
+def test_cpp_mha_pruning_unsafe_attention_bias_shape_declines_match_matches_python():
+    # rank-4 with axis-1 length neither 1 (broadcast) nor num_heads
+    # (per-head) -- HeadBiasAxis can't resolve this either way, so
+    # HeadBiasInputIsSafe declines the whole match outright, exactly like
+    # pruning.py's own `_head_bias_input_is_safe`/`_match_multi_head_attention_producer`.
+    bias = np.random.default_rng(26).standard_normal((2, 3, 5, 5)).astype(np.float32)
+    model, _ = _mha_model(K=8, H=4, D=4, Out=6, seed=26, attention_bias=bias)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    # Declined outright -- the whole model is left byte-for-byte unchanged.
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_mha_pruning_constant_past_kv_is_sliced_matches_python():
+    # A constant, BNSH-format (batch, kv_num_heads, past_seq, head_size)
+    # past_key/past_value -- PastKvConstantsAreSliceable confirms the shape,
+    # so both are sliced along their own kv_num_heads axis (axis 1) by the
+    # same kept-head index set K's/V's own producer weight is sliced by.
+    H, D, seq, batch, past_seq = 4, 4, 5, 2, 3
+    rng = np.random.default_rng(28)
+    past_key = rng.standard_normal((batch, H, past_seq, D)).astype(np.float32)
+    past_value = rng.standard_normal((batch, H, past_seq, D)).astype(np.float32)
+    model, cfg = _mha_model(
+        K=8,
+        H=H,
+        D=D,
+        Out=6,
+        seed=28,
+        batch=batch,
+        seq=seq,
+        past_key=past_key,
+        past_value=past_value,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    node = _mha_node(pruned_cpp)
+    num_heads = _mha_num_heads(node)
+    assert num_heads == 2
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, D, num_heads
+    )
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert inits["PastKey"].shape == (batch, num_heads, past_seq, D)
+    assert inits["PastValue"].shape == (batch, num_heads, past_seq, D)
+    np.testing.assert_array_equal(inits["PastKey"], past_key[:, keep_heads, :, :])
+    np.testing.assert_array_equal(inits["PastValue"], past_value[:, keep_heads, :, :])
+
+
+def test_cpp_mha_pruning_unsafe_past_key_shape_declines_match_matches_python():
+    # axis-1 length neither `kv_num_heads` nor otherwise resolvable --
+    # PastKvConstantsAreSliceable declines the whole match outright, exactly
+    # like pruning.py's own `_past_kv_constants_are_sliceable`.
+    H, D, seq, batch, past_seq = 4, 4, 5, 2, 3
+    rng = np.random.default_rng(29)
+    past_key = rng.standard_normal((batch, 3, past_seq, D)).astype(np.float32)
+    model, _ = _mha_model(
+        K=8, H=H, D=D, Out=6, seed=29, batch=batch, seq=seq, past_key=past_key
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
 
 
 # --- com.microsoft::PackedMultiHeadAttention --------------------------------
@@ -1948,6 +2157,7 @@ def _packed_mha_model(
     tok=5,
     combined_bias=False,
     attention_bias=None,
+    attention_bias_dynamic=False,  # declare AttentionBias as a graph INPUT instead
     wq=None,
     wk=None,
     wv=None,
@@ -1991,8 +2201,13 @@ def _packed_mha_model(
     else:
         operands.append("")
     operands += ["TokenOffset", "CumSeqLen"]
+    extra_inputs = ""
     if attention_bias is not None:
-        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        if attention_bias_dynamic:
+            shape_str = ",".join(str(d) for d in np.asarray(attention_bias).shape)
+            extra_inputs += f", float[{shape_str}] AttentionBias"
+        else:
+            initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
         operands.append("AttentionBias")
 
     while operands and operands[-1] == "":
@@ -2000,7 +2215,7 @@ def _packed_mha_model(
     qkv_inputs = ", ".join(operands)
 
     body = f"""
-        g (float[{tok},{K}] X) => (float[{tok},{Out}] Y)
+        g (float[{tok},{K}] X{extra_inputs}) => (float[{tok},{Out}] Y)
         {{
           q = MatMul(X, Wq)
           k = MatMul(X, Wk)
@@ -2066,25 +2281,127 @@ def test_cpp_packed_mha_pruning_slices_combined_bias_matches_python_reference():
     assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
 
 
-def test_cpp_packed_mha_pruning_nonempty_attention_bias_constant_is_left_untouched():
-    model, cfg = _packed_mha_model(
-        K=8,
-        H=4,
-        D=4,
-        Out=6,
-        seed=33,
-        tok=5,
-        attention_bias=np.zeros((1, 4, 5, 5), dtype=np.float32),
+def test_cpp_packed_mha_pruning_broadcast_attention_bias_is_left_untouched():
+    # A genuinely BROADCAST attention_bias (dims[1] == 1) -- see
+    # test_cpp_mha_pruning_broadcast_attention_bias_is_left_untouched's own
+    # comment; identical reasoning, just at this op's own attention_bias
+    # index (6, not 5).
+    bias = np.random.default_rng(33).standard_normal((1, 1, 5, 5)).astype(np.float32)
+    model, _ = _packed_mha_model(
+        K=8, H=4, D=4, Out=6, seed=33, tok=5, attention_bias=bias
     )
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    node = _packed_mha_node(pruned_cpp)
+    assert _mha_num_heads(node) == 2
     inits_before = {
         t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
     }
     inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    np.testing.assert_array_equal(
+        inits_before["AttentionBias"], inits_after["AttentionBias"]
+    )
+
+
+def test_cpp_packed_mha_pruning_per_head_attention_bias_is_sliced_matches_python():
+    # A genuinely PER-HEAD constant attention_bias (dims[1] == num_heads) --
+    # see test_cpp_mha_pruning_per_head_attention_bias_is_sliced_matches_python's
+    # own comment; identical reasoning, just at index 6.
+    H = 4
+    bias = np.random.default_rng(34).standard_normal((1, H, 5, 5)).astype(np.float32)
+    model, cfg = _packed_mha_model(
+        K=8, H=H, D=4, Out=6, seed=34, tok=5, attention_bias=bias
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _packed_mha_node(pruned_cpp)
+    num_heads = _mha_num_heads(node)
+    assert num_heads == 2
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, cfg["D"], num_heads
+    )
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert inits["AttentionBias"].shape == (1, num_heads, 5, 5)
+    np.testing.assert_array_equal(inits["AttentionBias"], bias[:, keep_heads, :, :])
+
+
+def test_cpp_packed_mha_pruning_dynamic_per_head_attention_bias_gathers_matches_python():
+    # A genuinely PER-HEAD, but DYNAMIC, attention_bias -- see
+    # test_cpp_mha_pruning_dynamic_per_head_attention_bias_gathers_matches_python's
+    # own comment; identical reasoning, just at index 6.
+    H = 4
+    model, cfg = _packed_mha_model(
+        K=8,
+        H=H,
+        D=4,
+        Out=6,
+        seed=35,
+        tok=5,
+        attention_bias=np.zeros((1, H, 5, 5), dtype=np.float32),
+        attention_bias_dynamic=True,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    gather_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    gather = gather_nodes[0]
+    assert gather.input[0] == "AttentionBias"
+    axis = next(a.i for a in gather.attribute if a.name == "axis")
+    assert axis == 1
+    indices_init = next(
+        t for t in pruned_cpp.graph.initializer if t.name == gather.input[1]
+    )
+    indices = onnx.numpy_helper.to_array(indices_init)
+
+    node = _packed_mha_node(pruned_cpp)
+    num_heads = _mha_num_heads(node)
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, cfg["D"], num_heads
+    )
+    np.testing.assert_array_equal(indices, keep_heads)
+    # PackedMultiHeadAttention's own attention_bias input (index 6) is
+    # rewired onto the new Gather's own output.
+    assert node.input[6] == gather.output[0]
+
+
+def test_cpp_packed_mha_pruning_unsafe_attention_bias_shape_declines_match_matches_python():
+    # rank-4 with axis-1 length neither 1 nor num_heads -- HeadBiasAxis can't
+    # resolve this either way, so HeadBiasInputIsSafe declines the whole
+    # match outright, exactly like pruning.py's own
+    # `_match_packed_multi_head_attention_producer`.
+    bias = np.random.default_rng(36).standard_normal((1, 3, 5, 5)).astype(np.float32)
+    model, _ = _packed_mha_model(
+        K=8, H=4, D=4, Out=6, seed=36, tok=5, attention_bias=bias
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
 
 
 # --- com.microsoft::DecoderMaskedMultiHeadAttention -------------------------
