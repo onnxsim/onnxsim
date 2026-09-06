@@ -11502,7 +11502,9 @@ def _match_coordatt_split_slice(
     consts = [initializer_map.get(n) for n in (starts_n, ends_n, axes_n)]
     if any(c is None or c.data_type != onnx.TensorProto.INT64 for c in consts):
         return None
-    starts, ends, axes = (onnx.numpy_helper.to_array(c) for c in consts)
+    starts, ends, axes = (
+        onnx.numpy_helper.to_array(c) for c in consts if c is not None
+    )
     if starts.shape != (1,) or ends.shape != (1,) or axes.shape != (1,):
         return None
     if int(axes[0]) not in (2, -2):
