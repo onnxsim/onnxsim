@@ -9,7 +9,8 @@ name: Backend Integration
 # tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
 # tests/test_torch_integration.py, tests/test_mlx_integration.py,
 # tests/test_modelopt_integration.py, tests/test_mmdeploy_integration.py,
-# tests/test_jax_export_integration.py, tests/test_jax_real_model_integration.py.
+# tests/test_jax_export_integration.py, tests/test_jax_real_model_integration.py,
+# tests/test_bev_models_torch_e2e.py.
 # See docs/dlpack-executor.md, which frames
 # the DLPack executor boundary as an "embeddability" seam for stacks like these.
 # The xnnpack job below is the odd one out: it exercises
@@ -51,6 +52,11 @@ on:
       - "tests/test_mmdeploy_integration.py"
       - "tests/test_jax_export_integration.py"
       - "tests/test_jax_real_model_integration.py"
+      - "tests/test_bev_models_torch_e2e.py"
+      - "tests/_bev_torch_custom_ops.py"
+      - "onnxsim/passes/rewrite_msdeformattn_to_gridsample.h"
+      - "onnxsim/passes/rewrite_deform_conv_to_gather.h"
+      - "onnxsim/passes/rewrite_trt_batched_nms.h"
       - ".github/workflows/backend-integration.yml"
       - "onnxsim/onnx_simplifier.py"
       - "onnxsim/onnxsim.cpp"
@@ -264,6 +270,42 @@ jobs:
       - name: Run torch integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_torch_integration.py"
+
+  bev_torch_e2e:
+    name: BEV custom-op rewrites (torch.onnx.export) E2E
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + torch + onnxruntime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest onnxruntime
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import torch; print('torch', torch.__version__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source
+      # package (without the compiled extension) does not shadow the
+      # installed wheel. pytest's own "prepend" import mode still puts
+      # tests/ (the test file's own directory) on sys.path from the
+      # absolute path alone, so the sibling helper import (`from
+      # _bev_torch_custom_ops import ...`, same convention as
+      # tests/test_coreml_compat.py's `_local_import` helper) resolves fine.
+      - name: Run BEV torch E2E tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_bev_models_torch_e2e.py"
 
   mlx:
     name: Simplify and run on MLX
