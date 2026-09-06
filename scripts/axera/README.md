@@ -1571,6 +1571,45 @@ This is now regression-tested (`test_grouped_conv_splits_across_two_mac_engines_
 via `--profile` engine/event-count assertions, following the same
 determinism-checked pattern as the rest of this file.
 
+### Does the two-engine split transfer to `resnet18d` itself? Yes, but it corrects the framing above
+
+The natural next question for the finding above (per this README's own
+established pattern -- see "Does this transfer to `resnet18d` itself?"):
+does a real, unmodified `resnet18d_Opset18` build's `--profile` trace show
+the same single-engine-vs-two-engine split? Checked directly against a
+real profiled build (`convert_onnxmodelzoo.py --models resnet18d_Opset18
+--profile`, real AX650N, confirmed bit-identical device output between the
+original and onnxsim-simplified model as usual): **all 15 of
+`resnet18d`'s distinct real Conv ops schedule on *both* `conv0` and
+`conv1`** -- none stays on a single engine, even though `resnet18d` has no
+grouped convolutions anywhere in it (confirmed above: this architecture
+doesn't use `group>1`).
+
+**This means the "grouped vs. dense" framing above was incomplete, not
+wrong.** Grouping isn't the underlying trigger for the two-engine split;
+channel count is, and the earlier experiment's `cin=cout=4` dense baseline
+just happened to sit right at the edge of a real, sharp threshold.
+Isolated directly by sweeping `cin=cout` for an otherwise-identical dense
+(`group=1`) `Conv`, confirmed stable across independent rebuilds at both
+ends: **`cin=cout<=4` stays on a single engine (`conv1`, 3 sub-events);
+`cin=cout>=5` splits across both `conv0` and `conv1` (6 sub-events)** --
+a precise, real, and surprisingly small cutover point. Every real
+`resnet18d` layer has far more than 5 channels (64 to 512), so all 15
+land unconditionally on the two-engine side of this threshold -- fully
+explaining the profiled result without needing any grouping-specific
+mechanism.
+
+Reconciling both findings: dense convs cross into the two-engine regime
+once total channel count passes this small threshold, while *any* grouped
+conv (confirmed down to `group=2`/`group=4` at only 4 total channels,
+`cin=cout=4`/`cin_per_group=1`) crosses into it regardless of size --
+two independent triggers for the same underlying two-engine scheduling
+strategy, not one unified rule. This refines, rather than replaces, the
+earlier regression test: `test_grouped_conv_splits_across_two_mac_engines_dense_does_not`'s
+`group=1` case is still correctly single-engine, precisely because it
+was chosen at `cin=cout=4` -- right at (not below) the real threshold.
+A second test now locks in the size-threshold side of this directly.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

@@ -952,3 +952,37 @@ def test_grouped_conv_splits_across_two_mac_engines_dense_does_not(tmp_path):
     assert conv_engines(groups=1) == (3, ["conv1"])
     for groups in (2, 4):
         assert conv_engines(groups=groups) == (6, ["conv0", "conv1"]), groups
+
+
+def test_dense_conv_two_engine_split_is_a_channel_count_threshold(tmp_path):
+    """Confirmed real via --profile (see the README's "Does the two-engine
+    split transfer to resnet18d itself?" section): the single-vs-two-engine
+    split above is not really about grouping -- a dense (group=1) Conv
+    crosses into the two-engine regime once its channel count passes a
+    real, sharp threshold. Confirmed stable across independent rebuilds at
+    both ends: cin=cout<=4 stays on a single engine (conv1); cin=cout>=5
+    splits across both conv0 and conv1. Every real resnet18d layer (64 to
+    512 channels) sits far on the two-engine side of this threshold,
+    explaining why a real profiled resnet18d build shows all 15 of its
+    distinct Conv ops on both engines despite having no grouped convs at
+    all.
+    """
+
+    def conv_engines(channels):
+        _, trace_path = _build_axmodel(
+            os.path.join(str(tmp_path), f"ch{channels}"),
+            _grouped_conv_model(groups=1, cin=channels, cout=channels),
+            (1, channels, 16, 16),
+            profile=True,
+        )
+        trace = json.load(open(trace_path))
+        events = trace["traceEvents"] if isinstance(trace, dict) else trace
+        conv_events = [
+            e
+            for e in events
+            if e.get("ph") == "X" and "AxQuantizedConv" in e.get("name", "")
+        ]
+        return len(conv_events), sorted({e.get("tid") for e in conv_events})
+
+    assert conv_engines(channels=4) == (3, ["conv1"])
+    assert conv_engines(channels=5) == (6, ["conv0", "conv1"])
