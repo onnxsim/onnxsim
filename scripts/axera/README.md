@@ -2160,6 +2160,63 @@ One suggestive detail, single data point: pointing the op at the last
 in-range word produced the *smallest* change of all six (0.83, vs
 2.4-7.5), as reading a near-empty tail of the weight table would.
 
+### `a1 00 xx yy` is a field write: `xx` is a 16-byte-granular field offset, `yy` a bank, and the map is shared across models
+
+Re-running the header statistics on the tiny two-Conv blob, side by
+side with `resnet18d`, corrects the "instruction kinds" framing above
+into something more specific and better supported -- all local, zero
+device runs.
+
+**Three checked regularities, both models:**
+
+- **`xx` is a multiple of `0x10` in every header: 58/58 and
+  1,197/1,197.** Not a single exception in 1,255 headers -- a 16-byte
+  granular offset, not an opcode.
+- **The `xx` values form ladders within each `yy`, and the ladders are
+  the same in both models.** Bank `0x02`: `0x10,0x20,0x40,...,0xd0` in
+  the tiny model, `0x10..0xd0` in `resnet18d`; bank `0x03`:
+  `0x30,0x50..0xe0` vs `0x30,0x50..0xf0`; bank `0x04`: `0x30..0xe0` vs
+  `0x40..0xf0`; bank `0x01`: `{0x50,0x60}` in both. A shared map of
+  fields, not a per-model vocabulary.
+- **`50 01` takes the identical operand set in both models:**
+  `{0x1, 0x100, 0x100000, 0x1000000}` -- single bits 0, 8, 20, 24. A
+  one-hot enable/mode register, written 724 times in `resnet18d` and 4
+  times in the tiny model, with the same four values.
+
+**So the reading is: `a1 00 xx yy <value>` writes a 32-bit value to
+field `xx` of bank `yy`** -- a descriptor or register-file write. That
+one reading explains everything found so far at once: a write is
+`[selector][value]`, so no selector is ever immediately followed by
+another (0/1,255); writes are two words, so the 2-word granularity and
+the 32-byte (four-write) unit; the "gate" is the selector word (corrupt
+it and the value goes to the wrong field, or nowhere -- one fixed
+fallback state); the validator faults on malformed *selectors*, never on
+*values*; `40 02` is the Wbt-offset field (181 distinct values spanning
+the Wbt in `resnet18d`; the single write in the tiny model is `0`, the
+first op's offset -- and `resnet18d`'s values include
+`0x14f80, 0x14f82, 0x14f84`, byte-granular steps, as INT8 weight
+offsets would be); and the input-independent vs input-dependent split is
+just which field got a bad value.
+
+**Corrections, stated in place.** (1) "The instruction mix is
+model-dependent; the format is not" -- better: the *field map* is
+shared; a large model re-writes a few fields (Wbt offset, an address in
+bank 3, the `50 01` flags) once per op, while a small model touches many
+fields once each as setup. (2) The tiny-model "structure holds" table
+earlier rested on 58 headers with many one-offs, which was thin; the
+ladders and the identical `50 01` set are the real, strong tiny-model
+evidence. (3) "Operands are address-like" holds for address *fields*
+(`40 02`, `50 03`); many bank-2/3/4 fields in the tiny model carry
+high-entropy packed values (`0xa1020c81`, `0x8130180f`, ...) -- packed
+configuration words, not addresses.
+
+What this still does not settle: the meaning of any field other than
+`40 02` (Wbt offset, quantitatively) and `50 01` (a one-hot flag, values
+known, meaning not), and what the banks are. But "decode mcode" has
+now gone from "49 KB of opaque bytes" to "a register map with ~50 named
+fields in a dozen banks, each written with a 32-bit value" -- a
+concrete, enumerable target.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

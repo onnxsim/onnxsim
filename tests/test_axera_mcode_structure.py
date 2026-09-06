@@ -1741,3 +1741,47 @@ def test_resnet18d_40_02_operand_is_live_for_any_value_with_no_bounds_check(tmp_
     assert np.array_equal(first, second), (
         "expected the past-end read to be deterministic"
     )
+
+
+def _header_fields(mcode):
+    """Every `a1 00 xx yy` header in an mcode blob read as 4-byte words,
+    as `(xx, yy, following 32-bit LE value)` -- see the README's
+    "`a1 00 xx yy` is a field write" section."""
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    return [
+        (w[2], w[3], int.from_bytes(words[i + 1], "little"))
+        for i, w in enumerate(words)
+        if w[:2] == b"\xa1\x00" and i + 1 < len(words)
+    ]
+
+
+def test_mcode_headers_are_field_writes_with_a_shared_map_across_models(tmp_path):
+    """Confirmed real (see the README's "`a1 00 xx yy` is a field write"
+    section), on both the tiny two-Conv blob and the real resnet18d
+    blob: `xx` is a multiple of 0x10 in every single header (a 16-byte
+    granular field offset, not an opcode); bank 0x02's `xx` ladder is
+    shared by both models; and the `50 01` field takes the identical
+    one-hot operand set {bit 0, 8, 20, 24} in both. Needs Docker for the
+    builds but no device.
+    """
+    tiny = _mcode_from_axmodel(
+        _build_axmodel(
+            os.path.join(str(tmp_path), "tiny"),
+            _two_conv_model(vary_first=True, dilation=2, pad=2),
+            (1, 4, 16, 16),
+        )
+    )
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    one_hot = {0x1, 0x100, 0x100000, 0x1000000}
+    shared_bank2_ladder = {0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0}
+
+    for name, mcode in (("tiny", tiny), ("resnet18d", r18)):
+        fields = _header_fields(mcode)
+        assert len(fields) >= 40, (name, len(fields))
+        assert all(xx % 0x10 == 0 for xx, _, _ in fields), name
+        assert {v for xx, yy, v in fields if (xx, yy) == (0x50, 0x01)} == one_hot, name
+        assert shared_bank2_ladder <= {xx for xx, yy, _ in fields if yy == 0x02}, name
+
+    assert (
+        sum(1 for xx, yy, _ in _header_fields(r18) if (xx, yy) == (0x40, 0x02)) == 181
+    )
