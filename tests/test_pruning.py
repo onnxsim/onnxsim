@@ -11641,6 +11641,403 @@ def test_structured_pruning_ese_gate_declines_on_extra_spine_consumer():
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
+# --- apply_structured_pruning: Coordinate Attention ("CoordAtt") chains -----
+#
+# `houqb/CoordAttention`'s own reference `CoordAtt` module (CVPR 2021),
+# reused verbatim in many YOLOv5/v7-CA and MobileNetV3-CA mobile-detection
+# forks -- see `onnxsim/pruning.py`'s own "Coordinate Attention ('CoordAtt')
+# gate chains" section comment for the full matched/declined topology this
+# exercises, confirmed live via a real `torch.onnx.export` of a verbatim
+# reproduction of that module's own `forward`. Built directly via
+# `onnx.parser` (per this file's own module docstring/CLAUDE.md's
+# convention) with the exact node shapes/ordering the real export produces
+# (both `AveragePool`s read `spine` directly; only `pool_w`'s own output is
+# transposed before the `Concat`; the hard-swish decomposition is the exact
+# `Add`+`Clip`+`Div`+`Mul` sequence a raw export emits for `x * (relu6(x +
+# 3) / 6)`).
+
+
+def _coordatt_keep_indices(w0, wh, ww, keep_count):
+    # Same combined (root-sum-square) L2-norm formula as
+    # `_se_conv_keep_indices`/`_ese_keep_indices`, just with THREE co-sliced
+    # producers instead of two: the spine `Conv` (`w0`) and CoordAtt's own
+    # two independent gate-producing convs, `conv_h`/`conv_w` (`wh`/`ww`).
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(w0.reshape(w0.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(wh.reshape(wh.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(ww.reshape(ww.shape[0], -1).astype(np.float64), axis=1)
+        )
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _coordatt_conv_model(
+    Cin=3, C=16, mip=8, Cout=8, spatial=8, seed=0, prefix="", input_name=None
+):
+    # `prefix` lets a caller embed more than one independent instance of this
+    # topology (with distinct initializer/value names) in the same graph --
+    # see `test_structured_pruning_se_ese_coordatt_dispatch_coexist_matches_
+    # oracle` below, which builds an ordinary SE block, an ESE block, and
+    # this CoordAtt block side by side from a shared input to lock in that
+    # this section's own widened 2-or-3-consumer dispatch leaves the
+    # pre-existing 2-consumer shapes completely unaffected.
+    rng = np.random.default_rng(seed)
+    w0 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    b0 = rng.standard_normal((C,)).astype(np.float32)
+    wc1 = rng.standard_normal((mip, C, 1, 1)).astype(np.float32)
+    bc1 = rng.standard_normal((mip,)).astype(np.float32)
+    wh = rng.standard_normal((C, mip, 1, 1)).astype(np.float32)
+    bh = rng.standard_normal((C,)).astype(np.float32)
+    ww = rng.standard_normal((C, mip, 1, 1)).astype(np.float32)
+    bw = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((Cout,)).astype(np.float32)
+
+    p = prefix
+    S = spatial
+    x_name = p + "X" if input_name is None else input_name
+    body = f"""
+      {p}h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>({x_name}, {p}W0, {p}B0)
+      {p}pool_h = AveragePool<kernel_shape=[1,{S}], strides=[1,{S}]>({p}h0)
+      {p}pool_w = AveragePool<kernel_shape=[{S},1], strides=[{S},1]>({p}h0)
+      {p}pool_w_t = Transpose<perm=[0,1,3,2]>({p}pool_w)
+      {p}cat = Concat<axis=2>({p}pool_h, {p}pool_w_t)
+      {p}bott = Conv<kernel_shape=[1,1]>({p}cat, {p}Wc1, {p}Bc1)
+      {p}hs_c1 = Constant<value = float {{3.0}}>()
+      {p}hs_add = Add({p}bott, {p}hs_c1)
+      {p}hs_min = Constant<value = float {{0.0}}>()
+      {p}hs_max = Constant<value = float {{6.0}}>()
+      {p}hs_clip = Clip({p}hs_add, {p}hs_min, {p}hs_max)
+      {p}hs_c2 = Constant<value = float {{6.0}}>()
+      {p}hs_div = Div({p}hs_clip, {p}hs_c2)
+      {p}act = Mul({p}bott, {p}hs_div)
+      {p}s_start0 = Constant<value = int64[1] {{0}}>()
+      {p}s_endS = Constant<value = int64[1] {{{S}}}>()
+      {p}s_axis2 = Constant<value = int64[1] {{2}}>()
+      {p}s_end2S = Constant<value = int64[1] {{{2 * S}}}>()
+      {p}split_h = Slice({p}act, {p}s_start0, {p}s_endS, {p}s_axis2)
+      {p}split_w = Slice({p}act, {p}s_endS, {p}s_end2S, {p}s_axis2)
+      {p}split_w_t = Transpose<perm=[0,1,3,2]>({p}split_w)
+      {p}ch = Conv<kernel_shape=[1,1]>({p}split_h, {p}Wh, {p}Bh)
+      {p}gh = Sigmoid({p}ch)
+      {p}cw = Conv<kernel_shape=[1,1]>({p}split_w_t, {p}Ww, {p}Bw)
+      {p}gw = Sigmoid({p}cw)
+      {p}m1 = Mul({p}h0, {p}gw)
+      {p}m2 = Mul({p}m1, {p}gh)
+      {p}Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>({p}m2, {p}W2, {p}B2)
+    """
+    initializer = [
+        _f32(w0, f"{p}W0"),
+        _f32(b0, f"{p}B0"),
+        _f32(wc1, f"{p}Wc1"),
+        _f32(bc1, f"{p}Bc1"),
+        _f32(wh, f"{p}Wh"),
+        _f32(bh, f"{p}Bh"),
+        _f32(ww, f"{p}Ww"),
+        _f32(bw, f"{p}Bw"),
+        _f32(w2, f"{p}W2"),
+        _f32(b2, f"{p}B2"),
+    ]
+    return body, initializer, (w0, b0, wc1, bc1, wh, bh, ww, bw, w2, b2)
+
+
+def test_structured_pruning_coordatt_gate_matches_oracle():
+    Cin, C, mip, Cout, S = 3, 16, 8, 8, 8
+    body, initializer, (w0, b0, wc1, bc1, wh, bh, ww, bw, w2, b2) = (
+        _coordatt_conv_model(Cin=Cin, C=C, mip=mip, Cout=Cout, spatial=S)
+    )
+    model = _model(
+        f"""
+        g (float[N,{Cin},{S},{S}] X) => (float[N,{Cout},{S},{S}] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert len(_find_conv_se_gate_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _coordatt_keep_indices(w0, wh, ww, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # The spine conv's own output channels, sliced.
+    np.testing.assert_array_equal(inits["W0"], w0[keep])
+    np.testing.assert_array_equal(inits["B0"], b0[keep])
+    # `conv_h`/`conv_w`'s own OUTPUT channels, sliced by the SAME keep-set --
+    # the broadcast-`Mul`-correctness requirement -- their own INPUT
+    # (`mip`) axis is untouched.
+    np.testing.assert_array_equal(inits["Wh"], wh[keep])
+    np.testing.assert_array_equal(inits["Bh"], bh[keep])
+    np.testing.assert_array_equal(inits["Ww"], ww[keep])
+    np.testing.assert_array_equal(inits["Bw"], bw[keep])
+    # `conv1`'s own INPUT channels (fed by the pooled spine) are re-sliced by
+    # the identical shared keep-set (an ordinary extra fan-out consumer
+    # branch) ...
+    np.testing.assert_array_equal(inits["Wc1"], wc1[:, keep])
+    # ... but `conv1`'s own OUTPUT-channel count (the independent bottleneck,
+    # `mip`) -- and its own bias -- is completely untouched.
+    assert inits["Wc1"].shape[0] == mip
+    np.testing.assert_array_equal(inits["Bc1"], bc1)
+    # The final downstream conv's own input channels, sliced by the same
+    # keep-set.
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+    np.testing.assert_array_equal(inits["B2"], b2)
+
+    rng = np.random.default_rng(400)
+    x = rng.standard_normal((2, Cin, S, S)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle_body, oracle_init, _ = _coordatt_conv_model(
+        Cin=Cin, C=C // 2, mip=mip, Cout=Cout, spatial=S
+    )
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},{S},{S}] X) => (float[N,{Cout},{S},{S}] Y)
+        {{
+          {oracle_body}
+        }}
+        """,
+        initializer=oracle_init,
+        opset=17,
+    )
+    oracle_inits = {
+        "W0": w0[keep],
+        "B0": b0[keep],
+        "Wc1": wc1[:, keep],
+        "Bc1": bc1,
+        "Wh": wh[keep],
+        "Bh": bh[keep],
+        "Ww": ww[keep],
+        "Bw": bw[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_coordatt_gate_declines_on_gate_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: `conv_h`'s own output
+    # channel count doesn't match the spine's `C` (still a legitimate,
+    # valid ONNX graph -- `conv_h`'s own output just wouldn't broadcast
+    # against `spine` at runtime the way a real CoordAtt block's does -- but
+    # not the exact shape `_match_conv_coordatt_gate` requires). Locks in the
+    # conservative "decline outright, never partially slice" bar: every one
+    # of the spine conv/`conv1`/`conv_h`/`conv_w`/the downstream conv must
+    # come back completely untouched.
+    Cin, C, mip, Cout, S = 3, 16, 8, 8, 8
+    body, initializer, (w0, b0, wc1, bc1, wh, bh, ww, bw, w2, b2) = (
+        _coordatt_conv_model(Cin=Cin, C=C, mip=mip, Cout=Cout, spatial=S)
+    )
+    model = _model(
+        f"""
+        g (float[N,{Cin},{S},{S}] X) => (float[N,{Cout},{S},{S}] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    # Overwrite `conv_h`'s own weight/bias so it outputs `C - 1` channels
+    # instead of `C` -- `ch`'s own output no longer matches `spine`'s own
+    # channel count, so `sigmoid(ch)` can't legitimately gate it, but the
+    # graph itself (pre-pruning) is still perfectly valid/checker-passing
+    # since nothing actually broadcasts `ch`'s own output against `spine`
+    # before the final `Sigmoid`.
+    rng = np.random.default_rng(41)
+    wh_bad = rng.standard_normal((C - 1, mip, 1, 1)).astype(np.float32)
+    bh_bad = rng.standard_normal((C - 1,)).astype(np.float32)
+    for init in model.graph.initializer:
+        if init.name == "Wh":
+            init.CopyFrom(_f32(wh_bad, "Wh"))
+        elif init.name == "Bh":
+            init.CopyFrom(_f32(bh_bad, "Bh"))
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], w0)
+    np.testing.assert_array_equal(inits["Wc1"], wc1)
+    np.testing.assert_array_equal(inits["Wh"], wh_bad)
+    np.testing.assert_array_equal(inits["Ww"], ww)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_se_ese_coordatt_dispatch_coexist_matches_oracle():
+    # Locks in that `_find_conv_se_gate_chains`'s own dispatch, widened from
+    # a hardcoded "`spine` has exactly two consumers" to "two OR three", still
+    # recognizes the two pre-existing two-consumer shapes (the ordinary SE
+    # gate's own two-conv fc1/fc2 bottleneck, and the no-bottleneck ESE gate)
+    # completely unaffected, in the SAME graph and the SAME
+    # `apply_structured_pruning` call as a three-consumer CoordAtt block --
+    # not merely "the existing SE/ESE tests still pass in isolation" (already
+    # covered elsewhere in this file), but that all three dispatch outcomes
+    # coexist correctly when the SAME top-level loop walks all three
+    # producer Convs in one pass. Three independent branches share one input
+    # `X` and each produce their own output; each branch's own pruning is
+    # checked against the SAME already-established per-shape formula
+    # (`_se_conv_keep_indices`/`_ese_keep_indices`/`_coordatt_keep_indices`)
+    # its own dedicated test above already locks in.
+    Cin, S = 3, 8
+
+    se_C1, se_Csq, se_C2 = 12, 1, 6
+    rng = np.random.default_rng(500)
+    se_w1 = rng.standard_normal((se_C1, Cin, 3, 3)).astype(np.float32)
+    se_b1 = rng.standard_normal((se_C1,)).astype(np.float32)
+    se_wf1 = rng.standard_normal((se_Csq, se_C1, 1, 1)).astype(np.float32)
+    se_bf1 = rng.standard_normal((se_Csq,)).astype(np.float32)
+    se_wf2 = rng.standard_normal((se_C1, se_Csq, 1, 1)).astype(np.float32)
+    se_bf2 = rng.standard_normal((se_C1,)).astype(np.float32)
+    se_w2 = rng.standard_normal((se_C2, se_C1, 3, 3)).astype(np.float32)
+    se_b2 = rng.standard_normal((se_C2,)).astype(np.float32)
+
+    ese_C1, ese_C2 = 12, 6
+    ese_w1 = rng.standard_normal((ese_C1, Cin, 3, 3)).astype(np.float32)
+    ese_b1 = rng.standard_normal((ese_C1,)).astype(np.float32)
+    ese_wfc = rng.standard_normal((ese_C1, ese_C1, 1, 1)).astype(np.float32)
+    ese_bfc = rng.standard_normal((ese_C1,)).astype(np.float32)
+    ese_w2 = rng.standard_normal((ese_C2, ese_C1, 3, 3)).astype(np.float32)
+    ese_b2 = rng.standard_normal((ese_C2,)).astype(np.float32)
+
+    ca_C, ca_mip, ca_Cout = 16, 8, 6
+    (
+        ca_body,
+        ca_initializer,
+        (
+            ca_w0,
+            ca_b0,
+            ca_wc1,
+            ca_bc1,
+            ca_wh,
+            ca_bh,
+            ca_ww,
+            ca_bw,
+            ca_w2,
+            ca_b2,
+        ),
+    ) = _coordatt_conv_model(
+        Cin=Cin,
+        C=ca_C,
+        mip=ca_mip,
+        Cout=ca_Cout,
+        spatial=S,
+        seed=501,
+        prefix="ca_",
+        input_name="X",
+    )
+
+    body = f"""
+      se_h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, SeW1, SeB1)
+      se_a0 = Relu(se_h0)
+      se_gap = GlobalAveragePool(se_a0)
+      se_f1 = Conv<kernel_shape=[1,1]>(se_gap, SeWf1, SeBf1)
+      se_fa = Relu(se_f1)
+      se_f2 = Conv<kernel_shape=[1,1]>(se_fa, SeWf2, SeBf2)
+      se_gate = Sigmoid(se_f2)
+      se_mulout = Mul(se_gate, se_a0)
+      SeY = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(se_mulout, SeW2, SeB2)
+
+      ese_h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, EseW1, EseB1)
+      ese_a0 = Relu(ese_h0)
+      ese_pooled = ReduceMean<axes=[2, 3], keepdims=1>(ese_a0)
+      ese_fc_out = Conv<kernel_shape=[1,1]>(ese_pooled, EseWfc, EseBfc)
+      ese_gate = HardSigmoid(ese_fc_out)
+      ese_mulout = Mul(ese_gate, ese_a0)
+      EseY = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(ese_mulout, EseW2, EseB2)
+
+      {ca_body}
+    """
+    model = _model(
+        f"""
+        g (float[N,{Cin},{S},{S}] X) => (
+            float[N,{se_C2},{S},{S}] SeY,
+            float[N,{ese_C2},{S},{S}] EseY,
+            float[N,{ca_Cout},{S},{S}] ca_Y
+        )
+        {{
+          {body}
+        }}
+        """,
+        initializer=[
+            _f32(se_w1, "SeW1"),
+            _f32(se_b1, "SeB1"),
+            _f32(se_wf1, "SeWf1"),
+            _f32(se_bf1, "SeBf1"),
+            _f32(se_wf2, "SeWf2"),
+            _f32(se_bf2, "SeBf2"),
+            _f32(se_w2, "SeW2"),
+            _f32(se_b2, "SeB2"),
+            _f32(ese_w1, "EseW1"),
+            _f32(ese_b1, "EseB1"),
+            _f32(ese_wfc, "EseWfc"),
+            _f32(ese_bfc, "EseBfc"),
+            _f32(ese_w2, "EseW2"),
+            _f32(ese_b2, "EseB2"),
+        ]
+        + ca_initializer,
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    # All three chains found in one pass over the same graph -- the widened
+    # dispatch offers the SE/ESE blocks' own two-consumer spines to the SE/
+    # ESE matchers exactly as before, and the CoordAtt block's own
+    # three-consumer spine to the new CoordAtt matcher only.
+    assert len(_find_conv_se_gate_chains(model.graph)) == 3
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    se_keep = _se_conv_keep_indices(se_w1, se_wf2, se_C1 // 2)
+    np.testing.assert_array_equal(inits["SeW1"], se_w1[se_keep])
+    np.testing.assert_array_equal(inits["SeWf2"], se_wf2[se_keep])
+    np.testing.assert_array_equal(inits["SeWf1"], se_wf1[:, se_keep])
+    np.testing.assert_array_equal(inits["SeW2"], se_w2[:, se_keep])
+
+    ese_keep = _ese_keep_indices(ese_w1, ese_wfc, ese_C1 // 2)
+    np.testing.assert_array_equal(inits["EseW1"], ese_w1[ese_keep])
+    np.testing.assert_array_equal(inits["EseWfc"], ese_wfc[ese_keep][:, ese_keep])
+    np.testing.assert_array_equal(inits["EseW2"], ese_w2[:, ese_keep])
+
+    ca_keep = _coordatt_keep_indices(ca_w0, ca_wh, ca_ww, ca_C // 2)
+    np.testing.assert_array_equal(inits["ca_W0"], ca_w0[ca_keep])
+    np.testing.assert_array_equal(inits["ca_Wh"], ca_wh[ca_keep])
+    np.testing.assert_array_equal(inits["ca_Ww"], ca_ww[ca_keep])
+    np.testing.assert_array_equal(inits["ca_Wc1"], ca_wc1[:, ca_keep])
+    np.testing.assert_array_equal(inits["ca_W2"], ca_w2[:, ca_keep])
+
+    rng = np.random.default_rng(502)
+    x = rng.standard_normal((2, Cin, S, S)).astype(np.float32)
+    (y_se, y_ese, y_ca) = _run(pruned, {"X": x})
+    assert y_se.shape == (2, se_C2, S, S)
+    assert y_ese.shape == (2, ese_C2, S, S)
+    assert y_ca.shape == (2, ca_Cout, S, S)
+
+
 # --- apply_structured_pruning: CBAM ChannelGate chains ----------------------
 #
 # See onnxsim/pruning.py's own "CBAM ChannelGate chains" section comment for
