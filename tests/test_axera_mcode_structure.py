@@ -13,6 +13,7 @@ tests/test_pulsar2_hf_to_axmodel.py.
 
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -627,6 +628,30 @@ def _mcode_from_axmodel(axmodel_path):
     return bytes(inits[mcode_key].raw_data)
 
 
+def _gemm_model(transb, m=1, k=16, n=8):
+    """One `Gemm(x, w, b)` -- `transb` selects whether `w` is stored as
+    `[k,n]` (transB=0) or `[n,k]` (transB=1), same logical matrix either
+    way."""
+    rng = np.random.RandomState(0)
+    w_shape = (n, k) if transb else (k, n)
+    w = (rng.randn(*w_shape) * 0.1).astype(np.float32)
+    b = (rng.randn(n) * 0.1).astype(np.float32)
+    node = helper.make_node("Gemm", ["x", "w", "b"], ["y"], transB=transb)
+    graph = helper.make_graph(
+        [node],
+        f"g_gemm_transb{transb}",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [m, k])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [m, n])],
+        initializer=[
+            numpy_helper.from_array(w, name="w"),
+            numpy_helper.from_array(b, name="b"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
 def _maxpool_model(k, stride, pad, ceil_mode=0, cin=4, insz=16):
     import math
 
@@ -817,3 +842,61 @@ def test_non_mac_ops_schedule_on_teng2_not_conv_engines(tmp_path):
     assert maxpool_events, "expected at least one AxMaxPool event in the trace"
     for e in maxpool_events:
         assert e["tid"] == "teng2", (e, "expected AxMaxPool to schedule on teng2")
+
+
+def test_gemm_schedules_on_conv_engine_like_conv_does(tmp_path):
+    """Confirmed real via --profile (see the README's "Gemm joins the MAC
+    engines" section): Gemm schedules on `conv1`, joining Conv in the
+    MAC-engine category rather than teng2's non-MAC group.
+    """
+    model = _gemm_model(transb=0)
+    _, trace_path = _build_axmodel(
+        os.path.join(str(tmp_path), "gemm_profiled"), model, (1, 16), profile=True
+    )
+    trace = json.load(open(trace_path))
+    events = trace["traceEvents"] if isinstance(trace, dict) else trace
+    gemm_events = [
+        e
+        for e in events
+        if e.get("ph") == "X" and re.fullmatch(r"y_\d+_\d+", e.get("name", ""))
+    ]
+    assert gemm_events, "expected at least one Gemm output event in the trace"
+    for e in gemm_events:
+        assert e["tid"] in ("conv0", "conv1"), (
+            e,
+            "expected Gemm to schedule on a conv engine",
+        )
+
+
+def test_gemm_transb_produces_a_real_substantial_signal_beyond_noise(tmp_path):
+    """Confirmed real (see the README's "Gemm joins the MAC engines"
+    section): this Gemm shape has the same small, known non-deterministic
+    noise as Conv/MaxPool (confirmed here by rebuilding `transb=0` twice --
+    an *initial* single rebuild pair happened to show zero diffs, which
+    turned out to be a lucky draw, not a real "this shape is noise-free"
+    property; corrected after a second rebuild pair showed the familiar
+    ~6-byte noise). Even accounting for that, transB produces a real,
+    substantial signal far beyond noise scale: dozens of differing bytes,
+    including a large contiguous block, at a completely different scale
+    than the small periodic fields found for Conv's attributes.
+    """
+    model_a = _gemm_model(transb=0)
+    model_b = _gemm_model(transb=1)
+
+    mcode_a1 = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "a1"), model_a, (1, 16))
+    )
+    mcode_a2 = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "a2"), model_a, (1, 16))
+    )
+    mcode_b = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "b"), model_b, (1, 16))
+    )
+    assert len(mcode_a1) == len(mcode_a2) == len(mcode_b)
+
+    noise_diff = sum(1 for i in range(len(mcode_a1)) if mcode_a1[i] != mcode_a2[i])
+    transb_diff = sum(1 for i in range(len(mcode_a1)) if mcode_a1[i] != mcode_b[i])
+    assert transb_diff > noise_diff + 50, (
+        (transb_diff, noise_diff),
+        "expected a real, substantial transB signal well beyond noise scale",
+    )

@@ -1487,6 +1487,58 @@ shape gives *different* total mcode lengths (2,408 vs 2,440 bytes, a
 32-byte-unit-consistent delta) -- real, but not a same-length pair, so no
 clean localized diff was possible here the way the dilation experiments
 allowed for Conv.
+
+### `Gemm` joins the MAC engines, and a real, substantial signal from `transB`
+
+Continuing to work through resnet18d's remaining real primitives: `Gemm`
+(the final FC layer, 3.3% of resnet18d's real schedule) and
+`AveragePool` (distinct from `GlobalAveragePool`, used 3x in
+`resnet18d`'s real downsample paths).
+
+**`Gemm` schedules on `conv1`** -- joining `Conv` in the MAC-engine
+category rather than `teng2`'s non-MAC group, extending the same clean
+split found above to a second op type. Its trace events keep the output
+tensor's own name (`y_0_0`, `y_0_1`, `y_0_2`) rather than being renamed to
+an `AxQuantized*`-style primitive the way `Conv`/`Pool`/`Add` are --
+matching, exactly, the un-renamed `"/fc/Gemm_*"` event names already seen
+in this README's real `resnet18d` profiling. **`AveragePool` schedules on
+`teng2`**, joining `MaxPool`/`Add`/`GlobalAvgPool`/`Normalize` in the
+non-MAC category, but with a real difference from `MaxPool` at the same
+input size: two sub-events (`AxQuantizedAvgPool_0_0` and
+`_1_0`) rather than one -- plausibly a real two-pass sum-then-divide
+structure specific to averaging, not investigated further here.
+
+**Correction, caught the same way the `auto_pad` false lead was**: this
+section first reported this `Gemm` shape as showing *zero*
+non-deterministic noise across a rebuild, based on a single rebuild pair.
+That turned out to be a lucky draw, not a real property of the shape --
+a second, independent pair of rebuilds (done while writing an automated
+regression test for this finding, which caught the discrepancy) showed
+the familiar ~6-byte noise at the same `~301-325` zone already confirmed
+for `Conv`/`MaxPool`/`auto_pad`/`ceil_mode`. This shape is not
+noise-free after all; it has the same known noise as everything else
+tested so far.
+
+**`transB=0` vs `transB=1` still produces a real, substantial signal, net
+of that noise.** Of the 95 originally-reported differing bytes, the two
+at offsets 319/325 fall inside the confirmed noisy zone and are not
+trustworthy as `transB`-specific signal on their own (this exact
+`gemm_base` config's own noise realization could easily land differently
+there by chance alone, independent of `transB`). The remaining ~93 bytes
+sit well outside any confirmed noise zone and hold up as real: a large,
+clean 85-byte contiguous block (offset 1620-1705, containing non-trivial
+repeated structure -- `f129ff3b81` and `f5852513c8` each appearing three
+times) plus smaller diffs at 1617, 1708, and 1712. Consistent with a real
+per-tile or per-output-column memory-access-pattern encoding that has to
+change because `transB` genuinely changes whether the weight matrix is
+traversed row-major or column-major. This remains, net of the correction,
+by a wide margin the largest and cleanest real signal isolated in this
+whole investigation -- a strong, well-motivated, precisely-located target
+(offset 1620, 85 bytes) for whoever attempts the next level of decoding.
+Also a second, independent confirmation of the broader determinism
+lesson: a single rebuild pair is not enough to call something noise-free,
+and this project has now made and caught that exact mistake twice.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
