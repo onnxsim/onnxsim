@@ -56,6 +56,7 @@ from onnxsim.flexround import apply_flexround
 from onnxsim.foem import apply_foem
 from onnxsim.fptq import apply_fptq
 from onnxsim.gear import apply_gear
+from onnxsim.gguf_kquant import apply_gguf_q4_k_quantization, quantize_dequantize_q4_k
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -341,6 +342,8 @@ __all__ = [
     "quantize_kv_cache",
     "apply_intactkv",
     "apply_gear",
+    "apply_gguf_q4_k_quantization",
+    "quantize_dequantize_q4_k",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
