@@ -3719,6 +3719,120 @@ _INSTANCE_NORM_PASS_THROUGH_OP = "InstanceNormalization"
 # constraint the native hop above already enforces. See
 # :func:`_match_decomposed_group_norm_pass_through`.
 
+# ``DepthToSpace`` (mode ``"CRD"``) -- PyTorch's ``nn.PixelShuffle`` (the
+# sub-pixel/"pixel shuffle" upsampling every ESPCN-style super-resolution
+# head and many GAN/segmentation decoders use), lowered to a native ONNX op
+# rather than a decomposition. Confirmed live via a real
+# ``torch.onnx.export`` of a ``Conv -> nn.PixelShuffle(r) -> Conv`` module
+# (opset 17, ``ir_version`` 10): BOTH the legacy TorchScript-based exporter
+# and the newer ``torch.export``-based ("dynamo") exporter agree on the exact
+# same 3-node shape, checker-passed and onnxruntime-verified against the
+# PyTorch reference to float32 noise (``2.98e-07`` max abs diff) --
+#
+#     h = Conv(x, W1, B1)                       # -> [N, C*r*r, H, W]
+#     d = DepthToSpace<blocksize=r, mode="CRD">(h)  # -> [N, C, H*r, W*r]
+#     y = Conv(d, W2, B2)                        # W2: [out, C, kh, kw]
+#
+# -- with NOTHING between the producing ``Conv`` and ``DepthToSpace``, and
+# nothing between ``DepthToSpace`` and the consuming ``Conv`` either (neither
+# exporter ever inserts an activation/reshape in between for this op). This
+# is a genuine, previously-unrecognized gap: before this hop existed,
+# `_walk_to_conv_consumer` simply had no case for a `DepthToSpace` node at
+# all, so hitting one mid-walk silently ended the walk with no consumer
+# found -- the producing Conv was left completely unpruned (confirmed
+# empirically against exactly the model above).
+#
+# ONNX's own schema (`onnx.defs.get_schema("DepthToSpace")`, confirmed live)
+# defaults `mode` to `"DCR"`; PyTorch's `nn.PixelShuffle` always lowers to
+# `"CRD"` specifically (confirmed above) -- the two modes are NOT
+# interchangeable (a different channel/block interleaving), and this hop
+# recognizes CRD *only*, declining `"DCR"` (or any other value) outright,
+# never guessed at, per this module's own "never recognize a topology
+# variant you haven't empirically confirmed" convention: no exporter this
+# module has confirmed produces `mode="DCR"` from a Conv-chain context, so
+# there is nothing to safely generalize to yet.
+#
+# The CRD math (confirmed against the schema, not merely assumed) reshapes
+# ``[N, C*r*r, H, W] -> [N, C, r, r, H, W]``, transposes to
+# ``[N, C, H, r, W, r]``, then reshapes to ``[N, C, H*r, W*r]`` -- i.e. the
+# producer's own physical output-channel axis (size ``C*r*r``) splits, in
+# order, into ``C`` contiguous blocks of ``r*r`` channels each, and each
+# whole block becomes exactly one of DepthToSpace's own ``C`` logical output
+# channels (physical channel ``c*r*r + i*r + j`` feeds logical channel ``c``,
+# sub-position ``(i, j)`` of its ``r``-by-``r`` upsampled block). The critical
+# correctness property this hop is built around: a block's own ``r*r``
+# physical channels can only be kept or dropped *as one unit* -- dropping
+# some but not all of a block's own channels would leave DepthToSpace filling
+# some of that logical channel's own ``r``-by-``r`` sub-pixel positions from
+# the *wrong* (shifted) physical channel, silently corrupting the output
+# rather than merely producing a differently-shaped one. This is a
+# genuinely different shape from `_GroupNormPassThrough`'s own
+# `num_groups`-block scope (see `_GROUP_NORM_PASS_THROUGH_OP`'s own comment):
+# GroupNorm's blocks keep an arbitrary *same-count* subset of each block
+# (0..block_size survivors, chosen independently per block) because every
+# surviving channel there is still a literal, independent physical channel
+# on both sides of the hop; here the reshape genuinely changes which
+# quantity ("physical sub-channel" vs. "logical channel") a keep/drop
+# decision is even indexed by, and a real channel-count *shrink* (`C*r*r` on
+# the producer's own axis down to `C` on the consumer's own axis) happens at
+# the hop itself -- so this needs its own representation
+# (:class:`_DepthToSpacePassThrough`) rather than forcing it into
+# `_chain_group`/`_GroupNormPassThrough`'s existing same-cardinality
+# per-block machinery.
+#
+# Scope actually implemented here, deliberately conservative rather than
+# fully general: recognized ONLY as the chain walk's very first hop (`_hop
+# == 0`, mirroring the self-gated-activation hop's own "first hop only"
+# restriction -- see this module's own "Self-gated activation decomposition"
+# section comment), i.e. `DepthToSpace` must consume the producing Conv's
+# raw output directly, with no intervening activation/pass-through hop of
+# any kind -- exactly, and only, the confirmed real-export shape above. Its
+# own single output must, in turn, feed an ORDINARY (`group == 1`) Conv
+# consumer directly (matched right here, ending the walk -- no further
+# chain_ops/pass-through hop, and no GroupNorm-family hop, is recognized
+# between `DepthToSpace` and that consumer either). The producing Conv
+# itself must also be an ordinary (`group == 1`) producer (checked by the
+# caller, :func:`_find_conv_chains` -- a general grouped Conv producer would
+# need its own `group` blocks reconciled against DepthToSpace's own `r*r`
+# blocks, a composition this hop does not attempt). None of these
+# restrictions is a guessed generalization stopped short -- each is exactly
+# the shape confirmed above; a real export that ever inserts something in
+# between, or feeds a grouped consumer, simply declines this hop the same
+# "declined, not guessed at" way any other unmatched topology does, falling
+# back to the walk's existing behavior (no consumer found) exactly as before
+# this hop existed.
+#
+# `chain.n_channels` for a chain carrying this hop is set to the *logical*
+# channel count `C` (`= producer's own raw output-channel count // r*r`) --
+# what DepthToSpace's own output, and therefore the consuming Conv's own
+# input-channel axis, actually is; this needs no special-case anywhere the
+# consumer side is touched at all (`_chain_group` already returns 1 for
+# these chains, since neither side is grouped and no GroupNorm-family hop
+# can coexist with this one -- see above). Only the *producer* side needs
+# dedicated handling, in two places: `_chain_importance` reduces the
+# producer's own per-*physical*-channel importance (computed completely
+# normally, via whichever `compute_importance` callback the caller already
+# uses -- it has no reason to know anything is different) down to one score
+# per logical block (plain sum, since this is only ever a ranking heuristic,
+# never itself sliced into the graph -- no particular combination is more
+# "exact" than another here), and `_depth_to_space_expand_keep` expands a
+# decided logical-index `keep` set back out into the producer's own
+# `r*r`-times-wider physical index space (each kept logical index `c`
+# expanding to the *whole*, contiguous physical block ``[c*r*r,
+# (c+1)*r*r)``) before the producer's own weight/bias are sliced -- see each
+# function's own docstring.
+#
+# Excluded from `global_sparsity` mode (see
+# `_chain_is_global_sparsity_eligible`): that mode pools a flat, single
+# per-channel importance vector across every eligible chain and picks one
+# shared cutoff -- correctly generalizing it to a mix of plain per-channel
+# items and this hop's own indivisible `r*r`-channel blocks was judged out
+# of scope for this round; a model with a PixelShuffle head is still fully
+# prunable everywhere else in `global_sparsity` mode, just not through this
+# one hop, the same "declined outright, not guessed at" bar every other
+# scope boundary in this module holds to. See :func:`_match_depth_to_space_pass_through`.
+_DEPTH_TO_SPACE_PASS_THROUGH_OP = "DepthToSpace"
+
 
 def _flat_channel_const(
     name: str, initializer_map: Dict[str, onnx.TensorProto]
@@ -4076,6 +4190,30 @@ class _GrnPassThrough:
 
 
 @dataclass(frozen=True)
+class _DepthToSpacePassThrough:
+    """A mid-chain ``DepthToSpace`` node (mode ``"CRD"``, PyTorch's
+    ``nn.PixelShuffle`` lowering) the Conv chain walk crossed -- see this
+    module's own ``DepthToSpace`` (mode ``"CRD"``) section comment (just
+    above `_DEPTH_TO_SPACE_PASS_THROUGH_OP`) for the full empirical shape,
+    the block-vs-channel safety argument, and this hop's scope. Unlike
+    every other hop on :class:`_Chain` (`conv_pass_through`, `group_norm`,
+    `grn`), this one carries no weight/bias of its own to slice -- plain
+    ``DepthToSpace`` has no operand beyond its single data input -- so
+    `node` and `blocksize` are all it needs: `node`'s own output is simply
+    marked stale (its shape changes along with the channel count either
+    side of it), and `blocksize` drives the two producer-side-only
+    adjustments :func:`_chain_importance`/:func:`_depth_to_space_expand_keep`
+    perform (see their own docstrings) -- nothing on the consumer side
+    needs any adjustment at all, since `chain.n_channels` is already set to
+    the *logical* (post-DepthToSpace) channel count the consumer's own
+    input axis genuinely has.
+    """
+
+    node: onnx.NodeProto
+    blocksize: int
+
+
+@dataclass(frozen=True)
 class _Chain:
     # One producer for a plain chain; two for a gated (elementwise-product)
     # pair, where both branches must agree on which channels survive.
@@ -4135,6 +4273,21 @@ class _Chain:
     # :class:`_GrnPassThrough` and this module's own "Global Response
     # Normalization (GRN) pass-through" section comment.
     grn: Optional[_GrnPassThrough] = None
+    # A single mid-chain ``DepthToSpace`` (mode ``"CRD"``) hop the chain walk
+    # crossed -- PyTorch's ``nn.PixelShuffle`` lowering (:func:`_find_conv_chains`
+    # only, for now, gated by :func:`_walk_to_conv_consumer`'s own
+    # `recognize_depth_to_space` parameter; always ``None`` for every other
+    # chain kind, and for a MatMul/Gemm chain). Unlike `group_norm`/
+    # `decomposed_group_norm_num_groups`/`grn`, this hop genuinely changes the
+    # channel *count* between the producer's own raw output (`blocksize**2`
+    # times wider) and everything downstream of it (`n_channels`, the
+    # consumer's own real input axis) -- see this module's own ``DepthToSpace``
+    # section comment and :class:`_DepthToSpacePassThrough` for the full
+    # reasoning and this hop's scope. Mutually exclusive with `group_norm`/
+    # `decomposed_group_norm_num_groups`/`grn` by construction (the walk
+    # always ends the moment this hop matches, with no room left for any of
+    # the other three to also match on the same chain).
+    depth_to_space: Optional[_DepthToSpacePassThrough] = None
     # The consumer's own ``group`` attribute (always 1 for a MatMul/Gemm
     # consumer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
     # Conv consumer (see :func:`_match_conv_consumer`) -- unlike the
@@ -7325,6 +7478,51 @@ def _match_group_norm_pass_through(
     return scale_name, bias_name, num_groups
 
 
+def _match_depth_to_space_pass_through(
+    node: onnx.NodeProto, n_channels: int
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a plain (default-domain) ``DepthToSpace`` node with
+    ``mode="CRD"`` exactly and a `blocksize` attribute whose square evenly
+    divides `n_channels` (the producer's own raw, physical output-channel
+    count), returns ``(blocksize, logical_n_channels)`` --
+    ``logical_n_channels = n_channels // blocksize**2`` being the channel
+    count DepthToSpace's own output, and therefore the consuming Conv's own
+    input axis, genuinely has. See this module's own ``DepthToSpace`` (mode
+    ``"CRD"``) section comment (just above `_DEPTH_TO_SPACE_PASS_THROUGH_OP`)
+    for the full empirical shape and why only ``"CRD"`` is ever recognized.
+
+    Declines (``None``) on a missing/non-``"CRD"`` `mode` (including the
+    schema's own ``"DCR"`` default when the attribute is simply absent --
+    never guessed at), a missing/non-positive `blocksize`, or a `blocksize`
+    whose square doesn't evenly divide `n_channels` -- none of these is
+    guessed at. The real "does the node downstream of this hop's own single
+    output resolve to an ordinary (``group == 1``) Conv consumer whose input
+    channel count matches `logical_n_channels`" check, and the "is `node`'s
+    own single consumer exactly the walk's current position, with nothing in
+    between" positional check, are both left to the caller
+    (:func:`_walk_to_conv_consumer`), which has visibility into both.
+    """
+    if node.op_type != _DEPTH_TO_SPACE_PASS_THROUGH_OP or node.domain != "":
+        return None
+    if len(node.input) != 1 or len(node.output) != 1:
+        return None
+    mode = "DCR"  # ONNX's own schema default when the attribute is absent
+    blocksize = None
+    for attr in node.attribute:
+        if attr.name == "mode":
+            mode = attr.s.decode("utf-8") if isinstance(attr.s, bytes) else attr.s
+        elif attr.name == "blocksize":
+            blocksize = attr.i
+    if mode != "CRD":
+        return None  # only the confirmed real-export mode is ever recognized
+    if not blocksize or blocksize < 1:
+        return None
+    block = blocksize * blocksize
+    if n_channels % block != 0:
+        return None
+    return blocksize, n_channels // block
+
+
 def _match_instance_norm_pass_through(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -8845,6 +9043,7 @@ def _walk_to_conv_consumer(
     recognize_grn: bool = False,
     recognize_spatial_gate: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
+    recognize_depth_to_space: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Tuple[
     Optional[Tuple[onnx.NodeProto, str, int, bool]],
@@ -8854,6 +9053,7 @@ def _walk_to_conv_consumer(
     Optional[int],
     Optional[_ConsumerMatch],
     Optional[_GrnPassThrough],
+    Optional[_DepthToSpacePassThrough],
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
@@ -9012,6 +9212,31 @@ def _walk_to_conv_consumer(
     no per-chain "at most one" restriction and needs no dedicated return
     value here.
 
+    `recognize_depth_to_space` gates a mid-chain ``DepthToSpace`` (mode
+    ``"CRD"``) node -- PyTorch's ``nn.PixelShuffle`` lowering, see this
+    module's own ``DepthToSpace`` (mode ``"CRD"``) section comment and
+    :func:`_match_depth_to_space_pass_through` -- scoped identically to
+    `recognize_group_norm`/`recognize_grn` for the identical reason (only
+    :func:`_find_conv_chains` passes ``True``), but tried, and terminating
+    the walk, ONLY at `_hop == 0` (mirroring the self-gated-activation hop's
+    own "first hop only" restriction above) -- the confirmed real-export
+    shape has this node consume the producing Conv's raw output directly,
+    with nothing in between, so this hop is never tried at any later hop the
+    way every GroupNorm-family hop above is. A match immediately resolves
+    the node consuming `DepthToSpace`'s own single output as an ordinary
+    (``group == 1``) Conv consumer, right here, rather than continuing the
+    walk -- no further `chain_ops`/pass-through hop, and no GroupNorm-family
+    hop, is ever recognized between `DepthToSpace` and that consumer. On a
+    successful match, `n_channels` from that point on is implicitly the
+    *logical* (post-DepthToSpace) channel count -- the caller
+    (:func:`_find_conv_chains`) reads it back off the returned
+    :class:`_DepthToSpacePassThrough` (via its own `blocksize`) rather than
+    this function threading a second, different `n_channels` through its own
+    return shape. Mutually exclusive with `group_norm`/
+    `decomposed_group_norm_num_groups`/`grn` by construction -- the walk
+    always terminates the moment this hop matches, leaving no room for any
+    of the other three to also match on the same chain.
+
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- every ordinary
     caller leaves it ``None`` and gets identical behavior to before this
@@ -9068,6 +9293,7 @@ def _walk_to_conv_consumer(
     group_norm: Optional[_GroupNormPassThrough] = None
     decomposed_group_norm_num_groups: Optional[int] = None
     grn: Optional[_GrnPassThrough] = None
+    depth_to_space: Optional[_DepthToSpacePassThrough] = None
     consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
     matmul_consumer: Optional[_ConsumerMatch] = None
     cur = start
@@ -9213,6 +9439,44 @@ def _walk_to_conv_consumer(
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
                 consumer = (nxt, match[0], match[2], False)
+            break
+
+        if (
+            recognize_depth_to_space
+            and _hop == 0
+            and nxt.op_type == _DEPTH_TO_SPACE_PASS_THROUGH_OP
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+        ):
+            # See `recognize_depth_to_space`'s own docstring and this
+            # module's own ``DepthToSpace`` (mode ``"CRD"``) section comment:
+            # recognized ONLY as the walk's very first hop -- the confirmed
+            # real-export shape has this node consume the producing Conv's
+            # raw output directly -- and, on a match, immediately resolves
+            # its own single consumer as the chain's real (ordinary,
+            # `group == 1`) consumer, ending the walk right here rather than
+            # continuing it (no further hop of any kind is recognized
+            # between `DepthToSpace` and that consumer). A failed match, or a
+            # consumer that doesn't resolve, simply ends the walk unmatched,
+            # the same "declined, not guessed at" outcome any other
+            # unrecognized topology already gets.
+            d2s_match = _match_depth_to_space_pass_through(nxt, n_channels)
+            if d2s_match is not None:
+                blocksize, logical_n_channels = d2s_match
+                d2s_out = nxt.output[0]
+                d2s_out_consumers = consumers_of.get(d2s_out, [])
+                if len(d2s_out_consumers) == 1 and d2s_out not in graph_outputs:
+                    d2s_next = d2s_out_consumers[0]
+                    d2s_consumer_match = _match_conv_consumer(d2s_next, initializer_map)
+                    if (
+                        d2s_consumer_match is not None
+                        and d2s_consumer_match[1] == logical_n_channels
+                        and d2s_consumer_match[2] == 1
+                        and d2s_next.input[0] == d2s_out
+                    ):
+                        consumer = (d2s_next, d2s_consumer_match[0], 1, False)
+                        depth_to_space = _DepthToSpacePassThrough(nxt, blocksize)
             break
 
         if (
@@ -9426,6 +9690,7 @@ def _walk_to_conv_consumer(
         decomposed_group_norm_num_groups,
         matmul_consumer,
         grn,
+        depth_to_space,
     )
 
 
@@ -9495,6 +9760,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             decomposed_group_norm_num_groups,
             matmul_consumer,
             grn,
+            depth_to_space,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -9508,9 +9774,21 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_grn=True,
             recognize_spatial_gate=True,
             recognize_gap_flatten_matmul_consumer=True,
+            recognize_depth_to_space=True,
             producers_of=producers_of,
         )
         if consumer is None and matmul_consumer is None:
+            continue
+
+        if depth_to_space is not None and producer_group > 1:
+            # A general grouped Conv producer's own `group` blocks and
+            # DepthToSpace's own `blocksize**2`-channel blocks are two
+            # different partitions of the same physical output-channel
+            # axis, with no general way to reconcile them (mirroring this
+            # module's own "both sides grouped with a different group
+            # count"/GroupNorm-`num_groups`-mismatch decline just below) --
+            # declined outright, never guessed at. See this module's own
+            # ``DepthToSpace`` section comment for this hop's full scope.
             continue
 
         if matmul_consumer is not None:
@@ -9617,6 +9895,19 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         ):
             continue
 
+        # A chain carrying a `depth_to_space` hop has its own `n_channels`
+        # set to the *logical* (post-DepthToSpace) channel count -- what
+        # `consumer_weight`'s own input axis genuinely has, and everywhere
+        # else downstream of the hop already assumes (see
+        # :class:`_DepthToSpacePassThrough`'s own docstring) -- rather than
+        # the producer's own raw, `blocksize**2`-times-wider output-channel
+        # count still held in this loop's own `n_channels` local.
+        chain_n_channels = (
+            n_channels // (depth_to_space.blocksize * depth_to_space.blocksize)
+            if depth_to_space is not None
+            else n_channels
+        )
+
         chains.append(
             _Chain(
                 producers=(
@@ -9634,12 +9925,13 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 consumer_node=consumer_node,
                 consumer_weight=consumer_weight,
                 consumer_weight_transposed=False,
-                n_channels=n_channels,
+                n_channels=chain_n_channels,
                 consumer_is_conv=True,
                 conv_pass_through=conv_pass_through,
                 group_norm=group_norm,
                 decomposed_group_norm_num_groups=decomposed_group_norm_num_groups,
                 grn=grn,
+                depth_to_space=depth_to_space,
                 consumer_group=consumer_group,
                 consumer_is_conv_transpose=consumer_is_conv_transpose,
             )
@@ -10114,6 +10406,7 @@ def _resolve_conv_fanout_branches(
                 _br_decomposed_group_norm,
                 _br_matmul_consumer,
                 _br_grn,
+                _br_depth_to_space,
             ) = _walk_to_conv_consumer(
                 tensor,
                 initializer_map,
@@ -10126,8 +10419,9 @@ def _resolve_conv_fanout_branches(
             if resolved is None:
                 return None
             # `recognize_group_norm`/`recognize_decomposed_group_norm`/
-            # `recognize_grn` were left at their defaults (False) above, so
-            # `_br_group_norm`/`_br_decomposed_group_norm`/`_br_grn` are
+            # `recognize_grn`/`recognize_depth_to_space` were left at their
+            # defaults (False) above, so `_br_group_norm`/
+            # `_br_decomposed_group_norm`/`_br_grn`/`_br_depth_to_space` are
             # always `None` -- GroupNorm/GRN pass-through (native or
             # decomposed) is deliberately out of scope for a residual/merge
             # group's own fan-out branches for now (see
@@ -10734,6 +11028,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             decomposed_group_norm_num_groups,
             _matmul_consumer,
             grn,
+            depth_to_space,
         ) = _walk_to_conv_consumer(
             mul_out,
             initializer_map,
@@ -10746,14 +11041,16 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             continue
         # Every optional `_walk_to_conv_consumer` flag (`allow_conv_transpose_
         # consumer`, `recognize_group_norm`, `recognize_decomposed_group_norm`,
-        # `recognize_grn`, `recognize_gap_flatten_matmul_consumer`) was left at
-        # its default (False) above -- see this section's own comment for why
-        # -- so `group_norm`/`decomposed_group_norm_num_groups`/`grn`/
+        # `recognize_grn`, `recognize_gap_flatten_matmul_consumer`,
+        # `recognize_depth_to_space`) was left at its default (False) above --
+        # see this section's own comment for why -- so `group_norm`/
+        # `decomposed_group_norm_num_groups`/`grn`/`depth_to_space`/
         # `_matmul_consumer` are always `None` here.
         assert (
             group_norm is None
             and decomposed_group_norm_num_groups is None
             and grn is None
+            and depth_to_space is None
         )
         (
             consumer_node,
@@ -11479,6 +11776,7 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             decomposed_group_norm_num_groups,
             _matmul_consumer,
             grn,
+            depth_to_space,
         ) = _walk_to_conv_consumer(
             mul_out,
             initializer_map,
@@ -11496,6 +11794,7 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             group_norm is None
             and decomposed_group_norm_num_groups is None
             and grn is None
+            and depth_to_space is None
         )
         (
             consumer_node,
@@ -14498,6 +14797,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             _fwd_decomposed_group_norm,
             _fwd_matmul_consumer,
             _fwd_grn,
+            _fwd_depth_to_space,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -14513,11 +14813,13 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         # consumer for now (see _walk_to_conv_consumer's own docstring), the
         # same way ConvTranspose/GroupNorm already are.
         # `recognize_group_norm`/`recognize_decomposed_group_norm`/
-        # `recognize_grn` were left at their defaults (False) above, so
-        # `_fwd_group_norm`/`_fwd_decomposed_group_norm`/`_fwd_grn` are always
-        # `None` -- GroupNorm/GRN pass-through (native or decomposed) is
-        # deliberately out of scope for a Concat-branch-merge chain's own
-        # consumer for now (see _walk_to_conv_consumer's own docstring).
+        # `recognize_grn`/`recognize_depth_to_space` were left at their
+        # defaults (False) above, so `_fwd_group_norm`/
+        # `_fwd_decomposed_group_norm`/`_fwd_grn`/`_fwd_depth_to_space` are
+        # always `None` -- GroupNorm/GRN/DepthToSpace pass-through (native or
+        # decomposed) is deliberately out of scope for a Concat-branch-merge
+        # chain's own consumer for now (see _walk_to_conv_consumer's own
+        # docstring).
         if consumer is None:
             continue
         # `allow_conv_transpose_consumer` was left at its default (False)
@@ -15381,6 +15683,64 @@ def _producer_weight_nk(w: np.ndarray, p: "_Producer") -> np.ndarray:
     return w if p.weight_transposed else w.T
 
 
+def _depth_to_space_expand_keep(chain: _Chain, keep: np.ndarray) -> np.ndarray:
+    """Expands a `depth_to_space` chain's own `keep` -- ascending indices
+    into `chain.n_channels`, the *logical* (post-DepthToSpace) channel
+    count every other role (the consumer, `_chain_group`, `keep_count`
+    itself) already operates in -- into the producer's own raw,
+    `blocksize**2`-times-wider *physical* output-channel index space. See
+    this module's own ``DepthToSpace`` (mode ``"CRD"``) section comment: a
+    kept logical index `c` maps to the entire, contiguous physical block
+    ``[c * blocksize**2, (c + 1) * blocksize**2)`` -- never a partial one,
+    since DepthToSpace's own reshape needs every one of a block's `r*r`
+    physical channels present to fill in that logical channel's own
+    `r`-by-`r` upsampled sub-grid correctly. `keep` is ascending and every
+    block is disjoint and increasing, so the concatenation below is
+    ascending too, the same invariant every other producer-side `keep`
+    array already holds.
+    """
+    assert chain.depth_to_space is not None
+    block = chain.depth_to_space.blocksize * chain.depth_to_space.blocksize
+    return (keep[:, None] * block + np.arange(block)[None, :]).reshape(-1)
+
+
+def _chain_importance(
+    chain: _Chain,
+    w_arrays_nk: List[np.ndarray],
+    compute_importance: Callable[[_Chain, List[np.ndarray]], np.ndarray],
+) -> np.ndarray:
+    """Wraps a plain ``compute_importance(chain, w_arrays_nk) ->
+    np.ndarray[chain.n_channels]`` call, redirecting it through the
+    producer's own wider *physical* channel space for a `depth_to_space`
+    chain -- see this module's own ``DepthToSpace`` (mode ``"CRD"``) section
+    comment and :class:`_DepthToSpacePassThrough`'s own docstring. The
+    ordinary `compute_importance` callback (`_plain_structured_importance`,
+    or any calibrated variant) is run completely unchanged, against the
+    producer's own real, physical per-channel weight rows -- it has no
+    reason to know anything is different, since every other chain kind's own
+    `w_arrays_nk` already has exactly one row per `chain.n_channels` entry
+    -- via a shadow chain (`dataclasses.replace`) whose own `n_channels` is
+    temporarily widened to the producer's own physical count; only the
+    *result* is then reduced, one plain sum per contiguous
+    `blocksize**2`-channel block, down to the logical, `chain.n_channels`
+    -wide vector every other piece of this chain's own machinery (`keep`,
+    `keep_count`, the consumer's real input axis) already operates in. Plain
+    sum, not (e.g.) each block's own max or a norm-of-norms recombination:
+    this is only ever a ranking heuristic (which logical channels are least
+    useful) -- never itself sliced into the graph anywhere -- so no
+    particular combination is more "exact" than another; sum simply treats
+    every physical sub-channel's own contribution equally. For every other
+    chain kind (`chain.depth_to_space is None`), this is exactly
+    `compute_importance(chain, w_arrays_nk)`, unchanged.
+    """
+    if chain.depth_to_space is None:
+        return compute_importance(chain, w_arrays_nk)
+    block = chain.depth_to_space.blocksize * chain.depth_to_space.blocksize
+    physical_chain = replace(chain, n_channels=chain.n_channels * block)
+    physical_importance = compute_importance(physical_chain, w_arrays_nk)
+    return physical_importance.reshape(chain.n_channels, block).sum(axis=1)
+
+
 def _plain_structured_importance(
     chain: _Chain, w_arrays_nk: List[np.ndarray], importance_norm: str = "l2"
 ) -> np.ndarray:
@@ -15520,11 +15880,23 @@ def _chain_is_global_sparsity_eligible(chain: _Chain) -> bool:
     and no general grouped Conv on either side. See
     :func:`apply_structured_pruning`'s own `global_sparsity` docstring for
     the full reasoning; this is just the predicate it describes.
+
+    A `depth_to_space` chain is excluded outright, regardless of
+    `_chain_group` (always 1 for these -- see :class:`_DepthToSpacePassThrough`'s
+    own docstring): `_apply_chains_global` pools one flat, single
+    per-*channel* importance value per admitted chain into one shared
+    global cutoff -- correctly generalizing that pooling to a mix of plain
+    per-channel items and this hop's own indivisible `blocksize**2`-channel
+    blocks (see this module's own ``DepthToSpace`` section comment) was
+    judged out of scope for this round, so it is declined here the same
+    "declined outright, not guessed at" way a general grouped Conv chain
+    already is above.
     """
     return (
         len(chain.producers) == 1
         and not chain.extra_consumers
         and _chain_group(chain) == 1
+        and chain.depth_to_space is None
     )
 
 
@@ -15547,16 +15919,29 @@ def _slice_chain_channels(
     per-chain top-k vs. a globally pooled threshold), never in how a
     decided `keep` set is applied to the graph.
     """
+    # A `depth_to_space` chain's own `keep` is indexed by the *logical*
+    # (post-DepthToSpace) channel count -- correct as-is for the consumer
+    # and every other role below, but the producer's own raw output-channel
+    # axis is `blocksize**2` times wider, so its own weight/bias need the
+    # expanded, physical-index-space `keep` instead -- see
+    # :func:`_depth_to_space_expand_keep`'s own docstring. Every other chain
+    # kind (`chain.depth_to_space is None`) is completely unaffected, using
+    # `keep` unchanged exactly as before this hop existed.
+    producer_keep = (
+        _depth_to_space_expand_keep(chain, keep)
+        if chain.depth_to_space is not None
+        else keep
+    )
     for p in chain.producers:
         _slice_producer_weight(
             initializer_map[p.weight],
             p.weight_transposed,
-            keep,
+            producer_keep,
             is_conv=p.is_conv,
             is_conv_transpose=p.is_conv_transpose,
         )
         if p.bias is not None:
-            _slice_last_axis(initializer_map[p.bias], keep)
+            _slice_last_axis(initializer_map[p.bias], producer_keep)
     for _, const_name in chain.chain_ops:
         if const_name is not None:
             _slice_last_axis(initializer_map[const_name], keep)
@@ -15652,6 +16037,8 @@ def _slice_chain_channels(
     if chain.grn is not None:
         stale_value_info.add(chain.grn.weight_node.output[0])
         stale_value_info.add(chain.grn.bias_node.output[0])
+    if chain.depth_to_space is not None:
+        stale_value_info.add(chain.depth_to_space.node.output[0])
     stale_value_info.update(
         chain_node.output[0]
         for b in chain.extra_consumers
@@ -15780,7 +16167,7 @@ def _apply_chains(
         for p in chain.producers:
             w = _to_f64(initializer_map[p.weight])
             w_arrays_nk.append(_producer_weight_nk(w, p))
-        importance = compute_importance(chain, w_arrays_nk)
+        importance = _chain_importance(chain, w_arrays_nk, compute_importance)
         if group > 1:
             # One independent top-k per block -- see _chain_group and this
             # function's own docstring. Blocks are contiguous and already
@@ -44016,7 +44403,7 @@ def _analyze_chains(
                     np.float64
                 )
                 w_arrays_nk.append(_producer_weight_nk(w, p))
-            importance = compute_importance(chain, w_arrays_nk)
+            importance = _chain_importance(chain, w_arrays_nk, compute_importance)
 
             if group > 1:
                 keep = np.concatenate(
