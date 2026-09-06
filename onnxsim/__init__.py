@@ -219,6 +219,11 @@ from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
+from onnxsim.qwen3_5_reconstruct import (
+    reconstruct_qwen3_5_language_model,
+    reconstruct_qwen3_5_vision_encoder,
+    reconstruct_qwen3_5_vlm,
+)
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
 from onnxsim.slim_llm import apply_slim_llm
@@ -448,6 +453,9 @@ __all__ = [
     "read_gguf_metadata",
     "reconstruct_gguf_graph",
     "reconstruct_hf_graph",
+    "reconstruct_qwen3_5_vlm",
+    "reconstruct_qwen3_5_language_model",
+    "reconstruct_qwen3_5_vision_encoder",
     "read_hf_config",
     "UnsupportedArchitectureError",
     "export_transformers_model",
