@@ -2444,6 +2444,56 @@ region (decoded first, long ago) to the field map for the first time.
 Whether `0x2ff000` is the physical on-chip memory size is still not
 checked against a spec.
 
+### The whole map generalizes to a second real architecture: `mnasnet_small`
+
+Everything above about mcode's structure was established on `resnet18d`
+(plus a tiny synthetic two-Conv model). A real second architecture,
+`mnasnet_small_Opset17` -- depthwise-separable, 133 NPU ops vs.
+`resnet18d`'s 181, a 2.77 MB weight table vs. 11.86 MB -- compiled fully
+on the NPU (one fused subgraph), ran on the real AX650N, and was
+bit-identical between the original and onnxsim-simplified graphs, as
+always. Its mcode (78,584 bytes) checked against every structural claim,
+all local:
+
+```
+claim                                   resnet18d            mnasnet_small
+header words 72 / 76                    4096 / 0x2ff000      4096 / 0x2ff000   (identical)
+largest 50 03 below the arena, by       32,704 B (< 1 tile)  26,848 B (< 1 tile)
+first field write                       byte 297, phase 1    byte 297, phase 1
+five verbs present                      yes                  yes
+40 02 / 50 03 / a9 / a8:3002 / a8:4003  181 each             133 each   (= op count)
+50 01 writes per op                     4.00                 4.00
+50 01 operand set                       {bit0,8,20,24}       {bit0,8,20,24}
+50 01 order per op                      bit8,bit0,bit20,bit24 (180/180)  same (132/132)
+dominant per-op template                64 of 180 ops        34 of 132 ops
+40 02 max / Wbt size                    0.997, all distinct  0.984, all distinct
+sdma4 trace events                      181 (= ops)          133 (= ops)
+two-word tiling of the bulk             97.5%                92.3%
+50 03 operands 64-byte aligned          175/176              112/133
+```
+
+**Every per-op invariant holds exactly on the second model**, with the
+op count simply changing from 181 to 133: the five verbs, the one write
+each of `40 02`/`50 03`/`a9`/both `a8` selectors per op, four `50 01`
+writes per op in the same one-hot set and the same fixed order, the same
+dominant eleven-instruction template, `40 02` spanning the weight table
+(all distinct, 98.4% of a Wbt one quarter the size), and one `sdma4` DMA
+per op. **The arena size `0x2ff000` is identical**, so it is a platform
+constant of the AX650N, not something the compiler sizes per model --
+and both models' arena addresses stay under it by less than one tile.
+The depthwise convs also show up where the engine-split finding said
+they would: both MAC engines busy (`conv0` 909, `conv1` 855 events).
+
+**Two honest deltas.** The bulk's two-word tiling is 92% here vs. 97.5%
+(a few 16-word gaps -- larger operands or a different verb the tally
+does not know), and `50 03` alignment is 84% vs. 99% (depthwise tiles
+plausibly use a finer granule). Neither touches the per-op invariants;
+both are worth knowing before treating the parser as complete.
+
+Net: the field-write reading, the verb set, the per-op program, and the
+two quantitatively decoded fields are properties of the compiler and
+the hardware, not of `resnet18d`.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
