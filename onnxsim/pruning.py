@@ -13764,6 +13764,29 @@ class _ConcatBranch:
     # (possibly-multi-producer) output actually feeds the `Concat` node --
     # a perfectly well-defined probe point either way.
     operand_name: str
+    # Set only for GhostModule's own "cheap operation" shape (see this
+    # section's own comment just above :func:`_match_ghost_module_cheap_op_concat`):
+    # the index, into this branch's own :class:`_ConcatChain.branches`, of
+    # the "primary" branch this one must reuse the *exact* local `keep`
+    # index set of -- never independently ranked/chosen -- because this
+    # branch's own real "producer" is a depthwise Conv fed *directly* by
+    # that primary branch's own output, so channel `i` here is, by
+    # construction, the exact same logical channel as channel `i` there (a
+    # depthwise Conv mixes no channels at all -- see
+    # :func:`_match_depthwise_conv_pass_through`'s own docstring). `None`
+    # (the default) for every other branch kind -- including a plain
+    # producer branch and a composed residual/merge-group branch -- both of
+    # which still rank and choose their own independent `keep` exactly as
+    # :func:`_apply_concat_chains`'s own docstring describes. Always `None`
+    # for a MatMul/Gemm branch (:func:`_find_matmul_concat_chains` never
+    # sets it). The referenced branch is always at a strictly lower index
+    # and always already resolved to its own `keep` by the time
+    # :func:`_apply_concat_chains` reaches this one, since `Concat` operand
+    # order is preserved in `branches` and this shape is only ever matched
+    # with the primary branch as the *first* operand (see that matcher's
+    # own docstring for why the narrower, exact operand-order scope is
+    # safe).
+    mirror_of: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -13834,6 +13857,43 @@ def _branch_walk_has_fanout(
         prev_consumer = node
         cur = new_cur
     consumers = consumers_of.get(cur, [])
+    return len(consumers) != 1 or consumers[0] is not prev_consumer
+
+
+def _branch_walk_has_fanout_tolerating(
+    start: str,
+    edges: Tuple[Tuple[str, onnx.NodeProto], ...],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    forward_node: onnx.NodeProto,
+    tolerated_tensor: str,
+    tolerated_consumers: Set[int],
+) -> bool:
+    """:func:`_branch_walk_has_fanout`, except `tolerated_tensor` -- wherever
+    this walk crosses it, including as `start` itself -- is allowed to have
+    exactly `tolerated_consumers` (node identities, via ``id()``) as its own
+    consumer set, instead of the single in-walk consumer the general bar
+    otherwise requires; every OTHER tensor crossed is still held to that
+    exact same strict single-consumer bar. Used only by
+    :func:`_match_ghost_module_cheap_op_concat` for the one confirmed real
+    shape where a tensor legitimately has two real consumers at once -- see
+    that function's own docstring and this section's own comment. Return
+    sense matches :func:`_branch_walk_has_fanout` exactly: `True` means an
+    (unresolved) fan-out was found, so the caller should decline.
+    """
+    prev_consumer = forward_node
+    cur = start
+    for new_cur, node in edges:
+        consumers = consumers_of.get(cur, [])
+        if cur == tolerated_tensor:
+            if {id(c) for c in consumers} != tolerated_consumers:
+                return True
+        elif len(consumers) != 1 or consumers[0] is not prev_consumer:
+            return True
+        prev_consumer = node
+        cur = new_cur
+    consumers = consumers_of.get(cur, [])
+    if cur == tolerated_tensor:
+        return {id(c) for c in consumers} != tolerated_consumers
     return len(consumers) != 1 or consumers[0] is not prev_consumer
 
 
@@ -14354,6 +14414,193 @@ def _concat_branches_align_to_consumer_group(
     return all(b.offset % block == 0 for b in branches)
 
 
+# --- GhostNet "GhostModule" cheap-operation concat fan-out -----------------
+#
+# GhostNet/GhostNetV2's own `GhostModule` (the verbatim reference
+# implementation, `huawei-noah/Efficient-AI-Backbones/ghostnet_pytorch/
+# ghostnet.py`, used by GhostNet and several derivative mobile backbones)
+# runs a "primary" Conv, then derives a SECOND set of channels from the
+# primary's own output via a cheap depthwise Conv, and concatenates the two:
+#
+#     r1 = relu(primary_conv(x))                    # group=1 Conv
+#     r2 = relu(cheap_operation(r1))                 # group=Cinit depthwise
+#     out = concat([r1, r2], axis=1)
+#
+# confirmed live via a real `torch.onnx.export` of that exact class (see
+# `tests/test_pruning.py`'s own fixture) -- `r1` feeds BOTH the `Concat`
+# directly AND the depthwise "cheap operation" Conv that produces `r2`, the
+# `Concat`'s *other* operand. Every other matcher in this section (and
+# :func:`_find_matmul_concat_chains`) resolves each `Concat` operand's own
+# backward walk *independently*, then declines the whole match outright
+# (:func:`_branch_walk_has_fanout`) the instant any tensor it crosses has
+# more than the one forward consumer that operand's own walk already
+# accounts for -- exactly what `r1` trips here, on BOTH operands' own walks
+# (`r1` directly, since it's also read by the cheap-operation Conv; and `r2`'s
+# own walk, since it crosses `r1` as a depthwise pass-through hop mid-walk
+# and finds the same second reader). That decline is correct in general --
+# resolving a shared tensor between two *independently, differently* ranked
+# branches has no safe meaning -- but this one specific shape is safe
+# precisely because it *isn't* independent: `r2`'s producer role is a
+# depthwise Conv fed directly by `r1`, which mixes no channels at all
+# (output channel `i` depends only on input channel `i`, see
+# :func:`_match_depthwise_conv_pass_through`'s own docstring), so `r2`'s
+# channel `i` is, by construction, the exact same logical channel as `r1`'s
+# channel `i`. There is no independent ranking to reconcile: whichever
+# channels `r1`'s own primary Conv survives ranking on, `r2`'s matching
+# channels must survive right alongside them, chosen once and reused, not
+# ranked a second, possibly-disagreeing time.
+#
+# What :func:`_match_ghost_module_cheap_op_concat` matches, conservatively:
+#
+#   - The `Concat` has EXACTLY TWO operands, in EXACTLY the order
+#     `[r1, r2]` -- matching the reference implementation's own literal
+#     `torch.cat([x1, x2], dim=1)` call, never the reverse order or a third
+#     operand. No trailing `Slice` (GhostNet's own `ratio != 2` case, which
+#     trims the merged tensor to an exact target channel count) is
+#     recognized at all here -- `_find_conv_concat_chains`'s own forward
+#     walk (:func:`_walk_to_conv_consumer`) has no `Slice` pass-through hop,
+#     so that shape simply fails to resolve a consumer and is declined the
+#     same "unmatched topology" way any other un-recognized forward hop
+#     already is; not specially detected or called out, just not reached.
+#   - `r1` resolves (:func:`_walk_conv_producer_backward`, reused unchanged)
+#     to a real, ordinary (`group == 1`) Conv producer with NO depthwise
+#     pass-through hop of its own -- the "primary" conv. Zero or more unary
+#     activations between it and `r1` are tolerated, exactly like any other
+#     plain Concat branch.
+#   - `r2` resolves the same way, but crossing EXACTLY ONE depthwise
+#     pass-through hop, landing on the *exact same* real producer weight as
+#     `r1`'s own (confirmed by initializer NAME equality) -- i.e. `r2`'s own
+#     depthwise Conv reads `r1` directly as its input (`dw_node.input[0] ==
+#     r1`, not merely "some upstream tensor that happens to also reach the
+#     same Conv"). A `Concat` branch normally declines two branches naming
+#     the same producer weight as degenerate (see
+#     :func:`_find_conv_concat_chains`'s own `seen_weights` check) -- that
+#     bar still applies to every OTHER branch shape; this one specific
+#     shape is recognized before that check is ever reached, specifically
+#     because `r2` carries its OWN extra depthwise weight distinguishing it
+#     from a genuine duplicate.
+#   - `r1`'s own two consumers must be EXACTLY the `Concat` node and that
+#     one depthwise Conv -- checked by node identity, not merely count.
+#     Every OTHER tensor either branch's own walk crosses is still held to
+#     the exact same strict single-consumer bar as any other Concat branch
+#     (:func:`_branch_walk_has_fanout_tolerating`, `_branch_walk_has_fanout`
+#     with the one `r1` checkpoint's own bar relaxed to that tolerated pair).
+#
+# Representation: two `_ConcatBranch` entries, exactly like an ordinary
+# plain-producer match -- branch A (`r1`, the primary conv) ranked and
+# pruned completely normally, and branch B (`r2`) carrying NO `producers` of
+# its own at all (nothing to independently rank) but the depthwise Conv as
+# its own `conv_pass_through` hop, and `mirror_of=0` -- telling
+# :func:`_apply_concat_chains` to skip ranking it and instead copy branch
+# A's own `keep` verbatim (see :class:`_ConcatBranch.mirror_of`'s own
+# docstring). This reuses the existing per-branch `_ConcatBranch`/
+# `_ConcatChain` machinery unchanged beyond that one new field -- no new
+# `_Chain`-like type, and no change to any *other* branch's own resolution
+# or slicing.
+#
+# What's declined, deliberately narrower than a hypothetical fully-general
+# matcher might reach: more than two `Concat` operands; the reverse operand
+# order (`[r2, r1]`); a non-depthwise (or grouped-but-not-fully-depthwise)
+# second branch; more than one depthwise hop on `r2`'s own path (e.g. a
+# "cheap operation" chained through two convs); a primary branch (`r1`)
+# that is itself a general grouped (`1 < group < n_channels`) Conv, or that
+# crosses a depthwise pass-through hop of its own; a trailing `Slice`
+# (GhostNet's own `ratio != 2` case -- see above); and every other topology
+# already declined by the ordinary per-operand loop below, which this
+# matcher's own failure falls straight through to.
+
+
+def _match_ghost_module_cheap_op_concat(
+    concat_node: onnx.NodeProto,
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[_ConcatBranch, _ConcatBranch]]:
+    """Matches GhostModule's own "cheap operation" concat fan-out shape --
+    see this section's own comment above for the exact topology and safety
+    argument. Returns `(branch_a, branch_b)` on success -- `branch_a` the
+    primary producer branch (operand 0, `r1`), `branch_b` the depthwise-
+    derived branch (operand 1, `r2`, `mirror_of=0`) -- or `None` on any
+    deviation, the caller falling through to the ordinary per-operand
+    resolution loop.
+    """
+    if len(concat_node.input) != 2:
+        return None
+    r1_name, r2_name = concat_node.input[0], concat_node.input[1]
+    if r1_name == r2_name:
+        return None
+
+    kind1, payload1, pass_through1, unary_ops1, edges1 = _walk_conv_producer_backward(
+        r1_name,
+        node_by_output,
+        initializer_map,
+        consumers_of,
+        graph_outputs,
+        _MAX_CHAIN_HOPS,
+    )
+    if kind1 != "producer" or pass_through1:
+        return None  # branch A must be a direct, plain producer branch
+    producer1, n_channels = cast(Tuple[_Producer, int], payload1)
+    if producer1.group != 1:
+        return None  # narrow scope -- an ordinary group=1 primary conv only
+
+    kind2, payload2, pass_through2, unary_ops2, edges2 = _walk_conv_producer_backward(
+        r2_name,
+        node_by_output,
+        initializer_map,
+        consumers_of,
+        graph_outputs,
+        _MAX_CHAIN_HOPS,
+    )
+    if kind2 != "producer" or len(pass_through2) != 1:
+        return None  # exactly one depthwise hop expected on r2's own path
+    producer2, n_channels2 = cast(Tuple[_Producer, int], payload2)
+    if n_channels2 != n_channels or producer2.weight != producer1.weight:
+        return None  # both branches must land on the exact same real producer
+
+    dw_hop = pass_through2[0]
+    dw_node = dw_hop.node
+    if dw_node.input[0] != r1_name:
+        return None  # the depthwise conv must read r1 directly, not some
+        # other upstream tensor that happens to reach the same producer
+    dw_w_init = initializer_map.get(dw_hop.weight)
+    if dw_w_init is None or dw_w_init.dims[0] != n_channels:
+        return None  # re-validate against the now-known real channel count
+
+    tolerated = {id(concat_node), id(dw_node)}
+    if {id(c) for c in consumers_of.get(r1_name, [])} != tolerated:
+        return None
+
+    if _branch_walk_has_fanout_tolerating(
+        r1_name, edges1, consumers_of, concat_node, r1_name, tolerated
+    ):
+        return None
+    if _branch_walk_has_fanout_tolerating(
+        r2_name, edges2, consumers_of, concat_node, r1_name, tolerated
+    ):
+        return None
+
+    branch_a = _ConcatBranch(
+        (producer1,),
+        tuple((op, None) for op in unary_ops1),
+        (),
+        n_channels,
+        0,
+        r1_name,
+    )
+    branch_b = _ConcatBranch(
+        (),
+        tuple((op, None) for op in unary_ops2),
+        (dw_hop,),
+        n_channels,
+        n_channels,
+        r2_name,
+        mirror_of=0,
+    )
+    return branch_a, branch_b
+
+
 def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     """The Conv analogue of :func:`_find_matmul_concat_chains`: every operand
     of a channel-axis `Concat` (`axis in (1, -3)` -- the channel axis of a
@@ -14398,91 +14645,109 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         seen_weights: Set[str] = set()
         offset = 0
         declined = False
-        for operand in node.input:
-            kind, payload, pass_through, unary_ops, edges = (
-                _walk_conv_producer_backward(
-                    operand,
-                    node_by_output,
-                    initializer_map,
-                    consumers_of,
-                    graph_outputs,
-                    _MAX_CHAIN_HOPS,
+
+        # GhostModule's own "cheap operation" concat fan-out (see this
+        # section's own comment above :func:`_match_ghost_module_cheap_op_concat`)
+        # is tried FIRST, since its own two branches are declined outright by
+        # the ordinary per-operand loop below (`r1`'s own extra consumer --
+        # the depthwise "cheap operation" Conv -- trips
+        # :func:`_branch_walk_has_fanout` on both operands' own walks). Any
+        # deviation from that one exact confirmed shape falls straight
+        # through to the ordinary loop, completely unaffected.
+        ghost_match = _match_ghost_module_cheap_op_concat(
+            node, node_by_output, initializer_map, consumers_of, graph_outputs
+        )
+        if ghost_match is not None:
+            branch_a, branch_b = ghost_match
+            branches = [branch_a, branch_b]
+            offset = branch_a.n_channels + branch_b.n_channels
+            declined = False
+        else:
+            for operand in node.input:
+                kind, payload, pass_through, unary_ops, edges = (
+                    _walk_conv_producer_backward(
+                        operand,
+                        node_by_output,
+                        initializer_map,
+                        consumers_of,
+                        graph_outputs,
+                        _MAX_CHAIN_HOPS,
+                    )
                 )
-            )
-            if kind == "fail":
-                declined = True
-                break
-            if _branch_walk_has_fanout(operand, edges, consumers_of, node):
-                declined = True
-                break
-            if kind == "add":
-                assert isinstance(payload, onnx.NodeProto)
-                resolved = _resolve_conv_residual_group_for_concat(
-                    payload,
-                    node_by_output,
-                    initializer_map,
-                    consumers_of,
-                    graph_outputs,
-                )
-                if resolved is None:
+                if kind == "fail":
                     declined = True
                     break
-                (
-                    producers,
-                    group_pass_through,
-                    group_unary_ops,
-                    n_channels,
-                    backbone,
-                    accounted,
-                ) = resolved
-                extra = _resolve_conv_fanout_branches(
-                    backbone,
-                    accounted,
-                    initializer_map,
-                    consumers_of,
-                    graph_outputs,
-                    n_channels,
-                )
-                # See _find_matmul_concat_chains's own matching comment --
-                # only an exactly-empty result confirms no fan-out anywhere
-                # else in the group.
-                if extra is None or extra:
+                if _branch_walk_has_fanout(operand, edges, consumers_of, node):
                     declined = True
                     break
-                if any(p.weight in seen_weights for p in producers):
+                if kind == "add":
+                    assert isinstance(payload, onnx.NodeProto)
+                    resolved = _resolve_conv_residual_group_for_concat(
+                        payload,
+                        node_by_output,
+                        initializer_map,
+                        consumers_of,
+                        graph_outputs,
+                    )
+                    if resolved is None:
+                        declined = True
+                        break
+                    (
+                        producers,
+                        group_pass_through,
+                        group_unary_ops,
+                        n_channels,
+                        backbone,
+                        accounted,
+                    ) = resolved
+                    extra = _resolve_conv_fanout_branches(
+                        backbone,
+                        accounted,
+                        initializer_map,
+                        consumers_of,
+                        graph_outputs,
+                        n_channels,
+                    )
+                    # See _find_matmul_concat_chains's own matching comment --
+                    # only an exactly-empty result confirms no fan-out anywhere
+                    # else in the group.
+                    if extra is None or extra:
+                        declined = True
+                        break
+                    if any(p.weight in seen_weights for p in producers):
+                        declined = True
+                        break
+                    seen_weights.update(p.weight for p in producers)
+                    branches.append(
+                        _ConcatBranch(
+                            producers,
+                            tuple((op, None) for op in group_unary_ops)
+                            + tuple((op, None) for op in unary_ops),
+                            group_pass_through + pass_through,
+                            n_channels,
+                            offset,
+                            operand,
+                        )
+                    )
+                    offset += n_channels
+                    continue
+                assert payload is not None and not isinstance(payload, onnx.NodeProto)
+                producer, n_channels = payload
+                if producer.weight in seen_weights:
                     declined = True
                     break
-                seen_weights.update(p.weight for p in producers)
+                seen_weights.add(producer.weight)
                 branches.append(
                     _ConcatBranch(
-                        producers,
-                        tuple((op, None) for op in group_unary_ops)
-                        + tuple((op, None) for op in unary_ops),
-                        group_pass_through + pass_through,
+                        (producer,),
+                        tuple((op, None) for op in unary_ops),
+                        pass_through,
                         n_channels,
                         offset,
                         operand,
                     )
                 )
                 offset += n_channels
-                continue
-            assert payload is not None and not isinstance(payload, onnx.NodeProto)
-            producer, n_channels = payload
-            if producer.weight in seen_weights:
-                declined = True
-                break
-            seen_weights.add(producer.weight)
-            branches.append(
-                _ConcatBranch(
-                    (producer,),
-                    tuple((op, None) for op in unary_ops),
-                    pass_through,
-                    n_channels,
-                    offset,
-                    operand,
-                )
-            )
-            offset += n_channels
         if declined:
             continue
 
@@ -14675,6 +14940,19 @@ def _apply_concat_chains(
         branch_keeps: List[np.ndarray] = []
         any_pruned = False
         for b in chain.branches:
+            if b.mirror_of is not None:
+                # GhostModule's own "cheap operation" branch (see
+                # :class:`_ConcatBranch.mirror_of`'s own docstring and
+                # :func:`_match_ghost_module_cheap_op_concat`'s own section
+                # comment) -- never independently ranked: reuses the
+                # mirrored branch's own already-computed local `keep`
+                # verbatim (both branches share the exact same `n_channels`
+                # by construction, so no reshaping/validation is needed).
+                # `any_pruned` already reflects whether that branch pruned
+                # anything, since it's always resolved earlier in `branches`
+                # (operand order) and so already iterated this same loop.
+                branch_keeps.append(branch_keeps[b.mirror_of])
+                continue
             n = b.n_channels
             if group > 1:
                 # Whole number by construction -- see
@@ -16449,6 +16727,14 @@ def _wanda_structured_calibration_stats(
     }
     for cchain in concat_chains:
         for b in cchain.branches:
+            if not b.producers:
+                # GhostModule's own "cheap operation" branch (see
+                # :class:`_ConcatBranch.mirror_of`'s own docstring) has no
+                # producer of its own to rank at all -- it's never
+                # independently probed/ranked, always mirroring another
+                # branch's own already-decided `keep` verbatim -- so no
+                # probe point is registered for it here.
+                continue
             # Every producer of a given branch is always uniformly Conv or
             # uniformly MatMul/Gemm (a residual/merge-group-composed branch
             # is only ever discovered by the one walker family that finder

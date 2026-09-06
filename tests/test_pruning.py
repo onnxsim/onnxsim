@@ -14042,6 +14042,176 @@ def test_structured_wanda_pruning_conv_concat_admits_block_aligned_grouped_conv_
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- GhostModule "cheap operation" concat fan-out --------------------------
+#
+# GhostNet/GhostNetV2's own `GhostModule` (the verbatim reference
+# implementation, `huawei-noah/Efficient-AI-Backbones/ghostnet_pytorch/
+# ghostnet.py`) -- confirmed live via a real `torch.onnx.export` of that
+# exact class (TorchScript exporter, opset 17): a "primary" Conv `h1 ->
+# Relu -> r1`, then a depthwise "cheap operation" Conv fed directly by `r1`
+# (`group == r1`'s own channel count) `-> Relu -> r2`, and
+# `Concat([r1, r2], axis=1)`. `r1` feeds BOTH the `Concat` directly and the
+# depthwise Conv -- the exact shape `_match_ghost_module_cheap_op_concat`
+# recognizes (see `onnxsim/pruning.py`'s own section comment just above it).
+# The real export always also appends `out[:, :oup, :, :]` (a `Slice`) --
+# even in the exact-division (`ratio=2`) case this section's own matcher
+# supports, where it's a structural no-op -- so the *positive* (matched)
+# test below builds the topology directly via `onnx.parser` (per this
+# file's own module docstring/CLAUDE.md's convention) with no trailing
+# `Slice`, and a separate decline test below confirms that real,
+# `Slice`-terminated shape is (deliberately, for now) still declined
+# outright, unpruned, exactly as it already was.
+
+
+def _ghost_module_model(w1, w2, wout, b1=None, bd=None, trailing_slice=False):
+    Cin = w1.shape[1]
+    Cinit = w1.shape[0]
+    n_channels = 2 * Cinit
+    Cout = wout.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2"), _f32(wout, "WOUT")]
+    h1_inputs = "X, W1, B1" if b1 is not None else "X, W1"
+    if b1 is not None:
+        initializer.append(_f32(b1, "B1"))
+    d1_inputs = "r1, W2, BD" if bd is not None else "r1, W2"
+    if bd is not None:
+        initializer.append(_f32(bd, "BD"))
+    lines = [
+        f"h1 = Conv<kernel_shape=[1,1]>({h1_inputs})",
+        "r1 = Relu(h1)",
+        f"d1 = Conv<kernel_shape=[3,3], group={Cinit}, pads=[1,1,1,1]>({d1_inputs})",
+        "r2 = Relu(d1)",
+        "merged = Concat<axis=1>(r1, r2)",
+    ]
+    consumer_input = "merged"
+    if trailing_slice:
+        lines += [
+            "starts = Constant<value = int64[1] {0}>()",
+            f"ends = Constant<value = int64[1] {{{n_channels}}}>()",
+            "axes = Constant<value = int64[1] {1}>()",
+            "sliced = Slice(merged, starts, ends, axes)",
+        ]
+        consumer_input = "sliced"
+    lines.append(
+        f"Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>({consumer_input}, WOUT)"
+    )
+    body = "\n          ".join(lines)
+    return _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_conv_concat_ghost_module_matches_oracle():
+    Cin, Cinit, Cout = 3, 8, 4
+    rng = np.random.default_rng(240)
+    w1 = rng.standard_normal((Cinit, Cin, 1, 1)).astype(np.float32)
+    b1 = rng.standard_normal((Cinit,)).astype(np.float32)
+    w2 = rng.standard_normal((Cinit, 1, 3, 3)).astype(np.float32)
+    bd = rng.standard_normal((Cinit,)).astype(np.float32)
+    wout = rng.standard_normal((Cout, 2 * Cinit, 3, 3)).astype(np.float32)
+    model = _ghost_module_model(w1, w2, wout, b1=b1, bd=bd)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # Both W1 (the primary conv) and W2 (the depthwise cheap-operation conv)
+    # must be co-sliced by the EXACT same local keep set -- driven solely by
+    # W1's own importance ranking, W2 contributing no independent ranking of
+    # its own (see this section's own comment and `_ConcatBranch.mirror_of`'s
+    # own docstring).
+    keep = _oracle_keep_indices_conv(w1, Cinit // 2)
+    global_keep = np.concatenate([keep, keep + Cinit])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["B1"], b1[keep])
+    np.testing.assert_array_equal(inits["W2"], w2[keep])
+    np.testing.assert_array_equal(inits["BD"], bd[keep])
+    np.testing.assert_array_equal(inits["WOUT"], wout[:, global_keep])
+
+    dw_node = next(n for n in pruned.graph.node if "W2" in n.input)
+    group_attr = next(a.i for a in dw_node.attribute if a.name == "group")
+    assert group_attr == len(keep)
+
+    oracle = _ghost_module_model(
+        w1[keep], w2[keep], wout[:, global_keep], b1=b1[keep], bd=bd[keep]
+    )
+    rng_x = np.random.default_rng(241)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_concat_declines_ghost_module_non_depthwise_cheap_op():
+    # The would-be "cheap operation" conv here is an ordinary (group=1) Conv,
+    # not a depthwise one -- `_match_ghost_module_cheap_op_concat` requires
+    # crossing EXACTLY one depthwise pass-through hop on r2's own path, so
+    # this doesn't match; the ordinary per-operand loop then also declines
+    # (r1 still fans out to both the Concat and this second Conv), so the
+    # whole match is declined outright, exactly as before this feature
+    # existed -- W1 stays completely unpruned.
+    Cin, Cinit, Cb, Cout = 3, 8, 6, 4
+    rng = np.random.default_rng(242)
+    w1 = rng.standard_normal((Cinit, Cin, 1, 1)).astype(np.float32)
+    w2 = rng.standard_normal((Cb, Cinit, 3, 3)).astype(
+        np.float32
+    )  # group=1, not depthwise
+    wout = rng.standard_normal((Cout, Cinit + Cb, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          h1 = Conv<kernel_shape=[1,1]>(X, W1)
+          r1 = Relu(h1)
+          d1 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(r1, W2)
+          r2 = Relu(d1)
+          merged = Concat<axis=1>(r1, r2)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(wout, "WOUT")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_conv_concat_declines_ghost_module_trailing_slice():
+    # The real GhostModule export (see this section's own comment) always
+    # appends `out[:, :oup, :, :]` -- a Slice -- even in the exact-division
+    # case matched here, where it's a structural no-op. `_walk_to_conv_consumer`
+    # has no Slice pass-through hop, so the forward walk to a real consumer
+    # simply fails to resolve and the whole match declines, unpruned --
+    # deliberately out of scope for this round (see this section's own
+    # comment and `_match_ghost_module_cheap_op_concat`'s own docstring).
+    Cin, Cinit, Cout = 3, 8, 4
+    rng = np.random.default_rng(243)
+    w1 = rng.standard_normal((Cinit, Cin, 1, 1)).astype(np.float32)
+    w2 = rng.standard_normal((Cinit, 1, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, 2 * Cinit, 3, 3)).astype(np.float32)
+    model = _ghost_module_model(w1, w2, wout, trailing_slice=True)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
 # --- apply_structured_wanda_pruning ------------------------------------------
 
 
