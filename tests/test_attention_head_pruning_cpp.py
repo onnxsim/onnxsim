@@ -888,6 +888,136 @@ def test_cpp_gqa_pruning_wrong_shape_head_sink_constant_is_declined():
     assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
+# --- True MQA (kv_num_heads == 1) fused GroupQueryAttention fast path ------
+#
+# Regression coverage for the bug the Python reference (pruning.py's own
+# `_apply_one_gqa_chain`) fixed and this C++ port (`ApplyOneGqaChain` in
+# structured_pruning_entry.cpp) now mirrors: with `kv_num_heads == 1`, the
+# ordinary KV-*group* formula (`max(1, kv_num_heads - round(kv_num_heads *
+# sparsity))`) is always `1 == kv_num_heads` for every `sparsity` in
+# `[0, 1)`, so `ApplyOneGqaChain` used to hit its own "nothing to prune"
+# early exit and leave the whole fused block byte-for-byte untouched no
+# matter how many query heads (`num_heads`) shared that one KV head -- a
+# complete no-op for every real-world MQA export (Falcon-7B/StarCoder/
+# PaLM-family-style `kv_num_heads=1`). `ApplyOneGqaChain` now has a
+# dedicated fast path for this case: individual query heads are ranked and
+# dropped directly, leaving the sole KV head -- and both its own K/V
+# producer weights and `kv_num_heads` itself -- completely untouched.
+
+
+def _oracle_keep_fused_mqa_query_heads(wq, num_heads, head_size, keep_count):
+    importance = np.zeros(num_heads)
+    for h in range(num_heads):
+        importance[h] = np.linalg.norm(wq[:, h * head_size : (h + 1) * head_size])
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_cpp_mqa_pruning_shrinks_query_heads_kv_fully_untouched():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=5)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1  # untouched -- true MQA always has exactly one
+    assert num_heads == 4  # max(1, 8 - round(8*0.5)) query heads dropped directly
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["Wq"].shape == (cfg["K"], 4 * cfg["D"])
+    assert inits["Wout"].shape == (4 * cfg["D"], cfg["Out"])
+    # K/V producer weights completely untouched -- same shape AND same
+    # values as the original, unpruned model (the confirmed-fixed bug's own
+    # "byte-identical in/out" no-op signature, but now scoped to just K/V,
+    # not the whole block).
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_cpp_mqa_pruning_is_not_a_complete_no_op():
+    # The confirmed bug itself: before this fix, this call was byte-identical
+    # to `model` for any `sparsity` (since `kv_num_heads == 1` always forced
+    # the group formula's early exit). It must not be anymore.
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=6)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.75)
+    assert pruned.SerializeToString() != model.SerializeToString()
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 2  # max(1, 8 - round(8*0.75)) < original 8
+
+
+def test_cpp_mqa_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.0)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_cpp_mqa_pruning_matches_oracle_exactly():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=9)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 4
+
+    d = cfg["D"]
+    keep_q_heads = _oracle_keep_fused_mqa_query_heads(cfg["wq"], cfg["H"], d, num_heads)
+    q_idx = _head_idx(keep_q_heads, d)
+
+    oracle, _ = _gqa_model(
+        K=cfg["K"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=9,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_mqa_pruning_slices_bias_when_producer_has_one():
+    model, cfg = _gqa_model(K=8, H=4, KVH=1, D=8, Out=6, seed=14, bias=True)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 2  # max(1, 4 - round(4*0.5))
+
+    d = cfg["D"]
+    keep_q_heads = _oracle_keep_fused_mqa_query_heads(cfg["wq"], cfg["H"], d, num_heads)
+    q_idx = _head_idx(keep_q_heads, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+    np.testing.assert_array_equal(inits["Bq"], cfg["bq"][q_idx])
+    np.testing.assert_array_equal(inits["Bk"], cfg["bk"])
+    np.testing.assert_array_equal(inits["Bv"], cfg["bv"])
+
+
 def test_cpp_attention_head_pruning_group_query_attention_missing_required_inputs_is_left_untouched():
     K, H, D, Out = 8, 4, 4, 6
     Nqkv = H * D

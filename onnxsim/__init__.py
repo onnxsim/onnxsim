@@ -13,6 +13,7 @@ from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
 from onnxsim.adpq import quantize_weight_only_adpq
 from onnxsim.affinequant import apply_affinequant
+from onnxsim.any_precision_llm import apply_any_precision_llm
 from onnxsim.aqlm import quantize_weight_only_aqlm
 from onnxsim.attention_quantization import apply_attention_quantization
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
@@ -39,6 +40,7 @@ from onnxsim.calibration import (
 )
 from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
+from onnxsim.deepseek_fp8 import apply_deepseek_fp8, quantize_dequantize_block_fp8
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.drop_by_drop import (
@@ -56,6 +58,7 @@ from onnxsim.flexround import apply_flexround
 from onnxsim.foem import apply_foem
 from onnxsim.fptq import apply_fptq
 from onnxsim.gear import apply_gear
+from onnxsim.gguf_kquant import apply_gguf_q4_k_quantization, quantize_dequantize_q4_k
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -69,6 +72,11 @@ from onnxsim.ibert_softmax import apply_ibert_softmax
 from onnxsim.icquant import icquant_metadata_bits, quantize_weight_only_icquant
 from onnxsim.if4_quantization import quantize_weight_only_if4
 from onnxsim.intactkv import apply_intactkv
+from onnxsim.iq4_nl import (
+    IQ4_NL_CODEBOOK,
+    apply_iq4_nl_quantization,
+    quantize_dequantize_iq4_nl,
+)
 from onnxsim.kbvq_moe import apply_kbvq_moe
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
@@ -91,11 +99,13 @@ from onnxsim.norm_tweaking import apply_norm_tweaking
 from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
+    apply_any_precision_llm_cpp,
     apply_attention_head_pruning_cpp,
     apply_attention_head_wanda_pruning_cpp,
     apply_double_quantization_cpp,
     apply_embedding_vocab_magnitude_pruning_cpp,
     apply_embedding_vocab_pruning_cpp,
+    apply_iq4_nl_quantization_cpp,
     apply_moe_expert_channel_pruning_cpp,
     apply_moe_whole_expert_pruning_cpp,
     apply_qmoe_expert_channel_pruning_cpp,
@@ -240,6 +250,8 @@ __all__ = [
     "apply_outlier_suppression",
     "apply_dsq",
     "apply_dac",
+    "apply_deepseek_fp8",
+    "quantize_dequantize_block_fp8",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_svdquant",
@@ -253,6 +265,7 @@ __all__ = [
     "apply_quip_sharp",
     "apply_quarot",
     "apply_quarot_cpp",
+    "apply_any_precision_llm_cpp",
     "apply_duquant",
     "apply_easyquant",
     "apply_zeroquant",
@@ -261,6 +274,7 @@ __all__ = [
     "apply_rotatekv",
     "apply_omniquant",
     "apply_affinequant",
+    "apply_any_precision_llm",
     "apply_magnitude_pruning",
     "prune_magnitude_cpp",
     "apply_wanda_pruning",
@@ -341,6 +355,12 @@ __all__ = [
     "quantize_kv_cache",
     "apply_intactkv",
     "apply_gear",
+    "apply_gguf_q4_k_quantization",
+    "quantize_dequantize_q4_k",
+    "apply_iq4_nl_quantization",
+    "apply_iq4_nl_quantization_cpp",
+    "quantize_dequantize_iq4_nl",
+    "IQ4_NL_CODEBOOK",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",

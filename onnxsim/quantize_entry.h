@@ -76,5 +76,9 @@ onnx::ModelProto QuantizeFp8(const onnx::ModelProto& model,
                              const std::string& format, bool keep_io_types);
 
 onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model);
+onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
+                                      int64_t bits, int64_t max_bits,
+                                      int64_t block_size);
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
+onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);

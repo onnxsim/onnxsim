@@ -668,6 +668,77 @@ def test_cpp_gqa_wanda_pruning_sliceable_past_kv_matches_python_reference():
     assert inits["PastKey"].shape == (cfg["batch"], kv_num_heads, 1, cfg["D"])
 
 
+# --- True MQA (kv_num_heads == 1) fused GroupQueryAttention Wanda fast path -
+#
+# Wanda-calibrated counterpart of test_attention_head_pruning_cpp.py's own
+# true-MQA `GroupQueryAttention` fast-path coverage: `ApplyOneGqaChain`'s own
+# `act_norm` branch is shared, unmodified, between the plain and Wanda entry
+# points (`apply_attention_head_pruning_cpp` passes `nullptr`,
+# `apply_attention_head_wanda_pruning_cpp` a real calibrated map), so the
+# same `is_mqa` fix that closes the plain no-op bug for `kv_num_heads == 1`
+# closes it here too, ranking each query head by its own weight norm scaled
+# by its own `d`-wide slice of the calibrated activation (mirroring
+# pruning.py's own `_wanda_gqa_query_head_importance`).
+
+
+def _oracle_wanda_keep_query_heads(wq, num_heads, head_size, act_norm, keep_count):
+    importance = np.zeros(num_heads)
+    for h in range(num_heads):
+        block_norm = np.linalg.norm(wq[:, h * head_size : (h + 1) * head_size])
+        act_head = np.linalg.norm(act_norm[h * head_size : (h + 1) * head_size])
+        importance[h] = block_norm * max(act_head, 1e-8)
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_cpp_mqa_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=15)
+
+    rng = np.random.default_rng(16)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    act_norm = _probe_act_norm(model, "ctx", {"X": x_cal})
+    keep_q_heads = _oracle_wanda_keep_query_heads(
+        cfg["wq"], cfg["H"], cfg["D"], act_norm, 4
+    )
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == len(keep_q_heads)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+    d = cfg["D"]
+    q_idx = _head_idx(keep_q_heads, d)
+    oracle, _ = _gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=1,
+        D=d,
+        Out=cfg["Out"],
+        seed=15,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 # --- Cross-check against the pure-Python reference --------------------------
 
 

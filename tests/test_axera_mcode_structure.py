@@ -13,6 +13,7 @@ tests/test_pulsar2_hf_to_axmodel.py.
 
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -72,6 +73,63 @@ def _single_conv_model(cin, cout, k):
         f"g_cin{cin}_cout{cout}_k{k}",
         [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, cin, 16, 16])],
         [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, cout, 16, 16])],
+        initializer=[numpy_helper.from_array(w, name="w")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _asym_kernel_model(kh, kw, cin=4, cout=4, insz=16):
+    """One `Conv` with an asymmetric `kh x kw` kernel -- same total weight
+    count regardless of orientation (`kh * kw` is the same for `(3,1)` and
+    `(1,3)`), isolating orientation from raw weight data size."""
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin, kh, kw) * 0.1).astype(np.float32)
+    ph, pw = kh // 2, kw // 2
+    graph = helper.make_graph(
+        [helper.make_node("Conv", ["x", "w"], ["y"], pads=[ph, pw, ph, pw])],
+        f"g_kernel_{kh}x{kw}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cout, insz, insz]
+            )
+        ],
+        initializer=[numpy_helper.from_array(w, name="w")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _autopad_model(use_auto_pad, cin=4, cout=4, k=3, insz=16):
+    """One `Conv`, either using `auto_pad="SAME_UPPER"` or the numerically
+    equivalent explicit `pads` -- to check whether auto_pad leaves any
+    trace in mcode after normalization."""
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin, k, k) * 0.1).astype(np.float32)
+    if use_auto_pad:
+        node = helper.make_node("Conv", ["x", "w"], ["y"], auto_pad="SAME_UPPER")
+    else:
+        node = helper.make_node("Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1])
+    graph = helper.make_graph(
+        [node],
+        f"g_autopad_{use_auto_pad}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cout, insz, insz]
+            )
+        ],
         initializer=[numpy_helper.from_array(w, name="w")],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
@@ -520,7 +578,7 @@ def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
     )
 
 
-def _build_axmodel(work_dir, model, input_shape):
+def _build_axmodel(work_dir, model, input_shape, profile=False):
     os.makedirs(work_dir, exist_ok=True)
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
     rng = np.random.RandomState(0)
@@ -550,10 +608,83 @@ def _build_axmodel(work_dir, model, input_shape):
     with open(os.path.join(work_dir, "config", "cfg.json"), "w") as f:
         json.dump(cfg, f)
     result = pulsar2_docker.build(
-        work_dir, "model.onnx", "output", config_path="config/cfg.json"
+        work_dir, "model.onnx", "output", config_path="config/cfg.json", profile=profile
     )
     assert result.success, result.error
+    if profile:
+        return result.axmodel_path, result.trace_path
     return result.axmodel_path
+
+
+def _mcode_from_axmodel(axmodel_path):
+    compiled = onnx.load(axmodel_path)
+    inits = {i.name: i for i in compiled.graph.initializer}
+    neu_node = next(nd for nd in compiled.graph.node if nd.op_type == "neu mode")
+    info = None
+    for attr in neu_node.attribute:
+        if attr.name == "npu_graph_info":
+            info = json.loads(attr.s.decode())
+    mcode_key = info["dotneus"][0]["neu_key"]
+    return bytes(inits[mcode_key].raw_data)
+
+
+def _gemm_model(transb, m=1, k=16, n=8):
+    """One `Gemm(x, w, b)` -- `transb` selects whether `w` is stored as
+    `[k,n]` (transB=0) or `[n,k]` (transB=1), same logical matrix either
+    way."""
+    rng = np.random.RandomState(0)
+    w_shape = (n, k) if transb else (k, n)
+    w = (rng.randn(*w_shape) * 0.1).astype(np.float32)
+    b = (rng.randn(n) * 0.1).astype(np.float32)
+    node = helper.make_node("Gemm", ["x", "w", "b"], ["y"], transB=transb)
+    graph = helper.make_graph(
+        [node],
+        f"g_gemm_transb{transb}",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [m, k])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [m, n])],
+        initializer=[
+            numpy_helper.from_array(w, name="w"),
+            numpy_helper.from_array(b, name="b"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _maxpool_model(k, stride, pad, ceil_mode=0, cin=4, insz=16):
+    import math
+
+    if ceil_mode:
+        out = math.ceil((insz + 2 * pad - k) / stride) + 1
+    else:
+        out = math.floor((insz + 2 * pad - k) / stride) + 1
+    node = helper.make_node(
+        "MaxPool",
+        ["x"],
+        ["y"],
+        kernel_shape=[k, k],
+        strides=[stride, stride],
+        pads=[pad, pad, pad, pad],
+        ceil_mode=ceil_mode,
+    )
+    graph = helper.make_graph(
+        [node],
+        f"g_maxpool_k{k}_s{stride}_p{pad}_ceil{ceil_mode}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cin, out, out]
+            )
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
 
 
 def test_mcode_nondeterminism_does_not_change_real_device_output(tmp_path):
@@ -585,3 +716,187 @@ def test_mcode_nondeterminism_does_not_change_real_device_output(tmp_path):
 
     for out in outputs[1:]:
         assert np.array_equal(outputs[0], out), "expected bit-identical device output"
+
+
+def test_kernel_orientation_changes_mcode_size_despite_equal_weight_count(tmp_path):
+    """Confirmed real (see the README's "Two more Conv attributes tried"
+    section): a `3x1` and a `1x3` kernel hold the exact same number of
+    weight values (`cin*cout*3*1 == cin*cout*1*3`), so Wbt comes out the
+    same size either way -- but mcode does not. A real, new asymmetry:
+    the compiler encodes a "tall" and a "wide" kernel of identical size
+    differently, plausibly due to a real difference in how it scans/tiles
+    the input by row vs. column.
+    """
+    wbt_h, mcode_h = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "k3x1"), _asym_kernel_model(3, 1), (1, 4, 16, 16)
+    )
+    wbt_w, mcode_w = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "k1x3"), _asym_kernel_model(1, 3), (1, 4, 16, 16)
+    )
+    assert len(wbt_h) == len(wbt_w), "same weight count should give the same Wbt size"
+    assert len(mcode_h) != len(mcode_w), (
+        "expected kernel orientation to produce a real mcode size difference"
+    )
+
+
+def test_autopad_normalizes_with_no_signal_beyond_known_noise(tmp_path):
+    """Confirmed real (see the README's "Two more Conv attributes tried"
+    section): `auto_pad="SAME_UPPER"` vs. the numerically-equivalent
+    explicit `pads` first looked like a real signal (a same-length pair
+    with a 4-byte diff at a location not seen before), but rebuilding the
+    identical `auto_pad=NOTSET` config alone, twice, reproduced a nearly
+    identical diff -- confirming it was this project's second encounter
+    with non-deterministic label noise, not a real auto_pad-specific
+    encoding. auto_pad appears to fully normalize away before
+    quantization. This test locks in the *correct*, determinism-checked
+    conclusion: the auto_pad-vs-explicit diff should be no bigger than
+    what an identical rebuild alone already produces.
+    """
+    same_model = _autopad_model(use_auto_pad=True)
+    explicit_model = _autopad_model(use_auto_pad=False)
+
+    _, mcode_same = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "same"), same_model, (1, 4, 16, 16)
+    )
+    _, mcode_explicit_a = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "explicit_a"), explicit_model, (1, 4, 16, 16)
+    )
+    _, mcode_explicit_b = _build_and_get_wbt_and_mcode_bytes(
+        os.path.join(str(tmp_path), "explicit_b"), explicit_model, (1, 4, 16, 16)
+    )
+    assert len(mcode_same) == len(mcode_explicit_a) == len(mcode_explicit_b)
+
+    cross_diff = sum(
+        1 for i in range(len(mcode_same)) if mcode_same[i] != mcode_explicit_a[i]
+    )
+    noise_diff = sum(
+        1
+        for i in range(len(mcode_explicit_a))
+        if mcode_explicit_a[i] != mcode_explicit_b[i]
+    )
+    assert cross_diff <= noise_diff + 2, (
+        (cross_diff, noise_diff),
+        "auto_pad-vs-explicit diff should not exceed identical-rebuild noise "
+        "by more than a token amount",
+    )
+
+
+def test_maxpool_ceil_mode_is_a_third_confirmed_false_lead(tmp_path):
+    """Confirmed real (see the README's "Expanding past Conv" section):
+    MaxPool's `ceil_mode=0` vs `ceil_mode=1`, on a shape where both give
+    the identical output size, produces a same-length pair with a few
+    differing bytes -- but rebuilding `ceil_mode=0` alone, twice,
+    reproduces the same diff. This is the same non-deterministic label
+    noise confirmed on Conv/auto_pad, now shown on a completely different
+    op type: mcode's non-determinism is a global property, not tied to
+    any one op or model.
+    """
+    model_off = _maxpool_model(2, 2, 0, ceil_mode=0)
+    model_on = _maxpool_model(2, 2, 0, ceil_mode=1)
+
+    mcode_off_a = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "off_a"), model_off, (1, 4, 16, 16))
+    )
+    mcode_off_b = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "off_b"), model_off, (1, 4, 16, 16))
+    )
+    mcode_on = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "on"), model_on, (1, 4, 16, 16))
+    )
+    assert len(mcode_off_a) == len(mcode_off_b) == len(mcode_on)
+
+    noise_diff = sum(
+        1 for i in range(len(mcode_off_a)) if mcode_off_a[i] != mcode_off_b[i]
+    )
+    cross_diff = sum(
+        1 for i in range(len(mcode_off_a)) if mcode_off_a[i] != mcode_on[i]
+    )
+    assert cross_diff <= noise_diff + 2, (
+        (cross_diff, noise_diff),
+        "ceil_mode-vs-off diff should not exceed identical-rebuild noise "
+        "by more than a token amount",
+    )
+
+
+def test_non_mac_ops_schedule_on_teng2_not_conv_engines(tmp_path):
+    """Confirmed real via --profile (see the README's "Expanding past
+    Conv" section): AxMaxPool, the real residual AxQuantizedAdd, and
+    AxQuantizedGlobAvgPool all schedule on the `teng2` engine, never on
+    `conv0`/`conv1` (reserved for AxQuantizedConv/Gemm MAC work) --
+    extending the same finding already confirmed for AxQuantizedNormalize
+    in this project's resnet18d profiling to three more real primitive
+    families.
+    """
+    model = _maxpool_model(2, 2, 0)
+    _, trace_path = _build_axmodel(
+        os.path.join(str(tmp_path), "maxpool_profiled"),
+        model,
+        (1, 4, 16, 16),
+        profile=True,
+    )
+    trace = json.load(open(trace_path))
+    events = trace["traceEvents"] if isinstance(trace, dict) else trace
+    maxpool_events = [
+        e for e in events if e.get("ph") == "X" and "AxMaxPool" in e.get("name", "")
+    ]
+    assert maxpool_events, "expected at least one AxMaxPool event in the trace"
+    for e in maxpool_events:
+        assert e["tid"] == "teng2", (e, "expected AxMaxPool to schedule on teng2")
+
+
+def test_gemm_schedules_on_conv_engine_like_conv_does(tmp_path):
+    """Confirmed real via --profile (see the README's "Gemm joins the MAC
+    engines" section): Gemm schedules on `conv1`, joining Conv in the
+    MAC-engine category rather than teng2's non-MAC group.
+    """
+    model = _gemm_model(transb=0)
+    _, trace_path = _build_axmodel(
+        os.path.join(str(tmp_path), "gemm_profiled"), model, (1, 16), profile=True
+    )
+    trace = json.load(open(trace_path))
+    events = trace["traceEvents"] if isinstance(trace, dict) else trace
+    gemm_events = [
+        e
+        for e in events
+        if e.get("ph") == "X" and re.fullmatch(r"y_\d+_\d+", e.get("name", ""))
+    ]
+    assert gemm_events, "expected at least one Gemm output event in the trace"
+    for e in gemm_events:
+        assert e["tid"] in ("conv0", "conv1"), (
+            e,
+            "expected Gemm to schedule on a conv engine",
+        )
+
+
+def test_gemm_transb_produces_a_real_substantial_signal_beyond_noise(tmp_path):
+    """Confirmed real (see the README's "Gemm joins the MAC engines"
+    section): this Gemm shape has the same small, known non-deterministic
+    noise as Conv/MaxPool (confirmed here by rebuilding `transb=0` twice --
+    an *initial* single rebuild pair happened to show zero diffs, which
+    turned out to be a lucky draw, not a real "this shape is noise-free"
+    property; corrected after a second rebuild pair showed the familiar
+    ~6-byte noise). Even accounting for that, transB produces a real,
+    substantial signal far beyond noise scale: dozens of differing bytes,
+    including a large contiguous block, at a completely different scale
+    than the small periodic fields found for Conv's attributes.
+    """
+    model_a = _gemm_model(transb=0)
+    model_b = _gemm_model(transb=1)
+
+    mcode_a1 = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "a1"), model_a, (1, 16))
+    )
+    mcode_a2 = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "a2"), model_a, (1, 16))
+    )
+    mcode_b = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "b"), model_b, (1, 16))
+    )
+    assert len(mcode_a1) == len(mcode_a2) == len(mcode_b)
+
+    noise_diff = sum(1 for i in range(len(mcode_a1)) if mcode_a1[i] != mcode_a2[i])
+    transb_diff = sum(1 for i in range(len(mcode_a1)) if mcode_a1[i] != mcode_b[i])
+    assert transb_diff > noise_diff + 50, (
+        (transb_diff, noise_diff),
+        "expected a real, substantial transB signal well beyond noise scale",
+    )

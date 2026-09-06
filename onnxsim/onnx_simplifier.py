@@ -2641,6 +2641,60 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
     return _embedding_pruning_result_from_cpp(*result)
 
 
+def apply_any_precision_llm_cpp(
+    model: Union[str, onnx.ModelProto],
+    bits: int = 4,
+    max_bits: int = 8,
+    block_size: int = 32,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_any_precision_llm`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D float32
+    weight to ``bits`` bits per element, per (output channel, ``block_size``
+    -element K-block), via a nested bit-plane code built once to
+    ``max_bits`` (repeated within-bin bisection at each bin's own current
+    min/max midpoint) and truncated down to ``bits`` by a plain integer
+    right-shift -- see :func:`onnxsim.apply_any_precision_llm`'s own
+    docstring for the full rationale (Park et al., 2024, ICML 2024,
+    "Any-Precision LLM: Low-Cost Deployment of Multiple, Different-Sized
+    LLMs"). One quantization pass serves any precision up to ``max_bits``
+    instead of re-quantizing from scratch per bit-width.
+
+    Every matched element is replaced by its own quantize-dequantize
+    (per-bin-mean reconstruction) round trip; the result stays float32
+    (same shape/dtype as the original weight) -- this is a compute-only
+    rewrite, not a compressed storage format, since no ONNX tensor type
+    below INT4 exists to store 3/5/6/7-bit codes natively.
+
+    Unlike that pure-Python implementation, this port's per-bin bisection
+    groups indices via a hash map rather than numpy's own reduction order,
+    so results are not expected to match bit-for-bit -- only to be
+    similarly accurate (both satisfy the same exact nesting invariant and
+    the same monotonically-improving-with-more-bits property; see
+    :func:`onnxsim.apply_any_precision_llm`'s own docstring for why an
+    earlier, affine-fit-based reconstruction did NOT have that property).
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param bits: the precision level to materialize, ``1 <= bits <=
+            max_bits``
+    :param max_bits: the highest bit-width the nested code tree is built to
+    :param block_size: elements per (output-channel, K-block) reconstruction
+            group, matching :func:`onnxsim.quantize_weight_only_int4`'s own
+            default block size convention
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_any_precision_llm(model.SerializeToString(), bits, max_bits, block_size)
+    )
+
+
 def apply_quarot_cpp(
     model: Union[str, onnx.ModelProto],
     seed: int = 0,
@@ -2686,6 +2740,49 @@ def apply_quarot_cpp(
     return onnx.load_from_string(
         C.apply_quarot(model.SerializeToString(), seed, block_size, epsilon)
     )
+
+
+def apply_iq4_nl_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_iq4_nl_quantization`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D float32
+    weight into llama.cpp's IQ4_NL format -- a fixed, 16-entry non-uniform
+    ("non-linear") codebook, one scale per 32-element block of the weight's
+    own flattened storage (``scale = max(|block|) / max(|codebook|)``, each
+    element snapped to whichever codebook entry times that scale is
+    closest). See :func:`onnxsim.apply_iq4_nl_quantization`'s own docstring
+    for the full rationale and, importantly, this format's own codebook
+    provenance -- this repo could not find or verify llama.cpp's real IQ4_NL
+    codebook (`kvalues_iq4nl`) anywhere in-tree, so both this port and its
+    Python counterpart use their own computationally-derived, honestly
+    documented non-uniform codebook instead, not a transcription of
+    llama.cpp's own table.
+
+    Unlike that pure-Python implementation, this port does not support
+    quantizing ``Conv`` weights, and is not guaranteed to be bit-for-bit
+    identical to it -- though, having no accumulation or
+    iterative-refinement step at all (every element's own code comes from a
+    single per-block max-abs scale and a 16-way nearest-neighbor scan over a
+    shared fixed codebook), it is expected to track the Python port's own
+    results unusually closely among this repo's ``*_cpp`` ports.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            IQ4_NL quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_iq4_nl(model.SerializeToString()))
 
 
 def quantize_fp16(
