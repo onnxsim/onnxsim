@@ -1539,6 +1539,38 @@ Also a second, independent confirmation of the broader determinism
 lesson: a single rebuild pair is not enough to call something noise-free,
 and this project has now made and caught that exact mistake twice.
 
+### `Conv`'s `group` attribute: grouped convolutions parallelize across both MAC engines, dense ones don't
+
+Untested until now: `Conv`'s `group` attribute (depthwise/grouped
+convolution, common in real MobileNet/ResNeXt-style architectures, though
+not `resnet18d` itself). A dense `Conv(cin=4, cout=4, 3x3, group=1)` and a
+grouped version at the same shape (`group=2`, and full depthwise
+`group=4`) all build successfully -- no compiler crash the way `Mul`/`Div`
+by 1.0 hit earlier -- but schedule genuinely differently, confirmed stable
+across two independent rebuilds of each config:
+
+- **`group=1` (dense): 3 sub-events, all on a single engine (`conv1`).**
+  Same one-engine pattern already seen for ordinary `Conv`/`Gemm` at small
+  shapes elsewhere in this README.
+- **`group=2` and `group=4` (any grouped conv): 6 sub-events, split evenly
+  across *both* `conv0` and `conv1`** (3 each). This is a real, binary
+  split on "is this Conv grouped at all," not something that scales with
+  the group count -- `group=2` (2 groups) and `group=4` (4 groups, full
+  depthwise) produce the identical 6-event, both-engines pattern, not 2 vs.
+  4 proportional sub-events. Consistent with the compiler parallelizing a
+  grouped conv's independent groups across the two MAC engines as a fixed
+  strategy, rather than a per-group unit of scheduling.
+- mcode grows despite Wbt shrinking: at this shape, dense `group=1` has a
+  1320-byte Wbt / 2984-byte mcode, while full depthwise `group=4` has a
+  *smaller* 1256-byte Wbt (fewer real weight values: `4*1*3*3=36` vs.
+  `4*4*3*3=144`) but a *larger* 3176-byte mcode (+192 bytes, +6.4%) --
+  the extra command bytes are the cost of coordinating two engines instead
+  of one, not weight-data volume.
+
+This is now regression-tested (`test_grouped_conv_splits_across_two_mac_engines_dense_does_not`)
+via `--profile` engine/event-count assertions, following the same
+determinism-checked pattern as the rest of this file.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import onnx
 import pytest
-from onnx import helper, numpy_helper
+from onnx import helper, numpy_helper, parser
 
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
@@ -652,6 +652,25 @@ def _gemm_model(transb, m=1, k=16, n=8):
     return model
 
 
+def _grouped_conv_model(groups, cin=4, cout=4, k=3, insz=16):
+    """One `Conv` with the `group` attribute set -- `groups=1` is an
+    ordinary dense conv, `groups>1` splits input/output channels into
+    independent groups (`groups=cin=cout` is a full depthwise conv). Text
+    form used per this repo's model-building convention -- see
+    scripts/axera/README.md's "`Conv`'s `group` attribute" section."""
+    pad = k // 2
+    model = parser.parse_model(
+        f'<ir_version: 10, opset_import: ["": 17]> '
+        f"agraph (float[1,{cin},{insz},{insz}] x) => (float[1,{cout},{insz},{insz}] y) "
+        f"{{ y = Conv<pads=[{pad},{pad},{pad},{pad}], group={groups}>(x, w) }}"
+    )
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin // groups, k, k) * 0.1).astype(np.float32)
+    model.graph.initializer.append(numpy_helper.from_array(w, name="w"))
+    onnx.checker.check_model(model)
+    return model
+
+
 def _maxpool_model(k, stride, pad, ceil_mode=0, cin=4, insz=16):
     import math
 
@@ -900,3 +919,34 @@ def test_gemm_transb_produces_a_real_substantial_signal_beyond_noise(tmp_path):
         (transb_diff, noise_diff),
         "expected a real, substantial transB signal well beyond noise scale",
     )
+
+
+def test_grouped_conv_splits_across_two_mac_engines_dense_does_not(tmp_path):
+    """Confirmed real via --profile (see the README's "Conv's group
+    attribute" section): a dense Conv (group=1) schedules its 3 sub-events
+    on a single MAC engine (conv1), while a grouped Conv -- both a partial
+    grouping (group=2) and a full depthwise one (group=4, cin=cout=4) --
+    schedules 6 sub-events split evenly across *both* conv0 and conv1.
+    This is a binary split on "is this Conv grouped at all," confirmed
+    stable across independent rebuilds of each config: group=2 and group=4
+    produce the identical 6-event, both-engines pattern rather than a
+    count that scales with the number of groups.
+    """
+
+    def conv_engines(groups):
+        _, trace_path = _build_axmodel(
+            os.path.join(str(tmp_path), f"groups{groups}"),
+            _grouped_conv_model(groups=groups),
+            (1, 4, 16, 16),
+            profile=True,
+        )
+        trace = json.load(open(trace_path))
+        events = trace["traceEvents"] if isinstance(trace, dict) else trace
+        conv_events = [
+            e for e in events if e.get("ph") == "X" and "AxQuantizedConv" in e.get("name", "")
+        ]
+        return len(conv_events), sorted({e.get("tid") for e in conv_events})
+
+    assert conv_engines(groups=1) == (3, ["conv1"])
+    for groups in (2, 4):
+        assert conv_engines(groups=groups) == (6, ["conv0", "conv1"]), groups
