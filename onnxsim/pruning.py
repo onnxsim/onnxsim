@@ -3333,6 +3333,14 @@ _UNARY_PASS_THROUGH = {
     "LeakyRelu",
     "Elu",
     "Selu",
+    # ai.onnx (domain "") Celu(X) -> Y, opset 12+ -- confirmed live via
+    # `onnx.defs.get_schema("Celu")`: single required input `X`, single
+    # output `Y`, one scalar float `alpha` attribute (default 1.0).
+    # Structurally identical to `Elu`/`Selu` immediately above (same
+    # per-element `x > 0 ? x : f(alpha, x)` shape, no cross-channel mixing,
+    # no second tensor operand to slice) -- it belongs here for the same
+    # reason those two do.
+    "Celu",
     "Sigmoid",
     "Tanh",
     "Softplus",
