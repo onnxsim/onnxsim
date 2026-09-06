@@ -110,7 +110,12 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _gptq_quantize_columns
 from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
@@ -737,8 +742,9 @@ def apply_quarot_gptq(
 
     **Fallback for a layer with no usable calibration data.** A candidate
     layer whose captured activation is empty (no calibration batch reached
-    it) or isn't a plain 2-D array, or whose feature dimension doesn't
-    match the weight's own ``K``, is left completely alone by this
+    it) or has no feature axis at all (rank < 2), or whose feature
+    dimension doesn't match the weight's own ``K``, is left completely
+    alone by this
     function -- no rotation, no quantization -- rather than silently
     falling back to plain round-to-nearest quantization under GPTQ's own
     name (mirrors :func:`onnxsim.gptq.apply_gptq`'s own
@@ -847,7 +853,7 @@ def apply_quarot_gptq(
             activations[name].append(np.asarray(result[name], dtype=np.float64))
 
     for node, x_name, w_name, bias_name, w_nk, n, k, u in rotated:
-        acts = [a for a in activations[x_name] if a.ndim == 2]
+        acts = _activation_rows(activations[x_name])
         if not acts:
             continue  # no usable calibration activation -- leave untouched
         x = np.concatenate(acts, axis=0)
