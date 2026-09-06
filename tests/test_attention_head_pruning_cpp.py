@@ -157,7 +157,44 @@ def _oracle_keep_heads(wqkv, nq, nk, nv, num_heads, keep_count):
     return np.sort(np.argsort(-importance)[:keep_count])
 
 
-def _oracle_keep_groups(wq, wk, wv, num_heads, kv_num_heads, head_size, keep_count):
+def _oracle_keep_groups(
+    wq, wk, wv, num_heads, kv_num_heads, head_size, keep_count, v_head_size=None
+):
+    # `v_head_size` (V's own per-head column stride into `wv`) defaults to
+    # `head_size` (Q's/K's shared one) -- the uniform case every caller but
+    # the plain-ai.onnx-Attention "diff V head size" tests wants; those pass a
+    # genuinely different `v_head_size` explicitly. Mirrors test_pruning.py's
+    # own `_oracle_keep_groups`.
+    if v_head_size is None:
+        v_head_size = head_size
+    group_size = num_heads // kv_num_heads
+    importance = np.zeros(kv_num_heads)
+    for kv in range(kv_num_heads):
+        q_block = np.concatenate(
+            [
+                wq[:, h * head_size : (h + 1) * head_size]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * head_size : (kv + 1) * head_size]
+        v_block = wv[:, kv * v_head_size : (kv + 1) * v_head_size]
+        importance[kv] = np.linalg.norm(
+            np.concatenate([q_block, k_block, v_block], axis=1)
+        )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _oracle_keep_groups_cross(
+    wq, wk, wv, num_heads, kv_num_heads, head_size, keep_count
+):
+    # Like `_oracle_keep_groups` above, but combines each KV group's Q/K/V
+    # block importance via sqrt(sum of squared per-block Frobenius norms)
+    # rather than norm(concatenate(...)) -- required once wq's own row count
+    # (Q's source tensor's own feature dimension) differs from wk's/wv's own
+    # (K/V's source tensor's own feature dimension), exactly the cross-
+    # attention shape this helper is for. Mirrors test_pruning.py's own
+    # `_oracle_keep_groups_cross`.
     group_size = num_heads // kv_num_heads
     importance = np.zeros(kv_num_heads)
     for kv in range(kv_num_heads):
@@ -170,8 +207,10 @@ def _oracle_keep_groups(wq, wk, wv, num_heads, kv_num_heads, head_size, keep_cou
         )
         k_block = wk[:, kv * head_size : (kv + 1) * head_size]
         v_block = wv[:, kv * head_size : (kv + 1) * head_size]
-        importance[kv] = np.linalg.norm(
-            np.concatenate([q_block, k_block, v_block], axis=1)
+        importance[kv] = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
         )
     return np.sort(np.argsort(-importance)[:keep_count])
 
@@ -577,6 +616,8 @@ def _gqa_model(
     #  shape -- Gather inserted) | "unsafe" (axis1 neither 1 nor num_heads)
     head_sink=None,  # None | "nonempty" (constant (num_heads,), sliced)
     #  | "dynamic" (graph input, left alone) | "wrong_shape" (declines the match)
+    q_norm_weight=None,  # constant q_norm_weight array (shape (D,)), or None (unconnected)
+    k_norm_weight=None,  # constant k_norm_weight array (shape (D,)), or None (unconnected)
 ):
     rng = np.random.default_rng(seed)
     Nq, Nkv = H * D, KVH * D
@@ -672,6 +713,24 @@ def _gqa_model(
         operands.append("HeadSink")
     else:
         operands.append("")
+
+    # k_scale/v_scale (indices 12/13) sit between head_sink and
+    # q_norm_weight/k_norm_weight (indices 14/15) -- always left unconnected
+    # here (this test file's own dedicated k_scale/v_scale tests build their
+    # own model directly), just placeholders so q_norm_weight/k_norm_weight
+    # land at the right index.
+    if q_norm_weight is not None or k_norm_weight is not None:
+        operands += ["", ""]
+        if q_norm_weight is not None:
+            initializer.append(_f32(np.asarray(q_norm_weight), "QNorm"))
+            operands.append("QNorm")
+        else:
+            operands.append("")
+        if k_norm_weight is not None:
+            initializer.append(_f32(np.asarray(k_norm_weight), "KNorm"))
+            operands.append("KNorm")
+        else:
+            operands.append("")
 
     while operands and operands[-1] == "":
         operands.pop()
@@ -1059,6 +1118,169 @@ def test_cpp_gqa_pruning_wrong_shape_head_sink_constant_is_declined():
     assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
+def test_cpp_gqa_pruning_qk_norm_weight_wrong_shape_is_declined_matches_python():
+    # Regression coverage for a real, previously-undetected parity gap:
+    # `FindGqaChains` used to never pass `qk_norm_weight_indices=(14, 15)` to
+    # `FindSeparateQkvChains` (unlike pruning.py's own `_find_gqa_chains`, see
+    # that function's own comment), so GroupQueryAttention's own
+    # `q_norm_weight`/`k_norm_weight` shape was never validated here -- a
+    # wrong-shaped connected pair would have been silently pruned through
+    # instead of declining the whole match, unlike the pure-Python reference.
+    # Now fixed: the whole match is declined here too, the node left
+    # completely untouched, matching `apply_attention_head_pruning` exactly.
+    model, cfg = _gqa_model(
+        K=8,
+        H=4,
+        KVH=2,
+        D=8,
+        Out=6,
+        seed=68,
+        q_norm_weight=np.ones(9, dtype=np.float32),  # D + 1 -- wrong shape
+        k_norm_weight=np.ones(9, dtype=np.float32),
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
+
+
+def _gqa_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    # Q fed from a different producer/input (`Xdec`) than K/V (`Xenc`) -- a
+    # real, valid shape (e.g. encoder-decoder cross-attention): Q's own
+    # producer weight has `K_dec` rows, K's/V's own has `K_enc`, genuinely
+    # different row counts. Mirrors test_pruning.py's own `_gqa_cross_model`.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K_dec}] Xdec, float[{batch},{seq},{K_enc}] Xenc) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_pruning_cross_attention_matches_oracle_exactly():
+    # Without the `Kq`/`Kk`/`Kv` fix (a single shared `K` row-count reused to
+    # index into `wk_kn`/`wv_kn` too), this either reads out of bounds or
+    # produces a wrong ranking whenever K/V's producer has a different row
+    # count than Q's -- K_dec=8 != K_enc=6 here is deliberate.
+    model, cfg = _gqa_cross_model(K_dec=8, K_enc=6, H=8, KVH=2, D=8, Out=6, seed=20)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=20,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(21)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Sanity: Q and K/V really are independently sourced, not accidentally
+    # both reading the same tensor -- perturbing Xenc alone (Xdec held fixed)
+    # must still change the output.
+    (y_pruned2,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
+
+
 # --- True MQA (kv_num_heads == 1) fused GroupQueryAttention fast path ------
 #
 # Regression coverage for the bug the Python reference (pruning.py's own
@@ -1257,17 +1479,23 @@ def _onnx_attention_model(
     past_kv=None,  # None (omitted) | "nonempty" (constant, sliced) | "dynamic"
     #  (graph input) | "unsafe" (constant, wrong kv_num_heads-axis length --
     #  declines the match)
+    Dv=None,  # V's own head_size, if it should genuinely differ from D -- this
+    #  op's real schema (unlike com.microsoft::GroupQueryAttention) allows it;
+    #  defaults to D (the uniform case every other caller wants). The raw
+    #  output/output-projection's own reduction dim is sized off Dv, not D.
 ):
+    if Dv is None:
+        Dv = D
     rng = np.random.default_rng(seed)
-    Nq, Nkv = H * D, KVH * D
+    Nq, Nkv, Nv = H * D, KVH * D, KVH * Dv
     if wq is None:
         wq = rng.standard_normal((K, Nq)).astype(np.float32)
     if wk is None:
         wk = rng.standard_normal((K, Nkv)).astype(np.float32)
     if wv is None:
-        wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
     if wout is None:
-        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+        wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
 
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
     q_op, k_op, v_op = "MatMul(X, Wq)", "MatMul(X, Wk)", "MatMul(X, Wv)"
@@ -1277,7 +1505,7 @@ def _onnx_attention_model(
         if bk is None:
             bk = rng.standard_normal((Nkv,)).astype(np.float32)
         if bv is None:
-            bv = rng.standard_normal((Nkv,)).astype(np.float32)
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
         initializer += [_f32(bq, "Bq"), _f32(bk, "Bk"), _f32(bv, "Bv")]
         q_op, k_op, v_op = "Gemm(X, Wq, Bq)", "Gemm(X, Wk, Bk)", "Gemm(X, Wv, Bv)"
 
@@ -1309,18 +1537,18 @@ def _onnx_attention_model(
 
     if past_kv == "nonempty":
         past_key = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
-        past_value = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH, 1, Dv)).astype(np.float32)
         initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
         operands += ["PastKey", "PastValue"]
     elif past_kv == "dynamic":
         operands += ["PastKeyIn", "PastValueIn"]
         extra_graph_inputs += (
             f", float[{batch},{KVH},1,{D}] PastKeyIn"
-            f", float[{batch},{KVH},1,{D}] PastValueIn"
+            f", float[{batch},{KVH},1,{Dv}] PastValueIn"
         )
     elif past_kv == "unsafe":
         past_key = rng.standard_normal((batch, KVH + 1, 1, D)).astype(np.float32)
-        past_value = rng.standard_normal((batch, KVH + 1, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH + 1, 1, Dv)).astype(np.float32)
         initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
         operands += ["PastKey", "PastValue"]
     else:
@@ -1330,7 +1558,7 @@ def _onnx_attention_model(
         operands.pop()
 
     if with_reshape:
-        shape = np.array([batch, seq, Nq], dtype=np.int64)
+        shape = np.array([batch, seq, H * Dv], dtype=np.int64)
         initializer.append(onnx.numpy_helper.from_array(shape, "Shape"))
         tail = "ctx2 = Reshape(ctx, Shape)\n          Y = MatMul(ctx2, Wout)"
     else:
@@ -1362,9 +1590,11 @@ def _onnx_attention_model(
         H=H,
         KVH=KVH,
         D=D,
+        Dv=Dv,
         Out=Out,
         Nq=Nq,
         Nkv=Nkv,
+        Nv=Nv,
         wq=wq,
         wk=wk,
         wv=wv,
@@ -1586,50 +1816,212 @@ def test_cpp_onnx_attention_pruning_dynamic_past_kv_input_is_still_pruned():
     assert kv_num_heads == 1
 
 
-def test_cpp_onnx_attention_pruning_diff_v_head_size_is_left_untouched():
+def test_cpp_onnx_attention_pruning_diff_v_head_size_matches_oracle_exactly():
     # This op's real schema (unlike GroupQueryAttention, which fuse_gqa.h
     # always emits with equal Q/K/V head_size) genuinely allows V its own,
-    # independent head_size. This pass reuses the shared, uniform-head_size
-    # slicing body unmodified rather than a parallel implementation, so a
-    # node whose V head size actually differs from Q/K's is declined here
-    # rather than mis-sliced.
-    K, H, KVH, D, Dv, Out = 8, 4, 4, 4, 6, 5
-    Nq, Nk, Nv = H * D, KVH * D, KVH * Dv
+    # independent head_size -- confirmed via the op's own backend-test suite
+    # and real onnxruntime execution. `FindSeparateQkvChains` now takes an
+    # `allow_differing_v_head_size` parameter (`true` for this op only,
+    # mirroring pruning.py's own `_find_onnx_attention_chains`), `AttnChain`
+    # carries Q's/K's shared `head_size` and V's own (possibly different)
+    # `v_head_size` as separate fields, and `ApplyOneGqaChain` slices Q's/K's
+    # own producer weight at `head_size` while V's own producer weight -- and
+    # the output projection's own reduction dim, and the raw output's own
+    # width -- at `v_head_size`. Each KV group's own Q+K+V block is scaled by
+    # a distinct, well-separated factor so which 2 of 4 groups the importance
+    # ranking keeps is unambiguous.
+    K, H, KVH, D, Dv, Out = 8, 8, 4, 4, 6, 5
+    group_size = H // KVH
     rng = np.random.default_rng(19)
-    wq = rng.standard_normal((K, Nq)).astype(np.float32)
-    wk = rng.standard_normal((K, Nk)).astype(np.float32)
-    wv = rng.standard_normal((K, Nv)).astype(np.float32)
-    wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    wq = rng.standard_normal((K, H * D)).astype(np.float32)
+    wk = rng.standard_normal((K, KVH * D)).astype(np.float32)
+    wv = rng.standard_normal((K, KVH * Dv)).astype(np.float32)
+    wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+
+    scales = [3.0, 0.1, 2.0, 0.05]
+    for kv, scale in enumerate(scales):
+        for h in range(kv * group_size, (kv + 1) * group_size):
+            wq[:, h * D : (h + 1) * D] *= scale
+        wk[:, kv * D : (kv + 1) * D] *= scale
+        wv[:, kv * Dv : (kv + 1) * Dv] *= scale
+
+    model, cfg = _onnx_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Dv=Dv, Out=Out, seed=19, wq=wq, wk=wk, wv=wv, wout=wout
+    )
+    onnx.checker.check_model(model)
+
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _onnx_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 2  # max(1, 4 - round(4*0.5))
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        wq, wk, wv, H, KVH, D, kv_num_heads, v_head_size=Dv
+    )
+    assert list(keep_groups) == [0, 2]
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx = _head_idx(keep_q_heads, D)  # Q's own producer weight columns
+    kv_idx = _head_idx(keep_groups, D)  # K's own producer weight columns
+    v_idx = _head_idx(keep_groups, Dv)  # V's own producer weight columns
+    y_idx = _head_idx(keep_q_heads, Dv)  # output/consumer-side columns
+
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    np.testing.assert_array_equal(inits["Wq"], wq[:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], wk[:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], wv[:, v_idx])
+    np.testing.assert_array_equal(inits["Wout"], wout[y_idx, :])
+
+    oracle, _ = _onnx_attention_model(
+        K=K,
+        H=q_num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Dv=Dv,
+        Out=Out,
+        seed=19,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, v_idx],
+        wout=wout[y_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+    onnx.checker.check_model(oracle)
+
+    rng2 = np.random.default_rng(22)
+    x = rng2.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def _onnx_attention_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    # Q fed from a different producer/input (`Xdec`) than K/V (`Xenc`) --
+    # mirrors `_gqa_cross_model` above, for the plain ai.onnx op instead.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    body = f"""
+        g (float[{batch},{seq},{K_dec}] Xdec, float[{batch},{seq},{K_enc}] Xenc) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
     model = parser.parse_model(
         f"""
         <
           ir_version: 10,
           opset_import: ["": 24]
         >
-        g (float[2,5,{K}] X) => (float[2,5,{Out}] Y)
-        {{
-          q = MatMul(X, Wq)
-          k = MatMul(X, Wk)
-          v = MatMul(X, Wv)
-          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
-          Y = MatMul(ctx, Wout)
-        }}
+        {body}
         """
     )
-    model.graph.initializer.extend(
-        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
     )
-    onnx.checker.check_model(model)
 
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
-    }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
-    }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+def test_cpp_onnx_attention_pruning_cross_attention_matches_oracle_exactly():
+    model, cfg = _onnx_attention_cross_model(
+        K_dec=8, K_enc=6, H=8, KVH=2, D=8, Out=6, seed=24
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _onnx_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=q_num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=24,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(25)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    (y_pruned2,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
 
 
 # --- Cross-check against the pure-Python reference --------------------------
@@ -2821,6 +3213,127 @@ def test_cpp_mha_pruning_unsafe_past_key_shape_declines_match_matches_python():
     onnx.checker.check_model(pruned_cpp)
     assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
     assert pruned_cpp.SerializeToString() == model.SerializeToString()
+
+
+def _mha_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq_q=5,
+    seq_kv=7,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    # Q fed from a different producer/input (`Xdec`) than K/V (`Xenc`) -- a
+    # real, valid shape (e.g. encoder-decoder cross-attention). Mirrors
+    # test_pruning.py's own `_mha_cross_model`.
+    rng = np.random.default_rng(seed)
+    Nq = H * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nq)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nq)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+
+    body = f"""
+        g (float[{batch},{seq_q},{K_dec}] Xdec, float[{batch},{seq_kv},{K_enc}] Xenc) => (float[{batch},{seq_q},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx = com.microsoft.MultiHeadAttention <num_heads={H}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq_q=seq_q,
+        seq_kv=seq_kv,
+    )
+
+
+def test_cpp_mha_pruning_cross_attention_matches_oracle_exactly():
+    # Q's own producer weight (`K_dec` rows) and K/V's own (`K_enc` rows)
+    # have genuinely different row counts here -- `_oracle_keep_groups_cross`
+    # (sqrt(sum of squared per-block norms), not concatenate-then-norm) is
+    # required for exactly the reason `ApplyOneGqaChain`'s own `Kq`/`Kk`/`Kv`
+    # fix (this same shared function MultiHeadAttention also goes through)
+    # exists.
+    model, cfg = _mha_cross_model(K_dec=8, K_enc=6, H=8, D=4, Out=6, seed=26)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _mha_node(pruned_cpp)
+    num_heads = _mha_num_heads(node)
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    oracle, _ = _mha_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=26,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+        seq_q=cfg["seq_q"],
+        seq_kv=cfg["seq_kv"],
+    )
+
+    rng = np.random.default_rng(27)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    (y_pruned2,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
 
 
 # --- com.microsoft::PackedMultiHeadAttention --------------------------------

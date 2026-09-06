@@ -5592,6 +5592,14 @@ struct AttnChain {
   std::optional<std::string> q_bias, k_bias, v_bias;
   int64_t kv_num_heads = 0;
   int64_t head_size = 0;
+  // V's own per-head width -- equal to `head_size` for every matched op
+  // except the plain `ai.onnx::Attention` op when `FindSeparateQkvChains`
+  // was called with `allow_differing_v_head_size=true` (that op's own
+  // schema genuinely allows V an independent head_size; every other matched
+  // op here still requires it equal to `head_size`, see
+  // `FindSeparateQkvChains`'s own comment) -- mirrors pruning.py's own
+  // `_GQAChain.v_head_size` field.
+  int64_t v_head_size = 0;
   std::string num_heads_attr = "num_heads";
   // Set only for a matched `MultiHeadAttention`/`PackedMultiHeadAttention`/
   // `DecoderMaskedMultiHeadAttention` node whose own combined `bias` input
@@ -6289,12 +6297,16 @@ std::optional<HeadCountsMatch> MatchSparseAttentionProducer(
 // PackedMultiHeadAttention/DecoderMaskedMultiHeadAttention only --
 // `combined_bias_input_index`, the input index of a single combined
 // `[nq + nk + nv]`-shaped Q+K+V bias (see AttnChain's own `mha_bias` field).
-// Mirrors pruning.py's own _find_separate_qkv_chains -- narrower in one
-// deliberate, already-established way (see FindGqaChains'/
-// FindOnnxAttentionChains' own comment below): V's own head_size is always
-// required equal to Q's/K's shared one, never pruning.py's own
-// `allow_differing_v_head_size=True` composition for the plain ai.onnx op/
-// MultiHeadAttention/PackedMultiHeadAttention/LinearAttention.
+// Mirrors pruning.py's own _find_separate_qkv_chains, including its own
+// `allow_differing_v_head_size` parameter (see this function's own
+// definition below) -- `true` only for the plain ai.onnx op
+// (FindOnnxAttentionChains), whose own schema genuinely allows V an
+// independent head_size; every other op family here still requires V's own
+// head_size equal to Q's/K's shared one (this port's own deliberately
+// narrower-than-pruning.py scope for MultiHeadAttention/
+// PackedMultiHeadAttention/LinearAttention, which pruning.py's own analogues
+// already widen -- see FindOnnxAttentionChains' own comment below for why
+// only this one op is widened here).
 // `value_info_by_name` is threaded straight through to every node's own
 // `match_producer(node, init_map, value_info_by_name)` call -- built the
 // same way every "Attention-head pruning" family entry point builds one
@@ -6305,7 +6317,19 @@ std::optional<HeadCountsMatch> MatchSparseAttentionProducer(
 // *dynamic* one's declared shape (HeadBiasInputIsSafe); every other matcher
 // accepts and ignores it. Defaults to `{}` so every pre-existing call site
 // below that has no dynamic-mask handling of its own to feed stays
-// unchanged.
+// unchanged. `allow_differing_v_head_size` (defaulted to `false`, so every
+// pre-existing call site keeps requiring V's own head_size equal to Q's/K's
+// shared one) mirrors pruning.py's own `_find_separate_qkv_chains` parameter
+// of the identical name -- `true` only for the plain ai.onnx `Attention` op
+// (FindOnnxAttentionChains), whose own schema genuinely allows V an
+// independent head_size (see AttnChain's own `v_head_size` field); every
+// other op family this function backs keeps the pre-existing, narrower
+// uniform-head_size requirement (see this function's own comment above for
+// why -- `fuse_gqa.h` for GroupQueryAttention, and this port's own
+// deliberately-not-yet-widened scope for MultiHeadAttention/
+// PackedMultiHeadAttention/DecoderMaskedMultiHeadAttention/PagedAttention/
+// LinearAttention/SparseAttention, even though pruning.py's own analogues of
+// some of those already permit it).
 std::vector<AttnChain> FindSeparateQkvChains(
     onnx::GraphProto* graph,
     const std::function<std::optional<HeadCountsMatch>(
@@ -6316,7 +6340,8 @@ std::vector<AttnChain> FindSeparateQkvChains(
     std::optional<int> combined_bias_input_index = std::nullopt,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {},
-    std::optional<std::pair<int, int>> qk_norm_weight_indices = std::nullopt) {
+    std::optional<std::pair<int, int>> qk_norm_weight_indices = std::nullopt,
+    bool allow_differing_v_head_size = false) {
   InitMap init_map;
   for (const auto& t : graph->initializer()) {
     init_map[t.name()] = &t;
@@ -6374,12 +6399,23 @@ std::vector<AttnChain> FindSeparateQkvChains(
       continue;
     }
     const int64_t head_size = pq->n_channels / info->num_heads;
-    if (head_size <= 0 || pk->n_channels / info->kv_num_heads != head_size ||
-        pv->n_channels / info->kv_num_heads != head_size) {
-      // fuse_gqa.h requires equal Q/K/V head_size; the plain ai.onnx op's
-      // own more permissive schema allows V its own head_size, but this
-      // shared, uniform-head_size body declines that composition rather
-      // than mis-slicing it.
+    if (head_size <= 0 || pk->n_channels / info->kv_num_heads != head_size) {
+      // Q's and K's own head_size must always agree -- required by the QK^T
+      // dot product itself, not a restriction this pass adds -- so a
+      // mismatch here is declined regardless of
+      // `allow_differing_v_head_size`.
+      continue;
+    }
+    const int64_t v_head_size = pv->n_channels / info->kv_num_heads;
+    if (v_head_size <= 0) {
+      continue;
+    }
+    if (!allow_differing_v_head_size && v_head_size != head_size) {
+      // fuse_gqa.h requires equal Q/K/V head_size for GroupQueryAttention;
+      // the plain ai.onnx op's own more permissive schema allows V its own
+      // head_size when the caller passes `allow_differing_v_head_size=true`
+      // (FindOnnxAttentionChains) -- every other op family declines this
+      // composition rather than mis-slicing it.
       continue;
     }
 
@@ -6443,10 +6479,13 @@ std::vector<AttnChain> FindSeparateQkvChains(
     if (!is_internal(out_name)) {
       continue;
     }
-    // Both matched ops' raw output is Nq-wide (num_heads * head_size),
-    // unlike plain com.microsoft::Attention's V-hidden-size-wide output.
+    // The raw output is always `num_heads * v_head_size` wide -- laid out
+    // per *query* head but at *V's* own per-head width -- equal to
+    // `pq->n_channels` exactly when `v_head_size == head_size` (always true
+    // unless `allow_differing_v_head_size` let it differ).
+    const int64_t raw_out_width = info->num_heads * v_head_size;
     auto [consumer, chain_ops] = WalkToAttentionConsumer(
-        out_name, init_map, consumers_of, graph_outputs, pq->n_channels);
+        out_name, init_map, consumers_of, graph_outputs, raw_out_width);
     if (!consumer) {
       continue;
     }
@@ -6466,6 +6505,7 @@ std::vector<AttnChain> FindSeparateQkvChains(
     chain.num_heads = info->num_heads;
     chain.kv_num_heads = info->kv_num_heads;
     chain.head_size = head_size;
+    chain.v_head_size = v_head_size;
     chain.chain_ops = std::move(chain_ops);
     chain.consumer_node = consumer->node;
     chain.consumer_weight = consumer->weight;
@@ -6486,25 +6526,39 @@ std::vector<AttnChain> FindSeparateQkvChains(
 // HeadBiasInputIsSafe check for a dynamic `attention_bias` -- the same map
 // FindDecomposedGqaChains' own equivalent parameter already documents at its
 // own call sites for why no real shape-inference pass backs it.
+// `qk_norm_weight_indices=(14, 15)` -- GroupQueryAttention's own
+// `q_norm_weight`/`k_norm_weight` input indices (mirrors pruning.py's own
+// `_find_gqa_chains`) -- the same deferred exact-`(head_size,)`-shape check
+// FindPagedAttentionChains already wires up for `PagedAttention`'s own
+// analogous pair at indices 12/13, so a wrong-shaped connected pair declines
+// the whole match here too instead of being silently pruned through
+// unvalidated.
 std::vector<AttnChain> FindGqaChains(
     onnx::GraphProto* graph,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
   return FindSeparateQkvChains(graph, MatchGqaProducer, "num_heads",
                                /*combined_bias_input_index=*/std::nullopt,
-                               value_info_by_name);
+                               value_info_by_name, std::make_pair(14, 15));
 }
 
 // The plain ai.onnx::Attention analogue of FindGqaChains -- see that
 // function's own comment for why `value_info_by_name` is threaded straight
-// through.
+// through. `allow_differing_v_head_size=true`: unlike GroupQueryAttention,
+// this op's own schema genuinely allows V its own `v_head_size` independent
+// of Q/K's shared `head_size` (mirrors pruning.py's own
+// `_find_onnx_attention_chains`, confirmed via the op's own backend-test
+// suite and real onnxruntime execution -- see AttnChain's own `v_head_size`
+// field).
 std::vector<AttnChain> FindOnnxAttentionChains(
     onnx::GraphProto* graph,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
   return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer, "q_num_heads",
                                /*combined_bias_input_index=*/std::nullopt,
-                               value_info_by_name);
+                               value_info_by_name,
+                               /*qk_norm_weight_indices=*/std::nullopt,
+                               /*allow_differing_v_head_size=*/true);
 }
 
 // The com.microsoft::MultiHeadAttention analogue of FindGqaChains -- see
@@ -6802,20 +6856,18 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
 // ApplyOnePlainAttentionChain's own trailing parameters of the same name
 // exactly (see that function's own doc comment): when `act_norm` is
 // non-null and holds an entry for `chain.consumer_node->input(0)` whose
-// length matches `chain.num_heads * chain.head_size` (this C++ port's
-// Q/K/V-uniform-head_size scope, see AttnChain's own `head_size` field --
-// the output projection's own input width, laid out per *query* head),
-// each KV group's plain Frobenius-norm weight importance is multiplied by
-// that group's own combined (root-sum-square) activation norm, summed
-// over every query head the group owns -- mirrors pruning.py's own
-// `_wanda_gqa_group_importance` exactly (there keyed by `chain.v_head_size`,
-// which pruning.py's own separate Q/K vs. V head-size support can genuinely
-// differ from `chain.head_size`; this port declines that shape entirely,
-// see FindGqaChains'/FindOnnxAttentionChains' own uniform-head_size
-// requirement, so `chain.head_size` alone is exact here), including its
-// fallback to plain `base` (left untouched) whenever no matching activation
-// was observed. `nullptr` (the default) keeps this identically the plain
-// ``||W||_F``-only ranking it always was.
+// length matches `chain.num_heads * chain.v_head_size` (the output
+// projection's own input width, laid out per *query* head at *V's* own
+// per-head width -- equal to `chain.head_size` unless
+// `allow_differing_v_head_size` let it differ, see AttnChain's own
+// `v_head_size` field), each KV group's plain Frobenius-norm weight
+// importance is multiplied by that group's own combined (root-sum-square)
+// activation norm, summed over every query head the group owns -- mirrors
+// pruning.py's own `_wanda_gqa_group_importance` exactly (keyed by
+// `chain.v_head_size` there too), including its fallback to plain `base`
+// (left untouched) whenever no matching activation was observed. `nullptr`
+// (the default) keeps this identically the plain ``||W||_F``-only ranking
+// it always was.
 std::optional<AppliedAttn> ApplyOneGqaChain(
     onnx::GraphProto* graph,
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
@@ -6908,8 +6960,21 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
 
   // Bring each to [K, N] (reduction dim first, head columns last) -- the
   // *opposite* of SliceProducerWeight's "output channel first" convention,
-  // matching pruning.py's own comment on this same transpose.
-  const int64_t K = wq_dims[chain.q_weight_transposed ? 1 : 0];
+  // matching pruning.py's own comment on this same transpose. `Kq`/`Kk`/`Kv`
+  // (each producer weight's OWN row count/reduction-dim width) are tracked
+  // independently, NOT assumed shared -- Q's own producer weight has as many
+  // rows as Q's own source tensor's feature dimension, while K's/V's own
+  // producer weight has as many rows as K's/V's own source tensor's feature
+  // dimension, and for cross-attention (Q and K/V drawn from genuinely
+  // different source tensors, e.g. a decoder/encoder pair -- a real, matched
+  // shape; nothing in FindSeparateQkvChains/its matchers ties Q's producer's
+  // row count to K/V's own) those two feature dimensions need not match at
+  // all. Mirrors pruning.py's own `_gqa_group_importance` doc comment
+  // exactly for why the per-tensor importance loops below must each use
+  // their own tensor's row count rather than a single shared one.
+  const int64_t Kq = wq_dims[chain.q_weight_transposed ? 1 : 0];
+  const int64_t Kk = wk_dims[chain.k_weight_transposed ? 1 : 0];
+  const int64_t Kv = wv_dims[chain.v_weight_transposed ? 1 : 0];
   const int64_t Nq = wq_dims[chain.q_weight_transposed ? 0 : 1];
   const int64_t Nk = wk_dims[chain.k_weight_transposed ? 0 : 1];
   const int64_t Nv = wv_dims[chain.v_weight_transposed ? 0 : 1];
@@ -6934,12 +6999,13 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // summing every entry, rather than concatenating, is used -- it stays
   // well-defined even when Q's own row count differs from K/V's, the
   // cross-attention shape this port also matches).
+  const int64_t dv = chain.v_head_size;
   std::vector<double> importance;
   if (is_mqa) {
     importance.assign(static_cast<size_t>(chain.num_heads), 0.0);
     for (int64_t qh = 0; qh < chain.num_heads; ++qh) {
       double acc = 0.0;
-      for (int64_t r = 0; r < K; ++r) {
+      for (int64_t r = 0; r < Kq; ++r) {
         for (int64_t c = qh * d; c < (qh + 1) * d; ++c) {
           const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
           acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
@@ -6952,18 +7018,31 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     importance.assign(static_cast<size_t>(chain.kv_num_heads), 0.0);
     for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
       double acc = 0.0;
-      for (int64_t r = 0; r < K; ++r) {
+      // Each tensor's own contribution is summed over ITS OWN row count
+      // (Kq/Kk/Kv) independently, never a single shared `r` range across all
+      // three -- Q's producer weight can have a genuinely different row
+      // count than K's/V's own (cross-attention: Q fed from a different
+      // producer/input than K/V), and reusing Q's own row count to index
+      // into wk_kn/wv_kn would be both wrong and an out-of-bounds read
+      // whenever the two differ. Mirrors pruning.py's own
+      // `_gqa_group_importance`, which sums each block's own squared
+      // Frobenius norm independently for the identical reason.
+      for (int64_t r = 0; r < Kq; ++r) {
         for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
           for (int64_t c = g * d; c < (g + 1) * d; ++c) {
             const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
             acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
           }
         }
+      }
+      for (int64_t r = 0; r < Kk; ++r) {
         for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
           const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
           acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
-        for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
+      }
+      for (int64_t r = 0; r < Kv; ++r) {
+        for (int64_t c = kv * dv; c < (kv + 1) * dv; ++c) {
           const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
           acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
@@ -6985,12 +7064,19 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // comment above).
   if (act_norm != nullptr) {
     auto it = act_norm->find(chain.consumer_node->input(0));
+    // The probed activation is the consumer's own input -- the attention
+    // output, laid out per *query* head at *V's* own per-head width `dv`
+    // (mirrors pruning.py's own `_wanda_gqa_group_importance`/
+    // `_wanda_gqa_query_head_importance`, which key this same width check
+    // and per-head/per-group stride off `chain.v_head_size`, not
+    // `chain.head_size` -- equal to `d` unless `allow_differing_v_head_size`
+    // let it differ).
     if (it != act_norm->end() &&
-        it->second.size() == static_cast<size_t>(chain.num_heads * d)) {
+        it->second.size() == static_cast<size_t>(chain.num_heads * dv)) {
       if (is_mqa) {
         for (int64_t qh = 0; qh < chain.num_heads; ++qh) {
           double sq = 0.0;
-          for (int64_t c = qh * d; c < (qh + 1) * d; ++c) {
+          for (int64_t c = qh * dv; c < (qh + 1) * dv; ++c) {
             const double v = it->second[static_cast<size_t>(c)];
             sq += v * v;
           }
@@ -7000,7 +7086,7 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
       } else {
         for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
           double sq = 0.0;
-          for (int64_t c = kv * group_size * d; c < (kv + 1) * group_size * d;
+          for (int64_t c = kv * group_size * dv; c < (kv + 1) * group_size * dv;
                ++c) {
             const double v = it->second[static_cast<size_t>(c)];
             sq += v * v;
@@ -7032,8 +7118,21 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
       }
     }
   }
+  // `q_idx`/`kv_idx` index Q's/K's own producer weight columns (their
+  // shared per-head width `d`); `v_idx` indexes V's own producer weight
+  // columns at *its* own per-head width `dv`, which can differ. `y_idx`
+  // indexes the *output* side instead -- the consumer's own reduction
+  // dimension and the raw output's own trailing axis (the reshape hop's
+  // target shape, if any) -- both laid out per query head at V's own
+  // per-head width `dv`, not Q's/K's `d`: mirrors pruning.py's own
+  // `_apply_one_gqa_chain` `q_idx`/`k_idx`/`v_idx`/`y_idx` exactly (`q_idx`
+  // there is only coincidentally the right index set for the consumer/raw
+  // output too when `dv == d`, which is why the two were never distinguished
+  // before V could have its own head_size).
   std::vector<int64_t> q_idx = HeadColumnIndices(keep_q_heads, d);
   std::vector<int64_t> kv_idx = HeadColumnIndices(keep_groups, d);
+  std::vector<int64_t> v_idx = HeadColumnIndices(keep_groups, dv);
+  std::vector<int64_t> y_idx = HeadColumnIndices(keep_q_heads, dv);
 
   // SliceAxisGeneric (axis = transposed ? 0 : 1 -- the output-channel/head
   // axis of a plain 2-D MatMul/Gemm producer weight, never a Conv here)
@@ -7041,7 +7140,7 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // function's own `wq`/`wk`/`wv` comment above for why.
   SliceAxisGeneric(wq_init, q_idx, chain.q_weight_transposed ? 0 : 1);
   SliceAxisGeneric(wk_init, kv_idx, chain.k_weight_transposed ? 0 : 1);
-  SliceAxisGeneric(wv_init, kv_idx, chain.v_weight_transposed ? 0 : 1);
+  SliceAxisGeneric(wv_init, v_idx, chain.v_weight_transposed ? 0 : 1);
   if (chain.q_bias) {
     SliceAxisGeneric(init_map.at(*chain.q_bias), q_idx, 0);
   }
@@ -7049,7 +7148,7 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     SliceAxisGeneric(init_map.at(*chain.k_bias), kv_idx, 0);
   }
   if (chain.v_bias) {
-    SliceAxisGeneric(init_map.at(*chain.v_bias), kv_idx, 0);
+    SliceAxisGeneric(init_map.at(*chain.v_bias), v_idx, 0);
   }
 
   // MultiHeadAttention/PackedMultiHeadAttention/
@@ -7059,21 +7158,22 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // sliced in the same three head-aligned ranges (Q's own kept columns, then
   // K's shifted by the *original* pre-pruning `nq_orig = num_heads * d`,
   // then V's shifted by `nq_orig + nk_orig`) mirrors pruning.py's own
-  // `_apply_one_gqa_chain` handling of `chain.mha_bias` exactly. This port's
-  // shared `FindSeparateQkvChains` body always requires V's own head_size
-  // equal to `d` (see that function's own comment), so `kv_idx` (already
-  // built at `d`-width) is the correct index set for V's own range here too,
-  // not merely Q's/K's.
+  // `_apply_one_gqa_chain` handling of `chain.mha_bias` exactly. `v_idx`
+  // (built at V's own `dv`-width, not `kv_idx`'s `d`-width) is the correct
+  // index set for V's own range -- none of the op families that can carry
+  // `mha_bias` currently set `allow_differing_v_head_size=true` in this
+  // port, so `dv == d` in practice here, but this stays correct if that
+  // scope ever widens.
   if (chain.mha_bias) {
     const int64_t nq_orig = chain.num_heads * d;
     const int64_t nk_orig = chain.kv_num_heads * d;
     std::vector<int64_t> full_bias_idx;
-    full_bias_idx.reserve(q_idx.size() + 2 * kv_idx.size());
+    full_bias_idx.reserve(q_idx.size() + kv_idx.size() + v_idx.size());
     full_bias_idx.insert(full_bias_idx.end(), q_idx.begin(), q_idx.end());
     for (int64_t x : kv_idx) {
       full_bias_idx.push_back(x + nq_orig);
     }
-    for (int64_t x : kv_idx) {
+    for (int64_t x : v_idx) {
       full_bias_idx.push_back(x + nq_orig + nk_orig);
     }
     SliceAxisGeneric(init_map.at(*chain.mha_bias), full_bias_idx, 0);
@@ -7208,12 +7308,20 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     }
   }
 
-  SliceAxisGeneric(init_map.at(chain.consumer_weight), q_idx,
+  // `y_idx` (V's own `dv`-width, not `q_idx`'s `d`-width): the consumer's
+  // own reduction dimension is the raw attention output's own hidden dim,
+  // laid out per query head at V's own per-head width -- mirrors
+  // pruning.py's own `_apply_one_gqa_chain` `_slice_consumer_weight(...,
+  // y_idx)` call exactly.
+  SliceAxisGeneric(init_map.at(chain.consumer_weight), y_idx,
                    chain.consumer_weight_transposed ? 1 : 0);
 
   for (const auto& co : chain.chain_ops) {
     if (co.shape_name) {
-      SetInt64TensorLastDim(init_map.at(*co.shape_name), new_num_heads * d);
+      // `dv`, not `d`: the raw output's own trailing axis this reshape hop
+      // targets is V-hidden-size-wide (mirrors pruning.py's own
+      // `dims[-1] = new_num_heads * dv`).
+      SetInt64TensorLastDim(init_map.at(*co.shape_name), new_num_heads * dv);
     }
   }
 
