@@ -82,7 +82,12 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.llm_int8 import _match_matmul_like
 
@@ -183,8 +188,11 @@ def apply_easyquant(
             its quantize-dequantize round-tripped float32 version, and a
             ``Div``/``Round``/``Clip``/``Mul`` round-trip inserted before
             its activation input -- layers with a non-constant, non-2-D
-            weight, a non-2-D activation, or whose activation's feature
-            dimension doesn't match the weight's own reduction size, are
+            weight, an activation with no feature axis at all (rank < 2;
+            a higher-rank ``[batch, seq, K]`` one is flattened to
+            ``[batch * seq, K]``, which is exact), or whose activation's
+            feature dimension doesn't match the weight's own reduction
+            size, are
             left untouched
     """
     if isinstance(float_model, str):
@@ -232,9 +240,9 @@ def apply_easyquant(
     node_by_output = {n.output[0]: n for n in out.graph.node if n.output}
 
     for x_name, w_init, weight_transposed, out_name in candidates:
-        acts = [a for a in activations[x_name] if a.ndim == 2]
+        acts = _activation_rows(activations[x_name])
         if not acts:
-            continue
+            continue  # no usable activation (no feature axis); skip
         x = np.concatenate(acts, axis=0)
 
         w = onnx.numpy_helper.to_array(w_init).astype(np.float64)

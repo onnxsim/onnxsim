@@ -78,7 +78,12 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _find_int4_matmul_candidates
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
 
@@ -125,7 +130,9 @@ def apply_owq(
             ModelProto or file path), produced by
             :func:`onnxsim.quantize_weight_only_int4`. Layers quantized by
             any other scheme (or left unquantized), or whose activation
-            input isn't a plain 2-D tensor, are left untouched. Assumes
+            input has no feature axis at all (rank < 2) are left
+            untouched; a higher-rank ``[batch, seq, K]`` activation is
+            flattened to ``[batch * seq, K]``, which is exact. Assumes
             ``quantized_model`` was produced from ``float_model`` without
             renaming any MatMul/Gemm node's own output tensor -- true of
             every onnxsim ``quantize_*`` function.
@@ -174,7 +181,7 @@ def apply_owq(
 
     wq_init_map = {t.name: t for t in quantized_model.graph.initializer}
 
-    probe_names = [c.float_node.input[0] for c in candidates]
+    probe_names = sorted({c.float_node.input[0] for c in candidates})
     float_probe = _add_probe_outputs(float_model, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
@@ -190,9 +197,9 @@ def apply_owq(
     node_by_output = {n.output[0]: n for n in graph.node if n.output}
 
     for c in candidates:
-        acts = [a for a in activations[c.float_node.input[0]] if a.ndim == 2]
+        acts = _activation_rows(activations[c.float_node.input[0]])
         if not acts:
-            continue  # not a plain 2-D activation; skip
+            continue  # no usable activation (no feature axis); skip
         x = np.concatenate(acts, axis=0)
 
         w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)

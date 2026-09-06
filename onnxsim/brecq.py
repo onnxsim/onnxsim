@@ -109,7 +109,7 @@ from onnxsim.adaround import (
     _node_outputs,
     _pack_int4,
 )
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
 _N_MIN = -7.0
@@ -418,19 +418,24 @@ def apply_brecq(
     optimized: Dict[str, np.ndarray] = {}
     for block_input_name, block_output_name, chain, has_residual in discovered:
         # Keep each batch's block-input/block-output pair together: only a
-        # batch where *both* probed tensors came back plain 2-D is usable,
-        # and concatenating them independently (rather than pairwise) could
-        # silently misalign samples if the two ever disagreed per batch.
+        # batch whose two probed tensors flatten to the *same* number of
+        # rows is usable, and concatenating them independently (rather
+        # than pairwise) could silently misalign samples if the two ever
+        # disagreed per batch. A block preserves its token axis, so a
+        # [batch, seq, K] input and its [batch, seq, N] output both
+        # flatten to batch * seq rows, in the same order.
         x0_batches = []
         final_batches = []
         for xa, fa in zip(
             activations[block_input_name], activations[block_output_name]
         ):
-            if xa.ndim == 2 and fa.ndim == 2:
-                x0_batches.append(xa)
-                final_batches.append(fa)
+            xr = _activation_rows([xa])
+            fr = _activation_rows([fa])
+            if xr and fr and xr[0].shape[0] == fr[0].shape[0]:
+                x0_batches.append(xr[0])
+                final_batches.append(fr[0])
         if not x0_batches:
-            continue  # not plain 2-D activations; skip this block
+            continue  # no usable activation pair; skip this block
         x0 = np.concatenate(x0_batches, axis=0)
         final_float = np.concatenate(final_batches, axis=0)
 

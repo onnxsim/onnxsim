@@ -109,7 +109,7 @@ import onnx
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _gptq_quantize_columns
 from onnxsim.pruning import _find_moe_chains, _MoEChain
@@ -274,9 +274,8 @@ def apply_moequant(
     for batch in calibration_data:
         out = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
-            arr = np.asarray(out[name])
-            if arr.ndim == 2:
-                collected[name].append(arr.astype(np.float64))
+            arr = np.asarray(out[name], dtype=np.float64)
+            collected[name].extend(_activation_rows([arr]))
 
     result = onnx.ModelProto()
     result.CopyFrom(model)
@@ -301,7 +300,7 @@ def apply_moequant(
         x_chunks = collected.get(chain.node.input[0], [])
         r_chunks = collected.get(chain.node.input[1], [])
         if not x_chunks or not r_chunks:
-            continue  # no usable (2-D) calibration activation observed
+            continue  # no usable calibration activation observed
 
         x_all = np.concatenate(x_chunks, axis=0)
         r_all = np.concatenate(r_chunks, axis=0)

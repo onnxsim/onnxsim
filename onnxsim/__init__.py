@@ -111,7 +111,12 @@ from onnxsim.kbvq_moe import apply_kbvq_moe
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
 from onnxsim.leptoquant import apply_leptoquant
-from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
+from onnxsim.llm_fp4 import (
+    FP4_FORMATS,
+    apply_llm_fp4_activation_quantization,
+    apply_llm_fp4_activation_quantization_per_tensor,
+    quantize_weight_only_llm_fp4,
+)
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
@@ -240,7 +245,7 @@ from onnxsim.ptq4vit import apply_ptq4vit_quantization
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
-from onnxsim.quarot import apply_quarot
+from onnxsim.quarot import apply_quarot, apply_quarot_fused, apply_quarot_gptq
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.qwen3_5_reconstruct import (
     reconstruct_qwen3_5_language_model,
@@ -326,7 +331,9 @@ __all__ = [
     "apply_slim_llm",
     "apply_quip_sharp",
     "apply_quarot",
+    "apply_quarot_fused",
     "apply_quarot_cpp",
+    "apply_quarot_gptq",
     "apply_any_precision_llm_cpp",
     "apply_duquant",
     "apply_easyquant",
@@ -407,6 +414,8 @@ __all__ = [
     "FLOAT8_E4M3_MAX",
     "MXFP4_CODEBOOK",
     "quantize_weight_only_llm_fp4",
+    "apply_llm_fp4_activation_quantization",
+    "apply_llm_fp4_activation_quantization_per_tensor",
     "FP4_FORMATS",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",

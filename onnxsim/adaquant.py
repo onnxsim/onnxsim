@@ -100,7 +100,7 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _GAMMA, _ZETA, _h_and_dhdv, _node_outputs
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
 _WEIGHT_N_MIN = -127.0
@@ -409,7 +409,7 @@ def apply_adaquant(
     if not candidates:
         return quantized_model
 
-    probe_names = [c.float_node.input[0] for c in candidates]
+    probe_names = sorted({c.float_node.input[0] for c in candidates})
     float_probe = _add_probe_outputs(float_model, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
@@ -424,9 +424,9 @@ def apply_adaquant(
     optimized_zp: Dict[str, int] = {}
 
     for c in candidates:
-        acts = [a for a in activations[c.float_node.input[0]] if a.ndim == 2]
+        acts = _activation_rows(activations[c.float_node.input[0]])
         if not acts:
-            continue  # not a plain 2-D activation (batched/broadcast MatMul); skip
+            continue  # no usable activation (no feature axis); skip
         x = np.concatenate(acts, axis=0)
 
         w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)

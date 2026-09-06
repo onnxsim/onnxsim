@@ -146,7 +146,12 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
 from onnxsim.quip_sharp import _match_matmul_like
@@ -360,8 +365,10 @@ def quantize_weight_only_billm(
             ``Add(Mul(Cast(Code1), Scale1), Mul(Cast(Code2), Scale2))``
             feeding the original MatMul/Gemm node -- ordinary ONNX ops
             only, opset 11+. Layers with a non-constant, non-2-D, or
-            non-float32 weight, or whose activation input isn't a plain
-            2-D tensor, are left untouched.
+            non-float32 weight, or whose activation input has no feature
+            axis at all (rank < 2), are left untouched; a higher-rank
+            ``[batch, seq, K]`` activation is flattened to
+            ``[batch * seq, K]``, which is exact.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -397,7 +404,7 @@ def quantize_weight_only_billm(
     if not candidates:
         return out
 
-    probe_names = [c[1] for c in candidates]
+    probe_names = sorted({c[1] for c in candidates})
     probe_model = _add_probe_outputs(model, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
@@ -407,9 +414,9 @@ def quantize_weight_only_billm(
             activations[name].append(np.asarray(result[name], dtype=np.float64))
 
     for node, x_name, w_name, weight_transposed in candidates:
-        acts = [a for a in activations[x_name] if a.ndim == 2]
+        acts = _activation_rows(activations[x_name])
         if not acts:
-            continue  # not a plain 2-D activation; skip
+            continue  # no usable activation (no feature axis); skip
         x = np.concatenate(acts, axis=0)
 
         w_init = initializer_map[w_name]

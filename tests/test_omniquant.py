@@ -223,3 +223,97 @@ def test_omniquant_noop_when_no_int4_matmul_present():
         model, model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
     assert result.SerializeToString() == model.SerializeToString()
+
+
+def _matmul_model_3d(K=64, N=16, seed=0):
+    # [batch, seq, K] -- the activation shape of essentially every real
+    # transformer, since ONNX MatMul broadcasts over leading dimensions.
+    rng = np.random.default_rng(seed)
+    return _model(
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(rng.standard_normal((K, N)).astype(np.float32) * 0.5, "W")],
+    )
+
+
+def _outlier_weight_calibration_3d(K=64, batch=8, seq=16, outlier_dims=(3, 7), seed=1):
+    # The 3-D counterpart of _outlier_weight_calibration: a nonzero
+    # per-channel mean (LET's shift should help) plus a couple of
+    # much-larger-magnitude channels (LET's scale and LWC's clipping should
+    # both help).
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((batch, seq, K)).astype(np.float32) + 2.0
+    for c in outlier_dims:
+        x[:, :, c] *= 20.0
+    return x
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_omniquant_handles_a_3d_transformer_shaped_activation(seed):
+    # A [batch, seq, K] activation used to be filtered out entirely (the
+    # capture kept only ndim == 2 arrays), so apply_omniquant silently
+    # returned quantized_model unchanged on exactly the model shape it
+    # exists for. Flattening the leading dimensions is exact -- LWC's and
+    # LET's own per-channel statistics sum over the same rows either way.
+    model = _matmul_model_3d(K=64, N=16, seed=seed)
+    x = _outlier_weight_calibration_3d(K=64, seed=seed + 400)
+    quant = onnxsim.quantize_weight_only_int4(model)
+
+    oq_model = onnxsim.apply_omniquant(model, quant, calibration_data=[{"X": x}])
+    onnx.checker.check_model(oq_model)
+    assert oq_model.SerializeToString() != quant.SerializeToString(), (
+        "apply_omniquant was a no-op on a 3-D activation"
+    )
+
+    (float_y,) = _run(model, {"X": x})
+    (rtn_y,) = _run(quant, {"X": x})
+    (oq_y,) = _run(oq_model, {"X": x})
+    assert np.all(np.isfinite(oq_y))
+    # Shifted, outlier-heavy channels are exactly what LET/LWC exist for,
+    # so the improvement over plain round-to-nearest is large here
+    # (measured ~0.12 -> ~0.035 across seeds), not a marginal difference
+    # that could flip on another platform.
+    assert _rel_l2(float_y, oq_y) < 0.7 * _rel_l2(float_y, rtn_y)
+
+
+def test_omniquant_flattening_matches_an_equivalent_2d_calibration():
+    # Flattening [batch, seq, K] -> [batch * seq, K] must be *exact*, not an
+    # approximation: feeding the same rows as a 2-D batch has to produce a
+    # byte-identical set of rewritten initializers (codes, scales, and
+    # LET's own shift/scale constants alike).
+    K, N = 32, 8
+    weight = (np.random.default_rng(5).standard_normal((K, N)) * 0.5).astype(np.float32)
+    model_3d = _model(
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
+    )
+    model_2d = _matmul_model(K=K, N=N, weight=weight)
+    x3 = _outlier_weight_calibration_3d(K=K, batch=4, seq=8, outlier_dims=(2,), seed=6)
+
+    out3 = onnxsim.apply_omniquant(
+        model_3d,
+        onnxsim.quantize_weight_only_int4(model_3d),
+        calibration_data=[{"X": x3}],
+    )
+    out2 = onnxsim.apply_omniquant(
+        model_2d,
+        onnxsim.quantize_weight_only_int4(model_2d),
+        calibration_data=[{"X": x3.reshape(-1, K)}],
+    )
+    assert _initializer_bytes(out3) == _initializer_bytes(out2)
+
+
+def _initializer_bytes(model):
+    return sorted(
+        (t.name, onnx.numpy_helper.to_array(t).tobytes())
+        for t in model.graph.initializer
+    )
