@@ -63,11 +63,48 @@ graph walk this module does not attempt; instead, matching
 `apply_spinquant`'s own scope, this module fits one independent rotation
 **per matched layer**, at the cost of an explicit `MatMul(X, U)` per layer
 rather than a fused rotation. The real QuaRot also offers an optional
-GPTQ-based weight quantizer for a tighter error bound; this module always
-uses plain round-to-nearest (GPTQ itself is already ported faithfully in
-`onnxsim.gptq` -- composing it with a rotation is future work, not part of
-what makes QuaRot's own idea distinct from every other onnxsim INT4
-scheme).
+GPTQ-based weight quantizer for a tighter error bound; `apply_quarot`
+itself always uses plain round-to-nearest for the weight, but see
+`apply_quarot_gptq` below for the GPTQ-based variant.
+
+## `apply_quarot_gptq`: GPTQ-based weight quantization
+
+`onnxsim.apply_quarot_gptq` is identical to `apply_quarot` in every
+respect -- same candidate matching, same per-layer rotation `U` (for a
+given `seed`, byte-identical to `apply_quarot`'s own), same data-free
+per-token INT4 activation quantization -- except the *weight* is
+quantized via `onnxsim.gptq`'s Hessian-based column algorithm instead of
+independent round-to-nearest, using real calibration activations:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("model.onnx")
+quantized = onnxsim.apply_quarot_gptq(model, block_size=32, seed=0)
+onnx.save(quantized, "model.quarot_gptq.onnx")
+```
+
+The composition: each matched layer's own (pre-rotation) activation `X`
+is captured from `model` via calibration data (the same
+`_add_probe_outputs` + `backend.run_model` pattern `apply_gptq` uses),
+then rotated by that layer's own `U` (`X_rotated = X @ U`) so the
+Hessian `H = X_rotated.T @ X_rotated` GPTQ's column algorithm needs is
+computed in the same (rotated) space as the weight it is quantizing,
+`Wtilde = W @ U` -- not the original, unrotated activation space, since
+that is not the space GPTQ's reconstruction objective is being evaluated
+in here. The per-block scale is still the one
+`_quantize_blockwise_int4_with_clip` computes (unchanged from
+`apply_quarot`); GPTQ only changes which integer each element rounds to.
+
+A matched layer with no calibration data reaching it, or whose captured
+activation isn't a plain 2-D array, or whose feature dimension doesn't
+match the weight's own `K`, is left completely untouched by
+`apply_quarot_gptq` -- no rotation, no quantization -- rather than
+silently falling back to plain round-to-nearest under GPTQ's own name.
+`calibration_data=None` generates it via
+`onnxsim.generate_random_calibration_data`, the same convention as
+`apply_gptq`/`apply_awq`/every other calibration-driven onnxsim pass.
 
 ## Scope
 
