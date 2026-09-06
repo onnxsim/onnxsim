@@ -2074,3 +2074,103 @@ def test_resnet18d_bulk_is_a_two_word_stream_of_five_verbs_with_a_per_op_program
         hex(max_50_03),
         hex(arena),
     )
+
+
+def _build_real_zoo_model(work_dir, name):
+    """Fetch and really build any single-image-input onnxmodelzoo model
+    the same way `convert_onnxmodelzoo.py` does. Returns `(axmodel_path,
+    mcode_key, mcode_bytes, wbt_bytes)`. The resnet18d-specific
+    `_build_real_resnet18d` above predates this and keeps its exact-size
+    assertion; new multi-model tests should use this one."""
+    import convert_onnxmodelzoo  # also puts model_zoo on sys.path
+    import model_zoo
+
+    model = onnx.load(model_zoo.fetch_model(name))
+    tensor_name = convert_onnxmodelzoo._single_image_input(model)
+    assert tensor_name is not None, name
+
+    os.makedirs(os.path.join(work_dir, "model"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    pulsar2_docker.make_synthetic_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib.tar")
+    )
+    onnx.save(model, os.path.join(work_dir, "model", f"{name}.onnx"))
+    result = pulsar2_docker.build(
+        work_dir,
+        f"model/{name}.onnx",
+        f"output/{name}",
+        tensor_name=tensor_name,
+        mean=convert_onnxmodelzoo._DEFAULT_MEAN,
+        std=convert_onnxmodelzoo._DEFAULT_STD,
+        calibration_dataset_rel_path="dataset/calib.tar",
+    )
+    assert result.success, (name, result.error)
+    compiled = onnx.load(result.axmodel_path)
+    inits = {i.name: i for i in compiled.graph.initializer}
+    key = _mcode_key(compiled)
+    return (
+        result.axmodel_path,
+        key,
+        bytes(inits[key].raw_data),
+        bytes(inits[_params_key(compiled)].raw_data),
+    )
+
+
+def test_mcode_field_map_generalizes_to_mnasnet_small(tmp_path):
+    """Confirmed real (see the README's "The whole map generalizes to a
+    second real architecture" section), all local on a real
+    `mnasnet_small_Opset17` build: the same header constants (4096,
+    0x2ff000 arena), the same five verbs, one `40 02`/`50 03`/`a9`/`a8`
+    write each per op with the op count simply changing (133), four
+    `50 01` writes per op in the same one-hot set and fixed order, `40 02`
+    spanning its (very different) Wbt, and the dominant per-op template.
+    Needs Docker for the build but no device.
+    """
+    from collections import Counter
+
+    _, _, mcode, wbt = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+    assert int.from_bytes(mcode[72:76], "little") == 4096
+    assert int.from_bytes(mcode[76:80], "little") == 0x2FF000, (
+        "arena size is a platform constant"
+    )
+
+    hdrs = _verb_headers(mcode)
+    by = Counter((v, xx, yy) for _, v, xx, yy, _ in hdrs)
+    n_ops = by[(0xA1, 0x40, 0x02)]
+    assert 100 <= n_ops <= 160, n_ops
+    for sel in (
+        (0xA1, 0x50, 0x03),
+        (0xA9, 0x00, 0x00),
+        (0xA8, 0x30, 0x02),
+        (0xA8, 0x40, 0x03),
+    ):
+        assert by[sel] == n_ops, (sel, by[sel], n_ops)
+    assert by[(0xA1, 0x50, 0x01)] == 4 * n_ops
+    assert {op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x01)} == {
+        0x1,
+        0x100,
+        0x100000,
+        0x1000000,
+    }
+
+    ops4002 = [op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x40, 0x02)]
+    assert len(set(ops4002)) == n_ops
+    assert 0.95 * len(wbt) <= max(ops4002) <= len(wbt), (max(ops4002), len(wbt))
+    max_50_03 = max(
+        op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x03)
+    )
+    assert max_50_03 < 0x2FF000 and 0x2FF000 - max_50_03 < 40_000, hex(max_50_03)
+
+    cuts = [k for k, v, xx, yy, _ in hdrs if (v, xx, yy) == (0xA1, 0x40, 0x02)]
+    flags = [(k, op) for k, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x01)]
+    order = (0x100, 0x1, 0x100000, 0x1000000)
+    assert all(
+        tuple(op for k, op in flags if a < k < b) == order
+        for a, b in zip(cuts, cuts[1:])
+    ), "expected every op to write the same four-step sequence"
+    template = "a1:5001 a1:5001 a8:4003 a1:5003 a1:5001 a3:0000 a1:5001 a9:0000 a2:0000 a8:3002"
+    patterns = Counter(
+        " ".join(f"{v:02x}:{xx:02x}{yy:02x}" for k, v, xx, yy, _ in hdrs if a < k < b)
+        for a, b in zip(cuts, cuts[1:])
+    )
+    assert patterns.most_common(1)[0][0] == template, patterns.most_common(2)
