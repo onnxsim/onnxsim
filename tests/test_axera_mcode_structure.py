@@ -2315,3 +2315,143 @@ def test_verb_free_regions_are_drifted_instructions_and_a_walker_beats_the_grid(
                 and r18[i + 2] % 0x10 == 0
             )
     assert off_phase >= 100, off_phase
+
+
+def test_resnet18d_verb_free_regions_fault_like_instructions_on_device(tmp_path):
+    """Confirmed real on the device (see the README's "The regions fault
+    like instructions on the device" section): flipping single bytes at
+    the start, middle and end of the largest "verb-free regions" of the
+    real resnet18d mcode mostly faults with 0x8030070C (24 of 30 in the
+    ten largest; 10 of 12 in the four largest used here on one build, 7
+    of 12 on a fresh rebuild -- per-flip outcomes vary between builds, the
+    majority does not) -- the answer of a validated instruction stream,
+    not of a data table, which would give wrong values or nothing.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    hdrs = _verb_headers(mcode)
+    regions = sorted(
+        (
+            (328 + 4 * (a[0] + 2), 4 * (b[0] - a[0] - 2))
+            for a, b in zip(hdrs, hdrs[1:])
+            if b[0] - a[0] >= 8
+        ),
+        key=lambda r: -r[1],
+    )[:4]
+    assert regions and regions[0][1] >= 2000, regions
+
+    x = np.random.RandomState(42).randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+
+    faults = 0
+    for start, length in regions:
+        for off in (start + 8, start + length // 2, start + length - 8):
+            patched = bytearray(mcode)
+            patched[off] ^= 0xFF
+            c = onnx.load(path)
+            {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+            p = os.path.join(str(tmp_path), f"region_{off}.axmodel")
+            onnx.save(c, p)
+            dev = _run_retry_once(p, x)
+            if dev.error:
+                assert "0x8030070C" in dev.error, (off, dev.error)
+                faults += 1
+    assert faults >= 7, (
+        faults,
+        "expected a majority of flips inside the regions to fault",
+    )
+
+
+def _permutation_ratio(non_verb_bytes, pattern, shuffles=10, seed=0):
+    """Observed count of `pattern(b, i)` over the bytes vs. its mean count
+    over byte-shuffled copies (same histogram, order destroyed) -- the
+    chance baseline the README's "Third correction" section shows is the
+    right one for positional patterns."""
+    import random
+
+    rng = random.Random(seed)
+
+    def count(b):
+        return sum(1 for i in range(len(b)) if pattern(b, i))
+
+    observed = count(non_verb_bytes)
+    nulls = []
+    for _ in range(shuffles):
+        s = bytearray(non_verb_bytes)
+        rng.shuffle(s)
+        nulls.append(count(bytes(s)))
+    return observed / (sum(nulls) / len(nulls))
+
+
+def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
+    """Confirmed real (see the README's "Third correction" section), all
+    local: against a permutation null (the non-verb bytes shuffled, same
+    histogram), the 4-byte `00 ?? TT ??` form, the prologue ladder
+    `00 x0 84 ??`, and the prefix + tag == 0x84 rule are each far above
+    chance on the real resnet18d blob -- unlike an independence estimate,
+    which understated them. Deterministic (fixed seed). Needs Docker for
+    the build but no device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    tags = set(range(0x81, 0x85))
+
+    def is_verb(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] in _VERBS
+            and mcode[i + 1] == 0
+            and mcode[i + 2] % 0x10 == 0
+        )
+
+    non_verb = bytearray()
+    i, end = 297, len(mcode) - 252
+    while i < end:
+        if is_verb(i):
+            i += 8
+        else:
+            non_verb.append(mcode[i])
+            i += 1
+    non_verb = bytes(non_verb)
+    assert len(non_verb) > 20_000
+
+    w4 = _permutation_ratio(
+        non_verb, lambda b, i: i + 3 < len(b) and b[i] == 0 and b[i + 2] in tags
+    )
+    ladder = _permutation_ratio(
+        non_verb,
+        lambda b, i: i + 3 < len(b)
+        and b[i] == 0
+        and b[i + 1] % 0x10 == 0
+        and b[i + 2] == 0x84,
+    )
+    complement = _permutation_ratio(
+        non_verb,
+        lambda b, i: i + 3 < len(b)
+        and b[i] <= 3
+        and i + 2 + b[i] < len(b)
+        and b[i + 2 + b[i]] == 0x84 - b[i],
+    )
+    assert w4 >= 2.5, w4
+    assert ladder >= 5.0, ladder
+    assert complement >= 4.0, complement
+
+    # The width rule: for prefix p, the tag byte is enriched at offset
+    # exactly p + 2 and nowhere else nearby -- the unit is p + 4 bytes long.
+    for prefix in range(4):
+        ratios = {
+            k: _permutation_ratio(
+                non_verb,
+                lambda b, i, k=k, p=prefix: i + k < len(b)
+                and b[i] == p
+                and b[i + k] in tags,
+                shuffles=5,
+            )
+            for k in range(1, 6)
+        }
+        peak = max(ratios, key=ratios.get)
+        assert peak == prefix + 2, (prefix, ratios)
+        assert ratios[peak] >= 2.0, (prefix, ratios)
+        assert all(r <= 1.8 for k, r in ratios.items() if k != peak), (prefix, ratios)

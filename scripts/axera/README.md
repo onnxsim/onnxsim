@@ -2590,6 +2590,148 @@ the bytes; the rest is further forms, mostly short, plus a few long
 stretches, all undecoded.** The "37%" and "verb-free" figures were
 artifacts of measuring a variable-length stream on a fixed grid.
 
+### The regions fault like instructions on the device -- and a chance baseline withdraws the "short-form family"
+
+**Device census: the former "verb-free regions" are validated
+structure.** Flipping one byte at the start, middle and end of each of
+the ten largest regions in the real `resnet18d` blob (30 flips, one
+patched model per run, retry-once on the known transient):
+
+```
+region (byte, len)   start / mid / end
+(18228, 4180)        F D =
+( 6844, 4160)        F F F
+(15436, 2744)        F D F
+(11812, 2032)        D F =
+( 4896, 1940)        F F F
+(  400, 1772)        = F F
+( 3200, 1688)        F F F
+(29188, 1352)        F F F
+(28032, 1148)        F F F
+( 2180, 1012)        F F F
+                     24 fault / 3 change output / 3 inert
+```
+
+**80% of flips inside these regions fault** with `0x8030070C` -- a
+higher rate than the original whole-blob sweep (61%). A data table
+answers corruption with wrong values (`D`) or nothing (`=`); a
+sequenced instruction stream answers it with the validator. This is the
+hardware-side confirmation of the previous section's reading, and it is
+the strongest single result in this arc: the regions are instructions.
+The device stayed healthy throughout (70 C, memory at baseline).
+One honest variance note: re-running the four largest regions' twelve
+flips on a *fresh* build gave 7 faults, not the 10 seen here -- per-flip
+outcomes at a fixed offset can differ between builds (the known
+non-deterministic label bytes are the obvious suspect), so the
+regression test asserts a majority of faults, not the exact count.
+
+**A chance baseline, applied late, withdraws a claim.** Tokenizing the
+bytes the walker could not explain suggested a family of short
+bank-tagged writes -- `00 ff TT vv` (4 B), `01 ff xx TT vv` (5 B),
+bare `TT vv` (2 B), tag `TT` in `0x81..0x84`, with the prefix and tag
+tending to sum to `0x84` -- and a walker taught those forms "explained"
+61-70% of the bulk. Checked against chance, that dissolves: `0x00` is
+28.5% of `resnet18d`'s bulk bytes and tag bytes 6.5%, so a `00 ?? TT`
+pattern arises at ~1.8% of positions by chance against 2.7% observed --
+**only 1.5x chance** (1.3x on `mnasnet`, 1.4x on the tiny model) -- and
+the bare 2-byte form is at or below chance. The verb forms, by
+contrast, are more than 100x chance (five specific first bytes, a zero,
+a multiple of 16). So: the compact `00 xx 84 vv` **prologue ladder** is
+real (a stepping field across three models is not chance), but
+generalizing it to a stream-wide short-form family is **not supported**
+at present, and the "a parser needs all three forms" sentence two
+sections up is too strong -- the third form is established in the
+prologue only. Coverage figures that lean on the loose short forms are
+inflated; the defensible number remains the three-form walker's 27-44%,
+of which the specific verb instructions are the reliable part.
+
+Net, stated carefully: the regions are instructions (device-confirmed),
+their alignment drifts (off-phase verbs), and their *encoding* is still
+mostly unknown -- the next real step is a form-by-form decoding with a
+chance baseline applied *before* each form is admitted, not after.
+
+### Third correction: with the right null, the short-form family is real after all
+
+Doing exactly that -- applying a chance baseline *properly* -- reverses
+the withdrawal just above. The "1.5x chance" figure came from an
+independence estimate (`P(byte == 00) x P(byte in 0x81..0x84)`) against
+the greedy walker's start rate. That is the wrong null for a
+*positional* pattern: what makes `00 ?? TT ??` an instruction form is
+that a tag byte sits at a fixed offset after a prefix byte, and an
+independence product says nothing about offsets. The right null keeps
+every byte and destroys only the order: shuffle the non-verb bytes of
+each bulk (20 permutations, identical byte histogram) and count each
+pattern in the shuffles.
+
+```
+pattern                       resnet18d: observed / null (+-sd)   ratio    z
+00 ?? TT ??  (4-byte form)    1485 /  382 (+-13)                  3.9x    82
+01 ?? ?? TT ??  (5-byte)       496 /  175 (+-12)                  2.8x    27
+02 ... TT ??  (6-byte)         229 /   68 (+- 5)                  3.4x    31
+03 ... TT ??  (7-byte)         154 /   63 (+- 8)                  2.4x    12
+00 x0 84 ??  (prologue ladder) 393 /   29 (+- 5)                 13.7x    72
+prefix + tag == 0x84          1286 /  191 (+-15)                  6.7x    75
+                              mnasnet: 3.9x / 4.1x / 3.8x / 4.8x / 9.4x / 8.3x, z up to 172
+```
+
+Every short form is far above its permutation null -- z-scores from 12
+to 172 -- and the prefix/tag complement (`00<->84`, `01<->83`,
+`02<->82`, `03<->81`) is 6.7-8.3x chance in both models. So the family
+of short bank-tagged writes **is real statistical structure**, the
+"withdrawal" above was an over-correction from a mis-specified
+baseline, and the honest state is: the forms exist; their exact widths
+are the best reading of where the tag byte lands (offset `prefix + 2`);
+and the coverage they add on top of the verb instructions (to ~61-63%
+of the bulk without the permissive 2-byte form) is legitimate. The
+bare 2-byte `TT vv` form remains unsupported (it has no positional
+structure to test) and stays out of the count.
+
+The methodological lesson is the durable part: three corrections in a
+row on one topic came from three different baselines -- a fixed grid,
+an independence estimate, and finally a permutation null. Only the last
+is appropriate for order-dependent structure, and it is the one this
+README should have reached for first.
+
+**The width rule, measured.** With the permutation null in hand, the
+"widths are the best reading" hedge can be replaced by a measurement:
+for each prefix `p` in `0..3`, where after the prefix does a tag byte
+sit more often than chance?
+
+```
+                         offset after the prefix (observed / null)
+prefix    k=1    k=2    k=3    k=4    k=5           mnasnet peak
+p=0      0.25   3.93   0.19   0.41   0.33           k=2  3.74x
+p=1      0.80   0.20   2.93   0.09   0.65           k=3  4.01x
+p=2      1.44   0.43   0.37   3.40   1.10           k=4  3.72x
+p=3      0.95   0.77   1.63   0.49   2.49           k=5  4.72x
+```
+
+The enrichment peaks at **exactly `k = p + 2`** for every prefix in
+both models, with every other offset at or below chance -- and at that
+offset the complement tag `0x84 - p` is elevated 5-12x while other tags
+are 0.9-3.3x. So the unit is `[p] [p+1 payload bytes] [0x84 - p]
+[value]`, **`p + 4` bytes long**: 4, 5, 6, 7 bytes for `p = 0..3`. The
+prefix encodes the payload length and, most of the time, the bank. That
+is a decoded *format* for the short instructions, not their semantics
+-- what the payload bytes and the value mean per bank is still open --
+but it is the first part of the non-verb encoding that can be stated as
+a rule rather than a pattern.
+
+**One step into the payload: the bank tag selects the payload's kind.**
+For the dominant 4-byte units `00 ff TT vv` (1,485 in `resnet18d`,
+3,500 in `mnasnet`), the field byte `ff` is a multiple of `0x10` far
+more often for tag `0x84` than for the others -- and bank `0x84`'s
+commonest fields are exactly the prologue ladder's (`0x80, 0xb0, 0x70,
+0xc0, 0xa0`), i.e. the same 16-byte-granular field space the `a1` verbs
+use. Banks `0x81..0x83` instead carry small integers in `ff` (`1, 5, 8,
+9, 0xe, 0xd`), which read as indices or counts rather than field
+offsets. Some units are constants (`00 b0 84 08` occurs 61 of 61 times
+in `resnet18d`); others carry a small numeric range (`00 80 84 vv` takes
+16 values, `0x56..0x5c`). Overall `ff` is 16-granular in only 35.6% of
+units against a 20.4% shuffled null (25.3% vs 21.1% in `mnasnet`), so
+this is a per-bank distinction, not a property of the family --
+reported as the shape of the data, not a decoding of it.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
