@@ -2974,6 +2974,57 @@ ops region carries proportionally more of those pre-verb runs.
 Test: `test_resnet18d_tag_9f_units_carry_one_extra_byte` in
 `tests/test_axera_mcode_structure.py` (fresh build, no device).
 
+### The op programs are fully tokenized; the "trailer" is a five-table FlatBuffers tail the header points to
+
+The op region's last residue turned out not to be instructions. Under
+the full rule its only leftovers were two runs at the very end whose
+bytes read `0c 00 10 00 0f 00 0e 00 08 00 04 00` (a FlatBuffers vtable)
+and `7b 7d` (the string `{}`), so the "252-byte trailer" every earlier
+section stopped short of was too short by about 230 bytes. Measured on
+all three models:
+
+- **The stream ends 7 bytes after its last verb** -- a 7-byte `a2`
+  verb -- at 48,583 (`resnet18d`), 78,103 (`mnasnet`) and 3,447 (tiny);
+  then 17, 1 and 1 zero bytes; then a FlatBuffers vector of five table
+  offsets (`05 00 00 00 | 20 | 2c | 50 | 74 | 98`) **480 bytes before
+  the end** (472 in the tiny model). The header's 32-bit word at offset
+  272 is a FlatBuffers offset to exactly that vector in all three
+  (272 + 48,328 = 48,600; 272 + 77,832 = 78,104; 272 + 3,176 = 3,448),
+  so the header and the tail are one FlatBuffers structure wrapped
+  around the instruction stream.
+- **With the boundary right, the op programs are 100% tokenized** in
+  all three models (0 residue bytes in 17,767, 13,431 and 311). The whole
+  stream is **98.1%** explained in `resnet18d` (block A 97.75%, block B
+  96.5%, ops 100%), 96.0% in `mnasnet` and 88.0% in the tiny model;
+  counting the untokenized header and tail against it, 96.5%, 95.1% and
+  70.7% of the whole blob.
+- **Every configuration block ends the same way the header does.** The
+  header's last 17 bytes, `2b a7 00 00 0a 00 00 00 00 a2 00 00 00 13 00
+  40 00`, reappear byte for byte as the last 17 bytes of block A in all
+  three models (`40` is `30` throughout `mnasnet`), preceded by zero
+  bytes. Their last 8 bytes are an 8-byte `a2 00 00 00` verb with
+  operand `0x00400013`; the stream's own final bytes are `a2` verbs of
+  the same shape with per-model low halves (`0x7b2`; `0x642`, `0x652`;
+  `0x12`, `0x22`). So the 297-byte "header" is a FlatBuffers header of
+  280 bytes plus the same block terminator the config blocks use.
+- **The five tables share one schema.** Table 0 has four fields
+  (`59393`, `260`, then two per-model words: 2,228 / 3,812 in
+  `resnet18d`); tables 1..4 have six: a type word (4,097 for tables
+  1..3, 2,561 for table 4), an id (257, 258, absent, absent), two
+  per-model counts, a packed word that is always the second count
+  shifted left 8 bits plus 1 (865,281 = 3,380 x 256 + 1, in every
+  table of every model), and a byte-count-sized value. Table 4's last
+  field is block A's length minus 21 in both large models (11,115 vs
+  11,136; 19,658 vs 19,680) -- the 21 bytes being the terminator above
+  plus four zeros -- but 606 vs 608 in the tiny model, so that reading
+  is a lead, not a result. `resnet18d`'s values, tables 1..4: counts
+  (432, 3,380), (612, 2,768), (1,376, 1,392), (1,392, --); sizes 3,455,
+  4,881, 11,000, 11,115. None equals a unit, verb or byte count measured
+  here; per-engine instruction budgets are the obvious guess.
+
+Test: `test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail` in
+`tests/test_axera_mcode_structure.py` (fresh build, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

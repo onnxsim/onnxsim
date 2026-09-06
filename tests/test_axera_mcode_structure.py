@@ -2822,3 +2822,76 @@ def test_resnet18d_tag_9f_units_carry_one_extra_byte(tmp_path):
     random.Random(0).shuffle(shuffled)
     e_real, e_null = explained(block), explained(bytes(shuffled))
     assert e_real >= 0.95 and e_null <= 0.55, (e_real, e_null)
+
+
+_TAIL_VECTOR = bytes.fromhex("05000000200000002c000000500000007400000098000000")
+"""The FlatBuffers vector of five table offsets that opens an mcode blob's
+tail -- see the README's "The op programs are fully tokenized" section."""
+
+
+def _tail_tables(mcode):
+    """Walk the five FlatBuffers tables of an mcode blob's tail. Returns, per
+    table, a dict of `field index -> uint32 (or uint16) value` for present
+    fields, read through each table's vtable."""
+    vec = mcode.find(_TAIL_VECTOR)
+    assert vec > 0 and mcode.find(_TAIL_VECTOR, vec + 1) < 0
+    u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
+    i32 = lambda o: struct.unpack_from("<i", mcode, o)[0]  # noqa: E731
+    u16 = lambda o: struct.unpack_from("<H", mcode, o)[0]  # noqa: E731
+    tables = []
+    for k in range(u32(vec)):
+        p = vec + 4 + 4 * k
+        tpos = p + u32(p)
+        vt = tpos - i32(tpos)
+        vsz, tsz = u16(vt), u16(vt + 2)
+        fields = {}
+        for f in range((vsz - 4) // 2):
+            off = u16(vt + 4 + 2 * f)
+            if off:
+                fields[f] = u32(tpos + off) if off + 4 <= tsz else u16(tpos + off)
+        tables.append(fields)
+    return vec, tables
+
+
+def test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail(tmp_path):
+    """Confirmed real (see the README's "The op programs are fully
+    tokenized" section), on a fresh resnet18d build: the header's word at
+    offset 272 is a FlatBuffers offset landing exactly on the tail's
+    five-table vector, ~480 bytes before the end; the instruction stream
+    ends 7 bytes after its last verb, just before that vector's zero
+    padding; under the full rule the op region has zero residue and the
+    stream is >= 97% explained; the header's last 17 bytes close block A
+    too; and tables 1..3 carry type word 4097 with the packed field equal
+    to `count << 8 | 1`. No device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    vec, tables = _tail_tables(mcode)
+    assert 460 <= len(mcode) - vec <= 500, len(mcode) - vec
+    assert 272 + struct.unpack_from("<I", mcode, 272)[0] == vec
+
+    pad = 0
+    while mcode[vec - pad - 1] == 0:
+        pad += 1
+    stream_end = vec - pad
+
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    a_lo, b_lo, ops_lo = narrow[cuts[0]][0], narrow[cuts[1]][0], narrow[cuts[2]][0]
+    assert mcode[280:297] == mcode[b_lo - 17 : b_lo]
+    assert mcode[b_lo - 8 : b_lo - 4] == bytes.fromhex("a2000000")
+
+    full = dict(tags=_ALL_TAGS, pmax=4, bare=True, extra_byte_tags={0x9F})
+    toks = _tokenize_mcode(mcode, start=a_lo, end=stream_end, **full)
+    last = toks[-1]
+    assert last[1] == "V" and last[2] == 0xA2 and stream_end - last[0] == 7, last
+    ops = [t for t in toks if t[0] >= ops_lo]
+    assert ops and not any(t[1] == "?" for t in ops)
+    explained = 1 - sum(1 for t in toks if t[1] == "?") / (stream_end - a_lo)
+    assert explained >= 0.97, explained
+
+    assert len(tables) == 5
+    for k in (1, 2, 3):
+        assert tables[k][0] == 4097 and tables[k][4] == (tables[k][3] << 8) | 1, tables[
+            k
+        ]
+    assert tables[4][0] == 2561
