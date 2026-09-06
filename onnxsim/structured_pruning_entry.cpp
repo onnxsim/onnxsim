@@ -382,6 +382,37 @@ void SetInt64TensorLastDim(onnx::TensorProto* t, int64_t new_last) {
   t->set_raw_data(std::move(raw));
 }
 
+// The SECOND-to-last analogue of SetInt64TensorLastDim -- overwrites the
+// second-to-last element of a 4-entry INT64 tensor `t` in place with
+// `new_val`, keeping every other dim (in particular the actual last entry,
+// `head_size`, which whole-head/KV-group pruning never touches). Used only
+// by the fused packed-QKV-then-Split Q/K-norm+RoPE pass-through's own
+// `GemmaRotaryEmbedding`-only `bnsh_reshape_shape` rewrite (see
+// QkNormRopePassThrough's own comment) -- mirrors pruning.py's own
+// `dims[-2] = ...; shape_init.CopyFrom(from_array(dims))` pattern.
+void SetInt64TensorSecondToLastDim(onnx::TensorProto* t, int64_t new_val) {
+  std::vector<int64_t> data = ReadInt64Tensor(*t);
+  if (data.size() < 2) {
+    return;
+  }
+  data[data.size() - 2] = new_val;
+  const std::string name = t->name();
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(onnx::TensorProto::INT64);
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  std::string raw(data.size() * sizeof(int64_t), '\0');
+  std::memcpy(raw.data(), data.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(int64_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
+
 // The INT64 analogue of SetFloatTensorData -- overwrites `t` in place with a
 // fresh INT64 tensor of `dims`/`data`, keeping its existing name. Used only
 // by ApplySplitGatedChains's own `split` *input* rewrite (mirrors
@@ -486,6 +517,89 @@ std::optional<MatMulLikeMatch> MatchMatMulLikeRaw(const onnx::NodeProto& node) {
 using InitMap = std::unordered_map<std::string, const onnx::TensorProto*>;
 using ConsumerMap =
     std::unordered_map<std::string, std::vector<onnx::NodeProto*>>;
+
+// Builds an `InitMap`-equivalent lookup from BOTH `graph.initializer()` AND
+// every plain (default-domain) `Constant` node's own embedded `value`
+// attribute tensor, keyed by that node's single output name -- the C++
+// mirror of pruning.py's own `_constant_map` (see that function's docstring
+// for the full rationale/semantics this reproduces exactly). Real
+// `torch.onnx.export` output routinely lowers an inline literal
+// shape/scalar operand (a `Reshape`'s target shape, a `Pow`'s exponent, ...)
+// to a `Constant` node rather than a genuine `graph.initializer` entry --
+// and onnxsim's own `simplify()` deliberately leaves it that way (its own
+// optimizer list always drops onnx-optimizer's
+// `extract_constant_to_initializer` pass) -- so a plain
+// `{t.name(): &t for t in graph.initializer()}`-style map alone misses
+// exactly this common, real shape.
+//
+// Only a `Constant` node's own `value` *tensor* attribute is recognized here
+// (`sparse_value`/`value_int`/`value_float`/`value_string`-family attributes
+// and their list forms are a different representation, never emitted by a
+// real exporter for a full tensor payload) -- mirrors `_constant_map`'s own
+// identical, deliberate narrowing.
+//
+// An actual `graph.initializer` entry always wins on a genuine name
+// collision with a `Constant` node's output (vanishingly unlikely in
+// practice): this uses `emplace`, which is a no-op when the key -- already
+// inserted from `graph.initializer()` in the loop above -- is present,
+// exactly mirroring `_constant_map`'s own `dict.setdefault` call.
+InitMap BuildConstantMap(const onnx::GraphProto& graph) {
+  InitMap constants;
+  for (const auto& t : graph.initializer()) {
+    constants[t.name()] = &t;
+  }
+  for (const auto& node : graph.node()) {
+    if ((node.domain() != "" && node.domain() != "ai.onnx") ||
+        node.op_type() != "Constant" || node.output_size() != 1 ||
+        node.output(0).empty()) {
+      continue;
+    }
+    for (const auto& attr : node.attribute()) {
+      if (attr.name() == "value" &&
+          attr.type() == onnx::AttributeProto::TENSOR) {
+        constants.emplace(node.output(0), &attr.t());
+        break;
+      }
+    }
+  }
+  return constants;
+}
+
+// Mutable analogue of `BuildConstantMap` above, for a caller (e.g.
+// `ApplyOneDecomposedGqaChain`'s own `_rewrite_shape_dim`-equivalent local
+// helper) that goes on to slice/edit a resolved value in place: a
+// `Constant` node's own `value` attribute tensor is returned via
+// `mutable_t()`, a live pointer into that node's own embedded `TensorProto`
+// -- editing through it (e.g. `SliceAxisGeneric`) mutates the node's own
+// serialized form directly, exactly as if it had been a real initializer
+// entry all along. Mirrors `_constant_map`'s own docstring paragraph on why
+// this is safe: protobuf's `attr.t`/`mutable_t()` is a live reference, never
+// a copy, in both languages.
+std::unordered_map<std::string, onnx::TensorProto*> BuildMutableConstantMap(
+    onnx::GraphProto* graph) {
+  std::unordered_map<std::string, onnx::TensorProto*> constants;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    constants[t->name()] = t;
+  }
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    if ((node->domain() != "" && node->domain() != "ai.onnx") ||
+        node->op_type() != "Constant" || node->output_size() != 1 ||
+        node->output(0).empty()) {
+      continue;
+    }
+    for (int j = 0; j < node->attribute_size(); ++j) {
+      onnx::AttributeProto* attr = node->mutable_attribute(j);
+      if (attr->name() == "value" &&
+          attr->type() == onnx::AttributeProto::TENSOR) {
+        constants.emplace(node->output(0), attr->mutable_t());
+        break;
+      }
+    }
+  }
+  return constants;
+}
 
 // Forward declarations for this file's own generic (FLOAT/FLOAT16/BFLOAT16)
 // dtype infrastructure -- defined much later in the file, inside this same
@@ -5507,6 +5621,32 @@ std::optional<int64_t> ReshapeLastDim(const onnx::NodeProto& node,
   return last > 0 ? std::optional<int64_t>(last) : std::nullopt;
 }
 
+// The SECOND-to-last analogue of ReshapeLastDim -- used only by
+// MatchBnshReshape/MatchReverseBnshReshape below, whose own `[batch, seq,
+// num_heads, head_size]` 4-entry target shape needs its `num_heads` entry
+// (index -2, not -1 -- `head_size`, the actual last entry, never changes
+// under head pruning) read the same deferred, wildcard-aware way. Requires
+// exactly 4 entries -- mirrors pruning.py's own
+// `_reshape_second_to_last_dim` exactly.
+std::optional<int64_t> ReshapeSecondToLastDim(const onnx::NodeProto& node,
+                                              const InitMap& init_map) {
+  if (node.op_type() != "Reshape" || node.input_size() != 2) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(node.input(1));
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::INT64) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> dims = ReadInt64Tensor(*it->second);
+  if (dims.size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t second_to_last = dims[dims.size() - 2];
+  return second_to_last > 0 ? std::optional<int64_t>(second_to_last)
+                            : std::nullopt;
+}
+
 struct AttnChainOp {
   onnx::NodeProto* node;
   std::optional<std::string> shape_name;
@@ -5575,6 +5715,61 @@ enum class AttnChainKind { kPlainAttention, kGqaLike };
 // than pruning.py's own _AttnLikeChain union of two dataclasses, since
 // C++ has no direct analogue of Python's runtime isinstance() dispatch;
 // `kind` says which of the two field groups below is populated.
+// One resolved Q- or K-branch "per-head norm + RoPE" pass-through a
+// packed-QKV chain walk (FindSeparateQkvChains) crossed between the shared
+// packed-QKV `Split` (AttnChain's own `packed_split_sizes` field) and the
+// fused attention op's own Q or K input -- mirrors pruning.py's own
+// `_QKNormRopePassThrough`/`_walk_back_through_qk_norm_rope` exactly (see
+// this file's own `MatchPackedQkvSplit`/`WalkBackThroughQkNormRope`/
+// `WalkBackThroughGemmaRopePair` for the exact topology matched and how its
+// head-independence was confirmed -- reusing pruning.py's own empirical
+// findings verbatim, not re-deriving them). Deliberately a SEPARATE struct
+// from this file's own
+// `DecomposedRopePassThrough`/`DecomposedQKNormPassThrough` (the
+// *decomposed*-attention family's own genuinely different decomposed-math
+// RoPE/QK-norm shape, wired into FindDecomposedGqaChains only) -- this one
+// covers the *fused*-op family's own fused `RotaryEmbedding`/
+// `MRotaryEmbedding`/`GemmaRotaryEmbedding` ops and fused
+// `SimplifiedLayerNormalization` sandwich instead, an unrelated topology
+// nothing here shares with that family.
+//
+// Unlike a slice-target field, nothing here names a tensor ApplyOneGqaChain
+// needs to *slice* -- neither a crossed norm's own `scale` nor a crossed
+// `RotaryEmbedding`'s `cos_cache`/`sin_cache` ever needs touching (both
+// confirmed head-independent by pruning.py's own empirical tests). Four
+// things still do, each rewritten (when present) to this branch's own new
+// post-pruning head count/flat width at apply time:
+//   - `rotary_node`: the crossed `RotaryEmbedding`/`MRotaryEmbedding` node
+//     (nullptr when neither was crossed) -- its own `num_heads` attribute,
+//     whenever it isn't already the schema's `0`, is rewritten.
+//   - `reshape_shape`: the crossed post-norm `Reshape`'s own target-shape
+//     constant name -- its own last entry is rewritten.
+//   - `bnsh_reshape_shape`: only ever populated by
+//     WalkBackThroughGemmaRopePair, for the `Reshape` feeding
+//     `GemmaRotaryEmbedding`'s own required 4D BNSH `q`/`k` input -- its own
+//     SECOND-to-last entry (num_heads; the last, head_size, never changes)
+//     is rewritten.
+//   - `output_reshape_shape`: only ever populated by
+//     WalkBackThroughGemmaRopePair, for the mirror-image `Reshape` back to
+//     flat 3D on `GemmaRotaryEmbedding`'s own OUTPUT side -- its own last
+//     entry is rewritten. Kept separate from `reshape_shape` since both can
+//     be crossed on the same branch at once.
+// `extra_stale_outputs` names extra tensors (beyond `nodes`'s own outputs)
+// whose value_info should be treated as stale -- only ever populated by
+// WalkBackThroughGemmaRopePair for the *other* branch's own output of a
+// single, jointly-consumed `GemmaRotaryEmbedding` node.
+// `nodes` lists every node actually crossed, purely for
+// ApplyAttentionChains' own stale-value_info bookkeeping -- never empty when
+// this struct is actually populated.
+struct QkNormRopePassThrough {
+  std::vector<onnx::NodeProto*> nodes;
+  onnx::NodeProto* rotary_node = nullptr;
+  std::optional<std::string> reshape_shape;
+  std::vector<std::string> extra_stale_outputs;
+  std::optional<std::string> bnsh_reshape_shape;
+  std::optional<std::string> output_reshape_shape;
+};
+
 struct AttnChain {
   AttnChainKind kind;
   onnx::NodeProto* node;
@@ -5610,6 +5805,28 @@ struct AttnChain {
   // `_GQAChain.mha_bias` field. `None`/`nullopt` for every other matched op,
   // and for a matched node whose own combined bias input is absent.
   std::optional<std::string> mha_bias;
+  // Set (to the name of the constant int64 split-sizes tensor feeding a
+  // shared upstream packed-QKV `Split` node) when Q/K/V are not three
+  // independent producer weights but three column ranges of one *packed*
+  // MatMul/Gemm weight split by a single `Split` node upstream of `.node` --
+  // mirrors pruning.py's own `_GQAChain.packed_split_sizes` field exactly
+  // (see MatchPackedQkvSplit for the exact topology matched). When set,
+  // `.q_weight`/`.k_weight`/`.v_weight` all name that SAME single packed
+  // initializer (and `.q_bias`, if not nullopt, names the single packed
+  // bias -- `.k_bias`/`.v_bias` stay nullopt for this shape, mirroring
+  // pruning.py's own producer_infos construction, which only ever threads
+  // the packed producer's own single bias through Q's slot). `nullopt` for
+  // the ordinary three-independent-producer shape every other chain has.
+  std::optional<std::string> packed_split_sizes;
+  // Set only alongside `packed_split_sizes`, and only when a per-head
+  // Q/K-norm + RoPE pass-through (QkNormRopePassThrough) was crossed
+  // walking back from `.node`'s own Q (`.q_norm_rope`) or K (`.k_norm_rope`)
+  // input to the shared `Split` -- mirrors pruning.py's own
+  // `_GQAChain.q_norm_rope`/`.k_norm_rope` fields exactly. `nullopt`
+  // (the default) whenever that particular branch feeds `.node` directly
+  // from the `Split` with no hop in between.
+  std::optional<QkNormRopePassThrough> q_norm_rope;
+  std::optional<QkNormRopePassThrough> k_norm_rope;
   // Shared:
   std::vector<AttnChainOp> chain_ops;
   onnx::NodeProto* consumer_node = nullptr;
@@ -6151,23 +6368,33 @@ std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
 // already-projected activations, `q_num_heads`/`kv_num_heads` both required
 // attributes with `q_num_heads` a positive multiple of `kv_num_heads`.
 //
-// Deliberately narrower than pruning.py's own matcher: `past_state`/`decay`/
-// `beta` (3/4/5) must all be absent here. This port only ever prunes the
-// stateless "linear" `update_rule` shape that needs none of the three --
-// pruning.py's own comment for this op already narrows its *real-world*
-// scope to almost exactly this (a genuinely dynamic `decay`/`beta` declines
-// the whole match there too; a *constant* one is called out as "a
-// degenerate shape no real dynamic-decode export produces" -- see this
-// file's own "Attention-head pruning" section comment, the `LinearAttention`
-// bullet), so requiring all three absent here -- rather than porting the
-// deferred decay/beta shape-classification logic pruning.py's own
-// matcher/finder pair uses -- gives up essentially nothing over the
-// realistic export shape while avoiding new, unverified slicing machinery.
+// `past_state`/`decay`/`beta` (3/4/5) are now validated-and-allowed, not a
+// blanket decline, mirroring pruning.py's own `_match_linear_attention_
+// producer` for the *constant* case exactly: a connected `past_state` is
+// checked here only when constant (a dynamic one is the caller's own
+// runtime data, left alone entirely, same as GroupQueryAttention's own
+// `past_key`/`past_value`) against this op's own documented `(*,
+// kv_num_heads, *, *)` shape; a connected `beta` is checked here, constant
+// or not needed (its own two documented shapes -- `(*, *, kv_num_heads)` or
+// a size-1 broadcast -- don't need `head_size` to tell apart, unlike
+// `decay`'s own).
+//
+// Still deliberately narrower than pruning.py's own matcher in one respect:
+// a *dynamic* `decay`/`beta` still declines the whole match here outright,
+// rather than being deferred to a `com.microsoft::LinearAttentionGate`
+// pass-through check the way pruning.py's own `_find_linear_attention_
+// chains` (via `_match_linear_attention_gate`) does -- that dynamic
+// producer-recognition machinery is not ported here (see this file's own
+// "Attention-head pruning" section comment, the `LinearAttention` bullet,
+// for the documented scope boundary this narrowing keeps). `decay`'s own
+// exact-shape check (which needs `head_size`, not known yet here) is
+// deferred to `FindLinearAttentionChains`, mirroring pruning.py's own
+// identical deferral to `_find_linear_attention_chains`.
 // `value_info_by_name` accepted (see MatchPagedAttentionProducer's own
 // comment) but ignored: this op has no attention_bias/attn_mask-equivalent
 // input on its own schema either.
 std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& /*init_map*/,
+    const onnx::NodeProto& node, const InitMap& init_map,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
     /*value_info_by_name*/
     = {}) {
@@ -6195,11 +6422,49 @@ std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
   if (q_num_heads % kv_num_heads != 0) {
     return std::nullopt;
   }
-  for (int idx : {3, 4, 5}) {  // past_state, decay, beta
-    if (node.input_size() > idx && !node.input(idx).empty()) {
+
+  if (node.input_size() > 3 && !node.input(3).empty()) {
+    auto ps_it = init_map.find(node.input(3));
+    if (ps_it != init_map.end()) {
+      const onnx::TensorProto* ps_init = ps_it->second;
+      if (!IsSupportedFloatDtype(ps_init->data_type()) ||
+          ps_init->dims_size() != 4 || ps_init->dims(1) != kv_num_heads) {
+        return std::nullopt;  // not this schema's own (B, kv_num_heads,
+                              // d_k, d_v) shape
+      }
+    }
+    // else: dynamic past_state -- the caller's own runtime data, left
+    // alone entirely, nothing to check here.
+  }
+
+  for (int idx : {4, 5}) {  // decay, beta
+    if (node.input_size() <= idx || node.input(idx).empty()) {
+      continue;
+    }
+    auto it = init_map.find(node.input(idx));
+    if (it == init_map.end()) {
+      // Dynamic decay/beta -- unlike pruning.py's own deferred
+      // LinearAttentionGate-pass-through check (not ported here, see this
+      // function's own comment above), declined outright.
+      return std::nullopt;
+    }
+    if (!IsSupportedFloatDtype(it->second->data_type()) ||
+        it->second->dims_size() != 3) {
       return std::nullopt;
     }
   }
+
+  if (node.input_size() > 5 && !node.input(5).empty()) {
+    auto beta_it = init_map.find(node.input(5));
+    if (beta_it != init_map.end()) {
+      const int64_t last =
+          beta_it->second->dims(beta_it->second->dims_size() - 1);
+      if (last != kv_num_heads && last != 1) {
+        return std::nullopt;  // neither of beta's own two documented shapes
+      }
+    }
+  }
+
   return HeadCountsMatch{q_num_heads, kv_num_heads};
 }
 
@@ -6285,6 +6550,720 @@ std::optional<HeadCountsMatch> MatchSparseAttentionProducer(
                           // already, before this pass even touches anything
   }
   return HeadCountsMatch{num_heads, kv_num_heads};
+}
+
+// A packed-QKV-then-`Split` producer -- Q's/K's/V's own raw projection
+// output all trace back to ONE combined MatMul/vanilla-Gemm projection
+// (optionally biased) whose wide `[..., nq+nk+nv]` output is split, by a
+// plain `Split(axis=-1)` node, into exactly three column ranges in
+// Q-then-K-then-V order. Mirrors pruning.py's own `_match_packed_qkv_split`
+// exactly -- see that function's own docstring for the real
+// onnxruntime-genai-model-builder export shape this was confirmed against.
+struct PackedQkvSplitMatch {
+  std::string weight;
+  bool weight_transposed = false;
+  std::optional<std::string> bias;
+  int64_t nq = 0, nk = 0, nv = 0;
+  std::string split_sizes_name;
+};
+
+std::optional<PackedQkvSplitMatch> MatchPackedQkvSplit(
+    const onnx::NodeProto& split_node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (split_node.domain() != "" || split_node.op_type() != "Split") {
+    return std::nullopt;
+  }
+  if (split_node.output_size() != 3 || split_node.input_size() != 2) {
+    return std::nullopt;
+  }
+  if (split_node.input(0).empty() || split_node.input(1).empty()) {
+    return std::nullopt;
+  }
+
+  int64_t axis = 0;
+  bool has_axis = false;
+  for (const auto& attr : split_node.attribute()) {
+    if (attr.name() == "axis") {
+      axis = attr.i();
+      has_axis = true;
+    }
+  }
+  if (!has_axis || axis != -1) {
+    return std::nullopt;
+  }
+
+  const std::string& sizes_name = split_node.input(1);
+  auto sit = init_map.find(sizes_name);
+  if (sit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::INT64 ||
+      sit->second->dims_size() != 1 || sit->second->dims(0) != 3) {
+    return std::nullopt;
+  }
+  if (ConsumerCount(consumers_of, sizes_name) != 1) {
+    return std::nullopt;  // shared split-sizes constant -- can't overwrite.
+  }
+  std::vector<int64_t> sizes = ReadInt64Tensor(*sit->second);
+  if (sizes.size() != 3) {
+    return std::nullopt;
+  }
+  const int64_t nq = sizes[0], nk = sizes[1], nv = sizes[2];
+  if (nq <= 0 || nk <= 0 || nv <= 0) {
+    return std::nullopt;
+  }
+
+  const std::string& data_name = split_node.input(0);
+  if (ConsumerCount(consumers_of, data_name) != 1) {
+    return std::nullopt;  // shared packed-projection output -- can't rewrite.
+  }
+  auto pit = node_by_output.find(data_name);
+  if (pit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  auto pinfo = MatchProducerAnyFloat(*pit->second, init_map);
+  if (!pinfo || pinfo->n_channels != nq + nk + nv) {
+    return std::nullopt;
+  }
+
+  PackedQkvSplitMatch m;
+  m.weight = pinfo->weight;
+  m.weight_transposed = pinfo->weight_transposed;
+  m.bias = pinfo->bias;
+  m.nq = nq;
+  m.nk = nk;
+  m.nv = nv;
+  m.split_sizes_name = sizes_name;
+  return m;
+}
+
+// --- Fused-op packed-QKV Q/K-norm + RoPE pass-through, mirroring
+// pruning.py's own `_walk_back_through_qk_norm_rope`/
+// `_walk_back_through_qk_norm`/`_walk_back_through_gemma_rope_pair`/
+// `_match_rotate_half`/`_match_bnsh_reshape`/`_match_reverse_bnsh_reshape`/
+// `_qk_norm_rope_hop_is_consistent` -- the packed-QKV producer
+// (MatchPackedQkvSplit above) covers Microsoft's own "no Q/K-norm" export
+// shape; onnxruntime-genai's own CPU/DirectML "fused Q/K-norm not supported"
+// export instead inserts, between the shared `Split`'s own Q/K outputs and
+// the fused attention op's own Q/K inputs, an optional per-head norm
+// sandwich (`Reshape` -> `SimplifiedLayerNormalization` -> `Reshape`) and,
+// unless RoPE is fused into the attention op itself, an optional
+// `RotaryEmbedding`/`MRotaryEmbedding`/`GemmaRotaryEmbedding` hop -- norm
+// before RoPE when both are present. This section walks *backward* from the
+// attention op's own Q or K input through this exact optional-hop sequence
+// to find the `Split` output feeding it, the same direction
+// WalkMatmulProducerBackward already walks in this file for an unrelated
+// reason.
+//
+// True for a plain `RotaryEmbedding` node, or an `MRotaryEmbedding` node
+// whose own `mrope_layout` attribute (when present -- schema default `0`) is
+// one of the two values (`0`/`1`) its own schema documents -- mirrors
+// pruning.py's own `_rotary_op_attrs_are_supported` exactly.
+bool RotaryOpAttrsAreSupported(const onnx::NodeProto& node) {
+  if (node.op_type() != "MRotaryEmbedding") {
+    return true;
+  }
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "mrope_layout") {
+      return attr.i() == 0 || attr.i() == 1;
+    }
+  }
+  return true;  // attribute absent -- schema default (0), always supported.
+}
+
+// The `Reshape` -> `SimplifiedLayerNormalization` -> `Reshape` "per-head
+// norm" sandwich half of the Q/K-norm+RoPE walk, factored out so
+// WalkBackThroughGemmaRopePair can cross the identical sandwich (with the
+// identical validation rigor) behind a `GemmaRotaryEmbedding` node's own
+// `q`/`k` inputs -- mirrors pruning.py's own `_walk_back_through_qk_norm`
+// exactly. Returns `(root, nodes, reshape_shape)`: `nodes` empty and
+// `reshape_shape` `nullopt` when the sandwich wasn't crossed (`root` is
+// `name` itself then). The norm's own `axis` is required to be exactly `-1`
+// (or absent, the schema default) -- mirrors pruning.py's own
+// `_norm_axis_is_last(norm_node, norm_node.input[0], None)` call, which
+// passes `value_info_by_name=None` and so likewise only ever accepts a
+// literal `-1`, never a positive axis resolved against a known rank.
+std::tuple<std::string, std::vector<onnx::NodeProto*>,
+           std::optional<std::string>>
+WalkBackThroughQkNorm(
+    const std::string& name, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  auto r2it = node_by_output.find(name);
+  if (r2it == node_by_output.end()) {
+    return {name, {}, std::nullopt};
+  }
+  onnx::NodeProto* reshape2 = r2it->second;
+  if (reshape2->domain() != "" || reshape2->op_type() != "Reshape" ||
+      reshape2->input_size() != 2 || reshape2->input(0).empty() ||
+      reshape2->output_size() != 1 || reshape2->output(0) != name ||
+      !is_internal(reshape2->input(0)) ||
+      !ReshapeLastDim(*reshape2, init_map) ||
+      ConsumerCount(consumers_of, reshape2->input(1)) != 1) {
+    return {name, {}, std::nullopt};
+  }
+
+  const std::string norm_out = reshape2->input(0);
+  auto nit = node_by_output.find(norm_out);
+  if (nit == node_by_output.end()) {
+    return {name, {}, std::nullopt};
+  }
+  onnx::NodeProto* norm_node = nit->second;
+  int64_t norm_axis = -1;
+  for (const auto& attr : norm_node->attribute()) {
+    if (attr.name() == "axis") {
+      norm_axis = attr.i();
+    }
+  }
+  const bool second_output_consumed =
+      norm_node->output_size() > 1 && !norm_node->output(1).empty() &&
+      (ConsumerCount(consumers_of, norm_node->output(1)) > 0 ||
+       graph_outputs.count(norm_node->output(1)));
+  if (norm_node->domain() != "" ||
+      norm_node->op_type() != "SimplifiedLayerNormalization" ||
+      norm_node->output_size() < 1 || norm_node->output(0) != norm_out ||
+      norm_node->input_size() != 2 || norm_node->input(1).empty() ||
+      !FlatChannelConst(norm_node->input(1), init_map) || norm_axis != -1 ||
+      second_output_consumed || norm_node->input(0).empty() ||
+      !is_internal(norm_node->input(0))) {
+    return {name, {}, std::nullopt};
+  }
+
+  auto r1it = node_by_output.find(norm_node->input(0));
+  if (r1it == node_by_output.end()) {
+    return {name, {}, std::nullopt};
+  }
+  onnx::NodeProto* reshape1 = r1it->second;
+  if (reshape1->domain() != "" || reshape1->op_type() != "Reshape" ||
+      reshape1->input_size() != 2 || reshape1->input(0).empty() ||
+      reshape1->output_size() != 1 ||
+      reshape1->output(0) != norm_node->input(0) ||
+      !is_internal(reshape1->input(0))) {
+    return {name, {}, std::nullopt};
+  }
+
+  return {reshape1->input(0),
+          std::vector<onnx::NodeProto*>{reshape2, norm_node, reshape1},
+          std::optional<std::string>(reshape2->input(1))};
+}
+
+// `RotaryEmbedding`/`MRotaryEmbedding`'s own shared single-tensor-in/
+// single-tensor-out shape this walk matches -- `MRotaryEmbedding` has no
+// native-domain (`""`) equivalent at all (confirmed live, per pruning.py's
+// own comment), so only plain `RotaryEmbedding` is ever widened to accept
+// the native domain.
+bool IsRotarySingleTensorOp(const std::string& op_type) {
+  return op_type == "RotaryEmbedding" || op_type == "MRotaryEmbedding";
+}
+
+// Walks *backward* from `name` -- the fused attention op's own Q or K input,
+// already confirmed by the caller to have exactly one consumer -- through an
+// optional `RotaryEmbedding`/`MRotaryEmbedding` node and, further back, an
+// optional per-head norm sandwich (WalkBackThroughQkNorm), stopping at the
+// first tensor not produced by one of these two recognized hops (each
+// independently optional). Mirrors pruning.py's own
+// `_walk_back_through_qk_norm_rope` exactly. Returns `(root_name, hop)`:
+// `hop` is `nullopt` when neither hop was crossed (`root_name` is `name`
+// itself then).
+std::pair<std::string, std::optional<QkNormRopePassThrough>>
+WalkBackThroughQkNormRope(
+    const std::string& name, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  std::vector<onnx::NodeProto*> nodes;
+  onnx::NodeProto* rotary_node = nullptr;
+  std::string cur = name;
+
+  auto rit = node_by_output.find(cur);
+  if (rit != node_by_output.end()) {
+    onnx::NodeProto* rope = rit->second;
+    const bool domain_ok =
+        rope->domain() == kComMicrosoftDomain ||
+        (rope->domain().empty() && rope->op_type() == "RotaryEmbedding");
+    if (domain_ok && IsRotarySingleTensorOp(rope->op_type()) &&
+        rope->input_size() >= 1 && !rope->input(0).empty() &&
+        rope->output_size() == 1 && rope->output(0) == cur &&
+        ConsumerCount(consumers_of, rope->input(0)) == 1 &&
+        !graph_outputs.count(rope->input(0)) &&
+        RotaryOpAttrsAreSupported(*rope)) {
+      rotary_node = rope;
+      nodes.push_back(rope);
+      cur = rope->input(0);
+    }
+  }
+
+  auto [root, norm_nodes, reshape_shape] = WalkBackThroughQkNorm(
+      cur, init_map, consumers_of, graph_outputs, node_by_output);
+  nodes.insert(nodes.end(), norm_nodes.begin(), norm_nodes.end());
+
+  if (nodes.empty()) {
+    return {name, std::nullopt};
+  }
+  QkNormRopePassThrough hop;
+  hop.nodes = std::move(nodes);
+  hop.rotary_node = rotary_node;
+  hop.reshape_shape = reshape_shape;
+  return {root, hop};
+}
+
+// Confirms `name` is produced by the textbook "rotate_half" subgraph --
+// `x1, x2 = x.chunk(2, dim=-1); return cat((-x2, x1), dim=-1)` -- rooted at
+// `expected_root`, via `Split`(opset-13+ tensor-input form or the plain
+// attribute form, evenly split)/`Neg`/`Concat` -- mirrors pruning.py's own
+// `_match_rotate_half` exactly. A genuinely DIFFERENT shape from this file's
+// own MatchDecomposedRotateHalfSlice (the decomposed-attention family's own
+// `Slice`-based rotate_half) -- `GemmaRotaryEmbedding`'s own `q_rot`/`k_rot`
+// input uses this `Split`-based form instead. Returns the three matched
+// nodes (`Concat`, `Neg`, `Split`, in that order) on a match; `nullopt`
+// otherwise.
+std::optional<std::vector<onnx::NodeProto*>> MatchRotateHalf(
+    const std::string& name, const std::string& expected_root,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  auto cit = node_by_output.find(name);
+  if (cit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* concat = cit->second;
+  if (concat->domain() != "" || concat->op_type() != "Concat" ||
+      concat->input_size() != 2 || concat->input(0).empty() ||
+      concat->input(1).empty() || concat->output_size() != 1 ||
+      concat->output(0) != name) {
+    return std::nullopt;
+  }
+  int64_t concat_axis = 0;
+  for (const auto& attr : concat->attribute()) {
+    if (attr.name() == "axis") {
+      concat_axis = attr.i();
+    }
+  }
+  if (concat_axis != -1) {
+    return std::nullopt;
+  }
+
+  const std::string neg_out = concat->input(0);
+  const std::string x1_out = concat->input(1);
+  if (!is_internal(neg_out)) {
+    return std::nullopt;
+  }
+  auto nit = node_by_output.find(neg_out);
+  if (nit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* neg = nit->second;
+  if (neg->domain() != "" || neg->op_type() != "Neg" ||
+      neg->input_size() != 1 || neg->input(0).empty() ||
+      neg->output_size() != 1 || neg->output(0) != neg_out) {
+    return std::nullopt;
+  }
+  const std::string x2_out = neg->input(0);
+  if (x2_out.empty() || !is_internal(x2_out)) {
+    return std::nullopt;
+  }
+
+  auto sit = node_by_output.find(x1_out);
+  if (sit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* split = sit->second;
+  if (split->domain() != "" || split->op_type() != "Split" ||
+      split->output_size() != 2 || split->output(0) != x1_out ||
+      split->output(1) != x2_out || split->input_size() == 0 ||
+      split->input(0) != expected_root) {
+    return std::nullopt;
+  }
+  int64_t split_axis = 0;  // Split's own schema default when absent.
+  for (const auto& attr : split->attribute()) {
+    if (attr.name() == "axis") {
+      split_axis = attr.i();
+    }
+  }
+  if (split_axis != -1) {
+    return std::nullopt;
+  }
+  if (split->input_size() >= 2 && !split->input(1).empty()) {
+    // The opset-13+ tensor-sizes form -- only accepted when the sizes are a
+    // resolvable constant splitting the axis into two exactly equal,
+    // strictly positive halves. Never overwritten in place (unlike
+    // MatchPackedQkvSplit's own split-sizes) -- it splits the `head_size`
+    // axis exactly in half, which whole-head pruning never changes.
+    auto sizes_it = init_map.find(split->input(1));
+    if (sizes_it == init_map.end() ||
+        sizes_it->second->data_type() != onnx::TensorProto::INT64 ||
+        sizes_it->second->dims_size() != 1 || sizes_it->second->dims(0) != 2) {
+      return std::nullopt;
+    }
+    std::vector<int64_t> sizes = ReadInt64Tensor(*sizes_it->second);
+    if (sizes.size() != 2 || sizes[0] <= 0 || sizes[0] != sizes[1]) {
+      return std::nullopt;
+    }
+  }
+  return std::vector<onnx::NodeProto*>{concat, neg, split};
+}
+
+// Matches the textbook `.view(batch, seq, num_heads, head_size)
+// .transpose(1, 2)` idiom -- turning a projection's own flat `(batch, seq,
+// num_heads * head_size)` output into the per-head-major "BNSH" `(batch,
+// num_heads, seq, head_size)` layout `GemmaRotaryEmbedding`'s own schema
+// requires for its `q`/`k` input -- rooted at `name`. Mirrors pruning.py's
+// own `_match_bnsh_reshape` exactly. Returns `(root, nodes, reshape_shape)`
+// -- `nodes` is `[transpose, reshape]`, `reshape_shape` is the `Reshape`'s
+// own target-shape constant name (`nullopt` only when that entry isn't
+// itself a resolvable literal) -- on a match; `nullopt` entirely otherwise.
+struct BnshReshapeMatch {
+  std::string root;
+  std::vector<onnx::NodeProto*> nodes;
+  std::optional<std::string> reshape_shape;
+};
+
+std::optional<BnshReshapeMatch> MatchBnshReshape(
+    const std::string& name, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  auto tit = node_by_output.find(name);
+  if (tit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* transpose = tit->second;
+  if (transpose->domain() != "" || transpose->op_type() != "Transpose" ||
+      transpose->input_size() != 1 || transpose->input(0).empty() ||
+      transpose->output_size() != 1 || transpose->output(0) != name ||
+      !is_internal(transpose->input(0))) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> perm;
+  for (const auto& attr : transpose->attribute()) {
+    if (attr.name() == "perm") {
+      perm.assign(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (perm != std::vector<int64_t>{0, 2, 1, 3}) {
+    return std::nullopt;
+  }
+
+  auto rit = node_by_output.find(transpose->input(0));
+  if (rit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* reshape = rit->second;
+  if (reshape->domain() != "" || reshape->op_type() != "Reshape" ||
+      reshape->input_size() != 2 || reshape->input(0).empty() ||
+      reshape->output_size() != 1 ||
+      reshape->output(0) != transpose->input(0) ||
+      !is_internal(reshape->input(0)) ||
+      ConsumerCount(consumers_of, reshape->input(1)) != 1) {
+    return std::nullopt;
+  }
+  auto shape_it = init_map.find(reshape->input(1));
+  if (shape_it == init_map.end() ||
+      shape_it->second->data_type() != onnx::TensorProto::INT64 ||
+      shape_it->second->dims_size() != 1) {
+    return std::nullopt;
+  }
+  if (ReadInt64Tensor(*shape_it->second).size() != 4) {
+    return std::nullopt;
+  }
+
+  auto num_heads_literal = ReshapeSecondToLastDim(*reshape, init_map);
+  BnshReshapeMatch m;
+  m.root = reshape->input(0);
+  m.nodes = {transpose, reshape};
+  m.reshape_shape = num_heads_literal
+                        ? std::optional<std::string>(reshape->input(1))
+                        : std::nullopt;
+  return m;
+}
+
+// The reverse of MatchBnshReshape: `Transpose(perm=[0,2,1,3])` back to
+// `(batch, seq, num_heads, head_size)` then `Reshape` to flat `(batch, seq,
+// num_heads * head_size)`, walked *backward* from `name` (an attention
+// consumer's own Q or K input) -- needed on the OUTPUT side of a
+// `GemmaRotaryEmbedding` node whenever the attention consumer itself only
+// accepts 3D (`GroupQueryAttention`). Mirrors pruning.py's own
+// `_match_reverse_bnsh_reshape` exactly. Returns `(root, nodes,
+// reshape_shape)` -- `nodes` is `[reshape, transpose]` (reverse order vs.
+// MatchBnshReshape) -- on a match; `nullopt` otherwise.
+struct ReverseBnshReshapeMatch {
+  std::string root;
+  std::vector<onnx::NodeProto*> nodes;
+  std::optional<std::string> reshape_shape;
+};
+
+std::optional<ReverseBnshReshapeMatch> MatchReverseBnshReshape(
+    const std::string& name, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  auto rit = node_by_output.find(name);
+  if (rit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* reshape = rit->second;
+  if (reshape->domain() != "" || reshape->op_type() != "Reshape" ||
+      reshape->input_size() != 2 || reshape->input(0).empty() ||
+      reshape->output_size() != 1 || reshape->output(0) != name ||
+      !is_internal(reshape->input(0)) || !ReshapeLastDim(*reshape, init_map) ||
+      ConsumerCount(consumers_of, reshape->input(1)) != 1) {
+    return std::nullopt;
+  }
+
+  auto tit = node_by_output.find(reshape->input(0));
+  if (tit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* transpose = tit->second;
+  if (transpose->domain() != "" || transpose->op_type() != "Transpose" ||
+      transpose->input_size() != 1 || transpose->input(0).empty() ||
+      transpose->output_size() != 1 ||
+      transpose->output(0) != reshape->input(0)) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> perm;
+  for (const auto& attr : transpose->attribute()) {
+    if (attr.name() == "perm") {
+      perm.assign(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (perm != std::vector<int64_t>{0, 2, 1, 3}) {
+    return std::nullopt;
+  }
+
+  ReverseBnshReshapeMatch m;
+  m.root = transpose->input(0);
+  m.nodes = {reshape, transpose};
+  m.reshape_shape = reshape->input(1);
+  return m;
+}
+
+// `com.microsoft::GemmaRotaryEmbedding` rotates BOTH Q's and K's own branch
+// TOGETHER in one node call (`emb`, `q`/`q_rot`/`k`/`k_rot` in, `output1`/
+// `output2` out) -- a genuinely different SHAPE from `RotaryEmbedding`/
+// `MRotaryEmbedding`'s own single-tensor-per-branch hop, so this is called
+// once with BOTH the attention op's own Q and K input names together,
+// mirroring pruning.py's own `_walk_back_through_gemma_rope_pair` exactly
+// (see that function's own docstring for the full schema/head-independence
+// reasoning). Returns `(root_q, root_k, q_hop, k_hop)` on a match; `nullopt`
+// (caller falls back to WalkBackThroughQkNormRope's own per-branch walk,
+// which simply won't match this node at all) otherwise.
+struct GemmaRopePairMatch {
+  std::string root_q, root_k;
+  QkNormRopePassThrough q_hop, k_hop;
+};
+
+std::optional<GemmaRopePairMatch> WalkBackThroughGemmaRopePair(
+    const std::string& q_name, const std::string& k_name,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  if (!is_internal(q_name) || !is_internal(k_name)) {
+    return std::nullopt;
+  }
+
+  auto q_reverse = MatchReverseBnshReshape(q_name, init_map, consumers_of,
+                                           graph_outputs, node_by_output);
+  auto k_reverse = MatchReverseBnshReshape(k_name, init_map, consumers_of,
+                                           graph_outputs, node_by_output);
+  const std::string q_pre = q_reverse ? q_reverse->root : q_name;
+  const std::string k_pre = k_reverse ? k_reverse->root : k_name;
+  if (!is_internal(q_pre) || !is_internal(k_pre)) {
+    return std::nullopt;
+  }
+
+  auto qit = node_by_output.find(q_pre);
+  if (qit == node_by_output.end() ||
+      node_by_output.find(k_pre) == node_by_output.end() ||
+      qit->second != node_by_output.find(k_pre)->second) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* node = qit->second;
+  if (node->domain() != kComMicrosoftDomain ||
+      node->op_type() != "GemmaRotaryEmbedding" || node->input_size() != 5 ||
+      node->output_size() != 2 || node->output(0) != q_pre ||
+      node->output(1) != k_pre) {
+    return std::nullopt;
+  }
+  const std::string& emb = node->input(0);
+  const std::string& q_in = node->input(1);
+  const std::string& q_rot_in = node->input(2);
+  const std::string& k_in = node->input(3);
+  const std::string& k_rot_in = node->input(4);
+  if (emb.empty() || q_in.empty() || q_rot_in.empty() || k_in.empty() ||
+      k_rot_in.empty() || q_in == k_in) {
+    return std::nullopt;
+  }
+
+  auto q_rotate_half = MatchRotateHalf(q_rot_in, q_in, init_map, consumers_of,
+                                       graph_outputs, node_by_output);
+  if (!q_rotate_half) {
+    return std::nullopt;
+  }
+  auto k_rotate_half = MatchRotateHalf(k_rot_in, k_in, init_map, consumers_of,
+                                       graph_outputs, node_by_output);
+  if (!k_rotate_half) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* q_split = q_rotate_half->back();
+  onnx::NodeProto* k_split = k_rotate_half->back();
+  if (graph_outputs.count(q_in) || graph_outputs.count(k_in)) {
+    return std::nullopt;
+  }
+  auto consumer_set_is = [&](const std::string& name,
+                             std::initializer_list<onnx::NodeProto*> want) {
+    auto cit = consumers_of.find(name);
+    if (cit == consumers_of.end() || cit->second.size() != want.size()) {
+      return false;
+    }
+    std::unordered_set<onnx::NodeProto*> got(cit->second.begin(),
+                                             cit->second.end());
+    for (onnx::NodeProto* w : want) {
+      if (!got.count(w)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!consumer_set_is(q_in, {node, q_split}) ||
+      !consumer_set_is(k_in, {node, k_split})) {
+    return std::nullopt;
+  }
+
+  auto q_bnsh = MatchBnshReshape(q_in, init_map, consumers_of, graph_outputs,
+                                 node_by_output);
+  auto k_bnsh = MatchBnshReshape(k_in, init_map, consumers_of, graph_outputs,
+                                 node_by_output);
+  const std::string q_pre_norm = q_bnsh ? q_bnsh->root : q_in;
+  const std::string k_pre_norm = k_bnsh ? k_bnsh->root : k_in;
+
+  auto [root_q, q_norm_nodes, q_reshape_shape] = WalkBackThroughQkNorm(
+      q_pre_norm, init_map, consumers_of, graph_outputs, node_by_output);
+  auto [root_k, k_norm_nodes, k_reshape_shape] = WalkBackThroughQkNorm(
+      k_pre_norm, init_map, consumers_of, graph_outputs, node_by_output);
+
+  GemmaRopePairMatch out;
+  out.root_q = root_q;
+  out.root_k = root_k;
+  out.q_hop.nodes.push_back(node);
+  if (q_reverse) {
+    out.q_hop.nodes.insert(out.q_hop.nodes.end(), q_reverse->nodes.begin(),
+                           q_reverse->nodes.end());
+  }
+  out.q_hop.nodes.insert(out.q_hop.nodes.end(), q_rotate_half->begin(),
+                         q_rotate_half->end());
+  if (q_bnsh) {
+    out.q_hop.nodes.insert(out.q_hop.nodes.end(), q_bnsh->nodes.begin(),
+                           q_bnsh->nodes.end());
+  }
+  out.q_hop.nodes.insert(out.q_hop.nodes.end(), q_norm_nodes.begin(),
+                         q_norm_nodes.end());
+  out.q_hop.reshape_shape = q_reshape_shape;
+  out.q_hop.bnsh_reshape_shape = q_bnsh ? q_bnsh->reshape_shape : std::nullopt;
+  out.q_hop.output_reshape_shape =
+      q_reverse ? q_reverse->reshape_shape : std::nullopt;
+
+  // `node` itself only sits in `q_hop.nodes` above (a jointly-consumed node
+  // can't be listed in both without double-counting it in stale-value_info
+  // bookkeeping) -- `k_pre` (this node's own OTHER output) is marked stale
+  // via `extra_stale_outputs` instead. `k_name` itself is already covered by
+  // `k_reverse`'s own trailing `Reshape` when the reverse hop was crossed,
+  // or is `k_pre` verbatim when it wasn't.
+  if (k_reverse) {
+    out.k_hop.nodes.insert(out.k_hop.nodes.end(), k_reverse->nodes.begin(),
+                           k_reverse->nodes.end());
+  }
+  out.k_hop.nodes.insert(out.k_hop.nodes.end(), k_rotate_half->begin(),
+                         k_rotate_half->end());
+  if (k_bnsh) {
+    out.k_hop.nodes.insert(out.k_hop.nodes.end(), k_bnsh->nodes.begin(),
+                           k_bnsh->nodes.end());
+  }
+  out.k_hop.nodes.insert(out.k_hop.nodes.end(), k_norm_nodes.begin(),
+                         k_norm_nodes.end());
+  out.k_hop.reshape_shape = k_reshape_shape;
+  out.k_hop.bnsh_reshape_shape = k_bnsh ? k_bnsh->reshape_shape : std::nullopt;
+  out.k_hop.output_reshape_shape =
+      k_reverse ? k_reverse->reshape_shape : std::nullopt;
+  out.k_hop.extra_stale_outputs = {k_pre};
+  return out;
+}
+
+// Deferred correctness check for a WalkBackThroughQkNormRope/
+// WalkBackThroughGemmaRopePair result, run only once `branch_width` (this
+// branch's own pre-pruning nq/nk) and `head_size` are themselves known --
+// mirrors pruning.py's own `_qk_norm_rope_hop_is_consistent` exactly. `true`
+// (nothing to check) when `hop` is `nullopt`.
+bool QkNormRopeHopIsConsistent(const std::optional<QkNormRopePassThrough>& hop,
+                               const InitMap& init_map, int64_t branch_width,
+                               int64_t head_size) {
+  if (!hop) {
+    return true;
+  }
+  for (onnx::NodeProto* node : hop->nodes) {
+    if (node->op_type() == "SimplifiedLayerNormalization") {
+      auto it = init_map.find(node->input(1));
+      if (it == init_map.end() || it->second->dims_size() != 1 ||
+          it->second->dims(0) != head_size) {
+        return false;
+      }
+    }
+  }
+  if (hop->reshape_shape) {
+    auto it = init_map.find(*hop->reshape_shape);
+    if (it == init_map.end()) {
+      return false;
+    }
+    std::vector<int64_t> dims = ReadInt64Tensor(*it->second);
+    if (dims.empty() || dims.back() != branch_width) {
+      return false;
+    }
+  }
+  if (hop->bnsh_reshape_shape) {
+    if (head_size <= 0 || branch_width % head_size != 0) {
+      return false;
+    }
+    auto it = init_map.find(*hop->bnsh_reshape_shape);
+    if (it == init_map.end()) {
+      return false;
+    }
+    std::vector<int64_t> dims = ReadInt64Tensor(*it->second);
+    if (dims.size() != 4 || dims[dims.size() - 2] != branch_width / head_size) {
+      return false;
+    }
+  }
+  if (hop->output_reshape_shape) {
+    auto it = init_map.find(*hop->output_reshape_shape);
+    if (it == init_map.end()) {
+      return false;
+    }
+    std::vector<int64_t> dims = ReadInt64Tensor(*it->second);
+    if (dims.empty() || dims.back() != branch_width) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Shared body for FindGqaChains/FindOnnxAttentionChains/FindMhaChains/
@@ -6376,24 +7355,118 @@ std::vector<AttnChain> FindSeparateQkvChains(
     if (q_name == k_name || q_name == v_name || k_name == v_name) {
       continue;  // Degenerate -- can't independently slice a shared producer.
     }
-    if (!is_internal(q_name) || !is_internal(k_name) || !is_internal(v_name)) {
-      continue;
+
+    // A shared upstream `Split` node producing all three -- the
+    // packed-QKV-then-Split shape (MatchPackedQkvSplit) -- is checked first
+    // and handled exclusively: a `Split` node can never itself match
+    // MatchProducerAnyFloat below (it isn't a MatMul/vanilla-Gemm), so
+    // falling through to the per-branch loop for it would just decline the
+    // same node three times over. Every other shape (three genuinely
+    // independent producers, or anything this function doesn't recognize)
+    // falls to that per-branch loop unchanged. Mirrors pruning.py's own
+    // `_find_separate_qkv_chains` packed-QKV branch exactly.
+    //
+    // `root_q`/`root_k` walk *backward* from Q's/K's own attention-op input
+    // through an optional per-head norm + RoPE pass-through
+    // (WalkBackThroughQkNormRope/WalkBackThroughGemmaRopePair) before
+    // checking for the shared `Split` -- `q_name`/`k_name` unchanged (and
+    // both hops `nullopt`) whenever neither is present, so this is a strict
+    // superset of the pre-existing "`Split` feeds the attention op directly"
+    // check, not a behavior change for any graph that already matched. V
+    // never gets this treatment -- neither hop ever touches V's own branch
+    // -- so `v_name` is still compared against the `Split`'s own third
+    // output verbatim, exactly as before.
+    std::optional<std::string> packed_split_sizes;
+    std::optional<QkNormRopePassThrough> q_norm_rope, k_norm_rope;
+
+    std::string root_q = q_name;
+    std::string root_k = k_name;
+    std::optional<QkNormRopePassThrough> q_hop, k_hop;
+    bool matched_gemma_pair = false;
+    if (is_internal(q_name) && is_internal(k_name)) {
+      auto gemma_pair =
+          WalkBackThroughGemmaRopePair(q_name, k_name, init_map, consumers_of,
+                                       graph_outputs, node_by_output);
+      if (gemma_pair) {
+        root_q = gemma_pair->root_q;
+        root_k = gemma_pair->root_k;
+        q_hop = std::move(gemma_pair->q_hop);
+        k_hop = std::move(gemma_pair->k_hop);
+        matched_gemma_pair = true;
+      }
     }
-    auto qit = node_by_output.find(q_name);
-    auto kit = node_by_output.find(k_name);
-    auto vit = node_by_output.find(v_name);
-    if (qit == node_by_output.end() || kit == node_by_output.end() ||
-        vit == node_by_output.end()) {
-      continue;
+    if (!matched_gemma_pair) {
+      if (is_internal(q_name)) {
+        auto [rq, qh] = WalkBackThroughQkNormRope(
+            q_name, init_map, consumers_of, graph_outputs, node_by_output);
+        root_q = rq;
+        q_hop = std::move(qh);
+      }
+      if (is_internal(k_name)) {
+        auto [rk, kh] = WalkBackThroughQkNormRope(
+            k_name, init_map, consumers_of, graph_outputs, node_by_output);
+        root_k = rk;
+        k_hop = std::move(kh);
+      }
     }
-    auto pq = MatchProducerAnyFloat(*qit->second, init_map);
-    auto pk = MatchProducerAnyFloat(*kit->second, init_map);
-    auto pv = MatchProducerAnyFloat(*vit->second, init_map);
-    if (!pq || !pk || !pv) {
-      continue;
+
+    auto internal_producer = [&](const std::string& n) -> onnx::NodeProto* {
+      if (!is_internal(n)) {
+        return nullptr;
+      }
+      auto it = node_by_output.find(n);
+      return it == node_by_output.end() ? nullptr : it->second;
+    };
+    onnx::NodeProto* prod_q = internal_producer(root_q);
+    onnx::NodeProto* prod_k = internal_producer(root_k);
+    onnx::NodeProto* prod_v = internal_producer(v_name);
+
+    std::optional<ProducerMatch> pq, pk, pv;
+    bool matched_packed = false;
+    if (prod_q != nullptr && prod_q == prod_k && prod_q == prod_v &&
+        prod_q->domain() == "" && prod_q->op_type() == "Split" &&
+        prod_q->output_size() == 3 && prod_q->output(0) == root_q &&
+        prod_q->output(1) == root_k && prod_q->output(2) == v_name) {
+      auto packed =
+          MatchPackedQkvSplit(*prod_q, init_map, consumers_of, node_by_output);
+      if (!packed) {
+        continue;
+      }
+      pq = ProducerMatch{packed->weight, packed->weight_transposed,
+                         packed->bias, packed->nq};
+      pk = ProducerMatch{packed->weight, packed->weight_transposed,
+                         packed->bias, packed->nk};
+      pv = ProducerMatch{packed->weight, packed->weight_transposed,
+                         packed->bias, packed->nv};
+      packed_split_sizes = packed->split_sizes_name;
+      q_norm_rope = std::move(q_hop);
+      k_norm_rope = std::move(k_hop);
+      matched_packed = true;
+    } else {
+      if (!is_internal(q_name) || !is_internal(k_name) ||
+          !is_internal(v_name)) {
+        continue;
+      }
+      auto qit = node_by_output.find(q_name);
+      auto kit = node_by_output.find(k_name);
+      auto vit = node_by_output.find(v_name);
+      if (qit == node_by_output.end() || kit == node_by_output.end() ||
+          vit == node_by_output.end()) {
+        continue;
+      }
+      pq = MatchProducerAnyFloat(*qit->second, init_map);
+      pk = MatchProducerAnyFloat(*kit->second, init_map);
+      pv = MatchProducerAnyFloat(*vit->second, init_map);
+      if (!pq || !pk || !pv) {
+        continue;
+      }
     }
-    if (pq->weight == pk->weight || pq->weight == pv->weight ||
-        pk->weight == pv->weight || pq->n_channels % info->num_heads != 0 ||
+    if (!matched_packed &&
+        (pq->weight == pk->weight || pq->weight == pv->weight ||
+         pk->weight == pv->weight)) {
+      continue;  // Degenerate -- can't independently slice a shared producer.
+    }
+    if (pq->n_channels % info->num_heads != 0 ||
         pk->n_channels % info->kv_num_heads != 0 ||
         pv->n_channels % info->kv_num_heads != 0) {
       continue;
@@ -6416,6 +7489,16 @@ std::vector<AttnChain> FindSeparateQkvChains(
       // head_size when the caller passes `allow_differing_v_head_size=true`
       // (FindOnnxAttentionChains) -- every other op family declines this
       // composition rather than mis-slicing it.
+      continue;
+    }
+
+    // Deferred correctness check for any Q/K-norm + RoPE pass-through
+    // crossed above -- mirrors pruning.py's own
+    // `_qk_norm_rope_hop_is_consistent` call exactly.
+    if (!(QkNormRopeHopIsConsistent(q_norm_rope, init_map, pq->n_channels,
+                                    head_size) &&
+          QkNormRopeHopIsConsistent(k_norm_rope, init_map, pk->n_channels,
+                                    head_size))) {
       continue;
     }
 
@@ -6512,6 +7595,9 @@ std::vector<AttnChain> FindSeparateQkvChains(
     chain.consumer_weight_transposed = consumer->weight_transposed;
     chain.num_heads_attr = num_heads_attr;
     chain.mha_bias = mha_bias;
+    chain.packed_split_sizes = packed_split_sizes;
+    chain.q_norm_rope = std::move(q_norm_rope);
+    chain.k_norm_rope = std::move(k_norm_rope);
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -6630,9 +7716,38 @@ std::vector<AttnChain> FindPagedAttentionChains(onnx::GraphProto* graph) {
 // MatchLinearAttentionProducer's own comment. Its own query head-count
 // attribute is named `q_num_heads` (same as the plain ai.onnx `Attention`
 // op's own), no combined bias input.
+//
+// Performs the one deferred check MatchLinearAttentionProducer itself
+// cannot: a connected constant `decay` (index 4) must be exactly one of its
+// own two documented shapes -- `(*, *, kv_num_heads)` (DeltaNet/RetNet,
+// per-head scalar decay) or `(*, *, kv_num_heads * head_size)` (GLA/RWKV-6,
+// per-key-dimension decay) -- anything else declines the whole chain here,
+// mirroring pruning.py's own `_find_linear_attention_chains` exactly
+// (`head_size`, Q's/K's own shared per-head width, is resolved only here,
+// by FindSeparateQkvChains itself, not yet known at match time).
 std::vector<AttnChain> FindLinearAttentionChains(onnx::GraphProto* graph) {
-  return FindSeparateQkvChains(graph, MatchLinearAttentionProducer,
-                               "q_num_heads");
+  std::vector<AttnChain> chains =
+      FindSeparateQkvChains(graph, MatchLinearAttentionProducer, "q_num_heads");
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  std::vector<AttnChain> out;
+  out.reserve(chains.size());
+  for (auto& chain : chains) {
+    if (chain.node->input_size() > 4 && !chain.node->input(4).empty()) {
+      auto it = init_map.find(chain.node->input(4));
+      if (it != init_map.end() && it->second->dims_size() > 0) {
+        const int64_t last = it->second->dims(it->second->dims_size() - 1);
+        if (last != chain.kv_num_heads &&
+            last != chain.kv_num_heads * chain.head_size) {
+          continue;  // neither of decay's own two documented shapes
+        }
+      }
+    }
+    out.push_back(std::move(chain));
+  }
+  return out;
 }
 
 // The com.microsoft::SparseAttention analogue of FindGqaChains -- see
@@ -6908,6 +8023,17 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   const int64_t d = chain.head_size;
   const int64_t group_size = chain.num_heads / chain.kv_num_heads;
 
+  // Pre-pruning flat widths of Q's/K's own producer weight -- needed both by
+  // the packed-QKV branch below (a column-range view into, and later a
+  // combined-index slice of, one shared tensor whenever
+  // `chain.packed_split_sizes` is set) and, independently, by
+  // `chain.mha_bias`'s own combined-bias slice further down (a
+  // MultiHeadAttention-only, bias-only sharing that has nothing to do with
+  // whether the *weights* are packed). Mirrors pruning.py's own
+  // `_apply_one_gqa_chain` `nq_orig`/`nk_orig` exactly.
+  const int64_t nq_orig = chain.num_heads * d;
+  const int64_t nk_orig = chain.kv_num_heads * d;
+
   // SparseAttention-only (see MatchSparseAttentionProducer's own comment):
   // its own `block_row_indices` (index 5), already confirmed at match time
   // to be a constant whose leading dimension is `num_layout`, must still
@@ -6971,22 +8097,62 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // row count to K/V's own) those two feature dimensions need not match at
   // all. Mirrors pruning.py's own `_gqa_group_importance` doc comment
   // exactly for why the per-tensor importance loops below must each use
-  // their own tensor's row count rather than a single shared one.
-  const int64_t Kq = wq_dims[chain.q_weight_transposed ? 1 : 0];
-  const int64_t Kk = wk_dims[chain.k_weight_transposed ? 1 : 0];
-  const int64_t Kv = wv_dims[chain.v_weight_transposed ? 1 : 0];
-  const int64_t Nq = wq_dims[chain.q_weight_transposed ? 0 : 1];
-  const int64_t Nk = wk_dims[chain.k_weight_transposed ? 0 : 1];
-  const int64_t Nv = wv_dims[chain.v_weight_transposed ? 0 : 1];
-  std::vector<double> wq_kn = chain.q_weight_transposed
-                                  ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
+  // their own tensor's row count rather than a single shared one. Whenever
+  // `chain.packed_split_sizes` is set, Q/K/V all name the SAME underlying
+  // packed tensor (see the branch below), so `Kq == Kk == Kv` trivially --
+  // it's the ordinary, non-packed shape where the three genuinely differ.
+  int64_t Kq, Kk, Kv, Nq, Nk, Nv;
+  std::vector<double> wq_kn, wk_kn, wv_kn;
+  if (chain.packed_split_sizes) {
+    // `chain.q_weight`/`.k_weight`/`.v_weight` all name the *same*
+    // underlying packed tensor (`wq_init == wk_init == wv_init`), one
+    // contiguous `[K, Nq+Nk+Nv]` (or `[Nq+Nk+Nv, K]`, if
+    // `chain.q_weight_transposed`) storage split Q-then-K-then-V by column
+    // -- so `wq_kn`/`wk_kn`/`wv_kn` are column-range slices of that one
+    // `[K, N]` array, computed from the chain's own original (before this
+    // call's own pruning) head counts, rather than three independently
+    // stored arrays. Mirrors pruning.py's own `_apply_one_gqa_chain` packed
+    // branch, and this file's own `ApplyOneDecomposedGqaChain`'s identical
+    // packed branch, exactly.
+    const int64_t total_n = wq_dims[chain.q_weight_transposed ? 0 : 1];
+    const int64_t K = chain.q_weight_transposed ? wq_dims[1] : wq_dims[0];
+    const std::vector<double> w_kn =
+        chain.q_weight_transposed ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
                                   : wq;
-  std::vector<double> wk_kn = chain.k_weight_transposed
-                                  ? TransposeFlat(wk, wk_dims[0], wk_dims[1])
-                                  : wk;
-  std::vector<double> wv_kn = chain.v_weight_transposed
-                                  ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
-                                  : wv;
+    const int64_t nv_orig = total_n - nq_orig - nk_orig;
+    auto column_slice = [&](int64_t col_lo, int64_t width) {
+      std::vector<double> out(static_cast<size_t>(K * width));
+      for (int64_t r = 0; r < K; ++r) {
+        std::copy(w_kn.begin() + r * total_n + col_lo,
+                  w_kn.begin() + r * total_n + col_lo + width,
+                  out.begin() + r * width);
+      }
+      return out;
+    };
+    wq_kn = column_slice(0, nq_orig);
+    wk_kn = column_slice(nq_orig, nk_orig);
+    wv_kn = column_slice(nq_orig + nk_orig, nv_orig);
+    Kq = Kk = Kv = K;
+    Nq = nq_orig;
+    Nk = nk_orig;
+    Nv = nv_orig;
+  } else {
+    Kq = wq_dims[chain.q_weight_transposed ? 1 : 0];
+    Kk = wk_dims[chain.k_weight_transposed ? 1 : 0];
+    Kv = wv_dims[chain.v_weight_transposed ? 1 : 0];
+    Nq = wq_dims[chain.q_weight_transposed ? 0 : 1];
+    Nk = wk_dims[chain.k_weight_transposed ? 0 : 1];
+    Nv = wv_dims[chain.v_weight_transposed ? 0 : 1];
+    wq_kn = chain.q_weight_transposed
+                ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
+                : wq;
+    wk_kn = chain.k_weight_transposed
+                ? TransposeFlat(wk, wk_dims[0], wk_dims[1])
+                : wk;
+    wv_kn = chain.v_weight_transposed
+                ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
+                : wv;
+  }
 
   // Importance: per-*query*-head (true MQA -- mirrors pruning.py's own
   // `_gqa_query_head_importance`, ranking each query head by its own Q
@@ -7138,17 +8304,50 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // axis of a plain 2-D MatMul/Gemm producer weight, never a Conv here)
   // rather than the shared, FLOAT32-only SliceProducerWeight -- see this
   // function's own `wq`/`wk`/`wv` comment above for why.
-  SliceAxisGeneric(wq_init, q_idx, chain.q_weight_transposed ? 0 : 1);
-  SliceAxisGeneric(wk_init, kv_idx, chain.k_weight_transposed ? 0 : 1);
-  SliceAxisGeneric(wv_init, v_idx, chain.v_weight_transposed ? 0 : 1);
-  if (chain.q_bias) {
-    SliceAxisGeneric(init_map.at(*chain.q_bias), q_idx, 0);
-  }
-  if (chain.k_bias) {
-    SliceAxisGeneric(init_map.at(*chain.k_bias), kv_idx, 0);
-  }
-  if (chain.v_bias) {
-    SliceAxisGeneric(init_map.at(*chain.v_bias), v_idx, 0);
+  if (chain.packed_split_sizes) {
+    // One shared tensor: a single combined-column slice (Q's own range,
+    // then K's shifted by the *original* `nq_orig`, then V's shifted by
+    // `nq_orig + nk_orig`) rather than three independent SliceAxisGeneric
+    // calls, which would each invalidate the column offsets the other two
+    // still need to read from the same underlying storage. `v_idx`
+    // (V's own `dv`-width, not `kv_idx`'s `d`-width) is the correct index
+    // set for V's own range here too, exactly as the non-packed branch
+    // below uses it -- packed-QKV composes with `allow_differing_v_head_size`
+    // the same way the ordinary three-independent-producer shape does.
+    // Mirrors pruning.py's own `_apply_one_gqa_chain` packed branch, and
+    // this file's own `ApplyOneDecomposedGqaChain`'s identical packed
+    // branch, exactly.
+    std::vector<int64_t> full_idx;
+    full_idx.reserve(q_idx.size() + kv_idx.size() + v_idx.size());
+    full_idx.insert(full_idx.end(), q_idx.begin(), q_idx.end());
+    for (int64_t x : kv_idx) {
+      full_idx.push_back(x + nq_orig);
+    }
+    for (int64_t x : v_idx) {
+      full_idx.push_back(x + nq_orig + nk_orig);
+    }
+    SliceAxisGeneric(wq_init, full_idx, chain.q_weight_transposed ? 0 : 1);
+    if (chain.q_bias) {
+      SliceAxisGeneric(init_map.at(*chain.q_bias), full_idx, 0);
+    }
+    onnx::TensorProto* sizes_init = init_map.at(*chain.packed_split_sizes);
+    SetInt64TensorData(sizes_init, {3},
+                       {static_cast<int64_t>(q_idx.size()),
+                        static_cast<int64_t>(kv_idx.size()),
+                        static_cast<int64_t>(v_idx.size())});
+  } else {
+    SliceAxisGeneric(wq_init, q_idx, chain.q_weight_transposed ? 0 : 1);
+    SliceAxisGeneric(wk_init, kv_idx, chain.k_weight_transposed ? 0 : 1);
+    SliceAxisGeneric(wv_init, v_idx, chain.v_weight_transposed ? 0 : 1);
+    if (chain.q_bias) {
+      SliceAxisGeneric(init_map.at(*chain.q_bias), q_idx, 0);
+    }
+    if (chain.k_bias) {
+      SliceAxisGeneric(init_map.at(*chain.k_bias), kv_idx, 0);
+    }
+    if (chain.v_bias) {
+      SliceAxisGeneric(init_map.at(*chain.v_bias), v_idx, 0);
+    }
   }
 
   // MultiHeadAttention/PackedMultiHeadAttention/
@@ -7165,8 +8364,6 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // port, so `dv == d` in practice here, but this stays correct if that
   // scope ever widens.
   if (chain.mha_bias) {
-    const int64_t nq_orig = chain.num_heads * d;
-    const int64_t nk_orig = chain.kv_num_heads * d;
     std::vector<int64_t> full_bias_idx;
     full_bias_idx.reserve(q_idx.size() + kv_idx.size() + v_idx.size());
     full_bias_idx.insert(full_bias_idx.end(), q_idx.begin(), q_idx.end());
@@ -7291,6 +8488,59 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     }
   }
 
+  // LinearAttention-only: its own `past_state`/`decay`/`beta` (indices
+  // 3/4/5), each already confirmed sliceable at match time
+  // (MatchLinearAttentionProducer/FindLinearAttentionChains -- see either's
+  // own comment for the full shape reasoning), sliced here exactly mirroring
+  // pruning.py's own `_apply_one_gqa_chain` `is_linear_attention` branch:
+  // `past_state` (rank-4 `(B, kv_num_heads, d_k, d_v)`) along its own axis 1
+  // by `keep_groups`; `decay` (rank-3) along its own last axis -- directly
+  // by `keep_groups` when `kv_num_heads`-wide (DeltaNet/RetNet, per-head
+  // scalar), or by the same per-head *column* expansion K's own producer
+  // weight gets (HeadColumnIndices) when `kv_num_heads * head_size`-wide
+  // (GLA/RWKV-6, per-key-dimension); and `beta` (rank-3) along its own last
+  // axis by `keep_groups`, only when genuinely `kv_num_heads`-wide (a size-1
+  // broadcast needs no slicing at all, the same "PER_TENSOR broadcast, left
+  // alone" reasoning as k_scale/v_scale above). A
+  // `com.microsoft::LinearAttentionGate`-fed dynamic `decay`/`beta`
+  // pass-through (pruning.py's own further upgrade, ranked/sliced through
+  // `chain.linear_attention_gate` there) is NOT ported here --
+  // MatchLinearAttentionProducer already declines that shape outright (see
+  // that function's own comment for the documented scope boundary), so it
+  // never reaches this branch.
+  const bool is_linear_attention = chain.node->domain().empty() &&
+                                   chain.node->op_type() == "LinearAttention";
+  if (is_linear_attention) {
+    if (chain.node->input_size() > 3 && !chain.node->input(3).empty()) {
+      auto it = init_map.find(chain.node->input(3));
+      if (it != init_map.end()) {
+        SliceAxisGeneric(it->second, keep_groups, 1);
+      }
+    }
+    if (chain.node->input_size() > 4 && !chain.node->input(4).empty()) {
+      auto it = init_map.find(chain.node->input(4));
+      if (it != init_map.end()) {
+        const int64_t last_axis = it->second->dims_size() - 1;
+        const int64_t last = it->second->dims(last_axis);
+        if (last == h) {
+          SliceAxisGeneric(it->second, keep_groups, last_axis);
+        } else if (last == h * d) {
+          SliceAxisGeneric(it->second, HeadColumnIndices(keep_groups, d),
+                           last_axis);
+        }
+      }
+    }
+    if (chain.node->input_size() > 5 && !chain.node->input(5).empty()) {
+      auto it = init_map.find(chain.node->input(5));
+      if (it != init_map.end()) {
+        const int64_t last_axis = it->second->dims_size() - 1;
+        if (it->second->dims(last_axis) == h) {
+          SliceAxisGeneric(it->second, keep_groups, last_axis);
+        }
+      }
+    }
+  }
+
   const int64_t new_kv_num_heads = keep_count;
   // `keep_q_heads.size()` rather than `keep_count * group_size`: identical
   // for the ordinary group-pruning path (`keep_q_heads` is built there as
@@ -7322,6 +8572,49 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
       // targets is V-hidden-size-wide (mirrors pruning.py's own
       // `dims[-1] = new_num_heads * dv`).
       SetInt64TensorLastDim(init_map.at(*co.shape_name), new_num_heads * dv);
+    }
+  }
+
+  // Q's/K's own per-head norm + RoPE pass-through, if either branch crossed
+  // one (QkNormRopePassThrough) -- mirrors pruning.py's own
+  // `_apply_one_gqa_chain` handling of `chain.q_norm_rope`/`.k_norm_rope`
+  // exactly: neither a crossed norm's own `scale` nor a crossed
+  // `RotaryEmbedding`'s `cos_cache`/`sin_cache` ever needs touching (both
+  // confirmed head-independent) -- only a crossed `RotaryEmbedding`/
+  // `MRotaryEmbedding`'s own `num_heads` attribute (when not already the
+  // schema's self-adjusting `0`), a crossed post-norm `Reshape`'s own
+  // target-width entry, and (`GemmaRotaryEmbedding`-only) a crossed BNSH
+  // `Reshape`'s own second-to-last `num_heads` entry / a crossed reverse
+  // BNSH `Reshape`'s own target-width entry ever do. `new_branch_heads`/
+  // `new_branch_width` are Q's own post-pruning `num_heads`/flat width for
+  // `.q_norm_rope`, K's own post-pruning `kv_num_heads`/flat width (K's own
+  // head_size equals Q's/K's shared `d`) for `.k_norm_rope`.
+  for (auto* hop_pair : {&chain.q_norm_rope, &chain.k_norm_rope}) {
+    if (!*hop_pair) {
+      continue;
+    }
+    const bool is_q_hop = hop_pair == &chain.q_norm_rope;
+    const int64_t new_branch_heads =
+        is_q_hop ? new_num_heads : new_kv_num_heads;
+    const int64_t new_branch_width = new_branch_heads * d;
+    QkNormRopePassThrough& hop = **hop_pair;
+    if (hop.rotary_node != nullptr) {
+      for (auto& attr : *hop.rotary_node->mutable_attribute()) {
+        if (attr.name() == "num_heads" && attr.i() != 0) {
+          attr.set_i(new_branch_heads);
+        }
+      }
+    }
+    if (hop.reshape_shape) {
+      SetInt64TensorLastDim(init_map.at(*hop.reshape_shape), new_branch_width);
+    }
+    if (hop.bnsh_reshape_shape) {
+      SetInt64TensorSecondToLastDim(init_map.at(*hop.bnsh_reshape_shape),
+                                    new_branch_heads);
+    }
+    if (hop.output_reshape_shape) {
+      SetInt64TensorLastDim(init_map.at(*hop.output_reshape_shape),
+                            new_branch_width);
     }
   }
 
@@ -7415,6 +8708,19 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   out.stale.insert(chain.node->output(0));
   for (const auto& co : chain.chain_ops) {
     out.stale.insert(co.node->output(0));
+  }
+  for (const auto* hop_pair : {&chain.q_norm_rope, &chain.k_norm_rope}) {
+    if (!*hop_pair) {
+      continue;
+    }
+    for (onnx::NodeProto* n : (*hop_pair)->nodes) {
+      if (n->output_size() > 0 && !n->output(0).empty()) {
+        out.stale.insert(n->output(0));
+      }
+    }
+    for (const std::string& extra : (*hop_pair)->extra_stale_outputs) {
+      out.stale.insert(extra);
+    }
   }
   return out;
 }
@@ -24323,90 +25629,6 @@ bool EinsumEquationIsBatchedMatmul(const std::string& equation,
   return rhs.substr(rank - 2) == std::string(1, free1) + free2;
 }
 
-// A packed-QKV-then-`Split` producer -- Q's/K's/V's own raw projection
-// output all trace back to ONE combined MatMul/vanilla-Gemm projection
-// (optionally biased) whose wide `[..., nq+nk+nv]` output is split, by a
-// plain `Split(axis=-1)` node, into exactly three column ranges in
-// Q-then-K-then-V order. Mirrors pruning.py's own `_match_packed_qkv_split`
-// exactly -- see that function's own docstring for the real
-// onnxruntime-genai-model-builder export shape this was confirmed against.
-struct PackedQkvSplitMatch {
-  std::string weight;
-  bool weight_transposed = false;
-  std::optional<std::string> bias;
-  int64_t nq = 0, nk = 0, nv = 0;
-  std::string split_sizes_name;
-};
-
-std::optional<PackedQkvSplitMatch> MatchPackedQkvSplit(
-    const onnx::NodeProto& split_node, const InitMap& init_map,
-    const ConsumerMap& consumers_of,
-    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
-  if (split_node.domain() != "" || split_node.op_type() != "Split") {
-    return std::nullopt;
-  }
-  if (split_node.output_size() != 3 || split_node.input_size() != 2) {
-    return std::nullopt;
-  }
-  if (split_node.input(0).empty() || split_node.input(1).empty()) {
-    return std::nullopt;
-  }
-
-  int64_t axis = 0;
-  bool has_axis = false;
-  for (const auto& attr : split_node.attribute()) {
-    if (attr.name() == "axis") {
-      axis = attr.i();
-      has_axis = true;
-    }
-  }
-  if (!has_axis || axis != -1) {
-    return std::nullopt;
-  }
-
-  const std::string& sizes_name = split_node.input(1);
-  auto sit = init_map.find(sizes_name);
-  if (sit == init_map.end() ||
-      sit->second->data_type() != onnx::TensorProto::INT64 ||
-      sit->second->dims_size() != 1 || sit->second->dims(0) != 3) {
-    return std::nullopt;
-  }
-  if (ConsumerCount(consumers_of, sizes_name) != 1) {
-    return std::nullopt;  // shared split-sizes constant -- can't overwrite.
-  }
-  std::vector<int64_t> sizes = ReadInt64Tensor(*sit->second);
-  if (sizes.size() != 3) {
-    return std::nullopt;
-  }
-  const int64_t nq = sizes[0], nk = sizes[1], nv = sizes[2];
-  if (nq <= 0 || nk <= 0 || nv <= 0) {
-    return std::nullopt;
-  }
-
-  const std::string& data_name = split_node.input(0);
-  if (ConsumerCount(consumers_of, data_name) != 1) {
-    return std::nullopt;  // shared packed-projection output -- can't rewrite.
-  }
-  auto pit = node_by_output.find(data_name);
-  if (pit == node_by_output.end()) {
-    return std::nullopt;
-  }
-  auto pinfo = MatchProducerAnyFloat(*pit->second, init_map);
-  if (!pinfo || pinfo->n_channels != nq + nk + nv) {
-    return std::nullopt;
-  }
-
-  PackedQkvSplitMatch m;
-  m.weight = pinfo->weight;
-  m.weight_transposed = pinfo->weight_transposed;
-  m.bias = pinfo->bias;
-  m.nq = nq;
-  m.nk = nk;
-  m.nv = nv;
-  m.split_sizes_name = sizes_name;
-  return m;
-}
-
 // Resolves `split_node` -- already confirmed by the caller to be the single
 // shared producer of Q's/K's/V's own raw (pre-reshape) projection outputs --
 // as this module's own packed-QKV producer (MatchPackedQkvSplit's own
@@ -25110,10 +26332,14 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     onnx::GraphProto* graph,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  InitMap init_map;
-  for (const auto& t : graph->initializer()) {
-    init_map[t.name()] = &t;
-  }
+  // BuildConstantMap (not a plain `graph.initializer()` loop) -- see that
+  // function's own comment: a real `torch.onnx.export` + `simplify()`
+  // pipeline's `Reshape`/`Unsqueeze`/`Expand` shape operands below are
+  // routinely `Constant`-node-fed rather than genuine `graph.initializer`
+  // entries, and every lookup in this function needs to see those too.
+  // Mirrors pruning.py's own `_find_decomposed_gqa_chains`'s identical
+  // `initializer_map = _constant_map(graph)`.
+  InitMap init_map = BuildConstantMap(*graph);
   ConsumerMap consumers_of = ConsumersOf(graph);
   std::unordered_set<std::string> graph_outputs;
   for (const auto& o : graph->output()) {
@@ -26179,11 +27405,17 @@ void ApplyDecomposedGqaChains(
     double epsilon = 1e-8, ImportanceNorm importance_norm = ImportanceNorm::kL2,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  std::unordered_map<std::string, onnx::TensorProto*> init_map;
-  for (int i = 0; i < graph->initializer_size(); ++i) {
-    onnx::TensorProto* t = graph->mutable_initializer(i);
-    init_map[t->name()] = t;
-  }
+  // BuildMutableConstantMap (not a plain `graph->initializer()` loop) -- see
+  // that function's own comment, and `FindDecomposedGqaChains`'s own
+  // identical `BuildConstantMap` call above: `ApplyOneDecomposedGqaChain`'s
+  // own `rewrite_shape_dim` local helper below resolves/edits exactly the
+  // same `Reshape`/`Expand` shape operands `FindDecomposedGqaChains` already
+  // matched, which on a real `torch.onnx.export` + `simplify()` pipeline are
+  // routinely `Constant`-node-fed rather than genuine `graph->initializer()`
+  // entries. Mirrors pruning.py's own shared apply-dispatch's identical
+  // `initializer_map = _constant_map(graph)`.
+  std::unordered_map<std::string, onnx::TensorProto*> init_map =
+      BuildMutableConstantMap(graph);
   std::unordered_set<std::string> used_names = ExistingGraphNames(*graph);
   std::unordered_set<std::string> producer_touched, consumer_touched,
       stale_value_info;

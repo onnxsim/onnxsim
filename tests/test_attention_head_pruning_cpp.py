@@ -104,6 +104,8 @@ fused-op family, has no optional per-head bias/mask/past-KV input on its own
 schema at all, so none of this machinery applies to it.
 """
 
+import io
+
 import ml_dtypes
 import numpy as np
 import onnx
@@ -1279,6 +1281,852 @@ def test_cpp_gqa_pruning_cross_attention_matches_oracle_exactly():
     # must still change the output.
     (y_pruned2,) = _run(pruned_cpp, {"Xdec": xdec, "Xenc": xenc + 1.0})
     assert not np.allclose(y_pruned, y_pruned2)
+
+
+# --- Packed-QKV-then-Split + RoPE/QK-norm walk-back (GroupQueryAttention/ ---
+# --- plain ai.onnx::Attention) -- FindSeparateQkvChains's own new
+# --- WalkBackThroughQkNormRope/WalkBackThroughGemmaRopePair machinery,
+# --- mirroring pruning.py's own `_walk_back_through_qk_norm_rope`/
+# --- `_walk_back_through_gemma_rope_pair` exactly -------------------------
+#
+# A single packed MatMul/Gemm projection feeding a `Split` whose three
+# outputs feed the fused attention op's own three separate query/key/value
+# inputs, optionally through an intervening per-head `SimplifiedLayerNorm`
+# sandwich and/or `RotaryEmbedding`/`MRotaryEmbedding`/`GemmaRotaryEmbedding`
+# hop on Q's/K's own branch -- see MatchPackedQkvSplit's/
+# WalkBackThroughQkNormRope's/WalkBackThroughGemmaRopePair's own comments in
+# structured_pruning_entry.cpp for the exact topology and the real
+# onnxruntime-genai model-builder export shape this was confirmed against.
+# Every test below verifies byte-for-byte parity against the (still
+# pure-Python, unaliased) `apply_attention_head_pruning` reference -- the
+# same bar `test_cpp_decomposed_packed_qkv_pruning_matches_python_reference_
+# exactly` above already holds the decomposed-attention family's own packed
+# producer to.
+
+
+def _gqa_packed_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    bias=False,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    qkv_op = "MatMul(X, Wqkv)"
+    if bias:
+        if bqkv is None:
+            bqkv = rng.standard_normal((Nq + 2 * Nkv,)).astype(np.float32)
+        initializer.append(_f32(bqkv, "Bqkv"))
+        qkv_op = "Gemm(X, Wqkv, Bqkv)"
+
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = {qkv_op}
+          q, k, v = Split <axis = -1> (qkv, SplitSizes)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_split_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=301)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * (H // KVH)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, H // KVH)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    expected_wqkv = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    np.testing.assert_array_equal(inits["Wqkv"], expected_wqkv)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+
+def test_cpp_gqa_packed_qkv_split_pruning_slices_packed_bias():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=302, bias=True)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv, bqkv = cfg["wqkv"], cfg["bqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+    bq, bk, bv = bqkv[:Nq], bqkv[Nq : Nq + Nkv], bqkv[Nq + Nkv :]
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, H // KVH)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    expected_bqkv = np.concatenate([bq[q_idx], bk[kv_idx], bv[kv_idx]])
+    np.testing.assert_array_equal(inits["Bqkv"], expected_bqkv)
+
+
+def _qk_norm_rope_body(
+    prefix,
+    raw_name,
+    gamma_name,
+    reshape1_shape_name,
+    reshape2_shape_name,
+    with_norm,
+    with_rope,
+    cos_name="CosCache",
+    sin_name="SinCache",
+    pos_name="PosIds",
+    interleaved=0,
+    rotary_embedding_dim=0,
+    rotary_num_heads=None,
+):
+    lines = []
+    cur = raw_name
+    if with_norm:
+        lines.append(f"{prefix}_r1 = Reshape({cur}, {reshape1_shape_name})")
+        lines.append(
+            f"{prefix}_ln = SimplifiedLayerNormalization <axis=-1, epsilon=1e-6> "
+            f"({prefix}_r1, {gamma_name})"
+        )
+        lines.append(f"{prefix}_normed = Reshape({prefix}_ln, {reshape2_shape_name})")
+        cur = f"{prefix}_normed"
+    if with_rope:
+        nh = rotary_num_heads if rotary_num_heads is not None else 0
+        lines.append(
+            f"{prefix}_rot = com.microsoft.RotaryEmbedding "
+            f"<num_heads={nh}, interleaved={interleaved}, "
+            f"rotary_embedding_dim={rotary_embedding_dim}> "
+            f"({cur}, {pos_name}, {cos_name}, {sin_name})"
+        )
+        cur = f"{prefix}_rot"
+    return "\n          ".join(lines), cur
+
+
+def _gqa_qk_norm_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    with_norm=True,
+    with_rope=True,
+    interleaved=0,
+    rotary_embedding_dim=0,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+    wqkv=None,
+    wout=None,
+    q_gamma=None,
+    k_gamma=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    half = D // 2
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+    initializer += [_f32(cos, "CosCache"), _f32(sin, "SinCache")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+    if q_gamma is None:
+        q_gamma = rng.standard_normal((D,)).astype(np.float32)
+    if k_gamma is None:
+        k_gamma = rng.standard_normal((D,)).astype(np.float32)
+    initializer += [_f32(q_gamma, "QGamma"), _f32(k_gamma, "KGamma")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, D], dtype=np.int64), "QReshape1Shape"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nq], dtype=np.int64), "QReshape2Shape"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, D], dtype=np.int64), "KReshape1Shape"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshape2Shape"
+        )
+    )
+
+    rope_kwargs = dict(
+        interleaved=interleaved, rotary_embedding_dim=rotary_embedding_dim
+    )
+    q_text, q_body = _qk_norm_rope_body(
+        "q",
+        "q_raw",
+        "QGamma",
+        "QReshape1Shape",
+        "QReshape2Shape",
+        with_norm,
+        with_rope,
+        rotary_num_heads=q_rotary_num_heads,
+        **rope_kwargs,
+    )
+    k_text, k_body = _qk_norm_rope_body(
+        "k",
+        "k_raw",
+        "KGamma",
+        "KReshape1Shape",
+        "KReshape2Shape",
+        with_norm,
+        with_rope,
+        rotary_num_heads=k_rotary_num_heads,
+        **rope_kwargs,
+    )
+    hop_body = q_text + "\n          " + k_text
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          {hop_body}
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({q_body}, {k_body}, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_qk_norm_rope_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=303,
+        with_norm=True,
+        with_rope=True,
+        interleaved=1,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    # No onnx.checker.check_model here -- `SimplifiedLayerNormalization`
+    # registers under the default ("") domain but isn't in onnx's own
+    # schema registry at all (pruning.py's own "Attention-head pruning"
+    # section comment/`_norm_pass_through_const_names`'s own docstring),
+    # so the checker itself declines this exact op/domain combination
+    # regardless of this port's own correctness -- matching
+    # test_pruning.py's own `test_gqa_packed_qkv_qk_norm_rope_pruning_
+    # matches_oracle_exactly`, which likewise never calls the checker.
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * (H // KVH)
+    rotary_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+
+
+def test_cpp_gqa_packed_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=304,
+        with_norm=True,
+        with_rope=True,
+        q_rotary_num_heads=H,
+        k_rotary_num_heads=KVH,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    q_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0] == "q_normed"
+    )
+    k_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0] == "k_normed"
+    )
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == num_heads
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == kv_num_heads
+
+
+def test_cpp_gqa_packed_qkv_norm_only_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=305,
+        with_norm=True,
+        with_rope=False,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    # No onnx.checker.check_model here -- see the qk_norm_rope test above.
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_gqa_packed_qkv_rope_only_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=306,
+        with_norm=False,
+        with_rope=True,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def _gqa_mrope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    mrope_section=(2, 1, 1),
+    mrope_layout=0,
+    wqkv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    half = D // 2
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        p = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        position_ids = np.stack([p, p, p], axis=0)
+    initializer += [_f32(cos, "Cos"), _f32(sin, "Sin")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    q_nh = q_rotary_num_heads if q_rotary_num_heads is not None else H
+    k_nh = k_rotary_num_heads if k_rotary_num_heads is not None else KVH
+    section_str = "[" + ", ".join(str(s) for s in mrope_section) + "]"
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          q_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={q_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (q_raw, PosIds, Cos, Sin)
+          k_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={k_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (k_raw, PosIds, Cos, Sin)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_rot, k_rot, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_mrope_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=307)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_gqa_packed_qkv_mrope_pruning_updates_explicit_rotary_num_heads():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=308)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    q_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == num_heads
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == kv_num_heads
+
+
+def _gqa_gemma_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    wqkv=None,
+    wout=None,
+    emb=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    if emb is None:
+        emb = rng.standard_normal((batch, seq, D)).astype(np.float32)
+    initializer.append(_f32(emb, "Emb"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([D // 2, D // 2], dtype=np.int64), "HalfSizes"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, H, D], dtype=np.int64), "QReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, KVH, D], dtype=np.int64), "KReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array([0, -1, Nq], dtype=np.int64), "QReshapeB")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshapeB"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          q_bnsh_in = Reshape(q_raw, QReshapeA)
+          q_bnsh = Transpose <perm=[0,2,1,3]> (q_bnsh_in)
+          q_x1, q_x2 = Split <axis=-1> (q_bnsh, HalfSizes)
+          q_x2n = Neg(q_x2)
+          q_rot_in = Concat <axis=-1> (q_x2n, q_x1)
+          k_bnsh_in = Reshape(k_raw, KReshapeA)
+          k_bnsh = Transpose <perm=[0,2,1,3]> (k_bnsh_in)
+          k_x1, k_x2 = Split <axis=-1> (k_bnsh, HalfSizes)
+          k_x2n = Neg(k_x2)
+          k_rot_in = Concat <axis=-1> (k_x2n, k_x1)
+          q_embed, k_embed = com.microsoft.GemmaRotaryEmbedding (Emb, q_bnsh, q_rot_in, k_bnsh, k_rot_in)
+          q_flat_bnsh = Transpose <perm=[0,2,1,3]> (q_embed)
+          q_flat = Reshape(q_flat_bnsh, QReshapeB)
+          k_flat_bnsh = Transpose <perm=[0,2,1,3]> (k_embed)
+          k_flat = Reshape(k_flat_bnsh, KReshapeB)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_flat, k_flat, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_gemma_rope_pruning_matches_python_reference_exactly():
+    # `GemmaRotaryEmbedding` has no usable CPU kernel in this environment (see
+    # pruning.py's own "Attention-head pruning" section comment) -- so, unlike
+    # every other test in this section, this one is verified purely by
+    # byte-for-byte parity against the pure-Python reference rather than a
+    # real `InferenceSession` run (`test_gqa_packed_qkv_gemma_rope_pruning_
+    # matches_decomposed_oracle` in test_pruning.py already covers the
+    # decomposed-execution oracle check for the shared Python logic itself).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_gemma_rope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=309)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * (H // KVH)
+
+
+def _onnx_attention_packed_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    rope_domain="",
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+    wqkv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+
+    half = D // 2
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+    initializer += [_f32(cos, "CosCache"), _f32(sin, "SinCache")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+
+    qnh = q_rotary_num_heads if q_rotary_num_heads is not None else 0
+    knh = k_rotary_num_heads if k_rotary_num_heads is not None else 0
+    domain_prefix = f"{rope_domain}." if rope_domain else ""
+    opset_imports = {"": 24}
+    if rope_domain == "":
+        hop_body = (
+            f"q = {domain_prefix}RotaryEmbedding <num_heads={qnh}> "
+            f"(q_raw, CosCache, SinCache, PosIds)\n"
+            f"          k = {domain_prefix}RotaryEmbedding <num_heads={knh}> "
+            f"(k_raw, CosCache, SinCache, PosIds)"
+        )
+    else:
+        hop_body = (
+            f"q = {domain_prefix}RotaryEmbedding <num_heads={qnh}> "
+            f"(q_raw, PosIds, CosCache, SinCache)\n"
+            f"          k = {domain_prefix}RotaryEmbedding <num_heads={knh}> "
+            f"(k_raw, PosIds, CosCache, SinCache)"
+        )
+        opset_imports[rope_domain] = 1
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          {hop_body}
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    opset_import_text = (
+        "[" + ", ".join(f'"{d}": {v}' for d, v in opset_imports.items()) + "]"
+    )
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: {opset_import_text}
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _onnx_attention_node(model):
+    return next(
+        n for n in model.graph.node if n.domain == "" and n.op_type == "Attention"
+    )
+
+
+def _onnx_attention_attrs(node):
+    q_num_heads = next(a.i for a in node.attribute if a.name == "q_num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return q_num_heads, kv_num_heads
+
+
+def test_cpp_onnx_attention_packed_qkv_native_rotary_embedding_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=310,
+        rope_domain="",
+        q_rotary_num_heads=H,
+        k_rotary_num_heads=KVH,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(_onnx_attention_node(pruned_cpp))
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * (H // KVH)
+    rotary_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        assert n.domain == ""
+
+
+def test_cpp_onnx_attention_packed_qkv_contrib_rotary_embedding_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=311,
+        rope_domain="com.microsoft",
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(_onnx_attention_node(pruned_cpp))
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * (H // KVH)
+    rotary_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        assert n.domain == "com.microsoft"
 
 
 # --- True MQA (kv_num_heads == 1) fused GroupQueryAttention fast path ------
@@ -4327,11 +5175,18 @@ def test_cpp_paged_attention_pruning_constant_per_channel_kv_scale_sliced_matche
 
 # --- Plain ai.onnx::LinearAttention (opset 27+) -----------------------------
 #
-# This port only ever matches this op's stateless "linear" update_rule shape
-# (no `past_state`/`decay`/`beta` connected at all) -- see
-# MatchLinearAttentionProducer's own comment for why this narrower-than-
-# pruning.py scope gives up essentially nothing over the realistic export
-# shape pruning.py's own docstring already narrows *its* real-world scope to.
+# This op's own optional `past_state`/`decay`/`beta` (indices 3/4/5) are now
+# validated-and-sliced when constant -- mirroring pruning.py's own
+# `_match_linear_attention_producer`/`_apply_one_gqa_chain` exactly for the
+# "linear"/"delta"/"gated" update_rule shapes -- rather than a blanket
+# decline of the whole match whenever any of the three is connected at all.
+# Still narrower than pruning.py's own matcher in one respect: a *dynamic*
+# `decay`/`beta` still declines the whole match here outright rather than
+# being deferred to a recognized `com.microsoft::LinearAttentionGate`
+# pass-through the way pruning.py's own `_find_linear_attention_chains`
+# (via `_match_linear_attention_gate`) does -- see
+# MatchLinearAttentionProducer's own comment for the documented scope
+# boundary this narrowing keeps.
 
 
 def _linear_attention_model(
@@ -4344,7 +5199,10 @@ def _linear_attention_model(
     wk=None,
     wv=None,
     wo=None,
-    decay=None,  # constant array, or None (unconnected) -- forces a decline
+    decay=None,  # constant array, or None (unconnected)
+    past_state=None,  # constant array, or None (unconnected)
+    beta=None,  # constant array, or None (unconnected)
+    update_rule=None,  # defaults to "gated" (decay set) or "linear" otherwise
 ):
     rng = np.random.default_rng(seed)
     Nq, Nkv = Hq * D, Hkv * D
@@ -4359,10 +5217,23 @@ def _linear_attention_model(
 
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
     operands = ["q", "k", "v"]
-    if decay is not None:
-        operands.append("")  # past_state -- unconnected
-        initializer.append(_f32(np.asarray(decay), "Decay"))
-        operands.append("Decay")
+    if past_state is not None or decay is not None or beta is not None:
+        if past_state is not None:
+            initializer.append(_f32(np.asarray(past_state), "PastState"))
+            operands.append("PastState")
+        else:
+            operands.append("")
+    if decay is not None or beta is not None:
+        if decay is not None:
+            initializer.append(_f32(np.asarray(decay), "Decay"))
+            operands.append("Decay")
+        else:
+            operands.append("")
+    if beta is not None:
+        initializer.append(_f32(np.asarray(beta), "Beta"))
+        operands.append("Beta")
+    if update_rule is None:
+        update_rule = "gated" if decay is not None else "linear"
 
     body = f"""
         g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
@@ -4370,7 +5241,7 @@ def _linear_attention_model(
           q = MatMul(X, Wq)
           k = MatMul(X, Wk)
           v = MatMul(X, Wv)
-          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="{"gated" if decay is not None else "linear"}">({", ".join(operands)})
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="{update_rule}">({", ".join(operands)})
           Y = MatMul(attn_out, Wo)
         }}
         """
@@ -4439,19 +5310,159 @@ def test_cpp_linear_attention_pruning_matches_oracle_exactly():
     np.testing.assert_array_equal(inits["Wo"], cfg["wo"][q_idx, :])
 
 
-def test_cpp_linear_attention_pruning_gated_mode_decay_present_is_left_untouched():
+def test_cpp_linear_attention_pruning_gated_mode_constant_decay_is_sliced_matches_python():
+    # A genuinely CONSTANT `decay` (the documented, `kv_num_heads`-wide
+    # DeltaNet/RetNet per-head-scalar shape) is now validated-and-sliced,
+    # not a whole-match decline -- mirrors pruning.py's own
+    # `_match_linear_attention_producer`/`_apply_one_gqa_chain` exactly
+    # (MatchLinearAttentionProducer/ApplyOneGqaChain's own `is_linear_
+    # attention` branch, see either's own comment). Only a genuinely
+    # DYNAMIC decay/beta still declines the whole match outright in this
+    # port (the LinearAttentionGate-fed pass-through pruning.py's own
+    # further upgrade recognizes is not ported here) -- see
+    # test_cpp_linear_attention_pruning_dynamic_decay_is_declined_matches_python
+    # below for that still-narrower scope boundary's own cpp-parity coverage.
     model, cfg = _linear_attention_model(
         Hq=4, Hkv=4, D=4, K=16, seed=63, decay=np.zeros((1, 3, 4), dtype=np.float32)
     )
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _linear_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _linear_attention_attrs(node)
+    assert kv_num_heads == 2  # pruning genuinely fired -- not a no-op decline
+    assert q_num_heads == 2
+
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    assert inits["Decay"].shape == (1, 3, kv_num_heads)
+
+
+def test_cpp_linear_attention_pruning_delta_mode_slices_past_state_and_beta_matches_python():
+    # `update_rule="delta"`'s own `past_state` (rank-4 `(B, kv_num_heads,
+    # d_k, d_v)`, sliced along axis 1) and `beta` (rank-3,
+    # `kv_num_heads`-wide, sliced along its own last axis) -- mirrors
+    # pruning.py's own `_apply_one_gqa_chain` `is_linear_attention` branch
+    # exactly. Mirrors tests/test_pruning.py's own
+    # test_linear_attention_pruning_delta_mode_slices_past_state_and_beta_matches_oracle
+    # fixture, called through the C++ port instead and checked byte-for-byte
+    # against the live Python reference.
+    Hq, Hkv, D, K = 4, 2, 4, 16
+    rng = np.random.default_rng(2)
+    past_state = rng.standard_normal((1, Hkv, D, D)).astype(np.float32)
+    beta = (np.abs(rng.standard_normal((1, 3, Hkv))) * 0.1).astype(np.float32)
+    model, cfg = _linear_attention_model(
+        Hq=Hq,
+        Hkv=Hkv,
+        D=D,
+        K=K,
+        seed=2,
+        update_rule="delta",
+        past_state=past_state,
+        beta=beta,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _linear_attention_node(pruned_cpp)
+    _, kv_num_heads = _linear_attention_attrs(node)
+    assert kv_num_heads == 1
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    assert inits["PastState"].shape == (1, kv_num_heads, D, D)
+    assert inits["Beta"].shape == (1, 3, kv_num_heads)
+
+
+def test_cpp_linear_attention_pruning_gated_mode_gla_decay_matches_python():
+    # `update_rule="gated"`'s own GLA/RWKV-6 shape: `decay` is
+    # `kv_num_heads * head_size`-wide (per-key-dimension, not per-head
+    # scalar) -- sliced by the same per-head column expansion K's own
+    # producer weight gets (HeadColumnIndices), distinct from the
+    # DeltaNet/RetNet per-head-scalar shape
+    # test_cpp_linear_attention_pruning_gated_mode_constant_decay_is_sliced_matches_python
+    # above already covers. Mirrors tests/test_pruning.py's own
+    # test_linear_attention_pruning_gated_mode_slices_gla_decay_matches_oracle
+    # fixture, called through the C++ port instead.
+    Hq, Hkv, D, K = 4, 2, 4, 16
+    rng = np.random.default_rng(3)
+    decay = (-np.abs(rng.standard_normal((1, 3, Hkv * D))) * 0.1).astype(np.float32)
+    model, cfg = _linear_attention_model(
+        Hq=Hq, Hkv=Hkv, D=D, K=K, seed=3, update_rule="gated", decay=decay
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _linear_attention_node(pruned_cpp)
+    _, kv_num_heads = _linear_attention_attrs(node)
+    assert kv_num_heads == 1
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert inits["Decay"].shape == (1, 3, kv_num_heads * D)
+
+
+def test_cpp_linear_attention_pruning_dynamic_decay_is_declined_matches_python():
+    # A `decay` fed by anything other than a constant initializer still
+    # declines the whole match outright in this port -- the
+    # LinearAttentionGate-fed pass-through pruning.py's own further upgrade
+    # recognizes is not ported here (see MatchLinearAttentionProducer's own
+    # comment). Mirrors tests/test_pruning.py's own
+    # test_linear_attention_pruning_dynamic_decay_is_declined, called
+    # through the C++ port instead.
+    Hq, Hkv, D, K = 4, 2, 4, 16
+    body = f"""
+        g (float[1,3,{K}] X, float[1,3,{Hkv}] DecayIn) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="gated">(q, k, v, , DecayIn)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    rng = np.random.default_rng(4)
+    wq = rng.standard_normal((K, Hq * D)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Hkv * D)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Hkv * D)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Hq * D, K)).astype(np.float32) * 0.3
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 27]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()  # untouched
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
 
 
 # --- com.microsoft::SparseAttention ------------------------------------------
@@ -6545,6 +7556,462 @@ def test_cpp_decomposed_gqa_qk_norm_pruning_matches_oracle_and_python_reference_
     (y_pruned,) = _run(pruned_cpp, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+# --- Decomposed-GQA, real `torch.onnx.export` pipeline: `Constant`-node-fed
+# --- shape operands (BuildConstantMap/BuildMutableConstantMap) --------------
+#
+# Every ``_decomposed_gqa_model`` fixture above spells its own `Reshape`/
+# `Expand` shape operands as genuine `graph.initializer` entries -- adequate
+# for exercising `FindDecomposedGqaChains`'/`ApplyOneDecomposedGqaChain`'s own
+# matching/slicing logic, but NOT for exercising `BuildConstantMap`'s own
+# reason to exist: a real `torch.onnx.export` -> `onnxsim.simplify()`
+# pipeline leaves exactly these operands as plain (default-domain) `Constant`
+# nodes instead (onnxsim's own `simplify()` deliberately never promotes one to
+# an initializer -- see `BuildConstantMap`'s own comment in
+# structured_pruning_entry.cpp, and pruning.py's own `_constant_map`
+# docstring, for the full empirical justification). Before `BuildConstantMap`/
+# `BuildMutableConstantMap` were wired into `FindDecomposedGqaChains`/
+# `ApplyDecomposedGqaChains`, every one of the five real-export shapes below
+# silently declined to match at all (its own `init_map` -- built from
+# `graph->initializer()` alone -- had no entry for a `Constant`-node-fed shape
+# name), even though the *same* chain, hand-built with those same values
+# sitting in `graph.initializer` (`_decomposed_gqa_model`'s own convention
+# above), matched and pruned correctly.
+#
+# Each test below builds the identical hand-written eager-attention
+# `nn.Module` one of `test_pruning.py`'s own
+# ``test_decomposed_attention_*_real_torch_export_pipeline`` tests uses,
+# exports it, and runs it through `onnxsim.simplify()` -- exactly the same
+# fixture-construction pattern (kept deliberately in sync; a real
+# `torch.onnx.export` graph cannot be reasonably hand-spelled via
+# `onnx.parser.parse_model`, per this repo's own CLAUDE.md note on this
+# convention's own limits). Rather than re-deriving each one's own numpy
+# oracle (already done exhaustively in `test_pruning.py`), each test here
+# instead directly confirms this C++ port's own parity bar: comparing
+# ``apply_attention_head_pruning_cpp`` against the live pure-Python
+# ``apply_attention_head_pruning`` reference on the exact same simplified
+# model, byte-for-byte -- this file's own established convention (see e.g.
+# ``test_cpp_attention_head_pruning_per_head_attention_bias_is_sliced_matches_python``
+# above) -- while also confirming the model genuinely contains `Constant`-fed
+# shape operands (not vacuously all-initializer) and that pruning actually
+# fired (not a silent no-op decline).
+def _export_and_simplify_decomposed(m, inputs, input_names):
+    """Shared plumbing every test below reuses: export `m`, load it back, and
+    run it through `onnxsim.simplify()`. Mirrors each
+    ``test_decomposed_attention_*_real_torch_export_pipeline`` test's own
+    identical opening in ``test_pruning.py``.
+    """
+    import torch
+
+    m.eval()
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m,
+        inputs,
+        buf,
+        input_names=input_names,
+        output_names=["output"],
+        opset_version=17,
+        dynamo=False,
+    )
+    raw = onnx.load_from_string(buf.getvalue())
+    simplified, ok = onnxsim.onnx_simplifier.simplify(raw)
+    assert ok
+    return simplified
+
+
+def _assert_cpp_matches_python_and_fires(simplified, sparsity=0.5):
+    """Shared parity assertion every test below reuses: `Constant`-node-fed
+    shape operands are genuinely present (else the whole test would be
+    vacuous -- a real export with everything already an initializer would
+    never have exposed this gap), pruning actually fires (rather than
+    silently declining the whole chain, this gap's own failure mode before
+    the fix), and the C++ port's own output is byte-identical to the live
+    pure-Python reference on the exact same input.
+    """
+    assert any(
+        n.op_type == "Constant" and n.domain == "" for n in simplified.graph.node
+    ), "fixture is vacuous: no Constant-node-fed operand in the simplified graph"
+
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(simplified)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=sparsity)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(simplified, sparsity=sparsity)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    assert pruned_cpp.SerializeToString() != simplified.SerializeToString(), (
+        "pruning did not fire at all -- BuildConstantMap wiring is not "
+        "actually closing the gap"
+    )
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    return pruned_cpp
+
+
+def test_cpp_decomposed_attention_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_real_torch_export_pipeline: plain GQA +
+    # causal mask, MatMul-based QK^T/AV products.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    class EagerGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        EagerGQA(), (x, mask), ["hidden_states", "attn_mask"]
+    )
+    assert not any(
+        n.op_type
+        in ("Attention", "GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+        for n in simplified.graph.node
+    )
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_einsum_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_einsum_real_torch_export_pipeline: same GQA +
+    # causal mask, but both the QK^T and AV products are literal
+    # `torch.einsum` calls.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    class EinsumGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.einsum("bhid,bhjd->bhij", q, k) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.einsum("bhij,bhjd->bhid", attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        EinsumGQA(), (x, mask), ["hidden_states", "attn_mask"]
+    )
+    assert any(n.op_type == "Einsum" for n in simplified.graph.node)
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_rope_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_rope_real_torch_export_pipeline: GQA + causal
+    # mask + HuggingFace-style decomposed RoPE on Q and K.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    class EagerGQARope(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, cos, sin, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        EagerGQARope(),
+        (x, cos, sin, mask),
+        ["hidden_states", "cos", "sin", "attn_mask"],
+    )
+
+    from onnxsim.pruning import (
+        _find_decomposed_gqa_chains,
+        _shape_inferred_value_info_by_name,
+    )
+
+    chains = _find_decomposed_gqa_chains(
+        simplified.graph, _shape_inferred_value_info_by_name(simplified)
+    )
+    assert len(chains) == 1
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_qk_norm_rope_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_qk_norm_rope_real_torch_export_pipeline: a
+    # Qwen3-style module with per-head RMSNorm on Q/K on top of RoPE + GQA.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    class RMSNorm(nn.Module):
+        def __init__(self, dim, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(dim) * 0.1 + 1.0)
+            self.eps = eps
+
+        def forward(self, x):
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.eps)
+            return self.weight * x
+
+    class Qwen3StyleGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.q_norm = RMSNorm(head_dim)
+            self.k_norm = RMSNorm(head_dim)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, cos, sin, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = self.q_norm(
+                self.q_proj(hidden_states).view(b, s, num_heads, head_dim)
+            ).transpose(1, 2)
+            k = self.k_norm(
+                self.k_proj(hidden_states).view(b, s, num_kv_heads, head_dim)
+            ).transpose(1, 2)
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        Qwen3StyleGQA(),
+        (x, cos, sin, mask),
+        ["hidden_states", "cos", "sin", "attn_mask"],
+    )
+
+    from onnxsim.pruning import (
+        _find_decomposed_gqa_chains,
+        _shape_inferred_value_info_by_name,
+    )
+
+    chains = _find_decomposed_gqa_chains(
+        simplified.graph, _shape_inferred_value_info_by_name(simplified)
+    )
+    assert len(chains) == 1
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+    assert chains[0].q_norm is not None
+    assert chains[0].k_norm is not None
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_packed_qkv_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_packed_qkv_real_torch_export_pipeline: a
+    # GPT-2-style single packed `c_attn` Linear feeding a `Split`.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, head_dim, seq, batch = 32, 4, 8, 4, 1
+
+    class GPT2StyleAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c_attn = nn.Linear(hidden, 3 * num_heads * head_dim, bias=True)
+            self.c_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            qkv = self.c_attn(hidden_states)
+            q, k, v = qkv.split(num_heads * head_dim, dim=-1)
+            q = q.view(b, s, num_heads, head_dim).transpose(1, 2)
+            k = k.view(b, s, num_heads, head_dim).transpose(1, 2)
+            v = v.view(b, s, num_heads, head_dim).transpose(1, 2)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.c_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        GPT2StyleAttention(), (x, mask), ["hidden_states", "attn_mask"]
+    )
+    assert any(n.op_type == "Split" for n in simplified.graph.node)
+    _assert_cpp_matches_python_and_fires(simplified)
 
 
 # --- FLOAT16 / BFLOAT16 weight support ---------------------------------------

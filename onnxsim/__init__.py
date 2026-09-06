@@ -40,6 +40,7 @@ from onnxsim.calibration import (
 )
 from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
+from onnxsim.daq import apply_daq
 from onnxsim.deepseek_fp8 import apply_deepseek_fp8, quantize_dequantize_block_fp8
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
@@ -66,7 +67,17 @@ from onnxsim.gguf_legacy_quant import (
     quantize_dequantize_q4_0,
     quantize_dequantize_q4_1,
 )
+from onnxsim.gguf_legacy_quant_5bit import (
+    apply_gguf_q5_0_quantization,
+    apply_gguf_q5_1_quantization,
+    quantize_dequantize_q5_0,
+    quantize_dequantize_q5_1,
+)
+from onnxsim.gguf_q2_k import apply_gguf_q2_k_quantization, quantize_dequantize_q2_k
+from onnxsim.gguf_q3_k import apply_gguf_q3_k_quantization, quantize_dequantize_q3_k
+from onnxsim.gguf_q5_k import apply_gguf_q5_k_quantization, quantize_dequantize_q5_k
 from onnxsim.gguf_q6_k import apply_gguf_q6_k_quantization, quantize_dequantize_q6_k
+from onnxsim.gguf_q8_0 import apply_gguf_q8_0_quantization, quantize_dequantize_q8_0
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -75,6 +86,7 @@ from onnxsim.gguf_ternary_quant import (
     apply_gguf_ternary_quantization,
     quantize_dequantize_ternary,
 )
+from onnxsim.gptaq import apply_gptaq
 from onnxsim.gptq import apply_gptq
 from onnxsim.gptvq import quantize_weight_only_gptvq
 from onnxsim.hf_reconstruct import read_hf_config, reconstruct_hf_graph
@@ -98,6 +110,7 @@ from onnxsim.iq4_nl import (
 from onnxsim.kbvq_moe import apply_kbvq_moe
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
+from onnxsim.leptoquant import apply_leptoquant
 from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
@@ -269,6 +282,7 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_gptaq",
     "apply_ptq4vit_quantization",
     "apply_qronos",
     "quantize_weight_only_qoq",
@@ -289,8 +303,10 @@ __all__ = [
     "apply_outlier_suppression",
     "apply_dsq",
     "apply_dac",
+    "apply_daq",
     "apply_deepseek_fp8",
     "quantize_dequantize_block_fp8",
+    "apply_leptoquant",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_lqer",
@@ -401,6 +417,12 @@ __all__ = [
     "apply_gear",
     "apply_gguf_q4_k_quantization",
     "quantize_dequantize_q4_k",
+    "apply_gguf_q2_k_quantization",
+    "quantize_dequantize_q2_k",
+    "apply_gguf_q3_k_quantization",
+    "quantize_dequantize_q3_k",
+    "apply_gguf_q5_k_quantization",
+    "quantize_dequantize_q5_k",
     "apply_gguf_q6_k_quantization",
     "apply_gguf_q6_k_quantization_cpp",
     "quantize_dequantize_q6_k",
@@ -410,6 +432,12 @@ __all__ = [
     "apply_gguf_q4_1_quantization_cpp",
     "quantize_dequantize_q4_0",
     "quantize_dequantize_q4_1",
+    "apply_gguf_q5_0_quantization",
+    "apply_gguf_q5_1_quantization",
+    "quantize_dequantize_q5_0",
+    "quantize_dequantize_q5_1",
+    "apply_gguf_q8_0_quantization",
+    "quantize_dequantize_q8_0",
     "apply_gguf_ternary_quantization",
     "apply_gguf_ternary_quantization_cpp",
     "quantize_dequantize_ternary",
