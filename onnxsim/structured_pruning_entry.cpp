@@ -657,6 +657,31 @@ size_t ConsumerCount(const ConsumerMap& consumers_of, const std::string& name) {
   return it == consumers_of.end() ? 0 : it->second.size();
 }
 
+// `name -> the one node producing it` (via any of its outputs) -- the
+// backward-lookup counterpart to ConsumersOf, mirrors pruning.py's own
+// `_producers_of` exactly (added there specifically for the ConvInteger
+// section below: unlike every other chain-finder in this file, which only
+// ever walks FORWARD from a producer's output, resolving a `ConvInteger`
+// match needs to walk BACKWARD from its own `x` input to find the
+// `DynamicQuantizeLinear` node that must produce it). A graph input or
+// initializer name is simply absent from the result (has no producing
+// node), matching pruning.py's own dict-comprehension-over-`graph.node`
+// semantics exactly.
+using ProducerMap = std::unordered_map<std::string, onnx::NodeProto*>;
+
+ProducerMap ProducersOf(onnx::GraphProto* graph) {
+  ProducerMap out;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& o : node->output()) {
+      if (!o.empty()) {
+        out[o] = node;
+      }
+    }
+  }
+  return out;
+}
+
 // True if `name` names a constant FLOAT initializer shaped like a flat
 // per-channel vector (`prod(dims) == dims[-1]`) -- mirrors pruning.py's own
 // `_flat_channel_const` exactly: the self-consistency bar every per-channel
@@ -20795,6 +20820,891 @@ void ApplyDynQuantChains(onnx::GraphProto* graph,
   }
 }
 
+// --- DynamicQuantizeConv (ConvInteger, ORT dynamic-quantization Conv
+//     pattern) structured pruning, mirroring pruning.py's own section of the
+//     same name -----------------------------------------------------------
+//
+// `ConvInteger` (plain `ai.onnx`, domain "") is the Conv analogue of
+// `MatMulInteger`/`DynamicQuantizeMatMul` -- what
+// `onnxruntime.quantization.quantize_dynamic()` emits for a dynamically
+// quantized Conv layer -- but UNLIKE `MatMulInteger` it has no fused
+// `com.microsoft` counterpart: a real `InferenceSession` leaves the raw,
+// unfused multi-node sequence behind (see pruning.py's own section comment
+// for the full empirical round trip this inherits):
+//
+//   Xq, x_scale, x_zero_point = DynamicQuantizeLinear(X)
+//   combined_scale             = Mul(x_scale, W_scale)
+//   Yi                         = ConvInteger(Xq, Wq, x_zero_point,
+//   W_zero_point) Yf                         = Cast(Yi, to=FLOAT) Yscaled =
+//   Mul(Yf, combined_scale) Y                          = Add(Yscaled,
+//   Reshape(B, [1, -1, 1, ..., 1]))  // bias, if any
+//
+// `Wq` is INT8/UINT8, `(out_channels, in_channels/group, kH, kW)` -- axis 0
+// is the output-channel axis, sliced via the SAME SliceProducerWeight/
+// SliceConsumerWeight helpers (`is_conv=true`) every plain-float Conv
+// already uses. `W_scale`/`W_zero_point` are ALWAYS scalar (per-tensor) here
+// -- confirmed directly off `onnxruntime.quantization.operators.conv.
+// ConvInteger.quantize()`'s own source (always the per-tensor
+// `quantize_weight` path, never `quantize_weight_per_channel`, regardless of
+// `per_channel`) -- so, unlike the QOperator section above, there is no
+// per-channel branch to support at all: neither is ever sliced by either
+// role. `B` (bias), when present, is PLAIN, UNQUANTIZED float `(N,)` --
+// sliced directly via SliceLastAxis, no rescale-recompute step, exactly like
+// `DynamicQuantizeMatMul`'s own bias. The bias `Reshape`'s own shape
+// initializer needs no adjustment at all (its `-1` entry auto-infers the new
+// bias length), so it is matched but never written to.
+//
+// Chain-finding (FindConvIntegerChains/WalkToConvIntegerConsumer) mirrors
+// the QOperator section's own `QLinearConv`-only, same-family-only walk,
+// DELIBERATELY narrower than the DynamicQuantizeMatMul section's own
+// quantized-or-plain-float union: only a `ConvInteger`-shaped producer
+// feeding a `ConvInteger`-shaped consumer (through zero or more
+// shape-preserving unary activations, plus a channel-agnostic `Clip` --
+// MatchClipChannelPassThrough, the same helper the plain-float Conv chain
+// walker already uses for the identical ReLU6 shape -- plus a depthwise
+// `ConvInteger` mid-chain hop, reached through its own dedicated
+// `DynamicQuantizeLinear` producer: the canonical MobileNetV1/V2/V3
+// `pointwise -> depthwise -> pointwise` unit) is matched -- a plain float
+// `Conv` peer on either side is declined outright, mirroring pruning.py's
+// own deliberate scope narrowing there exactly.
+//
+// KNOWN, DELIBERATE GAP relative to pruning.py's own
+// `apply_structured_pruning_dynamic_quantize_conv` (left out of THIS port
+// rather than guessed at, the same "decline rather than mis-match" bar
+// every other quantized-weight section in this file already holds): the one
+// narrow exception pruning.py matches where a producer's logical output
+// feeds `GlobalAveragePool -> {Flatten(axis=1), Reshape to [batch, -1],
+// Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}` (the canonical
+// dynamically-quantized classifier head) directly is NOT recognized here --
+// this walker simply has no case for `GlobalAveragePool` at all, so that
+// shape is left undeclined the same way an ordinary unmatched topology
+// already is. This mirrors an EXISTING, already-accepted gap in this very
+// file: the QOperator section's own top comment above documents the
+// identical `QLinearConv -> Flatten/Reshape -> QLinearMatMul/QGemm`
+// classifier-head shape as "a REAL, confirmed gap, not an oversight" for
+// the exact same reason (no `GlobalAveragePool`/`Flatten`/`Reshape`-walking
+// machinery exists anywhere in this file's C++ port yet, for ANY quantized
+// family, plain-float included) -- so this is a consistent, not a novel,
+// scope narrowing, not a correctness risk (an unrecognized topology is
+// always left completely untouched, never mis-sliced).
+//
+// This entire section is a genuinely separate match: `ConvInteger` is a node
+// type no other Find*Chains call in this file's ApplyStructuredPruning
+// recognizes at all, so FindConvIntegerChains below can never double-match a
+// tensor any other pass already claimed -- but it still shares this graph's
+// own single TouchedState with every other Apply* call, for the same "one
+// shared conflict ledger per graph" reason every other quantized-weight pass
+// here already does.
+
+// A matched `ConvInteger`-based dynamically-quantized Conv layer's own
+// sliceable operands and the full multi-node neighborhood MatchConvInteger
+// resolved it from -- mirrors pruning.py's own `_ConvIntegerConv` exactly.
+// `node` is the `ConvInteger` itself; `dq_node` is the
+// `DynamicQuantizeLinear` producing its own `x`/`x_zero_point` inputs;
+// `scales_mul_node` combines `x_scale` with `w_scale`; `cast_node`/
+// `rescale_mul_node` cast-then-rescale `ConvInteger`'s own int32 output back
+// to float; `bias_reshape_node`/`bias_add_node` are the optional bias pair
+// (both null together whenever the source Conv had no bias). `w_name` is
+// always INT8/UINT8, stored `(out_channels, in_channels/group, kH, kW)` --
+// `group` is always 1 here, so axis 1 spans the FULL input-channel count.
+// `w_scale_name`/`w_zero_point_name` are always scalar (never per-channel --
+// see this section's own top comment). `bias_name` is the optional
+// plain-float bias, shape `(N,)`. `N`/`K` are the weight's own
+// output-channel/input-channel sizes. Safe to store raw node pointers for
+// the same reason every other match struct in this file is (they all come
+// from `graph->mutable_node(i)`; no node is ever inserted/removed by this
+// whole pass).
+struct ConvIntegerMatch {
+  onnx::NodeProto* node = nullptr;
+  onnx::NodeProto* dq_node = nullptr;
+  onnx::NodeProto* scales_mul_node = nullptr;
+  onnx::NodeProto* cast_node = nullptr;
+  onnx::NodeProto* rescale_mul_node = nullptr;
+  onnx::NodeProto* bias_reshape_node = nullptr;
+  onnx::NodeProto* bias_add_node = nullptr;
+  std::string w_name;
+  std::string w_scale_name;
+  std::string w_zero_point_name;
+  std::optional<std::string> bias_name;
+  int64_t N = 0;
+  int64_t K = 0;
+};
+
+// The tensor name this matched Conv layer's own logical output is -- the
+// bias Add's own output when a bias was matched, the rescale Mul's own
+// output otherwise. Mirrors pruning.py's own `_conv_integer_final_output`.
+std::string ConvIntegerFinalOutput(const ConvIntegerMatch& w) {
+  if (w.bias_add_node != nullptr) {
+    return w.bias_add_node->output(0);
+  }
+  return w.rescale_mul_node->output(0);
+}
+
+// If `node` is a `ConvInteger` at the center of the full dynamically-
+// quantized Conv neighborhood this section's own top comment describes,
+// matching every scope boundary documented there, returns the match.
+// nullopt whenever anything is ambiguous, non-constant, shared, or
+// otherwise out of the empirically-verified scope, rather than guessing.
+// Mirrors pruning.py's own `_match_conv_integer` exactly. Note: unlike
+// pruning.py's own wider `_is_supported_float_dtype`, `bias` is admitted
+// only as plain FLOAT (float32) here -- this file's own float-tensor
+// helpers (ReadFloatTensor/SetFloatTensorData/SliceLastAxis) have no
+// FLOAT16/BFLOAT16 support anywhere yet, the same narrower-than-pruning.py
+// scope decision the DynamicQuantizeMatMul section above already
+// establishes for its own identical plain-float bias.
+std::optional<ConvIntegerMatch> MatchConvInteger(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of, const ProducerMap& producers_of) {
+  if (node->op_type() != "ConvInteger" || !node->domain().empty()) {
+    return std::nullopt;
+  }
+  if (node->input_size() != 4 || node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& x_name = node->input(0);
+  const std::string& w_name = node->input(1);
+  const std::string& x_zp_name = node->input(2);
+  const std::string& w_zp_name = node->input(3);
+  if (x_name.empty() || w_name.empty() || x_zp_name.empty() ||
+      w_zp_name.empty()) {
+    return std::nullopt;
+  }
+
+  if (ConvGroupAttr(*node) != 1) {
+    return std::nullopt;  // Grouped/depthwise ConvInteger -- out of scope,
+                          // see this section's own top comment.
+  }
+
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end()) {
+    return std::nullopt;  // Non-constant w.
+  }
+  const onnx::TensorProto* w_init = wit->second;
+  if (w_init->data_type() != onnx::TensorProto::INT8 &&
+      w_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (w_init->dims_size() != 4) {
+    return std::nullopt;  // 2-D spatial Conv only.
+  }
+  const int64_t n = w_init->dims(0);
+  const int64_t k = w_init->dims(1);
+  if (n <= 0 || k <= 0) {
+    return std::nullopt;
+  }
+  if (ConsumerCount(consumers_of, w_name) != 1) {
+    return std::nullopt;  // Shared/tied weight -- another node reads it too.
+  }
+
+  auto zit = init_map.find(w_zp_name);
+  if (zit == init_map.end() ||
+      zit->second->data_type() != w_init->data_type()) {
+    return std::nullopt;  // Non-constant, or dtype-mismatched, w_zero_point.
+  }
+  if (!(zit->second->dims_size() == 0 ||
+        (zit->second->dims_size() == 1 && zit->second->dims(0) == 1))) {
+    return std::nullopt;  // Non-scalar w_zero_point -- never confirmed
+                          // empirically, see this section's own top comment.
+  }
+
+  auto dq_it = producers_of.find(x_name);
+  if (dq_it == producers_of.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* dq_node = dq_it->second;
+  if (dq_node->op_type() != "DynamicQuantizeLinear" ||
+      !dq_node->domain().empty() || dq_node->input_size() != 1 ||
+      dq_node->output_size() != 3 || dq_node->output(0) != x_name ||
+      dq_node->output(2) != x_zp_name) {
+    return std::nullopt;  // x/x_zero_point don't resolve to one shared
+                          // DynamicQuantizeLinear producer.
+  }
+
+  const std::string& x_scale_name = dq_node->output(1);
+  if (ConsumerCount(consumers_of, x_scale_name) != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* scales_mul_node = consumers_of.at(x_scale_name)[0];
+  if (scales_mul_node->op_type() != "Mul" ||
+      scales_mul_node->input_size() != 2) {
+    return std::nullopt;
+  }
+  std::string w_scale_name;
+  if (scales_mul_node->input(0) == x_scale_name) {
+    w_scale_name = scales_mul_node->input(1);
+  } else if (scales_mul_node->input(1) == x_scale_name) {
+    w_scale_name = scales_mul_node->input(0);
+  } else {
+    return std::nullopt;  // Scale-combining Mul doesn't actually read
+                          // x_scale.
+  }
+
+  auto sit = init_map.find(w_scale_name);
+  if (sit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;  // Non-constant, or wrong-dtype, w_scale.
+  }
+  if (!(sit->second->dims_size() == 0 ||
+        (sit->second->dims_size() == 1 && sit->second->dims(0) == 1))) {
+    return std::nullopt;  // Non-scalar w_scale.
+  }
+  if (scales_mul_node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& combined_scale_name = scales_mul_node->output(0);
+
+  const std::string& ci_out = node->output(0);
+  if (ConsumerCount(consumers_of, ci_out) != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* cast_node = consumers_of.at(ci_out)[0];
+  if (cast_node->op_type() != "Cast" || cast_node->input_size() != 1 ||
+      cast_node->input(0) != ci_out || cast_node->output_size() != 1) {
+    return std::nullopt;
+  }
+  int64_t to_attr = -1;
+  for (const auto& a : cast_node->attribute()) {
+    if (a.name() == "to") {
+      to_attr = a.i();
+      break;
+    }
+  }
+  if (to_attr != onnx::TensorProto::FLOAT) {
+    return std::nullopt;  // Never confirmed for a FLOAT16/BFLOAT16 rescale
+                          // target -- declined, see this section's own top
+                          // comment.
+  }
+
+  const std::string& cast_out = cast_node->output(0);
+  if (ConsumerCount(consumers_of, cast_out) != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* rescale_mul_node = consumers_of.at(cast_out)[0];
+  if (rescale_mul_node->op_type() != "Mul" ||
+      rescale_mul_node->input_size() != 2 ||
+      rescale_mul_node->output_size() != 1) {
+    return std::nullopt;
+  }
+  {
+    const std::unordered_set<std::string> got = {rescale_mul_node->input(0),
+                                                 rescale_mul_node->input(1)};
+    const std::unordered_set<std::string> want = {cast_out,
+                                                  combined_scale_name};
+    if (got != want) {
+      return std::nullopt;  // Rescale Mul doesn't actually combine the cast
+                            // Conv output with the scale-combining Mul's own
+                            // output.
+    }
+  }
+
+  const std::string& rescale_out = rescale_mul_node->output(0);
+  onnx::NodeProto* bias_reshape_node = nullptr;
+  onnx::NodeProto* bias_add_node = nullptr;
+  std::optional<std::string> bias_name;
+  if (ConsumerCount(consumers_of, rescale_out) == 1) {
+    onnx::NodeProto* candidate_add = consumers_of.at(rescale_out)[0];
+    if (candidate_add->op_type() == "Add" && candidate_add->input_size() == 2 &&
+        candidate_add->output_size() == 1) {
+      const std::string& add_in0 = candidate_add->input(0);
+      const std::string& add_in1 = candidate_add->input(1);
+      std::optional<std::string> other;
+      if (add_in0 == rescale_out) {
+        other = add_in1;
+      } else if (add_in1 == rescale_out) {
+        other = add_in0;
+      }
+      if (other) {
+        auto rit = producers_of.find(*other);
+        if (rit != producers_of.end()) {
+          onnx::NodeProto* reshape_candidate = rit->second;
+          if (reshape_candidate->op_type() == "Reshape" &&
+              reshape_candidate->input_size() == 2 &&
+              reshape_candidate->output_size() == 1 &&
+              reshape_candidate->output(0) == *other &&
+              ConsumerCount(consumers_of, *other) == 1) {
+            const std::string& bias_cand_name = reshape_candidate->input(0);
+            const std::string& shape_name = reshape_candidate->input(1);
+            auto bit = init_map.find(bias_cand_name);
+            auto shape_it = init_map.find(shape_name);
+            if (bit != init_map.end() && shape_it != init_map.end() &&
+                bit->second->data_type() == onnx::TensorProto::FLOAT &&
+                bit->second->dims_size() == 1 && bit->second->dims(0) == n &&
+                ConsumerCount(consumers_of, bias_cand_name) == 1) {
+              bias_reshape_node = reshape_candidate;
+              bias_add_node = candidate_add;
+              bias_name = bias_cand_name;
+            }
+            // else: doesn't match the confirmed bias shape -- treated as
+            // bias-absent below, not an error (mirrors every other
+            // section's own "best-effort, else no bias" bar).
+          }
+        }
+      }
+    }
+  }
+
+  ConvIntegerMatch m;
+  m.node = node;
+  m.dq_node = dq_node;
+  m.scales_mul_node = scales_mul_node;
+  m.cast_node = cast_node;
+  m.rescale_mul_node = rescale_mul_node;
+  m.bias_reshape_node = bias_reshape_node;
+  m.bias_add_node = bias_add_node;
+  m.w_name = w_name;
+  m.w_scale_name = w_scale_name;
+  m.w_zero_point_name = w_zp_name;
+  m.bias_name = bias_name;
+  m.N = n;
+  m.K = k;
+  return m;
+}
+
+// A depthwise `ConvInteger` node (`group == in_channels == out_channels ==
+// n_channels`, weight shape `[n_channels, 1, kH, kW]`) sitting MID-CHAIN
+// between two ordinary (`group == 1`) `ConvInteger`-based Conv layers -- the
+// canonical MobileNetV1/V2/V3 depthwise-separable-conv unit, after real
+// dynamic quantization. Mirrors pruning.py's own `_ConvIntegerPassThrough`:
+// a depthwise Conv mixes no channels at all, so it needs no independent
+// importance ranking of its own, and is carried purely so
+// ApplyConvIntegerChains can slice its own int8 weight (axis 0) and, if
+// present, plain-float bias by the SAME `keep` index set the chain's real
+// producer/consumer already use, then shrink its own `group` attribute to
+// match. `w_scale`/`w_zero_point` are always per-tensor scalar here too (the
+// identical empirically-confirmed fact this section's own top comment
+// already documents for a terminal `ConvInteger`), so neither is ever
+// sliced -- only `w_name`/`bias_name` are kept here at all. `cast_node`/
+// `rescale_mul_node`/`bias_add_node` are kept only so
+// ApplyConvIntegerChains can mark their own (now-stale-shaped) outputs for
+// `value_info` cleanup, exactly like the chain's real producer already does
+// for its own identical trio.
+struct ConvIntegerPassThrough {
+  onnx::NodeProto* node = nullptr;
+  onnx::NodeProto* cast_node = nullptr;
+  onnx::NodeProto* rescale_mul_node = nullptr;
+  onnx::NodeProto* bias_add_node = nullptr;
+  std::string w_name;
+  std::optional<std::string> bias_name;
+};
+
+// If `node` is a depthwise `ConvInteger` (`group == in_channels ==
+// out_channels == n_channels`, weight shape `[n_channels, 1, kH, kW]`,
+// scalar `w_scale`/`w_zero_point` -- the same per-tensor bar
+// MatchConvInteger already holds a terminal `ConvInteger` to) reached via
+// `expected_dq_node` (its own dedicated `DynamicQuantizeLinear` producer,
+// already resolved by the caller, WalkToConvIntegerConsumer, as the sole
+// consumer of the walk's current tensor), followed by the same
+// Cast -> rescale Mul -> optional bias Reshape/Add neighborhood a terminal
+// `ConvInteger` has -- returns the matched ConvIntegerPassThrough together
+// with the tensor name this depthwise unit's own logical output is, for the
+// caller to continue walking forward from. Mirrors pruning.py's own
+// `_match_conv_integer_depthwise_pass_through` exactly. nullopt whenever
+// anything is ambiguous, non-constant, shared, or otherwise out of the
+// empirically-verified scope, never guessed at.
+std::optional<std::pair<ConvIntegerPassThrough, std::string>>
+MatchConvIntegerDepthwisePassThrough(onnx::NodeProto* node,
+                                     const InitMap& init_map,
+                                     const ConsumerMap& consumers_of,
+                                     const ProducerMap& producers_of,
+                                     int64_t n_channels,
+                                     onnx::NodeProto* expected_dq_node) {
+  if (node->op_type() != "ConvInteger" || !node->domain().empty()) {
+    return std::nullopt;
+  }
+  if (node->input_size() != 4 || node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& x_name = node->input(0);
+  const std::string& w_name = node->input(1);
+  const std::string& x_zp_name = node->input(2);
+  const std::string& w_zp_name = node->input(3);
+  if (x_name.empty() || w_name.empty() || x_zp_name.empty() ||
+      w_zp_name.empty()) {
+    return std::nullopt;
+  }
+
+  if (ConvGroupAttr(*node) != n_channels) {
+    return std::nullopt;  // Not this chain's own depthwise hop.
+  }
+
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end()) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* w_init = wit->second;
+  if (w_init->data_type() != onnx::TensorProto::INT8 &&
+      w_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (w_init->dims_size() != 4 || w_init->dims(0) != n_channels ||
+      w_init->dims(1) != 1) {
+    return std::nullopt;  // Not the depthwise [n_channels, 1, kH, kW] shape.
+  }
+  if (ConsumerCount(consumers_of, w_name) != 1) {
+    return std::nullopt;  // Shared/tied weight -- another node reads it too.
+  }
+
+  auto zit = init_map.find(w_zp_name);
+  if (zit == init_map.end() ||
+      zit->second->data_type() != w_init->data_type()) {
+    return std::nullopt;
+  }
+  if (!(zit->second->dims_size() == 0 ||
+        (zit->second->dims_size() == 1 && zit->second->dims(0) == 1))) {
+    return std::nullopt;  // Non-scalar w_zero_point -- never confirmed
+                          // empirically, declined.
+  }
+
+  auto dq_it = producers_of.find(x_name);
+  if (dq_it == producers_of.end() || dq_it->second != expected_dq_node ||
+      expected_dq_node->op_type() != "DynamicQuantizeLinear" ||
+      !expected_dq_node->domain().empty() ||
+      expected_dq_node->input_size() != 1 ||
+      expected_dq_node->output_size() != 3 ||
+      expected_dq_node->output(0) != x_name ||
+      expected_dq_node->output(2) != x_zp_name) {
+    return std::nullopt;  // x/x_zero_point don't resolve to the expected
+                          // shared DynamicQuantizeLinear producer.
+  }
+
+  const std::string& x_scale_name = expected_dq_node->output(1);
+  if (ConsumerCount(consumers_of, x_scale_name) != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* scales_mul_node = consumers_of.at(x_scale_name)[0];
+  if (scales_mul_node->op_type() != "Mul" ||
+      scales_mul_node->input_size() != 2) {
+    return std::nullopt;
+  }
+  std::string w_scale_name;
+  if (scales_mul_node->input(0) == x_scale_name) {
+    w_scale_name = scales_mul_node->input(1);
+  } else if (scales_mul_node->input(1) == x_scale_name) {
+    w_scale_name = scales_mul_node->input(0);
+  } else {
+    return std::nullopt;
+  }
+
+  auto sit = init_map.find(w_scale_name);
+  if (sit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  if (!(sit->second->dims_size() == 0 ||
+        (sit->second->dims_size() == 1 && sit->second->dims(0) == 1))) {
+    return std::nullopt;
+  }
+  if (scales_mul_node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& combined_scale_name = scales_mul_node->output(0);
+
+  const std::string& ci_out = node->output(0);
+  if (ConsumerCount(consumers_of, ci_out) != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* cast_node = consumers_of.at(ci_out)[0];
+  if (cast_node->op_type() != "Cast" || cast_node->input_size() != 1 ||
+      cast_node->input(0) != ci_out || cast_node->output_size() != 1) {
+    return std::nullopt;
+  }
+  int64_t to_attr = -1;
+  for (const auto& a : cast_node->attribute()) {
+    if (a.name() == "to") {
+      to_attr = a.i();
+      break;
+    }
+  }
+  if (to_attr != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+
+  const std::string& cast_out = cast_node->output(0);
+  if (ConsumerCount(consumers_of, cast_out) != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* rescale_mul_node = consumers_of.at(cast_out)[0];
+  if (rescale_mul_node->op_type() != "Mul" ||
+      rescale_mul_node->input_size() != 2 ||
+      rescale_mul_node->output_size() != 1) {
+    return std::nullopt;
+  }
+  {
+    const std::unordered_set<std::string> got = {rescale_mul_node->input(0),
+                                                 rescale_mul_node->input(1)};
+    const std::unordered_set<std::string> want = {cast_out,
+                                                  combined_scale_name};
+    if (got != want) {
+      return std::nullopt;
+    }
+  }
+
+  const std::string& rescale_out = rescale_mul_node->output(0);
+  onnx::NodeProto* bias_add_node = nullptr;
+  std::optional<std::string> bias_name;
+  std::string final_out = rescale_out;
+  if (ConsumerCount(consumers_of, rescale_out) == 1) {
+    onnx::NodeProto* candidate_add = consumers_of.at(rescale_out)[0];
+    if (candidate_add->op_type() == "Add" && candidate_add->input_size() == 2 &&
+        candidate_add->output_size() == 1) {
+      const std::string& add_in0 = candidate_add->input(0);
+      const std::string& add_in1 = candidate_add->input(1);
+      std::optional<std::string> other;
+      if (add_in0 == rescale_out) {
+        other = add_in1;
+      } else if (add_in1 == rescale_out) {
+        other = add_in0;
+      }
+      if (other) {
+        auto rit = producers_of.find(*other);
+        if (rit != producers_of.end()) {
+          onnx::NodeProto* reshape_candidate = rit->second;
+          if (reshape_candidate->op_type() == "Reshape" &&
+              reshape_candidate->input_size() == 2 &&
+              reshape_candidate->output_size() == 1 &&
+              reshape_candidate->output(0) == *other &&
+              ConsumerCount(consumers_of, *other) == 1) {
+            const std::string& bias_cand_name = reshape_candidate->input(0);
+            const std::string& shape_name = reshape_candidate->input(1);
+            auto bit = init_map.find(bias_cand_name);
+            auto shape_it = init_map.find(shape_name);
+            if (bit != init_map.end() && shape_it != init_map.end() &&
+                bit->second->data_type() == onnx::TensorProto::FLOAT &&
+                bit->second->dims_size() == 1 &&
+                bit->second->dims(0) == n_channels &&
+                ConsumerCount(consumers_of, bias_cand_name) == 1) {
+              bias_add_node = candidate_add;
+              bias_name = bias_cand_name;
+              final_out = candidate_add->output(0);
+            }
+            // else: doesn't match the confirmed bias shape -- treated as
+            // bias-absent below, not an error.
+          }
+        }
+      }
+    }
+  }
+
+  ConvIntegerPassThrough hop;
+  hop.node = node;
+  hop.cast_node = cast_node;
+  hop.rescale_mul_node = rescale_mul_node;
+  hop.bias_add_node = bias_add_node;
+  hop.w_name = w_name;
+  hop.bias_name = bias_name;
+  return std::make_pair(hop, final_out);
+}
+
+// The full float64 `(N, C*kH*kW)` dequantized weight matrix `w` refers to,
+// for IMPORTANCE RANKING ONLY -- never written back to the graph. Mirrors
+// pruning.py's own `_conv_integer_dequantized_nk`; `scale`/`zero_point` are
+// always scalar here (see this section's own top comment), so unlike
+// QopDequantizedNk there is no per-channel reshape-to-column branch to
+// consider at all -- the Conv weight's own row-major layout is already
+// `[N, C*kH*kW]`, needing no further transpose either.
+std::vector<double> ConvIntegerDequantizedNk(const ConvIntegerMatch& w,
+                                             const MutInitMap& init_map) {
+  const onnx::TensorProto* wt = init_map.at(w.w_name);
+  const std::vector<int64_t> codes = ReadQuantCodes(*wt);
+  const std::vector<int64_t> zp =
+      ReadQuantCodes(*init_map.at(w.w_zero_point_name));
+  const std::vector<float> scale =
+      ReadFloatTensor(*init_map.at(w.w_scale_name));
+  const double zpv = zp.empty() ? 0.0 : static_cast<double>(zp[0]);
+  const double s = static_cast<double>(scale[0]);
+  std::vector<double> out(codes.size());
+  for (size_t i = 0; i < codes.size(); ++i) {
+    out[i] = (static_cast<double>(codes[i]) - zpv) * s;
+  }
+  return out;
+}
+
+// Slices an INT8/UINT8 Conv-shaped `[dim0, dim1, kH, kW]` weight's own
+// `axis` (0 for the output-channel/producer role, 1 for the input-channel/
+// consumer role) to `keep` (ascending indices) -- the quantized-codes
+// analogue of SliceProducerWeight/SliceConsumerWeight's own `is_conv=true`
+// branch (which only ever handles a plain FLOAT weight via ReadFloatTensor/
+// SetFloatTensorData, wrong for `Wq`'s own int8/uint8 codes). Reuses
+// ReadQuantCodes/SliceAlongAxis/SetQuantCodes exactly like
+// SliceQopProducer/SliceQopConsumer above -- "slice, don't requantize": the
+// existing codes are relocated, never recomputed. Shared by
+// SliceConvIntegerProducer/SliceConvIntegerConsumer (axis 0/1 respectively)
+// and ApplyConvIntegerChains' own depthwise pass-through hop (axis 0).
+void SliceConvIntegerWeightAxis(onnx::TensorProto* wt, int64_t axis,
+                                const std::vector<int64_t>& keep) {
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const std::vector<int64_t> codes = ReadQuantCodes(*wt);
+  const std::vector<int64_t> new_codes =
+      SliceAlongAxis(codes, dims, axis, keep);
+  std::vector<int64_t> new_dims = dims;
+  new_dims[static_cast<size_t>(axis)] = static_cast<int64_t>(keep.size());
+  SetQuantCodes(wt, wt->data_type(), new_dims, new_codes);
+}
+
+// Slices `w`'s own N (output-channel) axis to `keep` -- the producer role.
+// `w_scale`/`w_zero_point` are always per-tensor scalar here (see this
+// section's own top comment), so -- unlike the QOperator section's own
+// per-channel branch -- neither is ever sliced. The plain-float `bias`
+// (never quantized) is sliced exactly like a plain float Conv's own bias.
+// Mirrors pruning.py's own `_slice_conv_integer_producer`.
+void SliceConvIntegerProducer(const ConvIntegerMatch& w,
+                              const std::vector<int64_t>& keep,
+                              MutInitMap& init_map) {
+  SliceConvIntegerWeightAxis(init_map.at(w.w_name), /*axis=*/0, keep);
+  if (w.bias_name) {
+    SliceLastAxis(init_map.at(*w.bias_name), keep);
+  }
+}
+
+// Slices `w`'s own K (input-channel) axis to `keep` -- the consumer role.
+// Never touches w_scale/w_zero_point/bias -- none of them are indexed by K.
+// Mirrors pruning.py's own `_slice_conv_integer_consumer`.
+void SliceConvIntegerConsumer(const ConvIntegerMatch& w,
+                              const std::vector<int64_t>& keep,
+                              MutInitMap& init_map) {
+  SliceConvIntegerWeightAxis(init_map.at(w.w_name), /*axis=*/1, keep);
+}
+
+// Mirrors pruning.py's own `_ConvIntegerChain`. `consumer` is always set
+// here -- unlike pruning.py's own `matmul_consumer` union member (the
+// GAP -> Flatten -> MatMul classifier-head exception), this port has no
+// second consumer shape at all, see this section's own top comment for why.
+struct ConvIntegerChain {
+  ConvIntegerMatch producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  ConvIntegerMatch consumer;
+  int64_t n_channels = 0;
+  std::vector<ConvIntegerPassThrough> conv_pass_through;
+};
+
+// From tensor `start` (a matched `ConvInteger` Conv layer's own logical
+// output, ConvIntegerFinalOutput), walks forward through shape-preserving
+// unary activations (UnaryPassThroughOps) -- plus a channel-agnostic `Clip`
+// (MatchClipChannelPassThrough) -- plus a depthwise `ConvInteger` mid-chain
+// hop, reached through its own dedicated `DynamicQuantizeLinear` producer
+// (MatchConvIntegerDepthwisePassThrough) -- with no other consumer anywhere
+// along the way, until a same-family, ordinary (`group == 1`)
+// `ConvInteger`-based consumer (reached through its own
+// `DynamicQuantizeLinear` producer) is found whose own `K` matches
+// `n_channels`. Mirrors pruning.py's own `_walk_to_conv_integer_consumer`,
+// EXCEPT for the `GlobalAveragePool` classifier-head exception it also
+// matches -- see this section's own top comment for why that one hop is a
+// known, deliberate gap in this port: a `GlobalAveragePool` hit here simply
+// isn't a recognized op (not in UnaryPassThroughOps, no dedicated case), so
+// the walk declines exactly like any other unmatched topology, never
+// guessing. Returns nullopt if the walk runs out of hops, hits a branch, or
+// never reaches a consumer.
+std::optional<std::tuple<ConvIntegerMatch, std::vector<onnx::NodeProto*>,
+                         std::vector<ConvIntegerPassThrough>>>
+WalkToConvIntegerConsumer(const std::string& start, const InitMap& init_map,
+                          const ConsumerMap& consumers_of,
+                          const ProducerMap& producers_of,
+                          const std::unordered_set<std::string>& graph_outputs,
+                          int64_t n_channels, int max_hops) {
+  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ConvIntegerPassThrough> pass_through;
+  std::string cur = start;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* nxt = cit->second[0];
+
+    if (nxt->op_type() == "DynamicQuantizeLinear" && nxt->domain().empty() &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 3) {
+      const std::string& y_name = nxt->output(0);
+      auto yit = consumers_of.find(y_name);
+      if (yit != consumers_of.end() && yit->second.size() == 1 &&
+          yit->second[0]->op_type() == "ConvInteger") {
+        onnx::NodeProto* ci_node = yit->second[0];
+        auto m =
+            MatchConvInteger(ci_node, init_map, consumers_of, producers_of);
+        if (m && m->dq_node == nxt && m->K == n_channels) {
+          return std::make_tuple(*m, std::move(chain_ops),
+                                 std::move(pass_through));
+        }
+        auto dw = MatchConvIntegerDepthwisePassThrough(
+            ci_node, init_map, consumers_of, producers_of, n_channels, nxt);
+        if (dw) {
+          const std::string& final_out = dw->second;
+          auto fit = consumers_of.find(final_out);
+          if (fit == consumers_of.end() || fit->second.size() != 1 ||
+              graph_outputs.count(final_out)) {
+            return std::nullopt;
+          }
+          pass_through.push_back(dw->first);
+          cur = final_out;
+          continue;
+        }
+      }
+      return std::nullopt;
+    }
+
+    if (nxt->op_type() == "Clip" && nxt->domain().empty() &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1 &&
+        MatchClipChannelPassThrough(*nxt, init_map)) {
+      const std::string& out2 = nxt->output(0);
+      auto oit = consumers_of.find(out2);
+      if (oit == consumers_of.end() || oit->second.size() != 1 ||
+          graph_outputs.count(out2)) {
+        return std::nullopt;
+      }
+      chain_ops.push_back(nxt);
+      cur = out2;
+      continue;
+    }
+
+    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+          nxt->input_size() == 1 && nxt->input(0) == cur &&
+          nxt->output_size() == 1)) {
+      return std::nullopt;
+    }
+    const std::string& out2 = nxt->output(0);
+    auto oit = consumers_of.find(out2);
+    if (oit == consumers_of.end() || oit->second.size() != 1 ||
+        graph_outputs.count(out2)) {
+      return std::nullopt;
+    }
+    chain_ops.push_back(nxt);
+    cur = out2;
+  }
+  return std::nullopt;
+}
+
+// Every `ConvInteger`-based producer/consumer pair connected by
+// WalkToConvIntegerConsumer -- both sides always `ConvInteger`-based, see
+// this section's own top comment for why. Mirrors pruning.py's own
+// `_find_conv_integer_chains`, minus its own `matmul_consumer` exception
+// (see this section's own top comment for that known gap).
+std::vector<ConvIntegerChain> FindConvIntegerChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  ProducerMap producers_of = ProducersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<ConvIntegerChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    if (node->op_type() != "ConvInteger") {
+      continue;
+    }
+    auto m = MatchConvInteger(node, init_map, consumers_of, producers_of);
+    if (!m) {
+      continue;
+    }
+
+    const std::string final_out = ConvIntegerFinalOutput(*m);
+    if (!is_internal(final_out)) {
+      continue;
+    }
+    auto found = WalkToConvIntegerConsumer(final_out, init_map, consumers_of,
+                                           producers_of, graph_outputs, m->N,
+                                           kMaxChainHops);
+    if (!found) {
+      continue;
+    }
+    auto& [consumer, chain_ops, pass_through] = *found;
+    ConvIntegerChain chain;
+    chain.producer = *m;
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer = std::move(consumer);
+    chain.n_channels = m->N;
+    chain.conv_pass_through = std::move(pass_through);
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// The apply body for ConvInteger chains, mirroring
+// `apply_structured_pruning_dynamic_quantize_conv`'s own main loop over
+// `_find_conv_integer_chains` -- see this section's own top comment for the
+// producer/consumer/depthwise-hop slicing rules this enforces. Only L2
+// importance is supported (QdqChannelImportanceL2) -- the same scope
+// narrowing every other quantized-weight family in this file already has
+// relative to pruning.py's own wider L1/L2 `importance_norm` parameter (see
+// ApplyQopChains's own identical comment).
+void ApplyConvIntegerChains(onnx::GraphProto* graph,
+                            std::vector<ConvIntegerChain>& chains,
+                            double sparsity, TouchedState& touched) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  auto& producer_touched = touched.producer;
+  auto& consumer_touched = touched.consumer;
+  auto& stale_value_info = touched.stale_value_info;
+
+  for (auto& chain : chains) {
+    const ConvIntegerMatch& p = chain.producer;
+    const ConvIntegerMatch& c = chain.consumer;
+    const std::string& p_key = p.w_name;
+    const std::string& c_key = c.w_name;
+    if (p_key == c_key) {
+      continue;  // Degenerate (the same weight in both roles).
+    }
+    if (producer_touched.count(p_key) || consumer_touched.count(c_key)) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const std::vector<double> w_nk = ConvIntegerDequantizedNk(p, init_map);
+    const int64_t row_len = static_cast<int64_t>(w_nk.size()) / n;
+    const std::vector<double> importance =
+        QdqChannelImportanceL2(w_nk, n, row_len);
+    const std::vector<int64_t> keep =
+        StableTopKIndicesAscending(importance, keep_count);
+
+    SliceConvIntegerProducer(p, keep, init_map);
+    SliceConvIntegerConsumer(c, keep, init_map);
+
+    for (auto& hop : chain.conv_pass_through) {
+      // Mirrors _apply_conv_pass_through_hop's identical depthwise-Conv
+      // treatment: axis-0 weight slice, bias slice (if present), group
+      // shrunk to the new channel count. w_scale/w_zero_point are always
+      // per-tensor scalar (see this section's own top comment), so never
+      // touched.
+      SliceConvIntegerWeightAxis(init_map.at(hop.w_name), /*axis=*/0, keep);
+      if (hop.bias_name) {
+        SliceLastAxis(init_map.at(*hop.bias_name), keep);
+      }
+      SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      stale_value_info.insert(hop.node->output(0));
+      stale_value_info.insert(hop.cast_node->output(0));
+      stale_value_info.insert(hop.rescale_mul_node->output(0));
+      if (hop.bias_add_node != nullptr) {
+        stale_value_info.insert(hop.bias_add_node->output(0));
+      }
+    }
+
+    producer_touched.insert(p_key);
+    consumer_touched.insert(c_key);
+    stale_value_info.insert(p.node->output(0));
+    stale_value_info.insert(p.cast_node->output(0));
+    stale_value_info.insert(p.rescale_mul_node->output(0));
+    if (p.bias_add_node != nullptr) {
+      stale_value_info.insert(p.bias_add_node->output(0));
+    }
+    for (auto* op : chain.chain_ops) {
+      stale_value_info.insert(op->output(0));
+    }
+  }
+}
+
 // --- Subgraph recursion ------------------------------------------------
 //
 // Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
@@ -24225,6 +25135,8 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
         FindFp4BlockQuantizedChains(graph);
     std::vector<QOpChain> qop_chains = FindQopChains(graph);
     std::vector<DynQuantChain> dynquant_chains = FindDynQuantChains(graph);
+    std::vector<ConvIntegerChain> conv_integer_chains =
+        FindConvIntegerChains(graph);
 
     TouchedState touched;
     // `global_sparsity` mirrors pruning.py's own apply_structured_pruning
@@ -24240,7 +25152,8 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
     // own `if global_sparsity: ... else: ...` body only ever calls
     // `_apply_concat_chains`/`_apply_split_gated_chains` from the `else`
     // branch) -- mirrored here the same way. The quantized-weight families
-    // below (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul)
+    // below
+    // (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul/ConvInteger)
     // are additional scope this one C++ entry point consolidates from
     // several separate pure-Python top-level functions
     // (apply_structured_pruning_qdq and friends), NONE of which have a
@@ -24349,7 +25262,7 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       ApplyQopChains(graph, qop_chains, sparsity, touched);
     }
     if (!dynquant_chains.empty()) {
-      // The eleventh and final application pass over this graph -- see this
+      // The eleventh application pass over this graph -- see this
       // file's own "DynamicQuantizeMatMul / MatMulIntegerToFloat" section
       // comment. Shares `touched` with every call above for the same "one
       // shared conflict ledger per graph" reason every other quantized-
@@ -24358,6 +25271,18 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       // double-resize, an ordinary chain/MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator
       // chain that already touched it.
       ApplyDynQuantChains(graph, dynquant_chains, sparsity, touched);
+    }
+    if (!conv_integer_chains.empty()) {
+      // The twelfth application pass over this graph -- see this file's own
+      // "DynamicQuantizeConv (ConvInteger, ORT dynamic-quantization Conv
+      // pattern)" section comment. Shares `touched` with every call above
+      // for the same "one shared conflict ledger per graph" reason every
+      // other quantized-weight pass here does: `ConvInteger` is a node type
+      // no other Find*Chains call above recognizes at all, so this can
+      // never double-match a tensor any of them already claimed, but a
+      // shared/tied weight could in principle still appear in more than one
+      // family's own initializer list.
+      ApplyConvIntegerChains(graph, conv_integer_chains, sparsity, touched);
     }
     if (!touched.stale_value_info.empty()) {
       google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
@@ -24395,7 +25320,7 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 
   // Same chain-finding as ApplyStructuredPruning's own PLAIN family --
   // deliberately excluding every quantized-weight family
-  // (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul)
+  // (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul/ConvInteger)
   // ApplyStructuredPruning additionally folds in, since pruning.py's own
   // apply_structured_wanda_pruning has no quantized-weight counterpart
   // either -- see structured_pruning_entry.h's own declaration comment.

@@ -9319,6 +9319,528 @@ def test_cpp_dynamic_quantize_matmul_matches_python_reference():
     assert py_bytes == cpp_bytes
 
 
+# --- DynamicQuantizeConv (ConvInteger, ORT dynamic-quantization Conv
+# --- pattern) structured pruning ---------------------------------------------
+#
+# Mirrors ``tests/test_pruning.py``'s own "DynamicQuantizeConv (ConvInteger)"
+# coverage for ``onnxsim.apply_structured_pruning_cpp`` -- the C++ port now
+# also runs this chain family (see ``onnxsim/structured_pruning_entry.cpp``'s
+# own "DynamicQuantizeConv (ConvInteger, ...)" section comment), wired into
+# the SAME entry point as every other chain family above. Fixture weights are
+# quantized via the REAL ``onnxruntime.quantization.quantize_dynamic`` tool
+# (never a hand-rolled re-implementation), mirroring ``test_pruning.py``'s own
+# identical ``_quantize_dynamic_conv_weight``/``_dqconv_model_from_weights``
+# helpers (trimmed here of that file's own ``Reshape([0,-1])`` classifier-head
+# variant, out of scope for this C++ port -- see below).
+#
+# KNOWN, DELIBERATE GAP (documented in the C++ section comment above
+# ``ApplyConvIntegerChains``): the classifier-head
+# ``GlobalAveragePool -> Flatten -> {MatMul, Gemm}`` hop pruning.py's own
+# reference additionally matches is NOT recognized by this C++ port --
+# ``test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_is_not_matched``
+# below confirms that shape is left completely untouched by
+# ``apply_structured_pruning_cpp`` (while the Python reference DOES prune
+# it), so this is documented directly by a test rather than merely implied.
+# Because of this gap, ``onnxsim.pruning.apply_structured_pruning_dynamic_
+# quantize_conv`` itself is NOT aliased to the C++ port (see that function's
+# own docstring/pruning.py's own section comment) -- only the ordinary
+# same-family producer/consumer chain (with the Clip/depthwise-mid-chain
+# hops) is covered here.
+
+
+def _quantize_dynamic_conv_weight(W, spatial=8, per_channel=False):
+    """Runs the REAL ``onnxruntime.quantization.quantize_dynamic`` tool on a
+    minimal ``Y = Conv(X, W)`` wrapper model and returns the genuine
+    quantized ``(W_int8[M,C,kH,kW], W_scale, W_zero_point)`` triple it emits
+    for `W` -- mirrors ``test_pruning.py``'s own identical helper.
+    """
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    m, c, kh, kw = W.shape
+    pad_h, pad_w = (kh - 1) // 2, (kw - 1) // 2
+    src = _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] X) => (float[1,{m},{spatial},{spatial}] Y)
+        {{
+          Y = Conv<kernel_shape=[{kh},{kw}], pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>(X, W)
+        }}
+        """,
+        initializer=[_f32(W, "W")],
+        opset=21,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        dst_path = os.path.join(d, "dst.onnx")
+        onnx.save(src, src_path)
+        quantize_dynamic(
+            src_path,
+            dst_path,
+            per_channel=per_channel,
+            weight_type=QuantType.QInt8,
+            op_types_to_quantize=["Conv"],
+        )
+        q = onnx.load(dst_path)
+    inits = {t.name: t for t in q.graph.initializer}
+    Wq = onnx.numpy_helper.to_array(inits["W_quantized"]).copy()
+    Wscale = onnx.numpy_helper.to_array(inits["W_scale"]).copy()
+    Wzp = onnx.numpy_helper.to_array(inits["W_zero_point"]).copy()
+    return Wq, Wscale, Wzp
+
+
+def _dqconv_model_from_weights(
+    c,
+    m1,
+    m2,
+    w1f,
+    w2f,
+    b1f=None,
+    spatial=8,
+    activation="Relu",
+    activation_node=None,
+    extra_initializer=(),
+):
+    """Builds ``DynamicQuantizeLinear -> ConvInteger -> Cast -> Mul
+    [-> Reshape -> Add] -> activation -> DynamicQuantizeLinear ->
+    ConvInteger -> Cast -> Mul`` -- a same-family chain -- mirrors
+    ``test_pruning.py``'s own identical ``_dqconv_model_from_weights``.
+    `activation_node`, when given, is a complete ONNX-text node line
+    overriding the plain ``h1 = {activation}(...)`` node below (e.g. a
+    ``Clip`` with explicit Min/Max operands), with `extra_initializer`
+    carrying whatever constant tensors that text line references.
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
+
+    kh1, kw1 = w1f.shape[2], w1f.shape[3]
+    kh2, kw2 = w2f.shape[2], w2f.shape[3]
+    ph1, pw1 = (kh1 - 1) // 2, (kw1 - 1) // 2
+    ph2, pw2 = (kh2 - 1) // 2, (kw2 - 1) // 2
+
+    if b1f is not None:
+        bias_ops = """
+          b1r = Reshape(b1, b1_shape)
+          c1 = Add(c1s, b1r)
+        """
+        c1_out = "c1"
+    else:
+        bias_ops = ""
+        c1_out = "c1s"
+
+    activation_ops = (
+        activation_node
+        if activation_node is not None
+        else f"h1 = {activation}({c1_out})"
+    )
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{m2},{spatial},{spatial}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[{kh1},{kw1}], pads=[{ph1},{pw1},{ph1},{pw1}]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      {bias_ops}
+      {activation_ops}
+      rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
+      combined_scale2 = Mul(r_scale, w2_scale)
+      c2i = ConvInteger<kernel_shape=[{kh2},{kw2}], pads=[{ph2},{pw2},{ph2},{pw2}]>(rq, w2_quantized, r_zero_point, w2_zero_point)
+      c2f = Cast<to=1>(c2i)
+      y = Mul(c2f, combined_scale2)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        onnx.numpy_helper.from_array(w2q, "w2_quantized"),
+        onnx.numpy_helper.from_array(w2s, "w2_scale"),
+        onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+        *extra_initializer,
+    ]
+    if b1f is not None:
+        inits.append(_f32(b1f, "b1"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "b1_shape"
+            )
+        )
+    model = _model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": w1f,
+        "W2f": w2f,
+        "B1f": b1f,
+        "W1q": w1q,
+        "W1s": w1s,
+        "W1zp": w1zp,
+        "W2q": w2q,
+        "W2s": w2s,
+        "W2zp": w2zp,
+        "spatial": spatial,
+    }
+
+
+def _dqconv_chain_model(c, m1, m2, kh=3, kw=3, bias1=False, spatial=8, seed=0):
+    rng = np.random.default_rng(seed)
+    w1f = (rng.standard_normal((m1, c, kh, kw)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, kh, kw)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(m1) * 0.05).astype(np.float32) if bias1 else None
+    return _dqconv_model_from_weights(c, m1, m2, w1f, w2f, b1f=b1f, spatial=spatial)
+
+
+def _dqconv_clip_model_from_weights(
+    c, m1, m2, w1f, w2f, b1f=None, spatial=8, min_val=0.0, max_val=6.0
+):
+    """The `_dqconv_model_from_weights` analogue exercising
+    `WalkToConvIntegerConsumer`'s own ``Clip`` pass-through hop (the ReLU6
+    shape MobileNetV2/V3 and EfficientNet-Lite Conv chains use) in place of a
+    plain unary activation between the two ``ConvInteger`` chains.
+    """
+    extra_initializer = []
+    if min_val is not None:
+        extra_initializer.append(
+            onnx.numpy_helper.from_array(np.array(min_val, dtype=np.float32), "ClipMin")
+        )
+    if max_val is not None:
+        extra_initializer.append(
+            onnx.numpy_helper.from_array(np.array(max_val, dtype=np.float32), "ClipMax")
+        )
+    c1_out = "c1" if b1f is not None else "c1s"
+    if min_val is not None and max_val is not None:
+        clip_node = f"h1 = Clip({c1_out}, ClipMin, ClipMax)"
+    elif min_val is not None:
+        clip_node = f"h1 = Clip({c1_out}, ClipMin)"
+    elif max_val is not None:
+        clip_node = f"h1 = Clip({c1_out}, , ClipMax)"
+    else:
+        clip_node = f"h1 = Clip({c1_out})"
+    return _dqconv_model_from_weights(
+        c,
+        m1,
+        m2,
+        w1f,
+        w2f,
+        b1f=b1f,
+        spatial=spatial,
+        activation_node=clip_node,
+        extra_initializer=extra_initializer,
+    )
+
+
+def _dqconv_clip_chain_model(
+    c, m1, m2, kh=3, kw=3, bias1=False, spatial=8, seed=0, min_val=0.0, max_val=6.0
+):
+    rng = np.random.default_rng(seed)
+    w1f = (rng.standard_normal((m1, c, kh, kw)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, kh, kw)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(m1) * 0.05).astype(np.float32) if bias1 else None
+    return _dqconv_clip_model_from_weights(
+        c, m1, m2, w1f, w2f, b1f=b1f, spatial=spatial, min_val=min_val, max_val=max_val
+    )
+
+
+def _dqconv_depthwise_chain_model_from_weights(
+    c, m1, m2, w1f, wdf, w2f, b1f=None, bdf=None, spatial=8, activation="Relu"
+):
+    """The `_dqconv_model_from_weights` analogue for a full ``pointwise
+    ConvInteger -> depthwise ConvInteger -> pointwise ConvInteger`` chain --
+    the canonical MobileNetV1/V2/V3 depthwise-separable-conv unit -- after
+    real dynamic quantization. `w1f`/`w2f` are ordinary (`group == 1`)
+    pointwise (``1x1``) Conv weights; `wdf` is the depthwise stage's own
+    ``[m1, 1, khd, kwd]`` weight (`group == m1`). Mirrors ``test_pruning.py``'s
+    own identical helper.
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    wdq, wds, wdzp = _quantize_dynamic_conv_weight(wdf, spatial=spatial)
+    w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
+
+    khd, kwd = wdf.shape[2], wdf.shape[3]
+    phd, pwd = (khd - 1) // 2, (kwd - 1) // 2
+
+    if b1f is not None:
+        bias1_ops = """
+          b1r = Reshape(b1, b1_shape)
+          c1 = Add(c1s, b1r)
+        """
+        c1_out = "c1"
+    else:
+        bias1_ops = ""
+        c1_out = "c1s"
+
+    if bdf is not None:
+        biasd_ops = """
+          bdr = Reshape(bd, bd_shape)
+          cd = Add(cds, bdr)
+        """
+        cd_out = "cd"
+    else:
+        biasd_ops = ""
+        cd_out = "cds"
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{m2},{spatial},{spatial}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[1,1]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      {bias1_ops}
+      h1 = {activation}({c1_out})
+      rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
+      combined_scaled = Mul(r_scale, wd_scale)
+      cdi = ConvInteger<kernel_shape=[{khd},{kwd}], pads=[{phd},{pwd},{phd},{pwd}], group={m1}>(rq, wd_quantized, r_zero_point, wd_zero_point)
+      cdf = Cast<to=1>(cdi)
+      cds = Mul(cdf, combined_scaled)
+      {biasd_ops}
+      hd = {activation}({cd_out})
+      rq2, r_scale2, r_zero_point2 = DynamicQuantizeLinear(hd)
+      combined_scale2 = Mul(r_scale2, w2_scale)
+      c2i = ConvInteger<kernel_shape=[1,1]>(rq2, w2_quantized, r_zero_point2, w2_zero_point)
+      c2f = Cast<to=1>(c2i)
+      y = Mul(c2f, combined_scale2)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        onnx.numpy_helper.from_array(wdq, "wd_quantized"),
+        onnx.numpy_helper.from_array(wds, "wd_scale"),
+        onnx.numpy_helper.from_array(wdzp, "wd_zero_point"),
+        onnx.numpy_helper.from_array(w2q, "w2_quantized"),
+        onnx.numpy_helper.from_array(w2s, "w2_scale"),
+        onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+    ]
+    if b1f is not None:
+        inits.append(_f32(b1f, "b1"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "b1_shape"
+            )
+        )
+    if bdf is not None:
+        inits.append(_f32(bdf, "bd"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "bd_shape"
+            )
+        )
+    model = _model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": w1f,
+        "Wdf": wdf,
+        "W2f": w2f,
+        "B1f": b1f,
+        "Bdf": bdf,
+        "W1q": w1q,
+        "W1s": w1s,
+        "W1zp": w1zp,
+        "Wdq": wdq,
+        "Wds": wds,
+        "Wdzp": wdzp,
+        "W2q": w2q,
+        "W2s": w2s,
+        "W2zp": w2zp,
+        "spatial": spatial,
+    }
+
+
+def _dqconv_depthwise_chain_model(
+    c, m1, m2, khd=3, kwd=3, bias1=False, biasd=False, spatial=8, seed=0
+):
+    rng = np.random.default_rng(seed)
+    w1f = (rng.standard_normal((m1, c, 1, 1)) * 0.3).astype(np.float32)
+    wdf = (rng.standard_normal((m1, 1, khd, kwd)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, 1, 1)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(m1) * 0.05).astype(np.float32) if bias1 else None
+    bdf = (rng.standard_normal(m1) * 0.05).astype(np.float32) if biasd else None
+    return _dqconv_depthwise_chain_model_from_weights(
+        c, m1, m2, w1f, wdf, w2f, b1f=b1f, bdf=bdf, spatial=spatial
+    )
+
+
+def _dqconv_gap_flatten_gemm_model_from_weights(c, m1, out, w1f, w3f, spatial=8):
+    """The classifier-head shape pruning.py's own reference matches --
+    a single ``ConvInteger`` producer's own logical output feeding
+    ``GlobalAveragePool -> Flatten(axis=1) -> Gemm`` DIRECTLY (no downstream
+    ``ConvInteger`` consumer at all, isolating this hop from the ordinary
+    producer/consumer chain shape already covered by the tests above) --
+    but this C++ port deliberately does NOT match (see this section's own
+    top comment) -- used only to confirm that gap directly: with no
+    recognized consumer of any kind, `WalkToConvIntegerConsumer` declines at
+    the very first hop (`GlobalAveragePool` isn't a unary/`Clip`/
+    `DynamicQuantizeLinear`-leading-to-`ConvInteger` hop), so
+    `FindConvIntegerChains` finds nothing at all here and the whole graph is
+    left untouched.
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    kh1, kw1 = w1f.shape[2], w1f.shape[3]
+    ph1, pw1 = (kh1 - 1) // 2, (kw1 - 1) // 2
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{out}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[{kh1},{kw1}], pads=[{ph1},{pw1},{ph1},{pw1}]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      h1 = Mul(c1f, combined_scale1)
+      p = GlobalAveragePool(h1)
+      f = Flatten<axis=1>(p)
+      y = Gemm<transB=1>(f, w3)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        _f32(w3f, "w3"),
+    ]
+    model = _model(body, initializer=inits, opset=21)
+    return model
+
+
+def test_cpp_dynamic_quantize_conv_matches_python_reference():
+    # Byte-for-byte parity between the Python `apply_structured_pruning_
+    # dynamic_quantize_conv` reference and the C++-backed
+    # `apply_structured_pruning_cpp` entry point, for the core (bias-bearing)
+    # producer -> consumer chain -- mirrors this file's own identical parity
+    # checks for every other quantized-weight chain family above.
+    c, m1, m2 = 4, 8, 6
+    model, _info = _dqconv_chain_model(c, m1, m2, bias1=True, seed=21)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_dynamic_quantize_conv(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+    # A real channel was actually removed (not a vacuous no-op comparison).
+    assert list(cpp_bytes.keys())
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert list(inits["w1_quantized"].dims)[0] == m1 // 2
+    assert list(inits["w2_quantized"].dims)[1] == m1 // 2
+
+
+def test_cpp_dynamic_quantize_conv_clip_pass_through_matches_python_reference():
+    # The ReLU6 (`Clip(0, 6)`) pass-through hop between the two `ConvInteger`
+    # layers -- the MobileNetV2/V3/EfficientNet-Lite shape.
+    c, m1, m2 = 4, 8, 6
+    model, _info = _dqconv_clip_chain_model(c, m1, m2, bias1=True, seed=22)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_dynamic_quantize_conv(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+
+def test_cpp_dynamic_quantize_conv_depthwise_mid_chain_matches_python_reference():
+    # The canonical MobileNetV1/V2/V3 `pointwise -> depthwise -> pointwise`
+    # unit: the depthwise `ConvInteger` sitting mid-chain must be recognized
+    # as a transparent pass-through hop (its own weight/bias sliced by the
+    # SAME `keep` set, `group` shrunk to match) rather than declined as an
+    # endpoint.
+    c, m1, m2 = 4, 8, 6
+    model, _info = _dqconv_depthwise_chain_model(
+        c, m1, m2, bias1=True, biasd=True, seed=23
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_dynamic_quantize_conv(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    # The depthwise hop's own weight/bias were resized/re-grouped too, not
+    # just the two ordinary endpoints.
+    assert list(inits["wd_quantized"].dims)[0] == m1 // 2
+    conv_nodes = {
+        n.output[0]: n for n in pruned_cpp.graph.node if n.op_type == "ConvInteger"
+    }
+    depthwise_node = conv_nodes["cdi"]
+    group_attr = next(a.i for a in depthwise_node.attribute if a.name == "group")
+    assert group_attr == m1 // 2
+
+
+def test_cpp_dynamic_quantize_conv_tied_weight_is_declined():
+    # A second, unrelated node also reads w1_quantized -- shared/tied, can't
+    # be sliced -- mirrors this file's own identical decline tests for the
+    # other quantized-weight chain families above.
+    c, m1, m2 = 4, 8, 6
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=24)
+    extra = onnx.helper.make_node(
+        "Identity", ["w1_quantized"], ["w1_alias"], name="alias"
+    )
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info(
+            "w1_alias", onnx.TensorProto.INT8, [m1, c, 3, 3]
+        )
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    # Left completely untouched -- w1_quantized is shared, so this chain is
+    # declined.
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_dynamic_quantize_conv_zero_sparsity_is_a_no_op():
+    c, m1, m2 = 4, 8, 6
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=25)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_is_not_matched():
+    # KNOWN, DELIBERATE GAP (see this section's own top comment and
+    # ``structured_pruning_entry.cpp``'s own "DynamicQuantizeConv
+    # (ConvInteger, ...)" section comment): the C++ port has no
+    # `GlobalAveragePool`/`Flatten`/`Gemm`-walking machinery at all, so this
+    # classifier-head shape -- which the Python reference DOES match and
+    # prune -- is left completely untouched here, exactly like any other
+    # unrecognized topology (never mis-sliced).
+    c, m1, out = 4, 8, 5
+    rng = np.random.default_rng(26)
+    w1f = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w3f = (rng.standard_normal((out, m1)) * 0.3).astype(np.float32)
+    model = _dqconv_gap_flatten_gemm_model_from_weights(c, m1, out, w1f, w3f)
+    onnx.checker.check_model(model)
+
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+
+    # Confirm this is a genuine "C++ doesn't recognize it" gap, not simply an
+    # unmatchable fixture: the Python reference DOES prune it (the whole
+    # point of this test).
+    pruned_py = onnxsim.apply_structured_pruning_dynamic_quantize_conv(
+        model, sparsity=0.5
+    )
+    assert pruned_py.SerializeToString() != model.SerializeToString()
+    py_inits = {t.name: t for t in pruned_py.graph.initializer}
+    assert list(py_inits["w1_quantized"].dims)[0] == m1 // 2
+
+
 # --- importance_norm ("l1" vs "l2") and global_sparsity ---------------------
 #
 # Adapted from test_pruning.py's own `test_structured_pruning_l1_norm_favors_
