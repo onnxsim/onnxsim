@@ -1281,6 +1281,854 @@ def test_cpp_gqa_pruning_cross_attention_matches_oracle_exactly():
     assert not np.allclose(y_pruned, y_pruned2)
 
 
+
+
+# --- Packed-QKV-then-Split + RoPE/QK-norm walk-back (GroupQueryAttention/ ---
+# --- plain ai.onnx::Attention) -- FindSeparateQkvChains's own new
+# --- WalkBackThroughQkNormRope/WalkBackThroughGemmaRopePair machinery,
+# --- mirroring pruning.py's own `_walk_back_through_qk_norm_rope`/
+# --- `_walk_back_through_gemma_rope_pair` exactly -------------------------
+#
+# A single packed MatMul/Gemm projection feeding a `Split` whose three
+# outputs feed the fused attention op's own three separate query/key/value
+# inputs, optionally through an intervening per-head `SimplifiedLayerNorm`
+# sandwich and/or `RotaryEmbedding`/`MRotaryEmbedding`/`GemmaRotaryEmbedding`
+# hop on Q's/K's own branch -- see MatchPackedQkvSplit's/
+# WalkBackThroughQkNormRope's/WalkBackThroughGemmaRopePair's own comments in
+# structured_pruning_entry.cpp for the exact topology and the real
+# onnxruntime-genai model-builder export shape this was confirmed against.
+# Every test below verifies byte-for-byte parity against the (still
+# pure-Python, unaliased) `apply_attention_head_pruning` reference -- the
+# same bar `test_cpp_decomposed_packed_qkv_pruning_matches_python_reference_
+# exactly` above already holds the decomposed-attention family's own packed
+# producer to.
+
+
+def _gqa_packed_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    bias=False,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    qkv_op = "MatMul(X, Wqkv)"
+    if bias:
+        if bqkv is None:
+            bqkv = rng.standard_normal((Nq + 2 * Nkv,)).astype(np.float32)
+        initializer.append(_f32(bqkv, "Bqkv"))
+        qkv_op = "Gemm(X, Wqkv, Bqkv)"
+
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = {qkv_op}
+          q, k, v = Split <axis = -1> (qkv, SplitSizes)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_split_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=301)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * (H // KVH)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, H // KVH)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    expected_wqkv = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    np.testing.assert_array_equal(inits["Wqkv"], expected_wqkv)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+
+def test_cpp_gqa_packed_qkv_split_pruning_slices_packed_bias():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=302, bias=True)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv, bqkv = cfg["wqkv"], cfg["bqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+    bq, bk, bv = bqkv[:Nq], bqkv[Nq : Nq + Nkv], bqkv[Nq + Nkv :]
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, H // KVH)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    expected_bqkv = np.concatenate([bq[q_idx], bk[kv_idx], bv[kv_idx]])
+    np.testing.assert_array_equal(inits["Bqkv"], expected_bqkv)
+
+
+def _qk_norm_rope_body(
+    prefix,
+    raw_name,
+    gamma_name,
+    reshape1_shape_name,
+    reshape2_shape_name,
+    with_norm,
+    with_rope,
+    cos_name="CosCache",
+    sin_name="SinCache",
+    pos_name="PosIds",
+    interleaved=0,
+    rotary_embedding_dim=0,
+    rotary_num_heads=None,
+):
+    lines = []
+    cur = raw_name
+    if with_norm:
+        lines.append(f"{prefix}_r1 = Reshape({cur}, {reshape1_shape_name})")
+        lines.append(
+            f"{prefix}_ln = SimplifiedLayerNormalization <axis=-1, epsilon=1e-6> "
+            f"({prefix}_r1, {gamma_name})"
+        )
+        lines.append(f"{prefix}_normed = Reshape({prefix}_ln, {reshape2_shape_name})")
+        cur = f"{prefix}_normed"
+    if with_rope:
+        nh = rotary_num_heads if rotary_num_heads is not None else 0
+        lines.append(
+            f"{prefix}_rot = com.microsoft.RotaryEmbedding "
+            f"<num_heads={nh}, interleaved={interleaved}, "
+            f"rotary_embedding_dim={rotary_embedding_dim}> "
+            f"({cur}, {pos_name}, {cos_name}, {sin_name})"
+        )
+        cur = f"{prefix}_rot"
+    return "\n          ".join(lines), cur
+
+
+def _gqa_qk_norm_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    with_norm=True,
+    with_rope=True,
+    interleaved=0,
+    rotary_embedding_dim=0,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+    wqkv=None,
+    wout=None,
+    q_gamma=None,
+    k_gamma=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    half = D // 2
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+    initializer += [_f32(cos, "CosCache"), _f32(sin, "SinCache")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+    if q_gamma is None:
+        q_gamma = rng.standard_normal((D,)).astype(np.float32)
+    if k_gamma is None:
+        k_gamma = rng.standard_normal((D,)).astype(np.float32)
+    initializer += [_f32(q_gamma, "QGamma"), _f32(k_gamma, "KGamma")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, D], dtype=np.int64), "QReshape1Shape"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nq], dtype=np.int64), "QReshape2Shape"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, D], dtype=np.int64), "KReshape1Shape"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshape2Shape"
+        )
+    )
+
+    rope_kwargs = dict(
+        interleaved=interleaved, rotary_embedding_dim=rotary_embedding_dim
+    )
+    q_text, q_body = _qk_norm_rope_body(
+        "q",
+        "q_raw",
+        "QGamma",
+        "QReshape1Shape",
+        "QReshape2Shape",
+        with_norm,
+        with_rope,
+        rotary_num_heads=q_rotary_num_heads,
+        **rope_kwargs,
+    )
+    k_text, k_body = _qk_norm_rope_body(
+        "k",
+        "k_raw",
+        "KGamma",
+        "KReshape1Shape",
+        "KReshape2Shape",
+        with_norm,
+        with_rope,
+        rotary_num_heads=k_rotary_num_heads,
+        **rope_kwargs,
+    )
+    hop_body = q_text + "\n          " + k_text
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          {hop_body}
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({q_body}, {k_body}, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_qk_norm_rope_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=303,
+        with_norm=True,
+        with_rope=True,
+        interleaved=1,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    # No onnx.checker.check_model here -- `SimplifiedLayerNormalization`
+    # registers under the default ("") domain but isn't in onnx's own
+    # schema registry at all (pruning.py's own "Attention-head pruning"
+    # section comment/`_norm_pass_through_const_names`'s own docstring),
+    # so the checker itself declines this exact op/domain combination
+    # regardless of this port's own correctness -- matching
+    # test_pruning.py's own `test_gqa_packed_qkv_qk_norm_rope_pruning_
+    # matches_oracle_exactly`, which likewise never calls the checker.
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * (H // KVH)
+    rotary_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+
+
+def test_cpp_gqa_packed_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=304,
+        with_norm=True,
+        with_rope=True,
+        q_rotary_num_heads=H,
+        k_rotary_num_heads=KVH,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    q_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0] == "q_normed"
+    )
+    k_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0] == "k_normed"
+    )
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == num_heads
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == kv_num_heads
+
+
+def test_cpp_gqa_packed_qkv_norm_only_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=305,
+        with_norm=True,
+        with_rope=False,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    # No onnx.checker.check_model here -- see the qk_norm_rope test above.
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_gqa_packed_qkv_rope_only_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=306,
+        with_norm=False,
+        with_rope=True,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def _gqa_mrope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    mrope_section=(2, 1, 1),
+    mrope_layout=0,
+    wqkv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    half = D // 2
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        p = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        position_ids = np.stack([p, p, p], axis=0)
+    initializer += [_f32(cos, "Cos"), _f32(sin, "Sin")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    q_nh = q_rotary_num_heads if q_rotary_num_heads is not None else H
+    k_nh = k_rotary_num_heads if k_rotary_num_heads is not None else KVH
+    section_str = "[" + ", ".join(str(s) for s in mrope_section) + "]"
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          q_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={q_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (q_raw, PosIds, Cos, Sin)
+          k_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={k_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (k_raw, PosIds, Cos, Sin)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_rot, k_rot, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_mrope_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=307)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_gqa_packed_qkv_mrope_pruning_updates_explicit_rotary_num_heads():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=308)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    q_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned_cpp.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == num_heads
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == kv_num_heads
+
+
+def _gqa_gemma_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    wqkv=None,
+    wout=None,
+    emb=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+    if emb is None:
+        emb = rng.standard_normal((batch, seq, D)).astype(np.float32)
+    initializer.append(_f32(emb, "Emb"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([D // 2, D // 2], dtype=np.int64), "HalfSizes"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, H, D], dtype=np.int64), "QReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, KVH, D], dtype=np.int64), "KReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array([0, -1, Nq], dtype=np.int64), "QReshapeB")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshapeB"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          q_bnsh_in = Reshape(q_raw, QReshapeA)
+          q_bnsh = Transpose <perm=[0,2,1,3]> (q_bnsh_in)
+          q_x1, q_x2 = Split <axis=-1> (q_bnsh, HalfSizes)
+          q_x2n = Neg(q_x2)
+          q_rot_in = Concat <axis=-1> (q_x2n, q_x1)
+          k_bnsh_in = Reshape(k_raw, KReshapeA)
+          k_bnsh = Transpose <perm=[0,2,1,3]> (k_bnsh_in)
+          k_x1, k_x2 = Split <axis=-1> (k_bnsh, HalfSizes)
+          k_x2n = Neg(k_x2)
+          k_rot_in = Concat <axis=-1> (k_x2n, k_x1)
+          q_embed, k_embed = com.microsoft.GemmaRotaryEmbedding (Emb, q_bnsh, q_rot_in, k_bnsh, k_rot_in)
+          q_flat_bnsh = Transpose <perm=[0,2,1,3]> (q_embed)
+          q_flat = Reshape(q_flat_bnsh, QReshapeB)
+          k_flat_bnsh = Transpose <perm=[0,2,1,3]> (k_embed)
+          k_flat = Reshape(k_flat_bnsh, KReshapeB)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_flat, k_flat, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_cpp_gqa_packed_qkv_gemma_rope_pruning_matches_python_reference_exactly():
+    # `GemmaRotaryEmbedding` has no usable CPU kernel in this environment (see
+    # pruning.py's own "Attention-head pruning" section comment) -- so, unlike
+    # every other test in this section, this one is verified purely by
+    # byte-for-byte parity against the pure-Python reference rather than a
+    # real `InferenceSession` run (`test_gqa_packed_qkv_gemma_rope_pruning_
+    # matches_decomposed_oracle` in test_pruning.py already covers the
+    # decomposed-execution oracle check for the shared Python logic itself).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_gemma_rope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=309)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * (H // KVH)
+
+
+def _onnx_attention_packed_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    rope_domain="",
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+    wqkv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+    initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+
+    half = D // 2
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+    initializer += [_f32(cos, "CosCache"), _f32(sin, "SinCache")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+
+    qnh = q_rotary_num_heads if q_rotary_num_heads is not None else 0
+    knh = k_rotary_num_heads if k_rotary_num_heads is not None else 0
+    domain_prefix = f"{rope_domain}." if rope_domain else ""
+    opset_imports = {"": 24}
+    if rope_domain == "":
+        hop_body = (
+            f"q = {domain_prefix}RotaryEmbedding <num_heads={qnh}> "
+            f"(q_raw, CosCache, SinCache, PosIds)\n"
+            f"          k = {domain_prefix}RotaryEmbedding <num_heads={knh}> "
+            f"(k_raw, CosCache, SinCache, PosIds)"
+        )
+    else:
+        hop_body = (
+            f"q = {domain_prefix}RotaryEmbedding <num_heads={qnh}> "
+            f"(q_raw, PosIds, CosCache, SinCache)\n"
+            f"          k = {domain_prefix}RotaryEmbedding <num_heads={knh}> "
+            f"(k_raw, PosIds, CosCache, SinCache)"
+        )
+        opset_imports[rope_domain] = 1
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)
+          {hop_body}
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    opset_import_text = (
+        "[" + ", ".join(f'"{d}": {v}' for d, v in opset_imports.items()) + "]"
+    )
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: {opset_import_text}
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _onnx_attention_node(model):
+    return next(
+        n for n in model.graph.node if n.domain == "" and n.op_type == "Attention"
+    )
+
+
+def _onnx_attention_attrs(node):
+    q_num_heads = next(a.i for a in node.attribute if a.name == "q_num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return q_num_heads, kv_num_heads
+
+
+def test_cpp_onnx_attention_packed_qkv_native_rotary_embedding_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=310,
+        rope_domain="",
+        q_rotary_num_heads=H,
+        k_rotary_num_heads=KVH,
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(_onnx_attention_node(pruned_cpp))
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * (H // KVH)
+    rotary_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        assert n.domain == ""
+
+
+def test_cpp_onnx_attention_packed_qkv_contrib_rotary_embedding_pruning_matches_python_reference_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=311,
+        rope_domain="com.microsoft",
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(_onnx_attention_node(pruned_cpp))
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * (H // KVH)
+    rotary_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        assert n.domain == "com.microsoft"
+
+
 # --- True MQA (kv_num_heads == 1) fused GroupQueryAttention fast path ------
 #
 # Regression coverage for the bug the Python reference (pruning.py's own
