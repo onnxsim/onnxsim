@@ -8385,12 +8385,13 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // by `keep_q_heads` -- *query*-head granularity (this input is added
   // against Q*K' scores, laid out per query head) -- mirrors pruning.py's
   // own `_apply_one_gqa_chain` handling of its `mask_idx` exactly. Every
-  // other chain kind this shared function also applies (GQA/plain
-  // ai.onnx::Attention/DecoderMaskedMultiHeadAttention/PagedAttention/
-  // LinearAttention/SparseAttention) has no analogous per-op `mask_idx` here
-  // yet -- a separate, pre-existing, out-of-scope gap (see this file's own
-  // "Attention-head pruning" section comment for scope); left completely
-  // untouched for those, exactly as before.
+  // other chain kind this shared function also applies now has its own
+  // analogous per-op mask/attention_bias handling elsewhere in this same
+  // function too (see `gqa_mask_idx` below for GQA/plain ai.onnx::Attention,
+  // `is_dmmha`'s own branch for DecoderMaskedMultiHeadAttention, and the
+  // `is_linear_attention`/`is_sparse_attention` branches for those two) --
+  // `PagedAttention` is the only exception, and only because its own ONNX
+  // schema has no analogous attention_bias-like input to slice at all.
   const bool is_mha = chain.node->domain() == kComMicrosoftDomain &&
                       chain.node->op_type() == "MultiHeadAttention";
   const bool is_packed_mha =
