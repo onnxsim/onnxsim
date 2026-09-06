@@ -34,7 +34,7 @@ guarantees (downstream consumers are never rewired by name).
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Union
 
 import numpy as np
 import onnx
@@ -87,6 +87,32 @@ def _add_probe_outputs(model: onnx.ModelProto, names: Sequence[str]) -> onnx.Mod
             probe.graph.output.append(onnx.ValueInfoProto(name=name))
             existing.add(name)
     return probe
+
+
+def _activation_rows(arrays: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """Flattens each captured activation to 2-D ``[rows, K]``, dropping any
+    that has no feature axis at all.
+
+    A MatMul/Gemm activation is ``[..., K]``: 2-D ``[tokens, K]`` for a plain
+    MLP, but ``[batch, seq, K]`` for essentially every real transformer, since
+    ONNX's MatMul broadcasts over leading dimensions. Every calibration-driven
+    pass in this repo wants the same thing from it -- the set of rows that
+    multiply ``W`` -- and a layer's reconstruction objective
+    ``||W X^T - Ŵ X^T||²`` sums over all of those rows however the leading
+    dimensions happen to group them. So collapsing the leading dimensions is
+    exact, not an approximation: it is the same set of rows in the same order.
+
+    This exists because filtering to ``ndim == 2`` instead (the previous
+    convention here) silently skipped every layer of a ``[batch, seq, hidden]``
+    model, i.e. made GPTQ/AWQ and friends no-ops on exactly the models they
+    are for, with no diagnostic.
+    """
+    rows = []
+    for a in arrays:
+        if a.ndim < 2:
+            continue  # no feature axis to multiply W with
+        rows.append(a.reshape(-1, a.shape[-1]) if a.ndim > 2 else a)
+    return rows
 
 
 def correct_bias(
