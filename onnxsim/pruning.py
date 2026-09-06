@@ -10063,6 +10063,7 @@ def _walk_matmul_producer_backward(
                     node_by_output,
                     producer_infos,
                     consumers_of,
+                    initializer_map,
                     graph_outputs,
                     max_hops,
                 )
@@ -10071,6 +10072,7 @@ def _walk_matmul_producer_backward(
                     node_by_output,
                     producer_infos,
                     consumers_of,
+                    initializer_map,
                     graph_outputs,
                     max_hops,
                 )
@@ -10509,6 +10511,7 @@ def _trace_gate_producer_backward(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, str, bool, Optional[str], int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -10525,17 +10528,58 @@ def _trace_gate_producer_backward(
     Every tensor walked through, `tensor_name` itself included, must have
     exactly one consumer and not be a graph output: the same safety bar
     the forward walk holds every intermediate tensor to.
+
+    The one exception is a self-gated activation decomposition's own origin
+    tensor -- SiLU/Swish exported as ``x * Sigmoid(x)`` (or erf-GELU's
+    longer gate branch, see :func:`_match_self_gated_activation`'s own
+    docstring for the exact shapes) rather than a single fused node --
+    legitimately read *twice* (once by the gate branch's own first node,
+    once by the self-gating `Mul`): when the node *producing* the current
+    tensor turns out to be such a self-gating `Mul`
+    (:func:`_match_self_gated_activation_backward` -- the identical matcher
+    :func:`_walk_matmul_producer_backward`'s own backward walk already uses
+    for the single-producer case), the whole diamond is crossed as a single
+    pass-through hop, consuming one iteration of `max_hops` the same as an
+    ordinary `_UNARY_PASS_THROUGH` node does, and the diamond's own origin
+    tensor (which itself legitimately has those two in-diamond consumers)
+    is exempted from the ordinary single-consumer bar for that one hop only
+    -- mirroring how :func:`_walk_matmul_producer_backward` itself never
+    gates that call on `cur`'s own consumer count either, deferring the
+    two-vs-one-consumer question entirely to the matcher. Without this, a
+    real SwiGLU FFN using `nn.SiLU()` (which PyTorch/ONNX export as exactly
+    this decomposition, not a single `Sigmoid`) is never recognized as a
+    gated pair at all -- previously such a graph matched zero chains here.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # True right after crossing a self-gated-activation diamond: `cur` is
+    # then that diamond's own origin tensor, whose *two* real consumers (the
+    # gate branch's own first node and the gate `Mul`) are both already
+    # accounted for by the diamond just crossed, so the ordinary
+    # exactly-one-consumer bar below must be skipped for this one tensor.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -10612,6 +10656,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -10620,6 +10665,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -16060,8 +16106,12 @@ def _walk_to_consumer_qdq(
     try), or a same-scale/zero_point ``QuantizeLinear -> DequantizeLinear``
     activation-requantization round trip (:func:`_match_qdq_requant_pass_through`
     -- the standard "full" QDQ format's own per-op activation boundary,
-    treated as a free pass-through exactly like a plain unary activation) --
-    with no other consumer anywhere along the way, until a
+    treated as a free pass-through exactly like a plain unary activation),
+    or a self-gated activation decomposition (SiLU/Swish exported as
+    ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
+    :func:`_match_self_gated_activation`, reused verbatim; both `is_conv`
+    and MatMul/Gemm families) -- with no other consumer anywhere along the
+    way, until a
     same-family (Conv/ConvTranspose-only or MatMul/Gemm-only, matching
     `is_conv`) consumer is found whose input-channel count matches
     `n_channels`. No per-channel Add/Mul bias/scale hop, no depthwise Conv
@@ -16138,6 +16188,33 @@ def _walk_to_consumer_qdq(
                 continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch -- see
+            # :func:`_match_self_gated_activation`'s own docstring for the
+            # exact shapes) -- tried before the ordinary "exactly one
+            # consumer" dispatch below, mirroring
+            # :func:`_walk_to_consumer`'s/:func:`_walk_to_conv_consumer`'s
+            # own identical hop dispatch, for the identical reason: this
+            # shape's own root tensor is read *twice*. Declines instantly
+            # (returns ``None`` here) whenever `cur` doesn't have exactly
+            # two consumers matching this shape -- a real, quantized SwiGLU
+            # FFN using `nn.SiLU()` would otherwise never walk through this
+            # hop at all, even as a plain (non-gated) single-producer chain.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -16349,9 +16426,6 @@ def _find_qdq_chains(
     }
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_QDQChain] = []
     for node in graph.node:
         is_conv_transpose = False
@@ -16378,7 +16452,16 @@ def _find_qdq_chains(
             is_conv = False
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok` (not a plain `_is_internal(out_name)`
+        # single-consumer gate) -- a producer's raw output that is itself a
+        # self-gated activation decomposition's own origin (read twice: once
+        # by the gate branch's own first node, once by the self-gating
+        # `Mul` -- see :func:`_walk_to_consumer_qdq`'s own hop dispatch) must
+        # reach the walker to be recognized at all; every other "is this
+        # safe to walk forward from" question is left to that walker's own
+        # dispatch, mirroring :func:`_find_chains`'s own identical choice
+        # (see `_matmul_walk_root_ok`'s own docstring).
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
 
         found = _walk_to_consumer_qdq(
@@ -16424,6 +16507,7 @@ def _trace_gate_producer_backward_qdq(
         str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[_BiasRef], int]
     ],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -16445,17 +16529,45 @@ def _trace_gate_producer_backward_qdq(
     resolved :class:`_WeightRef` here), so sharing one function would need
     either an unsound cast or a wider, less precise type on both call
     sites.
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's own
+    longer gate branch -- see :func:`_match_self_gated_activation`'s own
+    docstring) as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters (a real, quantized
+    SwiGLU FFN using `nn.SiLU()` would otherwise never be recognized as a
+    gated pair here either).
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards: right after crossing a self-gated-activation
+    # diamond, `cur` is that diamond's own origin tensor, whose two real
+    # consumers are both already accounted for by the diamond just crossed.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -16561,6 +16673,7 @@ def _find_qdq_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -16569,6 +16682,7 @@ def _find_qdq_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -17958,17 +18072,22 @@ def _walk_to_matmul_nbits_consumer(
     export emits instead of a fused `_NORM_PASS_THROUGH_OPS` node
     (:func:`_match_decomposed_layer_norm_pass_through`/
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim, the
-    identical two matchers :func:`_walk_to_consumer` tries) -- with no other
+    identical two matchers :func:`_walk_to_consumer` tries), or a
+    self-gated activation decomposition (SiLU/Swish exported as
+    ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
+    :func:`_match_self_gated_activation`, reused verbatim -- a single
+    tensor's own diamond, not a two-producer gated pair) -- with no other
     consumer anywhere along the way, until EITHER a ``MatMulNBits`` consumer
     OR a plain-float MatMul/vanilla-Gemm consumer
     (:func:`_match_plain_matmul_nbits_peer`) is found whose input-channel
     count matches `n_channels` -- the ``MatMulNBits``/plain-float union this
     section's own top comment describes, the analogue of
     :func:`_walk_to_consumer_qdq`'s own float/QDQ union but restricted to
-    ``MatMulNBits``/plain-float (never QDQ). No gated pair (self-gated
-    activation/tanh-GELU), no branch, no ``PRelu``/``Clip``/fused-bias-GELU
-    hop -- unlike :func:`_walk_to_consumer`, only the norm and
-    `_BINARY_CHANNEL_OPS` hops above are added here. Returns ``None`` if the
+    ``MatMulNBits``/plain-float (never QDQ). No two-producer gated pair
+    (that's :func:`_find_matmul_nbits_gated_chains`'s own job) or tanh-GELU,
+    no branch, no ``PRelu``/``Clip``/fused-bias-GELU hop -- unlike
+    :func:`_walk_to_consumer`, only the norm, `_BINARY_CHANNEL_OPS`, and
+    self-gated-activation hops above are added here. Returns ``None`` if the
     walk runs out of hops, hits a branch, or never reaches such a consumer.
     The caller (:func:`_find_matmul_nbits_chains`) is responsible for
     discarding a plain-float-to-plain-float result -- that pairing is
@@ -18013,6 +18132,28 @@ def _walk_to_matmul_nbits_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch, for the identical reason: this shape's own root
+            # tensor is read *twice*. Declines instantly (returns ``None``
+            # here) whenever `cur` doesn't match this shape.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -18161,9 +18302,6 @@ def _find_matmul_nbits_chains(
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_MatMulNBitsChain] = []
     for node in graph.node:
         producer: _MatMulNBitsChainSide
@@ -18180,7 +18318,11 @@ def _find_matmul_nbits_chains(
             producer, n_channels = peer, peer.out_channels
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok`, not `_is_internal` -- see
+        # :func:`_find_qdq_chains`'s own identical comment: a self-gated
+        # activation decomposition's own origin (read twice) must reach
+        # :func:`_walk_to_matmul_nbits_consumer` to be recognized at all.
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
         found = _walk_to_matmul_nbits_consumer(
             out_name,
@@ -18207,6 +18349,7 @@ def _trace_gate_producer_backward_matmul_nbits(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulNBitsChainSide, int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -18221,17 +18364,42 @@ def _trace_gate_producer_backward_matmul_nbits(
     :func:`_find_matmul_nbits_gated_chains`). Duplicated rather than shared
     with the QDQ section's own walker, for the identical reason that
     section gives (structurally different `producer_infos` value types).
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's own
+    longer gate branch) as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards: right after crossing a self-gated-activation
+    # diamond, `cur` is that diamond's own origin tensor, whose two real
+    # consumers are both already accounted for by the diamond just crossed.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -18321,6 +18489,7 @@ def _find_matmul_nbits_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -18329,6 +18498,7 @@ def _find_matmul_nbits_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -19265,6 +19435,28 @@ def _walk_to_matmul_bnb4_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch, for the identical reason: this shape's own root
+            # tensor is read *twice*. Declines instantly (returns ``None``
+            # here) whenever `cur` doesn't match this shape.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -19401,16 +19593,15 @@ def _find_matmul_bnb4_chains(
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_MatMulBnb4Chain] = []
     for node in graph.node:
         producer = _match_matmul_bnb4_producer(node, initializer_map, consumers_of)
         if producer is None:
             continue
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok`, not `_is_internal` -- see
+        # :func:`_find_qdq_chains`'s own identical comment.
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
         found = _walk_to_matmul_bnb4_consumer(
             out_name,
@@ -19433,6 +19624,7 @@ def _trace_gate_producer_backward_bnb4(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulBnb4ChainSide, int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -19450,17 +19642,39 @@ def _trace_gate_producer_backward_bnb4(
     with the ``MatMulNBits`` section's own walker, for the identical reason
     that section gives its own duplicate of the QDQ section's walker
     (structurally different `producer_infos` value types).
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -19579,6 +19793,7 @@ def _find_matmul_bnb4_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -19587,6 +19802,7 @@ def _find_matmul_bnb4_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -33017,6 +33233,28 @@ def _walk_to_fp8_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch (mechanically mirrored from the MatMulNBits/Bnb4/
+            # QDQ fix, not independently verified against a live FP8
+            # quantizer). Declines instantly whenever `cur` doesn't match.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -33188,6 +33426,25 @@ def _walk_to_fp4_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition -- see
+            # :func:`_walk_to_fp8_consumer`'s own identical hop (mechanically
+            # mirrored from the MatMulNBits/Bnb4/QDQ fix, not independently
+            # verified against a live FP4 quantizer).
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -35541,6 +35798,28 @@ def _walk_to_dynquant_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch, for the identical reason: this shape's own root
+            # tensor is read *twice*. Declines instantly (returns ``None``
+            # here) whenever `cur` doesn't match this shape.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -35659,9 +35938,6 @@ def _find_dynquant_chains(
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_DynQuantMatMulChain] = []
     for node in graph.node:
         producer: _DynQuantMatMulChainSide
@@ -35678,7 +35954,9 @@ def _find_dynquant_chains(
             producer, n_channels = peer, peer.out_channels
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok`, not `_is_internal` -- see
+        # :func:`_find_qdq_chains`'s own identical comment.
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
         found = _walk_to_dynquant_consumer(
             out_name,
@@ -35705,6 +35983,7 @@ def _trace_gate_producer_backward_dynquant(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, _DynQuantMatMulChainSide, int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -35723,17 +36002,39 @@ def _trace_gate_producer_backward_dynquant(
     shared with the `MatMulNBits`/QDQ sections' own walkers, for the
     identical reason those sections give (structurally different
     `producer_infos` value types).
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -35854,6 +36155,7 @@ def _find_dynquant_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -35862,6 +36164,7 @@ def _find_dynquant_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
