@@ -45839,20 +45839,17 @@ def _linear_attention_gate_model(Hkv=4, K=16, seed=0, decay_only=False):
 
 
 def test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle():
-    # Documented, pre-approved narrowing versus the pure-Python reference
-    # this test used to exercise directly: `apply_attention_head_pruning`
-    # is now a thin alias for the verified-full-parity C++ port
-    # (`apply_attention_head_pruning_cpp`), which does not (yet) recognize
+    # `apply_attention_head_pruning` is a thin alias for the C++ port
+    # (`apply_attention_head_pruning_cpp`), which now recognizes
     # `com.microsoft.LinearAttentionGate` as a decay/beta pass-through the
-    # way pruning.py's own from-scratch `_walk_back_through_linear_attention_gate`
-    # does -- a real, SAFE-DIRECTION scope gap: the C++ port cleanly declines
-    # the whole match (leaving every tensor/attribute completely untouched)
-    # rather than slicing `Wq`/`Wk`/`Wv`/`Wo` while leaving the gate's own
-    # `DtBias`/`DecayScale`/`Wa`/`Wb` at their original (now head-count-
-    # mismatched) width, exactly the same "declines rather than mis-slices"
-    # category as e.g.
-    # `test_gqa_pruning_qk_norm_weight_wrong_shape_is_declined` above. Out of
-    # scope to close here -- see this module's own C++-port-aliasing notes.
+    # same way pruning.py's own from-scratch `_match_linear_attention_gate`
+    # does -- see MatchLinearAttentionGate/LinearAttentionGatePassThrough in
+    # onnxsim/structured_pruning_entry.cpp for the ported mechanics. This
+    # test independently confirms, via the numeric oracle described in this
+    # module's own "LinearAttentionGate-fed dynamic decay/beta pass-through"
+    # section comment, that the pruned model's own sliced `Wa`/`Wb`/
+    # `DtBias`/`DecayScale` are mathematically equivalent to "compute at full
+    # width, then keep only the surviving heads' own output".
     model, cfg = _linear_attention_gate_model(Hkv=4, K=16, seed=10)
     pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
@@ -45860,58 +45857,135 @@ def test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle():
     node = _linear_attention_node(pruned)
     q_attr = next(a.i for a in node.attribute if a.name == "q_num_heads")
     kv_attr = next(a.i for a in node.attribute if a.name == "kv_num_heads")
-    assert (q_attr, kv_attr) == (cfg["Hq"], cfg["Hkv"])  # left untouched
+    assert kv_attr == 2
+    assert q_attr == 2  # group_size == 1 for this plain (non-GQA) shape
 
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    keep_groups = _linear_attention_keep_groups(
+        dict(
+            Hq=cfg["Hq"],
+            Hkv=cfg["Hkv"],
+            Dk=cfg["D"],
+            Dv=cfg["D"],
+            wq=cfg["wq"],
+            wk=cfg["wk"],
+            wv=cfg["wv"],
+        ),
+        sparsity=0.5,
+    )
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["DtBias"], cfg["dt_bias"][keep_groups])
+    np.testing.assert_array_equal(inits["DecayScale"], cfg["decay_scale"][keep_groups])
+    np.testing.assert_array_equal(inits["Wa"], cfg["wa"][:, keep_groups])
+    np.testing.assert_array_equal(inits["Wb"], cfg["wb"][:, keep_groups])
+
+    rng = np.random.default_rng(99)
+    x = rng.standard_normal((1, 3, cfg["K"])).astype(np.float32)
+    D = cfg["D"]
+    q_idx = np.concatenate([np.arange(h * D, (h + 1) * D) for h in keep_groups])
+
+    # Oracle: compute the gate's own formula at FULL width from the
+    # original weights, then slice its own output by `keep_groups`.
+    a_full = x @ cfg["wa"]
+    b_full = x @ cfg["wb"]
+    decay_full = cfg["decay_scale"] * _softplus(a_full + cfg["dt_bias"])
+    beta_full = _sigmoid(b_full)
+    oracle, _ = _linear_attention_model(
+        Hq=len(keep_groups),
+        Hkv=len(keep_groups),
+        Dk=D,
+        Dv=D,
+        K=cfg["K"],
+        update_rule="gated_delta",
+        decay=decay_full[:, :, keep_groups],
+        beta=beta_full[:, :, keep_groups],
+    )
+    oracle_vals = {
+        "Wq": cfg["wq"][:, q_idx],
+        "Wk": cfg["wk"][:, q_idx],
+        "Wv": cfg["wv"][:, q_idx],
+        "Wo": cfg["wo"][q_idx, :],
+        "Decay": decay_full[:, :, keep_groups],
+        "Beta": beta_full[:, :, keep_groups],
     }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    for init in oracle.graph.initializer:
+        init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(oracle_vals[init.name]), init.name
+            )
+        )
+    onnx.checker.check_model(oracle)
+
+    # Materialized pruned model: compute the identical formula, but from the
+    # PRUNED model's own already-sliced `Wa`/`Wb`/`DtBias`/`DecayScale`.
+    a_pruned = x @ inits["Wa"]
+    b_pruned = x @ inits["Wb"]
+    decay_pruned = inits["DecayScale"] * _softplus(a_pruned + inits["DtBias"])
+    beta_pruned = _sigmoid(b_pruned)
+    materialized, _ = _linear_attention_model(
+        Hq=len(keep_groups),
+        Hkv=len(keep_groups),
+        Dk=D,
+        Dv=D,
+        K=cfg["K"],
+        update_rule="gated_delta",
+        decay=decay_pruned,
+        beta=beta_pruned,
+    )
+    mat_vals = {
+        "Wq": inits["Wq"],
+        "Wk": inits["Wk"],
+        "Wv": inits["Wv"],
+        "Wo": inits["Wo"],
+        "Decay": decay_pruned,
+        "Beta": beta_pruned,
     }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    for init in materialized.graph.initializer:
+        init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(mat_vals[init.name]), init.name
+            )
+        )
+    onnx.checker.check_model(materialized)
+
+    y_oracle = _run27(oracle, {"X": x})[0]
+    y_pruned_materialized = _run27(materialized, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned_materialized, y_oracle)
 
 
 def test_linear_attention_pruning_gate_fed_decay_only_slices_wa_and_gate_weights():
     # `"gated"` mode: `beta` never requested, so the gate node has no `b`
-    # input/`beta` output at all. Same documented, pre-approved
-    # `LinearAttentionGate` narrowing as
-    # `test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle`
-    # above -- the C++ port this function is now a thin alias for declines
-    # the whole match cleanly rather than mis-slicing.
+    # input/`beta` output at all -- exercises MatchLinearAttentionGate's own
+    # `b_weight` (`std::optional`) staying unset (nothing to slice for a `b`
+    # that was never connected).
     model, cfg = _linear_attention_gate_model(Hkv=4, K=16, seed=13, decay_only=True)
     pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
-    node = _linear_attention_node(pruned)
-    q_attr = next(a.i for a in node.attribute if a.name == "q_num_heads")
-    kv_attr = next(a.i for a in node.attribute if a.name == "kv_num_heads")
-    assert (q_attr, kv_attr) == (cfg["Hq"], cfg["Hkv"])  # left untouched
-
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
-    }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
-    }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    keep_groups = _linear_attention_keep_groups(
+        dict(
+            Hq=cfg["Hq"],
+            Hkv=cfg["Hkv"],
+            Dk=cfg["D"],
+            Dv=cfg["D"],
+            wq=cfg["wq"],
+            wk=cfg["wk"],
+            wv=cfg["wv"],
+        ),
+        sparsity=0.5,
+    )
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert "Wb" not in inits
+    np.testing.assert_array_equal(inits["DtBias"], cfg["dt_bias"][keep_groups])
+    np.testing.assert_array_equal(inits["DecayScale"], cfg["decay_scale"][keep_groups])
+    np.testing.assert_array_equal(inits["Wa"], cfg["wa"][:, keep_groups])
 
 
 def test_linear_attention_pruning_constant_decay_beta_prunes_same_shapes_as_gate_fed():
-    # Regression guard, ORIGINALLY: a genuine *constant* decay/beta (the
-    # shape this pass already supported before this fix) must keep pruning
-    # to the exact same shapes as the new gate-fed path, given the identical
-    # Wq/Wk/Wv/Wo (and therefore the identical importance ranking/
-    # `keep_groups`). Now a documented divergence, same pre-approved
-    # `LinearAttentionGate` narrowing as
-    # `test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle`
-    # above: `apply_attention_head_pruning` is a thin alias for the C++ port,
-    # which prunes the genuine-constant-decay/beta path exactly as before
-    # (still verified full parity -- see
-    # `test_linear_attention_pruning_gated_mode_slices_gla_decay_matches_oracle`)
-    # but cleanly declines the gate-fed one, so the two paths' own shapes now
-    # genuinely differ instead of matching.
+    # Regression guard: a genuine *constant* decay/beta (the shape this pass
+    # already supported before this fix) must keep pruning to the exact same
+    # shapes as the gate-fed path, given the identical Wq/Wk/Wv/Wo (and
+    # therefore the identical importance ranking/`keep_groups`).
     gate_model, cfg = _linear_attention_gate_model(Hkv=4, K=16, seed=12)
 
     const_decay = np.broadcast_to(
@@ -45938,24 +46012,17 @@ def test_linear_attention_pruning_constant_decay_beta_prunes_same_shapes_as_gate
     onnx.checker.check_model(pruned_gate)
     onnx.checker.check_model(pruned_const)
 
-    # Gate-fed: declined, left at its original width (Hkv=4).
     dims_gate = _initializer_dims(pruned_gate)
-    for name in ("Wq", "Wk", "Wv", "Wo"):
-        assert dims_gate[name] == _initializer_dims(gate_model)[name]
-
-    # Constant decay/beta: genuinely pruned down to kv_num_heads=2 groups.
     dims_const = _initializer_dims(pruned_const)
-    assert dims_const["Wk"] != dims_gate["Wk"]
+    for name in ("Wq", "Wk", "Wv", "Wo"):
+        assert dims_gate[name] == dims_const[name]
 
     node_gate = _linear_attention_node(pruned_gate)
     node_const = _linear_attention_node(pruned_const)
-    assert (
-        next(a.i for a in node_gate.attribute if a.name == "kv_num_heads") == cfg["Hkv"]
-    )  # untouched
-    assert (
-        next(a.i for a in node_const.attribute if a.name == "kv_num_heads")
-        == cfg["Hkv"] // 2
-    )  # actually pruned
+    for attr_name in ("q_num_heads", "kv_num_heads"):
+        assert next(a.i for a in node_gate.attribute if a.name == attr_name) == next(
+            a.i for a in node_const.attribute if a.name == attr_name
+        )
 
 
 def test_linear_attention_pruning_dynamic_decay_from_non_gate_node_still_declines():
