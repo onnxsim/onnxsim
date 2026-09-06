@@ -711,6 +711,22 @@ def _build_real_resnet18d(work_dir):
     return result.axmodel_path, key, mcode
 
 
+def _run_retry_once(axmodel_path, x):
+    """`run_on_device_with_inputs`, retried once on a `0x8030070C` fault.
+
+    Confirmed real (see the README's "the fault is transient after a
+    burst" note): immediately after a run of deliberately-faulting
+    models, the runtime can transiently reject a *valid* model with the
+    same `0x8030070C` -- it self-clears on the next attempt. A retry
+    cleanly separates the two: a genuinely faulting byte faults on every
+    attempt (verified many times), so a second fault is a real one, while
+    a transient recovers. Never retries any other error."""
+    dev = pulsar2_docker.run_on_device_with_inputs(axmodel_path, {"x": x.tobytes()})
+    if dev.error and "0x8030070C" in dev.error:
+        dev = pulsar2_docker.run_on_device_with_inputs(axmodel_path, {"x": x.tobytes()})
+    return dev
+
+
 def _gemm_model(transb, m=1, k=16, n=8):
     """One `Gemm(x, w, b)` -- `transb` selects whether `w` is stored as
     `[k,n]` (transB=0) or `[n,k]` (transB=1), same logical matrix either
@@ -1189,11 +1205,11 @@ def test_bit_flip_in_opaque_mcode_region_is_sometimes_inert_sometimes_faults(tmp
         {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
         p = os.path.join(str(tmp_path), f"flip_{offset}.axmodel")
         onnx.save(c, p)
-        return pulsar2_docker.run_on_device_with_inputs(p, {"x": x.tobytes()})
+        return _run_retry_once(p, x)
 
     rng = np.random.RandomState(42)
     x = rng.randn(1, 4, 16, 16).astype(np.float32)
-    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    dev_base = _run_retry_once(path, x)
     assert not dev_base.error, dev_base.error
     out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
 
@@ -1250,7 +1266,7 @@ def test_patching_decoded_requant_scale_isolates_to_one_channel(tmp_path):
 
     rng = np.random.RandomState(42)
     x = rng.randn(1, 4, 16, 16).astype(np.float32)
-    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    dev_base = _run_retry_once(path, x)
     dev_patch = pulsar2_docker.run_on_device_with_inputs(
         patched_path, {"x": x.tobytes()}
     )
@@ -1305,7 +1321,7 @@ def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
 
     rng = np.random.RandomState(42)
     x = rng.randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
-    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    dev_base = _run_retry_once(path, x)
     assert not dev_base.error, dev_base.error
     out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
     assert out_base.shape == (1000,)
@@ -1317,7 +1333,7 @@ def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
         {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
         p = os.path.join(work_dir, f"flip_{offset}.axmodel")
         onnx.save(c, p)
-        return pulsar2_docker.run_on_device_with_inputs(p, {"x": x.tobytes()})
+        return _run_retry_once(p, x)
 
     for off in (300, 1500):
         dev = flip_and_run(off)
@@ -1360,7 +1376,7 @@ def test_resnet18d_live_byte_neighborhoods_share_a_template_signature(tmp_path):
 
     rng = np.random.RandomState(42)
     x = rng.randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
-    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    dev_base = _run_retry_once(path, x)
     assert not dev_base.error, dev_base.error
     out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
 
@@ -1371,7 +1387,7 @@ def test_resnet18d_live_byte_neighborhoods_share_a_template_signature(tmp_path):
         {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
         p = os.path.join(str(tmp_path), f"flip_{offset}_{mask:02x}.axmodel")
         onnx.save(c, p)
-        dev = pulsar2_docker.run_on_device_with_inputs(p, {"x": x.tobytes()})
+        dev = _run_retry_once(p, x)
         if dev.error:
             assert "0x8030070C" in dev.error, (offset, mask, dev.error)
             return "F", None
@@ -1402,3 +1418,67 @@ def test_resnet18d_live_byte_neighborhoods_share_a_template_signature(tmp_path):
     for bit in range(8):
         cls, _ = flip_and_run(9900, 1 << bit)
         assert cls == "D", (bit, cls, "expected every bit of byte 9900 to be live")
+
+
+def test_resnet18d_template_has_a_gate_a_dead_nibble_and_a_checked_msb(tmp_path):
+    """Confirmed real (see the README's "Inside one repeated template"
+    section): in the `FF==D=FDDDDDF=FF=` template of the real resnet18d
+    mcode, bytes X-4 and X-1 are a *gate*, not a value -- flipping X-4,
+    X-1, or both at once lands in the byte-identical output (a double
+    flip neither cancels nor compounds). Byte X-1 is half dead, half
+    gate: each low-nibble bit trips that same state, every high-nibble
+    bit is inert. And bit 7 of X+3 is the one single-bit flip that
+    faults the runtime's validator, while its other bits are live.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+
+    rng = np.random.RandomState(42)
+    x = rng.randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    def run(edits, tag):
+        patched = bytearray(mcode)
+        for off, mask in edits:
+            patched[off] ^= mask
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"edit_{tag}.axmodel")
+        onnx.save(c, p)
+        dev = _run_retry_once(p, x)
+        if dev.error:
+            assert "0x8030070C" in dev.error, (tag, dev.error)
+            return None
+        return np.frombuffer(dev.outputs[0], dtype=np.float32)
+
+    gate_state = {}
+    for X in (32700, 48300):
+        a = run([(X - 4, 0xFF)], f"{X}_a")
+        b = run([(X - 1, 0xFF)], f"{X}_b")
+        ab = run([(X - 4, 0xFF), (X - 1, 0xFF)], f"{X}_ab")
+        assert a is not None and b is not None and ab is not None
+        assert not np.array_equal(a, out_base), X
+        assert np.array_equal(a, b) and np.array_equal(a, ab), (
+            X,
+            "expected X-4, X-1, and both together to land in one gate state",
+        )
+        gate_state[X] = a
+
+    # X-1 at 32700: low nibble is the gate, high nibble is dead.
+    for bit in range(4):
+        out = run([(32699, 1 << bit)], f"32699_b{bit}")
+        assert out is not None and np.array_equal(out, gate_state[32700]), bit
+    for bit in range(4, 8):
+        out = run([(32699, 1 << bit)], f"32699_b{bit}")
+        assert out is not None and np.array_equal(out, out_base), (
+            bit,
+            "expected the high nibble of X-1 to be inert",
+        )
+
+    # The MSB of X+3 is the one single-bit flip that faults.
+    assert run([(32703, 0x80)], "32703_b7") is None
+    assert run([(32703, 0x01)], "32703_b0") is not None

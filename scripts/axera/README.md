@@ -1837,6 +1837,75 @@ is: a fully-live, non-bit-weighted numeric-ish field whose encoding is
 still not identified -- the exact-equality pairs are the lead, not a
 decoding.
 
+### Inside one repeated template: a gate, three address-like bytes, and a checked sign bit
+
+Two follow-up probes on the `FF==D=FDDDDDF=FF=` template, again no
+rebuild needed, sharpen what its live bytes actually are.
+
+**The interchangeable `X-4`/`X-1` pair is a gate, not a value.** Flipping
+`X-4` alone, `X-1` alone, or **both at once** lands in the byte-identical
+output at both template instances (32700: 3.986/argmax 111; 48300:
+1.293/argmax 305), and never back at baseline. A double flip that neither
+cancels (as two XOR-combined copies would) nor compounds (as two
+independent numeric contributions would) means the two bytes don't carry
+a *value* -- they gate a condition that either holds or doesn't, and any
+disturbance drops the computation into one fixed fallback state.
+
+**Per-bit across the 5-byte live run (`X-1..X+3`) at 32700:**
+
+```
+byte    bit0   bit1   bit2   bit3   bit4   bit5   bit6   bit7
+32699  3.986  3.986  3.986  3.986    =      =      =      =     <- X-1
+32700  5.135  3.016  5.063  6.176  6.068  6.751  5.530  5.099   <- X
+32701  5.386  6.284  3.447  6.894  6.858  2.370  7.469  3.052
+32702  3.591  5.745  5.997  3.375  4.776  4.453  4.596  6.104
+32703  5.925  4.740  5.889  3.627  5.853  4.309  5.673    F     <- X+3
+```
+
+- **`X-1` is half dead, half gate.** Its low nibble (bits 0-3) each
+  trips the *same* 3.986/argmax-111 state as `X-4` does; its high nibble
+  (bits 4-7) is completely inert. So `X-4` and the low nibble of `X-1`
+  are one gate -- the same fallback state now replicated across seven
+  independent single-flip measurements plus the double flip.
+- **`X..X+2` are three fully-live bytes with large, non-bit-weighted
+  effects** (every bit changes the output, deltas 2.4-7.5, no monotone
+  trend with bit index; e.g. at 32701 bit 6 gives 7.47 but bit 7 gives
+  3.05). A magnitude field would scale with bit significance; a field
+  where *any* corrupted bit makes the hardware read the wrong data --
+  an address, offset, or index -- would look exactly like this. Reported
+  as "address-like," not as a decoded address.
+- **`X+3`'s MSB is checked, its other 7 bits are live.** Bit 7 of the
+  run's last byte is the one single-bit flip in the whole 40-flip matrix
+  that faults (`0x8030070C`); bits 0-6 all run and change the output. A
+  sign/valid/reserved bit sitting at the top of a 4-byte little-endian
+  field, checked by the same validator the `F` positions hit, is the
+  simplest reading.
+
+Net: this template's live region reads as `[gate byte] [gate nibble |
+dead nibble] [3 address-like bytes] [7 live bits | 1 checked bit]` --
+the most detailed internal map of any mcode command this README has
+produced, obtained entirely from single-bit interventions on the real
+`resnet18d` blob.
+
+**A caveat on the fault class, found the hard way: `0x8030070C` can hit
+a valid model, rarely.** While locking the template findings into a
+regression test, the *unpatched* baseline of a freshly-built `resnet18d`
+faulted with the same `0x8030070C` -- once, immediately after a dense
+burst of roughly 65 deliberately-faulting runs plus a Docker build. The
+same file ran fine seconds later, and so did the known-good build, so it
+was neither a bad build nor a wedged device (no kernel/PCIe events;
+telemetry normal). Trying to reproduce it on purpose failed: 10 trials of
+a deterministic-fault run immediately followed by a valid run gave **0/10
+transient faults** (and 10/10 deliberate faults, reconfirming that class
+is deterministic). So this is a rare event -- one in well over 200 valid
+runs this session -- not something a single preceding fault triggers,
+and its trigger is not identified. The tests now retry a `0x8030070C`
+exactly once (`_run_retry_once`): safe, because a genuinely faulting
+byte faults on every attempt, so a second fault is a real one, while a
+transient recovers -- and it never masks anything, since no other error
+is retried. Worth knowing for anyone running large fault-injection
+sweeps on this hardware.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
