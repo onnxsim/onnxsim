@@ -2732,6 +2732,48 @@ units against a 20.4% shuffled null (25.3% vs 21.1% in `mnasnet`), so
 this is a per-bank distinction, not a property of the family --
 reported as the shape of the data, not a decoding of it.
 
+### The layout that explains all of it: two configuration blocks, then 180 clean op programs
+
+Splitting the whole token stream at every `a1 40 02` write and asking
+where the short units and unknown bytes actually are gives the blob's
+real layout, and it is simpler than the section-by-section picture
+suggested:
+
+```
+resnet18d (49,080 B)                       verbs  short units  unknown bytes
+  bytes    297 .. 11,433  config block A       50          750         7,282
+  bytes 11,433 .. 30,816  config block B      159        1,444        11,396
+  bytes 30,816 .. 48,496  180 op programs   ~2,160            0             0
+  bytes 48,496 .. 48,828  epilogue             11            0           244
+  (then the back FlatBuffers copy)
+
+mnasnet_small (78,584 B)
+  bytes    297 .. 19,977  config block A      141        1,574        10,756
+  bytes 19,977 .. 64,672  config block B      502        4,242        17,576
+  bytes 64,672 .. 78,008  132 op programs   ~1,650            0             0
+  bytes 78,008 .. 78,332  epilogue             12            0           228
+```
+
+**180 of 183 `resnet18d` segments, and 132 of 135 in `mnasnet`, contain
+no short unit and no unknown byte at all** -- each is exactly the
+eleven-instruction verb template (~96 bytes) and nothing else. Every
+short-form unit and every undecoded byte in the entire blob sits in two
+large configuration blocks at the front (bounded by two *setup* `40 02`
+writes whose operands -- `ff 00 00 00` and one more -- are not real
+op offsets) plus a ~330-byte epilogue. The blocks are 62% of
+`resnet18d`'s blob and 82% of `mnasnet`'s.
+
+This is why the coverage numbers looked the way they did: the "37%" of
+the bulk that the verb walker explained was, to first order, *the
+entire op-program region*, which is parsed end to end, while the
+"unexplained 63%" was the configuration blocks, where verbs are a
+minority among short units and undecoded bytes. It also corrects the
+earlier reading that the regions were interleaved "about one per four
+ops": they are not interleaved with ops at all. The per-op program is
+done; the frontier is precisely two configuration blocks whose short
+units follow the width rule and whose remaining bytes (18.9 KB in
+`resnet18d`) are the actual undecoded content of mcode.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

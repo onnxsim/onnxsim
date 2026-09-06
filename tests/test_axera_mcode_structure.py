@@ -2455,3 +2455,85 @@ def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
         assert peak == prefix + 2, (prefix, ratios)
         assert ratios[peak] >= 2.0, (prefix, ratios)
         assert all(r <= 1.8 for k, r in ratios.items() if k != peak), (prefix, ratios)
+
+
+def _tokenize_mcode(mcode, start=297):
+    """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
+    verb instructions and the width-rule short units `[p][p+1 bytes][0x84-p]
+    [value]` (p+4 bytes) -- stepping one unknown byte otherwise. Returns
+    `(byte_offset, kind, a, b, c)` tuples: kind 'V' (a=verb, b=xx, c=yy),
+    'S' (a=prefix, b=tag, c=field) or '?' (a=byte). See the README's "The
+    layout that explains all of it" section."""
+    tags = set(range(0x81, 0x85))
+    end = len(mcode) - 252
+
+    def is_verb(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] in _VERBS
+            and mcode[i + 1] == 0
+            and mcode[i + 2] % 0x10 == 0
+        )
+
+    def short_len(i):
+        p = mcode[i]
+        return (
+            p + 4
+            if (p <= 3 and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags)
+            else 0
+        )
+
+    out, i = [], start
+    while i < end:
+        if is_verb(i):
+            n = (
+                7
+                if (
+                    not (is_verb(i + 8) or short_len(i + 8))
+                    and (is_verb(i + 7) or short_len(i + 7))
+                )
+                else 8
+            )
+            out.append((i, "V", mcode[i], mcode[i + 2], mcode[i + 3]))
+        elif short_len(i):
+            n = short_len(i)
+            out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
+        else:
+            n = 1
+            out.append((i, "?", mcode[i], 0, 0))
+        i += n
+    return out
+
+
+def test_mcode_layout_is_two_config_blocks_then_clean_op_programs(tmp_path):
+    """Confirmed real (see the README's "The layout that explains all of
+    it" section), all local on real resnet18d and mnasnet_small builds:
+    splitting the token stream at every `a1 40 02` write, the op-program
+    region (the last 180 / 132 segments) contains no short unit and no
+    unknown byte -- each op is exactly the verb template -- while at least
+    90% of all short units and unknown bytes sit in the first two
+    segments, the configuration blocks. Needs Docker for the builds but
+    no device.
+    """
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    _, _, mnas, _ = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+
+    for name, mcode, min_clean_ops in (("resnet18d", r18, 178), ("mnasnet", mnas, 130)):
+        toks = _tokenize_mcode(mcode)
+        cuts = [k for k, t in enumerate(toks) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+        assert len(cuts) >= min_clean_ops + 2, (name, len(cuts))
+        segments = [toks[a:b] for a, b in zip(cuts, cuts[1:])]
+
+        def noise(seg):
+            return sum(1 for t in seg if t[1] in "S?")
+
+        clean = sum(1 for seg in segments[2:] if noise(seg) == 0)
+        assert clean >= min_clean_ops, (name, clean, len(segments))
+
+        total_noise = sum(noise(seg) for seg in segments) + noise(toks[cuts[-1] :])
+        front_noise = noise(segments[0]) + noise(segments[1])
+        assert front_noise >= 0.9 * total_noise, (name, front_noise, total_noise)
+        assert toks[cuts[2]][0] > 20_000, (
+            name,
+            "expected the op region to start after the config blocks",
+        )
