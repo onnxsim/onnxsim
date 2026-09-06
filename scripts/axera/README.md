@@ -1696,6 +1696,527 @@ to instrument or bisect further -- and a hard existence proof that some
 of that 99%-opaque region cannot be padding: a mechanism this precise and
 reproducible almost certainly means it's live, checked, structural data.
 
+### Hand-patching the *decoded* Wbt requantization scale: confirms the field, corrects the mental model of how it acts
+
+Everything above hand-patches still-*undecoded* mcode bytes. This applies
+the same causal-intervention technique to a field this README already
+claims to have decoded -- `Conv`'s per-channel requantization multiplier
+`M_channel` in Wbt (`input_scale * weight_scale_channel / output_scale`,
+identified earlier purely by correlation: it shrinks monotonically as
+bias grows). A `Conv(cin=cout=4)` with a distinctly non-uniform bias
+(`[0, 5, 10, 15]`, so each channel's own float32 value is individually
+identifiable instead of accidentally coinciding across channels) locates
+each channel's `M_channel` value at a precise Wbt offset, present in 4
+identical repeated copies (64 bytes apart) -- consistent with this
+README's earlier "Wbt reveals real channel-tiling structure" finding.
+
+**Multiplying channel 0's value by 0.5 at all 4 repeated copies, confirmed
+stable across two independent rebuilds**, cleanly isolates to exactly that
+channel: channels 1-3's real device output are **bit-identical** to the
+unpatched baseline, direct proof the offset identification and per-channel
+indexing are both correct. But channel 0's actual change **refutes the
+simple mental model** ("this scales the final float output by the same
+factor") the earlier correlation-only description implied:
+
+```
+channel 0, baseline:  min=-1.73 max=1.73 mean=0.034 std=0.649 (42 unique values)
+channel 0, M x 0.5:   min=-2.41 max=-1.13 mean=-1.976 std=0.299 (17 unique values)
+```
+
+Halving `M_channel` did **not** halve the float output (that would predict
+a new mean near 0.017, still centered on zero) -- it collapsed the channel
+to a much narrower, shifted band with far fewer distinct values. That
+signature -- reduced spread, fewer unique output codes, a shifted center
+-- is exactly what happens when a scale factor used *inside* int8
+requantization (`int8_code = round(int32_accumulator * M) + zero_point`)
+gets halved: the accumulator's full dynamic range collapses toward
+`zero_point` in int8-code space *before* a separate, untouched
+output-dequantization step converts back to float32, rather than `M`
+being applied as an external multiplier on the already-dequantized float
+result. This is consistent with -- and actually a more precise,
+causally-verified version of -- the standard quantized-conv formula this
+README already named, it just corrects exactly where the multiplication
+happens in the pipeline. A real, verified example of this project's
+recurring lesson: a correlation-only finding (an array that "shrinks as
+bias grows") can misdescribe the actual mechanism even when the general
+hypothesis is right, and only a direct intervention exposes that.
+
+### The bit-flip probe on the real `resnet18d` mcode: a third outcome appears, and the blob is ~83% live
+
+The single-byte-flip probe above only ever saw two outcomes on a tiny
+two-Conv model (inert, or a `0x8030070C` fault), across just 8 offsets.
+Running the same probe across the **real, unmodified `resnet18d_Opset18`
+mcode** (49,080 bytes; 41 offsets evenly spaced every 1,200 bytes through
+the interior, one flipped byte per run, each on a fresh copy of the same
+base file, all fed the identical fixed `uint8 [1,224,224,3]` input) gives
+a quantified, real-model-scale picture, and finds something the tiny
+model never showed:
+
+```
+25 / 41  (61%)  FAULT      -- runtime rejects it: 0x8030070C, same code every time
+ 9 / 41  (22%)  DIFFERENT  -- runs, but the 1000-class logits change
+ 7 / 41  (17%)  identical  -- runs, bit-identical output
+```
+
+**The `DIFFERENT` class is new, and it is real computation.** Every one of
+those 9 flips ran to completion with no error, yet produced different
+logits -- and in **7 of the 9 the predicted class itself changed** (e.g.
+argmax 305 -> 567, 908, 834, 143, 111, 533, 318), with max-abs logit
+deltas from 0.18 up to 7.29. The other 2 shifted the logits only mildly
+(0.18, 0.29) and kept the argmax. These are the first bytes this project
+has ever identified whose effect on the *actual computation* is directly
+observable -- a genuine instruction/parameter class, distinct from the
+checksum/opcode-validation class that faults, and from the inert class.
+All three outcomes were verified to be deterministic and not device noise:
+the unpatched baseline is bit-identical across 3 repeated runs; three of
+the `DIFFERENT` flips (9900, 32700, 48300) reproduce the *same* changed
+output on rerun; and two `identical` flips (12300, 26700) stay
+bit-identical against a second, different random input. The device stayed
+healthy throughout 25 consecutive faults (`axcl-smi` fine afterward) --
+the fault is graceful every time, never a lockup.
+
+**Bottom line for "how live is a real model's mcode":** by this sampling,
+**~83% of `resnet18d`'s mcode bytes are load-bearing** (61% checked
+structurally, 22% affecting real output), and only ~17% are inert -- far
+more live than the tiny model's 50/50 split suggested, and a direct,
+quantified counterpart to the earlier "43.4% of bytes are exact
+duplicates" finding: a byte being a *copy* of another span does not make
+it dead, since the hardware evidently reads those copies. The 9
+output-changing offsets are the most concrete decoding targets this
+README has produced so far -- each is a real, known-live byte whose
+effect on a real classifier is already measurable, so the next step
+(bisecting each one's *neighbors* to map the extent of its field, and
+correlating the resulting logit change with which layer's Conv it sits
+in) needs no new technique at all.
+
+### Bisecting the live bytes' neighbors: an identical field template 15,600 bytes apart, and every bit of one byte is live
+
+Following the step named above: flip each byte in a 17-byte window
+(`X-8..X+8`) around three of the output-changing offsets, one flip per
+run, and classify each as fault (`F`), identical (`=`), or different
+(`D`). Then flip each of the 8 bits of one such byte individually.
+
+```
+X=9900:   [FFFF=FFFDDFFFFDFF]
+X=32700:  [FF==D=FDDDDDF=FF=]
+X=48300:  [FF==D=FDDDDDF=FF=]     <- byte-for-byte the same signature as 32700
+```
+
+**Two offsets 15,600 bytes apart have the identical 17-position live-byte
+signature.** Not merely similar bytes: the same layout of which
+positions fault, which are inert, and which change the output --
+including the same contiguous 5-byte live run at `X-1..X+3` and the same
+isolated live byte at `X-4`. This is the earlier "43.4% of bytes are
+exact duplicates / repeated command templates" finding seen from the
+*hardware's* side: the same command template recurs, and its internal
+field structure recurs with it. `9900` has a different, narrower layout
+(a 2-byte live pair at `X..X+1`, one isolated live byte at `X+6`, faults
+everywhere else), i.e. a different template.
+
+**Two different bytes that are functionally interchangeable.** Within
+both templates, flipping `X-4` and flipping `X-1` (e.g. 32696 vs 32699,
+48296 vs 48299) produce the **bit-identical full 1000-logit output** --
+confirmed on rerun. Two distinct bytes, 3 apart, whose corruption drives
+the computation to exactly the same state: consistent with two copies of
+one value being combined (or a field where those two bytes play the same
+role), and a concrete, reproducible handle on this template's internal
+redundancy.
+
+**Every bit of byte 9900 is live, and the effect is not bit-weighted.**
+All 8 single-bit flips run without fault and all change the output --
+no bit is padding. But the max-abs logit delta does *not* grow with bit
+significance (bit0 3.41, bit1 1.54, bit2 2.15, bit3 1.97, bit4 1.08, bit5
+1.08, bit6 2.15, bit7 2.98), as a plain little-endian integer or a
+float32 byte would predict. Instead the deltas fall on a grid: bit4 and
+bit5 give exactly 1.077231, bit2 and bit6 exactly 2.154462 = 2 x 1.077231
+(equal max-abs, but *different* full outputs -- so it's the magnitude
+that quantizes, not the result). That grid is the output tensor's own
+int8 dequantization step showing through, which is why it cannot be used
+to read the byte's encoding off the logits directly. Reported as what it
+is: a fully-live, non-bit-weighted numeric-ish field whose encoding is
+still not identified -- the exact-equality pairs are the lead, not a
+decoding.
+
+### Inside one repeated template: a gate, three address-like bytes, and a checked sign bit
+
+Two follow-up probes on the `FF==D=FDDDDDF=FF=` template, again no
+rebuild needed, sharpen what its live bytes actually are.
+
+**The interchangeable `X-4`/`X-1` pair is a gate, not a value.** Flipping
+`X-4` alone, `X-1` alone, or **both at once** lands in the byte-identical
+output at both template instances (32700: 3.986/argmax 111; 48300:
+1.293/argmax 305), and never back at baseline. A double flip that neither
+cancels (as two XOR-combined copies would) nor compounds (as two
+independent numeric contributions would) means the two bytes don't carry
+a *value* -- they gate a condition that either holds or doesn't, and any
+disturbance drops the computation into one fixed fallback state.
+
+**Per-bit across the 5-byte live run (`X-1..X+3`) at 32700:**
+
+```
+byte    bit0   bit1   bit2   bit3   bit4   bit5   bit6   bit7
+32699  3.986  3.986  3.986  3.986    =      =      =      =     <- X-1
+32700  5.135  3.016  5.063  6.176  6.068  6.751  5.530  5.099   <- X
+32701  5.386  6.284  3.447  6.894  6.858  2.370  7.469  3.052
+32702  3.591  5.745  5.997  3.375  4.776  4.453  4.596  6.104
+32703  5.925  4.740  5.889  3.627  5.853  4.309  5.673    F     <- X+3
+```
+
+- **`X-1` is half dead, half gate.** Its low nibble (bits 0-3) each
+  trips the *same* 3.986/argmax-111 state as `X-4` does; its high nibble
+  (bits 4-7) is completely inert. So `X-4` and the low nibble of `X-1`
+  are one gate -- the same fallback state now replicated across seven
+  independent single-flip measurements plus the double flip.
+- **`X..X+2` are three fully-live bytes with large, non-bit-weighted
+  effects** (every bit changes the output, deltas 2.4-7.5, no monotone
+  trend with bit index; e.g. at 32701 bit 6 gives 7.47 but bit 7 gives
+  3.05). A magnitude field would scale with bit significance; a field
+  where *any* corrupted bit makes the hardware read the wrong data --
+  an address, offset, or index -- would look exactly like this. Reported
+  as "address-like," not as a decoded address.
+- **`X+3`'s MSB is checked, its other 7 bits are live.** Bit 7 of the
+  run's last byte is the one single-bit flip in the whole 40-flip matrix
+  that faults (`0x8030070C`); bits 0-6 all run and change the output. A
+  sign/valid/reserved bit sitting at the top of a 4-byte little-endian
+  field, checked by the same validator the `F` positions hit, is the
+  simplest reading.
+
+Net: this template's live region reads as `[gate byte] [gate nibble |
+dead nibble] [3 address-like bytes] [7 live bits | 1 checked bit]` --
+the most detailed internal map of any mcode command this README has
+produced, obtained entirely from single-bit interventions on the real
+`resnet18d` blob.
+
+**A caveat on the fault class, found the hard way: `0x8030070C` can hit
+a valid model, rarely.** While locking the template findings into a
+regression test, the *unpatched* baseline of a freshly-built `resnet18d`
+faulted with the same `0x8030070C` -- once, immediately after a dense
+burst of roughly 65 deliberately-faulting runs plus a Docker build. The
+same file ran fine seconds later, and so did the known-good build, so it
+was neither a bad build nor a wedged device (no kernel/PCIe events;
+telemetry normal). Trying to reproduce it on purpose failed: 10 trials of
+a deterministic-fault run immediately followed by a valid run gave **0/10
+transient faults** (and 10/10 deliberate faults, reconfirming that class
+is deterministic). So this is a rare event -- one in well over 200 valid
+runs this session -- not something a single preceding fault triggers,
+and its trigger is not identified. The tests now retry a `0x8030070C`
+exactly once (`_run_retry_once`): safe, because a genuinely faulting
+byte faults on every attempt, so a second fault is a real one, while a
+transient recovers -- and it never masks anything, since no other error
+is retried. Worth knowing for anyone running large fault-injection
+sweeps on this hardware.
+
+### What the output-changing bytes *are*: 8 of 9 are control-like, 1 is data-like
+
+The 22% "runs, but changes the output" class above says a byte is live
+and computational, but not what *kind* of byte it is. A cheap
+discriminator: run the same flipped model against **different inputs**.
+A corrupted *weight or data* value interacts with the input, so its
+effect should vary with the input; a corrupted *control* value (an
+address, offset, index, or fixed constant) redirects the computation the
+same way regardless of what flows through it. Each of the 9
+output-changing flips against three independent random `uint8` inputs
+(seeds 42, 7, 123; all three baselines classify as 305):
+
+```
+offset   seed42          seed7           seed123         shifted class
+ 6300    305  0.18       305  0.18       305  0.14       same
+ 9900    567  3.81       567  3.81       567  3.81       same
+20700    143  0.50       143  0.50       143  0.50       same
+24300    111  0.97       111  1.04       111  1.01       same
+32700    908  4.45       908  4.42       908  4.42       same
+36300    533  5.75       533  5.85       533  5.82       same
+43500    305  0.29        65  0.32        60  0.29       DIFFERS
+44700    318  1.47       318  1.47       318  1.51       same
+48300    834  7.29       834  7.29       834  7.33       same
+         (argmax, max-abs logit delta vs. that input's own baseline)
+```
+
+**Eight of the nine are input-independent**: the same flip lands the
+classifier on the same wrong class with a near-identical delta on every
+input -- 9900 goes to 567 at 3.81 all three times, 48300 to 834 at
+7.29/7.29/7.33. That is control-like behavior, and it lines up with the
+template map above: 32700 and 48300 are the template whose live run
+reads as address-like bytes, and a wrong address fetches the same wrong
+data no matter the input. **Exactly one, 43500, is input-dependent** --
+the shifted class moves with the input (305, 65, 60) and the delta stays
+small (~0.3): the signature of a corrupted weight/data value whose effect
+is modulated by what it multiplies. So the "changes the output" class is
+itself ~8:1 control-like to data-like at this sampling, which is also a
+useful hint about mcode's overall composition: it is dominated by
+control/addressing, with real numeric data mostly living elsewhere (Wbt)
+-- exactly what the `AxQuantizedConv` weight-in-Wbt / commands-in-mcode
+split found much earlier would predict.
+
+### The one data-like byte, probed: the gate recurs in a third template, and the prediction is only half right
+
+The control-vs-data reading above makes a falsifiable prediction: a
+data-like byte should be *bit-weighted* (its high bits should matter
+more than its low bits), unlike the control bytes at 9900/32700 whose
+every bit produced a large, unordered effect. Probing 43500 the same
+two ways:
+
+```
+window:  F===D=FDDDFFF=FF=      (43492..43508; control template was FF==D=FDDDDDF=FF=)
+  43496 (X-4): D 2.442 / argmax 116
+  43499 (X-1): D 2.442 / argmax 116      <- bit-identical output to X-4
+  43500 (X):   D 0.287 / argmax 305
+  43501 (X+1): D 1.149 / argmax 106
+
+per-bit at 43500:
+  bit0 0.323  bit1 0.395  bit2 0.287  bit3 0.359     (argmax stays 305)
+  bit4 0.682  bit5 1.149  bit7 1.508                 (argmax -> 741, 741, 106)
+  bit6 0.323                                         (argmax 305; == bit0 exactly)
+```
+
+**The gate is now seen in a third template.** The window shares the
+control template's skeleton -- an isolated live byte at `X-4`, the run
+starting at `X-1` -- and `X-4` and `X-1` again yield the bit-identical
+output. That makes the "any disturbance trips one fixed state"
+`X-4`/`X-1` structure a recurring feature of these command templates
+(three templates, ~10 independent measurements), not a quirk of one.
+The live run here is 3 bytes (`X-1..X+1`) rather than 5, so this is a
+related variant, not the same template.
+
+**The bit-weighting prediction is half right, and reported as such.**
+High bits dominate: bits 4, 5, and 7 produce the largest deltas and are
+the only ones that move the predicted class, while bits 0-3 perturb the
+logits without changing the class. That is more ordered than the control
+bytes ever were. But it is not a clean weighting: bit 6 is small (0.323,
+exactly equal to bit 0 -- the output's int8 grid again), so a strict
+"delta grows with bit index" test fails. One further observation does
+fit a *signed* numeric value specifically: flipping all 8 bits at once
+changes the output *less* (0.287) than flipping bit 7 alone (1.508).
+XOR-ing every bit of a small two's-complement value is approximately a
+negation and lands near zero, whereas flipping only the top bit moves it
+by half the range -- so this is exactly the ordering a small signed byte
+would show. Consistent with a signed quantized parameter, not a
+decoding of one.
+
+### The opaque region is a 32-bit-word instruction stream: `a1 00 xx yy` headers, never adjacent, each followed by an operand
+
+The hardware probes above pointed at *which* bytes matter; comparing the
+raw bytes of the probed windows -- zero device runs -- shows *why*, and
+it is the most concrete structural decoding of mcode this project has
+produced.
+
+**The two control-template instances differ at exactly the three
+"address-like" bytes and nowhere else.** The 17-byte windows around
+32700 and 48300 are identical at all 14 positions the probes classified
+as fault, inert, or gate, and differ only at `X..X+2` -- precisely the
+bytes whose flips gave large, unordered, input-independent effects:
+
+```
+32700:  05 00 00 00 | a1 00 40 02 | 8c 4c 06 00 | a1 00 50 01 | 00
+48300:  05 00 00 00 | a1 00 40 02 | a0 49 b3 00 | a1 00 50 01 | 00
+43500:  00 00 00 00 | a1 00 50 03 | 80 64 1e 00 | a1 00 50 01 | 00
+```
+
+Segmented into 4-byte words (all three windows start on a 4-byte
+boundary), the layout is the same everywhere: a **header word
+`a1 00 xx yy`**, then a **32-bit little-endian operand** (`0x00064c8c`,
+`0x00b349a0`, `0x001e6480`), then the next header. Every probe result now
+has a place: the gate at `X-4` is the header's first byte `a1`; the
+"gate nibble" at `X-1` is the low nibble of the header's last byte
+(`02`/`03`); the three address-like bytes are the operand's low three
+bytes; the checked MSB at `X+3` is bit 7 of the operand's top byte
+(`00`); and the data-like instance simply has a different header
+(`50 03` vs `40 02`), i.e. a different instruction kind whose operand
+the hardware treats differently.
+
+**This is the format of the whole blob, in two different models, not a
+local coincidence** (all of it local byte analysis, deterministic,
+re-checkable in seconds):
+
+```
+                             resnet18d (49,080 B)     tiny two-Conv (3,920 B)
+length % 4                   0                        0
+`a1 00` words, 4-byte aligned  1,197                  58
+`a1 00` byte pairs, unaligned  167 (~56 per phase)    49 (~16 per phase)
+header followed by a header  0 / 1,197                0 / 58
+even gaps between headers    98% (1,174 / 1,196)      86% (49 / 57)
+```
+
+Aligned headers are ~21x (resnet18d) and ~3.6x (tiny) more frequent than
+the same byte pair at any other phase, so the alignment is real, not
+chance. **No header is ever immediately followed by another** (random
+placement would give ~117 such pairs in resnet18d), which is the
+`[header][>=1 operand]` structure exactly. Gaps between headers are
+dominantly 2 words -- one operand -- with 4, 8, 10, 12 next; a first
+version of this section said "strictly even," which was an overstatement
+from reading only the top gap sizes: it is 98% and 86%, i.e. 2-word
+granularity with exceptions, and 32 bytes is four such 2-word
+instructions, reconciling the very first "32-byte mcode unit" finding.
+
+**The instruction mix is model-dependent; the format is not.** In
+`resnet18d` three header kinds dominate -- `50 01` (724), and `40 02`
+and `50 03` at *exactly* 181 each (the two probed control bytes were
+`40 02`, the data-like one `50 03`, so a `40 02`/`50 03` pair per op is
+the natural reading, e.g. an address-set and a data-set). The tiny model
+has a different top set (`80 02`, `b0 03`, `b0 0b`, `30 04`), as a
+different op/shape mix should. One more tie-in: the tiny model's four
+known non-deterministic noise bytes (858/864/870/876) fall in `23 00 xx
+82`-style words, never in an `a1 00` header, carrying exactly the known
+`{0x10,0x20,0x30,0x40}` label values -- the label noise is a field of a
+different word family.
+
+**What this does and does not settle.** It settles that the "99% opaque"
+region is a parseable stream of 4-byte words with a recognizable header
+kind, so "decoding mcode" now means "decoding operand semantics per
+header kind," a far smaller and better-posed problem. It does *not*
+identify what `a1` means, what `xx yy` encode beyond "kind," or confirm
+that operands are addresses -- though the input-dependence split
+(control-like `40 02` vs data-like `50 03`) is exactly what "an address
+to an output buffer" vs "an address to weights" would produce, which is
+now the leading hypothesis and one a single targeted test (patch an
+operand to another instance's value) could check.
+
+### `40 02` operands are weight-table offsets; `40 02`/`50 03` come in pairs one 32-byte unit apart; `50 01` is a 4-valued flag
+
+Still zero device runs -- pairing and operand statistics over all 1,197
+headers, then one size cross-check.
+
+**`40 02` and `50 03` are paired one-to-one.** Every one of the 181
+`50 03` headers has a `40 02` before it at a word distance of 8 (166
+cases), 10 (14), or 44 (1), and the reverse histogram -- each `40 02` to
+its next `50 03` -- is identical. Eight words is 32 bytes: the pair sits
+exactly one "32-byte mcode unit" apart, the unit this whole
+investigation began with, with three other two-word instructions in
+between.
+
+**Operand statistics separate the kinds cleanly:**
+
+```
+kind        n    distinct   operand range          reading
+a1 00 40 02  181    181     0x000000..0xb45ba0     address-like, one per op
+a1 00 50 03  181    176     0x000000..0x2f7040     address-like, smaller region
+a1 00 50 01  724      4     {0x1 .. 0x01000000}    enumerated flag, not an address
+```
+
+**And the size cross-check decodes `40 02`.** `resnet18d`'s Wbt
+(`npu_params`) is 11,855,108 bytes = `0x00b4e504`; the largest `40 02`
+operand is `0x00b45ba0` -- within 0.3% of the Wbt's end -- and the 181
+values are all distinct. So **`a1 00 40 02 <operand>` sets this op's
+offset into the weight table**: a real, quantitative, independently
+checkable semantic for one instruction kind, obtained without any
+device. `50 03`'s operands stop at ~3.1 MB, about a quarter of the Wbt,
+so they address a different, smaller region -- the size is consistent
+with an activation/intermediate-buffer arena, but that is inferred from
+size alone and is not confirmed.
+
+**Correction, stated in place.** The previous section guessed the
+opposite assignment -- `40 02` as an output-buffer address and `50 03`
+as a weight address -- from the input-dependence split alone. The Wbt
+span settles it the other way. The two observations still fit together:
+corrupting a Wbt offset can land the op on per-channel scale/bias data
+that saturates its output to a fixed value regardless of input
+(input-independent, as 32700/48300 showed), while corrupting a pointer
+into an activation region reads data that still varies with the input
+(input-dependent, as 43500 showed). A related caveat on that
+input-dependence experiment: its three "different inputs" were all
+independent uniform-noise images, which are statistically alike -- a
+weaker test than three genuinely different photographs. It still had
+discriminating power (43500 did vary), but the 8-of-9 count should be
+read with that in mind.
+
+The most common instruction, `50 01`, takes only four distinct operand
+values across 724 uses -- a small enumerated control/flag word, not a
+pointer; which flags is not identified.
+
+### Patching a `40 02` operand on the device: in-range predictions hold, the bounds-check prediction fails
+
+The section above named one targeted test; here it is, on the real
+device. Overwrite instance 32700's whole 4-byte operand (`0x00064c8c`)
+and run, one variant per fresh copy, same fixed input:
+
+```
+A <- B's operand 0x00b349a0 (valid, in range)   runs, D  argmax 905
+B <- A's operand 0x00064c8c (valid, in range)   runs, D  argmax 832
+A <- 0                                          runs, D  argmax 925
+A <- last in-range word (Wbt end - 4)           runs, D  argmax 18  (smallest change, 0.83)
+A <- 1 MB past the Wbt's end                    runs, D  argmax 530
+A <- 0x7fffff00 (~2 GB, far past)               runs, D  argmax 794
+```
+
+**Confirmed:** the operand is live and causal for any value -- every
+variant ran and changed the output, deterministically (the two past-end
+variants and the swap each reproduce the identical output across three
+reruns). Swapping two instances' offsets works in both directions.
+
+**Refuted, and worth stating plainly:** the prediction that an
+out-of-range offset would fault. It does not. The runtime accepts 1 MB
+past the Wbt's end, and `0x7fffff00`, without any error -- there is **no
+bounds check on this operand**. So the "weight-table offset" reading
+rests on the static evidence (181 distinct values whose maximum matches
+the Wbt's size to 0.3%), not on any runtime enforcement; mechanically
+this behaves like a raw base-plus-offset read, and a past-end value
+simply reads whatever stable, mapped memory sits there (deterministic
+across reruns, so not uninitialized garbage). It also sharpens what the
+`0x8030070C` validator is: every fault in this whole investigation came
+from a *header/format* byte, never from an operand value, however
+absurd -- the validator checks instruction structure, not operands.
+
+One suggestive detail, single data point: pointing the op at the last
+in-range word produced the *smallest* change of all six (0.83, vs
+2.4-7.5), as reading a near-empty tail of the weight table would.
+
+### `a1 00 xx yy` is a field write: `xx` is a 16-byte-granular field offset, `yy` a bank, and the map is shared across models
+
+Re-running the header statistics on the tiny two-Conv blob, side by
+side with `resnet18d`, corrects the "instruction kinds" framing above
+into something more specific and better supported -- all local, zero
+device runs.
+
+**Three checked regularities, both models:**
+
+- **`xx` is a multiple of `0x10` in every header: 58/58 and
+  1,197/1,197.** Not a single exception in 1,255 headers -- a 16-byte
+  granular offset, not an opcode.
+- **The `xx` values form ladders within each `yy`, and the ladders are
+  the same in both models.** Bank `0x02`: `0x10,0x20,0x40,...,0xd0` in
+  the tiny model, `0x10..0xd0` in `resnet18d`; bank `0x03`:
+  `0x30,0x50..0xe0` vs `0x30,0x50..0xf0`; bank `0x04`: `0x30..0xe0` vs
+  `0x40..0xf0`; bank `0x01`: `{0x50,0x60}` in both. A shared map of
+  fields, not a per-model vocabulary.
+- **`50 01` takes the identical operand set in both models:**
+  `{0x1, 0x100, 0x100000, 0x1000000}` -- single bits 0, 8, 20, 24. A
+  one-hot enable/mode register, written 724 times in `resnet18d` and 4
+  times in the tiny model, with the same four values.
+
+**So the reading is: `a1 00 xx yy <value>` writes a 32-bit value to
+field `xx` of bank `yy`** -- a descriptor or register-file write. That
+one reading explains everything found so far at once: a write is
+`[selector][value]`, so no selector is ever immediately followed by
+another (0/1,255); writes are two words, so the 2-word granularity and
+the 32-byte (four-write) unit; the "gate" is the selector word (corrupt
+it and the value goes to the wrong field, or nowhere -- one fixed
+fallback state); the validator faults on malformed *selectors*, never on
+*values*; `40 02` is the Wbt-offset field (181 distinct values spanning
+the Wbt in `resnet18d`; the single write in the tiny model is `0`, the
+first op's offset -- and `resnet18d`'s values include
+`0x14f80, 0x14f82, 0x14f84`, byte-granular steps, as INT8 weight
+offsets would be); and the input-independent vs input-dependent split is
+just which field got a bad value.
+
+**Corrections, stated in place.** (1) "The instruction mix is
+model-dependent; the format is not" -- better: the *field map* is
+shared; a large model re-writes a few fields (Wbt offset, an address in
+bank 3, the `50 01` flags) once per op, while a small model touches many
+fields once each as setup. (2) The tiny-model "structure holds" table
+earlier rested on 58 headers with many one-offs, which was thin; the
+ladders and the identical `50 01` set are the real, strong tiny-model
+evidence. (3) "Operands are address-like" holds for address *fields*
+(`40 02`, `50 03`); many bank-2/3/4 fields in the tiny model carry
+high-entropy packed values (`0xa1020c81`, `0x8130180f`, ...) -- packed
+configuration words, not addresses.
+
+What this still does not settle: the meaning of any field other than
+`40 02` (Wbt offset, quantitatively) and `50 01` (a one-hot flag, values
+known, meaning not), and what the banks are. But "decode mcode" has
+now gone from "49 KB of opaque bytes" to "a register map with ~50 named
+fields in a dozen banks, each written with a 32-bit value" -- a
+concrete, enumerable target.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
