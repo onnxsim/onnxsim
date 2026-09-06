@@ -4350,6 +4350,38 @@ class _ConsumerBranch:
     function's own docstring -- so by the time :func:`_apply_chains` reads
     it here, it's already established as the one shared block boundary
     every producer and every branch alike must honor.
+
+    `literal_reshape_dims` -- entries of ``(reshape_node, shape_initializer_name,
+    dim_index)`` -- is for a shape :func:`_find_conv_gc_context_chains` alone
+    produces (empty for every other branch, everywhere else): GCNet
+    ContextBlock's own "input_x"/"context" `Reshape`s each bake the spine's
+    own channel count in as a LITERAL element of their own ``shape`` operand
+    (``[batch_or_1, n_channels, H*W]``/``[batch_or_1, n_channels, 1, 1]``),
+    unlike every other Reshape this module's own Conv-chain walk already
+    tolerates (:func:`_match_reshape_batch_neg1_pass_through`'s own ``-1``-
+    tail convention needs no edit at all when pruned, precisely because it
+    does NOT bake a literal channel count in) -- see this module's own
+    "GCNet ContextBlock (channel-add attention) chains" section comment for
+    the full reasoning. Each entry's own `reshape_node` is ALSO present, as
+    an ordinary ``(node, None)`` pair, in this same branch's own `chain_ops`
+    above -- that copy drives the ordinary "mark this node's own output
+    value_info stale" bookkeeping :func:`_slice_chain_channels` already gives
+    every `chain_ops` entry; this field drives one MORE, additive action for
+    the identical node: overwriting `dim_index` of the *constant tensor named
+    by* `shape_initializer_name` (an initializer, or a plain ``Constant``
+    node's own embedded value -- either way, resolved through the same
+    `initializer_map`/:func:`_constant_map` every other hop in this module
+    already reads its own constants through) with the chain's own new
+    `keep_count`. Safe to edit in place with no "clone if shared" guard the
+    way :func:`_apply_one_decomposed_gqa_chain`'s own analogous
+    `_rewrite_shape_dim` local helper needs (see that function's own
+    docstring for why *it* needs one): :func:`_match_conv_gc_context_gate`
+    only ever returns a `shape_initializer_name` it already confirmed has
+    EXACTLY ONE reader in the whole graph (this same `reshape_node`, checked
+    via `consumers_of` at match time) -- and nothing this module's own
+    `_apply_chains`/:func:`_slice_chain_channels` ever does *adds* a new
+    reader to an existing constant, so that one-reader fact, once true at
+    match time, still holds by the time this edit actually runs.
     """
 
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
@@ -4359,6 +4391,7 @@ class _ConsumerBranch:
     consumer_is_conv: bool = False
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
     consumer_group: int = 1
+    literal_reshape_dims: Tuple[Tuple[onnx.NodeProto, str, int], ...] = ()
 
 
 @dataclass
@@ -12915,6 +12948,713 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- GCNet ContextBlock (channel-add attention) chains ----------------------
+#
+# GCNet (Cao et al. 2019, "GCNet: Non-local Networks Meet Squeeze-Excitation
+# Networks and Beyond", https://arxiv.org/abs/1904.11492)'s own `ContextBlock`
+# -- `xvjiarui/GCNet`'s own reference implementation, reused verbatim as
+# `mmcv.cnn.ContextBlock` throughout mmdetection/mmsegmentation -- configured
+# `pooling_type='att', fusion_types=('channel_add',)` (the "channel-add"
+# attention shape; the "channel-mul" fusion type, and the simpler
+# `pooling_type='avg'` global-average-pool shape, are NOT what's matched
+# here -- see below). Confirmed live via a real `torch.onnx.export` (torch
+# 2.14.0+cpu, legacy TorchScript-based exporter, opset 17) of a verbatim
+# reproduction of `ContextBlock.forward`/`spatial_pool` wrapped as
+# `Conv -> ContextBlock -> Conv` (see `tests/test_pruning.py`'s own fixture
+# for the captured `onnx.printer.to_text` graph this section's matcher is
+# built directly against):
+#
+#     batch, channel, height, width = x.size()
+#     input_x = x.view(batch, channel, height * width).unsqueeze(1)
+#     context_mask = self.conv_mask(x).view(batch, 1, height * width)
+#     context_mask = self.softmax(context_mask).unsqueeze(-1)
+#     context = torch.matmul(input_x, context_mask).view(batch, channel, 1, 1)
+#     channel_add_term = self.channel_add_conv(context)   # Conv->LN->ReLU->Conv
+#     out = x + channel_add_term
+#
+# i.e. `spine` (the producing Conv's own output) has exactly THREE direct
+# consumers -- never two, the bar every shape in this module's own
+# `_find_conv_se_gate_chains` dispatch holds (and, for its own three-consumer
+# case, Coordinate Attention's disjoint `AveragePool`-pair-plus-`Mul` shape;
+# see that function's own docstring) -- so this shape gets its own, entirely
+# separate top-level finder rather than widening that one: `Reshape` (the
+# "input_x" branch), `conv_mask` (a plain ``group=1`` 1x1 `Conv` reducing
+# `spine` to a single "attention pooling mask" channel), and the FINAL `Add`
+# (`spine + channel_add_term`) that closes the block. Left unrecognized, the
+# whole block (including `spine`'s own producing Conv) is completely
+# unprunable -- confirmed empirically the same way every other shape in this
+# module was: building the exact topology above and running
+# `apply_structured_pruning` at this feature's own starting commit leaves
+# every one of `P`/`conv_mask`/`channel_add_conv.0`/`channel_add_conv.2`
+# (this module's own 0-indexed naming for `channel_add_conv`'s two `Conv`
+# layers) completely untouched.
+#
+# Unlike CBAM/CoordAtt/GRN/SE-gate's own gate/pass-through shapes -- every
+# one of which either multiplies `spine` by a gate (needing no producer of
+# its own to co-slice beyond the gate-computing Conv itself) or crosses
+# `spine`'s own channel axis completely transparently (needing no slicing at
+# all) -- GCNet's channel-ADD path genuinely has to CO-SLICE three separate
+# weights against `spine`'s own surviving channel-index set, on three
+# DIFFERENT axes: `conv_mask`'s own weight (`[1, C, 1, 1]`, input-channel
+# axis 1 -- an ordinary CONSUMER role, exactly like SE-gate's own fc1),
+# `channel_add_conv.0`'s own weight (`[C/ratio, C, 1, 1]`, input-channel
+# axis 1 -- also a CONSUMER role, even though what feeds it, `context`, is
+# several hops downstream of `spine` rather than `spine` itself -- safe for
+# the identical reason a `MatMul`-joined diamond is safe elsewhere in this
+# module, see below), and `channel_add_conv.2`'s own weight (this module's
+# own naming: the LAST `Conv` in the `channel_add_conv` `Sequential` --
+# `[C, C/ratio, 1, 1]`, OUTPUT-channel axis 0 -- a genuine PRODUCER role,
+# co-sliced with `spine`'s own producing Conv `P` exactly like SE-gate's own
+# fc2, since its own output is what gets summed back onto `spine`. The
+# `ratio`-wide bottleneck dimension itself (`channel_add_conv.0`'s own
+# OUTPUT axis / `channel_add_conv.2`'s own INPUT axis, and the mid-chain
+# `LayerNormalization`'s own `scale`/`bias`, each `[C/ratio, 1, 1]`) is never
+# touched -- independent of `spine`'s own channel count, exactly like
+# SE-gate's own squeeze-bottleneck dimension already is, so `LayerNormalization`
+# and the trailing `Relu` need no bookkeeping on the matched :class:`_Chain`
+# at ALL (no slicing, and -- since neither op's own output shape changes as
+# a result of THIS pruning -- no staleness marking either), mirroring how
+# SE-gate's own fc1->activation->fc2 bottleneck activation already needs
+# none.
+#
+# The `input_x`/`context_mask` diamond `MatMul` joins is channel-safe for the
+# same "no cross-channel mixing" reason GRN's own `x * x_n` elementwise
+# multiply already is, just via a dot-product instead of an elementwise one:
+# `input_x` is `spine` reshaped/unsqueezed to `[N, 1, C, HW]` with NO
+# reordering of any kind (a plain `view`, contiguous per channel), and
+# `context_mask` is `[N, 1, HW, 1]` -- shared across every channel, computed
+# from `spine` via `conv_mask` (itself a channel-REDUCING 1x1 Conv, never
+# channel i's own value alone). `MatMul`'s own batched-matrix-multiply
+# semantics contract the shared `HW` axis, leaving `C` (`input_x`'s own
+# second-to-last axis) as a purely-passed-through batch-like axis: output
+# channel `i` is `sum_hw(input_x[i, hw] * context_mask[hw])`, depending on
+# `input_x`'s own channel `i` ONLY and nothing else -- so `context`'s own
+# channel axis is `spine`'s own channel axis, unpermuted, letting
+# `channel_add_conv.0`'s own input-channel axis be sliced by the identical
+# `keep` index set as `spine`'s own producer, with no re-derivation of this
+# algebra needed live (this module's own established "confirmed once via a
+# real reference implementation, structurally matched thereafter, declined
+# on any deviation" convention -- exactly how SE-gate/CoordAtt/CBAM's own
+# matchers already work).
+#
+# The one genuinely NEW wrinkle this shape brings that no earlier shape in
+# this module needed: TWO of the `Reshape`s astride that `MatMul` --
+# `input_x`'s own `view(batch, channel, height*width)` and `context`'s own
+# `view(batch, channel, 1, 1)` -- bake `channel` (`spine`'s own channel
+# count) in as a LITERAL element of their own `shape` operand, unlike every
+# `Reshape` this module's own Conv-chain walk already tolerates
+# (:func:`_match_reshape_batch_neg1_pass_through`'s own ``[batch, -1]``
+# convention needs no edit at all when pruned, precisely because a trailing
+# ``-1`` auto-infers the post-pruning width with zero graph changes -- the
+# "general, harder Reshape problem" that function's own docstring calls out
+# as excluded is exactly a literal, non-``-1`` channel count baked into the
+# target shape). `torch.onnx.export` bakes this in as a plain Python int no
+# matter how the model is exported (even with `dynamic_axes` covering batch
+# and/or spatial dims): `channel` is read from `x.size(1)` and traced as a
+# concrete int, never a `Shape`-derived tensor, since no real caller ever
+# marks a channel dimension itself dynamic. Both literals are handled here,
+# not declined: `_match_conv_gc_context_gate` resolves each one's own
+# `shape` operand as a genuine constant (an initializer, or a plain
+# ``Constant`` node's own embedded value, either way via `initializer_map`/
+# :func:`_constant_map`) with EXACTLY ONE reader in the whole graph (the
+# `Reshape` itself), then :class:`_ConsumerBranch.literal_reshape_dims`
+# carries `(reshape_node, shape_initializer_name, dim_index)` for
+# :func:`_slice_chain_channels` to overwrite in place at apply time -- safe
+# with no "clone if shared" guard (see that field's own docstring for why).
+# A `Reshape` whose own `shape` operand isn't a resolvable constant, or has
+# more than one reader, is declined outright, never guessed at -- the same
+# conservative bar this module holds every other hop to.
+#
+# What matches, conservatively -- declining rather than guessing at anything
+# beyond the one confirmed real shape above:
+#
+#   - `P`, an ordinary (``group == 1``) Conv/FusedConv producer
+#     (:func:`_match_conv_producer`) whose own raw output, optionally through
+#     a linear run of `_UNARY_PASS_THROUGH` activations (each a strict
+#     single-consumer hop, zero admitted too -- mirroring
+#     `_find_conv_se_gate_chains`'s own identical allowance), reaches a
+#     tensor `spine` with EXACTLY THREE consumers, classified by op type
+#     (declined if any of the three classifications below doesn't resolve to
+#     exactly one node, or if the three don't partition `spine_consumers`
+#     completely -- automatic here since `Add`/`Reshape`/`Conv` are mutually
+#     exclusive op types): one `Add` (`spine` plus a non-constant second
+#     operand), one `Reshape` (`spine`'s own single, direct input), and one
+#     ``group=1`` `Conv`/`FusedConv` (`spine`'s own single, direct input).
+#   - `conv_mask`: the classified `Conv`, required to be an ordinary
+#     (``group == 1``) 1x1 Conv (:func:`_match_conv_consumer`, own input
+#     channels == `n_channels` exactly) whose own OUTPUT channel count is
+#     exactly 1 (the attention-pooling mask) -- its own weight's `dims[0]`
+#     checked directly, since `_match_conv_consumer` only ever resolves the
+#     INPUT-channel role this section needs from it.
+#   - The classified `Reshape` (`reshape1`), matched via
+#     :func:`_match_gc_context_channel_reshape` (own `shape` operand a
+#     private, single-reader constant with `n_channels` at `dims[1]`) ->
+#     exactly one `Unsqueeze` (any single-axis `axes`, since its own exact
+#     value doesn't affect channel-pruning safety, only `MatMul`'s own
+#     downstream numerics) -> the join `MatMul` below.
+#   - `conv_mask`'s own output -> exactly one `Reshape` (own `shape` operand
+#     NOT checked against `n_channels` at all -- `conv_mask`'s own output
+#     always has exactly 1 channel, by construction, regardless of `spine`'s
+#     own channel count, so this `Reshape`'s own target shape needs no edit
+#     ever) -> exactly one `Softmax` -> exactly one `Unsqueeze` (any
+#     single-axis `axes`) -> the same join `MatMul`, as its OTHER operand.
+#   - The join `MatMul` (exactly the two `Unsqueeze` outputs above, in either
+#     operand order) -> exactly one `Reshape` (`reshape3`, matched via
+#     :func:`_match_gc_context_channel_reshape` exactly like `reshape1`
+#     above) -> `channel_add_conv.0`, an ordinary (``group == 1``) 1x1 Conv
+#     consumer (:func:`_match_conv_consumer`, own input channels ==
+#     `n_channels` exactly) whose own OUTPUT channel count (the `ratio`-wide
+#     bottleneck, `planes`) is left completely unconstrained (any positive
+#     value) and never itself sliced.
+#   - `channel_add_conv.0`'s own output -> exactly one `LayerNormalization`
+#     (own `scale`/`bias` never inspected or touched -- see above) ->
+#     exactly one `Relu` -> `channel_add_conv.2` (this module's own naming),
+#     an ordinary (``group == 1``) 1x1 Conv PRODUCER
+#     (:func:`_match_conv_producer`, own output channels == `n_channels`
+#     exactly) whose own raw output feeds the closing `Add` directly (no
+#     activation in between -- `pre_ops=()`, unlike SE-gate's own fc2, which
+#     always has a trailing Sigmoid/HardSigmoid).
+#   - The closing `Add` (the THIRD classified `spine` consumer): its own two
+#     inputs are required to be EXACTLY `{spine, channel_add_conv.2's own
+#     output}` -- no other operand combination -- closing the loop back to
+#     the block's own three `spine` consumers.
+#   - FIVE distinct roles overall (`P`, `conv_mask`, `channel_add_conv.0`,
+#     `channel_add_conv.2`, and the real downstream consumer the closing
+#     `Add`'s own output eventually reaches via :func:`_walk_to_conv_consumer`)
+#     must all name distinct weights -- an accidental/tied share between any
+#     two is not the confirmed real shape, mirroring SE-gate's/CoordAtt's own
+#     identical bar.
+#
+# Every :class:`_Chain` this produces has TWO producers (`P`, co-sliced with
+# `channel_add_conv.2` -- exactly SE-gate's own two-producer shape, just
+# combined by `Add` instead of `Mul`, which :class:`_Chain`'s own
+# `chain_ops`/:func:`_chain_importance` machinery already handles identically
+# either way: the combining op itself is just one more `(node, None)`
+# `chain_ops` entry, its own op type never inspected by either), TWO extra
+# fan-out consumer branches (`conv_mask`, and `channel_add_conv.0` --
+# `_Chain.extra_consumers`/`_ConsumerBranch` were already a plain tuple with
+# no hardcoded arity anywhere consumed, so this composes for free, exactly
+# like CoordAtt's own three-producer shape needed no changes there either),
+# and the closing `Add` continuing on to a real downstream consumer via
+# :func:`_walk_to_conv_consumer`, exactly like SE-gate's own closing `Mul`
+# does.
+
+
+def _match_gc_context_channel_reshape(
+    node: onnx.NodeProto,
+    data_in: str,
+    dim_index: int,
+    n_channels: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[str]:
+    """If `node` is a plain, single-output ``Reshape`` reading `data_in` as
+    its own ``data`` input, whose own ``shape`` operand is a genuine constant
+    (an initializer, or a plain ``Constant`` node's own embedded value --
+    resolved via `initializer_map`/:func:`_constant_map` either way) with
+    EXACTLY ONE reader in the whole graph (`node` itself, via `consumers_of`)
+    and a literal value of exactly `n_channels` at `dim_index`, returns that
+    `shape` operand's own name. Declines (``None``) on any deviation -- see
+    this module's own "GCNet ContextBlock (channel-add attention) chains"
+    section comment for why both the "single reader" and "literal
+    `n_channels` at a fixed index" bars matter (the former is what makes
+    :func:`_slice_chain_channels`'s own later in-place edit of this same
+    constant safe with no "clone if shared" guard; the latter is what makes
+    that edit the CORRECT one -- any other literal at `dim_index` would mean
+    this isn't the confirmed real shape at all).
+    """
+    if (
+        node.op_type != "Reshape"
+        or node.domain != ""
+        or len(node.input) != 2
+        or node.input[0] != data_in
+        or len(node.output) != 1
+    ):
+        return None
+    shape_name = node.input[1]
+    shape_init = initializer_map.get(shape_name)
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    if len(consumers_of.get(shape_name, [])) != 1:
+        return (
+            None  # shared/foreign reader -- declined, see this function's own docstring
+        )
+    dims = onnx.numpy_helper.to_array(shape_init).reshape(-1)
+    if dim_index >= len(dims) or int(dims[dim_index]) != n_channels:
+        return None
+    return shape_name
+
+
+def _match_conv_gc_context_gate(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # reshape1 (Reshape(spine) -> "input_x", channel literal)
+        str,  # reshape1's own shape initializer name
+        onnx.NodeProto,  # Unsqueeze(reshape1's own output)
+        onnx.NodeProto,  # conv_mask Conv node
+        str,  # conv_mask weight name
+        Optional[str],  # conv_mask bias name
+        onnx.NodeProto,  # join MatMul
+        onnx.NodeProto,  # reshape3 (Reshape(MatMul's own output) -> "context", channel literal)
+        str,  # reshape3's own shape initializer name
+        onnx.NodeProto,  # channel_add_conv.0 Conv node
+        str,  # channel_add_conv.0 weight name
+        onnx.NodeProto,  # channel_add_conv.2 Conv node (this module's own naming)
+        str,  # channel_add_conv.2 weight name
+        Optional[str],  # channel_add_conv.2 bias name
+        onnx.NodeProto,  # closing Add(spine, channel_add_conv.2's own output)
+    ]
+]:
+    """If `spine`'s own three consumers (`spine_consumers`) form GCNet
+    `ContextBlock`'s own channel-add attention shape this section's own
+    comment above describes, returns the full matched-node tuple. Declines
+    (``None``) on any deviation -- see that comment for the exact, narrow
+    bar.
+    """
+    if len(spine_consumers) != 3:
+        return None
+
+    add_candidates = [
+        c
+        for c in spine_consumers
+        if c.op_type == "Add"
+        and c.domain == ""
+        and len(c.input) == 2
+        and len(c.output) == 1
+        and spine in c.input
+        and c.input[0] != c.input[1]
+    ]
+    reshape_candidates = [
+        c
+        for c in spine_consumers
+        if c.op_type == "Reshape"
+        and c.domain == ""
+        and len(c.input) == 2
+        and c.input[0] == spine
+        and len(c.output) == 1
+    ]
+    conv_candidates = [
+        c
+        for c in spine_consumers
+        if c.op_type in ("Conv", "FusedConv")
+        and len(c.input) >= 2
+        and c.input[0] == spine
+    ]
+    if (
+        len(add_candidates) != 1
+        or len(reshape_candidates) != 1
+        or len(conv_candidates) != 1
+    ):
+        return None
+    add_node = add_candidates[0]
+    reshape1_node = reshape_candidates[0]
+    conv_mask_node = conv_candidates[0]
+
+    # `conv_mask`: ordinary group=1 1x1 Conv, own input channels ==
+    # `n_channels`, own output channels == 1 (the attention-pooling mask).
+    conv_mask_consumer_match = _match_conv_consumer(conv_mask_node, initializer_map)
+    if (
+        conv_mask_consumer_match is None
+        or conv_mask_consumer_match[1] != n_channels
+        or conv_mask_consumer_match[2] != 1
+    ):
+        return None
+    conv_mask_weight = conv_mask_consumer_match[0]
+    conv_mask_w_init = initializer_map[conv_mask_weight]
+    if conv_mask_w_init.dims[0] != 1:
+        return None  # not a 1-channel attention-pooling mask -- declined
+    if any(d != 1 for d in conv_mask_w_init.dims[2:]):
+        return None  # not a 1x1 (or equivalent) conv -- declined
+    conv_mask_producer_match = _match_conv_producer(conv_mask_node, initializer_map)
+    if conv_mask_producer_match is None:
+        return None
+    conv_mask_bias = conv_mask_producer_match[1]
+
+    # reshape1: Reshape(spine) -> "input_x", own shape literal `n_channels`
+    # at dims[1].
+    reshape1_shape_name = _match_gc_context_channel_reshape(
+        reshape1_node, spine, 1, n_channels, initializer_map, consumers_of
+    )
+    if reshape1_shape_name is None:
+        return None
+    reshape1_out = reshape1_node.output[0]
+    if reshape1_out in graph_outputs or len(consumers_of.get(reshape1_out, [])) != 1:
+        return None
+    unsqueeze1_node = consumers_of[reshape1_out][0]
+    if not (
+        unsqueeze1_node.op_type == "Unsqueeze"
+        and unsqueeze1_node.domain == ""
+        and len(unsqueeze1_node.input) >= 1
+        and unsqueeze1_node.input[0] == reshape1_out
+        and len(unsqueeze1_node.output) == 1
+    ):
+        return None
+    unsqueeze1_out = unsqueeze1_node.output[0]
+    if (
+        unsqueeze1_out in graph_outputs
+        or len(consumers_of.get(unsqueeze1_out, [])) != 1
+    ):
+        return None
+
+    # conv_mask's own branch: Conv -> Reshape (no channel literal -- own
+    # output is always 1 channel) -> Softmax -> Unsqueeze.
+    conv_mask_out = conv_mask_node.output[0]
+    if conv_mask_out in graph_outputs or len(consumers_of.get(conv_mask_out, [])) != 1:
+        return None
+    reshape2_node = consumers_of[conv_mask_out][0]
+    if not (
+        reshape2_node.op_type == "Reshape"
+        and reshape2_node.domain == ""
+        and len(reshape2_node.input) == 2
+        and reshape2_node.input[0] == conv_mask_out
+        and len(reshape2_node.output) == 1
+    ):
+        return None
+    reshape2_out = reshape2_node.output[0]
+    if reshape2_out in graph_outputs or len(consumers_of.get(reshape2_out, [])) != 1:
+        return None
+    softmax_node = consumers_of[reshape2_out][0]
+    if not (
+        softmax_node.op_type == "Softmax"
+        and softmax_node.domain == ""
+        and list(softmax_node.input) == [reshape2_out]
+        and len(softmax_node.output) == 1
+    ):
+        return None
+    softmax_out = softmax_node.output[0]
+    if softmax_out in graph_outputs or len(consumers_of.get(softmax_out, [])) != 1:
+        return None
+    unsqueeze2_node = consumers_of[softmax_out][0]
+    if not (
+        unsqueeze2_node.op_type == "Unsqueeze"
+        and unsqueeze2_node.domain == ""
+        and len(unsqueeze2_node.input) >= 1
+        and unsqueeze2_node.input[0] == softmax_out
+        and len(unsqueeze2_node.output) == 1
+    ):
+        return None
+    unsqueeze2_out = unsqueeze2_node.output[0]
+    if (
+        unsqueeze2_out in graph_outputs
+        or len(consumers_of.get(unsqueeze2_out, [])) != 1
+    ):
+        return None
+
+    # The join MatMul -- exactly the two Unsqueeze outputs above.
+    matmul_node = consumers_of[unsqueeze1_out][0]
+    if consumers_of[unsqueeze2_out][0] is not matmul_node:
+        return None
+    if not (
+        matmul_node.op_type == "MatMul"
+        and matmul_node.domain == ""
+        and len(matmul_node.input) == 2
+        and set(matmul_node.input) == {unsqueeze1_out, unsqueeze2_out}
+        and len(matmul_node.output) == 1
+    ):
+        return None
+    matmul_out = matmul_node.output[0]
+    if matmul_out in graph_outputs or len(consumers_of.get(matmul_out, [])) != 1:
+        return None
+
+    # reshape3: Reshape(MatMul's own output) -> "context", own shape literal
+    # `n_channels` at dims[1].
+    reshape3_node = consumers_of[matmul_out][0]
+    reshape3_shape_name = _match_gc_context_channel_reshape(
+        reshape3_node, matmul_out, 1, n_channels, initializer_map, consumers_of
+    )
+    if reshape3_shape_name is None:
+        return None
+    reshape3_out = reshape3_node.output[0]
+    if reshape3_out in graph_outputs or len(consumers_of.get(reshape3_out, [])) != 1:
+        return None
+
+    # channel_add_conv.0: ordinary group=1 1x1 Conv, own input channels ==
+    # `n_channels`; own output channels (the bottleneck) unconstrained.
+    conv0_node = consumers_of[reshape3_out][0]
+    conv0_match = _match_conv_consumer(conv0_node, initializer_map)
+    if (
+        conv0_match is None
+        or conv0_match[1] != n_channels
+        or conv0_match[2] != 1
+        or conv0_node.input[0] != reshape3_out
+    ):
+        return None
+    conv0_weight = conv0_match[0]
+    conv0_w_init = initializer_map[conv0_weight]
+    if any(d != 1 for d in conv0_w_init.dims[2:]):
+        return None  # not a 1x1 (or equivalent) conv -- declined
+    if conv0_w_init.dims[0] < 1:
+        return None
+
+    conv0_out = conv0_node.output[0]
+    if conv0_out in graph_outputs or len(consumers_of.get(conv0_out, [])) != 1:
+        return None
+    ln_node = consumers_of[conv0_out][0]
+    if not (
+        ln_node.op_type == "LayerNormalization"
+        and ln_node.domain == ""
+        and len(ln_node.input) >= 2
+        and ln_node.input[0] == conv0_out
+        and len(ln_node.output) >= 1
+    ):
+        return None
+    ln_out = ln_node.output[0]
+    if ln_out in graph_outputs or len(consumers_of.get(ln_out, [])) != 1:
+        return None
+    relu_node = consumers_of[ln_out][0]
+    if not (
+        relu_node.op_type == "Relu"
+        and relu_node.domain == ""
+        and list(relu_node.input) == [ln_out]
+        and len(relu_node.output) == 1
+    ):
+        return None
+    relu_out = relu_node.output[0]
+    if relu_out in graph_outputs or len(consumers_of.get(relu_out, [])) != 1:
+        return None
+
+    # channel_add_conv.2 (this module's own naming): ordinary group=1 1x1
+    # Conv PRODUCER, own output channels == `n_channels` exactly, raw output
+    # feeding the closing Add directly (no activation in between).
+    conv2_node = consumers_of[relu_out][0]
+    conv2_match = _match_conv_producer(conv2_node, initializer_map)
+    if (
+        conv2_match is None
+        or conv2_match[2] != n_channels
+        or conv2_match[3] != 1
+        or conv2_node.input[0] != relu_out
+    ):
+        return None
+    conv2_weight, conv2_bias, _conv2_out_channels, _conv2_group = conv2_match
+    conv2_w_init = initializer_map[conv2_weight]
+    if any(d != 1 for d in conv2_w_init.dims[2:]):
+        return None  # not a 1x1 (or equivalent) conv -- declined
+
+    conv2_out = conv2_node.output[0]
+    if conv2_out in graph_outputs or len(consumers_of.get(conv2_out, [])) != 1:
+        return None
+    if consumers_of[conv2_out][0] is not add_node:
+        return None
+    if set(add_node.input) != {spine, conv2_out}:
+        return None
+
+    return (
+        reshape1_node,
+        reshape1_shape_name,
+        unsqueeze1_node,
+        conv_mask_node,
+        conv_mask_weight,
+        conv_mask_bias,
+        matmul_node,
+        reshape3_node,
+        reshape3_shape_name,
+        conv0_node,
+        conv0_weight,
+        conv2_node,
+        conv2_weight,
+        conv2_bias,
+        add_node,
+    )
+
+
+def _find_conv_gc_context_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds GCNet `ContextBlock` channel-add attention blocks -- see this
+    section's own comment above for the exact topology matched and declined.
+    Every match produces one `_Chain` with TWO producers (`P`, the block's
+    own input Conv, and `channel_add_conv.2` -- this module's own naming for
+    `channel_add_conv`'s own last `Conv` layer, whose own output is summed
+    back onto `P`'s own output -- both forced to the same output-channel
+    keep set, exactly like SE-gate's own two-producer shape, just combined
+    by `Add` instead of `Mul`), one ordinary consumer (the real downstream
+    Conv/ConvTranspose the closing `Add` feeds, found via
+    :func:`_walk_to_conv_consumer`), and TWO extra fan-out consumer branches
+    (`conv_mask`, and `channel_add_conv.0`, each needing its own INPUT axis
+    sliced by the identical keep set -- see this section's own comment for
+    why `channel_add_conv.0`'s own branch is safe despite sitting several
+    hops downstream of `spine` rather than reading it directly).
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    chains: List[_Chain] = []
+    for node in graph.node:
+        info = _match_conv_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, n_channels, producer_group = info
+        if producer_group != 1:
+            continue  # narrow scope -- see this section's own comment
+
+        out_name = node.output[0]
+        if out_name in graph_outputs:
+            continue
+
+        pre_ops: List[onnx.NodeProto] = []
+        cur = out_name
+        spine: Optional[str] = None
+        spine_consumers: List[onnx.NodeProto] = []
+        for _ in range(_MAX_CHAIN_HOPS):
+            cands = consumers_of.get(cur, [])
+            if len(cands) == 3:
+                spine = cur
+                spine_consumers = cands
+                break
+            if len(cands) != 1:
+                break
+            nxt = cands[0]
+            if not (
+                nxt.op_type in _UNARY_PASS_THROUGH
+                and list(nxt.input) == [cur]
+                and len(nxt.output) == 1
+            ):
+                break
+            out2 = nxt.output[0]
+            if out2 in graph_outputs:
+                break
+            pre_ops.append(nxt)
+            cur = out2
+        if spine is None:
+            continue
+
+        match = _match_conv_gc_context_gate(
+            spine,
+            spine_consumers,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+        )
+        if match is None:
+            continue
+        (
+            reshape1_node,
+            reshape1_shape_name,
+            unsqueeze1_node,
+            conv_mask_node,
+            conv_mask_weight,
+            conv_mask_bias,
+            matmul_node,
+            reshape3_node,
+            reshape3_shape_name,
+            conv0_node,
+            conv0_weight,
+            conv2_node,
+            conv2_weight,
+            conv2_bias,
+            add_node,
+        ) = match
+
+        add_out = add_node.output[0]
+        if add_out in graph_outputs or len(consumers_of.get(add_out, [])) != 1:
+            continue
+
+        (
+            consumer,
+            post_add_chain_ops,
+            conv_pass_through,
+            group_norm,
+            decomposed_group_norm_num_groups,
+            _matmul_consumer,
+            grn,
+            depth_to_space,
+        ) = _walk_to_conv_consumer(
+            add_out,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+        # Every optional `_walk_to_conv_consumer` flag was left at its
+        # default (False) above -- see this section's own comment -- so
+        # `group_norm`/`decomposed_group_norm_num_groups`/`grn`/
+        # `depth_to_space`/`_matmul_consumer` are always `None` here.
+        assert (
+            group_norm is None
+            and decomposed_group_norm_num_groups is None
+            and grn is None
+            and depth_to_space is None
+        )
+        (
+            consumer_node,
+            consumer_weight,
+            consumer_group,
+            consumer_is_conv_transpose,
+        ) = consumer
+
+        # All FIVE roles (`P`, `conv_mask`, `channel_add_conv.0`,
+        # `channel_add_conv.2`, the real downstream consumer) must name
+        # distinct weights -- an accidental/tied share between any two is
+        # not the confirmed real shape.
+        role_weights = {w_name, conv_mask_weight, conv0_weight, conv2_weight}
+        if len(role_weights | {consumer_weight}) != 5:
+            continue  # a tied/shared weight across roles -- decline
+
+        chains.append(
+            _Chain(
+                producers=(
+                    _Producer(
+                        node,
+                        w_name,
+                        False,
+                        bias_name,
+                        pre_ops=tuple(pre_ops),
+                        is_conv=True,
+                    ),
+                    _Producer(
+                        conv2_node, conv2_weight, False, conv2_bias, is_conv=True
+                    ),
+                ),
+                chain_ops=((add_node, None),) + post_add_chain_ops,
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
+                conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
+                extra_consumers=(
+                    _ConsumerBranch(
+                        chain_ops=(),
+                        consumer_node=conv_mask_node,
+                        consumer_weight=conv_mask_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                    _ConsumerBranch(
+                        chain_ops=(
+                            (reshape1_node, None),
+                            (unsqueeze1_node, None),
+                            (matmul_node, None),
+                            (reshape3_node, None),
+                        ),
+                        consumer_node=conv0_node,
+                        consumer_weight=conv0_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                        literal_reshape_dims=(
+                            (reshape1_node, reshape1_shape_name, 1),
+                            (reshape3_node, reshape3_shape_name, 1),
+                        ),
+                    ),
+                ),
+            )
+        )
+    return chains
+
+
 # --- CBAM ChannelGate chains ------------------------------------------------
 #
 # CBAM (Convolutional Block Attention Module, Woo et al. 2018,
@@ -18140,6 +18880,17 @@ def _slice_chain_channels(
                 _slice_last_axis(initializer_map[const_name], keep)
         for hop in branch.conv_pass_through:
             _slice_conv_hop(hop)
+        # GCNet ContextBlock only (see :class:`_ConsumerBranch.literal_reshape_dims`'s
+        # own docstring): overwrite the literal channel-count element a
+        # mid-chain `Reshape`'s own `shape` operand bakes in, in place --
+        # already confirmed, at match time, to have no other reader.
+        for _reshape_node, shape_name, dim_index in branch.literal_reshape_dims:
+            shape_init = initializer_map[shape_name]
+            new_dims = onnx.numpy_helper.to_array(shape_init).copy()
+            new_dims[dim_index] = keep_count
+            shape_init.CopyFrom(
+                onnx.numpy_helper.from_array(new_dims, name=shape_init.name)
+            )
         if branch.consumer_is_conv and branch.consumer_group > 1:
             _slice_grouped_consumer_conv_weight(
                 initializer_map[branch.consumer_weight],
@@ -18867,6 +19618,7 @@ def apply_structured_pruning(
             + _find_conv_chains(graph)
             + _find_conv_residual_chains(graph)
             + _find_conv_se_gate_chains(graph)
+            + _find_conv_gc_context_chains(graph)
             + _find_conv_cbam_channel_gate_chains(graph)
             + _find_matmul_residual_chains(graph)
         )
@@ -46269,7 +47021,7 @@ def _chain_label(chain: _Chain) -> str:
 def _structured_chain_groups(
     graph: onnx.GraphProto,
 ) -> List[Tuple[str, List[_Chain]]]:
-    """The same seven finders, in the same order, that
+    """The same eight finders, in the same order, that
     :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`
     concatenate into their own single `chains` list -- kept as separate
     `(family_label, chains)` groups here purely so
@@ -46284,6 +47036,7 @@ def _structured_chain_groups(
         ("conv_plain", _find_conv_chains(graph)),
         ("conv_residual", _find_conv_residual_chains(graph)),
         ("conv_se_gate", _find_conv_se_gate_chains(graph)),
+        ("conv_gc_context", _find_conv_gc_context_chains(graph)),
         ("conv_cbam_channel_gate", _find_conv_cbam_channel_gate_chains(graph)),
         ("matmul_residual", _find_matmul_residual_chains(graph)),
     ]
