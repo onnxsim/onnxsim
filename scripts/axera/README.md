@@ -2494,6 +2494,316 @@ Net: the field-write reading, the verb set, the per-op program, and the
 two quantitatively decoded fields are properties of the compiler and
 the hardware, not of `resnet18d`.
 
+### Correction: the instruction runs are two-word, but they are only 37% of the bulk -- the rest is verb-free regions
+
+Chasing the small residue in the two-word tiling (97.5% on `resnet18d`,
+92% on `mnasnet`) exposed an overstatement two sections up, which is
+corrected here in place rather than rewritten there.
+
+**What was overstated.** "With all five verbs counted, the bulk is a
+uniform two-word stream." The 97.5% figure is real, but it measures the
+spacing *between consecutive verb headers* -- and the gap histogram it
+came from listed only the most common gap sizes. The full histogram has
+a long tail of very large gaps (in `resnet18d`: 1,047; 1,042; 688; 510;
+487 words ...). Counting words instead of gaps:
+
+```
+                          resnet18d          mnasnet_small
+bulk words                12,188             19,564
+verb-header + operand     4,574   (37.5%)    3,742   (19.1%)
+verb-free regions (>=8w)  44 regions,        127 regions,
+                          7,494 w (61.5%)    15,680 w (80.3%)
+regions per op            0.24               0.95
+largest region            1,047 words        1,597 words
+```
+
+So the correct statement is: **the five-verb instruction runs are
+tightly two-word (97.5%) but make up only 37% of `resnet18d`'s bulk and
+19% of `mnasnet`'s; the remainder is 44 (resp. 127) verb-free regions
+of other word families** -- `23 00`, `16 00`, `84 08`, `00 80` in
+`resnet18d`; `81 20` and `20 03` dominating in `mnasnet` -- whose
+content is high-entropy and whose format is not decoded. That family is
+where the tiny model's four non-deterministic noise bytes lived (`23 00
+xx 82` words), which fits these regions being data/descriptor tables
+rather than instructions, but "table" is an inference; only the
+counts, sizes and families are measured. `mnasnet`'s ~one region per op
+(0.95), versus `resnet18d`'s one per four ops, is also why its tiling
+residue was larger -- not a sixth verb: no other first byte >= 0x80
+occurs more than 5 times in the `VV 00 x0 yy` shape in either model.
+
+**Two more prologue facts from the same pass.** From the first field
+write at byte 297, the two real classifiers share a **byte-identical
+158-byte prologue** (they share only 21 bytes with the tiny synthetic
+model, whose input is float `4x16x16` rather than `uint8` NHWC
+`224x224` -- so the prologue plausibly carries input/preprocessing
+setup). Inside it, all three models carry the same compact ladder
+`00 90 84 08, 00 a0 84 0a, 00 b0 84 08, ... 00 f0 84 08`: seven 4-byte
+units of the shape `00 xx 84 vv` -- field `xx` stepping `0x10`, bank
+`0x84`, a **one-byte value** and **no verb byte**. That is a second,
+short-form write encoding, alongside the 8-byte `[VV 00 xx yy][32-bit]`
+form and the 7-byte 3-byte-operand slots already noted; a parser needs
+all three.
+
+### Second correction: the "verb-free regions" are the same instruction stream, drifted off the 4-byte grid
+
+The section above split the bulk into two-word verb runs (37%) and
+"verb-free regions" (63%) and floated "data/descriptor tables" for the
+latter. Testing that directly, locally, overturns it -- stated in place.
+
+**The regions are full of instructions the grid could not see.** Counting
+verb-shaped `VV 00 x0 yy` words *inside* the regions at every byte
+phase: `resnet18d` has 73 / 43 / 54 of them at phases 1 / 2 / 3 (and
+zero at phase 0 only because phase 0 is what defined the regions);
+`mnasnet` has 197 / 185 / 160. The compact `00 xx 84 vv` short-form
+write appears **417** times inside `resnet18d`'s regions and **580**
+times inside `mnasnet`'s, at any phase. The regions are not tables; they
+are stretches where the instruction stream's alignment has drifted off
+a fixed 4-byte grid -- exactly what 7-byte and 4-byte instructions
+interleaved with 8-byte ones must produce. Fixed-size records are also
+ruled out on their own terms: the regions' best internal periods are
+4-8 bytes with weak match (0.11 / 0.26), their sizes are rarely 32- or
+64-byte multiples, and only 0.7% / 2.9% of their 32-byte windows repeat.
+
+**A variable-length walker recovers what the grid missed -- and shows
+what is still unknown.** Walking from byte 297 and consuming an 8-byte
+verb instruction, a 7-byte one when the next header lands at +7, or a
+4-byte compact write, and otherwise stepping one unknown byte:
+
+```
+                       fixed 4-byte grid    variable-length walker (3 known forms)
+resnet18d  (48,531 B)  37.7% explained      43.8%   (2,443 x 8-byte, 16 x 7-byte, 398 x compact)
+mnasnet    (78,035 B)  19.2%                27.4%   (2,367, 49, 535)
+tiny       ( 3,371 B)  15.9%                39.4%   (  116,  8,  86)
+```
+
+The walker beats the grid everywhere, most on the tiny model, and the
+bytes it cannot explain sit overwhelmingly in **short** gaps (the most
+common unknown-run lengths are 5, 12, 1, 47, 6 and 7 bytes) with a few
+long stretches (the longest 1,352 bytes in `resnet18d`). Short gaps
+between recognized instructions are what additional, not-yet-known
+short instruction forms look like -- not what a data table looks like.
+
+So the corrected picture, replacing "37% two-word runs + 63% regions":
+**mcode's bulk is one variable-length instruction stream with at least
+three encodings, of which three forms are known and explain 27-44% of
+the bytes; the rest is further forms, mostly short, plus a few long
+stretches, all undecoded.** The "37%" and "verb-free" figures were
+artifacts of measuring a variable-length stream on a fixed grid.
+
+### The regions fault like instructions on the device -- and a chance baseline withdraws the "short-form family"
+
+**Device census: the former "verb-free regions" are validated
+structure.** Flipping one byte at the start, middle and end of each of
+the ten largest regions in the real `resnet18d` blob (30 flips, one
+patched model per run, retry-once on the known transient):
+
+```
+region (byte, len)   start / mid / end
+(18228, 4180)        F D =
+( 6844, 4160)        F F F
+(15436, 2744)        F D F
+(11812, 2032)        D F =
+( 4896, 1940)        F F F
+(  400, 1772)        = F F
+( 3200, 1688)        F F F
+(29188, 1352)        F F F
+(28032, 1148)        F F F
+( 2180, 1012)        F F F
+                     24 fault / 3 change output / 3 inert
+```
+
+**80% of flips inside these regions fault** with `0x8030070C` -- a
+higher rate than the original whole-blob sweep (61%). A data table
+answers corruption with wrong values (`D`) or nothing (`=`); a
+sequenced instruction stream answers it with the validator. This is the
+hardware-side confirmation of the previous section's reading, and it is
+the strongest single result in this arc: the regions are instructions.
+The device stayed healthy throughout (70 C, memory at baseline).
+One honest variance note: re-running the four largest regions' twelve
+flips on a *fresh* build gave 7 faults, not the 10 seen here -- per-flip
+outcomes at a fixed offset can differ between builds (the known
+non-deterministic label bytes are the obvious suspect), so the
+regression test asserts a majority of faults, not the exact count.
+
+**A chance baseline, applied late, withdraws a claim.** Tokenizing the
+bytes the walker could not explain suggested a family of short
+bank-tagged writes -- `00 ff TT vv` (4 B), `01 ff xx TT vv` (5 B),
+bare `TT vv` (2 B), tag `TT` in `0x81..0x84`, with the prefix and tag
+tending to sum to `0x84` -- and a walker taught those forms "explained"
+61-70% of the bulk. Checked against chance, that dissolves: `0x00` is
+28.5% of `resnet18d`'s bulk bytes and tag bytes 6.5%, so a `00 ?? TT`
+pattern arises at ~1.8% of positions by chance against 2.7% observed --
+**only 1.5x chance** (1.3x on `mnasnet`, 1.4x on the tiny model) -- and
+the bare 2-byte form is at or below chance. The verb forms, by
+contrast, are more than 100x chance (five specific first bytes, a zero,
+a multiple of 16). So: the compact `00 xx 84 vv` **prologue ladder** is
+real (a stepping field across three models is not chance), but
+generalizing it to a stream-wide short-form family is **not supported**
+at present, and the "a parser needs all three forms" sentence two
+sections up is too strong -- the third form is established in the
+prologue only. Coverage figures that lean on the loose short forms are
+inflated; the defensible number remains the three-form walker's 27-44%,
+of which the specific verb instructions are the reliable part.
+
+Net, stated carefully: the regions are instructions (device-confirmed),
+their alignment drifts (off-phase verbs), and their *encoding* is still
+mostly unknown -- the next real step is a form-by-form decoding with a
+chance baseline applied *before* each form is admitted, not after.
+
+### Third correction: with the right null, the short-form family is real after all
+
+Doing exactly that -- applying a chance baseline *properly* -- reverses
+the withdrawal just above. The "1.5x chance" figure came from an
+independence estimate (`P(byte == 00) x P(byte in 0x81..0x84)`) against
+the greedy walker's start rate. That is the wrong null for a
+*positional* pattern: what makes `00 ?? TT ??` an instruction form is
+that a tag byte sits at a fixed offset after a prefix byte, and an
+independence product says nothing about offsets. The right null keeps
+every byte and destroys only the order: shuffle the non-verb bytes of
+each bulk (20 permutations, identical byte histogram) and count each
+pattern in the shuffles.
+
+```
+pattern                       resnet18d: observed / null (+-sd)   ratio    z
+00 ?? TT ??  (4-byte form)    1485 /  382 (+-13)                  3.9x    82
+01 ?? ?? TT ??  (5-byte)       496 /  175 (+-12)                  2.8x    27
+02 ... TT ??  (6-byte)         229 /   68 (+- 5)                  3.4x    31
+03 ... TT ??  (7-byte)         154 /   63 (+- 8)                  2.4x    12
+00 x0 84 ??  (prologue ladder) 393 /   29 (+- 5)                 13.7x    72
+prefix + tag == 0x84          1286 /  191 (+-15)                  6.7x    75
+                              mnasnet: 3.9x / 4.1x / 3.8x / 4.8x / 9.4x / 8.3x, z up to 172
+```
+
+Every short form is far above its permutation null -- z-scores from 12
+to 172 -- and the prefix/tag complement (`00<->84`, `01<->83`,
+`02<->82`, `03<->81`) is 6.7-8.3x chance in both models. So the family
+of short bank-tagged writes **is real statistical structure**, the
+"withdrawal" above was an over-correction from a mis-specified
+baseline, and the honest state is: the forms exist; their exact widths
+are the best reading of where the tag byte lands (offset `prefix + 2`);
+and the coverage they add on top of the verb instructions (to ~61-63%
+of the bulk without the permissive 2-byte form) is legitimate. The
+bare 2-byte `TT vv` form remains unsupported (it has no positional
+structure to test) and stays out of the count.
+
+The methodological lesson is the durable part: three corrections in a
+row on one topic came from three different baselines -- a fixed grid,
+an independence estimate, and finally a permutation null. Only the last
+is appropriate for order-dependent structure, and it is the one this
+README should have reached for first.
+
+**The width rule, measured.** With the permutation null in hand, the
+"widths are the best reading" hedge can be replaced by a measurement:
+for each prefix `p` in `0..3`, where after the prefix does a tag byte
+sit more often than chance?
+
+```
+                         offset after the prefix (observed / null)
+prefix    k=1    k=2    k=3    k=4    k=5           mnasnet peak
+p=0      0.25   3.93   0.19   0.41   0.33           k=2  3.74x
+p=1      0.80   0.20   2.93   0.09   0.65           k=3  4.01x
+p=2      1.44   0.43   0.37   3.40   1.10           k=4  3.72x
+p=3      0.95   0.77   1.63   0.49   2.49           k=5  4.72x
+```
+
+The enrichment peaks at **exactly `k = p + 2`** for every prefix in
+both models, with every other offset at or below chance -- and at that
+offset the complement tag `0x84 - p` is elevated 5-12x while other tags
+are 0.9-3.3x. So the unit is `[p] [p+1 payload bytes] [0x84 - p]
+[value]`, **`p + 4` bytes long**: 4, 5, 6, 7 bytes for `p = 0..3`. The
+prefix encodes the payload length and, most of the time, the bank. That
+is a decoded *format* for the short instructions, not their semantics
+-- what the payload bytes and the value mean per bank is still open --
+but it is the first part of the non-verb encoding that can be stated as
+a rule rather than a pattern.
+
+**One step into the payload: the bank tag selects the payload's kind.**
+For the dominant 4-byte units `00 ff TT vv` (1,485 in `resnet18d`,
+3,500 in `mnasnet`), the field byte `ff` is a multiple of `0x10` far
+more often for tag `0x84` than for the others -- and bank `0x84`'s
+commonest fields are exactly the prologue ladder's (`0x80, 0xb0, 0x70,
+0xc0, 0xa0`), i.e. the same 16-byte-granular field space the `a1` verbs
+use. Banks `0x81..0x83` instead carry small integers in `ff` (`1, 5, 8,
+9, 0xe, 0xd`), which read as indices or counts rather than field
+offsets. Some units are constants (`00 b0 84 08` occurs 61 of 61 times
+in `resnet18d`); others carry a small numeric range (`00 80 84 vv` takes
+16 values, `0x56..0x5c`). Overall `ff` is 16-granular in only 35.6% of
+units against a 20.4% shuffled null (25.3% vs 21.1% in `mnasnet`), so
+this is a per-bank distinction, not a property of the family --
+reported as the shape of the data, not a decoding of it.
+
+### The layout that explains all of it: two configuration blocks, then 180 clean op programs
+
+Splitting the whole token stream at every `a1 40 02` write and asking
+where the short units and unknown bytes actually are gives the blob's
+real layout, and it is simpler than the section-by-section picture
+suggested:
+
+```
+resnet18d (49,080 B)                       verbs  short units  unknown bytes
+  bytes    297 .. 11,433  config block A       50          750         7,282
+  bytes 11,433 .. 30,816  config block B      159        1,444        11,396
+  bytes 30,816 .. 48,496  180 op programs   ~2,160            0             0
+  bytes 48,496 .. 48,828  epilogue             11            0           244
+  (then the back FlatBuffers copy)
+
+mnasnet_small (78,584 B)
+  bytes    297 .. 19,977  config block A      141        1,574        10,756
+  bytes 19,977 .. 64,672  config block B      502        4,242        17,576
+  bytes 64,672 .. 78,008  132 op programs   ~1,650            0             0
+  bytes 78,008 .. 78,332  epilogue             12            0           228
+```
+
+**180 of 183 `resnet18d` segments, and 132 of 135 in `mnasnet`, contain
+no short unit and no unknown byte at all** -- each is exactly the
+eleven-instruction verb template (~96 bytes) and nothing else. Every
+short-form unit and every undecoded byte in the entire blob sits in two
+large configuration blocks at the front (bounded by two *setup* `40 02`
+writes whose operands -- `ff 00 00 00` and one more -- are not real
+op offsets) plus a ~330-byte epilogue. The blocks are 62% of
+`resnet18d`'s blob and 82% of `mnasnet`'s.
+
+This is why the coverage numbers looked the way they did: the "37%" of
+the bulk that the verb walker explained was, to first order, *the
+entire op-program region*, which is parsed end to end, while the
+"unexplained 63%" was the configuration blocks, where verbs are a
+minority among short units and undecoded bytes. It also corrects the
+earlier reading that the regions were interleaved "about one per four
+ops": they are not interleaved with ops at all. The per-op program is
+done; the frontier is precisely two configuration blocks whose short
+units follow the width rule and whose remaining bytes (18.9 KB in
+`resnet18d`) are the actual undecoded content of mcode.
+
+### Into config block B: the width rule reaches prefix 4, and a candidate second header family
+
+First pass over the larger configuration block (`resnet18d` bytes
+11,433..30,816; `mnasnet` 19,977..64,672), asking what the undecoded
+residue is made of once every validated instruction is removed.
+
+**The width rule extends, a little.** Testing prefixes `p = 4..15` the
+same way (tag byte at offset `p + 2`, against a shuffled null of the
+block): `p = 4` holds in both models (2.6x, n = 68; 2.4x, n = 203);
+`p = 5` and `p = 9` reach ~2.2x in `mnasnet` only; `p = 6..8` and
+`10..15` sit at chance. Admitting `p <= 4` shrinks `resnet18d`'s block-B
+residue from 11,396 to 11,134 bytes -- the family is `p = 0..4` (units
+of 4..8 bytes), and it is not where most of the residue goes. Block B
+is **42.6%** explained in `resnet18d` and **63.4%** in `mnasnet`.
+
+**What remains is not records, and not noise.** The residue's runs are
+still instruction-sized (2, 4, 8, 6, 15, 13, 7, 5 bytes; longest 136),
+and its best internal period is weak in absolute terms (5 bytes, 8.3%
+matching) but **three times** the same residue shuffled (2.7%) -- real
+local structure, not fixed-size records. Its most common 2-byte pairs
+are `23 00` (139), `00 00`, `03 00`, `18 9f`, `8b 18`, `16 00` in
+`resnet18d` and `00 00`, `16 00`, `04 00`, `9f 16`, `01 00`, `16 04` in
+`mnasnet`: a set of `XX 00` pairs with `XX` in `{0x23, 0x16, 0x03,
+0x04, 0x01}` -- the same `23 00` family the tiny model's four
+non-deterministic noise bytes lived in. That reads as a **second header
+family** (`XX 00` with a first byte outside the verb set), i.e. more
+instruction forms with their own widths, and it is the next thing to
+validate with the permutation method -- the width-rule test above is
+exactly the template for it.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
