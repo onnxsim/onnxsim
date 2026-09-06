@@ -113,6 +113,15 @@ using PyAttribute =
 // A type constraint: (type_param_str, allowed_type_strs, description).
 using PyTypeConstraint =
     std::tuple<std::string, std::vector<std::string>, std::string>;
+// A full operator schema as read back from onnxsim's internal registry:
+// (name, domain, since_version, doc, inputs, outputs, attributes,
+// type_constraints, has_type_and_shape_inference_function). Same shape
+// ``_register_schema`` accepts, so it round-trips through the Python ``onnx``
+// module's own ``OpSchema``/``register_schema`` in the opposite direction.
+using PySchema =
+    std::tuple<std::string, std::string, int, std::string,
+               std::vector<PyFormalParameter>, std::vector<PyFormalParameter>,
+               std::vector<PyAttribute>, std::vector<PyTypeConstraint>, bool>;
 
 // Recursively marshal a MemoryPlan (see memory_planning.h) into the same
 // (offsets, arena_bytes, naive_bytes, unplanned, subgraph_reserved_bytes,
@@ -1189,6 +1198,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // FP6-LLM's E3M2 6-bit floating-point weight-only quantization, one
+  // scale per 64-element block. Data-free. See ApplyFp6Llm in onnxsim.h.
+  m.def(
+      "apply_fp6_llm",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyFp6Llm(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
@@ -1885,7 +1910,59 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           },
           "name"_a, "domain"_a, "since_version"_a, "doc"_a, "inputs"_a,
           "outputs"_a, "attributes"_a, "type_constraints"_a,
-          "has_inference_function"_a);
+          "has_inference_function"_a)
+      // The counterpart to ``_register_schema``: read back every operator
+      // schema onnxsim's internal (statically linked) registry knows about --
+      // its built-in ONNX Runtime contrib-op schemas (see
+      // ``contrib_schemas.cpp``) plus anything a caller previously imported
+      // via ``_register_schema`` -- in the same tuple shape that function
+      // accepts. This lets Python code (e.g. ``export_onnx_schemas``) push
+      // onnxsim's schemas into the separate registry the ``onnx`` Python
+      // module uses, so tools built on ``onnx.defs``/``onnx.checker``
+      // recognize them without onnxsim.
+      .def("_get_all_schemas", []() {
+        std::vector<PySchema> ret;
+        for (const auto& schema :
+             onnx::OpSchemaRegistry::get_all_schemas_with_history()) {
+          std::vector<PyFormalParameter> inputs;
+          inputs.reserve(schema.inputs().size());
+          for (const auto& p : schema.inputs()) {
+            inputs.emplace_back(p.GetName(), p.GetDescription(), p.GetTypeStr(),
+                                static_cast<int>(p.GetOption()),
+                                p.GetIsHomogeneous(), p.GetMinArity());
+          }
+          std::vector<PyFormalParameter> outputs;
+          outputs.reserve(schema.outputs().size());
+          for (const auto& p : schema.outputs()) {
+            outputs.emplace_back(p.GetName(), p.GetDescription(),
+                                 p.GetTypeStr(),
+                                 static_cast<int>(p.GetOption()),
+                                 p.GetIsHomogeneous(), p.GetMinArity());
+          }
+          std::vector<PyAttribute> attributes;
+          attributes.reserve(schema.attributes().size());
+          for (const auto& kv : schema.attributes()) {
+            const auto& attr = kv.second;
+            attributes.emplace_back(attr.name, attr.description,
+                                    static_cast<int>(attr.type), attr.required,
+                                    attr.default_value);
+          }
+          std::vector<PyTypeConstraint> type_constraints;
+          type_constraints.reserve(schema.typeConstraintParams().size());
+          for (const auto& tc : schema.typeConstraintParams()) {
+            type_constraints.emplace_back(tc.type_param_str,
+                                          tc.allowed_type_strs, tc.description);
+          }
+          const char* doc = schema.doc();
+          ret.emplace_back(schema.Name(), schema.domain(),
+                           schema.since_version(),
+                           doc ? std::string(doc) : std::string(),
+                           std::move(inputs), std::move(outputs),
+                           std::move(attributes), std::move(type_constraints),
+                           schema.has_type_and_shape_inference_function());
+        }
+        return ret;
+      });
 
   py::class_<PyModelExecutor, PyModelExecutorTrampoline>(m, "ModelExecutor")
       .def(py::init<>())
