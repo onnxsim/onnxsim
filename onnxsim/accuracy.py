@@ -37,6 +37,12 @@ import numpy as np
 import onnx
 
 from onnxsim import backend
+
+# apply_awq/apply_gptq/apply_gptaq/apply_double_quantization are imported at
+# module scope (not deferred inside quantize()) -- none of awq.py, gptq.py,
+# gptaq.py, or double_quantization.py import anything from onnxsim.accuracy,
+# so there is no import cycle to avoid here.
+from onnxsim.awq import apply_awq
 from onnxsim.calibration import (
     _ELEM_TYPE_TO_NP,
     Tensors,
@@ -45,6 +51,9 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.double_quantization import apply_double_quantization
+from onnxsim.gptaq import apply_gptaq
+from onnxsim.gptq import apply_gptq
 from onnxsim.onnx_simplifier import (
     quantize_bf16,
     quantize_dynamic,
@@ -109,6 +118,37 @@ class QuantizationConfig:
             external input/output types at float32 (inserting boundary
             ``Cast`` nodes) instead of redeclaring them in the target
             format. Default ``True``.
+    :param awq: only meaningful for ``scheme="weight_only"``,
+            ``dtype="int4"`` -- if ``True``, chain
+            :func:`onnxsim.apply_awq` (activation-aware per-channel weight
+            rescaling, using ``calibration_data``) onto
+            :func:`onnxsim.quantize_weight_only_int4`'s output. Ignored
+            (silently) for every other scheme/dtype -- see :func:`quantize`'s
+            docstring for the fixed pipeline order when combined with
+            ``gptq``/``gptaq``/``double_quant``.
+    :param gptq: only meaningful for ``scheme="weight_only"``,
+            ``dtype="int4"`` -- if ``True``, chain
+            :func:`onnxsim.apply_gptq` (Hessian-compensated sequential
+            rounding, using ``calibration_data``) after ``awq`` (if also
+            set). Ignored (silently) for every other scheme/dtype.
+    :param gptaq: only meaningful for ``scheme="weight_only"``,
+            ``dtype="int4"`` -- if ``True``, chain
+            :func:`onnxsim.apply_gptaq` (asymmetric-calibration variant of
+            GPTQ, using ``calibration_data``) after ``gptq`` (if also set --
+            GPTQ's own correction is itself a valid starting point for
+            GPTAQ's further correction, so setting both is not rejected).
+            Ignored (silently) for every other scheme/dtype.
+    :param double_quant: only meaningful for ``scheme="weight_only"``,
+            ``dtype="int4"`` -- if ``True``, chain
+            :func:`onnxsim.apply_double_quantization` (re-quantizes the
+            model's own per-block float32 scales into a smaller
+            representation; needs no calibration data) last, after
+            ``awq``/``gptq``/``gptaq``. Ignored (silently) for every other
+            scheme/dtype.
+    :param double_quant_min_elements: forwarded to
+            :func:`onnxsim.apply_double_quantization`'s own
+            ``min_elements`` parameter when ``double_quant`` is set. Default
+            matches that function's own default (``64``).
     """
 
     scheme: str
@@ -120,6 +160,11 @@ class QuantizationConfig:
     providers: Optional[Sequence[str]] = None
     calibration_method: str = "minmax"
     keep_io_types: bool = True
+    awq: bool = False
+    gptq: bool = False
+    gptaq: bool = False
+    double_quant: bool = False
+    double_quant_min_elements: int = 64
 
 
 def quantize(
@@ -153,6 +198,25 @@ def quantize(
     ``granularity`` is not consulted for it, and likewise for every other
     row with exactly one implemented granularity.
 
+    For ``scheme="weight_only"``, ``dtype="int4"`` specifically,
+    :attr:`QuantizationConfig.awq`, ``gptq``, ``gptaq``, and
+    ``double_quant`` chain onnxsim's calibration-driven correction passes
+    onto :func:`onnxsim.quantize_weight_only_int4`'s plain round-to-nearest
+    output, in this fixed order: AWQ's activation-aware rescale
+    (:func:`onnxsim.apply_awq`) first, then GPTQ's Hessian-compensated
+    rounding (:func:`onnxsim.apply_gptq`), then GPTAQ's
+    asymmetric-calibration variant of the same (:func:`onnxsim.apply_gptaq`),
+    then double-quantization of the resulting scales
+    (:func:`onnxsim.apply_double_quantization`) last -- matching AWQ's own
+    rescale feeding GPTQ's Hessian pass feeding double-quantization. ``gptq``
+    and ``gptaq`` may both be set: GPTQ's own correction is itself a valid
+    starting point for GPTAQ's further correction, so this simply applies
+    both in sequence rather than being rejected as redundant. Every flag
+    defaults to ``False`` (behaving exactly like calling
+    :func:`onnxsim.quantize_weight_only_int4` directly), and all four are
+    silently ignored for every other scheme/dtype pair -- see
+    :class:`QuantizationConfig`'s own docstring.
+
     Raises :class:`ValueError` for an unknown ``scheme``, a ``dtype`` not
     valid for that ``scheme``, or (``scheme="weight_only"``, ``dtype="int8"``)
     with a ``granularity`` other than ``"per_channel"``/``"per_block"``.
@@ -185,7 +249,50 @@ def quantize(
         if config.dtype == "int16":
             return quantize_weight_only_int16(model)
         if config.dtype == "int4":
-            return quantize_weight_only_int4(model)
+            # apply_awq/apply_gptq/apply_gptaq each take the *original*
+            # float model as their own first argument -- load `model` once
+            # here (it may be a bare path) so every call below (including
+            # quantize_weight_only_int4 itself) sees the exact same loaded
+            # ModelProto, rather than each re-loading its own separate copy
+            # from disk.
+            float_model = (
+                onnx.load(model, load_external_data=False)
+                if isinstance(model, str)
+                else model
+            )
+            quantized = quantize_weight_only_int4(float_model)
+            if config.awq:
+                quantized = apply_awq(
+                    float_model,
+                    quantized,
+                    calibration_data=config.calibration_data,
+                    num_samples=config.num_calibration_samples,
+                    seed=config.seed,
+                    providers=config.providers,
+                )
+            if config.gptq:
+                quantized = apply_gptq(
+                    float_model,
+                    quantized,
+                    calibration_data=config.calibration_data,
+                    num_samples=config.num_calibration_samples,
+                    seed=config.seed,
+                    providers=config.providers,
+                )
+            if config.gptaq:
+                quantized = apply_gptaq(
+                    float_model,
+                    quantized,
+                    calibration_data=config.calibration_data,
+                    num_samples=config.num_calibration_samples,
+                    seed=config.seed,
+                    providers=config.providers,
+                )
+            if config.double_quant:
+                quantized = apply_double_quantization(
+                    quantized, min_elements=config.double_quant_min_elements
+                )
+            return quantized
         # dtype == "int8": the one scheme/dtype pair with a granularity choice.
         if config.granularity == "per_channel":
             return quantize_weight_only(model)
