@@ -519,6 +519,155 @@ def test_cpp_gqa_wanda_pruning_empty_calibration_data_matches_plain():
     assert wanda_empty.SerializeToString() == plain.SerializeToString()
 
 
+# GroupQueryAttention's own optional attention_bias/past_key/past_value inputs
+# now reuse the exact same HeadBiasInputIsSafe/SliceOrGatherHeadBias/
+# PastKvConstantsAreSliceable/SliceKvCacheAxis1 machinery whether reached from
+# the plain (`apply_attention_head_pruning_cpp`, see
+# ``test_attention_head_pruning_cpp.py``'s own dedicated coverage) or this
+# Wanda-calibrated entry point -- both dispatch through the identical
+# ApplyOneGqaChain, just with a real calibrated `act_norm` map threaded
+# through here instead of `nullptr`. A small, local `_gqa_model_ext` (rather
+# than widening this file's own shared `_gqa_model`, used by many pre-existing
+# tests above with a fixed operand list) covers just the two new roles this
+# fix closes, to confirm the fix also holds up end to end through THIS entry
+# point's own separate graph/used_names/value_info_by_name plumbing
+# (ApplyAttentionHeadWandaPruning -> ApplyAttentionChains -> ApplyOneGqaChain).
+def _gqa_model_ext(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    attention_bias=None,
+    past_kv=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+    wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+    wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    operands = ["q", "k", "v"]
+    extra_graph_inputs = ""
+    if past_kv == "nonempty":
+        past_key = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
+        operands += ["PastKey", "PastValue"]
+    else:
+        operands += ["", ""]
+    operands += ["SeqLensK", "TotalSeq", "", "", ""]
+
+    if attention_bias == "per_head":
+        bias_t = rng.standard_normal((1, H, seq, seq)).astype(np.float32)
+        initializer.append(_f32(bias_t, "AttnBias"))
+        operands.append("AttnBias")
+    elif attention_bias == "dynamic_per_head":
+        operands.append("AttnBiasIn")
+        extra_graph_inputs += f", float[1,{H},{seq},{seq}] AttnBiasIn"
+    else:
+        operands.append("")
+
+    while operands and operands[-1] == "":
+        operands.pop()
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X{extra_graph_inputs}) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(K=K, H=H, KVH=KVH, D=D, Out=Out, batch=batch, seq=seq)
+
+
+def test_cpp_gqa_wanda_pruning_per_head_attention_bias_matches_python_reference():
+    model, cfg = _gqa_model_ext(seed=120, attention_bias="per_head")
+    rng_cal = np.random.default_rng(121)
+    x_cal = rng_cal.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+        np.float32
+    )
+    calibration_data = [{"X": x_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_gqa_wanda_pruning_dynamic_attention_bias_gather_matches_python_reference():
+    model, cfg = _gqa_model_ext(seed=122, attention_bias="dynamic_per_head")
+    rng_cal = np.random.default_rng(123)
+    x_cal = rng_cal.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+        np.float32
+    )
+    attn_bias_cal = rng_cal.standard_normal(
+        (1, cfg["H"], cfg["seq"], cfg["seq"])
+    ).astype(np.float32)
+    calibration_data = [{"X": x_cal, "AttnBiasIn": attn_bias_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert any(n.op_type == "Gather" for n in pruned_cpp.graph.node)
+
+
+def test_cpp_gqa_wanda_pruning_sliceable_past_kv_matches_python_reference():
+    model, cfg = _gqa_model_ext(seed=124, past_kv="nonempty")
+    rng_cal = np.random.default_rng(125)
+    x_cal = rng_cal.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+        np.float32
+    )
+    calibration_data = [{"X": x_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert inits["PastKey"].shape == (cfg["batch"], kv_num_heads, 1, cfg["D"])
+
+
 # --- True MQA (kv_num_heads == 1) fused GroupQueryAttention Wanda fast path -
 #
 # Wanda-calibrated counterpart of test_attention_head_pruning_cpp.py's own
