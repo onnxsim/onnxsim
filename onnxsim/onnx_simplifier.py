@@ -345,6 +345,109 @@ def import_onnx_schemas() -> int:
     return imported
 
 
+def _formal_parameter_from_tuple(t: Tuple):
+    """Rebuild an ``onnx.defs.OpSchema.FormalParameter`` from ``C._get_all_schemas``'s tuple."""
+    name, description, type_str, option, is_homogeneous, min_arity = t
+    return onnx.defs.OpSchema.FormalParameter(
+        name,
+        type_str,
+        description,
+        param_option=onnx.defs.OpSchema.FormalParameterOption(option),
+        is_homogeneous=is_homogeneous,
+        min_arity=min_arity,
+    )
+
+
+def _attribute_from_tuple(t: Tuple):
+    """Rebuild an ``onnx.defs.OpSchema.Attribute`` from ``C._get_all_schemas``'s tuple."""
+    name, description, attr_type, required, default_value = t
+    if default_value.type != onnx.AttributeProto.UNDEFINED:
+        return onnx.defs.OpSchema.Attribute(name, default_value, description)
+    return onnx.defs.OpSchema.Attribute(
+        name, onnx.defs.OpSchema.AttrType(attr_type), description, required=required
+    )
+
+
+def _register_schema_in_onnx(schema: Tuple) -> None:
+    """Register a single onnxsim-registry schema (from ``C._get_all_schemas``) into ``onnx``."""
+    (
+        name,
+        domain,
+        since_version,
+        doc,
+        inputs,
+        outputs,
+        attributes,
+        type_constraints,
+        _has_inference_function,
+    ) = schema
+
+    onnx.defs.register_schema(
+        onnx.defs.OpSchema(
+            name,
+            domain,
+            since_version,
+            doc,
+            inputs=[_formal_parameter_from_tuple(p) for p in inputs],
+            outputs=[_formal_parameter_from_tuple(p) for p in outputs],
+            attributes=[_attribute_from_tuple(a) for a in attributes],
+            type_constraints=[tuple(tc) for tc in type_constraints],
+        )
+    )
+
+
+def export_onnx_schemas() -> int:
+    """Copy operator schemas from onnxsim's internal registry into the Python ``onnx`` module.
+
+    This is the counterpart to :func:`import_onnx_schemas`. onnxsim links its
+    own copy of the ONNX C++ library (see that function's docstring), so its
+    operator schema registry also holds schemas the ``onnx`` Python module's
+    registry does not: onnxsim's built-in ONNX Runtime contrib-op schemas
+    (``com.microsoft`` ops such as ``QLinearAdd`` or ``Attention``, see
+    ``contrib_schemas.cpp``), and any custom schema previously bridged in via
+    :func:`import_onnx_schemas` or ``onnxsim.onnxsim_cpp2py_export._register_schema``.
+
+    Exporting these into ``onnx.defs`` lets other tools built on the ``onnx``
+    Python module -- ``onnx.checker.check_model``, ``onnx.shape_inference``,
+    third-party ``onnx.defs``-based tooling -- recognize onnxsim's operators
+    without depending on onnxsim itself.
+
+    It is idempotent and safe to call repeatedly: an operator ``onnx``
+    already knows -- including one exported by a previous call -- is skipped.
+    A schema's type/shape inference function is native code inside onnxsim
+    and is not transferred; exported schemas carry none.
+
+    :return: the number of schemas exported.
+    """
+    import onnx.defs
+
+    try:
+        schemas = C._get_all_schemas()
+    except Exception:
+        return 0
+
+    exported = 0
+    # Cache onnx's knowledge per (op, domain) so the native check runs once
+    # per operator rather than once per registered version.
+    onnx_knows: Dict[Tuple[str, str], bool] = {}
+    for schema in schemas:
+        try:
+            key = (schema[0], schema[1])
+            known = onnx_knows.get(key)
+            if known is None:
+                known = onnx.defs.has(key[0], domain=key[1])
+                onnx_knows[key] = known
+            if known:
+                continue
+            _register_schema_in_onnx(schema)
+            exported += 1
+        except Exception:
+            # A single unusual schema must never break the export: skip it
+            # and keep exporting the rest.
+            continue
+    return exported
+
+
 def _extract_tensor_to_dict(
     tensor: onnx.TensorProto, key: str, tensor_bytes: Dict[str, bytes]
 ) -> None:
