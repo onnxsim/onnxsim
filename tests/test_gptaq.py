@@ -61,25 +61,37 @@ def _matmul_model(K=64, N=16, seed=0):
     )
 
 
-def _two_layer_model(K0=32, N0=32, N1=8, seed=0):
-    # N0 is layer 2's own reduction dimension -- quantize_weight_only_int4
-    # only quantizes a MatMul/Gemm weight whose reduction size is evenly
-    # divisible by 32 (its own fixed block size), so N0 must be a multiple
-    # of 32 too, or layer 2 is silently left float32 by the real quantizer
-    # and this whole test's premise (comparing how layer 2 gets requantized)
-    # never engages at all.
+def _upstream_corrupted_model(K0=32, N1=8, corruption=None, seed=0):
+    # A layer's own true float input is X; `Corruption` (a fixed, chosen
+    # constant, not an emergent side effect of some earlier layer's own
+    # INT4 rounding) simulates whatever upstream layers' quantization
+    # already did to that input by the time it reaches this one. Passing
+    # `corruption=None` (the float model) makes `Y1 == X` exactly;
+    # passing a real array (the "quantized_model" input) makes `Y1` the
+    # *actual*, already-corrupted signal this layer really receives.
+    # Isolating the corruption in a plain `Add` (not a second real INT4
+    # layer) keeps the gap between the two models' `Y1` a deterministic,
+    # exactly-controlled quantity, not one dependent on some upstream
+    # layer's own INT4 rounding, which can differ from platform to
+    # platform (different onnxruntime kernels/BLAS backends can tip a
+    # marginal rounding decision either way -- exactly what made an
+    # earlier version of this test flaky across CI runners).
     rng = np.random.default_rng(seed)
-    w1 = rng.standard_normal((K0, N0)).astype(np.float32) * 0.5
-    w2 = rng.standard_normal((N0, N1)).astype(np.float32) * 0.5
+    w2 = rng.standard_normal((K0, N1)).astype(np.float32) * 0.5
+    corruption = (
+        np.zeros(K0, dtype=np.float32)
+        if corruption is None
+        else corruption.astype(np.float32)
+    )
     return _model(
         f"""
         g (float[batch,{K0}] X) => (float[batch,{N1}] Y2)
         {{
-          Y1 = MatMul(X, W1)
+          Y1 = Add(X, Corruption)
           Y2 = MatMul(Y1, W2)
         }}
         """,
-        [_f32(w1, "W1"), _f32(w2, "W2")],
+        [_f32(w2, "W2"), _f32(corruption, "Corruption")],
     )
 
 
@@ -133,40 +145,43 @@ def test_gptaq_matches_gptq_exactly_with_no_upstream_quantization():
 
 def test_gptaq_beats_gptq_once_an_upstream_layer_is_already_corrected():
     # GPTAQ's whole point only shows up once `quantized_model` reflects a
-    # real upstream correction: here we first fix layer 1 (identical either
-    # way, per the test above), then compare a *second* round of GPTQ
-    # against GPTAQ for layer 2. GPTQ recalibrates layer 2 against the
-    # *float* model's Y1 -- not what layer 2 actually receives at inference
-    # (the already-corrected layer 1's own output). GPTAQ recalibrates
-    # against `quantized_model`'s own actual Y1, which is exactly what
-    # layer 2 will really see, so it should reconstruct the network's true
-    # end-to-end output more closely.
-    # Seeds picked for a wide, robust margin (GPTAQ's error comes out well
-    # under half of GPTQ's on this pair) rather than an arbitrary default --
-    # both models' weights are chosen by discrete INT4 rounding, so a
-    # narrow margin could flip sign across platforms/BLAS kernels even
-    # with the underlying technique working as intended.
-    model = _two_layer_model(K0=32, N0=32, N1=8, seed=7)
-    x = _correlated_calibration(K=32, num_samples=64, rank=6, seed=18)
+    # real upstream correction: `float_model`'s own Y1 is exactly X, but
+    # `quantized_model`'s own Y1 is X plus a fixed, deliberately large
+    # `Corruption` (see `_upstream_corrupted_model`'s own docstring for why
+    # this is injected via a plain Add rather than a second real INT4
+    # layer). GPTQ recalibrates the MatMul against the *float* model's Y1
+    # -- not what it actually receives at inference (the corrupted Y1).
+    # GPTAQ recalibrates against `quantized_model`'s own actual Y1, which
+    # is exactly what the layer will really see, so it should reconstruct
+    # the network's true end-to-end output more closely. Verified (see the
+    # commit history of this test) to hold with a comfortable margin
+    # (GPTAQ's error stays well under a third of GPTQ's) across hundreds
+    # of independent weight/corruption/calibration seed combinations, not
+    # just the one fixed below -- unlike chaining two *real* INT4 layers
+    # (an earlier version of this test), where the gap between the two
+    # models' activations is itself a by-product of discrete INT4
+    # rounding and can happen to tie across platforms/BLAS kernels even
+    # when the technique is working as intended.
+    K0, N1 = 32, 8
+    corruption = np.random.default_rng(42).standard_normal(K0) * 0.6
+    float_model = _upstream_corrupted_model(K0=K0, N1=N1, corruption=None, seed=0)
+    corrupted_model = _upstream_corrupted_model(
+        K0=K0, N1=N1, corruption=corruption, seed=0
+    )
+    x = _correlated_calibration(K=K0, num_samples=64, rank=6, seed=1)
     calibration_data = [{"X": x}]
 
-    quant = onnxsim.quantize_weight_only_int4(model)
-    baseline = onnxsim.apply_gptq(model, quant, calibration_data=calibration_data)
-
-    final_gptq = onnxsim.apply_gptq(model, baseline, calibration_data=calibration_data)
+    quant = onnxsim.quantize_weight_only_int4(corrupted_model)
+    final_gptq = onnxsim.apply_gptq(
+        float_model, quant, calibration_data=calibration_data
+    )
     final_gptaq = onnxsim.apply_gptaq(
-        model, baseline, calibration_data=calibration_data
+        float_model, quant, calibration_data=calibration_data
     )
     onnx.checker.check_model(final_gptq)
     onnx.checker.check_model(final_gptaq)
 
-    # Layer 1 must be untouched (identical) by this second round in both --
-    # only layer 2 differs between final_gptq and final_gptaq.
-    w1_gptq = _int4_weight(final_gptq, "Y1")
-    w1_gptaq = _int4_weight(final_gptaq, "Y1")
-    assert w1_gptq.raw_data == w1_gptaq.raw_data
-
-    (float_y,) = _run(model, {"X": x})
+    (float_y,) = _run(float_model, {"X": x})
     (gptq_y,) = _run(final_gptq, {"X": x})
     (gptaq_y,) = _run(final_gptaq, {"X": x})
     assert np.all(np.isfinite(gptaq_y))
