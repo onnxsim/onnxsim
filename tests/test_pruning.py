@@ -6816,6 +6816,206 @@ def test_analyze_structured_pruning_instance_norm_pass_through_matches_real_call
     assert dims_after["INBias"][0] == kept
 
 
+# --- Conv chain: CBAM SpatialGate pass-through hop ---------------------------
+#
+# CBAM (Woo et al. 2018, "Convolutional Block Attention Module")'s
+# `SpatialGate` stage -- a *third* Conv-chain pass-through hop, alongside
+# GroupNorm/InstanceNorm above, but recognized on a spine tensor forking into
+# *exactly three* consumers (`ReduceMax`, `ReduceMean`, and the closing
+# `Mul`), not a mid-chain single-consumer node. See
+# `onnxsim.pruning`'s own "CBAM SpatialGate pass-through" section comment and
+# `onnxsim.pruning._match_spatial_gate_pass_through`'s own docstring for the
+# full empirical/architectural finding: confirmed via a real
+# `torch.onnx.export` of a `Conv -> SpatialGate -> Conv` module (both the
+# legacy TorchScript-based and newer `torch.export`-based/"dynamo" exporters
+# agree), `ReduceMax`/`ReduceMean` reduce with `keepdims=0` followed by an
+# explicit `Unsqueeze(axes=[1])` restoring the channel axis, `Concat` orders
+# its two inputs `[max_branch, mean_branch]` (matching the reference
+# implementation's own `torch.cat([max, mean], dim=1)`), and the internal
+# spatial `Conv`'s own in/out-channel counts (2 and 1) are architecturally
+# fixed, independent of the spine's own channel count -- so nothing on that
+# `Conv`'s own weight is ever sliced, and the whole subgraph contributes
+# nothing to slicing bookkeeping at all, a pure "hop over" case.
+def _spatial_gate_conv_pair_model(
+    w1, w2, sg_w, sg_b=None, b1=None, reduce_axis=1, spatial=10
+):
+    """`Conv -> {ReduceMax, ReduceMean} -> Unsqueeze -> Concat -> Conv ->
+    Sigmoid -> Mul} -> Conv` -- CBAM's `SpatialGate` stage, the exact shape a
+    real `torch.onnx.export` (opset 17, legacy and `torch.export`-based
+    exporters alike) emits. `sg_w` (shape ``[1, 2, kH, kW]``) is the internal
+    spatial-attention Conv's own weight, architecturally independent of
+    `w1`'s own output-channel count; `sg_b`, when given, is its optional
+    bias. `reduce_axis`, overridable away from its correct default (`1`, the
+    channel axis) to build the "wrong axis" decline case below. Built at
+    `opset=17` -- `ReduceMax`/`ReduceMean`'s own opset<=17 schema keeps
+    `axes` an *attribute*, matching the confirmed exporter output; opset 18
+    moves it to an input instead, a form `onnxsim.pruning`'s own matcher
+    deliberately never recognizes (see `_reduce_channel_axis_keepdims`'s own
+    docstring).
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    kh, kw = sg_w.shape[2], sg_w.shape[3]
+    pad_h, pad_w = (kh - 1) // 2, (kw - 1) // 2
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(sg_w, "SGW"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    if sg_b is not None:
+        sg_conv = (
+            f"sgc = Conv<kernel_shape=[{kh},{kw}], "
+            f"pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>(cat, SGW, SGB)"
+        )
+        initializer.append(_f32(sg_b, "SGB"))
+    else:
+        sg_conv = (
+            f"sgc = Conv<kernel_shape=[{kh},{kw}], "
+            f"pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>(cat, SGW)"
+        )
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs; the spatial
+    # gate's own internal Conv uses "same" padding and leaves it unchanged.
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          mx = ReduceMax<axes=[{reduce_axis}], keepdims=0>(h)
+          mxu = Unsqueeze(mx, AxesOne)
+          mn = ReduceMean<axes=[{reduce_axis}], keepdims=0>(h)
+          mnu = Unsqueeze(mn, AxesOne)
+          cat = Concat<axis=1>(mxu, mnu)
+          {sg_conv}
+          gate = Sigmoid(sgc)
+          sg = Mul(h, gate)
+          Y = Conv<kernel_shape=[3,3]>(sg, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_spatial_gate_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, same as every other Conv-chain hop's own
+    # oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model, verified end-to-end via
+    # onnxruntime -- not "close", and not a post-hoc slice of the full
+    # unpruned model's own output. `SpatialGate`'s own internal Conv/Sigmoid
+    # subgraph is architecturally untouched by pruning (see this section's
+    # own comment), so the plain, ungrouped `_oracle_keep_indices_conv`
+    # top-k-by-L2-norm oracle applies directly, exactly as it would for a
+    # bare `Conv -> Relu -> Conv` chain.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(200)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sg_b = rng.standard_normal((1,)).astype(np.float32)
+    model = _spatial_gate_conv_pair_model(w1, w2, sg_w, sg_b=sg_b, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+    # The spatial gate's own internal Conv is architecturally independent of
+    # the spine's own channel count -- untouched by pruning.
+    assert dims_after["SGW"] == (1, 2, 7, 7)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _spatial_gate_conv_pair_model(
+        w1[keep], w2[:, keep], sg_w, sg_b=sg_b, b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(201)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_spatial_gate_wrong_reduction_axis_declines():
+    # A `ReduceMax`/`ReduceMean` axis other than exactly the channel axis
+    # (`1`) is not `SpatialGate`'s own real shape -- see
+    # `_reduce_channel_axis_keepdims`'s own docstring ("no negative-axis/
+    # rank-resolution reasoning is attempted ... `1` is the one fixed,
+    # unambiguous channel axis index"). Declined outright, never guessed at:
+    # the whole chain is left unpruned, every weight untouched.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(202)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    model = _spatial_gate_conv_pair_model(w1, w2, sg_w, reduce_axis=2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["SGW"], sg_w)
+
+
+def test_structured_pruning_spatial_gate_stray_consumer_declines():
+    # A spine tensor read by a *fourth* consumer beyond the three
+    # `SpatialGate` itself needs (`ReduceMax`, `ReduceMean`, the closing
+    # `Mul`) isn't the recognized shape at all -- `_find_conv_chains`'s own
+    # producer-consumer-count gate (`{1, 2, 3, 5}`) already excludes it
+    # before `_match_spatial_gate_pass_through` is ever tried. Declined
+    # outright, same as the wrong-axis case above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(203)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    model = _spatial_gate_conv_pair_model(w1, w2, sg_w)
+    # Add a fourth, stray direct consumer of `h` (the producer Conv's own
+    # output) -- an otherwise-unused `Identity` node reading it.
+    stray = onnx.helper.make_node("Identity", ["h"], ["stray"])
+    model.graph.node.insert(1, stray)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["SGW"], sg_w)
+
+
+def test_analyze_structured_pruning_spatial_gate_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check for the SpatialGate hop specifically,
+    # mirroring `test_analyze_structured_pruning_group_norm_pass_through_matches_real_call`
+    # above -- SpatialGate contributes nothing to slicing bookkeeping, so
+    # this mainly guards against the dry-run mirror declining a chain the
+    # real call actually prunes (or vice versa).
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(204)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    model = _spatial_gate_conv_pair_model(w1, w2, sg_w)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["SGW"] == (1, 2, 7, 7)
+
+
 # --- Conv chain: decomposed-GroupNorm pass-through hop -----------------------
 #
 # The fixed 5-node ``Reshape -> InstanceNormalization -> Reshape -> Mul ->
