@@ -4044,6 +4044,38 @@ class _GroupNormPassThrough:
 
 
 @dataclass(frozen=True)
+class _GrnPassThrough:
+    """A mid-chain ConvNeXt-V2 ``GlobalResponseNorm`` (GRN) sequence the Conv
+    chain walk (:func:`_walk_to_conv_consumer`) crossed transparently -- see
+    :func:`_match_grn_pass_through`'s own docstring and this module's own
+    "Global Response Normalization (GRN) pass-through" section comment for
+    the full empirical op sequence and the safety argument (a composition of
+    the already-accepted ``num_groups=1`` degenerate case of
+    :class:`_GroupNormPassThrough`'s own channel-wide reduction and
+    :class:`_ConvPassThrough`'s own per-channel-affine slicing). Every node
+    in the matched sequence with no operand of its own to slice (``ReduceL2``,
+    ``ReduceMean``, the ``eps`` ``Add``, the normalizing ``Div``, the ``x *
+    x_n`` ``Mul``, an optional harmless ``* 1.0`` ``Mul``, and the residual
+    ``Add``) rides on the chain's own `chain_ops` instead, exactly like a
+    unary activation hop; only this hop's own affine `weight`/`bias` -- each
+    a constant, ``[1, n_channels, 1, 1]``-shaped initializer (channel axis 1,
+    *not* axis 0 the way a depthwise Conv's/PRelu's own ``[C, 1, ...]``
+    weight is, since these broadcast directly against the NCHW spine tensor
+    rather than reshape a per-output-channel Conv weight -- see
+    :func:`_grn_axis1_channel_const`) -- need their own dedicated slicing
+    (:func:`_slice_axis1`, not :class:`_ConvPassThrough`'s own axis-0/axis-(-1)
+    convention), hence this dedicated tuple type rather than reusing
+    :class:`_ConvPassThrough` the way a decomposed-GroupNorm hop's own
+    ``[C, 1, ..., 1]``-shaped `gamma`/`beta` already do.
+    """
+
+    weight_node: onnx.NodeProto
+    weight: str
+    bias_node: onnx.NodeProto
+    bias: str
+
+
+@dataclass(frozen=True)
 class _Chain:
     # One producer for a plain chain; two for a gated (elementwise-product)
     # pair, where both branches must agree on which channels survive.
@@ -4088,6 +4120,21 @@ class _Chain:
     # is ever set on the same chain -- see :func:`_walk_to_conv_consumer`'s
     # own mutual-exclusion gate.
     decomposed_group_norm_num_groups: Optional[int] = None
+    # A single mid-chain ConvNeXt-V2 ``GlobalResponseNorm`` (GRN) sequence the
+    # chain walk crossed transparently (:func:`_find_conv_chains` only, for
+    # now, mirroring `group_norm`'s own scope restriction above; always
+    # ``None`` for every other chain kind, and for a MatMul/Gemm chain -- see
+    # :func:`_walk_to_conv_consumer`'s own `recognize_grn` parameter). Mutually
+    # exclusive with `group_norm`/`decomposed_group_norm_num_groups` on the
+    # same chain, exactly like those two are mutually exclusive with each
+    # other. Like GRN's own ``ReduceMean`` over the *entire* channel axis is a
+    # degenerate (``num_groups == 1``) case of `group_norm`'s own block
+    # reduction, this field contributes an implied `num_groups == 1` to
+    # :func:`_chain_group` the identical way `group_norm.num_groups`/
+    # `decomposed_group_norm_num_groups` already do -- see
+    # :class:`_GrnPassThrough` and this module's own "Global Response
+    # Normalization (GRN) pass-through" section comment.
+    grn: Optional[_GrnPassThrough] = None
     # The consumer's own ``group`` attribute (always 1 for a MatMul/Gemm
     # consumer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
     # Conv consumer (see :func:`_match_conv_consumer`) -- unlike the
@@ -7660,6 +7707,419 @@ def _match_decomposed_group_norm_pass_through(
     return out_name, chain_ops, pass_through, num_groups
 
 
+# Global Response Normalization (GRN) pass-through -- ConvNeXt-V2's own
+# ``GlobalResponseNorm`` layer (https://arxiv.org/abs/2301.00808), wired into
+# every ``convnextv2_atto/femto/pico/nano/base`` model by the real, currently
+# shipping `timm` package (`timm.layers.grn.GlobalResponseNorm`, used by
+# `timm.layers.mlp.GlobalResponseNormMlp` in the ``conv_mlp=True`` (NCHW)
+# variant those models actually use: `fc1 (1x1 Conv) -> GELU -> GRN -> fc2
+# (1x1 Conv)`), otherwise sits directly between two Conv-chain nodes and
+# blocks pruning of the Conv that feeds it -- the exact same "mid-chain norm
+# hop" shape `GroupNormalization`/`InstanceNormalization` above already
+# solve, just for a fixed sequence of primitive ops rather than one named
+# node. Confirmed empirically (this environment's own installed
+# `timm==1.0.29`, `timm/layers/grn.py`'s own verbatim
+# ``channels_last=False`` forward: ``x_g = x.norm(p=2, dim=(2, 3),
+# keepdim=True); x_n = x_g / (x_g.mean(dim=1, keepdim=True) + eps); return x
+# + torch.addcmul(bias.view(1, -1, 1, 1), weight.view(1, -1, 1, 1), x *
+# x_n)``, exported via a real ``torch.onnx.export(..., opset_version=17,
+# dynamo=False)``, checker-passed, onnxruntime-verified against the PyTorch
+# module directly, max abs diff ``1.3e-7``) as exactly this fixed op
+# sequence, reading a spine tensor `x` with `n_channels` channels (NCHW):
+#
+#   x_g      = ReduceL2(x, axes=<spatial axes only>, keepdims=1)
+#   x_g_mean = ReduceMean(x_g, axes=[1], keepdims=1)
+#   denom    = Add(x_g_mean, eps)                 # eps a scalar constant
+#   x_n      = Div(x_g, denom)                    # operand order fixed: (x_g, denom)
+#   scaled   = Mul(x, x_n)                        # either operand order
+#   weighted = Mul(scaled, weight)                # either operand order
+#   [weighted = Mul(weighted, 1.0)]                # optional, see below
+#   biased   = Add(weighted, bias)                # either operand order
+#   out      = Add(x, biased)                     # either operand order
+#
+# `weight`/`bias` are each a constant ``[1, n_channels, 1, 1]`` initializer
+# (PyTorch's own `nn.Parameter(dim)` reshaped via `.view(1, -1, 1, 1)` for
+# the ``channels_last=False`` layout -- confirmed to land as a plain
+# pre-reshaped initializer in the exported graph, `do_constant_folding`
+# already folding the (parameter-only, so statically knowable) `Reshape`
+# away by the time the graph is emitted, not a live `Reshape` node this
+# matcher would otherwise also need to recognize). The bracketed extra `Mul`
+# by a scalar constant `1.0` is `torch.addcmul`'s own eager-mode fused
+# decomposition artifact (`addcmul(a, b, c, value=1.0)` traces as `a + (b *
+# c) * value`, `value` defaulting to the literal `1.0`) -- entirely harmless
+# (multiplying by exactly `1.0` changes nothing), so it is recognized and
+# skipped when present but not required.
+#
+# This is safe to prune through for exactly the same two, already-accepted
+# reasons `GroupNormalization`'s and `InstanceNormalization`'s own hops above
+# are, composed rather than reinvented (see each of their own section
+# comments for the full correctness arguments this leans on):
+#
+# - `x_g_mean`'s own ``ReduceMean(..., axes=[1])`` reduces over the *entire*
+#   channel axis -- precisely the degenerate ``num_groups == 1`` case
+#   `_GROUP_NORM_PASS_THROUGH_OP`'s own comment already tolerates (simpler,
+#   even: there is no per-`num_groups`-block uniformity bookkeeping to
+#   enforce at all, since it is always the *whole* remaining channel axis,
+#   whatever `keep` ends up being).
+# - `weight`/`bias`'s own per-channel affine (the `Mul` then `Add` against
+#   `scaled`) needs exactly the same "slice by the chain's own `keep` index
+#   set" treatment `InstanceNormalization`'s own `scale`/`B` already get --
+#   just on axis 1 of a ``[1, n_channels, 1, 1]`` tensor instead of axis 0 of
+#   a flat ``[n_channels]`` one (:func:`_slice_axis1`, not
+#   :func:`_slice_producer_weight`/:func:`_slice_last_axis`).
+#
+# `x_g` itself (`ReduceL2`'s own output, before the channel-mixing
+# `ReduceMean`) is never touched at all -- it is a *per-channel* L2 norm over
+# spatial axes only (never axis 1), so it needs no cross-channel reasoning of
+# its own, the same "no operand of its own to slice" shape a pooling hop
+# already has. See :func:`_match_grn_pass_through` and :class:`_GrnPassThrough`.
+def _grn_axis1_channel_const(
+    name: str, initializer_map: Dict[str, onnx.TensorProto], n_channels: int
+) -> bool:
+    """True iff `name` names a constant float initializer shaped exactly
+    ``[1, n_channels, 1, 1]`` -- the one shape a real ``torch.onnx.export`` of
+    `timm`'s own ``GlobalResponseNorm(channels_last=False)`` is confirmed to
+    emit for its own `weight`/`bias` (see this section's own comment above).
+    Deliberately narrower than :func:`_flat_channel_const` (which this shape
+    does *not* satisfy -- its own last dimension is `1`, not `n_channels`) and
+    than :class:`_ConvPassThrough`'s own ``[C, 1, ..., 1]`` axis-0 bar (this
+    shape's channel axis is 1, not 0): guessing at some other shape (a flat
+    ``[n_channels]``, say) that was never actually confirmed live would risk
+    silently slicing the wrong axis instead of declining, so this stays
+    exactly as narrow as what was verified.
+    """
+    init = initializer_map.get(name)
+    return (
+        init is not None
+        and _is_supported_float_dtype(init.data_type)
+        and list(init.dims) == [1, n_channels, 1, 1]
+    )
+
+
+def _match_grn_pass_through(
+    x_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[Tuple[str, Tuple[Tuple[onnx.NodeProto, None], ...], _GrnPassThrough]]:
+    """If `x_name` is the root of exactly the fixed GRN op sequence documented
+    in this module's own "Global Response Normalization (GRN) pass-through"
+    section comment just above -- confirmed live via a real
+    ``torch.onnx.export`` of the actual installed `timm` package's own
+    ``GlobalResponseNorm`` class -- returns ``(out_name, chain_ops, grn)``:
+    `out_name` the sequence's own true final output (the residual `Add`'s own
+    output, the tensor :func:`_walk_to_conv_consumer` should continue walking
+    from), `chain_ops` every node with no operand of its own to slice as
+    ``(node, None)`` pairs, and `grn` the two nodes (the affine `Mul` and
+    `Add`) that do, each carrying its own `weight`/`bias` name for
+    :func:`_apply_chains` to slice via :func:`_slice_axis1`.
+
+    Like :func:`_match_decomposed_group_norm_pass_through`, `x_name` itself
+    (not just some node's `.input[0]`) is the very thing matched here -- a
+    *multi*-node hop whose own root tensor is read three times over (by
+    `ReduceL2`, by the ``x * x_n`` `Mul`, and by the final residual `Add`), a
+    shape the ordinary ``len(candidates) == 1`` dispatch in
+    :func:`_walk_to_conv_consumer` can never reach on its own. Every
+    intermediate tensor inside the sequence is held to the same "no stray
+    fan-out" bar every other multi-node hop in this module already applies --
+    exactly one consumer, and not itself a graph output (`graph_outputs`) --
+    with one further exception besides `x_name` itself: `x_g` (`ReduceL2`'s
+    own output) is *also* read twice, once by `ReduceMean` and once by the
+    later ``Div(x_g, denom)``, so it is held to that same two-consumer bar
+    instead, with the second reader additionally confirmed (once `denom` is
+    known) to be exactly that one `Div` node, not some other, merely
+    coincidentally two-consumer, topology. Declines (``None``, never
+    partially matched) on any deviation from the exact confirmed sequence,
+    in particular:
+
+    - `x_name` read by anything other than exactly one ``ReduceL2``, one
+      ``x * x_n``-computing ``Mul``, and one final residual ``Add`` (in
+      particular, a *fourth* reader of any kind, declined by the initial
+      ``len(x_consumers) != 3`` check below).
+    - The ``ReduceL2``'s own `axes` attribute (opset < 18's attribute-based
+      form only -- an opset 18+ ``axes``-as-*input* node has no `axes`
+      attribute at all here and is declined the same way, never guessed at)
+      empty, absent, or naming axis 0 (batch) or axis 1 (channel) -- this
+      hop's own safety argument depends on this reduction being purely
+      *per-channel*, over spatial axes only; a reduction that also touches
+      the channel axis would mix channels here, a materially different (and
+      unsafe) computation, always declined rather than guessed at -- or
+      `keepdims` anything other than `1` (`ReduceL2`'s own schema default),
+      needed so `x_g` keeps `x`'s own rank for the later `Mul`/broadcast
+      reasoning below to hold.
+    - The ``ReduceMean``'s own `axes` not exactly ``[1]`` (the *whole*
+      channel axis, not some other axis or a strict subset -- reducing over
+      only part of the channel axis, or over a spatial axis instead, is a
+      materially different, unsafe computation; this is the "reduction over
+      the wrong axis" deviation this matcher's own decline path is exercised
+      against, see ``tests/test_pruning.py``), or `keepdims` anything other
+      than `1`.
+    - The `eps` operand of the first ``Add`` not a constant, scalar
+      (``dims`` exactly ``[]`` or ``[1]``) initializer -- a non-constant
+      (runtime-computed) `eps` means this pass cannot confirm it carries no
+      channel dependence, so it's declined, never guessed at, mirroring every
+      other "statically-known-constant-only" bar in this module. Its own
+      *value* is never inspected (any scalar commutes with a channel-axis
+      slice the same way, whatever it is).
+    - The ``Div``'s own inputs not exactly ``(x_g, denom)`` in that fixed
+      order -- ``Div`` is not commutative, so unlike every other operand-order
+      check in this module (`_flat_channel_const`-style ``Mul``/``Add`` pairs
+      admit either order), this one specific order is the only one that
+      actually computes ``x_g / denom`` rather than its reciprocal.
+    - The ``x * x_n`` ``Mul``'s own two operands not exactly ``{x_name, x_n}``
+      (either order), or its own output read by anything other than exactly
+      one node.
+    - The affine `weight`/`bias` ``Mul``/``Add`` not each a plain,
+      :func:`_grn_axis1_channel_const`-shaped (``[1, n_channels, 1, 1]``)
+      constant initializer, distinct from each other (a tied `weight`/`bias`
+      would be double-sliced by :func:`_apply_chains`'s own per-hop loop,
+      corrupting it, the same tied-name bar every other norm-family hop in
+      this module already applies) and from the tensor they multiply/add
+      against.
+    - A present optional harmless ``* 1.0`` ``Mul`` (see this section's own
+      comment for why one may legitimately appear) whose own second operand
+      is not a scalar constant of exactly value `1.0` -- any other constant
+      there would actually change the computation, so it is *not* treated as
+      the harmless decomposition artifact and this hop declines instead of
+      silently accepting a different value.
+    - The final residual ``Add`` not exactly the third of `x_name`'s own
+      three direct consumers (identified up front), or its own two operands
+      not exactly ``{x_name, biased}``.
+
+    The sequence's own true final output (the final `Add`'s own output) is
+    *not* itself checked against `graph_outputs`/single-consumer here --
+    exactly like :func:`_match_decomposed_group_norm_pass_through`'s own
+    `out_name`, that check is the caller's (:func:`_walk_to_conv_consumer`'s
+    own per-iteration `cur` check), applied uniformly whether `cur` arrived
+    via an ordinary hop or this one.
+    """
+    x_consumers = consumers_of.get(x_name, [])
+    if len(x_consumers) != 3:
+        return None
+    reduce_l2: Optional[onnx.NodeProto] = None
+    others: List[onnx.NodeProto] = []
+    for cand in x_consumers:
+        if cand.op_type == "ReduceL2" and reduce_l2 is None:
+            reduce_l2 = cand
+        else:
+            others.append(cand)
+    if reduce_l2 is None or len(others) != 2:
+        return None
+
+    if (
+        reduce_l2.domain != ""
+        or list(reduce_l2.input) != [x_name]
+        or len(reduce_l2.output) != 1
+        or not reduce_l2.output[0]
+    ):
+        return None
+    rl2_axes: Optional[List[int]] = None
+    rl2_keepdims = 1
+    for attr in reduce_l2.attribute:
+        if attr.name == "axes":
+            rl2_axes = list(attr.ints)
+        elif attr.name == "keepdims":
+            rl2_keepdims = attr.i
+    if not rl2_axes or rl2_keepdims != 1 or any(axis in (0, 1) for axis in rl2_axes):
+        return None  # empty/absent axes, batch/channel axis reduced, or dropped rank
+    x_g = reduce_l2.output[0]
+    # `x_g` is read *twice* -- once by `ReduceMean` (below) and once by the
+    # later `Div` (``Div(x_g, denom)``, see below) -- unlike every other
+    # intermediate tensor in this sequence, which is read exactly once.
+    if x_g in graph_outputs:
+        return None
+    xg_consumers = consumers_of.get(x_g, [])
+    if len(xg_consumers) != 2:
+        return None
+    reduce_mean: Optional[onnx.NodeProto] = None
+    div_candidate: Optional[onnx.NodeProto] = None
+    for cand in xg_consumers:
+        if cand.op_type == "ReduceMean" and reduce_mean is None:
+            reduce_mean = cand
+        else:
+            div_candidate = cand
+    if reduce_mean is None or div_candidate is None or reduce_mean is div_candidate:
+        return None
+    if (
+        reduce_mean.op_type != "ReduceMean"
+        or reduce_mean.domain != ""
+        or list(reduce_mean.input) != [x_g]
+        or len(reduce_mean.output) != 1
+        or not reduce_mean.output[0]
+    ):
+        return None
+    rm_axes: Optional[List[int]] = None
+    rm_keepdims = 1
+    for attr in reduce_mean.attribute:
+        if attr.name == "axes":
+            rm_axes = list(attr.ints)
+        elif attr.name == "keepdims":
+            rm_keepdims = attr.i
+    if rm_axes != [1] or rm_keepdims != 1:
+        return None  # must reduce over exactly the whole channel axis
+    mean_out = reduce_mean.output[0]
+    if mean_out in graph_outputs or len(consumers_of.get(mean_out, [])) != 1:
+        return None
+
+    eps_add = consumers_of[mean_out][0]
+    if (
+        eps_add.op_type != "Add"
+        or eps_add.domain != ""
+        or len(eps_add.input) != 2
+        or mean_out not in eps_add.input
+        or len(eps_add.output) != 1
+        or not eps_add.output[0]
+    ):
+        return None
+    eps_name = eps_add.input[1] if eps_add.input[0] == mean_out else eps_add.input[0]
+    if eps_name == mean_out:
+        return None
+    eps_init = initializer_map.get(eps_name)
+    if (
+        eps_init is None
+        or not _is_supported_float_dtype(eps_init.data_type)
+        or list(eps_init.dims) not in ([], [1])
+    ):
+        return None  # non-constant/non-scalar eps -- declined, never guessed at
+    denom = eps_add.output[0]
+    if denom in graph_outputs or len(consumers_of.get(denom, [])) != 1:
+        return None
+
+    div_node = consumers_of[denom][0]
+    if div_node is not div_candidate:
+        return None  # `x_g`'s own second reader must be exactly this `Div`
+    if (
+        div_node.op_type != "Div"
+        or div_node.domain != ""
+        or list(div_node.input) != [x_g, denom]
+        or len(div_node.output) != 1
+        or not div_node.output[0]
+    ):
+        return None  # `Div` isn't commutative -- operand order is fixed
+    x_n = div_node.output[0]
+    if x_n in graph_outputs or len(consumers_of.get(x_n, [])) != 1:
+        return None
+
+    mul_scaled = consumers_of[x_n][0]
+    if (
+        mul_scaled.op_type != "Mul"
+        or mul_scaled.domain != ""
+        or len(mul_scaled.input) != 2
+        or set(mul_scaled.input) != {x_name, x_n}
+        or len(mul_scaled.output) != 1
+        or not mul_scaled.output[0]
+        or not any(o is mul_scaled for o in others)  # `is`, not `==`/`in`: two
+        # structurally-identical-but-distinct nodes must never be confused --
+        # see this function's own docstring for why `x_name`'s own three
+        # direct consumers are tracked by identity throughout
+    ):
+        return None
+    final_add_candidates = [o for o in others if o is not mul_scaled]
+    if len(final_add_candidates) != 1:
+        return None
+    final_add = final_add_candidates[0]
+    scaled = mul_scaled.output[0]
+    if scaled in graph_outputs or len(consumers_of.get(scaled, [])) != 1:
+        return None
+
+    weight_mul = consumers_of[scaled][0]
+    if (
+        weight_mul.op_type != "Mul"
+        or weight_mul.domain != ""
+        or len(weight_mul.input) != 2
+        or scaled not in weight_mul.input
+        or len(weight_mul.output) != 1
+        or not weight_mul.output[0]
+    ):
+        return None
+    weight_name = (
+        weight_mul.input[1] if weight_mul.input[0] == scaled else weight_mul.input[0]
+    )
+    if weight_name == scaled or not _grn_axis1_channel_const(
+        weight_name, initializer_map, n_channels
+    ):
+        return None
+    weighted = weight_mul.output[0]
+    if weighted in graph_outputs or len(consumers_of.get(weighted, [])) != 1:
+        return None
+
+    chain_ops_extra: List[Tuple[onnx.NodeProto, None]] = []
+    next_node = consumers_of[weighted][0]
+    if (
+        next_node.op_type == "Mul"
+        and next_node.domain == ""
+        and len(next_node.input) == 2
+        and weighted in next_node.input
+        and len(next_node.output) == 1
+        and next_node.output[0]
+    ):
+        one_name = (
+            next_node.input[1] if next_node.input[0] == weighted else next_node.input[0]
+        )
+        one_init = initializer_map.get(one_name)
+        if (
+            one_init is not None
+            and _is_supported_float_dtype(one_init.data_type)
+            and list(one_init.dims) in ([], [1])
+            and float(onnx.numpy_helper.to_array(one_init).reshape(-1)[0]) == 1.0
+        ):
+            one_out = next_node.output[0]
+            if one_out in graph_outputs or len(consumers_of.get(one_out, [])) != 1:
+                return None
+            chain_ops_extra.append((next_node, None))
+            weighted = one_out
+            next_node = consumers_of[weighted][0]
+
+    bias_add = next_node
+    if (
+        bias_add.op_type != "Add"
+        or bias_add.domain != ""
+        or len(bias_add.input) != 2
+        or weighted not in bias_add.input
+        or len(bias_add.output) != 1
+        or not bias_add.output[0]
+    ):
+        return None
+    bias_name = (
+        bias_add.input[1] if bias_add.input[0] == weighted else bias_add.input[0]
+    )
+    if (
+        bias_name == weighted
+        or bias_name == weight_name  # tied weight/bias -- would double-slice it
+        or not _grn_axis1_channel_const(bias_name, initializer_map, n_channels)
+    ):
+        return None
+    biased = bias_add.output[0]
+    if biased in graph_outputs or len(consumers_of.get(biased, [])) != 1:
+        return None
+    if consumers_of[biased][0] is not final_add:
+        return None
+
+    if (
+        final_add.op_type != "Add"
+        or final_add.domain != ""
+        or len(final_add.input) != 2
+        or set(final_add.input) != {x_name, biased}
+        or len(final_add.output) != 1
+        or not final_add.output[0]
+    ):
+        return None
+
+    out_name = final_add.output[0]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, None], ...] = (
+        (reduce_l2, None),
+        (reduce_mean, None),
+        (eps_add, None),
+        (div_node, None),
+        (mul_scaled, None),
+        *chain_ops_extra,
+        (final_add, None),
+    )
+    grn = _GrnPassThrough(weight_mul, weight_name, bias_add, bias_name)
+    return out_name, chain_ops, grn
+
+
 def _match_resize_channel_pass_through(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> bool:
@@ -8037,6 +8497,7 @@ def _walk_to_conv_consumer(
     allow_conv_transpose_consumer: bool = False,
     recognize_group_norm: bool = False,
     recognize_decomposed_group_norm: bool = False,
+    recognize_grn: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Tuple[
@@ -8046,6 +8507,7 @@ def _walk_to_conv_consumer(
     Optional[_GroupNormPassThrough],
     Optional[int],
     Optional[_ConsumerMatch],
+    Optional[_GrnPassThrough],
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
@@ -8168,6 +8630,22 @@ def _walk_to_conv_consumer(
     so a chain can carry at most one GroupNorm-family hop, exactly like
     `recognize_group_norm` alone already guaranteed for the native shape.
 
+    `recognize_grn` is the analogous gate for the ConvNeXt-V2
+    ``GlobalResponseNorm`` (GRN) sequence -- see :func:`_match_grn_pass_through`
+    and this module's own "Global Response Normalization (GRN) pass-through"
+    section comment -- scoped identically to `recognize_group_norm`/
+    `recognize_decomposed_group_norm` for the identical reason (only
+    :func:`_find_conv_chains` passes ``True``), and mutually exclusive with
+    both of them (and with itself, past the first match) on any one chain:
+    tried, like `recognize_decomposed_group_norm`'s own decomposed-GroupNorm
+    shape, at whatever tensor `cur` is at the top of each hop iteration below
+    the moment it has exactly *three* consumers (GRN's own root tensor `x` is
+    read three times over -- by `ReduceL2`, by the ``x * x_n`` `Mul`, and by
+    the final residual `Add` -- a shape the ordinary
+    ``len(candidates) == 1`` dispatch can never reach on its own), only when
+    none of `group_norm`/`decomposed_group_norm_num_groups`/this hop has
+    already matched earlier on this same walk.
+
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- every ordinary
     caller leaves it ``None`` and gets identical behavior to before this
@@ -8223,6 +8701,7 @@ def _walk_to_conv_consumer(
     conv_pass_through: List[_ConvPassThrough] = []
     group_norm: Optional[_GroupNormPassThrough] = None
     decomposed_group_norm_num_groups: Optional[int] = None
+    grn: Optional[_GrnPassThrough] = None
     consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
     matmul_consumer: Optional[_ConsumerMatch] = None
     cur = start
@@ -8260,9 +8739,23 @@ def _walk_to_conv_consumer(
                 )
                 if diamond is not None:
                     diamond_nodes, diamond_out = diamond
-                    if (
-                        len(consumers_of.get(diamond_out, [])) != 1
-                        or diamond_out in graph_outputs
+                    if diamond_out in graph_outputs:
+                        break
+                    diamond_out_n_consumers = len(consumers_of.get(diamond_out, []))
+                    # Ordinarily exactly one consumer -- but a real
+                    # ConvNeXt-V2 block's own erf-GELU (this exact diamond
+                    # shape) feeds a GRN hop's own three-consumer root
+                    # directly (`fc1 -> GELU -> GRN -> fc2`, confirmed live
+                    # -- see this module's own "Global Response
+                    # Normalization (GRN) pass-through" section comment), so
+                    # `recognize_grn` admits that one specific count here
+                    # too: the next hop iteration's own top-of-loop dispatch
+                    # (identical to `cur == start`'s) then decides, via
+                    # :func:`_match_grn_pass_through`, whether those three
+                    # consumers actually form that shape -- declining, same
+                    # as any other unmatched topology, if they don't.
+                    if diamond_out_n_consumers != 1 and not (
+                        recognize_grn and diamond_out_n_consumers == 3
                     ):
                         break
                     chain_ops.extend((n, None) for n in diamond_nodes)
@@ -8287,6 +8780,27 @@ def _walk_to_conv_consumer(
                     cur = diamond_out
                     continue
                 break  # five consumers but not this shape -- declined, as before
+            if len(candidates) == 3:
+                # GRN's own root tensor `x` is read three times over -- see
+                # `recognize_grn`'s own docstring for the mutual-exclusion
+                # gate against `group_norm`/`decomposed_group_norm_num_groups`
+                # above and against itself past the first match.
+                if (
+                    recognize_grn
+                    and group_norm is None
+                    and decomposed_group_norm_num_groups is None
+                    and grn is None
+                ):
+                    grn_match = _match_grn_pass_through(
+                        cur, consumers_of, initializer_map, graph_outputs, n_channels
+                    )
+                    if grn_match is not None:
+                        grn_out, grn_chain_ops, grn_hop = grn_match
+                        chain_ops.extend(grn_chain_ops)
+                        grn = grn_hop
+                        cur = grn_out
+                        continue
+                break  # three consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -8519,6 +9033,7 @@ def _walk_to_conv_consumer(
         group_norm,
         decomposed_group_norm_num_groups,
         matmul_consumer,
+        grn,
     )
 
 
@@ -8562,9 +9077,15 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # surface as five entries there, not four).
         # :func:`_walk_to_conv_consumer` decides, at its own first hop,
         # whether those consumers actually form either shape.
+        # Also admit exactly three (GRN's own root tensor `x`, read three
+        # times over -- by `ReduceL2`, by the `x * x_n` `Mul`, and by the
+        # final residual `Add` -- see :func:`_match_grn_pass_through` and
+        # this module's own "Global Response Normalization (GRN)
+        # pass-through" section comment).
         if out_name in graph_outputs or len(consumers_of.get(out_name, [])) not in (
             1,
             2,
+            3,
             5,
         ):
             continue
@@ -8576,6 +9097,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             group_norm,
             decomposed_group_norm_num_groups,
             matmul_consumer,
+            grn,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -8586,6 +9108,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             allow_conv_transpose_consumer=True,
             recognize_group_norm=True,
             recognize_decomposed_group_norm=True,
+            recognize_grn=True,
             recognize_gap_flatten_matmul_consumer=True,
             producers_of=producers_of,
         )
@@ -8611,6 +9134,8 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 group_norm.num_groups
                 if group_norm is not None
                 else decomposed_group_norm_num_groups
+                if decomposed_group_norm_num_groups is not None
+                else (1 if grn is not None else None)
             )
             if (
                 effective_num_groups is not None
@@ -8647,6 +9172,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                     conv_pass_through=conv_pass_through,
                     group_norm=group_norm,
                     decomposed_group_norm_num_groups=decomposed_group_norm_num_groups,
+                    grn=grn,
                 )
             )
             continue
@@ -8684,6 +9210,8 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             group_norm.num_groups
             if group_norm is not None
             else decomposed_group_norm_num_groups
+            if decomposed_group_norm_num_groups is not None
+            else (1 if grn is not None else None)
         )
         if effective_num_groups is not None and (
             (producer_group > 1 and producer_group != effective_num_groups)
@@ -8713,6 +9241,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 conv_pass_through=conv_pass_through,
                 group_norm=group_norm,
                 decomposed_group_norm_num_groups=decomposed_group_norm_num_groups,
+                grn=grn,
                 consumer_group=consumer_group,
                 consumer_is_conv_transpose=consumer_is_conv_transpose,
             )
@@ -9186,6 +9715,7 @@ def _resolve_conv_fanout_branches(
                 _br_group_norm,
                 _br_decomposed_group_norm,
                 _br_matmul_consumer,
+                _br_grn,
             ) = _walk_to_conv_consumer(
                 tensor,
                 initializer_map,
@@ -9197,12 +9727,13 @@ def _resolve_conv_fanout_branches(
             )
             if resolved is None:
                 return None
-            # `recognize_group_norm`/`recognize_decomposed_group_norm` were
-            # left at their defaults (False) above, so `_br_group_norm`/
-            # `_br_decomposed_group_norm` are always `None` -- GroupNorm
-            # pass-through (native or decomposed) is deliberately out of
-            # scope for a residual/merge group's own fan-out branches for now
-            # (see _walk_to_conv_consumer's own docstring).
+            # `recognize_group_norm`/`recognize_decomposed_group_norm`/
+            # `recognize_grn` were left at their defaults (False) above, so
+            # `_br_group_norm`/`_br_decomposed_group_norm`/`_br_grn` are
+            # always `None` -- GroupNorm/GRN pass-through (native or
+            # decomposed) is deliberately out of scope for a residual/merge
+            # group's own fan-out branches for now (see
+            # _walk_to_conv_consumer's own docstring).
             # `recognize_gap_flatten_matmul_consumer` was left at its default
             # (False) above, so `_br_matmul_consumer` is always `None` -- the
             # `GlobalAveragePool -> Flatten -> {MatMul, Gemm}` consumer shape
@@ -9804,6 +10335,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             group_norm,
             decomposed_group_norm_num_groups,
             _matmul_consumer,
+            grn,
         ) = _walk_to_conv_consumer(
             mul_out,
             initializer_map,
@@ -9816,11 +10348,15 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             continue
         # Every optional `_walk_to_conv_consumer` flag (`allow_conv_transpose_
         # consumer`, `recognize_group_norm`, `recognize_decomposed_group_norm`,
-        # `recognize_gap_flatten_matmul_consumer`) was left at its default
-        # (False) above -- see this section's own comment for why -- so
-        # `group_norm`/`decomposed_group_norm_num_groups`/`_matmul_consumer`
-        # are always `None` here.
-        assert group_norm is None and decomposed_group_norm_num_groups is None
+        # `recognize_grn`, `recognize_gap_flatten_matmul_consumer`) was left at
+        # its default (False) above -- see this section's own comment for why
+        # -- so `group_norm`/`decomposed_group_norm_num_groups`/`grn`/
+        # `_matmul_consumer` are always `None` here.
+        assert (
+            group_norm is None
+            and decomposed_group_norm_num_groups is None
+            and grn is None
+        )
         (
             consumer_node,
             consumer_weight,
@@ -12813,6 +13349,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             _fwd_group_norm,
             _fwd_decomposed_group_norm,
             _fwd_matmul_consumer,
+            _fwd_grn,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -12827,12 +13364,12 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         # deliberately out of scope for a Concat-branch-merge chain's own
         # consumer for now (see _walk_to_conv_consumer's own docstring), the
         # same way ConvTranspose/GroupNorm already are.
-        # `recognize_group_norm`/`recognize_decomposed_group_norm` were left
-        # at their defaults (False) above, so `_fwd_group_norm`/
-        # `_fwd_decomposed_group_norm` are always `None` -- GroupNorm
-        # pass-through (native or decomposed) is deliberately out of scope
-        # for a Concat-branch-merge chain's own consumer for now (see
-        # _walk_to_conv_consumer's own docstring).
+        # `recognize_group_norm`/`recognize_decomposed_group_norm`/
+        # `recognize_grn` were left at their defaults (False) above, so
+        # `_fwd_group_norm`/`_fwd_decomposed_group_norm`/`_fwd_grn` are always
+        # `None` -- GroupNorm/GRN pass-through (native or decomposed) is
+        # deliberately out of scope for a Concat-branch-merge chain's own
+        # consumer for now (see _walk_to_conv_consumer's own docstring).
         if consumer is None:
             continue
         # `allow_conv_transpose_consumer` was left at its default (False)
@@ -13784,6 +14321,15 @@ def _chain_group(chain: _Chain) -> int:
     `chain.decomposed_group_norm_num_groups` is ever set (see
     :func:`_walk_to_conv_consumer`'s own mutual-exclusion gate), so checking
     both in sequence is never ambiguous.
+
+    A mid-chain GRN hop (`chain.grn`, likewise only ever set by
+    :func:`_find_conv_chains`, and mutually exclusive with both fields above
+    -- see :func:`_walk_to_conv_consumer`'s own `recognize_grn` docstring)
+    contributes an implied `num_groups == 1` the identical way -- its own
+    ``ReduceMean`` reduces over the *entire* channel axis, the degenerate
+    case of `group_norm`'s own per-block reduction -- see
+    :class:`_GrnPassThrough` and this module's own "Global Response
+    Normalization (GRN) pass-through" section comment.
     """
     group = chain.consumer_group
     for p in chain.producers:
@@ -13794,22 +14340,28 @@ def _chain_group(chain: _Chain) -> int:
         group = chain.group_norm.num_groups
     if chain.decomposed_group_norm_num_groups is not None:
         group = chain.decomposed_group_norm_num_groups
+    if chain.grn is not None:
+        group = 1
     return group
 
 
 def _chain_group_norm_consts(chain: _Chain) -> Set[str]:
-    """`chain.group_norm`'s own `scale`/`bias` names, if present, else an
-    empty set -- shared by :func:`_apply_chains`/:func:`_apply_chains_global`/
+    """`chain.group_norm`'s own `scale`/`bias` names and `chain.grn`'s own
+    `weight`/`bias` names, if present, else an empty set -- shared by
+    :func:`_apply_chains`/:func:`_apply_chains_global`/
     :func:`_analyze_chains`'s own identical `consts` touched-role
     bookkeeping (see :class:`_TouchedState`'s own docstring for why every
     per-channel constant, regardless of which hop owns it, is tracked
-    against the same cross-chain conflict set), so a `GroupNormalization`
-    hop's `scale`/`bias` get exactly the same shared/tied-initializer
-    protection every other chain-op constant already does.
+    against the same cross-chain conflict set), so a `GroupNormalization`/GRN
+    hop's own per-channel constants get exactly the same shared/tied-
+    initializer protection every other chain-op constant already does.
     """
-    if chain.group_norm is None:
-        return set()
-    return {chain.group_norm.scale, chain.group_norm.bias}
+    consts: Set[str] = set()
+    if chain.group_norm is not None:
+        consts.update({chain.group_norm.scale, chain.group_norm.bias})
+    if chain.grn is not None:
+        consts.update({chain.grn.weight, chain.grn.bias})
+    return consts
 
 
 def _chain_is_global_sparsity_eligible(chain: _Chain) -> bool:
@@ -13876,6 +14428,12 @@ def _slice_chain_channels(
         # comment for why it stays valid without changing it).
         _slice_last_axis(initializer_map[chain.group_norm.scale], keep)
         _slice_last_axis(initializer_map[chain.group_norm.bias], keep)
+    if chain.grn is not None:
+        # `weight`/`bias` are each ``[1, n_channels, 1, 1]`` -- channel axis
+        # 1, not the last axis a `group_norm` hop's own flat `scale`/`bias`
+        # sit on -- see :class:`_GrnPassThrough`'s own comment.
+        _slice_axis1(initializer_map[chain.grn.weight], keep)
+        _slice_axis1(initializer_map[chain.grn.bias], keep)
     if (
         chain.consumer_is_conv
         and not chain.consumer_is_conv_transpose
@@ -13943,6 +14501,9 @@ def _slice_chain_channels(
     )
     if chain.group_norm is not None:
         stale_value_info.add(chain.group_norm.node.output[0])
+    if chain.grn is not None:
+        stale_value_info.add(chain.grn.weight_node.output[0])
+        stale_value_info.add(chain.grn.bias_node.output[0])
     stale_value_info.update(
         chain_node.output[0]
         for b in chain.extra_consumers

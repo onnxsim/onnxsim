@@ -6816,6 +6816,357 @@ def test_analyze_structured_pruning_instance_norm_pass_through_matches_real_call
     assert dims_after["INBias"][0] == kept
 
 
+# --- Conv chain: ConvNeXt-V2 GlobalResponseNorm (GRN) pass-through hop ------
+#
+# The fixed ``ReduceL2 -> ReduceMean -> Add -> Div -> Mul -> Mul -> Add ->
+# Add`` op sequence a real ``torch.onnx.export`` of the actual installed
+# `timm` package's own `timm.layers.grn.GlobalResponseNorm` class emits (see
+# `onnxsim.pruning._match_grn_pass_through`'s own docstring and this
+# module's own "Global Response Normalization (GRN) pass-through" section
+# comment for the full empirical confirmation and correctness argument).
+
+
+def _grn_conv_pair_model(
+    w1, w2, grn_weight, grn_bias, b1=None, spatial=10, eps=1e-6, extra_mul_one=False
+):
+    """The mid-chain-GRN analogue of `_conv_pair_model`/
+    `_group_norm_conv_pair_model`/`_instance_norm_conv_pair_model`: the fixed
+    GRN op sequence sits between the two Convs, reading the first Conv's own
+    output `h` three times over (by `ReduceL2`, by the ``h * xn`` `Mul`, and
+    by the final residual `Add`). `grn_weight`/`grn_bias` (length `C1`) are
+    reshaped to the real, confirmed ``[1, C1, 1, 1]`` initializer shape here,
+    mirroring a real `torch.onnx.export` of `timm`'s own
+    `GlobalResponseNorm(channels_last=False)`. Built at opset 17 (not
+    `_model`'s own default 21): `ReduceL2`/`ReduceMean`'s `axes` moved from
+    an attribute to an optional *input* at opset 18, and this matcher --
+    like every other hop in this module -- only recognizes the exact shape
+    actually confirmed live (see `_grn_axis1_channel_const`'s own docstring
+    for the identical "don't guess at an unconfirmed shape" reasoning).
+    `extra_mul_one`, when set, additionally inserts the harmless ``* 1.0``
+    `Mul` `torch.addcmul`'s own eager-mode fused decomposition sometimes
+    emits (see this matcher's own comment for why it is recognized but not
+    required).
+    """
+    Cin, C1, C2 = w1.shape[1], w1.shape[0], w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(grn_weight.reshape(1, C1, 1, 1), "GrnWeight"),
+        _f32(grn_bias.reshape(1, C1, 1, 1), "GrnBias"),
+        _f32(np.array(eps, dtype=np.float32), "Eps"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    weighted_name = "weighted"
+    extra_line = ""
+    if extra_mul_one:
+        initializer.append(_f32(np.array(1.0, dtype=np.float32), "One"))
+        extra_line = "weighted1 = Mul(weighted, One)"
+        weighted_name = "weighted1"
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          xg = ReduceL2<axes=[2,3], keepdims=1>(h)
+          xgm = ReduceMean<axes=[1], keepdims=1>(xg)
+          denom = Add(xgm, Eps)
+          xn = Div(xg, denom)
+          scaled = Mul(h, xn)
+          weighted = Mul(scaled, GrnWeight)
+          {extra_line}
+          biased = Add({weighted_name}, GrnBias)
+          grn_out = Add(h, biased)
+          Y = Conv<kernel_shape=[3,3]>(grn_out, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_grn_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, same as every other Conv-chain hop's own
+    # oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model -- never "matches the
+    # un-pruned model's own output sliced after the fact". `_oracle_keep_
+    # indices_conv` -- the plain, unconstrained top-k `_apply_chains` itself
+    # uses for an ordinary (`group=1`) chain -- is the right oracle here:
+    # like the InstanceNorm hop, GRN's own `ReduceMean` over the *whole*
+    # channel axis (the degenerate `num_groups == 1` case) adds no grouping
+    # constraint of its own.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(70)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C1,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _grn_conv_pair_model(w1, w2, grn_weight, grn_bias, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["GrnWeight"] == (1, C1 // 2, 1, 1)
+    assert dims_after["GrnBias"] == (1, C1 // 2, 1, 1)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _grn_conv_pair_model(
+        w1[keep], w2[:, keep], grn_weight[keep], grn_bias[keep], b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(71)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_grn_pass_through_extra_mul_by_one_matches_oracle():
+    # The harmless ``* 1.0`` `Mul` `torch.addcmul`'s own eager-mode fused
+    # decomposition sometimes emits between the `weight` `Mul` and the
+    # `bias` `Add` -- recognized and skipped, not required (see
+    # `_match_grn_pass_through`'s own comment). Same oracle bar as above.
+    Cin, C1, C2 = 3, 12, 6
+    rng = np.random.default_rng(72)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C1,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _grn_conv_pair_model(w1, w2, grn_weight, grn_bias, extra_mul_one=True)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _grn_conv_pair_model(
+        w1[keep], w2[:, keep], grn_weight[keep], grn_bias[keep], extra_mul_one=True
+    )
+
+    rng_x = np.random.default_rng(73)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _conv_gelu_grn_conv_pair_model(w1, w2, grn_weight, grn_bias, b1=None, spatial=10):
+    """The actual real, currently-shipping ConvNeXt-V2 ``conv_mlp=True``
+    MLP-block shape: ``fc1 -> GELU (erf, decomposed) -> GRN -> fc2`` (see
+    this module's own top-of-file GRN section comment). The erf-GELU
+    decomposition text mirrors `_conv_erf_gelu_decomposed_pair_model`'s own
+    exactly; unlike that model, `a` (the GELU diamond's own `diamond_out`)
+    is read three times over by the GRN sequence that follows it, exactly
+    the interaction `_walk_to_conv_consumer`'s own comment (just above its
+    self-gated-activation dispatch) documents.
+    """
+    Cin, C1, C2 = w1.shape[1], w1.shape[0], w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(grn_weight.reshape(1, C1, 1, 1), "GrnWeight"),
+        _f32(grn_bias.reshape(1, C1, 1, 1), "GrnBias"),
+        _f32(np.array(1e-6, dtype=np.float32), "Eps"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        <float Sqrt2 = {{1.4142135}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          {conv1}
+          d = Div(h, Sqrt2)
+          e = Erf(d)
+          ao = Add(e, One)
+          m = Mul(h, ao)
+          a = Mul(m, Half)
+          xg = ReduceL2<axes=[2,3], keepdims=1>(a)
+          xgm = ReduceMean<axes=[1], keepdims=1>(xg)
+          denom = Add(xgm, Eps)
+          xn = Div(xg, denom)
+          scaled = Mul(a, xn)
+          weighted = Mul(scaled, GrnWeight)
+          biased = Add(weighted, GrnBias)
+          grn_out = Add(a, biased)
+          Y = Conv<kernel_shape=[3,3]>(grn_out, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_grn_after_erf_gelu_matches_oracle_exactly():
+    # The actual real, currently-shipping ConvNeXt-V2 ``conv_mlp=True``
+    # block shape (`fc1 -> GELU -> GRN -> fc2`) this whole feature exists to
+    # unblock -- a regression test for the interaction between the erf-GELU
+    # diamond and `recognize_grn`'s own three-consumer admission past it
+    # (see `_conv_gelu_grn_conv_pair_model`'s own docstring): before that
+    # admission existed, this exact chain came out completely unpruned end
+    # to end, the GELU diamond's own hard single-consumer gate breaking the
+    # walk before GRN was ever reached. Same oracle bar as every other
+    # Conv-chain hop's own oracle test.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(77)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C1,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _conv_gelu_grn_conv_pair_model(w1, w2, grn_weight, grn_bias, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["GrnWeight"] == (1, C1 // 2, 1, 1)
+    assert dims_after["GrnBias"] == (1, C1 // 2, 1, 1)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_gelu_grn_conv_pair_model(
+        w1[keep], w2[:, keep], grn_weight[keep], grn_bias[keep], b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(78)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_grn_reduce_mean_wrong_axis_declines():
+    # `ReduceMean` reducing over a spatial axis (here axis 2, already size 1
+    # after the preceding `ReduceL2<keepdims=1>`) instead of the *whole*
+    # channel axis (`axes=[1]`) is a materially different computation from
+    # the one confirmed live -- declined outright, never guessed at, the
+    # same "reduction over the wrong axis" bar every other norm-family hop
+    # in this module already applies.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(74)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C1,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          xg = ReduceL2<axes=[2,3], keepdims=1>(h)
+          xgm = ReduceMean<axes=[2], keepdims=1>(xg)
+          denom = Add(xgm, Eps)
+          xn = Div(xg, denom)
+          scaled = Mul(h, xn)
+          weighted = Mul(scaled, GrnWeight)
+          biased = Add(weighted, GrnBias)
+          grn_out = Add(h, biased)
+          Y = Conv<kernel_shape=[3,3]>(grn_out, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(grn_weight.reshape(1, C1, 1, 1), "GrnWeight"),
+            _f32(grn_bias.reshape(1, C1, 1, 1), "GrnBias"),
+            _f32(np.array(1e-6, dtype=np.float32), "Eps"),
+        ],
+        opset=17,
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_grn_non_constant_weight_declines():
+    # `weight` fed by a runtime value (here, a second graph input) rather
+    # than a constant initializer -- this pass cannot know its per-channel
+    # values ahead of time, so the whole chain is declined outright, never
+    # guessed at, the same "statically-known-constant-only" bar every other
+    # per-channel hop in this module already applies.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(75)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    grn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float[1,{C1},1,1] GrnWeight) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          xg = ReduceL2<axes=[2,3], keepdims=1>(h)
+          xgm = ReduceMean<axes=[1], keepdims=1>(xg)
+          denom = Add(xgm, Eps)
+          xn = Div(xg, denom)
+          scaled = Mul(h, xn)
+          weighted = Mul(scaled, GrnWeight)
+          biased = Add(weighted, GrnBias)
+          grn_out = Add(h, biased)
+          Y = Conv<kernel_shape=[3,3]>(grn_out, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(grn_bias.reshape(1, C1, 1, 1), "GrnBias"),
+            _f32(np.array(1e-6, dtype=np.float32), "Eps"),
+        ],
+        opset=17,
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_analyze_structured_pruning_grn_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check for the GRN hop specifically, mirroring
+    # `test_analyze_structured_pruning_group_norm_pass_through_matches_real_call`/
+    # `test_analyze_structured_pruning_instance_norm_pass_through_matches_real_call`
+    # above -- both `_apply_chains` and its dry-run mirror `_analyze_chains`
+    # share `_chain_group` and, via `_chain_group_norm_consts`, the same
+    # touched-role bookkeeping for `chain.grn`'s own `weight`/`bias`, so a
+    # mismatch here would mean the mirror drifted out of sync with the real
+    # call.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(76)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C1,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _grn_conv_pair_model(w1, w2, grn_weight, grn_bias)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["GrnWeight"] == (1, kept, 1, 1)
+    assert dims_after["GrnBias"] == (1, kept, 1, 1)
+
+
 # --- Conv chain: decomposed-GroupNorm pass-through hop -----------------------
 #
 # The fixed 5-node ``Reshape -> InstanceNormalization -> Reshape -> Mul ->
