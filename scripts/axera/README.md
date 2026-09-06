@@ -2273,6 +2273,76 @@ the ~3.1 MB span is the on-chip memory's actual size is not confirmed
 against any spec here, and the tile-to-tensor mapping is not
 decoded; the field's *kind* -- aligned tile address -- is.
 
+### `50 01` is a per-op four-step sequence, written in a fixed order -- not an engine selector
+
+The most-written field, `50 01`, takes exactly four one-hot values
+(`0x1, 0x100, 0x100000, 0x1000000` -- bits 0, 8, 20, 24) in both
+models. Four values and four profiled engines (`conv0`, `conv1`,
+`teng2`, `sdma4`) invite the guess "it selects an engine." Testing that
+guess, locally, refutes it:
+
+- **Every op writes all four, in the same fixed order.** Splitting
+  `resnet18d`'s header stream at each `40 02` (Wbt-offset) write, the
+  `50 01` values between consecutive ops are `bit8, bit0, bit20, bit24`
+  in **180 of 180** segments, and the tiny two-Conv model's single op
+  writes exactly the same four in the same order. Each value occurs
+  exactly 181 times -- once per op -- so 724 = 4 x 181 is not "four
+  choices" but "four steps."
+- So `50 01` is a **per-op sequence register**: every op pulses it
+  four times in a fixed order. Which four steps -- four stage triggers,
+  four engine-enable pulses issued in sequence, a four-phase handshake
+  -- is not identified; what is settled is that it is not a per-op
+  choice of one engine.
+
+A count that lines up on the way: `sdma4` has exactly **181** events in
+`resnet18d`'s trace -- one per op, one per `40 02` write -- consistent
+with each op's Wbt-offset write being followed by one weight DMA on the
+system DMA engine. (`conv0`/`conv1` have 522 events each; `teng2` 46;
+`cv3` 162.)
+
+### The four `50 01` steps on the device: three required, one optional, and a correction about what the validator checks
+
+`50 01` is written four times per op in a fixed order (`bit8, bit0,
+bit20, bit24`). Editing those four writes for one real `resnet18d` op
+on the device, one variant per run, then repeating on a second op:
+
+```
+                                      op @ word 8174   op @ word 12074
+skip bit8   (write 0 instead)         FAULT            FAULT
+skip bit0                             FAULT            (not repeated)
+skip bit20                            FAULT            (not repeated)
+skip bit24                            identical        identical
+swap bit8 <-> bit0                    identical        identical
+swap bit20 <-> bit24                  FAULT            (not repeated)
+all four -> 0                         runs, D (815)    runs, D (832)
+```
+
+- **`bit8`, `bit0`, `bit20` are each required**: removing any one of
+  them faults with the usual `0x8030070C`.
+- **`bit24` is optional**: removing it leaves the output bit-identical
+  on both ops -- whatever the fourth step does, correctness does not
+  depend on it (a timing or profiling pulse is the natural guess).
+- **`bit8` and `bit0` are order-free** (swapped, identical output);
+  **`bit20` must precede `bit24`** (swapped, fault; one op).
+- **Removing all four does *not* fault** -- the op runs, with a
+  different result, on both ops. So the check is not "a step is
+  missing" but "the steps present are inconsistent": a partial
+  sequence is rejected, an absent one falls back to some default mode.
+
+**Correction, stated in place.** The `40 02` operand section above
+concluded that "every fault in this whole investigation came from a
+header/format byte, never from an operand value, however absurd." That
+held for every *address* value tried, and it is wrong as a general
+statement: the `50 01` step values above are operand values, and
+zeroing one of them faults. The consistent reading of all of it is that
+`0x8030070C` is a **runtime sequencing rejection** rather than a static
+format check -- it fires when the command stream is inconsistent as a
+*sequence* (a corrupted selector word, a partial step set, a
+misordered step), and stays silent for values that do not break
+sequencing (an out-of-range address is still a well-formed step). That
+also explains why it never fired on any `40 02` value and why a wholly
+absent step set runs.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

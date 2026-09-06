@@ -1827,3 +1827,116 @@ def test_resnet18d_50_03_operands_are_a_64_byte_aligned_tile_arena(tmp_path):
     deltas = [b - a for a, b in zip(ops, ops[1:])]
     assert max(deltas) < 802_816, "expected tile-sized deltas, not tensor-sized ones"
     assert min(o for o in ops if o) == 37_120
+
+
+def _flag_sequence_per_op(mcode):
+    """For each pair of consecutive `40 02` (Wbt-offset) writes, the
+    ordered tuple of `50 01` values written between them -- see the
+    README's "`50 01` is a per-op four-step sequence" section."""
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    hdrs = [
+        (i, w[2], w[3], int.from_bytes(words[i + 1], "little"))
+        for i, w in enumerate(words)
+        if w[:2] == b"\xa1\x00" and i + 1 < len(words)
+    ]
+    cuts = [i for i, xx, yy, _ in hdrs if (xx, yy) == (0x40, 0x02)]
+    flags = [(i, v) for i, xx, yy, v in hdrs if (xx, yy) == (0x50, 0x01)]
+    return [tuple(v for i, v in flags if a < i < b) for a, b in zip(cuts, cuts[1:])]
+
+
+def test_50_01_is_a_fixed_four_step_sequence_per_op_in_both_models(tmp_path):
+    """Confirmed real (see the README's "`50 01` is a per-op four-step
+    sequence" section), all local: every op writes `50 01` exactly four
+    times in the fixed order bit8, bit0, bit20, bit24 -- 180 of 180
+    inter-op segments in resnet18d, and the tiny two-Conv model's single
+    op writes the same four in the same order. Not an engine selector.
+    Needs Docker for the builds but no device.
+    """
+    order = (0x100, 0x1, 0x100000, 0x1000000)
+
+    tiny = _mcode_from_axmodel(
+        _build_axmodel(
+            os.path.join(str(tmp_path), "tiny"),
+            _two_conv_model(vary_first=True, dilation=2, pad=2),
+            (1, 4, 16, 16),
+        )
+    )
+    tiny_flags = [v for xx, yy, v in _header_fields(tiny) if (xx, yy) == (0x50, 0x01)]
+    assert tuple(tiny_flags) == order, tiny_flags
+
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    segments = _flag_sequence_per_op(r18)
+    assert len(segments) == 180, len(segments)
+    assert all(seg == order for seg in segments), (
+        sum(1 for seg in segments if seg != order),
+        "expected every op to write the same four-step sequence",
+    )
+
+
+def test_resnet18d_50_01_steps_three_required_one_optional_on_device(tmp_path):
+    """Confirmed real on the device (see the README's "The four `50 01`
+    steps on the device" section), on two independent ops: zeroing the
+    `bit8` step faults (`0x8030070C`), zeroing the `bit24` step leaves
+    the output bit-identical, swapping `bit8` and `bit0` leaves it
+    bit-identical, and zeroing all four runs with a changed output. Also
+    the concrete counter-example to "the validator never faults on an
+    operand value": these are operand values, and one of them faults.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    hdrs = [
+        (i, w[2], w[3], int.from_bytes(words[i + 1], "little"))
+        for i, w in enumerate(words)
+        if w[:2] == b"\xa1\x00" and i + 1 < len(words)
+    ]
+    cuts = [i for i, xx, yy, _ in hdrs if (xx, yy) == (0x40, 0x02)]
+    op_start = 8174  # the op whose 40 02 write sits at byte 32696
+    assert op_start in cuts
+    op_end = min(i for i in cuts if i > op_start)
+    steps = [
+        (i, v)
+        for i, xx, yy, v in hdrs
+        if (xx, yy) == (0x50, 0x01) and op_start < i < op_end
+    ]
+    assert [v for _, v in steps] == [0x100, 0x1, 0x100000, 0x1000000], steps
+
+    x = np.random.RandomState(42).randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    def run_variant(edits, tag):
+        patched = bytearray(mcode)
+        for word_index, value in edits:
+            patched[(word_index + 1) * 4 : (word_index + 2) * 4] = struct.pack(
+                "<I", value
+            )
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"steps_{tag}.axmodel")
+        onnx.save(c, p)
+        dev = _run_retry_once(p, x)
+        if dev.error:
+            assert "0x8030070C" in dev.error, (tag, dev.error)
+            return None
+        return np.frombuffer(dev.outputs[0], dtype=np.float32)
+
+    (w8, v8), (w0, v0), _, (w24, _) = steps
+    assert run_variant([(w8, 0)], "skip_bit8") is None, (
+        "expected skipping bit8 to fault"
+    )
+    out = run_variant([(w24, 0)], "skip_bit24")
+    assert out is not None and np.array_equal(out, out_base), (
+        "expected bit24 to be optional"
+    )
+    out = run_variant([(w8, v0), (w0, v8)], "swap_bit8_bit0")
+    assert out is not None and np.array_equal(out, out_base), (
+        "expected bit8/bit0 order-free"
+    )
+    out = run_variant([(w, 0) for w, _ in steps], "all_zero")
+    assert out is not None and not np.array_equal(out, out_base), (
+        "expected an absent step set to run with a changed result, not fault"
+    )
