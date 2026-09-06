@@ -797,6 +797,49 @@ def test_reconstruct_qwen3_5_vlm_end_to_end(tmp_path):
         onnx.checker.check_model(m)
 
 
+def test_reconstruct_qwen3_5_vlm_end_to_end_simplifies(tmp_path):
+    """Integration test: the full public entry point (config extraction
+    from a wrapped ``vlm_config`` + both graph builders + checkpoint
+    loading), then a real ``onnxsim.simplify()`` pass over each of its two
+    returned graphs -- the same "does it actually simplify" claim the
+    per-function tests below check in isolation, exercised here through
+    the whole pipeline a real caller would use rather than by calling
+    ``reconstruct_qwen3_5_language_model``/``reconstruct_qwen3_5_vision_encoder``
+    directly."""
+    text_hf_dir, text_config, text_weights, _ = _build_tiny_qwen3_5_text_checkpoint(
+        tmp_path
+    )
+    vision_hf_dir, vision_config, vision_weights, vision_meta = (
+        _build_tiny_qwen3_5_vision_checkpoint(tmp_path)
+    )
+
+    combined_dir = tmp_path / "combined_simplify"
+    combined_dir.mkdir()
+    combined_weights = {**text_weights, **vision_weights}
+    _write_safetensors(combined_dir / "model.safetensors", combined_weights)
+    with open(combined_dir / "config.json", "w") as f:
+        json.dump(
+            {
+                "vlm_config": {
+                    "text_config": text_config,
+                    "vision_config": vision_config,
+                }
+            },
+            f,
+        )
+
+    models = reconstruct_qwen3_5_vlm(
+        str(combined_dir), batch_size=1, seq_len=3, grid_thw=vision_meta["grid_thw"]
+    )
+
+    for name, model in models.items():
+        before = sum(1 for n in model.graph.node if n.op_type == "Transpose")
+        simplified, check_ok = onnxsim.simplify(model, check_n=1)
+        assert check_ok, f"{name} failed its post-simplify numerical check"
+        after = sum(1 for n in simplified.graph.node if n.op_type == "Transpose")
+        assert after < before, f"{name}'s weight Transposes should fold away"
+
+
 def test_qwen3_5_language_model_simplifies_and_folds_weight_transposes(tmp_path):
     """Same claim as gguf_reconstruct.py's own
     ``test_simplify_folds_weight_transposes``: ``_linear`` (reused from
