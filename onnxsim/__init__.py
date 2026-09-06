@@ -66,6 +66,7 @@ from onnxsim.gguf_legacy_quant import (
     quantize_dequantize_q4_0,
     quantize_dequantize_q4_1,
 )
+from onnxsim.gguf_q6_k import apply_gguf_q6_k_quantization, quantize_dequantize_q6_k
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -120,6 +121,7 @@ from onnxsim.onnx_simplifier import (
     apply_fp6_llm_quantization_cpp,
     apply_gguf_q4_0_quantization_cpp,
     apply_gguf_q4_1_quantization_cpp,
+    apply_gguf_q6_k_quantization_cpp,
     apply_gguf_ternary_quantization_cpp,
     apply_iq4_nl_quantization_cpp,
     apply_moe_expert_channel_pruning_cpp,
@@ -377,6 +379,9 @@ __all__ = [
     "apply_gear",
     "apply_gguf_q4_k_quantization",
     "quantize_dequantize_q4_k",
+    "apply_gguf_q6_k_quantization",
+    "apply_gguf_q6_k_quantization_cpp",
+    "quantize_dequantize_q6_k",
     "apply_gguf_q4_0_quantization",
     "apply_gguf_q4_0_quantization_cpp",
     "apply_gguf_q4_1_quantization",

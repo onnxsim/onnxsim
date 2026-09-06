@@ -1178,6 +1178,24 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // llama.cpp's Q6_K K-quant format: weight-only, one 8-bit sub-block
+  // scale (times a shared float16 super-block scale) per 16-element
+  // sub-block of a 256-element super-block. Data-free. See ApplyGgufQ6K
+  // in onnxsim.h.
+  m.def(
+      "apply_gguf_q6_k_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ6K(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
