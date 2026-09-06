@@ -1050,6 +1050,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "model_bytes"_a, "sparsity"_a = 0.5, "protect_token_ids"_a.none(),
       "input_name"_a.none());
 
+  // Any-Precision LLM (Park et al., 2024, ICML 2024): nested bit-plane
+  // weight-only quantization, one quantization pass serving any bit-width
+  // up to max_bits. See ApplyAnyPrecisionLlm in onnxsim.h.
+  m.def(
+      "apply_any_precision_llm",
+      [](const py::bytes& model_proto_bytes, int64_t bits, int64_t max_bits,
+         int64_t block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyAnyPrecisionLlm(model, bits, max_bits, block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "bits"_a = 4, "max_bits"_a = 8, "block_size"_a = 32);
+
   // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
   // round-to-nearest quantization of both the weight and the activation of
   // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in

@@ -9,6 +9,7 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/any_precision_llm.h"
 #include "passes/cross_layer_equalization.h"
 #include "passes/defuse_matmul_integer_to_float.h"
 #include "passes/double_quantization.h"
@@ -111,6 +112,7 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::AnyPrecisionLlm>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DoubleQuantization>(registry);

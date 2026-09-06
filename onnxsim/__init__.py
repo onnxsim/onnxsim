@@ -92,6 +92,7 @@ from onnxsim.norm_tweaking import apply_norm_tweaking
 from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
+    apply_any_precision_llm_cpp,
     apply_attention_head_pruning_cpp,
     apply_attention_head_wanda_pruning_cpp,
     apply_double_quantization_cpp,
@@ -252,6 +253,7 @@ __all__ = [
     "apply_quip_sharp",
     "apply_quarot",
     "apply_quarot_cpp",
+    "apply_any_precision_llm_cpp",
     "apply_duquant",
     "apply_easyquant",
     "apply_zeroquant",
