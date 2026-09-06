@@ -5,7 +5,17 @@ import re
 import shutil
 import sys
 import tempfile
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import onnx  # type: ignore
@@ -1758,12 +1768,18 @@ def apply_attention_head_pruning_cpp(
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant or unsupported-dtype weight, a packed-QKV
-            GroupQueryAttention node, a node with a non-empty constant
-            past-KV-cache or attention-mask input, an ai.onnx Attention node
-            with differing Q/K/V head sizes or without explicit
+            GroupQueryAttention node, an ai.onnx Attention node with
+            differing Q/K/V head sizes or without explicit
             ``q_num_heads``/``kv_num_heads`` attributes, a consumer whose
             reduction dimension doesn't line up, ...) is left completely
-            untouched
+            untouched. A non-empty constant past-KV-cache or attention-
+            mask/bias input no longer forces this on its own: every matched
+            family now validates such an input and either slices it in
+            place (a genuine per-head/per-KV-group constant), leaves it
+            untouched (a broadcast shape needing no slicing), or splices in
+            a new ``Gather`` node (a genuinely per-head *dynamic* mask/bias)
+            -- only a shape that doesn't statically resolve either way still
+            declines the whole match.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1793,15 +1809,25 @@ def apply_attention_head_wanda_pruning_cpp(
     machinery (see that function's own docstring for the general pattern),
     applied to attention-head pruning instead of plain structured pruning.
 
-    Same real head (or, for ``GroupQueryAttention``/plain ``ai.onnx::Attention``,
-    whole-KV-group) removal and topology matching as
-    :func:`onnxsim.apply_attention_head_pruning_cpp` (a matched
-    ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``, or
-    plain ``ai.onnx::Attention`` block whose output feeds, optionally through
-    a single shape-preserving ``Reshape``, exactly one downstream
-    MatMul/vanilla-Gemm's reduction dimension -- see that function's own
-    docstring for the full topology and per-block-kind removal details), but
-    each unit's importance is ``||W||_F * ||X||_2`` -- the plain
+    Same real head (or, for the separate-Q/K/V-producer and decomposed
+    families, whole-KV-group) removal and topology matching as
+    :func:`onnxsim.apply_attention_head_pruning_cpp` -- every one of that
+    function's families *except* the fused, block-quantized
+    ``com.microsoft::MatMulNBitsQkv`` variant (mirroring pruning.py's own
+    ``apply_attention_head_wanda_pruning``, which has no calibration-driven
+    counterpart of that quantized-weight case either): a matched
+    ``com.microsoft::Attention``/``DecoderMaskedSelfAttention``/
+    ``PackedAttention`` (single merged QKV weight); a matched
+    ``com.microsoft::GroupQueryAttention``, plain ``ai.onnx::Attention``
+    (opset 24+), ``MultiHeadAttention``, ``PackedMultiHeadAttention``,
+    ``DecoderMaskedMultiHeadAttention``, ``PagedAttention``,
+    ``LinearAttention``, or ``SparseAttention`` block (separate, un-merged
+    Q/K/V producers); or the fully decomposed ("eager SDPA export") shape --
+    each whose output feeds, optionally through a single shape-preserving
+    ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's reduction
+    dimension -- see that function's own docstring for the full topology and
+    per-block-kind removal details. Each unit's importance is
+    ``||W||_F * ||X||_2`` -- the plain
     Frobenius-norm weight score times the combined (root-sum-square)
     activation norm of that unit's own slice of the *output projection's*
     input, captured over calibration data -- instead of weight magnitude
@@ -2152,6 +2178,115 @@ def apply_wanda_pruning_cpp(
             m,
             epsilon,
             global_sparsity,
+        )
+    )
+
+
+def apply_imatrix_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    block_size: int = 32,
+    num_scale_candidates: int = 41,
+    scale_search_range: Tuple[float, float] = (0.4, 1.6),
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_imatrix_quantization`:
+    llama.cpp's "importance matrix" (imatrix) applied to this repository's
+    own plain block-wise INT4 weight quantizer -- see
+    ``onnxsim/imatrix_quant.py``'s own module docstring for the technique
+    (why mean-square activation is a sound per-channel importance proxy,
+    and why this is a weighted grid-search extension of the plain block
+    quantizer rather than a new GGUF block format).
+
+    Same real calibration machinery as :func:`onnxsim.apply_wanda_pruning_cpp`/
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp` -- a live
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyImatrixQuantization`` in ``imatrix_quant_entry.h`` for the full
+    scope, including why this calibration-driven pass follows
+    ``ApplyWandaPruning``'s own protobuf-level shape rather than
+    :func:`onnxsim.apply_quarot_cpp`'s data-free ``PredicateBasedPass`` one).
+
+    Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
+    FLOAT32 weight (``Conv`` is out of scope, matching the pure-Python
+    :func:`onnxsim.apply_imatrix_quantization`'s own scope decision -- see
+    that function's own docstring for why).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute the
+            importance matrix from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :param block_size: elements per weight quantization block along ``K``
+    :param num_scale_candidates: candidate scale factors evaluated per
+            block -- see :func:`onnxsim.quantize_dequantize_int4_imatrix`
+    :param scale_search_range: ``(low, high)`` multiplier range for the
+            candidate scale grid -- see
+            :func:`onnxsim.quantize_dequantize_int4_imatrix`
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible
+    :returns: ``model`` with every matched layer's weight replaced by its
+            importance-weighted INT4 round trip, stored under a new
+            initializer name (the original initializer is left in the
+            graph, unused). A layer with a non-constant/non-2-D weight, a
+            reduction dimension not divisible by ``block_size``, or whose
+            activation was never observed as a FLOAT32 tensor across the
+            calibration data, is left untouched.
+
+    **Accepted divergence from the pure-Python
+    :func:`onnxsim.apply_imatrix_quantization`.** Not required to be
+    bit-for-bit identical: the pure-Python reference upcasts every weight
+    and activation to float64 throughout, whereas this port reads/writes
+    FLOAT32 protobuf tensors and accumulates calibration statistics in
+    float64 internally only -- both are the exact same algorithm
+    (:func:`onnxsim.quantize_dequantize_int4_imatrix`'s own weighted grid
+    search, ported scalar-loop-for-scalar-loop, see
+    ``onnxsim/passes/imatrix_quant.h``), so results are expected to track
+    each other unusually closely, but a floating-point rounding difference
+    at a scale-search tie is possible and not treated as a bug -- the same
+    "two independently-correct, non-interchangeable entry points" contract
+    :func:`onnxsim.apply_quarot_cpp`/:func:`onnxsim.apply_iq4_nl_quantization_cpp`
+    already establish for this codebase's other ``*_cpp`` ports.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_wanda_pruning_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    scale_lo, scale_hi = scale_search_range
+    return onnx.load_from_string(
+        C.apply_imatrix_quantization(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            block_size,
+            num_scale_candidates,
+            scale_lo,
+            scale_hi,
+            list(skip_names) if skip_names is not None else [],
         )
     )
 
@@ -3015,6 +3150,39 @@ def apply_fp6_llm_quantization_cpp(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(C.apply_fp6_llm(model.SerializeToString()))
+
+
+def apply_gguf_q6_k_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q6_k_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's Q6_K K-quant format -- a
+    256-element super-block split into 16 sub-blocks of 16 elements, each
+    sharing one 8-bit scale code times a shared float16 super-block scale,
+    times a symmetric 6-bit element code. See
+    :func:`onnxsim.apply_gguf_q6_k_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q6_K quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q6_k_quantization(model.SerializeToString())
+    )
 
 
 def quantize_fp16(

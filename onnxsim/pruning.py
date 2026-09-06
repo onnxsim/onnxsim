@@ -8120,6 +8120,351 @@ def _match_grn_pass_through(
     return out_name, chain_ops, grn
 
 
+# CBAM (Woo et al. 2018, "Convolutional Block Attention Module")'s
+# `SpatialGate` stage -- a third Conv-chain pass-through hop, alongside
+# GroupNorm/InstanceNorm above, recognized only when a spine tensor forks
+# into *exactly three* direct consumers. Confirmed against the paper's own
+# canonical reference implementation (``github.com/Jongchan/attention-
+# module``'s ``model/cbam.py``) and empirically, via a real
+# ``torch.onnx.export`` (opset 17, both the legacy TorchScript-based and the
+# newer ``torch.export``-based/"dynamo" exporters agree on the shape) of a
+# ``Conv -> SpatialGate -> Conv`` module, checker-passed and
+# ``onnxruntime``-verified against the PyTorch reference: reading a spine
+# tensor `x` with `N` channels,
+#
+#     max_branch  = Unsqueeze(ReduceMax(x, axes=[1], keepdims=0), axes=[1])
+#     mean_branch = Unsqueeze(ReduceMean(x, axes=[1], keepdims=0), axes=[1])
+#     cat         = Concat([max_branch, mean_branch], axis=1)  # -> [N, 2, H, W]
+#     gate        = Sigmoid(Conv(cat, W, B?))  # in_channels=2, out_channels=1
+#     out         = Mul(x, gate)
+#
+# -- i.e. the reduction is emitted as ``keepdims=0`` followed by an explicit
+# ``Unsqueeze(axes=[1])`` restoring the size-1 channel axis, *not* a direct
+# ``keepdims=1`` reduction (both forms are recognized below regardless, since
+# a `keepdims=1` reduction needs no `Unsqueeze` at all and is trivially
+# safe), and the `Concat`'s own two inputs are ordered max-branch-first,
+# mean-branch-second -- matching the reference implementation's own
+# ``torch.cat([max, mean], dim=1)`` exactly, in both exporters -- never
+# guessed at; the opposite order is declined, not silently accepted. A plain
+# ``Sigmoid`` is what the reference implementation's default (``no_spatial=
+# False``) configuration emits, but ``HardSigmoid`` (a plausible activation
+# swap some exporters/quantization-aware variants make) is recognized
+# identically, since neither activation's own per-element math is ever
+# inspected here at all. Any ``BatchNormalization`` the internal spatial
+# ``Conv`` may carry (``BasicConv``'s own ``bn=True`` default) is expected
+# to already be fused into that ``Conv``'s own weight by the time this pass
+# runs -- the same assumption this module's own docstring already states for
+# every Conv-chain ``BatchNormalization`` -- so it is never itself matched as
+# a node in this shape; a real ``torch.onnx.export`` with constant-folding
+# disabled confirms the un-fused shape inserts exactly one
+# ``BatchNormalization`` node between that `Conv` and `Sigmoid`, consistent
+# with this.
+#
+# This hop is *simpler* to reason about than the GroupNorm hop above, not
+# merely a second instance of the same problem: ``ReduceMax``/``ReduceMean``
+# each reduce the spine's *entire* channel axis down to size 1 -- no
+# `num_groups`/block-uniformity bookkeeping is needed at all, since there is
+# only ever one "group" (the whole axis). The internal spatial `Conv`'s own
+# input-channel count is architecturally fixed at exactly 2 (`Concat` of two
+# single-channel reductions) *independent of the spine's own channel count
+# `n_channels`* -- so there is nothing on that `Conv`'s own weight to slice
+# on this hop's account at all (confirmed by requiring its weight's own
+# `dims[1] == 2` outright, regardless of `n_channels`), and its own
+# out-channels is fixed at exactly 1 (`dims[0] == 1`), the channel count the
+# closing `Mul` needs to broadcast a single-channel spatial gate back across
+# the spine's own `N` channels. So the entire ``ReduceMax``+``ReduceMean``+
+# ``Concat``+``Conv``+``Sigmoid``/``HardSigmoid`` subgraph, once matched,
+# contributes *nothing* to `chain_ops`/slicing bookkeeping -- it is a pure
+# "hop over, keep going" case, folded into `chain_ops` exactly like a
+# `Clip`/`Dropout` pass-through hop, with the closing `Mul` (whose other
+# operand, the spine `x`, is untouched by slicing -- only its *count* of
+# surviving channels changes, which the `Mul`'s own broadcast already
+# tolerates) becoming the walk's new `cur`. Gated behind
+# :func:`_walk_to_conv_consumer`'s own `recognize_spatial_gate` parameter,
+# scoped identically to `recognize_group_norm` above for the identical
+# reason: only :func:`_find_conv_chains` (the plain single-producer/single-
+# consumer topology both hops were scoped to first) passes it `True`.
+def _reduce_channel_axis_keepdims(
+    node: onnx.NodeProto, op_type: str, input_name: str
+) -> Optional[int]:
+    """If `node` is a plain (default-domain) `op_type` (``"ReduceMax"`` or
+    ``"ReduceMean"``) reading exactly `input_name`, with an ``axes``
+    *attribute* (opset <= 17's schema -- opset 18+ moves it to an optional
+    *input* instead, a form deliberately never recognized here, mirroring
+    `_reduce_mean_axis_is_last`'s own identical opset scoping and for the
+    same reason: not a shape confirmed live against a real export) naming
+    exactly the channel axis (``[1]`` literally -- unlike
+    `_reduce_mean_axis_is_last`'s own `_axis_resolves_to_last`, no negative-
+    axis/rank-resolution reasoning is attempted here, since `1` is the one
+    fixed, unambiguous "channel axis" index this whole module already keys
+    every Conv-chain hop off of), returns its own ``keepdims`` (``0`` or
+    ``1`` -- the only two schema-valid values). Declines (``None``) on
+    anything else: a missing/multi-entry/non-``[1]`` ``axes``, a
+    differently-shaped `node.input`, or a multi-output node.
+    """
+    if (
+        node.op_type != op_type
+        or node.domain != ""
+        or list(node.input) != [input_name]
+        or len(node.output) != 1
+        or not node.output[0]
+    ):
+        return None
+    axes_attr: Optional[List[int]] = None
+    keepdims = 1
+    for attr in node.attribute:
+        if attr.name == "axes":
+            axes_attr = list(attr.ints)
+        elif attr.name == "keepdims":
+            keepdims = attr.i
+    if axes_attr is None or list(axes_attr) != [1] or keepdims not in (0, 1):
+        return None
+    return keepdims
+
+
+def _match_spatial_gate_channel_unsqueeze(
+    node: onnx.NodeProto, input_name: str, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True iff `node` is a plain, single-output ``Unsqueeze`` reading
+    `input_name`, re-inserting exactly the channel axis (``[1]``) a
+    preceding ``keepdims=0`` `ReduceMax`/`ReduceMean` dropped -- from either
+    the opset>=13 constant second input or the opset<13 ``axes`` attribute,
+    mirroring :func:`_gap_squeeze_axes`'s own identical two-form handling for
+    ``Squeeze``. Declines (``False``) on a non-constant/wrongly-valued
+    `axes`, exactly like every other "statically-known-constant-only" bar in
+    this module.
+    """
+    if (
+        node.op_type != "Unsqueeze"
+        or node.domain != ""
+        or not node.input
+        or node.input[0] != input_name
+        or len(node.output) != 1
+        or not node.output[0]
+    ):
+        return False
+    if len(node.input) >= 2 and node.input[1]:
+        axes_init = initializer_map.get(node.input[1])
+        if axes_init is None or axes_init.data_type != onnx.TensorProto.INT64:
+            return False
+        vals = [
+            int(v) for v in onnx.numpy_helper.to_array(axes_init).reshape(-1).tolist()
+        ]
+        return vals == [1]
+    for attr in node.attribute:
+        if attr.name == "axes":
+            return list(attr.ints) == [1]
+    return False
+
+
+def _resolve_spatial_gate_reduce_branch(
+    reduce_node: onnx.NodeProto,
+    op_type: str,
+    input_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """Resolves one of `_match_spatial_gate_pass_through`'s own two reduction
+    branches (`reduce_node` already confirmed by the caller to be one of
+    `input_name`'s three direct consumers): if `reduce_node` reduces exactly
+    the channel axis (:func:`_reduce_channel_axis_keepdims`) with
+    ``keepdims=1``, returns ``((reduce_node,), reduce_node.output[0])``
+    directly -- the channel axis is already size-1, nothing more to walk.
+    Otherwise (``keepdims=0``), requires `reduce_node`'s own output to have
+    exactly one consumer, not be a graph output, and be a channel-axis-
+    reinserting ``Unsqueeze`` (:func:`_match_spatial_gate_channel_unsqueeze`),
+    returning ``((reduce_node, unsqueeze_node), unsqueeze_node.output[0])``.
+    Declines (``None``) on any deviation from either shape.
+    """
+    keepdims = _reduce_channel_axis_keepdims(reduce_node, op_type, input_name)
+    if keepdims is None:
+        return None
+    reduce_out = reduce_node.output[0]
+    if keepdims == 1:
+        return (reduce_node,), reduce_out
+    if reduce_out in graph_outputs or len(consumers_of.get(reduce_out, [])) != 1:
+        return None
+    unsqueeze_node = consumers_of[reduce_out][0]
+    if not _match_spatial_gate_channel_unsqueeze(
+        unsqueeze_node, reduce_out, initializer_map
+    ):
+        return None
+    return (reduce_node, unsqueeze_node), unsqueeze_node.output[0]
+
+
+def _match_spatial_gate_pass_through(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* three direct consumers) is the root
+    of CBAM's `SpatialGate` shape -- see this section's own comment above for
+    the full empirical/architectural finding -- returns ``(diamond_nodes,
+    final_out)``, the same shape :func:`_match_self_gated_activation`/
+    :func:`_match_gelu_tanh_pass_through` return: `diamond_nodes` is every
+    node the shape spans, in forward order (the `ReduceMax` branch's own
+    nodes, then the `ReduceMean` branch's, then `Concat`, the internal
+    spatial `Conv`, the closing activation, and finally the gating `Mul`
+    itself); `final_out` is that `Mul`'s own output, the tensor the caller
+    should continue walking from.
+
+    Declines (``None``) unless:
+
+    - `cur` has exactly three *distinct* direct consumers (a doubly-read
+      consumer here isn't any confirmed real shape, so declined rather than
+      reasoned about) -- exactly one a `Mul(cur, gate)` (domain ``""``, two
+      inputs, one output, its other operand distinct from `cur` itself), one
+      a `ReduceMax`, and one a `ReduceMean`.
+    - Each reduction branch resolves via
+      :func:`_resolve_spatial_gate_reduce_branch`, and both branches' own
+      final outputs feed the *same* `Concat` node (domain ``""``, ``axis=1``,
+      exactly two inputs ordered ``[max_branch, mean_branch]`` -- the
+      opposite order is a deviation from the confirmed exporter shape and is
+      declined, not guessed at) with no other consumer, not a graph output.
+    - That `Concat`'s own single consumer is a plain `Conv` (domain ``""``,
+      ``group`` absent or ``1``, a constant weight initializer shaped
+      ``[1, 2, kH, kW]`` -- both channel counts architecturally fixed,
+      independent of the spine's own channel count -- see this section's own
+      comment) with no other consumer, not a graph output.
+    - That `Conv`'s own single consumer is a plain `Sigmoid` or `HardSigmoid`
+      (domain ``""``, one input, one output) with no other consumer, not a
+      graph output, whose own output is *exactly* the gating `Mul`'s other
+      operand (`gate` above) -- confirming the activation really is this
+      `Mul`'s own second input, not some unrelated same-shaped node -- and
+      whose own single consumer is that same `Mul` node.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 3 or len({id(c) for c in consumers}) != 3:
+        return None
+
+    mul_node: Optional[onnx.NodeProto] = None
+    reduce_max_node: Optional[onnx.NodeProto] = None
+    reduce_mean_node: Optional[onnx.NodeProto] = None
+    for c in consumers:
+        if (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            if mul_node is not None:
+                return None
+            mul_node = c
+        elif c.op_type == "ReduceMax" and reduce_max_node is None:
+            reduce_max_node = c
+        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
+            reduce_mean_node = c
+        else:
+            return None  # a fourth role, or a duplicate of one already seen
+    if mul_node is None or reduce_max_node is None or reduce_mean_node is None:
+        return None
+
+    gate_name = mul_node.input[1] if mul_node.input[0] == cur else mul_node.input[0]
+    if gate_name == cur:
+        return None
+
+    max_branch = _resolve_spatial_gate_reduce_branch(
+        reduce_max_node, "ReduceMax", cur, consumers_of, initializer_map, graph_outputs
+    )
+    if max_branch is None:
+        return None
+    max_nodes, max_out = max_branch
+
+    mean_branch = _resolve_spatial_gate_reduce_branch(
+        reduce_mean_node,
+        "ReduceMean",
+        cur,
+        consumers_of,
+        initializer_map,
+        graph_outputs,
+    )
+    if mean_branch is None:
+        return None
+    mean_nodes, mean_out = mean_branch
+
+    if (
+        max_out in graph_outputs
+        or mean_out in graph_outputs
+        or len(consumers_of.get(max_out, [])) != 1
+        or len(consumers_of.get(mean_out, [])) != 1
+    ):
+        return None
+    concat_node = consumers_of[max_out][0]
+    if concat_node is not consumers_of[mean_out][0]:
+        return None  # the two branches must join at the *same* Concat
+    if (
+        concat_node.op_type != "Concat"
+        or concat_node.domain != ""
+        or list(concat_node.input) != [max_out, mean_out]
+        or len(concat_node.output) != 1
+        or not concat_node.output[0]
+    ):
+        return None
+    concat_axis = None
+    for attr in concat_node.attribute:
+        if attr.name == "axis":
+            concat_axis = attr.i
+    if concat_axis != 1:
+        return None
+    concat_out = concat_node.output[0]
+    if concat_out in graph_outputs or len(consumers_of.get(concat_out, [])) != 1:
+        return None
+
+    conv_node = consumers_of[concat_out][0]
+    if (
+        conv_node.op_type != "Conv"
+        or conv_node.domain != ""
+        or len(conv_node.input) not in (2, 3)
+        or conv_node.input[0] != concat_out
+        or len(conv_node.output) != 1
+        or not conv_node.output[0]
+    ):
+        return None
+    conv_group = 1
+    for attr in conv_node.attribute:
+        if attr.name == "group":
+            conv_group = attr.i
+    weight_init = initializer_map.get(conv_node.input[1])
+    if (
+        conv_group != 1
+        or weight_init is None
+        or len(weight_init.dims) != 4
+        or weight_init.dims[0] != 1
+        or weight_init.dims[1] != 2
+    ):
+        return None
+    conv_out = conv_node.output[0]
+    if conv_out in graph_outputs or len(consumers_of.get(conv_out, [])) != 1:
+        return None
+
+    activation_node = consumers_of[conv_out][0]
+    if (
+        activation_node.op_type not in ("Sigmoid", "HardSigmoid")
+        or activation_node.domain != ""
+        or list(activation_node.input) != [conv_out]
+        or len(activation_node.output) != 1
+        or not activation_node.output[0]
+        or activation_node.output[0] != gate_name
+    ):
+        return None
+    activation_out = activation_node.output[0]
+    if (
+        activation_out in graph_outputs
+        or len(consumers_of.get(activation_out, [])) != 1
+        or consumers_of[activation_out][0] is not mul_node
+    ):
+        return None
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = (
+        max_nodes + mean_nodes + (concat_node, conv_node, activation_node, mul_node)
+    )
+    return diamond_nodes, mul_node.output[0]
+
+
 def _match_resize_channel_pass_through(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> bool:
@@ -8498,6 +8843,7 @@ def _walk_to_conv_consumer(
     recognize_group_norm: bool = False,
     recognize_decomposed_group_norm: bool = False,
     recognize_grn: bool = False,
+    recognize_spatial_gate: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Tuple[
@@ -8646,6 +8992,26 @@ def _walk_to_conv_consumer(
     none of `group_norm`/`decomposed_group_norm_num_groups`/this hop has
     already matched earlier on this same walk.
 
+    `recognize_spatial_gate` is the analogous gate for the CBAM
+    ``SpatialGate`` shape -- see :func:`_match_spatial_gate_pass_through`
+    and this module's own "CBAM SpatialGate pass-through" section comment
+    -- scoped identically to `recognize_group_norm`/`recognize_grn` for the
+    identical reason (only :func:`_find_conv_chains` passes ``True``):
+    tried, like `recognize_grn`'s own shape, at whatever tensor `cur` is at
+    the top of each hop iteration below the moment it has exactly *three*
+    consumers. `SpatialGate`'s own required op-type set (`ReduceMax` +
+    `ReduceMean` + the closing `Mul`) and `recognize_grn`'s own (`ReduceL2`
+    + two others) are disjoint by construction, so at most one of the two
+    can ever actually match a given tensor's three consumers -- tried in a
+    fixed order (`SpatialGate` first, then GRN only if `SpatialGate` didn't
+    match at all), never masking the other. Unlike `group_norm`/
+    `decomposed_group_norm_num_groups`/`grn`, a `SpatialGate` match
+    contributes nothing to `chain_ops`/slicing bookkeeping at all (both the
+    internal spatial `Conv`'s own channel counts and the closing `Mul`'s
+    broadcast are independent of the spine's channel count), so it carries
+    no per-chain "at most one" restriction and needs no dedicated return
+    value here.
+
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- every ordinary
     caller leaves it ``None`` and gets identical behavior to before this
@@ -8781,10 +9147,36 @@ def _walk_to_conv_consumer(
                     continue
                 break  # five consumers but not this shape -- declined, as before
             if len(candidates) == 3:
-                # GRN's own root tensor `x` is read three times over -- see
-                # `recognize_grn`'s own docstring for the mutual-exclusion
+                # Two mutually-exclusive three-consumer shapes share this
+                # dispatch: CBAM `SpatialGate`'s own spine root (`ReduceMax`
+                # + `ReduceMean` + the closing `Mul` -- see this module's own
+                # "CBAM SpatialGate pass-through" section comment and
+                # :func:`_match_spatial_gate_pass_through`) and GRN's own
+                # root tensor `x` (`ReduceL2` + two others -- see
+                # `recognize_grn`'s own docstring for its mutual-exclusion
                 # gate against `group_norm`/`decomposed_group_norm_num_groups`
-                # above and against itself past the first match.
+                # above and against itself past the first match). The two
+                # matchers' own required op-type sets are disjoint by
+                # construction (one requires a `ReduceMax`/`ReduceMean` pair
+                # and no `ReduceL2`; the other requires a `ReduceL2` and no
+                # `ReduceMax`/`ReduceMean`), so at most one can ever actually
+                # match a given tensor's three consumers -- trying
+                # `SpatialGate` first, then GRN only if `SpatialGate` didn't
+                # match at all, is always safe and never masks the other.
+                if recognize_spatial_gate:
+                    sg_diamond = _match_spatial_gate_pass_through(
+                        cur, consumers_of, initializer_map, graph_outputs
+                    )
+                    if sg_diamond is not None:
+                        diamond_nodes, diamond_out = sg_diamond
+                        if (
+                            len(consumers_of.get(diamond_out, [])) != 1
+                            or diamond_out in graph_outputs
+                        ):
+                            break
+                        chain_ops.extend((n, None) for n in diamond_nodes)
+                        cur = diamond_out
+                        continue
                 if (
                     recognize_grn
                     and group_norm is None
@@ -8800,7 +9192,7 @@ def _walk_to_conv_consumer(
                         grn = grn_hop
                         cur = grn_out
                         continue
-                break  # three consumers but not this shape -- declined, as before
+                break  # three consumers but not either shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -9075,13 +9467,18 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # per `node.input` occurrence, and that shape's own squaring `Mul`
         # reads its root twice over, so its four distinct direct consumers
         # surface as five entries there, not four).
+        # Also admit exactly three -- two mutually-exclusive shapes share
+        # this count: CBAM `SpatialGate`'s own spine root (`ReduceMax`,
+        # `ReduceMean`, and the closing `Mul`, each reading the root exactly
+        # once -- see this module's own "CBAM SpatialGate pass-through"
+        # section comment) and GRN's own root tensor `x` (read three times
+        # over -- by `ReduceL2`, by the `x * x_n` `Mul`, and by the final
+        # residual `Add` -- see :func:`_match_grn_pass_through` and this
+        # module's own "Global Response Normalization (GRN) pass-through"
+        # section comment).
         # :func:`_walk_to_conv_consumer` decides, at its own first hop,
-        # whether those consumers actually form either shape.
-        # Also admit exactly three (GRN's own root tensor `x`, read three
-        # times over -- by `ReduceL2`, by the `x * x_n` `Mul`, and by the
-        # final residual `Add` -- see :func:`_match_grn_pass_through` and
-        # this module's own "Global Response Normalization (GRN)
-        # pass-through" section comment).
+        # whether those consumers actually form any of the shapes admitted
+        # here.
         if out_name in graph_outputs or len(consumers_of.get(out_name, [])) not in (
             1,
             2,
@@ -9109,6 +9506,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_group_norm=True,
             recognize_decomposed_group_norm=True,
             recognize_grn=True,
+            recognize_spatial_gate=True,
             recognize_gap_flatten_matmul_consumer=True,
             producers_of=producers_of,
         )

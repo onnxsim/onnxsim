@@ -26,10 +26,18 @@ the plain ``ai.onnx::Attention`` op, ``com.microsoft::MultiHeadAttention``,
 Wanda port has no quantized-weight counterpart, mirroring the pure-Python
 ``onnxsim.apply_attention_head_wanda_pruning`` exactly (see
 ``structured_pruning_entry.h``'s own ``ApplyAttentionHeadWandaPruning``
-declaration comment). See ``test_attention_head_pruning_cpp.py``'s own
-docstring for this port's shared narrower-than-pruning.py scope decisions
-across the six newer fused-op families (no dynamic-attention-bias-Gather-
-insertion machinery). For the decomposed-GQA family, this port's
+declaration comment). Every family's own optional per-head bias/mask/
+past-KV/head_sink/norm/scale input -- ``attention_bias``/``attn_mask``,
+``past_key``/``past_value``, ``k_scale``/``v_scale``, ``head_sink``,
+``q_norm_weight``/``k_norm_weight`` -- shares the identical
+``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias``/
+``PastKvConstantsAreSliceable`` validate-and-slice machinery
+``ApplyAttentionHeadPruning`` itself uses (``ApplyOneGqaChain``/
+``ApplyOnePlainAttentionChain`` are shared verbatim between the two entry
+points, just with a real calibrated ``act_norm`` map threaded through here
+instead of ``nullptr``) -- see ``test_attention_head_pruning_cpp.py``'s own
+docstring for the exact per-family scope. For the decomposed-GQA family, this
+port's
 ``ApplyAttentionHeadWandaPruning`` shares ``FindDecomposedGqaChains``/
 ``ApplyOneDecomposedGqaChain`` entirely with ``ApplyAttentionHeadPruning``
 (both dispatch through the identical matcher/rewriter, just with a real
@@ -112,6 +120,8 @@ def _attention_model(
     bqkv=None,
     wout=None,
     num_heads=None,
+    attention_bias=None,  # constant/declared-shape attention_bias array, or None
+    attention_bias_dynamic=False,  # declare AttentionBias as a graph INPUT instead
 ):
     rng = np.random.default_rng(seed)
     Nq = Nk = Nv = H * D
@@ -124,10 +134,29 @@ def _attention_model(
     heads = H if num_heads is None else num_heads
 
     initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
-    qkv_inputs = "X, Wqkv"
+    extra_inputs = ""
+    operands = ["X", "Wqkv"]
     if bias:
         initializer.append(_f32(bqkv, "Bqkv"))
-        qkv_inputs = "X, Wqkv, Bqkv"
+        operands.append("Bqkv")
+    else:
+        operands.append("")
+
+    # `attention_bias` (index 5) sits behind `mask_index` (3) and `past` (4),
+    # both always left unconnected here -- threaded through as empty
+    # positional placeholders to reach index 5.
+    if attention_bias is not None:
+        operands += ["", ""]
+        if attention_bias_dynamic:
+            shape_str = ",".join(str(d) for d in np.asarray(attention_bias).shape)
+            extra_inputs += f", float[{shape_str}] AttentionBias"
+        else:
+            initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands.append("AttentionBias")
+
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
 
     if with_reshape:
         shape = np.array([batch, seq, Nv], dtype=np.int64)
@@ -137,7 +166,7 @@ def _attention_model(
         tail = "Y = MatMul(ctx, Wout)"
 
     body = f"""
-        g (float[batch,seq,{K}] X) => (float[batch,seq,{Out}] Y)
+        g (float[batch,seq,{K}] X{extra_inputs}) => (float[batch,seq,{Out}] Y)
         {{
           ctx = com.microsoft.Attention <num_heads={heads}, qkv_hidden_sizes=[{Nq},{Nk},{Nv}]> ({qkv_inputs})
           {tail}
@@ -316,6 +345,65 @@ def test_cpp_attention_head_wanda_pruning_empty_calibration_data_matches_plain()
     )
     plain = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
     assert wanda_empty.SerializeToString() == plain.SerializeToString()
+
+
+# The plain com.microsoft::Attention family's own optional `attention_bias`
+# input (index 5) now reuses the exact same HeadBiasInputIsSafe/
+# SliceOrGatherHeadBias machinery whether reached from the plain
+# (`apply_attention_head_pruning_cpp`, see
+# ``test_attention_head_pruning_cpp.py``'s own dedicated coverage) or this
+# Wanda-calibrated entry point -- both dispatch through the identical
+# ApplyOnePlainAttentionChain, just with a real calibrated `act_norm` map
+# threaded through here instead of `nullptr`.
+def test_cpp_attention_head_wanda_pruning_per_head_attention_bias_matches_python_reference():
+    H, D, seq = 4, 4, 5
+    bias = (
+        np.random.default_rng(124).standard_normal((1, H, seq, seq)).astype(np.float32)
+    )
+    model, cfg = _attention_model(K=8, H=H, D=D, Out=6, seed=124, attention_bias=bias)
+    rng_cal = np.random.default_rng(125)
+    x_cal = rng_cal.standard_normal((2, seq, cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+
+def test_cpp_attention_head_wanda_pruning_dynamic_attention_bias_gather_matches_python_reference():
+    H, D, seq = 4, 4, 5
+    model, cfg = _attention_model(
+        K=8,
+        H=H,
+        D=D,
+        Out=6,
+        seed=126,
+        attention_bias=np.zeros((1, H, seq, seq), dtype=np.float32),
+        attention_bias_dynamic=True,
+    )
+    rng_cal = np.random.default_rng(127)
+    x_cal = rng_cal.standard_normal((2, seq, cfg["K"])).astype(np.float32)
+    attn_bias_cal = rng_cal.standard_normal((1, H, seq, seq)).astype(np.float32)
+    calibration_data = [{"X": x_cal, "AttentionBias": attn_bias_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    gather_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    assert gather_nodes[0].input[0] == "AttentionBias"
 
 
 # --- com.microsoft::GroupQueryAttention (separate Q/K/V producers) ---------
@@ -1458,6 +1546,7 @@ def _sparse_attention_model(
     wk=None,
     wv=None,
     wout=None,
+    past_kv="dynamic",  # "dynamic" (graph input only) | "nonempty" (constant, sliced)
 ):
     rng = np.random.default_rng(seed)
     Nq, Nkv = H * D, KVH * D
@@ -1482,10 +1571,20 @@ def _sparse_attention_model(
             np.full((batch,), seq, dtype=np.int32), "KeyTotalSeq"
         )
     )
-    extra_inputs = (
-        f", float[{batch},{KVH},{seq},{D}] PastKey"
-        f", float[{batch},{KVH},{seq},{D}] PastValue"
-    )
+    extra_inputs = ""
+    past_key = past_value = None
+    if past_kv == "nonempty":
+        past_key = rng.standard_normal((batch, KVH, seq, D)).astype(np.float32) * 0.1
+        past_value = rng.standard_normal((batch, KVH, seq, D)).astype(np.float32) * 0.1
+        initializer += [
+            onnx.numpy_helper.from_array(past_key, "PastKey"),
+            onnx.numpy_helper.from_array(past_value, "PastValue"),
+        ]
+    else:
+        extra_inputs = (
+            f", float[{batch},{KVH},{seq},{D}] PastKey"
+            f", float[{batch},{KVH},{seq},{D}] PastValue"
+        )
     body = f"""
         g (float[{batch},{seq},{K}] X{extra_inputs}) => (float[{batch},{seq},{Out}] Y)
         {{
@@ -1520,6 +1619,8 @@ def _sparse_attention_model(
         wout=wout,
         batch=batch,
         seq=seq,
+        past_key=past_key,
+        past_value=past_value,
     )
 
 
@@ -1559,6 +1660,45 @@ def test_cpp_sparse_attention_wanda_pruning_empty_calibration_data_matches_pytho
     assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
     plain = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
     assert pruned_cpp.SerializeToString() == plain.SerializeToString()
+
+
+def test_cpp_sparse_attention_wanda_pruning_nonempty_past_kv_constant_is_sliced_matches_python():
+    # `SparseAttention`'s own required `past_key`/`past_value` now go through
+    # the exact same `PastKvConstantsAreSliceable`/`SliceKvCacheAxis1`
+    # validate-and-slice machinery whether reached from the plain
+    # (`apply_attention_head_pruning_cpp`, see
+    # ``test_attention_head_pruning_cpp.py``'s own dedicated coverage) or this
+    # Wanda-calibrated entry point -- both dispatch through the identical
+    # `MatchSparseAttentionProducer`/`ApplyOneGqaChain`. `calibration_data=[]`
+    # (see this file's sibling test above for why a REAL calibration run can
+    # never succeed for this op) still exercises this fix end to end through
+    # this entry point's own separate graph/used_names/value_info_by_name
+    # plumbing.
+    model, cfg = _sparse_attention_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=251, past_kv="nonempty"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+
+    node = _sparse_attention_node(pruned_cpp)
+    _, kv_num_heads = _sparse_attention_attrs(node)
+    assert kv_num_heads == 1
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert list(inits["PastKey"].shape) == [
+        cfg["batch"],
+        kv_num_heads,
+        cfg["seq"],
+        cfg["D"],
+    ]
 
 
 # --- Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning --------

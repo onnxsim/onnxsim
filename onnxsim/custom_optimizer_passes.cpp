@@ -46,7 +46,9 @@
 #include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/fuse_split_gather_concat.h"
 #include "passes/gguf_legacy_quant.h"
+#include "passes/gguf_q6_k.h"
 #include "passes/gguf_ternary_quant.h"
 #include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
@@ -65,9 +67,11 @@
 #include "passes/quarot.h"
 #include "passes/rewrite_arg_reduce_select_last_index.h"
 #include "passes/rewrite_bool_where.h"
+#include "passes/rewrite_gather_over_concat.h"
 #include "passes/rewrite_gatherelements_to_gather.h"
 #include "passes/rewrite_gathernd_to_gather.h"
 #include "passes/rewrite_gridsample_to_gather.h"
+#include "passes/split_large_gather.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -145,8 +149,10 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
     RegisterOrReplace<p::GgufQ4_0>(registry);
     RegisterOrReplace<p::GgufQ4_1>(registry);
+    RegisterOrReplace<p::GgufQ6K>(registry);
     RegisterOrReplace<p::GgufTernaryQuant>(registry);
     RegisterOrReplace<p::IQ4NL>(registry);
     RegisterOrReplace<p::MagnitudePruningAttention>(registry);
@@ -170,7 +176,9 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::RewriteBoolWhere>(registry);
     RegisterOrReplace<p::RewriteGatherElementsToGather>(registry);
     RegisterOrReplace<p::RewriteGatherNDToGather>(registry);
+    RegisterOrReplace<p::RewriteGatherOverConcat>(registry);
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
+    RegisterOrReplace<p::SplitLargeGather>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);
