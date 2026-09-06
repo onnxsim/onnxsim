@@ -1482,3 +1482,100 @@ def test_resnet18d_template_has_a_gate_a_dead_nibble_and_a_checked_msb(tmp_path)
     # The MSB of X+3 is the one single-bit flip that faults.
     assert run([(32703, 0x80)], "32703_b7") is None
     assert run([(32703, 0x01)], "32703_b0") is not None
+
+
+def test_resnet18d_output_changing_bytes_are_mostly_input_independent(tmp_path):
+    """Confirmed real (see the README's "What the output-changing bytes
+    are" section): running the same flipped real-resnet18d model against
+    different inputs discriminates control-like bytes from data-like
+    ones. Offsets 9900 and 48300 are control-like: the flip lands the
+    classifier on the same wrong class (567 and 834) with a near-identical
+    delta regardless of input. Offset 43500 is data-like: the shifted
+    class moves with the input and the delta stays small. 8 of the 9
+    output-changing offsets behaved like the former.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    inputs = {
+        seed: np.random.RandomState(seed).randint(
+            0, 256, size=(1, 224, 224, 3), dtype=np.uint8
+        )
+        for seed in (42, 7)
+    }
+    base = {}
+    for seed, x in inputs.items():
+        dev = _run_retry_once(path, x)
+        assert not dev.error, (seed, dev.error)
+        base[seed] = np.frombuffer(dev.outputs[0], dtype=np.float32)
+
+    def flipped_argmax(offset, seed):
+        patched = bytearray(mcode)
+        patched[offset] ^= 0xFF
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"flip_{offset}.axmodel")
+        onnx.save(c, p)
+        dev = _run_retry_once(p, inputs[seed])
+        assert not dev.error, (offset, seed, dev.error)
+        out = np.frombuffer(dev.outputs[0], dtype=np.float32)
+        assert not np.array_equal(out, base[seed]), (offset, seed)
+        return int(out.argmax())
+
+    for offset, wrong_class in ((9900, 567), (48300, 834)):
+        assert flipped_argmax(offset, 42) == flipped_argmax(offset, 7) == wrong_class, (
+            offset,
+            "expected a control-like byte to shift to the same class on every input",
+        )
+
+    assert flipped_argmax(43500, 42) != flipped_argmax(43500, 7), (
+        "expected the data-like byte's shifted class to move with the input"
+    )
+
+
+def test_resnet18d_data_like_byte_sits_in_a_gated_template_and_is_sign_like(tmp_path):
+    """Confirmed real (see the README's "The one data-like byte, probed"
+    section): the data-like byte 43500 sits in a third template that
+    shares the recurring gate structure -- flipping X-4 (43496) and X-1
+    (43499) yields the bit-identical output. Its own per-bit behavior is
+    only partly bit-weighted (bit 7 moves the class, bits 0-3 do not),
+    and it shows the signature of a small *signed* value: flipping all 8
+    bits changes the output less than flipping bit 7 alone. Every bit is
+    live.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    x = np.random.RandomState(42).randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    def flip(offset, mask):
+        patched = bytearray(mcode)
+        patched[offset] ^= mask
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"flip_{offset}_{mask:02x}.axmodel")
+        onnx.save(c, p)
+        dev = _run_retry_once(p, x)
+        assert not dev.error, (offset, mask, dev.error)
+        return np.frombuffer(dev.outputs[0], dtype=np.float32)
+
+    # The gate: X-4 and X-1 are interchangeable, and neither is the baseline.
+    gate_a, gate_b = flip(43496, 0xFF), flip(43499, 0xFF)
+    assert not np.array_equal(gate_a, out_base)
+    assert np.array_equal(gate_a, gate_b), "expected X-4 and X-1 to trip one state"
+
+    # Every bit of 43500 is live; bit 7 moves the class, bit 0 does not.
+    outs = {bit: flip(43500, 1 << bit) for bit in range(8)}
+    for bit, out in outs.items():
+        assert not np.array_equal(out, out_base), (bit, "expected every bit to be live")
+    assert outs[7].argmax() != out_base.argmax()
+    assert outs[0].argmax() == out_base.argmax()
+
+    # Sign-like: flipping all 8 bits perturbs less than flipping bit 7 alone.
+    all_bits = flip(43500, 0xFF)
+    assert np.max(np.abs(all_bits - out_base)) < np.max(np.abs(outs[7] - out_base))

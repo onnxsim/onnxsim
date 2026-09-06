@@ -1906,6 +1906,93 @@ transient recovers -- and it never masks anything, since no other error
 is retried. Worth knowing for anyone running large fault-injection
 sweeps on this hardware.
 
+### What the output-changing bytes *are*: 8 of 9 are control-like, 1 is data-like
+
+The 22% "runs, but changes the output" class above says a byte is live
+and computational, but not what *kind* of byte it is. A cheap
+discriminator: run the same flipped model against **different inputs**.
+A corrupted *weight or data* value interacts with the input, so its
+effect should vary with the input; a corrupted *control* value (an
+address, offset, index, or fixed constant) redirects the computation the
+same way regardless of what flows through it. Each of the 9
+output-changing flips against three independent random `uint8` inputs
+(seeds 42, 7, 123; all three baselines classify as 305):
+
+```
+offset   seed42          seed7           seed123         shifted class
+ 6300    305  0.18       305  0.18       305  0.14       same
+ 9900    567  3.81       567  3.81       567  3.81       same
+20700    143  0.50       143  0.50       143  0.50       same
+24300    111  0.97       111  1.04       111  1.01       same
+32700    908  4.45       908  4.42       908  4.42       same
+36300    533  5.75       533  5.85       533  5.82       same
+43500    305  0.29        65  0.32        60  0.29       DIFFERS
+44700    318  1.47       318  1.47       318  1.51       same
+48300    834  7.29       834  7.29       834  7.33       same
+         (argmax, max-abs logit delta vs. that input's own baseline)
+```
+
+**Eight of the nine are input-independent**: the same flip lands the
+classifier on the same wrong class with a near-identical delta on every
+input -- 9900 goes to 567 at 3.81 all three times, 48300 to 834 at
+7.29/7.29/7.33. That is control-like behavior, and it lines up with the
+template map above: 32700 and 48300 are the template whose live run
+reads as address-like bytes, and a wrong address fetches the same wrong
+data no matter the input. **Exactly one, 43500, is input-dependent** --
+the shifted class moves with the input (305, 65, 60) and the delta stays
+small (~0.3): the signature of a corrupted weight/data value whose effect
+is modulated by what it multiplies. So the "changes the output" class is
+itself ~8:1 control-like to data-like at this sampling, which is also a
+useful hint about mcode's overall composition: it is dominated by
+control/addressing, with real numeric data mostly living elsewhere (Wbt)
+-- exactly what the `AxQuantizedConv` weight-in-Wbt / commands-in-mcode
+split found much earlier would predict.
+
+### The one data-like byte, probed: the gate recurs in a third template, and the prediction is only half right
+
+The control-vs-data reading above makes a falsifiable prediction: a
+data-like byte should be *bit-weighted* (its high bits should matter
+more than its low bits), unlike the control bytes at 9900/32700 whose
+every bit produced a large, unordered effect. Probing 43500 the same
+two ways:
+
+```
+window:  F===D=FDDDFFF=FF=      (43492..43508; control template was FF==D=FDDDDDF=FF=)
+  43496 (X-4): D 2.442 / argmax 116
+  43499 (X-1): D 2.442 / argmax 116      <- bit-identical output to X-4
+  43500 (X):   D 0.287 / argmax 305
+  43501 (X+1): D 1.149 / argmax 106
+
+per-bit at 43500:
+  bit0 0.323  bit1 0.395  bit2 0.287  bit3 0.359     (argmax stays 305)
+  bit4 0.682  bit5 1.149  bit7 1.508                 (argmax -> 741, 741, 106)
+  bit6 0.323                                         (argmax 305; == bit0 exactly)
+```
+
+**The gate is now seen in a third template.** The window shares the
+control template's skeleton -- an isolated live byte at `X-4`, the run
+starting at `X-1` -- and `X-4` and `X-1` again yield the bit-identical
+output. That makes the "any disturbance trips one fixed state"
+`X-4`/`X-1` structure a recurring feature of these command templates
+(three templates, ~10 independent measurements), not a quirk of one.
+The live run here is 3 bytes (`X-1..X+1`) rather than 5, so this is a
+related variant, not the same template.
+
+**The bit-weighting prediction is half right, and reported as such.**
+High bits dominate: bits 4, 5, and 7 produce the largest deltas and are
+the only ones that move the predicted class, while bits 0-3 perturb the
+logits without changing the class. That is more ordered than the control
+bytes ever were. But it is not a clean weighting: bit 6 is small (0.323,
+exactly equal to bit 0 -- the output's int8 grid again), so a strict
+"delta grows with bit index" test fails. One further observation does
+fit a *signed* numeric value specifically: flipping all 8 bits at once
+changes the output *less* (0.287) than flipping bit 7 alone (1.508).
+XOR-ing every bit of a small two's-complement value is approximately a
+negation and lands near zero, whereas flipping only the top bit moves it
+by half the range -- so this is exactly the ordering a small signed byte
+would show. Consistent with a signed quantized parameter, not a
+decoding of one.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
