@@ -2804,6 +2804,85 @@ instruction forms with their own widths, and it is the next thing to
 validate with the permutation method -- the width-rule test above is
 exactly the template for it.
 
+### Fourth correction: seventeen tags, the trailing byte is the register, and `23 00` was a prefix byte
+
+Running that validation changed three earlier readings. All numbers are
+block B of the cached `resnet18d` and `mnasnet_small` builds plus the
+tiny two-conv model, against a shuffled copy of the same block.
+
+**The tag set is not 0x81..0x84.** Admitting any tag byte in
+0x81..0x9f (everything below the verb bytes 0xa1..0xa9) at offset
+`p + 2` lifts block B from 42.6% to **82.7%** explained in `resnet18d`
+while the null only moves from 10.7% to 23.3%. Per tag, the ratio over
+the null splits cleanly: 0x81..0x86, 0x89..0x8d, 0x94, 0x95, 0x9b..0x9d
+and 0x9f are 2x..9x above it in both models (0x9b 8.6x, 0x9d 6.0x, 0x95
+5.9x, 0x8b 4.8x, 0x9c 4.8x, 0x9f 3.6x in `resnet18d`, n = 416 for
+0x9f), while 0x90, 0x91, 0x96..0x99 sit *at or below* it (0.1x..0.5x)
+and 0x87, 0x88, 0x8e, 0x8f, 0x92, 0x93, 0x9a, 0x9e reach 2x in one
+model only. With that data-driven set of **17 tags** and `p <= 4`,
+block B is **76.1%** explained in `resnet18d` (null 19.5%, 3.9x),
+**81.8%** in `mnasnet` (null 22.7%, 3.6x) and 75.7% in the tiny model
+(null 26.5%); the residue falls from 11,134 to **4,636** bytes and from
+16,990 to **8,146** bytes. The `tag = 0x84 - p` pairing the third
+correction reported is the *dominant* pairing, not a rule: 0x84 takes
+`p = 0` in 539 of 601 units, but 0x81 takes `p = 3` in only 48 of 282
+`resnet18d` units (1,261 of 1,748 in `mnasnet`). The tag does not
+encode the width; `p` does.
+
+**The trailing byte is the register, and the payload is the value.**
+The byte after the tag is even in **2,909 of 2,911** `resnet18d` units,
+6,248 of 6,253 `mnasnet` units and 258 of 258 tiny-model units (99.9%),
+against a 64% background; the first payload byte is even at exactly the
+background rate (59.6%, 63.4%, 77.1% vs 64.5%, 63.8%, 71.7%). Only a
+2-byte-granular offset looks like that. So the short unit reads
+`[p][p+1-byte value][tag][register]`, not `[p][field][tag][value]` as
+the layout section had it -- the verb form `a1 00 xx yy <32-bit>`
+addresses at 16-byte granularity through `xx`, the short form at 2-byte
+granularity through its last byte. The test helper's tuple still
+returns the first payload byte in the slot it always did; only the name
+changed.
+
+**`23 00` is a prefix byte, not a header.** With the wide tag set,
+1-byte residue runs are the largest class (381 of 1,178 runs in
+`resnet18d`), and they sit *immediately before an ordinary unit*: `23`
+precedes a `p = 0` unit 139 times, `03` 102 times (plus 13 before a
+`p = 1` unit), `3c` 21 times; `mnasnet` uses `04` (104), `2d` (50),
+`03` (46), `05` (43), `1c` (42). The `23 00 ...` pairs the previous
+section counted are `23` followed by the `00` that opens a `p = 0`
+unit. That is a one-byte prefix with model-specific values on ordinary
+units -- what it modifies is open -- and not a second header family.
+The tiny model's four non-deterministic bytes are inside one such
+prefixed unit.
+
+**What does not validate.** A payload-less `[tag][even byte]` pair
+(the natural `p = -1`) would push `resnet18d` to 89.5% explained, but
+the null rises to 40.8% with it (ratio 2.2 from 3.9) and per tag it is
+at or below chance -- 0x84 pairs 59 real vs 266 shuffled, 0x9f 207 vs
+315, 0x81 126 vs 226; only 0x87 (112 vs 76; 183 vs 105) and 0x88 (154
+vs 101; 137 vs 86) exceed it, at ~1.5x. Not admitted. A 2-byte `e1 XX`
+pair (odd `XX`) is 21 vs 13 in `resnet18d` and 86 vs 31 in `mnasnet`
+-- a candidate, not a form. No tag byte has a fixed argument length
+(for every tag with n > 100 the modal distance to the next tag byte
+holds < 50% of cases), so the 0x85..0x9f family are tags in the same
+width rule, not opcodes of their own.
+
+**Both configuration blocks open with the same 158 bytes.** Block A
+and block B of `resnet18d` and of `mnasnet` all begin with the same
+158-byte prologue (four-way identical); the tiny model has the same
+prologue with one operand changed -- the `a1 00 60 02` write at +16
+carries `0x31480` (201,856) in both 224x224 models and `0xd80` (3,456)
+for the 1x4x16x16 input -- and its shorter blocks (608 and 2,231 bytes)
+lack the region that follows. The first per-model bytes after the
+prologue are `p = 2` units on tag 0x81/0x82 whose payloads are
+`09 bf 01` vs `09 c3 01` and `09 80 03` vs `09 3c 05` with `09 00 07`
+shared: 16-bit parts 447 vs 451, 896 vs 1,340, 1,792, the first model
+quantities in the block and unmatched to any count tracked here
+(op count, block sizes, token counts).
+
+Test: `test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register`
+in `tests/test_axera_mcode_structure.py` (fresh `resnet18d` build,
+fixed-seed null, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

@@ -2457,15 +2457,26 @@ def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
         assert all(r <= 1.8 for k, r in ratios.items() if k != peak), (prefix, ratios)
 
 
-def _tokenize_mcode(mcode, start=297):
+_WIDE_TAGS = frozenset(
+    {0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x89, 0x8A, 0x8B, 0x8C, 0x8D}
+    | {0x94, 0x95, 0x9B, 0x9C, 0x9D, 0x9F}
+)
+"""The 17 short-unit tag bytes that beat a shuffled null by >= 2x in both
+real models -- see the README's "Fourth correction" section."""
+
+
+def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
-    verb instructions and the width-rule short units `[p][p+1 bytes][0x84-p]
-    [value]` (p+4 bytes) -- stepping one unknown byte otherwise. Returns
+    verb instructions and the width-rule short units `[p][p+1 bytes][tag]
+    [register]` (p+4 bytes) -- stepping one unknown byte otherwise. Returns
     `(byte_offset, kind, a, b, c)` tuples: kind 'V' (a=verb, b=xx, c=yy),
-    'S' (a=prefix, b=tag, c=field) or '?' (a=byte). See the README's "The
-    layout that explains all of it" section."""
-    tags = set(range(0x81, 0x85))
-    end = len(mcode) - 252
+    'S' (a=prefix, b=tag, c=first payload byte) or '?' (a=byte). The
+    defaults (tags 0x81..0x84, p <= 3, stop 252 bytes before the end) are
+    the original narrow rule; `tags=_WIDE_TAGS, pmax=4` is the corrected
+    one. See the README's "The layout that explains all of it" and "Fourth
+    correction" sections."""
+    tags = set(range(0x81, 0x85)) if tags is None else set(tags)
+    end = len(mcode) - 252 if end is None else end
 
     def is_verb(i):
         return (
@@ -2476,10 +2487,12 @@ def _tokenize_mcode(mcode, start=297):
         )
 
     def short_len(i):
+        if i >= len(mcode):
+            return 0
         p = mcode[i]
         return (
             p + 4
-            if (p <= 3 and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags)
+            if (p <= pmax and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags)
             else 0
         )
 
@@ -2593,3 +2606,64 @@ def test_resnet18d_config_block_b_residue_is_structured_and_headed(tmp_path):
     assert top_pair[1] == 0 and top_pair[0] in {0x23, 0x16, 0x03, 0x04, 0x01, 0x00}, (
         top_pair.hex()
     )
+
+
+def test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register(tmp_path):
+    """Confirmed real (see the README's "Fourth correction" section), on a
+    fresh resnet18d build with a fixed-seed shuffled null of config block B:
+    the 17-tag width rule explains most of the block where the 4-tag rule
+    explains under half; the byte after the tag is even in >= 99.5% of
+    units (a 2-byte-granular register) while the first payload byte is at
+    the background rate; `23` is a prefix byte sitting directly before
+    ordinary units; a payload-less `[0x84][even]` pair is a null-level
+    pattern; and blocks A and B share a 158-byte prologue. No device.
+    """
+    import random
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    a_lo, lo, hi = narrow[cuts[0]][0], narrow[cuts[1]][0], narrow[cuts[2]][0]
+    assert mcode[a_lo : a_lo + 158] == mcode[lo : lo + 158]
+    block = mcode[lo:hi]
+    shuffled = bytearray(block)
+    random.Random(0).shuffle(shuffled)
+    shuffled = bytes(shuffled)
+
+    def explained(blob, tags, pmax):
+        toks = _tokenize_mcode(blob, start=0, end=len(blob), tags=tags, pmax=pmax)
+        return 1 - sum(1 for t in toks if t[1] == "?") / len(blob), toks
+
+    e_narrow, _ = explained(block, None, 3)
+    e_wide, toks = explained(block, _WIDE_TAGS, 4)
+    e_null, null_toks = explained(shuffled, _WIDE_TAGS, 4)
+    assert e_narrow < 0.5 < 0.7 < e_wide and e_wide / e_null >= 3.0, (
+        e_narrow,
+        e_wide,
+        e_null,
+    )
+
+    units = [(o, p) for o, k, p, *_ in toks if k == "S"]
+    assert len(units) > 2000, len(units)
+    trailing_even = sum(1 for o, p in units if block[o + p + 3] % 2 == 0) / len(units)
+    payload_even = sum(1 for o, p in units if block[o + 1] % 2 == 0) / len(units)
+    assert trailing_even >= 0.995 and payload_even <= 0.75, (
+        trailing_even,
+        payload_even,
+    )
+
+    starts = {o for o, _ in units}
+    prefixed = sum(
+        1 for o, k, a, *_ in toks if k == "?" and a == 0x23 and o + 1 in starts
+    )
+    assert prefixed >= 100, prefixed
+
+    def bare_84(blob, toks):
+        unknown = {o for o, k, *_ in toks if k == "?"}
+        return sum(
+            1
+            for o in unknown
+            if blob[o] == 0x84 and o + 1 < len(blob) and blob[o + 1] % 2 == 0
+        )
+
+    assert bare_84(block, toks) <= 1.2 * bare_84(shuffled, null_toks)
