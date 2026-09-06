@@ -115,6 +115,12 @@ from onnxsim.moequant import apply_moequant
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.norm_tweaking import apply_norm_tweaking
+from onnxsim.nvfp4_quantization import (
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    NVFP4_BLOCK_SIZE,
+    quantize_weight_only_nvfp4,
+)
 from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
@@ -368,6 +374,10 @@ __all__ = [
     "NF4_CODEBOOK",
     "quantize_weight_only_mxfp4",
     "quantize_weight_only_if4",
+    "quantize_weight_only_nvfp4",
+    "NVFP4_BLOCK_SIZE",
+    "FLOAT4_E2M1_MAX",
+    "FLOAT8_E4M3_MAX",
     "MXFP4_CODEBOOK",
     "quantize_weight_only_llm_fp4",
     "FP4_FORMATS",
