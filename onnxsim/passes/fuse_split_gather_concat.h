@@ -51,11 +51,15 @@
 //    rank, `ca` against the output's rank `=
 //    rank(x) - 1 + rank(idx)` -- each rank fetched only when the
 //    corresponding attribute is actually negative and needs it).
+//  - `split` does not carry the `split_large_gather` marker (see
+//    gather_split_concat_markers.h) -- otherwise this pass would
+//    immediately undo that opt-in, size-limited-backend rewrite.
 #include <cstdint>
 #include <string>
 
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/gather_split_concat_markers.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -98,6 +102,14 @@ struct FuseSplitGatherConcat final : public PredicateBasedPass {
     Node* split = first_gather->input(1)->node();
     if (split->kind() != Symbol("Split") ||
         split->outputs().size() != concat_inputs.size()) {
+      return false;
+    }
+    // See gather_split_concat_markers.h: a Split split_large_gather
+    // deliberately introduced to keep each Gather under a size-limited
+    // backend's indices-count limit must not be immediately re-fused, or
+    // the two passes would perpetually undo each other.
+    if (split->has_doc_string() &&
+        split->docString() == kSizeLimitedGatherSplitMarker) {
       return false;
     }
     if (split->has_domain() && !split->domain().empty()) {

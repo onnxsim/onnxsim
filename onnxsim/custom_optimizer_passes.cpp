@@ -69,6 +69,7 @@
 #include "passes/rewrite_gatherelements_to_gather.h"
 #include "passes/rewrite_gathernd_to_gather.h"
 #include "passes/rewrite_gridsample_to_gather.h"
+#include "passes/split_large_gather.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -173,6 +174,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::RewriteGatherNDToGather>(registry);
     RegisterOrReplace<p::RewriteGatherOverConcat>(registry);
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
+    RegisterOrReplace<p::SplitLargeGather>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);
