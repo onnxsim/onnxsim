@@ -5770,6 +5770,39 @@ struct QkNormRopePassThrough {
   std::optional<std::string> output_reshape_shape;
 };
 
+// A `com.microsoft::LinearAttentionGate` node recognized, by
+// MatchLinearAttentionGate, as a safe pass-through producer for a matched
+// `LinearAttention` chain's own dynamic `decay`/`beta` inputs -- mirrors
+// pruning.py's own `_LinearAttentionGatePassThrough` dataclass exactly (see
+// that class's own docstring for the full empirical schema findings: `decay
+// = decay_scale * Softplus(a + dt_bias)`, `beta = Sigmoid(b)`, `dt_bias`/
+// `decay_scale` each a real per-KV-head `(kv_num_heads,)` float constant).
+// `dt_bias`/`decay_scale` (this node's own inputs 1/2) are sliced directly,
+// axis 0, by the chain's own `keep_groups`. `a`/`b` (this node's own inputs
+// 0/3 -- `a` always present/resolved, since `decay` is this op's own
+// required output; `b` only present/resolved when `beta` is also wired to
+// the matched chain's own `LinearAttention` node) need no slicing of their
+// own: each is itself a plain MatMul/vanilla-Gemm activation, exactly
+// `kv_num_heads`-wide, so narrowing that producer's own output columns by
+// the identical `keep_groups` -- recorded here as `a_weight`/`a_bias`/
+// `a_weight_transposed` (always set) and `b_weight`/`b_bias`/
+// `b_weight_transposed` (set only when `b` needs narrowing too) -- narrows
+// `a`/`b` themselves "for free", the same way slicing Q's/K's/V's own
+// producer weight already narrows their own activation with no separate
+// step. `b_weight` stays `nullopt` whenever `beta` isn't wired to the
+// matched chain at all.
+struct LinearAttentionGatePassThrough {
+  onnx::NodeProto* node = nullptr;
+  std::string dt_bias;
+  std::string decay_scale;
+  std::string a_weight;
+  std::optional<std::string> a_bias;
+  bool a_weight_transposed = false;
+  std::optional<std::string> b_weight;
+  std::optional<std::string> b_bias;
+  bool b_weight_transposed = false;
+};
+
 struct AttnChain {
   AttnChainKind kind;
   onnx::NodeProto* node;
@@ -5827,6 +5860,15 @@ struct AttnChain {
   // from the `Split` with no hop in between.
   std::optional<QkNormRopePassThrough> q_norm_rope;
   std::optional<QkNormRopePassThrough> k_norm_rope;
+  // Set only for a matched `LinearAttention` node whose own `decay`/`beta`
+  // inputs (indices 4/5) are fed by a recognized
+  // `com.microsoft::LinearAttentionGate` node -- mirrors pruning.py's own
+  // `_GQAChain.linear_attention_gate` field exactly (see
+  // MatchLinearAttentionGate/LinearAttentionGatePassThrough for what's
+  // matched and sliced at apply time). `nullopt` (the default) for every
+  // other matched op, and for a `LinearAttention` chain whose `decay`/`beta`
+  // are absent or genuine constants.
+  std::optional<LinearAttentionGatePassThrough> linear_attention_gate;
   // Shared:
   std::vector<AttnChainOp> chain_ops;
   onnx::NodeProto* consumer_node = nullptr;
@@ -6379,17 +6421,16 @@ std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
 // a size-1 broadcast -- don't need `head_size` to tell apart, unlike
 // `decay`'s own).
 //
-// Still deliberately narrower than pruning.py's own matcher in one respect:
-// a *dynamic* `decay`/`beta` still declines the whole match here outright,
-// rather than being deferred to a `com.microsoft::LinearAttentionGate`
-// pass-through check the way pruning.py's own `_find_linear_attention_
-// chains` (via `_match_linear_attention_gate`) does -- that dynamic
-// producer-recognition machinery is not ported here (see this file's own
-// "Attention-head pruning" section comment, the `LinearAttention` bullet,
-// for the documented scope boundary this narrowing keeps). `decay`'s own
-// exact-shape check (which needs `head_size`, not known yet here) is
-// deferred to `FindLinearAttentionChains`, mirroring pruning.py's own
-// identical deferral to `_find_linear_attention_chains`.
+// A *dynamic* `decay`/`beta` (index 4/5) is no longer declined right here --
+// mirrors pruning.py's own `_match_linear_attention_producer` exactly: it
+// might be the one recognized `com.microsoft::LinearAttentionGate`
+// pass-through shape, checked later, once the graph-wide consumer/producer
+// maps are available, by `FindLinearAttentionChains` (via
+// `MatchLinearAttentionGate`) -- see that function's own comment for the
+// full reasoning either way. `decay`'s own exact-shape check (which needs
+// `head_size`, not known yet here) is likewise deferred to
+// `FindLinearAttentionChains`, mirroring pruning.py's own identical
+// deferral to `_find_linear_attention_chains`.
 // `value_info_by_name` accepted (see MatchPagedAttentionProducer's own
 // comment) but ignored: this op has no attention_bias/attn_mask-equivalent
 // input on its own schema either.
@@ -6443,10 +6484,12 @@ std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
     }
     auto it = init_map.find(node.input(idx));
     if (it == init_map.end()) {
-      // Dynamic decay/beta -- unlike pruning.py's own deferred
-      // LinearAttentionGate-pass-through check (not ported here, see this
-      // function's own comment above), declined outright.
-      return std::nullopt;
+      // Dynamic decay/beta -- no longer declined right here: might be the
+      // one recognized `LinearAttentionGate` pass-through shape, checked
+      // later, once graph-wide consumer/producer maps are available, by
+      // `FindLinearAttentionChains` (via `MatchLinearAttentionGate`) -- see
+      // this function's own comment for the full reasoning either way.
+      continue;
     }
     if (!IsSupportedFloatDtype(it->second->data_type()) ||
         it->second->dims_size() != 3) {
@@ -6466,6 +6509,170 @@ std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
   }
 
   return HeadCountsMatch{q_num_heads, kv_num_heads};
+}
+
+// Recognizes exactly one dynamic-producer shape for a matched
+// `LinearAttention` `node`'s own `decay`/`beta` inputs (indices 4/5, each
+// already confirmed non-constant by the caller -- see
+// MatchLinearAttentionProducer's own comment for why a dynamic `decay`/
+// `beta` is no longer declined right there, deferred here instead, where the
+// graph-wide consumer/producer maps this needs are available): both fed,
+// directly and exclusively, by the SAME `com.microsoft::LinearAttentionGate`
+// node's own `decay` (output 0) and, when `beta` is also connected, `beta`
+// (output 1) outputs -- this op's own documented companion: `decay =
+// decay_scale * Softplus(a + dt_bias)`, `beta = Sigmoid(b)` (`b` "Required
+// when the beta output is requested"), `dt_bias`/`decay_scale` "per-head
+// float32 vectors of length H" (`H` == `kv_num_heads`). Mirrors pruning.py's
+// own `_match_linear_attention_gate` exactly -- see that function's own
+// comment for why this is deliberately the ONLY dynamic `decay`/`beta`
+// producer shape ever recognized; anything else (a bare graph input, any
+// other node, a gate whose own `a`/`b` don't resolve to a plain
+// constant-weight producer) still declines the whole match.
+//
+// Every edge crossed -- `node`'s own `decay`/`beta` input(s), and the gate
+// node's own `a`/`b` input(s) -- is required to have exactly one consumer
+// and not be a graph output (the same "no other consumer along the way" bar
+// WalkBackThroughQkNormRope already holds its own crossed hops to). `a`'s
+// (always) and `b`'s (only when `beta` is connected) own producer must
+// independently resolve via MatchProducerAnyFloat (a plain MatMul/
+// vanilla-Gemm with a constant 2-D float weight -- the same matcher
+// FindSeparateQkvChains itself uses for Q/K/V) to a `kv_num_heads`-wide
+// output -- exactly the schema's own `(B, T, H)` shape -- so
+// ApplyOneGqaChain can narrow it the same "slice the producer weight's own
+// output columns by `keep_groups`" way Q's/K's/V's own producer weight
+// already gets narrowed. Anything not matching this exact shape declines
+// outright (returns `nullopt`) rather than guessed at.
+std::optional<LinearAttentionGatePassThrough> MatchLinearAttentionGate(
+    const onnx::NodeProto& node, int64_t kv_num_heads, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  const std::string decay_name =
+      node.input_size() > 4 ? node.input(4) : std::string();
+  const std::string beta_name =
+      node.input_size() > 5 ? node.input(5) : std::string();
+  const bool dyn_decay = !decay_name.empty() && !init_map.count(decay_name);
+  const bool dyn_beta = !beta_name.empty() && !init_map.count(beta_name);
+  if (!dyn_decay && !dyn_beta) {
+    return std::nullopt;  // nothing dynamic here -- not this function's own
+                          // case
+  }
+
+  std::vector<std::string> dyn_names;
+  if (dyn_decay) {
+    dyn_names.push_back(decay_name);
+  }
+  if (dyn_beta) {
+    dyn_names.push_back(beta_name);
+  }
+
+  auto git = node_by_output.find(dyn_names[0]);
+  if (git == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* gate_node = git->second;
+  for (const auto& n : dyn_names) {
+    auto it = node_by_output.find(n);
+    if (it == node_by_output.end() || it->second != gate_node) {
+      return std::nullopt;  // both dynamic inputs must be this SAME gate
+                            // node's own outputs
+    }
+  }
+  if (gate_node->domain() != kComMicrosoftDomain ||
+      gate_node->op_type() != "LinearAttentionGate") {
+    return std::nullopt;
+  }
+  if (dyn_decay &&
+      (gate_node->output_size() < 1 || gate_node->output(0).empty() ||
+       gate_node->output(0) != decay_name)) {
+    return std::nullopt;
+  }
+  if (dyn_beta &&
+      (gate_node->output_size() < 2 || gate_node->output(1).empty() ||
+       gate_node->output(1) != beta_name)) {
+    return std::nullopt;
+  }
+  for (const auto& n : dyn_names) {
+    if (!is_internal(n)) {
+      return std::nullopt;
+    }
+  }
+
+  if (gate_node->input_size() < 3 || gate_node->input(0).empty() ||
+      gate_node->input(1).empty() || gate_node->input(2).empty()) {
+    return std::nullopt;
+  }
+  const std::string a_name = gate_node->input(0);
+  const std::string dt_bias_name = gate_node->input(1);
+  const std::string decay_scale_name = gate_node->input(2);
+
+  auto dt_bias_it = init_map.find(dt_bias_name);
+  auto decay_scale_it = init_map.find(decay_scale_name);
+  if (dt_bias_it == init_map.end() || decay_scale_it == init_map.end()) {
+    return std::nullopt;
+  }
+  for (const onnx::TensorProto* init :
+       {dt_bias_it->second, decay_scale_it->second}) {
+    if (!IsSupportedFloatDtype(init->data_type()) || init->dims_size() != 1 ||
+        init->dims(0) != kv_num_heads) {
+      return std::nullopt;
+    }
+  }
+
+  if (!is_internal(a_name)) {
+    return std::nullopt;
+  }
+  auto a_prod_it = node_by_output.find(a_name);
+  if (a_prod_it == node_by_output.end()) {
+    return std::nullopt;
+  }
+  auto a_info = MatchProducerAnyFloat(*a_prod_it->second, init_map);
+  if (!a_info || a_info->n_channels != kv_num_heads) {
+    return std::nullopt;
+  }
+
+  std::optional<std::string> b_weight, b_bias;
+  bool b_weight_transposed = false;
+  if (dyn_beta) {
+    if (gate_node->input_size() < 4 || gate_node->input(3).empty()) {
+      return std::nullopt;
+    }
+    const std::string b_name = gate_node->input(3);
+    if (!is_internal(b_name)) {
+      return std::nullopt;
+    }
+    auto b_prod_it = node_by_output.find(b_name);
+    if (b_prod_it == node_by_output.end()) {
+      return std::nullopt;
+    }
+    auto b_info = MatchProducerAnyFloat(*b_prod_it->second, init_map);
+    if (!b_info || b_info->n_channels != kv_num_heads) {
+      return std::nullopt;
+    }
+    if (b_info->weight == a_info->weight) {
+      return std::nullopt;  // degenerate -- can't independently slice a
+                            // shared producer
+    }
+    b_weight = b_info->weight;
+    b_weight_transposed = b_info->weight_transposed;
+    b_bias = b_info->bias;
+  }
+
+  LinearAttentionGatePassThrough result;
+  result.node = gate_node;
+  result.dt_bias = dt_bias_name;
+  result.decay_scale = decay_scale_name;
+  result.a_weight = a_info->weight;
+  result.a_bias = a_info->bias;
+  result.a_weight_transposed = a_info->weight_transposed;
+  result.b_weight = b_weight;
+  result.b_bias = b_bias;
+  result.b_weight_transposed = b_weight_transposed;
+  return result;
 }
 
 // If `node` is a com.microsoft::SparseAttention node this pass can safely
@@ -7717,14 +7924,25 @@ std::vector<AttnChain> FindPagedAttentionChains(onnx::GraphProto* graph) {
 // attribute is named `q_num_heads` (same as the plain ai.onnx `Attention`
 // op's own), no combined bias input.
 //
-// Performs the one deferred check MatchLinearAttentionProducer itself
-// cannot: a connected constant `decay` (index 4) must be exactly one of its
-// own two documented shapes -- `(*, *, kv_num_heads)` (DeltaNet/RetNet,
-// per-head scalar decay) or `(*, *, kv_num_heads * head_size)` (GLA/RWKV-6,
-// per-key-dimension decay) -- anything else declines the whole chain here,
-// mirroring pruning.py's own `_find_linear_attention_chains` exactly
-// (`head_size`, Q's/K's own shared per-head width, is resolved only here,
-// by FindSeparateQkvChains itself, not yet known at match time).
+// Performs the two deferred checks MatchLinearAttentionProducer itself
+// cannot:
+//
+// - A connected constant `decay` (index 4) must be exactly one of its own
+//   two documented shapes -- `(*, *, kv_num_heads)` (DeltaNet/RetNet,
+//   per-head scalar decay) or `(*, *, kv_num_heads * head_size)` (GLA/RWKV-6,
+//   per-key-dimension decay) -- anything else declines the whole chain here,
+//   mirroring pruning.py's own `_find_linear_attention_chains` exactly
+//   (`head_size`, Q's/K's own shared per-head width, is resolved only here,
+//   by FindSeparateQkvChains itself, not yet known at match time).
+// - A connected *dynamic* `decay`/`beta` (deferred here, since it might be
+//   the one recognized `com.microsoft::LinearAttentionGate` pass-through
+//   shape) is resolved via MatchLinearAttentionGate, which needs the
+//   graph-wide consumer/producer maps MatchLinearAttentionProducer itself is
+//   never given -- a chain whose dynamic `decay`/`beta` doesn't resolve this
+//   way is dropped here (the same "unmatched topology" outcome as any other
+//   declined chain), one that does has its own `.linear_attention_gate` set,
+//   for ApplyOneGqaChain to slice at apply time. Mirrors pruning.py's own
+//   identical `_find_linear_attention_chains` logic exactly.
 std::vector<AttnChain> FindLinearAttentionChains(onnx::GraphProto* graph) {
   std::vector<AttnChain> chains =
       FindSeparateQkvChains(graph, MatchLinearAttentionProducer, "q_num_heads");
@@ -7732,11 +7950,52 @@ std::vector<AttnChain> FindLinearAttentionChains(onnx::GraphProto* graph) {
   for (const auto& t : graph->initializer()) {
     init_map[t.name()] = &t;
   }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+
   std::vector<AttnChain> out;
   out.reserve(chains.size());
   for (auto& chain : chains) {
-    if (chain.node->input_size() > 4 && !chain.node->input(4).empty()) {
-      auto it = init_map.find(chain.node->input(4));
+    const std::string decay_name =
+        chain.node->input_size() > 4 ? chain.node->input(4) : std::string();
+    const std::string beta_name =
+        chain.node->input_size() > 5 ? chain.node->input(5) : std::string();
+    const bool decay_dynamic =
+        !decay_name.empty() && !init_map.count(decay_name);
+    const bool beta_dynamic = !beta_name.empty() && !init_map.count(beta_name);
+
+    std::optional<LinearAttentionGatePassThrough> gate;
+    if (decay_dynamic || beta_dynamic) {
+      gate =
+          MatchLinearAttentionGate(*chain.node, chain.kv_num_heads, init_map,
+                                   consumers_of, graph_outputs, node_by_output);
+      if (!gate) {
+        continue;  // dynamic decay/beta not the recognized
+                   // LinearAttentionGate shape -- declined
+      }
+      if (gate->a_weight == chain.q_weight ||
+          gate->a_weight == chain.k_weight ||
+          gate->a_weight == chain.v_weight ||
+          (gate->b_weight && (*gate->b_weight == chain.q_weight ||
+                              *gate->b_weight == chain.k_weight ||
+                              *gate->b_weight == chain.v_weight))) {
+        continue;  // degenerate -- can't independently slice a shared
+                   // producer
+      }
+    }
+
+    if (!decay_name.empty() && !decay_dynamic) {
+      auto it = init_map.find(decay_name);
       if (it != init_map.end() && it->second->dims_size() > 0) {
         const int64_t last = it->second->dims(it->second->dims_size() - 1);
         if (last != chain.kv_num_heads &&
@@ -7745,6 +8004,8 @@ std::vector<AttnChain> FindLinearAttentionChains(onnx::GraphProto* graph) {
         }
       }
     }
+
+    chain.linear_attention_gate = std::move(gate);
     out.push_back(std::move(chain));
   }
   return out;
@@ -8501,13 +8762,7 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // (GLA/RWKV-6, per-key-dimension); and `beta` (rank-3) along its own last
   // axis by `keep_groups`, only when genuinely `kv_num_heads`-wide (a size-1
   // broadcast needs no slicing at all, the same "PER_TENSOR broadcast, left
-  // alone" reasoning as k_scale/v_scale above). A
-  // `com.microsoft::LinearAttentionGate`-fed dynamic `decay`/`beta`
-  // pass-through (pruning.py's own further upgrade, ranked/sliced through
-  // `chain.linear_attention_gate` there) is NOT ported here --
-  // MatchLinearAttentionProducer already declines that shape outright (see
-  // that function's own comment for the documented scope boundary), so it
-  // never reaches this branch.
+  // alone" reasoning as k_scale/v_scale above).
   const bool is_linear_attention = chain.node->domain().empty() &&
                                    chain.node->op_type() == "LinearAttention";
   if (is_linear_attention) {
@@ -8536,6 +8791,36 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
         const int64_t last_axis = it->second->dims_size() - 1;
         if (it->second->dims(last_axis) == h) {
           SliceAxisGeneric(it->second, keep_groups, last_axis);
+        }
+      }
+    }
+
+    // A recognized `com.microsoft::LinearAttentionGate` pass-through (see
+    // MatchLinearAttentionGate/LinearAttentionGatePassThrough): `dt_bias`/
+    // `decay_scale` (both real `(kv_num_heads,)` constants) are sliced
+    // directly, axis 0 -- the one genuinely new per-tensor edit this feature
+    // adds. `a`'s (always) and `b`'s (only when `beta` was also wired to
+    // this chain) own producer weight -- resolved, at match time, to a
+    // plain MatMul/vanilla-Gemm output exactly `kv_num_heads` columns wide
+    // -- is sliced the identical `keep_groups` way Q's/K's/V's own producer
+    // weight already is a few lines above, narrowing `a`/`b` themselves with
+    // no separate step (see LinearAttentionGatePassThrough's own comment for
+    // why). Mirrors pruning.py's own `_apply_one_gqa_chain` handling of
+    // `chain.linear_attention_gate` exactly.
+    if (chain.linear_attention_gate) {
+      const LinearAttentionGatePassThrough& gate = *chain.linear_attention_gate;
+      SliceAxisGeneric(init_map.at(gate.dt_bias), keep_groups, 0);
+      SliceAxisGeneric(init_map.at(gate.decay_scale), keep_groups, 0);
+      SliceAxisGeneric(init_map.at(gate.a_weight), keep_groups,
+                       gate.a_weight_transposed ? 0 : 1);
+      if (gate.a_bias) {
+        SliceAxisGeneric(init_map.at(*gate.a_bias), keep_groups, 0);
+      }
+      if (gate.b_weight) {
+        SliceAxisGeneric(init_map.at(*gate.b_weight), keep_groups,
+                         gate.b_weight_transposed ? 0 : 1);
+        if (gate.b_bias) {
+          SliceAxisGeneric(init_map.at(*gate.b_bias), keep_groups, 0);
         }
       }
     }
@@ -8722,6 +9007,23 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
       out.stale.insert(extra);
     }
   }
+  // A recognized `LinearAttentionGate` pass-through node is a distinct node
+  // from `chain.node` (already covered by `out.stale` above), so its own
+  // `decay`/`beta` outputs need marking stale here too, and `a`'s/`b`'s own
+  // (now narrower) producer weight needs the same touched-producer
+  // bookkeeping every other producer weight in this chain already gets --
+  // mirrors pruning.py's own `_apply_one_gqa_chain` identical addition to
+  // its returned producer-name/stale sets exactly.
+  if (chain.linear_attention_gate) {
+    const LinearAttentionGatePassThrough& gate = *chain.linear_attention_gate;
+    for (const auto& gate_out : gate.node->output()) {
+      out.stale.insert(gate_out);
+    }
+    out.producer_weights.insert(gate.a_weight);
+    if (gate.b_weight) {
+      out.producer_weights.insert(*gate.b_weight);
+    }
+  }
   return out;
 }
 
@@ -8765,6 +9067,17 @@ void ApplyAttentionChains(
             ? std::unordered_set<std::string>{chain.q_weight, chain.k_weight,
                                               chain.v_weight}
             : std::unordered_set<std::string>{chain.weight};
+    if (chain.kind == AttnChainKind::kGqaLike && chain.linear_attention_gate) {
+      // Mirrors ApplyOneGqaChain's own identical addition to its returned
+      // producer-name set -- checked here too so a `LinearAttentionGate`'s
+      // own `a`/`b` producer weight shared with an earlier chain is skipped
+      // up front, the same as Q's/K's/V's own already are. Mirrors
+      // pruning.py's own `_apply_attention_chains` identical check exactly.
+      producer_names.insert(chain.linear_attention_gate->a_weight);
+      if (chain.linear_attention_gate->b_weight) {
+        producer_names.insert(*chain.linear_attention_gate->b_weight);
+      }
+    }
 
     bool conflict = consumer_touched.count(chain.consumer_weight) != 0;
     for (const auto& w : producer_names) {
