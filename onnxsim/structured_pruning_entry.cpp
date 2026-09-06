@@ -518,6 +518,89 @@ using InitMap = std::unordered_map<std::string, const onnx::TensorProto*>;
 using ConsumerMap =
     std::unordered_map<std::string, std::vector<onnx::NodeProto*>>;
 
+// Builds an `InitMap`-equivalent lookup from BOTH `graph.initializer()` AND
+// every plain (default-domain) `Constant` node's own embedded `value`
+// attribute tensor, keyed by that node's single output name -- the C++
+// mirror of pruning.py's own `_constant_map` (see that function's docstring
+// for the full rationale/semantics this reproduces exactly). Real
+// `torch.onnx.export` output routinely lowers an inline literal
+// shape/scalar operand (a `Reshape`'s target shape, a `Pow`'s exponent, ...)
+// to a `Constant` node rather than a genuine `graph.initializer` entry --
+// and onnxsim's own `simplify()` deliberately leaves it that way (its own
+// optimizer list always drops onnx-optimizer's
+// `extract_constant_to_initializer` pass) -- so a plain
+// `{t.name(): &t for t in graph.initializer()}`-style map alone misses
+// exactly this common, real shape.
+//
+// Only a `Constant` node's own `value` *tensor* attribute is recognized here
+// (`sparse_value`/`value_int`/`value_float`/`value_string`-family attributes
+// and their list forms are a different representation, never emitted by a
+// real exporter for a full tensor payload) -- mirrors `_constant_map`'s own
+// identical, deliberate narrowing.
+//
+// An actual `graph.initializer` entry always wins on a genuine name
+// collision with a `Constant` node's output (vanishingly unlikely in
+// practice): this uses `emplace`, which is a no-op when the key -- already
+// inserted from `graph.initializer()` in the loop above -- is present,
+// exactly mirroring `_constant_map`'s own `dict.setdefault` call.
+InitMap BuildConstantMap(const onnx::GraphProto& graph) {
+  InitMap constants;
+  for (const auto& t : graph.initializer()) {
+    constants[t.name()] = &t;
+  }
+  for (const auto& node : graph.node()) {
+    if ((node.domain() != "" && node.domain() != "ai.onnx") ||
+        node.op_type() != "Constant" || node.output_size() != 1 ||
+        node.output(0).empty()) {
+      continue;
+    }
+    for (const auto& attr : node.attribute()) {
+      if (attr.name() == "value" &&
+          attr.type() == onnx::AttributeProto::TENSOR) {
+        constants.emplace(node.output(0), &attr.t());
+        break;
+      }
+    }
+  }
+  return constants;
+}
+
+// Mutable analogue of `BuildConstantMap` above, for a caller (e.g.
+// `ApplyOneDecomposedGqaChain`'s own `_rewrite_shape_dim`-equivalent local
+// helper) that goes on to slice/edit a resolved value in place: a
+// `Constant` node's own `value` attribute tensor is returned via
+// `mutable_t()`, a live pointer into that node's own embedded `TensorProto`
+// -- editing through it (e.g. `SliceAxisGeneric`) mutates the node's own
+// serialized form directly, exactly as if it had been a real initializer
+// entry all along. Mirrors `_constant_map`'s own docstring paragraph on why
+// this is safe: protobuf's `attr.t`/`mutable_t()` is a live reference, never
+// a copy, in both languages.
+std::unordered_map<std::string, onnx::TensorProto*> BuildMutableConstantMap(
+    onnx::GraphProto* graph) {
+  std::unordered_map<std::string, onnx::TensorProto*> constants;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    constants[t->name()] = t;
+  }
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    if ((node->domain() != "" && node->domain() != "ai.onnx") ||
+        node->op_type() != "Constant" || node->output_size() != 1 ||
+        node->output(0).empty()) {
+      continue;
+    }
+    for (int j = 0; j < node->attribute_size(); ++j) {
+      onnx::AttributeProto* attr = node->mutable_attribute(j);
+      if (attr->name() == "value" &&
+          attr->type() == onnx::AttributeProto::TENSOR) {
+        constants.emplace(node->output(0), attr->mutable_t());
+        break;
+      }
+    }
+  }
+  return constants;
+}
+
 // Forward declarations for this file's own generic (FLOAT/FLOAT16/BFLOAT16)
 // dtype infrastructure -- defined much later in the file, inside this same
 // anonymous namespace (the "MoE/QMoE whole-expert pruning" section's own
@@ -6285,23 +6368,33 @@ std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
 // already-projected activations, `q_num_heads`/`kv_num_heads` both required
 // attributes with `q_num_heads` a positive multiple of `kv_num_heads`.
 //
-// Deliberately narrower than pruning.py's own matcher: `past_state`/`decay`/
-// `beta` (3/4/5) must all be absent here. This port only ever prunes the
-// stateless "linear" `update_rule` shape that needs none of the three --
-// pruning.py's own comment for this op already narrows its *real-world*
-// scope to almost exactly this (a genuinely dynamic `decay`/`beta` declines
-// the whole match there too; a *constant* one is called out as "a
-// degenerate shape no real dynamic-decode export produces" -- see this
-// file's own "Attention-head pruning" section comment, the `LinearAttention`
-// bullet), so requiring all three absent here -- rather than porting the
-// deferred decay/beta shape-classification logic pruning.py's own
-// matcher/finder pair uses -- gives up essentially nothing over the
-// realistic export shape while avoiding new, unverified slicing machinery.
+// `past_state`/`decay`/`beta` (3/4/5) are now validated-and-allowed, not a
+// blanket decline, mirroring pruning.py's own `_match_linear_attention_
+// producer` for the *constant* case exactly: a connected `past_state` is
+// checked here only when constant (a dynamic one is the caller's own
+// runtime data, left alone entirely, same as GroupQueryAttention's own
+// `past_key`/`past_value`) against this op's own documented `(*,
+// kv_num_heads, *, *)` shape; a connected `beta` is checked here, constant
+// or not needed (its own two documented shapes -- `(*, *, kv_num_heads)` or
+// a size-1 broadcast -- don't need `head_size` to tell apart, unlike
+// `decay`'s own).
+//
+// Still deliberately narrower than pruning.py's own matcher in one respect:
+// a *dynamic* `decay`/`beta` still declines the whole match here outright,
+// rather than being deferred to a `com.microsoft::LinearAttentionGate`
+// pass-through check the way pruning.py's own `_find_linear_attention_
+// chains` (via `_match_linear_attention_gate`) does -- that dynamic
+// producer-recognition machinery is not ported here (see this file's own
+// "Attention-head pruning" section comment, the `LinearAttention` bullet,
+// for the documented scope boundary this narrowing keeps). `decay`'s own
+// exact-shape check (which needs `head_size`, not known yet here) is
+// deferred to `FindLinearAttentionChains`, mirroring pruning.py's own
+// identical deferral to `_find_linear_attention_chains`.
 // `value_info_by_name` accepted (see MatchPagedAttentionProducer's own
 // comment) but ignored: this op has no attention_bias/attn_mask-equivalent
 // input on its own schema either.
 std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& /*init_map*/,
+    const onnx::NodeProto& node, const InitMap& init_map,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
     /*value_info_by_name*/
     = {}) {
@@ -6329,11 +6422,49 @@ std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
   if (q_num_heads % kv_num_heads != 0) {
     return std::nullopt;
   }
-  for (int idx : {3, 4, 5}) {  // past_state, decay, beta
-    if (node.input_size() > idx && !node.input(idx).empty()) {
+
+  if (node.input_size() > 3 && !node.input(3).empty()) {
+    auto ps_it = init_map.find(node.input(3));
+    if (ps_it != init_map.end()) {
+      const onnx::TensorProto* ps_init = ps_it->second;
+      if (!IsSupportedFloatDtype(ps_init->data_type()) ||
+          ps_init->dims_size() != 4 || ps_init->dims(1) != kv_num_heads) {
+        return std::nullopt;  // not this schema's own (B, kv_num_heads,
+                              // d_k, d_v) shape
+      }
+    }
+    // else: dynamic past_state -- the caller's own runtime data, left
+    // alone entirely, nothing to check here.
+  }
+
+  for (int idx : {4, 5}) {  // decay, beta
+    if (node.input_size() <= idx || node.input(idx).empty()) {
+      continue;
+    }
+    auto it = init_map.find(node.input(idx));
+    if (it == init_map.end()) {
+      // Dynamic decay/beta -- unlike pruning.py's own deferred
+      // LinearAttentionGate-pass-through check (not ported here, see this
+      // function's own comment above), declined outright.
+      return std::nullopt;
+    }
+    if (!IsSupportedFloatDtype(it->second->data_type()) ||
+        it->second->dims_size() != 3) {
       return std::nullopt;
     }
   }
+
+  if (node.input_size() > 5 && !node.input(5).empty()) {
+    auto beta_it = init_map.find(node.input(5));
+    if (beta_it != init_map.end()) {
+      const int64_t last =
+          beta_it->second->dims(beta_it->second->dims_size() - 1);
+      if (last != kv_num_heads && last != 1) {
+        return std::nullopt;  // neither of beta's own two documented shapes
+      }
+    }
+  }
+
   return HeadCountsMatch{q_num_heads, kv_num_heads};
 }
 
@@ -7585,9 +7716,38 @@ std::vector<AttnChain> FindPagedAttentionChains(onnx::GraphProto* graph) {
 // MatchLinearAttentionProducer's own comment. Its own query head-count
 // attribute is named `q_num_heads` (same as the plain ai.onnx `Attention`
 // op's own), no combined bias input.
+//
+// Performs the one deferred check MatchLinearAttentionProducer itself
+// cannot: a connected constant `decay` (index 4) must be exactly one of its
+// own two documented shapes -- `(*, *, kv_num_heads)` (DeltaNet/RetNet,
+// per-head scalar decay) or `(*, *, kv_num_heads * head_size)` (GLA/RWKV-6,
+// per-key-dimension decay) -- anything else declines the whole chain here,
+// mirroring pruning.py's own `_find_linear_attention_chains` exactly
+// (`head_size`, Q's/K's own shared per-head width, is resolved only here,
+// by FindSeparateQkvChains itself, not yet known at match time).
 std::vector<AttnChain> FindLinearAttentionChains(onnx::GraphProto* graph) {
-  return FindSeparateQkvChains(graph, MatchLinearAttentionProducer,
-                               "q_num_heads");
+  std::vector<AttnChain> chains =
+      FindSeparateQkvChains(graph, MatchLinearAttentionProducer, "q_num_heads");
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  std::vector<AttnChain> out;
+  out.reserve(chains.size());
+  for (auto& chain : chains) {
+    if (chain.node->input_size() > 4 && !chain.node->input(4).empty()) {
+      auto it = init_map.find(chain.node->input(4));
+      if (it != init_map.end() && it->second->dims_size() > 0) {
+        const int64_t last = it->second->dims(it->second->dims_size() - 1);
+        if (last != chain.kv_num_heads &&
+            last != chain.kv_num_heads * chain.head_size) {
+          continue;  // neither of decay's own two documented shapes
+        }
+      }
+    }
+    out.push_back(std::move(chain));
+  }
+  return out;
 }
 
 // The com.microsoft::SparseAttention analogue of FindGqaChains -- see
@@ -8325,6 +8485,59 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
         SliceAxisGeneric(scale_it->second, keep_groups, 0);
       }
       // else: PER_TENSOR broadcast scalar -- no per-head axis to slice
+    }
+  }
+
+  // LinearAttention-only: its own `past_state`/`decay`/`beta` (indices
+  // 3/4/5), each already confirmed sliceable at match time
+  // (MatchLinearAttentionProducer/FindLinearAttentionChains -- see either's
+  // own comment for the full shape reasoning), sliced here exactly mirroring
+  // pruning.py's own `_apply_one_gqa_chain` `is_linear_attention` branch:
+  // `past_state` (rank-4 `(B, kv_num_heads, d_k, d_v)`) along its own axis 1
+  // by `keep_groups`; `decay` (rank-3) along its own last axis -- directly
+  // by `keep_groups` when `kv_num_heads`-wide (DeltaNet/RetNet, per-head
+  // scalar), or by the same per-head *column* expansion K's own producer
+  // weight gets (HeadColumnIndices) when `kv_num_heads * head_size`-wide
+  // (GLA/RWKV-6, per-key-dimension); and `beta` (rank-3) along its own last
+  // axis by `keep_groups`, only when genuinely `kv_num_heads`-wide (a size-1
+  // broadcast needs no slicing at all, the same "PER_TENSOR broadcast, left
+  // alone" reasoning as k_scale/v_scale above). A
+  // `com.microsoft::LinearAttentionGate`-fed dynamic `decay`/`beta`
+  // pass-through (pruning.py's own further upgrade, ranked/sliced through
+  // `chain.linear_attention_gate` there) is NOT ported here --
+  // MatchLinearAttentionProducer already declines that shape outright (see
+  // that function's own comment for the documented scope boundary), so it
+  // never reaches this branch.
+  const bool is_linear_attention = chain.node->domain().empty() &&
+                                   chain.node->op_type() == "LinearAttention";
+  if (is_linear_attention) {
+    if (chain.node->input_size() > 3 && !chain.node->input(3).empty()) {
+      auto it = init_map.find(chain.node->input(3));
+      if (it != init_map.end()) {
+        SliceAxisGeneric(it->second, keep_groups, 1);
+      }
+    }
+    if (chain.node->input_size() > 4 && !chain.node->input(4).empty()) {
+      auto it = init_map.find(chain.node->input(4));
+      if (it != init_map.end()) {
+        const int64_t last_axis = it->second->dims_size() - 1;
+        const int64_t last = it->second->dims(last_axis);
+        if (last == h) {
+          SliceAxisGeneric(it->second, keep_groups, last_axis);
+        } else if (last == h * d) {
+          SliceAxisGeneric(it->second, HeadColumnIndices(keep_groups, d),
+                           last_axis);
+        }
+      }
+    }
+    if (chain.node->input_size() > 5 && !chain.node->input(5).empty()) {
+      auto it = init_map.find(chain.node->input(5));
+      if (it != init_map.end()) {
+        const int64_t last_axis = it->second->dims_size() - 1;
+        if (it->second->dims(last_axis) == h) {
+          SliceAxisGeneric(it->second, keep_groups, last_axis);
+        }
+      }
     }
   }
 
@@ -26119,10 +26332,14 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     onnx::GraphProto* graph,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  InitMap init_map;
-  for (const auto& t : graph->initializer()) {
-    init_map[t.name()] = &t;
-  }
+  // BuildConstantMap (not a plain `graph.initializer()` loop) -- see that
+  // function's own comment: a real `torch.onnx.export` + `simplify()`
+  // pipeline's `Reshape`/`Unsqueeze`/`Expand` shape operands below are
+  // routinely `Constant`-node-fed rather than genuine `graph.initializer`
+  // entries, and every lookup in this function needs to see those too.
+  // Mirrors pruning.py's own `_find_decomposed_gqa_chains`'s identical
+  // `initializer_map = _constant_map(graph)`.
+  InitMap init_map = BuildConstantMap(*graph);
   ConsumerMap consumers_of = ConsumersOf(graph);
   std::unordered_set<std::string> graph_outputs;
   for (const auto& o : graph->output()) {
@@ -27188,11 +27405,17 @@ void ApplyDecomposedGqaChains(
     double epsilon = 1e-8, ImportanceNorm importance_norm = ImportanceNorm::kL2,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  std::unordered_map<std::string, onnx::TensorProto*> init_map;
-  for (int i = 0; i < graph->initializer_size(); ++i) {
-    onnx::TensorProto* t = graph->mutable_initializer(i);
-    init_map[t->name()] = t;
-  }
+  // BuildMutableConstantMap (not a plain `graph->initializer()` loop) -- see
+  // that function's own comment, and `FindDecomposedGqaChains`'s own
+  // identical `BuildConstantMap` call above: `ApplyOneDecomposedGqaChain`'s
+  // own `rewrite_shape_dim` local helper below resolves/edits exactly the
+  // same `Reshape`/`Expand` shape operands `FindDecomposedGqaChains` already
+  // matched, which on a real `torch.onnx.export` + `simplify()` pipeline are
+  // routinely `Constant`-node-fed rather than genuine `graph->initializer()`
+  // entries. Mirrors pruning.py's own shared apply-dispatch's identical
+  // `initializer_map = _constant_map(graph)`.
+  std::unordered_map<std::string, onnx::TensorProto*> init_map =
+      BuildMutableConstantMap(graph);
   std::unordered_set<std::string> used_names = ExistingGraphNames(*graph);
   std::unordered_set<std::string> producer_touched, consumer_touched,
       stale_value_info;
