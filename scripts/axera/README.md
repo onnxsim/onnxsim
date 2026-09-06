@@ -1789,6 +1789,54 @@ effect on a real classifier is already measurable, so the next step
 correlating the resulting logit change with which layer's Conv it sits
 in) needs no new technique at all.
 
+### Bisecting the live bytes' neighbors: an identical field template 15,600 bytes apart, and every bit of one byte is live
+
+Following the step named above: flip each byte in a 17-byte window
+(`X-8..X+8`) around three of the output-changing offsets, one flip per
+run, and classify each as fault (`F`), identical (`=`), or different
+(`D`). Then flip each of the 8 bits of one such byte individually.
+
+```
+X=9900:   [FFFF=FFFDDFFFFDFF]
+X=32700:  [FF==D=FDDDDDF=FF=]
+X=48300:  [FF==D=FDDDDDF=FF=]     <- byte-for-byte the same signature as 32700
+```
+
+**Two offsets 15,600 bytes apart have the identical 17-position live-byte
+signature.** Not merely similar bytes: the same layout of which
+positions fault, which are inert, and which change the output --
+including the same contiguous 5-byte live run at `X-1..X+3` and the same
+isolated live byte at `X-4`. This is the earlier "43.4% of bytes are
+exact duplicates / repeated command templates" finding seen from the
+*hardware's* side: the same command template recurs, and its internal
+field structure recurs with it. `9900` has a different, narrower layout
+(a 2-byte live pair at `X..X+1`, one isolated live byte at `X+6`, faults
+everywhere else), i.e. a different template.
+
+**Two different bytes that are functionally interchangeable.** Within
+both templates, flipping `X-4` and flipping `X-1` (e.g. 32696 vs 32699,
+48296 vs 48299) produce the **bit-identical full 1000-logit output** --
+confirmed on rerun. Two distinct bytes, 3 apart, whose corruption drives
+the computation to exactly the same state: consistent with two copies of
+one value being combined (or a field where those two bytes play the same
+role), and a concrete, reproducible handle on this template's internal
+redundancy.
+
+**Every bit of byte 9900 is live, and the effect is not bit-weighted.**
+All 8 single-bit flips run without fault and all change the output --
+no bit is padding. But the max-abs logit delta does *not* grow with bit
+significance (bit0 3.41, bit1 1.54, bit2 2.15, bit3 1.97, bit4 1.08, bit5
+1.08, bit6 2.15, bit7 2.98), as a plain little-endian integer or a
+float32 byte would predict. Instead the deltas fall on a grid: bit4 and
+bit5 give exactly 1.077231, bit2 and bit6 exactly 2.154462 = 2 x 1.077231
+(equal max-abs, but *different* full outputs -- so it's the magnitude
+that quantizes, not the result). That grid is the output tensor's own
+int8 dequantization step showing through, which is why it cannot be used
+to read the byte's encoding off the logits directly. Reported as what it
+is: a fully-live, non-bit-weighted numeric-ish field whose encoding is
+still not identified -- the exact-equality pairs are the lead, not a
+decoding.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

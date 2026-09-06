@@ -676,6 +676,41 @@ def _conv_with_bias_model(bias_vals, cin=4, cout=4, k=3, insz=16):
     return model
 
 
+def _build_real_resnet18d(work_dir):
+    """Fetch and really build `resnet18d_Opset18` the same way
+    `convert_onnxmodelzoo.py` does (single-image-classifier config,
+    synthetic calibration tar). Returns `(axmodel_path, mcode_key,
+    mcode_bytes)`; shared by the real-resnet18d hand-patching tests."""
+    import convert_onnxmodelzoo  # also puts model_zoo on sys.path
+    import model_zoo
+
+    model = onnx.load(model_zoo.fetch_model("resnet18d_Opset18"))
+    tensor_name = convert_onnxmodelzoo._single_image_input(model)
+    assert tensor_name is not None
+
+    os.makedirs(os.path.join(work_dir, "model"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    pulsar2_docker.make_synthetic_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib.tar")
+    )
+    onnx.save(model, os.path.join(work_dir, "model", "resnet18d.onnx"))
+    result = pulsar2_docker.build(
+        work_dir,
+        "model/resnet18d.onnx",
+        "output/resnet18d",
+        tensor_name=tensor_name,
+        mean=convert_onnxmodelzoo._DEFAULT_MEAN,
+        std=convert_onnxmodelzoo._DEFAULT_STD,
+        calibration_dataset_rel_path="dataset/calib.tar",
+    )
+    assert result.success, result.error
+    compiled = onnx.load(result.axmodel_path)
+    key = _mcode_key(compiled)
+    mcode = bytes({i.name: i for i in compiled.graph.initializer}[key].raw_data)
+    assert len(mcode) == 49080, len(mcode)
+    return result.axmodel_path, key, mcode
+
+
 def _gemm_model(transb, m=1, k=16, n=8):
     """One `Gemm(x, w, b)` -- `transb` selects whether `w` is stored as
     `[k,n]` (transB=0) or `[n,k]` (transB=1), same logical matrix either
@@ -1265,36 +1300,8 @@ def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
     if not pulsar2_docker.axcl_available():
         pytest.skip("no AXCL device connected")
 
-    import convert_onnxmodelzoo  # noqa: E402  -- also puts model_zoo on sys.path
-    import model_zoo  # noqa: E402
-
-    model = onnx.load(model_zoo.fetch_model("resnet18d_Opset18"))
-    tensor_name = convert_onnxmodelzoo._single_image_input(model)
-    assert tensor_name is not None
-
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
     work_dir = str(tmp_path)
-    os.makedirs(os.path.join(work_dir, "model"), exist_ok=True)
-    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
-    pulsar2_docker.make_synthetic_calibration_tar(
-        os.path.join(work_dir, "dataset", "calib.tar")
-    )
-    onnx.save(model, os.path.join(work_dir, "model", "resnet18d.onnx"))
-    result = pulsar2_docker.build(
-        work_dir,
-        "model/resnet18d.onnx",
-        "output/resnet18d",
-        tensor_name=tensor_name,
-        mean=convert_onnxmodelzoo._DEFAULT_MEAN,
-        std=convert_onnxmodelzoo._DEFAULT_STD,
-        calibration_dataset_rel_path="dataset/calib.tar",
-    )
-    assert result.success, result.error
-    path = result.axmodel_path
-
-    compiled = onnx.load(path)
-    key = _mcode_key(compiled)
-    mcode = bytes({i.name: i for i in compiled.graph.initializer}[key].raw_data)
-    assert len(mcode) == 49080, len(mcode)
 
     rng = np.random.RandomState(42)
     x = rng.randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
@@ -1332,3 +1339,66 @@ def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
             off,
             "expected the predicted class to change",
         )
+
+
+def test_resnet18d_live_byte_neighborhoods_share_a_template_signature(tmp_path):
+    """Confirmed real (see the README's "Bisecting the live bytes'
+    neighbors" section): flipping each byte in a 17-byte window around
+    two of the real resnet18d mcode's output-changing offsets, 15,600
+    bytes apart, gives the byte-for-byte identical fault/inert/different
+    signature `FF==D=FDDDDDF=FF=` -- the repeated-command-template
+    structure seen from the hardware's side, with the same internal field
+    layout. Within it, two distinct bytes (X-4 and X-1) are functionally
+    interchangeable: corrupting either yields the bit-identical full
+    1000-logit output. And every one of the 8 bits of byte 9900 is live
+    (all run, all change the output).
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+
+    rng = np.random.RandomState(42)
+    x = rng.randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    def flip_and_run(offset, mask):
+        patched = bytearray(mcode)
+        patched[offset] ^= mask
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"flip_{offset}_{mask:02x}.axmodel")
+        onnx.save(c, p)
+        dev = pulsar2_docker.run_on_device_with_inputs(p, {"x": x.tobytes()})
+        if dev.error:
+            assert "0x8030070C" in dev.error, (offset, mask, dev.error)
+            return "F", None
+        out = np.frombuffer(dev.outputs[0], dtype=np.float32)
+        return ("=" if np.array_equal(out, out_base) else "D"), out
+
+    outputs = {}
+    signatures = {}
+    for center in (32700, 48300):
+        sig = ""
+        for off in range(center - 8, center + 9):
+            cls, out = flip_and_run(off, 0xFF)
+            sig += cls
+            outputs[off] = out
+        signatures[center] = sig
+
+    assert signatures[32700] == signatures[48300] == "FF==D=FDDDDDF=FF=", signatures
+
+    for center in (32700, 48300):
+        a, b = outputs[center - 4], outputs[center - 1]
+        assert a is not None and b is not None
+        assert not np.array_equal(a, out_base)
+        assert np.array_equal(a, b), (
+            center,
+            "expected X-4 and X-1 to be interchangeable",
+        )
+
+    for bit in range(8):
+        cls, _ = flip_and_run(9900, 1 << bit)
+        assert cls == "D", (bit, cls, "expected every bit of byte 9900 to be live")
