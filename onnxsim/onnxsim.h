@@ -723,6 +723,39 @@ onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
 // non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
 
+// llama.cpp's GGUF Q6_K K-quant format -- C++ port of gguf_q6_k.py's own
+// apply_gguf_q6_k_quantization. Weight-only quantizes every MatMul/
+// vanilla-Gemm layer with a constant 2-D float32 weight, one 256-element
+// super-block at a time over the weight's own flattened storage: each
+// super-block is split into 16 sub-blocks of 16 elements, each sub-block
+// sharing one 8-bit scale code multiplied by one shared float16
+// super-block scale, times a symmetric 6-bit element code. See
+// ``passes/gguf_q6_k.h`` for the exact rewrite, and gguf_q6_k.py's own
+// docstring for the full rationale and this format's own
+// encoder-provenance honesty note (the dequantization formula is
+// transcribed from this repo's own verified ``onnxsim/ggml_kquant.h``
+// decoder; the encoder's own choice of sub-block/super-block scale is an
+// honestly-scoped fit, not a verified reproduction of llama.cpp's own
+// encoder). Unlike Q4_K/Q5_K (which this repo has no C++ port for at
+// all, due to their packed asymmetric 6-bit (scale, min) sub-block
+// codes), Q6_K's own reconstruction has no packed-bitfield complexity to
+// get wrong, so this port ships alongside its Python module.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_gguf_q6_k_quantization``'s Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_gguf_q6_k_quantization`` (``gguf_q6_k.py``): not required to be
+// bit-for-bit identical (see ``passes/gguf_q6_k.h``'s own note on why
+// this port is nonetheless expected to track the Python port unusually
+// closely, having no accumulation or iterative-refinement step at all) --
+// ``ApplyGgufQ6K``/its ``_cpp`` Python wrapper and
+// ``apply_gguf_q6_k_quantization`` are independently-correct,
+// non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
+
 // llama.cpp's "importance matrix" (imatrix) -- C++ port of
 // imatrix_quant.py's own apply_imatrix_quantization, declared in
 // imatrix_quant_entry.h (included above) rather than duplicated here,

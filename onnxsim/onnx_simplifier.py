@@ -3152,6 +3152,39 @@ def apply_fp6_llm_quantization_cpp(
     return onnx.load_from_string(C.apply_fp6_llm(model.SerializeToString()))
 
 
+def apply_gguf_q6_k_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q6_k_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's Q6_K K-quant format -- a
+    256-element super-block split into 16 sub-blocks of 16 elements, each
+    sharing one 8-bit scale code times a shared float16 super-block scale,
+    times a symmetric 6-bit element code. See
+    :func:`onnxsim.apply_gguf_q6_k_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q6_K quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q6_k_quantization(model.SerializeToString())
+    )
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:
