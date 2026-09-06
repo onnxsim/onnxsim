@@ -1610,6 +1610,24 @@ earlier regression test: `test_grouped_conv_splits_across_two_mac_engines_dense_
 was chosen at `cin=cout=4` -- right at (not below) the real threshold.
 A second test now locks in the size-threshold side of this directly.
 
+**`Gemm` has the same two-regime split, but at a much higher, distinct
+threshold.** Checked directly against a real profiled resnet18d fc layer
+(`k=512, n=1000`, the real shape): 48 sub-events split across both `conv0`
+and `conv1` (16 tiles x 3 sub-events), matching the real trace exactly.
+But unlike `Conv`, neither `k` nor `n` alone drives it: `Gemm(k=512,
+n=16)` and `Gemm(k=16, n=512)` -- each with 8,192 weight elements --
+*both* stay on a single engine, while `Gemm(k=n=256)` (65,536 elements)
+splits and `Gemm(k=n=128)` (16,384 elements) does not, confirmed stable
+across independent rebuilds at both ends. So `Gemm`'s cutover needs a much
+larger, roughly-square shape to trigger, sitting somewhere in the 128-256
+range for `k=n`, in clear contrast to `Conv`'s tiny 4-vs-5-channel
+threshold. This is a real, confirmed difference in the two ops' tiling
+strategies, not a single formula ported across op types -- reported
+honestly as "a real threshold exists, at a different scale per op," not
+as a unified quantity (candidates like raw weight-element count and
+output-element count were both checked and neither cleanly explains both
+ops' thresholds together).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

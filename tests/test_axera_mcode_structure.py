@@ -986,3 +986,34 @@ def test_dense_conv_two_engine_split_is_a_channel_count_threshold(tmp_path):
 
     assert conv_engines(channels=4) == (3, ["conv1"])
     assert conv_engines(channels=5) == (6, ["conv0", "conv1"])
+
+
+def test_gemm_two_engine_split_threshold_differs_from_conv(tmp_path):
+    """Confirmed real via --profile (see the README's "Gemm has the same
+    two-regime split, but at a much higher, distinct threshold" section):
+    Gemm(k=n=128) (16,384 weight elements) stays on a single engine while
+    Gemm(k=n=256) (65,536 elements) splits across both conv0 and conv1 --
+    confirmed stable across independent rebuilds at both ends. This is a
+    real threshold, but at a much larger, roughly-square shape than
+    Conv's tiny 4-vs-5-channel cutover -- neither op's threshold reduces
+    to the other's formula.
+    """
+
+    def gemm_engines(k, n):
+        _, trace_path = _build_axmodel(
+            os.path.join(str(tmp_path), f"k{k}_n{n}"),
+            _gemm_model(transb=0, k=k, n=n),
+            (1, k),
+            profile=True,
+        )
+        trace = json.load(open(trace_path))
+        events = trace["traceEvents"] if isinstance(trace, dict) else trace
+        gemm_events = [
+            e
+            for e in events
+            if e.get("ph") == "X" and re.fullmatch(r"y_\d+_\d+", e.get("name", ""))
+        ]
+        return len(gemm_events), sorted({e.get("tid") for e in gemm_events})
+
+    assert gemm_engines(k=128, n=128) == (3, ["conv1"])
+    assert gemm_engines(k=256, n=256) == (6, ["conv0", "conv1"])
