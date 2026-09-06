@@ -1689,3 +1689,55 @@ def test_resnet18d_40_02_operands_are_wbt_offsets_paired_with_50_03(tmp_path):
     assert max(ops5003) < 0.35 * wbt_size, (max(ops5003), wbt_size)
 
     assert len({operand(i) for i in by_kind["50 01"]}) <= 4
+
+
+def test_resnet18d_40_02_operand_is_live_for_any_value_with_no_bounds_check(tmp_path):
+    """Confirmed real (see the README's "Patching a `40 02` operand on the
+    device" section): overwriting instance 32700's whole 4-byte operand
+    with another instance's valid offset, with 0, or with a value 1 MB
+    past the Wbt's end all run without fault and all change the output
+    -- the operand is live and causal for any value, and the runtime
+    does not bounds-check it (the 0x8030070C validator guards header
+    words, never operand values). The past-end read is deterministic.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    compiled = onnx.load(path)
+    wbt_size = len(
+        bytes(
+            {i.name: i for i in compiled.graph.initializer}[
+                _params_key(compiled)
+            ].raw_data
+        )
+    )
+    x = np.random.RandomState(42).randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    a, b = 32700, 48300  # the two probed `40 02` instances' operand words
+    op_b = int.from_bytes(mcode[b : b + 4], "little")
+    assert op_b <= wbt_size
+
+    def run_with_operand(value, tag):
+        patched = bytearray(mcode)
+        patched[a : a + 4] = struct.pack("<I", value)
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"op_{tag}.axmodel")
+        onnx.save(c, p)
+        dev = _run_retry_once(p, x)
+        assert not dev.error, (tag, value, dev.error)
+        out = np.frombuffer(dev.outputs[0], dtype=np.float32)
+        assert not np.array_equal(out, out_base), (tag, value)
+        return out
+
+    run_with_operand(op_b, "foreign")
+    run_with_operand(0, "zero")
+    past = wbt_size + 0x100000
+    first, second = run_with_operand(past, "past1"), run_with_operand(past, "past2")
+    assert np.array_equal(first, second), (
+        "expected the past-end read to be deterministic"
+    )

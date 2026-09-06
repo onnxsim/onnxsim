@@ -2123,6 +2123,43 @@ The most common instruction, `50 01`, takes only four distinct operand
 values across 724 uses -- a small enumerated control/flag word, not a
 pointer; which flags is not identified.
 
+### Patching a `40 02` operand on the device: in-range predictions hold, the bounds-check prediction fails
+
+The section above named one targeted test; here it is, on the real
+device. Overwrite instance 32700's whole 4-byte operand (`0x00064c8c`)
+and run, one variant per fresh copy, same fixed input:
+
+```
+A <- B's operand 0x00b349a0 (valid, in range)   runs, D  argmax 905
+B <- A's operand 0x00064c8c (valid, in range)   runs, D  argmax 832
+A <- 0                                          runs, D  argmax 925
+A <- last in-range word (Wbt end - 4)           runs, D  argmax 18  (smallest change, 0.83)
+A <- 1 MB past the Wbt's end                    runs, D  argmax 530
+A <- 0x7fffff00 (~2 GB, far past)               runs, D  argmax 794
+```
+
+**Confirmed:** the operand is live and causal for any value -- every
+variant ran and changed the output, deterministically (the two past-end
+variants and the swap each reproduce the identical output across three
+reruns). Swapping two instances' offsets works in both directions.
+
+**Refuted, and worth stating plainly:** the prediction that an
+out-of-range offset would fault. It does not. The runtime accepts 1 MB
+past the Wbt's end, and `0x7fffff00`, without any error -- there is **no
+bounds check on this operand**. So the "weight-table offset" reading
+rests on the static evidence (181 distinct values whose maximum matches
+the Wbt's size to 0.3%), not on any runtime enforcement; mechanically
+this behaves like a raw base-plus-offset read, and a past-end value
+simply reads whatever stable, mapped memory sits there (deterministic
+across reruns, so not uninitialized garbage). It also sharpens what the
+`0x8030070C` validator is: every fault in this whole investigation came
+from a *header/format* byte, never from an operand value, however
+absurd -- the validator checks instruction structure, not operands.
+
+One suggestive detail, single data point: pointing the op at the last
+in-range word produced the *smallest* change of all six (0.83, vs
+2.4-7.5), as reading a near-empty tail of the weight table would.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
