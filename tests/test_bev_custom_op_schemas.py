@@ -52,7 +52,7 @@ def _folded_dim(model):
     folded, not left as live nodes)."""
     sim_model, ok = onnxsim.simplify(model)
     assert ok
-    assert sim_model.graph.node == [], [n.op_type for n in sim_model.graph.node]
+    assert len(sim_model.graph.node) == 0, [n.op_type for n in sim_model.graph.node]
     assert len(sim_model.graph.initializer) == 1
     return int(numpy_helper.to_array(sim_model.graph.initializer[0])[0])
 
