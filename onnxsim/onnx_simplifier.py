@@ -1500,15 +1500,24 @@ def apply_structured_pruning_cpp(
       (ORT's dynamic-quantization fusion) --
       :func:`onnxsim.apply_structured_pruning_dynamic_quantize_matmul`'s C++
       counterpart.
+    * ``ConvInteger``-based dynamic quantization (ORT's unfused
+      ``DynamicQuantizeLinear -> ConvInteger -> Cast -> Mul`` Conv pattern) --
+      a PARTIAL C++ counterpart of
+      :func:`onnxsim.apply_structured_pruning_dynamic_quantize_conv`: the
+      ordinary same-family producer/consumer chain (plus its ``Clip``
+      pass-through and depthwise-mid-chain hops) is matched and pruned here,
+      but the Python reference's own extra
+      ``GlobalAveragePool -> Flatten/Reshape -> {MatMul, Gemm}``
+      classifier-head exception is NOT -- so, unlike every other family
+      above, this one is still not a full behavioral match and
+      :func:`onnxsim.apply_structured_pruning_dynamic_quantize_conv` itself
+      remains pure Python, not aliased to this entry point.
 
     None of the pure-Python per-format functions above have a
     ``global_sparsity`` parameter of their own, so ``global_sparsity`` below
     has no defined meaning for any quantized-weight family here either --
     every one of them is always applied with its own local per-chain
-    sparsity, unaffected by that flag. ``com.microsoft::ConvInteger``-based
-    dynamic quantization
-    (:func:`onnxsim.apply_structured_pruning_dynamic_quantize_conv`) has no
-    C++ port at all yet and is NOT matched here.
+    sparsity, unaffected by that flag.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
