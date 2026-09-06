@@ -31,7 +31,7 @@
 // versioned dist/ directory (see ORT_BASE), so the glue and the .wasm can never
 // disagree. Bump this one constant to move the whole page to a new
 // onnxruntime-web.
-export const ORT_VERSION = "1.27.0";
+export const ORT_VERSION = "1.29.0";
 
 // Base URL of that version's dist/ directory. Callers append the bundle name
 // (e.g. `${ORT_BASE}ort.min.mjs`) and point `ort.env.wasm.wasmPaths` at it so

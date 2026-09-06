@@ -3,7 +3,7 @@
 # exposes an official release: an imported `onnxruntime` target carrying
 # ONNXRUNTIME_INCLUDE_DIR + the compiled shared library.
 #
-# This used to `add_subdirectory(third_party/onnxruntime-1.28.0/cmake)` ORT's
+# This used to `add_subdirectory(third_party/onnxruntime-1.29.0/cmake)` ORT's
 # own CMake project directly into onnxsim's own CMake project graph. That
 # meant ORT's own vendored onnx copy (fetched by ORT's build via
 # FetchContent, a different onnx version than onnxsim's own third_party/onnx
@@ -21,7 +21,7 @@
 # are precompiled, so their internal onnx never appears here either).
 include(ExternalProject)
 
-set(_ort_ext_source_dir "${CMAKE_SOURCE_DIR}/third_party/onnxruntime-1.28.0")
+set(_ort_ext_source_dir "${CMAKE_SOURCE_DIR}/third_party/onnxruntime-1.29.0")
 set(_ort_ext_prefix "${CMAKE_BINARY_DIR}/onnxruntime-ext")
 set(_ort_ext_install_dir "${_ort_ext_prefix}/install")
 

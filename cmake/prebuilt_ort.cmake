@@ -10,7 +10,7 @@
 #                         that contains include/ and lib/). When set it is used
 #                         as-is and nothing is downloaded.
 #   ONNXSIM_ORT_VERSION - release version to download when ONNXSIM_ORT_HOME is
-#                         unset (default 1.28.0).
+#                         unset (default 1.29.0).
 #   ONNXSIM_ORT_URL     - full download URL, overriding the auto-detected release
 #                         asset (useful for GPU builds or mirrors).
 #
@@ -24,7 +24,7 @@
 # that does not match the release tarball, so find_package(onnxruntime) fails on
 # the archive. Locating the artifacts directly is more robust.
 
-set(ONNXSIM_ORT_VERSION "1.28.0" CACHE STRING
+set(ONNXSIM_ORT_VERSION "1.29.0" CACHE STRING
     "Prebuilt ONNX Runtime release version to use when ONNXSIM_PREBUILT_ORT is ON")
 set(ONNXSIM_ORT_HOME "" CACHE PATH
     "Path to an extracted prebuilt ONNX Runtime release (skips the download)")

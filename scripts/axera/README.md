@@ -2804,6 +2804,396 @@ instruction forms with their own widths, and it is the next thing to
 validate with the permutation method -- the width-rule test above is
 exactly the template for it.
 
+### Fourth correction: seventeen tags, the trailing byte is the register, and `23 00` was a prefix byte
+
+Running that validation changed three earlier readings. All numbers are
+block B of the cached `resnet18d` and `mnasnet_small` builds plus the
+tiny two-conv model, against a shuffled copy of the same block.
+
+**The tag set is not 0x81..0x84.** Admitting any tag byte in
+0x81..0x9f (everything below the verb bytes 0xa1..0xa9) at offset
+`p + 2` lifts block B from 42.6% to **82.7%** explained in `resnet18d`
+while the null only moves from 10.7% to 23.3%. Per tag, the ratio over
+the null splits cleanly: 0x81..0x86, 0x89..0x8d, 0x94, 0x95, 0x9b..0x9d
+and 0x9f are 2x..9x above it in both models (0x9b 8.6x, 0x9d 6.0x, 0x95
+5.9x, 0x8b 4.8x, 0x9c 4.8x, 0x9f 3.6x in `resnet18d`, n = 416 for
+0x9f), while 0x90, 0x91, 0x96..0x99 sit *at or below* it (0.1x..0.5x)
+and 0x87, 0x88, 0x8e, 0x8f, 0x92, 0x93, 0x9a, 0x9e reach 2x in one
+model only. With that data-driven set of **17 tags** and `p <= 4`,
+block B is **76.1%** explained in `resnet18d` (null 19.5%, 3.9x),
+**81.8%** in `mnasnet` (null 22.7%, 3.6x) and 75.7% in the tiny model
+(null 26.5%); the residue falls from 11,134 to **4,636** bytes and from
+16,990 to **8,146** bytes. The `tag = 0x84 - p` pairing the third
+correction reported is the *dominant* pairing, not a rule: 0x84 takes
+`p = 0` in 539 of 601 units, but 0x81 takes `p = 3` in only 48 of 282
+`resnet18d` units (1,261 of 1,748 in `mnasnet`). The tag does not
+encode the width; `p` does.
+
+**The trailing byte is the register, and the payload is the value.**
+The byte after the tag is even in **2,909 of 2,911** `resnet18d` units,
+6,248 of 6,253 `mnasnet` units and 258 of 258 tiny-model units (99.9%),
+against a 64% background; the first payload byte is even at exactly the
+background rate (59.6%, 63.4%, 77.1% vs 64.5%, 63.8%, 71.7%). Only a
+2-byte-granular offset looks like that. So the short unit reads
+`[p][p+1-byte value][tag][register]`, not `[p][field][tag][value]` as
+the layout section had it -- the verb form `a1 00 xx yy <32-bit>`
+addresses at 16-byte granularity through `xx`, the short form at 2-byte
+granularity through its last byte. The test helper's tuple still
+returns the first payload byte in the slot it always did; only the name
+changed.
+
+**`23 00` is a prefix byte, not a header.** With the wide tag set,
+1-byte residue runs are the largest class (381 of 1,178 runs in
+`resnet18d`), and they sit *immediately before an ordinary unit*: `23`
+precedes a `p = 0` unit 139 times, `03` 102 times (plus 13 before a
+`p = 1` unit), `3c` 21 times; `mnasnet` uses `04` (104), `2d` (50),
+`03` (46), `05` (43), `1c` (42). The `23 00 ...` pairs the previous
+section counted are `23` followed by the `00` that opens a `p = 0`
+unit. That is a one-byte prefix with model-specific values on ordinary
+units -- what it modifies is open -- and not a second header family.
+The tiny model's four non-deterministic bytes are inside one such
+prefixed unit.
+
+**What does not validate.** A payload-less `[tag][even byte]` pair
+(the natural `p = -1`) would push `resnet18d` to 89.5% explained, but
+the null rises to 40.8% with it (ratio 2.2 from 3.9) and per tag it is
+at or below chance -- 0x84 pairs 59 real vs 266 shuffled, 0x9f 207 vs
+315, 0x81 126 vs 226; only 0x87 (112 vs 76; 183 vs 105) and 0x88 (154
+vs 101; 137 vs 86) exceed it, at ~1.5x. Not admitted. A 2-byte `e1 XX`
+pair (odd `XX`) is 21 vs 13 in `resnet18d` and 86 vs 31 in `mnasnet`
+-- a candidate, not a form. No tag byte has a fixed argument length
+(for every tag with n > 100 the modal distance to the next tag byte
+holds < 50% of cases), so the 0x85..0x9f family are tags in the same
+width rule, not opcodes of their own.
+
+**Both configuration blocks open with the same 158 bytes.** Block A
+and block B of `resnet18d` and of `mnasnet` all begin with the same
+158-byte prologue (four-way identical); the tiny model has the same
+prologue with one operand changed -- the `a1 00 60 02` write at +16
+carries `0x31480` (201,856) in both 224x224 models and `0xd80` (3,456)
+for the 1x4x16x16 input -- and its shorter blocks (608 and 2,231 bytes)
+lack the region that follows. The first per-model bytes after the
+prologue are `p = 2` units on tag 0x81/0x82 whose payloads are
+`09 bf 01` vs `09 c3 01` and `09 80 03` vs `09 3c 05` with `09 00 07`
+shared: 16-bit parts 447 vs 451, 896 vs 1,340, 1,792, the first model
+quantities in the block and unmatched to any count tracked here
+(op count, block sizes, token counts).
+
+Test: `test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register`
+in `tests/test_axera_mcode_structure.py` (fresh `resnet18d` build,
+fixed-seed null, no device).
+
+### Fifth correction: every tag byte is real, so is the bare pair -- the explained-bytes null was the wrong null
+
+The section above rejected 14 tag bytes and the payload-less
+`[tag][even]` pair because admitting them raised the *shuffled* block's
+explained fraction almost as much as the real one's. That comparison is
+sound for a common form and useless for a rare one: shuffling the block
+leaves ~60% of it unexplained, and a rare pattern then matches by
+chance inside that residue about as often as it occurs for real. The
+right null for a rare form is conditional: given the form's own anchor
+byte, does the byte the rule constrains behave as the rule says, and
+does it do so in the shuffled block?
+
+**Every byte in 0x81..0x9f is a tag.** Admitting all 31 as p-unit tags,
+the trailing byte is even in essentially every real unit *for every
+tag*: 0x87 52/52, 0x88 95/95, 0x8e 26/26, 0x92 31/31, 0x93 22/22 in
+`resnet18d` (the "rejected" ones), alongside 0x84 601/601 and 0x9f
+416/416; `mnasnet` likewise (0x87 14/14, 0x88 50/50, 0x92 26/26, 0x93
+51/51, 0x9c 166/166). In the shuffled block the same units are even at
+50..70% for every tag (0x84 100/151, 0x9f 79/116). The 17-tag set was
+a false rejection of the rarer tags, not a property of the format.
+
+**The bare `[tag][register]` pair is real.** Among residue runs of
+exactly two bytes that begin with a tag byte, the second byte is even in
+**265 of 265** (`resnet18d`), **598 of 600** (`mnasnet`) and 29 of 29
+(tiny) -- against a 60% background inside the residue and 7 of 12 in
+the shuffled block. That is the `p = -1` width: a register touched with
+no payload. Two more forms show the same signature and are noted, not
+yet tokenized: `e1 XX` with `XX` *odd* in 13/14, 48/48 and 7/7 cases
+(the verb byte 0xa1 with bit 6 set), and 0xa1 itself acting as a tag
+when not followed by `00` -- bare `a1 5e`-style pairs are even 8/8 and
+20/20, and `01 70 04 a1 5e` is a `p = 1` unit on tag 0xa1.
+
+**Where block B stands.** With all tags, `p <= 4` and bare pairs, block
+B is **93.5%** explained in `resnet18d` (residue 1,267 of 19,383
+bytes), **93.3%** in `mnasnet` (3,004 of 44,695) and 85.9% in the tiny
+model. The shuffled block reaches 42.9% under the same rule -- the
+inflation that misled the section above, and the reason the parity
+counts, not that figure, carry the claim. The residue is now mostly the
+one-byte prefixes: 641 of 762 residue runs in `resnet18d` (`23` 150,
+`03` 118, `16` 72, `3c` 28, `05` 21, `0d` 19), 992 of 1,415 in `mnasnet`
+(`04` 115, `05` 99, `03` 62, `1c` 52, `2d` 50), and 559 + 63 of those
+641 are followed directly by a p-unit or a bare pair. The multi-byte
+leftovers are a few 6..7-byte runs that sit immediately before a verb
+(`09 20 02 00 00 01 00`, `09 c0 0c 80 fe 01 01`, `08 0b 55 fc 55 01`)
+-- a candidate pre-verb form with too few instances to test yet.
+
+Test: `test_resnet18d_every_tag_and_the_bare_pair_pass_the_parity_null`
+in `tests/test_axera_mcode_structure.py`; the previous test's bare-pair
+assertion is replaced by the corrected claim.
+
+### Sixth correction: there is no prefix byte -- tag 0x9f's unit is one byte longer
+
+Asking what *precedes* the "prefix" bytes settles them. In `resnet18d`
+block B, 592 of the 641 one-byte residues follow a unit whose tag is
+0x9f (394 after a p-unit on 0x9f, 198 after a bare `9f reg` pair); in
+`mnasnet` it is 797 of 992. Per tag, the share of units followed by
+exactly one leftover byte is **592 of 624 for 0x9f** and at most 1% for
+every other tag (0x81 3/410, 0x84 0/661, 0x95 0/237, 0x8b 0/187);
+`mnasnet` 797 of 875 for 0x9f, at most 6% otherwise. A bare 0x9f pair is
+followed by one leftover byte in 198 of 208 cases where every other
+bare tag is followed by the next unit directly. So 0x9f's unit is
+`[p][value][9f][register][extra]` (and bare `9f reg extra`), one byte
+longer than any other tag's, and the fourth correction's "one-byte
+prefix with model-specific values" is that extra byte read as belonging
+to the wrong unit. Its values are the ones the prefix table listed
+(`23`, `03`, `16`, `3c`, `0d`, `26` in `resnet18d`; `04`, `05`, `03`,
+`1c`, `2d`, `00` in `mnasnet`), below 0x40 in 98.3% and 89.2% of cases
+and with no parity constraint (36% and 60% even) -- a small value, not
+a register. The 0x9f write shares its register with the *next* unit in
+320 of 544 and 315 of 647 cases, so 0x9f looks like a modifier issued
+just before a write to the same register; what the extra byte selects
+is open.
+
+**Where the blocks stand.** With every tag, `p <= 4`, bare pairs and the
+0x9f rule, block B is **96.5%** explained in `resnet18d` (673 of 19,383
+bytes left) and **95.2%** in `mnasnet` (2,152 of 44,695); the shuffled
+block stays at 44%. Under the same rule the whole mcode is covered
+region by region -- `resnet18d`: block A 93.8%, block B 96.5%, the op
+programs 98.7%, **95%+ of every tokenized byte** and 94% of the whole
+blob including the untokenized FlatBuffers header and trailer;
+`mnasnet` 92.6% / 95.2% / 98.5%. What remains in block B is a short
+list: `e1 XX` pairs (14, 48), `01 70 04 a1 5e`-style units on tag 0xa1
+(12, 37) and bare `a1 reg` pairs (8, 20), a handful of single `05`/`08`/
+`06` bytes, and the 6..7-byte runs that sit directly before a verb
+(`09 20 02 00 00 01 00`, `08 0b 55 fc 55 01`; 6 + 6 in `resnet18d`, 19 +
+17 in `mnasnet`). The tiny model's block B stays at 86% because its
+ops region carries proportionally more of those pre-verb runs.
+
+Test: `test_resnet18d_tag_9f_units_carry_one_extra_byte` in
+`tests/test_axera_mcode_structure.py` (fresh build, no device).
+
+### The op programs are fully tokenized; the "trailer" is a five-table FlatBuffers tail the header points to
+
+The op region's last residue turned out not to be instructions. Under
+the full rule its only leftovers were two runs at the very end whose
+bytes read `0c 00 10 00 0f 00 0e 00 08 00 04 00` (a FlatBuffers vtable)
+and `7b 7d` (the string `{}`), so the "252-byte trailer" every earlier
+section stopped short of was too short by about 230 bytes. Measured on
+all three models:
+
+- **The stream ends 7 bytes after its last verb** -- a 7-byte `a2`
+  verb -- at 48,583 (`resnet18d`), 78,103 (`mnasnet`) and 3,447 (tiny);
+  then 17, 1 and 1 zero bytes; then a FlatBuffers vector of five table
+  offsets (`05 00 00 00 | 20 | 2c | 50 | 74 | 98`) **480 bytes before
+  the end** (472 in the tiny model). The header's 32-bit word at offset
+  272 is a FlatBuffers offset to exactly that vector in all three
+  (272 + 48,328 = 48,600; 272 + 77,832 = 78,104; 272 + 3,176 = 3,448),
+  so the header and the tail are one FlatBuffers structure wrapped
+  around the instruction stream.
+- **With the boundary right, the op programs are 100% tokenized** in
+  all three models (0 residue bytes in 17,767, 13,431 and 311). The whole
+  stream is **98.1%** explained in `resnet18d` (block A 97.75%, block B
+  96.5%, ops 100%), 96.0% in `mnasnet` and 88.0% in the tiny model;
+  counting the untokenized header and tail against it, 96.5%, 95.1% and
+  70.7% of the whole blob.
+- **Every configuration block ends the same way the header does.** The
+  header's last 17 bytes, `2b a7 00 00 0a 00 00 00 00 a2 00 00 00 13 00
+  40 00`, reappear byte for byte as the last 17 bytes of block A in all
+  three models (`40` is `30` throughout `mnasnet`), preceded by zero
+  bytes. Their last 8 bytes are an 8-byte `a2 00 00 00` verb with
+  operand `0x00400013`; the stream's own final bytes are `a2` verbs of
+  the same shape with per-model low halves (`0x7b2`; `0x642`, `0x652`;
+  `0x12`, `0x22`). So the 297-byte "header" is a FlatBuffers header of
+  280 bytes plus the same block terminator the config blocks use.
+- **The five tables share one schema.** Table 0 has four fields
+  (`59393`, `260`, then two per-model words: 2,228 / 3,812 in
+  `resnet18d`); tables 1..4 have six: a type word (4,097 for tables
+  1..3, 2,561 for table 4), an id (257, 258, absent, absent), two
+  per-model counts, a packed word that is always the second count
+  shifted left 8 bits plus 1 (865,281 = 3,380 x 256 + 1, in every
+  table of every model), and a byte-count-sized value. Table 4's last
+  field is block A's length minus 21 in both large models (11,115 vs
+  11,136; 19,658 vs 19,680) -- the 21 bytes being the terminator above
+  plus four zeros -- but 606 vs 608 in the tiny model, so that reading
+  is a lead, not a result. `resnet18d`'s values, tables 1..4: counts
+  (432, 3,380), (612, 2,768), (1,376, 1,392), (1,392, --); sizes 3,455,
+  4,881, 11,000, 11,115. None equals a unit, verb or byte count measured
+  here; per-engine instruction budgets are the obvious guess.
+
+Test: `test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail` in
+`tests/test_axera_mcode_structure.py` (fresh build, no device).
+
+### The tail is the segment table: the stream is its segments, in reverse, and `a7` is the sixth verb
+
+The five tail tables decoded themselves once a second model shape was
+in hand. Verified on seven mcodes -- `resnet18d`, `mnasnet_small`, the
+tiny two-conv model, a 1-layer Mistral compiled through the ONNX path
+(`build_from_hf_checkpoint()`, see the LLM sections below) and, from a
+real `pulsar2 llm_build` of `HuggingFaceTB/SmolLM2-135M`, both `neu
+mode` subgraphs of `llama_p512_l0_together.axmodel` and the LM head
+`llama_post.axmodel`:
+
+- **Field 2 is a segment length in 8-byte words and field 3 counts
+  down.** In every table of every mcode, `f3[k] = f3[k-1] - f2[k]`, and
+  table 0's `f3` is the sum of every later table's `f2`. The packed
+  field 4 is `f3 << 8 | 1` throughout.
+- **The segments tile the blob exactly, in reverse table order.** Take
+  the tail vector's offset, subtract 8 x the sum of every table's `f2`,
+  and you land on the end of the FlatBuffers header (280 bytes for every
+  one-input CNN, 436 for the ONNX-path Mistral with two inputs, 700 and
+  744 for the two `llm_build` subgraphs, 296 for the post model); lay
+  the segments out from there, last table first, and the last one ends
+  on the tail vector to the byte in all seven mcodes. The last table is
+  configuration block A exactly (11,136 = 1,392 x 8); the "block B" the
+  earlier sections treated as one region is really *three* segments in
+  `resnet18d` (11,008 + 4,896 + 3,456 bytes); the op programs are table
+  0's segment.
+- **Every segment opens with an `a7` verb, and `a7` is a verb.** The
+  17-byte "block terminator" was misread: `2b a7 00 00 0a 00 00 00 00`
+  is one leading byte (`2b`, `24`, `33`, `3b` -- segment-specific) and
+  an 8-byte `a7 00 00 NN <u32>` instruction of exactly the verb shape
+  (`NN` = 0x0a in the CNNs and the post model, 0x10 in the ONNX-path
+  Mistral, 0x1e in the `llm_build` layer), followed by the segment's
+  first real verb. `llm_build` op programs then use `a7 00 00 02 02 00
+  00 00` freely -- 205 and 261 times inside the two subgraphs' op
+  segments, where the five-verb tokenizer left 8-byte holes.
+- **Segment types.** Table field 0 is `X << 8 | 1`: 0x0a for the first
+  configuration segment, 0x10 for the others and 0xe8 for the op
+  programs in every CNN and the ONNX-path LLM; the `llm_build` layer's
+  fifteen segments use 0x0a, 0x10, 0xe8, 0xd0, 0xb8, 0xa0, 0x88, 0x0c,
+  0xf0 with its 112-program op segment on 0x88 and two 14/15-program
+  segments on 0x0c/0xf0 -- different engines or queues is the obvious
+  reading, untested.
+
+**Coverage, by segment, with `a7` admitted.** Op-program segments are
+**100% tokenized in all seven mcodes** past the 4..5 marker bytes that
+straddle a segment's opening word boundary (resnet18d 17,824 bytes; mnasnet
+13,472; the `llm_build` layer's 12,160 + 1,984 + 2,080 and 19,712 + 992
++ 992; the post model's 72,448 with 772 programs). Configuration
+segments run 90..99%. Whole streams (zero padding trimmed): `resnet18d`
+98.3%, `mnasnet` 96.3%, tiny 91.7%, ONNX-path Mistral 95.4%, `llm_build`
+layer 96.1% and 96.5%, post model 99.7%.
+
+**What the LLM builds add.** The ONNX-path Mistral (80 ONNX ops, 75 op
+programs, 21 s to compile) keeps the CNN op-program skeleton verb for
+verb -- `40.02, 50.01, 50.01, a8 40.03, 50.03, 50.01, a3, 50.01, a9,
+[a2], a8 30.02`, the two most common variants covering 57 of 74
+programs -- with the trailing slot varying by op: `a1 30.03` in 9
+programs, `a1 20.02` (a slot the CNN templates lack) in 8, neither in
+the rest; its two graph inputs get two `a2` verbs in the segment opener
+where the CNNs' one input gets one, but the `llm_build` layer (5 inputs)
+gets one and the post model (1 input) gets four, so that is not an
+input count. The `llm_build` subgraphs (decode and prefill, 145 and 167
+programs, 92 s for all 30 layers plus the head) are the first mcode
+with programs of 104..144 bytes: the skeleton plus `a7` verbs inside.
+Their config-segment openers start `1e 00 00 00 00 a2 00 00 00 83 01
+c0` -- the `a7` marker's operand straddling the 8-byte segment
+boundary, so segment lengths are exact but not marker-aligned.
+
+**What `a7` does inside a program.** In the `llm_build` layer's 0x8801
+segment the two most common skeletons (85 of 112 programs in the decode
+subgraph, 67 of 151 in prefill) are the CNN core with two `a7` verbs
+inserted at fixed slots: `40.02 | 50.01 | 50.01 | a7.1e | a8 40.03 |
+50.03 | 50.01 | a3 | 50.01 | a9 | [a2] | a7.02 | a8 30.02`, where `a7.1e`
+carries operand 0 and `a7.02` operand 2. The same `a7.1e` with operand 0
+opens every segment of these mcodes (`a7.0a` in the CNNs, `a7.10` in the
+ONNX-path Mistral), so `a7` reads as a synchronization verb -- a wait
+or fence on channel `yy` before the engine-dispatch verbs and a signal
+on channel 2 after them -- that the CNN op programs never need and the
+BF16 layer programs use on every op. The layer's two small segments (14
+and 15 programs on types 0x0c01/0xf001 in decode, 6 and 6 in prefill)
+hold the core followed by runs of 2..13 `a2 00.00` verbs, plus one
+program per segment that writes every field 0x40..0xe0 of banks 2, 3
+and 4 in order -- a full register load, presumably the KV-cache and
+I/O binding.
+
+**Confirmed on the AX650N: `a7` is a synchronization verb, and its
+operand is what matters.** The layer-0 decode subgraph runs on the real
+device only when fed valid inputs (`axcl_run_model`'s random bytes land
+in the `indices` gather input and fault it with `0x8030070C`, exactly
+as the harness's `run_on_device_with_inputs()` docstring warns); with
+zero K/V caches, a zero hidden state and in-range indices it runs in
+0.44 ms and its three outputs are bit-identical run to run. Hand-patching
+its decode mcode and re-running, every outcome reproduced 3 of 3 times:
+
+| patch (decode subgraph) | edits | result |
+|---|---|---|
+| in-program `a7.02` operand 2 -> 0 | 102 | runs, **all three outputs change** |
+| in-program `a7.02` operand 2 -> 1 | 102 | runs, outputs change differently (K and V outputs become identical) |
+| in-program `a7.02` channel 02 -> 1e | 102 | runs, outputs **identical** to baseline |
+| in-program `a7.02` channel 02 -> 03 | 102 | runs, outputs change (same as operand 0) |
+| in-program `a7.1e` operand 0 -> 1 | 103 | **fault `0x8030070C`** |
+| in-program `a7.1e` channel 1e -> 02 | 103 | runs, outputs identical |
+| segment-opening `a7.1e` markers, operand 0 -> 1 | 15 | **fault `0x8030070C`** |
+
+So the operand-0 form (`a7.1e`, at every segment start and before each
+op's dispatch verbs) is a wait or reset that must read 0, the operand-2
+form (`a7.02`, after each op's dispatch) is a post whose value fixes
+what the consumers of that op see -- change it and the pipeline still
+runs to completion but with a different (racy or stale) data ordering,
+producing wrong outputs with no fault -- and the channel byte
+distinguishes 0x02/0x1e from 0x03 but not from each other. The
+timing differences between variants were within run-to-run noise
+(0.43..0.54 ms) and are not claimed.
+
+**0xa1 is also a tag, and bit 6 of a tag flips the register's parity.**
+The config-segment residue that remained is mostly three forms, and the
+conditional-parity null settles all three (counts are the `llm_build`
+layer's decode and prefill subgraphs; a fresh `resnet18d` build has 15
+of 16 and 18 of 19 for the first and third): bare `a1 XX` pairs have an
+even `XX` in
+37 of 37 and 65 of 65 cases against 28:13 and 36:31 in the shuffled
+segments; `01 .. a1 XX` p-units have an even register 31 of 31 and 76
+of 76 times; and bare `e1 XX` pairs have an **odd** `XX` in 71 of 71 and
+116 of 116 cases (`c1 XX` 4 of 4 and 10 of 10) against 4:2 and 8:2
+shuffled. So the verb
+byte 0xa1 doubles as a tag whenever it is not in verb position (`a1 00
+x0`), and the 0x40 bit of a tag (0x81 -> 0xc1, 0xa1 -> 0xe1) selects the
+odd register -- the other half of a 2-byte register pair, presumably.
+Admitting them takes the config segments' non-zero bytes from 97.4% to
+98.1% explained in `resnet18d`, 95.6% to 97.2% in `mnasnet`, and 95.9% /
+95.5% to 97.0% / 97.2% in the two `llm_build` subgraphs (shuffled
+segments stay at ~46% under the same rule). `_tokenize_mcode` takes
+these as `odd_tags`.
+
+**Confirmed on the AX650N: the segment table is a loader manifest the
+runtime validates field by field.** Patching one field of the decode
+subgraph's tail tables and re-running with valid inputs, every variant
+faulted with `0x8030070C` on every run (3 of 3 each, baseline
+bit-identical 3 of 3): the op segment's type word `0x8801 -> 0xe801`;
+its word count `f2 + 1`; its remaining count `f3 + 1`; table 0's total
+`f3 + 1`; a 6-field table's byte size `f5 - 64`; the same table's
+packed word `f4 + 1`; and table 0's own `f2 + 1`. Two of them (the type
+word's first run and the total-count patch) first hung the runtime for
+about two minutes -- `axcl_run_model` in uninterruptible sleep and
+`axcl-smi` blocked behind it -- before the fault surfaced, so a wrong
+segment table is the one patch class found so far that can stall the
+device rather than fail fast. Treat the table as load-bearing: an
+emitter must write the word counts, the countdown, the packed
+`f3 << 8 | 1` and the byte sizes exactly, not as metadata.
+
+**`llm_build` emits one instruction stream for all 30 layers.** Every
+per-layer file's two mcodes are byte-identical to layer 0's from the
+first byte of the FlatBuffers header to the tail vector; the only
+differing bytes are in the tail's name string (`llama_p512_l0_together_
+decode` / `_prefill_0` -- 1 byte for layers 1..9, 19 or 21 for the
+two-digit layers, where the longer string shifts what follows it) and,
+of course, in `npu_params` (3,963,652 bytes per layer, all different).
+So a transformer layer's mcode is position-independent: the program
+addresses its weights through the Wbt offsets the `40 02` writes carry,
+and a layer's identity lives entirely in the weight table. An emitter
+for this path has one 57,056-byte decode program and one 93,360-byte
+prefill program to get right, not thirty.
+
+Tests: `test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7`,
+`test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7`, and
+`test_onnx_path_llm_mcode_keeps_the_op_program_skeleton` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device; the two
+LLM tests skip unless the checkpoints are already in the HuggingFace
+cache).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
