@@ -25,6 +25,7 @@
 // core/common/endian.h (which neither ships).
 #include "onnxruntime_cxx_api.h"
 #endif
+#include "bev_custom_op_schemas.h"
 #include "constant_folding.h"
 #include "contrib_schemas.h"
 #include "custom_optimizer_passes.h"
@@ -322,6 +323,11 @@ static onnx::ModelProto SimplifyImpl(
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
+  // Likewise for the mmdeploy/mmcv/BEVDet custom ops this branch's
+  // rewrite_*_to_* passes decompose (MMCVMultiScaleDeformableAttention,
+  // MMCVDeformConv2d/MMCVModulatedDeformConv2d, TRTBatchedNMS/
+  // TRTBatchedRotatedNMS, bev_pool_v2).
+  onnxsim::RegisterBevCustomOpSchemas();
   // Correct the determinism metadata of ops ONNX mis-annotates (e.g. Range) so
   // constant folding does not skip them.
   FixupSchemaDeterminism();

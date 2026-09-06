@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "bev_custom_op_schemas.h"
 #include "constant_folding.h"
 #include "contrib_schemas.h"
 #include "onnx/checker.h"
@@ -523,6 +524,7 @@ onnx::ModelProto ConvertOpsetVersion(onnx::ModelProto model,
 // model that may not yet be fully valid.
 void PrepareSchemasForDebug(const onnx::ModelProto& model) {
   onnxsim::RegisterContribOpSchemas();
+  onnxsim::RegisterBevCustomOpSchemas();
   FixupSchemaDeterminism();
   RegisterCustomDefaultDomainOpSchemas(model);
 }
