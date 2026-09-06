@@ -6307,7 +6307,27 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
-  if (keep_count >= h) {
+  // True MQA (`chain.kv_num_heads == 1`) -- mirrors pruning.py's own
+  // `_apply_one_gqa_chain` docstring exactly (and ApplyOneDecomposedGqaChain's
+  // own `is_mqa` handling for the sibling decomposed-attention chain kind):
+  // with exactly one KV group, the ordinary group-granularity formula above
+  // is always `1 == kv_num_heads`, so it can never drop anything no matter
+  // how many query heads (`chain.num_heads`) share that one KV head. This
+  // path instead ranks and drops individual *query* heads directly, leaving
+  // the single shared KV head -- and both its own K/V producer weights and
+  // `kv_num_heads` itself -- completely untouched: `keep_groups` stays fixed
+  // at the sole surviving group (`{0}`, an identity slice of a size-1 axis),
+  // and only `keep_q_heads`/`new_num_heads` are computed differently.
+  const bool is_mqa = h == 1 && chain.num_heads > 1;
+  int64_t q_keep_count = 0;
+  if (is_mqa) {
+    const int64_t nq_total = chain.num_heads;
+    q_keep_count = std::max<int64_t>(
+        1, nq_total - std::llround(static_cast<double>(nq_total) * sparsity));
+    if (q_keep_count >= nq_total) {
+      return std::nullopt;  // no query heads prunable at this sparsity either
+    }
+  } else if (keep_count >= h) {
     return std::nullopt;
   }
 
@@ -6324,11 +6344,11 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   // outright (the same "sparsity rounds to no groups dropped" no-op outcome
   // the `keep_count >= h` check above already gives the caller) rather than
   // emitting an invalid node. Mirrors pruning.py's own `_apply_one_gqa_chain`
-  // `is_sparse_attention` branch -- this port has no MQA (kv_num_heads == 1)
-  // fast path (a pre-existing, already-accepted scope gap: `keep_count >= h`
-  // above already turns that case into a no-op for every chain kind), so
-  // `new_num_heads` here is always exactly `keep_count * group_size`, never
-  // pruning.py's own `q_keep_count` MQA-path alternative.
+  // `is_sparse_attention` branch. Uses `q_keep_count` (the true post-pruning
+  // query head count) rather than `keep_count * group_size` for the MQA fast
+  // path -- that formula assumes every surviving group keeps all
+  // `group_size` heads, which no longer holds once individual query heads
+  // are pruned independently of KV groups.
   const bool is_sparse_attention =
       chain.node->domain() == kComMicrosoftDomain &&
       chain.node->op_type() == "SparseAttention";
@@ -6336,7 +6356,8 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     auto row_it = init_map.find(chain.node->input(5));
     if (row_it != init_map.end() && row_it->second->dims_size() > 0) {
       const int64_t num_layout = row_it->second->dims(0);
-      const int64_t new_q_heads = keep_count * group_size;
+      const int64_t new_q_heads =
+          is_mqa ? q_keep_count : keep_count * group_size;
       if (num_layout != 0 && new_q_heads % num_layout != 0) {
         return std::nullopt;
       }
@@ -6373,64 +6394,113 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
                                  ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
                                  : wv;
 
-  // Combined importance of each KV group's own Q+K+V weight block -- for L2
-  // that's the block's own Frobenius norm; for L1 the sum of every entry's
-  // own absolute value instead, with no square/sqrt anywhere -- mirrors
-  // pruning.py's own `_gqa_group_importance` exactly (see that function's
-  // own comment for why summing every entry, rather than concatenating, is
-  // used -- it stays well-defined even when Q's own row count differs from
-  // K/V's, the cross-attention shape this port also matches).
-  std::vector<double> importance(static_cast<size_t>(chain.kv_num_heads), 0.0);
-  for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
-    double acc = 0.0;
-    for (int64_t r = 0; r < K; ++r) {
-      for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
-        for (int64_t c = g * d; c < (g + 1) * d; ++c) {
+  // Importance: per-*query*-head (true MQA -- mirrors pruning.py's own
+  // `_gqa_query_head_importance`, ranking each query head by its own Q
+  // weight block alone, the shared K/V block deliberately omitted since it
+  // is a constant term identical across every candidate query head here) or
+  // combined per-KV-group Q+K+V weight block -- for L2 that's the block's
+  // own Frobenius norm; for L1 the sum of every entry's own absolute value
+  // instead, with no square/sqrt anywhere -- mirrors pruning.py's own
+  // `_gqa_group_importance` exactly (see that function's own comment for why
+  // summing every entry, rather than concatenating, is used -- it stays
+  // well-defined even when Q's own row count differs from K/V's, the
+  // cross-attention shape this port also matches).
+  std::vector<double> importance;
+  if (is_mqa) {
+    importance.assign(static_cast<size_t>(chain.num_heads), 0.0);
+    for (int64_t qh = 0; qh < chain.num_heads; ++qh) {
+      double acc = 0.0;
+      for (int64_t r = 0; r < K; ++r) {
+        for (int64_t c = qh * d; c < (qh + 1) * d; ++c) {
           const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
           acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
       }
-      for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
-        const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
-        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
-      }
-      for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
-        const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
-        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
-      }
+      importance[static_cast<size_t>(qh)] =
+          importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
     }
-    importance[static_cast<size_t>(kv)] =
-        importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
+  } else {
+    importance.assign(static_cast<size_t>(chain.kv_num_heads), 0.0);
+    for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+      double acc = 0.0;
+      for (int64_t r = 0; r < K; ++r) {
+        for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
+          for (int64_t c = g * d; c < (g + 1) * d; ++c) {
+            const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
+            acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+          }
+        }
+        for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
+          const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+        }
+        for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
+          const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+        }
+      }
+      importance[static_cast<size_t>(kv)] =
+          importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
+    }
   }
 
-  // Wanda upgrade: multiply each KV group's plain ||W||_F by its own
+  // Wanda upgrade: multiply each candidate's plain ||W||_F by its own
   // combined (root-sum-square) slice of the calibrated output-projection
-  // input activation, summed over every query head the group owns --
-  // mirrors pruning.py's own `_wanda_gqa_group_importance` exactly (see
-  // this function's own doc comment above).
+  // input activation -- for true MQA, each *query* head's own `d`-wide slice
+  // at its own head index (mirrors pruning.py's own
+  // `_wanda_gqa_query_head_importance`: the per-head activation term scales
+  // `_gqa_query_head_importance`'s weight-only score instead of
+  // `_wanda_gqa_group_importance`'s combined-per-group one); otherwise summed
+  // over every query head the group owns, mirroring pruning.py's own
+  // `_wanda_gqa_group_importance` exactly (see this function's own doc
+  // comment above).
   if (act_norm != nullptr) {
     auto it = act_norm->find(chain.consumer_node->input(0));
     if (it != act_norm->end() &&
         it->second.size() == static_cast<size_t>(chain.num_heads * d)) {
-      for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
-        double sq = 0.0;
-        for (int64_t c = kv * group_size * d; c < (kv + 1) * group_size * d;
-             ++c) {
-          const double v = it->second[static_cast<size_t>(c)];
-          sq += v * v;
+      if (is_mqa) {
+        for (int64_t qh = 0; qh < chain.num_heads; ++qh) {
+          double sq = 0.0;
+          for (int64_t c = qh * d; c < (qh + 1) * d; ++c) {
+            const double v = it->second[static_cast<size_t>(c)];
+            sq += v * v;
+          }
+          importance[static_cast<size_t>(qh)] *=
+              std::max(std::sqrt(sq), epsilon);
         }
-        importance[static_cast<size_t>(kv)] *= std::max(std::sqrt(sq), epsilon);
+      } else {
+        for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+          double sq = 0.0;
+          for (int64_t c = kv * group_size * d; c < (kv + 1) * group_size * d;
+               ++c) {
+            const double v = it->second[static_cast<size_t>(c)];
+            sq += v * v;
+          }
+          importance[static_cast<size_t>(kv)] *=
+              std::max(std::sqrt(sq), epsilon);
+        }
       }
     }
   }
 
-  std::vector<int64_t> keep_groups =
-      TopKIndicesAscending(importance, keep_count);
+  std::vector<int64_t> keep_groups;
   std::vector<int64_t> keep_q_heads;
-  keep_q_heads.reserve(keep_groups.size() * static_cast<size_t>(group_size));
-  for (int64_t g : keep_groups) {
-    for (int64_t hh = g * group_size; hh < (g + 1) * group_size; ++hh) {
-      keep_q_heads.push_back(hh);
+  if (is_mqa) {
+    // Fixed at the sole surviving KV group -- HeadColumnIndices below turns
+    // this into an identity slice of K's/V's own size-`kv_num_heads * d`
+    // axis (`kv_num_heads == 1`), so K/V stay byte-for-byte untouched;
+    // ranked per query head instead (above), rather than expanding whichever
+    // groups the ordinary group-granularity path would have kept
+    // (meaningless here -- there is only ever one group).
+    keep_groups = {0};
+    keep_q_heads = TopKIndicesAscending(importance, q_keep_count);
+  } else {
+    keep_groups = TopKIndicesAscending(importance, keep_count);
+    keep_q_heads.reserve(keep_groups.size() * static_cast<size_t>(group_size));
+    for (int64_t g : keep_groups) {
+      for (int64_t hh = g * group_size; hh < (g + 1) * group_size; ++hh) {
+        keep_q_heads.push_back(hh);
+      }
     }
   }
   std::vector<int64_t> q_idx = HeadColumnIndices(keep_q_heads, d);
@@ -6477,7 +6547,14 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   }
 
   const int64_t new_kv_num_heads = keep_count;
-  const int64_t new_num_heads = keep_count * group_size;
+  // `keep_q_heads.size()` rather than `keep_count * group_size`: identical
+  // for the ordinary group-pruning path (`keep_q_heads` is built there as
+  // exactly `keep_count` groups of `group_size` heads each), but the only
+  // correct count for the MQA fast path above, where `keep_q_heads` is an
+  // arbitrary top-`q_keep_count` subset of individual query heads with no
+  // group structure to multiply out. Mirrors ApplyOneDecomposedGqaChain's
+  // own identical `new_num_heads` computation.
+  const int64_t new_num_heads = static_cast<int64_t>(keep_q_heads.size());
   for (auto& attr : *chain.node->mutable_attribute()) {
     if (attr.name() == chain.num_heads_attr) {
       attr.set_i(new_num_heads);
@@ -21987,8 +22064,7 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 // DELIBERATELY NARROWER than pruning.py's own matcher, the same kind of
 // documented, accepted scope gap this port already carries for the fused-op
 // families above (see e.g. MatchMultiHeadAttentionProducer's own comment on
-// declining rather than reproducing pruning.py's own dynamic-bias slicing,
-// and ApplyOneGqaChain's own comment on having no MQA fast path at all):
+// declining rather than reproducing pruning.py's own dynamic-bias slicing):
 //
 //   - An additive mask (`attn_mask`/causal bias), when present, IS matched
 //     and pruned -- `ResolveDecomposedQkRoot` recognizes the identical
