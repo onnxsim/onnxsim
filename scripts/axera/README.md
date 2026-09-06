@@ -1539,6 +1539,163 @@ Also a second, independent confirmation of the broader determinism
 lesson: a single rebuild pair is not enough to call something noise-free,
 and this project has now made and caught that exact mistake twice.
 
+### `Conv`'s `group` attribute: grouped convolutions parallelize across both MAC engines, dense ones don't
+
+Untested until now: `Conv`'s `group` attribute (depthwise/grouped
+convolution, common in real MobileNet/ResNeXt-style architectures, though
+not `resnet18d` itself). A dense `Conv(cin=4, cout=4, 3x3, group=1)` and a
+grouped version at the same shape (`group=2`, and full depthwise
+`group=4`) all build successfully -- no compiler crash the way `Mul`/`Div`
+by 1.0 hit earlier -- but schedule genuinely differently, confirmed stable
+across two independent rebuilds of each config:
+
+- **`group=1` (dense): 3 sub-events, all on a single engine (`conv1`).**
+  Same one-engine pattern already seen for ordinary `Conv`/`Gemm` at small
+  shapes elsewhere in this README.
+- **`group=2` and `group=4` (any grouped conv): 6 sub-events, split evenly
+  across *both* `conv0` and `conv1`** (3 each). This is a real, binary
+  split on "is this Conv grouped at all," not something that scales with
+  the group count -- `group=2` (2 groups) and `group=4` (4 groups, full
+  depthwise) produce the identical 6-event, both-engines pattern, not 2 vs.
+  4 proportional sub-events. Consistent with the compiler parallelizing a
+  grouped conv's independent groups across the two MAC engines as a fixed
+  strategy, rather than a per-group unit of scheduling.
+- mcode grows despite Wbt shrinking: at this shape, dense `group=1` has a
+  1320-byte Wbt / 2984-byte mcode, while full depthwise `group=4` has a
+  *smaller* 1256-byte Wbt (fewer real weight values: `4*1*3*3=36` vs.
+  `4*4*3*3=144`) but a *larger* 3176-byte mcode (+192 bytes, +6.4%) --
+  the extra command bytes are the cost of coordinating two engines instead
+  of one, not weight-data volume.
+
+This is now regression-tested (`test_grouped_conv_splits_across_two_mac_engines_dense_does_not`)
+via `--profile` engine/event-count assertions, following the same
+determinism-checked pattern as the rest of this file.
+
+### Does the two-engine split transfer to `resnet18d` itself? Yes, but it corrects the framing above
+
+The natural next question for the finding above (per this README's own
+established pattern -- see "Does this transfer to `resnet18d` itself?"):
+does a real, unmodified `resnet18d_Opset18` build's `--profile` trace show
+the same single-engine-vs-two-engine split? Checked directly against a
+real profiled build (`convert_onnxmodelzoo.py --models resnet18d_Opset18
+--profile`, real AX650N, confirmed bit-identical device output between the
+original and onnxsim-simplified model as usual): **all 15 of
+`resnet18d`'s distinct real Conv ops schedule on *both* `conv0` and
+`conv1`** -- none stays on a single engine, even though `resnet18d` has no
+grouped convolutions anywhere in it (confirmed above: this architecture
+doesn't use `group>1`).
+
+**This means the "grouped vs. dense" framing above was incomplete, not
+wrong.** Grouping isn't the underlying trigger for the two-engine split;
+channel count is, and the earlier experiment's `cin=cout=4` dense baseline
+just happened to sit right at the edge of a real, sharp threshold.
+Isolated directly by sweeping `cin=cout` for an otherwise-identical dense
+(`group=1`) `Conv`, confirmed stable across independent rebuilds at both
+ends: **`cin=cout<=4` stays on a single engine (`conv1`, 3 sub-events);
+`cin=cout>=5` splits across both `conv0` and `conv1` (6 sub-events)** --
+a precise, real, and surprisingly small cutover point. Every real
+`resnet18d` layer has far more than 5 channels (64 to 512), so all 15
+land unconditionally on the two-engine side of this threshold -- fully
+explaining the profiled result without needing any grouping-specific
+mechanism.
+
+Reconciling both findings: dense convs cross into the two-engine regime
+once total channel count passes this small threshold, while *any* grouped
+conv (confirmed down to `group=2`/`group=4` at only 4 total channels,
+`cin=cout=4`/`cin_per_group=1`) crosses into it regardless of size --
+two independent triggers for the same underlying two-engine scheduling
+strategy, not one unified rule. This refines, rather than replaces, the
+earlier regression test: `test_grouped_conv_splits_across_two_mac_engines_dense_does_not`'s
+`group=1` case is still correctly single-engine, precisely because it
+was chosen at `cin=cout=4` -- right at (not below) the real threshold.
+A second test now locks in the size-threshold side of this directly.
+
+**`Gemm` has the same two-regime split, but at a much higher, distinct
+threshold.** Checked directly against a real profiled resnet18d fc layer
+(`k=512, n=1000`, the real shape): 48 sub-events split across both `conv0`
+and `conv1` (16 tiles x 3 sub-events), matching the real trace exactly.
+But unlike `Conv`, neither `k` nor `n` alone drives it: `Gemm(k=512,
+n=16)` and `Gemm(k=16, n=512)` -- each with 8,192 weight elements --
+*both* stay on a single engine, while `Gemm(k=n=256)` (65,536 elements)
+splits and `Gemm(k=n=128)` (16,384 elements) does not, confirmed stable
+across independent rebuilds at both ends. So `Gemm`'s cutover needs a much
+larger, roughly-square shape to trigger, sitting somewhere in the 128-256
+range for `k=n`, in clear contrast to `Conv`'s tiny 4-vs-5-channel
+threshold. This is a real, confirmed difference in the two ops' tiling
+strategies, not a single formula ported across op types -- reported
+honestly as "a real threshold exists, at a different scale per op," not
+as a unified quantity (candidates like raw weight-element count and
+output-element count were both checked and neither cleanly explains both
+ops' thresholds together).
+
+### Beyond passive diffing: running our own hand-patched mcode on real hardware
+
+Everything above (and in every earlier section) only ever *observes*
+Pulsar2's own compiler output -- building variant ONNX graphs and diffing
+what the real compiler produces. This project has no mcode generator; it
+never emits mcode itself. This section goes one step further for the
+first time: directly editing a real, working `.axmodel`'s mcode bytes by
+hand (loading it as the ONNX protobuf it is, overwriting the `neu_key`
+initializer's `raw_data`, resaving) and running the hand-patched result on
+the real AX650N -- a much stronger causal test than comparing two
+independently-compiled outputs, since it can construct byte patterns the
+real compiler would never produce as a whole.
+
+**Splicing confirms the noise zone is truly a swappable, inert label, not
+just something two builds happen to agree is inert.** Building the same
+`_two_conv_model` three times gave three real mcode blobs differing only
+at 3 of the confirmed noise-zone positions (858, 870, 876 -- byte 864
+happened to coincide across all three this time, consistent with a small
+multiset randomly permuted per build). Constructing a hybrid -- build A's
+mcode, but with build B's value spliced in at position 858 -- gives a byte
+sequence that is **not** identical to any of the three real builds (a
+genuinely novel combination, confirmed by direct comparison), yet it
+loaded and ran on the real device with **bit-identical output** to the
+unpatched original. This is real, direct proof by construction, not
+correlation: the compiler's own output never had to agree with itself for
+this to work, because the byte pattern tested was never compiled as a
+whole by anything.
+
+(The regression test locking this in uses 5 rebuilds and mixes noisy
+positions across all of them, not just one -- caught during development:
+with only 3 rebuilds, occasionally just one position actually varies, and
+splicing only that one reproduces another real build byte-for-byte rather
+than a genuinely novel combination. Same false-positive-adjacent lesson
+this README has hit before elsewhere: verify the "novel" claim directly
+rather than assume it.)
+
+**Probing the still-opaque majority region with single-byte flips found
+something new: it isn't uniformly load-bearing.** Flipping all 8 bits of
+one byte (`^= 0xFF`) at 8 candidate offsets spread through the same
+3,920-byte mcode blob (avoiding the header, footer, and known noise
+positions) split cleanly into two real, reproducible outcomes, confirmed
+stable across two different random inputs and repeat runs:
+
+- **Offsets 400, 2000, 3000, 3400: the flip is completely inert** -- the
+  patched model ran and produced bit-identical output to the unpatched
+  original, for every input tried.
+- **Offsets 700, 1000, 1500, 2500: the flip reliably faults the runtime**,
+  every time, with the identical real error: `[ERROR] Run model
+  failed{0x8030070C}` / `Request api(11) return failed(-2147090294)`. The
+  device itself stayed healthy afterward (`axcl-smi` and the driver both
+  confirmed fine) -- this is a clean, graceful runtime-level rejection,
+  not a hardware lockup like the PCIe-driver crash this README's hardware
+  section separately covers.
+
+This is a real, useful, previously-unknown signal for future decoding
+work, found without decoding a single new bit: `0x8030070C` is Pulsar2's
+own real, reproducible signature for "this mcode program is structurally
+invalid" -- almost certainly evidence of an internal checksum, opcode
+validity check, or address-range check the runtime performs before or
+during execution, not a full re-verification of program *semantics*
+(since a corrupted-but-still-valid-looking byte can also just silently
+produce identical output, as the inert offsets show). Knowing which
+offsets fall on which side of this line, confirmed empirically rather
+than guessed, is a real, concrete, well-scoped map for whoever attempts
+to instrument or bisect further -- and a hard existence proof that some
+of that 99%-opaque region cannot be padding: a mechanism this precise and
+reproducible almost certainly means it's live, checked, structural data.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

@@ -25,6 +25,7 @@
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
+#include "passes/fp6_llm.h"
 #include "passes/fuse_add_bias_into_conv.h"
 #include "passes/fuse_attention.h"
 #include "passes/fuse_bn_into_conv.h"
@@ -45,6 +46,7 @@
 #include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/fuse_split_gather_concat.h"
 #include "passes/gguf_legacy_quant.h"
 #include "passes/gguf_ternary_quant.h"
 #include "passes/iq4_nl.h"
@@ -66,12 +68,14 @@
 #include "passes/rewrite_bev_pool_to_scatter.h"
 #include "passes/rewrite_bool_where.h"
 #include "passes/rewrite_deform_conv_to_gather.h"
+#include "passes/rewrite_gather_over_concat.h"
 #include "passes/rewrite_gatherelements_to_gather.h"
 #include "passes/rewrite_gathernd_to_gather.h"
 #include "passes/rewrite_gridsample_to_gather.h"
 #include "passes/rewrite_msdeformattn_to_gridsample.h"
 #include "passes/rewrite_trt_batched_nms.h"
 #include "passes/rewrite_trt_batched_rotated_nms.h"
+#include "passes/split_large_gather.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -134,6 +138,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
+    RegisterOrReplace<p::Fp6Llm>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
     RegisterOrReplace<p::FuseConsecutiveReduce>(registry);
@@ -148,6 +153,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
     RegisterOrReplace<p::GgufQ4_0>(registry);
     RegisterOrReplace<p::GgufQ4_1>(registry);
     RegisterOrReplace<p::GgufTernaryQuant>(registry);
@@ -175,10 +181,12 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::RewriteDeformConvToGather>(registry);
     RegisterOrReplace<p::RewriteGatherElementsToGather>(registry);
     RegisterOrReplace<p::RewriteGatherNDToGather>(registry);
+    RegisterOrReplace<p::RewriteGatherOverConcat>(registry);
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
     RegisterOrReplace<p::RewriteMSDeformAttnToGridSample>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedNMS>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedRotatedNMS>(registry);
+    RegisterOrReplace<p::SplitLargeGather>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);

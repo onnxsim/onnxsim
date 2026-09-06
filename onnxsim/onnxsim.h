@@ -18,6 +18,7 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+#include "imatrix_quant_entry.h"
 #include "structured_pruning_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
@@ -692,6 +693,46 @@ onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
 // ``apply_gguf_ternary_quantization`` are independently-correct,
 // non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
+
+// FP6-LLM (Xia et al., 2024, "FP6-LLM: Efficiently Serving Large Language
+// Models Through FP6-Centric Algorithm-System Co-Design") -- C++ port of
+// fp6_llm.py's own apply_fp6_llm_quantization. Weight-only quantizes every
+// MatMul/vanilla-Gemm layer with a constant 2-D float32 weight, one
+// 64-element block at a time over the weight's own flattened storage:
+// every block is rescaled by its own ``max(|block|)`` to fill FP6 E3M2's
+// (1 sign bit, 3 exponent bits, 2 mantissa bits) narrow representable
+// range, cast to the nearest representable value, and rescaled back. See
+// ``passes/fp6_llm.h`` for the exact rewrite -- including how its
+// 64-entry codebook is built from the format's own exponent/mantissa
+// arithmetic definition rather than any bit-level codec -- and
+// fp6_llm.py's own docstring for the full rationale.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port only implements the paper's primary
+// E3M2 format and does not support ``Conv`` weights the way
+// ``apply_fp6_llm_quantization``'s Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_fp6_llm_quantization`` (``fp6_llm.py``): not required to be
+// bit-for-bit identical (see ``passes/fp6_llm.h``'s own note on why this
+// port is nonetheless expected to track the Python port unusually
+// closely, having no accumulation or iterative-refinement step at all) --
+// ``ApplyFp6Llm``/its ``_cpp`` Python wrapper and
+// ``apply_fp6_llm_quantization`` are independently-correct,
+// non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
+
+// llama.cpp's "importance matrix" (imatrix) -- C++ port of
+// imatrix_quant.py's own apply_imatrix_quantization, declared in
+// imatrix_quant_entry.h (included above) rather than duplicated here,
+// mirroring how ApplyWandaPruning/ApplySparseGptPruning (structured_
+// pruning_entry.h, also included above) are documented in their own home
+// header instead of this one. See imatrix_quant.py's own module docstring
+// for the technique, imatrix_quant_entry.h for this port's own scope, and
+// that header's own top comment for why this calibration-driven pass
+// follows ApplyWandaPruning's protobuf-level shape rather than
+// ApplyQuarot's data-free PredicateBasedPass one.
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
