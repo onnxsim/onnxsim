@@ -890,8 +890,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const std::unordered_set<std::string> skip_names_set(
-            skip_names.begin(), skip_names.end());
+        const std::unordered_set<std::string> skip_names_set(skip_names.begin(),
+                                                             skip_names.end());
         const auto result = ApplyImatrixQuantization(
             model, *executor, calibration_data, block_size,
             num_scale_candidates, scale_lo, scale_hi, skip_names_set);
@@ -899,9 +899,9 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "executor"_a, "model_bytes"_a, "calibration_data"_a,
-      "block_size"_a = 32, "num_scale_candidates"_a = 41, "scale_lo"_a = 0.4,
-      "scale_hi"_a = 1.6, "skip_names"_a = std::vector<std::string>());
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32,
+      "num_scale_candidates"_a = 41, "scale_lo"_a = 0.4, "scale_hi"_a = 1.6,
+      "skip_names"_a = std::vector<std::string>());
 
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
