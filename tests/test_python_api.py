@@ -876,7 +876,9 @@ def test_export_onnx_schemas_bridges_registry():
                 "slope",
                 int(onnx.AttributeProto.FLOAT),
                 False,
-                onnx.AttributeProto(name="alpha", f=0.1, type=onnx.AttributeProto.FLOAT),
+                onnx.AttributeProto(
+                    name="alpha", f=0.1, type=onnx.AttributeProto.FLOAT
+                ),
             )
         ],
         [("T", ["tensor(float)"], "Constrain to float tensors.")],

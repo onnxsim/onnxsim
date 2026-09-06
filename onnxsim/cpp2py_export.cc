@@ -1827,8 +1827,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           std::vector<PyFormalParameter> inputs;
           inputs.reserve(schema.inputs().size());
           for (const auto& p : schema.inputs()) {
-            inputs.emplace_back(p.GetName(), p.GetDescription(),
-                                p.GetTypeStr(),
+            inputs.emplace_back(p.GetName(), p.GetDescription(), p.GetTypeStr(),
                                 static_cast<int>(p.GetOption()),
                                 p.GetIsHomogeneous(), p.GetMinArity());
           }
@@ -1845,15 +1844,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           for (const auto& kv : schema.attributes()) {
             const auto& attr = kv.second;
             attributes.emplace_back(attr.name, attr.description,
-                                    static_cast<int>(attr.type),
-                                    attr.required, attr.default_value);
+                                    static_cast<int>(attr.type), attr.required,
+                                    attr.default_value);
           }
           std::vector<PyTypeConstraint> type_constraints;
           type_constraints.reserve(schema.typeConstraintParams().size());
           for (const auto& tc : schema.typeConstraintParams()) {
             type_constraints.emplace_back(tc.type_param_str,
-                                          tc.allowed_type_strs,
-                                          tc.description);
+                                          tc.allowed_type_strs, tc.description);
           }
           const char* doc = schema.doc();
           ret.emplace_back(schema.Name(), schema.domain(),
