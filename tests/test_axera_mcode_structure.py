@@ -2472,19 +2472,30 @@ tag the byte after it is even in ~100% of real units against ~60% shuffled
 -- see the README's "Fifth correction" section."""
 
 
-def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3, bare=False):
+def _tokenize_mcode(
+    mcode,
+    start=297,
+    end=None,
+    tags=None,
+    pmax=3,
+    bare=False,
+    extra_byte_tags=frozenset(),
+):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
     [register]` (p+4 bytes) and, with `bare=True`, the payload-less 2-byte
-    `[tag][register]` pair -- stepping one unknown byte otherwise. Returns
-    `(byte_offset, kind, a, b, c)` tuples: kind 'V' (a=verb, b=xx, c=yy),
-    'S' (a=prefix, b=tag, c=first payload byte), 'B' (a=tag, b=register)
-    or '?' (a=byte). The defaults (tags 0x81..0x84, p <= 3, no bare pairs,
-    stop 252 bytes before the end) are the original narrow rule;
-    `tags=_ALL_TAGS, pmax=4, bare=True` is the corrected one. See the
-    README's "The layout that explains all of it", "Fourth correction" and
-    "Fifth correction" sections."""
+    `[tag][register]` pair -- stepping one unknown byte otherwise. Units
+    whose tag is in `extra_byte_tags` take one extra trailing byte (the
+    sixth correction: tag 0x9f). Returns `(byte_offset, kind, a, b, c)`
+    tuples: kind 'V' (a=verb, b=xx, c=yy), 'S' (a=prefix, b=tag, c=first
+    payload byte), 'B' (a=tag, b=register) or '?' (a=byte). The defaults
+    (tags 0x81..0x84, p <= 3, no bare pairs, no extra bytes, stop 252 bytes
+    before the end) are the original narrow rule; `tags=_ALL_TAGS, pmax=4,
+    bare=True, extra_byte_tags={0x9F}` is the corrected one. See the
+    README's "The layout that explains all of it" and "Fourth" .. "Sixth
+    correction" sections."""
     tags = set(range(0x81, 0x85)) if tags is None else set(tags)
+    extra_byte_tags = set(extra_byte_tags)
     end = len(mcode) - 252 if end is None else end
 
     def is_verb(i):
@@ -2499,11 +2510,9 @@ def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3, bare=False):
         if i >= len(mcode):
             return 0
         p = mcode[i]
-        return (
-            p + 4
-            if (p <= pmax and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags)
-            else 0
-        )
+        if p <= pmax and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags:
+            return p + 4 + (1 if mcode[i + p + 2] in extra_byte_tags else 0)
+        return 0
 
     out, i = [], start
     while i < end:
@@ -2521,7 +2530,7 @@ def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3, bare=False):
             n = short_len(i)
             out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
         elif bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
-            n = 2
+            n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
             out.append((i, "B", mcode[i], mcode[i + 1], 0))
         else:
             n = 1
@@ -2756,3 +2765,60 @@ def test_resnet18d_every_tag_and_the_bare_pair_pass_the_parity_null(tmp_path):
     singles = [a for a, b in runs if b - a == 1]
     assert len(singles) >= 0.75 * len(runs), (len(singles), len(runs))
     assert sum(1 for a in singles if a + 1 in starts) >= 0.9 * len(singles)
+
+
+def test_resnet18d_tag_9f_units_carry_one_extra_byte(tmp_path):
+    """Confirmed real (see the README's "Sixth correction" section), on a
+    fresh resnet18d build: a unit whose tag is 0x9f is followed by exactly
+    one leftover byte in >= 85% of cases while every other tag with n >= 30
+    is followed by one in <= 10%; that byte is below 0x40 in >= 95% of
+    cases; and admitting the extra byte (`extra_byte_tags={0x9f}`) takes
+    config block B to >= 95% explained while a shuffled copy stays under
+    55%. No device.
+    """
+    import random
+    from collections import Counter, defaultdict
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    lo, hi = narrow[cuts[1]][0], narrow[cuts[2]][0]
+    block = mcode[lo:hi]
+
+    toks = _tokenize_mcode(
+        block, start=0, end=len(block), tags=_ALL_TAGS, pmax=4, bare=True
+    )
+    follow = defaultdict(Counter)
+    extra = Counter()
+    for j, t in enumerate(toks[:-1]):
+        if t[1] not in ("S", "B"):
+            continue
+        tag = t[3] if t[1] == "S" else t[2]
+        nxt = toks[j + 1]
+        one = nxt[1] == "?" and (j + 2 >= len(toks) or toks[j + 2][1] != "?")
+        follow[tag][one] += 1
+        if one and tag == 0x9F:
+            extra[block[nxt[0]]] += 1
+    n9 = sum(follow[0x9F].values())
+    assert n9 >= 300 and follow[0x9F][True] >= 0.85 * n9, dict(follow[0x9F])
+    for tag, c in follow.items():
+        if tag != 0x9F and sum(c.values()) >= 30:
+            assert c[True] <= 0.1 * sum(c.values()), (hex(tag), dict(c))
+    assert sum(c for v, c in extra.items() if v < 0x40) >= 0.95 * sum(extra.values())
+
+    def explained(blob):
+        toks = _tokenize_mcode(
+            blob,
+            start=0,
+            end=len(blob),
+            tags=_ALL_TAGS,
+            pmax=4,
+            bare=True,
+            extra_byte_tags={0x9F},
+        )
+        return 1 - sum(1 for t in toks if t[1] == "?") / len(blob)
+
+    shuffled = bytearray(block)
+    random.Random(0).shuffle(shuffled)
+    e_real, e_null = explained(block), explained(bytes(shuffled))
+    assert e_real >= 0.95 and e_null <= 0.55, (e_real, e_null)

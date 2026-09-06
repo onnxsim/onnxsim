@@ -2933,6 +2933,47 @@ Test: `test_resnet18d_every_tag_and_the_bare_pair_pass_the_parity_null`
 in `tests/test_axera_mcode_structure.py`; the previous test's bare-pair
 assertion is replaced by the corrected claim.
 
+### Sixth correction: there is no prefix byte -- tag 0x9f's unit is one byte longer
+
+Asking what *precedes* the "prefix" bytes settles them. In `resnet18d`
+block B, 592 of the 641 one-byte residues follow a unit whose tag is
+0x9f (394 after a p-unit on 0x9f, 198 after a bare `9f reg` pair); in
+`mnasnet` it is 797 of 992. Per tag, the share of units followed by
+exactly one leftover byte is **592 of 624 for 0x9f** and at most 1% for
+every other tag (0x81 3/410, 0x84 0/661, 0x95 0/237, 0x8b 0/187);
+`mnasnet` 797 of 875 for 0x9f, at most 6% otherwise. A bare 0x9f pair is
+followed by one leftover byte in 198 of 208 cases where every other
+bare tag is followed by the next unit directly. So 0x9f's unit is
+`[p][value][9f][register][extra]` (and bare `9f reg extra`), one byte
+longer than any other tag's, and the fourth correction's "one-byte
+prefix with model-specific values" is that extra byte read as belonging
+to the wrong unit. Its values are the ones the prefix table listed
+(`23`, `03`, `16`, `3c`, `0d`, `26` in `resnet18d`; `04`, `05`, `03`,
+`1c`, `2d`, `00` in `mnasnet`), below 0x40 in 98.3% and 89.2% of cases
+and with no parity constraint (36% and 60% even) -- a small value, not
+a register. The 0x9f write shares its register with the *next* unit in
+320 of 544 and 315 of 647 cases, so 0x9f looks like a modifier issued
+just before a write to the same register; what the extra byte selects
+is open.
+
+**Where the blocks stand.** With every tag, `p <= 4`, bare pairs and the
+0x9f rule, block B is **96.5%** explained in `resnet18d` (673 of 19,383
+bytes left) and **95.2%** in `mnasnet` (2,152 of 44,695); the shuffled
+block stays at 44%. Under the same rule the whole mcode is covered
+region by region -- `resnet18d`: block A 93.8%, block B 96.5%, the op
+programs 98.7%, **95%+ of every tokenized byte** and 94% of the whole
+blob including the untokenized FlatBuffers header and trailer;
+`mnasnet` 92.6% / 95.2% / 98.5%. What remains in block B is a short
+list: `e1 XX` pairs (14, 48), `01 70 04 a1 5e`-style units on tag 0xa1
+(12, 37) and bare `a1 reg` pairs (8, 20), a handful of single `05`/`08`/
+`06` bytes, and the 6..7-byte runs that sit directly before a verb
+(`09 20 02 00 00 01 00`, `08 0b 55 fc 55 01`; 6 + 6 in `resnet18d`, 19 +
+17 in `mnasnet`). The tiny model's block B stays at 86% because its
+ops region carries proportionally more of those pre-verb runs.
+
+Test: `test_resnet18d_tag_9f_units_carry_one_extra_byte` in
+`tests/test_axera_mcode_structure.py` (fresh build, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
