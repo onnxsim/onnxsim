@@ -29,10 +29,19 @@ Wanda port has no quantized-weight counterpart, mirroring the pure-Python
 declaration comment). See ``test_attention_head_pruning_cpp.py``'s own
 docstring for this port's shared narrower-than-pruning.py scope decisions
 across the six newer fused-op families (no dynamic-attention-bias-Gather-
-insertion machinery) and across the decomposed-GQA family (no mask/RoPE/
-Q-K-norm/Einsum/packed-QKV, no true-MQA fast path) -- every one of those
-narrowings means ``apply_attention_head_wanda_pruning`` is NOT yet aliased
-to this port either.
+insertion machinery). For the decomposed-GQA family, this port's
+``ApplyAttentionHeadWandaPruning`` shares ``FindDecomposedGqaChains``/
+``ApplyOneDecomposedGqaChain`` entirely with ``ApplyAttentionHeadPruning``
+(both dispatch through the identical matcher/rewriter, just with a real
+calibrated ``act_norm`` map threaded through here instead of ``nullptr``) --
+so every sub-shape that port matches (additive mask via
+``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias``, ``Einsum``-based QK^T/AV
+products, decomposed RoPE/Q-K-norm pass-through, a packed-QKV-then-`Split`
+producer, and the true-MQA fast path) is matched and pruned here too,
+exactly mirroring pruning.py's own ``apply_attention_head_wanda_pruning``
+for this one chain family -- see ``test_attention_head_pruning_cpp.py``'s
+own docstring for the exact narrower-than-pruning.py scope each still
+carries.
 """
 
 import os
@@ -1342,8 +1351,10 @@ def test_cpp_sparse_attention_wanda_pruning_empty_calibration_data_matches_pytho
 # ``test_attention_head_pruning_cpp.py``'s own "Decomposed (un-fused)
 # GQA/MQA/plain-MHA attention head pruning" section comment for the exact
 # scope this port matches (deliberately narrower than pruning.py's own
-# ``_find_decomposed_gqa_chains``: no mask/RoPE/Q-K-norm/Einsum/packed-QKV,
-# no true-MQA fast path) -- so this tenth family is NOT yet aliased either.
+# ``_find_decomposed_gqa_chains``: no mask/RoPE/Q-K-norm/Einsum) -- packed-
+# QKV-then-``Split`` producers and true-MQA ARE matched/applied here, via
+# the same shared machinery -- so this tenth family is NOT yet aliased
+# either.
 
 
 def _decomposed_gqa_model(
@@ -1630,15 +1641,20 @@ def test_cpp_decomposed_gqa_wanda_pruning_clones_shape_constant_shared_with_fore
     assert "Sq_pruned" in inits
 
 
-def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_is_declined_but_python_still_prunes():
-    # Mirrors test_attention_head_pruning_cpp.py's own identical (data-free)
-    # test -- this C++ port never recognizes an additive mask at all, so the
-    # whole chain declines to match here regardless of whether calibration
-    # data is supplied, while pruning.py's own pure-Python
-    # apply_attention_head_wanda_pruning still prunes it.
+def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_matches_python_reference_exactly():
+    # An additive mask `Add` before `Softmax`, a constant of the
+    # schema-documented per-head-broadcastable shape -- `ApplyAttentionHead
+    # WandaPruning` shares `FindDecomposedGqaChains`/`ApplyOneDecomposedGqaChain`
+    # with the data-free entry point above, so it now matches and correctly
+    # leaves this broadcast mask untouched here too (see
+    # test_attention_head_pruning_cpp.py's own identical, more thorough
+    # coverage of this branch for the full reasoning) -- both ports must
+    # agree byte-for-byte, whether or not calibration data is supplied.
     model, cfg = _decomposed_gqa_model(
         K=32, H=8, KVH=2, D=8, Out=16, seed=107, masked=True
     )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
     rng = np.random.default_rng(108)
     calibration_data = [
         {
@@ -1651,17 +1667,73 @@ def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_is_declined_but_pyt
         model, calibration_data=calibration_data, sparsity=0.5
     )
     pruned_py = onnxsim.apply_attention_head_wanda_pruning(
-        model, calibration_data=calibration_data, sparsity=0.5
+        model_for_py, calibration_data=calibration_data, sparsity=0.5
     )
     onnx.checker.check_model(pruned_cpp)
     onnx.checker.check_model(pruned_py)
-    assert pruned_cpp.SerializeToString() == model.SerializeToString()
-    assert pruned_py.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
 
 
-def test_cpp_decomposed_mqa_wanda_pruning_is_a_permanent_no_op_unlike_python():
-    model, cfg = _decomposed_gqa_model(K=32, H=8, KVH=1, D=8, Out=16, seed=109)
+def _wanda_query_head_keep(wq, d, num_heads, act_norm, dv, keep_count, epsilon=1e-8):
+    # Mirrors pruning.py's own `_wanda_gqa_query_head_importance`: each
+    # query head's own weight-only score (`_gqa_query_head_importance`),
+    # scaled by that SAME head's own `dv`-wide slice of the probed
+    # activation (falling back to the plain weight-only score when the
+    # probed width doesn't match).
+    base = np.array(
+        [np.linalg.norm(wq[:, h * d : (h + 1) * d]) for h in range(num_heads)]
+    )
+    if act_norm.shape[0] == num_heads * dv:
+        act_head = np.array(
+            [np.linalg.norm(act_norm[h * dv : (h + 1) * dv]) for h in range(num_heads)]
+        )
+        base = base * np.maximum(act_head, epsilon)
+    return np.sort(np.argsort(-base)[:keep_count])
+
+
+def test_cpp_decomposed_mqa_wanda_pruning_matches_python_reference_exactly():
+    # True decomposed MQA (kv_num_heads == 1, more than one query head):
+    # ApplyOneDecomposedGqaChain's own `is_mqa` fast path -- shared,
+    # unmodified, by both the data-free and Wanda C++ entry points -- now
+    # applies here too, mirroring pruning.py's own
+    # `_wanda_gqa_query_head_importance`. Both ports must now agree
+    # byte-for-byte.
+    K, H, KVH, D, Out = 32, 8, 1, 8, 16
+    model, cfg = _decomposed_gqa_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=109)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
     rng = np.random.default_rng(110)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model_for_py, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    act_norm = _probe_act_norm(model, "ctx2", {"X": x_cal})
+    q_keep_count = max(1, H - round(H * 0.5))
+    keep_q_heads = _wanda_query_head_keep(cfg["wq"], D, H, act_norm, D, q_keep_count)
+    q_idx = _head_idx(keep_q_heads, D)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned_cpp)
+    np.testing.assert_array_equal(wq_new, cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+    np.testing.assert_array_equal(wo_new, cfg["wout"][q_idx, :])
+
+
+def test_cpp_decomposed_mqa_wanda_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _decomposed_gqa_model(K=32, H=8, KVH=1, D=8, Out=16, seed=111)
+    rng = np.random.default_rng(112)
     calibration_data = [
         {
             "X": rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
@@ -1669,13 +1741,7 @@ def test_cpp_decomposed_mqa_wanda_pruning_is_a_permanent_no_op_unlike_python():
             )
         }
     ]
-    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
-        model, calibration_data=calibration_data, sparsity=0.5
+    pruned = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.0
     )
-    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
-        model, calibration_data=calibration_data, sparsity=0.5
-    )
-    onnx.checker.check_model(pruned_cpp)
-    onnx.checker.check_model(pruned_py)
-    assert pruned_cpp.SerializeToString() == model.SerializeToString()
-    assert pruned_py.SerializeToString() != model.SerializeToString()
+    assert pruned.SerializeToString() == model.SerializeToString()
