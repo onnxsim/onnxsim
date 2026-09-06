@@ -487,6 +487,89 @@ using InitMap = std::unordered_map<std::string, const onnx::TensorProto*>;
 using ConsumerMap =
     std::unordered_map<std::string, std::vector<onnx::NodeProto*>>;
 
+// Builds an `InitMap`-equivalent lookup from BOTH `graph.initializer()` AND
+// every plain (default-domain) `Constant` node's own embedded `value`
+// attribute tensor, keyed by that node's single output name -- the C++
+// mirror of pruning.py's own `_constant_map` (see that function's docstring
+// for the full rationale/semantics this reproduces exactly). Real
+// `torch.onnx.export` output routinely lowers an inline literal
+// shape/scalar operand (a `Reshape`'s target shape, a `Pow`'s exponent, ...)
+// to a `Constant` node rather than a genuine `graph.initializer` entry --
+// and onnxsim's own `simplify()` deliberately leaves it that way (its own
+// optimizer list always drops onnx-optimizer's
+// `extract_constant_to_initializer` pass) -- so a plain
+// `{t.name(): &t for t in graph.initializer()}`-style map alone misses
+// exactly this common, real shape.
+//
+// Only a `Constant` node's own `value` *tensor* attribute is recognized here
+// (`sparse_value`/`value_int`/`value_float`/`value_string`-family attributes
+// and their list forms are a different representation, never emitted by a
+// real exporter for a full tensor payload) -- mirrors `_constant_map`'s own
+// identical, deliberate narrowing.
+//
+// An actual `graph.initializer` entry always wins on a genuine name
+// collision with a `Constant` node's output (vanishingly unlikely in
+// practice): this uses `emplace`, which is a no-op when the key -- already
+// inserted from `graph.initializer()` in the loop above -- is present,
+// exactly mirroring `_constant_map`'s own `dict.setdefault` call.
+InitMap BuildConstantMap(const onnx::GraphProto& graph) {
+  InitMap constants;
+  for (const auto& t : graph.initializer()) {
+    constants[t.name()] = &t;
+  }
+  for (const auto& node : graph.node()) {
+    if ((node.domain() != "" && node.domain() != "ai.onnx") ||
+        node.op_type() != "Constant" || node.output_size() != 1 ||
+        node.output(0).empty()) {
+      continue;
+    }
+    for (const auto& attr : node.attribute()) {
+      if (attr.name() == "value" &&
+          attr.type() == onnx::AttributeProto::TENSOR) {
+        constants.emplace(node.output(0), &attr.t());
+        break;
+      }
+    }
+  }
+  return constants;
+}
+
+// Mutable analogue of `BuildConstantMap` above, for a caller (e.g.
+// `ApplyOneDecomposedGqaChain`'s own `_rewrite_shape_dim`-equivalent local
+// helper) that goes on to slice/edit a resolved value in place: a
+// `Constant` node's own `value` attribute tensor is returned via
+// `mutable_t()`, a live pointer into that node's own embedded `TensorProto`
+// -- editing through it (e.g. `SliceAxisGeneric`) mutates the node's own
+// serialized form directly, exactly as if it had been a real initializer
+// entry all along. Mirrors `_constant_map`'s own docstring paragraph on why
+// this is safe: protobuf's `attr.t`/`mutable_t()` is a live reference, never
+// a copy, in both languages.
+std::unordered_map<std::string, onnx::TensorProto*> BuildMutableConstantMap(
+    onnx::GraphProto* graph) {
+  std::unordered_map<std::string, onnx::TensorProto*> constants;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    constants[t->name()] = t;
+  }
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    if ((node->domain() != "" && node->domain() != "ai.onnx") ||
+        node->op_type() != "Constant" || node->output_size() != 1 ||
+        node->output(0).empty()) {
+      continue;
+    }
+    for (int j = 0; j < node->attribute_size(); ++j) {
+      onnx::AttributeProto* attr = node->mutable_attribute(j);
+      if (attr->name() == "value" &&
+          attr->type() == onnx::AttributeProto::TENSOR) {
+        constants.emplace(node->output(0), attr->mutable_t());
+        break;
+      }
+    }
+  }
+  return constants;
+}
+
 // Forward declarations for this file's own generic (FLOAT/FLOAT16/BFLOAT16)
 // dtype infrastructure -- defined much later in the file, inside this same
 // anonymous namespace (the "MoE/QMoE whole-expert pruning" section's own
@@ -25002,10 +25085,14 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     onnx::GraphProto* graph,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  InitMap init_map;
-  for (const auto& t : graph->initializer()) {
-    init_map[t.name()] = &t;
-  }
+  // BuildConstantMap (not a plain `graph.initializer()` loop) -- see that
+  // function's own comment: a real `torch.onnx.export` + `simplify()`
+  // pipeline's `Reshape`/`Unsqueeze`/`Expand` shape operands below are
+  // routinely `Constant`-node-fed rather than genuine `graph.initializer`
+  // entries, and every lookup in this function needs to see those too.
+  // Mirrors pruning.py's own `_find_decomposed_gqa_chains`'s identical
+  // `initializer_map = _constant_map(graph)`.
+  InitMap init_map = BuildConstantMap(*graph);
   ConsumerMap consumers_of = ConsumersOf(graph);
   std::unordered_set<std::string> graph_outputs;
   for (const auto& o : graph->output()) {
@@ -26071,11 +26158,17 @@ void ApplyDecomposedGqaChains(
     double epsilon = 1e-8, ImportanceNorm importance_norm = ImportanceNorm::kL2,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  std::unordered_map<std::string, onnx::TensorProto*> init_map;
-  for (int i = 0; i < graph->initializer_size(); ++i) {
-    onnx::TensorProto* t = graph->mutable_initializer(i);
-    init_map[t->name()] = t;
-  }
+  // BuildMutableConstantMap (not a plain `graph->initializer()` loop) -- see
+  // that function's own comment, and `FindDecomposedGqaChains`'s own
+  // identical `BuildConstantMap` call above: `ApplyOneDecomposedGqaChain`'s
+  // own `rewrite_shape_dim` local helper below resolves/edits exactly the
+  // same `Reshape`/`Expand` shape operands `FindDecomposedGqaChains` already
+  // matched, which on a real `torch.onnx.export` + `simplify()` pipeline are
+  // routinely `Constant`-node-fed rather than genuine `graph->initializer()`
+  // entries. Mirrors pruning.py's own shared apply-dispatch's identical
+  // `initializer_map = _constant_map(graph)`.
+  std::unordered_map<std::string, onnx::TensorProto*> init_map =
+      BuildMutableConstantMap(graph);
   std::unordered_set<std::string> used_names = ExistingGraphNames(*graph);
   std::unordered_set<std::string> producer_touched, consumer_touched,
       stale_value_info;

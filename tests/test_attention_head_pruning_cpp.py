@@ -104,6 +104,8 @@ fused-op family, has no optional per-head bias/mask/past-KV input on its own
 schema at all, so none of this machinery applies to it.
 """
 
+import io
+
 import ml_dtypes
 import numpy as np
 import onnx
@@ -6032,6 +6034,462 @@ def test_cpp_decomposed_gqa_qk_norm_pruning_matches_oracle_and_python_reference_
     (y_pruned,) = _run(pruned_cpp, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+# --- Decomposed-GQA, real `torch.onnx.export` pipeline: `Constant`-node-fed
+# --- shape operands (BuildConstantMap/BuildMutableConstantMap) --------------
+#
+# Every ``_decomposed_gqa_model`` fixture above spells its own `Reshape`/
+# `Expand` shape operands as genuine `graph.initializer` entries -- adequate
+# for exercising `FindDecomposedGqaChains`'/`ApplyOneDecomposedGqaChain`'s own
+# matching/slicing logic, but NOT for exercising `BuildConstantMap`'s own
+# reason to exist: a real `torch.onnx.export` -> `onnxsim.simplify()`
+# pipeline leaves exactly these operands as plain (default-domain) `Constant`
+# nodes instead (onnxsim's own `simplify()` deliberately never promotes one to
+# an initializer -- see `BuildConstantMap`'s own comment in
+# structured_pruning_entry.cpp, and pruning.py's own `_constant_map`
+# docstring, for the full empirical justification). Before `BuildConstantMap`/
+# `BuildMutableConstantMap` were wired into `FindDecomposedGqaChains`/
+# `ApplyDecomposedGqaChains`, every one of the five real-export shapes below
+# silently declined to match at all (its own `init_map` -- built from
+# `graph->initializer()` alone -- had no entry for a `Constant`-node-fed shape
+# name), even though the *same* chain, hand-built with those same values
+# sitting in `graph.initializer` (`_decomposed_gqa_model`'s own convention
+# above), matched and pruned correctly.
+#
+# Each test below builds the identical hand-written eager-attention
+# `nn.Module` one of `test_pruning.py`'s own
+# ``test_decomposed_attention_*_real_torch_export_pipeline`` tests uses,
+# exports it, and runs it through `onnxsim.simplify()` -- exactly the same
+# fixture-construction pattern (kept deliberately in sync; a real
+# `torch.onnx.export` graph cannot be reasonably hand-spelled via
+# `onnx.parser.parse_model`, per this repo's own CLAUDE.md note on this
+# convention's own limits). Rather than re-deriving each one's own numpy
+# oracle (already done exhaustively in `test_pruning.py`), each test here
+# instead directly confirms this C++ port's own parity bar: comparing
+# ``apply_attention_head_pruning_cpp`` against the live pure-Python
+# ``apply_attention_head_pruning`` reference on the exact same simplified
+# model, byte-for-byte -- this file's own established convention (see e.g.
+# ``test_cpp_attention_head_pruning_per_head_attention_bias_is_sliced_matches_python``
+# above) -- while also confirming the model genuinely contains `Constant`-fed
+# shape operands (not vacuously all-initializer) and that pruning actually
+# fired (not a silent no-op decline).
+def _export_and_simplify_decomposed(m, inputs, input_names):
+    """Shared plumbing every test below reuses: export `m`, load it back, and
+    run it through `onnxsim.simplify()`. Mirrors each
+    ``test_decomposed_attention_*_real_torch_export_pipeline`` test's own
+    identical opening in ``test_pruning.py``.
+    """
+    import torch
+
+    m.eval()
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m,
+        inputs,
+        buf,
+        input_names=input_names,
+        output_names=["output"],
+        opset_version=17,
+        dynamo=False,
+    )
+    raw = onnx.load_from_string(buf.getvalue())
+    simplified, ok = onnxsim.onnx_simplifier.simplify(raw)
+    assert ok
+    return simplified
+
+
+def _assert_cpp_matches_python_and_fires(simplified, sparsity=0.5):
+    """Shared parity assertion every test below reuses: `Constant`-node-fed
+    shape operands are genuinely present (else the whole test would be
+    vacuous -- a real export with everything already an initializer would
+    never have exposed this gap), pruning actually fires (rather than
+    silently declining the whole chain, this gap's own failure mode before
+    the fix), and the C++ port's own output is byte-identical to the live
+    pure-Python reference on the exact same input.
+    """
+    assert any(
+        n.op_type == "Constant" and n.domain == "" for n in simplified.graph.node
+    ), "fixture is vacuous: no Constant-node-fed operand in the simplified graph"
+
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(simplified)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=sparsity)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(simplified, sparsity=sparsity)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    assert pruned_cpp.SerializeToString() != simplified.SerializeToString(), (
+        "pruning did not fire at all -- BuildConstantMap wiring is not "
+        "actually closing the gap"
+    )
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    return pruned_cpp
+
+
+def test_cpp_decomposed_attention_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_real_torch_export_pipeline: plain GQA +
+    # causal mask, MatMul-based QK^T/AV products.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    class EagerGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        EagerGQA(), (x, mask), ["hidden_states", "attn_mask"]
+    )
+    assert not any(
+        n.op_type
+        in ("Attention", "GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+        for n in simplified.graph.node
+    )
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_einsum_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_einsum_real_torch_export_pipeline: same GQA +
+    # causal mask, but both the QK^T and AV products are literal
+    # `torch.einsum` calls.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    class EinsumGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.einsum("bhid,bhjd->bhij", q, k) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.einsum("bhij,bhjd->bhid", attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        EinsumGQA(), (x, mask), ["hidden_states", "attn_mask"]
+    )
+    assert any(n.op_type == "Einsum" for n in simplified.graph.node)
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_rope_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_rope_real_torch_export_pipeline: GQA + causal
+    # mask + HuggingFace-style decomposed RoPE on Q and K.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    class EagerGQARope(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, cos, sin, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        EagerGQARope(),
+        (x, cos, sin, mask),
+        ["hidden_states", "cos", "sin", "attn_mask"],
+    )
+
+    from onnxsim.pruning import (
+        _find_decomposed_gqa_chains,
+        _shape_inferred_value_info_by_name,
+    )
+
+    chains = _find_decomposed_gqa_chains(
+        simplified.graph, _shape_inferred_value_info_by_name(simplified)
+    )
+    assert len(chains) == 1
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_qk_norm_rope_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_qk_norm_rope_real_torch_export_pipeline: a
+    # Qwen3-style module with per-head RMSNorm on Q/K on top of RoPE + GQA.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    class RMSNorm(nn.Module):
+        def __init__(self, dim, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(dim) * 0.1 + 1.0)
+            self.eps = eps
+
+        def forward(self, x):
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.eps)
+            return self.weight * x
+
+    class Qwen3StyleGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.q_norm = RMSNorm(head_dim)
+            self.k_norm = RMSNorm(head_dim)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, cos, sin, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = self.q_norm(
+                self.q_proj(hidden_states).view(b, s, num_heads, head_dim)
+            ).transpose(1, 2)
+            k = self.k_norm(
+                self.k_proj(hidden_states).view(b, s, num_kv_heads, head_dim)
+            ).transpose(1, 2)
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, num_kv_heads, head_dim)
+                .transpose(1, 2)
+            )
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            n_rep = num_heads // num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        Qwen3StyleGQA(),
+        (x, cos, sin, mask),
+        ["hidden_states", "cos", "sin", "attn_mask"],
+    )
+
+    from onnxsim.pruning import (
+        _find_decomposed_gqa_chains,
+        _shape_inferred_value_info_by_name,
+    )
+
+    chains = _find_decomposed_gqa_chains(
+        simplified.graph, _shape_inferred_value_info_by_name(simplified)
+    )
+    assert len(chains) == 1
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+    assert chains[0].q_norm is not None
+    assert chains[0].k_norm is not None
+    _assert_cpp_matches_python_and_fires(simplified)
+
+
+def test_cpp_decomposed_attention_packed_qkv_real_torch_export_pipeline_matches_python():
+    # Mirrors test_pruning.py's own
+    # test_decomposed_attention_packed_qkv_real_torch_export_pipeline: a
+    # GPT-2-style single packed `c_attn` Linear feeding a `Split`.
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, head_dim, seq, batch = 32, 4, 8, 4, 1
+
+    class GPT2StyleAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c_attn = nn.Linear(hidden, 3 * num_heads * head_dim, bias=True)
+            self.c_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            qkv = self.c_attn(hidden_states)
+            q, k, v = qkv.split(num_heads * head_dim, dim=-1)
+            q = q.view(b, s, num_heads, head_dim).transpose(1, 2)
+            k = k.view(b, s, num_heads, head_dim).transpose(1, 2)
+            v = v.view(b, s, num_heads, head_dim).transpose(1, 2)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.c_proj(attn_output)
+
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+    simplified = _export_and_simplify_decomposed(
+        GPT2StyleAttention(), (x, mask), ["hidden_states", "attn_mask"]
+    )
+    assert any(n.op_type == "Split" for n in simplified.graph.node)
+    _assert_cpp_matches_python_and_fires(simplified)
 
 
 # --- FLOAT16 / BFLOAT16 weight support ---------------------------------------
