@@ -405,8 +405,7 @@ struct TRTBatchedNMSBuilder {
     return n->output();
   }
 
-  Value* ReduceSum(Value* data, int64_t axis, bool keepdims,
-                   int32_t out_type) {
+  Value* ReduceSum(Value* data, int64_t axis, bool keepdims, int32_t out_type) {
     Node* n = graph.create(kReduceSum, 1);
     n->addInput(data);
     n->addInput(ConstI64Vec1(axis));
@@ -453,7 +452,7 @@ struct TRTBatchedNMSBuilder {
   }
 
   Value* NMS(Value* boxes, Value* scores, Value* max_boxes_per_class,
-            Value* iou_threshold, Value* score_threshold) {
+             Value* iou_threshold, Value* score_threshold) {
     Node* n = graph.create(Symbol("NonMaxSuppression"), 1);
     n->addInput(boxes);
     n->addInput(scores);
@@ -472,9 +471,7 @@ struct RewriteTRTBatchedNMS final : public PredicateBasedPass {
       : PredicateBasedPass(PassType::Other, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
 
-  std::string getPassName() const override {
-    return "rewrite_trt_batched_nms";
-  }
+  std::string getPassName() const override { return "rewrite_trt_batched_nms"; }
 
   bool patternMatchPredicate(Node* node) override {
     if (node->kind() != Symbol("TRTBatchedNMS")) {
@@ -554,12 +551,12 @@ struct RewriteTRTBatchedNMS final : public PredicateBasedPass {
         node, Symbol("keepTopK"), int64_t(-1));
     const float scoreThreshold = GetValueFromAttrWithDefault<float>(
         node, Symbol("scoreThreshold"), 0.0f);
-    const float iouThreshold = GetValueFromAttrWithDefault<float>(
-        node, Symbol("iouThreshold"), 0.45f);
+    const float iouThreshold =
+        GetValueFromAttrWithDefault<float>(node, Symbol("iouThreshold"), 0.45f);
     const int64_t background_label_id = GetValueFromAttrWithDefault<int64_t>(
         node, Symbol("background_label_id"), int64_t(-1));
     const bool clipBoxes = GetValueFromAttrWithDefault<int64_t>(
-                              node, Symbol("clipBoxes"), int64_t(0)) != 0;
+                               node, Symbol("clipBoxes"), int64_t(0)) != 0;
 
     TRTBatchedNMSBuilder b{graph, node};
 
@@ -586,26 +583,26 @@ struct RewriteTRTBatchedNMS final : public PredicateBasedPass {
       if (background_label_id < num_classes) {
         mask[static_cast<size_t>(background_label_id)] = -1e9f;
       }
-      Value* mask_1d = b.ConstFVec(mask);              // (num_classes,)
-      Value* mask_3d = b.Unsqueeze(mask_1d, 0);          // (1, num_classes)
-      mask_3d = b.Unsqueeze(mask_3d, 2);                 // (1, num_classes, 1)
+      Value* mask_1d = b.ConstFVec(mask);        // (num_classes,)
+      Value* mask_3d = b.Unsqueeze(mask_1d, 0);  // (1, num_classes)
+      mask_3d = b.Unsqueeze(mask_3d, 2);         // (1, num_classes, 1)
       scores_t = b.Add(scores_t, mask_3d);
     }
 
     // 4. One NonMaxSuppression call handles every (batch, class) pair.
-    Value* selected_indices =
-        b.NMS(boxes_sq, scores_t, b.ConstI64Scalar(topK), b.ConstF(iouThreshold),
-             b.ConstF(scoreThreshold));  // (num_selected, 3) int64
+    Value* selected_indices = b.NMS(
+        boxes_sq, scores_t, b.ConstI64Scalar(topK), b.ConstF(iouThreshold),
+        b.ConstF(scoreThreshold));  // (num_selected, 3) int64
 
     // 5. Split into columns and gather the actual box/score/class values.
-    Value* b_idx = b.SliceCol(selected_indices, 0);    // (num_selected, 1)
+    Value* b_idx = b.SliceCol(selected_indices, 0);  // (num_selected, 1)
     Value* c_idx = b.SliceCol(selected_indices, 1);
     Value* box_idx = b.SliceCol(selected_indices, 2);
 
     Value* boxes_sel =
         b.GatherND(boxes_sq, b.Concat(1, {b_idx, box_idx}));  // (S, 4)
     Value* scores_sel =
-        b.GatherND(scores_t, b.Concat(1, {b_idx, c_idx, box_idx}));  // (S,)
+        b.GatherND(scores_t, b.Concat(1, {b_idx, c_idx, box_idx}));    // (S,)
     Value* classes_sel = b.CastTo(c_idx, TensorProto_DataType_FLOAT);  // (S,1)
 
     // Output dtype for num_detections: match the node's own declared type,
@@ -631,42 +628,42 @@ struct RewriteTRTBatchedNMS final : public PredicateBasedPass {
     for (int64_t n = 0; n < N; ++n) {
       Value* mask_n = b.Squeeze(b.Equal(b_idx, b.ConstI64Scalar(n)), 1);
 
-      Value* scores_n = b.Compress(scores_sel, mask_n, 0);   // (count_n,)
-      Value* boxes_n = b.Compress(boxes_sel, mask_n, 0);     // (count_n, 4)
-      Value* classes_n = b.Compress(classes_sel, mask_n, 0); // (count_n, 1)
+      Value* scores_n = b.Compress(scores_sel, mask_n, 0);    // (count_n,)
+      Value* boxes_n = b.Compress(boxes_sel, mask_n, 0);      // (count_n, 4)
+      Value* classes_n = b.Compress(classes_sel, mask_n, 0);  // (count_n, 1)
 
       // pad_amount = max(keepTopK - count_n, 0), computed at runtime since
       // count_n is dynamic.
       Value* count_n =
           b.Gather(b.Shape(scores_n), b.ConstI64Scalar(0), 0);  // scalar
-      Value* pad_amount =
-          b.Max(b.Sub(b.ConstI64Scalar(keepTopK), count_n), b.ConstI64Scalar(0));
+      Value* pad_amount = b.Max(b.Sub(b.ConstI64Scalar(keepTopK), count_n),
+                                b.ConstI64Scalar(0));
       Value* pad_amount_vec = b.Unsqueeze(pad_amount, 0);  // (1,)
 
       Value* pads_1d =
           b.Concat(0, {b.ConstI64Vec1(0), pad_amount_vec});  // (2,)
-      Value* pads_2d = b.Concat(
-          0, {b.ConstI64Vec1(0), b.ConstI64Vec1(0), pad_amount_vec,
-              b.ConstI64Vec1(0)});  // (4,)
+      Value* pads_2d =
+          b.Concat(0, {b.ConstI64Vec1(0), b.ConstI64Vec1(0), pad_amount_vec,
+                       b.ConstI64Vec1(0)});  // (4,)
 
       Value* scores_n_pad = b.Pad(scores_n, pads_1d, b.ConstF(kSentinelScore));
       Value* boxes_n_pad = b.Pad(boxes_n, pads_2d, b.ConstF(0.0f));
       Value* classes_n_pad = b.Pad(classes_n, pads_2d, b.ConstF(-1.0f));
 
       auto [values, indices] = b.TopK(scores_n_pad, keepTopK, 0);
-      Value* boxes_n_final = b.Gather(boxes_n_pad, indices, 0);      // (K,4)
+      Value* boxes_n_final = b.Gather(boxes_n_pad, indices, 0);         // (K,4)
       Value* classes_n_final_2d = b.Gather(classes_n_pad, indices, 0);  // (K,1)
-      Value* classes_n_final = b.Squeeze(classes_n_final_2d, 1);      // (K,)
+      Value* classes_n_final = b.Squeeze(classes_n_final_2d, 1);        // (K,)
 
       Value* valid = b.Greater(values, b.ConstF(kSentinelCheck));
       Value* scores_n_final = b.Where(valid, values, b.ConstF(0.0f));
       Value* numdet_n =
           b.ReduceSum(b.CastTo(valid, num_det_dtype), 0, true, num_det_dtype);
 
-      boxes_chunks.push_back(b.Unsqueeze(boxes_n_final, 0));    // (1,K,4)
-      scores_chunks.push_back(b.Unsqueeze(scores_n_final, 0));  // (1,K)
-      classes_chunks.push_back(b.Unsqueeze(classes_n_final, 0));// (1,K)
-      numdet_chunks.push_back(b.Unsqueeze(numdet_n, 0));        // (1,1)
+      boxes_chunks.push_back(b.Unsqueeze(boxes_n_final, 0));      // (1,K,4)
+      scores_chunks.push_back(b.Unsqueeze(scores_n_final, 0));    // (1,K)
+      classes_chunks.push_back(b.Unsqueeze(classes_n_final, 0));  // (1,K)
+      numdet_chunks.push_back(b.Unsqueeze(numdet_n, 0));          // (1,1)
     }
 
     Value* final_boxes = b.Concat(0, boxes_chunks);

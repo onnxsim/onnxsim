@@ -47,7 +47,8 @@
 //   y  = ho*sh - ph + i*dh + dy   -- absolute pixel-space coordinate,
 //   x  = wo*sw - pw + j*dw + dx      NOT normalized to [-1, 1]
 //   m  = mask[n, dg*kh*kw + k, ho, wo]   if modulated, else 1
-//   sampled[...] = m * bilinear_sample_with_zero_padding(input[n,cin_global], y, x)
+//   sampled[...] = m * bilinear_sample_with_zero_padding(input[n,cin_global],
+//   y, x)
 //
 // `bilinear_sample_with_zero_padding` is standard 4-corner bilinear
 // interpolation where any out-of-range corner contributes 0 -- exactly
@@ -119,11 +120,11 @@
 //    `{1,2,4}` for the deformable-offset partitioning instead). This pass
 //    scopes down to `groups == 1` and *declines* (rather than silently
 //    mis-computing) anything else -- see
-//    `tests/test_deform_conv_to_gather.py`'s `test_declines_groups_greater_than_one`
-//    for a regression test proving the decline actually fires. When
-//    `groups == 1`, `Cin/groups == Cin`, so `weight`'s own declared
-//    `Cin/groups` dim must equal `Cin`; a mismatch (a malformed model) is
-//    also declined defensively.
+//    `tests/test_deform_conv_to_gather.py`'s
+//    `test_declines_groups_greater_than_one` for a regression test proving the
+//    decline actually fires. When `groups == 1`, `Cin/groups == Cin`, so
+//    `weight`'s own declared `Cin/groups` dim must equal `Cin`; a mismatch (a
+//    malformed model) is also declined defensively.
 //  - Requires opset (`""` domain) `>= 13`: this pass leans on `Range`
 //    (dynamic scalar `start`/`limit` inputs, opset >= 11), `GatherND`'s
 //    `batch_dims` attribute (opset >= 12), and `Unsqueeze`'s axes-as-input
@@ -599,8 +600,8 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
     m.dw = dilation[1];
 
     m.groups = GetValueFromAttrWithDefault<int64_t>(node, Symbol("groups"), 1);
-    m.deform_groups = GetValueFromAttrWithDefault<int64_t>(
-        node, Symbol("deform_groups"), 0);
+    m.deform_groups =
+        GetValueFromAttrWithDefault<int64_t>(node, Symbol("deform_groups"), 0);
     if (m.deform_groups == 0) {
       m.deform_groups = GetValueFromAttrWithDefault<int64_t>(
           node, Symbol("deformable_groups"), 1);
@@ -622,8 +623,7 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
     // Cross-check offset/mask channel counts against deform_groups*kh*kw
     // when statically known.
     const Dimension& off_c = m.offset->sizes()[1];
-    if (off_c.is_int &&
-        off_c.dim != m.deform_groups * 2 * m.kh * m.kw) {
+    if (off_c.is_int && off_c.dim != m.deform_groups * 2 * m.kh * m.kw) {
       return false;
     }
     if (m.mask != nullptr) {
@@ -687,15 +687,15 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
     Value* row_f = b.CastTo(row_i64, TensorProto_DataType_FLOAT);
     Value* col_f = b.CastTo(col_i64, TensorProto_DataType_FLOAT);
     // (Hout,) -> (Hout,1) so it broadcasts against a trailing (Hout,Wout).
-    Value* base_y = b.Unsqueeze(
-        b.Sub(b.Mul(row_f, b.ConstF(static_cast<float>(m.sh))),
-             b.ConstF(static_cast<float>(m.ph))),
-        1);
+    Value* base_y =
+        b.Unsqueeze(b.Sub(b.Mul(row_f, b.ConstF(static_cast<float>(m.sh))),
+                          b.ConstF(static_cast<float>(m.ph))),
+                    1);
     // (Wout,) -> (1,Wout).
-    Value* base_x = b.Unsqueeze(
-        b.Sub(b.Mul(col_f, b.ConstF(static_cast<float>(m.sw))),
-             b.ConstF(static_cast<float>(m.pw))),
-        0);
+    Value* base_x =
+        b.Unsqueeze(b.Sub(b.Mul(col_f, b.ConstF(static_cast<float>(m.sw))),
+                          b.ConstF(static_cast<float>(m.pw))),
+                    0);
 
     Value* one = b.ConstF(1.0f);
 
@@ -719,10 +719,10 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
                                      1);  // (N,Hout,Wout)
           Value* dx = b.GatherScalar(m.offset, b.ConstI64Scalar(off_dx_ch), 1);
 
-          Value* y = b.Add(
-              b.Add(base_y, b.ConstF(static_cast<float>(i * m.dh))), dy);
-          Value* x = b.Add(
-              b.Add(base_x, b.ConstF(static_cast<float>(j * m.dw))), dx);
+          Value* y =
+              b.Add(b.Add(base_y, b.ConstF(static_cast<float>(i * m.dh))), dy);
+          Value* x =
+              b.Add(b.Add(base_x, b.ConstF(static_cast<float>(j * m.dw))), dx);
 
           Value* x0f = b.Floor(x);
           Value* x1f = b.Add(x0f, one);
@@ -747,8 +747,7 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
                             Value* vx, Value* vy) -> Value* {
             Value* gathered = b.GatherPixel(xt_dg, ix, iy);
             Value* weight_v = b.Mul(wx, wy);
-            Value* mask_f =
-                b.CastTo(b.And(vx, vy), TensorProto_DataType_FLOAT);
+            Value* mask_f = b.CastTo(b.And(vx, vy), TensorProto_DataType_FLOAT);
             weight_v = b.Mul(weight_v, mask_f);
             return b.MulBroadcastLastAxis(gathered, weight_v);
           };
@@ -774,17 +773,16 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
       Value* stacked = b.Concat(3, taps);  // (N,Hout,Wout,kh*kw,Cin_dg)
       Value* transposed =
           b.Transpose(stacked, {0, 1, 2, 4, 3});  // (N,Hout,Wout,Cin_dg,kh*kw)
-      Value* reshaped =
-          b.Reshape(transposed, {0, 0, 0, Cin_dg * khkw});
+      Value* reshaped = b.Reshape(transposed, {0, 0, 0, Cin_dg * khkw});
       dg_blocks.push_back(reshaped);
     }
 
-    Value* unfolded = dg_blocks.size() == 1 ? dg_blocks[0]
-                                            : b.Concat(3, dg_blocks);
+    Value* unfolded =
+        dg_blocks.size() == 1 ? dg_blocks[0] : b.Concat(3, dg_blocks);
     // (N,Hout,Wout,Cin*kh*kw)
 
     Value* weight_flat =
-        b.Reshape(m.weight, {m.Cout, m.Cin * khkw});  // (Cout, Cin*kh*kw)
+        b.Reshape(m.weight, {m.Cout, m.Cin * khkw});     // (Cout, Cin*kh*kw)
     Value* weight_T = b.Transpose(weight_flat, {1, 0});  // (Cin*kh*kw, Cout)
 
     Value* result = b.MatMul(unfolded, weight_T);  // (N,Hout,Wout,Cout)
@@ -792,8 +790,7 @@ struct RewriteDeformConvToGather final : public PredicateBasedPass {
       result = b.Add(result, m.bias);
     }
 
-    Value* final_out =
-        b.Transpose(result, {0, 3, 1, 2});  // (N,Cout,Hout,Wout)
+    Value* final_out = b.Transpose(result, {0, 3, 1, 2});  // (N,Cout,Hout,Wout)
     if (!node->output()->sizes().empty()) {
       final_out->setSizes(node->output()->sizes());
     }

@@ -65,9 +65,9 @@
 //    opset).
 //
 // Derivation, verified against mmcv's pure-PyTorch fallback
-// (`multi_scale_deformable_attn_pytorch`, the ground-truth semantics this custom
-// op implements -- reproduced independently in NumPy in this pass's test file
-// and checked against the *simplified* graph's actual output, since no
+// (`multi_scale_deformable_attn_pytorch`, the ground-truth semantics this
+// custom op implements -- reproduced independently in NumPy in this pass's test
+// file and checked against the *simplified* graph's actual output, since no
 // ONNX kernel exists to compare against the original custom node):
 //
 //   def multi_scale_deformable_attn_pytorch(value, value_spatial_shapes,
@@ -173,7 +173,8 @@
 //    channels).
 // 5. `weighted = Mul(concat_flat, attn_reshaped)` (broadcasts the size-1 `D`
 //    axis of `attn_reshaped`) -> `ReduceSum(weighted, axes=[3], keepdims=0)`
-//    -> `(bs*M, D, num_queries)`, matching the reference's final `* ...).sum(-1)`.
+//    -> `(bs*M, D, num_queries)`, matching the reference's final `*
+//    ...).sum(-1)`.
 //    (`ReduceSum`'s `axes` is passed as the op's second *input*, not an
 //    attribute -- required since opset 13, and this pass already requires
 //    opset >= 16.)
@@ -199,11 +200,12 @@ namespace ONNX_NAMESPACE {
 namespace optimization {
 namespace onnxsim_passes {
 
-// Small node-construction helper bound to one `MMCVMultiScaleDeformableAttention`
-// rewrite: every node it creates is inserted immediately before `anchor` (the
-// custom op node itself), and scalar/vector int64 and float constants are
-// cached so literals shared across levels (`D`, `M*D`, `P`, `L*P`, `-1`, ...)
-// reuse one initializer instead of a fresh one per level.
+// Small node-construction helper bound to one
+// `MMCVMultiScaleDeformableAttention` rewrite: every node it creates is
+// inserted immediately before `anchor` (the custom op node itself), and
+// scalar/vector int64 and float constants are cached so literals shared across
+// levels (`D`, `M*D`, `P`, `L*P`, `-1`, ...) reuse one initializer instead of a
+// fresh one per level.
 struct MSDeformAttnToGridSampleBuilder {
   Graph& graph;
   Node* anchor;
@@ -532,9 +534,9 @@ struct RewriteMSDeformAttnToGridSample final : public PredicateBasedPass {
 
     // bs, num_queries as runtime int64 vec1s -- read fresh off Shape(...) of
     // an original input, never assumed static (see header comment).
-    Value* shape_value = b.Shape(value);              // (bs, num_keys, M, D)
+    Value* shape_value = b.Shape(value);  // (bs, num_keys, M, D)
     Value* bs_v = b.DimAt(shape_value, 0);
-    Value* shape_loc = b.Shape(sampling_locations);    // (bs, nq, M, L, P, 2)
+    Value* shape_loc = b.Shape(sampling_locations);  // (bs, nq, M, L, P, 2)
     Value* nq_v = b.DimAt(shape_loc, 1);
 
     Value* D_vec = b.ConstI64Vec1(D);
@@ -552,7 +554,7 @@ struct RewriteMSDeformAttnToGridSample final : public PredicateBasedPass {
     // (L,).
     Value* col0 = b.Gather(spatial_shapes, b.ConstI64Vec1(0), 1);  // (L,1)
     Value* col1 = b.Gather(spatial_shapes, b.ConstI64Vec1(1), 1);  // (L,1)
-    Value* split_sizes = b.Reshape(b.Mul(col0, col1), neg1_vec);  // (L,)
+    Value* split_sizes = b.Reshape(b.Mul(col0, col1), neg1_vec);   // (L,)
     std::vector<Value*> value_splits = b.Split(value, split_sizes, 1, L);
 
     // sampling_grids = 2 * sampling_locations - 1, converting [0,1] ->
@@ -563,19 +565,17 @@ struct RewriteMSDeformAttnToGridSample final : public PredicateBasedPass {
     std::vector<Value*> level_outputs;
     level_outputs.reserve(static_cast<size_t>(L));
     for (int64_t l = 0; l < L; ++l) {
-      Value* row_l =
-          b.Gather(spatial_shapes, b.ConstI64Scalar(l), 0);  // (2,)
+      Value* row_l = b.Gather(spatial_shapes, b.ConstI64Scalar(l), 0);  // (2,)
       Value* H_l = b.DimAt(row_l, 0);
       Value* W_l = b.DimAt(row_l, 1);
 
       // (bs, H_l*W_l, M, D) -> (bs, H_l*W_l, M*D) -> (bs, M*D, H_l*W_l) ->
       // (bs*M, D, H_l, W_l).
-      Value* reshaped1 = b.Reshape(
-          value_splits[static_cast<size_t>(l)],
-          b.Concat(0, {bs_v, neg1_vec, MD_vec}));
+      Value* reshaped1 = b.Reshape(value_splits[static_cast<size_t>(l)],
+                                   b.Concat(0, {bs_v, neg1_vec, MD_vec}));
       Value* transposed1 = b.Transpose(reshaped1, {0, 2, 1});
-      Value* value_reshaped_l = b.Reshape(
-          transposed1, b.Concat(0, {neg1_vec, D_vec, H_l, W_l}));
+      Value* value_reshaped_l =
+          b.Reshape(transposed1, b.Concat(0, {neg1_vec, D_vec, H_l, W_l}));
 
       // (bs, nq, M, P, 2) -> (bs, M, nq, P, 2) -> (bs*M, nq, P, 2).
       Value* level_grid = b.Gather(sampling_grids, b.ConstI64Scalar(l), 3);
@@ -591,12 +591,11 @@ struct RewriteMSDeformAttnToGridSample final : public PredicateBasedPass {
 
     // (bs*M, D, nq, L, P) -> (bs*M, D, nq, L*P).
     Value* concat_result = b.Concat(3, level_outputs);
-    Value* concat_flat = b.Reshape(
-        concat_result, b.Concat(0, {neg1_vec, D_vec, nq_v, LP_vec}));
+    Value* concat_flat =
+        b.Reshape(concat_result, b.Concat(0, {neg1_vec, D_vec, nq_v, LP_vec}));
 
     // (bs, nq, M, L, P) -> (bs, M, nq, L, P) -> (bs*M, 1, nq, L*P).
-    Value* attn_transposed =
-        b.Transpose(attention_weights, {0, 2, 1, 3, 4});
+    Value* attn_transposed = b.Transpose(attention_weights, {0, 2, 1, 3, 4});
     Value* attn_reshaped = b.Reshape(
         attn_transposed, b.Concat(0, {neg1_vec, one_vec, nq_v, LP_vec}));
 
@@ -605,10 +604,10 @@ struct RewriteMSDeformAttnToGridSample final : public PredicateBasedPass {
     Value* reduced = b.ReduceSum(weighted, b.ConstI64Vec1(3), false);
 
     // (bs*M, D, nq) -> (bs, M, D, nq) -> (bs, M*D, nq) -> (bs, nq, M*D).
-    Value* reshaped_bmdnq = b.Reshape(
-        reduced, b.Concat(0, {bs_v, M_vec, D_vec, nq_v}));
-    Value* reshaped_bmdnq2 = b.Reshape(
-        reshaped_bmdnq, b.Concat(0, {bs_v, MD_vec, nq_v}));
+    Value* reshaped_bmdnq =
+        b.Reshape(reduced, b.Concat(0, {bs_v, M_vec, D_vec, nq_v}));
+    Value* reshaped_bmdnq2 =
+        b.Reshape(reshaped_bmdnq, b.Concat(0, {bs_v, MD_vec, nq_v}));
     Value* final_out = b.Transpose(reshaped_bmdnq2, {0, 2, 1});
 
     if (!node->output()->sizes().empty()) {
