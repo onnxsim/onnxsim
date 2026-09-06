@@ -37,8 +37,6 @@ specific tie order.
 """
 
 import numpy as np
-import onnx
-import onnx.numpy_helper
 import pytest
 from onnx import parser
 
@@ -117,9 +115,7 @@ def _random_boxes_scores(rng, n, num_boxes, num_classes, box_scale=10.0):
     x2y2 = centers + sizes / 2
     boxes = np.concatenate([x1y1, x2y2], axis=-1).astype(np.float32)  # (N,B,4)
     boxes_5d = boxes[:, :, None, :]  # (N,B,1,4)
-    scores = rng.uniform(0.0, 1.0, size=(n, num_boxes, num_classes)).astype(
-        np.float32
-    )
+    scores = rng.uniform(0.0, 1.0, size=(n, num_boxes, num_classes)).astype(np.float32)
     return boxes_5d, boxes, scores
 
 
@@ -280,8 +276,13 @@ def test_single_batch_item():
     _, actual = _run_simplified(model, boxes_5d, scores)
 
     expected = reference_trt_batched_nms(
-        boxes, scores, background_label_id=-1, top_k=200, keep_top_k=keep_top_k,
-        score_threshold=0.05, iou_threshold=0.5,
+        boxes,
+        scores,
+        background_label_id=-1,
+        top_k=200,
+        keep_top_k=keep_top_k,
+        score_threshold=0.05,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
 
@@ -295,8 +296,13 @@ def test_multiple_batch_items():
     _, actual = _run_simplified(model, boxes_5d, scores)
 
     expected = reference_trt_batched_nms(
-        boxes, scores, background_label_id=-1, top_k=200, keep_top_k=keep_top_k,
-        score_threshold=0.05, iou_threshold=0.5,
+        boxes,
+        scores,
+        background_label_id=-1,
+        top_k=200,
+        keep_top_k=keep_top_k,
+        score_threshold=0.05,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
 
@@ -312,8 +318,13 @@ def test_background_label_id_negative_one_keeps_all_classes():
     _, actual = _run_simplified(model, boxes_5d, scores)
 
     expected = reference_trt_batched_nms(
-        boxes, scores, background_label_id=-1, top_k=200, keep_top_k=keep_top_k,
-        score_threshold=0.05, iou_threshold=0.5,
+        boxes,
+        scores,
+        background_label_id=-1,
+        top_k=200,
+        keep_top_k=keep_top_k,
+        score_threshold=0.05,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
     # Sanity: every one of num_classes appears somewhere as a kept class
@@ -364,8 +375,13 @@ def test_fewer_detections_than_keep_top_k_exercises_padding():
     _, actual = _run_simplified(model, boxes_5d, scores)
 
     expected = reference_trt_batched_nms(
-        boxes, scores, background_label_id=-1, top_k=200, keep_top_k=keep_top_k,
-        score_threshold=0.3, iou_threshold=0.5,
+        boxes,
+        scores,
+        background_label_id=-1,
+        top_k=200,
+        keep_top_k=keep_top_k,
+        score_threshold=0.3,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
 
@@ -380,14 +396,17 @@ def test_domain_empty_string_also_matches():
     n, num_boxes, num_classes, keep_top_k = 1, 20, 3, 10
     boxes_5d, boxes, scores = _random_boxes_scores(rng, n, num_boxes, num_classes)
 
-    model = _trt_batched_nms_model(
-        n, num_boxes, num_classes, keep_top_k, domain=None
-    )
+    model = _trt_batched_nms_model(n, num_boxes, num_classes, keep_top_k, domain=None)
     _, actual = _run_simplified(model, boxes_5d, scores)
 
     expected = reference_trt_batched_nms(
-        boxes, scores, background_label_id=-1, top_k=200, keep_top_k=keep_top_k,
-        score_threshold=0.05, iou_threshold=0.5,
+        boxes,
+        scores,
+        background_label_id=-1,
+        top_k=200,
+        keep_top_k=keep_top_k,
+        score_threshold=0.05,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
 
@@ -417,9 +436,7 @@ def test_declines_when_batch_size_is_dynamic():
     """N (batch size) not statically known is out of scope -- this pass
     unrolls a per-batch-item C++ loop at pass-build time."""
     n, num_boxes, num_classes, keep_top_k = 2, 10, 3, 5
-    model = _trt_batched_nms_model(
-        n, num_boxes, num_classes, keep_top_k, n_dyn=True
-    )
+    model = _trt_batched_nms_model(n, num_boxes, num_classes, keep_top_k, n_dyn=True)
     simplified, ok = onnxsim.simplify(
         model, check_n=0, extra_optimizers=["rewrite_trt_batched_nms"]
     )

@@ -33,7 +33,6 @@ import collections
 
 import numpy as np
 import onnx
-import pytest
 from onnx import parser
 
 import onnxsim
@@ -44,9 +43,7 @@ except ImportError:
     _ort = None
 
 
-def _model(
-    body, initializer=(), opset=17, ir_version=10, custom_domain="mmdeploy"
-):
+def _model(body, initializer=(), opset=17, ir_version=10, custom_domain="mmdeploy"):
     # `body` is just the graph declaration (`agraph (...) => (...) { ... }`),
     # not a full text-format model -- the ir_version/opset_import header is
     # added here, once, per CLAUDE.md's `_model` helper convention.
@@ -135,18 +132,14 @@ def _deform_conv2d_reference(
                 for j in range(kw):
                     k = i * kw + j
                     dy = offset[n, dg * 2 * kh * kw + 2 * k].astype(np.float64)
-                    dx = offset[n, dg * 2 * kh * kw + 2 * k + 1].astype(
-                        np.float64
-                    )
+                    dx = offset[n, dg * 2 * kh * kw + 2 * k + 1].astype(np.float64)
                     y = ho * sh - ph + i * dh + dy
                     x = wo * sw - pw + j * dw + dx
                     sampled = _bilinear_sample_zero_pad(
                         X[n, cin].astype(np.float64), y, x
                     )
                     if mask is not None:
-                        sampled = sampled * mask[n, dg * kh * kw + k].astype(
-                            np.float64
-                        )
+                        sampled = sampled * mask[n, dg * kh * kw + k].astype(np.float64)
                     # Accumulate this input channel's contribution into every
                     # output channel at once via the weight column.
                     out[n, :, :, :] += (
@@ -240,15 +233,15 @@ def _build_and_check(
     X = rng.randn(n, cin, h, w).astype(np.float32)
     # Offsets: mostly small (in-range) but with enough spread that some taps
     # land out-of-bounds, exercising the zeros-padding path.
-    offset = rng.uniform(-2.0, 2.0, size=_offset_shape(deform_groups, kh, kw, n, hout, wout)).astype(
-        np.float32
-    )
+    offset = rng.uniform(
+        -2.0, 2.0, size=_offset_shape(deform_groups, kh, kw, n, hout, wout)
+    ).astype(np.float32)
     weight = rng.randn(cout, cin, kh, kw).astype(np.float32) * 0.5
     mask = None
     if modulated:
-        mask = rng.uniform(0.0, 1.0, size=_mask_shape(deform_groups, kh, kw, n, hout, wout)).astype(
-            np.float32
-        )
+        mask = rng.uniform(
+            0.0, 1.0, size=_mask_shape(deform_groups, kh, kw, n, hout, wout)
+        ).astype(np.float32)
     bias = rng.randn(cout).astype(np.float32) if with_bias else None
 
     expected = _deform_conv2d_reference(

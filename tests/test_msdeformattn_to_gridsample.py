@@ -157,15 +157,9 @@ def _register_schema(domain, since_version=1):
         inputs=[
             OpSchema.FormalParameter("value", "T", "value"),
             OpSchema.FormalParameter("spatial_shapes", "T1", "spatial_shapes"),
-            OpSchema.FormalParameter(
-                "level_start_index", "T1", "level_start_index"
-            ),
-            OpSchema.FormalParameter(
-                "sampling_locations", "T", "sampling_locations"
-            ),
-            OpSchema.FormalParameter(
-                "attention_weights", "T", "attention_weights"
-            ),
+            OpSchema.FormalParameter("level_start_index", "T1", "level_start_index"),
+            OpSchema.FormalParameter("sampling_locations", "T", "sampling_locations"),
+            OpSchema.FormalParameter("attention_weights", "T", "attention_weights"),
         ],
         outputs=[OpSchema.FormalParameter("output", "T", "output")],
         type_constraints=[
@@ -266,7 +260,13 @@ def _rand_inputs(rng, bs, num_keys, num_queries, M, D, spatial_shapes, P):
     attention_weights = rng.uniform(
         0.0, 1.0, size=(bs, num_queries, M, len(spatial_shapes), P)
     ).astype(np.float32)
-    return value, spatial_shapes_arr, level_start_index, sampling_locations, attention_weights
+    return (
+        value,
+        spatial_shapes_arr,
+        level_start_index,
+        sampling_locations,
+        attention_weights,
+    )
 
 
 def _simplify_and_check(model, feeds, rtol=1e-4, atol=1e-5):
@@ -352,9 +352,7 @@ def test_single_level():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "M,D,P", [(1, 4, 1), (2, 16, 2), (8, 4, 8), (3, 5, 6)]
-)
+@pytest.mark.parametrize("M,D,P", [(1, 4, 1), (2, 16, 2), (8, 4, 8), (3, 5, 6)])
 def test_varying_heads_dims_points(M, D, P):
     rng = np.random.RandomState(2)
     spatial_shapes = [(6, 6), (3, 4)]
