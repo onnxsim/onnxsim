@@ -86,12 +86,24 @@ def _correlated_calibration(K, num_samples=64, rank=6, seed=1):
     return x
 
 
-def _int4_initializer(model, name):
-    return next(
-        t
-        for t in model.graph.initializer
-        if t.data_type == onnx.TensorProto.INT4 and t.name.startswith(name)
+def _int4_weight(model, node_output_name):
+    # Fetch Wq by the MatMul/Gemm node's own DequantizeLinear input, not by
+    # scanning for "some INT4 tensor" or guessing a name from the original
+    # weight's own name: quantize_weight_only_int4 does not derive the new
+    # initializer's name from the original weight's name at all, and never
+    # prunes the original (now-dead) float32 weight initializer either --
+    # same convention test_gptq.py's own _dequantize_int4 helper follows.
+    node = next(
+        n
+        for n in model.graph.node
+        if n.op_type in ("MatMul", "Gemm") and n.output[0] == node_output_name
     )
+    dq_node = next(
+        n
+        for n in model.graph.node
+        if n.op_type == "DequantizeLinear" and n.output[0] == node.input[1]
+    )
+    return next(t for t in model.graph.initializer if t.name == dq_node.input[0])
 
 
 def test_gptaq_matches_gptq_exactly_with_no_upstream_quantization():
@@ -108,8 +120,8 @@ def test_gptaq_matches_gptq_exactly_with_no_upstream_quantization():
     gptq_model = onnxsim.apply_gptq(model, quant, calibration_data=calibration_data)
     gptaq_model = onnxsim.apply_gptaq(model, quant, calibration_data=calibration_data)
 
-    wq_gptq = _int4_initializer(gptq_model, "W")
-    wq_gptaq = _int4_initializer(gptaq_model, "W")
+    wq_gptq = _int4_weight(gptq_model, "Y")
+    wq_gptaq = _int4_weight(gptaq_model, "Y")
     assert wq_gptq.raw_data == wq_gptaq.raw_data
 
 
@@ -139,8 +151,8 @@ def test_gptaq_beats_gptq_once_an_upstream_layer_is_already_corrected():
 
     # Layer 1 must be untouched (identical) by this second round in both --
     # only layer 2 differs between final_gptq and final_gptaq.
-    w1_gptq = _int4_initializer(final_gptq, "W1")
-    w1_gptaq = _int4_initializer(final_gptaq, "W1")
+    w1_gptq = _int4_weight(final_gptq, "Y1")
+    w1_gptaq = _int4_weight(final_gptaq, "Y1")
     assert w1_gptq.raw_data == w1_gptaq.raw_data
 
     (float_y,) = _run(model, {"X": x})
@@ -169,7 +181,7 @@ def test_gptaq_preserves_scale_and_shape():
     )
     np.testing.assert_array_equal(before_scale, after_scale)
 
-    wq = _int4_initializer(gptaq_model, "W")
+    wq = _int4_weight(gptaq_model, "Y")
     assert list(wq.dims) == [32, 8]
 
 
@@ -180,7 +192,7 @@ def test_gptaq_codes_stay_in_range():
 
     quant = onnxsim.quantize_weight_only_int4(model)
     gptaq_model = onnxsim.apply_gptaq(model, quant, calibration_data=calibration_data)
-    wq = _int4_initializer(gptaq_model, "W")
+    wq = _int4_weight(gptaq_model, "Y")
     numel = int(np.prod(list(wq.dims)))
     raw = np.frombuffer(wq.raw_data, dtype=np.uint8)
     lo = (raw & 0x0F).astype(np.int8)
