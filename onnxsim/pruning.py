@@ -3333,6 +3333,27 @@ _UNARY_PASS_THROUGH = {
     "LeakyRelu",
     "Elu",
     "Selu",
+    # ai.onnx (domain "") ThresholdedRelu(X) -> Y, since_version=22 --
+    # confirmed live via `onnx.defs.get_schema("ThresholdedRelu")`: single
+    # required input `X`, single output `Y`, one scalar float `alpha`
+    # attribute (default 1.0), computing `y = x for x > alpha, else 0`.
+    # Structurally identical to `LeakyRelu`/`Elu`/`Selu` immediately above
+    # (same per-element threshold-or-pass shape, no cross-channel mixing, no
+    # second tensor operand to slice) -- it belongs here for the same
+    # reason those do. Real provenance: neither PyTorch exporter (legacy
+    # TorchScript-based or the newer dynamo exporter) emits this op natively
+    # for `nn.Threshold` -- both decompose it into
+    # `Greater`/`LessOrEqual`/`Cast`/`Where` -- but tf2onnx (confirmed
+    # against the real 1.17.0 wheel) ships a dedicated rewriter,
+    # `tf2onnx/rewriter/thresholded_relu_rewriter.py`, that pattern-matches
+    # TensorFlow's `Greater -> Cast -> Mul` lowering of the real, documented
+    # `tf.keras.layers.ThresholdedReLU` Keras layer and canonicalizes it
+    # into a single native `ThresholdedRelu` node (opset 10+) -- tf2onnx's
+    # own test suite (`tests/test_backend.py::test_thresholded_relu`)
+    # explicitly asserts the converted graph contains exactly one
+    # `ThresholdedRelu` node, so this is real, shipped, tested exporter
+    # output, not a purely theoretical case.
+    "ThresholdedRelu",
     "Sigmoid",
     "Tanh",
     "Softplus",
