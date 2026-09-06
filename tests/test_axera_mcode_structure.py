@@ -1235,3 +1235,93 @@ def test_patching_decoded_requant_scale_isolates_to_one_channel(tmp_path):
         "expected halving the requant scale to narrow channel 0's output spread",
     )
     assert len(np.unique(patch0)) < len(np.unique(base0))
+
+
+def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
+    """Confirmed real (see the README's "The bit-flip probe on the real
+    resnet18d mcode" section): on the real, unmodified resnet18d_Opset18
+    mcode (49,080 bytes), flipping a single byte lands in one of THREE
+    deterministic classes -- not the two the tiny two-Conv model showed:
+
+    - FAULT: the runtime rejects it with 0x8030070C (structural check).
+    - DIFFERENT: it runs, but the real 1000-class logits change -- the
+      first bytes this project found whose effect on actual computation
+      is directly observable, most of them changing the predicted class.
+    - identical: it runs, bit-identical output (inert).
+
+    A 41-offset sweep measured 61% / 22% / 17%. This locks in two
+    representative offsets per class. Heavier than this file's other
+    tests (fetches the real model, one real Docker build) -- the same
+    class of work as the dormant self-hosted `pulsar2-docker-convert` CI
+    job, which is where it is meant to run.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    import convert_onnxmodelzoo  # noqa: E402  -- also puts model_zoo on sys.path
+    import model_zoo  # noqa: E402
+
+    model = onnx.load(model_zoo.fetch_model("resnet18d_Opset18"))
+    tensor_name = convert_onnxmodelzoo._single_image_input(model)
+    assert tensor_name is not None
+
+    work_dir = str(tmp_path)
+    os.makedirs(os.path.join(work_dir, "model"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    pulsar2_docker.make_synthetic_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib.tar")
+    )
+    onnx.save(model, os.path.join(work_dir, "model", "resnet18d.onnx"))
+    result = pulsar2_docker.build(
+        work_dir,
+        "model/resnet18d.onnx",
+        "output/resnet18d",
+        tensor_name=tensor_name,
+        mean=convert_onnxmodelzoo._DEFAULT_MEAN,
+        std=convert_onnxmodelzoo._DEFAULT_STD,
+        calibration_dataset_rel_path="dataset/calib.tar",
+    )
+    assert result.success, result.error
+    path = result.axmodel_path
+
+    compiled = onnx.load(path)
+    key = _mcode_key(compiled)
+    mcode = bytes({i.name: i for i in compiled.graph.initializer}[key].raw_data)
+    assert len(mcode) == 49080, len(mcode)
+
+    rng = np.random.RandomState(42)
+    x = rng.randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+    assert out_base.shape == (1000,)
+
+    def flip_and_run(offset):
+        patched = bytearray(mcode)
+        patched[offset] ^= 0xFF
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(work_dir, f"flip_{offset}.axmodel")
+        onnx.save(c, p)
+        return pulsar2_docker.run_on_device_with_inputs(p, {"x": x.tobytes()})
+
+    for off in (300, 1500):
+        dev = flip_and_run(off)
+        assert dev.error and "0x8030070C" in dev.error, (off, dev.error)
+
+    for off in (12300, 26700):
+        dev = flip_and_run(off)
+        assert not dev.error, (off, dev.error)
+        assert np.array_equal(
+            np.frombuffer(dev.outputs[0], dtype=np.float32), out_base
+        ), off
+
+    for off in (9900, 32700):
+        dev = flip_and_run(off)
+        assert not dev.error, (off, dev.error)
+        out = np.frombuffer(dev.outputs[0], dtype=np.float32)
+        assert not np.array_equal(out, out_base), off
+        assert out.argmax() != out_base.argmax(), (
+            off,
+            "expected the predicted class to change",
+        )

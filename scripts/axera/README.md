@@ -1741,6 +1741,54 @@ recurring lesson: a correlation-only finding (an array that "shrinks as
 bias grows") can misdescribe the actual mechanism even when the general
 hypothesis is right, and only a direct intervention exposes that.
 
+### The bit-flip probe on the real `resnet18d` mcode: a third outcome appears, and the blob is ~83% live
+
+The single-byte-flip probe above only ever saw two outcomes on a tiny
+two-Conv model (inert, or a `0x8030070C` fault), across just 8 offsets.
+Running the same probe across the **real, unmodified `resnet18d_Opset18`
+mcode** (49,080 bytes; 41 offsets evenly spaced every 1,200 bytes through
+the interior, one flipped byte per run, each on a fresh copy of the same
+base file, all fed the identical fixed `uint8 [1,224,224,3]` input) gives
+a quantified, real-model-scale picture, and finds something the tiny
+model never showed:
+
+```
+25 / 41  (61%)  FAULT      -- runtime rejects it: 0x8030070C, same code every time
+ 9 / 41  (22%)  DIFFERENT  -- runs, but the 1000-class logits change
+ 7 / 41  (17%)  identical  -- runs, bit-identical output
+```
+
+**The `DIFFERENT` class is new, and it is real computation.** Every one of
+those 9 flips ran to completion with no error, yet produced different
+logits -- and in **7 of the 9 the predicted class itself changed** (e.g.
+argmax 305 -> 567, 908, 834, 143, 111, 533, 318), with max-abs logit
+deltas from 0.18 up to 7.29. The other 2 shifted the logits only mildly
+(0.18, 0.29) and kept the argmax. These are the first bytes this project
+has ever identified whose effect on the *actual computation* is directly
+observable -- a genuine instruction/parameter class, distinct from the
+checksum/opcode-validation class that faults, and from the inert class.
+All three outcomes were verified to be deterministic and not device noise:
+the unpatched baseline is bit-identical across 3 repeated runs; three of
+the `DIFFERENT` flips (9900, 32700, 48300) reproduce the *same* changed
+output on rerun; and two `identical` flips (12300, 26700) stay
+bit-identical against a second, different random input. The device stayed
+healthy throughout 25 consecutive faults (`axcl-smi` fine afterward) --
+the fault is graceful every time, never a lockup.
+
+**Bottom line for "how live is a real model's mcode":** by this sampling,
+**~83% of `resnet18d`'s mcode bytes are load-bearing** (61% checked
+structurally, 22% affecting real output), and only ~17% are inert -- far
+more live than the tiny model's 50/50 split suggested, and a direct,
+quantified counterpart to the earlier "43.4% of bytes are exact
+duplicates" finding: a byte being a *copy* of another span does not make
+it dead, since the hardware evidently reads those copies. The 9
+output-changing offsets are the most concrete decoding targets this
+README has produced so far -- each is a real, known-live byte whose
+effect on a real classifier is already measurable, so the next step
+(bisecting each one's *neighbors* to map the extent of its field, and
+correlating the resulting logit change with which layer's Conv it sits
+in) needs no new technique at all.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
