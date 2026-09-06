@@ -1281,8 +1281,6 @@ def test_cpp_gqa_pruning_cross_attention_matches_oracle_exactly():
     assert not np.allclose(y_pruned, y_pruned2)
 
 
-
-
 # --- Packed-QKV-then-Split + RoPE/QK-norm walk-back (GroupQueryAttention/ ---
 # --- plain ai.onnx::Attention) -- FindSeparateQkvChains's own new
 # --- WalkBackThroughQkNormRope/WalkBackThroughGemmaRopePair machinery,

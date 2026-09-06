@@ -921,8 +921,6 @@ def test_cpp_gqa_wanda_pruning_cross_attention_matches_oracle_exactly():
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
-
-
 # --- Packed-QKV-then-Split + RoPE/QK-norm walk-back, Wanda-calibrated -------
 # --- (GroupQueryAttention/plain ai.onnx::Attention) -- mirrors
 # --- test_attention_head_pruning_cpp.py's own identically-named section,
