@@ -12,6 +12,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "passes/any_precision_llm.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
+#include "passes/iq4_nl.h"
 #include "passes/qoperator_quantize_gemm.h"
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
@@ -170,6 +171,15 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
   onnx::optimization::onnxsim_passes::QuarotEpsilon() = epsilon;
   return onnx::optimization::OptimizeFixed(model,
                                            std::vector<std::string>{"quarot"});
+}
+
+onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers iq4_nl (idempotent) into onnxoptimizer's registry so
+  // OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"iq4_nl"});
 }
 
 std::vector<std::string> ListQuantizableActivations(

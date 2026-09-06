@@ -5294,6 +5294,48 @@ def test_structured_pruning_conv_chain_celu_matches_oracle_exactly():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+def test_structured_pruning_conv_chain_thresholded_relu_matches_oracle_exactly():
+    # ai.onnx (domain "") ThresholdedRelu(X) -> Y, since_version=22 --
+    # single input, single output, one scalar float `alpha` attribute,
+    # structurally identical to `LeakyRelu`/`Elu`/`Selu`/`Celu` (all already
+    # in `_UNARY_PASS_THROUGH`). Was previously missing from that set
+    # entirely -- confirmed empirically that this exact Conv ->
+    # ThresholdedRelu -> Conv chain was left completely untouched (0 chains
+    # matched) before `ThresholdedRelu` was added. Same oracle bar as the
+    # Swish/HardSwish tests above: exact equivalence to deleting the same
+    # output filters by hand.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(240)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(
+        w1, w2, b1=b1, activation="ThresholdedRelu<alpha=0.5>", opset=22
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(
+        w1[keep],
+        w2[:, keep],
+        b1=b1[keep],
+        activation="ThresholdedRelu<alpha=0.5>",
+        opset=22,
+    )
+
+    rng_x = np.random.default_rng(241)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Self-gated activation decomposition (SiLU/erf-GELU, unfused) --------
 #
 # A raw `torch.onnx.export` of `nn.SiLU()`/`nn.GELU()` -- at any opset below
@@ -30856,6 +30898,83 @@ def test_qdq_structured_pruning_conv_celu_activation_matches_oracle():
             ],
         ),
         opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_conv_thresholded_relu_activation_matches_oracle():
+    # Same both-sides-QDQ topology as
+    # test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle, with a
+    # `ThresholdedRelu` activation node (now in `_UNARY_PASS_THROUGH`, see
+    # that set's own comment) sitting between the producer Conv and the
+    # consumer Conv -- confirming the QDQ walker (`_walk_to_consumer_qdq`),
+    # which consults the very same shared set, is fixed by the same
+    # one-entry addition.
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(10)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq)
+          hact = ThresholdedRelu<alpha=0.5>(h)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(hact, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["Wscale1"].dims) == [Cmid // 2]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+    assert list(inits["Wscale2"].dims) == [Cout]  # consumer's own scale untouched
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(13)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("ThresholdedRelu", ["h"], ["hact"], alpha=0.5),
+                onnx.helper.make_node("Conv", ["hact", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 22)],
         ir_version=10,
     )
     (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
