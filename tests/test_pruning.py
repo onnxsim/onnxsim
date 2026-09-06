@@ -7367,6 +7367,314 @@ def test_analyze_structured_pruning_spatial_gate_pass_through_matches_real_call(
     assert dims_after["SGW"] == (1, 2, 7, 7)
 
 
+# --- Conv chain: ECA-Net `eca_layer` channel-attention gate pass-through hop -
+#
+# ECA-Net (Wang et al. 2020 CVPR, "ECA-Net: Efficient Channel Attention for
+# Deep Convolutional Neural Networks")'s `eca_layer` -- a *fourth*
+# Conv-chain pass-through hop sharing SpatialGate/GRN's own three-consumer
+# dispatch. See `onnxsim.pruning`'s own "ECA-Net `eca_layer`
+# channel-attention gate" section comment and
+# `onnxsim.pruning._match_eca_gate_pass_through`'s own docstring for the full
+# empirical/architectural finding: confirmed via a real `torch.onnx.export`
+# (opset 17, legacy TorchScript-based exporter) of a verbatim
+# reimplementation of the reference implementation's own
+# (`github.com/BangguWu/ECANet`'s `models/eca_module.py`) `eca_layer.forward`,
+# wired as `Conv -> eca_layer(k_size=3) -> Conv`, checker-passed: a spine
+# tensor's own three direct consumers are exactly `GlobalAveragePool`, the
+# closing `Mul`, and a `Shape` feeding an `Expand` that broadcasts the
+# single-channel gate back out to the spine's own full spatial shape. The
+# internal `Conv1d`'s own weight is architecturally fixed at exactly
+# ``[1, 1, k]`` -- independent of the spine's own channel count -- so the
+# whole subgraph contributes nothing to slicing bookkeeping at all, a pure
+# "hop over" case exactly like `SpatialGate`'s own diamond.
+def _eca_conv_pair_model(w1, w2, eca_w, b1=None, b2=None, k=3, spatial=8):
+    """`Conv -> {GlobalAveragePool -> Squeeze -> Transpose -> Conv1d ->
+    Transpose -> Unsqueeze -> Sigmoid} & {Shape -> Expand} -> Mul -> Conv` --
+    ECA-Net's `eca_layer`, the exact shape a real `torch.onnx.export`
+    (opset 17, legacy TorchScript-based exporter) emits. `eca_w` (shape
+    ``[1, 1, k]``) is the internal 1-D attention Conv's own weight,
+    architecturally independent of `w1`'s own output-channel count. `Squeeze`
+    resolves its own `axes` from the confirmed real export's own literal
+    value (``[3]``, the pooling step's own guaranteed-size-1 last axis of its
+    rank-4 output) and `Unsqueeze` from its own (``[-1]``) -- both forms
+    :func:`onnxsim.pruning._match_eca_gate_pass_through` recognizes (see its
+    own docstring). Built at `opset=17`, matching the confirmed exporter
+    output. All three Convs use "same" padding, so the spatial size never
+    changes end to end -- unlike `_spatial_gate_conv_pair_model`'s own
+    "valid"-padding main convs, nothing here needs separate input/output
+    spatial-size bookkeeping.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    pad = (k - 1) // 2
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(eca_w, "EcaW"),
+        onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "SqAxes"),
+        onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "UnsAxes"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1)"
+    if b2 is not None:
+        conv2 = "Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, W2, B2)"
+        initializer.append(_f32(b2, "B2"))
+    else:
+        conv2 = "Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, W2)"
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          {conv1}
+          gap = GlobalAveragePool(h)
+          sq = Squeeze(gap, SqAxes)
+          tr1 = Transpose<perm=[0,2,1]>(sq)
+          c1d = Conv<kernel_shape=[{k}], pads=[{pad},{pad}]>(tr1, EcaW)
+          tr2 = Transpose<perm=[0,2,1]>(c1d)
+          uns = Unsqueeze(tr2, UnsAxes)
+          gate = Sigmoid(uns)
+          hshape = Shape(h)
+          expanded = Expand(gate, hshape)
+          gated = Mul(h, expanded)
+          {conv2}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_eca_gate_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, same as every other Conv-chain hop's own
+    # oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model, verified end-to-end via
+    # onnxruntime. ECA's own internal `Conv1d`/`Sigmoid` subgraph is
+    # architecturally untouched by pruning (see this section's own comment),
+    # so the plain, ungrouped `_oracle_keep_indices_conv` top-k-by-L2-norm
+    # oracle applies directly, exactly as it does for `SpatialGate`.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(700)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    eca_w = rng.standard_normal((1, 1, 3)).astype(np.float32)
+    model = _eca_conv_pair_model(w1, w2, eca_w, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+    # ECA's own internal Conv1d is architecturally independent of the
+    # spine's own channel count -- untouched by pruning.
+    assert dims_after["EcaW"] == (1, 1, 3)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _eca_conv_pair_model(w1[keep], w2[:, keep], eca_w, b1=b1[keep])
+
+    rng_x = np.random.default_rng(701)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_eca_gate_stray_consumer_declines():
+    # A spine tensor read by a *fourth* consumer beyond the three ECA's own
+    # `eca_layer` needs (`GlobalAveragePool`, `Shape`, the closing `Mul`)
+    # isn't the recognized shape at all -- `_find_conv_chains`'s own
+    # producer-consumer-count gate (`{1, 2, 3, 5}`) already excludes it
+    # before `_match_eca_gate_pass_through` is ever tried. Declined outright,
+    # mirroring `test_structured_pruning_spatial_gate_stray_consumer_declines`
+    # above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(702)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    eca_w = rng.standard_normal((1, 1, 3)).astype(np.float32)
+    model = _eca_conv_pair_model(w1, w2, eca_w)
+    # Add a fourth, stray direct consumer of `h` (the producer Conv's own
+    # output) -- an otherwise-unused `Identity` node reading it.
+    stray = onnx.helper.make_node("Identity", ["h"], ["stray"])
+    model.graph.node.insert(1, stray)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["EcaW"], eca_w)
+
+
+def _spatial_gate_grn_eca_coexist_model(
+    w1_sg, w2_sg, sg_w, w1_grn, w2_grn, grn_weight, grn_bias, w1_eca, w2_eca, eca_w
+):
+    """One graph, three completely independent Conv chains sharing the same
+    input `X` -- one `SpatialGate`, one GRN, one ECA -- each built from
+    exactly the same node shapes `_spatial_gate_conv_pair_model`/
+    `_grn_conv_pair_model`/`_eca_conv_pair_model` each use in isolation, just
+    combined into one multi-output graph so a single `_find_conv_chains` call
+    dispatches all three shapes at once (see the coexistence test below for
+    why this matters). All three main Convs use "same" padding, exactly like
+    `_eca_conv_pair_model`'s own, so every branch keeps the same spatial size
+    throughout -- no separate bookkeeping needed per branch.
+    """
+    Cin = w1_sg.shape[1]
+    Cout = w2_sg.shape[0]
+    spatial = 8
+    initializer = [
+        _f32(w1_sg, "W1_SG"),
+        _f32(w2_sg, "W2_SG"),
+        _f32(sg_w, "SGW"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+        _f32(w1_grn, "W1_GRN"),
+        _f32(w2_grn, "W2_GRN"),
+        _f32(grn_weight.reshape(1, -1, 1, 1), "GrnWeight"),
+        _f32(grn_bias.reshape(1, -1, 1, 1), "GrnBias"),
+        _f32(np.array(1e-6, dtype=np.float32), "Eps"),
+        _f32(w1_eca, "W1_ECA"),
+        _f32(w2_eca, "W2_ECA"),
+        _f32(eca_w, "EcaW"),
+        onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "SqAxes"),
+        onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "UnsAxes"),
+    ]
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (
+            float[N,{Cout},{spatial},{spatial}] Y_SG,
+            float[N,{Cout},{spatial},{spatial}] Y_GRN,
+            float[N,{Cout},{spatial},{spatial}] Y_ECA)
+        {{
+          h_sg = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1_SG)
+          mx = ReduceMax<axes=[1], keepdims=0>(h_sg)
+          mxu = Unsqueeze(mx, AxesOne)
+          mn = ReduceMean<axes=[1], keepdims=0>(h_sg)
+          mnu = Unsqueeze(mn, AxesOne)
+          cat = Concat<axis=1>(mxu, mnu)
+          sgc = Conv<kernel_shape=[7,7], pads=[3,3,3,3]>(cat, SGW)
+          sgate = Sigmoid(sgc)
+          sg = Mul(h_sg, sgate)
+          Y_SG = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(sg, W2_SG)
+
+          h_grn = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1_GRN)
+          xg = ReduceL2<axes=[2,3], keepdims=1>(h_grn)
+          xgm = ReduceMean<axes=[1], keepdims=1>(xg)
+          denom = Add(xgm, Eps)
+          xn = Div(xg, denom)
+          scaled = Mul(h_grn, xn)
+          weighted = Mul(scaled, GrnWeight)
+          biased = Add(weighted, GrnBias)
+          grn_out = Add(h_grn, biased)
+          Y_GRN = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(grn_out, W2_GRN)
+
+          h_eca = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1_ECA)
+          gap = GlobalAveragePool(h_eca)
+          sq = Squeeze(gap, SqAxes)
+          tr1 = Transpose<perm=[0,2,1]>(sq)
+          c1d = Conv<kernel_shape=[3], pads=[1,1]>(tr1, EcaW)
+          tr2 = Transpose<perm=[0,2,1]>(c1d)
+          uns = Unsqueeze(tr2, UnsAxes)
+          gate = Sigmoid(uns)
+          hshape = Shape(h_eca)
+          expanded = Expand(gate, hshape)
+          gated = Mul(h_eca, expanded)
+          Y_ECA = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, W2_ECA)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_spatial_gate_grn_eca_coexist_in_one_dispatch():
+    # Regression guard for the three-way `len(candidates) == 3` dispatch in
+    # `_walk_to_conv_consumer` (CBAM `SpatialGate`, GRN, and ECA-Net's own
+    # `eca_layer`, tried in that fixed order -- see `recognize_eca_gate`'s
+    # own docstring for why the three matchers' own required op-type sets
+    # are disjoint by construction, so at most one can ever match a given
+    # tensor's three consumers): one graph with three completely independent
+    # Conv chains, one of each shape, sharing the same input `X` -- proves
+    # admitting the third (ECA) shape doesn't mask or interfere with either
+    # of the first two, and that each of the three is still pruned exactly as
+    # it would be in isolation (mirroring
+    # `test_structured_pruning_cbam_channel_gate_alone_unaffected_by_spatial_gate_admission`
+    # above, generalized to all three shapes sharing this one dispatch).
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(703)
+    w1_sg = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w2_sg = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    w1_grn = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w2_grn = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C,)).astype(np.float32)
+    w1_eca = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w2_eca = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    eca_w = rng.standard_normal((1, 1, 3)).astype(np.float32)
+
+    model = _spatial_gate_grn_eca_coexist_model(
+        w1_sg,
+        w2_sg,
+        sg_w,
+        w1_grn,
+        w2_grn,
+        grn_weight,
+        grn_bias,
+        w1_eca,
+        w2_eca,
+        eca_w,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_chains
+
+    chains = _find_conv_chains(model.graph)
+    assert len(chains) == 3
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+
+    assert dims_after["W1_SG"][0] == C // 2
+    assert dims_after["W2_SG"][1] == C // 2
+    assert dims_after["SGW"] == (1, 2, 7, 7)
+
+    assert dims_after["W1_GRN"][0] == C // 2
+    assert dims_after["W2_GRN"][1] == C // 2
+    assert dims_after["GrnWeight"] == (1, C // 2, 1, 1)
+    assert dims_after["GrnBias"] == (1, C // 2, 1, 1)
+
+    assert dims_after["W1_ECA"][0] == C // 2
+    assert dims_after["W2_ECA"][1] == C // 2
+    assert dims_after["EcaW"] == (1, 1, 3)
+
+    keep_sg = _oracle_keep_indices_conv(w1_sg, C // 2)
+    keep_grn = _oracle_keep_indices_conv(w1_grn, C // 2)
+    keep_eca = _oracle_keep_indices_conv(w1_eca, C // 2)
+
+    oracle = _spatial_gate_grn_eca_coexist_model(
+        w1_sg[keep_sg],
+        w2_sg[:, keep_sg],
+        sg_w,
+        w1_grn[keep_grn],
+        w2_grn[:, keep_grn],
+        grn_weight[keep_grn],
+        grn_bias[keep_grn],
+        w1_eca[keep_eca],
+        w2_eca[:, keep_eca],
+        eca_w,
+    )
+
+    rng_x = np.random.default_rng(704)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    y_sg, y_grn, y_eca = _run(pruned, {"X": x})
+    y_sg_oracle, y_grn_oracle, y_eca_oracle = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_sg, y_sg_oracle, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_grn, y_grn_oracle, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_eca, y_eca_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Conv chain: decomposed-GroupNorm pass-through hop -----------------------
 #
 # The fixed 5-node ``Reshape -> InstanceNormalization -> Reshape -> Mul ->

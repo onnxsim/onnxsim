@@ -8663,6 +8663,324 @@ def _match_spatial_gate_pass_through(
     return diamond_nodes, mul_node.output[0]
 
 
+# ECA-Net (Wang et al. 2020 CVPR, "ECA-Net: Efficient Channel Attention for Deep
+# Convolutional Neural Networks")'s `eca_layer` channel-attention gate -- a
+# fourth Conv-chain pass-through hop recognized only when a spine tensor forks
+# into *exactly three* direct consumers, alongside CBAM `SpatialGate` and GRN
+# above. Confirmed empirically, via a real `torch.onnx.export` (opset 17,
+# legacy TorchScript-based exporter) of a verbatim reimplementation of the
+# reference implementation's own `eca_layer.forward`
+# (`github.com/BangguWu/ECANet`'s `models/eca_module.py`) wired as
+# `Conv -> eca_layer(k_size=3) -> Conv`, checker-passed: reading a spine
+# tensor `x` with `N` channels,
+#
+#     y      = GlobalAveragePool(x)                       # -> [N, C, 1, 1]
+#     y      = Squeeze(y, axes=[-1])                       # -> [N, C, 1]
+#     y      = Transpose(y, perm=[0, 2, 1])                 # -> [N, 1, C]
+#     y      = Conv1d(y, W)  # in=1, out=1, kernel=k, pad=(k-1)//2, no bias
+#     y      = Transpose(y, perm=[0, 2, 1])                 # -> [N, C, 1]
+#     y      = Unsqueeze(y, axes=[-1])                      # -> [N, C, 1, 1]
+#     gate   = Sigmoid(y)
+#     shape  = Shape(x)
+#     expand = Expand(gate, shape)                          # -> [N, C, H, W]
+#     out    = Mul(x, expand)
+#
+# -- i.e. `x`'s own three direct consumers are exactly `GlobalAveragePool`
+# (the "squeeze" step, tolerating a `ReduceMean`-based equivalent the same way
+# :func:`_match_se_gate_pool` already does for the ordinary SE gate -- both
+# collapse every spatial position into a single per-channel average, the same
+# ``[N, C, 1, 1]`` shape either way), `Shape` (feeding the closing `Expand`,
+# broadcasting the single-channel gate back out to `x`'s own full spatial
+# shape), and the closing `Mul` itself.
+#
+# The middle branch's own 1-D convolution is the entire mechanism's point:
+# unlike ordinary SE's fc1/fc2 (`[C_mid, C, 1, 1]`/`[C, C_mid, 1, 1]`, each
+# genuinely indexed by the spine's own channel count), this `Conv1d`'s own
+# weight is architecturally fixed at exactly ``[1, 1, k]`` -- it runs
+# *along* the channel axis (`y`'s own last axis after the two `Transpose`s,
+# length `C`, playing this Conv1d's "spatial" axis) rather than *across* it,
+# treating every channel as one position of a length-`C` 1-D signal with a
+# single shared, position-independent kernel -- so it has nothing on its own
+# weight to slice at all, independent of `n_channels`, the identical "no
+# operand of its own to slice" argument :func:`_match_spatial_gate_pass_through`
+# already makes for CBAM's internal spatial `Conv`. So the entire
+# `GlobalAveragePool`+`Squeeze`+`Transpose`+`Conv1d`+`Transpose`+`Unsqueeze`+
+# `Sigmoid`+`Shape`+`Expand`+`Mul` subgraph, once matched, contributes
+# *nothing* to `chain_ops`/slicing bookkeeping -- a pure "hop over, keep
+# going" case, folded into `chain_ops` exactly like `SpatialGate`'s own
+# diamond, with the closing `Mul` (whose other operand, the spine `x`, is
+# untouched by slicing -- only its *count* of surviving channels changes,
+# which the `Mul`'s own broadcast, via `Expand`, already tolerates) becoming
+# the walk's new `cur`. Gated behind :func:`_walk_to_conv_consumer`'s own
+# `recognize_eca_gate` parameter, scoped identically to `recognize_grn`/
+# `recognize_spatial_gate` for the identical reason: only
+# :func:`_find_conv_chains` passes it `True`.
+#
+# Every intermediate tensor along the way is held to this module's own usual
+# "no stray fan-out" bar -- exactly one consumer, and not itself a graph
+# output -- and every axis this matcher depends on (the `Squeeze`'s own
+# ``axes=[-1]``/``[3]``, the two `Transpose`s' own ``perm=[0, 2, 1]``, the
+# `Unsqueeze`'s own ``axes=[-1]``/``[3]``) is checked against exactly the one
+# literal value the confirmed export emits, in either of `Squeeze`/
+# `Unsqueeze`'s own two equivalent axis-resolution forms (opset>=13 constant
+# input or opset<13 attribute, via the already-existing
+# :func:`_gap_squeeze_axes`/:func:`_unsqueeze_axes` helpers) -- never
+# guessed at, declined on any deviation. Unlike `SpatialGate`'s own
+# `Sigmoid`-or-`HardSigmoid` tolerance, only a plain `Sigmoid` is recognized
+# here -- the reference implementation's own `nn.Sigmoid()` is the only
+# activation actually confirmed live for this shape, so a `HardSigmoid`
+# variant is declined rather than guessed at.
+def _match_transpose_021(node: onnx.NodeProto, input_name: str) -> bool:
+    """True iff `node` is a plain, single-input, single-output `Transpose`
+    reading exactly `input_name` with `perm` exactly ``[0, 2, 1]`` -- the one
+    literal permutation :func:`_match_eca_gate_pass_through`'s own confirmed
+    export shape uses (both of its own two `Transpose` nodes, swapping the
+    channel axis and ECA's own internal "spatial" axis). Declines (`False`)
+    on any deviation, including a missing/differently-valued `perm` -- never
+    guessed at.
+    """
+    if (
+        node.op_type != "Transpose"
+        or node.domain != ""
+        or list(node.input) != [input_name]
+        or len(node.output) != 1
+        or not node.output[0]
+    ):
+        return False
+    for attr in node.attribute:
+        if attr.name == "perm":
+            return list(attr.ints) == [0, 2, 1]
+    return False
+
+
+def _match_eca_gate_pass_through(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* three direct consumers) is the root
+    of ECA-Net's `eca_layer` shape -- see this section's own comment above
+    for the full empirical/architectural finding -- returns ``(diamond_nodes,
+    final_out)``, the same shape :func:`_match_spatial_gate_pass_through`
+    returns: `diamond_nodes` is every node the shape spans, in forward order
+    (the pooling step, `Squeeze`, the first `Transpose`, the internal
+    `Conv1d`, the second `Transpose`, `Unsqueeze`, `Sigmoid`, `Shape`,
+    `Expand`, and finally the gating `Mul` itself); `final_out` is that
+    `Mul`'s own output, the tensor the caller should continue walking from.
+
+    Declines (``None``) unless:
+
+    - `cur` has exactly three *distinct* direct consumers -- exactly one a
+      `Mul(cur, gate)` (domain ``""``, two inputs, one output, its other
+      operand distinct from `cur` itself), one a pooling step matched by
+      :func:`_match_se_gate_pool` (a literal `GlobalAveragePool` or a
+      `ReduceMean`-based equivalent, both collapsing every spatial position
+      into a single per-channel average), and one a plain `Shape` (domain
+      ``""``, reading exactly `cur`, one output).
+    - The pooling step's own output feeds exactly one consumer, a `Squeeze`
+      whose own resolved `axes` (:func:`_gap_squeeze_axes`) is exactly
+      ``[-1]`` or ``[3]`` (the two equivalent spellings of "the pooling
+      step's own guaranteed-size-1 trailing spatial axis", confirmed live) --
+      not a graph output.
+    - That `Squeeze`'s own output feeds exactly one consumer, a
+      :func:`_match_transpose_021`-shaped `Transpose` -- not a graph output.
+    - That `Transpose`'s own output feeds exactly one consumer, a plain 1-D
+      `Conv` (domain ``""``, ``group`` absent or ``1``, a constant weight
+      initializer shaped exactly ``[1, 1, k]`` -- both channel counts
+      architecturally fixed, independent of the spine's own channel count --
+      see this section's own comment) -- not a graph output.
+    - That `Conv`'s own output feeds exactly one consumer, a second
+      :func:`_match_transpose_021`-shaped `Transpose` -- not a graph output.
+    - That `Transpose`'s own output feeds exactly one consumer, an
+      `Unsqueeze` whose own resolved `axes` (:func:`_unsqueeze_axes`) is
+      exactly ``[-1]`` or ``[3]`` -- not a graph output.
+    - That `Unsqueeze`'s own output feeds exactly one consumer, a plain
+      `Sigmoid` (domain ``""``, one input, one output; unlike `SpatialGate`,
+      no `HardSigmoid` tolerance -- see this section's own comment) -- not a
+      graph output.
+    - `Shape`'s own output feeds exactly one consumer, an `Expand` (domain
+      ``""``, two inputs, ordered exactly ``(gate, shape)`` -- `Expand`'s own
+      schema-defined operand order -- one output) -- not a graph output.
+    - That `Sigmoid`'s own output is exactly `Expand`'s own first operand,
+      and that `Expand`'s own second operand is exactly `Shape`'s own
+      output (confirming the two parallel branches really do join at this
+      one `Expand`, not merely coincidentally-shaped unrelated nodes).
+    - That `Expand`'s own output is exactly `gate` (the `Mul`'s own other
+      operand, identified up front) and feeds exactly one consumer, that
+      same `Mul` node (checked by identity) -- not a graph output.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 3 or len({id(c) for c in consumers}) != 3:
+        return None
+
+    mul_node: Optional[onnx.NodeProto] = None
+    shape_node: Optional[onnx.NodeProto] = None
+    pool_node: Optional[onnx.NodeProto] = None
+    for c in consumers:
+        if (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            if mul_node is not None:
+                return None
+            mul_node = c
+        elif (
+            c.op_type == "Shape"
+            and c.domain == ""
+            and list(c.input) == [cur]
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            if shape_node is not None:
+                return None
+            shape_node = c
+        elif _match_se_gate_pool(c, cur):
+            if pool_node is not None:
+                return None
+            pool_node = c
+        else:
+            return None  # a fourth role, or a duplicate of one already seen
+    if mul_node is None or shape_node is None or pool_node is None:
+        return None
+
+    gate_name = mul_node.input[1] if mul_node.input[0] == cur else mul_node.input[0]
+    if gate_name == cur:
+        return None
+
+    pool_out = pool_node.output[0]
+    if pool_out in graph_outputs or len(consumers_of.get(pool_out, [])) != 1:
+        return None
+
+    squeeze_node = consumers_of[pool_out][0]
+    if (
+        squeeze_node.op_type != "Squeeze"
+        or squeeze_node.domain != ""
+        or not squeeze_node.input
+        or squeeze_node.input[0] != pool_out
+        or len(squeeze_node.output) != 1
+        or not squeeze_node.output[0]
+    ):
+        return None
+    sq_axes = _gap_squeeze_axes(squeeze_node, initializer_map)
+    if sq_axes is None or list(sq_axes) not in ([-1], [3]):
+        return None
+    sq_out = squeeze_node.output[0]
+    if sq_out in graph_outputs or len(consumers_of.get(sq_out, [])) != 1:
+        return None
+
+    transpose1 = consumers_of[sq_out][0]
+    if not _match_transpose_021(transpose1, sq_out):
+        return None
+    tr1_out = transpose1.output[0]
+    if tr1_out in graph_outputs or len(consumers_of.get(tr1_out, [])) != 1:
+        return None
+
+    conv1d = consumers_of[tr1_out][0]
+    if (
+        conv1d.op_type != "Conv"
+        or conv1d.domain != ""
+        or len(conv1d.input) not in (2, 3)
+        or conv1d.input[0] != tr1_out
+        or len(conv1d.output) != 1
+        or not conv1d.output[0]
+    ):
+        return None
+    conv1d_group = 1
+    for attr in conv1d.attribute:
+        if attr.name == "group":
+            conv1d_group = attr.i
+    conv1d_weight_init = initializer_map.get(conv1d.input[1])
+    if (
+        conv1d_group != 1
+        or conv1d_weight_init is None
+        or list(conv1d_weight_init.dims[:2]) != [1, 1]
+        or len(conv1d_weight_init.dims) != 3
+    ):
+        return None
+    conv1d_out = conv1d.output[0]
+    if conv1d_out in graph_outputs or len(consumers_of.get(conv1d_out, [])) != 1:
+        return None
+
+    transpose2 = consumers_of[conv1d_out][0]
+    if not _match_transpose_021(transpose2, conv1d_out):
+        return None
+    tr2_out = transpose2.output[0]
+    if tr2_out in graph_outputs or len(consumers_of.get(tr2_out, [])) != 1:
+        return None
+
+    unsqueeze_node = consumers_of[tr2_out][0]
+    if (
+        unsqueeze_node.op_type != "Unsqueeze"
+        or unsqueeze_node.domain != ""
+        or not unsqueeze_node.input
+        or unsqueeze_node.input[0] != tr2_out
+        or len(unsqueeze_node.output) != 1
+        or not unsqueeze_node.output[0]
+    ):
+        return None
+    unsq_axes = _unsqueeze_axes(unsqueeze_node, initializer_map)
+    if unsq_axes is None or list(unsq_axes) not in ([-1], [3]):
+        return None
+    unsq_out = unsqueeze_node.output[0]
+    if unsq_out in graph_outputs or len(consumers_of.get(unsq_out, [])) != 1:
+        return None
+
+    sigmoid_node = consumers_of[unsq_out][0]
+    if (
+        sigmoid_node.op_type != "Sigmoid"
+        or sigmoid_node.domain != ""
+        or list(sigmoid_node.input) != [unsq_out]
+        or len(sigmoid_node.output) != 1
+        or not sigmoid_node.output[0]
+    ):
+        return None
+    sigmoid_out = sigmoid_node.output[0]
+    if sigmoid_out in graph_outputs or len(consumers_of.get(sigmoid_out, [])) != 1:
+        return None
+
+    shape_out = shape_node.output[0]
+    if shape_out in graph_outputs or len(consumers_of.get(shape_out, [])) != 1:
+        return None
+
+    expand_node = consumers_of[sigmoid_out][0]
+    if (
+        expand_node.op_type != "Expand"
+        or expand_node.domain != ""
+        or list(expand_node.input) != [sigmoid_out, shape_out]
+        or len(expand_node.output) != 1
+        or not expand_node.output[0]
+        or consumers_of[shape_out][0] is not expand_node
+    ):
+        return None
+    expand_out = expand_node.output[0]
+    if (
+        expand_out != gate_name
+        or expand_out in graph_outputs
+        or len(consumers_of.get(expand_out, [])) != 1
+        or consumers_of[expand_out][0] is not mul_node
+    ):
+        return None
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = (
+        pool_node,
+        squeeze_node,
+        transpose1,
+        conv1d,
+        transpose2,
+        unsqueeze_node,
+        sigmoid_node,
+        shape_node,
+        expand_node,
+        mul_node,
+    )
+    return diamond_nodes, mul_node.output[0]
+
+
 def _match_resize_channel_pass_through(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> bool:
@@ -9042,6 +9360,7 @@ def _walk_to_conv_consumer(
     recognize_decomposed_group_norm: bool = False,
     recognize_grn: bool = False,
     recognize_spatial_gate: bool = False,
+    recognize_eca_gate: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
     recognize_depth_to_space: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
@@ -9212,6 +9531,29 @@ def _walk_to_conv_consumer(
     no per-chain "at most one" restriction and needs no dedicated return
     value here.
 
+    `recognize_eca_gate` is the analogous gate for ECA-Net's `eca_layer`
+    channel-attention shape -- see :func:`_match_eca_gate_pass_through` and
+    this module's own "ECA-Net `eca_layer` channel-attention gate"
+    section comment -- scoped identically to `recognize_group_norm`/
+    `recognize_grn`/`recognize_spatial_gate` for the identical reason (only
+    :func:`_find_conv_chains` passes ``True``): tried, like `recognize_grn`'s
+    and `recognize_spatial_gate`'s own shapes, at whatever tensor `cur` is at
+    the top of each hop iteration below the moment it has exactly *three*
+    consumers. ECA's own required op-type set (`GlobalAveragePool`/
+    `ReduceMean` + `Shape` + the closing `Mul`) is disjoint from both
+    `SpatialGate`'s own (`ReduceMax` + `ReduceMean` + `Mul`) and GRN's own
+    (`ReduceL2` + two others) by construction -- `Shape` appears in neither
+    of those, and neither `ReduceMax` nor `ReduceL2` appears here -- so at
+    most one of the three can ever actually match a given tensor's three
+    consumers, tried in a fixed order (`SpatialGate` first, then GRN, then
+    ECA only if neither of the first two matched at all), never masking
+    either. Like `SpatialGate`, an ECA match contributes nothing to
+    `chain_ops`/slicing bookkeeping at all (the internal `Conv1d`'s own
+    channel counts are architecturally fixed at ``[1, 1, k]``, independent of
+    the spine's own channel count, and the closing `Mul`'s broadcast, via
+    `Expand`, is likewise independent of it), so it carries no per-chain "at
+    most one" restriction and needs no dedicated return value here.
+
     `recognize_depth_to_space` gates a mid-chain ``DepthToSpace`` (mode
     ``"CRD"``) node -- PyTorch's ``nn.PixelShuffle`` lowering, see this
     module's own ``DepthToSpace`` (mode ``"CRD"``) section comment and
@@ -9373,22 +9715,26 @@ def _walk_to_conv_consumer(
                     continue
                 break  # five consumers but not this shape -- declined, as before
             if len(candidates) == 3:
-                # Two mutually-exclusive three-consumer shapes share this
+                # Three mutually-exclusive three-consumer shapes share this
                 # dispatch: CBAM `SpatialGate`'s own spine root (`ReduceMax`
                 # + `ReduceMean` + the closing `Mul` -- see this module's own
                 # "CBAM SpatialGate pass-through" section comment and
-                # :func:`_match_spatial_gate_pass_through`) and GRN's own
+                # :func:`_match_spatial_gate_pass_through`), GRN's own
                 # root tensor `x` (`ReduceL2` + two others -- see
                 # `recognize_grn`'s own docstring for its mutual-exclusion
                 # gate against `group_norm`/`decomposed_group_norm_num_groups`
-                # above and against itself past the first match). The two
-                # matchers' own required op-type sets are disjoint by
-                # construction (one requires a `ReduceMax`/`ReduceMean` pair
-                # and no `ReduceL2`; the other requires a `ReduceL2` and no
-                # `ReduceMax`/`ReduceMean`), so at most one can ever actually
+                # above and against itself past the first match), and
+                # ECA-Net's own `eca_layer` root (`GlobalAveragePool`/
+                # `ReduceMean` + `Shape` + the closing `Mul` -- see this
+                # module's own "ECA-Net `eca_layer` channel-attention gate"
+                # section comment and :func:`_match_eca_gate_pass_through`).
+                # The three matchers' own required op-type sets are disjoint
+                # by construction (see `recognize_eca_gate`'s own docstring
+                # for the full argument), so at most one can ever actually
                 # match a given tensor's three consumers -- trying
-                # `SpatialGate` first, then GRN only if `SpatialGate` didn't
-                # match at all, is always safe and never masks the other.
+                # `SpatialGate` first, then GRN, then ECA only if neither of
+                # the first two matched at all, is always safe and never
+                # masks either of the other two.
                 if recognize_spatial_gate:
                     sg_diamond = _match_spatial_gate_pass_through(
                         cur, consumers_of, initializer_map, graph_outputs
@@ -9418,7 +9764,21 @@ def _walk_to_conv_consumer(
                         grn = grn_hop
                         cur = grn_out
                         continue
-                break  # three consumers but not either shape -- declined, as before
+                if recognize_eca_gate:
+                    eca_diamond = _match_eca_gate_pass_through(
+                        cur, consumers_of, initializer_map, graph_outputs
+                    )
+                    if eca_diamond is not None:
+                        diamond_nodes, diamond_out = eca_diamond
+                        if (
+                            len(consumers_of.get(diamond_out, [])) != 1
+                            or diamond_out in graph_outputs
+                        ):
+                            break
+                        chain_ops.extend((n, None) for n in diamond_nodes)
+                        cur = diamond_out
+                        continue
+                break  # three consumers but not any of the three shapes -- declined
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -9732,15 +10092,19 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # per `node.input` occurrence, and that shape's own squaring `Mul`
         # reads its root twice over, so its four distinct direct consumers
         # surface as five entries there, not four).
-        # Also admit exactly three -- two mutually-exclusive shapes share
+        # Also admit exactly three -- three mutually-exclusive shapes share
         # this count: CBAM `SpatialGate`'s own spine root (`ReduceMax`,
         # `ReduceMean`, and the closing `Mul`, each reading the root exactly
         # once -- see this module's own "CBAM SpatialGate pass-through"
-        # section comment) and GRN's own root tensor `x` (read three times
+        # section comment), GRN's own root tensor `x` (read three times
         # over -- by `ReduceL2`, by the `x * x_n` `Mul`, and by the final
         # residual `Add` -- see :func:`_match_grn_pass_through` and this
         # module's own "Global Response Normalization (GRN) pass-through"
-        # section comment).
+        # section comment), and ECA-Net's own `eca_layer` root (a pooling
+        # step, `Shape`, and the closing `Mul`, each reading the root exactly
+        # once -- see this module's own "ECA-Net `eca_layer`
+        # channel-attention gate" section comment and
+        # :func:`_match_eca_gate_pass_through`).
         # :func:`_walk_to_conv_consumer` decides, at its own first hop,
         # whether those consumers actually form any of the shapes admitted
         # here.
@@ -9773,6 +10137,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_decomposed_group_norm=True,
             recognize_grn=True,
             recognize_spatial_gate=True,
+            recognize_eca_gate=True,
             recognize_gap_flatten_matmul_consumer=True,
             recognize_depth_to_space=True,
             producers_of=producers_of,
