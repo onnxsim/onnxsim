@@ -2882,6 +2882,38 @@ def apply_gguf_ternary_quantization_cpp(
     )
 
 
+def apply_fp6_llm_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_fp6_llm_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight using FP6-LLM's E3M2 6-bit floating-point format --
+    one shared scale ``s = max(|block|) / 28.0`` per 64-element block of
+    the weight's own flattened storage, each element snapped to the
+    nearest of FP6 E3M2's 64 representable values times that scale. See
+    :func:`onnxsim.apply_fp6_llm_quantization`'s own docstring for the
+    full rationale. Unlike its Python counterpart, this port only
+    implements the paper's primary E3M2 format.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            FP6 quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_fp6_llm(model.SerializeToString()))
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:

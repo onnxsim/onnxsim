@@ -1153,6 +1153,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // FP6-LLM's E3M2 6-bit floating-point weight-only quantization, one
+  // scale per 64-element block. Data-free. See ApplyFp6Llm in onnxsim.h.
+  m.def(
+      "apply_fp6_llm",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyFp6Llm(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
