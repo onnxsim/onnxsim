@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 from onnx.reference import ReferenceEvaluator
 
+import onnxsim
 from onnxsim.gguf_reconstruct import UnsupportedArchitectureError
 from onnxsim.qwen3_5_reconstruct import (
     _extract_qwen3_5_configs,
@@ -794,3 +795,50 @@ def test_reconstruct_qwen3_5_vlm_end_to_end(tmp_path):
     assert set(models) == {"vision_encoder", "language_model"}
     for m in models.values():
         onnx.checker.check_model(m)
+
+
+def test_qwen3_5_language_model_simplifies_and_folds_weight_transposes(tmp_path):
+    """Same claim as gguf_reconstruct.py's own
+    ``test_simplify_folds_weight_transposes``: ``_linear`` (reused from
+    that module) parameterizes every weight with a runtime ``Transpose``
+    node rather than pre-transposing it at build time -- once the
+    checkpoint's own tensors hydrate it, that Transpose is over a plain
+    constant, so ``onnxsim.simplify()`` should constant-fold it away
+    (leaving only the genuine per-call Q/K/V transposes), and the
+    simplified graph should still check out numerically equivalent to the
+    unsimplified one."""
+    hf_dir, text_config, _weights, _meta = _build_tiny_qwen3_5_text_checkpoint(tmp_path)
+
+    from onnxsim.hf_reconstruct import _index_safetensors_checkpoint
+
+    entries = _index_safetensors_checkpoint(str(hf_dir))
+    model = reconstruct_qwen3_5_language_model(
+        text_config, entries, batch_size=1, seq_len=3
+    )
+    before = sum(1 for n in model.graph.node if n.op_type == "Transpose")
+
+    simplified, check_ok = onnxsim.simplify(model, check_n=1)
+
+    assert check_ok
+    after = sum(1 for n in simplified.graph.node if n.op_type == "Transpose")
+    assert after < before
+
+
+def test_qwen3_5_vision_encoder_simplifies_and_folds_weight_transposes(tmp_path):
+    hf_dir, vision_config, _weights, meta = _build_tiny_qwen3_5_vision_checkpoint(
+        tmp_path
+    )
+
+    from onnxsim.hf_reconstruct import _index_safetensors_checkpoint
+
+    entries = _index_safetensors_checkpoint(str(hf_dir))
+    model = reconstruct_qwen3_5_vision_encoder(
+        vision_config, entries, grid_thw=meta["grid_thw"]
+    )
+    before = sum(1 for n in model.graph.node if n.op_type == "Transpose")
+
+    simplified, check_ok = onnxsim.simplify(model, check_n=1)
+
+    assert check_ok
+    after = sum(1 for n in simplified.graph.node if n.op_type == "Transpose")
+    assert after < before
