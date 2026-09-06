@@ -83,6 +83,12 @@ from onnxsim.ibert_gelu import apply_ibert_gelu
 from onnxsim.ibert_softmax import apply_ibert_softmax
 from onnxsim.icquant import icquant_metadata_bits, quantize_weight_only_icquant
 from onnxsim.if4_quantization import quantize_weight_only_if4
+from onnxsim.imatrix_quant import (
+    apply_imatrix_quantization,
+    compute_activation_importance,
+    quantize_dequantize_int4_imatrix,
+    quantize_dequantize_int4_plain,
+)
 from onnxsim.intactkv import apply_intactkv
 from onnxsim.iq4_nl import (
     IQ4_NL_CODEBOOK,
@@ -123,6 +129,7 @@ from onnxsim.onnx_simplifier import (
     apply_gguf_q4_1_quantization_cpp,
     apply_gguf_q6_k_quantization_cpp,
     apply_gguf_ternary_quantization_cpp,
+    apply_imatrix_quantization_cpp,
     apply_iq4_nl_quantization_cpp,
     apply_moe_expert_channel_pruning_cpp,
     apply_moe_whole_expert_pruning_cpp,
@@ -396,6 +403,11 @@ __all__ = [
     "apply_iq4_nl_quantization_cpp",
     "quantize_dequantize_iq4_nl",
     "IQ4_NL_CODEBOOK",
+    "apply_imatrix_quantization",
+    "apply_imatrix_quantization_cpp",
+    "compute_activation_importance",
+    "quantize_dequantize_int4_imatrix",
+    "quantize_dequantize_int4_plain",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
