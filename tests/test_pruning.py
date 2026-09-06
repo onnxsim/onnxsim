@@ -31385,6 +31385,200 @@ def test_qdq_structured_pruning_conv_biased_real_quantize_static_pipeline_end_to
     assert np.all(np.isfinite(y_pruned))
 
 
+# --- QDQ: PRelu pass-through hop ---------------------------------------
+#
+# `_walk_to_consumer_qdq` previously recognized no ``PRelu`` hop at all, on
+# either the `is_conv` or MatMul/Gemm side -- the hop the plain-float
+# walkers (`_walk_to_conv_consumer`/`_walk_to_consumer`, via
+# `_match_prelu_pass_through`/`_match_prelu_pass_through_matmul`) already
+# recognize. A real ``Conv -> PRelu(per-channel Slope) -> Conv`` model run
+# through ``onnxruntime.quantization.quantize_static(..., quant_format=
+# QuantFormat.QDQ, per_channel=True)`` matched ZERO chains before this fix
+# (the walk hit the ``PRelu`` node and declined every branch).
+
+
+def test_qdq_prelu_per_channel_pass_through_real_quantize_static_pipeline_end_to_end():
+    # THE primary repro this fix targets: runs the REAL
+    # ``onnxruntime.quantization.quantize_static`` tool (the same
+    # industry-standard QDQ quantizer `test_qdq_structured_pruning_conv_
+    # biased_real_quantize_static_pipeline_end_to_end` above already uses)
+    # on a `Conv -> PRelu(per-channel Slope) -> Conv` float model.
+    from onnxruntime.quantization import (
+        CalibrationDataReader,
+        QuantFormat,
+        quantize_static,
+    )
+
+    Cin, C1, C2, spatial = 3, 8, 6, 8
+    rng = np.random.default_rng(710)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    slope = (rng.standard_normal((C1, 1, 1)) * 0.2).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[1,{Cin},{spatial},{spatial}] X) => (float[1,{C2},{spatial},{spatial}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1)
+          h0a = PRelu(h0, Slope)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, W2)
+        }}
+        """,
+        initializer=[_f32(w1f, "W1"), _f32(w2f, "W2"), _f32(slope, "Slope")],
+    )
+    onnx.checker.check_model(float_model)
+
+    class _CDR(CalibrationDataReader):
+        def __init__(self):
+            self._data = iter(
+                [
+                    {
+                        "X": rng.standard_normal((1, Cin, spatial, spatial)).astype(
+                            np.float32
+                        )
+                    }
+                    for _ in range(8)
+                ]
+            )
+
+        def get_next(self):
+            return next(self._data, None)
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        onnx.save(float_model, src_path)
+        quantize_static(
+            src_path,
+            quant_path,
+            calibration_data_reader=_CDR(),
+            quant_format=QuantFormat.QDQ,
+            per_channel=True,
+        )
+        quantized = onnx.load(quant_path)
+    onnx.checker.check_model(quantized)
+
+    # Confirm the real tool genuinely leaves a plain `PRelu` node sitting
+    # between the two Conv layers' own QuantizeLinear/DequantizeLinear
+    # activation-requantization boundaries -- not merely assumed.
+    assert any(n.op_type == "PRelu" for n in quantized.graph.node)
+
+    chains = onnxsim.pruning._find_qdq_chains(quantized.graph)
+    assert len(chains) == 1  # before this fix: 0
+    chain = chains[0]
+    assert chain.consumer.node.op_type == "Conv"
+    # The per-channel `Slope` is carried as a `_ConvPassThrough` hop (axis-0
+    # slicing), not an ordinary `chain_ops` entry -- see `_QDQChain.
+    # conv_pass_through`'s own comment for why.
+    assert len(chain.conv_pass_through) == 1
+    assert chain.conv_pass_through[0].node.op_type == "PRelu"
+    assert chain.conv_pass_through[0].bias is None
+    assert [n.op_type for n, _ in chain.chain_ops] == [
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "QuantizeLinear",
+        "DequantizeLinear",
+    ]  # the activation-requantization round trip on both sides of PRelu
+
+    pruned = onnxsim.apply_structured_pruning_qdq(quantized, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    conv_nodes = [n for n in pruned.graph.node if n.op_type == "Conv"]
+    assert len(conv_nodes) == 2
+    keep_count1 = C1 - round(C1 * 0.5)
+
+    def _dq_source_dims(output_name):
+        dq = next(
+            n
+            for n in pruned.graph.node
+            if n.op_type == "DequantizeLinear" and n.output[0] == output_name
+        )
+        return list(inits[dq.input[0]].dims)
+
+    assert _dq_source_dims(conv_nodes[0].input[1])[0] == keep_count1  # W1 pruned
+    assert _dq_source_dims(conv_nodes[1].input[1])[1] == keep_count1  # W2 consumer
+
+    prelu_node = next(n for n in pruned.graph.node if n.op_type == "PRelu")
+    slope_dims = list(inits[prelu_node.input[1]].dims)
+    assert slope_dims[0] == keep_count1  # Slope co-sliced axis 0, like a
+    assert all(d == 1 for d in slope_dims[1:])  # depthwise Conv weight
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = rng.standard_normal((1, Cin, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = sess.run(None, {"X": x})
+    assert y_pruned.shape == (1, C2, spatial, spatial)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_qdq_prelu_scalar_shared_slope_pass_through_matches_and_leaves_slope_untouched():
+    # A scalar/single-shared-parameter `slope` (`nn.PReLU(1)` in torch
+    # terms) multiplies every channel identically -- `_match_prelu_pass_
+    # through`'s own scalar case, mirroring the plain-float Conv chain's
+    # identical `test_structured_pruning_prelu_scalar_shared_slope_pass_
+    # through_matches_oracle_exactly` -- so unlike a shape that cleanly
+    # fails to parse as either shape (which declines the WHOLE chain), this
+    # is an always-safe pass-through: the chain still matches and prunes,
+    # with `Slope` left byte-identical (no operand of its own to slice).
+    # Uses the lighter hand-built `_quantize_static_conv_weight` fixture
+    # (still the REAL `onnxsim.quantize_static` tool for the weights
+    # themselves, per this file's own convention) rather than a full
+    # `quantize_static` pipeline run, since this narrower point needs no
+    # activation-requantization complexity to exercise.
+    Cin, C1, C2 = 4, 6, 5
+    rng = np.random.default_rng(720)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    slope = (rng.standard_normal((1, 1, 1)) * 0.2).astype(np.float32)
+    w1q, w1s = _quantize_static_conv_weight(w1f)
+    w2q, w2s = _quantize_static_conv_weight(w2f)
+
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},10,10] Y)
+        {{
+          Wq1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, Wq1dq)
+          h0a = PRelu(h0, Slope)
+          Wq2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, Wq2dq)
+        }}
+        """,
+        initializer=[
+            _i8(w1q, "Wq1"),
+            _f32(w1s, "Wscale1"),
+            _i8(w2q, "Wq2"),
+            _f32(w2s, "Wscale2"),
+            _f32(slope, "Slope"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 1
+    chain = chains[0]
+    assert chain.conv_pass_through == ()  # scalar -- an ordinary chain_ops
+    assert [n.op_type for n, _ in chain.chain_ops] == ["PRelu"]  # entry instead
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Slope"], slope)  # left completely untouched
+
+    keep_count1 = C1 - round(C1 * 0.5)
+    assert inits["Wq1"].shape[0] == keep_count1
+    assert inits["Wq2"].shape[1] == keep_count1
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = rng.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y_pruned,) = sess.run(None, {"X": x})
+    assert y_pruned.shape == (2, C2, 10, 10)
+    assert np.all(np.isfinite(y_pruned))
+
+
 # --- QDQ ConvTranspose -------------------------------------------------
 #
 # Mirrors tests/test_pruning.py's own plain-float
@@ -34019,6 +34213,253 @@ def test_matmul_nbits_separate_trailing_bias_add_declines_shared_bias():
     pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
     after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
     assert before == after
+
+
+# --- MatMulNBits: mid-chain PRelu pass-through -----------------------------
+#
+# `_walk_to_matmul_nbits_consumer` previously recognized no ``PRelu`` hop at
+# all -- the hop `_walk_to_consumer`'s own plain-float walker already
+# recognizes (`_match_prelu_pass_through_matmul`). Hand-built via
+# `onnx.helper` (mirroring `_nbits_chain_bias_add_model` above), for the same
+# reason that section gives: the packed int4 ``B``/``scales``/
+# ``zero_points`` tensors need real array data a parser text literal can't
+# spell out.
+
+
+def _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope1):
+    """Builds ``A -> MatMulNBits(mm1) -> PRelu(Slope1) -> MatMulNBits(mm2) ->
+    Y`` -- `slope1` a flat, per-channel ``[N1]`` PRelu slope (the MatMul/
+    Gemm chain's own last-axis-is-channel convention,
+    `_match_prelu_pass_through_matmul`'s own bar). Otherwise mirrors
+    :func:`_nbits_chain_model`/:func:`_nbits_chain_bias_add_model` exactly
+    (bits=4, packed zero_points, neither MatMulNBits node given its own
+    native bias). Returns ``(model, info)`` the same shape those two give.
+    """
+    bits = 4
+    K2 = N1
+    assert K2 % block_size == 0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size, bits)
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size, bits)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size, bits)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(B1, name="B1"),
+        onnx.numpy_helper.from_array(scales1, name="scales1"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp1, bits), name="zp1"),
+        onnx.numpy_helper.from_array(B2, name="B2"),
+        onnx.numpy_helper.from_array(scales2, name="scales2"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp2, bits), name="zp2"),
+        onnx.numpy_helper.from_array(slope1, name="Slope1"),
+    ]
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size, bits
+    )
+    prelu = onnx.helper.make_node("PRelu", ["h1", "Slope1"], ["h1_act"], name="prelu1")
+    node2 = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2, K2, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node1, prelu, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [M, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes1=qcodes1,
+        scales1=scales1,
+        zp1=zp1,
+        kb1=kb1,
+        qcodes2=qcodes2,
+        scales2=scales2,
+        zp2=zp2,
+        kb2=kb2,
+        K2=K2,
+    )
+
+
+def test_matmul_nbits_prelu_pass_through_is_matched_and_prunes():
+    # Same block-aligned engineered-magnitude setup as
+    # `test_matmul_nbits_separate_trailing_bias_add_is_matched_and_prunes`:
+    # rows 0-15 large-magnitude (kept), 16-31 small (dropped). Before this
+    # fix, this returned 0 chains (the walk hit `PRelu` and declined).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(730)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    slope1 = (rng.standard_normal(N1) * 0.1).astype(np.float32)
+
+    model, info = _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope1)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+    assert [n.op_type for n, _ in chains[0].chain_ops] == ["PRelu"]
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * 4 // 8]
+    assert list(inits["Slope1"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * 4 // 8]
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["Slope1"]), slope1[keep]
+    )
+
+    # Independently-constructed, ALREADY-PRUNED reference model, mirroring
+    # this section's own oracle tests above.
+    ref_model, _ = _nbits_chain_prelu_model(
+        16, K1, N2, block_size, W1[keep], W2[:, keep], slope1[keep]
+    )
+    onnx.checker.check_model(ref_model)
+
+    rng2 = np.random.default_rng(731)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    (y_ref,) = _run(ref_model, {"A": x})
+    np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
+
+    # And matches a pure-float64 dequantize-then-PRelu-then-matmul oracle
+    # built directly from the pass's own (unmodified) quantized codes.
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size
+    )
+    h1 = x.astype(np.float64) @ w1_dequant[keep].T
+    h1_act = np.where(h1 > 0, h1, h1 * slope1[keep].astype(np.float64))
+    y_oracle = h1_act @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_prelu_scalar_shared_slope_leaves_slope_untouched():
+    # A scalar/single-shared-parameter `slope` -- `_match_prelu_pass_
+    # through_matmul`'s own scalar case, mirroring the plain-float MatMul
+    # chain's own identical always-safe pass-through (see
+    # `test_structured_pruning_matmul_prelu_scalar_shared_slope_pass_
+    # through_matches_oracle_exactly`): the chain still matches and prunes,
+    # with `Slope1` left byte-identical (no operand of its own to slice).
+    # Same block-aligned engineered-magnitude setup as
+    # `test_matmul_nbits_prelu_pass_through_is_matched_and_prunes` (rows
+    # 0-15 large-magnitude, kept) so the top-16 keep set lands on whole
+    # block 0, rather than leaving this test's own outcome dependent on
+    # whichever channels a plain random draw happens to rank highest.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(732)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    slope1 = np.array([0.25], dtype=np.float32)  # scalar, prod(dims) == 1
+
+    model, _info = _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope1)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Slope1"], slope1)  # left untouched
+    assert (
+        onnx.numpy_helper.to_array(
+            next(t for t in pruned.graph.initializer if t.name == "B1")
+        ).shape[0]
+        == 16
+    )
+
+
+def test_matmul_nbits_prelu_shared_slope_only_first_chain_prunes():
+    # The same trailing `Slope1` tensor read by two INDEPENDENT MatMulNBits
+    # producer chains' own `PRelu` nodes. UNLIKE the `_BINARY_CHANNEL_OPS`
+    # bias/scale hop (`test_matmul_nbits_separate_trailing_bias_add_
+    # declines_shared_bias`), which checks `len(consumers_of[bias]) == 1`
+    # and declines the WHOLE chain the moment it sees a shared constant --
+    # this `PRelu` hop has no such match-time check of its own, mirroring
+    # `_walk_to_consumer`'s own identical plain-float `PRelu` hop (see
+    # `onnxsim/pruning.py`'s own comment on this hop for why: it is folded
+    # into `chain_ops` the same ordinary way an Add/Mul hop's constant is,
+    # with no per-node guard beyond the generic cross-chain `const_touched`
+    # safety net every hop already shares). So both chains DO match here
+    # (unlike the bias-add case's 0), but only the FIRST one
+    # `apply_structured_pruning_matmul_nbits` processes is actually sliced;
+    # the second is left completely untouched once `Slope1` lands in
+    # `const_touched` -- never a wrong-sized tensor for either.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(733)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0  # block-aligned engineered magnitude, see the test above
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    slope = rng.standard_normal(N1).astype(np.float32)
+    model, _info = _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope)
+
+    N3, K3, N4 = 32, 48, 6
+    W3 = rng.standard_normal((N3, K3)).astype(np.float32) * 0.2
+    W3[:16] *= 6.0  # equally block-aligned, to prove it's the SHARED tensor
+    W4 = (
+        rng.standard_normal((N4, N3)).astype(np.float32) * 0.2
+    )  # blocking it, not incidental non-alignment
+    model2, _info2 = _nbits_chain_prelu_model(N3, K3, N4, block_size, W3, W4, slope)
+    # Every name in `model2` is renamed with a "_b" suffix EXCEPT "Slope1"
+    # itself, so it collides -- deliberately -- with the first model's own
+    # "Slope1" initializer once the two graphs are merged below.
+    for n in model2.graph.node:
+        n.name += "_b"
+        for i in range(len(n.input)):
+            if n.input[i] and n.input[i] != "Slope1":
+                n.input[i] += "_b"
+        for i in range(len(n.output)):
+            n.output[i] += "_b"
+    for t in model2.graph.initializer:
+        if t.name != "Slope1":
+            t.name += "_b"
+    model2.graph.input[0].name += "_b"
+    model2.graph.output[0].name += "_b"
+
+    model.graph.node.extend(model2.graph.node)
+    model.graph.initializer.extend(
+        t for t in model2.graph.initializer if t.name != "Slope1"
+    )
+    model.graph.input.extend(model2.graph.input)
+    model.graph.output.extend(model2.graph.output)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 2  # both match -- no match-time tied-tensor guard
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep = np.arange(16)
+    # First chain (graph node order): pruned normally.
+    assert list(inits["B1"].dims) == [16, _info["kb1"], block_size * 4 // 8]
+    assert list(inits["Slope1"].dims) == [16]
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["Slope1"]), slope[keep])
+    # Second chain: its own `Slope1` was already claimed by the first, so it
+    # is left completely untouched -- never partially, inconsistently sliced.
+    assert list(inits["B1_b"].dims) == [N3, _info2["kb1"], block_size * 4 // 8]
+    assert list(inits["B2_b"].dims) == [N4, N3 // block_size, block_size * 4 // 8]
 
 
 def test_matmul_nbits_pruning_producer_odd_kept_row_count_zero_points_has_no_repack_hazard():

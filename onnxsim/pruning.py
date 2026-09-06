@@ -15820,6 +15820,19 @@ class _QDQChain:
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _QDQConsumer
     n_channels: int
+    # A per-channel ``PRelu`` hop crossed on the `is_conv` (Conv/
+    # ConvTranspose) side only -- its own `slope` is `[C, 1, ..., 1]`
+    # (axis-0-is-channel), the same layout a depthwise Conv weight already
+    # needs :class:`_ConvPassThrough`/:func:`_apply_conv_pass_through_hop`
+    # for, reused verbatim here rather than folded into `chain_ops` (whose
+    # own `const_name` entries are always sliced by
+    # :func:`_slice_last_axis`, correct only for the MatMul/Gemm side's
+    # flat, last-axis-is-channel convention). Always empty on the
+    # MatMul/Gemm (`not is_conv`) side and for a `_QDQGatedChain` (always
+    # `is_conv=False`, see :func:`_find_qdq_gated_chains`) -- a per-channel
+    # PRelu hop there is an ordinary flat `chain_ops` entry instead, exactly
+    # like :func:`_walk_to_consumer`'s own identical MatMul-side PRelu hop.
+    conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -16087,7 +16100,13 @@ def _walk_to_consumer_qdq(
     max_hops: int,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
-) -> Optional[Tuple[_QDQConsumer, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
+) -> Optional[
+    Tuple[
+        _QDQConsumer,
+        Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+        Tuple[_ConvPassThrough, ...],
+    ]
+]:
     """From tensor `start`, walks forward through shape-preserving unary
     activations (`_UNARY_PASS_THROUGH`), and -- MatMul/Gemm family only
     (`not is_conv`; a norm hop is a Linear-adjacent concept, mirroring
@@ -16110,7 +16129,21 @@ def _walk_to_consumer_qdq(
     or a self-gated activation decomposition (SiLU/Swish exported as
     ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
     :func:`_match_self_gated_activation`, reused verbatim; both `is_conv`
-    and MatMul/Gemm families) -- with no other consumer anywhere along the
+    and MatMul/Gemm families), or a ``PRelu`` node (both `is_conv` and
+    MatMul/Gemm families): a *scalar* or single-shared-parameter `slope`
+    (every dimension size 1) needs no operand of its own sliced, the same
+    shape a plain unary activation hop already gets; a *per-channel* one is
+    co-sliced -- on the `is_conv` side via :func:`_match_prelu_pass_through`
+    (the Conv-chain `[C, 1, ..., 1]`, axis-0-is-channel convention, folded
+    into the returned `conv_pass_through` tuple as a :class:`_ConvPassThrough`
+    hop, reusing :func:`_apply_conv_pass_through_hop` exactly like a
+    depthwise Conv weight already is -- see :class:`_QDQChain.conv_pass_through`'s
+    own comment for why this needs a dedicated hop type rather than an
+    ordinary `chain_ops` entry), or on the MatMul/Gemm side via
+    :func:`_match_prelu_pass_through_matmul` (the flat, last-axis-is-channel
+    convention, folded into `chain_ops` as an ordinary ``(node, slope_name)``
+    entry, mirroring :func:`_walk_to_consumer`'s own identical hop) -- with
+    no other consumer anywhere along the
     way, until a
     same-family (Conv/ConvTranspose-only or MatMul/Gemm-only, matching
     `is_conv`) consumer is found whose input-channel count matches
@@ -16154,6 +16187,7 @@ def _walk_to_consumer_qdq(
     that function's whole-constant-initializer ``Reshape`` shape is matched.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+    conv_pass_through: List[_ConvPassThrough] = []
     cur = start
     for _hop in range(max_hops):
         if not is_conv:
@@ -16225,13 +16259,21 @@ def _walk_to_consumer_qdq(
                 if m is None or m[3] != n_channels:
                     return None
                 ref, _bias, _out, _in = m
-                return _QDQConsumer(nxt, ref, False, True), tuple(chain_ops)
+                return (
+                    _QDQConsumer(nxt, ref, False, True),
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
+                )
             if nxt.op_type == "ConvTranspose" and nxt.input[0] == cur:
                 m = _match_conv_transpose_qdq(nxt, initializer_map, dq_of, consumers_of)
                 if m is None or m[3] != n_channels:
                     return None
                 ref, _bias, _out, _in = m
-                return _QDQConsumer(nxt, ref, False, True, True), tuple(chain_ops)
+                return (
+                    _QDQConsumer(nxt, ref, False, True, True),
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
+                )
             if (
                 nxt.op_type == "GlobalAveragePool"
                 and nxt.domain == ""
@@ -16277,6 +16319,7 @@ def _walk_to_consumer_qdq(
                     return (
                         _QDQConsumer(mm_node, mm_ref, mm_weight_transposed, False),
                         tuple(chain_ops),
+                        tuple(conv_pass_through),
                     )
                 # No recognized Flatten(axis=1)/Reshape([batch,-1])/Squeeze
                 # -> {MatMul, vanilla Gemm} right after this
@@ -16290,8 +16333,10 @@ def _walk_to_consumer_qdq(
                 if mm[5] != n_channels:
                     return None
                 _x, ref, weight_transposed, _bias, _out, _in = mm
-                return _QDQConsumer(nxt, ref, weight_transposed, False), tuple(
-                    chain_ops
+                return (
+                    _QDQConsumer(nxt, ref, weight_transposed, False),
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
                 )
 
         if nxt.op_type == "QuantizeLinear":
@@ -16312,6 +16357,46 @@ def _walk_to_consumer_qdq(
             chain_ops.append((nxt, None))
             chain_ops.append((dq_node, None))
             cur = dq_out
+            continue
+
+        if (
+            nxt.op_type == "PRelu"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+        ):
+            # See this function's own docstring -- `is_conv` uses
+            # :func:`_match_prelu_pass_through`'s own axis-0,
+            # `[C, 1, ..., 1]` Conv-chain convention (a per-channel `slope`
+            # folded into `conv_pass_through` as a :class:`_ConvPassThrough`
+            # hop, sliced by :func:`_apply_conv_pass_through_hop` exactly
+            # like a depthwise Conv weight already is); the MatMul/Gemm side
+            # uses :func:`_match_prelu_pass_through_matmul`'s own flat,
+            # last-axis-is-channel convention (folded into `chain_ops` as an
+            # ordinary ``(node, slope_name)`` entry, mirroring
+            # :func:`_walk_to_consumer`'s own identical hop). Either way, a
+            # *scalar* `slope` needs no operand sliced at all.
+            prelu_match = (
+                _match_prelu_pass_through(nxt, initializer_map, n_channels)
+                if is_conv
+                else _match_prelu_pass_through_matmul(nxt, initializer_map, n_channels)
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            out2 = nxt.output[0]
+            if out2 in graph_outputs or len(consumers_of.get(out2, [])) != 1:
+                return None
+            if is_per_channel:
+                assert slope_name is not None
+                if is_conv:
+                    conv_pass_through.append(_ConvPassThrough(nxt, slope_name, None))
+                else:
+                    chain_ops.append((nxt, slope_name))
+            else:
+                chain_ops.append((nxt, None))
+            cur = out2
             continue
 
         const_name: Optional[str] = None
@@ -16478,7 +16563,7 @@ def _find_qdq_chains(
         )
         if found is None:
             continue
-        consumer, chain_ops = found
+        consumer, chain_ops, conv_pass_through = found
         if not (ref.is_qdq or consumer.ref.is_qdq):
             continue  # both plain float -- apply_structured_pruning's job
 
@@ -16495,6 +16580,7 @@ def _find_qdq_chains(
                 chain_ops=chain_ops,
                 consumer=consumer,
                 n_channels=out_channels,
+                conv_pass_through=conv_pass_through,
             )
         )
     return chains
@@ -16729,7 +16815,12 @@ def _find_qdq_gated_chains(
         )
         if found is None:
             continue
-        consumer, chain_ops = found
+        consumer, chain_ops, _conv_pass_through = found
+        # Always empty: this call site always passes `is_conv=False` (gated
+        # pairs are MatMul/Gemm-only, see this function's own docstring), and
+        # `conv_pass_through` is only ever populated on the `is_conv` side --
+        # see :func:`_walk_to_consumer_qdq`'s own docstring.
+        assert not _conv_pass_through
 
         producer_a = _producer(info_a, pre_a)
         producer_b = _producer(info_b, pre_b)
@@ -16938,6 +17029,7 @@ def apply_structured_pruning_qdq(
         producer_touched: Set[str] = set()
         consumer_touched: Set[str] = set()
         const_touched: Set[str] = set()
+        conv_hop_touched: Set[str] = set()
         stale_value_info: Set[str] = set()
 
         for chain in chains:
@@ -16949,12 +17041,22 @@ def apply_structured_pruning_qdq(
                 for _, const_name in chain.chain_ops
                 if const_name is not None
             }
+            # A per-channel PRelu hop's own `slope` (`is_conv` side only --
+            # see :class:`_QDQChain.conv_pass_through`'s own comment): kept
+            # in its own tied-tensor guard set, distinct from `consts`,
+            # mirroring the plain-float :class:`_Chain`'s own identical
+            # `conv_hop`/`const` split (see :func:`_apply_chains`'s own
+            # `conv_hop_weights`/`conv_hop_touched`).
+            conv_hop_weights = {h.weight for h in chain.conv_pass_through}
+            if len(conv_hop_weights) != len(chain.conv_pass_through):
+                continue  # degenerate (the same weight named twice)
             if p_key == c_key:
                 continue  # degenerate (the same weight in both roles)
             if (
                 p_key in producer_touched
                 or c_key in consumer_touched
                 or (consts & const_touched)
+                or (conv_hop_weights & conv_hop_touched)
             ):
                 continue  # a shared/tied weight another chain already resized
 
@@ -17007,12 +17109,18 @@ def apply_structured_pruning_qdq(
             for _, const_name in chain.chain_ops:
                 if const_name is not None:
                     _slice_last_axis(initializer_map[const_name], keep)
+            for hop in chain.conv_pass_through:
+                _apply_conv_pass_through_hop(hop, initializer_map, keep, keep_count)
 
             producer_touched.add(p_key)
             consumer_touched.add(c_key)
             const_touched.update(consts)
+            conv_hop_touched.update(conv_hop_weights)
             stale_value_info.add(p.node.output[0])
             stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+            stale_value_info.update(
+                out for h in chain.conv_pass_through for out in h.node.output
+            )
             if p.ref.qdq is not None:
                 stale_value_info.add(p.ref.qdq.dq_node.output[0])
             elif p.ref.qdq_block is not None:
@@ -18072,11 +18180,15 @@ def _walk_to_matmul_nbits_consumer(
     export emits instead of a fused `_NORM_PASS_THROUGH_OPS` node
     (:func:`_match_decomposed_layer_norm_pass_through`/
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim, the
-    identical two matchers :func:`_walk_to_consumer` tries), or a
+    identical two matchers :func:`_walk_to_consumer` tries), a
     self-gated activation decomposition (SiLU/Swish exported as
     ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
     :func:`_match_self_gated_activation`, reused verbatim -- a single
-    tensor's own diamond, not a two-producer gated pair) -- with no other
+    tensor's own diamond, not a two-producer gated pair), or a ``PRelu`` node
+    (:func:`_match_prelu_pass_through_matmul`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop -- a *scalar* `slope`
+    needs no operand sliced at all, a *per-channel* one is co-sliced exactly
+    like the `_BINARY_CHANNEL_OPS` hop above) -- with no other
     consumer anywhere along the way, until EITHER a ``MatMulNBits`` consumer
     OR a plain-float MatMul/vanilla-Gemm consumer
     (:func:`_match_plain_matmul_nbits_peer`) is found whose input-channel
@@ -18085,9 +18197,10 @@ def _walk_to_matmul_nbits_consumer(
     :func:`_walk_to_consumer_qdq`'s own float/QDQ union but restricted to
     ``MatMulNBits``/plain-float (never QDQ). No two-producer gated pair
     (that's :func:`_find_matmul_nbits_gated_chains`'s own job) or tanh-GELU,
-    no branch, no ``PRelu``/``Clip``/fused-bias-GELU hop -- unlike
-    :func:`_walk_to_consumer`, only the norm, `_BINARY_CHANNEL_OPS`, and
-    self-gated-activation hops above are added here. Returns ``None`` if the
+    no branch, no ``Clip``/fused-bias-GELU hop -- unlike
+    :func:`_walk_to_consumer`, only the norm, `_BINARY_CHANNEL_OPS`,
+    self-gated-activation, and ``PRelu`` hops above are added here. Returns
+    ``None`` if the
     walk runs out of hops, hits a branch, or never reaches such a consumer.
     The caller (:func:`_find_matmul_nbits_chains`) is responsible for
     discarding a plain-float-to-plain-float result -- that pairing is
@@ -18213,6 +18326,21 @@ def _walk_to_matmul_nbits_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop: a *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced exactly like the `_BINARY_CHANNEL_OPS` hop above.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -19384,7 +19512,14 @@ def _walk_to_matmul_bnb4_consumer(
     identical two matchers :func:`_walk_to_matmul_nbits_consumer`/
     :func:`_walk_to_dynquant_consumer` try, sound here for the identical
     reason: this op's own `A`/`Y` are always float32/float16/bfloat16,
-    never themselves quantized -- see this section's own top comment) --
+    never themselves quantized -- see this section's own top comment), a
+    self-gated activation decomposition (SiLU/Swish exported as
+    ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
+    :func:`_match_self_gated_activation`, reused verbatim), or a ``PRelu``
+    node (:func:`_match_prelu_pass_through_matmul`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop -- a *scalar* `slope`
+    needs no operand sliced at all, a *per-channel* one is co-sliced exactly
+    like the `_BINARY_CHANNEL_OPS` hop above) --
     with no other consumer anywhere along the way, until a plain-float
     (directly-constant weight) ``MatMul``/vanilla-``Gemm`` consumer
     (:func:`_match_plain_matmul_nbits_peer` -- reused directly here, fully
@@ -19506,6 +19641,21 @@ def _walk_to_matmul_bnb4_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop: a *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced exactly like the `_BINARY_CHANNEL_OPS` hop above.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -33187,7 +33337,15 @@ def _walk_to_fp8_consumer(
     `Y` staying float16/bfloat16 throughout, never itself quantized (unlike
     the QOperator family's own fully-activation-quantized int8/uint8 `Y` --
     see :func:`_walk_to_qop_consumer`'s own docstring for why that walker is
-    the one exception in this round) -- with no other consumer anywhere
+    the one exception in this round), a self-gated activation decomposition
+    (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's own longer
+    gate branch -- :func:`_match_self_gated_activation`, reused verbatim,
+    mechanically mirrored the same way), or a ``PRelu`` node
+    (:func:`_match_prelu_pass_through_matmul`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop, mechanically mirrored the
+    same way -- a *scalar* `slope` needs no operand sliced at all, a
+    *per-channel* one is co-sliced exactly like the `_BINARY_CHANNEL_OPS`
+    hop above) -- with no other consumer anywhere
     along the way, until EITHER a ``MatMulBlockQuantizedFp8Weight`` consumer
     OR a plain-float MatMul/vanilla-Gemm consumer is found whose
     input-channel count matches `n_channels`. No gated pair, no branch,
@@ -33314,6 +33472,23 @@ def _walk_to_fp8_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop (mechanically mirrored from the MatMulNBits/Bnb4/QDQ fix,
+            # not independently verified against a live FP8 quantizer): a
+            # *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced exactly like the `_BINARY_CHANNEL_OPS` hop above.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -33395,9 +33570,9 @@ def _walk_to_fp4_consumer(
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[_Fp4ChainSide, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
     """``Fp4Weight`` analogue of :func:`_walk_to_fp8_consumer` -- see that
-    function's own docstring, including its identical norm-hop and
-    per-channel bias/scale `Add`/`Mul` (`_BINARY_CHANNEL_OPS`) hop
-    recognition, and `value_info_by_name` parameter.
+    function's own docstring, including its identical norm-hop,
+    per-channel bias/scale `Add`/`Mul` (`_BINARY_CHANNEL_OPS`) hop, and
+    ``PRelu`` hop recognition, and `value_info_by_name` parameter.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
@@ -33504,6 +33679,19 @@ def _walk_to_fp4_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # See :func:`_walk_to_fp8_consumer`'s own identical hop
+            # (mechanically mirrored from the MatMulNBits/Bnb4/QDQ fix, not
+            # independently verified against a live FP4 quantizer).
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -35020,6 +35208,23 @@ def _walk_to_qop_consumer(
     (mechanical reuse of the already-merged norm hop, no new matching logic)
     deliberately excludes; left as a known, separately-scoped gap rather
     than an unsound fit forced into this walker.
+
+    A per-channel ``PRelu`` hop (the other quantized-family walkers'
+    :func:`_match_prelu_pass_through_matmul`/:func:`_match_prelu_pass_through`)
+    is excluded here for the identical reason: confirmed live via
+    ``onnx.defs.get_schema("PRelu").type_constraints``, its own `T` type
+    constraint list is `bfloat16/float16/float/double/uint32/uint64/int32/
+    int64` -- no `int8`/`uint8` -- so it can never legally consume `cur`'s
+    own int8/uint8 tensor here, the same schema-level bar the norm hop's own
+    paragraph above already establishes. There is also no
+    ``com.microsoft::QLinearPRelu``/``QLinearLeakyRelu`` contrib op
+    (confirmed by ``onnx.defs.get_schema`` raising for both names against
+    this environment's own installed ``onnxruntime`` contrib op registry) a
+    real QOperator quantizer could have emitted instead -- a genuine
+    per-channel-PRelu QOperator chain would need the same
+    ``DequantizeLinear``/``QuantizeLinear``-sandwiched primitive the norm
+    hop's own gap already calls for, left out of this round's scope for the
+    identical reason.
     """
     chain_ops: List[onnx.NodeProto] = []
     cur = start
@@ -36203,16 +36408,27 @@ def _walk_to_dynquant_consumer(
     (:func:`_match_decomposed_layer_norm_pass_through`/
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim -- the
     identical two matchers :func:`_walk_to_consumer`/
-    :func:`_walk_to_matmul_nbits_consumer` try), with no other consumer
+    :func:`_walk_to_matmul_nbits_consumer` try), a self-gated activation
+    decomposition (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's
+    own longer gate branch -- :func:`_match_self_gated_activation`, reused
+    verbatim), or a ``PRelu`` node (:func:`_match_prelu_pass_through_matmul`,
+    mirrors :func:`_walk_to_consumer`'s own identical hop -- a *scalar*
+    `slope` needs no operand sliced at all, a *per-channel* one is
+    co-sliced, folded into `chain_ops` as an ordinary ``(node, slope_name)``
+    entry), with no other consumer
     anywhere along the way, until EITHER a `DynamicQuantizeMatMul`/
     `MatMulIntegerToFloat` consumer OR a plain-float MatMul/vanilla-Gemm
     consumer (:func:`_match_plain_matmul_nbits_peer`) is found whose
     input-channel count matches `n_channels` -- mirrors
     :func:`_walk_to_matmul_nbits_consumer` closely (the identical
     quantized-or-plain-float union, and now the identical norm hop too),
-    see this section's own top comment for why. No gated pair, no branch,
-    no ``PRelu``/``Clip``/fused-bias-GELU hop -- unlike
-    :func:`_walk_to_consumer`, only the norm hop above is added here.
+    see this section's own top comment for why. No gated pair (the
+    two-producer kind -- :func:`_find_matmul_nbits_gated_chains`'s own
+    job), no branch, no ``Clip``/fused-bias-GELU hop, and (unlike
+    :func:`_walk_to_matmul_nbits_consumer`) no `_BINARY_CHANNEL_OPS`
+    per-channel bias/scale ``Add``/``Mul`` hop either -- unlike
+    :func:`_walk_to_consumer`, only the norm, self-gated-activation, and
+    ``PRelu`` hops above are added here.
     Returns ``None`` if the walk runs out of hops, hits a branch, or never
     reaches such a consumer. The caller (:func:`_find_dynquant_chains`) is
     responsible for discarding a plain-float-to-plain-float result.
@@ -36307,6 +36523,22 @@ def _walk_to_dynquant_consumer(
             and len(nxt.output) == 1
         ):
             pass
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop: a *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced, folded into `chain_ops` as an ordinary
+            # ``(node, slope_name)`` entry.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -37678,6 +37910,27 @@ def _walk_to_conv_integer_consumer(
 
     Returns ``None`` if the walk runs out of hops, hits a branch, or never
     reaches either kind of consumer.
+
+    No per-channel ``PRelu`` hop -- unlike :func:`_walk_to_qop_consumer`,
+    this is NOT a hard schema exclusion: `cur` at every ordinary mid-chain
+    point here is a plain float tensor (this docstring's own GAP paragraph
+    above already establishes why -- `ConvInteger`'s own rescale ``Mul``/
+    ``Cast`` pair always produces a float logical output before the next
+    hop's own leading ``DynamicQuantizeLinear`` re-quantizes it), so
+    ``onnx.defs.get_schema("PRelu")``'s own float-friendly `T` type
+    constraint (see :func:`_walk_to_qop_consumer`'s own docstring for the
+    exact list) would not itself reject a ``PRelu`` inserted there the way
+    it does for QOperator's int8/uint8-throughout `cur`. This is a real,
+    left-open gap, not investigated further in this round: unlike every
+    other walker's `chain_ops` (a ``(node, const_name)`` list), this
+    walker's own `chain_ops` is a bare `List[onnx.NodeProto]` with no
+    per-op constant slot at all (neither its own unary hop nor its own
+    ``Clip`` hop has one), so adding a per-channel ``PRelu`` hop here would
+    need a new pass-through representation (this function's own return
+    signature, and :func:`apply_structured_pruning_dynamic_quantize_conv`'s
+    own slicing, extended for it) rather than a same-shape mechanical port
+    of the other five walkers' fix -- left out of this round's scope rather
+    than forced in.
     """
     chain_ops: List[onnx.NodeProto] = []
     conv_pass_through: List[_ConvIntegerPassThrough] = []
