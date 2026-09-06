@@ -9,7 +9,7 @@ importScripts("./onnxsim.js");
 // the live value always comes from cdn.mjs through the page.
 const ORT_BASE =
     new URLSearchParams(self.location.search).get("ortBase") ||
-    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
+    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/";
 
 // Turn a low-level WASM out-of-memory abort into an actionable explanation.
 // When a model needs more heap than the module can address, Emscripten aborts

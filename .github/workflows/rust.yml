@@ -125,8 +125,8 @@ jobs:
       - name: Cache ONNX Runtime source
         uses: actions/cache@v6
         with:
-          path: third_party/onnxruntime-1.28.0
-          key: onnxruntime-src-1.28.0
+          path: third_party/onnxruntime-1.29.0
+          key: onnxruntime-src-1.29.0
       - name: Build the workspace (compiles and links the native library)
         run: cargo build --release --workspace
       - name: Run tests (unit + linked integration tests)

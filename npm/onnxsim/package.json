@@ -27,7 +27,7 @@
     "prepublishOnly": "node -e \"if(!require('fs').existsSync('onnxsim.wasm')){console.error('onnxsim.wasm is missing -- run scripts/build_npm_package.sh first');process.exit(1)}\" && npm test"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.27.0"
+    "onnxruntime-web": "^1.29.0"
   },
   "repository": {
     "type": "git",

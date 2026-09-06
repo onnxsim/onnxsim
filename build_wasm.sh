@@ -21,7 +21,7 @@ fi
 
 set -u -o pipefail
 
-ORT_VER=1.28.0
+ORT_VER=1.29.0
 # The ORT-web variant links no ONNX Runtime, so the source tarball is not needed.
 if [ "$ORT_WEB" != "ON" ] && [ ! -d "third_party/onnxruntime-${ORT_VER}" ] ; then
     pushd third_party

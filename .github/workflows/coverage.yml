@@ -122,7 +122,7 @@ jobs:
       # ONNXSIM_ORT_HOME points at the cached, pre-extracted release below so the
       # native build never re-downloads it.
       ONNXSIM_PREBUILT_ORT: "1"
-      ONNXSIM_ORT_HOME: ${{ github.workspace }}/rust/prebuilt-ort/onnxruntime-linux-x64-1.28.0
+      ONNXSIM_ORT_HOME: ${{ github.workspace }}/rust/prebuilt-ort/onnxruntime-linux-x64-1.29.0
     steps:
       - uses: actions/checkout@v7
         with:
@@ -145,7 +145,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: rust/prebuilt-ort
-          key: prebuilt-ort-linux-x64-1.28.0
+          key: prebuilt-ort-linux-x64-1.29.0
       - name: Download prebuilt ONNX Runtime
         if: steps.ort-cache.outputs.cache-hit != 'true'
         # Runs in ./rust (this job's default working-directory), so prebuilt-ort
@@ -154,7 +154,7 @@ jobs:
           mkdir -p prebuilt-ort
           curl -L --fail --silent --show-error \
             -o /tmp/onnxruntime.tgz \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+            https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz
           tar -xzf /tmp/onnxruntime.tgz -C prebuilt-ort
       # Build + run the tests under instrumentation, accumulating profiles across
       # both the default run and the native-only integration test, then render
