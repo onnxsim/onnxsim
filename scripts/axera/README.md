@@ -3138,6 +3138,26 @@ distinguishes 0x02/0x1e from 0x03 but not from each other. The
 timing differences between variants were within run-to-run noise
 (0.43..0.54 ms) and are not claimed.
 
+**0xa1 is also a tag, and bit 6 of a tag flips the register's parity.**
+The config-segment residue that remained is mostly three forms, and the
+conditional-parity null settles all three (counts are the `llm_build`
+layer's decode and prefill subgraphs; a fresh `resnet18d` build has 15
+of 16 and 18 of 19 for the first and third): bare `a1 XX` pairs have an
+even `XX` in
+37 of 37 and 65 of 65 cases against 28:13 and 36:31 in the shuffled
+segments; `01 .. a1 XX` p-units have an even register 31 of 31 and 76
+of 76 times; and bare `e1 XX` pairs have an **odd** `XX` in 71 of 71 and
+116 of 116 cases (`c1 XX` 4 of 4 and 10 of 10) against 4:2 and 8:2
+shuffled. So the verb
+byte 0xa1 doubles as a tag whenever it is not in verb position (`a1 00
+x0`), and the 0x40 bit of a tag (0x81 -> 0xc1, 0xa1 -> 0xe1) selects the
+odd register -- the other half of a 2-byte register pair, presumably.
+Admitting them takes the config segments' non-zero bytes from 97.4% to
+98.1% explained in `resnet18d`, 95.6% to 97.2% in `mnasnet`, and 95.9% /
+95.5% to 97.0% / 97.2% in the two `llm_build` subgraphs (shuffled
+segments stay at ~46% under the same rule). `_tokenize_mcode` takes
+these as `odd_tags`.
+
 **`llm_build` emits one instruction stream for all 30 layers.** Every
 per-layer file's two mcodes are byte-identical to layer 0's from the
 first byte of the FlatBuffers header to the tail vector; the only
