@@ -148,8 +148,7 @@ struct RewriteGatherOverConcat final : public PredicateBasedPass {
     }
     const int64_t r = static_cast<int64_t>(data->sizes().size());
 
-    int64_t ga =
-        GetValueFromAttrWithDefault<int64_t>(node, kaxis, int64_t(0));
+    int64_t ga = GetValueFromAttrWithDefault<int64_t>(node, kaxis, int64_t(0));
     int64_t ca = concat->i(kaxis);
     ga = AddYIfNegative(ga, r);
     ca = AddYIfNegative(ca, r);
@@ -168,8 +167,7 @@ struct RewriteGatherOverConcat final : public PredicateBasedPass {
     std::vector<int64_t> axis_sizes;
     axis_sizes.reserve(concat->inputs().size());
     for (Value* in : concat->inputs()) {
-      if (!in->has_sizes() ||
-          static_cast<int64_t>(in->sizes().size()) != r ||
+      if (!in->has_sizes() || static_cast<int64_t>(in->sizes().size()) != r ||
           !in->sizes()[ca].is_int) {
         return false;
       }
@@ -179,8 +177,7 @@ struct RewriteGatherOverConcat final : public PredicateBasedPass {
     const std::vector<int64_t> idx_values = GetIntsFromValue(indices);
     size_t segment;
     std::vector<int64_t> local_indices;
-    return ResolveSingleSegment(idx_values, axis_sizes, segment,
-                                local_indices);
+    return ResolveSingleSegment(idx_values, axis_sizes, segment, local_indices);
   }
 
   bool runTransform(Node* node, Graph& graph,
@@ -204,8 +201,7 @@ struct RewriteGatherOverConcat final : public PredicateBasedPass {
 
     size_t segment;
     std::vector<int64_t> local_indices;
-    if (!ResolveSingleSegment(idx_values, axis_sizes, segment,
-                              local_indices)) {
+    if (!ResolveSingleSegment(idx_values, axis_sizes, segment, local_indices)) {
       return false;
     }
 
