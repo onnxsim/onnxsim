@@ -67,6 +67,7 @@ from onnxsim.gguf_legacy_quant import (
     quantize_dequantize_q4_0,
     quantize_dequantize_q4_1,
 )
+from onnxsim.gguf_q2_k import apply_gguf_q2_k_quantization, quantize_dequantize_q2_k
 from onnxsim.gguf_q5_k import apply_gguf_q5_k_quantization, quantize_dequantize_q5_k
 from onnxsim.gguf_q6_k import apply_gguf_q6_k_quantization, quantize_dequantize_q6_k
 from onnxsim.gguf_reconstruct import (
@@ -408,6 +409,8 @@ __all__ = [
     "apply_gear",
     "apply_gguf_q4_k_quantization",
     "quantize_dequantize_q4_k",
+    "apply_gguf_q2_k_quantization",
+    "quantize_dequantize_q2_k",
     "apply_gguf_q5_k_quantization",
     "quantize_dequantize_q5_k",
     "apply_gguf_q6_k_quantization",
