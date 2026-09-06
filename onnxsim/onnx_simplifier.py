@@ -1655,12 +1655,18 @@ def apply_attention_head_pruning_cpp(
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant or unsupported-dtype weight, a packed-QKV
-            GroupQueryAttention node, a node with a non-empty constant
-            past-KV-cache or attention-mask input, an ai.onnx Attention node
-            with differing Q/K/V head sizes or without explicit
+            GroupQueryAttention node, an ai.onnx Attention node with
+            differing Q/K/V head sizes or without explicit
             ``q_num_heads``/``kv_num_heads`` attributes, a consumer whose
             reduction dimension doesn't line up, ...) is left completely
-            untouched
+            untouched. A non-empty constant past-KV-cache or attention-
+            mask/bias input no longer forces this on its own: every matched
+            family now validates such an input and either slices it in
+            place (a genuine per-head/per-KV-group constant), leaves it
+            untouched (a broadcast shape needing no slicing), or splices in
+            a new ``Gather`` node (a genuinely per-head *dynamic* mask/bias)
+            -- only a shape that doesn't statically resolve either way still
+            declines the whole match.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1690,15 +1696,25 @@ def apply_attention_head_wanda_pruning_cpp(
     machinery (see that function's own docstring for the general pattern),
     applied to attention-head pruning instead of plain structured pruning.
 
-    Same real head (or, for ``GroupQueryAttention``/plain ``ai.onnx::Attention``,
-    whole-KV-group) removal and topology matching as
-    :func:`onnxsim.apply_attention_head_pruning_cpp` (a matched
-    ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``, or
-    plain ``ai.onnx::Attention`` block whose output feeds, optionally through
-    a single shape-preserving ``Reshape``, exactly one downstream
-    MatMul/vanilla-Gemm's reduction dimension -- see that function's own
-    docstring for the full topology and per-block-kind removal details), but
-    each unit's importance is ``||W||_F * ||X||_2`` -- the plain
+    Same real head (or, for the separate-Q/K/V-producer and decomposed
+    families, whole-KV-group) removal and topology matching as
+    :func:`onnxsim.apply_attention_head_pruning_cpp` -- every one of that
+    function's families *except* the fused, block-quantized
+    ``com.microsoft::MatMulNBitsQkv`` variant (mirroring pruning.py's own
+    ``apply_attention_head_wanda_pruning``, which has no calibration-driven
+    counterpart of that quantized-weight case either): a matched
+    ``com.microsoft::Attention``/``DecoderMaskedSelfAttention``/
+    ``PackedAttention`` (single merged QKV weight); a matched
+    ``com.microsoft::GroupQueryAttention``, plain ``ai.onnx::Attention``
+    (opset 24+), ``MultiHeadAttention``, ``PackedMultiHeadAttention``,
+    ``DecoderMaskedMultiHeadAttention``, ``PagedAttention``,
+    ``LinearAttention``, or ``SparseAttention`` block (separate, un-merged
+    Q/K/V producers); or the fully decomposed ("eager SDPA export") shape --
+    each whose output feeds, optionally through a single shape-preserving
+    ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's reduction
+    dimension -- see that function's own docstring for the full topology and
+    per-block-kind removal details. Each unit's importance is
+    ``||W||_F * ||X||_2`` -- the plain
     Frobenius-norm weight score times the combined (root-sum-square)
     activation norm of that unit's own slice of the *output projection's*
     input, captured over calibration data -- instead of weight magnitude
