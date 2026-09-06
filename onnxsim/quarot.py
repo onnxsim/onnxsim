@@ -838,7 +838,7 @@ def apply_quarot_gptq(
     # Pass 2: capture every rotation-eligible layer's own (pre-rotation)
     # activation from the *original* model -- same probe pattern as
     # onnxsim.gptq.apply_gptq.
-    probe_names = [r[1] for r in rotated]  # x_name
+    probe_names = sorted({r[1] for r in rotated})  # x_name
     probe_model = _add_probe_outputs(model, probe_names)
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
     for batch in calibration_data:

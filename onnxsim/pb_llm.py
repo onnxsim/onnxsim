@@ -261,7 +261,7 @@ def quantize_weight_only_pb_llm(
     if not candidates:
         return out
 
-    probe_names = [c[1] for c in candidates]
+    probe_names = sorted({c[1] for c in candidates})
     probe_model = _add_probe_outputs(model, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}

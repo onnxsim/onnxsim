@@ -148,6 +148,18 @@ FP4_FORMATS: Dict[str, Tuple[int, int]] = {
     "e3m0": (3, 0),
 }
 
+# Cap on how many activation elements
+# :func:`apply_llm_fp4_activation_quantization_per_tensor` feeds into its
+# per-tensor scale search. That search allocates a ``size x 16`` float64
+# distance tensor per candidate clip ratio, and its input is every
+# calibration sample concatenated -- unbounded, unlike the weight side,
+# whose input is bounded by the weight. 2**18 elements caps the search at a
+# few tens of MB while still estimating a *single* scalar's MSE objective
+# from a quarter-million samples. See that function for how it is applied
+# (``max_abs`` stays exact over the full data; only the MSE estimate is
+# subsampled).
+_PER_TENSOR_FIT_MAX_ELEMENTS = 1 << 18
+
 
 def _fp4_magnitudes(e_bits: int, m_bits: int) -> List[float]:
     """The 8 non-negative magnitudes an ``e_bits``-exponent/``m_bits``-
@@ -317,10 +329,14 @@ def quantize_weight_only_llm_fp4(
     """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D float32
     weight (whose reduction dimension ``K`` is evenly divisible by
     ``block_size``) into LLM-FP4's weight format -- see this module's own
-    docstring for the technique and its scope (weight-only; W4A4 activation
-    quantization is out of scope, but composes with this repo's existing
-    :func:`onnxsim.apply_smoothquant`/:func:`onnxsim.apply_outlier_suppression`
-    migrations, run first). Needs no calibration data: both the per-tensor
+    docstring for the technique and its scope. This function itself is
+    **weight-only**; to also quantize the activation (W4A4), follow it with
+    either :func:`apply_llm_fp4_activation_quantization_per_tensor` (the
+    paper's own calibrated per-tensor quantizer, which composes with
+    :func:`onnxsim.apply_smoothquant`/
+    :func:`onnxsim.apply_outlier_suppression` run first) or
+    :func:`apply_llm_fp4_activation_quantization` (a data-free per-token
+    alternative). Needs no calibration data: both the per-tensor
     format choice and the per-block scale are fit directly to each weight's
     own values, by exhaustive grid search minimizing reconstruction MSE.
 
@@ -614,6 +630,16 @@ def apply_llm_fp4_activation_quantization(
     against a numpy reference via ``onnxruntime`` before being committed to
     this module (see ``tests/test_llm_fp4.py``).
 
+    **Runtime cost, beyond node count.** That broadcast is the price of a
+    *non-uniform* codebook: unlike a uniform integer grid (which quantizes
+    with plain arithmetic, as :mod:`onnxsim.quarot`/:mod:`onnxsim.zeroquant`
+    do), finding the nearest of 16 arbitrary values needs each element
+    compared against all 16, so the ``Sub``/``Abs`` intermediates are **16x
+    the activation's own size** while the lookup executes. On a large
+    activation that transient dominates this pass's memory, and no count of
+    inserted nodes reflects it. ONNX has no non-uniform-codebook
+    quantization op that would avoid the materialization.
+
     :param model: the original or weight-quantized onnx ModelProto or file
             path -- must already have been passed through
             :func:`quantize_weight_only_llm_fp4` for this function to do
@@ -821,7 +847,14 @@ def apply_llm_fp4_activation_quantization_per_tensor(
       ``Abs``, ``ArgMin``, ``Gather``, ``Mul``) -- versus 11 for the
       per-token pass (those same 7, plus ``Abs``, ``ReduceMax``, ``Max``
       and a second ``Div`` to derive the scale). Strictly fewer runtime
-      ops is the practical point of the per-tensor design.
+      ops is the practical point of the per-tensor design. Note node count
+      is not the whole cost: **both** passes share the
+      ``Unsqueeze``/``Sub``/``Abs``/``ArgMin`` nearest-codebook broadcast,
+      whose intermediates are 16x the activation's own size while it
+      executes -- inherent to a non-uniform codebook, and unchanged by
+      moving the scale to a constant. See
+      :func:`apply_llm_fp4_activation_quantization`'s own "Runtime cost"
+      note.
     * *Paper fidelity*: this is the paper's own quantizer (its migration
       half being the caller's job, above) -- the per-token pass is a
       simpler repo-convention alternative
@@ -989,8 +1022,25 @@ def apply_llm_fp4_activation_quantization_per_tensor(
         # activation as a single group instead of one group per weight
         # block -- that single group's winning scale *is* the per-tensor
         # scale being fit here.
+        #
+        # _search_fp4_clip_ratio materializes a ``values.size x 16`` float64
+        # distance tensor per candidate ratio. On the weight side that is
+        # bounded by the weight itself, but here ``values`` is *every*
+        # calibration sample concatenated, which is unbounded (more
+        # calibration data would mean more memory, up to tens of GB on a
+        # realistic model). Fitting a single scalar does not need every
+        # sample: ``max_abs`` above is computed exactly over all of them,
+        # and the MSE objective is estimated on a large, deterministic
+        # random subsample, which bounds the search's peak memory
+        # regardless of how much calibration data was supplied.
+        fit_values = values
+        if fit_values.size > _PER_TENSOR_FIT_MAX_ELEMENTS:
+            picks = np.random.default_rng(0).choice(
+                fit_values.size, size=_PER_TENSOR_FIT_MAX_ELEMENTS, replace=False
+            )
+            fit_values = fit_values[picks]
         _error, scale, _codes = _search_fp4_clip_ratio(
-            values, np.asarray(max_abs), codebook, ratios
+            fit_values, np.asarray(max_abs), codebook, ratios
         )
         scale_value = float(scale)
         if not np.isfinite(scale_value) or scale_value <= 0.0:

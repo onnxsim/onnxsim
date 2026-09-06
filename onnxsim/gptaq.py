@@ -145,7 +145,7 @@ def apply_gptaq(
         if qn is not None and len(qn.input) >= 1:
             quant_probe_name[c.output_name] = qn.input[0]
 
-    float_probe_names = [c.float_node.input[0] for c in candidates]
+    float_probe_names = sorted({c.float_node.input[0] for c in candidates})
     float_probe = _add_probe_outputs(float_model, float_probe_names)
     quant_probe = _add_probe_outputs(quantized_model, list(quant_probe_name.values()))
 

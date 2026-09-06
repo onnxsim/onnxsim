@@ -180,7 +180,7 @@ def apply_quantease(
     if not candidates:
         return quantized_model
 
-    probe_names = [c.float_node.input[0] for c in candidates]
+    probe_names = sorted({c.float_node.input[0] for c in candidates})
     float_probe = _add_probe_outputs(float_model, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}

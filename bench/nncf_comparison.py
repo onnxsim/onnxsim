@@ -287,11 +287,53 @@ def _nncf_configs(
 # --------------------------------------------------------------------------- #
 
 
+def _feed(
+    model: onnx.ModelProto, batch: int, rng: np.random.Generator
+) -> Dict[str, np.ndarray]:
+    """One feed dict covering *every* graph input, with symbolic dimensions
+    resolved.
+
+    A hand-built synthetic model has a single float32 input whose only
+    symbolic dimension is the batch, but a real exported model routinely has
+    several inputs, integer ones (token ids, masks), and symbolic dims beyond
+    the batch. Reading ``dim_value`` blindly yields 0 for a symbolic dim and
+    would build empty arrays; assuming float32 would feed the wrong dtype to
+    an integer input. Both make the advertised
+    ``python bench/nncf_comparison.py model.onnx`` usage fail rather than
+    measure anything.
+    """
+    feeds: Dict[str, np.ndarray] = {}
+    initializer_names = {t.name for t in model.graph.initializer}
+    for value in model.graph.input:
+        if value.name in initializer_names:
+            continue  # an initializer also listed as an input: not a real feed
+        tensor_type = value.type.tensor_type
+        shape = []
+        for i, d in enumerate(tensor_type.shape.dim):
+            if d.HasField("dim_value") and d.dim_value > 0:
+                shape.append(d.dim_value)
+            else:
+                # Symbolic (or 0) dim: the leading one is the batch, any other
+                # is a sequence-like axis that just needs *some* concrete size.
+                shape.append(batch if i == 0 else 8)
+        np_dtype = onnx.helper.tensor_dtype_to_np_dtype(tensor_type.elem_type)
+        if np.issubdtype(np_dtype, np.floating):
+            feeds[value.name] = rng.standard_normal(shape).astype(np_dtype)
+        elif np_dtype == np.bool_:
+            feeds[value.name] = np.ones(shape, dtype=np.bool_)
+        else:
+            # Integer input (token ids, masks, ...). Zeros are always in range;
+            # this benchmark measures weight quantization error, for which the
+            # exact token values do not matter.
+            feeds[value.name] = np.zeros(shape, dtype=np_dtype)
+    return feeds
+
+
 def compare(model: onnx.ModelProto, num_eval: int = 32, seed: int = 0) -> None:
-    in_name = model.graph.input[0].name
-    in_dim = model.graph.input[0].type.tensor_type.shape.dim[-1].dim_value
     rng = np.random.default_rng(seed)
-    eval_x = {in_name: rng.standard_normal((num_eval, in_dim)).astype(np.float32)}
+    eval_x = _feed(model, num_eval, rng)
+    in_name = model.graph.input[0].name
+    in_dim = int(eval_x[in_name].shape[-1])
     # GPTQ-style methods build a ``[K, K]`` Hessian from these activations, so
     # a calibration set with fewer rows than ``K`` leaves it rank-deficient and
     # its correction unreliable -- which shows up, misleadingly, as GPTQ
@@ -299,10 +341,7 @@ def compare(model: onnx.ModelProto, num_eval: int = 32, seed: int = 0) -> None:
     # dimension.
     per_batch = 64
     num_batches = max(4, -(-2 * in_dim // per_batch))
-    calibration = [
-        {in_name: rng.standard_normal((per_batch, in_dim)).astype(np.float32)}
-        for _ in range(num_batches)
-    ]
+    calibration = [_feed(model, per_batch, rng) for _ in range(num_batches)]
 
     float_y = _run(model, eval_x)
     float_bytes = _referenced_initializer_bytes(model)
@@ -357,7 +396,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    if args.model and os.path.exists(args.model):
+    if args.model and not os.path.exists(args.model):
+        # Falling back to the synthetic model here would silently report
+        # synthetic numbers under a real model's name.
+        raise SystemExit(f"no such model file: {args.model}")
+
+    if args.model:
         # Same reason as _synthetic_mlp: onnxsim's INT4 pass needs the
         # activation's element type on every candidate MatMul. Exported
         # models normally carry it; inferring is a no-op when they do.

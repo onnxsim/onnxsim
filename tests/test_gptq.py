@@ -252,3 +252,52 @@ def test_gptq_noop_when_no_int4_matmul_present():
         model, model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
     assert result.SerializeToString() == model.SerializeToString()
+
+
+def test_gptq_captures_a_shared_activation_only_once(monkeypatch):
+    # Q/K/V projections reading one shared LayerNorm output is the norm in a
+    # real transformer, and every calibration-driven pass in this repo probes
+    # each matched layer's activation by name. Collecting those names into a
+    # plain list (rather than a set) makes a shared tensor appear once per
+    # consuming layer, so the capture loop appends -- and later concatenates
+    # -- the same activation once per layer: N copies for N consumers, i.e.
+    # an N-times-larger Hessian to build and hold.
+    #
+    # The duplication is invisible in the *output* (H is scaled by a positive
+    # constant, and GPTQ's own column update depends only on the ratio
+    # hinv[i, j] / hinv[i, i], which that constant cancels out of), so only a
+    # structural check like this one catches a regression.
+    k, n = 32, 8
+    rng = np.random.default_rng(0)
+    model = _model(
+        f"""
+        g (float[batch,{k}] X) => (float[batch,{n}] Y1, float[batch,{n}] Y2)
+        {{
+          Y1 = MatMul(X, W1)
+          Y2 = MatMul(X, W2)
+        }}
+        """,
+        [
+            _f32(rng.standard_normal((k, n)) * 0.5, "W1"),
+            _f32(rng.standard_normal((k, n)) * 0.5, "W2"),
+        ],
+    )
+
+    seen = []
+    original = onnxsim.gptq._add_probe_outputs
+
+    def spy(m, names):
+        seen.append(list(names))
+        return original(m, names)
+
+    monkeypatch.setattr(onnxsim.gptq, "_add_probe_outputs", spy)
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnxsim.apply_gptq(
+        model,
+        quant,
+        calibration_data=[{"X": rng.standard_normal((16, k)).astype(np.float32)}],
+    )
+
+    assert seen, "apply_gptq did not probe any activation"
+    for names in seen:
+        assert len(names) == len(set(names)), f"duplicate probe names: {names}"
