@@ -3816,11 +3816,18 @@ def test_cpp_paged_attention_pruning_constant_per_channel_kv_scale_sliced_matche
 
 # --- Plain ai.onnx::LinearAttention (opset 27+) -----------------------------
 #
-# This port only ever matches this op's stateless "linear" update_rule shape
-# (no `past_state`/`decay`/`beta` connected at all) -- see
-# MatchLinearAttentionProducer's own comment for why this narrower-than-
-# pruning.py scope gives up essentially nothing over the realistic export
-# shape pruning.py's own docstring already narrows *its* real-world scope to.
+# This op's own optional `past_state`/`decay`/`beta` (indices 3/4/5) are now
+# validated-and-sliced when constant -- mirroring pruning.py's own
+# `_match_linear_attention_producer`/`_apply_one_gqa_chain` exactly for the
+# "linear"/"delta"/"gated" update_rule shapes -- rather than a blanket
+# decline of the whole match whenever any of the three is connected at all.
+# Still narrower than pruning.py's own matcher in one respect: a *dynamic*
+# `decay`/`beta` still declines the whole match here outright rather than
+# being deferred to a recognized `com.microsoft::LinearAttentionGate`
+# pass-through the way pruning.py's own `_find_linear_attention_chains`
+# (via `_match_linear_attention_gate`) does -- see
+# MatchLinearAttentionProducer's own comment for the documented scope
+# boundary this narrowing keeps.
 
 
 def _linear_attention_model(
@@ -3833,7 +3840,10 @@ def _linear_attention_model(
     wk=None,
     wv=None,
     wo=None,
-    decay=None,  # constant array, or None (unconnected) -- forces a decline
+    decay=None,  # constant array, or None (unconnected)
+    past_state=None,  # constant array, or None (unconnected)
+    beta=None,  # constant array, or None (unconnected)
+    update_rule=None,  # defaults to "gated" (decay set) or "linear" otherwise
 ):
     rng = np.random.default_rng(seed)
     Nq, Nkv = Hq * D, Hkv * D
@@ -3848,10 +3858,23 @@ def _linear_attention_model(
 
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
     operands = ["q", "k", "v"]
-    if decay is not None:
-        operands.append("")  # past_state -- unconnected
-        initializer.append(_f32(np.asarray(decay), "Decay"))
-        operands.append("Decay")
+    if past_state is not None or decay is not None or beta is not None:
+        if past_state is not None:
+            initializer.append(_f32(np.asarray(past_state), "PastState"))
+            operands.append("PastState")
+        else:
+            operands.append("")
+    if decay is not None or beta is not None:
+        if decay is not None:
+            initializer.append(_f32(np.asarray(decay), "Decay"))
+            operands.append("Decay")
+        else:
+            operands.append("")
+    if beta is not None:
+        initializer.append(_f32(np.asarray(beta), "Beta"))
+        operands.append("Beta")
+    if update_rule is None:
+        update_rule = "gated" if decay is not None else "linear"
 
     body = f"""
         g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
@@ -3859,7 +3882,7 @@ def _linear_attention_model(
           q = MatMul(X, Wq)
           k = MatMul(X, Wk)
           v = MatMul(X, Wv)
-          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="{"gated" if decay is not None else "linear"}">({", ".join(operands)})
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="{update_rule}">({", ".join(operands)})
           Y = MatMul(attn_out, Wo)
         }}
         """
@@ -3928,19 +3951,159 @@ def test_cpp_linear_attention_pruning_matches_oracle_exactly():
     np.testing.assert_array_equal(inits["Wo"], cfg["wo"][q_idx, :])
 
 
-def test_cpp_linear_attention_pruning_gated_mode_decay_present_is_left_untouched():
+def test_cpp_linear_attention_pruning_gated_mode_constant_decay_is_sliced_matches_python():
+    # A genuinely CONSTANT `decay` (the documented, `kv_num_heads`-wide
+    # DeltaNet/RetNet per-head-scalar shape) is now validated-and-sliced,
+    # not a whole-match decline -- mirrors pruning.py's own
+    # `_match_linear_attention_producer`/`_apply_one_gqa_chain` exactly
+    # (MatchLinearAttentionProducer/ApplyOneGqaChain's own `is_linear_
+    # attention` branch, see either's own comment). Only a genuinely
+    # DYNAMIC decay/beta still declines the whole match outright in this
+    # port (the LinearAttentionGate-fed pass-through pruning.py's own
+    # further upgrade recognizes is not ported here) -- see
+    # test_cpp_linear_attention_pruning_dynamic_decay_is_declined_matches_python
+    # below for that still-narrower scope boundary's own cpp-parity coverage.
     model, cfg = _linear_attention_model(
         Hq=4, Hkv=4, D=4, K=16, seed=63, decay=np.zeros((1, 3, 4), dtype=np.float32)
     )
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _linear_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _linear_attention_attrs(node)
+    assert kv_num_heads == 2  # pruning genuinely fired -- not a no-op decline
+    assert q_num_heads == 2
+
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    assert inits["Decay"].shape == (1, 3, kv_num_heads)
+
+
+def test_cpp_linear_attention_pruning_delta_mode_slices_past_state_and_beta_matches_python():
+    # `update_rule="delta"`'s own `past_state` (rank-4 `(B, kv_num_heads,
+    # d_k, d_v)`, sliced along axis 1) and `beta` (rank-3,
+    # `kv_num_heads`-wide, sliced along its own last axis) -- mirrors
+    # pruning.py's own `_apply_one_gqa_chain` `is_linear_attention` branch
+    # exactly. Mirrors tests/test_pruning.py's own
+    # test_linear_attention_pruning_delta_mode_slices_past_state_and_beta_matches_oracle
+    # fixture, called through the C++ port instead and checked byte-for-byte
+    # against the live Python reference.
+    Hq, Hkv, D, K = 4, 2, 4, 16
+    rng = np.random.default_rng(2)
+    past_state = rng.standard_normal((1, Hkv, D, D)).astype(np.float32)
+    beta = (np.abs(rng.standard_normal((1, 3, Hkv))) * 0.1).astype(np.float32)
+    model, cfg = _linear_attention_model(
+        Hq=Hq,
+        Hkv=Hkv,
+        D=D,
+        K=K,
+        seed=2,
+        update_rule="delta",
+        past_state=past_state,
+        beta=beta,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _linear_attention_node(pruned_cpp)
+    _, kv_num_heads = _linear_attention_attrs(node)
+    assert kv_num_heads == 1
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    assert inits["PastState"].shape == (1, kv_num_heads, D, D)
+    assert inits["Beta"].shape == (1, 3, kv_num_heads)
+
+
+def test_cpp_linear_attention_pruning_gated_mode_gla_decay_matches_python():
+    # `update_rule="gated"`'s own GLA/RWKV-6 shape: `decay` is
+    # `kv_num_heads * head_size`-wide (per-key-dimension, not per-head
+    # scalar) -- sliced by the same per-head column expansion K's own
+    # producer weight gets (HeadColumnIndices), distinct from the
+    # DeltaNet/RetNet per-head-scalar shape
+    # test_cpp_linear_attention_pruning_gated_mode_constant_decay_is_sliced_matches_python
+    # above already covers. Mirrors tests/test_pruning.py's own
+    # test_linear_attention_pruning_gated_mode_slices_gla_decay_matches_oracle
+    # fixture, called through the C++ port instead.
+    Hq, Hkv, D, K = 4, 2, 4, 16
+    rng = np.random.default_rng(3)
+    decay = (-np.abs(rng.standard_normal((1, 3, Hkv * D))) * 0.1).astype(np.float32)
+    model, cfg = _linear_attention_model(
+        Hq=Hq, Hkv=Hkv, D=D, K=K, seed=3, update_rule="gated", decay=decay
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() != model.SerializeToString()
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _linear_attention_node(pruned_cpp)
+    _, kv_num_heads = _linear_attention_attrs(node)
+    assert kv_num_heads == 1
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    assert inits["Decay"].shape == (1, 3, kv_num_heads * D)
+
+
+def test_cpp_linear_attention_pruning_dynamic_decay_is_declined_matches_python():
+    # A `decay` fed by anything other than a constant initializer still
+    # declines the whole match outright in this port -- the
+    # LinearAttentionGate-fed pass-through pruning.py's own further upgrade
+    # recognizes is not ported here (see MatchLinearAttentionProducer's own
+    # comment). Mirrors tests/test_pruning.py's own
+    # test_linear_attention_pruning_dynamic_decay_is_declined, called
+    # through the C++ port instead.
+    Hq, Hkv, D, K = 4, 2, 4, 16
+    body = f"""
+        g (float[1,3,{K}] X, float[1,3,{Hkv}] DecayIn) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="gated">(q, k, v, , DecayIn)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    rng = np.random.default_rng(4)
+    wq = rng.standard_normal((K, Hq * D)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Hkv * D)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Hkv * D)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Hq * D, K)).astype(np.float32) * 0.3
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 27]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model_for_py, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()  # untouched
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
 
 
 # --- com.microsoft::SparseAttention ------------------------------------------
