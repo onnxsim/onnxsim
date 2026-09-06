@@ -10083,6 +10083,276 @@ def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- apply_structured_pruning: CBAM ChannelGate chains ----------------------
+#
+# See onnxsim/pruning.py's own "CBAM ChannelGate chains" section comment for
+# the exact topology matched and declined. `Csq=1` below makes any
+# INDEPENDENT internal fc1->fc2 chain `_find_chains` might separately find
+# and prune (the shared bottleneck's own two `Gemm` layers, unrelated to
+# CBAM's own channel-gating mechanism) a deliberate no-op (`keep_count == n
+# == 1`), isolating what these tests check to purely the new CBAM
+# mechanism -- mirroring how this module's own SE-gate test suite isolates
+# its own identical, structurally analogous shape the same way.
+
+
+def _cbam_conv_keep_indices(conv1_w, fc2_w, keep_count):
+    # The correct paired-importance ranking: combined (root-sum-square) norm
+    # of conv1's own [C, Cin, kH, kW] filter and the SHARED fc2's own
+    # [C, Csq] (transB=1 Gemm) weight -- mirroring
+    # `_plain_structured_importance`'s identical two-producer formula, each
+    # producer's own [N, K] view built the way its own kind is (Conv's own
+    # `w.reshape(w.shape[0], -1)`, a transB=1 Gemm's own `w` as-is).
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(
+                conv1_w.reshape(conv1_w.shape[0], -1).astype(np.float64), axis=1
+            )
+        )
+        + np.square(np.linalg.norm(fc2_w.astype(np.float64), axis=1))
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _cbam_channel_gate_model(Cin=3, C=16, Csq=1, Cout=8, seed=0, spatial=8):
+    # Conv1 -> CBAM ChannelGate -> Conv2, the exact topology confirmed via a
+    # real `torch.onnx.export` (torch 2.14.0+cpu, TorchScript exporter,
+    # opset 17) of the canonical public CBAM reference implementation's own
+    # `ChannelGate` (`github.com/Jongchan/attention-module`) -- see
+    # onnxsim/pruning.py's own section comment for the full shape and why
+    # `AveragePool`/`MaxPool` (not `GlobalAveragePool`/`GlobalMaxPool`) with
+    # an explicit, full-spatial-extent `kernel_shape` is the real, confirmed
+    # export shape. `FC1_W`/`FC1_B` and `FC2_W`/`FC2_B` are each read by BOTH
+    # the avg and max branches -- the real, load-bearing weight-tie CBAM's
+    # own reference implementation applies (the literal same `nn.Sequential`
+    # `mlp`, traced twice).
+    rng = np.random.default_rng(seed)
+    conv1_w = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    conv1_b = rng.standard_normal((C,)).astype(np.float32)
+    fc1_w = rng.standard_normal((Csq, C)).astype(np.float32)
+    fc1_b = rng.standard_normal((Csq,)).astype(np.float32)
+    fc2_w = rng.standard_normal((C, Csq)).astype(np.float32)
+    fc2_b = rng.standard_normal((C,)).astype(np.float32)
+    conv2_w = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    conv2_b = rng.standard_normal((Cout,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{spatial},{spatial}] Y)
+        {{
+          spine = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, CONV1_W, CONV1_B)
+          avg = AveragePool<kernel_shape=[{spatial},{spatial}]>(spine)
+          mx = MaxPool<kernel_shape=[{spatial},{spatial}]>(spine)
+          avg_flat = Reshape(avg, flat_shape)
+          max_flat = Reshape(mx, flat_shape)
+          fc1_avg = Gemm<transB=1>(avg_flat, FC1_W, FC1_B)
+          fc1_max = Gemm<transB=1>(max_flat, FC1_W, FC1_B)
+          relu_avg = Relu(fc1_avg)
+          relu_max = Relu(fc1_max)
+          fc2_avg = Gemm<transB=1>(relu_avg, FC2_W, FC2_B)
+          fc2_max = Gemm<transB=1>(relu_max, FC2_W, FC2_B)
+          summed = Add(fc2_avg, fc2_max)
+          gate = Sigmoid(summed)
+          u1 = Unsqueeze(gate, ax2)
+          u2 = Unsqueeze(u1, ax3)
+          spine_shape = Shape(spine)
+          expanded = Expand(u2, spine_shape)
+          gated = Mul(spine, expanded)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, CONV2_W, CONV2_B)
+        }}
+        """,
+        initializer=[
+            _f32(conv1_w, "CONV1_W"),
+            _f32(conv1_b, "CONV1_B"),
+            _f32(fc1_w, "FC1_W"),
+            _f32(fc1_b, "FC1_B"),
+            _f32(fc2_w, "FC2_W"),
+            _f32(fc2_b, "FC2_B"),
+            _f32(conv2_w, "CONV2_W"),
+            _f32(conv2_b, "CONV2_B"),
+            onnx.numpy_helper.from_array(
+                np.array([0, -1], dtype=np.int64), "flat_shape"
+            ),
+            onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "ax2"),
+            onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "ax3"),
+        ],
+    )
+    return model, conv1_w, conv1_b, fc1_w, fc1_b, fc2_w, fc2_b, conv2_w, conv2_b
+
+
+def test_structured_pruning_cbam_channel_gate_matches_oracle():
+    Cin, C, Csq, Cout = 3, 16, 1, 8
+    model, conv1_w, conv1_b, fc1_w, fc1_b, fc2_w, fc2_b, conv2_w, conv2_b = (
+        _cbam_channel_gate_model(Cin=Cin, C=C, Csq=Csq, Cout=Cout, seed=501)
+    )
+
+    from onnxsim.pruning import _find_conv_cbam_channel_gate_chains
+
+    chains = _find_conv_cbam_channel_gate_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == C
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _cbam_conv_keep_indices(conv1_w, fc2_w, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # conv1's own output channels, and the SHARED fc2's own output channels,
+    # sliced by the identical combined-importance keep-set.
+    np.testing.assert_array_equal(inits["CONV1_W"], conv1_w[keep])
+    np.testing.assert_array_equal(inits["CONV1_B"], conv1_b[keep])
+    np.testing.assert_array_equal(inits["FC2_W"], fc2_w[keep])
+    np.testing.assert_array_equal(inits["FC2_B"], fc2_b[keep])
+    # The SHARED fc1's own INPUT channels (fed by both pooling branches) are
+    # re-sliced by the identical shared keep-set -- ONE slice, not two, since
+    # both branches read the identical tied tensor ...
+    np.testing.assert_array_equal(inits["FC1_W"], fc1_w[:, keep])
+    # ... but fc1's own OUTPUT-channel count (the squeeze bottleneck, `Csq`)
+    # -- and its own bias -- is completely untouched by this mechanism:
+    # still every one of the original `Csq` rows/entries.
+    assert inits["FC1_W"].shape[0] == Csq
+    np.testing.assert_array_equal(inits["FC1_B"], fc1_b)
+    # The downstream consumer's own input channels, sliced by the same
+    # keep-set.
+    np.testing.assert_array_equal(inits["CONV2_W"], conv2_w[:, keep])
+    np.testing.assert_array_equal(inits["CONV2_B"], conv2_b)
+
+    rng = np.random.default_rng(502)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _cbam_channel_gate_model(Cin=Cin, C=C // 2, Csq=Csq, Cout=Cout)
+    oracle_inits = {
+        "CONV1_W": conv1_w[keep],
+        "CONV1_B": conv1_b[keep],
+        "FC1_W": fc1_w[:, keep],
+        "FC1_B": fc1_b,
+        "FC2_W": fc2_w[keep],
+        "FC2_B": fc2_b[keep],
+        "CONV2_W": conv2_w[:, keep],
+        "CONV2_B": conv2_b,
+    }
+    for init in oracle.graph.initializer:
+        if init.name in oracle_inits:
+            init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_cbam_channel_gate_declines_on_weight_tie_mismatch():
+    # SIMILAR but not the confirmed real CBAM shape: the avg and max
+    # branches read DIFFERENT (not weight-tied) Gemm weights/biases for fc2
+    # -- a structurally valid, checker-passing graph (both branches still
+    # produce matching, Add-compatible shapes), just not real CBAM, whose
+    # own reference implementation applies the literal SAME `nn.Sequential`
+    # `mlp` to both pooled descriptors. Locks in the conservative "decline
+    # outright, never partially slice" bar: CONV1_W/CONV2_W/both FC2
+    # weights must all come back completely untouched.
+    Cin, C, Csq, Cout, spatial = 3, 16, 1, 8, 8
+    rng = np.random.default_rng(511)
+    conv1_w = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    conv1_b = rng.standard_normal((C,)).astype(np.float32)
+    fc1_w = rng.standard_normal((Csq, C)).astype(np.float32)
+    fc1_b = rng.standard_normal((Csq,)).astype(np.float32)
+    fc2_w_avg = rng.standard_normal((C, Csq)).astype(np.float32)
+    fc2_b_avg = rng.standard_normal((C,)).astype(np.float32)
+    fc2_w_max = rng.standard_normal((C, Csq)).astype(np.float32)  # DIFFERENT tensor
+    fc2_b_max = rng.standard_normal((C,)).astype(np.float32)  # DIFFERENT tensor
+    conv2_w = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    conv2_b = rng.standard_normal((Cout,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{spatial},{spatial}] Y)
+        {{
+          spine = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, CONV1_W, CONV1_B)
+          avg = AveragePool<kernel_shape=[{spatial},{spatial}]>(spine)
+          mx = MaxPool<kernel_shape=[{spatial},{spatial}]>(spine)
+          avg_flat = Reshape(avg, flat_shape)
+          max_flat = Reshape(mx, flat_shape)
+          fc1_avg = Gemm<transB=1>(avg_flat, FC1_W, FC1_B)
+          fc1_max = Gemm<transB=1>(max_flat, FC1_W, FC1_B)
+          relu_avg = Relu(fc1_avg)
+          relu_max = Relu(fc1_max)
+          fc2_avg = Gemm<transB=1>(relu_avg, FC2_W_AVG, FC2_B_AVG)
+          fc2_max = Gemm<transB=1>(relu_max, FC2_W_MAX, FC2_B_MAX)
+          summed = Add(fc2_avg, fc2_max)
+          gate = Sigmoid(summed)
+          u1 = Unsqueeze(gate, ax2)
+          u2 = Unsqueeze(u1, ax3)
+          spine_shape = Shape(spine)
+          expanded = Expand(u2, spine_shape)
+          gated = Mul(spine, expanded)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, CONV2_W, CONV2_B)
+        }}
+        """,
+        initializer=[
+            _f32(conv1_w, "CONV1_W"),
+            _f32(conv1_b, "CONV1_B"),
+            _f32(fc1_w, "FC1_W"),
+            _f32(fc1_b, "FC1_B"),
+            _f32(fc2_w_avg, "FC2_W_AVG"),
+            _f32(fc2_b_avg, "FC2_B_AVG"),
+            _f32(fc2_w_max, "FC2_W_MAX"),
+            _f32(fc2_b_max, "FC2_B_MAX"),
+            _f32(conv2_w, "CONV2_W"),
+            _f32(conv2_b, "CONV2_B"),
+            onnx.numpy_helper.from_array(
+                np.array([0, -1], dtype=np.int64), "flat_shape"
+            ),
+            onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "ax2"),
+            onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "ax3"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_cbam_channel_gate_chains
+
+    assert _find_conv_cbam_channel_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["CONV1_W"], conv1_w)
+    np.testing.assert_array_equal(inits["CONV2_W"], conv2_w)
+    np.testing.assert_array_equal(inits["FC2_W_AVG"], fc2_w_avg)
+    np.testing.assert_array_equal(inits["FC2_W_MAX"], fc2_w_max)
+
+
+def test_structured_pruning_cbam_channel_gate_declines_on_gate_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: the SHARED fc2 outputs a
+    # single (broadcastable) channel instead of one matching conv1's own
+    # `C` -- a legitimate, valid ONNX `Mul` broadcast (a "global" scalar
+    # gate, not a per-channel CBAM gate), but not the exact shape this
+    # section's own matcher requires (fc2's own output-channel count must
+    # equal conv1's exactly). Mirrors the SE-gate test suite's own
+    # equivalent decline case. Locks in the conservative "decline outright,
+    # never partially slice" bar: conv1/conv2/fc2 must all come back
+    # completely untouched.
+    Cin, C, Csq, Cout = 3, 16, 1, 8
+    model, conv1_w, conv1_b, fc1_w, fc1_b, fc2_w, fc2_b, conv2_w, conv2_b = (
+        _cbam_channel_gate_model(Cin=Cin, C=C, Csq=Csq, Cout=Cout, seed=521)
+    )
+    rng = np.random.default_rng(522)
+    fc2_w_bad = rng.standard_normal((1, Csq)).astype(np.float32)
+    fc2_b_bad = rng.standard_normal((1,)).astype(np.float32)
+    for init in model.graph.initializer:
+        if init.name == "FC2_W":
+            init.CopyFrom(_f32(fc2_w_bad, "FC2_W"))
+        elif init.name == "FC2_B":
+            init.CopyFrom(_f32(fc2_b_bad, "FC2_B"))
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_cbam_channel_gate_chains
+
+    assert _find_conv_cbam_channel_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["CONV1_W"], conv1_w)
+    np.testing.assert_array_equal(inits["CONV2_W"], conv2_w)
+    np.testing.assert_array_equal(inits["FC2_W"], fc2_w_bad)
+
+
 # --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----
 #
 # The MatMul/Gemm analogue of the Conv residual tests above -- see
