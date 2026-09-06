@@ -2461,20 +2461,29 @@ _WIDE_TAGS = frozenset(
     {0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x89, 0x8A, 0x8B, 0x8C, 0x8D}
     | {0x94, 0x95, 0x9B, 0x9C, 0x9D, 0x9F}
 )
-"""The 17 short-unit tag bytes that beat a shuffled null by >= 2x in both
-real models -- see the README's "Fourth correction" section."""
+"""The 17 short-unit tag bytes that beat a shuffled *explained-bytes* null
+by >= 2x in both real models -- the README's "Fourth correction" section.
+Superseded by `_ALL_TAGS`: the fifth correction's conditional-parity test
+showed the rejected tags were false rejections of rare forms."""
+
+_ALL_TAGS = frozenset(range(0x81, 0xA0))
+"""Every byte below the verb range: the full short-unit tag set. For every
+tag the byte after it is even in ~100% of real units against ~60% shuffled
+-- see the README's "Fifth correction" section."""
 
 
-def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3):
+def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3, bare=False):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
-    verb instructions and the width-rule short units `[p][p+1 bytes][tag]
-    [register]` (p+4 bytes) -- stepping one unknown byte otherwise. Returns
+    verb instructions, the width-rule short units `[p][p+1 bytes][tag]
+    [register]` (p+4 bytes) and, with `bare=True`, the payload-less 2-byte
+    `[tag][register]` pair -- stepping one unknown byte otherwise. Returns
     `(byte_offset, kind, a, b, c)` tuples: kind 'V' (a=verb, b=xx, c=yy),
-    'S' (a=prefix, b=tag, c=first payload byte) or '?' (a=byte). The
-    defaults (tags 0x81..0x84, p <= 3, stop 252 bytes before the end) are
-    the original narrow rule; `tags=_WIDE_TAGS, pmax=4` is the corrected
-    one. See the README's "The layout that explains all of it" and "Fourth
-    correction" sections."""
+    'S' (a=prefix, b=tag, c=first payload byte), 'B' (a=tag, b=register)
+    or '?' (a=byte). The defaults (tags 0x81..0x84, p <= 3, no bare pairs,
+    stop 252 bytes before the end) are the original narrow rule;
+    `tags=_ALL_TAGS, pmax=4, bare=True` is the corrected one. See the
+    README's "The layout that explains all of it", "Fourth correction" and
+    "Fifth correction" sections."""
     tags = set(range(0x81, 0x85)) if tags is None else set(tags)
     end = len(mcode) - 252 if end is None else end
 
@@ -2511,6 +2520,9 @@ def _tokenize_mcode(mcode, start=297, end=None, tags=None, pmax=3):
         elif short_len(i):
             n = short_len(i)
             out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
+        elif bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
+            n = 2
+            out.append((i, "B", mcode[i], mcode[i + 1], 0))
         else:
             n = 1
             out.append((i, "?", mcode[i], 0, 0))
@@ -2615,8 +2627,11 @@ def test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register(tmp_p
     explains under half; the byte after the tag is even in >= 99.5% of
     units (a 2-byte-granular register) while the first payload byte is at
     the background rate; `23` is a prefix byte sitting directly before
-    ordinary units; a payload-less `[0x84][even]` pair is a null-level
-    pattern; and blocks A and B share a 158-byte prologue. No device.
+    ordinary units; the payload-less `[tag][register]` pair is real (its
+    second byte is even in >= 99% of 2-byte tag-led residue runs -- the
+    fifth correction's claim, replacing the fourth's "null-level" verdict
+    that rested on the wrong null); and blocks A and B share a 158-byte
+    prologue. No device.
     """
     import random
 
@@ -2658,12 +2673,86 @@ def test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register(tmp_p
     )
     assert prefixed >= 100, prefixed
 
-    def bare_84(blob, toks):
-        unknown = {o for o, k, *_ in toks if k == "?"}
-        return sum(
-            1
-            for o in unknown
-            if blob[o] == 0x84 and o + 1 < len(blob) and blob[o + 1] % 2 == 0
-        )
+    def bare_pairs(blob, toks):
+        runs, last = [], None
+        for o, k, *_ in toks:
+            if k == "?":
+                if last == o:
+                    runs[-1][1] = o + 1
+                else:
+                    runs.append([o, o + 1])
+                last = o + 1
+        pairs = [blob[a + 1] for a, b in runs if b - a == 2 and blob[a] in _ALL_TAGS]
+        return len(pairs), sum(1 for x in pairs if x % 2 == 0)
 
-    assert bare_84(block, toks) <= 1.2 * bare_84(shuffled, null_toks)
+    n_real, even_real = bare_pairs(block, toks)
+    assert n_real >= 100 and even_real >= 0.99 * n_real, (n_real, even_real)
+    n_null, even_null = bare_pairs(shuffled, null_toks)
+    assert even_null <= 0.85 * n_null + 2, (n_null, even_null)
+
+
+def test_resnet18d_every_tag_and_the_bare_pair_pass_the_parity_null(tmp_path):
+    """Confirmed real (see the README's "Fifth correction" section), on a
+    fresh resnet18d build with a fixed-seed shuffled null of config block
+    B: with every byte in 0x81..0x9f admitted as a tag, the trailing byte
+    is even in >= 95% of units for *every* tag with n >= 20 (~60% when the
+    block is shuffled); with bare `[tag][register]` pairs admitted too the
+    block is >= 90% explained; `e1 XX` pairs have odd XX in every case;
+    and the residue is dominated by 1-byte prefixes that sit directly
+    before a unit. No device.
+    """
+    import random
+    from collections import defaultdict
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    lo, hi = narrow[cuts[1]][0], narrow[cuts[2]][0]
+    block = mcode[lo:hi]
+    shuffled = bytearray(block)
+    random.Random(0).shuffle(shuffled)
+    shuffled = bytes(shuffled)
+
+    def per_tag_even(blob):
+        toks = _tokenize_mcode(blob, start=0, end=len(blob), tags=_ALL_TAGS, pmax=4)
+        per = defaultdict(lambda: [0, 0])
+        for o, k, p, tag, _ in toks:
+            if k == "S":
+                per[tag][0] += 1
+                per[tag][1] += blob[o + p + 3] % 2 == 0
+        return per
+
+    real, null = per_tag_even(block), per_tag_even(shuffled)
+    tested = [t for t, (n, _) in real.items() if n >= 20]
+    assert len(tested) >= 15 and {0x87, 0x88, 0x8E, 0x92} <= set(tested), tested
+    for t in tested:
+        n, ev = real[t]
+        # 0x9c sits at 47/48 on this build -- one miss, well above the ~60% null.
+        assert ev >= 0.95 * n, (hex(t), n, ev)
+    null_even = sum(ev for n, ev in null.values()) / sum(n for n, ev in null.values())
+    assert null_even <= 0.8, null_even
+
+    toks = _tokenize_mcode(
+        block, start=0, end=len(block), tags=_ALL_TAGS, pmax=4, bare=True
+    )
+    explained = 1 - sum(1 for t in toks if t[1] == "?") / len(block)
+    assert explained >= 0.9, explained
+    assert sum(1 for t in toks if t[1] == "B") >= 500
+
+    runs, last = [], None
+    for o, k, *_ in toks:
+        if k == "?":
+            if last == o:
+                runs[-1][1] = o + 1
+            else:
+                runs.append([o, o + 1])
+            last = o + 1
+
+    # `e1 XX` as a 2-byte residue run: XX is odd (README: 13/14, 48/48, 7/7).
+    e1 = [block[a + 1] for a, b in runs if b - a == 2 and block[a] == 0xE1]
+    assert len(e1) >= 10 and sum(x % 2 for x in e1) >= 0.9 * len(e1), e1
+
+    starts = {o for o, k, *_ in toks if k != "?"}
+    singles = [a for a, b in runs if b - a == 1]
+    assert len(singles) >= 0.75 * len(runs), (len(singles), len(runs))
+    assert sum(1 for a in singles if a + 1 in starts) >= 0.9 * len(singles)

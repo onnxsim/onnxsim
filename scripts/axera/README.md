@@ -2883,6 +2883,56 @@ Test: `test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register`
 in `tests/test_axera_mcode_structure.py` (fresh `resnet18d` build,
 fixed-seed null, no device).
 
+### Fifth correction: every tag byte is real, so is the bare pair -- the explained-bytes null was the wrong null
+
+The section above rejected 14 tag bytes and the payload-less
+`[tag][even]` pair because admitting them raised the *shuffled* block's
+explained fraction almost as much as the real one's. That comparison is
+sound for a common form and useless for a rare one: shuffling the block
+leaves ~60% of it unexplained, and a rare pattern then matches by
+chance inside that residue about as often as it occurs for real. The
+right null for a rare form is conditional: given the form's own anchor
+byte, does the byte the rule constrains behave as the rule says, and
+does it do so in the shuffled block?
+
+**Every byte in 0x81..0x9f is a tag.** Admitting all 31 as p-unit tags,
+the trailing byte is even in essentially every real unit *for every
+tag*: 0x87 52/52, 0x88 95/95, 0x8e 26/26, 0x92 31/31, 0x93 22/22 in
+`resnet18d` (the "rejected" ones), alongside 0x84 601/601 and 0x9f
+416/416; `mnasnet` likewise (0x87 14/14, 0x88 50/50, 0x92 26/26, 0x93
+51/51, 0x9c 166/166). In the shuffled block the same units are even at
+50..70% for every tag (0x84 100/151, 0x9f 79/116). The 17-tag set was
+a false rejection of the rarer tags, not a property of the format.
+
+**The bare `[tag][register]` pair is real.** Among residue runs of
+exactly two bytes that begin with a tag byte, the second byte is even in
+**265 of 265** (`resnet18d`), **598 of 600** (`mnasnet`) and 29 of 29
+(tiny) -- against a 60% background inside the residue and 7 of 12 in
+the shuffled block. That is the `p = -1` width: a register touched with
+no payload. Two more forms show the same signature and are noted, not
+yet tokenized: `e1 XX` with `XX` *odd* in 13/14, 48/48 and 7/7 cases
+(the verb byte 0xa1 with bit 6 set), and 0xa1 itself acting as a tag
+when not followed by `00` -- bare `a1 5e`-style pairs are even 8/8 and
+20/20, and `01 70 04 a1 5e` is a `p = 1` unit on tag 0xa1.
+
+**Where block B stands.** With all tags, `p <= 4` and bare pairs, block
+B is **93.5%** explained in `resnet18d` (residue 1,267 of 19,383
+bytes), **93.3%** in `mnasnet` (3,004 of 44,695) and 85.9% in the tiny
+model. The shuffled block reaches 42.9% under the same rule -- the
+inflation that misled the section above, and the reason the parity
+counts, not that figure, carry the claim. The residue is now mostly the
+one-byte prefixes: 641 of 762 residue runs in `resnet18d` (`23` 150,
+`03` 118, `16` 72, `3c` 28, `05` 21, `0d` 19), 992 of 1,415 in `mnasnet`
+(`04` 115, `05` 99, `03` 62, `1c` 52, `2d` 50), and 559 + 63 of those
+641 are followed directly by a p-unit or a bare pair. The multi-byte
+leftovers are a few 6..7-byte runs that sit immediately before a verb
+(`09 20 02 00 00 01 00`, `09 c0 0c 80 fe 01 01`, `08 0b 55 fc 55 01`)
+-- a candidate pre-verb form with too few instances to test yet.
+
+Test: `test_resnet18d_every_tag_and_the_bare_pair_pass_the_parity_null`
+in `tests/test_axera_mcode_structure.py`; the previous test's bare-pair
+assertion is replaced by the corrected claim.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
