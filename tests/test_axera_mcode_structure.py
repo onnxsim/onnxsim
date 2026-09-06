@@ -1827,3 +1827,47 @@ def test_resnet18d_50_03_operands_are_a_64_byte_aligned_tile_arena(tmp_path):
     deltas = [b - a for a, b in zip(ops, ops[1:])]
     assert max(deltas) < 802_816, "expected tile-sized deltas, not tensor-sized ones"
     assert min(o for o in ops if o) == 37_120
+
+
+def _flag_sequence_per_op(mcode):
+    """For each pair of consecutive `40 02` (Wbt-offset) writes, the
+    ordered tuple of `50 01` values written between them -- see the
+    README's "`50 01` is a per-op four-step sequence" section."""
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    hdrs = [
+        (i, w[2], w[3], int.from_bytes(words[i + 1], "little"))
+        for i, w in enumerate(words)
+        if w[:2] == b"\xa1\x00" and i + 1 < len(words)
+    ]
+    cuts = [i for i, xx, yy, _ in hdrs if (xx, yy) == (0x40, 0x02)]
+    flags = [(i, v) for i, xx, yy, v in hdrs if (xx, yy) == (0x50, 0x01)]
+    return [tuple(v for i, v in flags if a < i < b) for a, b in zip(cuts, cuts[1:])]
+
+
+def test_50_01_is_a_fixed_four_step_sequence_per_op_in_both_models(tmp_path):
+    """Confirmed real (see the README's "`50 01` is a per-op four-step
+    sequence" section), all local: every op writes `50 01` exactly four
+    times in the fixed order bit8, bit0, bit20, bit24 -- 180 of 180
+    inter-op segments in resnet18d, and the tiny two-Conv model's single
+    op writes the same four in the same order. Not an engine selector.
+    Needs Docker for the builds but no device.
+    """
+    order = (0x100, 0x1, 0x100000, 0x1000000)
+
+    tiny = _mcode_from_axmodel(
+        _build_axmodel(
+            os.path.join(str(tmp_path), "tiny"),
+            _two_conv_model(vary_first=True, dilation=2, pad=2),
+            (1, 4, 16, 16),
+        )
+    )
+    tiny_flags = [v for xx, yy, v in _header_fields(tiny) if (xx, yy) == (0x50, 0x01)]
+    assert tuple(tiny_flags) == order, tiny_flags
+
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    segments = _flag_sequence_per_op(r18)
+    assert len(segments) == 180, len(segments)
+    assert all(seg == order for seg in segments), (
+        sum(1 for seg in segments if seg != order),
+        "expected every op to write the same four-step sequence",
+    )

@@ -2273,6 +2273,33 @@ the ~3.1 MB span is the on-chip memory's actual size is not confirmed
 against any spec here, and the tile-to-tensor mapping is not
 decoded; the field's *kind* -- aligned tile address -- is.
 
+### `50 01` is a per-op four-step sequence, written in a fixed order -- not an engine selector
+
+The most-written field, `50 01`, takes exactly four one-hot values
+(`0x1, 0x100, 0x100000, 0x1000000` -- bits 0, 8, 20, 24) in both
+models. Four values and four profiled engines (`conv0`, `conv1`,
+`teng2`, `sdma4`) invite the guess "it selects an engine." Testing that
+guess, locally, refutes it:
+
+- **Every op writes all four, in the same fixed order.** Splitting
+  `resnet18d`'s header stream at each `40 02` (Wbt-offset) write, the
+  `50 01` values between consecutive ops are `bit8, bit0, bit20, bit24`
+  in **180 of 180** segments, and the tiny two-Conv model's single op
+  writes exactly the same four in the same order. Each value occurs
+  exactly 181 times -- once per op -- so 724 = 4 x 181 is not "four
+  choices" but "four steps."
+- So `50 01` is a **per-op sequence register**: every op pulses it
+  four times in a fixed order. Which four steps -- four stage triggers,
+  four engine-enable pulses issued in sequence, a four-phase handshake
+  -- is not identified; what is settled is that it is not a per-op
+  choice of one engine.
+
+A count that lines up on the way: `sdma4` has exactly **181** events in
+`resnet18d`'s trace -- one per op, one per `40 02` write -- consistent
+with each op's Wbt-offset write being followed by one weight DMA on the
+system DMA engine. (`conv0`/`conv1` have 522 events each; `teng2` 46;
+`cv3` 162.)
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
