@@ -1642,3 +1642,50 @@ def test_resnet18d_mcode_word_stream_counts(tmp_path):
         suffixes["50 03"],
     )
     assert suffixes.most_common(1)[0] == ("50 01", 724), suffixes.most_common(3)
+
+
+def test_resnet18d_40_02_operands_are_wbt_offsets_paired_with_50_03(tmp_path):
+    """Confirmed real (see the README's "`40 02` operands are weight-table
+    offsets" section), all local byte analysis: `40 02` and `50 03`
+    headers are paired one-to-one, canonically 8 words (one 32-byte unit)
+    apart; the 181 `40 02` operands are all distinct and span exactly the
+    Wbt (the largest lands within 0.3% of `npu_params`'s size); `50 03`
+    operands stop at about a quarter of that; and the most common kind,
+    `50 01`, takes only four distinct operand values across 724 uses.
+    Needs Docker for the build but no device.
+    """
+    from collections import Counter
+
+    path, _, mcode = _build_real_resnet18d(str(tmp_path))
+    compiled = onnx.load(path)
+    wbt_size = len(
+        bytes(
+            {i.name: i for i in compiled.graph.initializer}[
+                _params_key(compiled)
+            ].raw_data
+        )
+    )
+
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    kind = {i: w[2:].hex(" ") for i, w in enumerate(words) if w[:2] == b"\xa1\x00"}
+    by_kind = {}
+    for i, k in kind.items():
+        by_kind.setdefault(k, []).append(i)
+    operand = lambda i: int.from_bytes(words[i + 1], "little")  # noqa: E731
+
+    i4002, i5003 = by_kind["40 02"], by_kind["50 03"]
+    assert len(i4002) == len(i5003) == 181
+    dist = Counter(
+        j - max(i for i in i4002 if i < j) for j in i5003 if any(i < j for i in i4002)
+    )
+    assert dist.most_common(1)[0][0] == 8 and dist[8] >= 160, dist.most_common(3)
+
+    ops4002 = [operand(i) for i in i4002]
+    assert len(set(ops4002)) == 181
+    assert max(ops4002) <= wbt_size
+    assert max(ops4002) >= 0.99 * wbt_size, (max(ops4002), wbt_size)
+
+    ops5003 = [operand(i) for i in i5003]
+    assert max(ops5003) < 0.35 * wbt_size, (max(ops5003), wbt_size)
+
+    assert len({operand(i) for i in by_kind["50 01"]}) <= 4

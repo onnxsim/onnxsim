@@ -2071,6 +2071,58 @@ to an output buffer" vs "an address to weights" would produce, which is
 now the leading hypothesis and one a single targeted test (patch an
 operand to another instance's value) could check.
 
+### `40 02` operands are weight-table offsets; `40 02`/`50 03` come in pairs one 32-byte unit apart; `50 01` is a 4-valued flag
+
+Still zero device runs -- pairing and operand statistics over all 1,197
+headers, then one size cross-check.
+
+**`40 02` and `50 03` are paired one-to-one.** Every one of the 181
+`50 03` headers has a `40 02` before it at a word distance of 8 (166
+cases), 10 (14), or 44 (1), and the reverse histogram -- each `40 02` to
+its next `50 03` -- is identical. Eight words is 32 bytes: the pair sits
+exactly one "32-byte mcode unit" apart, the unit this whole
+investigation began with, with three other two-word instructions in
+between.
+
+**Operand statistics separate the kinds cleanly:**
+
+```
+kind        n    distinct   operand range          reading
+a1 00 40 02  181    181     0x000000..0xb45ba0     address-like, one per op
+a1 00 50 03  181    176     0x000000..0x2f7040     address-like, smaller region
+a1 00 50 01  724      4     {0x1 .. 0x01000000}    enumerated flag, not an address
+```
+
+**And the size cross-check decodes `40 02`.** `resnet18d`'s Wbt
+(`npu_params`) is 11,855,108 bytes = `0x00b4e504`; the largest `40 02`
+operand is `0x00b45ba0` -- within 0.3% of the Wbt's end -- and the 181
+values are all distinct. So **`a1 00 40 02 <operand>` sets this op's
+offset into the weight table**: a real, quantitative, independently
+checkable semantic for one instruction kind, obtained without any
+device. `50 03`'s operands stop at ~3.1 MB, about a quarter of the Wbt,
+so they address a different, smaller region -- the size is consistent
+with an activation/intermediate-buffer arena, but that is inferred from
+size alone and is not confirmed.
+
+**Correction, stated in place.** The previous section guessed the
+opposite assignment -- `40 02` as an output-buffer address and `50 03`
+as a weight address -- from the input-dependence split alone. The Wbt
+span settles it the other way. The two observations still fit together:
+corrupting a Wbt offset can land the op on per-channel scale/bias data
+that saturates its output to a fixed value regardless of input
+(input-independent, as 32700/48300 showed), while corrupting a pointer
+into an activation region reads data that still varies with the input
+(input-dependent, as 43500 showed). A related caveat on that
+input-dependence experiment: its three "different inputs" were all
+independent uniform-noise images, which are statistically alike -- a
+weaker test than three genuinely different photographs. It still had
+discriminating power (43500 did vary), but the 8-of-9 count should be
+read with that in mind.
+
+The most common instruction, `50 01`, takes only four distinct operand
+values across 724 uses -- a small enumerated control/flag word, not a
+pointer; which flags is not identified.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
