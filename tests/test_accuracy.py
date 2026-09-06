@@ -146,6 +146,148 @@ def test_quantize_invalid_granularity_raises_value_error():
         )
 
 
+def _int4_matmul_model(K=64, N=16, seed=0):
+    # A bare MatMul (no bias Add) matching the model shape
+    # tests/test_awq.py, tests/test_gptq.py, and tests/test_gptaq.py
+    # exercise apply_awq/apply_gptq/apply_gptaq against directly -- the
+    # candidate-matching those passes do (by node output name, present in
+    # both the float and quantized model) is exact regardless, but reusing
+    # the same shape keeps the calibration helpers below meaningful.
+    rng = np.random.default_rng(seed)
+    weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [onnx.numpy_helper.from_array(weight, "W")],
+    )
+
+
+def _salient_channel_calibration(K=64, num_samples=64, salient_channels=(3, 7), seed=1):
+    # Matches tests/test_awq.py's own calibration helper: a handful of
+    # channels with much larger activation magnitude than the rest reliably
+    # gives AWQ's per-channel rescale something to improve on.
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((num_samples, K)).astype(np.float32)
+    for c in salient_channels:
+        x[:, c] *= 20.0
+    return [{"X": x}]
+
+
+def _correlated_calibration(K=64, num_samples=64, rank=6, seed=1):
+    # Matches tests/test_gptq.py's own calibration helper: channels that
+    # are linear combinations of a handful of latent factors, so GPTQ's
+    # off-diagonal Hessian terms have real correlation to compensate for.
+    rng = np.random.default_rng(seed)
+    latent = rng.standard_normal((num_samples, rank)).astype(np.float32)
+    projection = rng.standard_normal((rank, K)).astype(np.float32)
+    x = latent @ projection
+    x += rng.standard_normal((num_samples, K)).astype(np.float32) * 0.05
+    return [{"X": x.astype(np.float32)}]
+
+
+# --------------------------------------------------------------------------- #
+# QuantizationConfig awq/gptq/gptaq/double_quant pipeline flags
+# --------------------------------------------------------------------------- #
+def test_quantize_weight_only_int4_default_flags_match_direct_call():
+    model = _int4_matmul_model()
+    config = onnxsim.QuantizationConfig(scheme="weight_only", dtype="int4")
+
+    dispatched = onnxsim.quantize(model, config)
+    direct = onnxsim.quantize_weight_only_int4(model)
+
+    assert dispatched.SerializeToString() == direct.SerializeToString()
+
+
+def test_quantize_weight_only_int4_awq_flag_matches_direct_apply_awq():
+    model = _int4_matmul_model(K=64, N=16, seed=0)
+    calibration_data = _salient_channel_calibration(K=64, num_samples=64, seed=1)
+    config = onnxsim.QuantizationConfig(
+        scheme="weight_only",
+        dtype="int4",
+        awq=True,
+        calibration_data=calibration_data,
+    )
+
+    dispatched = onnxsim.quantize(model, config)
+
+    rtn = onnxsim.quantize_weight_only_int4(model)
+    direct = onnxsim.apply_awq(model, rtn, calibration_data=calibration_data)
+
+    assert dispatched.SerializeToString() == direct.SerializeToString()
+    # AWQ must have actually run (inserted its compensating Mul, changing
+    # the weight/scale initializers too) -- not just re-produced plain RTN.
+    assert dispatched.SerializeToString() != rtn.SerializeToString()
+
+
+def test_quantize_weight_only_int4_gptq_flag_matches_direct_apply_gptq():
+    model = _int4_matmul_model(K=64, N=16, seed=0)
+    calibration_data = _correlated_calibration(K=64, num_samples=64, seed=1)
+    config = onnxsim.QuantizationConfig(
+        scheme="weight_only",
+        dtype="int4",
+        gptq=True,
+        calibration_data=calibration_data,
+    )
+
+    dispatched = onnxsim.quantize(model, config)
+
+    rtn = onnxsim.quantize_weight_only_int4(model)
+    direct = onnxsim.apply_gptq(model, rtn, calibration_data=calibration_data)
+
+    assert dispatched.SerializeToString() == direct.SerializeToString()
+    assert dispatched.SerializeToString() != rtn.SerializeToString()
+
+
+def test_quantize_weight_only_int4_chains_awq_gptq_double_quant_in_fixed_order():
+    model = _int4_matmul_model(K=64, N=16, seed=0)
+    calibration_data = _salient_channel_calibration(K=64, num_samples=64, seed=1)
+    config = onnxsim.QuantizationConfig(
+        scheme="weight_only",
+        dtype="int4",
+        awq=True,
+        gptq=True,
+        double_quant=True,
+        calibration_data=calibration_data,
+    )
+
+    dispatched = onnxsim.quantize(model, config)
+
+    manual = onnxsim.quantize_weight_only_int4(model)
+    manual = onnxsim.apply_awq(model, manual, calibration_data=calibration_data)
+    manual = onnxsim.apply_gptq(model, manual, calibration_data=calibration_data)
+    manual = onnxsim.apply_double_quantization(manual)
+
+    assert dispatched.SerializeToString() == manual.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        {"scheme": "dynamic"},
+        {"scheme": "static"},
+        {"scheme": "float", "dtype": "float16"},
+    ],
+)
+def test_int4_pipeline_flags_silently_ignored_for_other_schemes(config_kwargs):
+    model = _linear_model(K=64, N=32)
+    plain = onnxsim.quantize(model, onnxsim.QuantizationConfig(**config_kwargs))
+    flagged = onnxsim.quantize(
+        model,
+        onnxsim.QuantizationConfig(
+            **config_kwargs,
+            awq=True,
+            gptq=True,
+            gptaq=True,
+            double_quant=True,
+        ),
+    )
+    assert plain.SerializeToString() == flagged.SerializeToString()
+
+
 def test_quantize_static_passes_through_calibration_settings():
     model = _linear_model(K=8, N=4)
     rng = np.random.default_rng(5)

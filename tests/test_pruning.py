@@ -7167,6 +7167,336 @@ def test_analyze_structured_pruning_grn_pass_through_matches_real_call():
     assert dims_after["GrnBias"] == (1, kept, 1, 1)
 
 
+# --- Conv chain: SGE (Spatial Group-wise Enhance) pass-through hop ----------
+#
+# Li et al. 2019 (arXiv:1905.09646), `SpatialGroupEnhance` -- confirmed via a
+# real `torch.onnx.export` (opset 17, static batch, `dynamo=False`) of the
+# paper's own canonical reference forward (see `onnxsim/pruning.py`'s own
+# "Spatial Group-wise Enhance (SGE) pass-through" section comment for the
+# full empirical op sequence this builder reproduces node-for-node).
+def _sge_conv_pair_model(
+    w1,
+    w2,
+    sge_weight,
+    sge_bias,
+    num_groups,
+    b1=None,
+    spatial=10,
+    batch=2,
+    eps=0.1234,
+    split_shape=None,
+    tr_shape=None,
+):
+    """Builds `Conv -> SpatialGroupEnhance(groups=num_groups) -> Conv`,
+    reproducing the exact confirmed op sequence directly in the ONNX text
+    format (opset 17, matching the attribute-based `ReduceMean`/`Gather`/
+    `ReduceProd`/`Cast` forms the real export uses -- see
+    `_grn_conv_pair_model`'s own identical `opset=17` override for why).
+    `split_shape`/`tr_shape` let a test override the two literal shapes that
+    matter for this hop's own group-count derivation (`reshape1`'s own
+    ``[batch*num_groups, -1, H, H]`` and `reshape3`'s own ``[batch,
+    num_groups, H, H]`` -- see `_match_sge_pass_through`'s own docstring for
+    why `num_groups` comes from the LATTER, not the former) to probe decline
+    behavior; both default to the real, correct shapes.
+    """
+    Cin, C1, C2 = w1.shape[1], w1.shape[0], w2.shape[0]
+    H = spatial - 2  # one valid (no-pad) 3x3 conv
+    N, G = batch, num_groups
+    if split_shape is None:
+        split_shape = [N * G, -1, H, H]
+    if tr_shape is None:
+        tr_shape = [N, G, H, H]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        onnx.numpy_helper.from_array(
+            np.array(split_shape, dtype=np.int64), "SplitShape"
+        ),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "RsAxes"),
+        onnx.numpy_helper.from_array(np.array([N * G, -1], dtype=np.int64), "T0Shape"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "GatherIdx"),
+        onnx.numpy_helper.from_array(np.array(tr_shape, dtype=np.int64), "TrShape"),
+        # Reshaped by each array's OWN length, not forced to `(1, G, 1, 1)`
+        # -- a wrongly-sized `sge_weight`/`sge_bias` (a decline-path test
+        # probing the per-GROUP shape bar) must actually reach the matcher
+        # with its own wrong shape, not get silently coerced back to the
+        # right one here.
+        _f32(np.asarray(sge_weight).reshape(1, -1, 1, 1), "SgeWeight"),
+        _f32(np.asarray(sge_bias).reshape(1, -1, 1, 1), "SgeBias"),
+        onnx.numpy_helper.from_array(
+            np.array([N * G, 1, H, H], dtype=np.int64), "GatePreShape"
+        ),
+        onnx.numpy_helper.from_array(
+            np.array([N, C1, H, H], dtype=np.int64), "OutShape"
+        ),
+        _f32(np.array(1.0), "One"),
+        _f32(np.array(eps), "Eps"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = H - 2  # a second valid (no-pad) 3x3 conv
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          r0 = Reshape(h, SplitShape)
+          gap = GlobalAveragePool(r0)
+          m1 = Mul(r0, gap)
+          rs = ReduceSum<keepdims=1>(m1, RsAxes)
+          t0 = Reshape(rs, T0Shape)
+          mean0 = ReduceMean<axes=[1],keepdims=1>(t0)
+          d = Sub(t0, mean0)
+          mean1 = ReduceMean<axes=[1],keepdims=1>(d)
+          shaped = Shape(d)
+          gathered = Gather<axis=0>(shaped, GatherIdx)
+          nval = ReduceProd<keepdims=0>(gathered)
+          e = Sub(d, mean1)
+          e2 = Mul(e, e)
+          meane2 = ReduceMean<axes=[1],keepdims=1>(e2)
+          nf = Cast<to=1>(nval)
+          sume2 = Mul(meane2, nf)
+          nminus1 = Sub(nf, One)
+          var = Div(sume2, nminus1)
+          std = Sqrt(var)
+          denom = Add(std, Eps)
+          tn = Div(d, denom)
+          tr = Reshape(tn, TrShape)
+          weighted = Mul(tr, SgeWeight)
+          biased = Add(weighted, SgeBias)
+          gatepre = Reshape(biased, GatePreShape)
+          gate = Sigmoid(gatepre)
+          gated = Mul(r0, gate)
+          sgeout = Reshape(gated, OutShape)
+          Y = Conv<kernel_shape=[3,3]>(sgeout, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_sge_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, identical in spirit to the native-GroupNorm
+    # hop's own oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model built by the SAME
+    # `_sge_conv_pair_model` with pre-sliced weights, not "the un-pruned
+    # model's own output sliced after the fact" -- SGE's own per-group
+    # `GlobalAveragePool`+instance-normalize statistics need the identical
+    # per-group-uniform-count scope `_GROUP_NORM_PASS_THROUGH_OP`'s own
+    # comment already established, so `_oracle_keep_indices_conv_grouped`
+    # (the same per-group top-k `_apply_chains`/`_chain_group` itself uses)
+    # is the right oracle here, exactly like the native-GroupNorm test uses.
+    # `sge.weight`/`sge.bias` are per-GROUP, independent of the channel
+    # count -- reused UNSLICED in the oracle, confirming this hop's own
+    # "never sliced" scope is correct.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(90)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sge_weight = rng.standard_normal((num_groups,)).astype(np.float32)
+    sge_bias = rng.standard_normal((num_groups,)).astype(np.float32)
+    model = _sge_conv_pair_model(w1, w2, sge_weight, sge_bias, num_groups, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] % num_groups == 0
+    assert dims_after["W1"][0] < C1  # actually pruned, not a no-op
+    assert dims_after["SgeWeight"] == (1, num_groups, 1, 1)  # never sliced
+    assert dims_after["SgeBias"] == (1, num_groups, 1, 1)
+
+    keep = _oracle_keep_indices_conv_grouped(w1, num_groups, 0.5)
+    oracle = _sge_conv_pair_model(
+        w1[keep], w2[:, keep], sge_weight, sge_bias, num_groups, b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(91)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_sge_wrong_weight_shape_declines():
+    # `sge.weight` shaped per-CHANNEL (`[1, C1, 1, 1]`) rather than
+    # per-GROUP (`[1, num_groups, 1, 1]`) -- the mirror-opposite mistake
+    # from GRN's own per-channel affine -- is not the confirmed real shape,
+    # so this hop declines outright, never guessed at, leaving the whole
+    # chain (and both Convs) completely untouched.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(92)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sge_weight_wrong = rng.standard_normal((C1,)).astype(
+        np.float32
+    )  # per-channel, not per-group
+    sge_bias = rng.standard_normal((num_groups,)).astype(np.float32)
+    model = _sge_conv_pair_model(w1, w2, sge_weight_wrong, sge_bias, num_groups)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_sge_num_groups_not_dividing_channels_declines():
+    # `n_channels % num_groups != 0` -- the split can never be even, so this
+    # hop declines outright rather than guessing at an uneven split.
+    Cin, C1, C2, num_groups = 3, 12, 6, 5  # 12 % 5 != 0
+    rng = np.random.default_rng(93)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sge_weight = rng.standard_normal((num_groups,)).astype(np.float32)
+    sge_bias = rng.standard_normal((num_groups,)).astype(np.float32)
+    # `reshape1`'s own literal `batch*num_groups` (here `1*5=5`) and
+    # `reshape3`'s own separate `[batch, num_groups, H, H]` both still name
+    # `num_groups=5` consistently -- the decline here is purely
+    # `n_channels % num_groups`, not a `split_shape`/`tr_shape` mismatch.
+    model = _sge_conv_pair_model(
+        w1,
+        w2,
+        sge_weight,
+        sge_bias,
+        num_groups,
+        batch=1,
+        split_shape=[num_groups, -1, 8, 8],
+        tr_shape=[1, num_groups, 8, 8],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_analyze_structured_pruning_sge_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check for the SGE hop specifically, mirroring
+    # `test_analyze_structured_pruning_group_norm_pass_through_matches_real_call`
+    # above -- both `_apply_chains` and its dry-run mirror `_analyze_chains`
+    # share `_chain_group` (and, via `chain.sge`, the same literal-reshape
+    # edit at apply time), so a mismatch here would mean the mirror drifted
+    # out of sync with the real call.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(94)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sge_weight = rng.standard_normal((num_groups,)).astype(np.float32)
+    sge_bias = rng.standard_normal((num_groups,)).astype(np.float32)
+    model = _sge_conv_pair_model(w1, w2, sge_weight, sge_bias, num_groups)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["SgeWeight"] == (1, num_groups, 1, 1)
+    assert dims_after["SgeBias"] == (1, num_groups, 1, 1)
+
+
+def test_structured_pruning_sge_and_group_norm_coexist_in_one_graph():
+    # A required safety check for this hop: SGE's own dispatch (a plain
+    # `Reshape` reading the producing Conv's raw output directly, at the
+    # ordinary `len(candidates) == 1` site) must never misfire on -- or be
+    # misfired on by -- another `len(candidates) == 1`-dispatched hop at
+    # that SAME site, even within one shared graph. Native `GroupNormalization`
+    # itself needs opset 18+ (its own per-channel `scale`/`bias` schema),
+    # which would force this combined graph's own single, shared opset high
+    # enough to also silently switch `ReduceMean`'s own `axes` from an
+    # attribute to an input (opset 18+) -- a DIFFERENT, unconfirmed shape
+    # `_match_sge_pass_through` deliberately never recognizes (see this
+    # module's own "Spatial Group-wise Enhance (SGE) pass-through" section
+    # comment) -- so `InstanceNormalization` (opset-6-compatible, unaffected
+    # either way) stands in here as the companion `len(candidates) == 1`
+    # shape instead, exactly the "or another len==1-dispatched shape"
+    # allowance this test was scoped to: two entirely independent
+    # `Conv -> SGE -> Conv` and `Conv -> InstanceNorm -> Conv` chains
+    # (disjoint inputs/outputs/weights, so no cross-chain touched-role
+    # interaction either) must BOTH resolve and prune correctly.
+    rng = np.random.default_rng(95)
+
+    Cin_a, C1_a, C2_a, num_groups = 3, 16, 8, 4
+    w1_a = rng.standard_normal((C1_a, Cin_a, 3, 3)).astype(np.float32)
+    w2_a = rng.standard_normal((C2_a, C1_a, 3, 3)).astype(np.float32)
+    sge_weight = rng.standard_normal((num_groups,)).astype(np.float32)
+    sge_bias = rng.standard_normal((num_groups,)).astype(np.float32)
+    sge_model = _sge_conv_pair_model(w1_a, w2_a, sge_weight, sge_bias, num_groups)
+
+    Cin_b, C1_b, C2_b = 3, 16, 8
+    w1_b = rng.standard_normal((C1_b, Cin_b, 3, 3)).astype(np.float32)
+    w2_b = rng.standard_normal((C2_b, C1_b, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C1_b,)).astype(np.float32)
+    in_bias = rng.standard_normal((C1_b,)).astype(np.float32)
+
+    # Splice the two independently-built single-input/single-output graphs'
+    # own nodes/initializers into one shared graph with two disjoint
+    # input/output pairs -- no shared tensor names between the halves.
+    def _prefixed(model, prefix):
+        g = onnx.GraphProto()
+        g.CopyFrom(model.graph)
+        rename = {}
+        for vi in list(g.input) + list(g.output):
+            rename[vi.name] = f"{prefix}{vi.name}"
+            vi.name = rename[vi.name]
+        for init in g.initializer:
+            rename[init.name] = f"{prefix}{init.name}"
+            init.name = rename[init.name]
+        for node in g.node:
+            node.input[:] = [rename.get(n, f"{prefix}{n}") for n in node.input]
+            node.output[:] = [rename.get(n, f"{prefix}{n}") for n in node.output]
+            for n in node.input:
+                rename.setdefault(n, n)
+        return g
+
+    ga = _prefixed(sge_model, "a_")
+    gb = _prefixed(_instance_norm_conv_pair_model(w1_b, w2_b, in_scale, in_bias), "b_")
+    combined = onnx.ModelProto()
+    combined.CopyFrom(sge_model)
+    del combined.graph.node[:]
+    del combined.graph.initializer[:]
+    del combined.graph.input[:]
+    del combined.graph.output[:]
+    combined.graph.node.extend(list(ga.node) + list(gb.node))
+    combined.graph.initializer.extend(list(ga.initializer) + list(gb.initializer))
+    combined.graph.input.extend(list(ga.input) + list(gb.input))
+    combined.graph.output.extend(list(ga.output) + list(gb.output))
+    onnx.checker.check_model(combined)
+
+    pruned = onnxsim.apply_structured_pruning(combined, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+
+    # SGE half: pruned, per-group-uniform, sge.weight/bias untouched.
+    assert dims_after["a_W1"][0] % num_groups == 0
+    assert dims_after["a_W1"][0] < C1_a
+    assert dims_after["a_W2"][1] == dims_after["a_W1"][0]
+    assert dims_after["a_SgeWeight"] == (1, num_groups, 1, 1)
+
+    # InstanceNorm half: pruned (no group constraint), scale/bias sliced.
+    assert dims_after["b_W1"][0] < C1_b
+    assert dims_after["b_W2"][1] == dims_after["b_W1"][0]
+    assert dims_after["b_INScale"][0] == dims_after["b_W1"][0]
+    assert dims_after["b_INBias"][0] == dims_after["b_W1"][0]
+
+    rng_x = np.random.default_rng(96)
+    xa = rng_x.standard_normal((2, Cin_a, 10, 10)).astype(np.float32)
+    xb = rng_x.standard_normal((2, Cin_b, 10, 10)).astype(np.float32)
+    _run(pruned, {"a_X": xa, "b_X": xb})  # must not raise -- both halves valid
+
+
 # --- Conv chain: CBAM SpatialGate pass-through hop ---------------------------
 #
 # CBAM (Woo et al. 2018, "Convolutional Block Attention Module")'s
@@ -7367,10 +7697,318 @@ def test_analyze_structured_pruning_spatial_gate_pass_through_matches_real_call(
     assert dims_after["SGW"] == (1, 2, 7, 7)
 
 
+# --- Conv chain: ECA-Net `eca_layer` channel-attention gate pass-through hop -
+#
+# ECA-Net (Wang et al. 2020 CVPR, "ECA-Net: Efficient Channel Attention for
+# Deep Convolutional Neural Networks")'s `eca_layer` -- a *fourth*
+# Conv-chain pass-through hop sharing SpatialGate/GRN's own three-consumer
+# dispatch. See `onnxsim.pruning`'s own "ECA-Net `eca_layer`
+# channel-attention gate" section comment and
+# `onnxsim.pruning._match_eca_gate_pass_through`'s own docstring for the full
+# empirical/architectural finding: confirmed via a real `torch.onnx.export`
+# (opset 17, legacy TorchScript-based exporter) of a verbatim
+# reimplementation of the reference implementation's own
+# (`github.com/BangguWu/ECANet`'s `models/eca_module.py`) `eca_layer.forward`,
+# wired as `Conv -> eca_layer(k_size=3) -> Conv`, checker-passed: a spine
+# tensor's own three direct consumers are exactly `GlobalAveragePool`, the
+# closing `Mul`, and a `Shape` feeding an `Expand` that broadcasts the
+# single-channel gate back out to the spine's own full spatial shape. The
+# internal `Conv1d`'s own weight is architecturally fixed at exactly
+# ``[1, 1, k]`` -- independent of the spine's own channel count -- so the
+# whole subgraph contributes nothing to slicing bookkeeping at all, a pure
+# "hop over" case exactly like `SpatialGate`'s own diamond.
+def _eca_conv_pair_model(w1, w2, eca_w, b1=None, b2=None, k=3, spatial=8):
+    """`Conv -> {GlobalAveragePool -> Squeeze -> Transpose -> Conv1d ->
+    Transpose -> Unsqueeze -> Sigmoid} & {Shape -> Expand} -> Mul -> Conv` --
+    ECA-Net's `eca_layer`, the exact shape a real `torch.onnx.export`
+    (opset 17, legacy TorchScript-based exporter) emits. `eca_w` (shape
+    ``[1, 1, k]``) is the internal 1-D attention Conv's own weight,
+    architecturally independent of `w1`'s own output-channel count. `Squeeze`
+    resolves its own `axes` from the confirmed real export's own literal
+    value (``[3]``, the pooling step's own guaranteed-size-1 last axis of its
+    rank-4 output) and `Unsqueeze` from its own (``[-1]``) -- both forms
+    :func:`onnxsim.pruning._match_eca_gate_pass_through` recognizes (see its
+    own docstring). Built at `opset=17`, matching the confirmed exporter
+    output. All three Convs use "same" padding, so the spatial size never
+    changes end to end -- unlike `_spatial_gate_conv_pair_model`'s own
+    "valid"-padding main convs, nothing here needs separate input/output
+    spatial-size bookkeeping.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    pad = (k - 1) // 2
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(eca_w, "EcaW"),
+        onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "SqAxes"),
+        onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "UnsAxes"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1)"
+    if b2 is not None:
+        conv2 = "Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, W2, B2)"
+        initializer.append(_f32(b2, "B2"))
+    else:
+        conv2 = "Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, W2)"
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          {conv1}
+          gap = GlobalAveragePool(h)
+          sq = Squeeze(gap, SqAxes)
+          tr1 = Transpose<perm=[0,2,1]>(sq)
+          c1d = Conv<kernel_shape=[{k}], pads=[{pad},{pad}]>(tr1, EcaW)
+          tr2 = Transpose<perm=[0,2,1]>(c1d)
+          uns = Unsqueeze(tr2, UnsAxes)
+          gate = Sigmoid(uns)
+          hshape = Shape(h)
+          expanded = Expand(gate, hshape)
+          gated = Mul(h, expanded)
+          {conv2}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_eca_gate_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, same as every other Conv-chain hop's own
+    # oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model, verified end-to-end via
+    # onnxruntime. ECA's own internal `Conv1d`/`Sigmoid` subgraph is
+    # architecturally untouched by pruning (see this section's own comment),
+    # so the plain, ungrouped `_oracle_keep_indices_conv` top-k-by-L2-norm
+    # oracle applies directly, exactly as it does for `SpatialGate`.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(700)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    eca_w = rng.standard_normal((1, 1, 3)).astype(np.float32)
+    model = _eca_conv_pair_model(w1, w2, eca_w, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+    # ECA's own internal Conv1d is architecturally independent of the
+    # spine's own channel count -- untouched by pruning.
+    assert dims_after["EcaW"] == (1, 1, 3)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _eca_conv_pair_model(w1[keep], w2[:, keep], eca_w, b1=b1[keep])
+
+    rng_x = np.random.default_rng(701)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_eca_gate_stray_consumer_declines():
+    # A spine tensor read by a *fourth* consumer beyond the three ECA's own
+    # `eca_layer` needs (`GlobalAveragePool`, `Shape`, the closing `Mul`)
+    # isn't the recognized shape at all -- `_find_conv_chains`'s own
+    # producer-consumer-count gate (`{1, 2, 3, 5}`) already excludes it
+    # before `_match_eca_gate_pass_through` is ever tried. Declined outright,
+    # mirroring `test_structured_pruning_spatial_gate_stray_consumer_declines`
+    # above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(702)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    eca_w = rng.standard_normal((1, 1, 3)).astype(np.float32)
+    model = _eca_conv_pair_model(w1, w2, eca_w)
+    # Add a fourth, stray direct consumer of `h` (the producer Conv's own
+    # output) -- an otherwise-unused `Identity` node reading it.
+    stray = onnx.helper.make_node("Identity", ["h"], ["stray"])
+    model.graph.node.insert(1, stray)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["EcaW"], eca_w)
+
+
+def _spatial_gate_grn_eca_coexist_model(
+    w1_sg, w2_sg, sg_w, w1_grn, w2_grn, grn_weight, grn_bias, w1_eca, w2_eca, eca_w
+):
+    """One graph, three completely independent Conv chains sharing the same
+    input `X` -- one `SpatialGate`, one GRN, one ECA -- each built from
+    exactly the same node shapes `_spatial_gate_conv_pair_model`/
+    `_grn_conv_pair_model`/`_eca_conv_pair_model` each use in isolation, just
+    combined into one multi-output graph so a single `_find_conv_chains` call
+    dispatches all three shapes at once (see the coexistence test below for
+    why this matters). All three main Convs use "same" padding, exactly like
+    `_eca_conv_pair_model`'s own, so every branch keeps the same spatial size
+    throughout -- no separate bookkeeping needed per branch.
+    """
+    Cin = w1_sg.shape[1]
+    Cout = w2_sg.shape[0]
+    spatial = 8
+    initializer = [
+        _f32(w1_sg, "W1_SG"),
+        _f32(w2_sg, "W2_SG"),
+        _f32(sg_w, "SGW"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+        _f32(w1_grn, "W1_GRN"),
+        _f32(w2_grn, "W2_GRN"),
+        _f32(grn_weight.reshape(1, -1, 1, 1), "GrnWeight"),
+        _f32(grn_bias.reshape(1, -1, 1, 1), "GrnBias"),
+        _f32(np.array(1e-6, dtype=np.float32), "Eps"),
+        _f32(w1_eca, "W1_ECA"),
+        _f32(w2_eca, "W2_ECA"),
+        _f32(eca_w, "EcaW"),
+        onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "SqAxes"),
+        onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "UnsAxes"),
+    ]
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (
+            float[N,{Cout},{spatial},{spatial}] Y_SG,
+            float[N,{Cout},{spatial},{spatial}] Y_GRN,
+            float[N,{Cout},{spatial},{spatial}] Y_ECA)
+        {{
+          h_sg = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1_SG)
+          mx = ReduceMax<axes=[1], keepdims=0>(h_sg)
+          mxu = Unsqueeze(mx, AxesOne)
+          mn = ReduceMean<axes=[1], keepdims=0>(h_sg)
+          mnu = Unsqueeze(mn, AxesOne)
+          cat = Concat<axis=1>(mxu, mnu)
+          sgc = Conv<kernel_shape=[7,7], pads=[3,3,3,3]>(cat, SGW)
+          sgate = Sigmoid(sgc)
+          sg = Mul(h_sg, sgate)
+          Y_SG = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(sg, W2_SG)
+
+          h_grn = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1_GRN)
+          xg = ReduceL2<axes=[2,3], keepdims=1>(h_grn)
+          xgm = ReduceMean<axes=[1], keepdims=1>(xg)
+          denom = Add(xgm, Eps)
+          xn = Div(xg, denom)
+          scaled = Mul(h_grn, xn)
+          weighted = Mul(scaled, GrnWeight)
+          biased = Add(weighted, GrnBias)
+          grn_out = Add(h_grn, biased)
+          Y_GRN = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(grn_out, W2_GRN)
+
+          h_eca = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1_ECA)
+          gap = GlobalAveragePool(h_eca)
+          sq = Squeeze(gap, SqAxes)
+          tr1 = Transpose<perm=[0,2,1]>(sq)
+          c1d = Conv<kernel_shape=[3], pads=[1,1]>(tr1, EcaW)
+          tr2 = Transpose<perm=[0,2,1]>(c1d)
+          uns = Unsqueeze(tr2, UnsAxes)
+          gate = Sigmoid(uns)
+          hshape = Shape(h_eca)
+          expanded = Expand(gate, hshape)
+          gated = Mul(h_eca, expanded)
+          Y_ECA = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(gated, W2_ECA)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_spatial_gate_grn_eca_coexist_in_one_dispatch():
+    # Regression guard for the three-way `len(candidates) == 3` dispatch in
+    # `_walk_to_conv_consumer` (CBAM `SpatialGate`, GRN, and ECA-Net's own
+    # `eca_layer`, tried in that fixed order -- see `recognize_eca_gate`'s
+    # own docstring for why the three matchers' own required op-type sets
+    # are disjoint by construction, so at most one can ever match a given
+    # tensor's three consumers): one graph with three completely independent
+    # Conv chains, one of each shape, sharing the same input `X` -- proves
+    # admitting the third (ECA) shape doesn't mask or interfere with either
+    # of the first two, and that each of the three is still pruned exactly as
+    # it would be in isolation (mirroring
+    # `test_structured_pruning_cbam_channel_gate_alone_unaffected_by_spatial_gate_admission`
+    # above, generalized to all three shapes sharing this one dispatch).
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(703)
+    w1_sg = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w2_sg = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    w1_grn = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w2_grn = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    grn_weight = rng.standard_normal((C,)).astype(np.float32)
+    grn_bias = rng.standard_normal((C,)).astype(np.float32)
+    w1_eca = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w2_eca = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    eca_w = rng.standard_normal((1, 1, 3)).astype(np.float32)
+
+    model = _spatial_gate_grn_eca_coexist_model(
+        w1_sg,
+        w2_sg,
+        sg_w,
+        w1_grn,
+        w2_grn,
+        grn_weight,
+        grn_bias,
+        w1_eca,
+        w2_eca,
+        eca_w,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_chains
+
+    chains = _find_conv_chains(model.graph)
+    assert len(chains) == 3
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+
+    assert dims_after["W1_SG"][0] == C // 2
+    assert dims_after["W2_SG"][1] == C // 2
+    assert dims_after["SGW"] == (1, 2, 7, 7)
+
+    assert dims_after["W1_GRN"][0] == C // 2
+    assert dims_after["W2_GRN"][1] == C // 2
+    assert dims_after["GrnWeight"] == (1, C // 2, 1, 1)
+    assert dims_after["GrnBias"] == (1, C // 2, 1, 1)
+
+    assert dims_after["W1_ECA"][0] == C // 2
+    assert dims_after["W2_ECA"][1] == C // 2
+    assert dims_after["EcaW"] == (1, 1, 3)
+
+    keep_sg = _oracle_keep_indices_conv(w1_sg, C // 2)
+    keep_grn = _oracle_keep_indices_conv(w1_grn, C // 2)
+    keep_eca = _oracle_keep_indices_conv(w1_eca, C // 2)
+
+    oracle = _spatial_gate_grn_eca_coexist_model(
+        w1_sg[keep_sg],
+        w2_sg[:, keep_sg],
+        sg_w,
+        w1_grn[keep_grn],
+        w2_grn[:, keep_grn],
+        grn_weight[keep_grn],
+        grn_bias[keep_grn],
+        w1_eca[keep_eca],
+        w2_eca[:, keep_eca],
+        eca_w,
+    )
+
+    rng_x = np.random.default_rng(704)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    y_sg, y_grn, y_eca = _run(pruned, {"X": x})
+    y_sg_oracle, y_grn_oracle, y_eca_oracle = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_sg, y_sg_oracle, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_grn, y_grn_oracle, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_eca, y_eca_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Conv chain: Triplet Attention pass-through hop ---------------------------
 #
 # Triplet Attention (Misra et al. 2021, WACV, "Rotate to Attend: Convolutional
-# Triplet Attention Module", `LandskapeAI/triplet-attention`) -- a *fourth*
+# Triplet Attention Module", `LandskapeAI/triplet-attention`) -- a *fifth*
 # Conv-chain pass-through hop, recognized on a spine tensor forking into
 # *exactly five* direct consumers. See `onnxsim.pruning`'s own "Triplet
 # Attention" section comment and
@@ -12982,6 +13620,698 @@ def test_structured_pruning_cbam_channel_gate_declines_on_stray_three_consumer_f
     np.testing.assert_array_equal(inits["CONV2_W"], conv2_w)
     np.testing.assert_array_equal(inits["FC2_W"], fc2_w)
     np.testing.assert_array_equal(inits["SGW"], sg_w)
+
+
+# --- apply_structured_pruning: SKNet Selective Kernel (SK) attention chains -
+#
+# See onnxsim/pruning.py's own "SKNet Selective Kernel (SK) attention
+# chains" section comment for the exact topology matched and declined.
+# Confirmed against a real `torch.onnx.export` (opset 17) of a hand-written
+# module following the canonical `implus/SKNet`/`pppLang/SKNet` reference
+# implementation's own shape (M=2 branches) before this matcher was written.
+
+
+def _sk_conv_body(
+    Cin=3,
+    C=16,
+    d=4,
+    Cout=16,
+    spatial=8,
+    seed=0,
+    branch1_out=None,
+    dynamic_gather_idx=False,
+    prefix="",
+    input_name=None,
+    output_name=None,
+):
+    # `prefix`/`input_name`/`output_name` let a caller embed this topology
+    # alongside another, independent one in the same graph -- see
+    # `test_structured_pruning_sk_attention_coexists_with_plain_residual`
+    # below, which builds this SK block and an ordinary plain residual block
+    # side by side, sharing the same input `X`, mirroring
+    # `_coordatt_conv_model`'s own identical composability convention.
+    rng = np.random.default_rng(seed)
+    if branch1_out is None:
+        branch1_out = C
+    w_stem = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    b_stem = rng.standard_normal((C,)).astype(np.float32)
+    w_c0 = rng.standard_normal((C, C, 3, 3)).astype(np.float32)
+    w_c1 = rng.standard_normal((branch1_out, C, 3, 3)).astype(np.float32)
+    w_fc = rng.standard_normal((d, branch1_out, 1, 1)).astype(np.float32)
+    w_fcs0 = rng.standard_normal((branch1_out, d, 1, 1)).astype(np.float32)
+    b_fcs0 = rng.standard_normal((branch1_out,)).astype(np.float32)
+    w_fcs1 = rng.standard_normal((branch1_out, d, 1, 1)).astype(np.float32)
+    b_fcs1 = rng.standard_normal((branch1_out,)).astype(np.float32)
+    w_tail = rng.standard_normal((Cout, branch1_out, 3, 3)).astype(np.float32)
+    b_tail = rng.standard_normal((Cout,)).astype(np.float32)
+
+    p = prefix
+    x_name = p + "X" if input_name is None else input_name
+    y_name = p + "Y" if output_name is None else output_name
+    initializer = [
+        _f32(w_stem, f"{p}Wstem"),
+        _f32(b_stem, f"{p}Bstem"),
+        _f32(w_c0, f"{p}Wc0"),
+        _f32(w_c1, f"{p}Wc1"),
+        _f32(w_fc, f"{p}Wfc"),
+        _f32(w_fcs0, f"{p}Wfcs0"),
+        _f32(b_fcs0, f"{p}Bfcs0"),
+        _f32(w_fcs1, f"{p}Wfcs1"),
+        _f32(b_fcs1, f"{p}Bfcs1"),
+        _f32(w_tail, f"{p}Wtail"),
+        _f32(b_tail, f"{p}Btail"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), f"{p}UnsqAxis"),
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.int64), f"{p}Idx0"),
+    ]
+    dyn_idx_name = None
+    if dynamic_gather_idx:
+        dyn_idx_name = f"{p}DynIdx"
+        idx1 = dyn_idx_name
+    else:
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(1, dtype=np.int64), f"{p}Idx1")
+        )
+        idx1 = f"{p}Idx1"
+
+    body = f"""
+      {p}h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>({x_name}, {p}Wstem, {p}Bstem)
+      {p}f0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>({p}h0, {p}Wc0)
+      {p}f1 = Conv<kernel_shape=[3,3], pads=[2,2,2,2], dilations=[2,2]>({p}h0, {p}Wc1)
+      {p}u = Add({p}f0, {p}f1)
+      {p}s = ReduceMean<axes=[2,3], keepdims=1>({p}u)
+      {p}z0 = Conv<kernel_shape=[1,1]>({p}s, {p}Wfc)
+      {p}z = Relu({p}z0)
+      {p}l0 = Conv<kernel_shape=[1,1]>({p}z, {p}Wfcs0, {p}Bfcs0)
+      {p}l1 = Conv<kernel_shape=[1,1]>({p}z, {p}Wfcs1, {p}Bfcs1)
+      {p}u0 = Unsqueeze({p}l0, {p}UnsqAxis)
+      {p}u1 = Unsqueeze({p}l1, {p}UnsqAxis)
+      {p}stacked = Concat<axis=1>({p}u0, {p}u1)
+      {p}soft = Softmax<axis=1>({p}stacked)
+      {p}g0 = Gather<axis=1>({p}soft, {p}Idx0)
+      {p}g1 = Gather<axis=1>({p}soft, {idx1})
+      {p}m0 = Mul({p}f0, {p}g0)
+      {p}m1 = Mul({p}f1, {p}g1)
+      {p}combined = Add({p}m0, {p}m1)
+      {y_name} = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>({p}combined, {p}Wtail, {p}Btail)
+    """
+    return (
+        body,
+        initializer,
+        (
+            w_stem,
+            b_stem,
+            w_c0,
+            w_c1,
+            w_fc,
+            w_fcs0,
+            b_fcs0,
+            w_fcs1,
+            b_fcs1,
+            w_tail,
+            b_tail,
+        ),
+        dyn_idx_name,
+    )
+
+
+def _sk_conv_model(
+    Cin=3,
+    C=16,
+    d=4,
+    Cout=16,
+    spatial=8,
+    seed=0,
+    branch1_out=None,
+    dynamic_gather_idx=False,
+):
+    body, initializer, weights, dyn_idx_name = _sk_conv_body(
+        Cin=Cin,
+        C=C,
+        d=d,
+        Cout=Cout,
+        spatial=spatial,
+        seed=seed,
+        branch1_out=branch1_out,
+        dynamic_gather_idx=dynamic_gather_idx,
+    )
+    extra_input = f", int64 {dyn_idx_name}" if dyn_idx_name is not None else ""
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X{extra_input})
+            => (float[N,{Cout},{spatial},{spatial}] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    return (model,) + weights
+
+
+def _sk_keep_indices(w_stem, w_c0, w_c1, w_fcs0, w_fcs1, keep_count):
+    # The correct combined-importance ranking across all FIVE co-sliced
+    # producers -- root-sum-square of each one's own per-output-channel L2
+    # norm, exactly `_plain_structured_importance`'s own L2 combination
+    # formula generalized from a gated pair to five producers.
+    squared = np.zeros(w_stem.shape[0], dtype=np.float64)
+    for w in (w_stem, w_c0, w_c1, w_fcs0, w_fcs1):
+        squared += np.square(
+            np.linalg.norm(w.reshape(w.shape[0], -1).astype(np.float64), axis=1)
+        )
+    importance = np.sqrt(squared)
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_structured_pruning_sk_attention_matches_oracle():
+    Cin, C, d, Cout = 3, 16, 4, 16
+    (
+        model,
+        w_stem,
+        b_stem,
+        w_c0,
+        w_c1,
+        w_fc,
+        w_fcs0,
+        b_fcs0,
+        w_fcs1,
+        b_fcs1,
+        w_tail,
+        b_tail,
+    ) = _sk_conv_model(Cin=Cin, C=C, d=d, Cout=Cout, seed=900)
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_sk_attention_chains
+
+    assert len(_find_conv_sk_attention_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _sk_keep_indices(w_stem, w_c0, w_c1, w_fcs0, w_fcs1, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    np.testing.assert_array_equal(inits["Wstem"], w_stem[keep])
+    np.testing.assert_array_equal(inits["Bstem"], b_stem[keep])
+    # Both branch convs: co-sliced on BOTH axes -- their own OUTPUT axis
+    # (they feed the final combine, tied to the shared keep set) AND their
+    # own INPUT axis (they consume `stem`'s pruned output).
+    np.testing.assert_array_equal(inits["Wc0"], w_c0[keep][:, keep])
+    np.testing.assert_array_equal(inits["Wc1"], w_c1[keep][:, keep])
+    # `fc`'s own INPUT axis is sliced (it consumes `U`, now `keep`-wide);
+    # its own OUTPUT/bottleneck axis (`d`) is completely untouched.
+    np.testing.assert_array_equal(inits["Wfc"], w_fc[:, keep])
+    assert inits["Wfc"].shape[0] == d
+    # `fcs[0]`/`fcs[1]`: own OUTPUT axis sliced (the per-channel attention
+    # logit broadcasts back against a branch's own `keep`-wide output); own
+    # INPUT/bottleneck axis untouched.
+    np.testing.assert_array_equal(inits["Wfcs0"], w_fcs0[keep])
+    np.testing.assert_array_equal(inits["Bfcs0"], b_fcs0[keep])
+    np.testing.assert_array_equal(inits["Wfcs1"], w_fcs1[keep])
+    np.testing.assert_array_equal(inits["Bfcs1"], b_fcs1[keep])
+    # tail's own INPUT axis, sliced by the identical shared keep set.
+    np.testing.assert_array_equal(inits["Wtail"], w_tail[:, keep])
+    np.testing.assert_array_equal(inits["Btail"], b_tail)
+
+    rng = np.random.default_rng(901)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _sk_conv_model(Cin=Cin, C=C // 2, d=d, Cout=Cout, seed=900)
+    oracle_inits = {
+        "Wstem": w_stem[keep],
+        "Bstem": b_stem[keep],
+        "Wc0": w_c0[keep][:, keep],
+        "Wc1": w_c1[keep][:, keep],
+        "Wfc": w_fc[:, keep],
+        "Wfcs0": w_fcs0[keep],
+        "Bfcs0": b_fcs0[keep],
+        "Wfcs1": w_fcs1[keep],
+        "Bfcs1": b_fcs1[keep],
+        "Wtail": w_tail[:, keep],
+        "Btail": b_tail,
+    }
+    for init in oracle.graph.initializer:
+        if init.name in oracle_inits:
+            init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_sk_attention_declines_on_nonstatic_gather_index():
+    # SIMILAR but not quite the confirmed shape: the second Gather's own
+    # index is a genuine graph input (a runtime value), not a static scalar
+    # constant -- a legitimate, valid ONNX graph, just not the confirmed
+    # real SK shape (whose two Gathers always read a literal, exported
+    # branch-index constant). Locks in the conservative "decline outright,
+    # never partially slice" bar.
+    Cin, C, d, Cout = 3, 12, 4, 12
+    (
+        model,
+        w_stem,
+        b_stem,
+        w_c0,
+        w_c1,
+        w_fc,
+        w_fcs0,
+        b_fcs0,
+        w_fcs1,
+        b_fcs1,
+        w_tail,
+        b_tail,
+    ) = _sk_conv_model(Cin=Cin, C=C, d=d, Cout=Cout, seed=910, dynamic_gather_idx=True)
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_sk_attention_chains
+
+    assert _find_conv_sk_attention_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wstem"], w_stem)
+    np.testing.assert_array_equal(inits["Wc0"], w_c0)
+    np.testing.assert_array_equal(inits["Wc1"], w_c1)
+    np.testing.assert_array_equal(inits["Wtail"], w_tail)
+
+
+def test_structured_pruning_sk_attention_declines_on_branch_channel_mismatch():
+    # SIMILAR but not quite the confirmed shape: both branch convs agree
+    # with EACH OTHER (a valid `Add(f0, f1)`) but neither one's own
+    # in/out-channel count equals `stem`'s own `n_channels` -- not the
+    # confirmed "square, tied to n_channels throughout" SK shape. Locks in
+    # the conservative "decline outright" bar.
+    Cin, C, d, Cout = 3, 16, 4, 12
+    (
+        model,
+        w_stem,
+        b_stem,
+        w_c0,
+        w_c1,
+        w_fc,
+        w_fcs0,
+        b_fcs0,
+        w_fcs1,
+        b_fcs1,
+        w_tail,
+        b_tail,
+    ) = _sk_conv_model(Cin=Cin, C=C, d=d, Cout=Cout, seed=920, branch1_out=C - 4)
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_sk_attention_chains
+
+    assert _find_conv_sk_attention_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wstem"], w_stem)
+    np.testing.assert_array_equal(inits["Wc0"], w_c0)
+    np.testing.assert_array_equal(inits["Wc1"], w_c1)
+
+
+def test_structured_pruning_sk_attention_coexists_with_plain_residual():
+    # Confirmed empirically (see onnxsim/pruning.py's own section comment)
+    # that `_find_conv_residual_chains` never (mis)matches either of an SK
+    # block's own two `Add`s -- both prospective groups fail to resolve
+    # their own extra fan-out (the branch's own combine `Mul`) or their own
+    # backward walk (the closing cross-branch gate `Mul`). This test locks
+    # that in end-to-end, in the SAME graph and the SAME
+    # `apply_structured_pruning` call as an ordinary plain residual block
+    # sharing the same input `X`: both must be pruned correctly, each by
+    # exactly the finder meant for it.
+    Cin, S = 3, 8
+
+    sk_C, sk_d, sk_Cout = 16, 4, 16
+    sk_body, sk_initializer, sk_weights, _ = _sk_conv_body(
+        Cin=Cin,
+        C=sk_C,
+        d=sk_d,
+        Cout=sk_Cout,
+        spatial=S,
+        seed=930,
+        prefix="sk_",
+        input_name="X",
+        output_name="SkY",
+    )
+    (
+        sk_w_stem,
+        sk_b_stem,
+        sk_w_c0,
+        sk_w_c1,
+        sk_w_fc,
+        sk_w_fcs0,
+        sk_b_fcs0,
+        sk_w_fcs1,
+        sk_b_fcs1,
+        sk_w_tail,
+        sk_b_tail,
+    ) = sk_weights
+
+    res_C, res_Cout = 16, 8
+    rng = np.random.default_rng(931)
+    res_w_f = rng.standard_normal((res_C, Cin, 3, 3)).astype(np.float32)
+    res_w_s = rng.standard_normal((res_C, Cin, 3, 3)).astype(np.float32)
+    res_w_out = rng.standard_normal((res_Cout, res_C, 3, 3)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[N,{Cin},{S},{S}] X) => (
+            float[N,{sk_Cout},{S},{S}] SkY,
+            float[N,{res_Cout},{S - 4},{S - 4}] ResY
+        )
+        {{
+          {sk_body}
+          res_f = Conv<kernel_shape=[3,3]>(X, ResWF)
+          res_s = Conv<kernel_shape=[3,3]>(X, ResWS)
+          res_add = Add(res_f, res_s)
+          res_r = Relu(res_add)
+          ResY = Conv<kernel_shape=[3,3]>(res_r, ResWOUT)
+        }}
+        """,
+        initializer=sk_initializer
+        + [
+            _f32(res_w_f, "ResWF"),
+            _f32(res_w_s, "ResWS"),
+            _f32(res_w_out, "ResWOUT"),
+        ],
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import (
+        _find_conv_residual_chains,
+        _find_conv_sk_attention_chains,
+    )
+
+    assert len(_find_conv_sk_attention_chains(model.graph)) == 1
+    assert len(_find_conv_residual_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    sk_keep = _sk_keep_indices(
+        sk_w_stem, sk_w_c0, sk_w_c1, sk_w_fcs0, sk_w_fcs1, sk_C // 2
+    )
+    np.testing.assert_array_equal(inits["sk_Wstem"], sk_w_stem[sk_keep])
+    np.testing.assert_array_equal(inits["sk_Wc0"], sk_w_c0[sk_keep][:, sk_keep])
+    np.testing.assert_array_equal(inits["sk_Wc1"], sk_w_c1[sk_keep][:, sk_keep])
+    np.testing.assert_array_equal(inits["sk_Wtail"], sk_w_tail[:, sk_keep])
+
+    res_importance = np.sqrt(
+        np.square(np.linalg.norm(res_w_f.reshape(res_C, -1).astype(np.float64), axis=1))
+        + np.square(
+            np.linalg.norm(res_w_s.reshape(res_C, -1).astype(np.float64), axis=1)
+        )
+    )
+    res_keep = np.sort(np.argsort(-res_importance)[: res_C // 2])
+    np.testing.assert_array_equal(inits["ResWF"], res_w_f[res_keep])
+    np.testing.assert_array_equal(inits["ResWS"], res_w_s[res_keep])
+    np.testing.assert_array_equal(inits["ResWOUT"], res_w_out[:, res_keep])
+
+    rng = np.random.default_rng(932)
+    x = rng.standard_normal((2, Cin, S, S)).astype(np.float32)
+    (y_sk, y_res) = _run(pruned, {"X": x})
+    assert y_sk.shape == (2, sk_Cout, S, S)
+    assert y_res.shape == (2, res_Cout, S - 4, S - 4)
+
+
+# --- apply_structured_pruning: GCNet ContextBlock (channel-add attention) --
+#
+# See onnxsim/pruning.py's own "GCNet ContextBlock (channel-add attention)
+# chains" section comment for the full confirmed topology
+# (`torch.onnx.export`, opset 17, of a verbatim `xvjiarui/GCNet`/
+# `mmcv.cnn.ContextBlock` reproduction, `pooling_type='att',
+# fusion_types=('channel_add',)`) this section's tests exercise.
+
+
+def _gc_context_keep_indices(w0, w2c, keep_count):
+    # Combined (root-sum-square) importance of P's own [C, Cin, kH, kW]
+    # filter and channel_add_conv.2's own [C, planes, 1, 1] filter --
+    # mirroring `_se_conv_keep_indices`'s identical two-producer formula,
+    # just combined via the block's own closing `Add` rather than SE-gate's
+    # `Mul` (irrelevant to the importance formula either way -- see
+    # `_plain_structured_importance`'s own docstring).
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(w0.reshape(w0.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(w2c.reshape(w2c.shape[0], -1).astype(np.float64), axis=1)
+        )
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _gc_context_conv_model(Cin=3, C=16, planes=4, Cout=5, spatial=8, seed=0):
+    """`Conv -> ContextBlock -> Conv` -- GCNet's own channel-add attention
+    block, the exact shape a real `torch.onnx.export` (opset 17, legacy
+    exporter) emits for `pooling_type='att', fusion_types=('channel_add',)`.
+    Batch is fixed at 1 -- exactly the confirmed real export's own shape,
+    where `batch` (like `channel`) is read via `x.size(0)` and traced as a
+    literal Python int no differently than `channel` is (see this module's
+    own "GCNet ContextBlock" section comment for why neither is a
+    `Shape`-derived tensor).
+    """
+    rng = np.random.default_rng(seed)
+    hw = spatial * spatial
+    w0 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    b0 = rng.standard_normal((C,)).astype(np.float32)
+    wmask = rng.standard_normal((1, C, 1, 1)).astype(np.float32)
+    bmask = rng.standard_normal((1,)).astype(np.float32)
+    w0b = rng.standard_normal((planes, C, 1, 1)).astype(np.float32)
+    b0b = rng.standard_normal((planes,)).astype(np.float32)
+    ln_scale = rng.standard_normal((planes, 1, 1)).astype(np.float32)
+    ln_bias = rng.standard_normal((planes, 1, 1)).astype(np.float32)
+    w2c = rng.standard_normal((C, planes, 1, 1)).astype(np.float32)
+    b2c = rng.standard_normal((C,)).astype(np.float32)
+    w3 = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    b3 = rng.standard_normal((Cout,)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,{Cin},{spatial},{spatial}] X) => (float[1,{Cout},{spatial},{spatial}] Y)
+        {{
+          spine = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W0, B0)
+          ix = Reshape(spine, Shape1)
+          ix1 = Unsqueeze(ix, AxesOne)
+          cm = Conv<kernel_shape=[1,1]>(spine, Wmask, Bmask)
+          cm2 = Reshape(cm, Shape2)
+          cm3 = Softmax<axis=2>(cm2)
+          cm4 = Unsqueeze(cm3, AxesNegOne)
+          ctxraw = MatMul(ix1, cm4)
+          ctx = Reshape(ctxraw, Shape3)
+          c0 = Conv<kernel_shape=[1,1]>(ctx, W0b, B0b)
+          ln = LayerNormalization<axis=-3>(c0, LNScale, LNBias)
+          rl = Relu(ln)
+          c2 = Conv<kernel_shape=[1,1]>(rl, W2c, B2c)
+          blk = Add(spine, c2)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(blk, W3, B3)
+        }}
+        """,
+        initializer=[
+            _f32(w0, "W0"),
+            _f32(b0, "B0"),
+            _f32(wmask, "Wmask"),
+            _f32(bmask, "Bmask"),
+            _f32(w0b, "W0b"),
+            _f32(b0b, "B0b"),
+            _f32(ln_scale, "LNScale"),
+            _f32(ln_bias, "LNBias"),
+            _f32(w2c, "W2c"),
+            _f32(b2c, "B2c"),
+            _f32(w3, "W3"),
+            _f32(b3, "B3"),
+            onnx.numpy_helper.from_array(
+                np.array([1, C, hw], dtype=np.int64), "Shape1"
+            ),
+            onnx.numpy_helper.from_array(
+                np.array([1, 1, hw], dtype=np.int64), "Shape2"
+            ),
+            onnx.numpy_helper.from_array(
+                np.array([1, C, 1, 1], dtype=np.int64), "Shape3"
+            ),
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "AxesNegOne"),
+        ],
+        opset=17,
+    )
+    return model, w0, b0, wmask, bmask, w0b, b0b, ln_scale, ln_bias, w2c, b2c, w3, b3
+
+
+def test_structured_pruning_gc_context_matches_oracle():
+    Cin, C, planes, Cout = 3, 16, 4, 5
+    (
+        model,
+        w0,
+        b0,
+        wmask,
+        bmask,
+        w0b,
+        b0b,
+        ln_scale,
+        ln_bias,
+        w2c,
+        b2c,
+        w3,
+        b3,
+    ) = _gc_context_conv_model(Cin=Cin, C=C, planes=planes, Cout=Cout)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _gc_context_keep_indices(w0, w2c, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # P's own output channels, sliced.
+    np.testing.assert_array_equal(inits["W0"], w0[keep])
+    np.testing.assert_array_equal(inits["B0"], b0[keep])
+    # channel_add_conv.2's own OUTPUT channels, sliced by the SAME keep set
+    # -- it's added back onto spine's own surviving channels.
+    np.testing.assert_array_equal(inits["W2c"], w2c[keep])
+    np.testing.assert_array_equal(inits["B2c"], b2c[keep])
+    # conv_mask's own INPUT channels, re-sliced by the identical shared keep
+    # set -- its own single output channel (the pooling mask) is untouched.
+    np.testing.assert_array_equal(inits["Wmask"], wmask[:, keep])
+    np.testing.assert_array_equal(inits["Bmask"], bmask)
+    assert inits["Wmask"].shape[0] == 1
+    # channel_add_conv.0's own INPUT channels, re-sliced too -- its own
+    # bottleneck OUTPUT axis (`planes`) and the LayerNorm scale/bias astride
+    # it are completely untouched.
+    np.testing.assert_array_equal(inits["W0b"], w0b[:, keep])
+    assert inits["W0b"].shape[0] == planes
+    np.testing.assert_array_equal(inits["B0b"], b0b)
+    np.testing.assert_array_equal(inits["LNScale"], ln_scale)
+    np.testing.assert_array_equal(inits["LNBias"], ln_bias)
+    # the real downstream consumer's own input channels, sliced.
+    np.testing.assert_array_equal(inits["W3"], w3[:, keep])
+    np.testing.assert_array_equal(inits["B3"], b3)
+    # the two literal-channel-count Reshape targets are rewritten in place
+    # to the new, post-pruning channel count -- not left stale.
+    new_c = keep.size
+    np.testing.assert_array_equal(inits["Shape1"], [1, new_c, 8 * 8])
+    np.testing.assert_array_equal(inits["Shape2"], [1, 1, 8 * 8])  # untouched
+    np.testing.assert_array_equal(inits["Shape3"], [1, new_c, 1, 1])
+
+    x = np.random.default_rng(500).standard_normal((1, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _gc_context_conv_model(Cin=Cin, C=C // 2, planes=planes, Cout=Cout)
+    oracle_inits = {
+        "W0": w0[keep],
+        "B0": b0[keep],
+        "Wmask": wmask[:, keep],
+        "Bmask": bmask,
+        "W0b": w0b[:, keep],
+        "B0b": b0b,
+        "LNScale": ln_scale,
+        "LNBias": ln_bias,
+        "W2c": w2c[keep],
+        "B2c": b2c[keep],
+        "W3": w3[:, keep],
+        "B3": b3,
+    }
+    for init in oracle.graph.initializer:
+        if init.name in oracle_inits:
+            init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_gc_context_declines_on_gate_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: channel_add_conv.2's own
+    # final Conv outputs a single (broadcastable) channel instead of one
+    # matching `spine`'s own `C` -- a legitimate, valid ONNX `Add` broadcast,
+    # but not the exact shape this section's own matcher requires
+    # (channel_add_conv.2's own output-channel count must equal `spine`'s
+    # exactly). Locks in the conservative "decline outright, never partially
+    # slice" bar -- mirroring `test_structured_pruning_se_gate_declines_on_
+    # gate_channel_count_mismatch`'s own identical trick for SE-gate's fc2.
+    Cin, C, planes, Cout = 3, 16, 4, 5
+    model, w0, b0, wmask, bmask, w0b, b0b, ln_scale, ln_bias, w2c, b2c, w3, b3 = (
+        _gc_context_conv_model(Cin=Cin, C=C, planes=planes, Cout=Cout)
+    )
+    rng = np.random.default_rng(13)
+    w2c_bad = rng.standard_normal((1, planes, 1, 1)).astype(np.float32)
+    b2c_bad = rng.standard_normal((1,)).astype(np.float32)
+    for init in model.graph.initializer:
+        if init.name == "W2c":
+            init.CopyFrom(_f32(w2c_bad, "W2c"))
+        elif init.name == "B2c":
+            init.CopyFrom(_f32(b2c_bad, "B2c"))
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_gc_context_chains
+
+    assert _find_conv_gc_context_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], w0)
+    np.testing.assert_array_equal(inits["W3"], w3)
+    np.testing.assert_array_equal(inits["W2c"], w2c_bad)
+    np.testing.assert_array_equal(inits["Wmask"], wmask)
+
+
+def test_structured_pruning_gc_context_coexists_with_spatial_gate():
+    # Two entirely independent chains, sharing no nodes/weights, in ONE
+    # graph: a GCNet ContextBlock and a CBAM SpatialGate (see
+    # `_spatial_gate_conv_pair_model` above) -- both must resolve and prune
+    # correctly via a single `apply_structured_pruning` call, confirming
+    # `_find_conv_gc_context_chains` (a brand-new top-level finder) neither
+    # collides with nor is shadowed by `_walk_to_conv_consumer`'s own
+    # existing `recognize_spatial_gate` three-consumer dispatch point.
+    Cin, C, planes, Cout = 3, 16, 4, 5
+    (
+        gc_model,
+        gc_w0,
+        gc_b0,
+        gc_wmask,
+        gc_bmask,
+        gc_w0b,
+        gc_b0b,
+        gc_ln_scale,
+        gc_ln_bias,
+        gc_w2c,
+        gc_b2c,
+        gc_w3,
+        gc_b3,
+    ) = _gc_context_conv_model(Cin=Cin, C=C, planes=planes, Cout=Cout, seed=42)
+
+    rng = np.random.default_rng(43)
+    sg_w1 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    sg_w2 = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    sg_gate_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sg_model = _spatial_gate_conv_pair_model(sg_w1, sg_w2, sg_gate_w, spatial=12)
+
+    combined = onnx.compose.merge_models(
+        gc_model,
+        sg_model,
+        io_map=[],
+        prefix1="gc_",
+        prefix2="sg_",
+    )
+    onnx.checker.check_model(combined)
+
+    pruned = onnxsim.apply_structured_pruning(combined, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    gc_keep = _gc_context_keep_indices(gc_w0, gc_w2c, C // 2)
+    np.testing.assert_array_equal(inits["gc_W0"], gc_w0[gc_keep])
+    np.testing.assert_array_equal(inits["gc_W2c"], gc_w2c[gc_keep])
+    np.testing.assert_array_equal(inits["gc_Wmask"], gc_wmask[:, gc_keep])
+    np.testing.assert_array_equal(inits["gc_W3"], gc_w3[:, gc_keep])
+
+    # SpatialGate's own producer/consumer are pruned by their own,
+    # completely independent keep set (no shared weight with the GC block
+    # above) -- just confirm the shapes actually shrank, matching the
+    # standalone SpatialGate oracle test's own bar.
+    assert inits["sg_W1"].shape[0] == C - round(C * 0.5)
+    assert inits["sg_W2"].shape[1] == C - round(C * 0.5)
 
 
 # --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----

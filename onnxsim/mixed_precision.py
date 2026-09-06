@@ -45,6 +45,7 @@ the same backend :mod:`onnxsim.spinquant`/:mod:`onnxsim.spqr` already use).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
@@ -53,6 +54,13 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
+
+# onnxsim.accuracy does not import anything from this module (checked by
+# grep), so this is not a cycle -- it is in fact the reverse of
+# onnxsim/__init__.py's own import order (`accuracy` is imported well before
+# `mixed_precision`), so `onnxsim.accuracy` is already fully initialized in
+# `sys.modules` by the time this module is loaded as part of `import onnxsim`.
+from onnxsim.accuracy import AccuracyDropReport, measure_accuracy_drop
 from onnxsim.adaround import _pack_int4
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
@@ -299,3 +307,157 @@ def apply_mixed_precision_quantization(
         del graph.node[node_idx + len(new_nodes)]
 
     return out
+
+
+DEFAULT_SEARCH_FRACTIONS: Sequence[float] = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)
+"""Default ``fractions`` sweep for :func:`search_mixed_precision_for_budget`,
+front-loaded towards small ``high_bits_fraction`` values (dense near 0,
+sparse near 1). Most of the compression benefit of mixed precision comes
+from keeping ``high_bits_fraction`` small -- only the few outlier-sensitive
+layers actually need INT8 -- so most models that can meet a reasonable
+accuracy budget at all will meet it at one of these early, small fractions.
+Trying small fractions first lets the search stop (see
+:func:`search_mixed_precision_for_budget`'s early-stopping) after as few
+:func:`onnxsim.accuracy.measure_accuracy_drop` calls as possible, since each
+one re-runs both the float and quantized model on every calibration sample.
+"""
+
+
+@dataclass
+class MixedPrecisionSearchResult:
+    """One :func:`search_mixed_precision_for_budget` result: the winning (or,
+    if none met the budget, least-lossy -- i.e. highest ``high_bits_fraction``
+    -- one tried) fraction, its measured accuracy drop, and the model already
+    quantized with it. Mirrors :class:`onnxsim.accuracy.QuantizationRecommendation`'s
+    shape, adapted to a search over ``high_bits_fraction`` within the mixed-
+    precision scheme rather than over whole quantization schemes.
+    """
+
+    high_bits_fraction: float
+    report: AccuracyDropReport
+    quantized_model: onnx.ModelProto
+    meets_budget: bool
+    fractions_tried: List[float]
+
+
+def search_mixed_precision_for_budget(
+    model: Union[str, onnx.ModelProto],
+    accuracy_budget: float = 0.02,
+    fractions: Optional[Sequence[float]] = None,
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    block_size: int = 32,
+    providers: Optional[Sequence[str]] = None,
+) -> MixedPrecisionSearchResult:
+    """Accuracy-aware search over :func:`apply_mixed_precision_quantization`'s
+    own ``high_bits_fraction`` parameter: tries ``fractions`` in order
+    (default :data:`DEFAULT_SEARCH_FRACTIONS`, smallest -- most compressed --
+    first), stopping as soon as one fraction's measured accuracy drop
+    (:func:`onnxsim.accuracy.measure_accuracy_drop`) meets ``accuracy_budget``.
+
+    This is the "iterate until target met" control loop described as the
+    missing piece over :func:`apply_mixed_precision_quantization`'s own
+    single-shot per-layer sensitivity dispatcher -- promoting more of the
+    most-sensitive layers to INT8 (by trying larger and larger
+    ``high_bits_fraction`` values) until the model's *actual measured*
+    accuracy drop, not just its estimated per-layer sensitivity score, is
+    under budget. It is not a replacement for
+    :func:`onnxsim.accuracy.recommend_quantization`, which searches across
+    whole quantization *schemes* rather than per-layer bit-width assignment
+    within this one scheme.
+
+    ``calibration_data`` is generated once (if not supplied) and reused,
+    unchanged, for every fraction tried -- both to quantize
+    (:func:`apply_mixed_precision_quantization`'s own sensitivity ranking)
+    and to measure (:func:`onnxsim.accuracy.measure_accuracy_drop`). Measuring
+    every fraction against the same data is what makes their accuracy drops
+    comparable at all; regenerating fresh random data per fraction would make
+    each measurement a comparison against different noise.
+
+    If ``model`` has no eligible mixed-precision candidate,
+    :func:`apply_mixed_precision_quantization` returns it unchanged
+    regardless of ``high_bits_fraction`` -- every fraction would measure the
+    same (no-op) accuracy drop, so this doesn't special-case that: it simply
+    tries ``fractions`` in order as usual and stops at ``fractions[0]``
+    (typically meeting even a tight budget, since nothing was quantized) or
+    proceeds through the full list if ``fractions[0]`` itself doesn't meet
+    budget for some other reason (e.g. an already-embedded quantization
+    error in ``model``, or an unreasonably tight ``accuracy_budget``).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param accuracy_budget: maximum acceptable worst-case relative L2 error
+            (see :attr:`onnxsim.accuracy.AccuracyDropReport.worst_relative_l2`)
+            for a fraction to be accepted
+    :param fractions: ``high_bits_fraction`` values to try, in the order
+            given -- defaults to :data:`DEFAULT_SEARCH_FRACTIONS`. Must be
+            non-empty. Not required to be sorted, but since the search stops
+            at the first fraction that meets budget, an order other than
+            increasing-fraction defeats the "stop as early as possible on the
+            most-compressed option" intent
+    :param calibration_data: representative input batches, used both to rank
+            per-layer sensitivity (:func:`apply_mixed_precision_quantization`)
+            and to measure accuracy drop
+            (:func:`onnxsim.accuracy.measure_accuracy_drop`) at every
+            fraction tried. See :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted) and
+            :func:`onnxsim.load_huggingface_calibration_data` (real data, a
+            more representative search than random input)
+    :param num_samples: random batches to generate when ``calibration_data``
+            is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param block_size: elements per quantization block, forwarded to
+            :func:`apply_mixed_precision_quantization` for every fraction
+            tried
+    :param providers: onnxruntime execution providers to calibrate/measure on
+    :returns: the winning (or, if none met budget, last-tried) fraction's
+            result. ``result.fractions_tried`` lists every fraction actually
+            measured, in the order tried, so a caller can tell e.g. that only
+            ``fractions[0]`` was needed
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if fractions is None:
+        fractions = DEFAULT_SEARCH_FRACTIONS
+    if not fractions:
+        raise ValueError("`fractions` must be non-empty")
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    fractions_tried: List[float] = []
+    result: Optional[MixedPrecisionSearchResult] = None
+    for frac in fractions:
+        fractions_tried.append(frac)
+        quantized = apply_mixed_precision_quantization(
+            model,
+            calibration_data=calibration_data,
+            num_samples=num_samples,
+            seed=seed,
+            high_bits_fraction=frac,
+            block_size=block_size,
+            providers=providers,
+        )
+        report = measure_accuracy_drop(
+            model,
+            quantized,
+            calibration_data=calibration_data,
+            num_samples=num_samples,
+            seed=seed,
+            providers=providers,
+        )
+        meets_budget = report.all_finite and report.worst_relative_l2 < accuracy_budget
+        result = MixedPrecisionSearchResult(
+            high_bits_fraction=frac,
+            report=report,
+            quantized_model=quantized,
+            meets_budget=meets_budget,
+            fractions_tried=list(fractions_tried),
+        )
+        if meets_budget:
+            return result
+
+    assert result is not None  # `fractions` was checked non-empty above
+    return result

@@ -2457,31 +2457,69 @@ def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
         assert all(r <= 1.8 for k, r in ratios.items() if k != peak), (prefix, ratios)
 
 
-def _tokenize_mcode(mcode, start=297):
+_WIDE_TAGS = frozenset(
+    {0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x89, 0x8A, 0x8B, 0x8C, 0x8D}
+    | {0x94, 0x95, 0x9B, 0x9C, 0x9D, 0x9F}
+)
+"""The 17 short-unit tag bytes that beat a shuffled *explained-bytes* null
+by >= 2x in both real models -- the README's "Fourth correction" section.
+Superseded by `_ALL_TAGS`: the fifth correction's conditional-parity test
+showed the rejected tags were false rejections of rare forms."""
+
+_VERBS6 = frozenset(_VERBS | {0xA7})
+"""The five verbs plus `a7`, the segment-marker verb every stream segment
+opens with and `llm_build` op programs use freely -- see the README's "The
+tail is the segment table" section. Pass as `verbs=` to `_tokenize_mcode`."""
+
+_ALL_TAGS = frozenset(range(0x81, 0xA0))
+"""Every byte below the verb range: the full short-unit tag set. For every
+tag the byte after it is even in ~100% of real units against ~60% shuffled
+-- see the README's "Fifth correction" section."""
+
+
+def _tokenize_mcode(
+    mcode,
+    start=297,
+    end=None,
+    tags=None,
+    pmax=3,
+    bare=False,
+    extra_byte_tags=frozenset(),
+    verbs=None,
+):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
-    verb instructions and the width-rule short units `[p][p+1 bytes][0x84-p]
-    [value]` (p+4 bytes) -- stepping one unknown byte otherwise. Returns
-    `(byte_offset, kind, a, b, c)` tuples: kind 'V' (a=verb, b=xx, c=yy),
-    'S' (a=prefix, b=tag, c=field) or '?' (a=byte). See the README's "The
-    layout that explains all of it" section."""
-    tags = set(range(0x81, 0x85))
-    end = len(mcode) - 252
+    verb instructions, the width-rule short units `[p][p+1 bytes][tag]
+    [register]` (p+4 bytes) and, with `bare=True`, the payload-less 2-byte
+    `[tag][register]` pair -- stepping one unknown byte otherwise. Units
+    whose tag is in `extra_byte_tags` take one extra trailing byte (the
+    sixth correction: tag 0x9f). Returns `(byte_offset, kind, a, b, c)`
+    tuples: kind 'V' (a=verb, b=xx, c=yy), 'S' (a=prefix, b=tag, c=first
+    payload byte), 'B' (a=tag, b=register) or '?' (a=byte). The defaults
+    (tags 0x81..0x84, p <= 3, no bare pairs, no extra bytes, stop 252 bytes
+    before the end) are the original narrow rule; `tags=_ALL_TAGS, pmax=4,
+    bare=True, extra_byte_tags={0x9F}` is the corrected one. See the
+    README's "The layout that explains all of it" and "Fourth" .. "Sixth
+    correction" sections."""
+    tags = set(range(0x81, 0x85)) if tags is None else set(tags)
+    extra_byte_tags = set(extra_byte_tags)
+    verbs = _VERBS if verbs is None else frozenset(verbs)
+    end = len(mcode) - 252 if end is None else end
 
     def is_verb(i):
         return (
             i + 3 < len(mcode)
-            and mcode[i] in _VERBS
+            and mcode[i] in verbs
             and mcode[i + 1] == 0
             and mcode[i + 2] % 0x10 == 0
         )
 
     def short_len(i):
+        if i >= len(mcode):
+            return 0
         p = mcode[i]
-        return (
-            p + 4
-            if (p <= 3 and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags)
-            else 0
-        )
+        if p <= pmax and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags:
+            return p + 4 + (1 if mcode[i + p + 2] in extra_byte_tags else 0)
+        return 0
 
     out, i = [], start
     while i < end:
@@ -2498,6 +2536,9 @@ def _tokenize_mcode(mcode, start=297):
         elif short_len(i):
             n = short_len(i)
             out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
+        elif bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
+            n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
+            out.append((i, "B", mcode[i], mcode[i + 1], 0))
         else:
             n = 1
             out.append((i, "?", mcode[i], 0, 0))
@@ -2593,3 +2634,695 @@ def test_resnet18d_config_block_b_residue_is_structured_and_headed(tmp_path):
     assert top_pair[1] == 0 and top_pair[0] in {0x23, 0x16, 0x03, 0x04, 0x01, 0x00}, (
         top_pair.hex()
     )
+
+
+def test_resnet18d_short_form_tags_are_seventeen_wide_and_trail_a_register(tmp_path):
+    """Confirmed real (see the README's "Fourth correction" section), on a
+    fresh resnet18d build with a fixed-seed shuffled null of config block B:
+    the 17-tag width rule explains most of the block where the 4-tag rule
+    explains under half; the byte after the tag is even in >= 99.5% of
+    units (a 2-byte-granular register) while the first payload byte is at
+    the background rate; `23` is a prefix byte sitting directly before
+    ordinary units; the payload-less `[tag][register]` pair is real (its
+    second byte is even in >= 99% of 2-byte tag-led residue runs -- the
+    fifth correction's claim, replacing the fourth's "null-level" verdict
+    that rested on the wrong null); and blocks A and B share a 158-byte
+    prologue. No device.
+    """
+    import random
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    a_lo, lo, hi = narrow[cuts[0]][0], narrow[cuts[1]][0], narrow[cuts[2]][0]
+    assert mcode[a_lo : a_lo + 158] == mcode[lo : lo + 158]
+    block = mcode[lo:hi]
+    shuffled = bytearray(block)
+    random.Random(0).shuffle(shuffled)
+    shuffled = bytes(shuffled)
+
+    def explained(blob, tags, pmax):
+        toks = _tokenize_mcode(blob, start=0, end=len(blob), tags=tags, pmax=pmax)
+        return 1 - sum(1 for t in toks if t[1] == "?") / len(blob), toks
+
+    e_narrow, _ = explained(block, None, 3)
+    e_wide, toks = explained(block, _WIDE_TAGS, 4)
+    e_null, null_toks = explained(shuffled, _WIDE_TAGS, 4)
+    assert e_narrow < 0.5 < 0.7 < e_wide and e_wide / e_null >= 3.0, (
+        e_narrow,
+        e_wide,
+        e_null,
+    )
+
+    units = [(o, p) for o, k, p, *_ in toks if k == "S"]
+    assert len(units) > 2000, len(units)
+    trailing_even = sum(1 for o, p in units if block[o + p + 3] % 2 == 0) / len(units)
+    payload_even = sum(1 for o, p in units if block[o + 1] % 2 == 0) / len(units)
+    assert trailing_even >= 0.995 and payload_even <= 0.75, (
+        trailing_even,
+        payload_even,
+    )
+
+    starts = {o for o, _ in units}
+    prefixed = sum(
+        1 for o, k, a, *_ in toks if k == "?" and a == 0x23 and o + 1 in starts
+    )
+    assert prefixed >= 100, prefixed
+
+    def bare_pairs(blob, toks):
+        runs, last = [], None
+        for o, k, *_ in toks:
+            if k == "?":
+                if last == o:
+                    runs[-1][1] = o + 1
+                else:
+                    runs.append([o, o + 1])
+                last = o + 1
+        pairs = [blob[a + 1] for a, b in runs if b - a == 2 and blob[a] in _ALL_TAGS]
+        return len(pairs), sum(1 for x in pairs if x % 2 == 0)
+
+    n_real, even_real = bare_pairs(block, toks)
+    assert n_real >= 100 and even_real >= 0.99 * n_real, (n_real, even_real)
+    n_null, even_null = bare_pairs(shuffled, null_toks)
+    assert even_null <= 0.85 * n_null + 2, (n_null, even_null)
+
+
+def test_resnet18d_every_tag_and_the_bare_pair_pass_the_parity_null(tmp_path):
+    """Confirmed real (see the README's "Fifth correction" section), on a
+    fresh resnet18d build with a fixed-seed shuffled null of config block
+    B: with every byte in 0x81..0x9f admitted as a tag, the trailing byte
+    is even in >= 95% of units for *every* tag with n >= 20 (~60% when the
+    block is shuffled); with bare `[tag][register]` pairs admitted too the
+    block is >= 90% explained; `e1 XX` pairs have odd XX in every case;
+    and the residue is dominated by 1-byte prefixes that sit directly
+    before a unit. No device.
+    """
+    import random
+    from collections import defaultdict
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    lo, hi = narrow[cuts[1]][0], narrow[cuts[2]][0]
+    block = mcode[lo:hi]
+    shuffled = bytearray(block)
+    random.Random(0).shuffle(shuffled)
+    shuffled = bytes(shuffled)
+
+    def per_tag_even(blob):
+        toks = _tokenize_mcode(blob, start=0, end=len(blob), tags=_ALL_TAGS, pmax=4)
+        per = defaultdict(lambda: [0, 0])
+        for o, k, p, tag, _ in toks:
+            if k == "S":
+                per[tag][0] += 1
+                per[tag][1] += blob[o + p + 3] % 2 == 0
+        return per
+
+    real, null = per_tag_even(block), per_tag_even(shuffled)
+    tested = [t for t, (n, _) in real.items() if n >= 20]
+    assert len(tested) >= 15 and {0x87, 0x88, 0x8E, 0x92} <= set(tested), tested
+    for t in tested:
+        n, ev = real[t]
+        # 0x9c sits at 47/48 on this build -- one miss, well above the ~60% null.
+        assert ev >= 0.95 * n, (hex(t), n, ev)
+    null_even = sum(ev for n, ev in null.values()) / sum(n for n, ev in null.values())
+    assert null_even <= 0.8, null_even
+
+    toks = _tokenize_mcode(
+        block, start=0, end=len(block), tags=_ALL_TAGS, pmax=4, bare=True
+    )
+    explained = 1 - sum(1 for t in toks if t[1] == "?") / len(block)
+    assert explained >= 0.9, explained
+    assert sum(1 for t in toks if t[1] == "B") >= 500
+
+    runs, last = [], None
+    for o, k, *_ in toks:
+        if k == "?":
+            if last == o:
+                runs[-1][1] = o + 1
+            else:
+                runs.append([o, o + 1])
+            last = o + 1
+
+    # `e1 XX` as a 2-byte residue run: XX is odd (README: 13/14, 48/48, 7/7).
+    e1 = [block[a + 1] for a, b in runs if b - a == 2 and block[a] == 0xE1]
+    assert len(e1) >= 10 and sum(x % 2 for x in e1) >= 0.9 * len(e1), e1
+
+    starts = {o for o, k, *_ in toks if k != "?"}
+    singles = [a for a, b in runs if b - a == 1]
+    assert len(singles) >= 0.75 * len(runs), (len(singles), len(runs))
+    assert sum(1 for a in singles if a + 1 in starts) >= 0.9 * len(singles)
+
+
+def test_resnet18d_tag_9f_units_carry_one_extra_byte(tmp_path):
+    """Confirmed real (see the README's "Sixth correction" section), on a
+    fresh resnet18d build: a unit whose tag is 0x9f is followed by exactly
+    one leftover byte in >= 85% of cases while every other tag with n >= 30
+    is followed by one in <= 10%; that byte is below 0x40 in >= 95% of
+    cases; and admitting the extra byte (`extra_byte_tags={0x9f}`) takes
+    config block B to >= 95% explained while a shuffled copy stays under
+    55%. No device.
+    """
+    import random
+    from collections import Counter, defaultdict
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    lo, hi = narrow[cuts[1]][0], narrow[cuts[2]][0]
+    block = mcode[lo:hi]
+
+    toks = _tokenize_mcode(
+        block, start=0, end=len(block), tags=_ALL_TAGS, pmax=4, bare=True
+    )
+    follow = defaultdict(Counter)
+    extra = Counter()
+    for j, t in enumerate(toks[:-1]):
+        if t[1] not in ("S", "B"):
+            continue
+        tag = t[3] if t[1] == "S" else t[2]
+        nxt = toks[j + 1]
+        one = nxt[1] == "?" and (j + 2 >= len(toks) or toks[j + 2][1] != "?")
+        follow[tag][one] += 1
+        if one and tag == 0x9F:
+            extra[block[nxt[0]]] += 1
+    n9 = sum(follow[0x9F].values())
+    assert n9 >= 300 and follow[0x9F][True] >= 0.85 * n9, dict(follow[0x9F])
+    for tag, c in follow.items():
+        if tag != 0x9F and sum(c.values()) >= 30:
+            assert c[True] <= 0.1 * sum(c.values()), (hex(tag), dict(c))
+    assert sum(c for v, c in extra.items() if v < 0x40) >= 0.95 * sum(extra.values())
+
+    def explained(blob):
+        toks = _tokenize_mcode(
+            blob,
+            start=0,
+            end=len(blob),
+            tags=_ALL_TAGS,
+            pmax=4,
+            bare=True,
+            extra_byte_tags={0x9F},
+        )
+        return 1 - sum(1 for t in toks if t[1] == "?") / len(blob)
+
+    shuffled = bytearray(block)
+    random.Random(0).shuffle(shuffled)
+    e_real, e_null = explained(block), explained(bytes(shuffled))
+    assert e_real >= 0.95 and e_null <= 0.55, (e_real, e_null)
+
+
+_TAIL_VECTOR = bytes.fromhex("05000000200000002c000000500000007400000098000000")
+"""The FlatBuffers vector of five table offsets that opens an mcode blob's
+tail -- see the README's "The op programs are fully tokenized" section."""
+
+
+def _tail_vector(mcode):
+    """Offset of the FlatBuffers table vector that opens an mcode blob's
+    tail, found through the header word that points at it (a uoffset whose
+    target holds a small count followed by increasing table offsets) -- the
+    fixed five-entry `_TAIL_VECTOR` pattern only holds for graphs with one
+    input and one output. See the README's "The tail is the segment table"
+    section."""
+    u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
+    first_verb = mcode.find(b"\xa1\x00\x40\x02")
+    assert first_verb > 0
+    for o in range(0, first_verb - 3, 4):
+        t = o + u32(o)
+        if not (first_verb < t < len(mcode) - 8):
+            continue
+        n = u32(t)
+        if not (1 <= n <= 64) or t + 4 + 4 * n > len(mcode):
+            continue
+        offs = [u32(t + 4 + 4 * k) for k in range(n)]
+        if all(0 < x < 8192 for x in offs) and offs == sorted(offs):
+            return t
+    raise AssertionError("no header word points at a tail table vector")
+
+
+def _segments(mcode):
+    """The stream segments the tail table describes: `(offset, length,
+    table)` per segment in stream order, which is *reverse* table order.
+    Table field 2 is the segment length in 8-byte words; the segments tile
+    the blob exactly from the end of the FlatBuffers header to the tail
+    vector. Also returns the header length."""
+    vec, tables = _tail_tables(mcode)
+    words = [t.get(2, 0) for t in tables]
+    header = vec - 8 * sum(words)
+    segs, pos = [], header
+    for k in range(len(tables) - 1, -1, -1):
+        segs.append((pos, 8 * words[k], tables[k]))
+        pos += 8 * words[k]
+    assert pos == vec
+    return header, segs
+
+
+def _tail_tables(mcode):
+    """Walk the FlatBuffers tables of an mcode blob's tail (five for a
+    one-input, one-output CNN; fifteen for an `llm_build` subgraph).
+    Returns, per table, a dict of `field index -> uint32 (or uint16) value`
+    for present fields, read through each table's vtable."""
+    vec = _tail_vector(mcode)
+    u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
+    i32 = lambda o: struct.unpack_from("<i", mcode, o)[0]  # noqa: E731
+    u16 = lambda o: struct.unpack_from("<H", mcode, o)[0]  # noqa: E731
+    tables = []
+    for k in range(u32(vec)):
+        p = vec + 4 + 4 * k
+        tpos = p + u32(p)
+        vt = tpos - i32(tpos)
+        vsz, tsz = u16(vt), u16(vt + 2)
+        fields = {}
+        for f in range((vsz - 4) // 2):
+            off = u16(vt + 4 + 2 * f)
+            if off:
+                fields[f] = u32(tpos + off) if off + 4 <= tsz else u16(tpos + off)
+        tables.append(fields)
+    return vec, tables
+
+
+def test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail(tmp_path):
+    """Confirmed real (see the README's "The op programs are fully
+    tokenized" section), on a fresh resnet18d build: the header's word at
+    offset 272 is a FlatBuffers offset landing exactly on the tail's
+    five-table vector, ~480 bytes before the end; the instruction stream
+    ends 7 bytes after its last verb, just before that vector's zero
+    padding; under the full rule the op region has zero residue and the
+    stream is >= 97% explained; the header's last 17 bytes close block A
+    too; and tables 1..3 carry type word 4097 with the packed field equal
+    to `count << 8 | 1`. No device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    vec, tables = _tail_tables(mcode)
+    assert 460 <= len(mcode) - vec <= 500, len(mcode) - vec
+    assert 272 + struct.unpack_from("<I", mcode, 272)[0] == vec
+
+    pad = 0
+    while mcode[vec - pad - 1] == 0:
+        pad += 1
+    stream_end = vec - pad
+
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    a_lo, b_lo, ops_lo = narrow[cuts[0]][0], narrow[cuts[1]][0], narrow[cuts[2]][0]
+    assert mcode[280:297] == mcode[b_lo - 17 : b_lo]
+    assert mcode[b_lo - 8 : b_lo - 4] == bytes.fromhex("a2000000")
+
+    full = dict(tags=_ALL_TAGS, pmax=4, bare=True, extra_byte_tags={0x9F})
+    toks = _tokenize_mcode(mcode, start=a_lo, end=stream_end, **full)
+    last = toks[-1]
+    assert last[1] == "V" and last[2] == 0xA2 and stream_end - last[0] == 7, last
+    ops = [t for t in toks if t[0] >= ops_lo]
+    assert ops and not any(t[1] == "?" for t in ops)
+    explained = 1 - sum(1 for t in toks if t[1] == "?") / (stream_end - a_lo)
+    assert explained >= 0.97, explained
+
+    assert len(tables) == 5
+    for k in (1, 2, 3):
+        assert tables[k][0] == 4097 and tables[k][4] == (tables[k][3] << 8) | 1, tables[
+            k
+        ]
+    assert tables[4][0] == 2561
+
+
+_FULL_RULE = dict(
+    tags=_ALL_TAGS, pmax=4, bare=True, extra_byte_tags={0x9F}, verbs=_VERBS6
+)
+"""Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
+six verbs -- the README's "The tail is the segment table" section."""
+
+
+def _segment_coverage(mcode, seg):
+    """Explained fraction of one stream segment under `_FULL_RULE`, with its
+    trailing zero padding trimmed; also the count of `a1 40 02` verbs (op
+    programs) and of `a7` verbs inside it."""
+    pos, length, _ = seg
+    end = pos + length
+    while end > pos and mcode[end - 1] == 0:
+        end -= 1
+    toks = _tokenize_mcode(mcode, start=pos, end=end, **_FULL_RULE)
+    # The segment's first 8 bytes can hold the tail of the `a7` marker verb
+    # that starts 4 bytes *before* the word boundary (`1e 00 00 00 00`);
+    # those are the marker's operand, not unexplained content. Zero bytes
+    # left over are padding (an `llm_build` op segment ends with 8 zero bytes
+    # before the next segment's marker), not content either.
+    unknown = sum(1 for t in toks if t[1] == "?" and t[0] >= pos + 8 and mcode[t[0]])
+    programs = sum(1 for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02))
+    a7 = sum(1 for t in toks if t[1] == "V" and t[2] == 0xA7)
+    return 1 - unknown / max(1, end - pos), programs, a7
+
+
+def _check_segment_table(mcode):
+    """The segment-table claims shared by every build: countdown, tiling,
+    an `a7` marker verb within the first 16 bytes of every segment."""
+    vec, tables = _tail_tables(mcode)
+    for k in range(1, len(tables)):
+        assert tables[k].get(3, 0) == tables[k - 1][3] - tables[k][2], (k, tables[k])
+    assert tables[0][3] == sum(t.get(2, 0) for t in tables[1:])
+    header, segs = _segments(mcode)
+    assert segs[-1][0] + segs[-1][1] == vec
+    # The marker's `a7 00 00` may sit in the 4 bytes before the 8-byte-word
+    # boundary (the `llm_build` subgraphs' segments open `1e 00 00 00 00 a2`,
+    # the marker's operand), so look from 4 bytes before each segment start.
+    for pos, length, _ in segs:
+        assert mcode.find(b"\xa7\x00\x00", pos - 4, pos + 16) >= 0, (
+            pos,
+            mcode[pos - 4 : pos + 16].hex(),
+        )
+    return header, segs
+
+
+def test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7(tmp_path):
+    """Confirmed real (see the README's "The tail is the segment table"
+    section), on a fresh resnet18d build: the tail tables' field 2 is a
+    length in 8-byte words that tiles the blob exactly from the 280-byte
+    header to the tail vector in reverse table order; field 3 counts down;
+    the last segment is block A exactly; every segment opens with an `a7`
+    verb; the op-program segment (table 0) is 100% tokenized with six
+    verbs and holds every `a1 40 02` program; types are 0xa01, 0x1001 x3,
+    0xe801. No device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    header, segs = _check_segment_table(mcode)
+    assert header == 280 and len(segs) == 5
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    a_lo, b_lo = narrow[cuts[0]][0], narrow[cuts[1]][0]
+    assert segs[0][0] + segs[0][1] == b_lo - 17 and segs[0][1] == b_lo - a_lo
+    assert [s[2][0] for s in segs] == [0xA01, 0x1001, 0x1001, 0x1001, 0xE801]
+    cov, programs, _ = _segment_coverage(mcode, segs[-1])
+    assert cov == 1.0 and programs == len(cuts) - 2, (cov, programs, len(cuts))
+    for seg in segs[:-1]:
+        assert _segment_coverage(mcode, seg)[0] >= 0.9
+
+
+def _cached_hf_checkpoint(repo_id, fallback_dir=None):
+    """Local snapshot directory of a HuggingFace checkpoint already in the
+    cache (with its weights present), else `fallback_dir` if that holds a
+    checkpoint, else None. Never downloads -- these tests stay offline."""
+    try:
+        from huggingface_hub import snapshot_download
+
+        path = snapshot_download(repo_id, local_files_only=True)
+        if any(f.endswith((".safetensors", ".bin")) for f in os.listdir(path)):
+            return path
+    except Exception:
+        pass
+    if fallback_dir and os.path.exists(os.path.join(fallback_dir, "config.json")):
+        return os.path.abspath(fallback_dir)
+    return None
+
+
+def _mcodes_of(axmodel_path):
+    """Every `neu mode` node's mcode in an `.axmodel`, as `(node name,
+    bytes)` -- `llm_build` per-layer files carry two (decode and prefill)."""
+    m = onnx.load(axmodel_path)
+    out = []
+    for node in m.graph.node:
+        if node.op_type != "neu mode":
+            continue
+        info = json.loads(
+            next(a for a in node.attribute if a.name == "npu_graph_info").s.decode()
+        )
+        for d in info["dotneus"]:
+            init = next(i for i in m.graph.initializer if i.name == d["neu_key"])
+            out.append((node.name, bytes(init.raw_data)))
+    return out
+
+
+def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
+    """Confirmed real (see the README's "The tail is the segment table"
+    section), on a fresh `pulsar2 llm_build` of SmolLM2-135M: each of the
+    per-layer file's two subgraphs has a 15-segment tail whose segments
+    tile the stream, every segment opens with `a7`, the op-program segment
+    (table 2, type 0x8801) is 100% tokenized and uses `a7` inside its
+    programs, and the whole stream is >= 95% explained. Skips unless the
+    checkpoint is already in the HuggingFace cache. No device.
+    """
+    import shutil
+    from collections import Counter
+
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+    result = pulsar2_docker.llm_build(str(work), "SmolLM2-135M", "output", parallel=8)
+    assert result.success, getattr(result, "error", None)
+    layer = str(work / "output" / "llama_p512_l0_together.axmodel")
+    mcodes = _mcodes_of(layer)
+    assert len(mcodes) == 2, [n for n, _ in mcodes]
+    for _, mcode in mcodes:
+        _, segs = _check_segment_table(mcode)
+        assert len(segs) == 15
+        ops = [s for s in segs if s[2][0] == 0x8801]
+        assert len(ops) == 1
+        cov, programs, a7 = _segment_coverage(mcode, ops[0])
+        assert cov == 1.0 and programs >= 100 and a7 >= 100, (cov, programs, a7)
+        # The op template: the CNN core with `a7.1e` (operand 0) after the
+        # two `50.01` writes and `a7.02` (operand 2) before the closing
+        # `a8 30.02`, in the two most common skeletons.
+        pos, length, _ = ops[0]
+        toks = _tokenize_mcode(mcode, start=pos, end=pos + length, **_FULL_RULE)
+        starts = [t[0] for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+        skeletons = Counter()
+        for a, b in zip(starts, starts[1:]):
+            prog = tuple(
+                (
+                    t[2],
+                    t[3],
+                    t[4],
+                    struct.unpack_from("<I", mcode, t[0] + 4)[0]
+                    if t[2] == 0xA7
+                    else None,
+                )
+                for t in toks
+                if a <= t[0] < b and t[1] == "V"
+            )
+            skeletons[prog] += 1
+        top = skeletons.most_common(2)
+        assert sum(c for _, c in top) >= 0.4 * sum(skeletons.values()), top
+        for prog, _ in top:
+            assert prog[3] == (0xA7, 0x00, 0x1E, 0) and prog[-2] == (
+                0xA7,
+                0x00,
+                0x02,
+                2,
+            ), prog
+            assert prog[-1][:3] == (0xA8, 0x30, 0x02)
+        total_e = total_n = 0
+        for seg in segs:
+            pos, length, _ = seg
+            end = pos + length
+            while end > pos and mcode[end - 1] == 0:
+                end -= 1
+            c, _, _ = _segment_coverage(mcode, seg)
+            total_e += c * (end - pos)
+            total_n += end - pos
+        assert total_e / total_n >= 0.95, total_e / total_n
+
+    # One instruction stream for all 30 layers: header + stream identical
+    # byte for byte, only the tail's name string and the weights differ.
+    for other in (1, 29):
+        path = str(work / "output" / f"llama_p512_l{other}_together.axmodel")
+        for (_, m0), (_, m1) in zip(mcodes, _mcodes_of(path)):
+            _, segs = _segments(m0)
+            vec = segs[-1][0] + segs[-1][1]
+            assert len(m0) == len(m1) and m0[:vec] == m1[:vec]
+            diff = [i for i in range(vec, len(m0)) if m0[i] != m1[i]]
+            assert 1 <= len(diff) <= 24, len(diff)
+    w0 = onnx.load(layer)
+    w29 = onnx.load(str(work / "output" / "llama_p512_l29_together.axmodel"))
+    params0 = {t.name: bytes(t.raw_data) for t in w0.graph.initializer}
+    params29 = {t.name: bytes(t.raw_data) for t in w29.graph.initializer}
+    key = _params_key(w0)
+    assert len(params0[key]) == len(params29[key]) and params0[key] != params29[key]
+
+
+def test_onnx_path_llm_mcode_keeps_the_op_program_skeleton(tmp_path):
+    """Confirmed real (see the README's "The tail is the segment table"
+    section), on a fresh ONNX-path build of the 1-layer tiny-random-mistral
+    checkpoint: five segments that tile the stream, a 436-byte header (two
+    graph inputs), a 100%-tokenized op segment with ~75 programs for 80
+    ONNX ops, and the CNN skeleton verb for verb with `a1 20.02` in place
+    of `a1 30.03`. Skips unless the checkpoint is in the HuggingFace
+    cache. No device.
+    """
+    from collections import Counter
+
+    ckpt = _cached_hf_checkpoint(
+        "distilabel-internal-testing/tiny-random-mistral",
+        fallback_dir=os.path.join(
+            os.path.dirname(__file__), "..", "tiny-random-mistral"
+        ),
+    )
+    if ckpt is None:
+        pytest.skip("tiny-random-mistral is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    result = pulsar2_docker.build_from_hf_checkpoint(ckpt, str(work), "output")
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    header, segs = _check_segment_table(mcode)
+    assert header == 436 and len(segs) == 5
+    cov, programs, _ = _segment_coverage(mcode, segs[-1])
+    assert cov == 1.0 and 60 <= programs <= 90, (cov, programs)
+    pos, length, _ = segs[-1]
+    toks = _tokenize_mcode(mcode, start=pos, end=pos + length, **_FULL_RULE)
+    starts = [t[0] for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    skeletons = Counter()
+    for a, b in zip(starts, starts[1:]):
+        prog = tuple((t[2], t[3], t[4]) for t in toks if a <= t[0] < b and t[1] == "V")
+        skeletons[prog] += 1
+    core = (
+        (0xA1, 0x40, 0x02),
+        (0xA1, 0x50, 0x01),
+        (0xA1, 0x50, 0x01),
+        (0xA8, 0x40, 0x03),
+        (0xA1, 0x50, 0x03),
+        (0xA1, 0x50, 0x01),
+        (0xA3, 0x00, 0x00),
+        (0xA1, 0x50, 0x01),
+        (0xA9, 0x00, 0x00),
+    )
+    top = skeletons.most_common(2)
+    assert sum(c for _, c in top) >= 0.6 * sum(skeletons.values()), top
+    for prog, _ in top:
+        assert tuple(v for v in prog if v in core) == core, prog
+    assert sum(c for prog, c in skeletons.items() if (0xA1, 0x20, 0x02) in prog) >= 5
+
+
+def _llm_layer_inputs(model):
+    """Valid inputs for an `llm_build` per-layer file's decode subgraph
+    (group 0: the graph inputs not suffixed `_1`): zero K/V caches, zero
+    hidden state and mask, and *in-range* `indices` -- `axcl_run_model`'s
+    own random bytes land in that gather input and fault the NPU."""
+    sizes = {onnx.TensorProto.BFLOAT16: 2, onnx.TensorProto.FLOAT: 4}
+    sizes.update(
+        {
+            onnx.TensorProto.INT32: 4,
+            onnx.TensorProto.UINT32: 4,
+            onnx.TensorProto.INT64: 8,
+        }
+    )
+    inputs = {}
+    for i in model.graph.input:
+        if i.name.endswith("_1"):
+            continue
+        n = int(np.prod([d.dim_value for d in i.type.tensor_type.shape.dim] or [1]))
+        size = sizes[i.type.tensor_type.elem_type]
+        if i.name.startswith("indices"):
+            inputs[i.name] = np.arange(
+                n, dtype=np.int32 if size == 4 else np.int64
+            ).tobytes()
+        else:
+            inputs[i.name] = b"\x00" * (n * size)
+    return inputs
+
+
+def _run_llm_layer(path, inputs, times):
+    """Run a per-layer file `times` times; returns a list of outcomes, each
+    either the string "fault" (a `0x8030070C` rejection) or the tuple of
+    output digests. Empty-output runs (the runtime's own transient) are
+    skipped, so callers judge on what actually came back."""
+    import hashlib
+
+    out = []
+    for _ in range(times):
+        r = pulsar2_docker.run_on_device_with_inputs(path, inputs, repeat=1, warmup=1)
+        if r.error and "0x8030070C" in r.error:
+            out.append("fault")
+        elif r.outputs:
+            out.append(tuple(hashlib.sha1(o).hexdigest() for o in r.outputs))
+    return out
+
+
+def test_llm_build_a7_is_a_sync_verb_on_device(tmp_path):
+    """Confirmed real on the AX650N (see the README's "Confirmed on the
+    AX650N: `a7` is a synchronization verb" table), on a fresh `llm_build`
+    of SmolLM2-135M: the layer-0 decode subgraph runs deterministically
+    with valid inputs; patching every in-program `a7.02` operand from 2 to
+    0 keeps it running but changes every output; patching every in-program
+    `a7.1e` operand from 0 to 1 faults; re-routing `a7.02` to channel 0x1e
+    leaves the outputs identical. Each outcome must reproduce on both of
+    two runs. Skips without a device or the cached checkpoint.
+    """
+    import shutil
+
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+    result = pulsar2_docker.llm_build(str(work), "SmolLM2-135M", "output", parallel=8)
+    assert result.success, getattr(result, "error", None)
+    layer = str(work / "output" / "llama_p512_l0_together.axmodel")
+
+    model = onnx.load(layer)
+    inputs = _llm_layer_inputs(model)
+    neu0 = next(n for n in model.graph.node if n.op_type == "neu mode")
+    info = json.loads(
+        next(a for a in neu0.attribute if a.name == "npu_graph_info").s.decode()
+    )
+    key = info["dotneus"][0]["neu_key"]
+    mcode = bytes(next(i for i in model.graph.initializer if i.name == key).raw_data)
+    _, segs = _segments(mcode)
+    ops = next(s for s in segs if s[2][0] == 0x8801)
+    toks = _tokenize_mcode(mcode, start=ops[0], end=ops[0] + ops[1], **_FULL_RULE)
+    a7_02 = [t[0] for t in toks if t[1] == "V" and t[2] == 0xA7 and t[4] == 0x02]
+    a7_1e = [t[0] for t in toks if t[1] == "V" and t[2] == 0xA7 and t[4] == 0x1E]
+    assert len(a7_02) >= 50 and len(a7_1e) >= 50, (len(a7_02), len(a7_1e))
+
+    def patched(name, edit):
+        b = bytearray(mcode)
+        edit(b)
+        m2 = onnx.ModelProto()
+        m2.CopyFrom(model)
+        next(i for i in m2.graph.initializer if i.name == key).raw_data = bytes(b)
+        path = str(tmp_path / f"{name}.axmodel")
+        onnx.save(m2, path)
+        return path
+
+    def set_operand(offs, val):
+        def edit(b):
+            for o in offs:
+                struct.pack_into("<I", b, o + 4, val)
+
+        return edit
+
+    def set_channel(offs, ch):
+        def edit(b):
+            for o in offs:
+                b[o + 3] = ch
+
+        return edit
+
+    # The runtime can reject one run transiently with the same fault code
+    # (see `_run_retry_once`), so a variant that is *expected to run* is
+    # judged on its non-fault runs -- at least two, all equal -- while a
+    # variant expected to fault must fault on every run.
+    def good(outcomes):
+        return [o for o in outcomes if o != "fault"]
+
+    base = good(_run_llm_layer(layer, inputs, 3))
+    assert len(base) >= 2 and len(set(base)) == 1, base
+    baseline = base[0]
+
+    changed = good(
+        _run_llm_layer(patched("a7_02_operand_0", set_operand(a7_02, 0)), inputs, 3)
+    )
+    assert len(changed) >= 2 and len(set(changed)) == 1, changed
+    assert all(a != b for a, b in zip(changed[0], baseline)), (changed[0], baseline)
+
+    faulted = _run_llm_layer(
+        patched("a7_1e_operand_1", set_operand(a7_1e, 1)), inputs, 2
+    )
+    assert faulted == ["fault", "fault"], faulted
+
+    same = good(
+        _run_llm_layer(patched("a7_02_channel_1e", set_channel(a7_02, 0x1E)), inputs, 3)
+    )
+    assert len(same) >= 2 and all(s == baseline for s in same), same
