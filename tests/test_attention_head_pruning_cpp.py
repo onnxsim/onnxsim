@@ -38,20 +38,39 @@ remaining shape not covered by one of those still declines to match in this
 C++ port (never mis-sliced), so ``apply_attention_head_pruning``/
 ``apply_attention_head_wanda_pruning`` remain pure-Python (NOT yet aliased to
 this port) -- see that section's own tests for the exact, explicit divergence
-each remaining narrowing produces. The six newer fused-op families
-(everything past plain ``Attention``/``GroupQueryAttention``/the plain
-``ai.onnx::Attention`` op) share one more deliberate, narrower-than-pruning.py
-scope choice throughout: this port has no analogue of pruning.py's own
-dynamic-attention-bias-Gather-insertion machinery (``_head_bias_input_is_safe``/
-``_slice_or_gather_head_bias``) at all for THOSE families -- a pre-existing,
-already-accepted gap for the three original fused-op families too (only the
-decomposed-GQA family above has that machinery ported) -- so every new
-fused-op matcher declines the whole chain outright whenever an optional
-per-head bias/mask/sink/norm/scale input resolves to a non-empty constant,
-rather than risk leaving one silently stale after ``num_heads``/
-``kv_num_heads`` shrink underneath it. See each new family's own model
-builder/test section below, and each ``Match*Producer`` function's own
-comment in ``structured_pruning_entry.cpp``, for the exact narrowing.
+each remaining narrowing produces.
+
+``GroupQueryAttention``'s and the plain ``ai.onnx::Attention`` op's own
+optional per-head inputs -- ``attention_bias``/``attn_mask``,
+``past_key``/``past_value`` (plus, GQA-only, ``k_scale``/``v_scale`` and
+``head_sink``) -- now reuse this exact same ``HeadBiasInputIsSafe``/
+``SliceOrGatherHeadBias`` machinery (``MatchGqaProducer``/
+``MatchOnnxAttentionProducer``/``ApplyOneGqaChain``, plus this file's own new
+``PastKvConstantsAreSliceable``/``SliceKvCacheAxis1`` for the KV-cache pair):
+a constant that resolves to a genuine per-head/per-KV-group tensor is sliced
+in place, a constant that resolves to a broadcast is left untouched (without
+declining the match), a dynamic one gets a ``Gather`` node spliced in ahead of
+it when genuinely per-head, and only a shape that doesn't statically resolve
+either way declines the whole match -- see the dedicated tests in each
+family's own section below (the ``_gqa_model`` helper's own
+``attention_bias``/``head_sink``/``past_kv`` parameters, and
+``_onnx_attention_model``'s own ``attn_mask``/``past_kv`` parameters).
+
+The other six fused-op families (``MultiHeadAttention``,
+``PackedMultiHeadAttention``, ``DecoderMaskedMultiHeadAttention``,
+``PagedAttention``, ``LinearAttention``, ``SparseAttention``) still share one
+more deliberate, narrower-than-pruning.py scope choice, unaffected by the
+above: this port has no analogue of pruning.py's own dynamic-attention-bias-
+Gather-insertion machinery for THOSE families -- a pre-existing,
+already-accepted gap (only GroupQueryAttention/the plain ``ai.onnx::Attention``
+op and the decomposed-GQA family above have that machinery ported) -- so
+every one of those six matchers still declines the whole chain outright
+whenever an optional per-head bias/mask/sink/norm/scale input resolves to a
+non-empty constant, rather than risk leaving one silently stale after
+``num_heads``/``kv_num_heads`` shrink underneath it. See each of those
+family's own model builder/test section below, and each ``Match*Producer``
+function's own comment in ``structured_pruning_entry.cpp``, for the exact
+narrowing.
 """
 
 import ml_dtypes
@@ -351,6 +370,12 @@ def _gqa_model(
     bv=None,
     wout=None,
     past_kv=None,  # None (empty) | "nonempty" (constant) | "dynamic" (graph input)
+    #  | "unsafe" (constant, wrong kv_num_heads-axis length -- declines the match)
+    attention_bias=None,  # None | "broadcast" (rank-4, axis1 size 1) | "per_head"
+    #  (rank-4, axis1 == num_heads, sliced) | "dynamic_per_head" (graph input, same
+    #  shape -- Gather inserted) | "unsafe" (axis1 neither 1 nor num_heads)
+    head_sink=None,  # None | "nonempty" (constant (num_heads,), sliced)
+    #  | "dynamic" (graph input, left alone) | "wrong_shape" (declines the match)
 ):
     rng = np.random.default_rng(seed)
     Nq, Nkv = H * D, KVH * D
@@ -397,9 +422,58 @@ def _gqa_model(
             f", float[{batch},{KVH},1,{D}] PastKeyIn"
             f", float[{batch},{KVH},1,{D}] PastValueIn"
         )
+    elif past_kv == "unsafe":
+        # rank-4 but axis-1 length != kv_num_heads -- not a shape either port
+        # can safely slice, so the whole match is declined outright by both.
+        past_key = rng.standard_normal((batch, KVH + 1, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH + 1, 1, D)).astype(np.float32)
+        initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
+        operands += ["PastKey", "PastValue"]
     else:
         operands += ["", ""]
     operands += ["SeqLensK", "TotalSeq"]
+
+    # cos_cache/sin_cache/position_ids (indices 7/8/9) -- always left empty here
+    # (this test file's own GQA models never exercise rotary embedding), just
+    # placeholders so attention_bias/head_sink (indices 10/11) land correctly.
+    operands += ["", "", ""]
+
+    if attention_bias == "broadcast":
+        bias_t = rng.standard_normal((1, 1, seq, seq)).astype(np.float32)
+        initializer.append(_f32(bias_t, "AttnBias"))
+        operands.append("AttnBias")
+    elif attention_bias == "per_head":
+        bias_t = rng.standard_normal((1, H, seq, seq)).astype(np.float32)
+        initializer.append(_f32(bias_t, "AttnBias"))
+        operands.append("AttnBias")
+    elif attention_bias == "dynamic_per_head":
+        operands.append("AttnBiasIn")
+        extra_graph_inputs += f", float[1,{H},{seq},{seq}] AttnBiasIn"
+    elif attention_bias == "unsafe":
+        # axis-1 length neither 1 (broadcast) nor num_heads -- unresolvable,
+        # declines the whole match rather than guessing.
+        bias_t = rng.standard_normal((1, H + 1, seq, seq)).astype(np.float32)
+        initializer.append(_f32(bias_t, "AttnBias"))
+        operands.append("AttnBias")
+    else:
+        operands.append("")
+
+    if head_sink == "nonempty":
+        sink_t = rng.standard_normal((H,)).astype(np.float32)
+        initializer.append(_f32(sink_t, "HeadSink"))
+        operands.append("HeadSink")
+    elif head_sink == "dynamic":
+        operands.append("HeadSinkIn")
+        extra_graph_inputs += f", float[{H}] HeadSinkIn"
+    elif head_sink == "wrong_shape":
+        sink_t = rng.standard_normal((H + 1,)).astype(np.float32)
+        initializer.append(_f32(sink_t, "HeadSink"))
+        operands.append("HeadSink")
+    else:
+        operands.append("")
+
+    while operands and operands[-1] == "":
+        operands.pop()
 
     if with_reshape:
         shape = np.array([batch, seq, Nq], dtype=np.int64)
@@ -608,17 +682,43 @@ def test_cpp_gqa_pruning_reshape_hop_is_recognized_and_shape_updated():
     assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
 
 
-def test_cpp_gqa_pruning_nonempty_past_kv_constant_is_left_untouched():
+def test_cpp_gqa_pruning_nonempty_sliceable_past_kv_constant_is_sliced():
+    # A constant past_key/past_value in the schema's own BNSH layout, with its
+    # axis-1 length matching kv_num_heads, is now validated-and-sliced along
+    # that axis by `keep_groups` -- the same index set K's/V's own producer
+    # weights are sliced by -- rather than declining the whole match outright
+    # (this test used to be named `..._is_left_untouched`, covering the OLD,
+    # narrower C++ behavior; see `..._past_kv_constant_is_unsafe_and_declined`
+    # below for the shape that genuinely still declines). Byte-for-byte
+    # cross-check against the live pure-Python reference.
     model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=12, past_kv="nonempty")
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1
+    assert num_heads == group_size
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
-    }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    assert inits["PastKey"].shape == (cfg["batch"], kv_num_heads, 1, cfg["D"])
+    assert inits["PastValue"].shape == (cfg["batch"], kv_num_heads, 1, cfg["D"])
+
+
+def test_cpp_gqa_pruning_past_kv_constant_is_unsafe_and_declined():
+    # A constant past_key/past_value whose axis-1 length does NOT match
+    # kv_num_heads (rank-4, but not the schema's own BNSH layout) is not a
+    # shape either port can safely slice -- both decline the whole match
+    # outright, identically.
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=75, past_kv="unsafe")
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
 def test_cpp_gqa_pruning_dynamic_past_kv_input_is_still_pruned():
@@ -630,6 +730,132 @@ def test_cpp_gqa_pruning_dynamic_past_kv_input_is_still_pruned():
     group_size = cfg["H"] // cfg["KVH"]
     assert kv_num_heads == 1
     assert num_heads == group_size
+
+
+def test_cpp_gqa_pruning_broadcast_attention_bias_is_left_untouched_block_still_pruned():
+    # A constant attention_bias whose axis-1 (num_heads) length is 1 is an
+    # unconditional broadcast -- it carries no per-head values at all, so it
+    # is left byte-for-byte untouched even though the rest of the block IS
+    # pruned (this does NOT decline the whole match, unlike the old,
+    # overly-conservative C++ behavior this fix replaces).
+    model, cfg = _gqa_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=31, attention_bias="broadcast"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == cfg["H"] // cfg["KVH"]
+    bias_before = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "AttnBias")
+    )
+    bias_after = onnx.numpy_helper.to_array(
+        next(t for t in pruned_cpp.graph.initializer if t.name == "AttnBias")
+    )
+    np.testing.assert_array_equal(bias_before, bias_after)
+
+
+def test_cpp_gqa_pruning_per_head_attention_bias_constant_is_sliced():
+    # A constant attention_bias whose axis-1 length equals num_heads is a
+    # genuine per-(query-)head tensor -- sliced in place by `keep_q_heads`,
+    # the same query-head granularity Q's own producer weight is sliced by.
+    model, cfg = _gqa_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=32, attention_bias="per_head"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    bias_after = onnx.numpy_helper.to_array(
+        next(t for t in pruned_cpp.graph.initializer if t.name == "AttnBias")
+    )
+    assert bias_after.shape == (1, num_heads, cfg["seq"], cfg["seq"])
+
+
+def test_cpp_gqa_pruning_dynamic_per_head_attention_bias_gets_gather_inserted():
+    # A DYNAMIC (graph-input) attention_bias whose declared shape resolves to
+    # a genuine per-head axis gets a new Gather node spliced in ahead of the
+    # GroupQueryAttention node, selecting the kept query heads' own slice at
+    # runtime, rather than being left stale or blocking the match.
+    model, cfg = _gqa_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=33, attention_bias="dynamic_per_head"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    gather_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    assert gather_nodes[0].input[0] == "AttnBiasIn"
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert node.input[10] == gather_nodes[0].output[0]
+
+    rng = np.random.default_rng(34)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    attn_bias_in = rng.standard_normal((1, cfg["H"], cfg["seq"], cfg["seq"])).astype(
+        np.float32
+    )
+    (y,) = _run(pruned_cpp, {"X": x, "AttnBiasIn": attn_bias_in})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_cpp_gqa_pruning_unsafe_attention_bias_constant_is_declined():
+    # A constant attention_bias whose axis-1 length is neither 1 (broadcast)
+    # nor num_heads (genuine per-head) doesn't statically resolve -- declined
+    # rather than guessed at, by both ports identically.
+    model, cfg = _gqa_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=35, attention_bias="unsafe"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_gqa_pruning_head_sink_constant_is_sliced():
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=36, head_sink="nonempty")
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    sink_after = onnx.numpy_helper.to_array(
+        next(t for t in pruned_cpp.graph.initializer if t.name == "HeadSink")
+    )
+    assert sink_after.shape == (num_heads,)
+
+
+def test_cpp_gqa_pruning_dynamic_head_sink_is_left_untouched_block_still_pruned():
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=37, head_sink="dynamic")
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    node = _gqa_node(pruned_cpp)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+
+
+def test_cpp_gqa_pruning_wrong_shape_head_sink_constant_is_declined():
+    model, cfg = _gqa_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=38, head_sink="wrong_shape"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
 
 
 def test_cpp_attention_head_pruning_group_query_attention_missing_required_inputs_is_left_untouched():
@@ -692,8 +918,14 @@ def _onnx_attention_model(
     bk=None,
     bv=None,
     wout=None,
-    attn_mask=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
-    past_kv=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
+    attn_mask=None,  # None (omitted) | "nonempty" (constant, rank-2 broadcast)
+    #  | "dynamic" (graph input, rank-2 broadcast) | "per_head" (constant,
+    #  rank-3, axis0 == q_num_heads, sliced) | "dynamic_per_head" (graph
+    #  input, same shape -- Gather inserted) | "unsafe" (axis0 neither 1 nor
+    #  q_num_heads -- declines the match)
+    past_kv=None,  # None (omitted) | "nonempty" (constant, sliced) | "dynamic"
+    #  (graph input) | "unsafe" (constant, wrong kv_num_heads-axis length --
+    #  declines the match)
 ):
     rng = np.random.default_rng(seed)
     Nq, Nkv = H * D, KVH * D
@@ -728,6 +960,19 @@ def _onnx_attention_model(
     elif attn_mask == "dynamic":
         operands.append("AttnMaskIn")
         extra_graph_inputs += f", float[{seq},{seq}] AttnMaskIn"
+    elif attn_mask == "per_head":
+        mask = rng.standard_normal((H, seq, seq)).astype(np.float32)
+        initializer.append(_f32(mask, "AttnMask"))
+        operands.append("AttnMask")
+    elif attn_mask == "dynamic_per_head":
+        operands.append("AttnMaskIn")
+        extra_graph_inputs += f", float[{H},{seq},{seq}] AttnMaskIn"
+    elif attn_mask == "unsafe":
+        # axis0 length neither 1 (broadcast) nor q_num_heads -- unresolvable,
+        # declines the whole match rather than guessing.
+        mask = rng.standard_normal((H + 1, seq, seq)).astype(np.float32)
+        initializer.append(_f32(mask, "AttnMask"))
+        operands.append("AttnMask")
     else:
         operands.append("")
 
@@ -742,6 +987,11 @@ def _onnx_attention_model(
             f", float[{batch},{KVH},1,{D}] PastKeyIn"
             f", float[{batch},{KVH},1,{D}] PastValueIn"
         )
+    elif past_kv == "unsafe":
+        past_key = rng.standard_normal((batch, KVH + 1, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH + 1, 1, D)).astype(np.float32)
+        initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
+        operands += ["PastKey", "PastValue"]
     else:
         operands += ["", ""]
 
@@ -884,19 +1134,125 @@ def test_cpp_onnx_attention_pruning_slices_bias_when_producer_has_one():
     np.testing.assert_array_equal(inits["Bv"], cfg["bv"][kv_idx])
 
 
-def test_cpp_onnx_attention_pruning_nonempty_attn_mask_constant_is_left_untouched():
+def test_cpp_onnx_attention_pruning_nonempty_2d_attn_mask_constant_is_pruned():
+    # A rank-2 (seq, seq) attn_mask never has a q_num_heads axis at all -- an
+    # unconditional broadcast -- so it needs no slicing and is left
+    # byte-for-byte untouched, but (unlike the OLD, overly-conservative C++
+    # behavior this fix replaces -- this test used to be named
+    # `..._is_left_untouched` and asserted the WHOLE model was unchanged) the
+    # rest of the block IS still pruned.
     model, cfg = _onnx_attention_model(
         K=8, H=4, KVH=2, D=4, Out=6, seed=17, attn_mask="nonempty"
     )
-    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _onnx_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * (cfg["H"] // cfg["KVH"])
+    mask_before = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "AttnMask")
+    )
+    mask_after = onnx.numpy_helper.to_array(
+        next(t for t in pruned_cpp.graph.initializer if t.name == "AttnMask")
+    )
+    np.testing.assert_array_equal(mask_before, mask_after)
+
+
+def test_cpp_onnx_attention_pruning_per_head_attn_mask_constant_is_sliced():
+    model, cfg = _onnx_attention_model(
+        K=8, H=4, KVH=2, D=4, Out=6, seed=41, attn_mask="per_head"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _onnx_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    mask_after = onnx.numpy_helper.to_array(
+        next(t for t in pruned_cpp.graph.initializer if t.name == "AttnMask")
+    )
+    assert mask_after.shape == (q_num_heads, cfg["seq"], cfg["seq"])
+
+
+def test_cpp_onnx_attention_pruning_dynamic_per_head_attn_mask_gets_gather_inserted():
+    model, cfg = _onnx_attention_model(
+        K=8, H=4, KVH=2, D=4, Out=6, seed=42, attn_mask="dynamic_per_head"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    gather_nodes = [n for n in pruned_cpp.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    assert gather_nodes[0].input[0] == "AttnMaskIn"
+
+    node = _onnx_attention_node(pruned_cpp)
+    assert node.input[3] == gather_nodes[0].output[0]
+
+    rng = np.random.default_rng(43)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    attn_mask_in = rng.standard_normal((cfg["H"], cfg["seq"], cfg["seq"])).astype(
+        np.float32
+    )
+    (y,) = _run(pruned_cpp, {"X": x, "AttnMaskIn": attn_mask_in})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_cpp_onnx_attention_pruning_unsafe_attn_mask_constant_is_declined():
+    model, cfg = _onnx_attention_model(
+        K=8, H=4, KVH=2, D=4, Out=6, seed=44, attn_mask="unsafe"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_onnx_attention_pruning_nonempty_sliceable_past_kv_constant_is_sliced():
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=45, past_kv="nonempty"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = _onnx_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
     }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
-    }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    assert inits["PastKey"].shape == (cfg["batch"], kv_num_heads, 1, cfg["D"])
+    assert inits["PastValue"].shape == (cfg["batch"], kv_num_heads, 1, cfg["D"])
+
+
+def test_cpp_onnx_attention_pruning_past_kv_constant_is_unsafe_and_declined():
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=46, past_kv="unsafe"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_onnx_attention_pruning_dynamic_past_kv_input_is_still_pruned():
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=47, past_kv="dynamic"
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    node = _onnx_attention_node(pruned_cpp)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
 
 
 def test_cpp_onnx_attention_pruning_diff_v_head_size_is_left_untouched():
