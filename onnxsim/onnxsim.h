@@ -18,6 +18,7 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+#include "imatrix_quant_entry.h"
 #include "structured_pruning_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
@@ -721,6 +722,17 @@ onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
 // ``apply_fp6_llm_quantization`` are independently-correct,
 // non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
+
+// llama.cpp's "importance matrix" (imatrix) -- C++ port of
+// imatrix_quant.py's own apply_imatrix_quantization, declared in
+// imatrix_quant_entry.h (included above) rather than duplicated here,
+// mirroring how ApplyWandaPruning/ApplySparseGptPruning (structured_
+// pruning_entry.h, also included above) are documented in their own home
+// header instead of this one. See imatrix_quant.py's own module docstring
+// for the technique, imatrix_quant_entry.h for this port's own scope, and
+// that header's own top comment for why this calibration-driven pass
+// follows ApplyWandaPruning's protobuf-level shape rather than
+// ApplyQuarot's data-free PredicateBasedPass one.
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
