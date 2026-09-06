@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// ONNX Runtime version onnxsim builds against; must match `cmake/build_ort.cmake`.
-const ONNXRUNTIME_VERSION: &str = "1.28.0";
+const ONNXRUNTIME_VERSION: &str = "1.29.0";
 
 /// C API implementation file, relative to the onnxsim source root. Used both as
 /// a rebuild trigger and as the marker that a directory really is an onnxsim
