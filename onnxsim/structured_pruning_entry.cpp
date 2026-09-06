@@ -5801,13 +5801,17 @@ std::optional<HeadCountsMatch> MatchOnnxAttentionProducer(
   return HeadCountsMatch{q_num_heads, kv_num_heads};
 }
 
-// Generic safety gate reused by every new "separate Q/K/V" matcher below
-// (MultiHeadAttention/PackedMultiHeadAttention/
-// DecoderMaskedMultiHeadAttention/SparseAttention): declines the whole match
+// Generic safety gate reused by MatchSparseAttentionProducer below (its own
+// `block_row_indices`/`block_col_indices` sit at fixed indices, but its own
+// past_key/past_value pair does not -- unlike MultiHeadAttention/
+// PackedMultiHeadAttention/DecoderMaskedMultiHeadAttention/GroupQueryAttention/
+// the plain ai.onnx::Attention op, all of which now validate-and-slice their
+// own analogous optional per-head inputs instead, via HeadBiasInputIsSafe/
+// PastKvConstantsAreSliceable -- this op's own past_key/past_value gap
+// remains a pre-existing, out-of-scope narrowing): declines the whole match
 // when any of `indices` resolves to a non-empty constant tensor -- mirrors
-// the identical "would need slicing, not attempted here" pattern
-// MatchGqaProducer/MatchOnnxAttentionProducer already use above for their
-// own past_key/past_value (and, for the latter, attn_mask) checks. An
+// the identical "would need slicing, not attempted here" pattern this port
+// used for every one of those other matchers before each one's own fix. An
 // absent, empty-string, or dynamic (unresolvable-to-constant) input at any
 // of `indices` is left completely alone -- nothing here ever slices any of
 // them either way, so a genuinely dynamic one is safe to leave connected
@@ -6515,8 +6519,7 @@ std::vector<AttnChain> FindOnnxAttentionChains(
     onnx::GraphProto* graph,
     const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
         value_info_by_name = {}) {
-  return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer,
-                               "q_num_heads",
+  return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer, "q_num_heads",
                                /*combined_bias_input_index=*/std::nullopt,
                                value_info_by_name);
 }
@@ -25931,8 +25934,7 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   // apply_attention_head_wanda_pruning has no quantized-weight counterpart
   // either (see structured_pruning_entry.h's own declaration comment).
   std::vector<AttnChain> chains = FindAttentionChains(graph);
-  std::vector<AttnChain> gqa_chains =
-      FindGqaChains(graph, value_info_by_name);
+  std::vector<AttnChain> gqa_chains = FindGqaChains(graph, value_info_by_name);
   std::vector<AttnChain> onnx_attn_chains =
       FindOnnxAttentionChains(graph, value_info_by_name);
   std::vector<AttnChain> mha_chains = FindMhaChains(graph, value_info_by_name);

@@ -44,43 +44,63 @@ each remaining narrowing produces.
 optional per-head inputs -- ``attention_bias``/``attn_mask``,
 ``past_key``/``past_value`` (plus, GQA-only, ``k_scale``/``v_scale`` and
 ``head_sink``) -- as well as ``com.microsoft::MultiHeadAttention``'s/
-``com.microsoft::PackedMultiHeadAttention``'s own optional ``attention_bias``
-(and, ``MultiHeadAttention``-only, ``past_key``/``past_value``) now reuse this
-exact same ``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias`` machinery
-(``MatchGqaProducer``/``MatchOnnxAttentionProducer``/
+``com.microsoft::PackedMultiHeadAttention``'s/
+``com.microsoft::DecoderMaskedMultiHeadAttention``'s own optional
+``attention_bias`` (and, ``MultiHeadAttention``'s/
+``DecoderMaskedMultiHeadAttention``'s own ``past_key``/``past_value``) now
+reuse this exact same ``HeadBiasInputIsSafe``/``SliceOrGatherHeadBias``
+machinery (``MatchGqaProducer``/``MatchOnnxAttentionProducer``/
 ``MatchMultiHeadAttentionProducer``/``MatchPackedMultiHeadAttentionProducer``/
-``ApplyOneGqaChain``, plus this file's own new
-``PastKvConstantsAreSliceable``/``SliceKvCacheAxis1`` for the KV-cache pair):
-a constant that resolves to a genuine per-head/per-KV-group tensor is sliced
-in place, a constant that resolves to a broadcast is left untouched (without
-declining the match), a dynamic one gets a ``Gather`` node spliced in ahead of
-it when genuinely per-head, and only a shape that doesn't statically resolve
-either way declines the whole match -- see the dedicated tests in each
-family's own section below (the ``_gqa_model`` helper's own
-``attention_bias``/``head_sink``/``past_kv`` parameters,
+``MatchDecoderMaskedMultiHeadAttentionProducer``/``ApplyOneGqaChain``, plus
+this file's own ``PastKvConstantsAreSliceable``/``SliceKvCacheAxis1`` for the
+KV-cache pair): a constant that resolves to a genuine per-head/per-KV-group
+tensor is sliced in place, a constant that resolves to a broadcast is left
+untouched (without declining the match), a dynamic one gets a ``Gather``
+node spliced in ahead of it when genuinely per-head, and only a shape that
+doesn't statically resolve either way declines the whole match -- see the
+dedicated tests in each family's own section below (the ``_gqa_model``
+helper's own ``attention_bias``/``head_sink``/``past_kv`` parameters,
 ``_onnx_attention_model``'s own ``attn_mask``/``past_kv`` parameters, and
-``MultiHeadAttention``'s/``PackedMultiHeadAttention``'s own model builders'
-``attention_bias``/``past_kv`` parameters). ``MultiHeadAttention``'s own
-optional ``past_key``/``past_value`` (indices 6/7) are validated with
-``PastKvConstantsAreSliceable`` called with no ``scale_indices`` (this op has
-no ``k_scale``/``v_scale``) and sliced along their own BNSH ``kv_num_heads``
-axis when a constant of that exact shape; ``PackedMultiHeadAttention`` has no
-``past_key``/``past_value`` inputs on its own schema at all (packing mode is
-encoder-only).
+``MultiHeadAttention``'s/``PackedMultiHeadAttention``'s/
+``DecoderMaskedMultiHeadAttention``'s own model builders' own
+``attention_bias``/``past_kv`` parameters). Each of ``MultiHeadAttention``'s
+(indices 6/7) and ``DecoderMaskedMultiHeadAttention``'s (indices 5/6) own
+optional ``past_key``/``past_value`` are validated with
+``PastKvConstantsAreSliceable`` called with no ``scale_indices`` (neither op
+has ``k_scale``/``v_scale``) and sliced along their own BNSH
+``kv_num_heads`` axis when a constant of that exact shape;
+``PackedMultiHeadAttention`` has no ``past_key``/``past_value`` inputs on its
+own schema at all (packing mode is encoder-only).
 
-The other four fused-op families (``DecoderMaskedMultiHeadAttention``,
-``PagedAttention``, ``LinearAttention``, ``SparseAttention``) still share one
-more deliberate, narrower-than-pruning.py scope choice, unaffected by the
-above: this port has no analogue of pruning.py's own dynamic-attention-bias-
-Gather-insertion machinery for THOSE families -- a pre-existing,
-already-accepted gap (only the families named above have that machinery
-ported) -- so every one of those four matchers still declines the whole chain
-outright whenever an optional per-head bias/mask/sink/norm/scale input
-resolves to a non-empty constant, rather than risk leaving one silently stale
-after ``num_heads``/``kv_num_heads`` shrink underneath it. See each of those
-family's own model builder/test section below, and each ``Match*Producer``
-function's own comment in ``structured_pruning_entry.cpp``, for the exact
-narrowing.
+``com.microsoft::PagedAttention`` -- the one remaining separate-Q/K/V family
+with a per-head optional input beyond a combined bias -- has no
+``attention_bias``/``attn_mask``-equivalent input on its own schema at all,
+but its own ``head_sink`` (index 11, a genuine ``(num_heads,)`` constant),
+``q_norm_weight``/``k_norm_weight`` (indices 12/13, paired-presence only --
+neither ever sliced, since a ``(head_size,)`` shape never changes under
+whole-head/KV-group pruning), and ``k_scale``/``v_scale`` (indices 14/15,
+``PagedKvScaleIsSliceable`` -- a *different*, rank-3/axis-0
+``(kv_num_heads, 1, head_size)`` PER_CHANNEL layout from every other family's
+own rank-4/axis-1 one, since this op's own schema documents it that way) are
+now all validated/sliced too, via ``FindSeparateQkvChains``'s own new
+``qk_norm_weight_indices`` parameter and ``ApplyOneGqaChain``'s own
+``is_paged`` branch -- see the dedicated PagedAttention tests below and
+``MatchPagedAttentionProducer``'s/``PagedKvScaleIsSliceable``'s own comments
+in ``structured_pruning_entry.cpp``.
+
+The two remaining fused-op families (``LinearAttention``, ``SparseAttention``)
+still share one more deliberate, narrower-than-pruning.py scope choice,
+unaffected by the above: ``SparseAttention``'s own optional
+``past_key``/``past_value`` (indices 3/4) still decline the whole chain
+outright whenever non-empty and constant (``NoNonEmptyConstantAt``, this
+port's own pre-existing, already-accepted gap -- no analogue of
+``PastKvConstantsAreSliceable``'s own validate-and-slice treatment for THIS
+op yet), rather than risk leaving one silently stale after
+``num_heads``/``kv_num_heads`` shrink underneath it; ``LinearAttention`` has
+no such optional per-head input on its own schema to begin with. See each of
+those two families' own model builder/test section below, and each
+``Match*Producer`` function's own comment in ``structured_pruning_entry.cpp``,
+for the exact narrowing.
 """
 
 import ml_dtypes
@@ -6154,3 +6174,274 @@ def test_cpp_attention_head_wanda_pruning_leaves_matmul_nbits_qkv_chains_untouch
     )
     onnx.checker.check_model(pruned)
     assert pruned.SerializeToString() == model.SerializeToString()
+
+
+# --- Cross-family regression checks --------------------------------------
+#
+# The three per-head-input fixes above (GroupQueryAttention/plain
+# ai.onnx::Attention, MultiHeadAttention/PackedMultiHeadAttention,
+# DecoderMaskedMultiHeadAttention/PagedAttention) were each authored
+# independently against the SAME shared dispatch machinery
+# (``FindSeparateQkvChains``, ``ApplyOneGqaChain``, ``HeadBiasInputIsSafe``/
+# ``SliceOrGatherHeadBias``, ``PastKvConstantsAreSliceable``) and merged
+# together afterwards. The two tests below are not about any one family's
+# own new behavior (already covered above) -- they specifically probe the
+# merge-time risk of one family's own per-head-input index/handling
+# accidentally leaking onto a DIFFERENT family's node when both are matched
+# and pruned together in the same graph: a wrong hard-coded input index
+# reused across op types, a `keep_heads`/`keep_q_heads` index set computed
+# for one chain applied to another's own attention_bias/past_key/past_value,
+# or a `used_names` collision between two independently-inserted dynamic
+# Gather nodes.
+
+
+def test_cpp_attention_head_pruning_gqa_and_mha_attention_bias_do_not_cross_contaminate():
+    # One graph, two independent chains: a GroupQueryAttention node
+    # (num_heads=4, kv_num_heads=2) and a MultiHeadAttention node
+    # (num_heads=4), each with its OWN dynamic (graph-input) attention_bias.
+    # head_size=8 (onnxruntime's own GroupQueryAttention kernel requires a
+    # multiple of 8) with every column WITHIN a head sharing that head's own
+    # single value keeps each chain's own kept-head set fully deterministic
+    # and, by construction, DISJOINT from the other's -- so if the merged
+    # code ever applied one chain's own `keep_q_heads`/`keep_heads` index set
+    # (or wrong input index) to the other's node, the assertions below on the
+    # inserted Gathers' own indices content would catch it immediately.
+    seq = 3
+    batch = 1
+    d = 8
+
+    def _per_head(values):
+        return np.repeat(np.asarray(values, dtype=np.float32), d).reshape(1, -1)
+
+    # GQA branch: group 1 (query heads {2, 3}) is the more important KV
+    # group by construction (larger Wk/Wv magnitude), so sparsity=0.5 (1 of
+    # 2 KV groups dropped) keeps exactly heads {2, 3}.
+    wq_g = _per_head([1.0, 2.0, 3.0, 4.0])
+    wk_g = _per_head([10.0, 20.0])
+    wv_g = _per_head([100.0, 200.0])
+    wout_g = np.eye(4 * d, dtype=np.float32)
+
+    # MHA branch: heads are ranked in the OPPOSITE order (head 0 most
+    # important), so the same sparsity=0.5 keeps exactly heads {0, 1} --
+    # disjoint from the GQA branch's own kept {2, 3}.
+    wq_m = _per_head([40.0, 30.0, 20.0, 10.0])
+    wk_m = np.ones((1, 4 * d), dtype=np.float32)
+    wv_m = np.ones((1, 4 * d), dtype=np.float32)
+    wout_m = np.eye(4 * d, dtype=np.float32)
+
+    seqlensk = np.full((batch,), seq - 1, dtype=np.int32)
+    totalseq = np.array(seq, dtype=np.int32)
+
+    body = f"""
+        g (float[{batch},{seq},1] X,
+           float[1,4,{seq},{seq}] AttnBiasGqaIn,
+           float[1,4,{seq},{seq}] AttnBiasMhaIn)
+          => (float[{batch},{seq},{4 * d}] Yg, float[{batch},{seq},{4 * d}] Ym)
+        {{
+          qg = MatMul(X, WqG)
+          kg = MatMul(X, WkG)
+          vg = MatMul(X, WvG)
+          ctxg, pkg, pvg = com.microsoft.GroupQueryAttention <num_heads=4, kv_num_heads=2> (qg, kg, vg, , , SeqLensK, TotalSeq, , , , AttnBiasGqaIn)
+          Yg = MatMul(ctxg, WoutG)
+          qm = MatMul(X, WqM)
+          km = MatMul(X, WkM)
+          vm = MatMul(X, WvM)
+          ctxm = com.microsoft.MultiHeadAttention <num_heads=4> (qm, km, vm, , , AttnBiasMhaIn)
+          Ym = MatMul(ctxm, WoutM)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(wq_g, "WqG"),
+            _f32(wk_g, "WkG"),
+            _f32(wv_g, "WvG"),
+            _f32(wout_g, "WoutG"),
+            _f32(wq_m, "WqM"),
+            _f32(wk_m, "WkM"),
+            _f32(wv_m, "WvM"),
+            _f32(wout_m, "WoutM"),
+            onnx.numpy_helper.from_array(seqlensk, "SeqLensK"),
+            onnx.numpy_helper.from_array(totalseq, "TotalSeq"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    gqa_node = next(n for n in pruned.graph.node if n.op_type == "GroupQueryAttention")
+    mha_node = next(n for n in pruned.graph.node if n.op_type == "MultiHeadAttention")
+    assert next(a.i for a in gqa_node.attribute if a.name == "num_heads") == 2
+    assert next(a.i for a in gqa_node.attribute if a.name == "kv_num_heads") == 1
+    assert next(a.i for a in mha_node.attribute if a.name == "num_heads") == 2
+
+    # Each node's own attention_bias input now names a freshly-inserted
+    # Gather's own output -- distinct nodes reading from each's own original
+    # dynamic input, never each other's.
+    gqa_bias_name = gqa_node.input[10]
+    mha_bias_name = mha_node.input[5]
+    assert gqa_bias_name != mha_bias_name
+
+    gather_by_output = {
+        n.output[0]: n for n in pruned.graph.node if n.op_type == "Gather"
+    }
+    init_by_name = {t.name: t for t in pruned.graph.initializer}
+    gqa_gather = gather_by_output[gqa_bias_name]
+    mha_gather = gather_by_output[mha_bias_name]
+    assert gqa_gather.name != mha_gather.name
+    assert gqa_gather.input[0] == "AttnBiasGqaIn"
+    assert mha_gather.input[0] == "AttnBiasMhaIn"
+
+    gqa_indices = list(onnx.numpy_helper.to_array(init_by_name[gqa_gather.input[1]]))
+    mha_indices = list(onnx.numpy_helper.to_array(init_by_name[mha_gather.input[1]]))
+    assert gqa_indices == [2, 3]
+    assert mha_indices == [0, 1]
+
+    # No name collision between the two independently-inserted Gathers/
+    # indices initializers -- a shared, incorrectly-threaded `used_names`
+    # set across the two chains would otherwise silently produce two
+    # differently-behaving nodes with the same name.
+    node_names = [n.name for n in pruned.graph.node if n.name]
+    assert len(node_names) == len(set(node_names))
+    init_names = [t.name for t in pruned.graph.initializer]
+    assert len(init_names) == len(set(init_names))
+
+    # Functional smoke test: the rewritten graph is still valid, executable
+    # ONNX -- each branch's own Gather correctly feeds its own node.
+    rng = np.random.default_rng(0)
+    feeds = {
+        "X": rng.standard_normal((batch, seq, 1)).astype(np.float32),
+        "AttnBiasGqaIn": rng.standard_normal((1, 4, seq, seq)).astype(np.float32),
+        "AttnBiasMhaIn": rng.standard_normal((1, 4, seq, seq)).astype(np.float32),
+    }
+    outs = _run(pruned, feeds)
+    assert all(np.isfinite(o).all() for o in outs)
+
+
+def test_cpp_attention_head_pruning_dmmha_and_mha_constant_inputs_do_not_cross_contaminate():
+    # A DecoderMaskedMultiHeadAttention node (attention_bias at index 4,
+    # past_key/past_value at 5/6) and a MultiHeadAttention node
+    # (attention_bias at index 5, past_key/past_value at 6/7) side by side in
+    # one graph -- deliberately overlapping-but-different index conventions,
+    # the exact shape of bug a copy-paste merge error between the two
+    # families' own matchers/appliers would produce. Every per-head constant
+    # here is filled with the head index scaled by a distinct base, so a
+    # sliced tensor's own surviving values pin exactly which head indices
+    # each op's own inputs were sliced by.
+    K = 1
+    Hd, Hm = 3, 4
+    total_seq = 2
+    past_seq = 2
+
+    # DecoderMaskedMultiHeadAttention: head 0 most important, so
+    # sparsity=1/3 (round(3/3)=1 KV/query head dropped) keeps heads {0, 1}.
+    wq_d = np.array([[100.0, 10.0, 1.0]], dtype=np.float32)
+    wk_d = np.ones((1, Hd), dtype=np.float32)
+    wv_d = np.ones((1, Hd), dtype=np.float32)
+    wout_d = np.eye(Hd, dtype=np.float32)
+    attn_bias_d = np.array(
+        [[[[h * 10.0] * total_seq] for h in range(Hd)]], dtype=np.float32
+    )
+    past_key_d = np.array(
+        [[[[h * 1000.0] * 1] * past_seq for h in range(Hd)]], dtype=np.float32
+    )
+    past_value_d = np.array(
+        [[[[h * 1000.0 + 1] * 1] * past_seq for h in range(Hd)]], dtype=np.float32
+    )
+
+    # MultiHeadAttention: head 3 most important, so sparsity=1/3
+    # (round(4/3)=1 head dropped) keeps heads {1, 2, 3}.
+    wq_m = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+    wk_m = np.ones((1, Hm), dtype=np.float32)
+    wv_m = np.ones((1, Hm), dtype=np.float32)
+    wout_m = np.eye(Hm, dtype=np.float32)
+    attn_bias_m = np.array(
+        [[[[h * 100.0] * total_seq] * total_seq for h in range(Hm)]], dtype=np.float32
+    )
+    past_key_m = np.array(
+        [[[[h * 10000.0] * 1] * past_seq for h in range(Hm)]], dtype=np.float32
+    )
+    past_value_m = np.array(
+        [[[[h * 10000.0 + 1] * 1] * past_seq for h in range(Hm)]], dtype=np.float32
+    )
+
+    body = f"""
+        g (float[1,1,{K}] X) => (float[1,1,{Hd}] Yd, float[1,1,{Hm}] Ym)
+        {{
+          qd = MatMul(X, WqD)
+          kd = MatMul(X, WkD)
+          vd = MatMul(X, WvD)
+          ctxd = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={Hd}> (qd, kd, vd, , AttnBiasD, PastKeyD, PastValueD)
+          Yd = MatMul(ctxd, WoutD)
+          qm = MatMul(X, WqM)
+          km = MatMul(X, WkM)
+          vm = MatMul(X, WvM)
+          ctxm = com.microsoft.MultiHeadAttention <num_heads={Hm}> (qm, km, vm, , , AttnBiasM, PastKeyM, PastValueM)
+          Ym = MatMul(ctxm, WoutM)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(wq_d, "WqD"),
+            _f32(wk_d, "WkD"),
+            _f32(wv_d, "WvD"),
+            _f32(wout_d, "WoutD"),
+            _f32(attn_bias_d, "AttnBiasD"),
+            _f32(past_key_d, "PastKeyD"),
+            _f32(past_value_d, "PastValueD"),
+            _f32(wq_m, "WqM"),
+            _f32(wk_m, "WkM"),
+            _f32(wv_m, "WvM"),
+            _f32(wout_m, "WoutM"),
+            _f32(attn_bias_m, "AttnBiasM"),
+            _f32(past_key_m, "PastKeyM"),
+            _f32(past_value_m, "PastValueM"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=1 / 3)
+    onnx.checker.check_model(pruned)
+
+    dmmha_node = next(
+        n for n in pruned.graph.node if n.op_type == "DecoderMaskedMultiHeadAttention"
+    )
+    mha_node = next(n for n in pruned.graph.node if n.op_type == "MultiHeadAttention")
+    assert next(a.i for a in dmmha_node.attribute if a.name == "num_heads") == 2
+    assert next(a.i for a in mha_node.attribute if a.name == "num_heads") == 3
+
+    init_by_name = {t.name: t for t in pruned.graph.initializer}
+
+    # DecoderMaskedMultiHeadAttention's own attention_bias/past_key/past_value
+    # (indices 4/5/6) are sliced to its OWN kept heads {0, 1} -- never
+    # touched by MultiHeadAttention's own {1, 2, 3}.
+    pruned_bias_d = onnx.numpy_helper.to_array(init_by_name[dmmha_node.input[4]])
+    assert list(pruned_bias_d[0, :, 0, 0]) == [0.0, 10.0]
+    pruned_past_key_d = onnx.numpy_helper.to_array(init_by_name[dmmha_node.input[5]])
+    assert list(pruned_past_key_d[0, :, 0, 0]) == [0.0, 1000.0]
+
+    # MultiHeadAttention's own attention_bias/past_key/past_value (indices
+    # 5/6/7) are sliced to ITS OWN kept heads {1, 2, 3} -- never touched by
+    # DecoderMaskedMultiHeadAttention's own {0, 1}.
+    pruned_bias_m = onnx.numpy_helper.to_array(init_by_name[mha_node.input[5]])
+    assert list(pruned_bias_m[0, :, 0, 0]) == [100.0, 200.0, 300.0]
+    pruned_past_key_m = onnx.numpy_helper.to_array(init_by_name[mha_node.input[6]])
+    assert list(pruned_past_key_m[0, :, 0, 0]) == [10000.0, 20000.0, 30000.0]
