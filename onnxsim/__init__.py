@@ -75,6 +75,7 @@ from onnxsim.gguf_ternary_quant import (
     apply_gguf_ternary_quantization,
     quantize_dequantize_ternary,
 )
+from onnxsim.gptaq import apply_gptaq
 from onnxsim.gptq import apply_gptq
 from onnxsim.gptvq import quantize_weight_only_gptvq
 from onnxsim.hf_reconstruct import read_hf_config, reconstruct_hf_graph
@@ -264,6 +265,7 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_gptaq",
     "apply_ptq4vit_quantization",
     "apply_qronos",
     "quantize_weight_only_qoq",
