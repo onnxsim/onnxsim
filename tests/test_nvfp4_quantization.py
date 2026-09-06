@@ -126,7 +126,13 @@ def test_nvfp4_effective_scale_is_a_rounded_e4m3_value_times_a_shared_global_sca
     # Every raw (pre-global-scale) block scale must itself be an exact
     # element of the E4M3 grid -- that is NVFP4's whole point.
     nearest = _round_to_e4m3(raw_block_scale)
-    assert np.allclose(nearest, raw_block_scale, rtol=1e-9, atol=1e-9)
+    # `effective_scale` round-tripped through the graph's float32 initializer,
+    # so `raw_block_scale` (recovered by dividing back out the exact float64
+    # global_scale) only matches the original float64 block_scale to float32
+    # precision (~1e-7 relative) -- comfortably tighter than the E4M3 grid's
+    # own spacing (as coarse as 32 at this magnitude), so this still clearly
+    # distinguishes "on the grid" from "an arbitrary unrounded value".
+    assert np.allclose(nearest, raw_block_scale, rtol=1e-5, atol=1e-3)
     assert np.all(raw_block_scale <= FLOAT8_E4M3_MAX + 1e-6)
 
 
