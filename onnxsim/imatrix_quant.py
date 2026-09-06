@@ -236,30 +236,42 @@ def quantize_dequantize_int4_imatrix(
     if k % block_size != 0:
         raise ValueError(f"K ({k}) must be a multiple of block_size ({block_size})")
     if importance_k.shape != (k,):
-        raise ValueError(f"importance_k must have shape ({k},), got {importance_k.shape}")
+        raise ValueError(
+            f"importance_k must have shape ({k},), got {importance_k.shape}"
+        )
 
     num_blocks = k // block_size
     blocks = w_nk.reshape(n, num_blocks, block_size)
     imp_blocks = importance_k.reshape(num_blocks, block_size)
 
-    base_scale = np.maximum(np.abs(blocks).max(axis=2), 1e-12) / _MAX_CODE  # [N, num_blocks]
+    base_scale = (
+        np.maximum(np.abs(blocks).max(axis=2), 1e-12) / _MAX_CODE
+    )  # [N, num_blocks]
     low, high = scale_search_range
     best_err = np.full((n, num_blocks), np.inf)
     best_scale = base_scale.copy()
     for factor in np.linspace(low, high, num_scale_candidates):
         trial_scale = np.maximum(base_scale * factor, 1e-12)  # [N, num_blocks]
-        codes = np.clip(np.round(blocks / trial_scale[:, :, np.newaxis]), -_MAX_CODE, _MAX_CODE)
+        codes = np.clip(
+            np.round(blocks / trial_scale[:, :, np.newaxis]), -_MAX_CODE, _MAX_CODE
+        )
         recon = codes * trial_scale[:, :, np.newaxis]
-        weighted_err = np.sum(imp_blocks[np.newaxis, :, :] * (blocks - recon) ** 2, axis=2)
+        weighted_err = np.sum(
+            imp_blocks[np.newaxis, :, :] * (blocks - recon) ** 2, axis=2
+        )
         improved = weighted_err < best_err
         best_err = np.where(improved, weighted_err, best_err)
         best_scale = np.where(improved, trial_scale, best_scale)
 
-    best_codes = np.clip(np.round(blocks / best_scale[:, :, np.newaxis]), -_MAX_CODE, _MAX_CODE)
+    best_codes = np.clip(
+        np.round(blocks / best_scale[:, :, np.newaxis]), -_MAX_CODE, _MAX_CODE
+    )
     return (best_codes * best_scale[:, :, np.newaxis]).reshape(n, k)
 
 
-def quantize_dequantize_int4_plain(w_nk: np.ndarray, block_size: int = 32) -> np.ndarray:
+def quantize_dequantize_int4_plain(
+    w_nk: np.ndarray, block_size: int = 32
+) -> np.ndarray:
     """Plain (unweighted) block-wise INT4 quantize-dequantize round trip of
     ``w_nk`` (``[N, K]``) -- the baseline
     :func:`quantize_dequantize_int4_imatrix` is compared against, built
