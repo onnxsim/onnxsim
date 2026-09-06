@@ -2748,6 +2748,70 @@ def apply_iq4_nl_quantization_cpp(
     return onnx.load_from_string(C.apply_iq4_nl(model.SerializeToString()))
 
 
+def apply_gguf_q4_0_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q4_0_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's legacy Q4_0 format -- one
+    symmetric scale per 32-element block of the weight's own flattened
+    storage, no separate min (``dequant = (code - 8) * d``). See
+    :func:`onnxsim.apply_gguf_q4_0_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q4_0 quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q4_0_quantization(model.SerializeToString())
+    )
+
+
+def apply_gguf_q4_1_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q4_1_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's legacy Q4_1 format -- one scale and
+    one explicit min per 32-element block of the weight's own flattened
+    storage (``dequant = code * d + m``). See
+    :func:`onnxsim.apply_gguf_q4_1_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q4_1 quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q4_1_quantization(model.SerializeToString())
+    )
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:

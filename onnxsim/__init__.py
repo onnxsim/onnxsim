@@ -59,6 +59,12 @@ from onnxsim.foem import apply_foem
 from onnxsim.fptq import apply_fptq
 from onnxsim.gear import apply_gear
 from onnxsim.gguf_kquant import apply_gguf_q4_k_quantization, quantize_dequantize_q4_k
+from onnxsim.gguf_legacy_quant import (
+    apply_gguf_q4_0_quantization,
+    apply_gguf_q4_1_quantization,
+    quantize_dequantize_q4_0,
+    quantize_dequantize_q4_1,
+)
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -105,6 +111,8 @@ from onnxsim.onnx_simplifier import (
     apply_double_quantization_cpp,
     apply_embedding_vocab_magnitude_pruning_cpp,
     apply_embedding_vocab_pruning_cpp,
+    apply_gguf_q4_0_quantization_cpp,
+    apply_gguf_q4_1_quantization_cpp,
     apply_iq4_nl_quantization_cpp,
     apply_moe_expert_channel_pruning_cpp,
     apply_moe_whole_expert_pruning_cpp,
@@ -357,6 +365,12 @@ __all__ = [
     "apply_gear",
     "apply_gguf_q4_k_quantization",
     "quantize_dequantize_q4_k",
+    "apply_gguf_q4_0_quantization",
+    "apply_gguf_q4_0_quantization_cpp",
+    "apply_gguf_q4_1_quantization",
+    "apply_gguf_q4_1_quantization_cpp",
+    "quantize_dequantize_q4_0",
+    "quantize_dequantize_q4_1",
     "apply_iq4_nl_quantization",
     "apply_iq4_nl_quantization_cpp",
     "quantize_dequantize_iq4_nl",

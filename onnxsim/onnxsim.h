@@ -627,6 +627,41 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
 // two independently-correct, non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
 
+// llama.cpp's legacy GGUF "Q4_0"/"Q4_1" block formats -- C++ port of
+// gguf_legacy_quant.py's own apply_gguf_q4_0_quantization/
+// apply_gguf_q4_1_quantization. Weight-only quantizes every MatMul/
+// vanilla-Gemm layer with a constant 2-D float32 weight, one plain
+// 32-element block at a time over the weight's own flattened storage (no
+// super-block/sub-block requantization like Q4_K, no fixed codebook like
+// IQ4_NL): Q4_0 is symmetric with no separate min
+// (``dequant = (code - 8) * d``, code in [0, 15]); Q4_1 is asymmetric with
+// an explicit per-block min (``dequant = code * d + m``, code in [0, 15]).
+// See ``passes/gguf_legacy_quant.h`` for the exact rewrite, and
+// gguf_legacy_quant.py's own docstring for the full rationale and this
+// format's own encoder-provenance honesty note (the dequantization formula
+// is transcribed from this repo's own verified
+// ``onnxsim/ggml_legacy_quant.h`` decoder; the encoder's own choice of
+// d/m is an ordinary, honestly-scoped min/max fit, not a verified
+// reproduction of llama.cpp's own encoder).
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization``'s
+// Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization``
+// (``gguf_legacy_quant.py``): not required to be bit-for-bit identical (see
+// ``passes/gguf_legacy_quant.h``'s own note on why this port is
+// nonetheless expected to track the Python port unusually closely, having
+// no accumulation or iterative-refinement step at all) --
+// ``ApplyGgufQ4_0``/``ApplyGgufQ4_1`` and their ``_cpp`` Python wrappers
+// and ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization`` are
+// independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
+
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
 // weight tensors, smaller matmuls on any runtime), as opposed to
