@@ -1785,3 +1785,45 @@ def test_mcode_headers_are_field_writes_with_a_shared_map_across_models(tmp_path
     assert (
         sum(1 for xx, yy, _ in _header_fields(r18) if (xx, yy) == (0x40, 0x02)) == 181
     )
+
+
+def test_resnet18d_three_per_op_fields_are_91_percent_of_all_field_writes(tmp_path):
+    """Confirmed real (see the README's "Typing the field map" section),
+    all local: resnet18d writes 68 distinct fields, but 57 of them fewer
+    than three times (one-time setup), and just three per-op fields --
+    `50 01` (flag), `40 02` (Wbt offset), `50 03` (the ~3.1 MB address
+    region) -- account for 1,086 of the 1,197 writes, 91%. Needs Docker
+    for the build but no device.
+    """
+    from collections import Counter
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    fields = _header_fields(mcode)
+    writes = Counter((xx, yy) for xx, yy, _ in fields)
+    assert len(writes) >= 60, len(writes)
+    assert sum(1 for n in writes.values() if n < 3) >= 50, writes.most_common(12)
+
+    hot = writes[(0x50, 0x01)] + writes[(0x40, 0x02)] + writes[(0x50, 0x03)]
+    assert hot >= 0.9 * len(fields), (hot, len(fields))
+    assert len({v for xx, yy, v in fields if (xx, yy) == (0x50, 0x03)}) >= 170
+
+
+def test_resnet18d_50_03_operands_are_a_64_byte_aligned_tile_arena(tmp_path):
+    """Confirmed real (see the README's "`50 03` is not whole activation
+    tensors" section), all local: the 176 distinct `50 03` operands are
+    64-byte aligned (175 of 176 exact multiples of 64), span ~3.1 MB, and
+    their consecutive deltas are tile-sized, not activation-tensor-sized
+    -- the largest resnet18d activation is 802,816 bytes and the span is
+    neither that nor the sum of all intermediates. Needs Docker for the
+    build but no device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    ops = sorted({v for xx, yy, v in _header_fields(mcode) if (xx, yy) == (0x50, 0x03)})
+    assert len(ops) >= 170, len(ops)
+    assert sum(1 for o in ops if o % 64 == 0) >= len(ops) - 1, (
+        "expected 64-byte alignment"
+    )
+    assert 3_000_000 < max(ops) < 3_300_000, max(ops)
+    deltas = [b - a for a, b in zip(ops, ops[1:])]
+    assert max(deltas) < 802_816, "expected tile-sized deltas, not tensor-sized ones"
+    assert min(o for o in ops if o) == 37_120
