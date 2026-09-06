@@ -3102,13 +3102,41 @@ opens every segment of these mcodes (`a7.0a` in the CNNs, `a7.10` in the
 ONNX-path Mistral), so `a7` reads as a synchronization verb -- a wait
 or fence on channel `yy` before the engine-dispatch verbs and a signal
 on channel 2 after them -- that the CNN op programs never need and the
-BF16 layer programs use on every op. Untested on device: an `a7`-patch
-run is the obvious next experiment. The layer's two small segments (14
+BF16 layer programs use on every op. The layer's two small segments (14
 and 15 programs on types 0x0c01/0xf001 in decode, 6 and 6 in prefill)
 hold the core followed by runs of 2..13 `a2 00.00` verbs, plus one
 program per segment that writes every field 0x40..0xe0 of banks 2, 3
 and 4 in order -- a full register load, presumably the KV-cache and
 I/O binding.
+
+**Confirmed on the AX650N: `a7` is a synchronization verb, and its
+operand is what matters.** The layer-0 decode subgraph runs on the real
+device only when fed valid inputs (`axcl_run_model`'s random bytes land
+in the `indices` gather input and fault it with `0x8030070C`, exactly
+as the harness's `run_on_device_with_inputs()` docstring warns); with
+zero K/V caches, a zero hidden state and in-range indices it runs in
+0.44 ms and its three outputs are bit-identical run to run. Hand-patching
+its decode mcode and re-running, every outcome reproduced 3 of 3 times:
+
+| patch (decode subgraph) | edits | result |
+|---|---|---|
+| in-program `a7.02` operand 2 -> 0 | 102 | runs, **all three outputs change** |
+| in-program `a7.02` operand 2 -> 1 | 102 | runs, outputs change differently (K and V outputs become identical) |
+| in-program `a7.02` channel 02 -> 1e | 102 | runs, outputs **identical** to baseline |
+| in-program `a7.02` channel 02 -> 03 | 102 | runs, outputs change (same as operand 0) |
+| in-program `a7.1e` operand 0 -> 1 | 103 | **fault `0x8030070C`** |
+| in-program `a7.1e` channel 1e -> 02 | 103 | runs, outputs identical |
+| segment-opening `a7.1e` markers, operand 0 -> 1 | 15 | **fault `0x8030070C`** |
+
+So the operand-0 form (`a7.1e`, at every segment start and before each
+op's dispatch verbs) is a wait or reset that must read 0, the operand-2
+form (`a7.02`, after each op's dispatch) is a post whose value fixes
+what the consumers of that op see -- change it and the pipeline still
+runs to completion but with a different (racy or stale) data ordering,
+producing wrong outputs with no fault -- and the channel byte
+distinguishes 0x02/0x1e from 0x03 but not from each other. The
+timing differences between variants were within run-to-run noise
+(0.43..0.54 ms) and are not claimed.
 
 **`llm_build` emits one instruction stream for all 30 layers.** Every
 per-layer file's two mcodes are byte-identical to layer 0's from the

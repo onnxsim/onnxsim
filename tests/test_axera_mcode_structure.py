@@ -3190,3 +3190,139 @@ def test_onnx_path_llm_mcode_keeps_the_op_program_skeleton(tmp_path):
     for prog, _ in top:
         assert tuple(v for v in prog if v in core) == core, prog
     assert sum(c for prog, c in skeletons.items() if (0xA1, 0x20, 0x02) in prog) >= 5
+
+
+def _llm_layer_inputs(model):
+    """Valid inputs for an `llm_build` per-layer file's decode subgraph
+    (group 0: the graph inputs not suffixed `_1`): zero K/V caches, zero
+    hidden state and mask, and *in-range* `indices` -- `axcl_run_model`'s
+    own random bytes land in that gather input and fault the NPU."""
+    sizes = {onnx.TensorProto.BFLOAT16: 2, onnx.TensorProto.FLOAT: 4}
+    sizes.update(
+        {
+            onnx.TensorProto.INT32: 4,
+            onnx.TensorProto.UINT32: 4,
+            onnx.TensorProto.INT64: 8,
+        }
+    )
+    inputs = {}
+    for i in model.graph.input:
+        if i.name.endswith("_1"):
+            continue
+        n = int(np.prod([d.dim_value for d in i.type.tensor_type.shape.dim] or [1]))
+        size = sizes[i.type.tensor_type.elem_type]
+        if i.name.startswith("indices"):
+            inputs[i.name] = np.arange(
+                n, dtype=np.int32 if size == 4 else np.int64
+            ).tobytes()
+        else:
+            inputs[i.name] = b"\x00" * (n * size)
+    return inputs
+
+
+def _run_llm_layer(path, inputs, times):
+    """Run a per-layer file `times` times; returns a list of outcomes, each
+    either the string "fault" (a `0x8030070C` rejection) or the tuple of
+    output digests. Empty-output runs (the runtime's own transient) are
+    skipped, so callers judge on what actually came back."""
+    import hashlib
+
+    out = []
+    for _ in range(times):
+        r = pulsar2_docker.run_on_device_with_inputs(path, inputs, repeat=1, warmup=1)
+        if r.error and "0x8030070C" in r.error:
+            out.append("fault")
+        elif r.outputs:
+            out.append(tuple(hashlib.sha1(o).hexdigest() for o in r.outputs))
+    return out
+
+
+def test_llm_build_a7_is_a_sync_verb_on_device(tmp_path):
+    """Confirmed real on the AX650N (see the README's "Confirmed on the
+    AX650N: `a7` is a synchronization verb" table), on a fresh `llm_build`
+    of SmolLM2-135M: the layer-0 decode subgraph runs deterministically
+    with valid inputs; patching every in-program `a7.02` operand from 2 to
+    0 keeps it running but changes every output; patching every in-program
+    `a7.1e` operand from 0 to 1 faults; re-routing `a7.02` to channel 0x1e
+    leaves the outputs identical. Each outcome must reproduce on both of
+    two runs. Skips without a device or the cached checkpoint.
+    """
+    import shutil
+
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+    result = pulsar2_docker.llm_build(str(work), "SmolLM2-135M", "output", parallel=8)
+    assert result.success, getattr(result, "error", None)
+    layer = str(work / "output" / "llama_p512_l0_together.axmodel")
+
+    model = onnx.load(layer)
+    inputs = _llm_layer_inputs(model)
+    neu0 = next(n for n in model.graph.node if n.op_type == "neu mode")
+    info = json.loads(
+        next(a for a in neu0.attribute if a.name == "npu_graph_info").s.decode()
+    )
+    key = info["dotneus"][0]["neu_key"]
+    mcode = bytes(next(i for i in model.graph.initializer if i.name == key).raw_data)
+    _, segs = _segments(mcode)
+    ops = next(s for s in segs if s[2][0] == 0x8801)
+    toks = _tokenize_mcode(mcode, start=ops[0], end=ops[0] + ops[1], **_FULL_RULE)
+    a7_02 = [t[0] for t in toks if t[1] == "V" and t[2] == 0xA7 and t[4] == 0x02]
+    a7_1e = [t[0] for t in toks if t[1] == "V" and t[2] == 0xA7 and t[4] == 0x1E]
+    assert len(a7_02) >= 50 and len(a7_1e) >= 50, (len(a7_02), len(a7_1e))
+
+    def patched(name, edit):
+        b = bytearray(mcode)
+        edit(b)
+        m2 = onnx.ModelProto()
+        m2.CopyFrom(model)
+        next(i for i in m2.graph.initializer if i.name == key).raw_data = bytes(b)
+        path = str(tmp_path / f"{name}.axmodel")
+        onnx.save(m2, path)
+        return path
+
+    def set_operand(offs, val):
+        def edit(b):
+            for o in offs:
+                struct.pack_into("<I", b, o + 4, val)
+
+        return edit
+
+    def set_channel(offs, ch):
+        def edit(b):
+            for o in offs:
+                b[o + 3] = ch
+
+        return edit
+
+    # The runtime can reject one run transiently with the same fault code
+    # (see `_run_retry_once`), so a variant that is *expected to run* is
+    # judged on its non-fault runs -- at least two, all equal -- while a
+    # variant expected to fault must fault on every run.
+    def good(outcomes):
+        return [o for o in outcomes if o != "fault"]
+
+    base = good(_run_llm_layer(layer, inputs, 3))
+    assert len(base) >= 2 and len(set(base)) == 1, base
+    baseline = base[0]
+
+    changed = good(
+        _run_llm_layer(patched("a7_02_operand_0", set_operand(a7_02, 0)), inputs, 3)
+    )
+    assert len(changed) >= 2 and len(set(changed)) == 1, changed
+    assert all(a != b for a, b in zip(changed[0], baseline)), (changed[0], baseline)
+
+    faulted = _run_llm_layer(
+        patched("a7_1e_operand_1", set_operand(a7_1e, 1)), inputs, 2
+    )
+    assert faulted == ["fault", "fault"], faulted
+
+    same = good(
+        _run_llm_layer(patched("a7_02_channel_1e", set_channel(a7_02, 0x1E)), inputs, 3)
+    )
+    assert len(same) >= 2 and all(s == baseline for s in same), same
