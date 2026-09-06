@@ -1,0 +1,51 @@
+--- a/ax_pcie_dev_host.c
++++ b/ax_pcie_dev_host.c
+@@ -242,6 +242,30 @@
+ }
+ #endif
+ 
++static ax_pcie_hotplug_notify_t g_hotplug_notify_cb;
++static DEFINE_MUTEX(g_hotplug_notify_lock);
++
++void ax_pcie_register_hotplug_notify(ax_pcie_hotplug_notify_t cb)
++{
++	mutex_lock(&g_hotplug_notify_lock);
++	g_hotplug_notify_cb = cb;
++	mutex_unlock(&g_hotplug_notify_lock);
++}
++EXPORT_SYMBOL(ax_pcie_register_hotplug_notify);
++
++/*
++ * The lock is held across the callback so that an unregister (the callback
++ * owner's module_exit) cannot complete while a callback is in flight -- it
++ * would otherwise be possible to call into unloaded module text.
++ */
++static void ax_pcie_hotplug_notify(unsigned int target, int event)
++{
++	mutex_lock(&g_hotplug_notify_lock);
++	if (g_hotplug_notify_cb)
++		g_hotplug_notify_cb(target, event);
++	mutex_unlock(&g_hotplug_notify_lock);
++}
++
+ static int ax_pcie_dev_probe(struct pci_dev *pdev,
+ 			     const struct pci_device_id *pci_id)
+ {
+@@ -362,6 +386,8 @@
+ 			goto request_msg_irq_err;
+ 	}
+ 
++	ax_pcie_hotplug_notify(ax_dev->slot_index, AX_PCIE_DEV_ADDED);
++
+ 	/* return success */
+ 	return 0;
+ 
+@@ -403,6 +429,8 @@
+ 		return;
+ 	}
+ 
++	ax_pcie_hotplug_notify(ax_dev->slot_index, AX_PCIE_DEV_REMOVED);
++
+ 	for (bar = BAR_0; bar <= BAR_5; bar++) {
+ 		if (ax_dev->bar_virt[bar])
+ 			pci_iounmap(pdev, ax_dev->bar_virt[bar]);

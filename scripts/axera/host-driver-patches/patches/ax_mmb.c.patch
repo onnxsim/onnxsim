@@ -1,0 +1,24 @@
+--- a/ax_mmb.c
++++ b/ax_mmb.c
+@@ -291,7 +291,20 @@
+ 	void *tmpvirtaddr;
+ 	unsigned long tmpphyaddr;
+ 
+-	tmpvirtaddr = kmalloc(size, GFP_KERNEL);
++	/*
++	 * size starts at MAX_SG_ALLOC_SIZE (4M, order-10) and the caller halves
++	 * it down to MIN_SG_ALLOC_SIZE on failure. Above PAGE_ALLOC_COSTLY_ORDER
++	 * (order 3, 32K) a plain GFP_KERNEL kmalloc() drives direct
++	 * reclaim/compaction to find a physically-contiguous run and, on
++	 * failure, dumps a "page allocation failure" WARN with a full stack
++	 * trace/meminfo -- easily mistaken for a kernel crash, and the
++	 * reclaim/compaction pass itself can stall for a long time under
++	 * fragmentation even though plenty of (non-contiguous) memory is free.
++	 * __GFP_NORETRY skips that expensive reclaim so oversized attempts fail
++	 * fast and fall through to the next halved size; __GFP_NOWARN silences
++	 * the backtrace since ax_mmb already logs the failure itself below.
++	 */
++	tmpvirtaddr = kmalloc(size, GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
+ 	if (!tmpvirtaddr) {
+ 		PCIe_PRINT(PCIe_ERR, "kmalloc %x memory failed\n", size);
+ 		return -1;

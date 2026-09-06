@@ -1,0 +1,14 @@
+--- a/ax_pcie_dev.h
++++ b/ax_pcie_dev.h
+@@ -297,6 +297,11 @@
+ extern struct ax_pcie_operation *g_pcie_opt;
+ extern struct axera_dev *g_axera_dev_map[MAX_PCIE_DEVICES];
+ 
++#define AX_PCIE_DEV_REMOVED	0
++#define AX_PCIE_DEV_ADDED	1
++typedef void (*ax_pcie_hotplug_notify_t) (unsigned int target, int event);
++extern void ax_pcie_register_hotplug_notify(ax_pcie_hotplug_notify_t cb);
++
+ extern int ax_pcie_arch_init(struct ax_pcie_operation *handler);
+ extern unsigned int get_pcie_controller(int bar);
+ extern void ax_pcie_arch_exit(void);

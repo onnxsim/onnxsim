@@ -1,0 +1,352 @@
+--- a/axcl_pcie_host.c
++++ b/axcl_pcie_host.c
+@@ -29,7 +29,19 @@
+ #define AXCL_DUMP_ADDR_SRC	(0x100000000)
+ 
+ static DEFINE_MUTEX(ioctl_mutex);
+-static struct task_struct *heartbeat[32];
++static struct task_struct *heartbeat[AXERA_MAX_MAP_DEV];
++/* stable thread argument: the axera_dev a slot_index lives in can be freed */
++static unsigned int heartbeat_target[AXERA_MAX_MAP_DEV];
++/* set before a device's BAR mappings are torn down; polling loops must bail */
++static volatile bool dev_offline[AXERA_MAX_MAP_DEV];
++/* bringing a reconnected device up blocks for a long time; keep it off the
++ * PCI probe path. Ordered so two devices are never brought up concurrently. */
++static struct workqueue_struct *axcl_hotplug_wq;
++
++struct axcl_online_work {
++	struct work_struct work;
++	unsigned int target;
++};
+ ax_pcie_msg_handle_t *port_handle[AXERA_MAX_MAP_DEV][MAX_MSG_PORTS];
+ 
+ static dma_addr_t phys_addr;
+@@ -208,6 +220,8 @@
+ 
+ 	ktime_get_ts64(&tv_start);
+ 	while (1) {
++		if (target < AXERA_MAX_MAP_DEV && dev_offline[target])
++			return -2;
+ 		ret = axcl_heartbeat_status(hbeat, target, count);
+ 		if (ret)
+ 			break;
+@@ -550,14 +564,6 @@
+ 
+ 	axcl_trace(AXCL_DEBUG, "target 0x%x thread running", target);
+ 
+-	axdev = g_pcie_opt->slot_to_axdev(target);
+-	if (!axdev) {
+-		axcl_trace(AXCL_ERR, "Get axdev is failed");
+-		return -1;
+-	}
+-
+-	hbeat = (struct device_heart_packet *)axdev->shm_base_virt;
+-
+ 	do {
+ 		if (kthread_should_stop()) {
+ 			break;
+@@ -568,6 +574,21 @@
+ 			printk("Continue to monitor dev %x heartbeats\n", target);
+ 		}
+ 
++		if (target >= AXERA_MAX_MAP_DEV || dev_offline[target]) {
++			axcl_trace(AXCL_ERR,
++				   "dev %x is gone, heartbeat thread exiting",
++				   target);
++			break;
++		}
++		axdev = g_pcie_opt->slot_to_axdev(target);
++		if (!axdev || !axdev->shm_base_virt) {
++			axcl_trace(AXCL_ERR,
++				   "dev %x has no mapping, heartbeat thread exiting",
++				   target);
++			break;
++		}
++		hbeat = (struct device_heart_packet *)axdev->shm_base_virt;
++
+ 		ret = axcl_heartbeat_recv_timeout(hbeat, target, count, timeout);
+ 		if (ret <= 0) {
+ 			axcl_trace(AXCL_ERR, "device %x: dead!", target);
+@@ -643,6 +664,11 @@
+ 		return -1;
+ 	}
+ 
++	if (target >= AXERA_MAX_MAP_DEV) {
++		axcl_trace(AXCL_ERR, "invalid target device: %u", target);
++		return -1;
++	}
++
+ 	if (!list_empty(&process_handle->dev_list)) {
+ 		list_for_each_safe(entry, tmp, &process_handle->dev_list) {
+ 			dev_handle = list_entry(entry, struct device_handle_t, head);
+@@ -686,6 +712,14 @@
+ 	dev_handle->device = target;
+ 	dev_handle->port_num = count;
+ 
++	if (!port_handle[target][port]) {
++		axcl_trace(AXCL_ERR,
++			   "port_handle for target %u port %u not open, dev not connected yet",
++			   target, port);
++		kfree(dev_handle);
++		return -1;
++	}
++
+ 	handle =
+ 	    (struct ax_transfer_handle *)port_handle[target][port]->pci_handle;
+ 	ret =
+@@ -1029,16 +1063,22 @@
+ 			devinfo.port_num = dev_handle->port_num;
+ 			memcpy(devinfo.ports, dev_handle->ports,
+ 			       dev_handle->port_num * sizeof(int));
+-			handle =
+-			    (struct ax_transfer_handle *)
+-			    port_handle[target][port]->pci_handle;
+-			ret =
+-			    axcl_pcie_msg_send(handle, (void *)&devinfo,
+-					       sizeof(struct axcl_device_info));
+-			if (ret < 0) {
++			if (port_handle[target][port]) {
++				handle =
++				    (struct ax_transfer_handle *)
++				    port_handle[target][port]->pci_handle;
++				ret =
++				    axcl_pcie_msg_send(handle, (void *)&devinfo,
++						       sizeof(struct axcl_device_info));
++				if (ret < 0) {
++					axcl_trace(AXCL_ERR,
++						   "Send dev %x destroy port msg info failed: %d",
++						   target, ret);
++				}
++			} else {
+ 				axcl_trace(AXCL_ERR,
+-					   "Send dev %x destroy port msg info failed: %d",
+-					   target, ret);
++					   "port_handle for target %x port %u not open, skip destroy msg",
++					   target, port);
+ 			}
+ 			axcl_clean_port_info(target, dev_handle);
+ 			list_del(&dev_handle->head);
+@@ -1314,6 +1354,160 @@
+ 	return 0;
+ }
+ 
++/*
++ * Called from ax_pcie_dev_remove() while the device's mappings are still
++ * valid. Drops every pointer this module cached into them and stops the
++ * heartbeat thread, so nothing follows a stale pointer once the BARs are
++ * unmapped and the axera_dev is freed.
++ */
++static void axcl_pcie_device_offline(unsigned int target)
++{
++	int port;
++
++	if (target >= AXERA_MAX_MAP_DEV)
++		return;
++
++	/* make the heartbeat poll loop bail out of its msleep(1000) cycle */
++	dev_offline[target] = true;
++
++	mutex_lock(&ioctl_mutex);
++	axcl_devices_heartbeat_status_set(target, AXCL_HEARTBEAT_DEAD);
++	for (port = 0; port < MAX_MSG_PORTS; port++) {
++		port_handle[target][port] = NULL;
++		port_info[target][port] = 0;
++	}
++	mutex_unlock(&ioctl_mutex);
++
++	/* release a thread parked on the DEAD wait so it can observe the flag */
++	htcondition[target] = true;
++	wake_up(&heart_waitqueue[target]);
++
++	if (heartbeat[target]) {
++		kthread_stop(heartbeat[target]);
++		heartbeat[target] = NULL;
++	}
++
++	axcl_trace(AXCL_ERR, "dev %x offline: cached handles dropped", target);
++}
++
++/*
++ * Bring one reconnected device up: the same sequence axcl_pcie_host_init()
++ * performs, for a single target. Kept separate from init's phased loops so
++ * that init still starts every device's firmware before waiting on any
++ * handshake (which lets multiple cards boot concurrently).
++ *
++ * Only ever called from the hotplug workqueue -- axcl_firmware_load() pushes
++ * ~150MB over PCIe and ax_pcie_msg_check_remote() can block for two minutes,
++ * so this must not run in a PCI probe callback.
++ */
++static int axcl_pcie_device_online(unsigned int target)
++{
++	struct axera_dev *ax_dev;
++	int ret;
++
++	if (target >= AXERA_MAX_MAP_DEV)
++		return -1;
++
++	ax_dev = g_pcie_opt->slot_to_axdev(target);
++	if (!ax_dev) {
++		axcl_trace(AXCL_ERR, "dev %x has no axdev, cannot bring up",
++			   target);
++		return -1;
++	}
++
++	dev_offline[target] = false;
++
++	/* 1. firmware loading */
++	ret = axcl_firmware_load(ax_dev);
++	if (ret < 0) {
++		axcl_trace(AXCL_ERR, "Device %x firmware load failed.", target);
++		goto dead;
++	}
++	if (dev_offline[target])
++		goto gone;
++
++	/* 2. create port */
++	ret = axcl_common_prot_create(target);
++	if (ret < 0)
++		goto dead;
++	if (dev_offline[target])
++		goto gone;
++
++	/* 3. rc and ep handshake */
++	axcl_trace(AXCL_ERR, "axcl wait dev %x handshake...", target);
++	ret = ax_pcie_msg_check_remote(target);
++	if (ret < 0) {
++		axcl_trace(AXCL_ERR, "axcl pcie check remote device %x failed",
++			   target);
++		goto dead;
++	}
++	if (dev_offline[target])
++		goto gone;
++	axcl_devices_heartbeat_status_set(target, AXCL_HEARTBEAT_ALIVE);
++
++	/* 4. timestamp sync */
++	axcl_timestamp_sync(target);
++
++	/* 5. heartbeat recv thread */
++	init_waitqueue_head(&heart_waitqueue[target]);
++	htcondition[target] = true;
++	heartbeat_target[target] = target;
++	heartbeat[target] = kthread_create(heartbeat_recv_thread,
++					   &heartbeat_target[target],
++					   "heartbeat_kthd");
++	if (IS_ERR(heartbeat[target])) {
++		ret = PTR_ERR(heartbeat[target]);
++		heartbeat[target] = NULL;
++		goto dead;
++	}
++	wake_up_process(heartbeat[target]);
++
++	axcl_trace(AXCL_ERR, "dev %x back online", target);
++	return 0;
++
++gone:
++	axcl_trace(AXCL_ERR, "dev %x went away again during bring-up", target);
++	ret = -1;
++dead:
++	axcl_devices_heartbeat_status_set(target, AXCL_HEARTBEAT_DEAD);
++	return ret;
++}
++
++static void axcl_pcie_device_online_work(struct work_struct *work)
++{
++	struct axcl_online_work *ow =
++	    container_of(work, struct axcl_online_work, work);
++	unsigned int target = ow->target;
++
++	kfree(ow);
++	axcl_pcie_device_online(target);
++}
++
++static void axcl_pcie_hotplug_notify(unsigned int target, int event)
++{
++	if (event == AX_PCIE_DEV_REMOVED) {
++		axcl_pcie_device_offline(target);
++	} else {
++		struct axcl_online_work *ow;
++
++		if (!axcl_hotplug_wq)
++			return;
++
++		ow = kmalloc(sizeof(*ow), GFP_KERNEL);
++		if (!ow) {
++			axcl_trace(AXCL_ERR,
++				   "dev %x: no memory to schedule bring-up",
++				   target);
++			return;
++		}
++		INIT_WORK(&ow->work, axcl_pcie_device_online_work);
++		ow->target = target;
++		queue_work(axcl_hotplug_wq, &ow->work);
++		axcl_trace(AXCL_ERR, "dev %x is back, bring-up scheduled",
++			   target);
++	}
++}
++
+ static int __init axcl_pcie_host_init(void)
+ {
+ 	int i, ret;
+@@ -1394,19 +1588,34 @@
+ 		    AXCL_HEARTBEAT_DEAD)
+ 			continue;
+ 
++		if (target >= AXERA_MAX_MAP_DEV) {
++			axcl_trace(AXCL_ERR, "invalid target device: %u", target);
++			continue;
++		}
++
+ 		init_waitqueue_head(&heart_waitqueue[target]);
+ 		htcondition[target] = true;
+-		heartbeat[i] =
++		dev_offline[target] = false;
++		heartbeat_target[target] = target;
++		heartbeat[target] =
+ 		    kthread_create(heartbeat_recv_thread,
+-				   &g_axera_dev_map[i]->slot_index,
++				   &heartbeat_target[target],
+ 				   "heartbeat_kthd");
+-		if (IS_ERR(heartbeat[i]))
+-			return PTR_ERR(heartbeat[i]);
+-		wake_up_process(heartbeat[i]);
++		if (IS_ERR(heartbeat[target]))
++			return PTR_ERR(heartbeat[target]);
++		wake_up_process(heartbeat[target]);
+ 	}
+ 
+ 	misc_register(&axcl_usrdev);
+ 
++	axcl_hotplug_wq = alloc_ordered_workqueue("axcl_hotplug", 0);
++	if (!axcl_hotplug_wq) {
++		axcl_trace(AXCL_ERR, "alloc hotplug workqueue failed");
++		return -ENOMEM;
++	}
++
++	ax_pcie_register_hotplug_notify(axcl_pcie_hotplug_notify);
++
+ 	return 0;
+ }
+ 
+@@ -1452,12 +1661,20 @@
+ 	int i;
+ 	unsigned int target;
+ 
++	ax_pcie_register_hotplug_notify(NULL);
++
++	if (axcl_hotplug_wq) {
++		destroy_workqueue(axcl_hotplug_wq);
++		axcl_hotplug_wq = NULL;
++	}
++
+ 	for (i = 0; i < g_pcie_opt->remote_device_number; i++) {
+ 		target = g_axera_dev_map[i]->slot_index;
+-		if (heartbeat[i]) {
++		if (target < AXERA_MAX_MAP_DEV && heartbeat[target]) {
+ 			htcondition[target] = true;
+ 			wake_up(&heart_waitqueue[target]);
+-			kthread_stop(heartbeat[i]);
++			kthread_stop(heartbeat[target]);
++			heartbeat[target] = NULL;
+ 		}
+ 		host_reset_device(target);
+ 	}
