@@ -3158,6 +3158,22 @@ Admitting them takes the config segments' non-zero bytes from 97.4% to
 segments stay at ~46% under the same rule). `_tokenize_mcode` takes
 these as `odd_tags`.
 
+**Confirmed on the AX650N: the segment table is a loader manifest the
+runtime validates field by field.** Patching one field of the decode
+subgraph's tail tables and re-running with valid inputs, every variant
+faulted with `0x8030070C` on every run (3 of 3 each, baseline
+bit-identical 3 of 3): the op segment's type word `0x8801 -> 0xe801`;
+its word count `f2 + 1`; its remaining count `f3 + 1`; table 0's total
+`f3 + 1`; a 6-field table's byte size `f5 - 64`; the same table's
+packed word `f4 + 1`; and table 0's own `f2 + 1`. Two of them (the type
+word's first run and the total-count patch) first hung the runtime for
+about two minutes -- `axcl_run_model` in uninterruptible sleep and
+`axcl-smi` blocked behind it -- before the fault surfaced, so a wrong
+segment table is the one patch class found so far that can stall the
+device rather than fail fast. Treat the table as load-bearing: an
+emitter must write the word counts, the countdown, the packed
+`f3 << 8 | 1` and the byte sizes exactly, not as metadata.
+
 **`llm_build` emits one instruction stream for all 30 layers.** Every
 per-layer file's two mcodes are byte-identical to layer 0's from the
 first byte of the FlatBuffers header to the tail vector; the only
