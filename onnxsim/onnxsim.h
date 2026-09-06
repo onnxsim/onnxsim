@@ -599,6 +599,34 @@ onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
 
+// llama.cpp's IQ4_NL -- C++ port of iq4_nl.py's own
+// apply_iq4_nl_quantization. Weight-only quantizes every MatMul/vanilla-Gemm
+// layer with a constant 2-D float32 weight into a fixed, 16-entry
+// non-uniform ("non-linear") codebook: every 32 consecutive elements of the
+// weight's own flattened storage share one scale (max(|block|) /
+// max(|codebook|)), and each element snaps to whichever codebook entry
+// (times that scale) is closest -- see ``passes/iq4_nl.h`` for the exact
+// rewrite, and iq4_nl.py's own docstring for the full rationale and,
+// importantly, this format's own codebook provenance (this repo could not
+// find or verify llama.cpp's real IQ4_NL codebook anywhere in-tree, so it
+// ships its own computationally-derived, honestly-documented non-uniform
+// codebook instead -- not a transcription of llama.cpp's own table).
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_iq4_nl_quantization``'s Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_iq4_nl_quantization`` (``iq4_nl.py``): not required to be
+// bit-for-bit identical (see ``passes/iq4_nl.h``'s own note on why this
+// port is nonetheless expected to track the Python port unusually closely
+// among this repo's *_cpp ports, having no accumulation or
+// iterative-refinement step at all) -- ``ApplyIQ4NL``/
+// ``apply_iq4_nl_quantization_cpp`` and ``apply_iq4_nl_quantization`` are
+// two independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
+
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
 // weight tensors, smaller matmuls on any runtime), as opposed to
