@@ -3388,3 +3388,83 @@ def test_resnet18d_a1_is_a_tag_and_bit6_tags_take_odd_registers(tmp_path):
     before = nonzero_residue(blob)
     after = nonzero_residue(blob, tags=_ALL_TAGS | {0xA1}, odd_tags={0xC1, 0xE1})
     assert after <= 0.85 * before, (before, after)
+
+
+def test_llm_build_segment_table_is_validated_on_device(tmp_path):
+    """Confirmed real on the AX650N (see the README's "the segment table is
+    a loader manifest -- but only its word counts are load-bearing"
+    paragraph), on a fresh `llm_build` of SmolLM2-135M and a healthy
+    device: the layer-0 decode subgraph runs deterministically with valid
+    inputs; table 0's word count + 1 is rejected at load ("Loading model
+    failed", no fault); the op segment's word count - 1 faults every run;
+    and the op segment's remaining count + 1 runs with outputs identical
+    to baseline. The type-word patch is deliberately not exercised -- it
+    is the one that stalled the runtime. Skips without a device or the
+    cached checkpoint.
+    """
+    import shutil
+
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+    result = pulsar2_docker.llm_build(str(work), "SmolLM2-135M", "output", parallel=8)
+    assert result.success, getattr(result, "error", None)
+    layer = str(work / "output" / "llama_p512_l0_together.axmodel")
+
+    model = onnx.load(layer)
+    inputs = _llm_layer_inputs(model)
+    neu0 = next(n for n in model.graph.node if n.op_type == "neu mode")
+    info = json.loads(
+        next(a for a in neu0.attribute if a.name == "npu_graph_info").s.decode()
+    )
+    key = info["dotneus"][0]["neu_key"]
+    mcode = bytes(next(i for i in model.graph.initializer if i.name == key).raw_data)
+    vec, tables = _tail_tables(mcode)
+
+    def field_offset(k, f):
+        p = vec + 4 + 4 * k
+        tpos = p + struct.unpack_from("<I", mcode, p)[0]
+        vt = tpos - struct.unpack_from("<i", mcode, tpos)[0]
+        fo = struct.unpack_from("<H", mcode, vt + 4 + 2 * f)[0]
+        assert fo, (k, f)
+        return tpos + fo
+
+    k_ops = next(k for k, t in enumerate(tables) if t[0] == 0x8801)
+
+    def patched(name, k, f, value):
+        b = bytearray(mcode)
+        struct.pack_into("<I", b, field_offset(k, f), value)
+        m2 = onnx.ModelProto()
+        m2.CopyFrom(model)
+        next(i for i in m2.graph.initializer if i.name == key).raw_data = bytes(b)
+        path = str(tmp_path / f"{name}.axmodel")
+        onnx.save(m2, path)
+        return path
+
+    base = [o for o in _run_llm_layer(layer, inputs, 3) if o != "fault"]
+    assert len(base) >= 2 and len(set(base)) == 1, base
+    baseline = base[0]
+
+    load = pulsar2_docker.run_on_device_with_inputs(
+        patched("t0_f2_plus1", 0, 2, tables[0][2] + 1), inputs, repeat=1, warmup=1
+    )
+    assert not load.outputs and load.error and "Loading model" in load.error, load.error
+
+    short = _run_llm_layer(
+        patched("ops_f2_minus1", k_ops, 2, tables[k_ops][2] - 1), inputs, 2
+    )
+    assert short == ["fault", "fault"], short
+
+    same = [
+        o
+        for o in _run_llm_layer(
+            patched("ops_f3_plus1", k_ops, 3, tables[k_ops][3] + 1), inputs, 3
+        )
+        if o != "fault"
+    ]
+    assert len(same) >= 2 and all(o == baseline for o in same), same
