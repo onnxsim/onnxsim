@@ -69,6 +69,10 @@ from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
 )
+from onnxsim.gguf_ternary_quant import (
+    apply_gguf_ternary_quantization,
+    quantize_dequantize_ternary,
+)
 from onnxsim.gptq import apply_gptq
 from onnxsim.gptvq import quantize_weight_only_gptvq
 from onnxsim.hf_reconstruct import read_hf_config, reconstruct_hf_graph
@@ -113,6 +117,7 @@ from onnxsim.onnx_simplifier import (
     apply_embedding_vocab_pruning_cpp,
     apply_gguf_q4_0_quantization_cpp,
     apply_gguf_q4_1_quantization_cpp,
+    apply_gguf_ternary_quantization_cpp,
     apply_iq4_nl_quantization_cpp,
     apply_moe_expert_channel_pruning_cpp,
     apply_moe_whole_expert_pruning_cpp,
@@ -371,6 +376,9 @@ __all__ = [
     "apply_gguf_q4_1_quantization_cpp",
     "quantize_dequantize_q4_0",
     "quantize_dequantize_q4_1",
+    "apply_gguf_ternary_quantization",
+    "apply_gguf_ternary_quantization_cpp",
+    "quantize_dequantize_ternary",
     "apply_iq4_nl_quantization",
     "apply_iq4_nl_quantization_cpp",
     "quantize_dequantize_iq4_nl",

@@ -2812,6 +2812,39 @@ def apply_gguf_q4_1_quantization_cpp(
     )
 
 
+def apply_gguf_ternary_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_ternary_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight using BitNet b1.58's published absmean ternary rule,
+    as shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types -- one shared
+    scale ``d = mean(|block|)`` per 256-element block of the weight's own
+    flattened storage, each element restricted to ``{-1, 0, +1}`` times
+    that scale. See :func:`onnxsim.apply_gguf_ternary_quantization`'s own
+    docstring for the full rationale and this format's own honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            ternary quantize-dequantize round-tripped float32 version,
+            stored under a *new* initializer (the original initializer is
+            left in the graph, unused). A model with no matching layer is
+            returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_ternary_quantization(model.SerializeToString())
+    )
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:

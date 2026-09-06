@@ -46,6 +46,7 @@
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
 #include "passes/gguf_legacy_quant.h"
+#include "passes/gguf_ternary_quant.h"
 #include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
 #include "passes/qoperator_quantize_activation.h"
@@ -144,6 +145,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::GgufQ4_0>(registry);
     RegisterOrReplace<p::GgufQ4_1>(registry);
+    RegisterOrReplace<p::GgufTernaryQuant>(registry);
     RegisterOrReplace<p::IQ4NL>(registry);
     RegisterOrReplace<p::MagnitudePruningAttention>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);

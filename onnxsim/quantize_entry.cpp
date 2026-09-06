@@ -13,6 +13,7 @@
 #include "passes/any_precision_llm.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/gguf_legacy_quant.h"
+#include "passes/gguf_ternary_quant.h"
 #include "passes/iq4_nl.h"
 #include "passes/qoperator_quantize_gemm.h"
 #include "passes/qoperator_quantize_pool.h"
@@ -195,6 +196,13 @@ onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model) {
   onnxsim::RegisterCustomOptimizerPasses();
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"gguf_q4_1"});
+}
+
+onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"gguf_ternary_quant"});
 }
 
 std::vector<std::string> ListQuantizableActivations(

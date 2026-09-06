@@ -1135,6 +1135,24 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // BitNet b1.58's published absmean ternary weight quantization, as
+  // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
+  // one shared {-1, 0, +1} scale per 256-element block. Data-free. See
+  // ApplyGgufTernaryQuant in onnxsim.h.
+  m.def(
+      "apply_gguf_ternary_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufTernaryQuant(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(

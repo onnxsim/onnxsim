@@ -662,6 +662,37 @@ onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
 
+// BitNet b1.58's published absmean ternary weight quantization (Ma et al.,
+// 2024, "The Era of 1-bit LLMs"), as shipped by llama.cpp's GGUF
+// TQ1_0/TQ2_0 tensor types -- C++ port of gguf_ternary_quant.py's own
+// apply_gguf_ternary_quantization. Weight-only quantizes every MatMul/
+// vanilla-Gemm layer with a constant 2-D float32 weight, one 256-element
+// block at a time over the weight's own flattened storage: every element
+// is restricted to one of {-1, 0, +1} times one shared per-block scale
+// ``d = mean(|block|)`` (the paper's own published rule, round-tripped
+// through float16 to match llama.cpp's own storage). See
+// ``passes/gguf_ternary_quant.h`` for the exact rewrite, and
+// gguf_ternary_quant.py's own docstring for the full rationale and this
+// format's own honesty note (this port represents the format as a plain
+// float32 quantize-dequantize round trip, not llama.cpp's own literal
+// bit-packed layout -- no ONNX tensor type below INT4 exists either way).
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_gguf_ternary_quantization``'s Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_gguf_ternary_quantization`` (``gguf_ternary_quant.py``): not
+// required to be bit-for-bit identical (see
+// ``passes/gguf_ternary_quant.h``'s own note on why this port is
+// nonetheless expected to track the Python port unusually closely, having
+// no accumulation or iterative-refinement step at all) --
+// ``ApplyGgufTernaryQuant``/its ``_cpp`` Python wrapper and
+// ``apply_gguf_ternary_quantization`` are independently-correct,
+// non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
+
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
 // weight tensors, smaller matmuls on any runtime), as opposed to
