@@ -9469,6 +9469,412 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- Squeeze-and-Excitation (SE) gate chains --------------------------------
+#
+# `torchvision.ops.SqueezeExcitation`'s own exact shape -- confirmed live via
+# `torch.onnx.export` (torch 2.14.0+cpu, opset 17; see
+# `tests/test_pruning.py`'s own fixture for the captured `onnx.printer.to_text`
+# graph this section's matcher is built directly against):
+#
+#     scale = self.scale_activation(
+#         self.fc2(self.activation(self.fc1(self.avgpool(input))))
+#     )
+#     return scale * input
+#
+# i.e. a Conv `P` (`conv1` in a real backbone) whose own output tensor,
+# optionally through one activation (`Relu` in the confirmed repro), reaches a
+# tensor `spine` read TWICE: once by a `GlobalAveragePool` feeding a short
+# "squeeze" gate subnetwork (`GlobalAveragePool -> Conv(1x1) "fc1" -> one
+# activation -> Conv(1x1) "fc2" -> {Sigmoid, HardSigmoid}`), and once directly
+# by the closing `Mul(gate, spine)` that broadcasts the gate subnetwork's own
+# per-channel output back over `spine`. None of the other Conv-chain finders
+# recognize this at all: `_find_conv_chains` never admits a two-consumer
+# tensor except for the totally different self-gated-activation/decomposed-
+# GroupNorm shapes (see `_walk_to_conv_consumer`'s own docstring),
+# `_find_conv_residual_chains` only ever unions `Add`-merge points, never a
+# `Mul`, and `_find_gated_chains` is MatMul/Gemm-only and shaped for TWO
+# INDEPENDENT producers combined by `Mul`, not one producer self-gated by a
+# whole subnetwork reading its own output back. Without this, `conv1`'s own
+# output channels and the gate subnetwork's own final Conv's output channels
+# (which must match `conv1`'s count exactly -- otherwise the closing `Mul`
+# wouldn't even be shape-valid) are left completely unprunable, even though
+# the two are one shared co-slice together with the SE block's own downstream
+# consumer.
+#
+# What this section matches, conservatively -- declining rather than guessing
+# at anything beyond the one confirmed real shape above:
+#
+#   - `P`, an ordinary (`group == 1`) Conv/FusedConv producer
+#     (`_match_conv_producer`) whose own raw output, optionally through a
+#     linear run of `_UNARY_PASS_THROUGH` activations (each a strict
+#     single-consumer hop -- the confirmed repro's own `Relu` takes exactly
+#     one such hop, but zero is admitted too), reaches a tensor `spine` with
+#     EXACTLY two consumers.
+#   - One of `spine`'s two consumers is a plain `Mul(spine, gate_out)`
+#     (domain "", two distinct non-constant operands, one of which is `spine`
+#     itself) -- the OTHER operand, `gate_out`, must be produced by exactly
+#     the fixed gate-subnetwork shape below.
+#   - `spine`'s other consumer is a `GlobalAveragePool` (domain "", `spine`
+#     its sole input) whose own single-consumer output feeds: `Conv(1x1,
+#     group=1)` ("fc1" -- its OWN output-channel count, the squeeze
+#     bottleneck, e.g. `4` in `SqueezeExcitation(16, 4)`, is never touched by
+#     this section: unrelated to the shared keep-set below, and left for
+#     `_find_conv_chains`'s own ordinary fc1->fc2 internal-chain recognition
+#     to independently prune, if it ever does) -> exactly ONE
+#     `_UNARY_PASS_THROUGH` activation (zero or more than one is declined) ->
+#     `Conv(1x1, group=1)` ("fc2") -> `{Sigmoid, HardSigmoid}`. Both final
+#     activations are confirmed real, not speculative: plain `Sigmoid` is
+#     `torchvision.ops.SqueezeExcitation`'s own default `scale_activation`,
+#     while `HardSigmoid` is the exact substitution the MobileNetV3 paper
+#     (Howard et al., 2019, "Searching for MobileNetV3") itself describes
+#     making in every SE block for inference efficiency, and is what
+#     `torchvision.models.mobilenetv3`'s own SE blocks construct their shared
+#     `SqueezeExcitation` with (`scale_activation=partial(nn.Hardsigmoid,
+#     inplace=True)`) -- both are already unconditionally recognized
+#     elsewhere in this module (`_UNARY_PASS_THROUGH`), so accepting either
+#     here needs no new op-recognition machinery, just this section's own
+#     fixed-position check. Every tensor along this gate branch must have
+#     EXACTLY one consumer and never be a graph output -- the same
+#     conservative bar every other hop in this module holds a mid-chain
+#     tensor to.
+#   - fc2's own output-channel count (`_match_conv_producer`) must exactly
+#     equal `P`'s (`n_channels`) -- the broadcast-`Mul`-correctness
+#     requirement -- and its own gate activation's output must be the EXACT
+#     same tensor as the `Mul`'s own `gate_out` operand identified above.
+#   - `GlobalAveragePool -> fc1` is resolved as an ordinary extra fan-out
+#     consumer branch of `spine`, exactly like `_find_conv_residual_chains`'s
+#     own `_resolve_conv_fanout_branches` already resolves an extra reader of
+#     an already-established group's own shared spine tensor -- fc1's own
+#     INPUT-channel axis needs the identical shared keep-set slice `P`'s
+#     other consumers do (`GlobalAveragePool` preserves channel count, so fc1
+#     genuinely reads exactly `P`'s own channel-indexed output), even though
+#     fc1's own OUTPUT-channel axis (the squeeze bottleneck) is left
+#     completely alone.
+#   - The `Mul`'s own output, in turn, must feed a single ordinary or
+#     general-grouped Conv/ConvTranspose consumer (`conv2` in the repro) via
+#     the existing, unmodified `_walk_to_conv_consumer` forward walk (left at
+#     its own default, narrower flag set -- no ConvTranspose/GroupNorm/
+#     `GlobalAveragePool -> Flatten -> MatMul` recognition, mirroring
+#     `_resolve_conv_fanout_branches`'s own identical conservative choice for
+#     a residual/merge group's fan-out branches, not `_find_conv_chains`'s
+#     own wider one) -- its own input-channel count must match `P`'s.
+#
+# What's declined, deliberately, narrower than a hypothetical fully-general
+# SE matcher might reach:
+#
+#   - A general grouped Conv anywhere in the three co-sliced roles (`P`, fc1,
+#     fc2) -- every one of `_match_conv_producer`/`_match_conv_consumer` is
+#     required to report `group == 1` here. A grouped `P`/fc1/fc2 in a real
+#     SE block is not a shape this module has seen in the wild, and working
+#     out the block-partition interaction between a *second*, independent
+#     group boundary (fc1/fc2's own, unrelated to `P`'s) and this shape's own
+#     shared keep set was judged out of scope for a first, narrowly-confirmed
+#     pass. Only the FINAL downstream consumer (`conv2`) may still be a
+#     general grouped Conv, exactly as an ordinary plain Conv chain already
+#     allows (see `_chain_group`'s own docstring for why that side alone is
+#     always safe -- `P` and fc2 both being `group == 1` producers here means
+#     there is no second, conflicting group boundary to reconcile).
+#   - A `ConvTranspose` producer (`P`) is out of scope -- a real SE block
+#     attaches to a regular Conv backbone, never a `ConvTranspose` one, in
+#     every export this module targets.
+#   - Zero, or more than one, activation between fc1 and fc2, or any op other
+#     than `Sigmoid`/`HardSigmoid` as the FINAL gate activation (immediately
+#     before the `Mul`) is declined outright, not guessed at.
+#   - A non-1x1 fc1/fc2 kernel (checked directly against each one's own
+#     weight shape, not inferred) is declined -- not the confirmed real
+#     shape, and spatially meaningless after a `GlobalAveragePool` collapses
+#     every spatial dimension to size 1 in the first place.
+#   - Any intermediate tensor along either branch (the `P -> spine` unary
+#     run, or the gate subnetwork itself) with anything other than exactly
+#     one consumer, or that is itself a graph output, declines the WHOLE
+#     match -- never a partial slice.
+
+
+def _match_conv_se_gate(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # GlobalAveragePool
+        onnx.NodeProto,  # fc1 Conv node (gate subnetwork's own squeeze layer)
+        str,  # fc1 weight name
+        onnx.NodeProto,  # Mul (the self-gating combine)
+        onnx.NodeProto,  # fc2 Conv node (the gate producer)
+        str,  # fc2 weight name
+        Optional[str],  # fc2 bias name
+        onnx.NodeProto,  # trailing Sigmoid/HardSigmoid gate activation
+    ]
+]:
+    """If `spine`'s own two consumers (`spine_consumers`) form the SE
+    "squeeze -> excite" gate shape this section's own comment above
+    describes, returns ``(gap_node, fc1_node, fc1_weight, mul_node, fc2_node,
+    fc2_weight, fc2_bias, gate_activation_node)``. Declines (``None``) on any
+    deviation -- see that comment for the exact, narrow bar.
+    """
+    if len(spine_consumers) != 2:
+        return None
+    for mul_node, gap_node in (
+        (spine_consumers[0], spine_consumers[1]),
+        (spine_consumers[1], spine_consumers[0]),
+    ):
+        if not (
+            mul_node.op_type == "Mul"
+            and mul_node.domain == ""
+            and len(mul_node.input) == 2
+            and len(mul_node.output) == 1
+            and spine in mul_node.input
+            and mul_node.input[0] != mul_node.input[1]
+        ):
+            continue
+        gate_out = (
+            mul_node.input[1] if mul_node.input[0] == spine else mul_node.input[0]
+        )
+        if gate_out in initializer_map:
+            continue
+        if not (
+            gap_node.op_type == "GlobalAveragePool"
+            and gap_node.domain == ""
+            and list(gap_node.input) == [spine]
+            and len(gap_node.output) == 1
+        ):
+            continue
+
+        gap_out = gap_node.output[0]
+        if gap_out in graph_outputs or len(consumers_of.get(gap_out, [])) != 1:
+            continue
+        fc1_node = consumers_of[gap_out][0]
+        fc1_match = _match_conv_consumer(fc1_node, initializer_map)
+        if (
+            fc1_match is None
+            or fc1_match[1] != n_channels
+            or fc1_match[2] != 1
+            or fc1_node.input[0] != gap_out
+        ):
+            continue
+        fc1_weight, _fc1_in_channels, _fc1_group = fc1_match
+        fc1_w_init = initializer_map[fc1_weight]
+        if any(d != 1 for d in fc1_w_init.dims[2:]):
+            continue  # not a 1x1 (or equivalent) conv -- declined
+
+        fc1_out = fc1_node.output[0]
+        if fc1_out in graph_outputs or len(consumers_of.get(fc1_out, [])) != 1:
+            continue
+        act_node = consumers_of[fc1_out][0]
+        if not (
+            act_node.op_type in _UNARY_PASS_THROUGH
+            and list(act_node.input) == [fc1_out]
+            and len(act_node.output) == 1
+        ):
+            continue
+
+        act_out = act_node.output[0]
+        if act_out in graph_outputs or len(consumers_of.get(act_out, [])) != 1:
+            continue
+        fc2_node = consumers_of[act_out][0]
+        fc2_match = _match_conv_producer(fc2_node, initializer_map)
+        if (
+            fc2_match is None
+            or fc2_match[3] != 1
+            or fc2_match[2] != n_channels
+            or fc2_node.input[0] != act_out
+        ):
+            continue
+        fc2_weight, fc2_bias, _fc2_out_channels, _fc2_group = fc2_match
+        fc2_w_init = initializer_map[fc2_weight]
+        if any(d != 1 for d in fc2_w_init.dims[2:]):
+            continue
+
+        fc2_out = fc2_node.output[0]
+        if fc2_out in graph_outputs or len(consumers_of.get(fc2_out, [])) != 1:
+            continue
+        gate_act_node = consumers_of[fc2_out][0]
+        if not (
+            gate_act_node.op_type in ("Sigmoid", "HardSigmoid")
+            and gate_act_node.domain == ""
+            and list(gate_act_node.input) == [fc2_out]
+            and len(gate_act_node.output) == 1
+        ):
+            continue
+        if gate_act_node.output[0] != gate_out:
+            continue
+
+        return (
+            gap_node,
+            fc1_node,
+            fc1_weight,
+            mul_node,
+            fc2_node,
+            fc2_weight,
+            fc2_bias,
+            gate_act_node,
+        )
+
+    return None
+
+
+def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds Squeeze-and-Excitation gate blocks -- see this section's own
+    comment above for the exact topology matched and declined. Every match
+    produces one `_Chain` with TWO producers (`P`, the block's own input
+    Conv, and fc2, the gate subnetwork's own final Conv -- both forced to
+    the same output-channel keep set, exactly like an ordinary gated-pair
+    chain already ties two producers together for `_find_gated_chains`), one
+    ordinary consumer (the real downstream Conv/ConvTranspose the closing
+    `Mul` feeds), and one extra fan-out branch (fc1, the gate subnetwork's
+    own squeeze layer, whose INPUT axis needs the identical keep set even
+    though its own output/squeeze-bottleneck axis is left untouched).
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    chains: List[_Chain] = []
+    for node in graph.node:
+        info = _match_conv_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, n_channels, producer_group = info
+        if producer_group != 1:
+            continue  # narrow scope -- see this section's own comment
+
+        out_name = node.output[0]
+        if out_name in graph_outputs:
+            continue
+
+        pre_ops: List[onnx.NodeProto] = []
+        cur = out_name
+        spine: Optional[str] = None
+        spine_consumers: List[onnx.NodeProto] = []
+        for _ in range(_MAX_CHAIN_HOPS):
+            cands = consumers_of.get(cur, [])
+            if len(cands) == 2:
+                spine = cur
+                spine_consumers = cands
+                break
+            if len(cands) != 1:
+                break
+            nxt = cands[0]
+            if not (
+                nxt.op_type in _UNARY_PASS_THROUGH
+                and list(nxt.input) == [cur]
+                and len(nxt.output) == 1
+            ):
+                break
+            out2 = nxt.output[0]
+            if out2 in graph_outputs:
+                break
+            pre_ops.append(nxt)
+            cur = out2
+        if spine is None:
+            continue
+
+        match = _match_conv_se_gate(
+            spine,
+            spine_consumers,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+        )
+        if match is None:
+            continue
+        (
+            gap_node,
+            fc1_node,
+            fc1_weight,
+            mul_node,
+            fc2_node,
+            fc2_weight,
+            fc2_bias,
+            gate_act_node,
+        ) = match
+
+        mul_out = mul_node.output[0]
+        if mul_out in graph_outputs or len(consumers_of.get(mul_out, [])) != 1:
+            continue
+
+        (
+            consumer,
+            post_mul_chain_ops,
+            conv_pass_through,
+            group_norm,
+            decomposed_group_norm_num_groups,
+            _matmul_consumer,
+        ) = _walk_to_conv_consumer(
+            mul_out,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+        # Every optional `_walk_to_conv_consumer` flag (`allow_conv_transpose_
+        # consumer`, `recognize_group_norm`, `recognize_decomposed_group_norm`,
+        # `recognize_gap_flatten_matmul_consumer`) was left at its default
+        # (False) above -- see this section's own comment for why -- so
+        # `group_norm`/`decomposed_group_norm_num_groups`/`_matmul_consumer`
+        # are always `None` here.
+        assert group_norm is None and decomposed_group_norm_num_groups is None
+        (
+            consumer_node,
+            consumer_weight,
+            consumer_group,
+            consumer_is_conv_transpose,
+        ) = consumer
+
+        if len({w_name, fc2_weight, fc1_weight, consumer_weight}) != 4:
+            continue  # a tied/shared weight across roles -- decline
+
+        chains.append(
+            _Chain(
+                producers=(
+                    _Producer(
+                        node,
+                        w_name,
+                        False,
+                        bias_name,
+                        pre_ops=tuple(pre_ops),
+                        is_conv=True,
+                    ),
+                    _Producer(
+                        fc2_node,
+                        fc2_weight,
+                        False,
+                        fc2_bias,
+                        pre_ops=(gate_act_node,),
+                        is_conv=True,
+                    ),
+                ),
+                chain_ops=((mul_node, None),) + post_mul_chain_ops,
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
+                conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
+                extra_consumers=(
+                    _ConsumerBranch(
+                        chain_ops=((gap_node, None),),
+                        consumer_node=fc1_node,
+                        consumer_weight=fc1_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                ),
+            )
+        )
+    return chains
+
+
 # --- MatMul/Gemm residual (Add-merged) chains -------------------------------
 #
 # The MatMul/Gemm analogue of the Conv residual/Add-merge grouping above --
@@ -14231,6 +14637,7 @@ def apply_structured_pruning(
             + _find_gated_chains(graph)
             + _find_conv_chains(graph)
             + _find_conv_residual_chains(graph)
+            + _find_conv_se_gate_chains(graph)
             + _find_matmul_residual_chains(graph)
         )
         concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
@@ -41391,7 +41798,7 @@ def _chain_label(chain: _Chain) -> str:
 def _structured_chain_groups(
     graph: onnx.GraphProto,
 ) -> List[Tuple[str, List[_Chain]]]:
-    """The same five finders, in the same order, that
+    """The same six finders, in the same order, that
     :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`
     concatenate into their own single `chains` list -- kept as separate
     `(family_label, chains)` groups here purely so
@@ -41405,6 +41812,7 @@ def _structured_chain_groups(
         ("matmul_gated", _find_gated_chains(graph)),
         ("conv_plain", _find_conv_chains(graph)),
         ("conv_residual", _find_conv_residual_chains(graph)),
+        ("conv_se_gate", _find_conv_se_gate_chains(graph)),
         ("matmul_residual", _find_matmul_residual_chains(graph)),
     ]
 
