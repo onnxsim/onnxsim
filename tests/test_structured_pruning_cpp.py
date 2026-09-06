@@ -5905,6 +5905,120 @@ def test_cpp_structured_pruning_matmul_nbits_matches_python_reference_output():
     np.testing.assert_allclose(y_py, y_cpp, rtol=1e-5, atol=1e-5)
 
 
+def test_cpp_structured_pruning_matmul_nbits_separate_bias_add_hop_matches_oracle():
+    # Regression test for the per-channel bias/scale `Add`/`Mul`
+    # pass-through hop (`_BINARY_CHANNEL_OPS` in pruning.py,
+    # WalkToConsumer's own identical hop in structured_pruning_entry.cpp)
+    # newly ported into WalkToMatMulNBitsConsumer: a SEPARATE trailing bias
+    # `Add` node (not MatMulNBits's own fused `bias` input) between the
+    # producer and the plain Relu/consumer -- the real shape a
+    # ``MatMulNBitsQuantizer`` round trip commonly emits before any later
+    # ORT graph-optimizer bias-folding pass. Before this hop was ported, the
+    # walk would decline at the `Add` node entirely (an unrecognized
+    # mid-chain op), leaving both `MatMulNBits` nodes byte-unchanged; with
+    # it, the chain is found, the bias is co-sliced, and the producer/
+    # consumer N/K axes are still pruned exactly as
+    # test_cpp_structured_pruning_matmul_nbits_plain_chain_matches_oracle
+    # confirms for the fused-bias case.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(9101)
+    w1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    w1[:16] *= 6.0  # rows 0-15 large (kept), 16-31 small (dropped)
+    w2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    inits1, info1 = _nbits_weight_initializers(w1, block_size, "sb_w1")
+    inits2, info2 = _nbits_weight_initializers(w2, block_size, "sb_w2")
+
+    model = _nbits_model(
+        f"""
+        g (float[batch,{K1}] A) => (float[batch,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulNBits<K={K1},N={N1},bits=4,block_size={block_size}>(A, {info1["b_name"]}, {info1["scales_name"]}, {info1["zp_name"]})
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = com.microsoft.MatMulNBits<K={N1},N={N2},bits=4,block_size={block_size}>(h1a, {info2["b_name"]}, {info2["scales_name"]}, {info2["zp_name"]})
+        }}
+        """,
+        initializer=[*inits1, *inits2, _f32(bias1, "Bias1")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+
+    keep = np.arange(16)
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    # The chain must actually be found and pruned (not silently declined):
+    # both N-axes and the separate Bias1 all shrink to the same keep_count.
+    assert list(inits["Bias1"].dims) == [16]
+    assert list(inits[info1["b_name"]].dims) == [
+        16,
+        info1["k_blocks"],
+        block_size * 4 // 8,
+    ]
+    assert list(inits[info2["b_name"]].dims) == [N2, 1, block_size * 4 // 8]
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["Bias1"]), bias1[keep])
+
+    # Byte-for-byte parity with the (already-correct) Python reference.
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+    rng2 = np.random.default_rng(9102)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned_cpp, {"A": x})
+    w1_dequant = _nbits_dequant(
+        info1["qcodes"], info1["scales"], info1["zp"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info2["qcodes"], info2["scales"], info2["zp"], block_size
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T + bias1[keep], 0.0)
+    y_oracle = h1 @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_cpp_structured_pruning_matmul_nbits_separate_bias_add_tied_declines():
+    # Bias1 (the mid-chain Add's own per-channel constant) is ALSO read by a
+    # second, unrelated Add elsewhere in the graph -- the tied/shared-tensor
+    # bar this hop's own C++ comment documents (mirrors
+    # `len(consumers_of.get(other, [])) == 1` in pruning.py): slicing Bias1
+    # in place would silently corrupt that second reader, so the walk must
+    # decline the Add hop (and hence the whole chain) entirely, leaving the
+    # model byte-unchanged. `h1` itself keeps exactly one consumer (`hb`),
+    # so this exercises the Add-hop's own tied-constant check specifically,
+    # not the ordinary "more than one consumer" top-of-loop dispatch.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(9111)
+    w1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    w2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+
+    inits1, info1 = _nbits_weight_initializers(w1, block_size, "td_w1")
+    inits2, info2 = _nbits_weight_initializers(w2, block_size, "td_w2")
+
+    model = _nbits_model(
+        f"""
+        g (float[batch,{K1}] A, float[batch,{N1}] B) => (float[batch,{N2}] Y, float[batch,{N1}] Y2)
+        {{
+          h1 = com.microsoft.MatMulNBits<K={K1},N={N1},bits=4,block_size={block_size}>(A, {info1["b_name"]}, {info1["scales_name"]}, {info1["zp_name"]})
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = com.microsoft.MatMulNBits<K={N1},N={N2},bits=4,block_size={block_size}>(h1a, {info2["b_name"]}, {info2["scales_name"]}, {info2["zp_name"]})
+          Y2 = Add(B, Bias1)
+        }}
+        """,
+        initializer=[*inits1, *inits2, _f32(bias1, "Bias1")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 # --- MatMulNBitsMlp (com.microsoft, fused gated-MLP block-quantized weight)
 # --- structured pruning ---------------------------------------------------
 #
@@ -7228,6 +7342,149 @@ def test_cpp_structured_pruning_matmul_bnb4_matches_python_reference_output():
     np.testing.assert_array_equal(y_py, y_cpp)
 
 
+def test_cpp_structured_pruning_matmul_bnb4_separate_bias_add_hop_matches_oracle():
+    # Regression test for the per-channel bias/scale `Add`/`Mul`
+    # pass-through hop newly ported into WalkToMatMulBnb4Consumer: a
+    # SEPARATE trailing bias `Add` node between the `MatMulBnb4` producer
+    # and the plain-float `MatMul` consumer -- the ONLY way a biased
+    # `MatMulBnb4` layer is representable at all, since the op's own live
+    # 3-input schema (`A, B, absmax`) has no bias slot of its own. Before
+    # this hop was ported, the walk would decline at the `Add` node
+    # entirely, leaving the producer byte-unchanged; with it, the chain is
+    # found, the bias is co-sliced, and `N` is still pruned exactly as
+    # test_cpp_structured_pruning_matmul_bnb4_plain_chain_matches_oracle
+    # confirms for the no-bias case.
+    K, N1, N2, block_size, quant_type = 64, 32, 8, 16, 1
+    rng = np.random.default_rng(31200)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    # Column-scale W1 so the top-16-by-L2-norm keep-set is unambiguous.
+    W1 = W1 * np.linspace(0.1, 3.0, N1, dtype=np.float32)[None, :]
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    B1, absmax1 = _bnb4_quantize(W1, quant_type, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[3,{K}] A) => (float[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBnb4 <K={K}, N={N1}, block_size={block_size}, quant_type={quant_type}> (A, B1, absmax1)
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = MatMul(h1a, W2)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(absmax1, name="absmax1"),
+            _f32(W2, "W2"),
+            _f32(bias1, "Bias1"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+
+    mm1 = next(n for n in pruned_cpp.graph.node if n.op_type == "MatMulBnb4")
+    assert {a.name: a.i for a in mm1.attribute}["N"] == 16
+
+    col_norms = np.linalg.norm(W1, axis=0)
+    keep = np.sort(np.argsort(-col_norms, kind="stable")[:16])
+
+    pruned_inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    B1_pruned = onnx.numpy_helper.to_array(pruned_inits[mm1.input[1]])
+    absmax1_pruned = onnx.numpy_helper.to_array(pruned_inits[mm1.input[2]])
+    B1_ref, absmax1_ref = _bnb4_quantize(W1[:, keep], quant_type, block_size)
+    np.testing.assert_array_equal(B1_pruned, B1_ref)
+    np.testing.assert_array_equal(absmax1_pruned, absmax1_ref)
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(pruned_inits["Bias1"]), bias1[keep]
+    )
+
+    # Byte-for-byte parity with the (already-correct) Python reference.
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+    ref_model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[3,{K}] A) => (float[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBnb4 <K={K}, N={len(keep)}, block_size={block_size}, quant_type={quant_type}> (A, B1r, absmax1r)
+          hb = Add(h1, Bias1r)
+          h1a = Relu(hb)
+          Y = MatMul(h1a, W2r)
+        }}
+        """
+    )
+    ref_model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(B1_ref, name="B1r"),
+            onnx.numpy_helper.from_array(absmax1_ref, name="absmax1r"),
+            _f32(W2[keep, :], "W2r"),
+            _f32(bias1[keep], "Bias1r"),
+        ]
+    )
+    A = rng.uniform(-1, 1, size=(3, K)).astype(np.float32)
+    (pruned_out,) = _run(pruned_cpp, {"A": A})
+    (ref_out,) = _run(ref_model, {"A": A})
+    np.testing.assert_array_equal(pruned_out, ref_out)
+
+
+def test_cpp_structured_pruning_matmul_bnb4_separate_bias_add_tied_declines():
+    # Bias1 is ALSO read by a second, unrelated Add -- the tied/shared-
+    # tensor bar this hop's own C++ comment documents: slicing Bias1 in
+    # place would silently corrupt that second reader, so the walk must
+    # decline the Add hop (and hence the whole chain) entirely.
+    K, N1, N2, block_size, quant_type = 64, 32, 8, 16, 1
+    rng = np.random.default_rng(31210)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    B1, absmax1 = _bnb4_quantize(W1, quant_type, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[3,{K}] A, float[3,{N1}] B) => (float[3,{N2}] Y, float[3,{N1}] Y2)
+        {{
+          h1 = com.microsoft.MatMulBnb4 <K={K}, N={N1}, block_size={block_size}, quant_type={quant_type}> (A, B1, absmax1)
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = MatMul(h1a, W2)
+          Y2 = Add(B, Bias1)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(absmax1, name="absmax1"),
+            _f32(W2, "W2"),
+            _f32(bias1, "Bias1"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 # --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight -----------
 # --- (NVFP4/FP8 block-quantized weight) structured pruning ----------------
 #
@@ -7525,6 +7782,119 @@ def test_cpp_structured_pruning_matmul_block_quantized_fp8_matches_python_refere
     assert py_bytes == cpp_bytes
 
 
+def test_cpp_structured_pruning_matmul_block_quantized_fp8_separate_bias_add_hop_matches_python_reference():
+    # Regression test for the per-channel bias/scale `Add`/`Mul`
+    # pass-through hop newly ported into WalkToFp8Consumer: a separate bias
+    # `Add` node between the first `MatMulBlockQuantizedFp8Weight` producer
+    # and the second consumer. Before this hop was ported, the walk would
+    # decline at the `Add` node entirely, leaving both nodes byte-unchanged;
+    # with it, the chain is found and both N-axes are pruned. As
+    # pruning.py's own comment on this exact hop notes, it was "mechanically
+    # mirrored from the MatMulNBits/Bnb4 fix, not independently verified
+    # against a live FP8 quantizer" (neither `MatMulBlockQuantizedFp8Weight`
+    # nor `Add(float16, float32)` has a real CPU kernel/strict type-checker
+    # opinion in this environment either way -- see this section's own top
+    # comment), so byte-for-byte parity with that Python reference
+    # implementation -- not a real onnxruntime kernel run -- is the
+    # correctness bar this test applies, mirroring the plain-chain
+    # matches_python_reference test above.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41200)
+    W1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    W1[:8] *= 6.0
+    W2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    b1, s1, _dq1 = _fp8bq_quantize(W1, block_size)
+    b2, s2, _dq2 = _fp8bq_quantize(W2, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float16[3,{K1}] A) => (float16[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBlockQuantizedFp8Weight <block_size={block_size}> (A, B1, S1)
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = com.microsoft.MatMulBlockQuantizedFp8Weight <block_size={block_size}> (h1a, B2, S2)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(b1, name="B1"),
+            _f32(s1, "S1"),
+            _f32(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(b2, name="B2"),
+            _f32(s2, "S2"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_matmul_block_quantized_fp8(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    # The chain must actually be found and pruned (not silently declined).
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert onnx.numpy_helper.to_array(inits["B1"]).shape == (8, K1)
+    assert onnx.numpy_helper.to_array(inits["Bias1"]).shape == (8,)
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["Bias1"]), bias1[:8])
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp8_separate_bias_add_tied_declines():
+    # Bias1 is ALSO read by a second, unrelated Add -- the tied/shared-
+    # tensor bar this hop's own C++ comment documents: slicing Bias1 in
+    # place would silently corrupt that second reader, so the walk must
+    # decline the Add hop (and hence the whole chain) entirely.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41210)
+    W1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    b1, s1, _dq1 = _fp8bq_quantize(W1, block_size)
+    b2, s2, _dq2 = _fp8bq_quantize(W2, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float16[3,{K1}] A, float16[3,{N1}] B) => (float16[3,{N2}] Y, float16[3,{N1}] Y2)
+        {{
+          h1 = com.microsoft.MatMulBlockQuantizedFp8Weight <block_size={block_size}> (A, B1, S1)
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = com.microsoft.MatMulBlockQuantizedFp8Weight <block_size={block_size}> (h1a, B2, S2)
+          Y2 = Add(B, Bias1)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(b1, name="B1"),
+            _f32(s1, "S1"),
+            _f32(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(b2, name="B2"),
+            _f32(s2, "S2"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def _fp4bq_chain_model(N1, K1, N2, block_size, W1, gs1, W2, gs2):
     """``Fp4Weight`` analogue of :func:`_fp8bq_chain_model`."""
     p1, ws1, dq1 = _fp4bq_quantize(W1, gs1, block_size)
@@ -7771,6 +8141,114 @@ def test_cpp_structured_pruning_matmul_block_quantized_fp4_matches_python_refere
     py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
     cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
     assert py_bytes == cpp_bytes
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_separate_bias_add_hop_matches_python_reference():
+    # `Fp4Weight` analogue of
+    # test_cpp_structured_pruning_matmul_block_quantized_fp8_separate_bias_
+    # add_hop_matches_python_reference -- see that test's own docstring for
+    # why byte-for-byte parity with the Python reference implementation
+    # (rather than a real onnxruntime kernel run) is the correctness bar
+    # here too.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41250)
+    W1 = (rng.standard_normal((N1, K1)) * 1.0).astype(np.float32)
+    W1[:8] *= 6.0
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    p1, ws1, _dq1 = _fp4bq_quantize(W1, 1.0, block_size)
+    p2, ws2, _dq2 = _fp4bq_quantize(W2, 1.0, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float16[3,{K1}] A) => (float16[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (A, B1, WS1, WS21)
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (h1a, B2, WS2, WS22)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(p1, name="B1"),
+            onnx.numpy_helper.from_array(ws1, name="WS1"),
+            _f32(np.array([1.0], dtype=np.float32), "WS21"),
+            _f32(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(p2, name="B2"),
+            onnx.numpy_helper.from_array(ws2, name="WS2"),
+            _f32(np.array([1.0], dtype=np.float32), "WS22"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_matmul_block_quantized_fp4(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    # The chain must actually be found and pruned (not silently declined).
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert onnx.numpy_helper.to_array(inits["B1"]).shape == (8, K1 // 2)
+    assert onnx.numpy_helper.to_array(inits["Bias1"]).shape == (8,)
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["Bias1"]), bias1[:8])
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_separate_bias_add_tied_declines():
+    # Bias1 is ALSO read by a second, unrelated Add -- the tied/shared-
+    # tensor bar this hop's own C++ comment documents: slicing Bias1 in
+    # place would silently corrupt that second reader, so the walk must
+    # decline the Add hop (and hence the whole chain) entirely.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41260)
+    W1 = (rng.standard_normal((N1, K1)) * 1.0).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    p1, ws1, _dq1 = _fp4bq_quantize(W1, 1.0, block_size)
+    p2, ws2, _dq2 = _fp4bq_quantize(W2, 1.0, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float16[3,{K1}] A, float16[3,{N1}] B) => (float16[3,{N2}] Y, float16[3,{N1}] Y2)
+        {{
+          h1 = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (A, B1, WS1, WS21)
+          hb = Add(h1, Bias1)
+          h1a = Relu(hb)
+          Y = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (h1a, B2, WS2, WS22)
+          Y2 = Add(B, Bias1)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(p1, name="B1"),
+            onnx.numpy_helper.from_array(ws1, name="WS1"),
+            _f32(np.array([1.0], dtype=np.float32), "WS21"),
+            _f32(bias1, "Bias1"),
+            onnx.numpy_helper.from_array(p2, name="B2"),
+            onnx.numpy_helper.from_array(ws2, name="WS2"),
+            _f32(np.array([1.0], dtype=np.float32), "WS22"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
 
 
 # --- QOperator (QLinearConv/QLinearMatMul/QGemm static-quantization) -------

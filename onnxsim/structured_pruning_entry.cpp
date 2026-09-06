@@ -9226,18 +9226,23 @@ void SliceNBitsSideConsumer(
 
 // From tensor `start` (a `MatMulNBits` OR plain-float MatMul/Gemm
 // producer's own output), walks forward through shape-preserving unary
-// activations (UnaryPassThroughOps) with no other consumer anywhere along
-// the way, until EITHER a `MatMulNBits` consumer OR a plain-float MatMul/
-// vanilla-Gemm consumer (MatchPlainMatMulNBitsPeer) is found whose
-// input-channel count matches `n_channels`. No per-channel Add/Mul/
-// BiasGelu/PRelu/Clip hop, no decomposed-LayerNorm/self-gated-activation
-// recognition, no branch -- narrower than WalkToConsumer above, mirroring
-// pruning.py's own `_walk_to_matmul_nbits_consumer` exactly (see this
-// section's own top comment). Returns `nullopt` if the walk runs out of
-// hops, hits a branch, or never reaches such a consumer.
+// activations (UnaryPassThroughOps) or a per-channel bias/scale `Add`/`Mul`
+// against a flat constant whose last dim equals `n_channels` (mirrors
+// WalkToConsumer's own identical hop -- the real shape a
+// `MatMulNBitsQuantizer` round trip commonly emits as a separate trailing
+// bias node, before any later ORT graph-optimizer bias-folding pass, since
+// `MatMulNBits`'s own schema has no bias input of its own), with no other
+// consumer anywhere along the way, until EITHER a `MatMulNBits` consumer OR
+// a plain-float MatMul/vanilla-Gemm consumer (MatchPlainMatMulNBitsPeer) is
+// found whose input-channel count matches `n_channels`. No BiasGelu/PRelu/
+// Clip hop, no decomposed-LayerNorm/self-gated-activation recognition, no
+// branch -- narrower than WalkToConsumer above, mirroring pruning.py's own
+// `_walk_to_matmul_nbits_consumer` exactly (see this section's own top
+// comment). Returns `nullopt` if the walk runs out of hops, hits a branch,
+// or never reaches such a consumer.
 struct MatMulNBitsWalkResult {
   NBitsSide consumer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
 };
 
 std::optional<MatMulNBitsWalkResult> WalkToMatMulNBitsConsumer(
@@ -9245,7 +9250,7 @@ std::optional<MatMulNBitsWalkResult> WalkToMatMulNBitsConsumer(
     const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
     int max_hops) {
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
     auto cit = consumers_of.find(cur);
@@ -9272,9 +9277,47 @@ std::optional<MatMulNBitsWalkResult> WalkToMatMulNBitsConsumer(
       return MatMulNBitsWalkResult{NBitsSide(*peer), std::move(chain_ops)};
     }
 
-    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
-          nxt->input_size() == 1 && nxt->input(0) == cur &&
-          nxt->output_size() == 1)) {
+    std::optional<std::string> const_name;
+    if (UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      // No constant operand.
+    } else if ((nxt->op_type() == "Add" || nxt->op_type() == "Mul") &&
+               nxt->input_size() == 2 && nxt->output_size() == 1 &&
+               (nxt->input(0) == cur || nxt->input(1) == cur)) {
+      // A separate trailing bias/scale `Add`/`Mul` against a flat
+      // per-channel constant -- mirrors WalkToConsumer's own identical hop.
+      // This is the real shape a `MatMulNBitsQuantizer` round trip commonly
+      // emits (before any later ORT graph-optimizer bias-folding pass),
+      // since `MatMulNBits`'s own schema has no bias input of its own.
+      const std::string& other =
+          (nxt->input(0) == cur) ? nxt->input(1) : nxt->input(0);
+      auto oit = init_map.find(other);
+      bool valid = false;
+      if (oit != init_map.end()) {
+        const onnx::TensorProto* c = oit->second;
+        int64_t prod = 1;
+        for (int64_t d : c->dims()) {
+          prod *= d;
+        }
+        valid =
+            c->data_type() == onnx::TensorProto::FLOAT && c->dims_size() > 0 &&
+            c->dims(c->dims_size() - 1) == n_channels && prod == n_channels &&
+            // Tied/shared-tensor bar -- unlike a MatMulNBits/plain-Gemm
+            // producer's own bias (checked once, at match time, by
+            // MatchMatMulNBits/MatchPlainMatMulNBitsPeer via this same
+            // `consumers_of`), a mid-chain hop's constant isn't tied to
+            // any single node's match, so it's checked here instead: a
+            // bias/scale read by more than one node would have a second
+            // reader silently left with a wrong-sized tensor once this
+            // chain's own keep-set slices it in place.
+            ConsumerCount(consumers_of, other) == 1;
+      }
+      if (!valid) {
+        return std::nullopt;
+      }
+      const_name = other;
+    } else {
       return std::nullopt;
     }
     const std::string& out2 = nxt->output(0);
@@ -9283,7 +9326,7 @@ std::optional<MatMulNBitsWalkResult> WalkToMatMulNBitsConsumer(
         graph_outputs.count(out2)) {
       return std::nullopt;
     }
-    chain_ops.push_back(nxt);
+    chain_ops.push_back(ChainOp{nxt, const_name});
     cur = out2;
   }
   return std::nullopt;
@@ -9291,7 +9334,7 @@ std::optional<MatMulNBitsWalkResult> WalkToMatMulNBitsConsumer(
 
 struct MatMulNBitsChain {
   NBitsSide producer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   NBitsSide consumer;
   int64_t n_channels;
 };
@@ -9409,7 +9452,7 @@ struct MatMulNBitsGatedChain {
   std::vector<onnx::NodeProto*> producer_a_pre_ops;
   NBitsSide producer_b;
   std::vector<onnx::NodeProto*> producer_b_pre_ops;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   NBitsSide consumer;
   int64_t n_channels;
 };
@@ -9581,10 +9624,24 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
   for (auto& chain : chains) {
     const std::string p_key = NBitsSideKey(chain.producer);
     const std::string c_key = NBitsSideKey(chain.consumer);
+    std::unordered_set<std::string> consts;
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        consts.insert(*co.const_name);
+      }
+    }
     if (p_key == c_key) {
       continue;  // Degenerate (the same weight in both roles).
     }
-    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+    bool const_conflict = false;
+    for (const auto& c : consts) {
+      if (touched.const_names.count(c)) {
+        const_conflict = true;
+        break;
+      }
+    }
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key) ||
+        const_conflict) {
       continue;  // A shared/tied weight another chain already resized.
     }
 
@@ -9618,12 +9675,20 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
 
     SliceNBitsSideProducer(chain.producer, init_map, keep);
     SliceNBitsSideConsumer(chain.consumer, init_map, consumer_keep);
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
 
     touched.producer.insert(p_key);
     touched.consumer.insert(c_key);
+    for (const auto& c : consts) {
+      touched.const_names.insert(c);
+    }
     touched.stale_value_info.insert(NBitsSideNode(chain.producer)->output(0));
-    for (auto* op : chain.chain_ops) {
-      touched.stale_value_info.insert(op->output(0));
+    for (auto& op : chain.chain_ops) {
+      touched.stale_value_info.insert(op.node->output(0));
     }
   }
 
@@ -9631,11 +9696,24 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
     const std::string pa_key = NBitsSideKey(gchain.producer_a);
     const std::string pb_key = NBitsSideKey(gchain.producer_b);
     const std::string c_key = NBitsSideKey(gchain.consumer);
+    std::unordered_set<std::string> gconsts;
+    for (const auto& co : gchain.chain_ops) {
+      if (co.const_name) {
+        gconsts.insert(*co.const_name);
+      }
+    }
     if (pa_key == pb_key || pa_key == c_key || pb_key == c_key) {
       continue;  // Degenerate (a weight tied across two roles).
     }
+    bool gconst_conflict = false;
+    for (const auto& c : gconsts) {
+      if (touched.const_names.count(c)) {
+        gconst_conflict = true;
+        break;
+      }
+    }
     if (touched.producer.count(pa_key) || touched.producer.count(pb_key) ||
-        touched.consumer.count(c_key)) {
+        touched.consumer.count(c_key) || gconst_conflict) {
       continue;  // A shared/tied weight another chain already resized.
     }
 
@@ -9679,10 +9757,18 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
     SliceNBitsSideProducer(gchain.producer_a, init_map, keep);
     SliceNBitsSideProducer(gchain.producer_b, init_map, keep);
     SliceNBitsSideConsumer(gchain.consumer, init_map, consumer_keep);
+    for (const auto& co : gchain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
 
     touched.producer.insert(pa_key);
     touched.producer.insert(pb_key);
     touched.consumer.insert(c_key);
+    for (const auto& c : gconsts) {
+      touched.const_names.insert(c);
+    }
     touched.stale_value_info.insert(
         NBitsSideNode(gchain.producer_a)->output(0));
     for (auto* op : gchain.producer_a_pre_ops) {
@@ -9693,8 +9779,8 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
     for (auto* op : gchain.producer_b_pre_ops) {
       touched.stale_value_info.insert(op->output(0));
     }
-    for (auto* op : gchain.chain_ops) {
-      touched.stale_value_info.insert(op->output(0));
+    for (auto& op : gchain.chain_ops) {
+      touched.stale_value_info.insert(op.node->output(0));
     }
   }
 }
@@ -9949,7 +10035,7 @@ MatMulNBitsWeight MlpBranchWeight(const MatMulNBitsMlpWeight& p, bool gate) {
 
 struct MatMulNBitsMlpChain {
   MatMulNBitsMlpWeight producer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   NBitsSide consumer;
   int64_t n_channels;
 };
@@ -10037,11 +10123,25 @@ void ApplyMatMulNBitsMlpChains(onnx::GraphProto* graph,
   for (auto& chain : chains) {
     auto& p = chain.producer;
     const std::string c_key = NBitsSideKey(chain.consumer);
+    std::unordered_set<std::string> consts;
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        consts.insert(*co.const_name);
+      }
+    }
     if (p.gate_b_name == c_key || p.up_b_name == c_key) {
       continue;  // Degenerate (the same weight in both roles).
     }
+    bool const_conflict = false;
+    for (const auto& c : consts) {
+      if (touched.const_names.count(c)) {
+        const_conflict = true;
+        break;
+      }
+    }
     if (touched.producer.count(p.gate_b_name) ||
-        touched.producer.count(p.up_b_name) || touched.consumer.count(c_key)) {
+        touched.producer.count(p.up_b_name) || touched.consumer.count(c_key) ||
+        const_conflict) {
       continue;  // A shared/tied weight another chain already resized.
     }
 
@@ -10087,13 +10187,21 @@ void ApplyMatMulNBitsMlpChains(onnx::GraphProto* graph,
                              p.block_size, p.bits, p.k_blocks, init_map, keep);
     SetOrAddIntAttr(p.node, "N", static_cast<int64_t>(keep.size()));
     SliceNBitsSideConsumer(chain.consumer, init_map, consumer_keep);
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
 
     touched.producer.insert(p.gate_b_name);
     touched.producer.insert(p.up_b_name);
     touched.consumer.insert(c_key);
+    for (const auto& c : consts) {
+      touched.const_names.insert(c);
+    }
     touched.stale_value_info.insert(p.node->output(0));
-    for (auto* op : chain.chain_ops) {
-      touched.stale_value_info.insert(op->output(0));
+    for (auto& op : chain.chain_ops) {
+      touched.stale_value_info.insert(op.node->output(0));
     }
   }
 }
@@ -12779,29 +12887,34 @@ void SliceMatMulBnb4ProducerRows(
 
 struct MatMulBnb4Chain {
   MatMulBnb4Weight producer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   PlainMatMulNBitsPeer consumer;
   int64_t n_channels = 0;
 };
 
 // From tensor `start` (a `MatMulBnb4` producer's own output), walks forward
-// through shape-preserving unary activations (UnaryPassThroughOps) with no
-// other consumer anywhere along the way, until a plain-float (directly-
-// constant weight) `MatMul`/vanilla-`Gemm` consumer
-// (MatchPlainMatMulNBitsPeer -- reused directly here, fully generic despite
-// its name) is found whose input-channel count matches `n_channels`. Unlike
+// through shape-preserving unary activations (UnaryPassThroughOps) or a
+// per-channel bias/scale `Add`/`Mul` against a flat constant whose last dim
+// equals `n_channels` (mirrors WalkToConsumer's own identical hop --
+// `MatMulBnb4`'s own live 3-input schema (`A, B, absmax`) has no bias slot
+// at all, so this separate-`Add` shape is the ONLY way a biased
+// `MatMulBnb4` layer is ever representable), with no other consumer
+// anywhere along the way, until a plain-float (directly-constant weight)
+// `MatMul`/vanilla-`Gemm` consumer (MatchPlainMatMulNBitsPeer -- reused
+// directly here, fully generic despite its name) is found whose
+// input-channel count matches `n_channels`. Unlike
 // WalkToMatMulNBitsConsumer's own `MatMulNBits`/plain-float union, a
 // `MatMulBnb4` CONSUMER is never matched here at all -- see this section's
 // own top comment for why K-axis pruning of a `MatMulBnb4` weight remains
 // out of scope. Returns `nullopt` if the walk runs out of hops, hits a
 // branch, or never reaches such a consumer. Mirrors pruning.py's own
 // `_walk_to_matmul_bnb4_consumer`.
-std::optional<std::pair<PlainMatMulNBitsPeer, std::vector<onnx::NodeProto*>>>
+std::optional<std::pair<PlainMatMulNBitsPeer, std::vector<ChainOp>>>
 WalkToMatMulBnb4Consumer(const std::string& start, const InitMap& init_map,
                          const ConsumerMap& consumers_of,
                          const std::unordered_set<std::string>& graph_outputs,
                          int64_t n_channels, int max_hops) {
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
     auto cit = consumers_of.find(cur);
@@ -12819,9 +12932,40 @@ WalkToMatMulBnb4Consumer(const std::string& start, const InitMap& init_map,
       return std::make_pair(*peer, std::move(chain_ops));
     }
 
-    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
-          nxt->input_size() == 1 && nxt->input(0) == cur &&
-          nxt->output_size() == 1)) {
+    std::optional<std::string> const_name;
+    if (UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      // No constant operand.
+    } else if ((nxt->op_type() == "Add" || nxt->op_type() == "Mul") &&
+               nxt->input_size() == 2 && nxt->output_size() == 1 &&
+               (nxt->input(0) == cur || nxt->input(1) == cur)) {
+      // A separate trailing bias/scale `Add`/`Mul` against a flat
+      // per-channel constant -- mirrors WalkToConsumer's own identical hop.
+      const std::string& other =
+          (nxt->input(0) == cur) ? nxt->input(1) : nxt->input(0);
+      auto oit = init_map.find(other);
+      bool valid = false;
+      if (oit != init_map.end()) {
+        const onnx::TensorProto* c = oit->second;
+        int64_t prod = 1;
+        for (int64_t d : c->dims()) {
+          prod *= d;
+        }
+        valid =
+            c->data_type() == onnx::TensorProto::FLOAT && c->dims_size() > 0 &&
+            c->dims(c->dims_size() - 1) == n_channels && prod == n_channels &&
+            // Tied/shared-tensor bar -- see
+            // WalkToMatMulNBitsConsumer's own identical check on this
+            // same hop for why a mid-chain hop's constant needs this
+            // checked here, not left to a producer/consumer match.
+            ConsumerCount(consumers_of, other) == 1;
+      }
+      if (!valid) {
+        return std::nullopt;
+      }
+      const_name = other;
+    } else {
       return std::nullopt;
     }
     const std::string& out2 = nxt->output(0);
@@ -12830,7 +12974,7 @@ WalkToMatMulBnb4Consumer(const std::string& start, const InitMap& init_map,
         graph_outputs.count(out2)) {
       return std::nullopt;
     }
-    chain_ops.push_back(nxt);
+    chain_ops.push_back(ChainOp{nxt, const_name});
     cur = out2;
   }
   return std::nullopt;
@@ -12898,7 +13042,21 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
   for (auto& chain : chains) {
     const std::string& p_key = chain.producer.b_name;
     const std::string& c_key = chain.consumer.w_name;
-    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+    std::unordered_set<std::string> consts;
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        consts.insert(*co.const_name);
+      }
+    }
+    bool const_conflict = false;
+    for (const auto& c : consts) {
+      if (touched.const_names.count(c)) {
+        const_conflict = true;
+        break;
+      }
+    }
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key) ||
+        const_conflict) {
       continue;  // A shared/tied weight another chain already resized.
     }
 
@@ -12919,12 +13077,20 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
     SliceMatMulBnb4ProducerRows(chain.producer, init_map, keep);
     SliceConsumerWeight(init_map.at(chain.consumer.w_name),
                         chain.consumer.weight_transposed, keep, false);
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
 
     touched.producer.insert(p_key);
     touched.consumer.insert(c_key);
+    for (const auto& c : consts) {
+      touched.const_names.insert(c);
+    }
     touched.stale_value_info.insert(chain.producer.node->output(0));
-    for (onnx::NodeProto* op : chain.chain_ops) {
-      touched.stale_value_info.insert(op->output(0));
+    for (auto& op : chain.chain_ops) {
+      touched.stale_value_info.insert(op.node->output(0));
     }
   }
 }
@@ -16396,23 +16562,26 @@ void SliceFp4SideConsumer(
 
 struct Fp8WalkResult {
   Fp8ChainSide consumer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
 };
 
 // From tensor `start` (a `Fp8Weight` OR plain-float MatMul/Gemm producer's
-// own output), walks forward through shape-preserving unary activations
-// with no other consumer anywhere along the way, until EITHER a
-// `MatMulBlockQuantizedFp8Weight` consumer OR a plain-float MatMul/vanilla-
-// Gemm consumer (MatchPlainMatMulNBitsPeer) is found whose input-channel
-// count matches `n_channels`. No gated pair, no branch, never a `Fp4Weight`/
-// `MatMulNBits`/QDQ consumer -- mirrors pruning.py's own `_walk_to_fp8_
-// consumer` exactly.
+// own output), walks forward through shape-preserving unary activations or
+// a per-channel bias/scale `Add`/`Mul` against a flat constant whose last
+// dim equals `n_channels` (mirrors WalkToConsumer's own identical hop --
+// mechanically mirrored from the MatMulNBits/Bnb4 fix, not independently
+// verified against a live FP8 quantizer), with no other consumer anywhere
+// along the way, until EITHER a `MatMulBlockQuantizedFp8Weight` consumer OR
+// a plain-float MatMul/vanilla-Gemm consumer (MatchPlainMatMulNBitsPeer) is
+// found whose input-channel count matches `n_channels`. No gated pair, no
+// branch, never a `Fp4Weight`/`MatMulNBits`/QDQ consumer -- mirrors
+// pruning.py's own `_walk_to_fp8_consumer` exactly.
 std::optional<Fp8WalkResult> WalkToFp8Consumer(
     const std::string& start, const InitMap& init_map,
     const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
     int max_hops) {
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
     auto cit = consumers_of.find(cur);
@@ -16440,9 +16609,42 @@ std::optional<Fp8WalkResult> WalkToFp8Consumer(
       return Fp8WalkResult{Fp8ChainSide(*peer), std::move(chain_ops)};
     }
 
-    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
-          nxt->input_size() == 1 && nxt->input(0) == cur &&
-          nxt->output_size() == 1)) {
+    std::optional<std::string> const_name;
+    if (UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      // No constant operand.
+    } else if ((nxt->op_type() == "Add" || nxt->op_type() == "Mul") &&
+               nxt->input_size() == 2 && nxt->output_size() == 1 &&
+               (nxt->input(0) == cur || nxt->input(1) == cur)) {
+      // A separate trailing bias/scale `Add`/`Mul` against a flat
+      // per-channel constant -- mirrors WalkToConsumer's own identical hop
+      // (mechanically mirrored from the MatMulNBits/Bnb4 fix, not
+      // independently verified against a live FP8 quantizer).
+      const std::string& other =
+          (nxt->input(0) == cur) ? nxt->input(1) : nxt->input(0);
+      auto oit = init_map.find(other);
+      bool valid = false;
+      if (oit != init_map.end()) {
+        const onnx::TensorProto* c = oit->second;
+        int64_t prod = 1;
+        for (int64_t d : c->dims()) {
+          prod *= d;
+        }
+        valid =
+            c->data_type() == onnx::TensorProto::FLOAT && c->dims_size() > 0 &&
+            c->dims(c->dims_size() - 1) == n_channels && prod == n_channels &&
+            // Tied/shared-tensor bar -- see
+            // WalkToMatMulNBitsConsumer's own identical check on this
+            // same hop for why a mid-chain hop's constant needs this
+            // checked here, not left to a producer/consumer match.
+            ConsumerCount(consumers_of, other) == 1;
+      }
+      if (!valid) {
+        return std::nullopt;
+      }
+      const_name = other;
+    } else {
       return std::nullopt;
     }
     const std::string& out2 = nxt->output(0);
@@ -16451,7 +16653,7 @@ std::optional<Fp8WalkResult> WalkToFp8Consumer(
         graph_outputs.count(out2)) {
       return std::nullopt;
     }
-    chain_ops.push_back(nxt);
+    chain_ops.push_back(ChainOp{nxt, const_name});
     cur = out2;
   }
   return std::nullopt;
@@ -16459,7 +16661,7 @@ std::optional<Fp8WalkResult> WalkToFp8Consumer(
 
 struct Fp4WalkResult {
   Fp4ChainSide consumer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
 };
 
 // `Fp4Weight` analogue of WalkToFp8Consumer -- see that function's own
@@ -16469,7 +16671,7 @@ std::optional<Fp4WalkResult> WalkToFp4Consumer(
     const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
     int max_hops) {
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
     auto cit = consumers_of.find(cur);
@@ -16497,9 +16699,42 @@ std::optional<Fp4WalkResult> WalkToFp4Consumer(
       return Fp4WalkResult{Fp4ChainSide(*peer), std::move(chain_ops)};
     }
 
-    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
-          nxt->input_size() == 1 && nxt->input(0) == cur &&
-          nxt->output_size() == 1)) {
+    std::optional<std::string> const_name;
+    if (UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      // No constant operand.
+    } else if ((nxt->op_type() == "Add" || nxt->op_type() == "Mul") &&
+               nxt->input_size() == 2 && nxt->output_size() == 1 &&
+               (nxt->input(0) == cur || nxt->input(1) == cur)) {
+      // A separate trailing bias/scale `Add`/`Mul` against a flat
+      // per-channel constant -- mirrors WalkToConsumer's own identical hop
+      // (mechanically mirrored from the MatMulNBits/Bnb4 fix, not
+      // independently verified against a live FP4 quantizer).
+      const std::string& other =
+          (nxt->input(0) == cur) ? nxt->input(1) : nxt->input(0);
+      auto oit = init_map.find(other);
+      bool valid = false;
+      if (oit != init_map.end()) {
+        const onnx::TensorProto* c = oit->second;
+        int64_t prod = 1;
+        for (int64_t d : c->dims()) {
+          prod *= d;
+        }
+        valid =
+            c->data_type() == onnx::TensorProto::FLOAT && c->dims_size() > 0 &&
+            c->dims(c->dims_size() - 1) == n_channels && prod == n_channels &&
+            // Tied/shared-tensor bar -- see
+            // WalkToMatMulNBitsConsumer's own identical check on this
+            // same hop for why a mid-chain hop's constant needs this
+            // checked here, not left to a producer/consumer match.
+            ConsumerCount(consumers_of, other) == 1;
+      }
+      if (!valid) {
+        return std::nullopt;
+      }
+      const_name = other;
+    } else {
       return std::nullopt;
     }
     const std::string& out2 = nxt->output(0);
@@ -16508,7 +16743,7 @@ std::optional<Fp4WalkResult> WalkToFp4Consumer(
         graph_outputs.count(out2)) {
       return std::nullopt;
     }
-    chain_ops.push_back(nxt);
+    chain_ops.push_back(ChainOp{nxt, const_name});
     cur = out2;
   }
   return std::nullopt;
@@ -16516,14 +16751,14 @@ std::optional<Fp4WalkResult> WalkToFp4Consumer(
 
 struct Fp8Chain {
   Fp8ChainSide producer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   Fp8ChainSide consumer;
   int64_t n_channels;
 };
 
 struct Fp4Chain {
   Fp4ChainSide producer;
-  std::vector<onnx::NodeProto*> chain_ops;
+  std::vector<ChainOp> chain_ops;
   Fp4ChainSide consumer;
   int64_t n_channels;
 };
@@ -16680,10 +16915,24 @@ void ApplyFp8BlockQuantizedChains(onnx::GraphProto* graph,
   for (auto& chain : chains) {
     const std::string p_key = Fp8ChainSideKey(chain.producer);
     const std::string c_key = Fp8ChainSideKey(chain.consumer);
+    std::unordered_set<std::string> consts;
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        consts.insert(*co.const_name);
+      }
+    }
     if (p_key == c_key) {
       continue;  // Degenerate (the same weight in both roles).
     }
-    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+    bool const_conflict = false;
+    for (const auto& c : consts) {
+      if (touched.const_names.count(c)) {
+        const_conflict = true;
+        break;
+      }
+    }
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key) ||
+        const_conflict) {
       continue;  // A shared/tied weight another chain already resized.
     }
 
@@ -16715,13 +16964,21 @@ void ApplyFp8BlockQuantizedChains(onnx::GraphProto* graph,
 
     SliceFp8SideProducer(chain.producer, init_map, keep);
     SliceFp8SideConsumer(chain.consumer, init_map, consumer_keep);
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
 
     touched.producer.insert(p_key);
     touched.consumer.insert(c_key);
+    for (const auto& c : consts) {
+      touched.const_names.insert(c);
+    }
     touched.stale_value_info.insert(
         Fp8ChainSideNode(chain.producer)->output(0));
-    for (auto* op : chain.chain_ops) {
-      touched.stale_value_info.insert(op->output(0));
+    for (auto& op : chain.chain_ops) {
+      touched.stale_value_info.insert(op.node->output(0));
     }
   }
 }
@@ -16757,10 +17014,24 @@ void ApplyFp4BlockQuantizedChains(onnx::GraphProto* graph,
   for (auto& chain : chains) {
     const std::string p_key = Fp4ChainSideKey(chain.producer);
     const std::string c_key = Fp4ChainSideKey(chain.consumer);
+    std::unordered_set<std::string> consts;
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        consts.insert(*co.const_name);
+      }
+    }
     if (p_key == c_key) {
       continue;
     }
-    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+    bool const_conflict = false;
+    for (const auto& c : consts) {
+      if (touched.const_names.count(c)) {
+        const_conflict = true;
+        break;
+      }
+    }
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key) ||
+        const_conflict) {
       continue;
     }
 
@@ -16792,13 +17063,21 @@ void ApplyFp4BlockQuantizedChains(onnx::GraphProto* graph,
 
     SliceFp4SideProducer(chain.producer, init_map, keep);
     SliceFp4SideConsumer(chain.consumer, init_map, consumer_keep);
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
 
     touched.producer.insert(p_key);
     touched.consumer.insert(c_key);
+    for (const auto& c : consts) {
+      touched.const_names.insert(c);
+    }
     touched.stale_value_info.insert(
         Fp4ChainSideNode(chain.producer)->output(0));
-    for (auto* op : chain.chain_ops) {
-      touched.stale_value_info.insert(op->output(0));
+    for (auto& op : chain.chain_ops) {
+      touched.stale_value_info.insert(op.node->output(0));
     }
   }
 }
