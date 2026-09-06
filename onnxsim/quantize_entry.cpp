@@ -10,6 +10,7 @@
 #include "model_prep.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnxoptimizer/optimize.h"
+#include "passes/any_precision_llm.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/qoperator_quantize_gemm.h"
 #include "passes/qoperator_quantize_pool.h"
@@ -127,6 +128,32 @@ onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model) {
   onnxsim::RegisterCustomOptimizerPasses();
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"double_quantization"});
+}
+
+onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
+                                      int64_t bits, int64_t max_bits,
+                                      int64_t block_size) {
+  if (max_bits < 1) {
+    throw std::invalid_argument(
+        "ApplyAnyPrecisionLlm: max_bits must be >= 1, got " +
+        std::to_string(max_bits));
+  }
+  if (bits < 1 || bits > max_bits) {
+    throw std::invalid_argument(
+        "ApplyAnyPrecisionLlm: bits (" + std::to_string(bits) +
+        ") must be in [1, max_bits=" + std::to_string(max_bits) + "]");
+  }
+  PrepareSchemasForDebug(model);
+  // Registers any_precision_llm (idempotent) into onnxoptimizer's registry
+  // so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // any_precision_llm reads these the same way quarot reads QuarotSeed() --
+  // OptimizeFixed's pass-name list has no way to carry a parameter directly.
+  onnx::optimization::onnxsim_passes::AnyPrecisionLlmBits() = bits;
+  onnx::optimization::onnxsim_passes::AnyPrecisionLlmMaxBits() = max_bits;
+  onnx::optimization::onnxsim_passes::AnyPrecisionLlmBlockSize() = block_size;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"any_precision_llm"});
 }
 
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
