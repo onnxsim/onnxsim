@@ -95,6 +95,7 @@ from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
+from onnxsim.lqer import apply_lqer
 from onnxsim.memory_planning import (
     MemoryPlan,
     annotate_memory_plan,
@@ -272,6 +273,7 @@ __all__ = [
     "quantize_dequantize_block_fp8",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "apply_lqer",
     "apply_svdquant",
     "apply_norm_tweaking",
     "MemoryPlan",
