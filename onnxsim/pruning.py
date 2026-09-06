@@ -11080,6 +11080,7 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             group_norm,
             decomposed_group_norm_num_groups,
             _matmul_consumer,
+            grn,
         ) = _walk_to_conv_consumer(
             mul_out,
             initializer_map,
@@ -11093,7 +11094,11 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # Every optional `_walk_to_conv_consumer` flag was left at its
         # default (False) above, mirroring `_find_conv_se_gate_chains`'s
         # own identical choice -- so these are always `None` here.
-        assert group_norm is None and decomposed_group_norm_num_groups is None
+        assert (
+            group_norm is None
+            and decomposed_group_norm_num_groups is None
+            and grn is None
+        )
         (
             consumer_node,
             consumer_weight,
