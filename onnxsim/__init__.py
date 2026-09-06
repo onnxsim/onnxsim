@@ -100,6 +100,7 @@ from onnxsim.iq4_nl import (
 from onnxsim.kbvq_moe import apply_kbvq_moe
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
+from onnxsim.leptoquant import apply_leptoquant
 from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
@@ -290,6 +291,7 @@ __all__ = [
     "apply_daq",
     "apply_deepseek_fp8",
     "quantize_dequantize_block_fp8",
+    "apply_leptoquant",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_lqer",
