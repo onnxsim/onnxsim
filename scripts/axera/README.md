@@ -1993,6 +1993,84 @@ by half the range -- so this is exactly the ordering a small signed byte
 would show. Consistent with a signed quantized parameter, not a
 decoding of one.
 
+### The opaque region is a 32-bit-word instruction stream: `a1 00 xx yy` headers, never adjacent, each followed by an operand
+
+The hardware probes above pointed at *which* bytes matter; comparing the
+raw bytes of the probed windows -- zero device runs -- shows *why*, and
+it is the most concrete structural decoding of mcode this project has
+produced.
+
+**The two control-template instances differ at exactly the three
+"address-like" bytes and nowhere else.** The 17-byte windows around
+32700 and 48300 are identical at all 14 positions the probes classified
+as fault, inert, or gate, and differ only at `X..X+2` -- precisely the
+bytes whose flips gave large, unordered, input-independent effects:
+
+```
+32700:  05 00 00 00 | a1 00 40 02 | 8c 4c 06 00 | a1 00 50 01 | 00
+48300:  05 00 00 00 | a1 00 40 02 | a0 49 b3 00 | a1 00 50 01 | 00
+43500:  00 00 00 00 | a1 00 50 03 | 80 64 1e 00 | a1 00 50 01 | 00
+```
+
+Segmented into 4-byte words (all three windows start on a 4-byte
+boundary), the layout is the same everywhere: a **header word
+`a1 00 xx yy`**, then a **32-bit little-endian operand** (`0x00064c8c`,
+`0x00b349a0`, `0x001e6480`), then the next header. Every probe result now
+has a place: the gate at `X-4` is the header's first byte `a1`; the
+"gate nibble" at `X-1` is the low nibble of the header's last byte
+(`02`/`03`); the three address-like bytes are the operand's low three
+bytes; the checked MSB at `X+3` is bit 7 of the operand's top byte
+(`00`); and the data-like instance simply has a different header
+(`50 03` vs `40 02`), i.e. a different instruction kind whose operand
+the hardware treats differently.
+
+**This is the format of the whole blob, in two different models, not a
+local coincidence** (all of it local byte analysis, deterministic,
+re-checkable in seconds):
+
+```
+                             resnet18d (49,080 B)     tiny two-Conv (3,920 B)
+length % 4                   0                        0
+`a1 00` words, 4-byte aligned  1,197                  58
+`a1 00` byte pairs, unaligned  167 (~56 per phase)    49 (~16 per phase)
+header followed by a header  0 / 1,197                0 / 58
+even gaps between headers    98% (1,174 / 1,196)      86% (49 / 57)
+```
+
+Aligned headers are ~21x (resnet18d) and ~3.6x (tiny) more frequent than
+the same byte pair at any other phase, so the alignment is real, not
+chance. **No header is ever immediately followed by another** (random
+placement would give ~117 such pairs in resnet18d), which is the
+`[header][>=1 operand]` structure exactly. Gaps between headers are
+dominantly 2 words -- one operand -- with 4, 8, 10, 12 next; a first
+version of this section said "strictly even," which was an overstatement
+from reading only the top gap sizes: it is 98% and 86%, i.e. 2-word
+granularity with exceptions, and 32 bytes is four such 2-word
+instructions, reconciling the very first "32-byte mcode unit" finding.
+
+**The instruction mix is model-dependent; the format is not.** In
+`resnet18d` three header kinds dominate -- `50 01` (724), and `40 02`
+and `50 03` at *exactly* 181 each (the two probed control bytes were
+`40 02`, the data-like one `50 03`, so a `40 02`/`50 03` pair per op is
+the natural reading, e.g. an address-set and a data-set). The tiny model
+has a different top set (`80 02`, `b0 03`, `b0 0b`, `30 04`), as a
+different op/shape mix should. One more tie-in: the tiny model's four
+known non-deterministic noise bytes (858/864/870/876) fall in `23 00 xx
+82`-style words, never in an `a1 00` header, carrying exactly the known
+`{0x10,0x20,0x30,0x40}` label values -- the label noise is a field of a
+different word family.
+
+**What this does and does not settle.** It settles that the "99% opaque"
+region is a parseable stream of 4-byte words with a recognizable header
+kind, so "decoding mcode" now means "decoding operand semantics per
+header kind," a far smaller and better-posed problem. It does *not*
+identify what `a1` means, what `xx yy` encode beyond "kind," or confirm
+that operands are addresses -- though the input-dependence split
+(control-like `40 02` vs data-like `50 03`) is exactly what "an address
+to an output buffer" vs "an address to weights" would produce, which is
+now the leading hypothesis and one a single targeted test (patch an
+operand to another instance's value) could check.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

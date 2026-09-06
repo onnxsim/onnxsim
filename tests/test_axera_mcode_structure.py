@@ -1579,3 +1579,66 @@ def test_resnet18d_data_like_byte_sits_in_a_gated_template_and_is_sign_like(tmp_
     # Sign-like: flipping all 8 bits perturbs less than flipping bit 7 alone.
     all_bits = flip(43500, 0xFF)
     assert np.max(np.abs(all_bits - out_base)) < np.max(np.abs(outs[7] - out_base))
+
+
+def _word_stream_stats(mcode):
+    """Local, deterministic structure stats for an mcode blob read as a
+    stream of 4-byte words (see the README's "32-bit-word instruction
+    stream" section): the word indices holding an `a1 00 xx yy` header,
+    how many headers are immediately followed by another header, the
+    fraction of even gaps between consecutive headers, and a Counter of
+    the `xx yy` header suffixes. No Docker or device needed beyond
+    producing the blob."""
+    from collections import Counter
+
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    headers = [i for i, w in enumerate(words) if w[0] == 0xA1 and w[1] == 0x00]
+    adjacent = sum(
+        1
+        for i in headers
+        if i + 1 < len(words) and words[i + 1][0] == 0xA1 and words[i + 1][1] == 0x00
+    )
+    gaps = [b - a for a, b in zip(headers, headers[1:])]
+    even_frac = sum(1 for g in gaps if g % 2 == 0) / len(gaps) if gaps else 0.0
+    suffixes = Counter(words[i][2:].hex(" ") for i in headers)
+    return headers, adjacent, even_frac, suffixes
+
+
+def test_mcode_is_a_word_stream_with_never_adjacent_headers_tiny_model(tmp_path):
+    """Confirmed real (see the README's "32-bit-word instruction stream"
+    section), on the tiny two-Conv model: the mcode blob is 4-byte
+    aligned, holds `a1 00 xx yy` header words at word alignment, no
+    header is ever immediately followed by another (the [header][operand]
+    structure), and the gaps between headers are dominantly even. Needs
+    Docker for the build but no device.
+    """
+    model = _two_conv_model(vary_first=True, dilation=2, pad=2)
+    mcode = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "tiny"), model, (1, 4, 16, 16))
+    )
+    assert len(mcode) % 4 == 0
+    headers, adjacent, even_frac, _ = _word_stream_stats(mcode)
+    assert len(headers) >= 40, len(headers)
+    assert adjacent == 0, adjacent
+    assert even_frac >= 0.8, even_frac
+
+
+def test_resnet18d_mcode_word_stream_counts(tmp_path):
+    """Confirmed real (see the README's "32-bit-word instruction stream"
+    section), on the real resnet18d blob: exactly 1,197 word-aligned
+    `a1 00` headers, none adjacent to another, 98% even gaps, and the two
+    probed instruction kinds `40 02` (control-like) and `50 03`
+    (data-like) occurring exactly as often as each other. Needs Docker
+    for the build but no device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    assert len(mcode) % 4 == 0
+    headers, adjacent, even_frac, suffixes = _word_stream_stats(mcode)
+    assert len(headers) == 1197, len(headers)
+    assert adjacent == 0, adjacent
+    assert even_frac >= 0.95, even_frac
+    assert suffixes["40 02"] == suffixes["50 03"] == 181, (
+        suffixes["40 02"],
+        suffixes["50 03"],
+    )
+    assert suffixes.most_common(1)[0] == ("50 01", 724), suffixes.most_common(3)
