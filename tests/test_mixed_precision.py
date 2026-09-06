@@ -1,6 +1,9 @@
 """Tests for ``onnxsim.apply_mixed_precision_quantization`` -- see
 ``onnxsim/mixed_precision.py`` for the technique (calibration-driven
-per-layer choice between block-wise INT8 and block-wise INT4).
+per-layer choice between block-wise INT8 and block-wise INT4) -- and for
+``onnxsim.search_mixed_precision_for_budget``, the accuracy-aware search
+over that dispatcher's own ``high_bits_fraction`` (see that function's
+docstring in ``onnxsim/mixed_precision.py``).
 """
 
 import numpy as np
@@ -8,6 +11,7 @@ import onnx
 import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -145,3 +149,145 @@ def test_mixed_precision_declines_below_opset21():
     model = _two_layer_model(K=32, H=16, N=8, opset=13)
     result = onnxsim.apply_mixed_precision_quantization(model)
     assert result.SerializeToString() == model.SerializeToString()
+
+
+# --------------------------------------------------------------------------- #
+# search_mixed_precision_for_budget
+# --------------------------------------------------------------------------- #
+# Named `_text_model` (rather than reusing `_model` above) since this repo's
+# CLAUDE.md asks new test model-building code to go through `onnx.parser`,
+# but `_model` above already names the onnx.helper-based builder the earlier
+# tests in this file use.
+def _text_model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
+def _search_test_model(seed=0, outlier=20.0):
+    # Two chained MatMuls, K=32/H=16/N=8 (block_size=8 divides both). W2's
+    # first row (every output channel's weight for hidden unit 0) is set to
+    # a large-but-not-extreme outlier: big enough (400x W2's other weights'
+    # scale) that the sensitivity ranking unambiguously ranks W2 above W1 on
+    # any platform (their MSE*activation-energy scores differ by ~5 orders
+    # of magnitude, nowhere near a rounding-boundary tie -- see this repo's
+    # own CLAUDE.md note on `tests/test_gptaq.py`'s prior single-seed
+    # flakiness for why that margin matters), while still leaving room for
+    # promoting more layers to INT8 to actually reduce the measured output
+    # error (an outlier so extreme it saturates the block scale would make
+    # INT4-vs-INT8 equally (in)accurate for that block, which would defeat
+    # the point of this test).
+    rng = np.random.default_rng(seed)
+    w1 = (rng.standard_normal((32, 16)) * 0.5).astype(np.float32)
+    w2 = (rng.standard_normal((16, 8)) * 0.05).astype(np.float32)
+    w2[0, :] = outlier
+    return _text_model(
+        """
+        agraph (float[batch, 32] X) => (float[batch, 8] Y)
+        {
+            H1 = MatMul(X, W1)
+            Y = MatMul(H1, W2)
+        }
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def test_search_mixed_precision_promotes_a_layer_to_meet_a_tight_budget():
+    model = _search_test_model(seed=0, outlier=20.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model, accuracy_budget=0.15, block_size=8, num_samples=16, seed=1
+    )
+    assert result.meets_budget
+    assert result.report.all_finite
+    assert result.report.worst_relative_l2 < 0.15
+    # Starts at the smallest fraction and has to promote at least one layer
+    # (in fact needs every eligible layer at INT8 here) before meeting a
+    # tight budget -- a single INT8 layer alone (fractions 0.3/0.5) still
+    # leaves worst_relative_l2 far above 0.15.
+    assert (
+        result.fractions_tried[0] == onnxsim.mixed_precision.DEFAULT_SEARCH_FRACTIONS[0]
+    )
+    assert len(result.fractions_tried) > 1
+    assert result.high_bits_fraction > 0.0
+
+
+def test_search_mixed_precision_stops_at_first_fraction_for_generous_budget():
+    model = _search_test_model(seed=0, outlier=20.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model, accuracy_budget=1.0, block_size=8, num_samples=16, seed=1
+    )
+    assert result.meets_budget
+    default_fractions = onnxsim.mixed_precision.DEFAULT_SEARCH_FRACTIONS
+    assert result.fractions_tried == [default_fractions[0]]
+    assert result.high_bits_fraction == default_fractions[0]
+
+
+def test_search_mixed_precision_exhausts_fractions_for_impossible_budget():
+    model = _search_test_model(seed=0, outlier=20.0)
+    fractions = (0.0, 0.1, 0.4, 1.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model,
+        accuracy_budget=1e-12,
+        fractions=fractions,
+        block_size=8,
+        num_samples=16,
+        seed=1,
+    )
+    assert not result.meets_budget
+    assert result.fractions_tried == list(fractions)
+    assert result.high_bits_fraction == fractions[-1]
+
+
+def test_search_mixed_precision_winner_matches_direct_call():
+    model = _search_test_model(seed=0, outlier=20.0)
+    calibration_data = onnxsim.generate_random_calibration_data(
+        model, num_samples=16, seed=1
+    )
+    result = onnxsim.search_mixed_precision_for_budget(
+        model,
+        accuracy_budget=0.15,
+        block_size=8,
+        calibration_data=calibration_data,
+    )
+    direct = onnxsim.apply_mixed_precision_quantization(
+        model,
+        calibration_data=calibration_data,
+        high_bits_fraction=result.high_bits_fraction,
+        block_size=8,
+    )
+    assert result.quantized_model.SerializeToString() == direct.SerializeToString()
+
+
+def test_search_mixed_precision_respects_custom_fractions():
+    model = _search_test_model(seed=0, outlier=20.0)
+    calibration_data = onnxsim.generate_random_calibration_data(
+        model, num_samples=16, seed=1
+    )
+    custom_fractions = (0.0, 1.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model,
+        # Impossibly tight so the search never stops early -- every fraction
+        # in `custom_fractions` must actually be tried.
+        accuracy_budget=1e-12,
+        fractions=custom_fractions,
+        block_size=8,
+        calibration_data=calibration_data,
+    )
+    assert result.fractions_tried == list(custom_fractions)
+    for frac in result.fractions_tried:
+        assert frac in custom_fractions
+    # None of the default sweep's own intermediate values (e.g. 0.2, 0.3,
+    # 0.5, 0.75) were ever tried.
+    default_fractions = onnxsim.mixed_precision.DEFAULT_SEARCH_FRACTIONS
+    for frac in default_fractions:
+        if frac not in custom_fractions:
+            assert frac not in result.fractions_tried

@@ -8491,76 +8491,34 @@ def _resolve_spatial_gate_reduce_branch(
     return (reduce_node, unsqueeze_node), unsqueeze_node.output[0]
 
 
-def _match_spatial_gate_pass_through(
+def _validate_spatial_gate_diamond(
     cur: str,
+    mul_node: onnx.NodeProto,
+    reduce_max_node: onnx.NodeProto,
+    reduce_mean_node: onnx.NodeProto,
     consumers_of: Dict[str, List[onnx.NodeProto]],
     initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
 ) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
-    """If `cur` (a tensor with *exactly* three direct consumers) is the root
-    of CBAM's `SpatialGate` shape -- see this section's own comment above for
-    the full empirical/architectural finding -- returns ``(diamond_nodes,
-    final_out)``, the same shape :func:`_match_self_gated_activation`/
-    :func:`_match_gelu_tanh_pass_through` return: `diamond_nodes` is every
-    node the shape spans, in forward order (the `ReduceMax` branch's own
-    nodes, then the `ReduceMean` branch's, then `Concat`, the internal
-    spatial `Conv`, the closing activation, and finally the gating `Mul`
-    itself); `final_out` is that `Mul`'s own output, the tensor the caller
-    should continue walking from.
+    """The shared validation core :func:`_match_spatial_gate_pass_through`
+    uses once it has identified `cur`'s own three direct-consumer roles (a
+    `Mul(cur, gate)`, a `ReduceMax`, and a `ReduceMean` -- each already
+    confirmed by the caller to actually read `cur`), and
+    :func:`_match_conv_triplet_attention_gate` reuses verbatim for its own
+    "direct" (`hw`) branch, whose three roles are three of `cur`'s *five*
+    direct consumers rather than all of them -- the diamond shape itself
+    (``ReduceMax``/``ReduceMean`` -> ``Concat`` -> ``Conv(2->1)`` ->
+    ``Sigmoid``/``HardSigmoid`` -> ``Mul``) is architecturally identical
+    either way, so re-deriving this validation a third time would just be
+    the same checks copy-pasted. See :func:`_match_spatial_gate_pass_through`'s
+    own docstring for the full list of what this declines on.
 
-    Declines (``None``) unless:
-
-    - `cur` has exactly three *distinct* direct consumers (a doubly-read
-      consumer here isn't any confirmed real shape, so declined rather than
-      reasoned about) -- exactly one a `Mul(cur, gate)` (domain ``""``, two
-      inputs, one output, its other operand distinct from `cur` itself), one
-      a `ReduceMax`, and one a `ReduceMean`.
-    - Each reduction branch resolves via
-      :func:`_resolve_spatial_gate_reduce_branch`, and both branches' own
-      final outputs feed the *same* `Concat` node (domain ``""``, ``axis=1``,
-      exactly two inputs ordered ``[max_branch, mean_branch]`` -- the
-      opposite order is a deviation from the confirmed exporter shape and is
-      declined, not guessed at) with no other consumer, not a graph output.
-    - That `Concat`'s own single consumer is a plain `Conv` (domain ``""``,
-      ``group`` absent or ``1``, a constant weight initializer shaped
-      ``[1, 2, kH, kW]`` -- both channel counts architecturally fixed,
-      independent of the spine's own channel count -- see this section's own
-      comment) with no other consumer, not a graph output.
-    - That `Conv`'s own single consumer is a plain `Sigmoid` or `HardSigmoid`
-      (domain ``""``, one input, one output) with no other consumer, not a
-      graph output, whose own output is *exactly* the gating `Mul`'s other
-      operand (`gate` above) -- confirming the activation really is this
-      `Mul`'s own second input, not some unrelated same-shaped node -- and
-      whose own single consumer is that same `Mul` node.
+    Returns ``(diamond_nodes, final_out)`` on a match -- `diamond_nodes` in
+    forward order (the `ReduceMax` branch's own nodes, then the `ReduceMean`
+    branch's, then `Concat`, the internal spatial `Conv`, the closing
+    activation, and finally `mul_node` itself); `final_out` is `mul_node`'s
+    own output. ``None`` on any deviation.
     """
-    consumers = consumers_of.get(cur, [])
-    if len(consumers) != 3 or len({id(c) for c in consumers}) != 3:
-        return None
-
-    mul_node: Optional[onnx.NodeProto] = None
-    reduce_max_node: Optional[onnx.NodeProto] = None
-    reduce_mean_node: Optional[onnx.NodeProto] = None
-    for c in consumers:
-        if (
-            c.op_type == "Mul"
-            and c.domain == ""
-            and len(c.input) == 2
-            and cur in c.input
-            and len(c.output) == 1
-            and c.output[0]
-        ):
-            if mul_node is not None:
-                return None
-            mul_node = c
-        elif c.op_type == "ReduceMax" and reduce_max_node is None:
-            reduce_max_node = c
-        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
-            reduce_mean_node = c
-        else:
-            return None  # a fourth role, or a duplicate of one already seen
-    if mul_node is None or reduce_max_node is None or reduce_mean_node is None:
-        return None
-
     gate_name = mul_node.input[1] if mul_node.input[0] == cur else mul_node.input[0]
     if gate_name == cur:
         return None
@@ -8661,6 +8619,91 @@ def _match_spatial_gate_pass_through(
         max_nodes + mean_nodes + (concat_node, conv_node, activation_node, mul_node)
     )
     return diamond_nodes, mul_node.output[0]
+
+
+def _match_spatial_gate_pass_through(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* three direct consumers) is the root
+    of CBAM's `SpatialGate` shape -- see this section's own comment above for
+    the full empirical/architectural finding -- returns ``(diamond_nodes,
+    final_out)``, the same shape :func:`_match_self_gated_activation`/
+    :func:`_match_gelu_tanh_pass_through` return: `diamond_nodes` is every
+    node the shape spans, in forward order (the `ReduceMax` branch's own
+    nodes, then the `ReduceMean` branch's, then `Concat`, the internal
+    spatial `Conv`, the closing activation, and finally the gating `Mul`
+    itself); `final_out` is that `Mul`'s own output, the tensor the caller
+    should continue walking from.
+
+    Declines (``None``) unless:
+
+    - `cur` has exactly three *distinct* direct consumers (a doubly-read
+      consumer here isn't any confirmed real shape, so declined rather than
+      reasoned about) -- exactly one a `Mul(cur, gate)` (domain ``""``, two
+      inputs, one output, its other operand distinct from `cur` itself), one
+      a `ReduceMax`, and one a `ReduceMean`.
+    - The three identified roles resolve via
+      :func:`_validate_spatial_gate_diamond` (shared with
+      :func:`_match_conv_triplet_attention_gate`'s own "direct" branch --
+      see that function's own docstring for why): each reduction branch
+      resolves via :func:`_resolve_spatial_gate_reduce_branch`, and both
+      branches' own final outputs feed the *same* `Concat` node (domain
+      ``""``, ``axis=1``, exactly two inputs ordered ``[max_branch,
+      mean_branch]`` -- the opposite order is a deviation from the confirmed
+      exporter shape and is declined, not guessed at) with no other
+      consumer, not a graph output.
+    - That `Concat`'s own single consumer is a plain `Conv` (domain ``""``,
+      ``group`` absent or ``1``, a constant weight initializer shaped
+      ``[1, 2, kH, kW]`` -- both channel counts architecturally fixed,
+      independent of the spine's own channel count -- see this section's own
+      comment) with no other consumer, not a graph output.
+    - That `Conv`'s own single consumer is a plain `Sigmoid` or `HardSigmoid`
+      (domain ``""``, one input, one output) with no other consumer, not a
+      graph output, whose own output is *exactly* the gating `Mul`'s other
+      operand (`gate` above) -- confirming the activation really is this
+      `Mul`'s own second input, not some unrelated same-shaped node -- and
+      whose own single consumer is that same `Mul` node.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 3 or len({id(c) for c in consumers}) != 3:
+        return None
+
+    mul_node: Optional[onnx.NodeProto] = None
+    reduce_max_node: Optional[onnx.NodeProto] = None
+    reduce_mean_node: Optional[onnx.NodeProto] = None
+    for c in consumers:
+        if (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            if mul_node is not None:
+                return None
+            mul_node = c
+        elif c.op_type == "ReduceMax" and reduce_max_node is None:
+            reduce_max_node = c
+        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
+            reduce_mean_node = c
+        else:
+            return None  # a fourth role, or a duplicate of one already seen
+    if mul_node is None or reduce_max_node is None or reduce_mean_node is None:
+        return None
+
+    return _validate_spatial_gate_diamond(
+        cur,
+        mul_node,
+        reduce_max_node,
+        reduce_mean_node,
+        consumers_of,
+        initializer_map,
+        graph_outputs,
+    )
 
 
 # ECA-Net (Wang et al. 2020 CVPR, "ECA-Net: Efficient Channel Attention for Deep
@@ -8979,6 +9022,299 @@ def _match_eca_gate_pass_through(
         mul_node,
     )
     return diamond_nodes, mul_node.output[0]
+
+
+# Triplet Attention (Misra et al. 2021, WACV, "Rotate to Attend: Convolutional
+# Triplet Attention Module", `LandskapeAI/triplet-attention`) -- a *fifth*
+# Conv-chain pass-through hop, alongside GroupNorm/GRN/`SpatialGate`/ECA-Net above,
+# recognized on a spine tensor forking into *exactly five* direct consumers.
+# Confirmed against the reference implementation's own canonical source
+# (`LandskapeAI/triplet-attention`'s `MODELS/triplet_attention.py`, fetched
+# directly) and empirically, via a real `torch.onnx.export` (opset 17, legacy
+# TorchScript-based exporter) of a `Conv -> TripletAttention() -> Conv`
+# module, checker-passed and `onnxruntime`-verified against the PyTorch
+# reference. The reference module wraps three instances of the *exact same*
+# `SpatialGate` class :func:`_match_spatial_gate_pass_through` above already
+# recognizes (`ChannelGateH`, `ChannelGateW`, and, when `no_spatial=False` --
+# the module's own default, and the only configuration recognized here --
+# `SpatialGate` itself), two of them fed a permuted view of the spine instead
+# of the spine directly:
+#
+#     t_cw   = Transpose(x, perm=[0, 2, 1, 3])   # swap(channel, height)
+#     b_cw   = SpatialGate(t_cw)                 # -- the shape above, verbatim
+#     out_cw = Transpose(b_cw, perm=[0, 2, 1, 3])  # permute back (self-inverse)
+#
+#     t_hc   = Transpose(x, perm=[0, 3, 2, 1])   # swap(channel, width)
+#     b_hc   = SpatialGate(t_hc)
+#     out_hc = Transpose(b_hc, perm=[0, 3, 2, 1])  # permute back (self-inverse)
+#
+#     out_hw = SpatialGate(x)                    # reads the spine directly
+#
+#     merged = (1/3) * ((out_hw + out_cw) + out_hc)   # -> feeds the next Conv
+#
+# -- i.e. `x`'s own five direct consumers are the two `Transpose`s (each
+# feeding its own independent `SpatialGate` instance) and the three nodes
+# `SpatialGate`'s own three-consumer shape needs when it reads `x` directly:
+# a `ReduceMax`, a `ReduceMean`, and the closing `Mul`. Both permutations are
+# involutions (swapping the same axis pair a second time undoes the first),
+# so the confirmed exporter shape's own "permute back" step always carries
+# the *identical* `perm` as its forward counterpart -- never re-derived or
+# guessed at, just compared for equality. `SpatialGate`'s own internal
+# spatial `Conv` is architecturally fixed at `in_channels=2`,
+# `out_channels=1` regardless of the spine's own channel count `n_channels`
+# -- confirmed already by :func:`_validate_spatial_gate_diamond` for all
+# *three* instances here (`ChannelGateH`'s, `ChannelGateW`'s, and
+# `SpatialGate`'s own) -- so, exactly like a bare `SpatialGate` hop, this
+# entire five-branch shape contributes *nothing* to `chain_ops`/slicing
+# bookkeeping: every node it spans folds into `chain_ops` the "hop over, keep
+# going" way, with the closing scalar-scale `Mul` (`merged` above) becoming
+# the walk's new `cur`.
+#
+# `x`'s five direct consumers collide, in raw count, with the decomposed
+# tanh-GELU shape's own five-consumer root (see that section's own comment
+# above) -- but the two are disjoint by construction on a strictly stronger
+# bar than op-type-set disjointness: `consumers_of` records one entry per
+# `node.input` *occurrence*, and the tanh-GELU shape's own root is read by
+# only *four* distinct nodes (one of them, the squaring `Mul`, reading it
+# twice -- see that section's own comment), whereas every one of Triplet
+# Attention's five roles here reads `x` exactly once, from a *different*
+# node -- five distinct nodes, not four. So the two shapes' own required
+# "how many distinct consumer nodes" counts (4 vs. 5) can never both hold for
+# the same tensor, making the two matchers mutually exclusive without
+# needing to reason about their op-type sets at all. Tried in a fixed order
+# at :func:`_walk_to_conv_consumer`'s own `len(candidates) == 5` dispatch
+# (tanh-GELU first, since it already declines instantly on 5 distinct nodes;
+# this hop second), never masking the other.
+#
+# Gated behind :func:`_walk_to_conv_consumer`'s own
+# `recognize_triplet_attention` parameter, scoped identically to
+# `recognize_spatial_gate` above for the identical reason: only
+# :func:`_find_conv_chains` (the plain single-producer/single-consumer
+# topology every hop in this module was scoped to first) passes it ``True``.
+def _match_conv_triplet_attention_gate(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* five direct consumers, all
+    distinct -- see this section's own comment above for why a doubly-read
+    consumer here is the decomposed tanh-GELU shape's own territory, not
+    this one) is the root of Triplet Attention's shape, returns
+    ``(diamond_nodes, final_out)`` -- the same shape every other pass-through
+    hop in this module returns: `diamond_nodes` is every node the shape
+    spans (in forward order: the `cw` branch's `Transpose`, its own
+    `SpatialGate` diamond, and its "permute back" `Transpose`; then the same
+    three for the `hc` branch; then the direct (`hw`) branch's own
+    `SpatialGate` diamond; then the two closing `Add`s and the final
+    scalar-scale `Mul`); `final_out` is that `Mul`'s own output.
+
+    Declines (``None``) unless:
+
+    - `cur` has exactly five *distinct* direct consumers: two plain
+      `Transpose` nodes (domain ``""``, single input exactly `cur`, single
+      output), one `ReduceMax`, one `ReduceMean`, and one `Mul(cur, gate)`
+      (domain ``""``, two inputs, one output, its other operand distinct
+      from `cur`) -- any other role composition (a sixth role, a duplicate
+      of one already seen, or a `Transpose` reading anything other than
+      `cur` alone) is declined outright.
+    - The two `Transpose`s carry *exactly* the two permutations the
+      confirmed real export uses -- ``[0, 2, 1, 3]`` (swap channel/height)
+      and ``[0, 3, 2, 1]`` (swap channel/width) -- one each; two of the same
+      permutation, or any other permutation entirely, is a deviation from
+      the confirmed shape and is declined, not guessed at.
+    - `cur`'s own direct `ReduceMax`/`ReduceMean`/`Mul` roles, together, form
+      a valid `SpatialGate` diamond via :func:`_validate_spatial_gate_diamond`
+      (the "direct"/`hw` branch) -- the identical validation
+      :func:`_match_spatial_gate_pass_through` itself uses, reused rather
+      than re-derived.
+    - Each `Transpose`'s own single-consumer output (not a graph output)
+      is, in turn, the root of *another* full `SpatialGate` diamond (via
+      :func:`_match_spatial_gate_pass_through`, called directly since that
+      tensor genuinely has exactly three consumers of its own), whose own
+      final `Mul` output (not a graph output) has exactly one consumer: a
+      second plain `Transpose` carrying the *identical* `perm` as the first
+      (both confirmed permutations are self-inverse) -- any other node, or a
+      different `perm`, is declined.
+    - The three branches' own final outputs (the direct branch's `Mul`
+      output, and each permuted branch's own "permute back" `Transpose`
+      output) are combined as *exactly* ``Mul(Add(Add(direct, cw), hc),
+      scale)`` -- the confirmed exporter's own operand pairing and order
+      (`direct` first into the first `Add`, then `hc`, then the scalar
+      `scale`) -- with every intermediate tensor read by no other consumer
+      and not a graph output; any other grouping, order, or non-scalar
+      `scale` is declined, not reordered/guessed at.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 5 or len({id(c) for c in consumers}) != 5:
+        return None
+
+    transposes: List[onnx.NodeProto] = []
+    reduce_max_node: Optional[onnx.NodeProto] = None
+    reduce_mean_node: Optional[onnx.NodeProto] = None
+    mul_node: Optional[onnx.NodeProto] = None
+    for c in consumers:
+        if (
+            c.op_type == "Transpose"
+            and c.domain == ""
+            and list(c.input) == [cur]
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            transposes.append(c)
+        elif c.op_type == "ReduceMax" and reduce_max_node is None:
+            reduce_max_node = c
+        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
+            reduce_mean_node = c
+        elif (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+            and c.output[0]
+            and mul_node is None
+        ):
+            mul_node = c
+        else:
+            return None  # a sixth role, or a duplicate of one already seen
+
+    if (
+        len(transposes) != 2
+        or reduce_max_node is None
+        or reduce_mean_node is None
+        or mul_node is None
+    ):
+        return None
+
+    perm_of: Dict[int, Tuple[int, ...]] = {}
+    for t in transposes:
+        perm: Optional[List[int]] = None
+        for attr in t.attribute:
+            if attr.name == "perm":
+                perm = list(attr.ints)
+        if perm is None:
+            return None
+        perm_of[id(t)] = tuple(perm)
+    if set(perm_of.values()) != {(0, 2, 1, 3), (0, 3, 2, 1)}:
+        return None
+    cw_transpose = (
+        transposes[0] if perm_of[id(transposes[0])] == (0, 2, 1, 3) else transposes[1]
+    )
+    hc_transpose = transposes[1] if cw_transpose is transposes[0] else transposes[0]
+
+    direct = _validate_spatial_gate_diamond(
+        cur,
+        mul_node,
+        reduce_max_node,
+        reduce_mean_node,
+        consumers_of,
+        initializer_map,
+        graph_outputs,
+    )
+    if direct is None:
+        return None
+    direct_nodes, direct_out = direct
+
+    branch_nodes: List[Tuple[onnx.NodeProto, ...]] = []
+    branch_outs: List[str] = []
+    for transpose_node in (cw_transpose, hc_transpose):
+        t_out = transpose_node.output[0]
+        if t_out in graph_outputs or len(consumers_of.get(t_out, [])) != 3:
+            return None
+        sub = _match_spatial_gate_pass_through(
+            t_out, consumers_of, initializer_map, graph_outputs
+        )
+        if sub is None:
+            return None
+        sub_nodes, sub_out = sub
+        if sub_out in graph_outputs or len(consumers_of.get(sub_out, [])) != 1:
+            return None
+        back_transpose = consumers_of[sub_out][0]
+        if (
+            back_transpose.op_type != "Transpose"
+            or back_transpose.domain != ""
+            or list(back_transpose.input) != [sub_out]
+            or len(back_transpose.output) != 1
+            or not back_transpose.output[0]
+        ):
+            return None
+        back_perm: Optional[List[int]] = None
+        for attr in back_transpose.attribute:
+            if attr.name == "perm":
+                back_perm = list(attr.ints)
+        if back_perm is None or tuple(back_perm) != perm_of[id(transpose_node)]:
+            return None
+        branch_nodes.append((transpose_node,) + sub_nodes + (back_transpose,))
+        branch_outs.append(back_transpose.output[0])
+
+    cw_nodes, hc_nodes = branch_nodes
+    branch_cw_out, branch_hc_out = branch_outs
+
+    if (
+        direct_out in graph_outputs
+        or branch_cw_out in graph_outputs
+        or branch_hc_out in graph_outputs
+        or len(consumers_of.get(direct_out, [])) != 1
+        or len(consumers_of.get(branch_cw_out, [])) != 1
+        or len(consumers_of.get(branch_hc_out, [])) != 1
+    ):
+        return None
+
+    add1 = consumers_of[direct_out][0]
+    if consumers_of[branch_cw_out][0] is not add1:
+        return None
+    if (
+        add1.op_type != "Add"
+        or add1.domain != ""
+        or len(add1.input) != 2
+        or set(add1.input) != {direct_out, branch_cw_out}
+        or len(add1.output) != 1
+        or not add1.output[0]
+    ):
+        return None
+    add1_out = add1.output[0]
+    if add1_out in graph_outputs or len(consumers_of.get(add1_out, [])) != 1:
+        return None
+
+    add2 = consumers_of[add1_out][0]
+    if consumers_of[branch_hc_out][0] is not add2:
+        return None
+    if (
+        add2.op_type != "Add"
+        or add2.domain != ""
+        or len(add2.input) != 2
+        or set(add2.input) != {add1_out, branch_hc_out}
+        or len(add2.output) != 1
+        or not add2.output[0]
+    ):
+        return None
+    add2_out = add2.output[0]
+    if add2_out in graph_outputs or len(consumers_of.get(add2_out, [])) != 1:
+        return None
+
+    final_mul = consumers_of[add2_out][0]
+    if (
+        final_mul.op_type != "Mul"
+        or final_mul.domain != ""
+        or len(final_mul.input) != 2
+        or add2_out not in final_mul.input
+        or len(final_mul.output) != 1
+        or not final_mul.output[0]
+    ):
+        return None
+    scale_name = (
+        final_mul.input[1] if final_mul.input[0] == add2_out else final_mul.input[0]
+    )
+    if scale_name == add2_out or not _gate_branch_scalar_const(
+        scale_name, initializer_map
+    ):
+        return None
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = (
+        cw_nodes + hc_nodes + direct_nodes + (add1, add2, final_mul)
+    )
+    return diamond_nodes, final_mul.output[0]
 
 
 def _match_resize_channel_pass_through(
@@ -9361,6 +9697,7 @@ def _walk_to_conv_consumer(
     recognize_grn: bool = False,
     recognize_spatial_gate: bool = False,
     recognize_eca_gate: bool = False,
+    recognize_triplet_attention: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
     recognize_depth_to_space: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
@@ -9554,6 +9891,23 @@ def _walk_to_conv_consumer(
     `Expand`, is likewise independent of it), so it carries no per-chain "at
     most one" restriction and needs no dedicated return value here.
 
+    `recognize_triplet_attention` is the analogous gate for Triplet
+    Attention's shape -- see :func:`_match_conv_triplet_attention_gate` and
+    this module's own "Triplet Attention" section comment -- scoped
+    identically to `recognize_spatial_gate` for the identical reason (only
+    :func:`_find_conv_chains` passes ``True``): tried at whatever tensor
+    `cur` is at the top of each hop iteration below the moment it has
+    exactly *five* consumers, right alongside the decomposed tanh-GELU
+    shape's own identical-count dispatch -- tried second, after tanh-GELU,
+    since the two are mutually exclusive by construction (see that section's
+    own comment for the "four vs. five distinct consumer nodes" argument),
+    so trying both costs nothing beyond one more declining call whenever
+    neither is actually present. Like `SpatialGate` alone (not `group_norm`/
+    `decomposed_group_norm_num_groups`/`grn`), a Triplet Attention match
+    contributes nothing to `chain_ops`/slicing bookkeeping at all, so it too
+    carries no per-chain "at most one" restriction and needs no dedicated
+    return value here.
+
     `recognize_depth_to_space` gates a mid-chain ``DepthToSpace`` (mode
     ``"CRD"``) node -- PyTorch's ``nn.PixelShuffle`` lowering, see this
     module's own ``DepthToSpace`` (mode ``"CRD"``) section comment and
@@ -9697,9 +10051,20 @@ def _walk_to_conv_consumer(
                     continue
                 break  # two consumers but not this shape -- declined, as before
             if len(candidates) == 5:
-                # The decomposed tanh-GELU shape's own root -- see this
-                # module's own "Decomposed tanh-approximate GELU pass-through"
-                # section comment and :func:`_match_gelu_tanh_pass_through`.
+                # Two mutually-exclusive five-*entry* shapes share this
+                # dispatch: the decomposed tanh-GELU shape's own root (see
+                # this module's own "Decomposed tanh-approximate GELU
+                # pass-through" section comment and
+                # :func:`_match_gelu_tanh_pass_through` -- only *four*
+                # distinct consumer nodes, one read twice) and Triplet
+                # Attention's own spine root (see this module's own
+                # "Triplet Attention" section comment and
+                # :func:`_match_conv_triplet_attention_gate` -- *five*
+                # distinct consumer nodes, each reading `cur` exactly once).
+                # Disjoint on that distinct-node-count alone, so trying
+                # tanh-GELU first, then Triplet Attention only if tanh-GELU
+                # didn't match at all, is always safe and never masks the
+                # other.
                 gelu_diamond = _match_gelu_tanh_pass_through(
                     cur, consumers_of, initializer_map, graph_outputs
                 )
@@ -9713,7 +10078,21 @@ def _walk_to_conv_consumer(
                     chain_ops.extend((n, None) for n in diamond_nodes)
                     cur = diamond_out
                     continue
-                break  # five consumers but not this shape -- declined, as before
+                if recognize_triplet_attention:
+                    ta_diamond = _match_conv_triplet_attention_gate(
+                        cur, consumers_of, initializer_map, graph_outputs
+                    )
+                    if ta_diamond is not None:
+                        diamond_nodes, diamond_out = ta_diamond
+                        if (
+                            len(consumers_of.get(diamond_out, [])) != 1
+                            or diamond_out in graph_outputs
+                        ):
+                            break
+                        chain_ops.extend((n, None) for n in diamond_nodes)
+                        cur = diamond_out
+                        continue
+                break  # five consumers but not either shape -- declined, as before
             if len(candidates) == 3:
                 # Three mutually-exclusive three-consumer shapes share this
                 # dispatch: CBAM `SpatialGate`'s own spine root (`ReduceMax`
@@ -10086,12 +10465,16 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # shape a self-gated activation decomposition's own origin tensor
         # takes -- see :func:`_find_chains`'s own identical comment and this
         # module's own "Self-gated activation decomposition" section
-        # comment) or exactly five (the decomposed tanh-GELU shape's own
-        # origin tensor -- see this module's own "Decomposed tanh-approximate
-        # GELU pass-through" section comment; `consumers_of` counts one entry
-        # per `node.input` occurrence, and that shape's own squaring `Mul`
-        # reads its root twice over, so its four distinct direct consumers
-        # surface as five entries there, not four).
+        # comment) or exactly five -- two mutually-exclusive shapes share
+        # this count too: the decomposed tanh-GELU shape's own origin tensor
+        # (see this module's own "Decomposed tanh-approximate GELU
+        # pass-through" section comment; `consumers_of` counts one entry per
+        # `node.input` occurrence, and that shape's own squaring `Mul` reads
+        # its root twice over, so its four distinct direct consumers surface
+        # as five entries there, not four) and Triplet Attention's own spine
+        # root (see this module's own "Triplet Attention" section comment --
+        # five distinct direct consumers, each reading the root exactly
+        # once).
         # Also admit exactly three -- three mutually-exclusive shapes share
         # this count: CBAM `SpatialGate`'s own spine root (`ReduceMax`,
         # `ReduceMean`, and the closing `Mul`, each reading the root exactly
@@ -10138,6 +10521,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_grn=True,
             recognize_spatial_gate=True,
             recognize_eca_gate=True,
+            recognize_triplet_attention=True,
             recognize_gap_flatten_matmul_consumer=True,
             recognize_depth_to_space=True,
             producers_of=producers_of,
@@ -11562,6 +11946,630 @@ def _match_conv_ese_gate(
     return None
 
 
+# --- Coordinate Attention ("CoordAtt") gate chains --------------------------
+#
+# Coordinate Attention (Hou, Zhou & Feng, CVPR 2021, "Coordinate Attention
+# for Efficient Mobile Network Design", https://arxiv.org/abs/2103.02907) --
+# `houqb/CoordAttention`'s own reference `CoordAtt` module, reused verbatim
+# in many YOLOv5/v7-CA and MobileNetV3-CA mobile-detection forks -- confirmed
+# live via a real `torch.onnx.export` (torch 2.14.0+cpu, TorchScript
+# exporter, opset 17) of a verbatim reproduction of that module's own
+# `forward` wrapped as `Conv -> CoordAtt -> Conv`:
+#
+#     identity = x                                          # spine, read 3x
+#     x_h = pool_h(x)                        # AveragePool(spine) -> [N,C,H,1]
+#     x_w = pool_w(x).permute(0, 1, 3, 2)    # AveragePool(spine) -> [N,C,1,W]
+#                                             # -> Transpose -> [N,C,W,1]
+#     y = conv1(cat([x_h, x_w], dim=2))      # Concat<axis=2> -> Conv(C->mip)
+#     y = act(bn1(y))                        # BN assumed already fused into
+#                                             # conv1 (this module's own
+#                                             # standing assumption for every
+#                                             # Conv-chain BatchNormalization);
+#                                             # act = h_swish = x * (relu6(x
+#                                             # + 3) / 6), which a raw export
+#                                             # decomposes to `Add(x,3) ->
+#                                             # Clip(0,6) -> Div(,6) -> Mul(x,
+#                                             # .)` -- `x` (conv1's own raw
+#                                             # output) read twice, exactly
+#                                             # the "self-gated activation"
+#                                             # diamond shape this module's
+#                                             # own "Self-gated activation
+#                                             # decomposition" section already
+#                                             # names (SiLU/erf-GELU), just
+#                                             # with a THIRD, narrower gate
+#                                             # branch (`Add`+`Clip`+`Div`)
+#                                             # that section's own shared
+#                                             # walker doesn't recognize --
+#                                             # matched here by a small,
+#                                             # dedicated, narrowly-scoped
+#                                             # sibling (:func:`_match_
+#                                             # coordatt_hard_swish`) rather
+#                                             # than widening that shared,
+#                                             # heavily-reused walker, since
+#                                             # this shape needs no `chain_ops`
+#                                             # bookkeeping at all (see below).
+#     x_h, x_w = split(y, [H, W], dim=2)     # two `Slice`s along axis 2
+#     x_w = x_w.permute(0, 1, 3, 2)          # Transpose -> [N,mip,1,W]
+#     a_h = conv_h(x_h).sigmoid()            # Conv(mip->C) -> Sigmoid
+#     a_w = conv_w(x_w).sigmoid()            # Conv(mip->C) -> Sigmoid
+#     out = identity * a_w * a_h             # Mul(spine, a_w) -> Mul(., a_h)
+#
+# i.e. `spine` (the producing Conv's own output) has exactly THREE direct
+# consumers -- both `AveragePool`s and the inner `Mul(spine, a_w)` -- never
+# two, the bar every other shape in this section's own dispatch
+# (:func:`_find_conv_se_gate_chains`) has held since before this shape
+# existed. Left unrecognized, the whole block (including `spine`'s own
+# producing Conv) is completely unprunable -- confirmed empirically the same
+# way the ESE gate shape above was: building the exact topology and running
+# `apply_structured_pruning` at this feature's own starting commit leaves
+# every one of `P`/`conv1`/`conv_h`/`conv_w` untouched.
+#
+# What matches, conservatively -- declining rather than guessing at anything
+# beyond the one confirmed real shape above:
+#
+#   - `P`, an ordinary (`group == 1`) Conv producer, whose own raw output,
+#     optionally through a run of `_UNARY_PASS_THROUGH` activations, reaches
+#     `spine` with EXACTLY THREE consumers: one `AveragePool` feeding
+#     `Concat` directly (`pool_h`), one `AveragePool` feeding a `Transpose`
+#     (`perm=[0,1,3,2]`, exactly -- not merely "some permutation") that in
+#     turn feeds the SAME `Concat` (`pool_w`), and one `Mul(spine,
+#     gate_w)` (the FIRST of the two closing multiplies). Neither
+#     `AveragePool`'s own `kernel_shape` is inspected at all -- exactly like
+#     this module's own CBAM `ChannelGate` section's identical stance on
+#     `AveragePool`/`MaxPool`: pooling never mixes channels regardless of
+#     window size, so it needs no value check for pruning to stay safe, only
+#     the op-type/single-input/single-output shape.
+#   - `Concat<axis=2>` (or its negative-index equivalent, `axis=-2`) over
+#     exactly `{pool_h_out, transpose_out}` (order-independent -- neither
+#     this matcher nor the slicing that follows relies on which physical
+#     half is which, only that the axis is the H+W one, never the channel
+#     axis) feeds `conv1` (`Conv(1x1, group=1)`, own in_channels == `C`
+#     exactly, own out_channels == an independent bottleneck `mip` --
+#     mirroring the ordinary SE gate's own `fc1`, whose OUTPUT/bottleneck
+#     axis is likewise left untouched).
+#   - `conv1`'s own raw output feeds the hard-swish diamond
+#     (:func:`_match_coordatt_hard_swish`) directly; the diamond's own final
+#     output (`act_out`) has EXACTLY TWO consumers -- both `Slice<axis=2>`
+#     (or `axis=-2`) reading `act_out`, contiguous and non-overlapping
+#     (`starts`/`ends` resolved from constant `int64` operands, `steps == 1`
+#     when present) -- one (`split_h`) feeding `conv_h` (`Conv(1x1,
+#     group=1)`, own in_channels == `mip`, own out_channels == `C` exactly)
+#     directly, the other (`split_w_pre`) feeding a `Transpose`
+#     (`perm=[0,1,3,2]`, exactly) that in turn feeds `conv_w` (the same
+#     shape as `conv_h`, a DIFFERENT weight). Distinguished purely
+#     structurally (which one feeds a Conv directly vs. through a
+#     Transpose first) -- the actual numeric split point is never checked
+#     against any particular half-width, mirroring this module's own
+#     established "don't check values that don't affect channel safety"
+#     precedent (`AveragePool`'s `kernel_shape`, `Clip`'s `min`/`max`).
+#   - `conv_h`'s own output feeds exactly one `{Sigmoid, HardSigmoid}`
+#     (`gate_h`); `conv_w`'s own output feeds exactly one `{Sigmoid,
+#     HardSigmoid}`, whose own output must be the exact `gate_w` operand the
+#     inner `Mul(spine, gate_w)` (identified at the very start) uses. The
+#     inner `Mul`'s own output must feed exactly one further `Mul`, combined
+#     with `gate_h` (order-independent) -- the outer `Mul` this whole block
+#     produces, walked onward via the existing, unmodified
+#     `_walk_to_conv_consumer` exactly like every other shape in this
+#     section.
+#   - Every intermediate tensor along the way, with anything other than
+#     exactly one consumer, or that is itself a graph output, declines the
+#     WHOLE match -- never a partial slice -- the same conservative bar
+#     every other hop in this module holds a mid-chain tensor to.
+#
+# Representation: `P`, `conv_h`, and `conv_w` are the chain's own THREE
+# co-sliced `_Chain.producers` (`producers` is already a plain tuple with no
+# hardcoded arity anywhere `_apply_chains`/`_slice_chain_channels`/
+# `_chain_importance` touch it -- extending it from two producers, the
+# ordinary SE gate's own arity, to three composes for free, no changes
+# needed to any of those shared functions), all forced to the same
+# output-channel `keep` set -- `conv_h`'s and `conv_w`'s own `pre_ops` are
+# each their own trailing `{Sigmoid, HardSigmoid}` (mirroring ordinary SE's
+# `fc2` exactly), `P`'s own `pre_ops` the optional pre-spine activation run
+# every producer in this section already carries. `chain_ops` carries BOTH
+# closing multiplies (`(inner_mul, None), (outer_mul, None)`, plus whatever
+# `_walk_to_conv_consumer` finds beyond them) -- the two channel-count-`C`-
+# wide nodes downstream of where the co-sliced producers actually combine,
+# exactly analogous to the ordinary SE gate's own single closing `Mul`, just
+# two of them here since `identity * a_w * a_h` is a chain of two binary
+# multiplies rather than one. `conv1` is the chain's own single extra fan-out
+# branch (`_Chain.extra_consumers`, exactly like ordinary SE's own `fc1`) --
+# its INPUT axis needs the shared `keep` set, its OUTPUT (`mip`) axis is left
+# alone; the branch's own `chain_ops` carries every node between `spine` and
+# `conv1`'s own input that still carries the `C`-wide channel axis and so
+# still needs its cached `value_info` invalidated (`pool_h`, `pool_w`, the
+# `Transpose` between them, `Concat`) -- `conv1` itself, the hard-swish
+# diamond, and both `Slice`s all operate at the independent `mip` width (or
+# are channel-agnostic), so none of them need any bookkeeping here at all.
+#
+# What's declined, deliberately, narrower than a hypothetical fully-general
+# CoordAtt matcher might reach:
+#
+#   - A general grouped Conv anywhere in the four co-sliced/branch roles
+#     (`P`, `conv1`, `conv_h`, `conv_w`) -- every one must report `group ==
+#     1`, mirroring every other shape in this section. Only the FINAL
+#     downstream consumer may still be a general grouped Conv.
+#   - A `ConvTranspose` producer (`P`) -- out of scope, mirroring every
+#     other shape in this section.
+#   - `conv_h`/`conv_w` channel counts not matching `n_channels` exactly (on
+#     either side -- `conv1`'s own input, or `conv_h`/`conv_w`'s own output),
+#     a non-1x1 kernel on any of `conv1`/`conv_h`/`conv_w`, a wrong `Concat`
+#     axis, `Slice` axis, or `Transpose` permutation, an activation other
+#     than the confirmed `Add`+`Clip`+`Div`+`Mul` hard-swish decomposition
+#     between `conv1` and the two `Slice`s, or anything other than exactly
+#     `{Sigmoid, HardSigmoid}` as either final gate activation -- every one
+#     declined outright, never guessed at.
+#   - The four weights (`P`, `conv1`, `conv_h`, `conv_w`) and the eventual
+#     downstream consumer must all be distinct -- an accidental/tied share
+#     between any two is not the confirmed real shape, mirroring the
+#     ordinary SE gate's own identical "four distinct roles" bar (here,
+#     five).
+
+
+def _match_coordatt_hard_swish(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[
+    Tuple[onnx.NodeProto, onnx.NodeProto, onnx.NodeProto, onnx.NodeProto, str]
+]:
+    """If `cur` (already confirmed by the caller to have exactly two
+    consumers) is the origin of `houqb/CoordAttention`'s own decomposed
+    `h_swish` activation -- ``x * (relu6(x + 3) / 6)``, which a raw
+    `torch.onnx.export` lowers to ``add = Add(x, 3); clip = Clip(add, 0, 6);
+    div = Div(clip, 6); out = Mul(x, div)`` (confirmed live, see this
+    section's own comment above) -- returns ``(add_node, clip_node,
+    div_node, mul_node, final_out)``. Declines (``None``) on any deviation.
+
+    Structurally this is one more instance of this module's own "self-gated
+    activation decomposition" diamond shape (`cur` read twice: once by the
+    gate branch's own first node, once by the closing `Mul`) --
+    :func:`_match_self_gated_activation` already recognizes the SiLU and
+    erf-GELU instances of that same diamond, but its own shared
+    :func:`_walk_gate_branch` gate-branch walker does not recognize `Clip`
+    as an allowed hop, and extending that heavily-reused, several-call-site
+    walker to do so was judged riskier than warranted for this one
+    additional, narrowly-scoped shape -- so this is a small, dedicated,
+    narrowly-scoped sibling instead, fixed to the exact `Add`+`Clip`+`Div`
+    sequence above rather than any general gate branch. `Clip`'s own
+    `min`/`max` values are never inspected (reusing
+    :func:`_match_clip_channel_pass_through`'s identical "any *scalar*
+    constant, whatever its value" bar -- a clamp commutes with a channel-axis
+    slice for any bound, so the confirmed `0`/`6` values aren't themselves
+    load-bearing for pruning safety), nor are the `Add`/`Div`'s own scalar
+    constants (:func:`_gate_branch_scalar_const`, the identical bar this
+    module's own SiLU/erf-GELU diamond already applies to its own scalar
+    operands).
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 2:
+        return None
+
+    mul_candidates = [
+        c
+        for c in consumers
+        if c.op_type == "Mul"
+        and c.domain == ""
+        and len(c.input) == 2
+        and cur in c.input
+        and len(c.output) == 1
+    ]
+    if len(mul_candidates) != 1:
+        return None
+    mul_node = mul_candidates[0]
+    div_out_operand = (
+        mul_node.input[1] if mul_node.input[0] == cur else mul_node.input[0]
+    )
+    if div_out_operand == cur or div_out_operand in initializer_map:
+        return None
+
+    add_candidates = [c for c in consumers if c is not mul_node]
+    if len(add_candidates) != 1:
+        return None
+    add_node = add_candidates[0]
+    if not (
+        add_node.op_type == "Add"
+        and add_node.domain == ""
+        and len(add_node.input) == 2
+        and cur in add_node.input
+        and len(add_node.output) == 1
+    ):
+        return None
+    add_const = add_node.input[1] if add_node.input[0] == cur else add_node.input[0]
+    if add_const == cur or not _gate_branch_scalar_const(add_const, initializer_map):
+        return None
+
+    add_out = add_node.output[0]
+    if add_out in graph_outputs or len(consumers_of.get(add_out, [])) != 1:
+        return None
+    clip_node = consumers_of[add_out][0]
+    if not (
+        clip_node.op_type == "Clip"
+        and clip_node.domain == ""
+        and clip_node.input
+        and clip_node.input[0] == add_out
+        and len(clip_node.output) == 1
+        and _match_clip_channel_pass_through(clip_node, initializer_map)
+    ):
+        return None
+
+    clip_out = clip_node.output[0]
+    if clip_out in graph_outputs or len(consumers_of.get(clip_out, [])) != 1:
+        return None
+    div_node = consumers_of[clip_out][0]
+    if not (
+        div_node.op_type == "Div"
+        and div_node.domain == ""
+        and len(div_node.input) == 2
+        and div_node.input[0] == clip_out
+        and len(div_node.output) == 1
+    ):
+        return None
+    if not _gate_branch_scalar_const(div_node.input[1], initializer_map):
+        return None
+    if div_node.output[0] != div_out_operand:
+        return None
+    if (
+        div_out_operand in graph_outputs
+        or len(consumers_of.get(div_out_operand, [])) != 1
+    ):
+        return None
+
+    return add_node, clip_node, div_node, mul_node, mul_node.output[0]
+
+
+def _match_coordatt_split_slice(
+    node: onnx.NodeProto,
+    data_name: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a plain, opset>=10 input-based ``Slice`` reading
+    `data_name` along a single, statically-known ``axis`` -- ``2`` or its
+    negative-index equivalent ``-2`` (the H+W axis `houqb/CoordAttention`'s
+    own ``torch.split(y, [H, W], dim=2)`` lowers to) -- with constant
+    ``int64``, single-element `starts`/`ends`/`axes` (and, if present, a
+    constant `steps` of exactly ``1``), returns ``(start, end)``. Declines
+    (``None``) on any deviation -- a differently-shaped `Slice`, a
+    non-constant or non-scalar bound, a non-1 `axes`/`steps`, or anything
+    else this exact shape doesn't confirm. The actual numeric split point is
+    never checked against any particular half-width here -- see this
+    section's own comment above for why that's not needed for pruning
+    safety; the caller distinguishes ``split_h``/``split_w_pre`` purely
+    structurally (which one feeds a `Conv` directly vs. through a
+    `Transpose` first), not by these values.
+    """
+    if (
+        node.op_type != "Slice"
+        or node.domain != ""
+        or len(node.input) not in (4, 5)
+        or not all(node.input[:4])
+        or len(node.output) != 1
+        or node.input[0] != data_name
+    ):
+        return None
+    starts_n, ends_n, axes_n = node.input[1], node.input[2], node.input[3]
+    consts = [initializer_map.get(n) for n in (starts_n, ends_n, axes_n)]
+    if any(c is None or c.data_type != onnx.TensorProto.INT64 for c in consts):
+        return None
+    starts, ends, axes = (
+        onnx.numpy_helper.to_array(c) for c in consts if c is not None
+    )
+    if starts.shape != (1,) or ends.shape != (1,) or axes.shape != (1,):
+        return None
+    if int(axes[0]) not in (2, -2):
+        return None
+    if len(node.input) == 5 and node.input[4]:
+        step_init = initializer_map.get(node.input[4])
+        if (
+            step_init is None
+            or step_init.data_type != onnx.TensorProto.INT64
+            or list(onnx.numpy_helper.to_array(step_init).reshape(-1)) != [1]
+        ):
+            return None
+    return int(starts[0]), int(ends[0])
+
+
+def _match_conv_coordatt_gate(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # pool_h (AveragePool(spine) -> Concat directly)
+        onnx.NodeProto,  # pool_w (AveragePool(spine) -> Transpose -> Concat)
+        onnx.NodeProto,  # Transpose(pool_w's own output)
+        onnx.NodeProto,  # Concat<axis=2>
+        onnx.NodeProto,  # conv1 (bottleneck Conv, C -> mip)
+        str,  # conv1 weight name
+        onnx.NodeProto,  # hard-swish Add
+        onnx.NodeProto,  # hard-swish Clip
+        onnx.NodeProto,  # hard-swish Div
+        onnx.NodeProto,  # hard-swish Mul (the diamond's own gate Mul)
+        onnx.NodeProto,  # split_h Slice (feeds conv_h directly)
+        onnx.NodeProto,  # split_w_pre Slice (feeds Transpose -> conv_w)
+        onnx.NodeProto,  # Transpose(split_w_pre's own output)
+        onnx.NodeProto,  # conv_h
+        str,  # conv_h weight name
+        Optional[str],  # conv_h bias name
+        onnx.NodeProto,  # Sigmoid/HardSigmoid(conv_h's own output) -- gate_h
+        onnx.NodeProto,  # conv_w
+        str,  # conv_w weight name
+        Optional[str],  # conv_w bias name
+        onnx.NodeProto,  # Sigmoid/HardSigmoid(conv_w's own output) -- gate_w
+        onnx.NodeProto,  # inner Mul(spine, gate_w)
+        onnx.NodeProto,  # outer Mul(inner_mul_out, gate_h)
+    ]
+]:
+    """If `spine`'s own three consumers (`spine_consumers`) form Coordinate
+    Attention's own gate shape this section's own comment above describes,
+    returns the full matched-node tuple. Declines (``None``) on any
+    deviation -- see that comment for the exact, narrow bar.
+    """
+    if len(spine_consumers) != 3:
+        return None
+
+    avg_pool_candidates = [
+        c for c in spine_consumers if c.op_type == "AveragePool" and c.domain == ""
+    ]
+    mul_candidates = [
+        c for c in spine_consumers if c.op_type == "Mul" and c.domain == ""
+    ]
+    if len(avg_pool_candidates) != 2 or len(mul_candidates) != 1:
+        return None
+    inner_mul_node = mul_candidates[0]
+
+    if not (
+        len(inner_mul_node.input) == 2
+        and len(inner_mul_node.output) == 1
+        and spine in inner_mul_node.input
+        and inner_mul_node.input[0] != inner_mul_node.input[1]
+    ):
+        return None
+    gate_w = (
+        inner_mul_node.input[1]
+        if inner_mul_node.input[0] == spine
+        else inner_mul_node.input[0]
+    )
+    if gate_w in initializer_map:
+        return None
+
+    for a, b in (
+        (avg_pool_candidates[0], avg_pool_candidates[1]),
+        (avg_pool_candidates[1], avg_pool_candidates[0]),
+    ):
+        if not (list(a.input) == [spine] and len(a.output) == 1):
+            continue
+        if not (list(b.input) == [spine] and len(b.output) == 1):
+            continue
+        a_out = a.output[0]
+        if a_out in graph_outputs or len(consumers_of.get(a_out, [])) != 1:
+            continue
+        b_out = b.output[0]
+        if b_out in graph_outputs or len(consumers_of.get(b_out, [])) != 1:
+            continue
+        candidate_transpose = consumers_of[b_out][0]
+        if not (
+            candidate_transpose.op_type == "Transpose"
+            and candidate_transpose.domain == ""
+            and list(candidate_transpose.input) == [b_out]
+            and len(candidate_transpose.output) == 1
+        ):
+            continue
+        perm = None
+        for attr in candidate_transpose.attribute:
+            if attr.name == "perm":
+                perm = list(attr.ints)
+        if perm != [0, 1, 3, 2]:
+            continue
+        transpose_out = candidate_transpose.output[0]
+        if (
+            transpose_out in graph_outputs
+            or len(consumers_of.get(transpose_out, [])) != 1
+        ):
+            continue
+        candidate_concat = consumers_of[a_out][0]
+        if consumers_of[transpose_out][0] is not candidate_concat:
+            continue
+        if not (
+            candidate_concat.op_type == "Concat"
+            and candidate_concat.domain == ""
+            and len(candidate_concat.input) == 2
+            and set(candidate_concat.input) == {a_out, transpose_out}
+            and len(candidate_concat.output) == 1
+        ):
+            continue
+        concat_axis = None
+        for attr in candidate_concat.attribute:
+            if attr.name == "axis":
+                concat_axis = attr.i
+        if concat_axis not in (2, -2):
+            continue
+        pool_h_node, pool_w_node, transpose_pw_node, concat_node = (
+            a,
+            b,
+            candidate_transpose,
+            candidate_concat,
+        )
+        break
+    else:
+        return None
+
+    concat_out = concat_node.output[0]
+    if concat_out in graph_outputs or len(consumers_of.get(concat_out, [])) != 1:
+        return None
+    conv1_node = consumers_of[concat_out][0]
+    conv1_match = _match_conv_consumer(conv1_node, initializer_map)
+    if (
+        conv1_match is None
+        or conv1_match[1] != n_channels
+        or conv1_match[2] != 1
+        or conv1_node.input[0] != concat_out
+    ):
+        return None
+    conv1_weight = conv1_match[0]
+    conv1_w_init = initializer_map[conv1_weight]
+    if any(d != 1 for d in conv1_w_init.dims[2:]):
+        return None  # not a 1x1 (or equivalent) conv -- declined
+
+    conv1_out = conv1_node.output[0]
+    if conv1_out in graph_outputs:
+        return None
+    hs_match = _match_coordatt_hard_swish(
+        conv1_out, consumers_of, initializer_map, graph_outputs
+    )
+    if hs_match is None:
+        return None
+    hs_add, hs_clip, hs_div, hs_mul, act_out = hs_match
+
+    if act_out in graph_outputs:
+        return None
+    act_consumers = consumers_of.get(act_out, [])
+    if len(act_consumers) != 2:
+        return None
+    slice_candidates = [
+        c for c in act_consumers if c.op_type == "Slice" and c.domain == ""
+    ]
+    if len(slice_candidates) != 2:
+        return None
+    slice_a, slice_b = slice_candidates
+    slice_a_bounds = _match_coordatt_split_slice(slice_a, act_out, initializer_map)
+    slice_b_bounds = _match_coordatt_split_slice(slice_b, act_out, initializer_map)
+    if slice_a_bounds is None or slice_b_bounds is None:
+        return None
+    start_a, end_a = slice_a_bounds
+    start_b, end_b = slice_b_bounds
+    if start_a == 0 and start_b == end_a and end_b >= start_b:
+        split_h_candidate, split_w_pre_candidate = slice_a, slice_b
+    elif start_b == 0 and start_a == end_b and end_a >= start_a:
+        split_h_candidate, split_w_pre_candidate = slice_b, slice_a
+    else:
+        return None
+
+    split_h_out = split_h_candidate.output[0]
+    if split_h_out in graph_outputs or len(consumers_of.get(split_h_out, [])) != 1:
+        return None
+    conv_h_node = consumers_of[split_h_out][0]
+    conv_h_match = _match_conv_producer(conv_h_node, initializer_map)
+    if (
+        conv_h_match is None
+        or conv_h_match[2] != n_channels
+        or conv_h_match[3] != 1
+        or conv_h_node.input[0] != split_h_out
+    ):
+        return None
+    conv_h_weight, conv_h_bias, _, _ = conv_h_match
+    conv_h_w_init = initializer_map[conv_h_weight]
+    if any(d != 1 for d in conv_h_w_init.dims[2:]):
+        return None
+
+    split_w_pre_out = split_w_pre_candidate.output[0]
+    if (
+        split_w_pre_out in graph_outputs
+        or len(consumers_of.get(split_w_pre_out, [])) != 1
+    ):
+        return None
+    transpose_sw_node = consumers_of[split_w_pre_out][0]
+    if not (
+        transpose_sw_node.op_type == "Transpose"
+        and transpose_sw_node.domain == ""
+        and list(transpose_sw_node.input) == [split_w_pre_out]
+        and len(transpose_sw_node.output) == 1
+    ):
+        return None
+    perm_sw = None
+    for attr in transpose_sw_node.attribute:
+        if attr.name == "perm":
+            perm_sw = list(attr.ints)
+    if perm_sw != [0, 1, 3, 2]:
+        return None
+    split_w_out = transpose_sw_node.output[0]
+    if split_w_out in graph_outputs or len(consumers_of.get(split_w_out, [])) != 1:
+        return None
+    conv_w_node = consumers_of[split_w_out][0]
+    conv_w_match = _match_conv_producer(conv_w_node, initializer_map)
+    if (
+        conv_w_match is None
+        or conv_w_match[2] != n_channels
+        or conv_w_match[3] != 1
+        or conv_w_node.input[0] != split_w_out
+    ):
+        return None
+    conv_w_weight, conv_w_bias, _, _ = conv_w_match
+    conv_w_w_init = initializer_map[conv_w_weight]
+    if any(d != 1 for d in conv_w_w_init.dims[2:]):
+        return None
+
+    conv_h_out = conv_h_node.output[0]
+    if conv_h_out in graph_outputs or len(consumers_of.get(conv_h_out, [])) != 1:
+        return None
+    sigmoid_h_node = consumers_of[conv_h_out][0]
+    if not (
+        sigmoid_h_node.op_type in ("Sigmoid", "HardSigmoid")
+        and sigmoid_h_node.domain == ""
+        and list(sigmoid_h_node.input) == [conv_h_out]
+        and len(sigmoid_h_node.output) == 1
+    ):
+        return None
+    gate_h_out = sigmoid_h_node.output[0]
+
+    conv_w_out = conv_w_node.output[0]
+    if conv_w_out in graph_outputs or len(consumers_of.get(conv_w_out, [])) != 1:
+        return None
+    sigmoid_w_node = consumers_of[conv_w_out][0]
+    if not (
+        sigmoid_w_node.op_type in ("Sigmoid", "HardSigmoid")
+        and sigmoid_w_node.domain == ""
+        and list(sigmoid_w_node.input) == [conv_w_out]
+        and len(sigmoid_w_node.output) == 1
+    ):
+        return None
+    if sigmoid_w_node.output[0] != gate_w:
+        return None
+
+    inner_mul_out = inner_mul_node.output[0]
+    if inner_mul_out in graph_outputs or len(consumers_of.get(inner_mul_out, [])) != 1:
+        return None
+    outer_mul_node = consumers_of[inner_mul_out][0]
+    if not (
+        outer_mul_node.op_type == "Mul"
+        and outer_mul_node.domain == ""
+        and len(outer_mul_node.input) == 2
+        and len(outer_mul_node.output) == 1
+        and inner_mul_out != gate_h_out
+        and set(outer_mul_node.input) == {inner_mul_out, gate_h_out}
+    ):
+        return None
+
+    return (
+        pool_h_node,
+        pool_w_node,
+        transpose_pw_node,
+        concat_node,
+        conv1_node,
+        conv1_weight,
+        hs_add,
+        hs_clip,
+        hs_div,
+        hs_mul,
+        split_h_candidate,
+        split_w_pre_candidate,
+        transpose_sw_node,
+        conv_h_node,
+        conv_h_weight,
+        conv_h_bias,
+        sigmoid_h_node,
+        conv_w_node,
+        conv_w_weight,
+        conv_w_bias,
+        sigmoid_w_node,
+        inner_mul_node,
+        outer_mul_node,
+    )
+
+
 def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
     """Finds Squeeze-and-Excitation gate blocks -- see this section's own
     comment above for the exact topology matched and declined, in either of
@@ -11580,6 +12588,22 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
     time in its consumer role, whose INPUT axis needs the identical keep
     set; fc1's own output/squeeze-bottleneck axis, for the bottleneck shape,
     is left untouched).
+
+    A `spine` tensor with exactly THREE consumers is tried against a third
+    shape instead -- `_match_conv_coordatt_gate`'s Coordinate Attention gate
+    (see this module's own "Coordinate Attention" section comment) -- rather
+    than the two shapes above, which both require exactly two; a two-consumer
+    `spine` is never offered to the CoordAtt matcher, and a three-consumer one
+    is never offered to either SE matcher, so widening this dispatch to admit
+    three costs the two pre-existing shapes nothing. Every CoordAtt match
+    produces one `_Chain` with THREE producers (`P`, `conv_h`, and `conv_w`,
+    all forced to the same output-channel keep set -- `_Chain.producers` is a
+    plain tuple with no hardcoded arity anywhere it's consumed, so this
+    composes for free), one ordinary consumer, one extra fan-out branch
+    (`conv1`, whose INPUT axis needs the identical keep set, its own
+    OUTPUT/bottleneck axis left untouched, exactly like SE's own fc1), and
+    TWO `chain_ops` entries for the closing `identity * a_w * a_h`'s own pair
+    of multiplies rather than SE's single one.
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -11604,7 +12628,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
         spine_consumers: List[onnx.NodeProto] = []
         for _ in range(_MAX_CHAIN_HOPS):
             cands = consumers_of.get(cur, [])
-            if len(cands) == 2:
+            if len(cands) in (2, 3):
                 spine = cur
                 spine_consumers = cands
                 break
@@ -11625,20 +12649,15 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if spine is None:
             continue
 
-        se_match = _match_conv_se_gate(
-            spine,
-            spine_consumers,
-            initializer_map,
-            consumers_of,
-            graph_outputs,
-            n_channels,
-        )
-        ese_match = None
-        if se_match is None:
-            # Fall back to the shorter, no-bottleneck `EffectiveSEModule`
-            # shape (see this section's own comment above) -- strictly
-            # additional, never instead of the two-conv shape above.
-            ese_match = _match_conv_ese_gate(
+        extra_producers: Tuple[_Producer, ...]
+        extra_consumers: Tuple[_ConsumerBranch, ...]
+        role_weights_before_consumer: Set[str]
+        expected_distinct: int
+        chain_ops_prefix: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+        mul_out: str
+
+        if len(spine_consumers) == 3:
+            coordatt_match = _match_conv_coordatt_gate(
                 spine,
                 spine_consumers,
                 initializer_map,
@@ -11646,72 +12665,183 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 graph_outputs,
                 n_channels,
             )
-            if ese_match is None:
+            if coordatt_match is None:
                 continue
-
-        if se_match is not None:
             (
-                gap_node,
-                fc1_node,
-                fc1_weight,
-                mul_node,
-                fc2_node,
-                fc2_weight,
-                fc2_bias,
-                gate_act_node,
-            ) = se_match
-            gate_producer_node = fc2_node
-            gate_producer_weight = fc2_weight
-            gate_producer_bias = fc2_bias
+                pool_h_node,
+                pool_w_node,
+                transpose_pw_node,
+                concat_node,
+                conv1_node,
+                conv1_weight,
+                _hs_add,
+                _hs_clip,
+                _hs_div,
+                _hs_mul,
+                _split_h_node,
+                _split_w_pre_node,
+                _transpose_sw_node,
+                conv_h_node,
+                conv_h_weight,
+                conv_h_bias,
+                sigmoid_h_node,
+                conv_w_node,
+                conv_w_weight,
+                conv_w_bias,
+                sigmoid_w_node,
+                inner_mul_node,
+                outer_mul_node,
+            ) = coordatt_match
+            extra_producers = (
+                _Producer(
+                    conv_h_node,
+                    conv_h_weight,
+                    False,
+                    conv_h_bias,
+                    pre_ops=(sigmoid_h_node,),
+                    is_conv=True,
+                ),
+                _Producer(
+                    conv_w_node,
+                    conv_w_weight,
+                    False,
+                    conv_w_bias,
+                    pre_ops=(sigmoid_w_node,),
+                    is_conv=True,
+                ),
+            )
             extra_consumers = (
                 _ConsumerBranch(
-                    chain_ops=((gap_node, None),),
-                    consumer_node=fc1_node,
-                    consumer_weight=fc1_weight,
+                    chain_ops=(
+                        (pool_h_node, None),
+                        (pool_w_node, None),
+                        (transpose_pw_node, None),
+                        (concat_node, None),
+                    ),
+                    consumer_node=conv1_node,
+                    consumer_weight=conv1_weight,
                     consumer_weight_transposed=False,
                     consumer_is_conv=True,
                     consumer_group=1,
                 ),
             )
-            # All FOUR roles (`P`, fc1, fc2, the real downstream consumer)
-            # must name distinct weights -- an accidental/tied share between
-            # any two is not the confirmed real shape.
-            role_weights_before_consumer = {w_name, fc2_weight, fc1_weight}
-            expected_distinct = 4
+            # All FIVE roles (`P`, `conv1`, `conv_h`, `conv_w`, the real
+            # downstream consumer) must name distinct weights -- an
+            # accidental/tied share between any two is not the confirmed
+            # real shape, mirroring SE's own identical bar.
+            role_weights_before_consumer = {
+                w_name,
+                conv1_weight,
+                conv_h_weight,
+                conv_w_weight,
+            }
+            expected_distinct = 5
+            chain_ops_prefix = ((inner_mul_node, None), (outer_mul_node, None))
+            mul_out = outer_mul_node.output[0]
         else:
-            assert ese_match is not None
-            (pool_node, mul_node, fc_node, fc_weight, fc_bias, gate_act_node) = (
-                ese_match
+            se_match = _match_conv_se_gate(
+                spine,
+                spine_consumers,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                n_channels,
             )
-            gate_producer_node = fc_node
-            gate_producer_weight = fc_weight
-            gate_producer_bias = fc_bias
-            # `fc` plays BOTH the co-sliced-producer role (its own
-            # OUTPUT-channel axis) and, via this extra fan-out branch, the
-            # consumer role (its own INPUT-channel axis) -- see this
-            # section's own comment above for why registering the identical
-            # weight under both of this module's own existing role
-            # mechanisms, rather than inventing a new one, already slices
-            # both axes correctly.
-            extra_consumers = (
-                _ConsumerBranch(
-                    chain_ops=((pool_node, None),),
-                    consumer_node=fc_node,
-                    consumer_weight=fc_weight,
-                    consumer_weight_transposed=False,
-                    consumer_is_conv=True,
-                    consumer_group=1,
-                ),
-            )
-            # Only THREE distinct roles here (`P`, `fc` -- once, even though
-            # it plays two roles -- and the real downstream consumer): `fc`
-            # is deliberately not double-counted the way the two-conv
-            # shape's fc1/fc2 are, since it is genuinely the same weight
-            # playing both of its own two roles on purpose.
-            role_weights_before_consumer = {w_name, fc_weight}
-            expected_distinct = 3
+            ese_match = None
+            if se_match is None:
+                # Fall back to the shorter, no-bottleneck `EffectiveSEModule`
+                # shape (see this section's own comment above) -- strictly
+                # additional, never instead of the two-conv shape above.
+                ese_match = _match_conv_ese_gate(
+                    spine,
+                    spine_consumers,
+                    initializer_map,
+                    consumers_of,
+                    graph_outputs,
+                    n_channels,
+                )
+                if ese_match is None:
+                    continue
 
-        mul_out = mul_node.output[0]
+            if se_match is not None:
+                (
+                    gap_node,
+                    fc1_node,
+                    fc1_weight,
+                    mul_node,
+                    fc2_node,
+                    fc2_weight,
+                    fc2_bias,
+                    gate_act_node,
+                ) = se_match
+                extra_producers = (
+                    _Producer(
+                        fc2_node,
+                        fc2_weight,
+                        False,
+                        fc2_bias,
+                        pre_ops=(gate_act_node,),
+                        is_conv=True,
+                    ),
+                )
+                extra_consumers = (
+                    _ConsumerBranch(
+                        chain_ops=((gap_node, None),),
+                        consumer_node=fc1_node,
+                        consumer_weight=fc1_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                )
+                # All FOUR roles (`P`, fc1, fc2, the real downstream
+                # consumer) must name distinct weights -- an accidental/tied
+                # share between any two is not the confirmed real shape.
+                role_weights_before_consumer = {w_name, fc2_weight, fc1_weight}
+                expected_distinct = 4
+            else:
+                assert ese_match is not None
+                (pool_node, mul_node, fc_node, fc_weight, fc_bias, gate_act_node) = (
+                    ese_match
+                )
+                # `fc` plays BOTH the co-sliced-producer role (its own
+                # OUTPUT-channel axis) and, via this extra fan-out branch,
+                # the consumer role (its own INPUT-channel axis) -- see this
+                # section's own comment above for why registering the
+                # identical weight under both of this module's own existing
+                # role mechanisms, rather than inventing a new one, already
+                # slices both axes correctly.
+                extra_producers = (
+                    _Producer(
+                        fc_node,
+                        fc_weight,
+                        False,
+                        fc_bias,
+                        pre_ops=(gate_act_node,),
+                        is_conv=True,
+                    ),
+                )
+                extra_consumers = (
+                    _ConsumerBranch(
+                        chain_ops=((pool_node, None),),
+                        consumer_node=fc_node,
+                        consumer_weight=fc_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                )
+                # Only THREE distinct roles here (`P`, `fc` -- once, even
+                # though it plays two roles -- and the real downstream
+                # consumer): `fc` is deliberately not double-counted the way
+                # the two-conv shape's fc1/fc2 are, since it is genuinely the
+                # same weight playing both of its own two roles on purpose.
+                role_weights_before_consumer = {w_name, fc_weight}
+                expected_distinct = 3
+
+            mul_out = mul_node.output[0]
+            chain_ops_prefix = ((mul_node, None),)
+
         if mul_out in graph_outputs or len(consumers_of.get(mul_out, [])) != 1:
             continue
 
@@ -11768,16 +12898,9 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
                         pre_ops=tuple(pre_ops),
                         is_conv=True,
                     ),
-                    _Producer(
-                        gate_producer_node,
-                        gate_producer_weight,
-                        False,
-                        gate_producer_bias,
-                        pre_ops=(gate_act_node,),
-                        is_conv=True,
-                    ),
-                ),
-                chain_ops=((mul_node, None),) + post_mul_chain_ops,
+                )
+                + extra_producers,
+                chain_ops=chain_ops_prefix + post_mul_chain_ops,
                 consumer_node=consumer_node,
                 consumer_weight=consumer_weight,
                 consumer_weight_transposed=False,
@@ -32334,52 +33457,31 @@ def apply_attention_head_pruning(
     is left unsliced there even though the equivalent top-level-graph case
     would be handled -- a documented, conservative gap, not a correctness
     risk.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_attention_head_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own ``ApplyAttentionHeadPruning``),
+    forwarding every argument unchanged. Imported lazily (inside the
+    function body, not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module
+    (:class:`EmbeddingPruningResult`), so importing it back at module load
+    time here would deadlock the import machinery. One pre-existing,
+    pre-approved narrowing: a ``com.microsoft::LinearAttentionGate``-fed
+    decay/beta producer (see this module's own
+    :func:`_match_linear_attention_gate`/:class:`_LinearAttentionGatePassThrough`)
+    is not yet recognized by the C++ port, which cleanly declines the whole
+    match instead of mis-slicing it -- see ``tests/test_pruning.py``'s own
+    ``test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle``/
+    ``test_linear_attention_pruning_gate_fed_decay_only_slices_wa_and_gate_weights``.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    _validate_importance_norm(importance_norm)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import apply_attention_head_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    top_value_info_by_name = _shape_inferred_value_info_by_name(out)
-
-    for graph in _iter_subgraphs(out.graph):
-        value_info_by_name = (
-            top_value_info_by_name if graph is out.graph else _value_info_by_name(graph)
-        )
-
-        chains: List[_AttnLikeChain] = [
-            *_find_attention_chains(graph, value_info_by_name),
-            *_find_gqa_chains(graph, value_info_by_name),
-            *_find_onnx_attention_chains(graph, value_info_by_name),
-            *_find_mha_chains(graph, value_info_by_name),
-            *_find_packed_mha_chains(graph, value_info_by_name),
-            *_find_decoder_masked_mha_chains(graph, value_info_by_name),
-            *_find_paged_attention_chains(graph, value_info_by_name),
-            *_find_linear_attention_chains(graph, value_info_by_name),
-            *_find_sparse_attention_chains(graph, value_info_by_name),
-            *_find_decomposed_gqa_chains(graph, value_info_by_name),
-        ]
-        if chains:
-            _apply_attention_chains(
-                graph,
-                chains,
-                sparsity,
-                lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
-                    chain, wq, wk, wv, dq, dk, dv, importance_norm
-                ),
-                lambda chain, wq, wk, wv: _gqa_group_importance(
-                    chain, wq, wk, wv, importance_norm
-                ),
-                value_info_by_name,
-                lambda chain, wq: _gqa_query_head_importance(
-                    chain, wq, importance_norm
-                ),
-            )
-
-    return out
+    return apply_attention_head_pruning_cpp(
+        model,
+        sparsity=sparsity,
+        importance_norm=importance_norm,
+    )
 
 
 def _wanda_attention_calibration_stats(
@@ -32515,112 +33617,29 @@ def apply_attention_head_wanda_pruning(
     calibration activations captured here are, like every other Wanda-style
     pass in this module, read via a real ``onnxruntime`` run and cast to
     float64 on capture regardless of the graph's own declared dtype.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_attention_head_wanda_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyAttentionHeadWandaPruning``), forwarding every argument unchanged.
+    Imported lazily (inside the function body, not at module scope) to avoid
+    a circular import, same reasoning as :func:`apply_attention_head_pruning`'s
+    own alias. Shares that same function's one pre-existing, pre-approved
+    ``com.microsoft::LinearAttentionGate`` narrowing (see its own docstring).
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    _validate_importance_norm(importance_norm)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_attention_head_wanda_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    value_info_by_name = _shape_inferred_value_info_by_name(out)
-
-    chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph, value_info_by_name),
-        *_find_gqa_chains(graph, value_info_by_name),
-        *_find_onnx_attention_chains(graph, value_info_by_name),
-        *_find_mha_chains(graph, value_info_by_name),
-        *_find_packed_mha_chains(graph, value_info_by_name),
-        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
-        *_find_paged_attention_chains(graph, value_info_by_name),
-        *_find_linear_attention_chains(graph, value_info_by_name),
-        *_find_sparse_attention_chains(graph, value_info_by_name),
-        *_find_decomposed_gqa_chains(graph, value_info_by_name),
-    ]
-    if not chains:
-        return out
-
-    act_norm = _wanda_attention_calibration_stats(
-        out, chains, calibration_data, providers
+    return apply_attention_head_wanda_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        importance_norm=importance_norm,
+        epsilon=epsilon,
+        providers=providers,
     )
-
-    def _wanda_attention_head_importance(chain, wq, wk, wv, dq, dk, dv):
-        base = _plain_attention_head_importance(
-            chain, wq, wk, wv, dq, dk, dv, importance_norm
-        )
-        norm = act_norm.get(chain.consumer_node.input[0])
-        if norm is None or norm.shape[0] != chain.nv:
-            return base  # no matching activation observed -- fall back to plain
-        act_head = np.array(
-            [
-                np.linalg.norm(norm[h * dv : (h + 1) * dv])
-                for h in range(chain.num_heads)
-            ]
-        )
-        return base * np.maximum(act_head, epsilon)
-
-    def _wanda_gqa_group_importance(chain, wq, wk, wv):
-        base = _gqa_group_importance(chain, wq, wk, wv, importance_norm)
-        norm = act_norm.get(chain.consumer_node.input[0])
-        # The probed activation is the consumer's own input -- the attention
-        # output, laid out per *query* head at *V's* own per-head width
-        # (`chain.v_head_size`), the same `dv` :func:`_apply_one_gqa_chain`
-        # itself uses for that tensor's own indexing (equal to
-        # `chain.head_size` for `GroupQueryAttention`, not necessarily for
-        # the plain ai.onnx op -- see :class:`_GQAChain`'s own `v_head_size`
-        # field).
-        dv = chain.v_head_size
-        width = chain.num_heads * dv
-        if norm is None or norm.shape[0] != width:
-            return base  # no matching activation observed -- fall back to plain
-        group_size = chain.num_heads // chain.kv_num_heads
-        act_group = np.array(
-            [
-                np.linalg.norm(norm[kv * group_size * dv : (kv + 1) * group_size * dv])
-                for kv in range(chain.kv_num_heads)
-            ]
-        )
-        return base * np.maximum(act_group, epsilon)
-
-    def _wanda_gqa_query_head_importance(chain, wq):
-        # MQA fast path's own Wanda variant -- mirrors
-        # `_wanda_attention_head_importance`'s per-head activation term
-        # exactly (each query head's own `dv`-wide slice of the probed
-        # activation, at *its own* head index rather than combined across a
-        # whole KV group's worth of query heads the way
-        # `_wanda_gqa_group_importance` above does), scaling
-        # `_gqa_query_head_importance`'s weight-only score instead of
-        # `_plain_attention_head_importance`'s.
-        base = _gqa_query_head_importance(chain, wq, importance_norm)
-        norm = act_norm.get(chain.consumer_node.input[0])
-        dv = chain.v_head_size
-        width = chain.num_heads * dv
-        if norm is None or norm.shape[0] != width:
-            return base  # no matching activation observed -- fall back to plain
-        act_head = np.array(
-            [
-                np.linalg.norm(norm[qh * dv : (qh + 1) * dv])
-                for qh in range(chain.num_heads)
-            ]
-        )
-        return base * np.maximum(act_head, epsilon)
-
-    _apply_attention_chains(
-        graph,
-        chains,
-        sparsity,
-        _wanda_attention_head_importance,
-        _wanda_gqa_group_importance,
-        value_info_by_name,
-        _wanda_gqa_query_head_importance,
-    )
-    return out
 
 
 # --- MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight) structured
