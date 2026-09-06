@@ -243,3 +243,102 @@ def test_adaround_noop_when_no_int4_matmul_present():
         model, model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
     assert result.SerializeToString() == model.SerializeToString()
+
+
+def _model_3d(K=64, N=16, seed=0):
+    # [batch, seq, K] -- the activation shape of essentially every real
+    # transformer, since ONNX MatMul broadcasts over leading dimensions.
+    rng = np.random.default_rng(seed)
+    return _model(
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(rng.standard_normal((K, N)).astype(np.float32) * 0.5, "W")],
+    )
+
+
+def _correlated_calibration_3d(K=64, batch=8, seq=16, rank=6, seed=1):
+    rng = np.random.default_rng(seed)
+    latent = rng.standard_normal((batch, seq, rank)).astype(np.float32)
+    projection = rng.standard_normal((rank, K)).astype(np.float32)
+    x = latent @ projection
+    x += rng.standard_normal((batch, seq, K)).astype(np.float32) * 0.05
+    return x.astype(np.float32)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_adaround_handles_a_3d_transformer_shaped_activation(seed):
+    # A [batch, seq, K] activation used to be filtered out entirely (the
+    # capture kept only ndim == 2 arrays), so apply_adaround silently
+    # returned quantized_model unchanged on exactly the model shape it
+    # exists for. Flattening the leading dimensions is exact -- the layer's
+    # own reconstruction objective sums over the same rows either way.
+    float_model = _model_3d(K=64, N=16, seed=seed)
+    x = _correlated_calibration_3d(K=64, seed=seed + 100)
+    quant_model = onnxsim.quantize_weight_only_int4(float_model)
+
+    adaround_model = onnxsim.apply_adaround(
+        float_model, quant_model, calibration_data=[{"X": x}]
+    )
+    onnx.checker.check_model(adaround_model)
+    assert adaround_model.SerializeToString() != quant_model.SerializeToString(), (
+        "apply_adaround was a no-op on a 3-D activation"
+    )
+
+    (float_y,) = _run(float_model, {"X": x})
+    (rtn_y,) = _run(quant_model, {"X": x})
+    (ada_y,) = _run(adaround_model, {"X": x})
+    assert np.all(np.isfinite(ada_y))
+    # Correlated channels are the regime AdaRound's own per-layer objective
+    # exploits, so the improvement over plain round-to-nearest is large
+    # here (measured ~0.10 -> ~0.035 across seeds), not a marginal
+    # difference that could flip on another platform.
+    assert _rel_l2(float_y, ada_y) < 0.7 * _rel_l2(float_y, rtn_y)
+
+
+def test_adaround_flattening_matches_an_equivalent_2d_calibration():
+    # Flattening [batch, seq, K] -> [batch * seq, K] must be *exact*, not an
+    # approximation: feeding the same rows as a 2-D batch has to produce
+    # byte-identical INT4 codes.
+    K, N = 32, 8
+    weight = (np.random.default_rng(7).standard_normal((K, N)) * 0.5).astype(np.float32)
+    model_3d = _model(
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
+    )
+    model_2d = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
+    )
+    x3 = _correlated_calibration_3d(K=K, batch=4, seq=8, rank=4, seed=11)
+
+    out3 = onnxsim.apply_adaround(
+        model_3d,
+        onnxsim.quantize_weight_only_int4(model_3d),
+        calibration_data=[{"X": x3}],
+    )
+    out2 = onnxsim.apply_adaround(
+        model_2d,
+        onnxsim.quantize_weight_only_int4(model_2d),
+        calibration_data=[{"X": x3.reshape(-1, K)}],
+    )
+    codes3 = next(
+        t for t in out3.graph.initializer if t.data_type == onnx.TensorProto.INT4
+    )
+    codes2 = next(
+        t for t in out2.graph.initializer if t.data_type == onnx.TensorProto.INT4
+    )
+    assert codes3.raw_data == codes2.raw_data

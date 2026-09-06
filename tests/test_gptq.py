@@ -369,9 +369,7 @@ def test_gptq_flattening_matches_an_equivalent_2d_calibration():
     q3 = onnxsim.quantize_weight_only_int4(model_3d)
     q2 = onnxsim.quantize_weight_only_int4(model_2d)
     out3 = onnxsim.apply_gptq(model_3d, q3, calibration_data=[{"X": x3}])
-    out2 = onnxsim.apply_gptq(
-        model_2d, q2, calibration_data=[{"X": x3.reshape(-1, k)}]
-    )
+    out2 = onnxsim.apply_gptq(model_2d, q2, calibration_data=[{"X": x3.reshape(-1, k)}])
 
     w3 = next(t for t in out3.graph.initializer if t.data_type == onnx.TensorProto.INT4)
     w2 = next(t for t in out2.graph.initializer if t.data_type == onnx.TensorProto.INT4)

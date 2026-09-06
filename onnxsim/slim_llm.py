@@ -73,7 +73,12 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
 from onnxsim.quip_sharp import _match_matmul_like
@@ -213,8 +218,7 @@ def apply_slim_llm(
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
             x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim == 2:
-                activations[name].append(x)
+            activations[name].extend(_activation_rows([x]))
 
     target_bits_clamped = min(max(target_bits, float(low_bits)), float(high_bits))
     fraction_high = (target_bits_clamped - low_bits) / (high_bits - low_bits)
@@ -222,7 +226,7 @@ def apply_slim_llm(
     for node, x_name, w_name, bias_name, weight_transposed in candidates:
         acts = activations.get(x_name)
         if not acts:
-            continue  # no 2-D calibration activation observed; skip
+            continue  # no usable calibration activation observed; skip
 
         w_init = initializer_map[w_name]
         w = onnx.numpy_helper.to_array(w_init).astype(np.float64)

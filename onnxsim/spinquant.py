@@ -78,7 +78,12 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
 from onnxsim.quip_sharp import _match_matmul_like
@@ -175,8 +180,7 @@ def apply_spinquant(
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
             arr = np.asarray(result[name], dtype=np.float64)
-            if arr.ndim == 2:
-                activations[name].append(arr)
+            activations[name].extend(_activation_rows([arr]))
 
     for node, x_name, w_name, bias_name, weight_transposed in candidates:
         acts = activations.get(x_name, [])

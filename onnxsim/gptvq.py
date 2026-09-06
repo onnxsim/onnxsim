@@ -65,7 +65,12 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.aqlm import _fit_kmeans_codebook
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
 
@@ -258,9 +263,9 @@ def quantize_weight_only_gptvq(
     rng = np.random.default_rng(seed)
 
     for node, x_name, w_name, weight_transposed in candidates:
-        acts = [a for a in activations[x_name] if a.ndim == 2]
+        acts = _activation_rows(activations[x_name])
         if not acts:
-            continue  # not a plain 2-D activation; skip
+            continue  # no usable activation (no feature axis); skip
         x = np.concatenate(acts, axis=0)
 
         w_init = initializer_map[w_name]

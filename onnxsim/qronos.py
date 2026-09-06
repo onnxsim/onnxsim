@@ -113,7 +113,7 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _gptq_quantize_columns, _inverse_hessian_cholesky
 
@@ -143,7 +143,9 @@ def apply_qronos(
             ModelProto or file path), produced by
             :func:`onnxsim.quantize_weight_only_int4`. Layers quantized by
             any other scheme (or left unquantized), or whose activation
-            input isn't a plain 2-D tensor, are left untouched. Assumes
+            input has no feature axis at all (rank < 2) are left
+            untouched; a higher-rank ``[batch, seq, K]`` activation is
+            flattened to ``[batch * seq, K]``, which is exact. Assumes
             ``quantized_model`` was produced from ``float_model`` without
             renaming any MatMul/Gemm node's own output tensor -- true of
             every onnxsim ``quantize_*`` function.
@@ -196,9 +198,9 @@ def apply_qronos(
     any_optimized = False
     for c in candidates:
         probe_name = c.float_node.input[0]
-        x_float_batches = [a for a in float_activations[probe_name] if a.ndim == 2]
+        x_float_batches = _activation_rows(float_activations[probe_name])
         if not x_float_batches:
-            continue  # not a plain 2-D activation; skip
+            continue  # no usable activation (no feature axis); skip
         x_float = np.concatenate(x_float_batches, axis=0)
 
         working_probe = _add_probe_outputs(working, [probe_name])
@@ -206,9 +208,12 @@ def apply_qronos(
         for batch in calibration_data:
             out = backend.run_model(working_probe, batch, providers=providers)
             x_quant_batches.append(np.asarray(out[probe_name], dtype=np.float64))
-        x_quant_batches = [a for a in x_quant_batches if a.ndim == 2]
-        if not x_quant_batches:
-            continue  # not a plain 2-D activation; skip
+        x_quant_batches = _activation_rows(x_quant_batches)
+        # Keep the float and quantized row sets aligned: `dx` below is their
+        # elementwise difference, so a batch usable on one side but not the
+        # other (no feature axis) would misalign samples.
+        if len(x_quant_batches) != len(x_float_batches):
+            continue
         x_quant = np.concatenate(x_quant_batches, axis=0)
 
         w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)

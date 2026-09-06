@@ -270,3 +270,112 @@ def test_owq_noop_when_outlier_fraction_rounds_to_zero():
         model, quant, calibration_data=calibration_data, outlier_fraction=0.001
     )
     assert owq_model.SerializeToString() == quant.SerializeToString()
+
+
+def _matmul_model_3d_with_outlier_column(K=64, N=16, outlier_col=3, seed=0):
+    # _matmul_model_with_outlier_column's [batch, seq, K] counterpart --
+    # the activation shape of essentially every real transformer, since
+    # ONNX MatMul broadcasts over leading dimensions.
+    rng = np.random.default_rng(seed)
+    weight = rng.standard_normal((K, N)).astype(np.float32) * 0.1
+    weight[outlier_col, :] = rng.standard_normal(N).astype(np.float32) * 20.0
+    return _model(
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
+    )
+
+
+def _calibration_3d(K=64, batch=6, seq=12, seed=1):
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((batch, seq, K)).astype(np.float32)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_owq_handles_a_3d_transformer_shaped_activation(seed):
+    # A [batch, seq, K] activation used to be filtered out entirely (the
+    # capture kept only ndim == 2 arrays), so apply_owq silently returned
+    # quantized_model unchanged on exactly the model shape it exists for.
+    # Flattening the leading dimensions is exact -- the Hessian X^T X sums
+    # over the same rows either way.
+    model = _matmul_model_3d_with_outlier_column(K=64, N=16, outlier_col=3, seed=seed)
+    x = _calibration_3d(K=64, seed=seed + 300)
+    quant = onnxsim.quantize_weight_only_int4(model)
+
+    owq_model = onnxsim.apply_owq(model, quant, calibration_data=[{"X": x}])
+    onnx.checker.check_model(owq_model)
+    assert owq_model.SerializeToString() != quant.SerializeToString(), (
+        "apply_owq was a no-op on a 3-D activation"
+    )
+    # The rescued column is spliced back in via a Gather-fed correction
+    # term, exactly as on a 2-D activation.
+    assert any(n.op_type == "Gather" for n in owq_model.graph.node)
+
+    (float_y,) = _run(model, {"X": x})
+    (rtn_y,) = _run(quant, {"X": x})
+    (owq_y,) = _run(owq_model, {"X": x})
+    assert np.all(np.isfinite(owq_y))
+    # OWQ rescues a single column out of 64 here, so its reconstruction
+    # gain is real but small (measured ~3-4% across seeds). Assert only
+    # that the correction did not make things *worse* -- the exactness of
+    # what it wrote is checked deterministically below and by
+    # test_owq_correction_initializer_exactly_cancels_int4_error.
+    assert _rel_l2(float_y, owq_y) <= 1.05 * _rel_l2(float_y, rtn_y)
+
+
+def test_owq_flattening_matches_an_equivalent_2d_calibration():
+    # Flattening [batch, seq, K] -> [batch * seq, K] must be *exact*, not an
+    # approximation: feeding the same rows as a 2-D batch has to produce a
+    # byte-identical set of rewritten initializers (the rescued column
+    # indices and the delta_w correction alike).
+    K, N = 32, 8
+    rng = np.random.default_rng(4)
+    weight = (rng.standard_normal((K, N)) * 0.1).astype(np.float32)
+    weight[3, :] = (rng.standard_normal(N) * 20.0).astype(np.float32)
+    model_3d = _model(
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
+    )
+    model_2d = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
+    )
+    x3 = _calibration_3d(K=K, batch=4, seq=8, seed=5)
+
+    # K=32 with the default outlier_fraction would round to zero rescued
+    # columns and make this vacuous, so ask for a few explicitly.
+    out3 = onnxsim.apply_owq(
+        model_3d,
+        onnxsim.quantize_weight_only_int4(model_3d),
+        calibration_data=[{"X": x3}],
+        outlier_fraction=0.1,
+    )
+    out2 = onnxsim.apply_owq(
+        model_2d,
+        onnxsim.quantize_weight_only_int4(model_2d),
+        calibration_data=[{"X": x3.reshape(-1, K)}],
+        outlier_fraction=0.1,
+    )
+    assert any(n.op_type == "Gather" for n in out2.graph.node)
+    assert _initializer_bytes(out3) == _initializer_bytes(out2)
+
+
+def _initializer_bytes(model):
+    return sorted(
+        (t.name, onnx.numpy_helper.to_array(t).tobytes())
+        for t in model.graph.initializer
+    )
