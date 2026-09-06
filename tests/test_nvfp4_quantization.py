@@ -15,9 +15,9 @@ from onnx import parser
 import onnxsim
 from onnxsim.mx_quantization import MXFP4_CODEBOOK
 from onnxsim.nvfp4_quantization import (
+    _E4M3_POSITIVE_GRID,
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
-    _E4M3_POSITIVE_GRID,
     _round_to_e4m3,
 )
 

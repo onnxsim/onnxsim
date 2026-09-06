@@ -64,7 +64,7 @@ codebook indices all come from the weight's own values.
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, Optional, Union
 
 import numpy as np
 import onnx
@@ -73,8 +73,8 @@ import onnx.numpy_helper
 
 from onnxsim.bias_correction import _all_names, _unique_name
 from onnxsim.mx_quantization import (
-    MXFP4_CODEBOOK,
     _MXFP4_MAX_MAGNITUDE,
+    MXFP4_CODEBOOK,
     _match_matmul_like,
     _nearest_codebook_index,
 )
