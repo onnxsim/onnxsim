@@ -2224,3 +2224,94 @@ def test_verb_runs_are_a_minority_of_the_bulk_and_the_prologue_is_shared(tmp_pat
     ):
         shared += 1
     assert shared >= 150, shared
+
+
+def _walk_variable_length(mcode, start=297, end=None):
+    """Greedy variable-length walk over an mcode blob's bulk with the three
+    known instruction forms (8-byte verb, 7-byte verb when the next header
+    lands at +7, 4-byte compact `00 xx 84 vv` write), stepping one unknown
+    byte otherwise -- see the README's "Second correction: the verb-free
+    regions are the same instruction stream, drifted off the 4-byte grid"
+    section. Returns `(explained_bytes, total_bytes, Counter of forms)`."""
+    from collections import Counter
+
+    end = len(mcode) - 252 if end is None else end
+
+    def is_verb(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] in _VERBS
+            and mcode[i + 1] == 0
+            and mcode[i + 2] % 0x10 == 0
+        )
+
+    def is_compact(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] == 0
+            and mcode[i + 2] == 0x84
+            and mcode[i + 1] % 0x10 == 0
+        )
+
+    forms, explained, i = Counter(), 0, start
+    while i < end:
+        if is_verb(i):
+            n = (
+                7
+                if (
+                    not (is_verb(i + 8) or is_compact(i + 8))
+                    and (is_verb(i + 7) or is_compact(i + 7))
+                )
+                else 8
+            )
+            forms[f"verb{n}"] += 1
+        elif is_compact(i):
+            n = 4
+            forms["compact4"] += 1
+        else:
+            n = 1
+            forms["unknown"] += 1
+        explained += n if n > 1 else 0
+        i += n
+    return explained, end - start, forms
+
+
+def test_verb_free_regions_are_drifted_instructions_and_a_walker_beats_the_grid(
+    tmp_path,
+):
+    """Confirmed real (see the README's "Second correction" section), all
+    local on real resnet18d and mnasnet_small builds: the "verb-free
+    regions" hold verb-shaped words at byte phases 1-3 (>= 100 in
+    resnet18d) and hundreds of compact `00 xx 84 vv` writes, and a
+    variable-length walker knowing only three forms explains more of the
+    bulk than the fixed 4-byte grid on both models, recovering 7-byte and
+    compact instructions the grid cannot see. Needs Docker for the builds
+    but no device.
+    """
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    _, _, mnas, _ = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+
+    for name, mcode in (("resnet18d", r18), ("mnasnet", mnas)):
+        explained, total, forms = _walk_variable_length(mcode)
+        grid = 8 * len(_verb_headers(mcode)) / total
+        assert explained / total > grid + 0.05, (name, explained / total, grid)
+        assert forms["verb7"] > 0 and forms["compact4"] > 300, (name, dict(forms))
+        assert explained / total < 0.6, (
+            name,
+            "walker should not claim near-complete coverage",
+        )
+
+    hdrs = _verb_headers(r18)
+    off_phase = 0
+    for a, b in zip(hdrs, hdrs[1:]):
+        if b[0] - a[0] >= 8:
+            lo, hi = 328 + 4 * (a[0] + 2), 328 + 4 * b[0]
+            off_phase += sum(
+                1
+                for i in range(lo, hi - 3)
+                if (i - 328) % 4 != 0
+                and r18[i] in _VERBS
+                and r18[i + 1] == 0
+                and r18[i + 2] % 0x10 == 0
+            )
+    assert off_phase >= 100, off_phase

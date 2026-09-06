@@ -2544,6 +2544,52 @@ short-form write encoding, alongside the 8-byte `[VV 00 xx yy][32-bit]`
 form and the 7-byte 3-byte-operand slots already noted; a parser needs
 all three.
 
+### Second correction: the "verb-free regions" are the same instruction stream, drifted off the 4-byte grid
+
+The section above split the bulk into two-word verb runs (37%) and
+"verb-free regions" (63%) and floated "data/descriptor tables" for the
+latter. Testing that directly, locally, overturns it -- stated in place.
+
+**The regions are full of instructions the grid could not see.** Counting
+verb-shaped `VV 00 x0 yy` words *inside* the regions at every byte
+phase: `resnet18d` has 73 / 43 / 54 of them at phases 1 / 2 / 3 (and
+zero at phase 0 only because phase 0 is what defined the regions);
+`mnasnet` has 197 / 185 / 160. The compact `00 xx 84 vv` short-form
+write appears **417** times inside `resnet18d`'s regions and **580**
+times inside `mnasnet`'s, at any phase. The regions are not tables; they
+are stretches where the instruction stream's alignment has drifted off
+a fixed 4-byte grid -- exactly what 7-byte and 4-byte instructions
+interleaved with 8-byte ones must produce. Fixed-size records are also
+ruled out on their own terms: the regions' best internal periods are
+4-8 bytes with weak match (0.11 / 0.26), their sizes are rarely 32- or
+64-byte multiples, and only 0.7% / 2.9% of their 32-byte windows repeat.
+
+**A variable-length walker recovers what the grid missed -- and shows
+what is still unknown.** Walking from byte 297 and consuming an 8-byte
+verb instruction, a 7-byte one when the next header lands at +7, or a
+4-byte compact write, and otherwise stepping one unknown byte:
+
+```
+                       fixed 4-byte grid    variable-length walker (3 known forms)
+resnet18d  (48,531 B)  37.7% explained      43.8%   (2,443 x 8-byte, 16 x 7-byte, 398 x compact)
+mnasnet    (78,035 B)  19.2%                27.4%   (2,367, 49, 535)
+tiny       ( 3,371 B)  15.9%                39.4%   (  116,  8,  86)
+```
+
+The walker beats the grid everywhere, most on the tiny model, and the
+bytes it cannot explain sit overwhelmingly in **short** gaps (the most
+common unknown-run lengths are 5, 12, 1, 47, 6 and 7 bytes) with a few
+long stretches (the longest 1,352 bytes in `resnet18d`). Short gaps
+between recognized instructions are what additional, not-yet-known
+short instruction forms look like -- not what a data table looks like.
+
+So the corrected picture, replacing "37% two-word runs + 63% regions":
+**mcode's bulk is one variable-length instruction stream with at least
+three encodings, of which three forms are known and explain 27-44% of
+the bytes; the rest is further forms, mostly short, plus a few long
+stretches, all undecoded.** The "37%" and "verb-free" figures were
+artifacts of measuring a variable-length stream on a fixed grid.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
