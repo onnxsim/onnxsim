@@ -114,6 +114,7 @@ from onnxsim.leptoquant import apply_leptoquant
 from onnxsim.llm_fp4 import (
     FP4_FORMATS,
     apply_llm_fp4_activation_quantization,
+    apply_llm_fp4_activation_quantization_per_tensor,
     quantize_weight_only_llm_fp4,
 )
 from onnxsim.llm_int8 import apply_llm_int8
@@ -413,6 +414,7 @@ __all__ = [
     "MXFP4_CODEBOOK",
     "quantize_weight_only_llm_fp4",
     "apply_llm_fp4_activation_quantization",
+    "apply_llm_fp4_activation_quantization_per_tensor",
     "FP4_FORMATS",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",

@@ -87,25 +87,42 @@ out of ordinary ONNX ops any opset-11+ runtime already supports: ``Gather``
 the per-element code out of a 16-entry constant codebook, then ``Mul`` by
 the per-block real-valued scale.
 
-**Update: a self-contained activation-side pass now exists, but it is NOT
-the paper's own per-tensor-via-migration design.** The "deliberately not
-ported" section above still accurately describes the real LLM-FP4 paper's
-own activation-quantization scheme: a per-*channel* real-valued scale fit
-from calibration data and migrated into the preceding weight/
-LayerNormalization (via :func:`onnxsim.apply_smoothquant`/:func:`onnxsim.
-apply_outlier_suppression`) so that a single shared exponent bias suffices
-for a per-*tensor* FP4 activation quantizer -- that migration-based design
-is still not implemented here. :func:`apply_llm_fp4_activation_quantization`
-below instead completes W4A4 with a *different*, simpler granularity: a
-per-*token* (per-row), data-free scale computed fresh from each token's own
-values at graph-run time -- exactly the convention every other per-token
-runtime quantizer in this repo already uses (:mod:`onnxsim.zeroquant`,
-:mod:`onnxsim.quarot`, :mod:`onnxsim.duquant`, :mod:`onnxsim.
-attention_quantization`, :mod:`onnxsim.kv_cache_quantization`'s Value-style
-rewrite), just against FP4's non-uniform 16-value codebook instead of a
-uniform integer grid, and needing no cross-layer migration pass first. See
-that function's own docstring for the full honesty note on this
-difference.
+**Update: two activation-side passes now exist.** The "deliberately not
+ported" section above is no longer wholly accurate: this paragraph
+supersedes its closing "is not implemented here"/"W4A4 is a legitimate
+follow-up, not attempted in this module" claims (its description of what
+the paper's own activation scheme *is* remains accurate, and is what
+:func:`apply_llm_fp4_activation_quantization_per_tensor` below implements
+the quantizer half of). Both passes act only on layers
+:func:`quantize_weight_only_llm_fp4` has already weight-quantized (found by
+walking the weight input backward through that function's own exact
+dequantization pattern -- see :func:`_find_llm_fp4_weight_codebook`), and
+both reuse that layer's own recovered codebook rather than re-deriving one:
+
+* :func:`apply_llm_fp4_activation_quantization` -- **per-token,
+  data-free**, and *not* the paper's own design. It computes the scale
+  fresh from each token's own values at graph-run time, exactly the
+  convention every other per-token runtime quantizer in this repo already
+  uses (:mod:`onnxsim.zeroquant`, :mod:`onnxsim.quarot`,
+  :mod:`onnxsim.duquant`, :mod:`onnxsim.attention_quantization`,
+  :mod:`onnxsim.kv_cache_quantization`'s Value-style rewrite), just against
+  FP4's non-uniform 16-value codebook instead of a uniform integer grid.
+  No calibration data and no migration pass needed.
+* :func:`apply_llm_fp4_activation_quantization_per_tensor` -- the
+  **calibrated per-tensor** half of the paper's own design. It fits one
+  real-valued scale per activation tensor offline, from calibration data,
+  by the *same* ``(clip ratio -> reconstruction MSE)`` grid search the
+  weight side already uses (:func:`_search_fp4_clip_ratio`, shared by both),
+  and bakes it into the graph as a constant initializer -- so the emitted
+  quantize/dequantize subgraph contains no runtime range reduction at all.
+  The *other* half of the paper's design -- migrating the per-channel
+  outliers into the preceding weight/LayerNormalization, which is what
+  makes a single shared exponent bias sufficient in the first place -- is
+  still **not** performed by that function; the caller composes it by
+  running :func:`onnxsim.apply_smoothquant` or
+  :func:`onnxsim.apply_outlier_suppression` first, as the "deliberately not
+  ported" section above already anticipated. See that function's own
+  docstring for the three-call sequence and the full honesty note.
 """
 
 from __future__ import annotations
@@ -117,7 +134,9 @@ import onnx
 import onnx.helper
 import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
+from onnxsim import backend
+from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.calibration import Tensors, generate_random_calibration_data
 
 # Every way to split FP4's 3 non-sign bits between exponent and mantissa --
 # the paper's own candidate set for its per-tensor format search. Named
@@ -194,6 +213,57 @@ def _match_matmul_like(node: onnx.NodeProto):
     return None
 
 
+def _search_fp4_clip_ratio(
+    values: np.ndarray,
+    max_abs: np.ndarray,
+    codebook: np.ndarray,
+    clip_ratios: np.ndarray,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """The clip-ratio half of this module's own ``(format, clip ratio)`` grid
+    search, for one *fixed* ``codebook``: for each group along ``values``'
+    leading axes, scans ``clip_ratios`` and keeps whichever
+    ``scale = max_abs * ratio / max(codebook)`` minimizes that group's own
+    codebook round-trip MSE (in the original, unnormalized units).
+
+    ``values`` has shape ``group_shape + (group_size,)`` and ``max_abs``
+    shape ``group_shape`` -- so the same routine serves both the weight
+    side (``group_shape == (N, K // block_size)``: one scale per
+    ``(output channel, block)`` group, see :func:`_search_llm_fp4_blockwise`)
+    and the activation side (``group_shape == ()``: a single per-tensor
+    scale over one flat calibration sample, see
+    :func:`apply_llm_fp4_activation_quantization_per_tensor`). Returns
+    ``(best_error, best_scale, best_codes)`` with shapes ``group_shape``,
+    ``group_shape`` and ``values.shape`` respectively; ``codebook`` must be
+    ascending so its last entry is the largest magnitude.
+    """
+    max_mag = codebook[-1]
+    group_shape = values.shape[:-1]
+    best_error = np.full(group_shape, np.inf)
+    best_scale = np.zeros(group_shape)
+    best_codes = np.zeros(values.shape, dtype=np.int64)
+
+    for r in clip_ratios:
+        # The "pre-shifted exponent bias" search, realized as a real-valued
+        # scale: r < 1 clips outliers harder but sharpens resolution for the
+        # bulk of the group, exactly the clip-vs-resolution trade
+        # _mse_threshold's own cutoff search makes for INT8 ranges.
+        scale = np.maximum(max_abs * r / max_mag, 1e-30)  # group_shape
+        normalized = values / scale[..., np.newaxis]
+        diffs = np.abs(normalized[..., np.newaxis] - codebook)
+        codes = np.argmin(diffs, axis=-1)  # values.shape
+        dequant_normalized = codebook[codes]
+        error = (
+            np.sum((dequant_normalized - normalized) ** 2, axis=-1) * scale**2
+        )  # group_shape, in the original (unnormalized) units
+
+        improved = error < best_error
+        best_error = np.where(improved, error, best_error)
+        best_scale = np.where(improved, scale, best_scale)
+        best_codes = np.where(improved[..., np.newaxis], codes, best_codes)
+
+    return best_error, best_scale, best_codes
+
+
 def _search_llm_fp4_blockwise(
     w_nk: np.ndarray,
     block_size: int,
@@ -221,31 +291,10 @@ def _search_llm_fp4_blockwise(
     for fmt in formats:
         e_bits, m_bits = FP4_FORMATS[fmt]
         codebook = np.asarray(_fp4_codebook(e_bits, m_bits), dtype=np.float64)
-        max_mag = codebook[-1]
 
-        fmt_best_error = np.full((n, num_blocks), np.inf)
-        fmt_best_scale = np.zeros((n, num_blocks))
-        fmt_best_codes = np.zeros((n, num_blocks, block_size), dtype=np.int64)
-
-        for r in clip_ratios:
-            # The "pre-shifted exponent bias" search, realized as a
-            # real-valued per-block scale: r < 1 clips outliers harder but
-            # sharpens resolution for the bulk of the block, exactly the
-            # clip-vs-resolution trade _mse_threshold's own cutoff search
-            # makes for INT8 ranges.
-            scale = np.maximum(max_abs * r / max_mag, 1e-30)  # [N, num_blocks]
-            normalized = blocks / scale[:, :, np.newaxis]
-            diffs = np.abs(normalized[..., np.newaxis] - codebook)
-            codes = np.argmin(diffs, axis=-1)  # [N, num_blocks, block_size]
-            dequant_normalized = codebook[codes]
-            error = (
-                np.sum((dequant_normalized - normalized) ** 2, axis=-1) * scale**2
-            )  # [N, num_blocks], in the original (unnormalized) units
-
-            improved = error < fmt_best_error
-            fmt_best_error = np.where(improved, error, fmt_best_error)
-            fmt_best_scale = np.where(improved, scale, fmt_best_scale)
-            fmt_best_codes = np.where(improved[:, :, np.newaxis], codes, fmt_best_codes)
+        fmt_best_error, fmt_best_scale, fmt_best_codes = _search_fp4_clip_ratio(
+            blocks, max_abs, codebook, clip_ratios
+        )
 
         total_error = float(fmt_best_error.sum())
         if total_error < best_total_error:
@@ -521,7 +570,14 @@ def apply_llm_fp4_activation_quantization(
     :func:`onnxsim.apply_outlier_suppression`), so that a single shared
     exponent bias suffices for a *per-tensor* FP4 activation quantizer --
     see this module's own docstring and ``docs/llm-fp4.md``'s "Scope"
-    section. This function does **not** reproduce that design: it computes
+    section. The *quantizer* half of that design --  one calibrated,
+    real-valued **per-tensor** scale, baked into the graph as a constant --
+    is implemented by this module's own
+    :func:`apply_llm_fp4_activation_quantization_per_tensor`, which is the
+    function to use if you want the paper's own scheme (compose it after
+    :func:`onnxsim.apply_smoothquant`/
+    :func:`onnxsim.apply_outlier_suppression` for the migration half). This
+    function does **not** reproduce that design: it computes
     a **per-token** (per-row) scale fresh, at graph-run time, from each
     token's own values -- no calibration data, no migration pass, no
     stored statistics -- exactly the convention every other per-token
@@ -671,6 +727,324 @@ def apply_llm_fp4_activation_quantization(
             "Gather", [codebook_name, nearest_idx], "nearest_val", axis=0
         )
         x_dequant = _new("Mul", [nearest_val, x_scale], "x_dequant")
+
+        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
+        for offset, new_node in enumerate(new_nodes):
+            graph.node.insert(insertion_point + offset, new_node)
+
+        node.input[0] = x_dequant
+
+    return out
+
+
+def apply_llm_fp4_activation_quantization_per_tensor(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    clip_ratios: Optional[Sequence[float]] = None,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """Completes W4A4 for every layer :func:`quantize_weight_only_llm_fp4`
+    has already weight-quantized, by fitting **one real-valued per-tensor
+    scale** to that layer's own activation from calibration data and baking
+    it into the graph as a **constant initializer**, then inserting a
+    *static* FP4 quantize/dequantize round-trip against that same layer's
+    own (byte-identical, recovered -- not re-derived) codebook.
+
+    This is the **calibrated per-tensor** half of the LLM-FP4 paper's own
+    activation-quantization design -- the quantizer "pre-shifted exponent
+    bias" is built for. The paper's per-tensor FP4 activation quantizer
+    works because a *single* shared exponent bias (here: a single
+    real-valued per-tensor scale -- the same degree of freedom, see this
+    module's own docstring) suffices once the activation's per-channel
+    outliers have been migrated away, and it fits that bias offline from
+    calibration data rather than recomputing a range at graph-run time.
+    This function does exactly that fitting and that insertion, reusing the
+    weight side's own search: :func:`_search_fp4_clip_ratio` scans the same
+    ``scale = max_abs * ratio / max(abs(codebook))`` clip-ratio grid against
+    the same codebook-round-trip MSE objective
+    :func:`_search_llm_fp4_blockwise` already uses per weight block, just
+    with the whole captured activation as a single group.
+
+    **Honesty note -- this implements the quantizer, NOT the migration;
+    read before using.** The paper's activation scheme is *two* pieces, and
+    this function is only the second one:
+
+    1. **Per-channel outlier migration** -- compute a per-channel
+       real-valued scale from calibration data and push it algebraically
+       into the preceding weight or LayerNormalization, so that what
+       reaches this layer no longer carries per-channel outliers and a
+       single shared scale/exponent bias actually suffices. This function
+       does **not** do this, and does not check whether it has been done.
+    2. **The per-tensor FP4 quantizer itself** -- this function.
+
+    Piece 1 already exists in this repo, as
+    :func:`onnxsim.apply_smoothquant` and
+    :func:`onnxsim.apply_outlier_suppression` (their INT8 migration algebra
+    is exactly the migration the paper describes, with FP4's real-valued
+    scale-as-bias standing in for those modules' INT8 quantization range),
+    so the paper's actual pipeline is a **three-call sequence** the caller
+    composes, migration first::
+
+        import onnxsim
+
+        # 1. migrate the per-channel activation outliers into the preceding
+        #    weight/LayerNormalization (apply_outlier_suppression is the
+        #    alternative)
+        migrated = onnxsim.apply_smoothquant(model)
+        # 2. weight-side FP4, with the paper's own (format, scale) search
+        weight_q = onnxsim.quantize_weight_only_llm_fp4(migrated)
+        # 3. this function: one calibrated, constant per-tensor FP4 scale
+        #    per activation
+        w4a4 = onnxsim.apply_llm_fp4_activation_quantization_per_tensor(
+            weight_q
+        )
+
+    Running this function *without* step 1 is supported and produces a
+    valid model, but it is then quantizing an unmigrated activation with a
+    single shared scale -- precisely the case the paper's migration exists
+    to avoid, and on outlier-heavy transformer activations it will be
+    noticeably worse than the paper's own reported numbers.
+
+    **How this differs from
+    :func:`apply_llm_fp4_activation_quantization`** (the per-token pass in
+    this same module):
+
+    * *Scale source*: calibration data, fit offline -- versus data-free,
+      recomputed from the tensor's own values at graph-run time.
+    * *Granularity*: one scale for the whole activation tensor -- versus
+      one scale per token (per row of the last axis).
+    * *Where the scale lives*: a constant initializer -- versus runtime
+      ``Abs``/``ReduceMax``/``Max`` nodes.
+    * *Runtime cost*: 7 nodes per layer (``Div``, ``Unsqueeze``, ``Sub``,
+      ``Abs``, ``ArgMin``, ``Gather``, ``Mul``) -- versus 11 for the
+      per-token pass (those same 7, plus ``Abs``, ``ReduceMax``, ``Max``
+      and a second ``Div`` to derive the scale). Strictly fewer runtime
+      ops is the practical point of the per-tensor design.
+    * *Paper fidelity*: this is the paper's own quantizer (its migration
+      half being the caller's job, above) -- the per-token pass is a
+      simpler repo-convention alternative
+      (:mod:`onnxsim.zeroquant`/:mod:`onnxsim.quarot`/
+      :mod:`onnxsim.duquant` all quantize activations per-token) that is
+      explicitly *not* the paper's design.
+
+    Neither pass emits a native FP4 tensor (ONNX has no FP4 type): both are
+    simulated ("fake") quantization -- values are snapped onto the FP4
+    codebook grid and immediately dequantized back to float32, so the
+    ``MatMul`` still runs in float. That is the same simulation
+    :mod:`onnxsim.mx_quantization`/:mod:`onnxsim.nf4`/
+    :mod:`onnxsim.zeroquant` already use, and it measures the accuracy
+    effect of FP4 activations without needing runtime FP4 kernels.
+
+    For each layer already matched by :func:`quantize_weight_only_llm_fp4`
+    (found by walking its weight input backward through that function's
+    exact dequantization pattern -- see
+    :func:`_find_llm_fp4_weight_codebook` -- so a layer this module didn't
+    itself weight-quantize is left completely untouched), the activation
+    ``X`` is quantized as::
+
+        scale   -- constant float32 initializer, fit offline (see below)
+        x_normalized = X / scale
+        nearest = Gather(Codebook, ArgMin(Abs(Unsqueeze(x_normalized, -1)
+                                              - Codebook), axis=-1))
+        x_dequant = nearest * scale
+
+    -- the same ``Unsqueeze``/``Sub``/``Abs``/``ArgMin``/``Gather``
+    nearest-codebook construction the per-token pass already uses (and
+    which was verified against a hand-computed numpy reference through
+    ``onnxruntime``; see ``tests/test_llm_fp4.py``), but with a
+    compile-time-constant ``scale``, so **no** ``Abs``/``ReduceMax``/
+    ``Max`` range-reduction node is emitted at all.
+
+    ``scale`` itself is fit by capturing ``X`` over ``calibration_data``
+    (the ``_add_probe_outputs`` + :func:`onnxsim.backend.run_model` capture
+    every calibration-driven pass in this repo uses -- see
+    :func:`onnxsim.apply_gptq`), concatenating every captured batch into
+    one flat sample, and grid-searching ``clip_ratios`` against that
+    sample's own codebook round-trip MSE. The FP4 *format* is **not**
+    re-searched: it was already fixed for this layer by
+    :func:`quantize_weight_only_llm_fp4`'s own per-weight-tensor search,
+    and the recovered codebook is exactly what encodes that choice.
+
+    :param model: a weight-quantized onnx ModelProto or file path -- must
+            already have been passed through
+            :func:`quantize_weight_only_llm_fp4` for this function to do
+            anything, since it only recognizes that function's own exact
+            weight-dequantization pattern
+    :param calibration_data: representative input batches to fit each
+            activation's scale on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted) and
+            :func:`onnxsim.load_huggingface_calibration_data` (real data, a
+            much more representative activation range than random input)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param clip_ratios: per-tensor clip-ratio candidates to grid-search --
+            ``1.0`` puts the activation's own observed max-abs value
+            exactly at the codebook's largest magnitude (no clipping),
+            values below ``1.0`` trade a harder clip on outliers for
+            sharper resolution on the bulk. Defaults to the weight side's
+            own default grid: 17 points evenly spaced over ``[0.5, 1.0]``
+            (:func:`quantize_weight_only_llm_fp4`'s own ``min_clip_ratio``/
+            ``num_scale_candidates`` defaults)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every already-FP4-weight-quantized layer's
+            activation input replaced by a static, per-tensor FP4
+            quantize/dequantize round-trip driven by a constant scale
+            initializer; every other input (weight, bias) and the node's
+            own output name are left exactly as
+            :func:`quantize_weight_only_llm_fp4` left them. A layer whose
+            weight input isn't fed by exactly that function's own
+            dequantization pattern, or whose activation no calibration
+            batch reached (or for which every captured value was zero or
+            non-finite), is left completely untouched -- this function
+            never silently falls back to a different scale scheme under its
+            own name. A model with no such layer, or with an opset older
+            than 13, is returned unchanged. (Opset 13, not the per-token
+            pass's 18: the ops emitted here are ``Unsqueeze`` -- whose
+            ``axes``-as-input form is what needs 13 -- plus ``ArgMin``/
+            ``Gather``/``Sub``/``Abs``/``Div``/``Mul``, all older. The
+            per-token pass needs 18 only for ``ReduceMax``'s own
+            ``axes``-as-input form, and this pass emits no ``ReduceMax``.)
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if not _has_min_opset(model, 13):
+        return model
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+    initializer_map = {t.name: t for t in graph.initializer}
+    producer_map = {output: node for node in graph.node for output in node.output}
+    taken_names = _all_names(graph)
+
+    candidates = []
+    for node in graph.node:
+        match = _match_matmul_like(node)
+        if match is None:
+            continue
+        w_name, _weight_transposed = match
+        x_name = node.input[0]  # guaranteed by _match_matmul_like's transA=0 check
+        codebook_name = _find_llm_fp4_weight_codebook(
+            w_name, producer_map, initializer_map
+        )
+        if codebook_name is None:
+            continue
+        candidates.append((node, x_name, w_name, codebook_name))
+
+    if not candidates:
+        return out
+
+    if clip_ratios is None:
+        ratios = np.linspace(0.5, 1.0, 17)
+    else:
+        ratios = np.asarray(list(clip_ratios), dtype=np.float64)
+    if ratios.size == 0:
+        raise ValueError("clip_ratios must be non-empty")
+
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    probe_names = sorted({x_name for _node, x_name, _w, _cb in candidates})
+    probe_model = _add_probe_outputs(model, probe_names)
+    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
+    for batch in calibration_data:
+        captured = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            value = captured.get(name)
+            if value is None:
+                continue
+            array = np.asarray(value)
+            if np.issubdtype(array.dtype, np.floating):
+                activations[name].append(array.astype(np.float64).ravel())
+
+    # Fit every scale before touching the graph, so a run in which no
+    # layer's activation turns out usable leaves `out` byte-identical to
+    # `model` rather than half-rewritten.
+    fitted: List[Tuple[onnx.NodeProto, str, str, str, float]] = []
+    for node, x_name, w_name, codebook_name in candidates:
+        samples = [a for a in activations[x_name] if a.size]
+        if not samples:
+            continue  # no calibration batch reached this activation
+        values = np.concatenate(samples)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            continue
+        max_abs = float(np.abs(values).max())
+        if max_abs <= 0.0:
+            continue  # an all-zero activation has no meaningful scale
+
+        codebook = onnx.numpy_helper.to_array(initializer_map[codebook_name]).astype(
+            np.float64
+        )
+        # The weight side's own clip-ratio search, with the whole flattened
+        # activation as a single group instead of one group per weight
+        # block -- that single group's winning scale *is* the per-tensor
+        # scale being fit here.
+        _error, scale, _codes = _search_fp4_clip_ratio(
+            values, np.asarray(max_abs), codebook, ratios
+        )
+        scale_value = float(scale)
+        if not np.isfinite(scale_value) or scale_value <= 0.0:
+            continue
+        fitted.append((node, x_name, w_name, codebook_name, scale_value))
+
+    if not fitted:
+        return out
+
+    axes_last_name = _unique_name("llmfp4act_pt_axes_last", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([-1], dtype=np.int64), name=axes_last_name
+        )
+    )
+
+    for node, x_name, w_name, codebook_name, scale_value in fitted:
+        # w_name (this layer's own dequantized-weight tensor) is unique per
+        # layer, unlike x_name -- two layers can share one activation.
+        prefix = f"{w_name}_llmfp4act_pt"
+        scale_name = _unique_name(f"{prefix}_scale", taken_names)
+        graph.initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array(scale_value, dtype=np.float32), name=scale_name
+            )
+        )
+
+        new_nodes: List[onnx.NodeProto] = []
+
+        def _new(op_type, inputs, out_suffix, **attrs):
+            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
+            n_ = onnx.helper.make_node(
+                op_type,
+                inputs,
+                [out_name],
+                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
+                **attrs,
+            )
+            new_nodes.append(n_)
+            return out_name
+
+        # No Abs/ReduceMax/Max anywhere in the scale path: the scale is a
+        # compile-time constant, which is the whole practical point of the
+        # per-tensor design over the per-token one. The single Abs below is
+        # the codebook-distance one, shared with the per-token pass.
+        x_norm = _new("Div", [x_name, scale_name], "x_norm")
+        x_norm_unsq = _new("Unsqueeze", [x_norm, axes_last_name], "x_norm_unsq")
+        diff = _new("Sub", [x_norm_unsq, codebook_name], "diff")
+        diff_abs = _new("Abs", [diff], "diff_abs")
+        nearest_idx = _new("ArgMin", [diff_abs], "nearest_idx", axis=-1, keepdims=0)
+        nearest_val = _new(
+            "Gather", [codebook_name, nearest_idx], "nearest_val", axis=0
+        )
+        x_dequant = _new("Mul", [nearest_val, scale_name], "x_dequant")
 
         insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
         for offset, new_node in enumerate(new_nodes):
