@@ -35772,12 +35772,13 @@ def apply_attention_head_pruning(
     function body, not at module scope) to avoid a circular import:
     ``onnxsim.onnx_simplifier`` already imports from this module
     (:class:`EmbeddingPruningResult`), so importing it back at module load
-    time here would deadlock the import machinery. One pre-existing,
-    pre-approved narrowing: a ``com.microsoft::LinearAttentionGate``-fed
-    decay/beta producer (see this module's own
-    :func:`_match_linear_attention_gate`/:class:`_LinearAttentionGatePassThrough`)
-    is not yet recognized by the C++ port, which cleanly declines the whole
-    match instead of mis-slicing it -- see ``tests/test_pruning.py``'s own
+    time here would deadlock the import machinery. The C++ port also
+    recognizes a ``com.microsoft::LinearAttentionGate``-fed decay/beta
+    producer (see this module's own
+    :func:`_match_linear_attention_gate`/:class:`_LinearAttentionGatePassThrough`,
+    and ``structured_pruning_entry.cpp``'s own ``MatchLinearAttentionGate``/
+    ``LinearAttentionGatePassThrough``), verified full parity -- see
+    ``tests/test_pruning.py``'s own
     ``test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle``/
     ``test_linear_attention_pruning_gate_fed_decay_only_slices_wa_and_gate_weights``.
     """
@@ -35931,8 +35932,9 @@ def apply_attention_head_wanda_pruning(
     ``ApplyAttentionHeadWandaPruning``), forwarding every argument unchanged.
     Imported lazily (inside the function body, not at module scope) to avoid
     a circular import, same reasoning as :func:`apply_attention_head_pruning`'s
-    own alias. Shares that same function's one pre-existing, pre-approved
-    ``com.microsoft::LinearAttentionGate`` narrowing (see its own docstring).
+    own alias. Also shares that same function's
+    ``com.microsoft::LinearAttentionGate``-fed decay/beta recognition (see
+    its own docstring).
     """
     from onnxsim.onnx_simplifier import apply_attention_head_wanda_pruning_cpp
 

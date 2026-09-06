@@ -52,18 +52,18 @@ own docstring for the exact narrower-than-pruning.py scope each still
 carries.
 
 ``onnxsim.apply_attention_head_wanda_pruning`` (the pure-Python name) is now
-itself a thin alias for this port (full parity verified -- see pruning.py's
-own "Attention-head pruning" section comment), exactly like
+itself a thin alias for this port (full parity verified, including the
+``com.microsoft::LinearAttentionGate``-fed decay/beta pass-through -- see
+pruning.py's own "Attention-head pruning" section comment), exactly like
 ``apply_attention_head_pruning``/``apply_wanda_pruning`` before it -- see
-``test_attention_head_pruning_cpp.py``'s own docstring for the one
-pre-existing, pre-approved narrowing (``com.microsoft::LinearAttentionGate``)
-that survives the alias. Every test below that used to call BOTH entry
-points and compare their live outputs would be tautological (literally the
-same code path twice) if left as-is -- those now instead compare the C++
-port's output against a golden fixture (`_GOLDEN`, base64-encoded serialized
-``ModelProto`` bytes) captured from the real pure-Python implementation
-*before* its own mutating body was replaced by the alias, mirroring
-``test_wanda_pruning_cpp.py``'s own established convention.
+``test_attention_head_pruning_cpp.py``'s own docstring. Every test below
+that used to call BOTH entry points and compare their live outputs would be
+tautological (literally the same code path twice) if left as-is -- those now
+instead compare the C++ port's output against a golden fixture (`_GOLDEN`,
+base64-encoded serialized ``ModelProto`` bytes) captured from the real
+pure-Python implementation *before* its own mutating body was replaced by
+the alias, mirroring ``test_wanda_pruning_cpp.py``'s own established
+convention.
 """
 
 import base64
