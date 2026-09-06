@@ -4214,6 +4214,47 @@ class _DepthToSpacePassThrough:
 
 
 @dataclass(frozen=True)
+class _SgePassThrough:
+    """A mid-chain SGE (Spatial Group-wise Enhance, Li et al. 2019,
+    arXiv:1905.09646) ``SpatialGroupEnhance`` sequence the Conv chain walk
+    (:func:`_walk_to_conv_consumer`) crossed transparently -- see
+    :func:`_match_sge_pass_through`'s own docstring and this module's own
+    "Spatial Group-wise Enhance (SGE) pass-through" section comment for the
+    full empirical op sequence. Needs exactly the same `_chain_group`/
+    `_apply_chains` per-block ``keep`` constraint :class:`_GroupNormPassThrough`
+    already established (`num_groups` here plays the identical role
+    `_GroupNormPassThrough.num_groups` does): SGE's own
+    ``GlobalAveragePool``+per-group instance-normalize statistics are
+    computed per contiguous `num_groups`-wide block of the spine's channel
+    axis, so a `keep` set that drops a different count of channels from
+    different groups would change those per-group statistics the same
+    unsafe way pruning a native GroupNorm unevenly would -- see
+    `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for the full correctness
+    argument this reuses verbatim.
+
+    Unlike `_GroupNormPassThrough`'s own per-*channel* `scale`/`bias`
+    (``[n_channels]``-shaped, sliced by `keep`), SGE's own `sge.weight`/
+    `sge.bias` are per-*group* (``[1, num_groups, 1, 1]``-shaped, one
+    scalar per group) -- independent of the channel count entirely, the
+    mirror-opposite case from :class:`_GrnPassThrough`'s own per-channel
+    ``[1, n_channels, 1, 1]`` affine -- so neither is ever sliced at all;
+    this class carries no `weight`/`bias` field for that reason. The one
+    thing that *does* need editing is the trailing ``Reshape`` back to
+    ``[B, n_channels, H, W]``, which bakes the channel count in as a
+    literal element of its own `shape` operand -- exactly the same shape
+    GCNet ContextBlock's own `Reshape`s already solve (see
+    :class:`_ConsumerBranch.literal_reshape_dims`'s own docstring) --
+    `final_reshape`/`final_reshape_shape` carry that node and its own
+    (already confirmed single-reader, at match time) `shape` initializer
+    name for :func:`_slice_chain_channels` to overwrite in place.
+    """
+
+    num_groups: int
+    final_reshape: onnx.NodeProto
+    final_reshape_shape: str
+
+
+@dataclass(frozen=True)
 class _Chain:
     # One producer for a plain chain; two for a gated (elementwise-product)
     # pair, where both branches must agree on which channels survive.
@@ -4288,6 +4329,20 @@ class _Chain:
     # always ends the moment this hop matches, with no room left for any of
     # the other three to also match on the same chain).
     depth_to_space: Optional[_DepthToSpacePassThrough] = None
+    # A single mid-chain SGE (Spatial Group-wise Enhance) hop the chain walk
+    # crossed transparently (:func:`_find_conv_chains` only, for now, gated
+    # by :func:`_walk_to_conv_consumer`'s own `recognize_sge_gate` parameter;
+    # always ``None`` for every other chain kind, and for a MatMul/Gemm
+    # chain). Mutually exclusive with `group_norm`/
+    # `decomposed_group_norm_num_groups`/`grn` on the same chain, exactly
+    # like those three are already mutually exclusive with each other --
+    # see :func:`_walk_to_conv_consumer`'s own `recognize_sge_gate`
+    # docstring. Present, its own `num_groups` constrains `keep` selection
+    # to a uniform count per group exactly like `group_norm.num_groups`
+    # already does -- see :class:`_SgePassThrough` and this module's own
+    # "Spatial Group-wise Enhance (SGE) pass-through" section comment for
+    # why that scope is safe.
+    sge: Optional[_SgePassThrough] = None
     # The consumer's own ``group`` attribute (always 1 for a MatMul/Gemm
     # consumer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
     # Conv consumer (see :func:`_match_conv_consumer`) -- unlike the
@@ -8351,6 +8406,740 @@ def _match_grn_pass_through(
     return out_name, chain_ops, grn
 
 
+# Spatial Group-wise Enhance (SGE, Li et al. 2019, arXiv:1905.09646,
+# CVPR-W, `SpatialGroupEnhance`) -- a fourth Conv-chain hop needing the
+# GroupNorm-family "arbitrary per-group-uniform-count pruning" constraint
+# already established above for native/decomposed GroupNorm and GRN.
+# Confirmed empirically via a real ``torch.onnx.export`` (opset 17, static
+# batch, ``dynamo=False``, this environment's own torch==2.14.0) of the
+# paper's own canonical reference forward (`github.com/implus/PytorchInsight`,
+# widely reused verbatim as a drop-in plug-in in third-party ResNet/ResNeXt
+# backbones) wired as ``Conv -> SpatialGroupEnhance(groups=G) -> Conv``,
+# checker-passed: reading the producing Conv's raw output `x` (`n_channels`
+# channels, NCHW, `n_channels % G == 0`),
+#
+#   r0     = Reshape(x, [B*G, -1, H, W])               # -> [B*G, C/G, H, W] -- `B*G` baked in as ONE literal (static batch)
+#   gap    = GlobalAveragePool(r0)                     # -> [B*G, C/G, 1, 1]
+#   m1     = Mul(r0, gap)                              # per-position dot with the group's own average
+#   rs     = ReduceSum(m1, axes=[1], keepdims=1)       # -> [B*G, 1, H, W] -- the channel-per-group axis is now gone entirely
+#   t0     = Reshape(rs, [B*G, -1])                    # -> [B*G, H*W]
+#   d      = Sub(t0, ReduceMean(t0, axes=[1], keepdims=1))   # t - mean(t) -- axis 1 here is the *flattened-spatial* axis, not a channel axis
+#   # `torch.std`'s own real (Bessel-corrected/unbiased-variance) ONNX
+#   # lowering from here -- confirmed live, not guessed at (this exact
+#   # sub-sequence is the single most version-sensitive part of this shape;
+#   # see this section's own scope note below):
+#   e      = Sub(d, ReduceMean(d, axes=[1], keepdims=1))
+#   n      = ReduceProd(Gather(Shape(d), [1], axis=0), keepdims=0)   # = H*W, as a scalar
+#   var    = Div(Mul(ReduceMean(Mul(e, e), axes=[1], keepdims=1), Cast(n, float)),
+#                Sub(Cast(n, float), 1.0))             # unbiased variance
+#   denom  = Add(Sqrt(var), eps)                        # eps a scalar constant
+#   t_n    = Div(d, denom)                              # normalized -- operand order fixed, `Div` isn't commutative
+#   t_r    = Reshape(t_n, [B, G, H, W])
+#   gate_pre = Add(Mul(t_r, sge.weight), sge.bias)      # sge.weight/sge.bias: [1, G, 1, 1] -- one scalar per GROUP
+#   gate     = Sigmoid(Reshape(gate_pre, [B*G, 1, H, W]))
+#   gated    = Mul(r0, gate)                            # gate times the ORIGINAL group-reshaped r0, NOT the normalized t_n
+#   out      = Reshape(gated, [B, n_channels, H, W])    # -> feeds the next Conv directly
+#
+# Every reduction from `rs` onward (`d`'s own `ReduceMean`s, `Mul(e, e)`'s own
+# `ReduceMean`, `ReduceProd`) operates on a tensor that has ALREADY had its
+# entire channel-per-group axis collapsed away by `rs`'s own `ReduceSum` --
+# none of them is a channel-axis reduction at all (they reduce the
+# *flattened-spatial* axis, or a scalar derived from `Shape`), so none of
+# them carries any group-boundary-drift risk of its own the way GroupNorm's
+# own per-group mean/variance reduction does; the ONE thing that genuinely
+# does need the same "arbitrary per-group-uniform-count" scope
+# `_GROUP_NORM_PASS_THROUGH_OP`'s own comment already established is `rs`'s
+# own `ReduceSum(m1, axes=[1])` itself -- computed per contiguous `G`-wide
+# block of `x`'s own channel axis (`r0`'s own group-split), so pruning a
+# different channel count from different groups would change that sum (and
+# therefore every following per-group scalar `t`/gate value) the identical
+# unsafe way. `keep` selecting the same count from every one of `G` blocks
+# makes this safe for exactly the reason already proven there -- reused
+# verbatim, not re-derived, via :func:`_chain_group`'s own existing
+# `chain.sge.num_groups` check (mirroring `chain.group_norm.num_groups`).
+#
+# `sge.weight`/`sge.bias` are the mirror-opposite case from GRN's own
+# per-CHANNEL ``[1, n_channels, 1, 1]`` affine: shaped ``[1, G, 1, 1]``, one
+# scalar per GROUP, entirely independent of the channel count -- so neither
+# is ever sliced (see :class:`_SgePassThrough`'s own docstring). The only
+# edit this hop needs on apply is the final `Reshape` back to
+# ``[B, n_channels, H, W]``, which bakes `n_channels` in as a literal element
+# of its own `shape` operand -- handled via
+# :func:`_match_gc_context_channel_reshape` (already proven, and already
+# reused as-is: a private, single-reader constant with the spine's own
+# channel count at a fixed `dim_index`, exactly this hop's own shape), the
+# same GCNet ContextBlock mechanism `_slice_chain_channels` already knows how
+# to apply in place (see :class:`_ConsumerBranch.literal_reshape_dims`'s own
+# docstring for why no "clone if shared" guard is needed).
+#
+# Scope: recognized only when `x`'s own single consumer (the walk always
+# reaches this hop via the ordinary ``len(candidates) == 1`` dispatch, since
+# the confirmed real export has NOTHING between the producing Conv and this
+# hop's own first `Reshape`) is this exact `Reshape`, with a literal
+# ``[B*G, -1, H, W]``-shaped `shape` operand (`-1` at index 1 needs no edit
+# at all when pruned, the same "no literal channel count baked in" reasoning
+# :func:`_match_reshape_batch_neg1_pass_through` already established for its
+# own ``[batch, -1]`` convention; a static-batch export bakes `B*G` in as one
+# literal, so the real `G` -- needed to confirm it evenly divides
+# `n_channels`, and for `_chain_group`'s own block count -- is instead read
+# off the LATER ``Reshape(t_n, [B, G, H, W])``, which keeps `B` and `G` as
+# two separate literal elements; `B*G` is cross-checked for consistency
+# against that `G` once known). Gated behind
+# :func:`_walk_to_conv_consumer`'s own `recognize_sge_gate` parameter, scoped
+# identically to `recognize_group_norm`/`recognize_grn` for the identical
+# reason: only :func:`_find_conv_chains` passes ``True``. Every deviation
+# from the exact sequence above -- a differently-shaped `Reshape`, a
+# different reduction axis, a flipped `Sub`/`Div` operand order, a
+# wrongly-shaped `sge.weight`/`sge.bias`, an extra/missing reader anywhere
+# along the way -- declines this hop outright (``None``, never partially
+# matched), falling back to the walk's ordinary behavior for an unrecognized
+# ``Reshape`` (no consumer found, same as before this hop existed), never
+# guessed at.
+def _sge_axis1_group_const(
+    name: str, initializer_map: Dict[str, onnx.TensorProto], num_groups: int
+) -> bool:
+    """True iff `name` names a constant float initializer shaped exactly
+    ``[1, num_groups, 1, 1]`` -- the shape a real ``torch.onnx.export`` of
+    the reference `SpatialGroupEnhance` module's own `weight`/`bias` (each a
+    ``nn.Parameter(torch.zeros/ones(1, groups, 1, 1))``) is confirmed to
+    emit. Mirrors :func:`_grn_axis1_channel_const` exactly, except the
+    constrained size sits on axis 1 as `num_groups` (one scalar per GROUP)
+    rather than `n_channels` (one scalar per CHANNEL) -- see this section's
+    own comment for why this constant is therefore never sliced at all, only
+    checked here for shape/identity.
+    """
+    init = initializer_map.get(name)
+    if init is None or not _is_supported_float_dtype(init.data_type):
+        return False
+    return list(init.dims) == [1, num_groups, 1, 1]
+
+
+def _sge_constant_int64_vector(
+    name: str, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[List[int]]:
+    """Resolves `name` to a flat list of ints iff it names a constant
+    ``int64`` initializer (an initializer, or a plain ``Constant`` node's own
+    embedded value, either way via `initializer_map`/:func:`_constant_map`).
+    Declines (``None``) on a missing or non-``int64`` constant -- every shape/
+    axes/indices operand :func:`_match_sge_pass_through` reads goes through
+    this one helper, rather than each re-deriving the same
+    ``to_array(...).reshape(-1).tolist()`` dance.
+    """
+    init = initializer_map.get(name)
+    if init is None or init.data_type != onnx.TensorProto.INT64:
+        return None
+    return [int(v) for v in onnx.numpy_helper.to_array(init).reshape(-1).tolist()]
+
+
+def _match_sge_pass_through(
+    reshape1: onnx.NodeProto,
+    x_name: str,
+    n_channels: int,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[str, Tuple[Tuple[onnx.NodeProto, None], ...], _SgePassThrough]]:
+    """If `reshape1` (already confirmed by the caller to be `x_name`'s own
+    single consumer, a plain ``Reshape`` reading `x_name` directly) is the
+    root of exactly the fixed SGE op sequence documented in this module's
+    own "Spatial Group-wise Enhance (SGE) pass-through" section comment just
+    above, returns ``(out_name, chain_ops, sge)``: `out_name` the sequence's
+    own true final output (the last `Reshape`'s own output, the tensor
+    :func:`_walk_to_conv_consumer` should continue walking from), `chain_ops`
+    every node with no operand of its own to slice as ``(node, None)`` pairs,
+    and `sge` the hop's own `num_groups` plus the one `Reshape` that DOES
+    need an edit (its own literal `n_channels` shape element) for the caller
+    to carry on :class:`_Chain.sge`. See that section comment for the full
+    op sequence and the exact list of what this declines on; not repeated
+    here in full -- broadly, any deviation from the confirmed shape (a
+    differently-shaped `Reshape`, a wrong reduction axis, a flipped
+    `Sub`/`Div` operand order, a wrongly-shaped `sge.weight`/`sge.bias`, or
+    an extra/missing reader anywhere along the way) declines this hop
+    outright, never guessed at.
+    """
+
+    def _int64_vec(name: str) -> Optional[List[int]]:
+        return _sge_constant_int64_vector(name, initializer_map)
+
+    def _one_reader(name: str) -> bool:
+        return name not in graph_outputs and len(consumers_of.get(name, [])) == 1
+
+    # r0 = Reshape(x, [G, -1, H, W])
+    if (
+        reshape1.domain != ""
+        or len(reshape1.input) != 2
+        or reshape1.input[0] != x_name
+        or not reshape1.input[1]
+        or len(reshape1.output) != 1
+        or not reshape1.output[0]
+    ):
+        return None
+    split_shape = _int64_vec(reshape1.input[1])
+    if split_shape is None or len(split_shape) != 4:
+        return None
+    # `split_shape[0]` is ``batch * num_groups`` (PyTorch's own
+    # ``x.view(b * self.groups, -1, h, w)``), not `num_groups` alone -- a
+    # static-batch export bakes the whole product in as one literal, so it
+    # can't be split back into `batch`/`num_groups` here. The real
+    # `num_groups` -- needed for the `n_channels % num_groups == 0`
+    # check, the `_chain_group` block count, and `sge.weight`/`sge.bias`'s
+    # own shape check -- is instead read off `reshape3`'s own shape below
+    # (``[batch, num_groups, H, W]``, batch and `num_groups` as two
+    # SEPARATE literal elements there, unlike here), and cross-checked
+    # against `bg` for consistency once known. `split_shape[1]` staying
+    # exactly `-1` is what makes this Reshape need no edit at all when
+    # pruned -- the same "no literal channel count baked in" reasoning
+    # :func:`_match_reshape_batch_neg1_pass_through` already established.
+    bg = split_shape[0]
+    if bg < 1 or split_shape[1] != -1:
+        return None
+    r0 = reshape1.output[0]
+    if r0 in graph_outputs:
+        return None
+    r0_consumers = consumers_of.get(r0, [])
+    if len(r0_consumers) != 3:
+        return None
+
+    # r0's own three direct consumers: `gap` (GlobalAveragePool), `mul1`
+    # (`Mul(r0, gap)`), and `final_mul` (`Mul(r0, gate)`, resolved later) --
+    # disjoint op-type/operand-set roles, so identified by elimination.
+    gap_node: Optional[onnx.NodeProto] = None
+    others: List[onnx.NodeProto] = []
+    for cand in r0_consumers:
+        if (
+            gap_node is None
+            and cand.op_type == "GlobalAveragePool"
+            and cand.domain == ""
+            and list(cand.input) == [r0]
+            and len(cand.output) == 1
+            and cand.output[0]
+        ):
+            gap_node = cand
+        else:
+            others.append(cand)
+    if gap_node is None or len(others) != 2:
+        return None
+    gap_out = gap_node.output[0]
+    if not _one_reader(gap_out):
+        return None
+
+    mul1_node: Optional[onnx.NodeProto] = None
+    final_mul_node: Optional[onnx.NodeProto] = None
+    for cand in others:
+        if (
+            cand.op_type == "Mul"
+            and cand.domain == ""
+            and len(cand.input) == 2
+            and set(cand.input) == {r0, gap_out}
+            and len(cand.output) == 1
+            and cand.output[0]
+        ):
+            mul1_node = cand
+        elif (
+            cand.op_type == "Mul"
+            and cand.domain == ""
+            and len(cand.input) == 2
+            and r0 in cand.input
+            and len(cand.output) == 1
+            and cand.output[0]
+        ):
+            final_mul_node = cand
+    if mul1_node is None or final_mul_node is None or mul1_node is final_mul_node:
+        return None
+    gate_name = (
+        final_mul_node.input[1]
+        if final_mul_node.input[0] == r0
+        else final_mul_node.input[0]
+    )
+    if gate_name == r0:
+        return None
+    m1_out = mul1_node.output[0]
+    if not _one_reader(m1_out):
+        return None
+
+    # rs = ReduceSum(m1, axes=[1], keepdims=1) -- opset 13+ input-form axes,
+    # confirmed live (not the deprecated attribute form).
+    reduce_sum = consumers_of[m1_out][0]
+    if (
+        reduce_sum.op_type != "ReduceSum"
+        or reduce_sum.domain != ""
+        or len(reduce_sum.input) != 2
+        or reduce_sum.input[0] != m1_out
+        or not reduce_sum.input[1]
+        or len(reduce_sum.output) != 1
+        or not reduce_sum.output[0]
+    ):
+        return None
+    if _int64_vec(reduce_sum.input[1]) != [1]:
+        return None
+    rs_keepdims = 1
+    for attr in reduce_sum.attribute:
+        if attr.name == "keepdims":
+            rs_keepdims = attr.i
+    if rs_keepdims != 1:
+        return None
+    rs_out = reduce_sum.output[0]
+    if not _one_reader(rs_out):
+        return None
+
+    # t0 = Reshape(rs, [B*G, -1])
+    reshape2 = consumers_of[rs_out][0]
+    if (
+        reshape2.op_type != "Reshape"
+        or reshape2.domain != ""
+        or len(reshape2.input) != 2
+        or reshape2.input[0] != rs_out
+        or not reshape2.input[1]
+        or len(reshape2.output) != 1
+        or not reshape2.output[0]
+    ):
+        return None
+    t0_shape = _int64_vec(reshape2.input[1])
+    if t0_shape is None or len(t0_shape) != 2 or t0_shape[1] != -1:
+        return None
+    t0 = reshape2.output[0]
+
+    def _reduce_mean_axis1(node: onnx.NodeProto, data_in: str) -> Optional[str]:
+        if (
+            node.op_type != "ReduceMean"
+            or node.domain != ""
+            or list(node.input) != [data_in]
+            or len(node.output) != 1
+            or not node.output[0]
+        ):
+            return None
+        axes = None
+        keepdims = 1
+        for attr in node.attribute:
+            if attr.name == "axes":
+                axes = list(attr.ints)
+            elif attr.name == "keepdims":
+                keepdims = attr.i
+        if axes != [1] or keepdims != 1:
+            return None
+        return node.output[0]
+
+    # d = Sub(t0, ReduceMean(t0, axes=[1], keepdims=1)) -- operand order
+    # fixed, `Sub` isn't commutative. `t0` itself is read TWICE (by its own
+    # `ReduceMean` and by this very `Sub`), unlike every other tensor so far
+    # in this sequence -- disambiguated by op type, mirroring how `d`'s own
+    # four-way fan-out just below is disambiguated.
+    if t0 in graph_outputs:
+        return None
+    t0_consumers = consumers_of.get(t0, [])
+    if len(t0_consumers) != 2:
+        return None
+    mean0_node = next((c for c in t0_consumers if c.op_type == "ReduceMean"), None)
+    sub0_node = next((c for c in t0_consumers if c.op_type == "Sub"), None)
+    if mean0_node is None or sub0_node is None or mean0_node is sub0_node:
+        return None
+    mean0_out = _reduce_mean_axis1(mean0_node, t0)
+    if mean0_out is None or not _one_reader(mean0_out):
+        return None
+    if (
+        sub0_node.domain != ""
+        or list(sub0_node.input) != [t0, mean0_out]
+        or len(sub0_node.output) != 1
+        or not sub0_node.output[0]
+    ):
+        return None
+    d = sub0_node.output[0]
+    if d in graph_outputs:
+        return None
+    d_consumers = consumers_of.get(d, [])
+    if len(d_consumers) != 4:
+        return None
+
+    # `d`'s own four direct consumers, from here on the fixed, verbose
+    # ``torch.std`` unbiased-variance lowering -- classified by op type
+    # (mutually exclusive, so never ambiguous): the second `ReduceMean`
+    # (-> `mean1`), `Shape` (-> the `n = H*W` derivation), `Sub` (`e = d -
+    # mean1`), and the final `Div` (`d / denom`, resolved once `denom` is
+    # known below).
+    mean1_node = next((c for c in d_consumers if c.op_type == "ReduceMean"), None)
+    shape_node = next((c for c in d_consumers if c.op_type == "Shape"), None)
+    sub1_node = next((c for c in d_consumers if c.op_type == "Sub"), None)
+    div_final_node = next((c for c in d_consumers if c.op_type == "Div"), None)
+    if (
+        mean1_node is None
+        or shape_node is None
+        or sub1_node is None
+        or div_final_node is None
+        or len({id(mean1_node), id(shape_node), id(sub1_node), id(div_final_node)}) != 4
+    ):
+        return None
+
+    mean1_out = _reduce_mean_axis1(mean1_node, d)
+    if mean1_out is None or not _one_reader(mean1_out):
+        return None
+    if (
+        sub1_node.domain != ""
+        or list(sub1_node.input) != [d, mean1_out]
+        or len(sub1_node.output) != 1
+        or not sub1_node.output[0]
+    ):
+        return None
+    e = sub1_node.output[0]
+    # `e` is read TWICE, but by the very same node (`Mul(e, e)` below) --
+    # `consumers_of` records one entry per `node.input` *occurrence*, so a
+    # node reading the same tensor as both of its own operands surfaces as
+    # that one node appearing twice here, not two distinct readers.
+    e_consumers = consumers_of.get(e, [])
+    if (
+        e in graph_outputs
+        or len(e_consumers) != 2
+        or e_consumers[0] is not e_consumers[1]
+    ):
+        return None
+
+    if (
+        shape_node.domain != ""
+        or list(shape_node.input) != [d]
+        or len(shape_node.output) != 1
+        or not shape_node.output[0]
+    ):
+        return None
+    shape_out = shape_node.output[0]
+    if not _one_reader(shape_out):
+        return None
+    gather_node = consumers_of[shape_out][0]
+    if (
+        gather_node.op_type != "Gather"
+        or gather_node.domain != ""
+        or len(gather_node.input) != 2
+        or gather_node.input[0] != shape_out
+        or not gather_node.input[1]
+        or len(gather_node.output) != 1
+        or not gather_node.output[0]
+    ):
+        return None
+    if _int64_vec(gather_node.input[1]) != [1]:
+        return None
+    gather_axis = 0
+    for attr in gather_node.attribute:
+        if attr.name == "axis":
+            gather_axis = attr.i
+    if gather_axis != 0:
+        return None
+    gather_out = gather_node.output[0]
+    if not _one_reader(gather_out):
+        return None
+    reduce_prod_node = consumers_of[gather_out][0]
+    if (
+        reduce_prod_node.op_type != "ReduceProd"
+        or reduce_prod_node.domain != ""
+        or list(reduce_prod_node.input) != [gather_out]
+        or len(reduce_prod_node.output) != 1
+        or not reduce_prod_node.output[0]
+    ):
+        return None
+    n_out = reduce_prod_node.output[0]
+    if not _one_reader(n_out):
+        return None
+    cast_node = consumers_of[n_out][0]
+    if (
+        cast_node.domain != ""
+        or list(cast_node.input) != [n_out]
+        or len(cast_node.output) != 1
+        or not cast_node.output[0]
+    ):
+        return None
+    cast_to = None
+    for attr in cast_node.attribute:
+        if attr.name == "to":
+            cast_to = attr.i
+    if cast_to is None or not _is_supported_float_dtype(cast_to):
+        return None
+    n_f = cast_node.output[0]
+    n_f_consumers = consumers_of.get(n_f, [])
+    if n_f in graph_outputs or len(n_f_consumers) != 2:
+        return None
+
+    # e2 = Mul(e, e); mean_e2 = ReduceMean(e2, axes=[1], keepdims=1)
+    mul_e_node = consumers_of[e][0]
+    if (
+        mul_e_node.op_type != "Mul"
+        or mul_e_node.domain != ""
+        or list(mul_e_node.input) != [e, e]
+        or len(mul_e_node.output) != 1
+        or not mul_e_node.output[0]
+    ):
+        return None
+    e2 = mul_e_node.output[0]
+    if not _one_reader(e2):
+        return None
+    mean_e2_node = consumers_of[e2][0]
+    mean_e2 = _reduce_mean_axis1(mean_e2_node, e2)
+    if mean_e2 is None or not _one_reader(mean_e2):
+        return None
+
+    # `n_f`'s own two direct consumers: `mul_sum = Mul(mean_e2, n_f)` (either
+    # order) and `sub_n1 = Sub(n_f, 1.0)` (order fixed).
+    mul_sum_node: Optional[onnx.NodeProto] = None
+    sub_n1_node: Optional[onnx.NodeProto] = None
+    for cand in n_f_consumers:
+        if (
+            cand.op_type == "Mul"
+            and cand.domain == ""
+            and len(cand.input) == 2
+            and set(cand.input) == {mean_e2, n_f}
+            and len(cand.output) == 1
+            and cand.output[0]
+        ):
+            mul_sum_node = cand
+        elif (
+            cand.op_type == "Sub"
+            and cand.domain == ""
+            and list(cand.input)[:1] == [n_f]
+            and len(cand.input) == 2
+            and len(cand.output) == 1
+            and cand.output[0]
+        ):
+            sub_n1_node = cand
+    if mul_sum_node is None or sub_n1_node is None or mul_sum_node is sub_n1_node:
+        return None
+    one_init = initializer_map.get(sub_n1_node.input[1])
+    if (
+        one_init is None
+        or not _is_supported_float_dtype(one_init.data_type)
+        or list(one_init.dims) not in ([], [1])
+        or float(onnx.numpy_helper.to_array(one_init).reshape(-1)[0]) != 1.0
+    ):
+        return None
+    sum_e2 = mul_sum_node.output[0]
+    n_minus_1 = sub_n1_node.output[0]
+    if not _one_reader(sum_e2) or not _one_reader(n_minus_1):
+        return None
+
+    # var = Div(sum_e2, n_minus_1) -- operand order fixed.
+    div_var_node = consumers_of[sum_e2][0]
+    if div_var_node is not consumers_of[n_minus_1][0]:
+        return None  # both must feed the SAME Div
+    if (
+        div_var_node.op_type != "Div"
+        or div_var_node.domain != ""
+        or list(div_var_node.input) != [sum_e2, n_minus_1]
+        or len(div_var_node.output) != 1
+        or not div_var_node.output[0]
+    ):
+        return None
+    var = div_var_node.output[0]
+    if not _one_reader(var):
+        return None
+
+    # std = Sqrt(var); denom = Add(std, eps) (either order)
+    sqrt_node = consumers_of[var][0]
+    if (
+        sqrt_node.op_type != "Sqrt"
+        or sqrt_node.domain != ""
+        or list(sqrt_node.input) != [var]
+        or len(sqrt_node.output) != 1
+        or not sqrt_node.output[0]
+    ):
+        return None
+    std = sqrt_node.output[0]
+    if not _one_reader(std):
+        return None
+    add_eps_node = consumers_of[std][0]
+    if (
+        add_eps_node.op_type != "Add"
+        or add_eps_node.domain != ""
+        or len(add_eps_node.input) != 2
+        or std not in add_eps_node.input
+        or len(add_eps_node.output) != 1
+        or not add_eps_node.output[0]
+    ):
+        return None
+    eps_name = (
+        add_eps_node.input[1] if add_eps_node.input[0] == std else add_eps_node.input[0]
+    )
+    eps_init = initializer_map.get(eps_name)
+    if (
+        eps_name == std
+        or eps_init is None
+        or not _is_supported_float_dtype(eps_init.data_type)
+        or list(eps_init.dims) not in ([], [1])
+    ):
+        return None
+    denom = add_eps_node.output[0]
+    if not _one_reader(denom):
+        return None
+
+    # t_n = Div(d, denom) -- this is `div_final_node`, already identified as
+    # one of `d`'s own four direct consumers above; confirm it's fed by
+    # exactly this `denom`, in this fixed order.
+    if consumers_of[denom][0] is not div_final_node:
+        return None
+    if (
+        div_final_node.domain != ""
+        or list(div_final_node.input) != [d, denom]
+        or len(div_final_node.output) != 1
+        or not div_final_node.output[0]
+    ):
+        return None
+    t_n = div_final_node.output[0]
+    if not _one_reader(t_n):
+        return None
+
+    # t_r = Reshape(t_n, [B, G, H, W]) -- unlike `reshape1`'s own merged
+    # `batch * num_groups` axis 0, `batch` and `num_groups` are two
+    # SEPARATE literal elements here, so this is where the real
+    # `num_groups` actually comes from.
+    reshape3 = consumers_of[t_n][0]
+    if (
+        reshape3.op_type != "Reshape"
+        or reshape3.domain != ""
+        or len(reshape3.input) != 2
+        or reshape3.input[0] != t_n
+        or not reshape3.input[1]
+        or len(reshape3.output) != 1
+        or not reshape3.output[0]
+    ):
+        return None
+    reshape3_shape = _int64_vec(reshape3.input[1])
+    if reshape3_shape is None or len(reshape3_shape) != 4:
+        return None
+    batch, num_groups = reshape3_shape[0], reshape3_shape[1]
+    if (
+        batch < 1
+        or num_groups < 1
+        or n_channels % num_groups != 0
+        or bg % num_groups != 0  # `bg` (reshape1's own batch*groups) must
+        # be some multiple of this same `num_groups` -- a real cross-check,
+        # not a guess: `reshape1`'s and `reshape3`'s own literal shapes were
+        # both baked in from the SAME static `batch`/`groups` pair by the
+        # same export, so they must agree.
+    ):
+        return None
+    t_r = reshape3.output[0]
+    if not _one_reader(t_r):
+        return None
+
+    # gate_pre = Add(Mul(t_r, sge.weight), sge.bias) -- both commutative.
+    mul_w_node = consumers_of[t_r][0]
+    if (
+        mul_w_node.op_type != "Mul"
+        or mul_w_node.domain != ""
+        or len(mul_w_node.input) != 2
+        or t_r not in mul_w_node.input
+        or len(mul_w_node.output) != 1
+        or not mul_w_node.output[0]
+    ):
+        return None
+    weight_name = (
+        mul_w_node.input[1] if mul_w_node.input[0] == t_r else mul_w_node.input[0]
+    )
+    if weight_name == t_r or not _sge_axis1_group_const(
+        weight_name, initializer_map, num_groups
+    ):
+        return None
+    weighted = mul_w_node.output[0]
+    if not _one_reader(weighted):
+        return None
+    add_b_node = consumers_of[weighted][0]
+    if (
+        add_b_node.op_type != "Add"
+        or add_b_node.domain != ""
+        or len(add_b_node.input) != 2
+        or weighted not in add_b_node.input
+        or len(add_b_node.output) != 1
+        or not add_b_node.output[0]
+    ):
+        return None
+    bias_name = (
+        add_b_node.input[1] if add_b_node.input[0] == weighted else add_b_node.input[0]
+    )
+    if (
+        bias_name == weighted
+        or bias_name
+        == weight_name  # tied weight/bias -- would corrupt slicing elsewhere
+        or not _sge_axis1_group_const(bias_name, initializer_map, num_groups)
+    ):
+        return None
+    biased = add_b_node.output[0]
+    if not _one_reader(biased):
+        return None
+
+    # gate = Sigmoid(Reshape(biased, [B*G, 1, H, W]))
+    reshape4 = consumers_of[biased][0]
+    if (
+        reshape4.op_type != "Reshape"
+        or reshape4.domain != ""
+        or len(reshape4.input) != 2
+        or reshape4.input[0] != biased
+        or not reshape4.input[1]
+        or len(reshape4.output) != 1
+        or not reshape4.output[0]
+    ):
+        return None
+    gate_pre = reshape4.output[0]
+    if not _one_reader(gate_pre):
+        return None
+    sigmoid_node = consumers_of[gate_pre][0]
+    if (
+        sigmoid_node.op_type != "Sigmoid"
+        or sigmoid_node.domain != ""
+        or list(sigmoid_node.input) != [gate_pre]
+        or len(sigmoid_node.output) != 1
+        or sigmoid_node.output[0] != gate_name  # must feed `final_mul` -- see above
+    ):
+        return None
+    sigmoid_out = sigmoid_node.output[0]
+    if not _one_reader(sigmoid_out):
+        return None
+    if consumers_of[sigmoid_out][0] is not final_mul_node:
+        return None
+
+    # gated = Mul(r0, gate) -- `final_mul_node`, already identified above.
+    gated_out = final_mul_node.output[0]
+    if not _one_reader(gated_out):
+        return None
+
+    # out = Reshape(gated, [B, n_channels, H, W]) -- the one Reshape in this
+    # whole sequence that bakes `n_channels` in as a literal shape element,
+    # handled via the same GCNet ContextBlock mechanism already proven safe
+    # (see this section's own comment).
+    reshape_final = consumers_of[gated_out][0]
+    final_shape_name = _match_gc_context_channel_reshape(
+        reshape_final, gated_out, 1, n_channels, initializer_map, consumers_of
+    )
+    if final_shape_name is None:
+        return None
+    out_name = reshape_final.output[0]
+
+    chain_ops: Tuple[Tuple[onnx.NodeProto, None], ...] = (
+        (reshape1, None),
+        (gap_node, None),
+        (mul1_node, None),
+        (reduce_sum, None),
+        (reshape2, None),
+        (mean0_node, None),
+        (sub0_node, None),
+        (mean1_node, None),
+        (shape_node, None),
+        (gather_node, None),
+        (reduce_prod_node, None),
+        (cast_node, None),
+        (mul_e_node, None),
+        (mean_e2_node, None),
+        (mul_sum_node, None),
+        (sub_n1_node, None),
+        (div_var_node, None),
+        (sqrt_node, None),
+        (add_eps_node, None),
+        (sub1_node, None),
+        (div_final_node, None),
+        (reshape3, None),
+        (mul_w_node, None),
+        (add_b_node, None),
+        (reshape4, None),
+        (sigmoid_node, None),
+        (final_mul_node, None),
+    )
+    sge = _SgePassThrough(num_groups, reshape_final, final_shape_name)
+    return out_name, chain_ops, sge
+
+
 # CBAM (Woo et al. 2018, "Convolutional Block Attention Module")'s
 # `SpatialGate` stage -- a third Conv-chain pass-through hop, alongside
 # GroupNorm/InstanceNorm above, recognized only when a spine tensor forks
@@ -9733,6 +10522,7 @@ def _walk_to_conv_consumer(
     recognize_triplet_attention: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
     recognize_depth_to_space: bool = False,
+    recognize_sge_gate: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Tuple[
     Optional[Tuple[onnx.NodeProto, str, int, bool]],
@@ -9743,6 +10533,7 @@ def _walk_to_conv_consumer(
     Optional[_ConsumerMatch],
     Optional[_GrnPassThrough],
     Optional[_DepthToSpacePassThrough],
+    Optional[_SgePassThrough],
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
@@ -10010,6 +10801,24 @@ def _walk_to_conv_consumer(
     walk always terminates (`break`s or runs out of hops) the moment either
     is decided.
 
+    `recognize_sge_gate` is the analogous gate for SGE (Spatial Group-wise
+    Enhance)'s own ``SpatialGroupEnhance`` shape -- see
+    :func:`_match_sge_pass_through` and this module's own "Spatial
+    Group-wise Enhance (SGE) pass-through" section comment -- scoped
+    identically to `recognize_group_norm`/`recognize_grn` for the identical
+    reason (only :func:`_find_conv_chains` passes ``True``), and mutually
+    exclusive with `group_norm`/`decomposed_group_norm_num_groups`/`grn` on
+    any one chain, exactly like those three already are with each other.
+    Unlike the three-/five-consumer dispatches above, this hop is reached
+    through the ORDINARY single-consumer dispatch (the confirmed real
+    export has the producing Conv's raw output read by exactly one node, a
+    ``Reshape``) -- so, like `recognize_group_norm`, it's tried whenever
+    `nxt` is a plain ``Reshape`` reading `cur` directly, at any hop, not
+    only the walk's first (nothing about this hop's own correctness depends
+    on its position the way `recognize_depth_to_space`'s own hop==0
+    restriction does -- see that parameter's own docstring for the
+    contrast).
+
     `producers_of`, when given, is threaded straight through to
     :func:`_match_gap_flatten_matmul_consumer` (only used when
     `recognize_gap_flatten_matmul_consumer` is set) to resolve a
@@ -10023,6 +10832,7 @@ def _walk_to_conv_consumer(
     decomposed_group_norm_num_groups: Optional[int] = None
     grn: Optional[_GrnPassThrough] = None
     depth_to_space: Optional[_DepthToSpacePassThrough] = None
+    sge: Optional[_SgePassThrough] = None
     consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
     matmul_consumer: Optional[_ConsumerMatch] = None
     cur = start
@@ -10340,6 +11150,28 @@ def _walk_to_conv_consumer(
             break
 
         if (
+            recognize_sge_gate
+            and sge is None
+            and group_norm is None
+            and decomposed_group_norm_num_groups is None
+            and grn is None
+            and nxt.op_type == "Reshape"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+        ):
+            sge_match = _match_sge_pass_through(
+                nxt, cur, n_channels, consumers_of, initializer_map, graph_outputs
+            )
+            if sge_match is not None:
+                sge_out, sge_chain_ops, sge_hop = sge_match
+                chain_ops.extend(sge_chain_ops)
+                sge = sge_hop
+                cur = sge_out
+                continue
+            break
+
+        if (
             nxt.op_type == "Resize"
             and nxt.domain == ""
             and nxt.input
@@ -10463,6 +11295,7 @@ def _walk_to_conv_consumer(
         matmul_consumer,
         grn,
         depth_to_space,
+        sge,
     )
 
 
@@ -10541,6 +11374,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             matmul_consumer,
             grn,
             depth_to_space,
+            sge,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -10557,6 +11391,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_triplet_attention=True,
             recognize_gap_flatten_matmul_consumer=True,
             recognize_depth_to_space=True,
+            recognize_sge_gate=True,
             producers_of=producers_of,
         )
         if consumer is None and matmul_consumer is None:
@@ -10593,6 +11428,8 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 if group_norm is not None
                 else decomposed_group_norm_num_groups
                 if decomposed_group_norm_num_groups is not None
+                else sge.num_groups
+                if sge is not None
                 else (1 if grn is not None else None)
             )
             if (
@@ -10631,6 +11468,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                     group_norm=group_norm,
                     decomposed_group_norm_num_groups=decomposed_group_norm_num_groups,
                     grn=grn,
+                    sge=sge,
                 )
             )
             continue
@@ -10714,6 +11552,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 decomposed_group_norm_num_groups=decomposed_group_norm_num_groups,
                 grn=grn,
                 depth_to_space=depth_to_space,
+                sge=sge,
                 consumer_group=consumer_group,
                 consumer_is_conv_transpose=consumer_is_conv_transpose,
             )
@@ -11189,6 +12028,7 @@ def _resolve_conv_fanout_branches(
                 _br_matmul_consumer,
                 _br_grn,
                 _br_depth_to_space,
+                _br_sge,
             ) = _walk_to_conv_consumer(
                 tensor,
                 initializer_map,
@@ -11201,12 +12041,12 @@ def _resolve_conv_fanout_branches(
             if resolved is None:
                 return None
             # `recognize_group_norm`/`recognize_decomposed_group_norm`/
-            # `recognize_grn`/`recognize_depth_to_space` were left at their
-            # defaults (False) above, so `_br_group_norm`/
-            # `_br_decomposed_group_norm`/`_br_grn`/`_br_depth_to_space` are
-            # always `None` -- GroupNorm/GRN pass-through (native or
-            # decomposed) is deliberately out of scope for a residual/merge
-            # group's own fan-out branches for now (see
+            # `recognize_grn`/`recognize_depth_to_space`/`recognize_sge_gate`
+            # were left at their defaults (False) above, so `_br_group_norm`/
+            # `_br_decomposed_group_norm`/`_br_grn`/`_br_depth_to_space`/
+            # `_br_sge` are always `None` -- GroupNorm/GRN/SGE pass-through
+            # (native or decomposed) is deliberately out of scope for a
+            # residual/merge group's own fan-out branches for now (see
             # _walk_to_conv_consumer's own docstring).
             # `recognize_gap_flatten_matmul_consumer` was left at its default
             # (False) above, so `_br_matmul_consumer` is always `None` -- the
@@ -12887,6 +13727,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _matmul_consumer,
             grn,
             depth_to_space,
+            sge,
         ) = _walk_to_conv_consumer(
             mul_out,
             initializer_map,
@@ -12900,15 +13741,16 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # Every optional `_walk_to_conv_consumer` flag (`allow_conv_transpose_
         # consumer`, `recognize_group_norm`, `recognize_decomposed_group_norm`,
         # `recognize_grn`, `recognize_gap_flatten_matmul_consumer`,
-        # `recognize_depth_to_space`) was left at its default (False) above --
-        # see this section's own comment for why -- so `group_norm`/
-        # `decomposed_group_norm_num_groups`/`grn`/`depth_to_space`/
-        # `_matmul_consumer` are always `None` here.
+        # `recognize_depth_to_space`, `recognize_sge_gate`) was left at its
+        # default (False) above -- see this section's own comment for why --
+        # so `group_norm`/`decomposed_group_norm_num_groups`/`grn`/
+        # `depth_to_space`/`sge`/`_matmul_consumer` are always `None` here.
         assert (
             group_norm is None
             and decomposed_group_norm_num_groups is None
             and grn is None
             and depth_to_space is None
+            and sge is None
         )
         (
             consumer_node,
@@ -13564,6 +14406,7 @@ def _find_conv_gc_context_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _matmul_consumer,
             grn,
             depth_to_space,
+            sge,
         ) = _walk_to_conv_consumer(
             add_out,
             initializer_map,
@@ -13577,12 +14420,13 @@ def _find_conv_gc_context_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # Every optional `_walk_to_conv_consumer` flag was left at its
         # default (False) above -- see this section's own comment -- so
         # `group_norm`/`decomposed_group_norm_num_groups`/`grn`/
-        # `depth_to_space`/`_matmul_consumer` are always `None` here.
+        # `depth_to_space`/`sge`/`_matmul_consumer` are always `None` here.
         assert (
             group_norm is None
             and decomposed_group_norm_num_groups is None
             and grn is None
             and depth_to_space is None
+            and sge is None
         )
         (
             consumer_node,
@@ -14366,6 +15210,7 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _matmul_consumer,
             grn,
             depth_to_space,
+            sge,
         ) = _walk_to_conv_consumer(
             mul_out,
             initializer_map,
@@ -14390,6 +15235,7 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             and decomposed_group_norm_num_groups is None
             and grn is None
             and depth_to_space is None
+            and sge is None
         )
         (
             consumer_node,
@@ -17658,6 +18504,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             _fwd_matmul_consumer,
             _fwd_grn,
             _fwd_depth_to_space,
+            _fwd_sge,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -17673,13 +18520,13 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         # consumer for now (see _walk_to_conv_consumer's own docstring), the
         # same way ConvTranspose/GroupNorm already are.
         # `recognize_group_norm`/`recognize_decomposed_group_norm`/
-        # `recognize_grn`/`recognize_depth_to_space` were left at their
-        # defaults (False) above, so `_fwd_group_norm`/
-        # `_fwd_decomposed_group_norm`/`_fwd_grn`/`_fwd_depth_to_space` are
-        # always `None` -- GroupNorm/GRN/DepthToSpace pass-through (native or
-        # decomposed) is deliberately out of scope for a Concat-branch-merge
-        # chain's own consumer for now (see _walk_to_conv_consumer's own
-        # docstring).
+        # `recognize_grn`/`recognize_depth_to_space`/`recognize_sge_gate`
+        # were left at their defaults (False) above, so `_fwd_group_norm`/
+        # `_fwd_decomposed_group_norm`/`_fwd_grn`/`_fwd_depth_to_space`/
+        # `_fwd_sge` are always `None` -- GroupNorm/GRN/DepthToSpace/SGE
+        # pass-through (native or decomposed) is deliberately out of scope
+        # for a Concat-branch-merge chain's own consumer for now (see
+        # _walk_to_conv_consumer's own docstring).
         if consumer is None:
             continue
         # `allow_conv_transpose_consumer` was left at its default (False)
@@ -18711,6 +19558,16 @@ def _chain_group(chain: _Chain) -> int:
     case of `group_norm`'s own per-block reduction -- see
     :class:`_GrnPassThrough` and this module's own "Global Response
     Normalization (GRN) pass-through" section comment.
+
+    A mid-chain SGE hop (`chain.sge`, likewise only ever set by
+    :func:`_find_conv_chains`, and mutually exclusive with `group_norm`/
+    `decomposed_group_norm_num_groups`/`grn` -- see
+    :func:`_walk_to_conv_consumer`'s own `recognize_sge_gate` docstring)
+    contributes its own `num_groups` the identical way `group_norm.num_groups`
+    already does -- see :class:`_SgePassThrough` and this module's own
+    "Spatial Group-wise Enhance (SGE) pass-through" section comment for why a
+    uniform count per `num_groups` block is exactly the scope that's safe
+    here too.
     """
     group = chain.consumer_group
     for p in chain.producers:
@@ -18723,6 +19580,8 @@ def _chain_group(chain: _Chain) -> int:
         group = chain.decomposed_group_norm_num_groups
     if chain.grn is not None:
         group = 1
+    if chain.sge is not None:
+        group = chain.sge.num_groups
     return group
 
 
@@ -18840,6 +19699,22 @@ def _slice_chain_channels(
         # sit on -- see :class:`_GrnPassThrough`'s own comment.
         _slice_axis1(initializer_map[chain.grn.weight], keep)
         _slice_axis1(initializer_map[chain.grn.bias], keep)
+    if chain.sge is not None:
+        # `sge.weight`/`sge.bias` are per-GROUP (``[1, num_groups, 1, 1]``),
+        # independent of the channel count entirely -- never sliced (see
+        # :class:`_SgePassThrough`'s own docstring). The one edit this hop
+        # needs is overwriting the literal `n_channels` element its own
+        # trailing `Reshape` bakes into its own `shape` operand -- the same
+        # GCNet ContextBlock mechanism `extra_consumers`'
+        # `literal_reshape_dims` already applies below, safe with no "clone
+        # if shared" guard for the identical reason (already confirmed, at
+        # match time, to have no other reader).
+        shape_init = initializer_map[chain.sge.final_reshape_shape]
+        new_dims = onnx.numpy_helper.to_array(shape_init).copy()
+        new_dims[1] = keep_count
+        shape_init.CopyFrom(
+            onnx.numpy_helper.from_array(new_dims, name=shape_init.name)
+        )
     if (
         chain.consumer_is_conv
         and not chain.consumer_is_conv_transpose
@@ -18923,6 +19798,8 @@ def _slice_chain_channels(
         stale_value_info.add(chain.grn.bias_node.output[0])
     if chain.depth_to_space is not None:
         stale_value_info.add(chain.depth_to_space.node.output[0])
+    if chain.sge is not None:
+        stale_value_info.add(chain.sge.final_reshape.output[0])
     stale_value_info.update(
         chain_node.output[0]
         for b in chain.extra_consumers
