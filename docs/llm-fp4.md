@@ -55,21 +55,51 @@ pairs against MSE).
 
 ## Scope
 
-**Weight-only.** The paper's other headline contribution -- migrating a
-per-channel real-valued *activation* scale into the preceding weight or
-LayerNormalization (via exactly the algebra `onnxsim.apply_smoothquant`/
+**Weight-only quantization (`quantize_weight_only_llm_fp4`).** The paper's
+other headline contribution -- migrating a per-channel real-valued
+*activation* scale into the preceding weight or LayerNormalization (via
+exactly the algebra `onnxsim.apply_smoothquant`/
 `onnxsim.apply_outlier_suppression` already implement), so that a single
 shared exponent bias suffices for a per-tensor FP4 *activation* quantizer,
 enabling full W4A4 -- is **not implemented here**. That migration machinery
 already exists in this repo and composes with this module unchanged (run
-either migration pass first); building the activation-side FP4 QDQ
-insertion itself (a new graph-run-time quantize/dequantize subgraph,
-analogous to `onnxsim.apply_zeroquant`'s own runtime INT8 activation
-quantization but emitting FP4 codes) is real additional scope, left as a
-follow-up. See `onnxsim/llm_fp4.py`'s own module docstring for the full
-rationale.
+either migration pass first). See `onnxsim/llm_fp4.py`'s own module
+docstring for the full rationale.
 
-Handled:
+**Activation quantization (`apply_llm_fp4_activation_quantization`) -- a
+different granularity than the paper's own design.** This module now also
+provides an activation-side pass, but it is **not** a port of the paper's
+per-tensor-via-migration scheme above. It computes a **per-token**
+(per-row), data-free scale fresh at graph-run time from each token's own
+values -- no calibration data, no cross-layer migration pass -- exactly the
+convention `onnxsim.zeroquant`/`onnxsim.quarot`/`onnxsim.duquant`/
+`onnxsim.attention_quantization` already use for their own per-token
+runtime quantizers, just against FP4's non-uniform 16-value codebook
+instead of a uniform integer grid. For every layer
+`quantize_weight_only_llm_fp4` already weight-quantized (found by walking
+its weight input backward through that function's own exact
+`Gather`/`Reshape`/`Mul`/`Cast` dequantization pattern -- the winning
+format isn't recorded anywhere else, so this is the only robust way to
+recover it), it inserts:
+
+```
+scale = max(ReduceMax(Abs(X), axis=-1, keepdims=1), epsilon) / max(abs(Codebook))
+x_normalized = X / scale
+nearest = Gather(Codebook, ArgMin(Abs(Unsqueeze(x_normalized, -1) - Codebook), axis=-1))
+x_dequant = nearest * scale
+```
+
+using that same layer's own recovered codebook, and rewires the MatMul/Gemm
+node's activation input to `x_dequant`. A layer not already matched by
+`quantize_weight_only_llm_fp4`'s exact pattern is left completely
+untouched -- this pass never runs the weight-side quantization itself.
+Composing with `apply_smoothquant`/`apply_outlier_suppression` beforehand
+remains possible (they act on the weight/LayerNorm side, which this pass
+never touches) but is not required by this simpler design. See
+`apply_llm_fp4_activation_quantization`'s own docstring in
+`onnxsim/llm_fp4.py` for the full honesty note.
+
+Handled (weight-only quantization):
 
 - `MatMul(X, W)` with `W` a constant 2-D float32 tensor whose reduction
   dimension `K` is divisible by `block_size`, or `Gemm(X, W)` with
@@ -83,6 +113,10 @@ Left untouched (safe no-op, node passes through as-is):
 
 - Non-constant weights, non-2-D weights, or a reduction dimension not
   divisible by `block_size`.
+- (Activation quantization) any layer whose weight input isn't fed by
+  `quantize_weight_only_llm_fp4`'s own exact dequantization pattern, and
+  any model whose opset is older than 18 (`ReduceMax`'s `axes`-as-input
+  form).
 
 ## Usage
 
@@ -93,6 +127,12 @@ import onnxsim
 model = onnx.load("model.onnx")
 quantized = onnxsim.quantize_weight_only_llm_fp4(model)  # block_size=32
 onnx.save(quantized, "model.llm_fp4.onnx")
+
+# Optional: complete W4A4 with a per-token, data-free activation quantizer
+# (a different granularity than the paper's own per-tensor-via-migration
+# design -- see "Scope" above).
+w4a4 = onnxsim.apply_llm_fp4_activation_quantization(quantized)
+onnx.save(w4a4, "model.llm_fp4.w4a4.onnx")
 ```
 
 Needs no calibration data: both the per-tensor format choice and the

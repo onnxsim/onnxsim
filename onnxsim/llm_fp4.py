@@ -86,6 +86,26 @@ use for their own codebook formats -- this module builds the dequantization
 out of ordinary ONNX ops any opset-11+ runtime already supports: ``Gather``
 the per-element code out of a 16-entry constant codebook, then ``Mul`` by
 the per-block real-valued scale.
+
+**Update: a self-contained activation-side pass now exists, but it is NOT
+the paper's own per-tensor-via-migration design.** The "deliberately not
+ported" section above still accurately describes the real LLM-FP4 paper's
+own activation-quantization scheme: a per-*channel* real-valued scale fit
+from calibration data and migrated into the preceding weight/
+LayerNormalization (via :func:`onnxsim.apply_smoothquant`/:func:`onnxsim.
+apply_outlier_suppression`) so that a single shared exponent bias suffices
+for a per-*tensor* FP4 activation quantizer -- that migration-based design
+is still not implemented here. :func:`apply_llm_fp4_activation_quantization`
+below instead completes W4A4 with a *different*, simpler granularity: a
+per-*token* (per-row), data-free scale computed fresh from each token's own
+values at graph-run time -- exactly the convention every other per-token
+runtime quantizer in this repo already uses (:mod:`onnxsim.zeroquant`,
+:mod:`onnxsim.quarot`, :mod:`onnxsim.duquant`, :mod:`onnxsim.
+attention_quantization`, :mod:`onnxsim.kv_cache_quantization`'s Value-style
+rewrite), just against FP4's non-uniform 16-value codebook instead of a
+uniform integer grid, and needing no cross-layer migration pass first. See
+that function's own docstring for the full honesty note on this
+difference.
 """
 
 from __future__ import annotations
@@ -424,5 +444,238 @@ def quantize_weight_only_llm_fp4(
         for i, inp in enumerate(node.input):
             if inp == w_name:
                 node.input[i] = dq_out
+
+    return out
+
+
+def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
+    return any(
+        o.domain in ("", "ai.onnx") and o.version >= min_version
+        for o in model.opset_import
+    )
+
+
+def _find_llm_fp4_weight_codebook(
+    w_name: str,
+    producer_map: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[str]:
+    """Walks backward from a MatMul/Gemm's own weight input through the
+    *exact* dequantization pattern :func:`quantize_weight_only_llm_fp4`
+    builds above -- ``Reshape(Mul(Reshape(Gather(Codebook,
+    Cast(Wq))), Reshape(Ws)), orig_shape)`` -- and returns that layer's own
+    ``Codebook`` initializer name, or ``None`` if ``w_name`` isn't fed by
+    exactly this pattern (an unquantized layer, or one quantized by a
+    different onnxsim scheme entirely).
+
+    Matched structurally, op-by-op, against the real node-construction
+    order in :func:`quantize_weight_only_llm_fp4` above -- not by
+    initializer/node naming convention -- because the winning format isn't
+    recorded anywhere else in the graph: the ``Gather`` node's own first
+    input is the only source of truth for which codebook a given layer
+    actually used.
+    """
+    reshape3 = producer_map.get(w_name)
+    if reshape3 is None or reshape3.op_type != "Reshape" or len(reshape3.input) != 2:
+        return None
+    mul = producer_map.get(reshape3.input[0])
+    if mul is None or mul.op_type != "Mul" or len(mul.input) != 2:
+        return None
+    reshape1 = producer_map.get(mul.input[0])
+    reshape2 = producer_map.get(mul.input[1])
+    if reshape1 is None or reshape1.op_type != "Reshape" or len(reshape1.input) != 2:
+        return None
+    if reshape2 is None or reshape2.op_type != "Reshape" or len(reshape2.input) != 2:
+        return None
+    if reshape2.input[0] not in initializer_map:  # Ws: constant per-block scale
+        return None
+    gather = producer_map.get(reshape1.input[0])
+    if gather is None or gather.op_type != "Gather" or len(gather.input) != 2:
+        return None
+    codebook_name = gather.input[0]
+    if codebook_name not in initializer_map:
+        return None
+    cast = producer_map.get(gather.input[1])
+    if cast is None or cast.op_type != "Cast" or len(cast.input) != 1:
+        return None
+    if cast.input[0] not in initializer_map:  # Wq: constant codebook indices
+        return None
+    return codebook_name
+
+
+def apply_llm_fp4_activation_quantization(
+    model: Union[str, onnx.ModelProto],
+    epsilon: float = 1e-12,
+) -> onnx.ModelProto:
+    """Completes W4A4 for every layer :func:`quantize_weight_only_llm_fp4`
+    has already weight-quantized, by inserting a **per-token, data-free**
+    FP4 quantize/dequantize round-trip on that layer's own activation
+    input, using that same layer's own (byte-identical, recovered -- not
+    re-derived) codebook.
+
+    **Honesty note -- this is NOT the paper's own activation-quantization
+    design; read before using.** The real LLM-FP4 paper's headline
+    activation contribution is a *per-channel* real-valued scale, fit from
+    calibration data and migrated into the preceding weight or
+    LayerNormalization (via :func:`onnxsim.apply_smoothquant`/
+    :func:`onnxsim.apply_outlier_suppression`), so that a single shared
+    exponent bias suffices for a *per-tensor* FP4 activation quantizer --
+    see this module's own docstring and ``docs/llm-fp4.md``'s "Scope"
+    section. This function does **not** reproduce that design: it computes
+    a **per-token** (per-row) scale fresh, at graph-run time, from each
+    token's own values -- no calibration data, no migration pass, no
+    stored statistics -- exactly the convention every other per-token
+    runtime quantizer in this repo already uses (:mod:`onnxsim.zeroquant`,
+    :mod:`onnxsim.quarot`, :mod:`onnxsim.duquant`, :mod:`onnxsim.
+    attention_quantization`, :mod:`onnxsim.kv_cache_quantization`'s
+    Value-style rewrite). It is a simpler, self-contained alternative that
+    completes W4A4 without requiring either migration pass first --
+    composing with :func:`onnxsim.apply_smoothquant`/:func:`onnxsim.
+    apply_outlier_suppression` beforehand remains possible (they act on the
+    weight/LayerNorm side and are unaffected by this pass, since it never
+    touches those), but this simpler design does not require it.
+
+    For each layer already matched by :func:`quantize_weight_only_llm_fp4`
+    (found by walking its weight input backward through that function's
+    exact dequantization pattern -- see :func:`_find_llm_fp4_weight_codebook`
+    -- so a layer this module didn't itself weight-quantize is left
+    completely untouched), the activation ``X`` is quantized as::
+
+        scale = max(ReduceMax(Abs(X), axis=-1, keepdims=1), epsilon)
+                / max(abs(Codebook))                    -- one scale per token
+        x_normalized = X / scale
+        nearest = Gather(Codebook, ArgMin(Abs(Unsqueeze(x_normalized, -1)
+                                              - Codebook), axis=-1))
+        x_dequant = nearest * scale
+
+    "Nearest codebook value" is found by broadcasting every element against
+    all 16 codebook entries and taking ``ArgMin`` over the distances, then
+    gathering the codebook by that index -- the same "distance to every
+    codebook entry, then argmin" idea this module's own (offline, numpy)
+    weight-side search and :mod:`onnxsim.iq4_nl`'s own codebook search
+    already use, just expressed as runtime ONNX ops since ``X`` is not a
+    compile-time constant here. This construction was checked directly
+    against a numpy reference via ``onnxruntime`` before being committed to
+    this module (see ``tests/test_llm_fp4.py``).
+
+    :param model: the original or weight-quantized onnx ModelProto or file
+            path -- must already have been passed through
+            :func:`quantize_weight_only_llm_fp4` for this function to do
+            anything, since it only recognizes that function's own exact
+            weight-dequantization pattern
+    :param epsilon: floor applied to a token's own max-abs value before
+            using it as a scale, avoiding a divide-by-zero on an all-zero
+            token
+    :returns: ``model`` with every already-FP4-weight-quantized layer's
+            activation input replaced by its own per-token FP4
+            quantize/dequantize round-trip; every other input (weight,
+            bias) and the node's own output name are left exactly as
+            :func:`quantize_weight_only_llm_fp4` left them. A layer whose
+            weight input isn't fed by exactly that function's own
+            dequantization pattern is left completely untouched. A model
+            with no such layer, or with an opset older than 18
+            (``ReduceMax``'s ``axes``-as-input form needs opset 18, the
+            same gate :func:`onnxsim.apply_zeroquant` uses), is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if not _has_min_opset(model, 18):
+        return model
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+    initializer_map = {t.name: t for t in graph.initializer}
+    producer_map = {output: node for node in graph.node for output in node.output}
+    taken_names = _all_names(graph)
+
+    candidates = []
+    for node in graph.node:
+        match = _match_matmul_like(node)
+        if match is None:
+            continue
+        w_name, _weight_transposed = match
+        x_name = node.input[0]  # guaranteed by _match_matmul_like's transA=0 check
+        codebook_name = _find_llm_fp4_weight_codebook(
+            w_name, producer_map, initializer_map
+        )
+        if codebook_name is None:
+            continue
+        candidates.append((node, x_name, w_name, codebook_name))
+
+    if not candidates:
+        return out
+
+    axes_last_name = _unique_name("llmfp4act_axes_last", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([-1], dtype=np.int64), name=axes_last_name
+        )
+    )
+    eps_name = _unique_name("llmfp4act_eps", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(np.array(epsilon, dtype=np.float32), name=eps_name)
+    )
+
+    codebook_max_names: Dict[str, str] = {}  # codebook initializer name -> maxabs const
+
+    for node, x_name, w_name, codebook_name in candidates:
+        if codebook_name not in codebook_max_names:
+            codebook_values = onnx.numpy_helper.to_array(initializer_map[codebook_name])
+            codebook_max = float(np.max(np.abs(codebook_values)))
+            max_name = _unique_name(f"{codebook_name}_maxabs", taken_names)
+            graph.initializer.append(
+                onnx.numpy_helper.from_array(
+                    np.array(codebook_max, dtype=np.float32), name=max_name
+                )
+            )
+            codebook_max_names[codebook_name] = max_name
+        codebook_max_name = codebook_max_names[codebook_name]
+
+        prefix = f"{w_name}_llmfp4act"
+        new_nodes: List[onnx.NodeProto] = []
+
+        def _new(op_type, inputs, out_suffix, **attrs):
+            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
+            n_ = onnx.helper.make_node(
+                op_type,
+                inputs,
+                [out_name],
+                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
+                **attrs,
+            )
+            new_nodes.append(n_)
+            return out_name
+
+        # Per-token scale: max(|x|) over the token's own last axis, floored
+        # by epsilon, normalized by the codebook's own max magnitude (the
+        # FP4 analogue of onnxsim.zeroquant's/onnxsim.quarot's own
+        # "scale = max(|x|) / <format max>" per-token quantizer).
+        x_abs = _new("Abs", [x_name], "x_abs")
+        x_max = _new("ReduceMax", [x_abs, axes_last_name], "x_max", keepdims=1)
+        x_safe_max = _new("Max", [x_max, eps_name], "x_safe_max")
+        x_scale = _new("Div", [x_safe_max, codebook_max_name], "x_scale")
+        x_norm = _new("Div", [x_name, x_scale], "x_norm")
+
+        # Nearest-codebook-value lookup: broadcast every normalized element
+        # against all 16 codebook entries, ArgMin the distances, Gather the
+        # codebook back -- the runtime-ops analogue of this module's own
+        # (offline, numpy) nearest-codebook search in
+        # _search_llm_fp4_blockwise above.
+        x_norm_unsq = _new("Unsqueeze", [x_norm, axes_last_name], "x_norm_unsq")
+        diff = _new("Sub", [x_norm_unsq, codebook_name], "diff")
+        diff_abs = _new("Abs", [diff], "diff_abs")
+        nearest_idx = _new("ArgMin", [diff_abs], "nearest_idx", axis=-1, keepdims=0)
+        nearest_val = _new(
+            "Gather", [codebook_name, nearest_idx], "nearest_val", axis=0
+        )
+        x_dequant = _new("Mul", [nearest_val, x_scale], "x_dequant")
+
+        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
+        for offset, new_node in enumerate(new_nodes):
+            graph.node.insert(insertion_point + offset, new_node)
+
+        node.input[0] = x_dequant
 
     return out
