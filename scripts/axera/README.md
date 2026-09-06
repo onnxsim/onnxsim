@@ -3092,6 +3092,37 @@ Their config-segment openers start `1e 00 00 00 00 a2 00 00 00 83 01
 c0` -- the `a7` marker's operand straddling the 8-byte segment
 boundary, so segment lengths are exact but not marker-aligned.
 
+**What `a7` does inside a program.** In the `llm_build` layer's 0x8801
+segment the two most common skeletons (85 of 112 programs in the decode
+subgraph, 67 of 151 in prefill) are the CNN core with two `a7` verbs
+inserted at fixed slots: `40.02 | 50.01 | 50.01 | a7.1e | a8 40.03 |
+50.03 | 50.01 | a3 | 50.01 | a9 | [a2] | a7.02 | a8 30.02`, where `a7.1e`
+carries operand 0 and `a7.02` operand 2. The same `a7.1e` with operand 0
+opens every segment of these mcodes (`a7.0a` in the CNNs, `a7.10` in the
+ONNX-path Mistral), so `a7` reads as a synchronization verb -- a wait
+or fence on channel `yy` before the engine-dispatch verbs and a signal
+on channel 2 after them -- that the CNN op programs never need and the
+BF16 layer programs use on every op. Untested on device: an `a7`-patch
+run is the obvious next experiment. The layer's two small segments (14
+and 15 programs on types 0x0c01/0xf001 in decode, 6 and 6 in prefill)
+hold the core followed by runs of 2..13 `a2 00.00` verbs, plus one
+program per segment that writes every field 0x40..0xe0 of banks 2, 3
+and 4 in order -- a full register load, presumably the KV-cache and
+I/O binding.
+
+**`llm_build` emits one instruction stream for all 30 layers.** Every
+per-layer file's two mcodes are byte-identical to layer 0's from the
+first byte of the FlatBuffers header to the tail vector; the only
+differing bytes are in the tail's name string (`llama_p512_l0_together_
+decode` / `_prefill_0` -- 1 byte for layers 1..9, 19 or 21 for the
+two-digit layers, where the longer string shifts what follows it) and,
+of course, in `npu_params` (3,963,652 bytes per layer, all different).
+So a transformer layer's mcode is position-independent: the program
+addresses its weights through the Wbt offsets the `40 02` writes carry,
+and a layer's identity lives entirely in the weight table. An emitter
+for this path has one 57,056-byte decode program and one 93,360-byte
+prefill program to get right, not thirty.
+
 Tests: `test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7`,
 `test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7`, and
 `test_onnx_path_llm_mcode_keeps_the_op_program_skeleton` in

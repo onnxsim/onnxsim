@@ -3059,6 +3059,7 @@ def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
     checkpoint is already in the HuggingFace cache. No device.
     """
     import shutil
+    from collections import Counter
 
     ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
     if ckpt is None:
@@ -3078,6 +3079,37 @@ def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
         assert len(ops) == 1
         cov, programs, a7 = _segment_coverage(mcode, ops[0])
         assert cov == 1.0 and programs >= 100 and a7 >= 100, (cov, programs, a7)
+        # The op template: the CNN core with `a7.1e` (operand 0) after the
+        # two `50.01` writes and `a7.02` (operand 2) before the closing
+        # `a8 30.02`, in the two most common skeletons.
+        pos, length, _ = ops[0]
+        toks = _tokenize_mcode(mcode, start=pos, end=pos + length, **_FULL_RULE)
+        starts = [t[0] for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+        skeletons = Counter()
+        for a, b in zip(starts, starts[1:]):
+            prog = tuple(
+                (
+                    t[2],
+                    t[3],
+                    t[4],
+                    struct.unpack_from("<I", mcode, t[0] + 4)[0]
+                    if t[2] == 0xA7
+                    else None,
+                )
+                for t in toks
+                if a <= t[0] < b and t[1] == "V"
+            )
+            skeletons[prog] += 1
+        top = skeletons.most_common(2)
+        assert sum(c for _, c in top) >= 0.4 * sum(skeletons.values()), top
+        for prog, _ in top:
+            assert prog[3] == (0xA7, 0x00, 0x1E, 0) and prog[-2] == (
+                0xA7,
+                0x00,
+                0x02,
+                2,
+            ), prog
+            assert prog[-1][:3] == (0xA8, 0x30, 0x02)
         total_e = total_n = 0
         for seg in segs:
             pos, length, _ = seg
@@ -3088,6 +3120,23 @@ def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
             total_e += c * (end - pos)
             total_n += end - pos
         assert total_e / total_n >= 0.95, total_e / total_n
+
+    # One instruction stream for all 30 layers: header + stream identical
+    # byte for byte, only the tail's name string and the weights differ.
+    for other in (1, 29):
+        path = str(work / "output" / f"llama_p512_l{other}_together.axmodel")
+        for (_, m0), (_, m1) in zip(mcodes, _mcodes_of(path)):
+            _, segs = _segments(m0)
+            vec = segs[-1][0] + segs[-1][1]
+            assert len(m0) == len(m1) and m0[:vec] == m1[:vec]
+            diff = [i for i in range(vec, len(m0)) if m0[i] != m1[i]]
+            assert 1 <= len(diff) <= 24, len(diff)
+    w0 = onnx.load(layer)
+    w29 = onnx.load(str(work / "output" / "llama_p512_l29_together.axmodel"))
+    params0 = {t.name: bytes(t.raw_data) for t in w0.graph.initializer}
+    params29 = {t.name: bytes(t.raw_data) for t in w29.graph.initializer}
+    key = _params_key(w0)
+    assert len(params0[key]) == len(params29[key]) and params0[key] != params29[key]
 
 
 def test_onnx_path_llm_mcode_keeps_the_op_program_skeleton(tmp_path):
