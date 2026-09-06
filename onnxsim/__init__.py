@@ -67,10 +67,17 @@ from onnxsim.gguf_legacy_quant import (
     quantize_dequantize_q4_0,
     quantize_dequantize_q4_1,
 )
+from onnxsim.gguf_legacy_quant_5bit import (
+    apply_gguf_q5_0_quantization,
+    apply_gguf_q5_1_quantization,
+    quantize_dequantize_q5_0,
+    quantize_dequantize_q5_1,
+)
 from onnxsim.gguf_q2_k import apply_gguf_q2_k_quantization, quantize_dequantize_q2_k
 from onnxsim.gguf_q3_k import apply_gguf_q3_k_quantization, quantize_dequantize_q3_k
 from onnxsim.gguf_q5_k import apply_gguf_q5_k_quantization, quantize_dequantize_q5_k
 from onnxsim.gguf_q6_k import apply_gguf_q6_k_quantization, quantize_dequantize_q6_k
+from onnxsim.gguf_q8_0 import apply_gguf_q8_0_quantization, quantize_dequantize_q8_0
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -425,6 +432,12 @@ __all__ = [
     "apply_gguf_q4_1_quantization_cpp",
     "quantize_dequantize_q4_0",
     "quantize_dequantize_q4_1",
+    "apply_gguf_q5_0_quantization",
+    "apply_gguf_q5_1_quantization",
+    "quantize_dequantize_q5_0",
+    "quantize_dequantize_q5_1",
+    "apply_gguf_q8_0_quantization",
+    "quantize_dequantize_q8_0",
     "apply_gguf_ternary_quantization",
     "apply_gguf_ternary_quantization_cpp",
     "quantize_dequantize_ternary",
