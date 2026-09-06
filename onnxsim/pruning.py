@@ -15855,6 +15855,7 @@ def _find_conv_sk_attention_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _matmul_consumer,
             grn,
             depth_to_space,
+            sge,
         ) = _walk_to_conv_consumer(
             final_add_node.output[0],
             initializer_map,
@@ -15873,6 +15874,7 @@ def _find_conv_sk_attention_chains(graph: onnx.GraphProto) -> List[_Chain]:
             and decomposed_group_norm_num_groups is None
             and grn is None
             and depth_to_space is None
+            and sge is None
         )
         (
             consumer_node,
