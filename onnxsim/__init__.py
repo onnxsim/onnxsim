@@ -40,6 +40,7 @@ from onnxsim.calibration import (
 )
 from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
+from onnxsim.daq import apply_daq
 from onnxsim.deepseek_fp8 import apply_deepseek_fp8, quantize_dequantize_block_fp8
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
@@ -286,6 +287,7 @@ __all__ = [
     "apply_outlier_suppression",
     "apply_dsq",
     "apply_dac",
+    "apply_daq",
     "apply_deepseek_fp8",
     "quantize_dequantize_block_fp8",
     "apply_llm_int8",
