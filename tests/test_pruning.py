@@ -10871,6 +10871,506 @@ def test_structured_pruning_se_gate_declines_on_gate_channel_count_mismatch():
     np.testing.assert_array_equal(inits["Wf2"], wf2_bad)
 
 
+def test_structured_pruning_se_gate_reduce_mean_pool_matches_oracle():
+    # The two-conv fc1/fc2 bottleneck shape (unchanged from the tests above),
+    # just with its own "squeeze" pooling step traced as `ReduceMean(axes=
+    # [2, 3], keepdims=1)` instead of `GlobalAveragePool` -- confirms the
+    # `_match_se_gate_pool` extension (see `onnxsim/pruning.py`'s own
+    # "Squeeze-and-Excitation (SE) gate chains" section comment) applies to
+    # the EXISTING bottleneck shape too, independently of the separate
+    # single-fc `EffectiveSEModule` shape exercised below. `_model`'s own
+    # opset default (21) is overridden to 17: `ReduceMean`'s `axes`
+    # *attribute* form (opset 18+ moves it to an input instead, deliberately
+    # never recognized here) needs an opset that still has it. `Csq=1`
+    # (mirroring `_se_conv_model`'s own default) makes any INDEPENDENT
+    # internal fc1->fc2 chain `_find_conv_chains` might separately find and
+    # prune a deliberate no-op (`keep_count == n == 1`), isolating what this
+    # test checks to purely this section's own SE-gate mechanism.
+    Cin, C1, Csq, C2 = 3, 16, 1, 8
+    rng = np.random.default_rng(11)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wf1 = rng.standard_normal((Csq, C1, 1, 1)).astype(np.float32)
+    bf1 = rng.standard_normal((Csq,)).astype(np.float32)
+    wf2 = rng.standard_normal((C1, Csq, 1, 1)).astype(np.float32)
+    bf2 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{C2},8,8] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          gap = ReduceMean<axes=[2, 3], keepdims=1>(a0)
+          f1 = Conv<kernel_shape=[1,1]>(gap, Wf1, Bf1)
+          fa = Relu(f1)
+          f2 = Conv<kernel_shape=[1,1]>(fa, Wf2, Bf2)
+          gate = Sigmoid(f2)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wf1, "Wf1"),
+            _f32(bf1, "Bf1"),
+            _f32(wf2, "Wf2"),
+            _f32(bf2, "Bf2"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+        ],
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert len(_find_conv_se_gate_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _se_conv_keep_indices(w1, wf2, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["Wf2"], wf2[keep])
+    np.testing.assert_array_equal(inits["Wf1"], wf1[:, keep])
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+
+    rng_x = np.random.default_rng(202)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{C2},8,8] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          gap = ReduceMean<axes=[2, 3], keepdims=1>(a0)
+          f1 = Conv<kernel_shape=[1,1]>(gap, Wf1, Bf1)
+          fa = Relu(f1)
+          f2 = Conv<kernel_shape=[1,1]>(fa, Wf2, Bf2)
+          gate = Sigmoid(f2)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1[keep], "W1"),
+            _f32(b1[keep], "B1"),
+            _f32(wf1[:, keep], "Wf1"),
+            _f32(bf1, "Bf1"),
+            _f32(wf2[keep], "Wf2"),
+            _f32(bf2[keep], "Bf2"),
+            _f32(w2[:, keep], "W2"),
+            _f32(b2, "B2"),
+        ],
+        opset=17,
+    )
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- apply_structured_pruning: EffectiveSEModule (ESE) gate chains ----------
+# (single fc, no bottleneck)
+#
+# timm's own `EffectiveSEModule` ("ESE" gate -- `timm/layers/
+# squeeze_excite.py`, used by VoVNetV2, CenterMask, TResNet) -- confirmed
+# live via a real `torch.onnx.export` of a verbatim reproduction of that
+# class's own `forward` (`add_maxpool=False`, its own default; `timm` itself
+# is not importable in this environment -- an unrelated broken
+# `torchvision` blocks `import timm` -- so the class's own `forward`/`fc`/
+# `gate` were hand-copied directly off `timm/layers/squeeze_excite.py`'s own
+# source, read straight from site-packages):
+#
+#     x_se = x.mean((2, 3), keepdim=True)
+#     x_se = self.fc(x_se)
+#     return x * self.gate(x_se)
+#
+# i.e. `conv1 -> {ReduceMean(axes=[2,3], keepdims=1) -> fc (a SINGLE
+# Conv1x1, in_channels == out_channels == n_channels -- no fc1/fc2
+# bottleneck at all) -> {HardSigmoid, Sigmoid}} -> Mul(gate, conv1_out) ->
+# conv2` -- see `onnxsim/pruning.py`'s own "Squeeze-and-Excitation (SE) gate
+# chains" section comment (the two extensions documented right before
+# `_match_conv_se_gate`) for the full matched/declined topology this
+# exercises. `fc`'s own weight needs BOTH axes (output AND input channel)
+# sliced by the identical shared keep-set -- the "square, identity-shaped
+# channel map" these tests lock in.
+#
+# Needs opset <= 17 (`_model`'s own default is 21): `ReduceMean`'s `axes`
+# *attribute* form (opset 18+ moves it to an input instead, deliberately
+# never recognized).
+
+
+def _ese_keep_indices(w1, wfc, keep_count):
+    # Same paired-importance formula as `_se_conv_keep_indices`, just with
+    # `fc`'s own OUTPUT row (its producer role) standing in for fc2's own.
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(w1.reshape(w1.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(wfc.reshape(wfc.shape[0], -1).astype(np.float64), axis=1)
+        )
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _ese_conv_model(
+    Cin=3,
+    C1=16,
+    C2=8,
+    gate_final_activation="HardSigmoid",
+    reduce_axes="[2, 3]",
+    reduce_keepdims=1,
+    fc_out_channels=None,
+    fc_in_channels=None,
+    seed=0,
+    spatial=8,
+):
+    rng = np.random.default_rng(seed)
+    fc_out_channels = C1 if fc_out_channels is None else fc_out_channels
+    fc_in_channels = C1 if fc_in_channels is None else fc_in_channels
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wfc = rng.standard_normal((fc_out_channels, fc_in_channels, 1, 1)).astype(
+        np.float32
+    )
+    bfc = rng.standard_normal((fc_out_channels,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          pooled = ReduceMean<axes={reduce_axes}, keepdims={reduce_keepdims}>(a0)
+          fc_out = Conv<kernel_shape=[1,1]>(pooled, Wfc, Bfc)
+          gate = {gate_final_activation}(fc_out)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wfc, "Wfc"),
+            _f32(bfc, "Bfc"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+        ],
+        opset=17,
+    )
+    return model, w1, b1, wfc, bfc, w2, b2
+
+
+def test_structured_pruning_ese_gate_matches_oracle():
+    # `HardSigmoid` is `EffectiveSEModule`'s own documented default
+    # (`gate_layer='hard_sigmoid'` in timm's own source).
+    Cin, C1, C2 = 3, 16, 8
+    model, w1, b1, wfc, bfc, w2, b2 = _ese_conv_model(Cin=Cin, C1=C1, C2=C2)
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert len(_find_conv_se_gate_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _ese_keep_indices(w1, wfc, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # conv1's own output channels, sliced.
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["B1"], b1[keep])
+    # `fc`'s own weight needs BOTH axes sliced by the SAME keep-set: output
+    # channels (the co-sliced-producer role, tied to conv1's own) AND input
+    # channels (the extra fan-out consumer role, fed by the pooled spine).
+    np.testing.assert_array_equal(inits["Wfc"], wfc[keep][:, keep])
+    np.testing.assert_array_equal(inits["Bfc"], bfc[keep])
+    # conv2's own input channels, sliced by the same keep-set.
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+    np.testing.assert_array_equal(inits["B2"], b2)
+
+    rng = np.random.default_rng(300)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _ese_conv_model(Cin=Cin, C1=C1 // 2, C2=C2)
+    oracle_inits = {
+        "W1": w1[keep],
+        "B1": b1[keep],
+        "Wfc": wfc[keep][:, keep],
+        "Bfc": bfc[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_ese_gate_sigmoid_matches_oracle():
+    # Plain `Sigmoid` (`gate_layer='sigmoid'`) is also a valid,
+    # already-recognized final gate activation (mirrors
+    # `_match_conv_se_gate`'s own tolerance for either).
+    Cin, C1, C2 = 3, 12, 6
+    model, w1, b1, wfc, bfc, w2, b2 = _ese_conv_model(
+        Cin=Cin, C1=C1, C2=C2, gate_final_activation="Sigmoid", seed=13
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _ese_keep_indices(w1, wfc, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["Wfc"], wfc[keep][:, keep])
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+
+    rng = np.random.default_rng(301)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _ese_conv_model(
+        Cin=Cin, C1=C1 // 2, C2=C2, gate_final_activation="Sigmoid"
+    )
+    oracle_inits = {
+        "W1": w1[keep],
+        "B1": b1[keep],
+        "Wfc": wfc[keep][:, keep],
+        "Bfc": bfc[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_ese_gate_declines_on_wrong_reduce_axes():
+    # SIMILAR but not quite the confirmed shape: the pooling step reduces
+    # the wrong axes (`[1, 2]` instead of the spatial `[2, 3]`) -- a
+    # perfectly valid `ReduceMean`, just not the channel-preserving
+    # "squeeze" this section's own pooling-equivalence check
+    # (`_match_se_gate_pool`/`_reduce_hw_axes_keepdims1`) requires. Locks in
+    # the conservative "decline outright" bar: `conv1`/`conv2`/`fc` must all
+    # come back completely untouched.
+    Cin, C1, C2 = 3, 16, 8
+    model, w1, b1, wfc, bfc, w2, b2 = _ese_conv_model(
+        Cin=Cin, C1=C1, C2=C2, reduce_axes="[1, 2]"
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Wfc"], wfc)
+
+
+def test_structured_pruning_ese_gate_declines_on_keepdims_zero():
+    # SIMILAR but not quite the confirmed shape: `keepdims=0` -- the correct
+    # spatial axes, but an output shape (`[N, C]`) that isn't actually
+    # equivalent to `GlobalAveragePool`'s own (`[N, C, 1, 1]`), and isn't
+    # even a valid 4-D `Conv` input in the first place (worked around here
+    # with an `Unsqueeze`x2 back to `[N, C, 1, 1]` so the graph stays valid
+    # ONNX, but that reinsertion is not a shape this matcher's `ReduceMean`
+    # check itself ever looks past).
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(21)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wfc = rng.standard_normal((C1, C1, 1, 1)).astype(np.float32)
+    bfc = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{C2},8,8] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          pooled0 = ReduceMean<axes=[2, 3], keepdims=0>(a0)
+          pooled1 = Unsqueeze(pooled0, ax2)
+          pooled = Unsqueeze(pooled1, ax3)
+          fc_out = Conv<kernel_shape=[1,1]>(pooled, Wfc, Bfc)
+          gate = HardSigmoid(fc_out)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wfc, "Wfc"),
+            _f32(bfc, "Bfc"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+            onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "ax2"),
+            onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "ax3"),
+        ],
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["Wfc"], wfc)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_ese_gate_declines_on_opset18_reduce_mean_axes_input():
+    # opset 18+ moves `ReduceMean`'s own `axes` from an attribute to an
+    # optional *input* -- a deliberately different, never-guessed-at form
+    # (mirroring `_reduce_channel_axis_keepdims`'s own identical opset
+    # scoping elsewhere in this module): declined outright even though the
+    # actual reduction is otherwise the exact right shape.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(23)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wfc = rng.standard_normal((C1, C1, 1, 1)).astype(np.float32)
+    bfc = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    axes = onnx.numpy_helper.from_array(np.array([2, 3], dtype=np.int64), "ReduceAxes")
+    model = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{C2},8,8] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          pooled = ReduceMean<keepdims=1>(a0, ReduceAxes)
+          fc_out = Conv<kernel_shape=[1,1]>(pooled, Wfc, Bfc)
+          gate = HardSigmoid(fc_out)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wfc, "Wfc"),
+            _f32(bfc, "Bfc"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+            axes,
+        ],
+        opset=21,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["Wfc"], wfc)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_ese_gate_declines_on_fc_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: `fc`'s own out_channels
+    # (`C1 // 2`) doesn't match `conv1`'s own `C1` -- the "square,
+    # identity-shaped channel map" `_match_conv_ese_gate` requires
+    # (in_channels == out_channels == n_channels) is broken. A legitimate,
+    # broadcastable `Conv` (its own output would need to broadcast against
+    # `a0`'s `C1` channels in the closing `Mul`, which wouldn't even be
+    # shape-valid unless `C1 // 2` broadcasts -- here it plainly doesn't
+    # divide `Mul`'s broadcast rules the intended way, so this is simply not
+    # a real network, only a matcher stress-test), locking in the
+    # conservative "decline outright" bar.
+    Cin, C1, C2 = 3, 16, 8
+    model, w1, b1, wfc, bfc, w2, b2 = _ese_conv_model(
+        Cin=Cin, C1=C1, C2=C2, fc_out_channels=C1 // 2
+    )
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["Wfc"], wfc)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_ese_gate_declines_on_extra_spine_consumer():
+    # SIMILAR but not quite the confirmed shape: `spine` (`a0`) has a THIRD
+    # consumer beyond the pooling node and the closing `Mul` -- declined
+    # outright, mirroring `_match_conv_se_gate`'s own "exactly two
+    # consumers" bar (`_match_conv_ese_gate` requires `len(spine_consumers)
+    # == 2` up front).
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(29)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wfc = rng.standard_normal((C1, C1, 1, 1)).astype(np.float32)
+    bfc = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{C2},8,8] Y, float[N,{C1},8,8] Extra)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          pooled = ReduceMean<axes=[2, 3], keepdims=1>(a0)
+          fc_out = Conv<kernel_shape=[1,1]>(pooled, Wfc, Bfc)
+          gate = HardSigmoid(fc_out)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+          Extra = Identity(a0)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wfc, "Wfc"),
+            _f32(bfc, "Bfc"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+        ],
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["Wfc"], wfc)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
 # --- apply_structured_pruning: CBAM ChannelGate chains ----------------------
 #
 # See onnxsim/pruning.py's own "CBAM ChannelGate chains" section comment for

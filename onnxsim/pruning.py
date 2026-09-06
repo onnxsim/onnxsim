@@ -10517,6 +10517,163 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #     run, or the gate subnetwork itself) with anything other than exactly
 #     one consumer, or that is itself a graph output, declines the WHOLE
 #     match -- never a partial slice.
+#
+# Two extensions to the above, both needed together to recognize timm's own
+# `EffectiveSEModule` ("ESE" gate -- `timm/layers/squeeze_excite.py`, used by
+# VoVNetV2, CenterMask, and TResNet) -- confirmed live via a real
+# `torch.onnx.export` of a verbatim reproduction of that class's own
+# `forward` (`add_maxpool=False`, its own default; see
+# `tests/test_pruning.py`'s own fixture for the captured
+# `onnx.printer.to_text` graph):
+#
+#     x_se = x.mean((2, 3), keepdim=True)
+#     x_se = self.fc(x_se)
+#     return x * self.gate(x_se)
+#
+# i.e. `ReduceMean(spine, axes=[2,3], keepdims=1) -> fc (a SINGLE Conv1x1,
+# in_channels == out_channels == n_channels -- no bottleneck at all, unlike
+# ordinary SE's fc1/fc2 pair) -> {HardSigmoid, Sigmoid} -> Mul(spine, gate)`.
+# Without either extension below, `EffectiveSEModule`'s own producer Conv is
+# left completely unpruned by this section (confirmed empirically -- see
+# `tests/test_pruning.py`'s own ESE fixture): `_match_conv_se_gate` declines
+# outright, on two INDEPENDENT, compounding grounds.
+#
+#   1. Pooling-op recognition: `EffectiveSEModule` traces `x.mean((2, 3),
+#      keepdim=True)` as a plain `ReduceMean`, never `GlobalAveragePool` (the
+#      op `torchvision.ops.SqueezeExcitation`'s own `nn.AdaptiveAvgPool2d(1)`
+#      traces to instead). :func:`_match_se_gate_pool` below recognizes
+#      EITHER: a literal `GlobalAveragePool`, or a `ReduceMean` reducing
+#      exactly the two trailing spatial axes with `keepdims=1` -- mirroring
+#      this module's own established precedent for treating a shape-matched
+#      `ReduceMean` as a named-pool equivalent (see
+#      `_reduce_channel_axis_keepdims`'s own docstring, used by the CBAM
+#      `SpatialGate` hop elsewhere in this module for an analogous
+#      channel-axis reduction) -- just for the *spatial* axes here (`[2, 3]`
+#      or their negative-index equivalent `[-2, -1]`) rather than the
+#      channel one. Only opset<=17's attribute-based `axes` form is ever
+#      recognized -- opset 18+'s input-based `axes` form is a deliberately
+#      different, never-guessed-at shape, mirroring
+#      `_reduce_channel_axis_keepdims`'s/`_reduce_mean_axis_is_last`'s own
+#      identical opset scoping throughout this module. A `keepdims=0`
+#      `ReduceMean` (output shape `[N, C]`, not `GlobalAveragePool`'s own
+#      `[N, C, 1, 1]`) is declined too -- not equivalent, and not even a
+#      valid `Conv` input in the first place.
+#   2. Shape recognition: `EffectiveSEModule` has no fc1/fc2 bottleneck pair
+#      at all -- just the ONE `fc` Conv, feeding the gate activation
+#      directly. :func:`_match_conv_ese_gate` below is this shape's own
+#      dedicated matcher (kept separate from :func:`_match_conv_se_gate`
+#      rather than folded into it -- the two topologies, and their two return
+#      shapes, are different enough that one shared function would need its
+#      own internal branch on which shape it ended up matching anyway):
+#      `spine`'s own two consumers must be exactly the pooling node (either
+#      form above) and the closing `Mul` -- no fc1, no bottleneck activation.
+#      The pooling node's own single-consumer output feeds `fc` (`Conv(1x1,
+#      group=1)`, via :func:`_match_conv_producer`/:func:`_match_conv_consumer`
+#      BOTH agreeing on the SAME weight -- `fc`'s own in_channels AND
+#      out_channels must each independently equal `n_channels` exactly: the
+#      "square, identity-shaped channel map" this module's own architectural
+#      comment above describes), which feeds exactly one `{Sigmoid,
+#      HardSigmoid}` (mirroring `_match_conv_se_gate`'s own tolerance for
+#      either), whose own output must be the `Mul`'s own `gate_out` operand.
+#
+#      Representation: `fc` needs BOTH its weight's output-channel axis (0)
+#      AND input-channel axis (1) sliced by the identical shared `keep` set
+#      -- a single "co-sliced producer" whose own weight also needs slicing
+#      as a consumer of that same shared set, unlike every other role in this
+#      module (a `_Producer`'s own weight only ever needs axis 0 touched, a
+#      consumer's only ever axis 1). Rather than inventing a new hop/carrier
+#      type for this, `fc` is registered TWICE on the very same
+#      :class:`_Chain` under the two roles this module already has a
+#      mechanism for: once as an ordinary co-sliced `_Producer` (alongside
+#      `P` -- ties `fc`'s own OUTPUT-channel axis to the shared `keep` set,
+#      exactly like `_match_conv_se_gate`'s own fc2), and once more as an
+#      extra fan-out `_ConsumerBranch` (exactly like `_match_conv_se_gate`'s
+#      own fc1 branch -- ties `fc`'s own INPUT-channel axis to the identical
+#      `keep` set). :func:`_apply_chains`/:func:`_slice_chain_channels`
+#      already handle a weight legitimately playing both a producer role and
+#      a (separately named-and-touched) consumer role with no changes needed
+#      at all -- see :func:`_apply_chains`'s own docstring for why that's
+#      already safe in general (a tied weight playing two independent axes'
+#      worth of role, `producer_touched`/`consumer_touched` tracked
+#      separately) -- and the actual two-step slice composes correctly by
+#      construction: the producer step slices axis 0 of `fc`'s weight first
+#      (axis 1 untouched, still its original full width), then the extra
+#      fan-out consumer step slices that already-axis-0-sliced weight's axis
+#      1 by the SAME `keep` array -- yielding the exact square co-sliced
+#      result with no dedicated two-axis-same-index-set machinery required.
+#      `fc`'s own bias is sliced exactly once, via its ordinary producer role
+#      (an extra consumer branch has no bias field of its own to double-slice
+#      it with).
+#
+#      Declined, conservatively, exactly like `_match_conv_se_gate`'s own
+#      bar: a non-square `fc` (in_channels != out_channels, or either != `P`'s
+#      own `n_channels`) -- the genuine two-conv bottleneck shape above still
+#      matches via `_match_conv_se_gate` unaffected, this is a strictly
+#      additional shape, not a replacement -- a grouped `fc` (`group != 1`),
+#      a non-1x1 `fc` kernel, more than the confirmed 2 consumers on `spine`,
+#      any op other than `Sigmoid`/`HardSigmoid` as the final gate activation,
+#      or any intermediate tensor along the way with anything other than
+#      exactly one consumer / being itself a graph output.
+
+
+def _reduce_hw_axes_keepdims1(node: onnx.NodeProto, input_name: str) -> bool:
+    """True iff `node` is a plain (default-domain) ``ReduceMean`` reading
+    exactly `input_name`, with an ``axes`` *attribute* (opset <= 17's schema
+    -- opset 18+ moves it to an optional *input* instead, a form
+    deliberately never recognized here, mirroring
+    `_reduce_channel_axis_keepdims`'s own identical opset scoping and for the
+    same reason: not a shape confirmed live against a real export) naming
+    exactly the two trailing spatial axes -- ``[2, 3]`` (the literal form a
+    real ``x.mean((2, 3), keepdim=True)`` export produces) or their
+    negative-index equivalent ``[-2, -1]`` -- with ``keepdims=1`` (the only
+    value whose output shape, ``[N, C, 1, 1]``, is actually equivalent to
+    ``GlobalAveragePool``'s own; ``keepdims=0``'s ``[N, C]`` is a different
+    shape entirely, not even a valid `Conv` input, and is declined). Declines
+    (``False``) on anything else: a missing/differently-valued ``axes``, a
+    non-1 ``keepdims``, a differently-shaped `node.input`, or a multi-output
+    node.
+    """
+    if (
+        node.op_type != "ReduceMean"
+        or node.domain != ""
+        or list(node.input) != [input_name]
+        or len(node.output) != 1
+        or not node.output[0]
+    ):
+        return False
+    axes_attr: Optional[List[int]] = None
+    keepdims = 1
+    for attr in node.attribute:
+        if attr.name == "axes":
+            axes_attr = list(attr.ints)
+        elif attr.name == "keepdims":
+            keepdims = attr.i
+    if axes_attr is None or list(axes_attr) not in ([2, 3], [-2, -1]):
+        return False
+    return keepdims == 1
+
+
+def _match_se_gate_pool(node: onnx.NodeProto, input_name: str) -> bool:
+    """True iff `node` is the SE "squeeze" pooling step -- either a literal
+    ``GlobalAveragePool`` reading exactly `input_name` (`torchvision.ops.
+    SqueezeExcitation`'s own shape, an `nn.AdaptiveAvgPool2d(1)` export), or
+    a `ReduceMean`-based equivalent (:func:`_reduce_hw_axes_keepdims1`, timm's
+    own `SEModule`/`EffectiveSEModule` shape, an
+    ``x.mean((2, 3), keepdim=True)`` export) -- both collapse every spatial
+    position of `input_name` into a single per-channel average, the
+    ``[N, C, 1, 1]``-shaped step every gate shape in this section needs,
+    whichever literal op the exporter happened to emit it as. Used by both
+    :func:`_match_conv_se_gate` (the two-conv fc1/fc2 bottleneck shape) and
+    :func:`_match_conv_ese_gate` (the single-fc no-bottleneck shape) below.
+    """
+    if (
+        node.op_type == "GlobalAveragePool"
+        and node.domain == ""
+        and list(node.input) == [input_name]
+        and len(node.output) == 1
+    ):
+        return True
+    return _reduce_hw_axes_keepdims1(node, input_name)
 
 
 def _match_conv_se_gate(
@@ -10528,7 +10685,7 @@ def _match_conv_se_gate(
     n_channels: int,
 ) -> Optional[
     Tuple[
-        onnx.NodeProto,  # GlobalAveragePool
+        onnx.NodeProto,  # GlobalAveragePool (or ReduceMean equivalent)
         onnx.NodeProto,  # fc1 Conv node (gate subnetwork's own squeeze layer)
         str,  # fc1 weight name
         onnx.NodeProto,  # Mul (the self-gating combine)
@@ -10540,9 +10697,13 @@ def _match_conv_se_gate(
 ]:
     """If `spine`'s own two consumers (`spine_consumers`) form the SE
     "squeeze -> excite" gate shape this section's own comment above
-    describes, returns ``(gap_node, fc1_node, fc1_weight, mul_node, fc2_node,
-    fc2_weight, fc2_bias, gate_activation_node)``. Declines (``None``) on any
-    deviation -- see that comment for the exact, narrow bar.
+    describes -- the two-conv fc1/fc2 bottleneck shape, matching either a
+    literal `GlobalAveragePool` or a `ReduceMean`-based equivalent pooling
+    step (:func:`_match_se_gate_pool`) -- returns ``(gap_node, fc1_node,
+    fc1_weight, mul_node, fc2_node, fc2_weight, fc2_bias,
+    gate_activation_node)``. Declines (``None``) on any deviation -- see that
+    comment for the exact, narrow bar. See :func:`_match_conv_ese_gate` for
+    the sibling single-fc, no-bottleneck shape this function does NOT match.
     """
     if len(spine_consumers) != 2:
         return None
@@ -10564,12 +10725,7 @@ def _match_conv_se_gate(
         )
         if gate_out in initializer_map:
             continue
-        if not (
-            gap_node.op_type == "GlobalAveragePool"
-            and gap_node.domain == ""
-            and list(gap_node.input) == [spine]
-            and len(gap_node.output) == 1
-        ):
+        if not _match_se_gate_pool(gap_node, spine):
             continue
 
         gap_out = gap_node.output[0]
@@ -10645,17 +10801,126 @@ def _match_conv_se_gate(
     return None
 
 
+def _match_conv_ese_gate(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # pooling node (GlobalAveragePool or ReduceMean equivalent)
+        onnx.NodeProto,  # Mul (the self-gating combine)
+        onnx.NodeProto,  # fc Conv node (BOTH the gate producer AND consumer)
+        str,  # fc weight name
+        Optional[str],  # fc bias name
+        onnx.NodeProto,  # trailing Sigmoid/HardSigmoid gate activation
+    ]
+]:
+    """If `spine`'s own two consumers (`spine_consumers`) form timm's own
+    `EffectiveSEModule` ("ESE" gate) shape -- see this section's own comment
+    above for the full empirical finding -- returns ``(pool_node, mul_node,
+    fc_node, fc_weight, fc_bias, gate_activation_node)``. Declines (``None``)
+    on any deviation. Unlike :func:`_match_conv_se_gate`'s two-conv fc1/fc2
+    bottleneck, there is no bottleneck here at all: a SINGLE `fc` Conv (own
+    in_channels == own out_channels == `n_channels` exactly, group == 1)
+    feeds the gate activation directly.
+    """
+    if len(spine_consumers) != 2:
+        return None
+    for mul_node, pool_node in (
+        (spine_consumers[0], spine_consumers[1]),
+        (spine_consumers[1], spine_consumers[0]),
+    ):
+        if not (
+            mul_node.op_type == "Mul"
+            and mul_node.domain == ""
+            and len(mul_node.input) == 2
+            and len(mul_node.output) == 1
+            and spine in mul_node.input
+            and mul_node.input[0] != mul_node.input[1]
+        ):
+            continue
+        gate_out = (
+            mul_node.input[1] if mul_node.input[0] == spine else mul_node.input[0]
+        )
+        if gate_out in initializer_map:
+            continue
+        if not _match_se_gate_pool(pool_node, spine):
+            continue
+
+        pool_out = pool_node.output[0]
+        if pool_out in graph_outputs or len(consumers_of.get(pool_out, [])) != 1:
+            continue
+        fc_node = consumers_of[pool_out][0]
+        # `fc` must be a plain `group=1` Conv whose own in_channels AND
+        # out_channels BOTH equal `n_channels` exactly -- the "square,
+        # identity-shaped channel map" this section's own comment above
+        # describes. Checked via both `_match_conv_producer` (out_channels,
+        # for the co-sliced-producer role below) and `_match_conv_consumer`
+        # (in_channels, for the extra-fan-out-consumer role below) agreeing
+        # on the identical weight -- a general grouped `fc` is declined
+        # outright (`group != 1`), mirroring `_match_conv_se_gate`'s own
+        # fc1/fc2 restriction.
+        fc_producer_match = _match_conv_producer(fc_node, initializer_map)
+        if (
+            fc_producer_match is None
+            or fc_producer_match[2] != n_channels
+            or fc_producer_match[3] != 1
+            or fc_node.input[0] != pool_out
+        ):
+            continue
+        fc_weight, fc_bias, _fc_out_channels, _fc_group = fc_producer_match
+        fc_consumer_match = _match_conv_consumer(fc_node, initializer_map)
+        if (
+            fc_consumer_match is None
+            or fc_consumer_match[0] != fc_weight
+            or fc_consumer_match[1] != n_channels
+            or fc_consumer_match[2] != 1
+        ):
+            continue
+        fc_w_init = initializer_map[fc_weight]
+        if any(d != 1 for d in fc_w_init.dims[2:]):
+            continue  # not a 1x1 (or equivalent) conv -- declined
+
+        fc_out = fc_node.output[0]
+        if fc_out in graph_outputs or len(consumers_of.get(fc_out, [])) != 1:
+            continue
+        gate_act_node = consumers_of[fc_out][0]
+        if not (
+            gate_act_node.op_type in ("Sigmoid", "HardSigmoid")
+            and gate_act_node.domain == ""
+            and list(gate_act_node.input) == [fc_out]
+            and len(gate_act_node.output) == 1
+        ):
+            continue
+        if gate_act_node.output[0] != gate_out:
+            continue
+
+        return (pool_node, mul_node, fc_node, fc_weight, fc_bias, gate_act_node)
+
+    return None
+
+
 def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
     """Finds Squeeze-and-Excitation gate blocks -- see this section's own
-    comment above for the exact topology matched and declined. Every match
-    produces one `_Chain` with TWO producers (`P`, the block's own input
-    Conv, and fc2, the gate subnetwork's own final Conv -- both forced to
-    the same output-channel keep set, exactly like an ordinary gated-pair
-    chain already ties two producers together for `_find_gated_chains`), one
+    comment above for the exact topology matched and declined, in either of
+    two shapes: `_match_conv_se_gate`'s two-conv fc1/fc2 bottleneck
+    (torchvision/MobileNetV3-style SE), tried first, or -- only if that
+    declines -- `_match_conv_ese_gate`'s single-fc, no-bottleneck shape
+    (timm's `EffectiveSEModule`). Every match produces one `_Chain` with TWO
+    producers (`P`, the block's own input Conv, and the gate subnetwork's
+    own final gate-producing Conv -- fc2 for the bottleneck shape, the sole
+    `fc` for the no-bottleneck shape -- both forced to the same
+    output-channel keep set, exactly like an ordinary gated-pair chain
+    already ties two producers together for `_find_gated_chains`), one
     ordinary consumer (the real downstream Conv/ConvTranspose the closing
-    `Mul` feeds), and one extra fan-out branch (fc1, the gate subnetwork's
-    own squeeze layer, whose INPUT axis needs the identical keep set even
-    though its own output/squeeze-bottleneck axis is left untouched).
+    `Mul` feeds), and one extra fan-out branch (fc1 for the bottleneck shape,
+    or -- for the no-bottleneck shape -- the SAME `fc` weight again, this
+    time in its consumer role, whose INPUT axis needs the identical keep
+    set; fc1's own output/squeeze-bottleneck axis, for the bottleneck shape,
+    is left untouched).
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -10701,7 +10966,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if spine is None:
             continue
 
-        match = _match_conv_se_gate(
+        se_match = _match_conv_se_gate(
             spine,
             spine_consumers,
             initializer_map,
@@ -10709,18 +10974,83 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             graph_outputs,
             n_channels,
         )
-        if match is None:
-            continue
-        (
-            gap_node,
-            fc1_node,
-            fc1_weight,
-            mul_node,
-            fc2_node,
-            fc2_weight,
-            fc2_bias,
-            gate_act_node,
-        ) = match
+        ese_match = None
+        if se_match is None:
+            # Fall back to the shorter, no-bottleneck `EffectiveSEModule`
+            # shape (see this section's own comment above) -- strictly
+            # additional, never instead of the two-conv shape above.
+            ese_match = _match_conv_ese_gate(
+                spine,
+                spine_consumers,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                n_channels,
+            )
+            if ese_match is None:
+                continue
+
+        if se_match is not None:
+            (
+                gap_node,
+                fc1_node,
+                fc1_weight,
+                mul_node,
+                fc2_node,
+                fc2_weight,
+                fc2_bias,
+                gate_act_node,
+            ) = se_match
+            gate_producer_node = fc2_node
+            gate_producer_weight = fc2_weight
+            gate_producer_bias = fc2_bias
+            extra_consumers = (
+                _ConsumerBranch(
+                    chain_ops=((gap_node, None),),
+                    consumer_node=fc1_node,
+                    consumer_weight=fc1_weight,
+                    consumer_weight_transposed=False,
+                    consumer_is_conv=True,
+                    consumer_group=1,
+                ),
+            )
+            # All FOUR roles (`P`, fc1, fc2, the real downstream consumer)
+            # must name distinct weights -- an accidental/tied share between
+            # any two is not the confirmed real shape.
+            role_weights_before_consumer = {w_name, fc2_weight, fc1_weight}
+            expected_distinct = 4
+        else:
+            assert ese_match is not None
+            (pool_node, mul_node, fc_node, fc_weight, fc_bias, gate_act_node) = (
+                ese_match
+            )
+            gate_producer_node = fc_node
+            gate_producer_weight = fc_weight
+            gate_producer_bias = fc_bias
+            # `fc` plays BOTH the co-sliced-producer role (its own
+            # OUTPUT-channel axis) and, via this extra fan-out branch, the
+            # consumer role (its own INPUT-channel axis) -- see this
+            # section's own comment above for why registering the identical
+            # weight under both of this module's own existing role
+            # mechanisms, rather than inventing a new one, already slices
+            # both axes correctly.
+            extra_consumers = (
+                _ConsumerBranch(
+                    chain_ops=((pool_node, None),),
+                    consumer_node=fc_node,
+                    consumer_weight=fc_weight,
+                    consumer_weight_transposed=False,
+                    consumer_is_conv=True,
+                    consumer_group=1,
+                ),
+            )
+            # Only THREE distinct roles here (`P`, `fc` -- once, even though
+            # it plays two roles -- and the real downstream consumer): `fc`
+            # is deliberately not double-counted the way the two-conv
+            # shape's fc1/fc2 are, since it is genuinely the same weight
+            # playing both of its own two roles on purpose.
+            role_weights_before_consumer = {w_name, fc_weight}
+            expected_distinct = 3
 
         mul_out = mul_node.output[0]
         if mul_out in graph_outputs or len(consumers_of.get(mul_out, [])) != 1:
@@ -10762,7 +11092,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             consumer_is_conv_transpose,
         ) = consumer
 
-        if len({w_name, fc2_weight, fc1_weight, consumer_weight}) != 4:
+        if len(role_weights_before_consumer | {consumer_weight}) != expected_distinct:
             continue  # a tied/shared weight across roles -- decline
 
         chains.append(
@@ -10777,10 +11107,10 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
                         is_conv=True,
                     ),
                     _Producer(
-                        fc2_node,
-                        fc2_weight,
+                        gate_producer_node,
+                        gate_producer_weight,
                         False,
-                        fc2_bias,
+                        gate_producer_bias,
                         pre_ops=(gate_act_node,),
                         is_conv=True,
                     ),
@@ -10794,16 +11124,7 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 conv_pass_through=conv_pass_through,
                 consumer_group=consumer_group,
                 consumer_is_conv_transpose=consumer_is_conv_transpose,
-                extra_consumers=(
-                    _ConsumerBranch(
-                        chain_ops=((gap_node, None),),
-                        consumer_node=fc1_node,
-                        consumer_weight=fc1_weight,
-                        consumer_weight_transposed=False,
-                        consumer_is_conv=True,
-                        consumer_group=1,
-                    ),
-                ),
+                extra_consumers=extra_consumers,
             )
         )
     return chains
