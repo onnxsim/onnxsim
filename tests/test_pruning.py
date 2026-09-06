@@ -7726,6 +7726,276 @@ def test_structured_pruning_native_and_decomposed_group_norm_still_supported_tog
     assert instance_dims["W1"][0] < C1
 
 
+# --- Conv chain: DepthToSpace (PixelShuffle) pass-through hop ---------------
+#
+# ``Conv -> DepthToSpace<mode="CRD">(...) -> Conv`` -- what `torch.onnx.export`
+# of `nn.PixelShuffle` (sub-pixel/"pixel shuffle" upsampling, the
+# ESPCN-style super-resolution/decoder-head shape) emits, confirmed live via
+# a real export (both the legacy TorchScript-based and the newer
+# `torch.export`-based/"dynamo" exporters agree exactly, opset 17,
+# checker-passed, `2.98e-07` max abs diff against the PyTorch reference) --
+# see `onnxsim.pruning._DEPTH_TO_SPACE_PASS_THROUGH_OP`'s own comment for
+# the full empirical shape and this hop's scope.
+def _pixel_shuffle_conv_pair_model(w1, w2, blocksize, mode="CRD", b1=None, spatial=10):
+    """`w1` -> `Conv` -> `DepthToSpace<blocksize, mode>` -> `Conv` -> `w2`.
+    `w1`'s own output-channel count must already be `C * blocksize**2` for
+    some `C`, and `w2`'s own input-channel count must already be that same
+    `C` -- the caller's own responsibility, the same convention every other
+    ``_..._conv_pair_model`` builder in this file already has for its own
+    weight shapes lining up.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    conv1_out_spatial = spatial - 2  # one valid (no-pad) 3x3 conv
+    d2s_out_spatial = conv1_out_spatial * blocksize
+    final_spatial = d2s_out_spatial - 2  # one valid (no-pad) 3x3 conv
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{final_spatial},{final_spatial}] Y)
+        {{
+          {conv1}
+          d = DepthToSpace<blocksize={blocksize}, mode="{mode}">(h)
+          Y = Conv<kernel_shape=[3,3]>(d, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _oracle_keep_indices_depth_to_space(w, blocksize, sparsity):
+    """The block-aware analogue of `_oracle_keep_indices_conv`:
+    `w`'s axis-0 output-channel count (the producing Conv's own physical
+    channels) splits into `C = out_channels // blocksize**2` contiguous
+    blocks of `blocksize**2` channels each -- DepthToSpace's own CRD
+    reshape, see `onnxsim.pruning._DEPTH_TO_SPACE_PASS_THROUGH_OP`'s own
+    comment -- each block ranked, and kept/dropped as one whole unit
+    (never partially), by the *sum* of its own channels' L2 norms,
+    mirroring `onnxsim.pruning._chain_importance`'s own block reduction. A
+    from-scratch reimplementation, not a call into it, so this is a real
+    check on the algorithm. Returns `(physical_keep, logical_keep)`:
+    `physical_keep` (indices into `w`'s own axis 0) slices the producing
+    Conv's weight/bias, `logical_keep` (indices into `0..C-1`) slices the
+    consuming Conv's own input-channel axis.
+    """
+    block = blocksize * blocksize
+    out_channels = w.shape[0]
+    C = out_channels // block
+    per_channel = np.linalg.norm(w.reshape(out_channels, -1).astype(np.float64), axis=1)
+    block_importance = per_channel.reshape(C, block).sum(axis=1)
+    keep_count = max(1, round(C * (1.0 - sparsity)))
+    logical_keep = np.sort(np.argsort(-block_importance)[:keep_count])
+    physical_keep = (logical_keep[:, None] * block + np.arange(block)[None, :]).reshape(
+        -1
+    )
+    return physical_keep, logical_keep
+
+
+def test_structured_pruning_depth_to_space_pass_through_matches_oracle_exactly():
+    # THE key correctness bar for this hop, same as every other Conv-chain
+    # hop's own oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model -- not "close". Pruning
+    # must respect the `blocksize**2`-channel block granularity (see
+    # `_DEPTH_TO_SPACE_PASS_THROUGH_OP`'s own comment for why a partial
+    # block would silently corrupt the output), so the oracle's own "keep"
+    # selection picks whole blocks, ranked by the sum of each block's own
+    # channels' L2 norms -- `_oracle_keep_indices_depth_to_space` above.
+    Cin, C, r, C2 = 3, 4, 2, 5
+    rng = np.random.default_rng(200)
+    w1 = rng.standard_normal((C * r * r, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C * r * r,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C, 3, 3)).astype(np.float32)
+    model = _pixel_shuffle_conv_pair_model(w1, w2, blocksize=r, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] < C * r * r  # actually pruned, not a no-op
+    assert dims_after["W1"][0] % (r * r) == 0  # whole blocks only
+
+    physical_keep, logical_keep = _oracle_keep_indices_depth_to_space(w1, r, 0.5)
+    oracle = _pixel_shuffle_conv_pair_model(
+        w1[physical_keep],
+        w2[:, logical_keep],
+        blocksize=r,
+        b1=b1[physical_keep],
+    )
+
+    rng_x = np.random.default_rng(201)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_depth_to_space_dcr_mode_is_declined():
+    # ONNX's own schema defaults `mode` to "DCR"; PyTorch's `nn.PixelShuffle`
+    # always lowers to "CRD" specifically (see this hop's own section
+    # comment) -- the two modes are NOT interchangeable, and no exporter
+    # this module has confirmed ever produces "DCR" from a Conv-chain
+    # context, so it is declined outright, never guessed at, the same
+    # "never recognize a topology variant you haven't empirically
+    # confirmed" bar this module holds every other hop to.
+    Cin, C, r, C2 = 3, 4, 2, 5
+    rng = np.random.default_rng(202)
+    w1 = rng.standard_normal((C * r * r, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C, 3, 3)).astype(np.float32)
+    model = _pixel_shuffle_conv_pair_model(w1, w2, blocksize=r, mode="DCR")
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_depth_to_space_activation_between_producer_and_hop_is_declined():
+    # This hop is recognized ONLY as the chain walk's very first hop --
+    # exactly, and only, the confirmed real-export shape (`DepthToSpace`
+    # consumes the producing Conv's raw output directly, nothing in
+    # between). An activation (or any other pass-through hop) sitting
+    # between the producing Conv and `DepthToSpace` is a real, deliberate
+    # scope limit, not an oversight -- declined outright here too, the
+    # producing Conv left completely unpruned, same as before this hop
+    # existed at all.
+    Cin, C, r, C2 = 3, 4, 2, 5
+    rng = np.random.default_rng(203)
+    w1 = rng.standard_normal((C * r * r, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C, 3, 3)).astype(np.float32)
+    conv1_out_spatial = 10 - 2
+    d2s_out_spatial = conv1_out_spatial * r
+    final_spatial = d2s_out_spatial - 2
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},{final_spatial},{final_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          d = DepthToSpace<blocksize={r}, mode="CRD">(a)
+          Y = Conv<kernel_shape=[3,3]>(d, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_depth_to_space_grouped_producer_declines():
+    # A general grouped Conv producer's own `group` blocks and
+    # DepthToSpace's own `blocksize**2`-channel blocks are two different
+    # partitions of the same physical output-channel axis, with no general
+    # way to reconcile them -- declined outright, never guessed at, the
+    # same bar a producer/consumer `group` mismatch already gets elsewhere
+    # in this module.
+    Cin, C, r, C2, group1 = 4, 4, 2, 5, 2
+    rng = np.random.default_rng(204)
+    w1 = rng.standard_normal((C * r * r, Cin // group1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C, 3, 3)).astype(np.float32)
+    conv1_out_spatial = 10 - 2
+    d2s_out_spatial = conv1_out_spatial * r
+    final_spatial = d2s_out_spatial - 2
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},{final_spatial},{final_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], group={group1}>(X, W1)
+          d = DepthToSpace<blocksize={r}, mode="CRD">(h)
+          Y = Conv<kernel_shape=[3,3]>(d, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_depth_to_space_global_sparsity_leaves_chain_untouched():
+    # Excluded from `global_sparsity` mode outright (see
+    # `_chain_is_global_sparsity_eligible`'s own comment) -- pooling a flat
+    # per-channel importance vector across chains has no general way to
+    # respect this hop's own indivisible `blocksize**2`-channel blocks yet.
+    # Its own weights are made uniformly tiny here, so a naive pooled
+    # ranking would otherwise be very eager to prune it hard.
+    Cin, C, r, C2 = 3, 4, 2, 5
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(205)
+    w1 = (rng.standard_normal((C * r * r, Cin, 3, 3)) * 0.01).astype(np.float32)
+    w2 = rng.standard_normal((C2, C, 3, 3)).astype(np.float32)
+    wm1 = (rng.standard_normal((K, H)) * 50.0).astype(np.float32)
+    wm2 = rng.standard_normal((H, Out)).astype(np.float32)
+    conv1_out_spatial = 10 - 2
+    d2s_out_spatial = conv1_out_spatial * r
+    final_spatial = d2s_out_spatial - 2
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float[batch,{K}] Xm)
+            => (float[N,{C2},{final_spatial},{final_spatial}] Y, float[batch,{Out}] Ym)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          d = DepthToSpace<blocksize={r}, mode="CRD">(h)
+          Y = Conv<kernel_shape=[3,3]>(d, W2)
+          hm = MatMul(Xm, Wm1)
+          am = Relu(hm)
+          Ym = MatMul(am, Wm2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(wm1, "Wm1"),
+            _f32(wm2, "Wm2"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5, global_sparsity=True)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # The DepthToSpace chain is left completely untouched by global_sparsity.
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    # The eligible plain MatMul chain is still pruned.
+    assert inits["Wm1"].shape[1] < H
+
+
+def test_analyze_structured_pruning_depth_to_space_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check, mirroring
+    # `test_analyze_structured_pruning_group_norm_pass_through_matches_real_call`:
+    # both `_apply_chains` and its dry-run mirror `_analyze_chains` share
+    # `_chain_importance`'s own block-reduction detour for this hop, so a
+    # mismatch here would mean the mirror drifted out of sync with the real
+    # call.
+    Cin, C, r, C2 = 3, 4, 2, 5
+    rng = np.random.default_rng(206)
+    w1 = rng.standard_normal((C * r * r, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C, 3, 3)).astype(np.float32)
+    model = _pixel_shuffle_conv_pair_model(w1, w2, blocksize=r)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C  # the *logical* channel count, not C * r * r
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept_logical = C - layer.would_drop
+    assert dims_after["W1"][0] == kept_logical * r * r
+    assert dims_after["W2"][1] == kept_logical
+
+
 # --- Conv chain: pooling/Resize/Pad pass-through hops -----------------------
 #
 # `MaxPool`/`AveragePool`/`GlobalAveragePool` (unconditional -- no weight of
