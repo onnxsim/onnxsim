@@ -1696,6 +1696,51 @@ to instrument or bisect further -- and a hard existence proof that some
 of that 99%-opaque region cannot be padding: a mechanism this precise and
 reproducible almost certainly means it's live, checked, structural data.
 
+### Hand-patching the *decoded* Wbt requantization scale: confirms the field, corrects the mental model of how it acts
+
+Everything above hand-patches still-*undecoded* mcode bytes. This applies
+the same causal-intervention technique to a field this README already
+claims to have decoded -- `Conv`'s per-channel requantization multiplier
+`M_channel` in Wbt (`input_scale * weight_scale_channel / output_scale`,
+identified earlier purely by correlation: it shrinks monotonically as
+bias grows). A `Conv(cin=cout=4)` with a distinctly non-uniform bias
+(`[0, 5, 10, 15]`, so each channel's own float32 value is individually
+identifiable instead of accidentally coinciding across channels) locates
+each channel's `M_channel` value at a precise Wbt offset, present in 4
+identical repeated copies (64 bytes apart) -- consistent with this
+README's earlier "Wbt reveals real channel-tiling structure" finding.
+
+**Multiplying channel 0's value by 0.5 at all 4 repeated copies, confirmed
+stable across two independent rebuilds**, cleanly isolates to exactly that
+channel: channels 1-3's real device output are **bit-identical** to the
+unpatched baseline, direct proof the offset identification and per-channel
+indexing are both correct. But channel 0's actual change **refutes the
+simple mental model** ("this scales the final float output by the same
+factor") the earlier correlation-only description implied:
+
+```
+channel 0, baseline:  min=-1.73 max=1.73 mean=0.034 std=0.649 (42 unique values)
+channel 0, M x 0.5:   min=-2.41 max=-1.13 mean=-1.976 std=0.299 (17 unique values)
+```
+
+Halving `M_channel` did **not** halve the float output (that would predict
+a new mean near 0.017, still centered on zero) -- it collapsed the channel
+to a much narrower, shifted band with far fewer distinct values. That
+signature -- reduced spread, fewer unique output codes, a shifted center
+-- is exactly what happens when a scale factor used *inside* int8
+requantization (`int8_code = round(int32_accumulator * M) + zero_point`)
+gets halved: the accumulator's full dynamic range collapses toward
+`zero_point` in int8-code space *before* a separate, untouched
+output-dequantization step converts back to float32, rather than `M`
+being applied as an external multiplier on the already-dequantized float
+result. This is consistent with -- and actually a more precise,
+causally-verified version of -- the standard quantized-conv formula this
+README already named, it just corrects exactly where the multiplication
+happens in the pipeline. A real, verified example of this project's
+recurring lesson: a correlation-only finding (an array that "shrinks as
+bias grows") can misdescribe the actual mechanism even when the general
+hypothesis is right, and only a direct intervention exposes that.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

@@ -14,6 +14,7 @@ tests/test_pulsar2_hf_to_axmodel.py.
 import json
 import os
 import re
+import struct
 import sys
 
 import numpy as np
@@ -638,6 +639,36 @@ def _mcode_key(compiled):
     return info["dotneus"][0]["neu_key"]
 
 
+def _params_key(compiled):
+    """The `npu_params` initializer name holding a compiled model's Wbt --
+    the hand-patching counterpart to `_mcode_key`."""
+    neu_node = next(nd for nd in compiled.graph.node if nd.op_type == "neu mode")
+    for attr in neu_node.attribute:
+        if attr.name == "npu_graph_info":
+            info = json.loads(attr.s.decode())
+    return info["dotneus"][0]["extra_inputs"][0]["const_data_key"]
+
+
+def _conv_with_bias_model(bias_vals, cin=4, cout=4, k=3, insz=16):
+    """One `Conv(x, w, b)` with an explicit, distinctly non-uniform bias --
+    used for hand-patching Wbt's per-channel requantization scale, where a
+    uniform bias would make every channel's own decoded value coincide and
+    hide per-channel indexing bugs."""
+    pad = k // 2
+    model = parser.parse_model(
+        f'<ir_version: 10, opset_import: ["": 17]> '
+        f"agraph (float[1,{cin},{insz},{insz}] x) => (float[1,{cout},{insz},{insz}] y) "
+        f"{{ y = Conv<pads=[{pad},{pad},{pad},{pad}]>(x, w, b) }}"
+    )
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin, k, k) * 0.1).astype(np.float32)
+    b = np.array(bias_vals, dtype=np.float32)
+    model.graph.initializer.append(numpy_helper.from_array(w, name="w"))
+    model.graph.initializer.append(numpy_helper.from_array(b, name="b"))
+    onnx.checker.check_model(model)
+    return model
+
+
 def _gemm_model(transb, m=1, k=16, n=8):
     """One `Gemm(x, w, b)` -- `transb` selects whether `w` is stored as
     `[k,n]` (transB=0) or `[n,k]` (transB=1), same logical matrix either
@@ -1131,3 +1162,76 @@ def test_bit_flip_in_opaque_mcode_region_is_sometimes_inert_sometimes_faults(tmp
 
     dev_fault = flip_and_run(700, x)
     assert dev_fault.error and "0x8030070C" in dev_fault.error, dev_fault.error
+
+
+def test_patching_decoded_requant_scale_isolates_to_one_channel(tmp_path):
+    """Confirmed real (see the README's "Hand-patching the decoded Wbt
+    requantization scale" section): halving `Conv`'s per-channel
+    requantization scale `M_channel` (Wbt's small ~1e-3-magnitude
+    per-channel float32 array, present in 4 identical repeated copies) at
+    only channel 0's 4 copies produces bit-identical device output for
+    channels 1-3, but visibly reshapes channel 0's own output (narrower
+    spread, fewer unique values -- the signature of compressing the int8
+    requantization range around a fixed zero-point, not simply halving
+    the final float result). Confirmed stable across independent
+    rebuilds. This test locks in the causal isolation (other channels
+    untouched) and the qualitative reshaping (not a naive linear scale),
+    without depending on brittle exact-offset assumptions beyond this
+    specific, confirmed model configuration.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    model = _conv_with_bias_model([0, 5, 10, 15])
+    path = _build_axmodel(os.path.join(str(tmp_path), "base"), model, (1, 4, 16, 16))
+    compiled = onnx.load(path)
+    key = _params_key(compiled)
+    wbt = bytes({i.name: i for i in compiled.graph.initializer}[key].raw_data)
+
+    # channel 0's requant-scale value, confirmed present at these 4
+    # identical repeated offsets for this exact model configuration.
+    repeat_offsets = [1216, 1232, 1248, 1264]
+    values = [struct.unpack("<f", wbt[o : o + 4])[0] for o in repeat_offsets]
+    assert len(set(values)) == 1, "expected the 4 repeated copies to agree"
+    assert 1e-4 < values[0] < 1e-2, (values, "expected a small requant-scale value")
+
+    patched = bytearray(wbt)
+    for off in repeat_offsets:
+        v = struct.unpack("<f", patched[off : off + 4])[0]
+        patched[off : off + 4] = struct.pack("<f", v * 0.5)
+    compiled_patched = onnx.load(path)
+    {i.name: i for i in compiled_patched.graph.initializer}[key].raw_data = bytes(
+        patched
+    )
+    patched_path = os.path.join(str(tmp_path), "patched.axmodel")
+    onnx.save(compiled_patched, patched_path)
+
+    rng = np.random.RandomState(42)
+    x = rng.randn(1, 4, 16, 16).astype(np.float32)
+    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    dev_patch = pulsar2_docker.run_on_device_with_inputs(
+        patched_path, {"x": x.tobytes()}
+    )
+    assert not dev_base.error, dev_base.error
+    assert not dev_patch.error, dev_patch.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32).reshape(
+        1, 4, 16, 16
+    )
+    out_patch = np.frombuffer(dev_patch.outputs[0], dtype=np.float32).reshape(
+        1, 4, 16, 16
+    )
+
+    for c in (1, 2, 3):
+        assert np.array_equal(out_base[0, c], out_patch[0, c]), (
+            c,
+            "expected untouched channels to be bit-identical",
+        )
+
+    base0, patch0 = out_base[0, 0], out_patch[0, 0]
+    assert not np.array_equal(base0, patch0)
+    assert patch0.std() < base0.std(), (
+        base0.std(),
+        patch0.std(),
+        "expected halving the requant scale to narrow channel 0's output spread",
+    )
+    assert len(np.unique(patch0)) < len(np.unique(base0))
