@@ -8491,76 +8491,34 @@ def _resolve_spatial_gate_reduce_branch(
     return (reduce_node, unsqueeze_node), unsqueeze_node.output[0]
 
 
-def _match_spatial_gate_pass_through(
+def _validate_spatial_gate_diamond(
     cur: str,
+    mul_node: onnx.NodeProto,
+    reduce_max_node: onnx.NodeProto,
+    reduce_mean_node: onnx.NodeProto,
     consumers_of: Dict[str, List[onnx.NodeProto]],
     initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
 ) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
-    """If `cur` (a tensor with *exactly* three direct consumers) is the root
-    of CBAM's `SpatialGate` shape -- see this section's own comment above for
-    the full empirical/architectural finding -- returns ``(diamond_nodes,
-    final_out)``, the same shape :func:`_match_self_gated_activation`/
-    :func:`_match_gelu_tanh_pass_through` return: `diamond_nodes` is every
-    node the shape spans, in forward order (the `ReduceMax` branch's own
-    nodes, then the `ReduceMean` branch's, then `Concat`, the internal
-    spatial `Conv`, the closing activation, and finally the gating `Mul`
-    itself); `final_out` is that `Mul`'s own output, the tensor the caller
-    should continue walking from.
+    """The shared validation core :func:`_match_spatial_gate_pass_through`
+    uses once it has identified `cur`'s own three direct-consumer roles (a
+    `Mul(cur, gate)`, a `ReduceMax`, and a `ReduceMean` -- each already
+    confirmed by the caller to actually read `cur`), and
+    :func:`_match_conv_triplet_attention_gate` reuses verbatim for its own
+    "direct" (`hw`) branch, whose three roles are three of `cur`'s *five*
+    direct consumers rather than all of them -- the diamond shape itself
+    (``ReduceMax``/``ReduceMean`` -> ``Concat`` -> ``Conv(2->1)`` ->
+    ``Sigmoid``/``HardSigmoid`` -> ``Mul``) is architecturally identical
+    either way, so re-deriving this validation a third time would just be
+    the same checks copy-pasted. See :func:`_match_spatial_gate_pass_through`'s
+    own docstring for the full list of what this declines on.
 
-    Declines (``None``) unless:
-
-    - `cur` has exactly three *distinct* direct consumers (a doubly-read
-      consumer here isn't any confirmed real shape, so declined rather than
-      reasoned about) -- exactly one a `Mul(cur, gate)` (domain ``""``, two
-      inputs, one output, its other operand distinct from `cur` itself), one
-      a `ReduceMax`, and one a `ReduceMean`.
-    - Each reduction branch resolves via
-      :func:`_resolve_spatial_gate_reduce_branch`, and both branches' own
-      final outputs feed the *same* `Concat` node (domain ``""``, ``axis=1``,
-      exactly two inputs ordered ``[max_branch, mean_branch]`` -- the
-      opposite order is a deviation from the confirmed exporter shape and is
-      declined, not guessed at) with no other consumer, not a graph output.
-    - That `Concat`'s own single consumer is a plain `Conv` (domain ``""``,
-      ``group`` absent or ``1``, a constant weight initializer shaped
-      ``[1, 2, kH, kW]`` -- both channel counts architecturally fixed,
-      independent of the spine's own channel count -- see this section's own
-      comment) with no other consumer, not a graph output.
-    - That `Conv`'s own single consumer is a plain `Sigmoid` or `HardSigmoid`
-      (domain ``""``, one input, one output) with no other consumer, not a
-      graph output, whose own output is *exactly* the gating `Mul`'s other
-      operand (`gate` above) -- confirming the activation really is this
-      `Mul`'s own second input, not some unrelated same-shaped node -- and
-      whose own single consumer is that same `Mul` node.
+    Returns ``(diamond_nodes, final_out)`` on a match -- `diamond_nodes` in
+    forward order (the `ReduceMax` branch's own nodes, then the `ReduceMean`
+    branch's, then `Concat`, the internal spatial `Conv`, the closing
+    activation, and finally `mul_node` itself); `final_out` is `mul_node`'s
+    own output. ``None`` on any deviation.
     """
-    consumers = consumers_of.get(cur, [])
-    if len(consumers) != 3 or len({id(c) for c in consumers}) != 3:
-        return None
-
-    mul_node: Optional[onnx.NodeProto] = None
-    reduce_max_node: Optional[onnx.NodeProto] = None
-    reduce_mean_node: Optional[onnx.NodeProto] = None
-    for c in consumers:
-        if (
-            c.op_type == "Mul"
-            and c.domain == ""
-            and len(c.input) == 2
-            and cur in c.input
-            and len(c.output) == 1
-            and c.output[0]
-        ):
-            if mul_node is not None:
-                return None
-            mul_node = c
-        elif c.op_type == "ReduceMax" and reduce_max_node is None:
-            reduce_max_node = c
-        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
-            reduce_mean_node = c
-        else:
-            return None  # a fourth role, or a duplicate of one already seen
-    if mul_node is None or reduce_max_node is None or reduce_mean_node is None:
-        return None
-
     gate_name = mul_node.input[1] if mul_node.input[0] == cur else mul_node.input[0]
     if gate_name == cur:
         return None
@@ -8661,6 +8619,384 @@ def _match_spatial_gate_pass_through(
         max_nodes + mean_nodes + (concat_node, conv_node, activation_node, mul_node)
     )
     return diamond_nodes, mul_node.output[0]
+
+
+def _match_spatial_gate_pass_through(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* three direct consumers) is the root
+    of CBAM's `SpatialGate` shape -- see this section's own comment above for
+    the full empirical/architectural finding -- returns ``(diamond_nodes,
+    final_out)``, the same shape :func:`_match_self_gated_activation`/
+    :func:`_match_gelu_tanh_pass_through` return: `diamond_nodes` is every
+    node the shape spans, in forward order (the `ReduceMax` branch's own
+    nodes, then the `ReduceMean` branch's, then `Concat`, the internal
+    spatial `Conv`, the closing activation, and finally the gating `Mul`
+    itself); `final_out` is that `Mul`'s own output, the tensor the caller
+    should continue walking from.
+
+    Declines (``None``) unless:
+
+    - `cur` has exactly three *distinct* direct consumers (a doubly-read
+      consumer here isn't any confirmed real shape, so declined rather than
+      reasoned about) -- exactly one a `Mul(cur, gate)` (domain ``""``, two
+      inputs, one output, its other operand distinct from `cur` itself), one
+      a `ReduceMax`, and one a `ReduceMean`.
+    - The three identified roles resolve via
+      :func:`_validate_spatial_gate_diamond` (shared with
+      :func:`_match_conv_triplet_attention_gate`'s own "direct" branch --
+      see that function's own docstring for why): each reduction branch
+      resolves via :func:`_resolve_spatial_gate_reduce_branch`, and both
+      branches' own final outputs feed the *same* `Concat` node (domain
+      ``""``, ``axis=1``, exactly two inputs ordered ``[max_branch,
+      mean_branch]`` -- the opposite order is a deviation from the confirmed
+      exporter shape and is declined, not guessed at) with no other
+      consumer, not a graph output.
+    - That `Concat`'s own single consumer is a plain `Conv` (domain ``""``,
+      ``group`` absent or ``1``, a constant weight initializer shaped
+      ``[1, 2, kH, kW]`` -- both channel counts architecturally fixed,
+      independent of the spine's own channel count -- see this section's own
+      comment) with no other consumer, not a graph output.
+    - That `Conv`'s own single consumer is a plain `Sigmoid` or `HardSigmoid`
+      (domain ``""``, one input, one output) with no other consumer, not a
+      graph output, whose own output is *exactly* the gating `Mul`'s other
+      operand (`gate` above) -- confirming the activation really is this
+      `Mul`'s own second input, not some unrelated same-shaped node -- and
+      whose own single consumer is that same `Mul` node.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 3 or len({id(c) for c in consumers}) != 3:
+        return None
+
+    mul_node: Optional[onnx.NodeProto] = None
+    reduce_max_node: Optional[onnx.NodeProto] = None
+    reduce_mean_node: Optional[onnx.NodeProto] = None
+    for c in consumers:
+        if (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            if mul_node is not None:
+                return None
+            mul_node = c
+        elif c.op_type == "ReduceMax" and reduce_max_node is None:
+            reduce_max_node = c
+        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
+            reduce_mean_node = c
+        else:
+            return None  # a fourth role, or a duplicate of one already seen
+    if mul_node is None or reduce_max_node is None or reduce_mean_node is None:
+        return None
+
+    return _validate_spatial_gate_diamond(
+        cur,
+        mul_node,
+        reduce_max_node,
+        reduce_mean_node,
+        consumers_of,
+        initializer_map,
+        graph_outputs,
+    )
+
+
+# Triplet Attention (Misra et al. 2021, WACV, "Rotate to Attend: Convolutional
+# Triplet Attention Module", `LandskapeAI/triplet-attention`) -- a *fourth*
+# Conv-chain pass-through hop, alongside GroupNorm/GRN/`SpatialGate` above,
+# recognized on a spine tensor forking into *exactly five* direct consumers.
+# Confirmed against the reference implementation's own canonical source
+# (`LandskapeAI/triplet-attention`'s `MODELS/triplet_attention.py`, fetched
+# directly) and empirically, via a real `torch.onnx.export` (opset 17, legacy
+# TorchScript-based exporter) of a `Conv -> TripletAttention() -> Conv`
+# module, checker-passed and `onnxruntime`-verified against the PyTorch
+# reference. The reference module wraps three instances of the *exact same*
+# `SpatialGate` class :func:`_match_spatial_gate_pass_through` above already
+# recognizes (`ChannelGateH`, `ChannelGateW`, and, when `no_spatial=False` --
+# the module's own default, and the only configuration recognized here --
+# `SpatialGate` itself), two of them fed a permuted view of the spine instead
+# of the spine directly:
+#
+#     t_cw   = Transpose(x, perm=[0, 2, 1, 3])   # swap(channel, height)
+#     b_cw   = SpatialGate(t_cw)                 # -- the shape above, verbatim
+#     out_cw = Transpose(b_cw, perm=[0, 2, 1, 3])  # permute back (self-inverse)
+#
+#     t_hc   = Transpose(x, perm=[0, 3, 2, 1])   # swap(channel, width)
+#     b_hc   = SpatialGate(t_hc)
+#     out_hc = Transpose(b_hc, perm=[0, 3, 2, 1])  # permute back (self-inverse)
+#
+#     out_hw = SpatialGate(x)                    # reads the spine directly
+#
+#     merged = (1/3) * ((out_hw + out_cw) + out_hc)   # -> feeds the next Conv
+#
+# -- i.e. `x`'s own five direct consumers are the two `Transpose`s (each
+# feeding its own independent `SpatialGate` instance) and the three nodes
+# `SpatialGate`'s own three-consumer shape needs when it reads `x` directly:
+# a `ReduceMax`, a `ReduceMean`, and the closing `Mul`. Both permutations are
+# involutions (swapping the same axis pair a second time undoes the first),
+# so the confirmed exporter shape's own "permute back" step always carries
+# the *identical* `perm` as its forward counterpart -- never re-derived or
+# guessed at, just compared for equality. `SpatialGate`'s own internal
+# spatial `Conv` is architecturally fixed at `in_channels=2`,
+# `out_channels=1` regardless of the spine's own channel count `n_channels`
+# -- confirmed already by :func:`_validate_spatial_gate_diamond` for all
+# *three* instances here (`ChannelGateH`'s, `ChannelGateW`'s, and
+# `SpatialGate`'s own) -- so, exactly like a bare `SpatialGate` hop, this
+# entire five-branch shape contributes *nothing* to `chain_ops`/slicing
+# bookkeeping: every node it spans folds into `chain_ops` the "hop over, keep
+# going" way, with the closing scalar-scale `Mul` (`merged` above) becoming
+# the walk's new `cur`.
+#
+# `x`'s five direct consumers collide, in raw count, with the decomposed
+# tanh-GELU shape's own five-consumer root (see that section's own comment
+# above) -- but the two are disjoint by construction on a strictly stronger
+# bar than op-type-set disjointness: `consumers_of` records one entry per
+# `node.input` *occurrence*, and the tanh-GELU shape's own root is read by
+# only *four* distinct nodes (one of them, the squaring `Mul`, reading it
+# twice -- see that section's own comment), whereas every one of Triplet
+# Attention's five roles here reads `x` exactly once, from a *different*
+# node -- five distinct nodes, not four. So the two shapes' own required
+# "how many distinct consumer nodes" counts (4 vs. 5) can never both hold for
+# the same tensor, making the two matchers mutually exclusive without
+# needing to reason about their op-type sets at all. Tried in a fixed order
+# at :func:`_walk_to_conv_consumer`'s own `len(candidates) == 5` dispatch
+# (tanh-GELU first, since it already declines instantly on 5 distinct nodes;
+# this hop second), never masking the other.
+#
+# Gated behind :func:`_walk_to_conv_consumer`'s own
+# `recognize_triplet_attention` parameter, scoped identically to
+# `recognize_spatial_gate` above for the identical reason: only
+# :func:`_find_conv_chains` (the plain single-producer/single-consumer
+# topology every hop in this module was scoped to first) passes it ``True``.
+def _match_conv_triplet_attention_gate(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* five direct consumers, all
+    distinct -- see this section's own comment above for why a doubly-read
+    consumer here is the decomposed tanh-GELU shape's own territory, not
+    this one) is the root of Triplet Attention's shape, returns
+    ``(diamond_nodes, final_out)`` -- the same shape every other pass-through
+    hop in this module returns: `diamond_nodes` is every node the shape
+    spans (in forward order: the `cw` branch's `Transpose`, its own
+    `SpatialGate` diamond, and its "permute back" `Transpose`; then the same
+    three for the `hc` branch; then the direct (`hw`) branch's own
+    `SpatialGate` diamond; then the two closing `Add`s and the final
+    scalar-scale `Mul`); `final_out` is that `Mul`'s own output.
+
+    Declines (``None``) unless:
+
+    - `cur` has exactly five *distinct* direct consumers: two plain
+      `Transpose` nodes (domain ``""``, single input exactly `cur`, single
+      output), one `ReduceMax`, one `ReduceMean`, and one `Mul(cur, gate)`
+      (domain ``""``, two inputs, one output, its other operand distinct
+      from `cur`) -- any other role composition (a sixth role, a duplicate
+      of one already seen, or a `Transpose` reading anything other than
+      `cur` alone) is declined outright.
+    - The two `Transpose`s carry *exactly* the two permutations the
+      confirmed real export uses -- ``[0, 2, 1, 3]`` (swap channel/height)
+      and ``[0, 3, 2, 1]`` (swap channel/width) -- one each; two of the same
+      permutation, or any other permutation entirely, is a deviation from
+      the confirmed shape and is declined, not guessed at.
+    - `cur`'s own direct `ReduceMax`/`ReduceMean`/`Mul` roles, together, form
+      a valid `SpatialGate` diamond via :func:`_validate_spatial_gate_diamond`
+      (the "direct"/`hw` branch) -- the identical validation
+      :func:`_match_spatial_gate_pass_through` itself uses, reused rather
+      than re-derived.
+    - Each `Transpose`'s own single-consumer output (not a graph output)
+      is, in turn, the root of *another* full `SpatialGate` diamond (via
+      :func:`_match_spatial_gate_pass_through`, called directly since that
+      tensor genuinely has exactly three consumers of its own), whose own
+      final `Mul` output (not a graph output) has exactly one consumer: a
+      second plain `Transpose` carrying the *identical* `perm` as the first
+      (both confirmed permutations are self-inverse) -- any other node, or a
+      different `perm`, is declined.
+    - The three branches' own final outputs (the direct branch's `Mul`
+      output, and each permuted branch's own "permute back" `Transpose`
+      output) are combined as *exactly* ``Mul(Add(Add(direct, cw), hc),
+      scale)`` -- the confirmed exporter's own operand pairing and order
+      (`direct` first into the first `Add`, then `hc`, then the scalar
+      `scale`) -- with every intermediate tensor read by no other consumer
+      and not a graph output; any other grouping, order, or non-scalar
+      `scale` is declined, not reordered/guessed at.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 5 or len({id(c) for c in consumers}) != 5:
+        return None
+
+    transposes: List[onnx.NodeProto] = []
+    reduce_max_node: Optional[onnx.NodeProto] = None
+    reduce_mean_node: Optional[onnx.NodeProto] = None
+    mul_node: Optional[onnx.NodeProto] = None
+    for c in consumers:
+        if (
+            c.op_type == "Transpose"
+            and c.domain == ""
+            and list(c.input) == [cur]
+            and len(c.output) == 1
+            and c.output[0]
+        ):
+            transposes.append(c)
+        elif c.op_type == "ReduceMax" and reduce_max_node is None:
+            reduce_max_node = c
+        elif c.op_type == "ReduceMean" and reduce_mean_node is None:
+            reduce_mean_node = c
+        elif (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+            and c.output[0]
+            and mul_node is None
+        ):
+            mul_node = c
+        else:
+            return None  # a sixth role, or a duplicate of one already seen
+
+    if (
+        len(transposes) != 2
+        or reduce_max_node is None
+        or reduce_mean_node is None
+        or mul_node is None
+    ):
+        return None
+
+    perm_of: Dict[int, Tuple[int, ...]] = {}
+    for t in transposes:
+        perm: Optional[List[int]] = None
+        for attr in t.attribute:
+            if attr.name == "perm":
+                perm = list(attr.ints)
+        if perm is None:
+            return None
+        perm_of[id(t)] = tuple(perm)
+    if set(perm_of.values()) != {(0, 2, 1, 3), (0, 3, 2, 1)}:
+        return None
+    cw_transpose = (
+        transposes[0] if perm_of[id(transposes[0])] == (0, 2, 1, 3) else transposes[1]
+    )
+    hc_transpose = transposes[1] if cw_transpose is transposes[0] else transposes[0]
+
+    direct = _validate_spatial_gate_diamond(
+        cur,
+        mul_node,
+        reduce_max_node,
+        reduce_mean_node,
+        consumers_of,
+        initializer_map,
+        graph_outputs,
+    )
+    if direct is None:
+        return None
+    direct_nodes, direct_out = direct
+
+    branch_nodes: List[Tuple[onnx.NodeProto, ...]] = []
+    branch_outs: List[str] = []
+    for transpose_node in (cw_transpose, hc_transpose):
+        t_out = transpose_node.output[0]
+        if t_out in graph_outputs or len(consumers_of.get(t_out, [])) != 3:
+            return None
+        sub = _match_spatial_gate_pass_through(
+            t_out, consumers_of, initializer_map, graph_outputs
+        )
+        if sub is None:
+            return None
+        sub_nodes, sub_out = sub
+        if sub_out in graph_outputs or len(consumers_of.get(sub_out, [])) != 1:
+            return None
+        back_transpose = consumers_of[sub_out][0]
+        if (
+            back_transpose.op_type != "Transpose"
+            or back_transpose.domain != ""
+            or list(back_transpose.input) != [sub_out]
+            or len(back_transpose.output) != 1
+            or not back_transpose.output[0]
+        ):
+            return None
+        back_perm: Optional[List[int]] = None
+        for attr in back_transpose.attribute:
+            if attr.name == "perm":
+                back_perm = list(attr.ints)
+        if back_perm is None or tuple(back_perm) != perm_of[id(transpose_node)]:
+            return None
+        branch_nodes.append((transpose_node,) + sub_nodes + (back_transpose,))
+        branch_outs.append(back_transpose.output[0])
+
+    cw_nodes, hc_nodes = branch_nodes
+    branch_cw_out, branch_hc_out = branch_outs
+
+    if (
+        direct_out in graph_outputs
+        or branch_cw_out in graph_outputs
+        or branch_hc_out in graph_outputs
+        or len(consumers_of.get(direct_out, [])) != 1
+        or len(consumers_of.get(branch_cw_out, [])) != 1
+        or len(consumers_of.get(branch_hc_out, [])) != 1
+    ):
+        return None
+
+    add1 = consumers_of[direct_out][0]
+    if consumers_of[branch_cw_out][0] is not add1:
+        return None
+    if (
+        add1.op_type != "Add"
+        or add1.domain != ""
+        or len(add1.input) != 2
+        or set(add1.input) != {direct_out, branch_cw_out}
+        or len(add1.output) != 1
+        or not add1.output[0]
+    ):
+        return None
+    add1_out = add1.output[0]
+    if add1_out in graph_outputs or len(consumers_of.get(add1_out, [])) != 1:
+        return None
+
+    add2 = consumers_of[add1_out][0]
+    if consumers_of[branch_hc_out][0] is not add2:
+        return None
+    if (
+        add2.op_type != "Add"
+        or add2.domain != ""
+        or len(add2.input) != 2
+        or set(add2.input) != {add1_out, branch_hc_out}
+        or len(add2.output) != 1
+        or not add2.output[0]
+    ):
+        return None
+    add2_out = add2.output[0]
+    if add2_out in graph_outputs or len(consumers_of.get(add2_out, [])) != 1:
+        return None
+
+    final_mul = consumers_of[add2_out][0]
+    if (
+        final_mul.op_type != "Mul"
+        or final_mul.domain != ""
+        or len(final_mul.input) != 2
+        or add2_out not in final_mul.input
+        or len(final_mul.output) != 1
+        or not final_mul.output[0]
+    ):
+        return None
+    scale_name = (
+        final_mul.input[1] if final_mul.input[0] == add2_out else final_mul.input[0]
+    )
+    if scale_name == add2_out or not _gate_branch_scalar_const(
+        scale_name, initializer_map
+    ):
+        return None
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = (
+        cw_nodes + hc_nodes + direct_nodes + (add1, add2, final_mul)
+    )
+    return diamond_nodes, final_mul.output[0]
 
 
 def _match_resize_channel_pass_through(
@@ -9042,6 +9378,7 @@ def _walk_to_conv_consumer(
     recognize_decomposed_group_norm: bool = False,
     recognize_grn: bool = False,
     recognize_spatial_gate: bool = False,
+    recognize_triplet_attention: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
     recognize_depth_to_space: bool = False,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
@@ -9212,6 +9549,23 @@ def _walk_to_conv_consumer(
     no per-chain "at most one" restriction and needs no dedicated return
     value here.
 
+    `recognize_triplet_attention` is the analogous gate for Triplet
+    Attention's shape -- see :func:`_match_conv_triplet_attention_gate` and
+    this module's own "Triplet Attention" section comment -- scoped
+    identically to `recognize_spatial_gate` for the identical reason (only
+    :func:`_find_conv_chains` passes ``True``): tried at whatever tensor
+    `cur` is at the top of each hop iteration below the moment it has
+    exactly *five* consumers, right alongside the decomposed tanh-GELU
+    shape's own identical-count dispatch -- tried second, after tanh-GELU,
+    since the two are mutually exclusive by construction (see that section's
+    own comment for the "four vs. five distinct consumer nodes" argument),
+    so trying both costs nothing beyond one more declining call whenever
+    neither is actually present. Like `SpatialGate` alone (not `group_norm`/
+    `decomposed_group_norm_num_groups`/`grn`), a Triplet Attention match
+    contributes nothing to `chain_ops`/slicing bookkeeping at all, so it too
+    carries no per-chain "at most one" restriction and needs no dedicated
+    return value here.
+
     `recognize_depth_to_space` gates a mid-chain ``DepthToSpace`` (mode
     ``"CRD"``) node -- PyTorch's ``nn.PixelShuffle`` lowering, see this
     module's own ``DepthToSpace`` (mode ``"CRD"``) section comment and
@@ -9355,9 +9709,20 @@ def _walk_to_conv_consumer(
                     continue
                 break  # two consumers but not this shape -- declined, as before
             if len(candidates) == 5:
-                # The decomposed tanh-GELU shape's own root -- see this
-                # module's own "Decomposed tanh-approximate GELU pass-through"
-                # section comment and :func:`_match_gelu_tanh_pass_through`.
+                # Two mutually-exclusive five-*entry* shapes share this
+                # dispatch: the decomposed tanh-GELU shape's own root (see
+                # this module's own "Decomposed tanh-approximate GELU
+                # pass-through" section comment and
+                # :func:`_match_gelu_tanh_pass_through` -- only *four*
+                # distinct consumer nodes, one read twice) and Triplet
+                # Attention's own spine root (see this module's own
+                # "Triplet Attention" section comment and
+                # :func:`_match_conv_triplet_attention_gate` -- *five*
+                # distinct consumer nodes, each reading `cur` exactly once).
+                # Disjoint on that distinct-node-count alone, so trying
+                # tanh-GELU first, then Triplet Attention only if tanh-GELU
+                # didn't match at all, is always safe and never masks the
+                # other.
                 gelu_diamond = _match_gelu_tanh_pass_through(
                     cur, consumers_of, initializer_map, graph_outputs
                 )
@@ -9371,7 +9736,21 @@ def _walk_to_conv_consumer(
                     chain_ops.extend((n, None) for n in diamond_nodes)
                     cur = diamond_out
                     continue
-                break  # five consumers but not this shape -- declined, as before
+                if recognize_triplet_attention:
+                    ta_diamond = _match_conv_triplet_attention_gate(
+                        cur, consumers_of, initializer_map, graph_outputs
+                    )
+                    if ta_diamond is not None:
+                        diamond_nodes, diamond_out = ta_diamond
+                        if (
+                            len(consumers_of.get(diamond_out, [])) != 1
+                            or diamond_out in graph_outputs
+                        ):
+                            break
+                        chain_ops.extend((n, None) for n in diamond_nodes)
+                        cur = diamond_out
+                        continue
+                break  # five consumers but not either shape -- declined, as before
             if len(candidates) == 3:
                 # Two mutually-exclusive three-consumer shapes share this
                 # dispatch: CBAM `SpatialGate`'s own spine root (`ReduceMax`
@@ -9726,12 +10105,16 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         # shape a self-gated activation decomposition's own origin tensor
         # takes -- see :func:`_find_chains`'s own identical comment and this
         # module's own "Self-gated activation decomposition" section
-        # comment) or exactly five (the decomposed tanh-GELU shape's own
-        # origin tensor -- see this module's own "Decomposed tanh-approximate
-        # GELU pass-through" section comment; `consumers_of` counts one entry
-        # per `node.input` occurrence, and that shape's own squaring `Mul`
-        # reads its root twice over, so its four distinct direct consumers
-        # surface as five entries there, not four).
+        # comment) or exactly five -- two mutually-exclusive shapes share
+        # this count too: the decomposed tanh-GELU shape's own origin tensor
+        # (see this module's own "Decomposed tanh-approximate GELU
+        # pass-through" section comment; `consumers_of` counts one entry per
+        # `node.input` occurrence, and that shape's own squaring `Mul` reads
+        # its root twice over, so its four distinct direct consumers surface
+        # as five entries there, not four) and Triplet Attention's own spine
+        # root (see this module's own "Triplet Attention" section comment --
+        # five distinct direct consumers, each reading the root exactly
+        # once).
         # Also admit exactly three -- two mutually-exclusive shapes share
         # this count: CBAM `SpatialGate`'s own spine root (`ReduceMax`,
         # `ReduceMean`, and the closing `Mul`, each reading the root exactly
@@ -9773,6 +10156,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_decomposed_group_norm=True,
             recognize_grn=True,
             recognize_spatial_gate=True,
+            recognize_triplet_attention=True,
             recognize_gap_flatten_matmul_consumer=True,
             recognize_depth_to_space=True,
             producers_of=producers_of,

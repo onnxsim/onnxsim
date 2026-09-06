@@ -7367,6 +7367,370 @@ def test_analyze_structured_pruning_spatial_gate_pass_through_matches_real_call(
     assert dims_after["SGW"] == (1, 2, 7, 7)
 
 
+# --- Conv chain: Triplet Attention pass-through hop ---------------------------
+#
+# Triplet Attention (Misra et al. 2021, WACV, "Rotate to Attend: Convolutional
+# Triplet Attention Module", `LandskapeAI/triplet-attention`) -- a *fourth*
+# Conv-chain pass-through hop, recognized on a spine tensor forking into
+# *exactly five* direct consumers. See `onnxsim.pruning`'s own "Triplet
+# Attention" section comment and
+# `onnxsim.pruning._match_conv_triplet_attention_gate`'s own docstring for
+# the full empirical/architectural finding: confirmed against the reference
+# implementation's own canonical source (`LandskapeAI/triplet-attention`'s
+# `MODELS/triplet_attention.py`, fetched directly) and empirically, via a
+# real `torch.onnx.export` (opset 17, legacy TorchScript-based exporter) of a
+# `Conv -> TripletAttention() -> Conv` module, checker-passed and
+# `onnxruntime`-verified against the PyTorch reference. The reference module
+# wraps three instances of the exact same `SpatialGate` class
+# `_spatial_gate_conv_pair_model` above already builds -- two of them fed a
+# permuted view of the spine (`Transpose(perm=[0,2,1,3])`/
+# `Transpose(perm=[0,3,2,1])`, each a self-inverse "permute back" afterward),
+# one fed the spine directly -- combined as
+# `Mul(Add(Add(direct, cw), hc), 1/3)`. Every internal spatial `Conv`
+# (`in_channels=2`, `out_channels=1`) is architecturally independent of the
+# spine's own channel count, exactly like a bare `SpatialGate` hop, so the
+# whole shape contributes nothing to slicing bookkeeping at all.
+def _triplet_attention_spatial_gate_branch(tag, x_name, sg_w_name, sg_b_name, kh, kw):
+    """Text fragment for one internal `SpatialGate` instance (`{ReduceMax,
+    ReduceMean} -> Unsqueeze -> Concat -> Conv -> Sigmoid`) reading `x_name`
+    -- reused for all three of Triplet Attention's own `SpatialGate`
+    instances (`cw`, `hc`, `hw`) below by interpolating a distinct `tag` into
+    every intermediate tensor name, mirroring `_spatial_gate_conv_pair_model`'s
+    own shape exactly (the same real-export-confirmed `keepdims=0` +
+    `Unsqueeze(AxesOne)` form). Stops short of the closing gating `Mul` --
+    each of the three call sites below pairs `gate_{tag}` with a different
+    "spine" operand (`t_cw`/`t_hc`/`h`), so that `Mul` is left to the caller.
+    """
+    pad_h, pad_w = (kh - 1) // 2, (kw - 1) // 2
+    conv_inputs = f"cat_{tag}, {sg_w_name}"
+    if sg_b_name is not None:
+        conv_inputs += f", {sg_b_name}"
+    return f"""
+          mx_{tag} = ReduceMax<axes=[1], keepdims=0>({x_name})
+          mxu_{tag} = Unsqueeze(mx_{tag}, AxesOne)
+          mn_{tag} = ReduceMean<axes=[1], keepdims=0>({x_name})
+          mnu_{tag} = Unsqueeze(mn_{tag}, AxesOne)
+          cat_{tag} = Concat<axis=1>(mxu_{tag}, mnu_{tag})
+          sgc_{tag} = Conv<kernel_shape=[{kh},{kw}], pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>({conv_inputs})
+          gate_{tag} = Sigmoid(sgc_{tag})
+    """
+
+
+def _triplet_attention_conv_pair_model(
+    w1,
+    w2,
+    sgw_cw,
+    sgw_hc,
+    sgw_hw,
+    b1=None,
+    sgb_cw=None,
+    sgb_hc=None,
+    sgb_hw=None,
+    spatial=10,
+    perm_cw=(0, 2, 1, 3),
+    perm_hc=(0, 3, 2, 1),
+    back_perm_cw=None,
+    back_perm_hc=None,
+    stray_consumer=False,
+):
+    """`Conv -> TripletAttention -> Conv` -- the exact shape a real
+    `torch.onnx.export` (opset 17, legacy TorchScript-based exporter) of
+    `LandskapeAI/triplet-attention`'s own `TripletAttention` module (fetched
+    directly from its own canonical source) emits, with `BatchNormalization`
+    already folded into each internal `SpatialGate`'s own spatial `Conv`
+    (mirroring every other Conv-chain hop's identical assumption elsewhere in
+    this module -- `SpatialGate`'s own `BasicConv` defaults to `bn=True`, so
+    the raw export carries one `BatchNormalization` per instance; confirmed
+    by exporting with constant-folding disabled). Each of the three internal
+    `SpatialGate` instances (`sgw_cw`/`sgw_hc`/`sgw_hw`, each `[1, 2, kH,
+    kW]`) is architecturally independent of `w1`'s own output-channel count.
+    `perm_cw`/`perm_hc` (forward) and `back_perm_cw`/`back_perm_hc`
+    (defaulting to their own forward `perm_*`, since both confirmed
+    permutations are self-inverse), overridable away from their correct
+    defaults, build the "wrong permutation" decline case below.
+    `stray_consumer`, when set, adds a sixth, stray direct consumer of `h`
+    (an otherwise-unused `Identity`), building the "stray consumer" decline
+    case.
+    """
+    if back_perm_cw is None:
+        back_perm_cw = perm_cw
+    if back_perm_hc is None:
+        back_perm_hc = perm_hc
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    kh, kw = sgw_hw.shape[2], sgw_hw.shape[3]
+
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(sgw_cw, "SGW_CW"),
+        _f32(sgw_hc, "SGW_HC"),
+        _f32(sgw_hw, "SGW_HW"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+        onnx.numpy_helper.from_array(np.array(1.0 / 3.0, dtype=np.float32), "OneThird"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+
+    sgb_names = {}
+    for tag, sgb in (("cw", sgb_cw), ("hc", sgb_hc), ("hw", sgb_hw)):
+        if sgb is not None:
+            name = f"SGB_{tag.upper()}"
+            sgb_names[tag] = name
+            initializer.append(_f32(sgb, name))
+        else:
+            sgb_names[tag] = None
+
+    cw_branch = _triplet_attention_spatial_gate_branch(
+        "cw", "t_cw", "SGW_CW", sgb_names["cw"], kh, kw
+    )
+    hc_branch = _triplet_attention_spatial_gate_branch(
+        "hc", "t_hc", "SGW_HC", sgb_names["hc"], kh, kw
+    )
+    hw_branch = _triplet_attention_spatial_gate_branch(
+        "hw", "h", "SGW_HW", sgb_names["hw"], kh, kw
+    )
+    stray = "stray = Identity(h)" if stray_consumer else ""
+    perm_cw_s = ",".join(str(v) for v in perm_cw)
+    perm_hc_s = ",".join(str(v) for v in perm_hc)
+    back_perm_cw_s = ",".join(str(v) for v in back_perm_cw)
+    back_perm_hc_s = ",".join(str(v) for v in back_perm_hc)
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs; every internal
+    # spatial-gate Conv uses "same" padding and leaves the spatial dims it
+    # touches unchanged.
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          {stray}
+          t_cw = Transpose<perm=[{perm_cw_s}]>(h)
+          {cw_branch}
+          b_cw = Mul(t_cw, gate_cw)
+          out_cw = Transpose<perm=[{back_perm_cw_s}]>(b_cw)
+          t_hc = Transpose<perm=[{perm_hc_s}]>(h)
+          {hc_branch}
+          b_hc = Mul(t_hc, gate_hc)
+          out_hc = Transpose<perm=[{back_perm_hc_s}]>(b_hc)
+          {hw_branch}
+          out_hw = Mul(h, gate_hw)
+          add1 = Add(out_hw, out_cw)
+          add2 = Add(add1, out_hc)
+          merged = Mul(add2, OneThird)
+          Y = Conv<kernel_shape=[3,3]>(merged, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+
+
+def test_structured_pruning_triplet_attention_matches_oracle_exactly():
+    # THE key correctness bar, same as every other Conv-chain hop's own
+    # oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model, verified end-to-end via
+    # onnxruntime. Before this hop existed, `h`'s own five direct reads left
+    # the producing Conv completely unpruned end to end (the plain
+    # single-consumer walk never even starts on a five-consumer root, and
+    # the decomposed tanh-GELU shape's own five-*entry* dispatch declines
+    # instantly here since all five of `h`'s reads are distinct nodes, not
+    # four with one doubly-counted).
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(700)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sgw_cw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hc = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgb_cw = rng.standard_normal((1,)).astype(np.float32)
+    sgb_hc = rng.standard_normal((1,)).astype(np.float32)
+    sgb_hw = rng.standard_normal((1,)).astype(np.float32)
+    model = _triplet_attention_conv_pair_model(
+        w1,
+        w2,
+        sgw_cw,
+        sgw_hc,
+        sgw_hw,
+        b1=b1,
+        sgb_cw=sgb_cw,
+        sgb_hc=sgb_hc,
+        sgb_hw=sgb_hw,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+    # Every internal spatial-gate Conv is architecturally independent of the
+    # spine's own channel count -- untouched by pruning.
+    assert dims_after["SGW_CW"] == (1, 2, 7, 7)
+    assert dims_after["SGW_HC"] == (1, 2, 7, 7)
+    assert dims_after["SGW_HW"] == (1, 2, 7, 7)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _triplet_attention_conv_pair_model(
+        w1[keep],
+        w2[:, keep],
+        sgw_cw,
+        sgw_hc,
+        sgw_hw,
+        b1=b1[keep],
+        sgb_cw=sgb_cw,
+        sgb_hc=sgb_hc,
+        sgb_hw=sgb_hw,
+    )
+
+    rng_x = np.random.default_rng(701)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_triplet_attention_wrong_transpose_perm_declines():
+    # A `cw`-branch `Transpose` carrying anything other than the one
+    # confirmed-live permutation (`[0, 2, 1, 3]`, swap channel/height) is not
+    # Triplet Attention's own real shape -- see
+    # `_match_conv_triplet_attention_gate`'s own docstring ("two of the same
+    # permutation, or any other permutation entirely ... is declined, not
+    # guessed at"). Declined outright: the whole chain is left unpruned,
+    # every weight untouched.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(702)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sgw_cw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hc = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    model = _triplet_attention_conv_pair_model(
+        w1,
+        w2,
+        sgw_cw,
+        sgw_hc,
+        sgw_hw,
+        perm_cw=(0, 1, 2, 3),  # identity -- not a real swap at all
+        back_perm_cw=(0, 1, 2, 3),
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["SGW_CW"], sgw_cw)
+    np.testing.assert_array_equal(inits["SGW_HC"], sgw_hc)
+    np.testing.assert_array_equal(inits["SGW_HW"], sgw_hw)
+
+
+def test_structured_pruning_triplet_attention_stray_consumer_declines():
+    # A spine tensor read by a *sixth* consumer beyond the five Triplet
+    # Attention itself needs (two `Transpose`s, `ReduceMax`, `ReduceMean`,
+    # and the direct branch's own closing `Mul`) isn't the recognized shape
+    # at all -- `_find_conv_chains`'s own producer-consumer-count gate
+    # (`{1, 2, 3, 5}`) already excludes it before
+    # `_match_conv_triplet_attention_gate` is ever tried. Declined outright,
+    # same as the wrong-permutation case above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(703)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sgw_cw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hc = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    model = _triplet_attention_conv_pair_model(
+        w1, w2, sgw_cw, sgw_hc, sgw_hw, stray_consumer=True
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["SGW_CW"], sgw_cw)
+    np.testing.assert_array_equal(inits["SGW_HC"], sgw_hc)
+    np.testing.assert_array_equal(inits["SGW_HW"], sgw_hw)
+
+
+def test_analyze_structured_pruning_triplet_attention_matches_real_call():
+    # Dry-run/real-call cross-check for the Triplet Attention hop
+    # specifically, mirroring
+    # `test_analyze_structured_pruning_spatial_gate_pass_through_matches_real_call`
+    # above -- Triplet Attention contributes nothing to slicing bookkeeping,
+    # so this mainly guards against the dry-run mirror declining a chain the
+    # real call actually prunes (or vice versa).
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(704)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    sgw_cw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hc = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sgw_hw = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    model = _triplet_attention_conv_pair_model(w1, w2, sgw_cw, sgw_hc, sgw_hw)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["SGW_CW"] == (1, 2, 7, 7)
+    assert dims_after["SGW_HC"] == (1, 2, 7, 7)
+    assert dims_after["SGW_HW"] == (1, 2, 7, 7)
+
+
+def test_structured_pruning_conv_chain_tanh_gelu_decomposed_unaffected_by_triplet_attention_admission():
+    # `_walk_to_conv_consumer`'s own `len(candidates) == 5` dispatch now
+    # tries two shapes, not one: the decomposed tanh-GELU diamond
+    # (`_conv_tanh_gelu_decomposed_pair_model` above, four *distinct*
+    # consumer nodes -- one, the squaring `Mul`, read twice) first, then
+    # `_match_conv_triplet_attention_gate` (five distinct consumer nodes)
+    # only if tanh-GELU didn't match. This is a fresh, explicit lock-in that
+    # the tanh-GELU shape -- the *other* hop sharing this exact dispatch
+    # count -- still gets recognized and correctly pruned now that a second
+    # matcher shares its dispatch point, not just "the existing suite still
+    # passes": `_match_conv_triplet_attention_gate` itself declines
+    # instantly on this shape's four-distinct-node root (see this module's
+    # own "Triplet Attention" section comment's "four vs. five distinct
+    # consumer nodes" argument), so tanh-GELU's own recognition must be
+    # completely undisturbed.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(705)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_tanh_gelu_decomposed_pair_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_tanh_gelu_decomposed_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(706)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Conv chain: decomposed-GroupNorm pass-through hop -----------------------
 #
 # The fixed 5-node ``Reshape -> InstanceNormalization -> Reshape -> Mul ->
