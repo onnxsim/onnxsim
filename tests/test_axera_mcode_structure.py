@@ -1031,15 +1031,21 @@ def test_gemm_two_engine_split_threshold_differs_from_conv(tmp_path):
 
 def test_spliced_frankenstein_noise_bytes_run_correctly_on_device(tmp_path):
     """Confirmed real (see the README's "Beyond passive diffing" section):
-    building the identical two-Conv model three times gives three real
-    mcode blobs differing only at the known small set of non-deterministic
-    noise positions. Splicing build A's mcode with one differing byte
-    swapped in from build B produces a byte sequence that is *not*
-    identical to any of the three real builds (a genuinely novel
-    combination the real compiler never produced as a whole) -- yet it
-    loads and runs on the real AX650N with bit-identical output to the
-    unpatched original. This is proof by construction, not correlation,
-    that the noise zone is a truly swappable, functionally inert label.
+    building the identical two-Conv model several times gives real mcode
+    blobs differing only at the known small set of non-deterministic noise
+    positions. Splicing build 0's mcode with differing bytes cycled in
+    from the other builds produces a byte sequence that is *not* identical
+    to any single real build (a genuinely novel combination the real
+    compiler never produced as a whole) -- yet it loads and runs on the
+    real AX650N with bit-identical output to the unpatched original. This
+    is proof by construction, not correlation, that the noise zone is a
+    truly swappable, functionally inert label.
+
+    Uses 5 rebuilds and mixes noisy positions across all of them (not just
+    one other build) specifically to avoid a real edge case hit during
+    development: with too few rebuilds, sometimes only a single position
+    actually varies, and splicing just that one position reproduces
+    another real build's mcode byte-for-byte rather than a novel one.
     """
     if not pulsar2_docker.axcl_available():
         pytest.skip("no AXCL device connected")
@@ -1047,7 +1053,7 @@ def test_spliced_frankenstein_noise_bytes_run_correctly_on_device(tmp_path):
     model = _two_conv_model(vary_first=True, dilation=2, pad=2)
     paths = [
         _build_axmodel(os.path.join(str(tmp_path), f"run{i}"), model, (1, 4, 16, 16))
-        for i in range(3)
+        for i in range(5)
     ]
     compiled = [onnx.load(p) for p in paths]
     keys = [_mcode_key(c) for c in compiled]
@@ -1062,7 +1068,8 @@ def test_spliced_frankenstein_noise_bytes_run_correctly_on_device(tmp_path):
     assert noisy, "expected the known small amount of run-to-run mcode noise"
 
     frank = bytearray(mcodes[0])
-    frank[noisy[0]] = mcodes[1][noisy[0]]
+    for n, pos in enumerate(noisy):
+        frank[pos] = mcodes[1 + (n % (len(mcodes) - 1))][pos]
     frank = bytes(frank)
     assert frank not in mcodes, "expected a genuinely novel combination"
 

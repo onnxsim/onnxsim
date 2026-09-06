@@ -1656,6 +1656,14 @@ correlation: the compiler's own output never had to agree with itself for
 this to work, because the byte pattern tested was never compiled as a
 whole by anything.
 
+(The regression test locking this in uses 5 rebuilds and mixes noisy
+positions across all of them, not just one -- caught during development:
+with only 3 rebuilds, occasionally just one position actually varies, and
+splicing only that one reproduces another real build byte-for-byte rather
+than a genuinely novel combination. Same false-positive-adjacent lesson
+this README has hit before elsewhere: verify the "novel" claim directly
+rather than assume it.)
+
 **Probing the still-opaque majority region with single-byte flips found
 something new: it isn't uniformly load-bearing.** Flipping all 8 bits of
 one byte (`^= 0xFF`) at 8 candidate offsets spread through the same
