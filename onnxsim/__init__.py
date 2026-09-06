@@ -245,7 +245,7 @@ from onnxsim.ptq4vit import apply_ptq4vit_quantization
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
-from onnxsim.quarot import apply_quarot, apply_quarot_gptq
+from onnxsim.quarot import apply_quarot, apply_quarot_fused, apply_quarot_gptq
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.qwen3_5_reconstruct import (
     reconstruct_qwen3_5_language_model,
@@ -331,6 +331,7 @@ __all__ = [
     "apply_slim_llm",
     "apply_quip_sharp",
     "apply_quarot",
+    "apply_quarot_fused",
     "apply_quarot_cpp",
     "apply_quarot_gptq",
     "apply_any_precision_llm_cpp",

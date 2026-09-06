@@ -345,3 +345,342 @@ def test_quarot_gptq_declines_below_opset21():
     model = _matmul_model(K=32, N=8, opset=13)
     result = onnxsim.apply_quarot_gptq(model)
     assert result.SerializeToString() == model.SerializeToString()
+
+
+# --- apply_quarot_fused ------------------------------------------------
+# The same rotation, folded into the producing layer's weight so it costs
+# nothing at inference. See onnxsim/quarot.py's own docstring.
+
+
+def _u_initializers(model):
+    return [t.name for t in model.graph.initializer if t.name.endswith("_quarot_u")]
+
+
+def _two_layer_model(K=32, M=32, N=8, seed=0):
+    rng = np.random.default_rng(seed)
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          T = MatMul(X, W1)
+          Y = MatMul(T, W2)
+        }}
+        """,
+        initializer=[
+            _f32(rng.standard_normal((K, M)) * 0.5, "W1"),
+            _f32(rng.standard_normal((M, N)) * 0.5, "W2"),
+        ],
+    )
+
+
+def _three_layer_model(K=32, M=32, P=32, N=8, seed=0):
+    rng = np.random.default_rng(seed)
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          A = MatMul(X, W1)
+          B = MatMul(A, W2)
+          Y = MatMul(B, W3)
+        }}
+        """,
+        initializer=[
+            _f32(rng.standard_normal((K, M)) * 0.5, "W1"),
+            _f32(rng.standard_normal((M, P)) * 0.5, "W2"),
+            _f32(rng.standard_normal((P, N)) * 0.5, "W3"),
+        ],
+    )
+
+
+def test_quarot_fused_emits_no_rotation_node_for_the_fused_layer():
+    model = _two_layer_model()
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=1)
+    onnx.checker.check_model(fused)
+
+    # Both layers are quantized, but only the first -- whose activation is
+    # the graph input X -- still needs a runtime MatMul(X, U). The second
+    # layer's rotation is folded into W1, so it has no U at all.
+    assert _u_initializers(fused) == ["W1_quarot_u"]
+    names = {t.name for t in fused.graph.initializer}
+    assert "W2_quarot_codes" in names  # ...but it is still quantized
+
+
+def test_quarot_fused_has_strictly_fewer_nodes_than_apply_quarot():
+    model = _two_layer_model()
+    plain = onnxsim.apply_quarot(model, block_size=8, seed=1)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=1)
+    # Exactly the one fused layer's MatMul(X, U) is gone.
+    assert len(fused.graph.node) == len(plain.graph.node) - 1
+    plain_ops = [n.op_type for n in plain.graph.node]
+    fused_ops = [n.op_type for n in fused.graph.node]
+    assert fused_ops.count("MatMul") == plain_ops.count("MatMul") - 1
+    assert len(_u_initializers(fused)) == len(_u_initializers(plain)) - 1
+
+
+def test_quarot_fused_is_about_as_accurate_as_apply_quarot():
+    # The fold is exact algebra, so the only lossy steps are the same two
+    # INT4 roundings apply_quarot already does -- but the rotation now
+    # happens inside a different float matmul, so the two are not
+    # bit-identical. Aggregate across seeds rather than betting on one.
+    plain_errors = []
+    fused_errors = []
+    for s in range(6):
+        model = _two_layer_model(seed=s)
+        plain = onnxsim.apply_quarot(model, block_size=8, seed=s + 1)
+        fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=s + 1)
+        x = np.random.default_rng(500 + s).standard_normal((16, 32)).astype(np.float32)
+        (float_y,) = _run(model, {"X": x})
+        (plain_y,) = _run(plain, {"X": x})
+        (fused_y,) = _run(fused, {"X": x})
+        assert np.all(np.isfinite(fused_y))
+        plain_errors.append(_rel_l2(float_y, plain_y))
+        fused_errors.append(_rel_l2(float_y, fused_y))
+
+    # Verified from real runs: both land around 0.17 mean, 0.23 max here.
+    assert np.mean(fused_errors) < 0.4
+    # Generous slack -- a layout/axis bug in the fold shows up as a
+    # several-times-worse error, not as a few percent.
+    assert np.mean(fused_errors) < 1.5 * np.mean(plain_errors) + 0.05
+
+
+def test_quarot_fused_chained_three_layers_round_trips():
+    # A -> B -> C: the middle layer is both a fused producer (its output
+    # dim carries C's rotation) and a quantized consumer (its reduction
+    # dim carries its own). Both rotations must be applied while the
+    # weight is still float; getting either axis wrong wrecks the numbers,
+    # not the shapes, so this has to be a real numeric check.
+    plain_errors = []
+    fused_errors = []
+    for s in range(6):
+        model = _three_layer_model(seed=s)
+        plain = onnxsim.apply_quarot(model, block_size=8, seed=s + 1)
+        fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=s + 1)
+        onnx.checker.check_model(fused)
+        # Only the first layer, fed by the graph input, keeps a runtime U.
+        assert _u_initializers(fused) == ["W1_quarot_u"]
+        assert len(fused.graph.node) == len(plain.graph.node) - 2
+
+        x = np.random.default_rng(700 + s).standard_normal((16, 32)).astype(np.float32)
+        (float_y,) = _run(model, {"X": x})
+        (plain_y,) = _run(plain, {"X": x})
+        (fused_y,) = _run(fused, {"X": x})
+        assert np.all(np.isfinite(fused_y))
+        plain_errors.append(_rel_l2(float_y, plain_y))
+        fused_errors.append(_rel_l2(float_y, fused_y))
+
+    # Verified from real runs: both land around 0.23 mean, 0.28 max here.
+    assert np.mean(fused_errors) < 0.5
+    assert np.mean(fused_errors) < 1.5 * np.mean(plain_errors) + 0.05
+
+
+def test_quarot_fused_gemm_producer_folds_the_bias_too():
+    # b_P' = b_P @ U, on the bias's output-channel axis. Left unrotated,
+    # the layer would emit T @ U + b_P instead of (T + b_P) @ U, which is
+    # visibly wrong rather than slightly noisy.
+    rng = np.random.default_rng(21)
+    K, M, N = 32, 32, 8
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          T = Gemm<transB=1>(X, W1, B1)
+          Y = Gemm(T, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(rng.standard_normal((M, K)) * 0.5, "W1"),
+            _f32(rng.standard_normal((M,)) * 0.5, "B1"),
+            _f32(rng.standard_normal((M, N)) * 0.5, "W2"),
+            _f32(rng.standard_normal((N,)) * 0.1, "B2"),
+        ],
+    )
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=2)
+    onnx.checker.check_model(fused)
+    assert _u_initializers(fused) == ["W1_quarot_u"]
+    assert "B1_quarot_folded" in {t.name for t in fused.graph.initializer}
+
+    x = rng.standard_normal((16, K)).astype(np.float32)
+    (float_y,) = _run(model, {"X": x})
+    (fused_y,) = _run(fused, {"X": x})
+    assert _rel_l2(float_y, fused_y) < 0.5
+
+
+def test_quarot_fused_folds_into_a_producer_it_does_not_quantize():
+    # The producer's own K=20 is not divisible by block_size 8, so it is
+    # left in float -- but its weight is still constant, so the consumer's
+    # rotation folds into it exactly and its rotated float weight is
+    # simply written back under a fresh name.
+    rng = np.random.default_rng(22)
+    model = _model(
+        """
+        g (float[batch,20] X) => (float[batch,8] Y)
+        {
+          T = MatMul(X, W1)
+          Y = MatMul(T, W2)
+        }
+        """,
+        initializer=[
+            _f32(rng.standard_normal((20, 32)) * 0.5, "W1"),
+            _f32(rng.standard_normal((32, 8)) * 0.5, "W2"),
+        ],
+    )
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=2)
+    onnx.checker.check_model(fused)
+    assert _u_initializers(fused) == []
+    assert "W1_quarot_folded" in {t.name for t in fused.graph.initializer}
+
+    x = rng.standard_normal((16, 20)).astype(np.float32)
+    (float_y,) = _run(model, {"X": x})
+    (fused_y,) = _run(fused, {"X": x})
+    assert _rel_l2(float_y, fused_y) < 0.5
+
+
+def test_quarot_fused_declines_when_activation_has_two_consumers():
+    # Rotating T for one consumer would corrupt the other, so both layers
+    # fall back to apply_quarot's explicit runtime rotation -- which is
+    # exactly what apply_quarot itself produces here, byte for byte.
+    rng = np.random.default_rng(23)
+    K, M, N = 32, 32, 8
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          T = MatMul(X, W1)
+          Y1 = MatMul(T, W2)
+          Y2 = MatMul(T, W3)
+          Y = Add(Y1, Y2)
+        }}
+        """,
+        initializer=[
+            _f32(rng.standard_normal((K, M)) * 0.5, "W1"),
+            _f32(rng.standard_normal((M, N)) * 0.5, "W2"),
+            _f32(rng.standard_normal((M, N)) * 0.5, "W3"),
+        ],
+    )
+    plain = onnxsim.apply_quarot(model, block_size=8, seed=3)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=3)
+    assert len(_u_initializers(fused)) == 3
+    assert fused.SerializeToString() == plain.SerializeToString()
+
+
+def test_quarot_fused_declines_when_producer_output_is_a_graph_output():
+    # T must keep its unrotated value for whoever reads it.
+    rng = np.random.default_rng(24)
+    model = _model(
+        """
+        g (float[batch,32] X) => (float[batch,32] T, float[batch,8] Y)
+        {
+          T = MatMul(X, W1)
+          Y = MatMul(T, W2)
+        }
+        """,
+        initializer=[
+            _f32(rng.standard_normal((32, 32)) * 0.5, "W1"),
+            _f32(rng.standard_normal((32, 8)) * 0.5, "W2"),
+        ],
+    )
+    plain = onnxsim.apply_quarot(model, block_size=8, seed=3)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=3)
+    assert len(_u_initializers(fused)) == 2
+    assert fused.SerializeToString() == plain.SerializeToString()
+
+
+def test_quarot_fused_declines_non_constant_producer_weight():
+    # Nothing to fold into: W1 is a graph input, not an initializer.
+    rng = np.random.default_rng(25)
+    model = _model(
+        """
+        g (float[batch,32] X, float[32,32] W1) => (float[batch,8] Y)
+        {
+          T = MatMul(X, W1)
+          Y = MatMul(T, W2)
+        }
+        """,
+        initializer=[_f32(rng.standard_normal((32, 8)) * 0.5, "W2")],
+    )
+    plain = onnxsim.apply_quarot(model, block_size=8, seed=3)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=3)
+    assert _u_initializers(fused) == ["W2_quarot_u"]
+    assert fused.SerializeToString() == plain.SerializeToString()
+
+
+def test_quarot_fused_declines_broadcast_gemm_bias():
+    # A scalar Gemm bias has no output-channel axis for b @ U to act on.
+    rng = np.random.default_rng(26)
+    model = _model(
+        """
+        g (float[batch,32] X) => (float[batch,8] Y)
+        {
+          T = Gemm(X, W1, B1)
+          Y = MatMul(T, W2)
+        }
+        """,
+        initializer=[
+            _f32(rng.standard_normal((32, 32)) * 0.5, "W1"),
+            _f32(np.array(0.25, dtype=np.float32), "B1"),
+            _f32(rng.standard_normal((32, 8)) * 0.5, "W2"),
+        ],
+    )
+    plain = onnxsim.apply_quarot(model, block_size=8, seed=3)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=3)
+    assert len(_u_initializers(fused)) == 2
+    assert fused.SerializeToString() == plain.SerializeToString()
+
+
+def test_quarot_fused_leaves_a_shared_producer_weight_intact():
+    # W1 feeds two nodes; only the one whose output is fused gets the
+    # rotated copy, under a fresh name. The other must stay exact.
+    rng = np.random.default_rng(27)
+    model = _model(
+        """
+        g (float[batch,20] X) => (float[batch,8] Y, float[batch,32] Z)
+        {
+          T = MatMul(X, W1)
+          Z = MatMul(X, W1)
+          Y = MatMul(T, W2)
+        }
+        """,
+        initializer=[
+            _f32(rng.standard_normal((20, 32)) * 0.5, "W1"),
+            _f32(rng.standard_normal((32, 8)) * 0.5, "W2"),
+        ],
+    )
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=3)
+    onnx.checker.check_model(fused)
+    x = rng.standard_normal((16, 20)).astype(np.float32)
+    float_y, float_z = _run(model, {"X": x})
+    fused_y, fused_z = _run(fused, {"X": x})
+    assert np.allclose(float_z, fused_z, atol=1e-5)
+    assert _rel_l2(float_y, fused_y) < 0.5
+
+
+def test_quarot_fused_matches_apply_quarot_when_nothing_is_fusable():
+    model = _matmul_model(K=32, N=8, seed=8)
+    plain = onnxsim.apply_quarot(model, block_size=8, seed=9)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8, seed=9)
+    assert fused.SerializeToString() == plain.SerializeToString()
+
+
+def test_quarot_fused_declines_when_k_not_divisible_by_block_size():
+    model = _matmul_model(K=20, N=4, seed=10)
+    fused = onnxsim.apply_quarot_fused(model, block_size=8)
+    assert fused.SerializeToString() == model.SerializeToString()
+
+
+def test_quarot_fused_noop_when_no_matmul_present():
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
+    fused = onnxsim.apply_quarot_fused(model)
+    assert fused.SerializeToString() == model.SerializeToString()
+
+
+def test_quarot_fused_declines_below_opset21():
+    model = _matmul_model(K=32, N=8, opset=13)
+    fused = onnxsim.apply_quarot_fused(model)
+    assert fused.SerializeToString() == model.SerializeToString()

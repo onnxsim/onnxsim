@@ -62,7 +62,9 @@ Fusing one global rotation across an entire model needs a model-level
 graph walk this module does not attempt; instead, matching
 `apply_spinquant`'s own scope, this module fits one independent rotation
 **per matched layer**, at the cost of an explicit `MatMul(X, U)` per layer
-rather than a fused rotation. The real QuaRot also offers an optional
+rather than a fused rotation. `apply_quarot_fused` (below) recovers the
+"free at inference" half of that gap on the subset of edges where the
+algebra allows it, without the model-level walk. The real QuaRot also offers an optional
 GPTQ-based weight quantizer for a tighter error bound; `apply_quarot`
 itself always uses plain round-to-nearest for the weight, but see
 `apply_quarot_gptq` below for the GPTQ-based variant.
@@ -139,3 +141,98 @@ No `calibration_data` argument exists -- unlike `apply_spinquant`,
 fit to data, and both quantization scales come from the rotated values
 themselves (offline for the weight, at graph-run time for the activation),
 so there is nothing to calibrate.
+
+## Fusing the rotation into the producer (`apply_quarot_fused`)
+
+`apply_quarot` pays an explicit `MatMul(X, U)` at run time for every
+layer it quantizes. `onnxsim.apply_quarot_fused` does the same matching,
+draws the same rotations from the same seed, and quantizes the same way --
+but wherever the graph allows it, it folds that `MatMul(X, U)` into the
+*producing* layer's weight offline, so the rotation costs nothing at
+inference. That is the "free at inference" property the real QuaRot gets
+from its residual-stream-wide rotation, here obtained one edge at a time.
+
+### The algebra
+
+If layer `P` produces the tensor `T` that layer `L` consumes, and `P`'s
+weight is constant:
+
+```
+P's output:  T = X_prev @ W_P            (+ b_P)
+Fold:        W_P' = W_P @ U    and (if P has a bias)  b_P' = b_P @ U
+Then:        X_prev @ W_P' (+ b_P')  ==  (X_prev @ W_P + b_P) @ U  ==  T @ U
+```
+
+so `P` directly emits the rotated activation `L` wants. `L`'s own weight
+is rotated exactly as `apply_quarot` rotates it, so
+`(T @ U) @ (U.T @ W_L) == T @ W_L` still holds. The fold is exact
+algebra: nothing is lost by it, and the only lossy steps remain the same
+two INT4 roundings. The result is `apply_quarot`'s accuracy with one
+`MatMul` node and one `[K, K]` float initializer fewer per fused layer.
+
+Note the two rotations act on **different axes** of a weight: a layer's
+own input-side rotation acts on its reduction dim `K` (right-multiply,
+`W @ U`), while an output-side fold acts on its output dim `N`. A layer
+that is both a fused producer and a quantized consumer -- the middle of a
+chain `A -> B -> C` -- gets **both**, and both are applied while its
+weight is still float, before it is quantized. Chains of any length are
+handled: the pass plans every rotation first, then rotates every weight,
+and only then quantizes.
+
+### Exactly which edges are fusable
+
+`L`'s activation edge is fused only when **all** of these hold:
+
+- the activation tensor is produced by a node in the main graph that the
+  same matcher accepts (a `MatMul`, or a `Gemm` with `transA=0`,
+  `alpha=1`, `beta=1`) whose weight is a constant 2-D float32
+  initializer. The producer does *not* itself need to be quantizable --
+  a producer whose own `K` is not divisible by `block_size` stays in
+  float and simply gets its rotated float weight written back;
+- that tensor is referenced by exactly one node input in the whole model,
+  subgraph bodies included. A tensor consumed twice cannot be rotated for
+  one consumer without corrupting the other;
+- that tensor is not a graph output -- a graph output must keep its
+  unrotated value;
+- the producer's output dimension equals `L`'s reduction dimension `K`;
+- if the producer has a bias, that bias is a constant float32 initializer
+  shaped `[N]` or `[1, N]` -- the only shapes whose last axis is
+  unambiguously the output-channel axis, and so the only ones `b @ U` is
+  defined for. A scalar/broadcast `Gemm` bias is not folded, and its edge
+  is not fused.
+
+An edge that fails any of these is **not** skipped and **not** silently
+mis-rotated: its layer falls back to `apply_quarot`'s explicit runtime
+`MatMul(X, U)`, exactly as before. When no edge in a model is fusable,
+`apply_quarot_fused` returns byte-for-byte what `apply_quarot` returns.
+Original initializers are never edited in place -- a rotated producer
+weight or bias is written under a fresh `_quarot_folded` name -- so a
+weight shared by several nodes stays exact for the nodes that were not
+folded into.
+
+### What this still is not
+
+This is still a **per-layer** rotation, not the real QuaRot's single
+residual-stream-wide one: each matched layer keeps its own independent
+`U`. What `apply_quarot_fused` removes is only the *runtime cost* of that
+rotation, on the subset of edges where the algebra above applies. Layers
+fed by anything other than another constant-weight `MatMul`/`Gemm` -- a
+model input, a normalization, an activation function, a residual `Add`,
+an attention softmax -- are not fusable and keep their explicit
+`MatMul(X, U)`. In a real transformer that means the projections that
+immediately follow a LayerNorm or a residual add (i.e. most of them) still
+pay for their rotation; fusing those needs the model-level residual-stream
+walk this module still does not attempt.
+
+### Usage
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("model.onnx")
+quantized = onnxsim.apply_quarot_fused(model, block_size=32, seed=0)
+onnx.save(quantized, "model.quarot.onnx")
+```
+
+Same signature as `apply_quarot`, and still no `calibration_data`.
