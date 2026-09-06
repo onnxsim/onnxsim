@@ -423,10 +423,16 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 // mirroring pruning.py's own `_to_f64`/`_from_f64` convention), plus every
 // `com.microsoft::Attention` node's constant 2-D FLOAT/FLOAT16/BFLOAT16
 // merged QKV weight (MatchAttentionProducerAnyFloat -- a narrow, SparseGPT-
-// local dtype-widened duplicate of the shared, still-FLOAT32-only
-// MatchAttentionProducer, which also backs this file's own structural
-// Attention-head pruning and was deliberately left untouched -- see that
-// function's own comment in structured_pruning_entry.cpp), PLUS every 2-D
+// local duplicate of the shared MatchAttentionProducer, which also backs
+// this file's own structural Attention-head pruning and has SINCE been
+// independently widened to the identical FLOAT/FLOAT16/BFLOAT16 dtype scope
+// -- the two functions' remaining difference is op-type scope, not dtype:
+// MatchAttentionProducerAnyFloat still only recognizes plain `Attention`,
+// while MatchAttentionProducer also recognizes `DecoderMaskedSelfAttention`/
+// `PackedAttention` -- a widening SparseGPT weight-only pruning has not been
+// independently re-verified against, so this duplicate is deliberately left
+// as is rather than merged -- see that function's own comment in
+// structured_pruning_entry.cpp), PLUS every 2-D
 // `Conv`/`FusedConv` node (ordinary/depthwise/general-grouped alike) with a
 // constant 4-D FLOAT/FLOAT16/BFLOAT16 `[out_channels, in_channels/group,
 // kh, kw]` weight (`_match_conv_weight_only`'s own criteria: `group >= 1`,

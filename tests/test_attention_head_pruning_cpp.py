@@ -54,6 +54,7 @@ builder/test section below, and each ``Match*Producer`` function's own
 comment in ``structured_pruning_entry.cpp``, for the exact narrowing.
 """
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx.helper
@@ -68,6 +69,14 @@ ort = pytest.importorskip("onnxruntime")
 
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
+
+
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+def _bf16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(ml_dtypes.bfloat16), name)
 
 
 def _run(model, feeds):
@@ -4566,3 +4575,466 @@ def test_cpp_decomposed_gqa_qk_norm_pruning_matches_oracle_and_python_reference_
     (y_pruned,) = _run(pruned_cpp, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+# --- FLOAT16 / BFLOAT16 weight support ---------------------------------------
+#
+# `_is_supported_float_dtype` (pruning.py) accepts FLOAT/FLOAT16/BFLOAT16
+# uniformly for every producer/consumer weight and bias across all matched
+# attention families; this port's own matchers (MatchAttentionProducer,
+# MatchProducerAnyFloat, WalkToAttentionConsumer, and every downstream
+# apply-time weight read/rank/slice/write) now mirror that exactly (see each
+# function's own comment in structured_pruning_entry.cpp). One FLOAT16 and
+# one BFLOAT16 case per major family group below (merged-QKV `Attention`,
+# separate-producer `GroupQueryAttention`, separate-producer
+# `MultiHeadAttention`, and the decomposed/un-fused shape), each checked
+# against the live pure-Python `apply_attention_head_pruning` reference
+# byte-for-byte (`SerializeToString()` equality) -- both `onnx.checker`
+# and this repo's own ONNX Runtime confirm FLOAT16 has a real CPU kernel for
+# every one of these ops in this environment, and BFLOAT16 at least passes
+# `onnx.checker.check_model` (its own schema's `T` type constraint includes
+# it) even where no CPU kernel exists, so both are exercised the same
+# structural way here -- via the graph-rewrite comparison alone, never a
+# real session run (mirroring this module's own decomposed-GQA/MQA tests'
+# "matches_python_reference_exactly" naming and style).
+
+
+@pytest.mark.parametrize(
+    "dtype,dtype_name",
+    [(np.float16, "float16"), (ml_dtypes.bfloat16, "bfloat16")],
+)
+def test_cpp_attention_head_pruning_widened_dtype_matches_python_reference_exactly(
+    dtype, dtype_name
+):
+    K, H, D, Out = 8, 4, 4, 6
+    Nq = Nk = Nv = H * D
+    rng = np.random.default_rng(301)
+    wqkv = (rng.standard_normal((K, Nq + Nk + Nv)) * 0.3).astype(dtype)
+    bqkv = (rng.standard_normal((Nq + Nk + Nv,)) * 0.1).astype(dtype)
+    wout = (rng.standard_normal((Nv, Out)) * 0.3).astype(dtype)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g ({dtype_name}[batch,seq,{K}] X) => ({dtype_name}[batch,seq,{Out}] Y)
+        {{
+          ctx = com.microsoft.Attention <num_heads={H}, qkv_hidden_sizes=[{Nq},{Nk},{Nv}]> (X, Wqkv, Bqkv)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(wqkv, "Wqkv"),
+            onnx.numpy_helper.from_array(bqkv, "Bqkv"),
+            onnx.numpy_helper.from_array(wout, "Wout"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    onnx_dtype = onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert inits["Wqkv"].data_type == onnx_dtype
+    assert list(inits["Wqkv"].dims) == [K, 6 * D]  # H=4 -> keep_count=2 heads
+
+
+@pytest.mark.parametrize(
+    "dtype,dtype_name",
+    [(np.float16, "float16"), (ml_dtypes.bfloat16, "bfloat16")],
+)
+def test_cpp_gqa_pruning_widened_dtype_matches_python_reference_exactly(
+    dtype, dtype_name
+):
+    K, H, KVH, D, Out, batch, seq = 8, 4, 2, 8, 6, 2, 5
+    Nq, Nkv = H * D, KVH * D
+    rng = np.random.default_rng(302)
+    wq = (rng.standard_normal((K, Nq)) * 0.3).astype(dtype)
+    wk = (rng.standard_normal((K, Nkv)) * 0.3).astype(dtype)
+    wv = (rng.standard_normal((K, Nkv)) * 0.3).astype(dtype)
+    wout = (rng.standard_normal((Nq, Out)) * 0.3).astype(dtype)
+    seqlens_k = np.full((batch,), seq - 1, dtype=np.int32)
+    total_seq = np.array(seq, dtype=np.int32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g ({dtype_name}[{batch},{seq},{K}] X) => ({dtype_name}[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(wq, "Wq"),
+            onnx.numpy_helper.from_array(wk, "Wk"),
+            onnx.numpy_helper.from_array(wv, "Wv"),
+            onnx.numpy_helper.from_array(wout, "Wout"),
+            onnx.numpy_helper.from_array(seqlens_k, "SeqLensK"),
+            onnx.numpy_helper.from_array(total_seq, "TotalSeq"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    onnx_dtype = onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert inits["Wq"].data_type == onnx_dtype
+    assert inits["Wk"].data_type == onnx_dtype
+    assert list(inits["Wk"].dims) == [K, D]  # KVH=2 -> keep_count=1 KV group
+
+
+@pytest.mark.parametrize(
+    "dtype,dtype_name",
+    [(np.float16, "float16"), (ml_dtypes.bfloat16, "bfloat16")],
+)
+def test_cpp_mha_pruning_widened_dtype_matches_python_reference_exactly(
+    dtype, dtype_name
+):
+    K, H, D, Out, batch, seq = 8, 8, 4, 6, 2, 5
+    Nq = Nk = Nv = H * D
+    rng = np.random.default_rng(303)
+    wq = (rng.standard_normal((K, Nq)) * 0.3).astype(dtype)
+    wk = (rng.standard_normal((K, Nk)) * 0.3).astype(dtype)
+    wv = (rng.standard_normal((K, Nv)) * 0.3).astype(dtype)
+    wout = (rng.standard_normal((Nv, Out)) * 0.3).astype(dtype)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g ({dtype_name}[{batch},{seq},{K}] X) => ({dtype_name}[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.MultiHeadAttention <num_heads={H}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(wq, "Wq"),
+            onnx.numpy_helper.from_array(wk, "Wk"),
+            onnx.numpy_helper.from_array(wv, "Wv"),
+            onnx.numpy_helper.from_array(wout, "Wout"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    onnx_dtype = onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert inits["Wq"].data_type == onnx_dtype
+    assert list(inits["Wq"].dims) == [K, 4 * D]  # H=8 -> keep_count=4 heads
+
+
+def _decomposed_gqa_model_dtype(dtype, dtype_name, seed):
+    """Trimmed, dtype-parametrized rebuild of `_decomposed_gqa_model`'s own
+    "plain" (bias=True, needs_repeat_kv, no mask/rope/qk_norm) shape --
+    covers this port's own downstream-arithmetic FLOAT16/BFLOAT16 widening
+    for `ApplyOneDecomposedGqaChain` (`ReadTensorAsF64`/`WriteF64TensorAs`/
+    `SliceAxisGeneric`/`TransposeFlat<double>` throughout).
+    """
+    K, H, KVH, D, Out, batch, seq = 32, 4, 2, 8, 16, 1, 4
+    Nq, Nk, Nv = H * D, KVH * D, KVH * D
+    rng = np.random.default_rng(seed)
+    wq = (rng.standard_normal((K, Nq)) * 0.3).astype(dtype)
+    wk = (rng.standard_normal((K, Nk)) * 0.3).astype(dtype)
+    wv = (rng.standard_normal((K, Nv)) * 0.3).astype(dtype)
+    wout = (rng.standard_normal((H * D, Out)) * 0.3).astype(dtype)
+    bq = (rng.standard_normal((Nq,)) * 0.1).astype(dtype)
+    bk = (rng.standard_normal((Nk,)) * 0.1).astype(dtype)
+    bv = (rng.standard_normal((Nv,)) * 0.1).astype(dtype)
+    bout = (rng.standard_normal((Out,)) * 0.1).astype(dtype)
+    scale = np.array(D**-0.5).astype(dtype)
+    n_rep = H // KVH
+
+    def _i64(arr, name):
+        return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    initializer = [
+        onnx.numpy_helper.from_array(wq, "Wq"),
+        onnx.numpy_helper.from_array(wk, "Wk"),
+        onnx.numpy_helper.from_array(wv, "Wv"),
+        onnx.numpy_helper.from_array(wout, "Wout"),
+        onnx.numpy_helper.from_array(bq, "Bq"),
+        onnx.numpy_helper.from_array(bk, "Bk"),
+        onnx.numpy_helper.from_array(bv, "Bv"),
+        onnx.numpy_helper.from_array(bout, "Bout"),
+        _i64([batch * seq, K], "XFlatShape"),
+        _i64([batch, seq, H, D], "Sq"),
+        _i64([batch, seq, KVH, D], "Sk"),
+        _i64([batch, seq, KVH, D], "Sv"),
+        _i64([2], "Ax2"),
+        _i64([batch, KVH, n_rep, seq, D], "KExpandShape"),
+        _i64([batch, H, seq, D], "KMergeShape"),
+        _i64([batch, KVH, n_rep, seq, D], "VExpandShape"),
+        _i64([batch, H, seq, D], "VMergeShape"),
+        onnx.numpy_helper.from_array(scale, "Scale"),
+        _i64([batch * seq, H * D], "OutShape"),
+        _i64([batch, seq, Out], "YShape"),
+    ]
+    body = f"""
+        g ({dtype_name}[{batch},{seq},{K}] X) => ({dtype_name}[{batch},{seq},{Out}] Y)
+        {{
+          xf = Reshape(X, XFlatShape)
+          q0 = Gemm(xf, Wq, Bq)
+          qr = Reshape(q0, Sq)
+          qt = Transpose<perm=[0,2,1,3]>(qr)
+          k0 = Gemm(xf, Wk, Bk)
+          kr = Reshape(k0, Sk)
+          kt0 = Transpose<perm=[0,2,1,3]>(kr)
+          ku = Unsqueeze(kt0, Ax2)
+          ke = Expand(ku, KExpandShape)
+          kre = Reshape(ke, KMergeShape)
+          kt = Transpose<perm=[0,1,3,2]>(kre)
+          v0 = Gemm(xf, Wv, Bv)
+          vr = Reshape(v0, Sv)
+          vt0 = Transpose<perm=[0,2,1,3]>(vr)
+          vu = Unsqueeze(vt0, Ax2)
+          ve = Expand(vu, VExpandShape)
+          vt = Reshape(ve, VMergeShape)
+          qk = MatMul(qt, kt)
+          scaled = Mul(qk, Scale)
+          attn = Softmax<axis=-1>(scaled)
+          ctx0 = MatMul(attn, vt)
+          ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)
+          ctx2 = Reshape(ctx1, OutShape)
+          y0 = Gemm(ctx2, Wout, Bout)
+          Y = Reshape(y0, YShape)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(K=K, H=H, KVH=KVH, D=D, wq=wq, wk=wk, wv=wv)
+
+
+@pytest.mark.parametrize(
+    "dtype,dtype_name",
+    [(np.float16, "float16"), (ml_dtypes.bfloat16, "bfloat16")],
+)
+def test_cpp_decomposed_gqa_pruning_widened_dtype_matches_python_reference_exactly(
+    dtype, dtype_name
+):
+    model, cfg = _decomposed_gqa_model_dtype(dtype, dtype_name, seed=304)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    onnx_dtype = onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert inits["Wq"].data_type == onnx_dtype
+    assert inits["Wk"].data_type == onnx_dtype
+    # KVH=2 -> keep_count=1 KV group -> Wk/Wv shrink to a single D-wide head;
+    # Wq shrinks to that group's own 2 (of 4) query heads.
+    assert list(inits["Wk"].dims) == [cfg["K"], cfg["D"]]
+    assert list(inits["Wq"].dims) == [cfg["K"], 2 * cfg["D"]]
+    # Value-preserving slice -- the surviving KV group's own column block
+    # (whichever of the two KVH=2 groups importance ranking kept) must
+    # reproduce the exact original fp16/bf16 bit pattern, not a re-rounded
+    # one -- checked against both candidate groups since which one survives
+    # is a ranking outcome, not fixed by construction.
+    d = cfg["D"]
+    kept_wk = onnx.numpy_helper.to_array(inits["Wk"]).view(np.uint16)
+    candidates = [
+        cfg["wk"][:, :d].view(np.uint16),
+        cfg["wk"][:, d : 2 * d].view(np.uint16),
+    ]
+    assert any(np.array_equal(kept_wk, c) for c in candidates)
+
+
+# --- com.microsoft::DecoderMaskedSelfAttention / PackedAttention producer
+# --- recognition (MatchAttentionProducer's own three-op-type scope) --------
+#
+# MatchAttentionProducer (structured_pruning_entry.cpp) now recognizes
+# `com.microsoft::DecoderMaskedSelfAttention` and `com.microsoft::
+# PackedAttention` as the same merged-QKV family plain `Attention` already
+# was -- mirroring pruning.py's own `_match_attention_producer`, including
+# `DecoderMaskedSelfAttention`'s own schema quirks (no `qkv_hidden_sizes`
+# attribute -- confirmed below -- and a required `past` input, left
+# untouched here since it's never a constant in this model). Both compared
+# against the live pure-Python reference byte-for-byte, same as every other
+# family above.
+
+
+def test_cpp_decoder_masked_self_attention_pruning_matches_python_reference_exactly():
+    K, H, D, Out, batch = 8, 4, 4, 6, 2
+    Nq = Nk = Nv = H * D
+    rng = np.random.default_rng(305)
+    wqkv = (rng.standard_normal((K, Nq + Nk + Nv)) * 0.3).astype(np.float32)
+    bqkv = (rng.standard_normal((Nq + Nk + Nv,)) * 0.1).astype(np.float32)
+    wout = (rng.standard_normal((Nv, Out)) * 0.3).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[{batch},1,{K}] X) => (float[{batch},1,{Out}] Y)
+        {{
+          ctx = com.microsoft.DecoderMaskedSelfAttention <num_heads={H}> (X, Wqkv, Bqkv)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wqkv, "Wqkv"), _f32(bqkv, "Bqkv"), _f32(wout, "Wout")]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = next(
+        n for n in pruned_cpp.graph.node if n.op_type == "DecoderMaskedSelfAttention"
+    )
+    assert next(a.i for a in node.attribute if a.name == "num_heads") == 2
+    # No real `qkv_hidden_sizes` attribute on this op's own schema -- never
+    # added, mirroring pruning.py's own `_apply_one_plain_attention_chain`.
+    assert not any(a.name == "qkv_hidden_sizes" for a in node.attribute)
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert list(inits["Wqkv"].dims) == [K, 6 * D]
+
+
+def test_cpp_packed_attention_pruning_matches_python_reference_exactly():
+    K, H, D, Out, batch = 8, 4, 4, 6, 2
+    Nq = Nk = Nv = H * D
+    rng = np.random.default_rng(306)
+    wqkv = (rng.standard_normal((K, Nq + Nk + Nv)) * 0.3).astype(np.float32)
+    bqkv = (rng.standard_normal((Nq + Nk + Nv,)) * 0.1).astype(np.float32)
+    wout = (rng.standard_normal((Nv, Out)) * 0.3).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[{batch * 3},{K}] X, int32[{batch},3] TokenOffset, int32[{batch + 1}] CumSeqLen) => (float[{batch * 3},{Out}] Y)
+        {{
+          ctx = com.microsoft.PackedAttention <num_heads={H}, qkv_hidden_sizes=[{Nq},{Nk},{Nv}]> (X, Wqkv, Bqkv, TokenOffset, CumSeqLen)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wqkv, "Wqkv"), _f32(bqkv, "Bqkv"), _f32(wout, "Wout")]
+    )
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    node = next(n for n in pruned_cpp.graph.node if n.op_type == "PackedAttention")
+    assert next(a.i for a in node.attribute if a.name == "num_heads") == 2
+    qkv = next(list(a.ints) for a in node.attribute if a.name == "qkv_hidden_sizes")
+    assert qkv == [2 * D, 2 * D, 2 * D]
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert list(inits["Wqkv"].dims) == [K, 6 * D]
+
+
+# --- Gap C: `com.microsoft::MatMulNBitsQkv` scope -- `ApplyAttentionHead
+# --- Pruning` vs. `ApplyAttentionHeadWandaPruning` ---------------------------
+#
+# Investigated as part of this same round of parity fixes: unlike a
+# hypothetical accidental scope-creep, `ApplyAttentionHeadPruning`'s own
+# `FindMatMulNBitsQkvChains`/`ApplyMatMulNBitsQkvChains` call is a
+# DELIBERATE, documented consolidation -- see structured_pruning_entry.cpp's
+# own comment directly above that call site, and this file's own "com.
+# microsoft::MatMulNBitsQkv" section comment above `_matmul_nbits_qkv_model`
+# (which pruning.py's own `apply_structured_pruning_matmul_nbits` explicitly
+# defers to `apply_attention_head_pruning_cpp` for -- see
+# `onnxsim.apply_structured_pruning_cpp`'s own docstring). Removing it would
+# leave `MatMulNBitsQkv` with NO C++ pruning path anywhere (pure-Python's own
+# `apply_attention_head_pruning` never touches it either -- that's
+# `apply_structured_pruning_matmul_nbits`'s own job there), a real regression
+# against this module's own already-extensive `test_cpp_matmul_nbits_qkv_
+# pruning_*` coverage above -- so it is intentionally KEPT here, unlike
+# `ApplyAttentionHeadWandaPruning`, which correctly has no such call at all
+# (mirroring pruning.py's own scope: no calibration-driven counterpart of
+# `apply_structured_pruning_matmul_nbits` exists there either). This test
+# pins that asymmetry: the plain entry point prunes a `MatMulNBitsQkv` chain
+# (already proven above), the Wanda entry point leaves the identical chain
+# completely untouched.
+
+
+def test_cpp_attention_head_wanda_pruning_leaves_matmul_nbits_qkv_chains_untouched():
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 8, 32, 16, 24
+    rng = np.random.default_rng(307)
+    Nq, Nkv = num_heads * d, kv_num_heads * d
+    w_q = (rng.standard_normal((Nq, K)) * 0.3).astype(np.float32)
+    w_k = (rng.standard_normal((Nkv, K)) * 0.3).astype(np.float32)
+    w_v = (rng.standard_normal((Nkv, K)) * 0.3).astype(np.float32)
+    bias_q = (rng.standard_normal((Nq,)) * 0.1).astype(np.float32)
+    bias_k = (rng.standard_normal((Nkv,)) * 0.1).astype(np.float32)
+    bias_v = (rng.standard_normal((Nkv,)) * 0.1).astype(np.float32)
+    norm_scale = np.ones((K,), dtype=np.float32)
+    model, _info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        w_q,
+        w_k,
+        w_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+    onnx.checker.check_model(model)
+
+    calibration_data = [
+        {"A": rng.standard_normal((2, 5, K)).astype(np.float32)} for _ in range(2)
+    ]
+    pruned = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    assert pruned.SerializeToString() == model.SerializeToString()
