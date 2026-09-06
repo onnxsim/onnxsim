@@ -32,7 +32,7 @@
     "coverage": "c8 npm run test:all"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.27.0"
+    "onnxruntime-web": "^1.29.0"
   },
   "devDependencies": {
     "c8": "^10.1.3"

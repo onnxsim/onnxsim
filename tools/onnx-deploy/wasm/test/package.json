@@ -7,6 +7,6 @@
     "test": "node run_test.mjs"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.19.2"
+    "onnxruntime-web": "^1.29.0"
   }
 }
