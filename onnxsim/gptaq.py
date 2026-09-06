@@ -67,7 +67,7 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _find_int4_matmul_candidates, _node_outputs, _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _gptq_quantize_columns, _inverse_hessian_cholesky
 
@@ -100,7 +100,9 @@ def apply_gptaq(
             activations at a candidate layer's input reflect whatever
             upstream layers' quantization already did. Layers quantized by
             any other scheme (or left unquantized), or whose activation
-            input isn't a plain 2-D tensor, are left untouched. Assumes
+            input has no feature axis at all (rank < 2) are left
+            untouched; a higher-rank ``[batch, seq, K]`` activation is
+            flattened to ``[batch * seq, K]``, which is exact. Assumes
             ``quantized_model`` was produced from ``float_model`` without
             renaming any MatMul/Gemm node's own output tensor -- true of
             every onnxsim ``quantize_*`` function.
@@ -145,7 +147,7 @@ def apply_gptaq(
         if qn is not None and len(qn.input) >= 1:
             quant_probe_name[c.output_name] = qn.input[0]
 
-    float_probe_names = [c.float_node.input[0] for c in candidates]
+    float_probe_names = sorted({c.float_node.input[0] for c in candidates})
     float_probe = _add_probe_outputs(float_model, float_probe_names)
     quant_probe = _add_probe_outputs(quantized_model, list(quant_probe_name.values()))
 
@@ -166,8 +168,8 @@ def apply_gptaq(
         quant_name = quant_probe_name.get(c.output_name)
         if quant_name is None:
             continue
-        x_true_parts = [a for a in float_acts[c.float_node.input[0]] if a.ndim == 2]
-        x_quant_parts = [a for a in quant_acts[quant_name] if a.ndim == 2]
+        x_true_parts = _activation_rows(float_acts[c.float_node.input[0]])
+        x_quant_parts = _activation_rows(quant_acts[quant_name])
         if not x_true_parts or len(x_true_parts) != len(x_quant_parts):
             continue
         if any(a.shape != b.shape for a, b in zip(x_true_parts, x_quant_parts)):

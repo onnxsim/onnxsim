@@ -79,9 +79,11 @@ an ordinary (convex) least-squares problem with no relaxation needed.
 :func:`onnxsim.apply_adaround`'s own scope exactly -- no Conv support (a
 Conv layer's own im2col expansion, and the padding/stride/dilation
 bookkeeping ``pruning.py``'s own Wanda-calibrated Conv path already needs,
-is real extra work this module doesn't yet do). A captured activation that
-isn't a plain 2-D array (e.g. an un-flattened ``[batch, seq, K]`` tensor)
-is skipped, the same boundary :func:`onnxsim.apply_adaround` already has.
+is real extra work this module doesn't yet do). A captured activation with
+no feature axis at all (rank < 2) is skipped; a higher-rank
+``[batch, seq, K]`` one is flattened to ``[batch * seq, K]`` -- exact, as
+the fit sums over the same rows either way -- the same boundary
+:func:`onnxsim.apply_adaround` already has.
 This also does not, itself, touch attention-head-pruned Q/K/V/output-
 projection weights that live inside a fused ``com.microsoft::Attention``/
 ``GroupQueryAttention``/``ai.onnx::Attention`` node (no MatMul/Gemm node
@@ -107,7 +109,7 @@ import onnx
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.smoothquant import _match_matmul_like
 
@@ -322,7 +324,9 @@ def apply_pruning_finetune(
             if it has one) replaced by its fine-tuned fit; a layer whose
             weight isn't a clean row/column subsequence of its own
             ``original_model`` counterpart, or whose captured activation
-            isn't a plain 2-D array, is left completely untouched
+            has no feature axis at all (rank < 2), is left completely
+            untouched; a higher-rank ``[batch, seq, K]`` activation is
+            flattened to ``[batch * seq, K]``, which is exact
     """
     if isinstance(original_model, str):
         original_model = onnx.load(original_model, load_external_data=False)
@@ -349,9 +353,9 @@ def apply_pruning_finetune(
     optimized_w: Dict[str, np.ndarray] = {}
     optimized_b: Dict[str, np.ndarray] = {}
     for c in candidates:
-        acts = [a for a in activations[c.x_name] if a.ndim == 2]
+        acts = _activation_rows(activations[c.x_name])
         if not acts:
-            continue  # not a plain 2-D activation -- skip, see this module's own docstring
+            continue  # no usable activation (no feature axis); skip
         x_full = np.concatenate(acts, axis=0)
 
         w_orig = onnx.numpy_helper.to_array(c.w_orig).astype(np.float64)

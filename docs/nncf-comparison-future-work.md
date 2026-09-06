@@ -59,14 +59,33 @@ that dispatcher rather than a new concept -- the missing piece is the
 iterate-until-target-met control loop and a formal target-metric API, not new
 math.
 
-### 3. A real onnxsim-vs-NNCF benchmark
-The comparison above is architectural, not empirical -- no benchmark in this
-repo actually runs the same model through both onnxsim and NNCF and compares
-accuracy/latency/size. Given the algorithm surfaces overlap most directly on
-int4 weight-only compression (onnxsim's `quantize_weight_only_int4` + GPTQ/AWQ
-vs. NNCF's `compress_weights(mode=INT4_*, awq=True, gptq=True)`), that's the
-most tractable starting point for a head-to-head benchmark script under
-`bench/`, producing numbers instead of a qualitative comparison.
+### 3. A real onnxsim-vs-NNCF benchmark -- **done**
+This is now `bench/nncf_comparison.py`, with measured results and their
+caveats in `bench/RESULTS_nncf_comparison.md`. It runs the same model through
+both tools on int4 weight-only compression (onnxsim's
+`quantize_weight_only_int4` + GPTQ/AWQ vs. NNCF's
+`compress_weights(mode=INT4_SYM, ...)`) and reports accuracy, size and
+quantization wall-clock. Note NNCF's ONNX backend rejects its own `gptq=`
+option, so the GPTQ comparison is onnxsim's GPTQ against NNCF's other
+data-aware modes (AWQ, Scale Estimation), not GPTQ against GPTQ.
+
+Three things that comparison surfaced, recorded here because they outlive the
+benchmark run itself:
+
+- onnxsim's INT4 pass emits codes in `[-7, 7]`, giving up the representable
+  `-8` that NNCF uses; at identical storage that is a ~12.5% coarser step, and
+  it accounts for onnxsim's plain-RTN accuracy trailing NNCF's at byte-identical
+  size. Whether to change it is a genuine trade-off (a symmetric grid keeps
+  `-x` representable whenever `x` is, which other passes assume) -- but the
+  cost is now measured.
+- onnxsim's INT4 pass silently skips any MatMul whose activation has no
+  `value_info` to read an element type from, so hand-built graphs get partially
+  quantized with no diagnostic. Running `onnx.shape_inference.infer_shapes`
+  first avoids it.
+- GPTQ-style methods need more calibration rows than the reduction dimension,
+  or the `[K, K]` Hessian is rank-deficient and the correction *hurts*
+  accuracy. Undersized calibration data inverted the benchmark's conclusion
+  before this was caught.
 
 ### 4. Structured pruning parity (lower priority)
 onnxsim's pruning (`pruning.py`) covers magnitude + Wanda + N:M sparsity but

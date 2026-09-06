@@ -66,7 +66,7 @@ from onnxsim.adaround import (
     _optimize_rounding,
     _pack_int4,
 )
-from onnxsim.bias_correction import _add_probe_outputs
+from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
 
@@ -306,7 +306,7 @@ def apply_autoround(
     if not candidates:
         return quantized_model
 
-    probe_names = [c.float_node.input[0] for c in candidates]
+    probe_names = sorted({c.float_node.input[0] for c in candidates})
     float_probe = _add_probe_outputs(float_model, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
@@ -318,10 +318,9 @@ def apply_autoround(
     optimized_codes: Dict[str, np.ndarray] = {}
     optimized_scale: Dict[str, np.ndarray] = {}
     for cand in candidates:
-        acts = activations[cand.float_node.input[0]]
-        acts = [a for a in acts if a.ndim == 2]
+        acts = _activation_rows(activations[cand.float_node.input[0]])
         if not acts:
-            continue  # not a plain 2-D activation (batched/broadcast MatMul); skip
+            continue  # no usable activation (no feature axis); skip
         x = np.concatenate(acts, axis=0)
 
         w = onnx.numpy_helper.to_array(cand.w_float_init).astype(np.float64)
