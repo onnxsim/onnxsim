@@ -83,7 +83,7 @@ def _upstream_corrupted_model(K0=32, N1=8, corruption=None, seed=0):
         if corruption is None
         else corruption.astype(np.float32)
     )
-    return _model(
+    model = _model(
         f"""
         g (float[batch,{K0}] X) => (float[batch,{N1}] Y2)
         {{
@@ -93,6 +93,16 @@ def _upstream_corrupted_model(K0=32, N1=8, corruption=None, seed=0):
         """,
         [_f32(w2, "W2"), _f32(corruption, "Corruption")],
     )
+    # `quantize_weight_only_int4` runs no shape inference of its own and
+    # rejects a MatMul whose activation's element type it cannot see. `Y1`
+    # is an intermediate tensor, so without a value_info its type is
+    # undefined to the pass, the MatMul is silently left unquantized, and
+    # both `apply_gptq` and `apply_gptaq` then return `quantized_model`
+    # unchanged -- which made the "beats" test below compare a model with
+    # itself (an exact tie, on every platform). Shape inference gives `Y1`
+    # the value_info the pass needs; `_matmul_model`'s MatMul reads the
+    # graph input directly and never had this problem.
+    return onnx.shape_inference.infer_shapes(model)
 
 
 def _correlated_calibration(K, num_samples=64, rank=6, seed=1):
