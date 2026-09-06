@@ -10948,7 +10948,24 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #     general-grouped Conv/ConvTranspose consumer via the existing,
 #     unmodified `_walk_to_conv_consumer` forward walk (left at its own
 #     default, narrower flag set, mirroring `_find_conv_se_gate_chains`'s
-#     own identical choice) -- its own input-channel count must match `P`'s.
+#     own identical choice, EXCEPT `recognize_spatial_gate` -- see below) --
+#     its own input-channel count must match `P`'s.
+#   - EXACTLY one exception to the "exactly one consumer" bar just above:
+#     the `Mul`'s own output may instead have exactly THREE consumers, when
+#     they form CBAM's OTHER stage, `SpatialGate`'s own spine root
+#     (`ReduceMax` + `ReduceMean` + `SpatialGate`'s own closing `Mul` -- see
+#     `_walk_to_conv_consumer`'s own `recognize_spatial_gate` parameter and
+#     `_match_spatial_gate_pass_through`) -- confirmed live: the REAL,
+#     default CBAM config (`no_spatial=False`, the normal config for any
+#     CBAM-attached backbone -- see `github.com/Jongchan/attention-module`'s
+#     own `CBAM.forward`) chains `ChannelGate` immediately into `SpatialGate`,
+#     so `ChannelGate`'s own closing `Mul` output is read three times over,
+#     not once. `_walk_to_conv_consumer` is called with
+#     `recognize_spatial_gate=True` (the one flag this section's own call
+#     doesn't leave at its default) specifically to admit this; if those
+#     three consumers don't actually form `SpatialGate`'s shape, the walk
+#     declines exactly as any other unmatched topology would (`consumer is
+#     None`), never partially slicing anything.
 #
 # Representation, mirroring `_find_conv_se_gate_chains`'s own two-producer
 # (gated-pair) shape: `P` and the SHARED fc2 weight/bias are the chain's own
@@ -10982,9 +10999,16 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #   - CBAM's OTHER stage, `SpatialGate` (`ReduceMax`/`ReduceMean` over the
 #     full channel axis -> `Concat` -> a 7x7 `Conv` -> `Sigmoid` -> `Mul`) is
 #     a fundamentally different shape (no per-channel learned weight at all,
-#     reduces over EVERY channel rather than gating them) and is out of
-#     scope for this section entirely -- a plausible future follow-on, not
-#     reached here.
+#     reduces over EVERY channel rather than gating them) and contributes
+#     nothing to this section's own slicing bookkeeping -- but, as of the
+#     `recognize_spatial_gate=True` change above, it's no longer declined
+#     when it immediately follows `ChannelGate` (the real, default
+#     `no_spatial=False` config): the whole `SpatialGate` shape is simply
+#     hopped over transparently by `_walk_to_conv_consumer`, exactly as it
+#     already does for `_find_conv_chains`'s own plain single-producer/
+#     single-consumer topology (see this module's own "CBAM SpatialGate
+#     pass-through" section comment), before the walk continues on to the
+#     real downstream Conv/ConvTranspose consumer.
 
 
 def _unsqueeze_axes(
@@ -11468,7 +11492,23 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
         ) = match
 
         mul_out = mul_node.output[0]
-        if mul_out in graph_outputs or len(consumers_of.get(mul_out, [])) != 1:
+        mul_out_n_consumers = len(consumers_of.get(mul_out, []))
+        # Ordinarily exactly one consumer -- but the REAL, default CBAM
+        # config (`no_spatial=False`, the normal config for any CBAM-attached
+        # backbone -- see `github.com/Jongchan/attention-module`'s own
+        # `CBAM.forward`) feeds `ChannelGate`'s own closing `Mul` output
+        # directly into `SpatialGate`'s own three-consumer spine root
+        # (`ReduceMax` + `ReduceMean` + `SpatialGate`'s own closing `Mul` --
+        # confirmed live), so admit that one specific count here too, exactly
+        # mirroring the erf-GELU diamond's own identical relaxation for GRN
+        # in `_walk_to_conv_consumer` above (search that function for
+        # "recognize_grn admits that one specific count here too"). The
+        # `_walk_to_conv_consumer` call below, with `recognize_spatial_gate=
+        # True`, then decides -- via `_match_spatial_gate_pass_through` --
+        # whether those three consumers actually form that shape, declining
+        # the whole chain (via `consumer is None` below), same as any other
+        # unmatched topology, if they don't.
+        if mul_out in graph_outputs or mul_out_n_consumers not in (1, 3):
             continue
 
         (
@@ -11486,12 +11526,18 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
             graph_outputs,
             n_channels,
             _MAX_CHAIN_HOPS,
+            recognize_spatial_gate=True,
         )
         if consumer is None:
             continue
-        # Every optional `_walk_to_conv_consumer` flag was left at its
-        # default (False) above, mirroring `_find_conv_se_gate_chains`'s
-        # own identical choice -- so these are always `None` here.
+        # Every optional `_walk_to_conv_consumer` flag except
+        # `recognize_spatial_gate` was left at its default (False) above,
+        # mirroring `_find_conv_se_gate_chains`'s own identical choice for
+        # all but that one flag -- so these are always `None` here.
+        # `recognize_spatial_gate` itself contributes nothing to any of
+        # these return values even when it does match (see
+        # `_walk_to_conv_consumer`'s own docstring: "a SpatialGate match
+        # contributes nothing to chain_ops/slicing bookkeeping at all").
         assert (
             group_norm is None
             and decomposed_group_norm_num_groups is None

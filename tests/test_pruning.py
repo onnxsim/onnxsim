@@ -11141,6 +11141,318 @@ def test_structured_pruning_cbam_channel_gate_declines_on_gate_channel_count_mis
     np.testing.assert_array_equal(inits["FC2_W"], fc2_w_bad)
 
 
+# --- apply_structured_pruning: CBAM full block (ChannelGate -> SpatialGate) -
+#
+# The REAL, default CBAM configuration (`no_spatial=False`, the normal config
+# for any CBAM-attached backbone -- ResNet+CBAM, MobileNet+CBAM, etc., per
+# the canonical reference implementation `github.com/Jongchan/attention-
+# module`'s own `CBAM.forward`) chains `ChannelGate` immediately into
+# `SpatialGate`: `ChannelGate`'s own closing `Mul` output (`gated` below)
+# feeds directly into `SpatialGate`'s own three-consumer spine root
+# (`ReduceMax` + `ReduceMean` + `SpatialGate`'s own closing `Mul`), not a
+# lone downstream Conv. Before `_find_conv_cbam_channel_gate_chains`'s own
+# `mul_out` consumer-count check admitted this one specific 3-consumer case
+# (mirroring the erf-GELU diamond's own identical relaxation for GRN in
+# `_walk_to_conv_consumer`), this real, canonical shape was declined
+# outright -- `ChannelGate`'s own producer Conv (and its own shared fc2) came
+# back completely unpruned in any real CBAM-attached backbone, even though
+# each stage individually (a bare `ChannelGate`, or a bare `SpatialGate`
+# feeding an ordinary single-consumer downstream Conv) already pruned fine
+# on its own. This section builds the fused `Conv -> ChannelGate ->
+# SpatialGate -> Conv` topology directly (fusing `_cbam_channel_gate_model`'s
+# own ChannelGate stage with `_spatial_gate_conv_pair_model`'s own
+# SpatialGate stage) to lock that composition in.
+
+
+def _cbam_full_block_model(
+    Cin=3, C=16, Csq=1, Cout=8, sg_kh=7, sg_kw=7, seed=0, spatial=8
+):
+    """`Conv1 -> CBAM ChannelGate -> CBAM SpatialGate -> Conv2` -- the real,
+    default CBAM config (`no_spatial=False`): identical to
+    `_cbam_channel_gate_model`'s own topology up through `gated` (its own
+    `ChannelGate`'s closing `Mul` output), except `gated` then feeds
+    `SpatialGate`'s own spine (rather than directly into `Conv2`), built at
+    `opset=17` for the identical reason `_spatial_gate_conv_pair_model` is
+    (`ReduceMax`/`ReduceMean`'s own opset<=17 schema keeps `axes` an
+    attribute, matching the confirmed exporter output).
+    """
+    rng = np.random.default_rng(seed)
+    conv1_w = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    conv1_b = rng.standard_normal((C,)).astype(np.float32)
+    fc1_w = rng.standard_normal((Csq, C)).astype(np.float32)
+    fc1_b = rng.standard_normal((Csq,)).astype(np.float32)
+    fc2_w = rng.standard_normal((C, Csq)).astype(np.float32)
+    fc2_b = rng.standard_normal((C,)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, sg_kh, sg_kw)).astype(np.float32)
+    sg_b = rng.standard_normal((1,)).astype(np.float32)
+    conv2_w = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    conv2_b = rng.standard_normal((Cout,)).astype(np.float32)
+    pad_h, pad_w = (sg_kh - 1) // 2, (sg_kw - 1) // 2
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{spatial},{spatial}] Y)
+        {{
+          spine = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, CONV1_W, CONV1_B)
+          avg = AveragePool<kernel_shape=[{spatial},{spatial}]>(spine)
+          mx = MaxPool<kernel_shape=[{spatial},{spatial}]>(spine)
+          avg_flat = Reshape(avg, flat_shape)
+          max_flat = Reshape(mx, flat_shape)
+          fc1_avg = Gemm<transB=1>(avg_flat, FC1_W, FC1_B)
+          fc1_max = Gemm<transB=1>(max_flat, FC1_W, FC1_B)
+          relu_avg = Relu(fc1_avg)
+          relu_max = Relu(fc1_max)
+          fc2_avg = Gemm<transB=1>(relu_avg, FC2_W, FC2_B)
+          fc2_max = Gemm<transB=1>(relu_max, FC2_W, FC2_B)
+          summed = Add(fc2_avg, fc2_max)
+          gate = Sigmoid(summed)
+          u1 = Unsqueeze(gate, ax2)
+          u2 = Unsqueeze(u1, ax3)
+          spine_shape = Shape(spine)
+          expanded = Expand(u2, spine_shape)
+          gated = Mul(spine, expanded)
+          smx = ReduceMax<axes=[1], keepdims=0>(gated)
+          smxu = Unsqueeze(smx, AxesOne)
+          smn = ReduceMean<axes=[1], keepdims=0>(gated)
+          smnu = Unsqueeze(smn, AxesOne)
+          cat = Concat<axis=1>(smxu, smnu)
+          sgc = Conv<kernel_shape=[{sg_kh},{sg_kw}], pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>(cat, SGW, SGB)
+          sgate = Sigmoid(sgc)
+          sg = Mul(gated, sgate)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(sg, CONV2_W, CONV2_B)
+        }}
+        """,
+        initializer=[
+            _f32(conv1_w, "CONV1_W"),
+            _f32(conv1_b, "CONV1_B"),
+            _f32(fc1_w, "FC1_W"),
+            _f32(fc1_b, "FC1_B"),
+            _f32(fc2_w, "FC2_W"),
+            _f32(fc2_b, "FC2_B"),
+            _f32(sg_w, "SGW"),
+            _f32(sg_b, "SGB"),
+            _f32(conv2_w, "CONV2_W"),
+            _f32(conv2_b, "CONV2_B"),
+            onnx.numpy_helper.from_array(
+                np.array([0, -1], dtype=np.int64), "flat_shape"
+            ),
+            onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "ax2"),
+            onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "ax3"),
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+        ],
+        opset=17,
+    )
+    return (
+        model,
+        conv1_w,
+        conv1_b,
+        fc1_w,
+        fc1_b,
+        fc2_w,
+        fc2_b,
+        sg_w,
+        sg_b,
+        conv2_w,
+        conv2_b,
+    )
+
+
+def test_structured_pruning_cbam_full_block_channel_then_spatial_gate_matches_oracle():
+    # THE key correctness bar for this composition: `ChannelGate`'s own
+    # producer Conv (and its own shared fc2) is pruned exactly as it would be
+    # in isolation (`test_structured_pruning_cbam_channel_gate_matches_oracle`
+    # above), `SpatialGate`'s own internal Conv is architecturally untouched
+    # (exactly as `test_structured_pruning_spatial_gate_pass_through_matches_
+    # oracle_exactly` confirms in isolation), and the pruned model matches an
+    # independently, already-pruned reference model's own onnxruntime output
+    # exactly (float32 noise only) -- not merely "close", and not a post-hoc
+    # slice of the full unpruned model's own output.
+    Cin, C, Csq, Cout = 3, 16, 1, 8
+    (
+        model,
+        conv1_w,
+        conv1_b,
+        fc1_w,
+        fc1_b,
+        fc2_w,
+        fc2_b,
+        sg_w,
+        sg_b,
+        conv2_w,
+        conv2_b,
+    ) = _cbam_full_block_model(Cin=Cin, C=C, Csq=Csq, Cout=Cout, seed=601)
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_cbam_channel_gate_chains
+
+    chains = _find_conv_cbam_channel_gate_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == C
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _cbam_conv_keep_indices(conv1_w, fc2_w, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    np.testing.assert_array_equal(inits["CONV1_W"], conv1_w[keep])
+    np.testing.assert_array_equal(inits["CONV1_B"], conv1_b[keep])
+    np.testing.assert_array_equal(inits["FC2_W"], fc2_w[keep])
+    np.testing.assert_array_equal(inits["FC2_B"], fc2_b[keep])
+    np.testing.assert_array_equal(inits["FC1_W"], fc1_w[:, keep])
+    assert inits["FC1_W"].shape[0] == Csq
+    np.testing.assert_array_equal(inits["FC1_B"], fc1_b)
+    np.testing.assert_array_equal(inits["CONV2_W"], conv2_w[:, keep])
+    np.testing.assert_array_equal(inits["CONV2_B"], conv2_b)
+    # SpatialGate's own internal Conv is architecturally independent of the
+    # spine's own channel count -- untouched by pruning.
+    np.testing.assert_array_equal(inits["SGW"], sg_w)
+    np.testing.assert_array_equal(inits["SGB"], sg_b)
+
+    rng = np.random.default_rng(602)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _cbam_full_block_model(Cin=Cin, C=C // 2, Csq=Csq, Cout=Cout)
+    oracle_inits = {
+        "CONV1_W": conv1_w[keep],
+        "CONV1_B": conv1_b[keep],
+        "FC1_W": fc1_w[:, keep],
+        "FC1_B": fc1_b,
+        "FC2_W": fc2_w[keep],
+        "FC2_B": fc2_b[keep],
+        "SGW": sg_w,
+        "SGB": sg_b,
+        "CONV2_W": conv2_w[:, keep],
+        "CONV2_B": conv2_b,
+    }
+    for init in oracle.graph.initializer:
+        if init.name in oracle_inits:
+            init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_cbam_channel_gate_alone_unaffected_by_spatial_gate_admission():
+    # Regression guard: admitting a 3-consumer `mul_out` (for the fused
+    # ChannelGate->SpatialGate shape above) must not change anything about
+    # the plain, ChannelGate-alone shape (`mul_out` still has exactly ONE
+    # consumer, the downstream Conv directly) -- `_cbam_channel_gate_model`
+    # is completely unmodified by this change, so this exact-match assertion
+    # mirrors `test_structured_pruning_cbam_channel_gate_matches_oracle`
+    # above verbatim.
+    Cin, C, Csq, Cout = 3, 16, 1, 8
+    model, conv1_w, conv1_b, fc1_w, fc1_b, fc2_w, fc2_b, conv2_w, conv2_b = (
+        _cbam_channel_gate_model(Cin=Cin, C=C, Csq=Csq, Cout=Cout, seed=603)
+    )
+
+    from onnxsim.pruning import _find_conv_cbam_channel_gate_chains
+
+    chains = _find_conv_cbam_channel_gate_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == C
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _cbam_conv_keep_indices(conv1_w, fc2_w, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["CONV1_W"], conv1_w[keep])
+    np.testing.assert_array_equal(inits["FC2_W"], fc2_w[keep])
+    np.testing.assert_array_equal(inits["CONV2_W"], conv2_w[:, keep])
+
+
+def test_structured_pruning_cbam_channel_gate_declines_on_stray_three_consumer_fanout():
+    # A `mul_out` with exactly THREE consumers that do NOT form SpatialGate's
+    # own confirmed shape must still decline the WHOLE match outright, never
+    # partially slicing anything -- exactly the same conservative bar
+    # `_match_spatial_gate_pass_through` already guarantees for every other
+    # caller of `_walk_to_conv_consumer`'s own `recognize_spatial_gate` hop
+    # (see `test_structured_pruning_spatial_gate_wrong_reduction_axis_
+    # declines` above for the analogous case scoped to that hop alone). Built
+    # by taking the real fused topology above and swapping the `ReduceMean`
+    # branch for a `ReduceSum` -- `gated` still forks into exactly three
+    # consumers, but `_match_spatial_gate_pass_through` requires a `ReduceMax`
+    # + `ReduceMean` pair specifically, so this is declined, not guessed at.
+    Cin, C, Csq, Cout = 3, 16, 1, 8
+    rng = np.random.default_rng(604)
+    conv1_w = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    conv1_b = rng.standard_normal((C,)).astype(np.float32)
+    fc1_w = rng.standard_normal((Csq, C)).astype(np.float32)
+    fc1_b = rng.standard_normal((Csq,)).astype(np.float32)
+    fc2_w = rng.standard_normal((C, Csq)).astype(np.float32)
+    fc2_b = rng.standard_normal((C,)).astype(np.float32)
+    sg_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sg_b = rng.standard_normal((1,)).astype(np.float32)
+    conv2_w = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    conv2_b = rng.standard_normal((Cout,)).astype(np.float32)
+    spatial = 8
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{spatial},{spatial}] Y)
+        {{
+          spine = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, CONV1_W, CONV1_B)
+          avg = AveragePool<kernel_shape=[{spatial},{spatial}]>(spine)
+          mx = MaxPool<kernel_shape=[{spatial},{spatial}]>(spine)
+          avg_flat = Reshape(avg, flat_shape)
+          max_flat = Reshape(mx, flat_shape)
+          fc1_avg = Gemm<transB=1>(avg_flat, FC1_W, FC1_B)
+          fc1_max = Gemm<transB=1>(max_flat, FC1_W, FC1_B)
+          relu_avg = Relu(fc1_avg)
+          relu_max = Relu(fc1_max)
+          fc2_avg = Gemm<transB=1>(relu_avg, FC2_W, FC2_B)
+          fc2_max = Gemm<transB=1>(relu_max, FC2_W, FC2_B)
+          summed = Add(fc2_avg, fc2_max)
+          gate = Sigmoid(summed)
+          u1 = Unsqueeze(gate, ax2)
+          u2 = Unsqueeze(u1, ax3)
+          spine_shape = Shape(spine)
+          expanded = Expand(u2, spine_shape)
+          gated = Mul(spine, expanded)
+          smx = ReduceMax<axes=[1], keepdims=0>(gated)
+          smxu = Unsqueeze(smx, AxesOne)
+          smn = ReduceSum<keepdims=0>(gated, AxesOne)
+          smnu = Unsqueeze(smn, AxesOne)
+          cat = Concat<axis=1>(smxu, smnu)
+          sgc = Conv<kernel_shape=[7,7], pads=[3,3,3,3]>(cat, SGW, SGB)
+          sgate = Sigmoid(sgc)
+          sg = Mul(gated, sgate)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(sg, CONV2_W, CONV2_B)
+        }}
+        """,
+        initializer=[
+            _f32(conv1_w, "CONV1_W"),
+            _f32(conv1_b, "CONV1_B"),
+            _f32(fc1_w, "FC1_W"),
+            _f32(fc1_b, "FC1_B"),
+            _f32(fc2_w, "FC2_W"),
+            _f32(fc2_b, "FC2_B"),
+            _f32(sg_w, "SGW"),
+            _f32(sg_b, "SGB"),
+            _f32(conv2_w, "CONV2_W"),
+            _f32(conv2_b, "CONV2_B"),
+            onnx.numpy_helper.from_array(
+                np.array([0, -1], dtype=np.int64), "flat_shape"
+            ),
+            onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "ax2"),
+            onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), "ax3"),
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+        ],
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_cbam_channel_gate_chains
+
+    assert _find_conv_cbam_channel_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["CONV1_W"], conv1_w)
+    np.testing.assert_array_equal(inits["CONV2_W"], conv2_w)
+    np.testing.assert_array_equal(inits["FC2_W"], fc2_w)
+    np.testing.assert_array_equal(inits["SGW"], sg_w)
+
+
 # --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----
 #
 # The MatMul/Gemm analogue of the Conv residual tests above -- see
