@@ -56,6 +56,7 @@ from onnxsim.embedding_quantization import (
 from onnxsim.finetune import apply_pruning_finetune
 from onnxsim.flexround import apply_flexround
 from onnxsim.foem import apply_foem
+from onnxsim.fp6_llm import apply_fp6_llm_quantization, quantize_dequantize_fp6
 from onnxsim.fptq import apply_fptq
 from onnxsim.gear import apply_gear
 from onnxsim.gguf_kquant import apply_gguf_q4_k_quantization, quantize_dequantize_q4_k
@@ -94,6 +95,7 @@ from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
+from onnxsim.lqer import apply_lqer
 from onnxsim.memory_planning import (
     MemoryPlan,
     annotate_memory_plan,
@@ -115,6 +117,7 @@ from onnxsim.onnx_simplifier import (
     apply_double_quantization_cpp,
     apply_embedding_vocab_magnitude_pruning_cpp,
     apply_embedding_vocab_pruning_cpp,
+    apply_fp6_llm_quantization_cpp,
     apply_gguf_q4_0_quantization_cpp,
     apply_gguf_q4_1_quantization_cpp,
     apply_gguf_ternary_quantization_cpp,
@@ -253,6 +256,8 @@ __all__ = [
     "apply_quantease",
     "apply_flexround",
     "apply_foem",
+    "apply_fp6_llm_quantization",
+    "quantize_dequantize_fp6",
     "apply_brecq",
     "apply_fptq",
     "apply_owq",
@@ -268,6 +273,7 @@ __all__ = [
     "quantize_dequantize_block_fp8",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "apply_lqer",
     "apply_svdquant",
     "apply_norm_tweaking",
     "MemoryPlan",
@@ -380,6 +386,7 @@ __all__ = [
     "apply_gguf_ternary_quantization",
     "apply_gguf_ternary_quantization_cpp",
     "quantize_dequantize_ternary",
+    "apply_fp6_llm_quantization_cpp",
     "apply_iq4_nl_quantization",
     "apply_iq4_nl_quantization_cpp",
     "quantize_dequantize_iq4_nl",
