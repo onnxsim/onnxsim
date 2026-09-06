@@ -867,6 +867,42 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "n"_a.none(), "m"_a.none(), "epsilon"_a = 1e-8,
       "global_sparsity"_a = false);
 
+  // llama.cpp's "importance matrix" (imatrix): weight-only-quantizes every
+  // matched MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight to INT4
+  // (folded as a float32 quantize-dequantize round trip, no new graph
+  // nodes), using real calibration activations to bias each weight block's
+  // scale search toward minimizing importance-weighted squared error. Same
+  // executor-as-first-argument, `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) crossing convention as apply_wanda_pruning's own
+  // binding above. See ApplyImatrixQuantization in imatrix_quant_entry.h
+  // for the full scope and onnxsim/imatrix_quant.py for the technique this
+  // ports.
+  m.def(
+      "apply_imatrix_quantization",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t block_size, int64_t num_scale_candidates, double scale_lo,
+         double scale_hi,
+         const std::vector<std::string>& skip_names) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const std::unordered_set<std::string> skip_names_set(
+            skip_names.begin(), skip_names.end());
+        const auto result = ApplyImatrixQuantization(
+            model, *executor, calibration_data, block_size,
+            num_scale_candidates, scale_lo, scale_hi, skip_names_set);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "block_size"_a = 32, "num_scale_candidates"_a = 41, "scale_lo"_a = 0.4,
+      "scale_hi"_a = 1.6, "skip_names"_a = std::vector<std::string>());
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.

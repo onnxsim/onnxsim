@@ -5,7 +5,17 @@ import re
 import shutil
 import sys
 import tempfile
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import onnx  # type: ignore
@@ -2012,6 +2022,115 @@ def apply_wanda_pruning_cpp(
             m,
             epsilon,
             global_sparsity,
+        )
+    )
+
+
+def apply_imatrix_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    block_size: int = 32,
+    num_scale_candidates: int = 41,
+    scale_search_range: Tuple[float, float] = (0.4, 1.6),
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_imatrix_quantization`:
+    llama.cpp's "importance matrix" (imatrix) applied to this repository's
+    own plain block-wise INT4 weight quantizer -- see
+    ``onnxsim/imatrix_quant.py``'s own module docstring for the technique
+    (why mean-square activation is a sound per-channel importance proxy,
+    and why this is a weighted grid-search extension of the plain block
+    quantizer rather than a new GGUF block format).
+
+    Same real calibration machinery as :func:`onnxsim.apply_wanda_pruning_cpp`/
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp` -- a live
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyImatrixQuantization`` in ``imatrix_quant_entry.h`` for the full
+    scope, including why this calibration-driven pass follows
+    ``ApplyWandaPruning``'s own protobuf-level shape rather than
+    :func:`onnxsim.apply_quarot_cpp`'s data-free ``PredicateBasedPass`` one).
+
+    Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
+    FLOAT32 weight (``Conv`` is out of scope, matching the pure-Python
+    :func:`onnxsim.apply_imatrix_quantization`'s own scope decision -- see
+    that function's own docstring for why).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute the
+            importance matrix from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :param block_size: elements per weight quantization block along ``K``
+    :param num_scale_candidates: candidate scale factors evaluated per
+            block -- see :func:`onnxsim.quantize_dequantize_int4_imatrix`
+    :param scale_search_range: ``(low, high)`` multiplier range for the
+            candidate scale grid -- see
+            :func:`onnxsim.quantize_dequantize_int4_imatrix`
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible
+    :returns: ``model`` with every matched layer's weight replaced by its
+            importance-weighted INT4 round trip, stored under a new
+            initializer name (the original initializer is left in the
+            graph, unused). A layer with a non-constant/non-2-D weight, a
+            reduction dimension not divisible by ``block_size``, or whose
+            activation was never observed as a FLOAT32 tensor across the
+            calibration data, is left untouched.
+
+    **Accepted divergence from the pure-Python
+    :func:`onnxsim.apply_imatrix_quantization`.** Not required to be
+    bit-for-bit identical: the pure-Python reference upcasts every weight
+    and activation to float64 throughout, whereas this port reads/writes
+    FLOAT32 protobuf tensors and accumulates calibration statistics in
+    float64 internally only -- both are the exact same algorithm
+    (:func:`onnxsim.quantize_dequantize_int4_imatrix`'s own weighted grid
+    search, ported scalar-loop-for-scalar-loop, see
+    ``onnxsim/passes/imatrix_quant.h``), so results are expected to track
+    each other unusually closely, but a floating-point rounding difference
+    at a scale-search tie is possible and not treated as a bug -- the same
+    "two independently-correct, non-interchangeable entry points" contract
+    :func:`onnxsim.apply_quarot_cpp`/:func:`onnxsim.apply_iq4_nl_quantization_cpp`
+    already establish for this codebase's other ``*_cpp`` ports.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_wanda_pruning_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    scale_lo, scale_hi = scale_search_range
+    return onnx.load_from_string(
+        C.apply_imatrix_quantization(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            block_size,
+            num_scale_candidates,
+            scale_lo,
+            scale_hi,
+            list(skip_names) if skip_names is not None else [],
         )
     )
 
