@@ -1425,7 +1425,7 @@ was:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Callable,
@@ -3333,6 +3333,35 @@ _UNARY_PASS_THROUGH = {
     "LeakyRelu",
     "Elu",
     "Selu",
+    # ai.onnx (domain "") Celu(X) -> Y, opset 12+ -- confirmed live via
+    # `onnx.defs.get_schema("Celu")`: single required input `X`, single
+    # output `Y`, one scalar float `alpha` attribute (default 1.0).
+    # Structurally identical to `Elu`/`Selu` immediately above (same
+    # per-element `x > 0 ? x : f(alpha, x)` shape, no cross-channel mixing,
+    # no second tensor operand to slice) -- it belongs here for the same
+    # reason those two do.
+    "Celu",
+    # ai.onnx (domain "") ThresholdedRelu(X) -> Y, since_version=22 --
+    # confirmed live via `onnx.defs.get_schema("ThresholdedRelu")`: single
+    # required input `X`, single output `Y`, one scalar float `alpha`
+    # attribute (default 1.0), computing `y = x for x > alpha, else 0`.
+    # Structurally identical to `LeakyRelu`/`Elu`/`Selu`/`Celu` immediately
+    # above (same per-element threshold-or-pass shape, no cross-channel
+    # mixing, no second tensor operand to slice) -- it belongs here for the
+    # same reason those do. Real provenance: neither PyTorch exporter
+    # (legacy TorchScript-based or the newer dynamo exporter) emits this op
+    # natively for `nn.Threshold` -- both decompose it into
+    # `Greater`/`LessOrEqual`/`Cast`/`Where` -- but tf2onnx (confirmed
+    # against the real 1.17.0 wheel) ships a dedicated rewriter,
+    # `tf2onnx/rewriter/thresholded_relu_rewriter.py`, that pattern-matches
+    # TensorFlow's `Greater -> Cast -> Mul` lowering of the real, documented
+    # `tf.keras.layers.ThresholdedReLU` Keras layer and canonicalizes it
+    # into a single native `ThresholdedRelu` node (opset 10+) -- tf2onnx's
+    # own test suite (`tests/test_backend.py::test_thresholded_relu`)
+    # explicitly asserts the converted graph contains exactly one
+    # `ThresholdedRelu` node, so this is real, shipped, tested exporter
+    # output, not a purely theoretical case.
+    "ThresholdedRelu",
     "Sigmoid",
     "Tanh",
     "Softplus",
@@ -9440,6 +9469,412 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- Squeeze-and-Excitation (SE) gate chains --------------------------------
+#
+# `torchvision.ops.SqueezeExcitation`'s own exact shape -- confirmed live via
+# `torch.onnx.export` (torch 2.14.0+cpu, opset 17; see
+# `tests/test_pruning.py`'s own fixture for the captured `onnx.printer.to_text`
+# graph this section's matcher is built directly against):
+#
+#     scale = self.scale_activation(
+#         self.fc2(self.activation(self.fc1(self.avgpool(input))))
+#     )
+#     return scale * input
+#
+# i.e. a Conv `P` (`conv1` in a real backbone) whose own output tensor,
+# optionally through one activation (`Relu` in the confirmed repro), reaches a
+# tensor `spine` read TWICE: once by a `GlobalAveragePool` feeding a short
+# "squeeze" gate subnetwork (`GlobalAveragePool -> Conv(1x1) "fc1" -> one
+# activation -> Conv(1x1) "fc2" -> {Sigmoid, HardSigmoid}`), and once directly
+# by the closing `Mul(gate, spine)` that broadcasts the gate subnetwork's own
+# per-channel output back over `spine`. None of the other Conv-chain finders
+# recognize this at all: `_find_conv_chains` never admits a two-consumer
+# tensor except for the totally different self-gated-activation/decomposed-
+# GroupNorm shapes (see `_walk_to_conv_consumer`'s own docstring),
+# `_find_conv_residual_chains` only ever unions `Add`-merge points, never a
+# `Mul`, and `_find_gated_chains` is MatMul/Gemm-only and shaped for TWO
+# INDEPENDENT producers combined by `Mul`, not one producer self-gated by a
+# whole subnetwork reading its own output back. Without this, `conv1`'s own
+# output channels and the gate subnetwork's own final Conv's output channels
+# (which must match `conv1`'s count exactly -- otherwise the closing `Mul`
+# wouldn't even be shape-valid) are left completely unprunable, even though
+# the two are one shared co-slice together with the SE block's own downstream
+# consumer.
+#
+# What this section matches, conservatively -- declining rather than guessing
+# at anything beyond the one confirmed real shape above:
+#
+#   - `P`, an ordinary (`group == 1`) Conv/FusedConv producer
+#     (`_match_conv_producer`) whose own raw output, optionally through a
+#     linear run of `_UNARY_PASS_THROUGH` activations (each a strict
+#     single-consumer hop -- the confirmed repro's own `Relu` takes exactly
+#     one such hop, but zero is admitted too), reaches a tensor `spine` with
+#     EXACTLY two consumers.
+#   - One of `spine`'s two consumers is a plain `Mul(spine, gate_out)`
+#     (domain "", two distinct non-constant operands, one of which is `spine`
+#     itself) -- the OTHER operand, `gate_out`, must be produced by exactly
+#     the fixed gate-subnetwork shape below.
+#   - `spine`'s other consumer is a `GlobalAveragePool` (domain "", `spine`
+#     its sole input) whose own single-consumer output feeds: `Conv(1x1,
+#     group=1)` ("fc1" -- its OWN output-channel count, the squeeze
+#     bottleneck, e.g. `4` in `SqueezeExcitation(16, 4)`, is never touched by
+#     this section: unrelated to the shared keep-set below, and left for
+#     `_find_conv_chains`'s own ordinary fc1->fc2 internal-chain recognition
+#     to independently prune, if it ever does) -> exactly ONE
+#     `_UNARY_PASS_THROUGH` activation (zero or more than one is declined) ->
+#     `Conv(1x1, group=1)` ("fc2") -> `{Sigmoid, HardSigmoid}`. Both final
+#     activations are confirmed real, not speculative: plain `Sigmoid` is
+#     `torchvision.ops.SqueezeExcitation`'s own default `scale_activation`,
+#     while `HardSigmoid` is the exact substitution the MobileNetV3 paper
+#     (Howard et al., 2019, "Searching for MobileNetV3") itself describes
+#     making in every SE block for inference efficiency, and is what
+#     `torchvision.models.mobilenetv3`'s own SE blocks construct their shared
+#     `SqueezeExcitation` with (`scale_activation=partial(nn.Hardsigmoid,
+#     inplace=True)`) -- both are already unconditionally recognized
+#     elsewhere in this module (`_UNARY_PASS_THROUGH`), so accepting either
+#     here needs no new op-recognition machinery, just this section's own
+#     fixed-position check. Every tensor along this gate branch must have
+#     EXACTLY one consumer and never be a graph output -- the same
+#     conservative bar every other hop in this module holds a mid-chain
+#     tensor to.
+#   - fc2's own output-channel count (`_match_conv_producer`) must exactly
+#     equal `P`'s (`n_channels`) -- the broadcast-`Mul`-correctness
+#     requirement -- and its own gate activation's output must be the EXACT
+#     same tensor as the `Mul`'s own `gate_out` operand identified above.
+#   - `GlobalAveragePool -> fc1` is resolved as an ordinary extra fan-out
+#     consumer branch of `spine`, exactly like `_find_conv_residual_chains`'s
+#     own `_resolve_conv_fanout_branches` already resolves an extra reader of
+#     an already-established group's own shared spine tensor -- fc1's own
+#     INPUT-channel axis needs the identical shared keep-set slice `P`'s
+#     other consumers do (`GlobalAveragePool` preserves channel count, so fc1
+#     genuinely reads exactly `P`'s own channel-indexed output), even though
+#     fc1's own OUTPUT-channel axis (the squeeze bottleneck) is left
+#     completely alone.
+#   - The `Mul`'s own output, in turn, must feed a single ordinary or
+#     general-grouped Conv/ConvTranspose consumer (`conv2` in the repro) via
+#     the existing, unmodified `_walk_to_conv_consumer` forward walk (left at
+#     its own default, narrower flag set -- no ConvTranspose/GroupNorm/
+#     `GlobalAveragePool -> Flatten -> MatMul` recognition, mirroring
+#     `_resolve_conv_fanout_branches`'s own identical conservative choice for
+#     a residual/merge group's fan-out branches, not `_find_conv_chains`'s
+#     own wider one) -- its own input-channel count must match `P`'s.
+#
+# What's declined, deliberately, narrower than a hypothetical fully-general
+# SE matcher might reach:
+#
+#   - A general grouped Conv anywhere in the three co-sliced roles (`P`, fc1,
+#     fc2) -- every one of `_match_conv_producer`/`_match_conv_consumer` is
+#     required to report `group == 1` here. A grouped `P`/fc1/fc2 in a real
+#     SE block is not a shape this module has seen in the wild, and working
+#     out the block-partition interaction between a *second*, independent
+#     group boundary (fc1/fc2's own, unrelated to `P`'s) and this shape's own
+#     shared keep set was judged out of scope for a first, narrowly-confirmed
+#     pass. Only the FINAL downstream consumer (`conv2`) may still be a
+#     general grouped Conv, exactly as an ordinary plain Conv chain already
+#     allows (see `_chain_group`'s own docstring for why that side alone is
+#     always safe -- `P` and fc2 both being `group == 1` producers here means
+#     there is no second, conflicting group boundary to reconcile).
+#   - A `ConvTranspose` producer (`P`) is out of scope -- a real SE block
+#     attaches to a regular Conv backbone, never a `ConvTranspose` one, in
+#     every export this module targets.
+#   - Zero, or more than one, activation between fc1 and fc2, or any op other
+#     than `Sigmoid`/`HardSigmoid` as the FINAL gate activation (immediately
+#     before the `Mul`) is declined outright, not guessed at.
+#   - A non-1x1 fc1/fc2 kernel (checked directly against each one's own
+#     weight shape, not inferred) is declined -- not the confirmed real
+#     shape, and spatially meaningless after a `GlobalAveragePool` collapses
+#     every spatial dimension to size 1 in the first place.
+#   - Any intermediate tensor along either branch (the `P -> spine` unary
+#     run, or the gate subnetwork itself) with anything other than exactly
+#     one consumer, or that is itself a graph output, declines the WHOLE
+#     match -- never a partial slice.
+
+
+def _match_conv_se_gate(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # GlobalAveragePool
+        onnx.NodeProto,  # fc1 Conv node (gate subnetwork's own squeeze layer)
+        str,  # fc1 weight name
+        onnx.NodeProto,  # Mul (the self-gating combine)
+        onnx.NodeProto,  # fc2 Conv node (the gate producer)
+        str,  # fc2 weight name
+        Optional[str],  # fc2 bias name
+        onnx.NodeProto,  # trailing Sigmoid/HardSigmoid gate activation
+    ]
+]:
+    """If `spine`'s own two consumers (`spine_consumers`) form the SE
+    "squeeze -> excite" gate shape this section's own comment above
+    describes, returns ``(gap_node, fc1_node, fc1_weight, mul_node, fc2_node,
+    fc2_weight, fc2_bias, gate_activation_node)``. Declines (``None``) on any
+    deviation -- see that comment for the exact, narrow bar.
+    """
+    if len(spine_consumers) != 2:
+        return None
+    for mul_node, gap_node in (
+        (spine_consumers[0], spine_consumers[1]),
+        (spine_consumers[1], spine_consumers[0]),
+    ):
+        if not (
+            mul_node.op_type == "Mul"
+            and mul_node.domain == ""
+            and len(mul_node.input) == 2
+            and len(mul_node.output) == 1
+            and spine in mul_node.input
+            and mul_node.input[0] != mul_node.input[1]
+        ):
+            continue
+        gate_out = (
+            mul_node.input[1] if mul_node.input[0] == spine else mul_node.input[0]
+        )
+        if gate_out in initializer_map:
+            continue
+        if not (
+            gap_node.op_type == "GlobalAveragePool"
+            and gap_node.domain == ""
+            and list(gap_node.input) == [spine]
+            and len(gap_node.output) == 1
+        ):
+            continue
+
+        gap_out = gap_node.output[0]
+        if gap_out in graph_outputs or len(consumers_of.get(gap_out, [])) != 1:
+            continue
+        fc1_node = consumers_of[gap_out][0]
+        fc1_match = _match_conv_consumer(fc1_node, initializer_map)
+        if (
+            fc1_match is None
+            or fc1_match[1] != n_channels
+            or fc1_match[2] != 1
+            or fc1_node.input[0] != gap_out
+        ):
+            continue
+        fc1_weight, _fc1_in_channels, _fc1_group = fc1_match
+        fc1_w_init = initializer_map[fc1_weight]
+        if any(d != 1 for d in fc1_w_init.dims[2:]):
+            continue  # not a 1x1 (or equivalent) conv -- declined
+
+        fc1_out = fc1_node.output[0]
+        if fc1_out in graph_outputs or len(consumers_of.get(fc1_out, [])) != 1:
+            continue
+        act_node = consumers_of[fc1_out][0]
+        if not (
+            act_node.op_type in _UNARY_PASS_THROUGH
+            and list(act_node.input) == [fc1_out]
+            and len(act_node.output) == 1
+        ):
+            continue
+
+        act_out = act_node.output[0]
+        if act_out in graph_outputs or len(consumers_of.get(act_out, [])) != 1:
+            continue
+        fc2_node = consumers_of[act_out][0]
+        fc2_match = _match_conv_producer(fc2_node, initializer_map)
+        if (
+            fc2_match is None
+            or fc2_match[3] != 1
+            or fc2_match[2] != n_channels
+            or fc2_node.input[0] != act_out
+        ):
+            continue
+        fc2_weight, fc2_bias, _fc2_out_channels, _fc2_group = fc2_match
+        fc2_w_init = initializer_map[fc2_weight]
+        if any(d != 1 for d in fc2_w_init.dims[2:]):
+            continue
+
+        fc2_out = fc2_node.output[0]
+        if fc2_out in graph_outputs or len(consumers_of.get(fc2_out, [])) != 1:
+            continue
+        gate_act_node = consumers_of[fc2_out][0]
+        if not (
+            gate_act_node.op_type in ("Sigmoid", "HardSigmoid")
+            and gate_act_node.domain == ""
+            and list(gate_act_node.input) == [fc2_out]
+            and len(gate_act_node.output) == 1
+        ):
+            continue
+        if gate_act_node.output[0] != gate_out:
+            continue
+
+        return (
+            gap_node,
+            fc1_node,
+            fc1_weight,
+            mul_node,
+            fc2_node,
+            fc2_weight,
+            fc2_bias,
+            gate_act_node,
+        )
+
+    return None
+
+
+def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds Squeeze-and-Excitation gate blocks -- see this section's own
+    comment above for the exact topology matched and declined. Every match
+    produces one `_Chain` with TWO producers (`P`, the block's own input
+    Conv, and fc2, the gate subnetwork's own final Conv -- both forced to
+    the same output-channel keep set, exactly like an ordinary gated-pair
+    chain already ties two producers together for `_find_gated_chains`), one
+    ordinary consumer (the real downstream Conv/ConvTranspose the closing
+    `Mul` feeds), and one extra fan-out branch (fc1, the gate subnetwork's
+    own squeeze layer, whose INPUT axis needs the identical keep set even
+    though its own output/squeeze-bottleneck axis is left untouched).
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    chains: List[_Chain] = []
+    for node in graph.node:
+        info = _match_conv_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, n_channels, producer_group = info
+        if producer_group != 1:
+            continue  # narrow scope -- see this section's own comment
+
+        out_name = node.output[0]
+        if out_name in graph_outputs:
+            continue
+
+        pre_ops: List[onnx.NodeProto] = []
+        cur = out_name
+        spine: Optional[str] = None
+        spine_consumers: List[onnx.NodeProto] = []
+        for _ in range(_MAX_CHAIN_HOPS):
+            cands = consumers_of.get(cur, [])
+            if len(cands) == 2:
+                spine = cur
+                spine_consumers = cands
+                break
+            if len(cands) != 1:
+                break
+            nxt = cands[0]
+            if not (
+                nxt.op_type in _UNARY_PASS_THROUGH
+                and list(nxt.input) == [cur]
+                and len(nxt.output) == 1
+            ):
+                break
+            out2 = nxt.output[0]
+            if out2 in graph_outputs:
+                break
+            pre_ops.append(nxt)
+            cur = out2
+        if spine is None:
+            continue
+
+        match = _match_conv_se_gate(
+            spine,
+            spine_consumers,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+        )
+        if match is None:
+            continue
+        (
+            gap_node,
+            fc1_node,
+            fc1_weight,
+            mul_node,
+            fc2_node,
+            fc2_weight,
+            fc2_bias,
+            gate_act_node,
+        ) = match
+
+        mul_out = mul_node.output[0]
+        if mul_out in graph_outputs or len(consumers_of.get(mul_out, [])) != 1:
+            continue
+
+        (
+            consumer,
+            post_mul_chain_ops,
+            conv_pass_through,
+            group_norm,
+            decomposed_group_norm_num_groups,
+            _matmul_consumer,
+        ) = _walk_to_conv_consumer(
+            mul_out,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+        # Every optional `_walk_to_conv_consumer` flag (`allow_conv_transpose_
+        # consumer`, `recognize_group_norm`, `recognize_decomposed_group_norm`,
+        # `recognize_gap_flatten_matmul_consumer`) was left at its default
+        # (False) above -- see this section's own comment for why -- so
+        # `group_norm`/`decomposed_group_norm_num_groups`/`_matmul_consumer`
+        # are always `None` here.
+        assert group_norm is None and decomposed_group_norm_num_groups is None
+        (
+            consumer_node,
+            consumer_weight,
+            consumer_group,
+            consumer_is_conv_transpose,
+        ) = consumer
+
+        if len({w_name, fc2_weight, fc1_weight, consumer_weight}) != 4:
+            continue  # a tied/shared weight across roles -- decline
+
+        chains.append(
+            _Chain(
+                producers=(
+                    _Producer(
+                        node,
+                        w_name,
+                        False,
+                        bias_name,
+                        pre_ops=tuple(pre_ops),
+                        is_conv=True,
+                    ),
+                    _Producer(
+                        fc2_node,
+                        fc2_weight,
+                        False,
+                        fc2_bias,
+                        pre_ops=(gate_act_node,),
+                        is_conv=True,
+                    ),
+                ),
+                chain_ops=((mul_node, None),) + post_mul_chain_ops,
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
+                conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
+                extra_consumers=(
+                    _ConsumerBranch(
+                        chain_ops=((gap_node, None),),
+                        consumer_node=fc1_node,
+                        consumer_weight=fc1_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                ),
+            )
+        )
+    return chains
+
+
 # --- MatMul/Gemm residual (Add-merged) chains -------------------------------
 #
 # The MatMul/Gemm analogue of the Conv residual/Add-merge grouping above --
@@ -10063,6 +10498,7 @@ def _walk_matmul_producer_backward(
                     node_by_output,
                     producer_infos,
                     consumers_of,
+                    initializer_map,
                     graph_outputs,
                     max_hops,
                 )
@@ -10071,6 +10507,7 @@ def _walk_matmul_producer_backward(
                     node_by_output,
                     producer_infos,
                     consumers_of,
+                    initializer_map,
                     graph_outputs,
                     max_hops,
                 )
@@ -10509,6 +10946,7 @@ def _trace_gate_producer_backward(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, str, bool, Optional[str], int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -10525,17 +10963,58 @@ def _trace_gate_producer_backward(
     Every tensor walked through, `tensor_name` itself included, must have
     exactly one consumer and not be a graph output: the same safety bar
     the forward walk holds every intermediate tensor to.
+
+    The one exception is a self-gated activation decomposition's own origin
+    tensor -- SiLU/Swish exported as ``x * Sigmoid(x)`` (or erf-GELU's
+    longer gate branch, see :func:`_match_self_gated_activation`'s own
+    docstring for the exact shapes) rather than a single fused node --
+    legitimately read *twice* (once by the gate branch's own first node,
+    once by the self-gating `Mul`): when the node *producing* the current
+    tensor turns out to be such a self-gating `Mul`
+    (:func:`_match_self_gated_activation_backward` -- the identical matcher
+    :func:`_walk_matmul_producer_backward`'s own backward walk already uses
+    for the single-producer case), the whole diamond is crossed as a single
+    pass-through hop, consuming one iteration of `max_hops` the same as an
+    ordinary `_UNARY_PASS_THROUGH` node does, and the diamond's own origin
+    tensor (which itself legitimately has those two in-diamond consumers)
+    is exempted from the ordinary single-consumer bar for that one hop only
+    -- mirroring how :func:`_walk_matmul_producer_backward` itself never
+    gates that call on `cur`'s own consumer count either, deferring the
+    two-vs-one-consumer question entirely to the matcher. Without this, a
+    real SwiGLU FFN using `nn.SiLU()` (which PyTorch/ONNX export as exactly
+    this decomposition, not a single `Sigmoid`) is never recognized as a
+    gated pair at all -- previously such a graph matched zero chains here.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # True right after crossing a self-gated-activation diamond: `cur` is
+    # then that diamond's own origin tensor, whose *two* real consumers (the
+    # gate branch's own first node and the gate `Mul`) are both already
+    # accounted for by the diamond just crossed, so the ordinary
+    # exactly-one-consumer bar below must be skipped for this one tensor.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -10612,6 +11091,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -10620,6 +11100,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -14156,6 +14637,7 @@ def apply_structured_pruning(
             + _find_gated_chains(graph)
             + _find_conv_chains(graph)
             + _find_conv_residual_chains(graph)
+            + _find_conv_se_gate_chains(graph)
             + _find_matmul_residual_chains(graph)
         )
         concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
@@ -15774,6 +16256,19 @@ class _QDQChain:
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _QDQConsumer
     n_channels: int
+    # A per-channel ``PRelu`` hop crossed on the `is_conv` (Conv/
+    # ConvTranspose) side only -- its own `slope` is `[C, 1, ..., 1]`
+    # (axis-0-is-channel), the same layout a depthwise Conv weight already
+    # needs :class:`_ConvPassThrough`/:func:`_apply_conv_pass_through_hop`
+    # for, reused verbatim here rather than folded into `chain_ops` (whose
+    # own `const_name` entries are always sliced by
+    # :func:`_slice_last_axis`, correct only for the MatMul/Gemm side's
+    # flat, last-axis-is-channel convention). Always empty on the
+    # MatMul/Gemm (`not is_conv`) side and for a `_QDQGatedChain` (always
+    # `is_conv=False`, see :func:`_find_qdq_gated_chains`) -- a per-channel
+    # PRelu hop there is an ordinary flat `chain_ops` entry instead, exactly
+    # like :func:`_walk_to_consumer`'s own identical MatMul-side PRelu hop.
+    conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -16041,7 +16536,13 @@ def _walk_to_consumer_qdq(
     max_hops: int,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
     producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
-) -> Optional[Tuple[_QDQConsumer, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
+) -> Optional[
+    Tuple[
+        _QDQConsumer,
+        Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+        Tuple[_ConvPassThrough, ...],
+    ]
+]:
     """From tensor `start`, walks forward through shape-preserving unary
     activations (`_UNARY_PASS_THROUGH`), and -- MatMul/Gemm family only
     (`not is_conv`; a norm hop is a Linear-adjacent concept, mirroring
@@ -16060,8 +16561,26 @@ def _walk_to_consumer_qdq(
     try), or a same-scale/zero_point ``QuantizeLinear -> DequantizeLinear``
     activation-requantization round trip (:func:`_match_qdq_requant_pass_through`
     -- the standard "full" QDQ format's own per-op activation boundary,
-    treated as a free pass-through exactly like a plain unary activation) --
-    with no other consumer anywhere along the way, until a
+    treated as a free pass-through exactly like a plain unary activation),
+    or a self-gated activation decomposition (SiLU/Swish exported as
+    ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
+    :func:`_match_self_gated_activation`, reused verbatim; both `is_conv`
+    and MatMul/Gemm families), or a ``PRelu`` node (both `is_conv` and
+    MatMul/Gemm families): a *scalar* or single-shared-parameter `slope`
+    (every dimension size 1) needs no operand of its own sliced, the same
+    shape a plain unary activation hop already gets; a *per-channel* one is
+    co-sliced -- on the `is_conv` side via :func:`_match_prelu_pass_through`
+    (the Conv-chain `[C, 1, ..., 1]`, axis-0-is-channel convention, folded
+    into the returned `conv_pass_through` tuple as a :class:`_ConvPassThrough`
+    hop, reusing :func:`_apply_conv_pass_through_hop` exactly like a
+    depthwise Conv weight already is -- see :class:`_QDQChain.conv_pass_through`'s
+    own comment for why this needs a dedicated hop type rather than an
+    ordinary `chain_ops` entry), or on the MatMul/Gemm side via
+    :func:`_match_prelu_pass_through_matmul` (the flat, last-axis-is-channel
+    convention, folded into `chain_ops` as an ordinary ``(node, slope_name)``
+    entry, mirroring :func:`_walk_to_consumer`'s own identical hop) -- with
+    no other consumer anywhere along the
+    way, until a
     same-family (Conv/ConvTranspose-only or MatMul/Gemm-only, matching
     `is_conv`) consumer is found whose input-channel count matches
     `n_channels`. No per-channel Add/Mul bias/scale hop, no depthwise Conv
@@ -16104,6 +16623,7 @@ def _walk_to_consumer_qdq(
     that function's whole-constant-initializer ``Reshape`` shape is matched.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+    conv_pass_through: List[_ConvPassThrough] = []
     cur = start
     for _hop in range(max_hops):
         if not is_conv:
@@ -16138,6 +16658,33 @@ def _walk_to_consumer_qdq(
                 continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch -- see
+            # :func:`_match_self_gated_activation`'s own docstring for the
+            # exact shapes) -- tried before the ordinary "exactly one
+            # consumer" dispatch below, mirroring
+            # :func:`_walk_to_consumer`'s/:func:`_walk_to_conv_consumer`'s
+            # own identical hop dispatch, for the identical reason: this
+            # shape's own root tensor is read *twice*. Declines instantly
+            # (returns ``None`` here) whenever `cur` doesn't have exactly
+            # two consumers matching this shape -- a real, quantized SwiGLU
+            # FFN using `nn.SiLU()` would otherwise never walk through this
+            # hop at all, even as a plain (non-gated) single-producer chain.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -16148,13 +16695,21 @@ def _walk_to_consumer_qdq(
                 if m is None or m[3] != n_channels:
                     return None
                 ref, _bias, _out, _in = m
-                return _QDQConsumer(nxt, ref, False, True), tuple(chain_ops)
+                return (
+                    _QDQConsumer(nxt, ref, False, True),
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
+                )
             if nxt.op_type == "ConvTranspose" and nxt.input[0] == cur:
                 m = _match_conv_transpose_qdq(nxt, initializer_map, dq_of, consumers_of)
                 if m is None or m[3] != n_channels:
                     return None
                 ref, _bias, _out, _in = m
-                return _QDQConsumer(nxt, ref, False, True, True), tuple(chain_ops)
+                return (
+                    _QDQConsumer(nxt, ref, False, True, True),
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
+                )
             if (
                 nxt.op_type == "GlobalAveragePool"
                 and nxt.domain == ""
@@ -16200,6 +16755,7 @@ def _walk_to_consumer_qdq(
                     return (
                         _QDQConsumer(mm_node, mm_ref, mm_weight_transposed, False),
                         tuple(chain_ops),
+                        tuple(conv_pass_through),
                     )
                 # No recognized Flatten(axis=1)/Reshape([batch,-1])/Squeeze
                 # -> {MatMul, vanilla Gemm} right after this
@@ -16213,8 +16769,10 @@ def _walk_to_consumer_qdq(
                 if mm[5] != n_channels:
                     return None
                 _x, ref, weight_transposed, _bias, _out, _in = mm
-                return _QDQConsumer(nxt, ref, weight_transposed, False), tuple(
-                    chain_ops
+                return (
+                    _QDQConsumer(nxt, ref, weight_transposed, False),
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
                 )
 
         if nxt.op_type == "QuantizeLinear":
@@ -16235,6 +16793,46 @@ def _walk_to_consumer_qdq(
             chain_ops.append((nxt, None))
             chain_ops.append((dq_node, None))
             cur = dq_out
+            continue
+
+        if (
+            nxt.op_type == "PRelu"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+        ):
+            # See this function's own docstring -- `is_conv` uses
+            # :func:`_match_prelu_pass_through`'s own axis-0,
+            # `[C, 1, ..., 1]` Conv-chain convention (a per-channel `slope`
+            # folded into `conv_pass_through` as a :class:`_ConvPassThrough`
+            # hop, sliced by :func:`_apply_conv_pass_through_hop` exactly
+            # like a depthwise Conv weight already is); the MatMul/Gemm side
+            # uses :func:`_match_prelu_pass_through_matmul`'s own flat,
+            # last-axis-is-channel convention (folded into `chain_ops` as an
+            # ordinary ``(node, slope_name)`` entry, mirroring
+            # :func:`_walk_to_consumer`'s own identical hop). Either way, a
+            # *scalar* `slope` needs no operand sliced at all.
+            prelu_match = (
+                _match_prelu_pass_through(nxt, initializer_map, n_channels)
+                if is_conv
+                else _match_prelu_pass_through_matmul(nxt, initializer_map, n_channels)
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            out2 = nxt.output[0]
+            if out2 in graph_outputs or len(consumers_of.get(out2, [])) != 1:
+                return None
+            if is_per_channel:
+                assert slope_name is not None
+                if is_conv:
+                    conv_pass_through.append(_ConvPassThrough(nxt, slope_name, None))
+                else:
+                    chain_ops.append((nxt, slope_name))
+            else:
+                chain_ops.append((nxt, None))
+            cur = out2
             continue
 
         const_name: Optional[str] = None
@@ -16349,9 +16947,6 @@ def _find_qdq_chains(
     }
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_QDQChain] = []
     for node in graph.node:
         is_conv_transpose = False
@@ -16378,7 +16973,16 @@ def _find_qdq_chains(
             is_conv = False
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok` (not a plain `_is_internal(out_name)`
+        # single-consumer gate) -- a producer's raw output that is itself a
+        # self-gated activation decomposition's own origin (read twice: once
+        # by the gate branch's own first node, once by the self-gating
+        # `Mul` -- see :func:`_walk_to_consumer_qdq`'s own hop dispatch) must
+        # reach the walker to be recognized at all; every other "is this
+        # safe to walk forward from" question is left to that walker's own
+        # dispatch, mirroring :func:`_find_chains`'s own identical choice
+        # (see `_matmul_walk_root_ok`'s own docstring).
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
 
         found = _walk_to_consumer_qdq(
@@ -16395,7 +16999,7 @@ def _find_qdq_chains(
         )
         if found is None:
             continue
-        consumer, chain_ops = found
+        consumer, chain_ops, conv_pass_through = found
         if not (ref.is_qdq or consumer.ref.is_qdq):
             continue  # both plain float -- apply_structured_pruning's job
 
@@ -16412,6 +17016,7 @@ def _find_qdq_chains(
                 chain_ops=chain_ops,
                 consumer=consumer,
                 n_channels=out_channels,
+                conv_pass_through=conv_pass_through,
             )
         )
     return chains
@@ -16424,6 +17029,7 @@ def _trace_gate_producer_backward_qdq(
         str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[_BiasRef], int]
     ],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -16445,17 +17051,45 @@ def _trace_gate_producer_backward_qdq(
     resolved :class:`_WeightRef` here), so sharing one function would need
     either an unsound cast or a wider, less precise type on both call
     sites.
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's own
+    longer gate branch -- see :func:`_match_self_gated_activation`'s own
+    docstring) as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters (a real, quantized
+    SwiGLU FFN using `nn.SiLU()` would otherwise never be recognized as a
+    gated pair here either).
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards: right after crossing a self-gated-activation
+    # diamond, `cur` is that diamond's own origin tensor, whose two real
+    # consumers are both already accounted for by the diamond just crossed.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -16561,6 +17195,7 @@ def _find_qdq_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -16569,6 +17204,7 @@ def _find_qdq_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -16615,7 +17251,12 @@ def _find_qdq_gated_chains(
         )
         if found is None:
             continue
-        consumer, chain_ops = found
+        consumer, chain_ops, _conv_pass_through = found
+        # Always empty: this call site always passes `is_conv=False` (gated
+        # pairs are MatMul/Gemm-only, see this function's own docstring), and
+        # `conv_pass_through` is only ever populated on the `is_conv` side --
+        # see :func:`_walk_to_consumer_qdq`'s own docstring.
+        assert not _conv_pass_through
 
         producer_a = _producer(info_a, pre_a)
         producer_b = _producer(info_b, pre_b)
@@ -16824,6 +17465,7 @@ def apply_structured_pruning_qdq(
         producer_touched: Set[str] = set()
         consumer_touched: Set[str] = set()
         const_touched: Set[str] = set()
+        conv_hop_touched: Set[str] = set()
         stale_value_info: Set[str] = set()
 
         for chain in chains:
@@ -16835,12 +17477,22 @@ def apply_structured_pruning_qdq(
                 for _, const_name in chain.chain_ops
                 if const_name is not None
             }
+            # A per-channel PRelu hop's own `slope` (`is_conv` side only --
+            # see :class:`_QDQChain.conv_pass_through`'s own comment): kept
+            # in its own tied-tensor guard set, distinct from `consts`,
+            # mirroring the plain-float :class:`_Chain`'s own identical
+            # `conv_hop`/`const` split (see :func:`_apply_chains`'s own
+            # `conv_hop_weights`/`conv_hop_touched`).
+            conv_hop_weights = {h.weight for h in chain.conv_pass_through}
+            if len(conv_hop_weights) != len(chain.conv_pass_through):
+                continue  # degenerate (the same weight named twice)
             if p_key == c_key:
                 continue  # degenerate (the same weight in both roles)
             if (
                 p_key in producer_touched
                 or c_key in consumer_touched
                 or (consts & const_touched)
+                or (conv_hop_weights & conv_hop_touched)
             ):
                 continue  # a shared/tied weight another chain already resized
 
@@ -16893,12 +17545,18 @@ def apply_structured_pruning_qdq(
             for _, const_name in chain.chain_ops:
                 if const_name is not None:
                     _slice_last_axis(initializer_map[const_name], keep)
+            for hop in chain.conv_pass_through:
+                _apply_conv_pass_through_hop(hop, initializer_map, keep, keep_count)
 
             producer_touched.add(p_key)
             consumer_touched.add(c_key)
             const_touched.update(consts)
+            conv_hop_touched.update(conv_hop_weights)
             stale_value_info.add(p.node.output[0])
             stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+            stale_value_info.update(
+                out for h in chain.conv_pass_through for out in h.node.output
+            )
             if p.ref.qdq is not None:
                 stale_value_info.add(p.ref.qdq.dq_node.output[0])
             elif p.ref.qdq_block is not None:
@@ -17958,17 +18616,27 @@ def _walk_to_matmul_nbits_consumer(
     export emits instead of a fused `_NORM_PASS_THROUGH_OPS` node
     (:func:`_match_decomposed_layer_norm_pass_through`/
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim, the
-    identical two matchers :func:`_walk_to_consumer` tries) -- with no other
+    identical two matchers :func:`_walk_to_consumer` tries), a
+    self-gated activation decomposition (SiLU/Swish exported as
+    ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
+    :func:`_match_self_gated_activation`, reused verbatim -- a single
+    tensor's own diamond, not a two-producer gated pair), or a ``PRelu`` node
+    (:func:`_match_prelu_pass_through_matmul`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop -- a *scalar* `slope`
+    needs no operand sliced at all, a *per-channel* one is co-sliced exactly
+    like the `_BINARY_CHANNEL_OPS` hop above) -- with no other
     consumer anywhere along the way, until EITHER a ``MatMulNBits`` consumer
     OR a plain-float MatMul/vanilla-Gemm consumer
     (:func:`_match_plain_matmul_nbits_peer`) is found whose input-channel
     count matches `n_channels` -- the ``MatMulNBits``/plain-float union this
     section's own top comment describes, the analogue of
     :func:`_walk_to_consumer_qdq`'s own float/QDQ union but restricted to
-    ``MatMulNBits``/plain-float (never QDQ). No gated pair (self-gated
-    activation/tanh-GELU), no branch, no ``PRelu``/``Clip``/fused-bias-GELU
-    hop -- unlike :func:`_walk_to_consumer`, only the norm and
-    `_BINARY_CHANNEL_OPS` hops above are added here. Returns ``None`` if the
+    ``MatMulNBits``/plain-float (never QDQ). No two-producer gated pair
+    (that's :func:`_find_matmul_nbits_gated_chains`'s own job) or tanh-GELU,
+    no branch, no ``Clip``/fused-bias-GELU hop -- unlike
+    :func:`_walk_to_consumer`, only the norm, `_BINARY_CHANNEL_OPS`,
+    self-gated-activation, and ``PRelu`` hops above are added here. Returns
+    ``None`` if the
     walk runs out of hops, hits a branch, or never reaches such a consumer.
     The caller (:func:`_find_matmul_nbits_chains`) is responsible for
     discarding a plain-float-to-plain-float result -- that pairing is
@@ -18013,6 +18681,28 @@ def _walk_to_matmul_nbits_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch, for the identical reason: this shape's own root
+            # tensor is read *twice*. Declines instantly (returns ``None``
+            # here) whenever `cur` doesn't match this shape.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -18072,6 +18762,21 @@ def _walk_to_matmul_nbits_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop: a *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced exactly like the `_BINARY_CHANNEL_OPS` hop above.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -18161,9 +18866,6 @@ def _find_matmul_nbits_chains(
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_MatMulNBitsChain] = []
     for node in graph.node:
         producer: _MatMulNBitsChainSide
@@ -18180,7 +18882,11 @@ def _find_matmul_nbits_chains(
             producer, n_channels = peer, peer.out_channels
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok`, not `_is_internal` -- see
+        # :func:`_find_qdq_chains`'s own identical comment: a self-gated
+        # activation decomposition's own origin (read twice) must reach
+        # :func:`_walk_to_matmul_nbits_consumer` to be recognized at all.
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
         found = _walk_to_matmul_nbits_consumer(
             out_name,
@@ -18207,6 +18913,7 @@ def _trace_gate_producer_backward_matmul_nbits(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulNBitsChainSide, int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -18221,17 +18928,42 @@ def _trace_gate_producer_backward_matmul_nbits(
     :func:`_find_matmul_nbits_gated_chains`). Duplicated rather than shared
     with the QDQ section's own walker, for the identical reason that
     section gives (structurally different `producer_infos` value types).
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's own
+    longer gate branch) as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards: right after crossing a self-gated-activation
+    # diamond, `cur` is that diamond's own origin tensor, whose two real
+    # consumers are both already accounted for by the diamond just crossed.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -18321,6 +19053,7 @@ def _find_matmul_nbits_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -18329,6 +19062,7 @@ def _find_matmul_nbits_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -19214,7 +19948,14 @@ def _walk_to_matmul_bnb4_consumer(
     identical two matchers :func:`_walk_to_matmul_nbits_consumer`/
     :func:`_walk_to_dynquant_consumer` try, sound here for the identical
     reason: this op's own `A`/`Y` are always float32/float16/bfloat16,
-    never themselves quantized -- see this section's own top comment) --
+    never themselves quantized -- see this section's own top comment), a
+    self-gated activation decomposition (SiLU/Swish exported as
+    ``x * Sigmoid(x)``, or erf-GELU's own longer gate branch --
+    :func:`_match_self_gated_activation`, reused verbatim), or a ``PRelu``
+    node (:func:`_match_prelu_pass_through_matmul`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop -- a *scalar* `slope`
+    needs no operand sliced at all, a *per-channel* one is co-sliced exactly
+    like the `_BINARY_CHANNEL_OPS` hop above) --
     with no other consumer anywhere along the way, until a plain-float
     (directly-constant weight) ``MatMul``/vanilla-``Gemm`` consumer
     (:func:`_match_plain_matmul_nbits_peer` -- reused directly here, fully
@@ -19265,6 +20006,28 @@ def _walk_to_matmul_bnb4_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch, for the identical reason: this shape's own root
+            # tensor is read *twice*. Declines instantly (returns ``None``
+            # here) whenever `cur` doesn't match this shape.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -19314,6 +20077,21 @@ def _walk_to_matmul_bnb4_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop: a *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced exactly like the `_BINARY_CHANNEL_OPS` hop above.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -19401,16 +20179,15 @@ def _find_matmul_bnb4_chains(
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_MatMulBnb4Chain] = []
     for node in graph.node:
         producer = _match_matmul_bnb4_producer(node, initializer_map, consumers_of)
         if producer is None:
             continue
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok`, not `_is_internal` -- see
+        # :func:`_find_qdq_chains`'s own identical comment.
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
         found = _walk_to_matmul_bnb4_consumer(
             out_name,
@@ -19433,6 +20210,7 @@ def _trace_gate_producer_backward_bnb4(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulBnb4ChainSide, int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -19450,17 +20228,39 @@ def _trace_gate_producer_backward_bnb4(
     with the ``MatMulNBits`` section's own walker, for the identical reason
     that section gives its own duplicate of the QDQ section's walker
     (structurally different `producer_infos` value types).
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -19579,6 +20379,7 @@ def _find_matmul_bnb4_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -19587,6 +20388,7 @@ def _find_matmul_bnb4_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -20771,6 +21573,15 @@ class _GQAChain:
     # `MultiHeadAttention` node whose own `bias` input is absent/empty --
     # both exactly as before this field existed.
     mha_bias: Optional[str] = None
+    # Set only for a matched ``LinearAttention`` node whose own `decay`/`beta`
+    # inputs (indices 4/5) are fed by a recognized ``com.microsoft::
+    # LinearAttentionGate`` node -- see :func:`_match_linear_attention_gate`
+    # (what's matched and why) and :class:`_LinearAttentionGatePassThrough`
+    # (what gets sliced at apply time). ``None`` (the default) for every
+    # other matched op, and for a `LinearAttention` chain whose `decay`/
+    # `beta` are absent or genuine constants -- both exactly as before this
+    # field existed.
+    linear_attention_gate: Optional["_LinearAttentionGatePassThrough"] = None
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -22142,46 +22953,65 @@ def _match_paged_attention_producer(
 #   or `attn_mask`).
 #
 #   **Scope boundary, declined rather than guessed at: a *dynamic*
-#   `decay`/`beta` declines the whole match outright**, unlike
-#   `GroupQueryAttention`'s own dynamic `past_key`/`past_value`/`attention_bias`
-#   (left alone, matched anyway) -- a deliberately narrower bar than the rest
-#   of this family, for a reason specific to these two inputs: `past_key`/
-#   `past_value`/`attention_bias`, when dynamic, are either an ordinary graph
-#   input (a caller free to supply a differently-sized tensor after this
-#   pass shrinks `kv_num_heads`) or, in an unrolled autoregressive loop,
-#   loop-carried from that *same op's own* `present_key`/`present_value`
-#   output -- which this pass's own `kv_num_heads` rewrite already narrows in
-#   step. `decay`/`beta` have no such self-consistent path: `LinearAttention`
-#   has no `decay`/`beta` *output* at all (only `output`/`present_state`), so
-#   a dynamic one can only come from a genuine graph input (in which case the
+#   `decay`/`beta` declines the whole match outright UNLESS it is fed by one
+#   specific, recognized producer shape**, unlike `GroupQueryAttention`'s own
+#   dynamic `past_key`/`past_value`/`attention_bias` (left alone, matched
+#   anyway) -- a deliberately narrower bar than the rest of this family, for
+#   a reason specific to these two inputs: `past_key`/`past_value`/
+#   `attention_bias`, when dynamic, are either an ordinary graph input (a
+#   caller free to supply a differently-sized tensor after this pass shrinks
+#   `kv_num_heads`) or, in an unrolled autoregressive loop, loop-carried from
+#   that *same op's own* `present_key`/`present_value` output -- which this
+#   pass's own `kv_num_heads` rewrite already narrows in step. `decay`/`beta`
+#   have no such self-consistent path in general: `LinearAttention` has no
+#   `decay`/`beta` *output* at all (only `output`/`present_state`), so a
+#   dynamic one can only come from a genuine graph input (in which case the
 #   "caller supplies a narrower tensor" reasoning above would still hold) or
 #   -- the realistic, common shape for every actual gated/delta/gated_delta
-#   export -- an internal node's own computation (e.g. `com.microsoft::
-#   LinearAttentionGate`, this op's own documented companion, projecting from
-#   a `dt_bias`/`decay_scale` weight sized `(kv_num_heads,)`) that this pass
-#   never traces into or adjusts. Nothing here can tell those two cases
-#   apart from the tensor name alone, and leaving a genuinely internally-
-#   computed, still-old-width `decay`/`beta` connected to a node whose own
-#   `kv_num_heads` this pass just shrank is a real, silent correctness risk
-#   (a shape mismatch at best, a wrong-axis silent miscompute at worst) --
-#   not a risk this pass is willing to take on an unconfirmed guess. The
-#   practical consequence: this pass only ever prunes a `LinearAttention`
-#   chain whose `update_rule` is `"linear"` (needs neither `decay` nor
-#   `beta` at all) or one whose `decay`/`beta` happen to be genuine constants
-#   (a degenerate shape no real dynamic-decode export produces, but handled
-#   correctly rather than assumed away) -- a `gated`/`delta`/`gated_delta`
-#   chain fed by a real `LinearAttentionGate` (or equivalent) node is left
-#   completely unmatched, exactly the same "unmatched topology, not a silent
-#   gap" outcome this module holds everywhere else. Recognizing
-#   `LinearAttentionGate` as its own pass-through hop (slicing its own
-#   `dt_bias`/`decay_scale` per-head weights by `keep_groups`, mirroring how
-#   `_walk_back_through_qk_norm_rope` already recognizes a per-head Q/K-norm
-#   sandwich) would close this gap, but is genuinely new machinery beyond
-#   this feature's own scope -- left for a future pass, the same kind of
-#   scoped-out future work `GroupQueryAttention`'s own in-op
-#   `q_norm_weight`/`k_norm_weight` gap once was, before this module's
-#   `_match_gqa_producer`/`_find_gqa_chains` closed it (see this module's
-#   "Attention-head pruning" section comment for that wiring).
+#   export -- an internal node's own computation that this pass would
+#   otherwise never trace into or adjust. Nothing here can tell those two
+#   cases apart from the tensor name alone, and leaving a genuinely
+#   internally-computed, still-old-width `decay`/`beta` connected to a node
+#   whose own `kv_num_heads` this pass just shrank is a real, silent
+#   correctness risk (a shape mismatch at best, a wrong-axis silent
+#   miscompute at worst) -- not a risk this pass is willing to take on an
+#   unconfirmed guess.
+#
+#   Exactly one internal-node shape *does* have a self-consistent "narrower
+#   output implies narrower producer" story, and is recognized:
+#   `com.microsoft::LinearAttentionGate` (this op's own documented
+#   companion, schema confirmed live via
+#   ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+#   against this environment's installed onnxruntime 1.29.0, `since_version`
+#   1) -- `decay = decay_scale * Softplus(a + dt_bias)`, `beta =
+#   Sigmoid(b)` (`b` "Required when the beta output is requested"), with
+#   `dt_bias`/`decay_scale` each a real `(kv_num_heads,)` float constant and
+#   `a`/`b` each a plain `(B, T, kv_num_heads)` MatMul/vanilla-Gemm
+#   activation. `dt_bias`/`decay_scale` are sliced directly (axis 0, by
+#   `keep_groups`) -- :func:`_apply_one_gqa_chain`'s own genuinely new
+#   per-tensor edit for this feature; `a`/`b` themselves need no slicing at
+#   all -- narrowing `a`'s/`b`'s own producer weight's output columns by the
+#   identical `keep_groups` (exactly how Q's/K's/V's own producer weight
+#   already gets narrowed) narrows `a`/`b` "for free", the same way this
+#   module never explicitly slices Q's/K's/V's own activation either. See
+#   :func:`_match_linear_attention_gate` (what's matched, and the
+#   single-consumer/not-a-graph-output bar every crossed edge is held to,
+#   mirroring `_walk_back_through_qk_norm_rope`'s own per-head Q/K-norm
+#   sandwich) and :class:`_LinearAttentionGatePassThrough` (what gets sliced)
+#   for the full mechanics. The practical consequence: this pass prunes a
+#   `LinearAttention` chain whose `update_rule` is `"linear"` (needs neither
+#   `decay` nor `beta` at all), one whose `decay`/`beta` happen to be genuine
+#   constants (a degenerate shape no real dynamic-decode export produces, but
+#   handled correctly rather than assumed away), AND -- since this fix -- a
+#   `gated`/`delta`/`gated_delta` chain fed by a real `LinearAttentionGate`
+#   node, the realistic shape every actual dynamic-decode export uses; a
+#   `decay`/`beta` fed by anything else dynamic (a bare graph input, any
+#   other node, a gate whose own `a`/`b` don't resolve to a plain constant-
+#   weight producer) is still left completely unmatched, exactly the same
+#   "unmatched topology, not a silent gap" outcome this module holds
+#   everywhere else -- deliberately NOT a general "any dynamic decay is now
+#   fine" relaxation, since no other shape has this one gate node's own
+#   self-consistent story.
 # - `scale` (float, default 0.0 -- "derives d_k... and uses 1/sqrt(d_k)")
 #   and `chunk_size` (int, "tuning hint; does not affect output correctness")
 #   are both entirely head-count-independent -- neither is ever read or
@@ -22234,12 +23064,18 @@ def _match_linear_attention_producer(
     rank-4 `(*, kv_num_heads, *, *)` shape (dynamic needs no check, left
     alone entirely -- the caller's own runtime data), and `decay`/`beta`
     (indices 4/5) -- see this section's own comment for the full reasoning
-    -- decline the whole match outright whenever either is connected but
-    *not* a constant, since nothing here can confirm a dynamic one's own
-    producer will still emit the correct post-pruning width. `beta`'s own
-    exact-shape check (its two documented shapes don't need `head_size` to
-    tell apart) runs here; `decay`'s own (which does) is deferred to
-    :func:`_find_linear_attention_chains`. This op has no
+    -- get their *constant*-shape checks here (a genuine constant not
+    exactly one of `decay`'s/`beta`'s own documented shapes declines the
+    whole match outright); a *dynamic* one is neither checked nor declined
+    here at all -- entirely deferred to :func:`_find_linear_attention_chains`
+    (via :func:`_match_linear_attention_gate`), which alone has the
+    graph-wide consumer/producer maps needed to tell a recognized
+    `com.microsoft::LinearAttentionGate` pass-through apart from anything
+    else dynamic (declined there instead). `beta`'s own exact-shape check
+    (its two documented shapes don't need `head_size` to tell apart) runs
+    here; `decay`'s own (which does) is deferred to
+    :func:`_find_linear_attention_chains` regardless of whether it is
+    constant or gate-fed. This op has no
     `attention_bias`/`attn_mask`-equivalent input at all on its own schema
     (confirmed off the same live schema dump the rest of this section was
     built from) -- `value_info_by_name` is accepted, unused, purely for
@@ -22278,9 +23114,13 @@ def _match_linear_attention_producer(
         if len(node.input) > idx and node.input[idx]:
             extra_init = initializer_map.get(node.input[idx])
             if extra_init is None:
-                return (
-                    None  # dynamic decay/beta -- declined, see this section's comment
-                )
+                # Dynamic decay/beta -- no longer declined right here: might
+                # be the one recognized `LinearAttentionGate` pass-through
+                # shape, checked later, once graph-wide consumer/producer
+                # maps are available, by :func:`_find_linear_attention_chains`
+                # (via :func:`_match_linear_attention_gate`) -- see this
+                # section's own comment for the full reasoning either way.
+                continue
             if (
                 not _is_supported_float_dtype(extra_init.data_type)
                 or len(extra_init.dims) != 3
@@ -24172,6 +25012,211 @@ def _find_paged_attention_chains(
     )
 
 
+@dataclass(frozen=True)
+class _LinearAttentionGatePassThrough:
+    """A ``com.microsoft::LinearAttentionGate`` node recognized, by
+    :func:`_match_linear_attention_gate`, as a safe pass-through producer
+    for a matched ``LinearAttention`` chain's own dynamic `decay`/`beta`
+    inputs -- see this module's own "Attention-head pruning" section
+    comment, the `LinearAttention` bullet's own `decay`/`beta` scope-boundary
+    paragraph, for the full empirical schema findings (`decay = decay_scale
+    * Softplus(a + dt_bias)`, `beta = Sigmoid(b)`, confirmed live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``)
+    and why this one op shape -- and only this one -- has a self-consistent
+    "narrower output implies narrower producer" story.
+
+    `dt_bias`/`decay_scale` (this node's own inputs 1/2, each a real
+    per-KV-head `(kv_num_heads,)` float constant) are sliced directly, axis
+    0, by the chain's own `keep_groups` -- :func:`_apply_one_gqa_chain`'s own
+    genuinely new per-tensor edit for this feature, mirroring how a
+    *constant* `decay`/`beta` already gets sliced elsewhere in that same
+    function.
+
+    `a`/`b` (this node's own inputs 0/3 -- `a` always present and always
+    resolved, since `decay` is this op's own required output, always
+    computed regardless of whether `LinearAttention` actually consumes it;
+    `b` only present/resolved when `beta` is *also* wired to the matched
+    chain's own `LinearAttention` node) need no slicing of their own: each
+    is itself a plain MatMul/vanilla-Gemm activation, exactly
+    `kv_num_heads`-wide, so narrowing that producer's own output columns by
+    the identical `keep_groups` -- recorded here as `a_weight`/`a_bias`/
+    `a_weight_transposed` (always set) and `b_weight`/`b_bias`/
+    `b_weight_transposed` (set only when `b` needs narrowing too) -- narrows
+    `a`/`b` themselves "for free", the same way slicing Q's/K's/V's own
+    producer weight already narrows their own activation with no separate
+    step. `b_weight` is left ``None`` whenever `beta` isn't wired to the
+    matched chain at all (the gate's own `beta` output, if present, is then
+    simply unused, so `b`'s own width is immaterial and left completely
+    untouched).
+    """
+
+    node: onnx.NodeProto
+    dt_bias: str
+    decay_scale: str
+    a_weight: str
+    a_bias: Optional[str]
+    a_weight_transposed: bool
+    b_weight: Optional[str] = None
+    b_bias: Optional[str] = None
+    b_weight_transposed: bool = False
+
+
+def _match_linear_attention_gate(
+    node: onnx.NodeProto,
+    kv_num_heads: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[_LinearAttentionGatePassThrough]:
+    """Recognizes exactly one dynamic-producer shape for a matched
+    ``LinearAttention`` `node`'s own `decay`/`beta` inputs (indices 4/5,
+    each already confirmed non-constant by the caller -- see
+    :func:`_match_linear_attention_producer`'s own docstring for why a
+    dynamic `decay`/`beta` is no longer declined right there, deferred here
+    instead, where the graph-wide consumer/producer maps this needs are
+    available): both fed, directly and exclusively, by the SAME
+    ``com.microsoft::LinearAttentionGate`` node's own `decay` (output 0)
+    and, when `beta` is also connected, `beta` (output 1) outputs -- this
+    op's own documented companion, confirmed live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+    against this environment's installed onnxruntime 1.29.0 (`since_version`
+    1): `decay = decay_scale * Softplus(a + dt_bias)`, `beta = Sigmoid(b)`
+    (`b` "Required when the beta output is requested"), `dt_bias`/
+    `decay_scale` "per-head float32 vectors of length H" (`H` ==
+    `kv_num_heads`). See this module's own "Attention-head pruning" section
+    comment, the `LinearAttention` bullet, for why this is deliberately the
+    ONLY dynamic `decay`/`beta` producer shape ever recognized -- anything
+    else (a bare graph input, any other node, a gate whose own `a`/`b` don't
+    resolve to a plain constant-weight producer) still declines the whole
+    match, exactly as before this function existed.
+
+    Every edge crossed -- `node`'s own `decay`/`beta` input(s), and the gate
+    node's own `a`/`b` input(s) -- is required to have exactly one consumer
+    and not be a graph output (the same "no other consumer along the way"
+    bar :func:`_walk_back_through_qk_norm_rope` already holds its own
+    crossed hops to): narrowing `dt_bias`'s/`decay_scale`'s/`a`'s-or-`b`'s
+    own producer weight in place would otherwise silently corrupt whatever
+    else reads that same tensor. `a`'s (always) and `b`'s (only when `beta`
+    is connected) own producer must independently resolve via
+    :func:`_match_producer` (a plain MatMul/vanilla-Gemm with a constant 2-D
+    float weight) to a `kv_num_heads`-wide output -- exactly the schema's
+    own `(B, T, H)` shape -- so :func:`_apply_one_gqa_chain` can narrow it
+    the same "slice the producer weight's own output columns by
+    `keep_groups`" way Q's/K's/V's own producer weight already gets
+    narrowed (see :class:`_LinearAttentionGatePassThrough`'s own docstring
+    for why `a`/`b` themselves never need touching beyond that). Anything
+    not matching this exact shape declines outright (returns ``None``)
+    rather than guessed at.
+    """
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    decay_name = node.input[4] if len(node.input) > 4 else ""
+    beta_name = node.input[5] if len(node.input) > 5 else ""
+    dyn_decay = bool(decay_name) and decay_name not in initializer_map
+    dyn_beta = bool(beta_name) and beta_name not in initializer_map
+    if not dyn_decay and not dyn_beta:
+        return None  # nothing dynamic here -- not this function's own case
+
+    dyn_names = [
+        n for n in (decay_name if dyn_decay else "", beta_name if dyn_beta else "") if n
+    ]
+    gate_node = node_by_output.get(dyn_names[0])
+    if gate_node is None:
+        return None
+    if any(node_by_output.get(n) is not gate_node for n in dyn_names):
+        return None  # both dynamic inputs must be this SAME gate node's own outputs
+    if (
+        gate_node.domain != "com.microsoft"
+        or gate_node.op_type != "LinearAttentionGate"
+    ):
+        return None
+    if dyn_decay and (
+        len(gate_node.output) < 1
+        or not gate_node.output[0]
+        or gate_node.output[0] != decay_name
+    ):
+        return None
+    if dyn_beta and (
+        len(gate_node.output) < 2
+        or not gate_node.output[1]
+        or gate_node.output[1] != beta_name
+    ):
+        return None
+    for n in dyn_names:
+        if not _is_internal(n):
+            return None
+
+    if (
+        len(gate_node.input) < 3
+        or not gate_node.input[0]
+        or not gate_node.input[1]
+        or not gate_node.input[2]
+    ):
+        return None
+    a_name, dt_bias_name, decay_scale_name = (
+        gate_node.input[0],
+        gate_node.input[1],
+        gate_node.input[2],
+    )
+    dt_bias_init = initializer_map.get(dt_bias_name)
+    decay_scale_init = initializer_map.get(decay_scale_name)
+    if dt_bias_init is None or decay_scale_init is None:
+        return None
+    for init in (dt_bias_init, decay_scale_init):
+        if not _is_supported_float_dtype(init.data_type) or list(init.dims) != [
+            kv_num_heads
+        ]:
+            return None
+
+    if not _is_internal(a_name):
+        return None
+    a_prod = node_by_output.get(a_name)
+    if a_prod is None:
+        return None
+    a_info = _match_producer(a_prod, initializer_map)
+    if a_info is None:
+        return None
+    a_weight, a_weight_t, a_bias, a_n = a_info
+    if a_n != kv_num_heads:
+        return None
+
+    b_weight: Optional[str] = None
+    b_bias: Optional[str] = None
+    b_weight_t = False
+    if dyn_beta:
+        if len(gate_node.input) < 4 or not gate_node.input[3]:
+            return None
+        b_name = gate_node.input[3]
+        if not _is_internal(b_name):
+            return None
+        b_prod = node_by_output.get(b_name)
+        if b_prod is None:
+            return None
+        b_info = _match_producer(b_prod, initializer_map)
+        if b_info is None:
+            return None
+        b_weight, b_weight_t, b_bias, b_n = b_info
+        if b_n != kv_num_heads:
+            return None
+        if b_weight == a_weight:
+            return None  # degenerate -- can't independently slice a shared producer
+
+    return _LinearAttentionGatePassThrough(
+        node=gate_node,
+        dt_bias=dt_bias_name,
+        decay_scale=decay_scale_name,
+        a_weight=a_weight,
+        a_bias=a_bias,
+        a_weight_transposed=a_weight_t,
+        b_weight=b_weight,
+        b_bias=b_bias,
+        b_weight_transposed=b_weight_t,
+    )
+
+
 def _find_linear_attention_chains(
     graph: onnx.GraphProto,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
@@ -24187,20 +25232,32 @@ def _find_linear_attention_chains(
     requirement the two agree), the same as the plain ai.onnx `Attention`
     op/`MultiHeadAttention`.
 
-    Performs the one deferred check :func:`_match_linear_attention_producer`
-    itself cannot -- it doesn't yet know `head_size` (resolved only here,
-    from Q's own producer weight, by :func:`_find_separate_qkv_chains`
-    itself): a connected constant `decay` (index 4) must be exactly one of
-    its own two documented shapes -- ``(*, *, kv_num_heads)`` (DeltaNet/
-    RetNet, per-head scalar decay) or ``(*, *, kv_num_heads * head_size)``
-    (GLA/RWKV-6, per-key-dimension decay, `head_size` being Q's/K's shared
-    per-head width -- *not* V's own, independent `v_head_size`) -- anything
-    else declines the whole chain here, the same "don't guess" bar every
-    other deferred shape check in this section already holds (mirroring
-    `PagedAttention`'s own deferred `q_norm_weight`/`k_norm_weight`
-    exact-shape check). A *dynamic* `decay`/`beta` was already declined
-    outright at match time (see :func:`_match_linear_attention_producer`'s
-    own docstring for why) -- nothing here is reachable for that case.
+    Performs two deferred checks :func:`_match_linear_attention_producer`
+    itself cannot:
+
+    - A connected constant `decay` (index 4) must be exactly one of its own
+      two documented shapes -- ``(*, *, kv_num_heads)`` (DeltaNet/RetNet,
+      per-head scalar decay) or ``(*, *, kv_num_heads * head_size)``
+      (GLA/RWKV-6, per-key-dimension decay, `head_size` being Q's/K's shared
+      per-head width -- *not* V's own, independent `v_head_size`) --
+      anything else declines the whole chain here, the same "don't guess"
+      bar every other deferred shape check in this section already holds
+      (mirroring `PagedAttention`'s own deferred `q_norm_weight`/
+      `k_norm_weight` exact-shape check); needs `head_size`, resolved only
+      here, from Q's own producer weight, by :func:`_find_separate_qkv_chains`
+      itself.
+    - A connected *dynamic* `decay`/`beta` (declined outright by
+      :func:`_match_linear_attention_producer` before this fix; now merely
+      deferred, since it might be the one recognized
+      `com.microsoft::LinearAttentionGate` pass-through shape) is resolved
+      here via :func:`_match_linear_attention_gate`, which needs the
+      graph-wide consumer/producer maps :func:`_match_linear_attention_producer`
+      itself is never given -- a chain whose dynamic `decay`/`beta` doesn't
+      resolve this way is dropped here (the same "unmatched topology"
+      outcome as any other declined chain), one that does is rewrapped
+      (:func:`dataclasses.replace`, since :class:`_GQAChain` is frozen) with
+      its own `.linear_attention_gate` set, for :func:`_apply_one_gqa_chain`
+      to slice at apply time.
     """
     chains = _find_separate_qkv_chains(
         graph,
@@ -24210,10 +25267,36 @@ def _find_linear_attention_chains(
         allow_differing_v_head_size=True,
     )
     initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
     out = []
     for chain in chains:
         decay_name = chain.node.input[4] if len(chain.node.input) > 4 else ""
-        if decay_name:
+        beta_name = chain.node.input[5] if len(chain.node.input) > 5 else ""
+        decay_dynamic = bool(decay_name) and decay_name not in initializer_map
+        beta_dynamic = bool(beta_name) and beta_name not in initializer_map
+
+        gate: Optional[_LinearAttentionGatePassThrough] = None
+        if decay_dynamic or beta_dynamic:
+            gate = _match_linear_attention_gate(
+                chain.node,
+                chain.kv_num_heads,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+            )
+            if gate is None:
+                continue  # dynamic decay/beta not the recognized
+                # LinearAttentionGate shape -- declined
+            if gate.a_weight in (chain.q_weight, chain.k_weight, chain.v_weight) or (
+                gate.b_weight is not None
+                and gate.b_weight in (chain.q_weight, chain.k_weight, chain.v_weight)
+            ):
+                continue  # degenerate -- can't independently slice a shared producer
+
+        if decay_name and not decay_dynamic:
             decay_init = initializer_map.get(decay_name)
             if decay_init is not None:
                 last = decay_init.dims[-1] if len(decay_init.dims) else -1
@@ -24222,7 +25305,10 @@ def _find_linear_attention_chains(
                     chain.kv_num_heads * chain.head_size,
                 ):
                     continue  # neither of decay's own two documented shapes
-        out.append(chain)
+
+        out.append(
+            chain if gate is None else replace(chain, linear_attention_gate=gate)
+        )
     return out
 
 
@@ -27634,24 +28720,27 @@ def _apply_one_gqa_chain(
 
     # `LinearAttention`'s own `past_state`/`decay`/`beta` (indices 3/4/5 --
     # see this module's own "Attention-head pruning" section comment, the
-    # `LinearAttention` bullet, for the full empirical schema findings and
-    # why a *dynamic* `decay`/`beta` already declined the whole match at
-    # :func:`_match_linear_attention_producer` time -- nothing reaches this
-    # block for that case). `past_state` (rank-4 `(B, kv_num_heads, d_k,
-    # d_v)`) is the closest analogue of `GroupQueryAttention`'s own
-    # `past_key`/`past_value`, sliced the identical axis-1 way when
-    # constant. `decay` (rank-3) is either `kv_num_heads`-wide (DeltaNet/
-    # RetNet, per-head scalar -- sliced directly by `keep_groups`, no
-    # `head_size` expansion) or `kv_num_heads * d`-wide (GLA/RWKV-6,
-    # per-key-dimension -- sliced by the same per-head *column* expansion
-    # K's own producer weight gets, :func:`_head_column_indices`); already
-    # confirmed to be exactly one of these two shapes, or dynamic, by
-    # :func:`_find_linear_attention_chains`'s own deferred check, so no
-    # `else` branch here needs to guess at a third shape. `beta` (rank-3,
-    # `kv_num_heads`-wide or a size-1 broadcast) is sliced only in the
-    # former case -- the latter needs no per-head slicing at all, the same
-    # "PER_TENSOR broadcast, left alone" reasoning as `k_scale`/`v_scale`
-    # above.
+    # `LinearAttention` bullet, for the full empirical schema findings). A
+    # *dynamic* `decay`/`beta` reaches this block only when
+    # `chain.linear_attention_gate` is set (see below) -- anything else
+    # dynamic already declined the whole match, in
+    # :func:`_find_linear_attention_chains` (via
+    # :func:`_match_linear_attention_gate`) or, before that, at
+    # :func:`_match_linear_attention_producer` time. `past_state` (rank-4
+    # `(B, kv_num_heads, d_k, d_v)`) is the closest analogue of
+    # `GroupQueryAttention`'s own `past_key`/`past_value`, sliced the
+    # identical axis-1 way when constant. `decay` (rank-3) is either
+    # `kv_num_heads`-wide (DeltaNet/RetNet, per-head scalar -- sliced
+    # directly by `keep_groups`, no `head_size` expansion) or `kv_num_heads
+    # * d`-wide (GLA/RWKV-6, per-key-dimension -- sliced by the same
+    # per-head *column* expansion K's own producer weight gets,
+    # :func:`_head_column_indices`); already confirmed, when constant, to be
+    # exactly one of these two shapes by :func:`_find_linear_attention_chains`'s
+    # own deferred check, so no `else` branch here needs to guess at a third
+    # shape. `beta` (rank-3, `kv_num_heads`-wide or a size-1 broadcast) is
+    # sliced only in the former case -- the latter needs no per-head slicing
+    # at all, the same "PER_TENSOR broadcast, left alone" reasoning as
+    # `k_scale`/`v_scale` above.
     if is_linear_attention:
         if len(chain.node.input) > 3 and chain.node.input[3]:
             past_state_init = initializer_map.get(chain.node.input[3])
@@ -27669,6 +28758,35 @@ def _apply_one_gqa_chain(
             beta_init = initializer_map.get(chain.node.input[5])
             if beta_init is not None and beta_init.dims[-1] == h:
                 _slice_last_axis(beta_init, keep_groups)
+
+        # A recognized ``com.microsoft::LinearAttentionGate`` pass-through
+        # (see :func:`_match_linear_attention_gate`,
+        # :class:`_LinearAttentionGatePassThrough`): `dt_bias`/`decay_scale`
+        # (both real `(kv_num_heads,)` constants) are sliced directly, axis
+        # 0 -- the one genuinely new per-tensor edit this feature adds.
+        # `a`'s (always) and `b`'s (only when `beta` was also wired to this
+        # chain) own producer weight -- resolved, at match time, to a plain
+        # MatMul/vanilla-Gemm output exactly `kv_num_heads` columns wide --
+        # is sliced the identical `keep_groups` way Q's/K's/V's own producer
+        # weight already is a few lines above, narrowing `a`/`b` themselves
+        # with no separate step (see that class's own docstring for why).
+        gate = chain.linear_attention_gate
+        if gate is not None:
+            _slice_last_axis(initializer_map[gate.dt_bias], keep_groups)
+            _slice_last_axis(initializer_map[gate.decay_scale], keep_groups)
+            _slice_producer_weight(
+                initializer_map[gate.a_weight], gate.a_weight_transposed, keep_groups
+            )
+            if gate.a_bias is not None:
+                _slice_last_axis(initializer_map[gate.a_bias], keep_groups)
+            if gate.b_weight is not None:
+                _slice_producer_weight(
+                    initializer_map[gate.b_weight],
+                    gate.b_weight_transposed,
+                    keep_groups,
+                )
+                if gate.b_bias is not None:
+                    _slice_last_axis(initializer_map[gate.b_bias], keep_groups)
 
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
     # for the plain ai.onnx op, 5 for `MultiHeadAttention`, 4 for
@@ -27812,8 +28930,20 @@ def _apply_one_gqa_chain(
         if hop is not None:
             stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
             stale.update(hop.extra_stale_outputs)
+    producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+    if chain.linear_attention_gate is not None:
+        # A recognized `LinearAttentionGate` pass-through node is a
+        # distinct node from `chain.node` (already covered by `stale`
+        # above), so its own `decay`/`beta` outputs need marking stale
+        # here too, and `a`'s/`b`'s own (now narrower) producer weight
+        # needs the same touched-producer bookkeeping every other producer
+        # weight in this chain already gets.
+        stale.update(chain.linear_attention_gate.node.output)
+        producer_names.add(chain.linear_attention_gate.a_weight)
+        if chain.linear_attention_gate.b_weight is not None:
+            producer_names.add(chain.linear_attention_gate.b_weight)
     return (
-        {chain.q_weight, chain.k_weight, chain.v_weight},
+        producer_names,
         chain.consumer_weight,
         stale,
     )
@@ -27875,6 +29005,15 @@ def _apply_attention_chains(
     for chain in chains:
         if isinstance(chain, (_GQAChain, _DecomposedGQAChain)):
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+            if isinstance(chain, _GQAChain) and chain.linear_attention_gate is not None:
+                # See :func:`_apply_one_gqa_chain`'s own identical addition
+                # to its returned producer-name set -- checked here too so a
+                # `LinearAttentionGate`'s own `a`/`b` producer weight shared
+                # with an earlier chain is skipped up front, the same as
+                # Q's/K's/V's own already are.
+                producer_names.add(chain.linear_attention_gate.a_weight)
+                if chain.linear_attention_gate.b_weight is not None:
+                    producer_names.add(chain.linear_attention_gate.b_weight)
         else:
             producer_names = {chain.weight}
         if (
@@ -32971,7 +34110,15 @@ def _walk_to_fp8_consumer(
     `Y` staying float16/bfloat16 throughout, never itself quantized (unlike
     the QOperator family's own fully-activation-quantized int8/uint8 `Y` --
     see :func:`_walk_to_qop_consumer`'s own docstring for why that walker is
-    the one exception in this round) -- with no other consumer anywhere
+    the one exception in this round), a self-gated activation decomposition
+    (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's own longer
+    gate branch -- :func:`_match_self_gated_activation`, reused verbatim,
+    mechanically mirrored the same way), or a ``PRelu`` node
+    (:func:`_match_prelu_pass_through_matmul`, mirrors
+    :func:`_walk_to_consumer`'s own identical hop, mechanically mirrored the
+    same way -- a *scalar* `slope` needs no operand sliced at all, a
+    *per-channel* one is co-sliced exactly like the `_BINARY_CHANNEL_OPS`
+    hop above) -- with no other consumer anywhere
     along the way, until EITHER a ``MatMulBlockQuantizedFp8Weight`` consumer
     OR a plain-float MatMul/vanilla-Gemm consumer is found whose
     input-channel count matches `n_channels`. No gated pair, no branch,
@@ -33017,6 +34164,28 @@ def _walk_to_fp8_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch (mechanically mirrored from the MatMulNBits/Bnb4/
+            # QDQ fix, not independently verified against a live FP8
+            # quantizer). Declines instantly whenever `cur` doesn't match.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -33076,6 +34245,23 @@ def _walk_to_fp8_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop (mechanically mirrored from the MatMulNBits/Bnb4/QDQ fix,
+            # not independently verified against a live FP8 quantizer): a
+            # *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced exactly like the `_BINARY_CHANNEL_OPS` hop above.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -33157,9 +34343,9 @@ def _walk_to_fp4_consumer(
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[_Fp4ChainSide, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
     """``Fp4Weight`` analogue of :func:`_walk_to_fp8_consumer` -- see that
-    function's own docstring, including its identical norm-hop and
-    per-channel bias/scale `Add`/`Mul` (`_BINARY_CHANNEL_OPS`) hop
-    recognition, and `value_info_by_name` parameter.
+    function's own docstring, including its identical norm-hop,
+    per-channel bias/scale `Add`/`Mul` (`_BINARY_CHANNEL_OPS`) hop, and
+    ``PRelu`` hop recognition, and `value_info_by_name` parameter.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
@@ -33188,6 +34374,25 @@ def _walk_to_fp4_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition -- see
+            # :func:`_walk_to_fp8_consumer`'s own identical hop (mechanically
+            # mirrored from the MatMulNBits/Bnb4/QDQ fix, not independently
+            # verified against a live FP4 quantizer).
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -33247,6 +34452,19 @@ def _walk_to_fp4_consumer(
                 const_name = other
             else:
                 return None
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # See :func:`_walk_to_fp8_consumer`'s own identical hop
+            # (mechanically mirrored from the MatMulNBits/Bnb4/QDQ fix, not
+            # independently verified against a live FP4 quantizer).
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -34763,6 +35981,23 @@ def _walk_to_qop_consumer(
     (mechanical reuse of the already-merged norm hop, no new matching logic)
     deliberately excludes; left as a known, separately-scoped gap rather
     than an unsound fit forced into this walker.
+
+    A per-channel ``PRelu`` hop (the other quantized-family walkers'
+    :func:`_match_prelu_pass_through_matmul`/:func:`_match_prelu_pass_through`)
+    is excluded here for the identical reason: confirmed live via
+    ``onnx.defs.get_schema("PRelu").type_constraints``, its own `T` type
+    constraint list is `bfloat16/float16/float/double/uint32/uint64/int32/
+    int64` -- no `int8`/`uint8` -- so it can never legally consume `cur`'s
+    own int8/uint8 tensor here, the same schema-level bar the norm hop's own
+    paragraph above already establishes. There is also no
+    ``com.microsoft::QLinearPRelu``/``QLinearLeakyRelu`` contrib op
+    (confirmed by ``onnx.defs.get_schema`` raising for both names against
+    this environment's own installed ``onnxruntime`` contrib op registry) a
+    real QOperator quantizer could have emitted instead -- a genuine
+    per-channel-PRelu QOperator chain would need the same
+    ``DequantizeLinear``/``QuantizeLinear``-sandwiched primitive the norm
+    hop's own gap already calls for, left out of this round's scope for the
+    identical reason.
     """
     chain_ops: List[onnx.NodeProto] = []
     cur = start
@@ -35946,16 +37181,27 @@ def _walk_to_dynquant_consumer(
     (:func:`_match_decomposed_layer_norm_pass_through`/
     :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim -- the
     identical two matchers :func:`_walk_to_consumer`/
-    :func:`_walk_to_matmul_nbits_consumer` try), with no other consumer
+    :func:`_walk_to_matmul_nbits_consumer` try), a self-gated activation
+    decomposition (SiLU/Swish exported as ``x * Sigmoid(x)``, or erf-GELU's
+    own longer gate branch -- :func:`_match_self_gated_activation`, reused
+    verbatim), or a ``PRelu`` node (:func:`_match_prelu_pass_through_matmul`,
+    mirrors :func:`_walk_to_consumer`'s own identical hop -- a *scalar*
+    `slope` needs no operand sliced at all, a *per-channel* one is
+    co-sliced, folded into `chain_ops` as an ordinary ``(node, slope_name)``
+    entry), with no other consumer
     anywhere along the way, until EITHER a `DynamicQuantizeMatMul`/
     `MatMulIntegerToFloat` consumer OR a plain-float MatMul/vanilla-Gemm
     consumer (:func:`_match_plain_matmul_nbits_peer`) is found whose
     input-channel count matches `n_channels` -- mirrors
     :func:`_walk_to_matmul_nbits_consumer` closely (the identical
     quantized-or-plain-float union, and now the identical norm hop too),
-    see this section's own top comment for why. No gated pair, no branch,
-    no ``PRelu``/``Clip``/fused-bias-GELU hop -- unlike
-    :func:`_walk_to_consumer`, only the norm hop above is added here.
+    see this section's own top comment for why. No gated pair (the
+    two-producer kind -- :func:`_find_matmul_nbits_gated_chains`'s own
+    job), no branch, no ``Clip``/fused-bias-GELU hop, and (unlike
+    :func:`_walk_to_matmul_nbits_consumer`) no `_BINARY_CHANNEL_OPS`
+    per-channel bias/scale ``Add``/``Mul`` hop either -- unlike
+    :func:`_walk_to_consumer`, only the norm, self-gated-activation, and
+    ``PRelu`` hops above are added here.
     Returns ``None`` if the walk runs out of hops, hits a branch, or never
     reaches such a consumer. The caller (:func:`_find_dynquant_chains`) is
     responsible for discarding a plain-float-to-plain-float result.
@@ -35999,6 +37245,28 @@ def _walk_to_dynquant_consumer(
             continue
 
         candidates = consumers_of.get(cur, [])
+        if len(candidates) == 2:
+            # Self-gated activation decomposition (SiLU/Swish exported as
+            # `x * Sigmoid(x)`, or erf-GELU's own longer gate branch) --
+            # tried before the ordinary "exactly one consumer" dispatch
+            # below, mirroring :func:`_walk_to_consumer`'s own identical
+            # hop dispatch, for the identical reason: this shape's own root
+            # tensor is read *twice*. Declines instantly (returns ``None``
+            # here) whenever `cur` doesn't match this shape.
+            diamond = _match_self_gated_activation(
+                cur, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, diamond_out = diamond
+                if (
+                    len(consumers_of.get(diamond_out, [])) != 1
+                    or diamond_out in graph_outputs
+                ):
+                    return None
+                chain_ops.extend((n, None) for n in diamond_nodes)
+                cur = diamond_out
+                continue
+            return None  # two consumers but not this shape -- declined
         if len(candidates) != 1:
             return None
         nxt = candidates[0]
@@ -36028,6 +37296,22 @@ def _walk_to_dynquant_consumer(
             and len(nxt.output) == 1
         ):
             pass
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            # Mirrors :func:`_walk_to_consumer`'s own identical ``PRelu``
+            # hop: a *scalar* `slope` needs no operand sliced at all; a
+            # *per-channel* one (flat, last-axis-is-channel, exactly
+            # :func:`_match_prelu_pass_through_matmul`'s own bar) is
+            # co-sliced, folded into `chain_ops` as an ordinary
+            # ``(node, slope_name)`` entry.
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                return None
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 return None
@@ -36117,9 +37401,6 @@ def _find_dynquant_chains(
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains: List[_DynQuantMatMulChain] = []
     for node in graph.node:
         producer: _DynQuantMatMulChainSide
@@ -36136,7 +37417,9 @@ def _find_dynquant_chains(
             producer, n_channels = peer, peer.out_channels
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # `_matmul_walk_root_ok`, not `_is_internal` -- see
+        # :func:`_find_qdq_chains`'s own identical comment.
+        if not _matmul_walk_root_ok(out_name, graph_outputs):
             continue
         found = _walk_to_dynquant_consumer(
             out_name,
@@ -36163,6 +37446,7 @@ def _trace_gate_producer_backward_dynquant(
     node_by_output: Dict[str, onnx.NodeProto],
     producer_infos: Dict[str, Tuple[onnx.NodeProto, _DynQuantMatMulChainSide, int]],
     consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Optional[
@@ -36181,17 +37465,39 @@ def _trace_gate_producer_backward_dynquant(
     shared with the `MatMulNBits`/QDQ sections' own walkers, for the
     identical reason those sections give (structurally different
     `producer_infos` value types).
+
+    Also recognizes a self-gated activation decomposition's own origin
+    tensor as a single pass-through hop, exactly like
+    :func:`_trace_gate_producer_backward`'s own identical addition -- see
+    that function's own docstring for why this matters.
     """
     pre_ops: List[onnx.NodeProto] = []
     cur = tensor_name
+    # See :func:`_trace_gate_producer_backward`'s own identical flag for
+    # what this guards.
+    skip_consumer_check = False
     for _ in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+        if cur in graph_outputs:
             return None
+        if not skip_consumer_check and len(consumers_of.get(cur, [])) != 1:
+            return None
+        skip_consumer_check = False
         if cur in producer_infos:
             return producer_infos[cur], tuple(reversed(pre_ops))
         producer_node = node_by_output.get(cur)
         if producer_node is None:
             return None
+        if producer_node.op_type == "Mul":
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, _gate_node = diamond
+                pre_ops.extend(reversed(diamond_nodes))
+                cur = origin
+                skip_consumer_check = True
+                continue
+            return None  # a Mul, but not this shape -- declined, as before
         if not (
             producer_node.op_type in _UNARY_PASS_THROUGH
             and len(producer_node.input) == 1
@@ -36312,6 +37618,7 @@ def _find_dynquant_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -36320,6 +37627,7 @@ def _find_dynquant_gated_chains(
                 node_by_output,
                 producer_infos,
                 consumers_of,
+                initializer_map,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -37375,6 +38683,27 @@ def _walk_to_conv_integer_consumer(
 
     Returns ``None`` if the walk runs out of hops, hits a branch, or never
     reaches either kind of consumer.
+
+    No per-channel ``PRelu`` hop -- unlike :func:`_walk_to_qop_consumer`,
+    this is NOT a hard schema exclusion: `cur` at every ordinary mid-chain
+    point here is a plain float tensor (this docstring's own GAP paragraph
+    above already establishes why -- `ConvInteger`'s own rescale ``Mul``/
+    ``Cast`` pair always produces a float logical output before the next
+    hop's own leading ``DynamicQuantizeLinear`` re-quantizes it), so
+    ``onnx.defs.get_schema("PRelu")``'s own float-friendly `T` type
+    constraint (see :func:`_walk_to_qop_consumer`'s own docstring for the
+    exact list) would not itself reject a ``PRelu`` inserted there the way
+    it does for QOperator's int8/uint8-throughout `cur`. This is a real,
+    left-open gap, not investigated further in this round: unlike every
+    other walker's `chain_ops` (a ``(node, const_name)`` list), this
+    walker's own `chain_ops` is a bare `List[onnx.NodeProto]` with no
+    per-op constant slot at all (neither its own unary hop nor its own
+    ``Clip`` hop has one), so adding a per-channel ``PRelu`` hop here would
+    need a new pass-through representation (this function's own return
+    signature, and :func:`apply_structured_pruning_dynamic_quantize_conv`'s
+    own slicing, extended for it) rather than a same-shape mechanical port
+    of the other five walkers' fix -- left out of this round's scope rather
+    than forced in.
     """
     chain_ops: List[onnx.NodeProto] = []
     conv_pass_through: List[_ConvIntegerPassThrough] = []
@@ -40806,7 +42135,7 @@ def _chain_label(chain: _Chain) -> str:
 def _structured_chain_groups(
     graph: onnx.GraphProto,
 ) -> List[Tuple[str, List[_Chain]]]:
-    """The same five finders, in the same order, that
+    """The same six finders, in the same order, that
     :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`
     concatenate into their own single `chains` list -- kept as separate
     `(family_label, chains)` groups here purely so
@@ -40820,6 +42149,7 @@ def _structured_chain_groups(
         ("matmul_gated", _find_gated_chains(graph)),
         ("conv_plain", _find_conv_chains(graph)),
         ("conv_residual", _find_conv_residual_chains(graph)),
+        ("conv_se_gate", _find_conv_se_gate_chains(graph)),
         ("matmul_residual", _find_matmul_residual_chains(graph)),
     ]
 
@@ -42101,6 +43431,12 @@ def _analyze_attention_chains(
         elif isinstance(chain, _GQAChain):
             label = _node_label(chain.node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+            if chain.linear_attention_gate is not None:
+                # See :func:`_apply_one_gqa_chain`'s own identical addition
+                # to its returned producer-name set.
+                producer_names.add(chain.linear_attention_gate.a_weight)
+                if chain.linear_attention_gate.b_weight is not None:
+                    producer_names.add(chain.linear_attention_gate.b_weight)
             h = chain.kv_num_heads
             # True MQA (`kv_num_heads == 1`) fast path -- mirrors
             # :func:`_apply_one_gqa_chain`'s own `is_mqa` handling: KV-group

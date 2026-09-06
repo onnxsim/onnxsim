@@ -1050,6 +1050,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "model_bytes"_a, "sparsity"_a = 0.5, "protect_token_ids"_a.none(),
       "input_name"_a.none());
 
+  // Any-Precision LLM (Park et al., 2024, ICML 2024): nested bit-plane
+  // weight-only quantization, one quantization pass serving any bit-width
+  // up to max_bits. See ApplyAnyPrecisionLlm in onnxsim.h.
+  m.def(
+      "apply_any_precision_llm",
+      [](const py::bytes& model_proto_bytes, int64_t bits, int64_t max_bits,
+         int64_t block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyAnyPrecisionLlm(model, bits, max_bits, block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "bits"_a = 4, "max_bits"_a = 8, "block_size"_a = 32);
+
   // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
   // round-to-nearest quantization of both the weight and the activation of
   // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in
@@ -1068,6 +1087,71 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "seed"_a, "block_size"_a = 32, "epsilon"_a = 1e-12f);
+
+  // llama.cpp's IQ4_NL: fixed 16-entry non-uniform-codebook weight-only 4-bit
+  // quantization, one scale per 32-element block. Data-free. See ApplyIQ4NL
+  // in onnxsim.h.
+  m.def(
+      "apply_iq4_nl",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyIQ4NL(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // llama.cpp's legacy GGUF Q4_0/Q4_1 block formats: weight-only 4-bit
+  // quantization, one plain 32-element block per scale(/min). Data-free.
+  // See ApplyGgufQ4_0/ApplyGgufQ4_1 in onnxsim.h.
+  m.def(
+      "apply_gguf_q4_0_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ4_0(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+  m.def(
+      "apply_gguf_q4_1_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ4_1(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // BitNet b1.58's published absmean ternary weight quantization, as
+  // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
+  // one shared {-1, 0, +1} scale per 256-element block. Data-free. See
+  // ApplyGgufTernaryQuant in onnxsim.h.
+  m.def(
+      "apply_gguf_ternary_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufTernaryQuant(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.

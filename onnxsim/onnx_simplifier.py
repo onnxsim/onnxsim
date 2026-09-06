@@ -1568,47 +1568,84 @@ def apply_attention_head_pruning_cpp(
     """
     C++-backed port of :func:`onnxsim.apply_attention_head_pruning`: removes
     whole attention heads -- or, for grouped-query attention, whole KV
-    groups -- from every matched ``com.microsoft::Attention``,
-    ``com.microsoft::GroupQueryAttention``, or plain ``ai.onnx::Attention``
-    node whose output feeds, optionally through a single shape-preserving
-    ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's reduction
-    dimension (the output projection) -- the attention analogue of
+    groups -- from every matched fused self-attention block whose output
+    feeds, optionally through a single shape-preserving ``Reshape``, exactly
+    one downstream MatMul/vanilla-Gemm's reduction dimension (the output
+    projection) -- the attention analogue of
     :func:`onnxsim.apply_structured_pruning_cpp`, at head (or KV-group)
-    instead of single-channel granularity.
+    instead of single-channel granularity. Every matched producer/consumer
+    weight (and bias) may be FLOAT, FLOAT16, or BFLOAT16 -- read/ranked/
+    sliced in double precision and written back down to its own original
+    dtype, so a surviving entry's exact bit pattern is preserved.
 
-    For each matched plain ``com.microsoft::Attention`` block (a single
-    merged QKV weight/bias): ranks every head by the combined Frobenius norm
-    of its own Q, K, and V weight columns, drops the lowest-``sparsity``-
-    fraction of heads (at least one head is always kept), and removes the
-    corresponding column blocks from the merged QKV weight (and bias, if
-    present), decrementing ``num_heads``/``qkv_hidden_sizes`` accordingly,
-    and the matching row block from the output projection's weight.
+    Three families of fused op are matched:
 
-    For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
-    block (separate, un-merged Q/K/V producers): ranks every *KV group* (a
-    KV head and the ``num_heads / kv_num_heads`` query heads the kernel maps
-    to it) by the combined Frobenius norm of that group's own Q+K+V weight
-    block, drops the lowest-``sparsity``-fraction of groups (at least one
-    group is always kept), and removes the corresponding column blocks from
-    all three producers (and their biases, if present) together with the
-    matching row block from the output projection's weight, decrementing the
-    query head count and ``kv_num_heads`` by the number of groups dropped --
-    so their ratio (query heads per KV head) is unchanged. An individual
-    query head is never dropped on its own: only a whole group, since
-    neither kernel has a way to keep a KV head alive for some, but not all,
-    of the query heads that shared it.
+    * A single merged QKV weight/bias -- ``com.microsoft::Attention``,
+      ``DecoderMaskedSelfAttention``, or ``PackedAttention`` (the three share
+      ``Attention``'s own weight/bias input positions and are matched
+      identically, net of ``DecoderMaskedSelfAttention``'s own schema
+      quirks -- no ``qkv_hidden_sizes`` attribute, a required, must-stay-
+      dynamic ``past`` input, no fused ``do_rotary``). Ranks every head by
+      the combined Frobenius norm of its own Q, K, and V weight columns,
+      drops the lowest-``sparsity``-fraction of heads (at least one head is
+      always kept), and removes the corresponding column blocks from the
+      merged QKV weight (and bias, if present), decrementing
+      ``num_heads``/``qkv_hidden_sizes`` accordingly (the latter left alone
+      for ``DecoderMaskedSelfAttention``, which has no such attribute), and
+      the matching row block from the output projection's weight.
+    * Separate, un-merged Q/K/V producers -- ``GroupQueryAttention``, plain
+      ``ai.onnx::Attention`` (opset 24+), ``MultiHeadAttention``,
+      ``PackedMultiHeadAttention``, ``DecoderMaskedMultiHeadAttention``,
+      ``PagedAttention``, ``LinearAttention``, or ``SparseAttention``. Ranks
+      every *KV group* (a KV head and the ``num_heads / kv_num_heads`` query
+      heads the kernel maps to it) by the combined Frobenius norm of that
+      group's own Q+K+V weight block, drops the lowest-``sparsity``-fraction
+      of groups (at least one group is always kept), and removes the
+      corresponding column blocks from all three producers (and their
+      biases, or a ``MultiHeadAttention``-style single combined Q+K+V bias,
+      if present) together with the matching row block from the output
+      projection's weight, decrementing the query head count and
+      ``kv_num_heads`` by the number of groups dropped -- so their ratio
+      (query heads per KV head) is unchanged. An individual query head is
+      never dropped on its own: only a whole group, since neither kernel has
+      a way to keep a KV head alive for some, but not all, of the query
+      heads that shared it.
+    * The fully decomposed ("eager SDPA export") shape -- separate Q/K/V
+      Linear producers (or one shared packed-QKV-then-``Split`` producer)
+      each reshaped/transposed to BNSH, an optional ``repeat_kv``
+      (``Unsqueeze``/``Expand``/``Reshape``) broadcast of K/V up to the full
+      query head count, optional decomposed RoPE and/or Q/K-norm pass-
+      throughs, ``MatMul(Q, K^T)`` -> scale -> optional additive mask ->
+      ``Softmax`` -> ``MatMul(., V)`` -> transpose/reshape back, feeding the
+      output projection. Ranked and pruned the same KV-group way as the
+      separate-producer family above (or, for true MQA -- a single shared KV
+      head -- by individual query head instead, since group-granularity
+      ranking can never distinguish anything when there is only one group).
 
-    The calibration-driven Wanda upgrade of this same matching/ranking
+    Also prunes ``com.microsoft::MatMulNBitsQkv`` (a block-quantized,
+    weight-only int4/int8 fused QKV projection) at whole-KV-group
+    granularity, reusing this function's own GQA/plain-Attention head-count-
+    matching machinery -- the C++ port's counterpart of
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits`'s own
+    ``MatMulNBitsQkv`` handling (deliberately consolidated here rather than
+    in :func:`onnxsim.apply_structured_pruning_cpp`, which explicitly defers
+    to this function for that one op -- see that function's own docstring).
+
+    The calibration-driven Wanda upgrade of the three fused-op families above
     (mirroring the pure-Python :func:`onnxsim.apply_attention_head_wanda_pruning`)
-    is :func:`onnxsim.apply_attention_head_wanda_pruning_cpp`.
+    is :func:`onnxsim.apply_attention_head_wanda_pruning_cpp` -- which does
+    NOT include the ``MatMulNBitsQkv`` family, mirroring pruning.py's own
+    scope (no calibration-driven counterpart of
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits` exists there
+    either).
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
-            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
-            remove (at least one is always kept); must be in ``[0, 1)``
+            the separate-producer/decomposed families, KV groups) to remove
+            (at least one is always kept); must be in ``[0, 1)``
     :param importance_norm: ``"l2"`` (default, unchanged from before this
             parameter existed) ranks by the combined Frobenius (L2) norm of
             each head's/KV group's own weight block, mirroring the
@@ -1617,13 +1654,13 @@ def apply_attention_head_pruning_cpp(
             across that same block instead.
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
-            non-constant weight, a packed-QKV GroupQueryAttention node, a
-            GroupQueryAttention/plain ai.onnx Attention node with a
-            non-empty constant past-KV-cache or attention-mask input, an
-            ai.onnx Attention node with differing Q/K/V head sizes or
-            without explicit ``q_num_heads``/``kv_num_heads`` attributes, a
-            consumer whose reduction dimension doesn't line up, ...) is
-            left completely untouched
+            non-constant or unsupported-dtype weight, a packed-QKV
+            GroupQueryAttention node, a node with a non-empty constant
+            past-KV-cache or attention-mask input, an ai.onnx Attention node
+            with differing Q/K/V head sizes or without explicit
+            ``q_num_heads``/``kv_num_heads`` attributes, a consumer whose
+            reduction dimension doesn't line up, ...) is left completely
+            untouched
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -2604,6 +2641,60 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
     return _embedding_pruning_result_from_cpp(*result)
 
 
+def apply_any_precision_llm_cpp(
+    model: Union[str, onnx.ModelProto],
+    bits: int = 4,
+    max_bits: int = 8,
+    block_size: int = 32,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_any_precision_llm`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D float32
+    weight to ``bits`` bits per element, per (output channel, ``block_size``
+    -element K-block), via a nested bit-plane code built once to
+    ``max_bits`` (repeated within-bin bisection at each bin's own current
+    min/max midpoint) and truncated down to ``bits`` by a plain integer
+    right-shift -- see :func:`onnxsim.apply_any_precision_llm`'s own
+    docstring for the full rationale (Park et al., 2024, ICML 2024,
+    "Any-Precision LLM: Low-Cost Deployment of Multiple, Different-Sized
+    LLMs"). One quantization pass serves any precision up to ``max_bits``
+    instead of re-quantizing from scratch per bit-width.
+
+    Every matched element is replaced by its own quantize-dequantize
+    (per-bin-mean reconstruction) round trip; the result stays float32
+    (same shape/dtype as the original weight) -- this is a compute-only
+    rewrite, not a compressed storage format, since no ONNX tensor type
+    below INT4 exists to store 3/5/6/7-bit codes natively.
+
+    Unlike that pure-Python implementation, this port's per-bin bisection
+    groups indices via a hash map rather than numpy's own reduction order,
+    so results are not expected to match bit-for-bit -- only to be
+    similarly accurate (both satisfy the same exact nesting invariant and
+    the same monotonically-improving-with-more-bits property; see
+    :func:`onnxsim.apply_any_precision_llm`'s own docstring for why an
+    earlier, affine-fit-based reconstruction did NOT have that property).
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param bits: the precision level to materialize, ``1 <= bits <=
+            max_bits``
+    :param max_bits: the highest bit-width the nested code tree is built to
+    :param block_size: elements per (output-channel, K-block) reconstruction
+            group, matching :func:`onnxsim.quantize_weight_only_int4`'s own
+            default block size convention
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_any_precision_llm(model.SerializeToString(), bits, max_bits, block_size)
+    )
+
+
 def apply_quarot_cpp(
     model: Union[str, onnx.ModelProto],
     seed: int = 0,
@@ -2648,6 +2739,146 @@ def apply_quarot_cpp(
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
         C.apply_quarot(model.SerializeToString(), seed, block_size, epsilon)
+    )
+
+
+def apply_iq4_nl_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_iq4_nl_quantization`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D float32
+    weight into llama.cpp's IQ4_NL format -- a fixed, 16-entry non-uniform
+    ("non-linear") codebook, one scale per 32-element block of the weight's
+    own flattened storage (``scale = max(|block|) / max(|codebook|)``, each
+    element snapped to whichever codebook entry times that scale is
+    closest). See :func:`onnxsim.apply_iq4_nl_quantization`'s own docstring
+    for the full rationale and, importantly, this format's own codebook
+    provenance -- this repo could not find or verify llama.cpp's real IQ4_NL
+    codebook (`kvalues_iq4nl`) anywhere in-tree, so both this port and its
+    Python counterpart use their own computationally-derived, honestly
+    documented non-uniform codebook instead, not a transcription of
+    llama.cpp's own table.
+
+    Unlike that pure-Python implementation, this port does not support
+    quantizing ``Conv`` weights, and is not guaranteed to be bit-for-bit
+    identical to it -- though, having no accumulation or
+    iterative-refinement step at all (every element's own code comes from a
+    single per-block max-abs scale and a 16-way nearest-neighbor scan over a
+    shared fixed codebook), it is expected to track the Python port's own
+    results unusually closely among this repo's ``*_cpp`` ports.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            IQ4_NL quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_iq4_nl(model.SerializeToString()))
+
+
+def apply_gguf_q4_0_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q4_0_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's legacy Q4_0 format -- one
+    symmetric scale per 32-element block of the weight's own flattened
+    storage, no separate min (``dequant = (code - 8) * d``). See
+    :func:`onnxsim.apply_gguf_q4_0_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q4_0 quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q4_0_quantization(model.SerializeToString())
+    )
+
+
+def apply_gguf_q4_1_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q4_1_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's legacy Q4_1 format -- one scale and
+    one explicit min per 32-element block of the weight's own flattened
+    storage (``dequant = code * d + m``). See
+    :func:`onnxsim.apply_gguf_q4_1_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q4_1 quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q4_1_quantization(model.SerializeToString())
+    )
+
+
+def apply_gguf_ternary_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_ternary_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight using BitNet b1.58's published absmean ternary rule,
+    as shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types -- one shared
+    scale ``d = mean(|block|)`` per 256-element block of the weight's own
+    flattened storage, each element restricted to ``{-1, 0, +1}`` times
+    that scale. See :func:`onnxsim.apply_gguf_ternary_quantization`'s own
+    docstring for the full rationale and this format's own honesty note.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            ternary quantize-dequantize round-tripped float32 version,
+            stored under a *new* initializer (the original initializer is
+            left in the graph, unused). A model with no matching layer is
+            returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_ternary_quantization(model.SerializeToString())
     )
 
 

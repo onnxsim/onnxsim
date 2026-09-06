@@ -9,6 +9,7 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/any_precision_llm.h"
 #include "passes/cross_layer_equalization.h"
 #include "passes/defuse_matmul_integer_to_float.h"
 #include "passes/double_quantization.h"
@@ -44,6 +45,9 @@
 #include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/gguf_legacy_quant.h"
+#include "passes/gguf_ternary_quant.h"
+#include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
@@ -116,6 +120,7 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::AnyPrecisionLlm>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DoubleQuantization>(registry);
@@ -143,6 +148,10 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::GgufQ4_0>(registry);
+    RegisterOrReplace<p::GgufQ4_1>(registry);
+    RegisterOrReplace<p::GgufTernaryQuant>(registry);
+    RegisterOrReplace<p::IQ4NL>(registry);
     RegisterOrReplace<p::MagnitudePruningAttention>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
     RegisterOrReplace<p::MagnitudePruningGlobal>(registry);

@@ -10,7 +10,11 @@
 #include "model_prep.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnxoptimizer/optimize.h"
+#include "passes/any_precision_llm.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
+#include "passes/gguf_legacy_quant.h"
+#include "passes/gguf_ternary_quant.h"
+#include "passes/iq4_nl.h"
 #include "passes/qoperator_quantize_gemm.h"
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
@@ -129,6 +133,32 @@ onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model) {
       model, std::vector<std::string>{"double_quantization"});
 }
 
+onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
+                                      int64_t bits, int64_t max_bits,
+                                      int64_t block_size) {
+  if (max_bits < 1) {
+    throw std::invalid_argument(
+        "ApplyAnyPrecisionLlm: max_bits must be >= 1, got " +
+        std::to_string(max_bits));
+  }
+  if (bits < 1 || bits > max_bits) {
+    throw std::invalid_argument(
+        "ApplyAnyPrecisionLlm: bits (" + std::to_string(bits) +
+        ") must be in [1, max_bits=" + std::to_string(max_bits) + "]");
+  }
+  PrepareSchemasForDebug(model);
+  // Registers any_precision_llm (idempotent) into onnxoptimizer's registry
+  // so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // any_precision_llm reads these the same way quarot reads QuarotSeed() --
+  // OptimizeFixed's pass-name list has no way to carry a parameter directly.
+  onnx::optimization::onnxsim_passes::AnyPrecisionLlmBits() = bits;
+  onnx::optimization::onnxsim_passes::AnyPrecisionLlmMaxBits() = max_bits;
+  onnx::optimization::onnxsim_passes::AnyPrecisionLlmBlockSize() = block_size;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"any_precision_llm"});
+}
+
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon) {
   PrepareSchemasForDebug(model);
@@ -143,6 +173,36 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
   onnx::optimization::onnxsim_passes::QuarotEpsilon() = epsilon;
   return onnx::optimization::OptimizeFixed(model,
                                            std::vector<std::string>{"quarot"});
+}
+
+onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers iq4_nl (idempotent) into onnxoptimizer's registry so
+  // OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"iq4_nl"});
+}
+
+onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"gguf_q4_0"});
+}
+
+onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"gguf_q4_1"});
+}
+
+onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"gguf_ternary_quant"});
 }
 
 std::vector<std::string> ListQuantizableActivations(

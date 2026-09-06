@@ -530,6 +530,37 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
                                 const std::optional<int64_t>& m = std::nullopt,
                                 bool global_sparsity = false);
 
+// Any-Precision LLM (Park et al., 2024, ICML 2024, "Any-Precision LLM:
+// Low-Cost Deployment of Multiple, Different-Sized LLMs") -- C++ port of
+// any_precision_llm.py's own apply_any_precision_llm. Weight-only quantizes
+// every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight to
+// ``bits`` bits per element, per (output channel, ``block_size``-element
+// K-block), via a nested bit-plane code built once to ``max_bits`` (repeated
+// within-bin bisection at each bin's own current min/max midpoint) and
+// truncated down to ``bits`` by a plain integer right-shift -- see
+// ``passes/any_precision_llm.h`` for the exact rewrite and rationale. Every
+// element is replaced by its own quantize-dequantize (per-bin-mean
+// reconstruction) round trip; the result stays float32 (same shape/dtype as
+// the original weight) -- this is a compute-only rewrite, not a compressed
+// storage format (see that header's own scope note on why: no ONNX tensor
+// type below INT4 exists to store 3/5/6/7-bit codes natively).
+//
+// Throws ``std::invalid_argument`` if ``max_bits < 1`` or ``bits`` is not in
+// ``[1, max_bits]``. Unlike ``Simplify``, this does not run shape inference,
+// constant folding or any other simplification pass. A layer with a
+// non-constant, non-2-D weight is left untouched.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_any_precision_llm`` (``any_precision_llm.py``): floating-point
+// summation/iteration order differs (this port groups bin members via an
+// ``std::unordered_map``, not numpy's own reduction order), so results can
+// differ in the last ULP or two -- the same "independently correct, not
+// required to be bit-for-bit identical" contract ``ApplyQuarot``/
+// ``apply_quarot_cpp`` already established for their own pair.
+onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
+                                      int64_t bits, int64_t max_bits,
+                                      int64_t block_size);
+
 // QuaRot (Ashkboos et al., 2024) rotation preprocessing plus INT4
 // round-to-nearest quantization of *both* the weight and the activation of
 // every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
@@ -567,6 +598,100 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
 // independently-correct, non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
+
+// llama.cpp's IQ4_NL -- C++ port of iq4_nl.py's own
+// apply_iq4_nl_quantization. Weight-only quantizes every MatMul/vanilla-Gemm
+// layer with a constant 2-D float32 weight into a fixed, 16-entry
+// non-uniform ("non-linear") codebook: every 32 consecutive elements of the
+// weight's own flattened storage share one scale (max(|block|) /
+// max(|codebook|)), and each element snaps to whichever codebook entry
+// (times that scale) is closest -- see ``passes/iq4_nl.h`` for the exact
+// rewrite, and iq4_nl.py's own docstring for the full rationale and,
+// importantly, this format's own codebook provenance (this repo could not
+// find or verify llama.cpp's real IQ4_NL codebook anywhere in-tree, so it
+// ships its own computationally-derived, honestly-documented non-uniform
+// codebook instead -- not a transcription of llama.cpp's own table).
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_iq4_nl_quantization``'s Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_iq4_nl_quantization`` (``iq4_nl.py``): not required to be
+// bit-for-bit identical (see ``passes/iq4_nl.h``'s own note on why this
+// port is nonetheless expected to track the Python port unusually closely
+// among this repo's *_cpp ports, having no accumulation or
+// iterative-refinement step at all) -- ``ApplyIQ4NL``/
+// ``apply_iq4_nl_quantization_cpp`` and ``apply_iq4_nl_quantization`` are
+// two independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
+
+// llama.cpp's legacy GGUF "Q4_0"/"Q4_1" block formats -- C++ port of
+// gguf_legacy_quant.py's own apply_gguf_q4_0_quantization/
+// apply_gguf_q4_1_quantization. Weight-only quantizes every MatMul/
+// vanilla-Gemm layer with a constant 2-D float32 weight, one plain
+// 32-element block at a time over the weight's own flattened storage (no
+// super-block/sub-block requantization like Q4_K, no fixed codebook like
+// IQ4_NL): Q4_0 is symmetric with no separate min
+// (``dequant = (code - 8) * d``, code in [0, 15]); Q4_1 is asymmetric with
+// an explicit per-block min (``dequant = code * d + m``, code in [0, 15]).
+// See ``passes/gguf_legacy_quant.h`` for the exact rewrite, and
+// gguf_legacy_quant.py's own docstring for the full rationale and this
+// format's own encoder-provenance honesty note (the dequantization formula
+// is transcribed from this repo's own verified
+// ``onnxsim/ggml_legacy_quant.h`` decoder; the encoder's own choice of
+// d/m is an ordinary, honestly-scoped min/max fit, not a verified
+// reproduction of llama.cpp's own encoder).
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization``'s
+// Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization``
+// (``gguf_legacy_quant.py``): not required to be bit-for-bit identical (see
+// ``passes/gguf_legacy_quant.h``'s own note on why this port is
+// nonetheless expected to track the Python port unusually closely, having
+// no accumulation or iterative-refinement step at all) --
+// ``ApplyGgufQ4_0``/``ApplyGgufQ4_1`` and their ``_cpp`` Python wrappers
+// and ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization`` are
+// independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
+
+// BitNet b1.58's published absmean ternary weight quantization (Ma et al.,
+// 2024, "The Era of 1-bit LLMs"), as shipped by llama.cpp's GGUF
+// TQ1_0/TQ2_0 tensor types -- C++ port of gguf_ternary_quant.py's own
+// apply_gguf_ternary_quantization. Weight-only quantizes every MatMul/
+// vanilla-Gemm layer with a constant 2-D float32 weight, one 256-element
+// block at a time over the weight's own flattened storage: every element
+// is restricted to one of {-1, 0, +1} times one shared per-block scale
+// ``d = mean(|block|)`` (the paper's own published rule, round-tripped
+// through float16 to match llama.cpp's own storage). See
+// ``passes/gguf_ternary_quant.h`` for the exact rewrite, and
+// gguf_ternary_quant.py's own docstring for the full rationale and this
+// format's own honesty note (this port represents the format as a plain
+// float32 quantize-dequantize round trip, not llama.cpp's own literal
+// bit-packed layout -- no ONNX tensor type below INT4 exists either way).
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass. A layer with a non-constant, non-2-D
+// weight is left untouched; this port does not support ``Conv`` weights the
+// way ``apply_gguf_ternary_quantization``'s Python side optionally does.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python
+// ``apply_gguf_ternary_quantization`` (``gguf_ternary_quant.py``): not
+// required to be bit-for-bit identical (see
+// ``passes/gguf_ternary_quant.h``'s own note on why this port is
+// nonetheless expected to track the Python port unusually closely, having
+// no accumulation or iterative-refinement step at all) --
+// ``ApplyGgufTernaryQuant``/its ``_cpp`` Python wrapper and
+// ``apply_gguf_ternary_quantization`` are independently-correct,
+// non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller

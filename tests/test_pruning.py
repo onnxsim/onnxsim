@@ -4043,6 +4043,85 @@ def test_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels():
     np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
 
 
+def _swiglu_mlp_decomposed_silu_model(K=8, H=16, Out=4, seed=0, opset=21):
+    # The REAL SwiGLU shape every Llama/Mistral/Qwen/Gemma-style FFN using
+    # PyTorch's `nn.SiLU()` actually exports as: SiLU(x) = x * Sigmoid(x),
+    # traced as a Sigmoid node feeding a *separate*, self-referencing Mul --
+    # NOT `_swiglu_mlp_model`'s own single-`Sigmoid`-then-`Mul`-with-`up`
+    # shape (that Mul combines the gate with a wholly separate producer, `up`
+    # -- this one instead re-reads the very same `gate` tensor a second time,
+    # a genuinely different diamond topology). Confirmed live via a real
+    # `torch.onnx.export` SwiGLU/`nn.SiLU()` model. Before
+    # `_trace_gate_producer_backward` recognized this diamond
+    # (`_match_self_gated_activation_backward`, see its own docstring),
+    # `_find_gated_chains` matched zero chains on this exact graph.
+    rng = np.random.default_rng(seed)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          gate_sig = Sigmoid(gate)
+          gate_act = Mul(gate, gate_sig)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        opset=opset,
+    )
+    return model, wg, wu, wd
+
+
+def test_structured_pruning_gated_ffn_decomposed_silu_matches_oracle():
+    # Confirmed gap: a real nn.SiLU()-exported gate activation (Sigmoid +
+    # self-Mul, not a single Sigmoid feeding a separate combine) was never
+    # recognized by _trace_gate_producer_backward, so _find_gated_chains
+    # matched zero chains on this exact graph before the fix -- even though
+    # the plain-float FORWARD walker (_walk_to_consumer's own
+    # _match_self_gated_activation) already handled this shape for the
+    # ordinary (non-gated) case.
+    K, H, Out = 8, 16, 4
+    model, wg, wu, wd = _swiglu_mlp_decomposed_silu_model(K, H, Out, seed=40)
+
+    chains = onnxsim.pruning._find_gated_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    keep = _combined_keep_indices(wg, wu, H // 2)
+    rng = np.random.default_rng(41)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    gate = x @ wg[:, keep]
+    silu = gate * (1.0 / (1.0 + np.exp(-gate)))
+    up = x @ wu[:, keep]
+    y_oracle = (silu * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_gated_ffn_decomposed_silu_prunes_both_branches_to_same_channels():
+    K, H, Out = 8, 20, 4
+    model, wg, wu, _ = _swiglu_mlp_decomposed_silu_model(K=K, H=H, Out=Out, seed=42)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.3)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    keep = _combined_keep_indices(wg, wu, H - round(H * 0.3))
+
+    np.testing.assert_array_equal(inits["Wg"], wg[:, keep])
+    np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
+
+
 def test_structured_pruning_gelu_gated_ffn_matches_oracle():
     # GeGLU: same gated topology, a different (still-unary) gate activation.
     # Uses Gelu's tanh approximation so the oracle needs no scipy/erf.
@@ -5173,6 +5252,83 @@ def test_structured_pruning_conv_chain_hardswish_matches_oracle_exactly():
     )
 
     rng_x = np.random.default_rng(237)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_celu_matches_oracle_exactly():
+    # ai.onnx (domain "") Celu(X) -> Y, opset 12+ -- single input, single
+    # output, one scalar float `alpha` attribute, structurally identical to
+    # `Elu`/`Selu` (both already in `_UNARY_PASS_THROUGH`). Was previously
+    # missing from that set entirely -- confirmed empirically that this
+    # exact Conv -> Celu -> Conv chain was left completely untouched (0
+    # chains matched) before `Celu` was added. Same oracle bar as the
+    # Swish/HardSwish tests above: exact equivalence to deleting the same
+    # output filters by hand.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(238)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2, b1=b1, activation="Celu<alpha=1.0>", opset=17)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(
+        w1[keep], w2[:, keep], b1=b1[keep], activation="Celu<alpha=1.0>", opset=17
+    )
+
+    rng_x = np.random.default_rng(239)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_thresholded_relu_matches_oracle_exactly():
+    # ai.onnx (domain "") ThresholdedRelu(X) -> Y, since_version=22 --
+    # single input, single output, one scalar float `alpha` attribute,
+    # structurally identical to `LeakyRelu`/`Elu`/`Selu`/`Celu` (all already
+    # in `_UNARY_PASS_THROUGH`). Was previously missing from that set
+    # entirely -- confirmed empirically that this exact Conv ->
+    # ThresholdedRelu -> Conv chain was left completely untouched (0 chains
+    # matched) before `ThresholdedRelu` was added. Same oracle bar as the
+    # Swish/HardSwish tests above: exact equivalence to deleting the same
+    # output filters by hand.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(240)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(
+        w1, w2, b1=b1, activation="ThresholdedRelu<alpha=0.5>", opset=22
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(
+        w1[keep],
+        w2[:, keep],
+        b1=b1[keep],
+        activation="ThresholdedRelu<alpha=0.5>",
+        opset=22,
+    )
+
+    rng_x = np.random.default_rng(241)
     x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
@@ -9925,6 +10081,243 @@ def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- apply_structured_pruning: Squeeze-and-Excitation (SE) gate chains -----
+#
+# `torchvision.ops.SqueezeExcitation`'s own exact shape (confirmed live via
+# `torch.onnx.export`, torch 2.14.0+cpu, opset 17) -- see
+# `onnxsim/pruning.py`'s own "Squeeze-and-Excitation (SE) gate chains"
+# section comment for the full matched/declined topology this exercises:
+#
+#     scale = self.scale_activation(
+#         self.fc2(self.activation(self.fc1(self.avgpool(input))))
+#     )
+#     return scale * input
+#
+# i.e. `conv1 -> Relu -> {GlobalAveragePool -> fc1 -> Relu -> fc2 ->
+# {Sigmoid, HardSigmoid}} -> Mul(gate, relu_out) -> conv2`, with `conv1`'s
+# own output channels, the gate subnetwork's own final `fc2` output
+# channels, and `conv2`'s own input channels all sliced by ONE shared
+# keep-set -- while `fc1`'s own output-channel count (the squeeze
+# bottleneck, unrelated to this shape) is left alone by this mechanism
+# entirely, and `Csq=1` below makes any INDEPENDENT internal fc1->fc2
+# chain `_find_conv_chains` might separately find and prune a deliberate
+# no-op (`keep_count == n == 1`), isolating what these tests check to
+# purely this new SE-gate mechanism.
+
+
+def _se_conv_keep_indices(w1, wf2, keep_count):
+    # The correct paired-importance ranking: combined (root-sum-square) norm
+    # of `conv1`'s own [C1, Cin, kH, kW] filter and the gate subnetwork's own
+    # final `fc2`'s [C1, Csq, 1, 1] filter -- mirroring
+    # `_combined_keep_indices`'s identical formula for the MatMul/Gemm gated
+    # pair, just with each producer's own [N, K] view built the Conv way
+    # (`_producer_weight_nk`'s own `w.reshape(w.shape[0], -1)`, no transpose)
+    # rather than MatMul's `w.T`.
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(w1.reshape(w1.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(wf2.reshape(wf2.shape[0], -1).astype(np.float64), axis=1)
+        )
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _se_conv_model(
+    Cin=3,
+    C1=16,
+    Csq=1,
+    C2=8,
+    gate_final_activation="Sigmoid",
+    seed=0,
+    spatial=8,
+):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wf1 = rng.standard_normal((Csq, C1, 1, 1)).astype(np.float32)
+    bf1 = rng.standard_normal((Csq,)).astype(np.float32)
+    wf2 = rng.standard_normal((C1, Csq, 1, 1)).astype(np.float32)
+    bf2 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          gap = GlobalAveragePool(a0)
+          f1 = Conv<kernel_shape=[1,1]>(gap, Wf1, Bf1)
+          fa = Relu(f1)
+          f2 = Conv<kernel_shape=[1,1]>(fa, Wf2, Bf2)
+          gate = {gate_final_activation}(f2)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wf1, "Wf1"),
+            _f32(bf1, "Bf1"),
+            _f32(wf2, "Wf2"),
+            _f32(bf2, "Bf2"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+        ],
+    )
+    return model, w1, b1, wf1, bf1, wf2, bf2, w2, b2
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _hardsigmoid(x, alpha=0.2, beta=0.5):
+    return np.clip(alpha * x + beta, 0.0, 1.0)
+
+
+def test_structured_pruning_se_gate_matches_oracle():
+    Cin, C1, Csq, C2 = 3, 16, 1, 8
+    model, w1, b1, wf1, bf1, wf2, bf2, w2, b2 = _se_conv_model(
+        Cin=Cin, C1=C1, Csq=Csq, C2=C2
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _se_conv_keep_indices(w1, wf2, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # conv1's own output channels, sliced.
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["B1"], b1[keep])
+    # fc2 (the gate producer)'s own output channels, sliced by the SAME
+    # keep-set -- the broadcast-`Mul`-correctness requirement.
+    np.testing.assert_array_equal(inits["Wf2"], wf2[keep])
+    np.testing.assert_array_equal(inits["Bf2"], bf2[keep])
+    # fc1's own INPUT channels (fed by GlobalAveragePool(a0)) are re-sliced
+    # by the identical shared keep-set (an ordinary extra fan-out consumer
+    # branch of the shared spine tensor) ...
+    np.testing.assert_array_equal(inits["Wf1"], wf1[:, keep])
+    # ... but fc1's own OUTPUT-channel count (the squeeze bottleneck, `Csq`)
+    # -- and its own bias, indexed by that same axis -- is completely
+    # untouched by this mechanism: still every one of the original `Csq`
+    # rows/entries.
+    assert inits["Wf1"].shape[0] == Csq
+    np.testing.assert_array_equal(inits["Bf1"], bf1)
+    # conv2's own input channels, sliced by the same keep-set.
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+    np.testing.assert_array_equal(inits["B2"], b2)
+
+    rng = np.random.default_rng(200)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _se_conv_model(Cin=Cin, C1=C1 // 2, Csq=Csq, C2=C2)
+    # Build the oracle by hand-slicing rather than re-generating random
+    # weights -- overwrite its initializers with the sliced originals so it
+    # computes the SAME function the real pruned graph is supposed to.
+    oracle_inits = {
+        "W1": w1[keep],
+        "B1": b1[keep],
+        "Wf1": wf1[:, keep],
+        "Bf1": bf1,
+        "Wf2": wf2[keep],
+        "Bf2": bf2[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_se_gate_hardsigmoid_matches_oracle():
+    # MobileNetV3's own SE blocks (Howard et al., 2019, "Searching for
+    # MobileNetV3") substitute `HardSigmoid` for `Sigmoid` as the gate's
+    # final activation for inference efficiency -- confirmed real, not
+    # speculative (`torchvision.models.mobilenetv3`'s own SE blocks
+    # construct `SqueezeExcitation` with
+    # `scale_activation=partial(nn.Hardsigmoid, inplace=True)`).
+    Cin, C1, Csq, C2 = 3, 12, 1, 6
+    model, w1, b1, wf1, bf1, wf2, bf2, w2, b2 = _se_conv_model(
+        Cin=Cin, C1=C1, Csq=Csq, C2=C2, gate_final_activation="HardSigmoid", seed=7
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _se_conv_keep_indices(w1, wf2, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["Wf2"], wf2[keep])
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+
+    rng = np.random.default_rng(201)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _se_conv_model(
+        Cin=Cin, C1=C1 // 2, Csq=Csq, C2=C2, gate_final_activation="HardSigmoid"
+    )
+    oracle_inits = {
+        "W1": w1[keep],
+        "B1": b1[keep],
+        "Wf1": wf1[:, keep],
+        "Bf1": bf1,
+        "Wf2": wf2[keep],
+        "Bf2": bf2[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_se_gate_declines_on_gate_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: the gate subnetwork's own
+    # final `fc2` outputs a single (broadcastable) channel instead of one
+    # matching `conv1`'s own `C1` -- a legitimate, valid ONNX `Mul`
+    # broadcast (a "global" scalar gate, not a per-channel SE gate), but not
+    # the exact shape this section's own matcher requires
+    # (`fc2`'s own output-channel count must equal `conv1`'s exactly). Locks
+    # in the conservative "decline outright, never partially slice" bar:
+    # `conv1`/`conv2`/`fc2` must all come back completely untouched.
+    Cin, C1, Csq, C2 = 3, 16, 1, 8
+    model, w1, b1, wf1, bf1, wf2, bf2, w2, b2 = _se_conv_model(
+        Cin=Cin, C1=C1, Csq=Csq, C2=C2
+    )
+    # Overwrite fc2's own weight/bias so it outputs exactly ONE channel
+    # (still a scalar-broadcastable `Mul` against `a0`'s own C1 channels --
+    # a valid graph, just not the SE shape) instead of C1.
+    rng = np.random.default_rng(9)
+    wf2_bad = rng.standard_normal((1, Csq, 1, 1)).astype(np.float32)
+    bf2_bad = rng.standard_normal((1,)).astype(np.float32)
+    for init in model.graph.initializer:
+        if init.name == "Wf2":
+            init.CopyFrom(_f32(wf2_bad, "Wf2"))
+        elif init.name == "Bf2":
+            init.CopyFrom(_f32(bf2_bad, "Bf2"))
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Wf2"], wf2_bad)
 
 
 # --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----
@@ -30353,6 +30746,89 @@ def test_qdq_structured_pruning_matmul_producer_matches_oracle():
     np.testing.assert_allclose(wscale_pruned, Wscale[keep])
 
 
+def _matmul_qdq_producer_silu_decomposed_model(K=8, H=16, Out=4, seed=0):
+    # The QDQ analogue of _mlp_silu_decomposed_model above: a QDQ producer
+    # (int8 weight) feeding a real nn.SiLU()-shaped self-gated activation
+    # (Sigmoid + self-Mul, the SAME tensor `h` read twice) rather than a
+    # single fused Sigmoid, then a plain-float consumer. Confirmed real-tool
+    # repro (onnxsim/pruning.py's own confirmed-gap writeup): quantizing this
+    # exact minimal shape via a real onnxruntime.quantization.quantize_static
+    # QDQ pass (with MatMul/Sigmoid/Mul all selected for quantization) also
+    # inserts a QuantizeLinear/DequantizeLinear activation-requantization
+    # round trip around `h`, `h_sig`, and `h_silu`, each -- NOT reproduced
+    # here (see this file's own established "real tool confirms shape,
+    # parser reproduces it" pattern): _walk_gate_branch's own generic
+    # gate-branch walk (shared with the plain-float matcher) only crosses
+    # `_UNARY_PASS_THROUGH`/scalar-const-binary hops, not a QuantizeLinear/
+    # DequantizeLinear pair, so reproducing that exact fully-activation-
+    # quantized shape byte-for-byte would need its own dedicated pass-through
+    # hop -- left as a known, narrower follow-up rather than guessed at here.
+    # This fixture instead isolates the CORE confirmed bug (the
+    # self-referencing Mul breaking the backward trace) with only the
+    # WEIGHT quantized, exactly like every other QDQ producer test in this
+    # file quantizes only the weight and leaves the activation stream plain
+    # float.
+    rng = np.random.default_rng(seed)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          h_sig = Sigmoid(h)
+          h_silu = Mul(h, h_sig)
+          Y = MatMul(h_silu, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wq, Wscale, W2
+
+
+def test_qdq_structured_pruning_matmul_producer_silu_decomposed_matches_oracle():
+    # Confirmed gap: this exact minimal single-producer/single-consumer
+    # shape matched zero chains via _find_qdq_chains before the fix (the
+    # self-gated diamond wasn't recognized by _walk_to_consumer_qdq's own
+    # forward walk at all), even though the plain-float analogue
+    # (test_structured_pruning_matmul_silu_decomposed_matches_oracle_exactly)
+    # already worked.
+    K, H, Out = 8, 16, 4
+    model, Wq, Wscale, W2 = _matmul_qdq_producer_silu_decomposed_model(
+        K, H, Out, seed=50
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert list(inits["Wscale"].dims) == [H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(51)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    h = x @ w_dequant[:, keep]
+    silu = h * (1.0 / (1.0 + np.exp(-h)))
+    y_oracle = silu @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    wq_pruned = onnx.numpy_helper.to_array(inits["Wq"])
+    np.testing.assert_array_equal(wq_pruned, Wq[:, keep])
+
+
 def test_qdq_structured_pruning_matmul_producer_asymmetric_zero_point_matches_oracle():
     # Nonzero, per-channel zero_point -- the general QDQ schema allows it
     # even though this repo's own quantize_static never emits it (always
@@ -30583,6 +31059,159 @@ def test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle():
             ],
         ),
         opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_conv_celu_activation_matches_oracle():
+    # Same both-sides-QDQ topology as
+    # test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle, with a
+    # `Celu` activation node (now in `_UNARY_PASS_THROUGH`, see that set's
+    # own comment) sitting between the producer Conv and the consumer Conv
+    # -- confirming the QDQ walker (`_walk_to_consumer_qdq`), which consults
+    # the very same shared set, is fixed by the same one-entry addition.
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(9)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq)
+          hact = Celu<alpha=1.0>(h)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(hact, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["Wscale1"].dims) == [Cmid // 2]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+    assert list(inits["Wscale2"].dims) == [Cout]  # consumer's own scale untouched
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(12)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("Celu", ["h"], ["hact"], alpha=1.0),
+                onnx.helper.make_node("Conv", ["hact", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_conv_thresholded_relu_activation_matches_oracle():
+    # Same both-sides-QDQ topology as
+    # test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle, with a
+    # `ThresholdedRelu` activation node (now in `_UNARY_PASS_THROUGH`, see
+    # that set's own comment) sitting between the producer Conv and the
+    # consumer Conv -- confirming the QDQ walker (`_walk_to_consumer_qdq`),
+    # which consults the very same shared set, is fixed by the same
+    # one-entry addition.
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(10)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq)
+          hact = ThresholdedRelu<alpha=0.5>(h)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(hact, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["Wscale1"].dims) == [Cmid // 2]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+    assert list(inits["Wscale2"].dims) == [Cout]  # consumer's own scale untouched
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(13)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("ThresholdedRelu", ["h"], ["hact"], alpha=0.5),
+                onnx.helper.make_node("Conv", ["hact", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 22)],
         ir_version=10,
     )
     (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
@@ -31220,6 +31849,200 @@ def test_qdq_structured_pruning_conv_biased_real_quantize_static_pipeline_end_to
     x = rng.standard_normal((1, Cin, spatial, spatial)).astype(np.float32)
     (y_pruned,) = sess.run(None, {"X": x})
     assert y_pruned.shape == (1, C2, spatial, spatial)
+    assert np.all(np.isfinite(y_pruned))
+
+
+# --- QDQ: PRelu pass-through hop ---------------------------------------
+#
+# `_walk_to_consumer_qdq` previously recognized no ``PRelu`` hop at all, on
+# either the `is_conv` or MatMul/Gemm side -- the hop the plain-float
+# walkers (`_walk_to_conv_consumer`/`_walk_to_consumer`, via
+# `_match_prelu_pass_through`/`_match_prelu_pass_through_matmul`) already
+# recognize. A real ``Conv -> PRelu(per-channel Slope) -> Conv`` model run
+# through ``onnxruntime.quantization.quantize_static(..., quant_format=
+# QuantFormat.QDQ, per_channel=True)`` matched ZERO chains before this fix
+# (the walk hit the ``PRelu`` node and declined every branch).
+
+
+def test_qdq_prelu_per_channel_pass_through_real_quantize_static_pipeline_end_to_end():
+    # THE primary repro this fix targets: runs the REAL
+    # ``onnxruntime.quantization.quantize_static`` tool (the same
+    # industry-standard QDQ quantizer `test_qdq_structured_pruning_conv_
+    # biased_real_quantize_static_pipeline_end_to_end` above already uses)
+    # on a `Conv -> PRelu(per-channel Slope) -> Conv` float model.
+    from onnxruntime.quantization import (
+        CalibrationDataReader,
+        QuantFormat,
+        quantize_static,
+    )
+
+    Cin, C1, C2, spatial = 3, 8, 6, 8
+    rng = np.random.default_rng(710)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    slope = (rng.standard_normal((C1, 1, 1)) * 0.2).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[1,{Cin},{spatial},{spatial}] X) => (float[1,{C2},{spatial},{spatial}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1)
+          h0a = PRelu(h0, Slope)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, W2)
+        }}
+        """,
+        initializer=[_f32(w1f, "W1"), _f32(w2f, "W2"), _f32(slope, "Slope")],
+    )
+    onnx.checker.check_model(float_model)
+
+    class _CDR(CalibrationDataReader):
+        def __init__(self):
+            self._data = iter(
+                [
+                    {
+                        "X": rng.standard_normal((1, Cin, spatial, spatial)).astype(
+                            np.float32
+                        )
+                    }
+                    for _ in range(8)
+                ]
+            )
+
+        def get_next(self):
+            return next(self._data, None)
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        onnx.save(float_model, src_path)
+        quantize_static(
+            src_path,
+            quant_path,
+            calibration_data_reader=_CDR(),
+            quant_format=QuantFormat.QDQ,
+            per_channel=True,
+        )
+        quantized = onnx.load(quant_path)
+    onnx.checker.check_model(quantized)
+
+    # Confirm the real tool genuinely leaves a plain `PRelu` node sitting
+    # between the two Conv layers' own QuantizeLinear/DequantizeLinear
+    # activation-requantization boundaries -- not merely assumed.
+    assert any(n.op_type == "PRelu" for n in quantized.graph.node)
+
+    chains = onnxsim.pruning._find_qdq_chains(quantized.graph)
+    assert len(chains) == 1  # before this fix: 0
+    chain = chains[0]
+    assert chain.consumer.node.op_type == "Conv"
+    # The per-channel `Slope` is carried as a `_ConvPassThrough` hop (axis-0
+    # slicing), not an ordinary `chain_ops` entry -- see `_QDQChain.
+    # conv_pass_through`'s own comment for why.
+    assert len(chain.conv_pass_through) == 1
+    assert chain.conv_pass_through[0].node.op_type == "PRelu"
+    assert chain.conv_pass_through[0].bias is None
+    assert [n.op_type for n, _ in chain.chain_ops] == [
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "QuantizeLinear",
+        "DequantizeLinear",
+    ]  # the activation-requantization round trip on both sides of PRelu
+
+    pruned = onnxsim.apply_structured_pruning_qdq(quantized, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    conv_nodes = [n for n in pruned.graph.node if n.op_type == "Conv"]
+    assert len(conv_nodes) == 2
+    keep_count1 = C1 - round(C1 * 0.5)
+
+    def _dq_source_dims(output_name):
+        dq = next(
+            n
+            for n in pruned.graph.node
+            if n.op_type == "DequantizeLinear" and n.output[0] == output_name
+        )
+        return list(inits[dq.input[0]].dims)
+
+    assert _dq_source_dims(conv_nodes[0].input[1])[0] == keep_count1  # W1 pruned
+    assert _dq_source_dims(conv_nodes[1].input[1])[1] == keep_count1  # W2 consumer
+
+    prelu_node = next(n for n in pruned.graph.node if n.op_type == "PRelu")
+    slope_dims = list(inits[prelu_node.input[1]].dims)
+    assert slope_dims[0] == keep_count1  # Slope co-sliced axis 0, like a
+    assert all(d == 1 for d in slope_dims[1:])  # depthwise Conv weight
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = rng.standard_normal((1, Cin, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = sess.run(None, {"X": x})
+    assert y_pruned.shape == (1, C2, spatial, spatial)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_qdq_prelu_scalar_shared_slope_pass_through_matches_and_leaves_slope_untouched():
+    # A scalar/single-shared-parameter `slope` (`nn.PReLU(1)` in torch
+    # terms) multiplies every channel identically -- `_match_prelu_pass_
+    # through`'s own scalar case, mirroring the plain-float Conv chain's
+    # identical `test_structured_pruning_prelu_scalar_shared_slope_pass_
+    # through_matches_oracle_exactly` -- so unlike a shape that cleanly
+    # fails to parse as either shape (which declines the WHOLE chain), this
+    # is an always-safe pass-through: the chain still matches and prunes,
+    # with `Slope` left byte-identical (no operand of its own to slice).
+    # Uses the lighter hand-built `_quantize_static_conv_weight` fixture
+    # (still the REAL `onnxsim.quantize_static` tool for the weights
+    # themselves, per this file's own convention) rather than a full
+    # `quantize_static` pipeline run, since this narrower point needs no
+    # activation-requantization complexity to exercise.
+    Cin, C1, C2 = 4, 6, 5
+    rng = np.random.default_rng(720)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    slope = (rng.standard_normal((1, 1, 1)) * 0.2).astype(np.float32)
+    w1q, w1s = _quantize_static_conv_weight(w1f)
+    w2q, w2s = _quantize_static_conv_weight(w2f)
+
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},10,10] Y)
+        {{
+          Wq1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, Wq1dq)
+          h0a = PRelu(h0, Slope)
+          Wq2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, Wq2dq)
+        }}
+        """,
+        initializer=[
+            _i8(w1q, "Wq1"),
+            _f32(w1s, "Wscale1"),
+            _i8(w2q, "Wq2"),
+            _f32(w2s, "Wscale2"),
+            _f32(slope, "Slope"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 1
+    chain = chains[0]
+    assert chain.conv_pass_through == ()  # scalar -- an ordinary chain_ops
+    assert [n.op_type for n, _ in chain.chain_ops] == ["PRelu"]  # entry instead
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Slope"], slope)  # left completely untouched
+
+    keep_count1 = C1 - round(C1 * 0.5)
+    assert inits["Wq1"].shape[0] == keep_count1
+    assert inits["Wq2"].shape[1] == keep_count1
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = rng.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y_pruned,) = sess.run(None, {"X": x})
+    assert y_pruned.shape == (2, C2, 10, 10)
     assert np.all(np.isfinite(y_pruned))
 
 
@@ -32685,6 +33508,86 @@ def test_qdq_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels(
     np.testing.assert_array_equal(inits["Wuq"], Wuq[:, keep])
 
 
+def _qdq_gated_mlp_decomposed_silu_model(K=8, H=16, Out=4, seed=0):
+    # The QDQ analogue of _swiglu_mlp_decomposed_silu_model above: gate_proj/
+    # up_proj are per-channel INT8 QDQ MatMul producers, and the gate branch
+    # uses a real nn.SiLU()-shaped self-gated activation (Sigmoid + self-Mul)
+    # rather than a single fused Sigmoid feeding the combine -- the shape
+    # _trace_gate_producer_backward_qdq previously couldn't cross at all
+    # (same confirmed gap as the plain-float/standalone-QDQ cases above,
+    # just for the gated-pair backward tracer this time).
+    rng = np.random.default_rng(seed)
+    Wgq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wgscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wuq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wuscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wd = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [
+        _i8(Wgq, "Wgq"),
+        _f32(Wgscale, "Wgscale"),
+        _i8(Wuq, "Wuq"),
+        _f32(Wuscale, "Wuscale"),
+        _f32(Wd, "Wd"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wgdq = DequantizeLinear<axis=1>(Wgq, Wgscale)
+          gate = MatMul(X, Wgdq)
+          gate_sig = Sigmoid(gate)
+          gate_act = Mul(gate, gate_sig)
+          Wudq = DequantizeLinear<axis=1>(Wuq, Wuscale)
+          up = MatMul(X, Wudq)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wgq, Wgscale, Wuq, Wuscale, Wd
+
+
+def test_qdq_structured_pruning_gated_ffn_decomposed_silu_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, Wgq, Wgscale, Wuq, Wuscale, Wd = _qdq_gated_mlp_decomposed_silu_model(
+        K, H, Out, seed=60
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_gated_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wgq"].dims) == [K, H // 2]
+    assert list(inits["Wuq"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wgq"]), Wgq[:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wuq"]), Wuq[:, keep]
+    )
+
+    rng = np.random.default_rng(61)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    gate = x @ wg_dequant[:, keep]
+    silu = gate * (1.0 / (1.0 + np.exp(-gate)))
+    up = x @ wu_dequant[:, keep]
+    y_oracle = (silu * up) @ Wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def test_qdq_structured_pruning_gelu_gated_ffn_matches_oracle():
     # GeGLU: the gate activation is Gelu (tanh approximation) rather than
     # Sigmoid -- exercises _find_qdq_gated_chains's own reuse of the plain-
@@ -33250,6 +34153,125 @@ def test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
 
 
+def _nbits_chain_decomposed_silu_model(N1, K1, N2, block_size, W1, W2, bits=4):
+    """The MatMulNBits analogue of ``_nbits_chain_model``, but with the
+    mid-chain activation a real ``nn.SiLU()``-shaped self-gated activation
+    (``Sigmoid`` feeding a *separate*, self-referencing ``Mul`` -- the SAME
+    tensor ``h1`` read twice) instead of a single fused unary op --
+    ``_nbits_chain_model``'s own ``activation`` string parameter can only
+    build a single node, so this needs its own dedicated builder.
+    """
+    K2 = N1
+    assert K2 % block_size == 0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size, bits)
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size, bits)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size, bits)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(B1, name="B1"),
+        onnx.numpy_helper.from_array(scales1, name="scales1"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp1, bits), name="zp1"),
+        onnx.numpy_helper.from_array(B2, name="B2"),
+        onnx.numpy_helper.from_array(scales2, name="scales2"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp2, bits), name="zp2"),
+    ]
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size, bits
+    )
+    sig = onnx.helper.make_node("Sigmoid", ["h1"], ["h1_sig"])
+    silu = onnx.helper.make_node("Mul", ["h1", "h1_sig"], ["h1_act"])
+    node2 = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2, K2, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node1, sig, silu, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [M, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes1=qcodes1,
+        scales1=scales1,
+        zp1=zp1,
+        kb1=kb1,
+        qcodes2=qcodes2,
+        scales2=scales2,
+        zp2=zp2,
+        kb2=kb2,
+        K2=K2,
+    )
+
+
+def test_matmul_nbits_pruning_matmul_producer_silu_decomposed_matches_oracle():
+    # Confirmed gap: a standalone (non-gated) MatMulNBits -> real
+    # nn.SiLU()-shaped self-gated activation -> MatMulNBits chain matched
+    # zero chains via _find_matmul_nbits_chains before the fix --
+    # _walk_to_matmul_nbits_consumer's own forward walk couldn't cross the
+    # self-referencing diamond at all.
+    N1, K1, N2, block_size, bits = 32, 16, 4, 16, 4
+    rng = np.random.default_rng(210)
+    W1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    W1[:16] *= 6.0  # rows 0-15: large magnitude (kept); 16-31: small (dropped)
+    W2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+
+    model, info = _nbits_chain_decomposed_silu_model(
+        N1, K1, N2, block_size, W1, W2, bits
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * bits // 8]
+    assert list(inits["scales1"].dims) == [16, info["kb1"]]
+    mm1 = next(n for n in pruned.graph.node if n.name == "mm1")
+    mm2 = next(n for n in pruned.graph.node if n.name == "mm2")
+    assert next(a.i for a in mm1.attribute if a.name == "N") == 16
+    assert next(a.i for a in mm2.attribute if a.name == "K") == 16
+
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B1"]),
+        _nbits_pack_B(info["qcodes1"][keep], 16, info["kb1"], block_size, bits),
+    )
+
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size, bits
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size, bits
+    )
+
+    rng2 = np.random.default_rng(211)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y,) = _run(pruned, {"A": x})
+
+    h1 = x.astype(np.float64) @ w1_dequant[keep].T
+    silu = h1 * (1.0 / (1.0 + np.exp(-h1)))
+    y_oracle = silu @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)
+
+
 # --- MatMulNBits: mid-chain LayerNorm/RMSNorm pass-through -----------------
 #
 # Regression coverage mirroring the DynamicQuantizeMatMul section's own
@@ -33658,6 +34680,253 @@ def test_matmul_nbits_separate_trailing_bias_add_declines_shared_bias():
     pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
     after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
     assert before == after
+
+
+# --- MatMulNBits: mid-chain PRelu pass-through -----------------------------
+#
+# `_walk_to_matmul_nbits_consumer` previously recognized no ``PRelu`` hop at
+# all -- the hop `_walk_to_consumer`'s own plain-float walker already
+# recognizes (`_match_prelu_pass_through_matmul`). Hand-built via
+# `onnx.helper` (mirroring `_nbits_chain_bias_add_model` above), for the same
+# reason that section gives: the packed int4 ``B``/``scales``/
+# ``zero_points`` tensors need real array data a parser text literal can't
+# spell out.
+
+
+def _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope1):
+    """Builds ``A -> MatMulNBits(mm1) -> PRelu(Slope1) -> MatMulNBits(mm2) ->
+    Y`` -- `slope1` a flat, per-channel ``[N1]`` PRelu slope (the MatMul/
+    Gemm chain's own last-axis-is-channel convention,
+    `_match_prelu_pass_through_matmul`'s own bar). Otherwise mirrors
+    :func:`_nbits_chain_model`/:func:`_nbits_chain_bias_add_model` exactly
+    (bits=4, packed zero_points, neither MatMulNBits node given its own
+    native bias). Returns ``(model, info)`` the same shape those two give.
+    """
+    bits = 4
+    K2 = N1
+    assert K2 % block_size == 0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size, bits)
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size, bits)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size, bits)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(B1, name="B1"),
+        onnx.numpy_helper.from_array(scales1, name="scales1"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp1, bits), name="zp1"),
+        onnx.numpy_helper.from_array(B2, name="B2"),
+        onnx.numpy_helper.from_array(scales2, name="scales2"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp2, bits), name="zp2"),
+        onnx.numpy_helper.from_array(slope1, name="Slope1"),
+    ]
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size, bits
+    )
+    prelu = onnx.helper.make_node("PRelu", ["h1", "Slope1"], ["h1_act"], name="prelu1")
+    node2 = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2, K2, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node1, prelu, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [M, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes1=qcodes1,
+        scales1=scales1,
+        zp1=zp1,
+        kb1=kb1,
+        qcodes2=qcodes2,
+        scales2=scales2,
+        zp2=zp2,
+        kb2=kb2,
+        K2=K2,
+    )
+
+
+def test_matmul_nbits_prelu_pass_through_is_matched_and_prunes():
+    # Same block-aligned engineered-magnitude setup as
+    # `test_matmul_nbits_separate_trailing_bias_add_is_matched_and_prunes`:
+    # rows 0-15 large-magnitude (kept), 16-31 small (dropped). Before this
+    # fix, this returned 0 chains (the walk hit `PRelu` and declined).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(730)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    slope1 = (rng.standard_normal(N1) * 0.1).astype(np.float32)
+
+    model, info = _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope1)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+    assert [n.op_type for n, _ in chains[0].chain_ops] == ["PRelu"]
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * 4 // 8]
+    assert list(inits["Slope1"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * 4 // 8]
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["Slope1"]), slope1[keep]
+    )
+
+    # Independently-constructed, ALREADY-PRUNED reference model, mirroring
+    # this section's own oracle tests above.
+    ref_model, _ = _nbits_chain_prelu_model(
+        16, K1, N2, block_size, W1[keep], W2[:, keep], slope1[keep]
+    )
+    onnx.checker.check_model(ref_model)
+
+    rng2 = np.random.default_rng(731)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    (y_ref,) = _run(ref_model, {"A": x})
+    np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
+
+    # And matches a pure-float64 dequantize-then-PRelu-then-matmul oracle
+    # built directly from the pass's own (unmodified) quantized codes.
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size
+    )
+    h1 = x.astype(np.float64) @ w1_dequant[keep].T
+    h1_act = np.where(h1 > 0, h1, h1 * slope1[keep].astype(np.float64))
+    y_oracle = h1_act @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_prelu_scalar_shared_slope_leaves_slope_untouched():
+    # A scalar/single-shared-parameter `slope` -- `_match_prelu_pass_
+    # through_matmul`'s own scalar case, mirroring the plain-float MatMul
+    # chain's own identical always-safe pass-through (see
+    # `test_structured_pruning_matmul_prelu_scalar_shared_slope_pass_
+    # through_matches_oracle_exactly`): the chain still matches and prunes,
+    # with `Slope1` left byte-identical (no operand of its own to slice).
+    # Same block-aligned engineered-magnitude setup as
+    # `test_matmul_nbits_prelu_pass_through_is_matched_and_prunes` (rows
+    # 0-15 large-magnitude, kept) so the top-16 keep set lands on whole
+    # block 0, rather than leaving this test's own outcome dependent on
+    # whichever channels a plain random draw happens to rank highest.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(732)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    slope1 = np.array([0.25], dtype=np.float32)  # scalar, prod(dims) == 1
+
+    model, _info = _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope1)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Slope1"], slope1)  # left untouched
+    assert (
+        onnx.numpy_helper.to_array(
+            next(t for t in pruned.graph.initializer if t.name == "B1")
+        ).shape[0]
+        == 16
+    )
+
+
+def test_matmul_nbits_prelu_shared_slope_only_first_chain_prunes():
+    # The same trailing `Slope1` tensor read by two INDEPENDENT MatMulNBits
+    # producer chains' own `PRelu` nodes. UNLIKE the `_BINARY_CHANNEL_OPS`
+    # bias/scale hop (`test_matmul_nbits_separate_trailing_bias_add_
+    # declines_shared_bias`), which checks `len(consumers_of[bias]) == 1`
+    # and declines the WHOLE chain the moment it sees a shared constant --
+    # this `PRelu` hop has no such match-time check of its own, mirroring
+    # `_walk_to_consumer`'s own identical plain-float `PRelu` hop (see
+    # `onnxsim/pruning.py`'s own comment on this hop for why: it is folded
+    # into `chain_ops` the same ordinary way an Add/Mul hop's constant is,
+    # with no per-node guard beyond the generic cross-chain `const_touched`
+    # safety net every hop already shares). So both chains DO match here
+    # (unlike the bias-add case's 0), but only the FIRST one
+    # `apply_structured_pruning_matmul_nbits` processes is actually sliced;
+    # the second is left completely untouched once `Slope1` lands in
+    # `const_touched` -- never a wrong-sized tensor for either.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(733)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0  # block-aligned engineered magnitude, see the test above
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    slope = rng.standard_normal(N1).astype(np.float32)
+    model, _info = _nbits_chain_prelu_model(N1, K1, N2, block_size, W1, W2, slope)
+
+    N3, K3, N4 = 32, 48, 6
+    W3 = rng.standard_normal((N3, K3)).astype(np.float32) * 0.2
+    W3[:16] *= 6.0  # equally block-aligned, to prove it's the SHARED tensor
+    W4 = (
+        rng.standard_normal((N4, N3)).astype(np.float32) * 0.2
+    )  # blocking it, not incidental non-alignment
+    model2, _info2 = _nbits_chain_prelu_model(N3, K3, N4, block_size, W3, W4, slope)
+    # Every name in `model2` is renamed with a "_b" suffix EXCEPT "Slope1"
+    # itself, so it collides -- deliberately -- with the first model's own
+    # "Slope1" initializer once the two graphs are merged below.
+    for n in model2.graph.node:
+        n.name += "_b"
+        for i in range(len(n.input)):
+            if n.input[i] and n.input[i] != "Slope1":
+                n.input[i] += "_b"
+        for i in range(len(n.output)):
+            n.output[i] += "_b"
+    for t in model2.graph.initializer:
+        if t.name != "Slope1":
+            t.name += "_b"
+    model2.graph.input[0].name += "_b"
+    model2.graph.output[0].name += "_b"
+
+    model.graph.node.extend(model2.graph.node)
+    model.graph.initializer.extend(
+        t for t in model2.graph.initializer if t.name != "Slope1"
+    )
+    model.graph.input.extend(model2.graph.input)
+    model.graph.output.extend(model2.graph.output)
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 2  # both match -- no match-time tied-tensor guard
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep = np.arange(16)
+    # First chain (graph node order): pruned normally.
+    assert list(inits["B1"].dims) == [16, _info["kb1"], block_size * 4 // 8]
+    assert list(inits["Slope1"].dims) == [16]
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["Slope1"]), slope[keep])
+    # Second chain: its own `Slope1` was already claimed by the first, so it
+    # is left completely untouched -- never partially, inconsistently sliced.
+    assert list(inits["B1_b"].dims) == [N3, _info2["kb1"], block_size * 4 // 8]
+    assert list(inits["B2_b"].dims) == [N4, N3 // block_size, block_size * 4 // 8]
 
 
 def test_matmul_nbits_pruning_producer_odd_kept_row_count_zero_points_has_no_repack_hazard():
@@ -37355,6 +38624,147 @@ def test_matmul_nbits_pruning_gated_ffn_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)
 
 
+def _nbits_gated_decomposed_silu_model(
+    K, H, Out, block_size, W_gate, W_up, W_down, bits=4
+):
+    # The MatMulNBits analogue of _swiglu_mlp_decomposed_silu_model /
+    # _qdq_gated_mlp_decomposed_silu_model above: gate_proj/up_proj are
+    # MatMulNBits producers, and the gate branch uses a real
+    # nn.SiLU()-shaped self-gated activation (Sigmoid + self-Mul, the SAME
+    # `gate` tensor read twice) rather than a single fused Sigmoid feeding
+    # the combine -- the shape _trace_gate_producer_backward_matmul_nbits
+    # previously couldn't cross at all.
+    assert K % block_size == 0
+    assert H % block_size == 0
+    qcodes_g, scales_g, zp_g, kbg = _nbits_quantize_block(W_gate, block_size, bits)
+    qcodes_u, scales_u, zp_u, kbu = _nbits_quantize_block(W_up, block_size, bits)
+    qcodes_d, scales_d, zp_d, kbd = _nbits_quantize_block(W_down, block_size, bits)
+    Bg = _nbits_pack_B(qcodes_g, H, kbg, block_size, bits)
+    Bu = _nbits_pack_B(qcodes_u, H, kbu, block_size, bits)
+    Bd = _nbits_pack_B(qcodes_d, Out, kbd, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(Bg, name="Bg"),
+        onnx.numpy_helper.from_array(scales_g, name="scales_g"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp_g, bits), name="zp_g"),
+        onnx.numpy_helper.from_array(Bu, name="Bu"),
+        onnx.numpy_helper.from_array(scales_u, name="scales_u"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp_u, bits), name="zp_u"),
+        onnx.numpy_helper.from_array(Bd, name="Bd"),
+        onnx.numpy_helper.from_array(scales_d, name="scales_d"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp_d, bits), name="zp_d"),
+    ]
+
+    node_g = _nbits_node(
+        "mm_g", "X", "gate", "Bg", "scales_g", "zp_g", None, H, K, block_size, bits
+    )
+    sig = onnx.helper.make_node("Sigmoid", ["gate"], ["gate_sig"])
+    silu = onnx.helper.make_node("Mul", ["gate", "gate_sig"], ["gate_act"])
+    node_u = _nbits_node(
+        "mm_u", "X", "up", "Bu", "scales_u", "zp_u", None, H, K, block_size, bits
+    )
+    mul = onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"])
+    node_d = _nbits_node(
+        "mm_d", "h", "Y", "Bd", "scales_d", "zp_d", None, Out, H, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node_g, sig, silu, node_u, mul, node_d],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [M, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, Out])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes_g=qcodes_g,
+        scales_g=scales_g,
+        zp_g=zp_g,
+        kbg=kbg,
+        qcodes_u=qcodes_u,
+        scales_u=scales_u,
+        zp_u=zp_u,
+        kbu=kbu,
+        qcodes_d=qcodes_d,
+        scales_d=scales_d,
+        zp_d=zp_d,
+        kbd=kbd,
+    )
+
+
+def test_matmul_nbits_pruning_gated_ffn_decomposed_silu_matches_oracle():
+    # Confirmed gap: same real nn.SiLU()-shaped decomposition as
+    # test_structured_pruning_gated_ffn_decomposed_silu_matches_oracle/
+    # test_qdq_structured_pruning_gated_ffn_decomposed_silu_matches_oracle
+    # above, on the gate branch of a MatMulNBits gated pair -- matched zero
+    # chains via _find_matmul_nbits_gated_chains before the fix.
+    K, H, Out, block_size, bits = 16, 32, 4, 16, 4
+    rng = np.random.default_rng(220)
+    W_gate = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_gate[:16] *= 6.0
+    W_up = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_up[:16] *= 6.0
+    W_down = (rng.standard_normal((Out, H)) * 0.2).astype(np.float32)
+
+    model, info = _nbits_gated_decomposed_silu_model(
+        K, H, Out, block_size, W_gate, W_up, W_down, bits
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_matmul_nbits_gated_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bg"].dims) == [16, info["kbg"], block_size * bits // 8]
+    assert list(inits["Bu"].dims) == [16, info["kbu"], block_size * bits // 8]
+    assert list(inits["Bd"].dims) == [Out, 1, block_size * bits // 8]
+
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bg"]),
+        _nbits_pack_B(info["qcodes_g"][keep], 16, info["kbg"], block_size, bits),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bu"]),
+        _nbits_pack_B(info["qcodes_u"][keep], 16, info["kbu"], block_size, bits),
+    )
+
+    wg_dequant = _nbits_dequant(
+        info["qcodes_g"], info["scales_g"], info["zp_g"], block_size, bits
+    )
+    wu_dequant = _nbits_dequant(
+        info["qcodes_u"], info["scales_u"], info["zp_u"], block_size, bits
+    )
+    wd_dequant = _nbits_dequant(
+        info["qcodes_d"], info["scales_d"], info["zp_d"], block_size, bits
+    )
+
+    x = rng.standard_normal((3, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    gate_lin = x.astype(np.float64) @ wg_dequant[keep].T
+    silu = gate_lin * (1.0 / (1.0 + np.exp(-gate_lin)))
+    up_lin = x.astype(np.float64) @ wu_dequant[keep].T
+    h = silu * up_lin
+    y_oracle = h @ wd_dequant[:, keep].T
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)
+
+
 def test_matmul_nbits_pruning_gated_ffn_non_block_aligned_declines():
     # keep_count for a 0.4 sparsity on H=32 is 20 (round(32*0.6)), not a
     # multiple of block_size=16 -- the whole gated group (both producers
@@ -40132,6 +41542,358 @@ def test_analyze_attention_head_pruning_linear_attention_matches_real_call():
     assert dims_after["Wq"][1] == kept_groups * group_size * cfg["Dk"]
     assert dims_after["Wk"][1] == kept_groups * cfg["Dk"]
     assert dims_after["Wv"][1] == kept_groups * cfg["Dv"]
+
+
+# --- LinearAttentionGate-fed dynamic decay/beta pass-through --------------
+#
+# `LinearAttention`'s own `decay`/`beta` inputs (indices 4/5), when fed by a
+# genuine `com.microsoft::LinearAttentionGate` node (this op's own
+# documented companion -- `decay = decay_scale * Softplus(a + dt_bias)`,
+# `beta = Sigmoid(b)`, schema confirmed live via
+# `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`
+# against this environment's installed onnxruntime 1.29.0), are recognized
+# as a safe pass-through: `dt_bias`/`decay_scale` (real `(kv_num_heads,)`
+# constants, this node's own inputs 1/2) are sliced directly, axis 0, and
+# `a`'s/`b`'s (inputs 0/3) own producer weight is sliced the identical
+# `keep_groups` way Q's/K's/V's own is -- see onnxsim/pruning.py's own
+# "Attention-head pruning" section comment, the `LinearAttention` bullet,
+# and `_match_linear_attention_gate`'s own docstring. This is the realistic
+# shape every actual gated/delta/gated_delta dynamic-decode export uses --
+# before this fix, a `decay`/`beta` fed this way declined the whole match
+# outright (see `test_linear_attention_pruning_dynamic_decay_is_declined`
+# above, which locks in the *general* dynamic-decay decline this fix
+# deliberately keeps for anything other than this one recognized shape).
+#
+# `LinearAttentionGate` itself has no CPU kernel in this environment's
+# onnxruntime (confirmed empirically -- attempting to run a model containing
+# it raises ``NOT_IMPLEMENTED: Could not find an implementation for
+# LinearAttentionGate``), so unlike every other `LinearAttention` test
+# above, the gate-bearing model itself can't be run end to end. The numeric
+# oracle check below instead "materializes" the gate's own well-known
+# formula to a constant decay/beta -- via the same, already
+# execution-verified constant-decay `LinearAttention` path those other
+# tests use -- on both the pruned side (using the pruned model's own sliced
+# `Wa`/`Wb`/`DtBias`/`DecayScale`) and an independently-built oracle side
+# (computing the identical formula at full width, then slicing its own
+# output by `keep_groups`), and confirms both give a bit-identical final
+# `Y` -- an end-to-end confirmation that slicing `Wa`/`Wb`/`DtBias`/
+# `DecayScale` the way this fix does is mathematically equivalent to
+# "compute at full width, then keep only the surviving heads' own output",
+# the same invariant every other oracle test in this file already checks.
+
+
+def _softplus(x):
+    return np.logaddexp(0.0, x)
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _linear_attention_gate_model(Hkv=4, K=16, seed=0, decay_only=False):
+    """The exact `com.microsoft::LinearAttentionGate`-fed `gated_delta`
+    topology from this fix's own confirmed real-tool repro: `q`/`k`/`v` each
+    `MatMul(X, W*)`, `a`/`b_in` each `MatMul(X, Wa/Wb)` (also `Hkv`-wide --
+    per-head scalar `a`/`b`, this op's own documented shape), gated into
+    `decay`/`beta` by the gate node, consumed by
+    `LinearAttention<update_rule="gated_delta">`. `Hq == Hkv` (a plain,
+    non-GQA shape, `group_size == 1`) -- the KV-group-pruning formula itself
+    is already covered by every other `LinearAttention` test above; this
+    section is only about the new `decay`/`beta` producer recognition.
+    `decay_only=True` omits `b_in`/`beta` entirely (the `"gated"`-mode
+    shape, `beta` never requested), exercising this fix's own `b_weight is
+    None` branch.
+    """
+    rng = np.random.default_rng(seed)
+    D = 4
+    N = Hkv * D
+    wq = rng.standard_normal((K, N)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, N)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, N)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((N, K)).astype(np.float32) * 0.3
+    wa = rng.standard_normal((K, Hkv)).astype(np.float32) * 0.3
+    dt_bias = rng.standard_normal((Hkv,)).astype(np.float32)
+    decay_scale = -np.abs(rng.standard_normal((Hkv,))).astype(np.float32)
+    cfg = dict(
+        Hq=Hkv,
+        Hkv=Hkv,
+        D=D,
+        K=K,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wo=wo,
+        wa=wa,
+        dt_bias=dt_bias,
+        decay_scale=decay_scale,
+    )
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wo, "Wo"),
+        _f32(wa, "Wa"),
+        _f32(dt_bias, "DtBias"),
+        _f32(decay_scale, "DecayScale"),
+    ]
+    if decay_only:
+        gate_line = "decay = com.microsoft.LinearAttentionGate(a, DtBias, DecayScale)"
+        la_args = "q, k, v, , decay"
+        update_rule = "gated"
+    else:
+        wb = rng.standard_normal((K, Hkv)).astype(np.float32) * 0.3
+        cfg["wb"] = wb
+        initializer.append(_f32(wb, "Wb"))
+        gate_line = (
+            "decay, beta = com.microsoft.LinearAttentionGate"
+            "(a, DtBias, DecayScale, b_in)"
+        )
+        la_args = "q, k, v, , decay, beta"
+        update_rule = "gated_delta"
+    b_line = "" if decay_only else "b_in = MatMul(X, Wb)"
+
+    body = f"""
+        <
+          ir_version: 10,
+          opset_import: ["" : 27, "com.microsoft" : 1]
+        >
+        g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          a = MatMul(X, Wa)
+          {b_line}
+          {gate_line}
+          attn_out, ps = LinearAttention<q_num_heads={Hkv}, kv_num_heads={Hkv}, update_rule="{update_rule}">({la_args})
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    model = parser.parse_model(body)
+    model.graph.initializer.extend(initializer)
+    return model, cfg
+
+
+def test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle():
+    model, cfg = _linear_attention_gate_model(Hkv=4, K=16, seed=10)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _linear_attention_node(pruned)
+    q_attr = next(a.i for a in node.attribute if a.name == "q_num_heads")
+    kv_attr = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    assert kv_attr == 2
+    assert q_attr == 2  # group_size == 1 for this plain (non-GQA) shape
+
+    keep_groups = _linear_attention_keep_groups(
+        dict(
+            Hq=cfg["Hq"],
+            Hkv=cfg["Hkv"],
+            Dk=cfg["D"],
+            Dv=cfg["D"],
+            wq=cfg["wq"],
+            wk=cfg["wk"],
+            wv=cfg["wv"],
+        ),
+        sparsity=0.5,
+    )
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["DtBias"], cfg["dt_bias"][keep_groups])
+    np.testing.assert_array_equal(inits["DecayScale"], cfg["decay_scale"][keep_groups])
+    np.testing.assert_array_equal(inits["Wa"], cfg["wa"][:, keep_groups])
+    np.testing.assert_array_equal(inits["Wb"], cfg["wb"][:, keep_groups])
+
+    rng = np.random.default_rng(99)
+    x = rng.standard_normal((1, 3, cfg["K"])).astype(np.float32)
+    D = cfg["D"]
+    q_idx = np.concatenate([np.arange(h * D, (h + 1) * D) for h in keep_groups])
+
+    # Oracle: compute the gate's own formula at FULL width from the
+    # original weights, then slice its own output by `keep_groups`.
+    a_full = x @ cfg["wa"]
+    b_full = x @ cfg["wb"]
+    decay_full = cfg["decay_scale"] * _softplus(a_full + cfg["dt_bias"])
+    beta_full = _sigmoid(b_full)
+    oracle, _ = _linear_attention_model(
+        Hq=len(keep_groups),
+        Hkv=len(keep_groups),
+        Dk=D,
+        Dv=D,
+        K=cfg["K"],
+        update_rule="gated_delta",
+        decay=decay_full[:, :, keep_groups],
+        beta=beta_full[:, :, keep_groups],
+    )
+    oracle_vals = {
+        "Wq": cfg["wq"][:, q_idx],
+        "Wk": cfg["wk"][:, q_idx],
+        "Wv": cfg["wv"][:, q_idx],
+        "Wo": cfg["wo"][q_idx, :],
+        "Decay": decay_full[:, :, keep_groups],
+        "Beta": beta_full[:, :, keep_groups],
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(oracle_vals[init.name]), init.name
+            )
+        )
+    onnx.checker.check_model(oracle)
+
+    # Materialized pruned model: compute the identical formula, but from the
+    # PRUNED model's own already-sliced `Wa`/`Wb`/`DtBias`/`DecayScale`.
+    a_pruned = x @ inits["Wa"]
+    b_pruned = x @ inits["Wb"]
+    decay_pruned = inits["DecayScale"] * _softplus(a_pruned + inits["DtBias"])
+    beta_pruned = _sigmoid(b_pruned)
+    materialized, _ = _linear_attention_model(
+        Hq=len(keep_groups),
+        Hkv=len(keep_groups),
+        Dk=D,
+        Dv=D,
+        K=cfg["K"],
+        update_rule="gated_delta",
+        decay=decay_pruned,
+        beta=beta_pruned,
+    )
+    mat_vals = {
+        "Wq": inits["Wq"],
+        "Wk": inits["Wk"],
+        "Wv": inits["Wv"],
+        "Wo": inits["Wo"],
+        "Decay": decay_pruned,
+        "Beta": beta_pruned,
+    }
+    for init in materialized.graph.initializer:
+        init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(mat_vals[init.name]), init.name
+            )
+        )
+    onnx.checker.check_model(materialized)
+
+    y_oracle = _run27(oracle, {"X": x})[0]
+    y_pruned_materialized = _run27(materialized, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned_materialized, y_oracle)
+
+
+def test_linear_attention_pruning_gate_fed_decay_only_slices_wa_and_gate_weights():
+    # `"gated"` mode: `beta` never requested, so the gate node has no `b`
+    # input/`beta` output at all -- exercises this fix's own `b_weight is
+    # None` branch (nothing to slice for a `b` that was never connected).
+    model, cfg = _linear_attention_gate_model(Hkv=4, K=16, seed=13, decay_only=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_groups = _linear_attention_keep_groups(
+        dict(
+            Hq=cfg["Hq"],
+            Hkv=cfg["Hkv"],
+            Dk=cfg["D"],
+            Dv=cfg["D"],
+            wq=cfg["wq"],
+            wk=cfg["wk"],
+            wv=cfg["wv"],
+        ),
+        sparsity=0.5,
+    )
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert "Wb" not in inits
+    np.testing.assert_array_equal(inits["DtBias"], cfg["dt_bias"][keep_groups])
+    np.testing.assert_array_equal(inits["DecayScale"], cfg["decay_scale"][keep_groups])
+    np.testing.assert_array_equal(inits["Wa"], cfg["wa"][:, keep_groups])
+
+
+def test_linear_attention_pruning_constant_decay_beta_prunes_same_shapes_as_gate_fed():
+    # Regression guard: a genuine *constant* decay/beta (the shape this pass
+    # already supported before this fix) must keep pruning to the exact same
+    # shapes as the new gate-fed path, given the identical Wq/Wk/Wv/Wo (and
+    # therefore the identical importance ranking/`keep_groups`).
+    gate_model, cfg = _linear_attention_gate_model(Hkv=4, K=16, seed=12)
+
+    const_decay = np.broadcast_to(
+        (cfg["decay_scale"] * _softplus(cfg["dt_bias"]))[None, None, :],
+        (1, 3, cfg["Hkv"]),
+    )
+    const_beta = np.full((1, 3, cfg["Hkv"]), 0.5, dtype=np.float32)
+    const_model, _ = _linear_attention_model(
+        Hq=cfg["Hq"],
+        Hkv=cfg["Hkv"],
+        Dk=cfg["D"],
+        Dv=cfg["D"],
+        K=cfg["K"],
+        update_rule="gated_delta",
+        decay=const_decay,
+        beta=const_beta,
+    )
+    for init in const_model.graph.initializer:
+        if init.name in ("Wq", "Wk", "Wv", "Wo"):
+            init.CopyFrom(_f32(cfg[init.name.lower()], init.name))
+
+    pruned_gate = onnxsim.apply_attention_head_pruning(gate_model, sparsity=0.5)
+    pruned_const = onnxsim.apply_attention_head_pruning(const_model, sparsity=0.5)
+    onnx.checker.check_model(pruned_gate)
+    onnx.checker.check_model(pruned_const)
+
+    dims_gate = _initializer_dims(pruned_gate)
+    dims_const = _initializer_dims(pruned_const)
+    for name in ("Wq", "Wk", "Wv", "Wo"):
+        assert dims_gate[name] == dims_const[name]
+
+    node_gate = _linear_attention_node(pruned_gate)
+    node_const = _linear_attention_node(pruned_const)
+    for attr_name in ("q_num_heads", "kv_num_heads"):
+        assert next(a.i for a in node_gate.attribute if a.name == attr_name) == next(
+            a.i for a in node_const.attribute if a.name == attr_name
+        )
+
+
+def test_linear_attention_pruning_dynamic_decay_from_non_gate_node_still_declines():
+    # Same math as `LinearAttentionGate` (`decay_scale * Softplus(a +
+    # dt_bias)`) but decomposed into plain ops instead of the single
+    # recognized `com.microsoft::LinearAttentionGate` node -- still declines:
+    # this fix recognizes exactly one op shape, not a general "any dynamic
+    # decay computed from a per-head constant is fine" relaxation (see
+    # onnxsim/pruning.py's own docstring/section comment).
+    Hq, Hkv, Dk, Dv, K = 4, 2, 4, 4, 16
+    body = f"""
+        g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          a = MatMul(X, Wa)
+          ap = Add(a, DtBias)
+          sp = Softplus(ap)
+          decay = Mul(sp, DecayScale)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="gated">(q, k, v, , decay)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    rng = np.random.default_rng(14)
+    wq = rng.standard_normal((K, Hq * Dk)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Hkv * Dk)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Hkv * Dv)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Hq * Dk, K)).astype(np.float32) * 0.3
+    wa = rng.standard_normal((K, Hkv)).astype(np.float32) * 0.3
+    dt_bias = rng.standard_normal((Hkv,)).astype(np.float32)
+    decay_scale = -np.abs(rng.standard_normal((Hkv,))).astype(np.float32)
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(
+        [
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wo, "Wo"),
+            _f32(wa, "Wa"),
+            _f32(dt_bias, "DtBias"),
+            _f32(decay_scale, "DecayScale"),
+        ]
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims = _initializer_dims(pruned)
+    assert dims["Wq"] == (K, Hq * Dk)  # completely untouched -- no match
 
 
 # --- SparseAttention head pruning (com.microsoft, block-sparse-KV attention) ---

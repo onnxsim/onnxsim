@@ -892,6 +892,44 @@ byte-diffing technique demonstrated for Conv's bias, scaled up to cover
 and critically, `AxQuantizedConv`'s dominant weight/compute payload itself
 -- each a real, well-scoped, but separately time-consuming target.
 
+**Update, after the further mcode-focused sections below**: the ~1% figure
+above is unchanged for raw "exact meaning known" bytes -- Conv's bias
+lives in Wbt, not mcode, so none of that work adds to mcode's own count --
+but the *map* of mcode is now materially more complete than "1% known,
+99% blank":
+
+- **Two distinct periodic fields are now precisely located inside a real
+  `AxQuantizedConv` command** (not just Wbt) -- the original 4-repeats/
+  7-byte-stride field, confirmed real and dilation/groups-sensitive across
+  six independent experiments, plus a second, similarly-shaped field that
+  only activates once dilation reaches 4. Neither is decoded at the bit
+  level, but both are now real, reproducible targets with exact byte
+  offsets, not part of the undifferentiated opaque mass.
+- **The confirmed non-deterministic region needs no further decoding at
+  all** -- it's understood to be a functionally-inert internal label
+  permutation (bit-identical real device output regardless of which
+  permutation a build lands on), not an encoded parameter. That's a small
+  but real subtraction from the "mystery" pile: bytes whose *role* is now
+  fully explained, even without knowing the exact label values' meaning.
+- **A real, quantified bound on how much of mcode is even distinct**: the
+  43.4%-of-bytes-are-exact-duplicates finding (from the self-similarity
+  scan elsewhere in this README) means the effective amount of *unique*
+  content to decode in a real model is well under its raw byte count --
+  most of what's left unexamined is copies of a smaller number of real
+  templates, not independent unique data.
+- **A negative result narrows where to keep looking**: profiling a real
+  two-op chain found no separately-scheduled "transfer" event for
+  inter-op data movement, meaning whatever addressing the intermediate
+  buffer needs is folded into the existing per-op command bytes rather
+  than existing as its own, separately-findable region -- ruling out one
+  plausible place further decoding might have focused on.
+
+None of this changes the honest headline (still roughly 1% exactly
+decoded, for a real model, and the dominant `AxQuantizedConv` payload
+itself still opaque) -- but "what's left to figure out" is now a
+materially smaller, better-characterized target than when this section
+was first written.
+
 ### A first real crack at `AxQuantizedConv`'s command encoding
 
 Taking up that target directly: since Conv's actual *weight values* live
@@ -1363,6 +1401,143 @@ Pulsar2's compiler behavior changing in threshold/tile-boundary ways
 rather than smoothly. Not chased further here, but a real, precisely
 reproducible lead (two exact offsets, two exact dilation thresholds) for
 future work.
+
+### Two more Conv attributes tried: a real asymmetry, and a second non-determinism zone found by a false lead
+
+Continuing to work through Conv's remaining untested attributes:
+
+**Asymmetric kernel shape (`3x1` vs `1x3`) reveals a real, new asymmetry.**
+Same total weight count either way (`cin*cout*3*1 == cin*cout*1*3`), so
+`Wbt` came out byte-identical in size (1,320 bytes both) as expected --
+but mcode did *not*: 3,528 bytes for `3x1` vs 3,208 bytes for `1x3`, a
+real 320-byte (10-unit) difference driven by orientation alone, not by
+how much weight data there is. A genuine, real finding: the compiler
+treats a "tall" and a "wide" kernel of otherwise identical size
+differently, plausibly because how it scans/tiles the input differs by
+row vs. column direction. Not further decoded (no same-length pair here
+to diff cleanly), but a real, motivated target for whoever chases the
+scanning-order encoding next.
+
+**`auto_pad="SAME_UPPER"` vs. the numerically-equivalent explicit `pads`
+looked at first like a real, tiny signal -- and turned out to be a false
+lead that found something else useful instead.** Both compiled to the
+identical 2,984-byte mcode length, and diffing them found only 4 bytes
+different, at a location (offsets 301/303/323/325) never seen in any
+prior section of this README -- a plausible candidate for auto_pad
+leaving some small trace even after normalization. **Checked properly
+before believing it**: rebuilding the *`auto_pad="NOTSET"` config alone*,
+twice, with nothing changed, reproduced a nearly identical diff pattern
+(5 bytes, offsets 301/303/317/319/325, same multiset-of-values signature
+as the already-confirmed non-determinism elsewhere in this README). The
+"auto_pad signal" was never real -- it was this project's second
+encounter with the same class of non-deterministic label noise, just at
+a location not seen before. **Real, useful takeaway**: `auto_pad` appears
+to fully normalize to its explicit-padding equivalent before
+quantization, with no detectable functional difference in mcode --  a
+clean negative result, now that the false positive has been ruled out.
+
+**More importantly, methodologically**: this confirms mcode's
+non-determinism is not confined to the one zone (offsets ~858-882)
+characterized earlier -- there are at least two independent noisy
+regions (~301-325 as well), and likely more not yet stumbled into. Any
+future same-length-diff finding in this space needs its own determinism
+check (rebuild the *unchanged* config and confirm the observed diff
+isn't reproduced by noise alone) before being trusted, not just a check
+against the two zones already known -- this project got this exact kind
+of false positive twice now, at two different locations.
+
+### Expanding past Conv: MaxPool, the real residual Add, and GlobalAveragePool, cross-checked against `--profile`
+
+Every mcode structural finding so far came from `Conv`. Directly
+extending coverage to three of `resnet18d`'s other real primitive
+families found in its own `trace.json` profiling earlier in this
+README -- `AxMaxPool`, `AxQuantizedAdd` (the real residual add of two
+activations, not the old constant-broadcast `Add` tested early in this
+investigation), and `AxQuantizedGlobAvgPool` -- using small controlled
+models and, per the user's suggestion, checking `--profile` metadata
+alongside mcode bytes this time rather than bytes alone.
+
+**A real, clean architectural split by execution engine, confirmed
+directly**: `AxMaxPool`, the real residual `AxQuantizedAdd`, and
+`AxQuantizedGlobAvgPool` all schedule on **`teng2`** (the same engine
+`AxQuantizedNormalize` used in the `resnet18d` profiling earlier) --
+never on `conv0`/`conv1`, which are reserved for `AxQuantizedConv` and
+`Gemm`-family MAC work. A clean, real, generalizable rule confirmed
+across four distinct primitive types now: **non-MAC ops run on `teng2`;
+MAC ops run on the conv engines.** `Pre_AxTranspose`'s own engine
+placement is context-dependent -- `cv3` when it wraps a `MaxPool` or
+`GlobalAvgPool`, `teng2` when it wraps a `Conv` in the residual-block
+test -- a real difference not chased down further here.
+
+**`MaxPool`'s `ceil_mode` is a third confirmed false lead, same
+signature as before.** Comparing `ceil_mode=0` vs `ceil_mode=1` on a
+shape where both give the identical output size produced a same-length
+pair with 5 differing bytes -- but a determinism check (rebuilding the
+`ceil_mode=0` config alone, twice) reproduced the same positions and the
+same exact multiset of values (`{0x13, 0x20, 0x23, 0x30, 0x40}`) already
+seen in the `auto_pad` false lead. **This is the same noise signature
+appearing a third time, now confirmed on a completely different op type
+and model** -- strong, direct evidence this non-determinism is a global
+property of mcode generation, not tied to Conv, to any one model shape,
+or to any one byte region.
+
+**`MaxPool`'s kernel size behaves like Conv's did**: comparing a `2x2`
+kernel against a `4x4` kernel with padding chosen to hold the same output
+shape gives *different* total mcode lengths (2,408 vs 2,440 bytes, a
+32-byte-unit-consistent delta) -- real, but not a same-length pair, so no
+clean localized diff was possible here the way the dilation experiments
+allowed for Conv.
+
+### `Gemm` joins the MAC engines, and a real, substantial signal from `transB`
+
+Continuing to work through resnet18d's remaining real primitives: `Gemm`
+(the final FC layer, 3.3% of resnet18d's real schedule) and
+`AveragePool` (distinct from `GlobalAveragePool`, used 3x in
+`resnet18d`'s real downsample paths).
+
+**`Gemm` schedules on `conv1`** -- joining `Conv` in the MAC-engine
+category rather than `teng2`'s non-MAC group, extending the same clean
+split found above to a second op type. Its trace events keep the output
+tensor's own name (`y_0_0`, `y_0_1`, `y_0_2`) rather than being renamed to
+an `AxQuantized*`-style primitive the way `Conv`/`Pool`/`Add` are --
+matching, exactly, the un-renamed `"/fc/Gemm_*"` event names already seen
+in this README's real `resnet18d` profiling. **`AveragePool` schedules on
+`teng2`**, joining `MaxPool`/`Add`/`GlobalAvgPool`/`Normalize` in the
+non-MAC category, but with a real difference from `MaxPool` at the same
+input size: two sub-events (`AxQuantizedAvgPool_0_0` and
+`_1_0`) rather than one -- plausibly a real two-pass sum-then-divide
+structure specific to averaging, not investigated further here.
+
+**Correction, caught the same way the `auto_pad` false lead was**: this
+section first reported this `Gemm` shape as showing *zero*
+non-deterministic noise across a rebuild, based on a single rebuild pair.
+That turned out to be a lucky draw, not a real property of the shape --
+a second, independent pair of rebuilds (done while writing an automated
+regression test for this finding, which caught the discrepancy) showed
+the familiar ~6-byte noise at the same `~301-325` zone already confirmed
+for `Conv`/`MaxPool`/`auto_pad`/`ceil_mode`. This shape is not
+noise-free after all; it has the same known noise as everything else
+tested so far.
+
+**`transB=0` vs `transB=1` still produces a real, substantial signal, net
+of that noise.** Of the 95 originally-reported differing bytes, the two
+at offsets 319/325 fall inside the confirmed noisy zone and are not
+trustworthy as `transB`-specific signal on their own (this exact
+`gemm_base` config's own noise realization could easily land differently
+there by chance alone, independent of `transB`). The remaining ~93 bytes
+sit well outside any confirmed noise zone and hold up as real: a large,
+clean 85-byte contiguous block (offset 1620-1705, containing non-trivial
+repeated structure -- `f129ff3b81` and `f5852513c8` each appearing three
+times) plus smaller diffs at 1617, 1708, and 1712. Consistent with a real
+per-tile or per-output-column memory-access-pattern encoding that has to
+change because `transB` genuinely changes whether the weight matrix is
+traversed row-major or column-major. This remains, net of the correction,
+by a wide margin the largest and cleanest real signal isolated in this
+whole investigation -- a strong, well-motivated, precisely-located target
+(offset 1620, 85 bytes) for whoever attempts the next level of decoding.
+Also a second, independent confirmation of the broader determinism
+lesson: a single rebuild pair is not enough to call something noise-free,
+and this project has now made and caught that exact mistake twice.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
