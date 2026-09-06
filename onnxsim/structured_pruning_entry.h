@@ -228,8 +228,8 @@ EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
 // FindMatmulConcatChains/FindConvConcatChains/FindSplitGatedChains) chain
 // families -- deliberately NOT the additional quantized-weight families
 // (MatMulNBits, QDQ, Bnb4, Fp8/Fp4 block-quantized, QOperator,
-// DynamicQuantizeMatMul, ConvInteger) ApplyStructuredPruning also folds in, since
-// pruning.py's own apply_structured_wanda_pruning has no quantized-weight
+// DynamicQuantizeMatMul, ConvInteger) ApplyStructuredPruning also folds in,
+// since pruning.py's own apply_structured_wanda_pruning has no quantized-weight
 // counterpart either -- but each chain's output channels are ranked by
 // ``||W_row||_2 * ||X||_2`` (weight-row/filter L2 norm times the L2 norm of
 // the *calibrated activation* actually flowing through that channel) rather
