@@ -2011,3 +2011,66 @@ def test_resnet18d_50_01_step_set_dispatches_the_op_and_bit24_is_inert_model_wid
     assert np.array_equal(all_bit24_zero, out_base), (
         "expected bit24 to be inert for correctness across every op"
     )
+
+
+_VERBS = {0xA1, 0xA2, 0xA3, 0xA8, 0xA9}
+
+
+def _verb_headers(mcode, start=328):
+    """Every verb header word in the phase-0 bulk of an mcode blob -- see
+    the README's "Five verbs, a readable per-op program" section. Returns
+    `(word_index, verb, xx, yy, operand)` for each `XX 00 <mult of 0x10>
+    yy` word whose first byte is a known verb, indexing words from
+    `start` (the preamble before it has variable-length slots)."""
+    words = [mcode[i : i + 4] for i in range(start, len(mcode) - 3, 4)]
+    return [
+        (k, w[0], w[2], w[3], int.from_bytes(words[k + 1], "little"))
+        for k, w in enumerate(words)
+        if w[0] in _VERBS and w[1] == 0 and w[2] % 0x10 == 0 and k + 1 < len(words)
+    ]
+
+
+def test_resnet18d_bulk_is_a_two_word_stream_of_five_verbs_with_a_per_op_program(
+    tmp_path,
+):
+    """Confirmed real (see the README's "Five verbs, a readable per-op
+    program" section), all local: with all five verbs counted, 97.5% of
+    consecutive headers in the bulk are exactly two words apart; `a9 00
+    00` and both `a8` selectors occur exactly once per op (181); and 64
+    of 180 ops are exactly one eleven-instruction template. Also locks in
+    the header-declared arena size 0x2ff000 bounding every `50 03`
+    address. Needs Docker for the build but no device.
+    """
+    from collections import Counter
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    hdrs = _verb_headers(mcode)
+    assert len(hdrs) >= 2200, len(hdrs)
+
+    gaps = Counter(b[0] - a[0] for a, b in zip(hdrs, hdrs[1:]))
+    assert gaps[2] / sum(gaps.values()) >= 0.95, gaps.most_common(5)
+
+    by_verb_sel = Counter((v, xx, yy) for _, v, xx, yy, _ in hdrs)
+    assert by_verb_sel[(0xA9, 0x00, 0x00)] == 181
+    assert by_verb_sel[(0xA8, 0x30, 0x02)] == by_verb_sel[(0xA8, 0x40, 0x03)] == 181
+    assert by_verb_sel[(0xA2, 0x00, 0x00)] >= 350
+    assert by_verb_sel[(0xA3, 0x00, 0x00)] >= 180
+
+    cuts = [k for k, v, xx, yy, _ in hdrs if (v, xx, yy) == (0xA1, 0x40, 0x02)]
+    template = "a1:5001 a1:5001 a8:4003 a1:5003 a1:5001 a3:0000 a1:5001 a9:0000 a2:0000 a8:3002"
+    patterns = Counter(
+        " ".join(f"{v:02x}:{xx:02x}{yy:02x}" for k, v, xx, yy, _ in hdrs if a < k < b)
+        for a, b in zip(cuts, cuts[1:])
+    )
+    assert patterns[template] >= 60, patterns.most_common(2)
+
+    arena = int.from_bytes(mcode[76:80], "little")
+    assert arena == 0x2FF000, hex(arena)
+    assert int.from_bytes(mcode[72:76], "little") == 4096
+    max_50_03 = max(
+        op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x03)
+    )
+    assert max_50_03 < arena and arena - max_50_03 < 40_000, (
+        hex(max_50_03),
+        hex(arena),
+    )

@@ -2372,6 +2372,78 @@ op is dispatched by three required steps (`bit8`, `bit0` in either
 order, then `bit20`), followed by one step that can be dropped
 model-wide without changing a single output bit.
 
+### Five verbs, a readable per-op program, a variable-length preamble, and the arena size in the header
+
+Three local, zero-device-run checks that complete the structural
+picture -- and correct one earlier statement.
+
+**`a1` is one of five verbs over the same selector.** Tallying every
+phase-0 word of the shape `XX 00 <multiple of 0x10> yy` in the
+`resnet18d` blob, `a1` is joined by four more first bytes with the same
+`xx yy` field/bank selector and the same per-op multiples:
+
+```
+verb  writes  distinct selectors   what it writes
+a1     1197   68                   field writes (the map above)
+a8      365   5    -> 30 02 x181, 40 03 x181   one bank-2 and one bank-3 write per op
+a2      359   2    -> 00 00 x358               ~2 per op, fixed selector
+a3      185   4    -> 00 00 x182               1 per op
+a9      181   1    -> 00 00 x181               exactly 1 per op
+```
+
+**With all five verbs counted, the bulk is a uniform two-word stream.**
+From byte 328 there are 2,287 verb headers and **97.5% of consecutive
+headers are exactly two words apart** (2,228 of 2,285): `[verb 00 xx yy]
+[32-bit operand]`, eight bytes per instruction, throughout. The earlier
+"gaps of 4, 8, 10 words between `a1` headers" were other verbs in
+between, not longer instructions.
+
+**The per-op program is now readable.** Splitting at each `a1 40 02`
+(Wbt offset), 64 of 180 ops are exactly this eleven-instruction
+sequence, and 40 more differ only by one extra `a2`:
+
+```
+a1 40 02 <Wbt offset>      set weight offset
+a1 50 01 bit8              step 1 (required)
+a1 50 01 bit0              step 2 (required, order-free with step 1)
+a8 40 03 <...>             bank-3 write
+a1 50 03 <arena address>   set tile-arena address
+a1 50 01 bit20             step 3 (required)
+a3 00 00 <...>
+a1 50 01 bit24             step 4 (optional model-wide)
+a9 00 00 <...>
+a2 00 00 <...>
+a8 30 02 <...>             bank-2 write
+```
+
+Each of the four `50 01` steps sits immediately before a different verb,
+which reads naturally as "arm, then do" -- but that is an interpretation;
+the sequence itself is the measured fact (22 distinct per-op patterns
+in total, dominated by these two).
+
+**Correction, stated in place: the stream is not 4-byte aligned from the
+blob's first byte.** The first field write sits at byte 297 (phase 1):
+`a1 00 40 02 ff 00 00 00 | a8 00 50 02 00 00 00 00 | a1 00 60 02 80 14 03
+00 | a1 00 70 02 81 0a 03`, where that last slot is **seven** bytes -- a
+3-byte operand -- and only from about byte 328 onward do headers settle
+at phase 0 and stay there (1,192 of the bulk's 1,320 `a1 00` pairs; the
+scattered phase-1/2/3 ones lie inside packed operand words). So the
+preamble has variable-length instructions, the bulk does not, and a
+parser must not assume 8-byte slots from offset 0. The earlier word
+indexing from the blob start was right for the bulk by coincidence of
+where the preamble's odd slots happen to end.
+
+**The tile arena's size is declared in the FlatBuffers header.** Header
+words 72 and 76 hold `4096` and `0x002ff000` (3,141,632). The largest
+`50 03` operand, `0x2f7040`, sits 32,704 bytes below `0x2ff000` -- less
+than one typical tile (the most common `50 03` delta is 37,120) -- i.e.
+the last tile fits exactly under it. A declared size that bounds every
+arena address to within one tile is strong evidence that word 76 is the
+arena size and word 72 its page/alignment, which also links the header
+region (decoded first, long ago) to the field map for the first time.
+Whether `0x2ff000` is the physical on-chip memory size is still not
+checked against a spec.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
