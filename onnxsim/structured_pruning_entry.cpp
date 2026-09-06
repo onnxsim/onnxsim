@@ -108,6 +108,89 @@
 // model happened to carry).
 #include "partial_shape_eval.h"
 
+// Forward declaration of this file's own SliceAxisGeneric -- defined much
+// later in the file (the "attention_bias"-slicing section, reusing the
+// MoE/QMoE section's own ReadTensorAsF64/WriteF64TensorAs), but at GLOBAL
+// scope, not inside the anonymous namespace below (that namespace is closed
+// and reopened more than once across this file, and SliceAxisGeneric's own
+// definition happens to sit in one of the gaps between those reopenings) --
+// so this declaration must also be at global scope, not repeated inside the
+// anonymous namespace itself: a same-signature declaration placed in there
+// would create a SECOND, distinct (anonymous-namespace-linkage) entity,
+// ambiguous against this one at every call site inside that namespace.
+// Needed here so the Attention-head-pruning matchers/appliers -- defined
+// earlier in the file, inside the anonymous namespace -- can reuse it rather
+// than duplicating the same generic-axis-slice logic a second time.
+void SliceAxisGeneric(onnx::TensorProto* t, const std::vector<int64_t>& keep,
+                      int64_t axis);
+
+// Forward declarations of three more of this file's own helpers, for the
+// identical global-scope reason SliceAxisGeneric's own declaration above
+// needs one: each one's real definition sits textually in the same
+// GLOBAL-scope gap SliceAxisGeneric's own does (the "Decomposed (un-fused)
+// GQA/MQA/plain-MHA attention head pruning" section, past this file's own
+// closing of the big anonymous namespace below), so a same-signature
+// declaration placed INSIDE that namespace would again create a second,
+// distinct (anonymous-namespace-linkage) entity rather than referring to the
+// real one. Needed here so GroupQueryAttention's/the plain ai.onnx::Attention
+// op's/MultiHeadAttention's/PackedMultiHeadAttention's/
+// DecoderMaskedMultiHeadAttention's own MatchGqaProducer/
+// MatchOnnxAttentionProducer/MatchMultiHeadAttentionProducer/
+// MatchPackedMultiHeadAttentionProducer/
+// MatchDecoderMaskedMultiHeadAttentionProducer/ApplyOneGqaChain -- defined
+// earlier in the file, inside that namespace -- can reuse this exact
+// additive-mask safety/rewrite machinery for their own attention_bias/
+// attn_mask input (HeadBiasInputIsSafe/SliceOrGatherHeadBias, mirroring
+// pruning.py's own `_head_bias_input_is_safe`/`_slice_or_gather_head_bias`),
+// and this file's own pre-existing ExistingGraphNames (mirroring pruning.py's
+// own `_existing_graph_names`) to seed the same used-names set
+// InsertDynamicHeadBiasGather (reached transitively via SliceOrGatherHeadBias)
+// mints fresh Gather-node/indices-initializer names from.
+bool HeadBiasInputIsSafe(
+    const onnx::NodeProto& node, int idx,
+    const std::unordered_map<std::string, const onnx::TensorProto*>& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name,
+    int64_t num_heads);
+void SliceOrGatherHeadBias(
+    onnx::NodeProto* node, int idx,
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    int64_t num_heads, const std::vector<int64_t>& keep,
+    onnx::GraphProto* graph, std::unordered_set<std::string>& used_names,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name);
+std::unordered_set<std::string> ExistingGraphNames(
+    const onnx::GraphProto& graph);
+
+// Also forward-declared here for the identical reason: the real definitions
+// sit in that same global-scope gap (grouped with HeadBiasInputIsSafe et al.
+// above, as this file's own shared "per-head/per-KV-cache safety net"), but
+// GroupQueryAttention's/the plain ai.onnx::Attention op's/
+// MultiHeadAttention's own matchers/appliers -- defined earlier in the file,
+// inside the anonymous namespace -- all need to validate and slice their own
+// optional constant `past_key`/`past_value` (BNSH-layout, `kv_num_heads` at
+// axis 1) before that point. `PastKvConstantsAreSliceable` mirrors
+// pruning.py's own `_past_kv_constants_are_sliceable` (one shared
+// implementation for every caller: GroupQueryAttention's own quantized-cache
+// case passes `scale_indices` for its `k_scale`/`v_scale` pair; the plain
+// ai.onnx::Attention op's, MultiHeadAttention's, and
+// DecoderMaskedMultiHeadAttention's own calls omit it, since none of those
+// three ops has quantized-cache inputs at all, so a quantized-dtype cache is
+// unconditionally declined for them). `SliceKvCacheAxis1` is this same
+// shared implementation's own apply-time counterpart: a plain
+// FLOAT/FLOAT16/BFLOAT16 cache (or PER_CHANNEL k_scale/v_scale) reuses
+// SliceAxisGeneric's own dtype-preserving double round trip, while a
+// quantized UINT8/INT8/FLOAT8E4M3FN cache -- only ever reachable via
+// GroupQueryAttention's own `scale_indices` path -- gets a raw-byte
+// index-select instead, since those encodings have no numeric meaning to
+// round-trip through double.
+bool PastKvConstantsAreSliceable(
+    const onnx::NodeProto& node,
+    const std::unordered_map<std::string, const onnx::TensorProto*>& init_map,
+    std::pair<int, int> indices, int64_t kv_num_heads,
+    std::optional<std::pair<int, int>> scale_indices = std::nullopt);
+void SliceKvCacheAxis1(onnx::TensorProto* t, const std::vector<int64_t>& keep);
+
 namespace {
 
 constexpr int kMaxChainHops = 8;
@@ -403,6 +486,44 @@ std::optional<MatMulLikeMatch> MatchMatMulLikeRaw(const onnx::NodeProto& node) {
 using InitMap = std::unordered_map<std::string, const onnx::TensorProto*>;
 using ConsumerMap =
     std::unordered_map<std::string, std::vector<onnx::NodeProto*>>;
+
+// Forward declarations for this file's own generic (FLOAT/FLOAT16/BFLOAT16)
+// dtype infrastructure -- defined much later in the file, inside this same
+// anonymous namespace (the "MoE/QMoE whole-expert pruning" section's own
+// IsSupportedFloatDtype/ReadTensorAsF64/WriteF64TensorAs), needed here so
+// the Attention-head-pruning matchers/appliers below -- defined earlier in
+// the file, before that section -- can reuse them rather than duplicating
+// the same FLOAT16/BFLOAT16 bit-conversion logic a second time: this
+// includes MatchGqaProducer/MatchOnnxAttentionProducer/
+// MatchMultiHeadAttentionProducer/MatchPackedMultiHeadAttentionProducer/
+// MatchDecoderMaskedMultiHeadAttentionProducer/MatchPagedAttentionProducer
+// and their own PastKvConstantsAreSliceable/PagedKvScaleIsSliceable helpers.
+// (This file's own SliceAxisGeneric, which reuses that same trio, is
+// declared separately below, at global scope -- see that declaration's own
+// comment for why: its own definition, unlike these three, sits textually
+// OUTSIDE this anonymous namespace.)
+bool IsSupportedFloatDtype(int32_t data_type);
+std::vector<double> ReadTensorAsF64(const onnx::TensorProto& t);
+void WriteF64TensorAs(onnx::TensorProto* t, int32_t data_type,
+                      const std::vector<int64_t>& dims,
+                      const std::vector<double>& data);
+
+// Forward declarations of this file's own single-byte-dtype (UINT8/
+// FLOAT8E4M3FN) tensor <-> flat-buffer helpers -- defined later in the file
+// (the "MatMulNBits"/QMoE sections), but still inside this SAME anonymous
+// namespace (unlike the trio above and SliceAxisGeneric, so an ordinary
+// same-signature forward declaration here refers to those exact
+// definitions, no global-scope declaration needed). Needed here so
+// GroupQueryAttention's own MatchGqaProducer/ApplyOneGqaChain -- defined
+// earlier in the file -- can reuse them for a quantized (uint8/int8/
+// float8e4m3fn) `past_key`/`past_value` KV cache (see this file's own
+// SliceKvCacheAxis1, defined just above those matchers/appliers).
+std::vector<uint8_t> ReadUint8Tensor(const onnx::TensorProto& t);
+void SetUint8TensorData(onnx::TensorProto* t, const std::vector<int64_t>& dims,
+                        const std::vector<uint8_t>& data);
+void SetFloat8E4M3TensorData(onnx::TensorProto* t,
+                             const std::vector<int64_t>& dims,
+                             const std::vector<uint8_t>& data);
 
 ConsumerMap ConsumersOf(onnx::GraphProto* graph) {
   ConsumerMap out;
@@ -755,6 +876,50 @@ std::optional<ProducerMatch> MatchProducer(const onnx::NodeProto& node,
   auto it = init_map.find(m->w_name);
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  std::optional<std::string> bias;
+  if (node.op_type() == "Gemm" && node.input_size() == 3) {
+    bias = node.input(2);
+    if (!init_map.count(*bias)) {
+      return std::nullopt;  // non-constant bias -- can't safely prune it.
+    }
+  }
+  const onnx::TensorProto* w = it->second;
+  const int64_t n_channels = m->weight_transposed ? w->dims(0) : w->dims(1);
+  return ProducerMatch{m->w_name, m->weight_transposed, bias, n_channels};
+}
+
+// Q/K/V producer matcher for the Attention-head-pruning section's own
+// separate-producer chain families (FindSeparateQkvChains/
+// FindDecomposedGqaChains/MatchPackedQkvSplit) ONLY -- mirrors MatchProducer
+// exactly, but widened to accept FLOAT16/BFLOAT16 in addition to FLOAT32 for
+// the weight, since pruning.py's own `_match_producer` -- shared by every ONE
+// of its own callers, unlike this file's own MatchProducer, which stays
+// FLOAT32-only for its OTHER callers -- already does. Deliberately a narrow,
+// LOCAL duplicate rather than a change to the shared MatchProducer itself:
+// that function backs a dozen OTHER chain families in this file (see
+// ApplyStructuredPruning's own six chain kinds), none of which has been
+// independently re-verified against a real FLOAT16/BFLOAT16 export -- exactly
+// the same reasoning as this file's own MatchMoeRouterProducer (MoE/QMoE
+// whole-expert pruning section, see that function's own comment). Unlike
+// MatchMoeRouterProducer, the Attention-head-pruning apply functions this
+// backs (ApplyOnePlainAttentionChain/ApplyOneGqaChain/
+// ApplyOneDecomposedGqaChain) HAVE been widened to FLOAT16/BFLOAT16 (see
+// their own comments -- ReadTensorAsF64/WriteF64TensorAs/SliceAxisGeneric
+// throughout), so this matcher's dtype gate is safe to widen. `bias` is
+// never dtype-checked at all, mirroring `_match_producer`'s/MatchProducer's
+// own identical lack of a bias dtype gate (only presence as a constant
+// initializer is required either way).
+std::optional<ProducerMatch> MatchProducerAnyFloat(const onnx::NodeProto& node,
+                                                   const InitMap& init_map) {
+  auto m = MatchMatMulLikeRaw(node);
+  if (!m) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(m->w_name);
+  if (it == init_map.end() || !IsSupportedFloatDtype(it->second->data_type()) ||
       it->second->dims_size() != 2) {
     return std::nullopt;
   }
@@ -4425,10 +4590,17 @@ std::vector<int64_t> TopKIndicesAscending(const std::vector<double>& importance,
   return idx;
 }
 
-// Transposes a [dim0, dim1] row-major matrix into [dim1, dim0].
-std::vector<float> TransposeFlat(const std::vector<float>& data, int64_t dim0,
-                                 int64_t dim1) {
-  std::vector<float> out(data.size());
+// Transposes a [dim0, dim1] row-major matrix into [dim1, dim0]. Templated
+// (not just `float`) for the same reason SliceAxis0/SliceAxis1 above are --
+// so the Attention-head-pruning section's own FLOAT16/BFLOAT16-widened
+// `double` code path (ReadTensorAsF64/WriteF64TensorAs) can reuse this exact
+// same transpose via `TransposeFlat<double>` instead of a hand-duplicated
+// copy; every existing caller below still passes `std::vector<float>` and
+// gets the identical instantiation/behavior as before.
+template <typename T>
+std::vector<T> TransposeFlat(const std::vector<T>& data, int64_t dim0,
+                             int64_t dim1) {
+  std::vector<T> out(data.size());
   for (int64_t i = 0; i < dim0; ++i) {
     for (int64_t j = 0; j < dim1; ++j) {
       out[static_cast<size_t>(j * dim0 + i)] =
@@ -5186,9 +5358,21 @@ void ApplyChainsGlobal(
 //   of query heads mapped to it after pruning (FindSeparateQkvChains/
 //   ApplyOneGqaChain, shared between the two ops).
 
-// True for a com.microsoft::Attention node with a constant 2-D float32
-// merged QKV weight [K, Nq+Nk+Nv] (and, if present, a constant 1-D float32
-// merged bias). Mirrors pruning.py's own _match_attention_producer.
+// True for a com.microsoft::Attention/DecoderMaskedSelfAttention/
+// PackedAttention node with a constant 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV
+// weight [K, Nq+Nk+Nv] (and, if present, a constant 1-D FLOAT/FLOAT16/
+// BFLOAT16 merged bias of the same dtype-class). Mirrors pruning.py's own
+// _match_attention_producer, including its own three-op-type scope: all
+// three share `Attention`'s exact input positions for everything this
+// matcher touches (weight/bias at 1/2), differing only as `is_dmsa` below
+// accounts for. `attention_bias` (input 5)'s own per-head-safety check
+// (pruning.py's own `_head_bias_input_is_safe`/`_slice_or_gather_head_bias`
+// dynamic-Gather-insertion machinery) is a separate, larger parity gap this
+// port does not yet close for ANY of its matched families -- see this
+// file's own "Attention-head pruning" section comment above for the
+// per-family scope, and tests/test_attention_head_pruning_cpp.py's own
+// top-of-file docstring for the exact, already-accepted divergence this
+// produces -- left untouched here exactly as before.
 struct AttentionProducerMatch {
   std::string weight;
   std::optional<std::string> bias;
@@ -5198,16 +5382,20 @@ struct AttentionProducerMatch {
 
 std::optional<AttentionProducerMatch> MatchAttentionProducer(
     const onnx::NodeProto& node, const InitMap& init_map) {
-  if (node.domain() != kComMicrosoftDomain || node.op_type() != "Attention") {
+  if (node.domain() != kComMicrosoftDomain ||
+      (node.op_type() != "Attention" &&
+       node.op_type() != "DecoderMaskedSelfAttention" &&
+       node.op_type() != "PackedAttention")) {
     return std::nullopt;
   }
+  const bool is_dmsa = node.op_type() == "DecoderMaskedSelfAttention";
   if (node.input_size() < 2) {
     return std::nullopt;
   }
   const std::string& w_name = node.input(1);
   auto wit = init_map.find(w_name);
   if (wit == init_map.end() ||
-      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
       wit->second->dims_size() != 2) {
     return std::nullopt;
   }
@@ -5218,15 +5406,27 @@ std::optional<AttentionProducerMatch> MatchAttentionProducer(
     bias_name = node.input(2);
     auto bit = init_map.find(*bias_name);
     if (bit == init_map.end() ||
-        bit->second->data_type() != onnx::TensorProto::FLOAT ||
+        !IsSupportedFloatDtype(bit->second->data_type()) ||
         bit->second->dims_size() != 1 || bit->second->dims(0) != total_n) {
       return std::nullopt;
     }
   }
 
+  // DecoderMaskedSelfAttention-only: `past` (index 4) is required by this
+  // op's own schema and holds combined key+value runtime decode state -- a
+  // real export always leaves it dynamic; a constant here has no
+  // established/tested slicing path, so decline conservatively rather than
+  // leaving it silently stale. Mirrors pruning.py's own
+  // `_match_attention_producer`.
+  if (is_dmsa && node.input_size() > 4 && !node.input(4).empty() &&
+      init_map.count(node.input(4))) {
+    return std::nullopt;
+  }
+
   int64_t num_heads = 0;
   bool has_num_heads = false;
   std::optional<std::vector<int64_t>> qkv_hidden_sizes;
+  int64_t do_rotary = 0;
   for (const auto& attr : node.attribute()) {
     if (attr.name() == "num_heads") {
       num_heads = attr.i();
@@ -5234,10 +5434,22 @@ std::optional<AttentionProducerMatch> MatchAttentionProducer(
     } else if (attr.name() == "qkv_hidden_sizes") {
       qkv_hidden_sizes =
           std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "do_rotary") {
+      do_rotary = attr.i();
     }
   }
   if (!has_num_heads || num_heads <= 0) {
     return std::nullopt;
+  }
+  if (is_dmsa) {
+    if (do_rotary) {
+      return std::nullopt;  // fused RoPE -- no confirmed per-head-safe
+                            // execution path for this op in this environment.
+    }
+    if (qkv_hidden_sizes) {
+      return std::nullopt;  // not a real attribute on this op's own schema --
+                            // decline rather than guess at an uneven split.
+    }
   }
 
   int64_t nq, nk, nv;
@@ -5332,7 +5544,7 @@ WalkToAttentionConsumer(const std::string& start, const InitMap& init_map,
   }
   auto wit = init_map.find(cm->w_name);
   if (wit == init_map.end() ||
-      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
       wit->second->dims_size() != 2) {
     return {std::nullopt, chain_ops};
   }
@@ -5439,11 +5651,43 @@ struct HeadCountsMatch {
 };
 
 // If `node` is a com.microsoft::GroupQueryAttention node this pass can
-// safely act on (separate Q/K/V inputs -- rules out the op's packed-QKV
-// calling convention; no non-empty constant past_key/past_value), returns
-// (num_heads, kv_num_heads). Mirrors pruning.py's own _match_gqa_producer.
-std::optional<HeadCountsMatch> MatchGqaProducer(const onnx::NodeProto& node,
-                                                const InitMap& init_map) {
+// safely act on, returns (num_heads, kv_num_heads). Mirrors pruning.py's own
+// _match_gqa_producer: separate, non-empty Q/K/V inputs (rules out the op's
+// packed-QKV calling convention), `num_heads`/`kv_num_heads` attributes with
+// `num_heads` a positive multiple of `kv_num_heads`, and a `past_key`/
+// `past_value` (indices 3/4) this pass can safely act on -- an absent or
+// dynamic one leaves the whole match unaffected, a constant one must be
+// safely sliceable (PastKvConstantsAreSliceable, passed `scale_indices =
+// (12, 13)` for GroupQueryAttention's own `k_scale`/`v_scale`; both this
+// helper and its own apply-time SliceKvCacheAxis1 counterpart are forward-
+// declared at the top of this file and defined once, alongside
+// HeadBiasInputIsSafe, in the decomposed-GQA section below -- shared with
+// the plain ai.onnx::Attention op's and MultiHeadAttention's own identical
+// past_key/past_value handling) or the whole match is declined.
+// `attention_bias` (index 10), documented shape `(batch_size or 1, num_heads
+// or 1, sequence_length, total_sequence_length)` -- addressed per QUERY head
+// (this op's own `num_heads`, not `kv_num_heads`) since it's added to Q*K'
+// after GQA's own internal K/V-repeat-to-query-head-count broadcast -- gets
+// the same constant-resolves-cleanly-or-is-declined treatment via
+// HeadBiasInputIsSafe the decomposed-GQA family's own additive mask already
+// gets. `head_sink` (index 11), documented shape `(num_heads,)`, is a genuine
+// one-scalar-per-query-head parameter, not a broadcastable mask -- a
+// constant one is only ever accepted at exactly that shape and a
+// FLOAT/FLOAT16/BFLOAT16 dtype (ApplyOneGqaChain's own SliceAxisGeneric,
+// unlike pruning.py's dtype-agnostic `_slice_last_axis`, only handles those
+// three -- a narrower-than-pruning.py scope decision analogous to
+// HeadBiasInputIsSafe's own identical one), declined otherwise; a dynamic
+// one is left alone as always. `q_norm_weight`/`k_norm_weight` (indices
+// 14/15), required by the schema to "be provided together", decline a match
+// where exactly one is connected (head_size itself never changes under this
+// pass' own whole-head/KV-group pruning, so neither ever needs slicing).
+// cos_cache/sin_cache (indices 7/8) are always left alone regardless -- both
+// are `[max_sequence_length, rotary_dim/2]`, broadcast identically across
+// every head.
+std::optional<HeadCountsMatch> MatchGqaProducer(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   if (node.domain() != kComMicrosoftDomain ||
       node.op_type() != "GroupQueryAttention") {
     return std::nullopt;
@@ -5469,29 +5713,57 @@ std::optional<HeadCountsMatch> MatchGqaProducer(const onnx::NodeProto& node,
   if (num_heads % kv_num_heads != 0) {
     return std::nullopt;
   }
-  for (int idx : {3, 4}) {  // past_key, past_value.
-    if (node.input_size() <= idx || node.input(idx).empty()) {
-      continue;
+  if (!PastKvConstantsAreSliceable(node, init_map, {3, 4}, kv_num_heads,
+                                   std::pair<int, int>{12, 13})) {
+    return std::nullopt;
+  }
+  if (node.input_size() > 10 && !node.input(10).empty()) {  // attention_bias
+    if (!HeadBiasInputIsSafe(node, 10, init_map, value_info_by_name,
+                             num_heads)) {
+      return std::nullopt;  // doesn't statically resolve -- decline rather
+                            // than guess.
     }
-    auto it = init_map.find(node.input(idx));
+  }
+  if (node.input_size() > 11 && !node.input(11).empty()) {  // head_sink
+    auto it = init_map.find(node.input(11));
     if (it != init_map.end()) {
-      int64_t prod = 1;
-      for (int64_t d : it->second->dims()) {
-        prod *= d;
-      }
-      if (prod > 0) {
-        return std::nullopt;  // Non-empty KV-cache constant -- needs slicing.
+      if (it->second->dims_size() != 1 || it->second->dims(0) != num_heads ||
+          !IsSupportedFloatDtype(it->second->data_type())) {
+        return std::nullopt;  // Not the schema's own (num_heads,) shape, or
+                              // (this port's own narrowing) not a dtype
+                              // ApplyOneGqaChain's own SliceAxisGeneric can
+                              // slice.
       }
     }
+  }
+  const std::string q_norm_name =
+      node.input_size() > 14 ? node.input(14) : std::string();
+  const std::string k_norm_name =
+      node.input_size() > 15 ? node.input(15) : std::string();
+  if (q_norm_name.empty() != k_norm_name.empty()) {
+    return std::nullopt;  // schema: "must be provided together".
   }
   return HeadCountsMatch{num_heads, kv_num_heads};
 }
 
 // If `node` is a plain ai.onnx::Attention node (domain "", opset 24+) this
 // pass can safely act on, returns (q_num_heads, kv_num_heads). Mirrors
-// pruning.py's own _match_onnx_attention_producer.
+// pruning.py's own _match_onnx_attention_producer: separate, non-empty Q/K/V
+// inputs, `q_num_heads`/`kv_num_heads` attributes with `q_num_heads` a
+// positive multiple of `kv_num_heads`. The optional `attn_mask` input (index
+// 3) -- added against the `(batch, q_num_heads, q_seq, kv_seq)`
+// attention-score tensor via ordinary broadcasting, so a rank-3 mask's own
+// axis 0 lands on the q_num_heads slot too, not just a rank-4 mask's axis 1
+// -- gets the identical HeadBiasInputIsSafe treatment GroupQueryAttention's
+// own `attention_bias` gets above. `past_key`/`past_value` (indices 4/5 --
+// a different pair from GroupQueryAttention's own 3/4) get the same safety
+// gate via the same shared PastKvConstantsAreSliceable, but with no
+// `scale_indices` (this op's schema has no k_scale/v_scale inputs at all, so
+// a quantized cache here is declined outright by that shared function).
 std::optional<HeadCountsMatch> MatchOnnxAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& init_map) {
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   if (!node.domain().empty() || node.op_type() != "Attention") {
     return std::nullopt;
   }
@@ -5516,31 +5788,30 @@ std::optional<HeadCountsMatch> MatchOnnxAttentionProducer(
   if (q_num_heads % kv_num_heads != 0) {
     return std::nullopt;
   }
-  for (int idx : {3, 4, 5}) {  // attn_mask, past_key, past_value.
-    if (node.input_size() <= idx || node.input(idx).empty()) {
-      continue;
+  if (node.input_size() > 3 && !node.input(3).empty()) {  // attn_mask
+    if (!HeadBiasInputIsSafe(node, 3, init_map, value_info_by_name,
+                             q_num_heads)) {
+      return std::nullopt;  // doesn't statically resolve -- decline rather
+                            // than guess.
     }
-    auto it = init_map.find(node.input(idx));
-    if (it != init_map.end()) {
-      int64_t prod = 1;
-      for (int64_t d : it->second->dims()) {
-        prod *= d;
-      }
-      if (prod > 0) {
-        return std::nullopt;  // Non-empty constant -- would need slicing.
-      }
-    }
+  }
+  if (!PastKvConstantsAreSliceable(node, init_map, {4, 5}, kv_num_heads)) {
+    return std::nullopt;
   }
   return HeadCountsMatch{q_num_heads, kv_num_heads};
 }
 
-// Generic safety gate reused by every new "separate Q/K/V" matcher below
-// (MultiHeadAttention/PackedMultiHeadAttention/
-// DecoderMaskedMultiHeadAttention/SparseAttention): declines the whole match
+// Generic safety gate reused by MatchSparseAttentionProducer below (its own
+// `block_row_indices`/`block_col_indices` sit at fixed indices, but its own
+// past_key/past_value pair does not -- unlike MultiHeadAttention/
+// PackedMultiHeadAttention/DecoderMaskedMultiHeadAttention/GroupQueryAttention/
+// the plain ai.onnx::Attention op, all of which now validate-and-slice their
+// own analogous optional per-head inputs instead, via HeadBiasInputIsSafe/
+// PastKvConstantsAreSliceable -- this op's own past_key/past_value gap
+// remains a pre-existing, out-of-scope narrowing): declines the whole match
 // when any of `indices` resolves to a non-empty constant tensor -- mirrors
-// the identical "would need slicing, not attempted here" pattern
-// MatchGqaProducer/MatchOnnxAttentionProducer already use above for their
-// own past_key/past_value (and, for the latter, attn_mask) checks. An
+// the identical "would need slicing, not attempted here" pattern this port
+// used for every one of those other matchers before each one's own fix. An
 // absent, empty-string, or dynamic (unresolvable-to-constant) input at any
 // of `indices` is left completely alone -- nothing here ever slices any of
 // them either way, so a genuinely dynamic one is safe to leave connected
@@ -5575,20 +5846,26 @@ bool NoNonEmptyConstantAt(const onnx::NodeProto& node, const InitMap& init_map,
 // convention (`query` alone carrying a packed rank-5 tensor) -- the same
 // exclusion pruning.py's own matcher gives.
 //
-// Deliberately narrower than pruning.py's own matcher in one way, consistent
-// with this file's own pre-existing, already-accepted scope gap (see this
-// section's own top comment and the MatMulNBitsQkv section's own comment on
-// ApplyOneGqaChain's identical gap for the already-shipped GQA/OnnxAttention
-// families): this port has no analogue of pruning.py's own
-// `_head_bias_input_is_safe`/`_slice_or_gather_head_bias` dynamic-bias
-// machinery at all, so rather than reproduce that same silent-corruption
-// risk for a brand new op family, `attention_bias` (index 5) declines the
-// whole match outright whenever it resolves to a non-empty constant (the
-// same `NoNonEmptyConstantAt` gate `past_key`/`past_value`, indices 6/7,
-// already get -- this port doesn't slice either past_kv tensor for this op
-// either, the same gap GQA/OnnxAttention already have).
+// The optional `attention_bias` input (index 5), documented shape
+// `(batch_size or 1, num_heads or 1, sequence_length,
+// total_sequence_length)`, gets the identical
+// constant-resolves-cleanly-or-is-declined treatment via HeadBiasInputIsSafe
+// that GroupQueryAttention's own attention_bias and the plain ai.onnx op's
+// own attn_mask would (see this section's own top comment for their own
+// still-open, out-of-scope gap). `key_padding_mask` (index 4) has no
+// num_heads-sized axis on any of its own documented shapes, so it is never
+// inspected here. The optional `past_key`/`past_value` inputs (indices 6/7
+// -- a different pair of indices from GroupQueryAttention's own 3/4 and the
+// plain ai.onnx op's own 4/5) get the same safety gate via the shared
+// PastKvConstantsAreSliceable, called with no `scale_indices`: this op's own
+// schema has no `k_scale`/`v_scale` inputs at all, so a quantized cache here
+// is declined outright. ApplyOneGqaChain performs the actual slice(s) of
+// both once a match succeeds -- mirrors pruning.py's own
+// _match_multi_head_attention_producer exactly.
 std::optional<HeadCountsMatch> MatchMultiHeadAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& init_map) {
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   if (node.domain() != kComMicrosoftDomain ||
       node.op_type() != "MultiHeadAttention") {
     return std::nullopt;
@@ -5608,8 +5885,14 @@ std::optional<HeadCountsMatch> MatchMultiHeadAttentionProducer(
   if (!has_nh || num_heads <= 0) {
     return std::nullopt;
   }
-  if (!NoNonEmptyConstantAt(node, init_map, {5, 6, 7})) {
-    return std::nullopt;  // attention_bias, past_key, past_value
+  if (node.input_size() > 5 && !node.input(5).empty()) {  // attention_bias
+    if (!HeadBiasInputIsSafe(node, 5, init_map, value_info_by_name,
+                             num_heads)) {
+      return std::nullopt;  // doesn't statically resolve -- decline
+    }
+  }
+  if (!PastKvConstantsAreSliceable(node, init_map, {6, 7}, num_heads)) {
+    return std::nullopt;
   }
   return HeadCountsMatch{num_heads, num_heads};
 }
@@ -5624,11 +5907,15 @@ std::optional<HeadCountsMatch> MatchMultiHeadAttentionProducer(
 // `token_offset`/`cumulative_sequence_length`, shifting everything after it
 // one position later, confirmed directly off ONNX Runtime's own
 // `_replace_attention_with_packing_attention` rewrite -- see pruning.py's
-// own docstring). This op's own schema has no `past_key`/`past_value` at
-// all (packing mode is an encoder-only, non-incremental-decode
-// optimization), so there is no KV-cache pair to gate here.
+// own docstring), gated by the same HeadBiasInputIsSafe treatment
+// MultiHeadAttention's own analogous input gets. This op's own schema has no
+// `past_key`/`past_value` at all (packing mode is an encoder-only,
+// non-incremental-decode optimization), so there is no KV-cache pair to
+// gate here.
 std::optional<HeadCountsMatch> MatchPackedMultiHeadAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& init_map) {
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   if (node.domain() != kComMicrosoftDomain ||
       node.op_type() != "PackedMultiHeadAttention") {
     return std::nullopt;
@@ -5648,8 +5935,11 @@ std::optional<HeadCountsMatch> MatchPackedMultiHeadAttentionProducer(
   if (!has_nh || num_heads <= 0) {
     return std::nullopt;
   }
-  if (!NoNonEmptyConstantAt(node, init_map, {6})) {
-    return std::nullopt;  // attention_bias
+  if (node.input_size() > 6 && !node.input(6).empty()) {  // attention_bias
+    if (!HeadBiasInputIsSafe(node, 6, init_map, value_info_by_name,
+                             num_heads)) {
+      return std::nullopt;  // doesn't statically resolve -- decline
+    }
   }
   return HeadCountsMatch{num_heads, num_heads};
 }
@@ -5661,13 +5951,25 @@ std::optional<HeadCountsMatch> MatchPackedMultiHeadAttentionProducer(
 // **4** (not 5), `past_key`/`past_value` at **5/6** (not 6/7) -- genuinely
 // different positions from MultiHeadAttention's own, confirmed off both the
 // live schema dump and ONNX Runtime's own `replace_mha_with_dmmha` rewrite
-// (see pruning.py's own docstring) -- gated the same
-// decline-if-non-empty-constant way as MultiHeadAttention's own analogous
-// inputs, for the identical reason (no slicing machinery ported for either).
-// This op's own combined `bias` moves to index **10**, the last input (see
-// FindDecoderMaskedMhaChains below).
+// (see pruning.py's own docstring). Unlike MultiHeadAttention/
+// PackedMultiHeadAttention above (whose own analogous inputs still decline
+// the whole match outright whenever non-empty -- a documented, narrower-
+// than-pruning.py gap left for a follow-up), `attention_bias` gets the exact
+// constant-resolves-cleanly-or-is-declined treatment
+// pruning.py's own `_head_bias_input_is_safe` gives it (HeadBiasInputIsSafe,
+// this port's own existing decomposed-GQA machinery, reused outright here),
+// and `past_key`/`past_value` get the shared PastKvConstantsAreSliceable's own
+// identical BNSH-axis-1 treatment (no `scale_indices` -- this op's own
+// schema has no `k_scale`/`v_scale` inputs at all) -- ApplyOneGqaChain's own
+// `is_dmmha` branch performs the actual per-head slice(s)/Gather-insertion
+// of both once a match succeeds, mirroring pruning.py's own
+// `_apply_one_gqa_chain` exactly for this op (`mask_idx=4`,
+// `past_kv_indices=(5, 6)`). This op's own combined `bias` moves to index
+// **10**, the last input (see FindDecoderMaskedMhaChains below).
 std::optional<HeadCountsMatch> MatchDecoderMaskedMultiHeadAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& init_map) {
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   if (node.domain() != kComMicrosoftDomain ||
       node.op_type() != "DecoderMaskedMultiHeadAttention") {
     return std::nullopt;
@@ -5687,10 +5989,58 @@ std::optional<HeadCountsMatch> MatchDecoderMaskedMultiHeadAttentionProducer(
   if (!has_nh || num_heads <= 0) {
     return std::nullopt;
   }
-  if (!NoNonEmptyConstantAt(node, init_map, {4, 5, 6})) {
-    return std::nullopt;  // attention_bias, past_key, past_value
+  if (node.input_size() > 4 && !node.input(4).empty()) {  // attention_bias
+    if (!HeadBiasInputIsSafe(node, 4, init_map, value_info_by_name,
+                             num_heads)) {
+      return std::nullopt;  // doesn't statically resolve -- decline rather
+                            // than guess
+    }
+  }
+  if (!PastKvConstantsAreSliceable(node, init_map, {5, 6}, num_heads)) {
+    return std::nullopt;
   }
   return HeadCountsMatch{num_heads, num_heads};
+}
+
+// Safety gate for one of PagedAttention's own k_scale/v_scale inputs
+// (indices 14/15 -- *not* the same positions GroupQueryAttention's own
+// analogous inputs sit at, 12/13) -- mirrors pruning.py's own
+// `_paged_kv_scale_is_sliceable` exactly. Unlike GroupQueryAttention's own
+// k_scale/v_scale (PastKvConstantsAreSliceable's own `scale_indices` branch,
+// shape [1, kv_num_heads, 1, head_size] when "PER_CHANNEL" -- the KV axis at
+// position 1 of a rank-4 tensor), PagedAttention's own doc gives its
+// analogous inputs a *different* shape: rank 3, (kv_num_heads, 1,
+// head_size) when "PER_CHANNEL" -- the KV axis at position *0*, not 1. A
+// constant one is accepted here at either shape ("PER_TENSOR", a single
+// broadcast scalar needing no slicing at all, or "PER_CHANNEL", sliceable
+// along axis 0 by the same `keep_groups` index set used everywhere else in
+// this chain); declined for any other constant shape; left alone when
+// unconnected or dynamic.
+bool PagedKvScaleIsSliceable(const onnx::NodeProto& node,
+                             const InitMap& init_map, int idx,
+                             int64_t kv_num_heads) {
+  if (node.input_size() <= idx || node.input(idx).empty()) {
+    return true;  // unconnected -- nothing to check
+  }
+  auto scale_it = init_map.find(node.input(idx));
+  if (scale_it == init_map.end()) {
+    return true;  // dynamic -- the caller's own runtime data, left alone
+  }
+  const onnx::TensorProto& scale_init = *scale_it->second;
+  if (scale_init.data_type() != onnx::TensorProto::FLOAT) {
+    return false;  // not T_KV_SCALE's own float-only constraint
+  }
+  int64_t prod = 1;
+  for (int64_t d : scale_init.dims()) {
+    prod *= d;
+  }
+  if (prod == 1) {
+    return true;  // PER_TENSOR: a single broadcast scalar, nothing to slice
+  }
+  if (scale_init.dims_size() != 3 || scale_init.dims(0) != kv_num_heads) {
+    return false;  // not the PER_CHANNEL (kv_num_heads, 1, head_size) layout
+  }
+  return true;
 }
 
 // If `node` is a com.microsoft::PagedAttention node (kv_cache_layout ==
@@ -5706,17 +6056,38 @@ std::optional<HeadCountsMatch> MatchDecoderMaskedMultiHeadAttentionProducer(
 // declined outright whenever either resolves to a constant (this op's own
 // cache is "updated in place" by a real continuous-batching serving
 // harness -- a constant one is not a real export this pass has any
-// execution-verified story for, per pruning.py's own docstring).
+// execution-verified story for, per pruning.py's own docstring) -- a
+// *dynamic* one is always left alone and never sliced, the identical "no
+// analogue of PastKvConstantsAreSliceable's own slicing here" scope
+// pruning.py's own matcher documents (this op's own cache buffer is
+// "updated in place" by the serving harness, never a captured weight the
+// way GroupQueryAttention's own optional past_key/past_value legitimately
+// can be).
 //
-// Narrower than pruning.py's own matcher in one deliberate way: `head_sink`
-// (11), `q_norm_weight`/`k_norm_weight` (12/13), and `k_scale`/`v_scale`
-// (14/15) are none of them ever sliced by this port (no analogue of
-// pruning.py's own deferred-shape-check/slicing machinery for any of the
-// three), so a match here requires every one of them absent, rather than
-// risk a present-and-genuinely-per-head/per-KV-group one silently going
-// unsliced after `num_heads`/`kv_num_heads` shrink underneath it.
+// `head_sink` (index 11, documented shape (num_heads,)) is accepted here at
+// either a genuine (num_heads,) constant -- sliced by ApplyOneGqaChain's own
+// `is_paged` branch along its sole axis by `keep_q_heads`, bounded to
+// FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype) the same way
+// HeadBiasInputIsSafe already bounds its own per-head constant -- unlike
+// pruning.py's own dtype-agnostic acceptance of any constant dtype there;
+// this port's own SliceAxisGeneric, its apply-time rewrite for this case,
+// only handles those three encodings) -- or dynamic (left alone
+// unconditionally, no check at all, exactly mirroring pruning.py's own
+// `_match_paged_attention_producer`, which only ever inspects a *constant*
+// `head_sink`'s own shape). `q_norm_weight`/`k_norm_weight` (12/13) are
+// validated here only for the schema's own paired-presence rule ("must be
+// provided together") -- the deferred exact-(head_size,)-shape half of that
+// check, run once `head_size` is known, is FindSeparateQkvChains' own job
+// (its `qk_norm_weight_indices` parameter, which FindPagedAttentionChains
+// passes `(12, 13)`) -- neither is ever sliced (a (head_size,)-shaped tensor
+// never needs touching under whole-head/KV-group pruning), mirroring
+// pruning.py's own identical two-stage validation split exactly. `k_scale`/
+// `v_scale` (14/15) get PagedKvScaleIsSliceable's own treatment above.
 std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& init_map) {
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+    /*value_info_by_name*/
+    = {}) {
   if (node.domain() != kComMicrosoftDomain ||
       node.op_type() != "PagedAttention") {
     return std::nullopt;
@@ -5761,10 +6132,28 @@ std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
   if (init_map.count(node.input(3)) || init_map.count(node.input(4))) {
     return std::nullopt;  // constant key_cache/value_cache -- out of scope
   }
-  for (int idx : {11, 12, 13, 14, 15}) {  // head_sink, qk_norm, k/v_scale
-    if (node.input_size() > idx && !node.input(idx).empty()) {
-      return std::nullopt;
+  if (node.input_size() > 11 && !node.input(11).empty()) {  // head_sink
+    auto sink_it = init_map.find(node.input(11));
+    if (sink_it != init_map.end()) {
+      if (sink_it->second->dims_size() != 1 ||
+          sink_it->second->dims(0) != num_heads) {
+        return std::nullopt;  // not the schema's own (num_heads,) shape
+      }
+      if (!IsSupportedFloatDtype(sink_it->second->data_type())) {
+        return std::nullopt;  // SliceAxisGeneric-bounded dtype scope, see
+                              // this function's own comment above
+      }
     }
+    // else: dynamic -- left alone, no check at all (mirrors pruning.py)
+  }
+  const bool has_q_norm = node.input_size() > 12 && !node.input(12).empty();
+  const bool has_k_norm = node.input_size() > 13 && !node.input(13).empty();
+  if (has_q_norm != has_k_norm) {
+    return std::nullopt;  // schema: "must be provided together"
+  }
+  if (!PagedKvScaleIsSliceable(node, init_map, 14, kv_num_heads) ||
+      !PagedKvScaleIsSliceable(node, init_map, 15, kv_num_heads)) {
+    return std::nullopt;
   }
   return HeadCountsMatch{num_heads, kv_num_heads};
 }
@@ -5788,8 +6177,14 @@ std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
 // deferred decay/beta shape-classification logic pruning.py's own
 // matcher/finder pair uses -- gives up essentially nothing over the
 // realistic export shape while avoiding new, unverified slicing machinery.
+// `value_info_by_name` accepted (see MatchPagedAttentionProducer's own
+// comment) but ignored: this op has no attention_bias/attn_mask-equivalent
+// input on its own schema either.
 std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& /*init_map*/) {
+    const onnx::NodeProto& node, const InitMap& /*init_map*/,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+    /*value_info_by_name*/
+    = {}) {
   if (!node.domain().empty() || node.op_type() != "LinearAttention") {
     return std::nullopt;
   }
@@ -5838,8 +6233,14 @@ std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
 // `is_sparse_attention` branch); `total_sequence_length`/
 // `key_total_sequence_lengths` (7/8) required present (pure bookkeeping,
 // checked only for presence -- a genuinely incomplete node otherwise).
+// `value_info_by_name` accepted (see MatchPagedAttentionProducer's own
+// comment) but ignored: this op has no attention_bias/attn_mask-equivalent
+// input on its own schema either.
 std::optional<HeadCountsMatch> MatchSparseAttentionProducer(
-    const onnx::NodeProto& node, const InitMap& init_map) {
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+    /*value_info_by_name*/
+    = {}) {
   if (node.domain() != kComMicrosoftDomain ||
       node.op_type() != "SparseAttention") {
     return std::nullopt;
@@ -5911,12 +6312,28 @@ std::optional<HeadCountsMatch> MatchSparseAttentionProducer(
 // required equal to Q's/K's shared one, never pruning.py's own
 // `allow_differing_v_head_size=True` composition for the plain ai.onnx op/
 // MultiHeadAttention/PackedMultiHeadAttention/LinearAttention.
+// `value_info_by_name` is threaded straight through to every node's own
+// `match_producer(node, init_map, value_info_by_name)` call -- built the
+// same way every "Attention-head pruning" family entry point builds one
+// (ValueInfoByName) -- purely so a matcher whose own op owns a per-head
+// attention_bias/attn_mask input (MatchMultiHeadAttentionProducer/
+// MatchPackedMultiHeadAttentionProducer, currently -- see each one's own
+// comment for this port's own narrower, per-op-family scope) can classify a
+// *dynamic* one's declared shape (HeadBiasInputIsSafe); every other matcher
+// accepts and ignores it. Defaults to `{}` so every pre-existing call site
+// below that has no dynamic-mask handling of its own to feed stays
+// unchanged.
 std::vector<AttnChain> FindSeparateQkvChains(
     onnx::GraphProto* graph,
     const std::function<std::optional<HeadCountsMatch>(
-        const onnx::NodeProto&, const InitMap&)>& match_producer,
+        const onnx::NodeProto&, const InitMap&,
+        const std::unordered_map<std::string, const onnx::ValueInfoProto*>&)>&
+        match_producer,
     const std::string& num_heads_attr,
-    std::optional<int> combined_bias_input_index = std::nullopt) {
+    std::optional<int> combined_bias_input_index = std::nullopt,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {},
+    std::optional<std::pair<int, int>> qk_norm_weight_indices = std::nullopt) {
   InitMap init_map;
   for (const auto& t : graph->initializer()) {
     init_map[t.name()] = &t;
@@ -5940,7 +6357,7 @@ std::vector<AttnChain> FindSeparateQkvChains(
   std::vector<AttnChain> chains;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    auto info = match_producer(*node, init_map);
+    auto info = match_producer(*node, init_map, value_info_by_name);
     if (!info) {
       continue;
     }
@@ -5961,9 +6378,9 @@ std::vector<AttnChain> FindSeparateQkvChains(
         vit == node_by_output.end()) {
       continue;
     }
-    auto pq = MatchProducer(*qit->second, init_map);
-    auto pk = MatchProducer(*kit->second, init_map);
-    auto pv = MatchProducer(*vit->second, init_map);
+    auto pq = MatchProducerAnyFloat(*qit->second, init_map);
+    auto pk = MatchProducerAnyFloat(*kit->second, init_map);
+    auto pv = MatchProducerAnyFloat(*vit->second, init_map);
     if (!pq || !pk || !pv) {
       continue;
     }
@@ -5983,6 +6400,36 @@ std::vector<AttnChain> FindSeparateQkvChains(
       continue;
     }
 
+    // PagedAttention-only (see MatchPagedAttentionProducer's own comment):
+    // its own q_norm_weight/k_norm_weight, when connected, are only ever
+    // validated for paired presence at match time (head_size isn't known
+    // yet there) -- the deferred exact-(head_size,)-shape half of that check
+    // runs here, now that head_size is settled, mirroring pruning.py's own
+    // `_find_separate_qkv_chains` `qk_norm_weight_indices` branch exactly. A
+    // connected constant not exactly (head_size,)-shaped declines the whole
+    // match outright; a dynamic one (or an unconnected pair) needs no check
+    // at all here -- neither is ever sliced regardless (a (head_size,)-
+    // shaped tensor never needs touching under whole-head/KV-group pruning).
+    if (qk_norm_weight_indices) {
+      bool bad_norm_shape = false;
+      for (int norm_idx :
+           {qk_norm_weight_indices->first, qk_norm_weight_indices->second}) {
+        if (node->input_size() <= norm_idx || node->input(norm_idx).empty()) {
+          continue;
+        }
+        auto norm_it = init_map.find(node->input(norm_idx));
+        if (norm_it != init_map.end() &&
+            (norm_it->second->dims_size() != 1 ||
+             norm_it->second->dims(0) != head_size)) {
+          bad_norm_shape = true;
+          break;
+        }
+      }
+      if (bad_norm_shape) {
+        continue;
+      }
+    }
+
     // MultiHeadAttention/PackedMultiHeadAttention/
     // DecoderMaskedMultiHeadAttention-only: a combined `[nq + nk + nv]`
     // Q+K+V bias sitting on the matched node's own input at
@@ -5999,7 +6446,7 @@ std::vector<AttnChain> FindSeparateQkvChains(
         const std::string& bias_name = node->input(idx);
         auto bit = init_map.find(bias_name);
         if (bit == init_map.end() ||
-            bit->second->data_type() != onnx::TensorProto::FLOAT ||
+            !IsSupportedFloatDtype(bit->second->data_type()) ||
             bit->second->dims_size() != 1 ||
             bit->second->dims(0) !=
                 pq->n_channels + pk->n_channels + pv->n_channels) {
@@ -6047,49 +6494,99 @@ std::vector<AttnChain> FindSeparateQkvChains(
   return chains;
 }
 
-std::vector<AttnChain> FindGqaChains(onnx::GraphProto* graph) {
-  return FindSeparateQkvChains(graph, MatchGqaProducer, "num_heads");
+// `value_info_by_name` (defaulted to `{}` -- every pre-existing call site
+// this port had before this attention_bias/attn_mask fix stays source
+// compatible) is this graph's own AS-DECLARED input/output/value_info
+// (ValueInfoByName), threaded straight through FindSeparateQkvChains' own
+// uniform 3-argument `match_producer(node, init_map, value_info_by_name)`
+// call (see that function's own comment) down to MatchGqaProducer's own
+// HeadBiasInputIsSafe check for a dynamic `attention_bias` -- the same map
+// FindDecomposedGqaChains' own equivalent parameter already documents at its
+// own call sites for why no real shape-inference pass backs it.
+std::vector<AttnChain> FindGqaChains(
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
+  return FindSeparateQkvChains(graph, MatchGqaProducer, "num_heads",
+                               /*combined_bias_input_index=*/std::nullopt,
+                               value_info_by_name);
 }
 
-std::vector<AttnChain> FindOnnxAttentionChains(onnx::GraphProto* graph) {
-  return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer,
-                               "q_num_heads");
+// The plain ai.onnx::Attention analogue of FindGqaChains -- see that
+// function's own comment for why `value_info_by_name` is threaded straight
+// through.
+std::vector<AttnChain> FindOnnxAttentionChains(
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
+  return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer, "q_num_heads",
+                               /*combined_bias_input_index=*/std::nullopt,
+                               value_info_by_name);
 }
 
 // The com.microsoft::MultiHeadAttention analogue of FindGqaChains -- see
 // MatchMultiHeadAttentionProducer's own comment. `combined_bias_input_index
 // = 3`: this op's own `bias` input, the combined-Q/K/V-bias shape AttnChain's
-// own `mha_bias` field documents.
-std::vector<AttnChain> FindMhaChains(onnx::GraphProto* graph) {
+// own `mha_bias` field documents. `value_info_by_name` (defaulted to `{}`,
+// the same default FindSeparateQkvChains' own parameter of that name has) is
+// forwarded straight through to MatchMultiHeadAttentionProducer, so a
+// dynamic (non-constant) attention_bias's own declared shape can be
+// classified via HeadBiasInputIsSafe.
+std::vector<AttnChain> FindMhaChains(
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   return FindSeparateQkvChains(graph, MatchMultiHeadAttentionProducer,
-                               "num_heads", /*combined_bias_input_index=*/3);
+                               "num_heads", /*combined_bias_input_index=*/3,
+                               value_info_by_name);
 }
 
 // The com.microsoft::PackedMultiHeadAttention analogue of FindMhaChains --
 // see MatchPackedMultiHeadAttentionProducer's own comment.
 // `combined_bias_input_index = 3`: this op's own `bias` input sits at the
 // same index MultiHeadAttention's own does (unlike `attention_bias`, which
-// moves to 6).
-std::vector<AttnChain> FindPackedMhaChains(onnx::GraphProto* graph) {
+// moves to 6). `value_info_by_name` forwarded the same way FindMhaChains'
+// own is.
+std::vector<AttnChain> FindPackedMhaChains(
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   return FindSeparateQkvChains(graph, MatchPackedMultiHeadAttentionProducer,
-                               "num_heads", /*combined_bias_input_index=*/3);
+                               "num_heads", /*combined_bias_input_index=*/3,
+                               value_info_by_name);
 }
 
 // The com.microsoft::DecoderMaskedMultiHeadAttention analogue of
 // FindMhaChains -- see MatchDecoderMaskedMultiHeadAttentionProducer's own
 // comment. `combined_bias_input_index = 10`: this op's own `bias` input,
 // moved to the *last* position (not index 3, MultiHeadAttention's own).
-std::vector<AttnChain> FindDecoderMaskedMhaChains(onnx::GraphProto* graph) {
-  return FindSeparateQkvChains(graph,
-                               MatchDecoderMaskedMultiHeadAttentionProducer,
-                               "num_heads", /*combined_bias_input_index=*/10);
+// `value_info_by_name`, defaulted to `{}` (see FindAttentionChains' own
+// analogous default's own reasoning), is threaded straight through to
+// MatchDecoderMaskedMultiHeadAttentionProducer's own
+// `match_producer(node, init_map, value_info_by_name)` call -- the one
+// matcher in this family whose own per-head `attention_bias` input needs it,
+// to classify a *dynamic* one's declared shape (HeadBiasInputIsSafe).
+std::vector<AttnChain> FindDecoderMaskedMhaChains(
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
+  return FindSeparateQkvChains(
+      graph, MatchDecoderMaskedMultiHeadAttentionProducer, "num_heads",
+      /*combined_bias_input_index=*/10, value_info_by_name);
 }
 
 // The com.microsoft::PagedAttention analogue of FindGqaChains -- see
 // MatchPagedAttentionProducer's own comment. No combined bias input on this
-// op's own schema.
+// op's own schema (this op has no attention_bias/attn_mask-equivalent input
+// at all). `qk_norm_weight_indices=(12, 13)` -- this op's own
+// q_norm_weight/k_norm_weight input indices -- mirrors pruning.py's own
+// `_find_paged_attention_chains`, which passes the identical pair for the
+// identical deferred exact-(head_size,)-shape check (see
+// FindSeparateQkvChains' own comment on that branch).
 std::vector<AttnChain> FindPagedAttentionChains(onnx::GraphProto* graph) {
-  return FindSeparateQkvChains(graph, MatchPagedAttentionProducer, "num_heads");
+  return FindSeparateQkvChains(graph, MatchPagedAttentionProducer, "num_heads",
+                               /*combined_bias_input_index=*/std::nullopt, {},
+                               std::make_pair(12, 13));
 }
 
 // The plain ai.onnx::LinearAttention analogue of FindGqaChains -- see
@@ -6163,7 +6660,12 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
   onnx::TensorProto* w_init = init_map.at(chain.weight);
   const int64_t K = w_init->dims(0);
   const int64_t total_n = w_init->dims(1);
-  std::vector<float> w = ReadFloatTensor(*w_init);  // [K, total_n] row-major.
+  // ReadTensorAsF64 (not ReadFloatTensor) -- FLOAT/FLOAT16/BFLOAT16 alike,
+  // upcast to double, mirroring pruning.py's own `_to_f64`, for the
+  // importance ranking below only: the actual slice further down
+  // (SliceAxisGeneric) reads/writes this same tensor completely
+  // independently, with its own dtype-preserving round trip.
+  std::vector<double> w = ReadTensorAsF64(*w_init);  // [K, total_n] row-major.
 
   // Combined importance of each head's full Q+K+V weight block -- for L2
   // that's the block's own Frobenius norm (sqrt of the sum of every entry
@@ -6230,11 +6732,20 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
   all_idx.insert(all_idx.end(), k_idx.begin(), k_idx.end());
   all_idx.insert(all_idx.end(), v_idx.begin(), v_idx.end());
 
-  std::vector<float> sliced_w = SliceAxis1(w, K, total_n, 1, all_idx);
-  SetFloatTensorData(w_init, {K, static_cast<int64_t>(all_idx.size())},
-                     sliced_w);
+  // SliceAxisGeneric (axis 1 -- the merged QKV weight's own column/head
+  // axis) rather than a manual SliceAxis1 + WriteF64TensorAs pair: reuses
+  // this file's own pre-existing MoE/QMoE-section ReadTensorAsF64/
+  // WriteF64TensorAs machinery in one call, preserving `w_init`'s own
+  // original dtype.
+  SliceAxisGeneric(w_init, all_idx, 1);
   if (chain.bias) {
-    SliceLastAxis(init_map.at(*chain.bias), all_idx);
+    // SliceAxisGeneric (axis 0 -- this bias' own only axis, always the last
+    // one) rather than the shared, FLOAT32-only SliceLastAxis: reuses this
+    // file's own pre-existing MoE/QMoE-section ReadTensorAsF64/
+    // WriteF64TensorAs machinery, mirroring pruning.py's own dtype-agnostic
+    // `_slice_last_axis` (`onnx.numpy_helper.to_array`/`from_array` handle
+    // any dtype).
+    SliceAxisGeneric(init_map.at(*chain.bias), all_idx, 0);
   }
 
   bool found_qkv = false;
@@ -6249,7 +6760,16 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
       attr.add_ints(keep_count * dv);
     }
   }
-  if (!found_qkv) {
+  // `DecoderMaskedSelfAttention` has no `qkv_hidden_sizes` attribute on its
+  // own schema at all (see MatchAttentionProducer's own comment) --
+  // `dq == dk == dv` is guaranteed for it (the matcher only ever accepts its
+  // own always-even 3-way split), so `keep_count * dq == keep_count * dk ==
+  // keep_count * dv` remains true after pruning too, and the kernel's own
+  // even-split default reproduces the right shape with no attribute needed.
+  // Writing one anyway would just be a dead, schema-unrecognized attribute on
+  // the node -- harmless but pointless. Mirrors pruning.py's own
+  // `_apply_one_plain_attention_chain` exactly.
+  if (!found_qkv && chain.node->op_type() != "DecoderMaskedSelfAttention") {
     onnx::AttributeProto* attr = chain.node->add_attribute();
     attr->set_name("qkv_hidden_sizes");
     attr->set_type(onnx::AttributeProto::INTS);
@@ -6258,8 +6778,12 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
     attr->add_ints(keep_count * dv);
   }
 
-  SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                      chain.consumer_weight_transposed, v_idx_local, false);
+  // SliceAxisGeneric (axis = transposed ? 1 : 0 -- the reduction/input-
+  // channel axis of a plain 2-D MatMul/Gemm consumer weight, never a Conv
+  // here) rather than the shared, FLOAT32-only SliceConsumerWeight -- see
+  // this function's own `w`/`chain.bias` comments above for why.
+  SliceAxisGeneric(init_map.at(chain.consumer_weight), v_idx_local,
+                   chain.consumer_weight_transposed ? 1 : 0);
 
   for (const auto& co : chain.chain_ops) {
     if (co.shape_name) {
@@ -6298,12 +6822,15 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
 // was observed. `nullptr` (the default) keeps this identically the plain
 // ``||W||_F``-only ranking it always was.
 std::optional<AppliedAttn> ApplyOneGqaChain(
+    onnx::GraphProto* graph,
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
-    AttnChain& chain, double sparsity,
+    std::unordered_set<std::string>& used_names, AttnChain& chain,
+    double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8,
-    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
+    double epsilon = 1e-8, ImportanceNorm importance_norm = ImportanceNorm::kL2,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -6373,9 +6900,16 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
                                      wk_init->dims().end());
   const std::vector<int64_t> wv_dims(wv_init->dims().begin(),
                                      wv_init->dims().end());
-  std::vector<float> wq = ReadFloatTensor(*wq_init);
-  std::vector<float> wk = ReadFloatTensor(*wk_init);
-  std::vector<float> wv = ReadFloatTensor(*wv_init);
+  // ReadTensorAsF64 (not ReadFloatTensor) -- FLOAT/FLOAT16/BFLOAT16 alike,
+  // upcast to double, for the importance ranking below only: the actual
+  // producer-weight slicing further down reads/writes each tensor completely
+  // independently (SliceAxisGeneric, its own dtype-preserving round trip), so
+  // no dtype needs tracking here. See ApplyOnePlainAttentionChain's own
+  // identical comment for why this round trip never rounds a surviving
+  // entry's own bit pattern.
+  std::vector<double> wq = ReadTensorAsF64(*wq_init);
+  std::vector<double> wk = ReadTensorAsF64(*wk_init);
+  std::vector<double> wv = ReadTensorAsF64(*wv_init);
 
   // Bring each to [K, N] (reduction dim first, head columns last) -- the
   // *opposite* of SliceProducerWeight's "output channel first" convention,
@@ -6384,15 +6918,15 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   const int64_t Nq = wq_dims[chain.q_weight_transposed ? 0 : 1];
   const int64_t Nk = wk_dims[chain.k_weight_transposed ? 0 : 1];
   const int64_t Nv = wv_dims[chain.v_weight_transposed ? 0 : 1];
-  std::vector<float> wq_kn = chain.q_weight_transposed
-                                 ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
-                                 : wq;
-  std::vector<float> wk_kn = chain.k_weight_transposed
-                                 ? TransposeFlat(wk, wk_dims[0], wk_dims[1])
-                                 : wk;
-  std::vector<float> wv_kn = chain.v_weight_transposed
-                                 ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
-                                 : wv;
+  std::vector<double> wq_kn = chain.q_weight_transposed
+                                  ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
+                                  : wq;
+  std::vector<double> wk_kn = chain.k_weight_transposed
+                                  ? TransposeFlat(wk, wk_dims[0], wk_dims[1])
+                                  : wk;
+  std::vector<double> wv_kn = chain.v_weight_transposed
+                                  ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
+                                  : wv;
 
   // Importance: per-*query*-head (true MQA -- mirrors pruning.py's own
   // `_gqa_query_head_importance`, ranking each query head by its own Q
@@ -6506,17 +7040,21 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   std::vector<int64_t> q_idx = HeadColumnIndices(keep_q_heads, d);
   std::vector<int64_t> kv_idx = HeadColumnIndices(keep_groups, d);
 
-  SliceProducerWeight(wq_init, chain.q_weight_transposed, q_idx, false);
-  SliceProducerWeight(wk_init, chain.k_weight_transposed, kv_idx, false);
-  SliceProducerWeight(wv_init, chain.v_weight_transposed, kv_idx, false);
+  // SliceAxisGeneric (axis = transposed ? 0 : 1 -- the output-channel/head
+  // axis of a plain 2-D MatMul/Gemm producer weight, never a Conv here)
+  // rather than the shared, FLOAT32-only SliceProducerWeight -- see this
+  // function's own `wq`/`wk`/`wv` comment above for why.
+  SliceAxisGeneric(wq_init, q_idx, chain.q_weight_transposed ? 0 : 1);
+  SliceAxisGeneric(wk_init, kv_idx, chain.k_weight_transposed ? 0 : 1);
+  SliceAxisGeneric(wv_init, kv_idx, chain.v_weight_transposed ? 0 : 1);
   if (chain.q_bias) {
-    SliceLastAxis(init_map.at(*chain.q_bias), q_idx);
+    SliceAxisGeneric(init_map.at(*chain.q_bias), q_idx, 0);
   }
   if (chain.k_bias) {
-    SliceLastAxis(init_map.at(*chain.k_bias), kv_idx);
+    SliceAxisGeneric(init_map.at(*chain.k_bias), kv_idx, 0);
   }
   if (chain.v_bias) {
-    SliceLastAxis(init_map.at(*chain.v_bias), kv_idx);
+    SliceAxisGeneric(init_map.at(*chain.v_bias), kv_idx, 0);
   }
 
   // MultiHeadAttention/PackedMultiHeadAttention/
@@ -6543,7 +7081,119 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     for (int64_t x : kv_idx) {
       full_bias_idx.push_back(x + nq_orig + nk_orig);
     }
-    SliceLastAxis(init_map.at(*chain.mha_bias), full_bias_idx);
+    SliceAxisGeneric(init_map.at(*chain.mha_bias), full_bias_idx, 0);
+  }
+
+  // MultiHeadAttention/PackedMultiHeadAttention-only: their own optional
+  // `attention_bias` input (index 5 for MultiHeadAttention, 6 for
+  // PackedMultiHeadAttention -- see MatchMultiHeadAttentionProducer's/
+  // MatchPackedMultiHeadAttentionProducer's own docstrings), already
+  // confirmed at match time (HeadBiasInputIsSafe) to resolve cleanly one way
+  // or another, is handled by SliceOrGatherHeadBias along its own head axis
+  // by `keep_q_heads` -- *query*-head granularity (this input is added
+  // against Q*K' scores, laid out per query head) -- mirrors pruning.py's
+  // own `_apply_one_gqa_chain` handling of its `mask_idx` exactly. Every
+  // other chain kind this shared function also applies (GQA/plain
+  // ai.onnx::Attention/DecoderMaskedMultiHeadAttention/PagedAttention/
+  // LinearAttention/SparseAttention) has no analogous per-op `mask_idx` here
+  // yet -- a separate, pre-existing, out-of-scope gap (see this file's own
+  // "Attention-head pruning" section comment for scope); left completely
+  // untouched for those, exactly as before.
+  const bool is_mha = chain.node->domain() == kComMicrosoftDomain &&
+                      chain.node->op_type() == "MultiHeadAttention";
+  const bool is_packed_mha =
+      chain.node->domain() == kComMicrosoftDomain &&
+      chain.node->op_type() == "PackedMultiHeadAttention";
+  std::optional<int> mha_mask_idx;
+  if (is_mha) {
+    mha_mask_idx = 5;
+  } else if (is_packed_mha) {
+    mha_mask_idx = 6;
+  }
+  if (mha_mask_idx) {
+    SliceOrGatherHeadBias(chain.node, *mha_mask_idx, init_map, chain.num_heads,
+                          keep_q_heads, graph, used_names, value_info_by_name);
+  }
+
+  // MultiHeadAttention-only: its own optional `past_key`/`past_value`
+  // (indices 6/7), already confirmed at match time
+  // (PastKvConstantsAreSliceable) to be either absent/dynamic (nothing to do
+  // here) or a BNSH-format FLOAT/FLOAT16/BFLOAT16 constant, is sliced along
+  // its own `kv_num_heads` axis (axis 1) by `keep_groups` -- the same axis
+  // K's/V's own producer weight is sliced by -- mirrors pruning.py's own
+  // `_apply_one_gqa_chain` handling of its `past_kv_indices` exactly.
+  // PackedMultiHeadAttention has no `past_key`/`past_value` inputs at all on
+  // its own schema (packing mode is an encoder-only, non-incremental-decode
+  // optimization), so this is skipped for it outright.
+  if (is_mha) {
+    for (int idx : {6, 7}) {
+      if (chain.node->input_size() <= idx || chain.node->input(idx).empty()) {
+        continue;
+      }
+      auto past_it = init_map.find(chain.node->input(idx));
+      if (past_it != init_map.end()) {
+        SliceAxisGeneric(past_it->second, keep_groups, 1);
+      }
+    }
+  }
+
+  // DecoderMaskedMultiHeadAttention-only: attention_bias (index 4) and
+  // past_key/past_value (indices 5/6) -- mirrors pruning.py's own
+  // `_apply_one_gqa_chain` `is_dmmha` branch (`mask_idx=4`,
+  // `past_kv_indices=(5, 6)`) exactly. `graph`/`used_names` (both required,
+  // non-null references -- every ApplyAttentionChains call site provides
+  // them) feed SliceOrGatherHeadBias's own dynamic-Gather-insertion path,
+  // reached whenever MatchDecoderMaskedMultiHeadAttentionProducer's own
+  // match-time check already confirmed `attention_bias` resolves cleanly
+  // that way.
+  const bool is_dmmha =
+      chain.node->domain() == kComMicrosoftDomain &&
+      chain.node->op_type() == "DecoderMaskedMultiHeadAttention";
+  if (is_dmmha) {
+    SliceOrGatherHeadBias(chain.node, 4, init_map, chain.num_heads,
+                          keep_q_heads, graph, used_names, value_info_by_name);
+    for (int idx : {5, 6}) {  // past_key, past_value
+      if (chain.node->input_size() <= idx || chain.node->input(idx).empty()) {
+        continue;
+      }
+      auto past_it = init_map.find(chain.node->input(idx));
+      if (past_it != init_map.end()) {
+        SliceAxisGeneric(past_it->second, keep_groups, 1);
+      }
+    }
+  }
+
+  // PagedAttention-only: head_sink (index 11, sliced by `keep_q_heads` along
+  // its own sole axis, no head_size expansion needed) and k_scale/v_scale
+  // (indices 14/15, PER_CHANNEL only -- a PER_TENSOR broadcast scalar needs
+  // no slicing at all -- sliced along axis *0*, not axis 1, by
+  // `keep_groups`) -- mirrors pruning.py's own `_apply_one_gqa_chain`
+  // `is_paged` branch exactly (see MatchPagedAttentionProducer's own comment
+  // for why these positions/shapes differ from GroupQueryAttention's own
+  // analogous inputs).
+  const bool is_paged = chain.node->domain() == kComMicrosoftDomain &&
+                        chain.node->op_type() == "PagedAttention";
+  if (is_paged) {
+    if (chain.node->input_size() > 11 && !chain.node->input(11).empty()) {
+      auto sink_it = init_map.find(chain.node->input(11));
+      if (sink_it != init_map.end()) {
+        SliceAxisGeneric(sink_it->second, keep_q_heads, 0);
+      }
+    }
+    for (int idx : {14, 15}) {  // k_scale, v_scale
+      if (chain.node->input_size() <= idx || chain.node->input(idx).empty()) {
+        continue;
+      }
+      auto scale_it = init_map.find(chain.node->input(idx));
+      if (scale_it == init_map.end()) {
+        continue;  // dynamic -- caller's own runtime data, left alone
+      }
+      if (scale_it->second->dims_size() == 3 &&
+          scale_it->second->dims(0) == h) {
+        SliceAxisGeneric(scale_it->second, keep_groups, 0);
+      }
+      // else: PER_TENSOR broadcast scalar -- no per-head axis to slice
+    }
   }
 
   const int64_t new_kv_num_heads = keep_count;
@@ -6563,12 +7213,92 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     }
   }
 
-  SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                      chain.consumer_weight_transposed, q_idx, false);
+  SliceAxisGeneric(init_map.at(chain.consumer_weight), q_idx,
+                   chain.consumer_weight_transposed ? 1 : 0);
 
   for (const auto& co : chain.chain_ops) {
     if (co.shape_name) {
       SetInt64TensorLastDim(init_map.at(*co.shape_name), new_num_heads * d);
+    }
+  }
+
+  // GroupQueryAttention/plain ai.onnx::Attention-only: past_key/past_value,
+  // k_scale/v_scale, attention_bias/attn_mask, and head_sink, each already
+  // confirmed at match time (MatchGqaProducer/MatchOnnxAttentionProducer, via
+  // PastKvConstantsAreSliceable/HeadBiasInputIsSafe) to be either absent/
+  // dynamic-and-left-alone, a provable broadcast needing no slicing, or a
+  // constant safe to slice -- mirrors pruning.py's own `_apply_one_gqa_chain`
+  // handling of these same four roles, scoped here to just these two op
+  // kinds (this port's own extended scope for this fix; every other chain
+  // kind sharing this function -- MultiHeadAttention/PackedMultiHeadAttention/
+  // DecoderMaskedMultiHeadAttention/PagedAttention/LinearAttention/
+  // SparseAttention -- keeps its own pre-existing, narrower-than-pruning.py
+  // scope untouched, per this file's own "Attention-head pruning" section
+  // comment).
+  const bool is_gqa = chain.node->domain() == kComMicrosoftDomain &&
+                      chain.node->op_type() == "GroupQueryAttention";
+  const bool is_onnx_attention =
+      chain.node->domain().empty() && chain.node->op_type() == "Attention";
+
+  if (is_gqa || is_onnx_attention) {
+    // past_key/past_value -- GroupQueryAttention's own at indices 3/4, the
+    // plain ai.onnx op's own at 4/5 -- sliced along axis 1 by the identical
+    // `keep_groups` K's/V's own producer weights are sliced by.
+    const int pk_idx = is_gqa ? 3 : 4;
+    const int pv_idx = is_gqa ? 4 : 5;
+    for (int idx : {pk_idx, pv_idx}) {
+      if (chain.node->input_size() <= idx || chain.node->input(idx).empty()) {
+        continue;
+      }
+      auto it = init_map.find(chain.node->input(idx));
+      if (it != init_map.end()) {
+        SliceKvCacheAxis1(it->second, keep_groups);
+      }
+    }
+  }
+
+  if (is_gqa) {
+    // k_scale/v_scale (indices 12/13, GroupQueryAttention-only -- the plain
+    // ai.onnx op's schema has no such inputs): a PER_CHANNEL
+    // [1, kv_num_heads, 1, head_size] float constant is sliced along axis 1
+    // the identical way; a PER_TENSOR scalar broadcast has no per-head axis
+    // and is left exactly as-is.
+    for (int idx : {12, 13}) {
+      if (chain.node->input_size() <= idx || chain.node->input(idx).empty()) {
+        continue;
+      }
+      auto it = init_map.find(chain.node->input(idx));
+      if (it == init_map.end()) {
+        continue;  // Dynamic -- the caller's own runtime data, left alone.
+      }
+      if (it->second->dims_size() == 4 && it->second->dims(1) == h) {
+        SliceAxisGeneric(it->second, keep_groups, 1);
+      }
+      // else: PER_TENSOR broadcast scalar -- no per-head axis to slice.
+    }
+  }
+
+  // attention_bias/attn_mask -- GroupQueryAttention's own at index 10, the
+  // plain ai.onnx op's own at index 3 -- handled by SliceOrGatherHeadBias
+  // along its own head axis by `keep_q_heads` (query-head granularity, not
+  // `keep_groups`' KV-group one: this input is added against Q*K' scores,
+  // laid out per query head).
+  const int gqa_mask_idx = is_gqa ? 10 : is_onnx_attention ? 3 : -1;
+  if (gqa_mask_idx >= 0) {
+    SliceOrGatherHeadBias(chain.node, gqa_mask_idx, init_map, chain.num_heads,
+                          keep_q_heads, graph, used_names, value_info_by_name);
+  }
+
+  // head_sink (index 11, GroupQueryAttention-only -- the plain ai.onnx op has
+  // no analogous input): a genuine (num_heads,) one-scalar-per-query-head
+  // constant, already confirmed at match time to be exactly that shape (and
+  // a FLOAT/FLOAT16/BFLOAT16 dtype) -- sliced directly by `keep_q_heads`, no
+  // head_size expansion needed.
+  if (is_gqa && chain.node->input_size() > 11 &&
+      !chain.node->input(11).empty()) {
+    auto it = init_map.find(chain.node->input(11));
+    if (it != init_map.end()) {
+      SliceAxisGeneric(it->second, keep_q_heads, 0);
     }
   }
 
@@ -6589,17 +7319,31 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
 // ApplyAttentionHeadPruning call site is unchanged, are threaded straight
 // through to both -- see either's own doc comment for what they do; this
 // dispatcher itself has no importance computation of its own to touch.
+// `value_info_by_name` (defaulted to `{}`, likewise source-compatible with
+// every pre-existing call site; unused by ApplyOnePlainAttentionChain, which
+// has no dynamic-mask machinery of its own -- see this section's own top
+// comment for that still-open, out-of-scope gap) is threaded straight through
+// to ApplyOneGqaChain's own attention_bias/attn_mask/MultiHeadAttention-
+// mask_idx handling -- see that function's own comment. `used_names`
+// (ExistingGraphNames -- mirrors pruning.py's own `_existing_graph_names`,
+// computed once here rather than once per chain) seeds the same used-name set
+// a dynamic attention_bias/attn_mask's own freshly-inserted Gather node/
+// indices initializer (InsertDynamicHeadBiasGather, reached transitively via
+// SliceOrGatherHeadBias) mints unique names from -- mirrors
+// ApplyDecomposedGqaChains' own identical `used_names` bookkeeping.
 void ApplyAttentionChains(
     onnx::GraphProto* graph, std::vector<AttnChain>& chains, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8,
-    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
+    double epsilon = 1e-8, ImportanceNorm importance_norm = ImportanceNorm::kL2,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name = {}) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
     init_map[t->name()] = t;
   }
+  std::unordered_set<std::string> used_names = ExistingGraphNames(*graph);
   std::unordered_set<std::string> producer_touched, consumer_touched,
       stale_value_info;
 
@@ -6622,8 +7366,9 @@ void ApplyAttentionChains(
 
     std::optional<AppliedAttn> applied =
         chain.kind == AttnChainKind::kGqaLike
-            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon,
-                               importance_norm)
+            ? ApplyOneGqaChain(graph, init_map, used_names, chain, sparsity,
+                               act_norm, epsilon, importance_norm,
+                               value_info_by_name)
             : ApplyOnePlainAttentionChain(init_map, chain, sparsity, act_norm,
                                           epsilon, importance_norm);
     if (!applied) {
@@ -10772,11 +11517,21 @@ void ApplyMatMulNBitsQkvChains(onnx::GraphProto* graph,
 
     const bool is_gqa = chain.attn_node->domain() == kComMicrosoftDomain &&
                         chain.attn_node->op_type() == "GroupQueryAttention";
-    // Constant past_key/past_value -- guaranteed EMPTY (product-of-dims-0)
-    // by MatchGqaProducer's own existing precondition whenever they're a
-    // constant at all, so this is purely a dim-count metadata fix, never a
-    // real data copy of any live cache values. Mirrors pruning.py's own
-    // identical `past_kv_indices` handling.
+    // Constant past_key/past_value -- guaranteed either EMPTY
+    // (product-of-dims-0) or a safely-sliceable BNSH-format cache (plain
+    // FLOAT/FLOAT16/BFLOAT16, or -- GQA only -- quantized with a
+    // schema-conforming k_scale/v_scale) by MatchGqaProducer's/
+    // MatchOnnxAttentionProducer's own existing precondition
+    // (PastKvConstantsAreSliceable) whenever they're a constant at all --
+    // sliced via SliceKvCacheAxis1 (the same dtype-dispatched helper
+    // ApplyOneGqaChain's own identical past_key/past_value handling uses),
+    // never a plain FLOAT-only slice: this dtype breadth was widened
+    // alongside MatchGqaProducer's/MatchOnnxAttentionProducer's own
+    // acceptance of a genuinely non-empty (not just guaranteed-empty) cache,
+    // so a FLOAT16/BFLOAT16 or quantized non-empty one reaching this apply
+    // function needs the identical real slice a FLOAT one does, not just a
+    // dim-count metadata fix. Mirrors pruning.py's own identical
+    // `past_kv_indices` handling.
     for (int idx :
          (is_gqa ? std::array<int, 2>{3, 4} : std::array<int, 2>{4, 5})) {
       if (chain.attn_node->input_size() <= idx ||
@@ -10784,14 +11539,16 @@ void ApplyMatMulNBitsQkvChains(onnx::GraphProto* graph,
         continue;
       }
       auto it = init_map.find(chain.attn_node->input(idx));
-      if (it != init_map.end() &&
-          it->second->data_type() == onnx::TensorProto::FLOAT) {
-        SliceFloatTensorAxis1(it->second, keep_groups);
+      if (it != init_map.end()) {
+        SliceKvCacheAxis1(it->second, keep_groups);
       }
     }
     // GQA's own `k_scale`/`v_scale` (indices 12/13), constant, per-KV-head
     // shaped `[.., kv_num_heads, .., 1]` -- mirrors pruning.py's own
-    // identical shape check.
+    // identical shape check. T_KV_SCALE is FLOAT-only per the schema (and
+    // PastKvConstantsAreSliceable's own match-time check already declined
+    // any other dtype), so this one stays a strict-FLOAT SliceAxisGeneric
+    // call, unlike the cache tensor itself just above.
     if (is_gqa) {
       for (int idx : {12, 13}) {
         if (chain.attn_node->input_size() <= idx ||
@@ -10804,7 +11561,7 @@ void ApplyMatMulNBitsQkvChains(onnx::GraphProto* graph,
           continue;
         }
         if (it->second->dims_size() == 4 && it->second->dims(1) == h) {
-          SliceFloatTensorAxis1(it->second, keep_groups);
+          SliceAxisGeneric(it->second, keep_groups, 1);
         }
       }
     }
@@ -23527,7 +24284,7 @@ std::optional<PackedQkvSplitMatch> MatchPackedQkvSplit(
   if (pit == node_by_output.end()) {
     return std::nullopt;
   }
-  auto pinfo = MatchProducer(*pit->second, init_map);
+  auto pinfo = MatchProducerAnyFloat(*pit->second, init_map);
   if (!pinfo || pinfo->n_channels != nq + nk + nv) {
     return std::nullopt;
   }
@@ -23949,6 +24706,140 @@ bool HeadBiasInputIsSafe(
     return true;
   }
   return DynamicHeadBiasAxis(name, value_info_by_name, num_heads).has_value();
+}
+
+// Quantized past_key/past_value cache dtypes (float8e4m3fn/uint8/int8) --
+// mirrors pruning.py's own `_QUANTIZED_KV_CACHE_DTYPES` exactly (confirmed
+// directly off the installed onnxruntime package's schema registry;
+// float16/bfloat16, T_CACHE's other two members, are not quantized dtypes
+// and stay handled by the plain IsSupportedFloatDtype branch below, same as
+// before this set existed).
+const std::unordered_set<int32_t> kQuantizedKvCacheDtypes = {
+    onnx::TensorProto::UINT8, onnx::TensorProto::INT8,
+    onnx::TensorProto::FLOAT8E4M3FN};
+
+// Forward-declared above (see that declaration's own comment for why) --
+// mirrors pruning.py's own `_past_kv_constants_are_sliceable` exactly (see
+// that function's own docstring for the full BNSH-layout/quantized-cache
+// reasoning this reproduces).
+bool PastKvConstantsAreSliceable(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    std::pair<int, int> indices, int64_t kv_num_heads,
+    std::optional<std::pair<int, int>> scale_indices) {
+  const int idxs[2] = {indices.first, indices.second};
+  const int scale_idxs[2] = {scale_indices ? scale_indices->first : -1,
+                             scale_indices ? scale_indices->second : -1};
+  for (int i = 0; i < 2; ++i) {
+    const int idx = idxs[i];
+    if (node.input_size() <= idx || node.input(idx).empty()) {
+      continue;
+    }
+    auto past_it = init_map.find(node.input(idx));
+    if (past_it == init_map.end()) {
+      continue;  // dynamic -- the caller's own runtime data, left alone
+    }
+    const onnx::TensorProto* past_init = past_it->second;
+    if (past_init->dims_size() != 4 || past_init->dims(1) != kv_num_heads) {
+      return false;  // not a shape this function can safely slice
+    }
+    if (IsSupportedFloatDtype(past_init->data_type())) {
+      continue;  // unquantized cache -- nothing else to check
+    }
+    const int scale_idx = scale_idxs[i];
+    if (scale_idx < 0 ||
+        !kQuantizedKvCacheDtypes.count(past_init->data_type())) {
+      return false;  // quantized dtype with nowhere to locate its scale
+    }
+    if (node.input_size() <= scale_idx || node.input(scale_idx).empty()) {
+      return false;  // quantized cache with no k_scale/v_scale connected
+    }
+    auto scale_it = init_map.find(node.input(scale_idx));
+    if (scale_it == init_map.end()) {
+      continue;  // dynamic scale -- the caller's own runtime data
+    }
+    const onnx::TensorProto* scale_init = scale_it->second;
+    if (scale_init->data_type() != onnx::TensorProto::FLOAT) {
+      return false;  // not T_KV_SCALE's own float-only constraint
+    }
+    int64_t prod = 1;
+    for (int64_t d : scale_init->dims()) {
+      prod *= d;
+    }
+    if (prod == 1) {
+      continue;  // PER_TENSOR: a single broadcast scalar, nothing to slice
+    }
+    if (scale_init->dims_size() != 4 || scale_init->dims(1) != kv_num_heads) {
+      return false;  // not the PER_CHANNEL [1, kv_num_heads, 1, head_size]
+                     // layout
+    }
+  }
+  return true;
+}
+
+// Forward-declared above (see that declaration's own comment for why) --
+// slices a rank-4 BNSH-format `past_key`/`past_value`/PER_CHANNEL
+// `k_scale`/`v_scale` constant `t` along axis 1 (its own kv_num_heads axis)
+// by `keep`, preserving `t`'s own original dtype -- mirrors pruning.py's own
+// dtype-agnostic `_slice_axis(t, keep, axis=1)` used for these tensors (see
+// PastKvConstantsAreSliceable's own docstring above). FLOAT/FLOAT16/BFLOAT16
+// (IsSupportedFloatDtype) reuse SliceAxisGeneric's own dtype-preserving
+// double round trip (defined just below, forward-declared at the top of this
+// file for the same reason). UINT8/INT8/FLOAT8E4M3FN
+// (GroupQueryAttention's own T_CACHE quantized-cache dtypes -- the only
+// caller that can ever reach this branch, via its own `scale_indices`) are
+// single-byte encodings with no numeric meaning to round-trip through
+// double, so they get a plain raw-byte index-select instead -- ReadUint8Tensor
+// already reads any of the three "regardless of the dtype tag" (that
+// function's own comment); INT8 has no dedicated Set*TensorData helper
+// elsewhere in this file (unlike UINT8/FLOAT8E4M3FN), so this function keeps
+// its own inline raw_data write for that one case.
+void SliceKvCacheAxis1(onnx::TensorProto* t, const std::vector<int64_t>& keep) {
+  if (IsSupportedFloatDtype(t->data_type())) {
+    SliceAxisGeneric(t, keep, 1);
+    return;
+  }
+  const std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  int64_t inner = 1;
+  for (size_t i = 2; i < dims.size(); ++i) {
+    inner *= dims[i];
+  }
+  const int64_t axis_len = dims[1];
+  const std::vector<uint8_t> data = ReadUint8Tensor(*t);
+  std::vector<uint8_t> out;
+  out.reserve(static_cast<size_t>(dims[0]) * keep.size() *
+              static_cast<size_t>(inner));
+  for (int64_t o = 0; o < dims[0]; ++o) {
+    for (int64_t k : keep) {
+      const int64_t base = (o * axis_len + k) * inner;
+      out.insert(out.end(), data.begin() + base, data.begin() + base + inner);
+    }
+  }
+  std::vector<int64_t> new_dims = dims;
+  new_dims[1] = static_cast<int64_t>(keep.size());
+  switch (t->data_type()) {
+    case onnx::TensorProto::UINT8:
+      SetUint8TensorData(t, new_dims, out);
+      return;
+    case onnx::TensorProto::FLOAT8E4M3FN:
+      SetFloat8E4M3TensorData(t, new_dims, out);
+      return;
+    case onnx::TensorProto::INT8: {
+      const std::string name = t->name();
+      t->Clear();
+      t->set_name(name);
+      t->set_data_type(onnx::TensorProto::INT8);
+      for (int64_t d : new_dims) {
+        t->add_dims(d);
+      }
+      t->set_raw_data(
+          std::string(reinterpret_cast<const char*>(out.data()), out.size()));
+      return;
+    }
+    default:
+      throw std::runtime_error(
+          "SliceKvCacheAxis1: unsupported tensor dtype " +
+          std::to_string(static_cast<int>(t->data_type())));
+  }
 }
 
 // Generic arbitrary-axis, arbitrary-rank slice of a FLOAT/FLOAT16/BFLOAT16
@@ -24449,7 +25340,7 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
     }
     auto cwit = init_map.find(cm->w_name);
     if (cwit == init_map.end() ||
-        cwit->second->data_type() != onnx::TensorProto::FLOAT ||
+        !IsSupportedFloatDtype(cwit->second->data_type()) ||
         cwit->second->dims_size() != 2) {
       continue;
     }
@@ -24556,9 +25447,9 @@ std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
                k_prod_node == v_prod_node) {
       continue;  // degenerate -- shared producer, can't independently slice
     } else {
-      auto q_info = MatchProducer(*q_prod_node, init_map);
-      auto k_info = MatchProducer(*k_prod_node, init_map);
-      auto v_info = MatchProducer(*v_prod_node, init_map);
+      auto q_info = MatchProducerAnyFloat(*q_prod_node, init_map);
+      auto k_info = MatchProducerAnyFloat(*k_prod_node, init_map);
+      auto v_info = MatchProducerAnyFloat(*v_prod_node, init_map);
       if (!q_info || !k_info || !v_info) {
         continue;
       }
@@ -24728,12 +25619,17 @@ std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
                                      wk_init->dims().end());
   const std::vector<int64_t> wv_dims(wv_init->dims().begin(),
                                      wv_init->dims().end());
-  std::vector<float> wq = ReadFloatTensor(*wq_init);
-  std::vector<float> wk = ReadFloatTensor(*wk_init);
-  std::vector<float> wv = ReadFloatTensor(*wv_init);
+  // ReadTensorAsF64 (not ReadFloatTensor) -- FLOAT/FLOAT16/BFLOAT16 alike,
+  // upcast to double, mirroring pruning.py's own `_to_f64`, for the
+  // importance ranking below only: the actual producer-weight slicing
+  // further down (SliceAxisGeneric) reads/writes each tensor completely
+  // independently, with its own dtype-preserving round trip.
+  std::vector<double> wq = ReadTensorAsF64(*wq_init);
+  std::vector<double> wk = ReadTensorAsF64(*wk_init);
+  std::vector<double> wv = ReadTensorAsF64(*wv_init);
 
   int64_t Nq, Nk, Nv, Kq, Kk, Kv;
-  std::vector<float> wq_kn, wk_kn, wv_kn;
+  std::vector<double> wq_kn, wk_kn, wv_kn;
   if (chain.packed_split_sizes) {
     // `chain.q_weight`/`.k_weight`/`.v_weight` all name the *same*
     // underlying packed tensor (`wq_init == wk_init == wv_init`), one
@@ -24746,12 +25642,12 @@ std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
     // chain` packed branch exactly.
     const int64_t total_n = wq_dims[chain.q_weight_transposed ? 0 : 1];
     const int64_t k_dim = chain.q_weight_transposed ? wq_dims[1] : wq_dims[0];
-    const std::vector<float> w_kn =
+    const std::vector<double> w_kn =
         chain.q_weight_transposed ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
                                   : wq;
     const int64_t nv_orig = total_n - nq_orig - nk_orig;
     auto column_slice = [&](int64_t col_lo, int64_t width) {
-      std::vector<float> out(static_cast<size_t>(k_dim * width));
+      std::vector<double> out(static_cast<size_t>(k_dim * width));
       for (int64_t r = 0; r < k_dim; ++r) {
         std::copy(w_kn.begin() + r * total_n + col_lo,
                   w_kn.begin() + r * total_n + col_lo + width,
@@ -24912,9 +25808,12 @@ std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
     for (int64_t x : v_idx) {
       full_idx.push_back(x + nq_orig + nk_orig);
     }
-    SliceProducerWeight(wq_init, chain.q_weight_transposed, full_idx, false);
+    // SliceAxisGeneric (axis = transposed ? 0 : 1) rather than the shared,
+    // FLOAT32-only SliceProducerWeight -- see this function's own `wq`/`wk`/
+    // `wv` comment above for why.
+    SliceAxisGeneric(wq_init, full_idx, chain.q_weight_transposed ? 0 : 1);
     if (chain.q_bias) {
-      SliceLastAxis(init_map.at(*chain.q_bias), full_idx);
+      SliceAxisGeneric(init_map.at(*chain.q_bias), full_idx, 0);
     }
     onnx::TensorProto* sizes_init = init_map.at(*chain.packed_split_sizes);
     SetInt64TensorData(
@@ -24922,21 +25821,21 @@ std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
         {static_cast<int64_t>(q_idx.size()), static_cast<int64_t>(k_idx.size()),
          static_cast<int64_t>(v_idx.size())});
   } else {
-    SliceProducerWeight(wq_init, chain.q_weight_transposed, q_idx, false);
-    SliceProducerWeight(wk_init, chain.k_weight_transposed, k_idx, false);
-    SliceProducerWeight(wv_init, chain.v_weight_transposed, v_idx, false);
+    SliceAxisGeneric(wq_init, q_idx, chain.q_weight_transposed ? 0 : 1);
+    SliceAxisGeneric(wk_init, k_idx, chain.k_weight_transposed ? 0 : 1);
+    SliceAxisGeneric(wv_init, v_idx, chain.v_weight_transposed ? 0 : 1);
     if (chain.q_bias) {
-      SliceLastAxis(init_map.at(*chain.q_bias), q_idx);
+      SliceAxisGeneric(init_map.at(*chain.q_bias), q_idx, 0);
     }
     if (chain.k_bias) {
-      SliceLastAxis(init_map.at(*chain.k_bias), k_idx);
+      SliceAxisGeneric(init_map.at(*chain.k_bias), k_idx, 0);
     }
     if (chain.v_bias) {
-      SliceLastAxis(init_map.at(*chain.v_bias), v_idx);
+      SliceAxisGeneric(init_map.at(*chain.v_bias), v_idx, 0);
     }
   }
-  SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                      chain.consumer_weight_transposed, y_idx, false);
+  SliceAxisGeneric(init_map.at(chain.consumer_weight), y_idx,
+                   chain.consumer_weight_transposed ? 1 : 0);
 
   // `keep_q_heads.size()` rather than `keep_count * group_size`: identical
   // for the ordinary group-pruning path (`keep_q_heads` is built there as
@@ -25246,9 +26145,23 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
   // Mirrors pruning.py's own apply_attention_head_pruning loop over
   // `_iter_subgraphs(out.graph)`.
   for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    // This graph's own AS-DECLARED input/output/value_info (ValueInfoByName)
+    // -- computed once per graph and reused below by FindGqaChains'/
+    // FindOnnxAttentionChains' own MatchGqaProducer/MatchOnnxAttentionProducer
+    // dynamic-attention_bias/attn_mask check, by FindMhaChains'/
+    // FindPackedMhaChains'/FindDecoderMaskedMhaChains' own identical
+    // MatchMultiHeadAttentionProducer/MatchPackedMultiHeadAttentionProducer/
+    // MatchDecoderMaskedMultiHeadAttentionProducer need, and by
+    // FindDecomposedGqaChains' own identical need further down -- see
+    // FindDecomposedGqaChains' own section comment for why no real
+    // shape-inference pass backs it, here or at the top level, unlike
+    // pruning.py's own top-level-graph case.
+    auto value_info_by_name = ValueInfoByName(*graph);
     std::vector<AttnChain> chains = FindAttentionChains(graph);
-    std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
-    std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+    std::vector<AttnChain> gqa_chains =
+        FindGqaChains(graph, value_info_by_name);
+    std::vector<AttnChain> onnx_attn_chains =
+        FindOnnxAttentionChains(graph, value_info_by_name);
     // MultiHeadAttention/PackedMultiHeadAttention/
     // DecoderMaskedMultiHeadAttention/PagedAttention/LinearAttention/
     // SparseAttention -- six more matched families sharing the identical
@@ -25256,9 +26169,12 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
     // already use above (see each Find*Chains function's own comment for
     // what's matched and this port's deliberate, narrower-than-pruning.py
     // scope decisions).
-    std::vector<AttnChain> mha_chains = FindMhaChains(graph);
-    std::vector<AttnChain> packed_mha_chains = FindPackedMhaChains(graph);
-    std::vector<AttnChain> dmmha_chains = FindDecoderMaskedMhaChains(graph);
+    std::vector<AttnChain> mha_chains =
+        FindMhaChains(graph, value_info_by_name);
+    std::vector<AttnChain> packed_mha_chains =
+        FindPackedMhaChains(graph, value_info_by_name);
+    std::vector<AttnChain> dmmha_chains =
+        FindDecoderMaskedMhaChains(graph, value_info_by_name);
     std::vector<AttnChain> paged_chains = FindPagedAttentionChains(graph);
     std::vector<AttnChain> linear_attn_chains =
         FindLinearAttentionChains(graph);
@@ -25285,7 +26201,8 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                   std::make_move_iterator(sparse_attn_chains.begin()),
                   std::make_move_iterator(sparse_attn_chains.end()));
     if (!chains.empty()) {
-      ApplyAttentionChains(graph, chains, sparsity, nullptr, 1e-8, norm);
+      ApplyAttentionChains(graph, chains, sparsity, nullptr, 1e-8, norm,
+                           value_info_by_name);
     }
     // The fully decomposed (un-fused, "eager SDPA export") shape
     // pruning.py's own `_find_decomposed_gqa_chains` additionally matches --
@@ -25298,17 +26215,13 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
     // touched bookkeeping (inside ApplyDecomposedGqaChains) is never shared
     // with ApplyAttentionChains's own above, the same "structurally
     // different node/weight shapes, always safe" reasoning this section's
-    // own MatMulNBitsQkv handling below already documents. `value_info_by_
-    // name` here is this graph's own AS-DECLARED input/output/value_info
-    // (ValueInfoByName) -- see FindDecomposedGqaChains' own section comment
-    // for why no real shape-inference pass backs it, here or at the top
-    // level, unlike pruning.py's own top-level-graph case.
-    auto decomposed_value_info_by_name = ValueInfoByName(*graph);
+    // own MatMulNBitsQkv handling below already documents. Reuses the same
+    // `value_info_by_name` computed above.
     std::vector<DecomposedGqaChain> decomposed_gqa_chains =
-        FindDecomposedGqaChains(graph, decomposed_value_info_by_name);
+        FindDecomposedGqaChains(graph, value_info_by_name);
     if (!decomposed_gqa_chains.empty()) {
       ApplyDecomposedGqaChains(graph, decomposed_gqa_chains, sparsity, nullptr,
-                               1e-8, norm, decomposed_value_info_by_name);
+                               1e-8, norm, value_info_by_name);
     }
     // The fused `com.microsoft::MatMulNBitsQkv` variant -- see the
     // "MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
@@ -25363,17 +26276,27 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   // inputs).
   onnx::GraphProto* graph = out.mutable_graph();
 
+  // This graph's own AS-DECLARED input/output/value_info -- see
+  // ApplyAttentionHeadPruning's own identical comment for why it's computed
+  // once up front and threaded into FindGqaChains/FindOnnxAttentionChains,
+  // FindMhaChains/FindPackedMhaChains/FindDecoderMaskedMhaChains, and
+  // FindDecomposedGqaChains/ApplyDecomposedGqaChains below.
+  auto value_info_by_name = ValueInfoByName(*graph);
+
   // Same chain-finding as ApplyAttentionHeadPruning's own nine matched
   // families -- deliberately excluding the fused `MatMulNBitsQkv` variant
   // that function additionally handles, since pruning.py's own
   // apply_attention_head_wanda_pruning has no quantized-weight counterpart
   // either (see structured_pruning_entry.h's own declaration comment).
   std::vector<AttnChain> chains = FindAttentionChains(graph);
-  std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
-  std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
-  std::vector<AttnChain> mha_chains = FindMhaChains(graph);
-  std::vector<AttnChain> packed_mha_chains = FindPackedMhaChains(graph);
-  std::vector<AttnChain> dmmha_chains = FindDecoderMaskedMhaChains(graph);
+  std::vector<AttnChain> gqa_chains = FindGqaChains(graph, value_info_by_name);
+  std::vector<AttnChain> onnx_attn_chains =
+      FindOnnxAttentionChains(graph, value_info_by_name);
+  std::vector<AttnChain> mha_chains = FindMhaChains(graph, value_info_by_name);
+  std::vector<AttnChain> packed_mha_chains =
+      FindPackedMhaChains(graph, value_info_by_name);
+  std::vector<AttnChain> dmmha_chains =
+      FindDecoderMaskedMhaChains(graph, value_info_by_name);
   std::vector<AttnChain> paged_chains = FindPagedAttentionChains(graph);
   std::vector<AttnChain> linear_attn_chains = FindLinearAttentionChains(graph);
   std::vector<AttnChain> sparse_attn_chains = FindSparseAttentionChains(graph);
@@ -25405,9 +26328,9 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   // ranked/sliced/probed entirely separately below, mirroring pruning.py's
   // own `chains: List[_AttnLikeChain]` union, which this port instead keeps
   // as two differently-typed collections threaded through in parallel.
-  auto decomposed_value_info_by_name = ValueInfoByName(*graph);
+  // Reuses the same `value_info_by_name` computed above.
   std::vector<DecomposedGqaChain> decomposed_gqa_chains =
-      FindDecomposedGqaChains(graph, decomposed_value_info_by_name);
+      FindDecomposedGqaChains(graph, value_info_by_name);
 
   if (chains.empty() && decomposed_gqa_chains.empty()) {
     return out;  // Mirrors pruning.py's own early return.
@@ -25437,11 +26360,12 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
   if (!chains.empty()) {
-    ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon, norm);
+    ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon, norm,
+                         value_info_by_name);
   }
   if (!decomposed_gqa_chains.empty()) {
     ApplyDecomposedGqaChains(graph, decomposed_gqa_chains, sparsity, &act_norm,
-                             epsilon, norm, decomposed_value_info_by_name);
+                             epsilon, norm, value_info_by_name);
   }
   return out;
 }
@@ -25848,23 +26772,27 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 
 // Attention QKV-weight matcher for ApplySparseGptPruning ONLY -- mirrors
 // MatchAttentionProducer (this file's "Attention-head pruning" section)
-// exactly, but widened to accept FLOAT16/BFLOAT16 in addition to FLOAT32 for
-// both the weight and (if present) bias, mirroring pruning.py's own
+// exactly for the plain-`Attention` case, accepting FLOAT/FLOAT16/BFLOAT16
+// for both the weight and (if present) bias, mirroring pruning.py's own
 // `_match_attention_producer`, which is itself already
 // `_is_supported_float_dtype`-widened (`_match_attention_weight_only` just
-// reuses it in full, dtype widening included). Deliberately a narrow, LOCAL
-// duplicate rather than a change to the shared MatchAttentionProducer
-// itself -- exactly the same reasoning as this file's own
+// reuses it in full, dtype widening included) -- the SAME dtype scope
+// MatchAttentionProducer itself now also accepts (it was independently
+// widened for the structural Attention-head-pruning family, once THAT
+// family's own downstream apply-time arithmetic was verified FLOAT16/
+// BFLOAT16-safe end to end; see that function's own comment). Still a
+// narrow, LOCAL duplicate rather than a repointed call to the shared
+// MatchAttentionProducer, though -- for a DIFFERENT reason now: op-type
+// scope. MatchAttentionProducer also recognizes `DecoderMaskedSelfAttention`/
+// `PackedAttention` (and the `is_dmsa`-only `past`/`do_rotary`/
+// `qkv_hidden_sizes` schema quirks that come with them), neither of which
+// SparseGPT's own Hessian-compensated column-pruning math has been
+// independently re-verified against, so repointing here would silently
+// widen candidate matching to two op types this pass has never been checked
+// against -- exactly the same reasoning as this file's own
 // MatchMoeRouterProducer (MoE/QMoE whole-expert pruning section, see that
-// function's own comment): MatchAttentionProducer also backs this file's
-// OWN structural Attention-head pruning (FindAttentionChains /
-// ApplyOnePlainAttentionChain), which has not been independently
-// re-verified against a real FLOAT16/BFLOAT16 export and stays FLOAT32-only
-// -- its own downstream weight/bias rewriting is still ReadFloatTensor/
-// SetFloatTensorData-based (FLOAT32 only), so widening the shared matcher
-// in place would silently let a FLOAT16/BFLOAT16 node through to code that
-// cannot correctly handle it. SparseGPT never touches bias, only the
-// weight, but bias dtype/shape is still validated here (mirroring
+// function's own comment). SparseGPT never touches bias, only the weight,
+// but bias dtype/shape is still validated here (mirroring
 // `_match_attention_producer`'s own checks, reused in full by
 // `_match_attention_weight_only` even though nothing there reads bias
 // either) so a node this file's own structural head-pruning would decline
@@ -26448,10 +27376,11 @@ onnx::ModelProto ApplySparseGptPruning(
   // original dtype, exactly like the MoE/QMoE FP16/BFLOAT16 widening this
   // mirrors), plus every matched `com.microsoft::Attention` node's constant
   // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
-  // (MatchAttentionProducerAnyFloat -- a narrow local dtype-widened
-  // duplicate of MatchAttentionProducer, see that function's own comment
-  // for why MatchAttentionProducer itself is left untouched -- exactly
-  // mirroring pruning.py's own _match_attention_weight_only, which reuses
+  // (MatchAttentionProducerAnyFloat -- a narrow local duplicate of
+  // MatchAttentionProducer, see that function's own comment for why this
+  // call site isn't simply repointed at the shared matcher directly --
+  // exactly mirroring pruning.py's own _match_attention_weight_only, which
+  // reuses
   // _match_attention_producer's own identical (already dtype-widened)
   // validation, minus its bias handling: SparseGPT never touches bias, only
   // weight). `com.microsoft::GroupQueryAttention`'s separate Q/K/V
@@ -26693,15 +27622,19 @@ onnx::ModelProto ApplySparseGptPruning(
 // Attention candidate case -- MatchAttentionProducer's own dtype gate is
 // baked INSIDE the shared matcher itself (unlike MatchMatMulLikeRaw's), and
 // that matcher is also reused by FindAttentionChains (structured
-// Attention-head pruning) and ApplySparseGptPruning immediately above, both
-// deliberately FLOAT32-only per their own declaration comments -- widening
-// it in place would silently widen candidate matching for those two
-// unrelated, independently-verified-only-for-FLOAT32 passes too. Hence the
-// narrow, local duplicate instead, exactly the same "narrow, local
-// duplicate instead of a shared-code change" precedent this file's own
-// MoE/QMoE section top comment already established for the analogous
-// FLOAT32-only-elsewhere situation. The only genuinely new machinery here
-// (beyond the dtype widening) is the plain one-shot importance score
+// Attention-head pruning) and ApplySparseGptPruning immediately above.
+// MatchAttentionProducer's own dtype scope now matches this pass' (both
+// FLOAT/FLOAT16/BFLOAT16 -- see that function's own comment), but it ALSO
+// recognizes `DecoderMaskedSelfAttention`/`PackedAttention`, an op-type
+// widening neither this pass nor ApplySparseGptPruning has independently
+// re-verified its own math against -- widening the call site to the shared
+// matcher in place would silently widen candidate matching for both of
+// those unrelated passes too. Hence the narrow, local duplicate instead,
+// exactly the same "narrow, local duplicate instead of a shared-code
+// change" precedent this file's own MoE/QMoE section top comment already
+// established for the analogous FLOAT32-only-elsewhere situation. The only
+// genuinely new machinery here (beyond the dtype widening) is the plain
+// one-shot importance score
 // (`|W_ij| * ||X_j||_2`, WandaImportance below, no Hessian/Cholesky at all)
 // and its element-wise masking (WandaSparsityMaskNK/WandaNmMaskNK/the
 // `global_sparsity` pooling loop inside ApplyWandaPruning itself), mirroring
@@ -27040,25 +27973,29 @@ std::vector<uint8_t> WandaNmMaskNK(const std::vector<double>& importance,
   return mask;
 }
 
-// Local, dtype-widened copy of MatchAttentionProducer (structural logic
-// verbatim identical -- domain/op_type, weight/bias shape and dtype,
+// Local, narrowed copy of MatchAttentionProducer (structural logic verbatim
+// identical for the plain-`Attention` case -- weight/bias shape and dtype,
 // num_heads/qkv_hidden_sizes consistency), scoped to ApplyWandaPruning
-// alone: accepts FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype) for both
-// the merged QKV weight and (if present) its merged bias, mirroring
-// pruning.py's own `_match_attention_producer`'s `_is_supported_float_dtype`
-// checks exactly (unlike MatchAttentionProducer's own hardcoded `==
-// onnx::TensorProto::FLOAT`). A genuinely separate copy rather than an
-// in-place widening of the shared MatchAttentionProducer -- see this file's
-// own "Wanda unstructured (element-wise) pruning" section top comment for
-// why: that function is also reused by FindAttentionChains (structured
-// Attention-head pruning) and ApplySparseGptPruning immediately above, both
-// deliberately FLOAT32-only per their own declaration comments, so widening
-// its dtype gate in place would silently widen candidate matching for those
-// two unrelated, independently-verified-only-for-FLOAT32 passes too --
-// exactly the MoE/QMoE section's own already-established "narrow, local
-// duplicate instead of a shared-code change" precedent. Bias dtype is
-// checked (though ApplyWandaPruning itself never reads bias) purely to
-// decline the same malformed-node shapes MatchAttentionProducer already
+// alone: accepts FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype) for both the
+// merged QKV weight and (if present) its merged bias, mirroring pruning.py's
+// own `_match_attention_producer`'s `_is_supported_float_dtype` checks
+// exactly -- the SAME dtype scope MatchAttentionProducer itself now also
+// accepts (see that function's own comment: it was independently widened,
+// for the structural Attention-head-pruning family only, once that family's
+// own downstream apply-time arithmetic was verified FLOAT16/BFLOAT16-safe
+// end to end). A genuinely separate copy rather than a repointed call to the
+// shared MatchAttentionProducer remains warranted for a DIFFERENT reason
+// now: op-type scope, not dtype -- MatchAttentionProducer also recognizes
+// `DecoderMaskedSelfAttention`/`PackedAttention` (and the `is_dmsa`-only
+// `past`/`do_rotary`/`qkv_hidden_sizes` schema quirks that come with them),
+// none of which ApplySparseGptPruning immediately above or ApplyWandaPruning
+// here have been independently re-verified against, so repointing either to
+// the shared matcher would silently widen candidate matching for both to
+// two op types their own Hessian-compensated/masking math has never been
+// checked against -- exactly the MoE/QMoE section's own already-established
+// "narrow, local duplicate instead of a shared-code change" precedent. Bias
+// dtype is checked (though ApplyWandaPruning itself never reads bias) purely
+// to decline the same malformed-node shapes MatchAttentionProducer already
 // would, matching pruning.py's own `_match_attention_weight_only`'s full
 // reuse of `_match_attention_producer` (including its bias check) exactly.
 std::optional<AttentionProducerMatch> MatchAttentionProducerWideDtype(

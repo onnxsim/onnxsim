@@ -849,6 +849,59 @@ def test_import_onnx_schemas_bridges_registry():
     assert C._has_schema(op_type, domain)
 
 
+def test_export_onnx_schemas_bridges_registry():
+    # The reverse direction of ``import_onnx_schemas``: a schema onnxsim's
+    # internal (statically linked) registry knows about -- registered here the
+    # same way onnxsim's own built-in ONNX Runtime contrib-op schemas are --
+    # is invisible to the Python ``onnx`` module's separate registry until
+    # ``export_onnx_schemas`` copies it across.
+    from onnxsim import onnx_simplifier
+
+    op_type = "OnnxsimExportTestOp"
+    domain = "onnxsim.export.test"
+
+    C = onnx_simplifier.C
+    assert not onnx.defs.has(op_type, domain=domain)
+
+    C._register_schema(
+        op_type,
+        domain,
+        1,
+        "a test op",
+        [("X", "the input", "T", 0, True, 1)],
+        [("Y", "the output", "T", 0, True, 1)],
+        [
+            (
+                "alpha",
+                "slope",
+                int(onnx.AttributeProto.FLOAT),
+                False,
+                onnx.AttributeProto(
+                    name="alpha", f=0.1, type=onnx.AttributeProto.FLOAT
+                ),
+            )
+        ],
+        [("T", ["tensor(float)"], "Constrain to float tensors.")],
+        False,
+    )
+    # Registering in onnxsim alone must not affect onnx's separate registry.
+    assert not onnx.defs.has(op_type, domain=domain)
+
+    exported = onnxsim.export_onnx_schemas()
+    assert exported >= 1
+    assert onnx.defs.has(op_type, domain=domain)
+
+    schema = onnx.defs.get_schema(op_type, domain=domain)
+    assert [p.name for p in schema.inputs] == ["X"]
+    assert [p.name for p in schema.outputs] == ["Y"]
+    assert "alpha" in schema.attributes
+
+    # Idempotent: a second call exports nothing new for this op (it is
+    # already known) and does not raise.
+    onnxsim.export_onnx_schemas()
+    assert onnx.defs.has(op_type, domain=domain)
+
+
 def test_custom_op_with_registered_schema_is_simplified():
     # End-to-end: a model using a custom operator whose schema was registered via
     # ``onnx.defs.register_schema`` must simplify successfully -- the custom op is
