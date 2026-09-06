@@ -14453,6 +14453,680 @@ def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- SKNet Selective Kernel (SK) attention chains ---------------------------
+#
+# Selective Kernel Networks (Li, Wang, Hu, Yang, CVPR 2019,
+# https://arxiv.org/abs/1903.06586)'s own "SK" attention block -- confirmed
+# live via a real `torch.onnx.export` (opset 17) of a hand-written module
+# following the canonical reference implementation's own shape
+# (`github.com/implus/SKNet`/`pppLang/SKNet`, M=2 branches):
+#
+#     f0 = convs[0](x); f1 = convs[1](x)        # SAME input x, two branches
+#     U = f0 + f1
+#     s = U.mean((2, 3), keepdim=True)          # squeeze
+#     z = relu(fc(s))                            # bottleneck, no bias
+#     a = stack([fcs[0](z), fcs[1](z)], dim=1)   # per-branch excitation
+#     a = softmax(a, dim=1)                      # per-channel, across branches
+#     out = f0 * a[:, 0] + f1 * a[:, 1]
+#
+# genuinely different in *shape* from every other gate this module already
+# recognizes: SE/ESE/CBAM/GCNet/CoordAtt/ECA all gate a SINGLE producer's own
+# tensor with a scale derived from that SAME tensor. SK instead gates
+# MULTIPLE co-equal producers (`convs[0]`, `convs[1]`) with per-branch scales
+# derived from their SHARED SUM `U`, then re-combines -- structurally closer
+# to `_find_conv_residual_chains`'s own multi-producer merge-at-an-`Add`
+# shape than to `_find_conv_se_gate_chains`'s single-producer one.
+#
+# Confirmed empirically that `_find_conv_residual_chains` does NOT also
+# (mis)match either `Add` here: `U`'s own backward walk resolves both
+# operands to real Conv producers fine, but its only extra fan-out consumer
+# (`_resolve_conv_fanout_branches`) is each branch's own combine `Mul` --
+# which `_walk_to_conv_consumer` has no hop case for at all (`Mul` is
+# explicitly out of scope there), so that prospective group is declined
+# outright before ever reaching `U`. The closing `Add` (`f0*a0 + f1*a1`)
+# fares no better: `_walk_conv_producer_backward`'s own `Mul` case only
+# recognizes a *self*-gated diamond (gate derived from the SAME operand it
+# multiplies) or the decomposed-GELU shape, neither of which this
+# cross-branch gate (derived from `U`, a genuinely different tensor) is, so
+# that operand fails to resolve and the whole prospective group is declined
+# too. Both declines fall out of `_find_conv_residual_chains`'s own existing
+# code with no changes needed -- see `tests/test_pruning.py`'s own SK
+# coexistence test, which builds a graph with both an SK block and an
+# ordinary plain residual `Add` elsewhere and confirms each is handled by
+# exactly the finder meant for it, with the other left alone.
+#
+# Given this, and this module's own established preference for a narrow,
+# purpose-built matcher over widening shared general-purpose machinery when
+# the two shapes are this different (see how GCNet-style ContextBlock
+# support, and CBAM's own ChannelGate before it, each got a dedicated finder
+# rather than teaching `_walk_to_conv_consumer`/`_walk_conv_producer_backward`
+# a new `Mul`/cross-branch-gate hop), this section is a wholly separate,
+# purpose-built finder (`_find_conv_sk_attention_chains`, mirroring
+# `_find_conv_se_gate_chains`'s own top-level structure) that matches the
+# WHOLE shape above in one pass, rather than extending
+# `_find_conv_residual_chains`'s backward walk to understand it. Teaching
+# `_walk_to_conv_consumer` a `Mul` hop for this one narrow cross-branch-gate
+# shape would risk that hop firing (or subtly interacting) in the *many*
+# other places this shared walker already runs, for no compensating benefit
+# -- confirmed the safer of the two options this module's own design
+# discussion considered.
+#
+# Scope, conservative and narrow like every dedicated finder in this module:
+#
+#   - Exactly `M == 2` branches -- the confirmed real shape above. A
+#     `Sum`/chained-`Add` reduction of three or more branches is a plausible
+#     SKNet generalization (the paper's own `M` parameter), but was not
+#     independently confirmed via a real export and is declined, not
+#     guessed at, mirroring this module's own "confirmed, not assumed"
+#     standard throughout.
+#   - `stem` (`P`), an ordinary (`group == 1`) Conv/FusedConv producer, whose
+#     raw output feeds `convs[0]`/`convs[1]` DIRECTLY -- no intervening
+#     activation or other hop tolerated (unlike SE/CBAM's own permissive
+#     "spine" walk): the confirmed reference implementation has none between
+#     a block's own input and its `SKConv`, and admitting one here would be
+#     new, unconfirmed surface for no observed benefit.
+#   - `convs[0]`/`convs[1]`: two DISTINCT, ordinary (`group == 1`) Conv
+#     producers, each reading `stem`'s raw output as their sole first input,
+#     each with weight shape `[n_channels, n_channels, k1, ...]` -- a
+#     *square* channel map (both `in_channels` and `out_channels` equal
+#     `stem`'s own `n_channels`), exactly the reference implementation's own
+#     "same channel count in, same channel count out" branch convs. Each
+#     plays BOTH a producer role (its own OUTPUT axis feeds the final
+#     combine, tied to the shared `keep` set) and a consumer role (its own
+#     INPUT axis reads `stem`'s pruned output, tied to the identical `keep`
+#     set) -- the same "register the identical weight under both of this
+#     module's own existing role mechanisms" trick `_match_conv_ese_gate`'s
+#     own `fc` already uses (see its own section comment above), here for
+#     TWO weights instead of one.
+#   - Each branch's own raw output has EXACTLY two consumers: one `Add`
+#     (summing `convs[0]`'s and `convs[1]`'s outputs -- and ONLY those two,
+#     nothing else -- into `U`; `_is_eligible_add_merge` reused unchanged
+#     from the residual-chain section, since it never was Conv-specific) and
+#     one `Mul` (this branch's own final combine, `branch_output * gate`);
+#     BOTH branches must name the exact SAME `Add` node.
+#   - `U` feeds exactly one squeeze pool step (`_reduce_hw_axes_keepdims1`,
+#     reused unchanged from the SE-gate/ESE section -- a plain `ReduceMean`
+#     over the two trailing spatial axes with `keepdims=1`, opset<=17's
+#     attribute-based `axes` form only), which feeds exactly one `fc`
+#     (`Conv(1x1, group=1)`, `in_channels == n_channels`, no bottleneck-size
+#     restriction of its own -- its OUTPUT axis, the reduced bottleneck
+#     width, is deliberately left untouched, exactly like SE's own `fc1`),
+#     which feeds exactly one `Relu`.
+#   - `Relu`'s own output feeds EXACTLY two `fcs[0]`/`fcs[1]` -- ordinary
+#     (`group == 1`) `Conv(1x1)` producers, each with `out_channels ==
+#     n_channels` (the eventual per-channel attention logit, broadcast back
+#     against a branch's own `n_channels`-wide output) and an UNCONSTRAINED,
+#     shared bottleneck `in_channels` (`fc`'s own output width) -- mirroring
+#     SE's own `fc2` bottleneck-width tolerance.
+#   - Each `fcs[i]`'s raw output feeds exactly one `Unsqueeze` (a single,
+#     resolvable, non-negative `axes` value -- the new "branch" axis), both
+#     agreeing on the SAME axis; both `Unsqueeze` outputs feed exactly one
+#     `Concat` (`axis` equal to that same value), which feeds exactly one
+#     `Softmax` (`axis` attribute -- non-negative, explicit, no opset-default
+#     ambiguity tolerated -- equal to that same value again), whose own
+#     output is read by EXACTLY two `Gather` nodes (`axis` equal to that same
+#     value again), each with a STATIC, scalar (rank-0, not a 1-element
+#     vector -- the two are different `Gather` output *ranks*, and only the
+#     scalar one matches the confirmed broadcast-back shape) integer index,
+#     the two indices distinct and exactly `{0, 1}`.
+#   - Each `Gather`'s own output must feed exactly the `Mul` that also reads
+#     the branch output whose own `Unsqueeze`/`fcs[i]` produced the operand
+#     at that `Gather`'s own stacked position -- i.e. the two `(branch,
+#     gather)` pairings are a bijection between the two branches and the two
+#     `Gather` nodes (which specific numeric index pairs with which branch
+#     doesn't matter -- `Softmax`'s own per-position normalization already
+#     makes either a valid, self-consistent SK block -- only that each
+#     branch is multiplied by its OWN, not the other's, gathered weight).
+#   - Both branches' own `Mul` outputs feed, and ONLY feed, one shared final
+#     `Add` (`_is_eligible_add_merge` again) -- the block's own real output,
+#     walked forward via `_walk_to_conv_consumer` to a real downstream
+#     Conv/ConvTranspose/MatMul/Gemm consumer exactly like every other gate
+#     shape in this module.
+#   - Every intermediate tensor along the way must have exactly the fan-out
+#     this section's own bar above describes, and none may be a graph
+#     output -- declined, not guessed at, otherwise, mirroring every other
+#     matcher in this module.
+#
+# Representation: SEVEN independent roles altogether -- `stem`, `convs[0]`,
+# `convs[1]`, `fc`, `fcs[0]`, `fcs[1]`, and the real downstream consumer --
+# each required to name a genuinely distinct weight (an accidental/tied
+# share between any two is not the confirmed real shape, mirroring every
+# other gate section's own identical bar). `stem`, `convs[0]`, `convs[1]`,
+# `fcs[0]`, `fcs[1]` are FIVE co-sliced `_Producer`s on one `_Chain` (their
+# own OUTPUT axis, `_Chain.producers` carrying no hardcoded arity anywhere
+# it's consumed, exactly like CoordAtt's own three); `convs[0]`, `convs[1]`,
+# and `fc` are additionally registered as `_ConsumerBranch`es (their own
+# INPUT axis) -- `convs[0]`/`convs[1]` playing both roles at once (see this
+# section's own comment above), `fc` playing the consumer role only (its own
+# OUTPUT/bottleneck axis is never touched). The real downstream consumer
+# rides on `_Chain`'s own singular `consumer_*` fields, exactly like every
+# other gate shape.
+
+
+def _match_conv_sk_attention(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # convs[0]
+        str,  # convs[0] weight
+        Optional[str],  # convs[0] bias
+        onnx.NodeProto,  # convs[1]
+        str,  # convs[1] weight
+        Optional[str],  # convs[1] bias
+        onnx.NodeProto,  # Add (U = f0 + f1)
+        onnx.NodeProto,  # ReduceMean (squeeze)
+        onnx.NodeProto,  # fc
+        str,  # fc weight
+        onnx.NodeProto,  # Relu
+        onnx.NodeProto,  # fcs[0]
+        str,  # fcs[0] weight
+        Optional[str],  # fcs[0] bias
+        onnx.NodeProto,  # fcs[1]
+        str,  # fcs[1] weight
+        Optional[str],  # fcs[1] bias
+        onnx.NodeProto,  # Unsqueeze (fcs[0]'s own)
+        onnx.NodeProto,  # Unsqueeze (fcs[1]'s own)
+        onnx.NodeProto,  # Concat
+        onnx.NodeProto,  # Softmax
+        onnx.NodeProto,  # Gather (index 0)
+        onnx.NodeProto,  # Gather (index 1)
+        onnx.NodeProto,  # Mul (branch 0's own combine)
+        onnx.NodeProto,  # Mul (branch 1's own combine)
+        onnx.NodeProto,  # final Add (the block's own real output)
+    ]
+]:
+    """If `spine`'s own two consumers (`spine_consumers`) form the SKNet SK
+    attention shape this section's own comment above describes, returns
+    every matched node/weight/bias needed to build the chain. Declines
+    (``None``) on any deviation -- see that comment for the exact, narrow
+    bar this checks.
+    """
+    if len(spine_consumers) != 2:
+        return None
+
+    branches: List[Tuple[onnx.NodeProto, str, Optional[str], str]] = []
+    for bnode in spine_consumers:
+        binfo = _match_conv_producer(bnode, initializer_map)
+        if binfo is None:
+            return None
+        bw, bbias, bout_channels, bgroup = binfo
+        if bgroup != 1 or bout_channels != n_channels or bnode.input[0] != spine:
+            return None
+        bw_init = initializer_map[bw]
+        if bw_init.dims[1] != n_channels:
+            return None  # not a square (in == out == n_channels) channel map
+        bout = bnode.output[0]
+        if bout in graph_outputs:
+            return None
+        branches.append((bnode, bw, bbias, bout))
+    (branch0_node, branch0_weight, branch0_bias, branch0_out) = branches[0]
+    (branch1_node, branch1_weight, branch1_bias, branch1_out) = branches[1]
+    if branch0_weight == branch1_weight:
+        return None  # tied weight -- not the confirmed real shape
+
+    # Each branch's own raw output has exactly two consumers: the SAME
+    # shared sum `Add`, and this branch's own final-combine `Mul`.
+    branch_muls: List[onnx.NodeProto] = []
+    add_u_node: Optional[onnx.NodeProto] = None
+    for bout in (branch0_out, branch1_out):
+        cands = consumers_of.get(bout, [])
+        if len(cands) != 2:
+            return None
+        found_add: Optional[onnx.NodeProto] = None
+        found_mul: Optional[onnx.NodeProto] = None
+        for c in cands:
+            if (
+                found_add is None
+                and _is_eligible_add_merge(c, initializer_map)
+                and bout in c.input
+            ):
+                found_add = c
+            elif (
+                found_mul is None
+                and c.op_type == "Mul"
+                and c.domain == ""
+                and len(c.input) == 2
+                and len(c.output) == 1
+                and bout in c.input
+                and c.input[0] != c.input[1]
+            ):
+                found_mul = c
+        if found_add is None or found_mul is None:
+            return None
+        if add_u_node is None:
+            add_u_node = found_add
+        elif add_u_node is not found_add:
+            return None  # the two branches don't share the same sum Add
+        branch_muls.append(found_mul)
+    assert add_u_node is not None
+    if set(add_u_node.input) != {branch0_out, branch1_out}:
+        return None
+    mul0_node, mul1_node = branch_muls
+
+    add_u_out = add_u_node.output[0]
+    if add_u_out in graph_outputs or len(consumers_of.get(add_u_out, [])) != 1:
+        return None
+    reduce_mean_node = consumers_of[add_u_out][0]
+    if not _reduce_hw_axes_keepdims1(reduce_mean_node, add_u_out):
+        return None
+
+    rm_out = reduce_mean_node.output[0]
+    if rm_out in graph_outputs or len(consumers_of.get(rm_out, [])) != 1:
+        return None
+    fc_node = consumers_of[rm_out][0]
+    fc_match = _match_conv_consumer(fc_node, initializer_map)
+    if fc_match is None:
+        return None
+    fc_weight, fc_in_channels, fc_group = fc_match
+    if fc_group != 1 or fc_in_channels != n_channels or fc_node.input[0] != rm_out:
+        return None
+    fc_w_init = initializer_map[fc_weight]
+    if any(d != 1 for d in fc_w_init.dims[2:]):
+        return None  # not a 1x1 (or equivalent) conv -- declined
+
+    fc_out = fc_node.output[0]
+    if fc_out in graph_outputs or len(consumers_of.get(fc_out, [])) != 1:
+        return None
+    relu_node = consumers_of[fc_out][0]
+    if (
+        relu_node.op_type != "Relu"
+        or relu_node.domain != ""
+        or list(relu_node.input) != [fc_out]
+        or len(relu_node.output) != 1
+    ):
+        return None
+    relu_out = relu_node.output[0]
+    if relu_out in graph_outputs:
+        return None
+    relu_consumers = consumers_of.get(relu_out, [])
+    if len(relu_consumers) != 2:
+        return None
+
+    fcs: List[Tuple[onnx.NodeProto, str, Optional[str], str]] = []
+    for c in relu_consumers:
+        cinfo = _match_conv_producer(c, initializer_map)
+        if cinfo is None:
+            return None
+        cw, cbias, cout, cgroup = cinfo
+        if cgroup != 1 or cout != n_channels or c.input[0] != relu_out:
+            return None
+        cw_init = initializer_map[cw]
+        if any(d != 1 for d in cw_init.dims[2:]):
+            return None  # not a 1x1 (or equivalent) conv -- declined
+        cout_name = c.output[0]
+        if cout_name in graph_outputs:
+            return None
+        fcs.append((c, cw, cbias, cout_name))
+    (fcs0_node, fcs0_weight, fcs0_bias, fcs0_out) = fcs[0]
+    (fcs1_node, fcs1_weight, fcs1_bias, fcs1_out) = fcs[1]
+    if fcs0_weight == fcs1_weight:
+        return None  # tied weight -- not the confirmed real shape
+
+    unsqueeze_info: List[Tuple[onnx.NodeProto, int, str]] = []
+    for src_out in (fcs0_out, fcs1_out):
+        cands = consumers_of.get(src_out, [])
+        if len(cands) != 1:
+            return None
+        u_node = cands[0]
+        if (
+            u_node.op_type != "Unsqueeze"
+            or u_node.domain != ""
+            or len(u_node.input) != 2
+            or u_node.input[0] != src_out
+            or len(u_node.output) != 1
+        ):
+            return None
+        axes_init = initializer_map.get(u_node.input[1])
+        if axes_init is None:
+            return None
+        axes_vals = onnx.numpy_helper.to_array(axes_init).reshape(-1).tolist()
+        if len(axes_vals) != 1 or axes_vals[0] < 0:
+            return None
+        u_out = u_node.output[0]
+        if u_out in graph_outputs:
+            return None
+        unsqueeze_info.append((u_node, int(axes_vals[0]), u_out))
+    (unsqueeze0_node, axis0, unsqueeze0_out) = unsqueeze_info[0]
+    (unsqueeze1_node, axis1, unsqueeze1_out) = unsqueeze_info[1]
+    if axis0 != axis1:
+        return None
+    stack_axis = axis0
+
+    concat_cands = consumers_of.get(unsqueeze0_out, [])
+    if len(concat_cands) != 1:
+        return None
+    concat_node = concat_cands[0]
+    if (
+        concat_node.op_type != "Concat"
+        or concat_node.domain != ""
+        or list(concat_node.input) != [unsqueeze0_out, unsqueeze1_out]
+        or len(concat_node.output) != 1
+    ):
+        return None
+    concat_axis = None
+    for attr in concat_node.attribute:
+        if attr.name == "axis":
+            concat_axis = attr.i
+    if concat_axis is None or concat_axis != stack_axis:
+        return None
+
+    concat_out = concat_node.output[0]
+    if concat_out in graph_outputs or len(consumers_of.get(concat_out, [])) != 1:
+        return None
+    softmax_node = consumers_of[concat_out][0]
+    if (
+        softmax_node.op_type != "Softmax"
+        or softmax_node.domain != ""
+        or list(softmax_node.input) != [concat_out]
+        or len(softmax_node.output) != 1
+    ):
+        return None
+    softmax_axis = None
+    for attr in softmax_node.attribute:
+        if attr.name == "axis":
+            softmax_axis = attr.i
+    if softmax_axis is None or softmax_axis < 0 or softmax_axis != stack_axis:
+        return None
+
+    softmax_out = softmax_node.output[0]
+    if softmax_out in graph_outputs:
+        return None
+    softmax_consumers = consumers_of.get(softmax_out, [])
+    if len(softmax_consumers) != 2:
+        return None
+    gather_by_index: Dict[int, onnx.NodeProto] = {}
+    for g in softmax_consumers:
+        if (
+            g.op_type != "Gather"
+            or g.domain != ""
+            or len(g.input) != 2
+            or g.input[0] != softmax_out
+            or len(g.output) != 1
+        ):
+            return None
+        g_axis = 0
+        for attr in g.attribute:
+            if attr.name == "axis":
+                g_axis = attr.i
+        if g_axis != stack_axis:
+            return None
+        idx_init = initializer_map.get(g.input[1])
+        if idx_init is None or len(idx_init.dims) != 0:
+            return None  # not a static, scalar (rank-0) index -- declined
+        idx = int(onnx.numpy_helper.to_array(idx_init).reshape(-1)[0])
+        if idx not in (0, 1) or idx in gather_by_index:
+            return None
+        gather_by_index[idx] = g
+    if set(gather_by_index) != {0, 1}:
+        return None
+    gather0_node = gather_by_index[0]
+    gather1_node = gather_by_index[1]
+
+    # Each Mul's own gate operand must be exactly one of the two Gathers'
+    # own outputs, the two Muls using different Gathers (a bijection) --
+    # see this section's own comment above for why *which* numeric index
+    # pairs with which branch doesn't itself matter.
+    gate0 = (
+        mul0_node.input[1] if mul0_node.input[0] == branch0_out else mul0_node.input[0]
+    )
+    gate1 = (
+        mul1_node.input[1] if mul1_node.input[0] == branch1_out else mul1_node.input[0]
+    )
+    if {gate0, gate1} != {gather0_node.output[0], gather1_node.output[0]}:
+        return None
+
+    mul0_out = mul0_node.output[0]
+    mul1_out = mul1_node.output[0]
+    if mul0_out in graph_outputs or mul1_out in graph_outputs:
+        return None
+    if (
+        len(consumers_of.get(mul0_out, [])) != 1
+        or len(consumers_of.get(mul1_out, [])) != 1
+    ):
+        return None
+    final_add_candidate0 = consumers_of[mul0_out][0]
+    final_add_candidate1 = consumers_of[mul1_out][0]
+    if final_add_candidate0 is not final_add_candidate1:
+        return None
+    final_add_node = final_add_candidate0
+    if not _is_eligible_add_merge(final_add_node, initializer_map):
+        return None
+    if set(final_add_node.input) != {mul0_out, mul1_out}:
+        return None
+    if final_add_node.output[0] in graph_outputs:
+        return None
+
+    return (
+        branch0_node,
+        branch0_weight,
+        branch0_bias,
+        branch1_node,
+        branch1_weight,
+        branch1_bias,
+        add_u_node,
+        reduce_mean_node,
+        fc_node,
+        fc_weight,
+        relu_node,
+        fcs0_node,
+        fcs0_weight,
+        fcs0_bias,
+        fcs1_node,
+        fcs1_weight,
+        fcs1_bias,
+        unsqueeze0_node,
+        unsqueeze1_node,
+        concat_node,
+        softmax_node,
+        gather0_node,
+        gather1_node,
+        mul0_node,
+        mul1_node,
+        final_add_node,
+    )
+
+
+def _find_conv_sk_attention_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds SKNet Selective Kernel (SK) attention blocks -- see this
+    section's own comment above for the exact topology matched and
+    declined. Every match produces one `_Chain` with FIVE co-sliced
+    producers (`stem`, `convs[0]`, `convs[1]`, `fcs[0]`, `fcs[1]`, all
+    forced to the same output-channel `keep` set), one ordinary consumer
+    (the real downstream Conv/MatMul/Gemm the final `Add` feeds), and THREE
+    extra fan-out branches (`convs[0]`, `convs[1]` -- each also playing the
+    producer role above, see this section's own comment -- and `fc`, whose
+    own INPUT axis needs the identical `keep` set while its own OUTPUT/
+    bottleneck axis is left untouched).
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    chains: List[_Chain] = []
+    for node in graph.node:
+        info = _match_conv_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, n_channels, producer_group = info
+        if producer_group != 1:
+            continue  # narrow scope -- see this section's own comment
+
+        stem_out = node.output[0]
+        if stem_out in graph_outputs:
+            continue
+        spine_consumers = consumers_of.get(stem_out, [])
+
+        match = _match_conv_sk_attention(
+            stem_out,
+            spine_consumers,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+        )
+        if match is None:
+            continue
+        (
+            branch0_node,
+            branch0_weight,
+            branch0_bias,
+            branch1_node,
+            branch1_weight,
+            branch1_bias,
+            add_u_node,
+            reduce_mean_node,
+            fc_node,
+            fc_weight,
+            relu_node,
+            fcs0_node,
+            fcs0_weight,
+            fcs0_bias,
+            fcs1_node,
+            fcs1_weight,
+            fcs1_bias,
+            unsqueeze0_node,
+            unsqueeze1_node,
+            concat_node,
+            softmax_node,
+            gather0_node,
+            gather1_node,
+            mul0_node,
+            mul1_node,
+            final_add_node,
+        ) = match
+
+        (
+            consumer,
+            post_chain_ops,
+            conv_pass_through,
+            group_norm,
+            decomposed_group_norm_num_groups,
+            _matmul_consumer,
+            grn,
+            depth_to_space,
+        ) = _walk_to_conv_consumer(
+            final_add_node.output[0],
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+        # Every optional `_walk_to_conv_consumer` flag was left at its
+        # default (False) above, so these are always `None` -- mirroring
+        # `_find_conv_se_gate_chains`'s own identical assertion.
+        assert (
+            group_norm is None
+            and decomposed_group_norm_num_groups is None
+            and grn is None
+            and depth_to_space is None
+        )
+        (
+            consumer_node,
+            consumer_weight,
+            consumer_group,
+            consumer_is_conv_transpose,
+        ) = consumer
+
+        # All SEVEN roles (`stem`, `convs[0]`, `convs[1]`, `fc`, `fcs[0]`,
+        # `fcs[1]`, the real downstream consumer) must name distinct
+        # weights -- an accidental/tied share between any two is not the
+        # confirmed real shape.
+        role_weights = {
+            w_name,
+            branch0_weight,
+            branch1_weight,
+            fc_weight,
+            fcs0_weight,
+            fcs1_weight,
+        }
+        if len(role_weights) != 6 or consumer_weight in role_weights:
+            continue
+
+        chain_ops = (
+            (relu_node, None),
+            (unsqueeze0_node, None),
+            (unsqueeze1_node, None),
+            (concat_node, None),
+            (softmax_node, None),
+            (gather0_node, None),
+            (gather1_node, None),
+            (mul0_node, None),
+            (mul1_node, None),
+            (final_add_node, None),
+        ) + post_chain_ops
+
+        chains.append(
+            _Chain(
+                producers=(
+                    _Producer(node, w_name, False, bias_name, is_conv=True),
+                    _Producer(
+                        branch0_node,
+                        branch0_weight,
+                        False,
+                        branch0_bias,
+                        is_conv=True,
+                    ),
+                    _Producer(
+                        branch1_node,
+                        branch1_weight,
+                        False,
+                        branch1_bias,
+                        is_conv=True,
+                    ),
+                    _Producer(fcs0_node, fcs0_weight, False, fcs0_bias, is_conv=True),
+                    _Producer(fcs1_node, fcs1_weight, False, fcs1_bias, is_conv=True),
+                ),
+                chain_ops=chain_ops,
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
+                conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
+                extra_consumers=(
+                    _ConsumerBranch(
+                        chain_ops=(),
+                        consumer_node=branch0_node,
+                        consumer_weight=branch0_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                    _ConsumerBranch(
+                        chain_ops=(),
+                        consumer_node=branch1_node,
+                        consumer_weight=branch1_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                    _ConsumerBranch(
+                        chain_ops=(
+                            (add_u_node, None),
+                            (reduce_mean_node, None),
+                        ),
+                        consumer_node=fc_node,
+                        consumer_weight=fc_weight,
+                        consumer_weight_transposed=False,
+                        consumer_is_conv=True,
+                        consumer_group=1,
+                    ),
+                ),
+            )
+        )
+    return chains
+
+
 # --- MatMul/Gemm residual (Add-merged) chains -------------------------------
 #
 # The MatMul/Gemm analogue of the Conv residual/Add-merge grouping above --
@@ -19620,6 +20294,7 @@ def apply_structured_pruning(
             + _find_conv_se_gate_chains(graph)
             + _find_conv_gc_context_chains(graph)
             + _find_conv_cbam_channel_gate_chains(graph)
+            + _find_conv_sk_attention_chains(graph)
             + _find_matmul_residual_chains(graph)
         )
         concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
@@ -47038,6 +47713,7 @@ def _structured_chain_groups(
         ("conv_se_gate", _find_conv_se_gate_chains(graph)),
         ("conv_gc_context", _find_conv_gc_context_chains(graph)),
         ("conv_cbam_channel_gate", _find_conv_cbam_channel_gate_chains(graph)),
+        ("conv_sk_attention", _find_conv_sk_attention_chains(graph)),
         ("matmul_residual", _find_matmul_residual_chains(graph)),
     ]
 
