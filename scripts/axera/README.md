@@ -2217,6 +2217,62 @@ now gone from "49 KB of opaque bytes" to "a register map with ~50 named
 fields in a dozen banks, each written with a 32-bit value" -- a
 concrete, enumerable target.
 
+### Typing the field map: three per-op fields are 91% of a real model's mcode; the rest is one-time setup
+
+Counting, per field, how many times `resnet18d` writes it and how many
+distinct values it uses (local, zero device runs) turns the enumerable
+map into a typed one:
+
+```
+field         writes  distinct   value range               what it looks like
+a1 00 50 01     724       4      {bit 0, 8, 20, 24}         one-hot flag, per op
+a1 00 40 02     181     181      0x0 .. 0xb45ba0 (= Wbt)    Wbt offset, per op
+a1 00 50 03     181     176      0x0 .. 0x2f7040 (~3.1 MB)  address into a smaller region, per op
+a1 00 30 03      16      10      0x1 .. 0x30009683          packed config, occasional
+a1 00 20 02      15       9      0x1 .. 0x93ff              small counts/sizes, occasional
+(6 more fields written 3-4 times, all high-entropy packed words, e.g. 0x888c97ff, 0xc0031883)
+(57 fields written once or twice)
+```
+
+**68 distinct fields in total; 57 of them are written fewer than three
+times.** Only three fields are written at per-op scale, and those three
+account for **1,086 of the 1,197 writes (91%)**. In other words, a
+real model's mcode is overwhelmingly a per-op loop of "set the flag,
+set the weight offset, set the other address" against a fixed
+configuration laid down once. That also says where the remaining
+decoding effort is worth spending: the semantics of exactly three
+fields would cover 91% of what the hardware is told, and two of them
+are already pinned quantitatively (`40 02`) or by value set (`50 01`).
+The obvious next target is `50 03`'s ~3.1 MB region -- the same
+size-matching argument that decoded `40 02` against the Wbt can be run
+against the model's activation tensors.
+
+### `50 03` is not whole activation tensors; it is a 64-byte-aligned tile arena
+
+Running that size-matching argument (local; shape inference on the
+cached `resnet18d` ONNX vs. the 176 distinct `50 03` operands):
+
+- **The whole-tensor hypothesis fails, and is reported as such.** The
+  operands' consecutive differences -- 4,096; 37,120; 14,080; 23,040;
+  7,936; ... -- are not activation-tensor sizes (`resnet18d` has 10
+  distinct INT8 activation sizes, from 512 to 802,816 bytes); only 2 of
+  the top 10 deltas coincide with a tensor size (25,088 and 512),
+  consistent with chance. Neither the largest tensor (802,816 B) nor the
+  sum of all intermediates (7.59 MB) equals the 3.1 MB span.
+- **What does hold is alignment and scale.** 175 of the 176 operands
+  are exact multiples of 64; the smallest non-zero one is 37,120
+  (`0x9100`, also the most frequent delta); the deltas are
+  tile-sized (a few KB to a few tens of KB), not tensor-sized.
+
+So `50 03` addresses a 64-byte-aligned arena of *tiles*, into which
+the compiler places activation chunks -- which fits both the earliest
+"32-byte unit / channel tiling" findings and the `_ocm_base` string
+this README decoded from the mcode header table long ago (on-chip
+memory has exactly this shape: small, aligned, tile-addressed). Whether
+the ~3.1 MB span is the on-chip memory's actual size is not confirmed
+against any spec here, and the tile-to-tensor mapping is not
+decoded; the field's *kind* -- aligned tile address -- is.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
