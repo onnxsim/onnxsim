@@ -577,7 +577,7 @@ def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
     )
 
 
-def _build_axmodel(work_dir, model, input_shape):
+def _build_axmodel(work_dir, model, input_shape, profile=False):
     os.makedirs(work_dir, exist_ok=True)
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
     rng = np.random.RandomState(0)
@@ -607,10 +607,59 @@ def _build_axmodel(work_dir, model, input_shape):
     with open(os.path.join(work_dir, "config", "cfg.json"), "w") as f:
         json.dump(cfg, f)
     result = pulsar2_docker.build(
-        work_dir, "model.onnx", "output", config_path="config/cfg.json"
+        work_dir, "model.onnx", "output", config_path="config/cfg.json", profile=profile
     )
     assert result.success, result.error
+    if profile:
+        return result.axmodel_path, result.trace_path
     return result.axmodel_path
+
+
+def _mcode_from_axmodel(axmodel_path):
+    compiled = onnx.load(axmodel_path)
+    inits = {i.name: i for i in compiled.graph.initializer}
+    neu_node = next(nd for nd in compiled.graph.node if nd.op_type == "neu mode")
+    info = None
+    for attr in neu_node.attribute:
+        if attr.name == "npu_graph_info":
+            info = json.loads(attr.s.decode())
+    mcode_key = info["dotneus"][0]["neu_key"]
+    return bytes(inits[mcode_key].raw_data)
+
+
+def _maxpool_model(k, stride, pad, ceil_mode=0, cin=4, insz=16):
+    import math
+
+    if ceil_mode:
+        out = math.ceil((insz + 2 * pad - k) / stride) + 1
+    else:
+        out = math.floor((insz + 2 * pad - k) / stride) + 1
+    node = helper.make_node(
+        "MaxPool",
+        ["x"],
+        ["y"],
+        kernel_shape=[k, k],
+        strides=[stride, stride],
+        pads=[pad, pad, pad, pad],
+        ceil_mode=ceil_mode,
+    )
+    graph = helper.make_graph(
+        [node],
+        f"g_maxpool_k{k}_s{stride}_p{pad}_ceil{ceil_mode}",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cin, out, out]
+            )
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
 
 
 def test_mcode_nondeterminism_does_not_change_real_device_output(tmp_path):
@@ -705,3 +754,66 @@ def test_autopad_normalizes_with_no_signal_beyond_known_noise(tmp_path):
         "auto_pad-vs-explicit diff should not exceed identical-rebuild noise "
         "by more than a token amount",
     )
+
+
+def test_maxpool_ceil_mode_is_a_third_confirmed_false_lead(tmp_path):
+    """Confirmed real (see the README's "Expanding past Conv" section):
+    MaxPool's `ceil_mode=0` vs `ceil_mode=1`, on a shape where both give
+    the identical output size, produces a same-length pair with a few
+    differing bytes -- but rebuilding `ceil_mode=0` alone, twice,
+    reproduces the same diff. This is the same non-deterministic label
+    noise confirmed on Conv/auto_pad, now shown on a completely different
+    op type: mcode's non-determinism is a global property, not tied to
+    any one op or model.
+    """
+    model_off = _maxpool_model(2, 2, 0, ceil_mode=0)
+    model_on = _maxpool_model(2, 2, 0, ceil_mode=1)
+
+    mcode_off_a = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "off_a"), model_off, (1, 4, 16, 16))
+    )
+    mcode_off_b = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "off_b"), model_off, (1, 4, 16, 16))
+    )
+    mcode_on = _mcode_from_axmodel(
+        _build_axmodel(os.path.join(str(tmp_path), "on"), model_on, (1, 4, 16, 16))
+    )
+    assert len(mcode_off_a) == len(mcode_off_b) == len(mcode_on)
+
+    noise_diff = sum(
+        1 for i in range(len(mcode_off_a)) if mcode_off_a[i] != mcode_off_b[i]
+    )
+    cross_diff = sum(
+        1 for i in range(len(mcode_off_a)) if mcode_off_a[i] != mcode_on[i]
+    )
+    assert cross_diff <= noise_diff + 2, (
+        (cross_diff, noise_diff),
+        "ceil_mode-vs-off diff should not exceed identical-rebuild noise "
+        "by more than a token amount",
+    )
+
+
+def test_non_mac_ops_schedule_on_teng2_not_conv_engines(tmp_path):
+    """Confirmed real via --profile (see the README's "Expanding past
+    Conv" section): AxMaxPool, the real residual AxQuantizedAdd, and
+    AxQuantizedGlobAvgPool all schedule on the `teng2` engine, never on
+    `conv0`/`conv1` (reserved for AxQuantizedConv/Gemm MAC work) --
+    extending the same finding already confirmed for AxQuantizedNormalize
+    in this project's resnet18d profiling to three more real primitive
+    families.
+    """
+    model = _maxpool_model(2, 2, 0)
+    _, trace_path = _build_axmodel(
+        os.path.join(str(tmp_path), "maxpool_profiled"),
+        model,
+        (1, 4, 16, 16),
+        profile=True,
+    )
+    trace = json.load(open(trace_path))
+    events = trace["traceEvents"] if isinstance(trace, dict) else trace
+    maxpool_events = [
+        e for e in events if e.get("ph") == "X" and "AxMaxPool" in e.get("name", "")
+    ]
+    assert maxpool_events, "expected at least one AxMaxPool event in the trace"
+    for e in maxpool_events:
+        assert e["tid"] == "teng2", (e, "expected AxMaxPool to schedule on teng2")

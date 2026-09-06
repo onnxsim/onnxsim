@@ -1446,6 +1446,47 @@ isn't reproduced by noise alone) before being trusted, not just a check
 against the two zones already known -- this project got this exact kind
 of false positive twice now, at two different locations.
 
+### Expanding past Conv: MaxPool, the real residual Add, and GlobalAveragePool, cross-checked against `--profile`
+
+Every mcode structural finding so far came from `Conv`. Directly
+extending coverage to three of `resnet18d`'s other real primitive
+families found in its own `trace.json` profiling earlier in this
+README -- `AxMaxPool`, `AxQuantizedAdd` (the real residual add of two
+activations, not the old constant-broadcast `Add` tested early in this
+investigation), and `AxQuantizedGlobAvgPool` -- using small controlled
+models and, per the user's suggestion, checking `--profile` metadata
+alongside mcode bytes this time rather than bytes alone.
+
+**A real, clean architectural split by execution engine, confirmed
+directly**: `AxMaxPool`, the real residual `AxQuantizedAdd`, and
+`AxQuantizedGlobAvgPool` all schedule on **`teng2`** (the same engine
+`AxQuantizedNormalize` used in the `resnet18d` profiling earlier) --
+never on `conv0`/`conv1`, which are reserved for `AxQuantizedConv` and
+`Gemm`-family MAC work. A clean, real, generalizable rule confirmed
+across four distinct primitive types now: **non-MAC ops run on `teng2`;
+MAC ops run on the conv engines.** `Pre_AxTranspose`'s own engine
+placement is context-dependent -- `cv3` when it wraps a `MaxPool` or
+`GlobalAvgPool`, `teng2` when it wraps a `Conv` in the residual-block
+test -- a real difference not chased down further here.
+
+**`MaxPool`'s `ceil_mode` is a third confirmed false lead, same
+signature as before.** Comparing `ceil_mode=0` vs `ceil_mode=1` on a
+shape where both give the identical output size produced a same-length
+pair with 5 differing bytes -- but a determinism check (rebuilding the
+`ceil_mode=0` config alone, twice) reproduced the same positions and the
+same exact multiset of values (`{0x13, 0x20, 0x23, 0x30, 0x40}`) already
+seen in the `auto_pad` false lead. **This is the same noise signature
+appearing a third time, now confirmed on a completely different op type
+and model** -- strong, direct evidence this non-determinism is a global
+property of mcode generation, not tied to Conv, to any one model shape,
+or to any one byte region.
+
+**`MaxPool`'s kernel size behaves like Conv's did**: comparing a `2x2`
+kernel against a `4x4` kernel with padding chosen to hold the same output
+shape gives *different* total mcode lengths (2,408 vs 2,440 bytes, a
+32-byte-unit-consistent delta) -- real, but not a same-length pair, so no
+clean localized diff was possible here the way the dilation experiments
+allowed for Conv.
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
