@@ -12984,6 +12984,283 @@ def test_structured_pruning_cbam_channel_gate_declines_on_stray_three_consumer_f
     np.testing.assert_array_equal(inits["SGW"], sg_w)
 
 
+# --- apply_structured_pruning: GCNet ContextBlock (channel-add attention) --
+#
+# See onnxsim/pruning.py's own "GCNet ContextBlock (channel-add attention)
+# chains" section comment for the full confirmed topology
+# (`torch.onnx.export`, opset 17, of a verbatim `xvjiarui/GCNet`/
+# `mmcv.cnn.ContextBlock` reproduction, `pooling_type='att',
+# fusion_types=('channel_add',)`) this section's tests exercise.
+
+
+def _gc_context_keep_indices(w0, w2c, keep_count):
+    # Combined (root-sum-square) importance of P's own [C, Cin, kH, kW]
+    # filter and channel_add_conv.2's own [C, planes, 1, 1] filter --
+    # mirroring `_se_conv_keep_indices`'s identical two-producer formula,
+    # just combined via the block's own closing `Add` rather than SE-gate's
+    # `Mul` (irrelevant to the importance formula either way -- see
+    # `_plain_structured_importance`'s own docstring).
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(w0.reshape(w0.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(w2c.reshape(w2c.shape[0], -1).astype(np.float64), axis=1)
+        )
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _gc_context_conv_model(Cin=3, C=16, planes=4, Cout=5, spatial=8, seed=0):
+    """`Conv -> ContextBlock -> Conv` -- GCNet's own channel-add attention
+    block, the exact shape a real `torch.onnx.export` (opset 17, legacy
+    exporter) emits for `pooling_type='att', fusion_types=('channel_add',)`.
+    Batch is fixed at 1 -- exactly the confirmed real export's own shape,
+    where `batch` (like `channel`) is read via `x.size(0)` and traced as a
+    literal Python int no differently than `channel` is (see this module's
+    own "GCNet ContextBlock" section comment for why neither is a
+    `Shape`-derived tensor).
+    """
+    rng = np.random.default_rng(seed)
+    hw = spatial * spatial
+    w0 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    b0 = rng.standard_normal((C,)).astype(np.float32)
+    wmask = rng.standard_normal((1, C, 1, 1)).astype(np.float32)
+    bmask = rng.standard_normal((1,)).astype(np.float32)
+    w0b = rng.standard_normal((planes, C, 1, 1)).astype(np.float32)
+    b0b = rng.standard_normal((planes,)).astype(np.float32)
+    ln_scale = rng.standard_normal((planes, 1, 1)).astype(np.float32)
+    ln_bias = rng.standard_normal((planes, 1, 1)).astype(np.float32)
+    w2c = rng.standard_normal((C, planes, 1, 1)).astype(np.float32)
+    b2c = rng.standard_normal((C,)).astype(np.float32)
+    w3 = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    b3 = rng.standard_normal((Cout,)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,{Cin},{spatial},{spatial}] X) => (float[1,{Cout},{spatial},{spatial}] Y)
+        {{
+          spine = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W0, B0)
+          ix = Reshape(spine, Shape1)
+          ix1 = Unsqueeze(ix, AxesOne)
+          cm = Conv<kernel_shape=[1,1]>(spine, Wmask, Bmask)
+          cm2 = Reshape(cm, Shape2)
+          cm3 = Softmax<axis=2>(cm2)
+          cm4 = Unsqueeze(cm3, AxesNegOne)
+          ctxraw = MatMul(ix1, cm4)
+          ctx = Reshape(ctxraw, Shape3)
+          c0 = Conv<kernel_shape=[1,1]>(ctx, W0b, B0b)
+          ln = LayerNormalization<axis=-3>(c0, LNScale, LNBias)
+          rl = Relu(ln)
+          c2 = Conv<kernel_shape=[1,1]>(rl, W2c, B2c)
+          blk = Add(spine, c2)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(blk, W3, B3)
+        }}
+        """,
+        initializer=[
+            _f32(w0, "W0"),
+            _f32(b0, "B0"),
+            _f32(wmask, "Wmask"),
+            _f32(bmask, "Bmask"),
+            _f32(w0b, "W0b"),
+            _f32(b0b, "B0b"),
+            _f32(ln_scale, "LNScale"),
+            _f32(ln_bias, "LNBias"),
+            _f32(w2c, "W2c"),
+            _f32(b2c, "B2c"),
+            _f32(w3, "W3"),
+            _f32(b3, "B3"),
+            onnx.numpy_helper.from_array(
+                np.array([1, C, hw], dtype=np.int64), "Shape1"
+            ),
+            onnx.numpy_helper.from_array(
+                np.array([1, 1, hw], dtype=np.int64), "Shape2"
+            ),
+            onnx.numpy_helper.from_array(
+                np.array([1, C, 1, 1], dtype=np.int64), "Shape3"
+            ),
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "AxesOne"),
+            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "AxesNegOne"),
+        ],
+        opset=17,
+    )
+    return model, w0, b0, wmask, bmask, w0b, b0b, ln_scale, ln_bias, w2c, b2c, w3, b3
+
+
+def test_structured_pruning_gc_context_matches_oracle():
+    Cin, C, planes, Cout = 3, 16, 4, 5
+    (
+        model,
+        w0,
+        b0,
+        wmask,
+        bmask,
+        w0b,
+        b0b,
+        ln_scale,
+        ln_bias,
+        w2c,
+        b2c,
+        w3,
+        b3,
+    ) = _gc_context_conv_model(Cin=Cin, C=C, planes=planes, Cout=Cout)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _gc_context_keep_indices(w0, w2c, C // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # P's own output channels, sliced.
+    np.testing.assert_array_equal(inits["W0"], w0[keep])
+    np.testing.assert_array_equal(inits["B0"], b0[keep])
+    # channel_add_conv.2's own OUTPUT channels, sliced by the SAME keep set
+    # -- it's added back onto spine's own surviving channels.
+    np.testing.assert_array_equal(inits["W2c"], w2c[keep])
+    np.testing.assert_array_equal(inits["B2c"], b2c[keep])
+    # conv_mask's own INPUT channels, re-sliced by the identical shared keep
+    # set -- its own single output channel (the pooling mask) is untouched.
+    np.testing.assert_array_equal(inits["Wmask"], wmask[:, keep])
+    np.testing.assert_array_equal(inits["Bmask"], bmask)
+    assert inits["Wmask"].shape[0] == 1
+    # channel_add_conv.0's own INPUT channels, re-sliced too -- its own
+    # bottleneck OUTPUT axis (`planes`) and the LayerNorm scale/bias astride
+    # it are completely untouched.
+    np.testing.assert_array_equal(inits["W0b"], w0b[:, keep])
+    assert inits["W0b"].shape[0] == planes
+    np.testing.assert_array_equal(inits["B0b"], b0b)
+    np.testing.assert_array_equal(inits["LNScale"], ln_scale)
+    np.testing.assert_array_equal(inits["LNBias"], ln_bias)
+    # the real downstream consumer's own input channels, sliced.
+    np.testing.assert_array_equal(inits["W3"], w3[:, keep])
+    np.testing.assert_array_equal(inits["B3"], b3)
+    # the two literal-channel-count Reshape targets are rewritten in place
+    # to the new, post-pruning channel count -- not left stale.
+    new_c = keep.size
+    np.testing.assert_array_equal(inits["Shape1"], [1, new_c, 8 * 8])
+    np.testing.assert_array_equal(inits["Shape2"], [1, 1, 8 * 8])  # untouched
+    np.testing.assert_array_equal(inits["Shape3"], [1, new_c, 1, 1])
+
+    x = np.random.default_rng(500).standard_normal((1, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _gc_context_conv_model(Cin=Cin, C=C // 2, planes=planes, Cout=Cout)
+    oracle_inits = {
+        "W0": w0[keep],
+        "B0": b0[keep],
+        "Wmask": wmask[:, keep],
+        "Bmask": bmask,
+        "W0b": w0b[:, keep],
+        "B0b": b0b,
+        "LNScale": ln_scale,
+        "LNBias": ln_bias,
+        "W2c": w2c[keep],
+        "B2c": b2c[keep],
+        "W3": w3[:, keep],
+        "B3": b3,
+    }
+    for init in oracle.graph.initializer:
+        if init.name in oracle_inits:
+            init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_gc_context_declines_on_gate_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: channel_add_conv.2's own
+    # final Conv outputs a single (broadcastable) channel instead of one
+    # matching `spine`'s own `C` -- a legitimate, valid ONNX `Add` broadcast,
+    # but not the exact shape this section's own matcher requires
+    # (channel_add_conv.2's own output-channel count must equal `spine`'s
+    # exactly). Locks in the conservative "decline outright, never partially
+    # slice" bar -- mirroring `test_structured_pruning_se_gate_declines_on_
+    # gate_channel_count_mismatch`'s own identical trick for SE-gate's fc2.
+    Cin, C, planes, Cout = 3, 16, 4, 5
+    model, w0, b0, wmask, bmask, w0b, b0b, ln_scale, ln_bias, w2c, b2c, w3, b3 = (
+        _gc_context_conv_model(Cin=Cin, C=C, planes=planes, Cout=Cout)
+    )
+    rng = np.random.default_rng(13)
+    w2c_bad = rng.standard_normal((1, planes, 1, 1)).astype(np.float32)
+    b2c_bad = rng.standard_normal((1,)).astype(np.float32)
+    for init in model.graph.initializer:
+        if init.name == "W2c":
+            init.CopyFrom(_f32(w2c_bad, "W2c"))
+        elif init.name == "B2c":
+            init.CopyFrom(_f32(b2c_bad, "B2c"))
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_gc_context_chains
+
+    assert _find_conv_gc_context_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], w0)
+    np.testing.assert_array_equal(inits["W3"], w3)
+    np.testing.assert_array_equal(inits["W2c"], w2c_bad)
+    np.testing.assert_array_equal(inits["Wmask"], wmask)
+
+
+def test_structured_pruning_gc_context_coexists_with_spatial_gate():
+    # Two entirely independent chains, sharing no nodes/weights, in ONE
+    # graph: a GCNet ContextBlock and a CBAM SpatialGate (see
+    # `_spatial_gate_conv_pair_model` above) -- both must resolve and prune
+    # correctly via a single `apply_structured_pruning` call, confirming
+    # `_find_conv_gc_context_chains` (a brand-new top-level finder) neither
+    # collides with nor is shadowed by `_walk_to_conv_consumer`'s own
+    # existing `recognize_spatial_gate` three-consumer dispatch point.
+    Cin, C, planes, Cout = 3, 16, 4, 5
+    (
+        gc_model,
+        gc_w0,
+        gc_b0,
+        gc_wmask,
+        gc_bmask,
+        gc_w0b,
+        gc_b0b,
+        gc_ln_scale,
+        gc_ln_bias,
+        gc_w2c,
+        gc_b2c,
+        gc_w3,
+        gc_b3,
+    ) = _gc_context_conv_model(Cin=Cin, C=C, planes=planes, Cout=Cout, seed=42)
+
+    rng = np.random.default_rng(43)
+    sg_w1 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    sg_w2 = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    sg_gate_w = rng.standard_normal((1, 2, 7, 7)).astype(np.float32)
+    sg_model = _spatial_gate_conv_pair_model(sg_w1, sg_w2, sg_gate_w, spatial=12)
+
+    combined = onnx.compose.merge_models(
+        gc_model,
+        sg_model,
+        io_map=[],
+        prefix1="gc_",
+        prefix2="sg_",
+    )
+    onnx.checker.check_model(combined)
+
+    pruned = onnxsim.apply_structured_pruning(combined, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    gc_keep = _gc_context_keep_indices(gc_w0, gc_w2c, C // 2)
+    np.testing.assert_array_equal(inits["gc_W0"], gc_w0[gc_keep])
+    np.testing.assert_array_equal(inits["gc_W2c"], gc_w2c[gc_keep])
+    np.testing.assert_array_equal(inits["gc_Wmask"], gc_wmask[:, gc_keep])
+    np.testing.assert_array_equal(inits["gc_W3"], gc_w3[:, gc_keep])
+
+    # SpatialGate's own producer/consumer are pruned by their own,
+    # completely independent keep set (no shared weight with the GC block
+    # above) -- just confirm the shapes actually shrank, matching the
+    # standalone SpatialGate oracle test's own bar.
+    assert inits["sg_W1"].shape[0] == C - round(C * 0.5)
+    assert inits["sg_W2"].shape[1] == C - round(C * 0.5)
+
+
 # --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----
 #
 # The MatMul/Gemm analogue of the Conv residual tests above -- see
