@@ -1425,7 +1425,7 @@ was:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Callable,
@@ -21573,6 +21573,15 @@ class _GQAChain:
     # `MultiHeadAttention` node whose own `bias` input is absent/empty --
     # both exactly as before this field existed.
     mha_bias: Optional[str] = None
+    # Set only for a matched ``LinearAttention`` node whose own `decay`/`beta`
+    # inputs (indices 4/5) are fed by a recognized ``com.microsoft::
+    # LinearAttentionGate`` node -- see :func:`_match_linear_attention_gate`
+    # (what's matched and why) and :class:`_LinearAttentionGatePassThrough`
+    # (what gets sliced at apply time). ``None`` (the default) for every
+    # other matched op, and for a `LinearAttention` chain whose `decay`/
+    # `beta` are absent or genuine constants -- both exactly as before this
+    # field existed.
+    linear_attention_gate: Optional["_LinearAttentionGatePassThrough"] = None
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -22944,46 +22953,65 @@ def _match_paged_attention_producer(
 #   or `attn_mask`).
 #
 #   **Scope boundary, declined rather than guessed at: a *dynamic*
-#   `decay`/`beta` declines the whole match outright**, unlike
-#   `GroupQueryAttention`'s own dynamic `past_key`/`past_value`/`attention_bias`
-#   (left alone, matched anyway) -- a deliberately narrower bar than the rest
-#   of this family, for a reason specific to these two inputs: `past_key`/
-#   `past_value`/`attention_bias`, when dynamic, are either an ordinary graph
-#   input (a caller free to supply a differently-sized tensor after this
-#   pass shrinks `kv_num_heads`) or, in an unrolled autoregressive loop,
-#   loop-carried from that *same op's own* `present_key`/`present_value`
-#   output -- which this pass's own `kv_num_heads` rewrite already narrows in
-#   step. `decay`/`beta` have no such self-consistent path: `LinearAttention`
-#   has no `decay`/`beta` *output* at all (only `output`/`present_state`), so
-#   a dynamic one can only come from a genuine graph input (in which case the
+#   `decay`/`beta` declines the whole match outright UNLESS it is fed by one
+#   specific, recognized producer shape**, unlike `GroupQueryAttention`'s own
+#   dynamic `past_key`/`past_value`/`attention_bias` (left alone, matched
+#   anyway) -- a deliberately narrower bar than the rest of this family, for
+#   a reason specific to these two inputs: `past_key`/`past_value`/
+#   `attention_bias`, when dynamic, are either an ordinary graph input (a
+#   caller free to supply a differently-sized tensor after this pass shrinks
+#   `kv_num_heads`) or, in an unrolled autoregressive loop, loop-carried from
+#   that *same op's own* `present_key`/`present_value` output -- which this
+#   pass's own `kv_num_heads` rewrite already narrows in step. `decay`/`beta`
+#   have no such self-consistent path in general: `LinearAttention` has no
+#   `decay`/`beta` *output* at all (only `output`/`present_state`), so a
+#   dynamic one can only come from a genuine graph input (in which case the
 #   "caller supplies a narrower tensor" reasoning above would still hold) or
 #   -- the realistic, common shape for every actual gated/delta/gated_delta
-#   export -- an internal node's own computation (e.g. `com.microsoft::
-#   LinearAttentionGate`, this op's own documented companion, projecting from
-#   a `dt_bias`/`decay_scale` weight sized `(kv_num_heads,)`) that this pass
-#   never traces into or adjusts. Nothing here can tell those two cases
-#   apart from the tensor name alone, and leaving a genuinely internally-
-#   computed, still-old-width `decay`/`beta` connected to a node whose own
-#   `kv_num_heads` this pass just shrank is a real, silent correctness risk
-#   (a shape mismatch at best, a wrong-axis silent miscompute at worst) --
-#   not a risk this pass is willing to take on an unconfirmed guess. The
-#   practical consequence: this pass only ever prunes a `LinearAttention`
-#   chain whose `update_rule` is `"linear"` (needs neither `decay` nor
-#   `beta` at all) or one whose `decay`/`beta` happen to be genuine constants
-#   (a degenerate shape no real dynamic-decode export produces, but handled
-#   correctly rather than assumed away) -- a `gated`/`delta`/`gated_delta`
-#   chain fed by a real `LinearAttentionGate` (or equivalent) node is left
-#   completely unmatched, exactly the same "unmatched topology, not a silent
-#   gap" outcome this module holds everywhere else. Recognizing
-#   `LinearAttentionGate` as its own pass-through hop (slicing its own
-#   `dt_bias`/`decay_scale` per-head weights by `keep_groups`, mirroring how
-#   `_walk_back_through_qk_norm_rope` already recognizes a per-head Q/K-norm
-#   sandwich) would close this gap, but is genuinely new machinery beyond
-#   this feature's own scope -- left for a future pass, the same kind of
-#   scoped-out future work `GroupQueryAttention`'s own in-op
-#   `q_norm_weight`/`k_norm_weight` gap once was, before this module's
-#   `_match_gqa_producer`/`_find_gqa_chains` closed it (see this module's
-#   "Attention-head pruning" section comment for that wiring).
+#   export -- an internal node's own computation that this pass would
+#   otherwise never trace into or adjust. Nothing here can tell those two
+#   cases apart from the tensor name alone, and leaving a genuinely
+#   internally-computed, still-old-width `decay`/`beta` connected to a node
+#   whose own `kv_num_heads` this pass just shrank is a real, silent
+#   correctness risk (a shape mismatch at best, a wrong-axis silent
+#   miscompute at worst) -- not a risk this pass is willing to take on an
+#   unconfirmed guess.
+#
+#   Exactly one internal-node shape *does* have a self-consistent "narrower
+#   output implies narrower producer" story, and is recognized:
+#   `com.microsoft::LinearAttentionGate` (this op's own documented
+#   companion, schema confirmed live via
+#   ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+#   against this environment's installed onnxruntime 1.29.0, `since_version`
+#   1) -- `decay = decay_scale * Softplus(a + dt_bias)`, `beta =
+#   Sigmoid(b)` (`b` "Required when the beta output is requested"), with
+#   `dt_bias`/`decay_scale` each a real `(kv_num_heads,)` float constant and
+#   `a`/`b` each a plain `(B, T, kv_num_heads)` MatMul/vanilla-Gemm
+#   activation. `dt_bias`/`decay_scale` are sliced directly (axis 0, by
+#   `keep_groups`) -- :func:`_apply_one_gqa_chain`'s own genuinely new
+#   per-tensor edit for this feature; `a`/`b` themselves need no slicing at
+#   all -- narrowing `a`'s/`b`'s own producer weight's output columns by the
+#   identical `keep_groups` (exactly how Q's/K's/V's own producer weight
+#   already gets narrowed) narrows `a`/`b` "for free", the same way this
+#   module never explicitly slices Q's/K's/V's own activation either. See
+#   :func:`_match_linear_attention_gate` (what's matched, and the
+#   single-consumer/not-a-graph-output bar every crossed edge is held to,
+#   mirroring `_walk_back_through_qk_norm_rope`'s own per-head Q/K-norm
+#   sandwich) and :class:`_LinearAttentionGatePassThrough` (what gets sliced)
+#   for the full mechanics. The practical consequence: this pass prunes a
+#   `LinearAttention` chain whose `update_rule` is `"linear"` (needs neither
+#   `decay` nor `beta` at all), one whose `decay`/`beta` happen to be genuine
+#   constants (a degenerate shape no real dynamic-decode export produces, but
+#   handled correctly rather than assumed away), AND -- since this fix -- a
+#   `gated`/`delta`/`gated_delta` chain fed by a real `LinearAttentionGate`
+#   node, the realistic shape every actual dynamic-decode export uses; a
+#   `decay`/`beta` fed by anything else dynamic (a bare graph input, any
+#   other node, a gate whose own `a`/`b` don't resolve to a plain constant-
+#   weight producer) is still left completely unmatched, exactly the same
+#   "unmatched topology, not a silent gap" outcome this module holds
+#   everywhere else -- deliberately NOT a general "any dynamic decay is now
+#   fine" relaxation, since no other shape has this one gate node's own
+#   self-consistent story.
 # - `scale` (float, default 0.0 -- "derives d_k... and uses 1/sqrt(d_k)")
 #   and `chunk_size` (int, "tuning hint; does not affect output correctness")
 #   are both entirely head-count-independent -- neither is ever read or
@@ -23036,12 +23064,18 @@ def _match_linear_attention_producer(
     rank-4 `(*, kv_num_heads, *, *)` shape (dynamic needs no check, left
     alone entirely -- the caller's own runtime data), and `decay`/`beta`
     (indices 4/5) -- see this section's own comment for the full reasoning
-    -- decline the whole match outright whenever either is connected but
-    *not* a constant, since nothing here can confirm a dynamic one's own
-    producer will still emit the correct post-pruning width. `beta`'s own
-    exact-shape check (its two documented shapes don't need `head_size` to
-    tell apart) runs here; `decay`'s own (which does) is deferred to
-    :func:`_find_linear_attention_chains`. This op has no
+    -- get their *constant*-shape checks here (a genuine constant not
+    exactly one of `decay`'s/`beta`'s own documented shapes declines the
+    whole match outright); a *dynamic* one is neither checked nor declined
+    here at all -- entirely deferred to :func:`_find_linear_attention_chains`
+    (via :func:`_match_linear_attention_gate`), which alone has the
+    graph-wide consumer/producer maps needed to tell a recognized
+    `com.microsoft::LinearAttentionGate` pass-through apart from anything
+    else dynamic (declined there instead). `beta`'s own exact-shape check
+    (its two documented shapes don't need `head_size` to tell apart) runs
+    here; `decay`'s own (which does) is deferred to
+    :func:`_find_linear_attention_chains` regardless of whether it is
+    constant or gate-fed. This op has no
     `attention_bias`/`attn_mask`-equivalent input at all on its own schema
     (confirmed off the same live schema dump the rest of this section was
     built from) -- `value_info_by_name` is accepted, unused, purely for
@@ -23080,9 +23114,13 @@ def _match_linear_attention_producer(
         if len(node.input) > idx and node.input[idx]:
             extra_init = initializer_map.get(node.input[idx])
             if extra_init is None:
-                return (
-                    None  # dynamic decay/beta -- declined, see this section's comment
-                )
+                # Dynamic decay/beta -- no longer declined right here: might
+                # be the one recognized `LinearAttentionGate` pass-through
+                # shape, checked later, once graph-wide consumer/producer
+                # maps are available, by :func:`_find_linear_attention_chains`
+                # (via :func:`_match_linear_attention_gate`) -- see this
+                # section's own comment for the full reasoning either way.
+                continue
             if (
                 not _is_supported_float_dtype(extra_init.data_type)
                 or len(extra_init.dims) != 3
@@ -24974,6 +25012,211 @@ def _find_paged_attention_chains(
     )
 
 
+@dataclass(frozen=True)
+class _LinearAttentionGatePassThrough:
+    """A ``com.microsoft::LinearAttentionGate`` node recognized, by
+    :func:`_match_linear_attention_gate`, as a safe pass-through producer
+    for a matched ``LinearAttention`` chain's own dynamic `decay`/`beta`
+    inputs -- see this module's own "Attention-head pruning" section
+    comment, the `LinearAttention` bullet's own `decay`/`beta` scope-boundary
+    paragraph, for the full empirical schema findings (`decay = decay_scale
+    * Softplus(a + dt_bias)`, `beta = Sigmoid(b)`, confirmed live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``)
+    and why this one op shape -- and only this one -- has a self-consistent
+    "narrower output implies narrower producer" story.
+
+    `dt_bias`/`decay_scale` (this node's own inputs 1/2, each a real
+    per-KV-head `(kv_num_heads,)` float constant) are sliced directly, axis
+    0, by the chain's own `keep_groups` -- :func:`_apply_one_gqa_chain`'s own
+    genuinely new per-tensor edit for this feature, mirroring how a
+    *constant* `decay`/`beta` already gets sliced elsewhere in that same
+    function.
+
+    `a`/`b` (this node's own inputs 0/3 -- `a` always present and always
+    resolved, since `decay` is this op's own required output, always
+    computed regardless of whether `LinearAttention` actually consumes it;
+    `b` only present/resolved when `beta` is *also* wired to the matched
+    chain's own `LinearAttention` node) need no slicing of their own: each
+    is itself a plain MatMul/vanilla-Gemm activation, exactly
+    `kv_num_heads`-wide, so narrowing that producer's own output columns by
+    the identical `keep_groups` -- recorded here as `a_weight`/`a_bias`/
+    `a_weight_transposed` (always set) and `b_weight`/`b_bias`/
+    `b_weight_transposed` (set only when `b` needs narrowing too) -- narrows
+    `a`/`b` themselves "for free", the same way slicing Q's/K's/V's own
+    producer weight already narrows their own activation with no separate
+    step. `b_weight` is left ``None`` whenever `beta` isn't wired to the
+    matched chain at all (the gate's own `beta` output, if present, is then
+    simply unused, so `b`'s own width is immaterial and left completely
+    untouched).
+    """
+
+    node: onnx.NodeProto
+    dt_bias: str
+    decay_scale: str
+    a_weight: str
+    a_bias: Optional[str]
+    a_weight_transposed: bool
+    b_weight: Optional[str] = None
+    b_bias: Optional[str] = None
+    b_weight_transposed: bool = False
+
+
+def _match_linear_attention_gate(
+    node: onnx.NodeProto,
+    kv_num_heads: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[_LinearAttentionGatePassThrough]:
+    """Recognizes exactly one dynamic-producer shape for a matched
+    ``LinearAttention`` `node`'s own `decay`/`beta` inputs (indices 4/5,
+    each already confirmed non-constant by the caller -- see
+    :func:`_match_linear_attention_producer`'s own docstring for why a
+    dynamic `decay`/`beta` is no longer declined right there, deferred here
+    instead, where the graph-wide consumer/producer maps this needs are
+    available): both fed, directly and exclusively, by the SAME
+    ``com.microsoft::LinearAttentionGate`` node's own `decay` (output 0)
+    and, when `beta` is also connected, `beta` (output 1) outputs -- this
+    op's own documented companion, confirmed live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+    against this environment's installed onnxruntime 1.29.0 (`since_version`
+    1): `decay = decay_scale * Softplus(a + dt_bias)`, `beta = Sigmoid(b)`
+    (`b` "Required when the beta output is requested"), `dt_bias`/
+    `decay_scale` "per-head float32 vectors of length H" (`H` ==
+    `kv_num_heads`). See this module's own "Attention-head pruning" section
+    comment, the `LinearAttention` bullet, for why this is deliberately the
+    ONLY dynamic `decay`/`beta` producer shape ever recognized -- anything
+    else (a bare graph input, any other node, a gate whose own `a`/`b` don't
+    resolve to a plain constant-weight producer) still declines the whole
+    match, exactly as before this function existed.
+
+    Every edge crossed -- `node`'s own `decay`/`beta` input(s), and the gate
+    node's own `a`/`b` input(s) -- is required to have exactly one consumer
+    and not be a graph output (the same "no other consumer along the way"
+    bar :func:`_walk_back_through_qk_norm_rope` already holds its own
+    crossed hops to): narrowing `dt_bias`'s/`decay_scale`'s/`a`'s-or-`b`'s
+    own producer weight in place would otherwise silently corrupt whatever
+    else reads that same tensor. `a`'s (always) and `b`'s (only when `beta`
+    is connected) own producer must independently resolve via
+    :func:`_match_producer` (a plain MatMul/vanilla-Gemm with a constant 2-D
+    float weight) to a `kv_num_heads`-wide output -- exactly the schema's
+    own `(B, T, H)` shape -- so :func:`_apply_one_gqa_chain` can narrow it
+    the same "slice the producer weight's own output columns by
+    `keep_groups`" way Q's/K's/V's own producer weight already gets
+    narrowed (see :class:`_LinearAttentionGatePassThrough`'s own docstring
+    for why `a`/`b` themselves never need touching beyond that). Anything
+    not matching this exact shape declines outright (returns ``None``)
+    rather than guessed at.
+    """
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    decay_name = node.input[4] if len(node.input) > 4 else ""
+    beta_name = node.input[5] if len(node.input) > 5 else ""
+    dyn_decay = bool(decay_name) and decay_name not in initializer_map
+    dyn_beta = bool(beta_name) and beta_name not in initializer_map
+    if not dyn_decay and not dyn_beta:
+        return None  # nothing dynamic here -- not this function's own case
+
+    dyn_names = [
+        n for n in (decay_name if dyn_decay else "", beta_name if dyn_beta else "") if n
+    ]
+    gate_node = node_by_output.get(dyn_names[0])
+    if gate_node is None:
+        return None
+    if any(node_by_output.get(n) is not gate_node for n in dyn_names):
+        return None  # both dynamic inputs must be this SAME gate node's own outputs
+    if (
+        gate_node.domain != "com.microsoft"
+        or gate_node.op_type != "LinearAttentionGate"
+    ):
+        return None
+    if dyn_decay and (
+        len(gate_node.output) < 1
+        or not gate_node.output[0]
+        or gate_node.output[0] != decay_name
+    ):
+        return None
+    if dyn_beta and (
+        len(gate_node.output) < 2
+        or not gate_node.output[1]
+        or gate_node.output[1] != beta_name
+    ):
+        return None
+    for n in dyn_names:
+        if not _is_internal(n):
+            return None
+
+    if (
+        len(gate_node.input) < 3
+        or not gate_node.input[0]
+        or not gate_node.input[1]
+        or not gate_node.input[2]
+    ):
+        return None
+    a_name, dt_bias_name, decay_scale_name = (
+        gate_node.input[0],
+        gate_node.input[1],
+        gate_node.input[2],
+    )
+    dt_bias_init = initializer_map.get(dt_bias_name)
+    decay_scale_init = initializer_map.get(decay_scale_name)
+    if dt_bias_init is None or decay_scale_init is None:
+        return None
+    for init in (dt_bias_init, decay_scale_init):
+        if not _is_supported_float_dtype(init.data_type) or list(init.dims) != [
+            kv_num_heads
+        ]:
+            return None
+
+    if not _is_internal(a_name):
+        return None
+    a_prod = node_by_output.get(a_name)
+    if a_prod is None:
+        return None
+    a_info = _match_producer(a_prod, initializer_map)
+    if a_info is None:
+        return None
+    a_weight, a_weight_t, a_bias, a_n = a_info
+    if a_n != kv_num_heads:
+        return None
+
+    b_weight: Optional[str] = None
+    b_bias: Optional[str] = None
+    b_weight_t = False
+    if dyn_beta:
+        if len(gate_node.input) < 4 or not gate_node.input[3]:
+            return None
+        b_name = gate_node.input[3]
+        if not _is_internal(b_name):
+            return None
+        b_prod = node_by_output.get(b_name)
+        if b_prod is None:
+            return None
+        b_info = _match_producer(b_prod, initializer_map)
+        if b_info is None:
+            return None
+        b_weight, b_weight_t, b_bias, b_n = b_info
+        if b_n != kv_num_heads:
+            return None
+        if b_weight == a_weight:
+            return None  # degenerate -- can't independently slice a shared producer
+
+    return _LinearAttentionGatePassThrough(
+        node=gate_node,
+        dt_bias=dt_bias_name,
+        decay_scale=decay_scale_name,
+        a_weight=a_weight,
+        a_bias=a_bias,
+        a_weight_transposed=a_weight_t,
+        b_weight=b_weight,
+        b_bias=b_bias,
+        b_weight_transposed=b_weight_t,
+    )
+
+
 def _find_linear_attention_chains(
     graph: onnx.GraphProto,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
@@ -24989,20 +25232,32 @@ def _find_linear_attention_chains(
     requirement the two agree), the same as the plain ai.onnx `Attention`
     op/`MultiHeadAttention`.
 
-    Performs the one deferred check :func:`_match_linear_attention_producer`
-    itself cannot -- it doesn't yet know `head_size` (resolved only here,
-    from Q's own producer weight, by :func:`_find_separate_qkv_chains`
-    itself): a connected constant `decay` (index 4) must be exactly one of
-    its own two documented shapes -- ``(*, *, kv_num_heads)`` (DeltaNet/
-    RetNet, per-head scalar decay) or ``(*, *, kv_num_heads * head_size)``
-    (GLA/RWKV-6, per-key-dimension decay, `head_size` being Q's/K's shared
-    per-head width -- *not* V's own, independent `v_head_size`) -- anything
-    else declines the whole chain here, the same "don't guess" bar every
-    other deferred shape check in this section already holds (mirroring
-    `PagedAttention`'s own deferred `q_norm_weight`/`k_norm_weight`
-    exact-shape check). A *dynamic* `decay`/`beta` was already declined
-    outright at match time (see :func:`_match_linear_attention_producer`'s
-    own docstring for why) -- nothing here is reachable for that case.
+    Performs two deferred checks :func:`_match_linear_attention_producer`
+    itself cannot:
+
+    - A connected constant `decay` (index 4) must be exactly one of its own
+      two documented shapes -- ``(*, *, kv_num_heads)`` (DeltaNet/RetNet,
+      per-head scalar decay) or ``(*, *, kv_num_heads * head_size)``
+      (GLA/RWKV-6, per-key-dimension decay, `head_size` being Q's/K's shared
+      per-head width -- *not* V's own, independent `v_head_size`) --
+      anything else declines the whole chain here, the same "don't guess"
+      bar every other deferred shape check in this section already holds
+      (mirroring `PagedAttention`'s own deferred `q_norm_weight`/
+      `k_norm_weight` exact-shape check); needs `head_size`, resolved only
+      here, from Q's own producer weight, by :func:`_find_separate_qkv_chains`
+      itself.
+    - A connected *dynamic* `decay`/`beta` (declined outright by
+      :func:`_match_linear_attention_producer` before this fix; now merely
+      deferred, since it might be the one recognized
+      `com.microsoft::LinearAttentionGate` pass-through shape) is resolved
+      here via :func:`_match_linear_attention_gate`, which needs the
+      graph-wide consumer/producer maps :func:`_match_linear_attention_producer`
+      itself is never given -- a chain whose dynamic `decay`/`beta` doesn't
+      resolve this way is dropped here (the same "unmatched topology"
+      outcome as any other declined chain), one that does is rewrapped
+      (:func:`dataclasses.replace`, since :class:`_GQAChain` is frozen) with
+      its own `.linear_attention_gate` set, for :func:`_apply_one_gqa_chain`
+      to slice at apply time.
     """
     chains = _find_separate_qkv_chains(
         graph,
@@ -25012,10 +25267,36 @@ def _find_linear_attention_chains(
         allow_differing_v_head_size=True,
     )
     initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
     out = []
     for chain in chains:
         decay_name = chain.node.input[4] if len(chain.node.input) > 4 else ""
-        if decay_name:
+        beta_name = chain.node.input[5] if len(chain.node.input) > 5 else ""
+        decay_dynamic = bool(decay_name) and decay_name not in initializer_map
+        beta_dynamic = bool(beta_name) and beta_name not in initializer_map
+
+        gate: Optional[_LinearAttentionGatePassThrough] = None
+        if decay_dynamic or beta_dynamic:
+            gate = _match_linear_attention_gate(
+                chain.node,
+                chain.kv_num_heads,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+            )
+            if gate is None:
+                continue  # dynamic decay/beta not the recognized
+                # LinearAttentionGate shape -- declined
+            if gate.a_weight in (chain.q_weight, chain.k_weight, chain.v_weight) or (
+                gate.b_weight is not None
+                and gate.b_weight in (chain.q_weight, chain.k_weight, chain.v_weight)
+            ):
+                continue  # degenerate -- can't independently slice a shared producer
+
+        if decay_name and not decay_dynamic:
             decay_init = initializer_map.get(decay_name)
             if decay_init is not None:
                 last = decay_init.dims[-1] if len(decay_init.dims) else -1
@@ -25024,7 +25305,10 @@ def _find_linear_attention_chains(
                     chain.kv_num_heads * chain.head_size,
                 ):
                     continue  # neither of decay's own two documented shapes
-        out.append(chain)
+
+        out.append(
+            chain if gate is None else replace(chain, linear_attention_gate=gate)
+        )
     return out
 
 
@@ -28436,24 +28720,27 @@ def _apply_one_gqa_chain(
 
     # `LinearAttention`'s own `past_state`/`decay`/`beta` (indices 3/4/5 --
     # see this module's own "Attention-head pruning" section comment, the
-    # `LinearAttention` bullet, for the full empirical schema findings and
-    # why a *dynamic* `decay`/`beta` already declined the whole match at
-    # :func:`_match_linear_attention_producer` time -- nothing reaches this
-    # block for that case). `past_state` (rank-4 `(B, kv_num_heads, d_k,
-    # d_v)`) is the closest analogue of `GroupQueryAttention`'s own
-    # `past_key`/`past_value`, sliced the identical axis-1 way when
-    # constant. `decay` (rank-3) is either `kv_num_heads`-wide (DeltaNet/
-    # RetNet, per-head scalar -- sliced directly by `keep_groups`, no
-    # `head_size` expansion) or `kv_num_heads * d`-wide (GLA/RWKV-6,
-    # per-key-dimension -- sliced by the same per-head *column* expansion
-    # K's own producer weight gets, :func:`_head_column_indices`); already
-    # confirmed to be exactly one of these two shapes, or dynamic, by
-    # :func:`_find_linear_attention_chains`'s own deferred check, so no
-    # `else` branch here needs to guess at a third shape. `beta` (rank-3,
-    # `kv_num_heads`-wide or a size-1 broadcast) is sliced only in the
-    # former case -- the latter needs no per-head slicing at all, the same
-    # "PER_TENSOR broadcast, left alone" reasoning as `k_scale`/`v_scale`
-    # above.
+    # `LinearAttention` bullet, for the full empirical schema findings). A
+    # *dynamic* `decay`/`beta` reaches this block only when
+    # `chain.linear_attention_gate` is set (see below) -- anything else
+    # dynamic already declined the whole match, in
+    # :func:`_find_linear_attention_chains` (via
+    # :func:`_match_linear_attention_gate`) or, before that, at
+    # :func:`_match_linear_attention_producer` time. `past_state` (rank-4
+    # `(B, kv_num_heads, d_k, d_v)`) is the closest analogue of
+    # `GroupQueryAttention`'s own `past_key`/`past_value`, sliced the
+    # identical axis-1 way when constant. `decay` (rank-3) is either
+    # `kv_num_heads`-wide (DeltaNet/RetNet, per-head scalar -- sliced
+    # directly by `keep_groups`, no `head_size` expansion) or `kv_num_heads
+    # * d`-wide (GLA/RWKV-6, per-key-dimension -- sliced by the same
+    # per-head *column* expansion K's own producer weight gets,
+    # :func:`_head_column_indices`); already confirmed, when constant, to be
+    # exactly one of these two shapes by :func:`_find_linear_attention_chains`'s
+    # own deferred check, so no `else` branch here needs to guess at a third
+    # shape. `beta` (rank-3, `kv_num_heads`-wide or a size-1 broadcast) is
+    # sliced only in the former case -- the latter needs no per-head slicing
+    # at all, the same "PER_TENSOR broadcast, left alone" reasoning as
+    # `k_scale`/`v_scale` above.
     if is_linear_attention:
         if len(chain.node.input) > 3 and chain.node.input[3]:
             past_state_init = initializer_map.get(chain.node.input[3])
@@ -28471,6 +28758,35 @@ def _apply_one_gqa_chain(
             beta_init = initializer_map.get(chain.node.input[5])
             if beta_init is not None and beta_init.dims[-1] == h:
                 _slice_last_axis(beta_init, keep_groups)
+
+        # A recognized ``com.microsoft::LinearAttentionGate`` pass-through
+        # (see :func:`_match_linear_attention_gate`,
+        # :class:`_LinearAttentionGatePassThrough`): `dt_bias`/`decay_scale`
+        # (both real `(kv_num_heads,)` constants) are sliced directly, axis
+        # 0 -- the one genuinely new per-tensor edit this feature adds.
+        # `a`'s (always) and `b`'s (only when `beta` was also wired to this
+        # chain) own producer weight -- resolved, at match time, to a plain
+        # MatMul/vanilla-Gemm output exactly `kv_num_heads` columns wide --
+        # is sliced the identical `keep_groups` way Q's/K's/V's own producer
+        # weight already is a few lines above, narrowing `a`/`b` themselves
+        # with no separate step (see that class's own docstring for why).
+        gate = chain.linear_attention_gate
+        if gate is not None:
+            _slice_last_axis(initializer_map[gate.dt_bias], keep_groups)
+            _slice_last_axis(initializer_map[gate.decay_scale], keep_groups)
+            _slice_producer_weight(
+                initializer_map[gate.a_weight], gate.a_weight_transposed, keep_groups
+            )
+            if gate.a_bias is not None:
+                _slice_last_axis(initializer_map[gate.a_bias], keep_groups)
+            if gate.b_weight is not None:
+                _slice_producer_weight(
+                    initializer_map[gate.b_weight],
+                    gate.b_weight_transposed,
+                    keep_groups,
+                )
+                if gate.b_bias is not None:
+                    _slice_last_axis(initializer_map[gate.b_bias], keep_groups)
 
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
     # for the plain ai.onnx op, 5 for `MultiHeadAttention`, 4 for
@@ -28614,8 +28930,20 @@ def _apply_one_gqa_chain(
         if hop is not None:
             stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
             stale.update(hop.extra_stale_outputs)
+    producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+    if chain.linear_attention_gate is not None:
+        # A recognized `LinearAttentionGate` pass-through node is a
+        # distinct node from `chain.node` (already covered by `stale`
+        # above), so its own `decay`/`beta` outputs need marking stale
+        # here too, and `a`'s/`b`'s own (now narrower) producer weight
+        # needs the same touched-producer bookkeeping every other producer
+        # weight in this chain already gets.
+        stale.update(chain.linear_attention_gate.node.output)
+        producer_names.add(chain.linear_attention_gate.a_weight)
+        if chain.linear_attention_gate.b_weight is not None:
+            producer_names.add(chain.linear_attention_gate.b_weight)
     return (
-        {chain.q_weight, chain.k_weight, chain.v_weight},
+        producer_names,
         chain.consumer_weight,
         stale,
     )
@@ -28677,6 +29005,15 @@ def _apply_attention_chains(
     for chain in chains:
         if isinstance(chain, (_GQAChain, _DecomposedGQAChain)):
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+            if isinstance(chain, _GQAChain) and chain.linear_attention_gate is not None:
+                # See :func:`_apply_one_gqa_chain`'s own identical addition
+                # to its returned producer-name set -- checked here too so a
+                # `LinearAttentionGate`'s own `a`/`b` producer weight shared
+                # with an earlier chain is skipped up front, the same as
+                # Q's/K's/V's own already are.
+                producer_names.add(chain.linear_attention_gate.a_weight)
+                if chain.linear_attention_gate.b_weight is not None:
+                    producer_names.add(chain.linear_attention_gate.b_weight)
         else:
             producer_names = {chain.weight}
         if (
@@ -43094,6 +43431,12 @@ def _analyze_attention_chains(
         elif isinstance(chain, _GQAChain):
             label = _node_label(chain.node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+            if chain.linear_attention_gate is not None:
+                # See :func:`_apply_one_gqa_chain`'s own identical addition
+                # to its returned producer-name set.
+                producer_names.add(chain.linear_attention_gate.a_weight)
+                if chain.linear_attention_gate.b_weight is not None:
+                    producer_names.add(chain.linear_attention_gate.b_weight)
             h = chain.kv_num_heads
             # True MQA (`kv_num_heads == 1`) fast path -- mirrors
             # :func:`_apply_one_gqa_chain`'s own `is_mqa` handling: KV-group
