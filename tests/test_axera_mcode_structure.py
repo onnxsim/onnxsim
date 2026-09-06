@@ -943,7 +943,9 @@ def test_grouped_conv_splits_across_two_mac_engines_dense_does_not(tmp_path):
         trace = json.load(open(trace_path))
         events = trace["traceEvents"] if isinstance(trace, dict) else trace
         conv_events = [
-            e for e in events if e.get("ph") == "X" and "AxQuantizedConv" in e.get("name", "")
+            e
+            for e in events
+            if e.get("ph") == "X" and "AxQuantizedConv" in e.get("name", "")
         ]
         return len(conv_events), sorted({e.get("tid") for e in conv_events})
 
