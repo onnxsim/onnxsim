@@ -73,6 +73,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.shape_inference
 
 BLOCK_SIZE = 32
 
@@ -115,7 +116,16 @@ def _synthetic_mlp(
         graph, opset_imports=[onnx.helper.make_opsetid("", 21)]
     )
     model.ir_version = 10
-    return model
+    # Shape inference is not cosmetic here. onnxsim's INT4 pass refuses a
+    # MatMul whose activation's element type it cannot see
+    # (``info.x->elemType() != FLOAT`` in
+    # passes/weight_only_quantize_int4_matmul.h), and a hand-built graph has
+    # no value_info for its intermediate tensors -- so without this only the
+    # *first* layer (whose input is the typed graph input) would be
+    # quantized, and this benchmark would report onnxsim compressing 1 of N
+    # layers against NNCF's N of N. A real exported model carries this
+    # value_info already; a synthetic one has to be given it.
+    return onnx.shape_inference.infer_shapes(model)
 
 
 def _referenced_initializer_bytes(model: onnx.ModelProto) -> int:
@@ -282,9 +292,16 @@ def compare(model: onnx.ModelProto, num_eval: int = 32, seed: int = 0) -> None:
     in_dim = model.graph.input[0].type.tensor_type.shape.dim[-1].dim_value
     rng = np.random.default_rng(seed)
     eval_x = {in_name: rng.standard_normal((num_eval, in_dim)).astype(np.float32)}
+    # GPTQ-style methods build a ``[K, K]`` Hessian from these activations, so
+    # a calibration set with fewer rows than ``K`` leaves it rank-deficient and
+    # its correction unreliable -- which shows up, misleadingly, as GPTQ
+    # *hurting* accuracy. Default to comfortably more rows than the reduction
+    # dimension.
+    per_batch = 64
+    num_batches = max(4, -(-2 * in_dim // per_batch))
     calibration = [
-        {in_name: rng.standard_normal((16, in_dim)).astype(np.float32)}
-        for _ in range(4)
+        {in_name: rng.standard_normal((per_batch, in_dim)).astype(np.float32)}
+        for _ in range(num_batches)
     ]
 
     float_y = _run(model, eval_x)
@@ -341,7 +358,10 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.model and os.path.exists(args.model):
-        model = onnx.load(args.model)
+        # Same reason as _synthetic_mlp: onnxsim's INT4 pass needs the
+        # activation's element type on every candidate MatMul. Exported
+        # models normally carry it; inferring is a no-op when they do.
+        model = onnx.shape_inference.infer_shapes(onnx.load(args.model))
         print(f"model: {args.model}")
     else:
         model = _synthetic_mlp(
