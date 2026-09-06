@@ -2011,3 +2011,585 @@ def test_resnet18d_50_01_step_set_dispatches_the_op_and_bit24_is_inert_model_wid
     assert np.array_equal(all_bit24_zero, out_base), (
         "expected bit24 to be inert for correctness across every op"
     )
+
+
+_VERBS = {0xA1, 0xA2, 0xA3, 0xA8, 0xA9}
+
+
+def _verb_headers(mcode, start=328):
+    """Every verb header word in the phase-0 bulk of an mcode blob -- see
+    the README's "Five verbs, a readable per-op program" section. Returns
+    `(word_index, verb, xx, yy, operand)` for each `XX 00 <mult of 0x10>
+    yy` word whose first byte is a known verb, indexing words from
+    `start` (the preamble before it has variable-length slots)."""
+    words = [mcode[i : i + 4] for i in range(start, len(mcode) - 3, 4)]
+    return [
+        (k, w[0], w[2], w[3], int.from_bytes(words[k + 1], "little"))
+        for k, w in enumerate(words)
+        if w[0] in _VERBS and w[1] == 0 and w[2] % 0x10 == 0 and k + 1 < len(words)
+    ]
+
+
+def test_resnet18d_bulk_is_a_two_word_stream_of_five_verbs_with_a_per_op_program(
+    tmp_path,
+):
+    """Confirmed real (see the README's "Five verbs, a readable per-op
+    program" section), all local: with all five verbs counted, 97.5% of
+    consecutive headers in the bulk are exactly two words apart; `a9 00
+    00` and both `a8` selectors occur exactly once per op (181); and 64
+    of 180 ops are exactly one eleven-instruction template. Also locks in
+    the header-declared arena size 0x2ff000 bounding every `50 03`
+    address. Needs Docker for the build but no device.
+    """
+    from collections import Counter
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    hdrs = _verb_headers(mcode)
+    assert len(hdrs) >= 2200, len(hdrs)
+
+    gaps = Counter(b[0] - a[0] for a, b in zip(hdrs, hdrs[1:]))
+    assert gaps[2] / sum(gaps.values()) >= 0.95, gaps.most_common(5)
+
+    by_verb_sel = Counter((v, xx, yy) for _, v, xx, yy, _ in hdrs)
+    assert by_verb_sel[(0xA9, 0x00, 0x00)] == 181
+    assert by_verb_sel[(0xA8, 0x30, 0x02)] == by_verb_sel[(0xA8, 0x40, 0x03)] == 181
+    assert by_verb_sel[(0xA2, 0x00, 0x00)] >= 350
+    assert by_verb_sel[(0xA3, 0x00, 0x00)] >= 180
+
+    cuts = [k for k, v, xx, yy, _ in hdrs if (v, xx, yy) == (0xA1, 0x40, 0x02)]
+    template = "a1:5001 a1:5001 a8:4003 a1:5003 a1:5001 a3:0000 a1:5001 a9:0000 a2:0000 a8:3002"
+    patterns = Counter(
+        " ".join(f"{v:02x}:{xx:02x}{yy:02x}" for k, v, xx, yy, _ in hdrs if a < k < b)
+        for a, b in zip(cuts, cuts[1:])
+    )
+    assert patterns[template] >= 60, patterns.most_common(2)
+
+    arena = int.from_bytes(mcode[76:80], "little")
+    assert arena == 0x2FF000, hex(arena)
+    assert int.from_bytes(mcode[72:76], "little") == 4096
+    max_50_03 = max(
+        op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x03)
+    )
+    assert max_50_03 < arena and arena - max_50_03 < 40_000, (
+        hex(max_50_03),
+        hex(arena),
+    )
+
+
+def _build_real_zoo_model(work_dir, name):
+    """Fetch and really build any single-image-input onnxmodelzoo model
+    the same way `convert_onnxmodelzoo.py` does. Returns `(axmodel_path,
+    mcode_key, mcode_bytes, wbt_bytes)`. The resnet18d-specific
+    `_build_real_resnet18d` above predates this and keeps its exact-size
+    assertion; new multi-model tests should use this one."""
+    import convert_onnxmodelzoo  # also puts model_zoo on sys.path
+    import model_zoo
+
+    model = onnx.load(model_zoo.fetch_model(name))
+    tensor_name = convert_onnxmodelzoo._single_image_input(model)
+    assert tensor_name is not None, name
+
+    os.makedirs(os.path.join(work_dir, "model"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    pulsar2_docker.make_synthetic_calibration_tar(
+        os.path.join(work_dir, "dataset", "calib.tar")
+    )
+    onnx.save(model, os.path.join(work_dir, "model", f"{name}.onnx"))
+    result = pulsar2_docker.build(
+        work_dir,
+        f"model/{name}.onnx",
+        f"output/{name}",
+        tensor_name=tensor_name,
+        mean=convert_onnxmodelzoo._DEFAULT_MEAN,
+        std=convert_onnxmodelzoo._DEFAULT_STD,
+        calibration_dataset_rel_path="dataset/calib.tar",
+    )
+    assert result.success, (name, result.error)
+    compiled = onnx.load(result.axmodel_path)
+    inits = {i.name: i for i in compiled.graph.initializer}
+    key = _mcode_key(compiled)
+    return (
+        result.axmodel_path,
+        key,
+        bytes(inits[key].raw_data),
+        bytes(inits[_params_key(compiled)].raw_data),
+    )
+
+
+def test_mcode_field_map_generalizes_to_mnasnet_small(tmp_path):
+    """Confirmed real (see the README's "The whole map generalizes to a
+    second real architecture" section), all local on a real
+    `mnasnet_small_Opset17` build: the same header constants (4096,
+    0x2ff000 arena), the same five verbs, one `40 02`/`50 03`/`a9`/`a8`
+    write each per op with the op count simply changing (133), four
+    `50 01` writes per op in the same one-hot set and fixed order, `40 02`
+    spanning its (very different) Wbt, and the dominant per-op template.
+    Needs Docker for the build but no device.
+    """
+    from collections import Counter
+
+    _, _, mcode, wbt = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+    assert int.from_bytes(mcode[72:76], "little") == 4096
+    assert int.from_bytes(mcode[76:80], "little") == 0x2FF000, (
+        "arena size is a platform constant"
+    )
+
+    hdrs = _verb_headers(mcode)
+    by = Counter((v, xx, yy) for _, v, xx, yy, _ in hdrs)
+    n_ops = by[(0xA1, 0x40, 0x02)]
+    assert 100 <= n_ops <= 160, n_ops
+    for sel in (
+        (0xA1, 0x50, 0x03),
+        (0xA9, 0x00, 0x00),
+        (0xA8, 0x30, 0x02),
+        (0xA8, 0x40, 0x03),
+    ):
+        assert by[sel] == n_ops, (sel, by[sel], n_ops)
+    assert by[(0xA1, 0x50, 0x01)] == 4 * n_ops
+    assert {op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x01)} == {
+        0x1,
+        0x100,
+        0x100000,
+        0x1000000,
+    }
+
+    ops4002 = [op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x40, 0x02)]
+    assert len(set(ops4002)) == n_ops
+    assert 0.95 * len(wbt) <= max(ops4002) <= len(wbt), (max(ops4002), len(wbt))
+    max_50_03 = max(
+        op for _, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x03)
+    )
+    assert max_50_03 < 0x2FF000 and 0x2FF000 - max_50_03 < 40_000, hex(max_50_03)
+
+    cuts = [k for k, v, xx, yy, _ in hdrs if (v, xx, yy) == (0xA1, 0x40, 0x02)]
+    flags = [(k, op) for k, v, xx, yy, op in hdrs if (v, xx, yy) == (0xA1, 0x50, 0x01)]
+    order = (0x100, 0x1, 0x100000, 0x1000000)
+    assert all(
+        tuple(op for k, op in flags if a < k < b) == order
+        for a, b in zip(cuts, cuts[1:])
+    ), "expected every op to write the same four-step sequence"
+    template = "a1:5001 a1:5001 a8:4003 a1:5003 a1:5001 a3:0000 a1:5001 a9:0000 a2:0000 a8:3002"
+    patterns = Counter(
+        " ".join(f"{v:02x}:{xx:02x}{yy:02x}" for k, v, xx, yy, _ in hdrs if a < k < b)
+        for a, b in zip(cuts, cuts[1:])
+    )
+    assert patterns.most_common(1)[0][0] == template, patterns.most_common(2)
+
+
+def _verb_free_regions(mcode, min_words=8):
+    """Gaps between consecutive verb headers larger than a [header][operand]
+    pair, as `(extra_words)` per gap -- the verb-free regions of the README's
+    "Correction: the instruction runs are two-word, but they are only 37% of
+    the bulk" section."""
+    hdrs = _verb_headers(mcode)
+    return [b[0] - a[0] - 2 for a, b in zip(hdrs, hdrs[1:]) if b[0] - a[0] >= min_words]
+
+
+def test_verb_runs_are_a_minority_of_the_bulk_and_the_prologue_is_shared(tmp_path):
+    """Confirmed real (see the README's "Correction: the instruction runs
+    are two-word, but they are only 37% of the bulk" section), all local
+    on real resnet18d and mnasnet_small builds: the five-verb pairs cover
+    ~37% / ~19% of the bulk words; the rest sits in 44 / 127 verb-free
+    regions; both prologues carry the compact `00 xx 84 vv` ladder (a
+    short-form write with no verb byte); and the two real classifiers
+    share a byte-identical prologue of 150+ bytes from the first field
+    write. Needs Docker for the builds but no device.
+    """
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    _, _, mnas, _ = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+
+    for name, mcode, cover_lo, cover_hi, min_regions in (
+        ("resnet18d", r18, 0.30, 0.45, 40),
+        ("mnasnet", mnas, 0.15, 0.25, 120),
+    ):
+        n_words = (len(mcode) - 328) // 4
+        coverage = 2 * len(_verb_headers(mcode)) / n_words
+        assert cover_lo <= coverage <= cover_hi, (name, coverage)
+        assert len(_verb_free_regions(mcode)) >= min_regions, (
+            name,
+            len(_verb_free_regions(mcode)),
+        )
+        seg = mcode[297 : 297 + 120]
+        ladder = [
+            seg[i + 1]
+            for i in range(len(seg) - 3)
+            if seg[i] == 0 and seg[i + 2] == 0x84 and seg[i + 1] % 0x10 == 0
+        ]
+        assert ladder == [0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0], (name, ladder)
+
+    shared = 0
+    while (
+        297 + shared < min(len(r18), len(mnas))
+        and r18[297 + shared] == mnas[297 + shared]
+    ):
+        shared += 1
+    assert shared >= 150, shared
+
+
+def _walk_variable_length(mcode, start=297, end=None):
+    """Greedy variable-length walk over an mcode blob's bulk with the three
+    known instruction forms (8-byte verb, 7-byte verb when the next header
+    lands at +7, 4-byte compact `00 xx 84 vv` write), stepping one unknown
+    byte otherwise -- see the README's "Second correction: the verb-free
+    regions are the same instruction stream, drifted off the 4-byte grid"
+    section. Returns `(explained_bytes, total_bytes, Counter of forms)`."""
+    from collections import Counter
+
+    end = len(mcode) - 252 if end is None else end
+
+    def is_verb(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] in _VERBS
+            and mcode[i + 1] == 0
+            and mcode[i + 2] % 0x10 == 0
+        )
+
+    def is_compact(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] == 0
+            and mcode[i + 2] == 0x84
+            and mcode[i + 1] % 0x10 == 0
+        )
+
+    forms, explained, i = Counter(), 0, start
+    while i < end:
+        if is_verb(i):
+            n = (
+                7
+                if (
+                    not (is_verb(i + 8) or is_compact(i + 8))
+                    and (is_verb(i + 7) or is_compact(i + 7))
+                )
+                else 8
+            )
+            forms[f"verb{n}"] += 1
+        elif is_compact(i):
+            n = 4
+            forms["compact4"] += 1
+        else:
+            n = 1
+            forms["unknown"] += 1
+        explained += n if n > 1 else 0
+        i += n
+    return explained, end - start, forms
+
+
+def test_verb_free_regions_are_drifted_instructions_and_a_walker_beats_the_grid(
+    tmp_path,
+):
+    """Confirmed real (see the README's "Second correction" section), all
+    local on real resnet18d and mnasnet_small builds: the "verb-free
+    regions" hold verb-shaped words at byte phases 1-3 (>= 100 in
+    resnet18d) and hundreds of compact `00 xx 84 vv` writes, and a
+    variable-length walker knowing only three forms explains more of the
+    bulk than the fixed 4-byte grid on both models, recovering 7-byte and
+    compact instructions the grid cannot see. Needs Docker for the builds
+    but no device.
+    """
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    _, _, mnas, _ = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+
+    for name, mcode in (("resnet18d", r18), ("mnasnet", mnas)):
+        explained, total, forms = _walk_variable_length(mcode)
+        grid = 8 * len(_verb_headers(mcode)) / total
+        assert explained / total > grid + 0.05, (name, explained / total, grid)
+        assert forms["verb7"] > 0 and forms["compact4"] > 300, (name, dict(forms))
+        assert explained / total < 0.6, (
+            name,
+            "walker should not claim near-complete coverage",
+        )
+
+    hdrs = _verb_headers(r18)
+    off_phase = 0
+    for a, b in zip(hdrs, hdrs[1:]):
+        if b[0] - a[0] >= 8:
+            lo, hi = 328 + 4 * (a[0] + 2), 328 + 4 * b[0]
+            off_phase += sum(
+                1
+                for i in range(lo, hi - 3)
+                if (i - 328) % 4 != 0
+                and r18[i] in _VERBS
+                and r18[i + 1] == 0
+                and r18[i + 2] % 0x10 == 0
+            )
+    assert off_phase >= 100, off_phase
+
+
+def test_resnet18d_verb_free_regions_fault_like_instructions_on_device(tmp_path):
+    """Confirmed real on the device (see the README's "The regions fault
+    like instructions on the device" section): flipping single bytes at
+    the start, middle and end of the largest "verb-free regions" of the
+    real resnet18d mcode mostly faults with 0x8030070C (24 of 30 in the
+    ten largest; 10 of 12 in the four largest used here on one build, 7
+    of 12 on a fresh rebuild -- per-flip outcomes vary between builds, the
+    majority does not) -- the answer of a validated instruction stream,
+    not of a data table, which would give wrong values or nothing.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    hdrs = _verb_headers(mcode)
+    regions = sorted(
+        (
+            (328 + 4 * (a[0] + 2), 4 * (b[0] - a[0] - 2))
+            for a, b in zip(hdrs, hdrs[1:])
+            if b[0] - a[0] >= 8
+        ),
+        key=lambda r: -r[1],
+    )[:4]
+    assert regions and regions[0][1] >= 2000, regions
+
+    x = np.random.RandomState(42).randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+
+    faults = 0
+    for start, length in regions:
+        for off in (start + 8, start + length // 2, start + length - 8):
+            patched = bytearray(mcode)
+            patched[off] ^= 0xFF
+            c = onnx.load(path)
+            {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+            p = os.path.join(str(tmp_path), f"region_{off}.axmodel")
+            onnx.save(c, p)
+            dev = _run_retry_once(p, x)
+            if dev.error:
+                assert "0x8030070C" in dev.error, (off, dev.error)
+                faults += 1
+    assert faults >= 7, (
+        faults,
+        "expected a majority of flips inside the regions to fault",
+    )
+
+
+def _permutation_ratio(non_verb_bytes, pattern, shuffles=10, seed=0):
+    """Observed count of `pattern(b, i)` over the bytes vs. its mean count
+    over byte-shuffled copies (same histogram, order destroyed) -- the
+    chance baseline the README's "Third correction" section shows is the
+    right one for positional patterns."""
+    import random
+
+    rng = random.Random(seed)
+
+    def count(b):
+        return sum(1 for i in range(len(b)) if pattern(b, i))
+
+    observed = count(non_verb_bytes)
+    nulls = []
+    for _ in range(shuffles):
+        s = bytearray(non_verb_bytes)
+        rng.shuffle(s)
+        nulls.append(count(bytes(s)))
+    return observed / (sum(nulls) / len(nulls))
+
+
+def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
+    """Confirmed real (see the README's "Third correction" section), all
+    local: against a permutation null (the non-verb bytes shuffled, same
+    histogram), the 4-byte `00 ?? TT ??` form, the prologue ladder
+    `00 x0 84 ??`, and the prefix + tag == 0x84 rule are each far above
+    chance on the real resnet18d blob -- unlike an independence estimate,
+    which understated them. Deterministic (fixed seed). Needs Docker for
+    the build but no device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    tags = set(range(0x81, 0x85))
+
+    def is_verb(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] in _VERBS
+            and mcode[i + 1] == 0
+            and mcode[i + 2] % 0x10 == 0
+        )
+
+    non_verb = bytearray()
+    i, end = 297, len(mcode) - 252
+    while i < end:
+        if is_verb(i):
+            i += 8
+        else:
+            non_verb.append(mcode[i])
+            i += 1
+    non_verb = bytes(non_verb)
+    assert len(non_verb) > 20_000
+
+    w4 = _permutation_ratio(
+        non_verb, lambda b, i: i + 3 < len(b) and b[i] == 0 and b[i + 2] in tags
+    )
+    ladder = _permutation_ratio(
+        non_verb,
+        lambda b, i: i + 3 < len(b)
+        and b[i] == 0
+        and b[i + 1] % 0x10 == 0
+        and b[i + 2] == 0x84,
+    )
+    complement = _permutation_ratio(
+        non_verb,
+        lambda b, i: i + 3 < len(b)
+        and b[i] <= 3
+        and i + 2 + b[i] < len(b)
+        and b[i + 2 + b[i]] == 0x84 - b[i],
+    )
+    assert w4 >= 2.5, w4
+    assert ladder >= 5.0, ladder
+    assert complement >= 4.0, complement
+
+    # The width rule: for prefix p, the tag byte is enriched at offset
+    # exactly p + 2 and nowhere else nearby -- the unit is p + 4 bytes long.
+    for prefix in range(4):
+        ratios = {
+            k: _permutation_ratio(
+                non_verb,
+                lambda b, i, k=k, p=prefix: i + k < len(b)
+                and b[i] == p
+                and b[i + k] in tags,
+                shuffles=5,
+            )
+            for k in range(1, 6)
+        }
+        peak = max(ratios, key=ratios.get)
+        assert peak == prefix + 2, (prefix, ratios)
+        assert ratios[peak] >= 2.0, (prefix, ratios)
+        assert all(r <= 1.8 for k, r in ratios.items() if k != peak), (prefix, ratios)
+
+
+def _tokenize_mcode(mcode, start=297):
+    """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
+    verb instructions and the width-rule short units `[p][p+1 bytes][0x84-p]
+    [value]` (p+4 bytes) -- stepping one unknown byte otherwise. Returns
+    `(byte_offset, kind, a, b, c)` tuples: kind 'V' (a=verb, b=xx, c=yy),
+    'S' (a=prefix, b=tag, c=field) or '?' (a=byte). See the README's "The
+    layout that explains all of it" section."""
+    tags = set(range(0x81, 0x85))
+    end = len(mcode) - 252
+
+    def is_verb(i):
+        return (
+            i + 3 < len(mcode)
+            and mcode[i] in _VERBS
+            and mcode[i + 1] == 0
+            and mcode[i + 2] % 0x10 == 0
+        )
+
+    def short_len(i):
+        p = mcode[i]
+        return (
+            p + 4
+            if (p <= 3 and i + p + 3 < len(mcode) and mcode[i + p + 2] in tags)
+            else 0
+        )
+
+    out, i = [], start
+    while i < end:
+        if is_verb(i):
+            n = (
+                7
+                if (
+                    not (is_verb(i + 8) or short_len(i + 8))
+                    and (is_verb(i + 7) or short_len(i + 7))
+                )
+                else 8
+            )
+            out.append((i, "V", mcode[i], mcode[i + 2], mcode[i + 3]))
+        elif short_len(i):
+            n = short_len(i)
+            out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
+        else:
+            n = 1
+            out.append((i, "?", mcode[i], 0, 0))
+        i += n
+    return out
+
+
+def test_mcode_layout_is_two_config_blocks_then_clean_op_programs(tmp_path):
+    """Confirmed real (see the README's "The layout that explains all of
+    it" section), all local on real resnet18d and mnasnet_small builds:
+    splitting the token stream at every `a1 40 02` write, the op-program
+    region (the last 180 / 132 segments) contains no short unit and no
+    unknown byte -- each op is exactly the verb template -- while at least
+    90% of all short units and unknown bytes sit in the first two
+    segments, the configuration blocks. Needs Docker for the builds but
+    no device.
+    """
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    _, _, mnas, _ = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+
+    for name, mcode, min_clean_ops in (("resnet18d", r18, 178), ("mnasnet", mnas, 130)):
+        toks = _tokenize_mcode(mcode)
+        cuts = [k for k, t in enumerate(toks) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+        assert len(cuts) >= min_clean_ops + 2, (name, len(cuts))
+        segments = [toks[a:b] for a, b in zip(cuts, cuts[1:])]
+
+        def noise(seg):
+            return sum(1 for t in seg if t[1] in "S?")
+
+        clean = sum(1 for seg in segments[2:] if noise(seg) == 0)
+        assert clean >= min_clean_ops, (name, clean, len(segments))
+
+        total_noise = sum(noise(seg) for seg in segments) + noise(toks[cuts[-1] :])
+        front_noise = noise(segments[0]) + noise(segments[1])
+        assert front_noise >= 0.9 * total_noise, (name, front_noise, total_noise)
+        assert toks[cuts[2]][0] > 20_000, (
+            name,
+            "expected the op region to start after the config blocks",
+        )
+
+
+def test_resnet18d_config_block_b_residue_is_structured_and_headed(tmp_path):
+    """Confirmed real (see the README's "Into config block B" section),
+    all local on a real resnet18d build: within the larger configuration
+    block, the width rule extends to prefix 4 (tag at offset 6, >= 2x a
+    shuffled null); the undecoded residue left after removing every
+    validated instruction has a best internal period that beats its own
+    shuffle by >= 2x (real local structure, not fixed records); and its
+    most common 2-byte pair is an `XX 00` header-like pair from the
+    candidate second family. Deterministic (fixed seed). Needs Docker for
+    the build but no device.
+    """
+    import random
+    from collections import Counter
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    toks = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(toks) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    lo, hi = toks[cuts[1]][0], toks[cuts[2]][0]
+    block = mcode[lo:hi]
+    assert 15_000 <= len(block) <= 25_000, len(block)
+
+    rng = random.Random(0)
+    tags = set(range(0x81, 0x85))
+
+    def count_p4(b):
+        return sum(1 for i in range(len(b) - 7) if b[i] == 4 and b[i + 6] in tags)
+
+    shuffled = bytearray(block)
+    rng.shuffle(shuffled)
+    observed, null = count_p4(block), count_p4(bytes(shuffled))
+    assert observed >= 40 and null > 0 and observed / null >= 2.0, (observed, null)
+
+    residue = bytes(mcode[i] for i, kind, *_ in toks if kind == "?" and lo <= i < hi)
+    assert 8_000 <= len(residue) <= 14_000, len(residue)
+
+    def best_period(b):
+        best = 0.0
+        for q in range(2, 65):
+            best = max(
+                best,
+                sum(1 for i in range(q, len(b)) if b[i] == b[i - q]) / (len(b) - q),
+            )
+        return best
+
+    res_shuffled = bytearray(residue)
+    rng.shuffle(res_shuffled)
+    assert best_period(residue) >= 2.0 * best_period(bytes(res_shuffled))
+
+    top_pair = Counter(residue[i : i + 2] for i in range(len(residue) - 1)).most_common(
+        1
+    )[0][0]
+    assert top_pair[1] == 0 and top_pair[0] in {0x23, 0x16, 0x03, 0x04, 0x01, 0x00}, (
+        top_pair.hex()
+    )
