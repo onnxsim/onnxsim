@@ -2537,3 +2537,59 @@ def test_mcode_layout_is_two_config_blocks_then_clean_op_programs(tmp_path):
             name,
             "expected the op region to start after the config blocks",
         )
+
+
+def test_resnet18d_config_block_b_residue_is_structured_and_headed(tmp_path):
+    """Confirmed real (see the README's "Into config block B" section),
+    all local on a real resnet18d build: within the larger configuration
+    block, the width rule extends to prefix 4 (tag at offset 6, >= 2x a
+    shuffled null); the undecoded residue left after removing every
+    validated instruction has a best internal period that beats its own
+    shuffle by >= 2x (real local structure, not fixed records); and its
+    most common 2-byte pair is an `XX 00` header-like pair from the
+    candidate second family. Deterministic (fixed seed). Needs Docker for
+    the build but no device.
+    """
+    import random
+    from collections import Counter
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    toks = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(toks) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    lo, hi = toks[cuts[1]][0], toks[cuts[2]][0]
+    block = mcode[lo:hi]
+    assert 15_000 <= len(block) <= 25_000, len(block)
+
+    rng = random.Random(0)
+    tags = set(range(0x81, 0x85))
+
+    def count_p4(b):
+        return sum(1 for i in range(len(b) - 7) if b[i] == 4 and b[i + 6] in tags)
+
+    shuffled = bytearray(block)
+    rng.shuffle(shuffled)
+    observed, null = count_p4(block), count_p4(bytes(shuffled))
+    assert observed >= 40 and null > 0 and observed / null >= 2.0, (observed, null)
+
+    residue = bytes(mcode[i] for i, kind, *_ in toks if kind == "?" and lo <= i < hi)
+    assert 8_000 <= len(residue) <= 14_000, len(residue)
+
+    def best_period(b):
+        best = 0.0
+        for q in range(2, 65):
+            best = max(
+                best,
+                sum(1 for i in range(q, len(b)) if b[i] == b[i - q]) / (len(b) - q),
+            )
+        return best
+
+    res_shuffled = bytearray(residue)
+    rng.shuffle(res_shuffled)
+    assert best_period(residue) >= 2.0 * best_period(bytes(res_shuffled))
+
+    top_pair = Counter(residue[i : i + 2] for i in range(len(residue) - 1)).most_common(
+        1
+    )[0][0]
+    assert top_pair[1] == 0 and top_pair[0] in {0x23, 0x16, 0x03, 0x04, 0x01, 0x00}, (
+        top_pair.hex()
+    )

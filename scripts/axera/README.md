@@ -2774,6 +2774,36 @@ done; the frontier is precisely two configuration blocks whose short
 units follow the width rule and whose remaining bytes (18.9 KB in
 `resnet18d`) are the actual undecoded content of mcode.
 
+### Into config block B: the width rule reaches prefix 4, and a candidate second header family
+
+First pass over the larger configuration block (`resnet18d` bytes
+11,433..30,816; `mnasnet` 19,977..64,672), asking what the undecoded
+residue is made of once every validated instruction is removed.
+
+**The width rule extends, a little.** Testing prefixes `p = 4..15` the
+same way (tag byte at offset `p + 2`, against a shuffled null of the
+block): `p = 4` holds in both models (2.6x, n = 68; 2.4x, n = 203);
+`p = 5` and `p = 9` reach ~2.2x in `mnasnet` only; `p = 6..8` and
+`10..15` sit at chance. Admitting `p <= 4` shrinks `resnet18d`'s block-B
+residue from 11,396 to 11,134 bytes -- the family is `p = 0..4` (units
+of 4..8 bytes), and it is not where most of the residue goes. Block B
+is **42.6%** explained in `resnet18d` and **63.4%** in `mnasnet`.
+
+**What remains is not records, and not noise.** The residue's runs are
+still instruction-sized (2, 4, 8, 6, 15, 13, 7, 5 bytes; longest 136),
+and its best internal period is weak in absolute terms (5 bytes, 8.3%
+matching) but **three times** the same residue shuffled (2.7%) -- real
+local structure, not fixed-size records. Its most common 2-byte pairs
+are `23 00` (139), `00 00`, `03 00`, `18 9f`, `8b 18`, `16 00` in
+`resnet18d` and `00 00`, `16 00`, `04 00`, `9f 16`, `01 00`, `16 04` in
+`mnasnet`: a set of `XX 00` pairs with `XX` in `{0x23, 0x16, 0x03,
+0x04, 0x01}` -- the same `23 00` family the tiny model's four
+non-deterministic noise bytes lived in. That reads as a **second header
+family** (`XX 00` with a first byte outside the verb set), i.e. more
+instruction forms with their own widths, and it is the next thing to
+validate with the permutation method -- the width-rule test above is
+exactly the template for it.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
