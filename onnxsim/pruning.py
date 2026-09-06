@@ -31969,52 +31969,31 @@ def apply_attention_head_pruning(
     is left unsliced there even though the equivalent top-level-graph case
     would be handled -- a documented, conservative gap, not a correctness
     risk.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_attention_head_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own ``ApplyAttentionHeadPruning``),
+    forwarding every argument unchanged. Imported lazily (inside the
+    function body, not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module
+    (:class:`EmbeddingPruningResult`), so importing it back at module load
+    time here would deadlock the import machinery. One pre-existing,
+    pre-approved narrowing: a ``com.microsoft::LinearAttentionGate``-fed
+    decay/beta producer (see this module's own
+    :func:`_match_linear_attention_gate`/:class:`_LinearAttentionGatePassThrough`)
+    is not yet recognized by the C++ port, which cleanly declines the whole
+    match instead of mis-slicing it -- see ``tests/test_pruning.py``'s own
+    ``test_linear_attention_pruning_gate_fed_decay_and_beta_matches_oracle``/
+    ``test_linear_attention_pruning_gate_fed_decay_only_slices_wa_and_gate_weights``.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    _validate_importance_norm(importance_norm)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import apply_attention_head_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    top_value_info_by_name = _shape_inferred_value_info_by_name(out)
-
-    for graph in _iter_subgraphs(out.graph):
-        value_info_by_name = (
-            top_value_info_by_name if graph is out.graph else _value_info_by_name(graph)
-        )
-
-        chains: List[_AttnLikeChain] = [
-            *_find_attention_chains(graph, value_info_by_name),
-            *_find_gqa_chains(graph, value_info_by_name),
-            *_find_onnx_attention_chains(graph, value_info_by_name),
-            *_find_mha_chains(graph, value_info_by_name),
-            *_find_packed_mha_chains(graph, value_info_by_name),
-            *_find_decoder_masked_mha_chains(graph, value_info_by_name),
-            *_find_paged_attention_chains(graph, value_info_by_name),
-            *_find_linear_attention_chains(graph, value_info_by_name),
-            *_find_sparse_attention_chains(graph, value_info_by_name),
-            *_find_decomposed_gqa_chains(graph, value_info_by_name),
-        ]
-        if chains:
-            _apply_attention_chains(
-                graph,
-                chains,
-                sparsity,
-                lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
-                    chain, wq, wk, wv, dq, dk, dv, importance_norm
-                ),
-                lambda chain, wq, wk, wv: _gqa_group_importance(
-                    chain, wq, wk, wv, importance_norm
-                ),
-                value_info_by_name,
-                lambda chain, wq: _gqa_query_head_importance(
-                    chain, wq, importance_norm
-                ),
-            )
-
-    return out
+    return apply_attention_head_pruning_cpp(
+        model,
+        sparsity=sparsity,
+        importance_norm=importance_norm,
+    )
 
 
 def _wanda_attention_calibration_stats(
@@ -32150,112 +32129,29 @@ def apply_attention_head_wanda_pruning(
     calibration activations captured here are, like every other Wanda-style
     pass in this module, read via a real ``onnxruntime`` run and cast to
     float64 on capture regardless of the graph's own declared dtype.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_attention_head_wanda_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyAttentionHeadWandaPruning``), forwarding every argument unchanged.
+    Imported lazily (inside the function body, not at module scope) to avoid
+    a circular import, same reasoning as :func:`apply_attention_head_pruning`'s
+    own alias. Shares that same function's one pre-existing, pre-approved
+    ``com.microsoft::LinearAttentionGate`` narrowing (see its own docstring).
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    _validate_importance_norm(importance_norm)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_attention_head_wanda_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    value_info_by_name = _shape_inferred_value_info_by_name(out)
-
-    chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph, value_info_by_name),
-        *_find_gqa_chains(graph, value_info_by_name),
-        *_find_onnx_attention_chains(graph, value_info_by_name),
-        *_find_mha_chains(graph, value_info_by_name),
-        *_find_packed_mha_chains(graph, value_info_by_name),
-        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
-        *_find_paged_attention_chains(graph, value_info_by_name),
-        *_find_linear_attention_chains(graph, value_info_by_name),
-        *_find_sparse_attention_chains(graph, value_info_by_name),
-        *_find_decomposed_gqa_chains(graph, value_info_by_name),
-    ]
-    if not chains:
-        return out
-
-    act_norm = _wanda_attention_calibration_stats(
-        out, chains, calibration_data, providers
+    return apply_attention_head_wanda_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        importance_norm=importance_norm,
+        epsilon=epsilon,
+        providers=providers,
     )
-
-    def _wanda_attention_head_importance(chain, wq, wk, wv, dq, dk, dv):
-        base = _plain_attention_head_importance(
-            chain, wq, wk, wv, dq, dk, dv, importance_norm
-        )
-        norm = act_norm.get(chain.consumer_node.input[0])
-        if norm is None or norm.shape[0] != chain.nv:
-            return base  # no matching activation observed -- fall back to plain
-        act_head = np.array(
-            [
-                np.linalg.norm(norm[h * dv : (h + 1) * dv])
-                for h in range(chain.num_heads)
-            ]
-        )
-        return base * np.maximum(act_head, epsilon)
-
-    def _wanda_gqa_group_importance(chain, wq, wk, wv):
-        base = _gqa_group_importance(chain, wq, wk, wv, importance_norm)
-        norm = act_norm.get(chain.consumer_node.input[0])
-        # The probed activation is the consumer's own input -- the attention
-        # output, laid out per *query* head at *V's* own per-head width
-        # (`chain.v_head_size`), the same `dv` :func:`_apply_one_gqa_chain`
-        # itself uses for that tensor's own indexing (equal to
-        # `chain.head_size` for `GroupQueryAttention`, not necessarily for
-        # the plain ai.onnx op -- see :class:`_GQAChain`'s own `v_head_size`
-        # field).
-        dv = chain.v_head_size
-        width = chain.num_heads * dv
-        if norm is None or norm.shape[0] != width:
-            return base  # no matching activation observed -- fall back to plain
-        group_size = chain.num_heads // chain.kv_num_heads
-        act_group = np.array(
-            [
-                np.linalg.norm(norm[kv * group_size * dv : (kv + 1) * group_size * dv])
-                for kv in range(chain.kv_num_heads)
-            ]
-        )
-        return base * np.maximum(act_group, epsilon)
-
-    def _wanda_gqa_query_head_importance(chain, wq):
-        # MQA fast path's own Wanda variant -- mirrors
-        # `_wanda_attention_head_importance`'s per-head activation term
-        # exactly (each query head's own `dv`-wide slice of the probed
-        # activation, at *its own* head index rather than combined across a
-        # whole KV group's worth of query heads the way
-        # `_wanda_gqa_group_importance` above does), scaling
-        # `_gqa_query_head_importance`'s weight-only score instead of
-        # `_plain_attention_head_importance`'s.
-        base = _gqa_query_head_importance(chain, wq, importance_norm)
-        norm = act_norm.get(chain.consumer_node.input[0])
-        dv = chain.v_head_size
-        width = chain.num_heads * dv
-        if norm is None or norm.shape[0] != width:
-            return base  # no matching activation observed -- fall back to plain
-        act_head = np.array(
-            [
-                np.linalg.norm(norm[qh * dv : (qh + 1) * dv])
-                for qh in range(chain.num_heads)
-            ]
-        )
-        return base * np.maximum(act_head, epsilon)
-
-    _apply_attention_chains(
-        graph,
-        chains,
-        sparsity,
-        _wanda_attention_head_importance,
-        _wanda_gqa_group_importance,
-        value_info_by_name,
-        _wanda_gqa_query_head_importance,
-    )
-    return out
 
 
 # --- MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight) structured
