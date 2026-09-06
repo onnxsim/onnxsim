@@ -10268,6 +10268,751 @@ def _find_conv_se_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- CBAM ChannelGate chains ------------------------------------------------
+#
+# CBAM (Convolutional Block Attention Module, Woo et al. 2018,
+# https://arxiv.org/abs/1807.06521)'s own "ChannelGate" stage -- the
+# canonical public reference implementation's own exact shape
+# (`github.com/Jongchan/attention-module`'s `ChannelGate`), confirmed live
+# via a real `torch.onnx.export` (torch 2.14.0+cpu, TorchScript exporter,
+# opset 17 -- see `tests/test_pruning.py`'s own fixture for the captured
+# `onnx.printer.to_text` graph this section's matcher is built directly
+# against):
+#
+#     avg = avg_pool2d(x, (H, W))       max = max_pool2d(x, (H, W))
+#     a = mlp(avg)                      m = mlp(max)          # SAME mlp
+#     scale = sigmoid(a + m).unsqueeze(2).unsqueeze(3).expand_as(x)
+#     return x * scale
+#
+# structurally analogous to, but a genuinely different shape from, the
+# Squeeze-and-Excitation gate this module's own Conv residual/merge section
+# above already recognizes (see its own section comment) -- CBAM's own
+# ChannelGate runs TWO pooling branches (global average AND global max,
+# not SE's one), through a SHARED-WEIGHT (tied) two-layer bottleneck
+# (`Gemm`/vanilla-`MatMul`, not SE's `Conv(1x1)`), combined by `Add` before
+# the final `Sigmoid`, and closes via `Unsqueeze`x2 + `Expand` + `Mul`
+# rather than SE's `Mul` fed directly by the gate Conv's own (already
+# `[N, C, 1, 1]`-shaped) output. None of `_find_conv_chains`/
+# `_find_conv_residual_chains`/`_find_conv_concat_chains` recognize any of
+# this -- confirmed empirically, all three return zero chains on the
+# topology below -- leaving the producer Conv's own output channels (and
+# the gate subnetwork's own final layer) completely unprunable in any
+# CBAM-attached backbone.
+#
+# What this section matches, conservatively -- declining rather than
+# guessing at anything beyond the one confirmed real shape above:
+#
+#   - `P`, an ordinary (`group == 1`) Conv/FusedConv producer
+#     (`_match_conv_producer`) whose own raw output, optionally through a
+#     linear run of `_UNARY_PASS_THROUGH` activations (each a strict
+#     single-consumer hop, zero admitted too -- mirroring
+#     `_find_conv_se_gate_chains`'s own identical allowance), reaches a
+#     tensor `spine` with EXACTLY FOUR consumers: one `Mul(spine, gate_out)`
+#     (the closing gate multiply), one `AveragePool`, one `MaxPool`, and one
+#     `Shape` -- confirmed real and, per this section's own investigation,
+#     load-bearing rather than a merely "harmless" extra reader (see below),
+#     so, unlike `_match_gap_flatten_matmul_consumer`'s own tolerated
+#     `Shape` side-reader (whose own output is never inspected further),
+#     this one is REQUIRED, not optional, and its own output is required to
+#     feed the closing `Expand` -- a deliberate, verified deviation from an
+#     earlier draft of this section's own brief, which framed it as merely
+#     "optional": `Expand`'s own shape argument, in the confirmed real
+#     export, is always `Shape(spine)` itself, which is exactly what makes
+#     pruning safe here at all -- `Shape` reads `spine`'s own ACTUAL runtime
+#     shape, so once `P`'s own output channels are pruned, `spine`'s real
+#     runtime channel count is already reduced by the time `Shape` executes,
+#     and `Expand`'s own target shape is automatically correct with no
+#     graph edit needed. A hardcoded/constant `Expand` target (this
+#     section's own narrower, declined case, never matched here) would be
+#     unsafe to prune past, since it would keep demanding the OLD channel
+#     count after `P` is pruned.
+#   - Real provenance for `AveragePool`/`MaxPool` (not `GlobalAveragePool`/
+#     `GlobalMaxPool`): the canonical reference implementation calls
+#     `F.avg_pool2d`/`F.max_pool2d` with an explicit `kernel_size =
+#     (x.size(2), x.size(3))` rather than an adaptive-pool-to-1 call, and a
+#     real static-shape `torch.onnx.export` bakes that into a plain
+#     `AveragePool`/`MaxPool` node with a literal `kernel_shape` -- not the
+#     `Global*Pool` op family. This section does not separately re-verify
+#     that `kernel_shape` covers `spine`'s own full spatial extent (`spine`'s
+#     own static shape may not even be known here, before shape inference)
+#     -- it doesn't need to: neither `AveragePool` nor `MaxPool` ever mixes
+#     channels regardless of kernel size (each output channel depends only
+#     on its own same-index input channel, for any pooling window), and the
+#     REAL safety property this section needs -- that the eventual
+#     `Reshape`'d/flattened row is a 1:1, no-mixing relabeling of `spine`'s
+#     own channels -- is instead proven structurally, exactly like
+#     `_match_gap_flatten_matmul_consumer`'s own proof for `GlobalAveragePool`:
+#     the first bottleneck `Gemm`/`MatMul`'s own reduction dimension is
+#     required to equal `n_channels` (`P`'s own output-channel count)
+#     EXACTLY (see below) -- which, since a `Reshape` to `[batch_or_1, -1]`'s
+#     own flattened width is `N * C * H' * W' / batch_or_1_literal` (`H'`,
+#     `W'` the pool's own spatial output dims), can only equal the true
+#     channel count `C` when `H' * W' == 1` -- i.e. the pool provably
+#     reduced every spatial position away, for any well-formed graph. A
+#     model that already computes something else entirely (an already-buggy
+#     export whose literal batch constant doesn't match its own real
+#     runtime batch) is left with that same pre-existing behavior either way
+#     -- pruning doesn't inspect or rely on the batch literal's own value at
+#     all, mirroring `_match_reshape_batch_neg1_pass_through`'s own
+#     identical stance.
+#   - Each pooling branch's own output feeds, through EXACTLY one `Reshape`
+#     to a resolvable `[batch_or_1, -1]` target (`_match_reshape_batch_neg1_
+#     pass_through`) or a plain `Flatten(axis=1)` (`_match_flatten_axis1_
+#     pass_through`) -- a two-layer bottleneck: `{MatMul, vanilla Gemm,
+#     FusedGemm, GemmFastGelu}` ("fc1", own reduction dim == `n_channels`)
+#     -> exactly ONE `_UNARY_PASS_THROUGH` activation (zero or more than one
+#     declined) -> `{MatMul, vanilla Gemm, FusedGemm, GemmFastGelu}` ("fc2",
+#     own OUTPUT dim == `n_channels` exactly -- the eventual broadcast-`Mul`-
+#     correctness requirement, exactly like SE's own fc2 check).
+#   - The WEIGHT-TIED requirement, confirmed a real, load-bearing structural
+#     invariant of CBAM's own reference implementation (both pooled
+#     descriptors are run through the literal SAME `nn.Sequential` `mlp`
+#     module, traced twice into two separate node instances that both
+#     reference the identical weight/bias initializers): the two branches'
+#     own fc1 nodes must name the IDENTICAL weight (and bias, if any)
+#     initializer -- confirmed by NAME equality, never merely matching shape
+#     -- and likewise for fc2. A topology that otherwise matches but uses
+#     two DIFFERENT weights per branch is not the confirmed real CBAM shape
+#     and is declined outright (see this module's own test suite's own
+#     decline case for exactly this).
+#   - The two branches' own fc2 outputs must both feed the SAME `Add` node
+#     (order-independent operands), whose own output feeds a `{Sigmoid,
+#     HardSigmoid}` (mirroring `_find_conv_se_gate_chains`'s own tolerance
+#     for either as the final gate activation), then one-or-more single-axis
+#     `Unsqueeze` nodes, each appending exactly one new TRAILING axis
+#     (mirroring `_squeeze_axis_is_trailing_spatial`'s own reasoning, just
+#     for insertion instead of removal) -- the confirmed real export emits
+#     exactly two (`axes=[2]` then `axes=[3]`, taking the gate tensor
+#     `[N, C]` to `[N, C, 1, 1]`) -- then the `Expand` (fed by `Shape(spine)`,
+#     see above) whose own output must be the exact `gate_out` operand of
+#     the `Mul` identified at the very start.
+#   - Every intermediate tensor along either branch, or the closing
+#     Add/Sigmoid/Unsqueeze/Expand chain, with anything other than exactly
+#     one consumer, or that is itself a graph output, declines the WHOLE
+#     match -- never a partial slice -- the same conservative bar every
+#     other hop in this module holds a mid-chain tensor to.
+#   - `AveragePool`/`Reshape` (avg branch) and `MaxPool`/`Reshape` (max
+#     branch) need no slicing of their own at all -- neither carries a
+#     weight, and neither has any channel-count-describing attribute to
+#     rewrite (a `Reshape`'s own `-1` target dimension, like
+#     `_match_reshape_batch_neg1_pass_through`'s own GAP-classifier case,
+#     re-derives itself from the already-pruned input with zero edits) --
+#     each is carried purely as a bookkeeping entry (`_ConsumerBranch.chain_ops`)
+#     so its own now-stale cached `value_info` is dropped. Likewise fc1's own
+#     OUTPUT (squeeze-bottleneck) axis and the activation between fc1/fc2 in
+#     BOTH branches are left completely untouched -- unaffected by pruning
+#     `n_channels`, mirroring SE's own fc1 treatment exactly -- so neither
+#     needs any bookkeeping at all.
+#   - The `Mul`'s own output, in turn, must feed a single ordinary or
+#     general-grouped Conv/ConvTranspose consumer via the existing,
+#     unmodified `_walk_to_conv_consumer` forward walk (left at its own
+#     default, narrower flag set, mirroring `_find_conv_se_gate_chains`'s
+#     own identical choice) -- its own input-channel count must match `P`'s.
+#
+# Representation, mirroring `_find_conv_se_gate_chains`'s own two-producer
+# (gated-pair) shape: `P` and the SHARED fc2 weight/bias are the chain's own
+# TWO co-sliced `_Chain.producers` (both forced to the same output-channel
+# `keep` set) -- fc2's own recorded `_Producer.node` is (arbitrarily) the
+# AVG branch's own fc2 instance; the MAX branch's own fc2 instance needs no
+# weight of its own sliced (the shared tensor is already sliced once via the
+# recorded producer), so it, and every node between it and the closing
+# `Mul`, rides along on that producer's own `pre_ops` purely for
+# `value_info` staleness bookkeeping. The SHARED fc1 weight is the chain's
+# own single extra fan-out branch (`_Chain.extra_consumers`, exactly like
+# SE's own fc1) -- fc1's own INPUT axis needs the identical shared `keep`
+# set, even though its own OUTPUT (bottleneck) axis is left alone; the MAX
+# branch's own fc1 instance, and both branches' own `AveragePool`/`MaxPool`/
+# `Reshape` hops, ride along on that one extra-consumer branch's own
+# `chain_ops` for the same staleness-bookkeeping reason.
+#
+# What's declined, deliberately, narrower than a hypothetical fully-general
+# CBAM matcher might reach:
+#
+#   - A general grouped Conv anywhere in the three co-sliced roles (`P`,
+#     fc1, fc2) -- `P` must report `group == 1`; fc1/fc2 must be a plain
+#     2-D `MatMul`/vanilla-`Gemm`/`FusedGemm`/`GemmFastGelu` (no grouped-
+#     MatMul concept exists at all). Only the FINAL downstream consumer may
+#     still be a general grouped Conv, exactly as SE's own matcher allows.
+#   - A `ConvTranspose` producer (`P`) -- out of scope, mirroring SE.
+#   - Any `Unsqueeze` inserting more than one axis at once, or at a
+#     non-trailing position, is declined -- not the confirmed real shape.
+#   - A hardcoded/constant `Expand` target (not `Shape(spine)`) is declined
+#     -- see this section's own safety argument above for why.
+#   - CBAM's OTHER stage, `SpatialGate` (`ReduceMax`/`ReduceMean` over the
+#     full channel axis -> `Concat` -> a 7x7 `Conv` -> `Sigmoid` -> `Mul`) is
+#     a fundamentally different shape (no per-channel learned weight at all,
+#     reduces over EVERY channel rather than gating them) and is out of
+#     scope for this section entirely -- a plausible future follow-on, not
+#     reached here.
+
+
+def _unsqueeze_axes(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[List[int]]:
+    """The ``Unsqueeze`` analogue of :func:`_gap_squeeze_axes`: returns a
+    plain, single-output ``Unsqueeze`` `node`'s own resolved ``axes`` list
+    -- from the opset>=13 constant second input, or the opset<13 ``axes``
+    attribute -- or ``None`` if `node` isn't such an ``Unsqueeze``, or its
+    ``axes`` isn't resolvable this way. Kept separate from
+    :func:`_gap_squeeze_axes` (rather than a shared, op-type-parameterized
+    helper) since that function's own callers are unrelated to this
+    section, and its own docstring is written specifically in terms of
+    ``Squeeze``'s own semantics -- not worth entangling for a few lines of
+    genuinely identical resolution logic.
+    """
+    if node.op_type != "Unsqueeze" or node.domain != "" or len(node.output) != 1:
+        return None
+    if len(node.input) >= 2 and node.input[1]:
+        axes_init = initializer_map.get(node.input[1])
+        if axes_init is None or axes_init.data_type != onnx.TensorProto.INT64:
+            return None
+        return [
+            int(v) for v in onnx.numpy_helper.to_array(axes_init).reshape(-1).tolist()
+        ]
+    for attr in node.attribute:
+        if attr.name == "axes":
+            return list(attr.ints)
+    return None
+
+
+def _match_cbam_pool_branch(
+    pool_node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    producers_of: Dict[str, onnx.NodeProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # Reshape/Flatten node
+        onnx.NodeProto,  # fc1 node
+        str,  # fc1 weight name
+        bool,  # fc1 weight_transposed
+        Optional[str],  # fc1 bias name (tie-check only -- never sliced)
+        onnx.NodeProto,  # activation node (fc1 -> fc2)
+        onnx.NodeProto,  # fc2 node
+        str,  # fc2 weight name
+        bool,  # fc2 weight_transposed
+        Optional[str],  # fc2 bias name
+    ]
+]:
+    """Matches one of CBAM ChannelGate's own two (structurally identical,
+    weight-tied) pooling branches -- ``pool_node`` (an ``AveragePool`` or
+    ``MaxPool`` reading `spine`) -> ``Reshape``/``Flatten`` -> fc1 -> one
+    activation -> fc2. See this section's own comment above for the exact
+    bar and why no `pool_node`-specific "is this global?" check is needed.
+    Declines (``None``) on any deviation. Called once per branch by
+    :func:`_match_conv_cbam_channel_gate`, which additionally checks the two
+    branches' own results agree (weight-tied) and combine correctly.
+    """
+    pool_out = pool_node.output[0]
+    if pool_out in graph_outputs or len(consumers_of.get(pool_out, [])) != 1:
+        return None
+    reshape_node = consumers_of[pool_out][0]
+    if _match_flatten_axis1_pass_through(reshape_node, pool_out):
+        pass
+    elif _match_reshape_batch_neg1_pass_through(
+        reshape_node, pool_out, initializer_map, producers_of
+    ):
+        pass
+    else:
+        return None
+
+    reshape_out = reshape_node.output[0]
+    if reshape_out in graph_outputs or len(consumers_of.get(reshape_out, [])) != 1:
+        return None
+    fc1_node = consumers_of[reshape_out][0]
+    fc1_match = _match_matmul_like(fc1_node)
+    if fc1_match is None or fc1_match[0] != reshape_out:
+        return None
+    _, fc1_weight, fc1_weight_transposed = fc1_match
+    fc1_w_init = initializer_map.get(fc1_weight)
+    if (
+        fc1_w_init is None
+        or not _is_supported_float_dtype(fc1_w_init.data_type)
+        or len(fc1_w_init.dims) != 2
+    ):
+        return None
+    fc1_k = fc1_w_init.dims[1] if fc1_weight_transposed else fc1_w_init.dims[0]
+    if fc1_k != n_channels:
+        return None
+    fc1_bias = None
+    if (
+        fc1_node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")
+        and len(fc1_node.input) == 3
+        and fc1_node.input[2]
+    ):
+        fc1_bias = fc1_node.input[2]
+
+    fc1_out = fc1_node.output[0]
+    if fc1_out in graph_outputs or len(consumers_of.get(fc1_out, [])) != 1:
+        return None
+    act_node = consumers_of[fc1_out][0]
+    if not (
+        act_node.op_type in _UNARY_PASS_THROUGH
+        and list(act_node.input) == [fc1_out]
+        and len(act_node.output) == 1
+    ):
+        return None
+
+    act_out = act_node.output[0]
+    if act_out in graph_outputs or len(consumers_of.get(act_out, [])) != 1:
+        return None
+    fc2_node = consumers_of[act_out][0]
+    fc2_match = _match_matmul_like(fc2_node)
+    if fc2_match is None or fc2_match[0] != act_out:
+        return None
+    _, fc2_weight, fc2_weight_transposed = fc2_match
+    fc2_w_init = initializer_map.get(fc2_weight)
+    if (
+        fc2_w_init is None
+        or not _is_supported_float_dtype(fc2_w_init.data_type)
+        or len(fc2_w_init.dims) != 2
+    ):
+        return None
+    fc2_out_channels = (
+        fc2_w_init.dims[0] if fc2_weight_transposed else fc2_w_init.dims[1]
+    )
+    if fc2_out_channels != n_channels:
+        return None
+    fc2_bias = None
+    if (
+        fc2_node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")
+        and len(fc2_node.input) == 3
+        and fc2_node.input[2]
+    ):
+        fc2_bias = fc2_node.input[2]
+        if fc2_bias not in initializer_map:
+            return None  # non-constant bias -- can't safely prune it
+
+    return (
+        reshape_node,
+        fc1_node,
+        fc1_weight,
+        fc1_weight_transposed,
+        fc1_bias,
+        act_node,
+        fc2_node,
+        fc2_weight,
+        fc2_weight_transposed,
+        fc2_bias,
+    )
+
+
+def _match_conv_cbam_channel_gate(
+    spine: str,
+    spine_consumers: List[onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    producers_of: Dict[str, onnx.NodeProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,  # AveragePool
+        onnx.NodeProto,  # MaxPool
+        onnx.NodeProto,  # avg branch Reshape/Flatten
+        onnx.NodeProto,  # max branch Reshape/Flatten
+        onnx.NodeProto,  # avg branch fc1
+        onnx.NodeProto,  # max branch fc1
+        str,  # shared fc1 weight name
+        bool,  # shared fc1 weight_transposed
+        onnx.NodeProto,  # Mul (the closing gate multiply)
+        onnx.NodeProto,  # avg branch fc2
+        onnx.NodeProto,  # max branch fc2
+        str,  # shared fc2 weight name
+        bool,  # shared fc2 weight_transposed
+        Optional[str],  # shared fc2 bias name
+        onnx.NodeProto,  # Add (merges the two fc2 outputs)
+        onnx.NodeProto,  # Sigmoid/HardSigmoid
+        Tuple[onnx.NodeProto, ...],  # Unsqueeze node(s), in walk order
+        onnx.NodeProto,  # Expand
+    ]
+]:
+    """If `spine`'s own FOUR consumers (`spine_consumers`) form the CBAM
+    ChannelGate shape this section's own comment above describes, returns
+    the full matched-node tuple. Declines (``None``) on any deviation.
+    """
+    if len(spine_consumers) != 4:
+        return None
+    mul_candidates = [
+        c for c in spine_consumers if c.op_type == "Mul" and c.domain == ""
+    ]
+    avg_candidates = [
+        c for c in spine_consumers if c.op_type == "AveragePool" and c.domain == ""
+    ]
+    max_candidates = [
+        c for c in spine_consumers if c.op_type == "MaxPool" and c.domain == ""
+    ]
+    shape_candidates = [
+        c for c in spine_consumers if c.op_type == "Shape" and c.domain == ""
+    ]
+    if not (
+        len(mul_candidates) == 1
+        and len(avg_candidates) == 1
+        and len(max_candidates) == 1
+        and len(shape_candidates) == 1
+    ):
+        return None  # some other node type present, or more than one of any
+    mul_node, avg_pool_node, max_pool_node, shape_node = (
+        mul_candidates[0],
+        avg_candidates[0],
+        max_candidates[0],
+        shape_candidates[0],
+    )
+
+    if not (
+        len(mul_node.input) == 2
+        and len(mul_node.output) == 1
+        and spine in mul_node.input
+        and mul_node.input[0] != mul_node.input[1]
+    ):
+        return None
+    gate_out = mul_node.input[1] if mul_node.input[0] == spine else mul_node.input[0]
+    if gate_out in initializer_map:
+        return None
+
+    if not (list(avg_pool_node.input) == [spine] and len(avg_pool_node.output) == 1):
+        return None
+    if not (list(max_pool_node.input) == [spine] and len(max_pool_node.output) == 1):
+        return None
+    if not (list(shape_node.input) == [spine] and len(shape_node.output) == 1):
+        return None
+    shape_out = shape_node.output[0]
+    if shape_out in graph_outputs or len(consumers_of.get(shape_out, [])) != 1:
+        return None
+
+    avg_match = _match_cbam_pool_branch(
+        avg_pool_node,
+        initializer_map,
+        consumers_of,
+        producers_of,
+        graph_outputs,
+        n_channels,
+    )
+    max_match = _match_cbam_pool_branch(
+        max_pool_node,
+        initializer_map,
+        consumers_of,
+        producers_of,
+        graph_outputs,
+        n_channels,
+    )
+    if avg_match is None or max_match is None:
+        return None
+    (
+        avg_reshape,
+        fc1_avg,
+        fc1_weight_a,
+        fc1_wt_a,
+        fc1_bias_a,
+        _act_avg,
+        fc2_avg,
+        fc2_weight_a,
+        fc2_wt_a,
+        fc2_bias_a,
+    ) = avg_match
+    (
+        max_reshape,
+        fc1_max,
+        fc1_weight_m,
+        fc1_wt_m,
+        fc1_bias_m,
+        _act_max,
+        fc2_max,
+        fc2_weight_m,
+        fc2_wt_m,
+        fc2_bias_m,
+    ) = max_match
+
+    # Weight-tied requirement -- see this section's own comment above.
+    if fc1_weight_a != fc1_weight_m or fc1_wt_a != fc1_wt_m or fc1_bias_a != fc1_bias_m:
+        return None
+    if fc2_weight_a != fc2_weight_m or fc2_wt_a != fc2_wt_m or fc2_bias_a != fc2_bias_m:
+        return None
+    fc1_weight, fc1_weight_transposed = fc1_weight_a, fc1_wt_a
+    fc2_weight, fc2_weight_transposed, fc2_bias = fc2_weight_a, fc2_wt_a, fc2_bias_a
+
+    fc2_avg_out = fc2_avg.output[0]
+    fc2_max_out = fc2_max.output[0]
+    if fc2_avg_out in graph_outputs or len(consumers_of.get(fc2_avg_out, [])) != 1:
+        return None
+    if fc2_max_out in graph_outputs or len(consumers_of.get(fc2_max_out, [])) != 1:
+        return None
+    add_node = consumers_of[fc2_avg_out][0]
+    if consumers_of[fc2_max_out][0] is not add_node:
+        return None
+    if not (
+        add_node.op_type == "Add"
+        and add_node.domain == ""
+        and len(add_node.input) == 2
+        and len(add_node.output) == 1
+        and set(add_node.input) == {fc2_avg_out, fc2_max_out}
+    ):
+        return None
+
+    add_out = add_node.output[0]
+    if add_out in graph_outputs or len(consumers_of.get(add_out, [])) != 1:
+        return None
+    sigmoid_node = consumers_of[add_out][0]
+    if not (
+        sigmoid_node.op_type in ("Sigmoid", "HardSigmoid")
+        and sigmoid_node.domain == ""
+        and list(sigmoid_node.input) == [add_out]
+        and len(sigmoid_node.output) == 1
+    ):
+        return None
+
+    # Walk the Unsqueeze(s) -> Expand closing chain -- see this section's
+    # own comment for why `Expand`'s own shape argument must be `shape_out`
+    # (`Shape(spine)`, already matched above) rather than any other tensor.
+    unsqueeze_nodes: List[onnx.NodeProto] = []
+    cur = sigmoid_node.output[0]
+    current_rank = 2  # Sigmoid's own output is [N, C] here -- see above
+    expand_node: Optional[onnx.NodeProto] = None
+    for _ in range(_MAX_CHAIN_HOPS):
+        if cur in graph_outputs:
+            return None
+        cands = consumers_of.get(cur, [])
+        if len(cands) != 1:
+            return None
+        nxt = cands[0]
+        if nxt.op_type == "Expand":
+            if (
+                unsqueeze_nodes
+                and nxt.domain == ""
+                and len(nxt.input) == 2
+                and nxt.input[0] == cur
+                and len(nxt.output) == 1
+            ):
+                expand_node = nxt
+            break
+        if not (
+            nxt.op_type == "Unsqueeze"
+            and nxt.domain == ""
+            and len(nxt.input) >= 1
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+        ):
+            break
+        axes = _unsqueeze_axes(nxt, initializer_map)
+        if axes is None or len(axes) != 1 or axes[0] not in (current_rank, -1):
+            break  # not a single, TRAILING-append axis -- declined
+        unsqueeze_nodes.append(nxt)
+        cur = nxt.output[0]
+        current_rank += 1
+    if expand_node is None:
+        return None
+    # Not fed by Shape(spine) -- see this section's own safety argument
+    # above; a hardcoded/other shape source is declined.
+    if expand_node.input[1] != shape_out:
+        return None
+
+    expand_out = expand_node.output[0]
+    if expand_out in graph_outputs or len(consumers_of.get(expand_out, [])) != 1:
+        return None
+    if expand_out != gate_out:
+        return None
+
+    return (
+        avg_pool_node,
+        max_pool_node,
+        avg_reshape,
+        max_reshape,
+        fc1_avg,
+        fc1_max,
+        fc1_weight,
+        fc1_weight_transposed,
+        mul_node,
+        fc2_avg,
+        fc2_max,
+        fc2_weight,
+        fc2_weight_transposed,
+        fc2_bias,
+        add_node,
+        sigmoid_node,
+        tuple(unsqueeze_nodes),
+        expand_node,
+    )
+
+
+def _find_conv_cbam_channel_gate_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds CBAM ChannelGate blocks -- see this section's own comment above
+    for the exact topology matched and declined. Every match produces one
+    `_Chain` with TWO producers (`P`, the block's own input Conv, and the
+    SHARED fc2 -- both forced to the same output-channel keep set, one
+    slice covering both the avg- and max-pool branches since they read the
+    identical tied weight/bias), one ordinary consumer (the real downstream
+    Conv/ConvTranspose the closing `Mul` feeds), and one extra fan-out
+    branch (the SHARED fc1, whose INPUT axis needs the identical keep set
+    even though its own OUTPUT/bottleneck axis is left untouched) -- see
+    this section's own "Representation" paragraph above for exactly which
+    node rides on which field.
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    producers_of = _producers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    chains: List[_Chain] = []
+    for node in graph.node:
+        info = _match_conv_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, n_channels, producer_group = info
+        if producer_group != 1:
+            continue  # narrow scope -- see this section's own comment
+
+        out_name = node.output[0]
+        if out_name in graph_outputs:
+            continue
+
+        pre_ops: List[onnx.NodeProto] = []
+        cur = out_name
+        spine: Optional[str] = None
+        spine_consumers: List[onnx.NodeProto] = []
+        for _ in range(_MAX_CHAIN_HOPS):
+            cands = consumers_of.get(cur, [])
+            if len(cands) == 4:
+                spine = cur
+                spine_consumers = cands
+                break
+            if len(cands) != 1:
+                break
+            nxt = cands[0]
+            if not (
+                nxt.op_type in _UNARY_PASS_THROUGH
+                and list(nxt.input) == [cur]
+                and len(nxt.output) == 1
+            ):
+                break
+            out2 = nxt.output[0]
+            if out2 in graph_outputs:
+                break
+            pre_ops.append(nxt)
+            cur = out2
+        if spine is None:
+            continue
+
+        match = _match_conv_cbam_channel_gate(
+            spine,
+            spine_consumers,
+            initializer_map,
+            consumers_of,
+            producers_of,
+            graph_outputs,
+            n_channels,
+        )
+        if match is None:
+            continue
+        (
+            avg_pool_node,
+            max_pool_node,
+            avg_reshape,
+            max_reshape,
+            fc1_avg,
+            fc1_max,
+            fc1_weight,
+            fc1_weight_transposed,
+            mul_node,
+            fc2_avg,
+            fc2_max,
+            fc2_weight,
+            fc2_weight_transposed,
+            fc2_bias,
+            add_node,
+            sigmoid_node,
+            unsqueeze_nodes,
+            expand_node,
+        ) = match
+
+        mul_out = mul_node.output[0]
+        if mul_out in graph_outputs or len(consumers_of.get(mul_out, [])) != 1:
+            continue
+
+        (
+            consumer,
+            post_mul_chain_ops,
+            conv_pass_through,
+            group_norm,
+            decomposed_group_norm_num_groups,
+            _matmul_consumer,
+        ) = _walk_to_conv_consumer(
+            mul_out,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+        # Every optional `_walk_to_conv_consumer` flag was left at its
+        # default (False) above, mirroring `_find_conv_se_gate_chains`'s
+        # own identical choice -- so these are always `None` here.
+        assert group_norm is None and decomposed_group_norm_num_groups is None
+        (
+            consumer_node,
+            consumer_weight,
+            consumer_group,
+            consumer_is_conv_transpose,
+        ) = consumer
+
+        if len({w_name, fc2_weight, fc1_weight, consumer_weight}) != 4:
+            continue  # a tied/shared weight across roles -- decline
+
+        chains.append(
+            _Chain(
+                producers=(
+                    _Producer(
+                        node,
+                        w_name,
+                        False,
+                        bias_name,
+                        pre_ops=tuple(pre_ops),
+                        is_conv=True,
+                    ),
+                    _Producer(
+                        fc2_avg,
+                        fc2_weight,
+                        fc2_weight_transposed,
+                        fc2_bias,
+                        pre_ops=(fc2_max, add_node, sigmoid_node)
+                        + unsqueeze_nodes
+                        + (expand_node,),
+                        is_conv=False,
+                    ),
+                ),
+                chain_ops=((mul_node, None),) + post_mul_chain_ops,
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
+                conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
+                extra_consumers=(
+                    _ConsumerBranch(
+                        chain_ops=(
+                            (avg_pool_node, None),
+                            (avg_reshape, None),
+                            (max_pool_node, None),
+                            (max_reshape, None),
+                            (fc1_max, None),
+                        ),
+                        consumer_node=fc1_avg,
+                        consumer_weight=fc1_weight,
+                        consumer_weight_transposed=fc1_weight_transposed,
+                        consumer_is_conv=False,
+                        consumer_group=1,
+                    ),
+                ),
+            )
+        )
+    return chains
+
+
 # --- MatMul/Gemm residual (Add-merged) chains -------------------------------
 #
 # The MatMul/Gemm analogue of the Conv residual/Add-merge grouping above --
@@ -15031,6 +15776,7 @@ def apply_structured_pruning(
             + _find_conv_chains(graph)
             + _find_conv_residual_chains(graph)
             + _find_conv_se_gate_chains(graph)
+            + _find_conv_cbam_channel_gate_chains(graph)
             + _find_matmul_residual_chains(graph)
         )
         concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
@@ -42528,7 +43274,7 @@ def _chain_label(chain: _Chain) -> str:
 def _structured_chain_groups(
     graph: onnx.GraphProto,
 ) -> List[Tuple[str, List[_Chain]]]:
-    """The same six finders, in the same order, that
+    """The same seven finders, in the same order, that
     :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`
     concatenate into their own single `chains` list -- kept as separate
     `(family_label, chains)` groups here purely so
@@ -42543,6 +43289,7 @@ def _structured_chain_groups(
         ("conv_plain", _find_conv_chains(graph)),
         ("conv_residual", _find_conv_residual_chains(graph)),
         ("conv_se_gate", _find_conv_se_gate_chains(graph)),
+        ("conv_cbam_channel_gate", _find_conv_cbam_channel_gate_chains(graph)),
         ("matmul_residual", _find_matmul_residual_chains(graph)),
     ]
 
