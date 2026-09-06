@@ -2486,6 +2486,7 @@ def _tokenize_mcode(
     bare=False,
     extra_byte_tags=frozenset(),
     verbs=None,
+    odd_tags=frozenset(),
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -2538,6 +2539,10 @@ def _tokenize_mcode(
             out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
         elif bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
             n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
+            out.append((i, "B", mcode[i], mcode[i + 1], 0))
+        elif bare and i + 1 < end and mcode[i] in odd_tags and mcode[i + 1] % 2 == 1:
+            # Tags with bit 6 set (0xc1, 0xe1) pair with an *odd* register byte.
+            n = 2
             out.append((i, "B", mcode[i], mcode[i + 1], 0))
         else:
             n = 1
@@ -3326,3 +3331,60 @@ def test_llm_build_a7_is_a_sync_verb_on_device(tmp_path):
         _run_llm_layer(patched("a7_02_channel_1e", set_channel(a7_02, 0x1E)), inputs, 3)
     )
     assert len(same) >= 2 and all(s == baseline for s in same), same
+
+
+def test_resnet18d_a1_is_a_tag_and_bit6_tags_take_odd_registers(tmp_path):
+    """Confirmed real (see the README's "0xa1 is also a tag" paragraph), on
+    a fresh resnet18d build's configuration segments under the full rule:
+    among the 2-byte non-zero residue runs, `a1 XX` has an even XX in
+    >= 95% of cases and `e1 XX`/`c1 XX` an odd XX in every case, while the
+    same runs in the shuffled segments split about evenly; admitting them
+    (`tags | {0xa1}`, `odd_tags={0xc1, 0xe1}`) lowers the non-zero residue.
+    No device.
+    """
+    import random
+    from collections import Counter
+
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    _, segs = _segments(mcode)
+    blob = b"".join(mcode[p : p + n] for p, n, t in segs if t[0] != 0xE801)
+    shuffled = bytearray(blob)
+    random.Random(0).shuffle(shuffled)
+    shuffled = bytes(shuffled)
+
+    def pair_parity(b):
+        toks = _tokenize_mcode(b, start=0, end=len(b), **_FULL_RULE)
+        runs, last = [], None
+        for o, k, *_ in toks:
+            if k == "?" and b[o]:
+                if last == o:
+                    runs[-1][1] = o + 1
+                else:
+                    runs.append([o, o + 1])
+                last = o + 1
+        par = Counter()
+        for a, e in runs:
+            if e - a == 2 and b[a] in (0xA1, 0xC1, 0xE1):
+                par[(b[a], b[a + 1] % 2)] += 1
+        return par
+
+    real, null = pair_parity(blob), pair_parity(shuffled)
+    a1_even, a1_odd = real[(0xA1, 0)], real[(0xA1, 1)]
+    # resnet18d has ~15 such pairs (the llm_build subgraphs 37 and 65).
+    assert a1_even >= 10 and a1_even >= 0.9 * (a1_even + a1_odd), (a1_even, a1_odd)
+    odd = real[(0xE1, 1)] + real[(0xC1, 1)]
+    even = real[(0xE1, 0)] + real[(0xC1, 0)]
+    # 18 of 19 on a fresh resnet18d build; 71/71 and 116/116 in llm_build.
+    assert odd >= 10 and odd >= 0.9 * (odd + even), (odd, even)
+    null_a1 = null[(0xA1, 0)] + null[(0xA1, 1)]
+    assert null_a1 == 0 or null[(0xA1, 0)] <= 0.8 * null_a1 + 2, dict(null)
+
+    def nonzero_residue(b, **extra):
+        rule = dict(_FULL_RULE)
+        rule.update(extra)
+        toks = _tokenize_mcode(b, start=0, end=len(b), **rule)
+        return sum(1 for t in toks if t[1] == "?" and b[t[0]])
+
+    before = nonzero_residue(blob)
+    after = nonzero_residue(blob, tags=_ALL_TAGS | {0xA1}, odd_tags={0xC1, 0xE1})
+    assert after <= 0.85 * before, (before, after)
