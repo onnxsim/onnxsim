@@ -10083,6 +10083,243 @@ def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- apply_structured_pruning: Squeeze-and-Excitation (SE) gate chains -----
+#
+# `torchvision.ops.SqueezeExcitation`'s own exact shape (confirmed live via
+# `torch.onnx.export`, torch 2.14.0+cpu, opset 17) -- see
+# `onnxsim/pruning.py`'s own "Squeeze-and-Excitation (SE) gate chains"
+# section comment for the full matched/declined topology this exercises:
+#
+#     scale = self.scale_activation(
+#         self.fc2(self.activation(self.fc1(self.avgpool(input))))
+#     )
+#     return scale * input
+#
+# i.e. `conv1 -> Relu -> {GlobalAveragePool -> fc1 -> Relu -> fc2 ->
+# {Sigmoid, HardSigmoid}} -> Mul(gate, relu_out) -> conv2`, with `conv1`'s
+# own output channels, the gate subnetwork's own final `fc2` output
+# channels, and `conv2`'s own input channels all sliced by ONE shared
+# keep-set -- while `fc1`'s own output-channel count (the squeeze
+# bottleneck, unrelated to this shape) is left alone by this mechanism
+# entirely, and `Csq=1` below makes any INDEPENDENT internal fc1->fc2
+# chain `_find_conv_chains` might separately find and prune a deliberate
+# no-op (`keep_count == n == 1`), isolating what these tests check to
+# purely this new SE-gate mechanism.
+
+
+def _se_conv_keep_indices(w1, wf2, keep_count):
+    # The correct paired-importance ranking: combined (root-sum-square) norm
+    # of `conv1`'s own [C1, Cin, kH, kW] filter and the gate subnetwork's own
+    # final `fc2`'s [C1, Csq, 1, 1] filter -- mirroring
+    # `_combined_keep_indices`'s identical formula for the MatMul/Gemm gated
+    # pair, just with each producer's own [N, K] view built the Conv way
+    # (`_producer_weight_nk`'s own `w.reshape(w.shape[0], -1)`, no transpose)
+    # rather than MatMul's `w.T`.
+    importance = np.sqrt(
+        np.square(
+            np.linalg.norm(w1.reshape(w1.shape[0], -1).astype(np.float64), axis=1)
+        )
+        + np.square(
+            np.linalg.norm(wf2.reshape(wf2.shape[0], -1).astype(np.float64), axis=1)
+        )
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _se_conv_model(
+    Cin=3,
+    C1=16,
+    Csq=1,
+    C2=8,
+    gate_final_activation="Sigmoid",
+    seed=0,
+    spatial=8,
+):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    wf1 = rng.standard_normal((Csq, C1, 1, 1)).astype(np.float32)
+    bf1 = rng.standard_normal((Csq,)).astype(np.float32)
+    wf2 = rng.standard_normal((C1, Csq, 1, 1)).astype(np.float32)
+    bf2 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b2 = rng.standard_normal((C2,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W1, B1)
+          a0 = Relu(h0)
+          gap = GlobalAveragePool(a0)
+          f1 = Conv<kernel_shape=[1,1]>(gap, Wf1, Bf1)
+          fa = Relu(f1)
+          f2 = Conv<kernel_shape=[1,1]>(fa, Wf2, Bf2)
+          gate = {gate_final_activation}(f2)
+          mulout = Mul(gate, a0)
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(mulout, W2, B2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(b1, "B1"),
+            _f32(wf1, "Wf1"),
+            _f32(bf1, "Bf1"),
+            _f32(wf2, "Wf2"),
+            _f32(bf2, "Bf2"),
+            _f32(w2, "W2"),
+            _f32(b2, "B2"),
+        ],
+    )
+    return model, w1, b1, wf1, bf1, wf2, bf2, w2, b2
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _hardsigmoid(x, alpha=0.2, beta=0.5):
+    return np.clip(alpha * x + beta, 0.0, 1.0)
+
+
+def test_structured_pruning_se_gate_matches_oracle():
+    Cin, C1, Csq, C2 = 3, 16, 1, 8
+    model, w1, b1, wf1, bf1, wf2, bf2, w2, b2 = _se_conv_model(
+        Cin=Cin, C1=C1, Csq=Csq, C2=C2
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _se_conv_keep_indices(w1, wf2, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    # conv1's own output channels, sliced.
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["B1"], b1[keep])
+    # fc2 (the gate producer)'s own output channels, sliced by the SAME
+    # keep-set -- the broadcast-`Mul`-correctness requirement.
+    np.testing.assert_array_equal(inits["Wf2"], wf2[keep])
+    np.testing.assert_array_equal(inits["Bf2"], bf2[keep])
+    # fc1's own INPUT channels (fed by GlobalAveragePool(a0)) are re-sliced
+    # by the identical shared keep-set (an ordinary extra fan-out consumer
+    # branch of the shared spine tensor) ...
+    np.testing.assert_array_equal(inits["Wf1"], wf1[:, keep])
+    # ... but fc1's own OUTPUT-channel count (the squeeze bottleneck, `Csq`)
+    # -- and its own bias, indexed by that same axis -- is completely
+    # untouched by this mechanism: still every one of the original `Csq`
+    # rows/entries.
+    assert inits["Wf1"].shape[0] == Csq
+    np.testing.assert_array_equal(inits["Bf1"], bf1)
+    # conv2's own input channels, sliced by the same keep-set.
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+    np.testing.assert_array_equal(inits["B2"], b2)
+
+    rng = np.random.default_rng(200)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _se_conv_model(Cin=Cin, C1=C1 // 2, Csq=Csq, C2=C2)
+    # Build the oracle by hand-slicing rather than re-generating random
+    # weights -- overwrite its initializers with the sliced originals so it
+    # computes the SAME function the real pruned graph is supposed to.
+    oracle_inits = {
+        "W1": w1[keep],
+        "B1": b1[keep],
+        "Wf1": wf1[:, keep],
+        "Bf1": bf1,
+        "Wf2": wf2[keep],
+        "Bf2": bf2[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_se_gate_hardsigmoid_matches_oracle():
+    # MobileNetV3's own SE blocks (Howard et al., 2019, "Searching for
+    # MobileNetV3") substitute `HardSigmoid` for `Sigmoid` as the gate's
+    # final activation for inference efficiency -- confirmed real, not
+    # speculative (`torchvision.models.mobilenetv3`'s own SE blocks
+    # construct `SqueezeExcitation` with
+    # `scale_activation=partial(nn.Hardsigmoid, inplace=True)`).
+    Cin, C1, Csq, C2 = 3, 12, 1, 6
+    model, w1, b1, wf1, bf1, wf2, bf2, w2, b2 = _se_conv_model(
+        Cin=Cin, C1=C1, Csq=Csq, C2=C2, gate_final_activation="HardSigmoid", seed=7
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _se_conv_keep_indices(w1, wf2, C1 // 2)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["Wf2"], wf2[keep])
+    np.testing.assert_array_equal(inits["W2"], w2[:, keep])
+
+    rng = np.random.default_rng(201)
+    x = rng.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    oracle, *_ = _se_conv_model(
+        Cin=Cin, C1=C1 // 2, Csq=Csq, C2=C2, gate_final_activation="HardSigmoid"
+    )
+    oracle_inits = {
+        "W1": w1[keep],
+        "B1": b1[keep],
+        "Wf1": wf1[:, keep],
+        "Bf1": bf1,
+        "Wf2": wf2[keep],
+        "Bf2": bf2[keep],
+        "W2": w2[:, keep],
+        "B2": b2,
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(_f32(oracle_inits[init.name], init.name))
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_se_gate_declines_on_gate_channel_count_mismatch():
+    # SIMILAR but not quite the confirmed shape: the gate subnetwork's own
+    # final `fc2` outputs a single (broadcastable) channel instead of one
+    # matching `conv1`'s own `C1` -- a legitimate, valid ONNX `Mul`
+    # broadcast (a "global" scalar gate, not a per-channel SE gate), but not
+    # the exact shape this section's own matcher requires
+    # (`fc2`'s own output-channel count must equal `conv1`'s exactly). Locks
+    # in the conservative "decline outright, never partially slice" bar:
+    # `conv1`/`conv2`/`fc2` must all come back completely untouched.
+    Cin, C1, Csq, C2 = 3, 16, 1, 8
+    model, w1, b1, wf1, bf1, wf2, bf2, w2, b2 = _se_conv_model(
+        Cin=Cin, C1=C1, Csq=Csq, C2=C2
+    )
+    # Overwrite fc2's own weight/bias so it outputs exactly ONE channel
+    # (still a scalar-broadcastable `Mul` against `a0`'s own C1 channels --
+    # a valid graph, just not the SE shape) instead of C1.
+    rng = np.random.default_rng(9)
+    wf2_bad = rng.standard_normal((1, Csq, 1, 1)).astype(np.float32)
+    bf2_bad = rng.standard_normal((1,)).astype(np.float32)
+    for init in model.graph.initializer:
+        if init.name == "Wf2":
+            init.CopyFrom(_f32(wf2_bad, "Wf2"))
+        elif init.name == "Bf2":
+            init.CopyFrom(_f32(bf2_bad, "Bf2"))
+    onnx.checker.check_model(model)
+
+    from onnxsim.pruning import _find_conv_se_gate_chains
+
+    assert _find_conv_se_gate_chains(model.graph) == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Wf2"], wf2_bad)
+
+
 # --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----
 #
 # The MatMul/Gemm analogue of the Conv residual tests above -- see
