@@ -67,6 +67,7 @@
 #include "passes/rewrite_gridsample_to_gather.h"
 #include "passes/rewrite_msdeformattn_to_gridsample.h"
 #include "passes/rewrite_trt_batched_nms.h"
+#include "passes/rewrite_trt_batched_rotated_nms.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -168,6 +169,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
     RegisterOrReplace<p::RewriteMSDeformAttnToGridSample>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedNMS>(registry);
+    RegisterOrReplace<p::RewriteTRTBatchedRotatedNMS>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);
