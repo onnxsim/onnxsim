@@ -41265,6 +41265,494 @@ def test_qgemm_ambiguous_bias_shape_is_declined():
     assert chains == []
 
 
+# --- QOperator gated (ReGLU/SwiGLU/GeGLU) FFN pair -------------------------
+#
+# gate_proj/up_proj -- both real, per-channel INT8 ``QLinearMatMul`` --
+# combined by ``com.microsoft::QLinearMul``, feeding a ``QLinearMatMul``
+# down_proj consumer. Mirrors ``_qlinearmatmul_chain_model``'s own
+# hand-built-via-``onnx.helper`` convention (real int8/scale/zero-point
+# arrays a parser text literal can't spell out -- see this file's own
+# comment above the QOperator section).
+#
+# The gate branch optionally carries the real asymmetric
+# ``DequantizeLinear -> <activation> -> QuantizeLinear`` sandwich a real
+# ``onnxruntime.quantization.quantize_static(..., quant_format=
+# QuantFormat.QOperator)`` round trip emits for an activation with no fused
+# QLinear op of its own (there is no ``QLinearRelu``) -- confirmed live by
+# ``test_qop_gated_ffn_real_quantize_static_pipeline_end_to_end`` below,
+# which runs the actual tool rather than merely asserting this hand-built
+# shape matches it.
+
+
+def _qop_gated_mlp_model(K=8, H=16, Out=4, gate_activation="Relu", seed=0):
+    """Builds the QOperator gated FFN shape :func:`_find_qop_gated_chains`
+    matches. `gate_activation` (e.g. ``"Relu"``), when given, puts the real
+    asymmetric ``DequantizeLinear -> <activation> -> QuantizeLinear``
+    sandwich on the gate branch (see this section's own comment above);
+    ``None`` feeds gate_proj's own raw output directly into ``QLinearMul``
+    instead (zero hops, the shape a real exporter emits for an unactivated
+    gate) -- both branches are always real, independently per-channel
+    INT8-quantized ``QLinearMatMul`` producers either way.
+    """
+    rng = np.random.default_rng(seed)
+    Wg = rng.standard_normal((K, H)).astype(np.float32) * 0.3
+    Wu = rng.standard_normal((K, H)).astype(np.float32) * 0.3
+    Wd = rng.standard_normal((H, Out)).astype(np.float32) * 0.3
+    Wgq, Wgs, Wgzp = _qop_quantize_per_channel_i8(Wg, axis=1)
+    Wuq, Wus, Wuzp = _qop_quantize_per_channel_i8(Wu, axis=1)
+    Wdq, Wds, Wdzp = _qop_quantize_per_channel_i8(Wd, axis=1)
+
+    inits = [
+        _f32(np.array(0.02), "x_scale"),
+        _i8(np.array(0), "x_zp"),
+        onnx.numpy_helper.from_array(Wgq, "Wg"),
+        _f32(Wgs, "Wg_scale"),
+        _i8(Wgzp, "Wg_zp"),
+        _f32(np.array(0.015), "gate_out_scale"),
+        _i8(np.array(0), "gate_out_zp"),
+        onnx.numpy_helper.from_array(Wuq, "Wu"),
+        _f32(Wus, "Wu_scale"),
+        _i8(Wuzp, "Wu_zp"),
+        _f32(np.array(0.018), "up_out_scale"),
+        _i8(np.array(0), "up_out_zp"),
+        _f32(np.array(0.01), "combined_scale"),
+        _i8(np.array(0), "combined_zp"),
+        onnx.numpy_helper.from_array(Wdq, "Wd"),
+        _f32(Wds, "Wd_scale"),
+        _i8(Wdzp, "Wd_zp"),
+        _f32(np.array(0.02), "y_scale"),
+        _i8(np.array(0), "y_zp"),
+    ]
+
+    nodes = [
+        _qlinearmatmul_node(
+            "gate_proj_quant",
+            "x_q",
+            "gate_out_q",
+            "Wg",
+            "Wg_scale",
+            "Wg_zp",
+            "gate_out_scale",
+            "gate_out_zp",
+            a_scale="x_scale",
+            a_zp="x_zp",
+        ),
+        _qlinearmatmul_node(
+            "up_proj_quant",
+            "x_q",
+            "up_out_q",
+            "Wu",
+            "Wu_scale",
+            "Wu_zp",
+            "up_out_scale",
+            "up_out_zp",
+            a_scale="x_scale",
+            a_zp="x_zp",
+        ),
+    ]
+
+    if gate_activation is not None:
+        inits.extend(
+            [_f32(np.array(0.012), "gate_act_scale"), _i8(np.array(0), "gate_act_zp")]
+        )
+        nodes.extend(
+            [
+                onnx.helper.make_node(
+                    "DequantizeLinear",
+                    ["gate_out_q", "gate_out_scale", "gate_out_zp"],
+                    ["gate_out_f"],
+                    name="gate_out_DequantizeLinear",
+                ),
+                onnx.helper.make_node(
+                    gate_activation, ["gate_out_f"], ["gate_act_f"], name="gate_act"
+                ),
+                onnx.helper.make_node(
+                    "QuantizeLinear",
+                    ["gate_act_f", "gate_act_scale", "gate_act_zp"],
+                    ["gate_act_q"],
+                    name="gate_act_QuantizeLinear",
+                ),
+            ]
+        )
+        gate_operand, gate_scale, gate_zp = (
+            "gate_act_q",
+            "gate_act_scale",
+            "gate_act_zp",
+        )
+    else:
+        gate_operand, gate_scale, gate_zp = (
+            "gate_out_q",
+            "gate_out_scale",
+            "gate_out_zp",
+        )
+
+    nodes.append(
+        onnx.helper.make_node(
+            "QLinearMul",
+            [
+                gate_operand,
+                gate_scale,
+                gate_zp,
+                "up_out_q",
+                "up_out_scale",
+                "up_out_zp",
+                "combined_scale",
+                "combined_zp",
+            ],
+            ["combined_q"],
+            domain="com.microsoft",
+            name="combine_quant",
+        )
+    )
+    nodes.append(
+        _qlinearmatmul_node(
+            "down_proj_quant",
+            "combined_q",
+            "y_q",
+            "Wd",
+            "Wd_scale",
+            "Wd_zp",
+            "y_scale",
+            "y_zp",
+            a_scale="combined_scale",
+            a_zp="combined_zp",
+        )
+    )
+
+    graph = onnx.helper.make_graph(
+        nodes,
+        "g",
+        [onnx.helper.make_tensor_value_info("x_q", onnx.TensorProto.INT8, [1, K])],
+        [onnx.helper.make_tensor_value_info("y_q", onnx.TensorProto.INT8, [1, Out])],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, {
+        "Wg": Wgq,
+        "Wg_scale": Wgs,
+        "Wg_zp": Wgzp,
+        "Wu": Wuq,
+        "Wu_scale": Wus,
+        "Wu_zp": Wuzp,
+        "Wd": Wdq,
+        "Wd_scale": Wds,
+        "Wd_zp": Wdzp,
+    }
+
+
+def test_qop_gated_ffn_relu_asymmetric_matches_oracle():
+    # THE primary real repro shape: gate_proj carries the real asymmetric
+    # DequantizeLinear -> Relu -> QuantizeLinear sandwich (ORT has no
+    # QLinearRelu), up_proj feeds QLinearMul directly with zero hops.
+    K, H, Out = 8, 16, 4
+    model, info = _qop_gated_mlp_model(K, H, Out, gate_activation="Relu", seed=60)
+    onnx.checker.check_model(model)
+
+    gated = onnxsim.pruning._find_qop_gated_chains(model.graph)
+    assert len(gated) == 1
+    g = gated[0]
+    assert [n.op_type for n in g.producer_a.pre_ops] == [
+        "DequantizeLinear",
+        "Relu",
+        "QuantizeLinear",
+    ]
+    assert g.producer_b.pre_ops == ()
+    assert g.n_channels == H
+
+    wg_dequant = _qop_dequant(info["Wg"], info["Wg_scale"], info["Wg_zp"], axis=1)
+    wu_dequant = _qop_dequant(info["Wu"], info["Wu_scale"], info["Wu_zp"], axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # Exact co-slice: both producers' own int8 codes AND per-channel scale/
+    # zero-point sliced by the identical `keep` set, never re-derived.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wg"]), info["Wg"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wg_scale"]), info["Wg_scale"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wu"]), info["Wu"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wd"]), info["Wd"][keep, :]
+    )
+
+    ref_model, _ = _qop_gated_mlp_model(
+        K, len(keep), Out, gate_activation="Relu", seed=999
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["Wg"].CopyFrom(onnx.numpy_helper.from_array(info["Wg"][:, keep], "Wg"))
+    ref_inits["Wg_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wg_scale"][keep], "Wg_scale")
+    )
+    ref_inits["Wg_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wg_zp"][keep], "Wg_zp")
+    )
+    ref_inits["Wu"].CopyFrom(onnx.numpy_helper.from_array(info["Wu"][:, keep], "Wu"))
+    ref_inits["Wu_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wu_scale"][keep], "Wu_scale")
+    )
+    ref_inits["Wu_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wu_zp"][keep], "Wu_zp")
+    )
+    ref_inits["Wd"].CopyFrom(onnx.numpy_helper.from_array(info["Wd"][keep, :], "Wd"))
+    ref_inits["Wd_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wd_scale"], "Wd_scale")
+    )
+    ref_inits["Wd_zp"].CopyFrom(onnx.numpy_helper.from_array(info["Wd_zp"], "Wd_zp"))
+
+    rng = np.random.default_rng(61)
+    xq = rng.integers(-100, 100, size=(1, K)).astype(np.int8)
+    (y_pruned,) = _run(pruned, {"x_q": xq})
+    (y_ref,) = _run(ref_model, {"x_q": xq})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_qop_gated_ffn_no_activation_symmetric_matches_oracle():
+    # Symmetric case: both branches feed QLinearMul directly (zero hops) --
+    # a plain (unactivated) Gated Linear Unit.
+    K, H, Out = 8, 16, 4
+    model, info = _qop_gated_mlp_model(K, H, Out, gate_activation=None, seed=62)
+    onnx.checker.check_model(model)
+
+    gated = onnxsim.pruning._find_qop_gated_chains(model.graph)
+    assert len(gated) == 1
+    assert gated[0].producer_a.pre_ops == ()
+    assert gated[0].producer_b.pre_ops == ()
+
+    wg_dequant = _qop_dequant(info["Wg"], info["Wg_scale"], info["Wg_zp"], axis=1)
+    wu_dequant = _qop_dequant(info["Wu"], info["Wu_scale"], info["Wu_zp"], axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wg"]), info["Wg"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wu"]), info["Wu"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wd"]), info["Wd"][keep, :]
+    )
+
+    rng = np.random.default_rng(63)
+    xq = rng.integers(-100, 100, size=(1, K)).astype(np.int8)
+    (y_pruned,) = _run(pruned, {"x_q": xq})
+    assert y_pruned.shape == (1, Out)
+
+
+def test_qop_gated_ffn_tied_weight_is_declined():
+    # gate_proj and up_proj both reading the SAME quantized weight
+    # initializer -- a tied/reused tensor, can't be independently sliced for
+    # each role. Naturally declined: `_match_qlinearmatmul`'s own
+    # single-consumer check on `b`/`b_scale`/`b_zero_point` fails for BOTH
+    # nodes once the tensor has two readers, so neither ever enters
+    # `producer_infos` in the first place.
+    K, H, Out = 8, 16, 4
+    model, _info = _qop_gated_mlp_model(K, H, Out, gate_activation=None, seed=64)
+    for node in model.graph.node:
+        if node.name == "up_proj_quant":
+            node.input[3] = "Wg"
+            node.input[4] = "Wg_scale"
+            node.input[5] = "Wg_zp"
+    gated = onnxsim.pruning._find_qop_gated_chains(model.graph)
+    assert gated == []
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H]  # untouched
+
+
+def test_qop_gated_ffn_mismatched_dq_scale_is_declined():
+    # The gate branch's own DequantizeLinear rescales using a DIFFERENT
+    # scale/zero-point pair than gate_proj's own y_scale/y_zero_point --
+    # doesn't actually reverse THAT producer's own quantization, so the
+    # sandwich is declined by name rather than assumed safe merely because
+    # the shape (DQ -> activation -> Q) matches.
+    K, H, Out = 8, 16, 4
+    model, _info = _qop_gated_mlp_model(K, H, Out, gate_activation="Relu", seed=65)
+    inits = {t.name: t for t in model.graph.initializer}
+    # An unrelated scale/zero-point pair with the identical value but a
+    # different identity.
+    inits["gate_out_scale"]  # sanity: exists
+    other_scale = _f32(np.array(0.015), "other_scale")
+    other_zp = _i8(np.array(0), "other_zp")
+    model.graph.initializer.extend([other_scale, other_zp])
+    for node in model.graph.node:
+        if node.name == "gate_out_DequantizeLinear":
+            node.input[1] = "other_scale"
+            node.input[2] = "other_zp"
+    gated = onnxsim.pruning._find_qop_gated_chains(model.graph)
+    assert gated == []
+
+
+def test_qop_gated_ffn_real_quantize_static_pipeline_end_to_end():
+    # Runs the REAL onnxruntime.quantization.quantize_static(...,
+    # quant_format=QuantFormat.QOperator, per_channel=True) tool on a real
+    # ReGLU FFN (gate_proj = MatMul, Relu, up_proj = MatMul, Mul combine,
+    # down_proj = MatMul). The default `op_types_to_quantize` fuses the
+    # elementwise Mul into `com.microsoft::QLinearMul` automatically,
+    # producing exactly the asymmetric
+    # DequantizeLinear -> Relu -> QuantizeLinear gate sandwich this
+    # section's own top comment documents.
+    from onnxruntime.quantization import (
+        CalibrationDataReader,
+        QuantFormat,
+        QuantType,
+        quantize_static,
+    )
+
+    K, H, Out = 8, 16, 6
+    rng = np.random.default_rng(70)
+    Wg = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wu = (rng.standard_normal((K, H)) * 0.3).astype(np.float32)
+    Wd = (rng.standard_normal((H, Out)) * 0.3).astype(np.float32)
+    float_model = _model(
+        f"""
+        reglu (float[1,{K}] x) => (float[1,{Out}] y)
+        {{
+          gate_out = MatMul(x, Wg)
+          gate_act = Relu(gate_out)
+          up_out = MatMul(x, Wu)
+          combined = Mul(gate_act, up_out)
+          y = MatMul(combined, Wd)
+        }}
+        """,
+        initializer=[_f32(Wg, "Wg"), _f32(Wu, "Wu"), _f32(Wd, "Wd")],
+        opset=17,
+    )
+    onnx.checker.check_model(float_model)
+
+    class _CDR(CalibrationDataReader):
+        def __init__(self):
+            self._data = iter(
+                [
+                    {"x": rng.standard_normal((1, K)).astype(np.float32)}
+                    for _ in range(8)
+                ]
+            )
+
+        def get_next(self):
+            return next(self._data, None)
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        onnx.save(float_model, src_path)
+        quantize_static(
+            src_path,
+            quant_path,
+            calibration_data_reader=_CDR(),
+            quant_format=QuantFormat.QOperator,
+            per_channel=True,
+            weight_type=QuantType.QInt8,
+            activation_type=QuantType.QInt8,
+            extra_options={"ActivationSymmetric": True},
+        )
+        quantized = onnx.load(quant_path)
+    onnx.checker.check_model(quantized)
+
+    # Confirm the real tool actually emitted the shape this section targets,
+    # not merely assumed.
+    op_types = [n.op_type for n in quantized.graph.node]
+    assert op_types.count("QLinearMatMul") == 3
+    assert any(
+        n.op_type == "QLinearMul" and n.domain == "com.microsoft"
+        for n in quantized.graph.node
+    )
+    assert op_types.count("DequantizeLinear") >= 2  # the gate rescale + final output
+
+    gated = onnxsim.pruning._find_qop_gated_chains(quantized.graph)
+    assert len(gated) == 1
+    assert [n.op_type for n in gated[0].producer_a.pre_ops] == [
+        "DequantizeLinear",
+        "Relu",
+        "QuantizeLinear",
+    ]
+    assert gated[0].producer_b.pre_ops == ()
+
+    init_map = {
+        t.name: onnx.numpy_helper.to_array(t) for t in quantized.graph.initializer
+    }
+    wg_name = gated[0].producer_a.weight.w_init.name
+    wu_name = gated[0].producer_b.weight.w_init.name
+    wg_scale_name = gated[0].producer_a.weight.w_scale_init.name
+    wu_scale_name = gated[0].producer_b.weight.w_scale_init.name
+    wg_zp_name = gated[0].producer_a.weight.w_zero_point_init.name
+    wu_zp_name = gated[0].producer_b.weight.w_zero_point_init.name
+    wd_name = gated[0].consumer.w_init.name
+
+    wg_dequant = _qop_dequant(
+        init_map[wg_name], init_map[wg_scale_name], init_map[wg_zp_name], axis=1
+    )
+    wu_dequant = _qop_dequant(
+        init_map[wu_name], init_map[wu_scale_name], init_map[wu_zp_name], axis=1
+    )
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(quantized, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(pruned_inits[wg_name].dims) == [K, H // 2]
+    assert list(pruned_inits[wu_name].dims) == [K, H // 2]
+    assert list(pruned_inits[wd_name].dims) == [H // 2, Out]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(pruned_inits[wg_name]),
+        init_map[wg_name][:, keep],
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(pruned_inits[wu_name]),
+        init_map[wu_name][:, keep],
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(pruned_inits[wd_name]),
+        init_map[wd_name][keep, :],
+    )
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = sess.run(None, {"x": x})
+    assert y_pruned.shape == (1, Out)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_analyze_structured_pruning_qoperator_gated_matches_real_call():
+    K, H, Out = 8, 16, 4
+    model, _info = _qop_gated_mlp_model(K, H, Out, gate_activation="Relu", seed=71)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qoperator, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qoperator_matmul_gated"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = H - layer.would_drop
+    assert inits["Wg"].dims[1] == kept
+    assert inits["Wu"].dims[1] == kept
+    assert inits["Wd"].dims[0] == kept
+
+
 # --- Dry-run parity / registry --------------------------------------------
 
 

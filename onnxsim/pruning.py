@@ -33997,16 +33997,75 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
 #     "QDQ" section top comment never gives its own rank restriction a
 #     wider justification either; both sections draw the same first-cut
 #     line).
-#   * Any residual/skip-connection merge, `Concat`-merged branch group, or
-#     gated (SwiGLU/GeGLU) pair -- only the plain single-producer/single-
-#     consumer/unary-hops-only topology above is matched, mirroring the
-#     `MatMulBlockQuantizedFp4Weight`/`Fp8Weight` section's own identical
-#     scope (and, for the residual/`Concat` case, the QDQ section's own).
-#     Unlike the QDQ section, this section does NOT add gated-pair support
-#     either -- a genuine, deliberately-left follow-up (the QDQ gated
-#     matcher's own backward walk could plausibly generalize the same way
-#     :func:`_find_qop_chains` generalizes the QDQ section's own ordinary
-#     chain walk, but doing so correctly was not attempted here).
+#   * Any residual/skip-connection merge, or `Concat`-merged branch group --
+#     only the plain single-producer/single-consumer/unary-hops-only
+#     topology above, or the gated pair just below, is matched, mirroring
+#     the `MatMulBlockQuantizedFp4Weight`/`Fp8Weight` section's own identical
+#     scope for those two shapes (and, for the residual/`Concat` case, the
+#     QDQ section's own).
+#   * A gated (SwiGLU/GeGLU/ReGLU) pair IS now matched
+#     (:func:`_find_qop_gated_chains`/:func:`_trace_gate_producer_backward_qop`),
+#     mirroring the QDQ section's own :func:`_find_qdq_gated_chains` --
+#     gate_proj/up_proj (two `QLinearMatMul`/`QGemm` producers, never
+#     `QLinearConv`, sharing one input) combined by
+#     `com.microsoft::QLinearMul`, feeding one down_proj consumer
+#     (:func:`_walk_to_qop_consumer`). Confirmed against a real
+#     ``onnxruntime.quantization.quantize_static(..., quant_format=
+#     QuantFormat.QOperator, per_channel=True)`` round trip on a ReGLU FFN
+#     (`gate_proj = QLinearMatMul`, `Relu`, `up_proj = QLinearMatMul`, `Mul`
+#     combine, `down_proj = QLinearMatMul`; the default `op_types_to_quantize`
+#     fuses the elementwise `Mul` straight into `QLinearMul`), which produces
+#     this exact node sequence::
+#
+#       x_quantized = QuantizeLinear(x, x_scale, x_zero_point)
+#       gate_out_quantized = QLinearMatMul(x_quantized, x_scale, x_zero_point,
+#           gate_w_quantized, gate_w_scale, gate_w_zero_point,
+#           gate_out_scale, gate_out_zero_point)
+#       up_out_quantized = QLinearMatMul(x_quantized, x_scale, x_zero_point,
+#           up_w_quantized, up_w_scale, up_w_zero_point,
+#           up_out_scale, up_out_zero_point)
+#       gate_out = DequantizeLinear(gate_out_quantized, gate_out_scale,
+#           gate_out_zero_point)
+#       gate_act = Relu(gate_out)
+#       gate_act_quantized = QuantizeLinear(gate_act, gate_act_scale,
+#           gate_act_zero_point)
+#       combined_quantized = com.microsoft.QLinearMul(
+#           gate_act_quantized, gate_act_scale, gate_act_zero_point,
+#           up_out_quantized, up_out_scale, up_out_zero_point,
+#           combined_scale, combined_zero_point)
+#       y_quantized = QLinearMatMul(combined_quantized, combined_scale,
+#           combined_zero_point, down_w_quantized, down_w_scale,
+#           down_w_zero_point, y_scale, y_zero_point)
+#
+#     The KEY asymmetric detail this shape forces: ORT has no `QLinearRelu`
+#     (or any other fused `QLinear<Activation>` op), so gate_proj's own raw
+#     `QLinearMatMul` output gets an explicit `DequantizeLinear -> Relu ->
+#     QuantizeLinear` sandwich (rescale to float, apply the activation,
+#     requantize) before reaching `QLinearMul`, while up_proj -- unactivated
+#     -- feeds `QLinearMul` directly, zero hops. This is genuinely
+#     ASYMMETRIC, unlike the QDQ section's own gated matcher (where the
+#     whole pipeline is float throughout a MatMul's own compute, so an
+#     activation is always just one more `_UNARY_PASS_THROUGH` node, no
+#     rescale/requantize needed on either branch). Rather than generalizing
+#     the QDQ gated matcher's own backward walk (which only ever crosses
+#     `_UNARY_PASS_THROUGH` nodes, never a DQ/Q pair), this section adds a
+#     narrow, purpose-built recognizer for exactly this sandwich
+#     (:func:`_trace_gate_producer_backward_qop`): a
+#     `DequantizeLinear -> <one _UNARY_PASS_THROUGH op> -> QuantizeLinear`
+#     hop is only accepted when the `DequantizeLinear`'s own scale/
+#     zero-point inputs are, BY NAME, the exact same initializers as the
+#     upstream producer's own `y_scale`/`y_zero_point` (confirmed true in
+#     the real round trip above) -- i.e. it demonstrably reverses THAT
+#     producer's own quantization, not merely a rescale that happens to have
+#     a matching shape. A branch with no such sandwich (feeding `QLinearMul`
+#     directly) is handled as the trivial zero-hop case. A plain `Mul` of
+#     two already-dequantized float operands, re-quantized afterward by its
+#     own single `QuantizeLinear` -- the shape a real exporter emits instead
+#     when the `com.microsoft` domain isn't registered for op fusion -- is
+#     deliberately NOT matched: only the `QLinearMul`-fused shape above was
+#     confirmed as the default, common one; declined rather than guessed at,
+#     the same conservative bar this module holds every other unconfirmed
+#     topology to.
 #   * Mixing a QOperator node with a QDQ (`DequantizeLinear`-fed) node, an
 #     unquantized plain-float node, or a `MatMulNBits`/block-quantized
 #     Fp4/Fp8 node, on EITHER side of a chain -- every one of those is a
@@ -34823,6 +34882,333 @@ def _find_qop_chains(graph: onnx.GraphProto) -> List[_QOpChain]:
     return chains
 
 
+@dataclass(frozen=True)
+class _QOpGatedProducer:
+    """One producer (gate_proj or up_proj) of a QOperator gated pair -- see
+    :func:`_find_qop_gated_chains`. `pre_ops` is empty when this producer's
+    own raw quantized output feeds the combining ``com.microsoft::
+    QLinearMul`` node directly, or exactly ``(DequantizeLinear, <one
+    _UNARY_PASS_THROUGH activation>, QuantizeLinear)`` for the one
+    asymmetric rescale-activate-requantize sandwich a real exporter inserts
+    on whichever branch carries an activation ORT has no fused QLinear op
+    for (there is no ``QLinearRelu``/``QLinearSigmoid``/etc.) -- see
+    :func:`_trace_gate_producer_backward_qop`'s own docstring for the exact
+    shape, confirmed live.
+    """
+
+    weight: _QOpWeight
+    pre_ops: Tuple[onnx.NodeProto, ...] = ()
+
+
+@dataclass(frozen=True)
+class _QOpGatedChain:
+    """The QOperator analogue of a gated (SwiGLU/GeGLU/ReGLU) :class:`_Chain`
+    -- two producers (`producer_a`/`producer_b`, gate_proj/up_proj, both
+    ``QLinearMatMul``/``QGemm`` -- never ``QLinearConv``, mirroring
+    :func:`_find_qdq_gated_chains`'s own identical MatMul/Gemm-only scope)
+    combined by ``com.microsoft::QLinearMul``, feeding one downstream
+    same-family `consumer`. See :func:`_find_qop_gated_chains`.
+    """
+
+    producer_a: _QOpGatedProducer
+    producer_b: _QOpGatedProducer
+    combine_node: onnx.NodeProto
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _QOpWeight
+    n_channels: int
+
+
+def _qop_producer_y_scale_zp(
+    w: _QOpWeight,
+) -> Tuple[Optional[str], Optional[str]]:
+    """The ``(y_scale_name, y_zero_point_name)`` pair describing how
+    `w.node`'s own output tensor is quantized -- always present (input
+    indices 6/7) for ``QLinearConv``/``QLinearMatMul``, only OPTIONALLY
+    present for ``QGemm`` (mirroring :func:`_match_qgemm`'s own identical
+    optional-trailing-input unpacking: `y_scale`/`y_zero_point` are checked
+    independently, not as a tied pair) -- either or both come back ``None``
+    when a ``QGemm`` omits them.
+    """
+    node = w.node
+    if w.op_kind in ("conv", "matmul"):
+        return node.input[6], node.input[7]
+    y_scale_name = node.input[7] if len(node.input) > 7 and node.input[7] else None
+    y_zp_name = node.input[8] if len(node.input) > 8 and node.input[8] else None
+    return y_scale_name, y_zp_name
+
+
+def _trace_gate_producer_backward_qop(
+    tensor_name: str,
+    scale_name: str,
+    zero_point_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    producer_infos: Dict[str, _QOpWeight],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[_QOpWeight, Tuple[onnx.NodeProto, ...]]]:
+    """Resolves one ``QLinearMul`` operand (`tensor_name`, quantized per
+    `scale_name`/`zero_point_name` -- that operand's own scale/zero-point
+    inputs on the ``QLinearMul`` node) back to a ``QLinearMatMul``/``QGemm``
+    producer (`producer_infos`, built the same way :func:`_find_qop_chains`
+    builds its own per-node match, keyed by each matched node's raw output
+    tensor name), tolerating the one real ASYMMETRIC shape a static
+    QOperator quantizer emits when a gate branch's activation has no fused
+    QLinear op of its own -- confirmed live via a real
+    ``onnxruntime.quantization.quantize_static(..., quant_format=
+    QuantFormat.QOperator, per_channel=True)`` round trip on a ReGLU FFN
+    (``gate_proj``/``up_proj`` = ``QLinearMatMul``, gate activation
+    ``Relu``, combined via ``com.microsoft::QLinearMul``, ``down_proj`` =
+    ``QLinearMatMul``; ORT has no ``QLinearRelu``, so the quantizer rescales
+    gate_proj's own raw output back to float, applies ``Relu``, then
+    requantizes)::
+
+        producer.raw_output -> DequantizeLinear -> <one _UNARY_PASS_THROUGH
+        activation> -> QuantizeLinear -> (this QLinearMul operand)
+
+    while the OTHER (unactivated) branch feeds `QLinearMul` directly, zero
+    hops. This function confirms the sandwich by NAME, not merely by shape
+    or value: the emitted ``DequantizeLinear``'s own scale/zero-point inputs
+    must be the EXACT SAME initializers as the producer node's own
+    `y_scale`/`y_zero_point` inputs (confirmed true in the real round trip
+    above) -- a real, distinct rescale using different scale/zero-point
+    tensors is never seen from any real exporter this investigation found,
+    so it's declined rather than assumed safe, the same "slice, don't
+    recompute, and don't assume what wasn't confirmed" bar this module holds
+    everywhere else. Likewise the zero-hop case requires `tensor_name`
+    itself to be the producer's own raw output AND the `scale_name`/
+    `zero_point_name` fed to this exact `QLinearMul` operand to be that same
+    producer's own `y_scale`/`y_zero_point` -- never assumed merely because
+    the tensor name matches.
+
+    Every tensor visited (`tensor_name` itself, and every intermediate hop
+    of the sandwich) must have EXACTLY one consumer and not be a graph
+    output -- mirroring :func:`_trace_gate_producer_backward_qdq`'s own
+    identical bar -- so a branch whose raw output, or whose sandwich's
+    intermediate float tensor, is reused anywhere else is declined outright
+    rather than silently corrupted.
+
+    Returns ``(producer, pre_ops)`` -- `pre_ops` is ``()`` for the zero-hop
+    case, or ``(dq_node, activation_node, q_node)`` for the sandwich -- or
+    ``None`` when `tensor_name` resolves to neither shape (more than one
+    activation node, an activation outside `_UNARY_PASS_THROUGH`, a
+    missing/mismatched DQ or Q scale/zero-point pair, any hop with more than
+    one consumer or itself a graph output, or `tensor_name` simply isn't
+    reachable from any matched producer at all): declined outright, the same
+    conservative bar this module holds every other ambiguous topology to.
+
+    A plain ``Mul`` of two already-dequantized float operands, re-quantized
+    afterward by its own single ``QuantizeLinear`` -- the shape a real
+    exporter emits instead when the ``com.microsoft`` domain isn't
+    registered for op fusion -- is NOT a shape this function (or its only
+    caller, :func:`_find_qop_gated_chains`) recognizes: this investigation
+    only confirmed the ``QLinearMul`` shape as the default, common one (see
+    this module's own "QOperator" section comment) -- declined rather than
+    guessed at.
+    """
+    if len(consumers_of.get(tensor_name, [])) != 1 or tensor_name in graph_outputs:
+        return None
+
+    direct = producer_infos.get(tensor_name)
+    if direct is not None:
+        y_scale_name, y_zp_name = _qop_producer_y_scale_zp(direct)
+        if y_scale_name == scale_name and y_zp_name == zero_point_name:
+            return direct, ()
+        return None  # this operand's own scale/zero-point don't describe
+        # `tensor_name` the way the producer's own output does -- declined
+        # rather than guessed at
+
+    q_node = node_by_output.get(tensor_name)
+    if (
+        q_node is None
+        or q_node.op_type != "QuantizeLinear"
+        or q_node.domain != ""
+        or len(q_node.input) != 3
+        or len(q_node.output) != 1
+    ):
+        return None
+    q_in, q_scale_name, q_zp_name = q_node.input
+    if q_scale_name != scale_name or q_zp_name != zero_point_name:
+        return None
+    if len(consumers_of.get(q_in, [])) != 1 or q_in in graph_outputs:
+        return None
+
+    act_node = node_by_output.get(q_in)
+    if (
+        act_node is None
+        or act_node.op_type not in _UNARY_PASS_THROUGH
+        or len(act_node.input) != 1
+        or len(act_node.output) != 1
+    ):
+        return None
+    act_in = act_node.input[0]
+    if len(consumers_of.get(act_in, [])) != 1 or act_in in graph_outputs:
+        return None
+
+    dq_node = node_by_output.get(act_in)
+    if (
+        dq_node is None
+        or dq_node.op_type != "DequantizeLinear"
+        or dq_node.domain != ""
+        or len(dq_node.input) != 3
+        or len(dq_node.output) != 1
+    ):
+        return None
+    dq_in, dq_scale_name, dq_zp_name = dq_node.input
+    if dq_in in graph_outputs or len(consumers_of.get(dq_in, [])) != 1:
+        return None
+    producer = producer_infos.get(dq_in)
+    if producer is None:
+        return None
+    y_scale_name, y_zp_name = _qop_producer_y_scale_zp(producer)
+    if dq_scale_name != y_scale_name or dq_zp_name != y_zp_name:
+        return None  # the DQ doesn't reverse THIS producer's own
+        # quantization -- declined rather than assumed safe
+    return producer, (dq_node, act_node, q_node)
+
+
+def _qop_gated_channel_importance(
+    w_a_nk: np.ndarray, w_b_nk: np.ndarray, importance_norm: str
+) -> np.ndarray:
+    """Combined importance across a QOperator gated pair's two producers --
+    root-sum-square (L2) or plain sum (L1) of each producer's own
+    per-channel dequantized-row norm, mirroring
+    :func:`_qdq_gated_channel_importance`'s own identical combination
+    exactly, restricted to the always-exactly-two-producer case a QOperator
+    gated chain matches.
+    """
+    if importance_norm == "l1":
+        return _qdq_channel_importance(w_a_nk, "l1") + _qdq_channel_importance(
+            w_b_nk, "l1"
+        )
+    return np.sqrt(
+        np.square(_qdq_channel_importance(w_a_nk, "l2"))
+        + np.square(_qdq_channel_importance(w_b_nk, "l2"))
+    )
+
+
+def _find_qop_gated_chains(graph: onnx.GraphProto) -> List[_QOpGatedChain]:
+    """Recognizes a gated (SwiGLU/GeGLU/ReGLU) FFN pair in QOperator format:
+    gate_proj/up_proj -- both ``QLinearMatMul``/``QGemm``, never
+    ``QLinearConv`` (mirroring :func:`_find_qdq_gated_chains`'s own
+    identical MatMul/Gemm-only restriction -- no gated-elementwise-product
+    convention for a Conv-family layer was found) -- combined by
+    ``com.microsoft::QLinearMul``, feeding exactly one downstream
+    same-family consumer (:func:`_walk_to_qop_consumer`, `is_conv=False`).
+    Each producer may feed the combine node either directly or through the
+    one real asymmetric rescale-activate-requantize sandwich a static
+    QOperator quantizer emits for a branch whose activation has no fused
+    QLinear op of its own (see :func:`_trace_gate_producer_backward_qop`'s
+    own docstring for the exact confirmed shape and why it's matched this
+    narrowly rather than as a general backward walk through
+    `_UNARY_PASS_THROUGH`). Confirmed live against a real
+    ``onnxruntime.quantization.quantize_static(..., quant_format=
+    QuantFormat.QOperator, per_channel=True)`` round trip on a ReGLU FFN
+    (default `op_types_to_quantize` fuses the elementwise ``Mul`` into
+    ``QLinearMul`` automatically) -- see this module's own "QOperator"
+    section comment for the full node sequence and why the plain-``Mul``
+    (non-fused) shape is deliberately NOT matched here.
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    producers_of = _producers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[str, _QOpWeight] = {}
+    for node in graph.node:
+        m: Optional[_QOpWeight]
+        if node.op_type == "QLinearMatMul":
+            m = _match_qlinearmatmul(node, initializer_map, consumers_of)
+        elif node.op_type == "QGemm":
+            m = _match_qgemm(node, initializer_map, consumers_of)
+        else:
+            continue
+        if m is not None:
+            producer_infos[node.output[0]] = m
+
+    chains: List[_QOpGatedChain] = []
+    for node in graph.node:
+        if (
+            node.op_type != "QLinearMul"
+            or node.domain != "com.microsoft"
+            or len(node.input) != 8
+            or len(node.output) != 1
+        ):
+            continue
+        (
+            a_name,
+            a_scale_name,
+            a_zp_name,
+            b_name,
+            b_scale_name,
+            b_zp_name,
+            _out_scale_name,
+            _out_zp_name,
+        ) = node.input
+        if not all((a_name, a_scale_name, a_zp_name, b_name, b_scale_name, b_zp_name)):
+            continue
+        if a_name == b_name:
+            continue
+
+        trace_a = _trace_gate_producer_backward_qop(
+            a_name,
+            a_scale_name,
+            a_zp_name,
+            node_by_output,
+            producer_infos,
+            consumers_of,
+            graph_outputs,
+        )
+        trace_b = _trace_gate_producer_backward_qop(
+            b_name,
+            b_scale_name,
+            b_zp_name,
+            node_by_output,
+            producer_infos,
+            consumers_of,
+            graph_outputs,
+        )
+        if trace_a is None or trace_b is None:
+            continue
+        info_a, pre_a = trace_a
+        info_b, pre_b = trace_b
+        if info_a.node is info_b.node or info_a.N != info_b.N:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        found = _walk_to_qop_consumer(
+            out_name,
+            False,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            info_a.N,
+            _MAX_CHAIN_HOPS,
+            producers_of,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+
+        chains.append(
+            _QOpGatedChain(
+                producer_a=_QOpGatedProducer(info_a, pre_a),
+                producer_b=_QOpGatedProducer(info_b, pre_b),
+                combine_node=node,
+                chain_ops=chain_ops,
+                consumer=consumer,
+                n_channels=info_a.N,
+            )
+        )
+    return chains
+
+
 def apply_structured_pruning_qoperator(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -34857,15 +35243,46 @@ def apply_structured_pruning_qoperator(
     scale/zero-point/bias are never touched -- none of the three ops'
     schemas index them by the reduction axis).
 
-    Unlike :func:`apply_structured_pruning_qdq`, no gated (SwiGLU/GeGLU)
-    pair, residual/skip-connection merge, or ``Concat``-merged branch group
-    is matched -- only the plain single-producer/single-consumer topology
-    above (see this module's own "QOperator" section comment for the full
-    scope-boundary list, including why a `QLinearConv` producer feeding a
-    `QLinearMatMul`/`QGemm` consumer through a GENERAL `Flatten`/`Reshape`
-    reading real, un-pooled spatial extent is declined outright, the same
-    known gap the QDQ section's own identical same-family-only walk already
-    has).
+    No residual/skip-connection merge or ``Concat``-merged branch group is
+    matched -- only the plain single-producer/single-consumer topology
+    above, or the gated pair just below (see this module's own "QOperator"
+    section comment for the full scope-boundary list, including why a
+    `QLinearConv` producer feeding a `QLinearMatMul`/`QGemm` consumer through
+    a GENERAL `Flatten`/`Reshape` reading real, un-pooled spatial extent is
+    declined outright, the same known gap the QDQ section's own identical
+    same-family-only walk already has).
+
+    Also handles the gated (SwiGLU/GeGLU/ReGLU) FFN pair
+    (:func:`_find_qop_gated_chains`, the QOperator analogue of
+    :func:`_find_qdq_gated_chains`) -- gate_proj/up_proj (two
+    ``QLinearMatMul``/``QGemm`` producers sharing one input, never
+    ``QLinearConv``) combined by ``com.microsoft::QLinearMul``, feeding one
+    down_proj consumer. Each producer may feed the combine node either
+    directly, or through the one real asymmetric sandwich a static
+    QOperator quantizer emits for a branch whose activation has no fused
+    QLinear op of its own (there is no ``QLinearRelu``/``QLinearSigmoid``/
+    etc.): ``producer's raw output -> DequantizeLinear -> <one unary
+    activation> -> QuantizeLinear -> QLinearMul`` -- confirmed live against
+    a real ``onnxruntime.quantization.quantize_static(..., quant_format=
+    QuantFormat.QOperator, per_channel=True)`` round trip on a ReGLU FFN
+    (see :func:`_trace_gate_producer_backward_qop`'s own docstring for the
+    exact node sequence and the by-name scale/zero-point identity check
+    that confirms the sandwich reverses THAT producer's own quantization,
+    not merely one that happens to have a matching shape). Both producers
+    are ranked by combined (root-sum-square, or plain sum for L1) importance
+    of their own dequantized rows (:func:`_qop_gated_channel_importance`)
+    and cut to the *same* surviving channel-index set, since they're about
+    to be multiplied elementwise -- each producer's own quantized codes/
+    scale/zero-point/bias co-sliced in lockstep exactly like an ordinary
+    QOperator producer's above, using the very same per-role slicing
+    helpers (:func:`_slice_qop_producer`); down_proj is sliced on its input
+    axis exactly like an ordinary QOperator consumer above
+    (:func:`_slice_qop_consumer`). A plain ``Mul`` of two already-
+    dequantized float operands, re-quantized by its own single
+    ``QuantizeLinear`` afterward -- the shape a real exporter emits instead
+    when the ``com.microsoft`` domain isn't registered for op fusion -- is
+    NOT matched here: only the ``QLinearMul``-fused shape was confirmed as
+    the default, common one.
 
     One narrow exception to the same-family-only consumer rule IS matched,
     though: a ``QLinearConv`` producer's logical output feeding
@@ -34911,7 +35328,8 @@ def apply_structured_pruning_qoperator(
 
     for graph in _iter_subgraphs(out.graph):
         chains = _find_qop_chains(graph)
-        if not chains:
+        gated_chains = _find_qop_gated_chains(graph)
+        if not chains and not gated_chains:
             continue
 
         producer_touched: Set[str] = set()
@@ -34946,6 +35364,46 @@ def apply_structured_pruning_qoperator(
             consumer_touched.add(c_key)
             stale_value_info.add(p.node.output[0])
             stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = pa.weight.w_init.name
+            pb_key = pb.weight.w_init.name
+            c_key = c.w_init.name
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles)
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                continue  # a shared/tied weight another chain already resized
+
+            n = gchain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_a_nk = _qop_dequantized_nk(pa.weight)
+            w_b_nk = _qop_dequantized_nk(pb.weight)
+            importance = _qop_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
+            # `kind="stable"` for the identical determinism reason documented
+            # above.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            _slice_qop_producer(pa.weight, keep)
+            _slice_qop_producer(pb.weight, keep)
+            _slice_qop_consumer(c, keep)
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(pa.weight.node.output[0])
+            stale_value_info.update(op.output[0] for op in pa.pre_ops)
+            stale_value_info.add(pb.weight.node.output[0])
+            stale_value_info.update(op.output[0] for op in pb.pre_ops)
+            stale_value_info.add(gchain.combine_node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.chain_ops)
 
         if stale_value_info:
             kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
@@ -42850,11 +43308,19 @@ def _analyze_structured_pruning_matmul_block_quantized_fp4(
 # --- QOperator (QLinearConv/QLinearMatMul/QGemm) family ---------------------
 
 
-def _qop_not_eligible(graph: onnx.GraphProto, chains: List[_QOpChain]) -> List[str]:
+def _qop_not_eligible(
+    graph: onnx.GraphProto,
+    chains: List[_QOpChain],
+    gated_chains: List[_QOpGatedChain],
+) -> List[str]:
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
         matched_ids.add(id(chain.consumer.node))
+    for gchain in gated_chains:
+        matched_ids.add(id(gchain.producer_a.weight.node))
+        matched_ids.add(id(gchain.producer_b.weight.node))
+        matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
         if node.op_type not in ("QLinearConv", "QLinearMatMul", "QGemm"):
@@ -42886,6 +43352,16 @@ def _analyze_structured_pruning_qoperator(
     consumer role gets no report row at all, mirroring
     :func:`_analyze_structured_pruning_qdq`'s own identical treatment.
 
+    Also mirrors the real call's own gated (SwiGLU/GeGLU/ReGLU) pair support
+    (:func:`_find_qop_gated_chains`, `family="qoperator_matmul_gated"`) --
+    same touched-role/keep-count treatment as an ordinary QOperator chain
+    above, just against the combined (root-sum-square, or plain sum for L1)
+    importance of both producers (:func:`_qop_gated_channel_importance`),
+    and reported as one row per gated pair (`label` joining both producers'
+    own labels, mirroring :func:`_chain_label`'s own plain-float convention
+    and :func:`_analyze_structured_pruning_qdq`'s own identical gated-pair
+    treatment).
+
     Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
     "Subgraph recursion" section comment), the dry-run mirror of
     :func:`apply_structured_pruning_qoperator`'s own subgraph awareness:
@@ -42903,8 +43379,9 @@ def _analyze_structured_pruning_qoperator(
 
     for graph in _iter_subgraphs(model.graph):
         chains = _find_qop_chains(graph)
-        not_eligible.extend(_qop_not_eligible(graph, chains))
-        if not chains:
+        gated_chains = _find_qop_gated_chains(graph)
+        not_eligible.extend(_qop_not_eligible(graph, chains, gated_chains))
+        if not chains and not gated_chains:
             continue
 
         producer_touched: Set[str] = set()
@@ -42969,6 +43446,74 @@ def _analyze_structured_pruning_qoperator(
             )
 
             producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = pa.weight.w_init.name
+            pb_key = pb.weight.w_init.name
+            c_key = c.w_init.name
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles) -- no report row
+
+            label = f"{_node_label(pa.weight.node)} + {_node_label(pb.weight.node)}"
+            family = "qoperator_matmul_gated"
+            n = gchain.n_channels
+
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_a_nk = _qop_dequantized_nk(pa.weight)
+            w_b_nk = _qop_dequantized_nk(pb.weight)
+            importance = _qop_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
+            )
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
             consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
