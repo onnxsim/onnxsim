@@ -628,6 +628,16 @@ def _mcode_from_axmodel(axmodel_path):
     return bytes(inits[mcode_key].raw_data)
 
 
+def _mcode_key(compiled):
+    """The `neu_key` initializer name holding a compiled model's mcode --
+    shared by tests that hand-patch mcode bytes and need to resave."""
+    neu_node = next(nd for nd in compiled.graph.node if nd.op_type == "neu mode")
+    for attr in neu_node.attribute:
+        if attr.name == "npu_graph_info":
+            info = json.loads(attr.s.decode())
+    return info["dotneus"][0]["neu_key"]
+
+
 def _gemm_model(transb, m=1, k=16, n=8):
     """One `Gemm(x, w, b)` -- `transb` selects whether `w` is stored as
     `[k,n]` (transB=0) or `[n,k]` (transB=1), same logical matrix either
@@ -1017,3 +1027,100 @@ def test_gemm_two_engine_split_threshold_differs_from_conv(tmp_path):
 
     assert gemm_engines(k=128, n=128) == (3, ["conv1"])
     assert gemm_engines(k=256, n=256) == (6, ["conv0", "conv1"])
+
+
+def test_spliced_frankenstein_noise_bytes_run_correctly_on_device(tmp_path):
+    """Confirmed real (see the README's "Beyond passive diffing" section):
+    building the identical two-Conv model three times gives three real
+    mcode blobs differing only at the known small set of non-deterministic
+    noise positions. Splicing build A's mcode with one differing byte
+    swapped in from build B produces a byte sequence that is *not*
+    identical to any of the three real builds (a genuinely novel
+    combination the real compiler never produced as a whole) -- yet it
+    loads and runs on the real AX650N with bit-identical output to the
+    unpatched original. This is proof by construction, not correlation,
+    that the noise zone is a truly swappable, functionally inert label.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    model = _two_conv_model(vary_first=True, dilation=2, pad=2)
+    paths = [
+        _build_axmodel(os.path.join(str(tmp_path), f"run{i}"), model, (1, 4, 16, 16))
+        for i in range(3)
+    ]
+    compiled = [onnx.load(p) for p in paths]
+    keys = [_mcode_key(c) for c in compiled]
+    assert len(set(keys)) == 1, "expected the same neu_key across identical rebuilds"
+    key = keys[0]
+    mcodes = [
+        bytes({i.name: i for i in c.graph.initializer}[key].raw_data) for c in compiled
+    ]
+    assert len(set(len(m) for m in mcodes)) == 1
+
+    noisy = [i for i in range(len(mcodes[0])) if len(set(m[i] for m in mcodes)) > 1]
+    assert noisy, "expected the known small amount of run-to-run mcode noise"
+
+    frank = bytearray(mcodes[0])
+    frank[noisy[0]] = mcodes[1][noisy[0]]
+    frank = bytes(frank)
+    assert frank not in mcodes, "expected a genuinely novel combination"
+
+    inits = {i.name: i for i in compiled[0].graph.initializer}
+    inits[key].raw_data = frank
+    frank_path = os.path.join(str(tmp_path), "frankenstein.axmodel")
+    onnx.save(compiled[0], frank_path)
+
+    rng = np.random.RandomState(42)
+    x = rng.randn(1, 4, 16, 16).astype(np.float32)
+    dev_orig = pulsar2_docker.run_on_device_with_inputs(paths[0], {"x": x.tobytes()})
+    dev_frank = pulsar2_docker.run_on_device_with_inputs(frank_path, {"x": x.tobytes()})
+    assert not dev_orig.error, dev_orig.error
+    assert not dev_frank.error, dev_frank.error
+    out_orig = np.frombuffer(dev_orig.outputs[0], dtype=np.float32)
+    out_frank = np.frombuffer(dev_frank.outputs[0], dtype=np.float32)
+    assert np.array_equal(out_orig, out_frank)
+
+
+def test_bit_flip_in_opaque_mcode_region_is_sometimes_inert_sometimes_faults(tmp_path):
+    """Confirmed real (see the README's "Beyond passive diffing" section):
+    flipping all 8 bits of a single byte, at offsets in the still-opaque
+    majority of mcode (not the header/footer, not the known noise zone),
+    splits cleanly into two real, reproducible outcomes. Offset 400 is
+    completely inert (bit-identical device output). Offset 700 reliably
+    faults the runtime with the same real error every time -- confirming
+    part of that opaque region is genuinely load-bearing structural data
+    (plausibly a checksum/opcode/address-range check), without decoding
+    a single new bit.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    model = _two_conv_model(vary_first=True, dilation=2, pad=2)
+    path = _build_axmodel(os.path.join(str(tmp_path), "base"), model, (1, 4, 16, 16))
+    compiled = onnx.load(path)
+    key = _mcode_key(compiled)
+    mcode = bytes({i.name: i for i in compiled.graph.initializer}[key].raw_data)
+
+    def flip_and_run(offset, x):
+        patched = bytearray(mcode)
+        patched[offset] ^= 0xFF
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"flip_{offset}.axmodel")
+        onnx.save(c, p)
+        return pulsar2_docker.run_on_device_with_inputs(p, {"x": x.tobytes()})
+
+    rng = np.random.RandomState(42)
+    x = rng.randn(1, 4, 16, 16).astype(np.float32)
+    dev_base = pulsar2_docker.run_on_device_with_inputs(path, {"x": x.tobytes()})
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    dev_inert = flip_and_run(400, x)
+    assert not dev_inert.error, dev_inert.error
+    out_inert = np.frombuffer(dev_inert.outputs[0], dtype=np.float32)
+    assert np.array_equal(out_base, out_inert)
+
+    dev_fault = flip_and_run(700, x)
+    assert dev_fault.error and "0x8030070C" in dev_fault.error, dev_fault.error

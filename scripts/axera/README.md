@@ -1628,6 +1628,66 @@ as a unified quantity (candidates like raw weight-element count and
 output-element count were both checked and neither cleanly explains both
 ops' thresholds together).
 
+### Beyond passive diffing: running our own hand-patched mcode on real hardware
+
+Everything above (and in every earlier section) only ever *observes*
+Pulsar2's own compiler output -- building variant ONNX graphs and diffing
+what the real compiler produces. This project has no mcode generator; it
+never emits mcode itself. This section goes one step further for the
+first time: directly editing a real, working `.axmodel`'s mcode bytes by
+hand (loading it as the ONNX protobuf it is, overwriting the `neu_key`
+initializer's `raw_data`, resaving) and running the hand-patched result on
+the real AX650N -- a much stronger causal test than comparing two
+independently-compiled outputs, since it can construct byte patterns the
+real compiler would never produce as a whole.
+
+**Splicing confirms the noise zone is truly a swappable, inert label, not
+just something two builds happen to agree is inert.** Building the same
+`_two_conv_model` three times gave three real mcode blobs differing only
+at 3 of the confirmed noise-zone positions (858, 870, 876 -- byte 864
+happened to coincide across all three this time, consistent with a small
+multiset randomly permuted per build). Constructing a hybrid -- build A's
+mcode, but with build B's value spliced in at position 858 -- gives a byte
+sequence that is **not** identical to any of the three real builds (a
+genuinely novel combination, confirmed by direct comparison), yet it
+loaded and ran on the real device with **bit-identical output** to the
+unpatched original. This is real, direct proof by construction, not
+correlation: the compiler's own output never had to agree with itself for
+this to work, because the byte pattern tested was never compiled as a
+whole by anything.
+
+**Probing the still-opaque majority region with single-byte flips found
+something new: it isn't uniformly load-bearing.** Flipping all 8 bits of
+one byte (`^= 0xFF`) at 8 candidate offsets spread through the same
+3,920-byte mcode blob (avoiding the header, footer, and known noise
+positions) split cleanly into two real, reproducible outcomes, confirmed
+stable across two different random inputs and repeat runs:
+
+- **Offsets 400, 2000, 3000, 3400: the flip is completely inert** -- the
+  patched model ran and produced bit-identical output to the unpatched
+  original, for every input tried.
+- **Offsets 700, 1000, 1500, 2500: the flip reliably faults the runtime**,
+  every time, with the identical real error: `[ERROR] Run model
+  failed{0x8030070C}` / `Request api(11) return failed(-2147090294)`. The
+  device itself stayed healthy afterward (`axcl-smi` and the driver both
+  confirmed fine) -- this is a clean, graceful runtime-level rejection,
+  not a hardware lockup like the PCIe-driver crash this README's hardware
+  section separately covers.
+
+This is a real, useful, previously-unknown signal for future decoding
+work, found without decoding a single new bit: `0x8030070C` is Pulsar2's
+own real, reproducible signature for "this mcode program is structurally
+invalid" -- almost certainly evidence of an internal checksum, opcode
+validity check, or address-range check the runtime performs before or
+during execution, not a full re-verification of program *semantics*
+(since a corrupted-but-still-valid-looking byte can also just silently
+produce identical output, as the inert offsets show). Knowing which
+offsets fall on which side of this line, confirmed empirically rather
+than guessed, is a real, concrete, well-scoped map for whoever attempts
+to instrument or bisect further -- and a hard existence proof that some
+of that 99%-opaque region cannot be padding: a mechanism this precise and
+reproducible almost certainly means it's live, checked, structural data.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
