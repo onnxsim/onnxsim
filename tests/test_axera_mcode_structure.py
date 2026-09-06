@@ -2466,6 +2466,11 @@ by >= 2x in both real models -- the README's "Fourth correction" section.
 Superseded by `_ALL_TAGS`: the fifth correction's conditional-parity test
 showed the rejected tags were false rejections of rare forms."""
 
+_VERBS6 = frozenset(_VERBS | {0xA7})
+"""The five verbs plus `a7`, the segment-marker verb every stream segment
+opens with and `llm_build` op programs use freely -- see the README's "The
+tail is the segment table" section. Pass as `verbs=` to `_tokenize_mcode`."""
+
 _ALL_TAGS = frozenset(range(0x81, 0xA0))
 """Every byte below the verb range: the full short-unit tag set. For every
 tag the byte after it is even in ~100% of real units against ~60% shuffled
@@ -2480,6 +2485,7 @@ def _tokenize_mcode(
     pmax=3,
     bare=False,
     extra_byte_tags=frozenset(),
+    verbs=None,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -2496,12 +2502,13 @@ def _tokenize_mcode(
     correction" sections."""
     tags = set(range(0x81, 0x85)) if tags is None else set(tags)
     extra_byte_tags = set(extra_byte_tags)
+    verbs = _VERBS if verbs is None else frozenset(verbs)
     end = len(mcode) - 252 if end is None else end
 
     def is_verb(i):
         return (
             i + 3 < len(mcode)
-            and mcode[i] in _VERBS
+            and mcode[i] in verbs
             and mcode[i + 1] == 0
             and mcode[i + 2] % 0x10 == 0
         )
@@ -2829,12 +2836,52 @@ _TAIL_VECTOR = bytes.fromhex("05000000200000002c000000500000007400000098000000")
 tail -- see the README's "The op programs are fully tokenized" section."""
 
 
+def _tail_vector(mcode):
+    """Offset of the FlatBuffers table vector that opens an mcode blob's
+    tail, found through the header word that points at it (a uoffset whose
+    target holds a small count followed by increasing table offsets) -- the
+    fixed five-entry `_TAIL_VECTOR` pattern only holds for graphs with one
+    input and one output. See the README's "The tail is the segment table"
+    section."""
+    u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
+    first_verb = mcode.find(b"\xa1\x00\x40\x02")
+    assert first_verb > 0
+    for o in range(0, first_verb - 3, 4):
+        t = o + u32(o)
+        if not (first_verb < t < len(mcode) - 8):
+            continue
+        n = u32(t)
+        if not (1 <= n <= 64) or t + 4 + 4 * n > len(mcode):
+            continue
+        offs = [u32(t + 4 + 4 * k) for k in range(n)]
+        if all(0 < x < 8192 for x in offs) and offs == sorted(offs):
+            return t
+    raise AssertionError("no header word points at a tail table vector")
+
+
+def _segments(mcode):
+    """The stream segments the tail table describes: `(offset, length,
+    table)` per segment in stream order, which is *reverse* table order.
+    Table field 2 is the segment length in 8-byte words; the segments tile
+    the blob exactly from the end of the FlatBuffers header to the tail
+    vector. Also returns the header length."""
+    vec, tables = _tail_tables(mcode)
+    words = [t.get(2, 0) for t in tables]
+    header = vec - 8 * sum(words)
+    segs, pos = [], header
+    for k in range(len(tables) - 1, -1, -1):
+        segs.append((pos, 8 * words[k], tables[k]))
+        pos += 8 * words[k]
+    assert pos == vec
+    return header, segs
+
+
 def _tail_tables(mcode):
-    """Walk the five FlatBuffers tables of an mcode blob's tail. Returns, per
-    table, a dict of `field index -> uint32 (or uint16) value` for present
-    fields, read through each table's vtable."""
-    vec = mcode.find(_TAIL_VECTOR)
-    assert vec > 0 and mcode.find(_TAIL_VECTOR, vec + 1) < 0
+    """Walk the FlatBuffers tables of an mcode blob's tail (five for a
+    one-input, one-output CNN; fifteen for an `llm_build` subgraph).
+    Returns, per table, a dict of `field index -> uint32 (or uint16) value`
+    for present fields, read through each table's vtable."""
+    vec = _tail_vector(mcode)
     u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
     i32 = lambda o: struct.unpack_from("<i", mcode, o)[0]  # noqa: E731
     u16 = lambda o: struct.unpack_from("<H", mcode, o)[0]  # noqa: E731
@@ -2895,3 +2942,202 @@ def test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail(tmp_path):
             k
         ]
     assert tables[4][0] == 2561
+
+
+_FULL_RULE = dict(
+    tags=_ALL_TAGS, pmax=4, bare=True, extra_byte_tags={0x9F}, verbs=_VERBS6
+)
+"""Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
+six verbs -- the README's "The tail is the segment table" section."""
+
+
+def _segment_coverage(mcode, seg):
+    """Explained fraction of one stream segment under `_FULL_RULE`, with its
+    trailing zero padding trimmed; also the count of `a1 40 02` verbs (op
+    programs) and of `a7` verbs inside it."""
+    pos, length, _ = seg
+    end = pos + length
+    while end > pos and mcode[end - 1] == 0:
+        end -= 1
+    toks = _tokenize_mcode(mcode, start=pos, end=end, **_FULL_RULE)
+    # The segment's first 8 bytes can hold the tail of the `a7` marker verb
+    # that starts 4 bytes *before* the word boundary (`1e 00 00 00 00`);
+    # those are the marker's operand, not unexplained content. Zero bytes
+    # left over are padding (an `llm_build` op segment ends with 8 zero bytes
+    # before the next segment's marker), not content either.
+    unknown = sum(1 for t in toks if t[1] == "?" and t[0] >= pos + 8 and mcode[t[0]])
+    programs = sum(1 for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02))
+    a7 = sum(1 for t in toks if t[1] == "V" and t[2] == 0xA7)
+    return 1 - unknown / max(1, end - pos), programs, a7
+
+
+def _check_segment_table(mcode):
+    """The segment-table claims shared by every build: countdown, tiling,
+    an `a7` marker verb within the first 16 bytes of every segment."""
+    vec, tables = _tail_tables(mcode)
+    for k in range(1, len(tables)):
+        assert tables[k].get(3, 0) == tables[k - 1][3] - tables[k][2], (k, tables[k])
+    assert tables[0][3] == sum(t.get(2, 0) for t in tables[1:])
+    header, segs = _segments(mcode)
+    assert segs[-1][0] + segs[-1][1] == vec
+    # The marker's `a7 00 00` may sit in the 4 bytes before the 8-byte-word
+    # boundary (the `llm_build` subgraphs' segments open `1e 00 00 00 00 a2`,
+    # the marker's operand), so look from 4 bytes before each segment start.
+    for pos, length, _ in segs:
+        assert mcode.find(b"\xa7\x00\x00", pos - 4, pos + 16) >= 0, (
+            pos,
+            mcode[pos - 4 : pos + 16].hex(),
+        )
+    return header, segs
+
+
+def test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7(tmp_path):
+    """Confirmed real (see the README's "The tail is the segment table"
+    section), on a fresh resnet18d build: the tail tables' field 2 is a
+    length in 8-byte words that tiles the blob exactly from the 280-byte
+    header to the tail vector in reverse table order; field 3 counts down;
+    the last segment is block A exactly; every segment opens with an `a7`
+    verb; the op-program segment (table 0) is 100% tokenized with six
+    verbs and holds every `a1 40 02` program; types are 0xa01, 0x1001 x3,
+    0xe801. No device.
+    """
+    _, _, mcode = _build_real_resnet18d(str(tmp_path))
+    header, segs = _check_segment_table(mcode)
+    assert header == 280 and len(segs) == 5
+    narrow = _tokenize_mcode(mcode)
+    cuts = [k for k, t in enumerate(narrow) if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    a_lo, b_lo = narrow[cuts[0]][0], narrow[cuts[1]][0]
+    assert segs[0][0] + segs[0][1] == b_lo - 17 and segs[0][1] == b_lo - a_lo
+    assert [s[2][0] for s in segs] == [0xA01, 0x1001, 0x1001, 0x1001, 0xE801]
+    cov, programs, _ = _segment_coverage(mcode, segs[-1])
+    assert cov == 1.0 and programs == len(cuts) - 2, (cov, programs, len(cuts))
+    for seg in segs[:-1]:
+        assert _segment_coverage(mcode, seg)[0] >= 0.9
+
+
+def _cached_hf_checkpoint(repo_id, fallback_dir=None):
+    """Local snapshot directory of a HuggingFace checkpoint already in the
+    cache (with its weights present), else `fallback_dir` if that holds a
+    checkpoint, else None. Never downloads -- these tests stay offline."""
+    try:
+        from huggingface_hub import snapshot_download
+
+        path = snapshot_download(repo_id, local_files_only=True)
+        if any(f.endswith((".safetensors", ".bin")) for f in os.listdir(path)):
+            return path
+    except Exception:
+        pass
+    if fallback_dir and os.path.exists(os.path.join(fallback_dir, "config.json")):
+        return os.path.abspath(fallback_dir)
+    return None
+
+
+def _mcodes_of(axmodel_path):
+    """Every `neu mode` node's mcode in an `.axmodel`, as `(node name,
+    bytes)` -- `llm_build` per-layer files carry two (decode and prefill)."""
+    m = onnx.load(axmodel_path)
+    out = []
+    for node in m.graph.node:
+        if node.op_type != "neu mode":
+            continue
+        info = json.loads(
+            next(a for a in node.attribute if a.name == "npu_graph_info").s.decode()
+        )
+        for d in info["dotneus"]:
+            init = next(i for i in m.graph.initializer if i.name == d["neu_key"])
+            out.append((node.name, bytes(init.raw_data)))
+    return out
+
+
+def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
+    """Confirmed real (see the README's "The tail is the segment table"
+    section), on a fresh `pulsar2 llm_build` of SmolLM2-135M: each of the
+    per-layer file's two subgraphs has a 15-segment tail whose segments
+    tile the stream, every segment opens with `a7`, the op-program segment
+    (table 2, type 0x8801) is 100% tokenized and uses `a7` inside its
+    programs, and the whole stream is >= 95% explained. Skips unless the
+    checkpoint is already in the HuggingFace cache. No device.
+    """
+    import shutil
+
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+    result = pulsar2_docker.llm_build(str(work), "SmolLM2-135M", "output", parallel=8)
+    assert result.success, getattr(result, "error", None)
+    layer = str(work / "output" / "llama_p512_l0_together.axmodel")
+    mcodes = _mcodes_of(layer)
+    assert len(mcodes) == 2, [n for n, _ in mcodes]
+    for _, mcode in mcodes:
+        _, segs = _check_segment_table(mcode)
+        assert len(segs) == 15
+        ops = [s for s in segs if s[2][0] == 0x8801]
+        assert len(ops) == 1
+        cov, programs, a7 = _segment_coverage(mcode, ops[0])
+        assert cov == 1.0 and programs >= 100 and a7 >= 100, (cov, programs, a7)
+        total_e = total_n = 0
+        for seg in segs:
+            pos, length, _ = seg
+            end = pos + length
+            while end > pos and mcode[end - 1] == 0:
+                end -= 1
+            c, _, _ = _segment_coverage(mcode, seg)
+            total_e += c * (end - pos)
+            total_n += end - pos
+        assert total_e / total_n >= 0.95, total_e / total_n
+
+
+def test_onnx_path_llm_mcode_keeps_the_op_program_skeleton(tmp_path):
+    """Confirmed real (see the README's "The tail is the segment table"
+    section), on a fresh ONNX-path build of the 1-layer tiny-random-mistral
+    checkpoint: five segments that tile the stream, a 436-byte header (two
+    graph inputs), a 100%-tokenized op segment with ~75 programs for 80
+    ONNX ops, and the CNN skeleton verb for verb with `a1 20.02` in place
+    of `a1 30.03`. Skips unless the checkpoint is in the HuggingFace
+    cache. No device.
+    """
+    from collections import Counter
+
+    ckpt = _cached_hf_checkpoint(
+        "distilabel-internal-testing/tiny-random-mistral",
+        fallback_dir=os.path.join(
+            os.path.dirname(__file__), "..", "tiny-random-mistral"
+        ),
+    )
+    if ckpt is None:
+        pytest.skip("tiny-random-mistral is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    result = pulsar2_docker.build_from_hf_checkpoint(ckpt, str(work), "output")
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    header, segs = _check_segment_table(mcode)
+    assert header == 436 and len(segs) == 5
+    cov, programs, _ = _segment_coverage(mcode, segs[-1])
+    assert cov == 1.0 and 60 <= programs <= 90, (cov, programs)
+    pos, length, _ = segs[-1]
+    toks = _tokenize_mcode(mcode, start=pos, end=pos + length, **_FULL_RULE)
+    starts = [t[0] for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02)]
+    skeletons = Counter()
+    for a, b in zip(starts, starts[1:]):
+        prog = tuple((t[2], t[3], t[4]) for t in toks if a <= t[0] < b and t[1] == "V")
+        skeletons[prog] += 1
+    core = (
+        (0xA1, 0x40, 0x02),
+        (0xA1, 0x50, 0x01),
+        (0xA1, 0x50, 0x01),
+        (0xA8, 0x40, 0x03),
+        (0xA1, 0x50, 0x03),
+        (0xA1, 0x50, 0x01),
+        (0xA3, 0x00, 0x00),
+        (0xA1, 0x50, 0x01),
+        (0xA9, 0x00, 0x00),
+    )
+    top = skeletons.most_common(2)
+    assert sum(c for _, c in top) >= 0.6 * sum(skeletons.values()), top
+    for prog, _ in top:
+        assert tuple(v for v in prog if v in core) == core, prog
+    assert sum(c for prog, c in skeletons.items() if (0xA1, 0x20, 0x02) in prog) >= 5

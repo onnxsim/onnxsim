@@ -3025,6 +3025,80 @@ all three models:
 Test: `test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail` in
 `tests/test_axera_mcode_structure.py` (fresh build, no device).
 
+### The tail is the segment table: the stream is its segments, in reverse, and `a7` is the sixth verb
+
+The five tail tables decoded themselves once a second model shape was
+in hand. Verified on seven mcodes -- `resnet18d`, `mnasnet_small`, the
+tiny two-conv model, a 1-layer Mistral compiled through the ONNX path
+(`build_from_hf_checkpoint()`, see the LLM sections below) and, from a
+real `pulsar2 llm_build` of `HuggingFaceTB/SmolLM2-135M`, both `neu
+mode` subgraphs of `llama_p512_l0_together.axmodel` and the LM head
+`llama_post.axmodel`:
+
+- **Field 2 is a segment length in 8-byte words and field 3 counts
+  down.** In every table of every mcode, `f3[k] = f3[k-1] - f2[k]`, and
+  table 0's `f3` is the sum of every later table's `f2`. The packed
+  field 4 is `f3 << 8 | 1` throughout.
+- **The segments tile the blob exactly, in reverse table order.** Take
+  the tail vector's offset, subtract 8 x the sum of every table's `f2`,
+  and you land on the end of the FlatBuffers header (280 bytes for every
+  one-input CNN, 436 for the ONNX-path Mistral with two inputs, 700 and
+  744 for the two `llm_build` subgraphs, 296 for the post model); lay
+  the segments out from there, last table first, and the last one ends
+  on the tail vector to the byte in all seven mcodes. The last table is
+  configuration block A exactly (11,136 = 1,392 x 8); the "block B" the
+  earlier sections treated as one region is really *three* segments in
+  `resnet18d` (11,008 + 4,896 + 3,456 bytes); the op programs are table
+  0's segment.
+- **Every segment opens with an `a7` verb, and `a7` is a verb.** The
+  17-byte "block terminator" was misread: `2b a7 00 00 0a 00 00 00 00`
+  is one leading byte (`2b`, `24`, `33`, `3b` -- segment-specific) and
+  an 8-byte `a7 00 00 NN <u32>` instruction of exactly the verb shape
+  (`NN` = 0x0a in the CNNs and the post model, 0x10 in the ONNX-path
+  Mistral, 0x1e in the `llm_build` layer), followed by the segment's
+  first real verb. `llm_build` op programs then use `a7 00 00 02 02 00
+  00 00` freely -- 205 and 261 times inside the two subgraphs' op
+  segments, where the five-verb tokenizer left 8-byte holes.
+- **Segment types.** Table field 0 is `X << 8 | 1`: 0x0a for the first
+  configuration segment, 0x10 for the others and 0xe8 for the op
+  programs in every CNN and the ONNX-path LLM; the `llm_build` layer's
+  fifteen segments use 0x0a, 0x10, 0xe8, 0xd0, 0xb8, 0xa0, 0x88, 0x0c,
+  0xf0 with its 112-program op segment on 0x88 and two 14/15-program
+  segments on 0x0c/0xf0 -- different engines or queues is the obvious
+  reading, untested.
+
+**Coverage, by segment, with `a7` admitted.** Op-program segments are
+**100% tokenized in all seven mcodes** past the 4..5 marker bytes that
+straddle a segment's opening word boundary (resnet18d 17,824 bytes; mnasnet
+13,472; the `llm_build` layer's 12,160 + 1,984 + 2,080 and 19,712 + 992
++ 992; the post model's 72,448 with 772 programs). Configuration
+segments run 90..99%. Whole streams (zero padding trimmed): `resnet18d`
+98.3%, `mnasnet` 96.3%, tiny 91.7%, ONNX-path Mistral 95.4%, `llm_build`
+layer 96.1% and 96.5%, post model 99.7%.
+
+**What the LLM builds add.** The ONNX-path Mistral (80 ONNX ops, 75 op
+programs, 21 s to compile) keeps the CNN op-program skeleton verb for
+verb -- `40.02, 50.01, 50.01, a8 40.03, 50.03, 50.01, a3, 50.01, a9,
+[a2], a8 30.02`, the two most common variants covering 57 of 74
+programs -- with the trailing slot varying by op: `a1 30.03` in 9
+programs, `a1 20.02` (a slot the CNN templates lack) in 8, neither in
+the rest; its two graph inputs get two `a2` verbs in the segment opener
+where the CNNs' one input gets one, but the `llm_build` layer (5 inputs)
+gets one and the post model (1 input) gets four, so that is not an
+input count. The `llm_build` subgraphs (decode and prefill, 145 and 167
+programs, 92 s for all 30 layers plus the head) are the first mcode
+with programs of 104..144 bytes: the skeleton plus `a7` verbs inside.
+Their config-segment openers start `1e 00 00 00 00 a2 00 00 00 83 01
+c0` -- the `a7` marker's operand straddling the 8-byte segment
+boundary, so segment lengths are exact but not marker-aligned.
+
+Tests: `test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7`,
+`test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7`, and
+`test_onnx_path_llm_mcode_keeps_the_op_program_skeleton` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device; the two
+LLM tests skip unless the checkpoints are already in the HuggingFace
+cache).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
