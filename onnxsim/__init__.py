@@ -122,7 +122,11 @@ from onnxsim.memory_planning import (
     plan_activation_memory,
     print_memory_plan,
 )
-from onnxsim.mixed_precision import apply_mixed_precision_quantization
+from onnxsim.mixed_precision import (
+    MixedPrecisionSearchResult,
+    apply_mixed_precision_quantization,
+    search_mixed_precision_for_budget,
+)
 from onnxsim.mlir_export import export_mlir
 from onnxsim.moequant import apply_moequant
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
@@ -317,6 +321,8 @@ __all__ = [
     "print_memory_plan",
     "annotate_memory_plan",
     "apply_mixed_precision_quantization",
+    "search_mixed_precision_for_budget",
+    "MixedPrecisionSearchResult",
     "apply_slim_llm",
     "apply_quip_sharp",
     "apply_quarot",
