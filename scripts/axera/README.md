@@ -3138,6 +3138,42 @@ distinguishes 0x02/0x1e from 0x03 but not from each other. The
 timing differences between variants were within run-to-run noise
 (0.43..0.54 ms) and are not claimed.
 
+**0xa1 is also a tag, and bit 6 of a tag flips the register's parity.**
+The config-segment residue that remained is mostly three forms, and the
+conditional-parity null settles all three (counts are the `llm_build`
+layer's decode and prefill subgraphs; a fresh `resnet18d` build has 15
+of 16 and 18 of 19 for the first and third): bare `a1 XX` pairs have an
+even `XX` in
+37 of 37 and 65 of 65 cases against 28:13 and 36:31 in the shuffled
+segments; `01 .. a1 XX` p-units have an even register 31 of 31 and 76
+of 76 times; and bare `e1 XX` pairs have an **odd** `XX` in 71 of 71 and
+116 of 116 cases (`c1 XX` 4 of 4 and 10 of 10) against 4:2 and 8:2
+shuffled. So the verb
+byte 0xa1 doubles as a tag whenever it is not in verb position (`a1 00
+x0`), and the 0x40 bit of a tag (0x81 -> 0xc1, 0xa1 -> 0xe1) selects the
+odd register -- the other half of a 2-byte register pair, presumably.
+Admitting them takes the config segments' non-zero bytes from 97.4% to
+98.1% explained in `resnet18d`, 95.6% to 97.2% in `mnasnet`, and 95.9% /
+95.5% to 97.0% / 97.2% in the two `llm_build` subgraphs (shuffled
+segments stay at ~46% under the same rule). `_tokenize_mcode` takes
+these as `odd_tags`.
+
+**Confirmed on the AX650N: the segment table is a loader manifest the
+runtime validates field by field.** Patching one field of the decode
+subgraph's tail tables and re-running with valid inputs, every variant
+faulted with `0x8030070C` on every run (3 of 3 each, baseline
+bit-identical 3 of 3): the op segment's type word `0x8801 -> 0xe801`;
+its word count `f2 + 1`; its remaining count `f3 + 1`; table 0's total
+`f3 + 1`; a 6-field table's byte size `f5 - 64`; the same table's
+packed word `f4 + 1`; and table 0's own `f2 + 1`. Two of them (the type
+word's first run and the total-count patch) first hung the runtime for
+about two minutes -- `axcl_run_model` in uninterruptible sleep and
+`axcl-smi` blocked behind it -- before the fault surfaced, so a wrong
+segment table is the one patch class found so far that can stall the
+device rather than fail fast. Treat the table as load-bearing: an
+emitter must write the word counts, the countdown, the packed
+`f3 << 8 | 1` and the byte sizes exactly, not as metadata.
+
 **`llm_build` emits one instruction stream for all 30 layers.** Every
 per-layer file's two mcodes are byte-identical to layer 0's from the
 first byte of the FlatBuffers header to the tail vector; the only
