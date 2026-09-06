@@ -104,6 +104,24 @@ def _correlated_calibration(K, num_samples=64, rank=6, seed=1):
     return x
 
 
+def _full_rank_calibration(K, num_samples=96, seed=1):
+    # Deliberately *not* _correlated_calibration's own low-rank-plus-noise
+    # signal: that shape gives GPTQ's own Hessian (H = X^T X) a condition
+    # number in the hundreds of thousands (rank-6 structure inside a
+    # 32-dimensional space), which makes _inverse_hessian_cholesky's
+    # Cholesky factorization genuinely ill-conditioned -- exactly the
+    # regime where different BLAS/LAPACK backends (observed: ARM vs
+    # x86_64) can round the last few bits differently and flip which
+    # side of an INT4 rounding boundary a marginal weight lands on. A
+    # plain full-rank Gaussian keeps H's condition number in the tens,
+    # not hundreds of thousands (checked directly with np.linalg.cond
+    # while designing this test), so GPTQ's and GPTAQ's shared linear
+    # algebra stays numerically well-behaved -- and reproducibly
+    # different between the two -- on every platform.
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((num_samples, K)).astype(np.float32)
+
+
 def _int4_weight(model, node_output_name):
     # Fetch Wq by the MatMul/Gemm node's own DequantizeLinear input, not by
     # scanning for "some INT4 tensor" or guessing a name from the original
@@ -155,20 +173,24 @@ def test_gptaq_beats_gptq_once_an_upstream_layer_is_already_corrected():
     # is exactly what the layer will really see, so it should reconstruct
     # the network's true end-to-end output more closely. Verified (see the
     # commit history of this test) to hold with a comfortable margin
-    # (GPTAQ's error stays well under a third of GPTQ's) across hundreds
-    # of independent weight/corruption/calibration seed combinations, not
-    # just the one fixed below -- unlike chaining two *real* INT4 layers
-    # (an earlier version of this test), where the gap between the two
-    # models' activations is itself a by-product of discrete INT4
-    # rounding and can happen to tie across platforms/BLAS kernels even
-    # when the technique is working as intended.
+    # (GPTAQ's error stays well under half of GPTQ's) across hundreds of
+    # independent weight/corruption/calibration seed combinations, not
+    # just the one fixed below -- unlike two earlier versions of this
+    # test, which each hit a *different* platform-specific exact tie in
+    # CI (chaining two real INT4 layers, whose activation gap is itself a
+    # by-product of discrete rounding; then, even after fixing that,
+    # using _correlated_calibration's own low-rank calibration signal,
+    # whose ill-conditioned Hessian made the column algorithm's shared
+    # Cholesky factorization sensitive to which BLAS backend a given
+    # platform happens to use). Uses `_full_rank_calibration`, not
+    # `_correlated_calibration`, specifically to avoid the latter.
     K0, N1 = 32, 8
     corruption = np.random.default_rng(42).standard_normal(K0) * 0.6
     float_model = _upstream_corrupted_model(K0=K0, N1=N1, corruption=None, seed=0)
     corrupted_model = _upstream_corrupted_model(
         K0=K0, N1=N1, corruption=corruption, seed=0
     )
-    x = _correlated_calibration(K=K0, num_samples=64, rank=6, seed=1)
+    x = _full_rank_calibration(K=K0, num_samples=96, seed=1)
     calibration_data = [{"X": x}]
 
     quant = onnxsim.quantize_weight_only_int4(corrupted_model)
