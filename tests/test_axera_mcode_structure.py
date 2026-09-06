@@ -559,24 +559,31 @@ def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
     exact same value set across independent builds run at different
     times, only a fixed label set being reshuffled could.
     """
+    # 4 rebuilds, not 2: with only 2, the non-deterministic label
+    # assignment occasionally lands identically by chance, giving zero
+    # differing positions and nothing to test (a real flake hit in CI --
+    # the same 2-build sample-size pitfall the frankenstein-splice test
+    # below fixed). Noisy positions are taken as the union against build 0.
     model = _two_conv_model(vary_first=True, dilation=2, pad=2)
-    _, mcode_a = _build_and_get_wbt_and_mcode_bytes(
-        os.path.join(str(tmp_path), "run1"), model, (1, 4, 16, 16)
-    )
-    _, mcode_b = _build_and_get_wbt_and_mcode_bytes(
-        os.path.join(str(tmp_path), "run2"), model, (1, 4, 16, 16)
-    )
-    assert len(mcode_a) == len(mcode_b)
+    mcodes = [
+        _build_and_get_wbt_and_mcode_bytes(
+            os.path.join(str(tmp_path), f"run{i}"), model, (1, 4, 16, 16)
+        )[1]
+        for i in range(4)
+    ]
+    assert len({len(m) for m in mcodes}) == 1
 
-    noisy = [i for i in range(len(mcode_a)) if mcode_a[i] != mcode_b[i]]
+    noisy = [i for i in range(len(mcodes[0])) if len({m[i] for m in mcodes}) > 1]
     assert noisy, "expected the known small amount of run-to-run mcode noise"
 
-    multiset_a = sorted(mcode_a[i] for i in noisy)
-    multiset_b = sorted(mcode_b[i] for i in noisy)
-    assert multiset_a == multiset_b, (
-        (multiset_a, multiset_b),
-        "expected the same multiset of values at the noisy positions, just reordered",
-    )
+    multiset_0 = sorted(mcodes[0][i] for i in noisy)
+    for n, other in enumerate(mcodes[1:], start=1):
+        multiset_n = sorted(other[i] for i in noisy)
+        assert multiset_0 == multiset_n, (
+            (n, multiset_0, multiset_n),
+            "expected the same multiset of values at the noisy positions, "
+            "just reordered",
+        )
 
 
 def _build_axmodel(work_dir, model, input_shape, profile=False):
