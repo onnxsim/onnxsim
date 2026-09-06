@@ -2174,3 +2174,53 @@ def test_mcode_field_map_generalizes_to_mnasnet_small(tmp_path):
         for a, b in zip(cuts, cuts[1:])
     )
     assert patterns.most_common(1)[0][0] == template, patterns.most_common(2)
+
+
+def _verb_free_regions(mcode, min_words=8):
+    """Gaps between consecutive verb headers larger than a [header][operand]
+    pair, as `(extra_words)` per gap -- the verb-free regions of the README's
+    "Correction: the instruction runs are two-word, but they are only 37% of
+    the bulk" section."""
+    hdrs = _verb_headers(mcode)
+    return [b[0] - a[0] - 2 for a, b in zip(hdrs, hdrs[1:]) if b[0] - a[0] >= min_words]
+
+
+def test_verb_runs_are_a_minority_of_the_bulk_and_the_prologue_is_shared(tmp_path):
+    """Confirmed real (see the README's "Correction: the instruction runs
+    are two-word, but they are only 37% of the bulk" section), all local
+    on real resnet18d and mnasnet_small builds: the five-verb pairs cover
+    ~37% / ~19% of the bulk words; the rest sits in 44 / 127 verb-free
+    regions; both prologues carry the compact `00 xx 84 vv` ladder (a
+    short-form write with no verb byte); and the two real classifiers
+    share a byte-identical prologue of 150+ bytes from the first field
+    write. Needs Docker for the builds but no device.
+    """
+    _, _, r18 = _build_real_resnet18d(str(tmp_path))
+    _, _, mnas, _ = _build_real_zoo_model(str(tmp_path), "mnasnet_small_Opset17")
+
+    for name, mcode, cover_lo, cover_hi, min_regions in (
+        ("resnet18d", r18, 0.30, 0.45, 40),
+        ("mnasnet", mnas, 0.15, 0.25, 120),
+    ):
+        n_words = (len(mcode) - 328) // 4
+        coverage = 2 * len(_verb_headers(mcode)) / n_words
+        assert cover_lo <= coverage <= cover_hi, (name, coverage)
+        assert len(_verb_free_regions(mcode)) >= min_regions, (
+            name,
+            len(_verb_free_regions(mcode)),
+        )
+        seg = mcode[297 : 297 + 120]
+        ladder = [
+            seg[i + 1]
+            for i in range(len(seg) - 3)
+            if seg[i] == 0 and seg[i + 2] == 0x84 and seg[i + 1] % 0x10 == 0
+        ]
+        assert ladder == [0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0], (name, ladder)
+
+    shared = 0
+    while (
+        297 + shared < min(len(r18), len(mnas))
+        and r18[297 + shared] == mnas[297 + shared]
+    ):
+        shared += 1
+    assert shared >= 150, shared

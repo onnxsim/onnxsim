@@ -2494,6 +2494,56 @@ Net: the field-write reading, the verb set, the per-op program, and the
 two quantitatively decoded fields are properties of the compiler and
 the hardware, not of `resnet18d`.
 
+### Correction: the instruction runs are two-word, but they are only 37% of the bulk -- the rest is verb-free regions
+
+Chasing the small residue in the two-word tiling (97.5% on `resnet18d`,
+92% on `mnasnet`) exposed an overstatement two sections up, which is
+corrected here in place rather than rewritten there.
+
+**What was overstated.** "With all five verbs counted, the bulk is a
+uniform two-word stream." The 97.5% figure is real, but it measures the
+spacing *between consecutive verb headers* -- and the gap histogram it
+came from listed only the most common gap sizes. The full histogram has
+a long tail of very large gaps (in `resnet18d`: 1,047; 1,042; 688; 510;
+487 words ...). Counting words instead of gaps:
+
+```
+                          resnet18d          mnasnet_small
+bulk words                12,188             19,564
+verb-header + operand     4,574   (37.5%)    3,742   (19.1%)
+verb-free regions (>=8w)  44 regions,        127 regions,
+                          7,494 w (61.5%)    15,680 w (80.3%)
+regions per op            0.24               0.95
+largest region            1,047 words        1,597 words
+```
+
+So the correct statement is: **the five-verb instruction runs are
+tightly two-word (97.5%) but make up only 37% of `resnet18d`'s bulk and
+19% of `mnasnet`'s; the remainder is 44 (resp. 127) verb-free regions
+of other word families** -- `23 00`, `16 00`, `84 08`, `00 80` in
+`resnet18d`; `81 20` and `20 03` dominating in `mnasnet` -- whose
+content is high-entropy and whose format is not decoded. That family is
+where the tiny model's four non-deterministic noise bytes lived (`23 00
+xx 82` words), which fits these regions being data/descriptor tables
+rather than instructions, but "table" is an inference; only the
+counts, sizes and families are measured. `mnasnet`'s ~one region per op
+(0.95), versus `resnet18d`'s one per four ops, is also why its tiling
+residue was larger -- not a sixth verb: no other first byte >= 0x80
+occurs more than 5 times in the `VV 00 x0 yy` shape in either model.
+
+**Two more prologue facts from the same pass.** From the first field
+write at byte 297, the two real classifiers share a **byte-identical
+158-byte prologue** (they share only 21 bytes with the tiny synthetic
+model, whose input is float `4x16x16` rather than `uint8` NHWC
+`224x224` -- so the prologue plausibly carries input/preprocessing
+setup). Inside it, all three models carry the same compact ladder
+`00 90 84 08, 00 a0 84 0a, 00 b0 84 08, ... 00 f0 84 08`: seven 4-byte
+units of the shape `00 xx 84 vv` -- field `xx` stepping `0x10`, bank
+`0x84`, a **one-byte value** and **no verb byte**. That is a second,
+short-form write encoding, alongside the 8-byte `[VV 00 xx yy][32-bit]`
+form and the 7-byte 3-byte-operand slots already noted; a parser needs
+all three.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
