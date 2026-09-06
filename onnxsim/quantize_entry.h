@@ -82,3 +82,6 @@ onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
 onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
