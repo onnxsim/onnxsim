@@ -1940,3 +1940,74 @@ def test_resnet18d_50_01_steps_three_required_one_optional_on_device(tmp_path):
     assert out is not None and not np.array_equal(out, out_base), (
         "expected an absent step set to run with a changed result, not fault"
     )
+
+
+def test_resnet18d_50_01_step_set_dispatches_the_op_and_bit24_is_inert_model_wide(
+    tmp_path,
+):
+    """Confirmed real on the device (see the README's "The `50 01` step set
+    is the op's dispatch" section): with all four `50 01` steps of one op
+    zeroed, the model runs with a changed result, and additionally
+    pointing that op's Wbt offset at another instance's weights gives the
+    byte-identical changed result -- the op no longer executes at all.
+    And zeroing `bit24` in all 181 ops at once leaves the whole output
+    bit-identical to the unpatched baseline.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    path, key, mcode = _build_real_resnet18d(str(tmp_path))
+    words = [mcode[i : i + 4] for i in range(0, len(mcode) - 3, 4)]
+    hdrs = [
+        (i, w[2], w[3], int.from_bytes(words[i + 1], "little"))
+        for i, w in enumerate(words)
+        if w[:2] == b"\xa1\x00" and i + 1 < len(words)
+    ]
+    cuts = [i for i, xx, yy, _ in hdrs if (xx, yy) == (0x40, 0x02)]
+    op_start = 8174
+    assert op_start in cuts
+    op_end = min(i for i in cuts if i > op_start)
+    steps = [
+        i for i, xx, yy, _ in hdrs if (xx, yy) == (0x50, 0x01) and op_start < i < op_end
+    ]
+    assert len(steps) == 4
+    other_offset = int.from_bytes(
+        mcode[48300:48304], "little"
+    )  # a different op's 40 02 value
+    bit24_writes = [
+        i for i, xx, yy, v in hdrs if (xx, yy) == (0x50, 0x01) and v == 0x1000000
+    ]
+    assert len(bit24_writes) == 181
+
+    x = np.random.RandomState(42).randint(0, 256, size=(1, 224, 224, 3), dtype=np.uint8)
+    dev_base = _run_retry_once(path, x)
+    assert not dev_base.error, dev_base.error
+    out_base = np.frombuffer(dev_base.outputs[0], dtype=np.float32)
+
+    def run_variant(edits, tag):
+        patched = bytearray(mcode)
+        for word_index, value in edits:
+            patched[(word_index + 1) * 4 : (word_index + 2) * 4] = struct.pack(
+                "<I", value
+            )
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"dispatch_{tag}.axmodel")
+        onnx.save(c, p)
+        dev = _run_retry_once(p, x)
+        assert not dev.error, (tag, dev.error)
+        return np.frombuffer(dev.outputs[0], dtype=np.float32)
+
+    no_steps = run_variant([(w, 0) for w in steps], "no_steps")
+    assert not np.array_equal(no_steps, out_base)
+    no_steps_other_weights = run_variant(
+        [(w, 0) for w in steps] + [(op_start, other_offset)], "no_steps_other_weights"
+    )
+    assert np.array_equal(no_steps, no_steps_other_weights), (
+        "expected an op with no step set to be skipped, so its weight offset is never read"
+    )
+
+    all_bit24_zero = run_variant([(w, 0) for w in bit24_writes], "all_bit24_zero")
+    assert np.array_equal(all_bit24_zero, out_base), (
+        "expected bit24 to be inert for correctness across every op"
+    )

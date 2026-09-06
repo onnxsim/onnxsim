@@ -2343,6 +2343,35 @@ sequencing (an out-of-range address is still a well-formed step). That
 also explains why it never fired on any `40 02` value and why a wholly
 absent step set runs.
 
+### The `50 01` step set is the op's dispatch, and its fourth step is inert model-wide
+
+Two device probes that each settle one question with a single decisive
+comparison.
+
+**An op with no step set does not execute.** Zeroing all four `50 01`
+writes of one real `resnet18d` op makes the model run with a changed
+result (argmax 305 -> 815). Doing the same *and* also pointing that
+op's `40 02` Wbt offset at a different instance's weights gives the
+**byte-identical** changed result. If the op still executed in some
+"default mode," its weights would matter and the two outputs would
+differ; they do not. So the four `50 01` writes are what dispatch the
+op -- remove them and the op is simply skipped, its weight offset never
+read, and the model's output is whatever the downstream layers make of
+a missing contribution. This also reinterprets the "removing all four
+does not fault" observation: there is no partial sequence left for the
+sequencer to reject, because there is no op.
+
+**`bit24` is inert for correctness across the entire model.** The
+per-op probe found that zeroing the fourth step (`bit24`) leaves one
+op's output bit-identical. Zeroing it in **all 181 ops at once**, in one
+patched model, leaves the whole network's output **bit-identical to the
+unpatched baseline**. Whatever the fourth write does -- a completion or
+profiling pulse is the natural guess -- no part of `resnet18d`'s
+computed result depends on it. Combined with the previous section: each
+op is dispatched by three required steps (`bit8`, `bit0` in either
+order, then `bit20`), followed by one step that can be dropped
+model-wide without changing a single output bit.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
