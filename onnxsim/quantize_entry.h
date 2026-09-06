@@ -81,3 +81,4 @@ onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
                                       int64_t block_size);
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
+onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);

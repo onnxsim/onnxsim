@@ -2705,6 +2705,49 @@ def apply_quarot_cpp(
     )
 
 
+def apply_iq4_nl_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_iq4_nl_quantization`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D float32
+    weight into llama.cpp's IQ4_NL format -- a fixed, 16-entry non-uniform
+    ("non-linear") codebook, one scale per 32-element block of the weight's
+    own flattened storage (``scale = max(|block|) / max(|codebook|)``, each
+    element snapped to whichever codebook entry times that scale is
+    closest). See :func:`onnxsim.apply_iq4_nl_quantization`'s own docstring
+    for the full rationale and, importantly, this format's own codebook
+    provenance -- this repo could not find or verify llama.cpp's real IQ4_NL
+    codebook (`kvalues_iq4nl`) anywhere in-tree, so both this port and its
+    Python counterpart use their own computationally-derived, honestly
+    documented non-uniform codebook instead, not a transcription of
+    llama.cpp's own table.
+
+    Unlike that pure-Python implementation, this port does not support
+    quantizing ``Conv`` weights, and is not guaranteed to be bit-for-bit
+    identical to it -- though, having no accumulation or
+    iterative-refinement step at all (every element's own code comes from a
+    single per-block max-abs scale and a 16-way nearest-neighbor scan over a
+    shared fixed codebook), it is expected to track the Python port's own
+    results unusually closely among this repo's ``*_cpp`` ports.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            IQ4_NL quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_iq4_nl(model.SerializeToString()))
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:

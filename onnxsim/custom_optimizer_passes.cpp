@@ -45,6 +45,7 @@
 #include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
@@ -140,6 +141,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::IQ4NL>(registry);
     RegisterOrReplace<p::MagnitudePruningAttention>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
     RegisterOrReplace<p::MagnitudePruningGlobal>(registry);

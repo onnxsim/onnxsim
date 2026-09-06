@@ -72,6 +72,11 @@ from onnxsim.ibert_softmax import apply_ibert_softmax
 from onnxsim.icquant import icquant_metadata_bits, quantize_weight_only_icquant
 from onnxsim.if4_quantization import quantize_weight_only_if4
 from onnxsim.intactkv import apply_intactkv
+from onnxsim.iq4_nl import (
+    IQ4_NL_CODEBOOK,
+    apply_iq4_nl_quantization,
+    quantize_dequantize_iq4_nl,
+)
 from onnxsim.kbvq_moe import apply_kbvq_moe
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
@@ -100,6 +105,7 @@ from onnxsim.onnx_simplifier import (
     apply_double_quantization_cpp,
     apply_embedding_vocab_magnitude_pruning_cpp,
     apply_embedding_vocab_pruning_cpp,
+    apply_iq4_nl_quantization_cpp,
     apply_moe_expert_channel_pruning_cpp,
     apply_moe_whole_expert_pruning_cpp,
     apply_qmoe_expert_channel_pruning_cpp,
@@ -351,6 +357,10 @@ __all__ = [
     "apply_gear",
     "apply_gguf_q4_k_quantization",
     "quantize_dequantize_q4_k",
+    "apply_iq4_nl_quantization",
+    "apply_iq4_nl_quantization_cpp",
+    "quantize_dequantize_iq4_nl",
+    "IQ4_NL_CODEBOOK",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
