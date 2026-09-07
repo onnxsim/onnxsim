@@ -41,6 +41,7 @@ from real activations" style.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -48,7 +49,7 @@ import numpy as np
 import onnx
 import onnx.numpy_helper
 
-from onnxsim import backend
+from onnxsim import backend, qat_graph
 from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
@@ -162,6 +163,23 @@ def _h_and_dhdv(v: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
     return h, dh_dv
 
 
+def _init_relaxation(
+    w_nk: np.ndarray, scale_nk: np.ndarray
+) -> "tuple[np.ndarray, np.ndarray]":
+    """The rectified-sigmoid relaxation's starting point ``v`` and each
+    element's own quantization bin ``floor(w / scale)``, shared by both
+    optimization paths (numpy and :mod:`onnxsim.qat_graph`)."""
+    ratio = w_nk / scale_nk
+    floor_base = np.floor(ratio)
+    frac = np.clip(ratio - floor_base, 1e-4, 1.0 - 1e-4)
+    # Inverse of h(v) at v's initial point: start each element's relaxation
+    # at round-to-nearest's own choice (h == frac puts the soft weight
+    # exactly at the un-rounded ratio, the least-biased starting point).
+    sig0 = (frac - _GAMMA) / (_ZETA - _GAMMA)
+    sig0 = np.clip(sig0, 1e-4, 1.0 - 1e-4)
+    return np.log(sig0 / (1.0 - sig0)), floor_base
+
+
 def _optimize_rounding(
     w_nk: np.ndarray,
     scale_nk: np.ndarray,
@@ -183,15 +201,7 @@ def _optimize_rounding(
     """
     y_float = x @ w_nk.T  # [num_samples, N]
 
-    ratio = w_nk / scale_nk
-    floor_base = np.floor(ratio)
-    frac = np.clip(ratio - floor_base, 1e-4, 1.0 - 1e-4)
-    # Inverse of h(v) at v's initial point: start each element's relaxation
-    # at round-to-nearest's own choice (h == frac puts the soft weight
-    # exactly at the un-rounded ratio, the least-biased starting point).
-    sig0 = (frac - _GAMMA) / (_ZETA - _GAMMA)
-    sig0 = np.clip(sig0, 1e-4, 1.0 - 1e-4)
-    v = np.log(sig0 / (1.0 - sig0))
+    v, floor_base = _init_relaxation(w_nk, scale_nk)
 
     m = np.zeros_like(v)
     v2 = np.zeros_like(v)
@@ -229,8 +239,157 @@ def _optimize_rounding(
         v_hat = v2 / (1.0 - adam_beta2 ** (t + 1))
         v = v - learning_rate * m_hat / (np.sqrt(v_hat) + adam_eps)
 
+    return _rounding_codes(v, floor_base, n_min, n_max)
+
+
+def _rounding_codes(
+    v: np.ndarray, floor_base: np.ndarray, n_min: float, n_max: float
+) -> np.ndarray:
+    """The hard (floor/ceil) decision each element's relaxation ``v`` has
+    settled on, as integer codes -- the last line of both the numpy and the
+    step-graph optimization paths."""
     h_final, _ = _h_and_dhdv(v)
     return np.clip(floor_base + np.round(h_final), n_min, n_max)
+
+
+def _build_rounding_step_graph(
+    num_rows: int, n: int, k: int, n_min: float, n_max: float
+) -> qat_graph.StepGraph:
+    """One Adam step of :func:`_optimize_rounding`, as an ONNX graph.
+
+    Node for node the same computation the numpy loop performs -- the same
+    rectified-sigmoid relaxation, the same straight-through masks, the same
+    annealed regularizer, the same Adam -- expressed so it can run on an
+    execution provider instead of on the host. See :mod:`onnxsim.qat_graph`
+    for why a hand-derived gradient can be written this way at all, and
+    ``docs/qat.md`` for what it is for.
+
+    Shapes are baked in at build time (``x`` is ``[num_rows, k]``, the weight
+    ``[n, k]``): the accelerator backends this exists for -- WebNN, and the
+    NPU execution providers -- compile a graph once and want static shapes,
+    and a step graph is rebuilt per layer anyway.
+    """
+    b = qat_graph.GraphBuilder()
+
+    x, y_float, floor_base, scale = "x", "y_float", "floor_base", "scale"
+    v, m, vv = "v", "m", "vv"
+
+    # h(v), the rectified sigmoid, and its derivative -- _h_and_dhdv's own
+    # two lines, with the "is this element still inside the clip" test as a
+    # float 0/1 mask rather than a Where.
+    s = b.sigmoid(v)
+    raw = b.add(b.mul(s, b.const(_ZETA - _GAMMA)), b.const(_GAMMA))
+    h = b.clip(raw, 0.0, 1.0)
+    active = b.mul(b.greater_mask(raw, 0.0), b.less_mask(raw, 1.0))
+    ds = b.mul(s, b.sub(b.const(1.0), s))
+    dh_dv = b.mul(active, b.mul(ds, b.const(_ZETA - _GAMMA)))
+
+    # The soft weight this relaxation currently implies, and the layer's own
+    # reconstruction error against the float model's activations.
+    raw2 = b.add(floor_base, h)
+    w_hat = b.mul(b.clip(raw2, n_min, n_max), scale)
+    active_w = b.mul(b.greater_mask(raw2, n_min), b.less_mask(raw2, n_max))
+    y_hat = b.matmul(x, b.transpose(w_hat))  # [num_rows, n]
+    diff = b.sub(y_hat, y_float)
+    dl_dy = b.mul(diff, b.const(2.0 / (num_rows * n)))
+    dl_dw_hat = b.matmul(b.transpose(dl_dy), x)  # [n, k]
+    dl_dh = b.mul(dl_dw_hat, b.mul(active_w, scale))
+    grad = b.mul(dl_dh, dh_dv)
+
+    # The rounding regularizer, pulling each relaxation toward a hard 0/1.
+    # `reg_scale` is the caller's reg_param, or 0 during the warm start --
+    # a scalar fed per step, so the warm start needs no second graph.
+    u = b.sub(b.mul(b.const(2.0), h), b.const(1.0))
+    sign_u = b.op("Sign", [u])
+    abs_u = b.op("Abs", [u])
+    pow_u = b.op("Pow", [abs_u, b.sub("beta", b.const(1.0))])
+    dreg_dh = b.mul(
+        b.mul(b.mul(b.const(-2.0), "reg_scale"), "beta"), b.mul(sign_u, pow_u)
+    )
+    grad = b.add(grad, b.mul(dreg_dh, dh_dv))
+
+    v_next, m_next, vv_next = qat_graph.adam_update(
+        b, v, grad, m, vv, "lr", "m_correction", "v_correction"
+    )
+    loss = b.mean_square(diff)
+
+    return qat_graph.make_step_graph(
+        b,
+        constants={
+            x: [num_rows, k],
+            y_float: [num_rows, n],
+            floor_base: [n, k],
+            scale: [n, k],
+        },
+        state={v: ([n, k], v_next), m: ([n, k], m_next), vv: ([n, k], vv_next)},
+        scalars=["lr", "reg_scale", "beta", "m_correction", "v_correction"],
+        loss=loss,
+        name="onnxsim_adaround_step",
+    )
+
+
+def _optimize_rounding_on_graph(
+    w_nk: np.ndarray,
+    scale_nk: np.ndarray,
+    x: np.ndarray,
+    n_min: float,
+    n_max: float,
+    num_iterations: int,
+    learning_rate: float,
+    reg_param: float,
+    warm_start: float,
+    beta_range: "tuple[float, float]",
+    providers: Optional[Sequence[str]],
+) -> np.ndarray:
+    """:func:`_optimize_rounding`, run through :mod:`onnxsim.qat_graph`
+    instead of in host numpy, on ``providers``.
+
+    Same result, up to the float32 the step graph computes in (the numpy loop
+    uses float64, which is not something a GPU/NPU execution provider offers).
+    """
+    v0, floor_base = _init_relaxation(w_nk, scale_nk)
+    step = _build_rounding_step_graph(
+        x.shape[0], w_nk.shape[0], w_nk.shape[1], n_min, n_max
+    )
+
+    warm_start_iters = int(num_iterations * warm_start)
+    beta_start, beta_end = beta_range
+
+    def scalars(t: int) -> Dict[str, float]:
+        values = {"lr": learning_rate}
+        if t >= warm_start_iters:
+            progress = (t - warm_start_iters) / max(
+                1, num_iterations - warm_start_iters - 1
+            )
+            values["reg_scale"] = reg_param
+            values["beta"] = beta_start + (beta_end - beta_start) * progress
+        else:
+            # The regularizer is switched off by its own weight rather than by
+            # a second graph. `beta` still needs a value Pow can evaluate --
+            # 1.0 makes the (zero-weighted) term |u|^0, finite everywhere.
+            values["reg_scale"] = 0.0
+            values["beta"] = 1.0
+        values.update(qat_graph.adam_bias_corrections(t))
+        return values
+
+    final = qat_graph.run_step_graph(
+        step,
+        constants={
+            "x": x,
+            "y_float": x @ w_nk.T,
+            "floor_base": floor_base,
+            "scale": scale_nk,
+        },
+        state={
+            "v": v0,
+            "m": np.zeros_like(v0),
+            "vv": np.zeros_like(v0),
+        },
+        num_steps=num_iterations,
+        scalars=scalars,
+        providers=providers,
+    )
+    return _rounding_codes(final["v"].astype(np.float64), floor_base, n_min, n_max)
 
 
 def _pack_int4(codes: np.ndarray) -> bytes:
@@ -259,6 +418,7 @@ def apply_adaround(
     warm_start: float = 0.2,
     beta_range: "tuple[float, float]" = (20.0, 2.0),
     providers: Optional[Sequence[str]] = None,
+    step_providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Optimizes AdaRound-style adaptive rounding for every
     ``quantize_weight_only_int4``-quantized MatMul/Gemm layer present (by
@@ -301,6 +461,14 @@ def apply_adaround(
             ``warm_start``
     :param providers: onnxruntime execution providers to run ``float_model``
             on when capturing calibration activations
+    :param step_providers: onnxruntime execution providers to run the *Adam
+            optimization itself* on, as an ONNX step graph
+            (:mod:`onnxsim.qat_graph`) rather than in host numpy -- the way to
+            reach a GPU, an NPU execution provider, or (in the WASM build)
+            WebGPU with this loop. ``None``, the default, keeps the in-process
+            float64 numpy loop, which is exact and deterministic; a step graph
+            computes in float32, so its result agrees closely rather than
+            bit-exactly. See ``docs/qat.md``.
     :returns: ``quantized_model`` with every matched layer's INT4 weight
             initializer rewritten to its AdaRound-optimized codes (same
             shape, dtype, and scale -- only which integer each element
@@ -351,7 +519,14 @@ def apply_adaround(
             continue  # activation's feature dim doesn't match K; skip
         scale_nk = np.repeat(scale_blocks, c.block_size, axis=1)[:, : w_nk.shape[1]]
 
-        codes_nk = _optimize_rounding(
+        optimize = (
+            _optimize_rounding
+            if step_providers is None
+            else functools.partial(
+                _optimize_rounding_on_graph, providers=step_providers
+            )
+        )
+        codes_nk = optimize(
             w_nk,
             scale_nk,
             x,

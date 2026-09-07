@@ -48,6 +48,9 @@ jobs:
       - name: Run WebNN helper unit test
         working-directory: scripts/convertmodel
         run: npm run test:webnn
+      - name: Run browser-calibration unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:quantize-cal
       - name: Run library-versions unit test
         working-directory: scripts/convertmodel
         run: npm run test:versions

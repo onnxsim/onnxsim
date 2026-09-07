@@ -102,6 +102,11 @@ on that decision, not as independent work.
   would mean maintaining a second, fundamentally different code path rather
   than adding another pass, which is a much bigger scope change than anything
   else in this list. Not pursued unless there's a specific driving use case.
+  `docs/qat.md` revisits this on a narrower reading -- label-free, block-wise
+  distillation against the float model, which needs no task loss and no
+  labelled dataset -- and sketches how its training step could run on WebGPU
+  or an NPU through the existing execution-provider boundary. Task-loss QAT,
+  the thing this bullet is about, stays out of scope there too.
 - **OpenVINO IR export/interop.** onnxsim targets ONNX Runtime; adding an
   OpenVINO IR export path duplicates what NNCF already does well and doesn't
   play to onnxsim's ONNX/ORT-centric strength.
