@@ -1863,13 +1863,21 @@ def test_the_whole_model_walk_trains_activation_quantizers_too():
     quantized model's, which held here (0.565) and failed in CI (0.929) on a
     bit-identical starting point -- same float model, same calibration, same
     quantized model, confirmed by the baseline error agreeing to fifteen
-    digits. Two candidate explanations were measured and ruled out: input
+    digits. Three candidate explanations were measured and ruled out. Input
     perturbation at the 1e-7..1e-5 level moves the ratio only within
-    0.565-0.590, nowhere near 0.929, and pinning the process to one, two or
-    four CPUs reproduces the local figure bit-for-bit. The remaining
-    difference is the onnxruntime build itself -- CI installs it unpinned --
-    which is consistent but was not confirmed from here, so it is offered as
-    the likely cause rather than the established one.
+    0.565-0.590, nowhere near 0.929, so it is not ulp-level sensitivity to
+    the data. Pinning the process to one, two or four CPUs reproduces the
+    local figure bit-for-bit, so it is not reduction order varying with
+    thread count. And it is neither architecture nor operating system: the
+    Linux x86 and Windows x86 jobs failed with *bit-identical* trained
+    values (20.286299462987046 on both), while this x86 development machine
+    produces 12.350471 -- two platforms agreeing exactly against a third of
+    the same architecture. What those two share and this machine does not is
+    the dependency set CI resolves at install time (``CIBW_TEST_REQUIRES``
+    pins no onnxruntime version), which makes the runtime build the
+    remaining explanation. That was not confirmed by installing CI's
+    resolution here, so it is the strongly indicated cause rather than a
+    demonstrated one.
 
     What is established is that a ratio measured through four layers, an
     outlier-calibrated quantizer and 300 Adam steps of a discretely
