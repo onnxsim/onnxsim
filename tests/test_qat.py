@@ -16,6 +16,16 @@ Claim 2 is the one with a nuance, and the test that makes it records the
 nuance instead of hiding it: freeing the weights wins where the reconstruction
 problem is *underdetermined*, and loses to AdaRound's smoother relaxation
 where it is not. Both directions are measured below.
+
+The second half of this file covers the whole-model entry points --
+:func:`onnxsim.discover_qat_blocks`, which partitions a model into trainable
+blocks with no caller-named tensors at all, and
+:func:`onnxsim.apply_qat_all_blocks`, which walks them in order. The claim
+there that is genuinely uncertain, and therefore measured rather than
+asserted, is whether feeding each block the *student's* recomputed activation
+beats capturing every block's input once from the teacher; see
+``test_sequential_input_beats_capturing_everything_once`` for the numbers and
+the direction they actually came out in.
 """
 
 import numpy as np
@@ -714,3 +724,373 @@ def test_a_transb_gemm_trains_on_the_other_blocked_axis():
     old, new = _weights_of(quant), _weights_of(tuned)
     assert list(old[scale_name].shape) == list(new[scale_name].shape) == [64, 1]
     assert not np.array_equal(old[codes_name], new[codes_name])
+
+
+def _chain_model(seed=1, depth=4, scale=0.5):
+    """A plain ``MatMul``/``Relu`` chain with no residual anywhere.
+
+    Deliberately the *worst* shape for capture-once block reconstruction:
+    every layer's input is entirely the previous layer's output, so the error
+    each block leaves behind is the error the next block is handed, with
+    nothing (no skip connection carrying a clean copy of the input) to dilute
+    it. ``scale=0.5`` keeps the per-layer quantization error large enough that
+    the compounding is visible above the noise floor.
+    """
+    rng = np.random.default_rng(seed)
+    weights = [
+        (rng.standard_normal((D, D)) * scale).astype(np.float32) for _ in range(depth)
+    ]
+    body = "\n".join(
+        f"  Y{i + 1} = MatMul({'X' if i == 0 else f'A{i}'}, W{i + 1})\n"
+        f"  A{i + 1} = Relu(Y{i + 1})"
+        for i in range(depth - 1)
+    )
+    body += f"\n  Yout = MatMul(A{depth - 1}, W{depth})"
+    return _model(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+        {body}
+        }}
+        """,
+        [_f32(w, f"W{i + 1}") for i, w in enumerate(weights)],
+    )
+
+
+def _run(model, x):
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return session.run(None, {"X": x})[0].astype(np.float64)
+
+
+def _whole_model_error(candidate, reference, x):
+    """``||float output - quantized output||`` through onnxruntime.
+
+    The end-to-end number, deliberately not the training loop's own loss: a
+    walk that drove every block's *reported* loss down while making the
+    deployed model worse would pass a loss-based assertion and fail this one.
+    """
+    return float(np.linalg.norm(_run(candidate, x) - _run(reference, x)))
+
+
+def _multi_block_model(seed=0):
+    """Two residual Linear+Relu+Linear stages with a ``Sin`` between them.
+
+    Every feature discovery has to handle at once: two blocks' worth of
+    quantized layers, a residual inside each stage (which must *not* be cut
+    through), and one op :mod:`onnxsim.graph_grad` has no gradient rule for
+    (which must become a gap between the blocks rather than a refusal of the
+    whole model).
+    """
+    rng = np.random.default_rng(seed)
+    weights = [(rng.standard_normal((D, D)) * 0.3).astype(np.float32) for _ in range(4)]
+    return _model(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+          Y1 = MatMul(X, W1)
+          A1 = Relu(Y1)
+          Y2 = MatMul(A1, W2)
+          R1 = Add(Y2, X)
+          S = Sin(R1)
+          Y3 = MatMul(S, W3)
+          A3 = Relu(Y3)
+          Y4 = MatMul(A3, W4)
+          Yout = Add(Y4, S)
+        }}
+        """,
+        [_f32(w, f"W{i + 1}") for i, w in enumerate(weights)],
+    )
+
+
+def test_discovery_matches_what_a_caller_would_have_named_by_hand():
+    """The single-block case, pinned against the boundaries every other test
+    in this file passes to :func:`onnxsim.apply_qat` explicitly.
+
+    ``_relu_block_model`` is ``MatMul -> Relu -> MatMul -> Add(residual from
+    X)``. A person names that block ``("X", "Yout")``, and so does discovery
+    -- not because a residual pattern is recognized, but because ``X`` stays
+    live until the residual ``Add`` consumes it, so the graph does not narrow
+    to a single activation anywhere in between. The intermediate tensors
+    ``Y1``/``A1``/``Y2`` are therefore not cut points, and the block is the
+    whole residual stage."""
+    model = _relu_block_model(seed=0)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    (block,) = onnxsim.discover_qat_blocks(model, quant)
+    assert (block.input_name, block.output_name) == ("X", "Yout")
+    assert block.quantized_outputs == ("Y1", "Y2")
+    assert block.op_types == ("Add", "MatMul", "Relu")
+    assert block.num_nodes == 4
+    # Nothing enters this block sideways: the residual's source *is* the
+    # block input.
+    assert block.external_inputs == ("X",)
+
+
+def test_discovery_routes_around_an_op_it_cannot_differentiate():
+    """A ``Sin`` in the middle becomes a gap between two blocks, not a
+    failure of the model.
+
+    This is the difference between the two entry points, and the reason
+    :func:`onnxsim.apply_qat_all_blocks` exists as its own function:
+    ``apply_qat("X", "Yout")`` on this model raises, correctly, because a
+    caller who names those boundaries is asking for something impossible.
+    Nobody names anything here, so the undifferentiable node is routed around
+    and the eight trainable nodes on either side of it are still trained."""
+    model = _multi_block_model()
+    quant = _quantize_chain_int4(model, {"W1", "W2", "W3", "W4"})
+
+    first, second = onnxsim.discover_qat_blocks(model, quant)
+    assert (first.input_name, first.output_name) == ("X", "R1")
+    assert (second.input_name, second.output_name) == ("S", "Yout")
+    assert first.quantized_outputs == ("Y1", "Y2")
+    assert second.quantized_outputs == ("Y3", "Y4")
+    # The gap really is a gap: the op with no gradient rule is inside neither
+    # block, and every op that is inside one has a rule.
+    for block in (first, second):
+        assert "Sin" not in block.op_types
+        assert set(block.op_types) <= set(graph_grad.SUPPORTED_OPS)
+    # ...and the boundaries a caller would have had to name by hand are
+    # refused outright by the single-block entry point, which is what makes
+    # the gap worth finding rather than a formality.
+    with pytest.raises(graph_grad.UnsupportedOpError, match="Sin"):
+        onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Yout",
+            calibration_data=[{"X": _correlated_calibration(2)}],
+        )
+
+
+def test_discovery_lets_a_second_graph_input_cross_a_block_boundary():
+    """A mask-shaped second input must not suppress every cut in the graph.
+
+    ``_liveness_cuts`` counts a tensor as blocking a cut because the student
+    would have to recompute it; a graph input is byte-identical in teacher and
+    student, so teacher-forcing it costs nothing and it is exempt. Without
+    that exemption this model -- whose ``M`` spans the middle of the graph --
+    would yield no cuts at all and therefore no blocks."""
+    rng = np.random.default_rng(7)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{D}] X, float[batch,{D}] M) => (float[batch,{D}] Yout)
+        {{
+          Y1 = MatMul(X, W1)
+          A1 = Mul(Y1, M)
+          Y2 = MatMul(A1, W2)
+          Yout = Add(Y2, X)
+        }}
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    (block,) = onnxsim.discover_qat_blocks(model, quant)
+    assert (block.input_name, block.output_name) == ("X", "Yout")
+    # ``M`` is teacher-forced into the block alongside the block input, which
+    # is exactly what ``_slice_block`` already does for a sideways tensor.
+    assert block.external_inputs == ("M", "X")
+
+    x = _correlated_calibration(rank=2)
+    m = np.abs(_correlated_calibration(rank=2, seed=11))
+    tuned, results = onnxsim.apply_qat_all_blocks(
+        model, quant, calibration_data=[{"X": x, "M": m}], num_iterations=200
+    )
+    onnx.checker.check_model(tuned)
+    assert [r.trained for r in results] == [True]
+    assert results[0].final_loss < results[0].initial_loss
+
+
+def test_max_layers_per_block_controls_the_granularity_of_the_plan():
+    """A chain with no residuals is a bottleneck at every layer, so the cut
+    structure alone would make each layer its own block and throw away the
+    intra-block error cancellation that block reconstruction is *for*. The
+    merge budget is what recovers it, and it is the only knob."""
+    model = _chain_model(depth=4)
+    quant = _quantize_chain_int4(model, {"W1", "W2", "W3", "W4"})
+
+    def plan(k):
+        return [
+            (b.input_name, b.output_name)
+            for b in onnxsim.discover_qat_blocks(model, quant, max_layers_per_block=k)
+        ]
+
+    assert plan(1) == [("X", "Y1"), ("Y1", "Y2"), ("Y2", "Y3"), ("Y3", "Yout")]
+    assert plan(2) == [("X", "Y2"), ("Y2", "Yout")]
+    assert plan(4) == [("X", "Yout")]
+    # Every layer is covered exactly once, at every granularity.
+    for k in (1, 2, 4):
+        covered = [
+            name
+            for b in onnxsim.discover_qat_blocks(model, quant, max_layers_per_block=k)
+            for name in b.quantized_outputs
+        ]
+        assert covered == ["Y1", "Y2", "Y3", "Yout"]
+
+
+def test_the_walk_improves_the_whole_models_output_error():
+    """The claim the whole feature rests on, measured end to end through
+    onnxruntime rather than through the training loop's own loss.
+
+    Measured on this scenario: round-to-nearest leaves a whole-model output
+    error of ~400 against the float model; the default walk (two blocks of two
+    layers each) takes it to ~200. Every block reports a falling loss, and no
+    block is skipped."""
+    model = _chain_model(seed=1, depth=4)
+    quant = _quantize_chain_int4(model, {"W1", "W2", "W3", "W4"})
+    x = _correlated_calibration(rank=2, num_samples=64)
+
+    tuned, results = onnxsim.apply_qat_all_blocks(
+        model, quant, calibration_data=[{"X": x}], num_iterations=400
+    )
+    onnx.checker.check_model(tuned)
+
+    assert len(results) == 2
+    assert all(r.trained and r.skipped_reason is None for r in results)
+    for r in results:
+        assert len(r.losses) == 400
+        assert r.final_loss < 0.6 * r.initial_loss
+
+    rtn_error = _whole_model_error(quant, model, x)
+    tuned_error = _whole_model_error(tuned, model, x)
+    assert tuned_error < 0.75 * rtn_error
+
+
+def test_sequential_input_beats_capturing_everything_once():
+    """The design decision, measured on a model built to make it matter.
+
+    Both modes aim every block at the *teacher's* output for that block; they
+    differ only in what they feed the block's input. ``sequential=True``
+    re-runs the student after each block, so block *k* sees the activation the
+    deployed model will really hand it -- error and all. ``sequential=False``
+    captures every block's input once from the float model, which is what
+    :mod:`onnxsim.adaround` and :mod:`onnxsim.brecq` do and which assumes
+    every earlier block was reconstructed perfectly.
+
+    ``_chain_model`` has no residual anywhere, so nothing dilutes the error
+    passed from one block to the next, and ``max_layers_per_block=1`` makes
+    the chain four blocks deep -- three chances for the assumption to be
+    wrong.
+
+    **Measured, and the direction is not assumed:** whole-model output error
+    against the float model, seed 1, rank-2 calibration -- round-to-nearest
+    400.3, capture-once 206.2, sequential 168.1. Sequential wins by ~19%. It
+    won on all five seeds tried (0-4), by 14-31%.
+
+    The counter-intuitive part is worth recording: sequential's *reported
+    per-block losses are higher* (block 4: 15.2 -> 7.3 sequential versus
+    12.0 -> 5.0 capture-once), because a block fed a dirtier input is solving
+    a harder reconstruction problem. The block-local loss is simply not the
+    quantity anyone cares about -- the deployed model's output error is, and
+    that is the one measured here."""
+    model = _chain_model(seed=1, depth=4)
+    quant = _quantize_chain_int4(model, {"W1", "W2", "W3", "W4"})
+    x = _correlated_calibration(rank=2, num_samples=64)
+
+    def walk(sequential):
+        tuned, results = onnxsim.apply_qat_all_blocks(
+            model,
+            quant,
+            calibration_data=[{"X": x}],
+            max_layers_per_block=1,
+            sequential=sequential,
+            num_iterations=400,
+        )
+        assert [r.trained for r in results] == [True] * 4
+        return _whole_model_error(tuned, model, x), results
+
+    rtn = _whole_model_error(quant, model, x)
+    sequential_error, sequential_results = walk(True)
+    once_error, once_results = walk(False)
+
+    assert sequential_error < rtn
+    assert once_error < rtn
+    # The two modes really are different computations, not the same one
+    # behind a flag.
+    assert sequential_error != once_error
+    assert sequential_error < once_error
+
+    # The first block's input is the graph input itself, which is identical in
+    # teacher and student, so that block must train identically in both modes
+    # -- the divergence can only start at the second block.
+    assert sequential_results[0].losses == once_results[0].losses
+    assert sequential_results[1].losses != once_results[1].losses
+
+
+def test_a_block_that_cannot_be_trained_is_reported_rather_than_dropped():
+    """Per-block failure must be recoverable *and* visible.
+
+    Discovery only ever proposes blocks it has already validated, so the way
+    to reach this path is to hand in a plan by hand -- which is also the
+    reason ``blocks=`` is part of the signature. Two of the three blocks below
+    are impossible (a slice with no quantized layer; a block output no node
+    produces), and the third is fine. The walk trains the third, records why
+    it refused the other two, and returns a model in which exactly the
+    trainable block moved."""
+    model = _relu_block_model(seed=0)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    def named(input_name, output_name):
+        return qat.QATBlock(
+            input_name=input_name,
+            output_name=output_name,
+            quantized_outputs=(),
+            external_inputs=(),
+            op_types=(),
+            num_nodes=0,
+        )
+
+    tuned, results = onnxsim.apply_qat_all_blocks(
+        model,
+        quant,
+        blocks=[named("Y1", "A1"), named("X", "Yout"), named("X", "X")],
+        calibration_data=[{"X": _correlated_calibration(rank=2)}],
+        num_iterations=100,
+    )
+    onnx.checker.check_model(tuned)
+
+    assert [r.trained for r in results] == [False, True, False]
+    # Nothing is dropped: every block handed in comes back, in order, with a
+    # reason a human can act on.
+    assert len(results) == 3
+    assert "no quantize_weight_only_int4" in results[0].skipped_reason
+    assert results[1].skipped_reason is None
+    assert "not produced by any node" in results[2].skipped_reason
+    assert results[0].losses == [] and results[2].losses == []
+    assert results[1].final_loss < results[1].initial_loss
+
+    # The trainable block did train, and only its own weights moved.
+    old, new = _weights_of(quant), _weights_of(tuned)
+    changed = {name for name in old if not np.array_equal(old[name], new[name])}
+    assert changed == {_quant_tensors_for(quant, name)[0] for name in ("Y1", "Y2")}
+
+
+def test_the_walk_leaves_a_model_with_no_discoverable_block_untouched():
+    """No blocks is an empty plan and an unchanged model, not an exception.
+    A caller running this over a directory of models needs the no-op case to
+    be quiet."""
+    rng = np.random.default_rng(0)
+    w = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+          Y1 = MatMul(X, W)
+          Yout = Sin(Y1)
+        }}
+        """,
+        [_f32(w, "W")],
+    )
+    # Passing the float model as its own "quantized" counterpart is the
+    # cleanest way to reach this: nothing matches
+    # ``quantize_weight_only_int4``'s scheme, so no span anywhere contains a
+    # layer to train and the plan comes back empty.
+    tuned, results = onnxsim.apply_qat_all_blocks(
+        model, model, calibration_data=[{"X": _correlated_calibration(rank=2)}]
+    )
+    assert results == []
+    assert tuned.SerializeToString() == model.SerializeToString()

@@ -242,7 +242,13 @@ from onnxsim.pruning import (
     weight_sparsity,
 )
 from onnxsim.ptq4vit import apply_ptq4vit_quantization
-from onnxsim.qat import apply_qat
+from onnxsim.qat import (
+    QATBlock,
+    QATBlockResult,
+    apply_qat,
+    apply_qat_all_blocks,
+    discover_qat_blocks,
+)
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
@@ -308,6 +314,10 @@ __all__ = [
     "quantize_dequantize_fp6",
     "apply_brecq",
     "apply_qat",
+    "apply_qat_all_blocks",
+    "discover_qat_blocks",
+    "QATBlock",
+    "QATBlockResult",
     "apply_fptq",
     "apply_owq",
     "apply_bwa_ptq",

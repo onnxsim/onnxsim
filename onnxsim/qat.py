@@ -53,10 +53,16 @@ one out of ``Sign``/``Abs``/``Cast``, and this reuses it).
   ceiling is "reproduce the float block", not "recover task accuracy the
   float block never had". Label-free distillation QAT is not paper-QAT
   accuracy and should not be advertised as it.
-- *Not whole-model training.* One caller-named block per call, exactly
-  :mod:`onnxsim.brecq`'s contract (``block_input_name`` /
-  ``block_output_name``). A sliding window over blocks, and an end-to-end
-  pass afterwards, are the caller's loop to write.
+- *Not end-to-end training.* :func:`apply_qat` still trains one
+  caller-named block per call, exactly :mod:`onnxsim.brecq`'s contract
+  (``block_input_name`` / ``block_output_name``), and
+  :func:`apply_qat_all_blocks` walks a whole model one block at a time --
+  discovering the blocks with :func:`discover_qat_blocks` and, by default,
+  feeding each one the student's own activation so it corrects what its
+  predecessors left behind. What is still absent is a final pass that
+  backpropagates through the *entire* graph at once against the model's own
+  output; a block is always the unit of optimization, and the teacher's
+  activations are always the target.
 - *Not activation quantization.* This targets
   :func:`onnxsim.quantize_weight_only_int4`'s weight-only scheme, the same
   one AdaRound/BRECQ/FOEM target. Learnable activation scales exist in-tree
@@ -84,8 +90,11 @@ one out of ``Sign``/``Abs``/``Cast``, and this reuses it).
   having -- but "QAT beats AdaRound" is not a claim this module makes.
 
 **What the block contract accepts and refuses.** Refusing is loud
-everywhere: a caller who names a block this cannot train gets a
-:class:`ValueError`, never a silently unchanged model. The slice is the
+wherever the caller named the block: :func:`apply_qat` on a block it cannot
+train raises :class:`ValueError`, never returning a silently unchanged
+model. :func:`apply_qat_all_blocks` inverts that -- nobody named those
+blocks, so an untrainable one is skipped with its reason recorded in the
+returned :class:`QATBlockResult` and the walk continues. The slice is the
 intersection of the two directions -- nodes downstream of
 ``block_input_name`` *and* upstream of ``block_output_name`` -- so naming a
 boundary cannot drag in a subgraph on the far side of it. A tensor the slice
@@ -102,7 +111,7 @@ if the block's shapes cannot be inferred statically at opset 17.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
@@ -657,6 +666,182 @@ def _build_step_graph(
     )
 
 
+@dataclass
+class _BlockPlan:
+    """Everything about one block that can be decided from the two graphs
+    alone, before any calibration data exists.
+
+    Separated out because both entry points need exactly this and nothing
+    more: :func:`apply_qat` builds one from the names its caller supplied,
+    and :func:`discover_qat_blocks` builds one per candidate boundary pair it
+    proposes -- using the plan's construction as the *validation* of that
+    proposal, so discovery and the single-block path can never disagree about
+    what a legal block is.
+    """
+
+    input_name: str
+    output_name: str
+    nodes: List[onnx.NodeProto]
+    externals: List[str]
+    candidates: List[_Candidate]
+
+
+def _plan_block(
+    float_model: onnx.ModelProto,
+    quantized_model: onnx.ModelProto,
+    block_input_name: str,
+    block_output_name: str,
+) -> _BlockPlan:
+    """Slices the block out of the float graph and checks the three things
+    that make it trainable at all: it is non-empty, every op in it has a
+    gradient rule, and at least one of its layers is INT4-quantized.
+
+    Deliberately does *not* check shapes -- that needs the concrete
+    calibration activations, so it happens later in :func:`_train_block`.
+    """
+    nodes, externals = _slice_block(
+        float_model.graph, block_input_name, block_output_name
+    )
+    if not nodes:
+        raise ValueError(
+            f"no nodes lie between {block_input_name!r} and {block_output_name!r}"
+        )
+    _refuse_unsupported(nodes)
+
+    slice_outputs = {out for node in nodes for out in node.output if out}
+    candidates = [
+        c
+        for c in _find_int4_matmul_candidates(float_model, quantized_model)
+        if c.output_name in slice_outputs
+    ]
+    if not candidates:
+        raise ValueError(
+            f"the block between {block_input_name!r} and {block_output_name!r} "
+            "contains no quantize_weight_only_int4-quantized MatMul/Gemm layer to "
+            "train"
+        )
+    return _BlockPlan(
+        input_name=block_input_name,
+        output_name=block_output_name,
+        nodes=nodes,
+        externals=externals,
+        candidates=candidates,
+    )
+
+
+def _train_block(
+    float_model: onnx.ModelProto,
+    quantized_model: onnx.ModelProto,
+    plan: _BlockPlan,
+    external_values: Dict[str, np.ndarray],
+    teacher_output: np.ndarray,
+    *,
+    num_iterations: int,
+    learning_rate: float,
+    learn_scales: bool,
+    scale_learning_rate: float,
+    lr_decay: bool,
+    step_providers: Optional[Sequence[backend.Provider]],
+    losses: Optional[List[float]],
+) -> onnx.ModelProto:
+    """Runs the whole optimization for one already-planned, already-captured
+    block and returns ``quantized_model`` with that block's initializers
+    rewritten.
+
+    ``external_values`` are the block's inputs -- ``plan.input_name`` and
+    anything entering sideways -- and ``teacher_output`` is the target. Which
+    *model* those two came from is the caller's decision, and it is the whole
+    difference between :func:`apply_qat`'s one-block contract and
+    :func:`apply_qat_all_blocks`'s sequential walk: the target is always the
+    teacher's, but the inputs may be the teacher's or the student's.
+    """
+    shapes = _block_shapes(
+        float_model, plan.nodes, external_values, plan.output_name, teacher_output
+    )
+
+    trained = _plan_trained(plan.candidates, learn_scales)
+    trained_weight_names = {t.candidate.float_node.input[1] for t in trained}
+    used = {name for node in plan.nodes for name in node.input if name}
+    block_initializers = [
+        t
+        for t in float_model.graph.initializer
+        if t.name in used and t.name not in trained_weight_names
+    ]
+
+    step = _build_step_graph(
+        trained,
+        plan.nodes,
+        shapes,
+        block_initializers,
+        external_values,
+        plan.output_name,
+        list(teacher_output.shape),
+        learn_scales,
+    )
+
+    constants: Dict[str, np.ndarray] = dict(external_values)
+    constants[f"{_PREFIX}teacher"] = teacher_output
+    state: Dict[str, np.ndarray] = {}
+    for t in trained:
+        state[t.w_input] = t.w_init
+        state[t.m_input] = np.zeros_like(t.w_init)
+        state[t.v_input] = np.zeros_like(t.w_init)
+        if t.scale_input is not None:
+            state[t.scale_input] = t.scale_init
+            state[str(t.ms_input)] = np.zeros_like(t.scale_init)
+            state[str(t.vs_input)] = np.zeros_like(t.scale_init)
+
+    def scalars(t: int) -> Dict[str, float]:
+        decay = 1.0 - t / num_iterations if lr_decay else 1.0
+        values = {
+            f"{_PREFIX}lr": learning_rate * decay,
+            f"{_PREFIX}lr_scale": scale_learning_rate * decay,
+        }
+        if not learn_scales:
+            del values[f"{_PREFIX}lr_scale"]
+        values.update(qat_graph.adam_bias_corrections(t))
+        return values
+
+    final = qat_graph.run_step_graph(
+        step,
+        constants=constants,
+        state=state,
+        num_steps=num_iterations,
+        scalars=scalars,
+        providers=step_providers,
+        losses=losses,
+    )
+
+    new_codes: Dict[str, np.ndarray] = {}
+    new_scales: Dict[str, np.ndarray] = {}
+    for t in trained:
+        w = final[t.w_input].astype(np.float64)
+        scale = (
+            final[t.scale_input].astype(np.float64)
+            if t.scale_input is not None
+            else t.scale_init.astype(np.float64)
+        )
+        scale_full = np.repeat(scale, t.candidate.block_size, axis=t.scale_axis)
+        codes = np.clip(_round_half_away(w / scale_full), _N_MIN, _N_MAX)
+        new_codes[t.candidate.wq_name] = codes.astype(np.int8)
+        if t.scale_input is not None:
+            new_scales[t.candidate.ws_init.name] = scale.astype(np.float32)
+
+    tuned = onnx.ModelProto()
+    tuned.CopyFrom(quantized_model)
+    for initializer in tuned.graph.initializer:
+        codes = new_codes.get(initializer.name)
+        if codes is not None:
+            initializer.raw_data = _pack_int4(codes)
+            continue
+        scale_array = new_scales.get(initializer.name)
+        if scale_array is not None:
+            initializer.CopyFrom(
+                onnx.numpy_helper.from_array(scale_array, name=initializer.name)
+            )
+    return tuned
+
+
 def apply_qat(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],
@@ -763,27 +948,9 @@ def apply_qat(
     if isinstance(quantized_model, str):
         quantized_model = onnx.load(quantized_model, load_external_data=False)
 
-    nodes, externals = _slice_block(
-        float_model.graph, block_input_name, block_output_name
+    plan = _plan_block(
+        float_model, quantized_model, block_input_name, block_output_name
     )
-    if not nodes:
-        raise ValueError(
-            f"no nodes lie between {block_input_name!r} and {block_output_name!r}"
-        )
-    _refuse_unsupported(nodes)
-
-    slice_outputs = {out for node in nodes for out in node.output if out}
-    candidates = [
-        c
-        for c in _find_int4_matmul_candidates(float_model, quantized_model)
-        if c.output_name in slice_outputs
-    ]
-    if not candidates:
-        raise ValueError(
-            f"the block between {block_input_name!r} and {block_output_name!r} "
-            "contains no quantize_weight_only_int4-quantized MatMul/Gemm layer to "
-            "train"
-        )
 
     if calibration_data is None:
         calibration_data = generate_random_calibration_data(
@@ -792,95 +959,541 @@ def apply_qat(
 
     captured = _capture(
         float_model,
-        sorted(set(externals) | {block_output_name}),
+        sorted(set(plan.externals) | {plan.output_name}),
         calibration_data,
         providers,
     )
-    teacher_output = captured[block_output_name]
-    external_values = {name: captured[name] for name in externals}
-
-    shapes = _block_shapes(
-        float_model, nodes, external_values, block_output_name, teacher_output
-    )
-
-    trained = _plan_trained(candidates, learn_scales)
-    trained_weight_names = {t.candidate.float_node.input[1] for t in trained}
-    used = {name for node in nodes for name in node.input if name}
-    block_initializers = [
-        t
-        for t in float_model.graph.initializer
-        if t.name in used and t.name not in trained_weight_names
-    ]
-
-    step = _build_step_graph(
-        trained,
-        nodes,
-        shapes,
-        block_initializers,
-        external_values,
-        block_output_name,
-        list(teacher_output.shape),
-        learn_scales,
-    )
-
-    constants: Dict[str, np.ndarray] = dict(external_values)
-    constants[f"{_PREFIX}teacher"] = teacher_output
-    state: Dict[str, np.ndarray] = {}
-    for t in trained:
-        state[t.w_input] = t.w_init
-        state[t.m_input] = np.zeros_like(t.w_init)
-        state[t.v_input] = np.zeros_like(t.w_init)
-        if t.scale_input is not None:
-            state[t.scale_input] = t.scale_init
-            state[str(t.ms_input)] = np.zeros_like(t.scale_init)
-            state[str(t.vs_input)] = np.zeros_like(t.scale_init)
-
-    def scalars(t: int) -> Dict[str, float]:
-        decay = 1.0 - t / num_iterations if lr_decay else 1.0
-        values = {
-            f"{_PREFIX}lr": learning_rate * decay,
-            f"{_PREFIX}lr_scale": scale_learning_rate * decay,
-        }
-        if not learn_scales:
-            del values[f"{_PREFIX}lr_scale"]
-        values.update(qat_graph.adam_bias_corrections(t))
-        return values
-
-    final = qat_graph.run_step_graph(
-        step,
-        constants=constants,
-        state=state,
-        num_steps=num_iterations,
-        scalars=scalars,
-        providers=step_providers,
+    return _train_block(
+        float_model,
+        quantized_model,
+        plan,
+        {name: captured[name] for name in plan.externals},
+        captured[plan.output_name],
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        learn_scales=learn_scales,
+        scale_learning_rate=scale_learning_rate,
+        lr_decay=lr_decay,
+        step_providers=step_providers,
         losses=losses,
     )
 
-    new_codes: Dict[str, np.ndarray] = {}
-    new_scales: Dict[str, np.ndarray] = {}
-    for t in trained:
-        w = final[t.w_input].astype(np.float64)
-        scale = (
-            final[t.scale_input].astype(np.float64)
-            if t.scale_input is not None
-            else t.scale_init.astype(np.float64)
+
+@dataclass(frozen=True)
+class QATBlock:
+    """One trainable block :func:`discover_qat_blocks` found, named the way
+    :func:`apply_qat` names one.
+
+    ``input_name``/``output_name`` are exactly what a caller would have passed
+    to :func:`apply_qat` by hand, so a plan is inspectable, diffable and
+    replayable one block at a time. The rest is metadata about what the
+    boundary pair actually resolved to -- useful for deciding whether the plan
+    is the one you wanted before spending a training budget on it.
+    """
+
+    input_name: str
+    output_name: str
+    #: Output tensor of every ``quantize_weight_only_int4``-quantized
+    #: MatMul/Gemm inside the block, in graph order. Never empty: a slice with
+    #: nothing to train is not a block.
+    quantized_outputs: Tuple[str, ...]
+    #: Tensors the block reads but does not produce, ``input_name`` included.
+    #: These are teacher-forced -- see :func:`_slice_block`.
+    external_inputs: Tuple[str, ...]
+    #: Op types inside the block, deduplicated and sorted. Every one of them
+    #: is in :data:`onnxsim.graph_grad.SUPPORTED_OPS`, by construction.
+    op_types: Tuple[str, ...]
+    num_nodes: int
+
+
+@dataclass
+class QATBlockResult:
+    """What happened to one block during :func:`apply_qat_all_blocks`.
+
+    ``trained`` and ``skipped_reason`` are mutually exclusive: a block either
+    trained (and ``losses`` has one entry per Adam step) or was skipped with a
+    reason string. A skip is never silent and never fatal -- see
+    :func:`apply_qat_all_blocks` for why that is the right trade here and
+    the opposite of :func:`apply_qat`'s own loud refusal.
+    """
+
+    block: QATBlock
+    trained: bool
+    skipped_reason: Optional[str] = None
+    losses: List[float] = field(default_factory=list)
+
+    @property
+    def initial_loss(self) -> Optional[float]:
+        """The block's reconstruction error before the first Adam step, i.e.
+        at round-to-nearest. ``None`` if the block was skipped."""
+        return self.losses[0] if self.losses else None
+
+    @property
+    def final_loss(self) -> Optional[float]:
+        """The block's reconstruction error after the last step. Compare it
+        against :attr:`initial_loss` -- the *ratio* is the only meaningful
+        number, since blocks differ in output scale and in element count."""
+        return self.losses[-1] if self.losses else None
+
+
+def _liveness_cuts(
+    graph: onnx.GraphProto, primary_input: Optional[str]
+) -> List[Tuple[int, str]]:
+    """Every index at which the graph narrows to a single live activation,
+    with the tensor that survives it.
+
+    This is the whole of boundary discovery, and it is a liveness argument
+    rather than a pattern match. Walk the nodes in their (topological) graph
+    order and track which tensors are *live* at each gap between node ``p``
+    and node ``p + 1``: produced at or before ``p``, and still read after it
+    (a graph output counts as read by the outside world). A gap where exactly
+    one tensor is live is a place the graph can be cut without severing
+    anything else, so the slice on either side is self-contained -- which is
+    precisely the property :func:`_slice_block` needs its two boundaries to
+    have.
+
+    The pleasant consequence is that residual connections *place* the
+    boundaries instead of defeating them. Inside ``y = f(x) + x`` the skip
+    tensor ``x`` is live alongside every intermediate, so no gap in the middle
+    of the residual is a cut, and the first cut after ``x`` is the residual
+    ``Add``'s own output -- exactly where a person would have drawn the block
+    boundary of a ResNet BasicBlock or a transformer sub-layer, derived rather
+    than special-cased.
+
+    Two things are excluded from the live set:
+
+    - **Initializers.** They are not activations; every block gets its own
+      copy in its step graph.
+    - **Graph inputs other than** ``primary_input``. A second graph input --
+      an attention mask, a position id tensor -- is byte-identical in the
+      teacher and the student, so teacher-forcing it into a block is exact
+      rather than an approximation, and letting it span the whole graph would
+      otherwise suppress every cut in a model that has one.
+
+    ``primary_input`` itself is *kept* in the live set, so a residual from the
+    model's own input still binds a block together (and its block ends at the
+    residual's output, not before it).
+
+    What this cannot see: a tensor computed purely from initializers -- a
+    pre-transposed weight shared by several layers, say -- is counted as an
+    ordinary live activation, so it suppresses cuts across its whole live
+    range. That is conservative in the safe direction (fewer, larger blocks,
+    or none) rather than the unsafe one.
+    """
+    initializers = {t.name for t in graph.initializer}
+    graph_inputs = {i.name for i in graph.input if i.name not in initializers}
+    ignored = {name for name in graph_inputs if name != primary_input}
+
+    # A tensor is live until its last consumer; a graph output is live past
+    # the end of the graph, so it is never dropped before the final gap.
+    last_use: Dict[str, int] = {}
+    for index, node in enumerate(graph.node):
+        for name in node.input:
+            if name and name not in initializers and name not in ignored:
+                last_use[name] = index
+    for out in graph.output:
+        if out.name and out.name not in initializers and out.name not in ignored:
+            last_use[out.name] = len(graph.node)
+
+    cuts: List[Tuple[int, str]] = []
+    live: Set[str] = {
+        name
+        for name in graph_inputs
+        if name not in ignored and last_use.get(name, -1) > -1
+    }
+    if len(live) == 1:
+        cuts.append((-1, next(iter(live))))
+    for index, node in enumerate(graph.node):
+        for name in node.output:
+            if name and name not in ignored and last_use.get(name, -1) > index:
+                live.add(name)
+        live = {name for name in live if last_use.get(name, -1) > index}
+        if len(live) == 1:
+            cuts.append((index, next(iter(live))))
+    return cuts
+
+
+def _primary_graph_input(graph: onnx.GraphProto) -> Optional[str]:
+    """The graph input the most nodes depend on -- the main activation path.
+
+    A heuristic, and named as one. Models with several inputs almost always
+    have one carrying the activations and the others carrying masks or ids,
+    and "reaches the most nodes" separates those reliably in practice while
+    being independent of naming conventions. Ties go to the earlier graph
+    input. It only decides which input keeps its power to *prevent* a cut
+    (see :func:`_liveness_cuts`); getting it wrong costs block granularity,
+    not correctness, because every non-chosen input is teacher-forced exactly.
+    """
+    initializers = {t.name for t in graph.initializer}
+    candidates = [i.name for i in graph.input if i.name not in initializers]
+    if not candidates:
+        return None
+
+    best_name, best_reach = candidates[0], -1
+    for name in candidates:
+        reached = {name}
+        count = 0
+        for node in graph.node:
+            if any(inp in reached for inp in node.input if inp):
+                count += 1
+                reached.update(out for out in node.output if out)
+        if count > best_reach:
+            best_name, best_reach = name, count
+    return best_name
+
+
+def discover_qat_blocks(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    max_layers_per_block: int = 2,
+) -> List[QATBlock]:
+    """Partitions the model into a sequence of blocks :func:`apply_qat` can
+    train, without the caller naming a single tensor.
+
+    This is the piece ``docs/qat.md`` lists as missing and
+    :mod:`onnxsim.brecq`'s docstring explicitly declines to attempt ("the
+    caller identifies a block by two tensor names"). BRECQ's reason was that
+    auto-detection looked architecture-specific; it is not, once the question
+    is asked in the right terms. Two properties make a slice trainable, and
+    both are decidable from the graph:
+
+    1. **Differentiable.** Every op inside must be in
+       :data:`onnxsim.graph_grad.SUPPORTED_OPS`, since the step graph
+       contains a backward pass over the block's own nodes.
+    2. **Self-contained.** The block must be cuttable out of the graph
+       without severing an activation that some other part of the graph is
+       still using. :func:`_liveness_cuts` finds exactly those places, by
+       liveness rather than by recognizing architectures -- read its
+       docstring, it is the substance of this function.
+
+    Blocks are then the spans between consecutive cuts, with two adjustments:
+
+    - **Unsupported ops become gaps, not failures.** A span containing an op
+      with no gradient rule cannot be a block, so it is skipped and the next
+      block starts after it. A model with one ``Sin`` in the middle trains
+      everything either side of it instead of being refused outright, which
+      is the behaviour that makes whole-model QAT usable at all; the
+      alternative -- :func:`apply_qat`'s loud refusal -- is right for a
+      caller who *named* a block and wrong for a caller who named none.
+    - **Spans are merged up to** ``max_layers_per_block`` **quantized
+      layers.** A cut exists between every pair of layers in a plain MLP, so
+      without merging every block would be a single layer and the whole point
+      of block-wise reconstruction (letting layers inside a block cancel each
+      other's error, :mod:`onnxsim.brecq`'s own argument) would be lost. The
+      default of 2 is the paired-projection shape BRECQ's Section 4 targets
+      -- a ResNet BasicBlock's two convolutions, a transformer FFN's up/down
+      pair. A span with no quantized layer in it (a lone activation) never
+      closes a block; it is absorbed into the next one.
+
+    **What discovery cannot see, and therefore does not promise.** It never
+    runs the model, so it cannot know whether a block's shapes are statically
+    inferable -- a dynamic ``Reshape``, a symbolic dimension that survives
+    inference -- and a block that fails on that is discovered here and
+    skipped later, by :func:`apply_qat_all_blocks`, with the reason recorded.
+    It also has no notion of which blocks *matter*: it will happily propose a
+    block whose quantization error is already negligible, and it has no
+    sensitivity metric to rank them (:mod:`onnxsim.precision_estimator` is
+    where such a thing would come from). And it inherits every limit of
+    :func:`_liveness_cuts`: a graph with a long-lived constant-derived tensor,
+    or with multi-output branches that never reconverge, simply yields fewer
+    or no cuts, and therefore fewer or no blocks -- an empty plan, not an
+    error.
+
+    :param float_model: the teacher, as an onnx ModelProto or a file path.
+            Boundaries are found in *this* graph, since it is the one whose
+            nodes the step graph differentiates.
+    :param quantized_model: its :func:`onnxsim.quantize_weight_only_int4`
+            counterpart, used only to find which layers are actually
+            quantized -- a block must contain at least one.
+    :param max_layers_per_block: how many quantized layers to merge into one
+            block before closing it. 1 gives per-layer blocks (more, cheaper
+            steps, no intra-block error cancellation); a large value gives
+            one block per gap between undifferentiable ops.
+    :returns: the blocks in graph order, possibly empty. Consecutive blocks
+            need not be adjacent: a gap between two of them is a region
+            nothing here can train.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if max_layers_per_block < 1:
+        raise ValueError("max_layers_per_block must be at least 1")
+
+    graph = float_model.graph
+    cuts = _liveness_cuts(graph, _primary_graph_input(graph))
+    quantized_outputs = {
+        c.output_name
+        for c in _find_int4_matmul_candidates(float_model, quantized_model)
+    }
+
+    # Walk the spans between consecutive cuts, accumulating them into blocks.
+    # ``start`` is the cut the pending block opens at; ``layers`` counts the
+    # quantized layers accumulated since then.
+    pairs: List[Tuple[str, str]] = []
+    start: Optional[Tuple[int, str]] = cuts[0] if cuts else None
+    layers = 0
+    for previous, current in zip(cuts, cuts[1:]):
+        span = graph.node[previous[0] + 1 : current[0] + 1]
+        if any(node.op_type not in graph_grad.SUPPORTED_OPS for node in span):
+            # A gap. Close whatever was pending *before* it (the pending
+            # block ends at the last cut that is still on the trainable side)
+            # and reopen after it.
+            if start is not None and layers and start[0] < previous[0]:
+                pairs.append((start[1], previous[1]))
+            start, layers = current, 0
+            continue
+        if start is None:
+            start = previous
+        layers += sum(
+            1 for node in span for out in node.output if out in quantized_outputs
         )
-        scale_full = np.repeat(scale, t.candidate.block_size, axis=t.scale_axis)
-        codes = np.clip(_round_half_away(w / scale_full), _N_MIN, _N_MAX)
-        new_codes[t.candidate.wq_name] = codes.astype(np.int8)
-        if t.scale_input is not None:
-            new_scales[t.candidate.ws_init.name] = scale.astype(np.float32)
+        if layers >= max_layers_per_block:
+            pairs.append((start[1], current[1]))
+            start, layers = current, 0
+    if start is not None and layers and cuts and start[0] < cuts[-1][0]:
+        pairs.append((start[1], cuts[-1][1]))
+
+    blocks: List[QATBlock] = []
+    for input_name, output_name in pairs:
+        try:
+            plan = _plan_block(float_model, quantized_model, input_name, output_name)
+        except ValueError:
+            # Defensive: the span construction above already guarantees a
+            # non-empty, supported, quantized slice. Rather than trust that
+            # invariant, the plan itself is the check -- and a boundary pair
+            # that somehow fails it is dropped rather than handed to a caller
+            # who would only fail on it later.
+            continue
+        blocks.append(
+            QATBlock(
+                input_name=input_name,
+                output_name=output_name,
+                quantized_outputs=tuple(c.output_name for c in plan.candidates),
+                external_inputs=tuple(plan.externals),
+                op_types=tuple(sorted({n.op_type for n in plan.nodes})),
+                num_nodes=len(plan.nodes),
+            )
+        )
+    return blocks
+
+
+def _capture_student_inputs(
+    student: onnx.ModelProto,
+    names: Sequence[str],
+    calibration_data: Sequence[Tensors],
+    providers: Optional[Sequence[backend.Provider]],
+    fallback: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """The student's own activations at ``names``, falling back to the
+    teacher's for any name the student's graph does not have.
+
+    ``quantize_weight_only_int4`` never renames a node's output, so an
+    activation named in the float graph is named identically in the quantized
+    one and this fallback is normally unused. It exists for the one case
+    :func:`_slice_block` can produce that is not an activation: a tensor
+    computed entirely from initializers, which a quantizer is free to fold or
+    rewrite. Capturing the teacher's value for such a tensor is exact anyway.
+    """
+    present = {i.name for i in student.graph.input}
+    present.update(out for node in student.graph.node for out in node.output if out)
+    wanted = [name for name in names if name in present]
+    captured = dict(fallback)
+    if wanted:
+        captured.update(_capture(student, wanted, calibration_data, providers))
+    return {name: captured[name] for name in names}
+
+
+def apply_qat_all_blocks(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    blocks: Optional[Sequence[QATBlock]] = None,
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 1000,
+    learning_rate: float = 1e-4,
+    learn_scales: bool = False,
+    scale_learning_rate: float = 1e-5,
+    lr_decay: bool = True,
+    sequential: bool = True,
+    max_layers_per_block: int = 2,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    step_providers: Optional[Sequence[backend.Provider]] = None,
+) -> Tuple[onnx.ModelProto, List[QATBlockResult]]:
+    """Trains every block :func:`discover_qat_blocks` finds, in graph order --
+    :func:`apply_qat` lifted from one caller-named block to the whole model.
+
+    **The design decision that matters: where each block's input comes
+    from.** Every block's optimization *target* is the teacher's output for
+    that block; that is not in question and is what makes this label-free.
+    The question is what to feed the block's input, and there are two honest
+    answers:
+
+    - ``sequential=True`` (**the default**): re-run the *student* -- the
+      quantized model as tuned so far -- before each block, and feed that
+      block the activation the deployed model will actually present to it.
+      Block *k* therefore sees the error blocks 0..k-1 left behind and spends
+      its own capacity correcting it, while still aiming at the teacher's
+      clean output. This is the standard sequential block-reconstruction
+      setup, and it is the reason the walk is worth more than *N* independent
+      calls to :func:`apply_qat`. It costs one forward pass of the student
+      per block -- inference, not training, and negligible beside
+      ``num_iterations`` optimizer steps.
+    - ``sequential=False``: capture everything once, from the float model,
+      before any block is touched. This is what :mod:`onnxsim.adaround` and
+      :mod:`onnxsim.brecq` do, and it is cheaper by exactly one forward pass
+      per block. It is also strictly the *independence assumption*
+      :mod:`onnxsim.brecq`'s own docstring identifies as the flaw in
+      per-layer reconstruction, applied one level up: it assumes every
+      earlier block was reconstructed perfectly, so a later block optimizes
+      against an input the deployed model never produces.
+
+    Sequential is the default because the assumption it drops is known to be
+    false -- quantization error compounds down a network, that is the entire
+    premise of block reconstruction. It is not, however, a free win:
+    ``tests/test_qat.py`` measures both modes on a deliberately
+    error-compounding model and records which one actually won, rather than
+    asserting the expected direction. On a shallow model with small
+    quantization error the two modes land within noise of each other, and on
+    any model the sequential input is *noisier* -- the student's activation
+    carries the earlier blocks' residual error, which acts a little like
+    input jitter. That is usually a regularizer and occasionally a handicap.
+
+    **Failures are per block, not per model.** A block that cannot be trained
+    -- an op with no gradient rule that discovery could not have foreseen, a
+    shape that will not infer statically, a slice with no quantized layer --
+    is skipped, the reason is recorded in its :class:`QATBlockResult`, and
+    the walk continues. That is the opposite of :func:`apply_qat`, which
+    refuses loudly, and the difference is deliberate: refusing loudly is
+    right when the caller *named* the thing that cannot be trained, and wrong
+    when they named nothing and one block out of forty is unusual. Nothing is
+    dropped silently -- every discovered block appears in the returned list,
+    trained or not.
+
+    :param float_model: the teacher (onnx ModelProto or file path). Its
+            activations are every block's target and its weights seed every
+            block's trained master weights.
+    :param quantized_model: its :func:`onnxsim.quantize_weight_only_int4`
+            counterpart -- the student, and the model that is returned with
+            its INT4 initializers rewritten.
+    :param blocks: the plan to walk. ``None`` runs :func:`discover_qat_blocks`
+            with ``max_layers_per_block``. Pass an explicit list to inspect,
+            filter or reorder the plan first -- e.g. to train only the blocks
+            a sensitivity analysis flagged.
+    :param calibration_data: representative input batches, as
+            :func:`apply_qat` takes them. All batches are concatenated into
+            one full-batch objective per block.
+    :param num_samples: random batches to generate when ``calibration_data``
+            is omitted
+    :param seed: seed for that random calibration data
+    :param num_iterations: Adam steps per block. The total budget is this
+            times the number of blocks, so a whole-model walk usually wants a
+            smaller value than a single :func:`apply_qat` call would.
+    :param learning_rate: Adam learning rate for the fp32 master weights
+    :param learn_scales: also train each weight's per-block quantization
+            scale, LSQ-style, in every block
+    :param scale_learning_rate: Adam learning rate for those scales
+    :param lr_decay: anneal both learning rates to zero within each block
+    :param sequential: feed each block the student's own activation rather
+            than the teacher's -- see above. ``True`` by default.
+    :param max_layers_per_block: passed to :func:`discover_qat_blocks` when
+            ``blocks`` is not given
+    :param providers: execution providers for the activation captures (both
+            the teacher's and, in sequential mode, the student's)
+    :param step_providers: execution providers for the optimization itself,
+            as an ONNX step graph -- the path to CUDA, an NPU EP or WebGPU
+    :returns: ``(tuned model, one QATBlockResult per discovered block)``. The
+            model is ``quantized_model`` with every successfully trained
+            block's initializers rewritten and nothing else touched; if no
+            block trained it is an unmodified copy.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+
+    if blocks is None:
+        blocks = discover_qat_blocks(
+            float_model, quantized_model, max_layers_per_block=max_layers_per_block
+        )
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+
+    # Plans are built once, against the *original* quantized model. Training a
+    # block rewrites initializer payloads and never the graph, so a plan --
+    # which is nodes, tensor names and candidate metadata -- stays valid for
+    # the whole walk. Master weights are seeded from the float model in every
+    # case (see :func:`_plan_trained`), so no plan depends on the tuned state.
+    plans: List[Optional[_BlockPlan]] = []
+    results: List[QATBlockResult] = []
+    for block in blocks:
+        try:
+            plans.append(
+                _plan_block(
+                    float_model, quantized_model, block.input_name, block.output_name
+                )
+            )
+            results.append(QATBlockResult(block=block, trained=False))
+        except ValueError as error:
+            plans.append(None)
+            results.append(
+                QATBlockResult(
+                    block=block, trained=False, skipped_reason=f"cannot plan: {error}"
+                )
+            )
+
+    # One teacher pass for the whole walk: every block's target, and (in
+    # capture-once mode) every block's input too. The teacher never changes,
+    # so re-running it per block would buy nothing.
+    wanted: Set[str] = set()
+    for plan in plans:
+        if plan is not None:
+            wanted.update(plan.externals)
+            wanted.add(plan.output_name)
+    teacher = (
+        _capture(float_model, sorted(wanted), calibration_data, providers)
+        if wanted
+        else {}
+    )
 
     tuned = onnx.ModelProto()
     tuned.CopyFrom(quantized_model)
-    for initializer in tuned.graph.initializer:
-        codes = new_codes.get(initializer.name)
-        if codes is not None:
-            initializer.raw_data = _pack_int4(codes)
+    for plan, result in zip(plans, results):
+        if plan is None:
             continue
-        scale_array = new_scales.get(initializer.name)
-        if scale_array is not None:
-            initializer.CopyFrom(
-                onnx.numpy_helper.from_array(scale_array, name=initializer.name)
+        if sequential:
+            # The one extra forward pass this mode costs. It has to happen
+            # here, not once up front, because ``tuned`` has changed since the
+            # previous block: that is the entire point.
+            inputs = _capture_student_inputs(
+                tuned, plan.externals, calibration_data, providers, teacher
             )
-    return tuned
+        else:
+            inputs = {name: teacher[name] for name in plan.externals}
+        try:
+            tuned = _train_block(
+                float_model,
+                tuned,
+                plan,
+                inputs,
+                teacher[plan.output_name],
+                num_iterations=num_iterations,
+                learning_rate=learning_rate,
+                learn_scales=learn_scales,
+                scale_learning_rate=scale_learning_rate,
+                lr_decay=lr_decay,
+                step_providers=step_providers,
+                losses=result.losses,
+            )
+        except (ValueError, graph_grad.UnsupportedOpError) as error:
+            # A step graph that was half-built cannot have touched ``tuned``
+            # -- _train_block only rewrites initializers on a fresh copy, as
+            # its very last act -- so the walk resumes from an intact model.
+            result.losses.clear()
+            result.skipped_reason = f"training failed: {error}"
+            continue
+        result.trained = True
+    return tuned, results
