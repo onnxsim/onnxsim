@@ -337,7 +337,27 @@ def quantize_weight_only_mxfp4_focus(
             plain element-wise MSE, for which per-element nearest rounding
             is already optimal -- so ``0.0`` reproduces
             :func:`~onnxsim.mx_quantization.quantize_weight_only_mxfp4`'s
-            codes exactly, and is the degenerate setting, not a neutral one
+            codes exactly, and is the degenerate setting, not a neutral one.
+
+            Picking a value: ``lambda`` is ``mean(x)^2 / var(x)`` of the
+            layer's *input*. For a standard-normal pre-activation that is
+            (measured numerically, 4M samples) about **0.47 after ReLU**,
+            **0.23 after GELU**, **0.14 after SiLU**, and **0** for a
+            zero-mean input such as a LayerNorm output feeding a QKV
+            projection. So a down-projection reading a post-GELU activation
+            is the case this mechanism is for, and an attention projection
+            reading a normalized activation is the case where it has nothing
+            to work with (there ``0.0`` is the honest setting, and this
+            function is then just a slower spelling of plain MXFP4).
+
+            The default ``1.0`` is deliberately **above** that realistic
+            range: it maximizes the aggregate term so the mechanism's effect
+            is visible rather than marginal, and the measurements in
+            ``docs/focus-fp4.md`` are taken there. It is not an estimate of
+            any real activation. Set it from your own layer statistics when
+            you have them -- the trade is real in both directions (see that
+            doc's table: better layer-output error on mean-shifted inputs,
+            worse element-wise weight error and worse on i.i.d. inputs)
     :param num_coefficient_candidates: size of the coefficient grid; forced
             odd internally so that ``1.0`` is always a candidate
     :param max_coefficient: grid endpoint -- candidates are log-spaced over
