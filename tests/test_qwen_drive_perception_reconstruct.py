@@ -33,8 +33,8 @@ import struct
 import numpy as np
 import onnx
 import pytest
-from onnx.reference import ReferenceEvaluator
 
+import onnxsim
 from onnxsim.gguf_reconstruct import UnsupportedArchitectureError, _Builder
 from onnxsim.qwen_drive_perception_reconstruct import (
     _IR_VERSION,
@@ -45,10 +45,35 @@ from onnxsim.qwen_drive_perception_reconstruct import (
     reconstruct_qwen_drive_perception,
 )
 
+try:
+    import onnxruntime as _ort
+except ImportError:
+    _ort = None
+
 NUM_HEADS = 8
 SCA_NUM_POINTS = 8
 TSA_NUM_POINTS = 4
 DECODER_NUM_POINTS = 4
+
+
+def _run_model(model, feeds):
+    """Prefers onnxruntime, falling back to ``onnx.reference.ReferenceEvaluator``
+    when it isn't installed -- same convention as
+    ``test_deform_conv_to_gather.py``. Needed (rather than always using
+    ``ReferenceEvaluator``) because this module's graphs use ``GridSample``
+    with the pre-opset-20 ``mode="bilinear"`` spelling (the only spelling
+    onnxruntime accepts below opset 20 -- see ``_grid_sample``'s own
+    docstring); ONNX's reference evaluator only implements the opset-20
+    spelling (``"linear"``) regardless of the node's actual opset, so it
+    would reject a spec-correct opset-17 graph."""
+    if _ort is not None:
+        sess = _ort.InferenceSession(
+            model.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        return sess.run(None, feeds)
+    from onnx.reference import ReferenceEvaluator
+
+    return ReferenceEvaluator(model).run(None, feeds)
 
 
 def _rand(rng, *shape):
@@ -572,8 +597,7 @@ def test_reconstruct_qwen_drive_perception_builds_and_runs(
         )
         * 0.1,
     }
-    sess = ReferenceEvaluator(model)
-    outputs = sess.run(None, inputs)
+    outputs = _run_model(model, inputs)
     output_names = [o.name for o in model.graph.output]
     out = dict(zip(output_names, outputs))
 
@@ -592,6 +616,40 @@ def test_reconstruct_qwen_drive_perception_builds_and_runs(
     assert occ_logits.shape[-1] == cfg["occ_num_classes"]
     map_logits = out[output_names[5]]
     assert map_logits.shape[0] == cfg["map_num_classes"]
+
+
+def test_reconstruct_qwen_drive_perception_simplifies(tmp_path):
+    """Real ``onnxsim.simplify()`` (not just ``onnx.checker`` +
+    ``ReferenceEvaluator``) over the full spine + all three heads. Neither
+    ``reconstruct_qwen_drive_perception`` nor this module calls
+    ``simplify()`` itself -- it's an opt-in step for the caller, same as
+    every other module in this reconstruction family -- so this exercises
+    it the way a real caller would: hand the freshly-built graph straight
+    to ``onnxsim.simplify()``. The many build-time-constant ``Transpose``/
+    ``Reshape``/``Cast`` nodes this reconstruction style deliberately
+    leaves for a later simplify pass (rather than folding by hand) should
+    shrink the graph, and the simplified graph must stay numerically
+    equivalent to the original -- ``simplify()``'s own ``check_n`` does
+    that comparison internally."""
+    hf_dir, cfg = _build_tiny_checkpoint(tmp_path)
+    lidar2img, lidar2ego = _tiny_calibration(3)
+    model = reconstruct_qwen_drive_perception(
+        hf_dir,
+        num_cams=3,
+        lidar2img=lidar2img,
+        lidar2ego=lidar2ego,
+        img_shape=(4, 4),
+        llm_feat_hw=(4, 4),
+        vit_feat_hw=(2, 2),
+    )
+    before = len(model.graph.node)
+
+    simplified, check_ok = onnxsim.simplify(model, check_n=1)
+
+    assert check_ok
+    after = len(simplified.graph.node)
+    assert after < before
+    onnx.checker.check_model(simplified)
 
 
 def test_unsupported_model_type_raises(tmp_path):
@@ -759,9 +817,8 @@ def test_ms_deform_attn_sample_matches_pytorch_reference():
     )
     onnx.checker.check_model(model)
 
-    sess = ReferenceEvaluator(model)
-    (actual,) = sess.run(
-        None, {value_in: value, loc_in: sampling_locations, aw_in: attention_weights}
+    (actual,) = _run_model(
+        model, {value_in: value, loc_in: sampling_locations, aw_in: attention_weights}
     )
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
 
@@ -799,8 +856,7 @@ def test_denormalize_bbox_matches_reference():
         ir_version=_IR_VERSION,
     )
     onnx.checker.check_model(model)
-    sess = ReferenceEvaluator(model)
-    (actual,) = sess.run(None, {boxes_in: boxes})
+    (actual,) = _run_model(model, {boxes_in: boxes})
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
 
 
@@ -835,6 +891,5 @@ def test_atan2_matches_numpy_away_from_singularity():
         ir_version=_IR_VERSION,
     )
     onnx.checker.check_model(model)
-    sess = ReferenceEvaluator(model)
-    (actual,) = sess.run(None, {y_in: y, x_in: x})
+    (actual,) = _run_model(model, {y_in: y, x_in: x})
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)

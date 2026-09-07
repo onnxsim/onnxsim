@@ -437,11 +437,20 @@ def _grid_sample(
     align_corners: bool,
     padding_mode: str = "zeros",
 ) -> str:
+    # GridSample's `mode` enum is opset-version-sensitive: "bilinear" (the
+    # value this module's target opset, _OPSET=17, needs -- GridSample-16)
+    # was renamed to "linear" only at opset 20 (to generalize the op to 3D
+    # volumes too). onnx.checker doesn't validate enum *values* against the
+    # opset, so "linear" here builds and checks fine, but onnxruntime's own
+    # GridSample-16 kernel rejects it outright -- caught by running real
+    # onnxsim.simplify() (its check_n pass executes via onnxruntime), not
+    # by onnx.checker or onnx.reference.ReferenceEvaluator, which are both
+    # lenient about the string value.
     return b.op(
         "GridSample",
         [x, grid],
         prefix,
-        mode="linear",
+        mode="bilinear",
         padding_mode=padding_mode,
         align_corners=1 if align_corners else 0,
     )

@@ -26,6 +26,7 @@ import onnx
 import pytest
 from onnx.reference import ReferenceEvaluator
 
+import onnxsim
 from onnxsim.gguf_reconstruct import UnsupportedArchitectureError
 from onnxsim.qwen_drive_planning_expert_reconstruct import (
     reconstruct_qwen_drive_planning_expert,
@@ -624,6 +625,47 @@ def test_matches_independent_numpy_reference(
         cfg["num_inference_steps"],
     )
     np.testing.assert_allclose(onnx_out, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_reconstruct_qwen_drive_planning_expert_simplifies(tmp_path):
+    """Real ``onnxsim.simplify()`` over the built graph. Neither
+    ``reconstruct_qwen_drive_planning_expert`` nor this module calls
+    ``simplify()`` itself -- it's an opt-in step for the caller, same as
+    every other module in this reconstruction family. The
+    ``scene_key_i``/``scene_value_i`` inputs carry a dynamic ``prefix_len``
+    axis, so ``test_input_shapes`` fixes it for ``simplify()``'s own
+    numerical ``check_n`` pass (the established pattern for this family's
+    dynamic-shape graphs -- see e.g. ``test_gan.py``/``test_python_api.py``)."""
+    hf_dir, cfg, _tensors = _build_tiny_checkpoint(tmp_path)
+    num_samples = 2
+    prefix_len = 6
+    model = reconstruct_qwen_drive_planning_expert(hf_dir, num_samples=num_samples)
+    before = len(model.graph.node)
+
+    num_kv_sources = cfg["num_hidden_layers"] // cfg["layers_per_kv"]
+    test_input_shapes = {}
+    for j in range(num_kv_sources):
+        test_input_shapes[f"scene_key_{j}"] = [
+            1,
+            prefix_len,
+            cfg["num_key_value_heads"],
+            cfg["head_dim"],
+        ]
+        test_input_shapes[f"scene_value_{j}"] = [
+            1,
+            prefix_len,
+            cfg["num_key_value_heads"],
+            cfg["head_dim"],
+        ]
+
+    simplified, check_ok = onnxsim.simplify(
+        model, check_n=1, test_input_shapes=test_input_shapes
+    )
+
+    assert check_ok
+    after = len(simplified.graph.node)
+    assert after < before
+    onnx.checker.check_model(simplified)
 
 
 def test_unsupported_model_type_raises(tmp_path):
