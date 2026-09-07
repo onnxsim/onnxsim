@@ -36,6 +36,10 @@ for p in /mnt/share/host-driver-patches/patches/*.patch; do
 done
 dkms add axcl/2.25.0 2>/dev/null || true
 dkms build axcl/2.25.0 --force && dkms install axcl/2.25.0 --force
-modprobe ax_pcie_host_dev && modprobe ax_pcie_msg && modprobe ax_pcie_mmb && modprobe axcl_host
+# The card reports a fixed device id (3); the driver otherwise derives the id
+# from the PCI bus number, which differs in the guest -- see driver fix 7.
+SLOT=${AXCL_SLOT_INDEX:-3}
+modprobe ax_pcie_host_dev slot_index_force=$SLOT || modprobe ax_pcie_host_dev
+modprobe ax_pcie_msg && modprobe ax_pcie_mmb && modprobe axcl_host
 echo "waiting for the handshake (up to ~2 min)..."; sleep 90
 timeout 30 axcl-smi || echo "axcl-smi did not answer yet; check dmesg for 'handshake'"

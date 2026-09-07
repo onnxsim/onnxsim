@@ -718,6 +718,13 @@ def _invoke_axcl(
                 )
             mapping[os.path.normpath(local)] = target
         if pull:
+            # axcl_run_model writes into an existing directory; create it.
+            res = lxc("exec", vm, "--", "mkdir", "-p", f"{remote}/{pull[0]}")
+            if res.returncode != 0:
+                return (
+                    res.returncode,
+                    "lxc exec mkdir failed: " + res.stdout + res.stderr,
+                )
             mapping[os.path.normpath(os.path.join(pull[1], pull[0]))] = (
                 f"{remote}/{pull[0]}"
             )
@@ -734,6 +741,12 @@ def _invoke_axcl(
         )
         log = proc.stdout + proc.stderr
         if pull:
+            # `lxc file pull -r` recreates the directory inside the target, so
+            # an existing (empty) local one would make the results land a level
+            # too deep for the caller's glob.
+            local_out = os.path.join(pull[1], pull[0])
+            if os.path.isdir(local_out) and not os.listdir(local_out):
+                os.rmdir(local_out)
             lxc("file", "pull", "-r", f"{vm}{remote}/{pull[0]}", pull[1], t=600)
         return proc.returncode, log
     finally:
