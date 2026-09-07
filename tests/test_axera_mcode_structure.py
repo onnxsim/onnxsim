@@ -3508,6 +3508,105 @@ def test_llm_build_segment_table_is_validated_on_device(tmp_path):
     assert len(same) >= 2 and all(o == baseline for o in same), same
 
 
+def _decode_mcode(mcode, start=None, end=None, **rule):
+    """Decode a stream into records that carry *everything* needed to write it
+    back out -- the counterpart of `_tokenize_mcode`, which returns only what
+    is needed to identify a form. Each record is a dict with a `kind`:
+
+    * `V`: a verb (`verb`, `field`, `bank`, `operand`; 8 bytes, or 7 when the
+      next form starts early and the operand is one byte shorter)
+    * `W`: a companion write (`x`, `field`, `bank`, `operand`)
+    * `S`: a width-rule unit (`p`, `payload`, `tag`, `reg`, `extra`)
+    * `B`: a bare `[tag][register]` pair (`tag`, `reg`, `extra`)
+    * `raw`: one byte no form accounts for (`byte`)
+
+    See the README's "A lossless codec" section.
+    """
+    lo = 297 if start is None else start
+    hi = (len(mcode) - 252) if end is None else end
+    out = []
+    toks = _tokenize_mcode(mcode, start=lo, end=hi, **rule)
+    for i, t in enumerate(toks):
+        o, kind = t[0], t[1]
+        nxt = toks[i + 1][0] if i + 1 < len(toks) else hi
+        n = nxt - o
+        if kind == "V":
+            out.append(
+                {
+                    "kind": "V",
+                    "verb": t[2],
+                    "field": t[3],
+                    "bank": t[4],
+                    "operand": mcode[o + 4 : o + n],
+                }
+            )
+        elif kind == "W":
+            out.append(
+                {
+                    "kind": "W",
+                    "x": t[2],
+                    "field": t[3],
+                    "bank": t[4],
+                    "operand": mcode[o + 3 : o + 7],
+                }
+            )
+        elif kind == "S":
+            p = t[2]
+            # Read the tag from the stream rather than the token: for a unit
+            # whose tag takes an extra byte, `_tokenize_mcode`'s third slot
+            # holds the register, not the tag.
+            out.append(
+                {
+                    "kind": "S",
+                    "p": p,
+                    "payload": mcode[o + 1 : o + 1 + p + 1],
+                    "tag": mcode[o + p + 2],
+                    "reg": mcode[o + p + 3],
+                    "extra": mcode[o + p + 4 : o + n],
+                }
+            )
+        elif kind == "B":
+            out.append(
+                {"kind": "B", "tag": t[2], "reg": t[3], "extra": mcode[o + 2 : o + n]}
+            )
+        else:
+            out.append({"kind": "raw", "byte": t[2]})
+    return out
+
+
+def _encode_mcode(records):
+    """Write decoded records back out as bytes -- the inverse of
+    `_decode_mcode`. Nothing here reads the original stream, so a byte-exact
+    round trip proves the decode captures every bit the forms carry."""
+    out = bytearray()
+    for r in records:
+        kind = r["kind"]
+        if kind == "V":
+            out += bytes([r["verb"], 0, r["field"], r["bank"]]) + r["operand"]
+        elif kind == "W":
+            out += bytes([r["x"], r["field"], r["bank"]]) + r["operand"]
+        elif kind == "S":
+            out += (
+                bytes([r["p"]])
+                + r["payload"]
+                + bytes([r["tag"], r["reg"]])
+                + r["extra"]
+            )
+        elif kind == "B":
+            out += bytes([r["tag"], r["reg"]]) + r["extra"]
+        else:
+            out += bytes([r["byte"]])
+    return bytes(out)
+
+
+def _structured_share(records):
+    """Fraction of the encoded bytes that come from a recognised form rather
+    than a raw escape -- how much of a stream we could write from structure."""
+    total = len(_encode_mcode(records))
+    raw = sum(1 for r in records if r["kind"] == "raw")
+    return (total - raw) / total
+
+
 _ANALYSIS_BUILDS = ("resnet18d", "mistral")
 """The device-free builds the coverage floor is measured on: the real
 resnet18d, and the 1-layer tiny-random-mistral through the ONNX path (the
@@ -3650,3 +3749,27 @@ def test_companion_writes_fill_the_slot_below_the_next_verb(tmp_path):
         covered_with, _ = _nonzero_coverage(mcode)
         assert covered_with > covered_without, (name, covered_without, covered_with)
     assert total >= 20, total
+
+
+def test_decode_encode_round_trip_is_byte_exact(tmp_path):
+    """Confirmed real (see the README's "A lossless codec" section): decoding
+    a real instruction stream into structured records and writing those
+    records back out reproduces the stream byte for byte, on a CNN and on a
+    transformer. The encoder reads nothing from the original, so this proves
+    the decode captures every bit the forms carry -- the first thing an mcode
+    *generator* needs. >= 95% of the bytes come from recognised forms; the
+    rest ride along as raw escapes. Needs Docker, no device.
+    """
+    for name in _ANALYSIS_BUILDS:
+        work = tmp_path / name
+        work.mkdir()
+        mcode = _build_analysis_mcode(name, str(work))
+        lo, hi = _stream_bounds(mcode)
+        records = _decode_mcode(mcode, start=lo, end=hi, **_FULL_RULE)
+        assert _encode_mcode(records) == mcode[lo:hi], name
+        assert _structured_share(records) >= 0.95, (name, _structured_share(records))
+
+        # A whole .axmodel: header and tail are not instructions, so they are
+        # carried verbatim, and the rebuilt blob must equal the original.
+        rebuilt = mcode[:lo] + _encode_mcode(records) + mcode[hi:]
+        assert rebuilt == mcode, name

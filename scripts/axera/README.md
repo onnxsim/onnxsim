@@ -3290,6 +3290,80 @@ Tests: `test_full_rule_explains_almost_every_stream_byte` and
 ONNX-path Mistral, no device); the `llm_build` layer's coverage is asserted
 by its own test.
 
+### A lossless codec: taking a model apart and putting it back together
+
+Reading mcode and *writing* it are different problems, and the coverage
+number above answers only the first. This is the first half of the second:
+`_decode_mcode()` turns a stream into structured records -- verb, field,
+bank and operand; prefix, payload, tag, register; the companion write's
+address and value -- and `_encode_mcode()` writes those records back out.
+The encoder reads nothing from the original blob, so a byte-exact round trip
+proves the decode captures every bit the forms carry, which is the first
+thing a generator needs.
+
+It round-trips exactly on a real `resnet18d` and on the ONNX-path
+transformer, with **over 95% of the bytes coming from recognised forms** and
+the rest riding along as raw escapes. Rebuilding a whole `.axmodel` -- the
+FlatBuffers header and tail copied verbatim, the stream re-encoded -- gives
+back the original file.
+
+**What that does and does not buy.** It means we can rewrite any field of any
+instruction and emit a valid stream, which is what every hand-patch
+experiment in this file has done by hand. It does *not* mean we can compile a
+new model. Splitting `resnet18d`'s parsed bytes by whether a destination ever
+receives more than one value:
+
+| | `resnet18d` | `llama` layer |
+| --- | --- | --- |
+| single-valued destinations (emit by copying) | 25.3% | 18.4% |
+| varying per op (need a rule) | 74.7% | 81.6% |
+| of those, at destinations whose meaning is documented here | 24.6% | 16.0% |
+
+So roughly a quarter of the stream is template, another sixth follows rules
+this file has verified (the Wbt offset, the four dispatch steps, the tile
+arena, the input size, the two synchronisation channels), and the remaining
+half goes to 627 destinations in `resnet18d` alone that we can parse but not
+compute. The largest single unknown is the `a2` verb: 360 distinct operands
+in `resnet18d`, 206 in the `llama` layer, ~6% of the stream.
+
+And the instruction stream is the small half of the problem. In the compiled
+artifacts the weight table is 99% of the file (`mistral` 21.4 MB against a
+27.5 KB mcode; the `llama` LM head 29.1 MB against 122.8 KB), and its layout
+is not decoded -- individual fields inside it have been located and patched,
+but not laid out from scratch.
+
+**What the two biggest unknowns look like from here.** Both were probed
+while the codec landed, and neither is decoded, but both now have shape:
+
+- **The `a2` operand is a packed record, not an address.** Its low nibble is
+  always 2 or 3 (75 and 62 times in the ONNX-path Mistral), the next nibble
+  steps through 0..15, byte 1 is a small counter (0..4), byte 2 is always
+  16-byte aligned (0x40, 0x10, 0x20, 0x00, 0x30), and byte 3 is zero except
+  for a flag-like 0x82/0x86/0x8b/0x92 on a minority. The *first* `a2` of each
+  op program rises with the op index in 69 of 71 programs, as does that
+  program's Wbt offset, so it carries something ordered per op. Programs
+  carry one to three of them (39, 27 and 2 of 77 in Mistral), never with all
+  operands equal.
+- **The weight table opens with a scale block.** The `llm_build` layer's
+  3,963,652-byte table starts with exactly 1,024 float32 words of 0.125
+  (4,096 bytes) followed by 768 zero words; only 2.9% of the whole table is
+  zero and its byte histogram peaks hard at 0x88/0x78/0x87/0x77, which is
+  what packed sub-byte values around mid-scale look like. The ONNX-path
+  Mistral's 21 MB table has no such prologue and is 0.4% zeros.
+
+**A refinement to "`40 02` is the Wbt offset."** That holds on the CNN and
+ONNX paths -- all 77 of Mistral's offsets land inside its table. It does
+*not* hold literally for `llm_build` layers: 22 of the decode subgraph's 147
+offsets and 12 of the prefill subgraph's 169 point past the end of the table
+they share, clustering around 2.9x its size. So on that path the operand
+addresses a device space that holds the weight table *and* other buffers --
+the KV caches are graph inputs there -- rather than a file offset. The
+hand-patch experiments that established the field remain valid; what changes
+is that a generator cannot compute it from the table alone.
+
+Test: `test_decode_encode_round_trip_is_byte_exact` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
