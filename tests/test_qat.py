@@ -2164,3 +2164,60 @@ def test_the_whole_model_walk_trains_activation_quantizers_too():
     # from. See this test's docstring for why the tighter ratio it used to
     # assert here does not belong in this test.
     assert _whole_model_error(tuned, model, x) < _whole_model_error(quant, model, x)
+
+
+# --- Real calibration data, in the shape the Hugging Face loader returns ---
+
+
+def test_many_calibration_batches_are_all_used_not_just_the_first(monkeypatch):
+    """The last roadmap item, pinned: real data flows in without adapting it.
+
+    :func:`onnxsim.load_huggingface_calibration_data` returns
+    ``List[Dict[str, ndarray]]`` -- one dict per batch -- which is exactly
+    ``Sequence[Tensors]``, what :func:`apply_qat` already takes. So there was
+    nothing to build here either; the open question was whether *many* batches
+    are actually used, because a pass that quietly trained on
+    ``calibration_data[0]`` and dropped the rest would look identical from the
+    outside: it would train, it would improve the model, and it would silently
+    be using a fraction of the data the caller paid to download.
+
+    :func:`_capture` concatenates along axis 0 across batches, so they are all
+    used. This asserts that where it is observable -- the step graph's own
+    teacher constant has to carry every row -- rather than trusting the
+    docstring. Three batches of eight rows must reach the graph as 24, not 8.
+
+    The loader itself is not called: it needs the optional ``datasets``
+    package and a network fetch, neither of which belongs in a unit test. What
+    is under test is the contract between its *return shape* and this module,
+    which is the part that could break.
+    """
+    model = _residual_stack_model(seed=0, stages=2)
+    quant = _quantize_chain_int4(model, _stack_weight_names(stages=2))
+
+    # Three batches, as the loader would hand them over -- distinct rows, so a
+    # pass that used only the first would produce a different teacher.
+    batches = [{"X": _gaussian_rows(8, seed=300 + i)} for i in range(3)]
+
+    seen: dict = {}
+    real_run = qat_graph.run_step_graph
+
+    def spy(step, **kwargs):
+        seen.setdefault("constants", kwargs["constants"])
+        return real_run(step, **kwargs)
+
+    monkeypatch.setattr(qat.qat_graph, "run_step_graph", spy)
+    tuned = onnxsim.apply_qat(
+        model, quant, "X", "Yout", calibration_data=batches, num_iterations=5
+    )
+
+    rows = {name: np.asarray(v).shape[0] for name, v in seen["constants"].items()}
+    assert rows, "the step graph bound no constants at all"
+    assert set(rows.values()) == {24}, (
+        f"expected every step-graph constant to carry all 3x8 = 24 calibration "
+        f"rows; got {rows}"
+    )
+    # And the run is a real one, not a no-op that happens to bind 24 rows.
+    old, new = _weights_of(quant), _weights_of(tuned)
+    assert any(
+        not np.array_equal(old[name], new[name]) for name in old if name in new
+    ), "no initializer changed, so the run trained nothing"

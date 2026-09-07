@@ -318,8 +318,15 @@ Each stage is independently shippable and independently useful.
    it a gap. A depth sweep puts the crossover around four stages; 64x the data
    narrows the held-out gap without closing it.
 
-   Still open from this stage's original description: real data via
-   `load_huggingface_calibration_data`.
+   Real data via `load_huggingface_calibration_data` needed no code either:
+   the loader returns `List[Dict[str, ndarray]]`, which is exactly the
+   `Sequence[Tensors]` `apply_qat` already takes, and `_capture` concatenates
+   across batches along axis 0 rather than using only the first. The thing
+   worth pinning was that *many* batches are genuinely used -- a pass that
+   quietly trained on `calibration_data[0]` would look identical from the
+   outside, training and improving the model while silently using a fraction
+   of the data the caller paid to download -- so a test asserts the step
+   graph's teacher constant carries every row. That closes this stage.
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
