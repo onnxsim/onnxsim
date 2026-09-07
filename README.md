@@ -93,6 +93,12 @@ constant folding until the model stops changing. Around that it offers:
   Face `diffusers` pipeline (Stable Diffusion, SDXL, ...) straight to a
   simplified ONNX deployment directory with
   `onnxsim.export_diffusion_model()`.
+- **[Quantization-aware fine-tuning](#quantization-aware-fine-tuning).**
+  Recover accuracy an INT4 weight-only quantization lost with
+  `onnxsim.apply_qat()`: label-free, block-wise fine-tuning of the fp32
+  weights themselves against the float model's own activations, over any
+  block topology. The training step is emitted as an ONNX graph, so it runs
+  on a GPU, an NPU execution provider or WebGPU via `step_providers=`.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **[MLIR export](#exporting-to-mlir-torch-mlir--onnx-mlir).** Hand the simplified
@@ -1214,6 +1220,140 @@ onnxsim.export_diffusion_model(
     save_as_external_data=False,
 )
 ```
+
+## Quantization-aware fine-tuning
+
+onnxsim's post-training quantization passes stop at *rounding*: AdaRound,
+BRECQ, FlexRound, AutoRound and the rest each pick, for every weight, which of
+the two neighbouring integers it rounds to, and nothing more.
+`onnxsim.apply_qat()` goes one step further -- the fp32 weight itself is the
+trained parameter, fake-quantized in the forward against
+`quantize_weight_only_int4`'s block-wise INT4 grid with a straight-through
+estimator, so an element can migrate several codes away from where
+round-to-nearest put it.
+
+It is **label-free**. The float model is the teacher, and the loss is the
+reconstruction error of one block's output against the float model's own
+activations for that block. There are no labels, no dataset API, no metric and
+no training-loop lifecycle -- the lifecycle stays the one onnxsim already has,
+a model in and a model out. Task-loss QAT remains out of scope; the design
+note is [`docs/qat.md`](docs/qat.md), which records both what was built and
+where the boundary is drawn.
+
+Two things here are genuinely new:
+
+- **Any block topology, not just a linear chain.** `apply_brecq` is capped at
+  a strict chain of MatMul/Gemm layers, because every op shape between two
+  quantized layers used to mean another hand-derived backward pass.
+  `onnxsim/graph_grad.py`'s `build_backward` removed that cost: it
+  differentiates a slice of an ONNX graph by walking it in reverse and
+  emitting ordinary ONNX nodes, so a normalization, an activation, a GELU's
+  `Erf`, a Softmax or a residual between two Linears is now simply more nodes
+  in the slice. A block that `apply_brecq` returns byte-identical, because its
+  discovery cannot see that topology at all, can be reconstructed here.
+- **The training step runs on an accelerator.** The fake-quant forward, that
+  backward, and one Adam update per trained tensor are emitted as a single
+  ONNX *step graph* -- a pure `(constants, state, per-step scalars) -> (next
+  state, loss)` function (`onnxsim/qat_graph.py`) -- so the loop runs on
+  whatever execution providers `step_providers=` names: a GPU, an NPU
+  execution provider, or WebGPU in the WASM build, rather than in host numpy.
+  The emitted graph stays inside `qat_graph.EP_FRIENDLY_OPS`, the operator set
+  those backends actually implement, and `onnxsim.backend.Runner` keeps the
+  parameters and the optimizer state resident on the provider's device between
+  steps, so only the per-step scalars go up and the loss comes down.
+
+A block is named by its input and output tensor, exactly the way
+`apply_brecq` names one:
+
+```python
+import onnx
+import onnxsim
+
+float_model = onnx.load("model.onnx")
+quantized = onnxsim.quantize_weight_only_int4(float_model)
+
+# Representative input batches: {input_name: np.ndarray} dicts matching the
+# float model's graph inputs. Random data is the default when omitted; real
+# data (onnxsim.load_huggingface_calibration_data) is a far better target.
+calibration_data = [{"input": batch} for batch in batches]
+
+losses = []  # the reconstruction loss, appended once per step
+tuned = onnxsim.apply_qat(
+    float_model,
+    quantized,
+    block_input_name="input",
+    block_output_name="block_out",
+    calibration_data=calibration_data,
+    losses=losses,
+    step_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+
+onnx.save(tuned, "model_int4_qat.onnx")
+```
+
+Only that block's INT4 weight initializers are rewritten; every other byte of
+the quantized model is untouched. One block is trained per call, so a sliding
+window over a model's blocks is the caller's own loop to write. Naming a block
+that cannot be trained is a loud error rather than a silently unchanged model:
+an op `graph_grad` has no gradient rule for, a block containing no
+`quantize_weight_only_int4`-quantized MatMul/Gemm, or shapes that cannot be
+inferred statically are all refused before any calibration runs.
+`learn_scales=True` trains each weight's per-block quantization scale
+alongside, LSQ-style (off by default, since it makes the problem non-convex in
+two coupled parameter sets at once). The whole calibration set is one
+full-batch objective -- no minibatching, no epochs, a calibration-scale budget
+rather than a training-scale one -- and activation quantization is not wired
+in: this targets `quantize_weight_only_int4`'s weight-only scheme.
+
+### When to reach for it, and when not to
+
+It is **not** uniformly better than `apply_adaround`, and the boundary is worth
+knowing before you spend a thousand Adam steps. On a two-Linear-plus-`Relu`
+block -- a topology `apply_brecq` cannot reconstruct at all -- the
+reconstruction error falls from 16.0 (round-to-nearest) to 6.5, and a GELU
+block's loss falls ~12x. But on a *single* layer, where the objective is
+identical to AdaRound's and only the parametrization differs, freeing the
+weight wins when the calibration activations are low-rank (round-to-nearest
+5.96, AdaRound 3.07, `apply_qat` 1.78) and **loses** when they are full-rank
+(28.5, 14.6, 22.8). The reason is not subtle: a well-determined reconstruction
+problem has its optimum within one quantization step of round-to-nearest, so
+floor/ceil is all the freedom worth having there, and AdaRound's continuous
+relaxation optimizes that restricted problem better than a hard
+straight-through estimator does. Real activations are widely observed to be
+close to low-rank -- the premise the whole reconstruction-based PTQ literature
+leans on -- which is the case for having this at all, though onnxsim has not
+measured that on your model, and "QAT beats AdaRound" is not a claim it
+makes. Both directions are measured in `tests/test_qat.py`, not
+assumed.
+
+So: reach for `apply_qat` for a block no rounding pass here can reconstruct (a
+normalization, an activation, a GELU, a residual in the middle of it), and for
+low-rank calibration activations at 4 bits. Stay with `apply_adaround` for a
+single well-conditioned layer.
+
+### Running AdaRound and AdaQuant on an accelerator
+
+The step-graph machinery is not QAT-only. `apply_adaround` and
+`apply_adaquant` take the same `step_providers=` argument, which runs their
+optimization loop as an ONNX step graph instead of in host numpy:
+
+```python
+tuned = onnxsim.apply_adaround(
+    float_model,
+    quantized_model,
+    calibration_data=batches,
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    step_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+`providers=` (unchanged) still selects where the float model's calibration
+activations are captured; `step_providers=` selects where the optimization
+itself runs. Omitting it keeps the existing float64 numpy loop, which is what
+CI runs: it is exact and reproducible, and a non-CPU provider is neither, since
+GPU/NPU reductions reassociate. `apply_qat` has no numpy alternative -- the
+step graph *is* the implementation there -- so `step_providers=None` simply
+means CPU.
 
 ## Projects Using ONNX Simplifier
 
