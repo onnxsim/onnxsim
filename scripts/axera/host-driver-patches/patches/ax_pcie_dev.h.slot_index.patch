@@ -1,0 +1,11 @@
+--- a/ax_pcie_dev.h
++++ b/ax_pcie_dev.h
+@@ -294,6 +294,8 @@
+ 	void (*release_msg_irq) (struct axera_dev *ax_dev);
+ };
+ 
++#define AX_SLOT_INDEX_AUTO	0xffffffff
++extern unsigned int slot_index_force;
+ extern struct ax_pcie_operation *g_pcie_opt;
+ extern struct axera_dev *g_axera_dev_map[MAX_PCIE_DEVICES];
+ 

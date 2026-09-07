@@ -3745,7 +3745,7 @@ AXCL host PCIe driver (`axclhost` 2.25.0, DKMS-built: `ax_pcie_host_dev`,
 over **Thunderbolt/USB4** (ASMedia 246x bridge -> PCIe bus 03,
 `[1f4b:0650]`), and that link drops on its own from time to time.
 
-Five real kernel bugs in that driver were found and fixed, plus one feature
+Six real kernel bugs in that driver were found and fixed, plus one feature
 added; see [`host-driver-patches/NOTES.md`](host-driver-patches/NOTES.md) for
 the full symptom -> evidence -> cause -> fix -> verification writeup, the
 unified diffs, and the apply scripts.
@@ -3806,13 +3806,18 @@ unified diffs, and the apply scripts.
    firmware chunk and inside every completion poll, and the offline path
    waits (bounded) for it to bail before teardown.
 
-Two things this does **not** fix, both still open:
+7. **The target id must be allowed to differ from the PCI bus number** --
+   the driver accepts a heartbeat only when the id the card reports equals
+   `pdev->bus->number`. The card reports a fixed 3, which matches this host
+   only because the card enumerates on bus 3; in a VM (bus 7) every heartbeat
+   and port ack was discarded and a healthy card was declared dead after 50s.
+   This was the "device-side handshake timeout" listed below as unexplained
+   and assumed to be the card's own agent failing to answer -- it was
+   answering all along. A `slot_index_force` module parameter pins the id;
+   the default keeps the old bus-number behaviour.
 
-- **`axcl-smi` hangs with no output.** It retries `IOC_AXCL_PORT_MANAGE`
-  forever, each attempt timing out after 50s (`AXCL_RECV_TIMEOUT`) waiting for
-  an ack from the AX650N's *own onboard software*. The low-level RC/EP handshake
-  succeeds and firmware loads fine (`ATF`/`KERNEL`/`ROOTFS` all `SUCCESS`), so
-  the gap is one level up, on the device side -- not a host kernel bug.
+One thing this does **not** fix, still open:
+
 - **The Thunderbolt link itself still drops** (`tbtacl` failure + `boltd` probe
   timeout accompanied one disconnect nobody physically triggered). Fixes 3/4
   make that survivable, not rare.

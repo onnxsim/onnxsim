@@ -11,9 +11,10 @@ chasing "kernel crash when running `axcl-smi`" on an **AX650N** attached over
 
 Three separate bugs turned out to be hiding behind one symptom, plus a fourth
 change layering auto-recovery on top, a fifth that lets the driver run with
-the IOMMU on, and a sixth that closes the bring-up/removal race. All six are
-applied and **confirmed on real hardware** (six: by construction plus a clean
-host bring-up).
+the IOMMU on, a sixth that closes the bring-up/removal race, and a
+seventh that lets the card work when its reported id differs from its PCI bus
+number. All seven are applied and **confirmed on real hardware** (six: by
+construction plus a clean host bring-up).
 
 These patches are host-side kernel driver fixes, not onnxsim code. They live
 here because keeping this AX650N reachable is a prerequisite for everything
@@ -282,6 +283,45 @@ bring-up path still completing.
 with the host AXCL modules loaded; `scripts/axera/vm/create_vm.sh` now refuses
 unless `host_bind_vfio.sh`'s blacklist is in place.
 
+## Fix 7 -- the target id must be allowed to differ from the PCI bus number
+
+**Symptom.** Behind VFIO passthrough into a VM, the AX650N boots perfectly --
+firmware push, RC/EP handshake and `axcl-smi`'s port requests all reach the
+card -- and is then declared dead 50 s later: `[heartbeat_recv_thread]:
+device 7: dead!`, no heartbeat ever accepted, `Recv port ack timeout` for
+every request. This was the "device-side handshake timeout" this file listed
+as an open, device-side problem. It is neither device-side nor a timeout.
+
+**Evidence.** A debug print of the heartbeat packet at the point of the
+timeout, in the guest:
+
+```
+HBDEBUG: target=7 want_count=1 pkt{dev=3 int=9000 cnt=16} raw=00000003 00002328 00000010 00000000
+```
+
+The card had already sent **16** heartbeats, every one discarded.
+`axcl_heartbeat_status()` accepts a packet only `if (hbeat->device ==
+target)`, and `target` is `ax_dev->slot_index`, which `ax_get_slot_index()`
+derives from `pdev->bus->number`. The card reports its own fixed id, 3. On
+this host the card happens to enumerate on **bus 3**, so the two match by
+coincidence of topology; in the guest it lands on bus 7 and nothing matches.
+Any host that enumerates the card on a different bus hits the same wall.
+
+**Fix** (`scripts/fix_axcl_slot_index_p7.sh`,
+`patches/ax_pcie_dev_host.c.slot_index.patch`,
+`patches/ax_pcie_dev.h.slot_index.patch`): a `slot_index_force` module
+parameter on `ax_pcie_host_dev`. Default `AX_SLOT_INDEX_AUTO` keeps the
+existing bus-number behaviour, so the host is unaffected; pass
+`slot_index_force=3` where the card's reported id and its bus number differ.
+The pinned value is logged once at probe.
+
+**Verified 2026-09-07 in the LXD guest**: with
+`modprobe ax_pcie_host_dev slot_index_force=3`, `[ax_pcie_dev_probe]: slot
+index pinned to 3 (bus 7)`, zero missed heartbeats, and `axcl-smi` lists the
+card with live temperature and utilisation. A real model then compiled on the
+host and ran on the card inside the guest through the harness's
+`AXCL_LXD_VM` mode (0.18 ms, correct output tensor returned).
+
 ## Not fixed: device-side handshake timeout
 
 Separate, **not** a kernel bug and not addressed here. `axcl-smi` still hangs
@@ -305,8 +345,6 @@ The scripts are idempotent and patch `/usr/src/axcl-2.25.0` in place, then
 ```sh
 sudo bash scripts/fix_axcl_hotplug_p1.sh    # fix 3
 sudo bash scripts/fix_axcl_hotplug_p2.sh    # fix 4 (requires p1)
-sudo bash scripts/fix_axcl_iommu_p5.sh      # fix 5 (independent of 3/4)
-sudo bash scripts/fix_axcl_online_race_p6.sh # fix 6 (requires p1 + p2)
 ```
 
 Fixes 1 and 2 predate these scripts and their originals were lost to a `/tmp`
@@ -314,16 +352,9 @@ wipe on reboot — `patches/*.patch` is the authoritative record for those (and
 for everything else). To apply from the patch files instead:
 
 ```sh
-# headers are in a/ b/ form, so -p1 with -d resolves them regardless of cwd
-sudo patch -p1 -d /usr/src/axcl-2.25.0 --dry-run < patches/ax_mmb.c.patch   # drop --dry-run to apply
-# all four, then rebuild:
-for p in patches/*.patch; do sudo patch -p1 -d /usr/src/axcl-2.25.0 < "$p"; done
-sudo dkms build axcl/2.25.0 --force && sudo dkms install axcl/2.25.0 --force
+cd /usr/src/axcl-2.25.0
+sudo patch -p0 --dry-run < .../patches/ax_mmb.c.patch    # drop --dry-run to apply
 ```
-
-Verified 2026-09-07: all four patches reverse-apply cleanly against the
-patched `/usr/src/axcl-2.25.0` and forward-apply cleanly against the pristine
-vendor tree `/usr/src/axcl/driver/axcl`, i.e. they are exactly the delta.
 
 **After any driver package upgrade or `dkms remove`, all of this is lost** —
 `/usr/src/axcl-2.25.0` gets replaced. Re-apply from `patches/`.

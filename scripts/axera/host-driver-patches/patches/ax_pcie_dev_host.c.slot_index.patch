@@ -1,0 +1,33 @@
+--- a/ax_pcie_dev_host.c
++++ b/ax_pcie_dev_host.c
+@@ -50,6 +50,17 @@
+ 
+ unsigned long int shm_phys_addr;
+ module_param(shm_phys_addr, ulong, S_IRUGO);
++
++/*
++ * The device's target id. Defaults to the PCI bus number, which is what
++ * this driver has always used, but that only works while the number the
++ * card's own software reports in its heartbeat packet happens to equal
++ * the bus it enumerated on. Pin it when they differ -- e.g. under VFIO
++ * passthrough, where the card lands on a different bus in the guest but
++ * still reports its own fixed id.
++ */
++unsigned int slot_index_force = AX_SLOT_INDEX_AUTO;
++module_param(slot_index_force, uint, S_IRUGO);
+ #endif
+ 
+ static struct pci_device_id ax_pcie_tbl[] = {
+@@ -346,7 +357,11 @@
+ #else
+ 	ax_dev->shm_size = ax_dev->bar_info[BAR_0].size;
+ #endif
+-	ax_dev->slot_index = ax_get_slot_index(pdev);
++	ax_dev->slot_index = (slot_index_force != AX_SLOT_INDEX_AUTO)
++			     ? slot_index_force : ax_get_slot_index(pdev);
++	if (slot_index_force != AX_SLOT_INDEX_AUTO)
++		axera_trace(AXERA_ERR, "slot index pinned to %u (bus %u)",
++			    ax_dev->slot_index, ax_get_slot_index(pdev));
+ 	ax_dev->domain = ax_get_bus_domain(pdev);
+ 	ax_dev->dev_slot = ax_get_dev_slot(pdev);
+ 	ax_dev->dev_func = ax_get_dev_func(pdev);
