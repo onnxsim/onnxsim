@@ -176,7 +176,13 @@ def test_adams_one_minus_beta_constants_are_computed_in_double(committed_text):
     after. Nothing else in either test suite would notice.
     """
     # The fixture writes floats as IEEE-754 bit patterns precisely so this
-    # distinction is legible: 0.1 narrowed from double is 0x3dcccccd, while
-    # subtracting in float32 first gives 0x3dcccccf.
+    # distinction is legible. Both constants are checked, and each against the
+    # *specific* value the mistake produces rather than merely "not the right
+    # one" -- a wrong-value assertion naming a pattern that can never occur
+    # passes forever and tests nothing.
+    #   1 - 0.9   : 0x3dcccccd narrowed from double, 0x3dccccd0 in float32
+    #   1 - 0.999 : 0x3a83126f narrowed from double, 0x3a831200 in float32
     assert "0x3dcccccd" in committed_text
-    assert "0x3dcccccf" not in committed_text
+    assert "0x3dccccd0" not in committed_text
+    assert "0x3a83126f" in committed_text
+    assert "0x3a831200" not in committed_text

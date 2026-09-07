@@ -298,9 +298,28 @@ Each stage is independently shippable and independently useful.
    derived from the scheme rather than exposed, so the API cannot express
    the pairing `apply_qat` refuses.
 
+   The end-to-end pass is closed, and it needed no code: **the whole graph is
+   already a legal block.** Naming the graph's own input and output builds one
+   step graph over every node and takes the loss against the float model's
+   final output -- the end-to-end objective exactly, and the only slice with
+   no teacher-forcing approximation left, since its externals are the graph's
+   own inputs. The premise of the original item, that a block is necessarily
+   smaller than the model, was simply wrong.
+
+   So the question was only whether to recommend it, and the measurements say
+   no. At an equal step budget on an eight-stage stack it fits the calibration
+   set 12-26% better -- it must, that being the quantity it minimizes where
+   the walk only approximates it -- and generalizes 1-12% *worse* to held-out
+   rows, on all eight seeds. That is BRECQ's own argument for the block being
+   the right unit. It also costs ~6x the wall clock and 3.4x the peak RSS
+   (105 MB against 31 MB on a one-million-parameter stack), linear in depth
+   where the walk is flat, and it is all-or-nothing on operator coverage: one
+   node without a gradient rule refuses the whole model where the walk makes
+   it a gap. A depth sweep puts the crossover around four stages; 64x the data
+   narrows the held-out gap without closing it.
+
    Still open from this stage's original description: real data via
-   `load_huggingface_calibration_data`, and an end-to-end pass against the
-   model's own output (a block is always the unit of optimization).
+   `load_huggingface_calibration_data`.
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side

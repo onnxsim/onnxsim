@@ -61,6 +61,33 @@ std::string Join(const std::vector<std::string>& parts, const char* sep) {
   return out;
 }
 
+// raw_data's byte order is fixed little-endian by ONNX on every host -- see
+// onnxsim/passes/endian_read.h, which exists for exactly this -- so these
+// decode by shifting bytes in, not by casting the host's own layout over them.
+// A memcpy/reinterpret_cast would agree with the fixture on x86 and disagree on
+// s390x, and the big-endian CI job runs these tests, so it would be caught --
+// but as a confusing parity failure blaming the emitter rather than the reader.
+uint32_t LittleEndianU32(const char* p) {
+  return (static_cast<uint32_t>(static_cast<unsigned char>(p[0]))) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 8) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 16) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[3])) << 24);
+}
+
+uint64_t LittleEndianU64(const char* p) {
+  uint64_t bits = 0;
+  for (int i = 0; i < 8; ++i) {
+    bits |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (8 * i);
+  }
+  return bits;
+}
+
+std::string F32BitsFromLittleEndian(const char* p) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "0x%08x", LittleEndianU32(p));
+  return buf;
+}
+
 // A tensor's values, whichever field the producer chose to put them in.
 // Encoding is deliberately not part of the comparison: float_data and raw_data
 // are indistinguishable to a runtime, so the fixture compares numbers.
@@ -68,13 +95,17 @@ std::vector<std::string> TensorValues(const onnx::TensorProto& t) {
   std::vector<std::string> out;
   if (t.data_type() == onnx::TensorProto::INT64) {
     if (t.int64_data_size() > 0) {
+      // A typed field needs no swap: protobuf decodes it into host-order
+      // scalars itself. Only the raw_data branch below is byte order's problem.
       for (int i = 0; i < t.int64_data_size(); ++i) {
         out.push_back(std::to_string(t.int64_data(i)));
       }
     } else {
-      const auto* raw = reinterpret_cast<const int64_t*>(t.raw_data().data());
-      const size_t n = t.raw_data().size() / sizeof(int64_t);
-      for (size_t i = 0; i < n; ++i) out.push_back(std::to_string(raw[i]));
+      const std::string& raw = t.raw_data();
+      for (size_t i = 0; i + 8 <= raw.size(); i += 8) {
+        out.push_back(std::to_string(
+            static_cast<int64_t>(LittleEndianU64(raw.data() + i))));
+      }
     }
     return out;
   }
@@ -83,9 +114,10 @@ std::vector<std::string> TensorValues(const onnx::TensorProto& t) {
       out.push_back(F32Bits(t.float_data(i)));
     }
   } else {
-    const auto* raw = reinterpret_cast<const float*>(t.raw_data().data());
-    const size_t n = t.raw_data().size() / sizeof(float);
-    for (size_t i = 0; i < n; ++i) out.push_back(F32Bits(raw[i]));
+    const std::string& raw = t.raw_data();
+    for (size_t i = 0; i + 4 <= raw.size(); i += 4) {
+      out.push_back(F32BitsFromLittleEndian(raw.data() + i));
+    }
   }
   return out;
 }
