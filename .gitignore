@@ -203,3 +203,4 @@ node_modules/
 # checkouts under .claude/worktrees/) -- never part of the repo itself.
 /.claude/
 scripts/axera/vm/share/
+tiny-random-mistral/

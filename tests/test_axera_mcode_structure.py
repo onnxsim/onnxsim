@@ -2950,7 +2950,12 @@ def test_resnet18d_stream_ends_at_a_five_table_flatbuffers_tail(tmp_path):
 
 
 _FULL_RULE = dict(
-    tags=_ALL_TAGS, pmax=4, bare=True, extra_byte_tags={0x9F}, verbs=_VERBS6
+    tags=_ALL_TAGS | {0xA1},
+    pmax=4,
+    bare=True,
+    extra_byte_tags={0x9F},
+    verbs=_VERBS6,
+    odd_tags={0xC1, 0xE1},
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section."""
@@ -3468,3 +3473,137 @@ def test_llm_build_segment_table_is_validated_on_device(tmp_path):
         if o != "fault"
     ]
     assert len(same) >= 2 and all(o == baseline for o in same), same
+
+
+_ANALYSIS_BUILDS = ("resnet18d", "mistral")
+"""The device-free builds the coverage floor is measured on: the real
+resnet18d, and the 1-layer tiny-random-mistral through the ONNX path (the
+`llm_build` layer is covered by its own test, which already builds it)."""
+
+
+def _stream_bounds(mcode):
+    """`(first instruction byte, one past the last)` -- the FlatBuffers header
+    and tail are not instructions."""
+    header, segs = _segments(mcode)
+    return header, segs[-1][0] + segs[-1][1]
+
+
+def _nonzero_coverage(mcode, **rule_overrides):
+    """Fraction of the stream's *non-zero* bytes the rule accounts for, plus
+    the unexplained non-zero runs as `(start, end)` pairs. Zero bytes are
+    segment padding and are not counted either way."""
+    rule = dict(_FULL_RULE)
+    rule.update(rule_overrides)
+    lo, hi = _stream_bounds(mcode)
+    toks = _tokenize_mcode(mcode, start=lo, end=hi, **rule)
+    nonzero = sum(1 for i in range(lo, hi) if mcode[i])
+    runs, last = [], None
+    for o, kind, *_ in toks:
+        if kind == "?" and mcode[o]:
+            if last == o:
+                runs[-1][1] = o + 1
+            else:
+                runs.append([o, o + 1])
+            last = o + 1
+    unexplained = sum(b - a for a, b in runs)
+    return (nonzero - unexplained) / nonzero, [tuple(r) for r in runs]
+
+
+def _build_analysis_mcode(name, work_dir):
+    """The mcode of one `_ANALYSIS_BUILDS` entry, compiled for real."""
+    if name == "resnet18d":
+        return _build_real_resnet18d(work_dir)[2]
+    ckpt = _cached_hf_checkpoint(
+        "distilabel-internal-testing/tiny-random-mistral",
+        fallback_dir=os.path.join(
+            os.path.dirname(__file__), "..", "tiny-random-mistral"
+        ),
+    )
+    if ckpt is None:
+        pytest.skip("tiny-random-mistral is not available locally")
+    result = pulsar2_docker.build_from_hf_checkpoint(ckpt, work_dir, "output")
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    return mcode
+
+
+def test_full_rule_explains_almost_every_stream_byte(tmp_path):
+    """Confirmed real (see the README's "Where the decoding stands" section):
+    the validated forms together account for 96..99% of the non-zero
+    instruction-stream bytes of a real resnet18d *and* of a transformer
+    compiled through the ONNX path -- the same rule, unchanged, across a CNN
+    and an LLM. Also pins the width rule's limit: admitting prefixes p >= 5
+    buys apparent coverage only by over-fitting, so it must not improve the
+    real-versus-shuffled ratio. Needs Docker, no device.
+    """
+    import random
+    from collections import Counter
+
+    for name in _ANALYSIS_BUILDS:
+        work = tmp_path / name
+        work.mkdir()
+        mcode = _build_analysis_mcode(name, str(work))
+        covered, runs = _nonzero_coverage(mcode)
+        # Measured 98.6% (resnet18d) and 96.9% (mistral); floor with headroom.
+        assert covered >= 0.96, (name, covered, len(runs))
+
+        # The width rule stops at p = 4. The decisive measure is per prefix,
+        # not aggregate coverage: a greedy walk with a bigger pmax always
+        # explains more of *any* byte string, so what matters is whether units
+        # with a given prefix occur more often than in a shuffled stream.
+        lo, hi = _stream_bounds(mcode)
+        blob = mcode[lo:hi]
+        shuffled = bytearray(blob)
+        random.Random(0).shuffle(shuffled)
+        shuffled = bytes(shuffled)
+
+        def prefix_counts(data):
+            rule = dict(_FULL_RULE)
+            rule["pmax"] = 16
+            toks = _tokenize_mcode(data, start=0, end=len(data), **rule)
+            return Counter(a for _, kind, a, *_ in toks if kind == "S")
+
+        real, null = prefix_counts(blob), prefix_counts(shuffled)
+        assert real[1] >= 2 * null[1] and real[2] >= 2 * null[2], (name, real, null)
+        # Individual large prefixes are too rare to judge one at a time; taken
+        # together, p >= 5 occurs *less* often than in the shuffled stream.
+        real_wide = sum(real[k] for k in range(5, 17))
+        null_wide = sum(null[k] for k in range(5, 17))
+        assert real_wide < null_wide, (name, real_wide, null_wide)
+
+
+def test_seven_byte_writes_address_the_slot_below_the_next_verb(tmp_path):
+    """Confirmed real (see the README's "Where the decoding stands" section):
+    every unexplained 7-byte run that is followed by a verb has the shape
+    `[X][field][bank][32-bit operand]` and addresses exactly the field slot
+    below that verb's -- the same bank one field lower, or the last field of
+    the previous bank. Needs Docker, no device.
+    """
+    hits = 0
+    for name in _ANALYSIS_BUILDS:
+        work = tmp_path / name
+        work.mkdir()
+        mcode = _build_analysis_mcode(name, str(work))
+        lo, hi = _stream_bounds(mcode)
+        toks = _tokenize_mcode(mcode, start=lo, end=hi, **_FULL_RULE)
+        at = {t[0]: i for i, t in enumerate(toks)}
+        _, runs = _nonzero_coverage(mcode)
+        for a, b in runs:
+            if b - a != 7 or b not in at:
+                continue
+            nxt = toks[at[b]]
+            if nxt[1] != "V":
+                continue
+            field, bank, nfield, nbank = mcode[a + 1], mcode[a + 2], nxt[3], nxt[4]
+            assert field % 0x10 == 0, (name, a, hex(field))
+            adjacent = (bank == nbank and (nfield - field) % 0x100 == 0x10) or (
+                field == 0xF0 and nfield == 0x00 and nbank == bank + 1
+            )
+            assert adjacent, (
+                name,
+                a,
+                mcode[a:b].hex(),
+                mcode[nxt[0] : nxt[0] + 8].hex(),
+            )
+            hits += 1
+    assert hits >= 10, hits
