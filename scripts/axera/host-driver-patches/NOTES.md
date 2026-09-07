@@ -10,8 +10,10 @@ chasing "kernel crash when running `axcl-smi`" on an **AX650N** attached over
 - Loaded modules: `ax_pcie_host_dev`, `ax_pcie_msg`, `ax_pcie_mmb`, `axcl_host`
 
 Three separate bugs turned out to be hiding behind one symptom, plus a fourth
-change layering auto-recovery on top. All four are applied and **confirmed on
-real hardware**.
+change layering auto-recovery on top, a fifth that lets the driver run with
+the IOMMU on, and a sixth that closes the bring-up/removal race. All six are
+applied and **confirmed on real hardware** (six: by construction plus a clean
+host bring-up).
 
 These patches are host-side kernel driver fixes, not onnxsim code. They live
 here because keeping this AX650N reachable is a prerequisite for everything
@@ -186,6 +188,100 @@ needs offline-awareness in the transport layer. Avoid unplugging within
 Also: `destroy_workqueue()` on module unload waits for an in-flight bring-up, so
 `rmmod axcl_host` can block up to ~2 minutes if it is mid-handshake.
 
+## Fix 5 -- `ax_mmb` hands the card raw physical addresses (breaks with the IOMMU on)
+
+**Symptom.** With `amd_iommu=off` removed from the kernel command line, the
+host driver loads, pushes firmware and reports `dev 3 back online`, then the
+card hits `AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0003 address=0x15cb400000 ...]`
+(ten events in the first minutes) and `axcl-smi` hangs. Reproduced 2026-09-07
+07:37 on kernel 7.0.0-31 right after the reboot that enabled the IOMMU.
+
+**Cause.** A Thunderbolt-attached device is untrusted, so the kernel keeps it
+in a translated `DMA` domain even with `iommu=pt`
+(`/sys/bus/pci/devices/0000:03:00.0/iommu_group/type` = `DMA`). Every address
+the driver hands the card must therefore be IOMMU-mapped for *that* device.
+`ax_mmb.c` was not doing that in either live allocation path:
+
+- `ax_mmb_alloc_mem()` called `dma_alloc_coherent()` on the module's own
+  **misc device**, which has no IOMMU domain, so the "DMA address" it returned
+  was a raw host physical address.
+- `ax_sglist_alloc_memory()` did `kmalloc()` + `virt_to_phys()` -- raw
+  physical again.
+
+(`axcl_pcie_host.c`'s firmware-push buffer already used `dma_alloc_coherent()`
+on the card's `pci_dev`, which is why the push worked; the per-device pool
+under `MEM_LIST_PARTITION` is compiled out.) The card then DMAs to unmapped
+addresses, faults, and its runtime never comes up. This is almost certainly why
+`amd_iommu=off` had been put on the command line.
+
+**Fix** (`scripts/fix_axcl_iommu_p5.sh`, `patches/ax_mmb.c.iommu.patch`):
+allocate and map every card-visible buffer against the card's own `pci_dev`
+(`g_axera_dev_map[0]->pdev->dev`, whose probe already sets 64-bit DMA masks):
+`dma_alloc_coherent()` on it for the coherent buffers, `dma_map_single()` on
+page-aligned `kmalloc` chunks for the scatterlist (page alignment keeps an
+untrusted-device mapping from bouncing through swiotlb). `mmap` no longer
+treats the card-visible address as a CPU page: scatter chunks map by
+`virt_to_phys()` of the kernel buffer, coherent buffers through
+`dma_mmap_coherent()` (which also handles IOMMU-backed, physically
+non-contiguous coherent memory). With the IOMMU off the DMA API degenerates
+to the identity mapping the old code assumed, so behaviour there is
+unchanged. Single-card assumption: all buffers map for the first device.
+`ax_pcie_mmb` now depends on `ax_pcie_host_dev` (symbol dependency), so
+reload the stack in dependency order.
+
+**Verified 2026-09-07 19:24, host, kernel 7.0.0-31, IOMMU on** (`amd_iommu=off`
+removed, `iommu=pt`, card in a translated `DMA` domain): after `dkms
+build/install` and a reload in dependency order (`lsmod` now shows
+`ax_pcie_mmb` among `ax_pcie_host_dev`'s users), firmware push and handshake
+completed, `axcl-smi` listed the card, and the kernel log stayed free of
+`IO_PAGE_FAULT` -- every fault on record predates the reload (the old module
+faulted at fresh 2 MB-aligned `kmalloc` chunks, e.g. `0x1838c00000`, each
+time the runtime library allocated a buffer for a request). Also compiles
+cleanly under DKMS on 6.8.0-138 in the LXD guest. Full inference through the
+mapped buffers was then exercised by the repo's on-device tests (an
+`llm_build` layer with real K/V-cache inputs and pulled outputs).
+
+## Fix 6 -- bring-up torn down under itself (the "unplugged again during bring-up" race)
+
+**Symptom.** Whole-host panic, kdump-captured (`/var/crash/202609071939`):
+`BUG: unable to handle page fault for address: ffffd4c4f380000c` (supervisor
+write, not-present), `RIP: axcl_firmware_load.cold`, called from
+`axcl_pcie_device_online_work` on the hotplug workqueue. One millisecond
+earlier, on another thread: `[axcl_pcie_device_offline, 1390]: dev 3 offline:
+cached handles dropped`. The log shows the bring-up mid-push (UBOOT, DTB, ATF
+`SUCCESS`, KERNEL header just printed) when the device was removed.
+
+**How it was triggered.** An LXD VM had the card via VFIO while the host AXCL
+modules were still loaded (the blacklist had been undone to test fix 5). The
+guest driver's SoC reset made the card re-enumerate; LXD's per-device
+`driver_override` went with the old instance; the host's `ax_pcie_dev_host`
+probed the new one and fix 4 scheduled a bring-up. A second re-enumeration
+during that push ran `ax_pcie_dev_remove()` -> offline -> BAR teardown, and
+the push's next write into the ioremap window faulted. This is exactly the
+race fix 4's notes called "known remaining"; a Thunderbolt drop during a
+normal host bring-up reaches the same window.
+
+**Fix** (`scripts/fix_axcl_online_race_p6.sh`,
+`patches/axcl_pcie_host.c.online_race.patch`; needs fixes 3 and 4):
+`axcl_pcie_device_online()` marks the target busy for its whole duration and
+wakes a waitqueue on every exit; the firmware chunk loop checks
+`dev_offline[]` before every chunk it writes (`[STATUS]: ABORTED, device
+went offline`) and the completion poll checks it on every iteration, so an
+in-flight push exits within one chunk timeout; `axcl_pcie_device_offline()`,
+which `ax_pcie_dev_remove()` calls *before* teardown, sets the flag and then
+waits (bounded, 20 s) for the busy bring-up to bail. Nothing in the driver
+follows a stale BAR mapping after that.
+
+**Verified.** Applies with `patch -p1` on the fix 1-5 tree; compiles cleanly
+under DKMS on 6.8.0-138 in the LXD guest and on the host (see below). The
+crash itself is not re-provoked on purpose -- doing so needs a card removal
+mid-push -- so the guard is verified by construction plus the normal host
+bring-up path still completing.
+
+**Operational rule that makes the trigger impossible:** never start the VM
+with the host AXCL modules loaded; `scripts/axera/vm/create_vm.sh` now refuses
+unless `host_bind_vfio.sh`'s blacklist is in place.
+
 ## Not fixed: device-side handshake timeout
 
 Separate, **not** a kernel bug and not addressed here. `axcl-smi` still hangs
@@ -209,6 +305,8 @@ The scripts are idempotent and patch `/usr/src/axcl-2.25.0` in place, then
 ```sh
 sudo bash scripts/fix_axcl_hotplug_p1.sh    # fix 3
 sudo bash scripts/fix_axcl_hotplug_p2.sh    # fix 4 (requires p1)
+sudo bash scripts/fix_axcl_iommu_p5.sh      # fix 5 (independent of 3/4)
+sudo bash scripts/fix_axcl_online_race_p6.sh # fix 6 (requires p1 + p2)
 ```
 
 Fixes 1 and 2 predate these scripts and their originals were lost to a `/tmp`

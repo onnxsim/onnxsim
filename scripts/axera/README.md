@@ -3745,7 +3745,7 @@ AXCL host PCIe driver (`axclhost` 2.25.0, DKMS-built: `ax_pcie_host_dev`,
 over **Thunderbolt/USB4** (ASMedia 246x bridge -> PCIe bus 03,
 `[1f4b:0650]`), and that link drops on its own from time to time.
 
-Three real kernel bugs in that driver were found and fixed, plus one feature
+Five real kernel bugs in that driver were found and fixed, plus one feature
 added; see [`host-driver-patches/NOTES.md`](host-driver-patches/NOTES.md) for
 the full symptom -> evidence -> cause -> fix -> verification writeup, the
 unified diffs, and the apply scripts.
@@ -3785,6 +3785,27 @@ unified diffs, and the apply scripts.
    block ~120s in the handshake, so it must not run in the PCI `.probe()`
    callback.
 
+5. **`ax_mmb` hands the card raw physical addresses** -- with the IOMMU on
+   (a Thunderbolt device is untrusted and always gets a translated domain,
+   even under `iommu=pt`), the card's DMA to those addresses faulted
+   (`AMD-Vi IO_PAGE_FAULT` storms) and the runtime never came up; this is why
+   `amd_iommu=off` had been on the kernel command line. The coherent buffers
+   were allocated on the module's own misc device (no IOMMU domain) and the
+   scatterlist used `kmalloc` + `virt_to_phys`. Fixed by allocating and
+   mapping every card-visible buffer against the card's own `pci_dev`
+   through the DMA API, with `mmap` using the CPU-physical page (or
+   `dma_mmap_coherent`) instead of the card-visible address. The host now
+   runs the card with the IOMMU on and zero faults; with the IOMMU off the
+   DMA API is the identity mapping the old code assumed.
+
+6. **Bring-up torn down under itself** -- the "unplugged again during
+   bring-up" race fix 4 left open became a real kdump-captured host panic
+   (`axcl_firmware_load` writing into a BAR window that `ax_pcie_dev_remove()`
+   had just unmapped, one millisecond after the offline notifier ran). The
+   bring-up now marks itself busy, checks the offline flag before every
+   firmware chunk and inside every completion poll, and the offline path
+   waits (bounded) for it to bail before teardown.
+
 Two things this does **not** fix, both still open:
 
 - **`axcl-smi` hangs with no output.** It retries `IOC_AXCL_PORT_MANAGE`
@@ -3798,7 +3819,8 @@ Two things this does **not** fix, both still open:
 
 ⚠️ Any `axclhost` package upgrade or `dkms remove` replaces
 `/usr/src/axcl-2.25.0` and silently drops all four fixes -- including the one
-standing between a Thunderbolt hiccup and a hard reset. Re-apply from
+standing between a Thunderbolt hiccup and a hard reset, and the one that lets
+the card work with the IOMMU on. Re-apply from
 `host-driver-patches/patches/` (`sudo patch -p1 -d /usr/src/axcl-2.25.0 <
 patches/<file>.patch` for each, then `dkms build`/`install`).
 

@@ -1,0 +1,168 @@
+--- a/ax_mmb.c
++++ b/ax_mmb.c
+@@ -20,6 +20,7 @@
+ #include <linux/mm_types.h>
+ #include <linux/mm.h>
+ #include <linux/dma-mapping.h>
++#include <linux/pci.h>
+ #include <linux/of_device.h>
+ #include <linux/version.h>
+ #include <asm/cacheflush.h>
+@@ -73,6 +74,7 @@
+ 	dma_addr_t dma_phy_addr;
+ 	struct ax_scatterlist *scatterlist;
+ 	unsigned long dma_buf_size;
++	struct device *dma_dev;
+ };
+ 
+ struct ax_mem_info {
+@@ -254,13 +256,37 @@
+ }
+ #endif
+ 
+-static void ax_sglist_free_memory(int count, struct ax_scatterlist *scatterlist)
++/*
++ * Every address this module hands the AX650N must be one the card can DMA
++ * to *as seen through the IOMMU*. The misc device this module used to
++ * allocate against has no IOMMU domain, so dma_alloc_coherent() on it (and
++ * virt_to_phys() on kmalloc memory) yield raw host physical addresses; with
++ * the IOMMU on, the card's DMA then faults (AMD-Vi IO_PAGE_FAULT) and the
++ * runtime never comes up. Allocate and map against the card's own pci_dev
++ * instead: with the IOMMU off that is the identity mapping the old code
++ * assumed, with it on it is the mapping the card actually needs.
++ * Single-card assumption: every buffer is mapped for the first device.
++ */
++static struct device *ax_mmb_dma_device(void)
++{
++	if (g_pcie_opt && g_pcie_opt->remote_device_number > 0 &&
++	    g_axera_dev_map[0] && g_axera_dev_map[0]->pdev)
++		return &g_axera_dev_map[0]->pdev->dev;
++	return ax_mmb_miscdev.this_device;
++}
++
++static void ax_sglist_free_memory(struct device *dev, int count,
++				  struct ax_scatterlist *scatterlist)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < count; i++) {
+-		if ((void *)(scatterlist->sg_list[i].virtaddr) != NULL)
++		if ((void *)(scatterlist->sg_list[i].virtaddr) != NULL) {
++			dma_unmap_single(dev, scatterlist->sg_list[i].phyaddr,
++					 PAGE_ALIGN(scatterlist->sg_list[i].size),
++					 DMA_BIDIRECTIONAL);
+ 			kfree((void *)(scatterlist->sg_list[i].virtaddr));
++		}
+ 	}
+ }
+ 
+@@ -271,12 +297,12 @@
+ 
+ 	if (ax_mmb) {
+ 		if ((ax_mmb->isScatter == true) && (ax_mmb->scatterlist != NULL)) {
+-				ax_sglist_free_memory(ax_mmb->scatterlist->num, ax_mmb->scatterlist);
++				ax_sglist_free_memory(ax_mmb->dma_dev, ax_mmb->scatterlist->num, ax_mmb->scatterlist);
+ 				kfree(ax_mmb->scatterlist);
+ 		}
+ 
+ 		if (ax_mmb->ax_mmb_buf)
+-			dma_free_coherent(ax_mmb_miscdev.this_device,
++			dma_free_coherent(ax_mmb->dma_dev,
+ 				  	ax_mmb->dma_buf_size, ax_mmb->ax_mmb_buf,
+ 				  	ax_mmb->dma_phy_addr);
+ 
+@@ -286,7 +312,8 @@
+ 	return 0;
+ }
+ 
+-static int ax_sglist_alloc_memory(int size, unsigned long *virtaddr, unsigned long *phyaddr)
++static int ax_sglist_alloc_memory(struct device *dev, int size,
++				  unsigned long *virtaddr, unsigned long *phyaddr)
+ {
+ 	void *tmpvirtaddr;
+ 	unsigned long tmpphyaddr;
+@@ -304,15 +331,16 @@
+ 	 * fast and fall through to the next halved size; __GFP_NOWARN silences
+ 	 * the backtrace since ax_mmb already logs the failure itself below.
+ 	 */
+-	tmpvirtaddr = kmalloc(size, GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
++	tmpvirtaddr = kmalloc(PAGE_ALIGN(size), GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
+ 	if (!tmpvirtaddr) {
+ 		PCIe_PRINT(PCIe_ERR, "kmalloc %x memory failed\n", size);
+ 		return -1;
+ 	}
+ 
+-	tmpphyaddr = virt_to_phys(tmpvirtaddr);
+-	if (tmpphyaddr < 0) {
+-		PCIe_PRINT(PCIe_ERR, "%x dmabuf virt to phys failed\n", size);
++	tmpphyaddr = dma_map_single(dev, tmpvirtaddr, PAGE_ALIGN(size),
++				    DMA_BIDIRECTIONAL);
++	if (dma_mapping_error(dev, tmpphyaddr)) {
++		PCIe_PRINT(PCIe_ERR, "%x dmabuf dma_map_single failed\n", size);
+ 		kfree(tmpvirtaddr);
+ 		return -1;
+ 	}
+@@ -339,21 +367,22 @@
+ 		return EINVAL;
+ 	}
+ 	memset((void *)ax_mmb->scatterlist, 0, sizeof(struct ax_scatterlist));
++	ax_mmb->dma_dev = ax_mmb_dma_device();
+ 
+ 	while (size > 0) {
+ 		if (count >= MAX_SG_LIST_ENTRY) {
+ 			PCIe_PRINT(PCIe_ERR, "There are no free entries");
+-			ax_sglist_free_memory(count, ax_mmb->scatterlist);
++			ax_sglist_free_memory(ax_mmb->dma_dev, count, ax_mmb->scatterlist);
+ 			kfree(ax_mmb->scatterlist);
+ 			return -1;
+ 		}
+ 
+ 		alloc_size = min(alloc_size, size);
+-		ret = ax_sglist_alloc_memory(alloc_size, &virtaddr, &phyaddr);
++		ret = ax_sglist_alloc_memory(ax_mmb->dma_dev, alloc_size, &virtaddr, &phyaddr);
+ 		if (ret < 0) {
+ 			if (alloc_size == min_alloc_size) {
+ 				PCIe_PRINT(PCIe_ERR, "Alloc min mem size failed");
+-				ax_sglist_free_memory(count, ax_mmb->scatterlist);
++				ax_sglist_free_memory(ax_mmb->dma_dev, count, ax_mmb->scatterlist);
+ 				kfree(ax_mmb->scatterlist);
+ 				return -1;
+ 			}
+@@ -396,8 +425,9 @@
+ 		   "ax_mmb_ioctl: alloc physical memory, size:%ld",
+ 		   dma_buf_size);
+ 	ax_mmb->dma_buf_size = dma_buf_size;
++	ax_mmb->dma_dev = ax_mmb_dma_device();
+ 	ax_mmb->ax_mmb_buf =
+-	    dma_alloc_coherent(ax_mmb_miscdev.this_device, dma_buf_size,
++	    dma_alloc_coherent(ax_mmb->dma_dev, dma_buf_size,
+ 			       (dma_addr_t *) (&ax_mmb->dma_phy_addr),
+ 			       GFP_KERNEL);
+ 	if (ax_mmb->ax_mmb_buf <= 0) {
+@@ -646,7 +676,7 @@
+ 
+ 	if (ax_mmb->isScatter) {
+ 		for (i = 0; i < ax_mmb->scatterlist->num; i++) {
+-			pfn_start = ax_mmb->scatterlist->sg_list[i].phyaddr >> PAGE_SHIFT;
++			pfn_start = virt_to_phys((void *)ax_mmb->scatterlist->sg_list[i].virtaddr) >> PAGE_SHIFT;
+ 			map_size = ax_mmb->scatterlist->sg_list[i].size;
+ 			ret = remap_pfn_range(vma, vm_start, pfn_start, map_size, vma->vm_page_prot);
+ 			if (ret)
+@@ -656,9 +686,14 @@
+ 			vm_start = vm_start + ax_mmb->scatterlist->sg_list[i].size;
+ 		}
+ 	} else {
+-		ret =
+-		    remap_pfn_range(vma, vma->vm_start, pfn_start, size,
+-				    vma->vm_page_prot);
++		if (ax_mmb->ax_mmb_buf)
++			ret = dma_mmap_coherent(ax_mmb->dma_dev, vma,
++						ax_mmb->ax_mmb_buf,
++						ax_mmb->dma_phy_addr,
++						ax_mmb->dma_buf_size);
++		else
++			ret = remap_pfn_range(vma, vma->vm_start, pfn_start,
++					      size, vma->vm_page_prot);
+ 		if (ret)
+ 			PCIe_PRINT(PCIe_ERR,
+ 				   "%s: remap_pfn_range failed at [0x%lx  0x%lx]",
