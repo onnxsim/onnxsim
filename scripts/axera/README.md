@@ -3745,7 +3745,7 @@ AXCL host PCIe driver (`axclhost` 2.25.0, DKMS-built: `ax_pcie_host_dev`,
 over **Thunderbolt/USB4** (ASMedia 246x bridge -> PCIe bus 03,
 `[1f4b:0650]`), and that link drops on its own from time to time.
 
-Four real kernel bugs in that driver were found and fixed, plus one feature
+Five real kernel bugs in that driver were found and fixed, plus one feature
 added; see [`host-driver-patches/NOTES.md`](host-driver-patches/NOTES.md) for
 the full symptom -> evidence -> cause -> fix -> verification writeup, the
 unified diffs, and the apply scripts.
@@ -3797,6 +3797,14 @@ unified diffs, and the apply scripts.
    `dma_mmap_coherent`) instead of the card-visible address. The host now
    runs the card with the IOMMU on and zero faults; with the IOMMU off the
    DMA API is the identity mapping the old code assumed.
+
+6. **Bring-up torn down under itself** -- the "unplugged again during
+   bring-up" race fix 4 left open became a real kdump-captured host panic
+   (`axcl_firmware_load` writing into a BAR window that `ax_pcie_dev_remove()`
+   had just unmapped, one millisecond after the offline notifier ran). The
+   bring-up now marks itself busy, checks the offline flag before every
+   firmware chunk and inside every completion poll, and the offline path
+   waits (bounded) for it to bail before teardown.
 
 Two things this does **not** fix, both still open:
 

@@ -1,0 +1,86 @@
+--- a/axcl_pcie_host.c
++++ b/axcl_pcie_host.c
+@@ -34,6 +34,10 @@
+ static unsigned int heartbeat_target[AXERA_MAX_MAP_DEV];
+ /* set before a device's BAR mappings are torn down; polling loops must bail */
+ static volatile bool dev_offline[AXERA_MAX_MAP_DEV];
++/* a bring-up (axcl_pcie_device_online) is in flight for this target; the
++ * offline path waits for it to bail before the device is torn down */
++static volatile bool online_busy[AXERA_MAX_MAP_DEV];
++static DECLARE_WAIT_QUEUE_HEAD(online_wq);
+ /* bringing a reconnected device up blocks for a long time; keep it off the
+  * PCI probe path. Ordered so two devices are never brought up concurrently. */
+ static struct workqueue_struct *axcl_hotplug_wq;
+@@ -273,6 +277,9 @@
+ 
+ 	ktime_get_ts64(&tv_start);
+ 	while (1) {
++		if (ax_dev->slot_index < AXERA_MAX_MAP_DEV &&
++		    dev_offline[ax_dev->slot_index])
++			return -ENODEV;
+ 		reg = pcie_dev_readl(ax_dev, AX_PCIE_ENDPOINT_STATUS);
+ 		if (reg != 0) {
+ 			if (reg & flags) {
+@@ -506,6 +513,13 @@
+ 		sent = 0;
+ 
+ 		while (imgsize) {
++			if (ax_dev->slot_index < AXERA_MAX_MAP_DEV &&
++			    dev_offline[ax_dev->slot_index]) {
++				printk("[STATUS]: ABORTED, device %x went offline\n",
++				       ax_dev->slot_index);
++				ret = -ENODEV;
++				goto out;
++			}
+ 			size = min_t(uint, imgsize, MAX_TRANSFER_SIZE);
+ 			memcpy(dma_virt_addr, imgaddr + sent, size);
+ 			ret = axcl_boot_device(ax_dev, dest, size);
+@@ -1370,6 +1384,22 @@
+ 	/* make the heartbeat poll loop bail out of its msleep(1000) cycle */
+ 	dev_offline[target] = true;
+ 
++	/*
++	 * A bring-up in flight for this target is still writing through the
++	 * BAR window and the DMA buffer the caller is about to tear down. It
++	 * checks dev_offline before every firmware chunk and inside every
++	 * completion poll, so it exits within one chunk timeout; wait for it.
++	 */
++	if (online_busy[target]) {
++		axcl_trace(AXCL_ERR, "dev %x offline: waiting for bring-up to bail",
++			   target);
++		if (!wait_event_timeout(online_wq, !online_busy[target],
++					msecs_to_jiffies(20000)))
++			axcl_trace(AXCL_ERR,
++				   "dev %x offline: bring-up did not bail in 20s",
++				   target);
++	}
++
+ 	mutex_lock(&ioctl_mutex);
+ 	axcl_devices_heartbeat_status_set(target, AXCL_HEARTBEAT_DEAD);
+ 	for (port = 0; port < MAX_MSG_PORTS; port++) {
+@@ -1416,6 +1446,7 @@
+ 	}
+ 
+ 	dev_offline[target] = false;
++	online_busy[target] = true;
+ 
+ 	/* 1. firmware loading */
+ 	ret = axcl_firmware_load(ax_dev);
+@@ -1463,6 +1494,8 @@
+ 	wake_up_process(heartbeat[target]);
+ 
+ 	axcl_trace(AXCL_ERR, "dev %x back online", target);
++	online_busy[target] = false;
++	wake_up(&online_wq);
+ 	return 0;
+ 
+ gone:
+@@ -1470,6 +1503,8 @@
+ 	ret = -1;
+ dead:
+ 	axcl_devices_heartbeat_status_set(target, AXCL_HEARTBEAT_DEAD);
++	online_busy[target] = false;
++	wake_up(&online_wq);
+ 	return ret;
+ }
+ 
