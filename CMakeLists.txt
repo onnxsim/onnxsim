@@ -617,6 +617,17 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(qat_graph_builder_test)
   add_test(NAME qat_graph_builder_test COMMAND qat_graph_builder_test)
 
+  # The Python<->C++ emitter parity check. It compares what qat_graph_builder.cpp
+  # emits against onnxsim/qat_parity_fixtures.txt, which is generated from
+  # onnxsim/qat_graph.py -- so the fixture path has to reach the source tree at
+  # runtime rather than the build tree, hence the compile definition.
+  add_executable(qat_graph_parity_test onnxsim/qat_graph_parity_test.cpp)
+  target_link_libraries(qat_graph_parity_test onnxsim)
+  target_compile_definitions(qat_graph_parity_test PRIVATE
+      QAT_PARITY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/qat_parity_fixtures.txt")
+  onnxsim_add_ort_rpath(qat_graph_parity_test)
+  add_test(NAME qat_graph_parity_test COMMAND qat_graph_parity_test)
+
   # contrib_schemas.cpp's MoE/QMoE registration needs onnx's schema
   # registry and function-building API, like precision_estimator_test
   # above -- links the fully-configured `onnxsim` target rather than

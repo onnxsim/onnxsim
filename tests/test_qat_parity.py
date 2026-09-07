@@ -7,7 +7,7 @@ quietly disagree is the whole hazard of having done that: both graphs would be
 valid, both would run, and the browser would train a model differently from the
 Python with nothing saying so.
 
-``onnxsim/qat_parity_fixtures.json`` is the shared reference both sides are
+``onnxsim/qat_parity_fixtures.txt`` is the shared reference both sides are
 measured against. This file asserts *fixture == Python*; the C++
 ``qat_graph_parity_test`` asserts *fixture == C++*. Together they give
 Python == C++, which is the property actually wanted and which neither test
@@ -24,14 +24,13 @@ must fail *here*, loudly, with instructions.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 
 import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GENERATOR = os.path.join(_ROOT, "scripts", "make_qat_parity_fixtures.py")
-_FIXTURE = os.path.join(_ROOT, "onnxsim", "qat_parity_fixtures.json")
+_FIXTURE = os.path.join(_ROOT, "onnxsim", "qat_parity_fixtures.txt")
 
 _REGENERATE = (
     "Run `python3 scripts/make_qat_parity_fixtures.py` and commit the result "
@@ -57,18 +56,36 @@ def _generator():
 
 
 @pytest.fixture(scope="module")
-def committed():
-    with open(_FIXTURE) as f:
-        return json.load(f)
+def gen():
+    return _generator()
 
 
 @pytest.fixture(scope="module")
-def regenerated():
-    return _generator().build()
+def committed_text():
+    with open(_FIXTURE) as f:
+        return f.read()
+
+
+@pytest.fixture(scope="module")
+def committed(gen, committed_text):
+    """The freshly-built structure, for the tests below that inspect one case.
+
+    Not parsed back out of the committed text -- the text has no parser on
+    either side, by design. Using the rebuilt structure here is only sound
+    because ``test_the_committed_fixture_still_describes_what_python_emits``
+    pins it to the committed text; if that test fails, treat every assertion
+    below it as describing the working tree rather than the fixture.
+    """
+    return gen.build()
+
+
+@pytest.fixture(scope="module")
+def regenerated_text(gen):
+    return gen.render(gen.build())
 
 
 def test_the_committed_fixture_still_describes_what_python_emits(
-    committed, regenerated
+    committed_text, regenerated_text
 ):
     """The fixture is not stale.
 
@@ -78,13 +95,13 @@ def test_the_committed_fixture_still_describes_what_python_emits(
     into a test of nothing, since it would keep agreeing with a description of
     an emitter that no longer exists.
     """
-    assert regenerated == committed, (
-        "onnxsim/qat_parity_fixtures.json no longer matches what "
+    assert regenerated_text == committed_text, (
+        "onnxsim/qat_parity_fixtures.txt no longer matches what "
         "onnxsim/qat_graph.py emits. " + _REGENERATE
     )
 
 
-def test_every_case_is_present_on_both_sides(committed, regenerated):
+def test_every_case_is_present_on_both_sides(committed_text, regenerated_text):
     """Cases are not silently dropped.
 
     A whole-object comparison already covers this, but it reports as one
@@ -92,10 +109,18 @@ def test_every_case_is_present_on_both_sides(committed, regenerated):
     builder method and a case for it, then forgetting to regenerate) diagnose
     itself.
     """
-    assert sorted(committed["cases"]) == sorted(regenerated["cases"]), _REGENERATE
+
+    def cases(text):
+        return sorted(
+            line.split(" ", 1)[1]
+            for line in text.splitlines()
+            if line.startswith("case ")
+        )
+
+    assert cases(committed_text) == cases(regenerated_text), _REGENERATE
 
 
-def test_the_fixture_pins_the_operator_allowlist(committed):
+def test_the_fixture_pins_the_operator_allowlist(committed_text):
     """``EP_FRIENDLY_OPS`` is part of the contract, not just the graphs.
 
     The C++ restates the allowlist, and a member present on one side only would
@@ -105,7 +130,8 @@ def test_the_fixture_pins_the_operator_allowlist(committed):
     """
     from onnxsim.qat_graph import EP_FRIENDLY_OPS
 
-    assert committed["ep_friendly_ops"] == sorted(EP_FRIENDLY_OPS), _REGENERATE
+    line = next(line for line in committed_text.splitlines() if line.startswith("ops "))
+    assert line.split(" ", 1)[1].split(",") == sorted(EP_FRIENDLY_OPS), _REGENERATE
 
 
 def test_no_case_emits_an_operator_outside_the_allowlist(committed):
@@ -140,7 +166,7 @@ def test_the_rounding_case_contains_no_round_node(committed):
     assert ops == ["Abs", "Add", "Cast", "Sign", "Cast", "Mul"]
 
 
-def test_adams_one_minus_beta_constants_are_computed_in_double(committed):
+def test_adams_one_minus_beta_constants_are_computed_in_double(committed_text):
     """The narrowing order is pinned, because it is invisible and it matters.
 
     ``1 - beta`` is computed in double precision and then narrowed to float32.
@@ -149,10 +175,8 @@ def test_adams_one_minus_beta_constants_are_computed_in_double(committed):
     perfectly valid graphs that take subtly different optimizer steps forever
     after. Nothing else in either test suite would notice.
     """
-    values = [
-        v
-        for init in committed["cases"]["adam_update"]["initializers"]
-        for v in init["values"]
-    ]
-    assert pytest.approx(0.1, abs=0.0) in values or 0.10000000149011612 in values
-    assert 0.10000002384185791 not in values
+    # The fixture writes floats as IEEE-754 bit patterns precisely so this
+    # distinction is legible: 0.1 narrowed from double is 0x3dcccccd, while
+    # subtracting in float32 first gives 0x3dcccccf.
+    assert "0x3dcccccd" in committed_text
+    assert "0x3dcccccf" not in committed_text

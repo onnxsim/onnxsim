@@ -31,19 +31,33 @@ stronger statement than "the graphs are isomorphic" and is the property that
 actually breaks first when someone reorders a rule. What is *not* compared is
 the byte encoding of a tensor -- ``onnx.numpy_helper.from_array`` and a
 hand-built C++ ``TensorProto`` may legitimately choose ``float_data`` versus
-``raw_data`` for the same values, and a runtime cannot tell the difference. So
-values are compared as numbers.
+``raw_data`` for the same values, and a runtime cannot tell the difference.
+
+**Why a flat text format rather than JSON.** The consumer on the other side is
+a C++ test, and the repository vendors no JSON parser; pulling one in to read a
+test fixture would be a dependency bought for one file. A line-oriented format
+costs each side a serializer of a few dozen lines and no parser at all, because
+the comparison is then string equality -- and a failure prints as a readable
+diff of exactly the nodes that moved, instead of a structural mismatch report
+somebody has to decode.
+
+Floats are written as their IEEE-754 bit pattern in hex rather than as decimal
+text. Decimal formatting differs between Python's ``repr`` and C++'s streams
+for the same value, which would produce spurious mismatches; the bit pattern is
+exact, identical in both languages, and makes the comparison sharp precisely
+where it needs to be. ``1 - beta`` narrowed from double is ``0x3dcccccd`` and
+the float32-subtracted version is ``0x3dcccccf``: one hex digit apart, and
+unmissable.
 
 Usage:
     python3 scripts/make_qat_parity_fixtures.py
 
-Writes ``onnxsim/qat_parity_fixtures.json``. Re-run it whenever the emitter
+Writes ``onnxsim/qat_parity_fixtures.txt``. Re-run it whenever the emitter
 changes on purpose, and commit the result alongside.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from typing import Any, Dict
@@ -56,7 +70,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from onnxsim import qat_graph  # noqa: E402
 
 FIXTURE_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "onnxsim", "qat_parity_fixtures.json"
+    os.path.dirname(__file__), "..", "onnxsim", "qat_parity_fixtures.txt"
 )
 
 
@@ -284,6 +298,90 @@ CASES = {
 }
 
 
+def _f32_bits(value: float) -> str:
+    """A float32's IEEE-754 bit pattern, as hex.
+
+    See this module's docstring: decimal text formats differently in Python and
+    C++ for the same number, and the differences this fixture exists to catch
+    are exactly one ulp wide.
+    """
+    return "0x%08x" % int(np.float32(value).view(np.uint32))
+
+
+def _render_values(dtype: int, values) -> str:
+    if dtype == int(onnx.TensorProto.INT64):
+        return ",".join(str(int(v)) for v in values)
+    return ",".join(_f32_bits(v) for v in values)
+
+
+def _render_case(name: str, case: Dict[str, Any]) -> list:
+    lines = ["case " + name]
+    for init in case["initializers"]:
+        lines.append(
+            "  init %s %d [%s] %s"
+            % (
+                init["name"],
+                init["dtype"],
+                ",".join(str(d) for d in init["dims"]),
+                _render_values(init["dtype"], init["values"]),
+            )
+        )
+    for node in case["nodes"]:
+        attrs = ";".join(
+            "%s=%s"
+            % (k, ",".join(str(x) for x in v) if isinstance(v, list) else str(v))
+            for k, v in sorted(node["attributes"].items())
+        )
+        lines.append(
+            "  node %s [%s] [%s] {%s}"
+            % (
+                node["op_type"],
+                ",".join(node["inputs"]),
+                ",".join(node["outputs"]),
+                attrs,
+            )
+        )
+    result = case.get("result")
+    if result is not None:
+        lines.append(
+            "  result " + (",".join(result) if isinstance(result, list) else result)
+        )
+    model = case.get("model")
+    if model is not None:
+        for o in model["opset"]:
+            lines.append("  opset %s %d" % (o["domain"], o["version"]))
+        lines.append("  ir_version %d" % model["ir_version"])
+        lines.append("  graph_name %s" % model["graph_name"])
+        for i in model["inputs"]:
+            lines.append(
+                "  input %s %d [%s]"
+                % (i["name"], i["elem_type"], ",".join(str(d) for d in i["dims"]))
+            )
+        for o in model["outputs"]:
+            lines.append(
+                "  output %s %d [%s]"
+                % (o["name"], o["elem_type"], ",".join(str(d) for d in o["dims"]))
+            )
+        for k in sorted(model["state"]):
+            lines.append("  state %s %s" % (k, model["state"][k]))
+        lines.append("  loss %s" % (model["loss_name"] or ""))
+    return lines
+
+
+def render(fixtures: Dict[str, Any]) -> str:
+    """The whole fixture as text -- the exact bytes both sides compare."""
+    lines = [
+        "# onnxsim QAT step-graph emitter parity fixture, format v1",
+        "# Generated by scripts/make_qat_parity_fixtures.py -- do not edit by hand.",
+        "# Asserted against onnxsim/qat_graph.py (tests/test_qat_parity.py) and",
+        "# against onnxsim/qat_graph_builder.cpp (onnxsim/qat_graph_parity_test.cpp).",
+        "ops " + ",".join(fixtures["ep_friendly_ops"]),
+    ]
+    for name in sorted(fixtures["cases"]):
+        lines.extend(_render_case(name, fixtures["cases"][name]))
+    return "\n".join(lines) + "\n"
+
+
 def build() -> Dict[str, Any]:
     """Every case, plus the operator allowlist both emitters must agree on.
 
@@ -323,8 +421,7 @@ def build() -> Dict[str, Any]:
 def main() -> None:
     fixtures = build()
     with open(FIXTURE_PATH, "w") as f:
-        json.dump(fixtures, f, indent=2, sort_keys=True)
-        f.write("\n")
+        f.write(render(fixtures))
     total = sum(len(c.get("nodes", [])) for c in fixtures["cases"].values())
     print(
         f"wrote {os.path.relpath(FIXTURE_PATH)}: "
