@@ -42,6 +42,7 @@ CLAUDE.md's convention for this repo's tests.
 
 import collections
 import contextlib
+import importlib.util
 
 import numpy as np
 import onnx
@@ -53,9 +54,16 @@ import onnxsim
 
 OP_TYPE = "MMCVMultiScaleDeformableAttention"
 
+# Only onnxruntime validates GridSample's `mode` against the opset the model
+# imports (the onnx reference evaluator accepts just the opset-20 spelling
+# whatever the opset), so it is what the pre-opset-20 spelling test below
+# checks the emitted graph against -- when it is installed.
+_HAS_ORT = importlib.util.find_spec("onnxruntime") is not None
+
 # A single reusable GridSample model/evaluator (mode="linear",
 # padding_mode="zeros", align_corners=0 -- exactly what the rewrite itself
-# emits per level, and exactly mmcv's own
+# emits per level on an opset-20 graph, "bilinear" being the same mode's name
+# on a pre-20 one, and exactly mmcv's own
 # ``F.grid_sample(..., mode='bilinear', padding_mode='zeros',
 # align_corners=False)`` call) used as the bilinear-sampling primitive for
 # the NumPy reference below, instead of a second hand-rolled implementation.
@@ -463,3 +471,64 @@ def test_declines_unknown_num_levels():
         op_types = collections.Counter(n.op_type for n in sim_model.graph.node)
         assert OP_TYPE in op_types, op_types
         assert "GridSample" not in op_types, op_types
+
+
+# --------------------------------------------------------------------------- #
+# GridSample's `mode` attribute follows the graph's opset. GridSample-20
+# renamed "bilinear" -> "linear" (and "bicubic" -> "cubic") without changing
+# what either computes, but runtimes validate the attribute against the opset
+# the model actually imports: onnxruntime rejects "linear" on a GridSample-16
+# node ('mode "linear" not supported, expect bilinear, nearest or bicubic')
+# just as it rejects "bilinear" on a GridSample-20 one. This pass accepts any
+# opset >= 16, so it must emit the spelling that opset uses.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "opset,expected_mode", [(16, "bilinear"), (19, "bilinear"), (20, "linear")]
+)
+def test_gridsample_mode_spelling_follows_opset(opset, expected_mode):
+    rng = np.random.RandomState(7)
+    spatial_shapes = [(6, 6), (3, 4)]
+    bs, M, D, P = 1, 2, 4, 3
+    num_keys = sum(h * w for h, w in spatial_shapes)
+    num_queries = 4
+
+    with _msda_schema(""):
+        model = _model(bs, num_keys, num_queries, M, D, spatial_shapes, P, opset=opset)
+        value, ss, lsi, loc, attn = _rand_inputs(
+            rng, bs, num_keys, num_queries, M, D, spatial_shapes, P
+        )
+        feeds = {
+            "value": value,
+            "spatial_shapes": ss,
+            "level_start_index": lsi,
+            "sampling_locations": loc,
+            "attention_weights": attn,
+        }
+        sim_model, _ = onnxsim.simplify(
+            model, extra_optimizers=["rewrite_msdeformattn_to_gridsample"]
+        )
+
+    op_types = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert OP_TYPE not in op_types, op_types
+    gs_nodes = [n for n in sim_model.graph.node if n.op_type == "GridSample"]
+    assert len(gs_nodes) == len(spatial_shapes), op_types
+    modes = {
+        attr.s.decode() for n in gs_nodes for attr in n.attribute if attr.name == "mode"
+    }
+    assert modes == {expected_mode}
+
+    if not _HAS_ORT:
+        return
+    # The spelling only matters because a runtime enforces it -- so actually
+    # load and run the rewritten graph under onnxruntime, which is what would
+    # reject the other spelling at this opset.
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(
+        sim_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    actual = sess.run(None, feeds)[0]
+    expected = multi_scale_deformable_attn_reference(value, ss, loc, attn)
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)

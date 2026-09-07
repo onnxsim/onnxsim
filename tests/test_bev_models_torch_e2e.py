@@ -115,13 +115,15 @@ def _export_and_simplify(model, inputs, input_names, output_names):
             model,
             inputs,
             buf,
-            # >= 20, not just the >= 16 rewrite_msdeformattn_to_gridsample.h's
-            # header comment asks for: that pass hardcodes GridSample's
-            # mode="linear" (opset 20's renamed enum value), which is not a
-            # legal value under GridSample-16's schema (needs "bilinear")
-            # even though the pass's own predicate only checks opset >= 16 --
-            # discovered empirically running this file against onnxruntime,
-            # not from the header comment alone.
+            # 20 (not just the >= 16 rewrite_msdeformattn_to_gridsample.h's
+            # header comment asks for) simply because it is the current opset
+            # for the ops these models use. The pass emits GridSample's `mode`
+            # in the spelling the graph's opset expects -- "linear" from opset
+            # 20 on, "bilinear" (the same mode's pre-20 name, and the only one
+            # GridSample-16's schema accepts) below it -- so a 16..19 export
+            # loads in onnxruntime just as well; that spelling is covered
+            # directly by tests/test_msdeformattn_to_gridsample.py's
+            # test_gridsample_mode_spelling_follows_opset.
             opset_version=20,
             dynamo=False,
             input_names=input_names,
