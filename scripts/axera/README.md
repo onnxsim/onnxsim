@@ -3290,6 +3290,199 @@ Tests: `test_full_rule_explains_almost_every_stream_byte` and
 ONNX-path Mistral, no device); the `llm_build` layer's coverage is asserted
 by its own test.
 
+### A lossless codec: taking a model apart and putting it back together
+
+Reading mcode and *writing* it are different problems, and the coverage
+number above answers only the first. This is the first half of the second:
+`_decode_mcode()` turns a stream into structured records -- verb, field,
+bank and operand; prefix, payload, tag, register; the companion write's
+address and value -- and `_encode_mcode()` writes those records back out.
+The encoder reads nothing from the original blob, so a byte-exact round trip
+proves the decode captures every bit the forms carry, which is the first
+thing a generator needs.
+
+It round-trips exactly on a real `resnet18d` and on the ONNX-path
+transformer, with **over 95% of the bytes coming from recognised forms** and
+the rest riding along as raw escapes. Rebuilding a whole `.axmodel` -- the
+FlatBuffers header and tail copied verbatim, the stream re-encoded -- gives
+back the original file.
+
+**What that does and does not buy.** It means we can rewrite any field of any
+instruction and emit a valid stream, which is what every hand-patch
+experiment in this file has done by hand. It does *not* mean we can compile a
+new model. Splitting `resnet18d`'s parsed bytes by whether a destination ever
+receives more than one value:
+
+| | `resnet18d` | `llama` layer |
+| --- | --- | --- |
+| single-valued destinations (emit by copying) | 25.3% | 18.4% |
+| varying per op (need a rule) | 74.7% | 81.6% |
+| of those, at destinations whose meaning is documented here | 24.6% | 16.0% |
+
+So roughly a quarter of the stream is template, another sixth follows rules
+this file has verified (the Wbt offset, the four dispatch steps, the tile
+arena, the input size, the two synchronisation channels), and the remaining
+half goes to 627 destinations in `resnet18d` alone that we can parse but not
+compute. The largest single unknown is the `a2` verb: 360 distinct operands
+in `resnet18d`, 206 in the `llama` layer, ~6% of the stream.
+
+And the instruction stream is the small half of the problem. In the compiled
+artifacts the weight table is 99% of the file (`mistral` 21.4 MB against a
+27.5 KB mcode; the `llama` LM head 29.1 MB against 122.8 KB), and its layout
+is not decoded -- individual fields inside it have been located and patched,
+but not laid out from scratch.
+
+**What the two biggest unknowns look like from here.** Both were probed
+while the codec landed, and neither is decoded, but both now have shape:
+
+- **The `a2` operand is a packed record, not an address.** Its low nibble is
+  always 2 or 3 (75 and 62 times in the ONNX-path Mistral), the next nibble
+  steps through 0..15, byte 1 is a small counter (0..4), byte 2 is always
+  16-byte aligned (0x40, 0x10, 0x20, 0x00, 0x30), and byte 3 is zero except
+  for a flag-like 0x82/0x86/0x8b/0x92 on a minority. The *first* `a2` of each
+  op program rises with the op index in 69 of 71 programs, as does that
+  program's Wbt offset, so it carries something ordered per op. Programs
+  carry one to three of them (39, 27 and 2 of 77 in Mistral), never with all
+  operands equal.
+- **The weight table opens with a scale block.** The `llm_build` layer's
+  3,963,652-byte table starts with exactly 1,024 float32 words of 0.125
+  (4,096 bytes) followed by 768 zero words; only 2.9% of the whole table is
+  zero and its byte histogram peaks hard at 0x88/0x78/0x87/0x77, which is
+  what packed sub-byte values around mid-scale look like. The ONNX-path
+  Mistral's 21 MB table has no such prologue and is 0.4% zeros.
+
+**A refinement to "`40 02` is the Wbt offset."** That holds on the CNN and
+ONNX paths -- all 77 of Mistral's offsets land inside its table. It does
+*not* hold literally for `llm_build` layers: 22 of the decode subgraph's 147
+offsets and 12 of the prefill subgraph's 169 point past the end of the table
+they share, clustering around 2.9x its size. So on that path the operand
+addresses a device space that holds the weight table *and* other buffers --
+the KV caches are graph inputs there -- rather than a file offset. The
+hand-patch experiments that established the field remain valid; what changes
+is that a generator cannot compute it from the table alone.
+
+Test: `test_decode_encode_round_trip_is_byte_exact` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device).
+
+### A third model family: text-to-speech, and what it did not change
+
+The decoding corpus was two CNNs and two transformers. A vocoder is a third
+shape entirely -- transposed-convolution upsampling, dilated 1-D residual
+convolutions, LeakyReLU, a bounded output -- and it is what text-to-speech
+actually runs on this class of hardware.
+
+**A full TTS graph does not compile, and that is expected.** A Piper voice
+(VITS, 63 MB, 2,755 nodes) carries `RandomNormalLike`, `NonZero`, `CumSum`,
+`Range` and `Shape`: stochastic sampling and data-dependent shapes, none of
+which an NPU compiler takes. Real deployments split the model, keeping the
+text encoder, duration prediction and sampling on the CPU and sending only
+the vocoder to the device. `_vocoder_model()` in the test file is that part,
+built small and static.
+
+**It compiles, and it taught us nothing new about the instruction set --
+which is the result.** The vocoder builds cleanly (`ConvTranspose`,
+`LeakyRelu`, `Tanh`, dilated `Conv`, `max_cycle` 55,183), its stream is
+96.8% explained by the existing rule, and it introduces **zero** verbs, tags
+or registers that the CNN and transformer builds had not already used. Its
+op programs are the same skeleton: `40.02 | 50.01 | 50.01 | [30.03] | a8
+40.03 | 50.03 | 50.01 | a3 | 50.01 | a9 | [a2] | [a1 20.02] | a8 30.02`.
+
+So op type is not encoded by choosing different instructions. Convolution,
+transposed convolution, matrix multiplication and elementwise activation all
+issue the same program shape, and what distinguishes them lives in the
+operand values -- which is exactly where a generator's remaining work is.
+
+**A caution about differencing.** Changing a shape parameter re-lays-out the
+whole stream: stride 8 to 4 moved 45 destinations, channel count 128 to 96
+moved 238, and input length 32 to 64 moved 286 of roughly 1,400. Attribution
+by differencing therefore needs experiments that hold every shape fixed --
+changing only `LeakyRelu`'s alpha still moved 2,171 bytes across 1,649 writes
+to tag 0x81 alone, so even that is not surgical. Single-register attribution
+will need a sharper instrument than model diffing.
+
+Test: `test_tts_vocoder_uses_no_new_instruction_forms` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device).
+
+### Real weights, real speech: the Piper vocoder on the NPU
+
+The synthetic vocoder above answered a question about the instruction set,
+but it had random weights, so its output was noise. The next question is
+whether this NPU can produce *audible* speech, and that needs a trained
+model. It can, and it does.
+
+**Extract the decoder rather than rebuild it.** Hand-building a HiFi-GAN
+shape and loading weights into it means guessing dilations, paddings and
+upsample rates, and a single mismatch turns speech into noise with no error
+message. Lifting the subgraph out of the voice with `onnx.utils.extract_
+model` avoids all of it. The boundary is found by weight name -- whichever
+tensor `dec.conv_pre.weight`'s convolution reads -- because the intermediate
+tensor names are export artefacts and differ between voices.
+
+What comes out of `en_US-lessac-low` is 68 nodes and 47 initializers, and
+nothing else: `Conv` (20), `Add` (24), `LeakyRelu` (16), `ConvTranspose`
+(3), `Div` (3), `Tanh`, `Unsqueeze`. Every one of those is supported. The
+architecture:
+
+| Stage | Shape |
+| --- | --- |
+| latent in | 192 channels |
+| `conv_pre` | 192 to 256, kernel 7 |
+| `ups.0` / `ups.1` / `ups.2` | kernel 16 stride 8, kernel 16 stride 8, kernel 8 stride 4 |
+| channels after each stage | 128, 64, 32 |
+| residual blocks | six, kernels 3/5/7, dilations 1 and 2, 2 and 6, 3 and 12 |
+| `conv_post` | 32 to 1, kernel 7, then `Tanh` |
+
+The three upsampling strides multiply to 256, which is exactly the measured
+ratio of output samples to latent frames at a 16 kHz sample rate.
+
+**The subgraph is the voice.** Frozen to a fixed 64-frame input and fed the
+latent captured from a real utterance, it reproduces the untouched model's
+own waveform at a correlation of 0.99999998. The remaining difference comes
+only from zero-padding the latent out to the compiled length, which is what
+the full graph's own length mask does anyway.
+
+**Quantisation does not destroy it.** Calibrated on real latents drawn from
+the model's own encoder, Pulsar2's end-to-end precision report gives a
+cosine similarity of 0.9943 at the output for a 64-frame build and 0.9909
+for a 256-frame one. On the device:
+
+| Build | Latent frames | Audio | NPU vs CPU correlation |
+| --- | --- | --- | --- |
+| `out_dec` | 64 | 0.94 s | 0.9956 |
+| `out_dec256` | 256 | 2.11 s | 0.9924 |
+
+The 256-frame model compiles to `max_cycle` 12,792,136 and runs in 13.4 ms,
+which is about 300 times faster than the 4.1 seconds of audio it emits.
+
+**This settles an open question, and the contrast is the interesting part.**
+Plain INT8 quantisation collapsed a 30-layer transformer to near-random
+output, so whether a deep convolutional stack would survive was genuinely
+open. It does. The plausible reason is structural: the vocoder is 20
+convolutions deep with additive residual paths and a `Tanh` bounding every
+output sample, where a transformer accumulates attention error across layers
+with nothing bounding it. Depth alone does not predict quantisation
+survival; what the depth is made of does.
+
+**And the mcode confirms the generalisation.** A trained model in a new
+domain, whose weights the decoder had never seen, introduces no new
+instruction forms at all. Both builds use exactly the six known verbs
+(`a1`, `a2`, `a3`, `a7`, `a8`, `a9`) and no tag outside `0x81`-`0x9f` plus
+`0xa1` and the bit-6 odd-register forms, and the codec round-trips both
+byte-exactly. Coverage is 96.47% at 64 frames and 97.29% at 256, in line
+with the transformer builds rather than the CNNs.
+
+One detail worth recording: the 64-frame build uses the odd-register tags
+`0xc1` and `0xe1`, and the 256-frame build uses `0xe1` but not `0xc1`. The
+odd-register forms are therefore optional per build, not a fixed part of
+every stream -- the same model at a different input length simply does not
+need one of them.
+
+Tests: `test_piper_decoder_subgraph_reproduces_the_whole_voice` (CPU only),
+`test_real_piper_decoder_uses_no_new_instruction_forms` (Docker) and
+`test_real_piper_decoder_makes_speech_on_device` (Docker and device) in
+`tests/test_axera_mcode_structure.py`. All three skip unless the voice is in
+the local HuggingFace cache, so the suite stays offline.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
