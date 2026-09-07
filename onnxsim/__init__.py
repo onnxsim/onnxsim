@@ -254,6 +254,7 @@ from onnxsim.qwen3_5_reconstruct import (
 )
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
+from onnxsim.sherry import apply_sherry_quantization, quantize_dequantize_sherry
 from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
@@ -456,6 +457,8 @@ __all__ = [
     "apply_gguf_ternary_quantization",
     "apply_gguf_ternary_quantization_cpp",
     "quantize_dequantize_ternary",
+    "apply_sherry_quantization",
+    "quantize_dequantize_sherry",
     "apply_fp6_llm_quantization_cpp",
     "apply_iq4_nl_quantization",
     "apply_iq4_nl_quantization_cpp",
