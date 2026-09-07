@@ -91,6 +91,7 @@ each element rounds to is optimized, the same restriction
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -98,8 +99,14 @@ import numpy as np
 import onnx
 import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _GAMMA, _ZETA, _h_and_dhdv, _node_outputs
+from onnxsim import backend, qat_graph
+from onnxsim.adaround import (
+    _GAMMA,
+    _ZETA,
+    _h_and_dhdv,
+    _init_relaxation,
+    _node_outputs,
+)
 from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
@@ -211,6 +218,51 @@ def _find_static_qdq_candidates(
     return candidates
 
 
+def _init_adaquant(
+    w_nk: np.ndarray, scale_n: np.ndarray, x_scale0: float, x_zp0: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """This layer's joint optimization problem, at its starting point:
+    ``(scale_nk, v, floor_base, log_s, zp)``.
+
+    Factored out for the same reason
+    :func:`onnxsim.adaround._init_relaxation` is, and it reuses that function
+    for the weight half: the numpy loop and the step-graph loop have to
+    optimize *the same problem from the same warm start*, and the only way to
+    keep that true as either one changes is for there to be a single copy of
+    it. Everything downstream (both optimizers, and
+    :func:`_adaquant_results`) is a pure function of what this returns.
+
+    The activation scale is carried in log space -- so a gradient step can
+    never drive it to zero or negative, which would make the quantizer
+    undefined -- and the ``max(..., 1e-8)`` floor guards the degenerate
+    calibrated scale of exactly 0 (a constant activation) that ``log`` would
+    otherwise turn into ``-inf``. The zero-point starts at the calibrated
+    one, clamped into uint8's range but *not* rounded: keeping it continuous
+    throughout is what lets a gradient reach it at all.
+    """
+    scale_nk = np.repeat(scale_n[:, None], w_nk.shape[1], axis=1)
+    v, floor_base = _init_relaxation(w_nk, scale_nk)
+    log_s = float(np.log(max(x_scale0, 1e-8)))
+    zp = float(np.clip(x_zp0, 0.0, _ACT_N_MAX))
+    return scale_nk, v, floor_base, log_s, zp
+
+
+def _adaquant_results(
+    v: np.ndarray, floor_base: np.ndarray, log_s: float, zp: float
+) -> Tuple[np.ndarray, float, int]:
+    """The deployable values the three optimized parameter groups have
+    settled on -- the last lines of both optimization paths.
+
+    This is where the continuous relaxations become the integers the model
+    actually stores: each element's rounding relaxation collapses to its
+    nearest hard floor/ceil choice, and the zero-point is projected back onto
+    uint8's grid.
+    """
+    h_final, _ = _h_and_dhdv(v)
+    codes_nk = np.clip(floor_base + np.round(h_final), _WEIGHT_N_MIN, _WEIGHT_N_MAX)
+    return codes_nk, float(np.exp(log_s)), int(np.clip(round(zp), 0, 255))
+
+
 def _optimize_adaquant(
     w_nk: np.ndarray,
     scale_n: np.ndarray,
@@ -239,17 +291,8 @@ def _optimize_adaquant(
     zero-point (rounded to the nearest integer in ``[0, 255]``, uint8's
     range).
     """
-    n, k = w_nk.shape
-    scale_nk = np.repeat(scale_n[:, None], k, axis=1)
-
-    ratio = w_nk / scale_nk
-    floor_base = np.floor(ratio)
-    frac = np.clip(ratio - floor_base, 1e-4, 1.0 - 1e-4)
-    sig0 = np.clip((frac - _GAMMA) / (_ZETA - _GAMMA), 1e-4, 1.0 - 1e-4)
-    v = np.log(sig0 / (1.0 - sig0))
-
-    log_s = float(np.log(max(x_scale0, 1e-8)))
-    zp = float(np.clip(x_zp0, 0.0, _ACT_N_MAX))
+    n = w_nk.shape[0]
+    scale_nk, v, floor_base, log_s, zp = _init_adaquant(w_nk, scale_n, x_scale0, x_zp0)
 
     m_v, v2_v = np.zeros_like(v), np.zeros_like(v)
     m_s = v2_s = m_zp = v2_zp = 0.0
@@ -323,11 +366,241 @@ def _optimize_adaquant(
         )
         zp = float(np.clip(zp, 0.0, _ACT_N_MAX))
 
-    h_final, _ = _h_and_dhdv(v)
-    codes_nk = np.clip(floor_base + np.round(h_final), _WEIGHT_N_MIN, _WEIGHT_N_MAX)
-    x_scale = float(np.exp(log_s))
-    x_zero_point = int(np.clip(round(zp), 0, 255))
-    return codes_nk, x_scale, x_zero_point
+    return _adaquant_results(v, floor_base, log_s, zp)
+
+
+def _sum_all(b: qat_graph.GraphBuilder, tensor: str) -> str:
+    """``sum(tensor)`` over every axis, as a scalar.
+
+    A one-line wrapper so the gradient expressions below read as the
+    summations they are; ``ReduceSum`` is in
+    :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`, so no rewriting is needed to
+    keep the graph runnable on an accelerator backend.
+    """
+    return b.op("ReduceSum", [tensor], keepdims=0)
+
+
+def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepGraph:
+    """One Adam step of :func:`_optimize_adaquant`, as an ONNX graph.
+
+    Node for node the same computation the numpy loop performs -- the same
+    rectified-sigmoid weight relaxation, the same step-by-step straight-
+    through quantize-dequantize of the activation, the same annealed
+    regularizer, the same Adam -- expressed so it can run on an execution
+    provider instead of on the host. See :mod:`onnxsim.qat_graph` for why a
+    hand-derived gradient can be written as an inference graph at all, and
+    ``docs/qat.md`` for what it is for.
+
+    The one structural difference from
+    :func:`onnxsim.adaround._build_rounding_step_graph` is what the step
+    updates: AdaQuant optimizes three parameter groups jointly, so there are
+    three :func:`onnxsim.qat_graph.adam_update` calls (it is a per-tensor
+    update) and nine state tensors -- the per-element relaxation ``v`` plus
+    the two rank-0 activation parameters, each with its own pair of Adam
+    moments. They share one learning rate each (``w_lr`` for the weight
+    relaxation, ``a_lr`` for both activation parameters, matching the numpy
+    loop's two rates) and one pair of bias corrections, since every group
+    takes its first step on the same iteration.
+
+    Critically, the quantize-then-dequantize chain is emitted as the four
+    separate stages the gradient is derived through (divide, round, offset,
+    clip) rather than as a ``QuantizeLinear``/``DequantizeLinear`` pair: the
+    scale's gradient lives entirely in the *difference* between ``x / s`` and
+    its rounded value, so a formulation that hid the rounding inside one op
+    would have nothing to differentiate. This module's own docstring explains
+    the same point for the numpy loop.
+
+    Shapes are baked in at build time (``x`` is ``[num_rows, k]``, the weight
+    ``[n, k]``): the accelerator backends this exists for -- WebNN and the NPU
+    execution providers -- compile a graph once and want static shapes, and a
+    step graph is rebuilt per layer anyway.
+    """
+    b = qat_graph.GraphBuilder()
+
+    x, y_float, floor_base, scale = "x", "y_float", "floor_base", "scale"
+    v, m_v, vv_v = "v", "m_v", "vv_v"
+    log_s, m_s, vv_s = "log_s", "m_s", "vv_s"
+    zp, m_zp, vv_zp = "zp", "m_zp", "vv_zp"
+
+    s_x = b.op("Exp", [log_s])
+
+    # h(v), the rectified sigmoid, and its derivative -- _h_and_dhdv's own two
+    # lines, with the "is this element still inside the clip" test as a float
+    # 0/1 mask rather than a Where.
+    s = b.sigmoid(v)
+    raw = b.add(b.mul(s, b.const(_ZETA - _GAMMA)), b.const(_GAMMA))
+    h = b.clip(raw, 0.0, 1.0)
+    active = b.mul(b.greater_mask(raw, 0.0), b.less_mask(raw, 1.0))
+    ds = b.mul(s, b.sub(b.const(1.0), s))
+    dh_dv = b.mul(active, b.mul(ds, b.const(_ZETA - _GAMMA)))
+
+    # The soft weight this relaxation currently implies.
+    raw_w = b.add(floor_base, h)
+    w_hat = b.mul(b.clip(raw_w, _WEIGHT_N_MIN, _WEIGHT_N_MAX), scale)
+    active_w = b.mul(
+        b.greater_mask(raw_w, _WEIGHT_N_MIN), b.less_mask(raw_w, _WEIGHT_N_MAX)
+    )
+
+    # Straight-through quantize-dequantize of the activation, stage by stage.
+    x_over_s = b.div(x, s_x)
+    xq_raw = b.add(b.round_to_nearest(x_over_s), zp)
+    active_x = b.mul(b.greater_mask(xq_raw, 0.0), b.less_mask(xq_raw, _ACT_N_MAX))
+    xq_minus_zp = b.sub(b.clip(xq_raw, 0.0, _ACT_N_MAX), zp)
+    xdq = b.mul(xq_minus_zp, s_x)
+
+    # The layer's reconstruction error against the float model's own output,
+    # and the loss gradient every parameter group's gradient flows out of.
+    y_hat = b.matmul(xdq, b.transpose(w_hat))  # [num_rows, n]
+    diff = b.sub(y_hat, y_float)
+    dl_dy = b.mul(diff, b.const(2.0 / (num_rows * n)))
+
+    dl_dw_hat = b.matmul(b.transpose(dl_dy), xdq)  # [n, k]
+    dl_dh = b.mul(dl_dw_hat, b.mul(active_w, scale))
+    grad_v = b.mul(dl_dh, dh_dv)
+
+    # The rounding regularizer, pulling each relaxation toward a hard 0/1.
+    # `reg_scale` is the caller's reg_param, or 0 during the warm start -- a
+    # scalar fed per step, so the warm start needs no second graph.
+    u = b.sub(b.mul(b.const(2.0), h), b.const(1.0))
+    sign_u = b.op("Sign", [u])
+    pow_u = b.op("Pow", [b.op("Abs", [u]), b.sub("beta", b.const(1.0))])
+    dreg_dh = b.mul(
+        b.mul(b.mul(b.const(-2.0), "reg_scale"), "beta"), b.mul(sign_u, pow_u)
+    )
+    grad_v = b.add(grad_v, b.mul(dreg_dh, dh_dv))
+
+    # The activation branch: the same loss gradient, pushed back through the
+    # dequantize (a pass-through scaled by s), the clip (1 inside, 0 outside)
+    # and the round (1, by the straight-through estimator).
+    dl_dxdq = b.matmul(dl_dy, w_hat)  # [num_rows, k]
+    dxdq_ds = b.sub(xq_minus_zp, b.mul(active_x, x_over_s))
+    dxdq_dzp = b.mul(s_x, b.sub(active_x, b.const(1.0)))
+    # d/d(log s) = d/ds * s, the chain rule for the log-space parametrization.
+    grad_log_s = b.mul(_sum_all(b, b.mul(dl_dxdq, dxdq_ds)), s_x)
+    grad_zp = _sum_all(b, b.mul(dl_dxdq, dxdq_dzp))
+
+    v_next, m_v_next, vv_v_next = qat_graph.adam_update(
+        b, v, grad_v, m_v, vv_v, "w_lr", "m_correction", "v_correction"
+    )
+    log_s_next, m_s_next, vv_s_next = qat_graph.adam_update(
+        b, log_s, grad_log_s, m_s, vv_s, "a_lr", "m_correction", "v_correction"
+    )
+    zp_stepped, m_zp_next, vv_zp_next = qat_graph.adam_update(
+        b, zp, grad_zp, m_zp, vv_zp, "a_lr", "m_correction", "v_correction"
+    )
+    # The zero-point is re-clamped into uint8's range every step, not just at
+    # the end: the forward pass's own clip is what the whole activation
+    # gradient is derived through, so a zero-point that wandered outside the
+    # representable range would saturate every element and silently kill it.
+    zp_next = b.clip(zp_stepped, 0.0, _ACT_N_MAX)
+
+    return qat_graph.make_step_graph(
+        b,
+        constants={
+            x: [num_rows, k],
+            y_float: [num_rows, n],
+            floor_base: [n, k],
+            scale: [n, k],
+        },
+        state={
+            v: ([n, k], v_next),
+            m_v: ([n, k], m_v_next),
+            vv_v: ([n, k], vv_v_next),
+            log_s: ([], log_s_next),
+            m_s: ([], m_s_next),
+            vv_s: ([], vv_s_next),
+            zp: ([], zp_next),
+            m_zp: ([], m_zp_next),
+            vv_zp: ([], vv_zp_next),
+        },
+        scalars=["w_lr", "a_lr", "reg_scale", "beta", "m_correction", "v_correction"],
+        loss=b.mean_square(diff),
+        name="onnxsim_adaquant_step",
+    )
+
+
+def _optimize_adaquant_on_graph(
+    w_nk: np.ndarray,
+    scale_n: np.ndarray,
+    x: np.ndarray,
+    x_scale0: float,
+    x_zp0: float,
+    num_iterations: int,
+    weight_learning_rate: float,
+    activation_learning_rate: float,
+    reg_param: float,
+    warm_start: float,
+    beta_range: Tuple[float, float],
+    providers: Optional[Sequence[str]],
+) -> Tuple[np.ndarray, float, int]:
+    """:func:`_optimize_adaquant`, run through :mod:`onnxsim.qat_graph`
+    instead of in host numpy, on ``providers``.
+
+    Same optimization, up to the float32 the step graph computes in (the numpy
+    loop uses float64, which is not something a GPU/NPU execution provider
+    offers). The activation branch is where that shows most: an element whose
+    ``x / scale`` sits within a float32 ulp of a .5 boundary can round to a
+    different integer in the two paths, which perturbs the scale and
+    zero-point gradients slightly -- so the two agree closely, not exactly.
+    """
+    scale_nk, v0, floor_base, log_s0, zp0 = _init_adaquant(
+        w_nk, scale_n, x_scale0, x_zp0
+    )
+    step = _build_adaquant_step_graph(x.shape[0], w_nk.shape[0], w_nk.shape[1])
+
+    warm_start_iters = int(num_iterations * warm_start)
+    beta_start, beta_end = beta_range
+
+    def scalars(t: int) -> Dict[str, float]:
+        values = {
+            "w_lr": weight_learning_rate,
+            "a_lr": activation_learning_rate,
+        }
+        if t >= warm_start_iters:
+            progress = (t - warm_start_iters) / max(
+                1, num_iterations - warm_start_iters - 1
+            )
+            values["reg_scale"] = reg_param
+            values["beta"] = beta_start + (beta_end - beta_start) * progress
+        else:
+            # The regularizer is switched off by its own weight rather than by
+            # a second graph. `beta` still needs a value Pow can evaluate --
+            # 1.0 makes the (zero-weighted) term |u|^0, finite everywhere.
+            values["reg_scale"] = 0.0
+            values["beta"] = 1.0
+        values.update(qat_graph.adam_bias_corrections(t))
+        return values
+
+    zero = np.zeros((), dtype=np.float64)
+    final = qat_graph.run_step_graph(
+        step,
+        constants={
+            "x": x,
+            "y_float": x @ w_nk.T,
+            "floor_base": floor_base,
+            "scale": scale_nk,
+        },
+        state={
+            "v": v0,
+            "m_v": np.zeros_like(v0),
+            "vv_v": np.zeros_like(v0),
+            "log_s": np.asarray(log_s0, dtype=np.float64),
+            "m_s": zero,
+            "vv_s": zero,
+            "zp": np.asarray(zp0, dtype=np.float64),
+            "m_zp": zero,
+            "vv_zp": zero,
+        },
+        num_steps=num_iterations,
+        scalars=scalars,
+        providers=providers,
+    )
+    return _adaquant_results(
+        final["v"].astype(np.float64),
+        floor_base,
+        float(final["log_s"]),
+        float(final["zp"]),
+    )
 
 
 def apply_adaquant(
@@ -343,6 +616,7 @@ def apply_adaquant(
     warm_start: float = 0.2,
     beta_range: Tuple[float, float] = (20.0, 2.0),
     providers: Optional[Sequence[str]] = None,
+    step_providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Optimizes AdaQuant-style joint weight-rounding + activation-clip-range
     calibration for every :func:`onnxsim.quantize_static`-quantized
@@ -390,6 +664,14 @@ def apply_adaquant(
             iterations after ``warm_start``
     :param providers: onnxruntime execution providers to run ``float_model``
             on when capturing calibration activations
+    :param step_providers: onnxruntime execution providers to run the *Adam
+            optimization itself* on, as an ONNX step graph
+            (:mod:`onnxsim.qat_graph`) rather than in host numpy -- the way to
+            reach a GPU, an NPU execution provider, or (in the WASM build)
+            WebGPU with this loop. ``None``, the default, keeps the in-process
+            float64 numpy loop, which is exact and deterministic; a step graph
+            computes in float32, so its result agrees closely rather than
+            bit-exactly. See ``docs/qat.md``.
     :returns: ``quantized_model`` with every matched layer's weight INT8
             codes and activation (scale, zero_point) initializers rewritten
             to their jointly-optimized values (same shapes/dtypes -- the
@@ -452,7 +734,14 @@ def apply_adaquant(
         x_scale0 = float(onnx.numpy_helper.to_array(x_scale_init).reshape(-1)[0])
         x_zp0 = float(onnx.numpy_helper.to_array(x_zp_init).reshape(-1)[0])
 
-        codes_nk, x_scale, x_zp = _optimize_adaquant(
+        optimize = (
+            _optimize_adaquant
+            if step_providers is None
+            else functools.partial(
+                _optimize_adaquant_on_graph, providers=step_providers
+            )
+        )
+        codes_nk, x_scale, x_zp = optimize(
             w_nk,
             scale_n,
             x,

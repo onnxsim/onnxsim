@@ -1,9 +1,10 @@
 # Delivering QAT in onnxsim: a design note
 
-**Status: design note, with its first two stages implemented.**
-`onnxsim/qat_graph.py` and the converter page's calibration-provider picker
-have landed (see "Staging" below); `apply_qat()` itself has not. This note
-answers "how *could* we deliver quantization-aware training as an onnxsim
+**Status: design note, with stages 0-2 implemented.**
+`onnxsim/qat_graph.py`, `onnxsim/graph_grad.py`, `onnxsim/qat.py`
+(`apply_qat`) and the converter page's calibration-provider picker have all
+landed; the browser fine-tuning panel and the QAT-interop paths have not
+(see "Staging" below). This note answers "how *could* we deliver quantization-aware training as an onnxsim
 feature, and can the training math run on WebGPU or an NPU?" and records the
 shape of the work so the question doesn't have to be re-derived. `docs/nncf-comparison-future-work.md`
 currently lists QAT as out of scope ("QAT needs a training loop with a
@@ -132,11 +133,17 @@ So the accelerator story is not a second backend to write; it is the existing
 to build. Three things it does *not* give for free:
 
 - **Readback dominates if ignored.** A naive loop copies every parameter and
-  every Adam moment host↔device per step. Parameters must stay resident:
-  `IOBinding` on the Python side, and on the web side onnxruntime-web's
-  GPU-buffer tensors with `preferredOutputLocation: "gpu-buffer"` (ORT-web
-  ≥1.17; the converter page is on 1.27), feeding each step's outputs straight
-  back in as the next step's inputs. Only the loss comes back to the host.
+  every Adam moment host-to-device per step. Parameters must stay resident.
+  The Python half of this is done: `backend.Runner.bind_loop` uploads the
+  constants once, allocates the state on the session's device and
+  ping-pongs it between two buffers (binding one buffer as both a step's
+  input and its output is unsafe -- onnxruntime may write an output before
+  it has finished reading its inputs), so only scalars go up and only the
+  loss comes down. On CPU that measures as a wash, which is the expected
+  result and not a disappointment: with the CPU provider the "device" is
+  host memory. The web half remains -- onnxruntime-web's GPU-buffer tensors
+  with `preferredOutputLocation: "gpu-buffer"` (ORT-web >=1.17; the
+  converter page is on 1.27).
 - **NPUs are inference silicon, and it shows.** WebNN, QNN, Core ML and the
   Axera path compile a *fixed* graph, prefer fp16/int8, and often reject
   fp32 accumulation or dynamic shapes. Adam in fp16 is not stable. The
@@ -185,13 +192,51 @@ Each stage is independently shippable and independently useful.
    agrees with the numpy loop it replaces (>95% of elements pick the identical
    floor/ceil decision; the rest is float32-vs-float64 boundary rounding, and
    the reconstruction error lands within 10%) and that both step graphs stay
-   inside an operator allowlist the accelerator backends actually implement.
-2. **`qat.py` / `apply_qat()`** (next). Free weights + LSQ/LSQ+ scales + block-wise
-   teacher distillation over `load_huggingface_calibration_data`, a
-   `QuantizationConfig` flag to reach it from `quantize()`, a doc, and tests
-   in the established style (parser-built models, a *measured* improvement
-   over RTN/AdaRound on a scenario engineered to make them differ, scoped as
-   honestly as `brecq.py` scopes its own).
+   inside `qat_graph.EP_FRIENDLY_OPS`, the operator set the accelerator
+   backends actually implement.
+
+   Since then: `adaquant` is ported onto it too, which is the harder case and
+   the evidence the machinery generalizes -- it optimizes three parameter
+   groups at once (rounding relaxation, activation scale, activation
+   zero-point), so the step graph carries nine state tensors and three
+   `adam_update` calls. It tracks its numpy loop tighter than adaround's port
+   does: identical weight codes on five of six seeds, identical integer
+   zero-point on all six. And the state now stays on the device between
+   steps (`backend.Runner.bind_loop`), which is what makes the accelerator
+   path worth taking rather than merely possible.
+2. **`qat.py` / `apply_qat()` -- done**, and it needed one thing this note
+   did not anticipate. Block-wise teacher distillation over an arbitrary
+   topology means differentiating an arbitrary slice of the graph, which no
+   pass here could do: every gradient in the repo is hand-derived for one
+   fixed shape, which is exactly why `brecq.py` is capped at a linear chain.
+   So `graph_grad.py` came first -- `build_backward` walks a forward slice in
+   reverse and emits the gradient as ordinary ONNX nodes, 20 op rules, each
+   checked against central finite differences, its emission pinned to
+   `qat_graph.EP_FRIENDLY_OPS`. It is a rule table and a reverse walk, not an
+   autograd framework: the ONNX graph is already the tape.
+
+   On top of it, `apply_qat` trains the fp32 weights themselves (a
+   straight-through estimator through the fake-quant, so an element can
+   migrate several codes from where round-to-nearest put it -- the
+   restriction every rounding pass here inherits), optionally the per-block
+   scales LSQ-style, against the float block's own output.
+
+   Measured honestly, and not a uniform win: on a two-Linear-plus-`Relu`
+   block, which `brecq` returns byte-identical because it cannot see that
+   topology at all, reconstruction error falls 16.0 -> 6.5. Against
+   `apply_adaround` on a *single* layer, where the objective is identical
+   and only the parametrization differs, freeing the weight wins on
+   low-rank calibration activations (RTN 5.96 / AdaRound 3.07 / QAT 1.78)
+   and **loses** on full-rank ones (28.5 / 14.6 / 22.8) -- a well-determined
+   reconstruction problem has its optimum within one quantization step of
+   round-to-nearest, so floor/ceil is all the freedom worth having there.
+   Both directions are asserted in `tests/test_qat.py`.
+
+   Still open from this stage's original description: real data via
+   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, a
+   sliding window over blocks and a whole-graph pass, minibatching, and
+   activation quantization (adaquant has the learnable activation scale, it
+   is simply not wired in here).
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
@@ -217,10 +262,30 @@ tuned = onnxsim.apply_adaround(
 ```
 
 Omitting `step_providers` keeps the existing float64 numpy loop, which is what
-CI runs: it is exact and reproducible, and a non-CPU provider is neither. In
-the browser, the Quantize panel's **calibration execution provider** picker
-does the equivalent for calibration's own forward passes (WebGPU, or WebNN's
-GPU/NPU device types).
+CI runs: it is exact and reproducible, and a non-CPU provider is neither.
+`apply_adaquant` takes the same argument. In the browser, the Quantize
+panel's **calibration execution provider** picker does the equivalent for
+calibration's own forward passes (WebGPU, or WebNN's GPU/NPU device types).
+
+Block-wise QAT itself, over a block the caller names by its input and output
+tensor:
+
+```python
+tuned = onnxsim.apply_qat(
+    float_model,
+    quantized_model,           # quantize_weight_only_int4's output
+    block_input_name="hidden",
+    block_output_name="block_out",
+    calibration_data=batches,
+    learn_scales=True,         # LSQ per-block scales alongside the weights
+    step_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+There is no numpy alternative there -- the step graph *is* the
+implementation -- so `step_providers=None` simply means CPU. Anything between
+the two named tensors that `graph_grad` can differentiate is fair game; an op
+it cannot is refused up front, before any calibration runs.
 
 To put a *new* algorithm on a step graph: build its gradient with
 `qat_graph.GraphBuilder`, close the loop with `qat_graph.adam_update` and

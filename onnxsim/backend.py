@@ -375,6 +375,101 @@ def run_model(
     return _run_with_reference(model, inputs, output_names, custom_lib, providers)
 
 
+# Which onnxruntime ``OrtValue`` device an execution provider keeps its tensors
+# on, for :meth:`Runner.bind_loop`. The strings are the ones onnxruntime's own
+# ``get_ort_device_type`` accepts; a provider missing from this table is bound
+# on the CPU, which is always *correct* -- onnxruntime then inserts the same
+# host-to-device copy the unbound path pays -- just not always the fastest
+# place. The ROCm/MIGraphX entries reuse the CUDA device enum, which is what
+# onnxruntime's ROCm build itself does; if that guess is ever wrong the
+# allocation raises and :meth:`Runner.bind_loop` degrades to the unbound path,
+# so it cannot produce a wrong answer.
+_PROVIDER_DEVICES: Dict[str, str] = {
+    "CPUExecutionProvider": "cpu",
+    "CUDAExecutionProvider": "cuda",
+    "TensorrtExecutionProvider": "cuda",
+    "ROCMExecutionProvider": "cuda",
+    "MIGraphXExecutionProvider": "cuda",
+    "CANNExecutionProvider": "cann",
+    "DmlExecutionProvider": "dml",
+    "WebGpuExecutionProvider": "webgpu",
+}
+
+# onnxruntime reports an output's type as a string like ``"tensor(float)"``.
+# Only tensor element types with a numpy equivalent can be pre-allocated as a
+# bound output buffer; anything else (a sequence, a map, a type numpy has no
+# dtype for) makes :meth:`Runner.bind_loop` decline.
+_ORT_TYPE_TO_NUMPY: Dict[str, Any] = {
+    "tensor(float)": np.float32,
+    "tensor(double)": np.float64,
+    "tensor(float16)": np.float16,
+    "tensor(int64)": np.int64,
+    "tensor(int32)": np.int32,
+    "tensor(int16)": np.int16,
+    "tensor(int8)": np.int8,
+    "tensor(uint64)": np.uint64,
+    "tensor(uint32)": np.uint32,
+    "tensor(uint16)": np.uint16,
+    "tensor(uint8)": np.uint8,
+    "tensor(bool)": np.bool_,
+}
+
+
+def _binding_device(providers: Optional[Sequence[Provider]]) -> Tuple[str, int]:
+    """The ``(device_type, device_id)`` to allocate bound tensors on for
+    ``providers``.
+
+    The *first* provider decides: onnxruntime tries the list in priority order
+    and only falls back for operators the leading provider cannot run, so its
+    device is where a step graph's tensors want to live. An unrecognized
+    provider, or one whose options do not name a device, gets ``("cpu", 0)`` --
+    see :data:`_PROVIDER_DEVICES` for why that is safe.
+    """
+    if not providers:
+        return "cpu", 0
+    provider = providers[0]
+    device = _PROVIDER_DEVICES.get(_provider_name(provider), "cpu")
+    device_id = 0
+    if isinstance(provider, (tuple, list)) and len(provider) > 1:
+        options = provider[1]
+        if isinstance(options, dict):
+            requested = options.get("device_id", 0)
+            if isinstance(requested, (int, str)):
+                try:
+                    device_id = int(requested)
+                except ValueError:
+                    device_id = 0
+    return device, device_id
+
+
+def _static_output_spec(meta: Any) -> Optional[Tuple[List[int], Any]]:
+    """``(shape, numpy dtype)`` for an onnxruntime output whose buffer can be
+    allocated up front, or ``None`` when it cannot.
+
+    A bound output needs a buffer before the run that fills it, so every
+    dimension has to be a concrete integer -- onnxruntime reports a symbolic or
+    unknown dimension as a string or ``None`` -- and the element type has to be
+    one numpy can hold. Returning ``None`` is not an error: it is how
+    :meth:`Runner.bind_loop` decides that this model is not one it can bind,
+    and the caller keeps using the ordinary feed-per-call path.
+    """
+    ort_type = getattr(meta, "type", None)
+    if not isinstance(ort_type, str):
+        return None
+    dtype = _ORT_TYPE_TO_NUMPY.get(ort_type)
+    if dtype is None:
+        return None
+    shape = getattr(meta, "shape", None)
+    if shape is None:
+        return None
+    dims: List[int] = []
+    for dim in shape:
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim < 0:
+            return None
+        dims.append(dim)
+    return dims, dtype
+
+
 class Runner:
     """A model prepared once and run many times.
 
@@ -451,3 +546,226 @@ class Runner:
         else:
             outputs = cast(List[np.ndarray], self._sess.run(self._output_names, inputs))
         return OrderedDict(zip(self._output_names, outputs))
+
+    def bind_loop(
+        self,
+        constants: Dict[str, np.ndarray],
+        state: Dict[str, Tuple[str, np.ndarray]],
+    ) -> Optional["BoundStepLoop"]:
+        """Prepare a device-resident, state-threading loop over this model, or
+        return ``None`` if this backend cannot provide one.
+
+        :meth:`__call__` re-sends every input on every call, because that is
+        what ``InferenceSession.run`` takes: a fresh ``{name: numpy array}``
+        dict. For an optimization loop that is the wrong shape of API. The
+        constants (calibration activations, a reconstruction target) never
+        change, and the state (the parameter being trained, Adam's moments) is
+        produced by the previous step -- so on a non-CPU provider every step
+        pays a host-to-device copy of *everything*, plus a device-to-host copy
+        back, for tensors that never needed to leave the device. Over a few
+        hundred steps that transfer, not the arithmetic, is the loop.
+
+        ``IOBinding`` is onnxruntime's answer: bind a tensor once, run against
+        the binding. This method uploads the constants once, allocates the
+        state on the session's device, and hands back a
+        :class:`BoundStepLoop` that runs step after step with only the
+        per-step scalars going up and only the explicitly fetched outputs
+        coming down.
+
+        :param constants: inputs whose value is the same on every step. Copied
+                to the device once. The copy is defensive: a caller's array
+                would otherwise stay aliased by the binding for the loop's
+                whole life.
+        :param state: ``{input name: (output name, initial value)}`` -- the
+                inputs each step re-supplies from the previous step's output.
+                The output is required to have the same shape and dtype as the
+                input it feeds; that is the step-graph contract
+                (:func:`onnxsim.qat_graph.make_step_graph` builds exactly this)
+                and it is verified here against the session's own metadata.
+
+        Returns ``None`` -- meaning "run the ordinary way" -- whenever binding
+        cannot be set up: no onnxruntime (the reference evaluator has no
+        binding and no devices), an onnxruntime too old for ``io_binding``, an
+        output whose buffer cannot be pre-allocated (dynamic shape, or a type
+        numpy cannot hold), a shape that contradicts the model, or an
+        allocation the provider refuses. Binding is a pure optimization, so
+        every one of those is a reason to fall back rather than to fail: the
+        caller gets the same numbers either way.
+        """
+        if not _HAS_ONNXRUNTIME or not hasattr(self._sess, "io_binding"):
+            return None
+        # Everything below is best-effort. A broad except is deliberate here:
+        # any failure at all -- an unavailable device string, an allocator that
+        # refuses, an onnxruntime whose binding API differs -- must land the
+        # caller on the unbound path, never on a traceback, because binding
+        # changes nothing about the answer.
+        try:
+            device_type, device_id = _binding_device(self._providers)
+            metadata = {o.name: o for o in self._sess.get_outputs()}
+            state_outputs = {name: out for name, (out, _) in state.items()}
+            produced = set(state_outputs.values())
+            if not produced <= set(metadata):
+                return None
+
+            buffers: Dict[str, List[Any]] = {}
+            for name, (out, value) in state.items():
+                array = np.ascontiguousarray(value)
+                spec = _static_output_spec(metadata[out])
+                if spec is None:
+                    return None
+                shape, dtype = spec
+                if tuple(shape) != array.shape or np.dtype(dtype) != array.dtype:
+                    return None
+                # Two buffers per state tensor, alternated by
+                # :meth:`BoundStepLoop.step` -- see its comment for why one
+                # would not be safe. Both are allocated by onnxruntime rather
+                # than wrapped around the caller's numpy array: on the CPU
+                # ``ortvalue_from_numpy`` aliases the array it is given, so a
+                # single buffer would make the caller's own initial state the
+                # loop's scratch space.
+                pair = [
+                    rt.OrtValue.ortvalue_from_shape_and_type(
+                        list(array.shape), dtype, device_type, device_id
+                    )
+                    for _ in range(2)
+                ]
+                # The one copy of the state the loop pays: the initial value
+                # into the buffer onnxruntime allocated for it.
+                pair[0].update_inplace(array)
+                buffers[name] = pair
+
+            binding = self._sess.io_binding()
+            # onnxruntime requires *every* model output to be bound before
+            # ``run_with_iobinding``, not only the ones this Runner fetches, so
+            # each non-state output gets a host buffer whether the caller reads
+            # it or not.
+            host_outputs: "OrderedDict[str, Any]" = OrderedDict()
+            for name, meta in metadata.items():
+                if name in produced:
+                    continue
+                spec = _static_output_spec(meta)
+                if spec is None:
+                    return None
+                shape, dtype = spec
+                value = rt.OrtValue.ortvalue_from_shape_and_type(shape, dtype, "cpu", 0)
+                host_outputs[name] = value
+                binding.bind_ortvalue_output(name, value)
+
+            # The constants: copied to the device once, bound once, never
+            # touched again. This is the whole point of the exercise.
+            resident: List[Any] = []
+            for name, value in constants.items():
+                array = np.array(value, copy=True, order="C")
+                ort_value = rt.OrtValue.ortvalue_from_numpy(
+                    array, device_type, device_id
+                )
+                resident.append(ort_value)
+                binding.bind_ortvalue_input(name, ort_value)
+
+            return BoundStepLoop(
+                self._sess,
+                self._run_options,
+                binding,
+                device_type,
+                buffers,
+                state_outputs,
+                host_outputs,
+                resident,
+            )
+        except Exception:
+            return None
+
+
+class BoundStepLoop:
+    """One step of a state-threading loop, run against onnxruntime tensors that
+    stay where the execution provider put them.
+
+    Created by :meth:`Runner.bind_loop`, never directly. The loop it serves is
+    the one :func:`onnxsim.qat_graph.run_step_graph` runs: a pure
+    ``(constants, state, per-step scalars) -> (next state, loss)`` function
+    applied over and over, each step's state outputs becoming the next step's
+    state inputs. Expressed through ``InferenceSession.run`` that costs a full
+    round trip of the state per step; expressed through ``IOBinding`` the state
+    never leaves the device at all, and what crosses the bus is a handful of
+    scalars up and (only if the caller asked for it) a scalar loss down.
+
+    The buffers are owned here and reused, so an instance is single-threaded
+    and stateful by construction: :meth:`step` advances it, :meth:`state` reads
+    where it got to.
+    """
+
+    def __init__(
+        self,
+        sess: Any,
+        run_options: Any,
+        binding: Any,
+        device_type: str,
+        buffers: Dict[str, List[Any]],
+        state_outputs: Dict[str, str],
+        host_outputs: "OrderedDict[str, Any]",
+        resident: List[Any],
+    ) -> None:
+        self._sess = sess
+        self._run_options = run_options
+        self._binding = binding
+        self._device_type = device_type
+        self._buffers = buffers
+        self._state_outputs = state_outputs
+        self._host_outputs = host_outputs
+        # Held only to keep the constants' device memory (and, on the CPU, the
+        # numpy arrays onnxruntime's OrtValues alias rather than copy) alive
+        # for as long as the binding refers to it.
+        self._resident = resident
+        self._slot = 0
+
+    def step(self, scalars: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """Run one step and return the host-side outputs.
+
+        ``scalars`` are the only inputs that go up per step: they are bound
+        from host memory each time (they are rank-0, so the transfer is
+        nothing), while the constants stay bound from :meth:`Runner.bind_loop`
+        and the state is bound from the buffers below.
+        """
+        for name, value in scalars.items():
+            self._binding.bind_cpu_input(name, value)
+
+        # Ping-pong: read this step's state out of one buffer, write the next
+        # state into the other, then swap. The single-buffer version -- bind
+        # the same OrtValue as both the state input and the state output --
+        # looks natural and is a correctness trap: onnxruntime is free to begin
+        # writing an output before it has finished reading every input, and
+        # free to hand a bound output buffer straight back to the next
+        # ``run_with_iobinding`` call, so a step could overwrite the very
+        # values it is still computing from. Two buffers make each run's read
+        # set and write set disjoint, which costs one extra tensor per state
+        # entry and removes the question entirely.
+        source, target = self._slot, 1 - self._slot
+        for name, output in self._state_outputs.items():
+            self._binding.bind_ortvalue_input(name, self._buffers[name][source])
+            self._binding.bind_ortvalue_output(output, self._buffers[name][target])
+
+        if self._device_type != "cpu":
+            # On a real device the copies onnxruntime issues for the bound
+            # inputs and outputs are asynchronous; on the CPU there is nothing
+            # to wait for, so skip the call rather than pay it 400 times.
+            self._binding.synchronize_inputs()
+        self._sess.run_with_iobinding(self._binding, self._run_options)
+        if self._device_type != "cpu":
+            self._binding.synchronize_outputs()
+        self._slot = target
+
+        # The host buffers are reused across steps, so the caller sees this
+        # step's values only until the next one -- which is all
+        # ``run_step_graph`` needs (it turns the loss into a float immediately).
+        return {name: value.numpy() for name, value in self._host_outputs.items()}
+
+    def state(self) -> "OrderedDict[str, np.ndarray]":
+        """The current state, copied back to the host as numpy arrays.
+
+        Copied, not aliased: the buffers behind it are this loop's own scratch
+        space and the next :meth:`step` would write through them.
+        """
+        return OrderedDict(
+            (name, self._buffers[name][self._slot].numpy().copy())
+            for name in self._state_outputs
+        )

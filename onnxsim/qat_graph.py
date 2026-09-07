@@ -37,13 +37,23 @@ build's model-executor trampoline (``docs/wasm_ort_web.md``) hands the same
 graph to onnxruntime-web, whose provider list already offers ``webgpu`` and
 WebNN's ``gpu``/``npu`` device types (``docs/webnn.md``).
 
+The tensors also *stay* where that provider put them. :func:`run_step_graph`
+binds the graph's constants and its state through onnxruntime's ``IOBinding``
+(``bind_state=True``, the default, via
+:meth:`onnxsim.backend.Runner.bind_loop`): the calibration activations are
+uploaded once at setup, each step's state outputs become the next step's state
+inputs without a round trip through host numpy, and only the per-step scalars
+go up and the loss comes down. On CPU that saves a memcpy or two; on a
+provider whose bus is PCIe it is the difference between a loop that is
+arithmetic and a loop that is transfers.
+
 **What it does not buy, and the honest limits.**
 
-- *Feeds are re-sent every step.* The calibration activations are re-fed on every
-  call, so on a non-CPU provider the loop currently pays a host-to-device copy
-  per step. Keeping tensors device-resident (``IOBinding`` in Python, ORT-web
-  GPU-buffer tensors in the browser) is the follow-up; the graph shape here --
-  state in, state out -- is exactly what that needs.
+- *Residency is the Python half only.* ``IOBinding`` covers onnxruntime in
+  Python. The browser half of the same idea -- ORT-web's GPU-buffer tensors
+  with ``preferredOutputLocation: "gpu-buffer"``, fed straight back in as the
+  next step's inputs -- is still to do, so the WASM path re-sends its feeds
+  every step.
 - *Precision.* Step graphs are built in float32, not the float64 the numpy
   loops use: fp64 is what accelerators do not have. Results therefore agree
   with the numpy path closely rather than bit-exactly.
@@ -69,6 +79,49 @@ from onnxsim import backend
 # requires, rather than whatever the installed onnx's newest opset needs.
 _OPSET = 17
 _IR_VERSION = 8
+
+# The operator set a step graph restricts itself to.
+#
+# The point of expressing a training step as an ONNX graph is that it runs
+# wherever inference runs -- including onnxruntime-web's WebGPU backend and
+# the WebNN/NPU execution providers, which implement far less than the full
+# ONNX operator set. A step graph that reached for a convenient operator one
+# of those cannot run would pass every numerical test and still be useless
+# for the thing this module exists for, so the ops a builder may emit are
+# pinned here and asserted in tests (``tests/test_qat_graph.py``,
+# ``tests/test_graph_grad.py``, ``tests/test_adaquant_step_graph.py``).
+#
+# What is deliberately absent: control flow, boolean logic ops (a mask is a
+# float 0/1 from ``Cast(Greater(...))``, multiplied in), ``Where``,
+# ``Expand``, and ``Round`` -- WebNN has no rounding operator at all, which is
+# why :mod:`onnxsim.adaquant` composes one out of ``Sign``/``Abs``/``Cast``.
+# Adding to this set is a real decision: check the operator actually has
+# coverage on the WebGPU and WebNN backends first, not just on ORT's CPU
+# kernels.
+EP_FRIENDLY_OPS = frozenset(
+    {
+        "Abs",
+        "Add",
+        "Cast",
+        "Clip",
+        "Div",
+        "Exp",
+        "Greater",
+        "Less",
+        "MatMul",
+        "Mul",
+        "Neg",
+        "Pow",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Sigmoid",
+        "Sign",
+        "Sqrt",
+        "Sub",
+        "Transpose",
+    }
+)
 
 # Adam's own standard hyper-parameters, matching the hand-rolled loops in
 # adaround.py/adaquant.py/brecq.py exactly so a ported loop keeps its
@@ -151,6 +204,27 @@ class GraphBuilder:
         """``(a < threshold)`` as a float32 0/1 tensor."""
         lt = self.op("Less", [a, self.const(threshold)])
         return self.op("Cast", [lt], to=onnx.TensorProto.FLOAT)
+
+    def round_to_nearest(self, a: str) -> str:
+        """``round(a)``, composed rather than emitted as ``Round``.
+
+        WebNN has no rounding operator at all, so ``Round`` is deliberately
+        absent from :data:`EP_FRIENDLY_OPS` -- and a fake-quant forward, which
+        is what every caller of this wants it for, is exactly the code that
+        must run on those backends. A float-to-int32 ``Cast`` truncates toward
+        zero, so truncating ``|a| + 0.5`` and re-applying the sign is
+        round-half-away-from-zero. That differs from ``Round``'s (and numpy's)
+        round-half-to-even on *exact* ties only: a value landing on a precise
+        .5, which real calibration data does not do at any measurable rate,
+        and which when it happens moves one element's code by one rather than
+        changing the shape of the optimization.
+        """
+        magnitude = self.add(self.op("Abs", [a]), self.const(0.5))
+        truncated = self.op("Cast", [magnitude], to=onnx.TensorProto.INT32)
+        return self.mul(
+            self.op("Sign", [a]),
+            self.op("Cast", [truncated], to=onnx.TensorProto.FLOAT),
+        )
 
     def mean_square(self, a: str) -> str:
         """``mean(a * a)`` as a scalar, for a reported loss."""
@@ -265,6 +339,45 @@ def make_step_graph(
     )
 
 
+def _run_bound_loop(
+    bound: backend.BoundStepLoop,
+    step: StepGraph,
+    num_steps: int,
+    scalar_feeds: Callable[[int], Dict[str, np.ndarray]],
+    losses: Optional[List[float]],
+) -> Optional[Dict[str, np.ndarray]]:
+    """Drive ``bound`` for ``num_steps``, or return ``None`` if onnxruntime
+    refuses to run the binding.
+
+    Some execution providers accept a binding at setup time and only fail when
+    a run actually reaches them, so "can this be bound?" is not fully knowable
+    until the first ``run_with_iobinding``. Rather than leave the caller half
+    way through a loop on a path that does not work, this reports the failure
+    and lets :func:`run_step_graph` re-run the whole thing unbound: the step
+    graph is a pure function of its state, so starting over from the same
+    initial state reproduces exactly the same trajectory.
+
+    ``losses`` is only extended once the whole loop has succeeded, so an
+    abandoned attempt leaves no half-written diagnostics behind. The scalars
+    callback is deliberately called *outside* the guarded region -- an
+    exception from the caller's own code is the caller's bug, not a binding
+    failure, and must not be swallowed into a silent fallback.
+    """
+    collected: List[float] = []
+    want_loss = losses is not None and step.loss_name is not None
+    for t in range(num_steps):
+        feeds = scalar_feeds(t)
+        try:
+            out = bound.step(feeds)
+        except Exception:
+            return None
+        if want_loss:
+            collected.append(float(out[str(step.loss_name)]))
+    if losses is not None:
+        losses.extend(collected)
+    return dict(bound.state())
+
+
 def run_step_graph(
     step: StepGraph,
     constants: Dict[str, np.ndarray],
@@ -273,6 +386,7 @@ def run_step_graph(
     scalars: Optional[Callable[[int], Dict[str, float]]] = None,
     providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
+    bind_state: bool = True,
 ) -> Dict[str, np.ndarray]:
     """Runs ``step`` ``num_steps`` times, threading its state through, and
     returns the final state.
@@ -291,6 +405,26 @@ def run_step_graph(
             run the step on. ``None`` means CPU.
     :param losses: when given, the step graph's loss output is appended to it
             once per step. Reading it back costs a scalar transfer per step.
+    :param bind_state: keep the constants and the state resident on the
+            execution provider's device across steps, via onnxruntime's
+            ``IOBinding`` (:meth:`onnxsim.backend.Runner.bind_loop`), instead
+            of re-sending every tensor as a feed on every step. This is the
+            follow-up this module's docstring names, and it is on by default
+            because it is what makes a non-CPU provider worth using: the
+            constants go up once, the state never comes down between steps,
+            and only the per-step scalars and (if asked for) the loss cross
+            the bus. It is transparent -- the same numbers come back either
+            way, and anything that stops the binding from working falls back
+            to the feed-per-step path on its own, so a caller never has to
+            know which one ran.
+
+            Turn it off to force the feed-per-step path: when debugging a
+            provider whose binding support is suspect and the unbound result
+            is the reference to compare against, when a profiler's per-step
+            input/output attribution is more useful than the speed, or when
+            the extra device buffer per state tensor (binding double-buffers
+            the state, see :class:`onnxsim.backend.BoundStepLoop`) is not
+            affordable.
     """
     fetch = list(step.state.values())
     if losses is not None and step.loss_name is not None:
@@ -298,14 +432,29 @@ def run_step_graph(
     runner = backend.Runner(step.model, output_names=fetch, providers=providers)
 
     fixed = {k: np.asarray(v, dtype=np.float32) for k, v in constants.items()}
-    current = {k: np.asarray(v, dtype=np.float32) for k, v in state.items()}
+    initial = {k: np.asarray(v, dtype=np.float32) for k, v in state.items()}
+
+    def scalar_feeds(t: int) -> Dict[str, np.ndarray]:
+        if scalars is None:
+            return {}
+        return {k: np.asarray(v, dtype=np.float32) for k, v in scalars(t).items()}
+
+    # A caller who left out one of the graph's state inputs gets the unbound
+    # path's error about a missing feed, not a KeyError from the setup below.
+    if bind_state and set(step.state) <= set(initial):
+        bound = runner.bind_loop(
+            fixed, {name: (out, initial[name]) for name, out in step.state.items()}
+        )
+        if bound is not None:
+            final = _run_bound_loop(bound, step, num_steps, scalar_feeds, losses)
+            if final is not None:
+                return final
+
+    current = dict(initial)
     for t in range(num_steps):
         feeds = dict(fixed)
         feeds.update(current)
-        if scalars is not None:
-            feeds.update(
-                {k: np.asarray(v, dtype=np.float32) for k, v in scalars(t).items()}
-            )
+        feeds.update(scalar_feeds(t))
         out = runner(feeds)
         current = {name: out[output] for name, output in step.state.items()}
         if losses is not None and step.loss_name is not None:
