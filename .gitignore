@@ -139,6 +139,14 @@ dmypy.json
 *.onnx
 *.onnx.data
 
+# Committed test fixtures, which the blanket *.onnx rule above would
+# otherwise drop silently -- scripts/convertmodel/test/step_*.onnx are step
+# graphs emitted by the library's own builders and checked in on purpose
+# (see make_step_graph_fixtures.py); regenerating them must not un-track
+# them, and a fixture missing from a fresh checkout fails CI rather than the
+# author's machine.
+!scripts/convertmodel/test/*.onnx
+
 compile_commands.json
 temp*.py
 test*.py
