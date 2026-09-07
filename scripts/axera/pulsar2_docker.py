@@ -77,7 +77,7 @@ import tarfile
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_IMAGE = "pulsar2:6.0-lite"
 
@@ -633,8 +633,114 @@ def llm_build(
     )
 
 
+# ---------------------------------------------------------------------------
+# Device runs, locally or inside an LXD virtual machine.
+#
+# Set `AXCL_LXD_VM=<vm name>` to run every `axcl_run_model` invocation inside
+# an LXD *virtual machine* that has the AX650N passed through via VFIO (see
+# `vm/README.md`). The out-of-tree AXCL host driver has crashed and wedged this
+# host more than once; inside a KVM guest the same fault kills only the guest,
+# and `lxc restart --force <vm>` bus-resets the card without a host reboot.
+# Files are pushed into a fresh guest temp dir, the tool runs via `lxc exec`,
+# and any output folder is pulled back -- callers see the same results as a
+# local run. `lxc exec` is an ordinary host client process, so the caller's
+# `timeout` still fires even when the guest driver hangs.
+# ---------------------------------------------------------------------------
+_AXCL_LXD_VM = os.environ.get("AXCL_LXD_VM")
+
+
+def axcl_lxd_vm() -> Optional[str]:
+    """Name of the LXD VM device runs are routed to, or None for local runs."""
+    return _AXCL_LXD_VM or None
+
+
 def axcl_available(binary: str = "/usr/bin/axcl/axcl_run_model") -> bool:
+    vm = axcl_lxd_vm()
+    if vm:
+        try:
+            proc = subprocess.run(
+                ["lxc", "exec", vm, "--", "test", "-x", binary],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        return proc.returncode == 0
     return os.path.exists(binary)
+
+
+def _invoke_axcl(
+    binary: str,
+    args: List[str],
+    *,
+    timeout: int,
+    push: Sequence[str] = (),
+    pull: Optional[Tuple[str, str]] = None,
+) -> Tuple[int, str]:
+    """Run `binary args...` locally or inside the `AXCL_LXD_VM` guest.
+
+    `push` lists local paths (files or directories) that appear in `args`;
+    in VM mode they are copied into a guest temp dir and their occurrences
+    in `args` rewritten to the guest paths. `pull=(guest_relative_name,
+    local_dir)` copies a guest output directory back into `local_dir` (as
+    `local_dir/<name>`) after the run. Returns `(returncode, stdout+stderr)`
+    and lets `subprocess.TimeoutExpired` propagate like a local run would.
+    """
+    vm = axcl_lxd_vm()
+    if not vm:
+        proc = subprocess.run(
+            [binary, *args], capture_output=True, text=True, timeout=timeout
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def lxc(*cmd: str, t: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(["lxc", *cmd], capture_output=True, text=True, timeout=t)
+
+    made = lxc("exec", vm, "--", "mktemp", "-d", "/tmp/axcl.XXXXXX")
+    if made.returncode != 0:
+        return made.returncode, "lxc exec mktemp failed: " + made.stdout + made.stderr
+    remote = made.stdout.strip()
+    mapping: Dict[str, str] = {}
+    try:
+        for local in push:
+            name = os.path.basename(os.path.normpath(local))
+            target = f"{remote}/{name}"
+            if os.path.isdir(local):
+                # `lxc file push -r DIR guest:REMOTE/` lands at REMOTE/<basename>
+                res = lxc("file", "push", "-r", local, f"{vm}{remote}/", t=600)
+            else:
+                res = lxc("file", "push", local, f"{vm}{target}", t=600)
+            if res.returncode != 0:
+                return (
+                    res.returncode,
+                    "lxc file push failed: " + res.stdout + res.stderr,
+                )
+            mapping[os.path.normpath(local)] = target
+        if pull:
+            mapping[os.path.normpath(os.path.join(pull[1], pull[0]))] = (
+                f"{remote}/{pull[0]}"
+            )
+
+        def rewrite(a: str) -> str:
+            key = os.path.normpath(a) if os.path.sep in a else a
+            return mapping.get(key, a)
+
+        proc = subprocess.run(
+            ["lxc", "exec", vm, "--", binary, *[rewrite(a) for a in args]],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        log = proc.stdout + proc.stderr
+        if pull:
+            lxc("file", "pull", "-r", f"{vm}{remote}/{pull[0]}", pull[1], t=600)
+        return proc.returncode, log
+    finally:
+        try:
+            lxc("exec", vm, "--", "rm", "-rf", remote, t=60)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def run_on_device(
@@ -658,15 +764,14 @@ def run_on_device(
             "error": "axcl_run_model not found",
         }
     try:
-        proc = subprocess.run(
-            [binary, "-m", axmodel_path, "-r", str(repeat), "-w", str(warmup)],
-            capture_output=True,
-            text=True,
+        _, log = _invoke_axcl(
+            binary,
+            ["-m", axmodel_path, "-r", str(repeat), "-w", str(warmup)],
             timeout=timeout,
+            push=[axmodel_path],
         )
     except subprocess.TimeoutExpired:
         return {"min_ms": None, "max_ms": None, "avg_ms": None, "error": "timeout"}
-    log = proc.stdout + proc.stderr
     m = _LATENCY_RE.search(log)
     if not m:
         return {"min_ms": None, "max_ms": None, "avg_ms": None, "error": log[-500:]}
@@ -744,9 +849,9 @@ def run_on_device_with_inputs(
         with open(list_path, "w") as f:
             f.write("0\n")
         try:
-            proc = subprocess.run(
+            _, log = _invoke_axcl(
+                binary,
                 [
-                    binary,
                     "-m",
                     axmodel_path,
                     "-i",
@@ -760,13 +865,12 @@ def run_on_device_with_inputs(
                     "-w",
                     str(warmup),
                 ],
-                capture_output=True,
-                text=True,
                 timeout=timeout,
+                push=[axmodel_path, os.path.join(td, "in"), list_path],
+                pull=("out", td),
             )
         except subprocess.TimeoutExpired:
             return DeviceRunResult(error="timeout")
-        log = proc.stdout + proc.stderr
         outputs = []
         for p in sorted(glob.glob(os.path.join(out_dir, "0", "*.bin"))):
             with open(p, "rb") as f:

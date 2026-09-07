@@ -202,3 +202,4 @@ node_modules/
 # Claude Code local session/tooling state (e.g. background-agent worktree
 # checkouts under .claude/worktrees/) -- never part of the repo itself.
 /.claude/
+scripts/axera/vm/share/
