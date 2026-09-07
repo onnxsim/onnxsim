@@ -83,40 +83,38 @@ SoC, only the driver's unload path does, so after `lxc restart --force`
 always `modprobe -r axcl_host && modprobe axcl_host` inside the guest before
 expecting a firmware push to succeed.
 
-## Where the guest path stands (2026-09-07 evening)
+## Status: the card runs inside the guest (2026-09-07)
 
-Two guest-side configuration bugs found and fixed, one blocker left.
+An `.axmodel` compiled on the host now runs on the AX650N inside the VM, and
+the repo's own device tests pass through it unchanged
+(`test_llm_build_a7_is_a_sync_verb_on_device` via `AXCL_LXD_VM=axcl-vm`,
+110 s, hand-patched mcode variants and all). Three things had to be fixed:
 
-**Fixed: the guest's virtual IOMMU was remapping the card's DMA.** Passing
-`-device intel-iommu,intremap=on,caching-mode=on` with a split irqchip (both
-in `raw.qemu`/`raw.qemu.conf`, already set on the VM) brings interrupt
-remapping up, but it also turns on DMA remapping, and the card's group in the
-guest came up as a translated `DMA` domain: the guest driver handed the card
-guest IOVAs that VFIO had never mapped, and the host logged
-`vfio-pci ... IO_PAGE_FAULT domain=0x0009 address=0xffc00000`. Adding
-`iommu=pt` to the *guest's* kernel command line (`/etc/default/grub.d/
-99-axcl-iommu.cfg`) gives the card an `identity` domain, so it gets
-guest-physical addresses that VFIO's mapping covers. After that: no host
-faults from the guest's DMA, and `DMAR-IR: Enabled IRQ remapping in x2apic
-mode` in the guest.
+1. **The guest's virtual IOMMU was remapping the card's DMA.** The
+   `intel-iommu,intremap=on` device needed for interrupt remapping also turns
+   on DMA remapping, and the card's group came up as a translated `DMA`
+   domain: the guest driver handed it IOVAs VFIO had never mapped, visible on
+   the host as `vfio-pci ... IO_PAGE_FAULT address=0xffc00000` (the IOVA
+   allocator works down from the top). Adding `iommu=pt` to the *guest's*
+   command line gives the card an `identity` domain, and the faults stop.
+   `create_vm.sh` does not set this for you; it lives in
+   `/etc/default/grub.d/99-axcl-iommu.cfg` in the guest.
+2. **A VFIO bus reset does not reset the card's SoC.** Only the driver's
+   unload path does (`start reset slave`), so after `lxc restart --force`
+   always `modprobe -r axcl_host && modprobe axcl_host` in the guest before
+   expecting a firmware push to succeed.
+3. **The driver rejected the card's heartbeats** because it compares the id
+   the card reports (a fixed 3) against `pdev->bus->number`, which is 3 on
+   this host by coincidence and 7 in the guest. Driver fix 7 adds
+   `slot_index_force`; load the stack in the guest with
+   `modprobe ax_pcie_host_dev slot_index_force=3`. Without it the card boots,
+   handshakes and sends heartbeats that are all discarded, and is declared
+   dead after 50 s -- which is what made this look like a device-side problem
+   for so long.
 
-**Fixed: a VFIO bus reset does not reset the card's SoC.** Only the driver's
-unload path does (`start reset slave`). After `lxc restart --force`, always
-`modprobe -r axcl_host && modprobe axcl_host` inside the guest before
-expecting a firmware push to succeed.
-
-**Blocker: the card's onboard software never comes up in the guest.** The
-boot ROM works -- all five firmware stages report `[STATUS]: SUCCESS`, which
-means the guest's MMIO writes reach the card *and* the card's DMA/status
-writes come back. But after `start_devices()` nothing follows: BAR0's shared
-window stays all zeros, the card raises no interrupt at all (VFIO's four host
-IRQs `vfio-msi[0..3]` stay at count 0 while the guest's MSI capability is
-enabled with the vIOMMU's remapped address `0xfee00918`), the RC/EP handshake
-times out, and `axcl-smi` reports `Recv port ack timeout`. On the host the
-same card raises hundreds of interrupts on its `endpoint-msi-irq` line. So
-the card's own Linux either does not finish booting or cannot signal from
-inside the guest; that is the next thing to chase, e.g. by capturing the
-card's own boot log (`/proc/ax_proc/pcie/sysdump`) after a failed bring-up.
+With those in place: `[ax_pcie_dev_probe]: slot index pinned to 3 (bus 7)`,
+no missed heartbeats, `axcl-smi` listing the card with live temperature and
+utilisation, and device runs at the same latency as on the host.
 
 ## Known limits
 
