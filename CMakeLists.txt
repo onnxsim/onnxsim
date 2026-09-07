@@ -169,7 +169,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -586,6 +586,19 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(precision_estimator_test)
   add_test(NAME precision_estimator_test COMMAND precision_estimator_test)
 
+  # graph_grad.{h,cpp} differentiates a slice of a forward graph into the
+  # GraphBuilder qat_graph_builder.{h,cpp} defines, and needs onnx for the
+  # NodeProtos it reads -- so it links the fully-configured `onnxsim` target
+  # like precision_estimator_test above. graph_grad.cpp is compiled into this
+  # target directly rather than into the `onnxsim` library because nothing in
+  # the library calls it yet; move it there when the WASM/C-API entry points
+  # do. GraphBuilder itself comes from qat_graph_builder.cpp via `onnxsim`.
+  add_executable(graph_grad_test onnxsim/graph_grad_test.cpp
+                                 onnxsim/graph_grad.cpp)
+  target_link_libraries(graph_grad_test onnxsim)
+  onnxsim_add_ort_rpath(graph_grad_test)
+  add_test(NAME graph_grad_test COMMAND graph_grad_test)
+
   # xnnpack_codegen.{h,cpp} needs onnx (ModelProto/shape inference), like
   # precision_estimator_test above -- links the fully-configured `onnxsim`
   # target rather than building standalone. Needs no XNNPACK build itself
@@ -594,6 +607,15 @@ if (ONNXSIM_TESTS)
   target_link_libraries(xnnpack_codegen_test onnxsim)
   onnxsim_add_ort_rpath(xnnpack_codegen_test)
   add_test(NAME xnnpack_codegen_test COMMAND xnnpack_codegen_test)
+
+  # qat_graph_builder.{h,cpp} builds onnx::ModelProto/NodeProto directly, so
+  # its test links the fully-configured `onnxsim` target like
+  # precision_estimator_test above -- and it calls onnx::checker on the step
+  # graph it emits, which needs the same.
+  add_executable(qat_graph_builder_test onnxsim/qat_graph_builder_test.cpp)
+  target_link_libraries(qat_graph_builder_test onnxsim)
+  onnxsim_add_ort_rpath(qat_graph_builder_test)
+  add_test(NAME qat_graph_builder_test COMMAND qat_graph_builder_test)
 
   # contrib_schemas.cpp's MoE/QMoE registration needs onnx's schema
   # registry and function-building API, like precision_estimator_test
