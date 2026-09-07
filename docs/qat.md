@@ -249,12 +249,24 @@ Each stage is independently shippable and independently useful.
    losses read higher, because a dirtier input is a harder reconstruction
    problem -- the block-local loss is not the quantity that matters.
 
+   Minibatching landed since (`batch_size=`), and the design question it
+   forced is worth recording: `Runner.bind_loop` uploads constants once
+   precisely to avoid per-step transfers, which is exactly what a batch that
+   changes every step breaks. The resolution keeps the whole calibration set
+   resident and feeds a per-step int64 index that a `Gather` turns into that
+   step's rows, so per-step traffic stays at a few scalars -- at the cost of
+   `Gather` in `EP_FRIENDLY_OPS` (justified there: WebNN specifies it, unlike
+   `Round`) and of the set still having to fit in one static tensor. So it
+   buys convergence rate and stochastic-gradient behaviour, not a
+   larger-than-memory dataset: at equal epochs it roughly halves the error at
+   a tight budget (11.41 -> 6.33) and washes out once full batch has
+   converged.
+
    Still open from this stage's original description: real data via
    `load_huggingface_calibration_data`, a `QuantizationConfig` flag, an
    end-to-end pass against the model's own output (a block is always the
-   unit of optimization), minibatching, and activation quantization
-   (adaquant has the learnable activation scale, it is simply not wired in
-   here).
+   unit of optimization), and activation quantization (adaquant has the
+   learnable activation scale, it is simply not wired in here).
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
@@ -330,10 +342,22 @@ arithmetic.
 
 ## Costs and risks
 
-- **Op coverage.** The backward graph's ops must all be implemented by the
-  target EP. On WebGPU that is very likely; on WebNN/NPU it is exactly why
-  the forward/backward split above exists. Needs measuring per EP before any
-  claim is made in the README.
+- **Op coverage -- now measurable, and measured on one backend.**
+  `scripts/convertmodel/test/step_graph_ep.test.mjs` runs real step graphs
+  (committed fixtures emitted by the actual builders, and a generator that
+  refuses to run unless their union is exactly `EP_FRIENDLY_OPS`) under one
+  execution provider at a time, with no fallback in the provider list so a
+  fallback cannot be mistaken for support. All 21 members verified on
+  `wasm`. WebGPU and the WebNN device types are *not* verified: ORT-web
+  refuses them in headless Node, so the test skips them loudly and says so,
+  and `ORT_REQUIRE` turns that skip into a hard failure on a host that has
+  them. The highest-risk unverified item is the minibatch index, the one
+  non-float step-graph input -- WebNN is on record rejecting int64.
+
+  Note also what the allowlist does *not* cover: `apply_qat` copies the
+  block's own forward nodes into the step graph verbatim, so a block
+  containing a `Relu` or a `Softmax` puts those in the graph too. The set
+  constrains what onnxsim emits, not what the block contains.
 - **A second code path.** This is the objection `nncf-comparison-future-work.md`
   raises, and it is real — mitigated by the fact that stage 1's step-graph
   builder *replaces* numpy inner loops in existing passes rather than sitting
