@@ -3364,6 +3364,45 @@ is that a generator cannot compute it from the table alone.
 Test: `test_decode_encode_round_trip_is_byte_exact` in
 `tests/test_axera_mcode_structure.py` (fresh builds, no device).
 
+### A third model family: text-to-speech, and what it did not change
+
+The decoding corpus was two CNNs and two transformers. A vocoder is a third
+shape entirely -- transposed-convolution upsampling, dilated 1-D residual
+convolutions, LeakyReLU, a bounded output -- and it is what text-to-speech
+actually runs on this class of hardware.
+
+**A full TTS graph does not compile, and that is expected.** A Piper voice
+(VITS, 63 MB, 2,755 nodes) carries `RandomNormalLike`, `NonZero`, `CumSum`,
+`Range` and `Shape`: stochastic sampling and data-dependent shapes, none of
+which an NPU compiler takes. Real deployments split the model, keeping the
+text encoder, duration prediction and sampling on the CPU and sending only
+the vocoder to the device. `_vocoder_model()` in the test file is that part,
+built small and static.
+
+**It compiles, and it taught us nothing new about the instruction set --
+which is the result.** The vocoder builds cleanly (`ConvTranspose`,
+`LeakyRelu`, `Tanh`, dilated `Conv`, `max_cycle` 55,183), its stream is
+96.8% explained by the existing rule, and it introduces **zero** verbs, tags
+or registers that the CNN and transformer builds had not already used. Its
+op programs are the same skeleton: `40.02 | 50.01 | 50.01 | [30.03] | a8
+40.03 | 50.03 | 50.01 | a3 | 50.01 | a9 | [a2] | [a1 20.02] | a8 30.02`.
+
+So op type is not encoded by choosing different instructions. Convolution,
+transposed convolution, matrix multiplication and elementwise activation all
+issue the same program shape, and what distinguishes them lives in the
+operand values -- which is exactly where a generator's remaining work is.
+
+**A caution about differencing.** Changing a shape parameter re-lays-out the
+whole stream: stride 8 to 4 moved 45 destinations, channel count 128 to 96
+moved 238, and input length 32 to 64 moved 286 of roughly 1,400. Attribution
+by differencing therefore needs experiments that hold every shape fixed --
+changing only `LeakyRelu`'s alpha still moved 2,171 bytes across 1,649 writes
+to tag 0x81 alone, so even that is not surgical. Single-register attribution
+will need a sharper instrument than model diffing.
+
+Test: `test_tts_vocoder_uses_no_new_instruction_forms` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
