@@ -150,7 +150,9 @@
 //       output position 1, instead of `num_queries`).
 //    c. `level_sampled = GridSample(value_reshaped_l, level_grid_reshaped,
 //       mode="linear", padding_mode="zeros", align_corners=0)` -> `(bs*M, D,
-//       num_queries, P)`. This is exactly mmcv's own `F.grid_sample(...,
+//       num_queries, P)`. (`mode` is spelled `"bilinear"`, GridSample-16's
+//       name for the same mode, on a graph whose opset is below 20 -- see
+//       `GridSampleOp`.) This is exactly mmcv's own `F.grid_sample(...,
 //       mode='bilinear', padding_mode='zeros', align_corners=False)` call --
 //       emitted as a real `GridSample` node rather than decomposed further
 //       (that is `rewrite_gridsample_to_gather`'s job; the two passes
@@ -360,11 +362,22 @@ struct MSDeformAttnToGridSampleBuilder {
     return outs;
   }
 
+  // GridSample-20 renamed two of the three interpolation modes: the linear
+  // one is "bilinear" in opset 16-19 and "linear" from opset 20 on. The
+  // sampling algorithm behind both names is identical, but the attribute is
+  // validated against the opset the model actually imports -- onnxruntime
+  // rejects "linear" on a GridSample-16 node ('mode "linear" not supported,
+  // expect bilinear, nearest or bicubic') just as it rejects "bilinear" on a
+  // GridSample-20 one -- so emit the spelling this graph's opset expects. A
+  // graph carrying no ai.onnx opset import at all (getOpsetVersion() == 0,
+  // which this pass's predicate also lets through) gets the current spelling.
   Value* GridSampleOp(Value* X, Value* grid) {
+    const int opset = PredicateBasedPass::getOpsetVersion(graph);
+    const char* mode = (opset != 0 && opset < 20) ? "bilinear" : "linear";
     Node* n = graph.create(Symbol("GridSample"), 1);
     n->addInput(X);
     n->addInput(grid);
-    n->s_(kmode, "linear");
+    n->s_(kmode, mode);
     n->s_(Symbol("padding_mode"), "zeros");
     n->i_(Symbol("align_corners"), int64_t(0));
     n->insertBefore(anchor);

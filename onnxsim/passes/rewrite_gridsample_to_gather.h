@@ -31,10 +31,14 @@
 //    tensor type for `X` (dequantizing to float internally and requantizing
 //    at the end for integer types); this pass does not attempt that and
 //    leaves such nodes alone.
-//  - Only `mode` (default `"linear"`) `"linear"` or `"nearest"`; `"cubic"` is
-//    left alone. Also leaves alone the pre-opset-20 `"bilinear"`/`"bicubic"`
-//    spelling of the same modes -- purely a naming difference (the sampling
-//    algorithm is identical), out of scope here rather than a semantic gap.
+//  - Only `mode` `"linear"` or `"nearest"`; `"cubic"` is left alone.
+//    GridSample-20 renamed two of the three modes -- opset 16-19 spell them
+//    `"bilinear"`/`"nearest"`/`"bicubic"` (default `"bilinear"`), opset 20+
+//    `"linear"`/`"nearest"`/`"cubic"` (default `"linear"`) -- with no change
+//    to the sampling algorithm, so both spellings of each mode are accepted
+//    and normalized to the opset-20 name before anything else looks at it.
+//    (Whichever spelling a node uses, the emitted subgraph is the same:
+//    `GridSample` disappears, so there is no spelling to preserve.)
 //  - All three `padding_mode` values (`"zeros"` default, `"border"`,
 //    `"reflection"`) and both `align_corners` values (0 default, 1) are
 //    handled.
@@ -428,6 +432,24 @@ struct GridSampleToGatherBuilder {
   }
 };
 
+// Reads `mode` off a `GridSample` node in the opset-20 spelling, whichever
+// spelling the node itself uses. GridSample-20 renamed "bilinear" -> "linear"
+// and "bicubic" -> "cubic" (and its default with them) without touching the
+// sampling algorithm, so an opset-16..19 node means exactly what the
+// same-named opset-20 one does. An absent attribute is "linear" under either
+// spelling, so the default needs no opset check of its own.
+inline std::string GetNormalizedGridSampleMode(Node* node) {
+  const std::string mode =
+      GetValueFromAttrWithDefault<std::string>(node, kmode, "linear");
+  if (mode == "bilinear") {
+    return "linear";
+  }
+  if (mode == "bicubic") {
+    return "cubic";
+  }
+  return mode;
+}
+
 struct RewriteGridSampleToGather final : public PredicateBasedPass {
   explicit RewriteGridSampleToGather()
       : PredicateBasedPass(PassType::Other, PassEfficiency::Complete,
@@ -467,8 +489,7 @@ struct RewriteGridSampleToGather final : public PredicateBasedPass {
     if (X->elemType() != TensorProto_DataType_FLOAT) {
       return false;
     }
-    const std::string mode =
-        GetValueFromAttrWithDefault<std::string>(node, kmode, "linear");
+    const std::string mode = GetNormalizedGridSampleMode(node);
     if (mode != "linear" && mode != "nearest") {
       return false;
     }
@@ -491,8 +512,7 @@ struct RewriteGridSampleToGather final : public PredicateBasedPass {
 
     Value* X = node->input(0);
     Value* grid = node->input(1);
-    const std::string mode =
-        GetValueFromAttrWithDefault<std::string>(node, kmode, "linear");
+    const std::string mode = GetNormalizedGridSampleMode(node);
     const std::string padding_mode = GetValueFromAttrWithDefault<std::string>(
         node, Symbol("padding_mode"), "zeros");
     const bool align_corners =
