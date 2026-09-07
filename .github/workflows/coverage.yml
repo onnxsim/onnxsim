@@ -133,7 +133,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@v2.87.0
+      - uses: taiki-e/install-action@v2.87.5
         with:
           tool: cargo-llvm-cov
       - name: Install build tools
