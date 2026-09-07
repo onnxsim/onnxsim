@@ -3915,10 +3915,17 @@ def _operands(mcode, verb, field, bank):
 
 # The weight table's layout for a convolution, confirmed by placing a single
 # non-zero weight at known positions and seeing which byte moved. See the
-# README's "Generating a weight table" section. `k_stride` is `cin // 2`;
-# these two are fixed for the channel counts this was confirmed at.
-_WBT_O_STRIDE = 72
+# README's "Generating a weight table" section.
+#
+# Weights are INT8 (zero point 128) split across two 36-byte nibble planes,
+# the high plane `_WBT_PLANE_GAP` bytes after the low one. Two input channels
+# share a byte. Output channels are grouped 16 at a time and slots are chunked
+# 36 at a time, and those groups and chunks interleave in 72-byte pairs -- so
+# a channel's weights are not contiguous once either dimension overflows.
+_WBT_PLANE = 36
 _WBT_PLANE_GAP = 36
+_WBT_PAIR = 72
+_WBT_O_GROUP = 16
 
 
 def _wbt_of(axmodel_path):
@@ -3929,10 +3936,25 @@ def _wbt_of(axmodel_path):
     )
 
 
-def _weight_offset(o, i, k, cin):
+def _weight_offset(o, i, k, cin, cout, kernel):
     """`(byte offset, nibble shift)` of weight `(o, i, k)`'s low-nibble plane.
-    The high nibble lives `_WBT_PLANE_GAP` bytes further on."""
-    return _WBT_O_STRIDE * o + (cin // 2) * k + i // 2, (4 if i % 2 else 0)
+    The high nibble lives `_WBT_PLANE_GAP` bytes further on.
+
+    Slot `s` walks the weights of one output channel; it is chunked into
+    36-byte planes, and output channels are grouped 16 at a time. Both the
+    group and the chunk index select which 72-byte pair the plane lands in.
+    """
+    s = (cin // 2) * k + i // 2
+    chunk, within = divmod(s, _WBT_PLANE)
+    group, member = divmod(o, _WBT_O_GROUP)
+    groups = -(-cout // _WBT_O_GROUP)
+    chunks = -(-((cin // 2) * kernel) // _WBT_PLANE)
+    low = (
+        _WBT_PAIR * groups * chunks * member
+        + _WBT_PAIR * (group + groups * chunk)
+        + within
+    )
+    return low, (4 if i % 2 else 0)
 
 
 def _read_weight_codes(wbt, shape):
@@ -3942,7 +3964,7 @@ def _read_weight_codes(wbt, shape):
     for o in range(cout):
         for i in range(cin):
             for k in range(kernel):
-                off, sh = _weight_offset(o, i, k, cin)
+                off, sh = _weight_offset(o, i, k, cin, cout, kernel)
                 lo = (wbt[off] >> sh) & 0xF
                 hi = (wbt[off + _WBT_PLANE_GAP] >> sh) & 0xF
                 codes[o, i, k] = (hi << 4) | lo
@@ -3956,7 +3978,7 @@ def _write_weight_codes(wbt, codes):
     for o in range(cout):
         for i in range(cin):
             for k in range(kernel):
-                off, sh = _weight_offset(o, i, k, cin)
+                off, sh = _weight_offset(o, i, k, cin, cout, kernel)
                 value = int(codes[o, i, k]) & 0xFF
                 out[off] = (out[off] & ~(0xF << sh) & 0xFF) | ((value & 0xF) << sh)
                 high = off + _WBT_PLANE_GAP
@@ -3991,35 +4013,48 @@ def test_conv_weights_are_int8_split_across_two_nibble_planes(tmp_path):
     `_weight_offset()` predicts, in the nibble `i % 2` selects. Needs Docker,
     no device.
     """
-    cin = cout = 8
     kernel, length = 3, 32
-    zero = tmp_path / "zero"
-    zero.mkdir()
-    base = _wbt_of(
-        _build_single_op_axmodel(
-            str(zero),
-            "m",
-            _one_conv_model(
-                cin, cout, length, kernel, weights=np.zeros((cout, cin, kernel))
-            ),
-        )
-    )
-    for o, i, k in [(0, 0, 0), (0, 1, 0), (0, 2, 0), (0, 0, 1), (3, 5, 1), (7, 7, 2)]:
-        w = np.zeros((cout, cin, kernel))
-        w[o, i, k] = 0.5
-        work = tmp_path / f"s{o}{i}{k}"
-        work.mkdir()
-        spike = _wbt_of(
+    # 8 channels needs neither an output group nor a slot chunk; 32 needs
+    # both, so `(0,8,2)` spills to the next chunk and `(16,0,0)` to the next
+    # output group. Those are the cases a naive contiguous layout gets wrong.
+    for cin, positions in (
+        (8, [(0, 0, 0), (0, 1, 0), (0, 2, 0), (0, 0, 1), (3, 5, 1), (7, 7, 2)]),
+        (32, [(0, 0, 0), (0, 8, 2), (16, 0, 0), (31, 31, 2)]),
+    ):
+        cout = cin
+        zero = tmp_path / f"zero{cin}"
+        zero.mkdir()
+        base = _wbt_of(
             _build_single_op_axmodel(
-                str(work), "m", _one_conv_model(cin, cout, length, kernel, weights=w)
+                str(zero),
+                "m",
+                _one_conv_model(
+                    cin, cout, length, kernel, weights=np.zeros((cout, cin, kernel))
+                ),
             )
         )
-        moved = [j for j in range(min(len(base), len(spike))) if base[j] != spike[j]]
-        low, shift = _weight_offset(o, i, k, cin)
-        assert low in moved, (o, i, k, low, moved[:8])
-        assert low + _WBT_PLANE_GAP in moved, (o, i, k, moved[:8])
-        # A weight at full scale saturates its nibble in both planes.
-        assert (spike[low] >> shift) & 0xF == 0xF, (o, i, k, spike[low])
+        for o, i, k in positions:
+            w = np.zeros((cout, cin, kernel))
+            w[o, i, k] = 0.5
+            work = tmp_path / f"s{cin}_{o}_{i}_{k}"
+            work.mkdir()
+            spike = _wbt_of(
+                _build_single_op_axmodel(
+                    str(work),
+                    "m",
+                    _one_conv_model(cin, cout, length, kernel, weights=w),
+                )
+            )
+            moved = [
+                j for j in range(min(len(base), len(spike))) if base[j] != spike[j]
+            ]
+            low, shift = _weight_offset(o, i, k, cin, cout, kernel)
+            assert low in moved, (cin, o, i, k, low, moved[:8])
+            assert low + _WBT_PLANE_GAP in moved, (cin, o, i, k, moved[:8])
+            # A weight at full scale saturates its nibble in both planes, and
+            # an all-zero table reads as the zero point in the high plane.
+            assert (spike[low] >> shift) & 0xF == 0xF, (cin, o, i, k, spike[low])
+            assert (base[low + _WBT_PLANE_GAP] >> shift) & 0xF == 0x8, (cin, o, i, k)
 
 
 def test_conv_weights_can_be_rewritten_without_pulsar2(tmp_path):
@@ -4037,8 +4072,15 @@ def test_conv_weights_can_be_rewritten_without_pulsar2(tmp_path):
     if not pulsar2_docker.axcl_available():
         pytest.skip("no AXCL device")
     ort = pytest.importorskip("onnxruntime")
-    cin = cout = 8
+    for channels in (8, 32):
+        _check_weight_retargeting(tmp_path / f"c{channels}", ort, channels)
+
+
+def _check_weight_retargeting(tmp_path, ort, channels):
+    """One shape's worth of `test_conv_weights_can_be_rewritten_without_pulsar2`."""
+    cin = cout = channels
     kernel, length = 3, 32
+    tmp_path.mkdir()
     rng = np.random.RandomState(0)
     w_old = (rng.randn(cout, cin, kernel) * 0.1).astype(np.float32)
     w_new = w_old[:, rng.permutation(cin), :].copy()

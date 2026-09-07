@@ -3569,14 +3569,29 @@ whose weights are all zero, then compile the same convolution with a *single*
 non-zero weight at a known `(o, i, k)`, and see which byte changes. Repeated
 over nine positions this gives the addressing exactly rather than by fitting.
 
-**The layout.** Weights live in the `npu_params` initializer at
+**The layout.** Weights live in the `npu_params` initializer. A slot index
+walks one output channel's weights, and both that index and the output
+channel are *tiled*:
 
-    offset(o, i, k) = 72*o + (Cin/2)*k + i//2,   nibble = i % 2
+    s      = (Cin/2)*k + i//2          slot within an output channel
+    chunk  = s // 36,  within = s % 36
+    group  = o // 16,  member = o % 16
+    groups = ceil(Cout/16),  chunks = ceil((Cin/2)*K / 36)
 
-with a *second* plane 36 bytes further on. Predictions from the first few
-positions land exactly: `(3,5,1)` at byte 222 and `(7,7,2)` at byte 515.
+    low  = 72*groups*chunks*member + 72*(group + groups*chunk) + within
+    high = low + 36,   nibble = i % 2
+
 Two input channels share a byte, which is what first looked like 4-bit
-weights.
+weights. The tiling is the part guessing would miss: a channel's weights are
+*not* contiguous once either dimension overflows its tile. At 8 channels
+neither does, and the formula collapses to `72*o + (Cin/2)*k + i//2`; at 32
+channels both do, and weight `(0,8,2)` jumps from a predicted byte 36 to 144
+while output channel 16 lands at byte 72 rather than after channel 15.
+
+Across both shapes the formula predicts **35 of 35** measured spike offsets
+exactly -- `(3,5,1)` at 222, `(7,7,2)` at 515, `(31,31,2)` at 4547 -- and it
+reconstructs a full 32x32x3 weight tensor from a compiled table at a
+per-channel correlation of 0.99998.
 
 **They are not 4-bit.** Combining the planes as `high*16 + low` gives INT8
 with zero point 128, and the arithmetic closes exactly:
@@ -3604,12 +3619,16 @@ least squares from a compiled reference reproduces pulsar2's own codes for
 compiled convolution and replacing its weights by hand -- no vendor compiler
 anywhere in the loop -- the NPU then computes the *new* convolution:
 
-| run | vs CPU reference | correlation |
-| --- | --- | --- |
-| pulsar2's own build | its own weights | 0.99992 |
-| our patched table | the **new** weights | 0.99987 |
-| our patched table | the old weights | 0.319 |
-| pulsar2's own build | the new weights | 0.320 |
+| shape | run | vs CPU reference | correlation |
+| --- | --- | --- | --- |
+| 8 ch | pulsar2's own build | its own weights | 0.99992 |
+| 8 ch | our patched table | the **new** weights | 0.99987 |
+| 8 ch | our patched table | the old weights | 0.319 |
+| 8 ch | pulsar2's own build | the new weights | 0.320 |
+| 32 ch | pulsar2's own build | its own weights | 0.99981 |
+| 32 ch | our patched table | the **new** weights | 0.99972 |
+| 32 ch | our patched table | the old weights | 0.052 |
+| 32 ch | pulsar2's own build | the new weights | 0.052 |
 
 The two cross-controls are the point. The patched model stops matching the
 old weights and the untouched model does not match the new ones, so the
@@ -3623,11 +3642,13 @@ activation scales too, and those are calibrated from the weights, so changing
 a channel's dynamic range invalidates the scale the table already holds.
 Rewriting weights freely needs the scale rewritten with them.
 
-And the addressing is confirmed for `Cin` up to 16, not beyond. The plane is
-36 bytes and a channel's weights occupy `(Cin/2)*K` of it, which fits at
-`Cin = 16, K = 3` (24 bytes) and overflows at `Cin = 32` (48). A search over
-strides finds no simple affine layout for 32 or 64 channels, so larger
-convolutions must tile, and how they tile is open.
+And the addressing is confirmed at 8, 16 and 32 channels with `K = 3`. The
+tiling constants (a 36-byte plane, 72-byte pairs, output groups of 16) are
+read off those shapes rather than derived, so a shape that overflows some
+*other* limit -- many chunks, a large kernel, 64 channels and up -- may well
+expose another level of tiling. A stride search alone never found this
+structure; the single-weight builds did, and the same method extends to any
+shape worth confirming.
 
 Tests: `test_conv_weights_are_int8_split_across_two_nibble_planes` (Docker)
 and `test_conv_weights_can_be_rewritten_without_pulsar2` (Docker and device)
