@@ -769,6 +769,12 @@ def test_the_emitted_backward_stays_inside_the_operator_allowlist():
     # allowlist is not padded with ops no rule can actually produce.
     assert emitted == set(graph_grad.BACKWARD_OPS)
 
+    # And this module's own allowlist has to sit inside the package-wide one a
+    # step graph is held to -- an emitted backward is appended to the same
+    # builder as the forward, so anything it can produce is something the
+    # execution provider has to be able to run.
+    assert graph_grad.BACKWARD_OPS <= qat_graph.EP_FRIENDLY_OPS
+
 
 def test_an_unsupported_op_is_refused():
     """No rule means no gradient -- not a zero, not a straight-through

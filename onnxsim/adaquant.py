@@ -369,24 +369,23 @@ def _optimize_adaquant(
     return _adaquant_results(v, floor_base, log_s, zp)
 
 
-def _sum_all(b: qat_graph.GraphBuilder, tensor: str, count: int) -> str:
+def _sum_all(b: qat_graph.GraphBuilder, tensor: str) -> str:
     """``sum(tensor)`` over every axis, as a scalar.
 
-    Spelled as ``mean * count`` rather than as a ``ReduceSum`` because
-    ``ReduceSum`` is not in the operator set these step graphs restrict
-    themselves to (``tests/test_qat_graph.py``'s allowlist, i.e. what the
-    WebNN/NPU execution providers actually implement) while ``ReduceMean``
-    is, and the element count is known when the graph is built.
+    A one-line wrapper so the gradient expressions below read as the
+    summations they are; ``ReduceSum`` is in
+    :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`, so no rewriting is needed to
+    keep the graph runnable on an accelerator backend.
     """
-    mean = b.op("ReduceMean", [tensor], keepdims=0)
-    return b.mul(mean, b.const(float(count)))
+    return b.op("ReduceSum", [tensor], keepdims=0)
 
 
 def _round_to_nearest(b: qat_graph.GraphBuilder, tensor: str) -> str:
     """``round(tensor)``, built out of the allowlisted ops.
 
-    ONNX has a ``Round``, but it is not in the set the accelerator backends
-    are known to cover, so this composes the same thing: a float-to-int32
+    ONNX has a ``Round``, but WebNN has no rounding operator at all, so it is
+    deliberately absent from :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` and
+    this composes the same thing instead: a float-to-int32
     ``Cast`` truncates toward zero, and truncating ``|t| + 0.5`` and
     re-applying the sign is round-half-away-from-zero. That differs from
     numpy's (and ``Round``'s) round-half-to-even on *exact* ties only -- an
@@ -444,9 +443,7 @@ def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepG
     log_s, m_s, vv_s = "log_s", "m_s", "vv_s"
     zp, m_zp, vv_zp = "zp", "m_zp", "vv_zp"
 
-    # exp(log_s). Written as Pow(e, log_s) because Exp is not in the
-    # allowlisted operator set; with a constant base it is the same function.
-    s_x = b.op("Pow", [b.const(np.e), log_s])
+    s_x = b.op("Exp", [log_s])
 
     # h(v), the rectified sigmoid, and its derivative -- _h_and_dhdv's own two
     # lines, with the "is this element still inside the clip" test as a float
@@ -500,8 +497,8 @@ def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepG
     dxdq_ds = b.sub(xq_minus_zp, b.mul(active_x, x_over_s))
     dxdq_dzp = b.mul(s_x, b.sub(active_x, b.const(1.0)))
     # d/d(log s) = d/ds * s, the chain rule for the log-space parametrization.
-    grad_log_s = b.mul(_sum_all(b, b.mul(dl_dxdq, dxdq_ds), num_rows * k), s_x)
-    grad_zp = _sum_all(b, b.mul(dl_dxdq, dxdq_dzp), num_rows * k)
+    grad_log_s = b.mul(_sum_all(b, b.mul(dl_dxdq, dxdq_ds)), s_x)
+    grad_zp = _sum_all(b, b.mul(dl_dxdq, dxdq_dzp))
 
     v_next, m_v_next, vv_v_next = qat_graph.adam_update(
         b, v, grad_v, m_v, vv_v, "w_lr", "m_correction", "v_correction"

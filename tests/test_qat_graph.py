@@ -21,29 +21,10 @@ from onnxsim import adaround, backend, qat_graph
 
 ort = pytest.importorskip("onnxruntime")
 
-# Operators a step graph may use. Everything here is a plain arithmetic,
-# comparison or reduction op with broad coverage across onnxruntime's
-# execution providers (including onnxruntime-web's WebGPU backend and the
-# WebNN/NPU ones). Ops deliberately kept out: control flow, boolean logic,
-# Where, anything that would make a graph runnable only on the CPU.
-_ALLOWED_OPS = {
-    "Abs",
-    "Add",
-    "Cast",
-    "Clip",
-    "Div",
-    "Greater",
-    "Less",
-    "MatMul",
-    "Mul",
-    "Pow",
-    "ReduceMean",
-    "Sigmoid",
-    "Sign",
-    "Sqrt",
-    "Sub",
-    "Transpose",
-}
+# The operator set a step graph may emit is the package's own, not a copy of
+# it: two allowlists that drift apart would each certify a graph the other
+# rejects. See qat_graph.EP_FRIENDLY_OPS for what earns a place in it.
+_ALLOWED_OPS = qat_graph.EP_FRIENDLY_OPS
 
 
 def _linear_fit_step_graph(rows, k, n):

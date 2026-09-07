@@ -83,6 +83,49 @@ _IR_VERSION = 8
 # Adam's own standard hyper-parameters, matching the hand-rolled loops in
 # adaround.py/adaquant.py/brecq.py exactly so a ported loop keeps its
 # behaviour.
+# The operator set a step graph restricts itself to.
+#
+# The point of expressing a training step as an ONNX graph is that it runs
+# wherever inference runs -- including onnxruntime-web's WebGPU backend and
+# the WebNN/NPU execution providers, which implement far less than the full
+# ONNX operator set. A step graph that reached for a convenient operator one
+# of those cannot run would pass every numerical test and still be useless
+# for the thing this module exists for, so the ops a builder may emit are
+# pinned here and asserted in tests (``tests/test_qat_graph.py``,
+# ``tests/test_graph_grad.py``, ``tests/test_adaquant_step_graph.py``).
+#
+# What is deliberately absent: control flow, boolean logic ops (a mask is a
+# float 0/1 from ``Cast(Greater(...))``, multiplied in), ``Where``,
+# ``Expand``, and ``Round`` -- WebNN has no rounding operator at all, which is
+# why :mod:`onnxsim.adaquant` composes one out of ``Sign``/``Abs``/``Cast``.
+# Adding to this set is a real decision: check the operator actually has
+# coverage on the WebGPU and WebNN backends first, not just on ORT's CPU
+# kernels.
+EP_FRIENDLY_OPS = frozenset(
+    {
+        "Abs",
+        "Add",
+        "Cast",
+        "Clip",
+        "Div",
+        "Exp",
+        "Greater",
+        "Less",
+        "MatMul",
+        "Mul",
+        "Neg",
+        "Pow",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Sigmoid",
+        "Sign",
+        "Sqrt",
+        "Sub",
+        "Transpose",
+    }
+)
+
 ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
