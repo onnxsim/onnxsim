@@ -16,11 +16,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 
 import numpy as np
 import onnx
+import onnx.utils
 import pytest
-from onnx import helper, numpy_helper, parser
+from onnx import TensorProto, helper, numpy_helper, parser
 
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
@@ -3777,6 +3779,259 @@ def _build_vocoder(work_dir, **kwargs):
     assert result.success, result.error
     ((_, mcode),) = _mcodes_of(result.axmodel_path)
     return mcode
+
+
+_PIPER_REPO = "rhasspy/piper-voices"
+_PIPER_VOICE = "en/en_US/lessac/low/en_US-lessac-low.onnx"
+
+
+def _cached_piper_voice():
+    """The `en_US-lessac-low` Piper voice and its config from the local
+    HuggingFace cache, as `(onnx path, config path)`, else None. Never
+    downloads -- these tests stay offline."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        model = hf_hub_download(_PIPER_REPO, _PIPER_VOICE, local_files_only=True)
+        config = hf_hub_download(
+            _PIPER_REPO, _PIPER_VOICE + ".json", local_files_only=True
+        )
+        return model, config
+    except Exception:
+        return None
+
+
+def _piper_decoder_input(model):
+    """The tensor a Piper voice feeds to its HiFi-GAN decoder: whatever the
+    `dec.conv_pre` convolution reads. Found by weight name rather than
+    hard-coded, since the intermediate tensor names are export artefacts."""
+    conv = next(
+        n
+        for n in model.graph.node
+        if n.op_type == "Conv"
+        and len(n.input) > 1
+        and n.input[1] == "dec.conv_pre.weight"
+    )
+    return conv.input[0]
+
+
+def _piper_decoder(voice_path, out_path, frames):
+    """The *real* HiFi-GAN decoder lifted out of a Piper VITS voice, with a
+    static `frames`-long latent input.
+
+    The rest of a VITS graph cannot be compiled -- `RandomNormalLike`,
+    `NonZero`, `CumSum` and `Range` are stochastic or data-dependent, so a
+    real deployment keeps the text encoder and duration sampling on the CPU
+    and sends only this decoder to the device. Extracting the subgraph
+    rather than rebuilding it by hand keeps the trained weights *and* the
+    exact dilations, which is what makes the device output audible speech
+    instead of the noise a randomly initialised vocoder emits.
+    """
+    model = onnx.load(voice_path)
+    latent = _piper_decoder_input(model)
+    onnx.utils.extract_model(
+        voice_path,
+        out_path,
+        [latent],
+        [model.graph.output[0].name],
+        check_model=False,
+    )
+    dec = onnx.load(out_path)
+    inp = dec.graph.input[0]
+    del inp.type.tensor_type.shape.dim[:]
+    for value in (1, 192, frames):
+        inp.type.tensor_type.shape.dim.add().dim_value = value
+    inp.name = "z"
+    for node in dec.graph.node:
+        node.input[:] = ["z" if i == latent else i for i in node.input]
+    # The exported output shape is written for the dynamic graph; drop it
+    # and let inference restate it for this fixed length.
+    del dec.graph.output[0].type.tensor_type.shape.dim[:]
+    dec = onnx.shape_inference.infer_shapes(dec)
+    onnx.save(dec, out_path)
+    return dec
+
+
+def _piper_say(voice_path, config_path, phonemes, length_scale=1.0):
+    """Run a Piper voice on the CPU for one phoneme sequence, returning
+    `(latent, audio)` -- the decoder's own input alongside the reference
+    waveform, so a device run of the decoder can be scored against the
+    audio the untouched model produces."""
+    ort = pytest.importorskip("onnxruntime")
+    model = onnx.load(voice_path)
+    latent = _piper_decoder_input(model)
+    model.graph.output.append(
+        helper.make_tensor_value_info(latent, TensorProto.FLOAT, None)
+    )
+    with tempfile.TemporaryDirectory() as td:
+        exposed = os.path.join(td, "piper.onnx")
+        onnx.save(
+            model,
+            exposed,
+            save_as_external_data=True,
+            location="piper.data",
+            all_tensors_to_one_file=True,
+            size_threshold=1024,
+        )
+        session = ort.InferenceSession(exposed, providers=["CPUExecutionProvider"])
+        table = json.load(open(config_path))["phoneme_id_map"]
+        ids = list(table["^"])
+        for phoneme in phonemes:
+            ids += table[phoneme] + table["_"]
+        ids += table["$"]
+        tokens = np.array([ids], dtype=np.int64)
+        audio, z = session.run(
+            [model.graph.output[0].name, latent],
+            {
+                "input": tokens,
+                "input_lengths": np.array([tokens.shape[1]], dtype=np.int64),
+                "scales": np.array([0.667, length_scale, 0.8], dtype=np.float32),
+            },
+        )
+    return np.asarray(z, dtype=np.float32), np.asarray(
+        audio, dtype=np.float32
+    ).squeeze()
+
+
+_PIPER_HELLO = list("h") + ["\u0259", "l", "\u02c8", "o", "\u028a"]
+
+
+def _pad_latent(z, frames):
+    """A latent padded out to the compiled length. Zero is the right filler:
+    the decoder's input is already a flow output multiplied by a length
+    mask, so every frame past the utterance is zero in the untouched graph
+    too."""
+    padded = np.zeros((1, 192, frames), dtype=np.float32)
+    padded[:, :, : z.shape[2]] = z[:, :, :frames]
+    return padded
+
+
+def _build_piper_decoder(work_dir, frames, latents):
+    """Compile the real Piper decoder for the AX650, calibrating on real
+    latents. Returns `(axmodel path, mcode)`."""
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", "z.tar"), latents
+    )
+    with open(os.path.join(work_dir, "config", "cfg.json"), "w") as f:
+        json.dump(
+            {
+                "model_type": "ONNX",
+                "npu_mode": "NPU1",
+                "quant": {
+                    "input_configs": [
+                        {
+                            "tensor_name": "z",
+                            "calibration_dataset": "./dataset/z.tar",
+                            "calibration_format": "Numpy",
+                            "calibration_size": len(latents),
+                        }
+                    ],
+                    "calibration_method": "MinMax",
+                    "precision_analysis": False,
+                },
+                "compiler": {"check": 0},
+            },
+            f,
+        )
+    result = pulsar2_docker.build(
+        work_dir, "decoder.onnx", "output", config_path="config/cfg.json"
+    )
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    return result.axmodel_path, mcode
+
+
+def test_piper_decoder_subgraph_reproduces_the_whole_voice(tmp_path):
+    """Confirmed real: the decoder subgraph lifted out of a Piper voice,
+    frozen to a fixed length, reproduces the untouched model's own audio
+    (correlation > 0.9999). That is what licenses treating a device run of
+    this subgraph as a device run of Piper's vocoder. CPU only -- no Docker,
+    no device.
+    """
+    voice = _cached_piper_voice()
+    if voice is None:
+        pytest.skip("the Piper en_US-lessac-low voice is not in the local cache")
+    ort = pytest.importorskip("onnxruntime")
+    frames = 64
+    z, reference = _piper_say(voice[0], voice[1], _PIPER_HELLO)
+    assert z.shape[1] == 192, z.shape
+    # 256 audio samples per latent frame -- the three upsampling stages
+    # multiply out to 8 * 8 * 4.
+    assert reference.size == 256 * z.shape[2], (reference.size, z.shape)
+
+    path = str(tmp_path / "decoder.onnx")
+    _piper_decoder(voice[0], path, frames)
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    out = np.asarray(session.run(None, {"z": _pad_latent(z, frames)})[0]).squeeze()
+    out = out[: reference.size]
+    assert np.corrcoef(out, reference)[0, 1] > 0.9999, np.corrcoef(out, reference)[0, 1]
+
+
+def test_real_piper_decoder_uses_no_new_instruction_forms(tmp_path):
+    """Confirmed real (see the README's "Real weights, real speech"
+    section): the *trained* Piper vocoder -- a different model family, a
+    different domain, weights this decoder has never seen -- compiles to an
+    mcode that introduces no verb and no tag beyond the ones the CNN and
+    transformer builds already used, and the codec round-trips it
+    byte-exactly. Needs Docker, no device.
+    """
+    voice = _cached_piper_voice()
+    if voice is None:
+        pytest.skip("the Piper en_US-lessac-low voice is not in the local cache")
+    frames = 64
+    z, _ = _piper_say(voice[0], voice[1], _PIPER_HELLO)
+    work = tmp_path / "work"
+    work.mkdir()
+    _piper_decoder(voice[0], str(work / "decoder.onnx"), frames)
+    _, mcode = _build_piper_decoder(str(work), frames, [_pad_latent(z, frames)] * 4)
+
+    covered, _ = _nonzero_coverage(mcode, **_FULL_RULE)
+    assert covered >= 0.95, covered
+    lo, hi = _stream_bounds(mcode)
+    records = _decode_mcode(mcode, start=lo, end=hi, **_FULL_RULE)
+    assert _encode_mcode(records) == mcode[lo:hi]
+
+    verbs = {r["verb"] for r in records if r["kind"] == "V"}
+    assert verbs <= _VERBS6, verbs
+    tags = {r["tag"] for r in records if r["kind"] in ("S", "B")}
+    assert tags <= _ALL_TAGS | {0xA1, 0xC1, 0xE1}, tags
+
+
+def test_real_piper_decoder_makes_speech_on_device(tmp_path):
+    """Confirmed on the AX650N: the real Piper vocoder, quantised to INT8
+    and run on the NPU, reproduces the CPU waveform at a correlation above
+    0.98 -- audible speech, not the noise a randomly initialised vocoder
+    emits. This is the end-to-end answer to whether a deep convolutional
+    stack survives this NPU's INT8 quantisation; a 30-layer transformer did
+    not. Needs Docker *and* a device.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device")
+    voice = _cached_piper_voice()
+    if voice is None:
+        pytest.skip("the Piper en_US-lessac-low voice is not in the local cache")
+    ort = pytest.importorskip("onnxruntime")
+    frames = 64
+    z, _ = _piper_say(voice[0], voice[1], _PIPER_HELLO)
+    padded = _pad_latent(z, frames)
+    work = tmp_path / "work"
+    work.mkdir()
+    path = str(work / "decoder.onnx")
+    _piper_decoder(voice[0], path, frames)
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    reference = np.asarray(session.run(None, {"z": padded})[0]).squeeze()
+
+    axmodel, _ = _build_piper_decoder(str(work), frames, [padded] * 4)
+    result = pulsar2_docker.run_on_device_with_inputs(
+        axmodel, {"z": padded.tobytes()}, timeout=300
+    )
+    assert not result.error, result.error
+    out = np.frombuffer(result.outputs[0], dtype=np.float32).squeeze()
+    assert out.size == frames * 256, out.size
+    correlation = float(np.corrcoef(out, reference)[0, 1])
+    assert correlation > 0.98, correlation
 
 
 def test_tts_vocoder_uses_no_new_instruction_forms(tmp_path):

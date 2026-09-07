@@ -3403,6 +3403,86 @@ will need a sharper instrument than model diffing.
 Test: `test_tts_vocoder_uses_no_new_instruction_forms` in
 `tests/test_axera_mcode_structure.py` (fresh builds, no device).
 
+### Real weights, real speech: the Piper vocoder on the NPU
+
+The synthetic vocoder above answered a question about the instruction set,
+but it had random weights, so its output was noise. The next question is
+whether this NPU can produce *audible* speech, and that needs a trained
+model. It can, and it does.
+
+**Extract the decoder rather than rebuild it.** Hand-building a HiFi-GAN
+shape and loading weights into it means guessing dilations, paddings and
+upsample rates, and a single mismatch turns speech into noise with no error
+message. Lifting the subgraph out of the voice with `onnx.utils.extract_
+model` avoids all of it. The boundary is found by weight name -- whichever
+tensor `dec.conv_pre.weight`'s convolution reads -- because the intermediate
+tensor names are export artefacts and differ between voices.
+
+What comes out of `en_US-lessac-low` is 68 nodes and 47 initializers, and
+nothing else: `Conv` (20), `Add` (24), `LeakyRelu` (16), `ConvTranspose`
+(3), `Div` (3), `Tanh`, `Unsqueeze`. Every one of those is supported. The
+architecture:
+
+| Stage | Shape |
+| --- | --- |
+| latent in | 192 channels |
+| `conv_pre` | 192 to 256, kernel 7 |
+| `ups.0` / `ups.1` / `ups.2` | kernel 16 stride 8, kernel 16 stride 8, kernel 8 stride 4 |
+| channels after each stage | 128, 64, 32 |
+| residual blocks | six, kernels 3/5/7, dilations 1 and 2, 2 and 6, 3 and 12 |
+| `conv_post` | 32 to 1, kernel 7, then `Tanh` |
+
+The three upsampling strides multiply to 256, which is exactly the measured
+ratio of output samples to latent frames at a 16 kHz sample rate.
+
+**The subgraph is the voice.** Frozen to a fixed 64-frame input and fed the
+latent captured from a real utterance, it reproduces the untouched model's
+own waveform at a correlation of 0.99999998. The remaining difference comes
+only from zero-padding the latent out to the compiled length, which is what
+the full graph's own length mask does anyway.
+
+**Quantisation does not destroy it.** Calibrated on real latents drawn from
+the model's own encoder, Pulsar2's end-to-end precision report gives a
+cosine similarity of 0.9943 at the output for a 64-frame build and 0.9909
+for a 256-frame one. On the device:
+
+| Build | Latent frames | Audio | NPU vs CPU correlation |
+| --- | --- | --- | --- |
+| `out_dec` | 64 | 0.94 s | 0.9956 |
+| `out_dec256` | 256 | 2.11 s | 0.9924 |
+
+The 256-frame model compiles to `max_cycle` 12,792,136 and runs in 13.4 ms,
+which is about 300 times faster than the 4.1 seconds of audio it emits.
+
+**This settles an open question, and the contrast is the interesting part.**
+Plain INT8 quantisation collapsed a 30-layer transformer to near-random
+output, so whether a deep convolutional stack would survive was genuinely
+open. It does. The plausible reason is structural: the vocoder is 20
+convolutions deep with additive residual paths and a `Tanh` bounding every
+output sample, where a transformer accumulates attention error across layers
+with nothing bounding it. Depth alone does not predict quantisation
+survival; what the depth is made of does.
+
+**And the mcode confirms the generalisation.** A trained model in a new
+domain, whose weights the decoder had never seen, introduces no new
+instruction forms at all. Both builds use exactly the six known verbs
+(`a1`, `a2`, `a3`, `a7`, `a8`, `a9`) and no tag outside `0x81`-`0x9f` plus
+`0xa1` and the bit-6 odd-register forms, and the codec round-trips both
+byte-exactly. Coverage is 96.47% at 64 frames and 97.29% at 256, in line
+with the transformer builds rather than the CNNs.
+
+One detail worth recording: the 64-frame build uses the odd-register tags
+`0xc1` and `0xe1`, and the 256-frame build uses `0xe1` but not `0xc1`. The
+odd-register forms are therefore optional per build, not a fixed part of
+every stream -- the same model at a different input length simply does not
+need one of them.
+
+Tests: `test_piper_decoder_subgraph_reproduces_the_whole_voice` (CPU only),
+`test_real_piper_decoder_uses_no_new_instruction_forms` (Docker) and
+`test_real_piper_decoder_makes_speech_on_device` (Docker and device) in
+`tests/test_axera_mcode_structure.py`. All three skip unless the voice is in
+the local HuggingFace cache, so the suite stays offline.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
