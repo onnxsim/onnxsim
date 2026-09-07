@@ -3158,21 +3158,41 @@ Admitting them takes the config segments' non-zero bytes from 97.4% to
 segments stay at ~46% under the same rule). `_tokenize_mcode` takes
 these as `odd_tags`.
 
-**Confirmed on the AX650N: the segment table is a loader manifest the
-runtime validates field by field.** Patching one field of the decode
-subgraph's tail tables and re-running with valid inputs, every variant
-faulted with `0x8030070C` on every run (3 of 3 each, baseline
-bit-identical 3 of 3): the op segment's type word `0x8801 -> 0xe801`;
-its word count `f2 + 1`; its remaining count `f3 + 1`; table 0's total
-`f3 + 1`; a 6-field table's byte size `f5 - 64`; the same table's
-packed word `f4 + 1`; and table 0's own `f2 + 1`. Two of them (the type
-word's first run and the total-count patch) first hung the runtime for
-about two minutes -- `axcl_run_model` in uninterruptible sleep and
-`axcl-smi` blocked behind it -- before the fault surfaced, so a wrong
-segment table is the one patch class found so far that can stall the
-device rather than fail fast. Treat the table as load-bearing: an
-emitter must write the word counts, the countdown, the packed
-`f3 << 8 | 1` and the byte sizes exactly, not as metadata.
+**Confirmed on the AX650N: the segment table is a loader manifest --
+but only its word counts are load-bearing, and the first version of
+this paragraph got that wrong.** The first series of tail-table patches
+(type word, word count, remaining count, total, byte size, packed word,
+each on its own) reported a `0x8030070C` fault for *every* variant, 3 of
+3 each. That table was measured after the first variant -- the type
+word `0x8801 -> 0xe801` -- had already stalled the runtime for about two
+minutes, and after the series the driver's heartbeat thread stayed
+blocked until a reboot; the faults were the degraded device, not
+validation. Redone on the healthy device, one variant at a time with an
+`axcl-smi` health check and a baseline control run after each
+(baseline bit-identical throughout):
+
+| patch (decode subgraph tail tables) | result |
+|---|---|
+| a 6-field table's byte size `f5 - 64` | runs, outputs **identical** |
+| the same table's packed word `f4 + 1` | runs, outputs **identical** |
+| op segment word count `f2 + 1` | runs, outputs **identical** |
+| op segment remaining count `f3 + 1` | runs, outputs **identical** |
+| table 0 word count `f2 + 1` | **`Loading model failed`** -- rejected at load, no fault, device unharmed |
+| table 0 total `f3 + 1` | **`Loading model failed`** -- same |
+| op segment word count `f2 - 1` | **fault `0x8030070C`** at run, device unharmed |
+| table 0 word count `f2 - 1` | **fault `0x8030070C`** at run, device unharmed |
+| op segment type word `0x8801 -> 0xe801` | not repeated: the one patch that wedged the runtime |
+
+So the loader reads the word counts (`f2`) and table 0's total (`f3`) to
+lay the segments out: a count that overshoots the blob is rejected at
+load, a count shorter than its segment lets the run read a truncated
+program and fault, and a mid-table count one word too long merely reads
+8 bytes of padding. The remaining count, the packed `f3 << 8 | 1` and the
+byte size are compiler bookkeeping the runtime does not check. An
+emitter must get the word counts and the total exactly right; the rest
+it can mirror without consequence. The one caution stands: a bad *type
+word* is the patch class that stalls the device rather than failing
+fast, and it is the one to avoid.
 
 **`llm_build` emits one instruction stream for all 30 layers.** Every
 per-layer file's two mcodes are byte-identical to layer 0's from the
