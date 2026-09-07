@@ -68,6 +68,21 @@ python -m pytest tests/test_axera_mcode_structure.py -k on_device
 If the guest driver wedges: `lxc restart --force axcl-vm` (the card gets a
 secondary bus reset on the way), then re-run. The host is never involved.
 
+## A host crash to never repeat (2026-09-07 19:39, kdump `202609071939`)
+
+Starting the VM while the host AXCL modules were still loaded (the blacklist
+had been undone to test driver fix 5) took the host down. LXD steals the card
+with a per-device `driver_override`; when the guest driver reset the card's
+SoC, the card re-enumerated, the override went with the old device instance,
+the host's `ax_pcie_dev_host` probed the new one, and driver fix 4's automatic
+bring-up pushed firmware into a card the guest was driving -- panic in
+`axcl_firmware_load` (`axcl_pcie_device_online_work`). `create_vm.sh` now
+refuses to run unless the stack is unloaded *and* the blacklist file exists.
+The guest side has a rule too: a VFIO bus reset does not reset the card's
+SoC, only the driver's unload path does, so after `lxc restart --force`
+always `modprobe -r axcl_host && modprobe axcl_host` inside the guest before
+expecting a firmware push to succeed.
+
 ## Known limits
 
 - A Thunderbolt link drop while the card is assigned reaches the *guest*
