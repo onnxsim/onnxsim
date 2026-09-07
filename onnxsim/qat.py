@@ -39,11 +39,20 @@ backward emitted by :func:`onnxsim.graph_grad.build_backward`, and one
 ``(constants, state, scalars) -> (next state, loss)`` function, driven by
 :func:`onnxsim.qat_graph.run_step_graph`. So the loop reaches whatever
 execution provider ``step_providers=`` names -- CUDA, an NPU EP, WebGPU in
-the WASM build -- and it stays inside
-:data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` to make that real rather than
-nominal (no ``Round``:
-:meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest` composes
-one out of ``Sign``/``Abs``/``Cast``, and this reuses it).
+the WASM build.
+
+Everything this module *emits* stays inside
+:data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` to make that reach real rather
+than nominal (no ``Round``:
+:meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest` composes one out of
+``Sign``/``Abs``/``Cast``, and this reuses it). Note the boundary, because it
+is easy to over-read: the block's *own forward nodes are copied into the step
+graph verbatim*, so a block containing a ``Relu``, a ``Softmax`` or a
+``LayerNormalization`` produces a step graph containing those too. The
+allowlist constrains the fake-quant, the backward and the optimizer -- the
+parts this repository writes -- and says nothing about the block. Whether a
+given block's step graph runs on a given accelerator therefore depends on
+that backend's coverage of the block's own operators as well.
 
 **What this deliberately is not, and does not claim.**
 

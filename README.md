@@ -1257,10 +1257,14 @@ Two things here are genuinely new:
   state, loss)` function (`onnxsim/qat_graph.py`) -- so the loop runs on
   whatever execution providers `step_providers=` names: a GPU, an NPU
   execution provider, or WebGPU in the WASM build, rather than in host numpy.
-  The emitted graph stays inside `qat_graph.EP_FRIENDLY_OPS`, the operator set
-  those backends actually implement, and `onnxsim.backend.Runner` keeps the
-  parameters and the optimizer state resident on the provider's device between
-  steps, so only the per-step scalars go up and the loss comes down.
+  The parts onnxsim emits -- the fake-quant, the backward, the optimizer --
+  stay inside `qat_graph.EP_FRIENDLY_OPS`, a deliberately small operator set;
+  the block's own forward nodes are copied in as they are, so whether a
+  particular block's step graph runs on a particular accelerator also depends
+  on that backend's coverage of the operators the block itself contains.
+  `onnxsim.backend.Runner` keeps the parameters and the optimizer state
+  resident on the provider's device between steps, so only the per-step
+  scalars go up and the loss comes down.
 
 A block is named by its input and output tensor, exactly the way
 `apply_brecq` names one:
