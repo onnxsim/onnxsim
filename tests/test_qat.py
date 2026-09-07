@@ -1413,3 +1413,491 @@ def test_the_whole_model_walk_minibatches_every_block():
     rtn_error = _whole_model_error(quant, model, x)
     tuned_error = _whole_model_error(tuned, model, x)
     assert tuned_error < 0.75 * rtn_error
+
+
+# --- Activation quantization -------------------------------------------------
+#
+# ``learn_activation_scales`` trains each layer's own input quantizer -- its
+# uint8 (scale, zero_point) pair -- jointly with the weights, LSQ-style, with
+# onnxsim.adaquant's straight-through gradients. It is the one argument here
+# that changes *which quantized model* the pass targets: a weight-only INT4
+# model has no activation quantizer anywhere in it, so the flag necessarily
+# selects onnxsim.quantize_static's QDQ scheme instead. The tests below pin
+# that decision (both directions of the refusal), the gradients (against
+# adaquant's closed form rather than against themselves), the measurement, and
+# the two invariants the rest of this file already holds the pass to: the
+# default path is untouched, and nothing outside EP_FRIENDLY_OPS is emitted.
+
+
+def _inferred(body, initializer=()):
+    """``_model`` with shape inference run over it.
+
+    Needed only for the static-QDQ tests, and needed there for a reason worth
+    naming: ``quantize_static`` only quantizes a MatMul whose activation input
+    has a known element type, and the ONNX text parser types graph inputs and
+    outputs but not intermediates. Without this, a chain's *first* layer is
+    quantized and the rest silently are not -- which would make a two-layer
+    block quietly a one-layer one.
+    """
+    return onnx.shape_inference.infer_shapes(_model(body, initializer))
+
+
+def _static_relu_block_model(seed=0):
+    """``_relu_block_model``'s topology, ready for ``quantize_static``."""
+    rng = np.random.default_rng(seed)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    return _inferred(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+          Y1 = MatMul(X, W1)
+          A1 = Relu(Y1)
+          Y2 = MatMul(A1, W2)
+          Yout = Add(Y2, X)
+        }}
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def _static_tensors_for(model, matmul_output_name):
+    """``(wq, ws, x_scale, x_zp)`` initializer names for one
+    ``quantize_static``-quantized MatMul, found through the two
+    ``DequantizeLinear`` nodes feeding it."""
+    matmul = next(n for n in model.graph.node if n.output[0] == matmul_output_name)
+    wdq = next(n for n in model.graph.node if n.output[0] == matmul.input[1])
+    xdq = next(n for n in model.graph.node if n.output[0] == matmul.input[0])
+    return wdq.input[0], wdq.input[1], xdq.input[1], xdq.input[2]
+
+
+def _outlier_calibrated(model, x, outlier=40.0):
+    """``quantize_static`` calibrated on ``x`` plus one outlier sample.
+
+    The scenario in which the activation quantizer is the binding constraint,
+    and it is a realistic one rather than a contrived one: min/max calibration
+    sets the clip range from the largest value it happened to see, so a single
+    unrepresentative sample -- 40.0 against a distribution whose values are
+    order 1 -- widens the range ~30x and starves every ordinary activation of
+    quantization levels. Everything downstream then trains and is measured on
+    ``x`` alone, which is what makes the calibrated range genuinely, visibly
+    too wide rather than merely suboptimal.
+    """
+    dirty = x.copy()
+    dirty[0, 0] = outlier
+    return onnxsim.quantize_static(model, [{"X": dirty}])
+
+
+def test_activation_quantization_off_leaves_the_weight_only_pass_untouched(monkeypatch):
+    """The default path must be exactly what it was before this flag existed
+    -- and "exactly" is asserted twice, structurally and byte for byte.
+
+    Structurally: with ``learn_activation_scales`` off the builder never emits
+    an activation fake-quant, so the step graph has no ``Exp``, no state
+    tensor beyond the three per weight (the master weight and Adam's two
+    moments), and no ``qat__lr_act`` scalar.
+
+    Byte for byte: the digest below was recorded by running this exact
+    scenario against the implementation *before* activation quantization was
+    written. It covers the whole returned model, whose only mutable payload is
+    the two trained INT4 code arrays, so a mismatch means the weight-only path
+    changed -- which is the thing this test exists to prevent, and which no
+    tolerance-based assertion could catch.
+    """
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    captured = _capture_step_graph(monkeypatch)
+    tuned = onnxsim.apply_qat(
+        model, quant, "X", "Yout", calibration_data=[{"X": x}], num_iterations=200
+    )
+
+    step = captured["step"]
+    assert not [n for n in step.model.graph.node if n.op_type == "Exp"]
+    assert len(step.state) == 3 * 2  # two layers, (weight, m, v) each
+    assert "qat__lr_act" not in {i.name for i in step.model.graph.input}
+
+    import hashlib
+
+    assert (
+        hashlib.sha256(tuned.SerializeToString()).hexdigest()
+        == "b8ff27e0dd19d1a806f87268841969719fbdac35e9c72835e58dae6cc5f52530"
+    )
+    # ...and passing the flag explicitly as False is the same call, so the
+    # default is not merely *a* behaviour but this one.
+    explicit = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        num_iterations=200,
+        learn_activation_scales=False,
+    )
+    assert explicit.SerializeToString() == tuned.SerializeToString()
+
+
+def test_activation_quantization_refuses_a_model_with_no_activation_quantizer():
+    """The scheme decision, enforced in both directions.
+
+    ``apply_qat``'s default target, ``quantize_weight_only_int4``, has fp32
+    activations: there is no quantizer in that model to train and no
+    initializer to write a trained one back into. Adding one would mean
+    *inserting* QDQ pairs -- inventing a W4A8 model no ``quantize_*`` function
+    emits -- so the flag is refused, loudly, naming the mismatch rather than
+    the block. The mirror case matters just as much: a ``quantize_static``
+    model has no INT4 layer, so the *default* mode refuses it, and its message
+    points at the flag that would have worked.
+    """
+    model = _relu_block_model(seed=0)
+    int4 = _quantize_chain_int4(model, {"W1", "W2"})
+    data = [{"X": _correlated_calibration(rank=2, num_samples=16)}]
+
+    with pytest.raises(ValueError, match="quantize_weight_only_int4 one"):
+        onnxsim.apply_qat(
+            model,
+            int4,
+            "X",
+            "Yout",
+            calibration_data=data,
+            learn_activation_scales=True,
+        )
+
+    static_model = _static_relu_block_model(seed=0)
+    static = _outlier_calibrated(static_model, _correlated_calibration(rank=2))
+    with pytest.raises(ValueError, match="learn_activation_scales=True trains"):
+        onnxsim.apply_qat(static_model, static, "X", "Yout", calibration_data=data)
+
+
+def test_the_activation_gradients_are_adaquants(monkeypatch):
+    """The gradients this emits are :mod:`onnxsim.adaquant`'s, checked against
+    adaquant's closed form rather than against themselves.
+
+    They are not transcribed from it. The quantize-dequantize chain is emitted
+    stage by stage and handed to :func:`onnxsim.graph_grad.build_backward`,
+    which differentiates it with its ordinary rules; the rounding's
+    straight-through estimator is *structural*, expressed as ``r + (round(r) -
+    r)`` with the residual computed by nodes deliberately left out of the
+    differentiated list. That is the one part of the construction that could
+    be silently wrong -- include those two nodes and the residual's ``-r``
+    cancels the ``+r``, leaving a zero gradient that would still train
+    something, just not the right thing. So the emitted gradient tensors are
+    pulled out of the step graph by name (through the ``adam_update`` call
+    that consumes them), evaluated, and compared with
+    ``d(xdq)/ds = (xq - zp) - active * x/s``, ``d(xdq)/d(zp) = s * (active -
+    1)`` and ``d/d(log s) = s * d/ds`` computed in numpy.
+    """
+    rng = np.random.default_rng(0)
+    w = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    model = _inferred(
+        f"""
+        g (float[8,{D}] X) => (float[8,{D}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(w, "W")],
+    )
+    x = _correlated_calibration(rank=3, num_samples=8)
+    quant = _outlier_calibrated(model, x)
+
+    gradients = {}
+    real_adam = qat_graph.adam_update
+
+    def spy_adam(b, param, grad, *args, **kwargs):
+        gradients[param] = grad
+        return real_adam(b, param, grad, *args, **kwargs)
+
+    monkeypatch.setattr(qat.qat_graph, "adam_update", spy_adam)
+    captured: dict = {}
+    real_run = qat_graph.run_step_graph
+
+    def spy_run(step, **kwargs):
+        captured.update(kwargs)
+        captured["step"] = step
+        return real_run(step, **kwargs)
+
+    monkeypatch.setattr(qat.qat_graph, "run_step_graph", spy_run)
+    onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Y",
+        calibration_data=[{"X": x}],
+        num_iterations=1,
+        learn_activation_scales=True,
+    )
+
+    # Evaluate the two gradient tensors the step graph actually computes.
+    step = captured["step"]
+    probe = onnx.ModelProto()
+    probe.CopyFrom(step.model)
+    wanted = [gradients["qat__as0"], gradients["qat__az0"]]
+    for name in wanted:
+        probe.graph.output.append(onnx.ValueInfoProto(name=name))
+    feeds = {k: np.asarray(v, np.float32) for k, v in captured["constants"].items()}
+    feeds.update({k: np.asarray(v, np.float32) for k, v in captured["state"].items()})
+    feeds.update(
+        {k: np.asarray(v, np.float32) for k, v in captured["scalars"](0).items()}
+    )
+    session = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    grad_log_s, grad_zp = session.run(wanted, feeds)
+
+    # ...and the same two quantities, adaquant's way.
+    _, ws_name, xs_name, xzp_name = _static_tensors_for(quant, "Y")
+    stored = _weights_of(quant)
+    scale_full = np.repeat(stored[ws_name].astype(np.float64).reshape(1, -1), D, axis=0)
+    w_hat = (
+        np.clip(np.round(w.astype(np.float64) / scale_full), -127.0, 127.0) * scale_full
+    )
+    s = float(stored[xs_name])
+    zp = float(stored[xzp_name])
+    xf = x.astype(np.float64)
+    ratio = xf / s
+    raw = np.sign(ratio) * np.floor(np.abs(ratio) + 0.5) + zp
+    active = ((raw > 0.0) & (raw < 255.0)).astype(np.float64)
+    centred = np.clip(raw, 0.0, 255.0) - zp
+    xdq = centred * s
+    teacher = xf @ w.astype(np.float64)
+    dl_dy = 2.0 * (xdq @ w_hat - teacher) / teacher.size
+    dl_dxdq = dl_dy @ w_hat.T
+    expected_log_s = float(np.sum(dl_dxdq * (centred - active * ratio)) * s)
+    expected_zp = float(np.sum(dl_dxdq * (s * (active - 1.0))))
+
+    assert grad_log_s == pytest.approx(expected_log_s, rel=2e-3)
+    assert grad_zp == pytest.approx(expected_zp, rel=2e-3)
+    # Not vacuous: a cancelled straight-through estimator would leave the
+    # scale's gradient at zero.
+    assert abs(expected_log_s) > 1e-6
+
+
+def test_training_the_activation_quantizer_beats_training_the_weights_alone():
+    """The measurement, on a case where the activation quantizer is the
+    binding constraint.
+
+    ``_outlier_calibrated`` gives the model a min/max activation range set by
+    one unrepresentative sample, ~30x wider than the data it is then trained
+    and measured on -- so most of the remaining error is activation
+    quantization, and no amount of weight fine-tuning can reach it. The
+    baseline is *not* a weight-only run of a different scheme (that would
+    compare two different models); it is this same joint run with
+    ``activation_learning_rate=0``, which freezes the quantizer while training
+    the weights against the same activation-quantized forward.
+
+    **Measured, whole-model output error against the float model** (seed 0,
+    800 steps, ``activation_learning_rate=1e-1``): round-to-nearest 4.73,
+    weights alone 4.08, weights + activation quantizers 2.54 -- 38% below the
+    weights-alone run. Across seeds 0-2: 38%, 43%, 38%.
+
+    **The honest boundaries, and the third one is the important one.**
+
+    1. *At the default learning rate the margin is much smaller.* The same
+       runs at ``activation_learning_rate=1e-2`` (the default, matching
+       :func:`onnxsim.apply_adaquant`) land at 3.47 / 3.38 / 3.51 -- 15-24%
+       rather than 38-43%. The scale has ~3 log units to travel here and
+       ``lr_decay`` anneals the budget away, so a badly calibrated range wants
+       a larger rate. The test passes 1e-1 and says so rather than quietly
+       tuning the default to the scenario.
+    2. *Re-calibrating is cheaper.* With a range this wrong, calibrating on
+       representative data (or ``calibrate(method="mse")``) is a forward pass,
+       not 800 optimizer steps, and should be tried first. What training buys
+       over re-calibrating is a range optimal for the reconstruction *loss*
+       rather than for the observed min and max.
+    3. **And when the range is already right, this does not help.** The same
+       comparison with the same model calibrated on the same clean data
+       (no outlier) reads round-to-nearest 1.51, weights alone 1.23, joint
+       1.23 at the default rate and 1.27 at 1e-1 -- a *regression* at both,
+       on all three seeds: 0.5-4% at the default, 3-6% at 1e-1. That is not
+       a tuning failure, it is the shape of the problem: min/max on
+       representative data is already close to MSE-optimal (the reason
+       ``calibrate(method="mse")`` buys little), the remaining error is the
+       weights' and the INT8 grid's, and a second coupled parameter group
+       makes a solved problem harder rather than a hard one easier. So this
+       flag is for a quantizer whose range is *wrong*, and the module says so.
+    """
+    model = _static_relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2, num_samples=64)
+    quant = _outlier_calibrated(model, x)
+
+    def tune(activation_learning_rate):
+        return onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Yout",
+            calibration_data=[{"X": x}],
+            num_iterations=800,
+            learn_activation_scales=True,
+            activation_learning_rate=activation_learning_rate,
+        )
+
+    weights_only = tune(0.0)
+    joint = tune(1e-1)
+    onnx.checker.check_model(joint)
+
+    rtn_error = _whole_model_error(quant, model, x)
+    weights_error = _whole_model_error(weights_only, model, x)
+    joint_error = _whole_model_error(joint, model, x)
+    assert weights_error < rtn_error
+    # The observed margin is ~38% (43% on seed 1); the assertion is
+    # deliberately looser so it tracks the mechanism rather than the seed.
+    assert joint_error < 0.75 * weights_error
+
+    # The quantizers really moved, and only they and the weights did.
+    old, new = _weights_of(quant), _weights_of(joint)
+    frozen = _weights_of(weights_only)
+    for matmul in ("Y1", "Y2"):
+        wq, ws, xs, xzp = _static_tensors_for(quant, matmul)
+        assert not np.array_equal(old[wq], new[wq])
+        # learn_scales is off, so the *weight's* scale is still byte-identical
+        # -- the same guarantee the weight-only path makes.
+        np.testing.assert_array_equal(old[ws], new[ws])
+        assert float(new[xs]) < float(old[xs])
+        # ...and unmoved when the activation learning rate is zero, which is
+        # what makes the comparison above a comparison. Not *byte* identical:
+        # the scale is optimized in log space and exported as exp(log(s)), and
+        # float32's log/exp is not exactly the identity, so a frozen quantizer
+        # comes back one ulp away. That is intrinsic to the log-space
+        # parametrization onnxsim.adaquant also uses, and 1e-7 relative is
+        # seven orders of magnitude below anything a uint8 grid can notice.
+        assert float(frozen[xs]) == pytest.approx(float(old[xs]), rel=1e-6)
+        np.testing.assert_array_equal(old[xzp], frozen[xzp])
+
+
+def test_each_consumer_of_an_activation_gets_its_own_trained_quantizer():
+    """The scope decision, stated as a test: a quantizer belongs to an *edge*,
+    not to a tensor.
+
+    ``quantize_static`` inserts one QuantizeLinear/DequantizeLinear pair per
+    quantized node, with its own scale and zero-point initializers, so an
+    activation feeding two MatMuls carries two independent quantizers in the
+    deployed model. They start identical -- same tensor, same calibrated
+    range. Training them as one would be a different (and lossier) model than
+    the one that ships, so they are trained separately, and here they end up
+    different.
+    """
+    rng = np.random.default_rng(1)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 2.0).astype(np.float32)
+    model = _inferred(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+          Y1 = MatMul(X, W1)
+          Y2 = MatMul(X, W2)
+          Yout = Add(Y1, Y2)
+        }}
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    x = _correlated_calibration(rank=2, num_samples=32)
+    quant = _outlier_calibrated(model, x)
+
+    _, _, first_scale, _ = _static_tensors_for(quant, "Y1")
+    _, _, second_scale, _ = _static_tensors_for(quant, "Y2")
+    assert first_scale != second_scale
+    before = _weights_of(quant)
+    assert float(before[first_scale]) == float(before[second_scale])
+
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        num_iterations=400,
+        learn_activation_scales=True,
+        activation_learning_rate=1e-1,
+    )
+    onnx.checker.check_model(tuned)
+    after = _weights_of(tuned)
+    assert float(after[first_scale]) != float(after[second_scale])
+
+
+def test_the_activation_quant_step_graph_stays_inside_the_allowlist(monkeypatch):
+    """The same standard the rest of this file holds the pass to, applied to
+    the nodes activation quantization adds.
+
+    Nothing new was needed: the fake-quant chain is ``Exp``/``Div``/``Add``/
+    ``Clip``/``Sub``/``Mul`` plus
+    :meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest`'s
+    ``Sign``/``Abs``/``Cast``, and its backward is what
+    :mod:`onnxsim.graph_grad` already emits. The ``Round`` operator WebNN does
+    not have stays absent, which is the whole reason ``round_to_nearest``
+    exists.
+    """
+    model = _static_relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2, num_samples=16)
+    quant = _outlier_calibrated(model, x)
+
+    captured = _capture_step_graph(monkeypatch)
+    onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        num_iterations=1,
+        learn_scales=True,
+        learn_activation_scales=True,
+    )
+
+    block_ops = {n.op_type for n in model.graph.node}
+    emitted = {n.op_type for n in captured["step"].model.graph.node} - block_ops
+    assert "Exp" in emitted  # the activation scale's log-space parametrization
+    assert emitted <= set(qat_graph.EP_FRIENDLY_OPS), sorted(
+        emitted - set(qat_graph.EP_FRIENDLY_OPS)
+    )
+
+
+def test_the_whole_model_walk_trains_activation_quantizers_too():
+    """``learn_activation_scales`` threaded through the walk, including
+    discovery: which layers count as quantized is what closes a block, so the
+    plan is made against the same scheme the training targets."""
+    rng = np.random.default_rng(0)
+    weights = [(rng.standard_normal((D, D)) * 0.4).astype(np.float32) for _ in range(4)]
+    body = "\n".join(
+        f"  Y{i + 1} = MatMul({'X' if i == 0 else f'A{i}'}, W{i + 1})\n"
+        f"  A{i + 1} = Relu(Y{i + 1})"
+        for i in range(3)
+    )
+    body += "\n  Yout = MatMul(A3, W4)"
+    model = _inferred(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+        {body}
+        }}
+        """,
+        [_f32(w, f"W{i + 1}") for i, w in enumerate(weights)],
+    )
+    x = _correlated_calibration(rank=2, num_samples=64)
+    quant = _outlier_calibrated(model, x)
+
+    blocks = onnxsim.discover_qat_blocks(model, quant, learn_activation_scales=True)
+    assert [(b.input_name, b.output_name) for b in blocks] == [
+        ("X", "Y2"),
+        ("Y2", "Yout"),
+    ]
+
+    tuned, results = onnxsim.apply_qat_all_blocks(
+        model,
+        quant,
+        calibration_data=[{"X": x}],
+        num_iterations=300,
+        learn_activation_scales=True,
+        activation_learning_rate=1e-1,
+    )
+    onnx.checker.check_model(tuned)
+    assert all(r.trained and r.skipped_reason is None for r in results)
+
+    old, new = _weights_of(quant), _weights_of(tuned)
+    for matmul in ("Y1", "Y2", "Y3", "Yout"):
+        _, _, xs, _ = _static_tensors_for(quant, matmul)
+        assert float(new[xs]) != float(old[xs])
+    assert _whole_model_error(tuned, model, x) < 0.6 * _whole_model_error(
+        quant, model, x
+    )

@@ -72,10 +72,19 @@ that backend's coverage of the block's own operators as well.
   backpropagates through the *entire* graph at once against the model's own
   output; a block is always the unit of optimization, and the teacher's
   activations are always the target.
-- *Not activation quantization.* This targets
-  :func:`onnxsim.quantize_weight_only_int4`'s weight-only scheme, the same
-  one AdaRound/BRECQ/FOEM target. Learnable activation scales exist in-tree
-  (:mod:`onnxsim.adaquant`) but are not wired in here.
+- *Weight-only by default; activation quantization is opt-in and changes
+  the target scheme.* With ``learn_activation_scales=False`` (the default)
+  this targets :func:`onnxsim.quantize_weight_only_int4`'s weight-only
+  scheme, the same one AdaRound/BRECQ/FOEM target, and there is no
+  activation quantizer anywhere in that model to train. With
+  ``learn_activation_scales=True`` it targets
+  :func:`onnxsim.quantize_static`'s QDQ scheme instead -- uint8 affine
+  activations, per-output-channel symmetric INT8 weights -- and trains the
+  weights *and* the activation quantizers of that scheme jointly. See
+  :func:`apply_qat`'s own docstring for why one flag necessarily selects a
+  scheme rather than adding a feature to the other one, and for what is
+  refused. The activation gradients are :mod:`onnxsim.adaquant`'s, not a
+  second derivation of them.
 - *Calibration-scale, even minibatched.* ``batch_size=None`` (the default)
   is full-batch gradient descent: the whole calibration set is one static
   tensor baked into the step graph's shapes, as in every other
@@ -108,6 +117,20 @@ that backend's coverage of the block's own operators as well.
   calibration activations are strongly low-rank, which is why this is worth
   having -- but "QAT beats AdaRound" is not a claim this module makes.
 
+  The same standard applied to ``learn_activation_scales``, and it lands in
+  the same shape: on a block whose activation range was calibrated from one
+  unrepresentative outlier -- ~30x too wide, so activation quantization is
+  the binding constraint -- training the quantizers alongside the weights
+  takes the whole-model output error from 4.08 (weights alone) to 2.54, 38%
+  better, on all three seeds tried. On the *same* block calibrated on
+  representative data it does not help at all: 1.23 weights alone against
+  1.23 joint at the default learning rate and 1.27 at 1e-1 -- a regression
+  at both rates and on all three seeds. Min/max on
+  representative data is already close to MSE-optimal, so there is little
+  left for a learned clip range to find, and a second coupled parameter
+  group makes a solved problem harder. This is a fix for a quantizer whose
+  range is wrong, not a free improvement on one whose range is right.
+
 **What the block contract accepts and refuses.** Refusing is loud
 wherever the caller named the block: :func:`apply_qat` on a block it cannot
 train raises :class:`ValueError`, never returning a silently unchanged
@@ -124,8 +147,10 @@ from further upstream, or a second graph input, is fine). It is refused if
 has an op type :data:`onnxsim.graph_grad.SUPPORTED_OPS` does not cover
 (including one no gradient reaches -- the same standard
 :func:`onnxsim.graph_grad.build_backward` holds itself to), if the slice
-contains no ``quantize_weight_only_int4``-quantized MatMul/Gemm to train, or
-if the block's shapes cannot be inferred statically at opset 17.
+contains no layer of the *targeted scheme* to train (which scheme that is
+depends on ``learn_activation_scales``, so the same block can be trainable
+under one and refused under the other -- see :func:`apply_qat`), or if the
+block's shapes cannot be inferred statically at opset 17.
 """
 
 from __future__ import annotations
@@ -139,7 +164,8 @@ import onnx.numpy_helper
 import onnx.shape_inference
 
 from onnxsim import backend, graph_grad, qat_graph
-from onnxsim.adaround import _Candidate, _find_int4_matmul_candidates, _pack_int4
+from onnxsim.adaquant import _find_static_qdq_candidates
+from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
 from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
@@ -147,6 +173,17 @@ from onnxsim.calibration import Tensors, generate_random_calibration_data
 # onnxsim.brecq pins for the same scheme.
 _N_MIN = -7.0
 _N_MAX = 7.0
+
+# quantize_static's weight range: per-output-channel symmetric INT8, the same
+# grid onnxsim.adaquant already optimizes rounding within.
+_INT8_N_MIN = -127.0
+_INT8_N_MAX = 127.0
+
+# ...and its activation range: uint8, asymmetric (a learned zero-point), so
+# the quantizer this module trains is exactly the (scale, zero_point) pair
+# onnxsim.adaquant trains -- same bounds, same straight-through derivation.
+_ACT_N_MIN = 0.0
+_ACT_N_MAX = 255.0
 
 # Every name this module introduces into the step graph starts here, so it
 # cannot collide with a tensor name carried over from the float model.
@@ -166,6 +203,177 @@ def _round_half_away(x: np.ndarray) -> np.ndarray:
     return np.sign(x) * np.floor(np.abs(x) + 0.5)
 
 
+@dataclass(frozen=True)
+class _ActQuant:
+    """One activation quantizer this module may train: where it sits, which
+    initializers it is stored in, and what calibration left it at.
+
+    It describes an *edge*, not a tensor, and that is the whole of the
+    "where does the quantizer sit" question. :func:`onnxsim.quantize_static`
+    inserts one ``QuantizeLinear``/``DequantizeLinear`` pair per quantized
+    node, with its own scale and zero-point initializers, even when two nodes
+    read the same activation -- so a tensor feeding two MatMuls carries two
+    independent quantizers and gets two independent :class:`_ActQuant`\ s.
+    Training one per *tensor* would be a different (and lossier) model than
+    the one that ships.
+    """
+
+    #: The activation the quantizer reads -- the layer's own ``input[0]``.
+    tensor: str
+    scale_name: str
+    zp_name: str
+    scale_init: float
+    zp_init: float
+
+
+@dataclass(frozen=True)
+class _QuantizedLayer:
+    """One quantized MatMul/Gemm this module can train, with the two schemes'
+    differences already normalized away.
+
+    Both schemes are "an integer code array plus a scale that tiles the
+    weight", and everything downstream -- the fake-quant forward, the
+    blocked-scale reshapes, the LSQ scale gradient, the export -- is written
+    against that shape rather than against either scheme. The normalization
+    is entirely in :func:`_from_int4` and :func:`_from_static`:
+
+    - ``quantize_weight_only_int4``: 32-element blocks along the reduction
+      axis, codes in ``[-7, 7]``, scale stored 2-D, no activation quantizer.
+    - ``quantize_static``: one scale per output channel, codes in
+      ``[-127, 127]``, scale stored 1-D. A per-channel scale *is* a
+      block-wise scale whose block spans the whole reduction axis, so it maps
+      onto the same rank-3 reshape with ``block_size`` = that axis's length
+      and a scale of shape ``[1, N]`` (or ``[N, 1]`` for a ``transB`` Gemm's
+      ``[N, K]`` weight). No special case is needed anywhere below.
+    """
+
+    output_name: str
+    float_node: onnx.NodeProto
+    w_float_init: onnx.TensorProto
+    wq_name: str
+    ws_name: str
+    #: The scale's shape as the *model* stores it, for writing it back.
+    ws_dims: Tuple[int, ...]
+    #: The same scale in the normalized 2-D blocked view.
+    scale_2d: np.ndarray
+    axis: int
+    block_size: int
+    n_min: float
+    n_max: float
+    #: INT4 codes are packed two to a byte on export; INT8 codes are not.
+    packed_int4: bool
+    act: Optional[_ActQuant]
+
+
+def _from_int4(candidate) -> _QuantizedLayer:
+    """A :func:`onnxsim.quantize_weight_only_int4` layer, unchanged in
+    substance from what this module trained before ``_QuantizedLayer``
+    existed."""
+    scale = onnx.numpy_helper.to_array(candidate.ws_init).astype(np.float32)
+    return _QuantizedLayer(
+        output_name=candidate.output_name,
+        float_node=candidate.float_node,
+        w_float_init=candidate.w_float_init,
+        wq_name=candidate.wq_name,
+        ws_name=candidate.ws_init.name,
+        ws_dims=tuple(int(d) for d in candidate.ws_init.dims),
+        scale_2d=scale,
+        axis=candidate.axis,
+        block_size=candidate.block_size,
+        n_min=_N_MIN,
+        n_max=_N_MAX,
+        packed_int4=True,
+        act=None,
+    )
+
+
+def _from_static(
+    candidate, quantized_model: onnx.ModelProto
+) -> Optional[_QuantizedLayer]:
+    """A :func:`onnxsim.quantize_static` QDQ layer, or ``None`` if its
+    initializers are not the shape that scheme produces.
+
+    The ``None`` cases are the ones a hand-edited or third-party model can
+    reach: a per-channel weight scale that is not 1-D of the output channel's
+    length, or an activation scale/zero-point that is not a single value.
+    They are dropped here rather than approximated, exactly as
+    :func:`_find_int4_matmul_candidates` drops a layer whose ``block_size``
+    it cannot read -- a layer this does not recognize is simply not trained,
+    and a block with none left is refused loudly by :func:`_plan_block`.
+    """
+    q_init = {t.name: t for t in quantized_model.graph.initializer}
+    ws_init = q_init.get(candidate.ws_name)
+    x_scale_init = q_init.get(candidate.x_scale_name)
+    x_zp_init = q_init.get(candidate.x_zp_name)
+    if ws_init is None or x_scale_init is None or x_zp_init is None:
+        return None
+
+    dims = tuple(int(d) for d in candidate.w_float_init.dims)
+    channel_axis = candidate.channel_axis
+    if channel_axis not in (0, 1):
+        return None
+    scale = onnx.numpy_helper.to_array(ws_init).astype(np.float32).reshape(-1)
+    if scale.shape[0] != dims[channel_axis]:
+        return None
+    # The blocked axis is the *other* one: one scale covers the whole
+    # reduction, which is what "per output channel" means.
+    blocked = 1 - channel_axis
+    scale_2d = scale.reshape((1, -1) if blocked == 0 else (-1, 1))
+
+    x_scale = onnx.numpy_helper.to_array(x_scale_init).astype(np.float64).reshape(-1)
+    x_zp = onnx.numpy_helper.to_array(x_zp_init).astype(np.float64).reshape(-1)
+    if x_scale.shape[0] != 1 or x_zp.shape[0] != 1:
+        return None
+
+    return _QuantizedLayer(
+        output_name=candidate.output_name,
+        float_node=candidate.float_node,
+        w_float_init=candidate.w_float_init,
+        wq_name=candidate.wq_name,
+        ws_name=candidate.ws_name,
+        ws_dims=tuple(int(d) for d in ws_init.dims),
+        scale_2d=scale_2d,
+        axis=blocked,
+        block_size=dims[blocked],
+        n_min=_INT8_N_MIN,
+        n_max=_INT8_N_MAX,
+        packed_int4=False,
+        act=_ActQuant(
+            tensor=candidate.float_node.input[0],
+            scale_name=candidate.x_scale_name,
+            zp_name=candidate.x_zp_name,
+            scale_init=float(x_scale[0]),
+            zp_init=float(x_zp[0]),
+        ),
+    )
+
+
+def _find_layers(
+    float_model: onnx.ModelProto,
+    quantized_model: onnx.ModelProto,
+    activation_quant: bool,
+) -> List[_QuantizedLayer]:
+    """Every layer of the scheme this run targets, in one list.
+
+    The two finders are mutually exclusive by construction -- a weight
+    dequantized from INT4 with a ``block_size`` is not one dequantized from
+    per-channel INT8, and a weight-only model has no activation QDQ pair at
+    all -- so this selects rather than merges. Which one is selected is the
+    single decision ``learn_activation_scales`` makes; see :func:`apply_qat`.
+    """
+    if not activation_quant:
+        return [
+            _from_int4(c)
+            for c in _find_int4_matmul_candidates(float_model, quantized_model)
+        ]
+    layers = []
+    for c in _find_static_qdq_candidates(float_model, quantized_model):
+        layer = _from_static(c, quantized_model)
+        if layer is not None:
+            layers.append(layer)
+    return layers
+
+
 @dataclass
 class _Trained:
     """One quantized layer's trainable state inside the step graph.
@@ -178,7 +386,7 @@ class _Trained:
     scale's blocked axis is carried explicitly instead.
     """
 
-    candidate: _Candidate
+    candidate: _QuantizedLayer
     w_input: str
     m_input: str
     v_input: str
@@ -190,6 +398,17 @@ class _Trained:
     scale_input: Optional[str] = None
     ms_input: Optional[str] = None
     vs_input: Optional[str] = None
+    # The layer's own activation quantizer, when one is being trained. Its
+    # scale is carried in log space for the reason onnxsim.adaquant carries
+    # it that way: a gradient step can then never drive the scale to zero or
+    # negative, which would make the quantizer undefined.
+    act: Optional[_ActQuant] = None
+    log_scale_input: Optional[str] = None
+    ma_input: Optional[str] = None
+    va_input: Optional[str] = None
+    zp_input: Optional[str] = None
+    mz_input: Optional[str] = None
+    vz_input: Optional[str] = None
     # Filled in as the graph is built.
     w_next: str = ""
     m_next: str = ""
@@ -197,6 +416,12 @@ class _Trained:
     scale_next: str = ""
     ms_next: str = ""
     vs_next: str = ""
+    log_scale_next: str = ""
+    ma_next: str = ""
+    va_next: str = ""
+    zp_next: str = ""
+    mz_next: str = ""
+    vz_next: str = ""
 
 
 @dataclass(frozen=True)
@@ -303,9 +528,15 @@ def _sum_over_blocks(
 
 
 def _emit_fake_quant(
-    b: qat_graph.GraphBuilder, w: str, scale_full: str, out_name: str
+    b: qat_graph.GraphBuilder,
+    w: str,
+    scale_full: str,
+    out_name: str,
+    n_min: float = _N_MIN,
+    n_max: float = _N_MAX,
 ) -> Tuple[str, str, str]:
-    """``w_hat = clip(round(w / s), -7, 7) * s``, written into ``out_name``.
+    """``w_hat = clip(round(w / s), n_min, n_max) * s``, written into
+    ``out_name``.
 
     Returns ``(code, ratio, active)`` -- everything the straight-through
     backward below needs. ``active`` is a float 0/1 mask of the elements
@@ -317,17 +548,115 @@ def _emit_fake_quant(
     Clipping happens *before* rounding rather than after. The two commute
     here because the bounds are integers, and doing it in this order leaves
     :meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest` with an argument
-    already
-    bounded to [-7, 7], where its float-to-int32 cast is exact.
+    already bounded to the grid, where its float-to-int32 cast is exact.
+
+    ``n_min``/``n_max`` default to ``quantize_weight_only_int4``'s symmetric
+    ``[-7, 7]``; ``quantize_static``'s per-channel INT8 weights pass
+    ``[-127, 127]``. Nothing else about the fake-quant differs between the
+    two schemes, which is why the grid is a pair of numbers rather than a
+    second code path.
     """
     ratio = b.div(w, scale_full)
-    code = b.round_to_nearest(b.clip(ratio, _N_MIN, _N_MAX))
+    code = b.round_to_nearest(b.clip(ratio, n_min, n_max))
     b.nodes.append(onnx.helper.make_node("Mul", [code, scale_full], [out_name]))
     active = b.mul(
-        b.greater_mask(ratio, _N_MIN),
-        b.less_mask(ratio, _N_MAX),
+        b.greater_mask(ratio, n_min),
+        b.less_mask(ratio, n_max),
     )
     return code, ratio, active
+
+
+def _take_nodes(b: qat_graph.GraphBuilder, start: int) -> List[onnx.NodeProto]:
+    """The nodes ``b`` has accumulated since index ``start``, removed from it.
+
+    :func:`_emit_activation_fake_quant` needs its nodes in two lists at once
+    -- the graph's, and the subset :func:`onnxsim.graph_grad.build_backward`
+    is asked to differentiate -- and a builder appends to only one. Lifting
+    them back out is a line; duplicating :class:`onnxsim.qat_graph.GraphBuilder`'s
+    naming and initializer bookkeeping to build them somewhere else would not
+    be.
+    """
+    taken = b.nodes[start:]
+    del b.nodes[start:]
+    return taken
+
+
+def _emit_activation_fake_quant(
+    b: qat_graph.GraphBuilder, t: _Trained, x_shape: Sequence[int]
+) -> Tuple[List[onnx.NodeProto], List[onnx.NodeProto], Dict[str, Sequence[int]], str]:
+    """One layer's uint8 affine quantize-dequantize, with a learnable scale
+    and zero-point, as nodes.
+
+    Returns ``(all nodes, the differentiable subset, their shapes, the
+    dequantized tensor's name)``. The caller splices the first list into the
+    graph ahead of the layer that reads it and hands the second to
+    :func:`onnxsim.graph_grad.build_backward`.
+
+    **Why this emits the chain stage by stage rather than a
+    ``QuantizeLinear``/``DequantizeLinear`` pair** is the point
+    :mod:`onnxsim.adaquant`'s own docstring makes and this inherits: the
+    scale's gradient lives entirely in the *difference* between ``x / s`` and
+    its rounded value, so a formulation that hid the rounding inside one op
+    -- or that "simplified" the round trip to the identity it almost is --
+    would have nothing left to differentiate.
+
+    **Why the gradients are not written out here.** :mod:`onnxsim.adaquant`
+    derives them by hand:
+    ``d(xdq)/ds = (xq - zp) - active * x/s``, ``d(xdq)/d(zp) = s * (active -
+    1)``, ``d/d(log s) = s * d/ds``, and a straight-through ``d(xdq)/dx =
+    active``. Every one of those falls out of
+    :mod:`onnxsim.graph_grad`'s ordinary rules applied to the chain below,
+    *provided* the round is expressed so the straight-through estimator is
+    structural rather than asserted -- which is the one trick here:
+
+        ``round(r)`` is emitted as ``r + residual`` where ``residual =
+        round(r) - r`` is computed by nodes deliberately left **out** of the
+        differentiated list.
+
+    A tensor no differentiated node produces is a leaf, so the backward walk
+    stops at it and the ``Add``'s other operand receives the whole incoming
+    gradient -- which is exactly what "the derivative of round is 1" means.
+    Include those two nodes instead and the residual's own ``-r`` cancels the
+    ``+r``, leaving a zero gradient: the failure mode this shape exists to
+    avoid. ``tests/test_qat.py`` checks the emitted gradients against
+    adaquant's closed form rather than trusting the argument.
+
+    The scale is read as ``exp(log_scale)`` inside the differentiated chain,
+    so the log-space chain rule is the ``Exp`` rule and not a hand-applied
+    factor.
+    """
+    act = t.act
+    assert act is not None  # only called for a layer with a trained quantizer
+    log_scale, zp = str(t.log_scale_input), str(t.zp_input)
+    scalar: List[int] = []
+    shapes: Dict[str, Sequence[int]] = {log_scale: scalar, zp: scalar}
+
+    start = len(b.nodes)
+    scale = b.op("Exp", [log_scale], "act_s")
+    ratio = b.div(act.tensor, scale)
+    head = _take_nodes(b, start)
+    shapes[scale] = scalar
+    shapes[ratio] = list(x_shape)
+
+    # The stop-gradient half: these two nodes are in the graph but not in the
+    # differentiated list, which is what makes the rounding a straight-through
+    # estimator. See this function's docstring.
+    start = len(b.nodes)
+    residual = b.sub(b.round_to_nearest(ratio), ratio)
+    rounding = _take_nodes(b, start)
+    shapes[residual] = list(x_shape)
+
+    start = len(b.nodes)
+    rounded = b.add(ratio, residual)
+    raw = b.add(rounded, zp)
+    clipped = b.clip(raw, _ACT_N_MIN, _ACT_N_MAX)
+    centred = b.sub(clipped, zp)
+    xdq = b.mul(centred, scale)
+    tail = _take_nodes(b, start)
+    for name in (rounded, raw, clipped, centred, xdq):
+        shapes[name] = list(x_shape)
+
+    return head + rounding + tail, head + tail, shapes, xdq
 
 
 def _slice_block(
@@ -543,17 +872,25 @@ def _capture(
 
 
 def _plan_trained(
-    candidates: Sequence[_Candidate], learn_scales: bool
+    candidates: Sequence[_QuantizedLayer],
+    learn_scales: bool,
+    learn_activation_scales: bool = False,
 ) -> List[_Trained]:
     """One :class:`_Trained` per quantized layer in the block, with its
     master weight seeded from the *float* model's own weight -- so step 0 of
     the loop reproduces round-to-nearest exactly, and every later step is a
     measured improvement on it rather than on an arbitrary re-initialization.
+
+    The activation quantizer, when there is one, is seeded the same way: from
+    what calibration already chose, so step 0 reproduces the quantized model
+    as shipped and the run can only be measured against it. That is the same
+    warm start :func:`onnxsim.apply_adaquant` uses, and the reason a run that
+    helps nothing costs accuracy rather than losing it outright.
     """
     planned: List[_Trained] = []
     for i, candidate in enumerate(candidates):
         w = onnx.numpy_helper.to_array(candidate.w_float_init).astype(np.float32)
-        scale = onnx.numpy_helper.to_array(candidate.ws_init).astype(np.float32)
+        scale = candidate.scale_2d.astype(np.float32)
         trained = _Trained(
             candidate=candidate,
             w_input=f"{_PREFIX}w{i}",
@@ -569,6 +906,14 @@ def _plan_trained(
             trained.scale_input = f"{_PREFIX}s{i}"
             trained.ms_input = f"{_PREFIX}ms{i}"
             trained.vs_input = f"{_PREFIX}vs{i}"
+        if learn_activation_scales and candidate.act is not None:
+            trained.act = candidate.act
+            trained.log_scale_input = f"{_PREFIX}as{i}"
+            trained.ma_input = f"{_PREFIX}mas{i}"
+            trained.va_input = f"{_PREFIX}vas{i}"
+            trained.zp_input = f"{_PREFIX}az{i}"
+            trained.mz_input = f"{_PREFIX}maz{i}"
+            trained.vz_input = f"{_PREFIX}vaz{i}"
         planned.append(trained)
     return planned
 
@@ -583,6 +928,7 @@ def _build_step_graph(
     block_output_shape: Sequence[int],
     learn_scales: bool,
     batch: Optional[_Minibatch] = None,
+    learn_activation_scales: bool = False,
 ) -> qat_graph.StepGraph:
     """The whole loop as one graph: fake-quant forward, block forward,
     reconstruction loss, backward, Adam.
@@ -594,6 +940,12 @@ def _build_step_graph(
     it appends. Hence: (optionally the minibatch gather,) fake-quant, then the
     block's own nodes verbatim, then the loss seed, then the backward, then
     the optimizer.
+
+    With ``learn_activation_scales`` the ordering gains one more rule: each
+    trained layer's activation fake-quant is spliced in immediately before
+    the layer that reads it, and its differentiable half joins the list
+    handed to the backward. The block's other nodes are untouched, so the
+    two features compose without either knowing about the other.
 
     ``externals`` and ``block_output_shape`` are always the *whole*
     calibration set's arrays and shape. With ``batch`` set they become the
@@ -647,11 +999,43 @@ def _build_step_graph(
             b, scale, t.w_shape, t.scale_shape, t.scale_axis, block_size
         )
         weight_name = t.candidate.float_node.input[1]
-        code, ratio, active = _emit_fake_quant(b, t.w_input, scale_full, weight_name)
+        code, ratio, active = _emit_fake_quant(
+            b,
+            t.w_input,
+            scale_full,
+            weight_name,
+            t.candidate.n_min,
+            t.candidate.n_max,
+        )
         per_layer.append((t, weight_name, scale_full, code, ratio, active))
 
-    # 2. The block itself, node for node as the float graph wrote it.
-    b.nodes.extend(nodes)
+    # 2. The block itself, node for node as the float graph wrote it -- except
+    #    that a layer whose activation quantizer is being trained reads a
+    #    fake-quantized copy of its own input instead of the raw tensor. Only
+    #    that one node is rewritten (one input name), so the quantizer lands
+    #    on the *edge* the deployed QDQ pair occupies rather than on the
+    #    tensor: two layers sharing an activation keep the two independent
+    #    quantizers quantize_static gave them.
+    act_shapes: Dict[str, Sequence[int]] = {}
+    quantized_input = {t.candidate.output_name: t for t in trained if t.act is not None}
+    forward: List[onnx.NodeProto] = []
+    differentiated: List[onnx.NodeProto] = []
+    for node in nodes:
+        layer = quantized_input.get(node.output[0]) if node.output else None
+        if layer is not None:
+            emitted, diff_nodes, extra, xdq = _emit_activation_fake_quant(
+                b, layer, shapes[node.input[0]]
+            )
+            forward.extend(emitted)
+            differentiated.extend(diff_nodes)
+            act_shapes.update(extra)
+            rewritten = onnx.NodeProto()
+            rewritten.CopyFrom(node)
+            rewritten.input[0] = xdq
+            node = rewritten
+        forward.append(node)
+        differentiated.append(node)
+    b.nodes.extend(forward)
 
     # 3. The objective: MSE of the student block's output against the
     #    teacher's, and its gradient, which is the seed of the backward pass.
@@ -663,13 +1047,22 @@ def _build_step_graph(
     n_elems = int(np.prod(list(block_output_shape)))
     dl_dy = b.mul(diff, b.const(2.0 / n_elems))
 
-    # 4. The backward pass over the block, emitted as ONNX nodes.
+    # 4. The backward pass over the block, emitted as ONNX nodes. The
+    #    activation quantizers' own parameters are targets alongside the
+    #    weights: nothing else reaches them, since they are read only by the
+    #    fake-quant chain.
+    all_shapes = dict(shapes)
+    all_shapes.update(act_shapes)
+    targets = [weight_name for _, weight_name, _, _, _, _ in per_layer]
+    for t in trained:
+        if t.act is not None:
+            targets.extend([str(t.log_scale_input), str(t.zp_input)])
     grads = graph_grad.build_backward(
         b,
-        nodes,
-        shapes,
+        differentiated,
+        all_shapes,
         {block_output_name: dl_dy},
-        [weight_name for _, weight_name, _, _, _, _ in per_layer],
+        targets,
     )
 
     # 5. Straight through the fake-quant, into the master weight and (if
@@ -690,31 +1083,63 @@ def _build_step_graph(
             "m_correction",
             "v_correction",
         )
-        if t.scale_input is None:
+        if t.scale_input is not None:
+            # LSQ's scale gradient, the same one onnxsim.autoround derives:
+            # d(w_hat)/d(s) = code - w/s where the element is inside the
+            # clipping range (the gap between the integer it rounds to and the
+            # exact ratio) and just `code` where it saturates.
+            dwhat_ds = b.sub(code, b.mul(active, ratio))
+            g_scale = _sum_over_blocks(
+                b,
+                b.mul(g, dwhat_ds),
+                t.w_shape,
+                t.scale_shape,
+                t.scale_axis,
+                t.candidate.block_size,
+            )
+            t.scale_next, t.ms_next, t.vs_next = qat_graph.adam_update(
+                b,
+                t.scale_input,
+                g_scale,
+                str(t.ms_input),
+                str(t.vs_input),
+                f"{_PREFIX}lr_scale",
+                "m_correction",
+                "v_correction",
+            )
+        if t.act is None:
             continue
-        # LSQ's scale gradient, the same one onnxsim.autoround derives:
-        # d(w_hat)/d(s) = code - w/s where the element is inside the clipping
-        # range (the gap between the integer it rounds to and the exact
-        # ratio) and just `code` where it saturates.
-        dwhat_ds = b.sub(code, b.mul(active, ratio))
-        g_scale = _sum_over_blocks(
+        # The activation quantizer's two parameters. Their gradients were
+        # emitted by the backward walk over the fake-quant chain (see
+        # _emit_activation_fake_quant for why that reproduces adaquant's
+        # hand-derived ones exactly), so all that is left is an Adam step
+        # each.
+        t.log_scale_next, t.ma_next, t.va_next = qat_graph.adam_update(
             b,
-            b.mul(g, dwhat_ds),
-            t.w_shape,
-            t.scale_shape,
-            t.scale_axis,
-            t.candidate.block_size,
-        )
-        t.scale_next, t.ms_next, t.vs_next = qat_graph.adam_update(
-            b,
-            t.scale_input,
-            g_scale,
-            str(t.ms_input),
-            str(t.vs_input),
-            f"{_PREFIX}lr_scale",
+            str(t.log_scale_input),
+            grads[str(t.log_scale_input)],
+            str(t.ma_input),
+            str(t.va_input),
+            f"{_PREFIX}lr_act",
             "m_correction",
             "v_correction",
         )
+        zp_stepped, t.mz_next, t.vz_next = qat_graph.adam_update(
+            b,
+            str(t.zp_input),
+            grads[str(t.zp_input)],
+            str(t.mz_input),
+            str(t.vz_input),
+            f"{_PREFIX}lr_act",
+            "m_correction",
+            "v_correction",
+        )
+        # Re-clamped into uint8's range every step rather than only at export,
+        # for onnxsim.adaquant's own reason: the forward's clip is what the
+        # whole activation gradient is derived through, so a zero-point that
+        # wandered outside the representable range would saturate every
+        # element and silently kill the signal.
+        t.zp_next = b.clip(zp_stepped, _ACT_N_MIN, _ACT_N_MAX)
 
     state: Dict[str, Tuple[Sequence[int], str]] = {}
     for t in trained:
@@ -725,10 +1150,22 @@ def _build_step_graph(
             state[t.scale_input] = (list(t.scale_shape), t.scale_next)
             state[str(t.ms_input)] = (list(t.scale_shape), t.ms_next)
             state[str(t.vs_input)] = (list(t.scale_shape), t.vs_next)
+        if t.act is not None:
+            for name, out in (
+                (str(t.log_scale_input), t.log_scale_next),
+                (str(t.ma_input), t.ma_next),
+                (str(t.va_input), t.va_next),
+                (str(t.zp_input), t.zp_next),
+                (str(t.mz_input), t.mz_next),
+                (str(t.vz_input), t.vz_next),
+            ):
+                state[name] = ([], out)
 
     scalars = [f"{_PREFIX}lr", "m_correction", "v_correction"]
     if learn_scales:
         scalars.append(f"{_PREFIX}lr_scale")
+    if learn_activation_scales:
+        scalars.append(f"{_PREFIX}lr_act")
 
     per_step: Optional[Dict[str, Tuple[Sequence[int], int]]] = None
     if batch is not None:
@@ -762,7 +1199,54 @@ class _BlockPlan:
     output_name: str
     nodes: List[onnx.NodeProto]
     externals: List[str]
-    candidates: List[_Candidate]
+    candidates: List[_QuantizedLayer]
+
+
+def _no_layers_message(
+    float_model: onnx.ModelProto,
+    quantized_model: onnx.ModelProto,
+    block_input_name: str,
+    block_output_name: str,
+    learn_activation_scales: bool,
+) -> str:
+    """Why this block has nothing to train, said in terms of the *scheme* the
+    caller asked for.
+
+    The bare fact ("no matching layer in this slice") is nearly useless when
+    the real cause is that the model was quantized by a different
+    ``quantize_*`` function than the flag selects -- a caller who turns
+    ``learn_activation_scales`` on over a weight-only INT4 model has made a
+    scheme error, not a boundary error, and would otherwise go looking at
+    their tensor names. So the mismatch is detected and named. Naming it
+    costs one extra scan of the model, on a path that is about to raise.
+    """
+    where = f"the block between {block_input_name!r} and {block_output_name!r}"
+    if learn_activation_scales:
+        if _find_int4_matmul_candidates(float_model, quantized_model):
+            return (
+                "learn_activation_scales targets onnxsim.quantize_static's QDQ "
+                "scheme (uint8 activations, per-output-channel INT8 weights), but "
+                "this quantized model is an onnxsim.quantize_weight_only_int4 one "
+                "-- a weight-only model has no activation quantizer anywhere in "
+                "it to train. Re-quantize with onnxsim.quantize_static, or leave "
+                "learn_activation_scales off to fine-tune the INT4 weights."
+            )
+        return (
+            f"{where} contains no quantize_static-quantized MatMul/Gemm layer to "
+            "train (learn_activation_scales targets that scheme; see apply_qat's "
+            "docstring for why it is the only one with activation quantizers to "
+            "train)"
+        )
+    message = (
+        f"{where} contains no quantize_weight_only_int4-quantized MatMul/Gemm "
+        "layer to train"
+    )
+    if _find_static_qdq_candidates(float_model, quantized_model):
+        message += (
+            "; this model's layers match onnxsim.quantize_static's QDQ scheme "
+            "instead, which learn_activation_scales=True trains"
+        )
+    return message
 
 
 def _plan_block(
@@ -770,6 +1254,7 @@ def _plan_block(
     quantized_model: onnx.ModelProto,
     block_input_name: str,
     block_output_name: str,
+    learn_activation_scales: bool = False,
 ) -> _BlockPlan:
     """Slices the block out of the float graph and checks the three things
     that make it trainable at all: it is non-empty, every op in it has a
@@ -777,6 +1262,13 @@ def _plan_block(
 
     Deliberately does *not* check shapes -- that needs the concrete
     calibration activations, so it happens later in :func:`_train_block`.
+
+    ``learn_activation_scales`` selects *which scheme* counts as quantized
+    here -- ``quantize_weight_only_int4``'s INT4 weight-only layers, or
+    ``quantize_static``'s QDQ ones -- so the same block can be trainable
+    under one and refused under the other. That is the point rather than a
+    wart: the two are different deployed models, and a run has to be aimed
+    at the one that will ship.
     """
     nodes, externals = _slice_block(
         float_model.graph, block_input_name, block_output_name
@@ -790,14 +1282,18 @@ def _plan_block(
     slice_outputs = {out for node in nodes for out in node.output if out}
     candidates = [
         c
-        for c in _find_int4_matmul_candidates(float_model, quantized_model)
+        for c in _find_layers(float_model, quantized_model, learn_activation_scales)
         if c.output_name in slice_outputs
     ]
     if not candidates:
         raise ValueError(
-            f"the block between {block_input_name!r} and {block_output_name!r} "
-            "contains no quantize_weight_only_int4-quantized MatMul/Gemm layer to "
-            "train"
+            _no_layers_message(
+                float_model,
+                quantized_model,
+                block_input_name,
+                block_output_name,
+                learn_activation_scales,
+            )
         )
     return _BlockPlan(
         input_name=block_input_name,
@@ -871,6 +1367,8 @@ def _train_block(
     batch_size: Optional[int] = None,
     shuffle: bool = True,
     batch_seed: int = 0,
+    learn_activation_scales: bool = False,
+    activation_learning_rate: float = 1e-2,
 ) -> onnx.ModelProto:
     """Runs the whole optimization for one already-planned, already-captured
     block and returns ``quantized_model`` with that block's initializers
@@ -897,7 +1395,7 @@ def _train_block(
         float_model, plan.nodes, block_inputs, plan.output_name, block_target
     )
 
-    trained = _plan_trained(plan.candidates, learn_scales)
+    trained = _plan_trained(plan.candidates, learn_scales, learn_activation_scales)
     trained_weight_names = {t.candidate.float_node.input[1] for t in trained}
     used = {name for node in plan.nodes for name in node.input if name}
     block_initializers = [
@@ -916,6 +1414,7 @@ def _train_block(
         list(teacher_output.shape),
         learn_scales,
         batch,
+        learn_activation_scales,
     )
 
     # The whole set is the constant either way; with a minibatch it is bound
@@ -936,15 +1435,34 @@ def _train_block(
             state[t.scale_input] = t.scale_init
             state[str(t.ms_input)] = np.zeros_like(t.scale_init)
             state[str(t.vs_input)] = np.zeros_like(t.scale_init)
+        if t.act is not None:
+            # Seeded from what calibration chose, so step 0 is the quantized
+            # model as shipped. The 1e-8 floor is onnxsim.adaquant's, guarding
+            # the degenerate calibrated scale of exactly 0 (a constant
+            # activation) that log would otherwise turn into -inf.
+            zero = np.zeros((), dtype=np.float32)
+            state[str(t.log_scale_input)] = np.asarray(
+                np.log(max(t.act.scale_init, 1e-8)), dtype=np.float32
+            )
+            state[str(t.ma_input)] = zero
+            state[str(t.va_input)] = zero
+            state[str(t.zp_input)] = np.asarray(
+                np.clip(t.act.zp_init, _ACT_N_MIN, _ACT_N_MAX), dtype=np.float32
+            )
+            state[str(t.mz_input)] = zero
+            state[str(t.vz_input)] = zero
 
     def scalars(t: int) -> Dict[str, float]:
         decay = 1.0 - t / num_iterations if lr_decay else 1.0
         values = {
             f"{_PREFIX}lr": learning_rate * decay,
             f"{_PREFIX}lr_scale": scale_learning_rate * decay,
+            f"{_PREFIX}lr_act": activation_learning_rate * decay,
         }
         if not learn_scales:
             del values[f"{_PREFIX}lr_scale"]
+        if not learn_activation_scales:
+            del values[f"{_PREFIX}lr_act"]
         values.update(qat_graph.adam_bias_corrections(t))
         return values
 
@@ -973,6 +1491,8 @@ def _train_block(
 
     new_codes: Dict[str, np.ndarray] = {}
     new_scales: Dict[str, np.ndarray] = {}
+    new_act_scales: Dict[str, float] = {}
+    new_act_zps: Dict[str, int] = {}
     for t in trained:
         w = final[t.w_input].astype(np.float64)
         scale = (
@@ -981,22 +1501,58 @@ def _train_block(
             else t.scale_init.astype(np.float64)
         )
         scale_full = np.repeat(scale, t.candidate.block_size, axis=t.scale_axis)
-        codes = np.clip(_round_half_away(w / scale_full), _N_MIN, _N_MAX)
+        codes = np.clip(
+            _round_half_away(w / scale_full), t.candidate.n_min, t.candidate.n_max
+        )
         new_codes[t.candidate.wq_name] = codes.astype(np.int8)
         if t.scale_input is not None:
-            new_scales[t.candidate.ws_init.name] = scale.astype(np.float32)
+            new_scales[t.candidate.ws_name] = scale.reshape(t.candidate.ws_dims).astype(
+                np.float32
+            )
+        if t.act is not None:
+            # Out of log space, and the zero-point back onto uint8's integer
+            # grid -- the two projections onnxsim.adaquant makes at the same
+            # point, and for the same reason: the optimizer needs them
+            # continuous, the model can only store what it can store.
+            new_act_scales[t.act.scale_name] = float(
+                np.exp(float(final[str(t.log_scale_input)]))
+            )
+            new_act_zps[t.act.zp_name] = int(
+                np.clip(round(float(final[str(t.zp_input)])), _ACT_N_MIN, _ACT_N_MAX)
+            )
 
     tuned = onnx.ModelProto()
     tuned.CopyFrom(quantized_model)
     for initializer in tuned.graph.initializer:
         codes = new_codes.get(initializer.name)
         if codes is not None:
-            initializer.raw_data = _pack_int4(codes)
+            if initializer.data_type == onnx.TensorProto.INT4:
+                initializer.raw_data = _pack_int4(codes)
+            else:
+                initializer.CopyFrom(
+                    onnx.numpy_helper.from_array(codes, name=initializer.name)
+                )
             continue
         scale_array = new_scales.get(initializer.name)
         if scale_array is not None:
             initializer.CopyFrom(
                 onnx.numpy_helper.from_array(scale_array, name=initializer.name)
+            )
+            continue
+        act_scale = new_act_scales.get(initializer.name)
+        if act_scale is not None:
+            initializer.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.array(act_scale, dtype=np.float32), name=initializer.name
+                )
+            )
+            continue
+        act_zp = new_act_zps.get(initializer.name)
+        if act_zp is not None:
+            initializer.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.array(act_zp, dtype=np.uint8), name=initializer.name
+                )
             )
     return tuned
 
@@ -1013,6 +1569,8 @@ def apply_qat(
     learning_rate: float = 1e-4,
     learn_scales: bool = False,
     scale_learning_rate: float = 1e-5,
+    learn_activation_scales: bool = False,
+    activation_learning_rate: float = 1e-2,
     lr_decay: bool = True,
     batch_size: Optional[int] = None,
     shuffle: bool = True,
@@ -1021,7 +1579,8 @@ def apply_qat(
     step_providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
 ) -> onnx.ModelProto:
-    """Fine-tunes one block's INT4 weights against the float model's own
+    """Fine-tunes one block's quantized weights (and, opted in, its activation
+    quantizers) against the float model's own
     output for that block -- label-free, teacher-distilled QAT. See this
     module's own docstring for the technique, what it refuses, and what it
     does not claim.
@@ -1039,9 +1598,11 @@ def apply_qat(
             the trained master weights.
     :param quantized_model: a quantized version of ``float_model`` (onnx
             ModelProto or file path), produced by
-            :func:`onnxsim.quantize_weight_only_int4`. Layers quantized by
-            any other scheme (or left unquantized) are left untouched, and a
-            block containing none of them is an error rather than a no-op.
+            :func:`onnxsim.quantize_weight_only_int4` -- or, with
+            ``learn_activation_scales=True``, by
+            :func:`onnxsim.quantize_static`. Layers quantized by any other
+            scheme (or left unquantized) are left untouched, and a block
+            containing none of them is an error rather than a no-op.
             Assumes ``quantized_model`` was produced from ``float_model``
             without renaming any MatMul/Gemm node's own output tensor -- true
             of every onnxsim ``quantize_*`` function.
@@ -1090,8 +1651,99 @@ def apply_qat(
             ``learn_scales`` is on. Smaller than ``learning_rate`` by
             default: one scale is shared by a whole block of weights, so a
             step of the same size is a far larger change to the model.
-    :param lr_decay: anneal both learning rates linearly to zero across the
-            run. On by default because the objective is piecewise constant in
+    :param learn_activation_scales: also train the *activation* quantizers
+            -- each trained layer's own input (scale, zero_point) pair --
+            LSQ-style, jointly with the weights. **This selects the target
+            scheme**, which is the part to read before turning it on.
+
+            *Which scheme, and why there is no choice.* onnxsim produces two
+            static schemes this pass could plausibly aim at.
+            :func:`onnxsim.quantize_weight_only_int4` (the default target,
+            everything above) quantizes weights only: its activations are
+            fp32, it has no activation quantizer anywhere, and there is
+            therefore no parameter to train and no initializer to write a
+            trained one back into. "Activation quantization on top of it"
+            would mean *inserting* quantizers -- inventing a W4A8 model no
+            ``quantize_*`` function here emits and no deployment story
+            expects -- which is a quantizer's job, not a fine-tuner's. So
+            this targets :func:`onnxsim.quantize_static`'s QDQ scheme
+            instead: uint8 asymmetric activations
+            (``QuantizeLinear``/``DequantizeLinear`` around each quantized
+            node's input) and per-output-channel symmetric INT8 weights. That
+            is the same scheme :func:`onnxsim.apply_adaquant` targets, for the
+            same reason, and this reuses adaquant's straight-through
+            derivation of the activation gradients rather than re-deriving
+            them.
+
+            *It follows that this flag also changes what the weights are.*
+            A ``quantize_static`` model's weights are per-channel INT8, so
+            with the flag on that is what the fp32 master weights are
+            fake-quantized against; the INT4 grid and its 32-element blocks
+            are simply not present in such a model. Weight training is
+            unchanged in every other respect, and the two parameter groups
+            are trained *jointly* on one loss -- which is AdaQuant's own
+            argument for why it is worth doing at all: the reconstruction
+            error is a joint function of both, and a weight choice that is
+            optimal against one activation clip range is not optimal against
+            another.
+
+            *Which tensors get a trained quantizer.* Exactly one per trained
+            layer: the quantizer on that layer's own activation input, where
+            ``quantize_static`` put it. It is trained per *edge*, not per
+            tensor -- two layers reading the same activation have two
+            independent QDQ pairs in the deployed model and get two
+            independent trained quantizers here. A layer in the block whose
+            input has no QDQ pair is not a candidate at all (it is not a
+            ``quantize_static`` layer), and a block with no candidates is
+            refused rather than silently trained weight-only.
+
+            *What training the block input's quantizer means, precisely.*
+            The block's input activation is teacher-forced: the value fed in
+            is the float model's, not the student's. The quantizer, though,
+            sits **inside** the block -- ``QuantizeLinear`` consumes the
+            block's input tensor and feeds the first layer -- so it is
+            genuinely this block's parameter to train, and training it is not
+            a boundary violation. What it *is* is a clip range fitted to the
+            teacher's distribution of that tensor rather than the student's.
+            Those coincide exactly at the model's own graph input, and drift
+            apart deeper in the model as upstream quantization error
+            accumulates. :func:`apply_qat_all_blocks` with ``sequential=True``
+            (the default) closes that gap by re-running the student before
+            each block, which matters more with this flag on than without it:
+            a clip range is a property of the input distribution in a way a
+            weight is not.
+
+            Off by default, and not only for compatibility: it is a harder,
+            non-convex problem in two coupled parameter groups (the caution
+            :mod:`onnxsim.autoround` documents for its own clip ratio), it
+            rewrites activation initializers a weight-only run leaves
+            untouched, and it applies to a different quantized model
+            entirely. Turning it on over a
+            ``quantize_weight_only_int4`` model raises
+            :class:`ValueError` naming the mismatch.
+
+            *And it is measured rather than assumed.* On a block whose
+            activation range was calibrated from one unrepresentative
+            outlier it takes the whole-model output error 38% below what
+            training the weights alone reaches; on the same block calibrated
+            on representative data it is a regression at every learning
+            rate tried, because min/max on
+            representative data is already close to MSE-optimal and a second
+            coupled parameter group makes a solved problem harder.
+            ``tests/test_qat.py`` records both, with the numbers. Use it when
+            the calibrated range is wrong -- and note that re-calibrating,
+            when that is available, costs one forward pass rather than a
+            training budget.
+    :param activation_learning_rate: Adam learning rate for the activation
+            scale (optimized in log space, so it can never reach zero or go
+            negative) and its zero-point, when ``learn_activation_scales`` is
+            on. Larger than ``scale_learning_rate`` by default because it is
+            a *log*-space step for the scale and a step in uint8 codes for
+            the zero-point -- neither is measured in the units the weight
+            learning rate is.
+    :param lr_decay: anneal every one of the learning rates above
+            (weight, weight scale, activation quantizer) linearly to zero
+            across the run. On by default because the objective is piecewise constant in
             the master weights -- the loss only moves when an element crosses
             a rounding boundary -- so a constant learning rate leaves the
             final iterate wherever the last step happened to put it, which
@@ -1147,13 +1799,17 @@ def apply_qat(
     :param losses: when given, the reconstruction loss is appended to it once
             per step -- the cheapest way to see whether a block actually
             trained, and what the tests here assert on.
-    :returns: ``quantized_model`` with the block's INT4 weight initializers
-            (and, if ``learn_scales``, their scale initializers) rewritten.
-            Every other byte of the model is untouched.
+    :returns: ``quantized_model`` with the block's quantized weight
+            initializers (and, if ``learn_scales``, their scale
+            initializers; if ``learn_activation_scales``, the activation
+            scale and zero-point initializers too) rewritten. Every other
+            byte of the model is untouched.
     :raises ValueError: if the block cannot be discovered, is not closed at
-            statically-known shapes, contains no quantized layer to train, or
-            (with ``batch_size`` set) has captured tensors that disagree
-            about how many rows they have
+            statically-known shapes, contains no layer of the targeted
+            scheme to train (including the scheme mismatch
+            ``learn_activation_scales`` can be asked for), or (with
+            ``batch_size`` set) has captured tensors that disagree about how
+            many rows they have
     :raises onnxsim.graph_grad.UnsupportedOpError: if any node in the block
             has no gradient rule
     """
@@ -1163,7 +1819,11 @@ def apply_qat(
         quantized_model = onnx.load(quantized_model, load_external_data=False)
 
     plan = _plan_block(
-        float_model, quantized_model, block_input_name, block_output_name
+        float_model,
+        quantized_model,
+        block_input_name,
+        block_output_name,
+        learn_activation_scales,
     )
 
     if calibration_data is None:
@@ -1187,6 +1847,8 @@ def apply_qat(
         learning_rate=learning_rate,
         learn_scales=learn_scales,
         scale_learning_rate=scale_learning_rate,
+        learn_activation_scales=learn_activation_scales,
+        activation_learning_rate=activation_learning_rate,
         lr_decay=lr_decay,
         batch_size=batch_size,
         shuffle=shuffle,
@@ -1363,6 +2025,7 @@ def discover_qat_blocks(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],
     max_layers_per_block: int = 2,
+    learn_activation_scales: bool = False,
 ) -> List[QATBlock]:
     """Partitions the model into a sequence of blocks :func:`apply_qat` can
     train, without the caller naming a single tensor.
@@ -1426,6 +2089,14 @@ def discover_qat_blocks(
             block before closing it. 1 gives per-layer blocks (more, cheaper
             steps, no intra-block error cancellation); a large value gives
             one block per gap between undifferentiable ops.
+    :param learn_activation_scales: plan for :func:`apply_qat`'s
+            activation-quantization mode, i.e. count
+            :func:`onnxsim.quantize_static` QDQ layers as the quantized ones
+            rather than ``quantize_weight_only_int4`` INT4 layers. It has to
+            be said here as well as at training time because "which layers
+            are quantized" is what closes a block: the same graph partitions
+            differently under the two schemes, and a plan made for one is
+            not a plan for the other.
     :returns: the blocks in graph order, possibly empty. Consecutive blocks
             need not be adjacent: a gap between two of them is a region
             nothing here can train.
@@ -1441,7 +2112,7 @@ def discover_qat_blocks(
     cuts = _liveness_cuts(graph, _primary_graph_input(graph))
     quantized_outputs = {
         c.output_name
-        for c in _find_int4_matmul_candidates(float_model, quantized_model)
+        for c in _find_layers(float_model, quantized_model, learn_activation_scales)
     }
 
     # Walk the spans between consecutive cuts, accumulating them into blocks.
@@ -1474,7 +2145,13 @@ def discover_qat_blocks(
     blocks: List[QATBlock] = []
     for input_name, output_name in pairs:
         try:
-            plan = _plan_block(float_model, quantized_model, input_name, output_name)
+            plan = _plan_block(
+                float_model,
+                quantized_model,
+                input_name,
+                output_name,
+                learn_activation_scales,
+            )
         except ValueError:
             # Defensive: the span construction above already guarantees a
             # non-empty, supported, quantized slice. Rather than trust that
@@ -1532,6 +2209,8 @@ def apply_qat_all_blocks(
     learning_rate: float = 1e-4,
     learn_scales: bool = False,
     scale_learning_rate: float = 1e-5,
+    learn_activation_scales: bool = False,
+    activation_learning_rate: float = 1e-2,
     lr_decay: bool = True,
     batch_size: Optional[int] = None,
     shuffle: bool = True,
@@ -1616,7 +2295,20 @@ def apply_qat_all_blocks(
     :param learn_scales: also train each weight's per-block quantization
             scale, LSQ-style, in every block
     :param scale_learning_rate: Adam learning rate for those scales
-    :param lr_decay: anneal both learning rates to zero within each block
+    :param learn_activation_scales: train each block's activation quantizers
+            alongside its weights, which also selects
+            :func:`onnxsim.quantize_static`'s QDQ scheme as the target -- see
+            :func:`apply_qat`, where the whole decision is written down. It is
+            passed to :func:`discover_qat_blocks` as well when ``blocks`` is
+            not given, since which layers count as quantized is what closes a
+            block. This mode is where ``sequential=True`` earns the most: a
+            clip range fitted to the teacher's activation distribution is a
+            worse fit for the student's than a weight is, so re-running the
+            student before each block matters more here than in the
+            weight-only case.
+    :param activation_learning_rate: Adam learning rate for those activation
+            scales and zero-points
+    :param lr_decay: anneal every learning rate to zero within each block
     :param batch_size: rows per optimizer step, applied identically in every
             block -- ``None`` (the default) is full batch, unchanged. Note
             that the blocks share the *same* batch schedule, since each is
@@ -1647,7 +2339,10 @@ def apply_qat_all_blocks(
 
     if blocks is None:
         blocks = discover_qat_blocks(
-            float_model, quantized_model, max_layers_per_block=max_layers_per_block
+            float_model,
+            quantized_model,
+            max_layers_per_block=max_layers_per_block,
+            learn_activation_scales=learn_activation_scales,
         )
     if calibration_data is None:
         calibration_data = generate_random_calibration_data(
@@ -1665,7 +2360,11 @@ def apply_qat_all_blocks(
         try:
             plans.append(
                 _plan_block(
-                    float_model, quantized_model, block.input_name, block.output_name
+                    float_model,
+                    quantized_model,
+                    block.input_name,
+                    block.output_name,
+                    learn_activation_scales,
                 )
             )
             results.append(QATBlockResult(block=block, trained=False))
@@ -1716,6 +2415,8 @@ def apply_qat_all_blocks(
                 learning_rate=learning_rate,
                 learn_scales=learn_scales,
                 scale_learning_rate=scale_learning_rate,
+                learn_activation_scales=learn_activation_scales,
+                activation_learning_rate=activation_learning_rate,
                 lr_decay=lr_decay,
                 batch_size=batch_size,
                 shuffle=shuffle,
