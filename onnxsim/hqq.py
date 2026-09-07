@@ -61,9 +61,8 @@ import onnx
 import onnx.helper
 import onnx.numpy_helper
 
+from onnxsim._onnx_compat import UINT4 as _UINT4
 from onnxsim.bias_correction import _all_names, _unique_name
-
-_UINT4 = onnx.TensorProto.UINT4
 
 
 def _match_matmul_like(node: onnx.NodeProto):

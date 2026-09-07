@@ -24,12 +24,11 @@ import onnx.helper  # type: ignore
 import onnx.numpy_helper  # type: ignore
 import onnx.shape_inference  # type: ignore
 from google.protobuf.message import EncodeError
-from rich import print
-from rich.text import Text
 
 import onnxsim.onnxsim_cpp2py_export as C
 
 from . import backend, model_checking, model_info, profile_merge, version
+from ._rich_compat import Text, print
 from .calibration import Tensors, generate_random_calibration_data
 from .pruning import EmbeddingPruningResult, _ImportanceNorm
 

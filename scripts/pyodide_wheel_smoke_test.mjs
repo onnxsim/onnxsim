@@ -63,7 +63,7 @@ async function main() {
   // `import onnxsim` needs both, not just onnxsim.simplify(). deps=False was
   // tried first and failed on exactly that ("ModuleNotFoundError: No module
   // named 'numpy'"), confirming this isn't optional. Letting micropip
-  // resolve the wheel's own declared dependencies (onnx, rich, and onnx's
+  // resolve the wheel's own declared dependencies (onnx and onnx's
   // own transitive numpy/protobuf/ml_dtypes) is also a better test than
   // skipping it: it validates the wheel's METADATA declares them correctly,
   // not just that the extension itself loads.

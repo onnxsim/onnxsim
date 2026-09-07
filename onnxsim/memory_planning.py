@@ -3,10 +3,8 @@ import dataclasses
 from typing import Dict, List, Tuple
 
 import onnx
-from rich import print
-from rich.table import Table
-from rich.text import Text
 
+from onnxsim._rich_compat import Table, Text, print
 from onnxsim.model_info import (
     METADATA_PREFIX,
     ModelInfo,

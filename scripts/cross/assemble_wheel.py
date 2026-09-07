@@ -71,9 +71,10 @@ Classifier: Topic :: Scientific/Engineering
 Classifier: Topic :: Software Development
 Requires-Python: >=3.11
 Requires-Dist: onnx
-Requires-Dist: rich
 Provides-Extra: onnxruntime
 Requires-Dist: onnxruntime >=1.6.0 ; extra == 'onnxruntime'
+Provides-Extra: rich
+Requires-Dist: rich !=12.1.0 ; extra == 'rich'
 Description-Content-Type: text/markdown
 
 Simplify your ONNX model. See https://github.com/onnxsim/onnxsim for details.

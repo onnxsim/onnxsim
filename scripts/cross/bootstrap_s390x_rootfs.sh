@@ -97,8 +97,9 @@ if [[ -f /root/.ccr/ca-bundle.crt ]]; then
   cp /root/.ccr/ca-bundle.crt "${SYSROOT}/root/.ccr/"
 fi
 
-# rich is a runtime dependency of onnxsim and pure Python, so the host's pip can
-# drop it straight in.
+# rich is an optional dependency of onnxsim (without it the reports fall back to
+# plain-text tables) and pure Python, so the host's pip can drop it straight in
+# and the rootfs exercises the rich path.
 python3 -m pip install --quiet --target="${SYSROOT}/usr/lib/python3/dist-packages" rich
 
 # ml_dtypes is a C extension the vendored onnx needs and has no s390x wheel, so

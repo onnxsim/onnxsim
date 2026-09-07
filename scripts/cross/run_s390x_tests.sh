@@ -105,9 +105,12 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # module not copied into the chroot" reason as the four vendor-compat tests
 # above. test_axera_conv_matmul_coverage.py (pulsar2_backend),
 # test_axera_conv_matmul_coverage_hardware.py, test_axera_neu_format_arith_ops.py,
-# test_pulsar2_hf_to_axmodel.py, test_axera_op_coverage_hardware.py and
-# test_axera_quantonnx.py (all: pulsar2_docker) are the same scripts/axera/
-# vendor-module gap. test_tflite_export_torchvision.py imports
+# test_pulsar2_hf_to_axmodel.py, test_axera_op_coverage_hardware.py,
+# test_axera_quantonnx.py and test_axera_mcode_structure.py (all: pulsar2_docker)
+# are the same scripts/axera/ vendor-module gap. Unlike the tests that guard a
+# missing dependency with pytest.importorskip (a skip), an unguarded import like
+# these is a *collection error*, which aborts the whole run -- so a new test in
+# this family has to be added here. test_tflite_export_torchvision.py imports
 # torch directly at module scope, the same "no s390x build" reason as
 # test_torch_export_integration.py/test_timm.py/test_yolo.py/test_gan.py above.
 #
@@ -160,6 +163,7 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_pulsar2_hf_to_axmodel.py \
   --ignore=tests/test_axera_op_coverage_hardware.py \
   --ignore=tests/test_axera_quantonnx.py \
+  --ignore=tests/test_axera_mcode_structure.py \
   --ignore=tests/test_tflite_export_torchvision.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
   --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn \
