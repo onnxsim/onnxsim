@@ -253,6 +253,9 @@ from onnxsim.qwen3_5_reconstruct import (
     reconstruct_qwen3_5_vlm,
 )
 from onnxsim.qwen_drive_perception_reconstruct import reconstruct_qwen_drive_perception
+from onnxsim.qwen_drive_planning_expert_reconstruct import (
+    reconstruct_qwen_drive_planning_expert,
+)
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
 from onnxsim.slim_llm import apply_slim_llm
@@ -511,6 +514,7 @@ __all__ = [
     "reconstruct_qwen3_5_language_model",
     "reconstruct_qwen3_5_vision_encoder",
     "reconstruct_qwen_drive_perception",
+    "reconstruct_qwen_drive_planning_expert",
     "read_hf_config",
     "UnsupportedArchitectureError",
     "export_transformers_model",
