@@ -249,6 +249,17 @@ from onnxsim.qat import (
     apply_qat_all_blocks,
     discover_qat_blocks,
 )
+from onnxsim.qat_interop import (
+    FakeQuantExport,
+    QdqAnnotation,
+    QdqIngestResult,
+    QdqScan,
+    SkippedQdq,
+    export_fake_quant,
+    find_existing_qdq,
+    quantize_static_keeping_qdq_scales,
+    strip_existing_qdq,
+)
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
@@ -318,6 +329,15 @@ __all__ = [
     "discover_qat_blocks",
     "QATBlock",
     "QATBlockResult",
+    "quantize_static_keeping_qdq_scales",
+    "export_fake_quant",
+    "find_existing_qdq",
+    "strip_existing_qdq",
+    "QdqAnnotation",
+    "QdqScan",
+    "QdqIngestResult",
+    "SkippedQdq",
+    "FakeQuantExport",
     "apply_fptq",
     "apply_owq",
     "apply_bwa_ptq",
