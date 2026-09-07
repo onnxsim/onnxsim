@@ -287,7 +287,7 @@ void AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
 
   CheckEqual(Joined(OpTypes(b)),
              "Mul,Mul,Add,Mul,Mul,Mul,Add,Mul,Mul,Mul,Sqrt,Add,Div,Sub",
-             "the fifteen-name, fourteen-node Adam step");
+             "the fourteen nodes of an Adam step, in order");
   CheckEqual(b.initializer().size(), size_t{5},
              "beta1, beta2, 1-beta1, 1-beta2, eps");
 
@@ -338,9 +338,12 @@ void AdamBiasCorrectionsAreTheClosedFormAtStepT() {
         1.0 / (1.0 - std::pow(0.9, static_cast<double>(t) + 1.0)));
     const float want_v = static_cast<float>(
         1.0 / (1.0 - std::pow(0.999, static_cast<double>(t) + 1.0)));
-    Check(got.first == want_m,
+    // Tolerance rather than equality only because a compiler is free to fold
+    // this file's std::pow while the library's stays a call; the claim under
+    // test is the formula, not the last ulp.
+    Check(std::fabs(got.first - want_m) <= 1e-6f * want_m,
           "m_correction = 1/(1-beta1^(t+1)) at t=" + std::to_string(t));
-    Check(got.second == want_v,
+    Check(std::fabs(got.second - want_v) <= 1e-6f * want_v,
           "v_correction = 1/(1-beta2^(t+1)) at t=" + std::to_string(t));
   }
   // t is 0-based, so the very first step's correction is 1/(1-beta), not 1.

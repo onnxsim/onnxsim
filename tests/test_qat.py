@@ -26,6 +26,13 @@ asserted, is whether feeding each block the *student's* recomputed activation
 beats capturing every block's input once from the teacher; see
 ``test_sequential_input_beats_capturing_everything_once`` for the numbers and
 the direction they actually came out in.
+
+The same half also records the *rejected* direction. Training the whole graph
+at once against the model's own output -- the end-to-end objective the
+block-wise loss only approximates -- needs no new entry point, because a block
+may be the whole graph; ``test_the_whole_graph_is_a_legal_block`` pins that,
+and ``test_the_end_to_end_objective_overfits_where_block_wise_does_not``
+measures what it is worth, which on a deep model is less than nothing.
 """
 
 import numpy as np
@@ -1094,6 +1101,193 @@ def test_the_walk_leaves_a_model_with_no_discoverable_block_untouched():
     )
     assert results == []
     assert tuned.SerializeToString() == model.SerializeToString()
+
+
+# --- End-to-end, the direction that lost -------------------------------------
+#
+# ``docs/qat.md`` lists a final pass that backpropagates through the whole
+# graph against the model's own output as this stage's last open item. It is
+# not a missing mechanism: a block may be the whole graph, so the pass is one
+# ordinary ``apply_qat`` call, and the first test below pins that. What is
+# genuinely open is whether it is *worth* doing, since the block-wise loss is
+# only a surrogate for it -- and the second test measures that rather than
+# assuming the answer, in the same shape as
+# ``test_sequential_input_beats_capturing_everything_once`` above.
+
+
+def _residual_stack_model(seed=0, stages=8, hidden=64):
+    """``stages`` stacked ``MatMul -> Relu -> MatMul -> Add(residual)`` blocks.
+
+    The shape ``_liveness_cuts`` partitions cleanly -- the skip tensor keeps
+    every intermediate company, so the only cut points are the stage
+    boundaries and discovery proposes exactly one block per stage. Every op in
+    it has a gradient rule, which is what makes the whole graph a legal block
+    too and therefore makes the two strategies comparable on the same model at
+    all.
+    """
+    rng = np.random.default_rng(seed)
+    initializer, body, previous = [], [], "X"
+    for s in range(stages):
+        w1 = (rng.standard_normal((D, hidden)) / np.sqrt(D)).astype(np.float32)
+        w2 = (rng.standard_normal((hidden, D)) / np.sqrt(hidden)).astype(np.float32)
+        initializer += [_f32(w1, f"Wa{s}"), _f32(w2, f"Wb{s}")]
+        out = f"R{s}" if s < stages - 1 else "Yout"
+        body.append(
+            f"  H{s} = MatMul({previous}, Wa{s})\n"
+            f"  A{s} = Relu(H{s})\n"
+            f"  P{s} = MatMul(A{s}, Wb{s})\n"
+            f"  {out} = Add(P{s}, {previous})"
+        )
+        previous = out
+    return _model(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+{chr(10).join(body)}
+        }}
+        """,
+        initializer,
+    )
+
+
+def _stack_weight_names(stages=8):
+    return {f"W{side}{s}" for s in range(stages) for side in "ab"}
+
+
+def _gaussian_rows(num_rows, seed):
+    """Plain isotropic rows.
+
+    Deliberately *not* ``_correlated_calibration``: a low-rank calibration set
+    leaves the reconstruction problem underdetermined for both strategies at
+    once, which confounds the only question here -- whether fitting the
+    calibration set harder transfers to inputs the run never saw.
+    """
+    return np.random.default_rng(seed).standard_normal((num_rows, D)).astype(np.float32)
+
+
+def test_the_whole_graph_is_a_legal_block(monkeypatch):
+    """The end-to-end pass needs no new entry point, and this is what that
+    claim means concretely.
+
+    If this failed, ``onnxsim/qat.py``'s docstring would be wrong where it
+    says the whole graph is a legal block, and ``docs/qat.md``'s "optional
+    end-to-end pass on the whole graph" would be a genuinely unimplemented
+    item rather than an undocumented degenerate case of the block contract.
+
+    Three things have to hold for the degenerate case to *be* the end-to-end
+    objective, and all three are checked: discovery proposes the whole graph
+    as one block once the merge budget allows it; every quantized layer in
+    the model is trained jointly inside a single step graph (one master
+    weight and two Adam moments each, all in one graph's state, driven by one
+    loss); and the only tensor captured from the teacher besides the target
+    is the graph's own input -- so nothing anywhere in the run is
+    teacher-forced at a boundary the deployed model would compute for itself.
+    """
+    model = _residual_stack_model(seed=0, stages=3)
+    quant = _quantize_chain_int4(model, _stack_weight_names(stages=3))
+    x = _gaussian_rows(64, seed=100)
+
+    per_stage = onnxsim.discover_qat_blocks(model, quant)
+    assert [(b.input_name, b.output_name) for b in per_stage] == [
+        ("X", "R0"),
+        ("R0", "R1"),
+        ("R1", "Yout"),
+    ]
+    (whole,) = onnxsim.discover_qat_blocks(model, quant, max_layers_per_block=10**6)
+    assert (whole.input_name, whole.output_name) == ("X", "Yout")
+    assert whole.quantized_outputs == ("H0", "P0", "H1", "P1", "H2", "P2")
+    assert whole.external_inputs == ("X",)
+
+    captured = _capture_step_graph(monkeypatch)
+    losses = []
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        whole.input_name,
+        whole.output_name,
+        calibration_data=[{"X": x}],
+        num_iterations=200,
+        losses=losses,
+    )
+    onnx.checker.check_model(tuned)
+
+    step = captured["step"]
+    # Six layers, three state tensors each, one graph, one loss.
+    assert len(step.state) == 6 * 3
+    assert step.loss_name is not None
+    # The graph input and the teacher's final output are the only constants;
+    # no intermediate activation is fed in from the float model.
+    state_and_scalars = set(step.state) | {"m_correction", "v_correction", "qat__lr"}
+    assert {i.name for i in step.model.graph.input} - state_and_scalars == {
+        "X",
+        "qat__teacher",
+    }
+
+    assert losses[-1] < 0.5 * losses[0]
+    assert _whole_model_error(tuned, model, x) < _whole_model_error(quant, model, x)
+
+
+def test_the_end_to_end_objective_overfits_where_block_wise_does_not():
+    """The measurement that decided against recommending the end-to-end pass.
+
+    Both runs get the same model, the same calibration rows and the same
+    total number of Adam steps. The block-wise walk spends them on eight
+    stage-sized reconstruction problems against the teacher's own
+    intermediate activations; the end-to-end run spends them on one problem
+    against the model's final output, which is the objective the walk's
+    per-block losses are only a surrogate for.
+
+    End-to-end therefore *has* to win on the calibration set, and does -- and
+    the number that matters is the other one. Measured on this scenario
+    (eight stages, 64 calibration rows, 1600 optimizer steps either way,
+    seed 0): calibration-set output error 14.74 block-wise against 11.68
+    end-to-end, 21% better; held-out error on 1024 fresh rows 113.6
+    block-wise against 120.6 end-to-end, 6% *worse*. Across seeds 0-7 the
+    direction held every time, end-to-end between 12% and 26% better on the
+    calibration set and between 1% and 12% worse off it.
+
+    That is an overfitting signature, and it is :mod:`onnxsim.brecq`'s own
+    argument for the block being the right unit: pinning every intermediate
+    activation to the teacher's is a far stronger constraint than pinning
+    only the final output, and at calibration scale the constraint is worth
+    more than the freedom. If this test failed in the *other* direction --
+    end-to-end ahead on held-out data -- the module docstring's advice to
+    stay block-wise on deep models would be wrong and worth rewriting.
+
+    The end-to-end run also costs about the block count in wall clock for the
+    same step budget (one step touches every layer, not two), which this does
+    not assert because timing assertions do not belong in CI, but which is
+    the other half of why it is not the default.
+    """
+    model = _residual_stack_model(seed=0, stages=8)
+    quant = _quantize_chain_int4(model, _stack_weight_names(stages=8))
+    x = _gaussian_rows(64, seed=100)
+    held_out = _gaussian_rows(1024, seed=900)
+
+    block_wise, results = onnxsim.apply_qat_all_blocks(
+        model, quant, calibration_data=[{"X": x}], num_iterations=200
+    )
+    assert [r.trained for r in results] == [True] * 8
+    steps = sum(len(r.losses) for r in results)
+
+    end_to_end = onnxsim.apply_qat(
+        model, quant, "X", "Yout", calibration_data=[{"X": x}], num_iterations=steps
+    )
+
+    # Both strategies beat round-to-nearest on data they never saw; the
+    # comparison below is between two things that work, not with a failure.
+    rtn_held_out = _whole_model_error(quant, model, held_out)
+    block_wise_held_out = _whole_model_error(block_wise, model, held_out)
+    end_to_end_held_out = _whole_model_error(end_to_end, model, held_out)
+    assert block_wise_held_out < 0.7 * rtn_held_out
+    assert end_to_end_held_out < 0.7 * rtn_held_out
+
+    # End-to-end minimizes the calibration-set error directly, and it shows.
+    assert _whole_model_error(end_to_end, model, x) < 0.9 * _whole_model_error(
+        block_wise, model, x
+    )
+    # None of that extra fit reaches data the run never saw.
+    assert end_to_end_held_out > 1.03 * block_wise_held_out
 
 
 # --- Minibatching ------------------------------------------------------------

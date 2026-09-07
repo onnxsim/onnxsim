@@ -62,16 +62,70 @@ that backend's coverage of the block's own operators as well.
   ceiling is "reproduce the float block", not "recover task accuracy the
   float block never had". Label-free distillation QAT is not paper-QAT
   accuracy and should not be advertised as it.
-- *Not end-to-end training.* :func:`apply_qat` still trains one
-  caller-named block per call, exactly :mod:`onnxsim.brecq`'s contract
-  (``block_input_name`` / ``block_output_name``), and
-  :func:`apply_qat_all_blocks` walks a whole model one block at a time --
-  discovering the blocks with :func:`discover_qat_blocks` and, by default,
-  feeding each one the student's own activation so it corrects what its
-  predecessors left behind. What is still absent is a final pass that
-  backpropagates through the *entire* graph at once against the model's own
-  output; a block is always the unit of optimization, and the teacher's
-  activations are always the target.
+- *Block-wise by default; end-to-end is reachable and measured worse.*
+  :func:`apply_qat` trains one caller-named block per call, exactly
+  :mod:`onnxsim.brecq`'s contract (``block_input_name`` /
+  ``block_output_name``), and :func:`apply_qat_all_blocks` walks a whole
+  model one block at a time -- discovering the blocks with
+  :func:`discover_qat_blocks` and, by default, feeding each one the
+  student's own activation so it corrects what its predecessors left
+  behind.
+
+  ``docs/qat.md`` lists "an optional end-to-end pass on the whole graph" as
+  this stage's last open item, on the reading that a block is necessarily
+  smaller than the model. It is not: **the whole graph is a legal block.**
+  Naming the graph's own input and its own output -- ``apply_qat(float,
+  quantized, "X", "Yout")``, or :func:`discover_qat_blocks` with
+  ``max_layers_per_block`` above the model's layer count -- builds one step
+  graph over every node, trains every quantized layer's master weight
+  jointly inside it, and takes the loss against the float model's own final
+  output. That is the end-to-end objective exactly, and it is the one slice
+  with no teacher-forcing approximation left in it at all: a whole-graph
+  slice's only external tensors are the graph's own inputs, whose values are
+  identical in teacher and student by construction.
+
+  So there was nothing here to build, and the only question was whether to
+  recommend it. Measured against :func:`apply_qat_all_blocks` at an equal
+  optimizer-step budget, on residual MLP stacks every one of whose ops has a
+  gradient rule (``tests/test_qat.py``), it lands the same way every time:
+  end-to-end reaches a **lower** error on the calibration set -- 12-26%
+  lower on an eight-stage stack, unsurprisingly, since that is literally the
+  quantity it minimizes and the block-wise walk only approximates it -- and
+  a **higher** error on held-out inputs, 1-12% higher on the same model, on
+  all eight seeds tried. It is buying calibration-set fit that does not
+  transfer, which is :mod:`onnxsim.brecq`'s own argument for why the block
+  is the right unit: requiring every intermediate activation to match the
+  teacher is a far stronger constraint than requiring only the final output
+  to, and at calibration scale that constraint is worth more than the
+  freedom. Sixty-four times the data narrows the held-out gap from ~15% to
+  ~9% without closing it, and by that budget end-to-end has stopped winning
+  even on its own objective -- one global loss over sixteen coupled
+  parameter groups is a harder problem than sixteen conditioned ones.
+
+  It is also the expensive direction, in the way that decides whether a run
+  fits at all. One end-to-end step touches every layer rather than one
+  block's, so at an equal step count it costs roughly the block count more
+  time (6x on an eight-block model, measured), and its working set is the
+  whole model's rather than one block's: three fp32 copies of every trained
+  weight (the master weight and Adam's two moments) plus every forward *and*
+  backward intermediate at the calibration batch size, all resident
+  simultaneously. Measured peak RSS on
+  a one-million-parameter stack: 105 MB against the walk's 31 MB -- and the
+  walk's is flat in depth where this one is linear in it.
+
+  And it is all-or-nothing on operator coverage where the walk is not: one
+  node without a gradient rule refuses the entire model, whereas
+  :func:`apply_qat_all_blocks` turns that node into a gap and trains
+  everything either side of it. :data:`onnxsim.graph_grad.SUPPORTED_OPS`
+  covers 20 of the 202 operators in ONNX's default domain, so on a real
+  model that is the binding constraint long before the accuracy question
+  above is reached.
+
+  Reach for it on a shallow model, where the two land within a few percent
+  of each other in both directions. Do not reach for it on a deep one: it
+  will report a better loss while shipping a worse model, which is why the
+  loss ``losses=`` records has never been the number ``tests/test_qat.py``
+  asserts on.
 - *Weight-only by default; activation quantization is opt-in and changes
   the target scheme.* With ``learn_activation_scales=False`` (the default)
   this targets :func:`onnxsim.quantize_weight_only_int4`'s weight-only
@@ -1609,7 +1663,13 @@ def apply_qat(
     :param block_input_name: the activation entering the block. The backward
             walk that discovers the block's nodes stops here.
     :param block_output_name: the block's own final output, the tensor whose
-            reconstruction error is the loss.
+            reconstruction error is the loss. Nothing stops these two names
+            from being the graph's own input and its own output: that makes
+            the block the whole model and the loss the model's own output
+            error, which is the end-to-end pass rather than a surrogate for
+            it. See this module's docstring for what that was measured to
+            cost and to buy, and why it is not what
+            :func:`apply_qat_all_blocks` does by default.
     :param calibration_data: representative input batches. Each batch is a
             ``{input_name: np.ndarray}`` dict matching ``float_model``'s graph
             inputs -- see :func:`onnxsim.generate_random_calibration_data`
@@ -2088,7 +2148,11 @@ def discover_qat_blocks(
     :param max_layers_per_block: how many quantized layers to merge into one
             block before closing it. 1 gives per-layer blocks (more, cheaper
             steps, no intra-block error cancellation); a large value gives
-            one block per gap between undifferentiable ops.
+            one block per gap between undifferentiable ops -- and on a model
+            with no such gap, one block spanning the whole graph, which is
+            the end-to-end objective itself rather than a surrogate for it.
+            This module's docstring records why that is reachable but not
+            the default.
     :param learn_activation_scales: plan for :func:`apply_qat`'s
             activation-quantization mode, i.e. count
             :func:`onnxsim.quantize_static` QDQ layers as the quantized ones
