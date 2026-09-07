@@ -1488,21 +1488,27 @@ def test_eliminate_reshape_on_constant_declines_shared_weight():
 
 
 def test_eliminate_reshape_on_constant_declines_non_constant_shape():
-    # The target shape is computed at runtime, so there is no static dims list
-    # to bake into the weight.
+    # The target shape is only known at runtime, so there is no static dims
+    # list to bake into the weight. It has to come from a *dynamically* shaped
+    # tensor: onnxsim resolves Shape() on a statically shaped one into a
+    # constant, and then the rewrite is both possible and correct. D's dims are
+    # symbolic, so this asserts on graph structure only (check_n needs concrete
+    # dims to run the model).
     W = np.random.randn(2, 3)
     model = _model(
         """
-        g (float[3,2] X) => (float[3,2] Y)
+        g (float[3,2] X, float[N,M] D) => (float[3,2] Y)
         {
-          s = Shape(X)
+          s = Shape(D)
           w = Reshape(W, s)
           Y = Add(X, w)
         }
         """,
         initializer=[_f32(W, "W")],
     )
-    _, ops = _simplify_no_folding(model)
+    sim_model, check_ok = onnxsim.simplify(model, check_n=0, skip_constant_folding=True)
+    assert check_ok
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
     assert ops["Reshape"] == 1
 
 
