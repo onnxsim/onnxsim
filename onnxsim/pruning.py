@@ -1448,6 +1448,8 @@ import onnx.numpy_helper
 import onnx.shape_inference
 
 from onnxsim import backend
+from onnxsim._onnx_compat import INT4 as _INT4
+from onnxsim._onnx_compat import UINT4 as _UINT4
 from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
@@ -46186,8 +46188,8 @@ def _match_embed_layer_norm_producer(
 #     matching or slicing correctness.
 _GATHER_BLOCK_QUANTIZED_DOMAIN = "com.microsoft"
 _GATHER_BLOCK_QUANTIZED_DATA_TYPES = {
-    onnx.TensorProto.UINT4,
-    onnx.TensorProto.INT4,
+    _UINT4,
+    _INT4,
     onnx.TensorProto.UINT8,
 }
 

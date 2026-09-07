@@ -67,12 +67,10 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
+from onnxsim._onnx_compat import INT4 as _INT4
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.smoothquant import _match_matmul_like
-
-_INT4 = onnx.TensorProto.INT4
-
 
 # ---------------------------------------------------------------------------
 # Dual-Scale Quantizer (DSQ)
