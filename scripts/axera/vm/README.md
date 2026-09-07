@@ -83,6 +83,41 @@ SoC, only the driver's unload path does, so after `lxc restart --force`
 always `modprobe -r axcl_host && modprobe axcl_host` inside the guest before
 expecting a firmware push to succeed.
 
+## Where the guest path stands (2026-09-07 evening)
+
+Two guest-side configuration bugs found and fixed, one blocker left.
+
+**Fixed: the guest's virtual IOMMU was remapping the card's DMA.** Passing
+`-device intel-iommu,intremap=on,caching-mode=on` with a split irqchip (both
+in `raw.qemu`/`raw.qemu.conf`, already set on the VM) brings interrupt
+remapping up, but it also turns on DMA remapping, and the card's group in the
+guest came up as a translated `DMA` domain: the guest driver handed the card
+guest IOVAs that VFIO had never mapped, and the host logged
+`vfio-pci ... IO_PAGE_FAULT domain=0x0009 address=0xffc00000`. Adding
+`iommu=pt` to the *guest's* kernel command line (`/etc/default/grub.d/
+99-axcl-iommu.cfg`) gives the card an `identity` domain, so it gets
+guest-physical addresses that VFIO's mapping covers. After that: no host
+faults from the guest's DMA, and `DMAR-IR: Enabled IRQ remapping in x2apic
+mode` in the guest.
+
+**Fixed: a VFIO bus reset does not reset the card's SoC.** Only the driver's
+unload path does (`start reset slave`). After `lxc restart --force`, always
+`modprobe -r axcl_host && modprobe axcl_host` inside the guest before
+expecting a firmware push to succeed.
+
+**Blocker: the card's onboard software never comes up in the guest.** The
+boot ROM works -- all five firmware stages report `[STATUS]: SUCCESS`, which
+means the guest's MMIO writes reach the card *and* the card's DMA/status
+writes come back. But after `start_devices()` nothing follows: BAR0's shared
+window stays all zeros, the card raises no interrupt at all (VFIO's four host
+IRQs `vfio-msi[0..3]` stay at count 0 while the guest's MSI capability is
+enabled with the vIOMMU's remapped address `0xfee00918`), the RC/EP handshake
+times out, and `axcl-smi` reports `Recv port ack timeout`. On the host the
+same card raises hundreds of interrupts on its `endpoint-msi-irq` line. So
+the card's own Linux either does not finish booting or cannot signal from
+inside the guest; that is the next thing to chase, e.g. by capturing the
+card's own boot log (`/proc/ax_proc/pcie/sysdump`) after a failed bring-up.
+
 ## Known limits
 
 - A Thunderbolt link drop while the card is assigned reaches the *guest*
