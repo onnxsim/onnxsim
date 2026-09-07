@@ -1,9 +1,11 @@
 # Delivering QAT in onnxsim: a design note
 
-**Status: design note, not an implementation.** It answers "how *could* we
-deliver quantization-aware training as an onnxsim feature, and can the
-training math run on WebGPU or an NPU?" and records the shape of the work so
-the question doesn't have to be re-derived. `docs/nncf-comparison-future-work.md`
+**Status: design note, with its first two stages implemented.**
+`onnxsim/qat_graph.py` and the converter page's calibration-provider picker
+have landed (see "Staging" below); `apply_qat()` itself has not. This note
+answers "how *could* we deliver quantization-aware training as an onnxsim
+feature, and can the training math run on WebGPU or an NPU?" and records the
+shape of the work so the question doesn't have to be re-derived. `docs/nncf-comparison-future-work.md`
 currently lists QAT as out of scope ("QAT needs a training loop with a
 framework-native model"); this note revisits that on the narrower reading
 below, and leaves the broader one (task loss, labels, epochs) exactly as
@@ -161,19 +163,30 @@ already does, and would serve the browser only).
 
 Each stage is independently shippable and independently useful.
 
-0. **Provider plumbing.** `apply_adaround`/`apply_adaquant`/`apply_brecq`
-   already accept `providers=`, but only for the teacher's activation capture
-   — the optimization itself is CPU numpy. Meanwhile
-   `scripts/convertmodel/quantize_calibration.mjs` hard-codes
-   `executionProviders: ["wasm"]` and ignores the page's own EP dropdown.
-   Fixing that one line puts browser calibration on WebGPU/WebNN today, and
-   is the smallest end-to-end proof that the accelerator path works.
-1. **`qat_graph.py`: the step-graph builder/runner.** Emit forward + backward
-   + Adam as one ONNX model; run it through `backend` with `providers=`.
-   Prove it by porting one existing pass (`adaround.py` is the smallest) onto
-   it and showing bit-comparable CPU results plus a working non-CPU provider.
-   This is the load-bearing piece; everything else is application.
-2. **`qat.py` / `apply_qat()`.** Free weights + LSQ/LSQ+ scales + block-wise
+0. **Provider plumbing -- done.** The converter page's browser-side
+   calibration (`scripts/convertmodel/quantize_calibration.mjs`) used to
+   hard-code `executionProviders: ["wasm"]`; it now takes the providers the
+   Quantize panel's own **calibration execution provider** picker selects
+   (`providersForEp` from `webnn.mjs`, so every accelerated choice keeps its
+   WASM fallback), and asks for onnxruntime-web's "all" bundle when a WebNN
+   device is chosen. WASM stays the default: an accelerated provider can
+   compute in a different precision, which moves the observed min/max, so
+   calibrating on one is opt-in. Unit-tested browser-free in
+   `scripts/convertmodel/test/quantize_calibration.test.mjs`.
+1. **`qat_graph.py`: the step-graph builder/runner -- done.** `GraphBuilder`
+   assembles a hand-derived gradient as ONNX nodes, `adam_update` appends one
+   Adam step, `make_step_graph` wraps the result into a pure
+   `(constants, state, per-step scalars) -> (next state, loss)` function, and
+   `run_step_graph` runs it N times through a single `onnxsim.backend.Runner`
+   -- one session for the whole loop, on whichever `providers=` the caller
+   names. `onnxsim.adaround` is the first caller ported onto it:
+   `apply_adaround(..., step_providers=[...])` runs the optimization as a step
+   graph instead of in host numpy. `tests/test_qat_graph.py` checks that it
+   agrees with the numpy loop it replaces (>95% of elements pick the identical
+   floor/ceil decision; the rest is float32-vs-float64 boundary rounding, and
+   the reconstruction error lands within 10%) and that both step graphs stay
+   inside an operator allowlist the accelerator backends actually implement.
+2. **`qat.py` / `apply_qat()`** (next). Free weights + LSQ/LSQ+ scales + block-wise
    teacher distillation over `load_huggingface_calibration_data`, a
    `QuantizationConfig` flag to reach it from `quantize()`, a doc, and tests
    in the established style (parser-built models, a *measured* improvement
@@ -185,6 +198,36 @@ Each stage is independently shippable and independently useful.
    QAT with no server is something none of the comparable tools offer.
 4. **QAT interop (A).** Ingest externally-trained QDQ scales; emit the
    fake-quant model for external trainers.
+
+## Using what has landed
+
+```python
+import onnxsim
+
+# The optimization loop itself now runs as an ONNX step graph on these
+# providers rather than in host numpy. `providers=` (unchanged) still selects
+# where the float model's calibration activations are captured.
+tuned = onnxsim.apply_adaround(
+    float_model,
+    quantized_model,
+    calibration_data=batches,
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    step_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+Omitting `step_providers` keeps the existing float64 numpy loop, which is what
+CI runs: it is exact and reproducible, and a non-CPU provider is neither. In
+the browser, the Quantize panel's **calibration execution provider** picker
+does the equivalent for calibration's own forward passes (WebGPU, or WebNN's
+GPU/NPU device types).
+
+To put a *new* algorithm on a step graph: build its gradient with
+`qat_graph.GraphBuilder`, close the loop with `qat_graph.adam_update` and
+`make_step_graph`, and run it with `run_step_graph`.
+`adaround._build_rounding_step_graph` is the worked example, and it is short
+for the reason this whole approach works -- a hand-derived gradient is just
+arithmetic.
 
 ## Costs and risks
 

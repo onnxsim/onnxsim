@@ -373,3 +373,81 @@ def run_model(
             deterministic,
         )
     return _run_with_reference(model, inputs, output_names, custom_lib, providers)
+
+
+class Runner:
+    """A model prepared once and run many times.
+
+    :func:`run_model` creates a fresh session per call, which is right for
+    constant folding (every fold group is a different throwaway sub-model) and
+    wrong for an optimization loop, where the *same* small graph is run
+    hundreds of times with different tensor values -- there, session creation
+    would dominate and ``enable_mem_pattern``'s cross-run buffer planning,
+    disabled in :func:`run_model` because it can never pay for itself in a
+    single ``Run()``, is exactly what should be on.
+
+    This is the Python counterpart of the converter page's own
+    ``makeOrtRunner`` (``scripts/convertmodel/ort_executor.mjs``): bind a model
+    and an execution-provider list once, then call it per step. See
+    :mod:`onnxsim.qat_graph` for the loop it exists for.
+    """
+
+    def __init__(
+        self,
+        model: Union[str, bytes, onnx.ModelProto],
+        output_names: Optional[Sequence[str]] = None,
+        providers: Optional[Sequence[Provider]] = None,
+    ) -> None:
+        self._providers = providers
+        if _HAS_ONNXRUNTIME:
+            if providers is None:
+                providers = DEFAULT_PROVIDERS
+            validate_providers(providers)
+            sess_options = rt.SessionOptions()
+            sess_options.graph_optimization_level = rt.GraphOptimizationLevel(0)
+            sess_options.log_severity_level = 3
+            if isinstance(model, onnx.ModelProto):
+                model = model.SerializeToString()
+            self._sess: Any = rt.InferenceSession(
+                model, sess_options=sess_options, providers=list(providers)
+            )
+            self._output_names = list(
+                output_names
+                if output_names is not None
+                else [o.name for o in self._sess.get_outputs()]
+            )
+            self._run_options = rt.RunOptions()
+            self._run_options.log_severity_level = 3
+            self._graph = None
+        else:
+            validate_providers(providers)
+            from onnx.reference import ReferenceEvaluator
+
+            if isinstance(model, str):
+                model = onnx.load(model)
+            elif isinstance(model, bytes):
+                model = onnx.load_from_string(model)
+            self._sess = ReferenceEvaluator(model)
+            self._output_names = list(
+                output_names
+                if output_names is not None
+                else list(self._sess.output_names)
+            )
+            self._graph = None if _has_subgraphs(model.graph) else model.graph
+
+    @property
+    def output_names(self) -> List[str]:
+        return list(self._output_names)
+
+    def __call__(self, inputs: Dict[str, np.ndarray]) -> "OrderedDict[str, np.ndarray]":
+        if _HAS_ONNXRUNTIME:
+            outputs = self._sess.run(
+                self._output_names, inputs, run_options=self._run_options
+            )
+        elif self._graph is not None:
+            outputs = _run_reference_pruned(
+                self._sess, self._graph, self._output_names, inputs
+            )
+        else:
+            outputs = cast(List[np.ndarray], self._sess.run(self._output_names, inputs))
+        return OrderedDict(zip(self._output_names, outputs))
