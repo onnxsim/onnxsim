@@ -110,8 +110,7 @@ class GraphBuilder {
   // As above, but writing to a caller-chosen output name -- for the caller
   // whose result must carry a name other nodes already read.
   void OpInto(const std::string& op_type,
-              const std::vector<std::string>& inputs,
-              const std::string& output,
+              const std::vector<std::string>& inputs, const std::string& output,
               const std::vector<onnx::AttributeProto>& attrs = {});
 
   // The handful of operators the hand-derived gradients actually use. Kept to
@@ -177,8 +176,7 @@ AdamOutputs AdamUpdate(GraphBuilder& b, const std::string& param,
                        const std::string& grad, const std::string& m,
                        const std::string& v, const std::string& lr,
                        const std::string& m_correction,
-                       const std::string& v_correction,
-                       float eps = kAdamEps);
+                       const std::string& v_correction, float eps = kAdamEps);
 
 // The two bias-correction factors for step `t` (0-based), the host-side half
 // of AdamUpdate's contract.
