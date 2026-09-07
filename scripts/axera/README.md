@@ -3483,6 +3483,79 @@ Tests: `test_piper_decoder_subgraph_reproduces_the_whole_voice` (CPU only),
 `tests/test_axera_mcode_structure.py`. All three skip unless the voice is in
 the local HuggingFace cache, so the suite stays offline.
 
+### The first operand with a known meaning: output channels in `40.02`
+
+Every finding above is about *form* -- which verbs, which tags, how a unit is
+framed. None of it says what any operand *means*, and a generator that cannot
+compute operand values cannot emit a working program. This is the first
+operand field with a confirmed meaning.
+
+**The instrument.** Differencing whole models failed before because changing
+a shape re-lays-out the entire stream. The fix is to shrink the experiment
+until only one thing can move: a model holding exactly *one* same-padded 1-D
+convolution, so the program has one op and its operands are unambiguous, and
+then to sweep one parameter at a time across separate builds.
+
+**The result.** In a single-convolution program the leading `a1 40.02`
+operand is exactly
+
+    8 * (output channels) - 1
+
+confirmed at 127, 255, 511 and 767 for 16, 32, 64 and 96 channels, and for
+`ConvTranspose` as well as `Conv`. At 8 bits per INT8 channel that is an
+inclusive bit extent over one output position.
+
+**Two negatives make it an output-channel reading specifically.** Symmetric
+convolutions cannot tell input from output, so the asymmetric cases decide
+it: 32 to 64 gives 511 and 64 to 32 gives 255, each following the *output*.
+And the value does not move when the input length (32 to 128), the kernel
+size (1 to 9) or the dilation (1 to 8) changes -- which is what rules out
+reading it as a buffer size or a weight-table offset, since both of those
+move when the kernel or the length does.
+
+**This corrects an earlier assumption.** `40 02` was being read as a Wbt
+offset, and the puzzle was that on `llm_build` layers 22 of 147 and 12 of 169
+of those "offsets" pointed past the end of the weight table. They were never
+offsets. The small leading values recorded earlier -- `0xff` on resnet18d,
+`0x1ff` on a llama layer, `0x3ff` on mistral -- are `8C-1` for 32, 64 and 128
+channels.
+
+**It is a convolution-engine register, not a general channel field.** A
+lone `Relu`, `LeakyRelu` or `Sigmoid` never writes `40.02` at all, and
+`Add`/`Mul` write it with something that is not `8C-1`. Those streams are
+otherwise complete and round-trip byte-exactly, so the register is simply not
+part of an elementwise program. This is the first concrete instance of the
+claim above that op type lives in operand values rather than in different
+instructions: the programs share their verbs and tags, and what separates a
+convolution from an elementwise op is *which registers the program bothers to
+set*.
+
+That also explains an accident in this file's own tooling. `_tail_vector()`
+located an mcode's tail by searching for the bytes `a1 00 40 02` -- so it was
+silently anchored on the presence of a convolution, and failed outright on a
+graph holding only a `Relu`. It now falls back to the end of the fixed
+header, which leaves every convolution-bearing blob decoded exactly as
+before.
+
+**And the honest limit: it does not generalise to multi-op programs.** On the
+real Piper decoder only 1 of 197 program-leading `40.02` operands has the
+`8C-1` form; the rest are large values that behave like addresses or strides.
+So `40.02` is a field that carries an output-channel extent in the
+single-op case and something else once a program holds several fused ops.
+The confirmed claim is the narrow one, and the wider question -- what selects
+between those uses -- is open.
+
+A note on what the fused programs mean for the method: eight chained
+convolutions compile to five programs, not eight, and a two-convolution chain
+compiles to one. Op programs are not one-to-one with graph nodes, so any
+attribution that assumes they are will be wrong. Shrinking the model until
+one op is one program is what makes the operand legible.
+
+Tests: `test_single_conv_program_encodes_its_output_channel_count`,
+`test_single_conv_channel_operand_ignores_length_kernel_and_dilation` and
+`test_the_channel_operand_belongs_to_the_convolution_engine` in
+`tests/test_axera_mcode_structure.py` (fresh builds, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
