@@ -4473,6 +4473,15 @@ def main():
         help="Which compute devices the --emit-coreml model may run on. Default: ALL.",
     )
     parser.add_argument(
+        "--coreml-io-dtype",
+        choices=["fp32", "fp16"],
+        default="fp32",
+        help="Dtype of the --emit-coreml model's float inputs and outputs. 'fp16' "
+        "matches the precision an ML Program already computes in, so Core ML stops "
+        "converting every float tensor at the model boundary on each call (needs "
+        "--coreml-format mlprogram and iOS16/macOS13 or newer). Default: fp32.",
+    )
+    parser.add_argument(
         "--coreml-minimum-deployment-target",
         default=None,
         metavar="TARGET",
@@ -5394,6 +5403,7 @@ def main():
                 convert_to=args.coreml_format,
                 compute_units=args.coreml_compute_units,
                 minimum_deployment_target=args.coreml_minimum_deployment_target,
+                io_dtype=args.coreml_io_dtype,
             )
         except RuntimeError as e:
             print(Text(str(e), style="bold red"))

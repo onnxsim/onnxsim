@@ -91,6 +91,26 @@ whether it helps *this* pipeline's shapes (mostly single-token decode, unlike
 the deep/wide conv1x1 chains the cited measurements used) before anyone
 enables it by default.
 
+`--io-dtype fp16` (default `fp32`) changes the exported model's *interface*
+rather than anything inside it: every float input and output is declared
+float16, so Core ML stops converting them at the boundary on every call. An ML
+Program already computes in float16 (`compute_precision`'s default), so an
+fp32 interface only buys a down-conversion on the way in and an up-conversion
+on the way out, over twice the bytes. This pipeline is the shape that pays
+most for that: the KV cache crosses the boundary twice per decode step (in as
+`past_key_values_*`, out as `present_*`) and is by far the largest thing
+moving, growing with every token generated. The ANE reverse-engineering work
+behind README.md's "Theoretical ceiling" numbers measures direct fp16 I/O at
+roughly 37% faster than fp32 I/O over the same buffers
+(https://github.com/maderix/ANE, "How It Works" step 3). Unlike
+`--quantize-weights` it changes no stored value and unlike `--matmul-to-conv`
+it changes no op, so it costs nothing in accuracy relative to the default --
+the computation was fp16 on both sides of the flag; only whether the caller
+sees the fp16 value directly or an upcast copy of it changes.
+`run_llm_decode_benchmark.py` and `check_decode_parity.py` both read their
+feed dtypes off the model's own spec, so they work against either interface
+unchanged.
+
 Usage:
     python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \\
         --max-context-length 512 --output smollm2.mlpackage
@@ -133,6 +153,7 @@ def export_llm_to_coreml(
     quantize_weights: str = "none",
     matmul_to_conv: bool = False,
     minimum_deployment_target: str | None = None,
+    io_dtype: str = "fp32",
 ) -> None:
     from optimum.exporters.onnx import main_export
 
@@ -216,6 +237,7 @@ def export_llm_to_coreml(
                 "past_sequence_length + sequence_length": (1, 1, max_context_length),
             },
             "matmul_to_conv": matmul_to_conv,
+            "io_dtype": io_dtype,
         }
         if minimum_deployment_target is not None:
             convert_kwargs["minimum_deployment_target"] = minimum_deployment_target
@@ -326,6 +348,16 @@ def main() -> int:
         "unvalidated on real hardware -- benchmark before trusting it.",
     )
     ap.add_argument(
+        "--io-dtype",
+        choices=["fp32", "fp16"],
+        default="fp32",
+        help="Dtype of the exported model's float inputs and outputs (default: "
+        "fp32). 'fp16' matches what an ML Program already computes in, so Core ML "
+        "stops converting every float tensor -- the whole KV cache, twice per "
+        "decode step -- at the boundary. See the module docstring and README.md's "
+        "'fp16 model interface' section.",
+    )
+    ap.add_argument(
         "--minimum-deployment-target",
         default=None,
         help="Force a minimum Core ML deployment target (e.g. 'iOS18'), overriding "
@@ -346,6 +378,7 @@ def main() -> int:
         quantize_weights=args.quantize_weights,
         matmul_to_conv=args.matmul_to_conv,
         minimum_deployment_target=args.minimum_deployment_target,
+        io_dtype=args.io_dtype,
     )
     return 0
 

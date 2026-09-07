@@ -359,6 +359,115 @@ quantized, rather than the two costs just adding. Reinforces the same
 conclusion from the solo measurement above: `--matmul-to-conv` isn't worth
 enabling for this pipeline's shapes, combined with int8 or otherwise.
 
+### fp16 model interface (`--io-dtype fp16`)
+
+Where `--quantize-weights` cuts the bytes read from DRAM *inside* the model and
+`--matmul-to-conv` changes which op runs, this flag touches neither: it changes
+the dtype of the model's **interface** -- the float tensors a caller hands in
+and gets back -- from float32 to float16.
+
+The reason it's worth a flag: an ML Program already computes in float16
+(coremltools' `compute_precision` default), but coremltools declares the
+model's inputs and outputs float32 unless told otherwise. That mismatch is not
+free. It shows up directly in the emitted program -- exporting a two-op graph
+and reading back the ops Core ML actually stores (`const` instances, which just
+carry other ops' arguments, elided):
+
+| `io_dtype` | ops in the ML Program |
+| --- | --- |
+| `fp32` (default) | `cast`, `relu`, `sqrt`, `cast` |
+| `fp16` | `relu`, `sqrt` |
+
+Those two `cast`s are the boundary conversion, and they run on every single
+`predict()` call: float32 down to float16 on the way in, float16 back up to
+float32 on the way out, with twice the bytes crossing the boundary in each
+direction. This pipeline is close to the worst case for that. The KV cache
+crosses the boundary **twice per decode step** -- in as `past_key_values_*`,
+out as `present_*` -- it is by far the largest thing moving (far larger than
+the single token's activations that step actually computes), and it grows with
+every token generated. `--io-dtype fp16` deletes both conversions.
+
+The finding this follows is from the same M4 ANE reverse-engineering work as
+the "Theoretical ceiling" section above -- its companion repository
+[`maderix/ANE`](https://github.com/maderix/ANE), which drives the ANE directly
+through the private `_ANEClient`/`_ANECompiler` APIs rather than through Core
+ML. Passing tensors as fp16 in its IOSurface I/O path measures **~37% faster
+than fp32** over the same buffers ("How It Works", step 3). That number is from
+a different stack (raw IOSurface I/O, no Core ML framework in between), so
+treat it as the reason to expect the effect, not as a prediction of this
+pipeline's speedup -- `coreml-integration.yml`'s `benchmark-decode-macos`
+matrix has an `io_dtype: fp16` entry (same model as the unquantized baseline,
+decode parity included) to measure what it's actually worth here.
+
+```bash
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --io-dtype fp16 --output smollm2-io16.mlpackage
+```
+
+Unlike the other two flags, this one is **not** a precision or structural
+trade-off. `--quantize-weights` changes stored values; `--matmul-to-conv`
+changes which ops run. This changes neither: the computation was float16 on
+both sides of the flag, so an fp32 output was only ever an upcast copy of the
+fp16 value Core ML had already computed. What changes is whether the caller is
+handed that value directly.
+
+Notes:
+
+- Only **float** inputs and outputs move. Integer inputs (`input_ids`,
+  `attention_mask`, `position_ids`) are untouched -- Core ML has no float16
+  form for them.
+- Needs `--format mlprogram` (the default; the legacy `neuralnetwork` format
+  has no float16 interface) and iOS16/macOS13 or newer. `onnxsim.export_coreml`
+  raises the deployment target to iOS16 itself when one isn't given, and
+  rejects an explicitly *lower* one rather than emitting a model Core ML would
+  refuse to load.
+- The graph body is lowered exactly as it is without the flag: each fp16 input
+  is cast straight back to the dtype the ONNX graph declares before any node is
+  translated, so no op sees a different dtype than it otherwise would, and
+  coremltools' own fp16 compute-precision pass folds the round trip away (the
+  table above is that folding, observed).
+- `run_llm_decode_benchmark.py`, `check_decode_parity.py` and
+  `lm_eval_coreml_adapter.py` all read their feed dtypes off the model's own
+  spec (`_DATATYPE_TO_NUMPY`), so they run against either interface with no
+  changes.
+
+#### What else came from `maderix/ANE`, and why not (yet)
+
+That repository documents several other ANE findings. Two are worth recording
+as deliberately *not* taken here, so the next person doesn't have to re-derive
+the reasoning:
+
+- **INT8 W8A8 (int8 weights *and* activations)** -- measured there at
+  **1.85-1.88x** fp16 throughput (35.1 vs 18.6 TOPS on 128x conv 512ch), via
+  MIL `quantize`/`dequantize` between tiles so activations stay int8 in L2
+  SRAM. Core ML's own equivalent is
+  `coremltools.optimize.coreml.linear_quantize_activations`, which needs a
+  calibration pass over real data. It is a **compute** lever, and the
+  "Theoretical ceiling" section above works out that single-token decode at
+  these model sizes is bandwidth-bound with compute already down in the noise
+  -- so it would be aimed at the side of the ceiling that isn't binding.
+  Interesting for *prefill* (whole-prompt, genuinely compute-bound), which this
+  suite doesn't currently optimize for; not for the decode tok/s number
+  `run_llm_decode_benchmark.py` reports.
+- **Channel-first `[1,C,1,S]` layout throughout** -- that project eliminates
+  transposes by keeping *its whole CPU-side pipeline* in the ANE's native
+  IOSurface layout, not by transposing around each op. Notably, that is the
+  opposite of what `--matmul-to-conv` does here: it wraps every projection in a
+  transpose/conv/transpose, and measured *slower* (see above). Doing this
+  properly means a layout-propagation pass over the whole graph that inserts
+  transposes only where the layout genuinely has to change -- a real
+  translator-level project, not a flag, and one that should only be started
+  once there's a measurement showing the transposes (rather than something
+  else) are what cost `--matmul-to-conv` its 16-22%.
+
+Its remaining findings are specific to driving the ANE through the private
+APIs and have no Core ML analogue to port: the ~119-compiles-per-process limit
+worked around by `exec()`, the single-input packing constraint, and the
+SDPA-`attn_mask` gap (that project decomposes causal attention itself because
+ANE hardware ignores `attn_mask`; `onnxsim/coreml_export.py` never emits a
+fused SDPA op in the first place -- it lowers attention as explicit
+`matmul`/`softmax`/`add`, so there is no mask to be dropped).
+
 ### Compute-unit device placement (`coreml_compute_plan_trace.m`)
 
 `--matmul-to-conv`'s standalone measurement above raised an obvious
