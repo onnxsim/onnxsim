@@ -56,6 +56,10 @@ from onnxsim.embedding_quantization import (
 )
 from onnxsim.finetune import apply_pruning_finetune
 from onnxsim.flexround import apply_flexround
+from onnxsim.focus_fp4 import (
+    FOCUS_DGS_SUB_BLOCK_SIZE,
+    quantize_weight_only_mxfp4_focus,
+)
 from onnxsim.foem import apply_foem
 from onnxsim.fp6_llm import apply_fp6_llm_quantization, quantize_dequantize_fp6
 from onnxsim.fptq import apply_fptq
@@ -408,6 +412,8 @@ __all__ = [
     "quantize_weight_only_nf4",
     "NF4_CODEBOOK",
     "quantize_weight_only_mxfp4",
+    "quantize_weight_only_mxfp4_focus",
+    "FOCUS_DGS_SUB_BLOCK_SIZE",
     "quantize_weight_only_if4",
     "quantize_weight_only_nvfp4",
     "NVFP4_BLOCK_SIZE",

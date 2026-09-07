@@ -87,3 +87,12 @@ onnx.save(quantized, "model.mxfp4.onnx")
 
 Needs no calibration data: both the codebook and the per-block
 power-of-two scale come entirely from the weight's own values.
+
+## See also
+
+`docs/focus-fp4.md` -- `onnxsim.quantize_weight_only_mxfp4_focus`, a port of
+Tencent AngelSlim's FOCUS (CRS/DGS) that emits the *identical* format this
+page describes -- same initializer names, shapes, dtypes and the same
+bit-identical power-of-two scale -- but picks each block's E2M1 codes with a
+quantization scale decoupled from the stored dequantization scale. Only the
+code bytes differ, so nothing downstream can tell the two apart.

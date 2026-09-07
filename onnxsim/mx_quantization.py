@@ -52,7 +52,7 @@ INT4, not the paper's own curated 2-bit/weight codebook indices).
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Union
+from typing import Callable, Iterable, List, Optional, Union
 
 import numpy as np
 import onnx
@@ -156,34 +156,27 @@ def _quantize_mxfp4_blockwise(
     return codes.reshape(n, k), scale
 
 
-def quantize_weight_only_mxfp4(
+def _quantize_weight_only_mxfp4_impl(
     model: Union[str, onnx.ModelProto],
-    block_size: int = MX_BLOCK_SIZE,
-    skip_names: Optional[Iterable[str]] = None,
+    block_size: int,
+    skip_names: Optional[Iterable[str]],
+    quantize_block: Callable[[np.ndarray, int], "tuple[np.ndarray, np.ndarray]"],
 ) -> onnx.ModelProto:
-    """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
-    float32 weight (whose reduction dimension ``K`` is evenly divisible by
-    ``block_size``) into the OCP MXFP4 format -- see this module's own
-    docstring for the technique. Needs no calibration data: both the
-    codebook and the per-block power-of-two scale come from the weight's
-    own values.
+    """Shared driver behind :func:`quantize_weight_only_mxfp4` and
+    :func:`onnxsim.focus_fp4.quantize_weight_only_mxfp4_focus`.
 
-    :param model: the original (unquantized) onnx ModelProto or file path
-    :param block_size: elements per (output-channel, block) scale group
-            along the reduction dimension; the OCP MX spec's own canonical
-            choice is 32 for every MX format
-    :param skip_names: weight initializer names to leave unquantized even
-            if otherwise eligible
-    :returns: ``model`` with every matched layer's weight replaced by
-            ``Mul(Reshape(Gather(codebook, Cast(Wq, INT64)), ...), Ws) ->
-            Reshape(..., original shape)`` feeding the original MatMul/Gemm
-            node -- ordinary ONNX ops only, no contrib op and no minimum
-            opset beyond what ``Gather``/``Cast``/``Reshape``/``Mul``
-            themselves need (opset 11+; unlike onnxsim's affine INT4
-            schemes, this needs no opset-21 ``DequantizeLinear``
-            ``block_size`` attribute since the codebook lookup is built
-            from ordinary ops directly). Layers with a non-constant,
-            non-2-D, or non-block-divisible weight are left untouched.
+    Matches every eligible layer, calls ``quantize_block(w_nk, block_size)``
+    on that layer's ``[N, K]`` (output-channel-first) weight -- which must
+    return ``(codes_nk, scale_blocks)`` with exactly the shapes and dtypes
+    :func:`_quantize_mxfp4_blockwise` returns -- and emits the MXFP4
+    dequantization subgraph and initializers for the result.
+
+    Every byte of the emitted graph (initializer *names*, shapes, dtypes,
+    node types, node order) is fixed here rather than by the caller's
+    fitting choice, so any ``quantize_block`` that keeps the same
+    power-of-two scale produces a model differing from plain MXFP4's only
+    in the ``*_mxfp4_q`` code values -- the structural guarantee
+    :mod:`onnxsim.focus_fp4` relies on.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -228,7 +221,7 @@ def quantize_weight_only_mxfp4(
             )
         num_blocks = k // block_size
 
-        codes_nk, scale_blocks = _quantize_mxfp4_blockwise(w_nk, block_size)
+        codes_nk, scale_blocks = quantize_block(w_nk, block_size)
         codes_orig = codes_nk if weight_transposed else codes_nk.T
         scale_orig = scale_blocks if weight_transposed else scale_blocks.T
         assert codes_orig.shape == (dim0, dim1)
@@ -319,3 +312,37 @@ def quantize_weight_only_mxfp4(
                 node.input[i] = dq_out
 
     return out
+
+
+def quantize_weight_only_mxfp4(
+    model: Union[str, onnx.ModelProto],
+    block_size: int = MX_BLOCK_SIZE,
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
+    float32 weight (whose reduction dimension ``K`` is evenly divisible by
+    ``block_size``) into the OCP MXFP4 format -- see this module's own
+    docstring for the technique. Needs no calibration data: both the
+    codebook and the per-block power-of-two scale come from the weight's
+    own values.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param block_size: elements per (output-channel, block) scale group
+            along the reduction dimension; the OCP MX spec's own canonical
+            choice is 32 for every MX format
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible
+    :returns: ``model`` with every matched layer's weight replaced by
+            ``Mul(Reshape(Gather(codebook, Cast(Wq, INT64)), ...), Ws) ->
+            Reshape(..., original shape)`` feeding the original MatMul/Gemm
+            node -- ordinary ONNX ops only, no contrib op and no minimum
+            opset beyond what ``Gather``/``Cast``/``Reshape``/``Mul``
+            themselves need (opset 11+; unlike onnxsim's affine INT4
+            schemes, this needs no opset-21 ``DequantizeLinear``
+            ``block_size`` attribute since the codebook lookup is built
+            from ordinary ops directly). Layers with a non-constant,
+            non-2-D, or non-block-divisible weight are left untouched.
+    """
+    return _quantize_weight_only_mxfp4_impl(
+        model, block_size, skip_names, _quantize_mxfp4_blockwise
+    )
