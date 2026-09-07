@@ -13,6 +13,16 @@
 // onnx.ValueInfoProto(name=name) -- and onnxruntime-web (already loaded on
 // this page for the "Run inference" panel) actually executes the augmented
 // model to observe them.
+//
+// Those forward passes are the expensive part of calibration (numSamples full
+// runs of the model), so they are not pinned to WASM: the caller passes the
+// execution providers the Quantize panel's own EP picker selected, the same
+// providersForEp() list the inference panel uses (webnn.mjs), which always
+// ends in "wasm" so an unavailable WebGPU/WebNN device just falls back. WASM
+// stays the default -- an accelerated provider can compute in a different
+// precision (fp16 on a WebNN NPU device), which moves the observed min/max a
+// little, so choosing one is opt-in rather than something calibration does
+// behind the user's back.
 
 import { loadOrt, makeDummyInputs } from "./inference_browser.mjs";
 
@@ -23,7 +33,16 @@ import { loadOrt, makeDummyInputs } from "./inference_browser.mjs";
 // zero-sized dim, is dropped), and `flat` is a plain array of
 // [min0, max0, min1, max1, ...] in the same order -- exactly the shape
 // runtime.onnxsim_quantize_static / _quantize_qoperator expect.
-export async function calibrateRanges(runtime, modelBuf, tensorNames, numSamples = 8, log = () => {}) {
+// `options` carries the execution-provider choice ({ providers, needWebnn } as
+// returned by providersForEp) and, for tests, injectable onnxruntime-web
+// entry points.
+export async function calibrateRanges(runtime, modelBuf, tensorNames, numSamples = 8, log = () => {}, options = {}) {
+  const {
+    providers = ["wasm"],
+    needWebnn = false,
+    ortLoader = loadOrt,
+    makeInputs = makeDummyInputs,
+  } = options;
   if (!tensorNames || tensorNames.length === 0) {
     return { names: [], flat: [] };
   }
@@ -35,9 +54,11 @@ export async function calibrateRanges(runtime, modelBuf, tensorNames, numSamples
   // next wasm call, and onnxruntime-web needs its own stable copy anyway.
   const augmentedBytes = new Uint8Array(augmented).slice();
 
-  const ort = await loadOrt();
+  // The WebNN providers only exist in onnxruntime-web's "all" bundle, the
+  // same variant split the inference panel makes.
+  const ort = await ortLoader(needWebnn ? "all" : "default");
   const sess = await ort.InferenceSession.create(augmentedBytes, {
-    executionProviders: ["wasm"],
+    executionProviders: providers,
   });
   const wanted = new Set(tensorNames);
   const ranges = new Map();
@@ -47,7 +68,7 @@ export async function calibrateRanges(runtime, modelBuf, tensorNames, numSamples
     // "zeros"/"sample": a fixed input would collapse every tensor's observed
     // range to a single point, and "sample" would need network fetches this
     // background calibration step shouldn't depend on.
-    const feeds = await makeDummyInputs(ort, sess, 1, "random", null, null, log);
+    const feeds = await makeInputs(ort, sess, 1, "random", null, null, log);
     const outputs = await sess.run(feeds);
     for (const name of sess.outputNames) {
       if (!wanted.has(name)) continue;

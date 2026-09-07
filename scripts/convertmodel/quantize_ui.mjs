@@ -29,6 +29,7 @@
 import { downloadBytes } from "./download.mjs";
 import { resolveOriginalModelBytes } from "./inference_browser.mjs";
 import { calibrateRanges } from "./quantize_calibration.mjs";
+import { providersForEp, isWebnnEp } from "./webnn.mjs";
 import { computeQuantizationQuality, renderQuantizationQuality } from "./quantize_metrics.mjs";
 
 // Resolves the model to quantize per the "Quantize input" radio: the raw
@@ -87,6 +88,7 @@ function initQuantizePanel() {
   const statusEl = document.getElementById("quantize-status");
   const dlBtn = document.getElementById("quantize-download");
   const samplesEl = document.getElementById("quantize-samples");
+  const epEl = document.getElementById("quantize-ep");
   const metricsToggleEl = document.getElementById("quantize-metrics-toggle");
   const metricsEl = document.getElementById("quantize-metrics");
 
@@ -140,8 +142,20 @@ function initQuantizePanel() {
           return;
         }
         const numSamples = Math.max(1, parseInt((samplesEl && samplesEl.value) || "8", 10) || 8);
-        setStatus(`calibrating ${names.length} tensor(s) over ${numSamples} random sample(s)…`);
-        const { names: calNames, flat } = await calibrateRanges(runtime, modelBuf, names, numSamples, setStatus);
+        // Calibration's own forward passes are the one part of quantizing that
+        // actually runs the model, so they honour this panel's own execution
+        // provider picker (WASM by default; every accelerated choice falls
+        // back to WASM -- see webnn.mjs / quantize_calibration.mjs).
+        const epValue = epEl ? epEl.value : "wasm";
+        const { providers, needWebnn } = providersForEp(epValue);
+        if (isWebnnEp(epValue)) {
+          setStatus("WebNN is experimental; calibration falls back to WASM if the device or an operator is unsupported.");
+        }
+        setStatus(`calibrating ${names.length} tensor(s) over ${numSamples} random sample(s) on ${epValue}…`);
+        const { names: calNames, flat } = await calibrateRanges(runtime, modelBuf, names, numSamples, setStatus, {
+          providers,
+          needWebnn,
+        });
         if (calNames.length === 0) {
           setStatus("calibration produced no ranges (the model may have no runnable inputs).");
           return;

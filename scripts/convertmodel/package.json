@@ -28,7 +28,8 @@
     "test:sample": "node test/sample_inputs.test.mjs",
     "test:classify": "node test/classify_output.test.mjs",
     "test:quantize-risk": "node test/quantize_risk_estimate.test.mjs",
-    "test:all": "npm run test:netron && npm run test:trace && npm run test:node-reduction && npm run test:macs && npm run test:shapes && npm run test:hf && npm run test:hftoken && npm run test:xet && npm run test:issue && npm run test:versions && npm run test:backend && npm run test:query && npm run test:webnn && npm run test:ortlog && npm run test:cdn && npm run test:fill && npm run test:tokenize && npm run test:hfdata && npm run test:sample && npm run test:classify && npm run test:quantize-risk && npm run test:inference && npm run test:compare",
+    "test:quantize-cal": "node test/quantize_calibration.test.mjs",
+    "test:all": "npm run test:netron && npm run test:trace && npm run test:node-reduction && npm run test:macs && npm run test:shapes && npm run test:hf && npm run test:hftoken && npm run test:xet && npm run test:issue && npm run test:versions && npm run test:backend && npm run test:query && npm run test:webnn && npm run test:ortlog && npm run test:cdn && npm run test:fill && npm run test:tokenize && npm run test:hfdata && npm run test:sample && npm run test:classify && npm run test:quantize-risk && npm run test:quantize-cal && npm run test:inference && npm run test:compare",
     "coverage": "c8 npm run test:all"
   },
   "dependencies": {
