@@ -98,6 +98,23 @@ class CoreMLDecoder:
             )
         self.max_context_length = max_context_length
 
+        # The model's float interface dtype (see export_llm_to_coreml.py's
+        # --io-dtype): float32 by default, float16 when the boundary conversion
+        # Core ML would otherwise do on every call was exported away. Reported
+        # below so a benchmark run's numbers are readable without cross-checking
+        # which flags produced the .mlpackage.
+        float_dtypes = {
+            self._input_dtypes[i.name]
+            for i in spec.description.input
+            if self._input_dtypes[i.name] in (np.float16, np.float32, np.float64)
+        }
+        if not float_dtypes:
+            self.io_dtype = "none"
+        elif len(float_dtypes) == 1:
+            self.io_dtype = np.dtype(float_dtypes.pop()).name
+        else:
+            self.io_dtype = "mixed"
+
         self._present_names = [
             o.name for o in spec.description.output if o.name.startswith("present_")
         ]
@@ -219,6 +236,7 @@ def main() -> int:
     )
     decoder = CoreMLDecoder(args.mlpackage, compute_units=args.compute_units)
     print(f"Max context length: {decoder.max_context_length} tokens", flush=True)
+    print(f"Model float interface: {decoder.io_dtype}", flush=True)
 
     prompt_ids = tokenizer(args.prompt, return_tensors="np")["input_ids"][0].tolist()
     print(f"Prompt: {args.prompt!r} ({len(prompt_ids)} tokens)", flush=True)

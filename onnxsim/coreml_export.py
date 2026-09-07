@@ -132,6 +132,7 @@ def _make_input_spec(
     range_dims: Dict[str, Any],
     RangeDim,
     TensorType,
+    io_dtype: Optional[str] = None,
 ):
     """Build this input's MIL ``TensorSpec`` and, if it has a dynamic dim, the
     matching coremltools ``TensorType`` (for ``ct.convert(inputs=...)``; ``None``
@@ -175,6 +176,11 @@ def _make_input_spec(
         ct_shape.append(rd)
         has_dynamic = True
     dtype = _onnx_elem_type_to_mil(tt.elem_type, types)
+    if io_dtype == "fp16" and dtype == types.fp32:
+        # Declare the *model boundary* as fp16 (see convert_to_coreml's `io_dtype`).
+        # Only float inputs move: an int/bool input has no fp16 equivalent, and
+        # Core ML would reject one anyway.
+        dtype = types.fp16
     spec = mb.TensorSpec(shape=tuple(mil_shape), dtype=dtype)
     ct_input = (
         TensorType(name=value_info.name, shape=tuple(ct_shape)) if has_dynamic else None
@@ -269,6 +275,14 @@ class _Lowerer:
         if suffix:
             base = f"{base}_{suffix}"
         return f"{base}__{self._counter}"
+
+    def fresh_io_name(self, base: str, suffix: str) -> str:
+        """A unique name for a cast inserted at the graph's I/O boundary, where
+        there is no ONNX node to derive one from (see ``convert_to_coreml``'s
+        ``io_dtype``). Shares ``_counter`` with ``fresh_name``/``make_const`` so a
+        graph tensor literally named ``x_from_fp16__1`` still can't collide."""
+        self._counter += 1
+        return f"{base}_{suffix}__{self._counter}"
 
     def lower_node(self, node: onnx.NodeProto) -> None:
         handler = _OP_HANDLERS.get(node.op_type)
@@ -1187,6 +1201,7 @@ def _build_mil_program(
     dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
     matmul_to_conv: bool = False,
     opset_version: Optional[Any] = None,
+    io_dtype: Optional[str] = None,
 ):
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
@@ -1201,18 +1216,34 @@ def _build_mil_program(
     range_dims: Dict[str, Any] = {}
     input_specs = {}
     flexible_inputs = []
+    graph_dtypes: Dict[str, Any] = {}
     for inp in graph.input:
         if inp.name in initializer_names:
             continue
         spec, ct_input = _make_input_spec(
-            inp, mb, types, dynamic_shapes, range_dims, RangeDim, TensorType
+            inp, mb, types, dynamic_shapes, range_dims, RangeDim, TensorType, io_dtype
         )
         input_specs[inp.name] = spec
+        graph_dtypes[inp.name] = _onnx_elem_type_to_mil(
+            inp.type.tensor_type.elem_type, types
+        )
         if ct_input is not None:
             flexible_inputs.append(ct_input)
 
     with Function(input_specs, opset_version=opset_version) as func:
         for name, var in func.inputs.items():
+            if var.dtype != graph_dtypes[name]:
+                # `io_dtype="fp16"` declared this input fp16 where the ONNX graph
+                # says fp32. Cast straight back at the boundary so every op below
+                # is lowered against exactly the dtype it would see without the
+                # flag -- the graph body stays byte-identical, only the model's
+                # declared input type changes. coremltools' own fp16
+                # compute-precision pass folds the round trip away.
+                var = mb.cast(
+                    x=var,
+                    dtype=types.builtin_to_string(graph_dtypes[name]),
+                    name=lowerer.fresh_io_name(name, "from_fp16"),
+                )
             lowerer.bind(name, var)
         for init in graph.initializer:
             lowerer.bind(
@@ -1220,9 +1251,15 @@ def _build_mil_program(
             )
         for node in graph.node:
             lowerer.lower_node(node)
-        outputs = [
-            mb.identity(x=lowerer.get(out.name), name=out.name) for out in graph.output
-        ]
+        outputs = []
+        for out in graph.output:
+            var = lowerer.get(out.name)
+            if io_dtype == "fp16" and var.dtype == types.fp32:
+                # Terminal cast: the Core ML model's declared output dtype is the
+                # dtype of the op that produces it.
+                outputs.append(mb.cast(x=var, dtype="fp16", name=out.name))
+            else:
+                outputs.append(mb.identity(x=var, name=out.name))
         func.set_outputs(outputs)
 
     prog = Program()
@@ -1251,6 +1288,38 @@ def _resolve_deployment_target(ct, target: Union[str, Any]):
     return target
 
 
+def _resolve_io_dtype(ct, io_dtype: Optional[str], convert_to: str, resolved_target):
+    """Validate ``io_dtype`` and return ``(normalized, resolved_target)``.
+
+    ``normalized`` is ``"fp16"`` or ``None`` ("leave the boundary alone"), and
+    ``resolved_target`` is bumped to iOS16/macOS13 when fp16 I/O is requested
+    without an explicit target -- that is the first Core ML version whose
+    ``MLMultiArray`` model interface can be declared float16 at all.
+    """
+    if io_dtype is None or io_dtype == "fp32":
+        return None, resolved_target
+    if io_dtype != "fp16":
+        raise RuntimeError(
+            f"Unknown io_dtype {io_dtype!r}; valid values: 'fp32' (the default, "
+            "float model inputs/outputs declared float32) or 'fp16'."
+        )
+    if convert_to != "mlprogram":
+        raise RuntimeError(
+            "io_dtype='fp16' requires convert_to='mlprogram'; the legacy "
+            "'neuralnetwork' format has no float16 model interface."
+        )
+    floor = ct.target.iOS16
+    if resolved_target is None:
+        return "fp16", floor
+    if int(resolved_target) < int(floor):
+        raise RuntimeError(
+            f"io_dtype='fp16' needs minimum_deployment_target iOS16/macOS13 or "
+            f"newer (got {resolved_target.name}); float16 model inputs/outputs "
+            "did not exist before then."
+        )
+    return "fp16", resolved_target
+
+
 def convert_to_coreml(
     model: onnx.ModelProto,
     *,
@@ -1261,6 +1330,7 @@ def convert_to_coreml(
     skip_model_load: bool = True,
     dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
     matmul_to_conv: bool = False,
+    io_dtype: Optional[str] = None,
 ):
     """Convert an ONNX model to an in-memory Core ML model.
 
@@ -1315,6 +1385,28 @@ def convert_to_coreml(
         Any ``MatMul`` that doesn't match that exact shape (a non-constant or
         non-2-D weight, or ``x`` of any rank other than 3) is left on the
         ``matmul`` path unchanged.
+    io_dtype:
+        Dtype of the *model interface* -- the float inputs and outputs Core ML
+        exposes to a caller. ``None``/``"fp32"`` (the default) leaves them
+        float32, coremltools' own default; ``"fp16"`` declares every float input
+        and output float16 instead.
+
+        An ML Program already computes in float16 by default, so a float32
+        interface makes Core ML convert every float input down to fp16 on the way
+        in and every float output back up on the way out, moving twice the bytes
+        across the boundary in the process. Declaring the boundary fp16 skips
+        both conversions; the ANE reverse-engineering work this follows measures
+        direct fp16 I/O at roughly 37% faster than fp32 I/O on the same buffers
+        (`maderix/ANE <https://github.com/maderix/ANE>`_, "How It Works" step 3).
+        It costs no accuracy relative to the default either: the computation was
+        already fp16 either way, so a float32 output is an upcast fp16 value.
+
+        Worth most on a graph that hands the same large float tensors back and
+        forth every call -- a decoder's KV cache, which arrives as
+        ``past_key_values_*`` inputs and leaves as ``present_*`` outputs on every
+        single decode step. Integer and bool inputs are unaffected (Core ML has
+        no fp16 form for them). Requires ``convert_to="mlprogram"`` and raises
+        ``minimum_deployment_target`` to iOS16/macOS13 when one isn't given.
 
     Returns
     -------
@@ -1346,6 +1438,9 @@ def convert_to_coreml(
         if minimum_deployment_target is not None
         else None
     )
+    io_dtype, resolved_target = _resolve_io_dtype(
+        ct, io_dtype, convert_to, resolved_target
+    )
 
     prog, flexible_inputs = _build_mil_program(
         model,
@@ -1358,6 +1453,7 @@ def convert_to_coreml(
         dynamic_shapes,
         matmul_to_conv,
         opset_version=resolved_target,
+        io_dtype=io_dtype,
     )
 
     kwargs: Dict[str, Any] = {}

@@ -272,6 +272,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: iOS18
+            io_dtype: fp32
           - model_id: Qwen/Qwen2.5-1.5B-Instruct
             slug: qwen2.5-1.5b
             max_context_length: 512
@@ -279,6 +280,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
           # Same model/dtype as the first entry, weight-only int8 quantized --
           # see scripts/apple/README.md's "Theoretical ceiling" section for why
           # this is expected to raise decode tok/s (roughly halves DRAM bytes
@@ -292,6 +294,7 @@ jobs:
             quantize_weights: int8
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
           # Same model/dtype as the first entry, --matmul-to-conv enabled --
           # unlike the int8 entry above, this targets compute (not bandwidth):
           # the M4 ANE's native matmul path measures well below its conv1x1
@@ -309,6 +312,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "true"
             min_deployment_target: iOS18
+            io_dtype: fp32
           # Both flags together -- measured worse than either alone: 2.26
           # tok/s vs. 3.61 baseline, 4.64 int8-only, 3.04 conv-only (see the
           # README's "matmul-to-conv1x1" section). Not the neutral
@@ -323,6 +327,39 @@ jobs:
             quantize_weights: int8
             matmul_to_conv: "true"
             min_deployment_target: ""
+            io_dtype: fp32
+          # Same model/dtype as the first entry with an fp16 *model interface*
+          # -- neither a bandwidth lever on the weights nor a change to which
+          # ops run, but the removal of the fp32<->fp16 conversion Core ML
+          # otherwise does at the model boundary on every call. This pipeline
+          # pays that twice per decode step over the whole KV cache (in as
+          # past_key_values_*, out as present_*), the largest thing crossing
+          # the boundary; see the README's "fp16 model interface" section.
+          # Runs decode parity too: it should be unchanged from the baseline
+          # (the computation was already fp16 -- only whether the caller gets
+          # that value or an upcast copy of it differs), so a parity *drop*
+          # here would mean something other than the interface moved.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-io16
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp16
+          # int8 weights + fp16 interface: the two levers that measured (int8)
+          # or are expected (fp16 I/O) to help, together. Checked explicitly
+          # rather than assumed to compose -- the int8 + matmul-to-conv entry
+          # above is precisely the case where two independently-scoped flags
+          # did not compose neutrally.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-int8-io16
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: int8
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp16
           # Few-billion-parameter tier -- DeviceMark's own leaderboard weight
           # class (https://devicemark.github.io/, roughly 1-4B), and the
           # entries prepare_benchmark_models.py's BENCHMARK_MODELS already
@@ -344,6 +381,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
           - model_id: meta-llama/Llama-3.2-1B-Instruct
             slug: llama-3.2-1b
             max_context_length: 512
@@ -351,6 +389,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
           - model_id: meta-llama/Llama-3.2-3B-Instruct
             slug: llama-3.2-3b
             max_context_length: 512
@@ -358,6 +397,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
           - model_id: Qwen/Qwen2.5-3B-Instruct
             slug: qwen2.5-3b
             max_context_length: 512
@@ -365,6 +405,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
           - model_id: microsoft/Phi-3.5-mini-instruct
             slug: phi-3.5-mini
             max_context_length: 512
@@ -372,6 +413,7 @@ jobs:
             quantize_weights: none
             matmul_to_conv: "false"
             min_deployment_target: ""
+            io_dtype: fp32
     env:
       # Read-only secret; only meta-llama/Llama-3.2-*-Instruct entries above
       # need it (gated -- see prepare_benchmark_models.py's module
@@ -402,6 +444,7 @@ jobs:
             --max-context-length ${{ matrix.max_context_length }} \
             --quantize-weights ${{ matrix.quantize_weights }} \
             ${{ matrix.matmul_to_conv == 'true' && '--matmul-to-conv' || '' }} \
+            --io-dtype ${{ matrix.io_dtype }} \
             ${{ matrix.min_deployment_target != '' && format('--minimum-deployment-target {0}', matrix.min_deployment_target) || '' }} \
             --output ${{ matrix.slug }}.mlpackage
       - name: Run the decode benchmark through the real Core ML runtime

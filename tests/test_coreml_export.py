@@ -26,7 +26,9 @@ from onnx import numpy_helper, parser
 
 pytest.importorskip("coremltools", reason="coremltools is not installed")
 
-import onnxruntime as ort  # noqa: E402  (imported after the coremltools availability check)
+import coremltools as ct  # noqa: E402  (imported after the availability check above)
+import onnxruntime as ort  # noqa: E402
+from coremltools.converters.mil.mil import types  # noqa: E402
 
 import onnxsim  # noqa: E402
 from onnxsim import coreml_export  # noqa: E402
@@ -450,7 +452,9 @@ def test_zero_length_input_dimension_is_static():
 # ---------------------------------------------------------------------------
 
 
-def _build_ops(model: onnx.ModelProto, dynamic_shapes=None, matmul_to_conv=False):
+def _build_ops(
+    model: onnx.ModelProto, dynamic_shapes=None, matmul_to_conv=False, io_dtype=None
+):
     """Like ``_mil_const_value``, but returns the built MIL function itself
     (not just a folded output value) -- for inspecting *which* ops got
     emitted, or reading an intermediate (not just the final output) value.
@@ -460,6 +464,7 @@ def _build_ops(model: onnx.ModelProto, dynamic_shapes=None, matmul_to_conv=False
         *coreml_export._import_mil(),
         dynamic_shapes,
         matmul_to_conv,
+        io_dtype=io_dtype,
     )
     return prog.functions["main"], flexible_inputs
 
@@ -738,6 +743,170 @@ def test_constant_of_shape_dynamic_fp16():
     mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
     (out_desc,) = mlmodel.get_spec().description.output
     assert out_desc.name == "y"
+
+
+# ---------------------------------------------------------------------------
+# io_dtype (opt-in: declare the model's float interface fp16 instead of fp32 --
+# see convert_to_coreml's docstring and scripts/apple/README.md's "fp16 model
+# interface" section). An ML Program computes in fp16 regardless, so an fp32
+# interface only buys a pair of boundary conversions; these tests check the
+# declared interface dtypes and that the conversions really disappear.
+# ---------------------------------------------------------------------------
+
+_ARRAY_DTYPE = ct.proto.FeatureTypes_pb2.ArrayFeatureType.ArrayDataType
+
+
+def _io_dtypes(mlmodel):
+    """``([(input name, dtype)], [(output name, dtype)])`` as Core ML declares them."""
+    desc = mlmodel.get_spec().description
+    return (
+        [(i.name, i.type.multiArrayType.dataType) for i in desc.input],
+        [(o.name, o.type.multiArrayType.dataType) for o in desc.output],
+    )
+
+
+def _mixed_dtype_model() -> onnx.ModelProto:
+    """One float input/output and one int32 input/output -- only the float pair
+    can move to fp16 (Core ML has no fp16 form for an integer array)."""
+    model = _model(
+        """
+        mixed (float[1,4] x, int32[1,4] idx) => (float[1,4] y, int32[1,4] z)
+        {
+            y = Relu (x)
+            z = Add (idx, idx)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_io_dtype_defaults_to_fp32():
+    inputs, outputs = _io_dtypes(onnxsim.export_coreml(_mixed_dtype_model()))
+    assert inputs == [("x", _ARRAY_DTYPE.FLOAT32), ("idx", _ARRAY_DTYPE.INT32)]
+    assert outputs == [("y", _ARRAY_DTYPE.FLOAT32), ("z", _ARRAY_DTYPE.INT32)]
+
+
+def test_io_dtype_fp32_is_the_default_spelled_out():
+    explicit = _io_dtypes(onnxsim.export_coreml(_mixed_dtype_model(), io_dtype="fp32"))
+    assert explicit == _io_dtypes(onnxsim.export_coreml(_mixed_dtype_model()))
+
+
+def test_io_dtype_fp16_declares_float16_interface():
+    inputs, outputs = _io_dtypes(
+        onnxsim.export_coreml(_mixed_dtype_model(), io_dtype="fp16")
+    )
+    # Only the float pair moves; the int32 pair is untouched.
+    assert inputs == [("x", _ARRAY_DTYPE.FLOAT16), ("idx", _ARRAY_DTYPE.INT32)]
+    assert outputs == [("y", _ARRAY_DTYPE.FLOAT16), ("z", _ARRAY_DTYPE.INT32)]
+
+
+def test_io_dtype_fp16_removes_the_boundary_casts():
+    # The point of the flag. An ML Program runs in fp16 by default, so with an
+    # fp32 interface coremltools' own compute-precision pass wraps the program
+    # in a cast pair: fp32 input -> fp16 on the way in, fp16 -> fp32 output on
+    # the way out. That is the per-call conversion (and the doubled bytes over
+    # the boundary) `io_dtype="fp16"` exists to delete.
+    model = _model(
+        "boundary (float[2,4] x) => (float[2,4] y) { t = Relu (x)  y = Sqrt (t) }"
+    )
+    onnx.checker.check_model(model)
+
+    def real_ops(mlmodel):
+        # `const` op instances just carry other ops' scalar arguments (here, each
+        # cast's target dtype string) -- not part of the computation.
+        return [t for t, _ in _spec_ops(mlmodel) if t != "const"]
+
+    assert real_ops(onnxsim.export_coreml(model)) == ["cast", "relu", "sqrt", "cast"]
+    # Same computation, no boundary conversions left around it.
+    assert real_ops(onnxsim.export_coreml(model, io_dtype="fp16")) == ["relu", "sqrt"]
+
+
+def test_io_dtype_fp16_leaves_an_already_fp16_graph_alone():
+    # An ONNX graph that is *itself* fp16 already gets an fp16 interface with no
+    # flag at all, and asking for one must not add a redundant cast to itself.
+    model = _model("f16 (float16[2,4] x) => (float16[2,4] y) { y = Relu (x) }")
+    onnx.checker.check_model(model)
+    inputs, outputs = _io_dtypes(onnxsim.export_coreml(model, io_dtype="fp16"))
+    assert inputs == [("x", _ARRAY_DTYPE.FLOAT16)]
+    assert outputs == [("y", _ARRAY_DTYPE.FLOAT16)]
+
+    func, _ = _build_ops(model, io_dtype="fp16")
+    assert [op.op_type for op in func.operations] == ["relu", "identity"]
+
+
+def test_io_dtype_fp16_casts_back_before_lowering_any_node():
+    # The graph body must be lowered against the dtype the *ONNX* graph declares,
+    # not fp16: the flag moves the model boundary, it does not retype the graph.
+    # So an fp32 graph gets one cast straight back to fp32 at each fp16 input,
+    # and one down to fp16 at each float output, with the body untouched between.
+    model = _model("body (float[2,4] x) => (float[2,4] y) { y = Relu (x) }")
+    onnx.checker.check_model(model)
+
+    def op_types(func):
+        # As in test_io_dtype_fp16_removes_the_boundary_casts: a `const` here is
+        # each cast's own dtype argument, not part of the computation.
+        return [op.op_type for op in func.operations if op.op_type != "const"]
+
+    default_func, _ = _build_ops(model)
+    assert op_types(default_func) == ["relu", "identity"]
+
+    fp16_func, _ = _build_ops(model, io_dtype="fp16")
+    assert op_types(fp16_func) == ["cast", "relu", "cast"]
+    (relu,) = [op for op in fp16_func.operations if op.op_type == "relu"]
+    assert types.builtin_to_string(relu.outputs[0].dtype) == "fp32"
+
+
+def test_io_dtype_fp16_defaults_the_deployment_target_to_ios16():
+    # A float16 MLMultiArray interface only exists from iOS16/macOS13 on, so the
+    # flag raises an unset target rather than emitting a model Core ML rejects.
+    mlmodel = onnxsim.export_coreml(_relu_model(), io_dtype="fp16")
+    assert mlmodel.get_spec().specificationVersion == int(ct.target.iOS16)
+
+    # An explicitly higher target is kept as-is.
+    higher = onnxsim.export_coreml(
+        _relu_model(), io_dtype="fp16", minimum_deployment_target="iOS17"
+    )
+    assert higher.get_spec().specificationVersion == int(ct.target.iOS17)
+
+
+def test_io_dtype_fp16_composes_with_dynamic_shapes():
+    # The KV-cache shape this flag is actually aimed at: an input that both
+    # varies in one dimension and carries most of the bytes crossing the
+    # boundary on every decode step.
+    model = _model(
+        "kv (float[1,2,past,4] past_key_values_0_key) => "
+        "(float[1,2,past,4] present_0_key) "
+        "{ present_0_key = Relu (past_key_values_0_key) }"
+    )
+    mlmodel = onnxsim.export_coreml(
+        model, io_dtype="fp16", dynamic_shapes={"past": (0, 1, 16)}
+    )
+    (in_desc,) = mlmodel.get_spec().description.input
+    assert in_desc.type.multiArrayType.dataType == _ARRAY_DTYPE.FLOAT16
+    size_range = in_desc.type.multiArrayType.shapeRange.sizeRanges[2]
+    assert (size_range.lowerBound, size_range.upperBound) == (0, 16)
+    (out_desc,) = mlmodel.get_spec().description.output
+    assert out_desc.type.multiArrayType.dataType == _ARRAY_DTYPE.FLOAT16
+
+
+def test_io_dtype_fp16_below_ios16_raises():
+    with pytest.raises(RuntimeError, match="iOS16/macOS13 or newer"):
+        onnxsim.export_coreml(
+            _relu_model(), io_dtype="fp16", minimum_deployment_target="iOS15"
+        )
+
+
+def test_io_dtype_fp16_on_neuralnetwork_raises():
+    with pytest.raises(RuntimeError, match="requires convert_to='mlprogram'"):
+        onnxsim.export_coreml(
+            _relu_model(), io_dtype="fp16", convert_to="neuralnetwork"
+        )
+
+
+def test_io_dtype_unknown_value_raises():
+    with pytest.raises(RuntimeError, match="Unknown io_dtype"):
+        onnxsim.export_coreml(_relu_model(), io_dtype="bf16")
 
 
 # ---------------------------------------------------------------------------

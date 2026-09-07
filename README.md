@@ -423,8 +423,21 @@ onnxsim.export_coreml(model_simp, "model.mlpackage")
 `export_coreml` accepts a few keyword arguments: `convert_to` (`"mlprogram"`,
 the default, or the legacy `"neuralnetwork"`), `compute_units` (which devices
 the model may run on, e.g. `"CPU_ONLY"`), `compute_precision`,
-`minimum_deployment_target` (e.g. `"iOS16"`), and `skip_model_load` (see
-above). See `onnxsim/coreml_export.py` for the full signature.
+`minimum_deployment_target` (e.g. `"iOS16"`), `io_dtype` (see below), and
+`skip_model_load` (see above). See `onnxsim/coreml_export.py` for the full
+signature.
+
+`io_dtype="fp16"` (CLI: `--coreml-io-dtype fp16`) declares the model's float
+inputs and outputs float16 instead of float32. An ML Program already computes
+in float16, so the float32 default only buys a conversion in each direction on
+every call, over twice the bytes — with no accuracy difference, since a float32
+output is just an upcast of the float16 value Core ML computed either way. It's
+worth most where the same large float tensors cross the boundary repeatedly, as
+a transformer decoder's KV cache does on every generated token. Requires
+`convert_to="mlprogram"` and raises the deployment target to iOS16/macOS13 when
+one isn't given. See
+[`scripts/apple/README.md`](scripts/apple/README.md)'s "fp16 model interface"
+section.
 
 ## Exporting to TensorFlow Lite
 
