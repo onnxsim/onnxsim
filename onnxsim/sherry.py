@@ -66,6 +66,20 @@ plus one sign bit exactly saturate a 5-bit index -- 5 bits per 4 weights =
   is the same size as the float32 model it came from, and its value is
   simulating the format's numerics (and feeding downstream tooling), not
   compressing the file.
+- **A weight that is exactly zero and is not the pruned one stays zero
+  here, where the real packed format could not.** Ternarizing takes
+  ``sign(w)``, and ``sign(0) == 0``, so a 4-block holding two exact zeros
+  comes out with two zeros rather than the format's exactly-one. The
+  packed layout has no encoding for "kept but zero" -- every kept slot
+  carries a sign bit and dequantizes to ``+-alpha`` -- so a real encoder
+  would have to pick a sign there and land a full ``alpha`` away from
+  this module's output. Leaving it at zero is the lower-error choice and
+  keeps this module from inventing a tie-break the paper does not state,
+  but it is a genuine divergence from the format rather than a rounding
+  detail. It cannot arise from ordinary trained weights, which contain no
+  exact zeros; it can arise from an *already-sparsified* model, e.g. one
+  that has been through :func:`onnxsim.apply_magnitude_pruning` first, so
+  the composition is worth knowing about.
 
 **``alpha`` granularity and layout.** The paper's scale is per-channel, and
 "channel" here means the same thing every other weight-only quantizer in

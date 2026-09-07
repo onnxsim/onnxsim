@@ -468,3 +468,31 @@ def test_apply_sherry_quantization_accepts_a_gemm_with_bias():
     np.testing.assert_allclose(new_w, _sherry_rows(w_nk.astype(np.float64)), rtol=1e-6)
     # The bias is untouched.
     assert next(t for t in q.graph.initializer if t.name == "B") is not None
+
+
+def test_sherry_keeps_an_exact_zero_weight_at_zero():
+    # sign(0) == 0, so a 4-block holding two exact zeros comes out with two
+    # zeros rather than the format's exactly-one non-pruned-zero. The real
+    # 5-bit layout has no "kept but zero" encoding (every kept slot carries a
+    # sign bit and dequantizes to +-alpha), so this is a documented
+    # divergence from the format, not a rounding artifact -- see this
+    # module's own docstring. Pinned here so it stays a deliberate choice.
+    #
+    # An ordinary trained weight has no exact zeros; an already-sparsified
+    # one (e.g. via onnxsim.apply_magnitude_pruning) does, which is why this
+    # case is worth pinning rather than dismissing.
+    rows = np.array([[0.0, 0.0, 3.0, 1.0]])
+    out = _sherry_rows(rows)
+    assert np.all(np.isfinite(out))
+    assert int(np.count_nonzero(out == 0.0)) == 2
+    # alpha averages |w| over the kept elements only: |0|, |3|, |1| -> 4/3.
+    assert out[0, 2] == pytest.approx(4.0 / 3.0)
+    assert out[0, 3] == pytest.approx(4.0 / 3.0)
+
+
+def test_sherry_all_zero_weight_stays_zero_without_nan():
+    # kept_count is floored at 1 so an all-zero channel cannot divide by
+    # zero; alpha is 0 and the round trip is the zero tensor.
+    out = onnxsim.quantize_dequantize_sherry(np.zeros(8, dtype=np.float32))
+    assert np.all(np.isfinite(out))
+    assert not np.any(out)
