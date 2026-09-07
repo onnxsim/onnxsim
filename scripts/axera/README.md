@@ -3654,6 +3654,67 @@ Tests: `test_conv_weights_are_int8_split_across_two_nibble_planes` (Docker)
 and `test_conv_weights_can_be_rewritten_without_pulsar2` (Docker and device)
 in `tests/test_axera_mcode_structure.py`.
 
+### A second packing, and how far generation reaches on resnet18d
+
+The weight layout above was found on 1-D convolutions. A real CNN is built
+from 2-D ones, so the obvious question is whether the same formula reads
+resnet18d. It does not, and the reason is worth recording: **the packing is a
+property of the convolution's shape, not of the format.**
+
+**2-D convolutions bit-slice differently.** The same INT8 codes are stored as
+*four* 2-bit planes 36 bytes apart rather than two 4-bit ones, four input
+channels share a byte instead of two, and the kernel is laid out in reverse:
+
+    offset(o, i, kh, kw) = 144*o + 4*(K - 1 - (kw + K_w*kh)) + i//4
+    bits  = 2 bits at 2*(i % 4), across planes 3, 2, 1, 0 most significant first
+
+Confirmed at `cin = cout = 8, 3x3`, where it reconstructs a compiled table at
+0.99998 and predicts `(7,7,2,2)` at byte 1009 exactly. **Confirmed on the
+device too**: rewriting a 2-D convolution's weights by hand gives 0.99982
+against the new weights' CPU reference versus 0.99988 for pulsar2's own
+build, with both cross-controls at zero.
+
+**At 32 channels the 2-D case adds two more levels.** Input channels group 16
+at a time (`+144` per group), and the output channel is addressed through a
+*bit-interleave* rather than a stride:
+
+    base(o) = 576*(o % 8) + 72*((o // 8) % 2) + 4608*(o // 16)
+
+which is exact for every measured channel -- `o = 8` lands at 72, `o = 16` at
+4608, `o = 31` at 8712 -- and predicts the compiled table's total size. The
+plane pairs also separate by `+288` rather than staying 36 apart, and that
+placement rule is not yet pinned down.
+
+**Where that leaves resnet18d.** Its 22 convolutions are 2-D with 3 to 512
+channels, so every one of them sits past the shapes confirmed above. A search
+over plausible strides for its *first* convolution reaches only 0.43
+correlation, so we cannot currently locate, read or generate resnet18d's
+weights. The block-size arithmetic does line up -- summing the predicted
+per-layer blocks gives 11,208,960 bytes against an actual `npu_params` of
+11,855,108, within 5.8% -- which says the tiling family is right and the
+addressing constants for large channel counts are what is missing.
+
+The honest budget for resnet18d today:
+
+| part | size | status |
+| --- | --- | --- |
+| weight table | 11,855,108 B (242x the mcode) | layout not yet decoded at these shapes |
+| mcode stream | 48,320 B | 98.92% explained, round-trips byte-exactly |
+| framing bytes | 28,552 B (59.1% of stream) | emitted from the grammar |
+| value bytes | 19,235 B (39.8%) | 3.81% have a confirmed meaning |
+| header + tail | 760 B | rules known |
+
+So on resnet18d specifically: we can decode and reproduce its instruction
+stream exactly, we understand under 4% of its operand values, and its weight
+table -- 242 times the size of everything else -- is not yet addressable. The
+method that cracked the smaller shapes is unchanged and keeps working; what
+it needs is the same single-weight sweep run at 64, 128, 256 and 512
+channels.
+
+Tests: `test_conv2d_weights_are_int8_split_across_four_bit_planes` (Docker)
+and `test_conv2d_weights_can_be_rewritten_without_pulsar2` (Docker and
+device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
