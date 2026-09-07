@@ -1094,3 +1094,322 @@ def test_the_walk_leaves_a_model_with_no_discoverable_block_untouched():
     )
     assert results == []
     assert tuned.SerializeToString() == model.SerializeToString()
+
+
+# --- Minibatching ------------------------------------------------------------
+#
+# ``batch_size`` makes each optimizer step train on a subset of the calibration
+# rows instead of all of them. The set itself does not move: it stays one
+# constant, uploaded once and resident on the execution provider's device, and
+# the step graph ``Gather``s its own rows out of it by an index fed per step
+# (``onnxsim.qat_graph``'s module docstring argues that choice against the
+# alternative). Four things are worth testing, and all four are below: that the
+# full-batch default did not change, that minibatching earns its place at equal
+# *epochs*, that the batch schedule is reproducible and really does shuffle,
+# and that the extra machinery stays inside the operator allowlist.
+
+
+def _capture_step_graph(monkeypatch):
+    """Spy on the step graph and the per-step feeds ``apply_qat`` builds.
+
+    Returns a dict that fills in when ``run_step_graph`` is called, so a test
+    can look at the graph that was actually emitted and at the row indices the
+    loop was actually driven with -- neither of which is visible in the
+    returned model.
+    """
+    captured: dict = {}
+    real = qat_graph.run_step_graph
+
+    def spy(step, **kwargs):
+        captured["step"] = step
+        captured["feeds"] = kwargs.get("feeds")
+        return real(step, **kwargs)
+
+    monkeypatch.setattr(qat.qat_graph, "run_step_graph", spy)
+    return captured
+
+
+def test_the_full_batch_default_is_the_graph_it_always_was(monkeypatch):
+    """Minibatching must be invisible unless it is asked for, and "invisible"
+    here means structurally as well as numerically.
+
+    Structurally: with ``batch_size`` unset the builder never takes the
+    minibatching branch, so the emitted graph has no ``Gather``, no per-step
+    index input, and its constants are still the block's own tensor names --
+    it is the same graph, node for node, that this module emitted before
+    minibatching existed.
+
+    Numerically: the scenario pinned here is the one this module's docstring
+    and ``docs/qat.md`` recorded *before* minibatching was written -- seed 0,
+    rank-2 calibration, the default 1000 steps, block error 16.0 at
+    round-to-nearest falling to 6.5. Asserting against that published figure
+    is what makes this a parity check against the past rather than against
+    itself; the tolerance is the precision the figure was quoted to.
+    """
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+    w1 = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "W1")
+    )
+    w2 = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "W2")
+    )
+
+    captured = _capture_step_graph(monkeypatch)
+    tuned = onnxsim.apply_qat(model, quant, "X", "Yout", calibration_data=[{"X": x}])
+
+    step = captured["step"]
+    assert captured["feeds"] is None
+    assert not [n for n in step.model.graph.node if n.op_type == "Gather"]
+    assert all(
+        i.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+        for i in step.model.graph.input
+    )
+    # The block's own input arrives as an input named by the model, not as a
+    # row of some private table.
+    assert "X" in {i.name for i in step.model.graph.input}
+
+    assert _relu_block_error(quant, x, w1, w2) == pytest.approx(16.0, abs=0.05)
+    assert _relu_block_error(tuned, x, w1, w2) == pytest.approx(6.47, abs=0.05)
+
+
+def test_a_batch_as_large_as_the_calibration_set_is_the_full_batch_path():
+    """A batch that covers every row *is* the full-batch objective, so it takes
+    the full-batch path and comes back byte-identical -- rather than wrapping
+    the index stream around and quietly training on some rows twice per step.
+    Same for a batch larger than the set, which is the shape of a caller who
+    picked a batch size for a dataset bigger than the one they passed."""
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2, num_samples=32)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    def tune(**kwargs):
+        return onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Yout",
+            calibration_data=[{"X": x}],
+            num_iterations=50,
+            **kwargs,
+        ).SerializeToString()
+
+    reference = tune()
+    assert tune(batch_size=32) == reference
+    assert tune(batch_size=1000) == reference
+    # ...and a real minibatch is a different computation, so the equality above
+    # is not passing because ``batch_size`` is ignored outright.
+    assert tune(batch_size=8) != reference
+
+
+def test_minibatching_beats_full_batch_at_equal_epochs():
+    """The measurement that says whether minibatching is worth having, run at
+    equal *epochs* -- equal passes over the data, so both sides see exactly the
+    same rows the same number of times and only the update granularity differs.
+
+    ``num_iterations`` counts optimizer steps, so equal epochs means the
+    minibatched run gets ``rows / batch_size`` times as many of them: 50 steps
+    full-batch against 400 steps of 8 rows out of 64.
+
+    **Measured, and this is the whole finding.** Block reconstruction error
+    after 50 epochs on ``_relu_block_model``: round-to-nearest 16.0,
+    full-batch 11.4, minibatched (batch 8) 6.3 -- 45% below full batch for the
+    same data budget, because 400 Adam steps get further than 50 do. The
+    direction held on all six model seeds tried, by 44-52%.
+
+    **And the honest boundary.** The advantage is a *convergence-rate* one, so
+    it shrinks to nothing once the budget is large enough for full batch to
+    converge too: at 400 epochs the same comparison reads 6.68 full-batch
+    against 6.14 minibatched, and at 1000 epochs 6.47 against 7.05 -- a wash,
+    and in that last case slightly worse. So minibatching here buys reaching a
+    given error in fewer passes over the data (and a step whose cost does not
+    scale with the set), not a better optimum. At this scale it is not a
+    memory feature either: the set is still one resident tensor.
+    """
+    rows, epochs, batch = 64, 50, 8
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2, num_samples=rows)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+    w1 = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "W1")
+    )
+    w2 = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "W2")
+    )
+
+    def error(**kwargs):
+        tuned = onnxsim.apply_qat(
+            model, quant, "X", "Yout", calibration_data=[{"X": x}], **kwargs
+        )
+        return _relu_block_error(tuned, x, w1, w2)
+
+    rtn = _relu_block_error(quant, x, w1, w2)
+    full = error(num_iterations=epochs)
+    mini = error(num_iterations=epochs * rows // batch, batch_size=batch)
+
+    assert full < rtn
+    assert mini < full
+    # The margin observed is ~45%; the assertion is deliberately looser so it
+    # tracks the mechanism rather than the seed.
+    assert mini < 0.8 * full
+
+
+def test_the_batch_schedule_is_reproducible_and_shuffling_changes_it(monkeypatch):
+    """Shuffling and determinism, checked on the indices the loop was actually
+    driven with rather than inferred from the trained model.
+
+    Both matter and they are in tension: a run has to be reproducible from its
+    seed, and consecutive epochs have to see different batch *compositions* --
+    without the reshuffle, the batches would be one fixed partition of the rows
+    replayed forever, and every step's gradient would be one of only
+    ``rows / batch_size`` distinct estimates.
+    """
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2, num_samples=32)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    def schedule(**kwargs):
+        captured = _capture_step_graph(monkeypatch)
+        onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Yout",
+            calibration_data=[{"X": x}],
+            num_iterations=8,
+            batch_size=8,
+            **kwargs,
+        )
+        feeds = captured["feeds"]
+        name = qat._Minibatch.index_name
+        return [feeds(t)[name] for t in range(8)]
+
+    first = schedule(batch_seed=0)
+    again = schedule(batch_seed=0)
+    other = schedule(batch_seed=1)
+    ordered = schedule(shuffle=False)
+
+    assert all(len(batch) == 8 for batch in first)
+    for expected, actual in zip(first, again):
+        np.testing.assert_array_equal(expected, actual)
+    assert any(not np.array_equal(a, b) for a, b in zip(first, other))
+
+    # Composition, not just order: with 32 rows and a batch of 8, four steps
+    # are one epoch, so step 4 opens a fresh permutation -- and its rows are a
+    # different *set* from step 0's, which is exactly what the unshuffled
+    # schedule below does not do.
+    assert set(first[0].tolist()) != set(first[4].tolist())
+    np.testing.assert_array_equal(ordered[0], np.arange(8))
+    np.testing.assert_array_equal(ordered[0], ordered[4])
+
+
+def test_a_batch_size_that_does_not_divide_the_row_count_trains(monkeypatch):
+    """The ragged-tail decision, end to end.
+
+    A step graph's shapes are static, so a short final batch is not
+    expressible; the schedule wraps into the next epoch's permutation instead,
+    keeping every batch exactly ``batch_size`` rows and every row's visit count
+    equal (``onnxsim.qat_graph.minibatch_indices`` documents the alternatives
+    and why they are worse). 50 rows with a batch of 12 puts an epoch boundary
+    inside a batch four times over 24 steps, and the block still trains.
+    """
+    rows, batch = 50, 12
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2, num_samples=rows)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    captured = _capture_step_graph(monkeypatch)
+    losses: list = []
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        num_iterations=200,
+        batch_size=batch,
+        losses=losses,
+    )
+    onnx.checker.check_model(tuned)
+
+    feeds = captured["feeds"]
+    name = qat._Minibatch.index_name
+    fed = [feeds(t)[name] for t in range(24)]
+    assert all(len(indices) == batch for indices in fed)
+    assert all(0 <= int(i) < rows for indices in fed for i in indices)
+    # Two full epochs' worth of positions cover the set exactly twice, seam or
+    # no seam.
+    stream = np.concatenate(fed)[: 2 * rows]
+    counts = np.bincount(stream, minlength=rows)
+    assert counts.tolist() == [2] * rows
+
+    # A batch loss is noisy, so head against tail rather than first against
+    # last.
+    assert np.mean(losses[-20:]) < 0.5 * np.mean(losses[:20])
+
+
+def test_the_minibatched_step_graph_stays_inside_the_allowlist(monkeypatch):
+    """The same standard the full-batch graph is held to, applied to the one
+    operator minibatching added. ``Gather`` is in
+    :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` deliberately -- WebNN specifies
+    ``gather`` and ORT-web's WebGPU backend implements it, which is the bar
+    that list exists to enforce -- so a minibatched loop is as portable as a
+    full-batch one."""
+    model = _relu_block_model(seed=0)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    captured = _capture_step_graph(monkeypatch)
+    onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": _correlated_calibration(rank=2, num_samples=16)}],
+        num_iterations=1,
+        batch_size=4,
+        learn_scales=True,
+    )
+
+    block_ops = {n.op_type for n in model.graph.node}
+    emitted = {n.op_type for n in captured["step"].model.graph.node} - block_ops
+    assert "Gather" in emitted
+    assert emitted <= set(qat_graph.EP_FRIENDLY_OPS), sorted(
+        emitted - set(qat_graph.EP_FRIENDLY_OPS)
+    )
+
+
+def test_minibatching_refuses_captured_tensors_that_disagree_about_rows():
+    """One index vector slices every captured tensor, so they have to agree
+    about what a row is. A block whose sideways input has no batch axis is
+    refused for minibatching -- with the full-batch path, which needs no such
+    agreement, named in the message -- rather than sliced into nonsense."""
+    rows = {"X": np.zeros((16, D), np.float32), "M": np.zeros((4, D), np.float32)}
+    with pytest.raises(ValueError, match="row count"):
+        qat._plan_minibatch(rows, np.zeros((16, D), np.float32), 4)
+
+    with pytest.raises(ValueError, match="batch_size"):
+        qat._plan_minibatch(
+            {"X": np.zeros((16, D), np.float32)}, np.zeros((16, D), np.float32), 0
+        )
+
+
+def test_the_whole_model_walk_minibatches_every_block():
+    """``apply_qat_all_blocks`` plumbs the batch through to each block's own
+    loop. The blocks share a schedule -- same seed, same step numbering -- and
+    that is coherent because every block's activations were captured from the
+    same calibration inputs in the same order, so "row 7" means the same input
+    row in all of them."""
+    model = _chain_model(seed=1, depth=4)
+    quant = _quantize_chain_int4(model, {"W1", "W2", "W3", "W4"})
+    x = _correlated_calibration(rank=2, num_samples=64)
+
+    tuned, results = onnxsim.apply_qat_all_blocks(
+        model, quant, calibration_data=[{"X": x}], num_iterations=400, batch_size=16
+    )
+    onnx.checker.check_model(tuned)
+
+    assert all(r.trained and r.skipped_reason is None for r in results)
+    rtn_error = _whole_model_error(quant, model, x)
+    tuned_error = _whole_model_error(tuned, model, x)
+    assert tuned_error < 0.75 * rtn_error

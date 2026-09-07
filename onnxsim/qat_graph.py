@@ -47,6 +47,32 @@ go up and the loss comes down. On CPU that saves a memcpy or two; on a
 provider whose bus is PCIe it is the difference between a loop that is
 arithmetic and a loop that is transfers.
 
+**Minibatching, and where the batch lives.** A step graph's shapes are
+static, so "the batch" is a fixed-size tensor either way; the question a
+minibatched loop has to answer is where the *rest* of the data sits between
+steps. Two answers, and this module implements the first:
+
+- **The whole set stays resident and the graph selects rows.** The
+  calibration set is one constant, uploaded once by ``bind_loop`` exactly as
+  before, and each step feeds a rank-1 int64 index vector that a ``Gather``
+  turns into that step's rows (:meth:`GraphBuilder.gather_rows`,
+  :func:`minibatch_indices`). Per-step traffic stays at "a few scalars up, a
+  loss down" -- ``batch_size`` int64s is not a transfer -- so the residency
+  argument above survives a batch that changes every step. What it costs:
+  one operator in :data:`EP_FRIENDLY_OPS` that is not arithmetic (see the
+  note there for why ``Gather`` clears that bar where ``Round`` does not),
+  a few nodes of graph, and the fact that the *set* must still fit in one
+  static tensor on the device. Minibatching this way buys per-step compute
+  and stochastic-gradient behaviour, not a larger-than-memory dataset.
+- **The batch's rows are fed per step.** No new operator, no resident set,
+  and no limit at all on how much data a run may stream -- but
+  ``batch_size x width`` floats cross the bus every step, which is the exact
+  cost :meth:`onnxsim.backend.Runner.bind_loop` was written to remove. The
+  seam is open (``run_step_graph``'s ``feeds``, which is what carries the
+  index vector in the chosen design), and its docstring records when this
+  second answer would be the right one; a calibration set is small and a
+  PCIe round trip per step is not, so it is not the default.
+
 **What it does not buy, and the honest limits.**
 
 - *Residency is the Python half only.* ``IOBinding`` covers onnxruntime in
@@ -98,6 +124,22 @@ _IR_VERSION = 8
 # Adding to this set is a real decision: check the operator actually has
 # coverage on the WebGPU and WebNN backends first, not just on ORT's CPU
 # kernels.
+#
+# ``Gather`` is the one addition made for a reason other than arithmetic, and
+# it earns its place on exactly that criterion rather than on convenience.
+# It is what lets a step graph read a *minibatch* out of a resident
+# calibration set (:meth:`GraphBuilder.gather_rows`, and see
+# :func:`minibatch_indices` for the loop around it): the whole set is uploaded
+# once as a constant and the step selects rows from it by an index vector, so
+# nothing large crosses the bus per step. The coverage is real on both
+# backends this list exists for -- WebNN specifies ``gather`` (unlike
+# ``round``, which it has no operator for at all, the case that shaped the
+# rest of this list), and onnxruntime-web's WebGPU EP implements ``Gather``;
+# it is also among the first ops every NPU EP in ``scripts/`` supports, since
+# embedding lookup is inference, not training. The alternative that needed no
+# new operator -- feeding the batch's rows themselves as a per-step input --
+# is rejected in :func:`run_step_graph`'s own docstring, where the trade-off
+# it loses is spelled out.
 EP_FRIENDLY_OPS = frozenset(
     {
         "Abs",
@@ -106,6 +148,7 @@ EP_FRIENDLY_OPS = frozenset(
         "Clip",
         "Div",
         "Exp",
+        "Gather",
         "Greater",
         "Less",
         "MatMul",
@@ -231,6 +274,32 @@ class GraphBuilder:
         sq = self.mul(a, a)
         return self.op("ReduceMean", [sq], keepdims=0)
 
+    def gather_rows(self, table: str, index: str, out: Optional[str] = None) -> str:
+        """Rows ``index`` of ``table``, i.e. ``table[index]`` along axis 0.
+
+        The minibatching primitive. ``table`` is the whole calibration set,
+        bound once as a step-graph constant and therefore resident on the
+        execution provider's device for the life of the loop; ``index`` is a
+        rank-1 int64 per-step input naming this step's rows. So what crosses
+        the bus per step is ``batch_size`` 8-byte integers instead of
+        ``batch_size x width`` floats, and the set is uploaded once rather
+        than once per step -- the property :meth:`onnxsim.backend.Runner.bind_loop`
+        exists to provide, preserved in the presence of a batch that changes
+        every step.
+
+        ``out`` names the output explicitly, for the caller who needs the
+        gathered rows to carry a name some *other* nodes already read (in
+        :mod:`onnxsim.qat`, the block's own input tensor: the block's nodes go
+        into the graph verbatim, so the batch has to arrive under the name
+        they were written against).
+        """
+        if out is None:
+            return self.op("Gather", [table, index], "rows", axis=0)
+        self.nodes.append(
+            onnx.helper.make_node("Gather", [table, index], [out], axis=0)
+        )
+        return out
+
 
 def adam_update(
     b: GraphBuilder,
@@ -292,6 +361,7 @@ def make_step_graph(
     scalars: Sequence[str] = (),
     loss: Optional[str] = None,
     name: str = "onnxsim_step",
+    per_step: Optional[Dict[str, Tuple[Sequence[int], int]]] = None,
 ) -> StepGraph:
     """Wraps ``b``'s accumulated nodes into a :class:`StepGraph`.
 
@@ -304,6 +374,14 @@ def make_step_graph(
     :param scalars: names of scalar (rank-0) per-step inputs, e.g. a learning
             rate or an annealed regularization weight
     :param loss: an optional scalar output name to expose as the loss
+    :param per_step: ``{input name: (shape, onnx element type)}`` for per-step
+            inputs that are neither float32 nor rank-0 -- in practice the
+            int64 row index a minibatched loop feeds
+            :meth:`GraphBuilder.gather_rows`. Kept separate from ``scalars``
+            rather than generalizing it because the two are fed differently
+            (``run_step_graph`` casts scalars to float32 and passes these
+            through with the dtype the caller built them with) and because a
+            scalar's shape and type never need saying.
     """
     inputs = [
         onnx.helper.make_tensor_value_info(n, onnx.TensorProto.FLOAT, list(shape))
@@ -316,6 +394,10 @@ def make_step_graph(
     inputs += [
         onnx.helper.make_tensor_value_info(n, onnx.TensorProto.FLOAT, [])
         for n in scalars
+    ]
+    inputs += [
+        onnx.helper.make_tensor_value_info(n, elem_type, list(shape))
+        for n, (shape, elem_type) in (per_step or {}).items()
     ]
     outputs = [
         onnx.helper.make_tensor_value_info(out, onnx.TensorProto.FLOAT, list(shape))
@@ -343,7 +425,7 @@ def _run_bound_loop(
     bound: backend.BoundStepLoop,
     step: StepGraph,
     num_steps: int,
-    scalar_feeds: Callable[[int], Dict[str, np.ndarray]],
+    step_feeds: Callable[[int], Dict[str, np.ndarray]],
     losses: Optional[List[float]],
 ) -> Optional[Dict[str, np.ndarray]]:
     """Drive ``bound`` for ``num_steps``, or return ``None`` if onnxruntime
@@ -366,7 +448,7 @@ def _run_bound_loop(
     collected: List[float] = []
     want_loss = losses is not None and step.loss_name is not None
     for t in range(num_steps):
-        feeds = scalar_feeds(t)
+        feeds = step_feeds(t)
         try:
             out = bound.step(feeds)
         except Exception:
@@ -387,6 +469,7 @@ def run_step_graph(
     providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
     bind_state: bool = True,
+    feeds: Optional[Callable[[int], Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, np.ndarray]:
     """Runs ``step`` ``num_steps`` times, threading its state through, and
     returns the final state.
@@ -425,6 +508,35 @@ def run_step_graph(
             the extra device buffer per state tensor (binding double-buffers
             the state, see :class:`onnxsim.backend.BoundStepLoop`) is not
             affordable.
+    :param feeds: called with the step index, returning that step's *tensor*
+            inputs -- the ones declared through ``make_step_graph``'s
+            ``per_step``, whose dtype is preserved rather than cast to
+            float32. This is the seam a per-step minibatch goes through, and
+            which of the two shapes of minibatching a caller gets depends
+            entirely on what it puts here:
+
+            - **An index vector into a resident set** (what
+              :func:`onnxsim.apply_qat` does, via
+              :meth:`GraphBuilder.gather_rows` and
+              :func:`minibatch_indices`). The whole calibration set stays in
+              ``constants``, uploaded once and never re-sent; the step graph
+              selects its own rows. Per-step traffic is ``batch_size``
+              int64s, which is nothing, and the residency this module is
+              built around survives a batch that changes every step. The
+              price is that the *set* still has to fit in one static tensor
+              on the device: minibatching this way buys per-step compute
+              (a step's FLOPs scale with the batch, not with the set) and
+              stochastic-gradient behaviour, not a larger-than-memory set.
+            - **The batch's rows themselves.** Then ``constants`` holds
+              nothing large, the set can live in host memory or be streamed
+              from disk, and the cap on how much data a run may use goes
+              away entirely -- at the cost of copying ``batch_size x width``
+              floats to the device on every single step, which is precisely
+              the transfer :meth:`onnxsim.backend.Runner.bind_loop` exists to
+              remove, and which on a PCIe bus turns the loop back into
+              transfers. Nothing here forbids it; it is simply not what
+              :mod:`onnxsim.qat` chose, because a calibration set is small
+              and a PCIe round trip per step is not.
     """
     fetch = list(step.state.values())
     if losses is not None and step.loss_name is not None:
@@ -434,10 +546,19 @@ def run_step_graph(
     fixed = {k: np.asarray(v, dtype=np.float32) for k, v in constants.items()}
     initial = {k: np.asarray(v, dtype=np.float32) for k, v in state.items()}
 
-    def scalar_feeds(t: int) -> Dict[str, np.ndarray]:
-        if scalars is None:
-            return {}
-        return {k: np.asarray(v, dtype=np.float32) for k, v in scalars(t).items()}
+    def step_feeds(t: int) -> Dict[str, np.ndarray]:
+        values: Dict[str, np.ndarray] = {}
+        if scalars is not None:
+            values.update(
+                {k: np.asarray(v, dtype=np.float32) for k, v in scalars(t).items()}
+            )
+        if feeds is not None:
+            # Passed through with the dtype the caller chose: an index vector
+            # is int64, and casting it to float32 the way the scalars above
+            # are cast would make it the wrong type for the graph input it
+            # feeds.
+            values.update({k: np.asarray(v) for k, v in feeds(t).items()})
+        return values
 
     # A caller who left out one of the graph's state inputs gets the unbound
     # path's error about a missing feed, not a KeyError from the setup below.
@@ -446,16 +567,16 @@ def run_step_graph(
             fixed, {name: (out, initial[name]) for name, out in step.state.items()}
         )
         if bound is not None:
-            final = _run_bound_loop(bound, step, num_steps, scalar_feeds, losses)
+            final = _run_bound_loop(bound, step, num_steps, step_feeds, losses)
             if final is not None:
                 return final
 
     current = dict(initial)
     for t in range(num_steps):
-        feeds = dict(fixed)
-        feeds.update(current)
-        feeds.update(scalar_feeds(t))
-        out = runner(feeds)
+        inputs = dict(fixed)
+        inputs.update(current)
+        inputs.update(step_feeds(t))
+        out = runner(inputs)
         current = {name: out[output] for name, output in step.state.items()}
         if losses is not None and step.loss_name is not None:
             losses.append(float(out[step.loss_name]))
@@ -470,3 +591,103 @@ def adam_bias_corrections(t: int) -> Dict[str, float]:
         "m_correction": 1.0 / (1.0 - ADAM_BETA1 ** (t + 1)),
         "v_correction": 1.0 / (1.0 - ADAM_BETA2 ** (t + 1)),
     }
+
+
+def minibatch_indices(
+    num_rows: int,
+    batch_size: int,
+    seed: int = 0,
+    shuffle: bool = True,
+) -> Callable[[int], np.ndarray]:
+    """The row indices step ``t`` should train on, as a pure function of ``t``.
+
+    Feed the result to :func:`run_step_graph`'s ``feeds`` and the graph's own
+    :meth:`GraphBuilder.gather_rows` and the loop is minibatched: the whole
+    calibration set stays resident as a constant, and each step reads
+    ``batch_size`` of its rows.
+
+    Three decisions live here, and each of them is a decision rather than an
+    accident:
+
+    **The stream is an endless concatenation of permutations, chopped into
+    fixed-size chunks.** Step ``t`` gets stream positions
+    ``[t*B, (t+1)*B)``; position ``p`` is row ``perm[p // N][p % N]``, where
+    ``perm[e]`` is epoch ``e``'s ordering of the ``N`` rows. So every row is
+    visited exactly once per ``N`` positions consumed, no matter where the
+    batch boundaries fall.
+
+    **What happens when the batch size does not divide the row count**: the
+    batch that would run off the end of an epoch is *completed from the front
+    of the next epoch's permutation*, rather than being short. It has to be:
+    a step graph's shapes are static -- that is the property that lets it
+    compile for an NPU and lets :meth:`onnxsim.backend.Runner.bind_loop`
+    pre-allocate its buffers -- so a ragged final batch would need a second
+    graph, and every alternative that keeps one graph is worse. Dropping the
+    tail (PyTorch's ``drop_last``) would silently discard up to
+    ``batch_size - 1`` rows per epoch, and *systematically* the same rows
+    whenever ``shuffle=False``. Padding by repeating a row would quietly
+    reweight it. Wrapping keeps every row's visit count equal and every batch
+    full; its only cost is that a straddling batch can contain the same row
+    twice, when that row lands near the end of one permutation and the start
+    of the next, which weights it double in that one step and not at all
+    thereafter.
+
+    **Shuffling and the seed.** ``shuffle=True`` draws a fresh permutation per
+    epoch, which is what makes consecutive steps see different rows rather
+    than the same ``B`` rows forever -- without it, an epoch's batches are
+    the same fixed partition every time round and the "stochastic" in
+    stochastic gradient descent is only the partition, never the composition.
+    The permutation for epoch ``e`` is drawn from ``(seed, e)`` alone, not
+    from a running generator, so this stays a pure function of ``t``: two runs
+    with the same seed see identical batches, and (like the step graph itself)
+    a loop can be stopped after ``N`` steps and resumed at step ``N`` without
+    the batch order shifting. ``shuffle=False`` walks the rows in order, which
+    is what a test that wants to see the batch composition directly, or a
+    caller whose rows are already in a meaningful order, should use.
+
+    :param num_rows: rows in the resident calibration set
+    :param batch_size: rows per step. Larger than ``num_rows`` is allowed and
+            simply means the wrap repeats rows within one batch, but callers
+            normally clamp to the set size instead -- at that point the batch
+            *is* the set and the full-batch path is both cheaper and exact.
+    :param seed: seed for the per-epoch permutations
+    :param shuffle: draw a new permutation per epoch instead of walking the
+            rows in order
+    """
+    if num_rows < 1:
+        raise ValueError(f"num_rows must be at least 1, got {num_rows}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+
+    # Regenerating a permutation is O(num_rows) and a step is far more than
+    # that, but a batch straddling an epoch boundary asks for two of them, so
+    # the last two are kept rather than redrawn twice per step.
+    cache: Dict[int, np.ndarray] = {}
+
+    def permutation(epoch: int) -> np.ndarray:
+        cached = cache.get(epoch)
+        if cached is not None:
+            return cached
+        if shuffle:
+            # Seeded by (seed, epoch) rather than advanced from a running
+            # generator: that is what keeps this a pure function of the step
+            # index.
+            drawn = np.random.default_rng([seed, epoch]).permutation(num_rows)
+        else:
+            drawn = np.arange(num_rows)
+        for stale in [e for e in cache if e < epoch - 1]:
+            del cache[stale]
+        cache[epoch] = drawn
+        return drawn
+
+    def rows(t: int) -> np.ndarray:
+        indices = np.empty(batch_size, dtype=np.int64)
+        filled = 0
+        while filled < batch_size:
+            epoch, offset = divmod(t * batch_size + filled, num_rows)
+            take = min(num_rows - offset, batch_size - filled)
+            indices[filled : filled + take] = permutation(epoch)[offset : offset + take]
+            filled += take
+        return indices
+
+    return rows

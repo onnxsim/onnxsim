@@ -67,10 +67,20 @@ one out of ``Sign``/``Abs``/``Cast``, and this reuses it).
   :func:`onnxsim.quantize_weight_only_int4`'s weight-only scheme, the same
   one AdaRound/BRECQ/FOEM target. Learnable activation scales exist in-tree
   (:mod:`onnxsim.adaquant`) but are not wired in here.
-- *Full-batch gradient descent.* The whole calibration set is one static
+- *Calibration-scale, even minibatched.* ``batch_size=None`` (the default)
+  is full-batch gradient descent: the whole calibration set is one static
   tensor baked into the step graph's shapes, as in every other
-  reconstruction pass here -- no minibatching, no epochs. That is a
-  calibration-scale budget, not a training-scale one.
+  reconstruction pass here. Passing a ``batch_size`` makes each step train
+  on that many rows instead -- the set is still uploaded once and stays
+  resident, and the step ``Gather``s its own rows out of it, so a step's
+  cost stops scaling with the size of the set and a pass over the data
+  performs many updates instead of one. What that does *not* do is lift the
+  ceiling on how much data a run may use: the set remains one static tensor
+  that has to fit in the execution provider's memory (:mod:`onnxsim.qat_graph`
+  documents the alternative, which trades the residency away for an
+  unbounded stream, and why it was not taken). This is still a
+  calibration-scale budget, not a training-scale one, and there is still no
+  task loss, no labels and no metric.
 - *Measured, not assumed, and not a uniform win.* ``tests/test_qat.py``
   measures both claims rather than asserting them, and one of the two has a
   boundary worth stating here. On a two-Linear-plus-``Relu`` block the
@@ -112,7 +122,7 @@ if the block's shapes cannot be inferred statically at opset 17.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import onnx
@@ -178,6 +188,27 @@ class _Trained:
     scale_next: str = ""
     ms_next: str = ""
     vs_next: str = ""
+
+
+@dataclass(frozen=True)
+class _Minibatch:
+    """How one block's step graph reads a minibatch out of its calibration set.
+
+    Present only when the caller asked for minibatching; ``None`` everywhere
+    means the full-batch graph this module started with, node for node.
+
+    The set itself stays a step-graph *constant* -- uploaded once and
+    device-resident for the whole loop, exactly as in the full-batch case --
+    and the step selects :attr:`size` of its :attr:`num_rows` rows with a
+    ``Gather`` driven by :attr:`index_name`, a rank-1 int64 per-step input.
+    See :mod:`onnxsim.qat_graph`'s module docstring for why the rows are
+    selected inside the graph rather than fed to it, and what that choice
+    does and does not buy.
+    """
+
+    size: int
+    num_rows: int
+    index_name: str = f"{_PREFIX}rows"
 
 
 def _int64_const(b: qat_graph.GraphBuilder, values: Sequence[int]) -> str:
@@ -542,6 +573,7 @@ def _build_step_graph(
     block_output_name: str,
     block_output_shape: Sequence[int],
     learn_scales: bool,
+    batch: Optional[_Minibatch] = None,
 ) -> qat_graph.StepGraph:
     """The whole loop as one graph: fake-quant forward, block forward,
     reconstruction loss, backward, Adam.
@@ -550,11 +582,46 @@ def _build_step_graph(
     reads forward tensors by name (including node *outputs*, where reusing a
     ``Sigmoid``/``Softmax`` result is cheaper than recomputing it), so every
     node it differentiates must already sit in the builder ahead of the nodes
-    it appends. Hence: fake-quant, then the block's own nodes verbatim, then
-    the loss seed, then the backward, then the optimizer.
+    it appends. Hence: (optionally the minibatch gather,) fake-quant, then the
+    block's own nodes verbatim, then the loss seed, then the backward, then
+    the optimizer.
+
+    ``externals`` and ``block_output_shape`` are always the *whole*
+    calibration set's arrays and shape. With ``batch`` set they become the
+    resident tables rather than the block's inputs, and the block's own
+    tensors are ``batch.size`` rows gathered out of them -- so every shape
+    from the block input downwards, the loss normalizer included, is a
+    batch-sized shape, and none of the code below has to know which case it
+    is in.
     """
     b = qat_graph.GraphBuilder(_PREFIX)
     b.initializer.extend(block_initializers)
+
+    # 0. The minibatch, if there is one. Each captured tensor is declared at
+    #    its full size and a Gather pulls this step's rows out of it under the
+    #    name the block's own nodes were written against, so step 2 below can
+    #    still splice those nodes in verbatim. The block never learns that its
+    #    input stopped being a graph input.
+    teacher = f"{_PREFIX}teacher"
+    constants: Dict[str, Sequence[int]] = {}
+    if batch is None:
+        constants.update(
+            {name: list(value.shape) for name, value in sorted(externals.items())}
+        )
+        constants[teacher] = list(block_output_shape)
+    else:
+        rows = batch.index_name
+        # A captured tensor's table is ``qat__all_<its name>`` and the
+        # teacher's is ``qat__teacher_all``; the two families cannot collide
+        # whatever the model calls its tensors, since one starts ``qat__all_``
+        # and the other ``qat__teacher_``.
+        for name, value in sorted(externals.items()):
+            table = f"{_PREFIX}all_{name}"
+            constants[table] = list(value.shape)
+            b.gather_rows(table, rows, name)
+        constants[f"{_PREFIX}teacher_all"] = list(block_output_shape)
+        b.gather_rows(f"{_PREFIX}teacher_all", rows, teacher)
+        block_output_shape = [batch.size] + list(block_output_shape)[1:]
 
     # 1. Fake-quantize each trained master weight into the tensor name the
     #    block's own node already reads, so the block's nodes need no
@@ -579,7 +646,10 @@ def _build_step_graph(
 
     # 3. The objective: MSE of the student block's output against the
     #    teacher's, and its gradient, which is the seed of the backward pass.
-    teacher = f"{_PREFIX}teacher"
+    #    ``block_output_shape`` is this step's shape, so the 2/n normalizer is
+    #    the batch's element count and a minibatched gradient is the same
+    #    *average* per-element quantity a full-batch one is -- which is what
+    #    keeps one learning rate meaningful across batch sizes.
     diff = b.sub(block_output_name, teacher)
     n_elems = int(np.prod(list(block_output_shape)))
     dl_dy = b.mul(diff, b.const(2.0 / n_elems))
@@ -637,11 +707,6 @@ def _build_step_graph(
             "v_correction",
         )
 
-    constants: Dict[str, Sequence[int]] = {
-        name: list(value.shape) for name, value in sorted(externals.items())
-    }
-    constants[teacher] = list(block_output_shape)
-
     state: Dict[str, Tuple[Sequence[int], str]] = {}
     for t in trained:
         state[t.w_input] = (list(t.w_shape), t.w_next)
@@ -656,6 +721,10 @@ def _build_step_graph(
     if learn_scales:
         scalars.append(f"{_PREFIX}lr_scale")
 
+    per_step: Optional[Dict[str, Tuple[Sequence[int], int]]] = None
+    if batch is not None:
+        per_step = {batch.index_name: ([batch.size], int(onnx.TensorProto.INT64))}
+
     return qat_graph.make_step_graph(
         b,
         constants=constants,
@@ -663,6 +732,7 @@ def _build_step_graph(
         scalars=scalars,
         loss=b.mean_square(diff),
         name="onnxsim_qat_step",
+        per_step=per_step,
     )
 
 
@@ -729,6 +799,52 @@ def _plan_block(
     )
 
 
+def _plan_minibatch(
+    external_values: Dict[str, np.ndarray],
+    teacher_output: np.ndarray,
+    batch_size: Optional[int],
+) -> Optional[_Minibatch]:
+    """The block's minibatch plan, or ``None`` for the full-batch graph.
+
+    ``None`` is returned for both ways of asking for full batch -- not
+    passing a ``batch_size`` at all, and passing one at least as large as the
+    calibration set -- and the second is the more interesting one. A batch
+    that covers every row *is* the full-batch objective, so taking the
+    full-batch path for it is not an approximation: it is the same
+    computation, minus a ``Gather`` per captured tensor, and it keeps the
+    default and the "batch_size larger than my data" case bit-for-bit
+    identical to what this module did before minibatching existed. The
+    alternative -- wrapping the index stream around and letting rows repeat
+    inside a single batch -- would quietly reweight those rows.
+
+    Minibatching needs a row axis, and this is where the assumption
+    :func:`_capture` already makes ("axis 0 is a batch axis the block treats
+    independently") stops being implicit: every captured tensor is sliced on
+    axis 0 by the *same* index vector, so they must agree on how many rows
+    they have. A block whose sideways input does not (a tensor computed from
+    initializers alone, say) is refused for minibatching rather than sliced
+    into nonsense -- and its full-batch path still works, which is what the
+    error message says to do.
+    """
+    if batch_size is None:
+        return None
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+
+    leading = {int(value.shape[0]) for value in external_values.values()}
+    leading.add(int(teacher_output.shape[0]))
+    if len(leading) != 1:
+        raise ValueError(
+            "minibatching slices every captured tensor on axis 0 with one shared "
+            f"index, so they must agree on their row count; got {sorted(leading)}. "
+            "Leave batch_size unset to train this block full-batch."
+        )
+    num_rows = leading.pop()
+    if batch_size >= num_rows:
+        return None
+    return _Minibatch(size=batch_size, num_rows=num_rows)
+
+
 def _train_block(
     float_model: onnx.ModelProto,
     quantized_model: onnx.ModelProto,
@@ -743,6 +859,9 @@ def _train_block(
     lr_decay: bool,
     step_providers: Optional[Sequence[backend.Provider]],
     losses: Optional[List[float]],
+    batch_size: Optional[int] = None,
+    shuffle: bool = True,
+    batch_seed: int = 0,
 ) -> onnx.ModelProto:
     """Runs the whole optimization for one already-planned, already-captured
     block and returns ``quantized_model`` with that block's initializers
@@ -755,8 +874,18 @@ def _train_block(
     :func:`apply_qat_all_blocks`'s sequential walk: the target is always the
     teacher's, but the inputs may be the teacher's or the student's.
     """
+    batch = _plan_minibatch(external_values, teacher_output, batch_size)
+    # Shape inference sees one step's worth of rows, since that is what the
+    # block's nodes -- and therefore the backward pass built from them -- will
+    # actually be handed. The views are free; nothing is copied.
+    if batch is None:
+        block_inputs, block_target = external_values, teacher_output
+    else:
+        block_inputs = {k: v[: batch.size] for k, v in external_values.items()}
+        block_target = teacher_output[: batch.size]
+
     shapes = _block_shapes(
-        float_model, plan.nodes, external_values, plan.output_name, teacher_output
+        float_model, plan.nodes, block_inputs, plan.output_name, block_target
     )
 
     trained = _plan_trained(plan.candidates, learn_scales)
@@ -777,10 +906,18 @@ def _train_block(
         plan.output_name,
         list(teacher_output.shape),
         learn_scales,
+        batch,
     )
 
-    constants: Dict[str, np.ndarray] = dict(external_values)
-    constants[f"{_PREFIX}teacher"] = teacher_output
+    # The whole set is the constant either way; with a minibatch it is bound
+    # under the private table names the gathers read instead of under the
+    # block's own tensor names, and it is still uploaded exactly once.
+    if batch is None:
+        constants: Dict[str, np.ndarray] = dict(external_values)
+        constants[f"{_PREFIX}teacher"] = teacher_output
+    else:
+        constants = {f"{_PREFIX}all_{k}": v for k, v in external_values.items()}
+        constants[f"{_PREFIX}teacher_all"] = teacher_output
     state: Dict[str, np.ndarray] = {}
     for t in trained:
         state[t.w_input] = t.w_init
@@ -802,6 +939,18 @@ def _train_block(
         values.update(qat_graph.adam_bias_corrections(t))
         return values
 
+    feeds: Optional[Callable[[int], Dict[str, np.ndarray]]] = None
+    if batch is not None:
+        rows = qat_graph.minibatch_indices(
+            batch.num_rows, batch.size, seed=batch_seed, shuffle=shuffle
+        )
+        index_name = batch.index_name
+
+        def batch_rows(t: int) -> Dict[str, np.ndarray]:
+            return {index_name: rows(t)}
+
+        feeds = batch_rows
+
     final = qat_graph.run_step_graph(
         step,
         constants=constants,
@@ -810,6 +959,7 @@ def _train_block(
         scalars=scalars,
         providers=step_providers,
         losses=losses,
+        feeds=feeds,
     )
 
     new_codes: Dict[str, np.ndarray] = {}
@@ -855,6 +1005,9 @@ def apply_qat(
     learn_scales: bool = False,
     scale_learning_rate: float = 1e-5,
     lr_decay: bool = True,
+    batch_size: Optional[int] = None,
+    shuffle: bool = True,
+    batch_seed: int = 0,
     providers: Optional[Sequence[backend.Provider]] = None,
     step_providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
@@ -899,7 +1052,19 @@ def apply_qat(
             is omitted
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
-    :param num_iterations: Adam steps to run over the block
+    :param num_iterations: Adam steps -- optimizer steps -- to run over the
+            block. That meaning is unchanged by ``batch_size``: it has always
+            been the number of times the parameters are updated, and it still
+            is. What ``batch_size`` changes is how much data each of those
+            steps sees, and therefore how many *epochs* the same budget buys:
+            with ``R`` calibration rows, a run covers
+            ``num_iterations * batch_size / R`` epochs (full batch is
+            ``batch_size = R``, hence exactly ``num_iterations`` epochs, one
+            per step). So halving the batch size at a fixed
+            ``num_iterations`` halves the data seen and the compute spent; to
+            hold the *epoch* count fixed while minibatching, scale
+            ``num_iterations`` up by ``R / batch_size``. ``lr_decay``
+            likewise anneals over ``num_iterations`` steps regardless.
     :param learning_rate: Adam learning rate for the fp32 master weights.
             The natural scale to compare it against is the quantization step
             itself: an element has to travel about half a step to change
@@ -923,6 +1088,44 @@ def apply_qat(
             final iterate wherever the last step happened to put it, which
             can be worse than a step earlier. Annealing makes the end of the
             run settle instead. Turn it off to hold the rate fixed.
+    :param batch_size: rows of the calibration set each step trains on.
+            ``None``, the default, is full batch -- every step sees every
+            row, which is what this module has always done and which stays
+            bit-for-bit unchanged, ``Gather``-free graph included, because a
+            full-batch run does not take the minibatching path at all. A
+            ``batch_size`` at least as large as the row count is the same
+            thing and takes the same path.
+
+            What minibatching is *for*, stated honestly: a step's cost stops
+            scaling with the size of the calibration set, so a larger set
+            costs more epochs rather than a bigger, slower step -- and each
+            pass over the data now performs ``R / batch_size`` updates
+            instead of one, which is the ordinary reason stochastic gradient
+            descent converges in fewer passes than full-batch descent. What
+            it is *not*: a way to train on more data than fits in memory. The
+            whole set is still one static tensor, resident on the execution
+            provider's device, out of which each step gathers its rows --
+            see :mod:`onnxsim.qat_graph`'s module docstring for that
+            trade-off and the alternative that was not taken.
+
+            The loss recorded in ``losses`` becomes the *batch's* loss, not
+            the set's, so it is noisy: compare a smoothed tail against a
+            smoothed head, not the last value against the first.
+    :param shuffle: draw a fresh permutation of the rows each epoch, so
+            consecutive steps see different rows rather than the same fixed
+            partition every time round. On by default, and only meaningful
+            when ``batch_size`` is set. ``False`` walks the rows in order,
+            which is for reproducing a specific batch composition (a test, a
+            debugging session) rather than for training.
+    :param batch_seed: seed for that shuffling. Deliberately its own
+            parameter rather than a second use of ``seed``: ``seed`` picks
+            the random *calibration data* and is documented as ignored when
+            the caller supplies their own, whereas the batch order matters in
+            exactly the case where the caller did supply data. Two runs with
+            the same ``batch_seed`` see identical batches in identical order.
+            Batches are a pure function of ``(batch_seed, step index)``, not
+            of a running generator, so an interrupted run resumes on the same
+            schedule.
     :param providers: onnxruntime execution providers to run ``float_model``
             on when capturing the teacher's activations
     :param step_providers: onnxruntime execution providers to run the
@@ -939,7 +1142,9 @@ def apply_qat(
             (and, if ``learn_scales``, their scale initializers) rewritten.
             Every other byte of the model is untouched.
     :raises ValueError: if the block cannot be discovered, is not closed at
-            statically-known shapes, or contains no quantized layer to train
+            statically-known shapes, contains no quantized layer to train, or
+            (with ``batch_size`` set) has captured tensors that disagree
+            about how many rows they have
     :raises onnxsim.graph_grad.UnsupportedOpError: if any node in the block
             has no gradient rule
     """
@@ -974,6 +1179,9 @@ def apply_qat(
         learn_scales=learn_scales,
         scale_learning_rate=scale_learning_rate,
         lr_decay=lr_decay,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        batch_seed=batch_seed,
         step_providers=step_providers,
         losses=losses,
     )
@@ -1316,6 +1524,9 @@ def apply_qat_all_blocks(
     learn_scales: bool = False,
     scale_learning_rate: float = 1e-5,
     lr_decay: bool = True,
+    batch_size: Optional[int] = None,
+    shuffle: bool = True,
+    batch_seed: int = 0,
     sequential: bool = True,
     max_layers_per_block: int = 2,
     providers: Optional[Sequence[backend.Provider]] = None,
@@ -1387,14 +1598,26 @@ def apply_qat_all_blocks(
     :param num_samples: random batches to generate when ``calibration_data``
             is omitted
     :param seed: seed for that random calibration data
-    :param num_iterations: Adam steps per block. The total budget is this
-            times the number of blocks, so a whole-model walk usually wants a
-            smaller value than a single :func:`apply_qat` call would.
+    :param num_iterations: Adam (optimizer) steps per block, exactly as in
+            :func:`apply_qat` -- see there for how ``batch_size`` relates
+            steps to epochs. The total budget is this times the number of
+            blocks, so a whole-model walk usually wants a smaller value than
+            a single :func:`apply_qat` call would.
     :param learning_rate: Adam learning rate for the fp32 master weights
     :param learn_scales: also train each weight's per-block quantization
             scale, LSQ-style, in every block
     :param scale_learning_rate: Adam learning rate for those scales
     :param lr_decay: anneal both learning rates to zero within each block
+    :param batch_size: rows per optimizer step, applied identically in every
+            block -- ``None`` (the default) is full batch, unchanged. Note
+            that the blocks share the *same* batch schedule, since each is
+            trained by its own :func:`apply_qat`-equivalent loop starting from
+            step 0 with the same ``batch_seed``; the rows are the same rows,
+            because every block's activations were captured from the same
+            calibration inputs in the same order, so block ``k`` and block
+            ``k+1`` agree about what "row 7" means.
+    :param shuffle: shuffle the rows per epoch, as :func:`apply_qat` does
+    :param batch_seed: seed for that shuffling
     :param sequential: feed each block the student's own activation rather
             than the teacher's -- see above. ``True`` by default.
     :param max_layers_per_block: passed to :func:`discover_qat_blocks` when
@@ -1485,6 +1708,9 @@ def apply_qat_all_blocks(
                 learn_scales=learn_scales,
                 scale_learning_rate=scale_learning_rate,
                 lr_decay=lr_decay,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                batch_seed=batch_seed,
                 step_providers=step_providers,
                 losses=result.losses,
             )
