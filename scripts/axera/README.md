@@ -3737,6 +3737,71 @@ print(coverage(model))          # "full" / "partial" / "none"
 print(simulate(model)["close"]) # fp32 vs. simulated-INT8, roughly sane?
 ```
 
+## Keeping the AX650N reachable: host driver fixes
+
+Everything above that touches the real device goes through Axera's out-of-tree
+AXCL host PCIe driver (`axclhost` 2.25.0, DKMS-built: `ax_pcie_host_dev`,
+`ax_pcie_msg`, `ax_pcie_mmb`, `axcl_host`). On this host the card is attached
+over **Thunderbolt/USB4** (ASMedia 246x bridge -> PCIe bus 03,
+`[1f4b:0650]`), and that link drops on its own from time to time.
+
+Three real kernel bugs in that driver were found and fixed, plus one feature
+added; see [`host-driver-patches/NOTES.md`](host-driver-patches/NOTES.md) for
+the full symptom -> evidence -> cause -> fix -> verification writeup, the
+unified diffs, and the apply scripts.
+
+1. **`ax_mmb` 4MB contiguous `kmalloc`** -- `axcl-smi` sprayed
+   `page allocation failure: order:10` WARNs with full backtraces. The
+   scatterlist allocator starts at `SZ_4M` (order-10, far above
+   `PAGE_ALLOC_COSTLY_ORDER`) and only halves down on failure, so on a
+   fragmented host every call dumped a stack trace before succeeding. Fixed
+   with `__GFP_NORETRY | __GFP_NOWARN` -- the existing halving loop already
+   degrades gracefully.
+2. **`axcl_pcie_port_manage` NULL deref / unvalidated ioctl input** -- a real
+   kdump-captured Oops (`axcl_pcie_ioctl+0x842`, `CR2=0`, `Comm: axcl-smi`).
+   `target` comes straight from a `copy_from_user`'d ioctl argument and indexes
+   `port_handle[AXERA_MAX_MAP_DEV][MAX_MSG_PORTS]` with no bounds check, then
+   dereferences the slot without a NULL check -- and the slot is NULL until the
+   device handshake completes.
+3. **Heartbeat thread reads unmapped MMIO after hot-unplug** -- this was the
+   one that reset the whole machine, with *no* Oops and *no* vmcore.
+   `heartbeat_recv_thread()` caches `axdev->shm_base_virt` (BAR-mapped shared
+   memory) once before its loop, and its poll helper reads through that pointer
+   once a second for up to 50s. When the link drops, `ax_pcie_dev_remove()`
+   `pci_iounmap()`s the BARs and `kfree()`s the `axera_dev`, so the thread keeps
+   reading a torn-down ioremap window -- an unrecoverable bus fault, not
+   something the kernel can trap and log. Nothing told `axcl_host` about the
+   removal at all: its `port_handle[]` and per-target state are populated once
+   at `module_init`. Fixed by adding a hotplug notifier
+   (`ax_pcie_register_hotplug_notify()`) that fires *before* teardown, dropping
+   every cached pointer then; re-resolving the device each loop iteration; and
+   an offline flag the poll loop checks so a thread already inside it bails
+   within ~1s.
+4. **Automatic bring-up on reconnect** -- after (3) a reconnected device is safe
+   but unusable until `axcl_host` is reloaded, since per-device bring-up only
+   ran at `module_init`. Added `axcl_pcie_device_online()` (firmware load ->
+   port creation -> RC/EP handshake -> timestamp sync -> heartbeat thread) on an
+   ordered workqueue, because that sequence pushes ~150MB of firmware and can
+   block ~120s in the handshake, so it must not run in the PCI `.probe()`
+   callback.
+
+Two things this does **not** fix, both still open:
+
+- **`axcl-smi` hangs with no output.** It retries `IOC_AXCL_PORT_MANAGE`
+  forever, each attempt timing out after 50s (`AXCL_RECV_TIMEOUT`) waiting for
+  an ack from the AX650N's *own onboard software*. The low-level RC/EP handshake
+  succeeds and firmware loads fine (`ATF`/`KERNEL`/`ROOTFS` all `SUCCESS`), so
+  the gap is one level up, on the device side -- not a host kernel bug.
+- **The Thunderbolt link itself still drops** (`tbtacl` failure + `boltd` probe
+  timeout accompanied one disconnect nobody physically triggered). Fixes 3/4
+  make that survivable, not rare.
+
+⚠️ Any `axclhost` package upgrade or `dkms remove` replaces
+`/usr/src/axcl-2.25.0` and silently drops all four fixes -- including the one
+standing between a Thunderbolt hiccup and a hard reset. Re-apply from
+`host-driver-patches/patches/` (`sudo patch -p1 -d /usr/src/axcl-2.25.0 <
+patches/<file>.patch` for each, then `dkms build`/`install`).
+
 ## Extending
 
 - If the real device/toolchain becomes available again: automate the manual

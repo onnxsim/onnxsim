@@ -1,0 +1,69 @@
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: thunderbolt 0-0:2.1: retimer disconnected
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: pciehp: Slot(0): Link Down
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: pciehp: Slot(0): Card not present
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: PME: Spurious native interrupt!
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: PME: Spurious native interrupt!
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: pci_bus 0000:03: busn_res: [bus 03] is released
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: pci_bus 0000:02: busn_res: [bus 02-03] is released
+Sep 07 06:09:07 takecheeze-NucBox-EVO-X2 kernel: thunderbolt 0-2: device disconnected
+Sep 07 06:09:10 takecheeze-NucBox-EVO-X2 kernel: thunderbolt 0-2: new device found, vendor=0xb8 device=0x2463
+Sep 07 06:09:10 takecheeze-NucBox-EVO-X2 kernel: thunderbolt 0-2: ASMedia 246x
+Sep 07 06:09:11 takecheeze-NucBox-EVO-X2 kernel: thunderbolt 0-0:2.1: new retimer found, vendor=0x1da0 device=0x8830
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: thunderbolt 0-2:1.1: new retimer found, vendor=0x1da0 device=0x8830
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: pciehp: Slot(0): Card present
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: pciehp: Slot(0): Link Up
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: [1b21:2463] type 01 class 0x060400 PCIe Switch Upstream Port
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: PCI bridge to [bus 00]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0:   bridge window [io  0x0000-0x0fff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0:   bridge window [mem 0x00000000-0x000fffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0:   bridge window [mem 0x00000000-0x000fffff 64bit pref]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: enabling Extended Tags
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: PME# supported from D0 D3hot D3cold
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: ASPM: current common clock configuration is inconsistent, reconfiguring
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: bridge configuration invalid ([bus 00-00]), reconfiguring
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: [1b21:2463] type 01 class 0x060400 PCIe Switch Downstream Port
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: PCI bridge to [bus 00]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0:   bridge window [io  0x0000-0x0fff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0:   bridge window [mem 0x00000000-0x000fffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0:   bridge window [mem 0x00000000-0x000fffff 64bit pref]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: enabling Extended Tags
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: PME# supported from D0 D3hot D3cold
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: PCI bridge to [bus 02-60]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: bridge configuration invalid ([bus 00-00]), reconfiguring
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: [1f4b:0650] type 00 class 0x040000 PCIe Endpoint
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: BAR 0 [mem 0x00000000-0x007fffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: BAR 1 [mem 0x00000000-0x0000ffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: BAR 4 [mem 0x00000000-0x000fffff 64bit]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: supports D1
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: PME# supported from D0 D1 D3hot
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: 2.000 Gb/s available PCIe bandwidth, limited by 2.5 GT/s PCIe x1 link at 0000:00:01.1 (capable of 8.000 Gb/s with 5.0 GT/s PCIe x2 link)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: PCI bridge to [bus 03-60]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci_bus 0000:03: busn_res: [bus 03-60] end is updated to 03
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci_bus 0000:02: busn_res: [bus 02-60] end is updated to 03
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: disabling bridge window [mem 0x00000000-0x000fffff 64bit pref] to [bus 03] (unused)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: disabling bridge window [mem 0x00000000-0x000fffff 64bit pref] to [bus 02-03] (unused)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: bridge window [mem 0xbc000000-0xd39fffff]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: bridge window [io  0xa000-0xdfff]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: bridge window [mem 0xbc000000-0xd39fffff]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: bridge window [io  0xa000-0xdfff]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: BAR 0 [mem 0xbc000000-0xbc7fffff]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: BAR 4 [mem 0xbc800000-0xbc8fffff 64bit]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:03:00.0: BAR 1 [mem 0xbc900000-0xbc90ffff]: assigned
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0: PCI bridge to [bus 03]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0:   bridge window [io  0xa000-0xdfff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:02:00.0:   bridge window [mem 0xbc000000-0xd39fffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0: PCI bridge to [bus 02-03]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0:   bridge window [io  0xa000-0xdfff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pci 0000:01:00.0:   bridge window [mem 0xbc000000-0xd39fffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1: PCI bridge to [bus 01-60]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1:   bridge window [io  0xa000-0xdfff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1:   bridge window [mem 0xbc000000-0xd3ffffff]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:00:01.1:   bridge window [mem 0x7000000000-0x8fffffffff 64bit pref]
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:01:00.0: enabling device (0000 -> 0003)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:02:00.0: enabling device (0000 -> 0003)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: ax_pcie_dev_host 0000:03:00.0: enabling device (0000 -> 0002)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: [ax_get_slot_index, 161]: busnr:3,devfn:0,slot:3.
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: [ax_get_bus_domain, 173]: no domain
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:02:00.0: disabling bridge window [mem 0x00000000-0x1fffffffff 64bit pref disabled] to [bus 03] (unused)
+Sep 07 06:09:12 takecheeze-NucBox-EVO-X2 kernel: pcieport 0000:01:00.0: disabling bridge window [mem 0x00000000-0x1fffffffff 64bit pref disabled] to [bus 02-03] (unused)
+Sep 07 06:09:15 takecheeze-NucBox-EVO-X2 kernel: [heartbeat_recv_thread, 573]: device 3: dead!
