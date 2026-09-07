@@ -76,7 +76,9 @@ objective `brecq.py` already optimizes, extended along axes 1, 2 and 4:
   forward with an STE), not only their rounding bit;
 - learnable step size for weights *and* activations (LSQ / LSQ+ / PACT) —
   `adaquant.py` already does this for activation scale/zero-point, so the
-  gradients exist in-tree;
+  gradients exist in-tree, and `apply_qat` now reuses them directly rather
+  than re-deriving them (`learn_scales` for weights,
+  `learn_activation_scales` for activations);
 - block discovery that walks through normalization/activation nodes instead
   of `brecq.py`'s strict linear-chain restriction, then a sliding window over
   blocks, ending with an optional end-to-end pass on the whole graph;
@@ -201,7 +203,8 @@ Each stage is independently shippable and independently useful.
    zero-point), so the step graph carries nine state tensors and three
    `adam_update` calls. It tracks its numpy loop tighter than adaround's port
    does: identical weight codes on five of six seeds, identical integer
-   zero-point on all six. And the state now stays on the device between
+   zero-point on all six. `autoround` followed, so all three rounding passes
+   now take `step_providers=`. And the state now stays on the device between
    steps (`backend.Runner.bind_loop`), which is what makes the accelerator
    path worth taking rather than merely possible.
 2. **`qat.py` / `apply_qat()` -- done**, and it needed one thing this note
@@ -262,11 +265,32 @@ Each stage is independently shippable and independently useful.
    a tight budget (11.41 -> 6.33) and washes out once full batch has
    converged.
 
+   Activation quantization landed too, as `learn_activation_scales=True`.
+   It could not be a feature added on top of the weight-only scheme, because
+   a `quantize_weight_only_int4` model has no activation quantizer anywhere
+   to train -- so the flag *selects* `quantize_static`'s QDQ scheme (uint8
+   asymmetric activations, per-channel INT8 weights) and trains its
+   quantizers jointly with its weights, refusing the wrong pairing loudly in
+   both directions. The gradients are adaquant's, reused rather than
+   re-derived: the quantize-dequantize chain is emitted stage by stage and
+   handed to `graph_grad`, with the straight-through estimator made
+   *structural* -- `round(r)` written as `r + (round(r) - r)`, the residual's
+   nodes left out of the differentiated list -- so the ordinary rules
+   reproduce adaquant's closed form, which a test checks against numpy. No
+   `EP_FRIENDLY_OPS` addition was needed; the chain is `Exp`/`Div`/`Add`/
+   `Sub`/`Mul` plus the existing clip and round helpers.
+
+   Measured the same way as everything else here, and it lands the same
+   shape: on a block whose range was calibrated from one outlier (~30x too
+   wide) it takes the whole-model error from 4.08 (weights alone) to 2.54,
+   38% better; on the same block calibrated on representative data it is a
+   small regression at every learning rate tried. It fixes a quantizer whose
+   range is wrong rather than improving one that is right.
+
    Still open from this stage's original description: real data via
-   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, an
+   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, and an
    end-to-end pass against the model's own output (a block is always the
-   unit of optimization), and activation quantization (adaquant has the
-   learnable activation scale, it is simply not wired in here).
+   unit of optimization).
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
@@ -309,7 +333,7 @@ tuned = onnxsim.apply_adaround(
 
 Omitting `step_providers` keeps the existing float64 numpy loop, which is what
 CI runs: it is exact and reproducible, and a non-CPU provider is neither.
-`apply_adaquant` takes the same argument. In the browser, the Quantize
+`apply_adaquant` and `apply_autoround` take the same argument. In the browser, the Quantize
 panel's **calibration execution provider** picker does the equivalent for
 calibration's own forward passes (WebGPU, or WebNN's GPU/NPU device types).
 
@@ -325,6 +349,22 @@ tuned = onnxsim.apply_qat(
     calibration_data=batches,
     learn_scales=True,         # LSQ per-block scales alongside the weights
     step_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+To train the activation quantizers as well, pass a `quantize_static` model
+instead -- the flag selects that scheme, it does not add to the weight-only
+one:
+
+```python
+tuned = onnxsim.apply_qat(
+    float_model,
+    quantized_model,           # quantize_static's output, not int4's
+    block_input_name="hidden",
+    block_output_name="block_out",
+    calibration_data=batches,
+    learn_activation_scales=True,
+    activation_learning_rate=1e-2,
 )
 ```
 
