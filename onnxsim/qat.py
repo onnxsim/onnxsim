@@ -41,7 +41,8 @@ backward emitted by :func:`onnxsim.graph_grad.build_backward`, and one
 execution provider ``step_providers=`` names -- CUDA, an NPU EP, WebGPU in
 the WASM build -- and it stays inside
 :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` to make that real rather than
-nominal (no ``Round``: :func:`onnxsim.adaquant._round_to_nearest` composes
+nominal (no ``Round``:
+:meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest` composes
 one out of ``Sign``/``Abs``/``Cast``, and this reuses it).
 
 **What this deliberately is not, and does not claim.**
@@ -110,7 +111,6 @@ import onnx.numpy_helper
 import onnx.shape_inference
 
 from onnxsim import backend, graph_grad, qat_graph
-from onnxsim.adaquant import _round_to_nearest
 from onnxsim.adaround import _Candidate, _find_int4_matmul_candidates, _pack_int4
 from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
@@ -126,7 +126,8 @@ _PREFIX = "qat__"
 
 
 def _round_half_away(x: np.ndarray) -> np.ndarray:
-    """Host-side twin of :func:`onnxsim.adaquant._round_to_nearest`.
+    """Host-side twin of
+    :meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest`.
 
     The export must round the trained master weights exactly the way the
     trained forward did, or the model that ships is not the model whose loss
@@ -266,11 +267,12 @@ def _emit_fake_quant(
 
     Clipping happens *before* rounding rather than after. The two commute
     here because the bounds are integers, and doing it in this order leaves
-    :func:`onnxsim.adaquant._round_to_nearest` with an argument already
+    :meth:`onnxsim.qat_graph.GraphBuilder.round_to_nearest` with an argument
+    already
     bounded to [-7, 7], where its float-to-int32 cast is exact.
     """
     ratio = b.div(w, scale_full)
-    code = _round_to_nearest(b, b.clip(ratio, _N_MIN, _N_MAX))
+    code = b.round_to_nearest(b.clip(ratio, _N_MIN, _N_MAX))
     b.nodes.append(onnx.helper.make_node("Mul", [code, scale_full], [out_name]))
     active = b.mul(
         b.greater_mask(ratio, _N_MIN),

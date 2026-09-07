@@ -205,6 +205,27 @@ class GraphBuilder:
         lt = self.op("Less", [a, self.const(threshold)])
         return self.op("Cast", [lt], to=onnx.TensorProto.FLOAT)
 
+    def round_to_nearest(self, a: str) -> str:
+        """``round(a)``, composed rather than emitted as ``Round``.
+
+        WebNN has no rounding operator at all, so ``Round`` is deliberately
+        absent from :data:`EP_FRIENDLY_OPS` -- and a fake-quant forward, which
+        is what every caller of this wants it for, is exactly the code that
+        must run on those backends. A float-to-int32 ``Cast`` truncates toward
+        zero, so truncating ``|a| + 0.5`` and re-applying the sign is
+        round-half-away-from-zero. That differs from ``Round``'s (and numpy's)
+        round-half-to-even on *exact* ties only: a value landing on a precise
+        .5, which real calibration data does not do at any measurable rate,
+        and which when it happens moves one element's code by one rather than
+        changing the shape of the optimization.
+        """
+        magnitude = self.add(self.op("Abs", [a]), self.const(0.5))
+        truncated = self.op("Cast", [magnitude], to=onnx.TensorProto.INT32)
+        return self.mul(
+            self.op("Sign", [a]),
+            self.op("Cast", [truncated], to=onnx.TensorProto.FLOAT),
+        )
+
     def mean_square(self, a: str) -> str:
         """``mean(a * a)`` as a scalar, for a reported loss."""
         sq = self.mul(a, a)

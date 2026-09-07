@@ -380,27 +380,6 @@ def _sum_all(b: qat_graph.GraphBuilder, tensor: str) -> str:
     return b.op("ReduceSum", [tensor], keepdims=0)
 
 
-def _round_to_nearest(b: qat_graph.GraphBuilder, tensor: str) -> str:
-    """``round(tensor)``, built out of the allowlisted ops.
-
-    ONNX has a ``Round``, but WebNN has no rounding operator at all, so it is
-    deliberately absent from :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` and
-    this composes the same thing instead: a float-to-int32
-    ``Cast`` truncates toward zero, and truncating ``|t| + 0.5`` and
-    re-applying the sign is round-half-away-from-zero. That differs from
-    numpy's (and ``Round``'s) round-half-to-even on *exact* ties only -- an
-    activation whose ``x / scale`` lands on a precise .5, which real
-    calibration data does not do at any measurable rate, and which when it
-    does happen moves that one element's quantized code by one rather than
-    changing the shape of the optimization.
-    """
-    magnitude = b.add(b.op("Abs", [tensor]), b.const(0.5))
-    truncated = b.op("Cast", [magnitude], to=onnx.TensorProto.INT32)
-    return b.mul(
-        b.op("Sign", [tensor]), b.op("Cast", [truncated], to=onnx.TensorProto.FLOAT)
-    )
-
-
 def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepGraph:
     """One Adam step of :func:`_optimize_adaquant`, as an ONNX graph.
 
@@ -464,7 +443,7 @@ def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepG
 
     # Straight-through quantize-dequantize of the activation, stage by stage.
     x_over_s = b.div(x, s_x)
-    xq_raw = b.add(_round_to_nearest(b, x_over_s), zp)
+    xq_raw = b.add(b.round_to_nearest(x_over_s), zp)
     active_x = b.mul(b.greater_mask(xq_raw, 0.0), b.less_mask(xq_raw, _ACT_N_MAX))
     xq_minus_zp = b.sub(b.clip(xq_raw, 0.0, _ACT_N_MAX), zp)
     xdq = b.mul(xq_minus_zp, s_x)
