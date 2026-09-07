@@ -1,10 +1,10 @@
 # Delivering QAT in onnxsim: a design note
 
-**Status: design note, with stages 0-2 implemented.**
+**Status: design note, with stages 0-2 and 4 implemented.**
 `onnxsim/qat_graph.py`, `onnxsim/graph_grad.py`, `onnxsim/qat.py`
-(`apply_qat`) and the converter page's calibration-provider picker have all
-landed; the browser fine-tuning panel and the QAT-interop paths have not
-(see "Staging" below). This note answers "how *could* we deliver quantization-aware training as an onnxsim
+(`apply_qat`, `apply_qat_all_blocks`), `onnxsim/qat_interop.py` and the
+converter page's calibration-provider picker have all landed; the browser
+fine-tuning panel (stage 3) has not (see "Staging" below). This note answers "how *could* we deliver quantization-aware training as an onnxsim
 feature, and can the training math run on WebGPU or an NPU?" and records the
 shape of the work so the question doesn't have to be re-derived. `docs/nncf-comparison-future-work.md`
 currently lists QAT as out of scope ("QAT needs a training loop with a
@@ -44,7 +44,7 @@ has never had. So split the feature there.
 
 ## Three deliverables, only two of which we should build
 
-### A. QAT interop (graph-only, no training)
+### A. QAT interop (graph-only, no training) -- built, see stage 4
 
 Consume and produce QAT artifacts without running any training:
 
@@ -232,17 +232,51 @@ Each stage is independently shippable and independently useful.
    round-to-nearest, so floor/ceil is all the freedom worth having there.
    Both directions are asserted in `tests/test_qat.py`.
 
+   The walk over blocks landed since: `discover_qat_blocks` plans the whole
+   model without the caller naming a tensor, and `apply_qat_all_blocks`
+   trains the plan in order. Boundary discovery is a liveness argument
+   rather than a pattern match -- cut wherever exactly one tensor is live
+   across a gap, since a slice bounded that way is self-contained -- so
+   residual connections *place* the boundaries instead of defeating them,
+   and a span containing an op `graph_grad` cannot differentiate becomes a
+   gap between blocks rather than a failure of the model. The walk is
+   sequential by default: each block's target is the teacher's output but
+   its input is recaptured from the student after the previous blocks were
+   tuned, which differs from what `adaround`/`brecq` do (capture once, never
+   re-run the student) and measured better on every seed tried (whole-model
+   output error on a 4-layer chain: 400.3 round-to-nearest, 206.2
+   capture-once, 168.1 sequential). Note that sequential's *per-block*
+   losses read higher, because a dirtier input is a harder reconstruction
+   problem -- the block-local loss is not the quantity that matters.
+
    Still open from this stage's original description: real data via
-   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, a
-   sliding window over blocks and a whole-graph pass, minibatching, and
-   activation quantization (adaquant has the learnable activation scale, it
-   is simply not wired in here).
+   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, an
+   end-to-end pass against the model's own output (a block is always the
+   unit of optimization), minibatching, and activation quantization
+   (adaquant has the learnable activation scale, it is simply not wired in
+   here).
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
    QAT with no server is something none of the comparable tools offer.
-4. **QAT interop (A).** Ingest externally-trained QDQ scales; emit the
-   fake-quant model for external trainers.
+4. **QAT interop (A) -- done.** `onnxsim/qat_interop.py`.
+   `quantize_static_keeping_qdq_scales` reads the parameters a QAT export
+   already carries, canonicalizes back to float only the pairs onnxsim can
+   re-emit, calibrates *only* the tensors with no usable annotation (a fully
+   annotated export needs no calibration data at all), and writes the
+   learned values back bit-exactly -- re-deriving a weight's integer codes
+   from its learned scale, since swapping the scale alone would change what
+   the weight dequantizes to. `export_fake_quant` closes the round trip,
+   naming the initializers a trainer should make learnable (returned, and
+   also stamped into `metadata_props`, since a round trip goes through a
+   saved file -- but non-load-bearing, because ingest re-derives everything
+   structurally). Refusal is a documented table and a refused pair is left
+   in the graph exactly as authored.
+
+   Why this matters more than it sounds: a learned scale is usually
+   deliberately *tighter* than the observed min/max, clipping outliers to
+   spend the codes where the values are. Re-deriving it, which is what
+   `quantize_static` would silently do, is a regression rather than a wash.
 
 ## Using what has landed
 
