@@ -23,6 +23,7 @@
 #include "passes/eliminate_optional_get_element.h"
 #include "passes/eliminate_optional_has_element.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
+#include "passes/eliminate_reshape_family_on_constant.h"
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
 #include "passes/fp6_llm.h"
@@ -137,6 +138,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateOptionalGetElement>(registry);
     RegisterOrReplace<p::EliminateOptionalHasElement>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
+    RegisterOrReplace<p::EliminateReshapeFamilyOnConstant>(registry);
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
     RegisterOrReplace<p::Fp6Llm>(registry);

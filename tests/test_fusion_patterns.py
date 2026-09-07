@@ -1347,3 +1347,180 @@ def test_fuse_layer_norm_skips_mismatched_scale_shape():
     )
     _, ops = _simplify(model)
     assert ops["LayerNormalization"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Reshape family applied to a constant: Reshape / Squeeze / Unsqueeze / Flatten
+# only rearrange a tensor's shape, so applying one to an initializer (or a
+# Constant node) is a pure metadata change and the node itself is redundant
+# (eliminate_reshape_family_on_constant). Constant folding removes these too,
+# so every test below runs with ``skip_constant_folding=True`` -- that is what
+# makes them test the pass rather than the folder.
+# --------------------------------------------------------------------------- #
+def _simplify_no_folding(model):
+    # Constant folding would remove a reshape-family node on a constant on its
+    # own (by executing it); disabling it isolates the pure-graph pass.
+    sim_model, check_ok = onnxsim.simplify(model, check_n=3, skip_constant_folding=True)
+    assert check_ok, "simplified model failed onnxsim's equivalence check"
+    return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
+
+
+def _initializer_dims(model, exclude=()):
+    return sorted(
+        tuple(init.dims) for init in model.graph.initializer if init.name not in exclude
+    )
+
+
+def test_eliminate_reshape_on_initializer():
+    # Reshape(W, {6,4}) on a [2,3,4] weight is just W with a different dims
+    # list: the node goes away and the weight is stored pre-reshaped.
+    W = np.random.randn(2, 3, 4)
+    model = _model(
+        """
+        g (float[6,4] X) => (float[6,4] Y)
+        <int64[2] s = {6,4}>
+        {
+          w = Reshape(W, s)
+          Y = Add(X, w)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    sim_model, ops = _simplify_no_folding(model)
+    assert ops["Reshape"] == 0
+    # The old [2,3,4] initializer is unused after the rewrite and dropped by
+    # eliminate_unused_initializer, so only the reshaped weight is left (`s`
+    # goes with the Reshape node that used it).
+    assert _initializer_dims(sim_model) == [(6, 4)]
+
+
+def test_eliminate_reshape_on_initializer_resolves_minus_one_and_zero():
+    # `-1` (infer from the element count) and, under the default allowzero=0,
+    # `0` (copy this dim from the data input) both resolve against the
+    # constant's own dims.
+    W = np.random.randn(2, 3, 4)
+    model = _model(
+        """
+        g (float[2,12] X) => (float[2,12] Y)
+        <int64[2] s = {0,-1}>
+        {
+          w = Reshape(W, s)
+          Y = Add(X, w)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    sim_model, ops = _simplify_no_folding(model)
+    assert ops["Reshape"] == 0
+    assert _initializer_dims(sim_model) == [(2, 12)]
+
+
+def test_eliminate_squeeze_unsqueeze_flatten_on_initializer():
+    # The rest of the family is handled the same way, all in one graph.
+    A = np.random.randn(1, 3, 4)
+    B = np.random.randn(3, 4)
+    C = np.random.randn(2, 3, 4)
+    model = _model(
+        """
+        g (float[3,4] X) => (float[3,4] Ya, float[1,3,4] Yb, float[2,12] Yc)
+        <int64[1] axes = {0}>
+        {
+          a = Squeeze(A, axes)
+          Ya = Add(X, a)
+          b = Unsqueeze(B, axes)
+          Yb = Add(a, b)
+          c = Flatten<axis = 1>(C)
+          Yc = Add(c, c)
+        }
+        """,
+        initializer=[_f32(A, "A"), _f32(B, "B"), _f32(C, "C")],
+    )
+    sim_model, ops = _simplify_no_folding(model)
+    assert ops["Squeeze"] == 0
+    assert ops["Unsqueeze"] == 0
+    assert ops["Flatten"] == 0
+    assert _initializer_dims(sim_model) == [(1, 3, 4), (2, 12), (3, 4)]
+
+
+def test_eliminate_reshape_on_constant_node_stays_a_constant():
+    # A Constant node's value is not graph weight data, so the rewrite keeps it
+    # a Constant node rather than promoting it to an initializer (the same
+    # provenance distinction onnxsim's constant folding maintains).
+    model = _model(
+        """
+        g (float[3,2] X) => (float[3,2] Y)
+        <int64[2] s = {3,2}>
+        {
+          c = Constant<value = float[2,3] {1.0, 2.0, 3.0, 4.0, 5.0, 6.0}>()
+          w = Reshape(c, s)
+          Y = Add(X, w)
+        }
+        """
+    )
+    sim_model, ops = _simplify_no_folding(model)
+    assert ops["Reshape"] == 0
+    assert ops["Constant"] == 1
+    assert not sim_model.graph.initializer
+    (constant,) = [n for n in sim_model.graph.node if n.op_type == "Constant"]
+    (value,) = [a.t for a in constant.attribute if a.name == "value"]
+    assert list(value.dims) == [3, 2]
+
+
+def test_eliminate_reshape_on_constant_declines_shared_weight():
+    # W feeds the Reshape *and* an Add, so rewriting it would leave a second
+    # copy of the weight in the graph next to the original. Not worth one node.
+    W = np.random.randn(2, 3)
+    model = _model(
+        """
+        g (float[2,3] X, float[3,2] Z) => (float[2,3] Ya, float[3,2] Yb)
+        <int64[2] s = {3,2}>
+        {
+          Ya = Add(X, W)
+          w = Reshape(W, s)
+          Yb = Add(Z, w)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    sim_model, ops = _simplify_no_folding(model)
+    assert ops["Reshape"] == 1
+    assert _initializer_dims(sim_model, exclude={"s"}) == [(2, 3)]
+
+
+def test_eliminate_reshape_on_constant_declines_non_constant_shape():
+    # The target shape is computed at runtime, so there is no static dims list
+    # to bake into the weight.
+    W = np.random.randn(2, 3)
+    model = _model(
+        """
+        g (float[3,2] X) => (float[3,2] Y)
+        {
+          s = Shape(X)
+          w = Reshape(W, s)
+          Y = Add(X, w)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    _, ops = _simplify_no_folding(model)
+    assert ops["Reshape"] == 1
+
+
+def test_eliminate_reshape_on_constant_declines_graph_output():
+    # Replacing the Reshape's output with the initializer would rename a value
+    # the graph itself hands back, changing the model's interface.
+    W = np.random.randn(2, 3)
+    model = _model(
+        """
+        g (float[2,3] X) => (float[2,3] Y, float[3,2] W_out)
+        <int64[2] s = {3,2}>
+        {
+          Y = Add(X, X)
+          W_out = Reshape(W, s)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    sim_model, ops = _simplify_no_folding(model)
+    assert ops["Reshape"] == 1
+    assert [o.name for o in sim_model.graph.output] == ["Y", "W_out"]

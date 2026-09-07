@@ -26,6 +26,7 @@ namespace onnxsim {
 //   - fuse_matmul_add_bias_into_gemm_batched
 //   - fuse_matmul_into_conv
 //   - eliminate_reshape_around_elementwise
+//   - eliminate_reshape_family_on_constant
 //   - fuse_rms_norm
 //   - fuse_rope
 //   - fuse_gelu
