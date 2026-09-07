@@ -4,4 +4,6 @@ onnxoptimizer >= 0.2.5
 # when it is not installed. See https://github.com/onnxsim/onnxsim/issues/441
 onnxruntime >= 1.6.0
 protobuf >= 3.7.0
+# rich is optional too; onnxsim._rich_compat falls back to plain-text tables
+# when it is not installed. Kept here so development/CI exercises the rich path.
 rich != 12.1.0

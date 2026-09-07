@@ -110,7 +110,8 @@ jobs:
           # X2Paddle 1.6.0 targets onnx<1.16 (onnx.mapping) and opset <= 15.
           # six and requests are undeclared x2paddle runtime deps that its
           # conversion path pulls in (x2paddle/core/program.py imports six and,
-          # via x2paddle.utils, requests); rich is an onnxsim runtime dep. All
+          # via x2paddle.utils, requests); rich is an optional onnxsim dep, kept
+          # here so the regression run exercises onnxsim's rich output path. All
           # are installed explicitly because the onnxsim wheel below goes in with
           # --no-deps. onnxslim is the comparison arm.
           python -m pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" \

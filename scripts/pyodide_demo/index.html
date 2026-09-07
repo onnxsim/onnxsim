@@ -308,6 +308,8 @@
   const ONNXSIM_PURE_PY_FILES = [
     "__init__.py",
     "__main__.py",
+    // The rich-optional print/Table/Text shim model_info.py imports.
+    "_rich_compat.py",
     "accuracy.py",
     "backend.py",
     "calibration.py",
@@ -359,7 +361,8 @@
 
   // Installs the real onnx PyPI package via micropip (works now that this
   // page's Pyodide version shares onnx's wheel's ABI epoch -- see the
-  // top-of-file comment), plus rich (a pure-Python onnxsim dependency), then
+  // top-of-file comment), plus rich (a pure-Python optional onnxsim dependency
+  // -- without it the reports fall back to plain-text tables), then
   // drops onnxsim's own pure-Python files into site-packages next to the
   // already-loaded onnxsim_cpp2py_export extension. Idempotent: safe to call
   // before every "full pipeline" run, only does real work once.

@@ -20,9 +20,8 @@ import numpy as np
 import onnx
 from onnx import defs, helper, numpy_helper, shape_inference
 from onnx.external_data_helper import ExternalDataInfo, uses_external_data
-from rich import print
-from rich.table import Table
-from rich.text import Text
+
+from onnxsim._rich_compat import Table, Text, print
 
 try:
     import sympy

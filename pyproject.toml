@@ -11,7 +11,6 @@ license = "MIT AND (Apache-2.0 OR BSD-2-Clause)"
 requires-python = ">=3.11"
 dependencies = [
     "onnx",
-    "rich",
 ]
 authors = [
     {name = "ONNX Simplifier Authors", email = "daquexian566@gmail.com"},
@@ -29,6 +28,12 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# rich is used only to pretty-print terminal reports (the original-vs-simplified
+# table, the memory plan, the graph diff, CLI warnings). Without it those fall
+# back to plain-text tables via onnxsim._rich_compat; nothing about the produced
+# model changes. The 12.1.0 exclusion matches requirements.txt's long-standing
+# pin of that known-bad release.
+rich = ["rich != 12.1.0"]
 # onnxruntime is preferred for constant folding and correctness checking.
 # When it is not installed, onnxsim falls back to onnx's reference evaluator.
 onnxruntime = ["onnxruntime >= 1.6.0"]

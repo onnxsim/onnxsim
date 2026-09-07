@@ -145,6 +145,16 @@ For more advanced features, try the following command for help message
 onnxsim -h
 ```
 
+`onnx` is the only required dependency. Everything else is an extra, installed
+only if you want it -- among them `rich`, which is used purely to colour and box
+the terminal reports (the original-vs-simplified table, the memory plan, the
+graph diff, CLI warnings). Without it those print as plain-text ASCII tables and
+the simplified models are byte-for-byte the same:
+
+```
+pip3 install "onnxsim[rich]"
+```
+
 ### Node.js version
 
 The same WebAssembly build backing the web version above is also published as
