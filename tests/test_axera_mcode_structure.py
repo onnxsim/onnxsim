@@ -2875,8 +2875,13 @@ def _tail_vector(mcode):
     input and one output. See the README's "The tail is the segment table"
     section."""
     u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
+    # The usual anchor is the convolution engine's channel-extent write (see
+    # the README's "The first operand with a known meaning" section). A graph
+    # with no convolution in it -- a lone LeakyRelu, Relu or Sigmoid -- never
+    # programs that register, so fall back to the end of the fixed header.
     first_verb = mcode.find(b"\xa1\x00\x40\x02")
-    assert first_verb > 0
+    if first_verb <= 0:
+        first_verb = 297
     for o in range(0, first_verb - 3, 4):
         t = o + u32(o)
         if not (first_verb < t < len(mcode) - 8):
@@ -3779,6 +3784,207 @@ def _build_vocoder(work_dir, **kwargs):
     assert result.success, result.error
     ((_, mcode),) = _mcodes_of(result.axmodel_path)
     return mcode
+
+
+def _elementwise_model(op, channels, length=64):
+    """A single elementwise op, shape-preserving, so its program can be
+    compared against a convolution's on equal footing."""
+    rng = np.random.RandomState(0)
+    inits = []
+    if op in ("Add", "Mul"):
+        inits.append(
+            numpy_helper.from_array(
+                rng.randn(1, channels, length).astype(np.float32), "b"
+            )
+        )
+        node = helper.make_node(op, ["x", "b"], ["y"])
+    elif op == "LeakyRelu":
+        node = helper.make_node(op, ["x"], ["y"], alpha=0.1)
+    else:
+        node = helper.make_node(op, ["x"], ["y"])
+    graph = helper.make_graph(
+        [node],
+        "elementwise",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, channels, length])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, channels, length])],
+        inits,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def _one_conv_model(cin, cout, length=64, kernel=3, dilation=1, op="Conv"):
+    """A single same-padded 1-D convolution, so the compiled program has
+    exactly one op and its operands are unambiguous."""
+    rng = np.random.RandomState(0)
+    shape = (cin, cout, kernel) if op == "ConvTranspose" else (cout, cin, kernel)
+    weight = numpy_helper.from_array((rng.randn(*shape) * 0.05).astype(np.float32), "w")
+    pad = dilation * (kernel - 1) // 2
+    node = helper.make_node(
+        op,
+        ["x", "w"],
+        ["y"],
+        name="conv",
+        kernel_shape=[kernel],
+        pads=[pad, pad],
+        dilations=[dilation],
+    )
+    graph = helper.make_graph(
+        [node],
+        "one_conv",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, cin, length])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, cout, length])],
+        [weight],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def _build_single_op(work_dir, tag, model):
+    """Compile a one-op model for real and return its mcode."""
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    cin = model.graph.input[0].type.tensor_type.shape.dim[1].dim_value
+    onnx.save(model, os.path.join(work_dir, f"{tag}.onnx"))
+    length = model.graph.input[0].type.tensor_type.shape.dim[2].dim_value
+    rng = np.random.RandomState(1)
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", f"{tag}.tar"),
+        [rng.randn(1, cin, length).astype(np.float32) for _ in range(4)],
+    )
+    with open(os.path.join(work_dir, "config", f"{tag}.json"), "w") as f:
+        json.dump(
+            {
+                "model_type": "ONNX",
+                "npu_mode": "NPU1",
+                "quant": {
+                    "input_configs": [
+                        {
+                            "tensor_name": "x",
+                            "calibration_dataset": f"./dataset/{tag}.tar",
+                            "calibration_format": "Numpy",
+                            "calibration_size": 4,
+                        }
+                    ],
+                    "calibration_method": "MinMax",
+                    "precision_analysis": False,
+                },
+                "compiler": {"check": 0},
+            },
+            f,
+        )
+    result = pulsar2_docker.build(
+        work_dir, f"{tag}.onnx", f"out_{tag}", config_path=f"config/{tag}.json"
+    )
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    return mcode
+
+
+def _operands(mcode, verb, field, bank):
+    """Every operand written by `verb` to `field`.`bank`, as integers."""
+    lo, hi = _stream_bounds(mcode)
+    out = []
+    for record in _decode_mcode(mcode, start=lo, end=hi, **_FULL_RULE):
+        if (
+            record["kind"] == "V"
+            and record["verb"] == verb
+            and record.get("field") == field
+            and record.get("bank") == bank
+        ):
+            operand = record.get("operand")
+            out.append(
+                int.from_bytes(operand, "little")
+                if isinstance(operand, (bytes, bytearray))
+                else operand
+            )
+    return out
+
+
+def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
+    """Confirmed real (see the README's "The first operand with a known
+    meaning" section): in a program holding exactly one convolution, the
+    leading `a1 40.02` operand is `8 * output channels - 1` -- an inclusive
+    bit extent over one output position, at 8 bits per INT8 channel.
+
+    The asymmetric cases are what make this an *output* channel reading
+    rather than an input one: 32->64 and 64->32 give opposite answers, and
+    each follows the output. This is the first operand field in the mcode
+    with a confirmed meaning, which is what a generator needs. Needs Docker,
+    no device.
+    """
+    for op in ("Conv", "ConvTranspose"):
+        for cin, cout in [(32, 64), (64, 32), (32, 16)]:
+            work = tmp_path / f"{op}_{cin}_{cout}"
+            work.mkdir()
+            model = _one_conv_model(cin, cout, op=op)
+            mcode = _build_single_op(str(work), "m", model)
+            values = _operands(mcode, 0xA1, 0x40, 0x02)
+            assert values, f"no 40.02 write in a single-{op} program"
+            assert values[0] == 8 * cout - 1, (op, cin, cout, values[:4])
+            # The reading is about channels alone: it must not follow the input.
+            if cin != cout:
+                assert values[0] != 8 * cin - 1, (op, cin, cout, values[0])
+
+
+def test_the_channel_operand_belongs_to_the_convolution_engine(tmp_path):
+    """Confirmed real: `40.02` is a convolution-engine register, not a
+    general "output channels" field. A lone `Relu`, `LeakyRelu` or `Sigmoid`
+    never writes it at all, and `Add`/`Mul` write it with something that is
+    not `8C-1`, while `Conv` and `ConvTranspose` both write `8C-1`.
+
+    That presence-or-absence is a concrete instance of the README's claim
+    that op type lives in operand values rather than in different
+    instructions: these programs are built from the same verbs and tags, and
+    what separates a convolution from an elementwise op is which registers
+    the program bothers to set. Needs Docker, no device.
+    """
+    channels = 32
+    for op in ("Relu", "LeakyRelu", "Sigmoid"):
+        work = tmp_path / op
+        work.mkdir()
+        mcode = _build_single_op(str(work), "m", _elementwise_model(op, channels))
+        assert _operands(mcode, 0xA1, 0x40, 0x02) == [], op
+        # The stream is real and complete even so -- it just never programs
+        # that register.
+        lo, hi = _stream_bounds(mcode)
+        records = _decode_mcode(mcode, start=lo, end=hi, **_FULL_RULE)
+        assert _encode_mcode(records) == mcode[lo:hi], op
+        assert {r["verb"] for r in records if r["kind"] == "V"} <= _VERBS6, op
+
+    for op in ("Add", "Mul"):
+        work = tmp_path / op
+        work.mkdir()
+        mcode = _build_single_op(str(work), "m", _elementwise_model(op, channels))
+        values = _operands(mcode, 0xA1, 0x40, 0x02)
+        assert 8 * channels - 1 not in values, (op, values)
+
+
+def test_single_conv_channel_operand_ignores_length_kernel_and_dilation(tmp_path):
+    """Confirmed real: the same `a1 40.02` operand is unmoved by the input
+    length, the kernel size and the dilation -- it tracks the output channel
+    count and nothing else. That negative is what rules out reading it as a
+    buffer size or a weight-table offset, both of which move when the kernel
+    or the length does. Needs Docker, no device.
+    """
+    variants = {
+        "base": {},
+        "long": {"length": 128},
+        "k7": {"kernel": 7},
+        "d4": {"dilation": 4},
+    }
+    seen = {}
+    for tag, kwargs in variants.items():
+        work = tmp_path / tag
+        work.mkdir()
+        model = _one_conv_model(32, 32, **kwargs)
+        mcode = _build_single_op(str(work), "m", model)
+        seen[tag] = _operands(mcode, 0xA1, 0x40, 0x02)[0]
+    assert set(seen.values()) == {8 * 32 - 1}, seen
 
 
 _PIPER_REPO = "rhasspy/piper-voices"
