@@ -3556,6 +3556,83 @@ Tests: `test_single_conv_program_encodes_its_output_channel_count`,
 `test_the_channel_operand_belongs_to_the_convolution_engine` in
 `tests/test_axera_mcode_structure.py` (fresh builds, no device).
 
+### Generating a weight table: the first piece we can produce ourselves
+
+Counting bytes says where the work is. On the Piper decoder the weight table
+is **26x** the size of the instruction stream -- 2.1 MB against 81 KB -- so
+generating an `.axmodel` is mostly a weight-table problem, not an instruction
+problem. This is the first part of a compiled model we can write ourselves
+and have the device execute correctly.
+
+**The instrument, again: make only one thing move.** Compile a convolution
+whose weights are all zero, then compile the same convolution with a *single*
+non-zero weight at a known `(o, i, k)`, and see which byte changes. Repeated
+over nine positions this gives the addressing exactly rather than by fitting.
+
+**The layout.** Weights live in the `npu_params` initializer at
+
+    offset(o, i, k) = 72*o + (Cin/2)*k + i//2,   nibble = i % 2
+
+with a *second* plane 36 bytes further on. Predictions from the first few
+positions land exactly: `(3,5,1)` at byte 222 and `(7,7,2)` at byte 515.
+Two input channels share a byte, which is what first looked like 4-bit
+weights.
+
+**They are not 4-bit.** Combining the planes as `high*16 + low` gives INT8
+with zero point 128, and the arithmetic closes exactly:
+
+| weight | low, high | byte | 128 + w/scale |
+| --- | --- | --- | --- |
+| +0.5 | 15, 15 | 255 | 128 + 127 |
+| -0.5 | 1, 0 | 1 | 128 - 127 |
+| +0.25 | 0, 12 | 192 | 128 + 63.5 |
+| -0.125 | 0, 6 | 96 | 128 - 31.75 |
+| 0.0 | 0, 8 | 128 | 128 |
+
+So a weight byte is split across two nibble planes: the low nibble at the
+offset above, the high nibble 36 bytes later.
+
+**The scale is stored, and should be read rather than derived.** A float32
+per output channel sits near the end of the table, exactly proportional to
+that channel's peak magnitude. The effective slope is close to `127.5 /
+max|w|` but not exactly -- it ranges over 127.27 to 127.76 across channels --
+so it is the compiler's choice, not a formula to rederive. Recovering it by
+least squares from a compiled reference reproduces pulsar2's own codes for
+97.4% of the weights, and the residue is +/-1 rounding.
+
+**Confirmed on the device: we can rewrite a model's weights.** Taking a
+compiled convolution and replacing its weights by hand -- no vendor compiler
+anywhere in the loop -- the NPU then computes the *new* convolution:
+
+| run | vs CPU reference | correlation |
+| --- | --- | --- |
+| pulsar2's own build | its own weights | 0.99992 |
+| our patched table | the **new** weights | 0.99987 |
+| our patched table | the old weights | 0.319 |
+| pulsar2's own build | the new weights | 0.320 |
+
+The two cross-controls are the point. The patched model stops matching the
+old weights and the untouched model does not match the new ones, so the
+function really moved, and it moved to within a hair of what the vendor
+compiler achieves on the same problem.
+
+**Two limits, both real.** The new weights here are a permutation of the old
+along the input-channel axis, chosen because it leaves every output channel's
+peak magnitude untouched. That matters: the stored scale absorbs the
+activation scales too, and those are calibrated from the weights, so changing
+a channel's dynamic range invalidates the scale the table already holds.
+Rewriting weights freely needs the scale rewritten with them.
+
+And the addressing is confirmed for `Cin` up to 16, not beyond. The plane is
+36 bytes and a channel's weights occupy `(Cin/2)*K` of it, which fits at
+`Cin = 16, K = 3` (24 bytes) and overflows at `Cin = 32` (48). A search over
+strides finds no simple affine layout for 32 or 64 channels, so larger
+convolutions must tile, and how they tile is open.
+
+Tests: `test_conv_weights_are_int8_split_across_two_nibble_planes` (Docker)
+and `test_conv_weights_can_be_rewritten_without_pulsar2` (Docker and device)
+in `tests/test_axera_mcode_structure.py`.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

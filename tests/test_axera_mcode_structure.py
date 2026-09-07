@@ -3815,12 +3815,15 @@ def _elementwise_model(op, channels, length=64):
     return model
 
 
-def _one_conv_model(cin, cout, length=64, kernel=3, dilation=1, op="Conv"):
+def _one_conv_model(
+    cin, cout, length=64, kernel=3, dilation=1, op="Conv", weights=None
+):
     """A single same-padded 1-D convolution, so the compiled program has
     exactly one op and its operands are unambiguous."""
     rng = np.random.RandomState(0)
     shape = (cin, cout, kernel) if op == "ConvTranspose" else (cout, cin, kernel)
-    weight = numpy_helper.from_array((rng.randn(*shape) * 0.05).astype(np.float32), "w")
+    values = (rng.randn(*shape) * 0.05) if weights is None else weights
+    weight = numpy_helper.from_array(np.asarray(values, dtype=np.float32), "w")
     pad = dilation * (kernel - 1) // 2
     node = helper.make_node(
         op,
@@ -3846,6 +3849,12 @@ def _one_conv_model(cin, cout, length=64, kernel=3, dilation=1, op="Conv"):
 
 def _build_single_op(work_dir, tag, model):
     """Compile a one-op model for real and return its mcode."""
+    ((_, mcode),) = _mcodes_of(_build_single_op_axmodel(work_dir, tag, model))
+    return mcode
+
+
+def _build_single_op_axmodel(work_dir, tag, model):
+    """Compile a one-op model for real and return the `.axmodel` path."""
     os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
     os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
     cin = model.graph.input[0].type.tensor_type.shape.dim[1].dim_value
@@ -3881,8 +3890,7 @@ def _build_single_op(work_dir, tag, model):
         work_dir, f"{tag}.onnx", f"out_{tag}", config_path=f"config/{tag}.json"
     )
     assert result.success, result.error
-    ((_, mcode),) = _mcodes_of(result.axmodel_path)
-    return mcode
+    return result.axmodel_path
 
 
 def _operands(mcode, verb, field, bank):
@@ -3903,6 +3911,184 @@ def _operands(mcode, verb, field, bank):
                 else operand
             )
     return out
+
+
+# The weight table's layout for a convolution, confirmed by placing a single
+# non-zero weight at known positions and seeing which byte moved. See the
+# README's "Generating a weight table" section. `k_stride` is `cin // 2`;
+# these two are fixed for the channel counts this was confirmed at.
+_WBT_O_STRIDE = 72
+_WBT_PLANE_GAP = 36
+
+
+def _wbt_of(axmodel_path):
+    """The `npu_params` weight table of a compiled model."""
+    model = onnx.load(axmodel_path)
+    return bytes(
+        next(i for i in model.graph.initializer if i.name == "npu_params").raw_data
+    )
+
+
+def _weight_offset(o, i, k, cin):
+    """`(byte offset, nibble shift)` of weight `(o, i, k)`'s low-nibble plane.
+    The high nibble lives `_WBT_PLANE_GAP` bytes further on."""
+    return _WBT_O_STRIDE * o + (cin // 2) * k + i // 2, (4 if i % 2 else 0)
+
+
+def _read_weight_codes(wbt, shape):
+    """The INT8 codes (zero point 128) a weight table holds, as `shape`."""
+    cout, cin, kernel = shape
+    codes = np.zeros(shape, dtype=int)
+    for o in range(cout):
+        for i in range(cin):
+            for k in range(kernel):
+                off, sh = _weight_offset(o, i, k, cin)
+                lo = (wbt[off] >> sh) & 0xF
+                hi = (wbt[off + _WBT_PLANE_GAP] >> sh) & 0xF
+                codes[o, i, k] = (hi << 4) | lo
+    return codes
+
+
+def _write_weight_codes(wbt, codes):
+    """`wbt` with the convolution's weight codes replaced."""
+    out = bytearray(wbt)
+    cout, cin, kernel = codes.shape
+    for o in range(cout):
+        for i in range(cin):
+            for k in range(kernel):
+                off, sh = _weight_offset(o, i, k, cin)
+                value = int(codes[o, i, k]) & 0xFF
+                out[off] = (out[off] & ~(0xF << sh) & 0xFF) | ((value & 0xF) << sh)
+                high = off + _WBT_PLANE_GAP
+                out[high] = (out[high] & ~(0xF << sh) & 0xFF) | (
+                    ((value >> 4) & 0xF) << sh
+                )
+    return bytes(out)
+
+
+def _effective_slopes(weights, codes):
+    """Pulsar2's own per-output-channel slope (the reciprocal of the weight
+    scale), recovered by least squares from a compiled reference. Reading it
+    back beats deriving it: the scale is close to `127.5 / max|w|` but not
+    exactly, and it is the compiler's choice, not ours."""
+    slopes = np.zeros(weights.shape[0])
+    for o in range(weights.shape[0]):
+        w = weights[o].reshape(-1).astype(float)
+        q = codes[o].reshape(-1).astype(float) - 128
+        nz = np.abs(w) > 0
+        slopes[o] = np.sum(w[nz] * q[nz]) / np.sum(w[nz] ** 2)
+    return slopes
+
+
+def test_conv_weights_are_int8_split_across_two_nibble_planes(tmp_path):
+    """Confirmed real (see the README's "Generating a weight table"
+    section): a convolution's weights live in `npu_params` as INT8 with zero
+    point 128, each byte split across *two* nibble planes 36 bytes apart,
+    with two input channels sharing a byte.
+
+    The single-non-zero-weight builds are what make the addressing exact
+    rather than fitted: a lone weight at `(o, i, k)` moves exactly the byte
+    `_weight_offset()` predicts, in the nibble `i % 2` selects. Needs Docker,
+    no device.
+    """
+    cin = cout = 8
+    kernel, length = 3, 32
+    zero = tmp_path / "zero"
+    zero.mkdir()
+    base = _wbt_of(
+        _build_single_op_axmodel(
+            str(zero),
+            "m",
+            _one_conv_model(
+                cin, cout, length, kernel, weights=np.zeros((cout, cin, kernel))
+            ),
+        )
+    )
+    for o, i, k in [(0, 0, 0), (0, 1, 0), (0, 2, 0), (0, 0, 1), (3, 5, 1), (7, 7, 2)]:
+        w = np.zeros((cout, cin, kernel))
+        w[o, i, k] = 0.5
+        work = tmp_path / f"s{o}{i}{k}"
+        work.mkdir()
+        spike = _wbt_of(
+            _build_single_op_axmodel(
+                str(work), "m", _one_conv_model(cin, cout, length, kernel, weights=w)
+            )
+        )
+        moved = [j for j in range(min(len(base), len(spike))) if base[j] != spike[j]]
+        low, shift = _weight_offset(o, i, k, cin)
+        assert low in moved, (o, i, k, low, moved[:8])
+        assert low + _WBT_PLANE_GAP in moved, (o, i, k, moved[:8])
+        # A weight at full scale saturates its nibble in both planes.
+        assert (spike[low] >> shift) & 0xF == 0xF, (o, i, k, spike[low])
+
+
+def test_conv_weights_can_be_rewritten_without_pulsar2(tmp_path):
+    """Confirmed on the AX650N: a compiled model's convolution weights can be
+    replaced by hand -- no vendor compiler -- and the device then computes
+    the *new* convolution at the same accuracy pulsar2's own build achieves.
+
+    The new weights are a permutation of the old along the input-channel
+    axis, which leaves every output channel's peak magnitude untouched, so
+    pulsar2's own weight and activation scales stay valid and only the weight
+    bytes need rewriting. The two cross-controls are what make this a real
+    result: the patched model must *stop* matching the old weights, and the
+    untouched model must not match the new ones. Needs Docker and a device.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device")
+    ort = pytest.importorskip("onnxruntime")
+    cin = cout = 8
+    kernel, length = 3, 32
+    rng = np.random.RandomState(0)
+    w_old = (rng.randn(cout, cin, kernel) * 0.1).astype(np.float32)
+    w_new = w_old[:, rng.permutation(cin), :].copy()
+    assert np.allclose(
+        np.abs(w_old).max(axis=(1, 2)), np.abs(w_new).max(axis=(1, 2))
+    ), "the permutation must preserve every channel's peak"
+
+    work = tmp_path / "work"
+    work.mkdir()
+    model = _one_conv_model(cin, cout, length, kernel, weights=w_old)
+    axmodel = _build_single_op_axmodel(str(work), "m", model)
+
+    compiled = onnx.load(axmodel)
+    init = next(i for i in compiled.graph.initializer if i.name == "npu_params")
+    codes = _read_weight_codes(bytes(init.raw_data), w_old.shape)
+    slopes = _effective_slopes(w_old.astype(float), codes)
+    retargeted = np.clip(
+        np.round(w_new.astype(float) * slopes[:, None, None]) + 128, 0, 255
+    ).astype(int)
+    init.raw_data = _write_weight_codes(bytes(init.raw_data), retargeted)
+    patched = str(work / "patched.axmodel")
+    onnx.save(compiled, patched)
+
+    x = rng.randn(1, cin, length).astype(np.float32)
+
+    def reference(weights):
+        ref = _one_conv_model(cin, cout, length, kernel, weights=weights)
+        path = str(work / "ref.onnx")
+        onnx.save(ref, path)
+        session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        return np.asarray(session.run(None, {"x": x})[0]).ravel()
+
+    def on_device(path):
+        result = pulsar2_docker.run_on_device_with_inputs(
+            path, {"x": x.tobytes()}, timeout=300
+        )
+        assert not result.error, result.error
+        return np.frombuffer(result.outputs[0], dtype=np.float32).ravel()
+
+    ref_old, ref_new = reference(w_old), reference(w_new)
+    npu_old, npu_new = on_device(axmodel), on_device(patched)
+    corr = lambda a, b: float(np.corrcoef(a, b)[0, 1])  # noqa: E731
+
+    # The patched model computes the new convolution as well as pulsar2's own
+    # build computes the old one.
+    assert corr(npu_old, ref_old) > 0.99, corr(npu_old, ref_old)
+    assert corr(npu_new, ref_new) > 0.99, corr(npu_new, ref_new)
+    # ... and the cross-controls say the function really moved.
+    assert corr(npu_new, ref_old) < 0.9, corr(npu_new, ref_old)
+    assert corr(npu_old, ref_new) < 0.9, corr(npu_old, ref_new)
 
 
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
