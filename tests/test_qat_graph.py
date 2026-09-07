@@ -17,7 +17,7 @@ import onnx
 import pytest
 
 import onnxsim
-from onnxsim import adaround, qat_graph
+from onnxsim import adaround, backend, qat_graph
 
 ort = pytest.importorskip("onnxruntime")
 
@@ -292,3 +292,230 @@ def test_apply_adaround_step_providers_are_validated():
             num_iterations=5,
             step_providers=["NoSuchExecutionProvider"],
         )
+
+
+# --- Device-resident state (``bind_state``) ----------------------------------
+#
+# ``run_step_graph`` keeps the constants and the state on the execution
+# provider's device between steps, through onnxruntime's ``IOBinding``
+# (``onnxsim.backend.Runner.bind_loop``). That is an optimization, so the tests
+# below are about it changing *nothing*: the same numbers as the feed-per-step
+# path, no corruption from onnxruntime reusing a bound buffer, and a clean
+# fallback whenever the binding cannot be set up or cannot run.
+
+
+def _linear_fit_case(seed, rows=48, k=8, n=6):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((rows, k))
+    y = x @ rng.standard_normal((n, k)).T
+    return x, y, np.zeros((n, k))
+
+
+def test_bound_and_unbound_loops_agree():
+    """The whole contract of ``bind_state``: it moves tensors, not numbers.
+
+    Exact equality, not a tolerance -- same graph, same provider, same values,
+    only a different way of handing onnxruntime the buffers -- so any
+    divergence here is a real bug rather than float noise.
+    """
+    x, y, zeros = _linear_fit_case(20)
+    step = _linear_fit_step_graph(x.shape[0], x.shape[1], y.shape[1])
+
+    bound_losses: list = []
+    unbound_losses: list = []
+    bound = _run_linear_fit(step, x, y, num_steps=150, losses=bound_losses)
+    unbound = qat_graph.run_step_graph(
+        step,
+        constants={"x": x, "y": y},
+        state={"w": zeros, "m": zeros, "vv": zeros},
+        num_steps=150,
+        scalars=lambda t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+        losses=unbound_losses,
+        bind_state=False,
+    )
+
+    for name in ("w", "m", "vv"):
+        np.testing.assert_array_equal(bound[name], unbound[name])
+    assert bound_losses == unbound_losses
+    assert len(bound_losses) == 150
+
+
+def test_bound_state_is_not_corrupted_by_buffer_reuse():
+    """onnxruntime may hand a bound output buffer back on the next run, so a
+    loop that fed a step's output straight back in as the next step's input --
+    while binding that same buffer as an output again -- could read values a
+    kernel is concurrently overwriting. ``BoundStepLoop`` double-buffers to
+    make each run's reads and writes disjoint.
+
+    The check: one bound loop of twelve chained steps against twelve one-step
+    bound loops. Every one-step loop allocates its own binding and its own
+    buffers, so no buffer can possibly survive from one step into the next
+    there; if reuse were corrupting the chained loop, the two would drift
+    apart. They agree exactly instead.
+    """
+    x, y, zeros = _linear_fit_case(21)
+    step = _linear_fit_step_graph(x.shape[0], x.shape[1], y.shape[1])
+
+    chained = _run_linear_fit(step, x, y, num_steps=12)
+
+    fresh = {"w": zeros, "m": zeros, "vv": zeros}
+    for t in range(12):
+        fresh = qat_graph.run_step_graph(
+            step,
+            constants={"x": x, "y": y},
+            state=fresh,
+            num_steps=1,
+            scalars=lambda _, t=t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+        )
+
+    for name in ("w", "m", "vv"):
+        np.testing.assert_array_equal(chained[name], fresh[name])
+
+
+def test_bound_loop_leaves_the_callers_arrays_alone():
+    """The state arrays a caller passes in are inputs, not scratch space.
+
+    Worth its own test because onnxruntime's CPU ``OrtValue`` wraps the numpy
+    buffer it is given rather than copying it, so binding a caller's array
+    directly as one half of the ping-pong pair would quietly turn the caller's
+    initial state into the loop's working memory.
+    """
+    x, y, _ = _linear_fit_case(22)
+    step = _linear_fit_step_graph(x.shape[0], x.shape[1], y.shape[1])
+    start = {
+        name: np.full((y.shape[1], x.shape[1]), 0.25, dtype=np.float32)
+        for name in ("w", "m", "vv")
+    }
+    before = {name: value.copy() for name, value in start.items()}
+
+    final = qat_graph.run_step_graph(
+        step,
+        constants={"x": x, "y": y},
+        state=start,
+        num_steps=8,
+        scalars=lambda t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+    )
+
+    for name, value in before.items():
+        np.testing.assert_array_equal(start[name], value)
+    assert not np.array_equal(final["w"], before["w"])
+
+
+def test_bound_loop_falls_back_when_a_bound_run_fails(monkeypatch):
+    """A provider that accepts a binding and then refuses to run against it --
+    an onnxruntime build without ``IOBinding`` support for that EP -- must land
+    the caller on the feed-per-step path, with the right answer and exactly one
+    loss per step rather than a half-written list from the abandoned attempt.
+    """
+    x, y, zeros = _linear_fit_case(23)
+    step = _linear_fit_step_graph(x.shape[0], x.shape[1], y.shape[1])
+    reference_losses: list = []
+    reference = qat_graph.run_step_graph(
+        step,
+        constants={"x": x, "y": y},
+        state={"w": zeros, "m": zeros, "vv": zeros},
+        num_steps=40,
+        scalars=lambda t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+        losses=reference_losses,
+        bind_state=False,
+    )
+
+    attempts = []
+
+    def refuse(self, iobinding, run_options=None):
+        attempts.append(iobinding)
+        raise RuntimeError("this provider has no IOBinding support")
+
+    monkeypatch.setattr(ort.InferenceSession, "run_with_iobinding", refuse)
+
+    losses: list = []
+    final = _run_linear_fit(step, x, y, num_steps=40, losses=losses)
+
+    # The binding was really tried -- which is also this file's evidence that
+    # the default path through ``run_step_graph`` is the bound one.
+    assert len(attempts) == 1
+    for name in ("w", "m", "vv"):
+        np.testing.assert_array_equal(final[name], reference[name])
+    assert losses == reference_losses
+
+
+def test_bind_state_falls_back_to_the_reference_evaluator(monkeypatch):
+    """Without onnxruntime there is no binding and no device to bind to, and
+    ``bind_state=True`` still has to run -- through onnx's reference evaluator,
+    which is what the whole backend degrades to (onnxsim/onnxsim#441)."""
+    x, y, zeros = _linear_fit_case(24, rows=16, k=4, n=3)
+    step = _linear_fit_step_graph(x.shape[0], x.shape[1], y.shape[1])
+    reference = _run_linear_fit(step, x, y, num_steps=30)
+
+    monkeypatch.setattr(backend, "_HAS_ONNXRUNTIME", False)
+    assert backend.Runner(step.model).bind_loop({}, {}) is None
+
+    final = _run_linear_fit(step, x, y, num_steps=30)
+    for name in ("w", "m", "vv"):
+        # Both compute in float32; the two implementations' arithmetic differs
+        # in the last bits, and 30 Adam steps amplify that a little.
+        np.testing.assert_allclose(final[name], reference[name], rtol=0, atol=1e-5)
+
+
+def test_bind_loop_declines_an_output_it_cannot_preallocate():
+    """A bound output needs its buffer before the run that fills it, so a
+    dynamic output shape is not bindable. ``bind_loop`` says so by returning
+    ``None`` -- the caller's cue to run the ordinary way -- instead of raising.
+    """
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["": 17]>
+        g (float[N,2] s) => (float[N,2] out) {
+          out = Add(s, s)
+        }
+        """
+    )
+    runner = backend.Runner(model)
+    state = {"s": ("out", np.ones((3, 2), dtype=np.float32))}
+    assert runner.bind_loop({}, state) is None
+    # ... and the unbound call it falls back to still works.
+    np.testing.assert_array_equal(
+        runner({"s": np.ones((3, 2), dtype=np.float32)})["out"],
+        np.full((3, 2), 2.0, dtype=np.float32),
+    )
+
+
+def test_bind_loop_declines_a_state_output_of_a_different_shape():
+    """State threading requires the output to be shaped like the input it feeds
+    back into. A graph that reshapes its state is not one this loop can carry,
+    and saying so up front beats discovering it as a binding error mid-loop."""
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["": 17]>
+        g (float[2,3] s) => (float[3,2] out) {
+          out = Transpose<perm = [1, 0]>(s)
+        }
+        """
+    )
+    runner = backend.Runner(model)
+    assert (
+        runner.bind_loop({}, {"s": ("out", np.ones((2, 3), dtype=np.float32))}) is None
+    )
+
+
+def test_runner_call_still_returns_an_ordered_dict():
+    """``Runner.__call__`` is the interface constant folding and the other
+    callers use; the binding path is additive and must not have touched it."""
+    x, y, _ = _linear_fit_case(25, rows=8, k=3, n=2)
+    step = _linear_fit_step_graph(x.shape[0], x.shape[1], y.shape[1])
+    zeros = np.zeros((y.shape[1], x.shape[1]), dtype=np.float32)
+    runner = backend.Runner(step.model, output_names=[step.state["w"]])
+    out = runner(
+        {
+            "x": x.astype(np.float32),
+            "y": y.astype(np.float32),
+            "w": zeros,
+            "m": zeros,
+            "vv": zeros,
+            "lr": np.asarray(0.1, dtype=np.float32),
+            "m_correction": np.asarray(10.0, dtype=np.float32),
+            "v_correction": np.asarray(1000.0, dtype=np.float32),
+        }
+    )
+    assert list(out) == [step.state["w"]]
+    assert out[step.state["w"]].shape == zeros.shape
