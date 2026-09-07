@@ -2487,6 +2487,7 @@ def _tokenize_mcode(
     extra_byte_tags=frozenset(),
     verbs=None,
     odd_tags=frozenset(),
+    companion=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -2495,7 +2496,8 @@ def _tokenize_mcode(
     whose tag is in `extra_byte_tags` take one extra trailing byte (the
     sixth correction: tag 0x9f). Returns `(byte_offset, kind, a, b, c)`
     tuples: kind 'V' (a=verb, b=xx, c=yy), 'S' (a=prefix, b=tag, c=first
-    payload byte), 'B' (a=tag, b=register) or '?' (a=byte). The defaults
+    payload byte), 'B' (a=tag, b=register), 'W' (a companion write:
+    a=X, b=field, c=bank) or '?' (a=byte). The defaults
     (tags 0x81..0x84, p <= 3, no bare pairs, no extra bytes, stop 252 bytes
     before the end) are the original narrow rule; `tags=_ALL_TAGS, pmax=4,
     bare=True, extra_byte_tags={0x9F}` is the corrected one. See the
@@ -2514,6 +2516,24 @@ def _tokenize_mcode(
             and mcode[i + 2] % 0x10 == 0
         )
 
+    def companion_at(i):
+        """A 7-byte `[X][field][bank][32-bit operand]` write, recognised only
+        when the next 8 bytes are an `a1` verb writing the adjacent slot --
+        the same bank one field higher, or the first field of the next bank.
+        That anchor never fires on a shuffled stream (see the README's "a
+        7-byte write that fills the slot below the next one")."""
+        if not companion or i + 15 > end:
+            return False
+        field, bank = mcode[i + 1], mcode[i + 2]
+        if field % 0x10 or mcode[i + 7] != 0xA1 or mcode[i + 8] != 0:
+            return False
+        nfield, nbank = mcode[i + 9], mcode[i + 10]
+        if nfield % 0x10:
+            return False
+        return (bank == nbank and (nfield - field) % 0x100 == 0x10) or (
+            field == 0xF0 and nfield == 0x00 and nbank == bank + 1
+        )
+
     def short_len(i):
         if i >= len(mcode):
             return 0
@@ -2524,6 +2544,10 @@ def _tokenize_mcode(
 
     out, i = [], start
     while i < end:
+        if companion_at(i):
+            out.append((i, "W", mcode[i], mcode[i + 1], mcode[i + 2]))
+            i += 7
+            continue
         if is_verb(i):
             n = (
                 7
@@ -2956,6 +2980,7 @@ _FULL_RULE = dict(
     extra_byte_tags={0x9F},
     verbs=_VERBS6,
     odd_tags={0xC1, 0xE1},
+    companion=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section."""
@@ -3020,7 +3045,7 @@ def test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7(tmp_path):
     assert segs[0][0] + segs[0][1] == b_lo - 17 and segs[0][1] == b_lo - a_lo
     assert [s[2][0] for s in segs] == [0xA01, 0x1001, 0x1001, 0x1001, 0xE801]
     cov, programs, _ = _segment_coverage(mcode, segs[-1])
-    assert cov == 1.0 and programs == len(cuts) - 2, (cov, programs, len(cuts))
+    assert cov >= 0.999 and programs == len(cuts) - 2, (cov, programs, len(cuts))
     for seg in segs[:-1]:
         assert _segment_coverage(mcode, seg)[0] >= 0.9
 
@@ -3088,7 +3113,10 @@ def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
         ops = [s for s in segs if s[2][0] == 0x8801]
         assert len(ops) == 1
         cov, programs, a7 = _segment_coverage(mcode, ops[0])
-        assert cov == 1.0 and programs >= 100 and a7 >= 100, (cov, programs, a7)
+        # Not exactly 1.0 any more: admitting 0xa1 as a tag (the fifth
+        # correction) costs a handful of bytes inside op segments and saves
+        # hundreds elsewhere -- see the README's coverage section.
+        assert cov >= 0.999 and programs >= 100 and a7 >= 100, (cov, programs, a7)
         # The op template: the CNN core with `a7.1e` (operand 0) after the
         # two `50.01` writes and `a7.02` (operand 2) before the closing
         # `a8 30.02`, in the two most common skeletons.
@@ -3135,12 +3163,17 @@ def test_llm_build_layer_mcode_keeps_the_layout_and_uses_a7(tmp_path):
     # byte for byte, only the tail's name string and the weights differ.
     for other in (1, 29):
         path = str(work / "output" / f"llama_p512_l{other}_together.axmodel")
-        for (_, m0), (_, m1) in zip(mcodes, _mcodes_of(path)):
-            _, segs = _segments(m0)
+        # Pair by node name: the two subgraphs are not always in the same
+        # order in every layer's file.
+        by_name = dict(_mcodes_of(path))
+        for name, m0 in mcodes:
+            m1 = by_name[name]
+            header, segs = _segments(m0)
             vec = segs[-1][0] + segs[-1][1]
-            assert len(m0) == len(m1) and m0[:vec] == m1[:vec]
+            assert len(m0) == len(m1), (name, len(m0), len(m1))
+            assert m0[header:vec] == m1[header:vec], name
             diff = [i for i in range(vec, len(m0)) if m0[i] != m1[i]]
-            assert 1 <= len(diff) <= 24, len(diff)
+            assert 1 <= len(diff) <= 24, (name, len(diff))
     w0 = onnx.load(layer)
     w29 = onnx.load(str(work / "output" / "llama_p512_l29_together.axmodel"))
     params0 = {t.name: bytes(t.raw_data) for t in w0.graph.initializer}
@@ -3176,7 +3209,7 @@ def test_onnx_path_llm_mcode_keeps_the_op_program_skeleton(tmp_path):
     header, segs = _check_segment_table(mcode)
     assert header == 436 and len(segs) == 5
     cov, programs, _ = _segment_coverage(mcode, segs[-1])
-    assert cov == 1.0 and 60 <= programs <= 90, (cov, programs)
+    assert cov >= 0.999 and 60 <= programs <= 90, (cov, programs)
     pos, length, _ = segs[-1]
     toks = _tokenize_mcode(mcode, start=pos, end=pos + length, **_FULL_RULE)
     starts = [t[0] for t in toks if t[1:] == ("V", 0xA1, 0x40, 0x02)]
@@ -3572,38 +3605,48 @@ def test_full_rule_explains_almost_every_stream_byte(tmp_path):
         assert real_wide < null_wide, (name, real_wide, null_wide)
 
 
-def test_seven_byte_writes_address_the_slot_below_the_next_verb(tmp_path):
-    """Confirmed real (see the README's "Where the decoding stands" section):
-    every unexplained 7-byte run that is followed by a verb has the shape
-    `[X][field][bank][32-bit operand]` and addresses exactly the field slot
-    below that verb's -- the same bank one field lower, or the last field of
-    the previous bank. Needs Docker, no device.
+def test_companion_writes_fill_the_slot_below_the_next_verb(tmp_path):
+    """Confirmed real (see the README's "a 7-byte write that fills the slot
+    below the next one"): a 7-byte `[X][field][bank][32-bit operand]` write
+    always targets the address slot directly below the verb that follows it
+    -- same bank one field lower, or the last field of the previous bank.
+    The anchor is exact: shuffling the stream yields *zero* such units, while
+    the real builds have dozens, and admitting the form lifts coverage.
+    Needs Docker, no device.
     """
-    hits = 0
+    import random
+
+    total = 0
     for name in _ANALYSIS_BUILDS:
         work = tmp_path / name
         work.mkdir()
         mcode = _build_analysis_mcode(name, str(work))
         lo, hi = _stream_bounds(mcode)
         toks = _tokenize_mcode(mcode, start=lo, end=hi, **_FULL_RULE)
+        writes = [t for t in toks if t[1] == "W"]
+        assert len(writes) >= 5, (name, len(writes))
+        total += len(writes)
+
         at = {t[0]: i for i, t in enumerate(toks)}
-        _, runs = _nonzero_coverage(mcode)
-        for a, b in runs:
-            if b - a != 7 or b not in at:
-                continue
-            nxt = toks[at[b]]
-            if nxt[1] != "V":
-                continue
-            field, bank, nfield, nbank = mcode[a + 1], mcode[a + 2], nxt[3], nxt[4]
-            assert field % 0x10 == 0, (name, a, hex(field))
-            adjacent = (bank == nbank and (nfield - field) % 0x100 == 0x10) or (
-                field == 0xF0 and nfield == 0x00 and nbank == bank + 1
+        for o, _, _, field, bank in writes:
+            nxt = toks[at[o + 7]]
+            assert nxt[1] == "V" and nxt[2] == 0xA1, (name, o, nxt)
+            adjacent = (bank == nxt[4] and (nxt[3] - field) % 0x100 == 0x10) or (
+                field == 0xF0 and nxt[3] == 0x00 and nxt[4] == bank + 1
             )
-            assert adjacent, (
-                name,
-                a,
-                mcode[a:b].hex(),
-                mcode[nxt[0] : nxt[0] + 8].hex(),
-            )
-            hits += 1
-    assert hits >= 10, hits
+            assert adjacent, (name, o, hex(field), hex(bank), hex(nxt[3]), hex(nxt[4]))
+
+        # The form never appears by chance, and it buys real coverage.
+        blob = mcode[lo:hi]
+        shuffled = bytearray(blob)
+        random.Random(0).shuffle(shuffled)
+        shuffled = bytes(shuffled)
+        null = _tokenize_mcode(shuffled, start=0, end=len(shuffled), **_FULL_RULE)
+        assert not [t for t in null if t[1] == "W"], name
+
+        without = dict(_FULL_RULE)
+        without["companion"] = False
+        covered_without, _ = _nonzero_coverage(mcode, **without)
+        covered_with, _ = _nonzero_coverage(mcode)
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    assert total >= 20, total

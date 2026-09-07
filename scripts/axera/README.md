@@ -3232,6 +3232,16 @@ byte). Zero bytes are segment padding and are excluded on both sides:
 | `llama` LM head | 124,736 | 77,790 | 169 | **99.78%** |
 | all five | | 243,554 | 3,851 | **98.42%** |
 
+Admitting the 7-byte companion write described below takes that to **98.69%**
+(3,179 unexplained).
+
+One trade-off is worth naming: treating 0xa1 as a tag (the fifth correction)
+is a large net win -- it cuts the `llama` prefill subgraph's residue from
+2,115 bytes to 1,301, and *improves* most op segments (the decode subgraph's
+from 510 to 321) -- but in two builds it costs a handful of bytes inside op
+segments that the narrower rule read exactly. Those segments are now asserted
+at 99.9% rather than 100%.
+
 The same rule, unchanged, reads a CNN and a transformer -- through either
 compiler path -- which is the strongest evidence yet that the grammar is the
 hardware's and not an artefact of one model.
@@ -3249,22 +3259,33 @@ over-fitting, not a real form. `p <= 4` is a hard limit.
 
 **A 7-byte write that fills the slot below the next one.** Among the
 remaining runs, the 7-byte ones have the shape `[X][field][bank][32-bit
-operand]`, and their address is always exactly one field slot below the
-verb that follows them: of the 28 such runs across the five mcodes, 24 are
-the same bank one field lower, and the other 4 are the last field of the
+operand]`, and their address is always exactly one field slot below the verb
+that follows them: same bank one field lower, or the last field of the
 previous bank (`09 f0 05 40 fc 03 06` then `a1 00 00 06 ...`: field 0xf0 in
-bank 5, then field 0x00 in bank 6). None is anything else, against a 38%
-null -- the rate at which the seven bytes preceding *any* `a1` verb happen to
-have that shape. In 14 of the 28 the 32-bit operand is byte-identical to the
-following verb's, so the pair writes one value into two adjacent slots.
-The leading byte varies (0x21, 0x05, 0x09, 0x7f, 0x02, 0x20, 0x1d, 0x1c);
-0x21 is `a1` with bit 7 cleared, which fits a compact encoding that drops the
-8-byte form's `00` byte, but the other values do not, so what `X` carries is
-still open. The bank wraps also confirm that `(bank, field)` is one
-continuous address space, not two independent selectors.
+bank 5, then field 0x00 in bank 6). The bank wraps confirm that
+`(bank, field)` is one continuous address space, not two independent
+selectors.
+
+That adjacency is a strong enough anchor to make the form a first-class
+rule: recognise a 7-byte unit only when the next eight bytes are an `a1`
+verb writing the adjacent slot. Across the five mcodes it fires **104
+times** and on their shuffled counterparts **zero times** -- perfect
+discrimination, no threshold to argue about. Admitting it takes the tail
+from 3,851 unexplained bytes to 3,179, and the whole-corpus figure from
+98.42% to **98.69%**.
+
+Many instances only became visible this way. `0a 90 0e 00 00 80 3f` writes
+the float 1.0 to field 0x90 of bank 0x0e and is followed by `a1 00 a0 0e`,
+the next slot up -- but the greedy walk used to swallow its first five bytes
+as a spurious short unit and leave `80 3f` (the high half of 1.0f) stranded,
+which is why `80 3f` was the single most common two-byte leftover. The
+leading byte still varies (0x21, 0x05, 0x09, 0x0a, 0x7f, 0x02, 0x20, 0x1d,
+0x1c) and what it carries is open; 0x21 is `a1` with bit 7 cleared, which
+would fit a compact encoding that drops the 8-byte form's `00`, but the
+other values do not.
 
 Tests: `test_full_rule_explains_almost_every_stream_byte` and
-`test_seven_byte_writes_address_the_slot_below_the_next_verb` in
+`test_companion_writes_fill_the_slot_below_the_next_verb` in
 `tests/test_axera_mcode_structure.py` (fresh builds of `resnet18d` and the
 ONNX-path Mistral, no device); the `llm_build` layer's coverage is asserted
 by its own test.
