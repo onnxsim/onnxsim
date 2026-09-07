@@ -3214,6 +3214,82 @@ Tests: `test_resnet18d_tail_segments_tile_the_stream_and_open_with_a7`,
 LLM tests skip unless the checkpoints are already in the HuggingFace
 cache).
 
+### Where the decoding stands: 98.4% of the instruction stream, across a CNN and two LLM paths
+
+Measured on five real mcodes -- `resnet18d`, a 1-layer `tiny-random-mistral`
+compiled through the ONNX path, both `neu mode` subgraphs of an `llm_build`
+`SmolLM2-135M` layer, and the LM head -- with every validated form admitted
+(six verbs, all tags 0x81..0x9f plus 0xa1, prefixes `p <= 4`, bare
+`[tag][register]` pairs, the bit-6 odd-register tags, and tag 0x9f's extra
+byte). Zero bytes are segment padding and are excluded on both sides:
+
+| build | stream | non-zero bytes | unexplained | explained |
+| --- | --- | --- | --- | --- |
+| `resnet18d` | 48,320 | 34,634 | 496 | **98.57%** |
+| `mistral` (ONNX path) | 27,104 | 20,252 | 619 | **96.94%** |
+| `llama` layer, decode | 55,104 | 40,557 | 975 | **97.60%** |
+| `llama` layer, prefill | 91,296 | 70,321 | 1,592 | **97.74%** |
+| `llama` LM head | 124,736 | 77,790 | 169 | **99.78%** |
+| all five | | 243,554 | 3,851 | **98.42%** |
+
+Admitting the 7-byte companion write described below takes that to **98.69%**
+(3,179 unexplained).
+
+One trade-off is worth naming: treating 0xa1 as a tag (the fifth correction)
+is a large net win -- it cuts the `llama` prefill subgraph's residue from
+2,115 bytes to 1,301, and *improves* most op segments (the decode subgraph's
+from 510 to 321) -- but in two builds it costs a handful of bytes inside op
+segments that the narrower rule read exactly. Those segments are now asserted
+at 99.9% rather than 100%.
+
+The same rule, unchanged, reads a CNN and a transformer -- through either
+compiler path -- which is the strongest evidence yet that the grammar is the
+hardware's and not an artefact of one model.
+
+**The width rule really does stop at `p = 4`.** The fourth correction
+established `p <= 4` with the narrow tag set; with the corrected 31-tag set
+the question reopens, since the leftover bytes (0x05..0x10) look exactly like
+larger prefixes. They are not. Counting units per prefix across all five
+mcodes against a shuffled stream: `p = 1` and `p = 2` run 3.2x over chance,
+`p = 0` 1.8x, `p = 3` 1.6x, `p = 4` 1.4x -- and from `p = 5` upward every
+prefix falls *below* chance (0.53, 0.58, 0.31, 0.25, 0.97, 0.29, ... down to
+0.04 at `p = 16`). Raising `pmax` does raise apparent coverage, but it raises
+the shuffled stream's more (46% -> 54% explained), so it is the greedy walk
+over-fitting, not a real form. `p <= 4` is a hard limit.
+
+**A 7-byte write that fills the slot below the next one.** Among the
+remaining runs, the 7-byte ones have the shape `[X][field][bank][32-bit
+operand]`, and their address is always exactly one field slot below the verb
+that follows them: same bank one field lower, or the last field of the
+previous bank (`09 f0 05 40 fc 03 06` then `a1 00 00 06 ...`: field 0xf0 in
+bank 5, then field 0x00 in bank 6). The bank wraps confirm that
+`(bank, field)` is one continuous address space, not two independent
+selectors.
+
+That adjacency is a strong enough anchor to make the form a first-class
+rule: recognise a 7-byte unit only when the next eight bytes are an `a1`
+verb writing the adjacent slot. Across the five mcodes it fires **104
+times** and on their shuffled counterparts **zero times** -- perfect
+discrimination, no threshold to argue about. Admitting it takes the tail
+from 3,851 unexplained bytes to 3,179, and the whole-corpus figure from
+98.42% to **98.69%**.
+
+Many instances only became visible this way. `0a 90 0e 00 00 80 3f` writes
+the float 1.0 to field 0x90 of bank 0x0e and is followed by `a1 00 a0 0e`,
+the next slot up -- but the greedy walk used to swallow its first five bytes
+as a spurious short unit and leave `80 3f` (the high half of 1.0f) stranded,
+which is why `80 3f` was the single most common two-byte leftover. The
+leading byte still varies (0x21, 0x05, 0x09, 0x0a, 0x7f, 0x02, 0x20, 0x1d,
+0x1c) and what it carries is open; 0x21 is `a1` with bit 7 cleared, which
+would fit a compact encoding that drops the 8-byte form's `00`, but the
+other values do not.
+
+Tests: `test_full_rule_explains_almost_every_stream_byte` and
+`test_companion_writes_fill_the_slot_below_the_next_verb` in
+`tests/test_axera_mcode_structure.py` (fresh builds of `resnet18d` and the
+ONNX-path Mistral, no device); the `llm_build` layer's coverage is asserted
+by its own test.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
