@@ -287,10 +287,20 @@ Each stage is independently shippable and independently useful.
    small regression at every learning rate tried. It fixes a quantizer whose
    range is wrong rather than improving one that is right.
 
+   The `QuantizationConfig` flag landed as well: `quantize(config)` chains
+   `apply_qat_all_blocks` the way it already chained AWQ/GPTQ/GPTAQ, for
+   both schemes. Its position in that pipeline is forced at both ends rather
+   than chosen -- after the correction passes, because QAT warm-starts from
+   whatever codes the model carries; before `double_quant`, because that
+   pass moves each scale out of an initializer and into a nested
+   `DequantizeLinear`, which is the shape the layer finder requires, so the
+   other order makes QAT a silent no-op. `learn_activation_scales` is
+   derived from the scheme rather than exposed, so the API cannot express
+   the pairing `apply_qat` refuses.
+
    Still open from this stage's original description: real data via
-   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, and an
-   end-to-end pass against the model's own output (a block is always the
-   unit of optimization).
+   `load_huggingface_calibration_data`, and an end-to-end pass against the
+   model's own output (a block is always the unit of optimization).
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
