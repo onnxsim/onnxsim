@@ -108,11 +108,9 @@ static_assert(static_cast<float>(kBeta2Double) == kAdamBeta2,
 
 const std::set<std::string>& EpFriendlyOps() {
   static const std::set<std::string> kOps = {
-      "Abs",        "Add",       "Cast",    "Clip",    "Div",
-      "Exp",        "Gather",    "Greater", "Less",    "MatMul",
-      "Mul",        "Neg",       "Pow",     "Reshape", "ReduceMean",
-      "ReduceSum",  "Sigmoid",   "Sign",    "Sqrt",    "Sub",
-      "Transpose"};
+      "Abs",        "Add",       "Cast",    "Clip", "Div",  "Exp", "Gather",
+      "Greater",    "Less",      "MatMul",  "Mul",  "Neg",  "Pow", "Reshape",
+      "ReduceMean", "ReduceSum", "Sigmoid", "Sign", "Sqrt", "Sub", "Transpose"};
   return kOps;
 }
 
@@ -225,9 +223,7 @@ std::string GraphBuilder::Transpose(const std::string& a,
   return Op("Transpose", {a}, {IntsAttr("perm", perm)});
 }
 
-std::string GraphBuilder::Sqrt(const std::string& a) {
-  return Op("Sqrt", {a});
-}
+std::string GraphBuilder::Sqrt(const std::string& a) { return Op("Sqrt", {a}); }
 
 std::string GraphBuilder::Sigmoid(const std::string& a) {
   return Op("Sigmoid", {a});

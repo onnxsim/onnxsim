@@ -125,9 +125,8 @@ class Backward {
                        const Shape& target_shape) {
     if (grad_shape == target_shape) return grad;
 
-    const int64_t offset =
-        static_cast<int64_t>(grad_shape.size()) -
-        static_cast<int64_t>(target_shape.size());
+    const int64_t offset = static_cast<int64_t>(grad_shape.size()) -
+                           static_cast<int64_t>(target_shape.size());
     if (offset < 0) {
       throw std::invalid_argument(
           "cannot reduce a gradient of shape " + ShapeStr(grad_shape) + " to " +
@@ -224,9 +223,8 @@ std::vector<OptStr> GradMatMul(Backward& ctx, const onnx::NodeProto& node,
   }
   // dA = G @ B^T, dB = A^T @ G, both then summed back over whatever batch
   // axes broadcasting replicated.
-  const Shape batch =
-      BroadcastShapes(Shape(sa.begin(), sa.end() - 2),
-                      Shape(sb.begin(), sb.end() - 2));
+  const Shape batch = BroadcastShapes(Shape(sa.begin(), sa.end() - 2),
+                                      Shape(sb.begin(), sb.end() - 2));
   const std::string bt = ctx.TransposeLastTwo(b, sb);
   const std::string ga = ctx.b().MatMul(g, bt);
   const std::string at = ctx.TransposeLastTwo(a, sa);
@@ -448,7 +446,8 @@ std::vector<OptStr> GradReshape(Backward& ctx, const onnx::NodeProto& node,
 // exactly with keepdims=1, and by elimination (refusing a genuine ambiguity)
 // without.
 std::vector<int64_t> ReducedAxes(const onnx::NodeProto& node,
-                                 const Shape& in_shape, const Shape& out_shape) {
+                                 const Shape& in_shape,
+                                 const Shape& out_shape) {
   const int64_t rank = static_cast<int64_t>(in_shape.size());
   const onnx::AttributeProto* attribute = FindAttr(node, "axes");
   if (attribute != nullptr) {
@@ -456,9 +455,9 @@ std::vector<int64_t> ReducedAxes(const onnx::NodeProto& node,
       // Python would raise ZeroDivisionError on the `% rank` below; a
       // rank-0 input to a Reduce* with an axes attribute is malformed either
       // way, and this says so rather than dividing by zero.
-      throw UnsupportedOpError(
-          "cannot interpret the axes attribute of " + Quoted(node.output(0)) +
-          " against a rank-0 input");
+      throw UnsupportedOpError("cannot interpret the axes attribute of " +
+                               Quoted(node.output(0)) +
+                               " against a rank-0 input");
     }
     std::set<int64_t> axes;
     for (int64_t a : attribute->ints()) axes.insert(((a % rank) + rank) % rank);
@@ -468,10 +467,10 @@ std::vector<int64_t> ReducedAxes(const onnx::NodeProto& node,
   const bool keepdims = AttrInt(node, "keepdims", 1) != 0;
   if (keepdims) {
     if (static_cast<int64_t>(out_shape.size()) != rank) {
-      throw UnsupportedOpError(node.op_type() + " with keepdims=1 changed rank " +
-                               std::to_string(rank) + " to " +
-                               std::to_string(out_shape.size()) + " (node " +
-                               Quoted(node.output(0)) + ")");
+      throw UnsupportedOpError(
+          node.op_type() + " with keepdims=1 changed rank " +
+          std::to_string(rank) + " to " + std::to_string(out_shape.size()) +
+          " (node " + Quoted(node.output(0)) + ")");
     }
     // An axis that is 1 on both sides may or may not have been reduced, and
     // it makes no difference: summing over a length-1 axis and broadcasting
@@ -583,10 +582,10 @@ std::vector<OptStr> GradReduce(Backward& ctx, const onnx::NodeProto& node,
     if (axes.count(static_cast<int64_t>(i)) == 0) ones_shape[i] = 1;
     elements *= ones_shape[i];
   }
-  const std::string ones = ctx.b().Const(
-      std::vector<float>(static_cast<size_t>(elements),
-                         static_cast<float>(fill)),
-      ones_shape, "bcast");
+  const std::string ones =
+      ctx.b().Const(std::vector<float>(static_cast<size_t>(elements),
+                                       static_cast<float>(fill)),
+                    ones_shape, "bcast");
   std::vector<OptStr> grads{ctx.b().Mul(grad, ones)};
   grads.insert(grads.end(), rest.begin(), rest.end());
   return grads;
@@ -606,8 +605,8 @@ std::vector<OptStr> GradSoftmax(Backward& ctx, const onnx::NodeProto& node,
   const int64_t axis = ((raw_axis % rank) + rank) % rank;
   const std::string gy = ctx.b().Mul(g, y);
   const std::string axes_const = ctx.b().ConstInt64({axis}, "axes");
-  const std::string total = ctx.b().Op(
-      "ReduceSum", {gy, axes_const}, {IntAttr("keepdims", 1)}, "reducesum");
+  const std::string total = ctx.b().Op("ReduceSum", {gy, axes_const},
+                                       {IntAttr("keepdims", 1)}, "reducesum");
   const std::string centred = ctx.b().Sub(g, total);
   return {ctx.b().Mul(y, centred)};
 }
@@ -637,26 +636,16 @@ std::vector<OptStr> GradClip(Backward& ctx, const onnx::NodeProto& node,
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
-          {"Add", &GradAdd},
-          {"Clip", &GradClip},
-          {"Div", &GradDiv},
-          {"Erf", &GradErf},
-          {"Exp", &GradExp},
-          {"Gemm", &GradGemm},
-          {"Identity", &GradIdentity},
-          {"MatMul", &GradMatMul},
-          {"Mul", &GradMul},
-          {"Neg", &GradNeg},
-          {"ReduceMean", &GradReduce},
-          {"ReduceSum", &GradReduce},
-          {"Relu", &GradRelu},
-          {"Reshape", &GradReshape},
-          {"Sigmoid", &GradSigmoid},
-          {"Softmax", &GradSoftmax},
-          {"Sqrt", &GradSqrt},
-          {"Sub", &GradSub},
-          {"Tanh", &GradTanh},
-          {"Transpose", &GradTranspose},
+          {"Add", &GradAdd},           {"Clip", &GradClip},
+          {"Div", &GradDiv},           {"Erf", &GradErf},
+          {"Exp", &GradExp},           {"Gemm", &GradGemm},
+          {"Identity", &GradIdentity}, {"MatMul", &GradMatMul},
+          {"Mul", &GradMul},           {"Neg", &GradNeg},
+          {"ReduceMean", &GradReduce}, {"ReduceSum", &GradReduce},
+          {"Relu", &GradRelu},         {"Reshape", &GradReshape},
+          {"Sigmoid", &GradSigmoid},   {"Softmax", &GradSoftmax},
+          {"Sqrt", &GradSqrt},         {"Sub", &GradSub},
+          {"Tanh", &GradTanh},         {"Transpose", &GradTranspose},
       };
   return *rules;
 }
@@ -678,8 +667,8 @@ std::string SupportedOpsList() {
 
 const std::set<std::string>& BackwardOps() {
   static const std::set<std::string>* ops = new std::set<std::string>{
-      "Add", "Cast",  "Div",       "Exp",     "Greater",   "Less",     "MatMul",
-      "Mul", "Neg",   "ReduceSum", "Reshape", "Sub",       "Transpose"};
+      "Add", "Cast", "Div",       "Exp",     "Greater", "Less",     "MatMul",
+      "Mul", "Neg",  "ReduceSum", "Reshape", "Sub",     "Transpose"};
   return *ops;
 }
 
@@ -715,10 +704,9 @@ std::map<std::string, std::string> BuildBackward(
           !node.name().empty()
               ? node.name()
               : (node.output_size() > 0 ? node.output(0) : std::string());
-      throw UnsupportedOpError("no gradient rule for op type " +
-                               Quoted(node.op_type()) + " (node " +
-                               Quoted(where) + "); graph_grad differentiates " +
-                               SupportedOpsList());
+      throw UnsupportedOpError(
+          "no gradient rule for op type " + Quoted(node.op_type()) + " (node " +
+          Quoted(where) + "); graph_grad differentiates " + SupportedOpsList());
     }
     if (node.output_size() != 1) {
       throw UnsupportedOpError(

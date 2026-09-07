@@ -80,8 +80,10 @@ std::string LittleEndianBytes(float value) {
 // Python-built one.
 void NamesAreThePrefixHintAndAPreIncrementedCounter() {
   GraphBuilder b("g_");
-  CheckEqual(b.Name(), "g_t_1", "first name uses the default hint and counter 1");
-  CheckEqual(b.Name("grad"), "g_grad_2", "the hint is spliced between prefix and counter");
+  CheckEqual(b.Name(), "g_t_1",
+             "first name uses the default hint and counter 1");
+  CheckEqual(b.Name("grad"), "g_grad_2",
+             "the hint is spliced between prefix and counter");
   CheckEqual(b.Name(), "g_t_3", "the counter is per-builder, not per-hint");
 
   GraphBuilder unprefixed;
@@ -110,9 +112,11 @@ void ConstMatchesNumpyHelperFromArrayForFloat32() {
   GraphBuilder b;
   const std::string name = b.Const(0.5f);
   CheckEqual(name, "c_1", "Const's default hint is \"c\"");
-  CheckEqual(b.initializer().size(), size_t{1}, "Const appends one initializer");
+  CheckEqual(b.initializer().size(), size_t{1},
+             "Const appends one initializer");
   const onnx::TensorProto& scalar = b.initializer()[0];
-  CheckEqual(scalar.name(), "c_1", "the initializer carries the generated name");
+  CheckEqual(scalar.name(), "c_1",
+             "the initializer carries the generated name");
   Check(scalar.data_type() == onnx::TensorProto::FLOAT, "Const is float32");
   CheckEqual(static_cast<size_t>(scalar.dims_size()), size_t{0},
              "a scalar Const has no dims, matching numpy shape ()");
@@ -124,7 +128,8 @@ void ConstMatchesNumpyHelperFromArrayForFloat32() {
   const std::string arr = b.Const({1.0f, 2.0f, 3.0f, 4.0f}, {2, 2}, "w");
   CheckEqual(arr, "w_2", "the array overload consumes exactly one name");
   const onnx::TensorProto& matrix = b.initializer()[1];
-  CheckEqual(static_cast<size_t>(matrix.dims_size()), size_t{2}, "dims are copied through");
+  CheckEqual(static_cast<size_t>(matrix.dims_size()), size_t{2},
+             "dims are copied through");
   CheckEqual(matrix.raw_data().size(), size_t{16},
              "four float32 values are sixteen raw bytes");
 
@@ -132,7 +137,8 @@ void ConstMatchesNumpyHelperFromArrayForFloat32() {
   CheckEqual(idx, "i_3", "ConstInt64 shares the one counter");
   const onnx::TensorProto& ints = b.initializer()[2];
   Check(ints.data_type() == onnx::TensorProto::INT64, "ConstInt64 is int64");
-  CheckEqual(ints.raw_data().size(), size_t{16}, "two int64 values are sixteen bytes");
+  CheckEqual(ints.raw_data().size(), size_t{16},
+             "two int64 values are sixteen bytes");
 }
 
 // If this fails, Clip's two bound constants and the Clip node itself are named
@@ -148,7 +154,8 @@ void ClipNamesBothBoundsBeforeTheClipNode() {
   CheckEqual(b.initializer()[1].raw_data(), LittleEndianBytes(1.0f),
              "the second initializer is the high bound");
   CheckEqual(b.nodes()[0].input(1), "c_1", "Clip's min input is the low bound");
-  CheckEqual(b.nodes()[0].input(2), "c_2", "Clip's max input is the high bound");
+  CheckEqual(b.nodes()[0].input(2), "c_2",
+             "Clip's max input is the high bound");
 }
 
 // If this fails, a mask has stopped being "const, compare, cast to float" --
@@ -158,14 +165,17 @@ void MasksEmitConstThenCompareThenCastToFloat() {
   GraphBuilder greater;
   CheckEqual(greater.GreaterMask("x", 0.0f), "cast_3",
              "threshold constant, Greater, Cast");
-  CheckEqual(Joined(OpTypes(greater)), "Greater,Cast", "no boolean logic op appears");
+  CheckEqual(Joined(OpTypes(greater)), "Greater,Cast",
+             "no boolean logic op appears");
   Check(greater.nodes()[1].attribute(0).name() == "to" &&
             greater.nodes()[1].attribute(0).i() == onnx::TensorProto::FLOAT,
         "the mask is cast to float32, not left as bool");
 
   GraphBuilder less;
-  CheckEqual(less.LessMask("x", 0.0f), "cast_3", "LessMask numbers identically");
-  CheckEqual(Joined(OpTypes(less)), "Less,Cast", "LessMask differs only in the comparison");
+  CheckEqual(less.LessMask("x", 0.0f), "cast_3",
+             "LessMask numbers identically");
+  CheckEqual(Joined(OpTypes(less)), "Less,Cast",
+             "LessMask differs only in the comparison");
 }
 
 // If this fails, either the composed rounding has drifted from qat_graph.py's
@@ -199,7 +209,8 @@ void MeanSquareReducesToARankZeroScalar() {
             b.nodes()[1].attribute(0).i() == 0,
         "keepdims=0, so the result is a scalar");
   CheckEqual(static_cast<size_t>(b.nodes()[1].attribute_size()), size_t{1},
-             "no axes attribute: opset 17's ReduceMean reduces every axis when omitted");
+             "no axes attribute: opset 17's ReduceMean reduces every axis when "
+             "omitted");
 }
 
 // If this fails, the minibatching primitive has stopped selecting along rows,
@@ -208,7 +219,8 @@ void MeanSquareReducesToARankZeroScalar() {
 // splice uses exactly that form.
 void GatherRowsSelectsAlongAxisZeroAndTheIntoFormConsumesNoName() {
   GraphBuilder b;
-  CheckEqual(b.GatherRows("table", "idx"), "rows_1", "the default hint is \"rows\"");
+  CheckEqual(b.GatherRows("table", "idx"), "rows_1",
+             "the default hint is \"rows\"");
   Check(b.nodes()[0].attribute(0).name() == "axis" &&
             b.nodes()[0].attribute(0).i() == 0,
         "rows are selected along axis 0");
@@ -246,7 +258,8 @@ void EveryOpAnyBuilderMethodEmitsIsEpFriendly() {
   Check(!b.nodes().empty(), "the sweep actually emitted nodes");
   for (const onnx::NodeProto& node : b.nodes()) {
     Check(EpFriendlyOps().count(node.op_type()) == 1,
-          node.op_type() + " is emitted by a builder method but is not in EpFriendlyOps()");
+          node.op_type() +
+              " is emitted by a builder method but is not in EpFriendlyOps()");
   }
 }
 
@@ -255,11 +268,9 @@ void EveryOpAnyBuilderMethodEmitsIsEpFriendly() {
 // only pins that the C++ copy says the same thing.
 void EpFriendlyOpsHasExactlyThePythonSetsMembers() {
   const std::set<std::string> expected = {
-      "Abs",        "Add",       "Cast",    "Clip",    "Div",
-      "Exp",        "Gather",    "Greater", "Less",    "MatMul",
-      "Mul",        "Neg",       "Pow",     "ReduceMean", "ReduceSum",
-      "Reshape",    "Sigmoid",   "Sign",    "Sqrt",    "Sub",
-      "Transpose"};
+      "Abs",       "Add",     "Cast",    "Clip", "Div",  "Exp", "Gather",
+      "Greater",   "Less",    "MatMul",  "Mul",  "Neg",  "Pow", "ReduceMean",
+      "ReduceSum", "Reshape", "Sigmoid", "Sign", "Sqrt", "Sub", "Transpose"};
   CheckEqual(expected.size(), size_t{21}, "the Python set has 21 members");
   Check(EpFriendlyOps() == expected, "EpFriendlyOps() equals EP_FRIENDLY_OPS");
   Check(EpFriendlyOps().count("Round") == 0,
@@ -272,8 +283,7 @@ void EpFriendlyOpsHasExactlyThePythonSetsMembers() {
 // the numpy loops in adaround.py/adaquant.py/brecq.py that it must reproduce.
 void AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
   GraphBuilder b;
-  const AdamOutputs out =
-      AdamUpdate(b, "p", "g", "m", "v", "lr", "mc", "vc");
+  const AdamOutputs out = AdamUpdate(b, "p", "g", "m", "v", "lr", "mc", "vc");
 
   CheckEqual(Joined(OpTypes(b)),
              "Mul,Mul,Add,Mul,Mul,Mul,Add,Mul,Mul,Mul,Sqrt,Add,Div,Sub",
@@ -285,17 +295,20 @@ void AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
   // number 5.
   CheckEqual(out.m_next, "add_7", "m' = beta1*m + (1-beta1)*g");
   CheckEqual(out.v_next, "add_11", "v' = beta2*v + (1-beta2)*g*g");
-  CheckEqual(out.param_next, "sub_19", "p' = p - lr*m_hat / (sqrt(v_hat) + eps)");
+  CheckEqual(out.param_next, "sub_19",
+             "p' = p - lr*m_hat / (sqrt(v_hat) + eps)");
 
   CheckEqual(b.nodes()[0].input(0), "c_1", "beta1 scales the old first moment");
   CheckEqual(b.nodes()[0].input(1), "m", "...against the incoming m");
-  CheckEqual(b.nodes()[4].input(0), "g", "the squared gradient is g*g, not Pow");
+  CheckEqual(b.nodes()[4].input(0), "g",
+             "the squared gradient is g*g, not Pow");
   CheckEqual(b.nodes()[4].input(1), "g", "...both operands the same tensor");
-  CheckEqual(b.nodes()[7].input(1), "mc",
-             "the first moment is bias-corrected by a fed scalar, not a Pow chain");
-  CheckEqual(b.nodes()[8].input(1), "vc",
-             "the second moment likewise");
-  CheckEqual(b.nodes()[13].input(0), "p", "the update is subtracted from the parameter");
+  CheckEqual(
+      b.nodes()[7].input(1), "mc",
+      "the first moment is bias-corrected by a fed scalar, not a Pow chain");
+  CheckEqual(b.nodes()[8].input(1), "vc", "the second moment likewise");
+  CheckEqual(b.nodes()[13].input(0), "p",
+             "the update is subtracted from the parameter");
 
   // The bias-correction *factors* are the host's job, so no step counter, Pow
   // over one, or extra state tensor may appear inside the graph.
@@ -321,12 +334,14 @@ void AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
 void AdamBiasCorrectionsAreTheClosedFormAtStepT() {
   for (int64_t t : {int64_t{0}, int64_t{1}, int64_t{9}, int64_t{99}}) {
     const std::pair<float, float> got = AdamBiasCorrections(t);
-    const float want_m =
-        static_cast<float>(1.0 / (1.0 - std::pow(0.9, static_cast<double>(t) + 1.0)));
-    const float want_v =
-        static_cast<float>(1.0 / (1.0 - std::pow(0.999, static_cast<double>(t) + 1.0)));
-    Check(got.first == want_m, "m_correction = 1/(1-beta1^(t+1)) at t=" + std::to_string(t));
-    Check(got.second == want_v, "v_correction = 1/(1-beta2^(t+1)) at t=" + std::to_string(t));
+    const float want_m = static_cast<float>(
+        1.0 / (1.0 - std::pow(0.9, static_cast<double>(t) + 1.0)));
+    const float want_v = static_cast<float>(
+        1.0 / (1.0 - std::pow(0.999, static_cast<double>(t) + 1.0)));
+    Check(got.first == want_m,
+          "m_correction = 1/(1-beta1^(t+1)) at t=" + std::to_string(t));
+    Check(got.second == want_v,
+          "v_correction = 1/(1-beta2^(t+1)) at t=" + std::to_string(t));
   }
   // t is 0-based, so the very first step's correction is 1/(1-beta), not 1.
   Check(std::fabs(AdamBiasCorrections(0).first - 10.0f) < 1e-4f,
@@ -365,50 +380,60 @@ void MakeStepGraphDeclaresInputsAndOutputsInOrderAndPassesTheChecker() {
   CheckEqual(static_cast<size_t>(step.model.opset_import_size()), size_t{1},
              "exactly one opset import");
   CheckEqual(step.model.opset_import(0).domain(), "", "the default domain");
-  Check(step.model.opset_import(0).version() == kStepGraphOpset,
-        "opset 17");
+  Check(step.model.opset_import(0).version() == kStepGraphOpset, "opset 17");
   Check(step.model.producer_name().empty(),
         "no producer_name, matching onnx.helper.make_model's default");
 
   std::vector<std::string> inputs;
-  for (const onnx::ValueInfoProto& vi : graph.input()) inputs.push_back(vi.name());
+  for (const onnx::ValueInfoProto& vi : graph.input())
+    inputs.push_back(vi.name());
   CheckEqual(Joined(inputs), "table,p,m,v,lr,m_correction,v_correction,idx",
              "constants, then state, then scalars, then per-step inputs");
 
   std::vector<std::string> outputs;
-  for (const onnx::ValueInfoProto& vi : graph.output()) outputs.push_back(vi.name());
-  CheckEqual(Joined(outputs), adam.param_next + "," + adam.m_next + "," +
-                                  adam.v_next + "," + loss,
-             "the state's next values in state order, then the loss");
+  for (const onnx::ValueInfoProto& vi : graph.output())
+    outputs.push_back(vi.name());
+  CheckEqual(
+      Joined(outputs),
+      adam.param_next + "," + adam.m_next + "," + adam.v_next + "," + loss,
+      "the state's next values in state order, then the loss");
 
   // Types and shapes: the scalars are rank 0 with a *present* shape (which is
   // what says "scalar" rather than "rank unknown"), and the index vector keeps
   // the int64 type the Gather needs rather than being cast to float like the
   // scalars are.
   const onnx::TypeProto::Tensor& lr = graph.input(4).type().tensor_type();
-  Check(lr.elem_type() == onnx::TensorProto::FLOAT, "a scalar input is float32");
-  Check(lr.has_shape() && lr.shape().dim_size() == 0, "a scalar input is rank 0");
+  Check(lr.elem_type() == onnx::TensorProto::FLOAT,
+        "a scalar input is float32");
+  Check(lr.has_shape() && lr.shape().dim_size() == 0,
+        "a scalar input is rank 0");
   const onnx::TypeProto::Tensor& idx = graph.input(7).type().tensor_type();
-  Check(idx.elem_type() == onnx::TensorProto::INT64, "the row index stays int64");
-  CheckEqual(static_cast<size_t>(idx.shape().dim_size()), size_t{1}, "the row index is rank 1");
+  Check(idx.elem_type() == onnx::TensorProto::INT64,
+        "the row index stays int64");
+  CheckEqual(static_cast<size_t>(idx.shape().dim_size()), size_t{1},
+             "the row index is rank 1");
   const onnx::TypeProto::Tensor& table = graph.input(0).type().tensor_type();
-  Check(table.shape().dim(0).dim_value() == 5 && table.shape().dim(1).dim_value() == 3,
+  Check(table.shape().dim(0).dim_value() == 5 &&
+            table.shape().dim(1).dim_value() == 3,
         "a constant's declared shape is copied through");
 
-  CheckEqual(static_cast<size_t>(graph.node_size()), b.nodes().size(), "every node is carried over");
-  CheckEqual(static_cast<size_t>(graph.initializer_size()), b.initializer().size(),
-             "every initializer is carried over");
+  CheckEqual(static_cast<size_t>(graph.node_size()), b.nodes().size(),
+             "every node is carried over");
+  CheckEqual(static_cast<size_t>(graph.initializer_size()),
+             b.initializer().size(), "every initializer is carried over");
 
   // The loop-closing map: which output carries the next value of which input.
   CheckEqual(step.state.size(), size_t{3}, "three state tensors");
   CheckEqual(step.state[0].first, "p", "state pairs are in spec order");
-  CheckEqual(step.state[0].second, adam.param_next, "...mapped to their next value");
+  CheckEqual(step.state[0].second, adam.param_next,
+             "...mapped to their next value");
   CheckEqual(step.loss_name, loss, "the loss name is reported back");
 
   try {
     onnx::checker::check_model(step.model);
   } catch (const std::exception& e) {
-    Check(false, std::string("onnx::checker rejected the step graph: ") + e.what());
+    Check(false,
+          std::string("onnx::checker rejected the step graph: ") + e.what());
   }
 }
 
@@ -424,11 +449,13 @@ void AStepGraphWithoutALossDeclaresOnlyItsStateOutputs() {
   CheckEqual(static_cast<size_t>(step.model.graph().output_size()), size_t{1},
              "only the state's next value is an output");
   Check(step.loss_name.empty(), "no loss is reported");
-  CheckEqual(step.model.graph().name(), "no_loss", "the graph name is overridable");
+  CheckEqual(step.model.graph().name(), "no_loss",
+             "the graph name is overridable");
   try {
     onnx::checker::check_model(step.model);
   } catch (const std::exception& e) {
-    Check(false, std::string("onnx::checker rejected the loss-free graph: ") + e.what());
+    Check(false, std::string("onnx::checker rejected the loss-free graph: ") +
+                     e.what());
   }
 }
 
