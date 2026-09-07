@@ -80,9 +80,6 @@ from onnxsim import backend
 _OPSET = 17
 _IR_VERSION = 8
 
-# Adam's own standard hyper-parameters, matching the hand-rolled loops in
-# adaround.py/adaquant.py/brecq.py exactly so a ported loop keeps its
-# behaviour.
 # The operator set a step graph restricts itself to.
 #
 # The point of expressing a training step as an ONNX graph is that it runs
@@ -126,6 +123,9 @@ EP_FRIENDLY_OPS = frozenset(
     }
 )
 
+# Adam's own standard hyper-parameters, matching the hand-rolled loops in
+# adaround.py/adaquant.py/brecq.py exactly so a ported loop keeps its
+# behaviour.
 ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
