@@ -1088,6 +1088,7 @@ def _build_step_graph(
     batch: Optional[_Minibatch] = None,
     learn_activation_scales: bool = False,
     fake_quant: bool = True,
+    preserve_sparsity: bool = False,
 ) -> qat_graph.StepGraph:
     """The whole loop as one graph: fake-quant forward, block forward,
     reconstruction loss, backward, Adam.
@@ -1114,6 +1115,13 @@ def _build_step_graph(
     student are different models: the student is the pruned, simplified or
     otherwise altered one, and the block is trained to reproduce what the
     original produced at that point.
+
+    ``preserve_sparsity`` adds one ``Mul`` per trained layer, zeroing the
+    weight gradient wherever the master weight started at zero. That is enough
+    to hold those elements at zero exactly, rather than merely near it: with a
+    gradient of 0 every step, Adam's ``m`` and ``v`` stay 0, its step is
+    ``lr * 0 / (sqrt(0) + eps)`` -- exactly 0 -- and the parameter never moves.
+    No clean-up pass at the end, and no drift in between.
 
     ``externals`` and ``block_output_shape`` are always the *whole*
     calibration set's arrays and shape. With ``batch`` set they become the
@@ -1273,6 +1281,12 @@ def _build_step_graph(
         # gradient, with no scale factor anywhere. Without a fake-quant there
         # is no clipping range and no estimator: ``g`` is already dL/dw.
         w_grad = g if ste_mask is None else b.mul(g, ste_mask)
+        if preserve_sparsity:
+            # The zeros the optimizer *started* from, held there. Emitted per
+            # layer rather than hoisted, so the mask sits next to the gradient
+            # it applies to and the builder's name counter stays a function of
+            # emission order.
+            w_grad = b.mul(w_grad, b.const((t.w_init != 0).astype(np.float32), "keep"))
         t.w_next, t.m_next, t.v_next = qat_graph.adam_update(
             b,
             t.w_input,
@@ -1587,6 +1601,7 @@ def _train_block(
     learn_activation_scales: bool = False,
     activation_learning_rate: float = 1e-2,
     fake_quant: bool = True,
+    preserve_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Runs the whole optimization for one already-planned, already-captured
     block and returns ``quantized_model`` with that block's initializers
@@ -1642,6 +1657,7 @@ def _train_block(
         batch,
         learn_activation_scales,
         fake_quant,
+        preserve_sparsity,
     )
 
     # The whole set is the constant either way; with a minibatch it is bound
@@ -1851,6 +1867,7 @@ def apply_qat(
     step_providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
     fake_quant: bool = True,
+    preserve_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Fine-tunes one block's quantized weights (and, opted in, its activation
     quantizers) against the float model's own
@@ -2078,6 +2095,30 @@ def apply_qat(
     :param losses: when given, the reconstruction loss is appended to it once
             per step -- the cheapest way to see whether a block actually
             trained, and what the tests here assert on.
+    :param preserve_sparsity: hold every weight element that starts at zero
+            at zero for the whole run. Off by default, and it is the caller's
+            call rather than a detected one, because "this element is zero" and
+            "this element was pruned away" are the same bit pattern and only
+            the caller knows which they meant.
+
+            **Turn it on for an unstructured-pruned model.** Nothing else in
+            the step graph masks the optimizer, so without it a pruned zero
+            gets a gradient like any other element and leaves zero on the very
+            first step: measured at 50% sparsity, 128 zeros per weight before
+            and none after, while the loss fell five orders of magnitude. Every
+            signal a caller would look at says that run went well, which is
+            what makes it worth a parameter rather than a note.
+
+            Structured pruning needs nothing here -- there the channel is gone
+            from the tensor rather than zeroed inside it.
+
+            The mask is the zero pattern of the weight the optimizer *starts*
+            from, which is the master weight's seed: the student's own weight
+            when fine-tuning, and the float model's when quantizing (so for
+            QAT over a pruned model, prune first and pass the pruned model as
+            ``float_model``, which is the ordinary order anyway). Elements it
+            holds are held exactly, not approximately -- see
+            :func:`_build_step_graph` for why one ``Mul`` is enough.
     :param fake_quant: with ``False``, drop the fake-quantizer and train the
             *second model's own float weights* directly. Everything else --
             the teacher, the reconstruction loss, the backward, Adam, the
@@ -2150,6 +2191,7 @@ def apply_qat(
         step_providers=step_providers,
         losses=losses,
         fake_quant=fake_quant,
+        preserve_sparsity=preserve_sparsity,
     )
 
 
@@ -2523,6 +2565,7 @@ def apply_qat_all_blocks(
     providers: Optional[Sequence[backend.Provider]] = None,
     step_providers: Optional[Sequence[backend.Provider]] = None,
     fake_quant: bool = True,
+    preserve_sparsity: bool = False,
 ) -> Tuple[onnx.ModelProto, List[QATBlockResult]]:
     """Trains every block :func:`discover_qat_blocks` finds, in graph order --
     :func:`apply_qat` lifted from one caller-named block to the whole model.
@@ -2737,6 +2780,7 @@ def apply_qat_all_blocks(
                 step_providers=step_providers,
                 losses=result.losses,
                 fake_quant=fake_quant,
+                preserve_sparsity=preserve_sparsity,
             )
         except (ValueError, graph_grad.UnsupportedOpError) as error:
             # A step graph that was half-built cannot have touched ``tuned``
@@ -2766,6 +2810,7 @@ def apply_block_finetune(
     providers: Optional[Sequence[backend.Provider]] = None,
     step_providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
+    preserve_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Fine-tunes one block's float weights against a *reference* model's own
     output for that block -- :func:`apply_qat` with the quantizer taken out of
@@ -2864,6 +2909,30 @@ def apply_block_finetune(
             optimization itself on
     :param losses: when given, the reconstruction loss is appended once per
             step
+    :param preserve_sparsity: hold every weight element that starts at zero
+            at zero for the whole run. Off by default, and it is the caller's
+            call rather than a detected one, because "this element is zero" and
+            "this element was pruned away" are the same bit pattern and only
+            the caller knows which they meant.
+
+            **Turn it on for an unstructured-pruned model.** Nothing else in
+            the step graph masks the optimizer, so without it a pruned zero
+            gets a gradient like any other element and leaves zero on the very
+            first step: measured at 50% sparsity, 128 zeros per weight before
+            and none after, while the loss fell five orders of magnitude. Every
+            signal a caller would look at says that run went well, which is
+            what makes it worth a parameter rather than a note.
+
+            Structured pruning needs nothing here -- there the channel is gone
+            from the tensor rather than zeroed inside it.
+
+            The mask is the zero pattern of the weight the optimizer *starts*
+            from, which is the master weight's seed: the student's own weight
+            when fine-tuning, and the float model's when quantizing (so for
+            QAT over a pruned model, prune first and pass the pruned model as
+            ``float_model``, which is the ordinary order anyway). Elements it
+            holds are held exactly, not approximately -- see
+            :func:`_build_step_graph` for why one ``Mul`` is enough.
     :returns: ``model`` with the block's weight initializers rewritten. Every
             other byte is untouched.
     :raises ValueError: if the block cannot be discovered, is not closed at
@@ -2890,6 +2959,7 @@ def apply_block_finetune(
         step_providers=step_providers,
         losses=losses,
         fake_quant=False,
+        preserve_sparsity=preserve_sparsity,
     )
 
 
@@ -2910,6 +2980,7 @@ def apply_block_finetune_all_blocks(
     max_layers_per_block: int = 2,
     providers: Optional[Sequence[backend.Provider]] = None,
     step_providers: Optional[Sequence[backend.Provider]] = None,
+    preserve_sparsity: bool = False,
 ) -> Tuple[onnx.ModelProto, List[QATBlockResult]]:
     """:func:`apply_block_finetune` lifted to the whole model, exactly as
     :func:`apply_qat_all_blocks` lifts :func:`apply_qat`.
@@ -2948,4 +3019,5 @@ def apply_block_finetune_all_blocks(
         providers=providers,
         step_providers=step_providers,
         fake_quant=False,
+        preserve_sparsity=preserve_sparsity,
     )

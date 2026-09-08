@@ -43,6 +43,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fields, decode } from "../macs.mjs";
 import { readShapes } from "../shapes.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -126,6 +127,27 @@ function copyBytes(view) {
 
 function names(valueInfos) {
   return valueInfos.map((v) => v.name);
+}
+
+// The op types of a model's nodes, read straight out of the bytes with the
+// same dependency-free wire reader shapes.mjs uses (ModelProto.graph = 7,
+// GraphProto.node = 1, NodeProto.op_type = 4). A substring search over the
+// model bytes would do for a name as long as "DequantizeLinear", but not for
+// the three-letter op names below -- "Abs" would match three bytes of a
+// weight as happily as an op type.
+function opTypes(modelBytes) {
+  const buf = modelBytes instanceof Uint8Array ? modelBytes : new Uint8Array(modelBytes);
+  const ops = new Set();
+  for (const model of fields(buf)) {
+    if (model.field !== 7 || model.wire !== 2) continue;
+    for (const graph of fields(model.bytes)) {
+      if (graph.field !== 1 || graph.wire !== 2) continue;
+      for (const node of fields(graph.bytes)) {
+        if (node.field === 4 && node.wire === 2) ops.add(decode(node.bytes));
+      }
+    }
+  }
+  return ops;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +365,60 @@ async function main() {
       assert.notEqual(capture.input, capture.source);
       assert.equal(capture.dims[0], NUM_ROWS);
     }
+  });
+
+  // --- the fine-tuning variant ----------------------------------------------
+  //
+  // fakeQuant:false takes the quantizer out of the middle and trains the
+  // *second* model's own float weights, so the student here is the float model
+  // rather than the quantized one -- the quantized model's MatMul reads a
+  // DequantizeLinear's output, not a stored weight, and would have nothing to
+  // fine-tune. Both models being the same one makes for a zero loss and
+  // nothing to learn, which is fine: what is under test is the graph the
+  // builder returns, and the numerics belong to the python tests.
+  await check("fakeQuant:false builds a step graph with no fake-quant in it", () => {
+    const tuned = runtime.onnxsim_qat_build_step_graph(
+      floatModel,
+      floatModel,
+      "X",
+      "Y",
+      NUM_ROWS,
+      { fakeQuant: false },
+    );
+    assert.ok(tuned, "onnxsim_qat_build_step_graph returned null for fakeQuant:false");
+    const graph = copyBytes(tuned.stepGraph);
+    const tunedState = tuned.state.map((s) => ({ input: s.input, output: s.output }));
+    const tunedScalars = [...tuned.scalars];
+    const tunedInputs = new Set(names(readShapes(graph).inputs));
+    runtime.onnxsim_qat_release_plan(tuned.planHandle);
+
+    assert.equal(tunedState.length, 3, "one weight plus Adam's two moments");
+    assert.equal(tunedScalars.length, 3, "no scale learning rate to feed");
+    for (const { input } of tunedState) {
+      assert.ok(tunedInputs.has(input), `state input '${input}' is not a graph input`);
+    }
+    // The weight fake-quant is Abs/Sign (GraphBuilder's RoundToNearest) and
+    // Clip; none of the three has any other reason to be in this graph, so
+    // their absence is what "the quantizer is gone" looks like from out here.
+    const ops = opTypes(graph);
+    assert.ok(ops.size > 0, "no nodes -- the step graph bytes did not parse");
+    for (const op of ["Abs", "Sign", "Clip", "Round"]) {
+      assert.ok(!ops.has(op), `the fine-tuning step graph contains a ${op}`);
+    }
+    assert.ok(ops.has("MatMul"), "the block's own node is still there");
+  });
+
+  await check("fakeQuant:false refuses the two scale flags rather than ignoring them", () => {
+    // Both name a parameter of a quantizer, and this is the mode with no
+    // quantizer in it. BuildQatStepGraph throws; the binding turns that into
+    // null with the reason on the console.
+    assert.equal(
+      runtime.onnxsim_qat_build_step_graph(floatModel, floatModel, "X", "Y", NUM_ROWS, {
+        fakeQuant: false,
+        learnScales: true,
+      }),
+      null,
+    );
   });
 
   // --- refusals -------------------------------------------------------------

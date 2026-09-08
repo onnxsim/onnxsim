@@ -1531,10 +1531,19 @@ strictly better. What it cannot do is what a block buys: it declines a layer
 pruned on its input and output channels at once, and a per-layer least-squares
 fit cannot let two layers with a nonlinearity between them trade error off
 against each other. `apply_block_finetune` is the general, slower,
-weaker-guarantee alternative for those cases. It also has no sparsity mask
-anywhere in the step graph, so it *fills in* the zeros of an unstructured
-(magnitude-pruned) model: measured on a two-layer block at 50% sparsity, 128
-zeros per weight before and 0 after.
+weaker-guarantee alternative for those cases.
+
+By default it *fills in* the zeros of an unstructured (magnitude-pruned)
+model, since nothing masks the optimizer: measured on a two-layer block at 50%
+sparsity, 128 zeros per weight before and 0 after, while the loss fell five
+orders of magnitude. Pass `preserve_sparsity=True` to hold every element that
+starts at zero at zero -- exactly, via one `Mul` on the gradient, which also
+keeps Adam's moments at zero. It costs accuracy, because half the parameters
+are pinned (held-out error 0.241 before, 0.191 with the zeros kept, 0.000 for
+the unconstrained run that hands back a dense model), and it is opt-in because
+only the caller knows whether a zero is a pruned weight or just a small one.
+`apply_qat` takes the same flag, where the erosion is gradual with the
+learning rate rather than immediate.
 
 ### Running AdaRound, AdaQuant and AutoRound on an accelerator
 
