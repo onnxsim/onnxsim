@@ -302,6 +302,10 @@ class _QuantizedLayer:
       onto the same rank-3 reshape with ``block_size`` = that axis's length
       and a scale of shape ``[1, N]`` (or ``[N, 1]`` for a ``transB`` Gemm's
       ``[N, K]`` weight). No special case is needed anywhere below.
+    - **no quantization at all**: :func:`_from_float`, which is what turns
+      this module into a plain fine-tuner. The layer's weight is trained as
+      itself and written back as itself; there is no code array, no scale and
+      no activation quantizer. See :attr:`fake_quant`.
     """
 
     output_name: str
@@ -320,6 +324,14 @@ class _QuantizedLayer:
     #: INT4 codes are packed two to a byte on export; INT8 codes are not.
     packed_int4: bool
     act: Optional[_ActQuant]
+    #: Whether the step graph fake-quantizes this layer's weight on the way
+    #: into the block. ``False`` is :func:`_from_float`'s third scheme: the
+    #: block reads the master weight directly, the straight-through estimator
+    #: has nothing to pass through, and the write-back stores fp32 rather than
+    #: codes. Every field above describing the quantizer is then *unread* --
+    #: and carries a value that would fail loudly rather than quietly if some
+    #: future caller read one anyway (see :func:`_from_float`).
+    fake_quant: bool = True
 
 
 def _from_int4(candidate) -> _QuantizedLayer:
@@ -405,10 +417,85 @@ def _from_static(
     )
 
 
+def _from_float(node: onnx.NodeProto, w_init: onnx.TensorProto) -> _QuantizedLayer:
+    """A plain, unquantized MatMul/Gemm -- the scheme that makes this module a
+    fine-tuner rather than only a quantizer.
+
+    Everything downstream is already written against "a master weight the
+    block reads and an optimizer updates"; quantization is what sits *between*
+    those two, and :attr:`_QuantizedLayer.fake_quant` is the switch that
+    removes it. So this constructor's job is only to say which weight is
+    trainable and where it is written back -- which, with no code array in the
+    picture, is the weight initializer itself.
+
+    The quantizer fields are unread when ``fake_quant`` is off, and they are
+    filled in with values chosen to *break* rather than to look plausible:
+    ``block_size`` of 0 makes the write-back's ``np.repeat`` produce an empty
+    array and ``n_min == n_max == 0`` makes a fake-quant forward produce all
+    zeros. A neutral-looking ``block_size`` of 1 with a unit scale would
+    instead round the weights to integers and train on quietly, which is the
+    failure mode worth ruling out: it is wrong, and it looks like a model
+    that merely trained badly.
+    """
+    return _QuantizedLayer(
+        output_name=node.output[0],
+        float_node=node,
+        w_float_init=w_init,
+        # There is no separate code array: the tensor trained and the tensor
+        # written back are the same one.
+        wq_name=w_init.name,
+        ws_name="",
+        ws_dims=(),
+        scale_2d=np.zeros((1, 1), dtype=np.float32),
+        axis=0,
+        block_size=0,
+        n_min=0.0,
+        n_max=0.0,
+        packed_int4=False,
+        act=None,
+        fake_quant=False,
+    )
+
+
+def _find_float_layers(model: onnx.ModelProto) -> List[_QuantizedLayer]:
+    """Every plain MatMul/Gemm in ``model`` whose weight is a 2-D fp32
+    initializer.
+
+    Scanned out of the *student* rather than the teacher, unlike the two
+    quantized schemes, and that is the substantive difference between
+    fine-tuning and QAT rather than an implementation detail. QAT seeds its
+    master weights from the teacher because the student's weights are a
+    lossy encoding of them and the teacher's are the thing being encoded.
+    Fine-tuning has no such relationship: the student's weights are the
+    starting point precisely because they are *not* the teacher's -- they
+    were pruned, or simplified, or already tuned -- and re-seeding from the
+    teacher would throw that away before the first step.
+
+    Rank-2 and fp32 are required for the same reason the other two schemes
+    require them: :class:`_Trained` carries the weight as a 2-D fp32 array,
+    and a layer this does not recognize is simply not trained.
+    """
+    initializers = {t.name: t for t in model.graph.initializer}
+    layers: List[_QuantizedLayer] = []
+    for node in model.graph.node:
+        if node.op_type not in ("MatMul", "Gemm") or len(node.input) < 2:
+            continue
+        if not node.output or not node.output[0]:
+            continue
+        w_init = initializers.get(node.input[1])
+        if w_init is None:
+            continue
+        if w_init.data_type != onnx.TensorProto.FLOAT or len(w_init.dims) != 2:
+            continue
+        layers.append(_from_float(node, w_init))
+    return layers
+
+
 def _find_layers(
     float_model: onnx.ModelProto,
     quantized_model: onnx.ModelProto,
     activation_quant: bool,
+    fake_quant: bool = True,
 ) -> List[_QuantizedLayer]:
     """Every layer of the scheme this run targets, in one list.
 
@@ -417,7 +504,13 @@ def _find_layers(
     per-channel INT8, and a weight-only model has no activation QDQ pair at
     all -- so this selects rather than merges. Which one is selected is the
     single decision ``learn_activation_scales`` makes; see :func:`apply_qat`.
+
+    ``fake_quant=False`` selects neither: it is the third scheme, in which
+    there is nothing quantized to look for and the trainable layers are just
+    the student's own float ones.
     """
+    if not fake_quant:
+        return _find_float_layers(quantized_model)
     if not activation_quant:
         return [
             _from_int4(c)
@@ -986,6 +1079,7 @@ def _build_step_graph(
     learn_scales: bool,
     batch: Optional[_Minibatch] = None,
     learn_activation_scales: bool = False,
+    fake_quant: bool = True,
 ) -> qat_graph.StepGraph:
     """The whole loop as one graph: fake-quant forward, block forward,
     reconstruction loss, backward, Adam.
@@ -1003,6 +1097,15 @@ def _build_step_graph(
     the layer that reads it, and its differentiable half joins the list
     handed to the backward. The block's other nodes are untouched, so the
     two features compose without either knowing about the other.
+
+    With ``fake_quant=False`` step 1 disappears instead: the block's node
+    reads the master weight itself, the loop is plain gradient descent on the
+    block's weights, and everything else here -- the teacher, the loss, the
+    backward, Adam, the minibatch -- is the same graph it always was. What
+    makes that a *fine-tuner* rather than a no-op is that the teacher and the
+    student are different models: the student is the pruned, simplified or
+    otherwise altered one, and the block is trained to reproduce what the
+    original produced at that point.
 
     ``externals`` and ``block_output_shape`` are always the *whole*
     calibration set's arrays and shape. With ``batch`` set they become the
@@ -1045,8 +1148,32 @@ def _build_step_graph(
     #    block's own node already reads, so the block's nodes need no
     #    rewriting at all -- the weight initializer simply became a computed
     #    value.
-    per_layer = []
+    # (layer, the tensor its gradient arrives on, and the fake-quant's own
+    # intermediates). The last four are None exactly when there is no
+    # fake-quant, which is what step 5 branches on.
+    per_layer: List[
+        Tuple[_Trained, str, Optional[str], Optional[str], Optional[str], Optional[str]]
+    ] = []
+    # Block tensor name -> what the block's own node should read instead.
+    # Only ``fake_quant=False`` puts anything here: the master weight is
+    # substituted for the weight initializer by *renaming one input*, rather
+    # than by emitting an Identity, because ``Identity`` is not in
+    # EP_FRIENDLY_OPS -- a node whose whole job is to copy a tensor is a node
+    # an execution provider would have to implement for no reason.
+    weight_rewrites: Dict[str, str] = {}
+    weight_shapes: Dict[str, Sequence[int]] = {}
     for t in trained:
+        if not fake_quant:
+            weight_name = t.candidate.float_node.input[1]
+            weight_rewrites[weight_name] = t.w_input
+            # The master weight is now a differentiated *leaf* of the block
+            # rather than a value computed inside it, so the backward needs
+            # its shape the way it needs the block's own tensors'.
+            weight_shapes[t.w_input] = list(t.w_shape)
+            # No quantizer, so no straight-through mask: the ``active`` slot
+            # below is None and step 5 uses the raw gradient.
+            per_layer.append((t, t.w_input, None, None, None, None))
+            continue
         block_size = t.candidate.block_size
         if t.scale_input is None:
             scale = b.const(t.scale_init, "scale")
@@ -1079,16 +1206,21 @@ def _build_step_graph(
     differentiated: List[onnx.NodeProto] = []
     for node in nodes:
         layer = quantized_input.get(node.output[0]) if node.output else None
-        if layer is not None:
-            emitted, diff_nodes, extra, xdq = _emit_activation_fake_quant(
-                b, layer, shapes[node.input[0]]
-            )
-            forward.extend(emitted)
-            differentiated.extend(diff_nodes)
-            act_shapes.update(extra)
+        rewrites = [name for name in node.input if name in weight_rewrites]
+        if layer is not None or rewrites:
             rewritten = onnx.NodeProto()
             rewritten.CopyFrom(node)
-            rewritten.input[0] = xdq
+            if layer is not None:
+                emitted, diff_nodes, extra, xdq = _emit_activation_fake_quant(
+                    b, layer, shapes[node.input[0]]
+                )
+                forward.extend(emitted)
+                differentiated.extend(diff_nodes)
+                act_shapes.update(extra)
+                rewritten.input[0] = xdq
+            for i, name in enumerate(rewritten.input):
+                if name in weight_rewrites:
+                    rewritten.input[i] = weight_rewrites[name]
             node = rewritten
         forward.append(node)
         differentiated.append(node)
@@ -1110,6 +1242,7 @@ def _build_step_graph(
     #    fake-quant chain.
     all_shapes = dict(shapes)
     all_shapes.update(act_shapes)
+    all_shapes.update(weight_shapes)
     targets = [weight_name for _, weight_name, _, _, _, _ in per_layer]
     for t in trained:
         if t.act is not None:
@@ -1124,16 +1257,18 @@ def _build_step_graph(
 
     # 5. Straight through the fake-quant, into the master weight and (if
     #    asked for) the scale, then one Adam step each.
-    for t, weight_name, _scale_full, code, ratio, active in per_layer:
+    for t, weight_name, _scale_full, quant_code, quant_ratio, ste_mask in per_layer:
         g = grads[weight_name]  # dL/d(w_hat), in the weight's storage layout
         # STE: d(w_hat)/d(w) is 1 inside the clipping range and 0 outside.
         # The scale cancels -- w_hat = round(w/s)*s -- which is why a
         # straight-through weight gradient is just the masked output
-        # gradient, with no scale factor anywhere.
+        # gradient, with no scale factor anywhere. Without a fake-quant there
+        # is no clipping range and no estimator: ``g`` is already dL/dw.
+        w_grad = g if ste_mask is None else b.mul(g, ste_mask)
         t.w_next, t.m_next, t.v_next = qat_graph.adam_update(
             b,
             t.w_input,
-            b.mul(g, active),
+            w_grad,
             t.m_input,
             t.v_input,
             f"{_PREFIX}lr",
@@ -1145,7 +1280,7 @@ def _build_step_graph(
             # d(w_hat)/d(s) = code - w/s where the element is inside the
             # clipping range (the gap between the integer it rounds to and the
             # exact ratio) and just `code` where it saturates.
-            dwhat_ds = b.sub(code, b.mul(active, ratio))
+            dwhat_ds = b.sub(str(quant_code), b.mul(str(ste_mask), str(quant_ratio)))
             g_scale = _sum_over_blocks(
                 b,
                 b.mul(g, dwhat_ds),
@@ -1265,6 +1400,7 @@ def _no_layers_message(
     block_input_name: str,
     block_output_name: str,
     learn_activation_scales: bool,
+    fake_quant: bool = True,
 ) -> str:
     """Why this block has nothing to train, said in terms of the *scheme* the
     caller asked for.
@@ -1278,6 +1414,14 @@ def _no_layers_message(
     costs one extra scan of the model, on a path that is about to raise.
     """
     where = f"the block between {block_input_name!r} and {block_output_name!r}"
+    if not fake_quant:
+        return (
+            f"{where} contains no MatMul/Gemm with a 2-D fp32 weight "
+            "initializer to fine-tune (fake_quant=False trains the model's "
+            "own float weights, so a layer whose weight is computed rather "
+            "than stored, or stored at some other rank or dtype, has nothing "
+            "for the optimizer to hold)"
+        )
     if learn_activation_scales:
         if _find_int4_matmul_candidates(float_model, quantized_model):
             return (
@@ -1312,6 +1456,7 @@ def _plan_block(
     block_input_name: str,
     block_output_name: str,
     learn_activation_scales: bool = False,
+    fake_quant: bool = True,
 ) -> _BlockPlan:
     """Slices the block out of the float graph and checks the three things
     that make it trainable at all: it is non-empty, every op in it has a
@@ -1326,6 +1471,10 @@ def _plan_block(
     under one and refused under the other. That is the point rather than a
     wart: the two are different deployed models, and a run has to be aimed
     at the one that will ship.
+
+    ``fake_quant=False`` replaces that question with a simpler one: the
+    trainable layers are the student's own float MatMul/Gemms, and the third
+    check becomes "at least one of those".
     """
     nodes, externals = _slice_block(
         float_model.graph, block_input_name, block_output_name
@@ -1339,7 +1488,9 @@ def _plan_block(
     slice_outputs = {out for node in nodes for out in node.output if out}
     candidates = [
         c
-        for c in _find_layers(float_model, quantized_model, learn_activation_scales)
+        for c in _find_layers(
+            float_model, quantized_model, learn_activation_scales, fake_quant
+        )
         if c.output_name in slice_outputs
     ]
     if not candidates:
@@ -1350,6 +1501,7 @@ def _plan_block(
                 block_input_name,
                 block_output_name,
                 learn_activation_scales,
+                fake_quant,
             )
         )
     return _BlockPlan(
@@ -1426,6 +1578,7 @@ def _train_block(
     batch_seed: int = 0,
     learn_activation_scales: bool = False,
     activation_learning_rate: float = 1e-2,
+    fake_quant: bool = True,
 ) -> onnx.ModelProto:
     """Runs the whole optimization for one already-planned, already-captured
     block and returns ``quantized_model`` with that block's initializers
@@ -1455,9 +1608,17 @@ def _train_block(
     trained = _plan_trained(plan.candidates, learn_scales, learn_activation_scales)
     trained_weight_names = {t.candidate.float_node.input[1] for t in trained}
     used = {name for node in plan.nodes for name in node.input if name}
+    # The block's *untrained* constants -- a LayerNorm's scale and bias, a
+    # Gemm's C -- come from whichever model the trained weights came from, and
+    # for the same reason. Under QAT that is the teacher, whose weights the
+    # student encodes. Under fine-tuning it is the student, because the
+    # student is a different model and quietly substituting the teacher's
+    # constants into it would train the block to compensate for a
+    # substitution the deployed model does not make.
+    constant_source = float_model if fake_quant else quantized_model
     block_initializers = [
         t
-        for t in float_model.graph.initializer
+        for t in constant_source.graph.initializer
         if t.name in used and t.name not in trained_weight_names
     ]
 
@@ -1472,6 +1633,7 @@ def _train_block(
         learn_scales,
         batch,
         learn_activation_scales,
+        fake_quant,
     )
 
     # The whole set is the constant either way; with a minibatch it is bound
@@ -1547,11 +1709,18 @@ def _train_block(
     )
 
     new_codes: Dict[str, np.ndarray] = {}
+    new_weights: Dict[str, np.ndarray] = {}
     new_scales: Dict[str, np.ndarray] = {}
     new_act_scales: Dict[str, float] = {}
     new_act_zps: Dict[str, int] = {}
     for t in trained:
         w = final[t.w_input].astype(np.float64)
+        if not t.candidate.fake_quant:
+            # Nothing to project back onto: the master weight *is* what the
+            # model stores, so the write-back is the identity that the two
+            # quantized schemes' rounding and clipping stand in for.
+            new_weights[t.candidate.wq_name] = w.astype(np.float32)
+            continue
         scale = (
             final[t.scale_input].astype(np.float64)
             if t.scale_input is not None
@@ -1581,6 +1750,12 @@ def _train_block(
     tuned = onnx.ModelProto()
     tuned.CopyFrom(quantized_model)
     for initializer in tuned.graph.initializer:
+        weight = new_weights.get(initializer.name)
+        if weight is not None:
+            initializer.CopyFrom(
+                onnx.numpy_helper.from_array(weight, name=initializer.name)
+            )
+            continue
         codes = new_codes.get(initializer.name)
         if codes is not None:
             if initializer.data_type == onnx.TensorProto.INT4:
@@ -1614,6 +1789,38 @@ def _train_block(
     return tuned
 
 
+def _refuse_quantizer_flags_without_fake_quant(
+    fake_quant: bool, learn_scales: bool, learn_activation_scales: bool
+) -> None:
+    """``fake_quant=False`` and the two scale flags are a contradiction, not a
+    combination.
+
+    Both scale flags name a parameter of a quantizer, and with the fake-quant
+    gone there is no quantizer for them to name -- no weight scale, no
+    activation scale, no zero-point. Silently ignoring them would be the worse
+    failure of the two available: a caller who asked to learn scales and got a
+    model whose scales are exactly as they were has no way to tell that from a
+    run in which learning them did not help.
+    """
+    if fake_quant:
+        return
+    asked = [
+        name
+        for name, on in (
+            ("learn_scales", learn_scales),
+            ("learn_activation_scales", learn_activation_scales),
+        )
+        if on
+    ]
+    if asked:
+        raise ValueError(
+            f"{' and '.join(asked)} cannot be used with fake_quant=False: "
+            "both train a quantizer's parameters, and fake_quant=False is "
+            "the mode with no quantizer in it. Fine-tuning trains the "
+            "weights themselves."
+        )
+
+
 def apply_qat(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],
@@ -1635,6 +1842,7 @@ def apply_qat(
     providers: Optional[Sequence[backend.Provider]] = None,
     step_providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
+    fake_quant: bool = True,
 ) -> onnx.ModelProto:
     """Fine-tunes one block's quantized weights (and, opted in, its activation
     quantizers) against the float model's own
@@ -1862,6 +2070,17 @@ def apply_qat(
     :param losses: when given, the reconstruction loss is appended to it once
             per step -- the cheapest way to see whether a block actually
             trained, and what the tests here assert on.
+    :param fake_quant: with ``False``, drop the fake-quantizer and train the
+            *second model's own float weights* directly. Everything else --
+            the teacher, the reconstruction loss, the backward, Adam, the
+            minibatch -- is unchanged, so this is the same block-wise,
+            label-free distillation with the quantizer taken out of the
+            middle: plain fine-tuning. :func:`apply_block_finetune` is this with a
+            name that says so and without the parameters that stop meaning
+            anything; prefer it, and see its docstring for when the two
+            models differ enough for there to be something to learn.
+            Incompatible with ``learn_scales`` and
+            ``learn_activation_scales``, which have no scales to learn.
     :returns: ``quantized_model`` with the block's quantized weight
             initializers (and, if ``learn_scales``, their scale
             initializers; if ``learn_activation_scales``, the activation
@@ -1876,6 +2095,9 @@ def apply_qat(
     :raises onnxsim.graph_grad.UnsupportedOpError: if any node in the block
             has no gradient rule
     """
+    _refuse_quantizer_flags_without_fake_quant(
+        fake_quant, learn_scales, learn_activation_scales
+    )
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -1887,6 +2109,7 @@ def apply_qat(
         block_input_name,
         block_output_name,
         learn_activation_scales,
+        fake_quant,
     )
 
     if calibration_data is None:
@@ -1918,6 +2141,7 @@ def apply_qat(
         batch_seed=batch_seed,
         step_providers=step_providers,
         losses=losses,
+        fake_quant=fake_quant,
     )
 
 
@@ -2089,6 +2313,7 @@ def discover_qat_blocks(
     quantized_model: Union[str, onnx.ModelProto],
     max_layers_per_block: int = 2,
     learn_activation_scales: bool = False,
+    fake_quant: bool = True,
 ) -> List[QATBlock]:
     """Partitions the model into a sequence of blocks :func:`apply_qat` can
     train, without the caller naming a single tensor.
@@ -2179,7 +2404,9 @@ def discover_qat_blocks(
     cuts = _liveness_cuts(graph, _primary_graph_input(graph))
     quantized_outputs = {
         c.output_name
-        for c in _find_layers(float_model, quantized_model, learn_activation_scales)
+        for c in _find_layers(
+            float_model, quantized_model, learn_activation_scales, fake_quant
+        )
     }
 
     # Walk the spans between consecutive cuts, accumulating them into blocks.
@@ -2218,6 +2445,7 @@ def discover_qat_blocks(
                 input_name,
                 output_name,
                 learn_activation_scales,
+                fake_quant,
             )
         except ValueError:
             # Defensive: the span construction above already guarantees a
@@ -2286,6 +2514,7 @@ def apply_qat_all_blocks(
     max_layers_per_block: int = 2,
     providers: Optional[Sequence[backend.Provider]] = None,
     step_providers: Optional[Sequence[backend.Provider]] = None,
+    fake_quant: bool = True,
 ) -> Tuple[onnx.ModelProto, List[QATBlockResult]]:
     """Trains every block :func:`discover_qat_blocks` finds, in graph order --
     :func:`apply_qat` lifted from one caller-named block to the whole model.
@@ -2399,6 +2628,9 @@ def apply_qat_all_blocks(
             block's initializers rewritten and nothing else touched; if no
             block trained it is an unmodified copy.
     """
+    _refuse_quantizer_flags_without_fake_quant(
+        fake_quant, learn_scales, learn_activation_scales
+    )
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -2410,6 +2642,7 @@ def apply_qat_all_blocks(
             quantized_model,
             max_layers_per_block=max_layers_per_block,
             learn_activation_scales=learn_activation_scales,
+            fake_quant=fake_quant,
         )
     if calibration_data is None:
         calibration_data = generate_random_calibration_data(
@@ -2419,8 +2652,12 @@ def apply_qat_all_blocks(
     # Plans are built once, against the *original* quantized model. Training a
     # block rewrites initializer payloads and never the graph, so a plan --
     # which is nodes, tensor names and candidate metadata -- stays valid for
-    # the whole walk. Master weights are seeded from the float model in every
-    # case (see :func:`_plan_trained`), so no plan depends on the tuned state.
+    # the whole walk. No plan depends on the tuned state either: under QAT the
+    # master weights are seeded from the float model (see
+    # :func:`_plan_trained`), and with ``fake_quant=False`` they are seeded
+    # from the student's own weights, which for a block about to be trained
+    # are still the ones this plan captured -- each block is trained exactly
+    # once, so nothing has rewritten them yet.
     plans: List[Optional[_BlockPlan]] = []
     results: List[QATBlockResult] = []
     for block in blocks:
@@ -2432,6 +2669,7 @@ def apply_qat_all_blocks(
                     block.input_name,
                     block.output_name,
                     learn_activation_scales,
+                    fake_quant,
                 )
             )
             results.append(QATBlockResult(block=block, trained=False))
@@ -2490,6 +2728,7 @@ def apply_qat_all_blocks(
                 batch_seed=batch_seed,
                 step_providers=step_providers,
                 losses=result.losses,
+                fake_quant=fake_quant,
             )
         except (ValueError, graph_grad.UnsupportedOpError) as error:
             # A step graph that was half-built cannot have touched ``tuned``
@@ -2500,3 +2739,194 @@ def apply_qat_all_blocks(
             continue
         result.trained = True
     return tuned, results
+
+
+def apply_block_finetune(
+    reference_model: Union[str, onnx.ModelProto],
+    model: Union[str, onnx.ModelProto],
+    block_input_name: str,
+    block_output_name: str,
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 1000,
+    learning_rate: float = 1e-4,
+    lr_decay: bool = True,
+    batch_size: Optional[int] = None,
+    shuffle: bool = True,
+    batch_seed: int = 0,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    step_providers: Optional[Sequence[backend.Provider]] = None,
+    losses: Optional[List[float]] = None,
+) -> onnx.ModelProto:
+    """Fine-tunes one block's float weights against a *reference* model's own
+    output for that block -- :func:`apply_qat` with the quantizer taken out of
+    the middle.
+
+    Everything that made QAT here work is about distillation rather than about
+    quantization: a block, a teacher's activation at its output, a mean
+    squared reconstruction error, a backward pass emitted as ONNX, an Adam
+    step. Quantization only ever entered at one point -- the fake-quantizer
+    between the master weight and the block's node -- and removing it leaves
+    ordinary block-wise fine-tuning. No labels, no loss function to choose, no
+    training framework: the same step graph, run the same way, on whatever
+    execution provider ``step_providers`` names.
+
+    **The two models must differ, or there is nothing to learn.** The loss is
+    the student block's output against the reference's, so a student that *is*
+    the reference starts at zero loss and stays there. This is for the case
+    where something has already changed the model and the change cost
+    accuracy:
+
+    - a pruned model (:func:`onnxsim.prune_model` and friends), whose
+      remaining weights can absorb some of what the removed ones did;
+    - a model whose weights were quantized and dequantized back to fp32, or
+      rewritten by any of this package's rounding passes;
+    - a model already fine-tuned once, being tuned further against the
+      original.
+
+    It is *not* a way to fine-tune on new data or a new task: the objective is
+    "reproduce what the reference model produced", which by construction
+    cannot exceed the reference. Fitting a different target needs a different
+    loss, and this module has one loss.
+
+    **Against :func:`onnxsim.apply_pruning_finetune`,** which solves the same
+    kind of problem and should usually be tried first for pruning. That one
+    fits each layer *individually* and in *closed form* -- one ridge
+    regression, one linear solve, no iteration, no learning rate, and an
+    exactness argument this has no equivalent of. It is strictly better
+    wherever it applies. What it cannot do is what a block buys: a layer
+    pruned on both its input and its output channels at once is outside its
+    channel-correspondence reconstruction and it declines to touch it, and a
+    per-layer least-squares fit cannot let two layers with a nonlinearity
+    between them trade error off against each other, because that objective
+    is not a linear least-squares problem at all. This is the general,
+    slower, weaker-guarantee alternative for those cases -- and, unlike a
+    numpy solve, it is a step graph, so it runs on whatever
+    ``step_providers`` names.
+
+    :param reference_model: the teacher (onnx ModelProto or file path). Its
+            activation at ``block_output_name`` is the only target. Its
+            weights are *not* used to seed anything -- unlike
+            :func:`apply_qat`, where the student's weights are a lossy
+            encoding of the teacher's and so seeding from the teacher is the
+            warm start. Here the student's weights are the starting point
+            precisely because they are not the teacher's.
+    :param model: the model being tuned (onnx ModelProto or file path). Every
+            MatMul/Gemm in the block whose weight is a 2-D fp32 initializer is
+            trained; the rest of the block is left alone, and a block with
+            none of them is an error rather than a no-op. Assumed to have
+            ``reference_model``'s topology and tensor names -- true of a
+            pruned or requantized model, and the same assumption
+            :func:`apply_qat` makes.
+    :param block_input_name: the activation entering the block
+    :param block_output_name: the block's own final output, the tensor whose
+            reconstruction error is the loss
+    :param calibration_data: representative input batches; see
+            :func:`apply_qat`, whose meaning is unchanged
+    :param num_samples: random batches to generate when ``calibration_data``
+            is omitted
+    :param seed: seed for that random calibration data
+    :param num_iterations: Adam steps to run over the block
+    :param learning_rate: Adam learning rate for the weights. The default is
+            :func:`apply_qat`'s, and is a starting point rather than a
+            recommendation: QAT's objective is piecewise constant in the
+            master weights (the loss only moves when an element crosses a
+            rounding boundary), and this one is not, so a rate tuned for one
+            is not tuned for the other.
+    :param lr_decay: anneal the learning rate linearly to zero across the run
+    :param batch_size: rows of the calibration set each step trains on;
+            ``None`` is full batch. See :func:`apply_qat`.
+    :param shuffle: draw a fresh permutation of the rows each epoch
+    :param batch_seed: seed for that shuffling
+    :param providers: onnxruntime execution providers for capturing the
+            reference's activations
+    :param step_providers: onnxruntime execution providers to run the
+            optimization itself on
+    :param losses: when given, the reconstruction loss is appended once per
+            step
+    :returns: ``model`` with the block's weight initializers rewritten. Every
+            other byte is untouched.
+    :raises ValueError: if the block cannot be discovered, is not closed at
+            statically-known shapes, or contains no MatMul/Gemm with a 2-D
+            fp32 weight initializer
+    :raises onnxsim.graph_grad.UnsupportedOpError: if any node in the block
+            has no gradient rule
+    """
+    return apply_qat(
+        reference_model,
+        model,
+        block_input_name,
+        block_output_name,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        lr_decay=lr_decay,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        batch_seed=batch_seed,
+        providers=providers,
+        step_providers=step_providers,
+        losses=losses,
+        fake_quant=False,
+    )
+
+
+def apply_block_finetune_all_blocks(
+    reference_model: Union[str, onnx.ModelProto],
+    model: Union[str, onnx.ModelProto],
+    blocks: Optional[Sequence[QATBlock]] = None,
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 1000,
+    learning_rate: float = 1e-4,
+    lr_decay: bool = True,
+    batch_size: Optional[int] = None,
+    shuffle: bool = True,
+    batch_seed: int = 0,
+    sequential: bool = True,
+    max_layers_per_block: int = 2,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    step_providers: Optional[Sequence[backend.Provider]] = None,
+) -> Tuple[onnx.ModelProto, List[QATBlockResult]]:
+    """:func:`apply_block_finetune` lifted to the whole model, exactly as
+    :func:`apply_qat_all_blocks` lifts :func:`apply_qat`.
+
+    The sequential default matters more here than it does under QAT, and for
+    the same reason it matters at all: block *k* is fed the *student's* own
+    activation, so it sees the error the earlier blocks left and can spend its
+    capacity on it. Under QAT that error is quantization noise; here it is
+    whatever the change to the model actually cost -- a pruned channel's
+    absence, say -- which is exactly what a later block would otherwise never
+    learn about.
+
+    Discovery, per-block failure handling and the returned results are
+    :func:`apply_qat_all_blocks`'s, unchanged. A block with no trainable
+    MatMul/Gemm is skipped with a reason rather than raising.
+
+    See :func:`apply_block_finetune` for what this is for, when the two models
+    are different enough for there to be anything to learn, and how it
+    compares with :func:`onnxsim.apply_pruning_finetune`.
+    """
+    return apply_qat_all_blocks(
+        reference_model,
+        model,
+        blocks=blocks,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        lr_decay=lr_decay,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        batch_seed=batch_seed,
+        sequential=sequential,
+        max_layers_per_block=max_layers_per_block,
+        providers=providers,
+        step_providers=step_providers,
+        fake_quant=False,
+    )
