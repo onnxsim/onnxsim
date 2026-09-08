@@ -3865,6 +3865,55 @@ absence of a dilation-only register -- comes from the 34-build sweep in this
 session's notes rather than from a regression test; it is a measurement of
 this toolchain version, not an invariant worth 34 Docker builds per CI run.
 
+### The same register, two spatial rules
+
+Running the same procedure over *2-D* convolutions -- 23 training builds
+sweeping `Cin`, `Cout`, height, width and kernel, against four held-out
+combinations -- first produced two apparent survivors, and both were wrong.
+Catching them sharpened the method.
+
+**A held-out set only falsifies what it actually varies.** The two candidates
+were quadratic in the kernel size, fitted to the three kernel values in the
+sweep with three free parameters -- exact by construction. The held-out
+configurations reused those same three kernel values, so they could not
+refute a kernel-only model. Extrapolating one to `k = 7` predicts **-9** for
+a two-bit field; the measured value is 0. A held-out set has to contain
+unseen *values* of whatever a candidate depends on, not merely unseen
+combinations.
+
+**What the register actually holds in 2-D.** The same `a1 b0.03` bits 4 to 6
+carry
+
+    floor((W + 2*pad - 1) / 32)
+
+the index of the last 32-wide tile of the *padded* width. Confirmed in
+**32 of 32** configurations, including four widths never swept. It follows
+the innermost dimension only: sweeping the height from 16 to 80 does not move
+it at all.
+
+**And it is not the 1-D rule.** For a 1-D convolution the same bits hold
+`floor((L - 1) / 16)` -- a 16-wide tile over the *unpadded* length. Two
+differences, both real:
+
+| | tile | padding |
+| --- | --- | --- |
+| 1-D | 16 | unpadded (`k` does not move it) |
+| 2-D | 32 | padded (`k` moves it) |
+
+The padding difference is visible only at an exact multiple of the tile,
+where a 1x1 and a 3x3 kernel disagree by one -- which is exactly the single
+configuration that a `floor(W/32)` reading gets wrong (31 of 32).
+
+So a register's meaning is not fixed by its address: this one is spatial in
+both layouts, but *what* it measures and *how* it tiles depend on the
+convolution's dimensionality. That is the same lesson the weight table
+taught -- the shape picks the encoding -- now showing up in the instruction
+stream.
+
+Tests: `test_spatial_extent_lives_in_three_bits_of_b0_03` and
+`test_the_spatial_field_follows_the_innermost_dimension_in_2d` (Docker, no
+device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
