@@ -1623,7 +1623,7 @@ void FoldGroupOnGraph(
       // sweep up later, instead of corrupting the graph.
       const bool all_outputs_unused =
           std::all_of(owner->outputs().begin(), owner->outputs().end(),
-                     [](onnx::Value* v) { return v->uses().empty(); });
+                      [](onnx::Value* v) { return v->uses().empty(); });
       if (all_outputs_unused) {
         owner->destroy();
       } else {
@@ -1642,7 +1642,8 @@ void FoldGroupOnGraph(
         // output names multiple times." Renaming every surviving output to
         // a fresh graph-unique name resolves the collision unconditionally.
         for (onnx::Value* v : owner->outputs()) {
-          v->setUniqueName(g.getNextUniqueName(), /*update_related_names=*/false);
+          v->setUniqueName(g.getNextUniqueName(),
+                           /*update_related_names=*/false);
         }
         if (IsTransientConstantOnGraph(owner)) {
           // `owner` is itself a transient Constant node
@@ -1661,7 +1662,8 @@ void FoldGroupOnGraph(
           // permanent Constant node instead -- accurate, since it is
           // neither transient nor foldable-away anymore now that something
           // still holds a live use of its output.
-          static const onnx::Symbol kTransientAttrToStrip(kTransientConstantAttr);
+          static const onnx::Symbol kTransientAttrToStrip(
+              kTransientConstantAttr);
           owner->removeAttribute(kTransientAttrToStrip);
         }
       }

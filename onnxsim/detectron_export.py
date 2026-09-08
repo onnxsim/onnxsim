@@ -25,7 +25,7 @@ build-model-then-trace-then-export recipe and feeds the result straight into
 
 import io
 import os
-from typing import Dict, Optional, Sequence, Union
+from typing import Callable, Dict, Optional, Sequence, Union
 
 import numpy as np
 import onnx
@@ -166,9 +166,7 @@ def export_detectron_model(
         [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
     )
     resized_image = aug.get_transform(original_image).apply_image(original_image)
-    image_tensor = torch.as_tensor(
-        resized_image.astype("float32").transpose(2, 0, 1)
-    )
+    image_tensor = torch.as_tensor(resized_image.astype("float32").transpose(2, 0, 1))
     # TracingAdapter requires every flattened input to be a tensor, so
     # height/width (plain ints, only used by postprocessing) are left out --
     # exactly what Detectron2's own tools/deploy/export_model.py does before
@@ -180,14 +178,12 @@ def export_detectron_model(
     # (height, width) shape from outside the traced graph.
     sample_inputs = [{"image": image_tensor}]
 
+    inference: Optional[Callable] = None
     if isinstance(model, GeneralizedRCNN):
 
         def inference(model, inputs):
             instances = model.inference(inputs, do_postprocess=False)[0]
             return [{"instances": instances}]
-
-    else:
-        inference = None
 
     traceable_model = TracingAdapter(model, sample_inputs, inference)
 
@@ -216,6 +212,8 @@ def export_detectron_model(
             )
     raw_model = onnx.load_from_string(buf.getvalue())
 
-    model_opt, check_ok = simplify(raw_model, check_n=check_n, **(simplify_kwargs or {}))
+    model_opt, check_ok = simplify(
+        raw_model, check_n=check_n, **(simplify_kwargs or {})
+    )
     _save(model_opt, output_path, force_external_data=save_as_external_data)
     return check_ok
