@@ -114,6 +114,7 @@ SEQ_LEN = int(os.environ.get("RKNN3_LLM_SEQ_LEN", "16"))
 
 RKNN3_AVAILABLE = False
 _UNAVAILABLE_REASON: str | None = None
+_llm_config_template = None
 
 try:
     from rknn.api import RKNN  # noqa: E402
@@ -123,9 +124,39 @@ try:
             "this 'rknn' package has no load_llm() -- looks like rknn-toolkit2, "
             "not RKNN3-Toolkit (both ship the same 'rknn.api.RKNN' import path)"
         )
+    # rknn.api.rknn.DEFAULT_RKNN_LLM_CONFIG_ -- see _llm_config()'s docstring.
+    from rknn.api.rknn import DEFAULT_RKNN_LLM_CONFIG_ as _llm_config_template
+
     RKNN3_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - exercised only without the SDK
     _UNAVAILABLE_REASON = f"{type(exc).__name__}: {exc}"
+
+
+def _llm_config(head_quantized_dtype: str = "w16a16") -> dict:
+    """`load_llm()`'s own ``DEFAULT_RKNN_LLM_CONFIG_`` always quantizes the LM
+    head (the final vocab-projection MatMul) to ``w6a16`` (6-bit weights) --
+    confirmed by reading `rknn.api.rknn`'s source: ``llm_head[0][
+    'quantized_dtype']`` defaults to ``'w6a16'`` and is applied unconditionally
+    by `load_llm()`, **regardless of** `build(do_quantization=False)` (which
+    only controls quantizing the rest of the network). There is no float/
+    unquantized option for this head at all -- only
+    ``w16a16``/``w4a16``/``w6a16``/``w8a8`` -- so ``w16a16`` (16-bit, the
+    least lossy of the four) is used here to avoid adding *unnecessary*
+    quantization noise on top of the PC simulator's other precision limits
+    on this checkpoint's already-tiny (hidden_size=8) head weights.
+
+    This alone turned out **not** to be why `compare_logits`'s default
+    tolerance below needed loosening, confirmed directly: the measured
+    original-vs-simplified diff was identical (``0.015625``) with the
+    default ``w6a16`` head and with this ``w16a16`` override -- that
+    divergence traces to `float16` rounding elsewhere in the graph, not the
+    head's integer quantization; see `compare_logits`'s docstring.
+    """
+    import copy
+
+    cfg = copy.deepcopy(_llm_config_template)
+    cfg["llm_head"][0]["quantized_dtype"] = head_quantized_dtype
+    return cfg
 
 
 def unavailable_reason() -> str:
@@ -181,7 +212,7 @@ def run(
     prev_cwd = os.getcwd()
     os.chdir(os.path.dirname(os.path.abspath(onnx_path)) or ".")
     try:
-        ret = rknn.config(target_platform=TARGET_PLATFORM)
+        ret = rknn.config(target_platform=TARGET_PLATFORM, llm_config=_llm_config())
         if ret != 0:
             raise RuntimeError(f"rknn.config failed (ret={ret})")
         ret = rknn.load_llm(model=onnx_path, config=config_path, seq_lens=[1, seq_len])
@@ -224,6 +255,27 @@ def run(
 
 
 def compare_logits(
-    a: np.ndarray, b: np.ndarray, rtol: float = 1e-2, atol: float = 1e-3
+    a: np.ndarray, b: np.ndarray, rtol: float = 3e-2, atol: float = 5e-2
 ) -> Tuple[bool, float]:
+    """Looser than `scripts/rknn/rknn_backend.compare`'s CNN-tuned default
+    (``rtol=1e-2, atol=1e-3``): confirmed by direct reproduction, comparing
+    the fixed checkpoint's original 702-node ONNX export against its
+    onnxsim-simplified 266-node graph (both convert and run cleanly; onnxsim's
+    own `simplify()` correctness check -- a separate, FP32 comparison --
+    passes) through this harness's `load_llm()` + PC-simulator pipeline gives
+    a small, consistent ``max_abs_diff`` of exactly ``0.015625`` = ``2**-6``,
+    on logits of magnitude up to ~18. That is precisely one `float16` ULP at
+    that magnitude (`float16`'s ~10-bit mantissa gives an absolute step of
+    ``2**floor(log2(x)) * 2**-10`` -- ``2**4 * 2**-10 = 2**-6`` for ``x`` near
+    16) -- i.e. the PC simulator's `float16` compute path (see this module's
+    docstring: `config()`'s ``float_dtype`` is `float16`-only, there is no
+    `float32` option) lands on a different last-bit rounding when it
+    recomputes a *legitimately, drastically restructured* graph (702 -> 266
+    nodes -- constant-folded `Shape`/`Gather`/`Concat` chains and the like,
+    a far bigger topology change than the small CNN synthetic graphs
+    `scripts/rknn` compares), not evidence of an onnxsim correctness bug.
+    Kept well above that single-ULP noise floor with margin, not loosened
+    to paper over an actual regression: an attention/RoPE/masking bug would
+    misroute values by whole logit magnitudes, not by a fraction of an ULP.
+    """
     return compare([a], [b], rtol=rtol, atol=atol)

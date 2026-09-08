@@ -49,11 +49,15 @@ argument) -- verified directly: `load_llm()` + `build(do_quantization=False)`
 end to end and produced real `(1, 1, vocab_size)` logits. As with
 `scripts/rknn`, that's a *functional* simulator, not real RK1820/RK1828/
 RK3572 silicon -- no NPU coprocessor board or `rknn3_transfer_proxy` link was
-used anywhere in this harness.
+used anywhere in this harness. It also always computes in `float16`, not
+`float32` (`rknn.config()`'s `float_dtype` parameter only accepts
+`'float16'`), and always quantizes the LM head to an integer dtype
+regardless of `do_quantization` -- see "Four real, verified findings" below
+for what that means for this harness's comparison tolerance.
 
-## Three real, verified findings
+## Four real, verified findings
 
-All three reproduced directly while building this harness, on a plain
+All four reproduced directly while building this harness, on a plain
 x86-64 Linux host with `rknn-toolkit==1.1.0` (the RKNN3 one) and no RK
 device:
 
@@ -87,6 +91,28 @@ device:
    `ep_numerics.py` by file path (`importlib.util.spec_from_file_location`)
    instead, never registering anything under the bare name `common` in
    `sys.modules` -- see `rknn3_backend._load_module()`'s docstring.
+4. **The PC simulator's `float16`-only compute path makes a legitimate,
+   large simplification land one rounding step off -- not an onnxsim bug.**
+   onnxsim's own `simplify()` shrinks this checkpoint's export from 702 to
+   266 nodes (constant-folding `Shape`/`Gather`/`Concat` chains and the
+   like) and its own correctness check (a separate, FP32 comparison)
+   passes. But `rknn.config()`'s `float_dtype` only ever accepts
+   `'float16'` (there is no `float32` option -- confirmed reading
+   `rknn.api.rknn`'s source), and comparing the original vs. simplified
+   graph's prefill logits through `load_llm()` + the PC simulator gave a
+   small, exactly reproducible `max_abs_diff` of `0.015625` = `2**-6` on
+   logits up to magnitude ~18 -- precisely one `float16` ULP at that
+   magnitude. `rknn3_backend.compare_logits()`'s tolerance
+   (`rtol=3e-2, atol=5e-2`, looser than `scripts/rknn`'s CNN-tuned
+   `rtol=1e-2, atol=1e-3`) is set with margin above that single-ULP noise
+   floor, not loosened to mask a real regression -- see its docstring.
+   Also tried and found *not* the cause: `load_llm()` separately always
+   quantizes the LM head to `w6a16` (6-bit weights) regardless of
+   `build(do_quantization=False)` -- `rknn3_backend._llm_config()`
+   overrides that to the least-lossy `w16a16`, a reasonable precision
+   improvement on general principle, but the measured diff was bit-for-bit
+   identical with and without it, so the head's own quantization is not
+   what this specific divergence traces to.
 
 ## What it checks
 

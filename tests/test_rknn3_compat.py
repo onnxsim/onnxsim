@@ -8,10 +8,12 @@ point, distinct from the ordinary `load_onnx()` path
 incompatible package despite the identical import path) -- and that
 simplification does not change the result on RKNN3's PC simulator. See
 `scripts/rknn3/rknn3_backend.py` for the fidelity tier this does and does not
-cover, and for two real, verified compatibility issues this harness works
+cover, and for the real, verified compatibility issues this harness works
 around: a torch>=2.9 ONNX-exporter default-flip bug in the upstream export
-reference implementation, and an SDK-vs-`scripts/common` `sys.modules["common"]`
-name collision.
+reference implementation, an SDK-vs-`scripts/common` `sys.modules["common"]`
+name collision, and why `compare_logits()`'s tolerance is looser than the
+CNN harness's (a single `float16`-ULP-scale divergence from the PC
+simulator's `float16`-only compute path, not an onnxsim correctness bug).
 
 Unlike `tests/test_rknn_compat.py`'s network-free synthetic-model suite, this
 module downloads a small (~10MB), real, publicly hosted Qwen2.5-architecture
