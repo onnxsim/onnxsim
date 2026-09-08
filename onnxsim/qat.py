@@ -2,6 +2,14 @@
 deliverable B, the "knowledge-distillation QAT" that stage 2 of that note
 describes.
 
+The same machinery also runs with no quantizer in it at all
+(``fake_quant=False``): :func:`apply_block_finetune` and
+:func:`apply_block_finetune_all_blocks` train a model's *own float* weights
+against a reference model's activations -- ordinary block-wise, label-free
+fine-tuning for a model something else already changed. Everything below
+applies to it unchanged except the fake-quantizer, which is the only
+quantization-specific part of any of it.
+
 Read :mod:`onnxsim.brecq` first. It already optimizes a *block's own final
 output* reconstruction error rather than each layer's own, which is the
 objective this module keeps unchanged. Two things it does not do, and this
@@ -117,7 +125,7 @@ that backend's coverage of the block's own operators as well.
   node without a gradient rule refuses the entire model, whereas
   :func:`apply_qat_all_blocks` turns that node into a gap and trains
   everything either side of it. :data:`onnxsim.graph_grad.SUPPORTED_OPS`
-  covers 20 of the 202 operators in ONNX's default domain, so on a real
+  covers 21 of the 202 operators in ONNX's default domain, so on a real
   model that is the binding constraint long before the accuracy question
   above is reached.
 

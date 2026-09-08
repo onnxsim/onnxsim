@@ -28,6 +28,14 @@ What is deliberately *not* claimed anywhere here: that this beats
 :func:`onnxsim.apply_pruning_finetune`, the closed-form layer-wise fit that
 already exists for pruning recovery. It does not, where that one applies; see
 ``apply_block_finetune``'s own docstring for the boundary.
+
+Two limitations are pinned rather than left to be discovered. A calibration set
+too small for the block's parameter count is fitted exactly and generalizes
+almost not at all -- the loss falls three orders of magnitude either way, so
+the loss cannot tell you which happened. And nothing masks the optimizer, so an
+unstructured-pruned weight comes back fully dense. Both have a test, and the
+second asserts the *current* behaviour rather than the desired one, so that
+fixing it is a visible change.
 """
 
 import numpy as np
@@ -543,3 +551,52 @@ def test_the_whole_model_walk_recovers_a_damaged_model():
 
     before = _held_out_error(student, reference, held_out)
     assert _held_out_error(tuned, reference, held_out) < before / 2
+
+
+def test_unstructured_sparsity_is_not_preserved():
+    """A known gap, pinned so that closing it is a visible change.
+
+    Nothing in the step graph masks the optimizer: Adam updates every element
+    of a trained weight, so an element pruning set to zero gets a gradient
+    like any other and leaves zero on the first step. For a model whose value
+    *is* its zeros -- an unstructured magnitude-pruned one -- that destroys
+    what was bought, and it does so while the loss falls by orders of
+    magnitude, which is exactly the shape of failure that goes unnoticed.
+
+    Structured pruning is unaffected, because there the channel is gone from
+    the tensor rather than zeroed inside it.
+
+    This asserts the current behaviour rather than the desired one. A masked
+    optimizer would be a real feature and would make this test fail, which is
+    the point of writing it down: the assertion below is the specification of
+    what such a change would have to alter.
+    """
+    rng = np.random.default_rng(12)
+    w1 = rng.normal(0, 0.3, (D, D)).astype(np.float32)
+    w2 = rng.normal(0, 0.3, (D, D)).astype(np.float32)
+
+    def pruned(w):
+        w = w.copy()
+        w[np.abs(w) < np.median(np.abs(w))] = 0.0
+        return w
+
+    reference = _mlp(w1, w2)
+    sparse1, sparse2 = pruned(w1), pruned(w2)
+    student = _mlp(sparse1, sparse2)
+    assert (sparse2 == 0).sum() == D * D // 2
+
+    losses: list = []
+    tuned = onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "X",
+        "Y",
+        calibration_data=_data(rng, batches=32),
+        num_iterations=300,
+        learning_rate=2e-2,
+        losses=losses,
+    )
+
+    assert losses[-1] < losses[0] / 100
+    assert (_init(tuned, "W1") == 0).sum() == 0
+    assert (_init(tuned, "W2") == 0).sum() == 0
