@@ -3914,6 +3914,68 @@ Tests: `test_spatial_extent_lives_in_three_bits_of_b0_03` and
 `test_the_spatial_field_follows_the_innermost_dimension_in_2d` (Docker, no
 device).
 
+### What the card actually does: 10.13 TOPS against a 10.8 TOPS rating
+
+Everything above is about *what* the hardware runs. This is about how fast.
+The graphs are deliberately the most compute-dense thing that will compile --
+stacks of identical same-padded convolutions, nothing else attached -- and
+accuracy is irrelevant to the measurement. Throughput is
+`2 * MACs / latency`, with the MAC count taken from the compiler's own
+`build_context.json` rather than recomputed.
+
+**Peak measured: 10.13 TOPS INT8**, which is **93.8%** of Axera's 10.8
+TOPS "from NPU alone" figure and 56% of the 18 TOPS INT8 headline. The curve
+flattens there:
+
+| graph | GMAC | min ms | TOPS |
+| --- | --- | --- | --- |
+| 1024ch 16x16 3x3, 8 layers | 19.3 | 4.13 | 9.37 |
+| 1024ch 16x16 3x3, 16 layers | 38.7 | 7.82 | 9.89 |
+| 1024ch 16x16 3x3, **24 layers** | 58.0 | 11.45 | **10.13** |
+| 1024ch 32x32 3x3, 8 layers | 77.3 | 15.35 | 10.07 |
+| 512ch 48x48 3x3, 12 layers | 65.2 | 13.04 | 10.01 |
+
+Depth is what buys the last 8%: identical arithmetic at 8, 16 and 24 layers
+gives 9.37, 9.89 and 10.13, so a fixed per-inference overhead of roughly
+0.3 ms is being amortised.
+
+**The cores scale almost linearly.** The same graph under each `npu_mode`:
+
+| mode | min ms | TOPS | relative |
+| --- | --- | --- | --- |
+| NPU1 | 11.49 | 3.37 | 1.00 |
+| NPU2 | 6.03 | 6.41 | 1.90 |
+| NPU3 | 4.09 | 9.45 | 2.80 |
+
+`NPU4` and `NPU5` exist in the toolchain's `NPUMode` enum but are rejected on
+this target, so three cores is the ceiling here.
+
+**Shape matters more than size.** All the 3x3 rows above are the *same* 19.3
+GMAC of arithmetic, and they differ by a factor of three depending on how it
+is shaped:
+
+| shape | TOPS | why |
+| --- | --- | --- |
+| 1024ch, 16x16 | 9.37 | best of the set |
+| 256ch, 64x64 | 8.47 | |
+| 128ch, 128x128 | 7.75 | |
+| 2048ch, **8x8** | 2.99 | spatial extent too small to fill the array |
+| 512ch 32x32, 1x1 kernel | 6.19 | nine times fewer MACs per weight byte |
+
+The 8x8 collapse is the sharpest result: the same arithmetic runs 3.1x slower
+purely because the spatial dimension no longer covers the tiles the engine
+works in -- which is the same 32-wide tiling the `b0.03` operand counts.
+
+**The 43.2 TOPS INT4 figure is not reachable through this compiler.** The
+build config's `weight_data_type` for convolution accepts only `S8` or
+`FP32`; there is no 4-bit weight option in this Pulsar2 version, whatever the
+silicon can do.
+
+Test: `test_int8_throughput_reaches_a_useful_fraction_of_the_rating` (Docker
+and device). Its floor of 5 TOPS sits between a healthy NPU3 run and the
+~3 TOPS a single-core or fallback build produces, so it doubles as a health
+check for a card that has quietly dropped to one core.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
