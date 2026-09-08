@@ -266,9 +266,9 @@ def test_full_hessian_sensitivity_captures_positive_cross_channel_correlation():
     assert onnxsim.mixed_precision._hessian_diag_sensitivity(
         err_nk, diag_h
     ) == pytest.approx(2.0)
-    assert onnxsim.mixed_precision._full_hessian_sensitivity(err_nk, h) == pytest.approx(
-        3.0
-    )
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(
+        err_nk, h
+    ) == pytest.approx(3.0)
 
 
 def test_full_hessian_sensitivity_negative_correlation_lowers_the_score():
