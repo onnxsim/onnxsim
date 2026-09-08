@@ -93,6 +93,10 @@ constant folding until the model stops changing. Around that it offers:
   Face `diffusers` pipeline (Stable Diffusion, SDXL, ...) straight to a
   simplified ONNX deployment directory with
   `onnxsim.export_diffusion_model()`.
+- **[Detectron2 export](#detectron2-export).** Trace a
+  [Detectron2](https://github.com/facebookresearch/detectron2) model
+  (Faster/Mask/Keypoint R-CNN, RetinaNet, ...) to ONNX and simplify it with
+  `onnxsim.export_detectron_model()`.
 - **[Quantization-aware fine-tuning](#quantization-aware-fine-tuning).**
   Recover accuracy a quantization lost with `onnxsim.apply_qat()`:
   label-free, block-wise fine-tuning of the fp32 weights themselves against
@@ -1222,6 +1226,50 @@ onnxsim.export_diffusion_model(
     save_as_external_data=False,
 )
 ```
+
+## Detectron2 export
+
+A [Detectron2](https://github.com/facebookresearch/detectron2) model (Faster/
+Mask/Keypoint R-CNN, RetinaNet, ...) has no `optimum`-style single-call ONNX
+exporter to build on: Detectron2's own supported recipe is
+`detectron2.export.TracingAdapter` wrapped around `torch.onnx.export` -- the
+same steps Detectron2's own `tools/deploy/export_model.py` runs by hand,
+because the model's `forward()` takes/returns Python dicts and `Instances`
+objects that neither `torch.jit.trace` nor `torch.onnx.export` understand
+directly. That export is plain, un-fused ONNX, so there is real
+simplification left for onnxsim to find, exactly as for a transformers or
+diffusion export.
+
+`onnxsim.export_detectron_model()` wraps the build-model, trace, export
+recipe and feeds the result straight into `onnxsim.simplify()`:
+
+```python
+import onnxsim
+
+onnxsim.export_detectron_model(
+    "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml",
+    "faster_rcnn_simplified.onnx",
+)
+```
+
+`config_file` is either a path to a Detectron2 YAML config or, as above, the
+name of one of Detectron2's built-in model zoo configs (resolved via
+`detectron2.model_zoo.get_config_file`). Pass `weights=` a checkpoint path
+or URL to trace with pretrained weights (e.g.
+`detectron2.model_zoo.get_checkpoint_url(config_file)` for a model zoo
+config's official COCO weights) -- if omitted (the default), no checkpoint
+is loaded at all, regardless of what `cfg.MODEL.WEIGHTS` the config itself
+specifies (most model zoo configs default it to an ImageNet-pretrained
+backbone URL, which would otherwise mean a surprise network fetch on every
+call), and the model traces with its random initialization instead. Pass
+`image=` a sample image path (or an already-loaded array) to trace with
+instead of the default synthetic random image.
+
+Needs the optional `torch` package (`pip install onnxsim[detectron2]`).
+`detectron2` itself is not published to PyPI, so it must be installed
+separately from source, e.g.
+`pip install 'git+https://github.com/facebookresearch/detectron2.git'` (see
+[Detectron2's install docs](https://detectron2.readthedocs.io/en/latest/tutorials/install.html)).
 
 ## Quantization-aware fine-tuning
 

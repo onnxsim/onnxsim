@@ -42,6 +42,7 @@ from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
 from onnxsim.daq import apply_daq
 from onnxsim.deepseek_fp8 import apply_deepseek_fp8, quantize_dequantize_block_fp8
+from onnxsim.detectron_export import export_detectron_model
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.drop_by_drop import (
@@ -551,6 +552,7 @@ __all__ = [
     "UnsupportedArchitectureError",
     "export_transformers_model",
     "export_diffusion_model",
+    "export_detectron_model",
     "export_mlir",
     "export_coreml",
     "export_tflite",
