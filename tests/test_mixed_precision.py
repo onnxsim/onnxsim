@@ -162,10 +162,13 @@ def _two_independent_layer_model(K=8, N=4, block_size=4, seed=0):
     # -- from the per-input-channel Hessian-diagonal score, which can: see
     # test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincide.
     rng = np.random.default_rng(seed)
-    assert K % block_size == 0 and K // block_size == 2  # exactly one noisy, one quiet block
+    assert (
+        K % block_size == 0 and K // block_size == 2
+    )  # exactly one noisy, one quiet block
     w = np.concatenate(
         [
-            rng.standard_normal((N, block_size)) * 1.0,  # noisy block (cols 0:block_size)
+            rng.standard_normal((N, block_size))
+            * 1.0,  # noisy block (cols 0:block_size)
             rng.standard_normal((N, block_size)) * 0.02,  # quiet block
         ],
         axis=1,
@@ -216,7 +219,9 @@ def test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincid
     # each new MatMul's own codes by tracing its input back to Xp/Xq instead
     # of by initializer name.
     matmuls = [n for n in q.graph.node if n.op_type == "MatMul"]
-    dequant_of = {n.output[0]: n for n in q.graph.node if n.op_type == "DequantizeLinear"}
+    dequant_of = {
+        n.output[0]: n for n in q.graph.node if n.op_type == "DequantizeLinear"
+    }
     codes_dtype_by_input = {}
     for mm in matmuls:
         x_name, w_dequant_name = mm.input
