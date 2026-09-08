@@ -1,0 +1,102 @@
+name: RKNN Integration
+
+# Compiles and runs onnxsim's output through Rockchip's real rknn-toolkit2
+# converter + PC simulator to catch simplifications that break RKNN
+# convertibility or change the simulator result. Runs entirely on a stock
+# x86-64 CPU runner via the pip-installable `rknn-toolkit2` wheel -- no
+# RK35xx/RV1106 device needed. See scripts/rknn/README.md for the fidelity
+# tiers this does and does not cover, and for two real onnx.mapping /
+# NCHW-vs-NHWC compatibility issues this harness works around.
+#
+# Scheduled + on demand, plus on PRs that touch the harness so it stays
+# valid.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/rknn-integration.yml"
+      - "scripts/rknn/**"
+      - "scripts/common/**"
+      - "tests/test_rknn_compat.py"
+
+concurrency:
+  group: rknn-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-rknn
+          path: ./wheelhouse/*.whl
+
+  rknn:
+    name: RKNN compatibility check
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # rknn-toolkit2 ships cp310/cp311/cp312 x86-64 Linux wheels.
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-rknn
+          path: wheelhouse
+      - name: Install onnxsim wheel + rknn-toolkit2
+        run: |
+          python -m pip install --upgrade pip
+          # rknn-toolkit2 brings its own onnxruntime/numpy/torch.
+          python -m pip install rknn-toolkit2
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the EP/model-regression workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim; print('onnxsim', onnxsim.__version__)"
+          python -c "import sys, os; sys.path.insert(0, os.path.join(os.environ['GITHUB_WORKSPACE'], 'scripts', 'rknn')); import rknn_backend as rb; print('RKNN available:', rb.RKNN_AVAILABLE, '| target:', rb.TARGET_PLATFORM if rb.RKNN_AVAILABLE else rb.unavailable_reason())"
+      - name: Run RKNN compatibility check
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/rknn/run_rknn_compat.py" \
+            --require-rknn \
+            --output rknn-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: rknn-compat-report
+          path: ${{ runner.temp }}/rknn-compat.csv
+          if-no-files-found: ignore
