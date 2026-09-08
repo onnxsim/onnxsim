@@ -616,6 +616,140 @@ _CASES = {
         """,
         None,
     ),
+    # MaxPool/AveragePool: both share _pool_geometry with Conv's discipline
+    # (resolve attributes, then require the resolved geometry to reproduce
+    # the node's own declared output shape), and both rules reuse the same
+    # im2col/col2im index tables Conv's rule does -- see _grad_maxpool and
+    # _grad_averagepool for why neither needs a MatMul or a ReduceMax.
+    "maxpool": (
+        """
+        g (float[1,2,4,4] A) => (float[1,2,2,2] Y) {
+          Y = MaxPool <kernel_shape = [2, 2], strides = [2, 2]> (A)
+        }
+        """,
+        None,
+    ),
+    "maxpool_strided_padded": (
+        """
+        g (float[1,2,5,5] A) => (float[1,2,3,3] Y) {
+          Y = MaxPool <kernel_shape = [3, 3], strides = [2, 2],
+                       pads = [1, 1, 1, 1]> (A)
+        }
+        """,
+        None,
+    ),
+    # dilations is MaxPool-only -- AveragePool has no such attribute, per the
+    # ONNX spec, and this rule does not invent support for it.
+    "maxpool_dilated": (
+        """
+        g (float[1,1,5,5] A) => (float[1,1,3,3] Y) {
+          Y = MaxPool <kernel_shape = [2, 2], dilations = [2, 2]> (A)
+        }
+        """,
+        None,
+    ),
+    "maxpool_1d": (
+        """
+        g (float[1,2,7] A) => (float[1,2,3] Y) {
+          Y = MaxPool <kernel_shape = [3], strides = [2]> (A)
+        }
+        """,
+        None,
+    ),
+    "maxpool_3d": (
+        """
+        g (float[1,1,4,4,4] A) => (float[1,1,2,2,2] Y) {
+          Y = MaxPool <kernel_shape = [2, 2, 2], strides = [2, 2, 2]> (A)
+        }
+        """,
+        None,
+    ),
+    # SAME_UPPER only: onnx's reference evaluator itself computes the wrong
+    # output shape for a MaxPool with auto_pad=SAME_LOWER (checked against
+    # onnxruntime when this was written -- the same shape of reference-
+    # evaluator bug the Conv auto_pad cases' comment already notes for a
+    # different attribute combination). SAME_LOWER is covered instead, for
+    # both ops, by the graph-equivalence check beside the Conv one.
+    "maxpool_same_upper": (
+        """
+        g (float[1,2,5,6] A) => (float[1,2,3,3] Y) {
+          Y = MaxPool <kernel_shape = [3, 3], strides = [2, 2],
+                       auto_pad = "SAME_UPPER"> (A)
+        }
+        """,
+        None,
+    ),
+    "averagepool": (
+        """
+        g (float[1,2,4,4] A) => (float[1,2,2,2] Y) {
+          Y = AveragePool <kernel_shape = [2, 2], strides = [2, 2]> (A)
+        }
+        """,
+        None,
+    ),
+    # The interesting AveragePool path: count_include_pad=0 (the default)
+    # with nonzero padding gives each border window a smaller divisor than
+    # the interior windows get, which is exactly what a uniform
+    # prod(kernel) divisor would get wrong.
+    "averagepool_count_exclude_pad": (
+        """
+        g (float[1,2,5,5] A) => (float[1,2,3,3] Y) {
+          Y = AveragePool <kernel_shape = [3, 3], strides = [2, 2],
+                           pads = [1, 1, 1, 1]> (A)
+        }
+        """,
+        None,
+    ),
+    # Same shape and padding, but count_include_pad=1: the divisor is
+    # prod(kernel) everywhere, including the border windows the case above
+    # gives a smaller divisor -- the two cases are a minimal pair for that
+    # branch in the divisor computation.
+    "averagepool_count_include_pad": (
+        """
+        g (float[1,2,5,5] A) => (float[1,2,3,3] Y) {
+          Y = AveragePool <kernel_shape = [3, 3], strides = [2, 2],
+                           pads = [1, 1, 1, 1], count_include_pad = 1> (A)
+        }
+        """,
+        None,
+    ),
+    "averagepool_1d": (
+        """
+        g (float[1,2,7] A) => (float[1,2,3] Y) {
+          Y = AveragePool <kernel_shape = [3], strides = [2]> (A)
+        }
+        """,
+        None,
+    ),
+    "averagepool_3d": (
+        """
+        g (float[1,1,4,4,4] A) => (float[1,1,2,2,2] Y) {
+          Y = AveragePool <kernel_shape = [2, 2, 2], strides = [2, 2, 2]> (A)
+        }
+        """,
+        None,
+    ),
+    # Unlike MaxPool's, onnx's reference evaluator agrees with onnxruntime on
+    # AveragePool's SAME_LOWER, so both spellings are differenced directly
+    # here rather than only checked for graph equivalence.
+    "averagepool_same_upper": (
+        """
+        g (float[1,2,5,6] A) => (float[1,2,3,3] Y) {
+          Y = AveragePool <kernel_shape = [3, 3], strides = [2, 2],
+                           auto_pad = "SAME_UPPER"> (A)
+        }
+        """,
+        None,
+    ),
+    "averagepool_same_lower": (
+        """
+        g (float[1,2,5,6] A) => (float[1,2,3,3] Y) {
+          Y = AveragePool <kernel_shape = [3, 3], strides = [2, 2],
+                           auto_pad = "SAME_LOWER"> (A)
+        }
+        """,
+        None,
+    ),
     "clip": (
         """
         g (float[3,4] A) => (float[3,4] Y)
@@ -1144,6 +1278,39 @@ def test_auto_pad_resolves_to_the_padding_the_spec_asks_for(
     assert _emitted(automatic) == _emitted(explicit)
 
 
+def test_maxpool_same_lower_resolves_to_the_padding_the_spec_asks_for():
+    """The pooling equivalent of the Conv check above, for the one auto_pad
+    spelling ``_CASES`` cannot finite-difference directly.
+
+    5 and 6 against a 3-wide kernel at stride 2 need 2 and 1 pads
+    respectively, so SAME_LOWER puts the odd one at the *beginning* --
+    ``pads = [1, 1, 1, 0]`` -- where SAME_UPPER (already differenced in
+    ``_CASES`` as ``maxpool_same_upper``) puts it at the end. onnx's own
+    reference evaluator computes the wrong *output shape* for a MaxPool with
+    auto_pad=SAME_LOWER (checked against onnxruntime when this rule was
+    written -- shape ``(1, 2, 2, 3)`` instead of ``(1, 2, 3, 3)``), which
+    rules out finite-differencing this one the way every other case here is
+    checked; this equivalence covers it instead.
+    """
+    automatic = _model(
+        """
+        g (float[1,2,5,6] A) => (float[1,2,3,3] Y) {
+          Y = MaxPool <kernel_shape = [3, 3], strides = [2, 2],
+                       auto_pad = "SAME_LOWER"> (A)
+        }
+        """
+    )
+    explicit = _model(
+        """
+        g (float[1,2,5,6] A) => (float[1,2,3,3] Y) {
+          Y = MaxPool <kernel_shape = [3, 3], strides = [2, 2],
+                       pads = [1, 1, 1, 0]> (A)
+        }
+        """
+    )
+    assert _emitted(automatic) == _emitted(explicit)
+
+
 def test_a_convolutions_gradient_contains_no_convolution():
     """The design claim of :func:`onnxsim.graph_grad._grad_conv`, checked
     rather than only argued.
@@ -1296,6 +1463,114 @@ def test_a_conv_whose_output_shape_does_not_follow_is_refused():
             qat_graph.GraphBuilder(),
             list(model.graph.node),
             shapes,
+            {"Y": "dY"},
+            ["A"],
+        )
+
+
+@pytest.mark.parametrize(
+    "op", ["MaxPool", "AveragePool"], ids=["maxpool", "averagepool"]
+)
+@pytest.mark.parametrize(
+    "attributes,fragment",
+    [
+        ("", "kernel_shape"),
+        ("<kernel_shape = [3, 3], strides = [2]>", "one entry per spatial axis"),
+        (
+            '<kernel_shape = [3, 3], strides = [2, 2], auto_pad = "SAME">',
+            "auto_pad",
+        ),
+        (
+            "<kernel_shape = [2, 2], strides = [2, 2], ceil_mode = 1>",
+            "ceil_mode",
+        ),
+    ],
+    ids=["no_kernel_shape", "wrong_strides_length", "unknown_auto_pad", "ceil_mode"],
+)
+def test_a_pool_this_rule_cannot_invert_is_refused(op, attributes, fragment):
+    """A ``MaxPool``/``AveragePool`` whose geometry does not add up, or whose
+    ``ceil_mode``/``auto_pad`` this rule refuses to guess at, is refused by
+    name -- the same discipline :func:`_conv_geometry` is held to, since
+    :func:`_pool_geometry` is written to the same standard.
+
+    ``ceil_mode=1`` is deliberately never made to work here (see
+    ``_pool_geometry``'s docstring): it can put a window's far edge fully
+    inside the padding, a case runtimes do not agree on, and this rule cannot
+    reproduce a convention it has not pinned down.
+    """
+    # The declared output shape only has to be one the parser accepts -- each
+    # of these is refused before _pool_geometry ever reaches its own
+    # output-shape check.
+    model = _model(
+        f"""
+        g (float[1,2,5,5] A) => (float[1,2,2,2] Y) {{
+          Y = {op} {attributes} (A)
+        }}
+        """
+    )
+    shapes = {
+        value.name: [d.dim_value for d in value.type.tensor_type.shape.dim]
+        for value in list(model.graph.input) + list(model.graph.output)
+    }
+    with pytest.raises(graph_grad.UnsupportedOpError, match=fragment):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            shapes,
+            {"Y": "dY"},
+            ["A"],
+        )
+
+
+@pytest.mark.parametrize(
+    "op", ["MaxPool", "AveragePool"], ids=["maxpool", "averagepool"]
+)
+def test_a_pool_with_a_window_that_is_entirely_padding_is_refused(op):
+    """A geometry where some window has no non-padding element in it at all
+    -- the pooling analogue of dividing by zero. ``kernel_shape=[1]`` with a
+    pad of 1 on each side of a length-1 input puts the first and last of the
+    three output windows entirely in the padding, which this rule refuses
+    rather than emitting a graph that divides by zero (AveragePool's
+    divisor) or a tie count of zero (MaxPool's credit) at run time.
+    """
+    model = _model(
+        f"""
+        g (float[1,1,1] A) => (float[1,1,3] Y) {{
+          Y = {op} <kernel_shape = [1], pads = [1, 1]> (A)
+        }}
+        """
+    )
+    with pytest.raises(graph_grad.UnsupportedOpError, match="no non-padding elements"):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            {"A": [1, 1, 1], "Y": [1, 1, 3]},
+            {"Y": "dY"},
+            ["A"],
+        )
+
+
+def test_a_maxpools_indices_output_is_refused():
+    """``MaxPool``'s optional second output is refused the same way any
+    multi-output node is -- ``build_backward``'s own single-output check,
+    which runs before any rule does -- rather than by a check in
+    ``_grad_maxpool`` itself. There is nothing this rule could sensibly
+    return a gradient *for* on an integer ``Indices`` tensor anyway, so the
+    existing refusal already covers it exactly.
+    """
+    model = onnx.parser.parse_model(
+        f"{_HEADER}\n"
+        """
+        g (float[1,1,4,4] A) => (float[1,1,2,2] Y) {
+          Y, Ind = MaxPool <kernel_shape = [2, 2], strides = [2, 2]> (A)
+        }
+        """
+    )
+    with pytest.raises(graph_grad.UnsupportedOpError, match="2 outputs"):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            {"A": [1, 1, 4, 4], "Y": [1, 1, 2, 2]},
             {"Y": "dY"},
             ["A"],
         )
