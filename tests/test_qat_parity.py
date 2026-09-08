@@ -140,15 +140,32 @@ def test_no_case_emits_an_operator_outside_the_allowlist(committed):
     If a case emitted an op outside the allowlist, the C++ test would be
     verifying parity on a graph that the allowlist says should never have been
     built -- so the reference would be enforcing agreement on a bug.
+
+    The planner case is exempt, and the exemption is the point rather than a
+    hole: its step graph contains the *block's* forward operators, copied in
+    verbatim from the float model. The allowlist has never governed those. It
+    constrains what onnxsim **emits** -- the fake-quant, the backward, the
+    optimizer -- which is exactly why whether a given block's step graph runs
+    on a given accelerator also depends on that backend's coverage of the
+    block's own operators. Asserting otherwise here would re-introduce the
+    overclaim that ``qat.py`` and the README were corrected for.
     """
     from onnxsim.qat_graph import EP_FRIENDLY_OPS
 
     emitted = {
         node["op_type"]
         for case in committed["cases"].values()
+        if not case.get("contains_block_nodes")
         for node in case.get("nodes", [])
     }
     assert not (emitted - set(EP_FRIENDLY_OPS))
+    # ...and the exemption is narrow: exactly one case claims it.
+    exempt = [
+        name
+        for name, case in committed["cases"].items()
+        if case.get("contains_block_nodes")
+    ]
+    assert exempt == ["planner"]
 
 
 def test_the_rounding_case_contains_no_round_node(committed):

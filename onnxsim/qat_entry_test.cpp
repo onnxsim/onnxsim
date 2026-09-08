@@ -266,6 +266,55 @@ onnx::ModelProto StaticQdqQuantizedModel() {
   return model;
 }
 
+// A deeper block: two quantized MatMuls with a Relu between them and a
+// residual arriving sideways, so the slice has two trained layers and two
+// external tensors. The hidden width is 4 so that both weights have an even
+// number of codes, which is what INT4's two-to-a-byte packing assumes.
+onnx::ModelProto DeepFloatModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("deep_float");
+  AddBatchedInput(graph, "X", kK);
+  AddBatchedInput(graph, "R", kN);
+  AddOutput(graph, "Y", kN);
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1"}, {"H"});
+  *graph->add_node() = MakeNode("Relu", {"H"}, {"A"});
+  *graph->add_node() = MakeNode("MatMul", {"A", "W2"}, {"B"});
+  *graph->add_node() = MakeNode("Add", {"B", "R"}, {"Y"});
+  *graph->add_initializer() =
+      FloatTensor("W1", {kK, kK}, std::vector<float>(16, 0.21f));
+  *graph->add_initializer() = FloatTensor("W2", {kK, kN}, FloatWeight());
+  Finish(&model);
+  return model;
+}
+
+onnx::ModelProto DeepInt4QuantizedModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("deep_int4");
+  AddBatchedInput(graph, "X", kK);
+  AddBatchedInput(graph, "R", kN);
+  AddOutput(graph, "Y", kN);
+  *graph->add_node() = MakeNode("DequantizeLinear", {"W1q", "W1s"}, {"W1dq"},
+                                {{"axis", 0}, {"block_size", kBlock}});
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1dq"}, {"H"});
+  *graph->add_node() = MakeNode("Relu", {"H"}, {"A"});
+  *graph->add_node() = MakeNode("DequantizeLinear", {"W2q", "W2s"}, {"W2dq"},
+                                {{"axis", 0}, {"block_size", kK}});
+  *graph->add_node() = MakeNode("MatMul", {"A", "W2dq"}, {"B"});
+  *graph->add_node() = MakeNode("Add", {"B", "R"}, {"Y"});
+  *graph->add_initializer() =
+      RawTensor("W1q", onnx::TensorProto::INT4, {kK, kK}, std::string(8, '\0'));
+  *graph->add_initializer() =
+      FloatTensor("W1s", {kK / kBlock, kK}, std::vector<float>(8, 0.1f));
+  *graph->add_initializer() =
+      RawTensor("W2q", onnx::TensorProto::INT4, {kK, kN}, std::string(6, '\0'));
+  *graph->add_initializer() =
+      FloatTensor("W2s", {1, kN}, std::vector<float>(kN, 0.05f));
+  Finish(&model);
+  return model;
+}
+
 std::set<std::string> InputNames(const onnx::ModelProto& model) {
   std::set<std::string> names;
   for (const onnx::ValueInfoProto& v : model.graph().input()) {
@@ -603,6 +652,50 @@ void TrainingActivationQuantizersPlansBothOfTheirParameters() {
   }
 }
 
+// A block is not one layer: two trained layers must be numbered in the order
+// the finder found them, and a tensor entering the block sideways must be
+// captured too. If the residual were missed the block would read an undefined
+// tensor; if the externals were not sorted the caller would bind them to the
+// wrong inputs, since qat.py orders the step graph's constants that way.
+void ADeeperBlockTrainsEveryLayerAndCapturesTheResidual() {
+  const QatStepPlan plan =
+      BuildQatStepGraph(DeepFloatModel(), DeepInt4QuantizedModel(), "X", "Y",
+                        kRows, QatOptions());
+  CheckModel(plan.step_graph, "the two-layer step graph");
+  CheckEqual(static_cast<int64_t>(plan.layers.size()), 2,
+             "both quantized MatMuls in the block are trained");
+  CheckEqual(plan.layers[0].codes_initializer, "W1q",
+             "the first layer is the one the finder saw first");
+  CheckEqual(plan.layers[1].codes_initializer, "W2q",
+             "the second layer follows it");
+  CheckEqual(plan.layers[0].weight_state_input, "qat__w0",
+             "the layers are numbered from zero in that order");
+  CheckEqual(plan.layers[1].weight_state_input, "qat__w1",
+             "the second layer gets the next index");
+  CheckEqual(static_cast<int64_t>(plan.state.size()), 6,
+             "three state tensors per trained layer");
+
+  CheckEqual(static_cast<int64_t>(plan.captures.size()), 3,
+             "the block input, the sideways residual and the teacher");
+  CheckEqual(plan.captures[0].source_tensor, "R",
+             "the externals are captured in sorted order, R first");
+  CheckEqual(plan.captures[1].source_tensor, "X",
+             "then the block input itself");
+  Check(plan.captures[2].is_teacher, "the teacher is captured last");
+  Check(plan.captures[0].dims == std::vector<int64_t>({kRows, kN}),
+        "the residual is captured at the block output's width");
+
+  // A per-output-channel scale (one block spanning the whole reduction) and a
+  // 32-element-style blocked scale both have to work in one graph.
+  CheckEqual(plan.layers[0].block_size, kBlock, "the first scale is blocked");
+  CheckEqual(plan.layers[1].block_size, kK,
+             "the second scale spans the whole reduction axis");
+  // Not asserted here: that every op is EP-friendly. The block's own Relu is
+  // copied in verbatim and the allowlist deliberately says nothing about the
+  // block -- see EveryOpTheStepGraphEmitsIsEpFriendly, which uses a block
+  // whose ops happen to be inside it.
+}
+
 // A node with no gradient rule must be refused by op type, before any of the
 // expensive work -- and the message must name both the offender and the
 // supported set, or the caller has to go read graph_grad to find out what to
@@ -707,6 +800,7 @@ int main() {
   LearnScalesAddsTheScaleStateAndItsOwnLearningRate();
   AMinibatchedBlockGathersItsRowsOutOfResidentTables();
   TrainingActivationQuantizersPlansBothOfTheirParameters();
+  ADeeperBlockTrainsEveryLayerAndCapturesTheResidual();
   ABlockContainingAnUndifferentiableOpIsRefusedByOpType();
   ABlockWithNoQuantizedLayerIsRefused();
   EachSchemeMismatchIsNamedRatherThanReportedAsABoundaryError();
