@@ -4656,6 +4656,111 @@ def test_the_spatial_field_follows_the_innermost_dimension_in_2d(tmp_path):
     assert field_for(32, kernel=3) == (32 + 2 - 1) // 32
 
 
+def _conv_stack_model(channels, hw, kernel, layers):
+    """A stack of identical same-padded convolutions -- arithmetic with as
+    little else attached as possible, for a throughput measurement."""
+    rng = np.random.RandomState(0)
+    nodes, inits = [], []
+    current = "x"
+    for i in range(layers):
+        name = f"w{i}"
+        inits.append(
+            numpy_helper.from_array(
+                (rng.randn(channels, channels, kernel, kernel) * 0.02).astype(
+                    np.float32
+                ),
+                name,
+            )
+        )
+        nodes.append(
+            helper.make_node(
+                "Conv",
+                [current, name],
+                [f"h{i}"],
+                name=f"c{i}",
+                kernel_shape=[kernel, kernel],
+                pads=[kernel // 2] * 4,
+            )
+        )
+        current = f"h{i}"
+    shape = [1, channels, hw, hw]
+    graph = helper.make_graph(
+        nodes,
+        "stack",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info(current, TensorProto.FLOAT, shape)],
+        inits,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_int8_throughput_reaches_a_useful_fraction_of_the_rating(tmp_path):
+    """Confirmed on the AX650N (see the README's "What the card actually
+    does" section): a compute-dense INT8 convolution stack sustains several
+    TOPS, well above what a misconfigured build would produce.
+
+    This is a hardware health check as much as a performance claim. A card
+    pinned to one NPU core, or a build that quietly fell back, lands around
+    3 TOPS; the floor here sits between the two so either failure shows up.
+    The peak actually measured was 10.13 TOPS against Axera's 10.8 TOPS
+    "NPU alone" INT8 figure. Needs Docker and a device.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device")
+    channels, hw, kernel, layers = 512, 32, 3, 8
+    work = tmp_path / "work"
+    work.mkdir()
+    os.makedirs(work / "dataset", exist_ok=True)
+    os.makedirs(work / "config", exist_ok=True)
+    model = _conv_stack_model(channels, hw, kernel, layers)
+    onnx.save(model, str(work / "m.onnx"))
+    rng = np.random.RandomState(1)
+    pulsar2_docker.make_numpy_calibration_tar(
+        str(work / "dataset" / "m.tar"),
+        [rng.randn(1, channels, hw, hw).astype(np.float32) for _ in range(2)],
+    )
+    with open(work / "config" / "m.json", "w") as f:
+        json.dump(
+            {
+                "model_type": "ONNX",
+                "npu_mode": "NPU3",
+                "quant": {
+                    "input_configs": [
+                        {
+                            "tensor_name": "x",
+                            "calibration_dataset": "./dataset/m.tar",
+                            "calibration_format": "Numpy",
+                            "calibration_size": 2,
+                        }
+                    ],
+                    "calibration_method": "MinMax",
+                    "precision_analysis": False,
+                },
+                "compiler": {"check": 0},
+            },
+            f,
+        )
+    result = pulsar2_docker.build(
+        str(work), "m.onnx", "out", config_path="config/m.json", timeout=3000
+    )
+    assert result.success, result.error
+
+    with open(work / "out" / "build_context.json") as f:
+        macs = json.load(f)["macs"]
+    # The compiler's own MAC count must match the arithmetic in the graph.
+    assert macs == channels * channels * kernel * kernel * hw * hw * layers, macs
+
+    stats = pulsar2_docker.run_on_device(
+        str(work / "out" / "compiled.axmodel"), repeat=20, warmup=5, timeout=900
+    )
+    assert not stats.get("error"), stats.get("error")
+    tops = 2 * macs / (stats["min_ms"] * 1e-3) / 1e12
+    assert tops > 5.0, (tops, stats)
+
+
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
     """Confirmed real (see the README's "The first operand with a known
     meaning" section): in a program holding exactly one convolution, the
