@@ -700,6 +700,20 @@ _CASES = {
         """,
         None,
     ),
+    # A regression case for a real bug this rule had while count_include_pad
+    # was applied to the padding's *begin* side only: an all-zero pads_begin
+    # with a nonzero pads_end (asymmetric, end-only padding) was
+    # misdetected as "no padding at all" and given a uniform prod(kernel)
+    # divisor instead of the smaller one its last window actually needs.
+    "averagepool_count_exclude_pad_end_only": (
+        """
+        g (float[1,1,4,4] A) => (float[1,1,4,4] Y) {
+          Y = AveragePool <kernel_shape = [2, 2], strides = [1, 1],
+                           pads = [0, 0, 1, 1]> (A)
+        }
+        """,
+        None,
+    ),
     # Same shape and padding, but count_include_pad=1: the divisor is
     # prod(kernel) everywhere, including the border windows the case above
     # gives a smaller divisor -- the two cases are a minimal pair for that

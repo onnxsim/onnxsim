@@ -884,9 +884,19 @@ def _grad_averagepool(
     taps = _prod(kernel)
     in_count, out_count = _prod(in_dims), _prod(out_dims)
 
-    if count_include_pad or not any(pads):
+    if count_include_pad:
+        # Every window is divided by the full kernel size regardless of
+        # padding -- that is what count_include_pad=1 means -- so this needs
+        # no padding information at all.
         divisor = np.full((1, out_count), float(taps), dtype=np.float64)
     else:
+        # Always the general path, never a "no padding, so it's just
+        # prod(kernel)" shortcut: ``pads`` here is _pool_geometry's
+        # pads_begin only, so a shortcut keyed on it would (and once did)
+        # miss padding that is entirely on the *end* side of an axis, e.g.
+        # explicit pads=[0, 0, 1, 1]. The mask sum below is exactly
+        # prod(kernel) anyway when there truly is no padding on either side,
+        # so nothing is lost by always taking this path.
         _, valid = _im2col_indices(in_dims, out_dims, kernel, strides, dilations, pads)
         divisor = (
             valid.reshape(taps, out_count).sum(axis=0, keepdims=True).astype(np.float64)

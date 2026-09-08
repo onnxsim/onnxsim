@@ -221,9 +221,10 @@ Shapes LayerNormShapes() {
   return {{"X", {2, 3, 4}}, {"S", {4}}, {"Bn", {4}}, {"Y", {2, 3, 4}}};
 }
 
-// A convolution with a bias -- the only rule that emits a Gather, and the
-// only one whose emission depends on arithmetic (the index tables) rather
-// than only on the shapes.
+// A convolution with a bias -- the rule with a weight tensor to
+// differentiate, and (along with MaxPool/AveragePool below) one whose
+// emission depends on arithmetic (the index tables) rather than only on the
+// shapes.
 std::vector<onnx::NodeProto> ConvSlice() {
   return {Node("Conv", {"X", "Wc", "Bc"}, {"Y"})};
 }
@@ -233,6 +234,21 @@ Shapes ConvShapes() {
           {"Wc", {3, 2, 3, 3}},
           {"Bc", {3}},
           {"Y", {1, 3, 2, 2}}};
+}
+
+// A MaxPool feeding an AveragePool -- the two rules that share Conv's
+// im2col/col2im index tables without a weight tensor, and (MaxPool) the one
+// rule other than Clip that emits Greater/Less/Cast.
+std::vector<onnx::NodeProto> PoolSlice() {
+  return {
+      Node("MaxPool", {"X"}, {"M"},
+           {IntsAttr("kernel_shape", {2, 2}), IntsAttr("strides", {2, 2})}),
+      Node("AveragePool", {"M"}, {"Y"}, {IntsAttr("kernel_shape", {1, 1})}),
+  };
+}
+
+Shapes PoolShapes() {
+  return {{"X", {1, 1, 4, 4}}, {"M", {1, 1, 2, 2}}, {"Y", {1, 1, 2, 2}}};
 }
 
 // ---------------------------------------------------------------------------
@@ -245,11 +261,12 @@ Shapes ConvShapes() {
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {
-      "Add",    "Clip",    "Conv",     "Div",        "Erf",
-      "Exp",    "Gather",  "Gemm",     "Identity",   "LayerNormalization",
-      "MatMul", "Mul",     "Neg",      "ReduceMean", "ReduceSum",
-      "Relu",   "Reshape", "Sigmoid",  "Softmax",    "Sqrt",
-      "Sub",    "Tanh",    "Transpose"};
+      "Add",     "AveragePool", "Clip",       "Conv",     "Div",
+      "Erf",     "Exp",         "Gather",     "Gemm",     "Identity",
+      "LayerNormalization",     "MatMul",     "MaxPool",  "Mul",
+      "Neg",     "ReduceMean",  "ReduceSum",  "Relu",     "Reshape",
+      "Sigmoid", "Softmax",     "Sqrt",       "Sub",      "Tanh",
+      "Transpose"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
@@ -289,6 +306,7 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
       {GemmSlice(), GemmShapes(), {"A", "W", "Cb"}},
       {LayerNormSlice(), LayerNormShapes(), {"X", "S", "Bn"}},
       {ConvSlice(), ConvShapes(), {"X", "Wc", "Bc"}},
+      {PoolSlice(), PoolShapes(), {"X"}},
   };
 
   std::set<std::string> emitted;
@@ -303,7 +321,7 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
     emitted.insert(types.begin(), types.end());
   }
   Check(emitted == BackwardOps(),
-        "the six slices together should emit every allowlisted op and no "
+        "the seven slices together should emit every allowlisted op and no "
         "other; got {" +
             Join(emitted) + "}");
 }
@@ -800,6 +818,157 @@ void AGatherWithRankTwoIndicesIsRefused() {
       "rank-2", "a rank-2 index tensor should be refused");
 }
 
+// If this fails, the C++ AveragePool rule has drifted from
+// _grad_averagepool in graph_grad.py. Pinned the same way and for the same
+// reason as the Conv rule above.
+void TheAveragePoolRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("AveragePool", {"X"}, {"Y"},
+           {IntsAttr("kernel_shape", {2, 2}), IntsAttr("strides", {2, 2})})};
+  const Shapes shapes = {{"X", {1, 1, 4, 4}}, {"Y", {1, 1, 2, 2}}};
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+  // dY reshaped to [planes, out_count], scaled by the per-window divisor,
+  // then col2im: one gather of the scaled gradient per kernel tap, masked,
+  // and summed over taps -- Conv's dX half with the MatMul against W deleted
+  // outright, since pooling has no weight to sum over.
+  const std::vector<std::string> expected = {
+      "Reshape", "Mul", "Gather", "Mul", "Reshape", "ReduceSum", "Reshape"};
+  Check(OpTypes(b) == expected,
+        "the AveragePool rule should emit graph_grad.py's nodes in its "
+        "order");
+  Check(b.initializer().size() == 7,
+        "the rule emits seven initializers: the reshape-to-[planes,"
+        "out_count] shape, the divisor, the gather index, the mask, the "
+        "col shape, the reduce axes and the final output shape");
+  Check(grads.at("X") == b.nodes().back().output(0),
+        "dX should be the last Reshape's output");
+  const std::set<std::string> emitted = OpTypeSet(b);
+  Check(emitted.count("Conv") == 0 && emitted.count("MatMul") == 0,
+        "AveragePool's gradient needs no weight, so unlike Conv's dX it "
+        "emits no MatMul");
+}
+
+// The same shape of pin as the AveragePool one above, for _grad_maxpool. The
+// sequence is Conv's dW-style windowing gather of X, the eq mask built from
+// Greater/Less/Cast with no Equal and no fresh ReduceMax, the tie count and
+// its Div, then the per-tap-offset scatter this rule needs that
+// AveragePool's uniform-per-tap gradient does not.
+void TheMaxPoolRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("MaxPool", {"X"}, {"Y"},
+           {IntsAttr("kernel_shape", {2, 2}), IntsAttr("strides", {2, 2})})};
+  const Shapes shapes = {{"X", {1, 1, 4, 4}}, {"Y", {1, 1, 2, 2}}};
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+  const std::vector<std::string> expected = {
+      "Reshape",   "Gather",  "Reshape",   "Reshape", "Greater", "Cast",
+      "Sub",       "Less",    "Cast",      "Sub",     "Mul",     "Mul",
+      "ReduceSum", "Div",     "Reshape",   "Mul",     "Reshape", "Gather",
+      "Mul",       "Reshape", "ReduceSum", "Reshape"};
+  Check(OpTypes(b) == expected,
+        "the MaxPool rule should emit graph_grad.py's nodes in its order");
+  Check(b.initializer().size() == 15, "the rule emits fifteen initializers");
+  Check(grads.at("X") == b.nodes().back().output(0),
+        "dX should be the last Reshape's output");
+  const std::set<std::string> emitted = OpTypeSet(b);
+  Check(emitted.count("Equal") == 0,
+        "the eq mask is built from Greater/Less/Cast, never Equal");
+  Check(emitted.count("Conv") == 0 && emitted.count("MatMul") == 0 &&
+            emitted.count("ReduceMax") == 0,
+        "MaxPool's gradient needs no weight and reuses the forward's own "
+        "output instead of a fresh ReduceMax");
+}
+
+// If this fails, a pooling geometry this rule cannot invert would be
+// differentiated against one it invented instead -- the same hazard
+// AConvWhoseGeometryDoesNotAddUpIsRefused checks for Conv, and the same
+// refusals PoolGeometryOf makes by the same name as _pool_geometry.
+void APoolGeometryThatDoesNotResolveIsRefused() {
+  for (const std::string& op :
+       {std::string("MaxPool"), std::string("AveragePool")}) {
+    {
+      // kernel_shape is required for both -- unlike Conv, there is no
+      // weight tensor to read it off.
+      const Shapes shapes = {{"X", {1, 1, 4, 4}}, {"Y", {1, 1, 2, 2}}};
+      GraphBuilder b;
+      CheckThrows<UnsupportedOpError>(
+          [&] {
+            BuildBackward(b, {Node(op, {"X"}, {"Y"})}, shapes, {{"Y", "dY"}},
+                          {"X"});
+          },
+          "kernel_shape", op + " without kernel_shape is refused");
+    }
+    {
+      // ceil_mode=1 is refused outright rather than reproduced -- see
+      // PoolGeometryOf's comment for why.
+      const Shapes shapes = {{"X", {1, 1, 5, 5}}, {"Y", {1, 1, 3, 3}}};
+      GraphBuilder b;
+      CheckThrows<UnsupportedOpError>(
+          [&] {
+            BuildBackward(
+                b,
+                {Node(op, {"X"}, {"Y"},
+                      {IntsAttr("kernel_shape", {2, 2}),
+                       IntsAttr("strides", {2, 2}), IntAttr("ceil_mode", 1)})},
+                shapes, {{"Y", "dY"}}, {"X"});
+          },
+          "ceil_mode", op + " with ceil_mode=1 is refused");
+    }
+    {
+      // A typo'd auto_pad must not silently fall back to no padding.
+      const Shapes shapes = {{"X", {1, 1, 5, 5}}, {"Y", {1, 1, 3, 3}}};
+      GraphBuilder b;
+      CheckThrows<UnsupportedOpError>(
+          [&] {
+            BuildBackward(b,
+                          {Node(op, {"X"}, {"Y"},
+                                {IntsAttr("kernel_shape", {3, 3}),
+                                 IntsAttr("strides", {2, 2}),
+                                 StrAttr("auto_pad", "SAME")})},
+                          shapes, {{"Y", "dY"}}, {"X"});
+          },
+          "auto_pad", op + " with an unknown auto_pad is refused");
+    }
+    {
+      // The declared output shape has to follow from the attributes.
+      const Shapes shapes = {{"X", {1, 1, 5, 5}}, {"Y", {1, 1, 4, 4}}};
+      GraphBuilder b;
+      CheckThrows<UnsupportedOpError>(
+          [&] {
+            BuildBackward(b,
+                          {Node(op, {"X"}, {"Y"},
+                                {IntsAttr("kernel_shape", {3, 3}),
+                                 IntsAttr("strides", {2, 2})})},
+                          shapes, {{"Y", "dY"}}, {"X"});
+          },
+          "does not follow from",
+          op + " with an inconsistent output shape is refused");
+    }
+    {
+      // A window that is entirely padding: kernel_shape=[1] against a
+      // length-1 input padded by 1 on each side puts the first and last of
+      // three output windows fully in the padding, where neither this
+      // rule's divisor (AveragePool) nor its tie count (MaxPool) is
+      // defined.
+      const Shapes shapes = {{"X", {1, 1, 1}}, {"Y", {1, 1, 3}}};
+      GraphBuilder b;
+      CheckThrows<UnsupportedOpError>(
+          [&] {
+            BuildBackward(b,
+                          {Node(op, {"X"}, {"Y"},
+                                {IntsAttr("kernel_shape", {1}),
+                                 IntsAttr("pads", {1, 1})})},
+                          shapes, {{"Y", "dY"}}, {"X"});
+          },
+          "no non-padding elements",
+          op + " with a window that is entirely padding is refused");
+    }
+  }
+}
+
 // If this fails, a tensor read by two consumers -- a residual connection's
 // own input, which is why this matters -- would keep only one contribution,
 // and the parameter upstream of it would train on a fraction of its
@@ -909,6 +1078,9 @@ int main() {
   ConvsOfAnyRankDifferentiateIdentically();
   TheGatherRuleEmitsTheSameNodesInTheSameOrderAsThePython();
   AGatherWithRankTwoIndicesIsRefused();
+  TheAveragePoolRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheMaxPoolRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  APoolGeometryThatDoesNotResolveIsRefused();
   ATensorReadTwiceAccumulatesItsContributions();
   AnIdentityAliasesTheSeedInsteadOfEmittingANode();
   TheReturnedMapCoversExactlyTheRequestedTargets();
