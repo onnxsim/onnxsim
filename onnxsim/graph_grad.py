@@ -710,6 +710,345 @@ def _grad_conv(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return grads
 
 
+def _pool_geometry(
+    node: onnx.NodeProto,
+    x_shape: Tuple[int, ...],
+    y_shape: Tuple[int, ...],
+    *,
+    has_dilations: bool,
+) -> Tuple[List[int], List[int], List[int], List[int]]:
+    """``MaxPool``/``AveragePool``'s attributes resolved against their actual
+    shapes -- the same discipline :func:`_conv_geometry` applies to ``Conv``:
+    the resolved kernel/strides/dilations/pads are required to reproduce the
+    node's own declared output shape, so a misread attribute cannot survive
+    to become a gradient computed against the wrong geometry.
+
+    Unlike ``Conv``, a pooling node carries no weight tensor to read
+    ``kernel_shape`` off, so it is read directly -- it is a required
+    attribute for both ops -- and there is no "does the weight agree with
+    it" check to make.
+
+    ``ceil_mode=1`` is refused outright rather than reproduced: it can make
+    the rightmost window's far edge fall entirely inside the padding region,
+    and ONNX's own spec leaves what happens then ("the sliding window ...
+    will start as long as the starting index ... is less than the padded
+    input size") looser than the exact-reproduction discipline this module
+    otherwise holds itself to. Guessing which convention a given model was
+    built for would be exactly the quietly-wrong gradient
+    :class:`UnsupportedOpError`'s docstring warns about, so it is refused
+    instead. Same for any ``auto_pad`` beyond ``NOTSET``/``VALID``/
+    ``SAME_UPPER``/``SAME_LOWER``, and for a ``kernel_shape`` that never
+    resolves to the declared output shape.
+    """
+    name = node.output[0]
+    rank = len(x_shape)
+    if rank < 3:
+        raise UnsupportedOpError(
+            f"{node.op_type} needs at least one spatial dimension, got input "
+            f"shape {x_shape} (node {name!r})"
+        )
+    spatial = rank - 2
+    if len(y_shape) != rank:
+        raise UnsupportedOpError(
+            f"{node.op_type}'s X and Y must have the same rank, got {x_shape} "
+            f"and {y_shape} (node {name!r})"
+        )
+    if int(y_shape[0]) != int(x_shape[0]) or int(y_shape[1]) != int(x_shape[1]):
+        raise UnsupportedOpError(
+            f"{node.op_type}'s output shape {y_shape} does not match its "
+            f"input {x_shape} in batch or channel size (node {name!r})"
+        )
+
+    declared = _attr(node, "kernel_shape", None)
+    if declared is None:
+        raise UnsupportedOpError(
+            f"{node.op_type} without a kernel_shape attribute is not "
+            f"differentiated here (node {name!r})"
+        )
+    kernel = [int(k) for k in declared]
+    if len(kernel) != spatial:
+        raise UnsupportedOpError(
+            f"{node.op_type}'s kernel_shape {kernel} must have one entry per "
+            f"spatial axis ({spatial}) (node {name!r})"
+        )
+
+    strides = [int(s) for s in _attr(node, "strides", [1] * spatial)]
+    dilations = (
+        [int(d) for d in _attr(node, "dilations", [1] * spatial)]
+        if has_dilations
+        else [1] * spatial
+    )
+    if len(strides) != spatial or len(dilations) != spatial:
+        raise UnsupportedOpError(
+            f"{node.op_type}'s strides {strides} and dilations {dilations} "
+            f"must have one entry per spatial axis ({spatial}) (node {name!r})"
+        )
+    if any(s < 1 for s in strides) or any(d < 1 for d in dilations):
+        raise UnsupportedOpError(
+            f"{node.op_type} with strides {strides} and dilations {dilations} "
+            f"is not a pooling this rule can invert (node {name!r})"
+        )
+
+    if int(_attr(node, "ceil_mode", 0)):
+        raise UnsupportedOpError(
+            f"{node.op_type} with ceil_mode=1 is not differentiated here "
+            f"(node {name!r})"
+        )
+
+    auto_pad = _attr(node, "auto_pad", "NOTSET")
+    if isinstance(auto_pad, bytes):
+        auto_pad = auto_pad.decode("utf-8")
+    if auto_pad == "NOTSET":
+        pads = [int(p) for p in _attr(node, "pads", [0] * (2 * spatial))]
+        if len(pads) != 2 * spatial:
+            raise UnsupportedOpError(
+                f"{node.op_type}'s pads {pads} must have two entries per "
+                f"spatial axis ({spatial}) (node {name!r})"
+            )
+    elif auto_pad == "VALID":
+        pads = [0] * (2 * spatial)
+    elif auto_pad in ("SAME_UPPER", "SAME_LOWER"):
+        # The spec's own formula, same as _conv_geometry's: output_shape[i] =
+        # ceil(input_shape[i] / strides[i]), the odd remainder going to the
+        # end for SAME_UPPER and the beginning for SAME_LOWER.
+        pads = [0] * (2 * spatial)
+        for i in range(spatial):
+            size = int(x_shape[2 + i])
+            out = -(-size // strides[i])
+            span = (kernel[i] - 1) * dilations[i] + 1
+            needed = max(0, (out - 1) * strides[i] + span - size)
+            if auto_pad == "SAME_UPPER":
+                pads[i] = needed // 2
+            else:
+                pads[i] = needed - needed // 2
+            pads[spatial + i] = needed - pads[i]
+    else:
+        raise UnsupportedOpError(
+            f"{node.op_type} with auto_pad {auto_pad!r} is not "
+            f"differentiated here (node {name!r})"
+        )
+
+    for i in range(spatial):
+        span = (kernel[i] - 1) * dilations[i] + 1
+        reach = int(x_shape[2 + i]) + pads[i] + pads[spatial + i] - span
+        expected = reach // strides[i] + 1 if reach >= 0 else 0
+        if expected != int(y_shape[2 + i]):
+            raise UnsupportedOpError(
+                f"{node.op_type}'s declared output shape {y_shape} does not "
+                f"follow from input {x_shape}, kernel {kernel}, strides "
+                f"{strides}, dilations {dilations} and pads {pads}: axis {i} "
+                f"should be {expected}, not {int(y_shape[2 + i])} "
+                f"(node {name!r})"
+            )
+    return kernel, strides, dilations, pads[:spatial]
+
+
+def _grad_averagepool(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``AveragePool``'s gradient: ``col2im`` of ``dY``, scaled by each
+    window's own divisor.
+
+    Pooling is depthwise by construction -- no channel mixes with another --
+    so this is exactly the ``dX`` half of :func:`_grad_conv`'s im2col
+    identity with the ``MatMul`` against ``W`` deleted outright: there is no
+    weight, every "tap" contributes with the same fixed coefficient
+    (``1 / divisor``), so summing a window's contributions is the ``ReduceSum``
+    :func:`_grad_conv` uses to sum ``dW`` over its batch axis, not a weighted
+    sum. Batch and channel are flattened into one axis throughout (called
+    ``planes`` below) since neither this rule nor the index tables it uses
+    ever need to tell them apart.
+
+    **The divisor.** With ``count_include_pad=1``, or no padding at all, every
+    window holds exactly ``prod(kernel)`` elements and the divisor is that one
+    number for the whole tensor. With ``count_include_pad=0`` (the default)
+    and nonzero padding, a window near the border is only averaged over its
+    *non-padding* elements, so the divisor varies by output position -- it is
+    exactly the count :func:`_im2col_indices`'s own validity mask already
+    computes (a tap is "valid" there iff it is not padding), summed over the
+    kernel taps. Both cases are folded into one ``[1, out_count]`` numpy array
+    computed once at build time and baked into a constant, so the emitted
+    graph never branches on which case it is.
+    """
+    x = node.input[0]
+    x_shape = ctx.shape(x)
+    y_shape = ctx.shape(node.output[0])
+    kernel, strides, dilations, pads = _pool_geometry(
+        node, x_shape, y_shape, has_dilations=False
+    )
+    count_include_pad = bool(_attr(node, "count_include_pad", 0))
+
+    planes = int(x_shape[0]) * int(x_shape[1])
+    in_dims = [int(d) for d in x_shape[2:]]
+    out_dims = [int(d) for d in y_shape[2:]]
+    taps = _prod(kernel)
+    in_count, out_count = _prod(in_dims), _prod(out_dims)
+
+    if count_include_pad:
+        # Every window is divided by the full kernel size regardless of
+        # padding -- that is what count_include_pad=1 means -- so this needs
+        # no padding information at all.
+        divisor = np.full((1, out_count), float(taps), dtype=np.float64)
+    else:
+        # Always the general path, never a "no padding, so it's just
+        # prod(kernel)" shortcut: ``pads`` here is _pool_geometry's
+        # pads_begin only, so a shortcut keyed on it would (and once did)
+        # miss padding that is entirely on the *end* side of an axis, e.g.
+        # explicit pads=[0, 0, 1, 1]. The mask sum below is exactly
+        # prod(kernel) anyway when there truly is no padding on either side,
+        # so nothing is lost by always taking this path.
+        _, valid = _im2col_indices(in_dims, out_dims, kernel, strides, dilations, pads)
+        divisor = (
+            valid.reshape(taps, out_count).sum(axis=0, keepdims=True).astype(np.float64)
+        )
+        if np.any(divisor == 0):
+            raise UnsupportedOpError(
+                f"AveragePool has a window with no non-padding elements at "
+                f"all (node {node.output[0]!r}); its average, and this "
+                f"rule's divisor, are undefined for that window"
+            )
+    recip = (1.0 / divisor).astype(np.float32)
+
+    g2 = ctx.b.op("Reshape", [g, ctx.int64_const([planes, out_count], "shape")])
+    scaled = ctx.b.mul(g2, ctx.b.const(recip, "recip"))
+
+    index, mask = _col2im_indices(in_dims, out_dims, kernel, strides, dilations, pads)
+    gathered = ctx.b.op("Gather", [scaled, ctx.int64_const(index, "idx")], axis=1)
+    masked = ctx.b.mul(gathered, ctx.b.const(mask.reshape(1, taps * in_count), "mask"))
+    col = ctx.b.op(
+        "Reshape", [masked, ctx.int64_const([planes, taps, in_count], "shape")]
+    )
+    dx_flat = ctx.b.op("ReduceSum", [col, ctx.int64_const([1], "axes")], keepdims=0)
+    dx = ctx.b.op("Reshape", [dx_flat, ctx.int64_const(x_shape, "shape")])
+    return [dx]
+
+
+def _grad_maxpool(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``MaxPool``'s gradient: route ``dY`` to whichever input element each
+    window's max came from.
+
+    A ``MaxPool`` with the optional ``Indices`` output present is never
+    reached here at all -- ``build_backward`` refuses any node with more than
+    one declared output before a rule ever runs, which is exactly right for
+    this one: computing a gradient *for* ``Indices`` (an integer tensor) does
+    not make sense, and this rule does not need ``Indices`` to compute
+    ``dX`` regardless, so nothing is lost by that refusal covering it too.
+    ``GlobalMaxPool`` is a different op type with no rule registered, so it
+    is refused the ordinary way. Neither is a design compromise here -- see
+    :func:`build_backward`'s single-output check and :data:`SUPPORTED_OPS`.
+
+    **No fresh ``ReduceMax``.** The forward already computed the window's max
+    as ``node.output[0]``; recomputing it (besides needing an op outside
+    :data:`BACKWARD_OPS`) would be redundant. Instead each window's input
+    elements are gathered the way :func:`_grad_conv`'s ``dW`` half gathers
+    ``X`` -- one ``Gather`` with :func:`_im2col_indices`'s constant index
+    table -- and compared against the broadcast ``Y`` for that window with
+    the two comparison ops this module already has::
+
+        eq = (1 - Cast(Greater(gathered, Y))) * (1 - Cast(Less(gathered, Y)))
+
+    which is 1 exactly where ``gathered`` equals ``Y`` and 0 elsewhere -- no
+    ``Equal`` needed. A tap the padding invented is masked out unconditionally
+    afterwards (its gathered value is an arbitrary element, which could
+    spuriously equal ``Y``), the same "gather from element 0, multiply the
+    invented ones away" convention :func:`_grad_conv` uses.
+
+    **Ties.** More than one input element exactly equal to a window's max is
+    a measure-zero event for real (or randomly generated) float data, but a
+    rule that assumed it away would misbehave silently the one time it
+    happens. So each window's ``eq`` mask is divided by its own tie count
+    (``ReduceSum`` of ``eq`` over the tap axis, always >= 1 since ``Y`` is
+    that window's max) before being multiplied by the incoming gradient --
+    the same "split the credit" choice :func:`_grad_clip` documents for a
+    value sitting exactly on a bound, made here so that a window's total
+    outgoing gradient sums to exactly the ``dY`` that came in regardless of
+    how many elements tie.
+
+    **The scatter.** Unlike :func:`_grad_conv`'s ``dX`` (whose gathered value
+    is the same for every tap, since the weight does the differentiating),
+    here each tap's credited gradient genuinely differs per tap, so the plain
+    :func:`_col2im_indices` trick -- gather the same ``[planes, out_count]``
+    tensor for every tap -- does not apply as-is. Each tap's slice is instead
+    given its own offset into a flattened ``[taps, out_count]`` axis (tap
+    ``t``'s block starts at ``t * out_count``) so one ``Gather`` still reaches
+    the right tap's own contribution for every input element, then a
+    ``ReduceSum`` over the tap axis sums however many windows each input
+    element belonged to -- the same shape of "sum via gather, not scatter"
+    identity :func:`_col2im_indices`'s own docstring explains.
+    """
+    x, y = node.input[0], node.output[0]
+    x_shape = ctx.shape(x)
+    y_shape = ctx.shape(y)
+    kernel, strides, dilations, pads = _pool_geometry(
+        node, x_shape, y_shape, has_dilations=True
+    )
+
+    planes = int(x_shape[0]) * int(x_shape[1])
+    in_dims = [int(d) for d in x_shape[2:]]
+    out_dims = [int(d) for d in y_shape[2:]]
+    taps = _prod(kernel)
+    in_count, out_count = _prod(in_dims), _prod(out_dims)
+
+    x2 = ctx.b.op("Reshape", [x, ctx.int64_const([planes, in_count], "shape")])
+    index, valid = _im2col_indices(in_dims, out_dims, kernel, strides, dilations, pads)
+    if np.any(valid.reshape(taps, out_count).sum(axis=0) == 0):
+        # A window every tap of which the padding invented has no real
+        # element to route dY to at all: the forward's own max over such a
+        # window is -inf by construction, which no real input value equals,
+        # so the tie count below would be a division by zero rather than a
+        # quietly wrong credit. Caught here, at build time, rather than
+        # producing a NaN gradient at run time.
+        raise UnsupportedOpError(
+            f"MaxPool has a window with no non-padding elements at all "
+            f"(node {node.output[0]!r}); its max, and this rule's gradient "
+            f"for that window, are undefined"
+        )
+    gathered = ctx.b.op("Gather", [x2, ctx.int64_const(index, "idx")], axis=1)
+    windows = ctx.b.op(
+        "Reshape", [gathered, ctx.int64_const([planes, taps, out_count], "shape")]
+    )
+    y3 = ctx.b.op("Reshape", [y, ctx.int64_const([planes, 1, out_count], "shape")])
+
+    not_greater = ctx.b.sub(ctx.b.const(1.0), ctx.mask_greater(windows, y3))
+    not_less = ctx.b.sub(ctx.b.const(1.0), ctx.mask_less(windows, y3))
+    eq = ctx.b.mul(not_greater, not_less)
+    eq = ctx.b.mul(eq, ctx.b.const(valid.reshape(1, taps, out_count), "valid"))
+
+    tie_count = ctx.b.op("ReduceSum", [eq, ctx.int64_const([1], "axes")], keepdims=1)
+    credit = ctx.b.div(eq, tie_count)
+
+    g3 = ctx.b.op("Reshape", [g, ctx.int64_const([planes, 1, out_count], "shape")])
+    contrib = ctx.b.mul(credit, g3)
+    contrib2 = ctx.b.op(
+        "Reshape", [contrib, ctx.int64_const([planes, taps * out_count], "shape")]
+    )
+
+    scatter_index, scatter_mask = _col2im_indices(
+        in_dims, out_dims, kernel, strides, dilations, pads
+    )
+    # Offset each tap's block into its own slice of the flattened
+    # [taps, out_count] axis contrib2 holds -- see the docstring above.
+    for tap in range(taps):
+        base = tap * in_count
+        offset = tap * out_count
+        for entry in range(in_count):
+            scatter_index[base + entry] += offset
+
+    gathered_back = ctx.b.op(
+        "Gather", [contrib2, ctx.int64_const(scatter_index, "idx")], axis=1
+    )
+    masked_back = ctx.b.mul(
+        gathered_back,
+        ctx.b.const(scatter_mask.reshape(1, taps * in_count), "mask"),
+    )
+    col = ctx.b.op(
+        "Reshape", [masked_back, ctx.int64_const([planes, taps, in_count], "shape")]
+    )
+    dx_flat = ctx.b.op("ReduceSum", [col, ctx.int64_const([1], "axes")], keepdims=0)
+    dx = ctx.b.op("Reshape", [dx_flat, ctx.int64_const(x_shape, "shape")])
+    return [dx]
+
+
 def _grad_add(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     out = ctx.shape(node.output[0])
     return [
@@ -1124,6 +1463,7 @@ def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
 
 _RULES: Dict[str, Rule] = {
     "Add": _grad_add,
+    "AveragePool": _grad_averagepool,
     "Clip": _grad_clip,
     "Conv": _grad_conv,
     "Div": _grad_div,
@@ -1134,6 +1474,7 @@ _RULES: Dict[str, Rule] = {
     "Identity": _grad_identity,
     "LayerNormalization": _grad_layer_normalization,
     "MatMul": _grad_matmul,
+    "MaxPool": _grad_maxpool,
     "Mul": _grad_mul,
     "Neg": _grad_neg,
     "ReduceMean": _grad_reduce,

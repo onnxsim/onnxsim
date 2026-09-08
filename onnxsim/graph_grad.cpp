@@ -668,6 +668,359 @@ std::vector<OptStr> GradConv(Backward& ctx, const onnx::NodeProto& node,
   return grads;
 }
 
+struct PoolGeometry {
+  std::vector<int64_t> kernel;
+  std::vector<int64_t> strides;
+  std::vector<int64_t> dilations;
+  std::vector<int64_t> pads_begin;
+};
+
+// MaxPool's/AveragePool's attributes resolved against their actual shapes --
+// _pool_geometry in graph_grad.py, refusal for refusal. Unlike Conv there is
+// no weight tensor to read kernel_shape off, so it is read directly (it is a
+// required attribute for both ops); ceil_mode=1 is refused outright rather
+// than reproduced, for the reason the Python docstring gives (it can put a
+// window's far edge fully inside the padding, a case runtimes do not agree
+// on). The final check is the same one ConvGeometryOf ends on: the resolved
+// geometry has to reproduce the node's own declared output shape.
+PoolGeometry PoolGeometryOf(const onnx::NodeProto& node, const Shape& x_shape,
+                            const Shape& y_shape, bool has_dilations) {
+  const std::string& op_type = node.op_type();
+  const std::string name = Quoted(node.output(0));
+  const size_t rank = x_shape.size();
+  if (rank < 3) {
+    throw UnsupportedOpError(op_type +
+                             " needs at least one spatial dimension, got "
+                             "input shape " +
+                             ShapeStr(x_shape) + " (node " + name + ")");
+  }
+  const size_t spatial = rank - 2;
+  if (y_shape.size() != rank) {
+    throw UnsupportedOpError(op_type +
+                             "'s X and Y must have the same rank, got " +
+                             ShapeStr(x_shape) + " and " + ShapeStr(y_shape) +
+                             " (node " + name + ")");
+  }
+  if (y_shape[0] != x_shape[0] || y_shape[1] != x_shape[1]) {
+    throw UnsupportedOpError(op_type + "'s output shape " + ShapeStr(y_shape) +
+                             " does not match its input " + ShapeStr(x_shape) +
+                             " in batch or channel size (node " + name + ")");
+  }
+
+  PoolGeometry geo;
+  const onnx::AttributeProto* declared = FindAttr(node, "kernel_shape");
+  if (declared == nullptr) {
+    throw UnsupportedOpError(op_type +
+                             " without a kernel_shape attribute is not "
+                             "differentiated here (node " +
+                             name + ")");
+  }
+  geo.kernel.assign(declared->ints().begin(), declared->ints().end());
+  if (geo.kernel.size() != spatial) {
+    throw UnsupportedOpError(op_type + "'s kernel_shape " +
+                             IntsStr(geo.kernel) +
+                             " must have one entry per spatial axis (" +
+                             std::to_string(spatial) + ") (node " + name + ")");
+  }
+
+  geo.strides = AttrInts(node, "strides", std::vector<int64_t>(spatial, 1));
+  geo.dilations = has_dilations ? AttrInts(node, "dilations",
+                                           std::vector<int64_t>(spatial, 1))
+                                : std::vector<int64_t>(spatial, 1);
+  if (geo.strides.size() != spatial || geo.dilations.size() != spatial) {
+    throw UnsupportedOpError(op_type + "'s strides " + IntsStr(geo.strides) +
+                             " and dilations " + IntsStr(geo.dilations) +
+                             " must have one entry per spatial axis (" +
+                             std::to_string(spatial) + ") (node " + name + ")");
+  }
+  for (size_t i = 0; i < spatial; ++i) {
+    if (geo.strides[i] < 1 || geo.dilations[i] < 1) {
+      throw UnsupportedOpError(
+          op_type + " with strides " + IntsStr(geo.strides) +
+          " and dilations " + IntsStr(geo.dilations) +
+          " is not a pooling this rule can invert (node " + name + ")");
+    }
+  }
+
+  if (AttrInt(node, "ceil_mode", 0) != 0) {
+    throw UnsupportedOpError(op_type +
+                             " with ceil_mode=1 is not differentiated here "
+                             "(node " +
+                             name + ")");
+  }
+
+  const onnx::AttributeProto* pad_mode = FindAttr(node, "auto_pad");
+  const std::string auto_pad =
+      pad_mode == nullptr ? std::string("NOTSET") : pad_mode->s();
+  std::vector<int64_t> pads;
+  if (auto_pad == "NOTSET") {
+    pads = AttrInts(node, "pads", std::vector<int64_t>(2 * spatial, 0));
+    if (pads.size() != 2 * spatial) {
+      throw UnsupportedOpError(op_type + "'s pads " + IntsStr(pads) +
+                               " must have two entries per spatial axis (" +
+                               std::to_string(spatial) + ") (node " + name +
+                               ")");
+    }
+  } else if (auto_pad == "VALID") {
+    pads.assign(2 * spatial, 0);
+  } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+    // The spec's own formula, same as ConvGeometryOf's: output_shape[i] =
+    // ceil(input_shape[i] / strides[i]), the odd remainder going to the end
+    // for SAME_UPPER and the beginning for SAME_LOWER.
+    pads.assign(2 * spatial, 0);
+    for (size_t i = 0; i < spatial; ++i) {
+      const int64_t size = x_shape[2 + i];
+      const int64_t out = (size + geo.strides[i] - 1) / geo.strides[i];
+      const int64_t span = (geo.kernel[i] - 1) * geo.dilations[i] + 1;
+      const int64_t needed =
+          std::max<int64_t>(0, (out - 1) * geo.strides[i] + span - size);
+      pads[i] = auto_pad == "SAME_UPPER" ? needed / 2 : needed - needed / 2;
+      pads[spatial + i] = needed - pads[i];
+    }
+  } else {
+    throw UnsupportedOpError(op_type + " with auto_pad '" + auto_pad +
+                             "' is not differentiated here (node " + name +
+                             ")");
+  }
+
+  for (size_t i = 0; i < spatial; ++i) {
+    const int64_t span = (geo.kernel[i] - 1) * geo.dilations[i] + 1;
+    const int64_t reach = x_shape[2 + i] + pads[i] + pads[spatial + i] - span;
+    // A negative reach is spelled out rather than divided, for the same
+    // reason ConvGeometryOf's does: Python's floor division and C++'s
+    // truncation disagree there.
+    const int64_t expected = reach >= 0 ? reach / geo.strides[i] + 1 : 0;
+    if (expected != y_shape[2 + i]) {
+      throw UnsupportedOpError(
+          op_type + "'s declared output shape " + ShapeStr(y_shape) +
+          " does not follow from input " + ShapeStr(x_shape) + ", kernel " +
+          IntsStr(geo.kernel) + ", strides " + IntsStr(geo.strides) +
+          ", dilations " + IntsStr(geo.dilations) + " and pads " +
+          IntsStr(pads) + ": axis " + std::to_string(i) + " should be " +
+          std::to_string(expected) + ", not " + std::to_string(y_shape[2 + i]) +
+          " (node " + name + ")");
+    }
+  }
+  geo.pads_begin.assign(pads.begin(), pads.begin() + spatial);
+  return geo;
+}
+
+std::vector<OptStr> GradAveragePool(Backward& ctx, const onnx::NodeProto& node,
+                                    const std::string& g) {
+  // AveragePool's gradient: col2im of dY, scaled by each window's own
+  // divisor -- GradConv's dX half with the MatMul against W deleted
+  // outright, since pooling is depthwise and there is no weight to sum
+  // over. _grad_averagepool in graph_grad.py carries the derivation; this is
+  // a transcription of it, node for node.
+  const std::string& x = node.input(0);
+  const Shape x_shape = ctx.ShapeOf(x);
+  const Shape y_shape = ctx.ShapeOf(node.output(0));
+  const PoolGeometry geo =
+      PoolGeometryOf(node, x_shape, y_shape, /*has_dilations=*/false);
+  const bool count_include_pad = AttrInt(node, "count_include_pad", 0) != 0;
+
+  const int64_t planes = x_shape[0] * x_shape[1];
+  const Shape in_dims(x_shape.begin() + 2, x_shape.end());
+  const Shape out_dims(y_shape.begin() + 2, y_shape.end());
+  const int64_t taps = Prod(geo.kernel);
+  const int64_t in_count = Prod(in_dims);
+  const int64_t out_count = Prod(out_dims);
+
+  // Every window's divisor, in double precision to match the Python's
+  // np.float64. Always the mask-summing general path when
+  // count_include_pad=0, never a "no padding" shortcut keyed on pads_begin
+  // alone -- pads_begin can be all zero while pads_end is not (asymmetric,
+  // end-only padding), and a shortcut keyed on it once got that case wrong
+  // on the Python side. The mask sum below already comes out to
+  // prod(kernel) everywhere when there truly is no padding, so nothing is
+  // lost by always taking it.
+  std::vector<double> divisor(static_cast<size_t>(out_count));
+  if (count_include_pad) {
+    std::fill(divisor.begin(), divisor.end(), static_cast<double>(taps));
+  } else {
+    const std::pair<std::vector<int64_t>, std::vector<float>> im2col =
+        Im2ColIndices(in_dims, out_dims, geo.kernel, geo.strides, geo.dilations,
+                      geo.pads_begin);
+    for (int64_t tap = 0; tap < taps; ++tap) {
+      for (int64_t out = 0; out < out_count; ++out) {
+        divisor[static_cast<size_t>(out)] +=
+            im2col.second[static_cast<size_t>(tap * out_count + out)];
+      }
+    }
+    for (double d : divisor) {
+      if (d == 0.0) {
+        throw UnsupportedOpError(
+            "AveragePool has a window with no non-padding elements at all "
+            "(node " +
+            Quoted(node.output(0)) +
+            "); its average, and this rule's divisor, are undefined for "
+            "that window");
+      }
+    }
+  }
+  std::vector<float> recip(divisor.size());
+  for (size_t i = 0; i < divisor.size(); ++i) {
+    recip[i] = static_cast<float>(1.0 / divisor[i]);
+  }
+
+  const std::string g2_shape = ctx.b().ConstInt64({planes, out_count}, "shape");
+  const std::string g2 = ctx.b().Op("Reshape", {g, g2_shape}, "reshape");
+  const std::string recip_const = ctx.b().Const(recip, {1, out_count}, "recip");
+  const std::string scaled = ctx.b().Mul(g2, recip_const);
+
+  const std::pair<std::vector<int64_t>, std::vector<float>> col2im =
+      Col2ImIndices(in_dims, out_dims, geo.kernel, geo.strides, geo.dilations,
+                    geo.pads_begin);
+  const std::string idx_const = ctx.b().ConstInt64(col2im.first, "idx");
+  const std::string gathered =
+      ctx.b().Op("Gather", {scaled, idx_const}, {IntAttr("axis", 1)}, "gather");
+  const std::string mask_const =
+      ctx.b().Const(col2im.second, {1, taps * in_count}, "mask");
+  const std::string masked = ctx.b().Mul(gathered, mask_const);
+  const std::string col_shape =
+      ctx.b().ConstInt64({planes, taps, in_count}, "shape");
+  const std::string col = ctx.b().Op("Reshape", {masked, col_shape}, "reshape");
+  const std::string axes_const = ctx.b().ConstInt64({1}, "axes");
+  const std::string dx_flat = ctx.b().Op("ReduceSum", {col, axes_const},
+                                         {IntAttr("keepdims", 0)}, "reducesum");
+  const std::string dx_shape = ctx.b().ConstInt64(x_shape, "shape");
+  const std::string dx = ctx.b().Op("Reshape", {dx_flat, dx_shape}, "reshape");
+  return {dx};
+}
+
+std::vector<OptStr> GradMaxPool(Backward& ctx, const onnx::NodeProto& node,
+                                const std::string& g) {
+  // MaxPool's gradient: route dY to whichever input element(s) achieved
+  // node.output(0) in each window, without a fresh ReduceMax and without a
+  // MatMul. _grad_maxpool in graph_grad.py carries the full derivation (why
+  // no ReduceMax is needed, the tie-splitting convention, the per-tap-offset
+  // scatter trick this rule needs that GradConv's dX half does not); this is
+  // a transcription of it, node for node. MaxPool's optional Indices output
+  // is never reached here at all -- BuildBackward refuses any node with more
+  // than one declared output before a rule ever runs.
+  const std::string& x = node.input(0);
+  const std::string& y = node.output(0);
+  const Shape x_shape = ctx.ShapeOf(x);
+  const Shape y_shape = ctx.ShapeOf(y);
+  const PoolGeometry geo =
+      PoolGeometryOf(node, x_shape, y_shape, /*has_dilations=*/true);
+
+  const int64_t planes = x_shape[0] * x_shape[1];
+  const Shape in_dims(x_shape.begin() + 2, x_shape.end());
+  const Shape out_dims(y_shape.begin() + 2, y_shape.end());
+  const int64_t taps = Prod(geo.kernel);
+  const int64_t in_count = Prod(in_dims);
+  const int64_t out_count = Prod(out_dims);
+
+  const std::string x2_shape = ctx.b().ConstInt64({planes, in_count}, "shape");
+  const std::string x2 = ctx.b().Op("Reshape", {x, x2_shape}, "reshape");
+  const std::pair<std::vector<int64_t>, std::vector<float>> im2col =
+      Im2ColIndices(in_dims, out_dims, geo.kernel, geo.strides, geo.dilations,
+                    geo.pads_begin);
+  for (int64_t out = 0; out < out_count; ++out) {
+    float sum = 0.0f;
+    for (int64_t tap = 0; tap < taps; ++tap) {
+      sum += im2col.second[static_cast<size_t>(tap * out_count + out)];
+    }
+    if (sum == 0.0f) {
+      // A window every tap of which the padding invented has no real
+      // element to route dY to at all: the forward's own max over such a
+      // window is -inf by construction, which no real input value equals,
+      // so the tie count below would be a division by zero rather than a
+      // quietly wrong credit. Caught here, at build time, rather than
+      // producing a NaN gradient at run time.
+      throw UnsupportedOpError(
+          "MaxPool has a window with no non-padding elements at all (node " +
+          Quoted(node.output(0)) +
+          "); its max, and this rule's gradient for that window, are "
+          "undefined");
+    }
+  }
+  const std::string x_index = ctx.b().ConstInt64(im2col.first, "idx");
+  const std::string gathered =
+      ctx.b().Op("Gather", {x2, x_index}, {IntAttr("axis", 1)}, "gather");
+  const std::string windows_shape =
+      ctx.b().ConstInt64({planes, taps, out_count}, "shape");
+  const std::string windows =
+      ctx.b().Op("Reshape", {gathered, windows_shape}, "reshape");
+  const std::string y3_shape =
+      ctx.b().ConstInt64({planes, 1, out_count}, "shape");
+  const std::string y3 = ctx.b().Op("Reshape", {y, y3_shape}, "reshape");
+
+  // eq[plane, tap, out] = 1 iff the tap's input element equals the window's
+  // max: neither strictly greater (impossible, Y is the max) nor strictly
+  // less -- Cast(Greater)/Cast(Less), no Equal needed. A tap the padding
+  // invented is excluded outright by multiplying in the same validity mask
+  // GradConv uses, since a masked tap's gathered value is an arbitrary
+  // element that could spuriously equal Y.
+  const std::string one_a = ctx.b().Const(1.0f);
+  const std::string greater_mask = ctx.MaskGreater(windows, y3);
+  const std::string not_greater = ctx.b().Sub(one_a, greater_mask);
+  const std::string one_b = ctx.b().Const(1.0f);
+  const std::string less_mask = ctx.MaskLess(windows, y3);
+  const std::string not_less = ctx.b().Sub(one_b, less_mask);
+  const std::string eq_raw = ctx.b().Mul(not_greater, not_less);
+  const std::string valid_const =
+      ctx.b().Const(im2col.second, {1, taps, out_count}, "valid");
+  const std::string eq = ctx.b().Mul(eq_raw, valid_const);
+
+  // Ties split the credited gradient so a window's total outgoing gradient
+  // still sums to exactly the dY that came in -- see _grad_maxpool's
+  // docstring for why, and for the near-zero real-world likelihood of a tie
+  // this exists to handle without crashing or misbehaving silently.
+  const std::string tie_axes = ctx.b().ConstInt64({1}, "axes");
+  const std::string tie_count = ctx.b().Op(
+      "ReduceSum", {eq, tie_axes}, {IntAttr("keepdims", 1)}, "reducesum");
+  const std::string credit = ctx.b().Div(eq, tie_count);
+
+  const std::string g3_shape =
+      ctx.b().ConstInt64({planes, 1, out_count}, "shape");
+  const std::string g3 = ctx.b().Op("Reshape", {g, g3_shape}, "reshape");
+  const std::string contrib = ctx.b().Mul(credit, g3);
+  const std::string contrib2_shape =
+      ctx.b().ConstInt64({planes, taps * out_count}, "shape");
+  const std::string contrib2 =
+      ctx.b().Op("Reshape", {contrib, contrib2_shape}, "reshape");
+
+  std::pair<std::vector<int64_t>, std::vector<float>> scatter =
+      Col2ImIndices(in_dims, out_dims, geo.kernel, geo.strides, geo.dilations,
+                    geo.pads_begin);
+  // Offset each tap's block into its own slice of the flattened
+  // [taps, out_count] axis contrib2 holds: unlike GradConv's dX (whose
+  // gathered value is the same for every tap, since the weight does the
+  // differentiating), here each tap's credited gradient genuinely differs
+  // per tap, so the plain Col2ImIndices trick of gathering the same
+  // [planes, out_count] tensor for every tap does not apply as-is. Tap t's
+  // block starts at t * out_count, so one Gather still reaches the right
+  // tap's own contribution for every input element.
+  for (int64_t tap = 0; tap < taps; ++tap) {
+    const int64_t base = tap * in_count;
+    const int64_t offset = tap * out_count;
+    for (int64_t entry = 0; entry < in_count; ++entry) {
+      scatter.first[static_cast<size_t>(base + entry)] += offset;
+    }
+  }
+
+  const std::string scatter_idx_const =
+      ctx.b().ConstInt64(scatter.first, "idx");
+  const std::string gathered_back = ctx.b().Op(
+      "Gather", {contrib2, scatter_idx_const}, {IntAttr("axis", 1)}, "gather");
+  const std::string scatter_mask_const =
+      ctx.b().Const(scatter.second, {1, taps * in_count}, "mask");
+  const std::string masked_back =
+      ctx.b().Mul(gathered_back, scatter_mask_const);
+  const std::string col_shape =
+      ctx.b().ConstInt64({planes, taps, in_count}, "shape");
+  const std::string col =
+      ctx.b().Op("Reshape", {masked_back, col_shape}, "reshape");
+  const std::string dx_axes = ctx.b().ConstInt64({1}, "axes");
+  const std::string dx_flat = ctx.b().Op("ReduceSum", {col, dx_axes},
+                                         {IntAttr("keepdims", 0)}, "reducesum");
+  const std::string dx_shape = ctx.b().ConstInt64(x_shape, "shape");
+  const std::string dx = ctx.b().Op("Reshape", {dx_flat, dx_shape}, "reshape");
+  return {dx};
+}
+
 std::vector<OptStr> GradAdd(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   const Shape out = ctx.ShapeOf(node.output(0));
@@ -1162,6 +1515,7 @@ const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
           {"Add", &GradAdd},
+          {"AveragePool", &GradAveragePool},
           {"Clip", &GradClip},
           {"Conv", &GradConv},
           {"Div", &GradDiv},
@@ -1172,6 +1526,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Identity", &GradIdentity},
           {"LayerNormalization", &GradLayerNormalization},
           {"MatMul", &GradMatMul},
+          {"MaxPool", &GradMaxPool},
           {"Mul", &GradMul},
           {"Neg", &GradNeg},
           {"ReduceMean", &GradReduce},
