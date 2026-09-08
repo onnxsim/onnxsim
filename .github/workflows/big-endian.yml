@@ -16,6 +16,15 @@ name: Big Endian
 # caught by the weekly run rather than at review time -- the trade that keeps
 # this off the critical path of ordinary PRs. To make it stricter, widen the
 # paths filter below to "onnxsim/**".
+#
+# **The filter has to keep step with what the job runs.** ctest here executes
+# every test CMake registers, and build_s390x_extension.sh builds 25 of them
+# specifically because they read or write raw_data. For a long time this list
+# named exactly one of those 25, so a change to (say) qat_entry.cpp -- which
+# reads float weights out of raw_data and packs INT4 codes back into it -- did
+# not run the job that tests it, and merged verified only by the following
+# Monday. Adding a test target there is therefore half the job: its source
+# belongs here too, or the coverage is nominal.
 
 on:
   schedule:
@@ -30,6 +39,51 @@ on:
       # The other file that reads raw_data (IntTensorToSymTensor, IsAllZeroTensor).
       - "onnxsim/onnxsim.cpp"
       - "onnxsim/onnxsim.h"
+      # Tensor bytes in and out of TensorPool, including its content hash.
+      - "onnxsim/tensor_pool.cpp"
+      - "onnxsim/tensor_pool.h"
+      - "onnxsim/tensor_pool_dtype.h"
+      - "onnxsim/tensor_pool_hash.cpp"
+      - "onnxsim/tensor_pool_hash.h"
+      - "onnxsim/tensor_pool_gguf.cpp"
+      - "onnxsim/tensor_pool_bridge.h"
+      - "onnxsim/tensor_pool_gguf_bridge.h"
+      # These two have no source of their own -- they cover the headers above
+      # -- but a test that picks up a host-order assumption reports a false
+      # pass, so editing one alone should still run here.
+      - "onnxsim/tensor_pool_archive_test.cpp"
+      - "onnxsim/read_gguf_metadata_test.cpp"
+      # The GGUF/GGML decoders: a decoded value is real numeric output rather
+      # than bytes copied through, so a host-order assumption changes results
+      # rather than merely scrambling a blob.
+      - "onnxsim/gguf_dtype.h"
+      - "onnxsim/ggml_kquant.h"
+      - "onnxsim/ggml_legacy_quant.h"
+      - "onnxsim/ggml_mxfp4.h"
+      # ReadFloatTensorFlat and GetTensorFloatData, which decode weight tensors.
+      - "onnxsim/precision_estimator.cpp"
+      - "onnxsim/precision_estimator.h"
+      - "onnxsim/xnnpack_codegen.cpp"
+      - "onnxsim/xnnpack_codegen.h"
+      # The step-graph emitters. GraphBuilder::Const *writes* raw_data and
+      # qat_entry reads weights and scales back out of it, so a big-endian run
+      # exercises both directions.
+      - "onnxsim/graph_grad.cpp"
+      - "onnxsim/graph_grad.h"
+      - "onnxsim/qat_graph_builder.cpp"
+      - "onnxsim/qat_graph_builder.h"
+      - "onnxsim/qat_entry.cpp"
+      - "onnxsim/qat_entry.h"
+      # The sharpest check in the tree, and the reason its four files are
+      # listed rather than just the C++: the fixture is generated on a
+      # little-endian host and both emitters are compared against it, so it
+      # fails if either side of the round trip picks up a host-order
+      # assumption. qat_graph.py and the generator decide what the fixture
+      # says; test_qat_parity.py runs here too.
+      - "onnxsim/qat_graph_parity_test.cpp"
+      - "onnxsim/qat_parity_fixtures.txt"
+      - "onnxsim/qat_graph.py"
+      - "scripts/make_qat_parity_fixtures.py"
       # The harness, so changes to it are validated before they are relied on.
       - "scripts/cross/bootstrap_s390x_rootfs.sh"
       - "scripts/cross/build_s390x_extension.sh"
