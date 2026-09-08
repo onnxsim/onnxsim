@@ -4887,6 +4887,49 @@ def test_nvfp4_weights_are_accepted_and_then_ignored(tmp_path):
     assert len(set(codes["S8"])) > 32, len(set(codes["S8"]))
 
 
+def test_per_channel_weight_scales_sit_just_past_the_weight_block(tmp_path):
+    """Confirmed real (see the README's "What a weight generator can and
+    cannot do yet" section): the weight table carries one float32 per output
+    channel, immediately after the weight block, exactly proportional to that
+    channel's peak magnitude.
+
+    Finding it by proportionality rather than by a fixed offset is the point:
+    the constant of proportionality absorbs the activation scales and differs
+    between models, so only the *ratios* identify the array. Needs Docker, no
+    device.
+    """
+    cin = cout = 8
+    kernel, hw = 3, 16
+    rng = np.random.RandomState(3)
+    weights = (rng.randn(cout, cin, kernel, kernel) * 0.1).astype(np.float32)
+    work = tmp_path / "work"
+    work.mkdir()
+    axmodel = _build_single_op_axmodel(
+        str(work), "m", _one_conv2d_model(cin, cout, hw, kernel, weights=weights)
+    )
+    wbt = _wbt_of(axmodel)
+    peaks = np.abs(weights.reshape(cout, -1)).max(1).astype(np.float64)
+
+    found = None
+    for off in range(0, len(wbt) - 4 * cout, 4):
+        values = np.frombuffer(wbt[off : off + 4 * cout], dtype=np.float32).astype(
+            np.float64
+        )
+        if not np.all(np.isfinite(values)) or values.min() <= 0:
+            continue
+        ratio = values / peaks
+        if ratio.std() / ratio.mean() < 1e-4:
+            found = (off, ratio.mean())
+            break
+    assert found is not None, "no per-channel scale array proportional to the peaks"
+    off, ratio = found
+    # It sits past the weights, which occupy `_WBT2D_O_STRIDE` per channel.
+    assert off >= _WBT2D_O_STRIDE * cout, (off, _WBT2D_O_STRIDE * cout)
+    assert off < len(wbt), (off, len(wbt))
+    # The constant is a scale, not something degenerate.
+    assert 0 < ratio < 1, ratio
+
+
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
     """Confirmed real (see the README's "The first operand with a known
     meaning" section): in a program holding exactly one convolution, the
