@@ -101,6 +101,10 @@ constant folding until the model stops changing. Around that it offers:
   [SAM 2](https://github.com/facebookresearch/sam2) image encoder and
   prompt/mask decoder to ONNX and simplify both with
   `onnxsim.export_sam2_model()`.
+- **[Deploying to Axelera Metis devices](#deploying-to-axelera-metis-devices-voyager-sdk).**
+  Safe to run ahead of [Voyager SDK](https://github.com/axelera-ai-hub/voyager-sdk)'s
+  own `deploy.py`: its Focus/space-to-depth and flattened-FC-head detectors,
+  and any custom decode ops, survive `simplify()`.
 - **[Quantization-aware fine-tuning](#quantization-aware-fine-tuning).**
   Recover accuracy a quantization lost with `onnxsim.apply_qat()`:
   label-free, block-wise fine-tuning of the fp32 weights themselves against
@@ -1325,6 +1329,47 @@ A same-named `sam2` package that *is* on PyPI is an unrelated, unofficial
 third-party upload as of this writing, not Meta's code -- don't substitute
 it for this.
 
+## Deploying to Axelera Metis devices (Voyager SDK)
+
+[Voyager SDK](https://github.com/axelera-ai-hub/voyager-sdk) is Axelera AI's
+SDK for deploying ONNX models onto Metis AI accelerators via its `deploy.py`
+tool. Voyager SDK's own tutorials already recommend running
+`onnxsim.simplify` as a manual pre-processing step before deployment (see its
+CLIP/FastSAM cascade deployment guide), so the usual pattern is:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("model.onnx")
+model_simp, check_ok = onnxsim.simplify(model)
+assert check_ok
+onnx.save(model_simp, "model_simplified.onnx")
+# Now point Voyager SDK's deploy.py / model YAML at model_simplified.onnx.
+```
+
+Voyager SDK also runs its own ONNX graph rewriter
+(`ax_models/onnx_optimizations.py`) ahead of compilation, which recognizes
+two structural patterns and rewrites them into a form its compiler tiles
+better on the AIPU: a YOLOX-style "Focus" space-to-depth block (four
+parity-quadrant `Slice` chains concatenated into a `Conv`), and a flattened
+fully-connected head (`Reshape` to `[N, C*H*W]` feeding a `Gemm`/`MatMul`, as
+in ArcFace-style face recognition heads). Both keep working after
+`onnxsim.simplify()`:
+onnxsim does fuse each Focus quadrant's two chained `Slice` nodes (H then W)
+into a single multi-axis `Slice`, but the fused chain still resolves to the
+same four quadrants and common root, and the flattened-FC `Reshape` and the
+`value_info` Voyager SDK's shape inference needs to recover its pre-flatten
+spatial shape both survive intact -- see `tests/test_voyager_sdk_patterns.py`
+for the structural checks this is based on. In short, it's safe to run
+`onnxsim.simplify()` *before* handing a model to Voyager SDK.
+
+Voyager SDK pipelines can also include custom decode/post-processing nodes
+in a private ONNX domain (e.g. a cascade's postamble subgraph). These are
+custom operators in the sense of the [Custom operators](#custom-operators)
+section above: `simplify()` preserves them -- with or without a schema
+registered for them -- and simplifies the rest of the graph around them.
+
 ## Quantization-aware fine-tuning
 
 onnxsim's post-training quantization passes stop at *rounding*: AdaRound,
@@ -1581,6 +1626,7 @@ conversion tooling include:
 * [X2Paddle](https://github.com/PaddlePaddle/X2Paddle) (PaddlePaddle) — runs `onnxsim.simplify` in its ONNX → Paddle conversion optimizer
 * [ncnn](https://github.com/Tencent/ncnn) (Tencent) — recommends simplifying with onnxsim before `onnx2ncnn`
 * [RKNN Model Zoo](https://github.com/airockchip/rknn_model_zoo) (Rockchip) — runs onnxsim in its ONNX export scripts before RKNN conversion
+* [Voyager SDK](https://github.com/axelera-ai-hub/voyager-sdk) (Axelera AI) — its deployment tutorials simplify models with onnxsim before deploying them to Metis accelerators
 
 ## Chat
 
