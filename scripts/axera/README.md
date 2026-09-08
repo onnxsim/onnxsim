@@ -3784,6 +3784,53 @@ A generator has to dispatch on shape, which is exactly what
 Test: `test_resnet18d_conv_weights_are_addressable` (Docker, no device),
 which locates every one of the 22 layers.
 
+### A second operand, and a method that rejects its own guesses
+
+With the weight table readable, the remaining unknown is operand meaning:
+156 register addresses across the models measured so far, of which `40.02`
+was the only one understood. This is a systematic attempt at the rest, and
+its most useful output is the shape of the method.
+
+**Sweep one parameter at a time, align, then split into bitfields.** Twenty-one
+single-convolution builds vary `Cin`, `Cout`, length, kernel and dilation
+independently. Aligning their records by *structural signature* (not
+position, which shifts) leaves 209 slots present in every build, of which 25
+carry an operand that moves at all. Fitting whole operands mostly fails,
+because a 32-bit operand is several packed fields; splitting each into the
+bits that actually move and fitting those separately produces five candidate
+`(register, bitfield)` semantics.
+
+**Then hold out configurations and see which candidates survive. Two of three
+did not.** A candidate `(k-1)/2` kernel field fit the sweep exactly and then
+read 2 where it should have read 3 at `k = 7`; a candidate `Cin/4 - 1` field
+fit and then read 0 on every held-out build. Both were artefacts of fitting
+four points with two degrees of freedom. Reporting them would have been easy
+and wrong -- the held-out builds are what made the difference.
+
+**What survives is a spatial extent.** Bits 4 to 6 of the first `a1 b0.03`
+operand are
+
+    length / 16 - 1
+
+the input's spatial size in 16-element tiles, inclusive -- the same
+convention `40.02` uses for channels. It is correct in **all 27**
+configurations measured, six of them held out from the fit, and the negatives
+are what make it a *spatial* field specifically: changing `Cin`, `Cout`, the
+kernel size or the dilation leaves it untouched, while several other operands
+that also move with the length fail one or more of those tests.
+
+A near-miss worth recording: bits 20 to 22 of `81.34` carry the same value in
+21 of 27 configurations and disagree in the other 6, all of which changed
+`Cin`. So it is not a spatial field; it is something that usually coincides
+with one. That is exactly the shape of error the held-out set is there to
+catch.
+
+So the operand budget moves from one confirmed field to two, and there is now
+a repeatable procedure for the rest: sweep, align by signature, split into
+moving bitfields, fit, and discard whatever a held-out configuration refutes.
+
+Test: `test_spatial_extent_lives_in_three_bits_of_b0_03` (Docker, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
