@@ -245,14 +245,11 @@ Shapes ConvShapes() {
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {
-      "Add",        "Clip",      "Conv",
-      "Div",        "Erf",       "Exp",
-      "Gemm",       "Identity",  "LayerNormalization",
-      "MatMul",     "Mul",       "Neg",
-      "ReduceMean", "ReduceSum", "Relu",
-      "Reshape",    "Sigmoid",   "Softmax",
-      "Sqrt",       "Sub",       "Tanh",
-      "Transpose"};
+      "Add",    "Clip",    "Conv",     "Div",        "Erf",
+      "Exp",    "Gather",  "Gemm",     "Identity",   "LayerNormalization",
+      "MatMul", "Mul",     "Neg",      "ReduceMean", "ReduceSum",
+      "Relu",   "Reshape", "Sigmoid",  "Softmax",    "Sqrt",
+      "Sub",    "Tanh",    "Transpose"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
@@ -729,6 +726,80 @@ void ConvsOfAnyRankDifferentiateIdentically() {
   }
 }
 
+// If this fails, the C++ Gather rule has drifted from _grad_gather in
+// graph_grad.py -- pinned the same way and for the same reason as the
+// LayerNorm and Conv rules above: the nodes are numbered by the builder's
+// counter in emission order, so a reordering alone renames every tensor a
+// browser-built step graph produces from there on. axis=1 on a rank-3 data
+// tensor exercises a non-trivial pre/post split around the gathered axis,
+// not just the plain [N, D] embedding-table case.
+void TheGatherRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Gather", {"data", "idx"}, {"Y"}, {IntAttr("axis", 1)})};
+  const Shapes shapes = {{"data", {2, 5, 3}}, {"idx", {2}}, {"Y", {2, 2, 3}}};
+  GraphBuilder b;
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"data"});
+
+  // Flatten and resolve indices (Reshape, Cast, Less, Cast, Mul, Add); build
+  // the one-hot mask (Reshape, Reshape, Greater, Cast, Sub, Less, Cast, Sub,
+  // Mul); then the batched one-hot matmul that stands in for the scatter-add
+  // (Transpose, Reshape, Reshape, MatMul, Reshape).
+  const std::vector<std::string> expected = {
+      "Reshape",   "Cast",    "Less",    "Cast",    "Mul",
+      "Add",       "Reshape", "Reshape", "Greater", "Cast",
+      "Sub",       "Less",    "Cast",    "Sub",     "Mul",
+      "Transpose", "Reshape", "Reshape", "MatMul",  "Reshape"};
+  Check(OpTypes(b) == expected,
+        "the Gather rule should emit graph_grad.py's nodes in its order");
+  Check(grads.size() == 1 && grads.at("data") == b.nodes().back().output(0),
+        "dData should be the last Reshape emitted");
+
+  Check(b.initializer().size() == 11,
+        "the rule should emit 11 initializers: the index-resolution "
+        "constants, the arange, and four reshape-shape operands");
+  const std::vector<onnx::TensorProto>& init = b.initializer();
+  Check(Int64Data(init[0]) == std::vector<int64_t>{2},
+        "the flat-index reshape target should be [length] = [2]");
+  Check(FloatData(init[1]) == std::vector<float>{0.0f} &&
+            FloatData(init[2]) == std::vector<float>{5.0f},
+        "the resolved-index constants should be 0.0 (the negativity bound) "
+        "and count = data.shape[axis] = 5");
+  Check(Int64Data(init[3]) == std::vector<int64_t>({2, 1}),
+        "the one-hot column reshape should be [length, 1]");
+  Check(FloatData(init[4]) == std::vector<float>({0, 1, 2, 3, 4}),
+        "the arange constant should be 0..count-1");
+  Check(Int64Data(init[5]) == std::vector<int64_t>({1, 5}),
+        "the one-hot row reshape should be [1, count]");
+  Check(FloatData(init[6]) == std::vector<float>{1.0f} &&
+            FloatData(init[7]) == std::vector<float>{1.0f},
+        "the two-sided one-hot mask should subtract from 1.0 twice");
+  Check(Int64Data(init[8]) == std::vector<int64_t>({1, 5, 2}),
+        "the batched one-hot reshape should be [1, count, length]");
+  Check(Int64Data(init[9]) == std::vector<int64_t>({2, 2, 3}),
+        "dY's flattening reshape should be [pre, length, post] = [2, 2, 3]");
+  Check(Int64Data(init.back()) == std::vector<int64_t>({2, 5, 3}),
+        "the final reshape should restore data's own shape");
+
+  // indices takes no gradient at all -- neither a node nor an entry.
+  Check(grads.count("idx") == 0,
+        "Gather's indices input should have no gradient");
+}
+
+// If this fails, a batched index tensor (e.g. [batch, seq]) would be
+// silently mixed across batch elements by a reshape that only makes sense
+// for a scalar or a rank-1 sequence of lookups -- see _grad_gather in
+// graph_grad.py for why this is refused rather than risked.
+void AGatherWithRankTwoIndicesIsRefused() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Gather", {"data", "idx"}, {"Y"})};
+  const Shapes shapes = {{"data", {5, 3}}, {"idx", {2, 2}}, {"Y", {2, 2, 3}}};
+  GraphBuilder b;
+  CheckThrows<UnsupportedOpError>(
+      [&] { BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"data"}); },
+      "rank-2", "a rank-2 index tensor should be refused");
+}
+
 // If this fails, a tensor read by two consumers -- a residual connection's
 // own input, which is why this matters -- would keep only one contribution,
 // and the parameter upstream of it would train on a fraction of its
@@ -836,6 +907,8 @@ int main() {
   TheConvIndexTablesAreTheOnesTheGeometryImplies();
   AConvWhoseGeometryDoesNotAddUpIsRefused();
   ConvsOfAnyRankDifferentiateIdentically();
+  TheGatherRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  AGatherWithRankTwoIndicesIsRefused();
   ATensorReadTwiceAccumulatesItsContributions();
   AnIdentityAliasesTheSeedInsteadOfEmittingANode();
   TheReturnedMapCoversExactlyTheRequestedTargets();

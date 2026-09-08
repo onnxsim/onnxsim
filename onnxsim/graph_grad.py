@@ -1011,6 +1011,117 @@ def _grad_clip(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return [ctx.b.mul(g, mask)] + rest
 
 
+def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``Gather``'s gradient: a scatter-add into ``data``, ``indices`` itself
+    untouched.
+
+    This is the embedding-lookup case -- ``Gather(table, token_ids)`` -- not
+    the constant-index-table use :func:`_grad_conv` makes of the *forward*
+    ``Gather`` op (see the note above :data:`BACKWARD_OPS`, which is a fact
+    about what the rules may *emit*, not about what they can differentiate).
+    Here ``indices`` is a real, run-time-valued tensor and ``data`` is the
+    thing being trained, so the direction of travel is the opposite one.
+
+    **Why a scatter-add, and why a one-hot matmul instead.** ONNX's
+    ``Gather`` reads ``N = data.shape[axis]`` rows and can read the same row
+    more than once (a repeated token in a sequence); the gradient of a
+    duplicated read is the *sum* of every place it was read, i.e. exactly a
+    scatter-add of ``dY`` into ``dData`` at each row ``indices`` named. There
+    is no scatter op in :data:`BACKWARD_OPS`, and there should not need to
+    be: the same accumulation is a matrix product against a one-hot matrix,
+    built from ops already there --
+
+    .. code-block:: text
+
+        onehot[l, n] = 1 if indices[l] == n else 0     (Greater/Less/Cast/Sub)
+        dData[n, ...] = sum_l onehot[l, n] * dY[l, ...]  (a MatMul)
+
+    ``onehot == 1`` is built the same two-sided way every other rule here
+    builds a boolean without an ``Equal`` node: ``(1 - (idx > n)) * (1 - (idx
+    < n))``, with ``idx`` cast to float and broadcast against a constant
+    ``arange(N)``.
+
+    **Shape handled.** ``data`` has ``axis`` picking out one of its axes
+    (``data: [..., N, ...]``); everything before it flattens to a batch
+    dimension ``pre`` and everything after to ``post``, so the one-hot
+    ``MatMul`` is ``[1, N, L] x [pre, L, post] -> [pre, N, post]`` -- the same
+    "leading 1 broadcasts across a batch axis" trick :func:`_grad_conv` uses
+    to keep every operand inside the rank a batched ``MatMul`` wants.
+    ``indices`` itself must be rank 0 (a single scalar lookup) or rank 1 (a
+    sequence of lookups, ``L`` of them) -- squarely the embedding-lookup
+    shape. A higher-rank index tensor (batched lookups, e.g. ``[batch,
+    seq]``) is the same idea with an extra flatten/unflatten, but is refused
+    here rather than risked: a wrong reshape there would not fail loudly, it
+    would silently mix gradients across batch elements. Negative ``axis`` and
+    negative index *values* (``indices[i] + N`` per the ONNX-13 spec) are
+    both resolved -- the axis at build time, the values in the graph itself,
+    since they are only known at run time.
+
+    **What it costs.** The one-hot matrix is ``L x N`` -- the number of
+    lookups times the *entire* size of the gathered axis, not just the rows
+    actually read. For a small reconstruction block's embedding table this is
+    fine; for a large vocabulary (tens of thousands of rows) times a long
+    sequence it is a lot of both compute and a materialized ``arange``
+    constant, in exactly the same "real, and the reason this rule would not
+    be the right one for a general-purpose trainer" way :func:`_grad_conv`'s
+    own docstring is upfront about for its index tables.
+
+    **What this does not do.** Differentiating a ``Gather`` node makes its
+    contribution to a block *differentiable* -- a block containing an
+    embedding lookup no longer has to be routed around. It does not by itself
+    make the embedding table a *trained* weight: the block-fine-tuning weight
+    finders in :mod:`onnxsim.qat` (the ``MatMul``/``Gemm``/``Conv``-only
+    finder and :func:`onnxsim.qat._plan_trained`) still only recognize those
+    three op types' weight inputs. Teaching them to also recognize
+    ``Gather``'s ``data`` input as trainable is separate, out-of-scope
+    follow-up work.
+    """
+    data, indices = node.input[0], node.input[1]
+    data_shape = ctx.shape(data)
+    idx_shape = ctx.shape(indices)
+    rank = len(data_shape)
+    if len(idx_shape) > 1:
+        raise UnsupportedOpError(
+            f"Gather with rank-{len(idx_shape)} indices is not differentiated "
+            f"here (node {node.output[0]!r}); only a scalar or a rank-1 index "
+            "vector is supported"
+        )
+    axis = int(_attr(node, "axis", 0)) % rank
+    count = int(data_shape[axis])
+    pre_shape, post_shape = data_shape[:axis], data_shape[axis + 1 :]
+    pre, post = _prod(pre_shape), _prod(post_shape)
+    length = _prod(idx_shape)  # 1 for a scalar (empty shape), L for a vector
+
+    # indices as a flat float32 [length] vector, with negative values resolved
+    # to indices[i] + count -- a run-time value, so this happens in the graph
+    # rather than at build time.
+    flat_idx = ctx.b.op("Reshape", [indices, ctx.int64_const([length], "shape")])
+    idx_f = ctx.b.op("Cast", [flat_idx], to=onnx.TensorProto.FLOAT)
+    is_negative = ctx.mask_less(idx_f, ctx.b.const(0.0))
+    idx_resolved = ctx.b.add(idx_f, ctx.b.mul(is_negative, ctx.b.const(float(count))))
+
+    # onehot[l, n] = (indices[l] == n), as a float32 [length, count] matrix.
+    idx_col = ctx.b.op("Reshape", [idx_resolved, ctx.int64_const([length, 1], "shape")])
+    arange = ctx.b.const(np.arange(count, dtype=np.float32), "arange")
+    arange_row = ctx.b.op("Reshape", [arange, ctx.int64_const([1, count], "shape")])
+    not_greater = ctx.b.sub(ctx.b.const(1.0), ctx.mask_greater(idx_col, arange_row))
+    not_less = ctx.b.sub(ctx.b.const(1.0), ctx.mask_less(idx_col, arange_row))
+    onehot = ctx.b.mul(not_greater, not_less)
+
+    # dData[n, ...] = sum_l onehot[l, n] * dY[l, ...], batched over `pre` with
+    # a broadcasting leading axis so one onehot matrix serves every batch
+    # element -- see _grad_conv's `wt` for the same trick.
+    onehot_t = ctx.b.transpose(onehot, [1, 0])  # [count, length]
+    onehot_batched = ctx.b.op(
+        "Reshape", [onehot_t, ctx.int64_const([1, count, length], "shape")]
+    )
+    dy_flat = ctx.b.op("Reshape", [g, ctx.int64_const([pre, length, post], "shape")])
+    ddata_flat = ctx.b.matmul(onehot_batched, dy_flat)  # [pre, count, post]
+    ddata = ctx.b.op("Reshape", [ddata_flat, ctx.int64_const(data_shape, "shape")])
+
+    return [ddata, None]
+
+
 _RULES: Dict[str, Rule] = {
     "Add": _grad_add,
     "Clip": _grad_clip,
@@ -1018,6 +1129,7 @@ _RULES: Dict[str, Rule] = {
     "Div": _grad_div,
     "Erf": _grad_erf,
     "Exp": _grad_exp,
+    "Gather": _grad_gather,
     "Gemm": _grad_gemm,
     "Identity": _grad_identity,
     "LayerNormalization": _grad_layer_normalization,

@@ -636,6 +636,58 @@ _CASES = {
         """,
         None,
     ),
+    # Gather: an embedding lookup. `idx` is a text-literal int64 initializer,
+    # not a graph input -- `_feeds` only ever produces random float32, so an
+    # integer index has to be spelled as a constant the way CLAUDE.md's
+    # guidance describes, and it also means `data` is the only graph input,
+    # so it is the only (and therefore the default) differentiation target.
+    "gather_embedding": (
+        """
+        g (float[5,3] data) => (float[3,3] Y)
+        <int64[3] idx = {0, 2, 4}>
+        {
+          Y = Gather(data, idx)
+        }
+        """,
+        None,
+    ),
+    # A repeated index: row 1 is read twice, so its gradient must be the sum
+    # of both readings' contributions -- the scatter-add case the one-hot
+    # matmul exists for, not just a permutation of rows.
+    "gather_repeated_index": (
+        """
+        g (float[4,2] data) => (float[3,2] Y)
+        <int64[3] idx = {1, 1, 3}>
+        {
+          Y = Gather(data, idx)
+        }
+        """,
+        None,
+    ),
+    # A negative axis (resolved at build time) and a negative index value
+    # (resolved in the graph, since it is only known at run time), together
+    # with a non-trivial `pre`/`post` split around the gathered axis.
+    "gather_negative_axis_and_index": (
+        """
+        g (float[2,5,3] data) => (float[2,2,3] Y)
+        <int64[2] idx = {-1, 0}>
+        {
+          Y = Gather <axis = -2> (data, idx)
+        }
+        """,
+        None,
+    ),
+    # A scalar (rank-0) index -- the other rank Gather's own spec allows.
+    "gather_scalar_index": (
+        """
+        g (float[4,3] data) => (float[3] Y)
+        <int64 idx = {2}>
+        {
+          Y = Gather(data, idx)
+        }
+        """,
+        None,
+    ),
 }
 
 
@@ -982,6 +1034,27 @@ def test_a_matmul_with_a_1d_operand_is_refused():
     with pytest.raises(graph_grad.UnsupportedOpError, match="1-D"):
         graph_grad.build_backward(
             b, list(model.graph.node), _static_shapes(model), {"Y": "dY"}, ["A"]
+        )
+
+
+def test_a_gather_with_rank_2_indices_is_refused():
+    """Batched lookups (``indices: [batch, seq]``) are a real use case, but
+    the one-hot-matmul construction only handles a scalar or a rank-1 index
+    vector here -- see :func:`onnxsim.graph_grad._grad_gather` for why a
+    higher rank is refused rather than risked."""
+    model = _model(
+        """
+        g (float[5,3] data) => (float[2,2,3] Y)
+        <int64[2,2] idx = {0, 1, 2, 3}>
+        {
+          Y = Gather(data, idx)
+        }
+        """
+    )
+    b = qat_graph.GraphBuilder()
+    with pytest.raises(graph_grad.UnsupportedOpError, match="rank-2"):
+        graph_grad.build_backward(
+            b, list(model.graph.node), _static_shapes(model), {"Y": "dY"}, ["data"]
         )
 
 
