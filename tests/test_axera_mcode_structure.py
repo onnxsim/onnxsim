@@ -4924,6 +4924,68 @@ def _weight1d_offset_wide(o, i, k, cin, cout, kernel, top):
     ), (4 if i % 2 else 0)
 
 
+def test_dilation_changes_the_weight_layout(tmp_path):
+    """Confirmed real (see the README's "Dilation reorders the weights"
+    section): a dilated convolution stores its weights in a *different*
+    arrangement from an undilated one of the same shape. Each kernel tap gets
+    its own 144-byte chunk instead of packing into the shared slot index.
+
+    The table is the same size either way, so this is a reordering rather
+    than a different amount of data -- which is why reading a dilated layer
+    with the undilated rule returns plausible-looking noise (about a third of
+    the codes right by chance) rather than failing outright. Needs Docker, no
+    device.
+    """
+    cin = cout = 64
+    kernel, length = 3, 64
+    rng = np.random.RandomState(5)
+    weights = rng.randn(cout, cin, kernel) * 0.05
+    for o in range(cout):
+        weights[o] *= 0.2 / np.abs(weights[o]).max()
+    weights = weights.astype(np.float32)
+    expected = _quantize_conv_weights(weights)
+
+    def read(wbt, dilated):
+        got = np.zeros(weights.shape, dtype=int)
+        for o in range(cout):
+            for i in range(cin):
+                for k in range(kernel):
+                    if dilated:
+                        off = (
+                            432 * (o % 16)
+                            + 72 * ((o >> 4) & 1)
+                            + 16 * 432 * (o >> 5)
+                            + 144 * k
+                            + i // 2
+                        )
+                        shift = 4 if i % 2 else 0
+                    else:
+                        off, shift = _weight1d_offset_wide(
+                            o, i, k, cin, cout, kernel, 16 * 432
+                        )
+                    got[o, i, k] = (
+                        ((wbt[off + _WBT_PLANE_GAP] >> shift) & 0xF) << 4
+                    ) | ((wbt[off] >> shift) & 0xF)
+        return got
+
+    tables = {}
+    for dilation in (1, 2):
+        work = tmp_path / f"d{dilation}"
+        work.mkdir()
+        model = _one_conv_model(
+            cin, cout, length, kernel, dilation=dilation, weights=weights
+        )
+        tables[dilation] = _wbt_of(_build_single_op_axmodel(str(work), "m", model))
+
+    # Each layout reads its own build exactly...
+    assert (read(tables[1], dilated=False) == expected).all(), "undilated"
+    assert (read(tables[2], dilated=True) == expected).all(), "dilated"
+    # ... and the undilated rule does not read the dilated build.
+    assert not (read(tables[2], dilated=False) == expected).all()
+    # Same size: a reordering, not more data.
+    assert len(tables[1]) == len(tables[2]), (len(tables[1]), len(tables[2]))
+
+
 def test_1d_weight_layout_holds_at_64_and_128_channels(tmp_path):
     """Confirmed real (see the README's "Closing the 1-D layout to 128
     channels" section): the 1-D weight layout, which stopped working past 32
