@@ -345,6 +345,49 @@ onnx::ModelProto FineTuneModel(float weight, float norm) {
   return model;
 }
 
+// A rank-4 value info, for the convolution model below. AddBatchedInput and
+// AddOutput above are [batch, width]; a Conv needs [batch, C, H, W].
+void AddImageValue(onnx::ValueInfoProto* vi, const std::string& name,
+                   int64_t channels, int64_t size) {
+  vi->set_name(name);
+  onnx::TypeProto::Tensor* tensor = vi->mutable_type()->mutable_tensor_type();
+  tensor->set_elem_type(onnx::TensorProto::FLOAT);
+  onnx::TensorShapeProto* shape = tensor->mutable_shape();
+  shape->add_dim()->set_dim_param("batch");
+  shape->add_dim()->set_dim_value(channels);
+  shape->add_dim()->set_dim_value(size);
+  shape->add_dim()->set_dim_value(size);
+}
+
+// X -> Conv(3x3, valid) -> Y, whose weight is [M, C, kH, kW]: rank 4, which is
+// the case the layer finder refused until Conv joined it.
+onnx::ModelProto ConvModel(float weight) {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("conv");
+  AddImageValue(graph->add_input(), "X", 3, 8);
+  AddImageValue(graph->add_output(), "Y", 4, 6);
+  onnx::NodeProto* conv = graph->add_node();
+  *conv = MakeNode("Conv", {"X", "W", "B"}, {"Y"});
+  // MakeNode carries scalar int attributes only; Conv's are INTS.
+  for (const auto& [name, values] :
+       std::vector<std::pair<std::string, std::vector<int64_t>>>{
+           {"kernel_shape", {3, 3}},
+           {"strides", {1, 1}},
+           {"pads", {0, 0, 0, 0}}}) {
+    onnx::AttributeProto* attr = conv->add_attribute();
+    attr->set_name(name);
+    attr->set_type(onnx::AttributeProto::INTS);
+    for (int64_t v : values) attr->add_ints(v);
+  }
+  *graph->add_initializer() =
+      FloatTensor("W", {4, 3, 3, 3}, std::vector<float>(4 * 3 * 3 * 3, weight));
+  *graph->add_initializer() =
+      FloatTensor("B", {4}, std::vector<float>(4, 0.0f));
+  Finish(&model);
+  return model;
+}
+
 // The teacher's weights, which fine-tuning must never read: it trains the
 // student, and re-seeding from the teacher would throw away whatever change
 // (a pruning, a simplification, an earlier tuning) made the two differ.
@@ -740,6 +783,53 @@ void ADeeperBlockTrainsEveryLayerAndCapturesTheResidual() {
 // The operators that make up the weight fake-quant are therefore the ones that
 // must be *absent* -- a port that emitted them anyway would round the trained
 // weights to a grid nobody asked for and train on quietly.
+// A Conv's weight is [M, C/group, kH, kW] -- rank 4, where every other layer
+// this trains is rank 2. Nothing in the loop actually needed 2-D: w_shape is a
+// Shape rather than a pair, the moments are sized from it, and the write-back
+// stores the weight back in the layout the block's own node reads. The rank
+// check in the finder was the whole restriction, which is why this test is
+// about the *plan* rather than about arithmetic -- if the plan carries a rank-4
+// state tensor and writes back to the right initializer, the rest already
+// worked.
+void AConvolutionsRank4WeightIsPlannedAndWrittenBack() {
+  QatOptions options;
+  options.fake_quant = false;
+  const QatStepPlan plan = BuildQatStepGraph(ConvModel(0.2f), ConvModel(0.3f),
+                                             "X", "Y", kRows, options);
+  CheckModel(plan.step_graph, "the convolution fine-tuning step graph");
+  CheckEqual(static_cast<int64_t>(plan.layers.size()), 1,
+             "the convolution is the one trained layer");
+  CheckEqual(plan.layers[0].codes_initializer, "W",
+             "it writes back into the weight itself");
+  Check(!plan.layers[0].fake_quant,
+        "no quantized scheme produces a Conv, so this is fine-tuning only");
+  CheckEqual(static_cast<int64_t>(plan.layers[0].weight_dims.size()), 4,
+             "the trained weight keeps its rank rather than being flattened");
+  const std::vector<int64_t> expected{4, 3, 3, 3};
+  Check(plan.layers[0].weight_dims == expected,
+        "and keeps its shape, [M, C, kH, kW]");
+
+  // The master weight seeded into the loop is the student's, at its own rank.
+  const onnx::TensorProto* seed = nullptr;
+  for (const onnx::TensorProto& t : plan.initial_state) {
+    if (t.name() == plan.layers[0].weight_state_input) seed = &t;
+  }
+  Check(seed != nullptr, "the loop is seeded with the convolution's weight");
+  if (seed != nullptr) {
+    const std::vector<int64_t> seed_dims(seed->dims().begin(),
+                                         seed->dims().end());
+    Check(seed_dims == expected, "seeded at rank 4, not flattened");
+    const std::vector<float> values = FloatsOf(*seed);
+    Check(!values.empty() && std::abs(values[0] - 0.3f) < 1e-6f,
+          "seeded from the student's weight, not the teacher's");
+  }
+
+  // The bias is input 2 and is not a trained layer, for Conv as for Gemm's C.
+  for (const QatTrainedLayer& layer : plan.layers) {
+    Check(layer.codes_initializer != "B", "the bias is not trained");
+  }
+}
+
 void AFloatBlockFineTunesWithNoQuantizerInTheStepGraph() {
   QatOptions options;
   options.fake_quant = false;
@@ -1036,7 +1126,8 @@ void ABlockWithNoFloatWeightToFineTuneIsRefusedInThoseTerms() {
         BuildQatStepGraph(FloatModel(), Int4QuantizedModel(), "X", "Y", kRows,
                           options);
       },
-      "contains no MatMul/Gemm with a 2-D fp32 weight initializer to fine-tune",
+      "contains no MatMul/Gemm/Conv with an fp32 weight initializer of rank 2 "
+      "or more to fine-tune",
       "a block with no stored float weight is refused in the scheme's terms");
 }
 
@@ -1146,6 +1237,7 @@ int main() {
   TrainingActivationQuantizersPlansBothOfTheirParameters();
   ADeeperBlockTrainsEveryLayerAndCapturesTheResidual();
   AFloatBlockFineTunesWithNoQuantizerInTheStepGraph();
+  AConvolutionsRank4WeightIsPlannedAndWrittenBack();
   PreserveSparsityPinsTheStartingZerosAndNothingElse();
   UntrainedBlockConstantsComeFromTheStudentWhenFineTuning();
   FineTunedWeightsAreWrittenBackAsFloatUnderTheirOwnName();

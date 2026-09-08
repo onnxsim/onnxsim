@@ -427,9 +427,20 @@ binding one on a real model: `graph_grad.SUPPORTED_OPS` is 22 rules
 one), so a normalization -- or a convolution -- in the middle of a block is
 now more nodes in the slice rather than a boundary between blocks. On a CNN
 that is the difference between blocks carved *around* every convolution and
-blocks that contain them; the convolution's own weights still do not train,
-since only MatMul and Gemm have a layer finder. The whole default ONNX domain
-is 202 operators.
+blocks that contain them, and the convolution's own weight trains too. The
+whole default ONNX domain is 202 operators.
+
+Conv weights train only with `fake_quant=False`, and that is a property of the
+quantizers rather than a limitation here: `adaround`'s INT4 finder and
+`quantize_static`'s QDQ finder are both MatMul/Gemm-only, so no quantized
+scheme ever produces a Conv layer for QAT to train. It is also what made the
+change cheap. The fake-quant path reads a weight as a 2-D grid of scale blocks,
+which is the only thing in the loop that ever needed rank 2; the rest -- the
+master weight fed to the block's own node in the layout that node already
+reads, Adam's moments sized from it, the write-back storing it back
+unchanged -- was rank-agnostic already, so a `[M, C/group, *kernel]` weight
+needed the finder's rank check relaxed and nothing else. Pooling is still a
+block boundary, which on a real CNN limits how much of this is reachable.
 
 ### Against `apply_pruning_finetune`, which came first
 
