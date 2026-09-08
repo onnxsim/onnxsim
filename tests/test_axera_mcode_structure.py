@@ -4586,9 +4586,8 @@ def test_spatial_extent_lives_in_three_bits_of_b0_03(tmp_path):
 
     def field_for(**overrides):
         cfg = dict(base, **overrides)
-        work = tmp_path / "_".join(
-            f"{k}{v}" for k, v in sorted(overrides.items()) or [("base", 0)]
-        )
+        name = "_".join(f"{k}{v}" for k, v in sorted(overrides.items())) or "base"
+        work = tmp_path / name
         work.mkdir()
         model = _one_conv_model(
             cfg["cin"],
