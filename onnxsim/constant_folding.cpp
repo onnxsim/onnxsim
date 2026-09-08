@@ -1504,70 +1504,16 @@ void FoldGroupOnGraph(
   }
   std::vector<onnx::Node*> ops(const_nodes.begin() + begin,
                                const_nodes.begin() + end);
+  // Only RunOpsOnGraph itself -- which merely evaluates `ops` and does not
+  // touch `g` -- is retried via bisection on failure below: at this point
+  // nothing in `g` has been mutated yet, so re-deriving `ops` from
+  // `const_nodes[begin, mid)`/`[mid, end)` and re-running is always safe.
+  // The splice-into-`g` loop that follows is deliberately kept outside this
+  // try/catch (see its own comment below for why).
+  RunOpsOnGraphResult result;
   try {
-    RunOpsOnGraphResult result =
-        RunOpsOnGraph(executor, g, ops, deferred_producers,
-                      constant_node_producers, ir_version);
-    // Every op in this batch folded successfully (RunOpsOnGraph throws,
-    // rather than partially populating its result, on any failure) -- decode
-    // each returned TensorProto (ToTensorProto always emits raw_data, see
-    // dlpack_bridge.h) into a Tensor, add it as a new initializer or Constant
-    // node, and rewire the Value it replaces onto it. A multi-output node's
-    // outputs are independent Values here, each replaced on its own; the
-    // owning node is only destroyed (never touched again after) once every
-    // one of its outputs has been replaced.
-    std::unordered_map<onnx::Node*, size_t> remaining_outputs;
-    for (onnx::Node* node : ops) {
-      remaining_outputs[node] = node->outputs().size();
-    }
-    for (size_t i = 0; i < result.tensors.size(); i++) {
-      const onnx::TensorProto& tp = result.tensors[i];
-      onnx::Value* old_value = result.values[i];
-      onnx::Node* owner = old_value->node();
-      onnx::Tensor t;
-      t.setName(tp.name());
-      t.elem_type() = tp.data_type();
-      for (int64_t d : tp.dims()) t.sizes().push_back(d);
-      if (tp.has_raw_data()) {
-        t.set_raw_data(tp.raw_data());
-      }
-      onnx::Value* new_value;
-      if (impure_outputs.count(tp.name()) == 0) {
-        new_value = g.addInitializerAndCreateValue(t);
-      } else {
-        // Not purely initializer-derived: materialize as a Constant node
-        // instead of an initializer. Prepended at the very front of the
-        // graph (rather than inserted at the folded node's old position):
-        // a Constant node has no inputs of its own, so the front is always
-        // topologically valid regardless of where its consumers -- or, for
-        // a multi-batch fold, nodes not yet visited in this same call --
-        // currently sit.
-        onnx::Node* constant = g.create(onnx::kConstant, 1);
-        constant->t_(onnx::kvalue, t);
-        std::vector<onnx::Dimension> sizes;
-        sizes.reserve(tp.dims_size());
-        for (int64_t d : tp.dims()) {
-          sizes.emplace_back(d);
-        }
-        constant->output()->setSizes(sizes);
-        constant->output()->setElemType(tp.data_type());
-        constant->output()->setUniqueName(tp.name());
-        g.prependNode(constant);
-        constant_node_producers[tp.name()] = constant;
-        new_value = constant->output();
-      }
-      old_value->replaceAllUsesWith(new_value);
-      if (--remaining_outputs[owner] == 0) {
-        // If `owner` is itself a (transient) Constant node seeded into
-        // constant_node_producers, drop its entry before destroying it --
-        // see the seeding loop's own comment on why transient nodes are
-        // seeded despite being foldable: this is the other half of that,
-        // keeping the map from ever pointing at freed memory.
-        constant_node_producers.erase(tp.name());
-        owner->destroy();
-      }
-    }
-    num_folded += end - begin;
+    result = RunOpsOnGraph(executor, g, ops, deferred_producers,
+                           constant_node_producers, ir_version);
   } catch (const std::exception& e) {
     if (end - begin == 1) {
       onnx::Node* node = const_nodes[begin];
@@ -1583,7 +1529,147 @@ void FoldGroupOnGraph(
     FoldGroupOnGraph(executor, g, const_nodes, mid, end, deferred_producers,
                      impure_outputs, constant_node_producers, num_folded,
                      ir_version);
+    return;
   }
+
+  // Every op in this batch folded successfully (RunOpsOnGraph throws,
+  // rather than partially populating its result, on any failure) -- decode
+  // each returned TensorProto (ToTensorProto always emits raw_data, see
+  // dlpack_bridge.h) into a Tensor, add it as a new initializer or Constant
+  // node, and rewire the Value it replaces onto it. A multi-output node's
+  // outputs are independent Values here, each replaced on its own; the
+  // owning node is only destroyed (never touched again after) once every
+  // one of its outputs has been replaced.
+  //
+  // Deliberately not wrapped in the try/catch above (nor any other): unlike
+  // RunOpsOnGraph, this loop mutates `g` as it goes (replaceAllUsesWith,
+  // Node::destroy), so a failure partway through leaves some of `ops`
+  // already spliced/destroyed. The old code caught exceptions from this
+  // whole function body in one try/catch, so a failure here after some
+  // nodes were already destroyed fell into the same bisect-and-retry path
+  // as a RunOpsOnGraph failure -- but that retry re-derives `ops` from
+  // `const_nodes[begin, end)` again, which still holds pointers to the
+  // now-destroyed (freed) nodes: a real use-after-free, observed as this
+  // exact code taking down the whole process nondeterministically (a clean
+  // assertion failure one run, a segfault or heap-corruption-flavored
+  // exception the next) on real-world models (see the Detectron2 export
+  // path's own tests). The fix has two parts: (1) this loop no longer
+  // retries on failure at all -- seeing the defensive check below, it
+  // should now never throw in the first place; (2) the check itself, so
+  // there is nothing left here for a stale retry to have papered over.
+  std::unordered_map<onnx::Node*, size_t> remaining_outputs;
+  for (onnx::Node* node : ops) {
+    remaining_outputs[node] = node->outputs().size();
+  }
+  for (size_t i = 0; i < result.tensors.size(); i++) {
+    const onnx::TensorProto& tp = result.tensors[i];
+    onnx::Value* old_value = result.values[i];
+    onnx::Node* owner = old_value->node();
+    onnx::Tensor t;
+    t.setName(tp.name());
+    t.elem_type() = tp.data_type();
+    for (int64_t d : tp.dims()) t.sizes().push_back(d);
+    if (tp.has_raw_data()) {
+      t.set_raw_data(tp.raw_data());
+    }
+    onnx::Value* new_value;
+    if (impure_outputs.count(tp.name()) == 0) {
+      new_value = g.addInitializerAndCreateValue(t);
+    } else {
+      // Not purely initializer-derived: materialize as a Constant node
+      // instead of an initializer. Prepended at the very front of the
+      // graph (rather than inserted at the folded node's old position):
+      // a Constant node has no inputs of its own, so the front is always
+      // topologically valid regardless of where its consumers -- or, for
+      // a multi-batch fold, nodes not yet visited in this same call --
+      // currently sit.
+      onnx::Node* constant = g.create(onnx::kConstant, 1);
+      constant->t_(onnx::kvalue, t);
+      std::vector<onnx::Dimension> sizes;
+      sizes.reserve(tp.dims_size());
+      for (int64_t d : tp.dims()) {
+        sizes.emplace_back(d);
+      }
+      constant->output()->setSizes(sizes);
+      constant->output()->setElemType(tp.data_type());
+      constant->output()->setUniqueName(tp.name());
+      g.prependNode(constant);
+      constant_node_producers[tp.name()] = constant;
+      new_value = constant->output();
+    }
+    old_value->replaceAllUsesWith(new_value);
+    if (--remaining_outputs[owner] == 0) {
+      // If `owner` is itself a (transient) Constant node seeded into
+      // constant_node_producers, drop its entry before destroying it --
+      // see the seeding loop's own comment on why transient nodes are
+      // seeded despite being foldable: this is the other half of that,
+      // keeping the map from ever pointing at freed memory.
+      constant_node_producers.erase(tp.name());
+      // Defensive: every one of owner's outputs has its own entry in
+      // result.tensors, so by the time remaining_outputs[owner] reaches 0
+      // each has already individually gone through replaceAllUsesWith
+      // above and should have zero uses left -- Node::destroy() asserts
+      // exactly that (onnx::Node::eraseOutput's
+      // outputs_[i]->uses().empty()). That assumption has been observed to
+      // not hold on some real-world models for reasons not fully
+      // root-caused (see this function's own comment above); asserting on
+      // it via destroy() takes the whole process down, nondeterministically
+      // (a clean exception one run, a segfault the next -- signs of memory
+      // corruption once it happens, not just a benign logic bug). Checking
+      // it explicitly here instead means the fold degrades safely: `owner`
+      // is left in the graph as dead code (unreachable, since nothing
+      // holds a live use for a value none of the checks above found any
+      // uses for) for eliminate_deadend/eliminate_unused_initializer to
+      // sweep up later, instead of corrupting the graph.
+      const bool all_outputs_unused =
+          std::all_of(owner->outputs().begin(), owner->outputs().end(),
+                      [](onnx::Value* v) { return v->uses().empty(); });
+      if (all_outputs_unused) {
+        owner->destroy();
+      } else {
+        // `owner` survives (see the invariant-violation comment above).
+        // Every one of its outputs was just given a fresh Value under its
+        // *old* name (the `new_value` created above, from `tp.name()` --
+        // the original output's own name, since RunOpsOnGraph/ToTensorProto
+        // preserve it) -- Value::replaceAllUsesWith only renames the value
+        // it's called on when that value is one of the graph's own formal
+        // outputs, so `owner`'s own (still-live) output otherwise keeps its
+        // original name too, and now collides with `new_value`'s. Left as
+        // is, this violates the graph's SSA invariant (two distinct values
+        // sharing one name) -- surfaced downstream (e.g. by the ModelProto
+        // <-> Graph round trip inside Optimize()) as "Graph must be in
+        // single static assignment (SSA) form, however 'X' has been used as
+        // output names multiple times." Renaming every surviving output to
+        // a fresh graph-unique name resolves the collision unconditionally.
+        for (onnx::Value* v : owner->outputs()) {
+          v->setUniqueName(g.getNextUniqueName(),
+                           /*update_related_names=*/false);
+        }
+        if (IsTransientConstantOnGraph(owner)) {
+          // `owner` is itself a transient Constant node
+          // (kTransientConstantAttr) -- this pass's/partial_shape_eval's own
+          // intermediate representation for a value it had proved fully
+          // known, meant to be normalized away (folded into a plain
+          // initializer) within the same round it was created, never to be
+          // inspected by anything outside constant folding. Left in place
+          // with that marker still attached, it stays alive to see a later
+          // round's shape inference, which validates a "Constant" node's
+          // attributes against its real schema and rejects this one it
+          // doesn't recognize -- surfaced as e.g. "Unrecognized attribute
+          // onnxsim_transient_constant for operator Constant" (see the
+          // Detectron2/torchvision R-CNN family export tests this was found
+          // on). Stripping the marker here turns `owner` into an ordinary,
+          // permanent Constant node instead -- accurate, since it is
+          // neither transient nor foldable-away anymore now that something
+          // still holds a live use of its output.
+          static const onnx::Symbol kTransientAttrToStrip(
+              kTransientConstantAttr);
+          owner->removeAttribute(kTransientAttrToStrip);
+        }
+      }
+    }
+  }
+  num_folded += end - begin;
 }
 
 // Graph-native counterpart of _FoldConstant. Returns whether anything

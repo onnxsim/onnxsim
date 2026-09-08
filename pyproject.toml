@@ -60,6 +60,21 @@ transformers = ["torch", "transformers", "optimum[exporters]", "optimum-onnx"]
 # Heavy and unrelated to onnxsim's own ONNX-to-ONNX pipeline, so kept out of
 # the base dependencies.
 diffusion = ["torch", "diffusers", "optimum[exporters]", "optimum-onnx"]
+# Needed by onnxsim.export_detectron_model(), which traces a Detectron2
+# (https://github.com/facebookresearch/detectron2) model to ONNX before
+# simplifying it. Only pulls in torch: detectron2 itself is not published to
+# PyPI, so it must be installed separately from source (see
+# onnxsim.export_detectron_model's docstring).
+detectron2 = ["torch"]
+# Needed by onnxsim.export_sam2_model(), which traces a Meta SAM 2
+# (https://github.com/facebookresearch/sam2) image encoder/decoder to ONNX
+# before simplifying each. Pulls in torch, samexporter (which implements the
+# encoder/decoder split this wraps), and hydra-core (SAM 2's config system).
+# The real 'sam2' package itself is not published to PyPI under its official
+# name, so it must be installed separately from source (see
+# onnxsim.export_sam2_model's docstring) -- do not substitute the unrelated,
+# unofficial same-named package that is on PyPI.
+sam2 = ["torch", "samexporter", "hydra-core"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"
