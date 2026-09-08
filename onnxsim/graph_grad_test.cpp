@@ -245,12 +245,11 @@ Shapes ConvShapes() {
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {
-      "Add",     "Clip",       "Conv",     "Div",   "Erf",
-      "Exp",     "Gather",     "Gemm",     "Identity",
-      "LayerNormalization",    "MatMul",   "Mul",   "Neg",
-      "ReduceMean", "ReduceSum", "Relu",   "Reshape",
-      "Sigmoid", "Softmax",    "Sqrt",     "Sub",   "Tanh",
-      "Transpose"};
+      "Add",    "Clip",    "Conv",     "Div",        "Erf",
+      "Exp",    "Gather",  "Gemm",     "Identity",   "LayerNormalization",
+      "MatMul", "Mul",     "Neg",      "ReduceMean", "ReduceSum",
+      "Relu",   "Reshape", "Sigmoid",  "Softmax",    "Sqrt",
+      "Sub",    "Tanh",    "Transpose"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
@@ -747,10 +746,10 @@ void TheGatherRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
   // Mul); then the batched one-hot matmul that stands in for the scatter-add
   // (Transpose, Reshape, Reshape, MatMul, Reshape).
   const std::vector<std::string> expected = {
-      "Reshape", "Cast",      "Less",    "Cast",  "Mul",     "Add",
-      "Reshape", "Reshape",   "Greater", "Cast",  "Sub",     "Less",
-      "Cast",    "Sub",       "Mul",     "Transpose", "Reshape", "Reshape",
-      "MatMul",  "Reshape"};
+      "Reshape",   "Cast",    "Less",    "Cast",    "Mul",
+      "Add",       "Reshape", "Reshape", "Greater", "Cast",
+      "Sub",       "Less",    "Cast",    "Sub",     "Mul",
+      "Transpose", "Reshape", "Reshape", "MatMul",  "Reshape"};
   Check(OpTypes(b) == expected,
         "the Gather rule should emit graph_grad.py's nodes in its order");
   Check(grads.size() == 1 && grads.at("data") == b.nodes().back().output(0),
