@@ -57,6 +57,7 @@ import { fields, decode } from "./macs.mjs";
 export const DIFFERENTIABLE_OPS = new Set([
   "Add",
   "Clip",
+  "Conv",
   "Div",
   "Erf",
   "Exp",

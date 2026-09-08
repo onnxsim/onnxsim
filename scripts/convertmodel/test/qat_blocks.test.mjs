@@ -14,6 +14,7 @@
 //   node test/qat_blocks.test.mjs
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   DIFFERENTIABLE_OPS,
   discoverBlocks,
@@ -111,6 +112,32 @@ check("the differentiable set tracks graph_grad's rule table", () => {
   }
   assert.ok(!DIFFERENTIABLE_OPS.has("Sin"));
   assert.ok(DIFFERENTIABLE_OPS.size >= 21, "graph_grad had 21 rules when this landed");
+});
+
+// The set above is a hand-kept copy of graph_grad's rule table, and the
+// header explains why drifting from it is *safe* -- the builder is the
+// authority and refuses a block it cannot differentiate. Safe is not the same
+// as free: a stale entry silently costs block granularity, which is the
+// failure that looks exactly like success. So it is pinned against the same
+// fixture the Python and C++ emitters are pinned against.
+//
+// It has already drifted once. Conv landed in graph_grad while this file was
+// being written, and nothing here noticed.
+check("DIFFERENTIABLE_OPS matches the committed rule table", () => {
+  const fixture = readFileSync(
+    new URL("../../../onnxsim/qat_parity_fixtures.txt", import.meta.url),
+    "utf8",
+  );
+  const line = fixture
+    .split("\n")
+    .find((l) => l.startsWith("rules "));
+  assert.ok(line, "qat_parity_fixtures.txt should carry a 'rules' line");
+  const pinned = line.slice("rules ".length).split(",");
+  assert.deepStrictEqual(
+    [...DIFFERENTIABLE_OPS].sort(),
+    pinned.slice().sort(),
+    "add the op here too, or regenerate the fixture",
+  );
 });
 
 check("a chain cuts at every gap", () => {
