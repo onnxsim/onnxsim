@@ -3685,35 +3685,78 @@ which is exact for every measured channel -- `o = 8` lands at 72, `o = 16` at
 plane pairs also separate by `+288` rather than staying 36 apart, and that
 placement rule is not yet pinned down.
 
-**Where that leaves resnet18d.** Its 22 convolutions are 2-D with 3 to 512
-channels, so every one of them sits past the shapes confirmed above. A search
-over plausible strides for its *first* convolution reaches only 0.43
-correlation, so we cannot currently locate, read or generate resnet18d's
-weights. The block-size arithmetic does line up -- summing the predicted
-per-layer blocks gives 11,208,960 bytes against an actual `npu_params` of
-11,855,108, within 5.8% -- which says the tiling family is right and the
-addressing constants for large channel counts are what is missing.
+**This has since been carried through to resnet18d** -- see the next section.
+The addressing constants for large channel counts turned out to be two
+things: a shape-scaled unit and a cap.
 
 The honest budget for resnet18d today:
 
 | part | size | status |
 | --- | --- | --- |
-| weight table | 11,855,108 B (242x the mcode) | layout not yet decoded at these shapes |
+| weight table | 11,855,108 B (242x the mcode) | 98.5% of conv weights addressable |
 | mcode stream | 48,320 B | 98.92% explained, round-trips byte-exactly |
 | framing bytes | 28,552 B (59.1% of stream) | emitted from the grammar |
 | value bytes | 19,235 B (39.8%) | 3.81% have a confirmed meaning |
 | header + tail | 760 B | rules known |
 
 So on resnet18d specifically: we can decode and reproduce its instruction
-stream exactly, we understand under 4% of its operand values, and its weight
-table -- 242 times the size of everything else -- is not yet addressable. The
-method that cracked the smaller shapes is unchanged and keeps working; what
-it needs is the same single-weight sweep run at 64, 128, 256 and 512
-channels.
+stream exactly, we can locate and read 98.5% of its convolution weights, and
+we understand under 4% of its operand values.
 
 Tests: `test_conv2d_weights_are_int8_split_across_four_bit_planes` (Docker)
 and `test_conv2d_weights_can_be_rewritten_without_pulsar2` (Docker and
 device).
+
+### Reading a real network's weights: 98.5% of resnet18d
+
+The sweep that finishes this is cheaper than it looks, because **the address
+is linear in the bits of the channel indices**. For the 32-channel case
+`base(1) + base(2) + base(4) + base(8) + base(16)` sums exactly to
+`base(31)`, so one build per *bit* suffices where one per channel would be
+hopeless. Fifteen builds characterise a shape.
+
+**Two constants, both shape-dependent.** Probing 8, 32 and 64 channels gives
+the same table twice over:
+
+    A = 18 * min(Cin, 128)      output-channel unit
+    P =  9 * min(Cin, 128)      separation between the two plane pairs
+
+and the full 2-D address is
+
+    addr(o,i,kh,kw) = A*(o%8) + 72*((o>>3)&1) + 8*A*(o>>4)
+                    + 4*(K - 1 - (K_w*kh + kw))
+                    + (i%16)//4 + 144*(i>>4)
+    planes at 0, 36, P, P+36;  bits 2*(i%4), planes 3,2,1,0 most significant first
+
+Output-channel bit 3 always costs 72 bytes while bits 0-2 cost `A` and bits 4
+and up cost `8A`: an interleave, not a stride. With no fitting at all this
+reconstructs a compiled 64x64x3x3 table at 0.99997.
+
+**The cap is the part that unlocks a real network.** `min(Cin, 128)` says a
+convolution wider than 128 input channels is *split into slices*. Until that
+was applied, resnet18d's 256- and 512-channel layers read as noise (0.36);
+with it, `(256,256,3,3)` and `(512,256,3,3)` both locate at 0.9999.
+
+**And one measurement trap worth recording.** Scoring a match by pooling
+output channels reads about 0.9 even when the addressing is perfectly right,
+because every output channel carries its own quantisation scale. Scored *per
+channel* the same layers read 0.9999. A 0.9 that should be 0.9999 looks like
+a nearly-correct layout and invites fiddling with the formula; it was
+actually a wrong metric.
+
+**The result on resnet18d:** 18 of 22 convolutions located and read from an
+11.9 MB table with nothing but each layer's shape and a search for its base
+offset -- **98.5% of its convolution weights**. The blocks are contiguous and
+in graph order, with regular deltas (37,376 bytes between 64-channel layers,
+148,480 between 128-channel ones).
+
+The four that resist are the three 1x1 convolutions (0.62-0.74, and a sweep
+over input-group strides does not improve them) and the 3-channel stem
+(0.92-0.93, clustered around one base, so the signal is there but the padding
+of a 3-channel input is not yet right). Together they are 1.5% of the
+weights.
+
+Test: `test_resnet18d_conv_weights_are_addressable` (Docker, no device).
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
