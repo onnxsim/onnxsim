@@ -23,32 +23,46 @@ graph-construction machinery for both.
 
 **The sensitivity score.** For a layer with weight ``W`` ([N, K]) and
 calibration activation ``X`` ([rows, K]), this asks "how much would this
-layer's *output* change if ``W`` were quantized to INT4?" -- not just "how
-big is the raw quantization error", which ignores that some input channels
-barely matter (tiny or rarely-large activation) even if their own weight
-column has a large per-element error. Concretely, per input channel ``k``:
+layer's *output* change if ``W`` were quantized to INT4?" under the same
+local quadratic reconstruction-error model :mod:`onnxsim.gptq` builds its
+own per-weight correction from: to first order, an error ``E = W -
+INT4_dequant(W)`` changes the layer's squared reconstruction error by
+``mean_n(e_n @ H @ e_n^T)``, where ``H = X^T X`` (the very same per-layer
+Hessian :mod:`onnxsim.gptq` computes, for a different purpose) and ``e_n``
+is row ``n`` of ``E``. ``sensitivity_metric`` selects how that quantity is
+turned into a per-layer score:
 
-    diag_h[k] = mean_rows(X[:, k] ** 2)          -- diag(X^T X) / rows
-    e[n, k]   = W[n, k] - INT4_dequant(W)[n, k]  -- INT4's own reconstruction error
-    sensitivity = mean_n( sum_k diag_h[k] * e[n, k] ** 2 )
+- ``"hessian_diag"`` (the default): drops ``H``'s off-diagonal
+  (cross-input-channel) terms, i.e. treats each channel's contribution to
+  the loss as independent of every other channel's:
 
-``diag_h`` is the diagonal of the same per-layer reconstruction-error
-Hessian ``H = X^T X`` that :mod:`onnxsim.gptq` builds and inverts for a
-different purpose (correcting *which* integer each weight rounds to, given
-its neighbors, via ``H^{-1}``) -- here only the cheap diagonal is needed,
-since the decision being made (INT4 vs INT8) is per-layer, not per-weight,
-so there's nothing to gain from the off-diagonal (cross-channel) terms
-GPTQ's own correction relies on. ``sensitivity`` is thus the diagonal
-(channel-independent) approximation of the true curvature-weighted error
-``e @ H @ e^T`` -- an Optimal-Brain-Damage-style saliency, ``O(N*K)`` and
-needing no matrix inversion, unlike GPTQ/OBQ's exact per-weight version.
-It improves on a plain ``mean((W - INT4_dequant(W))^2) * mean(X^2)`` scalar
-product (this module's original scheme) exactly when a layer's
-quantization error is concentrated in the *same* channels its activation
-energy is concentrated in -- an outlier channel that is both large-valued
-and strongly activated, exactly the case mixed precision exists to catch --
-since that scalar product averages error and energy independently and so
-can't see that correlation. Layers are ranked by this score; the top
+      diag_h[k] = mean_rows(X[:, k] ** 2)          -- diag(H) / rows
+      sensitivity = mean_n( sum_k diag_h[k] * e[n, k] ** 2 )
+
+  an Optimal-Brain-Damage-style saliency, ``O(N*K)`` and needing only
+  ``H``'s diagonal -- cheap enough to be the default. It improves on a
+  plain ``mean((W - INT4_dequant(W))^2) * mean(X^2)`` scalar product (this
+  module's very first scheme) exactly when a layer's quantization error is
+  concentrated in the *same* channels its activation energy is
+  concentrated in -- an outlier channel that is both large-valued and
+  strongly activated, exactly the case mixed precision exists to catch --
+  since that scalar product averages error and energy independently and so
+  can't see that correlation.
+- ``"full_hessian"``: the exact quadratic form, ``mean_n(e_n @ H @
+  e_n^T)``, with no diagonal approximation -- and, since ``E`` here is
+  already fully realized (every column of ``W`` was independently rounded
+  to its nearest grid point, unlike a single weight's OBS-style *removal*
+  in the GPTQ/OBQ sense), no matrix inversion needed either: just ``H``
+  itself. ``O(N*K^2)`` time and ``O(K^2)`` memory per candidate layer (the
+  full Gram matrix, not just its diagonal) to additionally capture
+  *cross*-channel correlation that ``"hessian_diag"`` cannot see -- e.g.
+  two input channels that tend to be large together, whose combined error
+  contributes more (or less, if they tend to offset) to the loss than
+  either channel's diagonal term alone would suggest. ``"hessian_diag"``
+  is exactly this quantity's diagonal approximation, and matches it
+  whenever ``H`` itself happens to be diagonal.
+
+Whichever metric is used, layers are ranked by its score; the top
 ``high_bits_fraction`` (by count, most sensitive first) get block-wise INT8
 (:func:`onnxsim.quantize_weight_only_int8_block`'s
 own granularity, reimplemented locally here since that function quantizes
@@ -95,6 +109,25 @@ def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
     )
 
 
+SENSITIVITY_METRICS = ("hessian_diag", "full_hessian")
+
+
+def _hessian_diag_sensitivity(err_nk: np.ndarray, diag_h: np.ndarray) -> float:
+    """``sensitivity_metric="hessian_diag"``'s score: the diagonal
+    (channel-independent) approximation of ``mean_n(e_n @ H @ e_n^T)`` --
+    see module docstring. ``err_nk`` is ``E`` ([N, K]); ``diag_h`` is
+    ``diag(H)`` ([K])."""
+    return float(np.mean((err_nk**2) @ diag_h))
+
+
+def _full_hessian_sensitivity(err_nk: np.ndarray, h: np.ndarray) -> float:
+    """``sensitivity_metric="full_hessian"``'s score: the exact quadratic
+    form ``mean_n(e_n @ H @ e_n^T)`` -- see module docstring. ``err_nk`` is
+    ``E`` ([N, K]); ``h`` is ``H`` ([K, K]). Reduces to
+    :func:`_hessian_diag_sensitivity` whenever ``h`` is itself diagonal."""
+    return float(np.mean(np.sum((err_nk @ h) * err_nk, axis=1)))
+
+
 def _quantize_blockwise_int8(
     w_nk: np.ndarray, block_size: int
 ) -> "tuple[np.ndarray, np.ndarray]":
@@ -120,6 +153,7 @@ def apply_mixed_precision_quantization(
     seed: int = 0,
     high_bits_fraction: float = 0.2,
     block_size: int = 32,
+    sensitivity_metric: str = "hessian_diag",
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
@@ -132,10 +166,11 @@ def apply_mixed_precision_quantization(
     :param calibration_data: representative input batches (each a
             ``{input_name: np.ndarray}`` dict matching ``model``'s graph
             inputs) used to measure each layer's own per-input-channel
-            activation energy -- see :func:`onnxsim.generate_random_calibration_data`
-            (the default when omitted) and
-            :func:`onnxsim.load_huggingface_calibration_data` (real data,
-            a more representative ranking than random input)
+            activation energy (and, for ``sensitivity_metric="full_hessian"``,
+            cross-channel correlation) -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted) and :func:`onnxsim.load_huggingface_calibration_data`
+            (real data, a more representative ranking than random input)
     :param num_samples: random batches to generate when ``calibration_data``
             is omitted
     :param seed: seed for the random calibration data (ignored if
@@ -148,6 +183,11 @@ def apply_mixed_precision_quantization(
     :param block_size: elements per quantization block along ``K``, for
             both the INT4 and INT8 tiers -- matching
             :func:`onnxsim.quantize_weight_only_int4`'s own default
+    :param sensitivity_metric: ``"hessian_diag"`` (the default) or
+            ``"full_hessian"`` -- which per-layer sensitivity score to rank
+            candidate layers by; see this module's own docstring for the
+            formulas and their cost/accuracy tradeoff. Raises
+            :class:`ValueError` for any other value.
     :param providers: onnxruntime execution providers to run calibration on
     :returns: ``model`` with every matched layer's weight replaced by
             block-wise INT4 or INT8 codes plus a per-block float32 scale
@@ -162,6 +202,11 @@ def apply_mixed_precision_quantization(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
+    if sensitivity_metric not in SENSITIVITY_METRICS:
+        raise ValueError(
+            f"sensitivity_metric must be one of {SENSITIVITY_METRICS}, "
+            f"got {sensitivity_metric!r}"
+        )
     if not _has_min_opset(model, 21):
         return model
 
@@ -199,30 +244,41 @@ def apply_mixed_precision_quantization(
             model, num_samples=num_samples, seed=seed
         )
 
+    need_full_hessian = sensitivity_metric == "full_hessian"
+
     probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(model, probe_names)
     # diag_h[name]: per-input-channel mean(X^2) -- diag(X^T X) / rows, the
     # diagonal of the same reconstruction-error Hessian onnxsim.gptq builds
-    # (see module docstring). Accumulated across batches before dividing by
+    # (see module docstring). full_h[name]: the full [K, K] Gram matrix,
+    # only accumulated when actually needed (it's O(K^2) memory per layer,
+    # vs. diag_h's O(K)) -- accumulated across batches before dividing by
     # the total row count, exactly like onnxsim.gptq's own H = X^T X.
     diag_h_sum: Dict[str, np.ndarray] = {}
-    diag_h_rows: Dict[str, int] = {}
+    full_h_sum: Dict[str, np.ndarray] = {}
+    rows_seen: Dict[str, int] = {}
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
             x = np.asarray(result[name], dtype=np.float64)
             for x_rows in _activation_rows([x]):
                 diag_h_sum[name] = diag_h_sum.get(name, 0.0) + np.sum(x_rows**2, axis=0)
-                diag_h_rows[name] = diag_h_rows.get(name, 0) + x_rows.shape[0]
+                if need_full_hessian:
+                    full_h_sum[name] = full_h_sum.get(name, 0.0) + x_rows.T @ x_rows
+                rows_seen[name] = rows_seen.get(name, 0) + x_rows.shape[0]
 
     diag_h: Dict[str, np.ndarray] = {
-        name: total / diag_h_rows[name]
+        name: total / rows_seen[name]
         for name, total in diag_h_sum.items()
-        if diag_h_rows[name] > 0
+        if rows_seen[name] > 0
+    }
+    full_h: Dict[str, np.ndarray] = {
+        name: total / rows_seen[name]
+        for name, total in full_h_sum.items()
+        if rows_seen[name] > 0
     }
 
-    # Sensitivity per candidate: an Optimal-Brain-Damage-style,
-    # curvature-weighted INT4 reconstruction error -- see module docstring.
+    # Sensitivity per candidate -- see module docstring for both metrics.
     sensitivities: List[Optional[float]] = []
     for node, x_name, w_name, bias_name, weight_transposed in candidates:
         if x_name not in diag_h:
@@ -235,9 +291,11 @@ def apply_mixed_precision_quantization(
             w_nk, block_size, 1.0
         )
         scale_full = np.repeat(scale_blocks_nk, block_size, axis=1)
-        dequant_nk = codes_nk * scale_full
-        err_sq_nk = (w_nk - dequant_nk) ** 2
-        sensitivities.append(float(np.mean(err_sq_nk @ diag_h[x_name])))
+        err_nk = w_nk - codes_nk * scale_full
+        if need_full_hessian:
+            sensitivities.append(_full_hessian_sensitivity(err_nk, full_h[x_name]))
+        else:
+            sensitivities.append(_hessian_diag_sensitivity(err_nk, diag_h[x_name]))
 
     eligible_idx = [i for i, s in enumerate(sensitivities) if s is not None]
     eligible_idx.sort(key=lambda i: sensitivities[i] or 0.0, reverse=True)

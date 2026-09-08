@@ -234,6 +234,110 @@ def test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincid
 
 
 # --------------------------------------------------------------------------- #
+# sensitivity_metric="full_hessian" -- see onnxsim/mixed_precision.py's own
+# docstring for the formula. These first three test the pure math directly
+# (no ONNX graph or calibration data involved) since hand-picked small
+# matrices make the expected cross-channel-correlation effect exact and
+# easy to verify by hand, unlike a real quantized layer's rounding error.
+# --------------------------------------------------------------------------- #
+def test_full_hessian_sensitivity_matches_diagonal_when_h_is_diagonal():
+    # With no off-diagonal terms, the exact quadratic form must equal its
+    # own diagonal approximation exactly.
+    rng = np.random.default_rng(30)
+    err_nk = rng.standard_normal((5, 4))
+    diag_vals = np.array([0.5, 1.0, 2.0, 3.0])
+    h = np.diag(diag_vals)
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(
+        err_nk, h
+    ) == pytest.approx(
+        onnxsim.mixed_precision._hessian_diag_sensitivity(err_nk, diag_vals)
+    )
+
+
+def test_full_hessian_sensitivity_captures_positive_cross_channel_correlation():
+    # e = [1, 1]; H = [[1, 0.5], [0.5, 1]]. Quadratic form by hand:
+    # H_00*e0^2 + H_11*e1^2 + 2*H_01*e0*e1 = 1 + 1 + 2*0.5*1*1 = 3.0, vs.
+    # the diagonal-only approximation's 1 + 1 = 2.0 -- the positive
+    # off-diagonal term (positively correlated input channels) raises the
+    # exact score above the diagonal one.
+    err_nk = np.array([[1.0, 1.0]])
+    diag_h = np.array([1.0, 1.0])
+    h = np.array([[1.0, 0.5], [0.5, 1.0]])
+    assert onnxsim.mixed_precision._hessian_diag_sensitivity(
+        err_nk, diag_h
+    ) == pytest.approx(2.0)
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(err_nk, h) == pytest.approx(
+        3.0
+    )
+
+
+def test_full_hessian_sensitivity_negative_correlation_lowers_the_score():
+    # Same error and diagonal as above, but negatively correlated channels
+    # (H_01 = -0.5 instead of +0.5) must lower the exact score below the
+    # diagonal-only baseline instead of raising it.
+    err_nk = np.array([[1.0, 1.0]])
+    h_pos = np.array([[1.0, 0.5], [0.5, 1.0]])
+    h_neg = np.array([[1.0, -0.5], [-0.5, 1.0]])
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(
+        err_nk, h_neg
+    ) < onnxsim.mixed_precision._full_hessian_sensitivity(err_nk, h_pos)
+
+
+def test_mixed_precision_rejects_unknown_sensitivity_metric():
+    model = _two_layer_model(K=32, H=16, N=8, seed=0)
+    with pytest.raises(ValueError, match="sensitivity_metric"):
+        onnxsim.apply_mixed_precision_quantization(
+            model, sensitivity_metric="not-a-real-metric"
+        )
+
+
+def test_mixed_precision_full_hessian_still_picks_the_obvious_outlier_layer():
+    # A sanity/wiring check on the clear-cut case both metrics should agree
+    # on (same model and assertion as
+    # test_mixed_precision_picks_the_more_sensitive_layer_for_int8, just
+    # with sensitivity_metric="full_hessian") -- the interesting case where
+    # the two metrics actually *disagree* is exercised at the pure-math
+    # level above, where hand-picked matrices make the expected direction
+    # unambiguous.
+    model = _two_layer_model(K=32, H=16, N=8, seed=3)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model,
+        block_size=8,
+        high_bits_fraction=0.5,
+        num_samples=32,
+        seed=4,
+        sensitivity_metric="full_hessian",
+    )
+    codes_by_prefix = {
+        t.name: t for t in q.graph.initializer if t.name.endswith("_codes")
+    }
+    w2_codes = next(t for name, t in codes_by_prefix.items() if name.startswith("W2_"))
+    w1_codes = next(t for name, t in codes_by_prefix.items() if name.startswith("W1_"))
+    assert w2_codes.data_type == onnx.TensorProto.INT8
+    assert w1_codes.data_type == onnx.TensorProto.INT4
+
+
+def test_mixed_precision_full_hessian_output_stays_close_to_float():
+    model = _two_layer_model(K=32, H=16, N=8, seed=0)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model,
+        block_size=8,
+        high_bits_fraction=0.5,
+        num_samples=16,
+        seed=1,
+        sensitivity_metric="full_hessian",
+    )
+    onnx.checker.check_model(q)
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((8, 32)).astype(np.float32)
+    (float_y,) = _run(model, {"X": x})
+    (q_y,) = _run(q, {"X": x})
+    assert np.all(np.isfinite(q_y))
+    assert _rel_l2(float_y, q_y) < 0.3
+
+
+# --------------------------------------------------------------------------- #
 # search_mixed_precision_for_budget
 # --------------------------------------------------------------------------- #
 # Named `_text_model` (rather than reusing `_model` above) since this repo's
