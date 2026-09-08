@@ -2786,8 +2786,19 @@ def apply_block_finetune(
     where something has already changed the model and the change cost
     accuracy:
 
-    - a pruned model (:func:`onnxsim.prune_model` and friends), whose
-      remaining weights can absorb some of what the removed ones did;
+    - a **structurally** pruned model
+      (:func:`onnxsim.apply_structured_pruning`,
+      :func:`onnxsim.apply_attention_head_pruning` and friends), whose
+      remaining weights can absorb some of what the removed ones did.
+      *Unstructured* pruning
+      (:func:`onnxsim.apply_magnitude_pruning`,
+      :func:`onnxsim.apply_wanda_pruning`) is the case to avoid rather than
+      the case to reach for: nothing here masks the optimizer, so every zero
+      pruning left behind gets a gradient like any other element and is
+      filled back in on the first step. Measured at 50% sparsity: 128 zeros
+      per weight before, none after, while the loss fell five orders of
+      magnitude -- so no signal a caller would look at says anything went
+      wrong. See ``test_unstructured_sparsity_is_not_preserved``;
     - a model whose weights were quantized and dequantized back to fp32, or
       rewritten by any of this package's rounding passes;
     - a model already fine-tuned once, being tuned further against the

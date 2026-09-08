@@ -454,11 +454,10 @@ the untuned student over 4 seeds (lower is better):
 
 16 rows is a fit with as many rows as each weight has input channels, so it
 interpolates the calibration set and leaves most of the error standing
-anywhere else; by 64 rows it recovers ~94% of the error and by 256 rows
-~99.6%. The same cliff
-shows up in `apply_block_finetune_all_blocks` over a 5-layer MLP (3 blocks
-discovered, all trained, 300 iterations each): a mean held-out ratio of 0.46
-at 16 rows against 0.015 at 256, over 3 seeds. The rows-versus-channels
+anywhere else; by 64 rows it recovers ~94% of the error and by 256 rows ~99.6%.
+The same cliff shows up in `apply_block_finetune_all_blocks` over a 5-layer MLP
+(3 blocks discovered, all trained, 300 iterations each): a mean held-out ratio
+of 0.46 at 16 rows against 0.015 at 256, over 3 seeds. The rows-versus-channels
 reading is intuition rather than a bound -- there is a nonlinearity in the
 middle of the block and two weights are trained jointly -- but the direction
 was the same everywhere it was measured.
