@@ -4854,7 +4854,13 @@ def test_nvfp4_weights_are_accepted_and_then_ignored(tmp_path):
 
     That is worth a regression test in both directions. It documents that
     there is no 4-bit weight path here today, and if a future toolchain ever
-    implements NVFP4 this test fails and says so. Needs Docker, no device.
+    implements NVFP4 this test fails and says so.
+
+    It has already done that once. Pulsar2 7.0 *does* implement `NVFP4` for
+    convolution, and there the same config does not build at all -- see the
+    README's "Pulsar2 7.0 implements NVFP4, and it is still unusable"
+    section. This test describes `DEFAULT_IMAGE`, which is 6.0. Needs Docker,
+    no device.
     """
     cin = cout = 64
     kernel, hw = 3, 16

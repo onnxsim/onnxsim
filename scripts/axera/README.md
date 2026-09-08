@@ -4494,6 +4494,59 @@ Test: `test_dilation_changes_the_weight_layout` (Docker, no device), which
 checks both rules against their own builds and that the undilated rule does
 not read a dilated one.
 
+### Pulsar2 7.0 implements NVFP4, and it is still unusable
+
+All the work above uses Pulsar2 6.0. The vendor publishes releases on
+HuggingFace at `AXERA-TECH/Pulsar2`, and **7.0 exists**. Its release notes
+carry entries that 6.0's do not:
+
+    support conv nvfp4
+    feat/quant-support-conv-nvfp4
+    quant: expand nvfp4 full graph config as weight-only
+    fix/8860_nvfp4_w_scale_cvt
+    fix/8860_mcore_nvfp4
+
+So the "NVFP4 parses and is silently ignored" finding was a statement about
+6.0, and it does not carry forward. Under 7.0 the same config **fails to
+build**.
+
+**What 7.0 actually does with it.** The failure is specific and says why:
+
+    TileFailException: AxConv, cannot reshape array of size 2304
+                       into shape (64, 1, 1, 1)
+
+2304 is 36,864 weights divided by 16 -- NVFP4's **block** scales, one per 16
+elements, being reshaped into a per-output-channel array that cannot hold
+them. So the quantiser emits block scales and the backend still wants one
+scale per channel.
+
+That predicts exactly when it can succeed: when each output channel is
+*exactly one block*. It does.
+
+| shape | blocks per output channel | result |
+| --- | --- | --- |
+| `Cin=16, K=1` | 1.00 | **builds** |
+| `Cin=32, K=1` | 2.00 | fails, "size 32" |
+| `Cin=16, K=3` | 9.00 | fails, "size 144" |
+
+The failing sizes are the channel count times the block count, which is the
+same arithmetic from the other side. So NVFP4 conv support in 7.0 accepts
+only `Cin * K * K == 16` -- a shape no real convolution has.
+
+**And it is not a chip gate.** The same build fails identically with
+`target_hardware` set to `AX8860`, despite two of the five NVFP4 commits
+naming that part. Both targets reach the same reshape.
+
+**Activations are unchanged.** 7.0's `data_type` still offers
+`U8, S8, U16, S16, FP32`, and `NVFP4` remains the only 4-bit name in the
+enum. So the W4A4 conclusion stands for 7.0 as well: **no 4-bit arithmetic in
+either version**, and now for a sharper reason -- 7.0 has the quantiser for
+4-bit weights and a backend that cannot yet consume its scales.
+
+Worth noting for anyone extending this: the HuggingFace repo also carries
+4.x, 5.x and dated "temp" builds, one of which is `4.2-temp-cosyvoice2` --
+a TTS-specific hotfix, which may matter to the vocoder work above.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
