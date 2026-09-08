@@ -67,6 +67,20 @@ struct QatOptions {
   // Incompatible with the two flags above, which have no scales to learn:
   // asking for either alongside this is refused rather than ignored.
   bool fake_quant = true;
+  // Hold every weight element that starts at zero at zero for the whole run --
+  // qat.py's preserve_sparsity. Off by default, and the caller's call rather
+  // than a detected one, because "this element is zero" and "this element was
+  // pruned away" are the same bit pattern and only the caller knows which they
+  // meant. Turn it on for an unstructured-pruned model: without it a pruned
+  // zero gets a gradient like any other element and leaves zero on the very
+  // first step, while the loss falls by orders of magnitude, so every signal a
+  // caller would look at says the run went well. Structured pruning needs
+  // nothing here -- the channel is gone from the tensor rather than zeroed
+  // inside it. The mask is the zero pattern of the master weight's seed, and
+  // one Mul on the gradient holds those elements at zero *exactly*: with a
+  // gradient of 0 every step Adam's m and v stay 0 and its step is
+  // lr * 0 / (sqrt(0) + eps), which is 0.
+  bool preserve_sparsity = false;
   // Rows per optimizer step. 0 means full batch, which is the default and the
   // only mode with no per-step input beyond the scalars.
   int64_t batch_size = 0;

@@ -1149,10 +1149,10 @@ em::val onnxsim_quantize_qoperator(const std::string &data, em::val names_ary,
 
 // QatOptions as a plain JS object with named fields:
 //
-//   { learnScales, learnActivationScales, fakeQuant, batchSize, batchSeed,
-//     shuffle }
+//   { learnScales, learnActivationScales, fakeQuant, preserveSparsity,
+//     batchSize, batchSeed, shuffle }
 //
-// Named fields rather than six positional arguments because they are
+// Named fields rather than seven positional arguments because they are
 // independent knobs that each already have a default: an absent (or
 // null/undefined) field keeps QatOptions' own, so `{}` means "full batch,
 // train the weights only" -- apply_qat's default -- and a caller that wants
@@ -1186,6 +1186,7 @@ QatOptions QatOptionsFromVal(em::val options) {
   read_bool("learnScales", out.learn_scales);
   read_bool("learnActivationScales", out.learn_activation_scales);
   read_bool("fakeQuant", out.fake_quant);
+  read_bool("preserveSparsity", out.preserve_sparsity);
   read_int("batchSize", out.batch_size);
   read_int("batchSeed", out.batch_seed);
   read_bool("shuffle", out.shuffle);

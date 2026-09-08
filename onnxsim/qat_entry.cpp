@@ -1473,7 +1473,18 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     // weight gradient is just the masked output gradient, with no scale factor
     // anywhere. Without a fake-quant there is no clipping range and no
     // estimator: `g` is already dL/dw.
-    const std::string masked = layer.fake_quant ? b.Mul(g, layer.fq.active) : g;
+    std::string masked = layer.fake_quant ? b.Mul(g, layer.fq.active) : g;
+    if (options.preserve_sparsity) {
+      // The zeros the optimizer *started* from, held there. The constant is
+      // built and then multiplied, in that order, because qat.py evaluates
+      // b.const(...) before the b.mul(...) that consumes it and the builder's
+      // name counter is a function of emission order.
+      std::vector<float> keep(t.w_init.size(), 1.0f);
+      for (size_t i = 0; i < t.w_init.size(); ++i) {
+        if (t.w_init[i] == 0.0f) keep[i] = 0.0f;
+      }
+      masked = b.Mul(masked, b.Const(keep, t.w_shape, "keep"));
+    }
     const AdamOutputs w_step =
         AdamUpdate(b, t.w_input, masked, t.m_input, t.v_input, lr,
                    "m_correction", "v_correction");

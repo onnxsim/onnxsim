@@ -845,6 +845,103 @@ void UntrainedBlockConstantsComeFromTheStudentWhenFineTuning() {
 // With no quantizer between the master weight and what the model stores, the
 // trained tensor *is* the stored tensor: the write-back is the identity that
 // the two quantized schemes' rounding and clipping stand in for.
+// A student whose weights carry real zeros, for preserve_sparsity. Every
+// other element is zeroed, so the mask is neither all-ones nor all-zeros and a
+// port that built it from the wrong tensor -- or inverted it -- fails rather
+// than coincidentally agreeing.
+onnx::ModelProto SparseStudent() {
+  onnx::ModelProto model = FineTuneModel(kStudentWeight, kStudentNorm);
+  for (onnx::TensorProto& t : *model.mutable_graph()->mutable_initializer()) {
+    if (t.name() != "W1" && t.name() != "W2") continue;
+    std::vector<float> values = FloatsOf(t);
+    for (size_t i = 0; i < values.size(); i += 2) values[i] = 0.0f;
+    const std::vector<int64_t> dims(t.dims().begin(), t.dims().end());
+    t = FloatTensor(t.name(), dims, values);
+  }
+  return model;
+}
+
+void PreserveSparsityPinsTheStartingZerosAndNothingElse() {
+  const onnx::ModelProto teacher = FineTuneModel(kTeacherWeight, kTeacherNorm);
+  const onnx::ModelProto student = SparseStudent();
+
+  QatOptions plain;
+  plain.fake_quant = false;
+  QatOptions kept = plain;
+  kept.preserve_sparsity = true;
+
+  const QatStepPlan a =
+      BuildQatStepGraph(teacher, student, "X", "Y", kRows, plain);
+  const QatStepPlan b =
+      BuildQatStepGraph(teacher, student, "X", "Y", kRows, kept);
+  CheckModel(b.step_graph, "the sparsity-preserving step graph");
+
+  // One Mul per trained layer and nothing else: the mask is applied to the
+  // gradient, not bolted on as a separate clean-up.
+  std::map<std::string, int64_t> before, after;
+  for (const onnx::NodeProto& n : a.step_graph.graph().node())
+    before[n.op_type()]++;
+  for (const onnx::NodeProto& n : b.step_graph.graph().node())
+    after[n.op_type()]++;
+  CheckEqual(after["Mul"] - before["Mul"], 2,
+             "preserve_sparsity costs one Mul per trained layer");
+  for (const auto& entry : after) {
+    if (entry.first == "Mul") continue;
+    CheckEqual(
+        entry.second, before[entry.first],
+        "preserve_sparsity changes no operator but Mul (" + entry.first + ")");
+  }
+
+  // The mask is the seed's zero pattern, element for element.
+  const onnx::TensorProto* w1 = FindInitializer(student, "W1");
+  Check(w1 != nullptr, "the sparse student has a W1 to mask");
+  const std::vector<float> seed = FloatsOf(*w1);
+  const onnx::TensorProto* mask = nullptr;
+  for (const onnx::TensorProto& t : b.step_graph.graph().initializer()) {
+    if (t.name().find("keep") != std::string::npos &&
+        FloatsOf(t).size() == seed.size()) {
+      mask = &t;
+      break;
+    }
+  }
+  Check(mask != nullptr, "the step graph carries a mask constant");
+  if (mask != nullptr) {
+    const std::vector<float> values = FloatsOf(*mask);
+    CheckEqual(static_cast<int64_t>(values.size()),
+               static_cast<int64_t>(seed.size()), "the mask covers the weight");
+    for (size_t i = 0; i < seed.size(); ++i) {
+      Check(values[i] == (seed[i] == 0.0f ? 0.0f : 1.0f),
+            "the mask is 0 exactly where the seed weight is 0");
+    }
+
+    // An op count cannot tell a gradient mask from a mask on the updated
+    // weight -- both are one Mul. Where the product *goes* can: a masked
+    // gradient feeds Adam's two moment updates, so it has several consumers
+    // and is not itself a state output, whereas a masked weight would be the
+    // state output and feed nothing.
+    std::string product;
+    for (const onnx::NodeProto& n : b.step_graph.graph().node()) {
+      for (int i = 0; i < n.input_size(); ++i) {
+        if (n.input(i) == mask->name()) product = n.output(0);
+      }
+    }
+    Check(!product.empty(), "the mask is consumed by a node");
+    int64_t consumers = 0;
+    for (const onnx::NodeProto& n : b.step_graph.graph().node()) {
+      for (int i = 0; i < n.input_size(); ++i) {
+        if (n.input(i) == product) consumers++;
+      }
+    }
+    Check(consumers >= 2,
+          "the masked gradient feeds Adam's moments rather than being a "
+          "finished parameter");
+    for (const onnx::ValueInfoProto& out : b.step_graph.graph().output()) {
+      Check(out.name() != product,
+            "the masked value is a gradient, not a state output");
+    }
+  }
+}
+
 void FineTunedWeightsAreWrittenBackAsFloatUnderTheirOwnName() {
   QatOptions options;
   options.fake_quant = false;
@@ -1049,6 +1146,7 @@ int main() {
   TrainingActivationQuantizersPlansBothOfTheirParameters();
   ADeeperBlockTrainsEveryLayerAndCapturesTheResidual();
   AFloatBlockFineTunesWithNoQuantizerInTheStepGraph();
+  PreserveSparsityPinsTheStartingZerosAndNothingElse();
   UntrainedBlockConstantsComeFromTheStudentWhenFineTuning();
   FineTunedWeightsAreWrittenBackAsFloatUnderTheirOwnName();
   TheScaleFlagsAreRefusedRatherThanIgnoredWithoutFakeQuant();
