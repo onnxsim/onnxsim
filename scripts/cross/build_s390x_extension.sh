@@ -257,6 +257,12 @@ cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
 # both directions. It was also, briefly, the worked example of the trap
 # described above -- added to CMakeLists.txt, left off this list, and so an
 # instant "Failed 0.00 sec" rather than a test that did not run.
+#
+# Adding a target here is half the job. The workflow that runs this script is
+# path-filtered, so a test built here whose source is not listed in
+# .github/workflows/big-endian.yml never runs on a pull request that changes
+# it -- it waits for the Monday schedule. Both lists have to move together:
+# add the target here, add its source there.
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
   tensor_pool_gguf_bridge_test tensor_pool_archive_test \
   precision_estimator_test contrib_schemas_moe_test xnnpack_codegen_test \
