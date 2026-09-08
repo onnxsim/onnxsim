@@ -4177,6 +4177,58 @@ where the decode measurements show INT4 buying 1.56x. The rating is not
 verifiable on this toolchain, and nothing measured here suggests it is
 reachable.
 
+### Is there a full INT4 path? No, and here is every place it is not
+
+A 43.2 TOPS INT4 rating describes 4-bit *arithmetic* -- 4-bit weights against
+4-bit activations. Both pipelines were checked for it, config schema and
+behaviour, and it is expressible in neither.
+
+**Activations cannot be 4-bit anywhere.** `pulsar2 build`'s `data_type`
+offers `U8, S8, U16, S16, FP32`; asking for the one 4-bit name in the enum
+gets an explicit rejection, `sepc_type NVFP4 not in STRING_NUMBER_MAP`.
+`llm_build --hidden_state_type` offers `fp16, bf16, fp32`. Nothing narrower
+exists in either.
+
+**The CNN path's one 4-bit weight type is silently ignored.** The `DataType`
+enum contains `NVFP4` even though `weight_data_type` is documented as
+`S8, FP32`, and setting it *builds successfully* -- which looks promising and
+is not. Against the `S8` build of the same graph it produces:
+
+| | S8 | NVFP4 |
+| --- | --- | --- |
+| weight table | 76.02 MB (1.007 B/weight) | 76.02 MB (1.007 B/weight) |
+| `max_cycle` | 3,905,355 | 3,905,355 |
+| device latency | 4.142 ms | 4.126 ms |
+| decoded weight codes | 167 distinct, 26..234 | **the same 167, 26..234** |
+
+The compiled weights are identical code for code -- decoded through the
+layout from the "Reading a real network's weights" section, which is what
+makes the comparison possible at all. `NVFP4` parses, is recorded in the
+build context, and changes nothing about the model.
+
+**`llm_build`'s `s4` is genuinely 4-bit storage, but only storage.** It
+measures 0.567 bytes per parameter against `s8`'s 1.10, so the weights really
+are four bits. The activations beside them are 16-bit, which is why it buys
+1.59x on decode (weight traffic) and 1.05x on prefill (arithmetic).
+
+So the complete picture is **W8A8 in the CNN pipeline, W4A16 or W8A16 in the
+LLM pipeline, and W4A4 nowhere.** The 43.2 TOPS figure cannot be reached
+through the vendor toolchain, not because the measurements fall short but
+because nothing in either pipeline emits that kind of program.
+
+**A note on whether the silicon could.** The weight tables this project
+decodes are stored as *bit planes* -- two 4-bit planes for a 1-D convolution,
+four 2-bit planes for a 2-D one, eight bits either way. A datapath that reads
+weights plane by plane is the kind where fewer weight bits would mean
+proportionally fewer passes, which is what a 2.4x INT8-to-INT4 rating would
+describe. That is consistent with the hardware supporting it and the
+toolchain not exposing it, but it is an inference from a storage format, not
+a measurement, and nothing here tests it.
+
+Test: `test_nvfp4_weights_are_accepted_and_then_ignored` (Docker, no device).
+It asserts the two builds' weights are identical, so if a future toolchain
+implements NVFP4 the test fails and says this section needs revisiting.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
