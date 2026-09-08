@@ -51,6 +51,13 @@ The three that used to fail only on big endian
 `test_profiling.py:134`, which used to *self-skip* with "constant folding did
 not run the ONNX Runtime executor here" — hence 21 skips rather than 22.
 
+(These counts are from when the fix above landed, against the full test
+suite of the time. The job's Python suite has since been narrowed to the
+core-simplify `CORE_TESTS` allowlist described under "Coverage" below, so a
+fresh run reports much smaller pass/skip totals — the same regressions this
+document describes would still be caught, since every file in that table is
+part of the allowlist.)
+
 ## What was wrong
 
 ### 1. The DLPack bridge refused to run (the actual breakage)
@@ -138,6 +145,21 @@ rootfs, cross-builds, runs the C++ tests through CTest (with qemu as
 demand, and on pull requests touching the harness or the files that read and
 write `raw_data` — a full run is ~40 minutes cold, which is too much for every
 PR. Widen the `paths` filter to `onnxsim/**` to make it stricter.
+
+The Python suite itself only runs an explicit allowlist of core-simplify test
+files (`CORE_TESTS` in `run_s390x_tests.sh`) — the CLI/Python API surface, the
+default-on and opt-in graph rewrite/fusion passes, shape inference and
+contrib-op schema registration, the function/custom rewriter engine, model
+checking/info/memory-planning/backend dispatch, profiling, and the
+raw_data-adjacent external-data loading path. It deliberately excludes the
+much larger set of quantization-algorithm, pruning-algorithm,
+hardware-backend-export/compat and LLM/GGUF-reconstruction test files: those
+operate on plain numpy arrays and Python floats and never touch
+`TensorProto.raw_data` or the DLPack bridge, so they cannot tell little-endian
+and big-endian apart, and running them under qemu would only add emulation
+cost and unrelated flakiness without adding byte-order coverage. A new test
+for one of the core areas above belongs in `CORE_TESTS`; a new test for an
+algorithm/backend/export feature does not need to be added there at all.
 
 ## Known unrelated failure in the no-onnxruntime configuration
 
