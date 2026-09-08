@@ -39,7 +39,10 @@ def _linear_fit_step_graph(rows, k, n):
     )
     return qat_graph.make_step_graph(
         b,
-        constants={"x": [rows, k], "y": [rows, n]},
+        constants={
+            "x": ([rows, k], onnx.TensorProto.FLOAT),
+            "y": ([rows, n], onnx.TensorProto.FLOAT),
+        },
         state={
             "w": ([n, k], w_next),
             "m": ([n, k], m_next),
@@ -531,7 +534,10 @@ def _gathered_linear_fit_step_graph(rows, batch, k, n):
     )
     return qat_graph.make_step_graph(
         b,
-        constants={"xs": [rows, k], "ys": [rows, n]},
+        constants={
+            "xs": ([rows, k], onnx.TensorProto.FLOAT),
+            "ys": ([rows, n], onnx.TensorProto.FLOAT),
+        },
         state={
             "w": ([n, k], w_next),
             "m": ([n, k], m_next),

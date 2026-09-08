@@ -410,7 +410,7 @@ class StepGraph:
 
 def make_step_graph(
     b: GraphBuilder,
-    constants: Dict[str, Sequence[int]],
+    constants: Dict[str, Tuple[Sequence[int], int]],
     state: Dict[str, Tuple[Sequence[int], str]],
     scalars: Sequence[str] = (),
     loss: Optional[str] = None,
@@ -419,9 +419,14 @@ def make_step_graph(
 ) -> StepGraph:
     """Wraps ``b``'s accumulated nodes into a :class:`StepGraph`.
 
-    :param constants: ``{input name: shape}`` for the tensors that do not
-            change across steps (calibration activations, the reconstruction
-            target, a frozen scale, ...)
+    :param constants: ``{input name: (shape, onnx element type)}`` for the
+            tensors that do not change across steps (calibration activations,
+            the reconstruction target, a frozen scale, ...). Most of these are
+            FLOAT -- an activation, a scale -- but a block-external tensor can
+            be any dtype the source model gave it (a ``Gather``'s integer row
+            ``indices``, captured whole as one of these when there is no
+            minibatch), which is why this takes an element type per entry
+            rather than assuming FLOAT for all of them the way it used to.
     :param state: ``{input name: (shape, output name)}`` for the tensors the
             step updates -- the parameter being optimized and the optimizer's
             own moments
@@ -438,8 +443,8 @@ def make_step_graph(
             scalar's shape and type never need saying.
     """
     inputs = [
-        onnx.helper.make_tensor_value_info(n, onnx.TensorProto.FLOAT, list(shape))
-        for n, shape in constants.items()
+        onnx.helper.make_tensor_value_info(n, elem_type, list(shape))
+        for n, (shape, elem_type) in constants.items()
     ]
     inputs += [
         onnx.helper.make_tensor_value_info(n, onnx.TensorProto.FLOAT, list(shape))
@@ -473,6 +478,26 @@ def make_step_graph(
         state={n: out for n, (_, out) in state.items()},
         loss_name=loss,
     )
+
+
+def _as_constant(v: np.ndarray) -> np.ndarray:
+    """A step-graph constant's value, cast to float32 if it is
+    floating-point and left alone otherwise.
+
+    Every constant used to be forced to float32 unconditionally, back when
+    every one of them was a float tensor. That is no longer true -- a
+    :func:`onnxsim.qat.apply_qat` block containing a ``Gather`` can capture
+    an integer ``indices`` tensor as one of these -- so only the
+    floating-point ones (an activation, a scale, ...; also whichever numpy
+    dtype a caller's own float64 host computation happened to produce, which
+    this cast has always absorbed) are normalized to float32. A non-float
+    array is passed through as the dtype it already is, matching the
+    element type :func:`make_step_graph` declared its graph input as.
+    """
+    array = np.asarray(v)
+    if np.issubdtype(array.dtype, np.floating):
+        return array.astype(np.float32, copy=False)
+    return array
 
 
 def _run_bound_loop(
@@ -531,7 +556,14 @@ def run_step_graph(
     The session (and its execution providers) is created once for the whole
     loop, not once per step -- see :class:`onnxsim.backend.Runner`.
 
-    :param constants: values for the step graph's constant inputs
+    :param constants: values for the step graph's constant inputs. A
+            floating-point array is cast to float32 (a caller may hand this a
+            float64 numpy computation and rely on that), but any other dtype
+            -- in practice a ``Gather``'s captured integer ``indices``, when
+            there is no minibatch -- is passed through as-is: casting it to
+            float32 the way this used to unconditionally would silently
+            corrupt it and then disagree with the dtype
+            :func:`make_step_graph` declared that same input as.
     :param state: initial values for its state inputs
     :param num_steps: iterations to run
     :param scalars: called with the step index, returning that step's scalar
@@ -597,7 +629,7 @@ def run_step_graph(
         fetch.append(step.loss_name)
     runner = backend.Runner(step.model, output_names=fetch, providers=providers)
 
-    fixed = {k: np.asarray(v, dtype=np.float32) for k, v in constants.items()}
+    fixed = {k: _as_constant(v) for k, v in constants.items()}
     initial = {k: np.asarray(v, dtype=np.float32) for k, v in state.items()}
 
     def step_feeds(t: int) -> Dict[str, np.ndarray]:

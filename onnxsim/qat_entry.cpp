@@ -54,6 +54,13 @@ namespace {
 
 using Shape = std::vector<int64_t>;
 using ShapeMap = std::map<std::string, Shape>;
+// A tensor's ONNX element type (onnx::TensorProto::DataType), keyed the same
+// way ShapeMap is. qat.py's block-external tensors were assumed float32
+// unconditionally until Gather's `indices` made a genuine integer one
+// possible; this is the C++ mirror of the map qat.py's
+// `_tensor_elem_types`/`_elem_type` builds to replace that assumption with
+// the float model's own declared/inferred type.
+using ElemTypeMap = std::map<std::string, int32_t>;
 
 // quantize_weight_only_int4's symmetric INT4 range, quantize_static's
 // per-output-channel INT8 one, and its uint8 activation range -- qat.py's
@@ -706,8 +713,18 @@ Shape StaticDims(const onnx::TypeProto& type, bool* ok) {
   return dims;
 }
 
-// Every tensor of the float model, shaped as if the caller had captured
-// `rows` calibration rows.
+// InferFloatShapes' result: each captured tensor's shape (pinned to `rows`
+// calibration rows) alongside its ONNX element type -- float for everything
+// this port used to assume, but whatever the float model itself declares (or
+// shape inference infers) for a genuinely non-float block-external, such as a
+// Gather's `indices`.
+struct FloatShapeInfo {
+  ShapeMap shapes;
+  ElemTypeMap elem_types;
+};
+
+// Every tensor of the float model, shaped (and typed) as if the caller had
+// captured `rows` calibration rows.
 //
 // This is what qat.py gets for free by running the model: its captured
 // activations are concrete arrays whose leading axis is the concatenated
@@ -716,7 +733,8 @@ Shape StaticDims(const onnx::TypeProto& type, bool* ok) {
 // model this port does that qat.py did out of data. Existing value_info and
 // output shapes are cleared first so a stale symbolic dimension cannot
 // survive the pinning and be refused later as "non-static".
-ShapeMap InferFloatShapes(const onnx::ModelProto& float_model, int64_t rows) {
+FloatShapeInfo InferFloatShapes(const onnx::ModelProto& float_model,
+                                int64_t rows) {
   onnx::ModelProto model = float_model;
   std::set<std::string> initializers;
   for (const onnx::TensorProto& t : model.graph().initializer()) {
@@ -743,19 +761,33 @@ ShapeMap InferFloatShapes(const onnx::ModelProto& float_model, int64_t rows) {
     // Fall through with whatever was inferred before the failure.
   }
 
-  ShapeMap shapes;
-  auto collect = [&shapes](const onnx::ValueInfoProto& value) {
+  FloatShapeInfo info;
+  auto collect = [&info](const onnx::ValueInfoProto& value) {
     bool ok = false;
     const Shape dims = StaticDims(value.type(), &ok);
-    if (ok) shapes[value.name()] = dims;
+    if (ok) info.shapes[value.name()] = dims;
+    const int32_t elem_type = value.type().tensor_type().elem_type();
+    if (elem_type != onnx::TensorProto::UNDEFINED) {
+      info.elem_types[value.name()] = elem_type;
+    }
   };
   for (const onnx::ValueInfoProto& v : model.graph().input()) collect(v);
   for (const onnx::ValueInfoProto& v : model.graph().value_info()) collect(v);
   for (const onnx::ValueInfoProto& v : model.graph().output()) collect(v);
   for (const onnx::TensorProto& t : model.graph().initializer()) {
-    shapes[t.name()] = DimsOf(t);
+    info.shapes[t.name()] = DimsOf(t);
+    info.elem_types[t.name()] = t.data_type();
   }
-  return shapes;
+  return info;
+}
+
+// `types[name]`, defaulting to FLOAT for a name shape inference could not
+// type -- the assumption every block-external tensor satisfied
+// unconditionally before Gather made a non-float one possible. Mirrors
+// qat.py's `_elem_type`.
+int32_t ElemTypeOr(const ElemTypeMap& types, const std::string& name) {
+  const auto it = types.find(name);
+  return it == types.end() ? onnx::TensorProto::FLOAT : it->second;
 }
 
 void SetValueInfo(onnx::ValueInfoProto* vi, const std::string& name,
@@ -772,9 +804,17 @@ void SetValueInfo(onnx::ValueInfoProto* vi, const std::string& name,
 // carry this step's concrete row count. Inference runs at opset 17, the
 // pairing the step graph emits, so a node the step graph could not legally
 // carry is refused here rather than at session-creation time.
+//
+// Every external is declared FLOAT here, save one exception: a tensor whose
+// element type `elem_types` (the float model's own declared/inferred types --
+// see InferFloatShapes) names as something else, in practice a Gather's
+// `indices`. Declaring it FLOAT regardless, the way this used to, is exactly
+// what upset the emitted step graph: a Gather node with a tensor(float)
+// `indices` input is not a legal graph.
 ShapeMap BlockShapes(const onnx::ModelProto& float_model,
                      const std::vector<onnx::NodeProto>& nodes,
                      const std::vector<std::pair<std::string, Shape>>& inputs,
+                     const ElemTypeMap& elem_types,
                      const std::string& block_output_name,
                      const Shape& block_output_shape) {
   std::set<std::string> used;
@@ -789,8 +829,8 @@ ShapeMap BlockShapes(const onnx::ModelProto& float_model,
   graph->set_name("qat_block");
   for (const onnx::NodeProto& node : nodes) *graph->add_node() = node;
   for (const auto& input : inputs) {
-    SetValueInfo(graph->add_input(), input.first, onnx::TensorProto::FLOAT,
-                 input.second);
+    SetValueInfo(graph->add_input(), input.first,
+                 ElemTypeOr(elem_types, input.first), input.second);
   }
   SetValueInfo(graph->add_output(), block_output_name, onnx::TensorProto::FLOAT,
                block_output_shape);
@@ -1217,8 +1257,11 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   }
 
   // --- shapes ------------------------------------------------------------
-  // The whole captured set's shapes, i.e. what the caller binds once.
-  const ShapeMap full_shapes = InferFloatShapes(float_model, num_rows);
+  // The whole captured set's shapes (and element types), i.e. what the
+  // caller binds once.
+  const FloatShapeInfo float_info = InferFloatShapes(float_model, num_rows);
+  const ShapeMap& full_shapes = float_info.shapes;
+  const ElemTypeMap& elem_types = float_info.elem_types;
   auto shape_of = [&full_shapes](const std::string& name) -> const Shape& {
     const auto it = full_shapes.find(name);
     if (it == full_shapes.end()) {
@@ -1269,8 +1312,9 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     step_inputs.emplace_back(external.first, with_rows(external.second));
   }
   const Shape step_teacher_shape = with_rows(teacher_shape);
-  const ShapeMap shapes = BlockShapes(float_model, slice.nodes, step_inputs,
-                                      block_output_name, step_teacher_shape);
+  const ShapeMap shapes =
+      BlockShapes(float_model, slice.nodes, step_inputs, elem_types,
+                  block_output_name, step_teacher_shape);
 
   // --- _plan_trained and the block's own initializers --------------------
   std::vector<Trained> trained = PlanTrained(candidates, options.learn_scales,
@@ -1314,28 +1358,31 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   std::vector<QatCapture> captures;
   if (!minibatch) {
     for (const auto& external : externals) {
-      constants.push_back({external.first, external.second});
+      const int32_t elem_type = ElemTypeOr(elem_types, external.first);
+      constants.push_back({external.first, external.second, elem_type});
       captures.push_back({external.first, external.first, external.second,
-                          /*is_teacher=*/false});
+                          elem_type, /*is_teacher=*/false});
     }
-    constants.push_back({teacher, teacher_shape});
-    captures.push_back(
-        {teacher, block_output_name, teacher_shape, /*is_teacher=*/true});
+    constants.push_back({teacher, teacher_shape, onnx::TensorProto::FLOAT});
+    captures.push_back({teacher, block_output_name, teacher_shape,
+                        onnx::TensorProto::FLOAT, /*is_teacher=*/true});
   } else {
     // A captured tensor's table is `qat__all_<its name>` and the teacher's is
     // `qat__teacher_all`; the two families cannot collide whatever the model
     // calls its tensors.
     for (const auto& external : externals) {
+      const int32_t elem_type = ElemTypeOr(elem_types, external.first);
       const std::string table = std::string(kPrefix) + "all_" + external.first;
-      constants.push_back({table, external.second});
-      captures.push_back(
-          {table, external.first, external.second, /*is_teacher=*/false});
+      constants.push_back({table, external.second, elem_type});
+      captures.push_back({table, external.first, external.second, elem_type,
+                          /*is_teacher=*/false});
       b.GatherRowsInto(table, rows_input, external.first);
     }
     const std::string teacher_table = std::string(kPrefix) + "teacher_all";
-    constants.push_back({teacher_table, teacher_shape});
+    constants.push_back(
+        {teacher_table, teacher_shape, onnx::TensorProto::FLOAT});
     captures.push_back({teacher_table, block_output_name, teacher_shape,
-                        /*is_teacher=*/true});
+                        onnx::TensorProto::FLOAT, /*is_teacher=*/true});
     b.GatherRowsInto(teacher_table, rows_input, teacher);
   }
   const Shape block_output_shape = step_teacher_shape;

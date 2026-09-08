@@ -315,6 +315,71 @@ onnx::ModelProto DeepInt4QuantizedModel() {
   return model;
 }
 
+// A batched int64 input -- the shape `SliceBlock`'s own comment names as
+// "an attention mask fed as a second graph input" (an external tensor
+// entering the block sideways), except this one is genuinely non-float: a
+// `Gather`'s row index. It is what
+// `ABlockExternalGatherIndexIsCapturedAndDeclaredAtItsRealDtype` below
+// exists to exercise -- every block-external tensor was assumed float32
+// unconditionally until `Gather` (differentiable via graph_grad's VJP rule)
+// made this legal.
+void AddBatchedInt64Input(onnx::GraphProto* graph, const std::string& name) {
+  onnx::ValueInfoProto* vi = graph->add_input();
+  vi->set_name(name);
+  onnx::TypeProto::Tensor* tensor = vi->mutable_type()->mutable_tensor_type();
+  tensor->set_elem_type(onnx::TensorProto::INT64);
+  tensor->mutable_shape()->add_dim()->set_dim_param("batch");
+}
+
+// `DeepFloatModel`/`DeepInt4QuantizedModel` with a `Gather` spliced into the
+// middle, reading a second graph input (`Idx`, int64) as its `indices` --
+// `data` is `H`, reachable from the block input `X`, which is what keeps
+// `Gather` *inside* the slice (see `SliceBlock`'s forward walk) rather than
+// having its output treated as an ordinary captured (float) external.
+onnx::ModelProto GatherFloatModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("gather_float");
+  AddBatchedInput(graph, "X", kK);
+  AddBatchedInt64Input(graph, "Idx");
+  AddOutput(graph, "Y", kK);
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1"}, {"H"});
+  *graph->add_node() = MakeNode("Gather", {"H", "Idx"}, {"G"});
+  *graph->add_node() = MakeNode("MatMul", {"G", "W2"}, {"Y"});
+  *graph->add_initializer() =
+      FloatTensor("W1", {kK, kK}, std::vector<float>(kK * kK, 0.21f));
+  *graph->add_initializer() =
+      FloatTensor("W2", {kK, kK}, std::vector<float>(kK * kK, 0.11f));
+  Finish(&model);
+  return model;
+}
+
+onnx::ModelProto GatherInt4QuantizedModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("gather_int4");
+  AddBatchedInput(graph, "X", kK);
+  AddBatchedInt64Input(graph, "Idx");
+  AddOutput(graph, "Y", kK);
+  *graph->add_node() = MakeNode("DequantizeLinear", {"W1q", "W1s"}, {"W1dq"},
+                                {{"axis", 0}, {"block_size", kBlock}});
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1dq"}, {"H"});
+  *graph->add_node() = MakeNode("Gather", {"H", "Idx"}, {"G"});
+  *graph->add_node() = MakeNode("DequantizeLinear", {"W2q", "W2s"}, {"W2dq"},
+                                {{"axis", 0}, {"block_size", kBlock}});
+  *graph->add_node() = MakeNode("MatMul", {"G", "W2dq"}, {"Y"});
+  *graph->add_initializer() =
+      RawTensor("W1q", onnx::TensorProto::INT4, {kK, kK}, std::string(8, '\0'));
+  *graph->add_initializer() =
+      FloatTensor("W1s", {kK / kBlock, kK}, std::vector<float>(8, 0.1f));
+  *graph->add_initializer() =
+      RawTensor("W2q", onnx::TensorProto::INT4, {kK, kK}, std::string(8, '\0'));
+  *graph->add_initializer() =
+      FloatTensor("W2s", {kK / kBlock, kK}, std::vector<float>(8, 0.1f));
+  Finish(&model);
+  return model;
+}
+
 // The fine-tuning pair -- QatOptions::fake_quant off. Nothing here is
 // quantized: this scheme trains the *student's* own float weights against the
 // teacher's activation, so the two models being different weights over one
@@ -1223,6 +1288,59 @@ void ABlockThatIsNotAClosedSliceIsRefused() {
       "a block whose input is downstream of its output is refused");
 }
 
+// The C++ mirror of the Python bug this file exists to close: a block
+// containing a `Gather` whose `indices` is a block-external, non-initializer
+// tensor (`Idx`, a genuine graph input here) used to be declared FLOAT
+// regardless of its real dtype -- both in the emitted step graph's own input
+// (which `onnx::checker` then rejected: a `Gather` node cannot read a
+// `tensor(float)` `indices`) and in the `QatCapture` a caller would use to
+// know what dtype to capture and bind it as. Both are pinned here.
+void ABlockExternalGatherIndexIsCapturedAndDeclaredAtItsRealDtype() {
+  const QatStepPlan plan =
+      BuildQatStepGraph(GatherFloatModel(), GatherInt4QuantizedModel(), "X",
+                        "Y", kRows, QatOptions());
+  CheckModel(plan.step_graph, "the step graph with a block-external Gather index");
+  Check(OpTypes(plan.step_graph).count("Gather") != 0,
+        "the block's own Gather node is carried into the step graph verbatim");
+
+  const onnx::ValueInfoProto* idx_input = nullptr;
+  for (const onnx::ValueInfoProto& v : plan.step_graph.graph().input()) {
+    if (v.name() == "Idx") idx_input = &v;
+  }
+  Check(idx_input != nullptr, "the step graph declares an input named Idx");
+  if (idx_input != nullptr) {
+    CheckEqual(
+        static_cast<int64_t>(idx_input->type().tensor_type().elem_type()),
+        static_cast<int64_t>(onnx::TensorProto::INT64),
+        "Idx is declared at its real dtype (INT64), not hardcoded FLOAT");
+  }
+
+  bool found_idx_capture = false;
+  for (const QatCapture& capture : plan.captures) {
+    if (capture.source_tensor != "Idx") continue;
+    found_idx_capture = true;
+    CheckEqual(
+        static_cast<int64_t>(capture.elem_type),
+        static_cast<int64_t>(onnx::TensorProto::INT64),
+        "the Idx capture says to capture it as INT64, not hardcoded FLOAT");
+    Check(capture.dims == std::vector<int64_t>({kRows}),
+          "the captured index carries num_rows rows, same as every other "
+          "block-external");
+  }
+  Check(found_idx_capture, "Idx is captured as one of the block's externals");
+
+  // The block's other, ordinary float external (X itself) and the teacher
+  // still declare FLOAT -- this is a per-tensor dtype, not a blanket switch
+  // away from float for the whole plan.
+  for (const QatCapture& capture : plan.captures) {
+    if (capture.source_tensor == "Idx") continue;
+    CheckEqual(static_cast<int64_t>(capture.elem_type),
+               static_cast<int64_t>(onnx::TensorProto::FLOAT),
+               "every other capture (" + capture.source_tensor +
+                   ") is still declared FLOAT");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1247,6 +1365,7 @@ int main() {
   ABlockWithNoQuantizedLayerIsRefused();
   EachSchemeMismatchIsNamedRatherThanReportedAsABoundaryError();
   ABlockThatIsNotAClosedSliceIsRefused();
+  ABlockExternalGatherIndexIsCapturedAndDeclaredAtItsRealDtype();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d qat_entry check(s) failed\n", g_failures);
