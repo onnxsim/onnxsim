@@ -42,6 +42,7 @@ from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
 from onnxsim.daq import apply_daq
 from onnxsim.deepseek_fp8 import apply_deepseek_fp8, quantize_dequantize_block_fp8
+from onnxsim.detectron_export import export_detectron_model
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.drop_by_drop import (
@@ -278,6 +279,7 @@ from onnxsim.qwen_drive_planning_expert_reconstruct import (
 )
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
+from onnxsim.sam2_export import export_sam2_model
 from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
@@ -555,6 +557,8 @@ __all__ = [
     "UnsupportedArchitectureError",
     "export_transformers_model",
     "export_diffusion_model",
+    "export_detectron_model",
+    "export_sam2_model",
     "export_mlir",
     "export_coreml",
     "export_tflite",
