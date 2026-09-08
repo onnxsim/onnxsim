@@ -4364,6 +4364,58 @@ reports `r_zeropoint = 121`.
 
 Test: `test_conv_weight_quantiser_is_reproduced_exactly` (Docker, no device).
 
+### Where the 1-D layout stops: 32 channels
+
+The TTS vocoder is the easier of the two remaining test beds -- it compiles
+through the same `pulsar2 build` path as everything else here, unlike the LLM
+pipeline. Pointing the weight locator at it fails almost completely: **1 of 23
+layers**, and reading its convolutions as 2-D with a unit dimension (either
+`1xk` or `kx1`) locates none at all.
+
+**The cause is a channel-count boundary, not the model.** A controlled sweep
+of single 1-D convolutions:
+
+| shape | located |
+| --- | --- |
+| 32 channels, K=3 | 1.0000 |
+| 32 channels, K=7 | 1.0000 |
+| 64 channels, K=3 | 0.42 |
+| 64 channels, K=7 | 0.19 |
+| 128 channels, K=3 | 0.27 |
+
+So the 1-D layout is right up to 32 input channels and wrong from 64. That
+explains the vocoder exactly: its convolutions run 32 to 256 channels, and the
+single layer that *did* locate is the one 32-channel `3x3`... which is to say
+the locator was never failing on the vocoder, it was failing on every shape
+past a limit nothing had tested.
+
+Two checks rule out the obvious alternatives. A **three-layer** 1-D model at
+32 channels locates all three layers at 1.0000, on contiguous bases -- so
+depth is not the problem. And kernel size is not either: 32 channels works at
+K=3 and K=7 alike.
+
+**What the 64-channel addressing looks like.** Dense single-weight probes give
+the output-channel map directly:
+
+    base(o) = 432*(o % 16) + 72*((o >> 4) & 1) + 6912*(o >> 5)
+
+with the input-channel and kernel rules unchanged (`i//2` bytes with the
+nibble chosen by `i % 2`, kernel stride `Cin/2`). The same
+bits-0-to-3/bit-4/higher-bits structure as everywhere else, with different
+constants.
+
+**What is still missing, and why the probe could not settle it.** The two
+nibble planes' separation at 64 channels is unknown. The probe flips a weight
+from `+0.1` to `-0.1`, and for this model's scale those quantise to `0xC0` and
+`0x40` -- a *low nibble of zero in both*, so only the high plane ever moved
+and the low one stayed invisible. Searching gaps from -2000 to +2000 bytes for
+a pair that reconstructs the weights found nothing, so the placement is not a
+simple offset from the plane the probe did find.
+
+The fix is mechanical and known: probe with a pair of values whose codes
+differ in *both* nibbles. That is the next step, and until it is done the
+vocoder's weights stay unreadable past 32 channels.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
