@@ -251,10 +251,17 @@ cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
 # generated on a little-endian host, so it fails if either side of the round
 # trip picks up a host-order assumption. graph_grad_test comes along because
 # it builds NodeProtos through the same emitter and costs only its link step.
+# qat_entry_test meets the same criterion and is the broadest of them:
+# qat_entry.cpp reads float weights and scales out of raw_data, packs INT4
+# codes back into it two to a byte, and round-trips a whole model through
+# both directions. It was also, briefly, the worked example of the trap
+# described above -- added to CMakeLists.txt, left off this list, and so an
+# instant "Failed 0.00 sec" rather than a test that did not run.
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
   tensor_pool_gguf_bridge_test tensor_pool_archive_test \
   precision_estimator_test contrib_schemas_moe_test xnnpack_codegen_test \
   graph_grad_test qat_graph_builder_test qat_graph_parity_test \
+  qat_entry_test \
   -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
