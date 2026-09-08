@@ -84,7 +84,17 @@ struct QatOptions {
   // Rows per optimizer step. 0 means full batch, which is the default and the
   // only mode with no per-step input beyond the scalars.
   int64_t batch_size = 0;
-  // Only consulted when batch_size > 0; matches minibatch_indices' own seed.
+  // Only consulted when batch_size > 0. It plays minibatch_indices' role --
+  // the per-epoch permutation is a function of (batch_seed, epoch) alone, so
+  // an interrupted run resumes on the same schedule -- but it does *not*
+  // reproduce that function's output, and no caller of this header can.
+  // minibatch_indices draws from np.random.default_rng([seed, epoch]), i.e.
+  // numpy's PCG64, which a browser has no way to regenerate. So the same seed
+  // picks different, equally valid batches here than in Python. That is the
+  // one place the Python and this port are deliberately not bit-comparable,
+  // and it is confined to *which rows* a step sees rather than to any emitted
+  // graph -- the step graph itself stays byte-identical, which is what
+  // qat_parity_fixtures.txt pins.
   int64_t batch_seed = 0;
   bool shuffle = true;
 };
@@ -172,8 +182,18 @@ struct QatStepPlan {
   // Input name -> the output carrying its next value. This is what makes the
   // loop a ping-pong of two buffers rather than a rebuild per step.
   std::vector<std::pair<std::string, std::string>> state;
-  // Scalar float inputs supplied fresh each step: the learning rates and Adam's
-  // two bias-correction factors. AdamBiasCorrections computes the latter.
+  // Scalar float inputs supplied fresh each step, by name, because feeding the
+  // right count of values in the wrong order is silent -- every one of them is
+  // a bare float and nothing downstream can tell a weight learning rate from an
+  // activation one:
+  //   "qat__lr"        the master weights' Adam learning rate
+  //   "m_correction"   Adam's first-moment bias correction, 1/(1 - beta1^(t+1))
+  //   "v_correction"   ... and its second, 1/(1 - beta2^(t+1))
+  //   "qat__lr_scale"  present only with learn_scales
+  //   "qat__lr_act"    present only with learn_activation_scales
+  // AdamBiasCorrections computes the two corrections. apply_qat decays each
+  // learning rate linearly (lr * (1 - t/num_iterations)) when lr_decay is on;
+  // that schedule is the caller's to reproduce, since nothing here sees t.
   std::vector<std::string> scalars;
   // The scalar output carrying this step's loss. Empty if none.
   std::string loss_name;
