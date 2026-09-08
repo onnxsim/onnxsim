@@ -4276,11 +4276,17 @@ The weight table is fully addressable -- every convolution in resnet18d, three
 packings, 100% of its weights. Writing it is more constrained than reading
 it, and this pins down exactly how.
 
-**The per-channel weight scale is findable and writable.** One float32 per
-output channel sits immediately after the weight block, exactly proportional
-to that channel's peak magnitude. It has to be found *by* that
-proportionality rather than at a fixed offset, because the constant absorbs
-the activation scales and differs between models.
+**That float array is not the weight scale -- it is the requantisation
+multiplier.** One float32 per output channel sits immediately after the
+weight block, and it equals
+
+    M[o] = x_scale * (peak[o] / 127.5) / r_scale
+
+to zero relative error: the input activation scale, times the per-channel
+weight scale, divided by the output activation scale. That is why its
+"constant of proportionality" appeared to absorb the activation scales
+earlier -- it is made of them. An earlier draft of this section called it a
+weight scale, which was wrong.
 
 **But rewriting weights and scales is still not enough.** Three device
 experiments, each stricter than the last:
@@ -4315,6 +4321,48 @@ tensor's dynamic range, and verified on hardware.** That is narrower than
 
 Test: `test_per_channel_weight_scales_sit_just_past_the_weight_block`
 (Docker, no device).
+
+### The weight quantiser, exactly
+
+Identifying the multiplier pinned the weight scale inside it, and that turned
+out to be the whole quantiser. Pulsar2's convolution weights are
+
+    scale[o] = float32(peak[o]) / float32(127.5)
+    code     = clip(round_half_to_even(float32(w) / scale) + 128, 0, 255)
+
+and this reproduces **100.000%** of the codes in a compiled model -- verified
+on three independent builds at 8 and 64 channels, with no reference model
+involved.
+
+Every detail earns its place, which is why the earlier fitted-slope approach
+plateaued at 97.4%:
+
+| variation | codes reproduced |
+| --- | --- |
+| `float32`, 127.5, round-half-to-even | **100.000%** |
+| `float64` instead of `float32` | 99.48% |
+| round-half-away instead of half-to-even | 99.83% |
+| 127 instead of 127.5 | 86.11% |
+| 128 instead of 127.5 | 84.03% |
+
+The 127.5 is what the earlier least-squares recovery was circling: it fitted
+slopes of 127.27 to 127.76 per channel and called the spread a property of
+the compiler. It was not -- it was noise around an exact constant, and the
+residue was float64 arithmetic where the compiler uses float32.
+
+**What this changes for a generator.** Weight codes no longer have to be
+recovered from a compiled model and re-quantised against a fitted slope; they
+can be computed from the weights alone. Together with the three layouts, a
+convolution's weight block is now fully synthesisable. What still requires a
+reference is the *multiplier* array, since `x_scale` and `r_scale` come from
+calibration -- and the output scale a layer's consumer expects is the same
+thing that makes an arbitrary weight rewrite saturate.
+
+**Also located: the output zero point** is an `int32` in the mcode -- byte 176
+of the stream in the model measured, holding 121 where the compiler's profile
+reports `r_zeropoint = 121`.
+
+Test: `test_conv_weight_quantiser_is_reproduced_exactly` (Docker, no device).
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 

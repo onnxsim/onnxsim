@@ -4887,6 +4887,62 @@ def test_nvfp4_weights_are_accepted_and_then_ignored(tmp_path):
     assert len(set(codes["S8"])) > 32, len(set(codes["S8"]))
 
 
+def _quantize_conv_weights(weights):
+    """Pulsar2's own convolution weight quantiser, reproduced exactly.
+
+    Per output channel: `scale = float32(peak) / float32(127.5)`, then
+    round-half-to-even in float32 and offset by the zero point 128. All three
+    details matter -- 127 or 128 in place of 127.5 costs ~14% of the codes,
+    float64 arithmetic costs 0.5%, and round-half-away costs 0.2%.
+    """
+    w = np.asarray(weights, dtype=np.float32)
+    cout = w.shape[0]
+    peaks = np.abs(w.reshape(cout, -1)).max(1)
+    scale = (peaks / np.float32(127.5)).astype(np.float32)
+    shaped = scale.reshape((cout,) + (1,) * (w.ndim - 1))
+    return np.clip(np.round(w / shaped) + 128, 0, 255).astype(int)
+
+
+def test_conv_weight_quantiser_is_reproduced_exactly(tmp_path):
+    """Confirmed real (see the README's "The weight quantiser, exactly"
+    section): `_quantize_conv_weights()` reproduces **every** code pulsar2
+    writes for a convolution, with no reference model involved.
+
+    That is what turns reading the weight table into generating one: the
+    codes no longer have to be recovered from a compiled model and
+    re-quantised against a fitted slope, they can be computed from the
+    weights alone. Needs Docker, no device.
+    """
+    kernel, hw = 3, 16
+    for cin in (8, 32):
+        cout = cin
+        rng = np.random.RandomState(cin)
+        weights = (rng.randn(cout, cin, kernel, kernel) * 0.1).astype(np.float32)
+        work = tmp_path / f"c{cin}"
+        work.mkdir()
+        axmodel = _build_single_op_axmodel(
+            str(work), "m", _one_conv2d_model(cin, cout, hw, kernel, weights=weights)
+        )
+        wbt = _wbt_of(axmodel)
+        compiled = np.array(
+            [
+                [
+                    [
+                        [
+                            _read_weight2d_code_at(wbt, 0, o, i, kh, kw, kernel, cin)
+                            for kw in range(kernel)
+                        ]
+                        for kh in range(kernel)
+                    ]
+                    for i in range(cin)
+                ]
+                for o in range(cout)
+            ],
+            dtype=int,
+        )
+        assert (_quantize_conv_weights(weights) == compiled).all(), cin
+
+
 def test_per_channel_weight_scales_sit_just_past_the_weight_block(tmp_path):
     """Confirmed real (see the README's "What a weight generator can and
     cannot do yet" section): the weight table carries one float32 per output
