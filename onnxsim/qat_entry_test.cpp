@@ -315,6 +315,44 @@ onnx::ModelProto DeepInt4QuantizedModel() {
   return model;
 }
 
+// The fine-tuning pair -- QatOptions::fake_quant off. Nothing here is
+// quantized: this scheme trains the *student's* own float weights against the
+// teacher's activation, so the two models being different weights over one
+// topology is the whole thing there is to learn. Two MatMuls make the block
+// two trained layers; the LayerNormalization between them carries the
+// untrained constants (its scale and bias) whose source is the one
+// substantive decision this scheme makes, so the two models give them
+// different values too.
+onnx::ModelProto FineTuneModel(float weight, float norm) {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("finetune");
+  AddBatchedInput(graph, "X", kK);
+  AddOutput(graph, "Y", kN);
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1"}, {"H"});
+  *graph->add_node() = MakeNode("LayerNormalization", {"H", "LnS", "LnB"},
+                                {"Nrm"}, {{"axis", -1}});
+  *graph->add_node() = MakeNode("MatMul", {"Nrm", "W2"}, {"Y"});
+  *graph->add_initializer() =
+      FloatTensor("W1", {kK, kK}, std::vector<float>(kK * kK, weight));
+  *graph->add_initializer() =
+      FloatTensor("LnS", {kK}, std::vector<float>(kK, norm));
+  *graph->add_initializer() =
+      FloatTensor("LnB", {kK}, std::vector<float>(kK, -norm));
+  *graph->add_initializer() =
+      FloatTensor("W2", {kK, kN}, std::vector<float>(kK * kN, weight));
+  Finish(&model);
+  return model;
+}
+
+// The teacher's weights, which fine-tuning must never read: it trains the
+// student, and re-seeding from the teacher would throw away whatever change
+// (a pruning, a simplification, an earlier tuning) made the two differ.
+constexpr float kTeacherWeight = 0.25f;
+constexpr float kTeacherNorm = 1.5f;
+constexpr float kStudentWeight = 0.5f;
+constexpr float kStudentNorm = 2.5f;
+
 std::set<std::string> InputNames(const onnx::ModelProto& model) {
   std::set<std::string> names;
   for (const onnx::ValueInfoProto& v : model.graph().input()) {
@@ -696,6 +734,215 @@ void ADeeperBlockTrainsEveryLayerAndCapturesTheResidual() {
   // whose ops happen to be inside it.
 }
 
+// fake_quant off is the same loop with the quantizer taken out of the middle:
+// the block reads the master weight itself, so there is nothing to
+// fake-quantize and nothing for a straight-through estimator to pass through.
+// The operators that make up the weight fake-quant are therefore the ones that
+// must be *absent* -- a port that emitted them anyway would round the trained
+// weights to a grid nobody asked for and train on quietly.
+void AFloatBlockFineTunesWithNoQuantizerInTheStepGraph() {
+  QatOptions options;
+  options.fake_quant = false;
+  const QatStepPlan plan = BuildQatStepGraph(
+      FineTuneModel(kTeacherWeight, kTeacherNorm),
+      FineTuneModel(kStudentWeight, kStudentNorm), "X", "Y", kRows, options);
+  CheckModel(plan.step_graph, "the fine-tuning step graph");
+  CheckEqual(static_cast<int64_t>(plan.layers.size()), 2,
+             "both of the student's float MatMuls are trained");
+  CheckEqual(plan.layers[0].codes_initializer, "W1",
+             "a fine-tuned layer writes back into the weight itself");
+  CheckEqual(plan.layers[1].codes_initializer, "W2",
+             "the second layer follows it in graph order");
+  Check(!plan.layers[0].fake_quant,
+        "the write-back is told there is no quantizer to invert");
+  CheckEqual(plan.layers[0].block_size, 0,
+             "the unread block size is the value that breaks rather than the "
+             "one that looks plausible");
+  CheckEqual(plan.layers[0].weight_scale_initializer, "",
+             "there is no scale initializer to write back into");
+
+  // Three state tensors per layer and one learning rate, exactly as the
+  // weight-only quantized path: the optimizer half is untouched.
+  CheckEqual(static_cast<int64_t>(plan.state.size()), 6,
+             "w, m and v for each of the two trained weights");
+  CheckEqual(plan.state[0].first, "qat__w0", "the master weight is state 0");
+  CheckEqual(plan.layers[1].weight_state_input, "qat__w1",
+             "the layers are numbered from zero in the order they were found");
+  CheckEqual(static_cast<int64_t>(plan.scalars.size()), 3,
+             "one learning rate and Adam's two bias corrections");
+  CheckEqual(static_cast<int64_t>(plan.captures.size()), 2,
+             "the block's input and its teacher");
+  CheckEqual(plan.captures[0].source_tensor, "X",
+             "the block input is captured from the float model");
+  CheckEqual(plan.captures[1].step_graph_input, "qat__teacher",
+             "the teacher is bound under the private name the loss reads");
+  Check(plan.captures[1].is_teacher, "the reconstruction target is flagged");
+
+  const std::set<std::string> ops = OpTypes(plan.step_graph);
+  for (const std::string& op : {"Sign", "Abs", "Clip", "Round"}) {
+    Check(ops.count(op) == 0,
+          "the fine-tuning step graph emits " + op +
+              ", which only a weight fake-quant would need");
+  }
+
+  // The block's node reads the master weight by *name*: the substitution is a
+  // renamed input rather than an Identity, since a node whose whole job is to
+  // copy a tensor is a node an execution provider would have to implement for
+  // no reason.
+  Check(FindInitializer(plan.step_graph, "W1") == nullptr,
+        "the trained weight is not an initializer of the step graph");
+  bool reads_master = false;
+  for (const onnx::NodeProto& node : plan.step_graph.graph().node()) {
+    if (node.op_type() == "MatMul" && node.input_size() > 1 &&
+        node.input(1) == "qat__w0" && node.output(0) == "H") {
+      reads_master = true;
+    }
+  }
+  Check(reads_master, "the block's own MatMul reads the master weight");
+  Check(ops.count("Identity") == 0,
+        "the substitution renames an input rather than emitting an Identity");
+}
+
+// Which model the block's *untrained* constants come from is a semantic
+// decision, not a detail. Under QAT it is the teacher, whose weights the
+// student encodes; under fine-tuning it is the student, because the student is
+// a different model and quietly substituting the teacher's constants into it
+// would train the block to compensate for a substitution the deployed model
+// does not make.
+void UntrainedBlockConstantsComeFromTheStudentWhenFineTuning() {
+  QatOptions options;
+  options.fake_quant = false;
+  const QatStepPlan plan = BuildQatStepGraph(
+      FineTuneModel(kTeacherWeight, kTeacherNorm),
+      FineTuneModel(kStudentWeight, kStudentNorm), "X", "Y", kRows, options);
+  for (const auto& entry :
+       {std::make_pair(std::string("LnS"), kStudentNorm),
+        std::make_pair(std::string("LnB"), -kStudentNorm)}) {
+    const onnx::TensorProto* constant =
+        FindInitializer(plan.step_graph, entry.first);
+    Check(constant != nullptr,
+          "the LayerNorm's " + entry.first + " is a step-graph initializer");
+    if (constant == nullptr) continue;
+    const std::vector<float> values = FloatsOf(*constant);
+    Check(values == std::vector<float>(kK, entry.second),
+          "the LayerNorm's " + entry.first +
+              " is the student's own, not the teacher's");
+  }
+
+  // And the master weight is seeded from the student too, for the same
+  // reason: its weights are the starting point precisely by not being the
+  // teacher's.
+  const std::map<std::string, onnx::TensorProto> state =
+      AsStateMap(plan.initial_state);
+  const auto w = state.find("qat__w0");
+  Check(w != state.end(), "the master weight is seeded");
+  if (w != state.end()) {
+    Check(FloatsOf(w->second) == std::vector<float>(kK * kK, kStudentWeight),
+          "fine-tuning starts from the student's own weight");
+  }
+}
+
+// With no quantizer between the master weight and what the model stores, the
+// trained tensor *is* the stored tensor: the write-back is the identity that
+// the two quantized schemes' rounding and clipping stand in for.
+void FineTunedWeightsAreWrittenBackAsFloatUnderTheirOwnName() {
+  QatOptions options;
+  options.fake_quant = false;
+  const onnx::ModelProto student = FineTuneModel(kStudentWeight, kStudentNorm);
+  const QatStepPlan plan =
+      BuildQatStepGraph(FineTuneModel(kTeacherWeight, kTeacherNorm), student,
+                        "X", "Y", kRows, options);
+
+  // A "trained" state that is not the warm start, so the write-back is
+  // visible: the whole point is that these values reach the model unrounded.
+  std::map<std::string, onnx::TensorProto> final_state =
+      AsStateMap(plan.initial_state);
+  final_state["qat__w0"] =
+      FloatTensor("qat__w0", {kK, kK}, std::vector<float>(kK * kK, 0.1234f));
+  const onnx::ModelProto tuned = WriteBackQatState(student, plan, final_state);
+
+  const onnx::TensorProto* w1 = FindInitializer(tuned, "W1");
+  Check(w1 != nullptr, "the weight initializer survives the write-back");
+  if (w1 != nullptr) {
+    CheckEqual(static_cast<int64_t>(w1->data_type()),
+               static_cast<int64_t>(onnx::TensorProto::FLOAT),
+               "a fine-tuned weight is written back as fp32");
+    Check(std::vector<int64_t>(w1->dims().begin(), w1->dims().end()) ==
+              std::vector<int64_t>({kK, kK}),
+          "it keeps the weight's storage layout");
+    Check(FloatsOf(*w1) == std::vector<float>(kK * kK, 0.1234f),
+          "the trained tensor is stored verbatim -- no rounding, no grid");
+  }
+  // The second layer was fed its warm start, so it comes back as it went in.
+  const onnx::TensorProto* w2 = FindInitializer(tuned, "W2");
+  Check(w2 != nullptr &&
+            FloatsOf(*w2) == std::vector<float>(kK * kN, kStudentWeight),
+        "an untrained-away weight is written back unchanged");
+  // Nothing else in the model was touched: there is no scale and no code
+  // array for this scheme to rewrite.
+  const onnx::TensorProto* norm_before = FindInitializer(student, "LnS");
+  const onnx::TensorProto* norm_after = FindInitializer(tuned, "LnS");
+  Check(norm_before != nullptr && norm_after != nullptr &&
+            norm_before->SerializeAsString() == norm_after->SerializeAsString(),
+        "the block's untrained constants are left byte-identical");
+}
+
+// The two scale flags each name a parameter of a quantizer, and fake_quant off
+// is the mode with no quantizer in it. Ignoring them would be the worse
+// failure of the two available: a caller who asked to learn scales and got a
+// model whose scales are exactly as they were has no way to tell that from a
+// run in which learning them did not help.
+void TheScaleFlagsAreRefusedRatherThanIgnoredWithoutFakeQuant() {
+  const onnx::ModelProto teacher = FineTuneModel(kTeacherWeight, kTeacherNorm);
+  const onnx::ModelProto student = FineTuneModel(kStudentWeight, kStudentNorm);
+  CheckThrows<std::invalid_argument>(
+      [&] {
+        QatOptions options;
+        options.fake_quant = false;
+        options.learn_scales = true;
+        BuildQatStepGraph(teacher, student, "X", "Y", kRows, options);
+      },
+      "learn_scales cannot be used with fake_quant=False",
+      "learn_scales without a fake-quant is refused");
+  CheckThrows<std::invalid_argument>(
+      [&] {
+        QatOptions options;
+        options.fake_quant = false;
+        options.learn_activation_scales = true;
+        BuildQatStepGraph(teacher, student, "X", "Y", kRows, options);
+      },
+      "learn_activation_scales cannot be used with fake_quant=False",
+      "learn_activation_scales without a fake-quant is refused");
+  CheckThrows<std::invalid_argument>(
+      [&] {
+        QatOptions options;
+        options.fake_quant = false;
+        options.learn_scales = true;
+        options.learn_activation_scales = true;
+        BuildQatStepGraph(teacher, student, "X", "Y", kRows, options);
+      },
+      "learn_scales and learn_activation_scales cannot be used",
+      "both flags at once are named together");
+}
+
+// A block with nothing to fine-tune is refused in terms of *this* scheme: the
+// caller's model has no MatMul/Gemm whose weight is a stored 2-D fp32 tensor,
+// which is a different problem from having no quantized layer and reads as
+// one.
+void ABlockWithNoFloatWeightToFineTuneIsRefusedInThoseTerms() {
+  QatOptions options;
+  options.fake_quant = false;
+  CheckThrows<std::invalid_argument>(
+      [&] {
+        // The INT4 student's MatMul reads a DequantizeLinear's output, not an
+        // initializer, so there is no stored weight for the optimizer to hold.
+        BuildQatStepGraph(FloatModel(), Int4QuantizedModel(), "X", "Y", kRows,
+                          options);
+      },
+      "contains no MatMul/Gemm with a 2-D fp32 weight initializer to fine-tune",
+      "a block with no stored float weight is refused in the scheme's terms");
+}
+
 // A node with no gradient rule must be refused by op type, before any of the
 // expensive work -- and the message must name both the offender and the
 // supported set, or the caller has to go read graph_grad to find out what to
@@ -801,6 +1048,11 @@ int main() {
   AMinibatchedBlockGathersItsRowsOutOfResidentTables();
   TrainingActivationQuantizersPlansBothOfTheirParameters();
   ADeeperBlockTrainsEveryLayerAndCapturesTheResidual();
+  AFloatBlockFineTunesWithNoQuantizerInTheStepGraph();
+  UntrainedBlockConstantsComeFromTheStudentWhenFineTuning();
+  FineTunedWeightsAreWrittenBackAsFloatUnderTheirOwnName();
+  TheScaleFlagsAreRefusedRatherThanIgnoredWithoutFakeQuant();
+  ABlockWithNoFloatWeightToFineTuneIsRefusedInThoseTerms();
   ABlockContainingAnUndifferentiableOpIsRefusedByOpType();
   ABlockWithNoQuantizedLayerIsRefused();
   EachSchemeMismatchIsNamedRatherThanReportedAsABoundaryError();

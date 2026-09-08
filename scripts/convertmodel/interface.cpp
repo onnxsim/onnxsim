@@ -1149,15 +1149,26 @@ em::val onnxsim_quantize_qoperator(const std::string &data, em::val names_ary,
 
 // QatOptions as a plain JS object with named fields:
 //
-//   { learnScales, learnActivationScales, batchSize, batchSeed, shuffle }
+//   { learnScales, learnActivationScales, fakeQuant, batchSize, batchSeed,
+//     shuffle }
 //
-// Named fields rather than five positional arguments because they are
+// Named fields rather than six positional arguments because they are
 // independent knobs that each already have a default: an absent (or
 // null/undefined) field keeps QatOptions' own, so `{}` means "full batch,
 // train the weights only" -- apply_qat's default -- and a caller that wants
 // one knob writes one field. `batchSize`/`batchSeed` arrive as JS numbers
 // (doubles) and are truncated to the int64 fields they feed; nothing here is
 // large enough for that to lose anything.
+//
+// `fakeQuant: false` is the one field that changes what the two model
+// arguments mean rather than adding a knob: the quantizer comes out of the
+// middle and the second model's own float MatMul/Gemm weights are trained
+// against the first model's activations -- apply_block_finetune, so the page
+// can fine-tune a pruned or otherwise altered model and not only quantize
+// one. It cannot be combined with either scale flag (there is no quantizer
+// left for them to name); BuildQatStepGraph refuses that pairing and the
+// binding returns null with the reason on the console, as it does for every
+// other refusal.
 QatOptions QatOptionsFromVal(em::val options) {
   QatOptions out;
   if (options.isUndefined() || options.isNull())
@@ -1174,6 +1185,7 @@ QatOptions QatOptionsFromVal(em::val options) {
   };
   read_bool("learnScales", out.learn_scales);
   read_bool("learnActivationScales", out.learn_activation_scales);
+  read_bool("fakeQuant", out.fake_quant);
   read_int("batchSize", out.batch_size);
   read_int("batchSeed", out.batch_seed);
   read_bool("shuffle", out.shuffle);

@@ -54,6 +54,19 @@
 struct QatOptions {
   bool learn_scales = false;
   bool learn_activation_scales = false;
+  // With false, drop the fake-quantizer and train the *second model's own
+  // float weights* directly -- apply_block_finetune rather than apply_qat.
+  // Everything else here (the teacher, the reconstruction loss, the backward,
+  // Adam, the minibatch) is unchanged, so this is the same block-wise,
+  // label-free distillation with the quantizer taken out of the middle: plain
+  // fine-tuning. The trainable layers stop being the quantized ones and become
+  // the *quantized_model* argument's own MatMul/Gemms whose weight is a 2-D
+  // fp32 initializer -- scanned out of the student, and seeded from the
+  // student, because its weights are the starting point precisely by *not*
+  // being the teacher's (they were pruned, or simplified, or already tuned).
+  // Incompatible with the two flags above, which have no scales to learn:
+  // asking for either alongside this is refused rather than ignored.
+  bool fake_quant = true;
   // Rows per optimizer step. 0 means full batch, which is the default and the
   // only mode with no per-step input beyond the scalars.
   int64_t batch_size = 0;
@@ -93,6 +106,11 @@ struct QatCapture {
 // *is* a block-wise scale whose block spans the whole reduction axis, so INT4's
 // 32-element blocks and INT8's per-channel scales are both just
 // (block_axis, block_size, grid), and the write-back needs no special case.
+//
+// The third scheme -- QatOptions::fake_quant off -- normalizes away
+// differently: see `fake_quant` below. There is nothing between the master
+// weight and the stored tensor there, so the trained tensor *is* the stored
+// tensor, and every field describing a quantizer is unread.
 struct QatTrainedLayer {
   // Loop state inputs. The last three are empty when not trained.
   std::string weight_state_input;
@@ -101,6 +119,9 @@ struct QatTrainedLayer {
   std::string act_zero_point_state_input;
 
   // Initializers in the quantized model these write back into.
+  // `codes_initializer` names the weight initializer itself when `fake_quant`
+  // is off, since then the write-back stores the trained fp32 tensor rather
+  // than codes derived from it.
   std::string codes_initializer;
   std::string weight_scale_initializer;
   std::string act_scale_initializer;
@@ -119,6 +140,16 @@ struct QatTrainedLayer {
   // The weight scale as the model currently stores it. Needed to re-derive
   // codes when learn_scales is off, since then no state tensor carries it.
   onnx::TensorProto frozen_weight_scale;
+  // QatOptions::fake_quant, carried per layer because it is what the
+  // write-back branches on. With it false there is no quantizer between the
+  // master weight and what the model stores, so WriteBackQatState writes
+  // `weight_state_input`'s final value straight back as a FLOAT initializer
+  // named `codes_initializer`: no rounding, no clipping to a code grid, and no
+  // scale -- the trained tensor is the stored tensor. Every quantizer field
+  // above is then unread, and carries a value chosen to fail loudly rather
+  // than plausibly if some future caller reads one anyway (a `block_size` of
+  // 0, an empty code grid), exactly as qat.py's _from_float does.
+  bool fake_quant = true;
 };
 
 // Everything needed to run the loop and then write its result back.
@@ -139,6 +170,10 @@ struct QatStepPlan {
   // Seeding from the float weight rather than the quantized one is what makes
   // step 0 reproduce round-to-nearest exactly, so every later step is a
   // measured improvement on it rather than on an arbitrary re-initialization.
+  // With QatOptions::fake_quant off the seed is the *student's* own weight
+  // instead, and for the same kind of reason: there is no encoding to invert,
+  // and the student's weights are the starting point precisely by not being
+  // the teacher's.
   std::vector<onnx::TensorProto> initial_state;
   // The minibatch row index input, when batch_size > 0. Empty otherwise.
   // It is rank-1 int64 and is the only non-float input a step graph ever has.
@@ -163,6 +198,10 @@ struct QatStepPlan {
 // slice contains no layer of the scheme `options` selects -- including the
 // case where the caller asked for activation training over a weight-only
 // model, which is a scheme error rather than a boundary error and says so.
+// `options.fake_quant` off with either scale flag on is refused the same way,
+// and for the same reason it is refused rather than ignored in the Python:
+// both flags name a parameter of a quantizer, and that is the mode with no
+// quantizer in it.
 QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
                               const onnx::ModelProto& quantized_model,
                               const std::string& block_input_name,
@@ -181,7 +220,10 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
 // rounded and clipped to the grid, the activation scale taken out of log
 // space, the zero-point rounded onto uint8's integer grid -- for the reason
 // qat.py does them here too: the optimizer needs those parameters continuous,
-// and the model can only hold what it can hold.
+// and the model can only hold what it can hold. A layer trained with
+// `fake_quant` off has no such projection to make: its trained master weight
+// is written back verbatim as a FLOAT initializer, which is the identity the
+// two quantized schemes' rounding and clipping stand in for.
 onnx::ModelProto WriteBackQatState(
     const onnx::ModelProto& quantized_model, const QatStepPlan& plan,
     const std::map<std::string, onnx::TensorProto>& final_state);

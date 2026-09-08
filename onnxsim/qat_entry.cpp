@@ -303,6 +303,13 @@ struct QuantizedLayer {
   float n_max = 0.0f;
   bool packed_int4 = false;
   ActQuant act;
+  // Whether the step graph fake-quantizes this layer's weight on the way into
+  // the block -- qat.py's _QuantizedLayer.fake_quant. False is FromFloat's
+  // third scheme: the block reads the master weight directly, the
+  // straight-through estimator has nothing to pass through, and the write-back
+  // stores fp32 rather than codes. Every field above describing the quantizer
+  // is then unread; see FromFloat for the values they carry instead.
+  bool fake_quant = true;
 };
 
 // adaround.py's _find_int4_matmul_candidates, already turned into the
@@ -484,12 +491,88 @@ std::vector<QuantizedLayer> FindStaticLayers(
   return layers;
 }
 
-// qat.py's _find_layers. The two finders are mutually exclusive by
+// A plain, unquantized MatMul/Gemm -- qat.py's _from_float, the scheme that
+// makes this a fine-tuner rather than only a quantizer.
+//
+// Everything downstream is already written against "a master weight the block
+// reads and an optimizer updates"; quantization is what sits *between* those
+// two, and QuantizedLayer::fake_quant is the switch that removes it. So this
+// only says which weight is trainable and where it is written back -- which,
+// with no code array in the picture, is the weight initializer itself.
+//
+// The quantizer fields are unread here, and are filled in with values chosen
+// to *break* rather than to look plausible, exactly as the Python's are: a
+// block_size of 0 makes the write-back's block indexing degenerate and
+// n_min == n_max == 0 makes a fake-quant forward produce all zeros. A
+// neutral-looking block_size of 1 with a unit scale would instead round the
+// weights to integers and train on quietly, which is the failure mode worth
+// ruling out: it is wrong, and it looks like a model that merely trained
+// badly.
+QuantizedLayer FromFloat(const onnx::NodeProto& node,
+                         const onnx::TensorProto& w_init) {
+  QuantizedLayer layer;
+  layer.output_name = node.output(0);
+  layer.float_node = node;
+  layer.w_float_init = w_init;
+  // There is no separate code array: the tensor trained and the tensor written
+  // back are the same one.
+  layer.wq_name = w_init.name();
+  layer.ws_name = "";
+  layer.scale_dims = Shape{1, 1};
+  layer.scale_2d = {0.0f};
+  layer.axis = 0;
+  layer.block_size = 0;
+  layer.n_min = 0.0f;
+  layer.n_max = 0.0f;
+  layer.packed_int4 = false;
+  layer.fake_quant = false;
+  return layer;
+}
+
+// qat.py's _find_float_layers: every plain MatMul/Gemm in `model` whose weight
+// is a 2-D fp32 initializer.
+//
+// Scanned out of the *student* rather than the teacher, unlike the two
+// quantized schemes, and that is the substantive difference between
+// fine-tuning and QAT rather than an implementation detail. QAT seeds its
+// master weights from the teacher because the student's weights are a lossy
+// encoding of them. Fine-tuning has no such relationship: the student's
+// weights are the starting point precisely because they are *not* the
+// teacher's -- they were pruned, or simplified, or already tuned -- and
+// re-seeding from the teacher would throw that away before the first step.
+//
+// Rank-2 and fp32 are required for the same reason the other two schemes
+// require them: the loop carries the weight as a 2-D fp32 state tensor, and a
+// layer this does not recognize is simply not trained.
+std::vector<QuantizedLayer> FindFloatLayers(const onnx::ModelProto& model) {
+  const auto initializers = InitializerIndex(model.graph());
+  std::vector<QuantizedLayer> layers;
+  for (const onnx::NodeProto& node : model.graph().node()) {
+    if ((node.op_type() != "MatMul" && node.op_type() != "Gemm") ||
+        node.input_size() < 2) {
+      continue;
+    }
+    if (node.output_size() == 0 || node.output(0).empty()) continue;
+    const onnx::TensorProto* w_init = Lookup(initializers, node.input(1));
+    if (w_init == nullptr) continue;
+    if (w_init->data_type() != onnx::TensorProto::FLOAT ||
+        w_init->dims_size() != 2) {
+      continue;
+    }
+    layers.push_back(FromFloat(node, *w_init));
+  }
+  return layers;
+}
+
+// qat.py's _find_layers. The two quantized finders are mutually exclusive by
 // construction, so this selects rather than merges; which one is selected is
-// the single decision learn_activation_scales makes.
+// the single decision learn_activation_scales makes. fake_quant=false selects
+// neither: it is the third scheme, in which there is nothing quantized to look
+// for and the trainable layers are just the student's own float ones.
 std::vector<QuantizedLayer> FindLayers(const onnx::ModelProto& float_model,
                                        const onnx::ModelProto& quantized_model,
-                                       bool activation_quant) {
+                                       bool activation_quant, bool fake_quant) {
+  if (!fake_quant) return FindFloatLayers(quantized_model);
   return activation_quant ? FindStaticLayers(float_model, quantized_model)
                           : FindInt4Layers(float_model, quantized_model);
 }
@@ -1004,9 +1087,17 @@ std::string NoLayersMessage(const onnx::ModelProto& float_model,
                             const onnx::ModelProto& quantized_model,
                             const std::string& block_input_name,
                             const std::string& block_output_name,
-                            bool learn_activation_scales) {
+                            bool learn_activation_scales, bool fake_quant) {
   const std::string where = "the block between " + Quoted(block_input_name) +
                             " and " + Quoted(block_output_name);
+  if (!fake_quant) {
+    return where +
+           " contains no MatMul/Gemm with a 2-D fp32 weight initializer to "
+           "fine-tune (fake_quant=False trains the model's own float weights, "
+           "so a layer whose weight is computed rather than stored, or stored "
+           "at some other rank or dtype, has nothing for the optimizer to "
+           "hold)";
+  }
   if (learn_activation_scales) {
     if (!FindInt4Layers(float_model, quantized_model).empty()) {
       return "learn_activation_scales targets onnxsim.quantize_static's QDQ "
@@ -1034,6 +1125,30 @@ std::string NoLayersMessage(const onnx::ModelProto& float_model,
   return message;
 }
 
+// qat.py's _refuse_quantizer_flags_without_fake_quant. fake_quant=false and
+// the two scale flags are a contradiction, not a combination: both flags name
+// a parameter of a quantizer, and with the fake-quant gone there is no
+// quantizer for them to name. Silently ignoring them would be the worse
+// failure of the two available -- a caller who asked to learn scales and got a
+// model whose scales are exactly as they were has no way to tell that from a
+// run in which learning them did not help.
+void RefuseQuantizerFlagsWithoutFakeQuant(bool fake_quant, bool learn_scales,
+                                          bool learn_activation_scales) {
+  if (fake_quant) return;
+  std::string asked;
+  if (learn_scales) asked = "learn_scales";
+  if (learn_activation_scales) {
+    if (!asked.empty()) asked += " and ";
+    asked += "learn_activation_scales";
+  }
+  if (asked.empty()) return;
+  throw std::invalid_argument(
+      asked +
+      " cannot be used with fake_quant=False: both train a quantizer's "
+      "parameters, and fake_quant=False is the mode with no quantizer in it. "
+      "Fine-tuning trains the weights themselves.");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1161,8 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
                               const std::string& block_input_name,
                               const std::string& block_output_name,
                               int64_t num_rows, const QatOptions& options) {
+  RefuseQuantizerFlagsWithoutFakeQuant(options.fake_quant, options.learn_scales,
+                                       options.learn_activation_scales);
   if (num_rows < 1) {
     throw std::invalid_argument("num_rows must be at least 1, got " +
                                 std::to_string(num_rows));
@@ -1072,16 +1189,17 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     }
   }
   std::vector<QuantizedLayer> candidates;
-  for (QuantizedLayer& layer : FindLayers(float_model, quantized_model,
-                                          options.learn_activation_scales)) {
+  for (QuantizedLayer& layer :
+       FindLayers(float_model, quantized_model, options.learn_activation_scales,
+                  options.fake_quant)) {
     if (slice_outputs.count(layer.output_name) != 0) {
       candidates.push_back(std::move(layer));
     }
   }
   if (candidates.empty()) {
-    throw std::invalid_argument(
-        NoLayersMessage(float_model, quantized_model, block_input_name,
-                        block_output_name, options.learn_activation_scales));
+    throw std::invalid_argument(NoLayersMessage(
+        float_model, quantized_model, block_input_name, block_output_name,
+        options.learn_activation_scales, options.fake_quant));
   }
 
   // --- shapes ------------------------------------------------------------
@@ -1156,7 +1274,16 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
 
   // --- _build_step_graph -------------------------------------------------
   GraphBuilder b(kPrefix);
-  for (const onnx::TensorProto& t : float_model.graph().initializer()) {
+  // The block's *untrained* constants -- a LayerNorm's scale and bias, a
+  // Gemm's C -- come from whichever model the trained weights came from, and
+  // for the same reason. Under QAT that is the teacher, whose weights the
+  // student encodes. Under fine-tuning it is the student, because the student
+  // is a different model and quietly substituting the teacher's constants into
+  // it would train the block to compensate for a substitution the deployed
+  // model does not make. qat.py's constant_source.
+  const onnx::ModelProto& constant_source =
+      options.fake_quant ? float_model : quantized_model;
+  for (const onnx::TensorProto& t : constant_source.graph().initializer()) {
     if (used.count(t.name()) != 0 &&
         trained_weight_names.count(t.name()) == 0) {
       b.initializer().push_back(t);
@@ -1202,14 +1329,40 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   // 1. Fake-quantize each trained master weight into the tensor name the
   //    block's own node already reads, so the block's nodes need no rewriting
   //    at all -- the weight initializer simply became a computed value.
+  //    `fq` is meaningful only when this layer has a fake-quant; step 5
+  //    branches on `fake_quant` exactly where qat.py branches on its `active`
+  //    slot being None.
   struct PerLayer {
     Trained* t;
+    // The tensor this layer's gradient arrives on: the block's own weight
+    // name, or -- with no fake-quant between them -- the master weight itself.
     std::string weight_name;
     std::string scale_full;
     FakeQuant fq;
+    bool fake_quant = true;
   };
   std::vector<PerLayer> per_layer;
+  // Block tensor name -> what the block's own node should read instead. Only
+  // fake_quant=false puts anything here: the master weight is substituted for
+  // the weight initializer by *renaming one input*, rather than by emitting an
+  // Identity, because Identity is not in EpFriendlyOps -- a node whose whole
+  // job is to copy a tensor is a node an execution provider would have to
+  // implement for no reason.
+  std::map<std::string, std::string> weight_rewrites;
+  ShapeMap weight_shapes;
   for (Trained& t : trained) {
+    if (!t.candidate->fake_quant) {
+      const std::string weight_name = t.candidate->float_node.input(1);
+      weight_rewrites[weight_name] = t.w_input;
+      // The master weight is now a differentiated *leaf* of the block rather
+      // than a value computed inside it, so the backward needs its shape the
+      // way it needs the block's own tensors'.
+      weight_shapes[t.w_input] = t.w_shape;
+      // No quantizer, so no straight-through mask: step 5 uses the raw
+      // gradient.
+      per_layer.push_back({&t, t.w_input, "", FakeQuant(), false});
+      continue;
+    }
     const int64_t block_size = t.candidate->block_size;
     const std::string scale =
         t.scale_input.empty() ? b.Const(t.scale_init, t.scale_shape, "scale")
@@ -1219,7 +1372,7 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     const std::string weight_name = t.candidate->float_node.input(1);
     const FakeQuant fq = EmitFakeQuant(b, t.w_input, scale_full, weight_name,
                                        t.candidate->n_min, t.candidate->n_max);
-    per_layer.push_back({&t, weight_name, scale_full, fq});
+    per_layer.push_back({&t, weight_name, scale_full, fq, true});
   }
 
   // 2. The block itself, node for node as the float graph wrote it -- except
@@ -1227,6 +1380,8 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   //    fake-quantized copy of its own input instead of the raw tensor. Only
   //    that one node is rewritten (one input name), so the quantizer lands on
   //    the *edge* the deployed QDQ pair occupies rather than on the tensor.
+  //    With no fake-quant, one more input name is rewritten per trained
+  //    layer: the weight the block reads becomes the master weight.
   ShapeMap act_shapes;
   std::map<std::string, Trained*> quantized_input;
   for (Trained& t : trained) {
@@ -1258,6 +1413,10 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
       act_shapes.insert(emitted.shapes.begin(), emitted.shapes.end());
       node.set_input(0, emitted.xdq);
     }
+    for (int i = 0; i < node.input_size(); ++i) {
+      const auto rewrite = weight_rewrites.find(node.input(i));
+      if (rewrite != weight_rewrites.end()) node.set_input(i, rewrite->second);
+    }
     forward.push_back(node);
     differentiated.push_back(node);
   }
@@ -1280,6 +1439,8 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   //    fake-quant chain.
   ShapeMap all_shapes = shapes;
   for (const auto& entry : act_shapes) all_shapes[entry.first] = entry.second;
+  for (const auto& entry : weight_shapes)
+    all_shapes[entry.first] = entry.second;
   std::vector<std::string> targets;
   for (const PerLayer& layer : per_layer) targets.push_back(layer.weight_name);
   for (const Trained& t : trained) {
@@ -1310,8 +1471,9 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     // STE: d(w_hat)/d(w) is 1 inside the clipping range and 0 outside. The
     // scale cancels -- w_hat = round(w/s)*s -- which is why a straight-through
     // weight gradient is just the masked output gradient, with no scale factor
-    // anywhere.
-    const std::string masked = b.Mul(g, layer.fq.active);
+    // anywhere. Without a fake-quant there is no clipping range and no
+    // estimator: `g` is already dL/dw.
+    const std::string masked = layer.fake_quant ? b.Mul(g, layer.fq.active) : g;
     const AdamOutputs w_step =
         AdamUpdate(b, t.w_input, masked, t.m_input, t.v_input, lr,
                    "m_correction", "v_correction");
@@ -1459,6 +1621,7 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     layer.packed_int4 = t.candidate->packed_int4;
     layer.frozen_weight_scale = MakeFloatTensor(
         t.candidate->ws_name, t.scale_shape, t.candidate->scale_2d);
+    layer.fake_quant = t.candidate->fake_quant;
     plan.layers.push_back(std::move(layer));
   }
   return plan;
@@ -1485,6 +1648,9 @@ onnx::ModelProto WriteBackQatState(
   // first so a layer naming an initializer the model does not have is a
   // no-op rather than a partial rewrite, exactly as the Python's dict lookup
   // over the initializer list is.
+  // Keyed by initializer, and already built as the tensor that replaces it:
+  // fp32, under the layer's own name, with the dims the plan carries.
+  std::map<std::string, onnx::TensorProto> new_weights;
   std::map<std::string, std::vector<int8_t>> new_codes;
   std::map<std::string, std::vector<double>> new_scales;
   std::map<std::string, double> new_act_scales;
@@ -1493,6 +1659,23 @@ onnx::ModelProto WriteBackQatState(
   for (const QatTrainedLayer& layer : plan.layers) {
     const std::vector<double> w =
         TensorValues(state_of(layer.weight_state_input));
+    if (!layer.fake_quant) {
+      // Nothing to project back onto: the master weight *is* what the model
+      // stores, so the write-back is the identity that the two quantized
+      // schemes' rounding and clipping stand in for.
+      if (static_cast<int64_t>(w.size()) != ElementCount(layer.weight_dims)) {
+        throw std::invalid_argument(
+            "the trained weight " + Quoted(layer.weight_state_input) + " has " +
+            std::to_string(w.size()) + " elements, expected " +
+            std::to_string(ElementCount(layer.weight_dims)));
+      }
+      std::vector<float> values;
+      values.reserve(w.size());
+      for (double v : w) values.push_back(static_cast<float>(v));
+      new_weights[layer.codes_initializer] =
+          MakeFloatTensor(layer.codes_initializer, layer.weight_dims, values);
+      continue;
+    }
     const std::vector<double> scale =
         layer.weight_scale_state_input.empty()
             ? TensorValues(layer.frozen_weight_scale)
@@ -1559,6 +1742,15 @@ onnx::ModelProto WriteBackQatState(
   onnx::ModelProto tuned = quantized_model;
   for (onnx::TensorProto& initializer :
        *tuned.mutable_graph()->mutable_initializer()) {
+    const auto weight = new_weights.find(initializer.name());
+    if (weight != new_weights.end()) {
+      // The tensor the loop trained, stored as itself. The initializer is
+      // replaced wholesale rather than patched -- numpy_helper.from_array's
+      // own rewrite in the Python -- so a weight the model happened to store
+      // some other way (in float_data, say) comes out canonical raw fp32.
+      initializer = weight->second;
+      continue;
+    }
     const auto codes = new_codes.find(initializer.name());
     if (codes != new_codes.end()) {
       if (initializer.data_type() == onnx::TensorProto::INT4) {
