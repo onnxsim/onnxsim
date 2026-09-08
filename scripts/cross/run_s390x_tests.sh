@@ -68,17 +68,6 @@ rm -rf "${SYSROOT}/work/tests"
 cp -r "${REPO_ROOT}/tests" "${SYSROOT}/work/tests"
 cp "${REPO_ROOT}/pyproject.toml" "${SYSROOT}/work/"
 
-# tests/test_check_decode_parity.py imports check_decode_parity from
-# scripts/apple/ at module scope (see that test file's sys.path.insert).
-# Copy just that one module in, not the rest of scripts/apple/ -- its
-# siblings (export_llm_to_coreml.py, coreml_backend.py, ...) pull in
-# coremltools/torch/transformers, which have no s390x build.
-# check_decode_parity.py itself only imports argparse/sys/pathlib, so it's
-# safe to run standalone here.
-rm -rf "${SYSROOT}/work/scripts"
-mkdir -p "${SYSROOT}/work/scripts/apple"
-cp "${REPO_ROOT}/scripts/apple/check_decode_parity.py" "${SYSROOT}/work/scripts/apple/"
-
 echo "== environment =="
 chroot "${SYSROOT}" /bin/sh -c 'cd /work && PYTHONPATH=/work/pylibs python3 -c "
 import sys, numpy, onnx, onnxsim
@@ -87,33 +76,79 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
       \"| onnxsim\", onnxsim.__version__)
 "'
 
-# torch, timm and onnxruntime have no s390x builds, so the test modules that
-# import them at module scope cannot be collected here. test_qnn_compat,
-# test_coreml_compat, test_migraphx_compat and test_openvino_compat each
-# import their vendor backend module (e.g. ``coreml_backend``) and a ``models``
-# fixture module from a sibling scripts/<vendor>/ directory at module scope --
-# above, only tests/ and pyproject.toml are copied into the chroot, so none of
-# those imports resolve there regardless of what's pip-installed. Same story
-# for test_check_decode_parity.py, which imports scripts/apple/check_decode_parity
-# at module scope, and test_compute_retention.py, test_run_quality_eval.py and
-# test_aggregate_quality_trend.py, which import scripts/apple/compute_retention,
-# scripts/apple/run_quality_eval and scripts/apple/aggregate_quality_trend the
-# same way. test_rtdetrv4.py imports onnxruntime directly at module scope for
-# the same "no s390x build" reason as test_qnn_compat.py and friends above.
-# test_pulsar2_compat.py and test_pulsar2_simulator.py import pulsar2_backend/
-# pulsar2_simulator from scripts/axera/ at module scope, the identical "vendor
-# module not copied into the chroot" reason as the four vendor-compat tests
-# above. test_axera_conv_matmul_coverage.py (pulsar2_backend),
-# test_axera_conv_matmul_coverage_hardware.py, test_axera_neu_format_arith_ops.py,
-# test_pulsar2_hf_to_axmodel.py, test_axera_op_coverage_hardware.py,
-# test_axera_quantonnx.py and test_axera_mcode_structure.py (all: pulsar2_docker)
-# are the same scripts/axera/ vendor-module gap. Unlike the tests that guard a
-# missing dependency with pytest.importorskip (a skip), an unguarded import like
-# these is a *collection error*, which aborts the whole run -- so a new test in
-# this family has to be added here. test_tflite_export_torchvision.py imports
-# torch directly at module scope, the same "no s390x build" reason as
-# test_torch_export_integration.py/test_timm.py/test_yolo.py/test_gan.py above.
+# This job exists to catch raw_data/DLPack byte-order bugs in onnxsim's own
+# simplify() pipeline (see docs/big-endian.md) -- not to re-run the whole repo's
+# test suite under qemu, which is both slow (an emulated big-endian run costs
+# real CI minutes) and pointless for the huge majority of tests here: the
+# quantization-algorithm, pruning-algorithm, hardware-backend-export/compat and
+# LLM/GGUF-reconstruction suites operate on plain numpy arrays and Python
+# floats, never touch TensorProto.raw_data or the DLPack bridge, and so cannot
+# tell little-endian and big-endian apart. Running them here would only add
+# emulation cost and unrelated flakiness without adding coverage.
 #
+# So, rather than "run everything, --ignore/--deselect what doesn't fit" (which
+# silently regrows every time a new experimental test file with an unguarded
+# heavy import lands), this selects an explicit allowlist of core-simplify
+# test files: the CLI/Python API surface, the default-on and opt-in graph
+# rewrite/fusion passes (fuse_attention, fuse_gqa, fuse_split_gather_concat,
+# rewrite_bool_where, split_large_gather, the *_to_gather/*_to_gridsample
+# rewrites), shape inference and contrib-op schema registration
+# (moe_contrib_schema), the function/custom rewriter engine, model
+# checking/info/memory-planning/backend dispatch, profiling, and the
+# raw_data-adjacent external-data loading path (test_onnx_safetensors_input.py).
+# A new test file for one of *these* areas belongs in CORE_TESTS below; a new
+# test file for a quantization scheme, pruning algorithm, hardware backend, or
+# model-export/reconstruction feature does not need to be added here at all.
+#
+# test_python_api.py and test_simple.py would otherwise belong on this list --
+# they exercise simplify()'s own basics -- but both import torch/torchvision at
+# module scope unguarded, which is a collection error (not a skip) with no
+# s390x torch build available; excluded for that reason, same as every other
+# torch/onnxruntime-dependent file that isn't on the list.
+CORE_TESTS="
+  tests/test_backend.py
+  tests/test_constant_fold_determinism.py
+  tests/test_custom_rewriter.py
+  tests/test_deform_conv_to_gather.py
+  tests/test_free_threading.py
+  tests/test_function_body_inference.py
+  tests/test_function_rewriter.py
+  tests/test_function_rewriter_common_rules.py
+  tests/test_function_rewriter_compile_rule.py
+  tests/test_function_rewriter_onnxscript_script.py
+  tests/test_function_rewriter_vs_onnxscript.py
+  tests/test_fuse_attention.py
+  tests/test_fuse_gqa.py
+  tests/test_fuse_split_gather_concat.py
+  tests/test_fusion_patterns.py
+  tests/test_gather_over_concat.py
+  tests/test_gatherelements_to_gather.py
+  tests/test_gathernd_to_gather.py
+  tests/test_gridsample_to_gather.py
+  tests/test_memory_planning.py
+  tests/test_model_checking.py
+  tests/test_model_info.py
+  tests/test_moe_contrib_schema.py
+  tests/test_moved_optimizer_passes.py
+  tests/test_msdeformattn_to_gridsample.py
+  tests/test_onnx_compat.py
+  tests/test_onnx_safetensors_input.py
+  tests/test_optimize_pipeline.py
+  tests/test_profile_merge.py
+  tests/test_profile_plot.py
+  tests/test_profiling.py
+  tests/test_pruning.py
+  tests/test_rewrite_bool_where.py
+  tests/test_rich_optional.py
+  tests/test_split_large_gather.py
+  tests/test_symexpr_kv_cache_consistency.py
+"
+# Collapsed to single-space-separated on one line: the string below is spliced
+# into a /bin/sh -c "..." script (see the pytest invocation further down), and
+# an embedded literal newline there would end the pytest command partway
+# through its argument list rather than just separating two paths.
+CORE_TESTS="$(printf '%s' "${CORE_TESTS}" | tr '\n' ' ')"
+
 # The three deselected BN-fusion tests fail onnxsim's own check_n equivalence
 # check whenever onnxruntime is absent and the reference evaluator is used
 # instead -- identically on x86_64, so this is not a byte-order problem and
@@ -124,14 +159,6 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # x86_64 run of the exact same commit -- a pre-existing GatherElements ->
 # Gather rewrite/reference-evaluator disagreement unrelated to byte order,
 # already noted as a known-flaky case before this deselect was added.
-# The six deselected test_ppq_compat.py
-# tests are the same "onnxruntime has no s390x build" gap, just at
-# call-time rather than collection-time: onnxsim/calibration.py imports
-# onnxruntime lazily inside the function these tests actually exercise
-# (real PPQ calibration/quantization), unlike test_ppq_compat.py's other,
-# still-collected tests, which only exercise its argument-validation and
-# platform-name plumbing and never reach that import. Everything else must
-# pass, so a genuine big-endian regression still turns this red.
 
 # tests/conftest.py mirrors the slowest-test table into $GITHUB_STEP_SUMMARY,
 # opening it unconditionally once the variable is set. In CI that path is on the
@@ -145,35 +172,10 @@ CHROOT_SUMMARY=/work/step-summary.md
 echo "== pytest =="
 set +e
 chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY} \
-  PYTHONPATH=/work/pylibs python3 -m pytest tests -p no:cacheprovider \
-  --ignore=tests/test_mnn_llm_export.py --ignore=tests/test_python_api.py --ignore=tests/test_rfdetr.py \
-  --ignore=tests/test_simple.py --ignore=tests/test_timm.py \
-  --ignore=tests/test_torch_export_integration.py --ignore=tests/test_yolo.py \
-  --ignore=tests/test_gan.py \
-  --ignore=tests/test_qnn_compat.py --ignore=tests/test_modelopt_integration.py \
-  --ignore=tests/test_mmdeploy_integration.py \
-  --ignore=tests/test_coreml_compat.py --ignore=tests/test_migraphx_compat.py \
-  --ignore=tests/test_openvino_compat.py --ignore=tests/test_check_decode_parity.py \
-  --ignore=tests/test_compute_retention.py --ignore=tests/test_rtdetrv4.py \
-  --ignore=tests/test_run_quality_eval.py --ignore=tests/test_aggregate_quality_trend.py \
-  --ignore=tests/test_pulsar2_compat.py --ignore=tests/test_pulsar2_simulator.py \
-  --ignore=tests/test_axera_conv_matmul_coverage.py \
-  --ignore=tests/test_axera_conv_matmul_coverage_hardware.py \
-  --ignore=tests/test_axera_neu_format_arith_ops.py \
-  --ignore=tests/test_pulsar2_hf_to_axmodel.py \
-  --ignore=tests/test_axera_op_coverage_hardware.py \
-  --ignore=tests/test_axera_quantonnx.py \
-  --ignore=tests/test_axera_mcode_structure.py \
-  --ignore=tests/test_tflite_export_torchvision.py \
+  PYTHONPATH=/work/pylibs python3 -m pytest ${CORE_TESTS} -p no:cacheprovider \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
   --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_with_bias_bn_into_conv \
-  --deselect tests/test_ppq_compat.py::test_quantize_onnx_model_with_dict_batches \
-  --deselect tests/test_ppq_compat.py::test_quantize_onnx_model_with_raw_array_batches_single_input \
-  --deselect tests/test_ppq_compat.py::test_quantize_onnx_model_with_tuple_batches_multi_input \
-  --deselect tests/test_ppq_compat.py::test_collate_fn_is_applied \
-  --deselect tests/test_ppq_compat.py::test_calib_steps_limits_batches_consumed \
-  --deselect tests/test_ppq_compat.py::test_setting_calib_algorithm_entropy_is_accepted \
   --deselect tests/test_gatherelements_to_gather.py::test_axis_invariant_negative_axis_rewrites ${PYTEST_ARGS:-}"
 pytest_status=$?
 set -e
