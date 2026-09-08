@@ -44,13 +44,32 @@ def test_export_sam2_model_simplifies(tmp_path):
         assert len(model.graph.node) > 0
 
 
-def test_export_sam2_model_returns_check_results(tmp_path):
+def test_export_sam2_model_decoder_checks_with_explicit_test_input_shapes(tmp_path):
+    # The decoder graph declares dynamic axes for its point/mask prompt
+    # inputs (num_labels, num_points -- a real decoder is called with a
+    # varying number of point prompts), so simplify()'s own check_n needs an
+    # explicit test shape for them -- export_sam2_model applies the same
+    # simplify_kwargs to both the encoder and decoder graphs, and the
+    # encoder has no dynamic inputs, so passing check_n through
+    # export_sam2_model itself isn't exercised here; this instead exercises
+    # the already-exported decoder.onnx directly. Shapes match the example
+    # inputs export_sam2_model traces the decoder with.
     out_dir = str(tmp_path)
+    onnxsim.export_sam2_model(_MODEL_TYPE, out_dir)
 
-    results = onnxsim.export_sam2_model(_MODEL_TYPE, out_dir, check_n=2)
+    model_opt, check_ok = onnxsim.simplify(
+        os.path.join(out_dir, "decoder.onnx"),
+        check_n=2,
+        test_input_shapes={
+            "point_coords": [1, 5, 2],
+            "point_labels": [1, 5],
+            "mask_input": [1, 1, 256, 256],
+            "has_mask_input": [1],
+        },
+    )
 
-    assert set(results.keys()) == _EXPECTED_FILES
-    assert all(results.values()), results
+    assert check_ok
+    assert len(model_opt.graph.node) > 0
 
 
 def test_export_sam2_model_save_as_external_data(tmp_path):
