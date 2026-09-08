@@ -1485,7 +1485,12 @@ EMSCRIPTEN_BINDINGS(module) {
   // above, and onnxsim/qat_entry.h for the flow they implement).
   function("onnxsim_qat_build_step_graph", &onnxsim_qat_build_step_graph);
   function("onnxsim_qat_write_back", &onnxsim_qat_write_back);
-  function("onnxsim_qat_release_plan", &onnxsim_qat_release_plan);
+  // Qualified, unlike its two neighbours, and not by preference: the bare
+  // `function` the registrations above use is found by argument-dependent
+  // lookup, which needs an argument type from emscripten's own namespace to
+  // associate it. Every other binding here takes or returns em::val and so
+  // drags it in; this one is bool(int), which associates nothing.
+  em::function("onnxsim_qat_release_plan", &onnxsim_qat_release_plan);
 
   em::register_vector<std::string>("string_list");
 }
