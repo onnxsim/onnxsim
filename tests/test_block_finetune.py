@@ -380,13 +380,18 @@ def test_the_weights_are_written_back_as_floats():
     onnx.checker.check_model(tuned, full_check=True)
 
 
-def test_only_the_matmul_weights_are_touched():
+def test_a_layer_norms_affine_parameters_are_left_alone():
     """A block's other initializers are left byte-identical.
 
-    :func:`onnxsim.qat._find_float_layers` trains MatMul/Gemm weights and
-    nothing else, so a LayerNorm's scale and bias sit inside the block, get
-    differentiated through, and come out unchanged. That boundary is worth
-    pinning: widening it later is a decision, not a refactor.
+    :func:`onnxsim.qat._find_float_layers` trains the weight of a MatMul, Gemm
+    or Conv -- input 1, and only input 1 -- so a LayerNorm's scale and bias sit
+    inside the block, get differentiated through, and come out unchanged.
+
+    That boundary has already moved once: this test was named for MatMul alone
+    until Conv joined the finder, which is the reason it is written against
+    what is *not* trained rather than what is. The list of trained ops will
+    keep growing; "a LayerNorm's affine parameters are not weights" is the
+    claim worth pinning.
     """
     rng = np.random.default_rng(6)
     w1 = rng.normal(0, 0.3, (D, D)).astype(np.float32)
@@ -504,7 +509,7 @@ def test_a_block_with_no_trainable_weight_says_so():
     }}
     """
     model = _model(body, [_f32(rng.normal(0, 0.1, D), "Bias")])
-    with pytest.raises(ValueError, match="no MatMul/Gemm with a 2-D fp32 weight"):
+    with pytest.raises(ValueError, match="no MatMul/Gemm/Conv with an fp32 weight"):
         onnxsim.apply_block_finetune(
             model, model, "X", "Y", calibration_data=_data(rng, batches=1)
         )
@@ -768,3 +773,127 @@ def test_preserve_sparsity_costs_exactly_one_multiply_per_layer():
         consumers = [node for node in graph.node if product in node.input]
         assert product not in outputs
         assert len(consumers) >= 2
+
+
+_CONV_BODY = """
+g (float[2,3,10,10] X) => (float[2,4,8,8] Y) {
+  Y = Conv<kernel_shape = [3, 3], strides = [1, 1], pads = [0, 0, 0, 0]>(X, W, B)
+}
+"""
+
+
+def _conv_model(weight, bias):
+    return _model(_CONV_BODY, [_f32(weight, "W"), _f32(bias, "B")])
+
+
+def test_a_convolutions_own_weight_trains():
+    """The rank-4 case, which is the whole point of letting the finder see Conv.
+
+    ``graph_grad`` gained a ``Conv`` rule so a convolution would stop *splitting*
+    a block; its weight stayed frozen, because the layer finders were
+    MatMul/Gemm with a 2-D initializer. Nothing in the loop actually needed the
+    weight to be 2-D -- the master weight is fed to the block's own node in the
+    layout that node already reads, Adam's moments are ``zeros_like`` it, and
+    the write-back stores it back unchanged -- so the rank restriction was the
+    only thing in the way.
+
+    A single convolution against its own reference is exactly solvable, so this
+    asserts the strong thing: the trained weight converges *onto* the
+    reference's, not merely toward it.
+    """
+    rng = np.random.default_rng(30)
+    weight = rng.normal(0, 0.3, (4, 3, 3, 3)).astype(np.float32)
+    bias = np.zeros(4, np.float32)
+    reference = _conv_model(weight, bias)
+    student = _conv_model(
+        weight + rng.normal(0, 0.15, weight.shape).astype(np.float32), bias
+    )
+    data = [
+        {"X": rng.normal(0, 1, (2, 3, 10, 10)).astype(np.float32)} for _ in range(16)
+    ]
+
+    losses: list = []
+    tuned = onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "X",
+        "Y",
+        calibration_data=data,
+        num_iterations=300,
+        learning_rate=2e-2,
+        losses=losses,
+    )
+
+    after = _init(tuned, "W")
+    assert after.shape == (4, 3, 3, 3)
+    assert losses[-1] < losses[0] / 1000
+    before_gap = np.abs(_init(student, "W") - weight).mean()
+    assert np.abs(after - weight).mean() < before_gap / 10
+    onnx.checker.check_model(tuned, full_check=True)
+
+
+def test_a_convolutions_bias_is_left_alone():
+    """Only input 1 is trained, for Conv as for MatMul and Gemm.
+
+    A Conv's bias is input 2 and a Gemm's ``C`` is likewise untrained. That is
+    a boundary rather than an oversight -- widening it is a decision about what
+    a "layer" is -- so it is pinned here, where a future change to the finder
+    would trip over it.
+    """
+    rng = np.random.default_rng(31)
+    weight = rng.normal(0, 0.3, (4, 3, 3, 3)).astype(np.float32)
+    bias = rng.normal(0, 0.1, 4).astype(np.float32)
+    reference = _conv_model(weight, bias)
+    student = _conv_model(
+        weight + rng.normal(0, 0.15, weight.shape).astype(np.float32), bias
+    )
+
+    tuned = onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "X",
+        "Y",
+        calibration_data=[
+            {"X": rng.normal(0, 1, (2, 3, 10, 10)).astype(np.float32)} for _ in range(4)
+        ],
+        num_iterations=50,
+    )
+    assert np.array_equal(_init(tuned, "B"), bias)
+    assert not np.array_equal(_init(tuned, "W"), _init(student, "W"))
+
+
+def test_preserve_sparsity_holds_a_pruned_convolutions_zeros():
+    """The rank-4 weight goes through the mask path too.
+
+    ``preserve_sparsity`` builds its mask from ``w_init != 0`` and multiplies
+    it into the gradient, both of which are rank-agnostic -- but "should be
+    fine" and "is fine" are different claims about a code path that had only
+    ever seen 2-D.
+    """
+    rng = np.random.default_rng(32)
+    weight = rng.normal(0, 0.3, (4, 3, 3, 3)).astype(np.float32)
+    bias = np.zeros(4, np.float32)
+    reference = _conv_model(weight, bias)
+
+    pruned = weight.copy()
+    pruned[np.abs(pruned) < np.quantile(np.abs(pruned), 0.5)] = 0.0
+    student = _conv_model(pruned, bias)
+    assert (pruned == 0).sum() == pruned.size // 2
+
+    tuned = onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "X",
+        "Y",
+        calibration_data=[
+            {"X": rng.normal(0, 1, (2, 3, 10, 10)).astype(np.float32)}
+            for _ in range(16)
+        ],
+        num_iterations=200,
+        learning_rate=2e-2,
+        preserve_sparsity=True,
+    )
+
+    after = _init(tuned, "W")
+    assert np.array_equal(after == 0, pruned == 0)
+    assert not np.array_equal(after, pruned)

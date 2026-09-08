@@ -541,14 +541,28 @@ QuantizedLayer FromFloat(const onnx::NodeProto& node,
 // teacher's -- they were pruned, or simplified, or already tuned -- and
 // re-seeding from the teacher would throw that away before the first step.
 //
-// Rank-2 and fp32 are required for the same reason the other two schemes
-// require them: the loop carries the weight as a 2-D fp32 state tensor, and a
-// layer this does not recognize is simply not trained.
+// Conv is here and is in neither quantized finder, which is not an oversight
+// in those: adaround's INT4 finder and quantize_static's QDQ finder are both
+// MatMul/Gemm-only, so no quantized scheme ever produces a Conv layer and
+// there is nothing for them to train. Training a Conv's weight is therefore
+// inherently a fake_quant=false feature, which is also what makes it cheap --
+// the fake-quant path reads a weight as a 2-D grid of scale blocks
+// (BlockedShapes) and none of that runs here.
+//
+// Rank is otherwise left alone: a Conv's weight is [M, C/group, *kernel],
+// rank 3 for a 1-D convolution and 5 for a 3-D one, and the loop is
+// indifferent to which -- w_shape is already a Shape rather than a pair, the
+// moments are sized from it, and the write-back stores the weight back in the
+// layout the block's own node reads. Only fp32 is still required, because the
+// state tensors the loop carries are fp32. A rank < 2 weight is skipped
+// rather than trained: no MatMul, Gemm or Conv has one, so such a tensor is
+// something this function has misidentified.
 std::vector<QuantizedLayer> FindFloatLayers(const onnx::ModelProto& model) {
   const auto initializers = InitializerIndex(model.graph());
   std::vector<QuantizedLayer> layers;
   for (const onnx::NodeProto& node : model.graph().node()) {
-    if ((node.op_type() != "MatMul" && node.op_type() != "Gemm") ||
+    if ((node.op_type() != "MatMul" && node.op_type() != "Gemm" &&
+         node.op_type() != "Conv") ||
         node.input_size() < 2) {
       continue;
     }
@@ -556,7 +570,7 @@ std::vector<QuantizedLayer> FindFloatLayers(const onnx::ModelProto& model) {
     const onnx::TensorProto* w_init = Lookup(initializers, node.input(1));
     if (w_init == nullptr) continue;
     if (w_init->data_type() != onnx::TensorProto::FLOAT ||
-        w_init->dims_size() != 2) {
+        w_init->dims_size() < 2) {
       continue;
     }
     layers.push_back(FromFloat(node, *w_init));
@@ -1092,11 +1106,11 @@ std::string NoLayersMessage(const onnx::ModelProto& float_model,
                             " and " + Quoted(block_output_name);
   if (!fake_quant) {
     return where +
-           " contains no MatMul/Gemm with a 2-D fp32 weight initializer to "
-           "fine-tune (fake_quant=False trains the model's own float weights, "
-           "so a layer whose weight is computed rather than stored, or stored "
-           "at some other rank or dtype, has nothing for the optimizer to "
-           "hold)";
+           " contains no MatMul/Gemm/Conv with an fp32 weight initializer of "
+           "rank 2 or more to fine-tune (fake_quant=False trains the model's "
+           "own float weights, so a layer whose weight is computed rather than "
+           "stored, or stored at some other dtype, has nothing for the "
+           "optimizer to hold)";
   }
   if (learn_activation_scales) {
     if (!FindInt4Layers(float_model, quantized_model).empty()) {

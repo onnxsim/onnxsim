@@ -479,21 +479,38 @@ def _find_float_layers(model: onnx.ModelProto) -> List[_QuantizedLayer]:
     were pruned, or simplified, or already tuned -- and re-seeding from the
     teacher would throw that away before the first step.
 
-    Rank-2 and fp32 are required for the same reason the other two schemes
-    require them: :class:`_Trained` carries the weight as a 2-D fp32 array,
-    and a layer this does not recognize is simply not trained.
+    ``Conv`` is here and is not in either quantized finder, which is not an
+    oversight in those: ``adaround``'s INT4 finder and ``quantize_static``'s
+    QDQ finder are both MatMul/Gemm-only, so no quantized scheme ever
+    produces a Conv layer and there is nothing for them to train. Training a
+    Conv's weight is therefore inherently a ``fake_quant=False`` feature,
+    which is also what makes it cheap: the fake-quant path reads a weight as
+    a 2-D grid of scale blocks (:func:`_blocked_shapes`), and none of that
+    runs here.
+
+    Rank is otherwise left alone -- a Conv's weight is
+    ``[M, C/group, *kernel]``, rank 3 for a 1-D convolution and 5 for a 3-D
+    one, and the training machinery is indifferent to which: the master
+    weight is fed to the block's own node in the layout that node already
+    reads, Adam's moments are ``zeros_like`` it, and the write-back stores it
+    back unchanged. Only fp32 is still required, because the state tensors
+    the loop carries are fp32.
+
+    A weight of rank < 2 is skipped rather than trained: nothing here would
+    break on one, but no MatMul, Gemm or Conv has a rank-1 weight, so such a
+    tensor is something this function has misidentified.
     """
     initializers = {t.name: t for t in model.graph.initializer}
     layers: List[_QuantizedLayer] = []
     for node in model.graph.node:
-        if node.op_type not in ("MatMul", "Gemm") or len(node.input) < 2:
+        if node.op_type not in ("MatMul", "Gemm", "Conv") or len(node.input) < 2:
             continue
         if not node.output or not node.output[0]:
             continue
         w_init = initializers.get(node.input[1])
         if w_init is None:
             continue
-        if w_init.data_type != onnx.TensorProto.FLOAT or len(w_init.dims) != 2:
+        if w_init.data_type != onnx.TensorProto.FLOAT or len(w_init.dims) < 2:
             continue
         layers.append(_from_float(node, w_init))
     return layers
@@ -537,18 +554,27 @@ class _Trained:
     """One quantized layer's trainable state inside the step graph.
 
     ``w`` is the fp32 master weight in the *storage* layout the graph's own
-    initializer uses ([K, N] for a MatMul, [N, K] for a ``transB`` Gemm) --
-    unlike :mod:`onnxsim.adaround` and :mod:`onnxsim.brecq`, which normalize
-    to [N, K], because nothing here needs a normalized layout: the forward
-    consumes the weight exactly where the block's own node reads it, and the
-    scale's blocked axis is carried explicitly instead.
+    initializer uses ([K, N] for a MatMul, [N, K] for a ``transB`` Gemm,
+    [M, C/group, *kernel] for a Conv) -- unlike :mod:`onnxsim.adaround` and
+    :mod:`onnxsim.brecq`, which normalize to [N, K], because nothing here
+    needs a normalized layout: the forward consumes the weight exactly where
+    the block's own node reads it, and the scale's blocked axis is carried
+    explicitly instead.
+
+    :attr:`w_shape` is therefore whatever rank the layer's own weight has.
+    Only the fake-quant path constrains it: :func:`_blocked_shapes` and the
+    two functions built on it read a weight as a 2-D grid of scale blocks,
+    which is what both quantized schemes produce and neither ever produces
+    for a Conv -- ``adaround``'s INT4 finder and ``quantize_static``'s QDQ
+    finder are both MatMul/Gemm-only. So a rank > 2 weight reaches here only
+    with ``fake_quant=False``, where none of that code runs.
     """
 
     candidate: _QuantizedLayer
     w_input: str
     m_input: str
     v_input: str
-    w_shape: Tuple[int, int]
+    w_shape: Tuple[int, ...]
     w_init: np.ndarray
     scale_axis: int
     scale_shape: Tuple[int, int]
@@ -644,6 +670,29 @@ def _blocked_shapes(
     split = d[:axis] + [s[axis], block_size] + d[axis + 1 :]
     with_one = s[:axis] + [s[axis], 1] + s[axis + 1 :]
     return split, with_one
+
+
+def _blocked_weight_shape(shape: Tuple[int, ...]) -> Tuple[int, int]:
+    """``shape`` as the 2-D grid the fake-quant path reads a weight as.
+
+    Only that path calls this. A weight of any other rank cannot legitimately
+    reach it: both quantized finders are MatMul/Gemm-only, so a Conv's
+    ``[M, C/group, *kernel]`` weight arrives only with ``fake_quant=False``,
+    where none of the blocked-scale code runs.
+
+    That is an invariant rather than a coincidence, so it is checked here
+    instead of asserted in a comment. The failure it prevents is quiet: a
+    rank-4 weight reinterpreted as a 2-D block grid produces a perfectly
+    valid graph that trains the wrong thing.
+    """
+    if len(shape) != 2:
+        raise ValueError(
+            "the fake-quant path reads a weight as a 2-D grid of scale blocks, "
+            f"but this one has shape {list(shape)}. No quantized scheme "
+            "produces a layer of that rank -- both finders are MatMul/Gemm-only "
+            "-- so a layer has been planned for the wrong scheme."
+        )
+    return (shape[0], shape[1])
 
 
 def _broadcast_scale(
@@ -1054,7 +1103,7 @@ def _plan_trained(
             w_input=f"{_PREFIX}w{i}",
             m_input=f"{_PREFIX}mw{i}",
             v_input=f"{_PREFIX}vw{i}",
-            w_shape=(int(w.shape[0]), int(w.shape[1])),
+            w_shape=tuple(int(d) for d in w.shape),
             w_init=w,
             scale_axis=candidate.axis,
             scale_shape=(int(scale.shape[0]), int(scale.shape[1])),
@@ -1196,7 +1245,12 @@ def _build_step_graph(
         else:
             scale = t.scale_input
         scale_full = _broadcast_scale(
-            b, scale, t.w_shape, t.scale_shape, t.scale_axis, block_size
+            b,
+            scale,
+            _blocked_weight_shape(t.w_shape),
+            t.scale_shape,
+            t.scale_axis,
+            block_size,
         )
         weight_name = t.candidate.float_node.input[1]
         code, ratio, active = _emit_fake_quant(
@@ -1306,7 +1360,7 @@ def _build_step_graph(
             g_scale = _sum_over_blocks(
                 b,
                 b.mul(g, dwhat_ds),
-                t.w_shape,
+                _blocked_weight_shape(t.w_shape),
                 t.scale_shape,
                 t.scale_axis,
                 t.candidate.block_size,
@@ -1438,11 +1492,11 @@ def _no_layers_message(
     where = f"the block between {block_input_name!r} and {block_output_name!r}"
     if not fake_quant:
         return (
-            f"{where} contains no MatMul/Gemm with a 2-D fp32 weight "
-            "initializer to fine-tune (fake_quant=False trains the model's "
-            "own float weights, so a layer whose weight is computed rather "
-            "than stored, or stored at some other rank or dtype, has nothing "
-            "for the optimizer to hold)"
+            f"{where} contains no MatMul/Gemm/Conv with an fp32 weight "
+            "initializer of rank 2 or more to fine-tune (fake_quant=False "
+            "trains the model's own float weights, so a layer whose weight is "
+            "computed rather than stored, or stored at some other dtype, has "
+            "nothing for the optimizer to hold)"
         )
     if learn_activation_scales:
         if _find_int4_matmul_candidates(float_model, quantized_model):
