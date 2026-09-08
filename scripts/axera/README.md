@@ -3971,6 +3971,31 @@ build config's `weight_data_type` for convolution accepts only `S8` or
 `FP32`, and `pulsar2 build --help` offers no 4-bit flag either. There is a
 4-bit path, but it is in the other pipeline -- see the next section.
 
+**Against the compiler's own cycle model.** Building with `profile=True`
+gives a modelled critical path, and a per-op profile in which convolutions
+are **98.9%** of the modelled cycles -- so the benchmark really is measuring
+arithmetic and not plumbing. Dividing that cycle count by the measured time
+gives an implied clock:
+
+| graph | max_cycle | min ms | implied MHz | MAC/cycle |
+| --- | --- | --- | --- | --- |
+| 1024ch 16x16 | 3,905,355 | 4.12 | 949 | 4,949 |
+| 512ch 32x32 | 3,704,778 | 4.30 | 862 | 5,217 |
+| 256ch 64x64 | 3,831,460 | 4.49 | 854 | 5,044 |
+
+**MAC-per-cycle is stable at about 5,000** across the three cores (roughly
+1,650 each), which is the more meaningful figure -- it is a property of the
+engine, not of the graph. The implied clock is *not* stable: 854 to 949 MHz.
+Since the clock cannot actually vary by 11% between two runs a minute apart,
+what that spread measures is the cycle model being optimistic by up to ~10%
+on some shapes -- stalls it does not account for. The best-matching graph is
+also the fastest one, which is consistent with that reading rather than with
+a variable clock.
+
+So the honest summary is: the engine sustains ~5,000 MAC/cycle at somewhere
+around 0.95 GHz, 9-10 TOPS is what that product comes to, and the compiler's
+cycle estimate is a good predictor to within about 10%.
+
 Test: `test_int8_throughput_reaches_a_useful_fraction_of_the_rating` (Docker
 and device). Its floor of 5 TOPS sits between a healthy NPU3 run and the
 ~3 TOPS a single-core or fallback build produces, so it doubles as a health
@@ -4012,6 +4037,36 @@ token of pure overhead, so this model cannot exceed roughly 80 tokens/s on
 this card no matter how the weights are quantised. INT4 pays off on a model
 whose per-layer weights are large enough for streaming to dominate that fixed
 cost -- which a 135M model's 3.5 MB per layer is not.
+
+**So the next test is a model built to make it pay.** A synthetic
+Llama-shaped checkpoint at 4096 hidden and 11008 intermediate -- **177 M
+parameters per layer**, fifty times SmolLM2's -- puts weight streaming firmly
+in charge:
+
+| weights | per layer | decode/layer | implied GB/s |
+| --- | --- | --- | --- |
+| `s4` | 100.5 MB | 5.91 ms | 17.0 |
+| `s8` | 195.6 MB | 9.20 ms | 21.3 |
+
+**INT4 now buys 1.56x**, against 1.10x on the small model, and the weight
+saving reaches 1.95x once layers are large enough that non-weight structure
+stops diluting it. The benefit scales with per-layer weight size exactly as
+the overhead argument predicts, and 1.56x of a theoretical 2x says roughly a
+third of a decode step is still something other than streaming weights.
+
+Effective weight-streaming bandwidth lands around **21 GB/s** at `s8`.
+
+**One caveat on the earlier model, stated plainly:** fitting
+`time = overhead + bytes / bandwidth` to the large model gives a fixed
+overhead of 2.6 ms per layer, not the 0.40 ms the small model gave. A
+genuinely fixed cost cannot do that, so that two-parameter fit describes each
+model at its own scale and should not be extrapolated between them. What does
+survive across both is the direction and its size: halving the weights buys
+almost nothing when layers are small and about 1.56x when they are large.
+
+For deployment arithmetic: at 9.20 ms per layer, a 32-layer model of this
+width would take 294 ms per token at `s8` and 189 ms at `s4` -- roughly 3.4
+against 5.3 tokens/s.
 
 **And the 43.2 TOPS INT4 rating stays unverified.** It is a compute-throughput
 claim, and the decode path cannot demonstrate it: a decode step is about
