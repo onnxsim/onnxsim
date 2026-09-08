@@ -4802,6 +4802,91 @@ def test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks(tmp_path):
     assert 1.3 < ratio < 2.0, (ratio, sizes)
 
 
+def _build_conv_with_weight_type(work_dir, tag, model, weight_type):
+    """Compile a model forcing Conv's `weight_data_type`."""
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, f"{tag}.onnx"))
+    shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
+    rng = np.random.RandomState(1)
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", f"{tag}.tar"),
+        [rng.randn(*shape).astype(np.float32) for _ in range(2)],
+    )
+    with open(os.path.join(work_dir, "config", f"{tag}.json"), "w") as f:
+        json.dump(
+            {
+                "model_type": "ONNX",
+                "npu_mode": "NPU3",
+                "quant": {
+                    "input_configs": [
+                        {
+                            "tensor_name": "x",
+                            "calibration_dataset": f"./dataset/{tag}.tar",
+                            "calibration_format": "Numpy",
+                            "calibration_size": 2,
+                        }
+                    ],
+                    "layer_configs": [
+                        {"op_type": "Conv", "weight_data_type": weight_type}
+                    ],
+                    "calibration_method": "MinMax",
+                    "precision_analysis": False,
+                },
+                "compiler": {"check": 0},
+            },
+            f,
+        )
+    return pulsar2_docker.build(
+        work_dir,
+        f"{tag}.onnx",
+        f"out_{tag}",
+        config_path=f"config/{tag}.json",
+        timeout=2400,
+    )
+
+
+def test_nvfp4_weights_are_accepted_and_then_ignored(tmp_path):
+    """Confirmed real (see the README's "Is there a full INT4 path" section):
+    `weight_data_type: NVFP4` is the only 4-bit type the CNN pipeline's config
+    will parse, and it changes nothing. The compiled convolution weights come
+    out **identical** to the `S8` build, code for code.
+
+    That is worth a regression test in both directions. It documents that
+    there is no 4-bit weight path here today, and if a future toolchain ever
+    implements NVFP4 this test fails and says so. Needs Docker, no device.
+    """
+    cin = cout = 64
+    kernel, hw = 3, 16
+    model = _one_conv2d_model(cin, cout, hw, kernel)
+    codes = {}
+    for weight_type in ("S8", "NVFP4"):
+        work = tmp_path / weight_type
+        work.mkdir()
+        result = _build_conv_with_weight_type(str(work), "m", model, weight_type)
+        assert result.success, (weight_type, result.error)
+        wbt = np.frombuffer(
+            next(
+                i
+                for i in onnx.load(result.axmodel_path).graph.initializer
+                if i.name == "npu_params"
+            ).raw_data,
+            dtype=np.uint8,
+        )
+        codes[weight_type] = [
+            _read_weight2d_code_at(wbt, 0, 0, i, kh, kw, kernel, cin)
+            for i in range(cin)
+            for kh in range(kernel)
+            for kw in range(kernel)
+        ]
+    assert codes["S8"] == codes["NVFP4"], (
+        "NVFP4 changed the compiled weights -- this toolchain may now implement "
+        "a real 4-bit weight path, and the README needs revisiting"
+    )
+    # ... and the weights really are 8-bit, spread over far more than 16 levels.
+    assert len(set(codes["S8"])) > 32, len(set(codes["S8"]))
+
+
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
     """Confirmed real (see the README's "The first operand with a known
     meaning" section): in a program holding exactly one convolution, the
