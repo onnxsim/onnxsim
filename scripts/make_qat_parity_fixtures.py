@@ -176,7 +176,9 @@ def _case_round_to_nearest() -> Dict[str, Any]:
     Six names in a fixed order, and the single most likely thing to be
     reordered by someone porting it from the expression form the Python
     writes it in. It must also contain no ``Round`` node at all -- WebNN has
-    no rounding operator, which is the reason the composition exists.
+    no rounding operator when this was written, which is why the
+    composition exists (see qat_graph.py's Conv note: WebNN has since
+    gained roundEven).
     """
     b = qat_graph.GraphBuilder()
     result = b.round_to_nearest("x")

@@ -422,10 +422,14 @@ learn scales and got a model whose scales are untouched has no way to tell
 that from a run where learning them did not help.
 
 Operator coverage is the same constraint it is under QAT, and it is still the
-binding one on a real model: `graph_grad.SUPPORTED_OPS` is 21 rules
-(`LayerNormalization` among them since this branch), so a normalization in the
-middle of a block is now more nodes in the slice rather than a boundary
-between blocks -- but the whole default ONNX domain is 202 operators.
+binding one on a real model: `graph_grad.SUPPORTED_OPS` is 22 rules
+(`LayerNormalization` among them since this branch, and `Conv` since a later
+one), so a normalization -- or a convolution -- in the middle of a block is
+now more nodes in the slice rather than a boundary between blocks. On a CNN
+that is the difference between blocks carved *around* every convolution and
+blocks that contain them; the convolution's own weights still do not train,
+since only MatMul and Gemm have a layer finder. The whole default ONNX domain
+is 202 operators.
 
 ### Against `apply_pruning_finetune`, which came first
 

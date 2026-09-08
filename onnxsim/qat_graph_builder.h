@@ -44,8 +44,10 @@
 // Expand and Round deliberately absent; Round because WebNN has no rounding
 // operator at all, which is why RoundToNearest composes one; Gather admitted
 // on the same coverage criterion rather than for convenience, because it is
-// what lets a step read a minibatch out of a resident calibration set) lives
-// in qat_graph.py next to the Python set. It is not repeated here, so that
+// what lets a step read a minibatch out of a resident calibration set; Conv
+// and ConvTranspose considered for GradConv and refused, because the coverage
+// they have on both browser backends is 2-D only) lives in qat_graph.py next
+// to the Python set. It is not repeated here, so that
 // there is one place to update when the reasoning changes.
 const std::set<std::string>& EpFriendlyOps();
 
@@ -133,12 +135,15 @@ class GraphBuilder {
 
   // round(a), composed rather than emitted as Round.
   //
-  // WebNN has no rounding operator at all, so Round is deliberately absent
-  // from EpFriendlyOps -- and a fake-quant forward, which is what every caller
-  // wants this for, is exactly the code that must run on those backends. A
-  // float-to-int32 Cast truncates toward zero, so truncating |a| + 0.5 and
-  // re-applying the sign is round-half-away-from-zero. That differs from
-  // Round's (and numpy's) round-half-to-even on *exact* ties only.
+  // Round is deliberately absent from EpFriendlyOps -- originally because
+  // WebNN had no rounding operator at all, which has since stopped being
+  // true (see qat_graph.py's Conv note); the composition is kept because it
+  // is verified, not because that argument still holds -- and a fake-quant
+  // forward, which is what every caller wants this for, is exactly the code
+  // that must run on those backends. A float-to-int32 Cast truncates toward
+  // zero, so truncating |a| + 0.5 and re-applying the sign is
+  // round-half-away-from-zero. That differs from Round's (and numpy's)
+  // round-half-to-even on *exact* ties only.
   std::string RoundToNearest(const std::string& a);
 
   // mean(a * a) as a scalar, for a reported loss.

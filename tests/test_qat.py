@@ -315,6 +315,77 @@ def test_a_gelu_block_trains():
     assert losses[-1] < 0.25 * losses[0]
 
 
+def test_a_convolution_no_longer_splits_a_block():
+    """What :func:`onnxsim.graph_grad._grad_conv` bought, measured at the
+    level a caller sees it.
+
+    ``discover_qat_blocks`` treats an op with no gradient rule as a *gap*: the
+    blocks it finds stop either side of it. So before ``Conv`` had a rule, the
+    model below -- a projection, a convolution, a second projection -- came
+    back as two single-layer blocks with the convolution stranded between
+    them, and naming its two ends by hand was refused outright. It is now one
+    block, and the two quantized MatMuls are trained *through* the
+    convolution against the whole span's reconstruction error.
+
+    The convolution's own weight is not trained, and that is checked here
+    rather than left implicit: a rule that differentiates an op is not the
+    same thing as a layer finder that would fake-quantize and train it, and
+    only the first of those exists for ``Conv``. It is teacher-forced like any
+    other constant in the block.
+    """
+    rng = np.random.default_rng(0)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    wc = (rng.standard_normal((2, 2, 3, 3)) * 0.3).astype(np.float32)
+    model = _model(
+        """
+        g (float[batch,32] X) => (float[batch,32] Yout)
+        <int64[4] to_image = {-1, 2, 4, 4}, int64[2] to_rows = {-1, 32}>
+        {
+          H = MatMul(X, W1)
+          Img = Reshape(H, to_image)
+          C = Conv <pads = [1, 1, 1, 1]> (Img, Wc)
+          Flat = Reshape(C, to_rows)
+          Yout = MatMul(Flat, W2)
+        }
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2"), _f32(wc, "Wc")],
+    )
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    (block,) = onnxsim.discover_qat_blocks(model, quant)
+    assert (block.input_name, block.output_name) == ("X", "Yout")
+    assert "Conv" in block.op_types
+    assert block.quantized_outputs == ("H", "Yout")
+
+    x = _correlated_calibration(rank=2)
+    losses = []
+    tuned = onnxsim.apply_qat(
+        model, quant, "X", "Yout", calibration_data=[{"X": x}], losses=losses
+    )
+    onnx.checker.check_model(tuned)
+    assert losses[-1] < 0.25 * losses[0]
+
+    # The gradient really did cross the convolution: the second projection is
+    # upstream of nothing else, so only a gradient that came back through the
+    # Conv could have moved the first one.
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    reference = session.run(None, {"X": x})[0]
+
+    def error(candidate):
+        run = ort.InferenceSession(
+            candidate.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        return float(np.linalg.norm(reference - run.run(None, {"X": x})[0]))
+
+    assert error(tuned) < 0.6 * error(quant)
+
+    frozen = {t.name: t for t in tuned.graph.initializer}["Wc"]
+    assert onnx.numpy_helper.to_array(frozen).tobytes() == wc.tobytes()
+
+
 def test_freeing_the_weights_beats_optimizing_only_their_rounding():
     """Claim 2, isolated as cleanly as it can be.
 

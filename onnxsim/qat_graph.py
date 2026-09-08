@@ -119,8 +119,12 @@ _IR_VERSION = 8
 #
 # What is deliberately absent: control flow, boolean logic ops (a mask is a
 # float 0/1 from ``Cast(Greater(...))``, multiplied in), ``Where``,
-# ``Expand``, and ``Round`` -- WebNN has no rounding operator at all, which is
-# why :mod:`onnxsim.adaquant` composes one out of ``Sign``/``Abs``/``Cast``.
+# ``Expand``, and ``Round`` -- which :mod:`onnxsim.adaquant` composes out of
+# ``Sign``/``Abs``/``Cast`` instead. That composition was written when WebNN
+# had no rounding operator at all; it has since gained ``roundEven``, and
+# onnxruntime-web's WebNN EP maps ``Round`` onto it, so the reason has
+# weakened rather than held. See the ``Conv`` note below, which is where that
+# was re-checked and what it was checked against.
 # Adding to this set is a real decision: check the operator actually has
 # coverage on the WebGPU and WebNN backends first, not just on ORT's CPU
 # kernels.
@@ -140,6 +144,51 @@ _IR_VERSION = 8
 # new operator -- feeding the batch's rows themselves as a per-step input --
 # is rejected in :func:`run_step_graph`'s own docstring, where the trade-off
 # it loses is spelled out.
+#
+# ``Conv`` and ``ConvTranspose`` were considered for this set and deliberately
+# left out, which is worth recording because the case for them looks strong:
+# :func:`onnxsim.graph_grad._grad_conv` differentiates a convolution, and the
+# textbook way to write that backward is a ``ConvTranspose`` for ``dX`` and a
+# ``Conv`` over permuted axes for ``dW``. Both operators do have coverage --
+# onnxruntime-web's WebGPU EP lists ``Conv`` and ``ConvTranspose``, and its
+# WebNN EP maps them onto WebNN's ``conv2d``/``convTranspose2d`` -- so the
+# membership test above is not what refuses them. What refuses them is the
+# shape of that coverage:
+#
+# - It is 2-D only, on *both* backends. The WebGPU EP's own operator table
+#   annotates ``Conv`` with "conv3d is not supported" and ``ConvTranspose``
+#   with "ConvTranspose3d is not supported"; the WebNN EP's table restricts
+#   both to "3-D or 4-D input and 'W'", and the WebNN specification defines
+#   ``conv2d`` and ``convTranspose2d`` and no other convolution at all
+#   ("Compute a 2-D convolution given 4-D input and filter tensors"). A rule
+#   emitting them would therefore be a rule that runs for a 2-D convolution
+#   and is dead in the browser for a 3-D one, which is precisely the failure
+#   this list exists to prevent -- and a *silent* one, since the graph would
+#   still be valid ONNX and still run on CPU.
+# - ``dW``-as-a-``Conv`` is not attribute-for-attribute the forward: it swaps
+#   strides with dilations and, when the stride does not divide the input,
+#   needs its result cropped -- a ``Slice``, which is a second new member.
+#   ``dX``-as-a-``ConvTranspose`` needs ``output_shape`` for the same reason.
+#
+# So ``_grad_conv`` is written as im2col instead -- one ``Gather`` with a
+# constant index, one ``Mul`` by a 0/1 mask, one ``MatMul`` -- which adds
+# nothing to this set, is rank-agnostic (1-D, 2-D and 3-D convolutions
+# differentiate identically), and stays inside the ranks the WebNN spec
+# *requires* implementations to support: its ``gather`` states allowed input
+# rank 1 to N with 1 to 5 required, and its ``matmul`` "2 to N" with "2 to 5"
+# required, against the rank-4 tensors that rule emits. What it costs instead
+# is memory -- a materialized index table per convolution -- which is stated
+# where the rule pays it rather than here.
+#
+# Sources checked when this was written (September 2026), rather than
+# remembered: onnxruntime's ``js/web/docs/webgpu-operators.md`` and
+# ``js/web/docs/webnn-operators.md`` on ``main``, and the WebNN
+# specification's operator definitions. One thing they say that the paragraph
+# above this one no longer does: WebNN today *has* gained a rounding
+# operator (``roundEven``, which the WebNN EP maps ``Round`` onto). The
+# composition in :mod:`onnxsim.adaquant` is not therefore wrong, but its
+# reason has weakened, and this note is here so the next person to reach for
+# ``Round`` re-checks rather than trusting the older sentence.
 EP_FRIENDLY_OPS = frozenset(
     {
         "Abs",
@@ -251,10 +300,15 @@ class GraphBuilder:
     def round_to_nearest(self, a: str) -> str:
         """``round(a)``, composed rather than emitted as ``Round``.
 
-        WebNN has no rounding operator at all, so ``Round`` is deliberately
-        absent from :data:`EP_FRIENDLY_OPS` -- and a fake-quant forward, which
-        is what every caller of this wants it for, is exactly the code that
-        must run on those backends. A float-to-int32 ``Cast`` truncates toward
+        ``Round`` is deliberately absent from :data:`EP_FRIENDLY_OPS` -- and
+        a fake-quant forward, which is what every caller of this wants it for,
+        is exactly the code that must run on the accelerator backends. The
+        original reason was that WebNN had no rounding operator at all, which
+        is no longer true (it has ``roundEven``, and the WebNN EP maps
+        ``Round`` onto it); see the ``Conv`` note beside
+        :data:`EP_FRIENDLY_OPS` for when that was re-checked. The composition
+        is kept because it works and is verified, not because the original
+        argument still stands. A float-to-int32 ``Cast`` truncates toward
         zero, so truncating ``|a| + 0.5`` and re-applying the sign is
         round-half-away-from-zero. That differs from ``Round``'s (and numpy's)
         round-half-to-even on *exact* ties only: a value landing on a precise

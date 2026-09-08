@@ -81,6 +81,7 @@ BACKWARD_OPS = frozenset(
         "Cast",
         "Div",
         "Exp",
+        "Gather",
         "Greater",
         "Less",
         "MatMul",
@@ -104,6 +105,15 @@ BACKWARD_OPS = frozenset(
 # be avoided by dividing a ``ReduceSum`` by a constant, but ``Sqrt`` could
 # not, so contorting one of the two to keep the set at its old size would buy
 # nothing.
+
+# ``Gather`` was admitted for :func:`_grad_conv`, and is the one member here
+# that is not arithmetic. It is also not a loosening: it was already in
+# :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` -- the note beside that set is
+# where its coverage was established, and the same note now records what a
+# ``Conv``/``ConvTranspose`` membership would have cost instead. The use is
+# the same shape as the minibatching one it was admitted for there: a single
+# axis, a constant int64 index, and no dependence of the *index* on any
+# runtime value.
 
 
 class UnsupportedOpError(ValueError):
@@ -307,6 +317,396 @@ def _grad_gemm(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
             # C spelled as an omitted optional input ("") rather than left off
             # the node entirely -- there is no tensor to give a gradient to.
             grads.append(None)
+    return grads
+
+
+def _prod(dims: Sequence[int]) -> int:
+    """The number of elements a shape holds; ``1`` for a rank-0 one."""
+    total = 1
+    for d in dims:
+        total *= int(d)
+    return total
+
+
+def _unflatten(index: int, dims: Sequence[int]) -> List[int]:
+    """``index`` as row-major coordinates in ``dims``."""
+    coords = [0] * len(dims)
+    for i in reversed(range(len(dims))):
+        coords[i] = index % int(dims[i])
+        index //= int(dims[i])
+    return coords
+
+
+def _im2col_indices(
+    in_dims: Sequence[int],
+    out_dims: Sequence[int],
+    kernel: Sequence[int],
+    strides: Sequence[int],
+    dilations: Sequence[int],
+    pads_begin: Sequence[int],
+) -> Tuple[List[int], np.ndarray]:
+    """Where each ``(kernel tap, output position)`` pair reads its input.
+
+    The pair ``(t, o)`` reads input position ``o * stride - pad + t *
+    dilation`` along each spatial axis; a pair whose position falls outside
+    the input is one the padding invented. Both are returned flattened in
+    ``[tap, output position]`` order: the index (with an invented tap pointing
+    at element 0, since ONNX's ``Gather`` rejects an out-of-range index
+    outright) and a 0/1 float mask that multiplies the invented ones away
+    afterwards.
+    """
+    spatial = len(in_dims)
+    out_count = _prod(out_dims)
+    index = [0] * (_prod(kernel) * out_count)
+    mask = np.zeros(len(index), dtype=np.float32)
+    for tap in range(_prod(kernel)):
+        taps = _unflatten(tap, kernel)
+        for out in range(out_count):
+            position = _unflatten(out, out_dims)
+            flat = 0
+            for i in range(spatial):
+                p = position[i] * strides[i] - pads_begin[i] + taps[i] * dilations[i]
+                if p < 0 or p >= in_dims[i]:
+                    flat = -1
+                    break
+                flat = flat * in_dims[i] + p
+            if flat >= 0:
+                index[tap * out_count + out] = flat
+                mask[tap * out_count + out] = 1.0
+    return index, mask
+
+
+def _col2im_indices(
+    in_dims: Sequence[int],
+    out_dims: Sequence[int],
+    kernel: Sequence[int],
+    strides: Sequence[int],
+    dilations: Sequence[int],
+    pads_begin: Sequence[int],
+) -> Tuple[List[int], np.ndarray]:
+    """The same correspondence read the other way: which *output* position a
+    given ``(kernel tap, input position)`` pair came from.
+
+    Inverting ``p = o * stride - pad + t * dilation`` for ``o`` is what turns
+    the gradient's scatter-add into a gather: for a fixed tap, every input
+    position is written by at most one output position, so the whole ``dx``
+    is a sum of ``prod(kernel)`` gathers of the incoming gradient rather than
+    an accumulation into overlapping windows. A stride greater than one makes
+    the division inexact for most positions -- those are exactly the input
+    elements that tap never touched -- and they are masked away like the
+    padded ones above.
+    """
+    spatial = len(in_dims)
+    in_count = _prod(in_dims)
+    index = [0] * (_prod(kernel) * in_count)
+    mask = np.zeros(len(index), dtype=np.float32)
+    for tap in range(_prod(kernel)):
+        taps = _unflatten(tap, kernel)
+        for entry in range(in_count):
+            position = _unflatten(entry, in_dims)
+            flat = 0
+            for i in range(spatial):
+                shifted = position[i] + pads_begin[i] - taps[i] * dilations[i]
+                if shifted % strides[i] != 0:
+                    flat = -1
+                    break
+                o = shifted // strides[i]
+                if o < 0 or o >= out_dims[i]:
+                    flat = -1
+                    break
+                flat = flat * out_dims[i] + o
+            if flat >= 0:
+                index[tap * in_count + entry] = flat
+                mask[tap * in_count + entry] = 1.0
+    return index, mask
+
+
+def _conv_geometry(
+    node: onnx.NodeProto,
+    x_shape: Tuple[int, ...],
+    w_shape: Tuple[int, ...],
+    y_shape: Tuple[int, ...],
+) -> Tuple[int, List[int], List[int], List[int], List[int]]:
+    """``Conv``'s attributes resolved against its actual shapes.
+
+    Returns ``(group, kernel, strides, dilations, pads_begin)`` -- everything
+    :func:`_grad_conv` needs to say where each output element read from --
+    with ``auto_pad`` already turned into explicit padding.
+
+    Every one of the refusals below is a configuration whose gradient this
+    rule would otherwise compute against a geometry it invented. The last one
+    is the important one: the resolved geometry is required to *reproduce the
+    node's own output shape*, so a mistake in reading the attributes cannot
+    survive to become a wrong gradient.
+    """
+    name = node.output[0]
+    rank = len(x_shape)
+    if rank < 3:
+        raise UnsupportedOpError(
+            f"Conv needs at least one spatial dimension, got input shape "
+            f"{x_shape} (node {name!r})"
+        )
+    spatial = rank - 2
+    if len(w_shape) != rank or len(y_shape) != rank:
+        raise UnsupportedOpError(
+            f"Conv's X, W and Y must have the same rank, got {x_shape}, "
+            f"{w_shape} and {y_shape} (node {name!r})"
+        )
+    group = int(_attr(node, "group", 1))
+    channels, features = int(x_shape[1]), int(w_shape[0])
+    if group < 1 or channels % group != 0 or features % group != 0:
+        raise UnsupportedOpError(
+            f"Conv with group={group} does not divide its {channels} input and "
+            f"{features} output channels (node {name!r})"
+        )
+    if int(w_shape[1]) != channels // group:
+        raise UnsupportedOpError(
+            f"Conv's W has {w_shape[1]} channels per group, but group={group} "
+            f"over {channels} input channels needs {channels // group} "
+            f"(node {name!r})"
+        )
+
+    kernel = [int(d) for d in w_shape[2:]]
+    declared = _attr(node, "kernel_shape", None)
+    if declared is not None and [int(k) for k in declared] != kernel:
+        raise UnsupportedOpError(
+            f"Conv's kernel_shape attribute {[int(k) for k in declared]} "
+            f"disagrees with W's own spatial shape {kernel} (node {name!r})"
+        )
+    strides = [int(s) for s in _attr(node, "strides", [1] * spatial)]
+    dilations = [int(d) for d in _attr(node, "dilations", [1] * spatial)]
+    if len(strides) != spatial or len(dilations) != spatial:
+        raise UnsupportedOpError(
+            f"Conv's strides {strides} and dilations {dilations} must have one "
+            f"entry per spatial axis ({spatial}) (node {name!r})"
+        )
+    if any(s < 1 for s in strides) or any(d < 1 for d in dilations):
+        raise UnsupportedOpError(
+            f"Conv with strides {strides} and dilations {dilations} is not a "
+            f"convolution this rule can invert (node {name!r})"
+        )
+
+    auto_pad = _attr(node, "auto_pad", "NOTSET")
+    if isinstance(auto_pad, bytes):
+        auto_pad = auto_pad.decode("utf-8")
+    if auto_pad == "NOTSET":
+        pads = [int(p) for p in _attr(node, "pads", [0] * (2 * spatial))]
+        if len(pads) != 2 * spatial:
+            raise UnsupportedOpError(
+                f"Conv's pads {pads} must have two entries per spatial axis "
+                f"({spatial}) (node {name!r})"
+            )
+    elif auto_pad == "VALID":
+        pads = [0] * (2 * spatial)
+    elif auto_pad in ("SAME_UPPER", "SAME_LOWER"):
+        # The spec's own formula, resolved here rather than left to the
+        # runtime: the shapes are static, so "same" is a number at build time.
+        pads = [0] * (2 * spatial)
+        for i in range(spatial):
+            size = int(x_shape[2 + i])
+            out = -(-size // strides[i])
+            span = (kernel[i] - 1) * dilations[i] + 1
+            needed = max(0, (out - 1) * strides[i] + span - size)
+            if auto_pad == "SAME_UPPER":
+                pads[i] = needed // 2
+            else:
+                pads[i] = needed - needed // 2
+            pads[spatial + i] = needed - pads[i]
+    else:
+        raise UnsupportedOpError(
+            f"Conv with auto_pad {auto_pad!r} is not differentiated here "
+            f"(node {name!r})"
+        )
+
+    if int(y_shape[0]) != int(x_shape[0]) or int(y_shape[1]) != features:
+        raise UnsupportedOpError(
+            f"Conv's output shape {y_shape} does not match its input {x_shape} "
+            f"and weight {w_shape} (node {name!r})"
+        )
+    for i in range(spatial):
+        span = (kernel[i] - 1) * dilations[i] + 1
+        reach = int(x_shape[2 + i]) + pads[i] + pads[spatial + i] - span
+        expected = reach // strides[i] + 1 if reach >= 0 else 0
+        if expected != int(y_shape[2 + i]):
+            raise UnsupportedOpError(
+                f"Conv's declared output shape {y_shape} does not follow from "
+                f"input {x_shape}, kernel {kernel}, strides {strides}, "
+                f"dilations {dilations} and pads {pads}: axis {i} should be "
+                f"{expected}, not {int(y_shape[2 + i])} (node {name!r})"
+            )
+    return group, kernel, strides, dilations, pads[:spatial]
+
+
+def _grad_conv(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``Conv``'s three gradients, without emitting a convolution.
+
+    **Why not a convolution.** ``dX`` is naturally a ``ConvTranspose`` and
+    ``dW`` a ``Conv`` over permuted axes, and neither operator is in
+    :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`. Putting them there would have
+    bought a rule that is dead on the very backends the allowlist exists for
+    as soon as the convolution is not 2-D -- the note beside that set records
+    what WebNN and onnxruntime-web's WebGPU backend actually implement. So
+    this rule takes the other road: the im2col identity, which needs nothing
+    the allowlist does not already have.
+
+    **The identity.** Write the forward as a matrix product. With ``t``
+    ranging over the kernel's taps and ``o`` over the output positions,
+
+    .. code-block:: text
+
+        col[c, t, o] = X[c, position(o, t)]      (im2col: one gather)
+        Y[m, o]      = sum_{c, t} W[m, c, t] * col[c, t, o]
+
+    which is a plain ``MatMul`` of ``W`` reshaped to ``[M, C*K]`` against
+    ``col``. Differentiating a matrix product is the rule
+    :func:`_grad_matmul` already implements, so::
+
+        dW[m, c, t] = sum_o dY[m, o] * col[c, t, o]        (a MatMul)
+        dcol[c, t, o] = sum_m W[m, c, t] * dY[m, o]        (a MatMul)
+        dX = col2im(dcol)                                  (a scatter-add)
+
+    and the last line is the only awkward one, because a scatter-add is not
+    an operator here. It does not have to be: for a *fixed* tap, ``position``
+    is injective -- input element ``p`` is read by at most one output
+    position -- so col2im rearranges into a sum of ``prod(kernel)`` gathers
+    of ``dY`` (:func:`_col2im_indices`), which is again one ``Gather`` and
+    one ``MatMul``. Both directions are therefore the same three nodes:
+    gather, mask, matmul.
+
+    **Padding and stride, as a mask.** A tap that reads outside the input
+    (padding) or an input element a strided tap never touched has no
+    correspondent, and ONNX's ``Gather`` refuses an out-of-range index rather
+    than producing a zero. Those entries are pointed at element 0 and
+    multiplied by a 0/1 constant instead -- the same "a mask is a float 0/1,
+    multiplied in" convention :class:`onnxsim.qat_graph.GraphBuilder` uses
+    everywhere else. It is emitted unconditionally, even for a geometry whose
+    mask is all ones, so that the two implementations of this rule cannot
+    disagree about when to branch.
+
+    **Groups** cost nothing extra: the group axis is split out of the channel
+    axis by the reshapes that are already there, and the ``MatMul`` batches
+    over it. The same is true of the number of spatial dimensions, which this
+    rule never looks at beyond building the index tables -- a 1-D or 3-D
+    convolution differentiates exactly like a 2-D one.
+
+    **What it costs.** The two index tables are ``prod(kernel) *
+    prod(output spatial)`` and ``prod(kernel) * prod(input spatial)``
+    elements, materialized as initializers. That is the price of not needing
+    a convolution kernel on the backend, and on a large feature map it is
+    megabytes per node: a 3x3 convolution over 224x224 carries ~3.6 MB of
+    int64 index and ~1.8 MB of mask. Reconstruction blocks are small and this
+    is bounded and predictable, but it is real, and it is the reason this
+    rule would not be the right one for a general-purpose trainer.
+    """
+    x, w = node.input[0], node.input[1]
+    x_shape, w_shape = ctx.shape(x), ctx.shape(w)
+    y_shape = ctx.shape(node.output[0])
+    group, kernel, strides, dilations, pads = _conv_geometry(
+        node, x_shape, w_shape, y_shape
+    )
+    bias: Optional[str] = None
+    if len(node.input) > 2 and node.input[2]:
+        bias = node.input[2]
+        bias_shape = ctx.shape(bias)
+        if tuple(bias_shape) != (int(w_shape[0]),):
+            raise UnsupportedOpError(
+                f"Conv's B has shape {tuple(bias_shape)}, not "
+                f"({int(w_shape[0])},) (node {node.output[0]!r})"
+            )
+
+    batch = int(x_shape[0])
+    features = int(w_shape[0]) // group
+    channels = int(x_shape[1]) // group
+    in_dims = [int(d) for d in x_shape[2:]]
+    out_dims = [int(d) for d in y_shape[2:]]
+    taps = _prod(kernel)
+    in_count, out_count = _prod(in_dims), _prod(out_dims)
+
+    # The incoming gradient with the group axis split out, which is the
+    # layout both halves below want: [N, group, M/group, output positions].
+    g4 = ctx.b.op(
+        "Reshape",
+        [g, ctx.int64_const([batch, group, features, out_count], "shape")],
+    )
+
+    # dX = sum over (m, t) of W[m, c, t] * dY[m, position], one gather of dY
+    # per tap. See _col2im_indices for why the scatter-add is a gather here.
+    index, mask = _col2im_indices(in_dims, out_dims, kernel, strides, dilations, pads)
+    gathered = ctx.b.op("Gather", [g4, ctx.int64_const(index, "idx")], axis=3)
+    masked = ctx.b.mul(
+        gathered,
+        ctx.b.const(mask.reshape(1, 1, 1, taps * in_count), "mask"),
+    )
+    dcol = ctx.b.op(
+        "Reshape",
+        [
+            masked,
+            ctx.int64_const([batch, group, features * taps, in_count], "shape"),
+        ],
+    )
+    w4 = ctx.b.op(
+        "Reshape",
+        [w, ctx.int64_const([group, features, channels, taps], "shape")],
+    )
+    w4t = ctx.b.transpose(w4, [0, 2, 1, 3])
+    # The leading 1 keeps both MatMul operands rank 4: a batch axis that
+    # broadcasts is the mildest form of the broadcasting MatMul the rules
+    # already rely on, and it keeps every tensor here inside the rank limit
+    # WebNN's matmul states.
+    wt = ctx.b.op(
+        "Reshape",
+        [
+            w4t,
+            ctx.int64_const([1, group, channels, features * taps], "shape"),
+        ],
+    )
+    dx4 = ctx.b.matmul(wt, dcol)
+    dx = ctx.b.op("Reshape", [dx4, ctx.int64_const(x_shape, "shape")])
+
+    # dW = sum over (n, o) of dY[n, m, o] * col[n, c, t, o], with col the
+    # forward's own im2col of X.
+    x4 = ctx.b.op(
+        "Reshape",
+        [x, ctx.int64_const([batch, group, channels, in_count], "shape")],
+    )
+    index, mask = _im2col_indices(in_dims, out_dims, kernel, strides, dilations, pads)
+    gathered = ctx.b.op("Gather", [x4, ctx.int64_const(index, "idx")], axis=3)
+    masked = ctx.b.mul(
+        gathered,
+        ctx.b.const(mask.reshape(1, 1, 1, taps * out_count), "mask"),
+    )
+    col = ctx.b.op(
+        "Reshape",
+        [
+            masked,
+            ctx.int64_const([batch, group, channels * taps, out_count], "shape"),
+        ],
+    )
+    colt = ctx.b.transpose(col, [0, 1, 3, 2])
+    dw4 = ctx.b.matmul(g4, colt)
+    dw3 = ctx.b.op(
+        "ReduceSum",
+        [dw4, ctx.int64_const([0], "axes")],
+        keepdims=0,
+    )
+    dw = ctx.b.op("Reshape", [dw3, ctx.int64_const(w_shape, "shape")])
+
+    grads: List[Optional[str]] = [dx, dw]
+    if len(node.input) > 2:
+        if bias is None:
+            grads.append(None)
+        else:
+            db = ctx.b.op(
+                "ReduceSum",
+                [g4, ctx.int64_const([0, 3], "axes")],
+                keepdims=0,
+            )
+            grads.append(
+                ctx.b.op(
+                    "Reshape",
+                    [db, ctx.int64_const([int(w_shape[0])], "shape")],
+                )
+            )
     return grads
 
 
@@ -614,6 +1014,7 @@ def _grad_clip(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
 _RULES: Dict[str, Rule] = {
     "Add": _grad_add,
     "Clip": _grad_clip,
+    "Conv": _grad_conv,
     "Div": _grad_div,
     "Erf": _grad_erf,
     "Exp": _grad_exp,

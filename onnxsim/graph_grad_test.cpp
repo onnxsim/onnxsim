@@ -30,6 +30,7 @@
 #include <onnx/onnx_pb.h>
 
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <set>
@@ -93,6 +94,15 @@ onnx::AttributeProto FloatAttr(const std::string& name, float value) {
   attribute.set_name(name);
   attribute.set_type(onnx::AttributeProto::FLOAT);
   attribute.set_f(value);
+  return attribute;
+}
+
+onnx::AttributeProto StrAttr(const std::string& name,
+                             const std::string& value) {
+  onnx::AttributeProto attribute;
+  attribute.set_name(name);
+  attribute.set_type(onnx::AttributeProto::STRING);
+  attribute.set_s(value);
   return attribute;
 }
 
@@ -211,6 +221,20 @@ Shapes LayerNormShapes() {
   return {{"X", {2, 3, 4}}, {"S", {4}}, {"Bn", {4}}, {"Y", {2, 3, 4}}};
 }
 
+// A convolution with a bias -- the only rule that emits a Gather, and the
+// only one whose emission depends on arithmetic (the index tables) rather
+// than only on the shapes.
+std::vector<onnx::NodeProto> ConvSlice() {
+  return {Node("Conv", {"X", "Wc", "Bc"}, {"Y"})};
+}
+
+Shapes ConvShapes() {
+  return {{"X", {1, 2, 4, 4}},
+          {"Wc", {3, 2, 3, 3}},
+          {"Bc", {3}},
+          {"Y", {1, 3, 2, 2}}};
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -221,11 +245,13 @@ Shapes LayerNormShapes() {
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {
-      "Add",       "Clip", "Div",      "Erf",
-      "Exp",       "Gemm", "Identity", "LayerNormalization",
-      "MatMul",    "Mul",  "Neg",      "ReduceMean",
-      "ReduceSum", "Relu", "Reshape",  "Sigmoid",
-      "Softmax",   "Sqrt", "Sub",      "Tanh",
+      "Add",        "Clip",      "Conv",
+      "Div",        "Erf",       "Exp",
+      "Gemm",       "Identity",  "LayerNormalization",
+      "MatMul",     "Mul",       "Neg",
+      "ReduceMean", "ReduceSum", "Relu",
+      "Reshape",    "Sigmoid",   "Softmax",
+      "Sqrt",       "Sub",       "Tanh",
       "Transpose"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
@@ -238,9 +264,9 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
 // as the forward and the optimizer step.
 void TheBackwardOpsAreThePythonAllowlistAndSitInsideEpFriendlyOps() {
   const std::set<std::string> expected = {
-      "Add",       "Cast",    "Div",  "Exp", "Greater",
-      "Less",      "MatMul",  "Mul",  "Neg", "ReduceMean",
-      "ReduceSum", "Reshape", "Sqrt", "Sub", "Transpose"};
+      "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
+      "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
+      "Reshape", "Sqrt",   "Sub", "Transpose"};
   Check(BackwardOps() == expected,
         "BackwardOps() should equal graph_grad.py's BACKWARD_OPS, got {" +
             Join(BackwardOps()) + "}");
@@ -265,6 +291,7 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
       {TranscendentalSlice(), TranscendentalShapes(), {"A"}},
       {GemmSlice(), GemmShapes(), {"A", "W", "Cb"}},
       {LayerNormSlice(), LayerNormShapes(), {"X", "S", "Bn"}},
+      {ConvSlice(), ConvShapes(), {"X", "Wc", "Bc"}},
   };
 
   std::set<std::string> emitted;
@@ -279,7 +306,7 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
     emitted.insert(types.begin(), types.end());
   }
   Check(emitted == BackwardOps(),
-        "the four slices together should emit every allowlisted op and no "
+        "the six slices together should emit every allowlisted op and no "
         "other; got {" +
             Join(emitted) + "}");
 }
@@ -493,6 +520,215 @@ void TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
   }
 }
 
+// Little-endian readers for an initializer's raw_data. GraphBuilder writes
+// tensors little-endian on purpose (see AppendLittleEndian), so a big-endian
+// host has to decode rather than reinterpret -- the same care
+// docs/big-endian.md asks of everything else that touches raw_data.
+std::vector<int64_t> Int64Data(const onnx::TensorProto& tensor) {
+  std::vector<int64_t> values;
+  const std::string& raw = tensor.raw_data();
+  for (size_t i = 0; i + 8 <= raw.size(); i += 8) {
+    uint64_t bits = 0;
+    for (int k = 7; k >= 0; --k) {
+      bits = (bits << 8) | static_cast<unsigned char>(raw[i + k]);
+    }
+    values.push_back(static_cast<int64_t>(bits));
+  }
+  return values;
+}
+
+std::vector<float> FloatData(const onnx::TensorProto& tensor) {
+  std::vector<float> values;
+  const std::string& raw = tensor.raw_data();
+  for (size_t i = 0; i + 4 <= raw.size(); i += 4) {
+    uint32_t bits = 0;
+    for (int k = 3; k >= 0; --k) {
+      bits = (bits << 8) | static_cast<unsigned char>(raw[i + k]);
+    }
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    values.push_back(value);
+  }
+  return values;
+}
+
+// If this fails, the C++ Conv rule has drifted from _grad_conv in
+// graph_grad.py. Pinned the same way and for the same reason as the
+// LayerNorm rule above: the nodes are numbered by the builder's counter in
+// emission order, so a reordering alone renames every tensor a browser-built
+// step graph produces from there on.
+void TheConvRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads = BuildBackward(
+      b, ConvSlice(), ConvShapes(), {{"Y", "dY"}}, {"X", "Wc", "Bc"});
+  // dY reshaped with the group axis split out; then dX -- gather dY per
+  // kernel tap, mask the taps that fall outside, matmul against W laid out
+  // [group, C/group, (M/group)*taps]; then dW -- im2col of X, matmul against
+  // dY, sum over the batch; then dB, dY summed over batch and positions.
+  const std::vector<std::string> expected = {
+      "Reshape",   "Gather",  "Mul",       "Reshape",   "Reshape",
+      "Transpose", "Reshape", "MatMul",    "Reshape",   "Reshape",
+      "Gather",    "Mul",     "Reshape",   "Transpose", "MatMul",
+      "ReduceSum", "Reshape", "ReduceSum", "Reshape"};
+  Check(OpTypes(b) == expected,
+        "the Conv rule should emit graph_grad.py's nodes in its order");
+  Check(b.nodes().size() == expected.size() &&
+            grads.at("X") == b.nodes()[8].output(0) &&
+            grads.at("Wc") == b.nodes()[16].output(0) &&
+            grads.at("Bc") == b.nodes().back().output(0),
+        "dX, dW and dB should be the three Reshapes that close each half");
+  // Neither Conv nor ConvTranspose: the whole point of writing the gradient
+  // as im2col is that the emitted graph needs no convolution kernel on the
+  // backend. See the note beside EpFriendlyOps() in qat_graph_builder.h.
+  const std::set<std::string> emitted = OpTypeSet(b);
+  Check(emitted.count("Conv") == 0 && emitted.count("ConvTranspose") == 0,
+        "a Conv's gradient must not itself contain a convolution");
+  for (const onnx::NodeProto& node : b.nodes()) {
+    if (node.op_type() != "Gather") continue;
+    Check(node.attribute_size() == 1 && node.attribute(0).name() == "axis" &&
+              node.attribute(0).i() == 3,
+          "both gathers run along axis 3, the flattened spatial axis");
+  }
+}
+
+// If this fails, the index tables the two gathers read from have been
+// computed differently here from the Python -- which no allowlist or op-order
+// check would catch, because the graph would have exactly the same shape and
+// simply read the wrong elements. The case is small enough to write the
+// answer out by hand: a 1-D convolution of a length-3 input by a width-2
+// kernel, padded on both sides, whose output is length 4.
+void TheConvIndexTablesAreTheOnesTheGeometryImplies() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Conv", {"X", "Wc"}, {"Y"}, {IntsAttr("pads", {1, 1})})};
+  const Shapes shapes = {{"X", {1, 1, 3}}, {"Wc", {1, 1, 2}}, {"Y", {1, 1, 4}}};
+  GraphBuilder b("bw_");
+  BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X", "Wc"});
+
+  // dX's gather: for tap t, input position p came from output position
+  // p + 1 - t. Tap 0 reads outputs 1, 2, 3; tap 1 reads outputs 0, 1, 2.
+  Check(b.initializer().size() == 13, "the rule emits thirteen initializers");
+  Check(
+      Int64Data(b.initializer()[1]) == std::vector<int64_t>({1, 2, 3, 0, 1, 2}),
+      "dX gathers output position p + 1 - t for tap t");
+  Check(FloatData(b.initializer()[2]) == std::vector<float>({1, 1, 1, 1, 1, 1}),
+        "with a width-2 kernel and one pad each side, every input position "
+        "is reached by both taps");
+
+  // dW's im2col: for tap t, output position o reads input o - 1 + t. Tap 0's
+  // first read and tap 1's last are the padding, and are masked away rather
+  // than gathered from out of range.
+  Check(Int64Data(b.initializer()[8]) ==
+            std::vector<int64_t>({0, 0, 1, 2, 0, 1, 2, 0}),
+        "im2col reads input position o - 1 + t, clamped to 0 where the tap "
+        "falls in the padding");
+  Check(FloatData(b.initializer()[9]) ==
+            std::vector<float>({0, 1, 1, 1, 1, 1, 1, 0}),
+        "the mask is 0 exactly where the tap read padding");
+}
+
+// If this fails, a convolution the rule cannot invert would be
+// differentiated against a geometry it invented, which is the one failure
+// mode that produces a plausible-looking wrong gradient rather than an
+// error. Each of these is a refusal graph_grad.py makes by the same name.
+void AConvWhoseGeometryDoesNotAddUpIsRefused() {
+  const Shapes ok = {
+      {"X", {1, 2, 5, 5}}, {"Wc", {2, 2, 3, 3}}, {"Y", {1, 2, 3, 3}}};
+  {
+    // The output shape the node declares has to follow from the attributes;
+    // if it does not, one of the two is being misread and neither can be
+    // trusted.
+    const Shapes wrong = {
+        {"X", {1, 2, 5, 5}}, {"Wc", {2, 2, 3, 3}}, {"Y", {1, 2, 4, 4}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b, {Node("Conv", {"X", "Wc"}, {"Y"})}, wrong,
+                        {{"Y", "dY"}}, {"X"});
+        },
+        "does not follow from", "an inconsistent output shape is refused");
+  }
+  {
+    // "SAME" is not a spelling ONNX has; a typo in the attribute must not
+    // silently fall back to no padding.
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(
+              b,
+              {Node("Conv", {"X", "Wc"}, {"Y"}, {StrAttr("auto_pad", "SAME")})},
+              ok, {{"Y", "dY"}}, {"X"});
+        },
+        "auto_pad", "an unknown auto_pad is refused by name");
+  }
+  {
+    // A group count that does not divide the channels describes no
+    // convolution at all.
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(
+              b, {Node("Conv", {"X", "Wc"}, {"Y"}, {IntAttr("group", 3)})}, ok,
+              {{"Y", "dY"}}, {"X"});
+        },
+        "group=3", "a group that does not divide the channels is refused");
+  }
+  {
+    // A kernel_shape attribute that disagrees with W's own spatial shape:
+    // the two say different things about what the node computes.
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b,
+                        {Node("Conv", {"X", "Wc"}, {"Y"},
+                              {IntsAttr("kernel_shape", {2, 2})})},
+                        ok, {{"Y", "dY"}}, {"X"});
+        },
+        "kernel_shape", "a kernel_shape that disagrees with W is refused");
+  }
+  {
+    // No spatial axis at all: a rank-2 "convolution" is a matrix product
+    // spelled wrong, and this rule will not guess which.
+    const Shapes flat = {{"X", {2, 3}}, {"Wc", {3, 4}}, {"Y", {2, 4}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b, {Node("Conv", {"X", "Wc"}, {"Y"})}, flat,
+                        {{"Y", "dY"}}, {"X"});
+        },
+        "spatial dimension", "a Conv with no spatial axis is refused");
+  }
+}
+
+// If this fails, the rule has grown a special case for the number of spatial
+// dimensions -- and since WebNN has conv2d and convTranspose2d and no other
+// convolution, a rank-dependent rule is exactly what writing this backward
+// as a convolution would have forced. The 1-D and 3-D cases must emit the
+// same nodes as the 2-D one, differing only in the tables' contents.
+void ConvsOfAnyRankDifferentiateIdentically() {
+  const std::vector<std::string> expected = {
+      "Reshape", "Gather",    "Mul",     "Reshape",   "Reshape", "Transpose",
+      "Reshape", "MatMul",    "Reshape", "Reshape",   "Gather",  "Mul",
+      "Reshape", "Transpose", "MatMul",  "ReduceSum", "Reshape"};
+  {
+    const Shapes shapes = {
+        {"X", {1, 2, 7}}, {"Wc", {3, 2, 3}}, {"Y", {1, 3, 3}}};
+    GraphBuilder b;
+    BuildBackward(
+        b, {Node("Conv", {"X", "Wc"}, {"Y"}, {IntsAttr("strides", {2})})},
+        shapes, {{"Y", "dY"}}, {"X", "Wc"});
+    Check(OpTypes(b) == expected, "a 1-D convolution emits the same nodes");
+  }
+  {
+    const Shapes shapes = {{"X", {1, 1, 3, 3, 3}},
+                           {"Wc", {2, 1, 2, 2, 2}},
+                           {"Y", {1, 2, 2, 2, 2}}};
+    GraphBuilder b;
+    BuildBackward(b, {Node("Conv", {"X", "Wc"}, {"Y"})}, shapes, {{"Y", "dY"}},
+                  {"X", "Wc"});
+    Check(OpTypes(b) == expected, "a 3-D convolution emits the same nodes");
+  }
+}
+
 // If this fails, a tensor read by two consumers -- a residual connection's
 // own input, which is why this matters -- would keep only one contribution,
 // and the parameter upstream of it would train on a fraction of its
@@ -596,6 +832,10 @@ int main() {
   ReducedAxesComeFromTheAttributeWhenThereIsOne();
   ABroadcastGradientIsSummedBackToTheOperandShape();
   TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheConvRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheConvIndexTablesAreTheOnesTheGeometryImplies();
+  AConvWhoseGeometryDoesNotAddUpIsRefused();
+  ConvsOfAnyRankDifferentiateIdentically();
   ATensorReadTwiceAccumulatesItsContributions();
   AnIdentityAliasesTheSeedInsteadOfEmittingANode();
   TheReturnedMapCoversExactlyTheRequestedTargets();
