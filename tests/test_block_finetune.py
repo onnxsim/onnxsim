@@ -553,23 +553,23 @@ def test_the_whole_model_walk_recovers_a_damaged_model():
     assert _held_out_error(tuned, reference, held_out) < before / 2
 
 
-def test_unstructured_sparsity_is_not_preserved():
-    """A known gap, pinned so that closing it is a visible change.
+def test_unstructured_sparsity_is_not_preserved_by_default():
+    """The default fills a pruned model's zeros back in, and says so.
 
-    Nothing in the step graph masks the optimizer: Adam updates every element
-    of a trained weight, so an element pruning set to zero gets a gradient
-    like any other and leaves zero on the first step. For a model whose value
-    *is* its zeros -- an unstructured magnitude-pruned one -- that destroys
-    what was bought, and it does so while the loss falls by orders of
+    Nothing in the step graph masks the optimizer unless asked: Adam updates
+    every element of a trained weight, so an element pruning set to zero gets
+    a gradient like any other and leaves zero on the first step. For a model
+    whose value *is* its zeros -- an unstructured magnitude-pruned one -- that
+    destroys what was bought, and it does so while the loss falls by orders of
     magnitude, which is exactly the shape of failure that goes unnoticed.
 
-    Structured pruning is unaffected, because there the channel is gone from
-    the tensor rather than zeroed inside it.
+    ``preserve_sparsity=True`` is the fix and the test next door measures it.
+    The default stays off because "this element is zero" and "this element was
+    pruned away" are the same bit pattern, and only the caller knows which
+    they meant -- so this test pins the default rather than deprecating it.
 
-    This asserts the current behaviour rather than the desired one. A masked
-    optimizer would be a real feature and would make this test fail, which is
-    the point of writing it down: the assertion below is the specification of
-    what such a change would have to alter.
+    Structured pruning is unaffected either way, because there the channel is
+    gone from the tensor rather than zeroed inside it.
     """
     rng = np.random.default_rng(12)
     w1 = rng.normal(0, 0.3, (D, D)).astype(np.float32)
@@ -600,3 +600,171 @@ def test_unstructured_sparsity_is_not_preserved():
     assert losses[-1] < losses[0] / 100
     assert (_init(tuned, "W1") == 0).sum() == 0
     assert (_init(tuned, "W2") == 0).sum() == 0
+
+
+def _pruned_pair(rng, sparsity=0.5):
+    """A dense reference and an unstructured magnitude-pruned copy of it."""
+    weights = [rng.normal(0, 0.3, (D, D)).astype(np.float32) for _ in range(2)]
+
+    def pruned(w):
+        w = w.copy()
+        w[np.abs(w) < np.quantile(np.abs(w), sparsity)] = 0.0
+        return w
+
+    sparse = [pruned(w) for w in weights]
+    return _mlp(*weights), _mlp(*sparse), sparse
+
+
+def test_preserve_sparsity_holds_every_pruned_zero_exactly():
+    """The fix, and the reason one ``Mul`` is enough.
+
+    With the gradient zeroed wherever the master weight started at zero,
+    Adam's ``m`` and ``v`` stay 0 for those elements, its step is
+    ``lr * 0 / (sqrt(0) + eps)`` -- exactly 0 -- and the parameter never
+    moves. So the assertion is equality with zero rather than a tolerance:
+    "held near zero" would be a different, weaker feature, and a model whose
+    zeros became 1e-20 is a dense model as far as any sparse kernel is
+    concerned.
+
+    The whole zero *pattern* is compared, not just the count, because a run
+    that zeroed some other element to compensate would keep the count and be
+    entirely wrong.
+    """
+    rng = np.random.default_rng(21)
+    reference, student, sparse = _pruned_pair(rng)
+
+    tuned = onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "X",
+        "Y",
+        calibration_data=_data(rng, batches=32),
+        num_iterations=300,
+        learning_rate=2e-2,
+        preserve_sparsity=True,
+    )
+
+    for name, before in zip(("W1", "W2"), sparse):
+        after = _init(tuned, name)
+        assert np.array_equal(after == 0, before == 0)
+        assert (after == 0).sum() == D * D // 2
+        # ...and the surviving weights did move, or the mask would have been
+        # a very thorough way of doing nothing.
+        assert not np.array_equal(after, before)
+
+
+def test_preserve_sparsity_still_recovers_error_while_staying_sparse():
+    """What the option is actually worth, measured against both alternatives.
+
+    Preserving the zeros costs reconstruction quality -- half the free
+    parameters are held at zero, so the block cannot fit the dense reference
+    and its loss plateaus far above the unconstrained run's. That is the
+    trade, and the number worth having is whether what remains still beats
+    doing nothing. It does, on a held-out input.
+
+    The unconstrained run is measured alongside precisely so the comparison is
+    not flattering by omission: it reaches a lower error, and it gets there by
+    returning a dense model, which is not the model that was asked for.
+    """
+    rng = np.random.default_rng(22)
+    reference, student, _ = _pruned_pair(rng)
+    data = _data(rng, batches=32)
+    held_out = _data(rng, batches=8)
+    before = _held_out_error(student, reference, held_out)
+
+    def run(preserve):
+        return onnxsim.apply_block_finetune(
+            reference,
+            student,
+            "X",
+            "Y",
+            calibration_data=data,
+            num_iterations=300,
+            learning_rate=2e-2,
+            preserve_sparsity=preserve,
+        )
+
+    sparse_tuned = run(True)
+    dense_tuned = run(False)
+
+    sparse_error = _held_out_error(sparse_tuned, reference, held_out)
+    dense_error = _held_out_error(dense_tuned, reference, held_out)
+
+    assert sparse_error < before * 0.9
+    # The dense run wins on error and loses the sparsity. Both halves are
+    # asserted so neither can quietly stop being true.
+    assert dense_error < sparse_error
+    assert (_init(dense_tuned, "W1") == 0).sum() == 0
+    assert (_init(sparse_tuned, "W1") == 0).sum() == D * D // 2
+
+
+def test_preserve_sparsity_costs_exactly_one_multiply_per_layer():
+    """The mechanism, pinned at the graph level.
+
+    A mask applied by writing zeros back after each step, or by a clean-up
+    pass at the end, would satisfy the tests above and be a different thing:
+    the weight would move and be moved back, its Adam moments would fill with
+    garbage, and the moments are state the loop carries. This asserts the
+    cheap version -- one extra ``Mul`` per trained layer, on the gradient --
+    which is what keeps the moments at zero too.
+    """
+    rng = np.random.default_rng(23)
+    reference, student, _ = _pruned_pair(rng)
+    data = _data(rng, batches=1)
+
+    def step_graph(preserve):
+        plan = qat._plan_block(reference, student, "X", "Y", False, False)
+        captured = qat._capture(
+            reference, sorted(set(plan.externals) | {plan.output_name}), data, None
+        )
+        externals = {name: captured[name] for name in plan.externals}
+        trained = qat._plan_trained(plan.candidates, False, False)
+        shapes = qat._block_shapes(
+            reference,
+            plan.nodes,
+            externals,
+            plan.output_name,
+            captured[plan.output_name],
+        )
+        return qat._build_step_graph(
+            trained,
+            plan.nodes,
+            shapes,
+            [],
+            externals,
+            plan.output_name,
+            list(captured[plan.output_name].shape),
+            False,
+            None,
+            False,
+            False,
+            preserve,
+        )
+
+    def counts(graph):
+        ops: dict = {}
+        for node in graph.model.graph.node:
+            ops[node.op_type] = ops.get(node.op_type, 0) + 1
+        return ops
+
+    plain_graph, masked_graph = step_graph(False), step_graph(True)
+    plain, masked = counts(plain_graph), counts(masked_graph)
+    assert masked["Mul"] - plain["Mul"] == 2  # two trained layers
+    assert {op: n for op, n in masked.items() if op != "Mul"} == {
+        op: n for op, n in plain.items() if op != "Mul"
+    }
+
+    # An op count alone cannot tell a gradient mask from a mask on the
+    # *updated weight* -- both are one Mul. What separates them is where the
+    # result goes: a masked gradient feeds Adam's two moment updates, so it
+    # has several consumers and is not itself a state output, whereas a masked
+    # weight would be the state output and feed nothing.
+    graph = masked_graph.model.graph
+    keep = [t.name for t in graph.initializer if "keep" in t.name]
+    assert len(keep) == 2
+    outputs = {o.name for o in graph.output}
+    for name in keep:
+        product = next(node.output[0] for node in graph.node if name in node.input)
+        consumers = [node for node in graph.node if product in node.input]
+        assert product not in outputs
+        assert len(consumers) >= 2

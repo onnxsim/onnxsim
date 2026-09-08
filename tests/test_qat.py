@@ -2221,3 +2221,69 @@ def test_many_calibration_batches_are_all_used_not_just_the_first(monkeypatch):
     assert any(
         not np.array_equal(old[name], new[name]) for name in old if name in new
     ), "no initializer changed, so the run trained nothing"
+
+
+def test_preserve_sparsity_holds_a_pruned_models_zero_codes():
+    """``preserve_sparsity`` under the quantized path, where the failure it
+    prevents is intermittent rather than total.
+
+    Fine-tuning destroys an unstructured-pruned model's zeros on the first
+    step, because nothing rounds the weight back (see
+    ``tests/test_block_finetune.py``). Quantization hides that: a weight has
+    to drift half a quantization step before ``round(w / s)`` reports anything
+    but 0, so at ``apply_qat``'s default learning rate of 1e-4 a short run
+    moves no code off zero at all and the problem is invisible.
+
+    It is invisible, not absent. Measured on this model at 300 iterations, the
+    number of pruned zeros that came back as nonzero codes was 6 at lr 1e-3,
+    38 at 1e-2 and 177 at 5e-2 -- a sparsity that erodes with the learning
+    rate and the budget, which is a worse way to lose it than losing it
+    outright. With the flag on it is 0 at every rate.
+
+    The mask is the zero pattern of the master weight's seed, and under QAT
+    that seed is ``float_model``'s weight -- so this is the ordinary order of
+    operations (prune, then quantize the pruned model) rather than a special
+    case.
+    """
+    rng = np.random.default_rng(5)
+    weight = rng.normal(0, 0.3, (D, D)).astype(np.float32)
+    weight[np.abs(weight) < np.quantile(np.abs(weight), 0.5)] = 0.0
+    zeros = weight == 0
+
+    model = _model(
+        f"""
+        g (float[8,{D}] X) => (float[8,{D}] Y) {{
+          H = MatMul(X, W1)
+          Y = Relu(H)
+        }}
+        """,
+        [_f32(weight, "W1")],
+    )
+    quant = _quantize_chain_int4(model, {"W1"})
+    data = [{"X": rng.normal(0, 1, (8, D)).astype(np.float32)} for _ in range(4)]
+
+    def codes(tuned):
+        packed = next(
+            t
+            for t in tuned.graph.initializer
+            if t.data_type in (onnx.TensorProto.INT4, onnx.TensorProto.INT8)
+        )
+        return onnx.numpy_helper.to_array(packed)
+
+    def run(preserve):
+        return onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Y",
+            calibration_data=data,
+            num_iterations=300,
+            learning_rate=1e-2,
+            preserve_sparsity=preserve,
+        )
+
+    # The learning rate is deliberately well above the default: at 1e-4 this
+    # test would pass with the feature removed, which would make it a test of
+    # nothing.
+    assert (zeros & (codes(run(False)) != 0)).sum() > 0
+    assert (zeros & (codes(run(True)) != 0)).sum() == 0

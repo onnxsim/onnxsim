@@ -421,13 +421,40 @@ alternative for those cases -- and, unlike a numpy solve, it is a step graph,
 so `step_providers=` reaches the same accelerators the rest of this note is
 about. It is a fallback, not a replacement.
 
-Note also what it does *not* preserve: the optimizer updates every element of
-a trained weight, with no sparsity mask anywhere in the step graph. On a
-magnitude-pruned (unstructured) model that is fatal to the thing that was
-bought -- measured on a two-layer block at 50% sparsity, 128 zeros per weight
-before and **0 after**, while the block's loss fell 0.140 -> 5.3e-06.
-Fine-tuning a model whose value is its zeros needs a masked optimizer this
-does not have.
+### Preserving a pruned model's zeros
+
+By default the optimizer updates every element of a trained weight, so on a
+magnitude-pruned (unstructured) model it *fills the zeros back in* -- measured
+on a two-layer block at 50% sparsity, 128 zeros per weight before and **0
+after**, while the block's loss fell 0.140 -> 5.3e-06. Every signal a caller
+looks at says that run went well, which is what makes it dangerous rather than
+merely wrong.
+
+`preserve_sparsity=True` zeroes the weight gradient wherever the master weight
+started at zero. One `Mul` per trained layer is enough to hold those elements
+at zero *exactly*, not approximately: with a gradient of 0 every step, Adam's
+`m` and `v` stay 0, its step is `lr * 0 / (sqrt(0) + eps)` -- exactly 0 -- and
+the parameter never moves. No clean-up pass, and no drift in between. It is
+opt-in because "this element is zero" and "this element was pruned away" are
+the same bit pattern, and only the caller knows which they meant. Structured
+pruning needs nothing here: the channel is gone from the tensor rather than
+zeroed inside it.
+
+It costs what it must. Half the free parameters are pinned, so the block
+cannot fit the reference as closely -- on the model above, held-out error
+0.241 before, **0.191** with the zeros kept, against 0.000 for the
+unconstrained run that returns a dense model. The unconstrained number is
+lower and is not the model that was asked for.
+
+**Under `apply_qat` the same flag applies, and there the failure it prevents
+is intermittent rather than total** -- which is worse. A weight must drift half
+a quantization step before `round(w / s)` reports anything but 0, so at the
+default learning rate of 1e-4 a short run moves no code off zero and the
+problem is invisible. It is invisible, not absent: on the same weight at 300
+iterations, the count of pruned zeros returning as nonzero codes was 6 at lr
+1e-3, 38 at 1e-2 and 177 at 5e-2. A sparsity that erodes with the learning
+rate and the budget is a worse way to lose it than losing it outright. With
+the flag on it is 0 at every rate.
 
 ### Measured, and the measurement is the point
 
