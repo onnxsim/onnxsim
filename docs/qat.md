@@ -1,14 +1,14 @@
 # Delivering QAT in onnxsim: a design note
 
-**Status: design note, with stages 0-2 and 4 implemented.**
+**Status: design note, all five stages implemented.**
 `onnxsim/qat_graph.py`, `onnxsim/graph_grad.py`, `onnxsim/qat.py`
 (`apply_qat`, `apply_qat_all_blocks`, and the `apply_block_finetune` pair the
-same machinery becomes with the quantizer removed), `onnxsim/qat_interop.py`
-and the converter page's calibration-provider picker have all landed; the
-browser fine-tuning panel (stage 3) has not (see "Staging" below). This note
-answers "how *could* we deliver quantization-aware training as an onnxsim
-feature, and can the training math run on WebGPU or an NPU?" and records the
-shape of the work so the question doesn't have to be re-derived. `docs/nncf-comparison-future-work.md`
+same machinery becomes with the quantizer removed), `onnxsim/qat_interop.py`,
+and the converter page's calibration-provider picker and fine-tuning panel
+have all landed. This note answers "how *could* we deliver quantization-aware
+training as an onnxsim feature, and can the training math run on WebGPU or an
+NPU?" and records the shape of the work so the question doesn't have to be
+re-derived. `docs/nncf-comparison-future-work.md`
 currently lists QAT as out of scope ("QAT needs a training loop with a
 framework-native model"); this note revisits that on the narrower reading
 below, and leaves the broader one (task loss, labels, epochs) exactly as
@@ -329,10 +329,36 @@ Each stage is independently shippable and independently useful.
    outside, training and improving the model while silently using a fraction
    of the data the caller paid to download -- so a test asserts the step
    graph's teacher constant carries every row. That closes this stage.
-3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
-   from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
-   loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
-   QAT with no server is something none of the comparable tools offer.
+3. **Browser QAT panel -- done**, as `scripts/convertmodel/qat_ui.mjs` over
+   `qat_finetune.mjs` and `qat_blocks.mjs`, driving the three wasm bindings
+   `interface.cpp` exposes. Two things in the sketch above did not survive
+   contact with the loop, and both are worth recording.
+
+   **`ort_executor.mjs` is the wrong runner for this.** Its `makeOrtRunner`
+   creates a session per call and passes tensors positionally as one packed
+   blob -- exactly right for the constant-folding trampoline it was written
+   for, and exactly wrong for a training loop, which needs one session held
+   across every step and binds inputs by name. The panel opens an
+   onnxruntime-web session directly, as `quantize_calibration.mjs` does, on
+   whatever `providersForEp` returns.
+
+   **The minibatch row stream cannot be bit-compatible with Python.**
+   `qat_graph.minibatch_indices` draws each epoch's permutation from
+   `np.random.default_rng([seed, epoch])` -- numpy's PCG64, which a browser
+   cannot regenerate. The port keeps every property the docstring argues for
+   (a permutation per epoch from `(seed, epoch)` alone, a straddling batch
+   completed from the front of the next epoch, the whole stream a pure
+   function of `t`) but not the sequence, so the same seed picks different,
+   equally valid batches. This is the one deliberate gap in Python/browser
+   parity, and it is confined to *which rows* a step sees: the emitted step
+   graph stays byte-identical, which is what `qat_parity_fixtures.txt` pins.
+
+   The panel captures every block's activations from the float model, which
+   is the capture-once walk rather than `apply_qat_all_blocks`' sequential
+   one -- the weaker of the two by this note's own measurements (206.2
+   against 168.1 above). `QatCapture` carries no "recapture this from the
+   student" flag, so doing better needs a change to the plan rather than to
+   the panel; it is flagged in `qat_ui.mjs` rather than quietly left out.
 4. **QAT interop (A) -- done.** `onnxsim/qat_interop.py`.
    `quantize_static_keeping_qdq_scales` reads the parameters a QAT export
    already carries, canonicalizes back to float only the pairs onnxsim can
