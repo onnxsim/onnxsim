@@ -288,6 +288,180 @@ def test_int4_pipeline_flags_silently_ignored_for_other_schemes(config_kwargs):
     assert plain.SerializeToString() == flagged.SerializeToString()
 
 
+# --------------------------------------------------------------------------- #
+# QuantizationConfig qat flag
+# --------------------------------------------------------------------------- #
+def test_quantize_weight_only_int4_qat_flag_matches_direct_apply_qat_all_blocks():
+    """``qat=True`` must be exactly ``apply_qat_all_blocks`` on the RTN model,
+    with the config's own calibration/seed/provider settings reused rather than
+    a second, differently-seeded set generated behind the caller's back. A
+    failure here means the dispatcher is fine-tuning against data the caller
+    did not choose -- or not fine-tuning at all."""
+    model = _int4_matmul_model(K=64, N=16, seed=0)
+    calibration_data = _correlated_calibration(K=64, num_samples=64, seed=1)
+    # A short, deliberately brisk schedule: at the default 1e-4 rate eight
+    # steps cannot carry any weight the half-quantization-step it takes to
+    # change which integer it rounds to, so the tuned model would come back
+    # byte-identical to RTN and the last assertion below would (correctly)
+    # fail. That coupling is why qat_learning_rate is its own knob.
+    config = onnxsim.QuantizationConfig(
+        scheme="weight_only",
+        dtype="int4",
+        qat=True,
+        qat_num_iterations=8,
+        qat_learning_rate=1e-2,
+        calibration_data=calibration_data,
+    )
+
+    dispatched = onnxsim.quantize(model, config)
+
+    rtn = onnxsim.quantize_weight_only_int4(model)
+    direct, results = onnxsim.apply_qat_all_blocks(
+        model,
+        rtn,
+        calibration_data=calibration_data,
+        num_iterations=8,
+        learning_rate=1e-2,
+    )
+
+    assert [r.trained for r in results] == [True]
+    assert dispatched.SerializeToString() == direct.SerializeToString()
+    # And QAT actually moved the weights -- not just re-produced plain RTN.
+    assert dispatched.SerializeToString() != rtn.SerializeToString()
+
+
+def test_quantize_weight_only_int4_runs_qat_after_awq_and_before_double_quant():
+    """The pipeline position ``quantize()``'s docstring claims. The
+    before-``double_quant`` half is the load-bearing one: that pass moves each
+    scale out of an initializer and into a nested ``DequantizeLinear``, which
+    is exactly what QAT's layer finder needs, so the reversed order would be a
+    silent no-op rather than a differently-ordered result."""
+    # N=64 rather than the N=16 the tests above use: apply_double_quantization
+    # only touches a scale tensor with at least 64 elements, and an N=16
+    # weight's [K/32, 16] scale has 32 -- the double_quant half of this test
+    # would be vacuous on it.
+    model = _int4_matmul_model(K=64, N=64, seed=0)
+    calibration_data = _salient_channel_calibration(K=64, num_samples=64, seed=1)
+    config = onnxsim.QuantizationConfig(
+        scheme="weight_only",
+        dtype="int4",
+        awq=True,
+        qat=True,
+        double_quant=True,
+        qat_num_iterations=8,
+        qat_learning_rate=1e-2,
+        calibration_data=calibration_data,
+    )
+
+    dispatched = onnxsim.quantize(model, config)
+
+    manual = onnxsim.quantize_weight_only_int4(model)
+    manual = onnxsim.apply_awq(model, manual, calibration_data=calibration_data)
+    manual, _ = onnxsim.apply_qat_all_blocks(
+        model,
+        manual,
+        calibration_data=calibration_data,
+        num_iterations=8,
+        learning_rate=1e-2,
+    )
+    manual = onnxsim.apply_double_quantization(manual)
+
+    assert dispatched.SerializeToString() == manual.SerializeToString()
+    # Why the order is fixed rather than a preference: run the other way
+    # round, there is nothing left for QAT to recognize as a quantized layer.
+    double_quantized = onnxsim.apply_double_quantization(
+        onnxsim.quantize_weight_only_int4(model)
+    )
+    assert onnxsim.discover_qat_blocks(model, double_quantized) == []
+
+
+def test_quantize_static_qat_flag_trains_the_qdq_scheme():
+    """``scheme="static"`` must reach ``apply_qat_all_blocks`` with
+    ``learn_activation_scales=True``. With it left off, apply_qat would look
+    for INT4 layers in a model that has none and skip every block -- so this
+    failing means the static path either doesn't run QAT or runs the mode that
+    cannot train this scheme."""
+    model = _linear_model(K=64, N=32)
+    rng = np.random.default_rng(7)
+    calibration_data = [{"X": rng.standard_normal((4, 64)).astype(np.float32)}]
+    config = onnxsim.QuantizationConfig(
+        scheme="static",
+        qat=True,
+        qat_num_iterations=8,
+        calibration_data=calibration_data,
+    )
+
+    dispatched = onnxsim.quantize(model, config)
+
+    plain = onnxsim.quantize_static(model, calibration_data=calibration_data)
+    direct, results = onnxsim.apply_qat_all_blocks(
+        model,
+        plain,
+        calibration_data=calibration_data,
+        num_iterations=8,
+        learn_activation_scales=True,
+    )
+
+    assert [r.trained for r in results] == [True]
+    assert dispatched.SerializeToString() == direct.SerializeToString()
+    assert dispatched.SerializeToString() != plain.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        {"scheme": "dynamic"},
+        {"scheme": "weight_only", "dtype": "int8"},
+        {"scheme": "static_int16", "dtype": "int16"},
+        {"scheme": "qoperator"},
+        {"scheme": "float", "dtype": "float16"},
+    ],
+)
+def test_qat_flag_silently_ignored_for_schemes_apply_qat_does_not_target(
+    config_kwargs,
+):
+    """``qat`` applies to exactly the two schemes ``apply_qat`` can train
+    (weight_only/int4 and static/int8). For every other scheme it is ignored
+    like the int4-only flags are -- byte-identically, with no warning: a
+    failure here means the config silently spent a training budget on a model
+    apply_qat cannot fine-tune, or refused a scheme this dispatcher has always
+    accepted."""
+    model = _linear_model(K=64, N=32)
+    plain = onnxsim.quantize(model, onnxsim.QuantizationConfig(**config_kwargs))
+    flagged = onnxsim.quantize(
+        model, onnxsim.QuantizationConfig(**config_kwargs, qat=True)
+    )
+    assert plain.SerializeToString() == flagged.SerializeToString()
+
+
+def test_quantize_warns_when_qat_trains_no_block():
+    """A model with no quantizable MatMul has no block to train, and
+    ``apply_qat_all_blocks`` reports that by returning an unmodified copy
+    rather than raising. ``quantize()`` must not pass that off as a
+    fine-tuned model: the caller asked for the most expensive flag on the
+    config and got nothing for it."""
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = Add(X, B)
+        }
+        """,
+        [onnx.numpy_helper.from_array(np.ones(8, dtype=np.float32), "B")],
+    )
+    config = onnxsim.QuantizationConfig(
+        scheme="weight_only", dtype="int4", qat=True, qat_num_iterations=8
+    )
+
+    with pytest.warns(UserWarning, match="qat trained no block"):
+        quantized = onnxsim.quantize(model, config)
+
+    # Warned, not raised -- and what comes back is the ordinary quantization.
+    assert quantized.SerializeToString() == (
+        onnxsim.quantize_weight_only_int4(model).SerializeToString()
+    )
+
+
 def test_quantize_static_passes_through_calibration_settings():
     model = _linear_model(K=8, N=4)
     rng = np.random.default_rng(5)

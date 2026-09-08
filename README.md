@@ -94,11 +94,13 @@ constant folding until the model stops changing. Around that it offers:
   simplified ONNX deployment directory with
   `onnxsim.export_diffusion_model()`.
 - **[Quantization-aware fine-tuning](#quantization-aware-fine-tuning).**
-  Recover accuracy an INT4 weight-only quantization lost with
-  `onnxsim.apply_qat()`: label-free, block-wise fine-tuning of the fp32
-  weights themselves against the float model's own activations, over any
-  block topology. The training step is emitted as an ONNX graph, so it runs
-  on a GPU, an NPU execution provider or WebGPU via `step_providers=`.
+  Recover accuracy a quantization lost with `onnxsim.apply_qat()`:
+  label-free, block-wise fine-tuning of the fp32 weights themselves against
+  the float model's own activations, over any block topology --- and, with
+  `learn_activation_scales=True`, of `quantize_static`'s activation
+  quantizers jointly with them. The training step is emitted as an ONNX
+  graph, so it runs on a GPU, an NPU execution provider or WebGPU via
+  `step_providers=`.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **[MLIR export](#exporting-to-mlir-torch-mlir--onnx-mlir).** Hand the simplified
@@ -1257,10 +1259,14 @@ Two things here are genuinely new:
   state, loss)` function (`onnxsim/qat_graph.py`) -- so the loop runs on
   whatever execution providers `step_providers=` names: a GPU, an NPU
   execution provider, or WebGPU in the WASM build, rather than in host numpy.
-  The emitted graph stays inside `qat_graph.EP_FRIENDLY_OPS`, the operator set
-  those backends actually implement, and `onnxsim.backend.Runner` keeps the
-  parameters and the optimizer state resident on the provider's device between
-  steps, so only the per-step scalars go up and the loss comes down.
+  The parts onnxsim emits -- the fake-quant, the backward, the optimizer --
+  stay inside `qat_graph.EP_FRIENDLY_OPS`, a deliberately small operator set;
+  the block's own forward nodes are copied in as they are, so whether a
+  particular block's step graph runs on a particular accelerator also depends
+  on that backend's coverage of the operators the block itself contains.
+  `onnxsim.backend.Runner` keeps the parameters and the optimizer state
+  resident on the provider's device between steps, so only the per-step
+  scalars go up and the loss comes down.
 
 A block is named by its input and output tensor, exactly the way
 `apply_brecq` names one:
@@ -1301,9 +1307,18 @@ inferred statically are all refused before any calibration runs.
 `learn_scales=True` trains each weight's per-block quantization scale
 alongside, LSQ-style (off by default, since it makes the problem non-convex in
 two coupled parameter sets at once). The whole calibration set is one
-full-batch objective -- no minibatching, no epochs, a calibration-scale budget
-rather than a training-scale one -- and activation quantization is not wired
-in: this targets `quantize_weight_only_int4`'s weight-only scheme.
+full-batch objective by default -- `batch_size=` opts into minibatching, but
+the budget stays a calibration-scale one either way.
+
+By default this targets `quantize_weight_only_int4`'s weight-only scheme.
+`learn_activation_scales=True` instead targets `quantize_static`'s QDQ scheme
+-- uint8 asymmetric activations, per-output-channel INT8 weights -- and trains
+each layer's activation `(scale, zero_point)` jointly with its weights. The
+flag necessarily *selects a scheme* rather than adding a feature to the other
+one: a weight-only model has no activation quantizer anywhere to train, and
+inserting one would invent a W4A8 model no `quantize_*` function here emits.
+Asking for the wrong pairing raises with the mismatch named, in both
+directions. `activation_learning_rate=` (default `1e-2`) tunes it.
 
 ### When to reach for it, and when not to
 
@@ -1326,16 +1341,31 @@ measured that on your model, and "QAT beats AdaRound" is not a claim it
 makes. Both directions are measured in `tests/test_qat.py`, not
 assumed.
 
+`learn_activation_scales` has a boundary of its own, and it is the same shape.
+On a block whose activation range was calibrated from one unrepresentative
+outlier -- ~30x too wide, so activation quantization is the binding constraint
+-- training the quantizers alongside the weights takes the whole-model output
+error from 4.08 (weights alone) to 2.54, 38% better, on all three seeds tried.
+On the *same* block calibrated on representative data it is a small regression
+at every learning rate tried: min/max on representative data is already close
+to MSE-optimal, so there is little left for a learned clip range to find, and a
+second coupled parameter group makes a solved problem harder rather than a hard
+one easier. It is a fix for a quantizer whose range is *wrong*, not a free
+improvement on one whose range is right --- and when re-calibrating is
+available at all, that costs one forward pass rather than a training budget.
+
 So: reach for `apply_qat` for a block no rounding pass here can reconstruct (a
 normalization, an activation, a GELU, a residual in the middle of it), and for
-low-rank calibration activations at 4 bits. Stay with `apply_adaround` for a
-single well-conditioned layer.
+low-rank calibration activations at 4 bits. Reach for
+`learn_activation_scales=True` when a `quantize_static` model's activation
+ranges are the binding constraint and re-calibrating them is not an option.
+Stay with `apply_adaround` for a single well-conditioned layer.
 
-### Running AdaRound and AdaQuant on an accelerator
+### Running AdaRound, AdaQuant and AutoRound on an accelerator
 
-The step-graph machinery is not QAT-only. `apply_adaround` and
-`apply_adaquant` take the same `step_providers=` argument, which runs their
-optimization loop as an ONNX step graph instead of in host numpy:
+The step-graph machinery is not QAT-only. `apply_adaround`, `apply_adaquant`
+and `apply_autoround` take the same `step_providers=` argument, which runs
+their optimization loop as an ONNX step graph instead of in host numpy:
 
 ```python
 tuned = onnxsim.apply_adaround(

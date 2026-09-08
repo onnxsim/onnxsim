@@ -79,6 +79,19 @@ rm -rf "${SYSROOT}/work/scripts"
 mkdir -p "${SYSROOT}/work/scripts/apple"
 cp "${REPO_ROOT}/scripts/apple/check_decode_parity.py" "${SYSROOT}/work/scripts/apple/"
 
+# tests/test_qat_parity.py loads scripts/make_qat_parity_fixtures.py by path
+# and reads onnxsim/qat_parity_fixtures.txt, neither of which is under tests/.
+# Copy both in for the same reason as check_decode_parity.py above -- and it is
+# worth running here rather than skipping: the fixture is generated on a
+# little-endian host, so a big-endian run of this test is what proves the
+# Python emitter's raw_data handling is byte-order independent. The C++ half
+# (qat_graph_parity_test) already covers the other direction under ctest.
+# The generator imports only json/numpy/onnx plus onnxsim.qat_graph, all of
+# which the chroot already has.
+cp "${REPO_ROOT}/scripts/make_qat_parity_fixtures.py" "${SYSROOT}/work/scripts/"
+mkdir -p "${SYSROOT}/work/onnxsim"
+cp "${REPO_ROOT}/onnxsim/qat_parity_fixtures.txt" "${SYSROOT}/work/onnxsim/"
+
 echo "== environment =="
 chroot "${SYSROOT}" /bin/sh -c 'cd /work && PYTHONPATH=/work/pylibs python3 -c "
 import sys, numpy, onnx, onnxsim

@@ -72,3 +72,13 @@ jobs:
       - name: Run before/after comparison test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:compare
+      # Runs the committed QAT step-graph fixtures through onnxruntime-web and
+      # prints which execution providers actually executed the operators
+      # onnxsim/qat_graph.py's EP_FRIENDLY_OPS claims coverage for. wasm is the
+      # only EP a headless runner can reach, and the only one this asserts;
+      # WebGPU and WebNN are attempted and reported as unreached. Set
+      # ORT_REQUIRE=wasm,webgpu on a runner that has a GPU to make WebGPU a
+      # hard requirement there instead.
+      - name: Run step-graph EP coverage test (wasm EP; webgpu/webnn reported)
+        working-directory: scripts/convertmodel
+        run: npm run test:stepgraph

@@ -718,15 +718,21 @@ class BoundStepLoop:
         self._resident = resident
         self._slot = 0
 
-    def step(self, scalars: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    def step(self, feeds: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """Run one step and return the host-side outputs.
 
-        ``scalars`` are the only inputs that go up per step: they are bound
-        from host memory each time (they are rank-0, so the transfer is
-        nothing), while the constants stay bound from :meth:`Runner.bind_loop`
-        and the state is bound from the buffers below.
+        ``feeds`` are the only inputs that go up per step: they are bound from
+        host memory each time, while the constants stay bound from
+        :meth:`Runner.bind_loop` and the state is bound from the buffers
+        below. They are normally rank-0 -- a learning rate, Adam's bias
+        corrections -- so the transfer is nothing; a minibatched loop also
+        sends its row index here (see
+        :func:`onnxsim.qat_graph.minibatch_indices`), which is a handful of
+        int64s and equally nothing. Anything genuinely large fed through here
+        would defeat the point of the binding, since it is host memory going
+        to the device on every step.
         """
-        for name, value in scalars.items():
+        for name, value in feeds.items():
             self._binding.bind_cpu_input(name, value)
 
         # Ping-pong: read this step's state out of one buffer, write the next
