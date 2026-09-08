@@ -1,0 +1,121 @@
+name: RKNN3 Integration
+
+# Compiles and runs onnxsim's output through Rockchip's real RKNN3-Toolkit
+# `load_llm()` converter + PC simulator -- the LLM/VLM conversion entry point
+# in RKNN3-Toolkit (airockchip/rknn3-toolkit, the RK1820/RK1828/RK3572 NPU
+# line's *next-gen*, `rknn-toolkit2`-incompatible SDK), to catch
+# simplifications that break `load_llm()` compatibility or change the
+# simulator result. Runs entirely on a stock x86-64 CPU runner -- no
+# RK1820/RK1828/RK3572 device needed. See scripts/rknn3/README.md for the
+# fidelity tier this does and does not cover, and for three real
+# compatibility issues this harness works around.
+#
+# Unlike rknn-integration.yml's rknn-toolkit2 (a real PyPI package), RKNN3-
+# Toolkit's wheel is not on PyPI -- only cp310/cp312 Linux/macOS wheels
+# checked into its own GitHub repo, so this job fetches it with a shallow
+# git clone instead of `pip install`.
+#
+# Scheduled + on demand, plus on PRs that touch the harness so it stays
+# valid.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Mondays 08:00 UTC (weekly, offset from rknn-integration.yml)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/rknn3-integration.yml"
+      - "scripts/rknn3/**"
+      - "scripts/common/**"
+      - "tests/test_rknn3_compat.py"
+
+concurrency:
+  group: rknn3-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-rknn3
+          path: ./wheelhouse/*.whl
+
+  rknn3:
+    name: RKNN3 load_llm() compatibility check
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # RKNN3-Toolkit ships only cp310/cp312 wheels (no cp311), unlike
+          # rknn-toolkit2's cp310/cp311/cp312 set -- see scripts/rknn3/README.md.
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-rknn3
+          path: wheelhouse
+      - name: Fetch RKNN3-Toolkit wheel (not on PyPI)
+        run: |
+          git clone --depth 1 https://github.com/airockchip/rknn3-toolkit /tmp/rknn3-toolkit-src
+          cp /tmp/rknn3-toolkit-src/rknn3-toolkit/packages/rknn3_toolkit-1.1.0-cp312-cp312-manylinux2014_x86_64.whl wheelhouse/
+          cp /tmp/rknn3-toolkit-src/rknn3-toolkit/packages/requirements_cp312-1.1.0.txt wheelhouse/rknn3-requirements.txt
+      - name: Install onnxsim wheel + RKNN3-Toolkit + HF export deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r wheelhouse/rknn3-requirements.txt
+          python -m pip install wheelhouse/rknn3_toolkit-1.1.0-cp312-cp312-manylinux2014_x86_64.whl
+          # the ONNX-export side (scripts/rknn3/llm_export.py) -- not part
+          # of RKNN3-Toolkit's own requirements, which only consume ONNX.
+          python -m pip install torch transformers jinja2 accelerate
+          # wheelhouse/ also holds the RKNN3-Toolkit wheel copied above
+          # (rknn3_toolkit-*.whl), already installed -- name this one
+          # explicitly rather than globbing wheelhouse/*.whl.
+          python -m pip install wheelhouse/onnxsim-*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the other integration workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim; print('onnxsim', onnxsim.__version__)"
+          python -c "import sys, os; sys.path.insert(0, os.path.join(os.environ['GITHUB_WORKSPACE'], 'scripts', 'rknn3')); import rknn3_backend as rb; print('RKNN3 available:', rb.RKNN3_AVAILABLE, '| model:', rb.MODEL_NAME if rb.RKNN3_AVAILABLE else rb.unavailable_reason())"
+      - name: Run RKNN3 load_llm() compatibility check
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/rknn3/run_rknn3_compat.py" \
+            --require-rknn3 \
+            --output rknn3-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: rknn3-compat-report
+          path: ${{ runner.temp }}/rknn3-compat.csv
+          if-no-files-found: ignore
