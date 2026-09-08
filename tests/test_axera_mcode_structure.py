@@ -4561,6 +4561,55 @@ def _check_weight_retargeting(tmp_path, ort, channels):
     assert corr(npu_old, ref_new) < 0.9, corr(npu_old, ref_new)
 
 
+def _operand_field(mcode, verb, field, bank, lo, hi, ordinal=0):
+    """One bitfield of the `ordinal`-th write to a register, or None."""
+    values = _operands(mcode, verb, field, bank)
+    if len(values) <= ordinal:
+        return None
+    mask = (1 << (hi - lo + 1)) - 1
+    return (values[ordinal] >> lo) & mask
+
+
+def test_spatial_extent_lives_in_three_bits_of_b0_03(tmp_path):
+    """Confirmed real (see the README's "A second operand" section): bits 4
+    to 6 of the first `a1 b0.03` operand are the input's spatial extent in
+    16-element tiles, minus one -- the same inclusive convention `40.02` uses
+    for channels.
+
+    The invariance is the evidence, not the fit. The field tracks the length
+    and *only* the length: changing the input channels, the output channels,
+    the kernel size or the dilation leaves it alone, which is what separates
+    a spatial field from the several other operands that also happen to move
+    with the length. Needs Docker, no device.
+    """
+    base = dict(cin=32, cout=32, length=64, kernel=3, dilation=1)
+
+    def field_for(**overrides):
+        cfg = dict(base, **overrides)
+        work = tmp_path / "_".join(
+            f"{k}{v}" for k, v in sorted(overrides.items()) or [("base", 0)]
+        )
+        work.mkdir()
+        model = _one_conv_model(
+            cfg["cin"],
+            cfg["cout"],
+            cfg["length"],
+            cfg["kernel"],
+            cfg["dilation"],
+        )
+        mcode = _build_single_op(str(work), "m", model)
+        return _operand_field(mcode, 0xA1, 0xB0, 0x03, 4, 6)
+
+    # It follows the length, in 16-element tiles, inclusive.
+    for length in (32, 64, 96):
+        assert field_for(length=length) == length // 16 - 1, length
+
+    # ... and nothing else moves it.
+    reference = 64 // 16 - 1
+    for overrides in ({"cin": 16}, {"cout": 64}, {"kernel": 7}, {"dilation": 4}):
+        assert field_for(**overrides) == reference, overrides
+
+
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
     """Confirmed real (see the README's "The first operand with a known
     meaning" section): in a program holding exactly one convolution, the
