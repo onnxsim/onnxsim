@@ -1366,7 +1366,7 @@ Stay with `apply_adaround` for a single well-conditioned layer.
 
 ### The same loop with the quantizer removed: `onnxsim.apply_block_finetune()`
 
-Only one thing in the paragraphs above is about quantization: the fake-quantizer
+Only one part of the loop above is specific to quantization: the fake-quantizer
 between the master weight and the block's own node. Take it out and what is
 left -- a block, a reference model's activation at its output, a reconstruction
 loss, `graph_grad`'s backward, an Adam step graph -- is ordinary block-wise,
@@ -1412,12 +1412,12 @@ onnx.save(tuned, "model_pruned_finetuned.onnx")
 **How much calibration data it gets dominates everything else**, and a falling
 loss is not evidence that the model improved. On a `MatMul`/`Relu`/`MatMul`
 block (16x16 fp32 weights, N(0, 0.15) noise on the second one, 300 iterations
-at lr 2e-2) the training loss falls 1700-5200x -- 0.2597 to 0.000154 on one
-seed -- while the end-to-end error against the reference, averaged over 8
-held-out input batches, only falls to 0.64-0.78 of the untuned model's. Varying
-only the number of calibration rows, the mean held-out error ratio over 4 seeds
-is 0.70 at 16 rows, 0.06 at 64, 0.004 at 256 and 0.002 at 1024: 16 rows is as
-many rows as each weight has input channels, so the fit interpolates the
+at lr 2e-2) the training loss falls by roughly 1700-5200x -- 0.2597 to 0.000154
+on one seed -- while the end-to-end error against the reference, averaged over
+8 held-out input batches, only falls to 0.64-0.78 of the untuned model's.
+Varying only the number of calibration rows, the mean held-out error ratio over
+4 seeds is 0.70 at 16 rows, 0.06 at 64, 0.004 at 256 and 0.002 at 1024: 16 rows
+is as many rows as each weight has input channels, so the fit interpolates the
 calibration set instead of generalizing. Note that `num_samples` defaults to 8
 *batches* of random data, which for a model with a small batch dimension is on
 the wrong side of that cliff -- real data

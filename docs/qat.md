@@ -425,16 +425,16 @@ Note also what it does *not* preserve: the optimizer updates every element of
 a trained weight, with no sparsity mask anywhere in the step graph. On a
 magnitude-pruned (unstructured) model that is fatal to the thing that was
 bought -- measured on a two-layer block at 50% sparsity, 128 zeros per weight
-before, **0 after**, with the loss falling three orders of magnitude on the
-way. Fine-tuning a model whose value is its zeros needs a masked optimizer
-this does not have.
+before and **0 after**, while the block's loss fell 0.140 -> 5.3e-06.
+Fine-tuning a model whose value is its zeros needs a masked optimizer this
+does not have.
 
 ### Measured, and the measurement is the point
 
 The honest headline is not the loss curve. On a `MatMul`/`Relu`/`MatMul` block
 (16x16 fp32 weights, N(0, 0.15) noise on the second weight, 300 iterations at
-lr 2e-2, full batch), the *training* loss falls by 1700-5200x -- e.g. 0.2597
--> 0.000154 -- while the end-to-end output error, measured against the
+lr 2e-2, full batch), the *training* loss falls by roughly 1700-5200x -- e.g.
+0.2597 -> 0.000154 -- while the end-to-end output error, measured against the
 reference on 8 held-out input batches the tuning never saw, only falls to
 0.64-0.78 of the student's. The block-local objective is fitted almost
 exactly and generalizes far less well, which is the same warning
@@ -453,8 +453,9 @@ the untuned student over 4 seeds (lower is better):
 | 1024 | 0.002 |
 
 16 rows is a fit with as many rows as each weight has input channels, so it
-interpolates the calibration set and takes most of the error with it; by 64
-rows it recovers ~94% of the error and by 256 rows ~99.6%. The same cliff
+interpolates the calibration set and leaves most of the error standing
+anywhere else; by 64 rows it recovers ~94% of the error and by 256 rows
+~99.6%. The same cliff
 shows up in `apply_block_finetune_all_blocks` over a 5-layer MLP (3 blocks
 discovered, all trained, 300 iterations each): a mean held-out ratio of 0.46
 at 16 rows against 0.015 at 256, over 3 seeds. The rows-versus-channels
