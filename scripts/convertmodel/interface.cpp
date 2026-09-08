@@ -6,6 +6,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
 #include "precision_estimator.h"
+#include "qat_entry.h"
 #include "tensor_pool.h"
 #include "tensor_pool_bridge.h"
 #include "tensor_pool_gguf_bridge.h"
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1133,6 +1135,304 @@ em::val onnxsim_quantize_qoperator(const std::string &data, em::val names_ary,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Block-wise QAT (onnxsim/qat_entry.h).
+//
+// Only the graph surgery crosses this boundary. Building the step graph is
+// what cannot be done without onnxsim; *running* it is an ordinary inference
+// loop -- bind the captured activations and the initial state, run the graph
+// once per step, feed each state output back into its state input -- and the
+// page already has a runtime for that (onnxruntime-web), so the loop stays in
+// JS. qat_entry.h's "intended browser flow" comment is the contract; the
+// object onnxsim_qat_build_step_graph returns names every piece of it, so a
+// caller never has to guess a tensor name.
+
+// QatOptions as a plain JS object with named fields:
+//
+//   { learnScales, learnActivationScales, batchSize, batchSeed, shuffle }
+//
+// Named fields rather than five positional arguments because they are
+// independent knobs that each already have a default: an absent (or
+// null/undefined) field keeps QatOptions' own, so `{}` means "full batch,
+// train the weights only" -- apply_qat's default -- and a caller that wants
+// one knob writes one field. `batchSize`/`batchSeed` arrive as JS numbers
+// (doubles) and are truncated to the int64 fields they feed; nothing here is
+// large enough for that to lose anything.
+QatOptions QatOptionsFromVal(em::val options) {
+  QatOptions out;
+  if (options.isUndefined() || options.isNull())
+    return out;
+  auto read_bool = [&options](const char *key, bool &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = v.as<bool>();
+  };
+  auto read_int = [&options](const char *key, int64_t &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = static_cast<int64_t>(v.as<double>());
+  };
+  read_bool("learnScales", out.learn_scales);
+  read_bool("learnActivationScales", out.learn_activation_scales);
+  read_int("batchSize", out.batch_size);
+  read_int("batchSeed", out.batch_seed);
+  read_bool("shuffle", out.shuffle);
+  return out;
+}
+
+// One TensorProto as { name, dtype, dims, data } -- deliberately the same
+// shape onnxsim_parse_tensor returns, so the page decodes a QAT state tensor
+// with the code it already has for a backend test's .pb. `data` is a view over
+// `storage`, which the caller owns and must keep alive for as long as JS holds
+// the view.
+em::val QatTensorToVal(const onnx::TensorProto &tensor, std::string &storage) {
+  em::val out = em::val::object();
+  out.set("name", tensor.name());
+  out.set("dtype", static_cast<int>(tensor.data_type()));
+  em::val dims = em::val::array();
+  for (int i = 0; i < tensor.dims_size(); ++i) {
+    dims.set(i, static_cast<double>(tensor.dims(i)));
+  }
+  out.set("dims", dims);
+  if (!TensorProtoToRawBytes(tensor, storage)) {
+    // Every state tensor a step graph has is float32, so this is a "cannot
+    // happen" that says so rather than handing back a silently empty buffer.
+    std::ostringstream os;
+    os << "unsupported tensor data type " << tensor.data_type();
+    out.set("error", os.str());
+    storage.clear();
+  }
+  out.set("data",
+          em::val(em::typed_memory_view(
+              storage.size(), reinterpret_cast<uint8_t *>(storage.data()))));
+  return out;
+}
+
+// The plans onnxsim_qat_build_step_graph has built, alive on the C++ side and
+// named to JS by an integer handle.
+//
+// A QatStepPlan is not a JS-shaped value: each QatTrainedLayer carries a whole
+// TensorProto (the frozen weight scale) plus the block geometry
+// WriteBackQatState re-derives integer codes from, and spelling all of that
+// out across the boundary would be a second, hand-maintained encoding of a
+// struct whose only reader is a C++ function. So the plan stays here and JS
+// gets `planHandle`, hands it back to onnxsim_qat_write_back, and drops it
+// with onnxsim_qat_release_plan. Nothing expires on its own: a page that
+// trains block after block without releasing keeps every step graph it built.
+std::map<int, QatStepPlan> &QatPlans() {
+  static std::map<int, QatStepPlan> plans;
+  return plans;
+}
+
+// Builds the step graph for one block of `quantized_data` against the float
+// model that produced it -- BuildQatStepGraph, reachable from the page.
+//
+// `num_rows` is how many calibration rows the caller will bind (the leading
+// dimension of every captured activation). It is a shape, not data: nothing
+// here runs either model, and the activations themselves never cross this
+// boundary in this direction.
+//
+// Returns null on a parse failure or a refused block (the reason goes to
+// stderr, which the worker mirrors into the page's log, as with every other
+// binding here), else:
+//
+//   {
+//     stepGraph:  Uint8Array,                  // serialized ModelProto
+//     planHandle: number,                      // for onnxsim_qat_write_back
+//     state:      [{ input, output }],         // feed `output` back to `input`
+//     scalars:    [string],                    // fresh scalar float per step
+//     loss:       string,                      // "" when the graph has none
+//     captures:   [{ input, source, dims, teacher }],
+//     initialState: [{ name, dtype, dims, data }],
+//     rowIndexInput: string,                   // "" unless batchSize > 0
+//     rowIndexSize:  number,
+//     numRows:       number,
+//   }
+//
+// Driving the loop from that: bind every `initialState` tensor by its name and
+// every capture (read `source` out of the float model, bind it as `input` --
+// they differ whenever the step graph renames a tensor, e.g. under a
+// minibatch, so binding by `source` would train on the wrong buffer); then per
+// step feed the `scalars` (the learning rates plus Adam's two bias-correction
+// factors) and, with a minibatch, `rowIndexSize` int64 row indices under
+// `rowIndexInput`; read `loss` for diagnostics; and carry each state pair's
+// `output` value into its `input` for the next step.
+//
+// Like every other model-returning binding here, `stepGraph` and each
+// `initialState.data` are views over buffers reused by the next call -- copy
+// them out (a fresh Uint8Array, or straight into an onnxruntime-web tensor)
+// before calling back in.
+em::val onnxsim_qat_build_step_graph(const std::string &float_data,
+                                     const std::string &quantized_data,
+                                     const std::string &block_input_name,
+                                     const std::string &block_output_name,
+                                     int num_rows, em::val options) {
+  onnx::ModelProto float_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size())) {
+    std::cerr << "Parse failed (float model)" << std::endl;
+    return em::val::null();
+  }
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed (quantized model)" << std::endl;
+    return em::val::null();
+  }
+
+  QatStepPlan plan;
+  try {
+    plan = BuildQatStepGraph(float_model, quantized_model, block_input_name,
+                             block_output_name, num_rows,
+                             QatOptionsFromVal(options));
+  } catch (const std::exception &e) {
+    // BuildQatStepGraph refuses loudly -- an unclosed block, a node with no
+    // gradient rule (named), a block with no layer of the requested scheme --
+    // and the message is the actionable half, so it goes to the log.
+    std::cerr << "qat_build_step_graph error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+
+  em::val step_graph = SerializeModel(plan.step_graph);
+  if (step_graph.isNull()) {
+    return em::val::null();
+  }
+
+  em::val out = em::val::object();
+  out.set("stepGraph", step_graph);
+
+  em::val state = em::val::array();
+  for (size_t i = 0; i < plan.state.size(); ++i) {
+    em::val entry = em::val::object();
+    entry.set("input", plan.state[i].first);
+    entry.set("output", plan.state[i].second);
+    state.set(i, entry);
+  }
+  out.set("state", state);
+
+  em::val scalars = em::val::array();
+  for (size_t i = 0; i < plan.scalars.size(); ++i) {
+    scalars.set(i, plan.scalars[i]);
+  }
+  out.set("scalars", scalars);
+  out.set("loss", plan.loss_name);
+
+  em::val captures = em::val::array();
+  for (size_t i = 0; i < plan.captures.size(); ++i) {
+    const QatCapture &capture = plan.captures[i];
+    em::val entry = em::val::object();
+    entry.set("input", capture.step_graph_input);
+    entry.set("source", capture.source_tensor);
+    em::val dims = em::val::array();
+    for (size_t d = 0; d < capture.dims.size(); ++d) {
+      dims.set(d, static_cast<double>(capture.dims[d]));
+    }
+    entry.set("dims", dims);
+    entry.set("teacher", capture.is_teacher);
+    captures.set(i, entry);
+  }
+  out.set("captures", captures);
+
+  // One buffer per initial-state tensor, all of them live at once (unlike
+  // onnxsim_parse_tensor's single static string, which only ever backs one
+  // tensor at a time). Sized up front so the vector never reallocates while
+  // the views into its elements are being made; reused, and so overwritten, by
+  // the next call to this function.
+  static std::vector<std::string> initial_state_raw;
+  initial_state_raw.assign(plan.initial_state.size(), std::string());
+  em::val initial_state = em::val::array();
+  for (size_t i = 0; i < plan.initial_state.size(); ++i) {
+    initial_state.set(
+        i, QatTensorToVal(plan.initial_state[i], initial_state_raw[i]));
+  }
+  out.set("initialState", initial_state);
+
+  out.set("rowIndexInput", plan.row_index_input);
+  out.set("rowIndexSize", static_cast<double>(plan.row_index_size));
+  out.set("numRows", static_cast<double>(plan.num_rows));
+
+  static int next_plan_handle = 1;
+  const int handle = next_plan_handle++;
+  QatPlans().emplace(handle, std::move(plan));
+  out.set("planHandle", handle);
+  return out;
+}
+
+// Writes a finished loop's state back into the quantized model --
+// WriteBackQatState, reachable from the page. Returns the tuned model's bytes,
+// or null (with the reason on stderr) if the model will not parse, the handle
+// is not a live plan, an entry is malformed, or the write-back itself refuses.
+//
+// `plan_handle` is the `planHandle` onnxsim_qat_build_step_graph returned.
+// `final_state` is the loop's last state values as
+// `{ <state input name>: { dims: [...], data: Float32Array } }` -- which is
+// exactly the shape of an onnxruntime-web output tensor, so the last step's
+// outputs can be handed back as they come, re-keyed from each state pair's
+// `output` to its `input`. Every state tensor a step graph carries is float32,
+// so that is what the values are read as.
+//
+// The plan is *not* released here: a caller may write back more than once
+// (e.g. to compare a mid-training snapshot against the final one). Call
+// onnxsim_qat_release_plan when the block is done.
+em::val onnxsim_qat_write_back(const std::string &data, int plan_handle,
+                               em::val final_state) {
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  auto plan = QatPlans().find(plan_handle);
+  if (plan == QatPlans().end()) {
+    std::cerr << "qat_write_back error: no plan with handle " << plan_handle
+              << " (already released?)" << std::endl;
+    return em::val::null();
+  }
+  if (final_state.isUndefined() || final_state.isNull()) {
+    std::cerr << "qat_write_back error: final state is missing" << std::endl;
+    return em::val::null();
+  }
+
+  std::map<std::string, onnx::TensorProto> state;
+  em::val keys = em::val::global("Object").call<em::val>("keys", final_state);
+  for (const std::string &name : em::vecFromJSArray<std::string>(keys)) {
+    em::val entry = final_state[name];
+    em::val dims = entry["dims"];
+    em::val values = entry["data"];
+    if (dims.isUndefined() || dims.isNull() || values.isUndefined() ||
+        values.isNull()) {
+      std::cerr << "qat_write_back error: final state entry '" << name
+                << "' needs both dims and data" << std::endl;
+      return em::val::null();
+    }
+    onnx::TensorProto &tensor = state[name];
+    tensor.set_name(name);
+    tensor.set_data_type(onnx::TensorProto::FLOAT);
+    for (double dim : em::convertJSArrayToNumberVector<double>(dims)) {
+      tensor.add_dims(static_cast<int64_t>(dim));
+    }
+    // raw_data, little-endian, matching what the emitter itself writes for
+    // every tensor it builds (qat_graph_builder.cpp) -- one encoding on both
+    // sides of the loop.
+    const std::vector<float> raw =
+        em::convertJSArrayToNumberVector<float>(values);
+    tensor.set_raw_data(raw.data(), raw.size() * sizeof(float));
+  }
+
+  try {
+    return SerializeModel(
+        WriteBackQatState(quantized_model, plan->second, state));
+  } catch (const std::exception &e) {
+    std::cerr << "qat_write_back error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// Drops a plan onnxsim_qat_build_step_graph handed out. True if it was there.
+// A plan holds its whole step graph, so a page training block after block
+// should release each one as it finishes rather than at the end.
+bool onnxsim_qat_release_plan(int plan_handle) {
+  return QatPlans().erase(plan_handle) > 0;
+}
+
 EMSCRIPTEN_BINDINGS(module) {
   function("onnxsimplify_export", &onnxsimplify_export);
   function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -1179,6 +1479,13 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_add_graph_outputs", &onnxsim_add_graph_outputs);
   function("onnxsim_quantize_static", &onnxsim_quantize_static);
   function("onnxsim_quantize_qoperator", &onnxsim_quantize_qoperator);
+
+  // Block-wise QAT: build one block's step graph, run the loop in JS on
+  // onnxruntime-web, write the trained state back (see the doc comments
+  // above, and onnxsim/qat_entry.h for the flow they implement).
+  function("onnxsim_qat_build_step_graph", &onnxsim_qat_build_step_graph);
+  function("onnxsim_qat_write_back", &onnxsim_qat_write_back);
+  function("onnxsim_qat_release_plan", &onnxsim_qat_release_plan);
 
   em::register_vector<std::string>("string_list");
 }
