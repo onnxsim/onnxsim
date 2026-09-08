@@ -4090,6 +4090,84 @@ def _read_weight2d_code_at(wbt, base, o, i, kh, kw, kernel, cin):
     return value
 
 
+def _conv_channel0_addresses(shape):
+    """Where output channel 0's weights live, relative to a layer's base, as
+    `(offsets, shifts or None, plane offsets)`.
+
+    Three packings, chosen by shape -- this is the whole point: the format
+    does not have *a* weight layout, the convolution's shape picks one.
+
+    * a narrow input (under four channels) stores plain INT8 bytes with the
+      kernel row fastest: `3*i + kh + 12*kw`;
+    * a 1x1 convolution stores plain INT8 bytes too, but chunks the input
+      channels 36 at a time with the next chunk 144 bytes on;
+    * anything wider bit-slices into four 2-bit planes (`_weight2d_offset`).
+    """
+    cin, kernel = shape[1], shape[2]
+    if cin < 4:
+        offsets, picks = [], []
+        for i in range(cin):
+            for kh in range(kernel):
+                for kw in range(kernel):
+                    offsets.append(3 * i + kh + 12 * kw)
+                    picks.append((i, kh, kw))
+        return np.array(offsets), None, (0,), picks
+    if kernel == 1:
+        offsets = [144 * (i // 36) + (i % 36) for i in range(cin)]
+        return np.array(offsets), None, (0,), [(i, 0, 0) for i in range(cin)]
+    slice_in = min(cin, _WBT2D_UNIT_CAP)
+    offsets, shifts, picks = [], [], []
+    for i in range(slice_in):
+        for kh in range(kernel):
+            for kw in range(kernel):
+                off, shift = _weight2d_offset(0, i, kh, kw, kernel, cin)
+                offsets.append(off)
+                shifts.append(shift)
+                picks.append((i, kh, kw))
+    return np.array(offsets), np.array(shifts), _wbt2d_planes(cin), picks
+
+
+def _locate_conv_weights_any(wbt, weights, step=4, samples=120):
+    """Locate any convolution's weight block, dispatching on its shape.
+    Scored on a single output channel, since each carries its own scale.
+
+    Every block observed so far starts on a 4-byte boundary, which is what
+    makes a whole-table scan affordable: at `step=1` this search over
+    resnet18d's 22 layers does not finish in a useful time.
+    """
+    offsets, shifts, planes, picks = _conv_channel0_addresses(weights.shape)
+    if len(picks) > samples:
+        keep = np.random.RandomState(1).choice(len(picks), samples, replace=False)
+        offsets = offsets[keep]
+        picks = [picks[k] for k in keep]
+        if shifts is not None:
+            shifts = shifts[keep]
+    target = np.array([weights[0, i, kh, kw] for (i, kh, kw) in picks], dtype=float)
+    centred = target - target.mean()
+    limit = len(wbt) - int(offsets.max()) - max(planes) - 4
+    best = (-2.0, None)
+    for start in range(0, max(limit, 1), 4096 * 32):
+        bases = np.arange(start, min(start + 4096 * 32, limit), step)
+        if not len(bases):
+            break
+        index = bases[:, None] + offsets[None, :]
+        if shifts is None:
+            codes = wbt[index].astype(float) - 128
+        else:
+            value = np.zeros(index.shape, np.int32)
+            for plane in _WBT2D_PLANES:
+                value = (value << 2) | ((wbt[index + planes[plane]] >> shifts) & 0x3)
+            codes = value.astype(float) - 128
+        codes = codes - codes.mean(1, keepdims=True)
+        denom = np.sqrt((codes**2).sum(1) * (centred**2).sum())
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.abs((codes * centred).sum(1) / denom)
+        pick = int(np.nanargmax(corr))
+        if corr[pick] > best[0]:
+            best = (float(corr[pick]), int(bases[pick]))
+    return best
+
+
 def _locate_conv_weights(wbt, weights, step=8, samples=200):
     """Find a convolution's weight block in a whole network's table, by
     correlating a *single* output channel -- each channel carries its own
@@ -4181,8 +4259,21 @@ def test_resnet18d_conv_weights_are_addressable(tmp_path):
     source = onnx.load(model_zoo.fetch_model("resnet18d_Opset18"))
     inits = {i.name: i for i in source.graph.initializer}
 
-    # One layer per distinct shape family, including a 256-channel one that
-    # only reads correctly once the 128 cap is applied.
+    # Every convolution in the network, all three packings.
+    convs = [
+        n.input[1]
+        for n in source.graph.node
+        if n.op_type == "Conv" and len(n.input) > 1 and n.input[1] in inits
+    ]
+    assert len(convs) == 22, len(convs)
+    located = 0
+    for name in convs:
+        weights = numpy_helper.to_array(inits[name]).astype(float)
+        correlation, base = _locate_conv_weights_any(wbt, weights)
+        assert correlation > 0.99, (name, weights.shape, correlation)
+        located += 1
+    assert located == 22, located
+
     for name in ("onnx::Conv_217", "onnx::Conv_223", "onnx::Conv_253"):
         weights = numpy_helper.to_array(inits[name]).astype(float)
         correlation, base = _locate_conv_weights(wbt, weights)
