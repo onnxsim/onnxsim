@@ -56,15 +56,18 @@ import { fields, decode } from "./macs.mjs";
 // refused and skipped with its reason -- neither trains anything wrongly.
 export const DIFFERENTIABLE_OPS = new Set([
   "Add",
+  "AveragePool",
   "Clip",
   "Conv",
   "Div",
   "Erf",
   "Exp",
+  "Gather",
   "Gemm",
   "Identity",
   "LayerNormalization",
   "MatMul",
+  "MaxPool",
   "Mul",
   "Neg",
   "ReduceMean",
