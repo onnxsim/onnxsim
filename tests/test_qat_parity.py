@@ -134,21 +134,69 @@ def test_the_fixture_pins_the_operator_allowlist(committed_text):
     assert line.split(" ", 1)[1].split(",") == sorted(EP_FRIENDLY_OPS), _REGENERATE
 
 
+def test_the_fixture_pins_the_autodiff_rule_table(committed_text):
+    """The rule table is part of the contract too, and this is the check that
+    was missing.
+
+    ``graph_grad.cpp`` re-implements every rule in ``graph_grad.py``, and its
+    own test compared ``SupportedOps()`` against a list hardcoded in C++ --
+    a snapshot of the Python, not the Python. So adding a rule on the Python
+    side left the C++ one rule short and nothing failed, which is precisely
+    the silent divergence this harness exists to prevent. It happened, with
+    ``LayerNormalization``. Pinning both sets here makes the next one a
+    parity failure instead.
+    """
+    from onnxsim.graph_grad import BACKWARD_OPS, SUPPORTED_OPS
+
+    def pinned(prefix):
+        line = next(
+            line
+            for line in committed_text.splitlines()
+            if line.startswith(prefix + " ")
+        )
+        return line.split(" ", 1)[1].split(",")
+
+    assert pinned("rules") == sorted(SUPPORTED_OPS), _REGENERATE
+    assert pinned("backward_ops") == sorted(BACKWARD_OPS), _REGENERATE
+    # The invariant graph_grad.py states about the two sets, checked against
+    # what actually shipped rather than against the source that declares it.
+    from onnxsim.qat_graph import EP_FRIENDLY_OPS
+
+    assert set(pinned("backward_ops")) <= set(EP_FRIENDLY_OPS)
+
+
 def test_no_case_emits_an_operator_outside_the_allowlist(committed):
     """The fixture cannot itself assert something false.
 
     If a case emitted an op outside the allowlist, the C++ test would be
     verifying parity on a graph that the allowlist says should never have been
     built -- so the reference would be enforcing agreement on a bug.
+
+    The planner case is exempt, and the exemption is the point rather than a
+    hole: its step graph contains the *block's* forward operators, copied in
+    verbatim from the float model. The allowlist has never governed those. It
+    constrains what onnxsim **emits** -- the fake-quant, the backward, the
+    optimizer -- which is exactly why whether a given block's step graph runs
+    on a given accelerator also depends on that backend's coverage of the
+    block's own operators. Asserting otherwise here would re-introduce the
+    overclaim that ``qat.py`` and the README were corrected for.
     """
     from onnxsim.qat_graph import EP_FRIENDLY_OPS
 
     emitted = {
         node["op_type"]
         for case in committed["cases"].values()
+        if not case.get("contains_block_nodes")
         for node in case.get("nodes", [])
     }
     assert not (emitted - set(EP_FRIENDLY_OPS))
+    # ...and the exemption is narrow: exactly one case claims it.
+    exempt = [
+        name
+        for name, case in committed["cases"].items()
+        if case.get("contains_block_nodes")
+    ]
+    assert exempt == ["planner"]
 
 
 def test_the_rounding_case_contains_no_round_node(committed):

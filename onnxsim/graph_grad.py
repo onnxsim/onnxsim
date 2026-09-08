@@ -86,12 +86,24 @@ BACKWARD_OPS = frozenset(
         "MatMul",
         "Mul",
         "Neg",
+        "ReduceMean",
         "ReduceSum",
         "Reshape",
+        "Sqrt",
         "Sub",
         "Transpose",
     }
 )
+# ``ReduceMean`` and ``Sqrt`` were admitted for
+# :func:`_grad_layer_normalization`, which needs a mean over the normalized
+# axes and the reciprocal square root of the variance. Neither is a loosening
+# of the criterion above: both were already in
+# :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`, so the execution-provider
+# coverage question was already settled for them, and both are exactly what
+# this set describes -- a reduction and plain arithmetic. ``ReduceMean`` could
+# be avoided by dividing a ``ReduceSum`` by a constant, but ``Sqrt`` could
+# not, so contorting one of the two to keep the set at its old size would buy
+# nothing.
 
 
 class UnsupportedOpError(ValueError):
@@ -511,6 +523,71 @@ def _grad_softmax(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
     return [ctx.b.mul(y, ctx.b.sub(g, total))]
 
 
+def _grad_layer_normalization(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``LayerNormalization``'s three gradients.
+
+    The one op a transformer block needs that arithmetic alone does not give:
+    a pre-norm decoder block is otherwise entirely covered by the rules above,
+    so without this a block containing a fused LayerNorm is refused outright
+    and the walk routes around it.
+
+    Writing the forward out, over the normalized axes ``[axis, rank)``::
+
+        mu   = mean(x)          xc  = x - mu
+        var  = mean(xc * xc)    inv = 1 / sqrt(var + eps)
+        xhat = xc * inv         y   = xhat * scale + b
+
+    the gradients are the standard ones, with ``gs = g * scale``::
+
+        db     = g summed over the broadcast axes
+        dscale = (g * xhat) summed the same way
+        dx     = inv * (gs - mean(gs) - xhat * mean(gs * xhat))
+
+    ``dx``'s two mean terms are what make this more than a chain rule: each
+    element's gradient depends on every other element in its normalization
+    group, through the mean and the variance it helped set.
+
+    ``mu`` and ``inv`` are recomputed here rather than read from the node's
+    optional ``Mean``/``InvStdDev`` outputs, because those outputs are
+    optional and a fused LayerNorm in a real model usually omits them.
+    Recomputing costs two reductions and is always available; reusing them
+    would be an optimization that silently does not apply.
+    """
+    x = node.input[0]
+    scale = node.input[1]
+    shape = ctx.shape(x)
+    rank = len(shape)
+    axis = int(_attr(node, "axis", -1)) % rank
+    eps = float(_attr(node, "epsilon", 1e-5))
+    # ``axes`` is an *attribute* here, not an input. ReduceSum moved its axes
+    # to an input at opset 13 and ReduceMean only at opset 18, so at the step
+    # graph's opset 17 the two spell the same idea differently -- the same
+    # asymmetry :func:`_reduced_axes` untangles in the forward direction.
+    axes = list(range(axis, rank))
+
+    mu = ctx.b.op("ReduceMean", [x], axes=axes, keepdims=1)
+    xc = ctx.b.sub(x, mu)
+    var = ctx.b.op("ReduceMean", [ctx.b.mul(xc, xc)], axes=axes, keepdims=1)
+    inv = ctx.b.div(ctx.b.const(1.0), ctx.b.sqrt(ctx.b.add(var, ctx.b.const(eps))))
+    xhat = ctx.b.mul(xc, inv)
+
+    gs = ctx.b.mul(g, scale)
+    mean_gs = ctx.b.op("ReduceMean", [gs], axes=axes, keepdims=1)
+    mean_gs_xhat = ctx.b.op("ReduceMean", [ctx.b.mul(gs, xhat)], axes=axes, keepdims=1)
+    dx = ctx.b.mul(
+        inv,
+        ctx.b.sub(ctx.b.sub(gs, mean_gs), ctx.b.mul(xhat, mean_gs_xhat)),
+    )
+
+    grads: List[Optional[str]] = [dx]
+    grads.append(ctx.reduce_to(ctx.b.mul(g, xhat), shape, ctx.shape(scale)))
+    if len(node.input) > 2 and node.input[2]:
+        grads.append(ctx.reduce_to(g, shape, ctx.shape(node.input[2])))
+    return grads
+
+
 def _grad_clip(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """Pass the gradient through where the input was strictly inside the
     bounds, zero it elsewhere.
@@ -542,6 +619,7 @@ _RULES: Dict[str, Rule] = {
     "Exp": _grad_exp,
     "Gemm": _grad_gemm,
     "Identity": _grad_identity,
+    "LayerNormalization": _grad_layer_normalization,
     "MatMul": _grad_matmul,
     "Mul": _grad_mul,
     "Neg": _grad_neg,

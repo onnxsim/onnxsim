@@ -100,7 +100,10 @@ constant folding until the model stops changing. Around that it offers:
   `learn_activation_scales=True`, of `quantize_static`'s activation
   quantizers jointly with them. The training step is emitted as an ONNX
   graph, so it runs on a GPU, an NPU execution provider or WebGPU via
-  `step_providers=`.
+  `step_providers=`. The same loop with the fake-quantizer removed is
+  `onnxsim.apply_block_finetune()` -- plain block-wise distillation of a
+  model's own float weights against a reference model, for a model something
+  else (a pruning, a requantization) already changed.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **[MLIR export](#exporting-to-mlir-torch-mlir--onnx-mlir).** Hand the simplified
@@ -1360,6 +1363,79 @@ low-rank calibration activations at 4 bits. Reach for
 `learn_activation_scales=True` when a `quantize_static` model's activation
 ranges are the binding constraint and re-calibrating them is not an option.
 Stay with `apply_adaround` for a single well-conditioned layer.
+
+### The same loop with the quantizer removed: `onnxsim.apply_block_finetune()`
+
+Only one part of the loop above is specific to quantization: the fake-quantizer
+between the master weight and the block's own node. Take it out and what is
+left -- a block, a reference model's activation at its output, a reconstruction
+loss, `graph_grad`'s backward, an Adam step graph -- is ordinary block-wise,
+label-free fine-tuning of the model's own float weights.
+`onnxsim.apply_block_finetune()` is that, and
+`onnxsim.apply_block_finetune_all_blocks()` walks a whole model with it, block
+by block, the way `apply_qat_all_blocks` does.
+
+The two models must *differ*, or there is nothing to learn: the loss is the
+student block's output against the reference's, so passing the same model twice
+starts at zero loss and stays there. It is for a model something else already
+changed and the change cost accuracy -- a pruned model, one whose weights were
+quantized and dequantized back to fp32, or one already tuned once and being
+tuned further against the original. It is **not** a way to fine-tune on new
+data or a new task: the objective is "reproduce what the reference produced",
+which by construction cannot exceed the reference. `learn_scales` and
+`learn_activation_scales` both name a parameter of a quantizer, so here they
+raise rather than being quietly ignored.
+
+```python
+import onnx
+import onnxsim
+
+original = onnx.load("model.onnx")
+changed = onnx.load("model_pruned.onnx")   # same graph, different weights
+
+# Rows matter more here than iterations do -- see below.
+calibration_data = [{"input": batch} for batch in batches]
+
+tuned, results = onnxsim.apply_block_finetune_all_blocks(
+    original,
+    changed,
+    calibration_data=calibration_data,
+    num_iterations=300,
+    learning_rate=2e-2,
+)
+for r in results:
+    print(r.block.output_name, r.trained, r.skipped_reason, r.final_loss)
+
+onnx.save(tuned, "model_pruned_finetuned.onnx")
+```
+
+**How much calibration data it gets dominates everything else**, and a falling
+loss is not evidence that the model improved. On a `MatMul`/`Relu`/`MatMul`
+block (16x16 fp32 weights, N(0, 0.15) noise on the second one, 300 iterations
+at lr 2e-2) the training loss falls by roughly 1700-5200x -- 0.2597 to 0.000154
+on one seed -- while the end-to-end error against the reference, averaged over
+8 held-out input batches, only falls to 0.64-0.78 of the untuned model's.
+Varying only the number of calibration rows, the mean held-out error ratio over
+4 seeds is 0.70 at 16 rows, 0.06 at 64, 0.004 at 256 and 0.002 at 1024: 16 rows
+is as many rows as each weight has input channels, so the fit interpolates the
+calibration set instead of generalizing. Note that `num_samples` defaults to 8
+*batches* of random data, which for a model with a small batch dimension is on
+the wrong side of that cliff -- real data
+(`onnxsim.load_huggingface_calibration_data`) is the fix, not more iterations.
+And measure on held-out inputs, not on `losses=`.
+
+For **pruning specifically, try `onnxsim.apply_pruning_finetune()` first.** It
+solves the same problem layer by layer and in closed form -- one ridge
+regression, one linear solve, no learning rate, no iteration count, and an
+exactness argument this has no equivalent of -- so where it applies it is
+strictly better. What it cannot do is what a block buys: it declines a layer
+pruned on its input and output channels at once, and a per-layer least-squares
+fit cannot let two layers with a nonlinearity between them trade error off
+against each other. `apply_block_finetune` is the general, slower,
+weaker-guarantee alternative for those cases. It also has no sparsity mask
+anywhere in the step graph, so it *fills in* the zeros of an unstructured
+(magnitude-pruned) model: measured on a two-layer block at 50% sparsity, 128
+zeros per weight before and 0 after.
 
 ### Running AdaRound, AdaQuant and AutoRound on an accelerator
 

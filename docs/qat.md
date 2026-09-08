@@ -2,9 +2,11 @@
 
 **Status: design note, with stages 0-2 and 4 implemented.**
 `onnxsim/qat_graph.py`, `onnxsim/graph_grad.py`, `onnxsim/qat.py`
-(`apply_qat`, `apply_qat_all_blocks`), `onnxsim/qat_interop.py` and the
-converter page's calibration-provider picker have all landed; the browser
-fine-tuning panel (stage 3) has not (see "Staging" below). This note answers "how *could* we deliver quantization-aware training as an onnxsim
+(`apply_qat`, `apply_qat_all_blocks`, and the `apply_block_finetune` pair the
+same machinery becomes with the quantizer removed), `onnxsim/qat_interop.py`
+and the converter page's calibration-provider picker have all landed; the
+browser fine-tuning panel (stage 3) has not (see "Staging" below). This note
+answers "how *could* we deliver quantization-aware training as an onnxsim
 feature, and can the training math run on WebGPU or an NPU?" and records the
 shape of the work so the question doesn't have to be re-derived. `docs/nncf-comparison-future-work.md`
 currently lists QAT as out of scope ("QAT needs a training loop with a
@@ -213,7 +215,7 @@ Each stage is independently shippable and independently useful.
    pass here could do: every gradient in the repo is hand-derived for one
    fixed shape, which is exactly why `brecq.py` is capped at a linear chain.
    So `graph_grad.py` came first -- `build_backward` walks a forward slice in
-   reverse and emits the gradient as ordinary ONNX nodes, 20 op rules, each
+   reverse and emits the gradient as ordinary ONNX nodes, 21 op rules, each
    checked against central finite differences, its emission pinned to
    `qat_graph.EP_FRIENDLY_OPS`. It is a rule table and a reverse walk, not an
    autograd framework: the ONNX graph is already the tape.
@@ -350,6 +352,124 @@ Each stage is independently shippable and independently useful.
    spend the codes where the values are. Re-deriving it, which is what
    `quantize_static` would silently do, is a regression rather than a wash.
 
+## What is left when the quantizer is taken out
+
+Nothing in stage 2 is specific to quantization except one node. A block, the
+teacher's activation at its output, a mean squared reconstruction error, a
+backward pass emitted by `graph_grad`, an Adam step graph, a liveness-cut
+block plan and a sequential walk over it -- quantization enters at exactly one
+place, the fake-quantizer sitting between the master weight and the block's
+own node. Remove that and the same loop trains the block's own float weights
+against the teacher: ordinary block-wise, label-free distillation, with no
+labels to supply and no loss to choose. That is `apply_block_finetune` and
+`apply_block_finetune_all_blocks` -- `apply_qat(..., fake_quant=False)` under
+a name that says what it does.
+
+The one substantive difference beside the missing quantizer is where the
+trainable layers come from. QAT matches the student's quantized layers against
+the teacher's float ones and seeds each master weight from the *teacher*,
+because the student's weight is a lossy encoding of it. Fine-tuning scans the
+*student* for plain MatMul/Gemms whose weight is a 2-D fp32 initializer and
+starts from the student's own values -- they are the starting point precisely
+because they are not the teacher's. The block's untrained constants (a
+LayerNorm's scale and bias, a Gemm's `C`) come from the student for the same
+reason: substituting the teacher's would train the block to compensate for a
+substitution the deployed model does not make.
+
+**The two models have to differ, or there is nothing to learn.** The loss is
+the student block's output against the reference's, so a student that *is* the
+reference starts at zero loss and stays there (measured: exactly `0.0` at the
+first step and the last). This is for a model something else already changed
+and the change cost accuracy -- a pruned model, a model whose weights were
+quantized and dequantized back to fp32 or rewritten by one of the rounding
+passes, a model already tuned once and being tuned further against the
+original.
+
+It is **not** a way to train on new data or a new task. The objective is
+"reproduce what the reference produced", which by construction cannot exceed
+the reference: deliverable C above is unchanged, and this is not a back door
+into it. The two scale flags are refused rather than ignored for the same
+reason -- `learn_scales` and `learn_activation_scales` each name a parameter
+of a quantizer, and this is the mode with no quantizer in it, so asking for
+them raises. Ignoring them would be the worse failure: a caller who asked to
+learn scales and got a model whose scales are untouched has no way to tell
+that from a run where learning them did not help.
+
+Operator coverage is the same constraint it is under QAT, and it is still the
+binding one on a real model: `graph_grad.SUPPORTED_OPS` is 21 rules
+(`LayerNormalization` among them since this branch), so a normalization in the
+middle of a block is now more nodes in the slice rather than a boundary
+between blocks -- but the whole default ONNX domain is 202 operators.
+
+### Against `apply_pruning_finetune`, which came first
+
+`onnxsim/finetune.py`'s `apply_pruning_finetune` solves the same kind of
+problem for pruning and should usually be tried first. It fits each layer
+*individually* and in *closed form*: one ridge regression, one linear solve
+per layer, no iteration, no learning rate -- and an exactness argument this
+has no equivalent of, since pruning never changes the value of a channel that
+survives, so a pruned layer's own input activation *is* the original model's,
+restricted to the surviving channels. Where it applies it is strictly better.
+
+What it cannot do is what a block buys. A layer pruned on both its input and
+its output channels at once falls outside its channel-correspondence
+reconstruction and it declines to touch it. And a per-layer least-squares fit
+cannot let two layers with a nonlinearity between them trade error off against
+each other, because that objective is not a linear least-squares problem at
+all. `apply_block_finetune` is the general, slower, weaker-guarantee
+alternative for those cases -- and, unlike a numpy solve, it is a step graph,
+so `step_providers=` reaches the same accelerators the rest of this note is
+about. It is a fallback, not a replacement.
+
+Note also what it does *not* preserve: the optimizer updates every element of
+a trained weight, with no sparsity mask anywhere in the step graph. On a
+magnitude-pruned (unstructured) model that is fatal to the thing that was
+bought -- measured on a two-layer block at 50% sparsity, 128 zeros per weight
+before and **0 after**, while the block's loss fell 0.140 -> 5.3e-06.
+Fine-tuning a model whose value is its zeros needs a masked optimizer this
+does not have.
+
+### Measured, and the measurement is the point
+
+The honest headline is not the loss curve. On a `MatMul`/`Relu`/`MatMul` block
+(16x16 fp32 weights, N(0, 0.15) noise on the second weight, 300 iterations at
+lr 2e-2, full batch), the *training* loss falls by roughly 1700-5200x -- e.g.
+0.2597 -> 0.000154 -- while the end-to-end output error, measured against the
+reference on 8 held-out input batches the tuning never saw, only falls to
+0.64-0.78 of the student's. The block-local objective is fitted almost
+exactly and generalizes far less well, which is the same warning
+`apply_qat_all_blocks` already carries about its per-block losses: the loss
+`losses=` records is not the quantity that matters.
+
+What dominates is how much calibration data there is. Same model and budget,
+varying only the number of calibration rows; mean held-out error ratio against
+the untuned student over 4 seeds (lower is better):
+
+| calibration rows | held-out error ratio |
+| --- | --- |
+| 16 | 0.70 |
+| 64 | 0.06 |
+| 256 | 0.004 |
+| 1024 | 0.002 |
+
+16 rows is a fit with as many rows as each weight has input channels, so it
+interpolates the calibration set and leaves most of the error standing
+anywhere else; by 64 rows it recovers ~94% of the error and by 256 rows ~99.6%.
+The same cliff shows up in `apply_block_finetune_all_blocks` over a 5-layer MLP
+(3 blocks discovered, all trained, 300 iterations each): a mean held-out ratio
+of 0.46 at 16 rows against 0.015 at 256, over 3 seeds. The rows-versus-channels
+reading is intuition rather than a bound -- there is a nonlinearity in the
+middle of the block and two weights are trained jointly -- but the direction
+was the same everywhere it was measured.
+
+Two things follow, and they belong in any use of this. First, `num_samples`
+defaults to 8 *batches* of random data, so the row count is 8 times the
+model's own batch dimension: for a model with a small batch dimension that is
+on the wrong side of the cliff above, and real data
+(`load_huggingface_calibration_data`) is the fix rather than more iterations.
+Second, a falling loss is not evidence that the model got better. Measure on
+held-out inputs.
+
 ## Using what has landed
 
 ```python
@@ -408,6 +528,26 @@ There is no numpy alternative there -- the step graph *is* the
 implementation -- so `step_providers=None` simply means CPU. Anything between
 the two named tensors that `graph_grad` can differentiate is fair game; an op
 it cannot is refused up front, before any calibration runs.
+
+And the same loop with no quantizer in it, walking a whole model one block at
+a time -- the reference here is not a float *teacher* of a quantized student
+but simply the model as it was before something changed it:
+
+```python
+tuned, results = onnxsim.apply_block_finetune_all_blocks(
+    original_model,            # the reference, before pruning/requantizing
+    changed_model,             # the one being tuned back towards it
+    calibration_data=batches,  # rows matter more than iterations; see above
+    num_iterations=300,
+    learning_rate=2e-2,
+)
+for r in results:
+    print(r.block.output_name, r.trained, r.skipped_reason, r.final_loss)
+```
+
+`apply_block_finetune` is the same thing over one caller-named block, and
+refuses loudly where the walk skips and records a reason -- the split
+`apply_qat`/`apply_qat_all_blocks` already draw, for the same reason.
 
 To put a *new* algorithm on a step graph: build its gradient with
 `qat_graph.GraphBuilder`, close the loop with `qat_graph.adam_update` and

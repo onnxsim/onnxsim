@@ -245,6 +245,8 @@ from onnxsim.ptq4vit import apply_ptq4vit_quantization
 from onnxsim.qat import (
     QATBlock,
     QATBlockResult,
+    apply_block_finetune,
+    apply_block_finetune_all_blocks,
     apply_qat,
     apply_qat_all_blocks,
     discover_qat_blocks,
@@ -324,6 +326,8 @@ __all__ = [
     "apply_fp6_llm_quantization",
     "quantize_dequantize_fp6",
     "apply_brecq",
+    "apply_block_finetune",
+    "apply_block_finetune_all_blocks",
     "apply_qat",
     "apply_qat_all_blocks",
     "discover_qat_blocks",

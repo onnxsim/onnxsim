@@ -67,7 +67,7 @@ import onnx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from onnxsim import qat_graph  # noqa: E402
+from onnxsim import graph_grad, qat_graph  # noqa: E402
 
 FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "onnxsim", "qat_parity_fixtures.txt"
@@ -287,6 +287,154 @@ def _case_step_graph() -> Dict[str, Any]:
     return out
 
 
+# The float model the planner case trains, in ONNX's text format.
+#
+# This string is the single source of truth for that model: it is written into
+# the fixture verbatim, and onnxsim/qat_graph_parity_test.cpp reads it back out
+# and parses it with onnx::OnnxParser rather than rebuilding the model in C++.
+# Two hand-built models that drifted apart would produce two different step
+# graphs and the diff would blame the planner, which is exactly the confusion
+# worth designing out.
+#
+# opset 21 is required, not incidental: INT4 tensors and DequantizeLinear's
+# INT4 support arrive there, and quantize_weight_only_int4 silently declines a
+# model below it. The block is deliberately more than one node -- MatMul, Relu,
+# MatMul -- so the case exercises the backward walk and an external input, not
+# just a single fake-quant.
+PLANNER_MODEL_TEXT = """<ir_version: 10, opset_import: ["" : 21]>
+g (float[4,32] X) => (float[4,32] Y) {
+  H = MatMul(X, W1)
+  A = Relu(H)
+  Y = MatMul(A, W2)
+}"""
+
+# W1/W2's values, as a formula both languages implement identically rather than
+# a thousand floats spelled out in the fixture. The arithmetic is done in
+# double and narrowed once, so C++'s `static_cast<float>(((i % 7) - 3) * 0.1)`
+# lands on the same bits.
+PLANNER_WEIGHT_DIMS = (32, 32)
+
+
+def _planner_weight(name: str):
+    n = PLANNER_WEIGHT_DIMS[0] * PLANNER_WEIGHT_DIMS[1]
+    values = np.array([((i % 7) - 3) * 0.1 for i in range(n)], dtype=np.float32)
+    return onnx.numpy_helper.from_array(values.reshape(PLANNER_WEIGHT_DIMS), name)
+
+
+def _planner_models():
+    """The float model and its int4 quantization, as both sides build them."""
+    import onnxsim
+
+    model = onnx.parser.parse_model(PLANNER_MODEL_TEXT)
+    model.graph.initializer.extend([_planner_weight("W1"), _planner_weight("W2")])
+    return model, onnxsim.quantize_weight_only_int4(model)
+
+
+def _describe_graph(graph) -> Dict[str, Any]:
+    """The same description as :func:`_describe`, read off a finished graph.
+
+    The planner returns a model rather than the builder that made it, so this
+    reads the nodes and initializers back out. The two must agree on shape,
+    because ``_render_case`` renders either one.
+    """
+    return {
+        "initializers": [
+            {
+                "name": t.name,
+                "dims": [int(d) for d in t.dims],
+                "dtype": int(t.data_type),
+                "values": [
+                    float(v) if t.data_type != onnx.TensorProto.INT64 else int(v)
+                    for v in onnx.numpy_helper.to_array(t).reshape(-1).tolist()
+                ],
+            }
+            for t in graph.initializer
+        ],
+        "nodes": [
+            {
+                "op_type": n.op_type,
+                "inputs": list(n.input),
+                "outputs": list(n.output),
+                "attributes": _attributes(n),
+            }
+            for n in graph.node
+        ],
+    }
+
+
+def _case_planner() -> Dict[str, Any]:
+    """A whole step graph, built the way the browser will build it.
+
+    Everything above this case tests one emitter primitive. This one tests the
+    composition: slice the block, find the quantized layer, plan the trained
+    state, emit fake-quant + block + loss + backward + Adam. It is the case
+    that actually pins onnxsim/qat_entry.cpp against onnxsim/qat.py, and the
+    one most likely to catch a reordering, because a step graph for even this
+    small model is over a hundred nodes deep.
+    """
+    from onnxsim import qat
+
+    float_model, quantized = _planner_models()
+    plan = qat._plan_block(float_model, quantized, "X", "Y")
+    rows = np.zeros((4, 32), dtype=np.float32)
+    shapes = qat._block_shapes(
+        float_model, plan.nodes, {"X": rows}, plan.output_name, rows
+    )
+    trained = qat._plan_trained(plan.candidates, False)
+    block_initializers = [
+        t
+        for t in float_model.graph.initializer
+        if t.name not in {x.candidate.float_node.input[1] for x in trained}
+    ]
+    step = qat._build_step_graph(
+        trained,
+        plan.nodes,
+        shapes,
+        block_initializers,
+        {"X": rows},
+        plan.output_name,
+        (4, 32),
+        False,
+    )
+    graph = step.model.graph
+    out = _describe_graph(graph)
+    # This case's graph contains the *block's* forward operators, copied in
+    # verbatim from the float model -- here a Relu. The allowlist has never
+    # governed those: it constrains what onnxsim emits (the fake-quant, the
+    # backward, the optimizer), which is why whether a given block's step
+    # graph runs on a given accelerator also depends on that backend's
+    # coverage of the block's own ops. So this case is exempt from the
+    # allowlist guard below, and only this case.
+    out["contains_block_nodes"] = True
+    out["model"] = {
+        "opset": [
+            {"domain": o.domain, "version": int(o.version)}
+            for o in step.model.opset_import
+        ],
+        "ir_version": int(step.model.ir_version),
+        "graph_name": graph.name,
+        "inputs": [
+            {
+                "name": i.name,
+                "elem_type": int(i.type.tensor_type.elem_type),
+                "dims": [int(d.dim_value) for d in i.type.tensor_type.shape.dim],
+            }
+            for i in graph.input
+        ],
+        "outputs": [
+            {
+                "name": o.name,
+                "elem_type": int(o.type.tensor_type.elem_type),
+                "dims": [int(d.dim_value) for d in o.type.tensor_type.shape.dim],
+            }
+            for o in graph.output
+        ],
+        "state": dict(step.state),
+        "loss_name": step.loss_name,
+    }
+    return out
+
+
 CASES = {
     "arithmetic": _case_arithmetic,
     "masks_and_clip": _case_masks_and_clip,
@@ -295,6 +443,7 @@ CASES = {
     "consts": _case_consts,
     "adam_update": _case_adam_update,
     "step_graph": _case_step_graph,
+    "planner": _case_planner,
 }
 
 
@@ -376,7 +525,21 @@ def render(fixtures: Dict[str, Any]) -> str:
         "# Asserted against onnxsim/qat_graph.py (tests/test_qat_parity.py) and",
         "# against onnxsim/qat_graph_builder.cpp (onnxsim/qat_graph_parity_test.cpp).",
         "ops " + ",".join(fixtures["ep_friendly_ops"]),
+        # The autodiff's rule table and the ops its rules may emit, pinned for
+        # the same reason as `ops` above. Without these, adding a rule on the
+        # Python side leaves the C++ one rule short and *nothing fails*: the
+        # C++ test compares SupportedOps() against a hardcoded list, which is
+        # a snapshot of the Python rather than the Python. That is exactly the
+        # silent divergence this harness exists to prevent, and it happened.
+        "rules " + ",".join(fixtures["supported_ops"]),
+        "backward_ops " + ",".join(fixtures["backward_ops"]),
     ]
+    # The planner case's model, verbatim. The C++ side parses these lines back
+    # rather than rebuilding the model, so there is exactly one definition of
+    # it and a drift between two hand-built copies cannot masquerade as a
+    # planner disagreement.
+    for line in PLANNER_MODEL_TEXT.splitlines():
+        lines.append("model_text " + line)
     for name in sorted(fixtures["cases"]):
         lines.extend(_render_case(name, fixtures["cases"][name]))
     return "\n".join(lines) + "\n"
@@ -396,7 +559,10 @@ def build() -> Dict[str, Any]:
     # one. This is the generator holding itself to what the tests downstream
     # will claim.
     emitted = {
-        node["op_type"] for case in cases.values() for node in case.get("nodes", [])
+        node["op_type"]
+        for case in cases.values()
+        if not case.get("contains_block_nodes")
+        for node in case.get("nodes", [])
     }
     outside = sorted(emitted - set(qat_graph.EP_FRIENDLY_OPS))
     if outside:
@@ -414,6 +580,8 @@ def build() -> Dict[str, Any]:
             "comparison is shaped this way."
         ),
         "ep_friendly_ops": sorted(qat_graph.EP_FRIENDLY_OPS),
+        "supported_ops": sorted(graph_grad.SUPPORTED_OPS),
+        "backward_ops": sorted(graph_grad.BACKWARD_OPS),
         "cases": cases,
     }
 

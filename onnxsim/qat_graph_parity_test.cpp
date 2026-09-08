@@ -34,7 +34,11 @@
 #include <string>
 #include <vector>
 
+#include "graph_grad.h"
+#include "onnx/defs/parser.h"
+#include "qat_entry.h"
 #include "qat_graph_builder.h"
+#include "quantize_entry.h"
 
 namespace {
 
@@ -284,6 +288,100 @@ std::vector<std::string> CaseStepGraph() {
   return lines;
 }
 
+// The planner case's float model, read out of the fixture rather than rebuilt
+// here. The fixture is the single definition of that model; two hand-built
+// copies that drifted apart would produce two different step graphs, and the
+// diff would blame the planner rather than the models. Set by main().
+std::string g_planner_model_text;
+
+// W1/W2's values. Must match _planner_weight in the generator bit for bit:
+// the arithmetic is done in double and narrowed once, so both languages land
+// on the same float.
+onnx::TensorProto PlannerWeight(const std::string& name) {
+  onnx::TensorProto t;
+  t.set_name(name);
+  t.set_data_type(onnx::TensorProto::FLOAT);
+  t.add_dims(32);
+  t.add_dims(32);
+  std::string raw;
+  for (int i = 0; i < 32 * 32; ++i) {
+    const float v = static_cast<float>(((i % 7) - 3) * 0.1);
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    for (int b = 0; b < 4; ++b) {
+      raw.push_back(static_cast<char>((bits >> (8 * b)) & 0xff));
+    }
+  }
+  t.set_raw_data(std::move(raw));
+  return t;
+}
+
+// A whole step graph, built the way the browser will build it.
+//
+// Every other case pins one emitter primitive; this one pins the composition
+// that onnxsim/qat_entry.cpp performs -- slice the block, find the quantized
+// layer, plan the trained state, emit fake-quant + block + loss + backward +
+// Adam. It is the case that actually holds qat_entry.cpp to qat.py, and the
+// one most likely to catch a reordering, since even this small model's step
+// graph is dozens of nodes deep.
+std::vector<std::string> CasePlanner() {
+  onnx::ModelProto float_model;
+  onnx::OnnxParser parser(g_planner_model_text.c_str());
+  auto status = parser.Parse(float_model);
+  if (!status.IsOK()) {
+    std::cerr << "planner: cannot parse the fixture's model_text: "
+              << status.ErrorMessage() << "\n";
+    ++failures;
+    return {};
+  }
+  *float_model.mutable_graph()->add_initializer() = PlannerWeight("W1");
+  *float_model.mutable_graph()->add_initializer() = PlannerWeight("W2");
+
+  const onnx::ModelProto quantized = QuantizeWeightOnlyInt4(float_model);
+  const QatStepPlan plan =
+      BuildQatStepGraph(float_model, quantized, "X", "Y", 4, QatOptions{});
+  const onnx::GraphProto& graph = plan.step_graph.graph();
+
+  std::vector<std::string> lines;
+  for (const auto& t : graph.initializer()) {
+    std::vector<std::string> dims;
+    for (int64_t d : t.dims()) dims.push_back(std::to_string(d));
+    lines.push_back("  init " + t.name() + " " +
+                    std::to_string(static_cast<int>(t.data_type())) + " [" +
+                    Join(dims, ",") + "] " + Join(TensorValues(t), ","));
+  }
+  for (const auto& n : graph.node()) {
+    std::vector<std::string> inputs(n.input().begin(), n.input().end());
+    std::vector<std::string> outputs(n.output().begin(), n.output().end());
+    lines.push_back("  node " + n.op_type() + " [" + Join(inputs, ",") + "] [" +
+                    Join(outputs, ",") + "] {" + RenderAttributes(n) + "}");
+  }
+  for (const auto& o : plan.step_graph.opset_import()) {
+    lines.push_back("  opset " + o.domain() + " " +
+                    std::to_string(o.version()));
+  }
+  lines.push_back("  ir_version " +
+                  std::to_string(plan.step_graph.ir_version()));
+  lines.push_back("  graph_name " + graph.name());
+  for (const auto& i : graph.input()) {
+    lines.push_back("  input " + i.name() + " " +
+                    std::to_string(i.type().tensor_type().elem_type()) + " [" +
+                    Dims(i) + "]");
+  }
+  for (const auto& o : graph.output()) {
+    lines.push_back("  output " + o.name() + " " +
+                    std::to_string(o.type().tensor_type().elem_type()) + " [" +
+                    Dims(o) + "]");
+  }
+  std::map<std::string, std::string> state(plan.state.begin(),
+                                           plan.state.end());
+  for (const auto& kv : state) {
+    lines.push_back("  state " + kv.first + " " + kv.second);
+  }
+  lines.push_back("  loss " + plan.loss_name);
+  return lines;
+}
+
 // Sorted by name, matching the generator's `for name in sorted(cases)`.
 const std::vector<std::pair<std::string, std::vector<std::string> (*)()>>&
 Cases() {
@@ -295,6 +393,7 @@ Cases() {
           {"consts", CaseConsts},
           {"gather_rows", CaseGatherRows},
           {"masks_and_clip", CaseMasksAndClip},
+          {"planner", CasePlanner},
           {"round_to_nearest", CaseRoundToNearest},
           {"step_graph", CaseStepGraph},
       };
@@ -312,6 +411,20 @@ std::string Render() {
       "(onnxsim/qat_graph_parity_test.cpp).",
       "ops " + Join(ops, ","),
   };
+  // The autodiff's two sets, mirroring the generator. A divergence shows up
+  // here as a one-line diff; TheAutodiffRuleTableMatchesTheFixture below says
+  // which set and which side, since a bare diff of two sorted lists is not
+  // obvious to read.
+  std::vector<std::string> rules(SupportedOps().begin(), SupportedOps().end());
+  std::vector<std::string> back(BackwardOps().begin(), BackwardOps().end());
+  lines.push_back("rules " + Join(rules, ","));
+  lines.push_back("backward_ops " + Join(back, ","));
+  // The planner case's model, verbatim -- the generator writes it and
+  // CasePlanner parses it back, so there is one definition of that model.
+  std::istringstream model_text(g_planner_model_text);
+  for (std::string line; std::getline(model_text, line);) {
+    lines.push_back("model_text " + line);
+  }
   for (const auto& entry : Cases()) {
     lines.push_back("case " + entry.first);
     const auto case_lines = entry.second();
@@ -389,11 +502,79 @@ void TheAllowlistMatchesTheFixture() {
   ++failures;
 }
 
+// The autodiff's rule table and emittable-op set, pinned by the fixture.
+//
+// This is the check whose absence let Python and C++ drift apart unnoticed:
+// graph_grad_test compares SupportedOps() against a list hardcoded in C++,
+// which is a snapshot of the Python rather than the Python, so a rule added
+// on the Python side left this side one rule short and nothing failed. It
+// happened, with LayerNormalization. Comparing against the shared fixture --
+// which the Python test independently pins to graph_grad.py -- makes the
+// next divergence a parity failure on whichever side falls behind.
+void TheAutodiffRuleTableMatchesTheFixture() {
+  std::ifstream in(QAT_PARITY_FIXTURE);
+  if (!in) {
+    std::cerr << "cannot open fixture " << QAT_PARITY_FIXTURE << "\n";
+    ++failures;
+    return;
+  }
+  std::map<std::string, std::string> pinned;
+  for (std::string line; std::getline(in, line);) {
+    for (const char* key : {"rules", "backward_ops"}) {
+      const std::string prefix = std::string(key) + " ";
+      if (line.rfind(prefix, 0) == 0) pinned[key] = line.substr(prefix.size());
+    }
+  }
+  const std::pair<const char*, const std::set<std::string>&> checks[] = {
+      {"rules", SupportedOps()},
+      {"backward_ops", BackwardOps()},
+  };
+  for (const auto& check : checks) {
+    const auto it = pinned.find(check.first);
+    if (it == pinned.end()) {
+      std::cerr << "fixture has no `" << check.first
+                << "` line; regenerate it with "
+                   "scripts/make_qat_parity_fixtures.py\n";
+      ++failures;
+      continue;
+    }
+    std::vector<std::string> ours(check.second.begin(), check.second.end());
+    const std::string expected = Join(ours, ",");
+    if (it->second != expected) {
+      std::cerr << check.first << " mismatch\n  fixture: " << it->second
+                << "\n  c++    : " << expected << "\n";
+      ++failures;
+    }
+  }
+}
+
+// Pulls the planner model out of the fixture's `model_text ` lines.
+bool LoadPlannerModelText() {
+  std::ifstream in(QAT_PARITY_FIXTURE);
+  if (!in) {
+    std::cerr << "cannot open fixture " << QAT_PARITY_FIXTURE << "\n";
+    return false;
+  }
+  std::vector<std::string> parts;
+  for (std::string line; std::getline(in, line);) {
+    if (line.rfind("model_text ", 0) == 0) parts.push_back(line.substr(11));
+  }
+  if (parts.empty()) {
+    std::cerr << "fixture has no model_text lines; regenerate it with "
+                 "scripts/make_qat_parity_fixtures.py\n";
+    return false;
+  }
+  g_planner_model_text = Join(parts, "\n");
+  return true;
+}
+
 }  // namespace
 
 int main() {
+  if (!LoadPlannerModelText()) return 1;
   TheCppEmitterReproducesTheCommittedFixture();
   TheAllowlistMatchesTheFixture();
+  TheAutodiffRuleTableMatchesTheFixture();
   if (failures) {
     std::cerr << failures << " parity check(s) failed\n";
     return 1;

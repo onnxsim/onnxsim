@@ -12,9 +12,10 @@
  * onnxruntime-web at run time. So this test covers the half that *is*
  * checkable without an evaluator, and covers it exactly: the rule table's
  * membership, the refusals, the operator allowlist the emitted graph must
- * stay inside, and the structural shape of the two things the Python
- * docstrings single out as easiest to get subtly wrong -- undoing a broadcast
- * and accumulating a tensor read more than once.
+ * stay inside, and the structural shape of the things the Python docstrings
+ * single out as easiest to get subtly wrong -- undoing a broadcast,
+ * accumulating a tensor read more than once, and the one rule whose emission
+ * order is long enough to drift unnoticed (LayerNormalization).
  *
  * The numerical half is not duplicated and not claimed: it lives in
  * tests/test_graph_grad.py, and the C++ rules are transcriptions of the
@@ -128,7 +129,7 @@ std::string Join(const std::set<std::string>& values) {
 }
 
 // ---------------------------------------------------------------------------
-// The four forward slices the allowlist test differentiates. Between them
+// The five forward slices the allowlist test differentiates. Between them
 // they reach every rule in the table; individually they are small enough that
 // a failure names a rule rather than a graph.
 // ---------------------------------------------------------------------------
@@ -199,6 +200,17 @@ Shapes GemmShapes() {
           {"E", {2, 4}}, {"Tr", {4, 2}}, {"M", {4}},    {"Y", {1}}};
 }
 
+// A fused LayerNorm with both parameters -- the only rule that reduces over
+// the normalized axes, and so the only source of ReduceMean and Sqrt in the
+// emitted backward.
+std::vector<onnx::NodeProto> LayerNormSlice() {
+  return {Node("LayerNormalization", {"X", "S", "Bn"}, {"Y"})};
+}
+
+Shapes LayerNormShapes() {
+  return {{"X", {2, 3, 4}}, {"S", {4}}, {"Bn", {4}}, {"Y", {2, 3, 4}}};
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -209,10 +221,12 @@ Shapes GemmShapes() {
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {
-      "Add",        "Clip",      "Div",    "Erf",     "Exp",
-      "Gemm",       "Identity",  "MatMul", "Mul",     "Neg",
-      "ReduceMean", "ReduceSum", "Relu",   "Reshape", "Sigmoid",
-      "Softmax",    "Sqrt",      "Sub",    "Tanh",    "Transpose"};
+      "Add",       "Clip", "Div",      "Erf",
+      "Exp",       "Gemm", "Identity", "LayerNormalization",
+      "MatMul",    "Mul",  "Neg",      "ReduceMean",
+      "ReduceSum", "Relu", "Reshape",  "Sigmoid",
+      "Softmax",   "Sqrt", "Sub",      "Tanh",
+      "Transpose"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
@@ -224,8 +238,9 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
 // as the forward and the optimizer step.
 void TheBackwardOpsAreThePythonAllowlistAndSitInsideEpFriendlyOps() {
   const std::set<std::string> expected = {
-      "Add", "Cast", "Div",       "Exp",     "Greater", "Less",     "MatMul",
-      "Mul", "Neg",  "ReduceSum", "Reshape", "Sub",     "Transpose"};
+      "Add",       "Cast",    "Div",  "Exp", "Greater",
+      "Less",      "MatMul",  "Mul",  "Neg", "ReduceMean",
+      "ReduceSum", "Reshape", "Sqrt", "Sub", "Transpose"};
   Check(BackwardOps() == expected,
         "BackwardOps() should equal graph_grad.py's BACKWARD_OPS, got {" +
             Join(BackwardOps()) + "}");
@@ -249,6 +264,7 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
       {AttentionishSlice(), AttentionishShapes(), {"X", "W"}},
       {TranscendentalSlice(), TranscendentalShapes(), {"A"}},
       {GemmSlice(), GemmShapes(), {"A", "W", "Cb"}},
+      {LayerNormSlice(), LayerNormShapes(), {"X", "S", "Bn"}},
   };
 
   std::set<std::string> emitted;
@@ -391,6 +407,92 @@ void ABroadcastGradientIsSummedBackToTheOperandShape() {
   }
 }
 
+// If this fails, the C++ LayerNorm rule has drifted from
+// _grad_layer_normalization in graph_grad.py -- and because a rule's nodes
+// are numbered by the builder's counter in emission order, drifting by a
+// *reordering* alone is enough to make every subsequent tensor in a
+// browser-built step graph carry a different name from the Python's. So the
+// whole emission is pinned here, node for node and in order, rather than just
+// its op set.
+void TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  {
+    GraphBuilder b;
+    const std::map<std::string, std::string> grads =
+        BuildBackward(b, LayerNormSlice(), LayerNormShapes(), {{"Y", "dY"}},
+                      {"X", "S", "Bn"});
+    // mu, xc, xc^2, var, var+eps, sqrt, inv, xhat, then gs, mean(gs),
+    // gs*xhat, mean(gs*xhat), the two mean terms subtracted off and dx;
+    // finally g*xhat and g summed back down to the parameters' own shapes.
+    const std::vector<std::string> expected = {
+        "ReduceMean", "Sub",       "Mul",    "ReduceMean", "Add", "Sqrt",
+        "Div",        "Mul",       "Mul",    "ReduceMean", "Mul", "ReduceMean",
+        "Sub",        "Mul",       "Sub",    "Mul",        "Mul", "ReduceSum",
+        "Reshape",    "ReduceSum", "Reshape"};
+    Check(OpTypes(b) == expected,
+          "the LayerNorm rule should emit graph_grad.py's nodes in its order");
+    Check(b.nodes().size() == expected.size() &&
+              grads.at("X") == b.nodes()[15].output(0),
+          "dx should be the Mul(inv, ...) that closes the dx expression");
+    Check(grads.at("Bn") == b.nodes().back().output(0),
+          "the bias gradient should be the last thing emitted");
+    // The 1.0 of the reciprocal and epsilon are initializers, not nodes, and
+    // they advance the same counter as the nodes do -- so they are checked
+    // here too rather than only implied by the node list. The other four are
+    // the axes/shape operands of the two broadcast-undoing reductions.
+    Check(b.initializer().size() == 6 &&
+              b.initializer()[0].data_type() == onnx::TensorProto::FLOAT &&
+              b.initializer()[0].dims_size() == 0 &&
+              b.initializer()[1].data_type() == onnx::TensorProto::FLOAT &&
+              b.initializer()[1].dims_size() == 0,
+          "the rule's first two constants are the scalars 1.0 and epsilon");
+
+    // axes as an *attribute*: ReduceMean only moved them to an input at opset
+    // 18, and the step graph is opset 17, where the input spelling fails the
+    // checker outright ("input size 2 not in range [min=1, max=1]").
+    for (const onnx::NodeProto& node : b.nodes()) {
+      if (node.op_type() != "ReduceMean") continue;
+      Check(node.input_size() == 1 && node.attribute_size() == 2 &&
+                node.attribute(0).name() == "axes" &&
+                node.attribute(0).ints_size() == 1 &&
+                node.attribute(0).ints(0) == 2 &&
+                node.attribute(1).name() == "keepdims" &&
+                node.attribute(1).i() == 1,
+            "the rule's ReduceMeans take axes [2] as an attribute, with "
+            "keepdims, at opset 17");
+    }
+  }
+  {
+    // axis spans [axis, rank), so a non-default axis widens the reduction
+    // rather than moving it.
+    const std::vector<onnx::NodeProto> nodes = {Node(
+        "LayerNormalization", {"X", "S", "Bn"}, {"Y"}, {IntAttr("axis", 1)})};
+    const Shapes shapes = {
+        {"X", {2, 3, 4}}, {"S", {3, 4}}, {"Bn", {3, 4}}, {"Y", {2, 3, 4}}};
+    GraphBuilder b;
+    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X", "S", "Bn"});
+    Check(b.nodes()[0].op_type() == "ReduceMean" &&
+              b.nodes()[0].attribute(0).ints_size() == 2 &&
+              b.nodes()[0].attribute(0).ints(0) == 1 &&
+              b.nodes()[0].attribute(0).ints(1) == 2,
+          "axis = 1 should normalize over axes [1, 2]");
+  }
+  {
+    // The bias is optional, and a real fused LayerNorm often omits it: one
+    // gradient fewer, and the two nodes that would have reduced g away are
+    // not emitted at all.
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("LayerNormalization", {"X", "S"}, {"Y"})};
+    const Shapes shapes = {{"X", {2, 3, 4}}, {"S", {4}}, {"Y", {2, 3, 4}}};
+    GraphBuilder b;
+    const std::map<std::string, std::string> grads =
+        BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X", "S"});
+    Check(b.nodes().size() == 19 && b.nodes().back().op_type() == "Reshape",
+          "a LayerNorm without a bias should emit two nodes fewer");
+    Check(grads.size() == 2 && grads.count("Bn") == 0,
+          "a LayerNorm without a bias has no third gradient");
+  }
+}
+
 // If this fails, a tensor read by two consumers -- a residual connection's
 // own input, which is why this matters -- would keep only one contribution,
 // and the parameter upstream of it would train on a fraction of its
@@ -493,6 +595,7 @@ int main() {
   AmbiguousReducedAxesAreRefusedRatherThanGuessed();
   ReducedAxesComeFromTheAttributeWhenThereIsOne();
   ABroadcastGradientIsSummedBackToTheOperandShape();
+  TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython();
   ATensorReadTwiceAccumulatesItsContributions();
   AnIdentityAliasesTheSeedInsteadOfEmittingANode();
   TheReturnedMapCoversExactlyTheRequestedTargets();
