@@ -21,21 +21,36 @@ sensitive layers, block-wise INT8), choosing which one each layer gets
 from a data-driven **sensitivity score**, then reusing existing
 graph-construction machinery for both.
 
-**The sensitivity score.** For a layer with weight ``W`` and calibration
-activation ``X``, this asks "how much would this layer's *output* change
-if ``W`` were quantized to INT4?" -- not just "how big is the raw
-quantization error", which ignores that a layer whose input is typically
-tiny barely matters even with a large per-weight error. Concretely:
+**The sensitivity score.** For a layer with weight ``W`` ([N, K]) and
+calibration activation ``X`` ([rows, K]), this asks "how much would this
+layer's *output* change if ``W`` were quantized to INT4?" -- not just "how
+big is the raw quantization error", which ignores that some input channels
+barely matter (tiny or rarely-large activation) even if their own weight
+column has a large per-element error. Concretely, per input channel ``k``:
 
-    mse = mean((W - INT4_dequant(W))^2)     -- INT4's own reconstruction error
-    sensitivity = mse * mean(X^2)           -- scaled by typical input magnitude
+    diag_h[k] = mean_rows(X[:, k] ** 2)          -- diag(X^T X) / rows
+    e[n, k]   = W[n, k] - INT4_dequant(W)[n, k]  -- INT4's own reconstruction error
+    sensitivity = mean_n( sum_k diag_h[k] * e[n, k] ** 2 )
 
-``mean(X^2)`` is the same per-layer activation-energy signal
-:mod:`onnxsim.duquant`'s own sensitivity ranking is built on (there,
-per-channel; here, a single per-layer scalar, since the decision being
-made -- INT4 vs INT8 -- is per-layer, not per-channel). Layers are ranked
-by this score; the top ``high_bits_fraction`` (by count, most sensitive
-first) get block-wise INT8 (:func:`onnxsim.quantize_weight_only_int8_block`'s
+``diag_h`` is the diagonal of the same per-layer reconstruction-error
+Hessian ``H = X^T X`` that :mod:`onnxsim.gptq` builds and inverts for a
+different purpose (correcting *which* integer each weight rounds to, given
+its neighbors, via ``H^{-1}``) -- here only the cheap diagonal is needed,
+since the decision being made (INT4 vs INT8) is per-layer, not per-weight,
+so there's nothing to gain from the off-diagonal (cross-channel) terms
+GPTQ's own correction relies on. ``sensitivity`` is thus the diagonal
+(channel-independent) approximation of the true curvature-weighted error
+``e @ H @ e^T`` -- an Optimal-Brain-Damage-style saliency, ``O(N*K)`` and
+needing no matrix inversion, unlike GPTQ/OBQ's exact per-weight version.
+It improves on a plain ``mean((W - INT4_dequant(W))^2) * mean(X^2)`` scalar
+product (this module's original scheme) exactly when a layer's
+quantization error is concentrated in the *same* channels its activation
+energy is concentrated in -- an outlier channel that is both large-valued
+and strongly activated, exactly the case mixed precision exists to catch --
+since that scalar product averages error and energy independently and so
+can't see that correlation. Layers are ranked by this score; the top
+``high_bits_fraction`` (by count, most sensitive first) get block-wise INT8
+(:func:`onnxsim.quantize_weight_only_int8_block`'s
 own granularity, reimplemented locally here since that function quantizes
 a whole model uniformly and can't be dispatched per-layer); every other
 layer gets ordinary block-wise INT4
@@ -62,7 +77,12 @@ from onnxsim import backend
 # `sys.modules` by the time this module is loaded as part of `import onnxsim`.
 from onnxsim.accuracy import AccuracyDropReport, measure_accuracy_drop
 from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import (
+    _activation_rows,
+    _add_probe_outputs,
+    _all_names,
+    _unique_name,
+)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
 from onnxsim.quip_sharp import _match_matmul_like
@@ -111,8 +131,8 @@ def apply_mixed_precision_quantization(
     :param model: the original (unquantized) onnx ModelProto or file path
     :param calibration_data: representative input batches (each a
             ``{input_name: np.ndarray}`` dict matching ``model``'s graph
-            inputs) used to measure each layer's own typical activation
-            magnitude -- see :func:`onnxsim.generate_random_calibration_data`
+            inputs) used to measure each layer's own per-input-channel
+            activation energy -- see :func:`onnxsim.generate_random_calibration_data`
             (the default when omitted) and
             :func:`onnxsim.load_huggingface_calibration_data` (real data,
             a more representative ranking than random input)
@@ -181,26 +201,33 @@ def apply_mixed_precision_quantization(
 
     probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(model, probe_names)
-    mean_x_sq: Dict[str, float] = {}
-    counts: Dict[str, int] = {}
+    # diag_h[name]: per-input-channel mean(X^2) -- diag(X^T X) / rows, the
+    # diagonal of the same reconstruction-error Hessian onnxsim.gptq builds
+    # (see module docstring). Accumulated across batches before dividing by
+    # the total row count, exactly like onnxsim.gptq's own H = X^T X.
+    diag_h_sum: Dict[str, np.ndarray] = {}
+    diag_h_rows: Dict[str, int] = {}
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
             x = np.asarray(result[name], dtype=np.float64)
-            total = float(np.sum(x**2))
-            mean_x_sq[name] = mean_x_sq.get(name, 0.0) + total
-            counts[name] = counts.get(name, 0) + x.size
+            for x_rows in _activation_rows([x]):
+                diag_h_sum[name] = diag_h_sum.get(name, 0.0) + np.sum(
+                    x_rows**2, axis=0
+                )
+                diag_h_rows[name] = diag_h_rows.get(name, 0) + x_rows.shape[0]
 
-    for name in list(mean_x_sq):
-        if counts[name] > 0:
-            mean_x_sq[name] /= counts[name]
+    diag_h: Dict[str, np.ndarray] = {
+        name: total / diag_h_rows[name]
+        for name, total in diag_h_sum.items()
+        if diag_h_rows[name] > 0
+    }
 
-    # Sensitivity per candidate: how much INT4 quantization error this
-    # layer's weight would have, scaled by that layer's own typical
-    # (calibration) input magnitude -- see module docstring.
+    # Sensitivity per candidate: an Optimal-Brain-Damage-style,
+    # curvature-weighted INT4 reconstruction error -- see module docstring.
     sensitivities: List[Optional[float]] = []
     for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        if x_name not in mean_x_sq:
+        if x_name not in diag_h:
             sensitivities.append(None)
             continue
         w_init = initializer_map[w_name]
@@ -211,8 +238,8 @@ def apply_mixed_precision_quantization(
         )
         scale_full = np.repeat(scale_blocks_nk, block_size, axis=1)
         dequant_nk = codes_nk * scale_full
-        mse = float(np.mean((w_nk - dequant_nk) ** 2))
-        sensitivities.append(mse * mean_x_sq[x_name])
+        err_sq_nk = (w_nk - dequant_nk) ** 2
+        sensitivities.append(float(np.mean(err_sq_nk @ diag_h[x_name])))
 
     eligible_idx = [i for i, s in enumerate(sensitivities) if s is not None]
     eligible_idx.sort(key=lambda i: sensitivities[i] or 0.0, reverse=True)
