@@ -243,9 +243,18 @@ cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
 # handling precision_estimator.cpp's ReadFloatTensorFlat does for real
 # weight tensors. xnnpack_codegen_test exercises xnnpack_codegen.cpp's own
 # GetTensorFloatData, which has the identical raw_data byte-order concern.
+# qat_graph_builder_test and qat_graph_parity_test earn their place on that
+# same criterion rather than for coverage's sake: qat_graph_builder.cpp's
+# Const() *writes* TensorProto raw_data, and the parity test reads it back,
+# so a big-endian run exercises both directions of the conversion. The
+# parity test is the sharper of the two -- it compares against a fixture
+# generated on a little-endian host, so it fails if either side of the round
+# trip picks up a host-order assumption. graph_grad_test comes along because
+# it builds NodeProtos through the same emitter and costs only its link step.
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
   tensor_pool_gguf_bridge_test tensor_pool_archive_test \
   precision_estimator_test contrib_schemas_moe_test xnnpack_codegen_test \
+  graph_grad_test qat_graph_builder_test qat_graph_parity_test \
   -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
