@@ -151,6 +151,83 @@ def test_mixed_precision_declines_below_opset21():
     assert result.SerializeToString() == model.SerializeToString()
 
 
+def _two_independent_layer_model(K=8, N=4, block_size=4, seed=0):
+    # Two UNCHAINED MatMuls sharing the exact same weight values (so their
+    # raw INT4 quantization MSE is identical), each block_size-wide K split
+    # into a "noisy" block (large-magnitude weights -> large absolute
+    # per-block quantization error) and a "quiet" block (tiny weights ->
+    # tiny error). This isolates a case a single-scalar
+    # `mse * mean(activation^2)` sensitivity score (this module's original
+    # heuristic) cannot distinguish -- both layers have the same overall MSE
+    # -- from the per-input-channel Hessian-diagonal score, which can: see
+    # test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincide.
+    rng = np.random.default_rng(seed)
+    assert K % block_size == 0 and K // block_size == 2  # exactly one noisy, one quiet block
+    w = np.concatenate(
+        [
+            rng.standard_normal((N, block_size)) * 1.0,  # noisy block (cols 0:block_size)
+            rng.standard_normal((N, block_size)) * 0.02,  # quiet block
+        ],
+        axis=1,
+    ).T.astype(np.float32)  # [K, N], transB=0 layout
+    nodes = [
+        onnx.helper.make_node("MatMul", ["Xp", "W"], ["Yp"]),
+        onnx.helper.make_node("MatMul", ["Xq", "W"], ["Yq"]),
+    ]
+    return _model(
+        nodes,
+        [_vi("Xp", ["batch", K]), _vi("Xq", ["batch", K])],
+        [_vi("Yp", ["batch", N]), _vi("Yq", ["batch", N])],
+        [_f32(w, "W")],
+    )
+
+
+def test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincide():
+    # Both MatMuls use the identical weight `W` above (identical MSE either
+    # way), so a sensitivity score built from one scalar mean(activation^2)
+    # per layer cannot tell them apart *if* their overall activation energy
+    # also happens to match -- exactly arranged here (`xp`/`xq` are the same
+    # values with their two blocks swapped, so both layers see the same
+    # total sum(activation^2)). The per-input-channel Hessian-diagonal score
+    # (this module's current scheme) can still tell them apart: "p"'s large
+    # activations land on the noisy (high quantization error) block, "q"'s
+    # land on the quiet block, so "p" is the genuinely more sensitive layer
+    # and must be the one promoted to INT8.
+    K, N, block_size = 8, 4, 4
+    model = _two_independent_layer_model(K=K, N=N, block_size=block_size, seed=11)
+
+    rng = np.random.default_rng(12)
+    noisy_block = rng.standard_normal((6, block_size)) * 5.0
+    quiet_block = rng.standard_normal((6, block_size)) * 0.02
+    xp = np.concatenate([noisy_block, quiet_block], axis=1).astype(np.float32)
+    xq = np.concatenate([quiet_block, noisy_block], axis=1).astype(np.float32)
+    # The two layers' overall activation energy is identical by construction
+    # (same blocks, swapped) -- the old single-scalar heuristic would have
+    # tied them.
+    assert np.isclose(np.sum(xp**2), np.sum(xq**2))
+
+    q = onnxsim.apply_mixed_precision_quantization(
+        model,
+        calibration_data=[{"Xp": xp, "Xq": xq}],
+        high_bits_fraction=0.5,  # exactly one of the two layers gets INT8
+        block_size=block_size,
+    )
+    # Both candidates quantize the same initializer name ("W"), so identify
+    # each new MatMul's own codes by tracing its input back to Xp/Xq instead
+    # of by initializer name.
+    matmuls = [n for n in q.graph.node if n.op_type == "MatMul"]
+    dequant_of = {n.output[0]: n for n in q.graph.node if n.op_type == "DequantizeLinear"}
+    codes_dtype_by_input = {}
+    for mm in matmuls:
+        x_name, w_dequant_name = mm.input
+        dq = dequant_of[w_dequant_name]
+        codes_init = next(t for t in q.graph.initializer if t.name == dq.input[0])
+        codes_dtype_by_input[x_name] = codes_init.data_type
+
+    assert codes_dtype_by_input["Xp"] == onnx.TensorProto.INT8
+    assert codes_dtype_by_input["Xq"] == onnx.TensorProto.INT4
+
+
 # --------------------------------------------------------------------------- #
 # search_mixed_precision_for_budget
 # --------------------------------------------------------------------------- #
