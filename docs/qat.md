@@ -422,7 +422,7 @@ learn scales and got a model whose scales are untouched has no way to tell
 that from a run where learning them did not help.
 
 Operator coverage is the same constraint it is under QAT, and it is still the
-binding one on a real model: `graph_grad.SUPPORTED_OPS` is 22 rules
+binding one on a real model: `graph_grad.SUPPORTED_OPS` is 23 rules
 (`LayerNormalization` among them since this branch, and `Conv` since a later
 one), so a normalization -- or a convolution -- in the middle of a block is
 now more nodes in the slice rather than a boundary between blocks. On a CNN

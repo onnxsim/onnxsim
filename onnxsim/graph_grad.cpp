@@ -1068,6 +1068,96 @@ std::vector<OptStr> GradClip(Backward& ctx, const onnx::NodeProto& node,
   return grads;
 }
 
+std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
+                               const std::string& g) {
+  // Gather's gradient: a scatter-add into `data`, `indices` itself untouched
+  // -- the embedding-lookup case, not the constant-index-table use GradConv
+  // makes of the *forward* Gather. There is no scatter op in BackwardOps(),
+  // so the accumulation is written as a one-hot matmul instead; the full
+  // derivation, the shape this rule handles (data: [..., N, ...], indices
+  // rank 0 or 1), and what it costs are in _grad_gather in graph_grad.py.
+  // This is a transcription of it, node for node.
+  const std::string& data = node.input(0);
+  const std::string& indices = node.input(1);
+  const Shape data_shape = ctx.ShapeOf(data);
+  const Shape idx_shape = ctx.ShapeOf(indices);
+  if (idx_shape.size() > 1) {
+    throw UnsupportedOpError(
+        "Gather with rank-" + std::to_string(idx_shape.size()) +
+        " indices is not differentiated here (node " + Quoted(node.output(0)) +
+        "); only a scalar or a rank-1 index vector is supported");
+  }
+  const int64_t rank = static_cast<int64_t>(data_shape.size());
+  if (rank == 0) {
+    // Python would raise ZeroDivisionError on its `% rank` below; in C++ the
+    // same modulo is undefined behaviour, so a rank-0 data tensor -- which
+    // Gather's own spec never produces anyway -- is refused by name instead.
+    throw UnsupportedOpError("Gather over a rank-0 data tensor (node " +
+                             Quoted(node.output(0)) + ") has no axis to index");
+  }
+  const int64_t raw_axis = AttrInt(node, "axis", 0);
+  const int64_t axis = ((raw_axis % rank) + rank) % rank;
+  const int64_t count = data_shape[static_cast<size_t>(axis)];
+  const Shape pre_shape(data_shape.begin(), data_shape.begin() + axis);
+  const Shape post_shape(data_shape.begin() + axis + 1, data_shape.end());
+  const int64_t pre = Prod(pre_shape);
+  const int64_t post = Prod(post_shape);
+  const int64_t length = Prod(idx_shape);  // 1 for a scalar, L for a vector
+
+  // indices as a flat float32 [length] vector, with negative values resolved
+  // to indices[i] + count -- a run-time value, so this happens in the graph
+  // rather than at build time.
+  const std::string flat_shape = ctx.b().ConstInt64({length}, "shape");
+  const std::string flat_idx =
+      ctx.b().Op("Reshape", {indices, flat_shape}, "reshape");
+  const std::string idx_f = ctx.b().Op(
+      "Cast", {flat_idx}, {IntAttr("to", onnx::TensorProto::FLOAT)}, "cast");
+  const std::string zero = ctx.b().Const(0.0f);
+  const std::string is_negative = ctx.MaskLess(idx_f, zero);
+  const std::string count_const = ctx.b().Const(static_cast<float>(count));
+  const std::string negative_amount = ctx.b().Mul(is_negative, count_const);
+  const std::string idx_resolved = ctx.b().Add(idx_f, negative_amount);
+
+  // onehot[l, n] = (indices[l] == n), as a float32 [length, count] matrix --
+  // the same two-sided (1 - greater) * (1 - less) trick every other rule
+  // here uses to build a boolean without an Equal node.
+  const std::string col_shape = ctx.b().ConstInt64({length, 1}, "shape");
+  const std::string idx_col =
+      ctx.b().Op("Reshape", {idx_resolved, col_shape}, "reshape");
+  std::vector<float> arange_values(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    arange_values[static_cast<size_t>(i)] = static_cast<float>(i);
+  }
+  const std::string arange = ctx.b().Const(arange_values, {count}, "arange");
+  const std::string row_shape = ctx.b().ConstInt64({1, count}, "shape");
+  const std::string arange_row =
+      ctx.b().Op("Reshape", {arange, row_shape}, "reshape");
+  const std::string one_a = ctx.b().Const(1.0f);
+  const std::string greater_mask = ctx.MaskGreater(idx_col, arange_row);
+  const std::string not_greater = ctx.b().Sub(one_a, greater_mask);
+  const std::string one_b = ctx.b().Const(1.0f);
+  const std::string less_mask = ctx.MaskLess(idx_col, arange_row);
+  const std::string not_less = ctx.b().Sub(one_b, less_mask);
+  const std::string onehot = ctx.b().Mul(not_greater, not_less);
+
+  // dData[n, ...] = sum_l onehot[l, n] * dY[l, ...], batched over `pre` with
+  // a broadcasting leading axis so one onehot matrix serves every batch
+  // element -- see GradConv's `wt` for the same trick.
+  const std::string onehot_t = ctx.b().Transpose(onehot, {1, 0});
+  const std::string batched_shape =
+      ctx.b().ConstInt64({1, count, length}, "shape");
+  const std::string onehot_batched =
+      ctx.b().Op("Reshape", {onehot_t, batched_shape}, "reshape");
+  const std::string dy_shape = ctx.b().ConstInt64({pre, length, post}, "shape");
+  const std::string dy_flat = ctx.b().Op("Reshape", {g, dy_shape}, "reshape");
+  const std::string ddata_flat = ctx.b().MatMul(onehot_batched, dy_flat);
+  const std::string ddata_shape = ctx.b().ConstInt64(data_shape, "shape");
+  const std::string ddata =
+      ctx.b().Op("Reshape", {ddata_flat, ddata_shape}, "reshape");
+
+  return {ddata, std::nullopt};
+}
+
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
@@ -1077,6 +1167,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Div", &GradDiv},
           {"Erf", &GradErf},
           {"Exp", &GradExp},
+          {"Gather", &GradGather},
           {"Gemm", &GradGemm},
           {"Identity", &GradIdentity},
           {"LayerNormalization", &GradLayerNormalization},
