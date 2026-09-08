@@ -454,6 +454,55 @@ _CASES = {
         """,
         None,
     ),
+    # LayerNormalization: the one op a pre-norm transformer block needs that
+    # plain arithmetic does not provide. Its dx depends on every element in
+    # the normalization group through both the mean and the variance, so a
+    # rule that dropped either mean term would still look plausible and would
+    # still be wrong -- which is what these finite differences are for.
+    "layer_norm": (
+        """
+        g (float[2,3,4] A, float[4] S, float[4] B) => (float[2,3,4] Y) {
+          Y = LayerNormalization (A, S, B)
+        }
+        """,
+        None,
+    ),
+    "layer_norm_no_bias": (
+        """
+        g (float[2,3,4] A, float[4] S) => (float[2,3,4] Y) {
+          Y = LayerNormalization (A, S)
+        }
+        """,
+        None,
+    ),
+    "layer_norm_axis_1": (
+        """
+        g (float[2,3,4] A, float[3,4] S, float[3,4] B) => (float[2,3,4] Y) {
+          Y = LayerNormalization <axis = 1> (A, S, B)
+        }
+        """,
+        None,
+    ),
+    "layer_norm_epsilon": (
+        """
+        g (float[2,3,4] A, float[4] S, float[4] B) => (float[2,3,4] Y) {
+          Y = LayerNormalization <epsilon = 0.001> (A, S, B)
+        }
+        """,
+        None,
+    ),
+    # ...and composed, since a block never contains a bare LayerNorm: the
+    # gradient has to flow through it into an upstream MatMul's weight.
+    "layer_norm_in_a_chain": (
+        """
+        g (float[2,4] A, float[4,4] W, float[4] S, float[4] B) => (float[2,4] Y) {
+          H = MatMul (A, W)
+          N = LayerNormalization (H, S, B)
+          Y = Relu (N)
+        }
+        """,
+        None,
+    ),
     "softmax_first_axis": (
         """
         g (float[3,4] A) => (float[3,4] Y) {

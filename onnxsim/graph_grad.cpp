@@ -66,6 +66,15 @@ onnx::AttributeProto IntAttr(const std::string& name, int64_t value) {
   return attribute;
 }
 
+onnx::AttributeProto IntsAttr(const std::string& name,
+                              const std::vector<int64_t>& values) {
+  onnx::AttributeProto attribute;
+  attribute.set_name(name);
+  attribute.set_type(onnx::AttributeProto::INTS);
+  for (int64_t value : values) attribute.add_ints(value);
+  return attribute;
+}
+
 // Shapes in error messages, spelled the way the Python's f-strings spell
 // them, so a refusal reads the same from either implementation.
 std::string ShapeStr(const Shape& shape) {
@@ -611,6 +620,69 @@ std::vector<OptStr> GradSoftmax(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Mul(y, centred)};
 }
 
+std::vector<OptStr> GradLayerNormalization(Backward& ctx,
+                                           const onnx::NodeProto& node,
+                                           const std::string& g) {
+  // With gs = g * scale: dx = inv * (gs - mean(gs) - xhat * mean(gs * xhat)),
+  // dscale = sum(g * xhat), db = sum(g). The derivation, and why mu and inv
+  // are recomputed here rather than read from the node's optional
+  // Mean/InvStdDev outputs, are in _grad_layer_normalization in
+  // graph_grad.py.
+  const std::string& x = node.input(0);
+  const std::string& scale = node.input(1);
+  const Shape shape = ctx.ShapeOf(x);
+  const int64_t rank = static_cast<int64_t>(shape.size());
+  if (rank == 0) {
+    // Python would raise ZeroDivisionError on its `% rank`; in C++ the same
+    // modulo is undefined behaviour, so a rank-0 input is refused by name.
+    throw UnsupportedOpError("LayerNormalization over a rank-0 input (node " +
+                             Quoted(node.output(0)) +
+                             ") has no axes to normalize");
+  }
+  const int64_t raw_axis = AttrInt(node, "axis", -1);
+  const int64_t axis = ((raw_axis % rank) + rank) % rank;
+  const float eps = AttrFloat(node, "epsilon", 1e-5f);
+  // The axes are an *attribute* here, not an input: ReduceSum moved its axes
+  // to an input at opset 13 and ReduceMean only at opset 18, so at the step
+  // graph's opset 17 the two spell the same idea differently.
+  std::vector<int64_t> axes;
+  for (int64_t i = axis; i < rank; ++i) axes.push_back(i);
+  const std::vector<onnx::AttributeProto> reduce_attrs = {
+      IntsAttr("axes", axes), IntAttr("keepdims", 1)};
+
+  const std::string mu =
+      ctx.b().Op("ReduceMean", {x}, reduce_attrs, "reducemean");
+  const std::string xc = ctx.b().Sub(x, mu);
+  const std::string xc_squared = ctx.b().Mul(xc, xc);
+  const std::string var =
+      ctx.b().Op("ReduceMean", {xc_squared}, reduce_attrs, "reducemean");
+  const std::string one = ctx.b().Const(1.0f);
+  const std::string eps_const = ctx.b().Const(eps);
+  const std::string shifted = ctx.b().Add(var, eps_const);
+  const std::string deviation = ctx.b().Sqrt(shifted);
+  const std::string inv = ctx.b().Div(one, deviation);
+  const std::string xhat = ctx.b().Mul(xc, inv);
+
+  const std::string gs = ctx.b().Mul(g, scale);
+  const std::string mean_gs =
+      ctx.b().Op("ReduceMean", {gs}, reduce_attrs, "reducemean");
+  const std::string gs_xhat = ctx.b().Mul(gs, xhat);
+  const std::string mean_gs_xhat =
+      ctx.b().Op("ReduceMean", {gs_xhat}, reduce_attrs, "reducemean");
+  const std::string centred = ctx.b().Sub(gs, mean_gs);
+  const std::string correction = ctx.b().Mul(xhat, mean_gs_xhat);
+  const std::string inner = ctx.b().Sub(centred, correction);
+  const std::string dx = ctx.b().Mul(inv, inner);
+
+  std::vector<OptStr> grads{dx};
+  const std::string g_xhat = ctx.b().Mul(g, xhat);
+  grads.push_back(ctx.ReduceTo(g_xhat, shape, ctx.ShapeOf(scale)));
+  if (node.input_size() > 2 && !node.input(2).empty()) {
+    grads.push_back(ctx.ReduceTo(g, shape, ctx.ShapeOf(node.input(2))));
+  }
+  return grads;
+}
+
 std::vector<OptStr> GradClip(Backward& ctx, const onnx::NodeProto& node,
                              const std::string& g) {
   // Pass the gradient through where the input was *strictly* inside the
@@ -636,16 +708,27 @@ std::vector<OptStr> GradClip(Backward& ctx, const onnx::NodeProto& node,
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
-          {"Add", &GradAdd},           {"Clip", &GradClip},
-          {"Div", &GradDiv},           {"Erf", &GradErf},
-          {"Exp", &GradExp},           {"Gemm", &GradGemm},
-          {"Identity", &GradIdentity}, {"MatMul", &GradMatMul},
-          {"Mul", &GradMul},           {"Neg", &GradNeg},
-          {"ReduceMean", &GradReduce}, {"ReduceSum", &GradReduce},
-          {"Relu", &GradRelu},         {"Reshape", &GradReshape},
-          {"Sigmoid", &GradSigmoid},   {"Softmax", &GradSoftmax},
-          {"Sqrt", &GradSqrt},         {"Sub", &GradSub},
-          {"Tanh", &GradTanh},         {"Transpose", &GradTranspose},
+          {"Add", &GradAdd},
+          {"Clip", &GradClip},
+          {"Div", &GradDiv},
+          {"Erf", &GradErf},
+          {"Exp", &GradExp},
+          {"Gemm", &GradGemm},
+          {"Identity", &GradIdentity},
+          {"LayerNormalization", &GradLayerNormalization},
+          {"MatMul", &GradMatMul},
+          {"Mul", &GradMul},
+          {"Neg", &GradNeg},
+          {"ReduceMean", &GradReduce},
+          {"ReduceSum", &GradReduce},
+          {"Relu", &GradRelu},
+          {"Reshape", &GradReshape},
+          {"Sigmoid", &GradSigmoid},
+          {"Softmax", &GradSoftmax},
+          {"Sqrt", &GradSqrt},
+          {"Sub", &GradSub},
+          {"Tanh", &GradTanh},
+          {"Transpose", &GradTranspose},
       };
   return *rules;
 }
@@ -666,9 +749,14 @@ std::string SupportedOpsList() {
 }  // namespace
 
 const std::set<std::string>& BackwardOps() {
+  // ReduceMean and Sqrt were admitted for GradLayerNormalization, which
+  // needs a mean over the normalized axes and the reciprocal square root of
+  // the variance; the Python set says at length why that is not a loosening
+  // of the criterion.
   static const std::set<std::string>* ops = new std::set<std::string>{
-      "Add", "Cast", "Div",       "Exp",     "Greater", "Less",     "MatMul",
-      "Mul", "Neg",  "ReduceSum", "Reshape", "Sub",     "Transpose"};
+      "Add",       "Cast",    "Div",  "Exp", "Greater",
+      "Less",      "MatMul",  "Mul",  "Neg", "ReduceMean",
+      "ReduceSum", "Reshape", "Sqrt", "Sub", "Transpose"};
   return *ops;
 }
 

@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "graph_grad.h"
 #include "onnx/defs/parser.h"
 #include "qat_entry.h"
 #include "qat_graph_builder.h"
@@ -410,6 +411,14 @@ std::string Render() {
       "(onnxsim/qat_graph_parity_test.cpp).",
       "ops " + Join(ops, ","),
   };
+  // The autodiff's two sets, mirroring the generator. A divergence shows up
+  // here as a one-line diff; TheAutodiffRuleTableMatchesTheFixture below says
+  // which set and which side, since a bare diff of two sorted lists is not
+  // obvious to read.
+  std::vector<std::string> rules(SupportedOps().begin(), SupportedOps().end());
+  std::vector<std::string> back(BackwardOps().begin(), BackwardOps().end());
+  lines.push_back("rules " + Join(rules, ","));
+  lines.push_back("backward_ops " + Join(back, ","));
   // The planner case's model, verbatim -- the generator writes it and
   // CasePlanner parses it back, so there is one definition of that model.
   std::istringstream model_text(g_planner_model_text);
@@ -493,6 +502,52 @@ void TheAllowlistMatchesTheFixture() {
   ++failures;
 }
 
+// The autodiff's rule table and emittable-op set, pinned by the fixture.
+//
+// This is the check whose absence let Python and C++ drift apart unnoticed:
+// graph_grad_test compares SupportedOps() against a list hardcoded in C++,
+// which is a snapshot of the Python rather than the Python, so a rule added
+// on the Python side left this side one rule short and nothing failed. It
+// happened, with LayerNormalization. Comparing against the shared fixture --
+// which the Python test independently pins to graph_grad.py -- makes the
+// next divergence a parity failure on whichever side falls behind.
+void TheAutodiffRuleTableMatchesTheFixture() {
+  std::ifstream in(QAT_PARITY_FIXTURE);
+  if (!in) {
+    std::cerr << "cannot open fixture " << QAT_PARITY_FIXTURE << "\n";
+    ++failures;
+    return;
+  }
+  std::map<std::string, std::string> pinned;
+  for (std::string line; std::getline(in, line);) {
+    for (const char* key : {"rules", "backward_ops"}) {
+      const std::string prefix = std::string(key) + " ";
+      if (line.rfind(prefix, 0) == 0) pinned[key] = line.substr(prefix.size());
+    }
+  }
+  const std::pair<const char*, const std::set<std::string>&> checks[] = {
+      {"rules", SupportedOps()},
+      {"backward_ops", BackwardOps()},
+  };
+  for (const auto& check : checks) {
+    const auto it = pinned.find(check.first);
+    if (it == pinned.end()) {
+      std::cerr << "fixture has no `" << check.first
+                << "` line; regenerate it with "
+                   "scripts/make_qat_parity_fixtures.py\n";
+      ++failures;
+      continue;
+    }
+    std::vector<std::string> ours(check.second.begin(), check.second.end());
+    const std::string expected = Join(ours, ",");
+    if (it->second != expected) {
+      std::cerr << check.first << " mismatch\n  fixture: " << it->second
+                << "\n  c++    : " << expected << "\n";
+      ++failures;
+    }
+  }
+}
+
 // Pulls the planner model out of the fixture's `model_text ` lines.
 bool LoadPlannerModelText() {
   std::ifstream in(QAT_PARITY_FIXTURE);
@@ -519,6 +574,7 @@ int main() {
   if (!LoadPlannerModelText()) return 1;
   TheCppEmitterReproducesTheCommittedFixture();
   TheAllowlistMatchesTheFixture();
+  TheAutodiffRuleTableMatchesTheFixture();
   if (failures) {
     std::cerr << failures << " parity check(s) failed\n";
     return 1;

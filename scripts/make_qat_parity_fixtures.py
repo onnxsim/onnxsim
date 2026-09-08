@@ -67,7 +67,7 @@ import onnx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from onnxsim import qat_graph  # noqa: E402
+from onnxsim import graph_grad, qat_graph  # noqa: E402
 
 FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "onnxsim", "qat_parity_fixtures.txt"
@@ -525,6 +525,14 @@ def render(fixtures: Dict[str, Any]) -> str:
         "# Asserted against onnxsim/qat_graph.py (tests/test_qat_parity.py) and",
         "# against onnxsim/qat_graph_builder.cpp (onnxsim/qat_graph_parity_test.cpp).",
         "ops " + ",".join(fixtures["ep_friendly_ops"]),
+        # The autodiff's rule table and the ops its rules may emit, pinned for
+        # the same reason as `ops` above. Without these, adding a rule on the
+        # Python side leaves the C++ one rule short and *nothing fails*: the
+        # C++ test compares SupportedOps() against a hardcoded list, which is
+        # a snapshot of the Python rather than the Python. That is exactly the
+        # silent divergence this harness exists to prevent, and it happened.
+        "rules " + ",".join(fixtures["supported_ops"]),
+        "backward_ops " + ",".join(fixtures["backward_ops"]),
     ]
     # The planner case's model, verbatim. The C++ side parses these lines back
     # rather than rebuilding the model, so there is exactly one definition of
@@ -572,6 +580,8 @@ def build() -> Dict[str, Any]:
             "comparison is shaped this way."
         ),
         "ep_friendly_ops": sorted(qat_graph.EP_FRIENDLY_OPS),
+        "supported_ops": sorted(graph_grad.SUPPORTED_OPS),
+        "backward_ops": sorted(graph_grad.BACKWARD_OPS),
         "cases": cases,
     }
 
