@@ -489,6 +489,27 @@ reading is intuition rather than a bound -- there is a nonlinearity in the
 middle of the block and two weights are trained jointly -- but the direction
 was the same everywhere it was measured.
 
+And `num_iterations` interacts with it, in opposite directions either side of
+the cliff. Held-out error ratio, 4 seeds, same model and learning rate:
+
+| rows | 25 iters | 50 | 100 | 300 |
+| --- | --- | --- | --- | --- |
+| 16 | 0.60-0.70 | 0.59-0.70 | 0.59-0.72 | 0.62-0.76 |
+| 256 | 0.30-0.34 | 0.14-0.18 | 0.03-0.07 | 0.000-0.002 |
+
+With enough rows, longer is monotonically better -- 300 iterations won on
+every seed. With too few, it is monotonically *worse* past a knee somewhere
+around 25-100: the training loss keeps falling three or four orders of
+magnitude while the held-out error climbs, which is textbook overfitting and
+is the same thing the table above measures from the other side.
+
+So `num_iterations` is the regularizer here, and the default of 1000 is aimed
+at the well-fed case. But note the sizes before reaching for it: stopping
+early at 16 rows buys perhaps 3-9% relative, where going to 256 rows buys
+99.8%. Early stopping is worth doing and is not a substitute for data, which
+is why no regularization parameter was added -- one would look like a fix for
+a problem it barely moves.
+
 Two things follow, and they belong in any use of this. First, `num_samples`
 defaults to 8 *batches* of random data, so the row count is 8 times the
 model's own batch dimension: for a model with a small batch dimension that is
