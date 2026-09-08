@@ -4078,6 +4078,56 @@ groups, of which these layer files have none.
 Test: `test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks`
 (Docker, no device).
 
+### Prefill: why it cannot be timed directly, and what stands in for it
+
+Decode measures memory. Prefill is the compute-bound half of an LLM, and it
+is what a 43.2 TOPS INT4 rating would have to be claiming. It cannot be timed
+on this stack, and the reasons are worth recording so nobody repeats the
+attempt.
+
+**The two halves are both in the file.** An `llm_build` layer `.axmodel`
+holds *two independent* `neu mode` nodes: `subgraph_npu_0` takes
+`K_cache, V_cache, indices, input, mask` (decode) and `subgraph_npu_1` takes
+the same names suffixed `_1` (prefill). Neither consumes the other's output.
+
+**`axcl_run_model` always runs the first one.** Its `--group` flag indexes
+*shape* groups, of which these files have none -- asking for group 0 or 1
+both return "Selected shape group index {n vs. 0} is out of range". Feeding
+only the `_1` inputs fails; feeding all ten runs decode and reports decode's
+latency. There is no other runner: `/usr/bin/axcl/` ships `axcl_run_model`,
+`axcl_demo` and hardware samples, nothing LLM-specific.
+
+**Editing the wrapper does not redirect it.** Deleting the decode node makes
+the model fail to load, while an unmodified load-and-re-save runs fine
+(9.268 ms against 9.182 ms), so the surgery is the cause, not the round trip.
+Renaming so prefill becomes `subgraph_npu_0` gets past loading and then fails
+at "Feed stimulus failed" -- the runtime takes its input specification from
+the compiled blob, not from the ONNX names, so the wrapper cannot choose
+which subgraph runs.
+
+**And a prefill-only build is not on offer.** `llm_build --kv_cache_len 0`
+fails in the frontend with degenerate RoPE parameters (`shape (0, 64)`).
+
+**What stands in for it: the arithmetic prefill is made of.** A prefill step
+is dominated by large matrix multiplications, and those compile through the
+ordinary path:
+
+| matmul stack | GMAC | min ms | TOPS |
+| --- | --- | --- | --- |
+| S=128, 4096x11008, 4 layers | 46.2 | 16.21 | 5.70 |
+| S=512, 2048x5632, 6 layers | 70.9 | 19.01 | 7.46 |
+
+So transformer-shaped INT8 arithmetic sustains **5.7 to 7.5 TOPS**, against
+10.13 for convolution. Longer sequences do better, which is the same tiling
+story as the CNN measurements: 128 rows do not fill the engine as well as 512.
+
+That puts a bound on the INT4 claim rather than testing it. Prefill
+arithmetic on this card runs at roughly 6-7 TOPS in INT8; for INT4 to reach
+43.2 it would have to be six times faster than INT8 matmul measured here,
+where the decode measurements show INT4 buying 1.56x. The rating is not
+verifiable on this toolchain, and nothing measured here suggests it is
+reachable.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
