@@ -277,6 +277,7 @@ from onnxsim.qwen_drive_planning_expert_reconstruct import (
 )
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
+from onnxsim.sam2_export import export_sam2_model
 from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
@@ -553,6 +554,7 @@ __all__ = [
     "export_transformers_model",
     "export_diffusion_model",
     "export_detectron_model",
+    "export_sam2_model",
     "export_mlir",
     "export_coreml",
     "export_tflite",

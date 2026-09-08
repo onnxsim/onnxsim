@@ -97,6 +97,10 @@ constant folding until the model stops changing. Around that it offers:
   [Detectron2](https://github.com/facebookresearch/detectron2) model
   (Faster/Mask/Keypoint R-CNN, RetinaNet, ...) to ONNX and simplify it with
   `onnxsim.export_detectron_model()`.
+- **[SAM 2 export](#sam-2-export).** Trace a Meta
+  [SAM 2](https://github.com/facebookresearch/sam2) image encoder and
+  prompt/mask decoder to ONNX and simplify both with
+  `onnxsim.export_sam2_model()`.
 - **[Quantization-aware fine-tuning](#quantization-aware-fine-tuning).**
   Recover accuracy a quantization lost with `onnxsim.apply_qat()`:
   label-free, block-wise fine-tuning of the fp32 weights themselves against
@@ -1270,6 +1274,53 @@ Needs the optional `torch` package (`pip install onnxsim[detectron2]`).
 separately from source, e.g.
 `pip install 'git+https://github.com/facebookresearch/detectron2.git'` (see
 [Detectron2's install docs](https://detectron2.readthedocs.io/en/latest/tutorials/install.html)).
+
+## SAM 2 export
+
+Meta's [SAM 2](https://github.com/facebookresearch/sam2) (Segment Anything
+2) has the same problem as Detectron2: no single-call ONNX exporter, and a
+`forward()` that isn't directly traceable end-to-end -- image embedding and
+prompt-driven mask decoding are two separate stages meant to be called many
+times per embedding (one embedding, many point/box prompts). The
+established recipe (Meta's own original SAM `scripts/export_onnx_model.py`,
+carried over to SAM 2 by the community) is two separate traced graphs
+instead: an image encoder, and a decoder wrapping the prompt encoder plus
+mask decoder.
+
+[`samexporter`](https://github.com/vietanhdev/samexporter) already
+implements and maintains that split for SAM/SAM2/SAM3 -- and its own CLI
+already calls `onnxsim.simplify()` under its `--simplify` flag, so onnxsim
+already sits downstream of it for real users. `onnxsim.export_sam2_model()`
+wraps that same build-model/trace/export sequence as a reusable entry point
+that always simplifies, the SAM 2 counterpart of
+`onnxsim.export_detectron_model()`:
+
+```python
+import onnxsim
+
+onnxsim.export_sam2_model(
+    "sam2.1_hiera_tiny",
+    "sam2_exported",
+)
+# {"encoder.onnx": True, "decoder.onnx": True}
+```
+
+`model_type` selects one of `samexporter`'s bundled Hydra model configs
+(`"sam2.1_hiera_tiny"`, `"sam2.1_hiera_small"`, `"sam2.1_hiera_base_plus"`,
+`"sam2.1_hiera_large"`, or the plain `"sam2_hiera_*"` names for the original
+SAM 2 release). Pass `checkpoint=` a path to a `.pt` checkpoint to trace
+with real weights -- if omitted, the model traces with its random
+initialization instead, with no checkpoint or network needed at all, e.g.
+for testing.
+
+Needs the optional `torch`, `samexporter`, and `hydra-core` packages
+(`pip install onnxsim[sam2]`). The real `sam2` package itself is **not**
+published to PyPI under its official name -- install it from source:
+`pip install 'git+https://github.com/facebookresearch/sam2.git'` (see
+[SAM 2's install docs](https://github.com/facebookresearch/sam2#installation)).
+A same-named `sam2` package that *is* on PyPI is an unrelated, unofficial
+third-party upload as of this writing, not Meta's code -- don't substitute
+it for this.
 
 ## Quantization-aware fine-tuning
 
