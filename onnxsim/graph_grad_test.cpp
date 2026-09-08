@@ -260,13 +260,31 @@ Shapes PoolShapes() {
 // SupportedOps rather than to catch refusals) would admit a block in the
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
-  const std::set<std::string> expected = {
-      "Add",     "AveragePool", "Clip",       "Conv",     "Div",
-      "Erf",     "Exp",         "Gather",     "Gemm",     "Identity",
-      "LayerNormalization",     "MatMul",     "MaxPool",  "Mul",
-      "Neg",     "ReduceMean",  "ReduceSum",  "Relu",     "Reshape",
-      "Sigmoid", "Softmax",     "Sqrt",       "Sub",      "Tanh",
-      "Transpose"};
+  const std::set<std::string> expected = {"Add",
+                                          "AveragePool",
+                                          "Clip",
+                                          "Conv",
+                                          "Div",
+                                          "Erf",
+                                          "Exp",
+                                          "Gather",
+                                          "Gemm",
+                                          "Identity",
+                                          "LayerNormalization",
+                                          "MatMul",
+                                          "MaxPool",
+                                          "Mul",
+                                          "Neg",
+                                          "ReduceMean",
+                                          "ReduceSum",
+                                          "Relu",
+                                          "Reshape",
+                                          "Sigmoid",
+                                          "Softmax",
+                                          "Sqrt",
+                                          "Sub",
+                                          "Tanh",
+                                          "Transpose"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
