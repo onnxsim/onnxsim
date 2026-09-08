@@ -4609,6 +4609,53 @@ def test_spatial_extent_lives_in_three_bits_of_b0_03(tmp_path):
         assert field_for(**overrides) == reference, overrides
 
 
+def test_the_spatial_field_follows_the_innermost_dimension_in_2d(tmp_path):
+    """Confirmed real (see the README's "The same register, two spatial
+    rules" section): in a *2-D* convolution the same `a1 b0.03` bits 4 to 6
+    hold
+
+        floor((W + 2*pad - 1) / 32)
+
+    -- the index of the last 32-wide tile of the *padded* width. It follows
+    the innermost dimension only: sweeping the height from 16 to 80 does not
+    move it at all.
+
+    Two details separate this from the 1-D rule for the same register, and
+    both are the kind of thing a single formula would paper over: the tile is
+    32 wide rather than 16, and the width is padded where the 1-D length is
+    not -- which is visible only at an exact multiple of the tile, where a
+    1x1 and a 3x3 kernel disagree. Needs Docker, no device.
+    """
+    cin = cout = 32
+    height = 32
+
+    seen = []
+
+    def field_for(width, kernel=3, h=height):
+        seen.append(1)
+        work = tmp_path / f"w{width}k{kernel}h{h}_{len(seen)}"
+        work.mkdir()
+        model = _one_conv2d_model(cin, cout, max(h, width), kernel)
+        # `_one_conv2d_model` is square; build the rectangle by hand.
+        model.graph.input[0].type.tensor_type.shape.dim[2].dim_value = h
+        model.graph.input[0].type.tensor_type.shape.dim[3].dim_value = width
+        model.graph.output[0].type.tensor_type.shape.dim[2].dim_value = h
+        model.graph.output[0].type.tensor_type.shape.dim[3].dim_value = width
+        mcode = _build_single_op(str(work), "m", model)
+        return _operand_field(mcode, 0xA1, 0xB0, 0x03, 4, 6)
+
+    for width in (32, 64, 96):
+        assert field_for(width) == (width + 2 - 1) // 32, width
+
+    # The height does not move it.
+    assert field_for(64, h=16) == field_for(64, h=80), "height must not matter"
+
+    # At an exact multiple of the tile the padding shows: a 1x1 kernel pads
+    # nothing and lands one tile lower than a 3x3.
+    assert field_for(32, kernel=1) == (32 - 1) // 32
+    assert field_for(32, kernel=3) == (32 + 2 - 1) // 32
+
+
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
     """Confirmed real (see the README's "The first operand with a known
     meaning" section): in a program holding exactly one convolution, the
