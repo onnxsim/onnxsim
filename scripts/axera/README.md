@@ -4078,7 +4078,56 @@ groups, of which these layer files have none.
 Test: `test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks`
 (Docker, no device).
 
-### Prefill: why it cannot be timed directly, and what stands in for it
+### Prefill, timed at last -- and INT4 does nothing for it
+
+The section below records four routes that all closed. The fifth works: go
+under `axcl_run_model` to the engine API it is built on.
+
+**The CLI was wrong about the shape groups.** `axcl_run_model -g 1` reports
+"Selected shape group index {1 vs. 0} is out of range", which reads as "this
+model has no groups". Asking the engine directly --
+`axclrtEngineGetShapeGroupsCount()` -- says an `llm_build` layer has **two**,
+and their sizes say exactly what they are:
+
+| | group 0 | group 1 |
+| --- | --- | --- |
+| `input` | 8,192 B (1 x 4096 x bf16) | 1,048,576 B (128 x 4096 x bf16) |
+| `mask` | 512 B | 32,768 B |
+
+Group 0 is decode, group 1 is prefill. `axclrtEngineExecute()` takes the
+group index, so a twenty-line C program can run either. `scripts/axera/tools/`
+carries it. Its group-0 timing reproduces `axcl_run_model`'s to within a few
+percent (9.117 ms against 9.14 ms), which is the check that the buffers and
+the timing loop are honest.
+
+**The result, on both models:**
+
+| model | group | `s8` | `s4` | INT4 gain |
+| --- | --- | --- | --- | --- |
+| 4096-hidden | decode | 9.117 ms | 5.751 ms | **1.59x** |
+| 4096-hidden | prefill, S=128 | 23.493 ms | 22.359 ms | **1.05x** |
+| SmolLM2-135M | decode | 0.476 ms | 0.447 ms | 1.06x |
+| SmolLM2-135M | prefill, S=512 | 19.952 ms | 19.553 ms | 1.02x |
+
+**INT4 buys 1.59x on decode and essentially nothing on prefill.** That is the
+whole answer to the 43.2 TOPS question. Four-bit weights cut weight *traffic*,
+which is what decode is made of; they do not make the arithmetic faster, which
+is what prefill is made of.
+
+**And prefill's arithmetic is slow in absolute terms.** The 4096-hidden layer
+is 22.8 GMAC of prefill, so 23.5 ms is **1.94 TOPS** -- against 5.7-7.5 for an
+INT8 matmul stack and 10.13 for convolution. The reason is in the build
+options: `llm_build --hidden_state_type` offers `fp16`, `bf16` and `fp32`, and
+nothing narrower. **The LLM pipeline is weight-only quantised**: `s4`/`s8`
+weights against 16-bit activations. Its arithmetic therefore never touches the
+INT8 or INT4 datapath the TOPS ratings describe, whatever the weights are
+stored as.
+
+So the 43.2 TOPS INT4 rating is not reachable through either pipeline, and now
+for a measured reason rather than a missing measurement: `pulsar2 build` has no
+4-bit weights at all, and `llm_build` has 4-bit weights but 16-bit activations.
+
+### Why the earlier routes closed (recorded so nobody repeats them)
 
 Decode measures memory. Prefill is the compute-bound half of an LLM, and it
 is what a 43.2 TOPS INT4 rating would have to be claiming. It cannot be timed
