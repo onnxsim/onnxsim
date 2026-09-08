@@ -8,6 +8,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Every rule below is a transcription of the same-named rule in
@@ -58,6 +59,14 @@ int64_t AttrInt(const onnx::NodeProto& node, const std::string& name,
   return a == nullptr ? fallback : a->i();
 }
 
+std::vector<int64_t> AttrInts(const onnx::NodeProto& node,
+                              const std::string& name,
+                              const std::vector<int64_t>& fallback) {
+  const onnx::AttributeProto* a = FindAttr(node, name);
+  if (a == nullptr) return fallback;
+  return std::vector<int64_t>(a->ints().begin(), a->ints().end());
+}
+
 onnx::AttributeProto IntAttr(const std::string& name, int64_t value) {
   onnx::AttributeProto attribute;
   attribute.set_name(name);
@@ -90,6 +99,17 @@ std::string ShapeStr(const Shape& shape) {
 }
 
 std::string Quoted(const std::string& value) { return "'" + value + "'"; }
+
+// An int list the way Python prints one -- "[3, 3]" -- for the Conv
+// refusals, whose messages name strides, dilations and pads.
+std::string IntsStr(const std::vector<int64_t>& values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) out += ", ";
+    out += std::to_string(values[i]);
+  }
+  return out + "]";
+}
 
 // numpy's broadcast_shapes, for the batch axes of a batched MatMul.
 Shape BroadcastShapes(const Shape& a, const Shape& b) {
@@ -300,6 +320,349 @@ std::vector<OptStr> GradGemm(Backward& ctx, const onnx::NodeProto& node,
       // C spelled as an omitted optional input ("") rather than left off the
       // node entirely -- there is no tensor to give a gradient to.
       grads.push_back(std::nullopt);
+    }
+  }
+  return grads;
+}
+
+// The Conv rule's helpers. graph_grad.py's _prod/_unflatten/_im2col_indices/
+// _col2im_indices, transcribed; the derivation and the reason a convolution's
+// gradient is written as im2col rather than as a ConvTranspose are in
+// _grad_conv's docstring there.
+int64_t Prod(const std::vector<int64_t>& dims) {
+  int64_t total = 1;
+  for (int64_t d : dims) total *= d;
+  return total;
+}
+
+std::vector<int64_t> Unflatten(int64_t index,
+                               const std::vector<int64_t>& dims) {
+  std::vector<int64_t> coords(dims.size(), 0);
+  for (size_t i = dims.size(); i-- > 0;) {
+    coords[i] = index % dims[i];
+    index /= dims[i];
+  }
+  return coords;
+}
+
+// Where each (kernel tap, output position) pair reads its input, and a 0/1
+// mask of the pairs that read real input rather than padding.
+std::pair<std::vector<int64_t>, std::vector<float>> Im2ColIndices(
+    const std::vector<int64_t>& in_dims, const std::vector<int64_t>& out_dims,
+    const std::vector<int64_t>& kernel, const std::vector<int64_t>& strides,
+    const std::vector<int64_t>& dilations,
+    const std::vector<int64_t>& pads_begin) {
+  const size_t spatial = in_dims.size();
+  const int64_t out_count = Prod(out_dims);
+  const int64_t taps = Prod(kernel);
+  std::vector<int64_t> index(static_cast<size_t>(taps * out_count), 0);
+  std::vector<float> mask(index.size(), 0.0f);
+  for (int64_t tap = 0; tap < taps; ++tap) {
+    const std::vector<int64_t> taps_at = Unflatten(tap, kernel);
+    for (int64_t out = 0; out < out_count; ++out) {
+      const std::vector<int64_t> position = Unflatten(out, out_dims);
+      int64_t flat = 0;
+      for (size_t i = 0; i < spatial; ++i) {
+        const int64_t p = position[i] * strides[i] - pads_begin[i] +
+                          taps_at[i] * dilations[i];
+        if (p < 0 || p >= in_dims[i]) {
+          flat = -1;
+          break;
+        }
+        flat = flat * in_dims[i] + p;
+      }
+      if (flat >= 0) {
+        index[static_cast<size_t>(tap * out_count + out)] = flat;
+        mask[static_cast<size_t>(tap * out_count + out)] = 1.0f;
+      }
+    }
+  }
+  return {index, mask};
+}
+
+// The same correspondence read the other way: which output position a given
+// (kernel tap, input position) pair came from -- what turns dX's scatter-add
+// into a gather.
+std::pair<std::vector<int64_t>, std::vector<float>> Col2ImIndices(
+    const std::vector<int64_t>& in_dims, const std::vector<int64_t>& out_dims,
+    const std::vector<int64_t>& kernel, const std::vector<int64_t>& strides,
+    const std::vector<int64_t>& dilations,
+    const std::vector<int64_t>& pads_begin) {
+  const size_t spatial = in_dims.size();
+  const int64_t in_count = Prod(in_dims);
+  const int64_t taps = Prod(kernel);
+  std::vector<int64_t> index(static_cast<size_t>(taps * in_count), 0);
+  std::vector<float> mask(index.size(), 0.0f);
+  for (int64_t tap = 0; tap < taps; ++tap) {
+    const std::vector<int64_t> taps_at = Unflatten(tap, kernel);
+    for (int64_t entry = 0; entry < in_count; ++entry) {
+      const std::vector<int64_t> position = Unflatten(entry, in_dims);
+      int64_t flat = 0;
+      for (size_t i = 0; i < spatial; ++i) {
+        const int64_t shifted =
+            position[i] + pads_begin[i] - taps_at[i] * dilations[i];
+        // Divisibility first: C++ truncates towards zero where Python floors,
+        // so the quotient is only read once it is known to be exact and the
+        // two languages cannot disagree about it.
+        if (shifted % strides[i] != 0) {
+          flat = -1;
+          break;
+        }
+        const int64_t o = shifted / strides[i];
+        if (o < 0 || o >= out_dims[i]) {
+          flat = -1;
+          break;
+        }
+        flat = flat * out_dims[i] + o;
+      }
+      if (flat >= 0) {
+        index[static_cast<size_t>(tap * in_count + entry)] = flat;
+        mask[static_cast<size_t>(tap * in_count + entry)] = 1.0f;
+      }
+    }
+  }
+  return {index, mask};
+}
+
+struct ConvGeometry {
+  int64_t group;
+  std::vector<int64_t> kernel;
+  std::vector<int64_t> strides;
+  std::vector<int64_t> dilations;
+  std::vector<int64_t> pads_begin;
+};
+
+// Conv's attributes resolved against its actual shapes, with auto_pad turned
+// into explicit padding -- _conv_geometry in graph_grad.py, refusal for
+// refusal. The last check is the one that matters: the resolved geometry has
+// to reproduce the node's own output shape, so a misreading of the attributes
+// cannot survive into a wrong gradient.
+ConvGeometry ConvGeometryOf(const onnx::NodeProto& node, const Shape& x_shape,
+                            const Shape& w_shape, const Shape& y_shape) {
+  const std::string name = Quoted(node.output(0));
+  const size_t rank = x_shape.size();
+  if (rank < 3) {
+    throw UnsupportedOpError(
+        "Conv needs at least one spatial dimension, got input shape " +
+        ShapeStr(x_shape) + " (node " + name + ")");
+  }
+  const size_t spatial = rank - 2;
+  if (w_shape.size() != rank || y_shape.size() != rank) {
+    throw UnsupportedOpError("Conv's X, W and Y must have the same rank, got " +
+                             ShapeStr(x_shape) + ", " + ShapeStr(w_shape) +
+                             " and " + ShapeStr(y_shape) + " (node " + name +
+                             ")");
+  }
+  ConvGeometry geo;
+  geo.group = AttrInt(node, "group", 1);
+  const int64_t channels = x_shape[1];
+  const int64_t features = w_shape[0];
+  if (geo.group < 1 || channels % geo.group != 0 || features % geo.group != 0) {
+    throw UnsupportedOpError(
+        "Conv with group=" + std::to_string(geo.group) +
+        " does not divide its " + std::to_string(channels) + " input and " +
+        std::to_string(features) + " output channels (node " + name + ")");
+  }
+  if (w_shape[1] != channels / geo.group) {
+    throw UnsupportedOpError(
+        "Conv's W has " + std::to_string(w_shape[1]) +
+        " channels per group, but group=" + std::to_string(geo.group) +
+        " over " + std::to_string(channels) + " input channels needs " +
+        std::to_string(channels / geo.group) + " (node " + name + ")");
+  }
+
+  geo.kernel.assign(w_shape.begin() + 2, w_shape.end());
+  const onnx::AttributeProto* declared = FindAttr(node, "kernel_shape");
+  if (declared != nullptr) {
+    const std::vector<int64_t> spelled(declared->ints().begin(),
+                                       declared->ints().end());
+    if (spelled != geo.kernel) {
+      throw UnsupportedOpError("Conv's kernel_shape attribute " +
+                               IntsStr(spelled) +
+                               " disagrees with W's own spatial shape " +
+                               IntsStr(geo.kernel) + " (node " + name + ")");
+    }
+  }
+  geo.strides = AttrInts(node, "strides", std::vector<int64_t>(spatial, 1));
+  geo.dilations = AttrInts(node, "dilations", std::vector<int64_t>(spatial, 1));
+  if (geo.strides.size() != spatial || geo.dilations.size() != spatial) {
+    throw UnsupportedOpError("Conv's strides " + IntsStr(geo.strides) +
+                             " and dilations " + IntsStr(geo.dilations) +
+                             " must have one entry per spatial axis (" +
+                             std::to_string(spatial) + ") (node " + name + ")");
+  }
+  for (size_t i = 0; i < spatial; ++i) {
+    if (geo.strides[i] < 1 || geo.dilations[i] < 1) {
+      throw UnsupportedOpError(
+          "Conv with strides " + IntsStr(geo.strides) + " and dilations " +
+          IntsStr(geo.dilations) +
+          " is not a convolution this rule can invert (node " + name + ")");
+    }
+  }
+
+  const onnx::AttributeProto* pad_mode = FindAttr(node, "auto_pad");
+  const std::string auto_pad =
+      pad_mode == nullptr ? std::string("NOTSET") : pad_mode->s();
+  std::vector<int64_t> pads;
+  if (auto_pad == "NOTSET") {
+    pads = AttrInts(node, "pads", std::vector<int64_t>(2 * spatial, 0));
+    if (pads.size() != 2 * spatial) {
+      throw UnsupportedOpError("Conv's pads " + IntsStr(pads) +
+                               " must have two entries per spatial axis (" +
+                               std::to_string(spatial) + ") (node " + name +
+                               ")");
+    }
+  } else if (auto_pad == "VALID") {
+    pads.assign(2 * spatial, 0);
+  } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+    // The spec's own formula, resolved here rather than left to the runtime:
+    // the shapes are static, so "same" is a number at build time.
+    pads.assign(2 * spatial, 0);
+    for (size_t i = 0; i < spatial; ++i) {
+      const int64_t size = x_shape[2 + i];
+      const int64_t out = (size + geo.strides[i] - 1) / geo.strides[i];
+      const int64_t span = (geo.kernel[i] - 1) * geo.dilations[i] + 1;
+      const int64_t needed =
+          std::max<int64_t>(0, (out - 1) * geo.strides[i] + span - size);
+      pads[i] = auto_pad == "SAME_UPPER" ? needed / 2 : needed - needed / 2;
+      pads[spatial + i] = needed - pads[i];
+    }
+  } else {
+    throw UnsupportedOpError("Conv with auto_pad '" + auto_pad +
+                             "' is not differentiated here (node " + name +
+                             ")");
+  }
+
+  if (y_shape[0] != x_shape[0] || y_shape[1] != features) {
+    throw UnsupportedOpError("Conv's output shape " + ShapeStr(y_shape) +
+                             " does not match its input " + ShapeStr(x_shape) +
+                             " and weight " + ShapeStr(w_shape) + " (node " +
+                             name + ")");
+  }
+  for (size_t i = 0; i < spatial; ++i) {
+    const int64_t span = (geo.kernel[i] - 1) * geo.dilations[i] + 1;
+    const int64_t reach = x_shape[2 + i] + pads[i] + pads[spatial + i] - span;
+    // A negative reach is spelled out rather than divided: Python's floor
+    // division and C++'s truncation disagree there, and this refusal is the
+    // one place the two could have produced different numbers.
+    const int64_t expected = reach >= 0 ? reach / geo.strides[i] + 1 : 0;
+    if (expected != y_shape[2 + i]) {
+      throw UnsupportedOpError(
+          "Conv's declared output shape " + ShapeStr(y_shape) +
+          " does not follow from input " + ShapeStr(x_shape) + ", kernel " +
+          IntsStr(geo.kernel) + ", strides " + IntsStr(geo.strides) +
+          ", dilations " + IntsStr(geo.dilations) + " and pads " +
+          IntsStr(pads) + ": axis " + std::to_string(i) + " should be " +
+          std::to_string(expected) + ", not " + std::to_string(y_shape[2 + i]) +
+          " (node " + name + ")");
+    }
+  }
+  geo.pads_begin.assign(pads.begin(), pads.begin() + spatial);
+  return geo;
+}
+
+std::vector<OptStr> GradConv(Backward& ctx, const onnx::NodeProto& node,
+                             const std::string& g) {
+  // Conv's three gradients, written as im2col plus a MatMul so that nothing
+  // outside BackwardOps() is emitted -- neither Conv nor ConvTranspose is in
+  // EpFriendlyOps(), and the note beside that set records why they were left
+  // out rather than added for this rule. _grad_conv in graph_grad.py carries
+  // the derivation; this is a transcription of it, node for node.
+  const std::string& x = node.input(0);
+  const std::string& w = node.input(1);
+  const Shape x_shape = ctx.ShapeOf(x);
+  const Shape w_shape = ctx.ShapeOf(w);
+  const Shape y_shape = ctx.ShapeOf(node.output(0));
+  const ConvGeometry geo = ConvGeometryOf(node, x_shape, w_shape, y_shape);
+  bool has_bias = false;
+  if (node.input_size() > 2 && !node.input(2).empty()) {
+    has_bias = true;
+    const Shape bias_shape = ctx.ShapeOf(node.input(2));
+    if (bias_shape.size() != 1 || bias_shape[0] != w_shape[0]) {
+      throw UnsupportedOpError("Conv's B has shape " + ShapeStr(bias_shape) +
+                               ", not (" + std::to_string(w_shape[0]) +
+                               ",) (node " + Quoted(node.output(0)) + ")");
+    }
+  }
+
+  const int64_t batch = x_shape[0];
+  const int64_t features = w_shape[0] / geo.group;
+  const int64_t channels = x_shape[1] / geo.group;
+  const Shape in_dims(x_shape.begin() + 2, x_shape.end());
+  const Shape out_dims(y_shape.begin() + 2, y_shape.end());
+  const int64_t taps = Prod(geo.kernel);
+  const int64_t in_count = Prod(in_dims);
+  const int64_t out_count = Prod(out_dims);
+
+  // The incoming gradient with the group axis split out, which is the layout
+  // both halves below want: [N, group, M/group, output positions].
+  const std::string g_shape =
+      ctx.b().ConstInt64({batch, geo.group, features, out_count}, "shape");
+  const std::string g4 = ctx.b().Op("Reshape", {g, g_shape}, "reshape");
+
+  // dX = sum over (m, t) of W[m, c, t] * dY[m, position], one gather of dY
+  // per tap.
+  const std::pair<std::vector<int64_t>, std::vector<float>> col2im =
+      Col2ImIndices(in_dims, out_dims, geo.kernel, geo.strides, geo.dilations,
+                    geo.pads_begin);
+  const std::string g_index = ctx.b().ConstInt64(col2im.first, "idx");
+  const std::string gathered_g =
+      ctx.b().Op("Gather", {g4, g_index}, {IntAttr("axis", 3)}, "gather");
+  const std::string g_mask =
+      ctx.b().Const(col2im.second, {1, 1, 1, taps * in_count}, "mask");
+  const std::string masked_g = ctx.b().Mul(gathered_g, g_mask);
+  const std::string dcol_shape = ctx.b().ConstInt64(
+      {batch, geo.group, features * taps, in_count}, "shape");
+  const std::string dcol =
+      ctx.b().Op("Reshape", {masked_g, dcol_shape}, "reshape");
+  const std::string w4_shape =
+      ctx.b().ConstInt64({geo.group, features, channels, taps}, "shape");
+  const std::string w4 = ctx.b().Op("Reshape", {w, w4_shape}, "reshape");
+  const std::string w4t = ctx.b().Transpose(w4, {0, 2, 1, 3});
+  // The leading 1 keeps both MatMul operands rank 4.
+  const std::string wt_shape =
+      ctx.b().ConstInt64({1, geo.group, channels, features * taps}, "shape");
+  const std::string wt = ctx.b().Op("Reshape", {w4t, wt_shape}, "reshape");
+  const std::string dx4 = ctx.b().MatMul(wt, dcol);
+  const std::string dx_shape = ctx.b().ConstInt64(x_shape, "shape");
+  const std::string dx = ctx.b().Op("Reshape", {dx4, dx_shape}, "reshape");
+
+  // dW = sum over (n, o) of dY[n, m, o] * col[n, c, t, o], with col the
+  // forward's own im2col of X.
+  const std::string x4_shape =
+      ctx.b().ConstInt64({batch, geo.group, channels, in_count}, "shape");
+  const std::string x4 = ctx.b().Op("Reshape", {x, x4_shape}, "reshape");
+  const std::pair<std::vector<int64_t>, std::vector<float>> im2col =
+      Im2ColIndices(in_dims, out_dims, geo.kernel, geo.strides, geo.dilations,
+                    geo.pads_begin);
+  const std::string x_index = ctx.b().ConstInt64(im2col.first, "idx");
+  const std::string gathered_x =
+      ctx.b().Op("Gather", {x4, x_index}, {IntAttr("axis", 3)}, "gather");
+  const std::string x_mask =
+      ctx.b().Const(im2col.second, {1, 1, 1, taps * out_count}, "mask");
+  const std::string masked_x = ctx.b().Mul(gathered_x, x_mask);
+  const std::string col_shape = ctx.b().ConstInt64(
+      {batch, geo.group, channels * taps, out_count}, "shape");
+  const std::string col =
+      ctx.b().Op("Reshape", {masked_x, col_shape}, "reshape");
+  const std::string colt = ctx.b().Transpose(col, {0, 1, 3, 2});
+  const std::string dw4 = ctx.b().MatMul(g4, colt);
+  const std::string dw_axes = ctx.b().ConstInt64({0}, "axes");
+  const std::string dw3 = ctx.b().Op("ReduceSum", {dw4, dw_axes},
+                                     {IntAttr("keepdims", 0)}, "reducesum");
+  const std::string dw_shape = ctx.b().ConstInt64(w_shape, "shape");
+  const std::string dw = ctx.b().Op("Reshape", {dw3, dw_shape}, "reshape");
+
+  std::vector<OptStr> grads{dx, dw};
+  if (node.input_size() > 2) {
+    if (!has_bias) {
+      grads.push_back(std::nullopt);
+    } else {
+      const std::string db_axes = ctx.b().ConstInt64({0, 3}, "axes");
+      const std::string db = ctx.b().Op("ReduceSum", {g4, db_axes},
+                                        {IntAttr("keepdims", 0)}, "reducesum");
+      const std::string db_shape = ctx.b().ConstInt64({w_shape[0]}, "shape");
+      grads.push_back(ctx.b().Op("Reshape", {db, db_shape}, "reshape"));
     }
   }
   return grads;
@@ -710,6 +1073,7 @@ const std::map<std::string, Rule>& Rules() {
       new std::map<std::string, Rule>{
           {"Add", &GradAdd},
           {"Clip", &GradClip},
+          {"Conv", &GradConv},
           {"Div", &GradDiv},
           {"Erf", &GradErf},
           {"Exp", &GradExp},
@@ -753,10 +1117,15 @@ const std::set<std::string>& BackwardOps() {
   // needs a mean over the normalized axes and the reciprocal square root of
   // the variance; the Python set says at length why that is not a loosening
   // of the criterion.
+  // Gather was admitted for GradConv, which writes a convolution's gradient
+  // as im2col rather than as the ConvTranspose it naturally is; the Python
+  // set says why that is not a loosening either, and the EP_FRIENDLY_OPS note
+  // in qat_graph.py records what a Conv/ConvTranspose membership would have
+  // cost instead.
   static const std::set<std::string>* ops = new std::set<std::string>{
-      "Add",       "Cast",    "Div",  "Exp", "Greater",
-      "Less",      "MatMul",  "Mul",  "Neg", "ReduceMean",
-      "ReduceSum", "Reshape", "Sqrt", "Sub", "Transpose"};
+      "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
+      "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
+      "Reshape", "Sqrt",   "Sub", "Transpose"};
   return *ops;
 }
 

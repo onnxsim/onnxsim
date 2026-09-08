@@ -274,7 +274,7 @@ void EpFriendlyOpsHasExactlyThePythonSetsMembers() {
   CheckEqual(expected.size(), size_t{21}, "the Python set has 21 members");
   Check(EpFriendlyOps() == expected, "EpFriendlyOps() equals EP_FRIENDLY_OPS");
   Check(EpFriendlyOps().count("Round") == 0,
-        "Round stays out: WebNN has no rounding operator");
+        "Round stays out of EpFriendlyOps");
   Check(EpFriendlyOps().count("Where") == 0, "Where stays out");
 }
 

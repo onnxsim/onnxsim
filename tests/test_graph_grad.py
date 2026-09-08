@@ -511,6 +511,111 @@ _CASES = {
         """,
         None,
     ),
+    # Conv, whose rule is written as im2col rather than as the ConvTranspose
+    # a convolution's gradient naturally is (see _grad_conv for why). Every
+    # attribute below changes the index tables that stand in for the
+    # convolution, and a table that is wrong produces a gradient that is
+    # finite, correctly shaped and quietly wrong -- so each combination is
+    # differenced separately rather than trusted to the plain case.
+    "conv": (
+        """
+        g (float[1,2,4,4] A, float[3,2,3,3] B) => (float[1,3,2,2] Y) {
+          Y = Conv(A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_bias": (
+        """
+        g (float[1,1,4,4] A, float[2,1,3,3] B, float[2] C)
+            => (float[1,2,2,2] Y) {
+          Y = Conv(A, B, C)
+        }
+        """,
+        None,
+    ),
+    "conv_pointwise": (
+        """
+        g (float[1,2,3,3] A, float[3,2,1,1] B) => (float[1,3,3,3] Y) {
+          Y = Conv(A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_strided_padded": (
+        """
+        g (float[1,2,5,5] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+          Y = Conv <strides = [2, 2], pads = [1, 1, 1, 1]> (A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_dilated": (
+        """
+        g (float[1,1,5,5] A, float[1,1,2,2] B) => (float[1,1,3,3] Y) {
+          Y = Conv <dilations = [2, 2]> (A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_grouped": (
+        """
+        g (float[1,4,3,3] A, float[4,2,2,2] B) => (float[1,4,2,2] Y) {
+          Y = Conv <group = 2> (A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_depthwise": (
+        """
+        g (float[1,3,3,3] A, float[3,1,2,2] B, float[3] C)
+            => (float[1,3,2,2] Y) {
+          Y = Conv <group = 3> (A, B, C)
+        }
+        """,
+        None,
+    ),
+    "conv_1d": (
+        """
+        g (float[1,2,7] A, float[2,2,3] B) => (float[1,2,3] Y) {
+          Y = Conv <strides = [2]> (A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_3d": (
+        """
+        g (float[1,1,3,3,3] A, float[2,1,2,2,2] B) => (float[1,2,2,2,2] Y) {
+          Y = Conv(A, B)
+        }
+        """,
+        None,
+    ),
+    # The two ``auto_pad`` spellings whose padding is asymmetric, which is
+    # what makes them worth differencing rather than only checking
+    # structurally: 5 and 6 against a 3-wide kernel at stride 2 need two and
+    # one pad respectively, so SAME_UPPER and SAME_LOWER put them in
+    # different places and a rule that confused the two would still produce
+    # the right *shape*. Both are two-input-channel on purpose -- see
+    # ``test_auto_pad_resolves_to_the_padding_the_spec_asks_for`` for the
+    # reference evaluator bug that makes the single-channel case unusable as
+    # a reference here.
+    "conv_same_upper": (
+        """
+        g (float[1,2,5,6] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+          Y = Conv <strides = [2, 2], auto_pad = "SAME_UPPER"> (A, B)
+        }
+        """,
+        None,
+    ),
+    "conv_same_lower": (
+        """
+        g (float[1,2,5,6] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+          Y = Conv <strides = [2, 2], auto_pad = "SAME_LOWER"> (A, B)
+        }
+        """,
+        None,
+    ),
     "clip": (
         """
         g (float[3,4] A) => (float[3,4] Y)
@@ -877,6 +982,249 @@ def test_a_matmul_with_a_1d_operand_is_refused():
     with pytest.raises(graph_grad.UnsupportedOpError, match="1-D"):
         graph_grad.build_backward(
             b, list(model.graph.node), _static_shapes(model), {"Y": "dY"}, ["A"]
+        )
+
+
+def _emitted(model: onnx.ModelProto):
+    """The backward a model's nodes emit, as comparable plain data.
+
+    Node op types, names and attributes plus every initializer's name, shape
+    and values -- the same things ``onnx/qat_parity_fixtures.txt`` compares,
+    and for the same reason: the builder's counter makes the names, so two
+    emissions with equal names ran the same operations in the same order.
+    """
+    shapes = _static_shapes(model)
+    b = qat_graph.GraphBuilder("bw_")
+    graph_grad.build_backward(
+        b,
+        list(model.graph.node),
+        shapes,
+        {model.graph.output[0].name: "dY"},
+        [value.name for value in model.graph.input],
+    )
+    nodes = [
+        (
+            n.op_type,
+            list(n.input),
+            list(n.output),
+            [onnx.helper.printable_attribute(a) for a in n.attribute],
+        )
+        for n in b.nodes
+    ]
+    initializers = [
+        (t.name, list(t.dims), t.data_type, onnx.numpy_helper.to_array(t).tolist())
+        for t in b.initializer
+    ]
+    return nodes, initializers
+
+
+@pytest.mark.parametrize(
+    "auto_pad,pads,in_shape,out_shape",
+    [
+        ("VALID", "0, 0, 0, 0", "1,2,5,5", "1,2,3,3"),
+        ("SAME_UPPER", "1, 0, 1, 1", "1,2,5,6", "1,2,3,3"),
+        ("SAME_LOWER", "1, 1, 1, 0", "1,2,5,6", "1,2,3,3"),
+        ("SAME_UPPER", "1, 0, 1, 1", "1,1,5,6", "1,2,3,3"),
+    ],
+    ids=["valid", "same_upper", "same_lower", "same_upper_single_channel"],
+)
+def test_auto_pad_resolves_to_the_padding_the_spec_asks_for(
+    auto_pad, pads, in_shape, out_shape
+):
+    """``auto_pad`` is resolved at build time, so the gradient of a
+    ``SAME_UPPER`` convolution must be *the same graph* as the gradient of the
+    explicitly padded one it stands for.
+
+    The expected padding is written out here rather than recomputed: 5 and 6
+    against a 3-wide kernel at stride 2 need 2 and 1 pads, and SAME_UPPER puts
+    the odd one at the end where SAME_LOWER puts it at the beginning. This is
+    the check that a misreading of the spec cannot pass.
+
+    It is also the only check ``VALID`` gets, and the reason is worth
+    recording: onnx's reference evaluator computes ``auto_pad="VALID"`` as if
+    it were ``SAME`` (a 5x5 input through a 3x3 kernel comes back 5x5 rather
+    than 3x3), and it disagrees with onnxruntime on ``SAME_UPPER`` for a
+    single-channel input as well. Both were checked against onnxruntime and
+    against a hand-written convolution when this rule was written; the
+    finite-difference cases above therefore avoid exactly those two shapes,
+    and the equivalence here covers them instead.
+    """
+    strides = "" if auto_pad == "VALID" else "strides = [2, 2], "
+    channels = in_shape.split(",")[1]
+    features = out_shape.split(",")[1]
+    automatic = _model(
+        f"""
+        g (float[{in_shape}] A, float[{features},{channels},3,3] B)
+            => (float[{out_shape}] Y) {{
+          Y = Conv <{strides}auto_pad = "{auto_pad}"> (A, B)
+        }}
+        """
+    )
+    explicit = _model(
+        f"""
+        g (float[{in_shape}] A, float[{features},{channels},3,3] B)
+            => (float[{out_shape}] Y) {{
+          Y = Conv <{strides}pads = [{pads}]> (A, B)
+        }}
+        """
+    )
+    assert _emitted(automatic) == _emitted(explicit)
+
+
+def test_a_convolutions_gradient_contains_no_convolution():
+    """The design claim of :func:`onnxsim.graph_grad._grad_conv`, checked
+    rather than only argued.
+
+    ``dX`` is naturally a ``ConvTranspose`` and ``dW`` a ``Conv``, and neither
+    is in :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` -- the note beside that
+    set records what their coverage on the WebGPU and WebNN backends actually
+    is and why it was not enough. So the rule is written as im2col instead,
+    and what it emits has to stay inside the allowlist like every other rule.
+    """
+    model = _model(_CASES["conv_grouped"][0])
+    b = qat_graph.GraphBuilder()
+    graph_grad.build_backward(
+        b,
+        list(model.graph.node),
+        _static_shapes(model),
+        {"Y": "dY"},
+        ["A", "B"],
+    )
+    emitted = {node.op_type for node in b.nodes}
+    assert not emitted & {"Conv", "ConvTranspose"}
+    assert emitted <= graph_grad.BACKWARD_OPS
+    # And the one operator this rule needed that arithmetic does not give: a
+    # Gather with a constant index, the same shape of thing gather_rows was
+    # admitted to EP_FRIENDLY_OPS for.
+    assert "Gather" in emitted
+
+
+@pytest.mark.parametrize(
+    "body,fragment",
+    [
+        (
+            """
+            g (float[2,3] A, float[3,4] B) => (float[2,4] Y) {
+              Y = Conv(A, B)
+            }
+            """,
+            "spatial dimension",
+        ),
+        (
+            """
+            g (float[1,4,5,5] A, float[4,2,3,3] B) => (float[1,4,3,3] Y) {
+              Y = Conv <group = 3> (A, B)
+            }
+            """,
+            "group=3",
+        ),
+        (
+            """
+            g (float[1,4,5,5] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+              Y = Conv(A, B)
+            }
+            """,
+            "channels per group",
+        ),
+        (
+            """
+            g (float[1,2,5,5] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+              Y = Conv <kernel_shape = [2, 2]> (A, B)
+            }
+            """,
+            "kernel_shape",
+        ),
+        (
+            """
+            g (float[1,2,5,5] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+              Y = Conv <auto_pad = "SAME"> (A, B)
+            }
+            """,
+            "auto_pad",
+        ),
+        (
+            """
+            g (float[1,2,5,5] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+              Y = Conv <strides = [2]> (A, B)
+            }
+            """,
+            "one entry per spatial axis",
+        ),
+        (
+            """
+            g (float[1,2,4,4] A, float[3,2,3,3] B, float[1,3] C)
+                => (float[1,3,2,2] Y) {
+              Y = Conv(A, B, C)
+            }
+            """,
+            "B has shape",
+        ),
+    ],
+    ids=[
+        "no_spatial_axis",
+        "group_does_not_divide",
+        "weight_channel_mismatch",
+        "kernel_shape_disagrees",
+        "unknown_auto_pad",
+        "wrong_strides_length",
+        "bias_not_rank_1",
+    ],
+)
+def test_a_conv_this_rule_cannot_invert_is_refused(body, fragment):
+    """A convolution whose geometry does not add up is refused by name.
+
+    This is the boundary that matters most for this rule, because its whole
+    method is to precompute *where every element came from*: a misread
+    attribute does not produce an error at build time or a wrong shape at run
+    time, it produces index tables that gather the wrong elements, and the
+    gradient that comes out is finite, correctly shaped and wrong. So each
+    disagreement between the attributes, the weight and the declared output
+    is refused rather than resolved in favour of one of them.
+    """
+    model = _model(body)
+    # The parser accepts these; onnx's own shape inference is not asked,
+    # because several of them are exactly the case where it would object
+    # first and the point is what this module does with them.
+    shapes = {
+        value.name: [d.dim_value for d in value.type.tensor_type.shape.dim]
+        for value in list(model.graph.input) + list(model.graph.output)
+    }
+    with pytest.raises(graph_grad.UnsupportedOpError, match=fragment):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            shapes,
+            {"Y": "dY"},
+            ["A"],
+        )
+
+
+def test_a_conv_whose_output_shape_does_not_follow_is_refused():
+    """The catch-all the rest of the refusals lean on: whatever the
+    attributes say, the geometry they resolve to has to reproduce the output
+    shape the node itself declares.
+
+    Written with the shapes passed in by hand rather than inferred, since a
+    model this inconsistent is one onnx's shape inference rejects outright --
+    which is the point: ``build_backward`` is given shapes by its caller, and
+    a caller that got them from somewhere else must not be trusted to have
+    got them right.
+    """
+    model = _model(
+        """
+        g (float[1,2,5,5] A, float[2,2,3,3] B) => (float[1,2,3,3] Y) {
+          Y = Conv(A, B)
+        }
+        """
+    )
+    shapes = {"A": [1, 2, 5, 5], "B": [2, 2, 3, 3], "Y": [1, 2, 4, 4]}
+    with pytest.raises(graph_grad.UnsupportedOpError, match="does not follow from"):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            shapes,
+            {"Y": "dY"},
+            ["A"],
         )
 
 
