@@ -672,6 +672,29 @@ def _blocked_shapes(
     return split, with_one
 
 
+def _blocked_weight_shape(shape: Tuple[int, ...]) -> Tuple[int, int]:
+    """``shape`` as the 2-D grid the fake-quant path reads a weight as.
+
+    Only that path calls this. A weight of any other rank cannot legitimately
+    reach it: both quantized finders are MatMul/Gemm-only, so a Conv's
+    ``[M, C/group, *kernel]`` weight arrives only with ``fake_quant=False``,
+    where none of the blocked-scale code runs.
+
+    That is an invariant rather than a coincidence, so it is checked here
+    instead of asserted in a comment. The failure it prevents is quiet: a
+    rank-4 weight reinterpreted as a 2-D block grid produces a perfectly
+    valid graph that trains the wrong thing.
+    """
+    if len(shape) != 2:
+        raise ValueError(
+            "the fake-quant path reads a weight as a 2-D grid of scale blocks, "
+            f"but this one has shape {list(shape)}. No quantized scheme "
+            "produces a layer of that rank -- both finders are MatMul/Gemm-only "
+            "-- so a layer has been planned for the wrong scheme."
+        )
+    return (shape[0], shape[1])
+
+
 def _broadcast_scale(
     b: qat_graph.GraphBuilder,
     scale: str,
@@ -1222,7 +1245,12 @@ def _build_step_graph(
         else:
             scale = t.scale_input
         scale_full = _broadcast_scale(
-            b, scale, t.w_shape, t.scale_shape, t.scale_axis, block_size
+            b,
+            scale,
+            _blocked_weight_shape(t.w_shape),
+            t.scale_shape,
+            t.scale_axis,
+            block_size,
         )
         weight_name = t.candidate.float_node.input[1]
         code, ratio, active = _emit_fake_quant(
@@ -1332,7 +1360,7 @@ def _build_step_graph(
             g_scale = _sum_over_blocks(
                 b,
                 b.mul(g, dwhat_ds),
-                t.w_shape,
+                _blocked_weight_shape(t.w_shape),
                 t.scale_shape,
                 t.scale_axis,
                 t.candidate.block_size,
