@@ -68,6 +68,19 @@ rm -rf "${SYSROOT}/work/tests"
 cp -r "${REPO_ROOT}/tests" "${SYSROOT}/work/tests"
 cp "${REPO_ROOT}/pyproject.toml" "${SYSROOT}/work/"
 
+# tests/test_qat_parity.py loads scripts/make_qat_parity_fixtures.py by path
+# and reads onnxsim/qat_parity_fixtures.txt, neither of which is under tests/.
+# Both are copied in below because this test belongs on CORE_TESTS: the
+# fixture is generated on a little-endian host, so a big-endian run of this
+# test is what proves the Python step-graph emitter's raw_data handling is
+# byte-order independent. The C++ half (qat_graph_parity_test) already covers
+# the other direction under ctest. The generator imports only json/numpy/onnx
+# plus onnxsim.qat_graph, all of which the chroot already has.
+rm -rf "${SYSROOT}/work/scripts"
+mkdir -p "${SYSROOT}/work/scripts" "${SYSROOT}/work/onnxsim"
+cp "${REPO_ROOT}/scripts/make_qat_parity_fixtures.py" "${SYSROOT}/work/scripts/"
+cp "${REPO_ROOT}/onnxsim/qat_parity_fixtures.txt" "${SYSROOT}/work/onnxsim/"
+
 echo "== environment =="
 chroot "${SYSROOT}" /bin/sh -c 'cd /work && PYTHONPATH=/work/pylibs python3 -c "
 import sys, numpy, onnx, onnxsim
@@ -95,7 +108,9 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # rewrites), shape inference and contrib-op schema registration
 # (moe_contrib_schema), the function/custom rewriter engine, model
 # checking/info/memory-planning/backend dispatch, profiling, and the
-# raw_data-adjacent external-data loading path (test_onnx_safetensors_input.py).
+# raw_data-adjacent external-data loading path (test_onnx_safetensors_input.py),
+# and the QAT step-graph emitter's Python<->fixture raw_data parity check
+# (test_qat_parity.py).
 # A new test file for one of *these* areas belongs in CORE_TESTS below; a new
 # test file for a quantization scheme, pruning algorithm, hardware backend, or
 # model-export/reconstruction feature does not need to be added here at all.
@@ -138,6 +153,7 @@ CORE_TESTS="
   tests/test_profile_plot.py
   tests/test_profiling.py
   tests/test_pruning.py
+  tests/test_qat_parity.py
   tests/test_rewrite_bool_where.py
   tests/test_rich_optional.py
   tests/test_split_large_gather.py

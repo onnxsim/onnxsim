@@ -500,3 +500,222 @@ def test_runner_call_still_returns_an_ordered_dict():
     )
     assert list(out) == [step.state["w"]]
     assert out[step.state["w"]].shape == zeros.shape
+
+
+# --- Minibatching (``Gather`` + a per-step row index) -------------------------
+#
+# A step graph's shapes are static, so a batch that changes per step has to
+# come from somewhere that is not a re-shaped input. ``run_step_graph``'s
+# answer: the whole set stays a constant (uploaded once, device-resident,
+# exactly as before), a rank-1 int64 per-step input names this step's rows,
+# and a ``Gather`` inside the graph selects them. The tests below cover the
+# two halves of that -- the index schedule ``minibatch_indices`` produces, and
+# the fact that gathering changes nothing about the arithmetic.
+
+
+def _gathered_linear_fit_step_graph(rows, batch, k, n):
+    """``_linear_fit_step_graph``, minibatched: the same fit, but ``x`` and
+    ``y`` are ``batch`` rows gathered out of resident ``[rows, ...]`` tables.
+
+    Deliberately identical to that builder in every other respect, so a
+    difference in the numbers can only come from the gather.
+    """
+    b = qat_graph.GraphBuilder()
+    x = b.gather_rows("xs", "idx")
+    y = b.gather_rows("ys", "idx")
+    y_hat = b.matmul(x, b.transpose("w"))
+    diff = b.sub(y_hat, y)
+    grad = b.mul(b.matmul(b.transpose(diff), x), b.const(2.0 / (batch * n)))
+    w_next, m_next, v_next = qat_graph.adam_update(
+        b, "w", grad, "m", "vv", "lr", "m_correction", "v_correction"
+    )
+    return qat_graph.make_step_graph(
+        b,
+        constants={"xs": [rows, k], "ys": [rows, n]},
+        state={
+            "w": ([n, k], w_next),
+            "m": ([n, k], m_next),
+            "vv": ([n, k], v_next),
+        },
+        scalars=["lr", "m_correction", "v_correction"],
+        per_step={"idx": ([batch], onnx.TensorProto.INT64)},
+        loss=b.mean_square(diff),
+    )
+
+
+def test_gathering_every_row_is_the_full_batch_loop_exactly():
+    """The transparency claim minibatching rests on: a ``Gather`` of *all* the
+    rows, in order, is the ungathered graph.
+
+    Exact equality, not a tolerance. The gathered graph does the same
+    arithmetic on a copy of the same bytes, so anything less than bit-for-bit
+    agreement would mean the batch machinery is perturbing the optimization
+    rather than only choosing which rows it sees -- and that is precisely what
+    the full-batch default in ``onnxsim.apply_qat`` must not do.
+    """
+    x, y, zeros = _linear_fit_case(30)
+    rows = x.shape[0]
+    plain = _linear_fit_step_graph(rows, x.shape[1], y.shape[1])
+    gathered = _gathered_linear_fit_step_graph(rows, rows, x.shape[1], y.shape[1])
+
+    plain_losses: list = []
+    gathered_losses: list = []
+    reference = _run_linear_fit(plain, x, y, num_steps=100, losses=plain_losses)
+    everything = np.arange(rows, dtype=np.int64)
+    final = qat_graph.run_step_graph(
+        gathered,
+        constants={"xs": x, "ys": y},
+        state={"w": zeros, "m": zeros, "vv": zeros},
+        num_steps=100,
+        scalars=lambda t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+        feeds=lambda t: {"idx": everything},
+        losses=gathered_losses,
+    )
+
+    for name in ("w", "m", "vv"):
+        np.testing.assert_array_equal(final[name], reference[name])
+    assert gathered_losses == plain_losses
+
+
+def test_a_minibatched_step_graph_optimizes_and_stays_in_the_allowlist():
+    """The loop actually runs minibatched -- through the bound, device-resident
+    path, with only the index going up per step -- and the operator it needed
+    to do so is one the accelerator backends implement (``Gather``; see
+    ``qat_graph.EP_FRIENDLY_OPS`` for why it clears that bar)."""
+    x, y, zeros = _linear_fit_case(31, rows=60, k=5, n=4)
+    batch = 12
+    step = _gathered_linear_fit_step_graph(60, batch, 5, 4)
+    onnx.checker.check_model(step.model)
+
+    used = {node.op_type for node in step.model.graph.node}
+    assert "Gather" in used
+    assert used <= _ALLOWED_OPS, f"unsupported ops in step graph: {used - _ALLOWED_OPS}"
+
+    rows = qat_graph.minibatch_indices(60, batch, seed=0)
+    losses: list = []
+    qat_graph.run_step_graph(
+        step,
+        constants={"xs": x, "ys": y},
+        state={"w": zeros, "m": zeros, "vv": zeros},
+        num_steps=300,
+        scalars=lambda t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+        feeds=lambda t: {"idx": rows(t)},
+        losses=losses,
+    )
+    # A batch loss is noisy by construction, so the comparison is head against
+    # tail rather than first against last.
+    assert np.mean(losses[-20:]) < 1e-3 * np.mean(losses[:20])
+
+
+def test_minibatch_indices_visit_every_row_once_per_epoch():
+    """The schedule is an endless concatenation of permutations chopped into
+    fixed-size chunks, so ``N / B`` consecutive steps cover the set exactly
+    once -- no row favoured, none starved."""
+    rows = qat_graph.minibatch_indices(24, 6, seed=1)
+    for epoch in range(3):
+        visited = np.concatenate([rows(epoch * 4 + i) for i in range(4)])
+        assert sorted(visited.tolist()) == list(range(24))
+        assert visited.dtype == np.int64
+
+
+def test_a_batch_size_that_does_not_divide_the_row_count_wraps():
+    """The documented answer to the ragged tail: every batch is exactly
+    ``batch_size`` rows, and the one that would run off the end of an epoch is
+    completed from the front of the next permutation instead of being short.
+    A short batch is not an option -- the graph's shapes are static -- and the
+    alternatives (drop the tail, pad by repetition) each change which rows the
+    optimization actually sees.
+
+    With 10 rows and a batch of 4, five steps consume 20 positions -- two whole
+    epochs -- and the epoch boundary falls in the *middle* of step 2's batch,
+    which is the case there is no way to express with a short batch.
+    """
+    rows = qat_graph.minibatch_indices(10, 4, seed=2)
+    batches = [rows(t) for t in range(5)]
+    assert all(len(batch) == 4 for batch in batches)
+
+    stream = np.concatenate(batches).tolist()
+    # Both epochs are complete permutations even though neither aligns with a
+    # batch boundary: nothing is dropped at the seam and nothing is repeated
+    # to pad it.
+    assert sorted(stream[:10]) == list(range(10))
+    assert sorted(stream[10:20]) == list(range(10))
+    # The batch straddling the seam is made of the tail of one epoch and the
+    # head of the next, which is what "wrap" means here.
+    assert batches[2].tolist() == stream[8:12]
+
+
+def test_a_fixed_seed_reproduces_the_batches_and_shuffling_changes_them():
+    """Determinism and shuffling are both load-bearing, and they pull in
+    opposite directions: a run has to be reproducible, and consecutive epochs
+    have to see different batch *compositions* rather than the same fixed
+    partition of the rows over and over."""
+    first = qat_graph.minibatch_indices(20, 5, seed=7)
+    same = qat_graph.minibatch_indices(20, 5, seed=7)
+    other = qat_graph.minibatch_indices(20, 5, seed=8)
+    ordered = qat_graph.minibatch_indices(20, 5, seed=7, shuffle=False)
+
+    for t in range(8):
+        np.testing.assert_array_equal(first(t), same(t))
+    assert any(not np.array_equal(first(t), other(t)) for t in range(8))
+
+    # Shuffling changes the composition, not merely the order within a batch:
+    # step 0's *set* of rows differs from the unshuffled first five.
+    np.testing.assert_array_equal(ordered(0), np.arange(5))
+    assert set(first(0).tolist()) != set(ordered(0).tolist())
+    # ...and it is re-drawn per epoch, so epoch 1's first batch is not epoch
+    # 0's (which is exactly what an unshuffled schedule would give).
+    assert set(first(0).tolist()) != set(first(4).tolist())
+    np.testing.assert_array_equal(ordered(0), ordered(4))
+
+
+def test_minibatch_indices_are_a_pure_function_of_the_step():
+    """Asked out of order, or twice, the schedule answers the same -- which is
+    what lets a loop be stopped and resumed without the batch order shifting,
+    the same property ``run_step_graph`` already has for the state."""
+    rows = qat_graph.minibatch_indices(14, 5, seed=3)
+    forwards = [rows(t) for t in range(6)]
+    backwards = [rows(t) for t in reversed(range(6))]
+    for expected, actual in zip(forwards, reversed(backwards)):
+        np.testing.assert_array_equal(expected, actual)
+
+
+def test_minibatch_indices_reject_a_nonsense_batch_size():
+    with pytest.raises(ValueError, match="batch_size"):
+        qat_graph.minibatch_indices(10, 0)
+    with pytest.raises(ValueError, match="num_rows"):
+        qat_graph.minibatch_indices(0, 4)
+
+
+def test_a_minibatched_loop_still_runs_through_the_binding(monkeypatch):
+    """The point of selecting rows *inside* the graph rather than feeding them:
+    the loop stays on the device-resident path.
+
+    Worth its own test because the fallback in ``run_step_graph`` is silent by
+    design -- anything that stops the binding from working lands the caller on
+    the feed-per-step path with the same numbers -- so a per-step int64 input
+    that onnxruntime refused to bind would cost the whole residency argument
+    and change nothing a numerical test can see. Counting the
+    ``run_with_iobinding`` calls is the only way to know.
+    """
+    x, y, zeros = _linear_fit_case(32, rows=40, k=4, n=3)
+    step = _gathered_linear_fit_step_graph(40, 10, 4, 3)
+    rows = qat_graph.minibatch_indices(40, 10, seed=0)
+
+    bound_runs = []
+    real = ort.InferenceSession.run_with_iobinding
+
+    def counted(self, iobinding, run_options=None):
+        bound_runs.append(iobinding)
+        return real(self, iobinding, run_options)
+
+    monkeypatch.setattr(ort.InferenceSession, "run_with_iobinding", counted)
+    qat_graph.run_step_graph(
+        step,
+        constants={"xs": x, "ys": y},
+        state={"w": zeros, "m": zeros, "vv": zeros},
+        num_steps=20,
+        scalars=lambda t: dict(lr=0.1, **qat_graph.adam_bias_corrections(t)),
+        feeds=lambda t: {"idx": rows(t)},
+    )
+    assert len(bound_runs) == 20

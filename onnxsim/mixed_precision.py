@@ -212,9 +212,7 @@ def apply_mixed_precision_quantization(
         for name in probe_names:
             x = np.asarray(result[name], dtype=np.float64)
             for x_rows in _activation_rows([x]):
-                diag_h_sum[name] = diag_h_sum.get(name, 0.0) + np.sum(
-                    x_rows**2, axis=0
-                )
+                diag_h_sum[name] = diag_h_sum.get(name, 0.0) + np.sum(x_rows**2, axis=0)
                 diag_h_rows[name] = diag_h_rows.get(name, 0) + x_rows.shape[0]
 
     diag_h: Dict[str, np.ndarray] = {

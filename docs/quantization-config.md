@@ -57,6 +57,40 @@ An unknown `scheme`, a `dtype` not valid for that `scheme`, or an invalid
 naming the valid options — `quantize` never silently guesses at a
 misconfigured request.
 
+## Chained passes (`awq`, `gptq`, `gptaq`, `qat`, `double_quant`)
+
+For `scheme="weight_only", dtype="int4"`, five flags chain onnxsim's
+correction passes onto `quantize_weight_only_int4`'s plain round-to-nearest
+output, in one fixed order: `awq` → `gptq` → `gptaq` → `qat` → `double_quant`.
+The last two positions are forced rather than preferred. QAT warm-starts from
+whatever codes the model already carries, so it wants the corrected model as
+its starting point; and `apply_double_quantization` moves each scale out of an
+initializer and into a nested `DequantizeLinear`, which is exactly the shape
+QAT's layer finder needs to recognize a quantized layer — run the other way
+round, `discover_qat_blocks` returns nothing and QAT is a silent no-op.
+
+`qat` is the one of the five that is not int4-only: with `scheme="static"` it
+chains `apply_qat_all_blocks` onto `quantize_static`'s output instead, training
+that scheme's activation quantizers alongside its INT8 weights. Which of
+`apply_qat`'s two modes runs is decided by the scheme rather than by a separate
+field — `learn_activation_scales` is `True` for `static` and `False` for
+`int4`, the only settings `apply_qat` accepts for those models — so this API
+cannot express the pairing it refuses.
+
+`qat_num_iterations` (optimizer steps *per block*) and `qat_learning_rate` are
+the only two knobs exposed; everything else about the walk is
+`apply_qat_all_blocks`' own defaults, and [qat.md](qat.md) covers what it is
+worth and where it loses. It is by far the most expensive flag here, and it is
+not a uniform win: it loses to AdaRound on a single layer with full-rank
+calibration activations, and the activation training `scheme="static"` implies
+is a small regression on a model whose ranges were calibrated on representative
+data — it fixes a clip range that is wrong rather than improving one that is
+right.
+
+If `qat` trains no block — none discovered, or all skipped — `quantize` warns
+and returns the untuned quantized model rather than raising, matching
+`apply_qat_all_blocks`' own per-block leniency.
+
 ## Other `QuantizationConfig` fields
 
 - `calibration_data`, `num_calibration_samples`, `seed`, `providers`,

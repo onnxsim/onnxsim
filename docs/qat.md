@@ -76,7 +76,9 @@ objective `brecq.py` already optimizes, extended along axes 1, 2 and 4:
   forward with an STE), not only their rounding bit;
 - learnable step size for weights *and* activations (LSQ / LSQ+ / PACT) —
   `adaquant.py` already does this for activation scale/zero-point, so the
-  gradients exist in-tree;
+  gradients exist in-tree, and `apply_qat` now reuses them directly rather
+  than re-deriving them (`learn_scales` for weights,
+  `learn_activation_scales` for activations);
 - block discovery that walks through normalization/activation nodes instead
   of `brecq.py`'s strict linear-chain restriction, then a sliding window over
   blocks, ending with an optional end-to-end pass on the whole graph;
@@ -201,7 +203,8 @@ Each stage is independently shippable and independently useful.
    zero-point), so the step graph carries nine state tensors and three
    `adam_update` calls. It tracks its numpy loop tighter than adaround's port
    does: identical weight codes on five of six seeds, identical integer
-   zero-point on all six. And the state now stays on the device between
+   zero-point on all six. `autoround` followed, so all three rounding passes
+   now take `step_providers=`. And the state now stays on the device between
    steps (`backend.Runner.bind_loop`), which is what makes the accelerator
    path worth taking rather than merely possible.
 2. **`qat.py` / `apply_qat()` -- done**, and it needed one thing this note
@@ -249,12 +252,81 @@ Each stage is independently shippable and independently useful.
    losses read higher, because a dirtier input is a harder reconstruction
    problem -- the block-local loss is not the quantity that matters.
 
-   Still open from this stage's original description: real data via
-   `load_huggingface_calibration_data`, a `QuantizationConfig` flag, an
-   end-to-end pass against the model's own output (a block is always the
-   unit of optimization), minibatching, and activation quantization
-   (adaquant has the learnable activation scale, it is simply not wired in
-   here).
+   Minibatching landed since (`batch_size=`), and the design question it
+   forced is worth recording: `Runner.bind_loop` uploads constants once
+   precisely to avoid per-step transfers, which is exactly what a batch that
+   changes every step breaks. The resolution keeps the whole calibration set
+   resident and feeds a per-step int64 index that a `Gather` turns into that
+   step's rows, so per-step traffic stays at a few scalars -- at the cost of
+   `Gather` in `EP_FRIENDLY_OPS` (justified there: WebNN specifies it, unlike
+   `Round`) and of the set still having to fit in one static tensor. So it
+   buys convergence rate and stochastic-gradient behaviour, not a
+   larger-than-memory dataset: at equal epochs it roughly halves the error at
+   a tight budget (11.41 -> 6.33) and washes out once full batch has
+   converged.
+
+   Activation quantization landed too, as `learn_activation_scales=True`.
+   It could not be a feature added on top of the weight-only scheme, because
+   a `quantize_weight_only_int4` model has no activation quantizer anywhere
+   to train -- so the flag *selects* `quantize_static`'s QDQ scheme (uint8
+   asymmetric activations, per-channel INT8 weights) and trains its
+   quantizers jointly with its weights, refusing the wrong pairing loudly in
+   both directions. The gradients are adaquant's, reused rather than
+   re-derived: the quantize-dequantize chain is emitted stage by stage and
+   handed to `graph_grad`, with the straight-through estimator made
+   *structural* -- `round(r)` written as `r + (round(r) - r)`, the residual's
+   nodes left out of the differentiated list -- so the ordinary rules
+   reproduce adaquant's closed form, which a test checks against numpy. No
+   `EP_FRIENDLY_OPS` addition was needed; the chain is `Exp`/`Div`/`Add`/
+   `Sub`/`Mul` plus the existing clip and round helpers.
+
+   Measured the same way as everything else here, and it lands the same
+   shape: on a block whose range was calibrated from one outlier (~30x too
+   wide) it takes the whole-model error from 4.08 (weights alone) to 2.54,
+   38% better; on the same block calibrated on representative data it is a
+   small regression at every learning rate tried. It fixes a quantizer whose
+   range is wrong rather than improving one that is right.
+
+   The `QuantizationConfig` flag landed as well: `quantize(config)` chains
+   `apply_qat_all_blocks` the way it already chained AWQ/GPTQ/GPTAQ, for
+   both schemes. Its position in that pipeline is forced at both ends rather
+   than chosen -- after the correction passes, because QAT warm-starts from
+   whatever codes the model carries; before `double_quant`, because that
+   pass moves each scale out of an initializer and into a nested
+   `DequantizeLinear`, which is the shape the layer finder requires, so the
+   other order makes QAT a silent no-op. `learn_activation_scales` is
+   derived from the scheme rather than exposed, so the API cannot express
+   the pairing `apply_qat` refuses.
+
+   The end-to-end pass is closed, and it needed no code: **the whole graph is
+   already a legal block.** Naming the graph's own input and output builds one
+   step graph over every node and takes the loss against the float model's
+   final output -- the end-to-end objective exactly, and the only slice with
+   no teacher-forcing approximation left, since its externals are the graph's
+   own inputs. The premise of the original item, that a block is necessarily
+   smaller than the model, was simply wrong.
+
+   So the question was only whether to recommend it, and the measurements say
+   no. At an equal step budget on an eight-stage stack it fits the calibration
+   set 12-26% better -- it must, that being the quantity it minimizes where
+   the walk only approximates it -- and generalizes 1-12% *worse* to held-out
+   rows, on all eight seeds. That is BRECQ's own argument for the block being
+   the right unit. It also costs ~6x the wall clock and 3.4x the peak RSS
+   (105 MB against 31 MB on a one-million-parameter stack), linear in depth
+   where the walk is flat, and it is all-or-nothing on operator coverage: one
+   node without a gradient rule refuses the whole model where the walk makes
+   it a gap. A depth sweep puts the crossover around four stages; 64x the data
+   narrows the held-out gap without closing it.
+
+   Real data via `load_huggingface_calibration_data` needed no code either:
+   the loader returns `List[Dict[str, ndarray]]`, which is exactly the
+   `Sequence[Tensors]` `apply_qat` already takes, and `_capture` concatenates
+   across batches along axis 0 rather than using only the first. The thing
+   worth pinning was that *many* batches are genuinely used -- a pass that
+   quietly trained on `calibration_data[0]` would look identical from the
+   outside, training and improving the model while silently using a fraction
+   of the data the caller paid to download -- so a test asserts the step
+   graph's teacher constant carries every row. That closes this stage.
 3. **Browser QAT panel.** A "fine-tune" panel in the converter page: data
    from `hf_datasets.mjs`, execution from `ort_executor.mjs` on WebGPU, a
    loss curve, and `quantize_metrics.mjs` for the before/after. Client-side
@@ -297,7 +369,7 @@ tuned = onnxsim.apply_adaround(
 
 Omitting `step_providers` keeps the existing float64 numpy loop, which is what
 CI runs: it is exact and reproducible, and a non-CPU provider is neither.
-`apply_adaquant` takes the same argument. In the browser, the Quantize
+`apply_adaquant` and `apply_autoround` take the same argument. In the browser, the Quantize
 panel's **calibration execution provider** picker does the equivalent for
 calibration's own forward passes (WebGPU, or WebNN's GPU/NPU device types).
 
@@ -316,6 +388,22 @@ tuned = onnxsim.apply_qat(
 )
 ```
 
+To train the activation quantizers as well, pass a `quantize_static` model
+instead -- the flag selects that scheme, it does not add to the weight-only
+one:
+
+```python
+tuned = onnxsim.apply_qat(
+    float_model,
+    quantized_model,           # quantize_static's output, not int4's
+    block_input_name="hidden",
+    block_output_name="block_out",
+    calibration_data=batches,
+    learn_activation_scales=True,
+    activation_learning_rate=1e-2,
+)
+```
+
 There is no numpy alternative there -- the step graph *is* the
 implementation -- so `step_providers=None` simply means CPU. Anything between
 the two named tensors that `graph_grad` can differentiate is fair game; an op
@@ -330,10 +418,22 @@ arithmetic.
 
 ## Costs and risks
 
-- **Op coverage.** The backward graph's ops must all be implemented by the
-  target EP. On WebGPU that is very likely; on WebNN/NPU it is exactly why
-  the forward/backward split above exists. Needs measuring per EP before any
-  claim is made in the README.
+- **Op coverage -- now measurable, and measured on one backend.**
+  `scripts/convertmodel/test/step_graph_ep.test.mjs` runs real step graphs
+  (committed fixtures emitted by the actual builders, and a generator that
+  refuses to run unless their union is exactly `EP_FRIENDLY_OPS`) under one
+  execution provider at a time, with no fallback in the provider list so a
+  fallback cannot be mistaken for support. All 21 members verified on
+  `wasm`. WebGPU and the WebNN device types are *not* verified: ORT-web
+  refuses them in headless Node, so the test skips them loudly and says so,
+  and `ORT_REQUIRE` turns that skip into a hard failure on a host that has
+  them. The highest-risk unverified item is the minibatch index, the one
+  non-float step-graph input -- WebNN is on record rejecting int64.
+
+  Note also what the allowlist does *not* cover: `apply_qat` copies the
+  block's own forward nodes into the step graph verbatim, so a block
+  containing a `Relu` or a `Softmax` puts those in the graph too. The set
+  constrains what onnxsim emits, not what the block contains.
 - **A second code path.** This is the objection `nncf-comparison-future-work.md`
   raises, and it is real — mitigated by the fact that stage 1's step-graph
   builder *replaces* numpy inner loops in existing passes rather than sitting

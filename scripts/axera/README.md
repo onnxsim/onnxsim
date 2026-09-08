@@ -3685,35 +3685,151 @@ which is exact for every measured channel -- `o = 8` lands at 72, `o = 16` at
 plane pairs also separate by `+288` rather than staying 36 apart, and that
 placement rule is not yet pinned down.
 
-**Where that leaves resnet18d.** Its 22 convolutions are 2-D with 3 to 512
-channels, so every one of them sits past the shapes confirmed above. A search
-over plausible strides for its *first* convolution reaches only 0.43
-correlation, so we cannot currently locate, read or generate resnet18d's
-weights. The block-size arithmetic does line up -- summing the predicted
-per-layer blocks gives 11,208,960 bytes against an actual `npu_params` of
-11,855,108, within 5.8% -- which says the tiling family is right and the
-addressing constants for large channel counts are what is missing.
+**This has since been carried through to resnet18d** -- see the next section.
+The addressing constants for large channel counts turned out to be two
+things: a shape-scaled unit and a cap.
 
 The honest budget for resnet18d today:
 
 | part | size | status |
 | --- | --- | --- |
-| weight table | 11,855,108 B (242x the mcode) | layout not yet decoded at these shapes |
+| weight table | 11,855,108 B (242x the mcode) | 100% of conv weights addressable |
 | mcode stream | 48,320 B | 98.92% explained, round-trips byte-exactly |
 | framing bytes | 28,552 B (59.1% of stream) | emitted from the grammar |
 | value bytes | 19,235 B (39.8%) | 3.81% have a confirmed meaning |
 | header + tail | 760 B | rules known |
 
 So on resnet18d specifically: we can decode and reproduce its instruction
-stream exactly, we understand under 4% of its operand values, and its weight
-table -- 242 times the size of everything else -- is not yet addressable. The
-method that cracked the smaller shapes is unchanged and keeps working; what
-it needs is the same single-weight sweep run at 64, 128, 256 and 512
-channels.
+stream exactly, we can locate and read *all* of its convolution weights, and
+we understand under 4% of its operand values.
 
 Tests: `test_conv2d_weights_are_int8_split_across_four_bit_planes` (Docker)
 and `test_conv2d_weights_can_be_rewritten_without_pulsar2` (Docker and
 device).
+
+### Reading a real network's weights: all of resnet18d
+
+The sweep that finishes this is cheaper than it looks, because **the address
+is linear in the bits of the channel indices**. For the 32-channel case
+`base(1) + base(2) + base(4) + base(8) + base(16)` sums exactly to
+`base(31)`, so one build per *bit* suffices where one per channel would be
+hopeless. Fifteen builds characterise a shape.
+
+**Two constants, both shape-dependent.** Probing 8, 32 and 64 channels gives
+the same table twice over:
+
+    A = 18 * min(Cin, 128)      output-channel unit
+    P =  9 * min(Cin, 128)      separation between the two plane pairs
+
+and the full 2-D address is
+
+    addr(o,i,kh,kw) = A*(o%8) + 72*((o>>3)&1) + 8*A*(o>>4)
+                    + 4*(K - 1 - (K_w*kh + kw))
+                    + (i%16)//4 + 144*(i>>4)
+    planes at 0, 36, P, P+36;  bits 2*(i%4), planes 3,2,1,0 most significant first
+
+Output-channel bit 3 always costs 72 bytes while bits 0-2 cost `A` and bits 4
+and up cost `8A`: an interleave, not a stride. With no fitting at all this
+reconstructs a compiled 64x64x3x3 table at 0.99997.
+
+**The cap is the part that unlocks a real network.** `min(Cin, 128)` says a
+convolution wider than 128 input channels is *split into slices*. Until that
+was applied, resnet18d's 256- and 512-channel layers read as noise (0.36);
+with it, `(256,256,3,3)` and `(512,256,3,3)` both locate at 0.9999.
+
+**And one measurement trap worth recording.** Scoring a match by pooling
+output channels reads about 0.9 even when the addressing is perfectly right,
+because every output channel carries its own quantisation scale. Scored *per
+channel* the same layers read 0.9999. A 0.9 that should be 0.9999 looks like
+a nearly-correct layout and invites fiddling with the formula; it was
+actually a wrong metric.
+
+**The result on resnet18d:** 18 of 22 convolutions located and read from an
+11.9 MB table with nothing but each layer's shape and a search for its base
+offset -- **98.5% of its convolution weights**. The blocks are contiguous and
+in graph order, with regular deltas (37,376 bytes between 64-channel layers,
+148,480 between 128-channel ones).
+
+**The last four needed two more packings, and they are not variations -- they
+are different formats.** Neither the 1x1 convolutions nor the 3-channel stem
+bit-slices at all; both store plain INT8 bytes.
+
+A **1x1 convolution** stores one byte per weight, chunking the input channels
+36 at a time with the next chunk 144 bytes on:
+
+    addr(o,i) = U*((o>>1)&15) + 144*(i//36) + 36*(o&1) + 72*((o>>5)&1) + (i%36)
+    U = 144 * ceil(Cin/36)
+
+A **narrow input** -- the 3-channel stem -- also stores plain bytes, with the
+kernel *row* fastest and the output channel on a flat 36-byte stride:
+
+    addr(o,i,kh,kw) = 36*o + 12*kw + 3*i + kh
+
+Both were found the same way, but with *dense* probe models: a nearly-empty
+weight tensor gets compressed, so flipping one weight's sign inside an
+otherwise dense tensor is what keeps the diff to a single byte. That is worth
+remembering -- an earlier 256-channel probe produced a 37 KB table where the
+weights alone should have taken 590 KB, and the sparsity was the reason.
+
+**resnet18d is now fully covered: 22 of 22 convolutions, 100% of its
+convolution weights.** The stem sits at base 0 and reads at correlation
+1.0000; the three 1x1 layers read at 1.0000; the eighteen bit-sliced layers at
+0.9998 or better.
+
+So the weight table does not have *a* layout. It has at least three, and the
+convolution's shape picks one -- narrow input, 1x1 kernel, or anything wider.
+A generator has to dispatch on shape, which is exactly what
+`_conv_channel0_addresses()` does.
+
+Test: `test_resnet18d_conv_weights_are_addressable` (Docker, no device),
+which locates every one of the 22 layers.
+
+### A second operand, and a method that rejects its own guesses
+
+With the weight table readable, the remaining unknown is operand meaning:
+156 register addresses across the models measured so far, of which `40.02`
+was the only one understood. This is a systematic attempt at the rest, and
+its most useful output is the shape of the method.
+
+**Sweep one parameter at a time, align, then split into bitfields.** Twenty-one
+single-convolution builds vary `Cin`, `Cout`, length, kernel and dilation
+independently. Aligning their records by *structural signature* (not
+position, which shifts) leaves 209 slots present in every build, of which 25
+carry an operand that moves at all. Fitting whole operands mostly fails,
+because a 32-bit operand is several packed fields; splitting each into the
+bits that actually move and fitting those separately produces five candidate
+`(register, bitfield)` semantics.
+
+**Then hold out configurations and see which candidates survive. Two of three
+did not.** A candidate `(k-1)/2` kernel field fit the sweep exactly and then
+read 2 where it should have read 3 at `k = 7`; a candidate `Cin/4 - 1` field
+fit and then read 0 on every held-out build. Both were artefacts of fitting
+four points with two degrees of freedom. Reporting them would have been easy
+and wrong -- the held-out builds are what made the difference.
+
+**What survives is a spatial extent.** Bits 4 to 6 of the first `a1 b0.03`
+operand are
+
+    length / 16 - 1
+
+the input's spatial size in 16-element tiles, inclusive -- the same
+convention `40.02` uses for channels. It is correct in **all 27**
+configurations measured, six of them held out from the fit, and the negatives
+are what make it a *spatial* field specifically: changing `Cin`, `Cout`, the
+kernel size or the dilation leaves it untouched, while several other operands
+that also move with the length fail one or more of those tests.
+
+A near-miss worth recording: bits 20 to 22 of `81.34` carry the same value in
+21 of 27 configurations and disagree in the other 6, all of which changed
+`Cin`. So it is not a spatial field; it is something that usually coincides
+with one. That is exactly the shape of error the held-out set is there to
+catch.
+
+So the operand budget moves from one confirmed field to two, and there is now
+a repeatable procedure for the rest: sweep, align by signature, split into
+moving bitfields, fit, and discard whatever a held-out configuration refutes.
+
+Test: `test_spatial_extent_lives_in_three_bits_of_b0_03` (Docker, no device).
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 

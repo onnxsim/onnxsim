@@ -4038,13 +4038,181 @@ _WBT2D_PLANE = 36
 _WBT2D_PLANES = (3, 2, 1, 0)  # most significant first
 
 
-def _weight2d_offset(o, i, kh, kw, kernel):
-    """`(byte offset of plane 0, bit shift)` for a 2-D weight."""
+# The shape-parameterised form, recovered by probing one build per index bit
+# (the address is *linear* in the bits of the channel indices, so a bit costs
+# one build rather than a channel costing one). Both units scale with the
+# input channel count and cap at 128: a wider convolution is split into
+# 128-channel slices. See the README's "Reading a real network's weights".
+_WBT2D_UNIT_CAP = 128
+
+
+def _wbt2d_unit(cin):
+    return min(cin, _WBT2D_UNIT_CAP)
+
+
+def _wbt2d_planes(cin):
+    """Byte offsets of the four 2-bit planes, relative to plane 0."""
+    pair = 9 * _wbt2d_unit(cin)
+    return (0, _WBT2D_PLANE, pair, pair + _WBT2D_PLANE)
+
+
+def _weight2d_offset(o, i, kh, kw, kernel, cin=None):
+    """`(byte offset of plane 0, bit shift)` for a 2-D weight.
+
+    `cin` selects the shape-dependent output unit `A = 18 * min(cin, 128)`;
+    omitting it keeps the 8-channel constant the first experiments used.
+    Output-channel bit 3 always costs 72 bytes, bits 0-2 cost `A` each and
+    bits 4 and up cost `8A` -- a bit-interleave, not a stride.
+    """
     flat = kernel * kh + kw
+    kernel_part = 4 * (kernel * kernel - 1 - flat)
+    if cin is None:
+        return _WBT2D_O_STRIDE * o + kernel_part + i // 4, 2 * (i % 4)
+    a = 18 * _wbt2d_unit(cin)
     return (
-        _WBT2D_O_STRIDE * o + 4 * (kernel * kernel - 1 - flat) + i // 4,
-        2 * (i % 4),
-    )
+        a * (o % 8)
+        + 72 * ((o >> 3) & 1)
+        + 8 * a * (o >> 4)
+        + kernel_part
+        + (i % 16) // 4
+        + 144 * (i >> 4)
+    ), 2 * (i % 4)
+
+
+def _read_weight2d_code_at(wbt, base, o, i, kh, kw, kernel, cin):
+    """One INT8 code from a real network's weight block at `base`."""
+    off, shift = _weight2d_offset(o, i, kh, kw, kernel, cin)
+    value = 0
+    for plane in _WBT2D_PLANES:
+        value = (value << 2) | (
+            (wbt[base + off + _wbt2d_planes(cin)[plane]] >> shift) & 0x3
+        )
+    return value
+
+
+def _conv_channel0_addresses(shape):
+    """Where output channel 0's weights live, relative to a layer's base, as
+    `(offsets, shifts or None, plane offsets)`.
+
+    Three packings, chosen by shape -- this is the whole point: the format
+    does not have *a* weight layout, the convolution's shape picks one.
+
+    * a narrow input (under four channels) stores plain INT8 bytes with the
+      kernel row fastest: `3*i + kh + 12*kw`;
+    * a 1x1 convolution stores plain INT8 bytes too, but chunks the input
+      channels 36 at a time with the next chunk 144 bytes on;
+    * anything wider bit-slices into four 2-bit planes (`_weight2d_offset`).
+    """
+    cin, kernel = shape[1], shape[2]
+    if cin < 4:
+        offsets, picks = [], []
+        for i in range(cin):
+            for kh in range(kernel):
+                for kw in range(kernel):
+                    offsets.append(3 * i + kh + 12 * kw)
+                    picks.append((i, kh, kw))
+        return np.array(offsets), None, (0,), picks
+    if kernel == 1:
+        offsets = [144 * (i // 36) + (i % 36) for i in range(cin)]
+        return np.array(offsets), None, (0,), [(i, 0, 0) for i in range(cin)]
+    slice_in = min(cin, _WBT2D_UNIT_CAP)
+    offsets, shifts, picks = [], [], []
+    for i in range(slice_in):
+        for kh in range(kernel):
+            for kw in range(kernel):
+                off, shift = _weight2d_offset(0, i, kh, kw, kernel, cin)
+                offsets.append(off)
+                shifts.append(shift)
+                picks.append((i, kh, kw))
+    return np.array(offsets), np.array(shifts), _wbt2d_planes(cin), picks
+
+
+def _locate_conv_weights_any(wbt, weights, step=4, samples=120):
+    """Locate any convolution's weight block, dispatching on its shape.
+    Scored on a single output channel, since each carries its own scale.
+
+    Every block observed so far starts on a 4-byte boundary, which is what
+    makes a whole-table scan affordable: at `step=1` this search over
+    resnet18d's 22 layers does not finish in a useful time.
+    """
+    offsets, shifts, planes, picks = _conv_channel0_addresses(weights.shape)
+    if len(picks) > samples:
+        keep = np.random.RandomState(1).choice(len(picks), samples, replace=False)
+        offsets = offsets[keep]
+        picks = [picks[k] for k in keep]
+        if shifts is not None:
+            shifts = shifts[keep]
+    target = np.array([weights[0, i, kh, kw] for (i, kh, kw) in picks], dtype=float)
+    centred = target - target.mean()
+    limit = len(wbt) - int(offsets.max()) - max(planes) - 4
+    best = (-2.0, None)
+    for start in range(0, max(limit, 1), 4096 * 32):
+        bases = np.arange(start, min(start + 4096 * 32, limit), step)
+        if not len(bases):
+            break
+        index = bases[:, None] + offsets[None, :]
+        if shifts is None:
+            codes = wbt[index].astype(float) - 128
+        else:
+            value = np.zeros(index.shape, np.int32)
+            for plane in _WBT2D_PLANES:
+                value = (value << 2) | ((wbt[index + planes[plane]] >> shifts) & 0x3)
+            codes = value.astype(float) - 128
+        codes = codes - codes.mean(1, keepdims=True)
+        denom = np.sqrt((codes**2).sum(1) * (centred**2).sum())
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.abs((codes * centred).sum(1) / denom)
+        pick = int(np.nanargmax(corr))
+        if corr[pick] > best[0]:
+            best = (float(corr[pick]), int(bases[pick]))
+    return best
+
+
+def _locate_conv_weights(wbt, weights, step=8, samples=200):
+    """Find a convolution's weight block in a whole network's table, by
+    correlating a *single* output channel -- each channel carries its own
+    quantisation scale, so pooling channels hides the match behind those
+    scales (it reads about 0.9 instead of 0.9999).
+
+    Returns `(best correlation, base offset)`.
+    """
+    cin, kernel = weights.shape[1], weights.shape[2]
+    slice_in = min(cin, _WBT2D_UNIT_CAP)
+    rng = np.random.RandomState(1)
+    count = min(samples, slice_in * kernel * kernel)
+    picks = [
+        (int(rng.randint(slice_in)), int(rng.randint(kernel)), int(rng.randint(kernel)))
+        for _ in range(count)
+    ]
+    target = np.array([weights[0, i, kh, kw] for (i, kh, kw) in picks], dtype=float)
+    rel, shifts = [], []
+    for i, kh, kw in picks:
+        off, shift = _weight2d_offset(0, i, kh, kw, kernel, cin)
+        rel.append(off)
+        shifts.append(shift)
+    rel = np.array(rel)
+    shifts = np.array(shifts)
+    planes = _wbt2d_planes(cin)
+    limit = len(wbt) - int(rel.max()) - max(planes) - 4
+    best = (-2.0, None)
+    centred = target - target.mean()
+    for start in range(0, max(limit, 1), 4096 * 16):
+        bases = np.arange(start, min(start + 4096 * 16, limit), step)
+        if not len(bases):
+            break
+        index = bases[:, None] + rel[None, :]
+        value = np.zeros(index.shape, np.int32)
+        for plane in _WBT2D_PLANES:
+            value = (value << 2) | ((wbt[index + planes[plane]] >> shifts) & 0x3)
+        codes = value.astype(float) - 128
+        codes -= codes.mean(1, keepdims=True)
+        denom = np.sqrt((codes**2).sum(1) * (centred**2).sum())
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.abs((codes * centred).sum(1) / denom)
+        pick = int(np.nanargmax(corr))
+        if corr[pick] > best[0]:
+            best = (float(corr[pick]), int(bases[pick]))
+    return best
 
 
 def _read_weight2d_code(wbt, o, i, kh, kw, kernel):
@@ -4061,6 +4229,74 @@ def _write_weight2d_code(wbt, o, i, kh, kw, kernel, code):
         bits = (code >> (2 * (len(_WBT2D_PLANES) - 1 - n))) & 0x3
         at = off + _WBT2D_PLANE * plane
         wbt[at] = (wbt[at] & ~(0x3 << shift) & 0xFF) | (bits << shift)
+
+
+def test_resnet18d_conv_weights_are_addressable(tmp_path):
+    """Confirmed real (see the README's "Reading a real network's weights"
+    section): the shape-parameterised 2-D layout locates and reads the
+    convolution weights of a *real* network -- resnet18d, 22 convolutions
+    from 3 to 512 channels in an 11.9 MB weight table -- with nothing but the
+    layer's shape and a search for its base offset.
+
+    The two things that made this work are worth keeping. The output unit
+    `A = 18 * min(cin, 128)` caps: a convolution wider than 128 input
+    channels is split into slices, which is why 256- and 512-channel layers
+    read as noise until the cap is applied. And the match must be scored
+    *per output channel*, because each channel carries its own quantisation
+    scale -- pooling channels reads about 0.9 where the true figure is
+    0.9999. Needs Docker, no device.
+    """
+    # `_build_real_resnet18d` imports convert_onnxmodelzoo, which is what puts
+    # model_zoo on sys.path -- so the build has to come first.
+    path, _, _ = _build_real_resnet18d(str(tmp_path))
+    import model_zoo
+
+    compiled = onnx.load(path)
+    wbt = np.frombuffer(
+        next(i for i in compiled.graph.initializer if i.name == "npu_params").raw_data,
+        dtype=np.uint8,
+    )
+    source = onnx.load(model_zoo.fetch_model("resnet18d_Opset18"))
+    inits = {i.name: i for i in source.graph.initializer}
+
+    # Every convolution in the network, all three packings.
+    convs = [
+        n.input[1]
+        for n in source.graph.node
+        if n.op_type == "Conv" and len(n.input) > 1 and n.input[1] in inits
+    ]
+    assert len(convs) == 22, len(convs)
+    located = 0
+    for name in convs:
+        weights = numpy_helper.to_array(inits[name]).astype(float)
+        correlation, base = _locate_conv_weights_any(wbt, weights)
+        assert correlation > 0.99, (name, weights.shape, correlation)
+        located += 1
+    assert located == 22, located
+
+    for name in ("onnx::Conv_217", "onnx::Conv_223", "onnx::Conv_253"):
+        weights = numpy_helper.to_array(inits[name]).astype(float)
+        correlation, base = _locate_conv_weights(wbt, weights)
+        assert correlation > 0.99, (name, weights.shape, correlation)
+
+        # Read the located block back and check a whole output channel.
+        cin, kernel = weights.shape[1], weights.shape[2]
+        codes = np.array(
+            [
+                [
+                    [
+                        _read_weight2d_code_at(wbt, base, 0, i, kh, kw, kernel, cin)
+                        for kw in range(kernel)
+                    ]
+                    for kh in range(kernel)
+                ]
+                for i in range(min(cin, _WBT2D_UNIT_CAP))
+            ],
+            dtype=float,
+        )
+        truth = weights[0, : min(cin, _WBT2D_UNIT_CAP)]
+        channel = abs(np.corrcoef(truth.ravel(), (codes - 128).ravel())[0, 1])
+        assert channel > 0.999, (name, channel)
 
 
 def test_conv2d_weights_are_int8_split_across_four_bit_planes(tmp_path):
@@ -4323,6 +4559,55 @@ def _check_weight_retargeting(tmp_path, ort, channels):
     # ... and the cross-controls say the function really moved.
     assert corr(npu_new, ref_old) < 0.9, corr(npu_new, ref_old)
     assert corr(npu_old, ref_new) < 0.9, corr(npu_old, ref_new)
+
+
+def _operand_field(mcode, verb, field, bank, lo, hi, ordinal=0):
+    """One bitfield of the `ordinal`-th write to a register, or None."""
+    values = _operands(mcode, verb, field, bank)
+    if len(values) <= ordinal:
+        return None
+    mask = (1 << (hi - lo + 1)) - 1
+    return (values[ordinal] >> lo) & mask
+
+
+def test_spatial_extent_lives_in_three_bits_of_b0_03(tmp_path):
+    """Confirmed real (see the README's "A second operand" section): bits 4
+    to 6 of the first `a1 b0.03` operand are the input's spatial extent in
+    16-element tiles, minus one -- the same inclusive convention `40.02` uses
+    for channels.
+
+    The invariance is the evidence, not the fit. The field tracks the length
+    and *only* the length: changing the input channels, the output channels,
+    the kernel size or the dilation leaves it alone, which is what separates
+    a spatial field from the several other operands that also happen to move
+    with the length. Needs Docker, no device.
+    """
+    base = dict(cin=32, cout=32, length=64, kernel=3, dilation=1)
+
+    def field_for(**overrides):
+        cfg = dict(base, **overrides)
+        work = tmp_path / "_".join(
+            f"{k}{v}" for k, v in sorted(overrides.items()) or [("base", 0)]
+        )
+        work.mkdir()
+        model = _one_conv_model(
+            cfg["cin"],
+            cfg["cout"],
+            cfg["length"],
+            cfg["kernel"],
+            cfg["dilation"],
+        )
+        mcode = _build_single_op(str(work), "m", model)
+        return _operand_field(mcode, 0xA1, 0xB0, 0x03, 4, 6)
+
+    # It follows the length, in 16-element tiles, inclusive.
+    for length in (32, 64, 96):
+        assert field_for(length=length) == length // 16 - 1, length
+
+    # ... and nothing else moves it.
+    reference = 64 // 16 - 1
+    for overrides in ({"cin": 16}, {"cout": 64}, {"kernel": 7}, {"dilation": 4}):
+        assert field_for(**overrides) == reference, overrides
 
 
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):
