@@ -1299,7 +1299,8 @@ void ABlockExternalGatherIndexIsCapturedAndDeclaredAtItsRealDtype() {
   const QatStepPlan plan =
       BuildQatStepGraph(GatherFloatModel(), GatherInt4QuantizedModel(), "X",
                         "Y", kRows, QatOptions());
-  CheckModel(plan.step_graph, "the step graph with a block-external Gather index");
+  CheckModel(plan.step_graph,
+             "the step graph with a block-external Gather index");
   Check(OpTypes(plan.step_graph).count("Gather") != 0,
         "the block's own Gather node is carried into the step graph verbatim");
 
