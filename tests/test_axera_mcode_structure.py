@@ -11,9 +11,11 @@ Needs a loaded `pulsar2:*` Docker image -- skip-guarded like
 tests/test_pulsar2_hf_to_axmodel.py.
 """
 
+import glob
 import json
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -4759,6 +4761,45 @@ def test_int8_throughput_reaches_a_useful_fraction_of_the_rating(tmp_path):
     assert not stats.get("error"), stats.get("error")
     tops = 2 * macs / (stats["min_ms"] * 1e-3) / 1e12
     assert tops > 5.0, (tops, stats)
+
+
+def test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks(tmp_path):
+    """Confirmed real (see the README's "Where the INT4 path actually is"
+    section): `pulsar2 llm_build` accepts `-w s4`, and the resulting model is
+    substantially smaller than the `s8` build of the same checkpoint.
+
+    This is the only 4-bit route in the toolchain. `pulsar2 build` -- the CNN
+    path everything else here uses -- has no 4-bit option at all: its
+    `weight_data_type` for convolution accepts only `S8` and `FP32`, and
+    there is no command-line flag either. Needs Docker, no device.
+    """
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+
+    sizes = {}
+    for weight_type in ("s8", "s4"):
+        result = pulsar2_docker.llm_build(
+            str(work),
+            "SmolLM2-135M",
+            f"out_{weight_type}",
+            weight_type=weight_type,
+            prefill_len=512,
+            kv_cache_len=1023,
+            parallel=8,
+        )
+        assert result.success, (weight_type, getattr(result, "error", None))
+        files = sorted(glob.glob(str(work / f"out_{weight_type}" / "*.axmodel")))
+        assert files, weight_type
+        sizes[weight_type] = sum(os.path.getsize(f) for f in files)
+
+    # 4-bit weights are the bulk of the saving, but a layer file also carries
+    # non-weight structure, so the ratio lands well short of 2x.
+    ratio = sizes["s8"] / sizes["s4"]
+    assert 1.3 < ratio < 2.0, (ratio, sizes)
 
 
 def test_single_conv_program_encodes_its_output_channel_count(tmp_path):

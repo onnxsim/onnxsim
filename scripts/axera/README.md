@@ -3966,15 +3966,62 @@ The 8x8 collapse is the sharpest result: the same arithmetic runs 3.1x slower
 purely because the spatial dimension no longer covers the tiles the engine
 works in -- which is the same 32-wide tiling the `b0.03` operand counts.
 
-**The 43.2 TOPS INT4 figure is not reachable through this compiler.** The
+**The 43.2 TOPS INT4 figure is not reachable through *this* path.** The
 build config's `weight_data_type` for convolution accepts only `S8` or
-`FP32`; there is no 4-bit weight option in this Pulsar2 version, whatever the
-silicon can do.
+`FP32`, and `pulsar2 build --help` offers no 4-bit flag either. There is a
+4-bit path, but it is in the other pipeline -- see the next section.
 
 Test: `test_int8_throughput_reaches_a_useful_fraction_of_the_rating` (Docker
 and device). Its floor of 5 TOPS sits between a healthy NPU3 run and the
 ~3 TOPS a single-core or fallback build produces, so it doubles as a health
 check for a card that has quietly dropped to one core.
+
+### Where the INT4 path actually is
+
+Searching for 4-bit support the way the LLM pipeline does it finds it
+immediately, and in only one of the two pipelines:
+
+| pipeline | weight types offered |
+| --- | --- |
+| `pulsar2 build` (CNNs, everything above) | `S8`, `FP32` |
+| `pulsar2 llm_build` (transformers) | `fp16`, `bf16`, `fp32`, `s8`, **`s4`**, `fp8_e5m2`, `fp8_e4m3` |
+
+So the toolchain does have INT4 weights -- and FP8 in two flavours -- but only
+for the LLM path. `pulsar2 build` has no 4-bit option at all, neither in its
+config schema nor on its command line.
+
+**It builds, and it is much smaller.** SmolLM2-135M compiled three ways, same
+prefill length and KV cache, measured on the AX650N:
+
+| weights | total | per layer | decode/layer | tokens/s |
+| --- | --- | --- | --- | --- |
+| `s4` | 98.2 MB | 2.30 MB | 0.441 ms | 75.6 |
+| `s8` | 152.7 MB | 4.12 MB | 0.485 ms | 68.7 |
+| `fp16` | 253.4 MB | 7.47 MB | 0.639 ms | 52.2 |
+
+**But at this size the win is memory, not speed.** Going from `s8` to `s4`
+cuts the model 1.56x and buys only 1.10x on decode. The reason is visible in
+the three points: fitting `time = overhead + bytes / bandwidth` gives a fixed
+**per-layer overhead of about 0.40 ms** against roughly 0.09 ms of weight
+streaming at `s8`. Overhead dominates by four to one, so halving the weights
+barely moves the total. The same fit predicts the `fp16` measurement to
+within 10%, which is about as much as a two-parameter model of this deserves.
+
+That also sets a ceiling worth knowing: 0.40 ms x 30 layers is 12 ms per
+token of pure overhead, so this model cannot exceed roughly 80 tokens/s on
+this card no matter how the weights are quantised. INT4 pays off on a model
+whose per-layer weights are large enough for streaming to dominate that fixed
+cost -- which a 135M model's 3.5 MB per layer is not.
+
+**And the 43.2 TOPS INT4 rating stays unverified.** It is a compute-throughput
+claim, and the decode path cannot demonstrate it: a decode step is about
+4.5 MMAC per layer, some 0.02 TOPS, so it is latency-bound by three orders of
+magnitude. Showing it would need the prefill subgraph in isolation, and
+`axcl_run_model` will not select it -- its `--group` flag indexes shape
+groups, of which these layer files have none.
+
+Test: `test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks`
+(Docker, no device).
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
