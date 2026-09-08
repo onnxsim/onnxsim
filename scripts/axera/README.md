@@ -3829,7 +3829,41 @@ So the operand budget moves from one confirmed field to two, and there is now
 a repeatable procedure for the rest: sweep, align by signature, split into
 moving bitfields, fit, and discard whatever a held-out configuration refutes.
 
-Test: `test_spatial_extent_lives_in_three_bits_of_b0_03` (Docker, no device).
+**Scaling the procedure up says the remaining operands are mostly not shape
+functions at all.** A larger sweep -- 28 training builds varying `Cin`,
+`Cout`, length, kernel, dilation *and* stride, against six held-out
+combinations -- finds 28 operand slots that move. Fitting each moving
+bitfield against nineteen derived quantities a convolution engine plausibly
+holds (raw parameters, padding, dilated kernel extent, output length, and
+each of those in 4- or 16-element tiles, plus `Cin*k`, `Cin*L`, `Cout*Lout`),
+allowing any one- or two-term exact affine combination, yields exactly **one**
+field that also survives the held-out set: the same `length/16 - 1`.
+
+That is a strong negative, and it points somewhere specific. Of the 28 moving
+slots, **25 carry values above 4096** and only 3 are small enough to be
+counts. Large, shape-sensitive, not affine in any shape quantity -- that is
+what an *allocator output* looks like. The compiler is choosing buffer
+addresses, and an address depends on the order and size of every prior
+allocation, not on the current layer's shape alone.
+
+One more measurement supports the reading: **no slot moves with dilation
+unless it also moves with a size parameter.** Dilation changes no tensor
+size, so a register that tracked dilation alone would have to be a genuine
+configuration field; there is not one. Every dilation-sensitive operand is
+sensitive to sizes too, consistent with dilation changing what gets buffered
+rather than being programmed directly.
+
+For a generator this reframes the remaining work. It is not "decode 154 more
+constants". Most of those operands cannot be computed from a layer's shape at
+all -- they require reproducing the compiler's allocator, which is a
+different and much larger problem than the weight table turned out to be.
+
+Test: `test_spatial_extent_lives_in_three_bits_of_b0_03` (Docker, no device)
+covers the confirmed field and its four invariances. The wider
+characterisation above -- the 28 moving slots, the 25 address-like values, the
+absence of a dilation-only register -- comes from the 34-build sweep in this
+session's notes rather than from a regression test; it is a measurement of
+this toolchain version, not an invariant worth 34 Docker builds per CI run.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
