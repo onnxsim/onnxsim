@@ -3966,15 +3966,216 @@ The 8x8 collapse is the sharpest result: the same arithmetic runs 3.1x slower
 purely because the spatial dimension no longer covers the tiles the engine
 works in -- which is the same 32-wide tiling the `b0.03` operand counts.
 
-**The 43.2 TOPS INT4 figure is not reachable through this compiler.** The
+**The 43.2 TOPS INT4 figure is not reachable through *this* path.** The
 build config's `weight_data_type` for convolution accepts only `S8` or
-`FP32`; there is no 4-bit weight option in this Pulsar2 version, whatever the
-silicon can do.
+`FP32`, and `pulsar2 build --help` offers no 4-bit flag either. There is a
+4-bit path, but it is in the other pipeline -- see the next section.
+
+**Against the compiler's own cycle model.** Building with `profile=True`
+gives a modelled critical path, and a per-op profile in which convolutions
+are **98.9%** of the modelled cycles -- so the benchmark really is measuring
+arithmetic and not plumbing. Dividing that cycle count by the measured time
+gives an implied clock:
+
+| graph | max_cycle | min ms | implied MHz | MAC/cycle |
+| --- | --- | --- | --- | --- |
+| 1024ch 16x16 | 3,905,355 | 4.12 | 949 | 4,949 |
+| 512ch 32x32 | 3,704,778 | 4.30 | 862 | 5,217 |
+| 256ch 64x64 | 3,831,460 | 4.49 | 854 | 5,044 |
+
+**MAC-per-cycle is stable at about 5,000** across the three cores (roughly
+1,650 each), which is the more meaningful figure -- it is a property of the
+engine, not of the graph. The implied clock is *not* stable: 854 to 949 MHz.
+Since the clock cannot actually vary by 11% between two runs a minute apart,
+what that spread measures is the cycle model being optimistic by up to ~10%
+on some shapes -- stalls it does not account for. The best-matching graph is
+also the fastest one, which is consistent with that reading rather than with
+a variable clock.
+
+So the honest summary is: the engine sustains ~5,000 MAC/cycle at somewhere
+around 0.95 GHz, 9-10 TOPS is what that product comes to, and the compiler's
+cycle estimate is a good predictor to within about 10%.
 
 Test: `test_int8_throughput_reaches_a_useful_fraction_of_the_rating` (Docker
 and device). Its floor of 5 TOPS sits between a healthy NPU3 run and the
 ~3 TOPS a single-core or fallback build produces, so it doubles as a health
 check for a card that has quietly dropped to one core.
+
+### Where the INT4 path actually is
+
+Searching for 4-bit support the way the LLM pipeline does it finds it
+immediately, and in only one of the two pipelines:
+
+| pipeline | weight types offered |
+| --- | --- |
+| `pulsar2 build` (CNNs, everything above) | `S8`, `FP32` |
+| `pulsar2 llm_build` (transformers) | `fp16`, `bf16`, `fp32`, `s8`, **`s4`**, `fp8_e5m2`, `fp8_e4m3` |
+
+So the toolchain does have INT4 weights -- and FP8 in two flavours -- but only
+for the LLM path. `pulsar2 build` has no 4-bit option at all, neither in its
+config schema nor on its command line.
+
+**It builds, and it is much smaller.** SmolLM2-135M compiled three ways, same
+prefill length and KV cache, measured on the AX650N:
+
+| weights | total | per layer | decode/layer | tokens/s |
+| --- | --- | --- | --- | --- |
+| `s4` | 98.2 MB | 2.30 MB | 0.441 ms | 75.6 |
+| `s8` | 152.7 MB | 4.12 MB | 0.485 ms | 68.7 |
+| `fp16` | 253.4 MB | 7.47 MB | 0.639 ms | 52.2 |
+
+**But at this size the win is memory, not speed.** Going from `s8` to `s4`
+cuts the model 1.56x and buys only 1.10x on decode. The reason is visible in
+the three points: fitting `time = overhead + bytes / bandwidth` gives a fixed
+**per-layer overhead of about 0.40 ms** against roughly 0.09 ms of weight
+streaming at `s8`. Overhead dominates by four to one, so halving the weights
+barely moves the total. The same fit predicts the `fp16` measurement to
+within 10%, which is about as much as a two-parameter model of this deserves.
+
+That also sets a ceiling worth knowing: 0.40 ms x 30 layers is 12 ms per
+token of pure overhead, so this model cannot exceed roughly 80 tokens/s on
+this card no matter how the weights are quantised. INT4 pays off on a model
+whose per-layer weights are large enough for streaming to dominate that fixed
+cost -- which a 135M model's 3.5 MB per layer is not.
+
+**So the next test is a model built to make it pay.** A synthetic
+Llama-shaped checkpoint at 4096 hidden and 11008 intermediate -- **177 M
+parameters per layer**, fifty times SmolLM2's -- puts weight streaming firmly
+in charge:
+
+| weights | per layer | decode/layer | implied GB/s |
+| --- | --- | --- | --- |
+| `s4` | 100.5 MB | 5.91 ms | 17.0 |
+| `s8` | 195.6 MB | 9.20 ms | 21.3 |
+
+**INT4 now buys 1.56x**, against 1.10x on the small model, and the weight
+saving reaches 1.95x once layers are large enough that non-weight structure
+stops diluting it. The benefit scales with per-layer weight size exactly as
+the overhead argument predicts, and 1.56x of a theoretical 2x says roughly a
+third of a decode step is still something other than streaming weights.
+
+Effective weight-streaming bandwidth lands around **21 GB/s** at `s8`.
+
+**One caveat on the earlier model, stated plainly:** fitting
+`time = overhead + bytes / bandwidth` to the large model gives a fixed
+overhead of 2.6 ms per layer, not the 0.40 ms the small model gave. A
+genuinely fixed cost cannot do that, so that two-parameter fit describes each
+model at its own scale and should not be extrapolated between them. What does
+survive across both is the direction and its size: halving the weights buys
+almost nothing when layers are small and about 1.56x when they are large.
+
+For deployment arithmetic: at 9.20 ms per layer, a 32-layer model of this
+width would take 294 ms per token at `s8` and 189 ms at `s4` -- roughly 3.4
+against 5.3 tokens/s.
+
+**And the 43.2 TOPS INT4 rating stays unverified.** It is a compute-throughput
+claim, and the decode path cannot demonstrate it: a decode step is about
+4.5 MMAC per layer, some 0.02 TOPS, so it is latency-bound by three orders of
+magnitude. Showing it would need the prefill subgraph in isolation, and
+`axcl_run_model` will not select it -- its `--group` flag indexes shape
+groups, of which these layer files have none.
+
+Test: `test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks`
+(Docker, no device).
+
+### Prefill, timed at last -- and INT4 does nothing for it
+
+The section below records four routes that all closed. The fifth works: go
+under `axcl_run_model` to the engine API it is built on.
+
+**The CLI was wrong about the shape groups.** `axcl_run_model -g 1` reports
+"Selected shape group index {1 vs. 0} is out of range", which reads as "this
+model has no groups". Asking the engine directly --
+`axclrtEngineGetShapeGroupsCount()` -- says an `llm_build` layer has **two**,
+and their sizes say exactly what they are:
+
+| | group 0 | group 1 |
+| --- | --- | --- |
+| `input` | 8,192 B (1 x 4096 x bf16) | 1,048,576 B (128 x 4096 x bf16) |
+| `mask` | 512 B | 32,768 B |
+
+Group 0 is decode, group 1 is prefill. `axclrtEngineExecute()` takes the
+group index, so a twenty-line C program can run either. `scripts/axera/tools/`
+carries it. Its group-0 timing reproduces `axcl_run_model`'s to within a few
+percent (9.117 ms against 9.14 ms), which is the check that the buffers and
+the timing loop are honest.
+
+**The result, on both models:**
+
+| model | group | `s8` | `s4` | INT4 gain |
+| --- | --- | --- | --- | --- |
+| 4096-hidden | decode | 9.117 ms | 5.751 ms | **1.59x** |
+| 4096-hidden | prefill, S=128 | 23.493 ms | 22.359 ms | **1.05x** |
+| SmolLM2-135M | decode | 0.476 ms | 0.447 ms | 1.06x |
+| SmolLM2-135M | prefill, S=512 | 19.952 ms | 19.553 ms | 1.02x |
+
+**INT4 buys 1.59x on decode and essentially nothing on prefill.** That is the
+whole answer to the 43.2 TOPS question. Four-bit weights cut weight *traffic*,
+which is what decode is made of; they do not make the arithmetic faster, which
+is what prefill is made of.
+
+**And prefill's arithmetic is slow in absolute terms.** The 4096-hidden layer
+is 22.8 GMAC of prefill, so 23.5 ms is **1.94 TOPS** -- against 5.7-7.5 for an
+INT8 matmul stack and 10.13 for convolution. The reason is in the build
+options: `llm_build --hidden_state_type` offers `fp16`, `bf16` and `fp32`, and
+nothing narrower. **The LLM pipeline is weight-only quantised**: `s4`/`s8`
+weights against 16-bit activations. Its arithmetic therefore never touches the
+INT8 or INT4 datapath the TOPS ratings describe, whatever the weights are
+stored as.
+
+So the 43.2 TOPS INT4 rating is not reachable through either pipeline, and now
+for a measured reason rather than a missing measurement: `pulsar2 build` has no
+4-bit weights at all, and `llm_build` has 4-bit weights but 16-bit activations.
+
+### Why the earlier routes closed (recorded so nobody repeats them)
+
+Decode measures memory. Prefill is the compute-bound half of an LLM, and it
+is what a 43.2 TOPS INT4 rating would have to be claiming. It cannot be timed
+on this stack, and the reasons are worth recording so nobody repeats the
+attempt.
+
+**The two halves are both in the file.** An `llm_build` layer `.axmodel`
+holds *two independent* `neu mode` nodes: `subgraph_npu_0` takes
+`K_cache, V_cache, indices, input, mask` (decode) and `subgraph_npu_1` takes
+the same names suffixed `_1` (prefill). Neither consumes the other's output.
+
+**`axcl_run_model` always runs the first one.** Its `--group` flag indexes
+*shape* groups, of which these files have none -- asking for group 0 or 1
+both return "Selected shape group index {n vs. 0} is out of range". Feeding
+only the `_1` inputs fails; feeding all ten runs decode and reports decode's
+latency. There is no other runner: `/usr/bin/axcl/` ships `axcl_run_model`,
+`axcl_demo` and hardware samples, nothing LLM-specific.
+
+**Editing the wrapper does not redirect it.** Deleting the decode node makes
+the model fail to load, while an unmodified load-and-re-save runs fine
+(9.268 ms against 9.182 ms), so the surgery is the cause, not the round trip.
+Renaming so prefill becomes `subgraph_npu_0` gets past loading and then fails
+at "Feed stimulus failed" -- the runtime takes its input specification from
+the compiled blob, not from the ONNX names, so the wrapper cannot choose
+which subgraph runs.
+
+**And a prefill-only build is not on offer.** `llm_build --kv_cache_len 0`
+fails in the frontend with degenerate RoPE parameters (`shape (0, 64)`).
+
+**What stands in for it: the arithmetic prefill is made of.** A prefill step
+is dominated by large matrix multiplications, and those compile through the
+ordinary path:
+
+| matmul stack | GMAC | min ms | TOPS |
+| --- | --- | --- | --- |
+| S=128, 4096x11008, 4 layers | 46.2 | 16.21 | 5.70 |
+| S=512, 2048x5632, 6 layers | 70.9 | 19.01 | 7.46 |
+
+So transformer-shaped INT8 arithmetic sustains **5.7 to 7.5 TOPS**, against
+10.13 for convolution. Longer sequences do better, which is the same tiling
+story as the CNN measurements: 128 rows do not fill the engine as well as 512.
+
+That puts a bound on the INT4 claim rather than testing it. Prefill
+arithmetic on this card runs at roughly 6-7 TOPS in INT8; for INT4 to reach
+43.2 it would have to be six times faster than INT8 matmul measured here,
+where the decode measurements show INT4 buying 1.56x. The rating is not
+verifiable on this toolchain, and nothing measured here suggests it is
+reachable.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
