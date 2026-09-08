@@ -4903,6 +4903,62 @@ def _quantize_conv_weights(weights):
     return np.clip(np.round(w / shaped) + 128, 0, 255).astype(int)
 
 
+def _weight1d_offset_wide(o, i, k, cin, cout, kernel, top):
+    """1-D weight address at 64 and 128 channels.
+
+    `A = 144 * ceil((Cin/2)*kernel / 36)` is the one constant that unifies 32,
+    64 and 128 channels (288, 432, 864). `m = min(Cout//4, 16)` members share
+    it, bit `log2(m)` of the output channel always costs 72, and whole
+    super-blocks cost `top` -- which is `m*A` at 64 channels and `m*A + 256` at
+    128, an extra region this has not explained.
+    """
+    a = 144 * -(-((cin // 2) * kernel) // 36)
+    m = min(max(cout // 4, 1), 16)
+    slot = (cin // 2) * k + i // 2
+    return (
+        a * (o % m)
+        + 72 * ((o // m) & 1)
+        + top * (o // (2 * m))
+        + 144 * (slot // 36)
+        + (slot % 36)
+    ), (4 if i % 2 else 0)
+
+
+def test_1d_weight_layout_holds_at_64_and_128_channels(tmp_path):
+    """Confirmed real (see the README's "Closing the 1-D layout to 128
+    channels" section): the 1-D weight layout, which stopped working past 32
+    input channels, is exact at 64 and 128 once the addressing constants are
+    measured there -- every code, not a correlation.
+
+    The probe that found them matters as much as the result. Flipping a weight
+    between `+0.1` and `-0.1` moves only one of the two nibble planes at this
+    scale, because both quantise to a low nibble of zero; the pair used here
+    differs in *both* nibbles, which is what made the second plane visible.
+    Needs Docker, no device.
+    """
+    kernel, length = 3, 64
+    for cin, top in ((64, 16 * 432), (128, 16 * 864 + 256)):
+        cout = cin
+        rng = np.random.RandomState(5)
+        weights = rng.randn(cout, cin, kernel) * 0.05
+        for o in range(cout):
+            weights[o] *= 0.2 / np.abs(weights[o]).max()
+        weights = weights.astype(np.float32)
+        work = tmp_path / f"c{cin}"
+        work.mkdir()
+        model = _one_conv_model(cin, cout, length, kernel, weights=weights)
+        wbt = _wbt_of(_build_single_op_axmodel(str(work), "m", model))
+        got = np.zeros(weights.shape, dtype=int)
+        for o in range(cout):
+            for i in range(cin):
+                for k in range(kernel):
+                    off, shift = _weight1d_offset_wide(o, i, k, cin, cout, kernel, top)
+                    got[o, i, k] = (
+                        ((wbt[off + _WBT_PLANE_GAP] >> shift) & 0xF) << 4
+                    ) | ((wbt[off] >> shift) & 0xF)
+        assert (got == _quantize_conv_weights(weights)).all(), cin
+
+
 def test_conv_weight_quantiser_is_reproduced_exactly(tmp_path):
     """Confirmed real (see the README's "The weight quantiser, exactly"
     section): `_quantize_conv_weights()` reproduces **every** code pulsar2

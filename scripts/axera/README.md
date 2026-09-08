@@ -4413,8 +4413,47 @@ a pair that reconstructs the weights found nothing, so the placement is not a
 simple offset from the plane the probe did find.
 
 The fix is mechanical and known: probe with a pair of values whose codes
-differ in *both* nibbles. That is the next step, and until it is done the
-vocoder's weights stay unreadable past 32 channels.
+differ in *both* nibbles. That was done -- see the next section.
+
+### Closing the 1-D layout to 128 channels
+
+The blind spot was the probe, not the format. Flipping a weight between `+0.1`
+and `-0.1` at a pinned peak of 0.2 quantises to `0xC0` and `0x40` -- both with
+a **low nibble of zero** -- so only the high plane ever moved and the byte it
+moved was mistaken for the block's base. A pair differing in both nibbles
+(`+0.1` and `-0.1176`, codes `0xC0` and `0x35`) shows both planes at once, and
+the separation is the same 36 bytes it always was.
+
+**Both widths are now exact -- every code, not a correlation:**
+
+    A    = 144 * ceil((Cin/2) * K / 36)
+    m    = min(Cout // 4, 16)
+    slot = (Cin/2)*k + i//2
+    byte = A*(o % m) + 72*((o // m) & 1) + top*(o // (2*m))
+         + 144*(slot // 36) + (slot % 36)
+    high plane = byte + 36,  nibble = i % 2
+
+`A` is the piece that unifies the widths: 288, 432 and 864 at 32, 64 and 128
+channels, all from `144 * ceil((Cin/2)*K/36)`. Bit `log2(m)` of the output
+channel always costs 72, exactly as at every other width. `top` is `m*A` at 64
+channels and `m*A + 256` at 128 -- an extra 256-byte region per super-block
+that is not yet explained.
+
+The chunk boundary was the other thing the earlier probes missed: they only
+touched slots below 36, so they never crossed one. Slot 36 lands at byte 144
+and slot 64 at 172, so the chunk stride is 144, unchanged from 32 channels.
+
+**On the vocoder this moves 1 layer to 4 of 23** -- one each at 32, 64 and 128
+channels plus the final 1-channel convolution, which reads at 1.0000. That is
+3.9% of its weights, so the headline is still that the vocoder is mostly
+unread. What now blocks it is narrower and visible: every located layer has
+`K = 3`, and every `K = 5`, `K = 7` and `ConvTranspose` layer still fails. A
+single 32-channel `K = 7` convolution locates perfectly on its own, so the
+kernel size is not the problem by itself -- something about those shapes
+inside a larger graph is, and that is the next thing to probe.
+
+Test: `test_1d_weight_layout_holds_at_64_and_128_channels` (Docker, no
+device).
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
