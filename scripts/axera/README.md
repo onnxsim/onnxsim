@@ -4229,6 +4229,47 @@ Test: `test_nvfp4_weights_are_accepted_and_then_ignored` (Docker, no device).
 It asserts the two builds' weights are identical, so if a future toolchain
 implements NVFP4 the test fails and says this section needs revisiting.
 
+### Survey: every 4-bit route the toolchain has, and what each is worth
+
+Re-running the question across the whole toolchain rather than one pipeline at
+a time. Six routes, one of which works:
+
+| route | 4-bit? | measured effect |
+| --- | --- | --- |
+| `pulsar2 build` weights, `NVFP4` | parses, silently ignored | none -- weights identical code for code |
+| `pulsar2 build` weights, `U4`/`S4` | not in the enum | rejected at parse |
+| `pulsar2 build` activations | `NVFP4 not in STRING_NUMBER_MAP` | rejected |
+| `llm_build -w s4` | **yes, real** -- 0.567 B/param | **1.59x decode, 1.05x prefill** |
+| `llm_build -w fp8_e4m3` | option exists | build fails, `OpBuildException: op: AxFu` |
+| `llm_build --hidden_state_type` | `fp16, bf16, fp32` only | no narrow activations |
+
+**Peak INT4 arithmetic measured: 2.04 TOPS.** That is the `s4` prefill number
+-- 22.8 GMAC in 22.36 ms -- against a 43.2 TOPS INT4 rating, so under 5% of
+it. The cause is not the 4-bit weights, which are real; it is that nothing
+narrower than 16 bits is available for the activations they multiply.
+
+**A tool that looks like the missing path, and is not.**
+`/opt/pulsar2/convert_to_4w8f_cli` is a real CLI whose name reads as 4-bit
+weights with 8-bit float activations -- exactly the combination that would be
+worth measuring. Run on `Conv`, `MatMul` and `Gemm` models it changes nothing
+but the IR version: same op counts, same model size to within four bytes.
+Whatever it keys on, an ordinary float graph is not it, and it is not a route
+to INT4 from here.
+
+**A methodological note, because it nearly produced a false finding.**
+Grepping the compiler's per-chip backends for `S4` and `U4` reports them in
+~30 of the AX650 backend's 142 files, which reads as "the backend supports
+4-bit even though the frontend does not". It does not: those files are
+Pyarmor-encrypted blobs, and a two-character string appears in almost any
+large binary by chance. The control settles it -- the nonsense pattern `Q7x`
+matches exactly as many files as `INT4` and `4w8f` do. Nothing about backend
+capability can be read this way, and the earlier draft of this section that
+did so was wrong.
+
+So the survey's answer is the same as the narrower one, now checked
+everywhere: **4-bit weights yes, 4-bit arithmetic no**, and the 43.2 TOPS
+rating is unreachable through any route this toolchain exposes.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
