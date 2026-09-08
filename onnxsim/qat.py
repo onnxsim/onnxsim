@@ -259,7 +259,10 @@ def _round_half_away(x: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True)
 class _ActQuant:
-    """One activation quantizer this module may train: where it sits, which
+    # Raw string: the Sphinx escaped space in ``:class:`_ActQuant`\ s`` below is
+    # an invalid escape sequence to Python, which 3.12 reports as a
+    # SyntaxWarning on import of the shipped package.
+    r"""One activation quantizer this module may train: where it sits, which
     initializers it is stored in, and what calibration left it at.
 
     It describes an *edge*, not a tensor, and that is the whole of the
