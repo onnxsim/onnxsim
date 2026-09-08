@@ -4443,17 +4443,56 @@ The chunk boundary was the other thing the earlier probes missed: they only
 touched slots below 36, so they never crossed one. Slot 36 lands at byte 144
 and slot 64 at 172, so the chunk stride is 144, unchanged from 32 channels.
 
-**On the vocoder this moves 1 layer to 4 of 23** -- one each at 32, 64 and 128
-channels plus the final 1-channel convolution, which reads at 1.0000. That is
-3.9% of its weights, so the headline is still that the vocoder is mostly
-unread. What now blocks it is narrower and visible: every located layer has
-`K = 3`, and every `K = 5`, `K = 7` and `ConvTranspose` layer still fails. A
-single 32-channel `K = 7` convolution locates perfectly on its own, so the
-kernel size is not the problem by itself -- something about those shapes
-inside a larger graph is, and that is the next thing to probe.
+**On the vocoder this moves 1 layer to 4 of 23**, and reading the failures
+properly then moved it to 10 -- see the next section.
 
 Test: `test_1d_weight_layout_holds_at_64_and_128_channels` (Docker, no
 device).
+
+### Dilation reorders the weights
+
+The "every located layer has K=3" reading of the vocoder was the wrong
+variable. Its resblocks pair convolutions of the *same* shape that differ only
+in dilation -- 1 against 2, 2 against 6, 3 against 12 -- and exactly one of
+each pair was locating. Every failure had dilation greater than one.
+
+**Dilation changes the layout, and only the layout.** A 64-channel `K = 3`
+convolution built at dilation 1, 2 and 4 produces a weight table of *identical
+size* (14,376 bytes) each time, and the undilated rule reads them at 100%,
+33.7% and 33.7%. Same data, rearranged -- and the two dilated builds agree
+with each other, so the arrangement does not depend on *how much* dilation,
+only on whether there is any.
+
+**The dilated rule is simpler than the undilated one.** Probing gives the
+kernel index its own chunk:
+
+    undilated:  slot = (Cin/2)*k + i//2, then chunk by 36 with stride 144
+    dilated:    byte = 144*k + i//2
+
+Each tap starts a fresh 144-byte chunk instead of packing taps together, which
+is what you would expect when the taps read discontiguous input. Everything
+else -- the output-channel map, the 36-byte plane gap, the nibble by `i % 2`
+-- is unchanged. Verified at 100.000% of codes.
+
+**The vocoder goes from 4 to 10 of 23 layers.** Every 32-channel layer now
+reads, and most 64-channel ones. The remaining failures are a narrower set
+again:
+
+| still unread | why it is plausible |
+| --- | --- |
+| all three `ConvTranspose` | a layout never probed at all |
+| `conv_pre` (256, 192, 7) | 192 and 256 channels, past anything measured |
+| 128-channel dilated layers | 128 works undilated, so the two rules interact |
+| dilation 6 and 12 at 64 channels | 32 channels handles both, so it interacts with width |
+
+That is still only **7.1% of the vocoder's weights**, because the three
+transposed convolutions and `conv_pre` hold most of them. The honest summary
+is that the vocoder's *small* layers are now fully readable and its *large*
+ones are not.
+
+Test: `test_dilation_changes_the_weight_layout` (Docker, no device), which
+checks both rules against their own builds and that the undilated rule does
+not read a dilated one.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
