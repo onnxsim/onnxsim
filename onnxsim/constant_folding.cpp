@@ -1626,6 +1626,44 @@ void FoldGroupOnGraph(
                      [](onnx::Value* v) { return v->uses().empty(); });
       if (all_outputs_unused) {
         owner->destroy();
+      } else {
+        // `owner` survives (see the invariant-violation comment above).
+        // Every one of its outputs was just given a fresh Value under its
+        // *old* name (the `new_value` created above, from `tp.name()` --
+        // the original output's own name, since RunOpsOnGraph/ToTensorProto
+        // preserve it) -- Value::replaceAllUsesWith only renames the value
+        // it's called on when that value is one of the graph's own formal
+        // outputs, so `owner`'s own (still-live) output otherwise keeps its
+        // original name too, and now collides with `new_value`'s. Left as
+        // is, this violates the graph's SSA invariant (two distinct values
+        // sharing one name) -- surfaced downstream (e.g. by the ModelProto
+        // <-> Graph round trip inside Optimize()) as "Graph must be in
+        // single static assignment (SSA) form, however 'X' has been used as
+        // output names multiple times." Renaming every surviving output to
+        // a fresh graph-unique name resolves the collision unconditionally.
+        for (onnx::Value* v : owner->outputs()) {
+          v->setUniqueName(g.getNextUniqueName(), /*update_related_names=*/false);
+        }
+        if (IsTransientConstantOnGraph(owner)) {
+          // `owner` is itself a transient Constant node
+          // (kTransientConstantAttr) -- this pass's/partial_shape_eval's own
+          // intermediate representation for a value it had proved fully
+          // known, meant to be normalized away (folded into a plain
+          // initializer) within the same round it was created, never to be
+          // inspected by anything outside constant folding. Left in place
+          // with that marker still attached, it stays alive to see a later
+          // round's shape inference, which validates a "Constant" node's
+          // attributes against its real schema and rejects this one it
+          // doesn't recognize -- surfaced as e.g. "Unrecognized attribute
+          // onnxsim_transient_constant for operator Constant" (see the
+          // Detectron2/torchvision R-CNN family export tests this was found
+          // on). Stripping the marker here turns `owner` into an ordinary,
+          // permanent Constant node instead -- accurate, since it is
+          // neither transient nor foldable-away anymore now that something
+          // still holds a live use of its output.
+          static const onnx::Symbol kTransientAttrToStrip(kTransientConstantAttr);
+          owner->removeAttribute(kTransientAttrToStrip);
+        }
       }
     }
   }
