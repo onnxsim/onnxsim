@@ -4270,6 +4270,52 @@ So the survey's answer is the same as the narrower one, now checked
 everywhere: **4-bit weights yes, 4-bit arithmetic no**, and the 43.2 TOPS
 rating is unreachable through any route this toolchain exposes.
 
+### What a weight generator can and cannot do yet
+
+The weight table is fully addressable -- every convolution in resnet18d, three
+packings, 100% of its weights. Writing it is more constrained than reading
+it, and this pins down exactly how.
+
+**The per-channel weight scale is findable and writable.** One float32 per
+output channel sits immediately after the weight block, exactly proportional
+to that channel's peak magnitude. It has to be found *by* that
+proportionality rather than at a fixed offset, because the constant absorbs
+the activation scales and differs between models.
+
+**But rewriting weights and scales is still not enough.** Three device
+experiments, each stricter than the last:
+
+| what was rewritten | new weights | result |
+| --- | --- | --- |
+| weights only | a permutation along the input axis | **0.99982** |
+| weights only | random, per-channel peak preserved | 0.19, amplitude 3.1x |
+| weights and scales | random, peaks 0.4x-2.5x | 0.25, amplitude 2.0x |
+
+The amplitude ratios are the diagnosis: the device output is several times
+larger than the reference, which is saturation. Every convolution's *output*
+activation scale was calibrated from the original weights and is stored
+elsewhere, so any edit that widens the output distribution clips against it.
+
+**So the real constraint is not "preserve the peak" -- it is "preserve the
+output distribution".** A permutation does that exactly, which is why it
+works and why random weights with the same peak do not: same maximum,
+different variance, different output range.
+
+**Where the activation scales live, so far.** Of the eleven activation scales
+the compiler's own profile lists for an eight-layer convolution stack, exactly
+one appears verbatim as a float32 in the mcode. The rest do not appear in any
+byte order, which is what you would expect if they are stored as fixed-point
+requantisation multipliers rather than floats. Locating and rewriting those is
+the next step, and it is a decoding problem rather than a search.
+
+Until then the honest capability statement is: **a compiled model's
+convolution weights can be replaced by any set that preserves each output
+tensor's dynamic range, and verified on hardware.** That is narrower than
+"generate a weight table", and wider than it was.
+
+Test: `test_per_channel_weight_scales_sit_just_past_the_weight_block`
+(Docker, no device).
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
