@@ -162,7 +162,6 @@ def export_detectron_model(
         original_image = detection_utils.read_image(image, format=cfg.INPUT.FORMAT)
     else:
         original_image = image
-    height, width = original_image.shape[:2]
     aug = T.ResizeShortestEdge(
         [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
     )
@@ -170,7 +169,16 @@ def export_detectron_model(
     image_tensor = torch.as_tensor(
         resized_image.astype("float32").transpose(2, 0, 1)
     )
-    sample_inputs = [{"image": image_tensor, "height": height, "width": width}]
+    # TracingAdapter requires every flattened input to be a tensor, so
+    # height/width (plain ints, only used by postprocessing) are left out --
+    # exactly what Detectron2's own tools/deploy/export_model.py does before
+    # constructing TracingAdapter. do_postprocess=False below means the
+    # traced GeneralizedRCNN graph skips the step that would need them
+    # (resizing masks/boxes back to the original image size); that resize
+    # is a real limitation of this export, not something to work around
+    # here -- callers doing their own postprocessing need original_image's
+    # (height, width) shape from outside the traced graph.
+    sample_inputs = [{"image": image_tensor}]
 
     if isinstance(model, GeneralizedRCNN):
 
