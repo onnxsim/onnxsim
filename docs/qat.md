@@ -215,7 +215,7 @@ Each stage is independently shippable and independently useful.
    pass here could do: every gradient in the repo is hand-derived for one
    fixed shape, which is exactly why `brecq.py` is capped at a linear chain.
    So `graph_grad.py` came first -- `build_backward` walks a forward slice in
-   reverse and emits the gradient as ordinary ONNX nodes, 21 op rules, each
+   reverse and emits the gradient as ordinary ONNX nodes, 27 op rules, each
    checked against central finite differences, its emission pinned to
    `qat_graph.EP_FRIENDLY_OPS`. It is a rule table and a reverse walk, not an
    autograd framework: the ONNX graph is already the tape.
@@ -422,10 +422,11 @@ learn scales and got a model whose scales are untouched has no way to tell
 that from a run where learning them did not help.
 
 Operator coverage is the same constraint it is under QAT, and it is still the
-binding one on a real model: `graph_grad.SUPPORTED_OPS` is 23 rules
-(`LayerNormalization` among them since this branch, and `Conv` since a later
-one), so a normalization -- or a convolution -- in the middle of a block is
-now more nodes in the slice rather than a boundary between blocks. On a CNN
+binding one on a real model: `graph_grad.SUPPORTED_OPS` is 27 rules
+(`LayerNormalization`, `BatchNormalization` and `InstanceNormalization` among
+them, and `Conv` since a later one), so a normalization -- or a convolution --
+in the middle of a block is now more nodes in the slice rather than a
+boundary between blocks. On a CNN
 that is the difference between blocks carved *around* every convolution and
 blocks that contain them, and the convolution's own weight trains too. The
 whole default ONNX domain is 202 operators.

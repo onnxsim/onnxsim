@@ -221,6 +221,29 @@ Shapes LayerNormShapes() {
   return {{"X", {2, 3, 4}}, {"S", {4}}, {"Bn", {4}}, {"Y", {2, 3, 4}}};
 }
 
+// A fused BatchNormalization in inference mode -- mean/var are fixed
+// per-channel inputs here rather than reductions of X, so this is the only
+// slice whose Neg comes from a reduction result rather than from GradSub.
+std::vector<onnx::NodeProto> BatchNormSlice() {
+  return {Node("BatchNormalization", {"X", "S", "Bn", "Mn", "Vr"}, {"Y"})};
+}
+
+Shapes BatchNormShapes() {
+  return {{"X", {2, 3, 4, 4}}, {"S", {3}},  {"Bn", {3}},
+          {"Mn", {3}},         {"Vr", {3}}, {"Y", {2, 3, 4, 4}}};
+}
+
+// InstanceNormalization -- mean/var computed from X itself like LayerNorm,
+// but over the spatial axes only, with a per-channel scale/B that (like
+// BatchNormalization's) needs reshaping before it broadcasts against X.
+std::vector<onnx::NodeProto> InstanceNormSlice() {
+  return {Node("InstanceNormalization", {"X", "S", "Bn"}, {"Y"})};
+}
+
+Shapes InstanceNormShapes() {
+  return {{"X", {2, 3, 4, 4}}, {"S", {3}}, {"Bn", {3}}, {"Y", {2, 3, 4, 4}}};
+}
+
 // A convolution with a bias -- the rule with a weight tensor to
 // differentiate, and (along with MaxPool/AveragePool below) one whose
 // emission depends on arithmetic (the index tables) rather than only on the
@@ -262,6 +285,7 @@ Shapes PoolShapes() {
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {"Add",
                                           "AveragePool",
+                                          "BatchNormalization",
                                           "Clip",
                                           "Conv",
                                           "Div",
@@ -270,6 +294,7 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "Gather",
                                           "Gemm",
                                           "Identity",
+                                          "InstanceNormalization",
                                           "LayerNormalization",
                                           "MatMul",
                                           "MaxPool",
@@ -323,6 +348,8 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
       {TranscendentalSlice(), TranscendentalShapes(), {"A"}},
       {GemmSlice(), GemmShapes(), {"A", "W", "Cb"}},
       {LayerNormSlice(), LayerNormShapes(), {"X", "S", "Bn"}},
+      {BatchNormSlice(), BatchNormShapes(), {"X", "S", "Bn", "Mn", "Vr"}},
+      {InstanceNormSlice(), InstanceNormShapes(), {"X", "S", "Bn"}},
       {ConvSlice(), ConvShapes(), {"X", "Wc", "Bc"}},
       {PoolSlice(), PoolShapes(), {"X"}},
   };
@@ -550,6 +577,170 @@ void TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
           "a LayerNorm without a bias should emit two nodes fewer");
     Check(grads.size() == 2 && grads.count("Bn") == 0,
           "a LayerNorm without a bias has no third gradient");
+  }
+}
+
+// If this fails, the C++ BatchNormalization rule has drifted from
+// _grad_batch_normalization in graph_grad.py -- pinned the same way and for
+// the same reason as the LayerNorm rule above.
+void TheBatchNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, BatchNormSlice(), BatchNormShapes(), {{"Y", "dY"}},
+                    {"X", "S", "Bn", "Mn", "Vr"});
+  // mean reshaped to [1, C, 1, 1] and subtracted (xc); var reshaped, +eps,
+  // sqrt, inv; xhat = xc * inv; scale reshaped, gs = g * scale, dx = gs *
+  // inv; g * xhat reduced over every axis but 1 for dscale; g reduced the
+  // same way for db; dx reduced and negated for dmean; dx * xhat * inv
+  // reduced and scaled by -0.5 for dvar (one more multiply by inv than
+  // dscale's numerator needed, since the chain rule through sqrt produces
+  // inv^3 rather than inv^2 -- see the Python docstring's note on this).
+  const std::vector<std::string> expected = {
+      "Reshape", "Sub",       "Reshape",   "Add",       "Sqrt",
+      "Div",     "Mul",       "Reshape",   "Mul",       "Mul",
+      "Mul",     "ReduceSum", "ReduceSum", "ReduceSum", "Neg",
+      "Mul",     "Mul",       "ReduceSum", "Mul"};
+  Check(OpTypes(b) == expected,
+        "the BatchNormalization rule should emit graph_grad.py's nodes in "
+        "its order");
+  Check(b.nodes().size() == expected.size() &&
+            grads.at("X") == b.nodes()[9].output(0),
+        "dX should be the Mul(gs, inv) that closes the dx expression");
+  Check(grads.at("S") == b.nodes()[11].output(0),
+        "dscale should be the ReduceSum over g * xhat");
+  Check(grads.at("Bn") == b.nodes()[12].output(0),
+        "db should be the ReduceSum over g alone");
+  Check(grads.at("Mn") == b.nodes()[14].output(0),
+        "dmean should be the Neg of the reduced dx");
+  Check(grads.at("Vr") == b.nodes().back().output(0),
+        "dvar should be the last thing emitted");
+  // Three broadcast shapes ([1, C, 1, 1] for mean, var and scale), the 1.0
+  // numerator, epsilon, four reduce-axes lists (dscale/db/dmean/dvar) and
+  // -0.5 -- ten initializers, none shared between uses, the same
+  // one-initializer-per-call discipline GraphBuilder.const/int64_const
+  // follow in the Python.
+  Check(b.initializer().size() == 10, "the rule emits ten initializers");
+  const std::set<std::string> emitted = OpTypeSet(b);
+  Check(emitted.count("Conv") == 0 && emitted.count("MatMul") == 0 &&
+            emitted.count("Expand") == 0,
+        "BatchNormalization's gradient needs no weight and no matmul, and "
+        "the per-channel broadcast is a Reshape plus an ordinary Mul rather "
+        "than an Expand");
+}
+
+// The InstanceNormalization analogue of the BatchNormalization pin above.
+void TheInstanceNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, InstanceNormSlice(), InstanceNormShapes(), {{"Y", "dY"}},
+                    {"X", "S", "Bn"});
+  // scale reshaped to [1, C, 1, 1] up front; mu, xc, xc^2, var (both
+  // ReduceMeans over the spatial axes only), var+eps, sqrt, inv, xhat --
+  // exactly LayerNorm's own sequence with the reduced axes changed; then gs,
+  // mean(gs), gs*xhat, mean(gs*xhat), the two mean terms subtracted off and
+  // dx; finally g*xhat and g reduced over batch and spatial together for
+  // dscale/db.
+  const std::vector<std::string> expected = {
+      "Reshape",    "ReduceMean", "Sub",        "Mul",       "ReduceMean",
+      "Add",        "Sqrt",       "Div",        "Mul",       "Mul",
+      "ReduceMean", "Mul",        "ReduceMean", "Sub",       "Mul",
+      "Sub",        "Mul",        "Mul",        "ReduceSum", "ReduceSum"};
+  Check(OpTypes(b) == expected,
+        "the InstanceNormalization rule should emit graph_grad.py's nodes "
+        "in its order");
+  Check(b.nodes().size() == expected.size() &&
+            grads.at("X") == b.nodes()[16].output(0),
+        "dX should be the Mul(inv, ...) that closes the dx expression");
+  Check(grads.at("S") == b.nodes()[18].output(0),
+        "dscale should be the ReduceSum over g * xhat");
+  Check(grads.at("Bn") == b.nodes().back().output(0),
+        "db should be the last thing emitted");
+  Check(b.initializer().size() == 5,
+        "the rule emits five initializers: the [1, C, 1, 1] broadcast "
+        "shape, the 1.0 numerator, epsilon, and the two reduce-axes lists");
+  const std::set<std::string> emitted = OpTypeSet(b);
+  Check(emitted.count("Expand") == 0 && emitted.count("Conv") == 0 &&
+            emitted.count("MatMul") == 0,
+        "InstanceNormalization's gradient needs no weight, no matmul and no "
+        "Expand");
+}
+
+// If this fails, a BatchNormalization whose rank or per-channel operand
+// shapes don't add up would be differentiated against a geometry it
+// invented -- the same hazard APoolGeometryThatDoesNotResolveIsRefused
+// checks for MaxPool/AveragePool.
+void ABatchNormGeometryThatDoesNotAddUpIsRefused() {
+  {
+    // No batch or channel axis at all.
+    const Shapes shapes = {{"X", {3}},  {"S", {3}},  {"Bn", {3}},
+                           {"Mn", {3}}, {"Vr", {3}}, {"Y", {3}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b, BatchNormSlice(), shapes, {{"Y", "dY"}}, {"X"});
+        },
+        "channel axis",
+        "BatchNormalization with no batch or channel axis is refused");
+  }
+  {
+    // scale's shape does not match X's channel count.
+    const Shapes shapes = {{"X", {1, 3, 4, 4}}, {"S", {2}},
+                           {"Bn", {3}},         {"Mn", {3}},
+                           {"Vr", {3}},         {"Y", {1, 3, 4, 4}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b, BatchNormSlice(), shapes, {{"Y", "dY"}}, {"X"});
+        },
+        "scale has shape",
+        "BatchNormalization with a mismatched scale is refused");
+  }
+  {
+    // training_mode=1 -- refused by BuildBackward's own single-output check
+    // before this rule ever runs, since the spec requires three outputs
+    // whenever training_mode=1. There is no spec-conformant one-output
+    // training_mode=1 graph to construct, which is exactly why this rule
+    // carries no training_mode check of its own -- see the rule's comment.
+    const Shapes shapes = {
+        {"X", {1, 2, 3, 3}}, {"S", {2}},          {"Bn", {2}}, {"Mn", {2}},
+        {"Vr", {2}},         {"Y", {1, 2, 3, 3}}, {"RM", {2}}, {"RV", {2}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(
+              b,
+              {Node("BatchNormalization", {"X", "S", "Bn", "Mn", "Vr"},
+                    {"Y", "RM", "RV"}, {IntAttr("training_mode", 1)})},
+              shapes, {{"Y", "dY"}}, {"X"});
+        },
+        "3 outputs", "BatchNormalization with training_mode=1 is refused");
+  }
+}
+
+// The InstanceNormalization analogue of the refusals above.
+void AnInstanceNormGeometryThatDoesNotAddUpIsRefused() {
+  {
+    // No spatial axis at all (rank 2: batch and channel only).
+    const Shapes shapes = {
+        {"X", {4, 3}}, {"S", {3}}, {"Bn", {3}}, {"Y", {4, 3}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b, InstanceNormSlice(), shapes, {{"Y", "dY"}}, {"X"});
+        },
+        "spatial dimension",
+        "InstanceNormalization with no spatial axis is refused");
+  }
+  {
+    const Shapes shapes = {
+        {"X", {1, 3, 4, 4}}, {"S", {2}}, {"Bn", {3}}, {"Y", {1, 3, 4, 4}}};
+    GraphBuilder b;
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(b, InstanceNormSlice(), shapes, {{"Y", "dY"}}, {"X"});
+        },
+        "scale has shape",
+        "InstanceNormalization with a mismatched scale is refused");
   }
 }
 
@@ -1090,6 +1281,10 @@ int main() {
   ReducedAxesComeFromTheAttributeWhenThereIsOne();
   ABroadcastGradientIsSummedBackToTheOperandShape();
   TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheBatchNormRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheInstanceNormRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  ABatchNormGeometryThatDoesNotAddUpIsRefused();
+  AnInstanceNormGeometryThatDoesNotAddUpIsRefused();
   TheConvRuleEmitsTheSameNodesInTheSameOrderAsThePython();
   TheConvIndexTablesAreTheOnesTheGeometryImplies();
   AConvWhoseGeometryDoesNotAddUpIsRefused();

@@ -115,6 +115,15 @@ BACKWARD_OPS = frozenset(
 # axis, a constant int64 index, and no dependence of the *index* on any
 # runtime value.
 
+# :func:`_grad_batch_normalization` and :func:`_grad_instance_normalization`
+# needed nothing from this set at all: every op their gradients use --
+# ``Sub``, ``Div``, ``Mul``, ``Add``, ``Sqrt``, ``Reshape`` (for the
+# per-channel broadcast, in place of ``Expand``), ``ReduceSum``/``ReduceMean``
+# and ``Neg`` -- was already here for :func:`_grad_layer_normalization` or the
+# elementwise rules. Worth recording precisely because it is the exception to
+# every other note in this block, which each admitted one specific op for one
+# specific rule.
+
 
 class UnsupportedOpError(ValueError):
     """Raised for a node whose op type has no VJP rule.
@@ -1327,6 +1336,201 @@ def _grad_layer_normalization(
     return grads
 
 
+def _grad_batch_normalization(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``BatchNormalization``'s five gradients, in inference mode.
+
+    A step graph never runs this op with ``training_mode=1``: this repo's
+    fine-tuning graphs fake-quantize and reconstruct against *fixed* running
+    statistics, they do not re-estimate a mean and variance from the current
+    minibatch the way live training would. A ``training_mode=1`` node is
+    refused anyway, but not by a check in this rule -- the spec requires it
+    to have three outputs (``Y``, ``running_mean``, ``running_var``), so
+    :func:`build_backward`'s own single-output check refuses it before this
+    rule ever runs, the same way :func:`_grad_maxpool`'s docstring explains
+    ``MaxPool``'s optional ``Indices`` output needs no rule-specific check of
+    its own. What is left, at the opset-17 default (``training_mode``
+    omitted or 0), is per the spec::
+
+        xc   = x - mean            inv = 1 / sqrt(var + eps)
+        xhat = xc * inv            y   = xhat * scale + B
+
+    with ``mean``/``var`` the node's own *inputs* -- fixed per-channel
+    numbers, not reductions of ``x``. That is the whole difference from
+    :func:`_grad_layer_normalization`: there, ``mean``/``var`` are computed
+    from ``x`` itself, so every output element's gradient depends on every
+    other element through them; here they do not depend on ``x`` at all, so
+    differentiating through them is nothing more than differentiating
+    through two more per-channel constants, each appearing exactly where the
+    forward above shows::
+
+        dx     = g * scale * inv
+        dscale = sum_{n, spatial} (g * xhat)
+        db     = sum_{n, spatial} g
+        dmean  = -sum_{n, spatial} (g * scale * inv)  = -sum_{n, spatial}(dx)
+        dvar   = -0.5 * sum_{n, spatial} (g * scale * xc * inv^3)
+               = -0.5 * sum_{n, spatial} (dx * xhat * inv)
+
+    the last two reusing ``dx`` (``g * scale * inv``, already needed for
+    ``x``'s own gradient) and ``xhat`` (already needed for ``dscale``)
+    instead of recomputing either -- ``dx * xhat`` alone is only ``inv^2``
+    (one factor from each), so ``dvar`` needs one more multiply by ``inv``
+    to reach the ``inv^3`` the chain rule through ``sqrt`` actually produces.
+
+    **The broadcast.** ``scale``, ``B``, ``mean`` and ``var`` are all
+    ``[C]`` and broadcast against axis 1 specifically, not against ``x``'s
+    trailing axes the way :meth:`_Backward.reduce_to` (built for ordinary
+    numpy-style broadcasting -- every ``Add``/``Mul``/``Sub`` rule's own
+    case) undoes. Reshaping ``scale`` and ``mean`` to ``[1, C, 1, ..., 1]``
+    once, up front, turns their use in the forward arithmetic above into an
+    ordinary broadcast; going the other way, the four channel-shaped
+    gradients are each one ``ReduceSum`` over every axis but 1 with
+    ``keepdims=0``, producing the ``[C]`` shape directly -- the same move
+    :func:`_grad_conv` makes for its own bias gradient, generalized from
+    "batch and the spatial axes" to "every axis but the channel one", which
+    is also right when there are no spatial axes at all (``x`` rank 2, just
+    batch and channel): the reduction is then over the batch axis alone.
+    """
+    x = node.input[0]
+    scale, bias = node.input[1], node.input[2]
+    mean, var = node.input[3], node.input[4]
+    name = node.output[0]
+    x_shape = ctx.shape(x)
+    rank = len(x_shape)
+    if rank < 2:
+        raise UnsupportedOpError(
+            f"BatchNormalization needs a batch and a channel axis, got "
+            f"input shape {x_shape} (node {name!r})"
+        )
+    channels = int(x_shape[1])
+    for label, tensor in (
+        ("scale", scale),
+        ("B", bias),
+        ("mean", mean),
+        ("var", var),
+    ):
+        shape = ctx.shape(tensor)
+        if tuple(shape) != (channels,):
+            raise UnsupportedOpError(
+                f"BatchNormalization's {label} has shape {tuple(shape)}, not "
+                f"({channels},) (node {name!r})"
+            )
+    eps = float(_attr(node, "epsilon", 1e-5))
+
+    bshape = (1, channels) + (1,) * (rank - 2)
+
+    def bcast(t: str) -> str:
+        return ctx.b.op("Reshape", [t, ctx.int64_const(bshape, "shape")])
+
+    xc = ctx.b.sub(x, bcast(mean))
+    inv = ctx.b.div(
+        ctx.b.const(1.0), ctx.b.sqrt(ctx.b.add(bcast(var), ctx.b.const(eps)))
+    )
+    xhat = ctx.b.mul(xc, inv)
+
+    gs = ctx.b.mul(g, bcast(scale))
+    dx = ctx.b.mul(gs, inv)
+
+    channel_axes = [0] + list(range(2, rank))
+
+    def reduce_channel(t: str) -> str:
+        return ctx.b.op(
+            "ReduceSum", [t, ctx.int64_const(channel_axes, "axes")], keepdims=0
+        )
+
+    dscale = reduce_channel(ctx.b.mul(g, xhat))
+    dbias = reduce_channel(g)
+    dmean = ctx.b.op("Neg", [reduce_channel(dx)])
+    dvar = ctx.b.mul(
+        reduce_channel(ctx.b.mul(ctx.b.mul(dx, xhat), inv)), ctx.b.const(-0.5)
+    )
+
+    return [dx, dscale, dbias, dmean, dvar]
+
+
+def _grad_instance_normalization(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``InstanceNormalization``'s three gradients.
+
+    Same coupling as :func:`_grad_layer_normalization` -- mean and variance
+    are computed from ``x`` itself, so every element's gradient depends on
+    every other element in its group through them -- but a different group:
+    one ``(batch, channel)`` pair, reduced over the spatial axes ``[2,
+    rank)`` only, rather than a suffix of axes named by an ``axis``
+    attribute (``InstanceNormalization`` has none; the channel axis is
+    always 1, per the spec). Per the ONNX doc::
+
+        mu   = mean_spatial(x)      xc  = x - mu
+        var  = mean_spatial(xc^2)   inv = 1 / sqrt(var + eps)
+        xhat = xc * inv             y   = xhat * scale + B
+
+    with ``scale``/``B`` one entry per channel, broadcasting against every
+    batch element and every spatial position --
+    :func:`_grad_batch_normalization`'s broadcast, not layer-norm's, so
+    ``scale`` is reshaped to ``[1, C, 1, ..., 1]`` the same way before use.
+    Past that reshape, ``dx`` is exactly layer-norm's own ``dx`` with
+    ``axes`` set to the spatial ones, and ``dscale``/``db`` are batch-norm's
+    channel-reduced ``ReduceSum``, over batch and spatial together this time
+    since neither of those is the channel axis.
+
+    A rank below 3 -- no spatial axis at all -- is refused: the reduction
+    would then be over an empty axis list, which ``ReduceMean`` treats as
+    "reduce every axis" rather than "reduce none", silently changing what
+    "instance" means. That is exactly the kind of behaviour
+    :class:`UnsupportedOpError` exists to catch at build time instead of
+    risking.
+    """
+    x, scale, bias = node.input[0], node.input[1], node.input[2]
+    name = node.output[0]
+    x_shape = ctx.shape(x)
+    rank = len(x_shape)
+    if rank < 3:
+        raise UnsupportedOpError(
+            f"InstanceNormalization needs at least one spatial dimension, "
+            f"got input shape {x_shape} (node {name!r})"
+        )
+    channels = int(x_shape[1])
+    for label, tensor in (("scale", scale), ("B", bias)):
+        shape = ctx.shape(tensor)
+        if tuple(shape) != (channels,):
+            raise UnsupportedOpError(
+                f"InstanceNormalization's {label} has shape {tuple(shape)}, "
+                f"not ({channels},) (node {name!r})"
+            )
+    eps = float(_attr(node, "epsilon", 1e-5))
+    spatial_axes = list(range(2, rank))
+    bshape = (1, channels) + (1,) * (rank - 2)
+    scale_b = ctx.b.op("Reshape", [scale, ctx.int64_const(bshape, "shape")])
+
+    mu = ctx.b.op("ReduceMean", [x], axes=spatial_axes, keepdims=1)
+    xc = ctx.b.sub(x, mu)
+    var = ctx.b.op("ReduceMean", [ctx.b.mul(xc, xc)], axes=spatial_axes, keepdims=1)
+    inv = ctx.b.div(ctx.b.const(1.0), ctx.b.sqrt(ctx.b.add(var, ctx.b.const(eps))))
+    xhat = ctx.b.mul(xc, inv)
+
+    gs = ctx.b.mul(g, scale_b)
+    mean_gs = ctx.b.op("ReduceMean", [gs], axes=spatial_axes, keepdims=1)
+    mean_gs_xhat = ctx.b.op(
+        "ReduceMean", [ctx.b.mul(gs, xhat)], axes=spatial_axes, keepdims=1
+    )
+    dx = ctx.b.mul(
+        inv, ctx.b.sub(ctx.b.sub(gs, mean_gs), ctx.b.mul(xhat, mean_gs_xhat))
+    )
+
+    channel_axes = [0] + spatial_axes
+
+    def reduce_channel(t: str) -> str:
+        return ctx.b.op(
+            "ReduceSum", [t, ctx.int64_const(channel_axes, "axes")], keepdims=0
+        )
+
+    dscale = reduce_channel(ctx.b.mul(g, xhat))
+    dbias = reduce_channel(g)
+    return [dx, dscale, dbias]
+
+
 def _grad_clip(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """Pass the gradient through where the input was strictly inside the
     bounds, zero it elsewhere.
@@ -1464,6 +1668,7 @@ def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
 _RULES: Dict[str, Rule] = {
     "Add": _grad_add,
     "AveragePool": _grad_averagepool,
+    "BatchNormalization": _grad_batch_normalization,
     "Clip": _grad_clip,
     "Conv": _grad_conv,
     "Div": _grad_div,
@@ -1472,6 +1677,7 @@ _RULES: Dict[str, Rule] = {
     "Gather": _grad_gather,
     "Gemm": _grad_gemm,
     "Identity": _grad_identity,
+    "InstanceNormalization": _grad_instance_normalization,
     "LayerNormalization": _grad_layer_normalization,
     "MatMul": _grad_matmul,
     "MaxPool": _grad_maxpool,
