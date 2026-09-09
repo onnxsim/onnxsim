@@ -4829,35 +4829,60 @@ tool for finding a block but the wrong one for confirming it. With sixteen
 input groups a block is twelve channels wide -- a six-byte pattern -- and a
 whole-table scan will find a spurious maximum for something that short.
 
-Switching the criterion to **exact code match** fixes both ends of that. The
+Switching the criterion to **exact code match** fixes both ends. The
 probability of twelve bytes matching by chance is about `256^-12`, so a hit is
 real; and because it never stops at a false maximum, the search finds *more*:
 
 | criterion | layers | weights |
 | --- | --- | --- |
 | correlation > 0.99 | 20 of 23 | 67.5% |
-| **every code exact** | **21 of 23** | **47.7%** |
+| **every code exact** | **20 of 23** | **67.5%** |
 
-The stricter test locating more layers is not a paradox: correlation was
-stopping at wrong answers, and the extra layers only appear once the search
-can reject them. The weight percentage falls because the one large layer that
-correlation accepted -- the 256-channel upsampler, 524K of the vocoder's 1.6M
-weights -- does not survive exact checking.
+Every code of two thirds of a trained vocoder's weights, including the
+524K-weight upsampler, is now predicted from the ONNX file alone.
 
-**Two layers remain, and both are 256-channel**: `conv_pre` at `(256,192,7)`
-and the first upsampler at `(256,128,16)`. Every 32-, 64- and 128-channel
-layer in the vocoder now reads exactly, transposed and dilated ones included.
-That is the same width boundary this work has crossed twice before, and the
-same probe closes it.
+**Three layers remain**, and the pattern in them is not width: `conv_pre`
+`(256,192,7)`, and the two 128-channel convolutions with the widest dilations
+(`K=5 d=6` at 3 of 5 tap blocks, `K=7 d=12` at 18 of 28). Their 64-channel
+twins read exactly, so whatever splits them is something 128 channels and a
+wide dilation do together.
 
-**One bug worth recording.** The first exact-match run lost all three
-transposed convolutions, which correlation had accepted. The cause was in the
-checker, not the format: it computed each polyphase slice's quantisation peak
-*from that slice* rather than from the whole kernel. The compiler scales per
-output channel over the entire weight, so a phase's expected codes have to be
-derived from the whole tensor and sliced afterwards. Correlation had hidden
-the error by being scale-invariant -- the same property that makes it useful
-for searching makes it blind to this.
+**Two bugs, both in the checker rather than the format**, and correlation had
+hidden both by being scale- and offset-invariant:
+
+* The first exact-match run lost all three transposed convolutions. It
+  computed each polyphase slice's quantisation peak *from that slice*; the
+  compiler scales per output channel over the whole kernel, so a phase's
+  expected codes have to come from the whole tensor and be sliced afterwards.
+  Fixing it is what makes the 256-channel upsampler readable.
+* The second lost every dilated convolution. A dilated layer does not pack its
+  taps into one slot space -- it rounds **each tap** up to a whole number of
+  144-byte chunks, `tap stride = 144*ceil((Cin/2)/36)`, against the undilated
+  `slot = (Cin/2)*k + i/2`. At `Cin=128, K=3` the two give the same output
+  stride, which is why a probe at that one shape had not separated them.
+
+### The layout does not change at 256 channels
+
+Since 128 channels was where the layout last grew a term, the natural guess
+for the unread layers was that 256 grows another. A dense probe says no. At
+`Cin = Cout = 256, K = 3`, every constant is the one already recorded:
+
+| probe | address | rule |
+| --- | --- | --- |
+| `i = 72` | 144 | slot chunked at 36, stride 144 |
+| `i = 255` | 451 | `144*3 + 19` |
+| `k = 1, 2` | 452, 1012 | `slot = (Cin/2)*k + i/2` |
+| `o = 1` | 1584 | `A = 144*ceil((Cin/2)*K/36)` |
+| `o = 16` | 72 | bit 4 of the output channel costs 72 |
+| `o = 32` | 25600 | `top = 16*A + 256` |
+
+So `top = m*A + 256` holds at 128 channels **and** at 256 -- the extra 256
+bytes are not a per-128-channel pad but a fixed region per super-block. A
+super-block covers 32 output channels, and the probe also moved four bytes at
+`m*A + 4*o` for each channel it touched: the requantisation multipliers, 32 x
+4 = 128 bytes. That leaves exactly 128 bytes unaccounted for -- room for one
+more per-channel float32 table, which the bias is the obvious candidate for
+and which no probe has yet moved.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
