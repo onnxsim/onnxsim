@@ -5153,6 +5153,31 @@ refinement:
   index; only its base moves. For a `(256,256,3,3)` layer the second block
   sits 35,968 bytes after the first.
 
+**Confirmed on a purpose-built probe.** The 128-channel split was inferred
+from resnet18d, so a single `(32,256,3,3)` convolution was built and probed
+one weight at a time. Every constant the layout claims comes back:
+
+| probe | bytes | rule |
+| --- | --- | --- |
+| `i = 0` | 32, 68, 1184, 1220 | four planes at 0, 36, `9*128`, `9*128+36` |
+| `i = 0, 1` | same byte | four input channels to a byte |
+| `i = 64` | 608 | `144*(i>>4) + (i%16)//4 + 32` |
+| `kw = 1` | 28 | `4*(K*K-1-flat)`, the kernel reversed |
+| `o = 1` | +2304 | `a = 18*min(Cin,128)` |
+| `o = 8` | +72 | bit 3 of the output channel |
+| `o = 16` | +18432 | `8a`, a bit-interleave |
+| **`i = 128`** | **37152** | `+35968` on the formula's 1184 |
+
+That last row is the boundary, measured directly: input channel 128 sits
+**35,968 bytes** past where the first block's addressing would put it, and
+from there the arithmetic is unchanged -- channel 192 and channel 255 both
+land exactly where `144*(i>>4) + (i%16)//4` predicts *relative to the new
+base*. The second block does not re-index its channels; only its base moves.
+
+And 35,968 is the same number measured on resnet18d's `(256,256,3,3)` layer,
+which has eight times the output channels. So the offset does not depend on
+`Cout`.
+
 **A correction, and it is about my own tooling rather than the format.** An
 earlier pass here reported that walking for the next input block "finds
 nothing that verifies", and concluded the remaining channels must be stored
