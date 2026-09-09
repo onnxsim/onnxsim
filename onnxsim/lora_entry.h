@@ -191,6 +191,79 @@ LoraInjectionResult InjectLora(const onnx::ModelProto& model,
                                const InjectLoraOptions& options = {});
 
 // ---------------------------------------------------------------------------
+// DiscoverLoraBlocks -- the C++ port of onnxsim/lora.py's
+// discover_lora_blocks, which itself reuses onnxsim/qat.py's
+// _liveness_cuts/_primary_graph_input
+// ---------------------------------------------------------------------------
+
+// One trainable block DiscoverLoraBlocks found, named the way a caller would
+// name one for BuildLoraStepGraph by hand. Mirrors lora.py's LoraBlock field
+// for field.
+struct LoraBlock {
+  std::string input_name;
+  std::string output_name;
+  std::vector<std::string> target_outputs;   // never empty
+  std::vector<std::string> external_inputs;  // sorted, input_name included
+  std::vector<std::string> op_types;         // deduplicated, sorted
+  int64_t num_nodes = 0;
+};
+
+// Partitions `injected_model` into a sequence of blocks BuildLoraStepGraph
+// can train, without a caller naming a single block_input_name/
+// block_output_name pair by hand -- the C++ port of lora.py's own
+// discover_lora_blocks, which itself reuses qat.py's _liveness_cuts /
+// _primary_graph_input verbatim (ported here as the same-named
+// anonymous-namespace helpers in lora_entry.cpp). Those two functions'
+// docstrings carry the actual argument and are not repeated here, on this
+// header's own standing policy of one place to update when a derivation
+// changes -- but in one sentence: a slice is trainable iff it is
+// **differentiable** (every op inside is in graph_grad::SupportedOps()) and
+// **self-contained** (the graph narrows to exactly one live tensor at both
+// of its boundaries, so cutting it out there severs nothing else still in
+// use). _liveness_cuts finds every such boundary by a liveness argument, not
+// by recognizing architectures -- initializers and every non-primary graph
+// input are excluded from the live set, so a second input (an attention
+// mask, say) never suppresses a cut the way it would if it were counted as
+// an ordinary activation; _primary_graph_input picks which input keeps that
+// power, by reachability, ties going to the earlier input. Neither can see a
+// tensor computed purely from initializers for what it is -- such a tensor
+// is counted as an ordinary live activation and so suppresses cuts across
+// its own live range -- but that is conservative (fewer, larger blocks, or
+// none), not incorrect.
+//
+// This walks consecutive cut pairs in graph order, treats any node in a span
+// whose op type is not in SupportedOps() as a hard gap that closes whatever
+// block was pending and reopens after it, and otherwise accumulates that
+// span's node outputs that are one of `adapter`'s own
+// LoraTarget::node_output tensors -- the same tensor InjectLora restored the
+// original node's name to -- closing a block once that running count
+// reaches `max_targets_per_block`. A final pending block, if any, is closed
+// against the last cut once the walk ends.
+//
+// This does NOT call FoldFrozenPrefixes: like lora.py's own
+// discover_lora_blocks, it has no notion of "frozen", so it treats every
+// unsupported op as a hard gap even where BuildLoraStepGraph could in
+// principle train through it by capturing it as a block-external constant
+// (an NF4 dequant chain's Cast, say -- see BuildLoraStepGraph's own comment
+// on why SliceBlock captures rather than folds it). That is conservative,
+// not incorrect: run this against an apply_qlora-composed model and it may
+// propose fewer or smaller blocks than a hand-named BuildLoraStepGraph call
+// could actually train; it never proposes one that cannot train.
+//
+// Throws std::invalid_argument when `max_targets_per_block < 1`, message
+// mirroring lora.py's own ValueError ("max_targets_per_block must be at
+// least 1"). Boundaries are found in `injected_model`'s own graph -- the one
+// BuildLoraStepGraph differentiates -- so pass the model InjectLora/
+// apply_qlora produced, not the original float model.
+//
+// Returns the blocks in graph order, possibly empty. Consecutive blocks need
+// not be adjacent: a gap between two of them is a region nothing here can
+// train.
+std::vector<LoraBlock> DiscoverLoraBlocks(
+    const onnx::ModelProto& injected_model, const LoraAdapter& adapter,
+    int64_t max_targets_per_block = 2);
+
+// ---------------------------------------------------------------------------
 // BuildLoraStepGraph -- the C++ port of the graph-building half of
 // onnxsim/lora.py's _build_lora_step_graph / _train_lora_block
 // ---------------------------------------------------------------------------
