@@ -1,0 +1,274 @@
+name: onnx-finetune training (incl. distillation)
+
+# Covers everything onnx-finetune-lora.yml deliberately doesn't:
+# generate_artifacts.py itself, the native onnx-finetune CLI, and its WASM
+# binding -- all three of which need a *training-enabled* onnxruntime, not
+# the plain onnxruntime that workflow installs. Split into three jobs by
+# cost and toolchain rather than one, same rationale as that workflow's own
+# split:
+#
+# - distillation-python: `pip install onnxruntime-training` is enough for
+#   generate_artifacts.py and a real onnxruntime.training.api training step
+#   -- no source build at all. Fast, so it also covers every --loss mode's
+#   Python side, not just distillation.
+# - distillation-native: builds a training-enabled onnxruntime from source
+#   (--enable_training_apis, ~20-40 min, see tools/onnx-finetune/README.md)
+#   and the onnx-finetune CLI against it, then actually runs --teacher-model
+#   distillation training end to end and checks the loss went down.
+# - distillation-wasm: the training+WASM+JSEP build tools/onnx-finetune/
+#   wasm/README.md documents (needs the mlas patch there too), then runs
+#   the compiled module under Node (matching scripts/convertmodel's own
+#   onnxruntime-web tests, which also run under plain Node rather than a
+#   real browser) -- the first automated check this binding has ever had;
+#   see that README's "Status" section for the regression this might catch.
+#
+# Both from-source builds are genuinely slow, so each caches its
+# build/Release tree keyed on the pinned onnxruntime ref + this file's own
+# hash (so a recipe change busts the cache instead of silently reusing a
+# stale one).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/onnx-finetune/**"
+      - ".github/workflows/onnx-finetune-training.yml"
+  push:
+    branches: [master]
+    paths:
+      - "tools/onnx-finetune/**"
+      - ".github/workflows/onnx-finetune-training.yml"
+
+concurrency:
+  group: onnx-finetune-training-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ORT_REF: v1.19.2
+  EMSCRIPTEN_VERSION: 3.1.59
+
+jobs:
+  distillation-python:
+    name: Python (generate_artifacts.py + a real training step)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install deps (onnxruntime-training needs no source build -- see README.md)
+        run: pip install onnx numpy onnxruntime-training pytest
+      - name: pytest tools/onnx-finetune/tests/test_distillation.py
+        run: pytest tools/onnx-finetune/tests/test_distillation.py -v
+
+  distillation-native:
+    name: Native CLI (builds training-enabled onnxruntime from source)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install onnx numpy onnxruntime-training
+
+      - name: Check out onnxruntime ${{ env.ORT_REF }}
+        run: |
+          git clone --branch "${ORT_REF}" --depth 1 https://github.com/microsoft/onnxruntime.git /tmp/onnxruntime
+          cd /tmp/onnxruntime && git submodule update --init --recursive --depth 1
+
+      - name: Cache onnxruntime training build
+        id: ort-cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/onnxruntime/build
+          key: ort-native-training-${{ env.ORT_REF }}-${{ hashFiles('.github/workflows/onnx-finetune-training.yml') }}
+
+      - name: Build onnxruntime (--enable_training_apis, ~20-40 min cold)
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp/onnxruntime
+          python3 tools/ci_build/build.py \
+            --build_dir build --config Release --parallel \
+            --skip_tests --allow_running_as_root \
+            --build_shared_lib --enable_training_apis
+
+      - name: Build onnx-finetune
+        run: |
+          cmake -B tools/onnx-finetune/build \
+            -DORT_SOURCE_DIR=/tmp/onnxruntime \
+            -DORT_BUILD_DIR=/tmp/onnxruntime/build/Release
+          cmake --build tools/onnx-finetune/build --parallel
+
+      - name: Generate toy teacher/student classifiers + synthetic data
+        working-directory: tools/onnx-finetune
+        run: |
+          python3 scripts/make_toy_classifier.py -o /tmp/teacher.onnx --hidden-dim 32 --num-classes 4 --seed 1
+          python3 scripts/make_toy_classifier.py -o /tmp/student.onnx --hidden-dim 8 --num-classes 4 --seed 2
+          python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samples 2048 \
+            --input-out /tmp/train_input.bin --labels-out /tmp/train_labels.bin
+
+      - name: Generate distillation training artifacts
+        working-directory: tools/onnx-finetune
+        run: |
+          python3 scripts/generate_artifacts.py /tmp/student.onnx -o /tmp/artifacts \
+            --loss distillation --distill-temperature 2.0 --distill-alpha 0.5
+
+      - name: Run onnx-finetune --teacher-model (distillation) end to end
+        working-directory: tools/onnx-finetune
+        run: |
+          ./build/onnx-finetune \
+            --artifacts-dir /tmp/artifacts --teacher-model /tmp/teacher.onnx \
+            --train-input /tmp/train_input.bin --train-target /tmp/train_labels.bin --label-dtype int64 \
+            --input-dim 8 --target-dim 1 --num-samples 2048 \
+            --batch-size 32 --epochs 20 --lr 0.05 --log-every 10 \
+            --output-model /tmp/distilled.onnx --output-names logits \
+            | tee /tmp/train.log
+
+      - name: Check the loss actually went down
+        run: |
+          python3 - <<'EOF'
+          import re
+          losses = [float(m.group(1)) for m in re.finditer(r"loss ([0-9.eE+-]+)", open("/tmp/train.log").read())]
+          assert len(losses) >= 2, f"expected at least 2 logged loss values, got {losses}"
+          print(f"first={losses[0]} last={losses[-1]}")
+          assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
+          EOF
+
+      - name: Sanity-check the exported model loads and runs
+        run: |
+          python3 -c "
+          import onnxruntime as ort
+          import numpy as np
+          sess = ort.InferenceSession('/tmp/distilled.onnx')
+          out = sess.run(None, {'input': np.random.randn(2, 8).astype(np.float32)})
+          print('output shape:', out[0].shape)
+          assert out[0].shape == (2, 4)
+          "
+
+  distillation-wasm:
+    name: WASM binding (builds training+JSEP onnxruntime for wasm32)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - run: pip install onnx numpy onnxruntime-training
+
+      - name: Install protoc (host codegen tool for the cross build)
+        run: |
+          PROTOC_VERSION=31.1
+          curl -sSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+
+      - name: Install emsdk ${{ env.EMSCRIPTEN_VERSION }}
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install "${EMSCRIPTEN_VERSION}"
+          ./emsdk/emsdk activate "${EMSCRIPTEN_VERSION}"
+
+      - name: Check out onnxruntime ${{ env.ORT_REF }} and apply the MLAS/wasm patch
+        run: |
+          git clone --branch "${ORT_REF}" --depth 1 https://github.com/microsoft/onnxruntime.git /tmp/onnxruntime-wasm
+          cd /tmp/onnxruntime-wasm && git submodule update --init --recursive --depth 1
+          git apply "${GITHUB_WORKSPACE}/tools/onnx-finetune/wasm/patches/mlas-wasm-ort-enforce.patch"
+
+      # Reusing the SAME build directory name across runs matters here --
+      # see wasm/README.md's "Build time" note: a differently-named build
+      # dir busts most of ccache's hash even with CCACHE_BASEDIR set,
+      # because generated headers are included via -I<build-dir>/..., not
+      # just referenced by absolute prefix.
+      - name: Cache onnxruntime training+wasm+JSEP build
+        id: ort-wasm-cache
+        uses: actions/cache@v6
+        with:
+          path: tools/onnx-finetune/wasm/build
+          key: ort-wasm-training-jsep-${{ env.ORT_REF }}-${{ env.EMSCRIPTEN_VERSION }}-${{ hashFiles('.github/workflows/onnx-finetune-training.yml', 'tools/onnx-finetune/wasm/patches/*.patch') }}
+
+      - name: Configure + build onnx-finetune-wasm (~25-40 min cold, ~7 min warm)
+        run: |
+          . ./emsdk/emsdk_env.sh
+          cd tools/onnx-finetune/wasm
+          emcmake cmake -B build \
+            -DORT_SOURCE_DIR=/tmp/onnxruntime-wasm \
+            -DONNX_CUSTOM_PROTOC_EXECUTABLE=$(which protoc) \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -t onnx-finetune-wasm --parallel
+
+      - name: Generate toy teacher/student classifiers + synthetic data + artifacts
+        working-directory: tools/onnx-finetune
+        run: |
+          python3 scripts/make_toy_classifier.py -o /tmp/teacher.onnx --hidden-dim 32 --num-classes 4 --seed 1
+          python3 scripts/make_toy_classifier.py -o /tmp/student.onnx --hidden-dim 8 --num-classes 4 --seed 2
+          python3 scripts/generate_artifacts.py /tmp/student.onnx -o /tmp/artifacts \
+            --loss distillation --distill-temperature 2.0 --distill-alpha 0.5
+
+      # This is a from-scratch smoke test (plain Node, no browser/Playwright
+      # needed -- same as scripts/convertmodel's own onnxruntime-web tests),
+      # not a reuse of wasm/example/app.js's UI-driven flow: it only needs
+      # to prove the *compiled module* trains correctly and the loss goes
+      # down, which is exactly what wasm/README.md's "Status" section
+      # flags as unconfirmed/regressed as of this writing.
+      - name: Run a real distillation training step under Node
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const Module = require(path.resolve('tools/onnx-finetune/wasm/build/onnx-finetune-wasm.js'));
+
+          function readBin(p, Ctor) { return new Ctor(fs.readFileSync(p).buffer); }
+
+          Module().then((mod) => {
+            const artifactsDir = '/tmp/artifacts';
+            const checkpoint = new Uint8Array(fs.readFileSync(`${artifactsDir}/checkpoint`));
+            const trainingModel = new Uint8Array(fs.readFileSync(`${artifactsDir}/training_model.onnx`));
+            const evalModel = new Uint8Array(fs.readFileSync(`${artifactsDir}/eval_model.onnx`));
+            const optimizerModel = new Uint8Array(fs.readFileSync(`${artifactsDir}/optimizer_model.onnx`));
+            const teacherModel = new Uint8Array(fs.readFileSync('/tmp/teacher.onnx'));
+
+            const session = new mod.FinetuneSession(
+              checkpoint, trainingModel, evalModel, optimizerModel, teacherModel);
+            session.setLearningRate(0.05);
+
+            const batch = 32, inputDim = 8, numClasses = 4;
+            const input = new Float32Array(batch * inputDim);
+            for (let i = 0; i < input.length; i++) input[i] = Math.sin(i) * 0.5;
+            const labels = new Float32Array(batch);
+            for (let i = 0; i < batch; i++) labels[i] = i % numClasses;
+
+            const losses = [];
+            for (let step = 0; step < 50; step++) {
+              const loss = session.trainStep(input, labels, batch, inputDim, 1);
+              losses.push(loss);
+              const sub = session.lastSubLosses();
+              if (step % 10 === 0) {
+                console.log(`step ${step}: loss=${loss} sub=${JSON.stringify(sub)}`);
+              }
+              session.optimizerStep();
+              session.lazyResetGrad();
+            }
+
+            if (!(losses[losses.length - 1] < losses[0])) {
+              console.error(`loss did not decrease: first=${losses[0]} last=${losses[losses.length - 1]}`);
+              process.exit(1);
+            }
+            console.log('OK: loss decreased', losses[0], '->', losses[losses.length - 1]);
+          }).catch((e) => {
+            console.error('FAILED:', e);
+            process.exit(1);
+          });
+          EOF

@@ -89,10 +89,24 @@ native CLI's loop one-for-one:
 | `OptimizerStep` | `session.optimizerStep()` |
 | `LazyResetGrad` | `session.lazyResetGrad()` |
 | `ExportModelForInferencing` + `--output-names` | `session.exportModel(['name1', ...])` -> `Uint8Array` |
+| `--teacher-model` (distillation mode) | 5-argument constructor overload: `new Module.FinetuneSession(checkpointBytes, trainingModelBytes, evalModelBytes, optimizerModelBytes, teacherModelBytes)` |
+| soft/hard loss breakdown | `session.lastSubLosses()` -> `{soft, hard}` after `trainStep()` (`undefined` outside distillation mode) |
 
 Batch construction, shuffling, and the epoch loop live in JS
 (`example/app.js`) rather than C++, same division of responsibility as the
 native CLI (C++ owns the training step, the caller owns the data loop).
+
+Distillation mode (see `../README.md`'s "Knowledge distillation" section for
+the full CLI-side recipe) needs no change to `trainStep`'s own signature:
+`target` still means whatever the training graph's `labels` input expects
+(int64 class indices, marshaled as a `Float32Array` of whole numbers -- see
+`onnx_finetune_wasm.cpp`'s `trainStep` for why: Embind typed-array bindings
+don't make mixed-dtype-per-call convenient, so the float->int64 conversion
+happens in C++ instead of asking every caller to build an `Int32Array`/
+`BigInt64Array` themselves). `FinetuneSession` internally runs a second,
+plain inference session against the teacher on each step's `input` to
+produce `teacher_logits` and feeds all three tensors to `TrainStep`, exactly
+mirroring `main.cpp`'s `--teacher-model` handling.
 
 ## Building
 

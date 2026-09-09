@@ -17,7 +17,7 @@ endif()
 # build output instead of an installed prefix:
 #   cmake -B build \
 #     -DORT_SOURCE_DIR=/path/to/onnxruntime \
-#     -DORT_BUILD_DIR=/path/to/onnxruntime/build/Linux/Release
+#     -DORT_BUILD_DIR=/path/to/onnxruntime/build/Release
 if(NOT ORT_SOURCE_DIR)
   message(FATAL_ERROR "ORT_SOURCE_DIR is not set -- point it at the onnxruntime source checkout used for the training build. See README.md.")
 endif()
