@@ -27,9 +27,9 @@ before this script existed (it is what ``onnxsim --check`` is); the value
 added here is feeding it NNSmith's diverse generated graphs instead of only
 the handful of real-world models onnxsim is normally exercised against.
 
-Each model gets its own subprocess for both generation and simplification,
-so a native crash in either NNSmith's torch export path or in onnxsim's
-compiled extension takes down only that one case.
+Each model gets its own subprocess for both generation (NNSmith generation
+plus our own ONNX export, both in `_nnsmith_gen.py`) and simplification, so
+a native crash in either takes down only that one case.
 
 ``check_n>0`` needs a backend (onnxruntime, or onnx's ReferenceEvaluator as a
 fallback -- see onnxsim/backend.py) to actually execute the original and
@@ -49,20 +49,24 @@ any other non-``ok`` case, but excluded from the exit-1 "bugs" list, since
 they are not findings about onnxsim.
 
 Requires the optional ``nnsmith[torch,onnx]`` package; skips with a clear
-message if missing. NNSmith's ONNX export goes through
-``torch.onnx.export(..., dynamo=False)`` -- forced by ``_nnsmith_gen.py``,
-see that file for why this is a required compatibility shim rather than an
-optional flag -- which is the legacy TorchScript-trace exporter and needs no
-extra package beyond torch itself (no onnxscript).
+message if missing. Generation goes through NNSmith's ``torch`` model type
+rather than its own ``onnx`` type, then ``_nnsmith_gen.py`` exports the
+result to ONNX itself via the legacy ``torch.onnx.export(..., dynamo=False)``
+TorchScript-trace exporter -- see that file's module docstring for why (a
+torch/NNSmith compatibility problem with ``model.type=onnx``'s own export
+path, and a ~80x cheaper opset-determination cost as a bonus). No extra
+package beyond torch itself is needed (no onnxscript).
 
 NNSmith's first run on a host builds and caches (``~/.cache/nnsmith-<ver>/``)
-a "topset" -- which candidate ops actually export successfully in this
-environment -- by trial-exporting every op/dtype combination it knows.
-Measured on this repo's CI-like environment (torch 2.14, nnsmith 0.1.0):
-~3.5 minutes for that one-time topset build, then ~2s per generated model
-after (dominated by Python/torch process startup, not generation itself,
-which is ~10-100ms). Cache ``~/.cache/nnsmith-<ver>/`` across CI runs (see
-the nightly workflow) so only the first run ever pays the topset-build cost.
+a "topset" -- which candidate ops actually work in this environment -- by
+trial-running every op/dtype combination it knows. Measured on this repo's
+CI-like environment (torch 2.14, nnsmith 0.1.0) for the ``torch`` model
+type this script now uses: ~2.7 seconds for that one-time topset build
+(``model.type=onnx``'s own trial-export-based version of the same check
+measured ~3.5 minutes), then ~2s per generated model after (dominated by
+Python/torch process startup, not generation itself, which is ~10-100ms).
+Cache ``~/.cache/nnsmith-<ver>/`` across CI runs regardless (see the
+nightly workflow) so only the first run ever pays even this small cost.
 
 Usage:
     python scripts/nnsmith_simplify_fuzz.py --count 100
@@ -117,15 +121,15 @@ def _generate(
     `gen_error`, does not count as a simplify() finding).
 
     Goes through `_nnsmith_gen.py` rather than `-m nnsmith.cli.model_gen`
-    directly -- see that file for why (a torch/NNSmith version compatibility
-    shim, not optional)."""
+    directly -- see that file for why (generates via NNSmith's `torch` model
+    type, ~80x cheaper to determine the exportable opset for than its own
+    `onnx` type, then exports to ONNX itself)."""
     proc = subprocess.run(
         [
             sys.executable,
             str(_GEN_HELPER),
             f"mgen.seed={seed}",
             f"mgen.max_nodes={max_nodes}",
-            "model.type=onnx",
             f"mgen.save={model_dir}",
             # Without this, Hydra (which nnsmith's CLI is built on) writes its
             # own run log/config under an `outputs/<date>/<time>/` directory
