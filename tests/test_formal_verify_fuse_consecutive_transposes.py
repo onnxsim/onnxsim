@@ -15,9 +15,8 @@ applied in sequence -- for every rank-4 index, a genuine universal proof
 quantified), not just a finite sample of concrete indices.
 """
 
-from onnx import parser
-
 from _formal_verify_common import prove, simplify_isolated, z3
+from onnx import parser
 
 _RANK = 4
 _T1 = [1, 0, 2, 3]  # inner transpose (applied first): swap axes 0 and 1

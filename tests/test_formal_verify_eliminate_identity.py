@@ -13,9 +13,8 @@ instead of just restating ``x == x``: the proof holds for every possible
 consumer, not only the one this file happens to test against.
 """
 
-from onnx import parser
-
 from _formal_verify_common import prove, simplify_isolated, z3
+from onnx import parser
 
 
 def test_eliminate_identity_is_sound():

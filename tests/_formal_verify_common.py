@@ -25,14 +25,14 @@ these tests are skipped, not failed, when it isn't installed.
 
 import collections
 
+import onnxsim.onnxsim_cpp2py_export as C
 import pytest
+
+import onnxsim
 
 z3 = pytest.importorskip(
     "z3", reason="formal verification tests need the 'verify' extra (z3-solver)"
 )
-
-import onnxsim
-import onnxsim.onnxsim_cpp2py_export as C
 
 
 def isolate(*pass_names):

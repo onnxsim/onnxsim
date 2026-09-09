@@ -31,9 +31,8 @@ identity directly instead of reasoning about an opaque sqrt symbol.
 
 import numpy as np
 import onnx
-from onnx import parser
-
 from _formal_verify_common import prove, simplify_isolated, z3
+from onnx import parser
 
 
 def test_fuse_bn_into_conv_is_sound():
