@@ -286,6 +286,28 @@ int main() {
     assert(ShapeIs("se", {"seq", "seq"}));
   }
 
+  // === MatMul rank-1 operand handling (onnxsim issue #1275) ================
+  // numpy matmul promotes a rank-1 lhs/rhs with a leading/trailing 1, then
+  // strips it back out of the result. Getting the "strip" step wrong for the
+  // rank-1 x rank-1 case (both promoted dims removed, leaving a 0-D scalar)
+  // used to erase past the front of the output vector.
+  {
+    ShapeGraph g;
+    g.value_info["v"] = {SymExpr(768)};
+    g.value_info["m"] = {SymExpr(768), SymExpr(1000)};
+    g.node = {
+        // rank-1 x rank-1 (dot product): self-MatMul is the exact shape NNSmith
+        // generated for issue #1275 -- both promoted dims are stripped, so the
+        // result is a 0-D scalar.
+        N("MatMul", {"v", "v"}, {"dot"}),
+        N("MatMul", {"v", "m"}, {"vm"}),  // rank-1 x rank-2 -> [1000]
+    };
+    const auto r = onnxsim::InferSymbolicShapes(g);
+    g_result = &r;
+    assert(ShapeIs("dot", {}));
+    assert(ShapeIs("vm", {"1000"}));
+  }
+
   std::cout << "sym_shape_infer_test: all assertions passed\n";
   return 0;
 }
