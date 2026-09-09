@@ -124,6 +124,19 @@ def _custom_default_domain_ops(model: onnx.ModelProto) -> Set[str]:
     return custom_ops
 
 
+def _has_one_sided_nan(a: np.ndarray, b: np.ndarray) -> bool:
+    """True if a NaN sits in one array where the other holds a non-NaN value.
+
+    Used only to explain a reported mismatch: ``np.max(np.abs(a - b))`` is NaN
+    whenever either side has one, so the printed "max diff" cannot by itself
+    distinguish a real NaN-vs-number regression from the both-sides-NaN case
+    that ``compare`` deliberately tolerates.
+    """
+    if a.dtype.kind not in "fc" or b.dtype.kind not in "fc":
+        return False  # integer/bool outputs cannot hold NaN
+    return bool(np.any(np.isnan(a) != np.isnan(b)))
+
+
 def compare(
     model_opt: Union[str, bytes, onnx.ModelProto],
     model_ori: Union[str, onnx.ModelProto],
@@ -153,6 +166,10 @@ def compare(
         (correct) op reordering accumulates floating-point error beyond the
         default -- see the RF-DETR XLarge case in ``scripts/rfdetr``.
     :param atol: Absolute tolerance for ``numpy.allclose`` (see ``rtol``).
+        Outputs are compared with ``equal_nan=True``: a NaN the original model
+        already produces for a given random input (a Div by zero, say) is not
+        counted as a change when the simplified model produces a NaN in the
+        same position. A NaN on only one side remains a mismatch.
     :param input_fill: How to fill the generated test inputs when ``input_data``
         is not given. One of ``"random"`` (uniform ``[0, 1)``, the default),
         ``"ones"``, ``"zeros"`` or ``"arange"`` (``0, 1, 2, ...`` in row-major
@@ -329,13 +346,33 @@ def compare(
         res_opt = forward(trial_opt, inputs, custom_lib)
 
         for name in res_opt.keys():
-            if not np.allclose(res_opt[name], res_ori[name], rtol=rtol, atol=atol):
+            # equal_nan=True: a NaN produced at the same position by *both*
+            # models is not evidence that anything changed -- it just means the
+            # model itself is undefined at this (random) input, e.g. a Div by
+            # zero. Without it, NaN != NaN made such inputs report a bogus
+            # "changes after optimization" (GitHub issue #1285). It only ever
+            # equates NaN with NaN: a NaN in one output where the other holds a
+            # number is still a mismatch, and so is +Inf vs -Inf or Inf vs any
+            # finite value (np.allclose compares infinities exactly by default,
+            # which is already the behaviour we want for them).
+            if not np.allclose(
+                res_opt[name], res_ori[name], rtol=rtol, atol=atol, equal_nan=True
+            ):
                 if verbose:
                     print(
                         "Tensor {} changes after optimization. The max diff is {}.".format(
                             name, np.max(np.abs(res_opt[name] - res_ori[name]))
                         )
                     )
+                    if _has_one_sided_nan(res_opt[name], res_ori[name]):
+                        # The max diff is NaN in this case, which reads exactly
+                        # like the (now tolerated) both-sides-NaN case. Say
+                        # which one it actually is.
+                        print(
+                            "(The max diff is NaN because NaN appears in one "
+                            "model's output where the other's is a number. "
+                            "Matching NaNs on both sides are not reported.)"
+                        )
                     print("After optimization:")
                     print(res_opt[name])
                     print("Before optimization:")
