@@ -4729,12 +4729,47 @@ An extent of 25 reads at 32 channels and not at 64; an extent of 19 reads at
 alone, but their product against some tile -- the same shape of interaction
 the polyphase finding turned out to be.
 
-That suggests the likely answer: a convolution whose dilated footprint
-outgrows the input tile is **decomposed**, exactly as a strided transposed
-convolution is decomposed into phases. If so, the remaining layers are not a
-new layout at all, only the existing one applied to sub-convolutions, and the
-probe that settles it is the one that settled `ConvTranspose` -- flip a
-single weight and see how many separate regions move.
+That suggested a decomposition, and it is one -- see the next section.
+
+### A widely dilated convolution is K convolutions
+
+Flipping one weight and counting how many separate byte regions move settles
+it, and the count is the whole argument:
+
+| convolution | dilation | regions that move |
+| --- | --- | --- |
+| 64ch, `K=3` | 1 | 2 (the weight, and the scales) |
+| 64ch, `K=7` | 3 | **8** |
+| 64ch, `K=5` | 6 | **6** |
+
+Eight regions at `K = 7` and six at `K = 5`: **one per kernel tap**, plus the
+scales. Not one per dilation, which is the decomposition one might guess
+first -- `d` is 3 and 6 in those two rows, and neither matches.
+
+So once a dilated kernel's footprint outgrows what one input tile holds, the
+convolution is compiled as **K separate single-tap convolutions**, each laid
+out as an ordinary `K = 1` block. The same move as the polyphase split of a
+strided transposed convolution, along a different axis.
+
+(A single weight perturbs *every* region because it shifts the layer's output
+range slightly, and each sub-block carries its own requantisation multiplier.
+That is why the region count is visible from a one-weight change at all.)
+
+**Reading each tap as its own block takes the vocoder to 19 of 23 layers and
+62.5% of its weights**, from 14 and 50.5%. Layers that had resisted from the
+start -- `(64,64,7)` at dilation 12, `(32,32,7)` at dilation 12,
+`(128,128,7)` at dilation 3 -- read at 0.9971 to 0.9999.
+
+**Four layers remain**: `conv_pre` at `(256,192,7)`, and three at 128
+channels -- `(128,128,5)` at dilations 2 and 6, and `(128,128,7)` at dilation
+12. Those are the interesting residue, because `(128,128,7)` at dilation 3
+*does* read: same width, same kernel, different dilation. So whatever splits
+those three is finer than one tap per block, and probably splits the input as
+well.
+
+Test: `test_a_widely_dilated_conv_splits_into_single_tap_convolutions`
+(Docker, no device), which counts regions rather than searching for them --
+the count is the claim, and it is robust where a base-offset search is not.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 

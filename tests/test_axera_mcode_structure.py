@@ -5027,6 +5027,62 @@ def _one_convtranspose_model(cin, cout, length, kernel, stride, weights=None):
     return model
 
 
+def test_a_widely_dilated_conv_splits_into_single_tap_convolutions(tmp_path):
+    """Confirmed real (see the README's "A widely dilated convolution is K
+    convolutions" section): once a dilated kernel's footprint grows past what
+    one input tile holds, the convolution is compiled as **K separate
+    single-tap convolutions**.
+
+    The count is what identifies it. Changing a single weight and grouping
+    the bytes that move gives one region per *tap* -- eight regions at
+    `K = 7`, six at `K = 5` -- and **not** one per dilation, which is the
+    other decomposition one might guess (`d` is 3 and 6 here). An undilated
+    convolution of the same width moves one region. Needs Docker, no device.
+    """
+    cin = cout = 64
+    length = 64
+
+    def regions(kernel, dilation):
+        rng = np.random.RandomState(5)
+        base = rng.randn(cout, cin, kernel) * 0.05
+        for o in range(cout):
+            base[o] *= 0.2 / np.abs(base[o]).max()
+        base[0, 0, 0] = 0.1
+        flipped = base.copy()
+        flipped[0, 0, 0] = -0.1176  # differs in both nibbles
+        tables = []
+        for tag, weights in (("a", base), ("b", flipped)):
+            work = tmp_path / f"k{kernel}d{dilation}{tag}"
+            work.mkdir()
+            model = _one_conv_model(
+                cin,
+                cout,
+                length,
+                kernel,
+                dilation=dilation,
+                weights=weights.astype(np.float32),
+            )
+            tables.append(_wbt_of(_build_single_op_axmodel(str(work), "m", model)))
+        a, b = tables
+        moved = [j for j in range(min(len(a), len(b))) if a[j] != b[j]]
+        assert moved, (kernel, dilation)
+        groups, current = [], [moved[0]]
+        for offset in moved[1:]:
+            if offset - current[-1] > 64:
+                groups.append(current)
+                current = [offset]
+            else:
+                current.append(offset)
+        groups.append(current)
+        return len(groups)
+
+    # Undilated: one weight region (plus the scales it perturbs).
+    assert regions(3, 1) <= 2, regions(3, 1)
+    # Widely dilated: one region per tap, not per dilation.
+    assert regions(7, 3) >= 7, "K=7 should split into per-tap regions"
+    assert regions(5, 6) >= 5, "K=5 should split into per-tap regions"
+
+
 def test_convtranspose_stores_taps_reversed_in_the_conv_layout(tmp_path):
     """Confirmed real (see the README's "A transposed convolution is several
     convolutions" section): an unstrided `ConvTranspose` uses the *ordinary*
