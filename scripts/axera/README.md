@@ -4822,6 +4822,43 @@ Test: `test_a_widely_dilated_conv_splits_into_single_tap_convolutions`
 (Docker, no device), which counts regions rather than searching for them --
 the count is the claim, and it is robust where a base-offset search is not.
 
+### Verifying by exact codes, not correlation
+
+Every coverage number above was scored by correlation, which is the right
+tool for finding a block but the wrong one for confirming it. With sixteen
+input groups a block is twelve channels wide -- a six-byte pattern -- and a
+whole-table scan will find a spurious maximum for something that short.
+
+Switching the criterion to **exact code match** fixes both ends of that. The
+probability of twelve bytes matching by chance is about `256^-12`, so a hit is
+real; and because it never stops at a false maximum, the search finds *more*:
+
+| criterion | layers | weights |
+| --- | --- | --- |
+| correlation > 0.99 | 20 of 23 | 67.5% |
+| **every code exact** | **21 of 23** | **47.7%** |
+
+The stricter test locating more layers is not a paradox: correlation was
+stopping at wrong answers, and the extra layers only appear once the search
+can reject them. The weight percentage falls because the one large layer that
+correlation accepted -- the 256-channel upsampler, 524K of the vocoder's 1.6M
+weights -- does not survive exact checking.
+
+**Two layers remain, and both are 256-channel**: `conv_pre` at `(256,192,7)`
+and the first upsampler at `(256,128,16)`. Every 32-, 64- and 128-channel
+layer in the vocoder now reads exactly, transposed and dilated ones included.
+That is the same width boundary this work has crossed twice before, and the
+same probe closes it.
+
+**One bug worth recording.** The first exact-match run lost all three
+transposed convolutions, which correlation had accepted. The cause was in the
+checker, not the format: it computed each polyphase slice's quantisation peak
+*from that slice* rather than from the whole kernel. The compiler scales per
+output channel over the entire weight, so a phase's expected codes have to be
+derived from the whole tensor and sliced afterwards. Correlation had hidden
+the error by being scale-invariant -- the same property that makes it useful
+for searching makes it blind to this.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
