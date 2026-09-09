@@ -1,0 +1,178 @@
+name: Optimizer Fuzzing
+
+# Two independent differential-fuzzing checks for the two gaps a hand-written
+# unit test or a per-pass Z3 proof (tests/test_formal_verify_*.py) cannot
+# reach by construction, sharing one workflow file since both are
+# exploratory/best-effort rather than release gates:
+#
+# - op-fuzzer: scripts/onnx_op_fuzzer.py sweeps onnx operator schemas across
+#   dtypes (and, with --all-versions, every historical opset version that
+#   op has had) and reports where onnxruntime succeeds but onnx's own
+#   ReferenceEvaluator does not -- the fallback onnxsim uses for constant
+#   folding / correctness checks when onnxruntime isn't installed (see
+#   onnxsim/backend.py). Fast (a few thousand tiny models run in seconds),
+#   so runs daily. Informational only: its findings are gaps in onnx /
+#   onnxruntime upstream, not onnxsim bugs, so it never fails the job --
+#   read the uploaded CSV to see what's there / changed.
+#
+# - nnsmith-simplify: scripts/nnsmith_simplify_fuzz.py generates diverse,
+#   valid whole ONNX graphs with NNSmith
+#   (https://github.com/ise-uiuc/nnsmith, ASPLOS'23) and differential-checks
+#   onnxsim's own simplify() pass against them via onnxsim's existing
+#   check_n random-input verifier (the same one `onnxsim --check` uses).
+#   This one DOES gate: a check_failed/onnxsim_crash finding is a real
+#   onnxsim bug, reachable only from *interactions* between ops (a fusion
+#   matching more broadly than intended, a rewrite applied where a
+#   neighboring op invalidates its precondition) that a single-pass Z3 proof
+#   or a single-op test cannot see. See that script's own module docstring
+#   for the NNSmith/torch compatibility shim it requires and measured
+#   per-model cost. Each model+simplify pair is its own subprocess, so runs
+#   weekly rather than daily.
+#
+# Both scheduled + on demand, plus on PRs that touch either harness so they
+# stay valid.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # op-fuzzer: daily 07:00 UTC
+    - cron: "0 8 * * 1" # nnsmith-simplify: weekly, Monday 08:00 UTC
+  workflow_dispatch:
+    inputs:
+      nnsmith_count:
+        description: "models to generate for the nnsmith-simplify job"
+        default: "60"
+  pull_request:
+    paths:
+      - ".github/workflows/optimizer-fuzzing.yml"
+      - "scripts/onnx_op_fuzzer.py"
+      - "scripts/nnsmith_simplify_fuzz.py"
+      - "scripts/_nnsmith_gen.py"
+
+concurrency:
+  group: optimizer-fuzzing-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  op-fuzzer:
+    name: onnx op-form fuzzer (ReferenceEvaluator vs onnxruntime)
+    # Only the daily cron fires this job; the weekly cron is nnsmith-simplify's.
+    # workflow_dispatch/pull_request runs have no `schedule` event, so they
+    # always run both jobs.
+    if: github.event_name != 'schedule' || github.event.schedule == '0 7 * * *'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install onnx + onnxruntime
+        run: python3 -m pip install --upgrade pip onnx onnxruntime
+      - name: Run the op-form fuzzer (latest + every historical opset version)
+        run: |
+          python3 scripts/onnx_op_fuzzer.py --all-versions --output op-fuzzer-report.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: op-fuzzer-report
+          path: op-fuzzer-report.csv
+          if-no-files-found: ignore
+
+  # Built once for nnsmith-simplify below, the same way ep-integration.yml
+  # shares one wheel across its EP checks: this validates the actual
+  # simplifier in this branch, not a released wheel, and a plain
+  # `pip install .` (no cibuildwheel) is only demonstrated elsewhere in this
+  # repo's workflows on macOS runners (apple-integration.yml) -- this reuses
+  # the proven ubuntu cibuildwheel path instead of gambling on bare
+  # `pip install .` having every build tool it needs on ubuntu-24.04.
+  build:
+    name: Build onnxsim wheel
+    if: github.event_name != 'schedule' || github.event.schedule == '0 8 * * 1'
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-nnsmith
+          path: ./wheelhouse/*.whl
+
+  nnsmith-simplify:
+    name: NNSmith vs onnxsim simplify()
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-nnsmith
+          path: wheelhouse
+      - name: Cache NNSmith's op/dtype topset
+        # The one-time cost this avoids repeating: NNSmith trial-exports
+        # every candidate op/dtype combination it knows on first use, to find
+        # which ones actually export in this environment (measured ~3.5
+        # minutes with torch 2.14 -- see nnsmith_simplify_fuzz.py's module
+        # docstring). Keyed on the scripts so a change to the generation
+        # shim invalidates it; NNSmith/torch version bumps go through the
+        # same `pip install` step below so this key alone won't catch those
+        # -- delete the cache manually after either if results look stale.
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/nnsmith-*
+          key: nnsmith-topset-${{ runner.os }}-${{ hashFiles('scripts/nnsmith_simplify_fuzz.py', 'scripts/_nnsmith_gen.py') }}
+      - name: Install onnxsim wheel + nnsmith
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install wheelhouse/*.whl
+          python3 -m pip install "nnsmith[torch,onnx]"
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel. Same guard the EP/Core ML integration workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim, torch, nnsmith; print('onnxsim', onnxsim.__version__); print('torch', torch.__version__); print('nnsmith', nnsmith.__version__)"
+      - name: Run the NNSmith vs simplify() differential fuzzer
+        working-directory: ${{ runner.temp }}
+        # Default count kept modest (measured ~5.5s/model on this workflow's
+        # first real run, so 60 models is ~6 minutes of actual fuzzing on top
+        # of ~1.5 minutes of setup) -- that first run tried 200 and had its
+        # runner killed by an external shutdown signal around the 10-minute
+        # mark (before its own 90-minute job timeout, so some infra-level
+        # constraint on this environment, not this job's own setting). Use
+        # workflow_dispatch's nnsmith_count input for a deliberately larger
+        # one-off sweep.
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/nnsmith_simplify_fuzz.py" \
+            --count "${{ github.event.inputs.nnsmith_count || '60' }}" \
+            --output-dir nnsmith-failures
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: nnsmith-simplify-failures
+          path: ${{ runner.temp }}/nnsmith-failures
+          if-no-files-found: ignore
