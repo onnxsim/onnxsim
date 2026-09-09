@@ -5414,11 +5414,66 @@ padding into an explicit `Pad` node is a correct rewrite -- 16 sites, verified
 identical to 5.4e-7 -- and it does not help, because **Pulsar2 re-fuses `Pad`
 into `Conv`**: the next build reports the identical `padding=(54, 0)`. The rule
 is kept because it is right and cheap, and because knowing the frontend undoes
-it is worth more than not knowing. A rewrite that survives fusion would have to
-change the convolution itself, not its padding.
+it is worth more than not knowing.
 
-So the decoder does not compile yet, and what stands between is now three named
-things rather than a percentage.
+**`dilated_conv_to_taps` is what actually clears it.** `y[t] = sum_j w[:,:,j] .
+xp[t + j*d]` is the definition of a dilated convolution, so slicing the padded
+input at each tap offset and convolving with a kernel of one computes the same
+thing -- with the dilation gone, and the padding now feeding a `Slice` rather
+than a convolution, where the `Pad`-into-`Conv` fusion cannot reach it. It is
+also the shape the hardware wants: the weight table already stores a widely
+dilated convolution as one block per tap.
+
+Eight convolutions rewritten, verified against onnxruntime at 6.2e-7. **The
+model compiles.**
+
+### And then it ran
+
+One more thing stood in the way, and it is this harness's own bug rather than
+the compiler's. `axcl_run_model` feeds a model by writing one
+`<tensor name>.bin` per input, and Pulsar2 carries an ONNX name through to the
+`.axmodel` unchanged. This decoder's input is called `/Add_10_output_0`, and a
+leading slash makes `os.path.join` produce an *absolute* path -- the runner
+tries to write `/Add_10_output_0.bin` and dies with `PermissionError`.
+Exporters emit slash-prefixed names constantly. `filename_safe_io_names` is the
+fifth rule.
+
+With that, the Audio8 codec decoder's vocoder body **compiles for the AX650 and
+runs on an AX650N**, 65,536 samples out of a 141 MB `.axmodel`.
+
+### The audio is poor, and the reason is worth more than the result
+
+| measure | value |
+| --- | --- |
+| correlation against the CPU reference | 0.808 |
+| signal-to-noise ratio | **3.33 dB** |
+| above 9 kHz | error *exceeds* signal, -16 to -42 dB |
+
+The error is a flat broadband noise floor while the vocoder's energy sits below
+6 kHz. Three hypotheses, and measuring each was the whole point:
+
+* **Calibration too thin?** No. Eight feature maps from different windows
+  instead of two copies of one made it slightly *worse* (0.763).
+* **The legalizer's own fault, for unfusing Snake into five quantised
+  intermediates?** No. Simulating INT8 on both forms costs **2 dB per
+  activation** (39.7 -> 37.7 dB); compounded over 29 of them that is ~23 dB,
+  nowhere near 3.3.
+* **A few bad layers?** No. Pulsar2's own per-layer analysis puts 661 of 675
+  layers above 0.99 cosine similarity, the worst at 0.9964.
+
+What is left is the sum: **675 quantised operations, each individually
+excellent, accumulating**. A few percent relative error per layer over that
+depth is a random walk of `sqrt(675)`, which lands about where the device
+measurement is.
+
+The sharpest part is that Pulsar2's precision analysis **cannot show this**,
+and says so in its own title -- *PerLayer Reference* scores each layer against
+float inputs, so accumulation is invisible by construction. A table of
+uniformly excellent per-layer numbers sitting above a 3 dB end-to-end result is
+not a contradiction; it is the two things measuring different quantities.
+
+So: the path is open and the model is not usable as built. Getting audio out of
+it needs higher precision through part of the network, not another rewrite.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 

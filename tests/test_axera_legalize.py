@@ -118,6 +118,38 @@ def test_float16_graph_is_retyped_everywhere_it_matters():
     )  # loads, which the half-converted graph does not
 
 
+def _dilated_conv_model(pads, dilation, k=3, C=4, L=16):
+    """A dilated 1-D convolution with shapes resolved, the way an export that
+    has been through shape inference looks."""
+    w = numpy_helper.from_array(
+        np.random.RandomState(0).randn(C, C, k).astype(np.float32), "w"
+    )
+    b = numpy_helper.from_array(
+        np.random.RandomState(1).randn(C).astype(np.float32), "b"
+    )
+    out_len = L + pads[0] + pads[1] - ((k - 1) * dilation + 1) + 1
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv",
+                ["x", "w", "b"],
+                ["y"],
+                kernel_shape=[k],
+                pads=list(pads),
+                dilations=[dilation],
+                strides=[1],
+            )
+        ],
+        "dilated",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, C, L])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, C, out_len])],
+        initializer=[w, b],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 10
+    return model
+
+
 def _causal_conv_model():
     """A convolution padded only on the left -- the causal form a streaming
     codec uses, and the one Pulsar2's backend refuses."""
@@ -174,6 +206,61 @@ def test_symmetric_padding_is_left_alone():
             attr.ints.extend([2, 2])
     assert legalize.explicit_conv_padding(model) == 0
     assert [n.op_type for n in model.graph.node] == ["Conv"]
+
+
+def test_dilated_conv_becomes_one_convolution_per_tap():
+    """`y[t] = sum_j w[:,:,j] . xp[t + j*d]` -- slicing the padded input at each
+    tap and convolving with a kernel of one is the same function, with the
+    dilation gone."""
+    ort = __import__("onnxruntime")
+    for pads, dilation in (((4, 0), 2), ((2, 2), 2), ((0, 0), 3)):
+        before = _dilated_conv_model(pads, dilation)
+        after = _dilated_conv_model(pads, dilation)
+        assert legalize.dilated_conv_to_taps(after) == 1, (pads, dilation)
+        kinds = [n.op_type for n in after.graph.node]
+        assert kinds.count("Conv") == 3 and "Pad" in kinds and "Slice" in kinds
+        onnx.checker.check_model(after)
+
+        x = np.random.RandomState(3).randn(1, 4, 16).astype(np.float32)
+        runs = [
+            ort.InferenceSession(
+                m.SerializeToString(), providers=["CPUExecutionProvider"]
+            ).run(None, {"x": x})[0]
+            for m in (before, after)
+        ]
+        assert np.allclose(runs[0], runs[1], atol=1e-5), (
+            pads,
+            dilation,
+            np.abs(runs[0] - runs[1]).max(),
+        )
+
+
+def test_dilated_conv_rule_needs_shapes_and_says_so_by_not_firing():
+    """The rule sizes each slice from the convolution's output length. A graph
+    cut out of a larger one carries no `value_info`, and an earlier version
+    skipped every convolution in silence because of it -- so the rule now runs
+    shape inference itself, and this is the case that regressed."""
+    model = _dilated_conv_model((4, 0), 2)
+    del model.graph.value_info[:]
+    assert legalize.dilated_conv_to_taps(model) == 1
+
+
+def test_io_names_are_made_filename_safe():
+    """`axcl_run_model` writes one `<tensor name>.bin` per input, so an
+    exporter's `/Add_10_output_0` becomes an absolute path and the run dies
+    with `PermissionError`."""
+    model = _dilated_conv_model((4, 0), 2)
+    model.graph.input[0].name = "/Add_10_output_0"
+    model.graph.node[0].input[0] = "/Add_10_output_0"
+    assert legalize.filename_safe_io_names(model) == 1
+    assert model.graph.input[0].name == "Add_10_output_0"
+    assert model.graph.node[0].input[0] == "Add_10_output_0"
+    onnx.checker.check_model(model)
+
+
+def test_clean_io_names_are_left_alone():
+    model = _dilated_conv_model((4, 0), 2)
+    assert legalize.filename_safe_io_names(model) == 0
 
 
 def test_legalize_reports_what_each_rule_changed():

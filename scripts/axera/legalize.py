@@ -25,6 +25,7 @@ import collections
 
 import numpy as np
 import onnx
+import onnx.shape_inference
 from onnx import AttributeProto, TensorProto, helper, numpy_helper
 
 
@@ -173,10 +174,176 @@ def explicit_conv_padding(model):
     return changed
 
 
+def _initializer(model, name):
+    for init in model.graph.initializer:
+        if init.name == name:
+            return init
+    return None
+
+
+def dilated_conv_to_taps(model, min_dilation=2):
+    """A dilated 1-D convolution becomes one 1x1 convolution per tap, summed.
+
+    `y[t] = sum_j w[:, :, j] . xp[t + j*d]` is the definition, so slicing the
+    padded input at each tap offset and convolving with a kernel of one is
+    exactly the same function -- with `dilation` gone and the padding consumed
+    by an explicit `Pad` that no longer sits against a convolution, so the
+    frontend's `Pad`-into-`Conv` fusion cannot put it back.
+
+    This is also the shape the hardware wants: the weight table stores a widely
+    dilated convolution as one block per tap already (see "A widely dilated
+    convolution is K convolutions"), so the rewrite moves the graph towards
+    what the compiler does internally rather than away from it.
+    """
+    # Shapes are needed to size each tap's slice, and a graph that was cut out
+    # of a larger one carries no `value_info` at all -- which made an earlier
+    # version of this rule skip every convolution in silence.
+    try:
+        shaped = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+        known = {
+            v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+            for v in list(shaped.graph.value_info) + list(shaped.graph.output)
+        }
+    except Exception:  # noqa: BLE001 -- shape inference is best-effort here
+        known = {}
+
+    changed = 0
+    out = []
+    for node in model.graph.node:
+        attrs = {a.name: a for a in node.attribute}
+        dil = list(attrs["dilations"].ints) if "dilations" in attrs else []
+        weight = _initializer(model, node.input[1]) if len(node.input) > 1 else None
+        strides = list(attrs["strides"].ints) if "strides" in attrs else [1]
+        group = attrs["group"].i if "group" in attrs else 1
+        shape = known.get(node.output[0], [])
+        if (
+            node.op_type != "Conv"
+            or weight is None
+            or len(dil) != 1
+            or dil[0] < min_dilation
+            or strides != [1]
+            or group != 1
+            or len(shape) != 3
+            or not shape[2]
+        ):
+            out.append(node)
+            continue
+
+        w = numpy_helper.to_array(weight)
+        taps, d, length = w.shape[2], dil[0], shape[2]
+        pads = list(attrs["pads"].ints) if "pads" in attrs else [0, 0]
+        stem = node.name or node.output[0]
+
+        pad_name = f"{stem}_pads"
+        model.graph.initializer.append(
+            numpy_helper.from_array(
+                np.array([0, 0, pads[0], 0, 0, pads[1]], np.int64), pad_name
+            )
+        )
+        padded = f"{stem}_padded"
+        out.append(
+            helper.make_node(
+                "Pad",
+                [node.input[0], pad_name],
+                [padded],
+                name=f"{stem}_pad",
+                mode="constant",
+            )
+        )
+
+        partials = []
+        for j in range(taps):
+            tap_w = f"{stem}_w{j}"
+            model.graph.initializer.append(
+                numpy_helper.from_array(np.ascontiguousarray(w[:, :, j : j + 1]), tap_w)
+            )
+            starts, ends, axes = (f"{stem}_s{j}", f"{stem}_e{j}", f"{stem}_a{j}")
+            for name, value in ((starts, j * d), (ends, j * d + length), (axes, 2)):
+                model.graph.initializer.append(
+                    numpy_helper.from_array(np.array([value], np.int64), name)
+                )
+            sliced = f"{stem}_x{j}"
+            out.append(
+                helper.make_node(
+                    "Slice",
+                    [padded, starts, ends, axes],
+                    [sliced],
+                    name=f"{stem}_slice{j}",
+                )
+            )
+            inputs = [sliced, tap_w]
+            if j == 0 and len(node.input) > 2:
+                inputs.append(node.input[2])
+            partial = f"{stem}_y{j}"
+            out.append(
+                helper.make_node(
+                    "Conv",
+                    inputs,
+                    [partial],
+                    name=f"{stem}_tap{j}",
+                    kernel_shape=[1],
+                    pads=[0, 0],
+                    dilations=[1],
+                    strides=[1],
+                )
+            )
+            partials.append(partial)
+
+        acc = partials[0]
+        for j, part in enumerate(partials[1:], start=1):
+            nxt = node.output[0] if j == len(partials) - 1 else f"{stem}_acc{j}"
+            out.append(
+                helper.make_node("Add", [acc, part], [nxt], name=f"{stem}_add{j}")
+            )
+            acc = nxt
+        changed += 1
+
+    if changed:
+        del model.graph.node[:]
+        model.graph.node.extend(out)
+    return changed
+
+
+def filename_safe_io_names(model):
+    """Graph inputs and outputs get names that can be a file name.
+
+    `axcl_run_model` feeds a compiled model by writing one `<tensor name>.bin`
+    per input, and Pulsar2 carries an ONNX name through to the `.axmodel`
+    unchanged. Exporters routinely emit names like `/Add_10_output_0`, and a
+    leading slash turns that path into an absolute one -- the runner then tries
+    to write `/Add_10_output_0.bin` and fails with `PermissionError`. Renaming
+    is safe: only the graph's own boundary names change, and nothing outside
+    the model refers to them.
+    """
+    renamed = {}
+    for value in list(model.graph.input) + list(model.graph.output):
+        if "/" in value.name or value.name.startswith("."):
+            clean = value.name.strip("/").replace("/", "_").lstrip(".")
+            renamed[value.name] = clean or "tensor"
+            value.name = renamed[value.name]
+    if not renamed:
+        return 0
+    for node in model.graph.node:
+        for i, name in enumerate(node.input):
+            if name in renamed:
+                node.input[i] = renamed[name]
+        for i, name in enumerate(node.output):
+            if name in renamed:
+                node.output[i] = renamed[name]
+    for value in model.graph.value_info:
+        if value.name in renamed:
+            value.name = renamed[value.name]
+    return len(renamed)
+
+
+#: Order matters. `dilated_conv_to_taps` consumes a convolution's `pads`
+#: attribute, so it has to run before `explicit_conv_padding` zeroes it.
 RULES = {
     "float16_to_float32": float16_to_float32,
     "pow2_to_mul": pow2_to_mul,
+    "dilated_conv_to_taps": dilated_conv_to_taps,
     "explicit_conv_padding": explicit_conv_padding,
+    "filename_safe_io_names": filename_safe_io_names,
 }
 
 
