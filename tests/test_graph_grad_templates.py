@@ -177,6 +177,24 @@ def test_grad_batch_normalization_templated_matches_torch_autograd():
 
     templated = _backward_model(model, targets, _templated_rules())
     assert {n.name for n in templated.functions} == set()  # fully inlined
+    # The inlined template must stay inside the same execution-provider
+    # allowlist a hand-written rule does -- graph_grad.py's own BACKWARD_OPS
+    # comment explains why (WebGPU/WebNN coverage). Excludes the forward
+    # model's own op_types (BatchNormalization itself, not a backward op)
+    # and Identity (this test's own copy-out scaffolding, not something a
+    # real caller emits -- see _backward_model). The first version of this
+    # template failed this exact check: it built `1.0`/`-0.5` in-body via
+    # Constant/CastLike, neither of which is in BACKWARD_OPS, instead of
+    # taking them as data the way the hand-written rule's ctx.b.const(...)
+    # already does for `eps` -- fixed by adding `one`/`neg_half` as ordinary
+    # function inputs (see generate_grad_templates.py's GradBatchNormalization
+    # docstring).
+    forward_ops = {node.op_type for node in model.graph.node}
+    emitted = {node.op_type for node in templated.graph.node} - forward_ops
+    assert emitted <= graph_grad.BACKWARD_OPS | {"Identity"}, (
+        f"templated backward reached outside the allowlist: "
+        f"{sorted(emitted - graph_grad.BACKWARD_OPS - {'Identity'})}"
+    )
     hand_written = _backward_model(model, targets, dict(graph_grad._RULES))
 
     rng = np.random.default_rng(0)

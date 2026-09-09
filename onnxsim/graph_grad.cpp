@@ -1,5 +1,7 @@
 #include "graph_grad.h"
 
+#include <onnx/defs/parser.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -10,6 +12,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "graph_grad_templates_gen.h"
 
 // Every rule below is a transcription of the same-named rule in
 // onnxsim/graph_grad.py, node for node and *in the same order*. The
@@ -1694,6 +1698,127 @@ std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
   return {ddata, std::nullopt};
 }
 
+// ---------------------------------------------------------------------------
+// Templated rules (proof of concept)
+// ---------------------------------------------------------------------------
+//
+// An alternative to hand-transcribing a rule's graph construction directly
+// here (and, separately, in graph_grad.py): author the rule once in
+// onnxscript, compile it offline to a checked-in ONNX FunctionProto
+// (scripts/codegen/generate_grad_templates.py ->
+// graph_grad_templates_gen.h/.py), and instantiate the same text from either
+// language via ONNX's own function-inlining machinery. See
+// graph_grad.py's matching section for the Python original and the full
+// rationale (in particular why these functions take no ONNX-level
+// attributes).
+//
+// Not wired into Rules(): these two functions exist to prove the mechanism
+// (see graph_grad_templates_test.cpp, which cross-checks
+// GradBatchNormalizationTemplated against the hand-written
+// GradBatchNormalization above) before any production rule is migrated to
+// it. Every real caller of BuildBackward still gets Rules() unchanged.
+
+const onnx::FunctionProto& GradAddTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradAddTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradAdd template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+const onnx::FunctionProto& GradBatchNormalizationTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status =
+        onnx::OnnxParser::Parse(*proto, kGradBatchNormalizationTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error(
+          "failed to parse the GradBatchNormalization template: " +
+          status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+// Same shape as GradAdd, but the identity-gradient core (da = db = g) comes
+// from a call to the checked-in GradAdd function instead of being written
+// here directly. Broadcast-undoing stays outside the template, exactly as
+// it does for the hand-written rule.
+std::vector<OptStr> GradAddTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  const std::vector<std::string> outs = ctx.b().Call(GradAddTemplate(), {g});
+  const Shape out = ctx.ShapeOf(node.output(0));
+  const std::string ga = ctx.ReduceTo(outs[0], out, ctx.ShapeOf(node.input(0)));
+  const std::string gb = ctx.ReduceTo(outs[1], out, ctx.ShapeOf(node.input(1)));
+  return {ga, gb};
+}
+
+// Same validation and shape-resolution as GradBatchNormalization (rank/shape
+// checks, the per-channel broadcast reshape, the reduction axes), but the
+// actual gradient arithmetic comes from a call to the checked-in
+// GradBatchNormalization function -- the rule this repo's own
+// dvar-derivation bug was in, so the one most worth proving out this way
+// first.
+std::vector<OptStr> GradBatchNormalizationTemplated(Backward& ctx,
+                                                    const onnx::NodeProto& node,
+                                                    const std::string& g) {
+  const std::string& x = node.input(0);
+  const std::string& scale = node.input(1);
+  const std::string& bias = node.input(2);
+  const std::string& mean = node.input(3);
+  const std::string& var = node.input(4);
+  const std::string name = Quoted(node.output(0));
+  const Shape x_shape = ctx.ShapeOf(x);
+  const int64_t rank = static_cast<int64_t>(x_shape.size());
+  if (rank < 2) {
+    throw UnsupportedOpError(
+        "BatchNormalization needs a batch and a channel axis, got input "
+        "shape " +
+        ShapeStr(x_shape) + " (node " + name + ")");
+  }
+  const int64_t channels = x_shape[1];
+  const std::vector<std::pair<std::string, std::string>> operands = {
+      {"scale", scale}, {"B", bias}, {"mean", mean}, {"var", var}};
+  for (const auto& [label, tensor] : operands) {
+    const Shape shape = ctx.ShapeOf(tensor);
+    if (shape.size() != 1 || shape[0] != channels) {
+      throw UnsupportedOpError(
+          "BatchNormalization's " + label + " has shape " + ShapeStr(shape) +
+          ", not (" + std::to_string(channels) + ",) (node " + name + ")");
+    }
+  }
+  const float eps = AttrFloat(node, "epsilon", 1e-5f);
+
+  Shape bshape{1, channels};
+  for (int64_t i = 2; i < rank; ++i) bshape.push_back(1);
+  const std::string mean_b = ctx.b().Op(
+      "Reshape", {mean, ctx.b().ConstInt64(bshape, "shape")}, "reshape");
+  const std::string var_b = ctx.b().Op(
+      "Reshape", {var, ctx.b().ConstInt64(bshape, "shape")}, "reshape");
+  const std::string scale_b = ctx.b().Op(
+      "Reshape", {scale, ctx.b().ConstInt64(bshape, "shape")}, "reshape");
+
+  Shape channel_axes{0};
+  for (int64_t i = 2; i < rank; ++i) channel_axes.push_back(i);
+  const std::string channel_axes_const =
+      ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string eps_const = ctx.b().Const(eps);
+  const std::string one_const = ctx.b().Const(1.0f);
+  const std::string neg_half_const = ctx.b().Const(-0.5f);
+
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradBatchNormalizationTemplate(),
+                   {g, x, mean_b, var_b, scale_b, eps_const, channel_axes_const,
+                    one_const, neg_half_const});
+  return {outs[0], outs[1], outs[2], outs[3], outs[4]};
+}
+
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
@@ -1728,55 +1853,29 @@ const std::map<std::string, Rule>& Rules() {
   return *rules;
 }
 
-// "['Add', 'Clip', ...]", the way the Python's sorted(SUPPORTED_OPS) prints
-// inside its refusal message.
-std::string SupportedOpsList() {
+// "['Add', 'Clip', ...]", the way the Python's sorted(rules) prints inside
+// its refusal message. `rules` rather than the global Rules()/SupportedOps()
+// so a caller with a different rule table (BuildBackwardWithTemplatedRules)
+// gets an accurate list too; std::map already iterates in key order.
+std::string SupportedOpsList(const std::map<std::string, Rule>& rules) {
   std::string out = "[";
   bool first = true;
-  for (const std::string& op : SupportedOps()) {
+  for (const auto& entry : rules) {
     if (!first) out += ", ";
     first = false;
-    out += Quoted(op);
+    out += Quoted(entry.first);
   }
   return out + "]";
 }
 
-}  // namespace
-
-const std::set<std::string>& BackwardOps() {
-  // ReduceMean and Sqrt were admitted for GradLayerNormalization, which
-  // needs a mean over the normalized axes and the reciprocal square root of
-  // the variance; the Python set says at length why that is not a loosening
-  // of the criterion.
-  // Gather was admitted for GradConv, which writes a convolution's gradient
-  // as im2col rather than as the ConvTranspose it naturally is; the Python
-  // set says why that is not a loosening either, and the EP_FRIENDLY_OPS note
-  // in qat_graph.py records what a Conv/ConvTranspose membership would have
-  // cost instead.
-  // GradBatchNormalization and GradInstanceNormalization needed nothing from
-  // this set at all -- every op their gradients use was already here for
-  // GradLayerNormalization or the elementwise rules.
-  static const std::set<std::string>* ops = new std::set<std::string>{
-      "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
-      "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
-      "Reshape", "Sqrt",   "Sub", "Transpose"};
-  return *ops;
-}
-
-const std::set<std::string>& SupportedOps() {
-  static const std::set<std::string>* ops = [] {
-    auto* names = new std::set<std::string>();
-    for (const auto& entry : Rules()) names->insert(entry.first);
-    return names;
-  }();
-  return *ops;
-}
-
-std::map<std::string, std::string> BuildBackward(
+// The core of BuildBackward, parameterized over the rule table -- see
+// BuildBackward and BuildBackwardWithTemplatedRules, its two callers.
+std::map<std::string, std::string> BuildBackwardImpl(
     GraphBuilder& b, const std::vector<onnx::NodeProto>& nodes,
-    const std::map<std::string, std::vector<int64_t>>& shapes,
+    const std::map<std::string, Shape>& shapes,
     const std::map<std::string, std::string>& grad_outputs,
-    const std::vector<std::string>& targets) {
+    const std::vector<std::string>& targets,
+    const std::map<std::string, Rule>& rules) {
   Backward ctx(b, shapes);
   std::map<std::string, std::string> grads(grad_outputs);
 
@@ -1785,8 +1884,8 @@ std::map<std::string, std::string> BuildBackward(
   // the time a producer asks for its output gradient the sum is complete.
   for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
     const onnx::NodeProto& node = *it;
-    const auto rule = Rules().find(node.op_type());
-    if (rule == Rules().end()) {
+    const auto rule = rules.find(node.op_type());
+    if (rule == rules.end()) {
       // The name a refusal points at: the node's own name where it has one,
       // its output otherwise. The Python indexes output[0] unconditionally;
       // a node with no outputs at all would make that an IndexError, so this
@@ -1795,9 +1894,10 @@ std::map<std::string, std::string> BuildBackward(
           !node.name().empty()
               ? node.name()
               : (node.output_size() > 0 ? node.output(0) : std::string());
-      throw UnsupportedOpError(
-          "no gradient rule for op type " + Quoted(node.op_type()) + " (node " +
-          Quoted(where) + "); graph_grad differentiates " + SupportedOpsList());
+      throw UnsupportedOpError("no gradient rule for op type " +
+                               Quoted(node.op_type()) + " (node " +
+                               Quoted(where) + "); graph_grad differentiates " +
+                               SupportedOpsList(rules));
     }
     if (node.output_size() != 1) {
       throw UnsupportedOpError(
@@ -1852,4 +1952,54 @@ std::map<std::string, std::string> BuildBackward(
     result[target] = found->second;
   }
   return result;
+}
+
+}  // namespace
+
+const std::set<std::string>& BackwardOps() {
+  // ReduceMean and Sqrt were admitted for GradLayerNormalization, which
+  // needs a mean over the normalized axes and the reciprocal square root of
+  // the variance; the Python set says at length why that is not a loosening
+  // of the criterion.
+  // Gather was admitted for GradConv, which writes a convolution's gradient
+  // as im2col rather than as the ConvTranspose it naturally is; the Python
+  // set says why that is not a loosening either, and the EP_FRIENDLY_OPS note
+  // in qat_graph.py records what a Conv/ConvTranspose membership would have
+  // cost instead.
+  // GradBatchNormalization and GradInstanceNormalization needed nothing from
+  // this set at all -- every op their gradients use was already here for
+  // GradLayerNormalization or the elementwise rules.
+  static const std::set<std::string>* ops = new std::set<std::string>{
+      "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
+      "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
+      "Reshape", "Sqrt",   "Sub", "Transpose"};
+  return *ops;
+}
+
+const std::set<std::string>& SupportedOps() {
+  static const std::set<std::string>* ops = [] {
+    auto* names = new std::set<std::string>();
+    for (const auto& entry : Rules()) names->insert(entry.first);
+    return names;
+  }();
+  return *ops;
+}
+
+std::map<std::string, std::string> BuildBackward(
+    GraphBuilder& b, const std::vector<onnx::NodeProto>& nodes,
+    const std::map<std::string, std::vector<int64_t>>& shapes,
+    const std::map<std::string, std::string>& grad_outputs,
+    const std::vector<std::string>& targets) {
+  return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, Rules());
+}
+
+std::map<std::string, std::string> BuildBackwardWithTemplatedRules(
+    GraphBuilder& b, const std::vector<onnx::NodeProto>& nodes,
+    const std::map<std::string, std::vector<int64_t>>& shapes,
+    const std::map<std::string, std::string>& grad_outputs,
+    const std::vector<std::string>& targets) {
+  std::map<std::string, Rule> rules(Rules());
+  rules["Add"] = &GradAddTemplated;
+  rules["BatchNormalization"] = &GradBatchNormalizationTemplated;
+  return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);
 }

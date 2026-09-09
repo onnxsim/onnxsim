@@ -24,6 +24,7 @@
  */
 #include "qat_graph_builder.h"
 
+#include <onnx/inliner/inliner.h>
 #include <onnx/onnx_pb.h>
 
 #include <cctype>
@@ -192,6 +193,27 @@ void GraphBuilder::OpInto(const std::string& op_type,
   // name= is passed; a generated node name would be one more thing the two
   // emitters would have to agree on.
   nodes_.push_back(std::move(node));
+}
+
+std::vector<std::string> GraphBuilder::Call(
+    const onnx::FunctionProto& fn, const std::vector<std::string>& inputs) {
+  const auto key = std::make_pair(fn.domain(), fn.name());
+  if (function_ids_.insert(key).second) {
+    functions_.push_back(fn);
+  }
+  std::vector<std::string> outs;
+  outs.reserve(static_cast<size_t>(fn.output_size()));
+  onnx::NodeProto node;
+  node.set_op_type(fn.name());
+  node.set_domain(fn.domain());
+  for (const std::string& in : inputs) node.add_input(in);
+  for (int i = 0; i < fn.output_size(); ++i) {
+    const std::string out = Name(Lowered(fn.name()));
+    node.add_output(out);
+    outs.push_back(out);
+  }
+  nodes_.push_back(std::move(node));
+  return outs;
 }
 
 std::string GraphBuilder::Add(const std::string& a, const std::string& b) {
@@ -363,9 +385,30 @@ StepGraph MakeStepGraph(const GraphBuilder& b, const StepGraphSpec& spec) {
   onnx::OperatorSetIdProto* opset = result.model.add_opset_import();
   opset->set_domain("");
   opset->set_version(kStepGraphOpset);
+  // One opset_import per distinct function domain, at a fixed private
+  // version this repo controls entirely -- unrelated to kStepGraphOpset,
+  // which is what the function *bodies* were authored against internally
+  // (each FunctionProto carries its own opset_import for that). Mirrors
+  // qat_graph.py's make_step_graph exactly.
+  std::set<std::string> function_domains;
+  for (const onnx::FunctionProto& fn : b.functions()) {
+    *result.model.add_functions() = fn;
+    if (function_domains.insert(fn.domain()).second) {
+      onnx::OperatorSetIdProto* fn_opset = result.model.add_opset_import();
+      fn_opset->set_domain(fn.domain());
+      fn_opset->set_version(1);
+    }
+  }
   result.model.set_ir_version(kStepGraphIrVersion);
   // No producer_name: onnx.helper.make_model sets none either, and an
   // initialized-vs-absent field is a byte-level difference.
   result.loss_name = spec.loss_output;
+  if (!b.functions().empty()) {
+    // Expand every call site before this model reaches a runtime: no
+    // execution provider needs to know about the private grad domain, and
+    // the result composes with the rest of this file exactly like a
+    // hand-written rule's nodes always have.
+    onnx::inliner::InlineLocalFunctions(result.model);
+  }
   return result;
 }

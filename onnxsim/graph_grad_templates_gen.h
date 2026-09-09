@@ -1,17 +1,18 @@
-# SPDX-License-Identifier: Apache-2.0
-#
-# GENERATED FILE -- do not edit by hand. Produced by
-#   python3 scripts/codegen/generate_grad_templates.py
-# from the onnxscript function definitions in that script; see its
-# module docstring for what this is and why it takes no ONNX-level
-# attributes.
-"""ONNX function text for onnxsim.graph_grad's templated
-gradient rules -- parsed back via onnx.parser.parse_function,
-never onnxscript itself, which this module does not import."""
+// SPDX-License-Identifier: Apache-2.0
+//
+// GENERATED FILE -- do not edit by hand. Produced by
+//   python3 scripts/codegen/generate_grad_templates.py
+// from the onnxscript function definitions in that script; see its
+// module docstring for what this is and why it takes no ONNX-level
+// attributes. graph_grad_templates_gen.py is the same text for the
+// Python side -- both are produced from the same entries so they
+// cannot drift from each other.
+#ifndef ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_
+#define ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_
 
-from __future__ import annotations
-
-GRAD_ADD = """<
+// No enclosing namespace -- graph_grad.cpp, this header's only consumer, has
+// none either (it mirrors graph_grad.py's flat module directly).
+constexpr const char* kGradAddTemplate = R"GRAD_TPL(<
   domain: "onnxsim.grad",
   opset_import: ["" : 17]
 >
@@ -19,9 +20,9 @@ GradAdd (g) => (da, db)
 {
    [n0] da = Identity (g)
    [n1] db = Identity (g)
-}"""
+})GRAD_TPL";
 
-GRAD_BATCH_NORMALIZATION = """<
+constexpr const char* kGradBatchNormalizationTemplate = R"GRAD_TPL(<
   domain: "onnxsim.grad",
   opset_import: ["" : 17]
 >
@@ -43,4 +44,6 @@ GradBatchNormalization (g, x, mean_b, var_b, scale_b, eps, channel_axes, one, ne
    [n13] tmp_4 = Mul (tmp_3, inv)
    [n14] tmp_5 = ReduceSum <keepdims: int = 0> (tmp_4, channel_axes)
    [n15] dvar = Mul (tmp_5, neg_half)
-}"""
+})GRAD_TPL";
+
+#endif  // ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_

@@ -115,6 +115,21 @@ class GraphBuilder {
               const std::vector<std::string>& inputs, const std::string& output,
               const std::vector<onnx::AttributeProto>& attrs = {});
 
+  // Emits a call node to the model-local function `fn` and returns one
+  // output name per fn.output(). Registers fn (once, by (domain, name)) so
+  // MakeStepGraph can attach it and expand every call site via
+  // onnx::inliner::InlineLocalFunctions before the step graph is returned --
+  // a backend never sees the custom domain, since inlining happens before
+  // MakeStepGraph returns. Mirrors qat_graph.GraphBuilder.call exactly; see
+  // graph_grad.cpp's "Templated rules (proof of concept)" section for what
+  // this is for.
+  std::vector<std::string> Call(const onnx::FunctionProto& fn,
+                                const std::vector<std::string>& inputs);
+
+  const std::vector<onnx::FunctionProto>& functions() const {
+    return functions_;
+  }
+
   // The handful of operators the hand-derived gradients actually use. Kept to
   // ops with broad execution-provider coverage: no boolean logic ops (a mask
   // is a float 0/1 from Cast(Greater), multiplied in) and no Where.
@@ -161,6 +176,8 @@ class GraphBuilder {
  private:
   std::vector<onnx::NodeProto> nodes_;
   std::vector<onnx::TensorProto> initializer_;
+  std::vector<onnx::FunctionProto> functions_;
+  std::set<std::pair<std::string, std::string>> function_ids_;
   std::string prefix_;
   int64_t counter_ = 0;
 };

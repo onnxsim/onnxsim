@@ -599,6 +599,18 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(graph_grad_test)
   add_test(NAME graph_grad_test COMMAND graph_grad_test)
 
+  # Proof of concept: BuildBackwardWithTemplatedRules, graph_grad.cpp's
+  # onnxscript-templated rules (see that file's "Templated rules" section).
+  # Needs the fully-configured `onnxsim` target for the same reason
+  # graph_grad_test does, plus onnx::inliner (already compiled into the
+  # `onnx` target, see third_party/onnx/onnx/inliner/CMakeLists.txt) for the
+  # inlining MakeStepGraph now does when a builder has accumulated
+  # functions.
+  add_executable(graph_grad_templates_test onnxsim/graph_grad_templates_test.cpp)
+  target_link_libraries(graph_grad_templates_test onnxsim)
+  onnxsim_add_ort_rpath(graph_grad_templates_test)
+  add_test(NAME graph_grad_templates_test COMMAND graph_grad_templates_test)
+
   # xnnpack_codegen.{h,cpp} needs onnx (ModelProto/shape inference), like
   # precision_estimator_test above -- links the fully-configured `onnxsim`
   # target rather than building standalone. Needs no XNNPACK build itself

@@ -44,9 +44,11 @@ the further check against torch.autograd on a real BatchNorm.
 
 Run this script whenever the generated templates need to change:
     python3 scripts/codegen/generate_grad_templates.py \
-        onnxsim/graph_grad_templates_gen.py
-(or with no argument, to print the generated module to stdout instead of
-writing it).
+        onnxsim/graph_grad_templates_gen.py \
+        onnxsim/graph_grad_templates_gen.h
+(the C++ header is optional -- pass just the first argument to regenerate
+only the Python side; with no arguments at all, prints the Python module to
+stdout instead of writing either file).
 """
 
 import sys
@@ -88,6 +90,8 @@ def GradBatchNormalization(
     scale_b: FLOAT["..."],
     eps: FLOAT,
     channel_axes: INT64["..."],
+    one: FLOAT,
+    neg_half: FLOAT,
 ):
     """``BatchNormalization``'s five gradients (inference mode), transcribed
     from graph_grad.py's _grad_batch_normalization docstring:
@@ -105,9 +109,19 @@ def GradBatchNormalization(
     keeps this function itself rank-generic: no attribute here depends on
     x's rank, so the same compiled FunctionProto instantiates for a rank-2
     (just batch and channel) or rank-5 input alike.
+
+    `one`/`neg_half` are the literals `1.0`/`-0.5` as ordinary float32
+    tensor inputs, the same way the hand-written GradBatchNormalization
+    passes them (`ctx.b().Const(1.0f)`/`ctx.b().Const(-0.5f)`) rather than
+    as in-body `Constant`/`CastLike` nodes: this function is checked against
+    graph_grad.py's BACKWARD_OPS/graph_grad.cpp's BackwardOps() allowlist
+    once inlined, and neither `Constant` nor `CastLike` is a member of it
+    (see qat_graph.py's EP_FRIENDLY_OPS note for why the allowlist is
+    deliberately narrow) -- so this function takes them as data instead of
+    manufacturing them itself.
     """
     xc = op.Sub(x, mean_b)
-    inv = op.Div(op.CastLike(1.0, x), op.Sqrt(op.Add(var_b, eps)))
+    inv = op.Div(one, op.Sqrt(op.Add(var_b, eps)))
     xhat = op.Mul(xc, inv)
     gs = op.Mul(g, scale_b)
     dx = op.Mul(gs, inv)
@@ -116,7 +130,7 @@ def GradBatchNormalization(
     dmean = op.Neg(op.ReduceSum(dx, channel_axes, keepdims=0))
     dvar = op.Mul(
         op.ReduceSum(op.Mul(op.Mul(dx, xhat), inv), channel_axes, keepdims=0),
-        op.CastLike(-0.5, x),
+        neg_half,
     )
     return dx, dscale, dbias, dmean, dvar
 
@@ -201,6 +215,8 @@ def _validate_grad_batch_normalization() -> None:
             "scale_b": bcast(scale),
             "eps": np.array(eps, dtype=np.float32),
             "channel_axes": np.array([0, 2, 3], dtype=np.int64),
+            "one": np.array(1.0, dtype=np.float32),
+            "neg_half": np.array(-0.5, dtype=np.float32),
         },
         {
             "dx": x.shape,
@@ -242,15 +258,21 @@ def _validate_grad_batch_normalization() -> None:
             raise AssertionError(f"GradBatchNormalization.{name}: relative error {rel}")
 
 
-def main() -> None:
-    _validate_grad_add()
-    _validate_grad_batch_normalization()
+# (python identifier, C++ identifier, onnxscript function). Both languages'
+# generated files are produced from this single list, so they cannot drift
+# from each other -- the whole point of checking in ONNX function *text*
+# rather than hand-porting the graph construction twice.
+_ENTRIES = [
+    ("GRAD_ADD", "kGradAddTemplate", GradAdd),
+    (
+        "GRAD_BATCH_NORMALIZATION",
+        "kGradBatchNormalizationTemplate",
+        GradBatchNormalization,
+    ),
+]
 
-    entries = [
-        ("GRAD_ADD", GradAdd.to_function_proto()),
-        ("GRAD_BATCH_NORMALIZATION", GradBatchNormalization.to_function_proto()),
-    ]
 
+def _python_module(entries) -> str:
     out = []
     out.append("# SPDX-License-Identifier: Apache-2.0")
     out.append("#")
@@ -267,18 +289,64 @@ def main() -> None:
     out.append("")
     out.append("from __future__ import annotations")
     out.append("")
-    for ident, proto in entries:
-        text = onnx.printer.to_text(proto)
-        out.append(f'{ident} = """{text}"""')
+    for py_ident, _cpp_ident, text in entries:
+        out.append(f'{py_ident} = """{text}"""')
         out.append("")
-    text = "\n".join(out).rstrip("\n") + "\n"
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _cpp_header(entries) -> str:
+    """The same checked-in ONNX text, as C++ string-literal constants --
+    onnxsim/graph_grad.cpp reads these with onnx::OnnxParser::Parse (the
+    full onnx.defs.parser text format, not the per-statement-line format
+    generate_moe_function_templates.py's own header needs for
+    onnx::FunctionBuilder): the checked-in text is identical between the two
+    languages, only the wrapper differs."""
+    out = []
+    out.append("// SPDX-License-Identifier: Apache-2.0")
+    out.append("//")
+    out.append(
+        "// GENERATED FILE -- do not edit by hand. Produced by\n"
+        "//   python3 scripts/codegen/generate_grad_templates.py\n"
+        "// from the onnxscript function definitions in that script; see its\n"
+        "// module docstring for what this is and why it takes no ONNX-level\n"
+        "// attributes. graph_grad_templates_gen.py is the same text for the\n"
+        "// Python side -- both are produced from the same entries so they\n"
+        "// cannot drift from each other."
+    )
+    out.append("#ifndef ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_")
+    out.append("#define ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_")
+    out.append("")
+    out.append(
+        "// No enclosing namespace -- graph_grad.cpp, this header's only"
+        " consumer, has\n// none either (it mirrors graph_grad.py's flat"
+        " module directly)."
+    )
+    for _py_ident, cpp_ident, text in entries:
+        out.append(f'constexpr const char* {cpp_ident} = R"GRAD_TPL({text})GRAD_TPL";')
+        out.append("")
+    out.append("#endif  // ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_")
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def main() -> None:
+    _validate_grad_add()
+    _validate_grad_batch_normalization()
+
+    entries = [
+        (py_ident, cpp_ident, onnx.printer.to_text(fn.to_function_proto()))
+        for py_ident, cpp_ident, fn in _ENTRIES
+    ]
 
     argv = sys.argv[1:]
-    if argv:
-        with open(argv[0], "w") as f:
-            f.write(text)
-    else:
-        sys.stdout.write(text)
+    if not argv:
+        sys.stdout.write(_python_module(entries))
+        return
+    with open(argv[0], "w") as f:
+        f.write(_python_module(entries))
+    if len(argv) > 1:
+        with open(argv[1], "w") as f:
+            f.write(_cpp_header(entries))
 
 
 if __name__ == "__main__":

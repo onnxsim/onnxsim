@@ -1913,6 +1913,8 @@ def _grad_batch_normalization_templated(
             bcast(scale),
             ctx.b.const(eps),
             channel_axes,
+            ctx.b.const(1.0),
+            ctx.b.const(-0.5),
         ],
     )
     return [dx, dscale, dbias, dmean, dvar]
