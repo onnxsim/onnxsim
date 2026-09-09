@@ -4698,8 +4698,43 @@ Table sizes agree independently: 192,889,348 bytes for a layer of about
 177.2M parameters is 1.09 bytes per parameter at `s8`, and the `s4` build of
 the same layer is 97,952,260 -- almost exactly half.
 
-That takes the LLM path from nothing to a known weight encoding. What is not
-yet known there is the addressing: which byte holds which weight. The
+That takes the LLM path from nothing to a known weight encoding.
+
+**The addressing is half-scale, and measured but not yet complete.**
+Single-weight probes on a small synthetic checkpoint give the index costs
+directly. Every one is exactly half its convolution-pipeline counterpart:
+
+| quantity | convolution | `llm_build` |
+| --- | --- | --- |
+| plane gap | 36 | **18** |
+| chunk size | 36 | **18** |
+| chunk stride | 144 | **72** |
+| the "special bit" | 72 | **36** |
+| `A` | `144*ceil((Cin/2)/36)` | `72*ceil((Cin/2)/18)` |
+
+Those are read off the probes, not fitted: a column at index 64 lands 86
+bytes in, which is `72*1 + 14` under chunking at 18, and index 128 lands at
+226, which is `72*3 + 10`. Row bits cost 576, 1152, 2304, 4608 for bits 0-3,
+36 for bit 4, then 9728, 19456, 38912.
+
+**The addressing is solved.** Scored by correlation per output row -- which
+tests the index without depending on the quantiser -- the map reads **every
+row of a 256x256 matmul at 1.0000**, all 256 of them. The index is linear in
+the bits, confirmed directly: row 17 costs 612, which is row 1's 576 plus row
+16's 36.
+
+An earlier reading of this section reported 45% and called the addressing
+unclosed. That number was an *exactness* score, and what it was measuring was
+the quantiser, not the index -- a scale-invariant metric would have separated
+the two immediately.
+
+**The quantiser is the part still open.** Its magnitude is `peak/128`, not
+the convolution pipeline's `peak/127.5`. About half the rows are additionally
+stored **negated**, in a pattern that nearly but not exactly follows the sign
+of each row's largest-magnitude element (using that sign directly reproduces
+93.3% of codes; using the measured per-row signs reproduces 94.7%). So the
+residue is a sign convention plus rounding, on top of an index that is fully
+understood. The
 convolution work needed single-weight probes for that, and `llm_build` takes
 a checkpoint rather than a graph, so the same trick needs a synthetic
 checkpoint per probe -- slower, but no different in kind.
@@ -4729,12 +4764,63 @@ An extent of 25 reads at 32 channels and not at 64; an extent of 19 reads at
 alone, but their product against some tile -- the same shape of interaction
 the polyphase finding turned out to be.
 
-That suggests the likely answer: a convolution whose dilated footprint
-outgrows the input tile is **decomposed**, exactly as a strided transposed
-convolution is decomposed into phases. If so, the remaining layers are not a
-new layout at all, only the existing one applied to sub-convolutions, and the
-probe that settles it is the one that settled `ConvTranspose` -- flip a
-single weight and see how many separate regions move.
+That suggested a decomposition, and it is one -- see the next section.
+
+### A widely dilated convolution is K convolutions
+
+Flipping one weight and counting how many separate byte regions move settles
+it, and the count is the whole argument:
+
+| convolution | dilation | regions that move |
+| --- | --- | --- |
+| 64ch, `K=3` | 1 | 2 (the weight, and the scales) |
+| 64ch, `K=7` | 3 | **8** |
+| 64ch, `K=5` | 6 | **6** |
+
+Eight regions at `K = 7` and six at `K = 5`: **one per kernel tap**, plus the
+scales. Not one per dilation, which is the decomposition one might guess
+first -- `d` is 3 and 6 in those two rows, and neither matches.
+
+So once a dilated kernel's footprint outgrows what one input tile holds, the
+convolution is compiled as **K separate single-tap convolutions**, each laid
+out as an ordinary `K = 1` block. The same move as the polyphase split of a
+strided transposed convolution, along a different axis.
+
+(A single weight perturbs *every* region because it shifts the layer's output
+range slightly, and each sub-block carries its own requantisation multiplier.
+That is why the region count is visible from a one-weight change at all.)
+
+**Reading each tap as its own block takes the vocoder to 19 of 23 layers and
+62.5% of its weights**, from 14 and 50.5% (and to 20 and 67.5% once input
+splitting is added, below). Layers that had resisted from the
+start -- `(64,64,7)` at dilation 12, `(32,32,7)` at dilation 12,
+`(128,128,7)` at dilation 3 -- read at 0.9971 to 0.9999.
+
+**The split is two-dimensional.** Counting regions for the layers that still
+failed shows the sub-block count is not always `K`:
+
+| convolution | dilation | sub-blocks |
+| --- | --- | --- |
+| 128ch, `K=7` | 3 | 7 (one per tap) |
+| 128ch, `K=5` | 2 | **2** (input halves, taps together) |
+| 128ch, `K=7` | 12 | **21** (7 taps x 3 input groups) |
+
+So a convolution is split along taps *and* along input channels, by whatever
+the tiling needs. Adding input-group splits to the reader -- trying 1, 2 and
+4 groups -- takes the vocoder to **20 of 23 layers and 67.5% of its
+weights**.
+
+**Three remain**: `conv_pre` at `(256,192,7)`, `(128,128,5)` at dilation 6,
+and `(128,128,7)` at dilation 12. The last two are close rather than opaque:
+15 of 20 and 25 of 28 of their sub-blocks locate individually at 1.0000, and
+the misses look like search collisions -- with four input groups a block is
+only 32 channels wide, which is a 16-byte pattern, short enough for a
+whole-table scan to find a false maximum. Confirming them needs a sharper
+search rather than a new rule.
+
+Test: `test_a_widely_dilated_conv_splits_into_single_tap_convolutions`
+(Docker, no device), which counts regions rather than searching for them --
+the count is the claim, and it is robust where a base-offset search is not.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
