@@ -53,6 +53,7 @@
 // reuses, copied out immediately.
 
 import { loadOrt } from "./inference_browser.mjs";
+import { discoverLoraBlocks } from "./lora_blocks.mjs";
 import { primaryGraphInput, readGraph } from "./qat_blocks.mjs";
 import {
   adamBiasCorrections,
@@ -249,50 +250,43 @@ export function buildLoraStepPlan(
   return copyLoraPlan(built);
 }
 
-// Train one LoRA adapter end to end: inject, build the step graph, run the
-// loop, write the trained state back, release the plan.
+// Train one already-injected model's block: build its step graph, run the
+// loop, write the trained state back, release the plan. The piece
+// trainLoraAdapter's single-block call and trainLoraAdapterAllBlocks' loop
+// (over lora_blocks.mjs's own proposal) both reduce to -- injection happens
+// once, before either, since InjectLora is a whole-model pass with nothing
+// block-specific about it.
 //
-// This is lora_entry.h's whole "intended browser flow" as one call, the way
-// qat_finetune.mjs's fineTuneBlock is BuildQatStepGraph's. The one training
-// mode implemented is reference-model distillation
+// `injectedBytes`/`adapter` are what injectLoraAdapter (or a previous call to
+// this function, chained -- see trainLoraAdapterAllBlocks) returned.
+// `adapter` may be the whole array or a caller-narrowed subset
+// (lora_blocks.mjs's own `targetOutputs` filtered against it): only the
+// targets passed are trained, exactly as onnxsim_lora_build_step_graph's own
+// contract says.
+//
+// The one training mode implemented is reference-model distillation
 // (`train_lora(..., reference_model=...)`'s browser equivalent): the block's
 // reconstruction target is captured from `referenceBytes` at `blockOutput`,
 // on the same calibration rows fed to the injected model. Caller-supplied
 // `target_data` (train_lora's other, mutually exclusive mode -- the loss
 // target handed in directly rather than read off a reference model, i.e.
-// genuine supervised fine-tuning against labels) is not implemented: it
-// needs a target-array plumbing path with no natural place in a rowFeeds-only
-// contract, and reference-model distillation is both the simpler surface and
-// the more common browser ask ("make this adapter reproduce the float
-// model"). A `targetData` argument to this function is refused rather than
-// silently ignored, so a caller relying on it fails loudly instead of
-// training against nothing.
+// genuine supervised fine-tuning against labels) is not implemented here;
+// see trainLoraAdapter's own doc comment for why.
 //
-// `baseBytes` is the model to inject into; `referenceBytes` defaults to
-// `baseBytes` itself (the ordinary case: the adapter should reproduce the
-// *same* model's own behaviour on rows the base model was not exactly
-// evaluated on post-injection -- injection alone is a numeric no-op, since
-// `B` starts at zero, so at step 0 the injected model already agrees with
-// the reference exactly and the loss starts there). A caller doing real
-// distillation against a different (larger, or differently fine-tuned) model
-// passes that model's bytes instead.
-//
-// `blockInput`/`blockOutput` default to the injected model's own graph
-// input/output (wholeGraphBlock) -- train the whole model as one block,
-// InjectLora's own scope. `rowFeeds` are the calibration rows
-// (buildCalibrationRows); `injectOptions` is InjectLoraOptions, `options` is
-// LoraOptions, and `rates` is loraStepScalars' own options.
-//
-// Returns { bytes, losses, adapter, plan }. The plan is always released,
-// including on a failure: nothing expires on its own, and a page training
-// adapter after adapter would otherwise keep every step graph it ever built.
-export async function trainLoraAdapter(runtime, {
-  baseBytes,
-  referenceBytes = null,
-  targetData = null,
-  injectOptions = {},
-  blockInput = null,
-  blockOutput = null,
+// Returns { bytes, losses }. `bytes` is the injected model with this block's
+// adapter tensors written back -- feed it into the next block's own call as
+// its `injectedBytes` to keep a multi-block run's writes visible to later
+// blocks, the same "recapture from the student after previous blocks were
+// tuned" sequencing docs/qat.md measures as better than capturing once. The
+// plan is always released, including on a failure: nothing expires on its
+// own, and a page training block after block would otherwise keep every step
+// graph it ever built.
+export async function trainLoraBlock(runtime, {
+  injectedBytes,
+  adapter,
+  referenceBytes,
+  blockInput,
+  blockOutput,
   rowFeeds,
   options = {},
   numSteps = 200,
@@ -303,33 +297,13 @@ export async function trainLoraAdapter(runtime, {
   log = () => {},
   onStep = () => {},
 }) {
-  if (targetData != null) {
-    throw new Error(
-      "target_data training is not implemented in the browser panel yet -- " +
-        "pass referenceBytes for reference-model distillation instead " +
-        "(see trainLoraAdapter's own doc comment)",
-    );
-  }
-  const teacherBytes = referenceBytes || baseBytes;
   const numRows = rowFeeds.length;
-
-  const injected = injectLoraAdapter(runtime, baseBytes, injectOptions);
-  const injectedBytes = injected.bytes;
-
-  let blockIn = blockInput;
-  let blockOut = blockOutput;
-  if (!blockIn || !blockOut) {
-    const whole = wholeGraphBlock(injectedBytes);
-    blockIn = blockIn || whole.input;
-    blockOut = blockOut || whole.output;
-  }
-
   const plan = buildLoraStepPlan(
     runtime,
     injectedBytes,
-    injected.adapter,
-    blockIn,
-    blockOut,
+    adapter,
+    blockInput,
+    blockOutput,
     numRows,
     options,
   );
@@ -340,7 +314,7 @@ export async function trainLoraAdapter(runtime, {
       ort,
       runtime,
       injectedBytes,
-      teacherBytes,
+      referenceBytes,
       plan.captures,
       rowFeeds,
       { providers, log },
@@ -401,10 +375,181 @@ export async function trainLoraAdapter(runtime, {
     return {
       bytes: new Uint8Array(written).slice(),
       losses,
-      adapter: injected.adapter,
       plan,
     };
   } finally {
     runtime.onnxsim_lora_release_plan(plan.planHandle);
   }
+}
+
+// Train one LoRA adapter end to end, over one block: inject, then
+// trainLoraBlock once. This is lora_entry.h's whole "intended browser flow"
+// as one call, the way qat_finetune.mjs's fineTuneBlock is
+// BuildQatStepGraph's -- see trainLoraBlock's own doc comment for the
+// training-mode/argument notes that still apply here unchanged, and
+// trainLoraAdapterAllBlocks below for training more than one block in a run.
+//
+// `baseBytes` is the model to inject into; `referenceBytes` defaults to
+// `baseBytes` itself (the ordinary case: the adapter should reproduce the
+// *same* model's own behaviour on rows the base model was not exactly
+// evaluated on post-injection -- injection alone is a numeric no-op, since
+// `B` starts at zero, so at step 0 the injected model already agrees with
+// the reference exactly and the loss starts there). A caller doing real
+// distillation against a different (larger, or differently fine-tuned) model
+// passes that model's bytes instead.
+//
+// `blockInput`/`blockOutput` default to the injected model's own graph
+// input/output (wholeGraphBlock) -- train the whole model as one block,
+// InjectLora's own scope.
+//
+// Returns { bytes, losses, adapter, plan } -- `adapter` is every target
+// InjectLora produced (trainLoraBlock's own return has no such field, since
+// a caller driving several blocks already has the adapter array from
+// injectLoraAdapter and would only be handed the same thing back unchanged).
+export async function trainLoraAdapter(runtime, {
+  baseBytes,
+  referenceBytes = null,
+  targetData = null,
+  injectOptions = {},
+  blockInput = null,
+  blockOutput = null,
+  rowFeeds,
+  options = {},
+  numSteps = 200,
+  rates = {},
+  providers = ["wasm"],
+  needWebnn = false,
+  ortLoader = loadOrt,
+  log = () => {},
+  onStep = () => {},
+}) {
+  if (targetData != null) {
+    throw new Error(
+      "target_data training is not implemented in the browser panel yet -- " +
+        "pass referenceBytes for reference-model distillation instead " +
+        "(see trainLoraBlock's own doc comment)",
+    );
+  }
+  const injected = injectLoraAdapter(runtime, baseBytes, injectOptions);
+  const injectedBytes = injected.bytes;
+
+  let blockIn = blockInput;
+  let blockOut = blockOutput;
+  if (!blockIn || !blockOut) {
+    const whole = wholeGraphBlock(injectedBytes);
+    blockIn = blockIn || whole.input;
+    blockOut = blockOut || whole.output;
+  }
+
+  const result = await trainLoraBlock(runtime, {
+    injectedBytes,
+    adapter: injected.adapter,
+    referenceBytes: referenceBytes || baseBytes,
+    blockInput: blockIn,
+    blockOutput: blockOut,
+    rowFeeds,
+    options,
+    numSteps,
+    rates,
+    providers,
+    needWebnn,
+    ortLoader,
+    log,
+    onStep,
+  });
+  return { ...result, adapter: injected.adapter };
+}
+
+// Train every block lora_blocks.mjs's discoverLoraBlocks proposes, in graph
+// order -- trainLoraAdapter lifted from one block to a model whose injected
+// adapters are spread too widely (or through enough undifferentiable ops)
+// for the whole-model default to reach in one call.
+//
+// Each block's write-back is visible to the next: `injectedBytes` is
+// threaded through the loop rather than re-read from the original
+// injection, the sequential walk apply_qat_all_blocks/docs/qat.md both
+// measure as better than capturing every block once from the same
+// unmodified model.
+//
+// A block onnxsim_lora_build_step_graph refuses (an op with no gradient
+// rule that discovery's own DIFFERENTIABLE_OPS pre-filter missed, say) is
+// skipped rather than failing the run -- discoverBlocks' own gap-not-failure
+// principle, one level up: a proposal that turns out untrainable costs that
+// block, not the page's whole result. `onBlockStart`/`onBlockDone` let the
+// caller report progress per block, in addition to `onStep`'s per-iteration
+// calls within one.
+//
+// Returns { bytes, losses, adapter, results }. `losses` concatenates every
+// trained block's own loss trace in order; `results` is one entry per
+// proposed block ({ block, trained, skippedReason, losses }), mirroring
+// apply_qat_all_blocks' own QATBlockResult so a caller can report exactly
+// what happened to each proposal.
+export async function trainLoraAdapterAllBlocks(runtime, {
+  baseBytes,
+  referenceBytes = null,
+  targetData = null,
+  injectOptions = {},
+  maxTargetsPerBlock = 2,
+  rowFeeds,
+  options = {},
+  numSteps = 200,
+  rates = {},
+  providers = ["wasm"],
+  needWebnn = false,
+  ortLoader = loadOrt,
+  log = () => {},
+  onStep = () => {},
+  onBlockStart = () => {},
+  onBlockDone = () => {},
+}) {
+  if (targetData != null) {
+    throw new Error(
+      "target_data training is not implemented in the browser panel yet -- " +
+        "pass referenceBytes for reference-model distillation instead " +
+        "(see trainLoraBlock's own doc comment)",
+    );
+  }
+  const injected = injectLoraAdapter(runtime, baseBytes, injectOptions);
+  let injectedBytes = injected.bytes;
+  const teacherBytes = referenceBytes || baseBytes;
+
+  const proposals = discoverLoraBlocks(injectedBytes, injected.adapter, { maxTargetsPerBlock });
+  const allLosses = [];
+  const results = [];
+  for (let i = 0; i < proposals.length; i++) {
+    const proposal = proposals[i];
+    onBlockStart(i, proposals.length, proposal);
+    const blockAdapter = injected.adapter.filter((t) => proposal.targetOutputs.includes(t.nodeOutput));
+    try {
+      const result = await trainLoraBlock(runtime, {
+        injectedBytes,
+        adapter: blockAdapter,
+        referenceBytes: teacherBytes,
+        blockInput: proposal.input,
+        blockOutput: proposal.output,
+        rowFeeds,
+        options,
+        numSteps,
+        rates,
+        providers,
+        needWebnn,
+        ortLoader,
+        log,
+        onStep: (t, loss) => onStep(i, proposals.length, t, loss),
+      });
+      injectedBytes = result.bytes;
+      allLosses.push(...result.losses);
+      results.push({ block: proposal, trained: true, skippedReason: null, losses: result.losses });
+    } catch (blockErr) {
+      results.push({
+        block: proposal,
+        trained: false,
+        skippedReason: blockErr.message,
+        losses: [],
+      });
+    }
+    onBlockDone(i, proposals.length, results[results.length - 1]);
+  }
+
+  return { bytes: injectedBytes, losses: allLosses, adapter: injected.adapter, results };
 }

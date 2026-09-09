@@ -622,10 +622,12 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <input type="text" id="lora-target-names" placeholder="w1, w2, ... (comma-separated)" style="width: 16em;">
             </div>
             <div>
-                <label for="lora-block-input" title="Leave both blank to train the whole model as one block, InjectLora's own scope -- the graph's own input/output tensor.">block input tensor</label>
-                <input type="text" id="lora-block-input" placeholder="(whole model)" style="width: 12em;">
+                <label for="lora-block-input" title="Leave both blank to discover blocks automatically: the graph is cut wherever exactly one activation is live, which is the boundary a self-contained slice needs -- the same liveness argument the QAT panel's own auto-discovery uses.">block input tensor</label>
+                <input type="text" id="lora-block-input" placeholder="(auto-discover)" style="width: 12em;">
                 <label for="lora-block-output">block output tensor</label>
-                <input type="text" id="lora-block-output" placeholder="(whole model)" style="width: 12em;">
+                <input type="text" id="lora-block-output" placeholder="(auto-discover)" style="width: 12em;">
+                <label for="lora-max-targets" title="How many injected adapters to merge into one block before closing it. 1 gives per-adapter blocks; a large value gives one block per gap between undifferentiable ops -- on a model with no such gap, the whole graph as a single block.">adapters per block</label>
+                <input type="number" id="lora-max-targets" value="2" min="1" max="16" step="1" style="width: 4em;">
             </div>
             <div>
                 <label for="lora-rows" title="Calibration rows captured from the base and reference models and held resident for the whole loop.">calibration rows</label>

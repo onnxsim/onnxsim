@@ -37,6 +37,7 @@ const {
   renderLossCurve,
   runStepLoop,
   trainLoraAdapter,
+  trainLoraAdapterAllBlocks,
   wholeGraphBlock,
 } = await import("../lora_finetune.mjs");
 const qat = await import("../qat_finetune.mjs");
@@ -296,8 +297,23 @@ function bytesField(field, bytes) {
 }
 const utf8 = new TextEncoder();
 const strField = (field, s) => bytesField(field, [...utf8.encode(s)]);
-function makeModel({ inputs = [], outputs = [] }) {
+// NodeProto: input = 1, output = 2, name = 3, op_type = 4; TensorProto.name
+// = 8 -- the extra fields makeModel below carries for
+// trainLoraAdapterAllBlocks' own tests further down, which need real nodes
+// for discoverLoraBlocks to find real cuts in (wholeGraphBlock's own tests
+// above only ever read the graph's input/output list).
+function makeNode(opType, inputs, outputs) {
+  return [
+    ...inputs.flatMap((n) => strField(1, n)),
+    ...outputs.flatMap((n) => strField(2, n)),
+    ...strField(3, outputs[0] || opType),
+    ...strField(4, opType),
+  ];
+}
+function makeModel({ nodes = [], initializers = [], inputs = [], outputs = [] }) {
   const graph = [
+    ...nodes.flatMap((n) => bytesField(1, n)),
+    ...initializers.flatMap((n) => bytesField(5, strField(8, n))),
     ...inputs.flatMap((n) => bytesField(11, strField(1, n))),
     ...outputs.flatMap((n) => bytesField(12, strField(1, n))),
   ];
@@ -514,6 +530,218 @@ await check("a refused block reports the refusal rather than returning null", as
     () => buildLoraStepPlan(runtime, new Uint8Array([1]), [], "X", "X", 2, {}),
     /could not build a LoRA step graph for X → X/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// trainLoraAdapterAllBlocks: the multi-block loop over lora_blocks.mjs's own
+// discoverLoraBlocks. Reuses makeNode/makeModel above -- discoverLoraBlocks
+// needs a real graph to find real cuts in, unlike every `built` step-graph
+// fixture in this section (those are the wasm binding's own return value,
+// entirely under this test's control regardless of what the graph actually
+// contains).
+
+// X -> MatMul -> h (adapter #1) -> MatMul -> Y (adapter #2), the same shape
+// lora_blocks.test.mjs's own INJECTED_CHAIN uses -- discoverLoraBlocks finds
+// two per-target blocks here at maxTargetsPerBlock: 1.
+const TWO_BLOCK_MODEL = makeModel({
+  nodes: [makeNode("MatMul", ["X", "W1"], ["h"]), makeNode("MatMul", ["h", "W2"], ["Y"])],
+  initializers: ["W1", "W2"],
+  inputs: ["X"],
+  outputs: ["Y"],
+});
+
+await check("trainLoraAdapterAllBlocks trains every discovered block in order, chaining writes", async () => {
+  const adapter = [
+    { weightName: "w1", nodeOutput: "h", loraAName: "w1.lora_A", loraBName: "w1.lora_B", rank: 4 },
+    { weightName: "w2", nodeOutput: "Y", loraAName: "w2.lora_A", loraBName: "w2.lora_B", rank: 4 },
+  ];
+  // Every block's own capture is defined to read "X" (a real graph input of
+  // TWO_BLOCK_MODEL) so captureActivations' graph-input fast path resolves
+  // it straight from rowFeeds with no session run needed -- the fixture is
+  // free to be this simple because a `built` object is the wasm binding's
+  // own mocked return value, not something derived from the real graph
+  // (discoverLoraBlocks, the one piece that reads the real graph, is
+  // exercised for real above it).
+  const makeBuilt = (handle, state) => ({
+    planHandle: handle,
+    stepGraph: new Uint8Array([9, handle]),
+    state,
+    scalars: ["lora__lr", "m_correction", "v_correction"],
+    loss: "lora__loss",
+    captures: [
+      { input: "lora__X", source: "X", dims: [1, 1], teacher: false },
+      { input: "lora__teacher", source: "Y", dims: [1, 1], teacher: true },
+    ],
+    initialState: [
+      { name: state[0].input, dtype: 1, dims: [1], data: new Uint8Array(new Float32Array([0]).buffer) },
+    ],
+    rowIndexInput: "",
+    rowIndexSize: 0,
+    numRows: 1,
+    parameters: [state[0].input],
+  });
+  const built1 = makeBuilt(21, [{ input: "w1.lora_A", output: "w1.lora_A_next" }]);
+  const built2 = makeBuilt(22, [{ input: "w2.lora_A", output: "w2.lora_A_next" }]);
+
+  const calls = [];
+  let injectCallCount = 0;
+  const runtime = {
+    onnxsim_add_graph_outputs: () => new Uint8Array([0]).buffer,
+    onnxsim_lora_inject(bytes, options) {
+      injectCallCount += 1;
+      calls.push(["inject", options]);
+      return { model: TWO_BLOCK_MODEL, adapter };
+    },
+    onnxsim_lora_build_step_graph(bytes, adapterArg, blockInput, blockOutput, numRows, options) {
+      calls.push(["build", blockInput, blockOutput, adapterArg.map((t) => t.nodeOutput)]);
+      if (blockInput === "X" && blockOutput === "h") return built1;
+      if (blockInput === "h" && blockOutput === "Y") return built2;
+      return null;
+    },
+    onnxsim_lora_write_back(bytes, handle) {
+      calls.push(["write_back", handle]);
+      // Tagged so the *next* block's build call is provably fed this
+      // block's own write-back rather than the original injected bytes --
+      // the "recapture from the student after previous blocks were tuned"
+      // sequencing this function's own doc comment promises.
+      return new Uint8Array([100, handle]);
+    },
+    onnxsim_lora_release_plan(handle) {
+      calls.push(["release", handle]);
+      return true;
+    },
+  };
+
+  const graph1 = fakeStepGraph(built1.state);
+  const graph2 = fakeStepGraph(built2.state);
+  const ort = fakeOrt({});
+  // Keyed by shape rather than by a single byte: the step graphs ([9,
+  // handle]) and write_back's own tagged output ([100, handle]) are both
+  // two bytes long, and 21/22 collide across the two purposes if only
+  // bytes[1] is compared -- see the block below.
+  ort.InferenceSession.create = async (bytes) => {
+    if (bytes.length === 2 && bytes[0] === 9) {
+      return bytes[1] === 21
+        ? { inputNames: [], outputNames: [], run: graph1.runStep }
+        : { inputNames: [], outputNames: [], run: graph2.runStep };
+    }
+    if (bytes.length === 1) {
+      // the reference model (baseBytes itself), queried once per block for
+      // its teacher capture
+      return { inputNames: [], outputNames: [], async run() { return { Y: tensor([1, 1], [9]) }; } };
+    }
+    // the injected model -- TWO_BLOCK_MODEL's own bytes for block 1, or
+    // write_back's [100, handle] tag standing in for it for block 2 onward.
+    // "X" is a real graph input of TWO_BLOCK_MODEL and every `built` fixture
+    // above names it as the block-external capture's source regardless of
+    // which block, so this always hits captureActivations' own graph-input
+    // fast path -- no augmented session, no model actually run.
+    return { inputNames: ["X"], outputNames: [], async run() { return {}; } };
+  };
+
+  const result = await trainLoraAdapterAllBlocks(runtime, {
+    baseBytes: new Uint8Array([1]),
+    maxTargetsPerBlock: 1,
+    rowFeeds: [{ X: tensor([1, 1], [1]) }],
+    numSteps: 1,
+    rates: { learningRate: 1e-3 },
+    ortLoader: async () => ort,
+  });
+
+  assert.equal(injectCallCount, 1, "InjectLora runs once for the whole run, not once per block");
+  const builds = calls.filter((c) => c[0] === "build");
+  assert.deepEqual(
+    builds.map((c) => c.slice(1)),
+    [
+      ["X", "h", ["h"]], // block 1 trains only its own target
+      ["h", "Y", ["Y"]], // block 2 trains only its own
+    ],
+  );
+  // Block 2's build call is proof the loop threaded block 1's write-back
+  // forward: onnxsim_lora_write_back tagged its output [100, 21], and that
+  // is exactly the `bytes` build_step_graph's own mock never inspects but
+  // this assertion does, by construction of the call order above -- the
+  // stronger, more direct check is that write_back and release both fire
+  // twice, once per block, in build/write_back/release order each time.
+  assert.deepEqual(
+    calls.map((c) => c[0]),
+    ["inject", "build", "write_back", "release", "build", "write_back", "release"],
+  );
+  assert.equal(result.results.length, 2);
+  assert.ok(result.results.every((r) => r.trained));
+  assert.equal(result.losses.length, 2, "one loss per block, one step each");
+  assert.deepEqual([...result.bytes], [100, 22], "the final bytes are the last block's write-back");
+});
+
+await check("trainLoraAdapterAllBlocks skips a block build_step_graph refuses and continues", async () => {
+  const adapter = [
+    { weightName: "w1", nodeOutput: "h", loraAName: "w1.lora_A", loraBName: "w1.lora_B", rank: 4 },
+    { weightName: "w2", nodeOutput: "Y", loraAName: "w2.lora_A", loraBName: "w2.lora_B", rank: 4 },
+  ];
+  const built2 = {
+    planHandle: 22,
+    stepGraph: new Uint8Array([9, 22]),
+    state: [{ input: "w2.lora_A", output: "w2.lora_A_next" }],
+    scalars: ["lora__lr", "m_correction", "v_correction"],
+    loss: "lora__loss",
+    captures: [
+      { input: "lora__X", source: "X", dims: [1, 1], teacher: false },
+      { input: "lora__teacher", source: "Y", dims: [1, 1], teacher: true },
+    ],
+    initialState: [
+      { name: "w2.lora_A", dtype: 1, dims: [1], data: new Uint8Array(new Float32Array([0]).buffer) },
+    ],
+    rowIndexInput: "",
+    rowIndexSize: 0,
+    numRows: 1,
+    parameters: ["w2.lora_A"],
+  };
+  const calls = [];
+  const runtime = {
+    onnxsim_add_graph_outputs: () => new Uint8Array([0]).buffer,
+    onnxsim_lora_inject: () => ({ model: TWO_BLOCK_MODEL, adapter }),
+    onnxsim_lora_build_step_graph(bytes, adapterArg, blockInput, blockOutput) {
+      calls.push(["build", blockInput, blockOutput]);
+      if (blockInput === "X" && blockOutput === "h") return null; // refused
+      if (blockInput === "h" && blockOutput === "Y") return built2;
+      return null;
+    },
+    onnxsim_lora_write_back: () => new Uint8Array([100, 22]),
+    onnxsim_lora_release_plan(handle) {
+      calls.push(["release", handle]);
+      return true;
+    },
+  };
+
+  const graph2 = fakeStepGraph(built2.state);
+  const ort = fakeOrt({});
+  ort.InferenceSession.create = async (bytes) => {
+    if (bytes.length === 2 && bytes[0] === 9 && bytes[1] === 22) {
+      return { inputNames: [], outputNames: [], run: graph2.runStep };
+    }
+    if (bytes.length === 1) {
+      return { inputNames: [], outputNames: [], async run() { return { Y: tensor([1, 1], [9]) }; } };
+    }
+    // the injected model (TWO_BLOCK_MODEL itself -- block 1 is refused
+    // before it ever writes back, so block 2 still sees the original bytes)
+    return { inputNames: ["X"], outputNames: [], async run() { return {}; } };
+  };
+
+  const result = await trainLoraAdapterAllBlocks(runtime, {
+    baseBytes: new Uint8Array([1]),
+    maxTargetsPerBlock: 1,
+    rowFeeds: [{ X: tensor([1, 1], [1]) }],
+    numSteps: 1,
+    ortLoader: async () => ort,
+  });
+
+  assert.equal(result.results.length, 2);
+  assert.equal(result.results[0].trained, false);
+  assert.match(result.results[0].skippedReason, /could not build a LoRA step graph for X → h/);
+  assert.equal(result.results[1].trained, true);
+  assert.equal(result.losses.length, 1, "only the trained block contributes a loss");
+  // The refused block never reached write_back/release; the trained one did.
+  assert.deepEqual(calls.map((c) => c[0]), ["build", "build", "release"]);
 });
 
 console.log(`\nlora_finetune: ${passed} checks passed`);

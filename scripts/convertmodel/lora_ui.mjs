@@ -36,6 +36,18 @@
 // window.__onnxsimLoraTrained -- independent of the Quantize and QAT panels'
 // own outputs, and never overwriting them.
 //
+// **Block boundaries**, like the QAT panel's own: a caller-named tensor pair
+// trains exactly that one block; leaving both fields blank discovers blocks
+// via lora_blocks.mjs's discoverLoraBlocks (a liveness-cut walk over the
+// *injected* model, closing a block once it has accumulated
+// "adapters per block" of the adapter's own targets -- lora_blocks.mjs's own
+// header has the full argument, ported from qat_blocks.mjs's identical one
+// for QAT) and trains each discovered block in turn via
+// trainLoraAdapterAllBlocks, the same "propose then train every block,
+// skipping one build_step_graph refuses rather than aborting the run" shape
+// the QAT panel's own button handler already has inline. A block that turns
+// out untrainable is skipped and reported, not fatal to the others.
+//
 // **Two things this panel does not do**, both flagged in the panel's own
 // static copy in index.html rather than only here: it has no QLoRA
 // (NF4-quantized base) composition wired in -- onnxsim.nf4's quantizer has
@@ -48,7 +60,12 @@
 
 import { downloadBytes } from "./download.mjs";
 import { resolveOriginalModelBytes, loadOrt } from "./inference_browser.mjs";
-import { buildCalibrationRows, renderLossCurve, trainLoraAdapter } from "./lora_finetune.mjs";
+import {
+  buildCalibrationRows,
+  renderLossCurve,
+  trainLoraAdapter,
+  trainLoraAdapterAllBlocks,
+} from "./lora_finetune.mjs";
 import { computeQuantizationQuality, renderQuantizationQuality } from "./quantize_metrics.mjs";
 import { providersForEp, isWebnnEp } from "./webnn.mjs";
 
@@ -198,35 +215,93 @@ function initLoraPanel() {
         log: setStatus,
       });
 
-      setStatus("injecting adapter and training…");
-      const result = await trainLoraAdapter(runtime, {
-        baseBytes,
-        referenceBytes,
-        injectOptions,
-        blockInput,
-        blockOutput,
-        rowFeeds,
-        options,
-        numSteps,
-        rates,
-        providers,
-        needWebnn,
-        log: setStatus,
-        onStep: (t, loss) => {
-          if (t % 10 === 0) {
-            setStatus(
-              `step ${t + 1}/${numSteps}` + (loss != null ? `, loss ${loss.toPrecision(4)}` : "") +
-                "…",
-            );
-          }
-        },
-      });
+      // Either the two tensor names the user typed (one block, exactly as
+      // before), or lora_blocks.mjs's own liveness-cut proposal over the
+      // injected model -- the QAT panel's own default shape, ported: leaving
+      // both blank discovers blocks rather than assuming the whole graph is
+      // the right unit, since a model whose injected adapters are spread
+      // across enough undifferentiable ops has no other way to train more
+      // than the first reachable one.
+      let result;
+      let skipped = [];
+      if (blockInput && blockOutput) {
+        setStatus("injecting adapter and training…");
+        result = await trainLoraAdapter(runtime, {
+          baseBytes,
+          referenceBytes,
+          injectOptions,
+          blockInput,
+          blockOutput,
+          rowFeeds,
+          options,
+          numSteps,
+          rates,
+          providers,
+          needWebnn,
+          log: setStatus,
+          onStep: (t, loss) => {
+            if (t % 10 === 0) {
+              setStatus(
+                `step ${t + 1}/${numSteps}` +
+                  (loss != null ? `, loss ${loss.toPrecision(4)}` : "") + "…",
+              );
+            }
+          },
+        });
+      } else {
+        const maxTargetsPerBlock = Math.max(
+          1,
+          parseInt((el("lora-max-targets") || {}).value || "2", 10) || 2,
+        );
+        setStatus("injecting adapter and discovering blocks…");
+        result = await trainLoraAdapterAllBlocks(runtime, {
+          baseBytes,
+          referenceBytes,
+          injectOptions,
+          maxTargetsPerBlock,
+          rowFeeds,
+          options,
+          numSteps,
+          rates,
+          providers,
+          needWebnn,
+          log: setStatus,
+          onStep: (i, total, t, loss) => {
+            if (t % 10 === 0) {
+              setStatus(
+                `block ${i + 1}/${total}: step ${t + 1}/${numSteps}` +
+                  (loss != null ? `, loss ${loss.toPrecision(4)}` : "") + "…",
+              );
+            }
+          },
+        });
+        if (result.results.length === 0) {
+          setStatus(
+            "no trainable block found in this model -- its activations never narrow to a " +
+              "single live tensor with an injected adapter behind it, so there is nowhere " +
+              "to cut. Name a block's input and output tensor explicitly to train one anyway.",
+          );
+          return;
+        }
+        // A block onnxsim_lora_build_step_graph refuses (an op with no
+        // gradient rule discoverLoraBlocks' own pre-filter missed, say) is a
+        // block to skip, not a run to abandon -- apply_qat_all_blocks' own
+        // rule, mirrored by trainLoraAdapterAllBlocks itself.
+        skipped = result.results
+          .filter((r) => !r.trained)
+          .map((r) => `${r.block.input} → ${r.block.output}: ${r.skippedReason}`);
+        if (skipped.length === result.results.length) {
+          setStatus(`no block could be trained. ${skipped.join(" | ")}`);
+          return;
+        }
+      }
 
       lastBytes = result.bytes;
       const outName = base.name.replace(/\.onnx$/i, "") + ".lora.onnx";
+      const skippedNote = skipped.length ? ` ${skipped.length} block(s) skipped (see below).` : "";
       setStatus(
         `done: ${result.adapter.length} adapter(s) trained, ` +
-          `${result.bytes.length.toLocaleString()} bytes.`,
+          `${result.bytes.length.toLocaleString()} bytes.${skippedNote}`,
       );
       if (dlBtn) {
         dlBtn.style.display = "";
@@ -235,7 +310,11 @@ function initLoraPanel() {
       window.__onnxsimLoraTrained = { bytes: result.bytes, name: outName };
 
       if (curveEl && result.losses.length) {
-        curveEl.innerHTML = renderLossCurve(result.losses);
+        curveEl.innerHTML =
+          renderLossCurve(result.losses) +
+          (skipped.length
+            ? `<p class="tool-note">skipped: ${skipped.map(escapeHtml).join("<br>")}</p>`
+            : "");
         curveEl.style.display = "";
       }
 
@@ -257,7 +336,7 @@ function initLoraPanel() {
           metricsEl.style.display = "";
           setStatus(
             `done: ${result.adapter.length} adapter(s) trained, relative L2 error ` +
-              `${(before.relL2 * 100).toFixed(2)}% → ${(after.relL2 * 100).toFixed(2)}%.`,
+              `${(before.relL2 * 100).toFixed(2)}% → ${(after.relL2 * 100).toFixed(2)}%.${skippedNote}`,
           );
         } catch (metricsErr) {
           setStatus(
@@ -272,6 +351,17 @@ function initLoraPanel() {
       btn.disabled = false;
     }
   });
+}
+
+// Skipped-block reasons come from exception messages, which can carry a
+// tensor name straight out of the model -- untrusted text, unlike every
+// other value this panel interpolates. Mirrors qat_ui.mjs's own copy rather
+// than importing it: neither module exports it, and it is four lines.
+function escapeHtml(s) {
+  return String(s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+  );
 }
 
 initLoraPanel();
