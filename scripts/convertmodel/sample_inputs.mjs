@@ -96,7 +96,7 @@ export function createSampleContext() {
 function getSampleImage(ctx, log) {
   if (!ctx.imagePromise) {
     ctx.imagePromise = fetchSampleImageBytes().then((r) => {
-      log(`sample image: ${r.label} (frgfm/imagenette)`);
+      log(`sample image: ${r.label} (uoft-cs/cifar10)`);
       return r;
     });
   }

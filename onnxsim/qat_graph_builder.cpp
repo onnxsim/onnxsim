@@ -343,6 +343,23 @@ AdamOutputs AdamUpdate(GraphBuilder& b, const std::string& param,
   return AdamOutputs{b.Sub(param, step), m_next, v_next};
 }
 
+SgdMomentumOutputs SgdMomentumUpdate(GraphBuilder& b, const std::string& param,
+                                     const std::string& grad,
+                                     const std::string& mom,
+                                     const std::string& lr, float momentum) {
+  const std::string momentum_const = b.Const(momentum);
+
+  // Sequenced in the Python's left-to-right order, as AdamUpdate's own locals
+  // above are: `b.add(b.mul(momentum_const, mom), grad)`.
+  const std::string decayed_mom = b.Mul(momentum_const, mom);
+  const std::string mom_next = b.Add(decayed_mom, grad);
+
+  const std::string step = b.Mul(lr, mom_next);
+  const std::string param_next = b.Sub(param, step);
+
+  return SgdMomentumOutputs{param_next, mom_next};
+}
+
 std::pair<float, float> AdamBiasCorrections(int64_t t) {
   // In double, then narrowed once -- the Python returns Python floats and the
   // narrowing happens where they are fed. Computing in float32 throughout

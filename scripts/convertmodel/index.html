@@ -502,7 +502,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div>
                 <label for="qat-rows" title="Calibration rows captured from the teacher and held resident for the whole loop.">calibration rows</label>
                 <input type="number" id="qat-rows" value="8" min="1" max="128" step="1" style="width: 4em;">
-                <label for="qat-fill" title="'sample data' fetches a fresh real image (frgfm/imagenette) or sentence (stanfordnlp/sst2) from Hugging Face per row; the synthetic fills are seeded, so every row is identical.">calibration data</label>
+                <label for="qat-fill" title="'sample data' fetches a fresh real image (uoft-cs/cifar10) or sentence (stanfordnlp/sst2) from Hugging Face per row; the synthetic fills are seeded, so every row is identical.">calibration data</label>
                 <select id="qat-fill">
                     <option value="sample" selected>sample data (Hugging Face image/text)</option>
                     <option value="random">random (deterministic)</option>
@@ -632,7 +632,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div>
                 <label for="lora-rows" title="Calibration rows captured from the base and reference models and held resident for the whole loop.">calibration rows</label>
                 <input type="number" id="lora-rows" value="8" min="1" max="128" step="1" style="width: 4em;">
-                <label for="lora-fill" title="'sample data' fetches a fresh real image (frgfm/imagenette) or sentence (stanfordnlp/sst2) from Hugging Face per row; the synthetic fills are seeded, so every row is identical.">calibration data</label>
+                <label for="lora-fill" title="'sample data' fetches a fresh real image (uoft-cs/cifar10) or sentence (stanfordnlp/sst2) from Hugging Face per row; the synthetic fills are seeded, so every row is identical.">calibration data</label>
                 <select id="lora-fill">
                     <option value="sample" selected>sample data (Hugging Face image/text)</option>
                     <option value="random">random (deterministic)</option>
@@ -673,6 +673,34 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="lora-metrics" style="display: none; margin-top: 0.4em;"></div>
         </div>
         <script type="module" src="./lora_ui.mjs"></script>
+        <h2 id="sec-webgpu-demo">WebGPU training demo (Hugging Face data)</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Not a tool for your own model -- a small, fixed, self-contained
+                demo of the machinery above: a tiny two-layer network,
+                <code>onnxsim.graph_grad</code>/<code>qat_graph</code>'s own
+                gradient/Adam step graph, trained on <b>real data fetched live
+                from Hugging Face</b>, with <b>WebGPU required</b> (no wasm/CPU
+                fallback -- this fails loudly on a browser without it, rather
+                than silently training somewhere else). See
+                <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/webgpu_hf_demo.mjs" target="_blank" rel="noopener">webgpu_hf_demo.mjs</a>
+                and <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/test/make_step_graph_fixtures.py" target="_blank" rel="noopener">test/make_step_graph_fixtures.py</a>
+                for exactly what each demo trains and why.
+            </p>
+            <div>
+                <label for="webgpu-demo-mode">demo</label>
+                <select id="webgpu-demo-mode">
+                    <option value="photo" selected>one real photo (uoft-cs/cifar10) → fixed target</option>
+                    <option value="cifar10">CIFAR-10 pretraining sample (8 labeled photos, checks accuracy)</option>
+                </select>
+            </div>
+            <div class="debug-actions">
+                <button id="webgpu-demo-button" type="button">Run demo</button>
+                <span id="webgpu-demo-status" class="tool-note"></span>
+            </div>
+            <div id="webgpu-demo-curve" style="display: none; margin-top: 0.4em;"></div>
+        </div>
+        <script type="module" src="./webgpu_demo_ui.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted
@@ -832,7 +860,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             selected here), instead of clicking <b>Run inference</b> each time.
             The <b>input fill</b> picker's <b>sample data</b> option feeds real
             data instead of synthetic numbers: a photo from
-            <a href="https://huggingface.co/datasets/frgfm/imagenette" target="_blank" rel="noopener">frgfm/imagenette</a>
+            <a href="https://huggingface.co/datasets/uoft-cs/cifar10" target="_blank" rel="noopener">uoft-cs/cifar10</a>
             for an image-shaped input, or a tokenized sentence from
             <a href="https://huggingface.co/datasets/stanfordnlp/sst2" target="_blank" rel="noopener">stanfordnlp/sst2</a>
             for a recognized NLP model's <code>input_ids</code>/
@@ -894,7 +922,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
             <label for="inference-fill">input fill</label>
             <select id="inference-fill"
-                    title="How the auto-generated inputs are valued. 'random'/'ones'/'zeros'/'arange' are synthetic (integer/bool inputs stay zero; mirrors the CLI's --input-fill). 'sample data' fetches a real image (frgfm/imagenette) or tokenized sentence (stanfordnlp/sst2) from Hugging Face for inputs shaped like one; any other input, or a model whose tokenizer isn't recognized, falls back to random fill (logged).">
+                    title="How the auto-generated inputs are valued. 'random'/'ones'/'zeros'/'arange' are synthetic (integer/bool inputs stay zero; mirrors the CLI's --input-fill). 'sample data' fetches a real image (uoft-cs/cifar10) or tokenized sentence (stanfordnlp/sst2) from Hugging Face for inputs shaped like one; any other input, or a model whose tokenizer isn't recognized, falls back to random fill (logged).">
                 <option value="random">random (deterministic)</option>
                 <option value="ones">ones</option>
                 <option value="zeros">zeros</option>

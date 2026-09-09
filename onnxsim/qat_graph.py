@@ -235,6 +235,12 @@ ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
 
+# Classic (heavy-ball) SGD momentum's own standard hyper-parameter -- the
+# fraction of the previous momentum buffer carried into the next step. Same
+# role as ADAM_BETA1 (an exponential-moving-average decay), but there is only
+# one of it: SGD-momentum has no second moment to decay separately.
+SGD_MOMENTUM = 0.9
+
 
 class GraphBuilder:
     """Accumulates nodes and initializers with unique names.
@@ -439,6 +445,61 @@ def adam_update(
     step = b.div(b.mul(lr, m_hat), b.add(b.sqrt(v_hat), b.const(eps)))
     param_next = b.sub(param, step)
     return param_next, m_next, v_next
+
+
+def sgd_momentum_update(
+    b: GraphBuilder,
+    param: str,
+    grad: str,
+    mom: str,
+    lr: str,
+    momentum: float = SGD_MOMENTUM,
+) -> Tuple[str, str]:
+    """Appends one classic (heavy-ball) momentum SGD step to ``b`` and returns
+    ``(param', mom')``.
+
+    ``mom`` is a single exponential moving average of the gradient -- unlike
+    Adam's ``m``/``v`` pair, there is no second moment estimating the
+    gradient's variance, so there is nothing here that plays ``v``'s role and
+    nothing to bias-correct against it. The update is textbook heavy-ball
+    momentum::
+
+        mom' = momentum * mom + grad
+        param' = param - lr * mom'
+
+    ``momentum`` is a plain Python float baked into the graph as a constant
+    with :meth:`GraphBuilder.const`, exactly like ``eps`` in :func:`adam_update`
+    -- not a per-step scalar input the way ``lr`` is. This is a real,
+    deliberate limitation rather than an oversight: a step graph built with
+    this function can anneal ``lr`` from one step to the next (it is fed
+    fresh every call to :func:`run_step_graph`), but ``momentum`` is fixed for
+    the life of the graph -- changing it means building a new step graph.
+    Nothing in this optimizer's current callers needs a per-step momentum
+    schedule, and keeping it a constant keeps the graph one input smaller.
+
+    No bias correction is needed here the way :func:`adam_update` needs
+    ``m_correction``/``v_correction``. Adam corrects because ``m``/``v`` are
+    *initialized at zero* and an EMA started at zero is biased low for its
+    first few steps in proportion to how fast it decays -- ``v``'s bias
+    matters more because it sits under a square root and a division, so an
+    underestimate there inflates the step size right when the estimate is
+    least reliable. Plain heavy-ball momentum has the same zero-init warm-up
+    (``mom`` is biased low for its first few steps too), but that bias shows up
+    linearly, inside a term that is merely *added* to the gradient and then
+    scaled by ``lr`` -- there is no division or square root downstream to
+    amplify it into instability, so callers of this optimizer accept the
+    same slow warm-up plain SGD momentum has always had rather than paying
+    for a correction the algebra does not need.
+
+    Uses only :meth:`GraphBuilder.const`/:meth:`add`/:meth:`mul`/:meth:`sub` --
+    no ``div``/``sqrt``, since there is no second moment or epsilon-guarded
+    denominator to compute.
+    """
+    momentum_const = b.const(momentum)
+    mom_next = b.add(b.mul(momentum_const, mom), grad)
+    step = b.mul(lr, mom_next)
+    param_next = b.sub(param, step)
+    return param_next, mom_next
 
 
 @dataclass

@@ -329,6 +329,42 @@ void AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
              "the epsilon initializer is the eps argument");
 }
 
+// If this fails, an SGD-momentum step has changed shape -- either its
+// arithmetic or the order it is emitted in -- and a ported loop silently
+// trains differently from qat_graph.py's sgd_momentum_update.
+void SgdMomentumUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
+  GraphBuilder b;
+  const SgdMomentumOutputs out = SgdMomentumUpdate(b, "p", "g", "mom", "lr");
+
+  CheckEqual(Joined(OpTypes(b)), "Mul,Add,Mul,Sub",
+             "the four nodes of an SGD-momentum step, in order");
+  CheckEqual(b.initializer().size(), size_t{1}, "just the momentum constant");
+
+  // The momentum constant is named before any node, so the first node is
+  // number 2.
+  CheckEqual(out.mom_next, "add_3", "mom' = momentum*mom + g");
+  CheckEqual(out.param_next, "sub_5", "p' = p - lr*mom'");
+
+  CheckEqual(b.nodes()[0].input(0), "c_1",
+             "momentum scales the old momentum buffer");
+  CheckEqual(b.nodes()[0].input(1), "mom", "...against the incoming mom");
+  CheckEqual(b.nodes()[1].input(1), "g",
+             "the decayed buffer is added to the raw gradient, unscaled");
+  CheckEqual(b.nodes()[3].input(0), "p",
+             "the update is subtracted from the parameter");
+
+  // No second moment, no epsilon-guarded denominator: none of Adam's Div/Sqrt
+  // appear, and there is exactly one initializer (momentum) rather than
+  // Adam's five.
+  for (const onnx::NodeProto& node : b.nodes()) {
+    Check(node.op_type() != "Div" && node.op_type() != "Sqrt",
+          "no Div/Sqrt: SGD-momentum has no second moment to normalize by");
+  }
+
+  CheckEqual(b.initializer()[0].raw_data(), LittleEndianBytes(kSgdMomentum),
+             "the momentum initializer is the momentum argument");
+}
+
 // If this fails, the host half of AdamUpdate's contract disagrees with the
 // graph half, and the moments are un-corrected (or over-corrected) at every
 // step -- a bias that is largest in exactly the early steps that matter.
@@ -478,6 +514,7 @@ int main() {
   EpFriendlyOpsHasExactlyThePythonSetsMembers();
   AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder();
   AdamBiasCorrectionsAreTheClosedFormAtStepT();
+  SgdMomentumUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder();
   MakeStepGraphDeclaresInputsAndOutputsInOrderAndPassesTheChecker();
   AStepGraphWithoutALossDeclaresOnlyItsStateOutputs();
 

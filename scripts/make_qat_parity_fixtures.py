@@ -231,6 +231,17 @@ def _case_adam_update() -> Dict[str, Any]:
     return out
 
 
+def _case_sgd_momentum_update() -> Dict[str, Any]:
+    """One SGD-momentum step: five names, half of Adam's nineteen, since there
+    is one state tensor (the momentum buffer) instead of two and no bias
+    correction to apply."""
+    b = qat_graph.GraphBuilder()
+    param_next, mom_next = qat_graph.sgd_momentum_update(b, "p", "g", "mom", "lr")
+    out = _describe(b)
+    out["result"] = [param_next, mom_next]
+    return out
+
+
 def _case_step_graph() -> Dict[str, Any]:
     """A complete ``make_step_graph``: input and output declaration order,
     opset, IR version, and the state map that closes the loop.
@@ -444,6 +455,7 @@ CASES = {
     "gather_rows": _case_gather_rows,
     "consts": _case_consts,
     "adam_update": _case_adam_update,
+    "sgd_momentum_update": _case_sgd_momentum_update,
     "step_graph": _case_step_graph,
     "planner": _case_planner,
 }

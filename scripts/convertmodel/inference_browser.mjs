@@ -530,7 +530,7 @@ async function renderSampleIO(container, sampleCtx, output, dims, outputLabel) {
       inputHtml =
         `<img class="sample-io-image" src="${url}" alt="sample input image">` +
         `<p class="sample-io-caption">"${escapeHtml(label)}" — ` +
-        '<a href="https://huggingface.co/datasets/frgfm/imagenette" target="_blank" rel="noopener">frgfm/imagenette</a></p>';
+        '<a href="https://huggingface.co/datasets/uoft-cs/cifar10" target="_blank" rel="noopener">uoft-cs/cifar10</a></p>';
     } catch (e) {
       inputHtml = `<p class="sample-io-note">sample image unavailable (${escapeHtml(e && e.message ? e.message : e)})</p>`;
     }
