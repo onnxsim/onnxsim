@@ -4485,10 +4485,9 @@ again:
 | 128-channel dilated layers | 128 works undilated, so the two rules interact |
 | dilation 6 and 12 at 64 channels | 32 channels handles both, so it interacts with width |
 
-That is still only **7.1% of the vocoder's weights**, because the three
-transposed convolutions and `conv_pre` hold most of them. The honest summary
-is that the vocoder's *small* layers are now fully readable and its *large*
-ones are not.
+That was 7.1% of the vocoder's weights, because the three transposed
+convolutions and `conv_pre` hold most of them. The transposed ones are now
+readable too -- see the next section, which takes it to 47.5%.
 
 Test: `test_dilation_changes_the_weight_layout` (Docker, no device), which
 checks both rules against their own builds and that the undilated rule does
@@ -4617,6 +4616,47 @@ between them there is no room for a large hidden clock deficit.
 scratch with a toolchain that is not part of this stack, and by the numbers
 it buys a fraction of what the rating implies. The rating's missing factor is
 much better explained by clock.**
+
+### A transposed convolution is several convolutions
+
+The three `ConvTranspose` upsamplers hold most of the vocoder's weights and
+none of them read. They are not stored in a layout of their own.
+
+**Unstrided, it is the ordinary conv layout with two adjustments.** ONNX
+orders a `ConvTranspose` weight `(Cin, Cout, K)` rather than
+`(Cout, Cin, K)`, and dimension 0 behaves as the *input* channel exactly as
+`i` does for a convolution -- weights `(0,0,0)` and `(1,0,0)` land in the
+same byte, different nibbles. The taps are then stored **reversed**: with
+`K = 4` at 32 channels, `k = 3` sits at byte 0, `k = 2` at 16, `k = 1` at 32
+and `k = 0` at 156, which is slot 48 chunked at 36 into `144 + 12`. Reading
+`(Cout, Cin, K)` with `k' = K-1-k` reproduces every code.
+
+**Strided, it is split into `stride` separate convolutions.** At stride 2 the
+taps do not stay together: `k = 0` and `k = 2` land 16 bytes apart while
+`k = 1` sits in an entirely different region. That is polyphase
+decomposition -- a stride-`s` transposed convolution compiled as `s` ordinary
+convolutions of `K/s` taps each, which is the standard way to implement one.
+
+**All twenty phases of the vocoder's three upsamplers locate**, at 0.9997 to
+0.9999:
+
+| layer | stride | phases | located |
+| --- | --- | --- | --- |
+| `(256, 128, 16)` | 8 | 8 x 2 taps | 8/8 |
+| `(128, 64, 16)` | 8 | 8 x 2 taps | 8/8 |
+| `(64, 32, 8)` | 4 | 4 x 2 taps | 4/4 |
+
+**The vocoder goes from 10 to 13 of 23 layers, and from 7.1% to 47.5% of its
+weights.** Three layers carried forty points of coverage, which is what
+happens when the unread ones are the big ones.
+
+What remains is `conv_pre` at 192 input channels, and the dilated layers at
+128 channels and at dilations 6 and 12 -- the same width-and-dilation
+interaction noted before, now the only thing between here and a fully read
+vocoder.
+
+Test: `test_convtranspose_stores_taps_reversed_in_the_conv_layout` (Docker,
+no device), which checks every code and that dropping the reversal breaks it.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 

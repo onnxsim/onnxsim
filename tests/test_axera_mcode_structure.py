@@ -4930,6 +4930,76 @@ def _weight1d_offset_wide(o, i, k, cin, cout, kernel, top):
     ), (4 if i % 2 else 0)
 
 
+def _one_convtranspose_model(cin, cout, length, kernel, stride, weights=None):
+    """A 1-D transposed convolution. ONNX orders its weight `(Cin, Cout, K)`,
+    the opposite of `Conv`."""
+    rng = np.random.RandomState(0)
+    values = (rng.randn(cin, cout, kernel) * 0.05) if weights is None else weights
+    weight = numpy_helper.from_array(np.asarray(values, dtype=np.float32), "w")
+    node = helper.make_node(
+        "ConvTranspose",
+        ["x", "w"],
+        ["y"],
+        name="convt",
+        kernel_shape=[kernel],
+        strides=[stride],
+        pads=[(kernel - stride) // 2] * 2,
+    )
+    graph = helper.make_graph(
+        [node],
+        "one_convt",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, cin, length])],
+        [
+            helper.make_tensor_value_info(
+                "y", TensorProto.FLOAT, [1, cout, length * stride]
+            )
+        ],
+        [weight],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_convtranspose_stores_taps_reversed_in_the_conv_layout(tmp_path):
+    """Confirmed real (see the README's "A transposed convolution is several
+    convolutions" section): an unstrided `ConvTranspose` uses the *ordinary*
+    convolution weight layout, with two adjustments -- ONNX's `(Cin, Cout, K)`
+    weight maps straight on (dimension 0 behaves as input channels), and the
+    kernel taps are stored **reversed**.
+
+    Getting the reversal wrong is not obvious from a correlation, so this
+    checks every code. Needs Docker, no device.
+    """
+    cin = cout = 32
+    kernel, length = 4, 32
+    rng = np.random.RandomState(5)
+    weights = rng.randn(cin, cout, kernel) * 0.05
+    for i in range(cin):
+        weights[i] *= 0.2 / np.abs(weights[i]).max()
+    weights = weights.astype(np.float32)
+
+    work = tmp_path / "s1"
+    work.mkdir()
+    model = _one_convtranspose_model(cin, cout, length, kernel, 1, weights=weights)
+    wbt = _wbt_of(_build_single_op_axmodel(str(work), "m", model))
+
+    # (Cin, Cout, K) -> the conv layout's (o, i, k), taps reversed.
+    as_conv = np.swapaxes(weights, 0, 1)[:, :, ::-1].copy()
+    got = np.zeros(as_conv.shape, dtype=int)
+    for o in range(cout):
+        for i in range(cin):
+            for k in range(kernel):
+                off, shift = _weight_offset(o, i, k, cin, cout, kernel)
+                got[o, i, k] = (((wbt[off + _WBT_PLANE_GAP] >> shift) & 0xF) << 4) | (
+                    (wbt[off] >> shift) & 0xF
+                )
+    assert (got == _quantize_conv_weights(as_conv)).all()
+    # Without the reversal it does not read.
+    assert not (got == _quantize_conv_weights(np.swapaxes(weights, 0, 1))).all()
+
+
 def test_dilation_changes_the_weight_layout(tmp_path):
     """Confirmed real (see the README's "Dilation reorders the weights"
     section): a dilated convolution stores its weights in a *different*
