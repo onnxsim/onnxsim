@@ -87,28 +87,41 @@ onnxsim's `check_n=3` verification.
 
 ## Try it in the browser wasm UI
 
-Both of this repo's in-browser tools accept any local `.onnx` file through a
-plain file picker -- no upload, no build step:
+**[onnxsim.github.io/onnxsim](https://onnxsim.github.io/onnxsim/)** (source:
+`scripts/convertmodel/index.html`) has a one-click **"Load nanochat demo
+model"** button under "Convert a model", right below the Hugging Face
+loader. It fetches `nanochat_wasm_demo.onnx` same-origin (bundled with the
+deployed page -- see `scripts/convertmodel/nanochat_demo.mjs` for the glue,
+which mirrors `hf_load.mjs`'s hand-off to the converter/Netron/inference
+panels) and runs it straight through Simplify. Hit **Simplify**, and the
+before/after Netron panes show rotary embeddings' `Slice`/`Concat` pairs,
+the QK-norm `Pow`/`ReduceMean`/`Sqrt` chain, the GQA `Tile` (from
+`repeat_interleave`), and the `relu^2` MLP getting folded down, live.
 
-- **[onnxsim.github.io/onnxsim](https://onnxsim.github.io/onnxsim/)**
-  (source: `scripts/convertmodel/index.html`) -- use the file input under
-  "Convert a model", pick [`nanochat_wasm_demo.onnx`](nanochat_wasm_demo.onnx),
-  then hit **Simplify**. The before/after Netron panes show rotary
-  embeddings' `Slice`/`Concat` pairs, the QK-norm `Pow`/`ReduceMean`/`Sqrt`
-  chain, the GQA `Tile` (from `repeat_interleave`), and the `relu^2` MLP
-  getting folded down, live.
+Both of this repo's in-browser tools also accept any local `.onnx` file
+through a plain file picker -- no upload, no build step, and no dependence
+on the button above:
+
+- **onnxsim.github.io/onnxsim** -- use the file input under "Convert a
+  model" and pick [`nanochat_wasm_demo.onnx`](nanochat_wasm_demo.onnx)
+  (or any other export from this directory) directly.
 - **`scripts/pyodide_demo/index.html`** -- runs full Python
   `onnxsim.simplify()` in-browser via Pyodide (see `docs/wasm_pyodide.md`);
-  serve the directory and pick the same `.onnx` file at step 2.
+  serve the directory and pick the same `.onnx` file at step 2. (No
+  one-click button here -- the Pyodide demo is a separate, smaller page.)
 
 `nanochat_wasm_demo.onnx` is the *unsimplified* export of `model.py`'s
 `_WASM_DEMO_CONFIG` (1 layer, `n_head=2`, `n_kv_head=1` -- so GQA's
 `repeat_interleave` shows up too -- `n_embd=16`, 8-way-padded 32-token
 vocab, 8-token context; 169 nodes, 3,840 params) -- small enough to commit
 and load instantly, but big enough to carry every op the harness above
-exercises at larger scale. Regenerate it with:
+exercises at larger scale. It is committed **twice**: once here for the
+Python-side docs/fixtures, and once under `scripts/convertmodel/` so the
+deployed converter page can fetch it same-origin (that directory is what
+`static.yml` uploads as the Pages artifact). Regenerate both with:
 
 ```bash
 python scripts/nanochat/simplify_nanochat.py --tiny --output-dir .
-cp nanochat_tiny.onnx nanochat_wasm_demo.onnx   # keep the *unsimplified* export
+cp nanochat_tiny.onnx nanochat_wasm_demo.onnx                          # keep the *unsimplified* export
+cp nanochat_wasm_demo.onnx ../convertmodel/nanochat_wasm_demo.onnx     # keep both copies in sync
 ```
