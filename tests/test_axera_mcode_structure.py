@@ -4509,6 +4509,266 @@ def _llm_weight_offset(row, col, cin):
     ), (4 if col % 2 else 0)
 
 
+def _bf16_trunc(value):
+    """A float32's top 16 bits, rounded toward zero -- how the mcode stores an
+    activation scale."""
+    return struct.unpack("<I", struct.pack("<f", np.float32(value)))[0] >> 16
+
+
+def _u16_offsets(mcode, word):
+    """Every offset holding `word` as a little-endian uint16."""
+    raw = struct.pack("<H", word)
+    out, at = [], mcode.find(raw)
+    while at >= 0:
+        out.append(at)
+        at = mcode.find(raw, at + 1)
+    return out
+
+
+def _compiler_scales(axmodel_path):
+    """The per-tensor activation scales pulsar2 recorded for a build, smallest
+    first, from its own `quant/quant_axmodel.json`."""
+    path = os.path.join(os.path.dirname(axmodel_path), "quant", "quant_axmodel.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        quant = json.load(f)
+    scales = [v["scale"] for v in quant["values"].values() if "scale" in v]
+    return sorted(s[0] for s in scales if len(s) == 1)
+
+
+def _scale_probe_build(work_dir, tag, amplitude, channels=32, kernel=3, length=64):
+    """One convolution, calibrated against inputs scaled by `amplitude`. The
+    weights never change, so only the activation scales can."""
+    rng = np.random.RandomState(7)
+    weights = (rng.randn(channels, channels, kernel) * 0.05).astype(np.float32)
+    model = _one_conv_model(
+        channels, channels, length, kernel, 1, "Conv", weights=weights
+    )
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, f"{tag}.onnx"))
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", f"{tag}.tar"),
+        [
+            (np.random.RandomState(1).randn(1, channels, length) * amplitude).astype(
+                np.float32
+            )
+            for _ in range(2)
+        ],
+    )
+    with open(os.path.join(work_dir, "config", f"{tag}.json"), "w") as f:
+        json.dump(
+            {
+                "model_type": "ONNX",
+                "npu_mode": "NPU1",
+                "quant": {
+                    "input_configs": [
+                        {
+                            "tensor_name": "x",
+                            "calibration_dataset": f"./dataset/{tag}.tar",
+                            "calibration_format": "Numpy",
+                            "calibration_size": 2,
+                        }
+                    ],
+                    "calibration_method": "MinMax",
+                    "precision_analysis": False,
+                },
+                "compiler": {"check": 0},
+            },
+            f,
+        )
+    result = pulsar2_docker.build(
+        work_dir, f"{tag}.onnx", f"out_{tag}", config_path=f"config/{tag}.json"
+    )
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    return result.axmodel_path, mcode
+
+
+def test_activation_scales_are_bfloat16_in_the_mcode(tmp_path):
+    """Confirmed real (see the README's "The activation scales, decoded"
+    section): the two per-tensor activation scales a convolution needs are in
+    the mcode as **bfloat16 truncated toward zero** -- the input's as its
+    reciprocal `1/x_scale`, the output's directly as `y_scale`, four copies
+    of each.
+
+    Found by a differential that can only move scales: the same model built
+    against calibration inputs scaled by 1, 2 and 4. The weight codes and the
+    requantisation multipliers are invariant to that (`M = x_scale *
+    (peak/127.5) / r_scale` scales away), so the weight table must not move at
+    all -- and it does not, which is half of what this asserts.
+
+    This is what stands between rewriting weights that preserve a tensor's
+    dynamic range and rewriting any weights at all. Needs Docker, no device.
+    """
+    builds = {}
+    for amplitude in (1.0, 2.0, 4.0):
+        tag = f"a{amplitude:g}".replace(".", "_")
+        work = tmp_path / tag
+        work.mkdir()
+        path, mcode = _scale_probe_build(str(work), tag, amplitude)
+        scales = _compiler_scales(path)
+        if scales is None:
+            pytest.skip("this pulsar2 build wrote no quant_axmodel.json")
+        builds[amplitude] = (path, mcode, scales)
+
+    # The weight table cannot move: nothing in it depends on an activation
+    # scale once the requantisation multiplier is formed.
+    tables = {a: _wbt_of(p) for a, (p, _, _) in builds.items()}
+    assert len(set(tables.values())) == 1, "the weight table moved"
+
+    slots = {}
+    for amplitude, (_, mcode, scales) in builds.items():
+        y_scale, x_scale = scales[0], scales[1]
+        for name, word in (
+            ("1/x_scale", _bf16_trunc(1.0 / x_scale)),
+            ("y_scale", _bf16_trunc(y_scale)),
+        ):
+            at = _u16_offsets(mcode, word)
+            assert len(at) >= 4, (amplitude, name, word, at)
+            slots.setdefault(name, []).append(set(at))
+
+    # The same slots carry it at every amplitude -- otherwise a coincidence
+    # somewhere in a 2.8 KB stream would pass the test above.
+    for name, seen in slots.items():
+        assert set.intersection(*seen), name
+
+
+def _requant_multiplier_offset(wbt, peaks):
+    """Offset of the per-channel float32 array proportional to `peaks`."""
+    cout = len(peaks)
+    for off in range(0, len(wbt) - 4 * cout, 4):
+        values = np.frombuffer(wbt[off : off + 4 * cout], np.float32).astype(float)
+        if not np.all(np.isfinite(values)) or values.min() <= 0:
+            continue
+        ratio = values / peaks
+        if ratio.std() / ratio.mean() < 1e-4:
+            return off
+    return None
+
+
+def _patch_scale_and_multiplier(axmodel, out_path, weights, y_factor, m_factor):
+    """Rewrite a compiled convolution's weights, its output activation scale
+    (by `y_factor`) and its per-channel float32 array (by `m_factor`)."""
+    model = onnx.load(axmodel)
+    table = next(i for i in model.graph.initializer if i.name == "npu_params")
+    neu = next(i for i in model.graph.initializer if i.name.endswith("_neu"))
+    wbt, mcode = bytes(table.raw_data), bytes(neu.raw_data)
+
+    scales = _compiler_scales(axmodel)
+    y_scale = next(s for s in scales if len(_u16_offsets(mcode, _bf16_trunc(s))) >= 4)
+    peaks = np.abs(weights.reshape(weights.shape[0], -1)).max(1).astype(float)
+    patched = bytearray(_write_weight_codes(wbt, _quantize_conv_weights(weights)))
+    off = _requant_multiplier_offset(wbt, peaks)
+    assert off is not None, "no per-channel multiplier array"
+    if m_factor != 1.0:
+        values = np.frombuffer(wbt[off : off + 4 * len(peaks)], np.float32)
+        patched[off : off + 4 * len(peaks)] = (values * np.float32(m_factor)).tobytes()
+    table.raw_data = bytes(patched)
+
+    stream = bytearray(mcode)
+    if y_factor != 1.0:
+        word = _bf16_trunc(y_scale * y_factor)
+        for at in _u16_offsets(mcode, _bf16_trunc(y_scale)):
+            stream[at : at + 2] = struct.pack("<H", word)
+    neu.raw_data = bytes(stream)
+    onnx.save(model, out_path)
+    return out_path
+
+
+def test_output_scale_is_rewritable_but_the_multiplier_is_not(tmp_path):
+    """Confirmed real on an AX650N (see the README's "The activation scales,
+    decoded" section): the bfloat16 output scale in the mcode *is* the
+    dequantisation scale -- doubling it doubles the device's output exactly --
+    and that is what lets a layer's weights be rescaled, which saturated
+    before.
+
+    The same run refutes something this file used to assume. The per-channel
+    float32 array next to the weight block is proportional to
+    `x_scale * (peak/127.5) / y_scale`, but it is **not consumed as a linear
+    multiplier**: scaling it by 0.5 and by 2 damages the output *by the same
+    amplitude*, which no linear factor can do. Rewriting it was never tested
+    before; it does not work.
+
+    Needs Docker and a device.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device")
+    ort = pytest.importorskip("onnxruntime")
+    cin = cout = 32
+    kernel, length = 3, 32
+    rng = np.random.RandomState(0)
+    weights = (rng.randn(cout, cin, kernel) * 0.1).astype(np.float32)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    axmodel = _build_single_op_axmodel(
+        str(work), "m", _one_conv_model(cin, cout, length, kernel, weights=weights)
+    )
+    if _compiler_scales(axmodel) is None:
+        pytest.skip("this pulsar2 build wrote no quant_axmodel.json")
+
+    x = np.random.RandomState(99).randn(1, cin, length).astype(np.float32)
+
+    def reference(w):
+        path = str(work / "ref.onnx")
+        onnx.save(_one_conv_model(cin, cout, length, kernel, weights=w), path)
+        session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        return np.asarray(session.run(None, {"x": x})[0]).ravel()
+
+    def device(path):
+        result = pulsar2_docker.run_on_device_with_inputs(
+            path, {"x": x.tobytes()}, timeout=300
+        )
+        assert not result.error, result.error
+        return np.frombuffer(result.outputs[0], np.float32).ravel()
+
+    ref = reference(weights)
+    amp = lambda a: float(np.abs(a).max() / np.abs(ref).max())  # noqa: E731
+    corr = lambda a: float(np.corrcoef(a, ref)[0, 1])  # noqa: E731
+
+    plain = device(axmodel)
+    assert corr(plain) > 0.99, corr(plain)
+
+    # Doubling the stored output scale doubles the output, and nothing else.
+    doubled = device(
+        _patch_scale_and_multiplier(
+            axmodel, str(work / "y2.axmodel"), weights, 2.0, 1.0
+        )
+    )
+    assert corr(doubled) > 0.99, corr(doubled)
+    assert 1.9 < amp(doubled) / amp(plain) < 2.1, amp(doubled) / amp(plain)
+
+    # So a layer whose weights are rescaled can now be written, which is what
+    # saturated before: triple the weights, triple the output scale.
+    tripled = (weights * 3).astype(np.float32)
+    scaled = device(
+        _patch_scale_and_multiplier(
+            axmodel, str(work / "w3.axmodel"), tripled, 3.0, 1.0
+        )
+    )
+    ref3 = reference(tripled)
+    assert float(np.corrcoef(scaled, ref3)[0, 1]) > 0.99, np.corrcoef(scaled, ref3)[
+        0, 1
+    ]
+
+    # The per-channel array is not a linear multiplier: halving and doubling
+    # it damage the output identically.
+    half = device(
+        _patch_scale_and_multiplier(
+            axmodel, str(work / "m05.axmodel"), weights, 1.0, 0.5
+        )
+    )
+    twice = device(
+        _patch_scale_and_multiplier(
+            axmodel, str(work / "m2.axmodel"), weights, 1.0, 2.0
+        )
+    )
+    assert corr(half) < 0.9 and corr(twice) < 0.9, (corr(half), corr(twice))
+    assert abs(amp(half) - amp(twice)) < 0.01 * amp(half), (amp(half), amp(twice))
+
+
 def _quantize_llm_weights(weights):
     """`llm_build`'s weight quantiser, reproduced exactly -- and it is not the
     convolution pipeline's (see `_quantize_conv_weights`).

@@ -4307,17 +4307,20 @@ output distribution".** A permutation does that exactly, which is why it
 works and why random weights with the same peak do not: same maximum,
 different variance, different output range.
 
-**Where the activation scales live, so far.** Of the eleven activation scales
-the compiler's own profile lists for an eight-layer convolution stack, exactly
-one appears verbatim as a float32 in the mcode. The rest do not appear in any
-byte order, which is what you would expect if they are stored as fixed-point
-requantisation multipliers rather than floats. Locating and rewriting those is
-the next step, and it is a decoding problem rather than a search.
+**Where the activation scales live.** Of the eleven activation scales the
+compiler's own profile lists for an eight-layer convolution stack, exactly one
+appears verbatim as a float32 in the mcode. The rest do not appear in any byte
+order -- because they are not float32 at all. See "The activation scales,
+decoded" below: they are bfloat16.
 
-Until then the honest capability statement is: **a compiled model's
-convolution weights can be replaced by any set that preserves each output
-tensor's dynamic range, and verified on hardware.** That is narrower than
-"generate a weight table", and wider than it was.
+The honest capability statement, updated by the device runs in "The
+activation scales, decoded" below: **a compiled model's convolution weights
+can be replaced by any set that preserves each output channel's peak, and the
+whole layer may now be rescaled freely** -- the output activation scale is
+writable, so a uniform 3x rescale reproduces the new convolution at 0.99975
+where it used to saturate. What still blocks arbitrary weights is one thing,
+now precisely identified: the per-channel requantisation multiplier is not
+rewritable as a float32, because the datapath does not read it as one.
 
 Test: `test_per_channel_weight_scales_sit_just_past_the_weight_block`
 (Docker, no device).
@@ -4940,6 +4943,109 @@ That last point is the one to carry forward. Every earlier failure to read a
 layer was a search looking for a layer-wide rule that does not exist: the
 allocator decides per tap, and the only way to know what it decided is to read
 it back out of the table.
+
+### The activation scales, decoded
+
+Rewriting a compiled model's weights only worked for weights that preserved
+each output tensor's dynamic range, because every convolution's output
+activation scale was calibrated from the original weights and stored somewhere
+unread. An earlier search for those scales as float32 found one of eleven and
+concluded they must be fixed-point. They are neither: they are **bfloat16**,
+which is why a float32 search found almost nothing and a byte-order search
+found nothing at all.
+
+**The differential that isolates them.** Build one identical model against
+calibration inputs scaled by 1, 2 and 4. Both the input and the output
+activation scale then scale with the amplitude, while the weight codes and the
+requantisation multiplier
+
+    M[o] = x_scale * (peak[o]/127.5) / r_scale
+
+are invariant -- the amplitude cancels. So the weight table must not move at
+all, and every byte that *does* move is an activation scale and nothing else.
+The weight table does not move, and 22 bytes of a 2,824-byte mcode do.
+
+**What they are.** Two families of four copies each, both bfloat16 rounded
+*toward zero*:
+
+| field | holds | amp 1 | amp 2 | amp 4 |
+| --- | --- | --- | --- | --- |
+| four 16-bit slots | `1/x_scale` | 35.75 | 17.875 | 8.9375 |
+| four 16-bit slots | `y_scale` | 0.0122681 | 0.0245361 | 0.0490723 |
+
+Checked against pulsar2's own `quant_axmodel.json`, all six agree exactly:
+`bf16_trunc(1/x_scale)` and `bf16_trunc(y_scale)`, where `bf16_trunc` is the
+float32's top 16 bits with the rest discarded. Note the asymmetry -- the input
+scale is stored **reciprocated** and the output scale is not, which is what a
+requantisation datapath that multiplies by one and divides by the other would
+want.
+
+The remaining six moving bytes are not values at all: across the three builds
+they hold the same multiset in a different order, so they are an ordering that
+depends on the scales rather than a scale.
+
+Test: `test_activation_scales_are_bfloat16_in_the_mcode` (Docker, no device).
+
+**Confirmed on the device, and it moves the capability.** Doubling the stored
+`y_scale` word doubles the AX650N's output exactly -- amplitude 1.98x,
+correlation unchanged at 0.99975 -- so that bfloat16 really is the
+dequantisation scale and not a copy of one. With it writable, a layer's
+weights can be **rescaled**, which is precisely what saturated before: tripling
+every weight and tripling the output scale reproduces the new convolution at
+0.99975, where the old table's fixed output scale would have clipped it.
+
+**And the same run refutes something this file had assumed.** The per-channel
+float32 array next to the weight block is proportional to
+`x_scale * (peak[o]/127.5) / y_scale` -- that much still holds exactly, and the
+measured constant matches `x_scale/y_scale` to eight digits. But it is **not
+consumed as a linear multiplier**. Scaling it on the device:
+
+| edit | correlation | amplitude |
+| --- | --- | --- |
+| untouched | 0.99975 | 0.990 |
+| `y_scale` x2 | 0.99975 | 1.980 |
+| multiplier x0.5 | 0.302 | 1.197 |
+| multiplier x2 | 0.515 | **1.197** |
+
+Halving and doubling it produce *the same* amplitude. No linear factor does
+that. The array is read -- corrupting it clearly damages the output -- but
+whatever the datapath takes from those four bytes is not their float32 value,
+which is what you would see if it reads a fixed-point mantissa and shift out
+of the same word. Rewriting that array had never actually been tested; it does
+not work, and the earlier plan of "rewrite weights, multipliers and scales
+together" was resting on it.
+
+Test: `test_output_scale_is_rewritable_but_the_multiplier_is_not` (Docker and
+device).
+
+### Held out: a second vocoder, and why the splits must be walked
+
+100% on the model a method was developed against is not evidence the method
+works. The synthetic HiFi-GAN-shaped vocoder built earlier in this file is a
+genuine held-out test: different depths, different channel counts, an 80-band
+mel input instead of a 192-wide latent, and never once consulted while the
+reading pass was written.
+
+It came back at **91.3%** -- five of six layers exact, and the sixth was its
+`conv_pre` equivalent, `(128,80,7)`, at 71.4%. Enumerating candidate input
+splits had reached its limit: 80 channels do not split any way the candidate
+list contained.
+
+So the splits are now **walked** rather than guessed. Within a block, tap 0
+always occupies slots `0..w/2-1` whatever the tap convention is, so its
+channels can be walked one pair at a time until the codes stop matching, and
+that measures `w`. It is the same move that measured the LLM's column blocks,
+and it takes both vocoders to **100.0%**.
+
+What it measured is the argument for it. That first layer's splits, per tap:
+
+| tap | 0 | 1 | 2 |
+| --- | --- | --- | --- |
+| blocks | `[80]` | `[48, 32]` | `[24, 56]` |
+
+`24 + 56`. No candidate list anyone would write contains that. The allocator
+is not applying a rule with parameters -- it is packing, and the only way to
+know how it packed is to read it back.
 
 ### The LLM layout at 4096 hidden: column blocks, and all of them
 
