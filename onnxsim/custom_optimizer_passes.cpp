@@ -74,6 +74,7 @@
 #include "passes/rewrite_gatherelements_to_gather.h"
 #include "passes/rewrite_gathernd_to_gather.h"
 #include "passes/rewrite_gridsample_to_gather.h"
+#include "passes/rewrite_implicit_broadcast.h"
 #include "passes/rewrite_msdeformattn_to_gridsample.h"
 #include "passes/rewrite_trt_batched_nms.h"
 #include "passes/rewrite_trt_batched_rotated_nms.h"
@@ -187,6 +188,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::RewriteGatherNDToGather>(registry);
     RegisterOrReplace<p::RewriteGatherOverConcat>(registry);
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
+    RegisterOrReplace<p::RewriteImplicitBroadcast>(registry);
     RegisterOrReplace<p::RewriteMSDeformAttnToGridSample>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedNMS>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedRotatedNMS>(registry);
