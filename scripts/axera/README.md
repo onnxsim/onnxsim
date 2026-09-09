@@ -4941,23 +4941,27 @@ layer was a search looking for a layer-wide rule that does not exist: the
 allocator decides per tap, and the only way to know what it decided is to read
 it back out of the table.
 
-### The LLM layout at 4096 hidden: 288-column blocks
+### The LLM layout at 4096 hidden: column blocks, and all of them
 
 The `llm_build` addressing was solved at 256 hidden and scored 0.73 by
-correlation at 4096, which was recorded as a likely block split. With the
-quantiser now exact the question can be asked properly, and the answer is a
-column split with nothing else changed:
+correlation at 4096, which was recorded as a likely block split. It is a
+column split, and nothing else changes. Walking the table -- following columns
+until the codes stop matching, rather than assuming a width -- gives eight
+blocks:
 
-* one block holds **288 columns** -- read off the table by walking columns
-  until the codes stop matching, not inferred;
-* its row stride is **576**, which is exactly `72*ceil((288/2)/18)`, the same
-  formula that governs 256 hidden;
-* within one block **all 4096 rows** verify exactly, with the odd-register
-  offset at 36 and the super-block stride at 142336.
+| block | columns | width | row stride `a` | `72*ceil(w/2/18)` |
+| --- | --- | --- | --- | --- |
+| 1 | 0..287 | 288 | 576 | 576 |
+| 2..8 | 288..4095 | 544 each | 1152 | 1152 |
 
-So the row addressing was never the problem at 4096. 288 columns is 144 slots,
-eight chunks of 18 -- the widest a block can be and still have a row stride of
-576.
+Every block's row stride is the same `72*ceil((width/2)/18)` that governs 256
+hidden, every block sits `16*a + 512` bytes after the last -- the same `top`
+the conv layout uses -- and **all 4096 rows of every block verify exactly**.
+
+That is 16,777,216 codes of a 4096x4096 `q_proj`, **100.0% of them**, from the
+checkpoint alone. The row addressing was never the problem at 4096; the guess
+that 0.73 meant "the layout breaks at this width" was wrong, and the only
+thing that was actually unknown was where one block stops.
 
 ### The LLM path quantises differently, and here it is exactly
 
