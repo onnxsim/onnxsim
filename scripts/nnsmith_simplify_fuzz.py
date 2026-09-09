@@ -48,6 +48,18 @@ and reports them as ``checker_backend_error``: saved for inspection like
 any other non-``ok`` case, but excluded from the exit-1 "bugs" list, since
 they are not findings about onnxsim.
 
+A second, similarly-excluded case: onnxsim's own ``model_checking.compare()``
+compares outputs with plain ``np.allclose(..., equal_nan=False)`` (its
+default), so when the *original* model's random inputs already produce
+NaN/Inf on their own (a Div by zero, which NNSmith's inputs hit far more
+often than onnxsim's usual smoke-test models), comparing it against the
+simplified model's equally-NaN output reports a mismatch even though
+neither side is well-defined -- confirmed by hand: "The max diff is nan."
+for a case traced to exactly that. Reported as ``check_nan_mismatch``, same
+treatment as ``checker_backend_error`` (saved, not gating): it is a
+pre-existing blind spot in onnxsim's own checker, not evidence that
+simplify() changed anything.
+
 Requires the optional ``nnsmith[torch,onnx]`` package; skips with a clear
 message if missing. Generation goes through NNSmith's ``torch`` model type
 rather than its own ``onnx`` type, then ``_nnsmith_gen.py`` exports the
@@ -90,9 +102,10 @@ from typing import List, Optional
 class CaseResult:
     seed: int
     # gen_error | ok | check_failed | onnxsim_crash | onnxsim_timeout |
-    # checker_backend_error -- see main()'s `bugs` filter for which of these
-    # gate (exit 1) and _run_onnxsim for how check_failed/onnxsim_crash are
-    # told apart from checker_backend_error.
+    # checker_backend_error | check_nan_mismatch -- see main()'s `bugs`
+    # filter for which of these gate (exit 1) and _run_onnxsim for how
+    # check_failed/onnxsim_crash are told apart from checker_backend_error
+    # and check_nan_mismatch.
     status: str
     detail: str = ""
     model_dir: Optional[Path] = None
@@ -183,6 +196,19 @@ def _run_onnxsim(
     if proc.returncode == 0:
         return CaseResult(0, "ok")
     if "Check failed" in output:
+        # onnxsim's own model_checking.compare() reports a mismatch via plain
+        # np.allclose(..., equal_nan=False) (its default) -- so when the
+        # *original* model's random-input run already produces NaN/Inf (e.g.
+        # a Div by zero, which NNSmith's random inputs hit far more often
+        # than onnxsim's usual smoke-test models), comparing it against the
+        # simplified model's equally-NaN output reports "changed" even
+        # though neither side is well-defined -- confirmed by hand: "The max
+        # diff is nan." printed for a case traced to exactly a Div-by-zero
+        # RuntimeWarning earlier in the same run. That is a real, pre-existing
+        # blind spot in onnxsim's own checker, but not evidence simplify()
+        # changed anything -- keep it out of the genuine check_failed bucket.
+        if "The max diff is nan." in output:
+            return CaseResult(0, "check_nan_mismatch", output[-800:])
         # simplify()'s own check_n verification caught a semantic change --
         # this is the actual finding this script exists to surface.
         return CaseResult(0, "check_failed", output[-800:])
