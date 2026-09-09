@@ -5344,6 +5344,82 @@ those from a checkpoint through `llm_build`, never from an ONNX export. And
 the **`com.microsoft` INT4 exports are a dead end** for this toolchain in the
 form they ship.
 
+## A legalizer for the AX650, and what compiling Audio8 taught it
+
+Op coverage says whether a graph's op *types* are on the vendor's list.
+The Audio8 codec decoder is the case that shows how far short of sufficient
+that is: after conversion and simplification it reaches **99.3% NPU-eligible**,
+and it still does not compile. `legalize.py` is where the difference lives --
+semantics-preserving rewrites that make a graph acceptable, each one added
+because a real `pulsar2 build` refused a real model without it.
+
+### Getting the decoder ready
+
+| stage | nodes | NPU-eligible |
+| --- | --- | --- |
+| as shipped (fp16, symbolic shapes) | 3,341 | 93.8% |
+| float32, batch and frames frozen, simplified | 871 | 99.3% |
+
+The blockers collapse from `Shape` (170), `Reciprocal` (29), `Range`, `Einsum`
+to a single op type. Shape arithmetic was never a real obstacle -- it only
+existed because the batch and frame count were symbolic, and folding it away
+is onnxsim's own job.
+
+**`float16_to_float32` is the first rule, and it is fiddlier than it sounds.**
+Constants live in three places: the initializer list, the `value` attribute of
+`Constant` nodes, and the `to` attribute of `Cast`. This decoder has 214
+initializers and **1,174 `Constant` nodes**, so converting only the
+initializers -- the obvious implementation -- leaves a graph that binds a
+single `Div` to both `float` and `float16`, which onnxruntime rejects outright.
+
+### Then the compiler's own fused ops take over
+
+What blocks this model is not an ONNX op at all. Pulsar2 pattern-matches the
+Snake activation `x + sin(alpha*x)**2 / alpha` -- 29 of them in the vocoder
+trunk -- into a **native `AxQuantizedSnake`** carrying per-channel alpha, and
+that op then fails to build at both ends of the size range:
+
+| frames | tensor | failure |
+| --- | --- | --- |
+| 110 | `(1, 384, 28160)` | `NoTilerException` -- no tiler for that length |
+| 8 | dim 2: 32 vs 1536 | `OpBuildException: broadcast dim 2 mismatch` |
+
+**`pow2_to_mul` answers it.** Rewriting `Pow(x, 2)` to `Mul(x, x)` is exact for
+floats, and it stops the matcher: after the rewrite `AxQuantizedSnake` appears
+**zero times** in the build log, and the build proceeds past it. The unfused
+`Sin`/`Mul`/`Div`/`Add` are each on the supported list. Confirmed
+semantics-preserving on the real decoder against onnxruntime -- 46 sites,
+maximum absolute difference 8.8e-7, correlation 1.00000000.
+
+That is the general point, and the reason a legalizer cannot be derived from
+an op list: **the op that blocked this model appears in no ONNX graph and on no
+support list, because the compiler invents it during fusion.**
+
+### The remaining blockers, and one rule the compiler undoes
+
+Each build gets strictly further, which is how you tell a legalizer is working:
+
+1. `AxQuantizedSnake` -- fixed by `pow2_to_mul`.
+2. `AxClip`, `min 0 max 4095`, `dtype.num_bits=16, lut.output_dtype.num_bits=32`
+   -- the clamp on codec token indices. This is the int64 `codes` input, and
+   the answer is not a rewrite but a cut: feeding the vocoder body its float
+   feature map instead of tokens sidesteps it. (Worth recording separately
+   that Pulsar2's frontend and PTQ *do* accept an int64 input; it is the
+   backend's Clip that refuses.)
+3. `AxQuantizedConv` with `padding=(54, 0)`, `dilation=9` -- the causal
+   convolutions.
+
+**`explicit_conv_padding` is the honest failure here.** Hoisting asymmetric
+padding into an explicit `Pad` node is a correct rewrite -- 16 sites, verified
+identical to 5.4e-7 -- and it does not help, because **Pulsar2 re-fuses `Pad`
+into `Conv`**: the next build reports the identical `padding=(54, 0)`. The rule
+is kept because it is right and cheap, and because knowing the frontend undoes
+it is worth more than not knowing. A rewrite that survives fusion would have to
+change the convolution itself, not its padding.
+
+So the decoder does not compile yet, and what stands between is now three named
+things rather than a percentage.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
