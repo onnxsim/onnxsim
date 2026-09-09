@@ -5128,6 +5128,42 @@ stepped candidate offsets one at a time in Python, which on a 192 MB table is
 minutes per bit; vectorising it is the difference between a run that finishes
 and one that looks like a hang.
 
+### The 2-D path, read by discovered geometry, and where it stops
+
+The 1-D layout is read by discovering each block's geometry from the table
+rather than assuming a formula. Applying the same treatment to the 2-D path,
+against a real resnet18d, says two things.
+
+**Every layer with 128 or fewer input channels reads exactly.** That includes
+both packings that store plain INT8 instead of bit planes -- the `(32,3,3,3)`
+first convolution, whose three input channels put the kernel row fastest, and
+every 1x1 shortcut, which chunks input channels 36 at a time with the next
+chunk 144 bytes on. Neither had been implemented before, and both read 0%
+until they were; both now read 100%.
+
+**And it stops at exactly 128 input channels.**
+
+| `Cin` | layers | exact |
+| --- | --- | --- |
+| 3, 32, 64, 128 | 12 | **100.00%** each |
+| 256 | 4 | 50.00% each |
+| 512 | 3 | 25.00% each |
+
+Those are `128/Cin` to the digit, and they do not move: the totals at a search
+budget of 24 and of 256 are identical (4,403,040 of 11,186,016 weights, 39.4%).
+So it is not the search running out -- it is a real boundary, and one the
+format already named: `A = 18 * min(Cin, 128)`, the same
+`_WBT2D_UNIT_CAP = 128` the layout code has carried all along.
+
+**What does not clear it, which is the useful part.** In the 1-D layout the
+equivalent boundary was input-channel splitting, and walking for the next
+block cleared it. Doing the same here -- searching for output channel 0's
+pattern over input channels 128 and up -- finds nothing that verifies. The
+remaining input channels are therefore *not* the same block relocated: whatever
+holds them differs in more than its base address. That is a narrower and more
+useful statement than "the layout stops at 128", and it is where the next
+probe should go.
+
 ### The LLM path quantises differently, and here it is exactly
 
 The convolution pipeline's quantiser was pinned down earlier: `scale =
