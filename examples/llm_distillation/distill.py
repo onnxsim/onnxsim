@@ -1,18 +1,21 @@
-"""Knowledge-distillation example: train a ~1B-parameter causal LM "student"
-to mimic a larger "teacher" model.
+"""Knowledge-distillation example: train a small causal LM "student" to mimic
+a larger "teacher" model.
 
 This is a standalone PyTorch training example, unrelated to onnxsim's own
 ONNX-to-ONNX simplification pipeline -- onnxsim has no training code, and
 this script doesn't add any to the package. It exists to demonstrate the
 distillation *mechanics* (soft-target KL divergence with temperature, per
 Hinton et al., combined with the usual next-token hard-label loss) end to
-end on a real, named architecture:
+end on real, named architectures, kept deliberately small so the demo is
+actually runnable without a beefy GPU:
 
-- **Student**: matches TinyLlama-1.1B's published shape (hidden_size=2048,
-  22 layers, 32 attention heads / 4 KV heads, 32000-token vocabulary) --
-  a real ~1.1B-parameter decoder-only causal LM, not a made-up size.
-- **Teacher**: a wider/deeper sibling architecture, roughly Open-LLaMA-3B
-  sized, used as the distillation target.
+- **Student**: matches the widely-used ``JackFram/llama-160m`` shape
+  (hidden_size=768, 12 layers, 12 attention heads, 32000-token vocabulary,
+  no GQA) -- a real ~162M-parameter decoder-only causal LM, the same
+  architecture commonly used as a speculative-decoding draft model.
+- **Teacher**: matches TinyLlama-1.1B's published shape (hidden_size=2048,
+  22 layers, 32 attention heads / 4 KV heads) -- a real ~1.1B-parameter
+  sibling architecture, comfortably larger than the student above.
 
 Both are randomly initialized by default and trained on synthetic random
 token ids -- this exercises the training loop's shapes/losses/gradient flow
@@ -42,23 +45,25 @@ class ModelSpec:
     num_key_value_heads: int
 
 
-# TinyLlama-1.1B's published architecture (~1.1B parameters).
+# JackFram/llama-160m's published architecture (~162M parameters) -- small
+# enough to train on CPU for this demo, while still a real architecture
+# (commonly used as a speculative-decoding draft model for larger Llamas).
 STUDENT_SPEC = ModelSpec(
+    hidden_size=768,
+    intermediate_size=3072,
+    num_hidden_layers=12,
+    num_attention_heads=12,
+    num_key_value_heads=12,
+)
+
+# TinyLlama-1.1B's published architecture (~1.1B parameters) -- comfortably
+# larger than STUDENT_SPEC above, to act as its distillation teacher.
+TEACHER_SPEC = ModelSpec(
     hidden_size=2048,
     intermediate_size=5632,
     num_hidden_layers=22,
     num_attention_heads=32,
     num_key_value_heads=4,
-)
-
-# Roughly Open-LLaMA-3B sized -- comfortably larger than STUDENT_SPEC above,
-# to act as its distillation teacher.
-TEACHER_SPEC = ModelSpec(
-    hidden_size=3200,
-    intermediate_size=8640,
-    num_hidden_layers=26,
-    num_attention_heads=32,
-    num_key_value_heads=32,
 )
 
 # A tiny stand-in for both specs above: same code path, no real
