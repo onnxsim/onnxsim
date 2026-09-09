@@ -139,6 +139,115 @@ def test_step_graph_is_a_pure_function_of_its_state():
         np.testing.assert_allclose(straight[name], resumed[name], rtol=0, atol=1e-6)
 
 
+def _linear_fit_step_graph_sgd_momentum(rows, k, n):
+    """The same fit as :func:`_linear_fit_step_graph`, but optimized by
+    :func:`qat_graph.sgd_momentum_update` instead of Adam -- one state tensor
+    (the momentum buffer) instead of two, and one per-step scalar (``lr``)
+    instead of three."""
+    b = qat_graph.GraphBuilder()
+    y_hat = b.matmul("x", b.transpose("w"))
+    diff = b.sub(y_hat, "y")
+    grad = b.mul(b.matmul(b.transpose(diff), "x"), b.const(2.0 / (rows * n)))
+    w_next, mom_next = qat_graph.sgd_momentum_update(b, "w", grad, "mom", "lr")
+    return qat_graph.make_step_graph(
+        b,
+        constants={
+            "x": ([rows, k], onnx.TensorProto.FLOAT),
+            "y": ([rows, n], onnx.TensorProto.FLOAT),
+        },
+        state={
+            "w": ([n, k], w_next),
+            "mom": ([n, k], mom_next),
+        },
+        scalars=["lr"],
+        loss=b.mean_square(diff),
+    )
+
+
+def _numpy_sgd_momentum_linear_fit(x, y, num_steps, lr=0.1):
+    """The same fit, as a hand-rolled numpy heavy-ball momentum loop --
+    :func:`_numpy_adam_linear_fit`'s counterpart for the new optimizer."""
+    rows, k = x.shape
+    n = y.shape[1]
+    w = np.zeros((n, k))
+    mom = np.zeros_like(w)
+    for _ in range(num_steps):
+        grad = 2.0 * ((x @ w.T - y).T @ x) / (rows * n)
+        mom = qat_graph.SGD_MOMENTUM * mom + grad
+        w = w - lr * mom
+    return w
+
+
+def _run_linear_fit_sgd_momentum(
+    step, x, y, num_steps, lr=0.1, losses=None, providers=None
+):
+    # w and the momentum buffer share the parameter's [n, k] shape.
+    zeros = np.zeros((y.shape[1], x.shape[1]))
+    return qat_graph.run_step_graph(
+        step,
+        constants={"x": x, "y": y},
+        state={"w": zeros, "mom": zeros},
+        num_steps=num_steps,
+        scalars=lambda t: dict(lr=lr),
+        providers=providers,
+        losses=losses,
+    )
+
+
+def test_step_graph_sgd_momentum_matches_the_numpy_loop_it_replaces():
+    rng = np.random.default_rng(6)
+    rows, k, n = 32, 5, 3
+    x = rng.standard_normal((rows, k))
+    w_true = rng.standard_normal((n, k))
+    y = x @ w_true.T
+
+    step = _linear_fit_step_graph_sgd_momentum(rows, k, n)
+    final = _run_linear_fit_sgd_momentum(step, x, y, num_steps=400)
+    reference = _numpy_sgd_momentum_linear_fit(x, y, num_steps=400)
+
+    # Both recover the generating weight; the step graph computes in float32
+    # (what accelerators have) against the loop's float64, so they agree to
+    # float32 precision rather than exactly.
+    assert np.abs(final["w"] - w_true).max() < 1e-5
+    assert np.abs(final["w"] - reference).max() < 1e-5
+
+
+def test_step_graph_sgd_momentum_reports_a_decreasing_loss():
+    rng = np.random.default_rng(7)
+    rows, k, n = 24, 4, 2
+    x = rng.standard_normal((rows, k))
+    y = x @ rng.standard_normal((n, k)).T
+
+    losses = []
+    step = _linear_fit_step_graph_sgd_momentum(rows, k, n)
+    _run_linear_fit_sgd_momentum(step, x, y, num_steps=200, losses=losses)
+
+    assert len(losses) == 200
+    assert losses[-1] < losses[0] * 1e-3
+
+
+def test_step_graph_sgd_momentum_is_a_pure_function_of_its_state():
+    """Running N steps and then M more is the same as running N + M: nothing
+    is carried between calls except the state the graph declares."""
+    rng = np.random.default_rng(8)
+    rows, k, n = 16, 4, 3
+    x = rng.standard_normal((rows, k))
+    y = x @ rng.standard_normal((n, k)).T
+    step = _linear_fit_step_graph_sgd_momentum(rows, k, n)
+
+    straight = _run_linear_fit_sgd_momentum(step, x, y, num_steps=60)
+    part = _run_linear_fit_sgd_momentum(step, x, y, num_steps=25)
+    resumed = qat_graph.run_step_graph(
+        step,
+        constants={"x": x, "y": y},
+        state=part,
+        num_steps=35,
+        scalars=lambda t: dict(lr=0.1),
+    )
+    for name in ("w", "mom"):
+        np.testing.assert_allclose(straight[name], resumed[name], rtol=0, atol=1e-6)
+
+
 def test_step_graph_is_a_valid_model_and_declares_its_state():
     step = _linear_fit_step_graph(8, 3, 2)
     onnx.checker.check_model(step.model)

@@ -163,6 +163,13 @@ case round_to_nearest
   node Cast [cast_4] [cast_6] {to=1}
   node Mul [sign_5,cast_6] [mul_7] {}
   result mul_7
+case sgd_momentum_update
+  init c_1 1 [] 0x3f666666
+  node Mul [c_1,mom] [mul_2] {}
+  node Add [mul_2,g] [add_3] {}
+  node Mul [lr,add_3] [mul_4] {}
+  node Sub [p,mul_4] [sub_5] {}
+  result sub_5,add_3
 case step_graph
   init c_4 1 [] 0x3f666666
   init c_5 1 [] 0x3f7fbe77

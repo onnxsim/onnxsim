@@ -244,6 +244,14 @@ std::vector<std::string> CaseAdamUpdate() {
   return lines;
 }
 
+std::vector<std::string> CaseSgdMomentumUpdate() {
+  GraphBuilder b;
+  const SgdMomentumOutputs out = SgdMomentumUpdate(b, "p", "g", "mom", "lr");
+  auto lines = RenderBuilder(b);
+  lines.push_back("  result " + out.param_next + "," + out.mom_next);
+  return lines;
+}
+
 std::vector<std::string> CaseStepGraph() {
   GraphBuilder b;
   const std::string diff = b.Sub("student", "teacher");
@@ -395,6 +403,7 @@ Cases() {
           {"masks_and_clip", CaseMasksAndClip},
           {"planner", CasePlanner},
           {"round_to_nearest", CaseRoundToNearest},
+          {"sgd_momentum_update", CaseSgdMomentumUpdate},
           {"step_graph", CaseStepGraph},
       };
   return cases;

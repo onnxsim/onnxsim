@@ -57,6 +57,10 @@ inline constexpr float kAdamBeta1 = 0.9f;
 inline constexpr float kAdamBeta2 = 0.999f;
 inline constexpr float kAdamEps = 1e-8f;
 
+// Classic (heavy-ball) SGD momentum's standard hyper-parameter, matching
+// qat_graph.py's SGD_MOMENTUM.
+inline constexpr float kSgdMomentum = 0.9f;
+
 // The opset and IR version every emitted step graph declares. Pinned rather
 // than inherited from the model being trained: the emitter's own operators are
 // written against these, and a step graph is a new graph rather than an edit
@@ -203,6 +207,23 @@ AdamOutputs AdamUpdate(GraphBuilder& b, const std::string& param,
 // The two bias-correction factors for step `t` (0-based), the host-side half
 // of AdamUpdate's contract.
 std::pair<float, float> AdamBiasCorrections(int64_t t);
+
+// Appends one classic (heavy-ball) momentum SGD step to `b` and returns
+// (param', mom'): mom' = momentum*mom + grad; param' = param - lr*mom'.
+//
+// `momentum` is baked in as a graph constant, not a per-step scalar input the
+// way `lr` is -- see qat_graph.py's sgd_momentum_update for why that is a
+// real, deliberate limitation, and why (unlike Adam's m/v) this optimizer
+// needs no bias-correction scalar.
+struct SgdMomentumOutputs {
+  std::string param_next;
+  std::string mom_next;
+};
+SgdMomentumOutputs SgdMomentumUpdate(GraphBuilder& b, const std::string& param,
+                                     const std::string& grad,
+                                     const std::string& mom,
+                                     const std::string& lr,
+                                     float momentum = kSgdMomentum);
 
 // A pure function performing one optimizer step.
 //
