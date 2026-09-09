@@ -4884,6 +4884,86 @@ super-block covers 32 output channels, and the probe also moved four bytes at
 more per-channel float32 table, which the bias is the obvious candidate for
 and which no probe has yet moved.
 
+### The LLM path quantises differently, and here it is exactly
+
+The convolution pipeline's quantiser was pinned down earlier: `scale =
+float32(peak)/float32(127.5)`, round half to even, offset 128. The `llm_build`
+path had resisted, sitting at 94.7% with "an unexplained per-row negation".
+The negation was the clue, and all three of its differences are real:
+
+```python
+scale = -w[argmax|w|] / 128      # the SIGNED weight at the peak, negated
+code  = clip(floor(w/scale + 0.5) + 128, 0, 255)     # ties round toward +inf
+```
+
+* **`/128`, not `/127.5`.** At 127.5 the fit is 90.4%; at 128, 95.2%.
+* **The signed peak, negated.** The scale is not `|peak|/128` -- it is the
+  weight *at* the peak index, sign included, with a minus in front. Stated
+  without the arithmetic: the row's most extreme weight always maps to code 0
+  and zero maps to 128, whichever sign that extreme has. It is the usual code
+  mirrored. Using `|peak|` instead scores 54% -- about half the rows, which is
+  exactly how many happen to have a positive extreme.
+* **Ties round toward `+inf`.** Every last miss sat at exactly `x.5`, and
+  every one of them rounded up: `-88.5` became `-88`, not `-89`.
+
+And the precision is **the checkpoint's own**, not the compiler's. The same
+weights written as a BF16 safetensors file are quantised from bfloat16 values;
+written as F32, from float32. This was worth an experiment rather than an
+assumption -- a bfloat16 fit of an F32 checkpoint scores nothing at all.
+
+| checkpoint | matmuls | exact |
+| --- | --- | --- |
+| BF16 | q, k, v, o, gate, up, down | **100.000%**, 32 of 32 rows each |
+| F32 | q_proj | **100.000%**, 32 of 32 rows |
+
+With the addressing already solved, that closes the `llm_build` weight table:
+its contents are now computable from the checkpoint alone, the same as the
+convolution table. Two quantisers in one toolchain, sharing no constant --
+which is worth remembering before assuming any other part of the two paths
+matches.
+
+### Checking an mcode without Docker and without a card
+
+Everything above needed a Pulsar2 image to compile with or an AX650N to
+confirm on. That makes it untestable in ordinary CI, and a format nobody
+re-checks is a format that quietly rots. `mcode.py` fixes that: the codec and
+every structural rule confirmed on hardware, in a module that imports numpy
+and onnx and nothing else, plus three real compiled streams committed under
+`fixtures/`.
+
+`mcode.check(blob)` returns a list of violations -- empty means well-formed as
+far as the format is understood. The rules are exactly the confirmed findings,
+no more:
+
+1. the segment table is a loader manifest, and its word counts must tile the
+   stream from the end of the header to the tail vector;
+2. the codec round-trips byte for byte;
+3. `a7` sits within four bytes of every segment boundary but the first (the
+   verb can begin just before the word boundary its segment starts on);
+4. only the six known verbs, and only tags below the verb range plus `a1` and
+   the odd-register form of each;
+5. at least 94% of non-zero bytes belong to a recognised form;
+6. no unexplained non-zero run is longer than twelve bytes.
+
+Rules 3, 5 and 6 are thresholds, so they are measured rather than guessed:
+across seventy real streams -- convolutional and `llm_build`, up to 1.8 MB --
+coverage never fell below 94.1%, and the longest unexplained run anywhere was
+nine bytes. Writing rule 3 down from memory as "every segment opens with a7"
+produced a checker that failed on all three fixtures; the real streams
+corrected it.
+
+**What it catches, and what it does not.** A deleted byte, bulk noise, a lost
+manifest, a stream that is not an mcode at all -- all caught. A single flipped
+byte in an operand is *not*, and should not be: operands are addresses and
+sizes the allocator chose, and the format permits any of them. This checks
+form.
+
+**There is deliberately no evaluator.** What a verb computes is not known --
+no verb's datapath semantics have been established, and 25 of the 28 operand
+slots that move between builds hold allocator output. An interpreter that
+produced numbers would be inventing them. `check` answers the question that
+can be answered honestly: could the runtime load and walk this?
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

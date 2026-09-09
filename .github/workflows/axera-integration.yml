@@ -10,6 +10,12 @@ name: Axera Integration
 # runs on any stock runner with just onnxsim + onnxruntime -- no Docker, no
 # device.
 #
+# The `pulsar2-compat` job also runs tests/test_axera_mcode_validator.py, which
+# checks the mcode codec and every confirmed structural rule
+# (scripts/axera/mcode.py) against real compiled streams committed under
+# scripts/axera/fixtures/ -- so the reverse-engineered format is regression-
+# tested on every push, with no Docker and no card.
+#
 # `pulsar2-docker-convert` is the real thing: an actual `pulsar2 build`
 # (Docker) + `axcl_run_model` (device) conversion, following
 # scripts/axera/README.md's confirmed-real workflow, plus
@@ -44,6 +50,7 @@ on:
       - "tests/test_axera_op_coverage_hardware.py"
       - "tests/test_axera_quantonnx.py"
       - "tests/test_axera_mcode_structure.py"
+      - "tests/test_axera_mcode_validator.py"
 
 concurrency:
   group: axera-integration-${{ github.ref }}
@@ -111,7 +118,7 @@ jobs:
       - name: Run in-tree smoke tests
         working-directory: ${{ runner.temp }}
         run: |
-          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_compat.py" "$GITHUB_WORKSPACE/tests/test_pulsar2_simulator.py" "$GITHUB_WORKSPACE/tests/test_axera_conv_matmul_coverage.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_compat.py" "$GITHUB_WORKSPACE/tests/test_pulsar2_simulator.py" "$GITHUB_WORKSPACE/tests/test_axera_conv_matmul_coverage.py" "$GITHUB_WORKSPACE/tests/test_axera_mcode_validator.py"
       - name: Run static Pulsar2 compatibility suite
         working-directory: ${{ runner.temp }}
         run: |
