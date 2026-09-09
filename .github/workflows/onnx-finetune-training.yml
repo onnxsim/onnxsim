@@ -1,0 +1,163 @@
+name: onnx-finetune training path
+
+# tools/onnx-finetune's actual training path (scripts/generate_artifacts.py +
+# the onnx-finetune C++ binary, see ../../tools/onnx-finetune/README.md) needs
+# a training-enabled ONNX Runtime built from source -- ~20-40 minutes cold,
+# unlike onnx-finetune-lora.yml's graph-surgery-only jobs, which run against a
+# plain `pip install onnxruntime`. Kept in a separate workflow (rather than a
+# third job in onnx-finetune-lora.yml) so its cache/trigger tuning doesn't
+# leak into that file's fast/cheap jobs.
+#
+# Cost is why this does not gate every PR that touches tools/onnx-finetune/**
+# (that's already covered, cheaply, by onnx-finetune-lora.yml). It runs
+# weekly, on demand, and on pull requests that touch the training path
+# itself -- src/main.cpp, CMakeLists.txt, or the scripts the toy end-to-end
+# example actually exercises. Mirrors big-endian.yml's trigger shape.
+#
+# ONNX Runtime here is pinned to v1.19.2 (matching tools/onnx-finetune/README.md),
+# deliberately NOT the v1.29.0 this repo's own standalone C++/WASM build uses
+# (third_party/onnxruntime-1.29.0, cmake/build_ort.cmake, rust.yml's
+# `onnxruntime-src-1.29.0` cache) -- that build is not training-enabled, is
+# assembled fully out-of-tree via ExternalProject_Add, and nobody has verified
+# onnx-finetune still builds against 1.29.0's newer/less-stable training API
+# surface. Bumping onnx-finetune's ORT version is a separate task.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/onnx-finetune/src/**"
+      - "tools/onnx-finetune/CMakeLists.txt"
+      - "tools/onnx-finetune/scripts/generate_artifacts.py"
+      - "tools/onnx-finetune/scripts/make_toy_model.py"
+      - "tools/onnx-finetune/scripts/make_synthetic_data.py"
+      - "tools/onnx-finetune/tests/test_training_e2e.py"
+      - ".github/workflows/onnx-finetune-training.yml"
+
+concurrency:
+  group: onnx-finetune-training-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ORT_SRC_DIR: ${{ github.workspace }}/third_party/onnxruntime-1.19.2
+  ORT_DIST_DIR: ${{ github.workspace }}/ort-dist # curated, cache-friendly
+
+jobs:
+  training-e2e:
+    name: build ORT (training) + onnx-finetune toy end-to-end
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # 1. ONNX Runtime source (with submodules: protobuf, abseil, onnx, ...).
+      # Headers only need this tree, regardless of whether the build below
+      # runs or is skipped by a dist-cache hit -- CMakeLists.txt's
+      # ORT_SOURCE_DIR include dirs (include/onnxruntime/core/session,
+      # orttraining/orttraining/training_api/include) live here, not in the
+      # build output.
+      - name: Cache ONNX Runtime source (v1.19.2)
+        id: cache-ort-src
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.ORT_SRC_DIR }}
+          key: onnxruntime-src-1.19.2
+
+      - name: Clone ONNX Runtime source (v1.19.2)
+        if: steps.cache-ort-src.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch v1.19.2 --depth 1 \
+            https://github.com/microsoft/onnxruntime.git "${{ env.ORT_SRC_DIR }}"
+          cd "${{ env.ORT_SRC_DIR }}"
+          git submodule update --init --recursive --depth 1
+
+      # 2. Curated build output only: libonnxruntime.so (+ its versioned
+      # symlinks) and the compiled Python training package -- NOT the full
+      # build/ tree (object files, CMakeFiles, etc. for protobuf+abseil+onnx+
+      # ORT built from source can be many GB; GitHub's cache budget is a
+      # shared 10GB/repo LRU pool that rust.yml's sccache + its own
+      # onnxruntime-src-1.29.0 cache already draw on). Only libonnxruntime.so
+      # is needed to satisfy CMakeLists.txt's
+      # `find_library(... PATHS ${ORT_BUILD_DIR} REQUIRED NO_DEFAULT_PATH)`;
+      # it doesn't need the rest of the build tree.
+      #
+      # Trailing "-v1" is a manual cache-bust switch: bump it if these staged
+      # contents or the build flags below change without the ORT version
+      # itself changing.
+      - name: Cache curated ONNX Runtime build output (lib + python bindings)
+        id: cache-ort-dist
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.ORT_DIST_DIR }}
+          key: onnxruntime-dist-1.19.2-training-pybind-ubuntu-24.04-v1
+
+      - name: Build ONNX Runtime (training + pybind, one build serves both consumers)
+        if: steps.cache-ort-dist.outputs.cache-hit != 'true'
+        working-directory: ${{ env.ORT_SRC_DIR }}
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install cmake numpy packaging
+          df -h
+          # --enable_training is a superset of --enable_training_apis (what
+          # the C++-only build needs), so this one build satisfies both
+          # generate_artifacts.py (via --enable_pybind) and the onnx-finetune
+          # C++ binary. --build_wheel is deliberately omitted: --enable_pybind
+          # alone already populates build/Release/build/lib/, and the
+          # wheel-install step has a documented setuptools/distutils bug (see
+          # README.md) whose own documented workaround -- pointing PYTHONPATH
+          # at that directory -- is what this workflow does instead.
+          python3 tools/ci_build/build.py \
+            --build_dir build --config Release --parallel \
+            --skip_tests --allow_running_as_root \
+            --build_shared_lib --enable_training --enable_pybind
+          df -h
+
+      - name: Stage curated ORT dist (lib + python bindings)
+        if: steps.cache-ort-dist.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${{ env.ORT_DIST_DIR }}/lib" "${{ env.ORT_DIST_DIR }}/python"
+          # -P preserves symlinks (libonnxruntime.so -> libonnxruntime.so.1 ->
+          # libonnxruntime.so.1.19.2); actions/cache tars the directory so
+          # symlinks survive the round trip.
+          cp -P "${{ env.ORT_SRC_DIR }}"/build/Release/libonnxruntime.so* \
+            "${{ env.ORT_DIST_DIR }}/lib/"
+          cp -r "${{ env.ORT_SRC_DIR }}"/build/Release/build/lib/. \
+            "${{ env.ORT_DIST_DIR }}/python/"
+          du -sh "${{ env.ORT_DIST_DIR }}"
+
+      # 3. Build the onnx-finetune C++ binary against ORT_SRC_DIR (headers,
+      # always present from step 1) + ORT_DIST_DIR/lib (libonnxruntime.so,
+      # from either the cache or the fresh build+stage above).
+      - name: Configure and build onnx-finetune
+        run: |
+          cmake -B tools/onnx-finetune/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DORT_SOURCE_DIR="${{ env.ORT_SRC_DIR }}" \
+            -DORT_BUILD_DIR="${{ env.ORT_DIST_DIR }}/lib"
+          cmake --build tools/onnx-finetune/build --parallel
+
+      # 4. Run the toy end-to-end test. generate_artifacts.py needs the
+      # training python bindings via PYTHONPATH (see README's troubleshooting
+      # note on the setuptools/distutils wheel-install bug -- this sidesteps
+      # it entirely by never installing a wheel); the eval half of the test
+      # imports a *plain* pip-installed onnxruntime, verifying the README's
+      # claim that finetuned.onnx loads fine outside a training build.
+      - name: Install plain onnxruntime + pytest (for evaluating finetuned.onnx)
+        run: pip install onnx numpy onnxruntime pytest
+
+      - name: pytest tools/onnx-finetune/tests/test_training_e2e.py
+        env:
+          ONNX_FINETUNE_BIN: ${{ github.workspace }}/tools/onnx-finetune/build/onnx-finetune
+          ORT_TRAINING_PYTHONPATH: ${{ env.ORT_DIST_DIR }}/python
+        run: pytest tools/onnx-finetune/tests/test_training_e2e.py -v
