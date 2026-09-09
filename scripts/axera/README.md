@@ -4547,6 +4547,54 @@ Worth noting for anyone extending this: the HuggingFace repo also carries
 4.x, 5.x and dated "temp" builds, one of which is `4.2-temp-cosyvoice2` --
 a TTS-specific hotfix, which may matter to the vocoder work above.
 
+### The DSPs, and why they cannot close the gap to the rating
+
+**First, what the card is.** Three independent identifiers agree: the PCI
+device is `1f4b:0650`, the host firmware is `ax650_card.pac`, and `axcl-smi`
+reports `AX650N`. So the measurements above are AX650N measurements. (An
+M5Stack LLM-8850 is a different part -- AX8850, rated 24 TOPS INT8 -- and
+would present a different device ID and firmware.)
+
+**The DSPs are real and programmable.** The AX650N carries **two Cadence
+Tensilica Vision Q7** cores alongside the NPU, and Cadence lists the part on
+its platform pages, so a Tensilica toolchain can target them. From this side
+the interface is thin: `libaxcl_dsp.so` exports exactly seven functions --
+`PowerOn`, `PowerOff`, `LoadBin`, `EnableCore`, `DisableCore`, `PRC`,
+`Query`. That is a firmware loader and a mailbox. No kernels ship with AXCL,
+and `pulsar2 build` has no DSP path at all: its backends are `ax620l`,
+`ax650npu` and `ax8860`, and neither the 6.0 nor the 7.0 release notes
+mention DSP.
+
+**And the arithmetic says they would not be enough anyway.** A Vision Q7
+provides **512 8-bit MACs per cycle**. Closing the gap from the measured
+10.13 TOPS to the rated 18 would need 7.87 TOPS from two DSPs, or 3.9 TOPS
+each -- which at 512 MACs/cycle demands roughly **3.8 GHz**. Even a generous
+1.5 GHz gives about 1.5 TOPS per core, so the pair can offer perhaps 2 to 3
+TOPS: a useful 20-30% on top of the NPU, not a doubling.
+
+**Where the gap actually is: clock.** The NPU sustains **4,949 MAC/cycle**
+across its three cores (measured, stable across shapes). At that rate,
+18 TOPS requires
+
+    18e12 / (2 * 4949) = 1.82 GHz
+
+and the implied clock measured here is **854-949 MHz** -- almost exactly
+half. So the rating is consistent with the same silicon at roughly twice the
+clock this card runs at, and the card idles at 75 C in an M.2 slot. The
+shortfall looks like clock and thermal headroom rather than lost efficiency,
+which also fits the earlier finding that the NPU executes essentially the
+cycle count its own compiler predicts.
+
+That is a hypothesis about *why*, not a measurement: AXCL exposes no NPU
+frequency (`axcl-smi info --npu` reports usage and an engine version, no
+clock), so the 1.82 GHz figure is inferred from the rating and the measured
+MAC rate, not read from the hardware.
+
+**So: using the DSPs is possible but would need firmware written from
+scratch with a toolchain that is not part of this stack, and by the numbers
+it buys a fraction of what the rating implies. The rating's missing factor is
+much better explained by clock.**
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
