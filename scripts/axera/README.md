@@ -5128,41 +5128,45 @@ stepped candidate offsets one at a time in Python, which on a 192 MB table is
 minutes per bit; vectorising it is the difference between a run that finishes
 and one that looks like a hang.
 
-### The 2-D path, read by discovered geometry, and where it stops
+### The 2-D path reads exactly too: 100% of a real resnet18d
 
 The 1-D layout is read by discovering each block's geometry from the table
-rather than assuming a formula. Applying the same treatment to the 2-D path,
-against a real resnet18d, says two things.
+rather than assuming a formula. The same treatment applied to the 2-D path
+reads **every convolution weight of a real resnet18d -- 11,186,016 of them,
+22 of 22 layers, 100.0% exact.**
 
-**Every layer with 128 or fewer input channels reads exactly.** That includes
-both packings that store plain INT8 instead of bit planes -- the `(32,3,3,3)`
-first convolution, whose three input channels put the kernel row fastest, and
-every 1x1 shortcut, which chunks input channels 36 at a time with the next
-chunk 144 bytes on. Neither had been implemented before, and both read 0%
-until they were; both now read 100%.
+Three things had to be added, and each was a boundary rather than a
+refinement:
 
-**And it stops at exactly 128 input channels.**
+* **The two plain-INT8 packings.** Not every 2-D weight is bit-sliced. A
+  narrow input (under four channels) stores plain bytes with the kernel row
+  fastest, and a 1x1 convolution stores plain bytes chunked 36 input channels
+  at a time with the next chunk 144 bytes on. The `(32,3,3,3)` first
+  convolution and every 1x1 shortcut read **0%** until these were implemented.
+* **The output-channel term is a bit-interleave, not a stride.** Assuming a
+  stride reads the first 32 output channels and then stops, which is exactly
+  the 25% a 128-channel layer returned. Each bit of the channel index carries
+  its own cost, found by searching for channel `2**b`.
+* **Input channels split into blocks of 128.** `A = 18 * min(Cin, 128)` caps a
+  block, so a 256-channel layer read 50% and a 512-channel one 25% -- `128/Cin`
+  to the digit. The next block keeps addressing channels by their **absolute**
+  index; only its base moves. For a `(256,256,3,3)` layer the second block
+  sits 35,968 bytes after the first.
 
-| `Cin` | layers | exact |
-| --- | --- | --- |
-| 3, 32, 64, 128 | 12 | **100.00%** each |
-| 256 | 4 | 50.00% each |
-| 512 | 3 | 25.00% each |
+**A correction, and it is about my own tooling rather than the format.** An
+earlier pass here reported that walking for the next input block "finds
+nothing that verifies", and concluded the remaining channels must be stored
+differently. That was wrong. The edit adding the walk had silently failed to
+apply -- a string replacement that matched nothing -- so the run being measured
+was the unmodified script, and it produced a plausible number (39.4%, stable
+across two search budgets) that looked like a finding. Once the walk was
+actually applied and *verified to be in the file*, every layer closed.
 
-Those are `128/Cin` to the digit, and they do not move: the totals at a search
-budget of 24 and of 256 are identical (4,403,040 of 11,186,016 weights, 39.4%).
-So it is not the search running out -- it is a real boundary, and one the
-format already named: `A = 18 * min(Cin, 128)`, the same
-`_WBT2D_UNIT_CAP = 128` the layout code has carried all along.
-
-**What does not clear it, which is the useful part.** In the 1-D layout the
-equivalent boundary was input-channel splitting, and walking for the next
-block cleared it. Doing the same here -- searching for output channel 0's
-pattern over input channels 128 and up -- finds nothing that verifies. The
-remaining input channels are therefore *not* the same block relocated: whatever
-holds them differs in more than its base address. That is a narrower and more
-useful statement than "the layout stops at 128", and it is where the next
-probe should go.
+The lesson is the one this file keeps relearning in different costumes: a
+measurement that agrees with the previous measurement is not thereby
+confirmed. Two runs at different search budgets returning identical totals was
+read as "the boundary is real"; it was equally consistent with "neither run
+contained the change".
 
 ### The LLM path quantises differently, and here it is exactly
 
