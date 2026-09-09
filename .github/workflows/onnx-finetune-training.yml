@@ -190,7 +190,14 @@ jobs:
       # from either the cache or the fresh build+stage above).
       - name: Configure and build onnx-finetune
         run: |
-          cmake -B tools/onnx-finetune/build \
+          # -S is required: without it, `cmake -B tools/onnx-finetune/build`
+          # defaults the *source* directory to the current working directory
+          # (the repo root), configuring onnxsim's own root CMakeLists.txt
+          # (which add_subdirectory()s third_party/onnx, not present here
+          # since this job checks out with submodules: false) instead of
+          # tools/onnx-finetune/CMakeLists.txt -- caught by the first real
+          # run reaching this step, after the ORT build itself completed.
+          cmake -S tools/onnx-finetune -B tools/onnx-finetune/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DORT_SOURCE_DIR="${{ env.ORT_SRC_DIR }}" \
             -DORT_BUILD_DIR="${{ env.ORT_DIST_DIR }}/lib"
