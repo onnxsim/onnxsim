@@ -97,6 +97,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx
+import onnx.inliner
 
 from onnxsim import backend
 
@@ -234,6 +235,15 @@ class GraphBuilder:
     def __init__(self, prefix: str = "") -> None:
         self.nodes: List[onnx.NodeProto] = []
         self.initializer: List[onnx.TensorProto] = []
+        # Model-local functions called by any templated (see
+        # onnxsim.graph_grad's `_template_rule`) gradient rule this builder's
+        # nodes use, keyed by (domain, name) to register each one once no
+        # matter how many call sites reference it. Empty for every graph
+        # built only from hand-written rules -- make_step_graph only pays for
+        # the extra opset_import and the final inline pass when this is
+        # non-empty.
+        self.functions: List[onnx.FunctionProto] = []
+        self._function_ids: set = set()
         self._prefix = prefix
         self._counter = 0
 
@@ -248,10 +258,41 @@ class GraphBuilder:
         self.initializer.append(onnx.numpy_helper.from_array(array, name))
         return name
 
-    def op(self, op_type: str, inputs: Sequence[str], hint: str = "", **attrs) -> str:
+    def op(
+        self,
+        op_type: str,
+        inputs: Sequence[str],
+        hint: str = "",
+        domain: str = "",
+        **attrs,
+    ) -> str:
         out = self.name(hint or op_type.lower())
-        self.nodes.append(onnx.helper.make_node(op_type, list(inputs), [out], **attrs))
+        self.nodes.append(
+            onnx.helper.make_node(op_type, list(inputs), [out], domain=domain, **attrs)
+        )
         return out
+
+    def call(
+        self, fn: onnx.FunctionProto, inputs: Sequence[str], hint: str = ""
+    ) -> List[str]:
+        """Emits a call node to the model-local function ``fn`` and returns
+        one output name per ``fn.output``.
+
+        Registers ``fn`` (once) so the caller that ultimately assembles a
+        ``ModelProto`` -- :func:`make_step_graph` -- can attach it and expand
+        every call site via ``onnx.inliner.inline_local_functions`` before
+        the graph is handed to a runtime. A backend never sees the custom
+        domain: inlining happens before the model is returned.
+        """
+        fn_id = (fn.domain, fn.name)
+        if fn_id not in self._function_ids:
+            self._function_ids.add(fn_id)
+            self.functions.append(fn)
+        outs = [self.name(hint or fn.name.lower()) for _ in fn.output]
+        self.nodes.append(
+            onnx.helper.make_node(fn.name, list(inputs), outs, domain=fn.domain)
+        )
+        return outs
 
     # The handful of operators the hand-derived gradients below actually use.
     # Deliberately kept to ops with broad execution-provider coverage: no
@@ -469,10 +510,25 @@ def make_step_graph(
     graph = onnx.helper.make_graph(
         b.nodes, name, inputs, outputs, initializer=b.initializer
     )
+    opset_imports = [onnx.helper.make_opsetid("", _OPSET)]
+    if b.functions:
+        # One opset_import per distinct function domain, at a fixed private
+        # version this repo controls entirely -- unrelated to _OPSET, which
+        # is what the function *bodies* were authored against internally
+        # (each FunctionProto carries its own opset_import for that).
+        domains = sorted({fn.domain for fn in b.functions})
+        opset_imports += [onnx.helper.make_opsetid(d, 1) for d in domains]
     model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", _OPSET)]
+        graph, opset_imports=opset_imports, functions=list(b.functions)
     )
     model.ir_version = _IR_VERSION
+    if b.functions:
+        # Expand every call site before this model reaches a runtime: no
+        # execution provider needs to know about the private grad domain,
+        # onnx.inliner already fully resolves it, and the result composes
+        # with the rest of this module exactly like a hand-written rule's
+        # nodes always have.
+        model = onnx.inliner.inline_local_functions(model)
     return StepGraph(
         model=model,
         state={n: out for n, (_, out) in state.items()},

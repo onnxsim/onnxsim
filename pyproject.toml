@@ -36,6 +36,11 @@ classifiers = [
 rich = ["rich != 12.1.0"]
 # onnxruntime is preferred for constant folding and correctness checking.
 # When it is not installed, onnxsim falls back to onnx's reference evaluator.
+# onnxsim.lora.export_lora_adapter additionally needs onnxruntime >= 1.20 for
+# its AdapterFormat class -- checked at call time via a hasattr guard, not
+# by raising this floor, since every other onnxruntime use in the package
+# (including the rest of onnxsim.lora/onnxsim.qat's own step-graph training)
+# works on far older onnxruntime.
 onnxruntime = ["onnxruntime >= 1.6.0"]
 # sympy lets the MACs/FLOPs report keep dynamic dimensions (dim_param, e.g.
 # "batch") as symbols and produce a formula instead of assuming them to be 1.

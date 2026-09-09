@@ -120,6 +120,16 @@ from onnxsim.llm_fp4 import (
 )
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
+from onnxsim.lora import (
+    LoraAdapter,
+    LoraBlock,
+    LoraTarget,
+    apply_qlora,
+    discover_lora_blocks,
+    export_lora_adapter,
+    inject_lora,
+    train_lora,
+)
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
 from onnxsim.lqer import apply_lqer
 from onnxsim.memory_planning import (
@@ -360,6 +370,14 @@ __all__ = [
     "apply_leptoquant",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "inject_lora",
+    "train_lora",
+    "apply_qlora",
+    "export_lora_adapter",
+    "discover_lora_blocks",
+    "LoraAdapter",
+    "LoraTarget",
+    "LoraBlock",
     "apply_lqer",
     "apply_svdquant",
     "apply_norm_tweaking",
