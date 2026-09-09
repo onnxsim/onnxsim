@@ -10,6 +10,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "constant_folding.h"
@@ -429,6 +430,49 @@ std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
   return onnxsim::EvaluateSymbolicValues(vg);
 }
 
+// ModelProto-flavoured CollectRankUnsafeDataValues (declared further down,
+// next to the Graph-native folder) -- see that function's comment for what
+// "rank unsafe" means and why the mark has to be carried forward. Rank comes
+// from the model's type map rather than a Value's own sizes(), and a name
+// missing from that map counts as "rank not proven", i.e. unsafe.
+std::unordered_set<std::string> CollectRankUnsafeDataValuesOnModel(
+    const onnx::GraphProto& graph,
+    const std::unordered_map<std::string, const onnx::TypeProto*>& type_map,
+    const onnx::shape_inference::DataValueMap& data_map) {
+  std::unordered_set<std::string> unsafe;
+  auto rank_is_modelled = [&type_map](const std::string& name) {
+    auto iter = type_map.find(name);
+    if (iter == type_map.end() || !iter->second->has_tensor_type()) {
+      return false;
+    }
+    const auto& tensor_type = iter->second->tensor_type();
+    return tensor_type.has_shape() && tensor_type.shape().dim_size() <= 1;
+  };
+  // A GraphProto's nodes are required to be in topological order, so one pass
+  // over them propagates the mark completely.
+  for (const auto& node : graph.node()) {
+    bool tainted = false;
+    for (const std::string& in : node.input()) {
+      if (data_map.count(in) == 0) {
+        continue;
+      }
+      if (unsafe.count(in) != 0 || !rank_is_modelled(in)) {
+        tainted = true;
+        break;
+      }
+    }
+    for (const std::string& out : node.output()) {
+      if (data_map.count(out) == 0) {
+        continue;
+      }
+      if (tainted || !rank_is_modelled(out)) {
+        unsafe.insert(out);
+      }
+    }
+  }
+  return unsafe;
+}
+
 // Partial shape evaluation (issue #139) via ONNX data propagation.
 //
 // The plain constant folder only folds a node when *all* of its inputs are
@@ -561,6 +605,11 @@ void _EvalPartialShape(onnx::ModelProto& model) {
 
   const auto type_map = BuildTypeMap(model);
 
+  // Values whose propagated data must not be trusted -- see
+  // CollectRankUnsafeDataValues' own comment.
+  const std::unordered_set<std::string> rank_unsafe =
+      CollectRankUnsafeDataValuesOnModel(model.graph(), type_map, data_map);
+
   // Maps the output of a foldable node to the constant tensor it produces. Each
   // such node is rewritten into a `Constant` node holding this value.
   std::unordered_map<std::string, onnx::TensorProto> folded_values;
@@ -574,6 +623,9 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     const std::string& output = node.output(0);
     auto data_iter = data_map.find(output);
     if (data_iter == data_map.end()) {
+      continue;
+    }
+    if (rank_unsafe.count(output) != 0) {
       continue;
     }
 
@@ -657,6 +709,9 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     if (data_iter == data_map.end()) {
       continue;
     }
+    if (rank_unsafe.count(node.input(1)) != 0) {
+      continue;
+    }
     const onnx::TensorShapeProto& shape_value = data_iter->second;
     if (shape_value.dim_size() == 0) {
       continue;
@@ -727,6 +782,12 @@ void _EvalPartialShape(onnx::ModelProto& model) {
       int64_t element_count = 1;
       for (int64_t d : dims) element_count *= d;
       if (element_count != static_cast<int64_t>(flat.size())) continue;
+      // SymTensor models a rank-0 scalar or a rank-1 vector and nothing else
+      // (sym_value_eval.h), and its evaluators say so -- EvalSlice is "rank-1
+      // data, axis 0 only", Transpose is evaluated as the identity. Same
+      // reasoning as CollectRankUnsafeDataValues: a flat element sequence must
+      // not be reinterpreted under a rank >= 2 output's dims (issue #1284).
+      if (dims.size() > 1) continue;
       onnx::TensorProto tp;
       tp.set_data_type(elem_type);
       for (int64_t d : dims) tp.add_dims(d);
@@ -844,6 +905,68 @@ void _EvalPartialShape(onnx::ModelProto& model) {
   }
 }
 
+// Values whose ONNX-propagated data is meaningless because the propagation ran
+// on a tensor of a rank it does not model (onnxsim issue #1284).
+//
+// Data propagation carries a value as a `TensorShapeProto` -- a flat sequence
+// with no rank of its own -- because it exists to resolve *shape* scaffolding,
+// which is rank <= 1 by nature. Every `PartialDataPropagationFunction` is
+// written for that form: `Slice`'s says outright "Only supports axis = 0 since
+// the data comes from Shape", and `DataPropagationContextImpl::getInputData`
+// refuses to seed data from an initializer of rank >= 2 for the same reason.
+//
+// Nothing enforces that on a value produced *inside* the propagation, though.
+// Let a rank >= 2 tensor in -- e.g. the `[3, 2]` pads matrix in the
+// `Concat -> Reshape([-1, 2]) -> Slice(steps=-1) -> Transpose -> Reshape([-1])`
+// construction PyTorch emits for `F.pad` -- and the propagators silently read
+// its flat entries as a rank-1 element order: that `Slice` must reverse the 3
+// rows, but the propagator reverses all 6 flat entries. The value is still
+// "fully known", just wrong, and it keeps propagating to everything downstream,
+// so an element-count check on the folded node alone does not catch it.
+//
+// So mark a value's propagated data unusable when the value's own rank is not
+// provably <= 1, and carry that mark forward through any node that consumed a
+// marked value's data. `Shape(x)` and friends are unaffected: `x` carries no
+// propagated data of its own, so a rank-4 activation feeding a `Shape` marks
+// nothing -- which is the whole point of this pass (issue #139).
+std::unordered_set<std::string> CollectRankUnsafeDataValues(
+    const std::vector<onnx::Node*>& node_ptrs,
+    const onnx::shape_inference::DataValueMap& data_map) {
+  std::unordered_set<std::string> unsafe;
+  // A rank onnx's own data propagation models: a rank-0 scalar or a rank-1
+  // vector, and only when shape inference actually proved which.
+  auto rank_is_modelled = [](const onnx::Value* v) {
+    return v->has_sizes() && v->sizes().size() <= 1;
+  };
+  // node_ptrs is in topological order, so a producer is always visited before
+  // its consumers and one pass suffices.
+  for (const onnx::Node* node : node_ptrs) {
+    bool tainted = false;
+    for (const onnx::Value* in : node->inputs()) {
+      const std::string& name = in->uniqueName();
+      // Only an input that actually carries propagated data can taint this
+      // node's output; an ordinary activation input cannot.
+      if (data_map.count(name) == 0) {
+        continue;
+      }
+      if (unsafe.count(name) != 0 || !rank_is_modelled(in)) {
+        tainted = true;
+        break;
+      }
+    }
+    for (const onnx::Value* out : node->outputs()) {
+      const std::string& name = out->uniqueName();
+      if (data_map.count(name) == 0) {
+        continue;
+      }
+      if (tainted || !rank_is_modelled(out)) {
+        unsafe.insert(name);
+      }
+    }
+  }
+  return unsafe;
+}
+
 // Graph-native counterpart of _EvalPartialShape: same two rewrites (fold a
 // fully-known shape-family output to a Constant; materialize a Reshape's
 // shape input as a Constant with a single -1 slot when everything else is
@@ -900,6 +1023,11 @@ bool _EvalPartialShapeOnGraph(
     }
   }
 
+  // Values whose propagated data must not be trusted -- see
+  // CollectRankUnsafeDataValues' own comment.
+  const std::unordered_set<std::string> rank_unsafe =
+      CollectRankUnsafeDataValues(node_ptrs, data_map);
+
   // Maps the output of a foldable node to the constant tensor it produces.
   std::unordered_map<std::string, onnx::Tensor> folded_values;
   for (onnx::Node* node : node_ptrs) {
@@ -907,6 +1035,7 @@ bool _EvalPartialShapeOnGraph(
     onnx::Value* out = node->outputs()[0];
     auto data_iter = data_map.find(out->uniqueName());
     if (data_iter == data_map.end()) continue;
+    if (rank_unsafe.count(out->uniqueName())) continue;
 
     const onnx::TensorShapeProto& value = data_iter->second;
     bool fully_known = true;
@@ -966,6 +1095,7 @@ bool _EvalPartialShapeOnGraph(
     if (folded_values.count(node->outputs()[0]->uniqueName())) continue;
     auto data_iter = data_map.find(node->inputs()[1]->uniqueName());
     if (data_iter == data_map.end()) continue;
+    if (rank_unsafe.count(node->inputs()[1]->uniqueName())) continue;
     const onnx::TensorShapeProto& shape_value = data_iter->second;
     if (shape_value.dim_size() == 0) continue;
     int unknown = 0;
@@ -1034,6 +1164,12 @@ bool _EvalPartialShapeOnGraph(
       int64_t element_count = 1;
       for (int64_t d : dims) element_count *= d;
       if (element_count != static_cast<int64_t>(flat.size())) continue;
+      // SymTensor models a rank-0 scalar or a rank-1 vector and nothing else
+      // (sym_value_eval.h), and its evaluators say so -- EvalSlice is "rank-1
+      // data, axis 0 only", Transpose is evaluated as the identity. Same
+      // reasoning as CollectRankUnsafeDataValues: a flat element sequence must
+      // not be reinterpreted under a rank >= 2 output's dims (issue #1284).
+      if (dims.size() > 1) continue;
       onnx::Tensor t;
       t.elem_type() = elem_type;
       t.sizes() = dims;
