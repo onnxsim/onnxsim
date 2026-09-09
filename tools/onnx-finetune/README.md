@@ -33,7 +33,7 @@ API or `onnxruntime.training.artifacts`. You need to build ONNX Runtime from
 source with training enabled, once:
 
 ```sh
-git clone --branch v1.19.2 https://github.com/microsoft/onnxruntime.git
+git clone --branch v1.29.0 https://github.com/microsoft/onnxruntime.git
 cd onnxruntime
 git submodule update --init --recursive
 
