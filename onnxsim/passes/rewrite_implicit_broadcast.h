@@ -92,13 +92,13 @@ struct RewriteImplicitBroadcast final : public PredicateBasedPass {
 
   static bool IsMultidirectionalBroadcastOp(Symbol kind) {
     static const std::vector<Symbol> kOps = {
-        Symbol("Add"),          Symbol("Sub"),         Symbol("Mul"),
-        Symbol("Div"),          Symbol("Pow"),         Symbol("Mod"),
-        Symbol("Max"),          Symbol("Min"),         Symbol("Mean"),
-        Symbol("Sum"),          Symbol("Greater"),     Symbol("GreaterOrEqual"),
-        Symbol("Less"),         Symbol("LessOrEqual"), Symbol("Equal"),
-        Symbol("And"),          Symbol("Or"),          Symbol("Xor"),
-        Symbol("BitwiseAnd"),   Symbol("BitwiseOr"),   Symbol("BitwiseXor"),
+        Symbol("Add"),        Symbol("Sub"),         Symbol("Mul"),
+        Symbol("Div"),        Symbol("Pow"),         Symbol("Mod"),
+        Symbol("Max"),        Symbol("Min"),         Symbol("Mean"),
+        Symbol("Sum"),        Symbol("Greater"),     Symbol("GreaterOrEqual"),
+        Symbol("Less"),       Symbol("LessOrEqual"), Symbol("Equal"),
+        Symbol("And"),        Symbol("Or"),          Symbol("Xor"),
+        Symbol("BitwiseAnd"), Symbol("BitwiseOr"),   Symbol("BitwiseXor"),
         Symbol("Where"),
     };
     for (const Symbol& s : kOps) {

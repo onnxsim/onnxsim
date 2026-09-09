@@ -41,14 +41,12 @@ def _simplify_with_pass(model, **kwargs):
     )
 
 
-def _elementwise_ops(model):
-    return [n for n in model.graph.node if n.op_type != "Expand"]
-
-
 def _operand_shapes(model, node):
     value_shapes = {}
-    for vi in list(model.graph.input) + list(model.graph.value_info) + list(
-        model.graph.output
+    for vi in (
+        list(model.graph.input)
+        + list(model.graph.value_info)
+        + list(model.graph.output)
     ):
         value_shapes[vi.name] = tuple(
             d.dim_value for d in vi.type.tensor_type.shape.dim
