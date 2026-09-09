@@ -57,12 +57,14 @@ run.
 
 from __future__ import annotations
 
+import functools
 import itertools
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx
 
+from onnxsim import graph_grad_templates_gen as _templates
 from onnxsim import qat_graph
 
 # The complete set of operators the rules below can emit. Same standard the
@@ -1708,6 +1710,7 @@ def build_backward(
     shapes: Dict[str, Sequence[int]],
     grad_outputs: Dict[str, str],
     targets: Sequence[str],
+    rules: Optional[Dict[str, Rule]] = None,
 ) -> Dict[str, str]:
     """Appends the reverse-mode gradient of ``nodes`` to ``b`` and returns
     where each target's gradient landed.
@@ -1760,17 +1763,23 @@ def build_backward(
             through ``nodes`` (a disconnected target almost always means the
             slice or the target list is wrong, and a zero gradient would hide
             it), or if a shape is missing from ``shapes``.
+    :param rules: overrides :data:`_RULES` for this call. Exists for
+            :mod:`tests.test_graph_grad_templates`, which builds a copy with
+            one or two entries replaced by a :func:`_template_rule` -- never
+            for ordinary callers, which should omit this and get the
+            hand-written table every other rule in this module still uses.
     """
+    rules = _RULES if rules is None else rules
     ctx = _Backward(b, shapes)
     grads: Dict[str, str] = dict(grad_outputs)
 
     for node in reversed(list(nodes)):
-        rule = _RULES.get(node.op_type)
+        rule = rules.get(node.op_type)
         if rule is None:
             raise UnsupportedOpError(
                 f"no gradient rule for op type {node.op_type!r} "
                 f"(node {node.name or node.output[0]!r}); "
-                f"onnxsim.graph_grad differentiates {sorted(SUPPORTED_OPS)}"
+                f"onnxsim.graph_grad differentiates {sorted(rules)}"
             )
         if len(node.output) != 1:
             raise UnsupportedOpError(
@@ -1810,3 +1819,100 @@ def build_backward(
             )
         result[target] = grads[target]
     return result
+
+
+# --- Templated rules (proof of concept) ------------------------------------
+#
+# An alternative to hand-transcribing a rule's graph construction directly in
+# Python (and, separately, a second time in graph_grad.cpp): author the rule
+# once in onnxscript, compile it offline to a checked-in ONNX FunctionProto
+# (scripts/codegen/generate_grad_templates.py ->
+# onnxsim.graph_grad_templates_gen), and instantiate the same text from
+# either language via ONNX's own function-inlining machinery. onnxscript
+# itself is never imported here -- only onnx.parser, already a base
+# dependency, to read the checked-in text back into a FunctionProto.
+#
+# Not wired into :data:`_RULES`: these two functions exist to prove the
+# mechanism (see tests/test_graph_grad_templates.py, which checks
+# GradBatchNormalization against torch.autograd) before any production rule
+# is migrated to it. `_grad_add`/`_grad_batch_normalization` above remain
+# what every real caller of this module gets.
+
+
+@functools.lru_cache(maxsize=None)
+def _load_template(text: str) -> onnx.FunctionProto:
+    return onnx.parser.parse_function(text)
+
+
+def _grad_add_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Same shape as :func:`_grad_add`, but the identity-gradient core
+    (``da = db = g``) comes from a call to the checked-in ``GradAdd``
+    function instead of being written here directly. Broadcast-undoing
+    stays outside the template, exactly as it does for the hand-written
+    rule -- see graph_grad_templates_gen's module docstring for why."""
+    fn = _load_template(_templates.GRAD_ADD)
+    da, db = ctx.b.call(fn, [g])
+    out = ctx.shape(node.output[0])
+    return [
+        ctx.reduce_to(da, out, ctx.shape(node.input[0])),
+        ctx.reduce_to(db, out, ctx.shape(node.input[1])),
+    ]
+
+
+def _grad_batch_normalization_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Same validation and shape-resolution as
+    :func:`_grad_batch_normalization` (rank/shape checks, the per-channel
+    broadcast reshape, the reduction axes), but the actual gradient
+    arithmetic comes from a call to the checked-in
+    ``GradBatchNormalization`` function -- the rule this repo's own
+    dvar-derivation bug was in, so the one most worth proving out this way
+    first."""
+    x = node.input[0]
+    scale, bias = node.input[1], node.input[2]
+    mean, var = node.input[3], node.input[4]
+    name = node.output[0]
+    x_shape = ctx.shape(x)
+    rank = len(x_shape)
+    if rank < 2:
+        raise UnsupportedOpError(
+            f"BatchNormalization needs a batch and a channel axis, got "
+            f"input shape {x_shape} (node {name!r})"
+        )
+    channels = int(x_shape[1])
+    for label, tensor in (
+        ("scale", scale),
+        ("B", bias),
+        ("mean", mean),
+        ("var", var),
+    ):
+        shape = ctx.shape(tensor)
+        if tuple(shape) != (channels,):
+            raise UnsupportedOpError(
+                f"BatchNormalization's {label} has shape {tuple(shape)}, not "
+                f"({channels},) (node {name!r})"
+            )
+    eps = float(_attr(node, "epsilon", 1e-5))
+    bshape = (1, channels) + (1,) * (rank - 2)
+
+    def bcast(t: str) -> str:
+        return ctx.b.op("Reshape", [t, ctx.int64_const(bshape, "shape")])
+
+    channel_axes = ctx.int64_const([0] + list(range(2, rank)), "axes")
+    fn = _load_template(_templates.GRAD_BATCH_NORMALIZATION)
+    dx, dscale, dbias, dmean, dvar = ctx.b.call(
+        fn,
+        [
+            g,
+            x,
+            bcast(mean),
+            bcast(var),
+            bcast(scale),
+            ctx.b.const(eps),
+            channel_axes,
+        ],
+    )
+    return [dx, dscale, dbias, dmean, dvar]
