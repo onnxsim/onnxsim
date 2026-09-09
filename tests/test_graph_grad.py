@@ -25,6 +25,7 @@ import math
 
 import numpy as np
 import onnx
+import onnx.inliner
 import onnx.parser
 import onnx.shape_inference
 import pytest
@@ -113,6 +114,18 @@ def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
     convenience -- it is the contract: the rules read forward tensors
     (including intermediate node outputs) by name, so they only mean anything
     where those tensors exist.
+
+    A templated rule (see graph_grad.py's "Templated rules" section --
+    :data:`graph_grad._RULES` uses one for "Add" and "BatchNormalization")
+    appends a call to a model-local function rather than plain ops directly,
+    so ``b.functions`` has to be attached and every call site inlined via
+    ``onnx.inliner.inline_local_functions`` before the result is a plain
+    graph a runtime can execute -- exactly what
+    :func:`onnxsim.qat_graph.make_step_graph` does for a real step graph, and
+    what ``tests/test_graph_grad_templates.py``'s own ``_backward_model``
+    already does. Skipping this would leave an unresolved "onnxsim.grad"
+    -domain call node in the graph, which is not itself an op in
+    :data:`graph_grad.BACKWARD_OPS`.
     """
     shapes = _static_shapes(model)
     output = model.graph.output[0].name
@@ -121,19 +134,20 @@ def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
         b, list(model.graph.node), shapes, {output: seed_name}, targets
     )
 
-    emitted = {node.op_type for node in b.nodes}
-    assert emitted <= graph_grad.BACKWARD_OPS, (
-        f"backward graph reached outside the allowlist: "
-        f"{sorted(emitted - graph_grad.BACKWARD_OPS)}"
-    )
-
     # A returned gradient can be an alias of an existing tensor (Identity
     # emits no node at all), and a graph output has to be produced by a node,
-    # so each one is copied out under a stable name.
+    # so each one is copied out under a stable name. Their names are recorded
+    # so the allowlist check below can tell this scaffolding's own Identity
+    # nodes apart from a real one a rule emitted (see
+    # graph_grad.BACKWARD_OPS's own comment on why "Identity" is now in that
+    # set at all) -- a blanket exclusion of every "Identity" node would hide
+    # the latter along with the former.
     nodes = list(model.graph.node) + list(b.nodes)
     outputs = []
+    copy_out_names = set()
     for target in targets:
         name = f"grad_{target}"
+        copy_out_names.add(name)
         nodes.append(onnx.helper.make_node("Identity", [grads[target]], [name]))
         outputs.append(
             onnx.helper.make_tensor_value_info(
@@ -152,11 +166,31 @@ def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
         outputs,
         initializer=list(model.graph.initializer) + list(b.initializer),
     )
+    opset_imports = [onnx.helper.make_opsetid("", 17)]
+    opset_imports += [onnx.helper.make_opsetid(fn.domain, 1) for fn in b.functions]
     built = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+        graph, functions=list(b.functions), opset_imports=opset_imports
     )
     built.ir_version = 8
     onnx.checker.check_model(built)
+    if b.functions:
+        built = onnx.inliner.inline_local_functions(built)
+
+    # Everything the backward pass itself emitted, forward nodes and this
+    # function's own copy-out Identity nodes excluded, must stay inside the
+    # execution-provider allowlist -- checked post-inlining so a templated
+    # rule's call node (resolved away by inlining) does not need its own
+    # entry in the allowlist.
+    forward_ops = {node.op_type for node in model.graph.node}
+    emitted = {
+        node.op_type
+        for node in built.graph.node
+        if node.output[0] not in copy_out_names
+    } - forward_ops
+    assert emitted <= graph_grad.BACKWARD_OPS, (
+        f"backward graph reached outside the allowlist: "
+        f"{sorted(emitted - graph_grad.BACKWARD_OPS)}"
+    )
     return built
 
 
@@ -1198,15 +1232,22 @@ def test_the_emitted_backward_stays_inside_the_operator_allowlist():
     bodies = [body for body, _ in _CASES.values()] + list(_BLOCKS.values())
     for body in bodies:
         model = _model(body)
-        b = qat_graph.GraphBuilder()
-        graph_grad.build_backward(
-            b,
-            list(model.graph.node),
-            _static_shapes(model),
-            {model.graph.output[0].name: "dY"},
-            [value.name for value in model.graph.input],
-        )
-        emitted |= {node.op_type for node in b.nodes}
+        targets = [value.name for value in model.graph.input]
+        # _backward_model attaches and inlines any templated rule's
+        # model-local function (see its own docstring) -- needed here too,
+        # not just by the numeric tests, since a templated rule's raw call
+        # node is not itself an op in BACKWARD_OPS.
+        backward = _backward_model(model, targets)
+        forward_ops = {node.op_type for node in model.graph.node}
+        # _backward_model's own copy-out Identity nodes (named "grad_<target>"
+        # there), excluded the same way -- a genuine Identity a rule emitted
+        # (GradAddTemplated's inlined body) is not scaffolding and must count.
+        copy_out_names = {f"grad_{t}" for t in targets}
+        emitted |= {
+            node.op_type
+            for node in backward.graph.node
+            if node.output[0] not in copy_out_names
+        } - forward_ops
 
     # Exact equality, both ways: nothing escapes the allowlist, and the
     # allowlist is not padded with ops no rule can actually produce.

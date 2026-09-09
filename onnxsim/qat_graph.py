@@ -200,6 +200,7 @@ EP_FRIENDLY_OPS = frozenset(
         "Exp",
         "Gather",
         "Greater",
+        "Identity",
         "Less",
         "MatMul",
         "Mul",
@@ -215,6 +216,17 @@ EP_FRIENDLY_OPS = frozenset(
         "Transpose",
     }
 )
+
+# ``Identity`` was admitted for :mod:`onnxsim.graph_grad`'s templated "Add"
+# rule (:data:`onnxsim.graph_grad.BACKWARD_OPS`, which explains in full why a
+# checked-in ONNX ``FunctionProto`` -- unlike a hand-written rule -- cannot
+# express a pure alias without an actual node). Not a coverage gap being
+# papered over: ``Identity`` is a plain copy with no arithmetic at all, and
+# qat_entry.cpp's own preference for renaming a tensor over emitting an
+# ``Identity`` for it (see its comment where that happens) was about not
+# emitting a needless node, not about ``Identity`` lacking WebGPU/WebNN/NPU
+# coverage -- unlike every other addition recorded above, this one needed no
+# coverage check at all.
 
 # Adam's own standard hyper-parameters, matching the hand-rolled loops in
 # adaround.py/adaquant.py/brecq.py exactly so a ported loop keeps its

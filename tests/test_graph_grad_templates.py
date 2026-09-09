@@ -1,15 +1,22 @@
-"""Proof of concept for onnxsim.graph_grad's *templated* gradient rules --
-see graph_grad.py's own "Templated rules (proof of concept)" section and
+"""Tests for onnxsim.graph_grad's *templated* gradient rules -- see
+graph_grad.py's own "Templated rules" section and
 scripts/codegen/generate_grad_templates.py's module docstring for what these
 are: a VJP rule authored once in onnxscript, compiled offline to a checked-in
 ONNX FunctionProto (onnxsim.graph_grad_templates_gen), and instantiated via a
 call node + ``onnx.inliner.inline_local_functions`` instead of hand-writing
 the same graph construction directly in Python (and a second time in C++).
 
-Not exercising the production ``_RULES`` table: :func:`graph_grad.build_backward`
-takes an explicit ``rules=`` override for exactly this purpose, so this file
-substitutes ``_grad_add_templated``/``_grad_batch_normalization_templated``
-without touching what every other caller of the module gets.
+``_grad_add_templated``/``_grad_batch_normalization_templated`` are what
+production ``_RULES`` now uses for "Add"/"BatchNormalization" -- so
+:func:`_templated_rules` below builds a table that is, deliberately, just
+``_RULES`` again (spelled out explicitly rather than relying on that being
+true, so this file keeps testing the templated path even if that ever
+changes). ``_hand_written_rules`` builds the opposite table, pinning those
+two entries back to the original hand-written ``_grad_add``/
+``_grad_batch_normalization`` -- no longer reachable through ``_RULES``, but
+kept specifically so this file's numeric cross-check has something
+independent to check against. ``build_backward``'s ``rules=`` override
+exists for exactly this.
 
 Two independent checks:
 
@@ -134,6 +141,17 @@ def _templated_rules() -> dict:
     return rules
 
 
+def _hand_written_rules() -> dict:
+    """The reference table: "Add"/"BatchNormalization" pinned back to the
+    original hand-written rules, which :data:`graph_grad._RULES` no longer
+    uses directly (see graph_grad.py's "Templated rules" section) but keeps
+    defined for exactly this cross-check."""
+    rules = dict(graph_grad._RULES)
+    rules["Add"] = graph_grad._grad_add
+    rules["BatchNormalization"] = graph_grad._grad_batch_normalization
+    return rules
+
+
 def test_grad_add_templated_matches_closed_form():
     """``Y = Add(A, B)`` with ``B`` broadcasting against ``A`` -- exercises
     both the template call (``da = db = g``) and the broadcast-undoing
@@ -195,7 +213,7 @@ def test_grad_batch_normalization_templated_matches_torch_autograd():
         f"templated backward reached outside the allowlist: "
         f"{sorted(emitted - graph_grad.BACKWARD_OPS - {'Identity'})}"
     )
-    hand_written = _backward_model(model, targets, dict(graph_grad._RULES))
+    hand_written = _backward_model(model, targets, _hand_written_rules())
 
     rng = np.random.default_rng(0)
     n, c, h, w = 2, 3, 4, 4

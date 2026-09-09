@@ -40,7 +40,8 @@
             <a href="#sec-parse">Parse graph</a>
             <a href="#sec-convert">Convert</a>
             <a href="#sec-quantize">Quantize</a>
-            <a href="#sec-qat">Fine-tune</a>
+            <a href="#sec-qat">Fine-tune (QAT)</a>
+            <a href="#sec-lora">Fine-tune (LoRA)</a>
             <a href="#sec-visualize">Netron</a>
             <a href="#sec-dims">Dynamic dims</a>
             <a href="#sec-console">Console</a>
@@ -550,6 +551,128 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="qat-metrics" style="display: none; margin-top: 0.4em;"></div>
         </div>
         <script type="module" src="./qat_ui.mjs"></script>
+        <h2 id="sec-lora">Fine-tune with a LoRA adapter</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Injects a trainable low-rank (<code>X @ A @ B</code>) branch
+                around each eligible <code>MatMul</code>/<code>Gemm</code>/<code>Conv</code>
+                layer and trains only <code>A</code>/<code>B</code> by Adam,
+                with every base weight frozen -- in your browser, with no
+                server. This is <code>onnxsim.inject_lora</code> +
+                <code>onnxsim.train_lora</code>, reachable without Python: the
+                WebAssembly module performs the injection and emits one
+                optimizer step as a plain ONNX inference graph, and
+                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+                runs that graph in a loop, exactly as the QAT panel above
+                does for its own step graph. See
+                <a href="https://github.com/onnxsim/onnxsim/blob/master/onnxsim/lora_entry.h" target="_blank" rel="noopener">onnxsim/lora_entry.h</a>.
+            </p>
+            <p class="tool-note">
+                <b>What it can and cannot do.</b> The adapter is trained to
+                reproduce a <b>reference</b> model's own output on the same
+                inputs, so the two models have to differ or there is nothing
+                to learn -- a natural pairing is <b>base = onnxsim-simplified</b>
+                against <b>reference = the original upload</b>, patching back
+                whatever simplification changed with a small trainable branch
+                instead of a full re-tune. It trains on a handful of
+                calibration rows, so treat the result as a demonstration of
+                the machinery rather than a production adapter. <b>QLoRA</b>
+                (composing this with an NF4-quantized base) and
+                <b>caller-supplied training targets</b> (rather than a
+                reference model) are not wired into this panel yet -- see
+                <code>lora_finetune.mjs</code>'s own top comment. Exporting to
+                ONNX Runtime's native <code>.onnx_adapter</code> format
+                (<code>export_lora_adapter</code>) needs its Python
+                <code>onnxruntime.AdapterFormat</code> API, which has no C++
+                counterpart to reach from wasm, so this panel exports the
+                trained <b>full model</b> only.
+            </p>
+            <div>
+                <label for="lora-base">base (trained)</label>
+                <select id="lora-base">
+                    <option value="converted" selected>onnxsim-simplified (Convert section)</option>
+                    <option value="original">original (uploaded)</option>
+                    <option value="quantized">quantized (Quantize panel output)</option>
+                </select>
+                <label for="lora-reference" title="The model the adapter is trained to reproduce. Must differ from the base model, or the loss starts at zero and stays there.">reference (reproduce this)</label>
+                <select id="lora-reference">
+                    <option value="original" selected>original (uploaded)</option>
+                    <option value="converted">onnxsim-simplified (Convert section)</option>
+                    <option value="quantized">quantized (Quantize panel output)</option>
+                </select>
+            </div>
+            <div>
+                <label for="lora-rank" title="The low-rank branch's inner dimension. Larger trains more parameters and can fit a bigger gap between base and reference.">rank</label>
+                <input type="number" id="lora-rank" value="8" min="1" max="256" step="1" style="width: 4em;">
+                <label for="lora-alpha" title="Scales the injected branch before it is added back (branch * alpha / rank). Leave blank to add it unscaled, matching inject_lora's own default.">alpha (optional)</label>
+                <input type="text" id="lora-alpha" placeholder="(unscaled)" style="width: 5em;">
+                <label for="lora-seed" title="Seeds A's random (Kaiming-normal) initialization. B always starts at zero, so this only affects the very first optimizer step.">init seed</label>
+                <input type="number" id="lora-seed" value="0" min="0" step="1" style="width: 4em;">
+            </div>
+            <div>
+                <span class="tool-note">inject into:</span>
+                <input type="checkbox" id="lora-target-matmul" checked>
+                <label for="lora-target-matmul">MatMul</label>
+                <input type="checkbox" id="lora-target-gemm" checked>
+                <label for="lora-target-gemm">Gemm</label>
+                <input type="checkbox" id="lora-target-conv" checked>
+                <label for="lora-target-conv">Conv</label>
+                <input type="checkbox" id="lora-restrict-names">
+                <label for="lora-restrict-names" title="With this ticked, only the weight initializer names listed below are injected (an empty list injects nothing). Left unticked, every eligible layer of the checked op types above is injected.">restrict to names:</label>
+                <input type="text" id="lora-target-names" placeholder="w1, w2, ... (comma-separated)" style="width: 16em;">
+            </div>
+            <div>
+                <label for="lora-block-input" title="Leave both blank to discover blocks automatically: the graph is cut wherever exactly one activation is live, which is the boundary a self-contained slice needs -- the same liveness argument the QAT panel's own auto-discovery uses.">block input tensor</label>
+                <input type="text" id="lora-block-input" placeholder="(auto-discover)" style="width: 12em;">
+                <label for="lora-block-output">block output tensor</label>
+                <input type="text" id="lora-block-output" placeholder="(auto-discover)" style="width: 12em;">
+                <label for="lora-max-targets" title="How many injected adapters to merge into one block before closing it. 1 gives per-adapter blocks; a large value gives one block per gap between undifferentiable ops -- on a model with no such gap, the whole graph as a single block.">adapters per block</label>
+                <input type="number" id="lora-max-targets" value="2" min="1" max="16" step="1" style="width: 4em;">
+            </div>
+            <div>
+                <label for="lora-rows" title="Calibration rows captured from the base and reference models and held resident for the whole loop.">calibration rows</label>
+                <input type="number" id="lora-rows" value="8" min="1" max="128" step="1" style="width: 4em;">
+                <label for="lora-fill" title="'sample data' fetches a fresh real image (frgfm/imagenette) or sentence (stanfordnlp/sst2) from Hugging Face per row; the synthetic fills are seeded, so every row is identical.">calibration data</label>
+                <select id="lora-fill">
+                    <option value="sample" selected>sample data (Hugging Face image/text)</option>
+                    <option value="random">random (deterministic)</option>
+                    <option value="ones">ones</option>
+                    <option value="zeros">zeros</option>
+                </select>
+                <label for="lora-steps">steps</label>
+                <input type="number" id="lora-steps" value="200" min="1" max="20000" step="1" style="width: 5em;">
+                <label for="lora-lr">learning rate</label>
+                <input type="text" id="lora-lr" value="1e-3" style="width: 5em;">
+                <label for="lora-batch-size" title="Rows per optimizer step. 0 (or the full row count) trains full batch, the only mode with no per-step input beyond the scalars.">minibatch</label>
+                <input type="number" id="lora-batch-size" value="0" min="0" max="128" step="1" style="width: 4em;">
+                <label for="lora-batch-seed">seed</label>
+                <input type="number" id="lora-batch-seed" value="0" min="0" step="1" style="width: 4em;">
+            </div>
+            <div>
+                <label for="lora-ep" title="Which execution provider runs the training loop and the calibration captures. The loop is hundreds of forward+backward passes over the block, which is what makes an accelerator worth using here; every accelerated choice falls back to WASM.">execution provider</label>
+                <select id="lora-ep">
+                    <option value="webgpu" selected>WebGPU (fallback to WASM)</option>
+                    <option value="wasm">WASM</option>
+                    <option value="webnn-gpu">WebNN · GPU (fallback to WASM)</option>
+                    <option value="webnn-npu">WebNN · NPU (fallback to WASM)</option>
+                    <option value="webnn-cpu">WebNN · CPU (fallback to WASM)</option>
+                </select>
+            </div>
+            <div>
+                <input type="checkbox" id="lora-lr-decay" checked>
+                <label for="lora-lr-decay" title="Decays the learning rate linearly to zero across the run (train_lora's lr_decay, on by default there too).">learning-rate decay</label>
+                <input type="checkbox" id="lora-metrics-toggle" checked>
+                <label for="lora-metrics-toggle" title="After training, run the reference, the base and the trained model on the same random input through onnxruntime-web and report both drifts against the reference -- relative L2 error and SQNR, the same metric the Quantize/QAT panels report.">report before/after quality</label>
+            </div>
+            <div class="debug-actions">
+                <button id="lora-button" type="button">Fine-tune</button>
+                <button id="lora-download" type="button" style="display: none;">download model ↓</button>
+                <span id="lora-status" class="tool-note"></span>
+            </div>
+            <div id="lora-curve" style="display: none; margin-top: 0.4em;"></div>
+            <div id="lora-metrics" style="display: none; margin-top: 0.4em;"></div>
+        </div>
+        <script type="module" src="./lora_ui.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted
