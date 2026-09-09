@@ -4884,12 +4884,12 @@ super-block covers 32 output channels, and the probe also moved four bytes at
 more per-channel float32 table, which the bias is the obvious candidate for
 and which no probe has yet moved.
 
-### Reading 90.6% of the vocoder, by discovering the geometry
+### Reading the whole vocoder, by discovering the geometry
 
 Exact-code coverage had stalled at 67.5% with three layers unread. The
 blocker was not the format -- it was that every search so far *assumed* a
-block's geometry and then looked for it. Two assumptions were wrong at once,
-and each hid the other.
+block's geometry and then looked for it. Three assumptions were wrong, and
+each one hid the next.
 
 **The first: that a block's input tile starts on a chunk boundary.** Slots are
 chunked 36 at a time with a 144-byte stride, and a search that lays a tile out
@@ -4907,14 +4907,23 @@ by exact bytes, then take the stride from where channel 1 sits, the odd offset
 from channel 16, and the super-block stride from channel 32, and only then
 verify every code of every output channel.
 
+**The third: that a layer splits its input channels one way.** It does not.
+The split is per **tap**. A byte-by-byte read of a widely dilated build showed
+its tap 0 ending at channel 31 -- with two slots of padding after it -- while
+every other tap of the same layer kept all 128 channels in one block. Choosing
+the split per tap rather than per layer is what closes the last two layers,
+and `conv_pre` wanted an uneven `32 + 160` that no uniform tiling would ever
+have proposed.
+
 | | layers at 100% | weights read |
 | --- | --- | --- |
 | assumed geometry | 20 of 23 | 67.5% |
-| **discovered geometry** | **20 of 23** | **90.6%** |
+| discovered geometry | 20 of 23 | 90.6% |
+| **+ per-tap splits** | **23 of 23** | **100.0%** |
 
-The layer count is the same and the weight count is not, which is the point:
-the earlier pass was scoring whole layers found or not found, and most of the
-"found" ones were only partly read.
+That is every one of the 1,661,152 weights of a real trained vocoder,
+predicted from the ONNX file alone and matched code for code -- transposed
+layers, dilated layers and all.
 
 The conventions it discovers are consistent, and worth stating because they
 are now measured rather than assumed:
@@ -4923,17 +4932,14 @@ are now measured rather than assumed:
   single slot space;
 * a **dilated** one is one block per tap, each tap padded up to a whole number
   of 144-byte chunks;
-* a **transposed** one is one block per polyphase, taps reversed.
+* a **transposed** one is one block per polyphase, taps reversed;
+* and any tap may split its input channels further, unevenly, independently of
+  its neighbours.
 
-**Three layers stay partial**, and they are the same three as before:
-`conv_pre` `(256,192,7)` at 64.3%, and the two 128-channel convolutions with
-the widest dilations (`K=5 d=6` at 75.0%, `K=7 d=12` at 89.3%). What is now
-known about them is that they are split further along the input axis, and not
-evenly: `conv_pre` reads exactly for its first 32 input channels at table
-offset 0, and the widely dilated pair put channels 0..31 in a block of their
-own with channels 32 onward in another. A 36-channel tile matched them at
-first -- until reading the table byte by byte showed the tile ending at
-channel 31 with two slots of padding after it.
+That last point is the one to carry forward. Every earlier failure to read a
+layer was a search looking for a layer-wide rule that does not exist: the
+allocator decides per tap, and the only way to know what it decided is to read
+it back out of the table.
 
 ### The LLM layout at 4096 hidden: 288-column blocks
 
