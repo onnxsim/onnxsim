@@ -1,3 +1,4 @@
+#include "lora_entry.h"
 #include "model_info.h"
 #include "onnx/checker.h"
 #include "onnx/defs/parser.h"
@@ -35,6 +36,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include <emscripten/bind.h>
@@ -1446,6 +1448,455 @@ bool onnxsim_qat_release_plan(int plan_handle) {
   return QatPlans().erase(plan_handle) > 0;
 }
 
+// ---------------------------------------------------------------------------
+// LoRA/QLoRA fine-tuning (onnxsim/lora_entry.h).
+//
+// The same split as QAT's, and for the same reason (see the comment above
+// QAT's own section): building the step graph is graph surgery and belongs
+// in wasm, running it is an ordinary inference loop and belongs wherever the
+// runtime is. lora_entry.h's own top comment is the contract; the object
+// onnxsim_lora_build_step_graph returns names every piece of it.
+//
+// The one shape difference from QAT is that LoRA also needs an *injection*
+// binding. QAT takes an already-quantized model as input -- the quantizer has
+// its own WASM entry points elsewhere (onnxsim_quantize_weight_only_int4 and
+// friends) -- but LoRA's injection step (onnxsim/lora.py's inject_lora) has
+// no such precedent: it is graph surgery private to this module. So the flow
+// here is four calls rather than QAT's three: onnxsim_lora_inject, then
+// onnxsim_lora_build_step_graph, the loop, onnxsim_lora_write_back, and
+// onnxsim_lora_release_plan.
+
+// InjectLoraOptions as a plain JS object with named fields:
+//
+//   { rank, hasAlpha, alpha, targetOpTypes, restrictTargetNames, targetNames,
+//     seed }
+//
+// Absent (or null/undefined) fields keep InjectLoraOptions' own defaults, so
+// `{}` means "inject every eligible MatMul/Gemm/Conv at rank 8, unscaled".
+// `restrictTargetNames`/`targetNames` are the one pair where absent and
+// present-but-empty are different requests, exactly as InjectLoraOptions'
+// own field comment explains: `restrictTargetNames: false` (the default)
+// injects everything eligible regardless of what `targetNames` holds, while
+// `restrictTargetNames: true, targetNames: []` injects nothing at all -- a
+// caller cannot express the second with `targetNames` alone.
+InjectLoraOptions InjectLoraOptionsFromVal(em::val options) {
+  InjectLoraOptions out;
+  if (options.isUndefined() || options.isNull())
+    return out;
+  auto read_bool = [&options](const char *key, bool &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = v.as<bool>();
+  };
+  auto read_int = [&options](const char *key, int64_t &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = static_cast<int64_t>(v.as<double>());
+  };
+  auto read_strings = [&options](const char *key,
+                                  std::vector<std::string> &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = em::vecFromJSArray<std::string>(v);
+  };
+  read_int("rank", out.rank);
+  read_bool("hasAlpha", out.has_alpha);
+  {
+    em::val v = options["alpha"];
+    if (!v.isUndefined() && !v.isNull())
+      out.alpha = v.as<float>();
+  }
+  read_strings("targetOpTypes", out.target_op_types);
+  read_bool("restrictTargetNames", out.restrict_target_names);
+  read_strings("targetNames", out.target_names);
+  {
+    // uint64_t rather than int64_t, matching InjectLoraOptions::seed --
+    // narrowed through a JS double the same way batchSize/batchSeed are
+    // above, which loses nothing for a seed value in practice.
+    em::val v = options["seed"];
+    if (!v.isUndefined() && !v.isNull())
+      out.seed = static_cast<uint64_t>(v.as<double>());
+  }
+  return out;
+}
+
+// LoraOptions as a plain JS object: { batchSize, batchSeed, shuffle } -- the
+// same three fields QatOptions carries for its own minibatch schedule
+// (QatOptionsFromVal above), and nothing else: LoRA has no scales to learn
+// and no sparsity to preserve, so it needs none of QatOptions' other knobs.
+LoraOptions LoraOptionsFromVal(em::val options) {
+  LoraOptions out;
+  if (options.isUndefined() || options.isNull())
+    return out;
+  auto read_bool = [&options](const char *key, bool &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = v.as<bool>();
+  };
+  auto read_int = [&options](const char *key, int64_t &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = static_cast<int64_t>(v.as<double>());
+  };
+  read_int("batchSize", out.batch_size);
+  read_int("batchSeed", out.batch_seed);
+  read_bool("shuffle", out.shuffle);
+  return out;
+}
+
+// One LoraTarget as { weightName, nodeOutput, opType, loraAName, loraBName,
+// rank, hasAlpha, alpha } -- field for field, so a page can list what got
+// injected (which weight, which op type, at what rank) without decoding the
+// model itself. `alpha` is 0 when `hasAlpha` is false, matching
+// LoraTarget::alpha's own "meaningful only when has_alpha is set" contract.
+em::val LoraTargetToVal(const LoraTarget &target) {
+  em::val out = em::val::object();
+  out.set("weightName", target.weight_name);
+  out.set("nodeOutput", target.node_output);
+  out.set("opType", target.op_type);
+  out.set("loraAName", target.lora_a_name);
+  out.set("loraBName", target.lora_b_name);
+  out.set("rank", static_cast<double>(target.rank));
+  out.set("hasAlpha", target.has_alpha);
+  out.set("alpha", target.has_alpha ? target.alpha : 0.0f);
+  return out;
+}
+
+// A LoraAdapter as a plain array of LoraTargetToVal entries -- what
+// onnxsim_lora_inject hands back and what onnxsim_lora_build_step_graph
+// takes in, so JS can filter the array (train only some of the injected
+// branches, per BuildLoraStepGraph's own "a caller may pass a LoraAdapter
+// with a subset of targets" contract) with no C++ round trip.
+em::val LoraAdapterToVal(const LoraAdapter &adapter) {
+  em::val out = em::val::array();
+  for (size_t i = 0; i < adapter.targets.size(); ++i) {
+    out.set(i, LoraTargetToVal(adapter.targets[i]));
+  }
+  return out;
+}
+
+// The inverse of LoraAdapterToVal -- reads a JS array of the same shape back
+// into a LoraAdapter. Throws std::invalid_argument (caught by the calling
+// binding, same as every other refusal here) rather than defaulting a
+// missing field: an adapter entry with, say, no `loraBName` is a caller bug
+// (a hand-built array, or one filtered incorrectly) and BuildLoraStepGraph
+// would fail confusingly further in rather than saying so here.
+LoraAdapter LoraAdapterFromVal(em::val adapter_val) {
+  if (adapter_val.isUndefined() || adapter_val.isNull()) {
+    throw std::invalid_argument("lora adapter is missing");
+  }
+  LoraAdapter out;
+  const int n = adapter_val["length"].as<int>();
+  for (int i = 0; i < n; ++i) {
+    em::val item = adapter_val[i];
+    if (item.isUndefined() || item.isNull()) {
+      throw std::invalid_argument("lora adapter entry " + std::to_string(i) +
+                                  " is missing");
+    }
+    LoraTarget target;
+    target.weight_name = item["weightName"].as<std::string>();
+    target.node_output = item["nodeOutput"].as<std::string>();
+    target.op_type = item["opType"].as<std::string>();
+    target.lora_a_name = item["loraAName"].as<std::string>();
+    target.lora_b_name = item["loraBName"].as<std::string>();
+    target.rank = static_cast<int64_t>(item["rank"].as<double>());
+    target.has_alpha = item["hasAlpha"].as<bool>();
+    target.alpha = target.has_alpha ? item["alpha"].as<float>() : 0.0f;
+    out.targets.push_back(std::move(target));
+  }
+  return out;
+}
+
+// The plans onnxsim_lora_build_step_graph has built, alive on the C++ side
+// and named to JS by an integer handle -- LoRA's own parallel registry to
+// QatPlans() above, not shared with it. A LoraStepPlan is a different C++
+// type from QatStepPlan, and a page that is training a LoRA adapter and a
+// QAT block in the same session (nothing here forbids it) must be able to
+// release one without touching the other's handle numbering.
+std::map<int, LoraStepPlan> &LoraPlans() {
+  static std::map<int, LoraStepPlan> plans;
+  return plans;
+}
+
+// Injects a trainable low-rank adapter branch -- InjectLora, reachable from
+// the page. Unlike onnxsim_qat_build_step_graph, which takes an
+// already-quantized model produced by one of the quantize_* bindings, LoRA
+// has no separate injection entry point elsewhere (see this section's own
+// top comment), so this binding is what produces the model
+// onnxsim_lora_build_step_graph trains.
+//
+// Returns null on a parse failure or a refused injection (an
+// onnx::checker::ValidationError from InjectLora's own final check; the
+// reason goes to stderr, as with every other refusal here), else:
+//
+//   {
+//     model:   Uint8Array,   // serialized ModelProto, the injected model
+//     adapter: [{ weightName, nodeOutput, opType, loraAName, loraBName,
+//                 rank, hasAlpha, alpha }],
+//   }
+//
+// `adapter` is every target InjectLora produced, in injection order -- hand
+// it to onnxsim_lora_build_step_graph unchanged to train all of them, or
+// filter it first to train only some.
+//
+// Like every other model-returning binding here, `model` is a view over a
+// buffer the next call reuses -- copy it out before calling back in.
+em::val onnxsim_lora_inject(const std::string &data, em::val options) {
+  onnx::ModelProto model;
+  if (!model.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+
+  LoraInjectionResult result;
+  try {
+    result = InjectLora(model, InjectLoraOptionsFromVal(options));
+  } catch (const std::exception &e) {
+    std::cerr << "lora_inject error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+
+  em::val model_bytes = SerializeModel(result.model);
+  if (model_bytes.isNull()) {
+    return em::val::null();
+  }
+  em::val out = em::val::object();
+  out.set("model", model_bytes);
+  out.set("adapter", LoraAdapterToVal(result.adapter));
+  return out;
+}
+
+// Builds the step graph for one block of `injected_data` -- BuildLoraStepGraph,
+// reachable from the page. Mirrors onnxsim_qat_build_step_graph's shape and
+// contract closely (see that function's own doc comment for the fuller
+// walkthrough, which applies here too); what differs is LoRA's own: one
+// model rather than a float/quantized pair -- there is no separate teacher
+// model argument here, because the reconstruction target is whatever the
+// caller captures and binds as the block's teacher capture, ordinarily read
+// from a reference model per lora_entry.h's "intended browser flow" --
+// `adapter` (this run's own LoraAdapter, as onnxsim_lora_inject returned it
+// or a caller-filtered subset) in place of a quantization scheme, and
+// `parameters` in the returned object (see below).
+//
+// `num_rows` is how many calibration rows the caller will bind (the leading
+// dimension of every captured activation). It is a shape, not data: nothing
+// here runs the injected model or the reference model, and neither model's
+// activations cross this boundary in this direction.
+//
+// Returns null on a parse failure or a refused block -- see
+// BuildLoraStepGraph's own doc comment for the refusal cases: an unclosed
+// block, a node with no gradient rule (named), an adapter with no targets, or
+// a minibatch whose captures disagree on their row count -- else:
+//
+//   {
+//     stepGraph:  Uint8Array,                  // serialized ModelProto
+//     planHandle: number,                      // for onnxsim_lora_write_back
+//     state:      [{ input, output }],         // feed `output` back to `input`
+//     scalars:    [string],                    // "lora__lr" plus Adam's two
+//                                               // bias-correction factors --
+//                                               // no scale rates, unlike QAT
+//     loss:       string,                      // "" when the graph has none
+//     captures:   [{ input, source, dims, teacher }],
+//     initialState: [{ name, dtype, dims, data }],
+//     rowIndexInput: string,                   // "" unless batchSize > 0
+//     rowIndexSize:  number,
+//     numRows:       number,
+//     parameters:    [string],                 // onnxsim_lora_write_back's
+//                                               // finalState key list --
+//                                               // LoraStepPlan::parameters
+//   }
+//
+// Driving the loop from that is identical to onnxsim_qat_build_step_graph's
+// own (see that function's doc comment): bind every `initialState` tensor by
+// its name and every capture by its `input` (never its `source` -- they
+// differ under a minibatch); feed the `scalars` and, with a minibatch,
+// `rowIndexSize` int64 row indices under `rowIndexInput` each step; read
+// `loss` for diagnostics; and carry each state pair's `output` into its
+// `input` for the next step.
+//
+// Like every other model-returning binding here, `stepGraph` and each
+// `initialState.data` are views over buffers reused by the next call -- copy
+// them out before calling back in.
+em::val onnxsim_lora_build_step_graph(const std::string &injected_data,
+                                      em::val adapter_val,
+                                      const std::string &block_input_name,
+                                      const std::string &block_output_name,
+                                      int num_rows, em::val options) {
+  onnx::ModelProto injected_model;
+  if (!injected_model.ParseFromArray(injected_data.data(),
+                                     injected_data.size())) {
+    std::cerr << "Parse failed (injected model)" << std::endl;
+    return em::val::null();
+  }
+
+  LoraStepPlan plan;
+  try {
+    const LoraAdapter adapter = LoraAdapterFromVal(adapter_val);
+    plan = BuildLoraStepGraph(injected_model, adapter, block_input_name,
+                              block_output_name, num_rows,
+                              LoraOptionsFromVal(options));
+  } catch (const std::exception &e) {
+    // BuildLoraStepGraph refuses loudly -- an unclosed block, a node with no
+    // gradient rule (named), an adapter with no targets -- and the message
+    // is the actionable half, so it goes to the log.
+    std::cerr << "lora_build_step_graph error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+
+  em::val step_graph = SerializeModel(plan.step_graph);
+  if (step_graph.isNull()) {
+    return em::val::null();
+  }
+
+  em::val out = em::val::object();
+  out.set("stepGraph", step_graph);
+
+  em::val state = em::val::array();
+  for (size_t i = 0; i < plan.state.size(); ++i) {
+    em::val entry = em::val::object();
+    entry.set("input", plan.state[i].first);
+    entry.set("output", plan.state[i].second);
+    state.set(i, entry);
+  }
+  out.set("state", state);
+
+  em::val scalars = em::val::array();
+  for (size_t i = 0; i < plan.scalars.size(); ++i) {
+    scalars.set(i, plan.scalars[i]);
+  }
+  out.set("scalars", scalars);
+  out.set("loss", plan.loss_name);
+
+  em::val captures = em::val::array();
+  for (size_t i = 0; i < plan.captures.size(); ++i) {
+    const LoraCapture &capture = plan.captures[i];
+    em::val entry = em::val::object();
+    entry.set("input", capture.step_graph_input);
+    entry.set("source", capture.source_tensor);
+    em::val dims = em::val::array();
+    for (size_t d = 0; d < capture.dims.size(); ++d) {
+      dims.set(d, static_cast<double>(capture.dims[d]));
+    }
+    entry.set("dims", dims);
+    entry.set("teacher", capture.is_teacher);
+    captures.set(i, entry);
+  }
+  out.set("captures", captures);
+
+  // Same per-call reuse pattern onnxsim_qat_build_step_graph's own
+  // initial_state_raw uses (see that function's comment) -- a parallel
+  // static buffer rather than a shared one, so a LoRA build and a QAT build
+  // alive at once do not stomp on each other's views. QatTensorToVal itself
+  // is reused unchanged: it encodes a bare TensorProto as { name, dtype,
+  // dims, data } with no QAT-specific content, which is exactly what a LoRA
+  // state tensor needs too.
+  static std::vector<std::string> initial_state_raw;
+  initial_state_raw.assign(plan.initial_state.size(), std::string());
+  em::val initial_state = em::val::array();
+  for (size_t i = 0; i < plan.initial_state.size(); ++i) {
+    initial_state.set(
+        i, QatTensorToVal(plan.initial_state[i], initial_state_raw[i]));
+  }
+  out.set("initialState", initial_state);
+
+  out.set("rowIndexInput", plan.row_index_input);
+  out.set("rowIndexSize", static_cast<double>(plan.row_index_size));
+  out.set("numRows", static_cast<double>(plan.num_rows));
+
+  em::val parameters = em::val::array();
+  for (size_t i = 0; i < plan.parameters.size(); ++i) {
+    parameters.set(i, plan.parameters[i]);
+  }
+  out.set("parameters", parameters);
+
+  static int next_plan_handle = 1;
+  const int handle = next_plan_handle++;
+  LoraPlans().emplace(handle, std::move(plan));
+  out.set("planHandle", handle);
+  return out;
+}
+
+// Writes a finished loop's state back into the injected model --
+// WriteBackLoraState, reachable from the page. Mirrors onnxsim_qat_write_back
+// closely (see that function's own doc comment for `final_state`'s shape);
+// the one difference is what the write-back reads out of it.
+// WriteBackLoraState only looks up `plan.parameters` (each adapter tensor's
+// own name) in `final_state`, unlike QAT's write-back, which also reads
+// scale/zero-point state when those were trained -- but every other entry
+// (the Adam moments the loop's own `state` list also carries) is simply
+// unread rather than rejected, so this passes `final_state` through as
+// given rather than trimming it first.
+//
+// `plan_handle` is the `planHandle` onnxsim_lora_build_step_graph returned.
+// Returns the tuned model's bytes, or null (with the reason on stderr) if the
+// model will not parse, the handle is not a live plan, an entry is malformed,
+// or the write-back itself refuses (a state tensor's element count does not
+// match the adapter tensor it is meant to replace).
+//
+// The plan is *not* released here, for the same reason as QAT's: a caller
+// may write back more than once (e.g. to compare a mid-training snapshot
+// against the final one). Call onnxsim_lora_release_plan when the block is
+// done.
+em::val onnxsim_lora_write_back(const std::string &data, int plan_handle,
+                                em::val final_state) {
+  onnx::ModelProto injected_model;
+  if (!injected_model.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  auto plan = LoraPlans().find(plan_handle);
+  if (plan == LoraPlans().end()) {
+    std::cerr << "lora_write_back error: no plan with handle " << plan_handle
+              << " (already released?)" << std::endl;
+    return em::val::null();
+  }
+  if (final_state.isUndefined() || final_state.isNull()) {
+    std::cerr << "lora_write_back error: final state is missing" << std::endl;
+    return em::val::null();
+  }
+
+  std::map<std::string, onnx::TensorProto> state;
+  em::val keys = em::val::global("Object").call<em::val>("keys", final_state);
+  for (const std::string &name : em::vecFromJSArray<std::string>(keys)) {
+    em::val entry = final_state[name];
+    em::val dims = entry["dims"];
+    em::val values = entry["data"];
+    if (dims.isUndefined() || dims.isNull() || values.isUndefined() ||
+        values.isNull()) {
+      std::cerr << "lora_write_back error: final state entry '" << name
+                << "' needs both dims and data" << std::endl;
+      return em::val::null();
+    }
+    onnx::TensorProto &tensor = state[name];
+    tensor.set_name(name);
+    tensor.set_data_type(onnx::TensorProto::FLOAT);
+    for (double dim : em::convertJSArrayToNumberVector<double>(dims)) {
+      tensor.add_dims(static_cast<int64_t>(dim));
+    }
+    // raw_data, little-endian, matching what the emitter itself writes for
+    // every tensor it builds (qat_graph_builder.cpp, shared by LoRA's own
+    // step-graph builder) -- one encoding on both sides of the loop.
+    const std::vector<float> raw =
+        em::convertJSArrayToNumberVector<float>(values);
+    tensor.set_raw_data(raw.data(), raw.size() * sizeof(float));
+  }
+
+  try {
+    return SerializeModel(
+        WriteBackLoraState(injected_model, plan->second, state));
+  } catch (const std::exception &e) {
+    std::cerr << "lora_write_back error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// Drops a plan onnxsim_lora_build_step_graph handed out. True if it was
+// there. Mirrors onnxsim_qat_release_plan; see that function's own comment --
+// nothing here expires on its own either.
+bool onnxsim_lora_release_plan(int plan_handle) {
+  return LoraPlans().erase(plan_handle) > 0;
+}
+
 EMSCRIPTEN_BINDINGS(module) {
   function("onnxsimplify_export", &onnxsimplify_export);
   function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -1504,6 +1955,19 @@ EMSCRIPTEN_BINDINGS(module) {
   // associate it. Every other binding here takes or returns em::val and so
   // drags it in; this one is bool(int), which associates nothing.
   em::function("onnxsim_qat_release_plan", &onnxsim_qat_release_plan);
+
+  // LoRA/QLoRA fine-tuning: inject a trainable low-rank branch, build one
+  // block's step graph, run the loop in JS on onnxruntime-web, write the
+  // trained state back, release the plan (see the doc comments above, and
+  // onnxsim/lora_entry.h for the flow they implement). Unlike QAT, LoRA also
+  // needs its own injection binding -- see onnxsim_lora_inject's own comment
+  // for why.
+  function("onnxsim_lora_inject", &onnxsim_lora_inject);
+  function("onnxsim_lora_build_step_graph", &onnxsim_lora_build_step_graph);
+  function("onnxsim_lora_write_back", &onnxsim_lora_write_back);
+  // Qualified for the same reason onnxsim_qat_release_plan is -- see that
+  // registration's own comment.
+  em::function("onnxsim_lora_release_plan", &onnxsim_lora_release_plan);
 
   em::register_vector<std::string>("string_list");
 }
