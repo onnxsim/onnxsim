@@ -114,10 +114,6 @@ ort = pytest.importorskip("onnxruntime")
 _FLOAT16_MAX = 65504.0
 
 
-def _abs(v):
-    return z3.If(v >= 0, v, -v)
-
-
 def test_quantize_fp16_round_to_nearest_is_half_step_bound():
     # n stands for "the number of grid steps the rounded value sits at" --
     # constrained only by *being nearest* to v / step (within 0.5, the same
