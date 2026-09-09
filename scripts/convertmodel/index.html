@@ -673,6 +673,34 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="lora-metrics" style="display: none; margin-top: 0.4em;"></div>
         </div>
         <script type="module" src="./lora_ui.mjs"></script>
+        <h2 id="sec-webgpu-demo">WebGPU training demo (Hugging Face data)</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Not a tool for your own model -- a small, fixed, self-contained
+                demo of the machinery above: a tiny two-layer network,
+                <code>onnxsim.graph_grad</code>/<code>qat_graph</code>'s own
+                gradient/Adam step graph, trained on <b>real data fetched live
+                from Hugging Face</b>, with <b>WebGPU required</b> (no wasm/CPU
+                fallback -- this fails loudly on a browser without it, rather
+                than silently training somewhere else). See
+                <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/webgpu_hf_demo.mjs" target="_blank" rel="noopener">webgpu_hf_demo.mjs</a>
+                and <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/test/make_step_graph_fixtures.py" target="_blank" rel="noopener">test/make_step_graph_fixtures.py</a>
+                for exactly what each demo trains and why.
+            </p>
+            <div>
+                <label for="webgpu-demo-mode">demo</label>
+                <select id="webgpu-demo-mode">
+                    <option value="photo" selected>one real photo (frgfm/imagenette) → fixed target</option>
+                    <option value="cifar10">CIFAR-10 pretraining sample (8 labeled photos, checks accuracy)</option>
+                </select>
+            </div>
+            <div class="debug-actions">
+                <button id="webgpu-demo-button" type="button">Run demo</button>
+                <span id="webgpu-demo-status" class="tool-note"></span>
+            </div>
+            <div id="webgpu-demo-curve" style="display: none; margin-top: 0.4em;"></div>
+        </div>
+        <script type="module" src="./webgpu_demo_ui.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted

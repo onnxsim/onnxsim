@@ -105,74 +105,29 @@ function serveConvertmodelDir() {
 
 // Everything below runs inside the real browser page, via page.evaluate --
 // it has no access to this file's own scope, only what it's passed and what
-// it can import()/fetch() from the server above. Kept as one function (Node
-// can't step through it) so its shape stays close to what a person reading
-// the browser's own devtools console would see.
+// it can import()/fetch() from the server above. The actual "fetch a real
+// photo, run the step loop on WebGPU" logic lives in webgpu_hf_demo.mjs,
+// shared with the interactive panel (webgpu_demo_ui.mjs) -- this function is
+// just that module's Node/Playwright-side caller: load the local
+// node_modules onnxruntime-web bundle (the interactive page instead loads
+// from a CDN; see webgpu_hf_demo.mjs's own top comment for why the shared
+// module takes an already-loaded `ort` rather than caring), fetch the fixture
+// bytes from this test's own throwaway static server, and time the run.
 async function runInPage(port) {
   const base = `http://localhost:${port}`;
   const ortMod = await import(`${base}/node_modules/onnxruntime-web/dist/ort.all.bundle.min.mjs`);
   const ort = ortMod.default ?? ortMod;
   ort.env.wasm.wasmPaths = `${base}/node_modules/onnxruntime-web/dist/`;
 
-  const { fetchSampleImageBytes } = await import(`${base}/hf_datasets.mjs`);
-  const { normalizePixels } = await import(`${base}/sample_inputs.mjs`);
+  const { runPhotoDemo } = await import(`${base}/webgpu_hf_demo.mjs`);
   const manifest = await fetch(`${base}/test/step_qat_hf_demo.json`).then((r) => r.json());
   const modelBytes = await fetch(`${base}/test/step_qat_hf_demo.onnx`).then((r) => r.arrayBuffer());
 
-  // The real Hugging Face photo -- resized down to a flat 8x8 grayscale
-  // (inputDim=64) image via an offscreen canvas, the same decode primitive
-  // sample_inputs.mjs's own (unexported) buildSampleInput uses for the "Run
-  // inference" panel's image sample-data mode, just at a much smaller target
-  // size (that panel resizes to a real model's actual input; this one always
-  // wants 8x8, since step_qat_hf_demo.onnx's "x" is fixed at [1, 64]).
-  const { bytes, label } = await fetchSampleImageBytes();
-  const side = Math.round(Math.sqrt(manifest.inputDim));
-  const blob = new Blob([bytes]);
-  const bitmap = await createImageBitmap(blob);
-  const canvas = new OffscreenCanvas(side, side);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(bitmap, 0, 0, side, side);
-  const rgba = ctx.getImageData(0, 0, side, side).data;
-  const x = normalizePixels(rgba, 1, side, side); // grayscale -> [1, 64]
-
-  const session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
-    // The one hard requirement this whole file exists to check: no CPU or
-    // wasm fallback in the requested EP list, so a WebGPU-incapable host
-    // fails session creation outright rather than silently training on CPU.
-    executionProviders: ["webgpu"],
-    graphOptimizationLevel: "disabled",
-    logSeverityLevel: 0,
-    logVerbosityLevel: 4,
-  });
-
-  const constants = {
-    x: new ort.Tensor("float32", x, [1, manifest.inputDim]),
-    teacher: new ort.Tensor("float32", new Float32Array([0]), [1, 1]),
-  };
-  let state = {};
-  for (const [name, spec] of Object.entries(manifest.state)) {
-    state[name] = new ort.Tensor("float32", Float32Array.from(spec.data), spec.dims);
-  }
-
   const t0 = performance.now();
-  const losses = [];
-  for (let t = 0; t < manifest.scalars.length; t++) {
-    const feeds = { ...constants, ...state };
-    for (const [name, value] of Object.entries(manifest.scalars[t])) {
-      feeds[name] = new ort.Tensor("float32", Float32Array.from([value]), []);
-    }
-    const out = await session.run(feeds);
-    const next = {};
-    for (const [name, spec] of Object.entries(manifest.state)) {
-      next[name] = out[spec.output];
-    }
-    state = next;
-    losses.push(Number(out[manifest.loss].data[0]));
-  }
+  const { losses, imageLabel } = await runPhotoDemo({ ort, modelBytes, manifest });
   const trainMs = performance.now() - t0;
-  await session.release?.();
 
-  return { losses, trainMs, imageLabel: label };
+  return { losses, trainMs, imageLabel };
 }
 
 // The same "Node(s) placed on [Provider]" parser step_graph_ep.test.mjs uses,

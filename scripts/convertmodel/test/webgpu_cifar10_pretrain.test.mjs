@@ -101,91 +101,26 @@ function serveConvertmodelDir() {
   });
 }
 
-// Runs inside the real browser page -- see page.evaluate.
+// Runs inside the real browser page -- see page.evaluate. The actual
+// "fetch a real labeled batch, run the step loop on WebGPU, check accuracy"
+// logic lives in webgpu_hf_demo.mjs, shared with the interactive panel
+// (webgpu_demo_ui.mjs); see webgpu_hf_demo.test.mjs's own runInPage comment
+// for why this function is just that module's Node/Playwright-side caller.
 async function runInPage(port) {
   const base = `http://localhost:${port}`;
   const ortMod = await import(`${base}/node_modules/onnxruntime-web/dist/ort.all.bundle.min.mjs`);
   const ort = ortMod.default ?? ortMod;
   ort.env.wasm.wasmPaths = `${base}/node_modules/onnxruntime-web/dist/`;
 
-  const { fetchCifar10Batch } = await import(`${base}/hf_datasets.mjs`);
-  const { normalizePixels } = await import(`${base}/sample_inputs.mjs`);
+  const { runCifar10PretrainDemo } = await import(`${base}/webgpu_hf_demo.mjs`);
   const manifest = await fetch(`${base}/test/step_qat_cifar10_pretrain.json`).then((r) => r.json());
   const modelBytes = await fetch(`${base}/test/step_qat_cifar10_pretrain.onnx`).then((r) => r.arrayBuffer());
 
-  // A real, fixed batch of labeled photos -- fetched once, trained on for
-  // the whole run (see this file's own top comment on why that's the point).
-  const samples = await fetchCifar10Batch(manifest.numSamples);
-  const side = Math.round(Math.sqrt(manifest.inputDim));
-  const x = new Float32Array(manifest.numSamples * manifest.inputDim);
-  const teacher = new Float32Array(manifest.numSamples * manifest.numClasses);
-  const labels = [];
-  for (let i = 0; i < samples.length; i++) {
-    const blob = new Blob([samples[i].bytes]);
-    const bitmap = await createImageBitmap(blob);
-    const canvas = new OffscreenCanvas(side, side);
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(bitmap, 0, 0, side, side);
-    const rgba = ctx.getImageData(0, 0, side, side).data;
-    const flat = normalizePixels(rgba, 1, side, side);
-    x.set(flat, i * manifest.inputDim);
-    teacher[i * manifest.numClasses + samples[i].label] = 1.0;
-    labels.push(samples[i].label);
-  }
-
-  const session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
-    executionProviders: ["webgpu"],
-    graphOptimizationLevel: "disabled",
-    logSeverityLevel: 0,
-    logVerbosityLevel: 4,
-  });
-
-  const constants = {
-    x: new ort.Tensor("float32", x, [manifest.numSamples, manifest.inputDim]),
-    teacher: new ort.Tensor("float32", teacher, [manifest.numSamples, manifest.numClasses]),
-  };
-  let state = {};
-  for (const [name, spec] of Object.entries(manifest.state)) {
-    state[name] = new ort.Tensor("float32", Float32Array.from(spec.data), spec.dims);
-  }
-
   const t0 = performance.now();
-  const losses = [];
-  let lastY = null;
-  for (let t = 0; t < manifest.scalars.length; t++) {
-    const feeds = { ...constants, ...state };
-    for (const [name, value] of Object.entries(manifest.scalars[t])) {
-      feeds[name] = new ort.Tensor("float32", Float32Array.from([value]), []);
-    }
-    const out = await session.run(feeds);
-    const next = {};
-    for (const [name, spec] of Object.entries(manifest.state)) {
-      next[name] = out[spec.output];
-    }
-    state = next;
-    losses.push(Number(out[manifest.loss].data[0]));
-    lastY = out[manifest.outputName].data; // overwritten each step; final value used below
-  }
+  const { losses, correct, total, labelNames } = await runCifar10PretrainDemo({ ort, modelBytes, manifest });
   const trainMs = performance.now() - t0;
-  await session.release?.();
 
-  // Predicted class per sample from the final step's own output -- argmax
-  // over each row of [numSamples, numClasses].
-  const predictions = [];
-  for (let i = 0; i < manifest.numSamples; i++) {
-    let best = 0;
-    for (let c = 1; c < manifest.numClasses; c++) {
-      if (lastY[i * manifest.numClasses + c] > lastY[i * manifest.numClasses + best]) best = c;
-    }
-    predictions.push(best);
-  }
-  const correct = predictions.filter((p, i) => p === labels[i]).length;
-
-  return {
-    losses, trainMs, correct,
-    total: manifest.numSamples,
-    labelNames: samples.map((s) => s.labelName),
-  };
+  return { losses, trainMs, correct, total, labelNames };
 }
 
 // Same as webgpu_hf_demo.test.mjs's own parsePlacements.
