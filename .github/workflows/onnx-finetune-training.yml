@@ -117,10 +117,20 @@ jobs:
           # wheel-install step has a documented setuptools/distutils bug (see
           # README.md) whose own documented workaround -- pointing PYTHONPATH
           # at that directory -- is what this workflow does instead.
+          #
+          # --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5: ORT
+          # v1.19.2 vendors google_nsync, whose CMakeLists.txt declares
+          # `cmake_minimum_required(VERSION 3.5)` -- support for which CMake
+          # itself has since dropped entirely ("Compatibility with CMake <
+          # 3.5 has been removed from CMake"). `pip install cmake` always
+          # resolves to the latest release, so this isn't optional even
+          # though ORT's own source needs no other change; it's exactly the
+          # workaround CMake's own error message names.
           python3 tools/ci_build/build.py \
             --build_dir build --config Release --parallel \
             --skip_tests --allow_running_as_root \
-            --build_shared_lib --enable_training --enable_pybind
+            --build_shared_lib --enable_training --enable_pybind \
+            --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5
           df -h
 
       - name: Stage curated ORT dist (lib + python bindings)
