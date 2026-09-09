@@ -169,7 +169,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -637,6 +637,16 @@ if (ONNXSIM_TESTS)
   target_link_libraries(qat_entry_test onnxsim)
   onnxsim_add_ort_rpath(qat_entry_test)
   add_test(NAME qat_entry_test COMMAND qat_entry_test)
+
+  # lora_entry.{h,cpp} builds a LoRA/QLoRA step graph (and does the adapter
+  # injection qat_entry.{h,cpp} has no counterpart for -- see lora_entry.h's
+  # own comment on why), so its test needs onnx's shape inference and
+  # onnx::checker as well as the emitter -- all of which come from the
+  # fully-configured `onnxsim` target, like qat_entry_test above.
+  add_executable(lora_entry_test onnxsim/lora_entry_test.cpp)
+  target_link_libraries(lora_entry_test onnxsim)
+  onnxsim_add_ort_rpath(lora_entry_test)
+  add_test(NAME lora_entry_test COMMAND lora_entry_test)
 
   # The Python<->C++ emitter parity check. It compares what qat_graph_builder.cpp
   # emits against onnxsim/qat_parity_fixtures.txt, which is generated from
