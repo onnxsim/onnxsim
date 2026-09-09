@@ -4313,10 +4313,14 @@ appears verbatim as a float32 in the mcode. The rest do not appear in any byte
 order -- because they are not float32 at all. See "The activation scales,
 decoded" below: they are bfloat16.
 
-Until then the honest capability statement is: **a compiled model's
-convolution weights can be replaced by any set that preserves each output
-tensor's dynamic range, and verified on hardware.** That is narrower than
-"generate a weight table", and wider than it was.
+The honest capability statement, updated by the device runs in "The
+activation scales, decoded" below: **a compiled model's convolution weights
+can be replaced by any set that preserves each output channel's peak, and the
+whole layer may now be rescaled freely** -- the output activation scale is
+writable, so a uniform 3x rescale reproduces the new convolution at 0.99975
+where it used to saturate. What still blocks arbitrary weights is one thing,
+now precisely identified: the per-channel requantisation multiplier is not
+rewritable as a float32, because the datapath does not read it as one.
 
 Test: `test_per_channel_weight_scales_sit_just_past_the_weight_block`
 (Docker, no device).
@@ -4981,6 +4985,38 @@ they hold the same multiset in a different order, so they are an ordering that
 depends on the scales rather than a scale.
 
 Test: `test_activation_scales_are_bfloat16_in_the_mcode` (Docker, no device).
+
+**Confirmed on the device, and it moves the capability.** Doubling the stored
+`y_scale` word doubles the AX650N's output exactly -- amplitude 1.98x,
+correlation unchanged at 0.99975 -- so that bfloat16 really is the
+dequantisation scale and not a copy of one. With it writable, a layer's
+weights can be **rescaled**, which is precisely what saturated before: tripling
+every weight and tripling the output scale reproduces the new convolution at
+0.99975, where the old table's fixed output scale would have clipped it.
+
+**And the same run refutes something this file had assumed.** The per-channel
+float32 array next to the weight block is proportional to
+`x_scale * (peak[o]/127.5) / y_scale` -- that much still holds exactly, and the
+measured constant matches `x_scale/y_scale` to eight digits. But it is **not
+consumed as a linear multiplier**. Scaling it on the device:
+
+| edit | correlation | amplitude |
+| --- | --- | --- |
+| untouched | 0.99975 | 0.990 |
+| `y_scale` x2 | 0.99975 | 1.980 |
+| multiplier x0.5 | 0.302 | 1.197 |
+| multiplier x2 | 0.515 | **1.197** |
+
+Halving and doubling it produce *the same* amplitude. No linear factor does
+that. The array is read -- corrupting it clearly damages the output -- but
+whatever the datapath takes from those four bytes is not their float32 value,
+which is what you would see if it reads a fixed-point mantissa and shift out
+of the same word. Rewriting that array had never actually been tested; it does
+not work, and the earlier plan of "rewrite weights, multipliers and scales
+together" was resting on it.
+
+Test: `test_output_scale_is_rewritable_but_the_multiplier_is_not` (Docker and
+device).
 
 ### Held out: a second vocoder, and why the splits must be walked
 
