@@ -6,7 +6,7 @@
 //   node test/hf_datasets.test.mjs
 
 import assert from "node:assert/strict";
-import { fetchSampleImageBytes, fetchSampleSentence } from "../hf_datasets.mjs";
+import { fetchSampleImageBytes, fetchSampleSentence, fetchCifar10Batch } from "../hf_datasets.mjs";
 
 let passed = 0;
 async function acheck(name, fn) {
@@ -119,6 +119,81 @@ await acheck("fetchSampleSentence throws when the row has no sentence field", as
     ],
     async () => {
       await assert.rejects(() => fetchSampleSentence(), /no sentence field/);
+    },
+  );
+});
+
+await acheck("fetchCifar10Batch fetches numSamples rows in one call, mapping label names", async () => {
+  await withStubs(
+    [
+      (url) =>
+        url.startsWith("https://datasets-server.huggingface.co/rows") &&
+        url.includes("dataset=uoft-cs%2Fcifar10") &&
+        url.includes("length=2")
+          ? jsonResponse({
+              rows: [
+                { row: { img: { src: "https://example.com/a.png" }, label: 3 } },
+                { row: { img: { src: "https://example.com/b.png" }, label: 8 } },
+              ],
+            })
+          : null,
+      (url) => (url === "https://example.com/a.png" ? bytesResponse(new Uint8Array([1])) : null),
+      (url) => (url === "https://example.com/b.png" ? bytesResponse(new Uint8Array([2])) : null),
+    ],
+    async () => {
+      const samples = await fetchCifar10Batch(2);
+      assert.equal(samples.length, 2);
+      assert.deepEqual([...samples[0].bytes], [1]);
+      assert.equal(samples[0].label, 3);
+      assert.equal(samples[0].labelName, "cat");
+      assert.deepEqual([...samples[1].bytes], [2]);
+      assert.equal(samples[1].label, 8);
+      assert.equal(samples[1].labelName, "ship");
+    },
+  );
+});
+
+await acheck("fetchCifar10Batch also accepts an `image` field (not just `img`)", async () => {
+  await withStubs(
+    [
+      (url) =>
+        url.startsWith("https://datasets-server.huggingface.co/rows")
+          ? jsonResponse({ rows: [{ row: { image: { src: "https://example.com/c.png" }, label: 0 } }] })
+          : null,
+      (url) => (url === "https://example.com/c.png" ? bytesResponse(new Uint8Array([9])) : null),
+    ],
+    async () => {
+      const samples = await fetchCifar10Batch(1);
+      assert.equal(samples[0].labelName, "airplane");
+    },
+  );
+});
+
+await acheck("fetchCifar10Batch throws when a row has neither img nor image", async () => {
+  await withStubs(
+    [
+      (url) =>
+        url.startsWith("https://datasets-server.huggingface.co/rows")
+          ? jsonResponse({ rows: [{ row: { label: 0 } }] })
+          : null,
+    ],
+    async () => {
+      await assert.rejects(() => fetchCifar10Batch(1), /neither img\.src nor image\.src/);
+    },
+  );
+});
+
+await acheck("fetchCifar10Batch throws when fewer rows come back than requested", async () => {
+  await withStubs(
+    [
+      (url) =>
+        url.startsWith("https://datasets-server.huggingface.co/rows")
+          ? jsonResponse({ rows: [{ row: { img: { src: "https://example.com/a.png" }, label: 0 } }] })
+          : null,
+      (url) => (url === "https://example.com/a.png" ? bytesResponse(new Uint8Array([1])) : null),
+    ],
+    async () => {
+      await assert.rejects(() => fetchCifar10Batch(2), /requested 2 rows .* but got 1/);
     },
   );
 });

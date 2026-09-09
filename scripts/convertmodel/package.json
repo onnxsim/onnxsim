@@ -38,7 +38,8 @@
     "test:stepgraph": "node test/step_graph_ep.test.mjs",
     "test:all": "npm run test:netron && npm run test:trace && npm run test:node-reduction && npm run test:macs && npm run test:shapes && npm run test:hf && npm run test:hftoken && npm run test:xet && npm run test:issue && npm run test:versions && npm run test:backend && npm run test:query && npm run test:webnn && npm run test:ortlog && npm run test:cdn && npm run test:fill && npm run test:tokenize && npm run test:hfdata && npm run test:sample && npm run test:classify && npm run test:quantize-risk && npm run test:quantize-cal && npm run test:qat-blocks && npm run test:qat-finetune && npm run test:qat-loop && npm run test:lora-blocks && npm run test:lora-finetune && npm run test:lora-stepgraph && npm run test:inference && npm run test:compare && npm run test:stepgraph",
     "coverage": "c8 npm run test:all",
-    "test:webgpu-hf-demo": "node test/webgpu_hf_demo.test.mjs"
+    "test:webgpu-hf-demo": "node test/webgpu_hf_demo.test.mjs",
+    "test:webgpu-cifar10": "node test/webgpu_cifar10_pretrain.test.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "^1.29.0"

@@ -591,6 +591,172 @@ def build_qat_hf_demo(rng: np.random.Generator) -> Dict:
     )
 
 
+def build_qat_cifar10_pretrain(rng: np.random.Generator) -> Dict:
+    """A batched two-layer QAT step graph pretrained on a small, fixed sample
+    of real CIFAR-10 images -- ``build_qat_hf_demo``'s architecture widened
+    from "fit one photo to zero" to "fit a real, labeled batch of eight",
+    which is what makes this an actual (if tiny) classification pretraining
+    run rather than an arbitrary reconstruction target.
+
+    Structurally this differs from ``build_qat_hf_demo`` only in shape: ``x``
+    gains a batch dimension (``num_samples`` real photos flattened+grayscaled
+    the same way), ``teacher`` becomes a one-hot row per photo instead of a
+    fixed zero scalar, and the hidden layer is a little wider (16 instead of
+    8) to have enough capacity to separate eight distinct real examples
+    across ten classes. Same op set, same reason it needs its own file and
+    no baked ``x``/``teacher`` values: this script has no network access
+    (see ``build_qat_hf_demo``'s docstring), so ``webgpu_cifar10_pretrain
+    .test.mjs`` supplies a real batch fetched live via
+    ``hf_datasets.fetchCifar10Batch``.
+
+    Unlike ``build_qat_hf_demo`` (a different real photo every run, since
+    nothing needs it to be the same one), this is meant to be **pretrained**
+    on that one fetched batch repeatedly across many steps -- the browser
+    feeds the same eight (x, teacher) pairs every step, exactly like
+    ``build_qat_hf_demo``'s own x/teacher being loop-invariant, just batched.
+    """
+    num_samples, in_dim, hidden, num_classes = 8, 64, 16, 10
+    b = qat_graph.GraphBuilder("cifar10_")
+    forward = [
+        onnx.helper.make_node("MatMul", ["x", "w1"], ["h0"]),
+        onnx.helper.make_node("Add", ["h0", "b1"], ["h1"]),
+        onnx.helper.make_node("Sigmoid", ["h1"], ["h2"]),
+        onnx.helper.make_node("MatMul", ["h2", "w2"], ["h3"]),
+        onnx.helper.make_node("Add", ["h3", "b2"], ["y"]),
+    ]
+    b.nodes.extend(forward)
+    shapes = {
+        "x": (num_samples, in_dim),
+        "w1": (in_dim, hidden),
+        "b1": (hidden,),
+        "h0": (num_samples, hidden),
+        "h1": (num_samples, hidden),
+        "h2": (num_samples, hidden),
+        "w2": (hidden, num_classes),
+        "b2": (num_classes,),
+        "h3": (num_samples, num_classes),
+        "y": (num_samples, num_classes),
+    }
+
+    diff = b.sub("y", "teacher")
+    # The batched MSE gradient: 2 / (rows * classes), matching
+    # build_qat_backward's own 2.0 / prod(out_shape) convention -- an
+    # unnormalized 2.0 (build_qat_hf_demo's own choice) would otherwise scale
+    # the gradient up by num_samples * num_classes here.
+    dl_dy = b.mul(diff, b.const(2.0 / float(num_samples * num_classes)))
+    grads = graph_grad.build_backward(
+        b, forward, shapes, {"y": dl_dy}, ["w1", "b1", "w2", "b2"]
+    )
+
+    state_vars = {}
+    for name, grad_name, shape in [
+        ("w1", grads["w1"], (in_dim, hidden)),
+        ("b1", grads["b1"], (hidden,)),
+        ("w2", grads["w2"], (hidden, num_classes)),
+        ("b2", grads["b2"], (num_classes,)),
+    ]:
+        next_v, next_m, next_v2 = qat_graph.adam_update(
+            b, name, grad_name, f"m_{name}", f"v_{name}", "lr",
+            "m_correction", "v_correction",
+        )
+        state_vars[name] = (shape, next_v, f"m_{name}", next_m, f"v_{name}", next_v2)
+
+    state = {}
+    for name, (shape, next_v, m_name, next_m, v_name, next_v2) in state_vars.items():
+        state[name] = (list(shape), next_v)
+        state[m_name] = (list(shape), next_m)
+        state[v_name] = (list(shape), next_v2)
+
+    step = qat_graph.make_step_graph(
+        b,
+        constants={
+            "x": ([num_samples, in_dim], onnx.TensorProto.FLOAT),
+            "teacher": ([num_samples, num_classes], onnx.TensorProto.FLOAT),
+        },
+        state=state,
+        scalars=["lr", "m_correction", "v_correction"],
+        loss=b.mean_square(diff),
+        name="onnxsim_qat_cifar10_pretrain_step",
+    )
+    # make_step_graph only declares state outputs + the loss -- "y" (the raw
+    # per-class prediction, needed for the browser's own end-of-run accuracy
+    # check) is otherwise just an internal tensor. Any already-produced
+    # tensor may additionally be declared a graph output in ONNX, so this
+    # adds "y" without touching the state/loss wiring above.
+    step.model.graph.output.append(
+        onnx.helper.make_tensor_value_info(
+            "y", onnx.TensorProto.FLOAT, [num_samples, num_classes]
+        )
+    )
+    onnx.checker.check_model(step.model, full_check=True)
+    onnx.save(step.model, HERE / "step_qat_cifar10_pretrain.onnx")
+
+    # Offline sanity check (no network access here -- see the docstring):
+    # a synthetic batch of num_samples "photos" against random one-hot
+    # targets should still be memorizable by this many steps.
+    init_state = {
+        "w1": _f32(rng.normal(scale=0.3, size=(in_dim, hidden))),
+        "b1": np.zeros(hidden, np.float32),
+        "w2": _f32(rng.normal(scale=0.3, size=(hidden, num_classes))),
+        "b2": np.zeros(num_classes, np.float32),
+    }
+    for name in list(init_state):
+        init_state[f"m_{name}"] = np.zeros_like(init_state[name])
+        init_state[f"v_{name}"] = np.zeros_like(init_state[name])
+    sanity_x = _f32(rng.normal(size=(num_samples, in_dim)))
+    sanity_labels = rng.integers(0, num_classes, size=num_samples)
+    sanity_teacher = np.zeros((num_samples, num_classes), np.float32)
+    sanity_teacher[np.arange(num_samples), sanity_labels] = 1.0
+
+    NUM_PRETRAIN_STEPS = 60
+    sanity_scalars = []
+    for t in range(NUM_PRETRAIN_STEPS):
+        values = {"lr": 0.05}
+        values.update(qat_graph.adam_bias_corrections(t))
+        sanity_scalars.append(values)
+    sanity_losses = _reference_losses(
+        step,
+        {"x": sanity_x, "teacher": sanity_teacher},
+        init_state,
+        sanity_scalars,
+        [],
+    )
+    if not (sanity_losses[-1] < 0.2 * sanity_losses[0]):
+        raise SystemExit(
+            "step_qat_cifar10_pretrain.onnx sanity check: loss did not "
+            f"meaningfully decrease over {NUM_PRETRAIN_STEPS} synthetic "
+            f"steps ({sanity_losses[0]:.6g} -> {sanity_losses[-1]:.6g}); the "
+            "graph is broken before it ever reaches a browser"
+        )
+
+    manifest = {
+        "file": "step_qat_cifar10_pretrain.onnx",
+        "opset": qat_graph._OPSET,
+        "irVersion": qat_graph._IR_VERSION,
+        "loss": step.loss_name,
+        "outputName": "y",
+        "numSamples": num_samples,
+        "inputDim": in_dim,
+        "numClasses": num_classes,
+        # Declared shape/dtype only -- no baked values, same reasoning as
+        # build_qat_hf_demo's own manifest.
+        "constants": {
+            "x": {"dims": [num_samples, in_dim], "dtype": "float32"},
+            "teacher": {"dims": [num_samples, num_classes], "dtype": "float32"},
+        },
+        "state": {
+            name: {"dims": list(shape), "output": out, "data": [float(v) for v in init_state[name].ravel()]}
+            for name, (shape, out) in state.items()
+        },
+        "scalars": [dict(s) for s in sanity_scalars],
+    }
+    (HERE / "step_qat_cifar10_pretrain.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print(
+        f"wrote step_qat_cifar10_pretrain.onnx + step_qat_cifar10_pretrain.json; "
+        f"offline sanity loss {sanity_losses[0]:.6g} -> {sanity_losses[-1]:.6g}"
+    )
+
+
 def _package(
     name: str,
     filename: str,
@@ -673,11 +839,12 @@ def main() -> None:
         )
     print(f"wrote step_graphs.json; {len(covered)} of EP_FRIENDLY_OPS covered")
 
-    # Separate from the four above: this one is driven with live data by
-    # webgpu_hf_demo.test.mjs, not replayed against a baked reference
-    # trajectory, so it gets its own file rather than joining step_graphs.json
-    # (see build_qat_hf_demo's own docstring).
+    # Separate from the four above: these are driven with live data by
+    # webgpu_hf_demo.test.mjs/webgpu_cifar10_pretrain.test.mjs, not replayed
+    # against a baked reference trajectory, so each gets its own file rather
+    # than joining step_graphs.json (see build_qat_hf_demo's own docstring).
     build_qat_hf_demo(np.random.default_rng(SEED))
+    build_qat_cifar10_pretrain(np.random.default_rng(SEED))
 
 
 if __name__ == "__main__":

@@ -1,12 +1,19 @@
-name: convertmodel WebGPU + Hugging Face training demo
+name: convertmodel WebGPU + Hugging Face training demos
 
-# A small, real, end-to-end training pipeline check: fetch one real photo
-# from a Hugging Face dataset, train onnxsim/qat_graph's step-graph machinery
-# on it for a few dozen steps, and require every step to actually run on
-# WebGPU -- see test/webgpu_hf_demo.test.mjs's own top comment for the full
-# design (why it needs a real browser rather than plain Node, what the
-# training objective is and is not, and what step_qat_hf_demo.onnx does and
-# does not have baked into it).
+# Two small, real, end-to-end training pipeline checks, both fetching real
+# data live from Hugging Face and requiring every training step to actually
+# run on WebGPU -- see each test file's own top comment for the full design
+# (why a real browser rather than plain Node is what makes WebGPU reachable
+# at all, what each training objective is and is not, and what each step
+# graph fixture does and does not have baked into it):
+#
+#   * test/webgpu_hf_demo.test.mjs -- one real photo (frgfm/imagenette),
+#     fetched fresh every run, fit toward a fixed arbitrary target. Proves
+#     the pipeline runs end to end.
+#   * test/webgpu_cifar10_pretrain.test.mjs -- a real, labeled batch of eight
+#     photos (uoft-cs/cifar10), fetched once and pretrained on repeatedly.
+#     Proves the pipeline can actually learn something (checks classification
+#     accuracy at the end, not just that the loss number went down).
 #
 # Runs on a stock macOS GitHub-hosted runner: WebGPU needs a real GPU-backed
 # browser, which is exactly what convertmodel-inference.yml's ubuntu job
@@ -18,8 +25,9 @@ name: convertmodel WebGPU + Hugging Face training demo
 # macOS runner are both real dependencies this repo's fast/offline test suite
 # should not inherit.
 #
-# Scheduled + on demand, plus on PRs that touch the files this check actually
-# depends on, so it stays valid without gating unrelated convertmodel work.
+# Scheduled + on demand, plus on PRs that touch the files either check
+# actually depends on, so both stay valid without gating unrelated
+# convertmodel work.
 
 on:
   schedule:
@@ -29,9 +37,12 @@ on:
     paths:
       - ".github/workflows/convertmodel-webgpu-demo.yml"
       - "scripts/convertmodel/test/webgpu_hf_demo.test.mjs"
+      - "scripts/convertmodel/test/webgpu_cifar10_pretrain.test.mjs"
       - "scripts/convertmodel/test/make_step_graph_fixtures.py"
       - "scripts/convertmodel/test/step_qat_hf_demo.onnx"
       - "scripts/convertmodel/test/step_qat_hf_demo.json"
+      - "scripts/convertmodel/test/step_qat_cifar10_pretrain.onnx"
+      - "scripts/convertmodel/test/step_qat_cifar10_pretrain.json"
       - "scripts/convertmodel/hf_datasets.mjs"
       - "scripts/convertmodel/sample_inputs.mjs"
       - "scripts/convertmodel/package.json"
@@ -66,3 +77,25 @@ jobs:
       - name: Run the WebGPU + Hugging Face training demo
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-hf-demo
+
+  webgpu-cifar10-pretrain:
+    name: WebGPU + CIFAR-10 pretraining demo
+    runs-on: macos-15
+    # As webgpu-hf-demo's own comment: this job's own training run is a few
+    # seconds for 60 steps against eight photos (this repo's own dev
+    # sandbox); the rest of the budget is Chromium's one-time install.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU + CIFAR-10 pretraining demo
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-cifar10
