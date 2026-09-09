@@ -622,6 +622,180 @@ def test_learn_scales_moves_the_scales_and_still_reconstructs():
     assert _relu_block_error(tuned, x, w1, w2) < _relu_block_error(quant, x, w1, w2)
 
 
+def test_sgd_momentum_optimizer_trains():
+    """``optimizer="sgd_momentum"`` on the block's own weight update, the
+    default (``"adam"``) left otherwise unused. The reconstruction loss falls
+    over the run, exactly as it does under Adam -- this is the coarse "did it
+    actually train" check; ``test_sgd_momentum_matches_hand_rolled_heavy_ball``
+    below is the precise one, pinning the *trajectory* rather than only its
+    direction."""
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    losses = []
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        optimizer="sgd_momentum",
+        losses=losses,
+    )
+    onnx.checker.check_model(tuned)
+    assert losses[-1] < 0.5 * losses[0]
+
+
+def test_unknown_optimizer_is_refused():
+    """A typo in ``optimizer`` is refused loudly, naming both the bad value
+    and the two it will accept -- the same style as every other invalid
+    combination :func:`onnxsim.apply_qat` refuses (see
+    ``_refuse_quantizer_flags_without_fake_quant``)."""
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    with pytest.raises(ValueError, match="not_a_real_optimizer"):
+        onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Yout",
+            calibration_data=[{"X": x}],
+            optimizer="not_a_real_optimizer",
+        )
+
+
+def test_sgd_momentum_matches_hand_rolled_heavy_ball():
+    """``optimizer="sgd_momentum"`` reproduces exactly the textbook heavy-ball
+    update :func:`onnxsim.qat_graph.sgd_momentum_update` documents, checked
+    against an independent, hand-rolled numpy loop over the same block --
+    not against onnxsim's own implementation, so a bug shared by both sides
+    would not hide from this test the way it would from one that only checks
+    the loss went down.
+
+    ``fake_quant=False`` strips the quantizer/straight-through machinery out
+    entirely, so the forward is exactly ``Y = X @ W`` and the one gradient
+    path a hand-rolled loop has to reproduce is a plain MatMul backward --
+    exact on both sides, rather than approximated on either. The two
+    trajectories agree to float32 rounding; run against Adam's own
+    trajectory over the same problem, the two optimizers land somewhere
+    else entirely, confirming this is really SGD-momentum's dynamics in the
+    graph and not Adam's under another name.
+    """
+    rng = np.random.default_rng(3)
+    w_teacher = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w_student0 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    body = f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """
+    teacher = _model(body, [_f32(w_teacher, "W")])
+    student = _model(body, [_f32(w_student0, "W")])
+
+    x = _correlated_calibration(rank=4, num_samples=16, seed=42)
+    lr = 1e-2
+    steps = 8
+
+    tuned = onnxsim.apply_qat(
+        teacher,
+        student,
+        "X",
+        "Y",
+        calibration_data=[{"X": x}],
+        num_iterations=steps,
+        learning_rate=lr,
+        lr_decay=False,
+        fake_quant=False,
+        optimizer="sgd_momentum",
+        step_providers=["CPUExecutionProvider"],
+    )
+
+    # The identical loop qat_graph.sgd_momentum_update's docstring writes out:
+    # mom' = momentum * mom + grad; param' = param - lr * mom'. Computed in
+    # float64 throughout so this comparison's own arithmetic is not the
+    # source of any disagreement.
+    w = w_student0.astype(np.float64)
+    mom = np.zeros_like(w)
+    target = x.astype(np.float64) @ w_teacher.astype(np.float64)
+    n_elems = target.size
+    for _ in range(steps):
+        y = x.astype(np.float64) @ w
+        diff = y - target
+        dl_dy = diff * (2.0 / n_elems)
+        grad = x.astype(np.float64).T @ dl_dy
+        mom = qat_graph.SGD_MOMENTUM * mom + grad
+        w = w - lr * mom
+
+    trained_w = onnx.numpy_helper.to_array(
+        next(t for t in tuned.graph.initializer if t.name == "W")
+    ).astype(np.float64)
+    np.testing.assert_allclose(trained_w, w, rtol=1e-3, atol=1e-4)
+
+    # Adam over the identical problem lands somewhere else -- this is really
+    # SGD-momentum's own trajectory, not Adam's under a different name.
+    tuned_adam = onnxsim.apply_qat(
+        teacher,
+        student,
+        "X",
+        "Y",
+        calibration_data=[{"X": x}],
+        num_iterations=steps,
+        learning_rate=lr,
+        lr_decay=False,
+        fake_quant=False,
+        optimizer="adam",
+        step_providers=["CPUExecutionProvider"],
+    )
+    adam_w = onnx.numpy_helper.to_array(
+        next(t for t in tuned_adam.graph.initializer if t.name == "W")
+    ).astype(np.float64)
+    assert np.max(np.abs(adam_w - trained_w)) > 0.1
+
+
+def test_sgd_momentum_weight_with_adam_scales_in_the_same_run():
+    """``optimizer="sgd_momentum"`` combined with ``learn_scales=True``: the
+    weight trains with SGD-momentum and the scale still trains with Adam, in
+    one run -- the case that most directly exercises the conditional
+    "m_correction"/"v_correction" declare-and-feed logic in
+    ``_build_step_graph``/``_train_block``, since this block's step graph
+    needs those two scalars for the scale's own Adam update even though the
+    weight update next to it never reads them. If that conditional logic
+    ever drifted out of sync (declared but not fed, or fed but not declared),
+    this would fail with an onnxruntime feed-name error rather than a
+    numeric mismatch -- so reaching the assertions below at all is most of
+    what this test is checking."""
+    model = _relu_block_model(seed=0)
+    x = _correlated_calibration(rank=2)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    losses = []
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        optimizer="sgd_momentum",
+        learn_scales=True,
+        scale_learning_rate=1e-4,
+        losses=losses,
+    )
+    onnx.checker.check_model(tuned)
+    assert losses[-1] < losses[0]
+
+    old, new = _weights_of(quant), _weights_of(tuned)
+    moved = 0
+    for matmul in ("Y1", "Y2"):
+        scale_name = _quant_tensors_for(quant, matmul)[1]
+        if not np.array_equal(old[scale_name], new[scale_name]):
+            moved += 1
+    assert moved == 2
+
+
 def test_end_to_end_on_the_cpu_step_provider():
     """The whole loop through ``step_providers=``, which is the boundary
     ``docs/qat.md`` says carries this to CUDA, an NPU EP or WebGPU

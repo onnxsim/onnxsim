@@ -513,6 +513,11 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <input type="number" id="qat-steps" value="200" min="1" max="20000" step="1" style="width: 5em;">
                 <label for="qat-lr">learning rate</label>
                 <input type="text" id="qat-lr" value="1e-4" style="width: 5em;">
+                <label for="qat-optimizer" title="Which optimizer trains the block's own weight. Scoped to the weight alone: the LSQ weight-scale and activation-quantizer parameters (learn weight scales / learn activation scales, below) always train with Adam regardless of this choice (apply_qat's optimizer).">optimizer</label>
+                <select id="qat-optimizer">
+                    <option value="adam" selected>Adam</option>
+                    <option value="sgd_momentum">SGD (momentum)</option>
+                </select>
                 <label for="qat-batch-size" title="Rows per optimizer step. 0 (or the full row count) trains full batch, the only mode with no per-step input beyond the scalars.">minibatch</label>
                 <input type="number" id="qat-batch-size" value="0" min="0" max="128" step="1" style="width: 4em;">
                 <label for="qat-batch-seed">seed</label>

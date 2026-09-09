@@ -96,7 +96,16 @@ function readOptions(el) {
         "activation scales left to learn -- untick one of the three.",
     );
   }
+  // Which optimizer trains the block's own weight -- BuildQatStepGraph's
+  // default ("adam") when the select is absent. Scoped to the weight alone,
+  // exactly as in apply_qat: learnScales/learnActivationScales's parameters
+  // always train with Adam regardless of this choice, so picking
+  // "sgd_momentum" here while either of those is ticked still trains the
+  // scale/activation quantizer with Adam in the same run.
+  const optimizerEl = el("qat-optimizer");
+  const optimizer = optimizerEl ? optimizerEl.value : "adam";
   return {
+    optimizer,
     fakeQuant,
     learnScales: checked("qat-learn-scales"),
     learnActivationScales: checked("qat-learn-act-scales"),

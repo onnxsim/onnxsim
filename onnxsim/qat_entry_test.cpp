@@ -1342,6 +1342,141 @@ void ABlockExternalGatherIndexIsCapturedAndDeclaredAtItsRealDtype() {
   }
 }
 
+// optimizer="sgd_momentum" drops the weight's second Adam moment entirely --
+// state carries w and m (the one momentum buffer) but no v, and the per-step
+// scalars carry only the weight learning rate, since nothing in this
+// weight-only run uses Adam at all. If the graph declared "m_correction"/
+// "v_correction" here anyway (or omitted them while a caller still expected
+// them), a caller feeding exactly `plan.scalars` -- the documented contract
+// -- would either feed an undeclared input or leave a declared one unfed,
+// both of which onnxruntime rejects.
+void SgdMomentumOptimizerOmitsTheSecondMomentFromStateAndScalars() {
+  QatOptions options;
+  options.optimizer = "sgd_momentum";
+  const QatStepPlan plan = BuildQatStepGraph(FloatModel(), Int4QuantizedModel(),
+                                             "X", "Y", kRows, options);
+  CheckModel(plan.step_graph, "the sgd_momentum step graph");
+  CheckEqual(static_cast<int64_t>(plan.state.size()), 2,
+             "sgd_momentum carries only w and its one momentum buffer");
+  CheckEqual(plan.state[0].first, "qat__w0", "the master weight is state 0");
+  CheckEqual(plan.state[1].first, "qat__mw0",
+             "the momentum buffer reuses Adam's m_input name");
+  CheckEqual(static_cast<int64_t>(plan.scalars.size()), 1,
+             "sgd_momentum with no scale/activation training feeds only lr");
+  CheckEqual(plan.scalars[0], "qat__lr", "the weight's own learning rate");
+
+  const std::set<std::string> inputs = InputNames(plan.step_graph);
+  for (const std::string& name : {"qat__w0", "qat__mw0", "qat__lr"}) {
+    Check(inputs.count(name) != 0, "the step graph declares the input " + name);
+  }
+  for (const std::string& name : {"qat__vw0", "m_correction", "v_correction"}) {
+    Check(inputs.count(name) == 0, "the step graph does not declare " + name +
+                                       " -- nothing here would feed it");
+  }
+
+  const std::map<std::string, onnx::TensorProto> state =
+      AsStateMap(plan.initial_state);
+  CheckEqual(static_cast<int64_t>(plan.initial_state.size()), 2,
+             "one initial value for w, one for the momentum buffer");
+  Check(state.count("qat__vw0") == 0,
+        "there is no second-moment initial value to seed");
+}
+
+// A caller must feed exactly plan.scalars -- optimizer="sgd_momentum" with
+// learn_scales still needs the corrections, because the *scale* update
+// (always Adam, regardless of `optimizer`) reads them even though the
+// weight's own update next to it never does. If the declared scalars ever
+// disagreed with what the scale's AdamUpdate call site actually consumes,
+// this would be the run that exposes it.
+void SgdMomentumWeightWithAdamScalesStillDeclaresTheCorrections() {
+  QatOptions options;
+  options.optimizer = "sgd_momentum";
+  options.learn_scales = true;
+  const QatStepPlan plan = BuildQatStepGraph(FloatModel(), Int4QuantizedModel(),
+                                             "X", "Y", kRows, options);
+  CheckModel(plan.step_graph, "the sgd_momentum+learn_scales step graph");
+  // w, m (sgd_momentum's one buffer, no v) plus the scale's own s, ms, vs.
+  CheckEqual(static_cast<int64_t>(plan.state.size()), 5,
+             "w, m, s, ms, vs -- no v for the weight, full Adam state for "
+             "the scale");
+  CheckEqual(plan.state[0].first, "qat__w0", "the master weight is state 0");
+  CheckEqual(plan.state[1].first, "qat__mw0",
+             "the momentum buffer is state 1, with no v between it and the "
+             "scale");
+  CheckEqual(plan.state[2].first, "qat__s0", "the scale is state 2");
+
+  CheckEqual(static_cast<int64_t>(plan.scalars.size()), 4,
+             "lr, plus the two Adam corrections the scale's update needs, "
+             "plus lr_scale");
+  bool has_m_correction = false, has_v_correction = false, has_lr_scale = false;
+  for (const std::string& name : plan.scalars) {
+    if (name == "m_correction") has_m_correction = true;
+    if (name == "v_correction") has_v_correction = true;
+    if (name == "qat__lr_scale") has_lr_scale = true;
+  }
+  Check(has_m_correction,
+        "m_correction is declared even though the weight itself never reads "
+        "it, because the scale's Adam update does");
+  Check(has_v_correction, "v_correction is declared for the same reason");
+  Check(has_lr_scale, "the scale's own learning rate is declared");
+
+  const std::set<std::string> inputs = InputNames(plan.step_graph);
+  for (const std::string& name : {"m_correction", "v_correction"}) {
+    Check(inputs.count(name) != 0,
+          "the step graph actually declares " + name +
+              " as a graph input, not only as a plan.scalars entry");
+  }
+  Check(inputs.count("qat__vw0") == 0,
+        "the weight still has no second moment even with the scale trained");
+
+  CheckEqual(plan.layers[0].weight_state_input, "qat__w0",
+             "the write-back reads the trained weight out of the loop state");
+  CheckEqual(plan.layers[0].weight_scale_state_input, "qat__s0",
+             "the write-back reads the trained scale out of the loop state, "
+             "same as under optimizer=\"adam\"");
+}
+
+// The default path must be exactly what it was before `optimizer` existed:
+// QatOptions() (optimizer left at its default "adam") produces the identical
+// plan AnInt4MatMulBlockProducesAStepGraphTheCheckerAccepts already pins --
+// three state tensors, three scalars, "adam" spelled out explicitly here
+// reproduces the same numbers as leaving the field untouched.
+void TheDefaultOptimizerIsAdamAndMatchesLeavingTheFieldUnset() {
+  QatOptions defaulted;
+  QatOptions explicit_adam;
+  explicit_adam.optimizer = "adam";
+  const QatStepPlan a = BuildQatStepGraph(FloatModel(), Int4QuantizedModel(),
+                                          "X", "Y", kRows, defaulted);
+  const QatStepPlan b = BuildQatStepGraph(FloatModel(), Int4QuantizedModel(),
+                                          "X", "Y", kRows, explicit_adam);
+  CheckEqual(static_cast<int64_t>(a.step_graph.SerializeAsString().size()),
+             static_cast<int64_t>(b.step_graph.SerializeAsString().size()),
+             "leaving optimizer unset and spelling out \"adam\" emit the "
+             "same-size step graph");
+  Check(a.step_graph.SerializeAsString() == b.step_graph.SerializeAsString(),
+        "leaving optimizer unset and spelling out \"adam\" emit a "
+        "byte-identical step graph");
+  CheckEqual(static_cast<int64_t>(a.state.size()), 3,
+             "the default path still carries w, m and v -- unchanged by "
+             "optimizer's addition");
+}
+
+// A typo in `optimizer` is refused loudly rather than silently defaulting to
+// one of the two real optimizers, naming the bad value -- the same style
+// TheScaleFlagsAreRefusedRatherThanIgnoredWithoutFakeQuant pins for the
+// fake_quant/scale-flag contradiction.
+void AnUnrecognizedOptimizerIsRefused() {
+  CheckThrows<std::invalid_argument>(
+      [&] {
+        QatOptions options;
+        options.optimizer = "not_a_real_optimizer";
+        BuildQatStepGraph(FloatModel(), Int4QuantizedModel(), "X", "Y", kRows,
+                          options);
+      },
+      "not_a_real_optimizer",
+      "an unrecognized optimizer string is refused and named");
+}
+
 }  // namespace
 
 int main() {
@@ -1367,6 +1502,10 @@ int main() {
   EachSchemeMismatchIsNamedRatherThanReportedAsABoundaryError();
   ABlockThatIsNotAClosedSliceIsRefused();
   ABlockExternalGatherIndexIsCapturedAndDeclaredAtItsRealDtype();
+  SgdMomentumOptimizerOmitsTheSecondMomentFromStateAndScalars();
+  SgdMomentumWeightWithAdamScalesStillDeclaresTheCorrections();
+  TheDefaultOptimizerIsAdamAndMatchesLeavingTheFieldUnset();
+  AnUnrecognizedOptimizerIsRefused();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d qat_entry check(s) failed\n", g_failures);

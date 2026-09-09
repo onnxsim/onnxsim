@@ -892,9 +892,33 @@ ShapeMap BlockShapes(const onnx::ModelProto& float_model,
 // Per-layer training state -- qat.py's _Trained and _plan_trained
 // ---------------------------------------------------------------------------
 
+// Which optimizer QatOptions::optimizer selected, for the one call site
+// (the weight's own update) that dispatches on it. Kept as a tiny internal
+// enum, parsed once at BuildQatStepGraph's own boundary via ParseOptimizer,
+// rather than threading the raw `std::string` through PlanTrained and the
+// per-layer loop and re-comparing it there -- the same "parse the string
+// once at the boundary" convention structured_pruning_entry.cpp's
+// ImportanceNorm/ParseImportanceNorm already establishes.
+enum class Optimizer { kAdam, kSgdMomentum };
+
+Optimizer ParseOptimizer(const std::string& optimizer, const char* caller) {
+  if (optimizer == "adam") return Optimizer::kAdam;
+  if (optimizer == "sgd_momentum") return Optimizer::kSgdMomentum;
+  throw std::invalid_argument(std::string(caller) +
+                              ": optimizer must be \"adam\" or "
+                              "\"sgd_momentum\", got \"" +
+                              optimizer + "\"");
+}
+
 struct Trained {
   const QuantizedLayer* candidate = nullptr;
-  std::string w_input, m_input, v_input;
+  std::string w_input, m_input;
+  // The weight's second Adam moment. Empty when the weight trains with
+  // sgd_momentum instead of adam -- that optimizer has only one state
+  // tensor (m_input doubles as its one momentum buffer) and no use for a
+  // second. Same "empty means not present" idiom scale_input/ms_input/
+  // vs_input below already use for learn_scales.
+  std::string v_input;
   Shape w_shape;
   std::vector<float> w_init;
   int64_t scale_axis = 0;
@@ -918,9 +942,17 @@ struct Trained {
 // round-to-nearest exactly, and every later step is a measured improvement on
 // it rather than on an arbitrary re-initialization. The activation quantizer,
 // when there is one, is seeded the same way, from what calibration chose.
+//
+// `optimizer` picks what the weight's own state looks like: kAdam allocates
+// v_input alongside m_input; kSgdMomentum leaves v_input empty, since
+// sgd_momentum_update has only the one momentum buffer m_input already
+// carries. It never touches the scale/activation-quantizer state below,
+// which is always Adam's two moments regardless -- see BuildQatStepGraph's
+// own weight-update call site.
 std::vector<Trained> PlanTrained(const std::vector<QuantizedLayer>& candidates,
                                  bool learn_scales,
-                                 bool learn_activation_scales) {
+                                 bool learn_activation_scales,
+                                 Optimizer optimizer) {
   std::vector<Trained> planned;
   for (size_t i = 0; i < candidates.size(); ++i) {
     const QuantizedLayer& candidate = candidates[i];
@@ -929,7 +961,9 @@ std::vector<Trained> PlanTrained(const std::vector<QuantizedLayer>& candidates,
     trained.candidate = &candidate;
     trained.w_input = std::string(kPrefix) + "w" + index;
     trained.m_input = std::string(kPrefix) + "mw" + index;
-    trained.v_input = std::string(kPrefix) + "vw" + index;
+    if (optimizer == Optimizer::kAdam) {
+      trained.v_input = std::string(kPrefix) + "vw" + index;
+    }
     trained.w_shape = DimsOf(candidate.w_float_init);
     for (double v : TensorValues(candidate.w_float_init)) {
       trained.w_init.push_back(static_cast<float>(v));
@@ -1217,6 +1251,8 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
                               int64_t num_rows, const QatOptions& options) {
   RefuseQuantizerFlagsWithoutFakeQuant(options.fake_quant, options.learn_scales,
                                        options.learn_activation_scales);
+  const Optimizer optimizer =
+      ParseOptimizer(options.optimizer, "BuildQatStepGraph");
   if (num_rows < 1) {
     throw std::invalid_argument("num_rows must be at least 1, got " +
                                 std::to_string(num_rows));
@@ -1317,8 +1353,9 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
                   block_output_name, step_teacher_shape);
 
   // --- _plan_trained and the block's own initializers --------------------
-  std::vector<Trained> trained = PlanTrained(candidates, options.learn_scales,
-                                             options.learn_activation_scales);
+  std::vector<Trained> trained =
+      PlanTrained(candidates, options.learn_scales,
+                  options.learn_activation_scales, optimizer);
   std::set<std::string> trained_weight_names;
   for (const Trained& t : trained) {
     trained_weight_names.insert(t.candidate->float_node.input(1));
@@ -1523,7 +1560,9 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   };
 
   // 5. Straight through the fake-quant, into the master weight and (if asked
-  //    for) the scale, then one Adam step each.
+  //    for) the scale, then one optimizer step each: the weight uses
+  //    whichever of Adam/SGD-momentum `optimizer` names; the scale (like the
+  //    activation quantizer below) is always Adam, regardless.
   const std::string lr = std::string(kPrefix) + "lr";
   const std::string lr_scale = std::string(kPrefix) + "lr_scale";
   const std::string lr_act = std::string(kPrefix) + "lr_act";
@@ -1548,12 +1587,21 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
       }
       masked = b.Mul(masked, b.Const(keep, t.w_shape, "keep"));
     }
-    const AdamOutputs w_step =
-        AdamUpdate(b, t.w_input, masked, t.m_input, t.v_input, lr,
-                   "m_correction", "v_correction");
-    t.w_next = w_step.param_next;
-    t.m_next = w_step.m_next;
-    t.v_next = w_step.v_next;
+    if (optimizer == Optimizer::kAdam) {
+      const AdamOutputs w_step =
+          AdamUpdate(b, t.w_input, masked, t.m_input, t.v_input, lr,
+                     "m_correction", "v_correction");
+      t.w_next = w_step.param_next;
+      t.m_next = w_step.m_next;
+      t.v_next = w_step.v_next;
+    } else {
+      // Optimizer::kSgdMomentum -- the only other value ParseOptimizer
+      // allows.
+      const SgdMomentumOutputs w_step =
+          SgdMomentumUpdate(b, t.w_input, masked, t.m_input, lr);
+      t.w_next = w_step.param_next;
+      t.m_next = w_step.mom_next;
+    }
     if (!t.scale_input.empty()) {
       // LSQ's scale gradient, the same one onnxsim.autoround derives:
       // d(w_hat)/d(s) = code - w/s where the element is inside the clipping
@@ -1598,10 +1646,12 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   for (const Trained& t : trained) {
     state.push_back({t.w_input, t.w_shape, t.w_next});
     state.push_back({t.m_input, t.w_shape, t.m_next});
-    state.push_back({t.v_input, t.w_shape, t.v_next});
     initial_state.push_back(MakeFloatTensor(t.w_input, t.w_shape, t.w_init));
     initial_state.push_back(MakeZeroTensor(t.m_input, t.w_shape));
-    initial_state.push_back(MakeZeroTensor(t.v_input, t.w_shape));
+    if (!t.v_input.empty()) {
+      state.push_back({t.v_input, t.w_shape, t.v_next});
+      initial_state.push_back(MakeZeroTensor(t.v_input, t.w_shape));
+    }
     if (!t.scale_input.empty()) {
       state.push_back({t.scale_input, t.scale_shape, t.scale_next});
       state.push_back({t.ms_input, t.scale_shape, t.ms_next});
@@ -1637,7 +1687,22 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
     }
   }
 
-  std::vector<std::string> scalars{lr, "m_correction", "v_correction"};
+  // "m_correction"/"v_correction" are Adam's bias-correction factors
+  // (AdamUpdate's own inputs), declared exactly when *something* in this
+  // block uses Adam: the weight itself (optimizer == kAdam) or, if not, the
+  // scale/activation updates above, which are always Adam regardless of
+  // `optimizer`. A caller that binds a step graph declaring neither of these
+  // must not feed them, and one that does declare them must always be fed
+  // them -- see qat.py's _build_step_graph for the identical condition on
+  // the Python side.
+  std::vector<std::string> scalars{lr};
+  const bool uses_adam = optimizer == Optimizer::kAdam ||
+                         options.learn_scales ||
+                         options.learn_activation_scales;
+  if (uses_adam) {
+    scalars.push_back("m_correction");
+    scalars.push_back("v_correction");
+  }
   if (options.learn_scales) scalars.push_back(lr_scale);
   if (options.learn_activation_scales) scalars.push_back(lr_act);
 
