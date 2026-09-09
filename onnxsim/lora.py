@@ -1006,9 +1006,10 @@ def discover_lora_blocks(
     pairs: List[Tuple[str, str]] = []
     start: Optional[Tuple[int, str]] = cuts[0] if cuts else None
     count = 0
+    supported = graph_grad.supported_ops()
     for previous, current in zip(cuts, cuts[1:]):
         span = graph.node[previous[0] + 1 : current[0] + 1]
-        if any(node.op_type not in graph_grad.SUPPORTED_OPS for node in span):
+        if any(node.op_type not in supported for node in span):
             # A gap. Close whatever was pending before it and reopen after.
             if start is not None and count and start[0] < previous[0]:
                 pairs.append((start[1], previous[1]))

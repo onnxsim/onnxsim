@@ -1151,16 +1151,23 @@ em::val onnxsim_quantize_qoperator(const std::string &data, em::val names_ary,
 
 // QatOptions as a plain JS object with named fields:
 //
-//   { learnScales, learnActivationScales, fakeQuant, preserveSparsity,
-//     batchSize, batchSeed, shuffle }
+//   { optimizer, learnScales, learnActivationScales, fakeQuant,
+//     preserveSparsity, batchSize, batchSeed, shuffle }
 //
-// Named fields rather than seven positional arguments because they are
+// Named fields rather than eight positional arguments because they are
 // independent knobs that each already have a default: an absent (or
 // null/undefined) field keeps QatOptions' own, so `{}` means "full batch,
-// train the weights only" -- apply_qat's default -- and a caller that wants
-// one knob writes one field. `batchSize`/`batchSeed` arrive as JS numbers
-// (doubles) and are truncated to the int64 fields they feed; nothing here is
-// large enough for that to lose anything.
+// train the weights only with Adam" -- apply_qat's default -- and a caller
+// that wants one knob writes one field. `batchSize`/`batchSeed` arrive as JS
+// numbers (doubles) and are truncated to the int64 fields they feed; nothing
+// here is large enough for that to lose anything.
+//
+// `optimizer` is `"adam"` (QatOptions' own default, kept when the field is
+// absent) or `"sgd_momentum"`, and picks only the block's own weight update --
+// learnScales/learnActivationScales's parameters always train with Adam
+// regardless, exactly as in apply_qat. Anything else is refused the same way
+// an unrecognized value in any other field here would be: BuildQatStepGraph
+// throws, and the binding returns null with the reason on the console.
 //
 // `fakeQuant: false` is the one field that changes what the two model
 // arguments mean rather than adding a knob: the quantizer comes out of the
@@ -1185,6 +1192,12 @@ QatOptions QatOptionsFromVal(em::val options) {
     if (!v.isUndefined() && !v.isNull())
       dst = static_cast<int64_t>(v.as<double>());
   };
+  auto read_string = [&options](const char *key, std::string &dst) {
+    em::val v = options[key];
+    if (!v.isUndefined() && !v.isNull())
+      dst = v.as<std::string>();
+  };
+  read_string("optimizer", out.optimizer);
   read_bool("learnScales", out.learn_scales);
   read_bool("learnActivationScales", out.learn_activation_scales);
   read_bool("fakeQuant", out.fake_quant);

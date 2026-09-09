@@ -48,15 +48,21 @@
 // the QAT panel's own button handler already has inline. A block that turns
 // out untrainable is skipped and reported, not fatal to the others.
 //
-// **Two things this panel does not do**, both flagged in the panel's own
-// static copy in index.html rather than only here: it has no QLoRA
-// (NF4-quantized base) composition wired in -- onnxsim.nf4's quantizer has
-// no C++ port, per lora_entry.h's own top comment on why that is
-// deliberately out of this header's scope -- and it trains only against a
-// reference model's own activations (train_lora's `reference_model=` mode),
-// never against caller-supplied `target_data`. Both are follow-ups, not
-// oversights; see lora_finetune.mjs's trainLoraAdapter for the fuller
-// reasoning on the second.
+// **One thing this panel does not do**, flagged in the panel's own static
+// copy in index.html rather than only here: it has no QLoRA (NF4-quantized
+// base) composition wired in -- onnxsim.nf4's quantizer has no C++ port, per
+// lora_entry.h's own top comment on why that is deliberately out of this
+// header's scope. That is a follow-up, not an oversight.
+//
+// lora_finetune.mjs's training calls (trainLoraAdapter,
+// trainLoraAdapterAllBlocks) do support train_lora's other mode --
+// caller-supplied `targetData`, real supervised fine-tuning against labels
+// rather than distilling a reference model -- but this panel's own button
+// handler below only ever drives reference-model distillation: calibration
+// rows here come from real images/text via hf_datasets.mjs, and there is no
+// equivalent live source on this generic model-conversion page for arbitrary
+// numeric training labels to pass as `targetData`. Wiring that mode up is a
+// UI/data-source question, not a training-loop gap.
 
 import { downloadBytes } from "./download.mjs";
 import { resolveOriginalModelBytes, loadOrt } from "./inference_browser.mjs";

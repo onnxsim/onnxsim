@@ -573,12 +573,17 @@ class _Trained:
     candidate: _QuantizedLayer
     w_input: str
     m_input: str
-    v_input: str
     w_shape: Tuple[int, ...]
     w_init: np.ndarray
     scale_axis: int
     scale_shape: Tuple[int, int]
     scale_init: np.ndarray
+    # The weight's second Adam moment. Present (a real name) only when the
+    # weight is trained with Adam; ``None`` when it is trained with SGD
+    # momentum instead, which has only one state tensor (``m_input`` doubles
+    # as that one moment buffer) and so no use for a second. See
+    # :func:`_build_step_graph` and :func:`_plan_trained`.
+    v_input: Optional[str] = None
     scale_input: Optional[str] = None
     ms_input: Optional[str] = None
     vs_input: Optional[str] = None
@@ -939,20 +944,20 @@ def _refuse_unsupported(nodes: Sequence[onnx.NodeProto]) -> None:
     """Every op in the slice must have a gradient rule, checked before any
     calibration data is run.
 
-    Tested against :data:`onnxsim.graph_grad.SUPPORTED_OPS` rather than by
-    catching :class:`onnxsim.graph_grad.UnsupportedOpError` from
-    ``build_backward``, which is what that module's own docstring asks
-    callers who pick their own slice to do -- and it means the caller learns
-    the block is out of scope in milliseconds rather than after a full
-    activation capture.
+    Tested against :func:`onnxsim.graph_grad.supported_ops` (the builtin
+    rules plus anything registered via
+    :func:`onnxsim.graph_grad.register_gradient`) rather than by catching
+    :class:`onnxsim.graph_grad.UnsupportedOpError` from ``build_backward``,
+    which is what that module's own docstring asks callers who pick their
+    own slice to do -- and it means the caller learns the block is out of
+    scope in milliseconds rather than after a full activation capture.
     """
-    unsupported = sorted(
-        {n.op_type for n in nodes if n.op_type not in graph_grad.SUPPORTED_OPS}
-    )
+    supported = graph_grad.supported_ops()
+    unsupported = sorted({n.op_type for n in nodes if n.op_type not in supported})
     if unsupported:
         raise graph_grad.UnsupportedOpError(
             f"the block contains {unsupported}, which onnxsim.graph_grad cannot "
-            f"differentiate; it differentiates {sorted(graph_grad.SUPPORTED_OPS)}. "
+            f"differentiate; it differentiates {sorted(supported)}. "
             "Choose block boundaries that exclude those nodes."
         )
 
@@ -1156,6 +1161,7 @@ def _plan_trained(
     candidates: Sequence[_QuantizedLayer],
     learn_scales: bool,
     learn_activation_scales: bool = False,
+    optimizer: str = "adam",
 ) -> List[_Trained]:
     """One :class:`_Trained` per quantized layer in the block, with its
     master weight seeded from the *float* model's own weight -- so step 0 of
@@ -1167,6 +1173,15 @@ def _plan_trained(
     as shipped and the run can only be measured against it. That is the same
     warm start :func:`onnxsim.apply_adaquant` uses, and the reason a run that
     helps nothing costs accuracy rather than losing it outright.
+
+    ``optimizer`` picks what the *weight's own* state looks like: with
+    ``"adam"`` (the default) a second-moment buffer ``v_input`` is allocated
+    alongside ``m_input``; with ``"sgd_momentum"`` there is only the one
+    momentum buffer Adam's ``m_input`` name already carries, so ``v_input``
+    is left ``None`` -- see :class:`_Trained`. It never touches the scale or
+    activation-quantizer state (``ms_input``/``vs_input``,
+    ``ma_input``/``va_input``/``mz_input``/``vz_input``), which are always
+    Adam's two moments regardless of this choice -- see :func:`_build_step_graph`.
     """
     planned: List[_Trained] = []
     for i, candidate in enumerate(candidates):
@@ -1176,7 +1191,7 @@ def _plan_trained(
             candidate=candidate,
             w_input=f"{_PREFIX}w{i}",
             m_input=f"{_PREFIX}mw{i}",
-            v_input=f"{_PREFIX}vw{i}",
+            v_input=f"{_PREFIX}vw{i}" if optimizer == "adam" else None,
             w_shape=tuple(int(d) for d in w.shape),
             w_init=w,
             scale_axis=candidate.axis,
@@ -1212,9 +1227,19 @@ def _build_step_graph(
     learn_activation_scales: bool = False,
     fake_quant: bool = True,
     preserve_sparsity: bool = False,
+    optimizer: str = "adam",
 ) -> qat_graph.StepGraph:
     """The whole loop as one graph: fake-quant forward, block forward,
-    reconstruction loss, backward, Adam.
+    reconstruction loss, backward, optimizer.
+
+    ``optimizer`` (``"adam"`` or ``"sgd_momentum"``) picks what the *block's
+    own weight* update looks like -- see :func:`apply_qat`'s docstring for
+    the full scope boundary. It never reaches the LSQ scale update or the
+    activation-quantizer updates below (the ``learn_scales``/
+    ``learn_activation_scales`` extras): those are always Adam, unconditionally.
+    With the default ``"adam"``, every node this function emits -- including
+    which scalars it declares and which state tensors it threads -- is
+    byte-identical to what it emitted before this parameter existed.
 
     The ordering is the only subtle part. :func:`graph_grad.build_backward`
     reads forward tensors by name (including node *outputs*, where reusing a
@@ -1254,6 +1279,7 @@ def _build_step_graph(
     batch-sized shape, and none of the code below has to know which case it
     is in.
     """
+    _refuse_unknown_optimizer(optimizer)
     b = qat_graph.GraphBuilder(_PREFIX)
     b.initializer.extend(block_initializers)
 
@@ -1415,7 +1441,9 @@ def _build_step_graph(
     )
 
     # 5. Straight through the fake-quant, into the master weight and (if
-    #    asked for) the scale, then one Adam step each.
+    #    asked for) the scale, then one optimizer step each: the weight uses
+    #    whichever of Adam/SGD-momentum ``optimizer`` names; the scale (like
+    #    the activation quantizer below) is always Adam, regardless.
     for t, weight_name, _scale_full, quant_code, quant_ratio, ste_mask in per_layer:
         g = grads[weight_name]  # dL/d(w_hat), in the weight's storage layout
         # STE: d(w_hat)/d(w) is 1 inside the clipping range and 0 outside.
@@ -1430,16 +1458,25 @@ def _build_step_graph(
             # it applies to and the builder's name counter stays a function of
             # emission order.
             w_grad = b.mul(w_grad, b.const((t.w_init != 0).astype(np.float32), "keep"))
-        t.w_next, t.m_next, t.v_next = qat_graph.adam_update(
-            b,
-            t.w_input,
-            w_grad,
-            t.m_input,
-            t.v_input,
-            f"{_PREFIX}lr",
-            "m_correction",
-            "v_correction",
-        )
+        if optimizer == "adam":
+            t.w_next, t.m_next, t.v_next = qat_graph.adam_update(
+                b,
+                t.w_input,
+                w_grad,
+                t.m_input,
+                str(t.v_input),
+                f"{_PREFIX}lr",
+                "m_correction",
+                "v_correction",
+            )
+        else:  # "sgd_momentum" -- the only other value _refuse_unknown_optimizer allows
+            t.w_next, t.m_next = qat_graph.sgd_momentum_update(
+                b,
+                t.w_input,
+                w_grad,
+                t.m_input,
+                f"{_PREFIX}lr",
+            )
         if t.scale_input is not None:
             # LSQ's scale gradient, the same one onnxsim.autoround derives:
             # d(w_hat)/d(s) = code - w/s where the element is inside the
@@ -1502,7 +1539,8 @@ def _build_step_graph(
     for t in trained:
         state[t.w_input] = (list(t.w_shape), t.w_next)
         state[t.m_input] = (list(t.w_shape), t.m_next)
-        state[t.v_input] = (list(t.w_shape), t.v_next)
+        if t.v_input is not None:
+            state[t.v_input] = (list(t.w_shape), t.v_next)
         if t.scale_input is not None:
             state[t.scale_input] = (list(t.scale_shape), t.scale_next)
             state[str(t.ms_input)] = (list(t.scale_shape), t.ms_next)
@@ -1518,7 +1556,20 @@ def _build_step_graph(
             ):
                 state[name] = ([], out)
 
-    scalars = [f"{_PREFIX}lr", "m_correction", "v_correction"]
+    # "m_correction"/"v_correction" are Adam's bias-correction factors
+    # (adam_update's own inputs). They are declared here -- and must be fed
+    # by every caller of the resulting step graph -- exactly when *something*
+    # in this block uses Adam: the weight itself (optimizer == "adam") or, if
+    # neither is, the scale/activation updates above, which are always Adam
+    # regardless of ``optimizer``. A step graph that declares neither of the
+    # two extra optimizer flags and chose sgd_momentum for its one weight
+    # never declares these -- and onnxruntime raises on a feed for an input a
+    # graph never declared, so run_step_graph's own scalars callback (see
+    # _train_block) must derive the identical condition rather than guess.
+    scalars = [f"{_PREFIX}lr"]
+    uses_adam = optimizer == "adam" or learn_scales or learn_activation_scales
+    if uses_adam:
+        scalars += ["m_correction", "v_correction"]
     if learn_scales:
         scalars.append(f"{_PREFIX}lr_scale")
     if learn_activation_scales:
@@ -1745,6 +1796,7 @@ def _train_block(
     activation_learning_rate: float = 1e-2,
     fake_quant: bool = True,
     preserve_sparsity: bool = False,
+    optimizer: str = "adam",
 ) -> onnx.ModelProto:
     """Runs the whole optimization for one already-planned, already-captured
     block and returns ``quantized_model`` with that block's initializers
@@ -1756,6 +1808,9 @@ def _train_block(
     difference between :func:`apply_qat`'s one-block contract and
     :func:`apply_qat_all_blocks`'s sequential walk: the target is always the
     teacher's, but the inputs may be the teacher's or the student's.
+
+    ``optimizer`` picks the block's own weight update (``"adam"`` or
+    ``"sgd_momentum"``); see :func:`apply_qat` for the full scope boundary.
     """
     batch = _plan_minibatch(external_values, teacher_output, batch_size)
     # Shape inference sees one step's worth of rows, since that is what the
@@ -1771,7 +1826,9 @@ def _train_block(
         float_model, plan.nodes, block_inputs, plan.output_name, block_target
     )
 
-    trained = _plan_trained(plan.candidates, learn_scales, learn_activation_scales)
+    trained = _plan_trained(
+        plan.candidates, learn_scales, learn_activation_scales, optimizer
+    )
     trained_weight_names = {t.candidate.float_node.input[1] for t in trained}
     used = {name for node in plan.nodes for name in node.input if name}
     # The block's *untrained* constants -- a LayerNorm's scale and bias, a
@@ -1801,6 +1858,7 @@ def _train_block(
         learn_activation_scales,
         fake_quant,
         preserve_sparsity,
+        optimizer=optimizer,
     )
 
     # The whole set is the constant either way; with a minibatch it is bound
@@ -1816,7 +1874,8 @@ def _train_block(
     for t in trained:
         state[t.w_input] = t.w_init
         state[t.m_input] = np.zeros_like(t.w_init)
-        state[t.v_input] = np.zeros_like(t.w_init)
+        if t.v_input is not None:
+            state[t.v_input] = np.zeros_like(t.w_init)
         if t.scale_input is not None:
             state[t.scale_input] = t.scale_init
             state[str(t.ms_input)] = np.zeros_like(t.scale_init)
@@ -1838,6 +1897,18 @@ def _train_block(
             state[str(t.mz_input)] = zero
             state[str(t.vz_input)] = zero
 
+    # Whether the step graph declared "m_correction"/"v_correction" at all --
+    # onnxruntime raises on a feed for an input the graph never declared, so
+    # this has to agree exactly with _build_step_graph's own "uses_adam"
+    # condition (optimizer == "adam" or learn_scales or
+    # learn_activation_scales) for whether those two scalars exist. Reading
+    # it off ``step.model.graph.input`` directly, rather than recomputing
+    # that condition a second time here, is what keeps the two checks from
+    # ever drifting apart.
+    uses_adam_scalars = any(
+        inp.name == "m_correction" for inp in step.model.graph.input
+    )
+
     def scalars(t: int) -> Dict[str, float]:
         decay = 1.0 - t / num_iterations if lr_decay else 1.0
         values = {
@@ -1849,7 +1920,8 @@ def _train_block(
             del values[f"{_PREFIX}lr_scale"]
         if not learn_activation_scales:
             del values[f"{_PREFIX}lr_act"]
-        values.update(qat_graph.adam_bias_corrections(t))
+        if uses_adam_scalars:
+            values.update(qat_graph.adam_bias_corrections(t))
         return values
 
     feeds: Optional[Callable[[int], Dict[str, np.ndarray]]] = None
@@ -1956,6 +2028,24 @@ def _train_block(
     return tuned
 
 
+#: The block weight's own optimizer choice -- see :func:`apply_qat`'s
+#: ``optimizer`` parameter for what each one means and, crucially, what it
+#: does *not* apply to.
+_VALID_OPTIMIZERS = frozenset({"adam", "sgd_momentum"})
+
+
+def _refuse_unknown_optimizer(optimizer: str) -> None:
+    """Shared by :func:`apply_qat`/:func:`apply_qat_all_blocks` (fail fast,
+    before spending a capture or a training budget) and
+    :func:`_build_step_graph` (defensive -- it is the function whose contract
+    ``optimizer`` actually governs, so it checks its own argument rather than
+    trusting every caller to have checked first)."""
+    if optimizer not in _VALID_OPTIMIZERS:
+        raise ValueError(
+            f"optimizer must be one of {sorted(_VALID_OPTIMIZERS)}, got {optimizer!r}"
+        )
+
+
 def _refuse_quantizer_flags_without_fake_quant(
     fake_quant: bool, learn_scales: bool, learn_activation_scales: bool
 ) -> None:
@@ -2011,6 +2101,7 @@ def apply_qat(
     losses: Optional[List[float]] = None,
     fake_quant: bool = True,
     preserve_sparsity: bool = False,
+    optimizer: str = "adam",
 ) -> onnx.ModelProto:
     """Fine-tunes one block's quantized weights (and, opted in, its activation
     quantizers) against the float model's own
@@ -2273,6 +2364,27 @@ def apply_qat(
             models differ enough for there to be something to learn.
             Incompatible with ``learn_scales`` and
             ``learn_activation_scales``, which have no scales to learn.
+    :param optimizer: which optimizer trains the block's own weight --
+            ``"adam"`` (the default) or ``"sgd_momentum"`` (classic
+            heavy-ball momentum SGD, :func:`onnxsim.qat_graph.sgd_momentum_update`).
+            **This is deliberately scoped to the weight alone.** When
+            ``learn_scales`` and/or ``learn_activation_scales`` are also on,
+            their LSQ scale / activation-quantizer parameters always train
+            with Adam, regardless of what ``optimizer`` says -- so
+            ``optimizer="sgd_momentum"`` with ``learn_scales=True`` trains
+            the weight with SGD-momentum and the scale with Adam, in the same
+            run. That is not an oversight: Adam's per-parameter state is two
+            tensors shaped like the parameter (``m``, ``v``) plus two
+            step-dependent bias-correction scalars, while SGD-momentum's is
+            one tensor and no scalars, so a *uniform* optimizer choice across
+            weight, scale and activation quantizer would mean plumbing that
+            same either/or through three independently-shaped parameter
+            groups instead of one -- a materially larger change for a
+            feature nothing has asked to extend past the weight, which is
+            also the one parameter every trained block always has (the scale
+            and activation-quantizer state exist only when their own opt-in
+            flags are on). Raises :class:`ValueError` if ``optimizer`` is
+            neither of the two recognized strings.
     :returns: ``quantized_model`` with the block's quantized weight
             initializers (and, if ``learn_scales``, their scale
             initializers; if ``learn_activation_scales``, the activation
@@ -2290,6 +2402,7 @@ def apply_qat(
     _refuse_quantizer_flags_without_fake_quant(
         fake_quant, learn_scales, learn_activation_scales
     )
+    _refuse_unknown_optimizer(optimizer)
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -2335,6 +2448,7 @@ def apply_qat(
         losses=losses,
         fake_quant=fake_quant,
         preserve_sparsity=preserve_sparsity,
+        optimizer=optimizer,
     )
 
 
@@ -2608,9 +2722,10 @@ def discover_qat_blocks(
     pairs: List[Tuple[str, str]] = []
     start: Optional[Tuple[int, str]] = cuts[0] if cuts else None
     layers = 0
+    supported = graph_grad.supported_ops()
     for previous, current in zip(cuts, cuts[1:]):
         span = graph.node[previous[0] + 1 : current[0] + 1]
-        if any(node.op_type not in graph_grad.SUPPORTED_OPS for node in span):
+        if any(node.op_type not in supported for node in span):
             # A gap. Close whatever was pending *before* it (the pending
             # block ends at the last cut that is still on the trainable side)
             # and reopen after it.
@@ -2709,6 +2824,7 @@ def apply_qat_all_blocks(
     step_providers: Optional[Sequence[backend.Provider]] = None,
     fake_quant: bool = True,
     preserve_sparsity: bool = False,
+    optimizer: str = "adam",
 ) -> Tuple[onnx.ModelProto, List[QATBlockResult]]:
     """Trains every block :func:`discover_qat_blocks` finds, in graph order --
     :func:`apply_qat` lifted from one caller-named block to the whole model.
@@ -2817,6 +2933,16 @@ def apply_qat_all_blocks(
             the teacher's and, in sequential mode, the student's)
     :param step_providers: execution providers for the optimization itself,
             as an ONNX step graph -- the path to CUDA, an NPU EP or WebGPU
+    :param optimizer: which optimizer trains each block's own weight --
+            ``"adam"`` (the default) or ``"sgd_momentum"``, applied
+            identically to every block in the walk. Scoped to the weight
+            alone, exactly as in :func:`apply_qat`: with ``learn_scales``
+            and/or ``learn_activation_scales`` also on, every block's scale
+            and activation-quantizer parameters still train with Adam
+            regardless of this choice -- see :func:`apply_qat`'s own
+            ``optimizer`` paragraph for why that boundary was drawn where it
+            was. Raises :class:`ValueError` if ``optimizer`` is neither of
+            the two recognized strings.
     :returns: ``(tuned model, one QATBlockResult per discovered block)``. The
             model is ``quantized_model`` with every successfully trained
             block's initializers rewritten and nothing else touched; if no
@@ -2825,6 +2951,7 @@ def apply_qat_all_blocks(
     _refuse_quantizer_flags_without_fake_quant(
         fake_quant, learn_scales, learn_activation_scales
     )
+    _refuse_unknown_optimizer(optimizer)
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -2924,6 +3051,7 @@ def apply_qat_all_blocks(
                 losses=result.losses,
                 fake_quant=fake_quant,
                 preserve_sparsity=preserve_sparsity,
+                optimizer=optimizer,
             )
         except (ValueError, graph_grad.UnsupportedOpError) as error:
             # A step graph that was half-built cannot have touched ``tuned``

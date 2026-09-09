@@ -52,6 +52,22 @@
 // activation quantizer anywhere to train. Asking for the wrong pairing is an
 // error, not a silent no-op -- see BuildQatStepGraph's contract below.
 struct QatOptions {
+  // Which optimizer trains the block's *own weight* -- "adam" (the default)
+  // or "sgd_momentum" (classic heavy-ball momentum SGD, qat_graph_builder.h's
+  // SgdMomentumUpdate). Mirrors apply_qat's own `optimizer` parameter, scope
+  // boundary included: this is deliberately confined to the weight alone.
+  // With learn_scales and/or learn_activation_scales also on, the LSQ scale
+  // and activation-quantizer parameters always train with Adam regardless of
+  // this string -- a uniform choice across all three would mean plumbing the
+  // same either/or through three independently-shaped state groups (Adam's
+  // two moment tensors plus two bias-correction scalars vs. SGD-momentum's
+  // one tensor and no scalars) instead of just the one every trained block
+  // always has. Parsed once, at BuildQatStepGraph's own boundary, into the
+  // internal Optimizer enum (see qat_entry.cpp's ParseOptimizer) -- anything
+  // other than the two recognized strings throws std::invalid_argument
+  // naming the bad value, the same way an unrecognized `importance_norm`
+  // does in structured_pruning_entry.cpp.
+  std::string optimizer = "adam";
   bool learn_scales = false;
   bool learn_activation_scales = false;
   // With false, drop the fake-quantizer and train the *second model's own
@@ -194,11 +210,20 @@ struct QatStepPlan {
   // right count of values in the wrong order is silent -- every one of them is
   // a bare float and nothing downstream can tell a weight learning rate from an
   // activation one:
-  //   "qat__lr"        the master weights' Adam learning rate
+  //   "qat__lr"        the master weights' own learning rate, for whichever
+  //                    of QatOptions::optimizer's two optimizers trains them
   //   "m_correction"   Adam's first-moment bias correction, 1/(1 - beta1^(t+1))
   //   "v_correction"   ... and its second, 1/(1 - beta2^(t+1))
   //   "qat__lr_scale"  present only with learn_scales
   //   "qat__lr_act"    present only with learn_activation_scales
+  // "m_correction"/"v_correction" are present exactly when *something* in
+  // this run uses Adam -- the weight itself (optimizer == "adam") or, if
+  // not, learn_scales/learn_activation_scales, whose parameters are always
+  // Adam regardless of `optimizer`. A caller must feed exactly the scalars
+  // named here, in whatever order it likes (they are fed by name) -- binding
+  // a scalar this list omits, or omitting one it names, is what a step graph
+  // built with optimizer="sgd_momentum" and neither scale flag looks like if
+  // a caller assumes the two corrections are always present.
   // AdamBiasCorrections computes the two corrections. apply_qat decays each
   // learning rate linearly (lr * (1 - t/num_iterations)) when lr_decay is on;
   // that schedule is the caller's to reproduce, since nothing here sees t.
@@ -243,7 +268,8 @@ struct QatStepPlan {
 // `options.fake_quant` off with either scale flag on is refused the same way,
 // and for the same reason it is refused rather than ignored in the Python:
 // both flags name a parameter of a quantizer, and that is the mode with no
-// quantizer in it.
+// quantizer in it. `options.optimizer` outside {"adam", "sgd_momentum"} is
+// refused the same way too, naming the bad value.
 QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
                               const onnx::ModelProto& quantized_model,
                               const std::string& block_input_name,

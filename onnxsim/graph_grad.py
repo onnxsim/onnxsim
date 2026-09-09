@@ -40,6 +40,22 @@ emitting a wrong gradient is not -- it shows up as a model that trains to a
 slightly worse answer, which is nearly impossible to attribute after the
 fact.
 
+**Extending the boundary: :func:`register_gradient`.** A caller whose block
+contains an op none of the builtin rules cover -- a custom domain op, or a
+standard one this module has not grown a rule for yet -- can hand it one
+directly, the same relationship :func:`torch.autograd.Function.backward` (or
+more recently ``torch.library.register_autograd``) has to a custom torch op:
+write the vector-Jacobian product once, register it against the op type, and
+every caller that differentiates through :func:`build_backward` with its
+default ``rules=None`` -- which is every public onnxsim entry point that
+trains a block (:func:`onnxsim.apply_qat`, :func:`onnxsim.train_lora`, ...) --
+picks it up with no further plumbing. Registration is process-global and
+Python-only: it has no counterpart in ``graph_grad.h``/``.cpp`` (the
+hand-ported C++ mirror the browser/WASM converter path uses), whose rule
+table is a fixed, parity-pinned function-pointer map baked in at compile
+time -- see :func:`register_gradient`'s own docstring for what that means
+for a block trained both ways.
+
 **The one subtlety worth naming up front: broadcasting.** ``Add``, ``Mul``,
 ``Div`` and friends broadcast their inputs numpy-style, and the gradient of a
 broadcast is a *sum* over the axes that were broadcast. A rule that returns
@@ -57,9 +73,10 @@ run.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import itertools
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx
@@ -1834,7 +1851,145 @@ _RULES: Dict[str, Rule] = {
 # the slice themselves -- block discovery for QAT, say -- should test against
 # this rather than rediscovering the list by catching
 # :class:`UnsupportedOpError`.
+#
+# Deliberately the *builtin* set alone, unaffected by :func:`register_gradient`
+# -- tests/test_qat_parity.py pins ``sorted(SUPPORTED_OPS)`` byte-for-byte
+# against qat_parity_fixtures.txt (the Python<->C++ parity mechanism), and
+# that pin must not shift just because some other test in the same process
+# registered a custom rule. Callers that pick their own block boundaries and
+# want custom-registered ops included in that boundary -- not just accepted
+# once :func:`build_backward` is actually called -- should test against
+# :func:`supported_ops` instead; :func:`onnxsim.qat._refuse_unsupported` and
+# :func:`onnxsim.qat.discover_qat_blocks`/:func:`onnxsim.lora.discover_lora_blocks`
+# all do.
 SUPPORTED_OPS = frozenset(_RULES)
+
+#: Custom gradient rules registered via :func:`register_gradient`, kept in a
+#: table separate from the builtin, parity-pinned :data:`_RULES` for exactly
+#: the reason :data:`SUPPORTED_OPS` above stays builtin-only. Process-global
+#: -- see :func:`register_gradient`'s docstring for the test-isolation
+#: implications, and :func:`custom_gradient` for a scoped alternative.
+_CUSTOM_RULES: Dict[str, Rule] = {}
+
+
+def supported_ops() -> frozenset:
+    """:data:`SUPPORTED_OPS` (the builtin rules) unioned with every op type
+    currently registered via :func:`register_gradient`. This is the set
+    :func:`build_backward` (called the ordinary way, with ``rules=None``)
+    can actually differentiate right now."""
+    return SUPPORTED_OPS | frozenset(_CUSTOM_RULES)
+
+
+def register_gradient(
+    op_type: str, rule: Optional[Rule] = None, *, override: bool = False
+):
+    """Registers ``rule`` as the gradient for ``op_type``, usable by every
+    caller of :func:`build_backward` that leaves its ``rules`` argument at
+    the default ``None`` -- which includes every public onnxsim entry point
+    that differentiates a block (:func:`onnxsim.apply_qat`,
+    :func:`onnxsim.apply_qat_all_blocks`, :func:`onnxsim.train_lora`, and
+    everything built on :func:`onnxsim.qat._refuse_unsupported`'s block-scope
+    check, which now tests against :func:`supported_ops` rather than the
+    builtin-only :data:`SUPPORTED_OPS`). The relationship to the caller is
+    the same one :func:`torch.autograd.Function.backward` has to a custom
+    torch op: write the vector-Jacobian product once, register it, and every
+    later differentiation of that op type uses it with no further plumbing.
+
+    Works as a decorator::
+
+        @graph_grad.register_gradient("MyCustomOp")
+        def _grad_my_custom_op(ctx, node, g):
+            ...
+            return [dx, dy]  # one entry per node.input, None where there is
+                              # no gradient for that input (Reshape's shape
+                              # operand is the builtin example)
+
+    or as a direct call: ``graph_grad.register_gradient("MyCustomOp", rule)``.
+
+    ``rule`` must match :data:`Rule`'s signature -- ``(ctx, node, g) ->
+    List[Optional[str]]``, exactly what a builtin rule in :data:`_RULES`
+    looks like; see any of them (``_grad_relu`` is the simplest) for the
+    shape of ``ctx`` (a :class:`_Backward`, offering ``ctx.b`` -- the
+    :class:`onnxsim.qat_graph.GraphBuilder` to append new nodes to -- plus
+    ``ctx.shape``/``ctx.reduce_to``/``ctx.int64_const`` and friends).
+    :func:`build_backward` asserts the returned list is the same length as
+    ``node.input``; nothing here can check that in advance since it would
+    mean calling the rule speculatively.
+
+    Refuses to silently replace an existing rule -- builtin or a previously
+    registered custom one -- unless ``override=True``, the same "a surprising
+    collision is refused, not resolved by whichever registration happened to
+    run last" stance :class:`UnsupportedOpError` itself takes toward an
+    unrecognized op. Overriding a *builtin* op's rule changes differentiation
+    for Python callers only: it has no effect on the C++/WASM path (the
+    browser QAT/LoRA panels), whose step graphs come from ``qat_entry.cpp``'s
+    own hardcoded, unregistrable rule table -- so a block containing that op
+    type will train differently in the browser than it does here, a real and
+    easy-to-miss divergence worth thinking twice about before reaching for
+    ``override=True`` on anything already in :data:`SUPPORTED_OPS`.
+
+    Global and *not* automatically cleaned up -- a test that registers a rule
+    and does not call :func:`unregister_gradient` (or use
+    :func:`custom_gradient` instead) leaves it registered for every test that
+    runs afterward in the same process. Prefer :func:`custom_gradient` for
+    anything scoped to one test or one call.
+
+    :raises ValueError: if ``op_type`` already has a rule (builtin or
+            custom) and ``override`` is not set.
+    """
+
+    def _register(fn: Rule) -> Rule:
+        if not override:
+            if op_type in _RULES:
+                raise ValueError(
+                    f"{op_type!r} already has a builtin gradient rule; pass "
+                    "override=True to replace it (this affects Python-side "
+                    "differentiation only -- see register_gradient's own "
+                    "docstring for the C++/WASM divergence that implies)"
+                )
+            if op_type in _CUSTOM_RULES:
+                raise ValueError(
+                    f"{op_type!r} already has a custom gradient rule "
+                    "registered; pass override=True to replace it, or call "
+                    "unregister_gradient(op_type) first"
+                )
+        _CUSTOM_RULES[op_type] = fn
+        return fn
+
+    return _register if rule is None else _register(rule)
+
+
+def unregister_gradient(op_type: str) -> None:
+    """Removes a rule :func:`register_gradient` registered for ``op_type``.
+    Builtin rules (:data:`_RULES`) are never affected -- there is nothing to
+    unregister for an op :func:`register_gradient` was never used on.
+
+    :raises KeyError: if no custom rule is currently registered for
+            ``op_type``.
+    """
+    if op_type not in _CUSTOM_RULES:
+        raise KeyError(f"no custom gradient rule is registered for {op_type!r}")
+    del _CUSTOM_RULES[op_type]
+
+
+@contextlib.contextmanager
+def custom_gradient(
+    op_type: str, rule: Rule, *, override: bool = False
+) -> Iterator[None]:
+    """Scoped form of :func:`register_gradient`: registers ``rule`` for
+    ``op_type`` on entry and unregisters it on exit (success or exception
+    alike), so a test or a one-off call cannot leak a registration into
+    whatever else shares this process -- the leak risk :func:`register_gradient`'s
+    own docstring warns about. ::
+
+        with graph_grad.custom_gradient("MyCustomOp", my_rule):
+            tuned = onnxsim.apply_qat(float_model, quant_model, ...)
+    """
+    register_gradient(op_type, rule, override=override)
+    try:
+        yield
+    finally:
+        unregister_gradient(op_type)
 
 
 def build_backward(
@@ -1896,16 +2051,22 @@ def build_backward(
             through ``nodes`` (a disconnected target almost always means the
             slice or the target list is wrong, and a zero gradient would hide
             it), or if a shape is missing from ``shapes``.
-    :param rules: overrides :data:`_RULES` for this call. Exists for
+    :param rules: replaces the *entire* rule table this call uses, bypassing
+            :func:`register_gradient` registrations altogether. Exists for
             :mod:`tests.test_graph_grad_templates`, which builds a copy with
             ``Add``/``BatchNormalization`` pinned to the reference
             hand-written rule (:func:`_grad_add`/
             :func:`_grad_batch_normalization`) instead of the templated one
             :data:`_RULES` uses by default, as an independent numeric
-            cross-check -- never for ordinary callers, which should omit this
-            and get :data:`_RULES` as-is.
+            cross-check -- ordinary callers should omit this. Left at the
+            default ``None``, this call uses :data:`_RULES` plus any rules
+            registered via :func:`register_gradient`, so a rule registered
+            once is picked up here with no further plumbing -- the same
+            "register once, every later differentiation of that op uses it"
+            relationship :func:`torch.autograd.Function.backward` has to a
+            custom torch op.
     """
-    rules = _RULES if rules is None else rules
+    rules = dict(_RULES, **_CUSTOM_RULES) if rules is None else rules
     ctx = _Backward(b, shapes)
     grads: Dict[str, str] = dict(grad_outputs)
 

@@ -38,6 +38,7 @@ const {
   runStepLoop,
   trainLoraAdapter,
   trainLoraAdapterAllBlocks,
+  trainLoraBlock,
   wholeGraphBlock,
 } = await import("../lora_finetune.mjs");
 const qat = await import("../qat_finetune.mjs");
@@ -186,6 +187,67 @@ await check("a block with no teacher capture never touches the reference model",
   );
   assert.deepEqual([...captured.X.data], [5, 6]);
   assert.equal(ort.seen.created.length, 1, "only the injected model's session was created");
+});
+
+// ---------------------------------------------------------------------------
+// target_data mode: the teacher capture is stacked directly out of
+// caller-supplied rows, no reference model touched at all.
+
+await check("target_data stacks the teacher capture directly, without a reference model", async () => {
+  const injectedBytes = new Uint8Array([1]);
+  const captures = [
+    { input: "lora__X", source: "X", dims: [2, 2], teacher: false },
+    { input: "lora__teacher", source: "Y", dims: [2, 1], teacher: true },
+  ];
+  const runtime = {
+    onnxsim_add_graph_outputs() {
+      throw new Error("must not be called -- target_data mode never runs the reference model");
+    },
+  };
+  const ort = fakeOrt({ 1: { inputNames: ["X"], outputsPerRun: [{}] } });
+  const rowFeeds = [{ X: tensor([1, 2], [1, 2]) }, { X: tensor([1, 2], [3, 4]) }];
+  const captured = await captureLoraActivations(
+    ort,
+    runtime,
+    injectedBytes,
+    null, // no reference bytes at all -- target_data does not need them
+    captures,
+    rowFeeds,
+    [Float32Array.of(10), Float32Array.of(20)],
+  );
+  assert.deepEqual([...captured.X.data], [1, 2, 3, 4]);
+  assert.deepEqual([...captured.Y.data], [10, 20]);
+  assert.equal(ort.seen.created.length, 1, "only the injected model's session was created");
+});
+
+await check("target_data with the wrong number of rows is refused", async () => {
+  await assert.rejects(
+    captureLoraActivations(
+      fakeOrt({}),
+      {},
+      new Uint8Array([1]),
+      null,
+      [{ input: "lora__teacher", source: "Y", dims: [2, 1], teacher: true }],
+      [{ X: tensor([1, 1], [1]) }, { X: tensor([1, 1], [2]) }],
+      [Float32Array.of(1)], // one target row, but two calibration rows
+    ),
+    /target_data has 1 row\(s\) but 2 calibration row\(s\)/,
+  );
+});
+
+await check("a target_data row of the wrong length is refused", async () => {
+  await assert.rejects(
+    captureLoraActivations(
+      fakeOrt({}),
+      {},
+      new Uint8Array([1]),
+      null,
+      [{ input: "lora__teacher", source: "Y", dims: [2, 1], teacher: true }],
+      [{ X: tensor([1, 1], [1]) }, { X: tensor([1, 1], [2]) }],
+      [Float32Array.of(1), Float32Array.of(2, 3)], // row 1 has 2 values, not 1
+    ),
+    /target_data row 1: 'Y' expected 1 value\(s\).*got 2/,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -509,15 +571,210 @@ await check("a plan is released even when the loop fails", async () => {
   );
 });
 
-await check("targetData is refused rather than silently ignored", async () => {
+// ---------------------------------------------------------------------------
+// target_data mode: trainLoraBlock's own XOR (exactly one of
+// referenceBytes/targetData) and, once satisfied, a run that never creates a
+// reference-model session and trains against the supplied values.
+
+await check("trainLoraBlock refuses both referenceBytes and targetData", async () => {
   await assert.rejects(
-    trainLoraAdapter({}, {
-      baseBytes: new Uint8Array([1]),
-      targetData: [tensor([1, 1], [1])],
-      rowFeeds: [{ X: tensor([1, 2], [1, 2]) }],
-    }),
-    /target_data training is not implemented/,
+    trainLoraBlock(
+      {},
+      {
+        injectedBytes: new Uint8Array([1]),
+        adapter: [],
+        referenceBytes: new Uint8Array([2]),
+        targetData: [Float32Array.of(1)],
+        blockInput: "X",
+        blockOutput: "Y",
+        rowFeeds: [{ X: tensor([1, 1], [1]) }],
+      },
+    ),
+    /exactly one of referenceBytes or targetData/,
   );
+});
+
+await check("trainLoraBlock refuses neither referenceBytes nor targetData", async () => {
+  await assert.rejects(
+    trainLoraBlock(
+      {},
+      {
+        injectedBytes: new Uint8Array([1]),
+        adapter: [],
+        blockInput: "X",
+        blockOutput: "Y",
+        rowFeeds: [{ X: tensor([1, 1], [1]) }],
+      },
+    ),
+    /exactly one of referenceBytes or targetData/,
+  );
+});
+
+await check("trainLoraBlock trains against caller-supplied targetData, with no reference model", async () => {
+  const injectedBytes = new Uint8Array([1]);
+  const built = {
+    planHandle: 41,
+    stepGraph: new Uint8Array([1, 2, 3]),
+    state: [{ input: "w.lora_A", output: "w.lora_A_next" }],
+    scalars: ["lora__lr", "m_correction", "v_correction"],
+    loss: "lora__loss",
+    captures: [
+      { input: "lora__X", source: "X", dims: [2, 2], teacher: false },
+      { input: "lora__teacher", source: "Y", dims: [2, 1], teacher: true },
+    ],
+    initialState: [
+      { name: "w.lora_A", dtype: 1, dims: [2], data: new Uint8Array(new Float32Array([0, 0]).buffer) },
+    ],
+    rowIndexInput: "",
+    rowIndexSize: 0,
+    numRows: 2,
+    parameters: ["w.lora_A"],
+  };
+  const calls = [];
+  const runtime = {
+    onnxsim_lora_build_step_graph(...args) {
+      calls.push(["build", args]);
+      return built;
+    },
+    onnxsim_lora_write_back(bytes, handle, finalState) {
+      calls.push(["write_back", handle, finalState]);
+      return new Uint8Array([9, 9]);
+    },
+    onnxsim_lora_release_plan(handle) {
+      calls.push(["release", handle]);
+      return true;
+    },
+  };
+  const graph = fakeStepGraph(built.state);
+  const ort = fakeOrt({ 1: { inputNames: ["X"], outputsPerRun: [{}] } });
+  ort.InferenceSession.create = async (bytes, options) => {
+    ort.seen.created.push({ bytes, options });
+    if (bytes.length === 3) return { inputNames: [], outputNames: [], run: graph.runStep };
+    // Only ever the injected model -- X is a graph input so no augmented
+    // session is needed, and no reference-model bytes exist to be asked for.
+    return { inputNames: ["X"], outputNames: [], async run() { return {}; } };
+  };
+
+  const result = await trainLoraBlock(runtime, {
+    injectedBytes,
+    adapter: [{ weightName: "w", loraAName: "w.lora_A", loraBName: "w.lora_B", rank: 4 }],
+    targetData: [Float32Array.of(5), Float32Array.of(7)],
+    blockInput: "X",
+    blockOutput: "Y",
+    rowFeeds: [{ X: tensor([1, 2], [1, 2]) }, { X: tensor([1, 2], [3, 4]) }],
+    numSteps: 2,
+    rates: { learningRate: 1e-3 },
+    ortLoader: async () => ort,
+  });
+
+  assert.deepEqual([...result.bytes], [9, 9]);
+  assert.deepEqual(result.losses, [1, 0.5]);
+  // Exactly two sessions ever created: the injected model (for its input
+  // names) and the step graph -- never a third, reference-model session.
+  assert.equal(ort.seen.created.length, 2);
+  // The teacher feed the step graph actually trained against is the stacked
+  // targetData, not anything read off a model.
+  assert.deepEqual([...graph.seen[0].lora__teacher.data], [5, 7]);
+  assert.deepEqual(calls.map((c) => c[0]), ["build", "write_back", "release"]);
+});
+
+// ---------------------------------------------------------------------------
+// target_data mode at trainLoraAdapter's own layer: the XOR fires here too
+// (not only once execution reaches trainLoraBlock), and reaching
+// trainLoraBlock in this mode never exercises the referenceBytes/baseBytes
+// fallback.
+
+await check("trainLoraAdapter refuses both referenceBytes and targetData", async () => {
+  await assert.rejects(
+    trainLoraAdapter(
+      {},
+      {
+        baseBytes: new Uint8Array([1]),
+        referenceBytes: new Uint8Array([2]),
+        targetData: [Float32Array.of(1)],
+        blockInput: "X",
+        blockOutput: "Y",
+        rowFeeds: [{ X: tensor([1, 1], [1]) }],
+      },
+    ),
+    /at most one of referenceBytes or targetData/,
+  );
+});
+
+await check("trainLoraAdapter's targetData mode reaches trainLoraBlock without the baseBytes fallback", async () => {
+  const injectedModel = new Uint8Array([1]);
+  const adapter = [
+    {
+      weightName: "w",
+      nodeOutput: "y",
+      opType: "MatMul",
+      loraAName: "w.lora_A",
+      loraBName: "w.lora_B",
+      rank: 4,
+      hasAlpha: false,
+      alpha: 0,
+    },
+  ];
+  const built = {
+    planHandle: 12,
+    stepGraph: new Uint8Array([1, 2, 3]),
+    state: [{ input: "w.lora_A", output: "w.lora_A_next" }],
+    scalars: ["lora__lr", "m_correction", "v_correction"],
+    loss: "lora__loss",
+    captures: [
+      { input: "lora__X", source: "X", dims: [2, 2], teacher: false },
+      { input: "lora__teacher", source: "Y", dims: [2, 1], teacher: true },
+    ],
+    initialState: [
+      { name: "w.lora_A", dtype: 1, dims: [2], data: new Uint8Array(new Float32Array([0, 0]).buffer) },
+    ],
+    rowIndexInput: "",
+    rowIndexSize: 0,
+    numRows: 2,
+    parameters: ["w.lora_A"],
+  };
+  const calls = [];
+  const runtime = {
+    onnxsim_lora_inject(bytes, options) {
+      calls.push(["inject", bytes, options]);
+      return { model: injectedModel, adapter };
+    },
+    onnxsim_lora_build_step_graph(...args) {
+      calls.push(["build", args]);
+      return built;
+    },
+    onnxsim_lora_write_back(bytes, handle, finalState) {
+      calls.push(["write_back", handle, finalState]);
+      return new Uint8Array([4, 5, 6]);
+    },
+    onnxsim_lora_release_plan(handle) {
+      calls.push(["release", handle]);
+      return true;
+    },
+  };
+  const graph = fakeStepGraph(built.state);
+  const ort = fakeOrt({ 1: { inputNames: ["X"], outputsPerRun: [{}] } });
+  ort.InferenceSession.create = async (bytes, options) => {
+    ort.seen.created.push({ bytes, options });
+    if (bytes.length === 3) return { inputNames: [], outputNames: [], run: graph.runStep };
+    return { inputNames: ["X"], outputNames: [], async run() { return {}; } };
+  };
+
+  const result = await trainLoraAdapter(runtime, {
+    baseBytes: new Uint8Array([1]),
+    targetData: [Float32Array.of(5), Float32Array.of(7)],
+    blockInput: "X",
+    blockOutput: "Y",
+    rowFeeds: [{ X: tensor([1, 2], [1, 2]) }, { X: tensor([1, 2], [3, 4]) }],
+    numSteps: 1,
+    ortLoader: async () => ort,
+  });
+
+  assert.deepEqual([...result.bytes], [4, 5, 6]);
+  // Only the injected model and the step graph were ever asked for a
+  // session -- baseBytes was never separately opened as a reference model.
+  assert.equal(ort.seen.created.length, 2);
+  assert.deepEqual([...graph.seen[0].lora__teacher.data], [5, 7]);
 });
 
 // ---------------------------------------------------------------------------
@@ -742,6 +999,95 @@ await check("trainLoraAdapterAllBlocks skips a block build_step_graph refuses an
   assert.equal(result.losses.length, 1, "only the trained block contributes a loss");
   // The refused block never reached write_back/release; the trained one did.
   assert.deepEqual(calls.map((c) => c[0]), ["build", "build", "release"]);
+});
+
+await check("trainLoraAdapterAllBlocks refuses both referenceBytes and targetData", async () => {
+  await assert.rejects(
+    trainLoraAdapterAllBlocks(
+      {},
+      {
+        baseBytes: new Uint8Array([1]),
+        referenceBytes: new Uint8Array([2]),
+        targetData: [Float32Array.of(1)],
+        rowFeeds: [{ X: tensor([1, 1], [1]) }],
+      },
+    ),
+    /at most one of referenceBytes or targetData/,
+  );
+});
+
+await check("trainLoraAdapterAllBlocks' targetData mode reaches trainLoraBlock, no reference model", async () => {
+  // One MatMul, one adapter target -- discoverLoraBlocks proposes exactly
+  // one block, so a single targetData array (one row) legitimately matches
+  // that one block's own reconstruction target.
+  const ONE_BLOCK_MODEL = makeModel({
+    nodes: [makeNode("MatMul", ["X", "W1"], ["Y"])],
+    initializers: ["W1"],
+    inputs: ["X"],
+    outputs: ["Y"],
+  });
+  const adapter = [{ weightName: "w1", nodeOutput: "Y", loraAName: "w1.lora_A", loraBName: "w1.lora_B", rank: 4 }];
+  const built = {
+    planHandle: 51,
+    stepGraph: new Uint8Array([9, 9]),
+    state: [{ input: "w1.lora_A", output: "w1.lora_A_next" }],
+    scalars: ["lora__lr", "m_correction", "v_correction"],
+    loss: "lora__loss",
+    captures: [
+      { input: "lora__X", source: "X", dims: [1, 1], teacher: false },
+      { input: "lora__teacher", source: "Y", dims: [1, 1], teacher: true },
+    ],
+    initialState: [
+      { name: "w1.lora_A", dtype: 1, dims: [1], data: new Uint8Array(new Float32Array([0]).buffer) },
+    ],
+    rowIndexInput: "",
+    rowIndexSize: 0,
+    numRows: 1,
+    parameters: ["w1.lora_A"],
+  };
+  const calls = [];
+  const runtime = {
+    onnxsim_lora_inject: () => ({ model: ONE_BLOCK_MODEL, adapter }),
+    onnxsim_lora_build_step_graph(bytes, adapterArg, blockInput, blockOutput) {
+      calls.push(["build", blockInput, blockOutput]);
+      return built;
+    },
+    onnxsim_lora_write_back(bytes, handle, finalState) {
+      calls.push(["write_back", handle, finalState]);
+      return new Uint8Array([100]);
+    },
+    onnxsim_lora_release_plan(handle) {
+      calls.push(["release", handle]);
+      return true;
+    },
+  };
+  const graph = fakeStepGraph(built.state);
+  const ort = fakeOrt({});
+  ort.InferenceSession.create = async (bytes) => {
+    ort.seen.created.push({ bytes });
+    if (bytes.length === 2 && bytes[0] === 9) return { inputNames: [], outputNames: [], run: graph.runStep };
+    // the injected model -- X is a real graph input, read straight from
+    // rowFeeds, so this is only ever asked for its input names.
+    return { inputNames: ["X"], outputNames: [], async run() { return {}; } };
+  };
+
+  const result = await trainLoraAdapterAllBlocks(runtime, {
+    baseBytes: new Uint8Array([1]),
+    maxTargetsPerBlock: 1,
+    targetData: [Float32Array.of(3)],
+    rowFeeds: [{ X: tensor([1, 1], [2]) }],
+    numSteps: 1,
+    ortLoader: async () => ort,
+  });
+
+  assert.equal(result.results.length, 1);
+  assert.ok(result.results[0].trained);
+  // Exactly two sessions: the injected model and the step graph -- no
+  // reference-model session, since there is no reference bytes anywhere in
+  // this call.
+  assert.equal(ort.seen.created.length, 2);
+  assert.deepEqual([...graph.seen[0].lora__teacher.data], [3]);
+  assert.deepEqual(calls.map((c) => c[0]), ["build", "write_back", "release"]);
 });
 
 console.log(`\nlora_finetune: ${passed} checks passed`);
