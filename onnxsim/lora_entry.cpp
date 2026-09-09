@@ -1219,6 +1219,131 @@ void RefuseUnsupported(const std::vector<onnx::NodeProto>& nodes) {
 }
 
 // ---------------------------------------------------------------------------
+// Block discovery -- faithful ports of qat.py's _liveness_cuts and
+// _primary_graph_input, the two helpers lora.py's discover_lora_blocks
+// calls. See lora_entry.h's DiscoverLoraBlocks for the argument summary and
+// qat.py's own docstrings (read in full before touching either function
+// below) for the actual liveness argument -- it is not re-derived here.
+// ---------------------------------------------------------------------------
+
+// Every index at which `graph` narrows to a single live activation, paired
+// with the tensor that survives it -- index -1 meaning "before the first
+// node". A faithful port of qat.py::_liveness_cuts; see that function's
+// docstring for why this is the whole of boundary discovery. `primary_input`
+// is the one graph input kept in the live set (ordinarily
+// PrimaryGraphInput(graph)'s result, or "" for a graph with none); every
+// other graph input is excluded from liveness entirely, exactly as
+// _liveness_cuts documents.
+std::vector<std::pair<int, std::string>> LivenessCuts(
+    const onnx::GraphProto& graph, const std::string& primary_input) {
+  std::set<std::string> initializers;
+  for (const onnx::TensorProto& t : graph.initializer()) {
+    initializers.insert(t.name());
+  }
+  std::set<std::string> graph_inputs;
+  for (const onnx::ValueInfoProto& input : graph.input()) {
+    if (initializers.count(input.name()) == 0) {
+      graph_inputs.insert(input.name());
+    }
+  }
+  std::set<std::string> ignored;
+  for (const std::string& name : graph_inputs) {
+    if (name != primary_input) ignored.insert(name);
+  }
+
+  // A tensor is live until its last consumer; a graph output is live past
+  // the end of the graph, so it is never dropped before the final gap.
+  const int node_count = graph.node_size();
+  std::map<std::string, int> last_use;
+  for (int index = 0; index < node_count; ++index) {
+    for (const std::string& name : graph.node(index).input()) {
+      if (!name.empty() && initializers.count(name) == 0 &&
+          ignored.count(name) == 0) {
+        last_use[name] = index;
+      }
+    }
+  }
+  for (const onnx::ValueInfoProto& out : graph.output()) {
+    if (!out.name().empty() && initializers.count(out.name()) == 0 &&
+        ignored.count(out.name()) == 0) {
+      last_use[out.name()] = node_count;
+    }
+  }
+  auto last_use_of = [&last_use](const std::string& name) -> int {
+    const auto it = last_use.find(name);
+    return it == last_use.end() ? -1 : it->second;
+  };
+
+  std::vector<std::pair<int, std::string>> cuts;
+  std::set<std::string> live;
+  for (const std::string& name : graph_inputs) {
+    if (ignored.count(name) == 0 && last_use_of(name) > -1) live.insert(name);
+  }
+  if (live.size() == 1) cuts.emplace_back(-1, *live.begin());
+
+  for (int index = 0; index < node_count; ++index) {
+    for (const std::string& name : graph.node(index).output()) {
+      if (!name.empty() && ignored.count(name) == 0 &&
+          last_use_of(name) > index) {
+        live.insert(name);
+      }
+    }
+    std::set<std::string> still_live;
+    for (const std::string& name : live) {
+      if (last_use_of(name) > index) still_live.insert(name);
+    }
+    live = std::move(still_live);
+    if (live.size() == 1) cuts.emplace_back(index, *live.begin());
+  }
+  return cuts;
+}
+
+// The graph input the most nodes depend on -- the main activation path,
+// empty when `graph` has no non-initializer input. A faithful port of
+// qat.py::_primary_graph_input; see that function's docstring for why "reach
+// the most nodes" is the right heuristic and why getting it wrong costs
+// block granularity, not correctness. Ties go to the earlier graph input.
+std::string PrimaryGraphInput(const onnx::GraphProto& graph) {
+  std::set<std::string> initializers;
+  for (const onnx::TensorProto& t : graph.initializer()) {
+    initializers.insert(t.name());
+  }
+  std::vector<std::string> candidates;
+  for (const onnx::ValueInfoProto& input : graph.input()) {
+    if (initializers.count(input.name()) == 0) {
+      candidates.push_back(input.name());
+    }
+  }
+  if (candidates.empty()) return "";
+
+  std::string best_name = candidates[0];
+  int64_t best_reach = -1;
+  for (const std::string& name : candidates) {
+    std::set<std::string> reached{name};
+    int64_t count = 0;
+    for (const onnx::NodeProto& node : graph.node()) {
+      bool depends = false;
+      for (const std::string& in : node.input()) {
+        if (!in.empty() && reached.count(in) != 0) {
+          depends = true;
+          break;
+        }
+      }
+      if (!depends) continue;
+      ++count;
+      for (const std::string& out : node.output()) {
+        if (!out.empty()) reached.insert(out);
+      }
+    }
+    if (count > best_reach) {
+      best_name = name;
+      best_reach = count;
+    }
+  }
+  return best_name;
+}
+
+// ---------------------------------------------------------------------------
 // Shapes -- mirrors qat_entry.cpp's StaticDims/FloatShapeInfo/
 // InferFloatShapes/ElemTypeOr/SetValueInfo/BlockShapes.
 // ---------------------------------------------------------------------------
@@ -1524,6 +1649,115 @@ LoraInjectionResult InjectLora(const onnx::ModelProto& model,
 
   onnx::checker::check_model(result.model);
   return result;
+}
+
+std::vector<LoraBlock> DiscoverLoraBlocks(
+    const onnx::ModelProto& injected_model, const LoraAdapter& adapter,
+    int64_t max_targets_per_block) {
+  if (max_targets_per_block < 1) {
+    throw std::invalid_argument("max_targets_per_block must be at least 1");
+  }
+
+  const onnx::GraphProto& graph = injected_model.graph();
+  const std::vector<std::pair<int, std::string>> cuts =
+      LivenessCuts(graph, PrimaryGraphInput(graph));
+  std::set<std::string> target_outputs;
+  for (const LoraTarget& t : adapter.targets)
+    target_outputs.insert(t.node_output);
+
+  // Walk consecutive cut pairs exactly as lora.py's discover_lora_blocks
+  // does: `start` is the cut a pending block began at (unset only when
+  // `cuts` itself is empty, which skips this loop entirely), `count` how
+  // many of `adapter`'s own target outputs have accumulated into it since.
+  std::vector<std::pair<std::string, std::string>> pairs;
+  bool have_start = !cuts.empty();
+  std::pair<int, std::string> start;
+  if (have_start) start = cuts.front();
+  int64_t count = 0;
+
+  for (size_t i = 0; i + 1 < cuts.size(); ++i) {
+    const std::pair<int, std::string>& previous = cuts[i];
+    const std::pair<int, std::string>& current = cuts[i + 1];
+    bool gap = false;
+    for (int index = previous.first + 1; index <= current.first; ++index) {
+      if (SupportedOps().count(graph.node(index).op_type()) == 0) {
+        gap = true;
+        break;
+      }
+    }
+    if (gap) {
+      // A gap. Close whatever was pending before it and reopen after.
+      if (have_start && count > 0 && start.first < previous.first) {
+        pairs.emplace_back(start.second, previous.second);
+      }
+      start = current;
+      have_start = true;
+      count = 0;
+      continue;
+    }
+    if (!have_start) {
+      start = previous;
+      have_start = true;
+    }
+    for (int index = previous.first + 1; index <= current.first; ++index) {
+      for (const std::string& out : graph.node(index).output()) {
+        if (target_outputs.count(out) != 0) ++count;
+      }
+    }
+    if (count >= max_targets_per_block) {
+      pairs.emplace_back(start.second, current.second);
+      start = current;
+      count = 0;
+    }
+  }
+  if (have_start && count > 0 && !cuts.empty() &&
+      start.first < cuts.back().first) {
+    pairs.emplace_back(start.second, cuts.back().second);
+  }
+
+  std::vector<LoraBlock> blocks;
+  for (const auto& pair : pairs) {
+    BlockSlice slice;
+    try {
+      slice = SliceBlock(graph, pair.first, pair.second);
+    } catch (const std::invalid_argument&) {
+      // Defensive, matching discover_lora_blocks: the span construction
+      // above already guarantees a non-empty, block_output_name-producing
+      // slice.
+      continue;
+    }
+    std::set<std::string> block_outputs;
+    for (const onnx::NodeProto& node : slice.nodes) {
+      for (const std::string& out : node.output()) {
+        if (!out.empty()) block_outputs.insert(out);
+      }
+    }
+    std::vector<std::string> block_targets;
+    for (const LoraTarget& t : adapter.targets) {
+      if (block_outputs.count(t.node_output) != 0) {
+        block_targets.push_back(t.node_output);
+      }
+    }
+    // Structurally unreachable given how `pairs` was built above -- every
+    // pair spans at least one node whose output is a target -- but kept for
+    // symmetry with discover_lora_blocks's own defensive check.
+    if (block_targets.empty()) continue;
+
+    std::set<std::string> op_type_set;
+    for (const onnx::NodeProto& node : slice.nodes) {
+      op_type_set.insert(node.op_type());
+    }
+
+    LoraBlock block;
+    block.input_name = pair.first;
+    block.output_name = pair.second;
+    block.target_outputs = std::move(block_targets);
+    block.external_inputs = slice.externals;  // already sorted
+    block.op_types.assign(op_type_set.begin(), op_type_set.end());
+    block.num_nodes = static_cast<int64_t>(slice.nodes.size());
+    blocks.push_back(std::move(block));
+  }
+  return blocks;
 }
 
 // A finding worth recording here rather than only in a commit message:

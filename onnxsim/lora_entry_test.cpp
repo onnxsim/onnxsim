@@ -587,6 +587,190 @@ void AlphaAddsAScaleInitializerAndAMulNode() {
 }
 
 // ---------------------------------------------------------------------------
+// DiscoverLoraBlocks
+// ---------------------------------------------------------------------------
+
+// A LoraAdapter whose targets carry only `node_output` -- the only field
+// DiscoverLoraBlocks reads. The other LoraTarget fields (weight_name,
+// op_type, lora_a_name/lora_b_name, rank) are irrelevant to it, exactly as
+// lora.py's own discover_lora_blocks only ever touches LoraTarget.node_output.
+LoraAdapter AdapterFor(const std::vector<std::string>& target_outputs) {
+  LoraAdapter adapter;
+  for (const std::string& name : target_outputs) {
+    LoraTarget t;
+    t.node_output = name;
+    adapter.targets.push_back(t);
+  }
+  return adapter;
+}
+
+// X -> MatMul(X, W1) -> H -> MatMul(H, W2) -> Y. A straight-line chain with
+// no gap: MatMul is in graph_grad::SupportedOps() throughout.
+onnx::ModelProto TwoMatMulChainModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("two_matmul_chain");
+  AddBatchedInput(graph, "X", kK);
+  AddOutput(graph, "Y", kN);
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1"}, {"H"});
+  *graph->add_node() = MakeNode("MatMul", {"H", "W2"}, {"Y"});
+  *graph->add_initializer() =
+      FloatTensor("W1", {kK, kK}, std::vector<float>(kK * kK, 0.1f));
+  *graph->add_initializer() =
+      FloatTensor("W2", {kK, kN}, std::vector<float>(kK * kN, 0.1f));
+  Finish(&model);
+  return model;
+}
+
+// X -> MatMul(X, W1) -> H -> Elu(H) -> R -> MatMul(R, W2) -> Y. Elu has no
+// graph_grad rule (see UndifferentiableModel above), so a candidate span
+// crossing it is a hard gap even though both MatMuls on either side are
+// individually differentiable.
+onnx::ModelProto MatMulEluMatMulModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("matmul_elu_matmul");
+  AddBatchedInput(graph, "X", kK);
+  AddOutput(graph, "Y", kN);
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1"}, {"H"});
+  *graph->add_node() = MakeNode("Elu", {"H"}, {"R"});
+  *graph->add_node() = MakeNode("MatMul", {"R", "W2"}, {"Y"});
+  *graph->add_initializer() =
+      FloatTensor("W1", {kK, kK}, std::vector<float>(kK * kK, 0.1f));
+  *graph->add_initializer() =
+      FloatTensor("W2", {kK, kN}, std::vector<float>(kK * kN, 0.1f));
+  Finish(&model);
+  return model;
+}
+
+// X -> MatMul(X, W1) -> A and X -> MatMul(X, W2) -> B, with both A and B
+// graph outputs: a fork that never narrows back to a single live tensor
+// after the very first cut (the model's own input X).
+onnx::ModelProto NonReconvergingBranchModel() {
+  onnx::ModelProto model;
+  onnx::GraphProto* graph = model.mutable_graph();
+  graph->set_name("non_reconverging_branch");
+  AddBatchedInput(graph, "X", kK);
+  AddOutput(graph, "A", kN);
+  AddOutput(graph, "B", kN);
+  *graph->add_node() = MakeNode("MatMul", {"X", "W1"}, {"A"});
+  *graph->add_node() = MakeNode("MatMul", {"X", "W2"}, {"B"});
+  *graph->add_initializer() =
+      FloatTensor("W1", {kK, kN}, std::vector<float>(kK * kN, 0.1f));
+  *graph->add_initializer() =
+      FloatTensor("W2", {kK, kN}, std::vector<float>(kK * kN, 0.1f));
+  Finish(&model);
+  return model;
+}
+
+void TwoAdapterTargetsMergeIntoOneBlockUnderTheDefaultMaxTargetsPerBlock() {
+  const onnx::ModelProto model = TwoMatMulChainModel();
+  const LoraAdapter adapter = AdapterFor({"H", "Y"});
+
+  const std::vector<LoraBlock> blocks = DiscoverLoraBlocks(model, adapter, 2);
+  CheckEqual(static_cast<int64_t>(blocks.size()), 1,
+             "both injected-adapter targets merge into a single block");
+  if (blocks.size() == 1) {
+    CheckEqual(blocks[0].input_name, "X", "the merged block's input");
+    CheckEqual(blocks[0].output_name, "Y", "the merged block's output");
+    CheckEqual(static_cast<int64_t>(blocks[0].target_outputs.size()), 2,
+               "both H and Y fall inside the merged block");
+    Check(blocks[0].target_outputs[0] == "H" &&
+              blocks[0].target_outputs[1] == "Y",
+          "target_outputs is in graph order");
+    CheckEqual(blocks[0].num_nodes, 2,
+               "the merged block contains both MatMuls");
+    CheckEqual(static_cast<int64_t>(blocks[0].op_types.size()), 1,
+               "op_types is deduplicated to the one op type present");
+    CheckEqual(blocks[0].op_types[0], "MatMul", "the block's only op type");
+    Check(!blocks[0].external_inputs.empty() &&
+              blocks[0].external_inputs[0] == "X",
+          "external_inputs includes the block's own input");
+  }
+}
+
+void MaxTargetsPerBlockOneGivesOneBlockPerAdapterTarget() {
+  const onnx::ModelProto model = TwoMatMulChainModel();
+  const LoraAdapter adapter = AdapterFor({"H", "Y"});
+
+  const std::vector<LoraBlock> blocks = DiscoverLoraBlocks(model, adapter, 1);
+  CheckEqual(static_cast<int64_t>(blocks.size()), 2,
+             "max_targets_per_block=1 gives one block per adapter target "
+             "instead of merging them");
+  if (blocks.size() == 2) {
+    CheckEqual(blocks[0].input_name, "X", "the first block's input");
+    CheckEqual(blocks[0].output_name, "H", "the first block's output");
+    CheckEqual(static_cast<int64_t>(blocks[0].target_outputs.size()), 1,
+               "the first block has exactly one target");
+    CheckEqual(blocks[0].target_outputs[0], "H", "the first block's target");
+
+    CheckEqual(blocks[1].input_name, "H", "the second block's input");
+    CheckEqual(blocks[1].output_name, "Y", "the second block's output");
+    CheckEqual(static_cast<int64_t>(blocks[1].target_outputs.size()), 1,
+               "the second block has exactly one target");
+    CheckEqual(blocks[1].target_outputs[0], "Y", "the second block's target");
+  }
+}
+
+void AnUnsupportedOpSplitsWhatWouldOtherwiseBeOneBlockIntoTwo() {
+  const onnx::ModelProto model = MatMulEluMatMulModel();
+  const LoraAdapter adapter = AdapterFor({"H", "Y"});
+
+  // max_targets_per_block=2 merges H and Y into one block on a chain with no
+  // gap (the previous test) -- here Elu (no graph_grad rule) forces a split
+  // regardless of max_targets_per_block, and nothing spans it.
+  const std::vector<LoraBlock> blocks = DiscoverLoraBlocks(model, adapter, 2);
+  CheckEqual(static_cast<int64_t>(blocks.size()), 2,
+             "the unsupported Elu splits the chain into two blocks");
+  if (blocks.size() == 2) {
+    CheckEqual(blocks[0].input_name, "X", "the first block's input");
+    CheckEqual(blocks[0].output_name, "H",
+               "the first block ends right before the gap");
+    CheckEqual(blocks[1].input_name, "R",
+               "the second block starts right after the gap");
+    CheckEqual(blocks[1].output_name, "Y", "the second block's output");
+  }
+  for (const LoraBlock& block : blocks) {
+    for (const std::string& op : block.op_types) {
+      Check(op != "Elu", "no block contains the unsupported Elu");
+    }
+  }
+}
+
+void ASpanWithNoAdapterTargetInsideItIsNeverProposedAsABlock() {
+  const onnx::ModelProto model = TwoMatMulChainModel();
+  const LoraAdapter adapter = AdapterFor({"NotAnyNodesOutput"});
+
+  const std::vector<LoraBlock> blocks = DiscoverLoraBlocks(model, adapter, 2);
+  Check(blocks.empty(),
+        "a graph with none of the adapter's target outputs proposes no "
+        "block at all");
+}
+
+void NonPositiveMaxTargetsPerBlockIsRefused() {
+  const onnx::ModelProto model = TwoMatMulChainModel();
+  const LoraAdapter adapter = AdapterFor({"H", "Y"});
+  CheckThrows<std::invalid_argument>(
+      [&]() { DiscoverLoraBlocks(model, adapter, 0); },
+      "max_targets_per_block must be at least 1",
+      "max_targets_per_block=0 is refused");
+  CheckThrows<std::invalid_argument>(
+      [&]() { DiscoverLoraBlocks(model, adapter, -1); },
+      "max_targets_per_block must be at least 1",
+      "a negative max_targets_per_block is refused");
+}
+
+void ANonReconvergingBranchYieldsNoBlocksWithoutCrashing() {
+  const onnx::ModelProto model = NonReconvergingBranchModel();
+  const LoraAdapter adapter = AdapterFor({"A", "B"});
+
+  const std::vector<LoraBlock> blocks = DiscoverLoraBlocks(model, adapter, 2);
+  Check(blocks.empty(),
+        "a fork that never narrows back to one live tensor yields no "
+        "blocks rather than crashing");
+}
+
+// ---------------------------------------------------------------------------
 // BuildLoraStepGraph
 // ---------------------------------------------------------------------------
 
@@ -973,6 +1157,13 @@ int main() {
   ANon1x1ConvIsNotInjected();
   RestrictTargetNamesLimitsInjectionToTheNamedWeights();
   AlphaAddsAScaleInitializerAndAMulNode();
+
+  TwoAdapterTargetsMergeIntoOneBlockUnderTheDefaultMaxTargetsPerBlock();
+  MaxTargetsPerBlockOneGivesOneBlockPerAdapterTarget();
+  AnUnsupportedOpSplitsWhatWouldOtherwiseBeOneBlockIntoTwo();
+  ASpanWithNoAdapterTargetInsideItIsNeverProposedAsABlock();
+  NonPositiveMaxTargetsPerBlockIsRefused();
+  ANonReconvergingBranchYieldsNoBlocksWithoutCrashing();
 
   AnInjectedMatMulProducesAStepGraphTheCheckerAccepts();
   InitialStateSeedsTheAdapterFromItsCurrentValueAndZeroesTheMoments();
