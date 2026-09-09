@@ -5128,6 +5128,71 @@ stepped candidate offsets one at a time in Python, which on a 192 MB table is
 minutes per bit; vectorising it is the difference between a run that finishes
 and one that looks like a hang.
 
+### The 2-D path reads exactly too: 100% of a real resnet18d
+
+The 1-D layout is read by discovering each block's geometry from the table
+rather than assuming a formula. The same treatment applied to the 2-D path
+reads **every convolution weight of a real resnet18d -- 11,186,016 of them,
+22 of 22 layers, 100.0% exact.**
+
+Three things had to be added, and each was a boundary rather than a
+refinement:
+
+* **The two plain-INT8 packings.** Not every 2-D weight is bit-sliced. A
+  narrow input (under four channels) stores plain bytes with the kernel row
+  fastest, and a 1x1 convolution stores plain bytes chunked 36 input channels
+  at a time with the next chunk 144 bytes on. The `(32,3,3,3)` first
+  convolution and every 1x1 shortcut read **0%** until these were implemented.
+* **The output-channel term is a bit-interleave, not a stride.** Assuming a
+  stride reads the first 32 output channels and then stops, which is exactly
+  the 25% a 128-channel layer returned. Each bit of the channel index carries
+  its own cost, found by searching for channel `2**b`.
+* **Input channels split into blocks of 128.** `A = 18 * min(Cin, 128)` caps a
+  block, so a 256-channel layer read 50% and a 512-channel one 25% -- `128/Cin`
+  to the digit. The next block keeps addressing channels by their **absolute**
+  index; only its base moves. For a `(256,256,3,3)` layer the second block
+  sits 35,968 bytes after the first.
+
+**Confirmed on a purpose-built probe.** The 128-channel split was inferred
+from resnet18d, so a single `(32,256,3,3)` convolution was built and probed
+one weight at a time. Every constant the layout claims comes back:
+
+| probe | bytes | rule |
+| --- | --- | --- |
+| `i = 0` | 32, 68, 1184, 1220 | four planes at 0, 36, `9*128`, `9*128+36` |
+| `i = 0, 1` | same byte | four input channels to a byte |
+| `i = 64` | 608 | `144*(i>>4) + (i%16)//4 + 32` |
+| `kw = 1` | 28 | `4*(K*K-1-flat)`, the kernel reversed |
+| `o = 1` | +2304 | `a = 18*min(Cin,128)` |
+| `o = 8` | +72 | bit 3 of the output channel |
+| `o = 16` | +18432 | `8a`, a bit-interleave |
+| **`i = 128`** | **37152** | `+35968` on the formula's 1184 |
+
+That last row is the boundary, measured directly: input channel 128 sits
+**35,968 bytes** past where the first block's addressing would put it, and
+from there the arithmetic is unchanged -- channel 192 and channel 255 both
+land exactly where `144*(i>>4) + (i%16)//4` predicts *relative to the new
+base*. The second block does not re-index its channels; only its base moves.
+
+And 35,968 is the same number measured on resnet18d's `(256,256,3,3)` layer,
+which has eight times the output channels. So the offset does not depend on
+`Cout`.
+
+**A correction, and it is about my own tooling rather than the format.** An
+earlier pass here reported that walking for the next input block "finds
+nothing that verifies", and concluded the remaining channels must be stored
+differently. That was wrong. The edit adding the walk had silently failed to
+apply -- a string replacement that matched nothing -- so the run being measured
+was the unmodified script, and it produced a plausible number (39.4%, stable
+across two search budgets) that looked like a finding. Once the walk was
+actually applied and *verified to be in the file*, every layer closed.
+
+The lesson is the one this file keeps relearning in different costumes: a
+measurement that agrees with the previous measurement is not thereby
+confirmed. Two runs at different search budgets returning identical totals was
+read as "the boundary is real"; it was equally consistent with "neither run
+contained the change".
+
 ### The LLM path quantises differently, and here it is exactly
 
 The convolution pipeline's quantiser was pinned down earlier: `scale =
