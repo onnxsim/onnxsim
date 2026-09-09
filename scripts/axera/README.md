@@ -5602,6 +5602,34 @@ It switches the addressing. A single-weight probe on the 16-bit build:
 Those are the `llm_build` constants exactly -- the layout recorded earlier as
 "the conv layout halved". Reading every weight with them: **100.000% exact.**
 
+**And that single shape was not enough.** Sweeping the shape says the formula
+above is *incomplete*: `Conv(64,64,3)` read 50% and `Conv(16,16,3)` read 0%.
+The missing piece is the super-block term, which `Cout = 32` never exercises --
+`o % 16` and one bit above it cover exactly 32 output channels, so a
+32-channel layer cannot reveal what bit 5 costs. Discovering the constants per
+shape instead of assuming them:
+
+| shape | `a` (and the formula's answer) | bit 4 | bit 5+ | exact |
+| --- | --- | --- | --- | --- |
+| `Conv(32,32,3)` | 216 (216) | 36 | -- | 32/32 |
+| `Conv(32,32,5)` | 360 (360) | 36 | -- | 32/32 |
+| `Conv(64,32,3)` | 216 (216) | 36 | **3456** | 64/64 |
+| `Conv(64,64,3)` | 432 (432) | 36 | **6912** | 64/64 |
+| `Conv(16,16,3)` | not found | -- | -- | 0/16 |
+
+`a = 72*ceil((Cin/2)*K/18)` holds in every case it was found, and the missing
+term is `top = 16*a` -- note *without* the `+512` that `llm_build` carries and
+the `+256` the 8-bit convolution layout carries. With it, four of five shapes
+read whole.
+
+`Cin = Cout = 16` does not, and that is consistent rather than mysterious: the
+8-bit layout has its own low-channel boundary, recorded above as "where the
+1-D layout stops: 32 channels".
+
+The lesson is the one this file keeps paying for: **one shape proves a formula
+fits, not that it is the formula.** A 32-channel convolution was structurally
+incapable of exposing the term that was missing.
+
 So the two layouts decoded separately in this file are **one layout at two
 scales**: gap 36 with stride 144 for 8-bit activations, gap 18 with stride 72
 for 16-bit, identical slot arithmetic either way.
