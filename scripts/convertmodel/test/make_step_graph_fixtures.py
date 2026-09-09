@@ -43,11 +43,18 @@ produce through onnxruntime's CPU provider in Python. The Node test replays
 exactly that loop and compares, so "onnxruntime-web on this EP agrees with
 onnxruntime on CPU" is a numeric check rather than a claim.
 
+A fifth graph, ``step_qat_hf_demo.onnx`` (``build_qat_hf_demo``, below), is
+generated here too but is not part of the ``step_graphs.json`` manifest or
+``step_graph_ep.test.mjs``'s own EP-coverage measurement -- it is driven with
+*live* data (a real Hugging Face photo) by a different consumer,
+``webgpu_hf_demo.test.mjs``; see that function's own docstring for why it
+needs its own file.
+
 Regenerate (from this directory, with onnxsim importable from the repo root)::
 
     python3 make_step_graph_fixtures.py
 
-Rerun it after changing any of the three builders; the committed ``.onnx``
+Rerun it after changing any of the four builders; the committed ``.onnx``
 files are the point of the fixture, so they must be regenerated and committed
 deliberately rather than rebuilt at test time.
 """
@@ -433,6 +440,157 @@ def build_minibatch(rng: np.random.Generator) -> Dict:
     )
 
 
+def build_qat_hf_demo(rng: np.random.Generator) -> Dict:
+    """A tiny two-layer QAT step graph, structurally identical in spirit to
+    ``build_qat_backward`` but meant to be *driven*, not replayed: unlike
+    every other fixture here, its ``x``/``teacher`` constants are declared
+    (as ``make_step_graph`` always declares constants -- see that function's
+    docstring) but never baked into ``step_qat_hf_demo.json`` with values,
+    because the whole point of ``webgpu_hf_demo.test.mjs`` is to feed them
+    something this script cannot reach: a real photo fetched live from a
+    Hugging Face dataset, inside a real browser, on WebGPU. This script runs
+    in plain Python with no network access and has no opinion about what that
+    photo will be -- it only fixes the *shape* of the problem.
+
+    The forward is deliberately smaller than ``build_qat_backward``'s (two
+    ``MatMul``s, two ``Add``s, one ``Sigmoid`` -- all already covered by other
+    fixtures, so this adds no new operator to verify) and takes a flattened
+    8x8 grayscale image (64 features) down to a single scalar, regressed
+    toward a fixed zero target. "Fit a real photo to zero" is an arbitrary
+    objective, not a meaningful one -- chosen because it needs no labels, only
+    a real ``x``, which is all ``hf_datasets.mjs`` promises. What this proves
+    is that the whole pipeline (a real photo in, a real gradient/Adam step
+    graph, WebGPU execution) runs end to end and the loss actually moves.
+    """
+    in_dim, hidden = 64, 8
+    b = qat_graph.GraphBuilder("hfdemo_")
+    forward = [
+        onnx.helper.make_node("MatMul", ["x", "w1"], ["h0"]),
+        onnx.helper.make_node("Add", ["h0", "b1"], ["h1"]),
+        onnx.helper.make_node("Sigmoid", ["h1"], ["h2"]),
+        onnx.helper.make_node("MatMul", ["h2", "w2"], ["h3"]),
+        onnx.helper.make_node("Add", ["h3", "b2"], ["y"]),
+    ]
+    b.nodes.extend(forward)
+    shapes = {
+        "x": (1, in_dim),
+        "w1": (in_dim, hidden),
+        "b1": (hidden,),
+        "h0": (1, hidden),
+        "h1": (1, hidden),
+        "h2": (1, hidden),
+        "w2": (hidden, 1),
+        "b2": (1,),
+        "h3": (1, 1),
+        "y": (1, 1),
+    }
+
+    diff = b.sub("y", "teacher")
+    dl_dy = b.mul(diff, b.const(2.0))
+    grads = graph_grad.build_backward(
+        b, forward, shapes, {"y": dl_dy}, ["w1", "b1", "w2", "b2"]
+    )
+
+    state_vars = {}
+    for name, grad_name, shape in [
+        ("w1", grads["w1"], (in_dim, hidden)),
+        ("b1", grads["b1"], (hidden,)),
+        ("w2", grads["w2"], (hidden, 1)),
+        ("b2", grads["b2"], (1,)),
+    ]:
+        next_v, next_m, next_v2 = qat_graph.adam_update(
+            b, name, grad_name, f"m_{name}", f"v_{name}", "lr",
+            "m_correction", "v_correction",
+        )
+        state_vars[name] = (shape, next_v, f"m_{name}", next_m, f"v_{name}", next_v2)
+
+    state = {}
+    for name, (shape, next_v, m_name, next_m, v_name, next_v2) in state_vars.items():
+        state[name] = (list(shape), next_v)
+        state[m_name] = (list(shape), next_m)
+        state[v_name] = (list(shape), next_v2)
+
+    step = qat_graph.make_step_graph(
+        b,
+        constants={
+            "x": ([1, in_dim], onnx.TensorProto.FLOAT),
+            "teacher": ([1, 1], onnx.TensorProto.FLOAT),
+        },
+        state=state,
+        scalars=["lr", "m_correction", "v_correction"],
+        loss=b.mean_square(diff),
+        name="onnxsim_qat_hf_demo_step",
+    )
+    onnx.checker.check_model(step.model, full_check=True)
+    onnx.save(step.model, HERE / "step_qat_hf_demo.onnx")
+
+    # A quick offline sanity check with synthetic data (this script has no
+    # network access): the graph should still be a working optimizer step,
+    # decreasing loss on *some* input, before the browser ever sees it with a
+    # real one. Not shipped as a "match this" reference -- see the docstring.
+    init_state = {
+        "w1": _f32(rng.normal(scale=0.3, size=(in_dim, hidden))),
+        "b1": np.zeros(hidden, np.float32),
+        "w2": _f32(rng.normal(scale=0.3, size=(hidden, 1))),
+        "b2": np.zeros(1, np.float32),
+    }
+    for name in list(init_state):
+        init_state[f"m_{name}"] = np.zeros_like(init_state[name])
+        init_state[f"v_{name}"] = np.zeros_like(init_state[name])
+    sanity_x = _f32(rng.normal(size=(1, in_dim)))
+    sanity_teacher = np.zeros((1, 1), np.float32)
+    # lr is deliberately small: at t=0 Adam's bias correction makes its
+    # first update roughly lr * sign(gradient) regardless of magnitude (see
+    # this function's own commit message/PR description for the derivation),
+    # which for a batch of one real photo can otherwise overshoot hard enough
+    # to make the loss curve look broken rather than noisy-but-improving.
+    NUM_DEMO_STEPS = 40
+    sanity_scalars = []
+    for t in range(NUM_DEMO_STEPS):
+        values = {"lr": 0.01}
+        values.update(qat_graph.adam_bias_corrections(t))
+        sanity_scalars.append(values)
+    sanity_losses = _reference_losses(
+        step,
+        {"x": sanity_x, "teacher": sanity_teacher},
+        init_state,
+        sanity_scalars,
+        [],
+    )
+    if not (sanity_losses[-1] < 0.5 * sanity_losses[0]):
+        raise SystemExit(
+            "step_qat_hf_demo.onnx sanity check: loss did not meaningfully "
+            f"decrease over {NUM_DEMO_STEPS} synthetic steps "
+            f"({sanity_losses[0]:.6g} -> {sanity_losses[-1]:.6g}); the graph "
+            "is broken before it ever reaches a browser"
+        )
+
+    manifest = {
+        "file": "step_qat_hf_demo.onnx",
+        "opset": qat_graph._OPSET,
+        "irVersion": qat_graph._IR_VERSION,
+        "loss": step.loss_name,
+        "inputDim": in_dim,
+        # Declared shape/dtype only -- no baked values. webgpu_hf_demo.test.mjs
+        # supplies "x" (a real photo, flattened+resized to [1, inputDim]) and
+        # "teacher" (fixed zero) itself.
+        "constants": {
+            "x": {"dims": [1, in_dim], "dtype": "float32"},
+            "teacher": {"dims": [1, 1], "dtype": "float32"},
+        },
+        "state": {
+            name: {"dims": list(shape), "output": out, "data": [float(v) for v in init_state[name].ravel()]}
+            for name, (shape, out) in state.items()
+        },
+        "scalars": [dict(s) for s in sanity_scalars],
+    }
+    (HERE / "step_qat_hf_demo.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print(
+        f"wrote step_qat_hf_demo.onnx + step_qat_hf_demo.json; offline sanity "
+        f"loss {sanity_losses[0]:.6g} -> {sanity_losses[-1]:.6g}"
+    )
+
+
 def _package(
     name: str,
     filename: str,
@@ -514,6 +672,12 @@ def main() -> None:
             f"{graph['referenceLosses'][-1]:.6g}"
         )
     print(f"wrote step_graphs.json; {len(covered)} of EP_FRIENDLY_OPS covered")
+
+    # Separate from the four above: this one is driven with live data by
+    # webgpu_hf_demo.test.mjs, not replayed against a baked reference
+    # trajectory, so it gets its own file rather than joining step_graphs.json
+    # (see build_qat_hf_demo's own docstring).
+    build_qat_hf_demo(np.random.default_rng(SEED))
 
 
 if __name__ == "__main__":

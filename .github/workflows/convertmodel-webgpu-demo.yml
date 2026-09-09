@@ -1,0 +1,68 @@
+name: convertmodel WebGPU + Hugging Face training demo
+
+# A small, real, end-to-end training pipeline check: fetch one real photo
+# from a Hugging Face dataset, train onnxsim/qat_graph's step-graph machinery
+# on it for a few dozen steps, and require every step to actually run on
+# WebGPU -- see test/webgpu_hf_demo.test.mjs's own top comment for the full
+# design (why it needs a real browser rather than plain Node, what the
+# training objective is and is not, and what step_qat_hf_demo.onnx does and
+# does not have baked into it).
+#
+# Runs on a stock macOS GitHub-hosted runner: WebGPU needs a real GPU-backed
+# browser, which is exactly what convertmodel-inference.yml's ubuntu job
+# cannot give it (see step_graph_ep.test.mjs's own comment on why webgpu is
+# only ever "attempted and reported" there, never required). Separate from
+# that workflow, and not part of `npm run test:all`, for the same reason
+# apple-integration.yml runs on its own schedule rather than gating every PR:
+# a live external network call (the Hugging Face dataset-server API) and a
+# macOS runner are both real dependencies this repo's fast/offline test suite
+# should not inherit.
+#
+# Scheduled + on demand, plus on PRs that touch the files this check actually
+# depends on, so it stays valid without gating unrelated convertmodel work.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Mondays 08:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/convertmodel-webgpu-demo.yml"
+      - "scripts/convertmodel/test/webgpu_hf_demo.test.mjs"
+      - "scripts/convertmodel/test/make_step_graph_fixtures.py"
+      - "scripts/convertmodel/test/step_qat_hf_demo.onnx"
+      - "scripts/convertmodel/test/step_qat_hf_demo.json"
+      - "scripts/convertmodel/hf_datasets.mjs"
+      - "scripts/convertmodel/sample_inputs.mjs"
+      - "scripts/convertmodel/package.json"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  webgpu-hf-demo:
+    name: WebGPU + Hugging Face training demo
+    runs-on: macos-15
+    # Generous headroom over the pipeline's own few-minutes budget for
+    # Chromium's one-time download/install; the training run itself is the
+    # part meant to be fast (see the test's own printed step count/elapsed
+    # ms -- a few seconds for 40 steps against this repo's own dev sandbox).
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU + Hugging Face training demo
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-hf-demo
