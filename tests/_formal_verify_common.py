@@ -52,6 +52,41 @@ def simplify_isolated(model, *pass_names, check_n=3):
     return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
 
 
+def simplify_isolated_extra(model, *pass_names, check_n=3):
+    """Like ``simplify_isolated``, but for opt-in ("other") passes -- ones not
+    part of the default set, which must be named via ``extra_optimizers`` to
+    run at all (see ``onnxsim --list-other-optimizers``). Every default pass
+    is skipped, so only the named opt-in pass(es) run.
+    """
+    names = set(pass_names)
+    all_other = set(C._list_other_optimizers())
+    unknown = names - all_other
+    assert not unknown, f"not an opt-in onnxsim optimizer pass: {sorted(unknown)}"
+    sim_model, check_ok = onnxsim.simplify(
+        model,
+        check_n=check_n,
+        extra_optimizers=sorted(names),
+        skipped_optimizers=sorted(C._list_optimizers()),
+    )
+    assert check_ok, "simplified model failed onnxsim's own equivalence check"
+    return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
+
+
+def producer(model, output_name):
+    """The node that produces ``output_name`` in ``model``'s graph.
+
+    Isolating one opt-in pass via ``simplify_isolated_extra`` runs it without
+    its usual companion dead-code pass (``eliminate_deadend`` is a default
+    pass, skipped here like every other one) -- so a rewrite that leaves its
+    old input dangling (rather than deleting it outright) can leave a second,
+    dead copy of the rewrite's own output type sitting unused elsewhere in
+    the graph. A raw ``Counter`` of op types then overcounts; walking
+    backward from a real graph output instead finds the live computation
+    regardless of what dead code is also lying around.
+    """
+    return next(n for n in model.graph.node if output_name in n.output)
+
+
 def prove(claim, msg="rewrite is not a sound equivalence"):
     """Prove ``claim`` valid.
 
