@@ -4509,6 +4509,96 @@ def _llm_weight_offset(row, col, cin):
     ), (4 if col % 2 else 0)
 
 
+def _quantize_llm_weights(weights):
+    """`llm_build`'s weight quantiser, reproduced exactly -- and it is not the
+    convolution pipeline's (see `_quantize_conv_weights`).
+
+    Three things differ, and all three matter. The scale divides by 128, not
+    127.5. It is taken from the *signed* weight at the peak index rather than
+    its magnitude, and then negated -- so the row's extreme weight always
+    lands on code 0 and zero lands on 128, whichever sign that extreme has.
+    And ties round toward `+inf`, not to even and not away from zero.
+
+    The arithmetic happens in whatever precision the checkpoint holds: a
+    bfloat16 safetensors file is quantised from bfloat16 values, an F32 one
+    from float32. Cast before calling if the checkpoint is not float32.
+    """
+    w = np.asarray(weights, dtype=np.float32)
+    peak = w[np.arange(len(w)), np.abs(w).argmax(1)].astype(np.float32)
+    scale = (-peak / np.float32(128)).astype(np.float32)
+    return np.clip(np.floor(w / scale[:, None] + np.float32(0.5)) + 128, 0, 255).astype(
+        int
+    )
+
+
+def _read_llm_codes(wbt, base, rows, cin):
+    """The INT8 codes an `llm_build` weight block holds, as `(rows, cin)`."""
+    out = np.zeros((rows, cin), dtype=int)
+    for r in range(rows):
+        for c in range(cin):
+            off, shift = _llm_weight_offset(r, c, cin)
+            low = (wbt[base + off] >> shift) & 0xF
+            high = (wbt[base + off + 18] >> shift) & 0xF
+            out[r, c] = (high << 4) | low
+    return out
+
+
+def test_llm_weight_quantiser_is_reproduced_exactly(tmp_path):
+    """Confirmed real (see the README's "The LLM path quantises differently"
+    section): `_quantize_llm_weights()` reproduces **every** code `llm_build`
+    writes, for every matmul in a layer -- and it is a different quantiser
+    from the convolution pipeline's, not a variant of it.
+
+    This is what the addressing test above deliberately did not test. With
+    both solved, an `llm_build` weight table can be written from the
+    checkpoint alone. Needs Docker, no device.
+    """
+    hidden = 256
+    rng = np.random.RandomState(11)
+    weights = (rng.randn(hidden, hidden) * 0.02).astype(np.float32)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _tiny_llama_checkpoint(str(work / "tiny"), weights, hidden=hidden)
+    result = pulsar2_docker.llm_build(
+        str(work),
+        "tiny",
+        "out",
+        weight_type="s8",
+        prefill_len=64,
+        kv_cache_len=127,
+        parallel=8,
+    )
+    assert result.success, getattr(result, "error", None)
+    files = sorted(glob.glob(str(work / "out" / "*.axmodel")))
+    assert files
+    wbt = np.frombuffer(
+        next(
+            i for i in onnx.load(files[0]).graph.initializer if i.name == "npu_params"
+        ).raw_data,
+        dtype=np.uint8,
+    )
+
+    codes = _quantize_llm_weights(weights)
+    offsets = np.array([_llm_weight_offset(0, c, hidden)[0] for c in range(hidden)])
+    shifts = np.array([4 if c % 2 else 0 for c in range(hidden)])
+    want = codes[0].astype(np.uint8)
+
+    # Every code of row 0 exact is already 256**-256 against chance, so the
+    # block is found rather than guessed at.
+    base = None
+    for start in range(0, len(wbt) - int(offsets.max()) - 22, 2):
+        low = (wbt[start + offsets] >> shifts) & 0xF
+        high = (wbt[start + offsets + 18] >> shifts) & 0xF
+        if (((high.astype(int) << 4) | low) == want).all():
+            base = start
+            break
+    assert base is not None, "q_proj's first row is nowhere in the table"
+
+    got = _read_llm_codes(wbt, base, 32, hidden)
+    assert (got == codes[:32]).all(), (got != codes[:32]).sum()
+
+
 def test_llm_matmul_weight_addressing_is_the_conv_layout_halved(tmp_path):
     """Confirmed real (see the README's "The LLM path's weight encoding"
     section): `_llm_weight_offset()` locates every weight of an `llm_build`

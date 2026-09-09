@@ -4884,6 +4884,44 @@ super-block covers 32 output channels, and the probe also moved four bytes at
 more per-channel float32 table, which the bias is the obvious candidate for
 and which no probe has yet moved.
 
+### The LLM path quantises differently, and here it is exactly
+
+The convolution pipeline's quantiser was pinned down earlier: `scale =
+float32(peak)/float32(127.5)`, round half to even, offset 128. The `llm_build`
+path had resisted, sitting at 94.7% with "an unexplained per-row negation".
+The negation was the clue, and all three of its differences are real:
+
+```python
+scale = -w[argmax|w|] / 128      # the SIGNED weight at the peak, negated
+code  = clip(floor(w/scale + 0.5) + 128, 0, 255)     # ties round toward +inf
+```
+
+* **`/128`, not `/127.5`.** At 127.5 the fit is 90.4%; at 128, 95.2%.
+* **The signed peak, negated.** The scale is not `|peak|/128` -- it is the
+  weight *at* the peak index, sign included, with a minus in front. Stated
+  without the arithmetic: the row's most extreme weight always maps to code 0
+  and zero maps to 128, whichever sign that extreme has. It is the usual code
+  mirrored. Using `|peak|` instead scores 54% -- about half the rows, which is
+  exactly how many happen to have a positive extreme.
+* **Ties round toward `+inf`.** Every last miss sat at exactly `x.5`, and
+  every one of them rounded up: `-88.5` became `-88`, not `-89`.
+
+And the precision is **the checkpoint's own**, not the compiler's. The same
+weights written as a BF16 safetensors file are quantised from bfloat16 values;
+written as F32, from float32. This was worth an experiment rather than an
+assumption -- a bfloat16 fit of an F32 checkpoint scores nothing at all.
+
+| checkpoint | matmuls | exact |
+| --- | --- | --- |
+| BF16 | q, k, v, o, gate, up, down | **100.000%**, 32 of 32 rows each |
+| F32 | q_proj | **100.000%**, 32 of 32 rows |
+
+With the addressing already solved, that closes the `llm_build` weight table:
+its contents are now computable from the checkpoint alone, the same as the
+convolution table. Two quantisers in one toolchain, sharing no constant --
+which is worth remembering before assuming any other part of the two paths
+matches.
+
 ### Checking an mcode without Docker and without a card
 
 Everything above needed a Pulsar2 image to compile with or an AX650N to
