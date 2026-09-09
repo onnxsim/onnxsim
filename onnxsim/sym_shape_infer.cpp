@@ -251,10 +251,16 @@ class ShapeInferer {
     SymShape a_batch(la.begin(), la.end() - 2);
     SymShape b_batch(lb.begin(), lb.end() - 2);
     SymShape out = BroadcastShapes({&a_batch, &b_batch});
+    // M's position is fixed once the batch dims are laid down; erase it there
+    // (rather than at out.end() - 2) so a_vec's erase is still correct after
+    // b_vec's pop_back has already shortened `out` -- e.g. both inputs rank-1
+    // (a plain dot product), where out.end() - 2 would underflow before
+    // begin() once N has already been popped.
+    const std::size_t m_pos = out.size();
     out.push_back(la[la.size() - 2]);  // M
     out.push_back(lb[lb.size() - 1]);  // N
     if (b_vec) out.pop_back();
-    if (a_vec) out.erase(out.end() - 2);
+    if (a_vec) out.erase(out.begin() + static_cast<std::ptrdiff_t>(m_pos));
     return out;
   }
 
