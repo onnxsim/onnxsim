@@ -8,6 +8,7 @@
   "Exp",
   "Gather",
   "Greater",
+  "Identity",
   "Less",
   "MatMul",
   "Mul",
@@ -842,6 +843,7 @@
    "ops": {
     "Add": 7,
     "Div": 5,
+    "Identity": 2,
     "MatMul": 3,
     "Mul": 22,
     "Neg": 1,
@@ -853,7 +855,7 @@
     "Sub": 4,
     "Transpose": 4
    },
-   "loss": "qat_reducemean_65",
+   "loss": "qat_reducemean_67",
    "constants": {
     "x": {
      "dims": [
@@ -944,7 +946,7 @@
       -0.7231848239898682,
       0.7886651158332825
      ],
-     "output": "qat_sub_44"
+     "output": "qat_sub_46"
     },
     "mw": {
      "dims": [
@@ -983,7 +985,7 @@
       0.0,
       0.0
      ],
-     "output": "qat_add_32"
+     "output": "qat_add_34"
     },
     "vw": {
      "dims": [
@@ -1022,7 +1024,7 @@
       0.0,
       0.0
      ],
-     "output": "qat_add_36"
+     "output": "qat_add_38"
     },
     "bias": {
      "dims": [
@@ -1035,7 +1037,7 @@
       -0.11387668550014496,
       0.1556958556175232
      ],
-     "output": "qat_sub_63"
+     "output": "qat_sub_65"
     },
     "mb": {
      "dims": [
@@ -1048,7 +1050,7 @@
       0.0,
       0.0
      ],
-     "output": "qat_add_51"
+     "output": "qat_add_53"
     },
     "vb": {
      "dims": [
@@ -1061,7 +1063,7 @@
       0.0,
       0.0
      ],
-     "output": "qat_add_55"
+     "output": "qat_add_57"
     }
    },
    "scalars": [
