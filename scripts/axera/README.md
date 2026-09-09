@@ -5082,6 +5082,52 @@ checkpoint alone. The row addressing was never the problem at 4096; the guess
 that 0.73 meant "the layout breaks at this width" was wrong, and the only
 thing that was actually unknown was where one block stops.
 
+### A whole 4096-hidden layer, and the bit-interleave that was hiding in plain sight
+
+`q_proj` read exactly at 4096 hidden. Extending that to the other six matmuls
+of the layer turned up one more wrong assumption, and it is the same shape as
+all the others: a term that looked like a stride is not one.
+
+**The row index is a bit-interleave.** The addressing had been written as
+`a*(r%16) + odd*((r//16)&1) + top*(r//32)`, which is exact at 256 hidden. At
+4096 it reads the first four super-blocks of a matrix and then silently
+stops -- a 1024-row matmul came back at **12.5%**, which is 128 of 1024 rows,
+and a 128-channel convolution at **25%**, which is 32 of 128. Those fractions
+are the tell: they are `2^k / rows`, not a fraction of anything meaningful.
+
+So each *bit* of the row index carries its own cost, discovered by searching
+for the row `2**b` and taking the offset. Twelve searches per block instead of
+three constants, and no formula assumed. The layout's own docstring had said
+as much about the output-channel term -- "bits 4 and up cost `8A`, a
+bit-interleave, not a stride" -- and the addressing code had been
+extrapolating a stride from it anyway.
+
+| matmul | shape | blocks | exact |
+| --- | --- | --- | --- |
+| `q_proj` | 4096 x 4096 | 8 | **100.00%** |
+| `k_proj` | 1024 x 4096 | 8 | 50.00% |
+| `v_proj` | 1024 x 4096 | 8 | **100.00%** |
+| `o_proj` | 4096 x 4096 | 8 | **100.00%** |
+| `gate_proj` | 11008 x 4096 | 8 | **100.00%** |
+| `up_proj` | 11008 x 4096 | 8 | **100.00%** |
+| `down_proj` | 4096 x 11008 | 21 | **100.00%** |
+
+**175,112,192 of 177,209,344 codes -- 98.82% of a whole transformer layer's
+weights**, predicted from the checkpoint alone and matched code for code.
+
+`k_proj` is the one gap, and it is a limitation of the search rather than of
+the format: `v_proj` has exactly the same shape and reads whole, so nothing
+about 1024 rows is special. The search only looked *forward* from the block
+base, and a bit whose data sits at a lower address is invisible to it.
+
+**Two mistakes worth recording, because both produced plausible numbers.**
+The bit-cost search first bailed out of a whole block when any one bit could
+not be found, which turned that 100% `q_proj` into **0%** -- a failure that
+reports as "the layout does not work here" rather than as a bug. And it
+stepped candidate offsets one at a time in Python, which on a 192 MB table is
+minutes per bit; vectorising it is the difference between a run that finishes
+and one that looks like a hang.
+
 ### The LLM path quantises differently, and here it is exactly
 
 The convolution pipeline's quantiser was pinned down earlier: `scale =
