@@ -12,8 +12,13 @@ schemas (``onnx.defs``) instead of waiting to trip over the next one.
 For each op this script knows how to construct, it builds one minimal model
 per allowed input dtype (the "dtype sweep"), and -- for a handful of ops with
 enumerated string attributes (``Resize``'s ``mode``, ``Pad``'s ``mode``, ...)
--- one model per attribute value at a fixed dtype (the "attribute sweep").
-Each model is run on both backends and classified:
+-- one model per attribute value at a fixed dtype (the "attribute sweep"). By
+default the dtype sweep targets each op's *latest* schema version only; pass
+``--all-versions`` to additionally repeat it at every older opset version the
+op has had (``ReduceSum``'s opset-13 signature vs. its opset-1 one, etc.) --
+the reference evaluator keeps a separate implementation per version, and an
+older one is just as likely to have a gap as the newest. Each model is run on
+both backends and classified:
 
     both_ok        -- both ran and agreed (the common, uninteresting case)
     ref_gap        -- onnxruntime ran, the reference evaluator raised
@@ -49,6 +54,7 @@ before pointing this at a wide, unfamiliar dtype/attribute matrix.
 Usage:
     python scripts/onnx_op_fuzzer.py                    # sweep every known op
     python scripts/onnx_op_fuzzer.py --ops Resize Pad    # just these ops
+    python scripts/onnx_op_fuzzer.py --all-versions      # + every opset version
     python scripts/onnx_op_fuzzer.py --list              # coverage, no run
     python scripts/onnx_op_fuzzer.py --output report.csv
 """
@@ -117,6 +123,21 @@ def _pick_ir_and_opset() -> Tuple[int, int]:
 
 _IR_VERSION, _OPSET = _pick_ir_and_opset()
 
+# Which op version to introspect schemas at. None means "latest" (the normal
+# dtype/attribute sweep, at the host's max loadable opset). The per-opset
+# version sweep (see _all_versions/iter_cases) sets this for the duration of
+# one op version's cases, so the *same* family/helper code that already reads
+# a schema dynamically (e.g. _family_reduce checking whether `axes` is an
+# input or attribute) automatically does the right thing at that version too,
+# instead of always seeing the latest signature.
+_ACTIVE_VERSION: Optional[int] = None
+
+
+def _schema_at(op: str) -> Any:
+    if _ACTIVE_VERSION is None:
+        return defs.get_schema(op)
+    return defs.get_schema(op, _ACTIVE_VERSION, "")
+
 
 # ---------------------------------------------------------------------------
 # dtype <-> numpy plumbing
@@ -178,6 +199,10 @@ class CaseGraph:
     outputs: List[ValueInfoProto]
     initializers: List[Any]
     feeds: Dict[str, np.ndarray]
+    # The op's since_version this case targets -- defaults to the host's max
+    # loadable opset (see _pick_ir_and_opset); the per-opset-version sweep
+    # (see _all_versions/iter_cases) overrides this per case.
+    opset: int = 0  # 0 is a sentinel replaced with _OPSET in _build_model.
 
 
 def _vi(name: str, elem_type: int, shape: Sequence[int]) -> ValueInfoProto:
@@ -198,7 +223,7 @@ def _build_model(case: CaseGraph, op_type: str) -> onnx.ModelProto:
     )
     return helper.make_model(
         graph,
-        opset_imports=[helper.make_opsetid("", _OPSET)],
+        opset_imports=[helper.make_opsetid("", case.opset or _OPSET)],
         ir_version=_IR_VERSION,
     )
 
@@ -291,7 +316,7 @@ def _family_reduce(op, dtype, attrs, rng):
     x = _random_array(dtype, shape, rng)
     if x is None:
         return None
-    schema = defs.get_schema(op)
+    schema = _schema_at(op)
     has_axes_input = any(i.name == "axes" for i in schema.inputs)
     node_attrs = {"keepdims": 1, **attrs}
     if has_axes_input:
@@ -917,7 +942,7 @@ _SWEEP_TYPE_OVERRIDE: Dict[str, str] = {"QuantizeLinear": "T3"}
 
 
 def _swept_dtypes(op: str) -> List[int]:
-    schema = defs.get_schema(op)
+    schema = _schema_at(op)
     type_str = _SWEEP_TYPE_OVERRIDE.get(op, schema.inputs[0].type_str)
     for tc in schema.type_constraints:
         if tc.type_param_str == type_str:
@@ -1027,16 +1052,60 @@ def _run_case(op: str, label: str, case: CaseGraph) -> Result:
 # ---------------------------------------------------------------------------
 
 
-def iter_cases(op: str, seed: int) -> List[Tuple[str, CaseGraph]]:
-    """All (label, CaseGraph) pairs for `op`: the dtype sweep, plus the
-    attribute sweep if one is registered."""
+def _all_versions(op: str) -> List[int]:
+    """Every since_version this op has had in the default domain, oldest
+    first, capped at the opset onnxruntime on this host can actually load
+    (a newer since_version than that would just fail to load for every op,
+    the same environment mismatch _pick_ir_and_opset already guards against)."""
+    versions = sorted(
+        {
+            s.since_version
+            for s in defs.get_all_schemas_with_history()
+            if s.name == op and s.domain == ""
+        }
+    )
+    return [v for v in versions if v <= _OPSET]
+
+
+def iter_cases(
+    op: str, seed: int, all_versions: bool = False
+) -> List[Tuple[str, CaseGraph]]:
+    """All (label, CaseGraph) pairs for `op`.
+
+    By default this is just the dtype sweep at the op's latest version, plus
+    the attribute sweep if one is registered in `_ATTR_SWEEPS`. With
+    `all_versions=True`, the dtype sweep additionally repeats at every older
+    since_version the op has had -- each op version's own type constraints
+    (a version's kernel table can differ from the latest, which is exactly
+    what changed) decide which dtypes are swept for it, via `_schema_at`. A
+    shape/attribute recipe written against the latest signature can still be
+    invalid for an old version whose inputs/attributes were different (e.g.
+    `Pad` took `pads` as an attribute before opset 11); that shows up as the
+    ordinary `invalid_model` status rather than a crash, so it costs nothing
+    beyond a slightly noisier `invalid_model` bucket. The attribute sweep
+    itself stays at latest only -- it is a small hand-curated table, not
+    something meaningful to repeat across op versions.
+    """
+    global _ACTIVE_VERSION
     family = _OP_TO_FAMILY[op]
     rng = np.random.RandomState(seed)
     out: List[Tuple[str, CaseGraph]] = []
-    for dtype in _swept_dtypes(op):
-        case = family(op, dtype, {}, rng)
-        if case is not None:
-            out.append((f"dtype={_elem_name(dtype)}", case))
+
+    versions: List[Optional[int]] = _all_versions(op) if all_versions else [None]
+    for version in versions:
+        _ACTIVE_VERSION = version
+        try:
+            for dtype in _swept_dtypes(op):
+                case = family(op, dtype, {}, rng)
+                if case is not None:
+                    case.opset = version or _OPSET
+                    label = f"dtype={_elem_name(dtype)}"
+                    if version is not None:
+                        label = f"opset={version} {label}"
+                    out.append((label, case))
+        finally:
+            _ACTIVE_VERSION = None
+
     attr_sweep = _ATTR_SWEEPS.get(op)
     if attr_sweep:
         default_dtype = _default_dtype(op)
@@ -1088,6 +1157,12 @@ def main() -> int:
         ),
         help="which status to print case detail for (default: ref_gap, the interesting one)",
     )
+    ap.add_argument(
+        "--all-versions",
+        action="store_true",
+        help="also sweep every historical opset version of each op's schema, "
+        "not just the latest (see the module docstring)",
+    )
     args = ap.parse_args()
 
     total_ops = all_default_domain_ops()
@@ -1119,7 +1194,7 @@ def main() -> int:
 
     rows: List[Result] = []
     for op in ops:
-        for label, case in iter_cases(op, args.seed):
+        for label, case in iter_cases(op, args.seed, all_versions=args.all_versions):
             rows.append(_run_case(op, label, case))
 
     counts: Dict[str, int] = {}
