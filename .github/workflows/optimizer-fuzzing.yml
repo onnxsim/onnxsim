@@ -40,7 +40,7 @@ on:
     inputs:
       nnsmith_count:
         description: "models to generate for the nnsmith-simplify job"
-        default: "200"
+        default: "60"
   pull_request:
     paths:
       - ".github/workflows/optimizer-fuzzing.yml"
@@ -158,9 +158,17 @@ jobs:
           python3 -c "import onnxsim, torch, nnsmith; print('onnxsim', onnxsim.__version__); print('torch', torch.__version__); print('nnsmith', nnsmith.__version__)"
       - name: Run the NNSmith vs simplify() differential fuzzer
         working-directory: ${{ runner.temp }}
+        # Default count kept modest (measured ~5.5s/model on this workflow's
+        # first real run, so 60 models is ~6 minutes of actual fuzzing on top
+        # of ~1.5 minutes of setup) -- that first run tried 200 and had its
+        # runner killed by an external shutdown signal around the 10-minute
+        # mark (before its own 90-minute job timeout, so some infra-level
+        # constraint on this environment, not this job's own setting). Use
+        # workflow_dispatch's nnsmith_count input for a deliberately larger
+        # one-off sweep.
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/nnsmith_simplify_fuzz.py" \
-            --count "${{ github.event.inputs.nnsmith_count || '200' }}" \
+            --count "${{ github.event.inputs.nnsmith_count || '60' }}" \
             --output-dir nnsmith-failures
       - uses: actions/upload-artifact@v7
         if: always()
