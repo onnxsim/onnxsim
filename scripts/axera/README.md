@@ -4717,13 +4717,24 @@ bytes in, which is `72*1 + 14` under chunking at 18, and index 128 lands at
 226, which is `72*3 + 10`. Row bits cost 576, 1152, 2304, 4608 for bits 0-3,
 36 for bit 4, then 9728, 19456, 38912.
 
-**But the combined map does not reconstruct**: it reproduces about 45% of a
-weight matrix's codes, uniformly across rows and columns rather than failing
-in one region. Each dimension's costs are right individually and something
-about how they compose is not, which -- given what the convolution path
-turned out to do -- is most likely a further block split that the probes so
-far cannot see. So: encoding confirmed, index costs measured, addressing not
-yet closed. The
+**The addressing is solved.** Scored by correlation per output row -- which
+tests the index without depending on the quantiser -- the map reads **every
+row of a 256x256 matmul at 1.0000**, all 256 of them. The index is linear in
+the bits, confirmed directly: row 17 costs 612, which is row 1's 576 plus row
+16's 36.
+
+An earlier reading of this section reported 45% and called the addressing
+unclosed. That number was an *exactness* score, and what it was measuring was
+the quantiser, not the index -- a scale-invariant metric would have separated
+the two immediately.
+
+**The quantiser is the part still open.** Its magnitude is `peak/128`, not
+the convolution pipeline's `peak/127.5`. About half the rows are additionally
+stored **negated**, in a pattern that nearly but not exactly follows the sign
+of each row's largest-magnitude element (using that sign directly reproduces
+93.3% of codes; using the measured per-row signs reproduces 94.7%). So the
+residue is a sign convention plus rounding, on top of an index that is fully
+understood. The
 convolution work needed single-weight probes for that, and `llm_build` takes
 a checkpoint rather than a graph, so the same trick needs a synthetic
 checkpoint per probe -- slower, but no different in kind.

@@ -4781,6 +4781,167 @@ def _plane_pairing_lift(wbt, gap, limit=4_000_000):
     return float((seg[zeros + gap] == 0x88).mean()) / base
 
 
+def _write_safetensors(path, tensors):
+    """Minimal safetensors writer: an 8-byte header length, a JSON header,
+    then the raw float32 blocks."""
+    header, offset, blobs = {}, 0, []
+    for name, array in tensors:
+        data = np.ascontiguousarray(array, dtype=np.float32).tobytes()
+        header[name] = {
+            "dtype": "F32",
+            "shape": list(np.shape(array)),
+            "data_offsets": [offset, offset + len(data)],
+        }
+        offset += len(data)
+        blobs.append(data)
+    blob = json.dumps(header).encode()
+    blob += b" " * ((-len(blob)) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)))
+        f.write(blob)
+        for data in blobs:
+            f.write(data)
+
+
+def _tiny_llama_checkpoint(
+    path, weights, hidden=256, inter=512, heads=8, kv=2, vocab=512
+):
+    """A synthetic Llama checkpoint whose layer-0 `q_proj` is `weights`."""
+    os.makedirs(path, exist_ok=True)
+    rng = np.random.RandomState(3)
+
+    def small(*shape):
+        return rng.randn(*shape) * 0.02
+
+    head_dim = hidden // heads
+    tensors = [
+        ("model.embed_tokens.weight", small(vocab, hidden)),
+        ("model.layers.0.self_attn.q_proj.weight", weights),
+        ("model.layers.0.self_attn.k_proj.weight", small(kv * head_dim, hidden)),
+        ("model.layers.0.self_attn.v_proj.weight", small(kv * head_dim, hidden)),
+        ("model.layers.0.self_attn.o_proj.weight", small(hidden, heads * head_dim)),
+        ("model.layers.0.mlp.gate_proj.weight", small(inter, hidden)),
+        ("model.layers.0.mlp.up_proj.weight", small(inter, hidden)),
+        ("model.layers.0.mlp.down_proj.weight", small(hidden, inter)),
+        ("model.layers.0.input_layernorm.weight", np.ones(hidden)),
+        ("model.layers.0.post_attention_layernorm.weight", np.ones(hidden)),
+        ("model.norm.weight", np.ones(hidden)),
+        ("lm_head.weight", small(vocab, hidden)),
+    ]
+    _write_safetensors(os.path.join(path, "model.safetensors"), tensors)
+    with open(os.path.join(path, "config.json"), "w") as f:
+        json.dump(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": hidden,
+                "intermediate_size": inter,
+                "num_hidden_layers": 1,
+                "num_attention_heads": heads,
+                "num_key_value_heads": kv,
+                "vocab_size": vocab,
+                "max_position_embeddings": 512,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "hidden_act": "silu",
+                "torch_dtype": "float32",
+                "tie_word_embeddings": False,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "attention_bias": False,
+                "mlp_bias": False,
+            },
+            f,
+        )
+
+
+def _llm_weight_offset(row, col, cin):
+    """Where `llm_build` puts a matmul weight. Every constant is half its
+    convolution-pipeline counterpart: an 18-byte plane gap, chunks of 18 with
+    a stride of 72, and 36 for the bit that costs 72 there."""
+    a = 72 * -(-(cin // 2) // 18)
+    m = 16
+    top = m * a + 512
+    slot = col // 2
+    return (
+        a * (row % m)
+        + 36 * ((row // m) & 1)
+        + top * (row // (2 * m))
+        + 72 * (slot // 18)
+        + (slot % 18)
+    ), (4 if col % 2 else 0)
+
+
+def test_llm_matmul_weight_addressing_is_the_conv_layout_halved(tmp_path):
+    """Confirmed real (see the README's "The LLM path's weight encoding"
+    section): `_llm_weight_offset()` locates every weight of an `llm_build`
+    matmul. Scored by correlation per output row, which tests the *addressing*
+    without depending on the quantiser -- that convention differs from the
+    convolution pipeline's and is not fully pinned down.
+
+    Needs Docker, no device.
+    """
+    hidden = 256
+    rng = np.random.RandomState(11)
+    weights = rng.randn(hidden, hidden) * 0.02
+    weights *= 0.2 / np.abs(weights).max(axis=1, keepdims=True)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _tiny_llama_checkpoint(str(work / "tiny"), weights, hidden=hidden)
+    result = pulsar2_docker.llm_build(
+        str(work),
+        "tiny",
+        "out",
+        weight_type="s8",
+        prefill_len=64,
+        kv_cache_len=127,
+        parallel=8,
+    )
+    assert result.success, getattr(result, "error", None)
+    files = sorted(glob.glob(str(work / "out" / "*.axmodel")))
+    assert files
+    wbt = np.frombuffer(
+        next(
+            i for i in onnx.load(files[0]).graph.initializer if i.name == "npu_params"
+        ).raw_data,
+        dtype=np.uint8,
+    )
+
+    offsets = np.array(
+        [[_llm_weight_offset(0, c, hidden)[0] for c in range(hidden)]]
+    ).ravel()
+    shifts = np.array([4 if c % 2 else 0 for c in range(hidden)])
+    span = int(offsets.max()) + 18 + 4
+
+    # Find the block by its first row, then require every row to correlate.
+    target = weights[0] - weights[0].mean()
+    best, base = -2.0, None
+    for start in range(0, len(wbt) - span, 2):
+        low = (wbt[start + offsets] >> shifts) & 0xF
+        high = (wbt[start + offsets + 18] >> shifts) & 0xF
+        codes = ((high.astype(int) << 4) | low).astype(float)
+        codes -= codes.mean()
+        denom = np.sqrt((codes**2).sum() * (target**2).sum())
+        if denom == 0:
+            continue
+        corr = abs(float((codes * target).sum() / denom))
+        if corr > best:
+            best, base = corr, start
+        if corr > 0.9999:
+            break
+    assert best > 0.99, best
+
+    worst = 1.0
+    for row in range(hidden):
+        rel = np.array([_llm_weight_offset(row, c, hidden)[0] for c in range(hidden)])
+        low = (wbt[base + rel] >> shifts) & 0xF
+        high = (wbt[base + rel + 18] >> shifts) & 0xF
+        codes = ((high.astype(int) << 4) | low).astype(float)
+        worst = min(worst, abs(float(np.corrcoef(weights[row], codes)[0, 1])))
+    assert worst > 0.99, worst
+
+
 def test_llm_build_weights_use_the_same_nibble_planes_at_half_the_gap(tmp_path):
     """Confirmed real (see the README's "The LLM path's weight encoding"
     section): `llm_build` stores INT8 weights in the same two-nibble-plane
