@@ -5475,6 +5475,99 @@ not a contradiction; it is the two things measuring different quantities.
 So: the path is open and the model is not usable as built. Getting audio out of
 it needs higher precision through part of the network, not another rewrite.
 
+## Mixed precision on the AX650: how to ask, and what it buys
+
+The Audio8 decoder runs but sounds poor (3.33 dB), and the diagnosis was
+accumulation across 675 quantised operations rather than any single bad layer.
+Pulsar2 does expose per-layer precision, so this is the obvious lever. Pulling
+it took four builds to aim correctly, because **three of the four ways to ask
+fail without saying so.**
+
+`quant.layer_configs` is the control -- not `mix_precision_configs`, which is
+an *output* field in `quant_axmodel.json`. Its schema is not in the CLI help;
+it came out of the protobuf validator, which prints every field name when
+handed one it does not recognise, and was confirmed against
+`/opt/pulsar2/yamain/config/build_config.proto` inside the image:
+
+```protobuf
+message LayerConfig {
+  string layer_name = 1;                   // or op_type / layer_names / op_types
+  repeated string start_tensor_names = 3;  // ...or a subgraph range
+  repeated string end_tensor_names = 4;
+  common.DataType data_type = 5;           // "option: U8, S8, U16, S16, FP32"
+}
+```
+
+**Note what is not there: FP16.** It exists in `common.DataType`, but the
+documented options for layer precision are `U8, S8, U16, S16, FP32`. The
+16-bit path on this hardware is U16/S16.
+
+### Three of the four selectors fail silently
+
+| selector | result |
+| --- | --- |
+| `op_types`, ONNX op names | works |
+| `op_types`, Pulsar2's fused names | **silently ignored** -- build succeeds, request vanishes |
+| `layer_names`, pre-fusion ONNX node names | loud error: "Op of name(...) doesn't exist in model" |
+| `layer_names`, post-fusion names | works |
+
+The second row is the dangerous one, and it cost two builds that were
+**byte-identical** to the one before them -- same bit-width histogram, same
+file hash -- while appearing to succeed. Pulsar2's fused operators
+(`onnx.FullyConnected`, `onnx.RMSNormalization`, `onnx.RotaryEmbedding`,
+`onnx.Silu`) live in a different namespace from ONNX op types, so exactly the
+layers that most needed precision were the ones `op_types` could not name.
+
+That is the third time this namespace split has bitten in one session --
+after `AxQuantizedSnake` (an op that exists only after fusion) and `Topk`
+versus `TopK`. Stated once, generally: **anything keyed on ONNX op names
+silently misses whatever the compiler fuses, and fails in the direction that
+looks like success.**
+
+The working recipe is therefore: build once, read the surviving names out of
+`<output>/quant/quant_axmodel.json`, then target those.
+
+### FP32 applies, and the backend will not always take it
+
+Asked correctly, `data_type: FP32` does apply -- 8-bit tensors dropped from 378
+to 160. The build then failed in the NPU backend with
+`TileFailException: AxLayerNorm`. The AX650 is an integer engine and a float
+LayerNorm has nowhere to run, so FP32 is best treated as a request the backend
+may refuse per op, with U16 as the dependable knob.
+
+### What precision actually bought
+
+| build | 8-bit tensors | correlation | SNR |
+| --- | --- | --- | --- |
+| INT8 throughout | 2037 | 0.808 | 3.33 dB |
+| `Conv` at 16-bit | 1807 | 0.813 | 3.44 dB |
+| every ONNX op type at 16-bit | 378 | **0.908** | **7.37 dB** |
+| plus the surviving layers at 16-bit | 244 | 0.906 | -- |
+
+Doubling the bit depth is worth 4 dB, and then it **plateaus**: the last 134
+tensors bought nothing at all.
+
+**And precision cannot be the remaining constraint.** The model's input is
+already 16-bit -- a feature map of range +/-10.2 and standard deviation 1.77,
+which at 16 bits is ~86 dB of headroom against a 7.4 dB result. Nor is it a
+misalignment that would sound fine anyway: cross-correlating the two waveforms
+puts the best lag at exactly **0**, so the error is genuine and sample-wise.
+
+Roughly 78 dB is unaccounted for by tensor precision. The open hypothesis is
+the one widening tensors cannot touch: Pulsar2 evaluates nonlinearities by
+**lookup table** -- visible in the earlier `AxClip ... lut.output_dtype`
+failure -- and a LUT's resolution is fixed no matter what dtype surrounds it.
+This vocoder is unusually LUT-heavy: 29 Snake activations plus `Silu`,
+`RMSNormalization` and `Gelu`. That is a hypothesis and not a finding; the
+experiment that would settle it is `precision_analysis_mode: NPUBackend`,
+which exercises the real backend rather than PPQ's float simulation.
+
+Which also corrects something said above: Pulsar2's precision analysis is
+**not** structurally blind to end-to-end behaviour. The default
+`precision_analysis_mode` is `Reference`, which scores each layer against
+float inputs; `NPUBackend` is the other option. The earlier claim that the
+tool "cannot show this" should have been "does not show this by default".
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
