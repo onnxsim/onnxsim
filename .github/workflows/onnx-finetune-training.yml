@@ -102,6 +102,25 @@ jobs:
           path: ${{ env.ORT_DIST_DIR }}
           key: onnxruntime-dist-1.19.2-training-pybind-ubuntu-24.04-v1
 
+      # ORT v1.19.2 fetches eigen from a GitLab commit-archive URL with a
+      # pinned SHA1 hash; GitLab's archive generator is not byte-stable over
+      # the ~1.5 years since this ORT release, so that hash now legitimately
+      # mismatches what GitLab serves (verified: this is the *same* commit,
+      # just re-archived differently -- not a compromised or wrong source).
+      # A plain git clone of that exact commit sidesteps the flaky archive
+      # entirely; --use_preinstalled_eigen/--eigen_path (real build.py flags,
+      # confirmed against ORT's own source -- they map straight to
+      # -Donnxruntime_USE_PREINSTALLED_EIGEN=ON -Deigen_SOURCE_PATH=<path>)
+      # is what tells build.py to use it instead of FetchContent's own
+      # download. Other vendored deps use the same URL+hash pattern but are
+      # GitHub-hosted, which has not shown this problem here -- fix only
+      # what has actually failed, not every dependency speculatively.
+      - name: Fetch eigen via git (GitLab's archive endpoint isn't hash-stable long-term)
+        if: steps.cache-ort-dist.outputs.cache-hit != 'true'
+        run: |
+          git clone https://gitlab.com/libeigen/eigen.git "${{ runner.temp }}/eigen"
+          git -C "${{ runner.temp }}/eigen" checkout e7248b26a1ed53fa030c5c459f7ea095dfd276ac
+
       - name: Build ONNX Runtime (training + pybind, one build serves both consumers)
         if: steps.cache-ort-dist.outputs.cache-hit != 'true'
         working-directory: ${{ env.ORT_SRC_DIR }}
@@ -126,11 +145,14 @@ jobs:
           # resolves to the latest release, so this isn't optional even
           # though ORT's own source needs no other change; it's exactly the
           # workaround CMake's own error message names.
+          #
+          # --use_preinstalled_eigen/--eigen_path: see the step above.
           python3 tools/ci_build/build.py \
             --build_dir build --config Release --parallel \
             --skip_tests --allow_running_as_root \
             --build_shared_lib --enable_training --enable_pybind \
-            --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5
+            --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            --use_preinstalled_eigen --eigen_path "${{ runner.temp }}/eigen"
           df -h
 
       - name: Stage curated ORT dist (lib + python bindings)
