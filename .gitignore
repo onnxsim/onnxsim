@@ -147,6 +147,10 @@ dmypy.json
 # author's machine.
 !scripts/convertmodel/test/*.onnx
 
+# Tiny (34KB) unsimplified nanochat export, committed so it can be dropped
+# straight into the browser wasm UI's file picker -- see scripts/nanochat/README.md.
+!scripts/nanochat/nanochat_wasm_demo.onnx
+
 compile_commands.json
 temp*.py
 test*.py
