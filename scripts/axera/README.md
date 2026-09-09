@@ -4941,6 +4941,35 @@ layer was a search looking for a layer-wide rule that does not exist: the
 allocator decides per tap, and the only way to know what it decided is to read
 it back out of the table.
 
+### Held out: a second vocoder, and why the splits must be walked
+
+100% on the model a method was developed against is not evidence the method
+works. The synthetic HiFi-GAN-shaped vocoder built earlier in this file is a
+genuine held-out test: different depths, different channel counts, an 80-band
+mel input instead of a 192-wide latent, and never once consulted while the
+reading pass was written.
+
+It came back at **91.3%** -- five of six layers exact, and the sixth was its
+`conv_pre` equivalent, `(128,80,7)`, at 71.4%. Enumerating candidate input
+splits had reached its limit: 80 channels do not split any way the candidate
+list contained.
+
+So the splits are now **walked** rather than guessed. Within a block, tap 0
+always occupies slots `0..w/2-1` whatever the tap convention is, so its
+channels can be walked one pair at a time until the codes stop matching, and
+that measures `w`. It is the same move that measured the LLM's column blocks,
+and it takes both vocoders to **100.0%**.
+
+What it measured is the argument for it. That first layer's splits, per tap:
+
+| tap | 0 | 1 | 2 |
+| --- | --- | --- | --- |
+| blocks | `[80]` | `[48, 32]` | `[24, 56]` |
+
+`24 + 56`. No candidate list anyone would write contains that. The allocator
+is not applying a rule with parameters -- it is packing, and the only way to
+know how it packed is to read it back.
+
 ### The LLM layout at 4096 hidden: column blocks, and all of them
 
 The `llm_build` addressing was solved at 256 hidden and scored 0.73 by
