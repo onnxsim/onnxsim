@@ -4463,27 +4463,35 @@ size* (14,376 bytes) each time, and the undilated rule reads them at 100%,
 with each other, so the arrangement does not depend on *how much* dilation,
 only on whether there is any.
 
-**The dilated rule is simpler than the undilated one.** Probing gives the
-kernel index its own chunk:
+**The dilated rule gives the kernel index its own chunk.** Everything still
+chunks at 36 with a stride of 144; dilation only changes what the outer
+dimension is:
 
-    undilated:  slot = (Cin/2)*k + i//2, then chunk by 36 with stride 144
-    dilated:    byte = 144*k + i//2
+    undilated:  slot = (Cin/2)*k + i//2
+                byte = 144*(slot // 36) + slot % 36
 
-Each tap starts a fresh 144-byte chunk instead of packing taps together, which
-is what you would expect when the taps read discontiguous input. Everything
-else -- the output-channel map, the 36-byte plane gap, the nibble by `i % 2`
--- is unchanged. Verified at 100.000% of codes.
+    dilated:    byte = 144*ceil((Cin/2)/36)*k          [a whole tap per chunk]
+                     + 144*((i//2) // 36) + (i//2) % 36
 
-**The vocoder goes from 4 to 10 of 23 layers.** Every 32-channel layer now
-reads, and most 64-channel ones. The remaining failures are a narrower set
-again:
+Each tap starts a fresh chunk instead of packing taps together, which is what
+you would expect when the taps read discontiguous input. The input channels
+chunk inside it exactly as before -- invisible at 64 channels, where
+`Cin/2 = 32` fits in one chunk, and required at 128, where it does not: the
+tap stride is 144 there and 288 here. Everything else, the output-channel
+map, the 36-byte plane gap and the nibble by `i % 2`, is unchanged. Verified
+at 100.000% of codes at both widths.
+
+**The vocoder goes from 4 to 10 of 23 layers** on the first form of this
+rule, and to 14 once the input chunking above is included -- **50.5% of its
+weights** together with the transposed convolutions. The remaining failures
+are a narrower set again:
 
 | still unread | why it is plausible |
 | --- | --- |
 | all three `ConvTranspose` | a layout never probed at all |
 | `conv_pre` (256, 192, 7) | 192 and 256 channels, past anything measured |
 | 128-channel dilated layers | 128 works undilated, so the two rules interact |
-| dilation 6 and 12 at 64 channels | 32 channels handles both, so it interacts with width |
+| large dilated extents at 64 and 128 channels | see below |
 
 That was 7.1% of the vocoder's weights, because the three transposed
 convolutions and `conv_pre` hold most of them. The transposed ones are now
@@ -4699,6 +4707,34 @@ checkpoint per probe -- slower, but no different in kind.
 Test: `test_llm_build_weights_use_the_same_nibble_planes_at_half_the_gap`
 (Docker, no device), which checks the peak at 18, that it beats the
 convolution pipeline's 36, and that `s4` shows nothing.
+
+### What is left in the vocoder, stated precisely
+
+At **14 of 23 layers and 50.5% of weights**, the failures are no longer a
+grab bag. Sorting them by the dilated kernel extent `d*(K-1)+1` makes the
+boundary visible:
+
+| layer | extent | reads |
+| --- | --- | --- |
+| `(32,32,5)` d=6 | 25 | yes |
+| `(32,32,7)` d=3 | 19 | yes |
+| `(64,64,5)` d=2 | 9 | yes |
+| `(64,64,7)` d=3 | 19 | **no** |
+| `(64,64,5)` d=6 | 25 | **no** |
+| `(32,32,7)` d=12 | 73 | **no** |
+| all `(128,128,*)` with K>3 | 9 to 73 | **no** |
+
+An extent of 25 reads at 32 channels and not at 64; an extent of 19 reads at
+32 and not at 64. So the limit is not the extent alone and not the width
+alone, but their product against some tile -- the same shape of interaction
+the polyphase finding turned out to be.
+
+That suggests the likely answer: a convolution whose dilated footprint
+outgrows the input tile is **decomposed**, exactly as a strided transposed
+convolution is decomposed into phases. If so, the remaining layers are not a
+new layout at all, only the existing one applied to sub-convolutions, and the
+probe that settles it is the one that settled `ConvTranspose` -- flip a
+single weight and see how many separate regions move.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
