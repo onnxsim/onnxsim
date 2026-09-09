@@ -92,6 +92,51 @@ await acheck("fetchSampleImageBytes throws on a non-OK rows response", async () 
   );
 });
 
+// Regression test for a real failure found live: frgfm/imagenette's actual
+// row count is smaller than this file's own hand-maintained estimate, so a
+// large random offset 404s. fetchRowsPage should retry once at offset 0
+// rather than fail the whole run.
+await acheck("fetchSampleImageBytes retries once at offset 0 after a 404 at a large offset", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedRandom = Math.random;
+  Math.random = () => 0.99; // -> a large offset, past the dataset's real size
+  const rowsCalls = [];
+  globalThis.fetch = async (url) => {
+    if (url.startsWith("https://datasets-server.huggingface.co/rows")) {
+      rowsCalls.push(url);
+      const offset = new URL(url).searchParams.get("offset");
+      if (offset !== "0") return { ok: false, status: 404 };
+      return jsonResponse({ rows: [{ row: { image: { src: "https://example.com/img.jpg" }, label: 0 } }] });
+    }
+    if (url === "https://example.com/img.jpg") return bytesResponse(new Uint8Array([7]));
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  try {
+    const { bytes, label } = await fetchSampleImageBytes();
+    assert.deepEqual([...bytes], [7]);
+    assert.equal(label, "tench"); // class index 0
+    assert.equal(rowsCalls.length, 2, "the failed large-offset try, then the offset-0 retry");
+  } finally {
+    globalThis.fetch = savedFetch;
+    Math.random = savedRandom;
+  }
+});
+
+await acheck("fetchSampleImageBytes throws when even the offset-0 request 404s", async () => {
+  await withStubs(
+    [
+      (url) =>
+        url.startsWith("https://datasets-server.huggingface.co/rows") ? { ok: false, status: 404 } : null,
+    ],
+    async () => {
+      // withStubs pins Math.random to 0, so the first try is already
+      // offset 0 -- there is nowhere left to retry, so this should throw
+      // directly rather than loop.
+      await assert.rejects(() => fetchSampleImageBytes(), /HTTP 404/);
+    },
+  );
+});
+
 await acheck("fetchSampleSentence fetches a row and maps the sentiment label", async () => {
   await withStubs(
     [

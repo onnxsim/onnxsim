@@ -52,17 +52,37 @@ function rowsUrl({ dataset, config, split }, offset, length = 1) {
   return `${ROWS_API}?${p.toString()}`;
 }
 
+// Fetch a page of rows at `offset`, retrying once at offset 0 on a 404. The
+// `rows` counts above (IMAGE_DATASET/TEXT_DATASET/CIFAR10_DATASET) are
+// hand-maintained estimates that can drift as a dataset/config/split is
+// edited on the Hub -- a 404 at a plausible-looking offset means the real
+// row count is smaller than assumed, not that the dataset itself is gone
+// (offset 0 is always valid for a dataset/config/split that resolves at
+// all). Retrying there once turns a stale estimate into a less-random pick
+// instead of a failed run. Found live: frgfm/imagenette's actual
+// 160px/validation row count is smaller than this file's own `rows: 3900`
+// estimate, 404ing on an in-range-looking offset near the top.
+async function fetchRowsPage(source, offset, length) {
+  const url = rowsUrl(source, offset, length);
+  const r = await fetch(url);
+  if (r.ok) return r.json();
+  if (r.status === 404 && offset !== 0) {
+    const retryUrl = rowsUrl(source, 0, length);
+    const retry = await fetch(retryUrl);
+    if (retry.ok) return retry.json();
+    throw new Error(
+      `Hugging Face dataset viewer returned HTTP ${retry.status} for ${retryUrl} (after a 404 at offset ${offset})`,
+    );
+  }
+  throw new Error(`Hugging Face dataset viewer returned HTTP ${r.status} for ${url}`);
+}
+
 // Fetch a single random row from a dataset config/split. Returns the row's
 // `row` object (the dataset's own column shape) or throws on a network/HTTP
 // failure.
 async function fetchRandomRow(source) {
   const offset = Math.floor(Math.random() * Math.max(1, source.rows));
-  const url = rowsUrl(source, offset, 1);
-  const r = await fetch(url);
-  if (!r.ok) {
-    throw new Error(`Hugging Face dataset viewer returned HTTP ${r.status} for ${url}`);
-  }
-  const data = await r.json();
+  const data = await fetchRowsPage(source, offset, 1);
   const row = data.rows && data.rows[0] && data.rows[0].row;
   if (!row) throw new Error(`no rows returned for ${source.dataset} (${source.config}/${source.split})`);
   return row;
@@ -115,12 +135,7 @@ export async function fetchSampleSentence() {
 // than the caller asked for).
 export async function fetchCifar10Batch(numSamples) {
   const offset = Math.floor(Math.random() * Math.max(1, CIFAR10_DATASET.rows - numSamples));
-  const url = rowsUrl(CIFAR10_DATASET, offset, numSamples);
-  const r = await fetch(url);
-  if (!r.ok) {
-    throw new Error(`Hugging Face dataset viewer returned HTTP ${r.status} for ${url}`);
-  }
-  const data = await r.json();
+  const data = await fetchRowsPage(CIFAR10_DATASET, offset, numSamples);
   const rows = (data.rows || []).map((entry) => entry.row);
   if (rows.length < numSamples) {
     throw new Error(
