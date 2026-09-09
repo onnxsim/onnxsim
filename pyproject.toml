@@ -49,6 +49,13 @@ shape-inference = ["onnx-shape-inference"]
 # Needed by onnxsim.profile_plot.plot_node_reduction() / --node-reduction-plot,
 # which renders the "NodeCount" events in a simplify(..., profile=...) trace.
 plot = ["matplotlib"]
+# z3-solver backs tests/_formal_verify_common.py's translation-validation tests
+# (tests/test_formal_verify_*.py): each targeted optimizer rewrite gets a
+# hand-written Z3 proof that its documented algebra is a sound equivalence,
+# plus a differential check that the compiled pass, run in isolation, agrees
+# with that same algebra on concrete models. Unrelated to onnxsim's own
+# ONNX-to-ONNX pipeline; those tests are skipped (not failed) without it.
+verify = ["z3-solver"]
 # Needed by onnxsim.export_transformers_model(), which calls
 # optimum.exporters.onnx.main_export to turn a Hugging Face transformers model
 # into ONNX before simplifying it. Heavy and unrelated to onnxsim's own
