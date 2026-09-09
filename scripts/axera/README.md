@@ -5568,6 +5568,63 @@ Which also corrects something said above: Pulsar2's precision analysis is
 float inputs; `NPUBackend` is the other option. The earlier claim that the
 tool "cannot show this" should have been "does not show this by default".
 
+## Dtype coverage: the weight dtype knob is inert, and the two layouts are one
+
+If precision has to be controlled from our side, the first question is what
+the weight table can even hold. Compiling one convolution at every dtype
+`layer_configs` accepts answers it, and the answer is blunt.
+
+| requested | effect on the weight table |
+| --- | --- |
+| `weight_data_type` = S8 / U8 / U16 / FP32 | **none** -- all four tables md5-identical to the default, and the INT8 layout reads 100% of the weights in every one |
+| `weight_data_type` = S16 | build fails: `TileFailException: AxQuantizedConv, not enough values to unpack` |
+| `data_type` (activations) = U16 / FP32 | the table changes shape, 4904 -> 3752 bytes for the same 3072 weights |
+
+**The knob that names weight precision does nothing.** Four requested dtypes,
+one byte-identical table. Weights are INT8 whatever you ask for -- which is the
+fourth silently-ignored setting this toolchain has produced in a session, and
+the most consequential, because it is the exact control anyone wanting
+higher-precision weights would reach for.
+
+### What activation width actually changes
+
+It switches the addressing. A single-weight probe on the 16-bit build:
+
+| probe | bytes | rule |
+| --- | --- | --- |
+| `i = 0`, `i = 1` | 0, 18 | plane gap **18**, two channels per byte |
+| `i = 2` | 1 | `slot = i/2` |
+| `k = 1` | 16 | `slot = (Cin/2)*k + i/2` |
+| `k = 2` | 86 | `72*(32//18) + 32%18` -- chunk **18**, stride **72** |
+| `o = 1` | 216 | `A = 72*ceil((Cin/2)*K/18)` |
+| `o = 16` | 36 | bit 4 of the output channel |
+
+Those are the `llm_build` constants exactly -- the layout recorded earlier as
+"the conv layout halved". Reading every weight with them: **100.000% exact.**
+
+So the two layouts decoded separately in this file are **one layout at two
+scales**: gap 36 with stride 144 for 8-bit activations, gap 18 with stride 72
+for 16-bit, identical slot arithmetic either way.
+
+**And the quantiser is an independent choice from the addressing.** The 16-bit
+convolution table uses the halved *addressing* with the *convolution*
+quantiser (`peak/127.5`, zero point 128) -- 100% exact, against 47.8% for
+`llm_build`'s own (`-signed peak/128`). Layout and encoding vary separately,
+which is worth knowing before assuming that recognising one implies the other.
+
+### The coverage table
+
+| path | addressing | quantiser |
+| --- | --- | --- |
+| 1-D convolution, 8-bit activations | gap 36, stride 144 | `peak/127.5`, +128 |
+| 2-D convolution | four 2-bit planes | `peak/127.5`, +128 |
+| dilated / transposed | per tap / per polyphase | `peak/127.5`, +128 |
+| **1-D convolution, 16-bit activations** | **gap 18, stride 72** | `peak/127.5`, +128 |
+| `llm_build` | gap 18, stride 72 | `-signed peak/128`, ties up |
+
+Five encodings, all read exactly. What none of them offers is a weight wider
+than 8 bits.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
