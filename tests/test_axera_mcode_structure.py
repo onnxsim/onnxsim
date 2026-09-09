@@ -4509,6 +4509,132 @@ def _llm_weight_offset(row, col, cin):
     ), (4 if col % 2 else 0)
 
 
+def _bf16_trunc(value):
+    """A float32's top 16 bits, rounded toward zero -- how the mcode stores an
+    activation scale."""
+    return struct.unpack("<I", struct.pack("<f", np.float32(value)))[0] >> 16
+
+
+def _u16_offsets(mcode, word):
+    """Every offset holding `word` as a little-endian uint16."""
+    raw = struct.pack("<H", word)
+    out, at = [], mcode.find(raw)
+    while at >= 0:
+        out.append(at)
+        at = mcode.find(raw, at + 1)
+    return out
+
+
+def _compiler_scales(axmodel_path):
+    """The per-tensor activation scales pulsar2 recorded for a build, smallest
+    first, from its own `quant/quant_axmodel.json`."""
+    path = os.path.join(os.path.dirname(axmodel_path), "quant", "quant_axmodel.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        quant = json.load(f)
+    scales = [v["scale"] for v in quant["values"].values() if "scale" in v]
+    return sorted(s[0] for s in scales if len(s) == 1)
+
+
+def _scale_probe_build(work_dir, tag, amplitude, channels=32, kernel=3, length=64):
+    """One convolution, calibrated against inputs scaled by `amplitude`. The
+    weights never change, so only the activation scales can."""
+    rng = np.random.RandomState(7)
+    weights = (rng.randn(channels, channels, kernel) * 0.05).astype(np.float32)
+    model = _one_conv_model(
+        channels, channels, length, kernel, 1, "Conv", weights=weights
+    )
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "config"), exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, f"{tag}.onnx"))
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", f"{tag}.tar"),
+        [
+            (np.random.RandomState(1).randn(1, channels, length) * amplitude).astype(
+                np.float32
+            )
+            for _ in range(2)
+        ],
+    )
+    with open(os.path.join(work_dir, "config", f"{tag}.json"), "w") as f:
+        json.dump(
+            {
+                "model_type": "ONNX",
+                "npu_mode": "NPU1",
+                "quant": {
+                    "input_configs": [
+                        {
+                            "tensor_name": "x",
+                            "calibration_dataset": f"./dataset/{tag}.tar",
+                            "calibration_format": "Numpy",
+                            "calibration_size": 2,
+                        }
+                    ],
+                    "calibration_method": "MinMax",
+                    "precision_analysis": False,
+                },
+                "compiler": {"check": 0},
+            },
+            f,
+        )
+    result = pulsar2_docker.build(
+        work_dir, f"{tag}.onnx", f"out_{tag}", config_path=f"config/{tag}.json"
+    )
+    assert result.success, result.error
+    ((_, mcode),) = _mcodes_of(result.axmodel_path)
+    return result.axmodel_path, mcode
+
+
+def test_activation_scales_are_bfloat16_in_the_mcode(tmp_path):
+    """Confirmed real (see the README's "The activation scales, decoded"
+    section): the two per-tensor activation scales a convolution needs are in
+    the mcode as **bfloat16 truncated toward zero** -- the input's as its
+    reciprocal `1/x_scale`, the output's directly as `y_scale`, four copies
+    of each.
+
+    Found by a differential that can only move scales: the same model built
+    against calibration inputs scaled by 1, 2 and 4. The weight codes and the
+    requantisation multipliers are invariant to that (`M = x_scale *
+    (peak/127.5) / r_scale` scales away), so the weight table must not move at
+    all -- and it does not, which is half of what this asserts.
+
+    This is what stands between rewriting weights that preserve a tensor's
+    dynamic range and rewriting any weights at all. Needs Docker, no device.
+    """
+    builds = {}
+    for amplitude in (1.0, 2.0, 4.0):
+        tag = f"a{amplitude:g}".replace(".", "_")
+        work = tmp_path / tag
+        work.mkdir()
+        path, mcode = _scale_probe_build(str(work), tag, amplitude)
+        scales = _compiler_scales(path)
+        if scales is None:
+            pytest.skip("this pulsar2 build wrote no quant_axmodel.json")
+        builds[amplitude] = (path, mcode, scales)
+
+    # The weight table cannot move: nothing in it depends on an activation
+    # scale once the requantisation multiplier is formed.
+    tables = {a: _wbt_of(p) for a, (p, _, _) in builds.items()}
+    assert len(set(tables.values())) == 1, "the weight table moved"
+
+    slots = {}
+    for amplitude, (_, mcode, scales) in builds.items():
+        y_scale, x_scale = scales[0], scales[1]
+        for name, word in (
+            ("1/x_scale", _bf16_trunc(1.0 / x_scale)),
+            ("y_scale", _bf16_trunc(y_scale)),
+        ):
+            at = _u16_offsets(mcode, word)
+            assert len(at) >= 4, (amplitude, name, word, at)
+            slots.setdefault(name, []).append(set(at))
+
+    # The same slots carry it at every amplitude -- otherwise a coincidence
+    # somewhere in a 2.8 KB stream would pass the test above.
+    for name, seen in slots.items():
+        assert set.intersection(*seen), name
+
+
 def _quantize_llm_weights(weights):
     """`llm_build`'s weight quantiser, reproduced exactly -- and it is not the
     convolution pipeline's (see `_quantize_conv_weights`).

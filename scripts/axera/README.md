@@ -4307,12 +4307,11 @@ output distribution".** A permutation does that exactly, which is why it
 works and why random weights with the same peak do not: same maximum,
 different variance, different output range.
 
-**Where the activation scales live, so far.** Of the eleven activation scales
-the compiler's own profile lists for an eight-layer convolution stack, exactly
-one appears verbatim as a float32 in the mcode. The rest do not appear in any
-byte order, which is what you would expect if they are stored as fixed-point
-requantisation multipliers rather than floats. Locating and rewriting those is
-the next step, and it is a decoding problem rather than a search.
+**Where the activation scales live.** Of the eleven activation scales the
+compiler's own profile lists for an eight-layer convolution stack, exactly one
+appears verbatim as a float32 in the mcode. The rest do not appear in any byte
+order -- because they are not float32 at all. See "The activation scales,
+decoded" below: they are bfloat16.
 
 Until then the honest capability statement is: **a compiled model's
 convolution weights can be replaced by any set that preserves each output
@@ -4940,6 +4939,48 @@ That last point is the one to carry forward. Every earlier failure to read a
 layer was a search looking for a layer-wide rule that does not exist: the
 allocator decides per tap, and the only way to know what it decided is to read
 it back out of the table.
+
+### The activation scales, decoded
+
+Rewriting a compiled model's weights only worked for weights that preserved
+each output tensor's dynamic range, because every convolution's output
+activation scale was calibrated from the original weights and stored somewhere
+unread. An earlier search for those scales as float32 found one of eleven and
+concluded they must be fixed-point. They are neither: they are **bfloat16**,
+which is why a float32 search found almost nothing and a byte-order search
+found nothing at all.
+
+**The differential that isolates them.** Build one identical model against
+calibration inputs scaled by 1, 2 and 4. Both the input and the output
+activation scale then scale with the amplitude, while the weight codes and the
+requantisation multiplier
+
+    M[o] = x_scale * (peak[o]/127.5) / r_scale
+
+are invariant -- the amplitude cancels. So the weight table must not move at
+all, and every byte that *does* move is an activation scale and nothing else.
+The weight table does not move, and 22 bytes of a 2,824-byte mcode do.
+
+**What they are.** Two families of four copies each, both bfloat16 rounded
+*toward zero*:
+
+| field | holds | amp 1 | amp 2 | amp 4 |
+| --- | --- | --- | --- | --- |
+| four 16-bit slots | `1/x_scale` | 35.75 | 17.875 | 8.9375 |
+| four 16-bit slots | `y_scale` | 0.0122681 | 0.0245361 | 0.0490723 |
+
+Checked against pulsar2's own `quant_axmodel.json`, all six agree exactly:
+`bf16_trunc(1/x_scale)` and `bf16_trunc(y_scale)`, where `bf16_trunc` is the
+float32's top 16 bits with the rest discarded. Note the asymmetry -- the input
+scale is stored **reciprocated** and the output scale is not, which is what a
+requantisation datapath that multiplies by one and divides by the other would
+want.
+
+The remaining six moving bytes are not values at all: across the three builds
+they hold the same multiset in a different order, so they are an ordering that
+depends on the scales rather than a scale.
+
+Test: `test_activation_scales_are_bfloat16_in_the_mcode` (Docker, no device).
 
 ### Held out: a second vocoder, and why the splits must be walked
 
