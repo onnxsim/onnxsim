@@ -31,6 +31,23 @@ Each model gets its own subprocess for both generation and simplification,
 so a native crash in either NNSmith's torch export path or in onnxsim's
 compiled extension takes down only that one case.
 
+``check_n>0`` needs a backend (onnxruntime, or onnx's ReferenceEvaluator as a
+fallback -- see onnxsim/backend.py) to actually execute the original and
+simplified models to compare them, and that backend can fail on a model
+independently of anything onnxsim's optimizer did -- confirmed by hand
+running this script for real: onnx's ReferenceEvaluator rejecting Pad's
+legal negative pad values (a real bug in onnx's own reference impl) and
+onnxruntime refusing an exact Resize form it doesn't implement, on NNSmith
+models that never even reach onnxsim's own pass code. ``_run_onnxsim``
+tells these apart from a genuine onnxsim finding by checking which module's
+frames appear in the failure (a native crash, identifiable by
+``faulthandler``'s distinctive dump -- see ``main()``'s own
+``faulthandler.enable()`` and its comment on why -- always wins, since a
+segfault matters regardless of what else appears in the same traceback)
+and reports them as ``checker_backend_error``: saved for inspection like
+any other non-``ok`` case, but excluded from the exit-1 "bugs" list, since
+they are not findings about onnxsim.
+
 Requires the optional ``nnsmith[torch,onnx]`` package; skips with a clear
 message if missing. NNSmith's ONNX export goes through
 ``torch.onnx.export(..., dynamo=False)`` -- forced by ``_nnsmith_gen.py``,
@@ -68,7 +85,11 @@ from typing import List, Optional
 @dataclass
 class CaseResult:
     seed: int
-    status: str  # gen_error | check_failed | onnxsim_crash | onnxsim_timeout | ok
+    # gen_error | ok | check_failed | onnxsim_crash | onnxsim_timeout |
+    # checker_backend_error -- see main()'s `bugs` filter for which of these
+    # gate (exit 1) and _run_onnxsim for how check_failed/onnxsim_crash are
+    # told apart from checker_backend_error.
+    status: str
     detail: str = ""
     model_dir: Optional[Path] = None
 
@@ -161,6 +182,28 @@ def _run_onnxsim(
         # simplify()'s own check_n verification caught a semantic change --
         # this is the actual finding this script exists to surface.
         return CaseResult(0, "check_failed", output[-800:])
+    # check_n>0 needs *some* backend (onnxruntime, or onnx's ReferenceEvaluator
+    # as a fallback -- see onnxsim/backend.py) to execute both the original
+    # and simplified models for comparison. A raised exception with a frame
+    # in that backend's own code -- confirmed by hand: onnx.reference's Pad
+    # rejecting ONNX's legal negative pads (a real onnx bug, unrelated to
+    # onnxsim), and onnxruntime failing to bind a Resize form it doesn't
+    # implement -- means the *checker's backend* couldn't even run one of the
+    # models, which happens independently of anything onnxsim's own optimizer
+    # did. A native crash (faulthandler's dump, identifiable by "Extension
+    # modules:" with no ordinary Python "Traceback" -- see main()'s
+    # faulthandler.enable()) always means the C++ extension itself, so takes
+    # priority over this even if a backend frame appears afterward in the
+    # same graph traversal.
+    is_native_crash = "Extension modules:" in output and "Traceback" not in output
+    checker_backend_frames = (
+        "onnx/reference/ops/",
+        "onnxruntime/capi/",
+        "onnxsim/model_checking.py",
+        "onnxsim/backend.py",
+    )
+    if not is_native_crash and any(f in output for f in checker_backend_frames):
+        return CaseResult(0, "checker_backend_error", output[-800:])
     return CaseResult(0, "onnxsim_crash", output[-800:])
 
 
