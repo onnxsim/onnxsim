@@ -15,6 +15,7 @@ It is registered as ``PassType::Other`` and therefore never runs by default
 
 import numpy as np
 import onnx
+import onnx.reference
 from onnx import parser
 
 import onnxsim
