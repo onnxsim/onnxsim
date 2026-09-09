@@ -2358,3 +2358,264 @@ def test_preserve_sparsity_holds_a_pruned_models_zero_codes():
     # nothing.
     assert (zeros & (codes(run(False)) != 0)).sum() > 0
     assert (zeros & (codes(run(True)) != 0)).sum() == 0
+
+
+# --- A `Gather` inside a block, and the non-float block-external it can have ----
+#
+# `onnxsim.graph_grad` grew a VJP rule for `Gather`, which makes it eligible
+# to sit *inside* a block instead of forcing block discovery to stop there.
+# But a `Gather` has two inputs of different semantic types: `data` (float)
+# and `indices` (integer) -- and every op in `SUPPORTED_OPS` before it had
+# exclusively float inputs, so the block-capture machinery in this module
+# assumed every block-external tensor is float32. That is false whenever a
+# block contains a `Gather` whose `indices` is a genuine block-external
+# (fed in from outside the block, not a same-block initializer): declaring
+# it FLOAT regardless -- what `_capture`, `_block_shapes` and
+# `onnxsim.qat_graph.make_step_graph` all used to do unconditionally -- is
+# not a legal type for a `Gather` node to read `indices` at, and building or
+# running the step graph raised for it.
+
+
+def _gather_block_model(seed=0):
+    """Two Linears with a ``Gather`` between them, whose ``indices`` is a
+    second graph input -- exactly the "attention mask fed as a second graph
+    input" shape ``_slice_block``'s own docstring names as a block-external
+    tensor entering sideways, except this one is genuinely non-float: a row
+    index, not a mask.
+
+    ``H``'s row axis is exactly what ``_slice_block``'s forward walk needs
+    ``Gather`` to depend on for the node to land *inside* the block at all
+    (see that function's docstring): its ``data`` input must be reachable
+    from the block input, or the whole node is treated as outside the slice
+    and its output captured as an ordinary (float) external instead -- which
+    would not exercise this bug at all.
+    """
+    rng = np.random.default_rng(seed)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    return _model(
+        f"""
+        g (float[batch,{D}] X, int64[batch] idx) => (float[batch,{D}] Yout)
+        {{
+          H = MatMul(X, W1)
+          G = Gather(H, idx)
+          Yout = MatMul(G, W2)
+        }}
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def test_a_block_external_gather_index_trains():
+    """The headline regression: building and running the step graph for a
+    block whose ``Gather`` reads a block-external, non-initializer integer
+    ``indices`` tensor no longer raises, and the block still trains.
+
+    Before the fix this failed two different ways depending on how far it
+    got: ``onnxruntime`` refused to even load the emitted step graph
+    (``idx`` declared ``tensor(float)``, which a ``Gather`` node cannot
+    read), and once that declaration was fixed on its own, refused to *run*
+    it instead (the captured ``idx`` array itself was cast to float32 before
+    being fed, disagreeing with the graph's own declared type). Both are
+    pinned here by the fact that this whole call completes.
+    """
+    model = _gather_block_model(seed=0)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    rng = np.random.default_rng(1)
+    rows = 16
+    x = _correlated_calibration(rank=2, num_samples=rows)
+    idx = rng.integers(0, rows, size=rows).astype(np.int64)
+    calibration_data = [{"X": x, "idx": idx}]
+
+    losses = []
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=calibration_data,
+        num_iterations=200,
+        losses=losses,
+    )
+    onnx.checker.check_model(tuned)
+    # The loop really optimized rather than merely surviving: the reported
+    # block loss falls well below where it started.
+    assert losses[-1] < 0.5 * losses[0]
+
+
+def test_a_same_block_gather_initializer_index_still_works():
+    """The case that already worked before this bug was fixed: a ``Gather``
+    whose ``indices`` is an initializer local to the block, not a
+    block-external tensor. ``_slice_block`` special-cases an initializer (it
+    is never added to ``externals``), so this exercises a different path
+    than ``test_a_block_external_gather_index_trains`` above and must be
+    unaffected by the dtype generalization there -- the assertion on
+    ``externals`` below is what pins that this test is actually exercising
+    the "already worked" path and not silently retesting the other one.
+
+    ``axis=1`` rather than the default 0: a block-local initializer's shape
+    cannot depend on the calibration batch size, and the feature axis is the
+    one dimension of ``H`` that is static regardless of it.
+    """
+    rng = np.random.default_rng(2)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    permutation = np.arange(D, dtype=np.int64)[::-1].copy()
+    model = _model(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+          H = MatMul(X, W1)
+          G = Gather <axis = 1> (H, idx)
+          Yout = MatMul(G, W2)
+        }}
+        """,
+        [
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            onnx.numpy_helper.from_array(permutation, "idx"),
+        ],
+    )
+    _, externals = qat._slice_block(model.graph, "X", "Yout")
+    assert "idx" not in externals, "the initializer path is what this pins"
+
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+    x = _correlated_calibration(rank=2, num_samples=16)
+
+    losses = []
+    tuned = onnxsim.apply_qat(
+        model,
+        quant,
+        "X",
+        "Yout",
+        calibration_data=[{"X": x}],
+        num_iterations=200,
+        losses=losses,
+    )
+    onnx.checker.check_model(tuned)
+    assert losses[-1] < 0.5 * losses[0]
+
+
+def test_capture_preserves_a_non_float_externals_real_dtype():
+    """Unit-level pin on ``qat._capture``: a captured tensor is cast to the
+    element type the float model itself declares for it, not
+    unconditionally to float32 -- so an int64 ``indices`` tensor comes back
+    as int64, byte-for-byte the values that went in, rather than silently
+    reinterpreted as (or rounded into) float32.
+    """
+    model = _gather_block_model(seed=0)
+    rng = np.random.default_rng(3)
+    rows = 8
+    x = rng.standard_normal((rows, D)).astype(np.float32)
+    idx = rng.integers(0, rows, size=rows).astype(np.int64)
+
+    captured = qat._capture(model, ["X", "idx", "Yout"], [{"X": x, "idx": idx}], None)
+    assert captured["idx"].dtype == np.int64
+    np.testing.assert_array_equal(captured["idx"], idx)
+    assert captured["X"].dtype == np.float32
+
+
+def test_block_shapes_declares_a_non_float_externals_real_elem_type():
+    """Unit-level pin on ``qat._block_shapes``: the standalone model it
+    builds to infer the block's shapes declares each external input at the
+    element type the float model itself gives it, not unconditionally
+    FLOAT -- which is what made ONNX's own checker refuse the emitted step
+    graph before this was fixed (a ``Gather`` node cannot read
+    ``tensor(float)`` ``indices``).
+    """
+    model = _gather_block_model(seed=0)
+    nodes, externals = qat._slice_block(model.graph, "X", "Yout")
+    assert set(externals) == {"X", "idx"}
+
+    rows = 8
+    rng = np.random.default_rng(4)
+    block_inputs = {
+        "X": rng.standard_normal((rows, D)).astype(np.float32),
+        "idx": rng.integers(0, rows, size=rows).astype(np.int64),
+    }
+    block_output = rng.standard_normal((rows, D)).astype(np.float32)
+
+    shapes = qat._block_shapes(model, nodes, block_inputs, "Yout", block_output)
+    assert shapes["idx"] == [rows]
+    assert shapes["X"] == [rows, D]
+
+    # `shapes` is shape-only, so pin the element type `_block_shapes` now
+    # declares each external at through the lookup it builds from the float
+    # model itself -- the same one it feeds `onnx.helper.make_tensor_value_info`
+    # for each external input.
+    probe_types = qat._tensor_elem_types(model)
+    assert probe_types["idx"] == onnx.TensorProto.INT64
+    assert qat._elem_type(probe_types, "idx") == onnx.TensorProto.INT64
+    assert qat._elem_type(probe_types, "X") == onnx.TensorProto.FLOAT
+    # A name genuinely absent from the model falls back to FLOAT, the
+    # assumption every block-external tensor satisfied unconditionally
+    # before this fix.
+    assert qat._elem_type(probe_types, "no_such_tensor") == onnx.TensorProto.FLOAT
+
+
+def test_make_step_graph_declares_a_non_float_constant():
+    """Unit-level pin on ``qat_graph.make_step_graph``: a ``constants`` entry
+    is declared at the element type its caller pairs with the shape, not
+    unconditionally FLOAT -- and the emitted graph actually runs end to end
+    with an integer constant feeding a ``Gather``, through
+    ``qat_graph.run_step_graph``'s own dtype handling.
+
+    The step this builds fits ``w`` to two rows of ``table`` gathered by
+    ``idx`` -- ``w``'s only path to those values is through the ``Gather``,
+    so a graph that declared (or fed) ``idx`` as anything but its real int64
+    would either fail to build/run at all (this file's other regressions
+    already pin that) or gather the wrong rows and never converge to them,
+    which is what the final assertion below checks for.
+    """
+    b = qat_graph.GraphBuilder()
+    gathered = b.op("Gather", ["table", "idx"], "gathered")
+    diff = b.sub("w", gathered)
+    grad = b.mul(diff, b.const(2.0 / (2 * D)))
+    w_next, m_next, v_next = qat_graph.adam_update(
+        b, "w", grad, "m", "vv", "lr", "m_correction", "v_correction"
+    )
+    step = qat_graph.make_step_graph(
+        b,
+        constants={
+            "table": ([4, D], onnx.TensorProto.FLOAT),
+            "idx": ([2], onnx.TensorProto.INT64),
+        },
+        state={"w": ([2, D], w_next), "m": ([2, D], m_next), "vv": ([2, D], v_next)},
+        scalars=["lr", "m_correction", "v_correction"],
+        loss=b.mean_square(diff),
+    )
+    idx_input = next(i for i in step.model.graph.input if i.name == "idx")
+    assert idx_input.type.tensor_type.elem_type == onnx.TensorProto.INT64
+    table_input = next(i for i in step.model.graph.input if i.name == "table")
+    assert table_input.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+    onnx.checker.check_model(step.model)
+
+    rng = np.random.default_rng(6)
+    table = rng.standard_normal((4, D)).astype(np.float32)
+    idx = np.array([3, 1], dtype=np.int64)
+    target = table[idx]
+
+    def scalars(t):
+        values = {"lr": 0.1}
+        values.update(qat_graph.adam_bias_corrections(t))
+        return values
+
+    losses = []
+    final = qat_graph.run_step_graph(
+        step,
+        constants={"table": table, "idx": idx},
+        state={
+            "w": np.zeros((2, D), np.float32),
+            "m": np.zeros((2, D), np.float32),
+            "vv": np.zeros((2, D), np.float32),
+        },
+        num_steps=300,
+        scalars=scalars,
+        losses=losses,
+    )
+    assert np.isfinite(final["w"]).all()
+    # The loop really converged onto `table`'s rows 3 and 1 -- not onto
+    # garbage a mistyped or miscast `idx` would have gathered instead.
+    assert losses[-1] < 1e-3 * losses[0]
+    np.testing.assert_allclose(final["w"], target, atol=0.05)

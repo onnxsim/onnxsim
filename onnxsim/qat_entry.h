@@ -112,6 +112,14 @@ struct QatCapture {
   std::string step_graph_input;
   std::string source_tensor;
   std::vector<int64_t> dims;
+  // The ONNX element type (onnx::TensorProto::DataType) to capture and bind
+  // `source_tensor` as. FLOAT for every capture this ever had, and now
+  // whatever non-float type the float model itself gives a genuine
+  // block-external tensor -- in practice a Gather's `indices`. A caller that
+  // captured everything as float32 the way this used to assume would corrupt
+  // an integer tensor's values and then hand the step graph a tensor of the
+  // wrong ONNX type for the input it declared.
+  int32_t elem_type = onnx::TensorProto::FLOAT;
   // True for the block's reconstruction target -- the float model's own output
   // for this block, which is the teacher. It is captured the same way as the
   // rest; the flag exists so a caller can label it in a UI.

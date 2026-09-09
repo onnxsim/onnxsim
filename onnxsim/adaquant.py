@@ -497,10 +497,10 @@ def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepG
     return qat_graph.make_step_graph(
         b,
         constants={
-            x: [num_rows, k],
-            y_float: [num_rows, n],
-            floor_base: [n, k],
-            scale: [n, k],
+            x: ([num_rows, k], onnx.TensorProto.FLOAT),
+            y_float: ([num_rows, n], onnx.TensorProto.FLOAT),
+            floor_base: ([n, k], onnx.TensorProto.FLOAT),
+            scale: ([n, k], onnx.TensorProto.FLOAT),
         },
         state={
             v: ([n, k], v_next),

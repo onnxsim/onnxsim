@@ -194,13 +194,19 @@ std::pair<float, float> AdamBiasCorrections(int64_t t);
 // rebuild per step. `per_step` names the inputs whose value changes every step
 // (the scalars, and a minibatch index vector when there is one).
 struct StepGraphSpec {
-  // Float32 graph inputs whose value does not change across steps
-  // (calibration activations, the reconstruction target, a frozen scale).
-  // They are *inputs* rather than initializers because the runner binds them
-  // once and keeps them resident; the emitter only declares their shape.
+  // Graph inputs whose value does not change across steps (calibration
+  // activations, the reconstruction target, a frozen scale). They are
+  // *inputs* rather than initializers because the runner binds them once and
+  // keeps them resident; the emitter only declares their shape and type.
+  // Most are FLOAT, but a captured block-external can be any dtype the
+  // source model gave it (a Gather's integer row indices, captured whole as
+  // one of these when there is no minibatch) -- `elem_type` defaults to
+  // FLOAT so every existing caller that only ever had float constants needs
+  // no change.
   struct NamedShape {
     std::string name;
     std::vector<int64_t> dims;
+    int32_t elem_type = onnx::TensorProto::FLOAT;
   };
   std::vector<NamedShape> constants;
   // (input name, dims, output name carrying the next value).

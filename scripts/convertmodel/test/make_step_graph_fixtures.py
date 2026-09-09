@@ -314,7 +314,10 @@ def build_qat_backward(rng: np.random.Generator) -> Dict:
     )
     step = qat_graph.make_step_graph(
         b,
-        constants={"x": list(x_shape), "teacher": list(out_shape)},
+        constants={
+            "x": (list(x_shape), onnx.TensorProto.FLOAT),
+            "teacher": (list(out_shape), onnx.TensorProto.FLOAT),
+        },
         state={
             "w": (list(w_shape), w_next),
             "mw": (list(w_shape), mw_next),
@@ -384,7 +387,10 @@ def build_minibatch(rng: np.random.Generator) -> Dict:
     )
     step = qat_graph.make_step_graph(
         b,
-        constants={"x_all": [total, kin], "y_all": [total, out]},
+        constants={
+            "x_all": ([total, kin], onnx.TensorProto.FLOAT),
+            "y_all": ([total, out], onnx.TensorProto.FLOAT),
+        },
         state={
             "w": ([kin, out], w_next),
             "mw": ([kin, out], mw_next),

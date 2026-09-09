@@ -316,10 +316,10 @@ def _build_rounding_step_graph(
     return qat_graph.make_step_graph(
         b,
         constants={
-            x: [num_rows, k],
-            y_float: [num_rows, n],
-            floor_base: [n, k],
-            scale: [n, k],
+            x: ([num_rows, k], onnx.TensorProto.FLOAT),
+            y_float: ([num_rows, n], onnx.TensorProto.FLOAT),
+            floor_base: ([n, k], onnx.TensorProto.FLOAT),
+            scale: ([n, k], onnx.TensorProto.FLOAT),
         },
         state={v: ([n, k], v_next), m: ([n, k], m_next), vv: ([n, k], vv_next)},
         scalars=["lr", "reg_scale", "beta", "m_correction", "v_correction"],

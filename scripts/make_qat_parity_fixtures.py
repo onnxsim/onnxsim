@@ -248,7 +248,7 @@ def _case_step_graph() -> Dict[str, Any]:
     )
     step = qat_graph.make_step_graph(
         b,
-        constants={"teacher": [4, 3]},
+        constants={"teacher": ([4, 3], int(onnx.TensorProto.FLOAT))},
         state={
             "w": ([4, 3], param_next),
             "m": ([4, 3], m_next),

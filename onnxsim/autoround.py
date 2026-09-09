@@ -570,10 +570,10 @@ def _build_autoround_step_graph(
     return qat_graph.make_step_graph(
         b,
         constants={
-            x: [num_rows, k],
-            y_float: [num_rows, n],
-            w: [n, k],
-            scale_blocks: [n, num_blocks],
+            x: ([num_rows, k], onnx.TensorProto.FLOAT),
+            y_float: ([num_rows, n], onnx.TensorProto.FLOAT),
+            w: ([n, k], onnx.TensorProto.FLOAT),
+            scale_blocks: ([n, num_blocks], onnx.TensorProto.FLOAT),
         },
         state={
             v: ([n, k], v_next),

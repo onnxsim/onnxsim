@@ -1687,7 +1687,11 @@ def test_the_backward_composes_into_a_step_graph_that_trains():
     )
     step = qat_graph.make_step_graph(
         b,
-        constants={"x": [rows, k], "y": [rows, k], "w1": [k, hidden]},
+        constants={
+            "x": ([rows, k], onnx.TensorProto.FLOAT),
+            "y": ([rows, k], onnx.TensorProto.FLOAT),
+            "w1": ([k, hidden], onnx.TensorProto.FLOAT),
+        },
         state={
             "w2": ([hidden, k], w2_next),
             "m": ([hidden, k], m_next),

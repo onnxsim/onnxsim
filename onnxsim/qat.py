@@ -957,6 +957,56 @@ def _refuse_unsupported(nodes: Sequence[onnx.NodeProto]) -> None:
         )
 
 
+def _tensor_elem_types(model: onnx.ModelProto) -> Dict[str, int]:
+    """``{tensor name: ONNX element type}`` for every tensor ``model``
+    declares a type for, after a best-effort shape-inference pass fills in
+    whatever ``model`` did not already carry.
+
+    Every tensor a block reads from outside itself used to be assumed
+    float32 -- true of every op in :data:`onnxsim.graph_grad.SUPPORTED_OPS`
+    until ``Gather`` joined it, whose ``indices`` input is a genuine integer
+    tensor. This is the single place that assumption is replaced by the
+    model's own answer, mirroring :func:`onnxsim.qat_interop._infer`'s
+    reasoning: inference only *adds* value_info, so a model it fails on is
+    simply used as-is, and a name still missing afterwards (never a graph
+    input/output, never produced by a node, never an initializer) is left
+    out of the map for the caller to default on.
+    """
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+    except Exception:  # noqa: BLE001 -- inference is best-effort here
+        inferred = model
+    types: Dict[str, int] = {}
+    for value in (
+        list(inferred.graph.input)
+        + list(inferred.graph.output)
+        + list(inferred.graph.value_info)
+    ):
+        elem_type = value.type.tensor_type.elem_type
+        if elem_type:
+            types[value.name] = elem_type
+    for init in inferred.graph.initializer:
+        types[init.name] = init.data_type
+    return types
+
+
+def _elem_type(types: Dict[str, int], name: str) -> int:
+    """``types[name]``, defaulting to FLOAT for a name shape inference could
+    not type -- the assumption every block-external tensor satisfied
+    unconditionally before ``Gather`` made a non-float one possible.
+    """
+    return types.get(name, onnx.TensorProto.FLOAT)
+
+
+def _np_elem_type(dtype: np.dtype) -> int:
+    """The ONNX element type a captured array's own numpy dtype corresponds
+    to -- what :func:`_build_step_graph` declares a constant's step-graph
+    input as, now that :func:`_capture` preserves each tensor's real dtype
+    instead of forcing float32 on all of them.
+    """
+    return int(onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype)))
+
+
 def _block_shapes(
     float_model: onnx.ModelProto,
     nodes: Sequence[onnx.NodeProto],
@@ -977,12 +1027,22 @@ def _block_shapes(
     Inference runs at opset 17, the pairing :mod:`onnxsim.qat_graph` emits, so
     a node the step graph could not legally carry is refused here rather than
     at session-creation time.
+
+    Every external is declared FLOAT here, save one exception: a tensor whose
+    element type the *float model itself* declares (or shape inference over
+    it infers) as something else -- in practice a ``Gather``'s ``indices``,
+    an integer tensor entering the block sideways rather than the float
+    activation every other block-external tensor is. Declaring it FLOAT
+    regardless, the way this used to, is exactly what upset ONNX's own
+    checker over the emitted step graph: a ``Gather`` node with a
+    ``tensor(float)`` ``indices`` input is not a legal graph.
     """
     used = {name for node in nodes for name in node.input if name}
     initializers = [t for t in float_model.graph.initializer if t.name in used]
+    elem_types = _tensor_elem_types(float_model)
     inputs = [
         onnx.helper.make_tensor_value_info(
-            name, onnx.TensorProto.FLOAT, list(value.shape)
+            name, _elem_type(elem_types, name), list(value.shape)
         )
         for name, value in sorted(externals.items())
     ]
@@ -1057,13 +1117,27 @@ def _capture(
     block seeing the shape it was written for; it does assume axis 0 is a
     batch axis the block treats independently, which is what a calibration
     batch axis is.
+
+    Each tensor is cast to the element type ``float_model`` itself declares
+    (or shape inference infers) for it, not unconditionally to float32: a
+    ``Gather``'s ``indices`` input is a genuine integer tensor, and casting
+    its captured values to float32 the way every block-external tensor used
+    to be cast would silently corrupt them (and disagree with the dtype
+    :func:`_block_shapes` and :func:`onnxsim.qat_graph.make_step_graph` now
+    declare for the same tensor). A name shape inference could not type falls
+    back to float32, which is what this did unconditionally before.
     """
     probe = _add_probe_outputs(float_model, names)
+    elem_types = _tensor_elem_types(probe)
+    dtypes = {
+        name: onnx.helper.tensor_dtype_to_np_dtype(_elem_type(elem_types, name))
+        for name in names
+    }
     collected: Dict[str, List[np.ndarray]] = {name: [] for name in names}
     for batch in calibration_data:
         out = backend.run_model(probe, batch, providers=providers)
         for name in names:
-            collected[name].append(np.asarray(out[name], dtype=np.float32))
+            collected[name].append(np.asarray(out[name], dtype=dtypes[name]))
 
     captured: Dict[str, np.ndarray] = {}
     for name, arrays in collected.items():
@@ -1189,12 +1263,22 @@ def _build_step_graph(
     #    still splice those nodes in verbatim. The block never learns that its
     #    input stopped being a graph input.
     teacher = f"{_PREFIX}teacher"
-    constants: Dict[str, Sequence[int]] = {}
+    # Each constant's declared element type is the captured array's own dtype
+    # -- float for every external this ever ran on, and now whatever
+    # non-float type a ``Gather``'s ``indices`` genuinely has, since
+    # :func:`_capture` stopped forcing float32 on every block-external
+    # tensor. The teacher/target is always float: it is the reconstruction
+    # loss's own output, never a block-external a ``Gather`` could have made
+    # non-float.
+    constants: Dict[str, Tuple[Sequence[int], int]] = {}
     if batch is None:
         constants.update(
-            {name: list(value.shape) for name, value in sorted(externals.items())}
+            {
+                name: (list(value.shape), _np_elem_type(value.dtype))
+                for name, value in sorted(externals.items())
+            }
         )
-        constants[teacher] = list(block_output_shape)
+        constants[teacher] = (list(block_output_shape), onnx.TensorProto.FLOAT)
     else:
         rows = batch.index_name
         # A captured tensor's table is ``qat__all_<its name>`` and the
@@ -1203,9 +1287,12 @@ def _build_step_graph(
         # and the other ``qat__teacher_``.
         for name, value in sorted(externals.items()):
             table = f"{_PREFIX}all_{name}"
-            constants[table] = list(value.shape)
+            constants[table] = (list(value.shape), _np_elem_type(value.dtype))
             b.gather_rows(table, rows, name)
-        constants[f"{_PREFIX}teacher_all"] = list(block_output_shape)
+        constants[f"{_PREFIX}teacher_all"] = (
+            list(block_output_shape),
+            onnx.TensorProto.FLOAT,
+        )
         b.gather_rows(f"{_PREFIX}teacher_all", rows, teacher)
         block_output_shape = [batch.size] + list(block_output_shape)[1:]
 

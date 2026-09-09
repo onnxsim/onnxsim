@@ -333,7 +333,7 @@ StepGraph MakeStepGraph(const GraphBuilder& b, const StepGraphSpec& spec) {
   // Python builds these from four dicts in this order and a positional binding
   // (ORT's IOBinding, and the WASM trampoline) reads them positionally.
   for (const StepGraphSpec::NamedShape& c : spec.constants) {
-    SetValueInfo(graph->add_input(), c.name, onnx::TensorProto::FLOAT, c.dims);
+    SetValueInfo(graph->add_input(), c.name, c.elem_type, c.dims);
   }
   for (const StepGraphSpec::StateEntry& s : spec.state) {
     SetValueInfo(graph->add_input(), s.input, onnx::TensorProto::FLOAT, s.dims);
