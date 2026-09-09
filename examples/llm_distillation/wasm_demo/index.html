@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Knowledge distillation WASM demo</title>
+<!--
+  Real, in-browser knowledge-distillation training, via ONNX Runtime Web's
+  on-device training API (`ort.TrainingSession`) -- unlike scripts/pyodide_demo/
+  (which runs onnxsim's own simplify()/quantization passes client-side), this
+  page trains a tiny student model against a frozen teacher, live, with no
+  server involved beyond serving these static files.
+
+  SCOPE
+  ======
+  This demonstrates the distillation *mechanics* (real gradients, real KD
+  loss, real AdamW steps) working end to end in a browser tab -- it is NOT
+  the ~1B/~162M-parameter demo examples/llm_distillation/distill.py runs
+  (that needs PyTorch, which has no WASM build at all, and would blow past
+  WASM32's ~4GB linear memory ceiling regardless -- see
+  tools/onnx-finetune/wasm/README.md's sizing note). Both the student and
+  the frozen teacher here use the same microscopic architecture as
+  distill.py's `TINY_SPEC` (hidden_size=32, 2 layers, real attention/RoPE/
+  RMSNorm/SwiGLU, ~22K parameters) -- see generate_web_artifacts.py, which
+  produced the .onnx/checkpoint files this page fetches from ./assets/.
+
+  Also unlike distill.py's true next-token loss, this demo's hard-label loss
+  is *position-aligned* (student's prediction at position i is scored
+  against labels[i], not a shifted next-token) -- see
+  generate_web_artifacts.py's DistillationLoss for why.
+
+  HOW IT WORKS
+  =============
+  - assets/teacher_model.onnx: a plain inference-only export, run via a
+    normal ort.InferenceSession.
+  - assets/checkpoint + training_model.onnx + optimizer_model.onnx: the
+    student's ONNX Runtime *training* artifacts (forward+loss graph, AdamW
+    optimizer graph, initial parameters), run via ort.TrainingSession.
+  - Each step: random synthetic token ids (no real corpus -- same
+    simplification distill.py's own README documents for its synthetic-data
+    default) go through the teacher (frozen forward pass) to get soft
+    targets, then through trainingSession.runTrainStep() with those teacher
+    logits fed in alongside the same input as a position-aligned hard label,
+    then runOptimizerStep() + lazyResetGrad().
+
+  Validated (as of this writing) in real headless Chromium via Playwright,
+  loading onnxruntime-web@1.19.2 from jsdelivr -- pinned to that exact
+  version because it is the last onnxruntime-web release to ship the
+  ort.training.wasm.min.js bundle (ort.TrainingSession) as of the versions
+  available when this was written; later 1.2x releases dropped it from
+  their dist/ entirely. No cross-origin-isolation headers are needed: the
+  "threaded" wasm binary this bundle ships falls back to single-threaded
+  execution when SharedArrayBuffer isn't available (confirmed empirically,
+  not documented behavior to rely on if a future onnxruntime-web version
+  changes this).
+-->
+<style>
+  :root {
+    --bg: #0f1220;
+    --panel: #171b2e;
+    --panel-2: #1f2440;
+    --border: #2c3358;
+    --text: #e7e9f5;
+    --text-dim: #9aa2c7;
+    --accent: #7c9fff;
+    --accent-2: #6ee7b7;
+    --warn: #f5a623;
+    --err: #ff6b6b;
+    --ok: #6ee7b7;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  body { min-height: 100vh; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-dim); font-size: 14px; margin: 0 0 20px; }
+  .scope-banner {
+    border: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(245,166,35,0.10), rgba(245,166,35,0.03));
+    border-left: 3px solid var(--warn);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 20px;
+    font-size: 13.5px;
+    line-height: 1.55;
+  }
+  .scope-banner b { color: var(--warn); }
+  .scope-banner code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12.5px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); margin: 0 0 12px; }
+  button {
+    background: var(--accent);
+    color: #0c1020;
+    border: none;
+    border-radius: 7px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-weight: 500;
+  }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+  .metric-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .metric-card .label { font-size: 11.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
+  .metric-card .value { font-size: 20px; font-weight: 700; margin-top: 4px; font-family: var(--mono); }
+  #log {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    max-height: 260px;
+    overflow-y: auto;
+    background: #0b0e1c;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 10px 12px;
+    margin-top: 14px;
+  }
+  .log-line.ok { color: var(--ok); }
+  .log-line.err { color: var(--err); }
+  footer { color: var(--text-dim); font-size: 12px; margin-top: 30px; line-height: 1.6; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Knowledge distillation, live in your browser</h1>
+  <p class="subtitle">A tiny student model learns from a frozen teacher via ONNX Runtime Web's on-device training API -- no server-side compute.</p>
+
+  <div class="scope-banner">
+    <b>Scope:</b> this trains a microscopic ~22K-parameter toy architecture (real attention/RoPE/RMSNorm, same shape as
+    <code>examples/llm_distillation/distill.py</code>'s <code>TINY_SPEC</code>), not the ~1B/~162M-parameter models that
+    Python demo trains -- PyTorch has no WASM build, and that scale doesn't fit WASM's memory ceiling regardless. This
+    demonstrates the distillation <i>mechanics</i> (real gradients, real KD loss, real optimizer steps) working end to
+    end client-side, on synthetic random token ids, not a useful language model.
+  </div>
+
+  <div class="panel">
+    <h2>Training</h2>
+    <div class="row">
+      <button id="start-btn">Start training</button>
+      <button id="stop-btn" class="secondary" disabled>Stop</button>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="label">Step</div>
+        <div class="value" id="step-value">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">Loss</div>
+        <div class="value" id="loss-value">--</div>
+      </div>
+    </div>
+    <div id="log">Click "Start training" to load the models and begin.</div>
+  </div>
+
+  <footer>
+    Models generated offline by <code>generate_web_artifacts.py</code> (needs torch/transformers/onnxruntime-training)
+    -- see this directory's <code>README.md</code>. Loads
+    <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+    1.19.2 from jsdelivr.
+  </footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.training.wasm.min.js"></script>
+<script>
+(function () {
+  const VOCAB_SIZE = 64;
+  const SEQ_LEN = 8;
+  const ASSETS = "./assets";
+
+  const logEl = document.getElementById("log");
+  const stepEl = document.getElementById("step-value");
+  const lossEl = document.getElementById("loss-value");
+  const startBtn = document.getElementById("start-btn");
+  const stopBtn = document.getElementById("stop-btn");
+
+  function log(msg, cls) {
+    const line = document.createElement("div");
+    if (cls) line.className = "log-line " + cls;
+    line.textContent = msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  async function fetchBuffer(path) {
+    const res = await fetch(path);
+    if (!res.ok) throw new Error(`fetch ${path} failed: ${res.status}`);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  // Simple deterministic PRNG (mulberry32) so each run's synthetic batch is
+  // reproducible -- not cryptographic, just enough to avoid Math.random()
+  // producing an unrepeatable demo.
+  function makeRng(seed) {
+    let s = seed >>> 0;
+    return function () {
+      s = (s + 0x6d2b79f5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function randInt64Tensor(rng, n, max, dims) {
+    const a = new BigInt64Array(n);
+    for (let i = 0; i < n; i++) a[i] = BigInt(Math.floor(rng() * max));
+    return new ort.Tensor("int64", a, dims);
+  }
+
+  function onesInt64Tensor(n, dims) {
+    return new ort.Tensor("int64", new BigInt64Array(n).fill(1n), dims);
+  }
+
+  let running = false;
+  let trainingSession = null;
+  let teacherSession = null;
+
+  async function loadModels() {
+    log("fetching teacher_model.onnx...");
+    const teacherBytes = await fetchBuffer(`${ASSETS}/teacher_model.onnx`);
+    teacherSession = await ort.InferenceSession.create(teacherBytes);
+    log("teacher inference session ready", "ok");
+
+    log("fetching training artifacts (checkpoint, training_model.onnx, optimizer_model.onnx)...");
+    const [checkpoint, trainModel, optimizerModel] = await Promise.all([
+      fetchBuffer(`${ASSETS}/checkpoint`),
+      fetchBuffer(`${ASSETS}/training_model.onnx`),
+      fetchBuffer(`${ASSETS}/optimizer_model.onnx`),
+    ]);
+    trainingSession = await ort.TrainingSession.create({
+      checkpointState: checkpoint,
+      trainModel: trainModel,
+      optimizerModel: optimizerModel,
+    });
+    log(`training session ready (inputs: ${trainingSession.trainingInputNames.join(", ")})`, "ok");
+  }
+
+  // A handful of fixed synthetic examples, generated once, that training
+  // cycles through repeatedly -- rather than an endless stream of fresh
+  // i.i.d. random batches (which never lets the loss visibly converge,
+  // since every step would see unrelated data). Repeating a small fixed
+  // pool lets the student actually fit it, so the loss curve in the log
+  // means something to someone watching the page train.
+  const NUM_FIXED_EXAMPLES = 4;
+
+  function buildFixedExamples() {
+    const rng = makeRng(42);
+    const examples = [];
+    for (let i = 0; i < NUM_FIXED_EXAMPLES; i++) {
+      examples.push({
+        inputIds: randInt64Tensor(rng, SEQ_LEN, VOCAB_SIZE, [1, SEQ_LEN]),
+        attentionMask: onesInt64Tensor(SEQ_LEN, [1, SEQ_LEN]),
+        labels: randInt64Tensor(rng, SEQ_LEN, VOCAB_SIZE, [1, SEQ_LEN]),
+      });
+    }
+    return examples;
+  }
+
+  async function trainLoop() {
+    const examples = buildFixedExamples();
+    let step = 0;
+    while (running) {
+      const { inputIds, attentionMask, labels } = examples[step % examples.length];
+
+      const teacherOut = await teacherSession.run({ input_ids: inputIds, attention_mask: attentionMask });
+      const teacherLogits = teacherOut[teacherSession.outputNames[0]];
+
+      const feeds = {
+        input_ids: inputIds,
+        attention_mask: attentionMask,
+        teacher_logits: teacherLogits,
+        labels: labels,
+      };
+      const results = await trainingSession.runTrainStep(feeds);
+      const lossName = trainingSession.trainingOutputNames[0];
+      const loss = results[lossName].data[0];
+
+      step += 1;
+      stepEl.textContent = String(step);
+      lossEl.textContent = loss.toFixed(4);
+      if (step % 5 === 0) log(`step ${step}: loss=${loss.toFixed(4)}`);
+
+      await trainingSession.runOptimizerStep();
+      await trainingSession.lazyResetGrad();
+
+      // Yield to the event loop between steps so the UI (and the Stop
+      // button) stays responsive -- these steps are cheap enough that a
+      // tight loop would otherwise starve rendering.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  startBtn.addEventListener("click", async () => {
+    startBtn.disabled = true;
+    try {
+      if (!trainingSession) {
+        await loadModels();
+      }
+      running = true;
+      stopBtn.disabled = false;
+      log("training started", "ok");
+      trainLoop().catch((e) => {
+        log("ERROR: " + e.message, "err");
+        console.error(e);
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      });
+    } catch (e) {
+      log("ERROR: " + e.message, "err");
+      console.error(e);
+      startBtn.disabled = false;
+    }
+  });
+
+  stopBtn.addEventListener("click", () => {
+    running = false;
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+    log("training stopped");
+  });
+})();
+</script>
+</body>
+</html>

@@ -68,3 +68,13 @@ import onnxsim
 
 onnxsim.export_transformers_model("./distilled-student-demo", "./distilled-student-demo/onnx")
 ```
+
+## Running distillation in the browser instead
+
+`wasm_demo/` is a separate, self-contained demo that runs actual knowledge-distillation
+*training* client-side in a browser tab, via ONNX Runtime Web's on-device training API -- no
+PyTorch, no server. It necessarily trains a much smaller (~22K-parameter) toy architecture than
+this directory's own `distill.py` (PyTorch has no WASM build, and this scale is many times over
+what fits in WASM's memory ceiling regardless), but the training mechanics -- real gradients, a
+real multi-input KD loss, real AdamW steps -- are genuine, not simulated. See
+`wasm_demo/README.md`.
