@@ -1182,6 +1182,12 @@ onnxsim.export_transformers_model(
 )
 ```
 
+Producing the checkpoint in the first place is a separate concern from
+exporting/simplifying it -- see `examples/llm_distillation/` for a standalone
+knowledge-distillation demo that trains a ~1B-parameter causal-LM student
+(TinyLlama-1.1B's architecture) and can hand the result straight to
+`export_transformers_model()` above.
+
 ## Diffusion model export
 
 A Hugging Face `diffusers` pipeline (Stable Diffusion, SDXL, ...) isn't one
