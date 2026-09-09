@@ -4677,19 +4677,23 @@ def _patch_scale_and_multiplier(axmodel, out_path, weights, y_factor, m_factor):
     return out_path
 
 
-def test_output_scale_is_rewritable_but_the_multiplier_is_not(tmp_path):
+def test_output_scale_and_multiplier_are_both_writable_within_a_range(tmp_path):
     """Confirmed real on an AX650N (see the README's "The activation scales,
-    decoded" section): the bfloat16 output scale in the mcode *is* the
-    dequantisation scale -- doubling it doubles the device's output exactly --
-    and that is what lets a layer's weights be rescaled, which saturated
-    before.
+    decoded" section).
 
-    The same run refutes something this file used to assume. The per-channel
-    float32 array next to the weight block is proportional to
-    `x_scale * (peak/127.5) / y_scale`, but it is **not consumed as a linear
-    multiplier**: scaling it by 0.5 and by 2 damages the output *by the same
-    amplitude*, which no linear factor can do. Rewriting it was never tested
-    before; it does not work.
+    Two things, measured as per-channel least-squares slopes against the CPU
+    reference rather than as amplitudes -- the maximum of 32 quantised samples
+    is far too coarse a statistic, and reading one led this file to the wrong
+    conclusion once already.
+
+    * The bfloat16 output scale in the mcode *is* the dequantisation scale:
+      doubling it doubles the device's output exactly, so a layer's weights
+      can be rescaled, which used to saturate.
+    * The per-channel float32 array next to the weight block *is* a linear
+      multiplier, and it is writable -- but only over a limited range. At
+      +/-5% every channel's slope tracks the factor to within a few percent;
+      at 0.5x or 2x individual channels break badly, some inverting sign, and
+      the output saturates.
 
     Needs Docker and a device.
     """
@@ -4715,58 +4719,69 @@ def test_output_scale_is_rewritable_but_the_multiplier_is_not(tmp_path):
         path = str(work / "ref.onnx")
         onnx.save(_one_conv_model(cin, cout, length, kernel, weights=w), path)
         session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        return np.asarray(session.run(None, {"x": x})[0]).ravel()
+        return np.asarray(session.run(None, {"x": x})[0]).reshape(cout, length)
 
     def device(path):
         result = pulsar2_docker.run_on_device_with_inputs(
             path, {"x": x.tobytes()}, timeout=300
         )
         assert not result.error, result.error
-        return np.frombuffer(result.outputs[0], np.float32).ravel()
+        return np.frombuffer(result.outputs[0], np.float32).reshape(cout, length)
 
     ref = reference(weights)
-    amp = lambda a: float(np.abs(a).max() / np.abs(ref).max())  # noqa: E731
-    corr = lambda a: float(np.corrcoef(a, ref)[0, 1])  # noqa: E731
 
-    plain = device(axmodel)
-    assert corr(plain) > 0.99, corr(plain)
+    def slopes(path, against=ref):
+        got = device(path)
+        return (got * against).sum(1) / (against * against).sum(1)
 
-    # Doubling the stored output scale doubles the output, and nothing else.
-    doubled = device(
+    plain = slopes(axmodel)
+    assert abs(np.median(plain) - 1) < 0.02, np.median(plain)
+
+    # Doubling the stored output scale doubles the output, every channel.
+    doubled = slopes(
         _patch_scale_and_multiplier(
             axmodel, str(work / "y2.axmodel"), weights, 2.0, 1.0
         )
     )
-    assert corr(doubled) > 0.99, corr(doubled)
-    assert 1.9 < amp(doubled) / amp(plain) < 2.1, amp(doubled) / amp(plain)
+    assert abs(np.median(doubled) - 2) < 0.05, np.median(doubled)
 
-    # So a layer whose weights are rescaled can now be written, which is what
-    # saturated before: triple the weights, triple the output scale.
+    # So a rescaled layer can be written, which used to saturate.
     tripled = (weights * 3).astype(np.float32)
-    scaled = device(
+    scaled = slopes(
         _patch_scale_and_multiplier(
             axmodel, str(work / "w3.axmodel"), tripled, 3.0, 1.0
-        )
+        ),
+        against=reference(tripled),
     )
-    ref3 = reference(tripled)
-    assert float(np.corrcoef(scaled, ref3)[0, 1]) > 0.99, np.corrcoef(scaled, ref3)[
-        0, 1
-    ]
+    assert abs(np.median(scaled) - 1) < 0.05, np.median(scaled)
 
-    # The per-channel array is not a linear multiplier: halving and doubling
-    # it damage the output identically.
-    half = device(
+    # The multiplier is linear over a small range...
+    near = {}
+    for factor in (0.95, 1.05):
+        near[factor] = slopes(
+            _patch_scale_and_multiplier(
+                axmodel,
+                str(work / f"m{factor}.axmodel"),
+                weights,
+                1.0,
+                factor,
+            )
+        )
+        assert abs(np.median(near[factor]) / factor - 1) < 0.03, (
+            factor,
+            np.median(near[factor]),
+        )
+        assert (np.abs(near[factor] / factor - 1) < 0.15).all(), near[factor]
+
+    # ... and not beyond it: halving it makes channels disagree by an order of
+    # magnitude more, and at least one inverts.
+    far = slopes(
         _patch_scale_and_multiplier(
-            axmodel, str(work / "m05.axmodel"), weights, 1.0, 0.5
+            axmodel, str(work / "mhalf.axmodel"), weights, 1.0, 0.5
         )
     )
-    twice = device(
-        _patch_scale_and_multiplier(
-            axmodel, str(work / "m2.axmodel"), weights, 1.0, 2.0
-        )
-    )
-    assert corr(half) < 0.9 and corr(twice) < 0.9, (corr(half), corr(twice))
-    assert abs(amp(half) - amp(twice)) < 0.01 * amp(half), (amp(half), amp(twice))
+    spread = lambda v: float(np.std(v / np.median(v)))  # noqa: E731
+    assert spread(far) > 5 * spread(near[0.95]), (spread(far), spread(near[0.95]))
 
 
 def _quantize_llm_weights(weights):

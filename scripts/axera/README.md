@@ -4318,9 +4318,12 @@ activation scales, decoded" below: **a compiled model's convolution weights
 can be replaced by any set that preserves each output channel's peak, and the
 whole layer may now be rescaled freely** -- the output activation scale is
 writable, so a uniform 3x rescale reproduces the new convolution at 0.99975
-where it used to saturate. What still blocks arbitrary weights is one thing,
-now precisely identified: the per-channel requantisation multiplier is not
-rewritable as a float32, because the datapath does not read it as one.
+where it used to saturate. What still blocks arbitrary weights is
+narrower than it was: the per-channel requantisation multiplier is a real
+linear multiplier and is writable, but only within roughly +/-10% before
+individual channels start to break, so new weights must keep each output
+channel's peak close to its original *relative* to the others. A uniform
+rescale of the whole layer is free, because the output scale absorbs it.
 
 Test: `test_per_channel_weight_scales_sit_just_past_the_weight_block`
 (Docker, no device).
@@ -4994,29 +4997,39 @@ weights can be **rescaled**, which is precisely what saturated before: tripling
 every weight and tripling the output scale reproduces the new convolution at
 0.99975, where the old table's fixed output scale would have clipped it.
 
-**And the same run refutes something this file had assumed.** The per-channel
-float32 array next to the weight block is proportional to
-`x_scale * (peak[o]/127.5) / y_scale` -- that much still holds exactly, and the
-measured constant matches `x_scale/y_scale` to eight digits. But it is **not
-consumed as a linear multiplier**. Scaling it on the device:
+**The per-channel multiplier is writable too, over a limited range.** It is
+the float32 array next to the weight block, proportional to
+`x_scale * (peak[o]/127.5) / y_scale` -- and the measured constant matches
+`x_scale/y_scale` to eight digits. Scaling it and measuring each channel's
+least-squares slope against the CPU reference:
 
-| edit | correlation | amplitude |
+| factor | median slope | worst channel, slope/factor |
 | --- | --- | --- |
-| untouched | 0.99975 | 0.990 |
-| `y_scale` x2 | 0.99975 | 1.980 |
-| multiplier x0.5 | 0.302 | 1.197 |
-| multiplier x2 | 0.515 | **1.197** |
+| 0.95 | 0.952 | 0.92 .. 1.07 |
+| 1.05 | 1.043 | 0.93 .. 1.06 |
+| 1.10 | 1.090 | 0.87 .. 1.12 |
+| 1.25 | 1.230 | 0.71 .. 1.21 |
+| 0.50 | 0.541 | **-0.31 .. 1.20** |
 
-Halving and doubling it produce *the same* amplitude. No linear factor does
-that. The array is read -- corrupting it clearly damages the output -- but
-whatever the datapath takes from those four bytes is not their float32 value,
-which is what you would see if it reads a fixed-point mantissa and shift out
-of the same word. Rewriting that array had never actually been tested; it does
-not work, and the earlier plan of "rewrite weights, multipliers and scales
-together" was resting on it.
+Within a few percent it is an ordinary linear multiplier. Past about 25% the
+per-channel error grows until channels start breaking outright -- at 0.5x one
+channel's slope is *negative*, its output inverted -- and at 2x the output
+saturates.
 
-Test: `test_output_scale_is_rewritable_but_the_multiplier_is_not` (Docker and
-device).
+**A correction, and the measurement error behind it.** An earlier pass here
+concluded this array was "not consumed as a linear multiplier", on the
+evidence that scaling it by 0.5 and by 2 produced *the same* output amplitude
+(1.197 both times), which no linear factor can do. That observation was real
+and the inference from it was wrong. Amplitude is the maximum of 32 quantised
+samples, so it is set by whichever channel blew up, and at both factors that
+happened to be the same magnitude. Per-channel slopes -- 32 numbers instead of
+one, and a fit instead of a maximum -- show a clean linear multiplier with a
+few channels broken. The lesson is narrow and worth keeping: a single
+whole-tensor statistic cannot tell "the mechanism is different" from "most of
+it worked and a little of it broke".
+
+Test: `test_output_scale_and_multiplier_are_both_writable_within_a_range`
+(Docker and device).
 
 ### Held out: a second vocoder, and why the splits must be walked
 
