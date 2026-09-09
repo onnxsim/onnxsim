@@ -4698,8 +4698,32 @@ Table sizes agree independently: 192,889,348 bytes for a layer of about
 177.2M parameters is 1.09 bytes per parameter at `s8`, and the `s4` build of
 the same layer is 97,952,260 -- almost exactly half.
 
-That takes the LLM path from nothing to a known weight encoding. What is not
-yet known there is the addressing: which byte holds which weight. The
+That takes the LLM path from nothing to a known weight encoding.
+
+**The addressing is half-scale, and measured but not yet complete.**
+Single-weight probes on a small synthetic checkpoint give the index costs
+directly. Every one is exactly half its convolution-pipeline counterpart:
+
+| quantity | convolution | `llm_build` |
+| --- | --- | --- |
+| plane gap | 36 | **18** |
+| chunk size | 36 | **18** |
+| chunk stride | 144 | **72** |
+| the "special bit" | 72 | **36** |
+| `A` | `144*ceil((Cin/2)/36)` | `72*ceil((Cin/2)/18)` |
+
+Those are read off the probes, not fitted: a column at index 64 lands 86
+bytes in, which is `72*1 + 14` under chunking at 18, and index 128 lands at
+226, which is `72*3 + 10`. Row bits cost 576, 1152, 2304, 4608 for bits 0-3,
+36 for bit 4, then 9728, 19456, 38912.
+
+**But the combined map does not reconstruct**: it reproduces about 45% of a
+weight matrix's codes, uniformly across rows and columns rather than failing
+in one region. Each dimension's costs are right individually and something
+about how they compose is not, which -- given what the convolution path
+turned out to do -- is most likely a further block split that the probes so
+far cannot see. So: encoding confirmed, index costs measured, addressing not
+yet closed. The
 convolution work needed single-weight probes for that, and `llm_build` takes
 a checkpoint rather than a graph, so the same trick needs a synthetic
 checkpoint per probe -- slower, but no different in kind.
@@ -4756,16 +4780,32 @@ range slightly, and each sub-block carries its own requantisation multiplier.
 That is why the region count is visible from a one-weight change at all.)
 
 **Reading each tap as its own block takes the vocoder to 19 of 23 layers and
-62.5% of its weights**, from 14 and 50.5%. Layers that had resisted from the
+62.5% of its weights**, from 14 and 50.5% (and to 20 and 67.5% once input
+splitting is added, below). Layers that had resisted from the
 start -- `(64,64,7)` at dilation 12, `(32,32,7)` at dilation 12,
 `(128,128,7)` at dilation 3 -- read at 0.9971 to 0.9999.
 
-**Four layers remain**: `conv_pre` at `(256,192,7)`, and three at 128
-channels -- `(128,128,5)` at dilations 2 and 6, and `(128,128,7)` at dilation
-12. Those are the interesting residue, because `(128,128,7)` at dilation 3
-*does* read: same width, same kernel, different dilation. So whatever splits
-those three is finer than one tap per block, and probably splits the input as
-well.
+**The split is two-dimensional.** Counting regions for the layers that still
+failed shows the sub-block count is not always `K`:
+
+| convolution | dilation | sub-blocks |
+| --- | --- | --- |
+| 128ch, `K=7` | 3 | 7 (one per tap) |
+| 128ch, `K=5` | 2 | **2** (input halves, taps together) |
+| 128ch, `K=7` | 12 | **21** (7 taps x 3 input groups) |
+
+So a convolution is split along taps *and* along input channels, by whatever
+the tiling needs. Adding input-group splits to the reader -- trying 1, 2 and
+4 groups -- takes the vocoder to **20 of 23 layers and 67.5% of its
+weights**.
+
+**Three remain**: `conv_pre` at `(256,192,7)`, `(128,128,5)` at dilation 6,
+and `(128,128,7)` at dilation 12. The last two are close rather than opaque:
+15 of 20 and 25 of 28 of their sub-blocks locate individually at 1.0000, and
+the misses look like search collisions -- with four input groups a block is
+only 32 channels wide, which is a 16-byte pattern, short enough for a
+whole-table scan to find a false maximum. Confirming them needs a sharper
+search rather than a new rule.
 
 Test: `test_a_widely_dilated_conv_splits_into_single_tap_convolutions`
 (Docker, no device), which counts regions rather than searching for them --
