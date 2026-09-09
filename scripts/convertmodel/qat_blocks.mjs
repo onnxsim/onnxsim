@@ -57,6 +57,7 @@ import { fields, decode } from "./macs.mjs";
 export const DIFFERENTIABLE_OPS = new Set([
   "Add",
   "AveragePool",
+  "BatchNormalization",
   "Clip",
   "Conv",
   "Div",
@@ -65,6 +66,7 @@ export const DIFFERENTIABLE_OPS = new Set([
   "Gather",
   "Gemm",
   "Identity",
+  "InstanceNormalization",
   "LayerNormalization",
   "MatMul",
   "MaxPool",

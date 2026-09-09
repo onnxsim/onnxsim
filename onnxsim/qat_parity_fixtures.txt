@@ -3,7 +3,7 @@
 # Asserted against onnxsim/qat_graph.py (tests/test_qat_parity.py) and
 # against onnxsim/qat_graph_builder.cpp (onnxsim/qat_graph_parity_test.cpp).
 ops Abs,Add,Cast,Clip,Div,Exp,Gather,Greater,Less,MatMul,Mul,Neg,Pow,ReduceMean,ReduceSum,Reshape,Sigmoid,Sign,Sqrt,Sub,Transpose
-rules Add,AveragePool,Clip,Conv,Div,Erf,Exp,Gather,Gemm,Identity,LayerNormalization,MatMul,MaxPool,Mul,Neg,ReduceMean,ReduceSum,Relu,Reshape,Sigmoid,Softmax,Sqrt,Sub,Tanh,Transpose
+rules Add,AveragePool,BatchNormalization,Clip,Conv,Div,Erf,Exp,Gather,Gemm,Identity,InstanceNormalization,LayerNormalization,MatMul,MaxPool,Mul,Neg,ReduceMean,ReduceSum,Relu,Reshape,Sigmoid,Softmax,Sqrt,Sub,Tanh,Transpose
 backward_ops Add,Cast,Div,Exp,Gather,Greater,Less,MatMul,Mul,Neg,ReduceMean,ReduceSum,Reshape,Sqrt,Sub,Transpose
 model_text <ir_version: 10, opset_import: ["" : 21]>
 model_text g (float[4,32] X) => (float[4,32] Y) {

@@ -764,6 +764,95 @@ _CASES = {
         """,
         None,
     ),
+    # BatchNormalization, inference mode (training_mode omitted, the opset-17
+    # default): mean/var are the node's own *inputs*, fixed per-channel
+    # numbers rather than reductions of X, so unlike LayerNormalization dX
+    # does not depend on every other element in its group -- see
+    # _grad_batch_normalization for the derivation. V is kept positive
+    # (variance) via _positive, the same way sqrt's own case does.
+    "batch_norm": (
+        """
+        g (float[2,3,4,4] X, float[3] S, float[3] Bs, float[3] M, float[3] V)
+            => (float[2,3,4,4] Y) {
+          Y = BatchNormalization(X, S, Bs, M, V)
+        }
+        """,
+        {"V": _positive},
+    ),
+    # A non-trivial channel count together with a different spatial rank (one
+    # spatial axis instead of two), to catch a rule that hardcoded "axis 1 of
+    # 4" rather than reading the rank generically.
+    "batch_norm_channel_count": (
+        """
+        g (float[2,5,7] X, float[5] S, float[5] Bs, float[5] M, float[5] V)
+            => (float[2,5,7] Y) {
+          Y = BatchNormalization(X, S, Bs, M, V)
+        }
+        """,
+        {"V": _positive},
+    ),
+    # Rank 2 -- batch and channel only, no spatial axis at all. The
+    # broadcast/reduce subtlety this exercises: dscale/db/dmean/dvar's
+    # ReduceSum then has only the batch axis to sum over, not "batch and
+    # spatial", and a rule that assumed a spatial axis exists (e.g. hardcoded
+    # axes=[0, 2, 3]) would break here instead of merely computing a
+    # differently-shaped right answer.
+    "batch_norm_no_spatial": (
+        """
+        g (float[4,3] X, float[3] S, float[3] Bs, float[3] M, float[3] V)
+            => (float[4,3] Y) {
+          Y = BatchNormalization(X, S, Bs, M, V)
+        }
+        """,
+        {"V": _positive},
+    ),
+    "batch_norm_epsilon": (
+        """
+        g (float[2,3,4,4] X, float[3] S, float[3] Bs, float[3] M, float[3] V)
+            => (float[2,3,4,4] Y) {
+          Y = BatchNormalization <epsilon = 0.01> (X, S, Bs, M, V)
+        }
+        """,
+        {"V": _positive},
+    ),
+    # InstanceNormalization: mean/var computed from X itself, like
+    # LayerNormalization, but over the spatial axes only -- see
+    # _grad_instance_normalization. No override needed: X is continuous
+    # random data, so its per-(batch, channel) spatial variance is never
+    # exactly zero.
+    "instance_norm": (
+        """
+        g (float[2,3,4,4] X, float[3] S, float[3] Bs) => (float[2,3,4,4] Y) {
+          Y = InstanceNormalization(X, S, Bs)
+        }
+        """,
+        None,
+    ),
+    "instance_norm_channel_count": (
+        """
+        g (float[2,5,3,3] X, float[5] S, float[5] Bs) => (float[2,5,3,3] Y) {
+          Y = InstanceNormalization(X, S, Bs)
+        }
+        """,
+        None,
+    ),
+    # The minimum rank this rule accepts: one spatial axis (rank 3 total).
+    "instance_norm_1d_spatial": (
+        """
+        g (float[2,3,5] X, float[3] S, float[3] Bs) => (float[2,3,5] Y) {
+          Y = InstanceNormalization(X, S, Bs)
+        }
+        """,
+        None,
+    ),
+    "instance_norm_epsilon": (
+        """
+        g (float[2,3,4,4] X, float[3] S, float[3] Bs) => (float[2,3,4,4] Y) {
+          Y = InstanceNormalization <epsilon = 0.001> (X, S, Bs)
+        }
+        """,
+        None,
+    ),
     "clip": (
         """
         g (float[3,4] A) => (float[3,4] Y)
@@ -1561,6 +1650,174 @@ def test_a_pool_with_a_window_that_is_entirely_padding_is_refused(op):
             {"A": [1, 1, 1], "Y": [1, 1, 3]},
             {"Y": "dY"},
             ["A"],
+        )
+
+
+@pytest.mark.parametrize(
+    "body,fragment",
+    [
+        (
+            """
+            g (float[3] X, float[3] S, float[3] Bs, float[3] M, float[3] V)
+                => (float[3] Y) {
+              Y = BatchNormalization(X, S, Bs, M, V)
+            }
+            """,
+            "channel axis",
+        ),
+        (
+            """
+            g (float[1,3,4,4] X, float[2] S, float[3] Bs, float[3] M, float[3] V)
+                => (float[1,3,4,4] Y) {
+              Y = BatchNormalization(X, S, Bs, M, V)
+            }
+            """,
+            "scale has shape",
+        ),
+        (
+            """
+            g (float[1,3,4,4] X, float[3] S, float[2] Bs, float[3] M, float[3] V)
+                => (float[1,3,4,4] Y) {
+              Y = BatchNormalization(X, S, Bs, M, V)
+            }
+            """,
+            "B has shape",
+        ),
+        (
+            """
+            g (float[1,3,4,4] X, float[3] S, float[3] Bs, float[2] M, float[3] V)
+                => (float[1,3,4,4] Y) {
+              Y = BatchNormalization(X, S, Bs, M, V)
+            }
+            """,
+            "mean has shape",
+        ),
+        (
+            """
+            g (float[1,3,4,4] X, float[3] S, float[3] Bs, float[3] M, float[2] V)
+                => (float[1,3,4,4] Y) {
+              Y = BatchNormalization(X, S, Bs, M, V)
+            }
+            """,
+            "var has shape",
+        ),
+    ],
+    ids=[
+        "no_batch_or_channel_axis",
+        "scale_shape_mismatch",
+        "bias_shape_mismatch",
+        "mean_shape_mismatch",
+        "var_shape_mismatch",
+    ],
+)
+def test_a_batch_norm_this_rule_cannot_invert_is_refused(body, fragment):
+    """A ``BatchNormalization`` whose rank or per-channel operand shapes
+    don't add up is refused by name -- the same discipline
+    :func:`_conv_geometry`/:func:`_pool_geometry` are held to.
+
+    ``training_mode=1`` gets no case here: per the spec it always comes with
+    three declared outputs, so it is already refused by
+    :func:`build_backward`'s own single-output check (see
+    :func:`test_a_maxpools_indices_output_is_refused` for the same shape of
+    refusal on ``MaxPool``'s ``Indices``), and there is no spec-conformant
+    graph left to construct that would reach a training_mode-specific check
+    in the rule itself.
+    """
+    model = _model(body)
+    shapes = {
+        value.name: [d.dim_value for d in value.type.tensor_type.shape.dim]
+        for value in list(model.graph.input) + list(model.graph.output)
+    }
+    with pytest.raises(graph_grad.UnsupportedOpError, match=fragment):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            shapes,
+            {"Y": "dY"},
+            ["X"],
+        )
+
+
+def test_a_batch_norms_training_mode_output_is_refused():
+    """``training_mode=1`` -- computing batch statistics live rather than
+    taking fixed running ones -- is refused the same way ``MaxPool``'s
+    ``Indices`` output is: the spec requires three outputs
+    (``Y``, ``running_mean``, ``running_var``) whenever ``training_mode=1``,
+    so :func:`build_backward`'s own single-output check refuses it before
+    :func:`onnxsim.graph_grad._grad_batch_normalization` ever runs.
+    """
+    model = onnx.parser.parse_model(
+        f"{_HEADER}\n"
+        """
+        g (float[1,2,3,3] X, float[2] S, float[2] Bs, float[2] M, float[2] V)
+            => (float[1,2,3,3] Y, float[2] RM, float[2] RV) {
+          Y, RM, RV = BatchNormalization <training_mode = 1> (X, S, Bs, M, V)
+        }
+        """
+    )
+    with pytest.raises(graph_grad.UnsupportedOpError, match="3 outputs"):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            {
+                "X": [1, 2, 3, 3],
+                "S": [2],
+                "Bs": [2],
+                "M": [2],
+                "V": [2],
+                "Y": [1, 2, 3, 3],
+            },
+            {"Y": "dY"},
+            ["X"],
+        )
+
+
+@pytest.mark.parametrize(
+    "body,fragment",
+    [
+        (
+            """
+            g (float[4,3] X, float[3] S, float[3] Bs) => (float[4,3] Y) {
+              Y = InstanceNormalization(X, S, Bs)
+            }
+            """,
+            "spatial dimension",
+        ),
+        (
+            """
+            g (float[1,3,4,4] X, float[2] S, float[3] Bs) => (float[1,3,4,4] Y) {
+              Y = InstanceNormalization(X, S, Bs)
+            }
+            """,
+            "scale has shape",
+        ),
+        (
+            """
+            g (float[1,3,4,4] X, float[3] S, float[2] Bs) => (float[1,3,4,4] Y) {
+              Y = InstanceNormalization(X, S, Bs)
+            }
+            """,
+            "B has shape",
+        ),
+    ],
+    ids=["no_spatial_axis", "scale_shape_mismatch", "bias_shape_mismatch"],
+)
+def test_an_instance_norm_this_rule_cannot_invert_is_refused(body, fragment):
+    """The ``InstanceNormalization`` analogue of the ``BatchNormalization``
+    refusals above: a rank with no spatial axis at all, or a ``scale``/``B``
+    that does not have one entry per channel."""
+    model = _model(body)
+    shapes = {
+        value.name: [d.dim_value for d in value.type.tensor_type.shape.dim]
+        for value in list(model.graph.input) + list(model.graph.output)
+    }
+    with pytest.raises(graph_grad.UnsupportedOpError, match=fragment):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(model.graph.node),
+            shapes,
+            {"Y": "dY"},
+            ["X"],
         )
 
 

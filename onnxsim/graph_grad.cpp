@@ -1399,6 +1399,189 @@ std::vector<OptStr> GradLayerNormalization(Backward& ctx,
   return grads;
 }
 
+std::vector<OptStr> GradBatchNormalization(Backward& ctx,
+                                           const onnx::NodeProto& node,
+                                           const std::string& g) {
+  // Five gradients, in inference mode (training_mode omitted or 0, the
+  // opset-17 default). mean/var are the node's own *inputs* here, fixed
+  // per-channel numbers rather than reductions of x, so unlike
+  // GradLayerNormalization dx does not depend on every other element in its
+  // group -- see _grad_batch_normalization in graph_grad.py for the
+  // derivation and for why training_mode=1 needs no check in this rule at
+  // all (the spec requires it to carry three outputs, so BuildBackward's own
+  // single-output check refuses it before this rule ever runs). This is a
+  // transcription of the Python, node for node.
+  const std::string& x = node.input(0);
+  const std::string& scale = node.input(1);
+  const std::string& bias = node.input(2);
+  const std::string& mean = node.input(3);
+  const std::string& var = node.input(4);
+  const std::string name = Quoted(node.output(0));
+  const Shape x_shape = ctx.ShapeOf(x);
+  const int64_t rank = static_cast<int64_t>(x_shape.size());
+  if (rank < 2) {
+    throw UnsupportedOpError(
+        "BatchNormalization needs a batch and a channel axis, got input "
+        "shape " +
+        ShapeStr(x_shape) + " (node " + name + ")");
+  }
+  const int64_t channels = x_shape[1];
+  const std::vector<std::pair<std::string, std::string>> operands = {
+      {"scale", scale}, {"B", bias}, {"mean", mean}, {"var", var}};
+  for (const auto& [label, tensor] : operands) {
+    const Shape shape = ctx.ShapeOf(tensor);
+    if (shape.size() != 1 || shape[0] != channels) {
+      throw UnsupportedOpError(
+          "BatchNormalization's " + label + " has shape " + ShapeStr(shape) +
+          ", not (" + std::to_string(channels) + ",) (node " + name + ")");
+    }
+  }
+  const float eps = AttrFloat(node, "epsilon", 1e-5f);
+
+  Shape bshape{1, channels};
+  for (int64_t i = 2; i < rank; ++i) bshape.push_back(1);
+
+  const std::string mean_shape_const = ctx.b().ConstInt64(bshape, "shape");
+  const std::string mean_b =
+      ctx.b().Op("Reshape", {mean, mean_shape_const}, "reshape");
+  const std::string xc = ctx.b().Sub(x, mean_b);
+
+  const std::string one = ctx.b().Const(1.0f);
+  const std::string var_shape_const = ctx.b().ConstInt64(bshape, "shape");
+  const std::string var_b =
+      ctx.b().Op("Reshape", {var, var_shape_const}, "reshape");
+  const std::string eps_const = ctx.b().Const(eps);
+  const std::string shifted = ctx.b().Add(var_b, eps_const);
+  const std::string deviation = ctx.b().Sqrt(shifted);
+  const std::string inv = ctx.b().Div(one, deviation);
+  const std::string xhat = ctx.b().Mul(xc, inv);
+
+  const std::string scale_shape_const = ctx.b().ConstInt64(bshape, "shape");
+  const std::string scale_b =
+      ctx.b().Op("Reshape", {scale, scale_shape_const}, "reshape");
+  const std::string gs = ctx.b().Mul(g, scale_b);
+  const std::string dx = ctx.b().Mul(gs, inv);
+
+  Shape channel_axes{0};
+  for (int64_t i = 2; i < rank; ++i) channel_axes.push_back(i);
+
+  const std::string g_xhat = ctx.b().Mul(g, xhat);
+  const std::string dscale_axes = ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string dscale = ctx.b().Op("ReduceSum", {g_xhat, dscale_axes},
+                                        {IntAttr("keepdims", 0)}, "reducesum");
+
+  const std::string dbias_axes = ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string dbias = ctx.b().Op("ReduceSum", {g, dbias_axes},
+                                       {IntAttr("keepdims", 0)}, "reducesum");
+
+  const std::string dmean_axes = ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string dx_summed = ctx.b().Op(
+      "ReduceSum", {dx, dmean_axes}, {IntAttr("keepdims", 0)}, "reducesum");
+  const std::string dmean = ctx.b().Op("Neg", {dx_summed}, "neg");
+
+  // dvar = -0.5 * sum(dx * xhat * inv): dx * xhat alone is only inv^2 (one
+  // factor from each), so this needs one more multiply by inv to reach the
+  // inv^3 the chain rule through sqrt actually produces -- see the Python
+  // docstring's note on exactly this point.
+  const std::string dx_xhat = ctx.b().Mul(dx, xhat);
+  const std::string dx_xhat_inv = ctx.b().Mul(dx_xhat, inv);
+  const std::string dvar_axes = ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string dvar_summed =
+      ctx.b().Op("ReduceSum", {dx_xhat_inv, dvar_axes},
+                 {IntAttr("keepdims", 0)}, "reducesum");
+  const std::string neg_half = ctx.b().Const(-0.5f);
+  const std::string dvar = ctx.b().Mul(dvar_summed, neg_half);
+
+  return {dx, dscale, dbias, dmean, dvar};
+}
+
+std::vector<OptStr> GradInstanceNormalization(Backward& ctx,
+                                              const onnx::NodeProto& node,
+                                              const std::string& g) {
+  // Three gradients. Same coupling as GradLayerNormalization -- mean and
+  // variance are computed from x itself, so every element's gradient depends
+  // on every other element in its group through them -- but the group is one
+  // (batch, channel) pair, reduced over the spatial axes [2, rank) only,
+  // rather than a suffix of axes named by an axis attribute
+  // (InstanceNormalization has none; the channel axis is always 1). scale/B
+  // are one entry per channel, GradBatchNormalization's broadcast rather
+  // than layer-norm's, so scale is reshaped to [1, C, 1, ..., 1] the same
+  // way before use. See _grad_instance_normalization in graph_grad.py for
+  // the full derivation; this is a transcription of it, node for node.
+  const std::string& x = node.input(0);
+  const std::string& scale = node.input(1);
+  const std::string& bias = node.input(2);
+  const std::string name = Quoted(node.output(0));
+  const Shape x_shape = ctx.ShapeOf(x);
+  const int64_t rank = static_cast<int64_t>(x_shape.size());
+  if (rank < 3) {
+    throw UnsupportedOpError(
+        "InstanceNormalization needs at least one spatial dimension, got "
+        "input shape " +
+        ShapeStr(x_shape) + " (node " + name + ")");
+  }
+  const int64_t channels = x_shape[1];
+  const std::vector<std::pair<std::string, std::string>> operands = {
+      {"scale", scale}, {"B", bias}};
+  for (const auto& [label, tensor] : operands) {
+    const Shape shape = ctx.ShapeOf(tensor);
+    if (shape.size() != 1 || shape[0] != channels) {
+      throw UnsupportedOpError(
+          "InstanceNormalization's " + label + " has shape " + ShapeStr(shape) +
+          ", not (" + std::to_string(channels) + ",) (node " + name + ")");
+    }
+  }
+  const float eps = AttrFloat(node, "epsilon", 1e-5f);
+
+  Shape spatial_axes;
+  for (int64_t i = 2; i < rank; ++i) spatial_axes.push_back(i);
+  const std::vector<onnx::AttributeProto> reduce_attrs = {
+      IntsAttr("axes", spatial_axes), IntAttr("keepdims", 1)};
+
+  Shape bshape{1, channels};
+  for (int64_t i = 2; i < rank; ++i) bshape.push_back(1);
+  const std::string scale_shape_const = ctx.b().ConstInt64(bshape, "shape");
+  const std::string scale_b =
+      ctx.b().Op("Reshape", {scale, scale_shape_const}, "reshape");
+
+  const std::string mu =
+      ctx.b().Op("ReduceMean", {x}, reduce_attrs, "reducemean");
+  const std::string xc = ctx.b().Sub(x, mu);
+  const std::string xc_squared = ctx.b().Mul(xc, xc);
+  const std::string var =
+      ctx.b().Op("ReduceMean", {xc_squared}, reduce_attrs, "reducemean");
+  const std::string one = ctx.b().Const(1.0f);
+  const std::string eps_const = ctx.b().Const(eps);
+  const std::string shifted = ctx.b().Add(var, eps_const);
+  const std::string deviation = ctx.b().Sqrt(shifted);
+  const std::string inv = ctx.b().Div(one, deviation);
+  const std::string xhat = ctx.b().Mul(xc, inv);
+
+  const std::string gs = ctx.b().Mul(g, scale_b);
+  const std::string mean_gs =
+      ctx.b().Op("ReduceMean", {gs}, reduce_attrs, "reducemean");
+  const std::string gs_xhat = ctx.b().Mul(gs, xhat);
+  const std::string mean_gs_xhat =
+      ctx.b().Op("ReduceMean", {gs_xhat}, reduce_attrs, "reducemean");
+  const std::string centred = ctx.b().Sub(gs, mean_gs);
+  const std::string correction = ctx.b().Mul(xhat, mean_gs_xhat);
+  const std::string inner = ctx.b().Sub(centred, correction);
+  const std::string dx = ctx.b().Mul(inv, inner);
+
+  const std::string g_xhat = ctx.b().Mul(g, xhat);
+  Shape channel_axes{0};
+  channel_axes.insert(channel_axes.end(), spatial_axes.begin(),
+                      spatial_axes.end());
+  const std::string dscale_axes = ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string dscale = ctx.b().Op("ReduceSum", {g_xhat, dscale_axes},
+                                        {IntAttr("keepdims", 0)}, "reducesum");
+  const std::string dbias_axes = ctx.b().ConstInt64(channel_axes, "axes");
+  const std::string dbias = ctx.b().Op("ReduceSum", {g, dbias_axes},
+                                       {IntAttr("keepdims", 0)}, "reducesum");
+
+  return {dx, dscale, dbias};
+}
+
 std::vector<OptStr> GradClip(Backward& ctx, const onnx::NodeProto& node,
                              const std::string& g) {
   // Pass the gradient through where the input was *strictly* inside the
@@ -1516,6 +1699,7 @@ const std::map<std::string, Rule>& Rules() {
       new std::map<std::string, Rule>{
           {"Add", &GradAdd},
           {"AveragePool", &GradAveragePool},
+          {"BatchNormalization", &GradBatchNormalization},
           {"Clip", &GradClip},
           {"Conv", &GradConv},
           {"Div", &GradDiv},
@@ -1524,6 +1708,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Gather", &GradGather},
           {"Gemm", &GradGemm},
           {"Identity", &GradIdentity},
+          {"InstanceNormalization", &GradInstanceNormalization},
           {"LayerNormalization", &GradLayerNormalization},
           {"MatMul", &GradMatMul},
           {"MaxPool", &GradMaxPool},
@@ -1568,6 +1753,9 @@ const std::set<std::string>& BackwardOps() {
   // set says why that is not a loosening either, and the EP_FRIENDLY_OPS note
   // in qat_graph.py records what a Conv/ConvTranspose membership would have
   // cost instead.
+  // GradBatchNormalization and GradInstanceNormalization needed nothing from
+  // this set at all -- every op their gradients use was already here for
+  // GradLayerNormalization or the elementwise rules.
   static const std::set<std::string>* ops = new std::set<std::string>{
       "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
       "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
