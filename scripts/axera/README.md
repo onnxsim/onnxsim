@@ -4658,6 +4658,48 @@ vocoder.
 Test: `test_convtranspose_stores_taps_reversed_in_the_conv_layout` (Docker,
 no device), which checks every code and that dropping the reversal breaks it.
 
+### The LLM path's weight encoding
+
+Everything decoded so far is `pulsar2 build` output. `llm_build` is a
+different compiler entry point, and its weight tables had never been looked
+at -- coverage there was zero. They are not a different format.
+
+**The tell is the zero weight.** In the two-nibble-plane INT8 encoding an
+all-zero weight reads `0x00` in the low plane and `0x88` in the high one, so
+a real plane gap makes `0x00` at some offset predict `0x88` a fixed distance
+later. Scanning gaps 1 to 64 over a layer's `npu_params`:
+
+| model | best gap | P(`0x88` at j+gap given `0x00` at j) | lift |
+| --- | --- | --- | --- |
+| synthetic 4096-hidden, `s8` | **18** | 0.52 | **12.3x** |
+| SmolLM2-135M, `s8` | **18** | 0.21 | **7.9x** |
+| synthetic 4096-hidden, `s4` | 64 | 0.005 | 0.06x |
+
+So `llm_build` uses **the same two-nibble-plane INT8 encoding, with the
+planes 18 bytes apart** rather than the convolution pipeline's 36 -- half the
+plane, and the same idea. Two independent models agree on 18, with 17 and 19
+as shoulders, so the fine structure may not be a single fixed stride.
+
+**The `s4` build is what makes this an encoding claim rather than a
+coincidence.** Four-bit weights need only one nibble, so there is no second
+plane to pair with, and indeed no gap anywhere from 1 to 64 shows any lift at
+all -- the best is 0.06x, i.e. *less* than chance. The pairing appears
+exactly when the format says it should and vanishes exactly when it should.
+
+Table sizes agree independently: 192,889,348 bytes for a layer of about
+177.2M parameters is 1.09 bytes per parameter at `s8`, and the `s4` build of
+the same layer is 97,952,260 -- almost exactly half.
+
+That takes the LLM path from nothing to a known weight encoding. What is not
+yet known there is the addressing: which byte holds which weight. The
+convolution work needed single-weight probes for that, and `llm_build` takes
+a checkpoint rather than a graph, so the same trick needs a synthetic
+checkpoint per probe -- slower, but no different in kind.
+
+Test: `test_llm_build_weights_use_the_same_nibble_planes_at_half_the_gap`
+(Docker, no device), which checks the peak at 18, that it beats the
+convolution pipeline's 36, and that `s4` shows nothing.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
