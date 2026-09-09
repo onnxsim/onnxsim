@@ -4884,6 +4884,85 @@ super-block covers 32 output channels, and the probe also moved four bytes at
 more per-channel float32 table, which the bias is the obvious candidate for
 and which no probe has yet moved.
 
+### Reading the whole vocoder, by discovering the geometry
+
+Exact-code coverage had stalled at 67.5% with three layers unread. The
+blocker was not the format -- it was that every search so far *assumed* a
+block's geometry and then looked for it. Three assumptions were wrong, and
+each one hid the next.
+
+**The first: that a block's input tile starts on a chunk boundary.** Slots are
+chunked 36 at a time with a 144-byte stride, and a search that lays a tile out
+contiguously from its own start is only right when the tile begins at a
+multiple of 36. In a packed layout tap `k` begins at slot `(Cin/2)*k`, which
+lands mid-chunk for almost every `k` -- so every tile that straddled a
+boundary was silently missed. Addressing each weight at its *absolute*
+intra-block slot and searching for the block base instead fixes it, and has
+the side benefit that one search now covers a whole block rather than a tile.
+
+**The second: that the member stride, the odd-register offset and the
+super-block stride follow the formula.** They usually do, but "usually" is not
+a criterion. So they are now read off the table: find output channel 0's block
+by exact bytes, then take the stride from where channel 1 sits, the odd offset
+from channel 16, and the super-block stride from channel 32, and only then
+verify every code of every output channel.
+
+**The third: that a layer splits its input channels one way.** It does not.
+The split is per **tap**. A byte-by-byte read of a widely dilated build showed
+its tap 0 ending at channel 31 -- with two slots of padding after it -- while
+every other tap of the same layer kept all 128 channels in one block. Choosing
+the split per tap rather than per layer is what closes the last two layers,
+and `conv_pre` wanted an uneven `32 + 160` that no uniform tiling would ever
+have proposed.
+
+| | layers at 100% | weights read |
+| --- | --- | --- |
+| assumed geometry | 20 of 23 | 67.5% |
+| discovered geometry | 20 of 23 | 90.6% |
+| **+ per-tap splits** | **23 of 23** | **100.0%** |
+
+That is every one of the 1,661,152 weights of a real trained vocoder,
+predicted from the ONNX file alone and matched code for code -- transposed
+layers, dilated layers and all.
+
+The conventions it discovers are consistent, and worth stating because they
+are now measured rather than assumed:
+
+* an **undilated** convolution is one block, the whole kernel packed into a
+  single slot space;
+* a **dilated** one is one block per tap, each tap padded up to a whole number
+  of 144-byte chunks;
+* a **transposed** one is one block per polyphase, taps reversed;
+* and any tap may split its input channels further, unevenly, independently of
+  its neighbours.
+
+That last point is the one to carry forward. Every earlier failure to read a
+layer was a search looking for a layer-wide rule that does not exist: the
+allocator decides per tap, and the only way to know what it decided is to read
+it back out of the table.
+
+### The LLM layout at 4096 hidden: column blocks, and all of them
+
+The `llm_build` addressing was solved at 256 hidden and scored 0.73 by
+correlation at 4096, which was recorded as a likely block split. It is a
+column split, and nothing else changes. Walking the table -- following columns
+until the codes stop matching, rather than assuming a width -- gives eight
+blocks:
+
+| block | columns | width | row stride `a` | `72*ceil(w/2/18)` |
+| --- | --- | --- | --- | --- |
+| 1 | 0..287 | 288 | 576 | 576 |
+| 2..8 | 288..4095 | 544 each | 1152 | 1152 |
+
+Every block's row stride is the same `72*ceil((width/2)/18)` that governs 256
+hidden, every block sits `16*a + 512` bytes after the last -- the same `top`
+the conv layout uses -- and **all 4096 rows of every block verify exactly**.
+
+That is 16,777,216 codes of a 4096x4096 `q_proj`, **100.0% of them**, from the
+checkpoint alone. The row addressing was never the problem at 4096; the guess
+that 0.73 meant "the layout breaks at this width" was wrong, and the only
+thing that was actually unknown was where one block stops.
+
 ### The LLM path quantises differently, and here it is exactly
 
 The convolution pipeline's quantiser was pinned down earlier: `scale =
