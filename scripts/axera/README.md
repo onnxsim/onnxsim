@@ -4884,6 +4884,75 @@ super-block covers 32 output channels, and the probe also moved four bytes at
 more per-channel float32 table, which the bias is the obvious candidate for
 and which no probe has yet moved.
 
+### Reading 90.6% of the vocoder, by discovering the geometry
+
+Exact-code coverage had stalled at 67.5% with three layers unread. The
+blocker was not the format -- it was that every search so far *assumed* a
+block's geometry and then looked for it. Two assumptions were wrong at once,
+and each hid the other.
+
+**The first: that a block's input tile starts on a chunk boundary.** Slots are
+chunked 36 at a time with a 144-byte stride, and a search that lays a tile out
+contiguously from its own start is only right when the tile begins at a
+multiple of 36. In a packed layout tap `k` begins at slot `(Cin/2)*k`, which
+lands mid-chunk for almost every `k` -- so every tile that straddled a
+boundary was silently missed. Addressing each weight at its *absolute*
+intra-block slot and searching for the block base instead fixes it, and has
+the side benefit that one search now covers a whole block rather than a tile.
+
+**The second: that the member stride, the odd-register offset and the
+super-block stride follow the formula.** They usually do, but "usually" is not
+a criterion. So they are now read off the table: find output channel 0's block
+by exact bytes, then take the stride from where channel 1 sits, the odd offset
+from channel 16, and the super-block stride from channel 32, and only then
+verify every code of every output channel.
+
+| | layers at 100% | weights read |
+| --- | --- | --- |
+| assumed geometry | 20 of 23 | 67.5% |
+| **discovered geometry** | **20 of 23** | **90.6%** |
+
+The layer count is the same and the weight count is not, which is the point:
+the earlier pass was scoring whole layers found or not found, and most of the
+"found" ones were only partly read.
+
+The conventions it discovers are consistent, and worth stating because they
+are now measured rather than assumed:
+
+* an **undilated** convolution is one block, the whole kernel packed into a
+  single slot space;
+* a **dilated** one is one block per tap, each tap padded up to a whole number
+  of 144-byte chunks;
+* a **transposed** one is one block per polyphase, taps reversed.
+
+**Three layers stay partial**, and they are the same three as before:
+`conv_pre` `(256,192,7)` at 64.3%, and the two 128-channel convolutions with
+the widest dilations (`K=5 d=6` at 75.0%, `K=7 d=12` at 89.3%). What is now
+known about them is that they are split further along the input axis, and not
+evenly: `conv_pre` reads exactly for its first 32 input channels at table
+offset 0, and the widely dilated pair put channels 0..31 in a block of their
+own with channels 32 onward in another. A 36-channel tile matched them at
+first -- until reading the table byte by byte showed the tile ending at
+channel 31 with two slots of padding after it.
+
+### The LLM layout at 4096 hidden: 288-column blocks
+
+The `llm_build` addressing was solved at 256 hidden and scored 0.73 by
+correlation at 4096, which was recorded as a likely block split. With the
+quantiser now exact the question can be asked properly, and the answer is a
+column split with nothing else changed:
+
+* one block holds **288 columns** -- read off the table by walking columns
+  until the codes stop matching, not inferred;
+* its row stride is **576**, which is exactly `72*ceil((288/2)/18)`, the same
+  formula that governs 256 hidden;
+* within one block **all 4096 rows** verify exactly, with the odd-register
+  offset at 36 and the super-block stride at 142336.
+
+So the row addressing was never the problem at 4096. 288 columns is 144 slots,
+eight chunks of 18 -- the widest a block can be and still have a row stride of
+576.
+
 ### The LLM path quantises differently, and here it is exactly
 
 The convolution pipeline's quantiser was pinned down earlier: `scale =
