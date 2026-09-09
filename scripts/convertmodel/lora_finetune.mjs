@@ -106,25 +106,37 @@ export function loraStepScalars(scalarNames, t, options = {}) {
   return values;
 }
 
-// Capture the activations a LoRA step graph binds, out of *two* models --
-// unlike QAT, where every capture (the block's externals and the teacher
-// alike) comes from the same float model, because there the float model
-// produces both. LoRA's block externals are the *injected* model's own
-// activations (train_lora's own `qat._capture(model, ...)`, where `model` is
-// the model being trained) and its reconstruction target is a *reference*
-// model's activation at the same block output (train_lora's
-// `qat._capture(reference_model, [block_output_name], ...)`)  -- two
-// different models in the general case, so this runs captureActivations
-// once per model and merges the results, rather than once as QAT does.
+// Capture the activations a LoRA step graph binds. Block-external captures
+// (`teacher: false`) always come from the *injected* model
+// (train_lora's own `qat._capture(model, ...)`, where `model` is the model
+// being trained) -- that half is unaffected by which training mode below is
+// in use. The teacher capture(s) (`teacher: true`, the block's own
+// reconstruction target) come from one of two mutually exclusive sources,
+// mirroring train_lora's own `reference_model`/`target_data` split:
+//
+// - `targetData == null` (reference-model distillation, the default): the
+//   teacher value is a *reference* model's activation at the same block
+//   output (train_lora's `qat._capture(reference_model,
+//   [block_output_name], ...)`) -- a second model, hence captureActivations
+//   is run once per model (when each has captures to make) and the results
+//   merged, rather than once as QAT does.
+// - `targetData != null`: the caller-supplied loss targets themselves
+//   (train_lora's `target_data` mode -- real supervised fine-tuning against
+//   labels, not reproducing a reference model). `referenceBytes` is not
+//   required or used in this mode; the reference model is never run.
+//   `targetData` is one array (or typed array) per `rowFeeds` entry, exactly
+//   train_lora's own "one array per calibration row" contract -- its rows
+//   are stacked into `{ dims, data }` the same shape captureActivations
+//   itself produces, directly here rather than via a model run.
 //
 // For the recommended default -- the whole graph as one block -- every
 // non-teacher capture is a graph input of the injected model, so
 // captureActivations' own optimization (a source that is a graph input is
 // read straight from `rowFeeds`, never asked of a model) means the injected
-// model is not actually run at all in that case; only the reference model is,
-// for the one teacher capture. That only stops being true for a
-// caller-narrowed sub-block, where a non-teacher capture can be a genuine
-// intermediate activation.
+// model is not actually run at all in that case; only the reference model is
+// (in reference-model mode), for the one teacher capture. That only stops
+// being true for a caller-narrowed sub-block, where a non-teacher capture can
+// be a genuine intermediate activation.
 export async function captureLoraActivations(
   ort,
   runtime,
@@ -132,6 +144,7 @@ export async function captureLoraActivations(
   referenceBytes,
   captures,
   rowFeeds,
+  targetData = null,
   options = {},
 ) {
   const teacherCaptures = captures.filter((c) => c.teacher);
@@ -141,10 +154,47 @@ export async function captureLoraActivations(
       ? captureActivations(ort, runtime, injectedBytes, blockCaptures, rowFeeds, options)
       : {},
     teacherCaptures.length
-      ? captureActivations(ort, runtime, referenceBytes, teacherCaptures, rowFeeds, options)
+      ? targetData != null
+        ? stackLoraTargets(teacherCaptures, targetData, rowFeeds)
+        : captureActivations(ort, runtime, referenceBytes, teacherCaptures, rowFeeds, options)
       : {},
   ]);
   return { ...block, ...teacher };
+}
+
+// Build the teacher capture(s) for target_data mode directly out of
+// caller-supplied rows -- no model run, no reference model. Same shape and
+// same validation spirit as captureActivations' own (`{ [source]: { dims,
+// data } }`, each row placed at its `i * perRow` offset): `targetData` must
+// have exactly one row per calibration row, and each row's flat length must
+// match the teacher capture's own per-row size (`dims`' total divided by the
+// row count) -- a mismatch is far cheaper to report here, by name, than to
+// let onnxruntime report a shape error about a `lora__`-prefixed tensor.
+function stackLoraTargets(teacherCaptures, targetData, rowFeeds) {
+  if (targetData.length !== rowFeeds.length) {
+    throw new Error(
+      `target_data has ${targetData.length} row(s) but ${rowFeeds.length} calibration ` +
+        "row(s) were given -- target_data needs exactly one target per calibration row",
+    );
+  }
+  const rows = targetData.map((row) => Float32Array.from(row));
+  const captured = {};
+  for (const { source, dims } of teacherCaptures) {
+    const total = dims.reduce((a, b) => a * b, 1);
+    const perRow = rows.length ? total / rows.length : 0;
+    const data = new Float32Array(total);
+    rows.forEach((row, i) => {
+      if (row.length !== perRow) {
+        throw new Error(
+          `target_data row ${i}: '${source}' expected ${perRow} value(s) (the step graph ` +
+            `declares ${dims.join("×")} over ${rows.length} row(s)), got ${row.length}`,
+        );
+      }
+      data.set(row, i * perRow);
+    });
+    captured[source] = { dims: [...dims], data };
+  }
+  return captured;
 }
 
 // Copy a LoRA plan out of the wasm heap -- qat_finetune.mjs's copyPlan plus
@@ -264,14 +314,19 @@ export function buildLoraStepPlan(
 // targets passed are trained, exactly as onnxsim_lora_build_step_graph's own
 // contract says.
 //
-// The one training mode implemented is reference-model distillation
-// (`train_lora(..., reference_model=...)`'s browser equivalent): the block's
-// reconstruction target is captured from `referenceBytes` at `blockOutput`,
-// on the same calibration rows fed to the injected model. Caller-supplied
-// `target_data` (train_lora's other, mutually exclusive mode -- the loss
-// target handed in directly rather than read off a reference model, i.e.
-// genuine supervised fine-tuning against labels) is not implemented here;
-// see trainLoraAdapter's own doc comment for why.
+// Exactly one of `referenceBytes`/`targetData` is required, mirroring
+// train_lora's own XOR contract (`train_lora(..., reference_model=...)` vs.
+// `train_lora(..., target_data=...)`):
+//
+// - `referenceBytes`: reference-model distillation. The block's
+//   reconstruction target is captured from `referenceBytes` at
+//   `blockOutput`, on the same calibration rows fed to the injected model.
+// - `targetData`: the loss target handed in directly rather than read off a
+//   reference model -- genuine supervised fine-tuning against caller-supplied
+//   labels, one array (or typed array) per `rowFeeds` entry. `referenceBytes`
+//   is neither required nor used in this mode; the reference model is never
+//   run (see captureLoraActivations' own doc comment for the exact shape
+//   contract).
 //
 // Returns { bytes, losses }. `bytes` is the injected model with this block's
 // adapter tensors written back -- feed it into the next block's own call as
@@ -284,7 +339,8 @@ export function buildLoraStepPlan(
 export async function trainLoraBlock(runtime, {
   injectedBytes,
   adapter,
-  referenceBytes,
+  referenceBytes = null,
+  targetData = null,
   blockInput,
   blockOutput,
   rowFeeds,
@@ -297,6 +353,13 @@ export async function trainLoraBlock(runtime, {
   log = () => {},
   onStep = () => {},
 }) {
+  if ((referenceBytes == null) === (targetData == null)) {
+    throw new Error(
+      "trainLoraBlock needs exactly one of referenceBytes or targetData -- " +
+        "reference-model distillation (referenceBytes) and caller-supplied " +
+        "training targets (targetData) are mutually exclusive, and one is required",
+    );
+  }
   const numRows = rowFeeds.length;
   const plan = buildLoraStepPlan(
     runtime,
@@ -317,6 +380,7 @@ export async function trainLoraBlock(runtime, {
       referenceBytes,
       plan.captures,
       rowFeeds,
+      targetData,
       { providers, log },
     );
     const captureFeeds = bindCaptures(plan.captures, captured);
@@ -389,14 +453,21 @@ export async function trainLoraBlock(runtime, {
 // training-mode/argument notes that still apply here unchanged, and
 // trainLoraAdapterAllBlocks below for training more than one block in a run.
 //
-// `baseBytes` is the model to inject into; `referenceBytes` defaults to
-// `baseBytes` itself (the ordinary case: the adapter should reproduce the
-// *same* model's own behaviour on rows the base model was not exactly
-// evaluated on post-injection -- injection alone is a numeric no-op, since
-// `B` starts at zero, so at step 0 the injected model already agrees with
-// the reference exactly and the loss starts there). A caller doing real
-// distillation against a different (larger, or differently fine-tuned) model
-// passes that model's bytes instead.
+// `baseBytes` is the model to inject into. `referenceBytes`/`targetData` are
+// mutually exclusive (a caller passing both gets a clear error here, before
+// injection even runs) -- see trainLoraBlock's own doc comment for the two
+// modes' full contract. Unlike trainLoraBlock, giving *neither* here is not
+// an error: `referenceBytes` then defaults to `baseBytes` itself (the
+// ordinary case: the adapter should reproduce the *same* model's own
+// behaviour on rows the base model was not exactly evaluated on
+// post-injection -- injection alone is a numeric no-op, since `B` starts at
+// zero, so at step 0 the injected model already agrees with the reference
+// exactly and the loss starts there). A caller doing real distillation
+// against a different (larger, or differently fine-tuned) model passes that
+// model's bytes instead. That default applies only in reference-model mode:
+// when `targetData` is given, `referenceBytes` is left null and never
+// touched or required -- trainLoraBlock's own XOR check is satisfied by
+// `targetData` alone.
 //
 // `blockInput`/`blockOutput` default to the injected model's own graph
 // input/output (wholeGraphBlock) -- train the whole model as one block,
@@ -423,11 +494,11 @@ export async function trainLoraAdapter(runtime, {
   log = () => {},
   onStep = () => {},
 }) {
-  if (targetData != null) {
+  if (referenceBytes != null && targetData != null) {
     throw new Error(
-      "target_data training is not implemented in the browser panel yet -- " +
-        "pass referenceBytes for reference-model distillation instead " +
-        "(see trainLoraBlock's own doc comment)",
+      "trainLoraAdapter takes at most one of referenceBytes or targetData -- " +
+        "reference-model distillation and caller-supplied training targets " +
+        "are mutually exclusive (see trainLoraBlock's own doc comment)",
     );
   }
   const injected = injectLoraAdapter(runtime, baseBytes, injectOptions);
@@ -444,7 +515,8 @@ export async function trainLoraAdapter(runtime, {
   const result = await trainLoraBlock(runtime, {
     injectedBytes,
     adapter: injected.adapter,
-    referenceBytes: referenceBytes || baseBytes,
+    referenceBytes: targetData != null ? null : referenceBytes || baseBytes,
+    targetData,
     blockInput: blockIn,
     blockOutput: blockOut,
     rowFeeds,
@@ -479,6 +551,18 @@ export async function trainLoraAdapter(runtime, {
 // caller report progress per block, in addition to `onStep`'s per-iteration
 // calls within one.
 //
+// `referenceBytes`/`targetData` are mutually exclusive, exactly as for
+// trainLoraAdapter (whose doc comment has the fuller argument): giving
+// neither defaults `referenceBytes` to `baseBytes` (self-distillation);
+// giving `targetData` leaves `referenceBytes` untouched and unused. Whichever
+// mode is in effect applies the same way to every discovered block -- a
+// single `targetData` array is passed through unchanged to each block's own
+// trainLoraBlock call, exactly as the single reference-model teacher bytes
+// already are, so it is on the caller to only reach for `targetData` here
+// when its shape genuinely matches every block's own reconstruction target
+// (ordinarily a single-block run, since a multi-block model's later blocks
+// have a different output tensor than the first).
+//
 // Returns { bytes, losses, adapter, results }. `losses` concatenates every
 // trained block's own loss trace in order; `results` is one entry per
 // proposed block ({ block, trained, skippedReason, losses }), mirroring
@@ -502,16 +586,17 @@ export async function trainLoraAdapterAllBlocks(runtime, {
   onBlockStart = () => {},
   onBlockDone = () => {},
 }) {
-  if (targetData != null) {
+  if (referenceBytes != null && targetData != null) {
     throw new Error(
-      "target_data training is not implemented in the browser panel yet -- " +
-        "pass referenceBytes for reference-model distillation instead " +
-        "(see trainLoraBlock's own doc comment)",
+      "trainLoraAdapterAllBlocks takes at most one of referenceBytes or " +
+        "targetData -- reference-model distillation and caller-supplied " +
+        "training targets are mutually exclusive (see trainLoraBlock's own " +
+        "doc comment)",
     );
   }
   const injected = injectLoraAdapter(runtime, baseBytes, injectOptions);
   let injectedBytes = injected.bytes;
-  const teacherBytes = referenceBytes || baseBytes;
+  const teacherBytes = targetData != null ? null : referenceBytes || baseBytes;
 
   const proposals = discoverLoraBlocks(injectedBytes, injected.adapter, { maxTargetsPerBlock });
   const allLosses = [];
@@ -525,6 +610,7 @@ export async function trainLoraAdapterAllBlocks(runtime, {
         injectedBytes,
         adapter: blockAdapter,
         referenceBytes: teacherBytes,
+        targetData,
         blockInput: proposal.input,
         blockOutput: proposal.output,
         rowFeeds,
