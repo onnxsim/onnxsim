@@ -255,7 +255,13 @@ AX650_SUPPORTED_OPS: frozenset = frozenset(
         "Swish",
         "Tanh",
         "Tile",
+        # Axera's own list spells it "Topk"; ONNX's operator is "TopK". Both
+        # are here because the vendor spelling matches no node in a real graph
+        # -- and the real-hardware op sweep built a "TopK" node successfully
+        # (see the README's "Systematic op coverage" section), so treating one
+        # as unsupported was a misclassification, not a missing capability.
         "Topk",
+        "TopK",
         "Transpose",
         "Unsqueeze",
         "Where",

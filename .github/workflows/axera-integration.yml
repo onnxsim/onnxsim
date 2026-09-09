@@ -51,6 +51,7 @@ on:
       - "tests/test_axera_quantonnx.py"
       - "tests/test_axera_mcode_structure.py"
       - "tests/test_axera_mcode_validator.py"
+      - "tests/test_axera_op_coverage_report.py"
 
 concurrency:
   group: axera-integration-${{ github.ref }}
@@ -118,7 +119,7 @@ jobs:
       - name: Run in-tree smoke tests
         working-directory: ${{ runner.temp }}
         run: |
-          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_compat.py" "$GITHUB_WORKSPACE/tests/test_pulsar2_simulator.py" "$GITHUB_WORKSPACE/tests/test_axera_conv_matmul_coverage.py" "$GITHUB_WORKSPACE/tests/test_axera_mcode_validator.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_compat.py" "$GITHUB_WORKSPACE/tests/test_pulsar2_simulator.py" "$GITHUB_WORKSPACE/tests/test_axera_conv_matmul_coverage.py" "$GITHUB_WORKSPACE/tests/test_axera_mcode_validator.py" "$GITHUB_WORKSPACE/tests/test_axera_op_coverage_report.py"
       - name: Run static Pulsar2 compatibility suite
         working-directory: ${{ runner.temp }}
         run: |
