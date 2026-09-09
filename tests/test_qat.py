@@ -480,6 +480,64 @@ def test_an_unsupported_op_in_the_block_is_refused():
         )
 
 
+def test_registering_a_gradient_rule_lets_apply_qat_train_a_previously_refused_block():
+    """The same block :func:`test_an_unsupported_op_in_the_block_is_refused`
+    above refuses -- ``Sin`` has no builtin :mod:`onnxsim.graph_grad` rule --
+    trains once a caller registers one via
+    :func:`onnxsim.graph_grad.register_gradient`:
+    :func:`onnxsim.qat._refuse_unsupported` checks
+    :func:`onnxsim.graph_grad.supported_ops` (builtin rules plus anything
+    registered), not the builtin-only
+    :data:`onnxsim.graph_grad.SUPPORTED_OPS`, so the registration is picked
+    up with no other change to this ``apply_qat`` call.
+
+    Uses :func:`onnxsim.graph_grad.custom_gradient` (the scoped form) rather
+    than a bare ``register_gradient``, so the registration cannot leak into
+    whatever test happens to run after this one in the same process --
+    including :func:`test_an_unsupported_op_in_the_block_is_refused` itself,
+    if pytest ever reorders them.
+    """
+    rng = np.random.default_rng(0)
+    w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{D}] X) => (float[batch,{D}] Yout)
+        {{
+          Y1 = MatMul(X, W1)
+          A1 = Sin(Y1)
+          Y2 = MatMul(A1, W2)
+          Yout = Add(Y2, X)
+        }}
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
+
+    def _grad_sin(ctx, node, g):
+        (x,) = node.input
+        cos_x = ctx.b.op("Cos", [x])
+        return [ctx.b.mul(g, cos_x)]
+
+    losses = []
+    with graph_grad.custom_gradient("Sin", _grad_sin):
+        assert "Sin" in graph_grad.supported_ops()
+        tuned = onnxsim.apply_qat(
+            model,
+            quant,
+            "X",
+            "Yout",
+            calibration_data=[{"X": _correlated_calibration(rank=4)}],
+            losses=losses,
+        )
+    onnx.checker.check_model(tuned)
+    assert losses[-1] < losses[0]
+    # Both the base rule table and the scoped registration are back to how
+    # they were before this test ran.
+    assert "Sin" not in graph_grad.SUPPORTED_OPS
+    assert "Sin" not in graph_grad.supported_ops()
+
+
 def test_a_block_with_nothing_quantized_in_it_is_refused():
     """The other half of the same contract: a block that matches no
     ``quantize_weight_only_int4`` layer has nothing to train, so saying so

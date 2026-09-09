@@ -944,20 +944,20 @@ def _refuse_unsupported(nodes: Sequence[onnx.NodeProto]) -> None:
     """Every op in the slice must have a gradient rule, checked before any
     calibration data is run.
 
-    Tested against :data:`onnxsim.graph_grad.SUPPORTED_OPS` rather than by
-    catching :class:`onnxsim.graph_grad.UnsupportedOpError` from
-    ``build_backward``, which is what that module's own docstring asks
-    callers who pick their own slice to do -- and it means the caller learns
-    the block is out of scope in milliseconds rather than after a full
-    activation capture.
+    Tested against :func:`onnxsim.graph_grad.supported_ops` (the builtin
+    rules plus anything registered via
+    :func:`onnxsim.graph_grad.register_gradient`) rather than by catching
+    :class:`onnxsim.graph_grad.UnsupportedOpError` from ``build_backward``,
+    which is what that module's own docstring asks callers who pick their
+    own slice to do -- and it means the caller learns the block is out of
+    scope in milliseconds rather than after a full activation capture.
     """
-    unsupported = sorted(
-        {n.op_type for n in nodes if n.op_type not in graph_grad.SUPPORTED_OPS}
-    )
+    supported = graph_grad.supported_ops()
+    unsupported = sorted({n.op_type for n in nodes if n.op_type not in supported})
     if unsupported:
         raise graph_grad.UnsupportedOpError(
             f"the block contains {unsupported}, which onnxsim.graph_grad cannot "
-            f"differentiate; it differentiates {sorted(graph_grad.SUPPORTED_OPS)}. "
+            f"differentiate; it differentiates {sorted(supported)}. "
             "Choose block boundaries that exclude those nodes."
         )
 
@@ -2722,9 +2722,10 @@ def discover_qat_blocks(
     pairs: List[Tuple[str, str]] = []
     start: Optional[Tuple[int, str]] = cuts[0] if cuts else None
     layers = 0
+    supported = graph_grad.supported_ops()
     for previous, current in zip(cuts, cuts[1:]):
         span = graph.node[previous[0] + 1 : current[0] + 1]
-        if any(node.op_type not in graph_grad.SUPPORTED_OPS for node in span):
+        if any(node.op_type not in supported for node in span):
             # A gap. Close whatever was pending *before* it (the pending
             # block ends at the last cut that is still on the trainable side)
             # and reopen after it.
