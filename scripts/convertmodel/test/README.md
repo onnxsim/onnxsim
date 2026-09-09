@@ -110,8 +110,8 @@ numbers (`random`/`ones`/`zeros`/`arange`, `input_fill.mjs`). The `sample data`
 option instead feeds *real* data fetched live from Hugging Face:
 
 - **Images** (`hf_datasets.mjs`'s `fetchSampleImageBytes()`): a random row from
-  [`frgfm/imagenette`](https://huggingface.co/datasets/frgfm/imagenette)
-  (Apache-2.0, 10 easy ImageNet classes) via the public, CORS-enabled
+  [`uoft-cs/cifar10`](https://huggingface.co/datasets/uoft-cs/cifar10)
+  (10 classes, 32x32 RGB) via the public, CORS-enabled
   `datasets-server.huggingface.co/rows` API — the same endpoint behind HF's own
   embeddable dataset-viewer widget. `sample_inputs.mjs` decodes it
   (`createImageBitmap`), resizes to the model's declared `[H, W]`, and

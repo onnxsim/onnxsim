@@ -84,7 +84,7 @@ if (el("webgpu-demo-button")) {
           `<p class="tool-note">sample: ${escapeHtml(result.labelNames.join(", "))} — ` +
           `${result.correct}/${result.total} correct after training.</p>`;
       } else {
-        extra = `<p class="tool-note">sample photo: ${escapeHtml(result.imageLabel)} (frgfm/imagenette).</p>`;
+        extra = `<p class="tool-note">sample photo: ${escapeHtml(result.imageLabel)} (uoft-cs/cifar10).</p>`;
       }
       curveEl.innerHTML = renderLossCurve(result.losses) + extra;
       setStatus("done.");

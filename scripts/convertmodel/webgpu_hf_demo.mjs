@@ -75,8 +75,9 @@ async function runStepLoop(ort, session, manifest, constants, onStep) {
 }
 
 // The "one real photo -> fixed target" demo: fetches a fresh photo from
-// frgfm/imagenette every call, fits it toward a zero target for
-// manifest.scalars.length steps. See test/make_step_graph_fixtures.py's
+// hf_datasets.mjs's IMAGE_DATASET (uoft-cs/cifar10) every call, fits it
+// toward a zero target for manifest.scalars.length steps. See
+// test/make_step_graph_fixtures.py's
 // build_qat_hf_demo for why the target is arbitrary and what this does and
 // does not prove.
 //

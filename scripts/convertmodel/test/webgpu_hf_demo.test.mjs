@@ -191,7 +191,7 @@ async function main() {
     server.close();
   }
 
-  console.log(`  sample photo: ${result.imageLabel} (frgfm/imagenette)`);
+  console.log(`  sample photo: ${result.imageLabel} (uoft-cs/cifar10)`);
   const trace = `loss ${result.losses[0].toExponential(3)} -> ` +
     `${result.losses[result.losses.length - 1].toExponential(3)}`;
   console.log(`  ${NUM_STEPS} steps in ${result.trainMs.toFixed(0)}ms, ${trace}`);
