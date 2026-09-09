@@ -4463,32 +4463,39 @@ size* (14,376 bytes) each time, and the undilated rule reads them at 100%,
 with each other, so the arrangement does not depend on *how much* dilation,
 only on whether there is any.
 
-**The dilated rule is simpler than the undilated one.** Probing gives the
-kernel index its own chunk:
+**The dilated rule gives the kernel index its own chunk.** Everything still
+chunks at 36 with a stride of 144; dilation only changes what the outer
+dimension is:
 
-    undilated:  slot = (Cin/2)*k + i//2, then chunk by 36 with stride 144
-    dilated:    byte = 144*k + i//2
+    undilated:  slot = (Cin/2)*k + i//2
+                byte = 144*(slot // 36) + slot % 36
 
-Each tap starts a fresh 144-byte chunk instead of packing taps together, which
-is what you would expect when the taps read discontiguous input. Everything
-else -- the output-channel map, the 36-byte plane gap, the nibble by `i % 2`
--- is unchanged. Verified at 100.000% of codes.
+    dilated:    byte = 144*ceil((Cin/2)/36)*k          [a whole tap per chunk]
+                     + 144*((i//2) // 36) + (i//2) % 36
 
-**The vocoder goes from 4 to 10 of 23 layers.** Every 32-channel layer now
-reads, and most 64-channel ones. The remaining failures are a narrower set
-again:
+Each tap starts a fresh chunk instead of packing taps together, which is what
+you would expect when the taps read discontiguous input. The input channels
+chunk inside it exactly as before -- invisible at 64 channels, where
+`Cin/2 = 32` fits in one chunk, and required at 128, where it does not: the
+tap stride is 144 there and 288 here. Everything else, the output-channel
+map, the 36-byte plane gap and the nibble by `i % 2`, is unchanged. Verified
+at 100.000% of codes at both widths.
+
+**The vocoder goes from 4 to 10 of 23 layers** on the first form of this
+rule, and to 14 once the input chunking above is included -- **50.5% of its
+weights** together with the transposed convolutions. The remaining failures
+are a narrower set again:
 
 | still unread | why it is plausible |
 | --- | --- |
 | all three `ConvTranspose` | a layout never probed at all |
 | `conv_pre` (256, 192, 7) | 192 and 256 channels, past anything measured |
 | 128-channel dilated layers | 128 works undilated, so the two rules interact |
-| dilation 6 and 12 at 64 channels | 32 channels handles both, so it interacts with width |
+| large dilated extents at 64 and 128 channels | see below |
 
-That is still only **7.1% of the vocoder's weights**, because the three
-transposed convolutions and `conv_pre` hold most of them. The honest summary
-is that the vocoder's *small* layers are now fully readable and its *large*
-ones are not.
+That was 7.1% of the vocoder's weights, because the three transposed
+convolutions and `conv_pre` hold most of them. The transposed ones are now
+readable too -- see the next section, which takes it to 47.5%.
 
 Test: `test_dilation_changes_the_weight_layout` (Docker, no device), which
 checks both rules against their own builds and that the undilated rule does
@@ -4572,28 +4579,162 @@ each -- which at 512 MACs/cycle demands roughly **3.8 GHz**. Even a generous
 1.5 GHz gives about 1.5 TOPS per core, so the pair can offer perhaps 2 to 3
 TOPS: a useful 20-30% on top of the NPU, not a doubling.
 
-**Where the gap actually is: clock.** The NPU sustains **4,949 MAC/cycle**
-across its three cores (measured, stable across shapes). At that rate,
-18 TOPS requires
+**Where the gap actually is: array utilisation, not clock.** The NPU
+sustains **4,949 MAC/cycle** across its cores, measured and stable across
+shapes.
 
-    18e12 / (2 * 4949) = 1.82 GHz
+The clock no longer has to be guessed. A `profile=True` build writes a
+`trace.json` whose events carry durations, and comparing their span against
+the same build's `max_cycle` gives the toolchain's own conversion:
 
-and the implied clock measured here is **854-949 MHz** -- almost exactly
-half. So the rating is consistent with the same silicon at roughly twice the
-clock this card runs at, and the card idles at 75 C in an M.2 slot. The
-shortfall looks like clock and thermal headroom rather than lost efficiency,
-which also fits the earlier finding that the NPU executes essentially the
-cycle count its own compiler predicts.
+| graph | max_cycle | trace span | nominal |
+| --- | --- | --- | --- |
+| 1024ch 16x16 | 3,905,355 | 3906.3 us | 999.8 MHz |
+| 256ch 64x64 | 3,831,460 | 3832.7 us | 999.7 MHz |
+| 512ch 32x32 | 3,704,778 | 3706.5 us | 999.5 MHz |
 
-That is a hypothesis about *why*, not a measurement: AXCL exposes no NPU
-frequency (`axcl-smi info --npu` reports usage and an engine version, no
-clock), so the 1.82 GHz figure is inferred from the rating and the measured
-MAC rate, not read from the hardware.
+The compiler emits exactly one cycle per nanosecond, so its **nominal NPU
+clock is 1.0 GHz**. Measured against real device time the same builds give
+854 to 949 MHz, so the hardware runs at **85-95% of nominal** -- close to it,
+not at half of something larger.
+
+That settles the arithmetic. At 1.0 GHz, 18 TOPS requires
+
+    18e12 / (2 * 1.0e9) = 9,000 MAC/cycle
+
+and the hardware sustains 4,949, or **55%** of it. The kernel log names
+sixteen execution units (`EU[0]` through `EU[15]`), and 9,000 over 16 is 562
+per unit -- consistent with a 512-MAC unit per EU and a rating that assumes
+the whole array busy.
+
+So the distance to 18 TOPS is how much of the array a real convolution keeps
+fed, not clock and not the DSPs. An earlier draft of this section proposed a
+1.82 GHz rated clock with this card running at half; the trace says
+otherwise and that reading was wrong.
+
+**What is still not directly readable** is the hardware's instantaneous
+frequency: AXCL exposes no NPU clock (`axcl-smi info --npu` gives usage and
+an engine version; `set --freq` sets the *CPU*, offering 1200/1400/1700 MHz),
+the device kernel log prints none, and no `AX_SYS_*` clock getter is exported
+even though `AX_NPU_CLK_ID` exists in the headers. The 1.0 GHz above is the
+compiler's nominal, and the 854-949 MHz is measured effective throughput --
+between them there is no room for a large hidden clock deficit.
 
 **So: using the DSPs is possible but would need firmware written from
 scratch with a toolchain that is not part of this stack, and by the numbers
 it buys a fraction of what the rating implies. The rating's missing factor is
 much better explained by clock.**
+
+### A transposed convolution is several convolutions
+
+The three `ConvTranspose` upsamplers hold most of the vocoder's weights and
+none of them read. They are not stored in a layout of their own.
+
+**Unstrided, it is the ordinary conv layout with two adjustments.** ONNX
+orders a `ConvTranspose` weight `(Cin, Cout, K)` rather than
+`(Cout, Cin, K)`, and dimension 0 behaves as the *input* channel exactly as
+`i` does for a convolution -- weights `(0,0,0)` and `(1,0,0)` land in the
+same byte, different nibbles. The taps are then stored **reversed**: with
+`K = 4` at 32 channels, `k = 3` sits at byte 0, `k = 2` at 16, `k = 1` at 32
+and `k = 0` at 156, which is slot 48 chunked at 36 into `144 + 12`. Reading
+`(Cout, Cin, K)` with `k' = K-1-k` reproduces every code.
+
+**Strided, it is split into `stride` separate convolutions.** At stride 2 the
+taps do not stay together: `k = 0` and `k = 2` land 16 bytes apart while
+`k = 1` sits in an entirely different region. That is polyphase
+decomposition -- a stride-`s` transposed convolution compiled as `s` ordinary
+convolutions of `K/s` taps each, which is the standard way to implement one.
+
+**All twenty phases of the vocoder's three upsamplers locate**, at 0.9997 to
+0.9999:
+
+| layer | stride | phases | located |
+| --- | --- | --- | --- |
+| `(256, 128, 16)` | 8 | 8 x 2 taps | 8/8 |
+| `(128, 64, 16)` | 8 | 8 x 2 taps | 8/8 |
+| `(64, 32, 8)` | 4 | 4 x 2 taps | 4/4 |
+
+**The vocoder goes from 10 to 13 of 23 layers, and from 7.1% to 47.5% of its
+weights.** Three layers carried forty points of coverage, which is what
+happens when the unread ones are the big ones.
+
+What remains is `conv_pre` at 192 input channels, and the dilated layers at
+128 channels and at dilations 6 and 12 -- the same width-and-dilation
+interaction noted before, now the only thing between here and a fully read
+vocoder.
+
+Test: `test_convtranspose_stores_taps_reversed_in_the_conv_layout` (Docker,
+no device), which checks every code and that dropping the reversal breaks it.
+
+### The LLM path's weight encoding
+
+Everything decoded so far is `pulsar2 build` output. `llm_build` is a
+different compiler entry point, and its weight tables had never been looked
+at -- coverage there was zero. They are not a different format.
+
+**The tell is the zero weight.** In the two-nibble-plane INT8 encoding an
+all-zero weight reads `0x00` in the low plane and `0x88` in the high one, so
+a real plane gap makes `0x00` at some offset predict `0x88` a fixed distance
+later. Scanning gaps 1 to 64 over a layer's `npu_params`:
+
+| model | best gap | P(`0x88` at j+gap given `0x00` at j) | lift |
+| --- | --- | --- | --- |
+| synthetic 4096-hidden, `s8` | **18** | 0.52 | **12.3x** |
+| SmolLM2-135M, `s8` | **18** | 0.21 | **7.9x** |
+| synthetic 4096-hidden, `s4` | 64 | 0.005 | 0.06x |
+
+So `llm_build` uses **the same two-nibble-plane INT8 encoding, with the
+planes 18 bytes apart** rather than the convolution pipeline's 36 -- half the
+plane, and the same idea. Two independent models agree on 18, with 17 and 19
+as shoulders, so the fine structure may not be a single fixed stride.
+
+**The `s4` build is what makes this an encoding claim rather than a
+coincidence.** Four-bit weights need only one nibble, so there is no second
+plane to pair with, and indeed no gap anywhere from 1 to 64 shows any lift at
+all -- the best is 0.06x, i.e. *less* than chance. The pairing appears
+exactly when the format says it should and vanishes exactly when it should.
+
+Table sizes agree independently: 192,889,348 bytes for a layer of about
+177.2M parameters is 1.09 bytes per parameter at `s8`, and the `s4` build of
+the same layer is 97,952,260 -- almost exactly half.
+
+That takes the LLM path from nothing to a known weight encoding. What is not
+yet known there is the addressing: which byte holds which weight. The
+convolution work needed single-weight probes for that, and `llm_build` takes
+a checkpoint rather than a graph, so the same trick needs a synthetic
+checkpoint per probe -- slower, but no different in kind.
+
+Test: `test_llm_build_weights_use_the_same_nibble_planes_at_half_the_gap`
+(Docker, no device), which checks the peak at 18, that it beats the
+convolution pipeline's 36, and that `s4` shows nothing.
+
+### What is left in the vocoder, stated precisely
+
+At **14 of 23 layers and 50.5% of weights**, the failures are no longer a
+grab bag. Sorting them by the dilated kernel extent `d*(K-1)+1` makes the
+boundary visible:
+
+| layer | extent | reads |
+| --- | --- | --- |
+| `(32,32,5)` d=6 | 25 | yes |
+| `(32,32,7)` d=3 | 19 | yes |
+| `(64,64,5)` d=2 | 9 | yes |
+| `(64,64,7)` d=3 | 19 | **no** |
+| `(64,64,5)` d=6 | 25 | **no** |
+| `(32,32,7)` d=12 | 73 | **no** |
+| all `(128,128,*)` with K>3 | 9 to 73 | **no** |
+
+An extent of 25 reads at 32 channels and not at 64; an extent of 19 reads at
+32 and not at 64. So the limit is not the extent alone and not the width
+alone, but their product against some tile -- the same shape of interaction
+the polyphase finding turned out to be.
+
+That suggests the likely answer: a convolution whose dilated footprint
+outgrows the input tile is **decomposed**, exactly as a strided transposed
+convolution is decomposed into phases. If so, the remaining layers are not a
+new layout at all, only the existing one applied to sub-convolutions, and the
+probe that settles it is the one that settled `ConvTranspose` -- flip a
+single weight and see how many separate regions move.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 

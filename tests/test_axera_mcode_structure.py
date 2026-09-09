@@ -4763,6 +4763,71 @@ def test_int8_throughput_reaches_a_useful_fraction_of_the_rating(tmp_path):
     assert tops > 5.0, (tops, stats)
 
 
+def _plane_pairing_lift(wbt, gap, limit=4_000_000):
+    """How much more often a zero low-nibble byte is followed `gap` bytes
+    later by `0x88`, relative to how often `0x88` occurs at all.
+
+    In the two-nibble-plane INT8 encoding an all-zero weight reads `0x00` in
+    the low plane and `0x88` in the high one, so a real plane gap shows a
+    large lift and a wrong one shows about 1.0.
+    """
+    seg = np.frombuffer(wbt[: min(len(wbt), limit)], dtype=np.uint8)
+    base = float((seg == 0x88).mean())
+    if base == 0:
+        return 0.0
+    zeros = np.nonzero(seg[: len(seg) - gap] == 0x00)[0]
+    if len(zeros) < 1000:
+        return 0.0
+    return float((seg[zeros + gap] == 0x88).mean()) / base
+
+
+def test_llm_build_weights_use_the_same_nibble_planes_at_half_the_gap(tmp_path):
+    """Confirmed real (see the README's "The LLM path's weight encoding"
+    section): `llm_build` stores INT8 weights in the same two-nibble-plane
+    form the convolution pipeline uses, but with the planes **18** bytes
+    apart rather than 36.
+
+    The `s4` build is the control that makes this an encoding claim rather
+    than a coincidence: four-bit weights need only one nibble, so they show
+    no pairing at any gap. Needs Docker, no device.
+    """
+    ckpt = _cached_hf_checkpoint("HuggingFaceTB/SmolLM2-135M")
+    if ckpt is None:
+        pytest.skip("HuggingFaceTB/SmolLM2-135M is not in the local HuggingFace cache")
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(ckpt, work / "SmolLM2-135M", symlinks=False)
+
+    lifts = {}
+    for weight_type in ("s8", "s4"):
+        result = pulsar2_docker.llm_build(
+            str(work),
+            "SmolLM2-135M",
+            f"out_{weight_type}",
+            weight_type=weight_type,
+            prefill_len=512,
+            kv_cache_len=1023,
+            parallel=8,
+        )
+        assert result.success, (weight_type, getattr(result, "error", None))
+        layer = sorted(glob.glob(str(work / f"out_{weight_type}" / "*_l0_*.axmodel")))
+        assert layer, weight_type
+        wbt = bytes(
+            next(
+                i
+                for i in onnx.load(layer[0]).graph.initializer
+                if i.name == "npu_params"
+            ).raw_data
+        )
+        lifts[weight_type] = {g: _plane_pairing_lift(wbt, g) for g in (17, 18, 19, 36)}
+
+    # s8: a clear peak at 18, and *not* at the convolution pipeline's 36.
+    assert lifts["s8"][18] > 4.0, lifts["s8"]
+    assert lifts["s8"][18] > lifts["s8"][36], lifts["s8"]
+    # s4: four-bit weights occupy one nibble, so nothing pairs anywhere.
+    assert max(lifts["s4"].values()) < 2.0, lifts["s4"]
+
+
 def test_llm_build_offers_an_int4_weight_path_the_cnn_path_lacks(tmp_path):
     """Confirmed real (see the README's "Where the INT4 path actually is"
     section): `pulsar2 llm_build` accepts `-w s4`, and the resulting model is
@@ -4928,6 +4993,76 @@ def _weight1d_offset_wide(o, i, k, cin, cout, kernel, top):
         + 144 * (slot // 36)
         + (slot % 36)
     ), (4 if i % 2 else 0)
+
+
+def _one_convtranspose_model(cin, cout, length, kernel, stride, weights=None):
+    """A 1-D transposed convolution. ONNX orders its weight `(Cin, Cout, K)`,
+    the opposite of `Conv`."""
+    rng = np.random.RandomState(0)
+    values = (rng.randn(cin, cout, kernel) * 0.05) if weights is None else weights
+    weight = numpy_helper.from_array(np.asarray(values, dtype=np.float32), "w")
+    node = helper.make_node(
+        "ConvTranspose",
+        ["x", "w"],
+        ["y"],
+        name="convt",
+        kernel_shape=[kernel],
+        strides=[stride],
+        pads=[(kernel - stride) // 2] * 2,
+    )
+    graph = helper.make_graph(
+        [node],
+        "one_convt",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, cin, length])],
+        [
+            helper.make_tensor_value_info(
+                "y", TensorProto.FLOAT, [1, cout, length * stride]
+            )
+        ],
+        [weight],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_convtranspose_stores_taps_reversed_in_the_conv_layout(tmp_path):
+    """Confirmed real (see the README's "A transposed convolution is several
+    convolutions" section): an unstrided `ConvTranspose` uses the *ordinary*
+    convolution weight layout, with two adjustments -- ONNX's `(Cin, Cout, K)`
+    weight maps straight on (dimension 0 behaves as input channels), and the
+    kernel taps are stored **reversed**.
+
+    Getting the reversal wrong is not obvious from a correlation, so this
+    checks every code. Needs Docker, no device.
+    """
+    cin = cout = 32
+    kernel, length = 4, 32
+    rng = np.random.RandomState(5)
+    weights = rng.randn(cin, cout, kernel) * 0.05
+    for i in range(cin):
+        weights[i] *= 0.2 / np.abs(weights[i]).max()
+    weights = weights.astype(np.float32)
+
+    work = tmp_path / "s1"
+    work.mkdir()
+    model = _one_convtranspose_model(cin, cout, length, kernel, 1, weights=weights)
+    wbt = _wbt_of(_build_single_op_axmodel(str(work), "m", model))
+
+    # (Cin, Cout, K) -> the conv layout's (o, i, k), taps reversed.
+    as_conv = np.swapaxes(weights, 0, 1)[:, :, ::-1].copy()
+    got = np.zeros(as_conv.shape, dtype=int)
+    for o in range(cout):
+        for i in range(cin):
+            for k in range(kernel):
+                off, shift = _weight_offset(o, i, k, cin, cout, kernel)
+                got[o, i, k] = (((wbt[off + _WBT_PLANE_GAP] >> shift) & 0xF) << 4) | (
+                    (wbt[off] >> shift) & 0xF
+                )
+    assert (got == _quantize_conv_weights(as_conv)).all()
+    # Without the reversal it does not read.
+    assert not (got == _quantize_conv_weights(np.swapaxes(weights, 0, 1))).all()
 
 
 def test_dilation_changes_the_weight_layout(tmp_path):
