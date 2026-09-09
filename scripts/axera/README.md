@@ -5273,6 +5273,77 @@ slots that move between builds hold allocator output. An interpreter that
 produced numbers would be inventing them. `check` answers the question that
 can be answered honestly: could the runtime load and walk this?
 
+## Per-ONNX-op coverage, and what it caught
+
+`op_coverage.py` classifies every operator in the ai.onnx default domain
+against Axera's published support list, and counts a model's nodes by whether
+the NPU can take them. Neither needs Docker or a card.
+
+| classification | ops | share of ai.onnx |
+| --- | --- | --- |
+| NPU-eligible | 83 | 41.1% |
+| confirmed broken on real hardware | 6 | 3.0% |
+| CPU-only by construction | 21 | 10.4% |
+| not on the vendor's list | 92 | 45.5% |
+
+**The audit paid for itself immediately.** Axera's list spells the op `Topk`;
+ONNX's operator is `TopK`. A list entry that is not a real ONNX op name can
+never match a node, so every `TopK` in every graph was being classified
+unsupported -- while the real-hardware op sweep had *already built a `TopK`
+node successfully*. It was a misclassification, not a missing capability, and
+nothing downstream could have noticed: the heuristic and the sweep never
+compared notes. Both spellings are now in the list, and a test asserts that the
+only entries which are not ai.onnx names are the vendor's own fused ops
+(`InverseSigmoid`, `Silu`, `SpatialTransformer`), named explicitly.
+
+That is the general hazard with a scraped support list, and it is worth
+stating: **an entry that matches nothing fails silently and in the safe
+direction**, so it shows up as a model being less compatible than it is,
+never as an error.
+
+### Audio8: which parts could run on an AX650, measured
+
+The Audio8 TTS/ASR packages (`tests/test_audio8.py`) are a useful test of that
+table against real, awkward graphs -- ORT deployment exports full of
+`com.microsoft` contrib ops, INT4 weight-only quantization and KV caches.
+Counting their nodes, without downloading their weights:
+
+| graph | nodes | NPU-eligible |
+| --- | --- | --- |
+| `codec_decoder_fp16` (TTS vocoder) | 3,341 | 94.0% |
+| `codec_encoder_fp16` | 4,916 | 93.7% |
+| `slow_ar_int8` | 16,426 | 91.8% |
+| `fast_ar_int8` | 1,116 | 91.5% |
+| `lm_cache_decode_int4` | 943 | 92.3% |
+| `llm_kv_cpu_fp32_int4` | 6,651 | 89.5% |
+| `genai_int4_qwen/model` | 299 | 34.8% |
+
+61 distinct op types across all of them, 47 NPU-eligible. The 14 that are not
+fall into three groups, and the distinction matters more than the percentage:
+
+* **`com.microsoft` contrib ops** -- `MatMulNBits` (546 nodes),
+  `SkipSimplifiedLayerNormalization`, `GroupQueryAttention`,
+  `GatherBlockQuantized`. These are ONNX Runtime's own, with no ai.onnx
+  equivalent in the graph. Pulsar2 will not take them, and no simplification
+  turns them back into standard ops.
+* **ORT dynamic-quantization plumbing** -- `MatMulInteger` (240),
+  `DynamicQuantizeLinear` (140), `DequantizeLinear`. Not a real obstacle so
+  much as the wrong starting point: the NPU quantizes for itself, so the
+  float export is what to feed it.
+* **Ordinary ONNX ops the list lacks** -- and `Shape` alone is 2,293 nodes,
+  with `Range`, `Neg`, `Reciprocal`, `Trilu`, `Einsum` behind it. Shape
+  arithmetic is exactly what constant-folding removes once the input shapes
+  are fixed, which is onnxsim's own job.
+
+So the honest read is not one verdict but three. The **codec decoder is the
+promising target**: it is a convolutional vocoder at 94% eligible, the same
+shape of model as the Piper decoder this project already compiled and ran on
+an AX650N to produce audible speech. The **autoregressive halves are not an
+ONNX problem at all** -- they are transformer decoders, and Axera compiles
+those from a checkpoint through `llm_build`, never from an ONNX export. And
+the **`com.microsoft` INT4 exports are a dead end** for this toolchain in the
+form they ship.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
