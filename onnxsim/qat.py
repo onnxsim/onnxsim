@@ -1309,9 +1309,11 @@ def _build_step_graph(
     # Block tensor name -> what the block's own node should read instead.
     # Only ``fake_quant=False`` puts anything here: the master weight is
     # substituted for the weight initializer by *renaming one input*, rather
-    # than by emitting an Identity, because ``Identity`` is not in
-    # EP_FRIENDLY_OPS -- a node whose whole job is to copy a tensor is a node
-    # an execution provider would have to implement for no reason.
+    # than by emitting an Identity -- a node whose whole job is to copy a
+    # tensor is a node worth avoiding even though ``Identity`` is, as of
+    # :mod:`onnxsim.graph_grad`'s templated "Add" rule, in EP_FRIENDLY_OPS:
+    # renaming costs the execution provider nothing at all, where even an
+    # allowlisted no-op node still costs a dispatch.
     weight_rewrites: Dict[str, str] = {}
     weight_shapes: Dict[str, Sequence[int]] = {}
     for t in trained:

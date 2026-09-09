@@ -108,10 +108,16 @@ static_assert(static_cast<float>(kBeta2Double) == kAdamBeta2,
 }  // namespace
 
 const std::set<std::string>& EpFriendlyOps() {
+  // Identity was admitted for graph_grad.cpp's templated "Add" rule
+  // (BackwardOps() there explains in full why a checked-in ONNX
+  // FunctionProto -- unlike a hand-written rule -- cannot express a pure
+  // alias without an actual node). Not a coverage gap: Identity is a plain
+  // copy with no arithmetic at all.
   static const std::set<std::string> kOps = {
-      "Abs",        "Add",       "Cast",    "Clip", "Div",  "Exp", "Gather",
-      "Greater",    "Less",      "MatMul",  "Mul",  "Neg",  "Pow", "Reshape",
-      "ReduceMean", "ReduceSum", "Sigmoid", "Sign", "Sqrt", "Sub", "Transpose"};
+      "Abs",    "Add",     "Cast",     "Clip",       "Div",       "Exp",
+      "Gather", "Greater", "Identity", "Less",       "MatMul",    "Mul",
+      "Neg",    "Pow",     "Reshape",  "ReduceMean", "ReduceSum", "Sigmoid",
+      "Sign",   "Sqrt",    "Sub",      "Transpose"};
   return kOps;
 }
 

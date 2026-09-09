@@ -19,6 +19,7 @@ import types
 
 import numpy as np
 import onnx
+import onnx.inliner
 import onnx.numpy_helper
 import pytest
 from onnx import parser
@@ -263,11 +264,21 @@ def test_train_lora_gradient_matches_torch_autograd():
         ],
         initializer=list(injected.graph.initializer) + list(b.initializer),
     )
+    # The base MatMul's own residual Add (`Y = base + lora_branch * alpha`)
+    # goes through graph_grad._RULES's templated "Add" rule -- a call to the
+    # checked-in GradAdd FunctionProto, not plain ops -- so b.functions has to
+    # be attached and every call site inlined before this is a plain graph a
+    # runtime can execute, exactly as qat_graph.make_step_graph does for a
+    # real step graph.
+    opset_imports = [onnx.helper.make_opsetid("", 17)]
+    opset_imports += [onnx.helper.make_opsetid(fn.domain, 1) for fn in b.functions]
     backward_model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+        graph, functions=list(b.functions), opset_imports=opset_imports
     )
     backward_model.ir_version = 8
     onnx.checker.check_model(backward_model)
+    if b.functions:
+        backward_model = onnx.inliner.inline_local_functions(backward_model)
     da, db = _run(backward_model, {"X": x, "dY": seed}, outputs)
 
     tx = torch.tensor(x)

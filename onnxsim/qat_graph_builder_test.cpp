@@ -268,10 +268,11 @@ void EveryOpAnyBuilderMethodEmitsIsEpFriendly() {
 // only pins that the C++ copy says the same thing.
 void EpFriendlyOpsHasExactlyThePythonSetsMembers() {
   const std::set<std::string> expected = {
-      "Abs",       "Add",     "Cast",    "Clip", "Div",  "Exp", "Gather",
-      "Greater",   "Less",    "MatMul",  "Mul",  "Neg",  "Pow", "ReduceMean",
-      "ReduceSum", "Reshape", "Sigmoid", "Sign", "Sqrt", "Sub", "Transpose"};
-  CheckEqual(expected.size(), size_t{21}, "the Python set has 21 members");
+      "Abs",    "Add",     "Cast",     "Clip",       "Div",       "Exp",
+      "Gather", "Greater", "Identity", "Less",       "MatMul",    "Mul",
+      "Neg",    "Pow",     "Reshape",  "ReduceMean", "ReduceSum", "Sigmoid",
+      "Sign",   "Sqrt",    "Sub",      "Transpose"};
+  CheckEqual(expected.size(), size_t{22}, "the Python set has 22 members");
   Check(EpFriendlyOps() == expected, "EpFriendlyOps() equals EP_FRIENDLY_OPS");
   Check(EpFriendlyOps().count("Round") == 0,
         "Round stays out of EpFriendlyOps");

@@ -1405,10 +1405,12 @@ QatStepPlan BuildQatStepGraph(const onnx::ModelProto& float_model,
   std::vector<PerLayer> per_layer;
   // Block tensor name -> what the block's own node should read instead. Only
   // fake_quant=false puts anything here: the master weight is substituted for
-  // the weight initializer by *renaming one input*, rather than by emitting an
-  // Identity, because Identity is not in EpFriendlyOps -- a node whose whole
-  // job is to copy a tensor is a node an execution provider would have to
-  // implement for no reason.
+  // the weight initializer by *renaming one input*, rather than by emitting
+  // an Identity -- a node whose whole job is to copy a tensor is a node
+  // worth avoiding even though Identity is, as of graph_grad.cpp's templated
+  // "Add" rule, in EpFriendlyOps: renaming costs the execution provider
+  // nothing at all, where even an allowlisted no-op node still costs a
+  // dispatch.
   std::map<std::string, std::string> weight_rewrites;
   ShapeMap weight_shapes;
   for (Trained& t : trained) {

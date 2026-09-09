@@ -1,14 +1,18 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Exercises graph_grad.cpp's "Templated rules (proof of concept)" section:
+ * Exercises graph_grad.cpp's "Templated rules" section:
  * GradAddTemplated/GradBatchNormalizationTemplated, which call into the
  * checked-in onnxscript-compiled FunctionProto templates
  * (graph_grad_templates_gen.h) via GraphBuilder::Call and
  * onnx::inliner::InlineLocalFunctions (run by MakeStepGraph once a builder
  * has accumulated functions) instead of hand-emitting their nodes directly.
- * See graph_grad.py's matching section,
- * scripts/codegen/generate_grad_templates.py, and
+ * Rules() now uses these for "Add"/"BatchNormalization" in production;
+ * GradAdd/GradBatchNormalization (the original hand-written rules) remain as
+ * a reference implementation, reachable here via
+ * BuildBackwardWithHandWrittenRules, purely so the second test below keeps
+ * an independent structural cross-check. See graph_grad.py's matching
+ * section, scripts/codegen/generate_grad_templates.py, and
  * tests/test_graph_grad_templates.py for the Python side.
  *
  * Numeric validation is not duplicated here, for the reason graph_grad_test.cpp
@@ -180,7 +184,8 @@ void TheBatchNormTemplateInlinesToAnAllowlistedGraph() {
 
   GraphBuilder hand;
   const std::map<std::string, std::string> hand_grads =
-      BuildBackward(hand, nodes, shapes, {{"Y", "dY"}}, targets);
+      BuildBackwardWithHandWrittenRules(hand, nodes, shapes, {{"Y", "dY"}},
+                                        targets);
 
   GraphBuilder templated;
   const std::map<std::string, std::string> templated_grads =

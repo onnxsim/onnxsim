@@ -111,17 +111,33 @@ std::map<std::string, std::string> BuildBackward(
     const std::map<std::string, std::string>& grad_outputs,
     const std::vector<std::string>& targets);
 
-// Proof of concept only (see graph_grad.py's "Templated rules" section for
-// the Python original, and graph_grad_templates_gen.h for what's checked
-// in). Same as BuildBackward, except the Add/BatchNormalization rules call
-// into the checked-in onnxscript-compiled FunctionProto templates via
+// Same as BuildBackward, with the Add/BatchNormalization rules forced to
+// call into the checked-in onnxscript-compiled FunctionProto templates via
 // GraphBuilder::Call + onnx::inliner::InlineLocalFunctions (run by
 // MakeStepGraph once the whole step graph is assembled) instead of
-// hand-emitting their nodes directly. Not called by BuildBackward or Rules()
-// -- exists so graph_grad_templates_test.cpp can prove the C++ side of the
-// mechanism works, exactly like tests/test_graph_grad_templates.py does for
-// Python.
+// hand-emitting their nodes directly -- see graph_grad.py's "Templated
+// rules" section for the Python original, and graph_grad_templates_gen.h for
+// what's checked in. Rules() itself now uses these same templated rules for
+// "Add"/"BatchNormalization" (see graph_grad.cpp), so this is functionally
+// identical to plain BuildBackward today; it is kept as an explicit,
+// self-documenting entry point so graph_grad_templates_test.cpp keeps
+// exercising the templated path by name even if Rules() ever changes,
+// exactly like tests/test_graph_grad_templates.py does for Python.
 std::map<std::string, std::string> BuildBackwardWithTemplatedRules(
+    GraphBuilder& b, const std::vector<onnx::NodeProto>& nodes,
+    const std::map<std::string, std::vector<int64_t>>& shapes,
+    const std::map<std::string, std::string>& grad_outputs,
+    const std::vector<std::string>& targets);
+
+// The mirror image of BuildBackwardWithTemplatedRules: Add/BatchNormalization
+// forced to the original hand-written GradAdd/GradBatchNormalization, which
+// Rules() no longer uses directly. Exists purely so
+// graph_grad_templates_test.cpp has an independent reference implementation
+// to structurally cross-check the templated rules against -- losing that
+// cross-check would lose exactly the kind of regression test that caught
+// this repo's own dvar-derivation bug in the hand-written
+// GradBatchNormalization in the first place.
+std::map<std::string, std::string> BuildBackwardWithHandWrittenRules(
     GraphBuilder& b, const std::vector<onnx::NodeProto>& nodes,
     const std::map<std::string, std::vector<int64_t>>& shapes,
     const std::map<std::string, std::string>& grad_outputs,

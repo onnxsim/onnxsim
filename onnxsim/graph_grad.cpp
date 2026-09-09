@@ -1025,6 +1025,12 @@ std::vector<OptStr> GradMaxPool(Backward& ctx, const onnx::NodeProto& node,
   return {dx};
 }
 
+// Reference-only: Rules() wires "Add" to GradAddTemplated below instead of
+// this. Kept, and still exercised by graph_grad_templates_test.cpp and
+// tests/test_graph_grad_templates.py, as an independent hand-written
+// implementation to cross-check the templated one against -- the same
+// reasoning as GradBatchNormalization below, whose own hand-written bug is
+// why that cross-check exists at all.
 std::vector<OptStr> GradAdd(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   const Shape out = ctx.ShapeOf(node.output(0));
@@ -1403,6 +1409,14 @@ std::vector<OptStr> GradLayerNormalization(Backward& ctx,
   return grads;
 }
 
+// Reference-only: Rules() wires "BatchNormalization" to
+// GradBatchNormalizationTemplated below instead of this. Kept, and still
+// exercised by graph_grad_templates_test.cpp and
+// tests/test_graph_grad_templates.py, as an independent hand-written
+// implementation to cross-check the templated one against -- this is the
+// rule whose own hand-written dvar-derivation bug motivated the templated
+// design in the first place, so losing this cross-check would be losing
+// exactly the regression test that would have caught it.
 std::vector<OptStr> GradBatchNormalization(Backward& ctx,
                                            const onnx::NodeProto& node,
                                            const std::string& g) {
@@ -1699,7 +1713,7 @@ std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
 }
 
 // ---------------------------------------------------------------------------
-// Templated rules (proof of concept)
+// Templated rules
 // ---------------------------------------------------------------------------
 //
 // An alternative to hand-transcribing a rule's graph construction directly
@@ -1712,11 +1726,15 @@ std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
 // rationale (in particular why these functions take no ONNX-level
 // attributes).
 //
-// Not wired into Rules(): these two functions exist to prove the mechanism
-// (see graph_grad_templates_test.cpp, which cross-checks
-// GradBatchNormalizationTemplated against the hand-written
-// GradBatchNormalization above) before any production rule is migrated to
-// it. Every real caller of BuildBackward still gets Rules() unchanged.
+// Wired into Rules() below for "Add" and "BatchNormalization": these were a
+// proof of concept (see graph_grad_templates_test.cpp, which cross-checks
+// GradBatchNormalizationTemplated's structure against the hand-written
+// GradBatchNormalization above, and tests/test_graph_grad_templates.py,
+// which cross-checks its numbers) before graduating to production.
+// GradAdd/GradBatchNormalization above are no longer reachable through
+// Rules(), but are kept as an independent reference implementation --
+// BuildBackwardWithHandWrittenRules below exists specifically so
+// graph_grad_templates_test.cpp keeps that cross-check.
 
 const onnx::FunctionProto& GradAddTemplate() {
   static const onnx::FunctionProto* fn = [] {
@@ -1822,9 +1840,9 @@ std::vector<OptStr> GradBatchNormalizationTemplated(Backward& ctx,
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
-          {"Add", &GradAdd},
+          {"Add", &GradAddTemplated},
           {"AveragePool", &GradAveragePool},
-          {"BatchNormalization", &GradBatchNormalization},
+          {"BatchNormalization", &GradBatchNormalizationTemplated},
           {"Clip", &GradClip},
           {"Conv", &GradConv},
           {"Div", &GradDiv},
@@ -1969,10 +1987,20 @@ const std::set<std::string>& BackwardOps() {
   // GradBatchNormalization and GradInstanceNormalization needed nothing from
   // this set at all -- every op their gradients use was already here for
   // GradLayerNormalization or the elementwise rules.
+  // Identity was admitted for GradAddTemplated. A hand-written rule that is a
+  // pure alias emits no node at all (GradIdentity below just returns g), but
+  // the checked-in GradAdd FunctionProto's identity case (da = db = g) is
+  // compiled by onnxscript, which can only produce a declared output via an
+  // actual node -- even one whose whole job is to copy its input. Not a
+  // coverage gap: Identity is a plain copy with no arithmetic at all, about
+  // the least a WebGPU/WebNN/NPU execution provider could fail to implement;
+  // qat_entry.cpp's own preference for renaming a tensor over emitting an
+  // Identity for it (see its comment where that happens) was about avoiding
+  // a needless node, not about Identity lacking backend support.
   static const std::set<std::string>* ops = new std::set<std::string>{
-      "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
-      "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
-      "Reshape", "Sqrt",   "Sub", "Transpose"};
+      "Add",       "Cast",    "Div",    "Exp", "Gather",   "Greater",
+      "Identity",  "Less",    "MatMul", "Mul", "Neg",      "ReduceMean",
+      "ReduceSum", "Reshape", "Sqrt",   "Sub", "Transpose"};
   return *ops;
 }
 
@@ -2001,5 +2029,16 @@ std::map<std::string, std::string> BuildBackwardWithTemplatedRules(
   std::map<std::string, Rule> rules(Rules());
   rules["Add"] = &GradAddTemplated;
   rules["BatchNormalization"] = &GradBatchNormalizationTemplated;
+  return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);
+}
+
+std::map<std::string, std::string> BuildBackwardWithHandWrittenRules(
+    GraphBuilder& b, const std::vector<onnx::NodeProto>& nodes,
+    const std::map<std::string, std::vector<int64_t>>& shapes,
+    const std::map<std::string, std::string>& grad_outputs,
+    const std::vector<std::string>& targets) {
+  std::map<std::string, Rule> rules(Rules());
+  rules["Add"] = &GradAdd;
+  rules["BatchNormalization"] = &GradBatchNormalization;
   return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);
 }

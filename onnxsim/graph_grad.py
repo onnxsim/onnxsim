@@ -85,6 +85,7 @@ BACKWARD_OPS = frozenset(
         "Exp",
         "Gather",
         "Greater",
+        "Identity",
         "Less",
         "MatMul",
         "Mul",
@@ -125,6 +126,20 @@ BACKWARD_OPS = frozenset(
 # elementwise rules. Worth recording precisely because it is the exception to
 # every other note in this block, which each admitted one specific op for one
 # specific rule.
+
+# ``Identity`` was admitted for :func:`_grad_add_templated`. A hand-written
+# rule that is a pure alias never emits a node at all (see
+# :func:`_grad_identity`'s own "an alias, not a node" comment) -- it just
+# returns an existing tensor's name -- but a *templated* rule's identity case
+# (``GradAdd``'s ``da = db = g``, see
+# scripts/codegen/generate_grad_templates.py) is compiled to an ONNX
+# ``FunctionProto``, whose declared outputs onnxscript can only produce via an
+# actual node, even when that node's whole job is to copy its input. Not a
+# coverage gap: ``Identity`` is a plain copy with no arithmetic of its own --
+# about the least a WebGPU/WebNN/NPU execution provider could fail to implement --
+# and qat_entry.cpp's own choice to route around it elsewhere (renaming a
+# tensor instead of emitting an ``Identity`` for it) was about avoiding a
+# needless node, not about ``Identity`` lacking backend support.
 
 
 class UnsupportedOpError(ValueError):
@@ -1060,6 +1075,12 @@ def _grad_maxpool(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
     return [dx]
 
 
+# Reference-only: :data:`_RULES` wires "Add" to the templated
+# `_grad_add_templated` below instead of this. Kept, and still exercised by
+# tests/test_graph_grad_templates.py, as an independent hand-written
+# implementation to cross-check the templated one's numbers against -- the
+# same reasoning as `_grad_batch_normalization` below, whose own hand-written
+# bug is why that cross-check exists at all.
 def _grad_add(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     out = ctx.shape(node.output[0])
     return [
@@ -1338,6 +1359,14 @@ def _grad_layer_normalization(
     return grads
 
 
+# Reference-only: :data:`_RULES` wires "BatchNormalization" to the templated
+# `_grad_batch_normalization_templated` below instead of this. Kept, and
+# still exercised by tests/test_graph_grad_templates.py, as an independent
+# hand-written implementation to cross-check the templated one's numbers
+# against -- this is the rule whose own hand-written dvar-derivation bug
+# motivated the templated design in the first place, so losing this
+# cross-check would be losing exactly the regression test that would have
+# caught it.
 def _grad_batch_normalization(
     ctx: _Backward, node: onnx.NodeProto, g: str
 ) -> List[Optional[str]]:
@@ -1667,10 +1696,114 @@ def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
     return [ddata, None]
 
 
+# --- Templated rules ---------------------------------------------------
+#
+# An alternative to hand-transcribing a rule's graph construction directly in
+# Python (and, separately, a second time in graph_grad.cpp): author the rule
+# once in onnxscript, compile it offline to a checked-in ONNX FunctionProto
+# (scripts/codegen/generate_grad_templates.py ->
+# onnxsim.graph_grad_templates_gen), and instantiate the same text from
+# either language via ONNX's own function-inlining machinery. onnxscript
+# itself is never imported here -- only onnx.parser, already a base
+# dependency, to read the checked-in text back into a FunctionProto.
+#
+# Wired into :data:`_RULES` below for "Add" and "BatchNormalization" -- these
+# were a proof of concept (see tests/test_graph_grad_templates.py, which
+# checks GradBatchNormalization against torch.autograd) before graduating to
+# production. `_grad_add`/`_grad_batch_normalization` above are no longer
+# reachable through :data:`_RULES`, but are kept, deliberately, as an
+# independent reference implementation: tests/test_graph_grad_templates.py
+# still cross-checks the templated rule's numbers against them on the same
+# inputs, which is exactly the kind of regression check that caught this
+# repo's own dvar-derivation bug in the first place and would otherwise be
+# lost by deleting the hand-written code.
+
+
+@functools.lru_cache(maxsize=None)
+def _load_template(text: str) -> onnx.FunctionProto:
+    return onnx.parser.parse_function(text)
+
+
+def _grad_add_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Same shape as :func:`_grad_add`, but the identity-gradient core
+    (``da = db = g``) comes from a call to the checked-in ``GradAdd``
+    function instead of being written here directly. Broadcast-undoing
+    stays outside the template, exactly as it does for the hand-written
+    rule -- see graph_grad_templates_gen's module docstring for why."""
+    fn = _load_template(_templates.GRAD_ADD)
+    da, db = ctx.b.call(fn, [g])
+    out = ctx.shape(node.output[0])
+    return [
+        ctx.reduce_to(da, out, ctx.shape(node.input[0])),
+        ctx.reduce_to(db, out, ctx.shape(node.input[1])),
+    ]
+
+
+def _grad_batch_normalization_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Same validation and shape-resolution as
+    :func:`_grad_batch_normalization` (rank/shape checks, the per-channel
+    broadcast reshape, the reduction axes), but the actual gradient
+    arithmetic comes from a call to the checked-in
+    ``GradBatchNormalization`` function -- the rule this repo's own
+    dvar-derivation bug was in, so the one most worth proving out this way
+    first."""
+    x = node.input[0]
+    scale, bias = node.input[1], node.input[2]
+    mean, var = node.input[3], node.input[4]
+    name = node.output[0]
+    x_shape = ctx.shape(x)
+    rank = len(x_shape)
+    if rank < 2:
+        raise UnsupportedOpError(
+            f"BatchNormalization needs a batch and a channel axis, got "
+            f"input shape {x_shape} (node {name!r})"
+        )
+    channels = int(x_shape[1])
+    for label, tensor in (
+        ("scale", scale),
+        ("B", bias),
+        ("mean", mean),
+        ("var", var),
+    ):
+        shape = ctx.shape(tensor)
+        if tuple(shape) != (channels,):
+            raise UnsupportedOpError(
+                f"BatchNormalization's {label} has shape {tuple(shape)}, not "
+                f"({channels},) (node {name!r})"
+            )
+    eps = float(_attr(node, "epsilon", 1e-5))
+    bshape = (1, channels) + (1,) * (rank - 2)
+
+    def bcast(t: str) -> str:
+        return ctx.b.op("Reshape", [t, ctx.int64_const(bshape, "shape")])
+
+    channel_axes = ctx.int64_const([0] + list(range(2, rank)), "axes")
+    fn = _load_template(_templates.GRAD_BATCH_NORMALIZATION)
+    dx, dscale, dbias, dmean, dvar = ctx.b.call(
+        fn,
+        [
+            g,
+            x,
+            bcast(mean),
+            bcast(var),
+            bcast(scale),
+            ctx.b.const(eps),
+            channel_axes,
+            ctx.b.const(1.0),
+            ctx.b.const(-0.5),
+        ],
+    )
+    return [dx, dscale, dbias, dmean, dvar]
+
+
 _RULES: Dict[str, Rule] = {
-    "Add": _grad_add,
+    "Add": _grad_add_templated,
     "AveragePool": _grad_averagepool,
-    "BatchNormalization": _grad_batch_normalization,
+    "BatchNormalization": _grad_batch_normalization_templated,
     "Clip": _grad_clip,
     "Conv": _grad_conv,
     "Div": _grad_div,
@@ -1765,9 +1898,12 @@ def build_backward(
             it), or if a shape is missing from ``shapes``.
     :param rules: overrides :data:`_RULES` for this call. Exists for
             :mod:`tests.test_graph_grad_templates`, which builds a copy with
-            one or two entries replaced by a :func:`_template_rule` -- never
-            for ordinary callers, which should omit this and get the
-            hand-written table every other rule in this module still uses.
+            ``Add``/``BatchNormalization`` pinned to the reference
+            hand-written rule (:func:`_grad_add`/
+            :func:`_grad_batch_normalization`) instead of the templated one
+            :data:`_RULES` uses by default, as an independent numeric
+            cross-check -- never for ordinary callers, which should omit this
+            and get :data:`_RULES` as-is.
     """
     rules = _RULES if rules is None else rules
     ctx = _Backward(b, shapes)
@@ -1819,102 +1955,3 @@ def build_backward(
             )
         result[target] = grads[target]
     return result
-
-
-# --- Templated rules (proof of concept) ------------------------------------
-#
-# An alternative to hand-transcribing a rule's graph construction directly in
-# Python (and, separately, a second time in graph_grad.cpp): author the rule
-# once in onnxscript, compile it offline to a checked-in ONNX FunctionProto
-# (scripts/codegen/generate_grad_templates.py ->
-# onnxsim.graph_grad_templates_gen), and instantiate the same text from
-# either language via ONNX's own function-inlining machinery. onnxscript
-# itself is never imported here -- only onnx.parser, already a base
-# dependency, to read the checked-in text back into a FunctionProto.
-#
-# Not wired into :data:`_RULES`: these two functions exist to prove the
-# mechanism (see tests/test_graph_grad_templates.py, which checks
-# GradBatchNormalization against torch.autograd) before any production rule
-# is migrated to it. `_grad_add`/`_grad_batch_normalization` above remain
-# what every real caller of this module gets.
-
-
-@functools.lru_cache(maxsize=None)
-def _load_template(text: str) -> onnx.FunctionProto:
-    return onnx.parser.parse_function(text)
-
-
-def _grad_add_templated(
-    ctx: _Backward, node: onnx.NodeProto, g: str
-) -> List[Optional[str]]:
-    """Same shape as :func:`_grad_add`, but the identity-gradient core
-    (``da = db = g``) comes from a call to the checked-in ``GradAdd``
-    function instead of being written here directly. Broadcast-undoing
-    stays outside the template, exactly as it does for the hand-written
-    rule -- see graph_grad_templates_gen's module docstring for why."""
-    fn = _load_template(_templates.GRAD_ADD)
-    da, db = ctx.b.call(fn, [g])
-    out = ctx.shape(node.output[0])
-    return [
-        ctx.reduce_to(da, out, ctx.shape(node.input[0])),
-        ctx.reduce_to(db, out, ctx.shape(node.input[1])),
-    ]
-
-
-def _grad_batch_normalization_templated(
-    ctx: _Backward, node: onnx.NodeProto, g: str
-) -> List[Optional[str]]:
-    """Same validation and shape-resolution as
-    :func:`_grad_batch_normalization` (rank/shape checks, the per-channel
-    broadcast reshape, the reduction axes), but the actual gradient
-    arithmetic comes from a call to the checked-in
-    ``GradBatchNormalization`` function -- the rule this repo's own
-    dvar-derivation bug was in, so the one most worth proving out this way
-    first."""
-    x = node.input[0]
-    scale, bias = node.input[1], node.input[2]
-    mean, var = node.input[3], node.input[4]
-    name = node.output[0]
-    x_shape = ctx.shape(x)
-    rank = len(x_shape)
-    if rank < 2:
-        raise UnsupportedOpError(
-            f"BatchNormalization needs a batch and a channel axis, got "
-            f"input shape {x_shape} (node {name!r})"
-        )
-    channels = int(x_shape[1])
-    for label, tensor in (
-        ("scale", scale),
-        ("B", bias),
-        ("mean", mean),
-        ("var", var),
-    ):
-        shape = ctx.shape(tensor)
-        if tuple(shape) != (channels,):
-            raise UnsupportedOpError(
-                f"BatchNormalization's {label} has shape {tuple(shape)}, not "
-                f"({channels},) (node {name!r})"
-            )
-    eps = float(_attr(node, "epsilon", 1e-5))
-    bshape = (1, channels) + (1,) * (rank - 2)
-
-    def bcast(t: str) -> str:
-        return ctx.b.op("Reshape", [t, ctx.int64_const(bshape, "shape")])
-
-    channel_axes = ctx.int64_const([0] + list(range(2, rank)), "axes")
-    fn = _load_template(_templates.GRAD_BATCH_NORMALIZATION)
-    dx, dscale, dbias, dmean, dvar = ctx.b.call(
-        fn,
-        [
-            g,
-            x,
-            bcast(mean),
-            bcast(var),
-            bcast(scale),
-            ctx.b.const(eps),
-            channel_axes,
-            ctx.b.const(1.0),
-            ctx.b.const(-0.5),
-        ],
-    )
-    return [dx, dscale, dbias, dmean, dvar]

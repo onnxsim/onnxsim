@@ -129,6 +129,29 @@ std::set<std::string> OpTypeSet(const GraphBuilder& b) {
   return std::set<std::string>(types.begin(), types.end());
 }
 
+// Every op type `b` emitted, with any templated rule's function call
+// resolved via MakeStepGraph's own inlining -- otherwise a call node's
+// op_type (the function's own name, e.g. "GradAdd") would show up here
+// instead of the ops it actually expands to, which is what an allowlist
+// check is about. One state entry per `grads` target is enough to give
+// MakeStepGraph something to close the graph on; the values it computes for
+// those outputs are never read here.
+std::set<std::string> InlinedOpTypeSet(
+    const GraphBuilder& b, const std::map<std::string, std::string>& grads,
+    const Shapes& shapes) {
+  StepGraphSpec spec;
+  for (const auto& [target, grad_name] : grads) {
+    spec.state.push_back({/*input=*/target + "_unused", shapes.at(target),
+                          /*next_output=*/grad_name});
+  }
+  const StepGraph step = MakeStepGraph(b, spec);
+  std::set<std::string> types;
+  for (const onnx::NodeProto& node : step.model.graph().node()) {
+    types.insert(node.op_type());
+  }
+  return types;
+}
+
 std::string Join(const std::set<std::string>& values) {
   std::string out;
   for (const std::string& value : values) {
@@ -144,18 +167,22 @@ std::string Join(const std::set<std::string>& values) {
 // a failure names a rule rather than a graph.
 // ---------------------------------------------------------------------------
 
-// Broadcasting elementwise arithmetic, plus a tensor read twice.
+// Broadcasting elementwise arithmetic, plus a tensor read twice. Includes an
+// Add -- the one rule this slice would otherwise never exercise, and (since
+// GradAddTemplated) the one source of an inlined Identity node, not just an
+// Add: see BackwardOps()'s own comment for why.
 std::vector<onnx::NodeProto> ElementwiseSlice() {
   return {
       Node("Sub", {"A", "B"}, {"T0"}),
       Node("Div", {"T0", "C"}, {"T1"}),
-      Node("Mul", {"T1", "T1"}, {"Y"}),
+      Node("Add", {"T1", "C"}, {"T2"}),
+      Node("Mul", {"T2", "T2"}, {"Y"}),
   };
 }
 
 Shapes ElementwiseShapes() {
-  return {{"A", {4, 3}},  {"B", {3}},     {"C", {4, 3}},
-          {"T0", {4, 3}}, {"T1", {4, 3}}, {"Y", {4, 3}}};
+  return {{"A", {4, 3}},  {"B", {3}},     {"C", {4, 3}}, {"T0", {4, 3}},
+          {"T1", {4, 3}}, {"T2", {4, 3}}, {"Y", {4, 3}}};
 }
 
 // A matmul, a rectifier, a softmax and a clip -- the activation half of a
@@ -321,9 +348,9 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
 // as the forward and the optimizer step.
 void TheBackwardOpsAreThePythonAllowlistAndSitInsideEpFriendlyOps() {
   const std::set<std::string> expected = {
-      "Add",     "Cast",   "Div", "Exp",      "Gather",     "Greater",
-      "Less",    "MatMul", "Mul", "Neg",      "ReduceMean", "ReduceSum",
-      "Reshape", "Sqrt",   "Sub", "Transpose"};
+      "Add",       "Cast",    "Div",    "Exp", "Gather",   "Greater",
+      "Identity",  "Less",    "MatMul", "Mul", "Neg",      "ReduceMean",
+      "ReduceSum", "Reshape", "Sqrt",   "Sub", "Transpose"};
   Check(BackwardOps() == expected,
         "BackwardOps() should equal graph_grad.py's BACKWARD_OPS, got {" +
             Join(BackwardOps()) + "}");
@@ -357,8 +384,10 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
   std::set<std::string> emitted;
   for (const Slice& slice : slices) {
     GraphBuilder b("bw_");
-    BuildBackward(b, slice.nodes, slice.shapes, {{"Y", "dY"}}, slice.targets);
-    const std::set<std::string> types = OpTypeSet(b);
+    const std::map<std::string, std::string> grads = BuildBackward(
+        b, slice.nodes, slice.shapes, {{"Y", "dY"}}, slice.targets);
+    const std::set<std::string> types =
+        InlinedOpTypeSet(b, grads, slice.shapes);
     for (const std::string& op : types) {
       Check(BackwardOps().count(op) != 0,
             "backward graph reached outside the allowlist: " + op);
@@ -452,6 +481,13 @@ void ReducedAxesComeFromTheAttributeWhenThereIsOne() {
 // carries the mismatch into the optimizer, which broadcasts again and takes
 // four times the intended step. The Python module docstring calls this out as
 // the one subtlety worth naming, so it is checked on its own here.
+//
+// BuildBackwardWithHandWrittenRules rather than plain BuildBackward: the
+// broadcast-undoing this pins (ctx.ReduceTo) is identical code in both the
+// hand-written and the templated "Add" rule -- only the identity-gradient
+// core ahead of it differs, a Call node the templated rule adds and the
+// hand-written one does not -- so pinning against the hand-written rule
+// keeps this test about broadcasting, not about which rule produced `g`.
 void ABroadcastGradientIsSummedBackToTheOperandShape() {
   const std::vector<onnx::NodeProto> nodes = {Node("Add", {"A", "B"}, {"Y"})};
   {
@@ -459,7 +495,8 @@ void ABroadcastGradientIsSummedBackToTheOperandShape() {
     // summed with keepdims and then reshaped back down to [3].
     const Shapes shapes = {{"A", {4, 3}}, {"B", {3}}, {"Y", {4, 3}}};
     GraphBuilder b;
-    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A", "B"});
+    BuildBackwardWithHandWrittenRules(b, nodes, shapes, {{"Y", "dY"}},
+                                      {"A", "B"});
     const std::vector<std::string> expected = {"ReduceSum", "Reshape"};
     Check(OpTypes(b) == expected,
           "reducing a [4, 3] gradient to [3] should be ReduceSum then "
@@ -476,7 +513,8 @@ void ABroadcastGradientIsSummedBackToTheOperandShape() {
     // would still break name-counter parity with the Python.
     const Shapes shapes = {{"A", {4, 3}}, {"B", {1, 3}}, {"Y", {4, 3}}};
     GraphBuilder b;
-    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A", "B"});
+    BuildBackwardWithHandWrittenRules(b, nodes, shapes, {{"Y", "dY"}},
+                                      {"A", "B"});
     const std::vector<std::string> expected = {"ReduceSum"};
     Check(OpTypes(b) == expected,
           "reducing a [4, 3] gradient to [1, 3] needs no Reshape");
@@ -487,7 +525,8 @@ void ABroadcastGradientIsSummedBackToTheOperandShape() {
     const Shapes shapes = {{"A", {4, 3}}, {"B", {4, 3}}, {"Y", {4, 3}}};
     GraphBuilder b;
     const std::map<std::string, std::string> grads =
-        BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A", "B"});
+        BuildBackwardWithHandWrittenRules(b, nodes, shapes, {{"Y", "dY"}},
+                                          {"A", "B"});
     Check(b.nodes().empty(), "an un-broadcast Add should emit no nodes");
     Check(grads.at("A") == "dY" && grads.at("B") == "dY",
           "an un-broadcast Add's gradients are the seed itself");
@@ -583,11 +622,19 @@ void TheLayerNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
 // If this fails, the C++ BatchNormalization rule has drifted from
 // _grad_batch_normalization in graph_grad.py -- pinned the same way and for
 // the same reason as the LayerNorm rule above.
+// BuildBackwardWithHandWrittenRules rather than plain BuildBackward: Rules()
+// now differentiates "BatchNormalization" via the checked-in template
+// (GradBatchNormalizationTemplated, wired in for production -- see Rules()'s
+// own comment), and this test's whole point is pinning the *hand-written*
+// GradBatchNormalization's node sequence as an independent structural
+// cross-check, the same reason graph_grad_templates_test.cpp reaches for the
+// same override.
 void TheBatchNormRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
   GraphBuilder b("bw_");
   const std::map<std::string, std::string> grads =
-      BuildBackward(b, BatchNormSlice(), BatchNormShapes(), {{"Y", "dY"}},
-                    {"X", "S", "Bn", "Mn", "Vr"});
+      BuildBackwardWithHandWrittenRules(b, BatchNormSlice(), BatchNormShapes(),
+                                        {{"Y", "dY"}},
+                                        {"X", "S", "Bn", "Mn", "Vr"});
   // mean reshaped to [1, C, 1, 1] and subtracted (xc); var reshaped, +eps,
   // sqrt, inv; xhat = xc * inv; scale reshaped, gs = g * scale, dx = gs *
   // inv; g * xhat reduced over every axis but 1 for dscale; g reduced the
