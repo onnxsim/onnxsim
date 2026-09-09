@@ -917,6 +917,139 @@ def apply_qlora(
     return quantized, adapter
 
 
+@dataclass
+class LoraBlock:
+    """One trainable block :func:`discover_lora_blocks` found, named the way
+    a caller would name one for :func:`train_lora` by hand.
+
+    ``input_name``/``output_name`` are exactly what a caller would pass as
+    :func:`train_lora`'s ``block_input_name``/``block_output_name``, so a
+    plan is inspectable, diffable and replayable one block at a time.
+    """
+
+    input_name: str
+    output_name: str
+    #: The injected adapters' own :attr:`LoraTarget.node_output` tensors that
+    #: fall inside this block, in graph order. Never empty: a slice with no
+    #: adapter to train is not a block.
+    target_outputs: Tuple[str, ...]
+    #: Tensors the block reads but does not produce, ``input_name`` included.
+    #: These are teacher-forced -- see :func:`onnxsim.qat._slice_block`.
+    external_inputs: Tuple[str, ...]
+    #: Op types inside the block, deduplicated and sorted.
+    op_types: Tuple[str, ...]
+    num_nodes: int
+
+
+def discover_lora_blocks(
+    model: Union[str, onnx.ModelProto],
+    adapter: LoraAdapter,
+    max_targets_per_block: int = 2,
+) -> List[LoraBlock]:
+    """Partitions ``model`` into a sequence of blocks :func:`train_lora` can
+    train, without the caller naming a single ``block_input_name``/
+    ``block_output_name`` pair -- :func:`onnxsim.qat.discover_qat_blocks`'s
+    liveness argument, adapted to LoRA's own shape of problem.
+
+    The underlying question is identical to QAT's: a slice is trainable iff
+    it is (1) **differentiable** -- every op inside is in
+    :data:`onnxsim.graph_grad.SUPPORTED_OPS` -- and (2) **self-contained** --
+    cuttable out of the graph without severing an activation something else
+    still uses. :func:`onnxsim.qat._liveness_cuts` answers (2) by liveness,
+    not by recognizing architectures; this function reuses it verbatim on
+    ``model``'s own graph. Unlike QAT -- which differentiates a float graph
+    and reconstructs a separately quantized one -- LoRA trains directly
+    against the one already-injected model :func:`inject_lora`/
+    :func:`apply_qlora` produced, so there is no second graph to keep in
+    sync.
+
+    Where this differs from QAT's discovery: "at least one quantized layer"
+    becomes "at least one injected adapter" -- a span closes a block once it
+    has accumulated ``max_targets_per_block`` of ``adapter``'s own
+    :attr:`LoraTarget.node_output` tensors, the same tensor
+    :func:`inject_lora` restored the original node's name to, so every
+    non-adapter consumer downstream is unaffected by which block boundary
+    falls where.
+
+    **What this does not see.** :func:`_fold_frozen_prefixes` lets
+    :func:`train_lora` train straight through a frozen dequant chain (NF4's
+    ``Cast``, say) that has no rule in ``SUPPORTED_OPS`` -- but this function
+    has no notion of "frozen": it treats every unsupported op as a hard gap,
+    the same conservative-not-incorrect trade-off
+    :func:`onnxsim.qat.discover_qat_blocks` documents for itself. Run this on
+    an :func:`apply_qlora` model and it may propose fewer or smaller blocks
+    than an :func:`apply_qlora` + hand-named :func:`train_lora` call could
+    actually train; it never proposes one that cannot train.
+
+    :param model: the model with adapters already injected, as returned by
+            :func:`inject_lora`/:func:`apply_qlora`. Boundaries are found in
+            *this* graph -- the one :func:`train_lora` differentiates.
+    :param adapter: the :class:`LoraAdapter` :func:`inject_lora`/
+            :func:`apply_qlora` returned alongside ``model``.
+    :param max_targets_per_block: how many injected adapters to merge into
+            one block before closing it. 1 gives per-adapter blocks; a large
+            value gives one block per gap between undifferentiable ops -- on
+            a model with no such gap, the whole graph as a single block.
+    :returns: the blocks in graph order, possibly empty. Consecutive blocks
+            need not be adjacent: a gap between two of them is a region
+            nothing here can train.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if max_targets_per_block < 1:
+        raise ValueError("max_targets_per_block must be at least 1")
+
+    graph = model.graph
+    cuts = qat._liveness_cuts(graph, qat._primary_graph_input(graph))
+    target_outputs = {t.node_output for t in adapter.targets}
+
+    pairs: List[Tuple[str, str]] = []
+    start: Optional[Tuple[int, str]] = cuts[0] if cuts else None
+    count = 0
+    for previous, current in zip(cuts, cuts[1:]):
+        span = graph.node[previous[0] + 1 : current[0] + 1]
+        if any(node.op_type not in graph_grad.SUPPORTED_OPS for node in span):
+            # A gap. Close whatever was pending before it and reopen after.
+            if start is not None and count and start[0] < previous[0]:
+                pairs.append((start[1], previous[1]))
+            start, count = current, 0
+            continue
+        if start is None:
+            start = previous
+        count += sum(1 for node in span for out in node.output if out in target_outputs)
+        if count >= max_targets_per_block:
+            pairs.append((start[1], current[1]))
+            start, count = current, 0
+    if start is not None and count and cuts and start[0] < cuts[-1][0]:
+        pairs.append((start[1], cuts[-1][1]))
+
+    blocks: List[LoraBlock] = []
+    for input_name, output_name in pairs:
+        try:
+            nodes, externals = qat._slice_block(graph, input_name, output_name)
+        except ValueError:
+            # Defensive, matching discover_qat_blocks: the span construction
+            # above already guarantees a non-empty, supported slice.
+            continue
+        block_outputs = {out for node in nodes for out in node.output}
+        block_targets = tuple(
+            t.node_output for t in adapter.targets if t.node_output in block_outputs
+        )
+        if not block_targets:
+            continue
+        blocks.append(
+            LoraBlock(
+                input_name=input_name,
+                output_name=output_name,
+                target_outputs=block_targets,
+                external_inputs=tuple(externals),
+                op_types=tuple(sorted({n.op_type for n in nodes})),
+                num_nodes=len(nodes),
+            )
+        )
+    return blocks
+
+
 def export_lora_adapter(
     model: onnx.ModelProto,
     adapter: LoraAdapter,

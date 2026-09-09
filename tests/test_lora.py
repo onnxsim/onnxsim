@@ -374,6 +374,79 @@ def test_apply_qlora_then_train_lora_does_not_raise_on_the_nf4_dequant_chain():
     assert codes_before == codes_after
 
 
+def test_discover_lora_blocks_finds_liveness_cut_boundaries():
+    rng = np.random.default_rng(0)
+    w1 = rng.standard_normal((6, 8)).astype(np.float32)
+    w2 = rng.standard_normal((8, 4)).astype(np.float32)
+    model = _model(
+        """
+        g (float[batch,6] X) => (float[batch,4] Y) {
+          H = MatMul(X, W1)
+          R = Relu(H)
+          Y = MatMul(R, W2)
+        }
+        """,
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    injected, adapter = lora.inject_lora(model, rank=2, seed=0)
+    onnx.checker.check_model(injected)
+    assert len(adapter.targets) == 2
+
+    # Per-adapter blocks: one boundary per injected MatMul, matching where a
+    # caller would have named train_lora's block_input_name/block_output_name
+    # by hand.
+    per_layer = lora.discover_lora_blocks(injected, adapter, max_targets_per_block=1)
+    assert [(b.input_name, b.output_name, b.target_outputs) for b in per_layer] == [
+        ("X", "H", ("H",)),
+        ("H", "Y", ("Y",)),
+    ]
+
+    # max_targets_per_block=2 (the default) merges both into one block
+    # spanning the whole graph -- no gap between them since Relu is in
+    # graph_grad.SUPPORTED_OPS.
+    merged = lora.discover_lora_blocks(injected, adapter)
+    assert len(merged) == 1
+    assert merged[0].input_name == "X"
+    assert merged[0].output_name == "Y"
+    assert merged[0].target_outputs == ("H", "Y")
+
+    # The discovered blocks are directly usable by train_lora.
+    x = rng.standard_normal((5, 6)).astype(np.float32)
+    target_data = rng.standard_normal((5, 4)).astype(np.float32)
+    losses = []
+    trained = lora.train_lora(
+        injected,
+        adapter,
+        merged[0].input_name,
+        merged[0].output_name,
+        target_data=[target_data],
+        calibration_data=[{"X": x}],
+        num_iterations=200,
+        learning_rate=1e-2,
+        losses=losses,
+    )
+    onnx.checker.check_model(trained)
+    assert losses[-1] < losses[0]
+
+
+def test_discover_lora_blocks_rejects_non_positive_max_targets_per_block():
+    rng = np.random.default_rng(0)
+    w = rng.standard_normal((6, 8)).astype(np.float32)
+    model = _model(
+        """
+        g (float[batch,6] X) => (float[batch,8] Y) {
+          Y = MatMul(X, W)
+        }
+        """,
+        [_f32(w, "W")],
+    )
+    injected, adapter = lora.inject_lora(model, rank=2, seed=0)
+
+    with pytest.raises(ValueError, match="max_targets_per_block"):
+        lora.discover_lora_blocks(injected, adapter, max_targets_per_block=0)
+
+
 def test_export_lora_adapter_round_trips_through_adapterformat(tmp_path):
     rng = np.random.default_rng(0)
     w = rng.standard_normal((8, 8)).astype(np.float32)
