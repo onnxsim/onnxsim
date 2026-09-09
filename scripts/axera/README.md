@@ -4572,23 +4572,46 @@ each -- which at 512 MACs/cycle demands roughly **3.8 GHz**. Even a generous
 1.5 GHz gives about 1.5 TOPS per core, so the pair can offer perhaps 2 to 3
 TOPS: a useful 20-30% on top of the NPU, not a doubling.
 
-**Where the gap actually is: clock.** The NPU sustains **4,949 MAC/cycle**
-across its three cores (measured, stable across shapes). At that rate,
-18 TOPS requires
+**Where the gap actually is: array utilisation, not clock.** The NPU
+sustains **4,949 MAC/cycle** across its cores, measured and stable across
+shapes.
 
-    18e12 / (2 * 4949) = 1.82 GHz
+The clock no longer has to be guessed. A `profile=True` build writes a
+`trace.json` whose events carry durations, and comparing their span against
+the same build's `max_cycle` gives the toolchain's own conversion:
 
-and the implied clock measured here is **854-949 MHz** -- almost exactly
-half. So the rating is consistent with the same silicon at roughly twice the
-clock this card runs at, and the card idles at 75 C in an M.2 slot. The
-shortfall looks like clock and thermal headroom rather than lost efficiency,
-which also fits the earlier finding that the NPU executes essentially the
-cycle count its own compiler predicts.
+| graph | max_cycle | trace span | nominal |
+| --- | --- | --- | --- |
+| 1024ch 16x16 | 3,905,355 | 3906.3 us | 999.8 MHz |
+| 256ch 64x64 | 3,831,460 | 3832.7 us | 999.7 MHz |
+| 512ch 32x32 | 3,704,778 | 3706.5 us | 999.5 MHz |
 
-That is a hypothesis about *why*, not a measurement: AXCL exposes no NPU
-frequency (`axcl-smi info --npu` reports usage and an engine version, no
-clock), so the 1.82 GHz figure is inferred from the rating and the measured
-MAC rate, not read from the hardware.
+The compiler emits exactly one cycle per nanosecond, so its **nominal NPU
+clock is 1.0 GHz**. Measured against real device time the same builds give
+854 to 949 MHz, so the hardware runs at **85-95% of nominal** -- close to it,
+not at half of something larger.
+
+That settles the arithmetic. At 1.0 GHz, 18 TOPS requires
+
+    18e12 / (2 * 1.0e9) = 9,000 MAC/cycle
+
+and the hardware sustains 4,949, or **55%** of it. The kernel log names
+sixteen execution units (`EU[0]` through `EU[15]`), and 9,000 over 16 is 562
+per unit -- consistent with a 512-MAC unit per EU and a rating that assumes
+the whole array busy.
+
+So the distance to 18 TOPS is how much of the array a real convolution keeps
+fed, not clock and not the DSPs. An earlier draft of this section proposed a
+1.82 GHz rated clock with this card running at half; the trace says
+otherwise and that reading was wrong.
+
+**What is still not directly readable** is the hardware's instantaneous
+frequency: AXCL exposes no NPU clock (`axcl-smi info --npu` gives usage and
+an engine version; `set --freq` sets the *CPU*, offering 1200/1400/1700 MHz),
+the device kernel log prints none, and no `AX_SYS_*` clock getter is exported
+even though `AX_NPU_CLK_ID` exists in the headers. The 1.0 GHz above is the
+compiler's nominal, and the 854-949 MHz is measured effective throughput --
+between them there is no room for a large hidden clock deficit.
 
 **So: using the DSPs is possible but would need firmware written from
 scratch with a toolchain that is not part of this stack, and by the numbers
