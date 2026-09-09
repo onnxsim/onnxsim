@@ -23,11 +23,12 @@ import onnxsim.onnxsim_cpp2py_export as C
 _TESTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests")
 
 # test_formal_verify_*.py files in this family that verify a property shared
-# across ONNX ops onnxsim's quantization relies on, rather than one of
-# onnxsim's own optimizer passes (see each such file's own module
-# docstring) -- these don't correspond to a pass name and aren't counted
-# against the pass universe below.
-_NOT_A_PASS = {"quantize_round_trip"}
+# across ONNX ops onnxsim's quantization relies on, or a derived lemma
+# composed from other such files, rather than one of onnxsim's own
+# optimizer passes (see each such file's own module docstring) -- these
+# don't correspond to a pass name and aren't counted against the pass
+# universe below.
+_NOT_A_PASS = {"quantize_round_trip", "quantized_mac_bound"}
 
 
 def _proved_pass_names():
