@@ -635,6 +635,12 @@ Runtime does not offer, onnxsim raises a `ValueError` listing the available
 providers instead of silently folding on the CPU. When `providers` is left
 unset (the default), folding runs on the CPU.
 
+`examples/cuda_feature_tests/` has a notebook exercising this end to end
+(folding, the CLI, `device_id` pinning, DLPack CUDA tensors, provider
+validation) against a real GPU -- open it in Colab and run it by hand
+whenever you want to check these on an actual NVIDIA GPU; it is not wired
+into CI.
+
 ## Profiling the optimization
 
 Simplification alternates a handful of transforms -- shape inference, the
