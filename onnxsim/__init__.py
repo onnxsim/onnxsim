@@ -21,6 +21,14 @@ from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
 from onnxsim.bias_correction import correct_bias
 from onnxsim.billm import quantize_weight_only_billm
+from onnxsim.bn_recovery import (
+    RecoveredBatchNorm,
+    calibrate_recovered_bn,
+    find_recoverable_convs,
+    find_recovered_bn_nodes,
+    insert_identity_bn,
+    recover_batch_norm,
+)
 from onnxsim.brecq import apply_brecq
 from onnxsim.bwa_ptq import apply_bwa_ptq
 from onnxsim.calibration import (
@@ -337,6 +345,12 @@ __all__ = [
     "apply_foem",
     "apply_fp6_llm_quantization",
     "quantize_dequantize_fp6",
+    "RecoveredBatchNorm",
+    "calibrate_recovered_bn",
+    "find_recoverable_convs",
+    "find_recovered_bn_nodes",
+    "insert_identity_bn",
+    "recover_batch_norm",
     "apply_brecq",
     "apply_block_finetune",
     "apply_block_finetune_all_blocks",
