@@ -141,11 +141,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest onnxruntime ml_dtypes z3-solver
           python -m pip install wheelhouse/onnxsim-*.whl
+      # Run from a neutral directory (matching test_wheels_windows_cross's own
+      # established fix for the identical problem): the repo root's own
+      # ./onnxsim/ source package (a plain Python package directory, no
+      # compiled extension) would otherwise shadow the installed wheel on
+      # sys.path, since Python prepends the current directory -- pytest still
+      # finds pyproject.toml's [tool.pytest.ini_options] and tests/'s own
+      # sibling-module imports (e.g. _formal_verify_common) by walking up from
+      # the absolute test paths given below, so nothing else needs to change.
       - name: Verify onnxsim under test is the built wheel
+        working-directory: ${{ runner.temp }}
         run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
       - name: Run Z3 formal-verification proof suite
+        working-directory: ${{ runner.temp }}
         run: |
-          pytest -v tests/test_formal_verify_*.py tests/test_fusion_patterns.py tests/test_ort_matmul_nbits_workaround.py
+          pytest -v "${GITHUB_WORKSPACE}"/tests/test_formal_verify_*.py "${GITHUB_WORKSPACE}/tests/test_fusion_patterns.py" "${GITHUB_WORKSPACE}/tests/test_ort_matmul_nbits_workaround.py"
 
   # Windows wheels are cross-compiled on a cheap Ubuntu runner with llvm-mingw
   # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
