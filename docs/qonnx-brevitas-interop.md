@@ -2,7 +2,7 @@
 
 ## What this is
 
-Two independent, additive pieces of support for models exported from
+Three independent, additive pieces of support for models exported from
 [Brevitas](https://github.com/Xilinx/brevitas) (the PyTorch
 quantization-aware-training library FINN/Xilinx deployments are built on),
 whose *default* ONNX export path (`brevitas.export.export_qonnx`) does not
@@ -19,12 +19,13 @@ otherwise simplified.
 Like `docs/dynamic-quantization.md` says of its own scope: this is not a
 from-scratch reimplementation of Brevitas or QONNX -- those are large,
 independent projects. What's here is (1) teaching onnxsim's own shape
-inference about the four ops so simplification isn't blocked by them, and (2)
+inference about the four ops so simplification isn't blocked by them, (2)
 teaching `onnxsim.qat_interop` (deliverable A of `docs/qat.md`, "QAT interop")
 to recognize a `Quant` node as a fourth shape of already-learned quantizer,
 alongside the three QDQ shapes it already understood -- so a Brevitas-trained
 model's learned scales/zero-points survive `quantize_static_keeping_qdq_scales`
-exactly like a QDQ-exported QAT model's do.
+exactly like a QDQ-exported QAT model's do -- and (3) the reverse direction,
+emitting `Quant` nodes for an external (Brevitas-side) trainer to fine-tune.
 
 ## 1. Shape inference (`onnxsim/qonnx_schemas.cpp`)
 
@@ -68,21 +69,30 @@ producing `QuantizeLinear` to look for, unlike a QDQ pair), and its output is
 already the fake-quantized-and-dequantized result, so recognizing one is
 simpler than the QDQ case -- at the cost of `Quant`'s own extra constraints:
 
-- **Covered:** an 8-bit, per-tensor `Quant` node with constant
-  `scale`/`zeropoint`/`bitwidth` -- `signed=1` maps onto onnxsim's own
-  symmetric int8 weight scheme, `signed=0` onto its uint8 activation scheme,
-  exactly like an ordinary QDQ pair with that zero-point dtype. From there
-  on, a QONNX-sourced learned quantizer and a QDQ-sourced one are
-  indistinguishable to the rest of the pipeline
+- **Covered:** an 8- or 16-bit `Quant` node with constant
+  `scale`/`zeropoint`/`bitwidth` -- `signed` and `bitwidth` together select
+  which of onnxsim's own schemes it maps to (8-bit signed: its symmetric
+  int8 weight scheme; 8-bit unsigned: `quantize_static`'s uint8 activation
+  scheme; 16-bit unsigned: `quantize_static_int16`'s uint16 one -- a
+  *weight* is always carried as 8-bit signed regardless of the activation
+  scheme in play, the one scheme onnxsim's weight quantization has). The
+  scale may be per-tensor for either role, or -- for a **weight** only --
+  single-axis per-channel: `_infer_weight_axis` reads the broadcast axis
+  straight off the scale's own shape against the weight's real shape, since
+  a valid `Quant` node's scale must already broadcast correctly against the
+  tensor it multiplies at runtime -- no `axis` attribute needed, and no
+  guessing. From there on, a QONNX-sourced learned quantizer and a
+  QDQ-sourced one are indistinguishable to the rest of the pipeline
   (`quantize_static_keeping_qdq_scales`'s writeback, `strip_existing_qdq`'s
   canonicalization) -- both are just "this float tensor's learned `(scale,
   zero_point)`" by the time detection is done.
-- **Not covered, deliberately:** per-channel `Quant` scale (QONNX carries no
-  `axis` attribute to check a broadcast shape's claim against, unlike
-  `DequantizeLinear`), bit-widths other than 8 (the case QONNX exists for,
-  and the one onnxsim's own 8-bit-only schemes have no counterpart for), and
-  `BipolarQuant`/`Trunc`/`FloatQuant` (recognized so a model using them isn't
-  silently mis-scanned as an ordinary float graph, but not yet
+- **Not covered, deliberately:** a `Quant` scale broadcasting over more than
+  one axis (a per-block scale, no onnxsim counterpart) or belonging to an
+  activation (whose shape isn't known statically here); bit-widths other
+  than 8/16 (the arbitrary-precision case QONNX exists for in the first
+  place, and the one onnxsim's own integer schemes have no counterpart for);
+  and `BipolarQuant`/`Trunc`/`FloatQuant` (recognized so a model using them
+  isn't silently mis-scanned as an ordinary float graph, but not yet
   canonicalized -- none of onnxsim's own schemes are 1-bit, truncating, or
   float-grid). Each has its own `SKIP_REASONS` entry
   (`qonnx_per_channel_scale_unsupported`, `qonnx_bitwidth_unsupported`,
@@ -90,34 +100,67 @@ simpler than the QDQ case -- at the cost of `Quant`'s own extra constraints:
   never guessed at -- the same "refuse rather than guess" policy the rest of
   `qat_interop.py` already applies to QDQ.
 
+## 3. QAT egress (`onnxsim/qat_interop.py`)
+
+`export_fake_quant_qonnx` is the QONNX-emitting counterpart of
+`export_fake_quant`: it runs the exact same calibration/rewrite/naming
+`export_fake_quant` already does, then `_rewrite_qdq_to_quant` replaces each
+emitted `QuantizeLinear`/`DequantizeLinear` pair (or lone weight
+`DequantizeLinear`) with an equivalent `Quant` node in place -- same
+position in the node list, since a `Quant` node's own `X` input may be an
+intermediate activation an *earlier* node in the graph produces, so simply
+appending the new nodes at the end would leave the graph topologically
+invalid. `learnable_scales` names are unaffected (`Quant`'s `scale` input is
+the same tensor, same convention, as a QDQ pair's own); `learnable_zero_points`
+names are remapped, since QONNX's zero-point is always a float tensor rather
+than an integer one of the target dtype.
+
+A model this produces, trained externally, and then handed to
+`quantize_static_keeping_qdq_scales` recovers exactly the trained parameters
+-- the two halves are tested together
+(`test_round_trip_through_an_external_trainer_qonnx`), not just each in
+isolation against plain QDQ.
+
 ## Tests
 
 - `tests/test_qonnx_custom_op_schemas.py` -- proves shape inference actually
   runs the registered schemas (a `Shape`/`Gather` chain past each op folds to
   a literal), for both domains.
-- `tests/test_qat_interop.py`'s "QONNX/Brevitas ingest" section -- detection,
-  activation/weight preservation through `quantize_static_keeping_qdq_scales`,
-  canonicalization through `strip_existing_qdq`, and each refusal reason.
+- `tests/test_qat_interop.py`'s "QONNX/Brevitas ingest" section -- detection
+  (including per-channel weight scale and 8-/16-bit), activation/weight
+  preservation through `quantize_static_keeping_qdq_scales`, canonicalization
+  through `strip_existing_qdq`, each refusal reason, `export_fake_quant_qonnx`,
+  and the egress/ingest round trip.
 
 ## Not covered
 
-- **Per-channel weight quantization.** This is the common case for a real
-  Brevitas `QuantConv2d`/`QuantLinear` export, so it is the biggest practical
-  gap left: such a weight is recognized (detection succeeds) but reported as
-  `qonnx_per_channel_scale_unsupported` rather than preserved, falling back
-  to onnxsim's own round-to-nearest per-channel scale -- accurate, but not
-  the trained one.
-- **Sub-8-bit and super-8-bit precision** -- the entire reason QONNX's
-  `bitwidth` is a runtime input rather than an implied dtype. A model
-  actually using this (rather than defaulting to 8-bit) falls back to
-  calibration for that tensor.
+- **A `Quant` scale broadcasting over more than one axis** (a per-block
+  scale) or an **activation's per-channel scale** -- QONNX carries no `axis`
+  attribute, so a weight's own broadcast shape is the only thing this module
+  can check a per-channel claim against; an activation has no static shape
+  to check it against at all.
+- **Bit-widths other than 8/16** -- the arbitrary/learned precision QONNX
+  exists to support in the first place has no counterpart in onnxsim's own
+  integer schemes. A model actually using this (rather than 8- or 16-bit)
+  falls back to calibration for that tensor.
 - **`BipolarQuant`/`Trunc`/`FloatQuant` canonicalization.** Recognized at the
   schema level (shape inference) and at the ingest-detection level (a
   reported, not silent, refusal), but there is no onnxsim quantization
-  scheme yet for any of the three to round-trip into.
-- **Egress** (`export_fake_quant`) still only emits standard QDQ; there is no
-  QONNX-emitting counterpart. An external Brevitas-side trainer round-trips
-  through ordinary QDQ, same as any other QDQ-based QAT trainer.
+  scheme yet for any of the three to round-trip into -- `quantize_fp8` (a
+  whole-graph `Cast`-based scheme with no scale/zero-point at all) and
+  `quantize_ternary` (a *structural*-ternary-weight detector) are both
+  architecturally too different from the QDQ-preservation pattern this
+  module is built around to be a natural target for `FloatQuant`/
+  `BipolarQuant` respectively; a real port would need a new ingest pathway
+  of its own, not just a new scheme mapping.
+- **`apply_qat` does not understand `Quant` nodes directly.** The QAT
+  *training* loop (`docs/qat.md`'s deliverable B, block-wise fine-tuning) has
+  its own fake-quantizer/backward machinery
+  (`onnxsim.graph_grad`/`onnxsim.qat_graph`) with no notion of a QONNX node.
+  A Brevitas-exported model reaches it by going through ingest first
+  (`Quant` nodes -> `quantize_static_keeping_qdq_scales` -> ordinary onnxsim
+  QDQ -> `apply_qat` works on it like any other QDQ model), not by
+  differentiating a raw `Quant`/`Trunc` node directly.
 - **Brevitas's other export paths** (`export_onnx_qcdq`'s
   `QuantizeLinear`-`Clip`-`DequantizeLinear`, `export_onnx_qop`'s
   `com.microsoft` QOperator ops) already worked before this change: the

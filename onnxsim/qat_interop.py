@@ -102,28 +102,45 @@ from there on a QONNX-sourced annotation and a QDQ-sourced one are
 indistinguishable, because both are just "this float tensor's learned
 ``(scale, zero_point)``" by the time canonicalization is done.
 
-What is covered: an 8-bit, per-tensor (scalar scale/zero-point) ``Quant``
-node with a constant ``scale``/``zeropoint``/``bitwidth``, in the
-``qonnx.custom_op.general`` or ``finn.custom_op.general`` domain --
-``signed=1`` maps to onnxsim's own symmetric int8 weight scheme,
-``signed=0`` to its uint8 activation scheme, exactly like an ordinary QDQ
-pair with that zero-point dtype.
+What is covered: an 8- or 16-bit ``Quant`` node with a constant ``scale``/
+``zeropoint``/``bitwidth``, in the ``qonnx.custom_op.general`` or
+``finn.custom_op.general`` domain -- ``signed`` and ``bitwidth`` together
+select which of onnxsim's own schemes it maps to (8-bit signed: its
+symmetric int8 weight scheme; 8-bit unsigned:
+:func:`onnxsim.quantize_static`'s uint8 activation scheme; 16-bit unsigned:
+:func:`onnxsim.quantize_static_int16`'s uint16 one), exactly like an ordinary
+QDQ pair with that zero-point dtype -- a *weight*, though, is only ever
+carried as 8-bit signed regardless of which activation scheme is in play,
+since that is the one scheme onnxsim's own weight quantization has. The
+scale may be per-tensor (a scalar) for either role, or -- for a **weight**
+only -- per-channel: :func:`_infer_weight_axis` reads the single broadcast
+axis straight off the scale's own shape against the weight's real shape (no
+``axis`` attribute needed, since a valid ``Quant`` node's scale must already
+broadcast correctly against the tensor it multiplies at runtime), the same
+per-axis annotation a ``DequantizeLinear`` with an explicit ``axis`` produces.
+An activation's per-channel scale is still refused: unlike a weight, an
+activation has no static initializer to read a real shape off of.
 
 Not covered, deliberately, on top of the QDQ limitations above:
 
-- **Per-channel ``Quant`` scale** (the common case for a Brevitas
-  ``QuantConv2d``/``QuantLinear`` weight, e.g. a ``(Cout, 1, 1, 1)``-shaped
-  scale broadcasting against the weight). Unlike ``DequantizeLinear``'s
-  ``axis`` attribute, QONNX's ``Quant`` carries no axis annotation to check a
-  broadcast shape's claim against -- inferring one from the scale tensor's
-  own shape would be a guess, and this module does not guess. Reported as
+- **A ``Quant`` scale broadcasting over more than one axis** (a per-block
+  scale) has no onnxsim counterpart to preserve it in. Reported as
   ``qonnx_per_channel_scale_unsupported``; the weight falls back to
   onnxsim's own round-to-nearest per-channel scale.
-- **Bit-widths other than 8** (the case QONNX/Brevitas exists for) have no
-  counterpart in onnxsim's own 8-bit-only schemes, so a ``Quant`` node whose
-  ``bitwidth`` input does not round to exactly 8 is reported
+- **An activation's per-channel ``Quant`` scale** -- same reason and report
+  as above, but because the activation's shape isn't known statically here,
+  not because the scale itself is unresolvable.
+- **Bit-widths other than 8 or 16** -- including the arbitrary, possibly
+  learned, widths QONNX/Brevitas exists to support in the first place -- have
+  no counterpart in onnxsim's own integer schemes, so a ``Quant`` node whose
+  ``bitwidth``/``signed`` do not name one of the four (width, signedness)
+  combinations those schemes cover is reported
   (``qonnx_bitwidth_unsupported``) rather than lossily re-quantized to a
-  width the export did not ask for.
+  width the export did not ask for. A 16-bit signed *weight* is a different
+  case -- recognized here (16-bit signed is a real combination, just not for
+  a weight), reported downstream as ``weight_dtype_not_int8`` instead, the
+  same as any other non-int8 learned weight quantizer QDQ ingest already
+  reports that way.
 - **``BipolarQuant``, ``Trunc``, ``FloatQuant``** are recognized (so a model
   using them is not silently mis-scanned as an ordinary float graph) but not
   yet canonicalized -- reported as ``qonnx_op_unsupported``. None of onnxsim's
@@ -161,6 +178,7 @@ __all__ = [
     "strip_existing_qdq",
     "quantize_static_keeping_qdq_scales",
     "export_fake_quant",
+    "export_fake_quant_qonnx",
 ]
 
 
@@ -256,17 +274,20 @@ SKIP_REASONS: Dict[str, str] = {
     # -- QONNX/Brevitas detection (see the module docstring's "QONNX/Brevitas
     # ingest" section for the full picture) --
     "qonnx_bitwidth_unsupported": (
-        "the Quant node's bitwidth input is not a constant that rounds to "
-        "8; onnxsim's own quantization schemes are 8-bit only"
+        "the Quant node's (bitwidth, signed) is not a constant one of "
+        "(8, signed), (8, unsigned), (16, signed) or (16, unsigned); "
+        "onnxsim's own integer quantization schemes cover only those four"
     ),
     "qonnx_zero_point_not_integral": (
         "the Quant node's zeropoint input is not a constant, or its value "
         "is not (within tolerance) an integer code"
     ),
     "qonnx_per_channel_scale_unsupported": (
-        "the Quant node's scale is not a scalar; QONNX's Quant carries no "
-        "axis attribute to check a per-channel broadcast shape's claim "
-        "against, so this module does not guess one"
+        "the Quant node's scale is non-scalar but is not a single-axis "
+        "per-channel weight scale this module can resolve -- either it "
+        "broadcasts over more than one axis (a per-block scale, which has "
+        "no onnxsim counterpart), or it belongs to an activation, whose "
+        "shape is a runtime property this scan does not have on hand"
     ),
     "qonnx_op_unsupported": (
         "this is a QONNX/FINN custom op this module recognizes but does not "
@@ -707,6 +728,39 @@ def _scan_dequantize(
     )
 
 
+def _infer_weight_axis(
+    scale_shape: Tuple[int, ...], weight_shape: Tuple[int, ...]
+) -> Optional[int]:
+    """The single axis a per-channel ``Quant`` ``scale`` (or ``zeropoint``)
+    broadcasts over against a weight shaped ``weight_shape``, or ``None`` if
+    ``scale_shape`` is not a valid, unambiguous per-channel broadcast shape.
+
+    Unlike ``DequantizeLinear``'s explicit ``axis`` attribute (checked by
+    :func:`_pair_axis`), QONNX's ``Quant`` carries no axis annotation at
+    all -- the scale's own shape *is* the broadcast contract, via ordinary
+    numpy/ONNX broadcasting (right-aligned, each dim either 1 or equal to the
+    corresponding weight dim). For the node to be valid at all, ``scale``
+    must already broadcast correctly against the real weight tensor it
+    multiplies at runtime, so this is not a guess: exactly one non-1
+    (right-aligned) dim is the single axis being broadcast over, and this
+    finds it directly rather than inferring it from convention. Two or more
+    non-1 dims (a genuinely per-block/multi-axis scale, which onnxsim's own
+    schemes have no counterpart for) come back as ``None``, same as any
+    shape that does not broadcast at all.
+    """
+    if len(scale_shape) > len(weight_shape):
+        return None
+    padded = (1,) * (len(weight_shape) - len(scale_shape)) + tuple(scale_shape)
+    axis: Optional[int] = None
+    for i, (s, w) in enumerate(zip(padded, weight_shape)):
+        if s == 1:
+            continue
+        if axis is not None or s != w:
+            return None
+        axis = i
+    return axis
+
+
 def _scan_quant_node(
     node: onnx.NodeProto,
     inits: Dict[str, onnx.TensorProto],
@@ -726,7 +780,9 @@ def _scan_quant_node(
     ``None`` means "not a recognized shape" only where nothing was even
     attempted; every other refusal comes back as a :class:`SkippedQdq`. See
     the module docstring's "QONNX/Brevitas ingest" section for what counts as
-    recognized: 8-bit, per-tensor, with constant, integral parameters.
+    recognized: 8- or 16-bit, with constant, integral parameters, and a
+    scale that is either per-tensor or (for a weight) single-axis
+    per-channel.
     """
     if not node.output or len(node.input) < 4:
         return None
@@ -749,17 +805,34 @@ def _scan_quant_node(
     if scale_init.data_type != onnx.TensorProto.FLOAT:
         return SkippedQdq(tensor_name, "unsupported_scale_dtype", out_name)
     scale = onnx.numpy_helper.to_array(scale_init).astype(np.float64)
-    if scale.size != 1:
-        return SkippedQdq(tensor_name, "qonnx_per_channel_scale_unsupported", out_name)
     if not np.all(np.isfinite(scale)) or not np.all(scale > 0):
         return SkippedQdq(tensor_name, "non_positive_scale", out_name)
+
+    # A per-tensor (scalar) scale needs no axis and no weight shape to check
+    # it against, so it is handled the same for both roles. A non-scalar
+    # scale is only resolvable for a weight, whose shape is statically known
+    # from its own initializer; an activation's shape is a runtime property
+    # this scan does not have on hand, so a non-scalar activation scale is
+    # refused exactly as before.
+    weight_init = inits.get(tensor_name)
+    axis: Optional[int] = None
+    if scale.size != 1:
+        if weight_init is None:
+            return SkippedQdq(
+                tensor_name, "qonnx_per_channel_scale_unsupported", out_name
+            )
+        axis = _infer_weight_axis(scale.shape, tuple(weight_init.dims))
+        if axis is None:
+            return SkippedQdq(
+                tensor_name, "qonnx_per_channel_scale_unsupported", out_name
+            )
 
     zp_init = inits.get(zp_name)
     if zp_init is None:
         return SkippedQdq(tensor_name, "zero_point_not_constant", out_name)
     zero_point_f = onnx.numpy_helper.to_array(zp_init).astype(np.float64)
-    if zero_point_f.size != 1:
-        return SkippedQdq(tensor_name, "qonnx_per_channel_scale_unsupported", out_name)
+    if zero_point_f.size != 1 and zero_point_f.shape != scale.shape:
+        return SkippedQdq(tensor_name, "zero_point_shape_mismatch", out_name)
     zero_point_rounded = np.round(zero_point_f)
     if not np.allclose(zero_point_f, zero_point_rounded, atol=1e-4):
         return SkippedQdq(tensor_name, "qonnx_zero_point_not_integral", out_name)
@@ -767,22 +840,36 @@ def _scan_quant_node(
     bitwidth_init = inits.get(bitwidth_name)
     if bitwidth_init is None:
         return SkippedQdq(tensor_name, "qonnx_bitwidth_unsupported", out_name)
-    bitwidth = onnx.numpy_helper.to_array(bitwidth_init).astype(np.float64).reshape(-1)
-    if bitwidth.size != 1 or round(float(bitwidth[0])) != 8:
+    bitwidth_arr = (
+        onnx.numpy_helper.to_array(bitwidth_init).astype(np.float64).reshape(-1)
+    )
+    if bitwidth_arr.size != 1:
         return SkippedQdq(tensor_name, "qonnx_bitwidth_unsupported", out_name)
-
+    bitwidth = round(float(bitwidth_arr[0]))
+    # 8 and 16 bits are the two integer widths onnxsim's own schemes cover
+    # (quantize_static / quantize_static_int16 -- see _SCHEMES); anything
+    # else, including the arbitrary/learned widths QONNX exists to support,
+    # has no scheme here to preserve it in.
+    zero_point_dtype_by_width_signed = {
+        (8, True): onnx.TensorProto.INT8,
+        (8, False): onnx.TensorProto.UINT8,
+        (16, True): onnx.TensorProto.INT16,
+        (16, False): onnx.TensorProto.UINT16,
+    }
     signed_attr = _attr(node, "signed")
     signed = bool(signed_attr.i) if signed_attr is not None else True
-    zero_point_dtype = onnx.TensorProto.INT8 if signed else onnx.TensorProto.UINT8
+    zero_point_dtype = zero_point_dtype_by_width_signed.get((bitwidth, signed))
+    if zero_point_dtype is None:
+        return SkippedQdq(tensor_name, "qonnx_bitwidth_unsupported", out_name)
 
-    is_weight = tensor_name in inits
+    is_weight = weight_init is not None
     return QdqAnnotation(
         tensor_name=tensor_name,
         role="weight" if is_weight else "activation",
         scale=np.asarray(scale, dtype=np.float32),
         zero_point=zero_point_rounded.astype(np.int64),
         zero_point_dtype=zero_point_dtype,
-        axis=None,
+        axis=axis,
         scale_name=scale_name,
         zero_point_name=zp_name,
         quantize_node=None,
@@ -1507,3 +1594,242 @@ def export_fake_quant(
     _set_metadata(quantized, LEARNABLE_SCALES_KEY, json.dumps(scales))
     _set_metadata(quantized, LEARNABLE_ZERO_POINTS_KEY, json.dumps(zero_points))
     return FakeQuantExport(quantized, tuple(scales), tuple(zero_points))
+
+
+# --------------------------------------------------------------------------- #
+# Egress, QONNX flavor: emit Quant nodes for a Brevitas-side external trainer
+# --------------------------------------------------------------------------- #
+def _quant_node_for(
+    ann: QdqAnnotation, x_name: str, taken: Set[str]
+) -> Tuple[onnx.NodeProto, onnx.TensorProto, onnx.TensorProto]:
+    """A QONNX ``Quant`` node computing the same fake-quantized value ``ann``
+    already describes, reading ``x_name`` as its float input -- plus the two
+    new initializers it needs (``ann.scale_name`` itself is reused as-is,
+    since ``Quant``'s scale convention is identical to QDQ's).
+
+    QONNX has no zero-point *dtype* to speak of -- unlike ``DequantizeLinear``,
+    whose ``zeropoint`` is stored as an integer tensor of the target
+    (u)int8/(u)int16 dtype, ``Quant``'s ``zeropoint`` is always ``T`` (the
+    same float type as ``X``), and the bit-width that would otherwise be
+    implied by that dtype is instead its own explicit ``bitwidth`` input.
+    Both are therefore rebuilt fresh here rather than reused from the QDQ
+    pair being replaced.
+    """
+    bitwidth_by_dtype = {
+        onnx.TensorProto.INT8: 8,
+        onnx.TensorProto.UINT8: 8,
+        onnx.TensorProto.INT16: 16,
+        onnx.TensorProto.UINT16: 16,
+    }
+    bitwidth = bitwidth_by_dtype[ann.zero_point_dtype]
+    signed = ann.zero_point_dtype in (onnx.TensorProto.INT8, onnx.TensorProto.INT16)
+
+    zp_name = _unique(f"{ann.tensor_name}_qonnx_zeropoint", taken)
+    bw_name = _unique(f"{ann.tensor_name}_qonnx_bitwidth", taken)
+    out_name = _unique(f"{ann.tensor_name}_qonnx_quant", taken)
+    node_name = _unique(f"{ann.tensor_name}_qonnx_quant_node", taken)
+
+    zp_init = onnx.numpy_helper.from_array(
+        np.asarray(ann.zero_point, dtype=np.float32), zp_name
+    )
+    bw_init = onnx.numpy_helper.from_array(
+        np.asarray(float(bitwidth), dtype=np.float32), bw_name
+    )
+    node = onnx.helper.make_node(
+        "Quant",
+        [x_name, ann.scale_name, zp_name, bw_name],
+        [out_name],
+        name=node_name,
+        domain="qonnx.custom_op.general",
+        signed=int(signed),
+        narrow=0,
+        rounding_mode="ROUND",
+    )
+    return node, zp_init, bw_init
+
+
+def _rewrite_qdq_to_quant(
+    model: onnx.ModelProto, scan: QdqScan, zero_point_names: Sequence[str]
+) -> Tuple[onnx.ModelProto, Tuple[str, ...]]:
+    """``model`` (a plain QDQ model, freshly emitted by ``quantize_static``)
+    with every pair named in ``scan.annotations`` replaced by an equivalent
+    QONNX ``Quant`` node -- the mirror image of :func:`_strip`, which
+    replaces such a pair with the plain float tensor instead of a new node.
+
+    ``zero_point_names`` is ``export_fake_quant``'s own
+    ``FakeQuantExport.learnable_zero_points`` for the QDQ model being
+    converted: those names stop existing here (the old integer-dtype
+    zero-point initializers are dropped along with their pair, replaced by
+    the new float-dtype ones ``_quant_node_for`` creates), so the returned
+    tuple is that same list with each name remapped to its replacement,
+    same order, so the caller's ``FakeQuantExport`` stays accurate against
+    the model this function returns.
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+    producers = _producers(graph)
+    inits = {init.name: init for init in graph.initializer}
+    taken = (
+        {init.name for init in graph.initializer}
+        | {out for node in graph.node for out in node.output}
+        | {node.name for node in graph.node if node.name}
+        | {v.name for v in list(graph.input) + list(graph.output)}
+    )
+
+    drop_nodes: Set[str] = set()
+    rewire: Dict[str, str] = {}
+    orphan_candidates: Set[str] = set()
+    replace_at: Dict[str, onnx.NodeProto] = {}
+    new_inits: List[onnx.TensorProto] = []
+    zp_remap: Dict[str, str] = {}
+
+    for ann in scan.annotations:
+        drop_nodes.add(ann.dequantize_node)
+        orphan_candidates.add(ann.scale_name)
+        if ann.zero_point_name:
+            orphan_candidates.add(ann.zero_point_name)
+
+        if ann.quantize_node is not None:
+            drop_nodes.add(ann.quantize_node)
+            x_name = ann.tensor_name
+        else:
+            # Shape 3: no float tensor exists in the graph to read as X --
+            # materialize one from the stored integer codes, the same way
+            # _strip does for the same shape.
+            dq = producers[ann.dequantize_node]
+            codes_name = dq.input[0]
+            orphan_candidates.add(codes_name)
+            x_name = _unique(f"{ann.tensor_name}_float", taken)
+            new_inits.append(
+                onnx.numpy_helper.from_array(
+                    _dequantize(onnx.numpy_helper.to_array(inits[codes_name]), ann),
+                    x_name,
+                )
+            )
+
+        quant_node, zp_init, bw_init = _quant_node_for(ann, x_name, taken)
+        new_inits.extend([zp_init, bw_init])
+        rewire[ann.dequantize_node] = quant_node.output[0]
+        replace_at[ann.dequantize_node] = quant_node
+        if ann.zero_point_name:
+            zp_remap[ann.zero_point_name] = zp_init.name
+
+    # Each new Quant node takes the exact position its dequantize_node had --
+    # not appended after everything else -- because its own X input may be an
+    # intermediate activation some *earlier* node in this graph produces
+    # (shape 1: an activation quantized partway through the graph, not at its
+    # very start). The dequantize_node's own position was already valid for
+    # that dependency, so replacing it in place keeps the whole graph
+    # topologically sorted; only the (always now-earlier, and now unneeded)
+    # paired quantize_node is dropped outright, never replaced.
+    rebuilt = []
+    for node in graph.node:
+        out0 = node.output[0] if node.output else None
+        if out0 in replace_at:
+            rebuilt.append(replace_at[out0])
+        elif out0 not in drop_nodes:
+            rebuilt.append(node)
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    for node in graph.node:
+        for i, name in enumerate(node.input):
+            if name in rewire:
+                node.input[i] = rewire[name]
+    graph.initializer.extend(new_inits)
+
+    still_used: Set[str] = set()
+    for node in graph.node:
+        still_used.update(node.input)
+    for sub in _iter_subgraphs(graph):
+        for node in sub.node:
+            still_used.update(node.input)
+    still_used.update(o.name for o in graph.output)
+    still_used.update(i.name for i in graph.input)
+    orphans = {name for name in orphan_candidates if name not in still_used}
+    if orphans:
+        surviving = [i for i in graph.initializer if i.name not in orphans]
+        del graph.initializer[:]
+        graph.initializer.extend(surviving)
+
+    gone = drop_nodes | orphans
+    surviving_info = [v for v in graph.value_info if v.name not in gone]
+    del graph.value_info[:]
+    graph.value_info.extend(surviving_info)
+
+    if not any(oi.domain == "qonnx.custom_op.general" for oi in out.opset_import):
+        opset = out.opset_import.add()
+        opset.domain = "qonnx.custom_op.general"
+        opset.version = 1
+
+    remapped_zero_points = tuple(zp_remap.get(name, name) for name in zero_point_names)
+    return out, remapped_zero_points
+
+
+def export_fake_quant_qonnx(
+    model: Union[str, onnx.ModelProto],
+    scheme: str = "int8",
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_calibration_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+    rename_parameters: bool = True,
+) -> FakeQuantExport:
+    """Like :func:`export_fake_quant`, but emits QONNX ``Quant`` nodes
+    (``qonnx.custom_op.general`` domain) instead of ``QuantizeLinear``/
+    ``DequantizeLinear`` pairs -- for a Brevitas-side external trainer, which
+    differentiates a single ``Quant`` node directly rather than a QDQ pair
+    (Brevitas's own autograd function *is* what ``export_qonnx`` traces
+    through to produce one in the first place). The two share every
+    parameter, and share the actual quantization math: this calls
+    :func:`export_fake_quant` for the calibration/rewrite/naming it already
+    does, then rewrites the result's QDQ pairs to ``Quant`` nodes with
+    :func:`_rewrite_qdq_to_quant` -- so a model round-tripped through this and
+    then :func:`quantize_static_keeping_qdq_scales` (which reads ``Quant``
+    nodes directly, per the module docstring's "QONNX/Brevitas ingest"
+    section) recovers exactly the parameters that were trained.
+
+    ``learnable_scales`` names are unaffected (a ``Quant`` node's ``scale``
+    input is the same tensor, same convention, as a QDQ pair's own scale);
+    ``learnable_zero_points`` names are not, since QONNX's zero-point is
+    always a float tensor rather than an integer one of the target dtype --
+    see :func:`_rewrite_qdq_to_quant`'s own docstring for how those are kept
+    in sync with the model this function returns.
+
+    :param model: onnx ModelProto object or file path
+    :param scheme: ``"int8"`` or ``"int16"`` -- see :func:`export_fake_quant`.
+            Maps onto ``Quant``'s ``bitwidth``/``signed`` (8/unsigned for
+            activations under ``"int8"``, 16/unsigned under ``"int16"``; a
+            weight is always 8/signed, matching onnxsim's own weight scheme
+            regardless of ``scheme``).
+    :param calibration_data: see :func:`export_fake_quant`
+    :param num_calibration_samples: see :func:`export_fake_quant`
+    :param seed: see :func:`export_fake_quant`
+    :param providers: see :func:`export_fake_quant`
+    :param method: see :func:`export_fake_quant`
+    :param rename_parameters: see :func:`export_fake_quant` -- applies only to
+            the QDQ-stage names this reuses (``learnable_scales``); the new
+            zero-point/bit-width tensors ``Quant`` needs are always given
+            descriptive names, since they have no "original" name to keep.
+    :returns: a :class:`FakeQuantExport` whose model uses ``Quant`` nodes
+    """
+    export = export_fake_quant(
+        model,
+        scheme=scheme,
+        calibration_data=calibration_data,
+        num_calibration_samples=num_calibration_samples,
+        seed=seed,
+        providers=providers,
+        method=method,
+        rename_parameters=rename_parameters,
+    )
+    scan = find_existing_qdq(export.model)
+    qonnx_model, zero_points = _rewrite_qdq_to_quant(
+        export.model, scan, export.learnable_zero_points
+    )
+    _set_metadata(
+        qonnx_model, LEARNABLE_SCALES_KEY, json.dumps(export.learnable_scales)
+    )
+    _set_metadata(qonnx_model, LEARNABLE_ZERO_POINTS_KEY, json.dumps(zero_points))
+    return FakeQuantExport(qonnx_model, export.learnable_scales, zero_points)
