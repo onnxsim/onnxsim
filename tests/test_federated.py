@@ -85,7 +85,10 @@ def test_fedavg_rejects_empty_or_mismatched_input():
         federated.fedavg([{"A": np.zeros(1, dtype=np.float32)}], [])
     with pytest.raises(ValueError, match="positive"):
         federated.fedavg(
-            [{"A": np.zeros(1, dtype=np.float32)}, {"A": np.zeros(1, dtype=np.float32)}],
+            [
+                {"A": np.zeros(1, dtype=np.float32)},
+                {"A": np.zeros(1, dtype=np.float32)},
+            ],
             [0.0, 0.0],
         )
     with pytest.raises(ValueError, match="same tensors"):
@@ -245,14 +248,24 @@ def test_run_federated_round_matches_manual_fedavg_of_independent_client_runs():
     )
 
     trained_a = lora.train_lora(
-        injected, adapter, "X", "Y",
-        target_data=[y_a], calibration_data=[{"X": x_a}],
-        num_iterations=5, learning_rate=1e-2,
+        injected,
+        adapter,
+        "X",
+        "Y",
+        target_data=[y_a],
+        calibration_data=[{"X": x_a}],
+        num_iterations=5,
+        learning_rate=1e-2,
     )
     trained_b = lora.train_lora(
-        injected, adapter, "X", "Y",
-        target_data=[y_b], calibration_data=[{"X": x_b}],
-        num_iterations=5, learning_rate=1e-2,
+        injected,
+        adapter,
+        "X",
+        "Y",
+        target_data=[y_b],
+        calibration_data=[{"X": x_b}],
+        num_iterations=5,
+        learning_rate=1e-2,
     )
     expected = federated.fedavg(
         [

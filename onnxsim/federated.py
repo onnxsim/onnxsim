@@ -85,8 +85,7 @@ class FederatedClient:
     def __post_init__(self) -> None:
         if (self.reference_model is None) == (self.target_data is None):
             raise ValueError(
-                "FederatedClient needs exactly one of reference_model or "
-                "target_data"
+                "FederatedClient needs exactly one of reference_model or target_data"
             )
 
     def weight(self) -> int:
@@ -160,8 +159,7 @@ def fedavg(
         raise ValueError("fedavg needs at least one client state")
     if len(weights) != len(client_states):
         raise ValueError(
-            f"fedavg got {len(client_states)} client states but "
-            f"{len(weights)} weights"
+            f"fedavg got {len(client_states)} client states but {len(weights)} weights"
         )
     total = float(sum(weights))
     if total <= 0:
@@ -170,9 +168,7 @@ def fedavg(
     names = set(client_states[0])
     for state in client_states[1:]:
         if set(state) != names:
-            raise ValueError(
-                "fedavg needs every client state to name the same tensors"
-            )
+            raise ValueError("fedavg needs every client state to name the same tensors")
 
     averaged: Dict[str, np.ndarray] = {}
     for name in names:
