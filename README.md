@@ -1182,6 +1182,16 @@ onnxsim.export_transformers_model(
 )
 ```
 
+Producing the checkpoint in the first place is a separate concern from
+exporting/simplifying it -- see `examples/llm_distillation/` for a standalone
+knowledge-distillation demo that trains a ~162M-parameter causal-LM student
+(`JackFram/llama-160m`'s architecture) against a ~1.1B-parameter teacher
+(TinyLlama-1.1B's architecture), and can hand the result straight to
+`export_transformers_model()` above. That directory's `wasm_demo/` subfolder
+also runs a (much smaller, toy-scale) version of the same distillation
+training live in a browser tab, via ONNX Runtime Web's on-device training
+API -- no PyTorch, no server.
+
 ## Diffusion model export
 
 A Hugging Face `diffusers` pipeline (Stable Diffusion, SDXL, ...) isn't one

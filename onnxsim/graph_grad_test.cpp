@@ -323,6 +323,7 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "Identity",
                                           "InstanceNormalization",
                                           "LayerNormalization",
+                                          "Log",
                                           "MatMul",
                                           "MaxPool",
                                           "Mul",

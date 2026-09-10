@@ -1187,6 +1187,16 @@ def _grad_sqrt(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return [ctx.b.div(ctx.b.mul(g, ctx.b.const(0.5)), node.output[0])]
 
 
+def _grad_log(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    # d/dx log(x) = g / x. Admitted for the log-softmax term a cross-entropy
+    # or knowledge-distillation loss needs (log(softmax(x)), built from this
+    # plus the existing Softmax rule rather than as a fused LogSoftmax rule of
+    # its own) -- singular at x = 0 the same way _grad_sqrt is, and for the
+    # same reason: that is genuinely where the derivative blows up, not
+    # something to paper over here.
+    return [ctx.b.div(g, node.input[0])]
+
+
 def _grad_transpose(
     ctx: _Backward, node: onnx.NodeProto, g: str
 ) -> List[Optional[str]]:
@@ -1831,6 +1841,7 @@ _RULES: Dict[str, Rule] = {
     "Identity": _grad_identity,
     "InstanceNormalization": _grad_instance_normalization,
     "LayerNormalization": _grad_layer_normalization,
+    "Log": _grad_log,
     "MatMul": _grad_matmul,
     "MaxPool": _grad_maxpool,
     "Mul": _grad_mul,

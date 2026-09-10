@@ -147,6 +147,13 @@ dmypy.json
 # author's machine.
 !scripts/convertmodel/test/*.onnx
 
+# Same reasoning for the WASM knowledge-distillation demo's checked-in
+# assets (see examples/llm_distillation/wasm_demo/generate_web_artifacts.py):
+# index.html fetches these small, tiny-architecture files directly, with no
+# build/generation step at request time, so they must not be silently
+# dropped by the blanket *.onnx rule above.
+!examples/llm_distillation/wasm_demo/assets/*.onnx
+
 # Tiny (34KB) unsimplified nanochat export, committed so it can be dropped
 # straight into the browser wasm UI's file picker -- see scripts/nanochat/README.md.
 # The same file also lives under scripts/convertmodel/, served same-origin

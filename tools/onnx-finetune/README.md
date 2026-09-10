@@ -27,26 +27,36 @@ Swift runtime, never Python).
 
 ## Prerequisite: a training-enabled ONNX Runtime build
 
-Neither the `pip install onnxruntime` wheels nor the official prebuilt
-release tarballs (the ones under GitHub Releases) include the training C++
-API or `onnxruntime.training.artifacts`. You need to build ONNX Runtime from
-source with training enabled, once:
+For `scripts/generate_artifacts.py` (and, if you'd rather train from Python
+than build the C++ CLI below, `onnxruntime.training.api` too): just
+`pip install onnxruntime-training` -- a separate PyPI distribution from
+plain `onnxruntime`, published by the ONNX Runtime team with
+`onnxruntime.training.artifacts`/`.api` included, no source build needed.
+(Pinned at 1.19.2 as of this writing -- there have been no newer releases of
+this particular distribution; match that version if you build `onnx-
+finetune` itself from source per the following, to keep the artifact
+format and IR version expectations aligned between the two.)
+
+`onnxruntime.training`'s own `__init__.py` unconditionally imports an `optim`
+submodule that unconditionally imports `torch` -- for an apex/FP16
+optimizer-modifier interop this tool never touches, but `pip install
+onnxruntime-training` does not pull `torch` in as a dependency, so a clean
+environment fails on `import onnxruntime.training.artifacts` with
+`ModuleNotFoundError: No module named 'torch'` until you install it too (a
+CPU-only build is enough: `pip install torch --index-url
+https://download.pytorch.org/whl/cpu`).
+
+`onnx-finetune` itself (the C++ CLI) and its WASM binding are a different
+story: neither the `pip install onnxruntime` wheels nor the official
+prebuilt release tarballs (the ones under GitHub Releases) include the
+training C++ headers/library at all, in any distribution -- for those two,
+you need to build ONNX Runtime from source with training enabled, once:
 
 ```sh
 git clone --branch v1.19.2 https://github.com/microsoft/onnxruntime.git
 cd onnxruntime
 git submodule update --init --recursive
 
-# For generate_artifacts.py (Python bindings + wheel):
-python3 tools/ci_build/build.py \
-  --build_dir build --config Release --parallel \
-  --skip_tests --allow_running_as_root \
-  --build_shared_lib --enable_training \
-  --enable_pybind --build_wheel
-
-# For onnx-finetune only (no Python bindings needed), drop --enable_pybind
-# --build_wheel and --enable_training_apis is enough instead of the fuller
-# --enable_training:
 python3 tools/ci_build/build.py \
   --build_dir build --config Release --parallel \
   --skip_tests --allow_running_as_root \
@@ -54,13 +64,15 @@ python3 tools/ci_build/build.py \
 ```
 
 This is a real ~20-40 minute build (protobuf, abseil, onnx, and ONNX Runtime
-itself, all from source). If you only need to run `onnx-finetune` against
-artifacts someone else generated, the second (`--enable_training_apis`) build
-is sufficient and noticeably smaller in scope than the first.
-
-If `pip install .` on the wheel build fails with a `setuptools`/`distutils`
+itself, all from source). `--enable_training_apis` is enough for the C++ CLI
+and WASM binding (no Python bindings needed, so no `--enable_pybind
+--build_wheel`); if you separately need a from-source *Python* build of
+`onnxruntime.training` for some reason `pip install onnxruntime-training`
+doesn't cover (a different commit, GPU support, ...), add `--enable_training
+--enable_pybind --build_wheel` instead of `--enable_training_apis` -- and if
+`pip install .` on that wheel build fails with a `setuptools`/`distutils`
 `install_layout` error, that's an unrelated packaging-step bug in older
-`setup.py` against newer `setuptools` -- the compiled Python module already
+`setup.py` against newer `setuptools`: the compiled Python module already
 exists by that point, at `<build_dir>/Release/build/lib/`, and can be used
 directly by pointing `PYTHONPATH` there without needing an installed wheel:
 
@@ -77,6 +89,23 @@ cmake -B build \
   -DORT_BUILD_DIR=/path/to/onnxruntime/build/Release
 cmake --build build
 ```
+
+`onnx-finetune-distill-step-graph` (see "Knowledge distillation (graph_grad)" above) is a
+separate target with a much lighter requirement -- `ORT_HOME` pointing at *any* plain
+onnxruntime distribution that ships `onnxruntime_cxx_api.h` + `libonnxruntime`, no
+`--enable_training_apis` build needed at all:
+
+```sh
+# An official prebuilt release works -- no build, no ORT_SOURCE_DIR/ORT_BUILD_DIR.
+curl -sSL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz
+tar xzf ort.tgz
+cmake -B build -DORT_HOME=$PWD/onnxruntime-linux-x64-1.19.2
+cmake --build build --target onnx-finetune-distill-step-graph
+```
+
+Both `-DORT_SOURCE_DIR`/`-DORT_BUILD_DIR` and `-DORT_HOME` can be given to the same `cmake -B
+build` invocation to build both tools at once; each is independently optional (whichever
+you omit, that tool's target is simply skipped).
 
 ## Usage
 
@@ -252,12 +281,119 @@ and defeat the point of keeping it full precision. NF4 quantization only
 covers 2-D MatMul/vanilla-Gemm weights (see `onnxsim/nf4.py`), so a 1x1-Conv
 LoRA target stays full precision under `prepare_qlora.py` too.
 
+## Knowledge distillation
+
+Train a small "student" classifier to mimic a larger "teacher" via knowledge distillation
+(Hinton et al. -- temperature-scaled soft-target cross-entropy, combined with the usual
+hard-label cross-entropy): `generate_artifacts.py --loss distillation` builds a custom loss
+graph (`scripts/distillation_loss.py`) that takes a second model's logits as an extra input,
+rather than one of the three plain `--loss` enum choices above.
+
+```sh
+# 1. A teacher (bigger) and a student (smaller) classifier -- any two ONNX
+#    models producing (batch, num_classes) logits work; make_toy_classifier.py
+#    is provided for trying this out without one of your own.
+python3 scripts/make_toy_classifier.py -o teacher.onnx --hidden-dim 32 --num-classes 4
+python3 scripts/make_toy_classifier.py -o student.onnx --hidden-dim 8  --num-classes 4
+
+# 2. Training artifacts for the student only -- the teacher never enters
+#    generate_artifacts.py at all; its logits are supplied at *train* time
+#    (step 4), not baked into the artifacts. --distill-temperature/--distill-alpha
+#    default to 2.0/0.5 (1.0 = pure distillation, 0.0 = plain supervised training).
+python3 scripts/generate_artifacts.py student.onnx -o artifacts \
+  --loss distillation --distill-temperature 2.0 --distill-alpha 0.5
+
+# 3. Labels are int64 class indices, not float32 -- make_synthetic_classification_data.py
+#    writes them in that layout (see make_synthetic_data.py for the plain-regression
+#    equivalent this tool's other --loss modes use).
+python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samples 2048
+
+# 4. Train: --teacher-model runs a plain frozen inference session against
+#    --teacher-model on each batch's input to supply teacher_logits, so
+#    --train-input/--train-target stay exactly the same two files any other
+#    --loss mode uses. --label-dtype int64 is required here (see below).
+./build/onnx-finetune \
+  --artifacts-dir artifacts --teacher-model teacher.onnx \
+  --train-input train_input.bin --train-target train_labels.bin --label-dtype int64 \
+  --input-dim 8 --target-dim 1 --num-samples 2048 \
+  --batch-size 32 --epochs 20 --lr 0.01 \
+  --output-model distilled.onnx --output-names logits
+```
+
+The training graph `--loss distillation` produces declares **three** external inputs at
+runtime, in this fixed order: the model's own input, `teacher_logits`, then `labels` -- not
+the usual two -- which is exactly what `--teacher-model` mode feeds (the ordinary two data
+files, plus a teacher forward pass computed internally each step). Training also exposes the
+soft/hard sub-losses as two extra outputs (`kd_soft_loss`/`kd_hard_loss`); `--log-every`'s
+printed line includes both automatically whenever `--teacher-model` is given.
+
+The WASM binding mirrors this one-for-one: pass a 5th argument (`teacherModelBytes`) to
+`new Module.FinetuneSession(...)` to enable distillation mode -- `trainStep()`'s own JS
+signature is unchanged, and `session.lastSubLosses()` returns `{soft, hard}` after each step
+(`undefined` outside distillation mode). See `wasm/README.md`.
+
+This is a general-purpose classification loss, not tied to any particular architecture --
+unlike `examples/llm_distillation/`'s standalone PyTorch/ONNX Runtime Web demos elsewhere in
+this repo (a ~1B/~162M-parameter causal-LM pair, and a browser-trained toy Llama respectively),
+which distill actual language models. Nothing here requires `torch`/`transformers`: only
+`onnx` + a training-enabled `onnxruntime`, same as every other `generate_artifacts.py` mode.
+
+### Knowledge distillation (graph_grad) -- no training-enabled ONNX Runtime at all
+
+A second, independent implementation of the same idea, existing alongside the one above rather
+than replacing it: `scripts/generate_distillation_step_graph.py` differentiates the whole
+student forward pass and the KD loss itself with onnxsim's own reverse-mode autodiff
+(`onnxsim.graph_grad`/`onnxsim.qat_graph` -- the same machinery `onnxsim.lora`/`onnxsim.qat`
+already use to avoid `onnxruntime.training` for LoRA and block-wise QAT), instead of
+`onnxruntime.training.artifacts`/`onnxblock`. The result is **one** ordinary ONNX graph --
+forward, loss, backward, and an Adam step all baked in -- runnable by repeatedly calling
+`session.run()`/`Run()` on a **plain, non-training** onnxruntime. No `pip install
+onnxruntime-training`, no from-source `--enable_training_apis` build, anywhere in this path --
+see that script's own module docstring for the full design writeup, including the one real
+trade-off it makes (a step graph's batch size is fixed at build time; `onnxruntime.training`'s
+graph tolerates a symbolic one).
+
+```sh
+# 1. Same teacher/student pair as above.
+python3 scripts/make_toy_classifier.py -o teacher.onnx --hidden-dim 32 --num-classes 4
+python3 scripts/make_toy_classifier.py -o student.onnx --hidden-dim 8  --num-classes 4
+
+# 2. One step graph, batch size fixed at build time. Also writes step.onnx.manifest.txt
+#    and step.onnx.initial_state.bin alongside it -- a non-Python caller (the native CLI
+#    below, or the wasm runner) needs both to actually run it.
+python3 scripts/generate_distillation_step_graph.py student.onnx -o step.onnx --batch-size 32
+
+# 3. Same synthetic data as above (int64 labels; this path builds its own one-hot matrix
+#    from them on the host, see the script's docstring on why that's not done in-graph).
+python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samples 2048
+
+# 4. Train with the plain-onnxruntime native tool (see "Building" below for ORT_HOME) --
+#    a completely separate binary from ./build/onnx-finetune, built against a *plain*
+#    onnxruntime (an official prebuilt release tarball works, no build at all).
+./build/onnx-finetune-distill-step-graph \
+  --step-graph step.onnx --teacher-model teacher.onnx \
+  --train-input train_input.bin --train-target train_labels.bin --num-samples 2048 \
+  --epochs 20 --lr 0.01 --output-weights final_weights.bin
+
+# 5. Reassemble the trained weights into an ordinary, inference-ready .onnx -- the plain
+#    Ort::Session this tool uses has no ExportModelForInferencing equivalent, so this one
+#    step stays in Python, the same division of labor the rest of this repo already uses.
+python3 scripts/apply_trained_weights.py student.onnx step.onnx.manifest.txt final_weights.bin \
+  -o distilled.onnx
+```
+
+Building `onnx-finetune-distill-step-graph` needs only `-DORT_HOME=/path/to/a/plain/onnxruntime`
+(see "Building onnx-finetune" below) -- unlike `onnx-finetune` itself, it never needs
+`ORT_SOURCE_DIR`/`ORT_BUILD_DIR`. The browser has its own runner too, built on the *official*
+`onnxruntime-web` npm package rather than a custom Emscripten build: see
+`wasm/distill_step_graph/`.
+
 ## CLI reference
 
 | flag | required | description |
 |---|---|---|
 | `--artifacts-dir` | yes | directory containing `checkpoint`, `training_model.onnx`, `eval_model.onnx`, `optimizer_model.onnx` |
-| `--train-input` / `--train-target` | yes | raw float32 binary files |
+| `--train-input` / `--train-target` | yes | raw binary files -- `--train-input` always float32, `--train-target` float32 unless `--label-dtype int64` |
 | `--input-dim` / `--target-dim` | yes | per-sample element counts |
 | `--num-samples` | yes | total samples in the input/target files |
 | `--output-model` | yes | where to write the fine-tuned inference `.onnx` |
@@ -267,3 +403,6 @@ LoRA target stays full precision under `prepare_qlora.py` too.
 | `--lr` | no (default 1e-3) | |
 | `--save-checkpoint` | no | also save the post-training checkpoint (for resuming training later) |
 | `--log-every` | no (default 50) | print loss every N steps; 0 disables |
+| `--label-dtype` | no (default `float32`) | `int64` for class-index labels (`--loss cross-entropy`/`distillation`) |
+| `--teacher-model` | no | enables distillation mode: path to a frozen teacher `.onnx`, run each step to produce `teacher_logits`. Requires `--label-dtype int64` and artifacts from `--loss distillation` |
+| `--teacher-output-name` | no | which of the teacher model's outputs to use; defaults to its sole output |
