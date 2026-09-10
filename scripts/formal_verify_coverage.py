@@ -28,7 +28,24 @@ _TESTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tes
 # optimizer passes (see each such file's own module docstring) -- these
 # don't correspond to a pass name and aren't counted against the pass
 # universe below.
-_NOT_A_PASS = {"quantize_round_trip", "quantized_mac_bound"}
+_NOT_A_PASS = {
+    "quantize_round_trip",
+    "quantized_mac_bound",
+    # graph_grad's VJP rules (onnxsim/graph_grad.py / graph_grad.cpp) are not
+    # onnxoptimizer passes at all -- they're proved here for the same reason,
+    # but have no C._list_optimizers()/_list_other_optimizers() name to match
+    # against.
+    "grad_transpose",
+    "grad_add",
+    "grad_mul",
+    "grad_relu",
+    "grad_matmul",
+    "grad_gemm",
+    "grad_conv",
+    # onnxsim::TryExactDivide (onnxsim/sym_expr.cpp) is a shape-arithmetic
+    # primitive, not an onnxoptimizer pass either.
+    "sym_expr_exact_divide",
+}
 
 
 def _proved_pass_names():
