@@ -45,7 +45,7 @@ absolute prefix.
 **Runtime: partially exercised, currently flaky.** Loaded the compiled
 module in Node (bundled with emsdk, not a browser) and ran a real training
 loop against the same toy artifacts the native CLI's example uses. First
-attempt: the full 20-epoch loop ran and the loss converged
+attempt (historical): the full 20-epoch loop ran and the loss converged
 (5.06 -> ~0.00001, matching the native CLI almost exactly) -- genuine
 confirmation the training loop executes correctly in wasm -- but
 `exportModel()` then failed with an undecodable raw exception pointer
@@ -56,16 +56,30 @@ lives on `onnxruntime_webassembly`'s LINK_FLAGS in
 is a bundled `STATIC IMPORTED` library rather than the final linked module)
 -- but `build.ninja` shows the flag was already present globally via ORT's
 own wasm CXX flags both before and after that change, so it wasn't actually
-the fix. Two rebuilds since then (with the flag change, then again with
-constructor/TrainStep try/catch diagnostics added) both fail *immediately*,
-before any training step runs at all -- a regression from the first
-successful run, cause not yet identified. Leading hypothesis, unconfirmed:
-JSEP/WebGPU EP init probing `navigator.gpu` during session construction,
-which doesn't exist in Node (only real browsers) -- would need a JSEP-off
-comparison build to confirm (a ~25min rebuild, not a quick check, since
-`-DUSE_JSEP=1` is baked into many cached object files). Whether it runs
-correctly in an actual browser (`example/`, where `navigator.gpu` is real)
-is untested.
+the fix.
+
+**Update, from re-testing while adding distillation support:** the earlier
+"JSEP/WebGPU EP probing `navigator.gpu`" hypothesis is **ruled out**. A
+`-DONNX_FINETUNE_WASM_WEBGPU=OFF` rebuild (no JSEP at all) still fails on
+the very first `trainStep()` call -- but now with a real, decodable error
+instead of an opaque pointer: `RuntimeError: memory access out of bounds`,
+thrown from inside a `dynCall`/`invoke_viiiii` trampoline (an indirect call
+into a training-op kernel). Reproduces at the smallest possible scale
+(`batch=1`, the plain 2-tensor non-distillation path, the exact toy
+regression model the README's own example uses) -- not something specific
+to distillation, larger batches, or JSEP. This looks like a genuine
+wasm32-compiled-kernel memory bug in this exact onnxruntime v1.19.2 +
+emsdk 3.1.59 combination, not an application-level bug in this file or
+`../src/main.cpp` (both build clean and are exercised end to end by the
+*native* CLI without issue -- see `../README.md`'s distillation section).
+Root-causing further needs bisecting onnxruntime commits/emsdk versions
+with a symbol-level (`-g`) debug build, which is out of scope here;
+`.github/workflows/onnx-finetune-training.yml`'s wasm job runs this
+anyway (so a future fix shows up as newly-green CI) but doesn't block on
+it. Whether it runs correctly in an actual browser (`example/`, untested
+either way) is unknown -- Node is where this was reproduced, and there's
+no reason to expect a browser's wasm engine to behave differently for a
+plain memory-safety bug like this.
 
 ## Design
 
