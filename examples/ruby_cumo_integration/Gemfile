@@ -1,0 +1,9 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+gem 'ffi', '~> 1.16'
+# https://github.com/sonots/cumo -- GPU (CUDA) NArray, API-compatible with
+# Numo::NArray. Requires an NVIDIA GPU + CUDA 11.0+ to install and run; see
+# this directory's README.
+gem 'cumo'
