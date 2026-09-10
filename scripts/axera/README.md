@@ -5715,9 +5715,47 @@ Worth stating on its own, because it is cheaper than any of this: **a
 calibration set that does not cover the input costs more than the quantiser
 does, and no amount of bit depth buys it back.**
 
-The card reaching 33.00 where the model says 53.26 leaves about 20 dB
-unexplained -- a floor that is not the weights (the same simulation with
-*exact* weights reads 71 dB) and not the activation width. That is open.
+#### The 20 dB that looked unexplained was the scales, and there is no floor
+
+The card reaching 33.00 where an idealised simulation says 53.26 looked like a
+hardware floor. It is not. `pulsar2 build` writes every scale it chose into
+`<output>/quant/quant_axmodel.json` -- bit width, policy, and a hash into a
+shared `values` table holding the scale and zero point. Feed *those* numbers
+back into the float graph instead of recomputing MinMax ranges, and the
+prediction lands on the measurement:
+
+| build | replayed offline | on the AX650N |
+| --- | --- | --- |
+| INT8 | 21.64 dB | 21.64 dB |
+| INT8, split weights | 21.15 dB | 21.34 dB |
+| U16 | 25.78 dB | 25.77 dB |
+| U16, split weights | **33.03 dB** | **33.00 dB** |
+
+Four builds, worst case 0.19 dB, two of them exact. **The card computes
+precisely the affine quantisation the compiler wrote down.** There is no
+unexplained numerical floor, and the gap was never the hardware -- it was that
+the compiler's chosen ranges are wider than an ideal MinMax fit, which is the
+calibration point above stated a second way.
+
+`replay.py` is that replay, spelled as ONNX arithmetic (`Div`, `Round`,
+`Clip`, `Mul`) rather than `QuantizeLinear`, because a UINT16 zero point needs
+opset 21 and bumping a real graph that far breaks ops whose signature moved on
+the way -- `ReduceMean`'s `axes` became an input at opset 18.
+
+The practical consequence: **accuracy on this NPU can be searched offline.**
+Precision configurations and calibration sets can be scored against a build's
+own quantisation table with no card and no rebuild.
+
+**Where it is not yet faithful: fusion.** On the full Audio8 decoder the
+replay reads 3.65 dB against the card's 7.37 -- pessimistic, and for a
+findable reason. `quant/quant_axmodel.onnx` is the graph Pulsar2 actually
+lowers, and 385 of the float graph's 1002 tensors are simply *not in it*,
+folded inside a fused `AxQuantizedRMSNorm`, `AxQuantizedRoPE` or
+`AxQuantizedFullyConnected`. Nothing on the card rounds those, so quantising
+them invents error: doing so read 1.12 dB. Filtering to the tensors that
+survive as edges recovers 2.5 dB of the 6.3, and the rest is presumably
+higher-precision arithmetic *inside* the fused ops. So the replay is exact on
+a graph the compiler does not fuse and a lower bound on one it does.
 
 ### The fused-op namespace, and how to see it before you trip on it
 
@@ -6343,6 +6381,7 @@ CNN/LLM focus.
 | `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects both `onnxruntime`'s availability and `onnxsim` itself actually being importable (a checkout with `onnxsim`'s compiled extension not yet built fails `import onnxsim`, not just the lazy `onnxruntime` import inside it -- both are caught the same way so this degrades gracefully instead of taking `pulsar2_simulator.py`'s `import` down with it). |
 | `precision.py` | `weight_residual_split()`: rewrites `Conv`/`MatMul`/`Gemm`/`ConvTranspose` as `op(x, W_hi) + op(x, W_lo)` so two INT8 weights carry ~16 bits between them, plus `quantise_dequantise()`/`compiler_view()` (Pulsar2's per-output-channel weight quantiser, and the re-rounding the residual has to be taken against), `weight_error_db()` and `split_op_types()` (the op types to promote to `U16`, without which the split does not pay). Measured +7.23 dB on the AX650N at 16-bit activations -- see above. |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
+| `replay.py` | `load_scales()`/`insert_qdq()`/`replay()`: re-runs a float graph at the scales `pulsar2 build` recorded in `quant/quant_axmodel.json`, reproducing four real AX650N measurements to within 0.19 dB with no card and no rebuild. `surviving_edges()` drops the tensors the compiler fused away -- quantising those invents error the hardware never makes. Exact on an unfused graph, a lower bound on a fused one. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
