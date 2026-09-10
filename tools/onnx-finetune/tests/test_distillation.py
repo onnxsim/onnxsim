@@ -85,6 +85,15 @@ def test_generate_artifacts_distillation_mode(tmp_path, toy_models):
     # Combined loss first, then the soft/hard breakdown (additional_output_names).
     assert output_names[1:3] == ["kd_soft_loss", "kd_hard_loss"]
 
+    # Regression check for a real bug found only by actually running the
+    # native CLI: SoftmaxCrossEntropyLoss's labels input is rank 1 (batch,),
+    # not rank 2 (batch, 1) -- onnxblock drops the score tensor's trailing
+    # class dim entirely rather than shrinking it to size 1. main.cpp/
+    # onnx_finetune_wasm.cpp both build a rank-1 tensor for it specifically
+    # because of this.
+    labels_input = next(i for i in model.graph.input if i.name == "labels")
+    assert len(labels_input.type.tensor_type.shape.dim) == 1
+
 
 def test_generate_artifacts_rejects_distill_flags_without_distillation_loss(tmp_path, toy_models):
     _teacher_path, student_path = toy_models

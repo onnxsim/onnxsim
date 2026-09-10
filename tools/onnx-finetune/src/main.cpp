@@ -122,6 +122,17 @@ Args ParseArgs(int argc, char** argv) {
     std::fprintf(stderr, "error: --label-dtype must be float32 or int64\n");
     Usage(argv[0]);
   }
+  if (a.label_dtype == "int64" && a.target_dim != 1) {
+    // SoftmaxCrossEntropyLoss's labels input is rank 1 (batch,), not rank 2
+    // (batch, target_dim) -- onnxblock's CrossEntropyLoss/DistillationLoss
+    // both build it by dropping the score tensor's trailing class dim
+    // entirely, not shrinking it to size 1. --train-target still holds
+    // exactly one int64 class index per sample either way, so --target-dim
+    // stays the right knob for "how many raw values per sample in the
+    // file" -- just constrained to 1 here rather than a separate flag.
+    std::fprintf(stderr, "error: --label-dtype int64 requires --target-dim 1\n");
+    std::exit(1);
+  }
   if (!a.teacher_model.empty() && a.label_dtype == "float32") {
     // Distillation artifacts always use SoftmaxCrossEntropyLoss for the
     // hard-label term (see distillation_loss.py), which needs int64 --
@@ -272,7 +283,12 @@ int main(int argc, char** argv) {
       }
 
       std::vector<int64_t> in_shape = {args.batch_size, args.input_dim};
-      std::vector<int64_t> tgt_shape = {args.batch_size, args.target_dim};
+      // int64 labels are rank 1 (batch,) -- see ParseArgs's --target-dim
+      // check above for why -- float32 targets stay rank 2 (batch, target_dim)
+      // as before, for the regression --loss modes' arbitrary output_dim.
+      std::vector<int64_t> tgt_shape = args.label_dtype == "int64"
+          ? std::vector<int64_t>{args.batch_size}
+          : std::vector<int64_t>{args.batch_size, args.target_dim};
 
       std::vector<Ort::Value> step_inputs;
       step_inputs.push_back(Ort::Value::CreateTensor<float>(

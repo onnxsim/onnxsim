@@ -37,6 +37,26 @@ OPTIM_TYPES = {
     "sgd": artifacts.OptimType.SGD,
 }
 
+# onnx-finetune links a specific from-source onnxruntime build (see
+# README.md's "Prerequisite" section); its bundled C++ engine rejects any
+# model IR version newer than this. onnxruntime.training.artifacts.
+# generate_artifacts() builds optimizer_model.onnx fresh internally using
+# whichever onnx package happens to be installed, so its ir_version tracks
+# that package's default (13 as of a reasonably current onnx release) --
+# independent of training_model.onnx/eval_model.onnx, which inherit the
+# ir_version of the model passed in and so are usually already low enough.
+# Without this clamp, onnx-finetune fails at load time with "Unsupported
+# model IR version" even though generate_artifacts.py itself ran cleanly --
+# affects every --loss mode, not just distillation.
+MAX_SUPPORTED_IR_VERSION = 10
+
+
+def _clamp_ir_version(path):
+    model = onnx.load(path)
+    if model.ir_version > MAX_SUPPORTED_IR_VERSION:
+        model.ir_version = MAX_SUPPORTED_IR_VERSION
+        onnx.save(model, path)
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -147,6 +167,9 @@ def main():
             artifact_directory=args.output_dir,
         )
         print("wrote training artifacts ->", args.output_dir)
+
+    for name in ("training_model.onnx", "eval_model.onnx", "optimizer_model.onnx"):
+        _clamp_ir_version(os.path.join(args.output_dir, name))
 
 
 if __name__ == "__main__":

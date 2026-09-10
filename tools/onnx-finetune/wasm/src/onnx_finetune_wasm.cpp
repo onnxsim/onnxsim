@@ -153,8 +153,12 @@ class FinetuneSession {
       for (size_t i = 0; i < target_float_vec.size(); ++i) {
         target_int64_vec[i] = static_cast<int64_t>(target_float_vec[i]);
       }
+      // Rank 1 (batch,), not rank 2 -- see main.cpp's --label-dtype int64
+      // handling for why (onnxblock's labels input drops the score
+      // tensor's trailing class dim entirely, not just shrinking it to 1).
+      std::vector<int64_t> labels_shape = {batch};
       inputs.push_back(Ort::Value::CreateTensor<int64_t>(
-          mem_info, target_int64_vec.data(), target_int64_vec.size(), tgt_shape.data(), tgt_shape.size()));
+          mem_info, target_int64_vec.data(), target_int64_vec.size(), labels_shape.data(), labels_shape.size()));
     } else {
       std::vector<float> target_vec = emscripten::vecFromJSArray<float>(target);
       inputs.push_back(Ort::Value::CreateTensor<float>(mem_info, target_vec.data(), target_vec.size(),
