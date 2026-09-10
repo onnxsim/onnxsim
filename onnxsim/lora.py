@@ -591,8 +591,14 @@ def _build_lora_step_graph(
     dl_dy = b.mul(diff, b.const(2.0 / n_elems))
 
     targets = adapter.parameter_names()
+    # graph_grad.build_backward's shapes dict allows a dynamic (dim_param)
+    # entry, for callers (the distillation step graph) that need one -- this
+    # LoRA block's own shapes are always fully static, so the wider type
+    # here is just to match build_backward's signature, not a behavior
+    # change.
+    shapes_for_backward: Dict[str, Sequence[Union[int, str]]] = dict(shapes)
     grads = graph_grad.build_backward(
-        b, nodes, shapes, {block_output_name: dl_dy}, targets
+        b, nodes, shapes_for_backward, {block_output_name: dl_dy}, targets
     )
 
     state: Dict[str, Tuple[Sequence[int], str]] = {}

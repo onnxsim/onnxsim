@@ -1425,7 +1425,11 @@ def _build_step_graph(
     #    activation quantizers' own parameters are targets alongside the
     #    weights: nothing else reaches them, since they are read only by the
     #    fake-quant chain.
-    all_shapes = dict(shapes)
+    # graph_grad.build_backward's shapes dict allows a dynamic (dim_param)
+    # entry, for callers (the distillation step graph) that need one -- this
+    # QAT block's own shapes are always fully static, so the wider type here
+    # is just to match build_backward's signature, not a behavior change.
+    all_shapes: Dict[str, Sequence[Union[int, str]]] = dict(shapes)
     all_shapes.update(act_shapes)
     all_shapes.update(weight_shapes)
     targets = [weight_name for _, weight_name, _, _, _, _ in per_layer]

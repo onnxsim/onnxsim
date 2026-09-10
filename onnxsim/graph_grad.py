@@ -229,12 +229,17 @@ class _Backward:
             )
         return tuple(d if isinstance(d, str) else int(d) for d in self.shapes[name])
 
-    def int64_const(self, values: Sequence[int], hint: str = "i") -> str:
+    def int64_const(self, values: Sequence[Union[int, str]], hint: str = "i") -> str:
         """An int64 initializer, for the ``axes``/``shape`` inputs that
         ``ReduceSum`` and ``Reshape`` take as tensors from opset 13 on.
 
         ``GraphBuilder.const`` is float32-only, which is right for everything
-        it was written for; these two are the exceptions.
+        it was written for; these two are the exceptions. ``values`` accepts
+        a dynamic (``str``) entry only in the type-checking sense -- an
+        actual int64 constant cannot hold one, so ``np.asarray(..., dtype=
+        np.int64)`` below fails with its own clear ``ValueError`` if one
+        slips through, the same "misbehave via a failed conversion" contract
+        class ``_Backward``'s own docstring describes.
         """
         array = np.asarray(list(values), dtype=np.int64)
         name = self.b.name(hint)
@@ -307,7 +312,7 @@ class _Backward:
             )
         return out
 
-    def transpose_last_two(self, name: str, shape: Sequence[int]) -> str:
+    def transpose_last_two(self, name: str, shape: Sequence[Union[int, str]]) -> str:
         """``name`` with its last two axes swapped -- what a MatMul's own VJP
         needs, and what a bare ``Transpose`` (which reverses *all* axes) would
         get wrong for a batched operand."""
@@ -395,8 +400,11 @@ def _grad_gemm(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return grads
 
 
-def _prod(dims: Sequence[int]) -> int:
-    """The number of elements a shape holds; ``1`` for a rank-0 one."""
+def _prod(dims: Sequence[Union[int, str]]) -> int:
+    """The number of elements a shape holds; ``1`` for a rank-0 one. A
+    dynamic (``str``) entry fails via ``int()`` below, same as everywhere
+    else in this module that needs a dimension's actual size rather than
+    just its rank or position."""
     total = 1
     for d in dims:
         total *= int(d)
@@ -498,9 +506,9 @@ def _col2im_indices(
 
 def _conv_geometry(
     node: onnx.NodeProto,
-    x_shape: Tuple[int, ...],
-    w_shape: Tuple[int, ...],
-    y_shape: Tuple[int, ...],
+    x_shape: Tuple[Union[int, str], ...],
+    w_shape: Tuple[Union[int, str], ...],
+    y_shape: Tuple[Union[int, str], ...],
 ) -> Tuple[int, List[int], List[int], List[int], List[int]]:
     """``Conv``'s attributes resolved against its actual shapes.
 
@@ -512,7 +520,12 @@ def _conv_geometry(
     rule would otherwise compute against a geometry it invented. The last one
     is the important one: the resolved geometry is required to *reproduce the
     node's own output shape*, so a mistake in reading the attributes cannot
-    survive to become a wrong gradient.
+    survive to become a wrong gradient. A dynamic (``str``) entry anywhere in
+    ``x_shape``/``w_shape``/``y_shape`` is not something this function
+    supports -- Conv's own geometry math needs every one of these as a real
+    size -- and fails via one of the ``int(...)`` conversions below rather
+    than being refused up front, the same contract every other real-
+    arithmetic user of a shape in this module keeps.
     """
     name = node.output[0]
     rank = len(x_shape)
@@ -787,8 +800,8 @@ def _grad_conv(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
 
 def _pool_geometry(
     node: onnx.NodeProto,
-    x_shape: Tuple[int, ...],
-    y_shape: Tuple[int, ...],
+    x_shape: Tuple[Union[int, str], ...],
+    y_shape: Tuple[Union[int, str], ...],
     *,
     has_dilations: bool,
 ) -> Tuple[List[int], List[int], List[int], List[int]]:
@@ -796,7 +809,9 @@ def _pool_geometry(
     shapes -- the same discipline :func:`_conv_geometry` applies to ``Conv``:
     the resolved kernel/strides/dilations/pads are required to reproduce the
     node's own declared output shape, so a misread attribute cannot survive
-    to become a gradient computed against the wrong geometry.
+    to become a gradient computed against the wrong geometry. Like
+    ``_conv_geometry``, a dynamic entry in either shape is unsupported here
+    and fails via ``int(...)`` below rather than a separate check.
 
     Unlike ``Conv``, a pooling node carries no weight tensor to read
     ``kernel_shape`` off, so it is read directly -- it is a required
@@ -1247,9 +1262,18 @@ def _grad_reshape(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
 
 
 def _reduced_axes(
-    node: onnx.NodeProto, in_shape: Tuple[int, ...], out_shape: Tuple[int, ...]
+    node: onnx.NodeProto,
+    in_shape: Tuple[Union[int, str], ...],
+    out_shape: Tuple[Union[int, str], ...],
 ) -> List[int]:
     """Which axes a ``Reduce*`` node reduced over.
+
+    Unlike ``_conv_geometry``/``_pool_geometry``, this one genuinely supports
+    a dynamic (``str``) entry in either shape: every comparison below is
+    structural (an axis's own position, or whether two shape entries are
+    equal), never arithmetic on a dimension's size -- exactly what lets
+    ``_grad_reduce`` differentiate a ``ReduceSum`` over a dynamic batch axis
+    at all (see this module's own "dynamic batch size" notes).
 
     From opset 13 the axes are a *tensor input*, and ``build_backward`` is
     given nodes and shapes but not the initializers behind them, so the axes
