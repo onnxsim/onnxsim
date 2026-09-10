@@ -1370,6 +1370,14 @@ custom operators in the sense of the [Custom operators](#custom-operators)
 section above: `simplify()` preserves them -- with or without a schema
 registered for them -- and simplifies the rest of the graph around them.
 
+For a rough, no-hardware read on which operators in a model Voyager SDK's
+Metis AIPU compiler documents as accelerated versus CPU-fallback (and,
+for most "Constrained" operators, whether a node's actual attributes/shapes
+satisfy Axelera's own published per-operator constraints), see
+[`scripts/axelera/README.md`](scripts/axelera/README.md) -- built entirely
+from Voyager SDK's public docs, with no real compiler or hardware behind it
+(that README explains exactly why, and what that limits).
+
 ## Quantization-aware fine-tuning
 
 onnxsim's post-training quantization passes stop at *rounding*: AdaRound,
