@@ -347,6 +347,59 @@ which distill actual language models. Nothing here requires `torch`/`transformer
 training-enabled `onnxruntime`: only `onnx` + `numpy` to build the step graph, and a plain
 `onnxruntime`/`onnxruntime-web` to run it.
 
+## Federated learning (FedAvg over LoRA, browser clients included)
+
+Train a shared LoRA adapter across several clients that each hold private data, without any
+client's data -- or the base model's own weights -- ever leaving where it started. Server-side,
+this is `onnxsim.federated`'s FedAvg loop (`onnxsim.federated.run_federated_round`/
+`run_federated_training`, exercised in-process by `tests/test_federated.py`): broadcast the
+current adapter state, train each client independently, average the results back in. This
+section is the client-doesn't-share-a-Python-process version of the same loop --
+`scripts/generate_federated_lora_step_graph.py` produces the same kind of step graph
+`onnxsim.lora`/the distillation path above already do (forward, LoRA-restricted backward, and an
+Adam step baked into one ordinary ONNX graph -- no `onnxruntime.training` anywhere in this path
+either), except this one is built *before* any client's data exists, so it can be shipped to and
+run entirely inside an untrusted browser tab via the official `onnxruntime-web` package. Only the
+trained `lora_A`/`lora_B` values -- a few KB, not the whole model -- ever cross back out of the
+client; `scripts/federated_lora_aggregate.py` is the thin CLI wrapper that feeds them into
+`onnxsim.federated.fedavg`/`apply_adapter_state` to produce the next round's base model.
+
+```sh
+# 1. Any ONNX model with an eligible MatMul/Gemm/Conv weight to adapt -- make_toy_model.py
+#    for trying this out without one of your own.
+python3 scripts/make_toy_model.py -o base.onnx --hidden-dim 16
+
+# 2. One step graph for this round, at a fixed batch size (unlike the distillation step graph
+#    above, this one has no dynamic batch dimension -- see the script's own docstring for why).
+#    Also writes step.onnx.base_model.onnx (the deployable, LoRA-injected model), step.onnx.manifest.txt
+#    and step.onnx.initial_state.bin -- everything a browser client needs to train, and nothing
+#    of this server's own data.
+python3 scripts/generate_federated_lora_step_graph.py base.onnx -o step.onnx --batch-size 32 --rank 4
+
+# 3. Each client loads step.onnx + step.onnx.manifest.txt + step.onnx.initial_state.bin via
+#    ../wasm/federated_lora/step_graph_runner.mjs (plain onnxruntime-web, no custom WASM build --
+#    see that directory's own test for a full worked example) and trains locally on its own
+#    private data. What comes back from each client is exportTrainedState()'s output: a small
+#    binary file, byte-for-byte the same layout as step.onnx.initial_state.bin.
+#      client_a.bin, client_b.bin, ...  (produced in the browser, one per participant)
+
+# 4. FedAvg the clients' updates into the next round's global model. --weight (optional, one per
+#    --client) is each client's local example count, i.e. FedAvg proper rather than a plain mean.
+python3 scripts/federated_lora_aggregate.py \
+  --manifest step.onnx.manifest.txt --base-model step.onnx.base_model.onnx \
+  --client client_a.bin --client client_b.bin \
+  -o round1.base_model.onnx
+
+# 5. round1.base_model.onnx is an ordinary, inference-ready .onnx (base weights untouched, only
+#    the adapter moved) -- and round1.base_model.onnx.initial_state.bin is ready to hand straight
+#    back to step_graph_runner.mjs for the next round, no re-derivation needed.
+```
+
+What this does *not* add: secure aggregation (the server here sees each client's own update, not
+just the sum) and differential privacy are both real requirements for production cross-device FL
+and neither is implemented -- `onnxsim.federated.fedavg` is a plain, visible weighted average. See
+that module's own docstring for the full scope statement.
+
 ## CLI reference
 
 | flag | required | description |

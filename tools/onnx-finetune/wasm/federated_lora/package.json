@@ -1,0 +1,12 @@
+{
+  "name": "onnx-finetune-federated-lora-step-graph-runner",
+  "private": true,
+  "type": "module",
+  "description": "Runs a federated-round LoRA step graph via the official onnxruntime-web package -- the client half of onnxsim.federated's FedAvg loop.",
+  "scripts": {
+    "test": "node --test step_graph_runner.test.mjs"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.19.2"
+  }
+}
