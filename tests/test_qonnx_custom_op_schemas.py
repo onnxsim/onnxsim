@@ -37,21 +37,21 @@ def _model(body, domain, opset=17, ir_version=10):
 
 
 def _folded_leading_dim(model):
-    """Simplify and return the sole remaining output's folded scalar value,
-    asserting the graph collapsed to a pure initializer (proof the
-    Shape/Gather chain was fully constant-folded, not left as live nodes) --
-    while the custom-op node itself survives, proving onnxsim treats it as
-    opaque rather than guessing at (and folding away) its semantics."""
+    """Simplify with no extra optimizers/rewrite passes and return the sole
+    remaining output's folded scalar value, asserting the graph collapsed to
+    a pure initializer -- same technique and same assertion as
+    test_bev_custom_op_schemas.py's own ``_folded_dim``. The custom-op node
+    is not expected to survive here: once the Shape/Gather chain folds to a
+    literal, its own output has no remaining consumer, so onnxsim's ordinary
+    dead-node elimination removes it along with the rest of the chain -- that
+    it *can* be removed is itself downstream of shape inference having
+    resolved it in the first place, since an op whose output shape onnxsim
+    could not determine would leave the Shape/Gather chain live."""
     sim_model, ok = onnxsim.simplify(model)
     assert ok
-    custom_ops = [
-        n.op_type for n in sim_model.graph.node if n.domain not in ("", "ai.onnx")
-    ]
-    assert len(custom_ops) == 1, custom_ops
-    assert len(sim_model.graph.initializer) >= 1
-    out_name = sim_model.graph.output[0].name
-    out_init = next(i for i in sim_model.graph.initializer if i.name == out_name)
-    return int(numpy_helper.to_array(out_init)[0])
+    assert len(sim_model.graph.node) == 0, [n.op_type for n in sim_model.graph.node]
+    assert len(sim_model.graph.initializer) == 1
+    return int(numpy_helper.to_array(sim_model.graph.initializer[0])[0])
 
 
 def test_quant_output_shape_inferred_from_input():
@@ -120,6 +120,32 @@ def test_float_quant_output_shape_inferred_from_input():
         domain="qonnx.custom_op.general",
     )
     assert _folded_leading_dim(model) == 9
+
+
+def test_quant_node_itself_survives_when_its_value_is_actually_used():
+    # Unlike the folding tests above (where Xq's only consumer, Shape, itself
+    # folds away and takes the now-unused Quant node with it), a Quant node
+    # whose fake-quantized *value* is actually read is never a folding
+    # candidate: onnxsim's constant folder only ever considers the default
+    # ONNX domain (IsOfficialOp in constant_folding.cpp), so a custom-domain
+    # node survives simplification unchanged regardless of whether its
+    # inputs are constant -- proof onnxsim treats it as opaque rather than
+    # guessing at its semantics.
+    model = _model(
+        """
+        agraph (float[2,3] X) => (float[2,3] Y)
+        <float scale = {0.1}, float zeropoint = {0.0}, float bitwidth = {8.0}>
+        {
+          Xq = qonnx.custom_op.general.Quant<signed=1, narrow=0>(X, scale, zeropoint, bitwidth)
+          Y = Identity(Xq)
+        }
+        """,
+        domain="qonnx.custom_op.general",
+    )
+    sim_model, ok = onnxsim.simplify(model)
+    assert ok
+    op_types = [(n.op_type, n.domain) for n in sim_model.graph.node]
+    assert ("Quant", "qonnx.custom_op.general") in op_types, op_types
 
 
 def test_finn_legacy_domain_also_registered():
