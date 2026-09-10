@@ -19,6 +19,7 @@ from onnx import parser
 
 import onnxsim
 from onnxsim import backend, graph_grad
+from onnxsim.compile_training import CustomOptimizer
 
 ort = pytest.importorskip("onnxruntime")
 
@@ -212,6 +213,100 @@ def test_sgd_momentum_optimizer_also_trains():
     )
     losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
     assert losses[-1] < 0.1 * losses[0]
+
+
+def _hand_built_sgd_optimizer() -> CustomOptimizer:
+    """Plain (momentum-free, ``num_state=0``) SGD, built directly as an ONNX
+    ``ModelProto`` with ``onnx.parser`` -- no torch anywhere -- to check that
+    :class:`CustomOptimizer` is genuinely usable by any caller who can
+    produce a model matching its input/output contract, not just
+    ``onnxsim.torch_training.trace_torch_optimizer``. Traced shape ``[2,3]``
+    is arbitrary and unrelated to ``_linear_model``'s own ``w`` shape (also
+    ``[2,3]``, coincidentally) -- see :class:`CustomOptimizer`'s own
+    docstring for why that reuse across shapes is sound for an elementwise
+    update like this one.
+    """
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad, float lr)
+            => (float[2,3] new_param)
+        {{
+            step = Mul(lr, grad)
+            new_param = Sub(param, step)
+        }}
+        """
+    )
+    return CustomOptimizer(model=model, num_state=0)
+
+
+def _hand_built_momentum_optimizer() -> CustomOptimizer:
+    """Classic heavy-ball momentum SGD (``num_state=1``), reimplementing
+    :func:`onnxsim.qat_graph.sgd_momentum_update`'s own update rule by hand
+    as an ONNX model -- also exercises an initializer on the optimizer's own
+    model (``momentum_const``), which :func:`_custom_optimizer_function`
+    lowers to a ``Constant`` node since a ``FunctionProto`` has no
+    initializer list of its own.
+    """
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad, float[2,3] mom, float lr)
+            => (float[2,3] new_param, float[2,3] new_mom)
+        <float momentum_const = {{0.9}}>
+        {{
+            scaled_mom = Mul(momentum_const, mom)
+            new_mom = Add(scaled_mom, grad)
+            step = Mul(lr, new_mom)
+            new_param = Sub(param, step)
+        }}
+        """
+    )
+    return CustomOptimizer(model=model, num_state=1)
+
+
+def test_custom_optimizer_hand_built_sgd_trains():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(
+        model, "loss", ("w",), optimizer=_hand_built_sgd_optimizer()
+    )
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.02 * losses[0]
+
+
+def test_custom_optimizer_hand_built_momentum_trains_and_uses_its_own_initializer():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(
+        model, "loss", ("w",), optimizer=_hand_built_momentum_optimizer()
+    )
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.1 * losses[0]
+
+
+def test_custom_optimizer_wrong_input_count_is_refused():
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad) => (float[2,3] new_param)
+        {{
+            new_param = Identity(param)
+        }}
+        """
+    )
+    with pytest.raises(ValueError, match="inputs"):
+        CustomOptimizer(model=model, num_state=0)
+
+
+def test_custom_optimizer_wrong_output_count_is_refused():
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad, float lr)
+            => (float[2,3] new_param, float[2,3] extra)
+        {{
+            new_param = Identity(param)
+            extra = Identity(param)
+        }}
+        """
+    )
+    with pytest.raises(ValueError, match="outputs"):
+        CustomOptimizer(model=model, num_state=0)
 
 
 def test_export_reflects_trained_parameters():

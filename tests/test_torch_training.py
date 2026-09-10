@@ -144,6 +144,56 @@ def test_output_names_must_be_exactly_one():
         )
 
 
+def test_trace_torch_optimizer_sgd_trains_to_match_the_true_weight():
+    """A hand-written, momentum-free SGD update, expressed as ordinary torch
+    arithmetic and traced with :func:`torch_training.trace_torch_optimizer`
+    -- the same kind of convergence check
+    ``test_sgd_momentum_optimizer_also_trains`` already applies to the
+    builtin ``"sgd_momentum"`` optimizer, now with a
+    :class:`onnxsim.compile_training.CustomOptimizer`. A looser bound than
+    ``test_compile_torch_training_loop_trains_to_match_the_true_weight``'s
+    own (that one uses Adam, whose adaptive step size converges much faster
+    per step than plain, fixed-step SGD does at the same learning rate).
+    """
+
+    def sgd(param, grad, lr):
+        return (param - lr * grad,)
+
+    optimizer = torch_training.trace_torch_optimizer(sgd, num_state=0)
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module, example, optimizer=optimizer
+    )
+
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 1e-3 * losses[0]
+
+
+def test_trace_torch_optimizer_adam_trains_with_multiple_state_buffers():
+    """A hand-written Adam reimplementation with ``num_state=2`` (``m`` and
+    ``v``), checking a traced optimizer with more than one state buffer
+    threads both correctly -- not just the single-state SGD case above.
+    """
+
+    def adam(param, grad, m, v, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        m_next = beta1 * m + (1 - beta1) * grad
+        v_next = beta2 * v + (1 - beta2) * grad * grad
+        step = lr * m_next / (v_next.sqrt() + eps)
+        return param - step, m_next, v_next
+
+    optimizer = torch_training.trace_torch_optimizer(adam, num_state=2)
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module, example, optimizer=optimizer
+    )
+
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 1e-4 * losses[0]
+    np.testing.assert_allclose(loop.parameters()["w"], w_true, atol=1e-2)
+
+
 def test_pow_is_refused_with_the_ops_graph_grad_actually_differentiates():
     """``**`` (``torch.pow``/``Tensor.__pow__``) lowers to ONNX ``Pow``, which
     has no gradient rule in :mod:`onnxsim.graph_grad` -- see _Regression's own

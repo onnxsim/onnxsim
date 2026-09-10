@@ -137,6 +137,104 @@ def _static_shapes_and_types(
     return shapes, elem_types
 
 
+@dataclass(frozen=True)
+class CustomOptimizer:
+    """A per-parameter optimizer update rule, expressed as one reusable ONNX
+    function, for :func:`compile_training_loop`'s/
+    ``onnxsim.compile_torch_training_loop``'s own ``optimizer=`` argument --
+    an alternative to the two builtin string choices (``"adam"``,
+    ``"sgd_momentum"``, see :func:`onnxsim.qat_graph.adam_update`/
+    :func:`onnxsim.qat_graph.sgd_momentum_update`) for a caller whose
+    optimizer those two do not cover.
+
+    Not constructed directly in the ordinary case; see
+    ``onnxsim.torch_training.trace_torch_optimizer``, which builds one from
+    an ordinary PyTorch function via the same ``torch.export`` FX pipeline
+    :func:`onnxsim.torch_training.export_torch_module_to_onnx` uses for the
+    forward model itself. Nothing here is torch-specific, though: any
+    caller that can produce a model matching the shape below (by any means)
+    can use one, exactly as any caller of :func:`compile_training_loop`
+    itself can hand it a plain ONNX model with no torch involved anywhere.
+
+    ``model`` must have exactly ``2 + num_state + 1`` inputs, in order:
+    ``param``, ``grad``, ``num_state`` state tensors, then ``lr`` (a
+    rank-0 scalar) -- and exactly ``1 + num_state`` outputs: the updated
+    parameter, then the updated state tensors in the same order theirs came
+    in. :meth:`TrainingLoop._compile` calls it once per trained parameter,
+    each call wiring that parameter's own name, gradient, state buffers
+    (freshly allocated and zero-initialized, :attr:`num_state` of them) and
+    the step graph's shared ``"lr"`` input to those formal names.
+
+    Traced once, against a fixed shape unrelated to any trained parameter's
+    own shape, and reused unchanged at every parameter's own call site --
+    which is only sound because an ordinary optimizer update is elementwise
+    (nothing about it depends on a tensor's rank or size beyond
+    broadcasting a scalar learning rate over it) and therefore genuinely
+    does not care what shape it runs against once spliced in. A custom
+    optimizer that is not elementwise in this sense (indexes into ``param``,
+    reshapes it, reduces over some of its axes but not others) is out of
+    scope for the same reason :mod:`onnxsim.qat_graph`'s own two builtin
+    optimizers never needed to be anything but elementwise themselves.
+    """
+
+    #: A model-local ONNX function's worth of nodes -- see this class's own
+    #: docstring for the exact input/output contract.
+    model: onnx.ModelProto
+    #: How many per-parameter state tensors this optimizer carries (Adam: 2,
+    #: SGD-momentum: 1, plain SGD: 0).
+    num_state: int
+
+    def __post_init__(self) -> None:
+        want = 2 + self.num_state + 1
+        got = len(self.model.graph.input)
+        if got != want:
+            raise ValueError(
+                f"a CustomOptimizer with num_state={self.num_state} needs a model "
+                f"with {want} inputs (param, grad, {self.num_state} state tensors, "
+                f"lr), got {got}"
+            )
+        want_out = 1 + self.num_state
+        got_out = len(self.model.graph.output)
+        if got_out != want_out:
+            raise ValueError(
+                f"a CustomOptimizer with num_state={self.num_state} needs a model "
+                f"with {want_out} outputs (the updated parameter, then "
+                f"{self.num_state} updated state tensors), got {got_out}"
+            )
+
+
+def _custom_optimizer_function(
+    optimizer: CustomOptimizer, name: str
+) -> onnx.FunctionProto:
+    """``optimizer.model`` as one reusable :class:`onnx.FunctionProto`, for
+    :meth:`GraphBuilder.call` to splice in once per trained parameter (see
+    :class:`CustomOptimizer`'s own docstring for why the same traced function
+    is sound to reuse unchanged at every call site).
+
+    A ``FunctionProto`` has no initializer list of its own (unlike the
+    ``ModelProto`` :func:`onnxsim.torch_training.trace_torch_optimizer`
+    actually produces) -- any initializer the traced update needs (Adam's own
+    beta/eps constants baked in by the traced Python code, say) is lowered to
+    a ``Constant`` node feeding the same name instead, prepended before the
+    model's own nodes.
+    """
+    constant_nodes = [
+        onnx.helper.make_node("Constant", [], [init.name], value=init)
+        for init in optimizer.model.graph.initializer
+    ]
+    opset_imports = list(optimizer.model.opset_import) or [
+        onnx.helper.make_opsetid("", _OPSET)
+    ]
+    return onnx.helper.make_function(
+        domain="onnxsim.custom_optimizer",
+        fname=name,
+        inputs=[i.name for i in optimizer.model.graph.input],
+        outputs=[o.name for o in optimizer.model.graph.output],
+        nodes=constant_nodes + list(optimizer.model.graph.node),
+        opset_imports=opset_imports,
+    )
+
+
 @dataclass
 class TrainingLoop:
     """One training step, compiled lazily on first call and reused on every
@@ -169,10 +267,14 @@ class TrainingLoop:
     loss_output: str
     #: Names of the model's own float32 initializers to train.
     params: Tuple[str, ...]
-    #: ``"adam"`` (default) or ``"sgd_momentum"`` -- see
+    #: ``"adam"`` (default), ``"sgd_momentum"`` -- see
     #: :func:`onnxsim.qat_graph.adam_update` and
-    #: :func:`onnxsim.qat_graph.sgd_momentum_update`.
-    optimizer: str = "adam"
+    #: :func:`onnxsim.qat_graph.sgd_momentum_update` -- or a
+    #: :class:`CustomOptimizer` for an update rule neither of those two
+    #: covers (see that class's own docstring, and
+    #: ``onnxsim.torch_training.trace_torch_optimizer`` for the usual way to
+    #: build one).
+    optimizer: Union[str, CustomOptimizer] = "adam"
     #: onnxruntime execution providers for the compiled step, in priority
     #: order. ``None`` means CPU.
     providers: Optional[Sequence[backend.Provider]] = None
@@ -188,9 +290,13 @@ class TrainingLoop:
     _t: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.optimizer not in ("adam", "sgd_momentum"):
+        if not isinstance(self.optimizer, CustomOptimizer) and self.optimizer not in (
+            "adam",
+            "sgd_momentum",
+        ):
             raise ValueError(
-                f"unknown optimizer {self.optimizer!r}; use 'adam' or 'sgd_momentum'"
+                f"unknown optimizer {self.optimizer!r}; use 'adam', 'sgd_momentum', "
+                "or a CustomOptimizer instance"
             )
         self.params = tuple(self.params)
         if not self.params:
@@ -395,28 +501,48 @@ class TrainingLoop:
         if self.optimizer == "adam":
             scalars += ["m_correction", "v_correction"]
 
+        custom_fn: Optional[onnx.FunctionProto] = None
+        if isinstance(self.optimizer, CustomOptimizer):
+            custom_fn = _custom_optimizer_function(self.optimizer, b.name("custom_opt"))
+
         initial_state: Dict[str, np.ndarray] = {}
         for p in self.params:
             w_shape = _int_shape(shapes[p])
             grad = grads[p]
-            m_input = b.name("m")
-            if self.optimizer == "adam":
-                v_input = b.name("v")
-                w_next, m_next, v_next = qat_graph.adam_update(
-                    b, p, grad, m_input, v_input, "lr", "m_correction", "v_correction"
-                )
-                state[v_input] = (w_shape, v_next)
-                initial_state[v_input] = np.zeros(w_shape, dtype=np.float32)
+            if custom_fn is not None:
+                assert isinstance(self.optimizer, CustomOptimizer)
+                state_inputs = [b.name("s") for _ in range(self.optimizer.num_state)]
+                outs = b.call(custom_fn, [p, grad, *state_inputs, "lr"])
+                w_next, *state_next = outs
+                for s_input, s_next in zip(state_inputs, state_next):
+                    state[s_input] = (w_shape, s_next)
+                    initial_state[s_input] = np.zeros(w_shape, dtype=np.float32)
             else:
-                w_next, m_next = qat_graph.sgd_momentum_update(
-                    b, p, grad, m_input, "lr"
-                )
+                m_input = b.name("m")
+                if self.optimizer == "adam":
+                    v_input = b.name("v")
+                    w_next, m_next, v_next = qat_graph.adam_update(
+                        b,
+                        p,
+                        grad,
+                        m_input,
+                        v_input,
+                        "lr",
+                        "m_correction",
+                        "v_correction",
+                    )
+                    state[v_input] = (w_shape, v_next)
+                    initial_state[v_input] = np.zeros(w_shape, dtype=np.float32)
+                else:
+                    w_next, m_next = qat_graph.sgd_momentum_update(
+                        b, p, grad, m_input, "lr"
+                    )
+                state[m_input] = (w_shape, m_next)
+                initial_state[m_input] = np.zeros(w_shape, dtype=np.float32)
             state[p] = (w_shape, w_next)
-            state[m_input] = (w_shape, m_next)
             initial_state[p] = onnx.numpy_helper.to_array(initializers[p]).astype(
                 np.float32
             )
-            initial_state[m_input] = np.zeros(w_shape, dtype=np.float32)
 
         constants: Dict[str, Tuple[Sequence[int], int]] = {}
         for inp in model.graph.input:
@@ -457,7 +583,7 @@ def compile_training_loop(
     model: onnx.ModelProto,
     loss_output: str,
     params: Sequence[str],
-    optimizer: str = "adam",
+    optimizer: Union[str, CustomOptimizer] = "adam",
     providers: Optional[Sequence[backend.Provider]] = None,
 ) -> TrainingLoop:
     """Wraps ``model`` as a ``torch.compile``-styled training loop.
@@ -474,7 +600,9 @@ def compile_training_loop(
             time, on the first call, not here.
     :param loss_output: name of a scalar (rank-0) tensor the model produces.
     :param params: names of the model's own float32 initializers to train.
-    :param optimizer: ``"adam"`` (default) or ``"sgd_momentum"``.
+    :param optimizer: ``"adam"`` (default), ``"sgd_momentum"``, or a
+            :class:`CustomOptimizer` for an update rule neither builtin
+            covers.
     :param providers: onnxruntime execution providers for the compiled step,
             in priority order. ``None`` means CPU.
     """
