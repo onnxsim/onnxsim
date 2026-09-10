@@ -80,9 +80,12 @@ def surviving_edges(build_dir, quantising_only=False):
     if not os.path.exists(path):
         return None
     graph = onnx.load(path, load_external_data=False).graph
-    return ({o for node in graph.node for o in node.output
-             if not quantising_only or node.op_type.startswith(_QUANTISING)}
-            | {i.name for i in graph.input})
+    return {
+        o
+        for node in graph.node
+        for o in node.output
+        if not quantising_only or node.op_type.startswith(_QUANTISING)
+    } | {i.name for i in graph.input}
 
 
 def load_scales(build_dir, fused_aware=True, quantising_only=False):
@@ -110,8 +113,11 @@ def load_scales(build_dir, fused_aware=True, quantising_only=False):
             if not value or not value.get("scale"):
                 continue
             policy = entry["policy"]
-            if (keep is not None and tensor not in keep
-                    and not policy.get("PER_CHANNEL")):
+            if (
+                keep is not None
+                and tensor not in keep
+                and not policy.get("PER_CHANNEL")
+            ):
                 continue
             out[tensor] = (
                 entry["bit_width"],
@@ -125,6 +131,7 @@ def load_scales(build_dir, fused_aware=True, quantising_only=False):
 
 def _weight_axis(node, ndim):
     from precision import channel_axis
+
     return channel_axis(node, ndim)
 
 
@@ -169,15 +176,19 @@ def insert_qdq(model, scales):
         bits, scale, zero, per_channel, _ = entry
         w = numpy_helper.to_array(init).astype(np.float32)
         axis = _weight_axis(node, w.ndim) if per_channel else None
-        s = scale.reshape([-1] + [1] * (w.ndim - 1 - (axis or 0))) if per_channel \
+        s = (
+            scale.reshape([-1] + [1] * (w.ndim - 1 - (axis or 0)))
+            if per_channel
             else scale.reshape(())
+        )
         if per_channel and axis:
             s = scale.reshape([1] * axis + [-1] + [1] * (w.ndim - axis - 1))
         z = zero.reshape(s.shape) if per_channel else zero.reshape(())
         lo, hi = -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
         q = np.clip(np.rint(w / s) + z, lo, hi)
-        init.CopyFrom(numpy_helper.from_array(((q - z) * s).astype(np.float32),
-                                              init.name))
+        init.CopyFrom(
+            numpy_helper.from_array(((q - z) * s).astype(np.float32), init.name)
+        )
         n_w += 1
 
     # then activations. Spelled as arithmetic (`Div`, `Round`, `Clip`, `Mul`)
@@ -190,18 +201,21 @@ def insert_qdq(model, scales):
         s_name = const(unique(f"{out}_s"), np.float32(scale))
         z_name = const(unique(f"{out}_z"), np.float32(zero))
         lo_name = const(unique(f"{out}_lo"), np.float32(0.0))
-        hi_name = const(unique(f"{out}_hi"), np.float32(2 ** bits - 1))
+        hi_name = const(unique(f"{out}_hi"), np.float32(2**bits - 1))
         t = [unique(f"{out}_t{i}") for i in range(4)]
         return [
             helper.make_node("Div", [raw, s_name], [t[0]], name=unique(f"{out}_Q0")),
             helper.make_node("Round", [t[0]], [t[1]], name=unique(f"{out}_Q1")),
             helper.make_node("Add", [t[1], z_name], [t[2]], name=unique(f"{out}_Q2")),
-            helper.make_node("Clip", [t[2], lo_name, hi_name], [t[3]],
-                             name=unique(f"{out}_Q3")),
-            helper.make_node("Sub", [t[3], z_name], [t[0] + "_d"],
-                             name=unique(f"{out}_Q4")),
-            helper.make_node("Mul", [t[0] + "_d", s_name], [out],
-                             name=unique(f"{out}_Q5")),
+            helper.make_node(
+                "Clip", [t[2], lo_name, hi_name], [t[3]], name=unique(f"{out}_Q3")
+            ),
+            helper.make_node(
+                "Sub", [t[3], z_name], [t[0] + "_d"], name=unique(f"{out}_Q4")
+            ),
+            helper.make_node(
+                "Mul", [t[0] + "_d", s_name], [out], name=unique(f"{out}_Q5")
+            ),
         ]
 
     new_nodes = []
@@ -216,9 +230,11 @@ def insert_qdq(model, scales):
                 continue
             raw = unique(f"{out}_pre_q")
             node.output[i] = raw
-            new_nodes.extend(fake_quant(raw, out, bits,
-                                        float(scale.reshape(())),
-                                        float(zero.reshape(()))))
+            new_nodes.extend(
+                fake_quant(
+                    raw, out, bits, float(scale.reshape(())), float(zero.reshape(()))
+                )
+            )
             n_act += 1
     del graph.node[:]
     graph.node.extend(new_nodes)
@@ -238,8 +254,15 @@ def insert_qdq(model, scales):
             for i, name in enumerate(node.input):
                 if name == inp.name:
                     node.input[i] = renamed
-        front.extend(fake_quant(inp.name, renamed, bits,
-                                float(scale.reshape(())), float(zero.reshape(()))))
+        front.extend(
+            fake_quant(
+                inp.name,
+                renamed,
+                bits,
+                float(scale.reshape(())),
+                float(zero.reshape(())),
+            )
+        )
         n_act += 1
     if front:
         nodes = list(graph.node)
@@ -253,13 +276,15 @@ def replay(model, build_dir, feeds, fused_aware=True, quantising_only=False):
     """Run `model` as the card will run it. Returns the graph's outputs."""
     import onnxruntime as ort
 
-    scales = load_scales(build_dir, fused_aware=fused_aware,
-                         quantising_only=quantising_only)
+    scales = load_scales(
+        build_dir, fused_aware=fused_aware, quantising_only=quantising_only
+    )
     quantised, _, _ = insert_qdq(model, scales)
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    sess = ort.InferenceSession(quantised.SerializeToString(), options,
-                                providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(
+        quantised.SerializeToString(), options, providers=["CPUExecutionProvider"]
+    )
     return sess.run(None, feeds)
 
 
@@ -268,17 +293,23 @@ def snr_db(ref, got):
     got = np.asarray(got, np.float64).ravel()
     n = min(ref.size, got.size)
     err = ref[:n] - got[:n]
-    return float(10 * np.log10((ref[:n] ** 2).sum() / max((err ** 2).sum(), 1e-30)))
+    return float(10 * np.log10((ref[:n] ** 2).sum() / max((err**2).sum(), 1e-30)))
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("model")
     p.add_argument("build_dir")
-    p.add_argument("--input", action="append", default=[],
-                   metavar="NAME=FILE.npy", help="repeatable")
-    p.add_argument("--ref", action="store_true",
-                   help="also run the float model and report the SNR")
+    p.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        metavar="NAME=FILE.npy",
+        help="repeatable",
+    )
+    p.add_argument(
+        "--ref", action="store_true", help="also run the float model and report the SNR"
+    )
     args = p.parse_args(argv)
 
     model = onnx.load(args.model)
@@ -289,20 +320,25 @@ def main(argv=None):
     if not feeds:
         for inp in model.graph.input:
             shape = [d.dim_value or 1 for d in inp.type.tensor_type.shape.dim]
-            feeds[inp.name] = np.random.default_rng(0).standard_normal(
-                shape).astype(np.float32)
+            feeds[inp.name] = (
+                np.random.default_rng(0).standard_normal(shape).astype(np.float32)
+            )
 
     got = replay(model, args.build_dir, feeds)
     if args.ref:
         import onnxruntime as ort
-        ref = ort.InferenceSession(args.model,
-                                   providers=["CPUExecutionProvider"]).run(None, feeds)
+
+        ref = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"]).run(
+            None, feeds
+        )
         for i, (r, g) in enumerate(zip(ref, got)):
             print(f"output {i}: {snr_db(r, g):.2f} dB")
     else:
         for i, g in enumerate(got):
-            print(f"output {i}: shape {np.shape(g)} "
-                  f"rms {float(np.sqrt((np.asarray(g, np.float64) ** 2).mean())):.6g}")
+            print(
+                f"output {i}: shape {np.shape(g)} "
+                f"rms {float(np.sqrt((np.asarray(g, np.float64) ** 2).mean())):.6g}"
+            )
     return 0
 
 

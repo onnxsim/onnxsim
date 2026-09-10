@@ -72,7 +72,7 @@ def channel_axis(node, ndim):
     if node.op_type == "Gemm":
         trans_b = any(a.name == "transB" and a.i for a in node.attribute)
         return 0 if trans_b else ndim - 1
-    return ndim - 1                      # MatMul: x @ W, output channel last
+    return ndim - 1  # MatMul: x @ W, output channel last
 
 
 def quantise_dequantise(w, bits=8, axis=0):
@@ -114,10 +114,10 @@ def peak_to_rms(w, axis=None):
     """
     w = np.asarray(w, dtype=np.float64)
     if axis is None:
-        rms = float(np.sqrt((w ** 2).mean()))
+        rms = float(np.sqrt((w**2).mean()))
         return float(np.abs(w).max()) / rms if rms else 0.0
     red = tuple(i for i in range(w.ndim) if i != axis)
-    rms = np.sqrt((w ** 2).mean(axis=red))
+    rms = np.sqrt((w**2).mean(axis=red))
     peak = np.abs(w).max(axis=red)
     ok = rms > 0
     return float(np.median(peak[ok] / rms[ok])) if ok.any() else 0.0
@@ -136,7 +136,7 @@ def weight_error_db(w, bits=8, axis=0):
     if p2r == 0.0:
         return float("inf")
     full = 2.0 ** (bits - 1) - 0.5
-    return float(10 * np.log10(12 * full ** 2) - 20 * np.log10(p2r))
+    return float(10 * np.log10(12 * full**2) - 20 * np.log10(p2r))
 
 
 def _initializers(model):
@@ -174,8 +174,9 @@ def split_weight(w, bits=8, axis=0):
     return hi, lo
 
 
-def weight_residual_split(model, bits=8, ops=SPLITTABLE, layers=None,
-                          min_peak_to_rms=0.0):
+def weight_residual_split(
+    model, bits=8, ops=SPLITTABLE, layers=None, min_peak_to_rms=0.0
+):
     """Rewrite eligible weighted ops as ``op(x, W_hi) + op(x, W_lo)``.
 
     `layers` restricts the rewrite to a set of node names; `min_peak_to_rms`
@@ -187,9 +188,11 @@ def weight_residual_split(model, bits=8, ops=SPLITTABLE, layers=None,
     the result is far closer to the original than either half alone.
     """
     inits = _initializers(model)
-    taken = ({i.name for i in model.graph.initializer}
-             | {n.name for n in model.graph.node if n.name}
-             | {o for n in model.graph.node for o in n.output})
+    taken = (
+        {i.name for i in model.graph.initializer}
+        | {n.name for n in model.graph.node if n.name}
+        | {o for n in model.graph.node for o in n.output}
+    )
     targets = []
     for node in splittable_nodes(model, ops):
         if layers is not None and node.name not in layers:
@@ -208,8 +211,9 @@ def weight_residual_split(model, bits=8, ops=SPLITTABLE, layers=None,
         stem = node.name or node.output[0]
         hi_w = _unique(taken, f"{stem}_hi_w")
         lo_w = _unique(taken, f"{stem}_lo_w")
-        model.graph.initializer.extend([numpy_helper.from_array(hi, hi_w),
-                                        numpy_helper.from_array(lo, lo_w)])
+        model.graph.initializer.extend(
+            [numpy_helper.from_array(hi, hi_w), numpy_helper.from_array(lo, lo_w)]
+        )
         hi_out = _unique(taken, f"{stem}_hi")
         lo_out = _unique(taken, f"{stem}_lo")
 
@@ -230,8 +234,12 @@ def weight_residual_split(model, bits=8, ops=SPLITTABLE, layers=None,
         del lo_node.output[:]
         lo_node.output.append(lo_out)
 
-        add = helper.make_node("Add", [hi_out, lo_out], [node.output[0]],
-                               name=_unique(taken, f"{stem}_join"))
+        add = helper.make_node(
+            "Add",
+            [hi_out, lo_out],
+            [node.output[0]],
+            name=_unique(taken, f"{stem}_join"),
+        )
         replacement[id(node)] = [hi_node, lo_node, add]
 
     rebuilt = []
@@ -256,13 +264,24 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("input")
     p.add_argument("output", nargs="?")
-    p.add_argument("--bits", type=int, default=8,
-                   help="width the compiler will quantise the weight to (8)")
-    p.add_argument("--min-peak-to-rms", type=float, default=0.0,
-                   help="only split weights at least this outlier-heavy")
+    p.add_argument(
+        "--bits",
+        type=int,
+        default=8,
+        help="width the compiler will quantise the weight to (8)",
+    )
+    p.add_argument(
+        "--min-peak-to-rms",
+        type=float,
+        default=0.0,
+        help="only split weights at least this outlier-heavy",
+    )
     p.add_argument("--ops", default=",".join(SPLITTABLE))
-    p.add_argument("--dry-run", action="store_true",
-                   help="report what would be split and why, change nothing")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be split and why, change nothing",
+    )
     args = p.parse_args(argv)
 
     model = onnx.load(args.input)
@@ -274,16 +293,21 @@ def main(argv=None):
             w = numpy_helper.to_array(inits[node.input[1]])
             ax = channel_axis(node, w.ndim)
             hi, lo = split_weight(w, args.bits, ax)
-            got = compiler_view(hi, args.bits, ax) + quantise_dequantise(lo, args.bits, ax)
+            got = compiler_view(hi, args.bits, ax) + quantise_dequantise(
+                lo, args.bits, ax
+            )
             err = float(((w - got).astype(np.float64) ** 2).sum())
             sig = float((w.astype(np.float64) ** 2).sum())
-            print(f"{(node.name or node.output[0])[:43]:<44}{node.op_type:<15}"
-                  f"{peak_to_rms(w, ax):>9.2f}{weight_error_db(w, args.bits, ax):>9.2f}"
-                  f"{10 * np.log10(sig / max(err, 1e-30)):>10.2f}")
+            print(
+                f"{(node.name or node.output[0])[:43]:<44}{node.op_type:<15}"
+                f"{peak_to_rms(w, ax):>9.2f}{weight_error_db(w, args.bits, ax):>9.2f}"
+                f"{10 * np.log10(sig / max(err, 1e-30)):>10.2f}"
+            )
         return 0
-    n = weight_residual_split(model, bits=args.bits, ops=ops,
-                              min_peak_to_rms=args.min_peak_to_rms)
-    onnx.save(model, args.output, save_as_external_data=model.ByteSize() > 2 ** 30)
+    n = weight_residual_split(
+        model, bits=args.bits, ops=ops, min_peak_to_rms=args.min_peak_to_rms
+    )
+    onnx.save(model, args.output, save_as_external_data=model.ByteSize() > 2**30)
     print(f"split {n} op(s); promote {split_op_types(model, ops)} to U16")
     return 0
 

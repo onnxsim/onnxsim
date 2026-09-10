@@ -14,7 +14,7 @@ import sys
 import numpy as np
 import onnx
 import onnx.parser
-from onnx import helper, numpy_helper
+from onnx import numpy_helper
 
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
@@ -27,10 +27,15 @@ import replay  # noqa: E402
 
 def _policy(per_channel=False):
     return {
-        "PER_TENSOR": not per_channel, "PER_CHANNEL": per_channel,
-        "LINEAR": True, "EXPONENTIAL": False,
-        "SYMMETRICAL": per_channel, "ASYMMETRICAL": not per_channel,
-        "POWER_OF_2": False, "PER_CHANNEL_RE_GROUP": False, "PER_BLOCK": False,
+        "PER_TENSOR": not per_channel,
+        "PER_CHANNEL": per_channel,
+        "LINEAR": True,
+        "EXPONENTIAL": False,
+        "SYMMETRICAL": per_channel,
+        "ASYMMETRICAL": not per_channel,
+        "POWER_OF_2": False,
+        "PER_CHANNEL_RE_GROUP": False,
+        "PER_BLOCK": False,
     }
 
 
@@ -45,19 +50,29 @@ def _write_build(tmp_path, entries, fused_graph=None):
     for op, tensors in entries.items():
         configs[op] = {}
         for tensor, (bits, scale, zero, per_channel) in tensors.items():
-            h = str(abs(hash((op, tensor))) % (10 ** 10))
-            values[h] = {"scale": list(np.atleast_1d(scale).astype(float)),
-                         "zero_point": list(np.atleast_1d(zero).astype(float))}
-            configs[op][tensor] = {
-                "bit_width": bits, "policy": _policy(per_channel),
-                "state": "ACTIVATED", "hash": int(h),
-                "quant_min": -(2 ** (bits - 1)) if per_channel else 0,
-                "quant_max": 2 ** (bits - 1) - 1 if per_channel else 2 ** bits - 1,
+            h = str(abs(hash((op, tensor))) % (10**10))
+            values[h] = {
+                "scale": list(np.atleast_1d(scale).astype(float)),
+                "zero_point": list(np.atleast_1d(zero).astype(float)),
             }
-    (quant / "quant_axmodel.json").write_text(json.dumps(
-        {"quant_config": {}, "tensor_configs": configs,
-         "dispatchings": {op: "AX_NPU_AX650_INT8" for op in entries},
-         "values": values}))
+            configs[op][tensor] = {
+                "bit_width": bits,
+                "policy": _policy(per_channel),
+                "state": "ACTIVATED",
+                "hash": int(h),
+                "quant_min": -(2 ** (bits - 1)) if per_channel else 0,
+                "quant_max": 2 ** (bits - 1) - 1 if per_channel else 2**bits - 1,
+            }
+    (quant / "quant_axmodel.json").write_text(
+        json.dumps(
+            {
+                "quant_config": {},
+                "tensor_configs": configs,
+                "dispatchings": {op: "AX_NPU_AX650_INT8" for op in entries},
+                "values": values,
+            }
+        )
+    )
     if fused_graph is not None:
         onnx.save(fused_graph, str(quant / "quant_axmodel.onnx"))
     return str(tmp_path)
@@ -66,7 +81,7 @@ def _write_build(tmp_path, entries, fused_graph=None):
 def _conv_model(w):
     model = onnx.parser.parse_model(
         '<ir_version: 10, opset_import: ["": 17]>'
-        f' g (float[1, {w.shape[1]}, 8] x) => (float[1, {w.shape[0]}, 8] y) {{'
+        f" g (float[1, {w.shape[1]}, 8] x) => (float[1, {w.shape[0]}, 8] y) {{"
         "   y = Conv <kernel_shape = [3], pads = [1, 1]> (x, w)"
         " }"
     )
@@ -75,16 +90,22 @@ def _conv_model(w):
 
 
 def _affine(x, bits, scale, zero):
-    n = 2 ** bits - 1
+    n = 2**bits - 1
     codes = np.clip(np.rint(x / scale) + zero, 0, n)
     return ((codes - zero) * scale).astype(np.float32)
 
 
 def test_scales_load_from_the_table_the_compiler_writes(tmp_path):
-    build = _write_build(tmp_path, {
-        "conv": {"x": (8, 0.031, 130.0, False),
-                 "w": (8, [0.004, 0.002], 0.0, True),
-                 "y": (16, 9.3e-05, 0.0, False)}})
+    build = _write_build(
+        tmp_path,
+        {
+            "conv": {
+                "x": (8, 0.031, 130.0, False),
+                "w": (8, [0.004, 0.002], 0.0, True),
+                "y": (16, 9.3e-05, 0.0, False),
+            }
+        },
+    )
     scales = replay.load_scales(build)
     assert set(scales) == {"x", "w", "y"}
     assert scales["x"][0] == 8 and scales["y"][0] == 16
@@ -102,10 +123,17 @@ def test_fused_away_tensors_are_dropped(tmp_path):
         "   y = Relu (x)"
         " }"
     )
-    build = _write_build(tmp_path, {
-        "op": {"x": (8, 0.03, 128.0, False),
-               "gone": (8, 0.02, 128.0, False),
-               "y": (8, 0.01, 128.0, False)}}, fused_graph=fused)
+    build = _write_build(
+        tmp_path,
+        {
+            "op": {
+                "x": (8, 0.03, 128.0, False),
+                "gone": (8, 0.02, 128.0, False),
+                "y": (8, 0.01, 128.0, False),
+            }
+        },
+        fused_graph=fused,
+    )
     assert set(replay.load_scales(build)) == {"x", "y"}
     assert set(replay.load_scales(build, fused_aware=False)) == {"x", "gone", "y"}
     assert replay.surviving_edges(build) == {"x", "y"}
@@ -125,10 +153,17 @@ def test_quantising_only_drops_the_movement_ops(tmp_path):
     )
     for node in fused.graph.node:
         node.op_type = "AxQuantizedRelu" if node.op_type == "Relu" else "AxTranspose"
-    build = _write_build(tmp_path, {
-        "op": {"x": (8, 0.03, 128.0, False),
-               "y": (8, 0.02, 128.0, False),
-               "moved": (8, 0.01, 128.0, False)}}, fused_graph=fused)
+    build = _write_build(
+        tmp_path,
+        {
+            "op": {
+                "x": (8, 0.03, 128.0, False),
+                "y": (8, 0.02, 128.0, False),
+                "moved": (8, 0.01, 128.0, False),
+            }
+        },
+        fused_graph=fused,
+    )
     assert replay.surviving_edges(build) == {"x", "y", "moved"}
     assert replay.surviving_edges(build, quantising_only=True) == {"x", "y"}
 
@@ -148,10 +183,16 @@ def test_the_replay_reproduces_the_affine_quantisation_exactly(tmp_path):
     x_scale, x_zp = 0.03115052543580532, 130.0
     y_scale, y_zp = 9.281877282774076e-05, 32768.0
     w_scale = np.abs(w).max(axis=(1, 2)) / 127.5
-    build = _write_build(tmp_path, {
-        "y": {"x": (8, x_scale, x_zp, False),
-              "w": (8, w_scale, np.zeros(6), True),
-              "y": (16, y_scale, y_zp, False)}})
+    build = _write_build(
+        tmp_path,
+        {
+            "y": {
+                "x": (8, x_scale, x_zp, False),
+                "w": (8, w_scale, np.zeros(6), True),
+                "y": (16, y_scale, y_zp, False),
+            }
+        },
+    )
 
     x = rng.standard_normal((1, 4, 8)).astype(np.float32) * 0.5
     got = replay.replay(model, build, {"x": x})[0]
@@ -160,8 +201,9 @@ def test_the_replay_reproduces_the_affine_quantisation_exactly(tmp_path):
     s = w_scale.reshape(-1, 1, 1)
     wq = (np.clip(np.rint(w / s), -128, 127) * s).astype(np.float32)
     pad = np.pad(xq, ((0, 0), (0, 0), (1, 1)))
-    acc = sum(np.einsum("oi,bil->bol", wq[:, :, k], pad[:, :, k:k + 8])
-              for k in range(3))
+    acc = sum(
+        np.einsum("oi,bil->bol", wq[:, :, k], pad[:, :, k : k + 8]) for k in range(3)
+    )
     want = _affine(acc, 16, y_scale, y_zp)
     assert np.allclose(got, want, atol=1e-6), np.abs(got - want).max()
 
@@ -175,16 +217,23 @@ def test_widening_the_activations_stalls_on_the_int8_weights(tmp_path):
     model = _conv_model(w)
     x = rng.standard_normal((1, 4, 8)).astype(np.float32) * 0.5
     ort = __import__("onnxruntime")
-    ref = ort.InferenceSession(model.SerializeToString(),
-                               providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+    ref = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"x": x})[0]
     w_scale = np.abs(w).max(axis=(1, 2)) / 127.5
     snrs = {}
     for bits in (8, 16):
-        n = 2 ** bits - 1
-        build = _write_build(tmp_path / f"b{bits}", {
-            "y": {"x": (bits, 2 * float(np.abs(x).max()) / n, n // 2, False),
-                  "w": (8, w_scale, np.zeros(6), True),
-                  "y": (bits, 2 * float(np.abs(ref).max()) / n, n // 2, False)}})
+        n = 2**bits - 1
+        build = _write_build(
+            tmp_path / f"b{bits}",
+            {
+                "y": {
+                    "x": (bits, 2 * float(np.abs(x).max()) / n, n // 2, False),
+                    "w": (8, w_scale, np.zeros(6), True),
+                    "y": (bits, 2 * float(np.abs(ref).max()) / n, n // 2, False),
+                }
+            },
+        )
         got = replay.replay(_conv_model(w), build, {"x": x})[0]
         snrs[bits] = replay.snr_db(ref, got)
     import precision
@@ -201,8 +250,10 @@ def test_a_tensor_with_no_entry_is_left_in_float(tmp_path):
     invent a scale for them."""
     rng = np.random.default_rng(1)
     w = rng.standard_normal((6, 4, 3)).astype(np.float32) * 0.3
-    build = _write_build(tmp_path, {"y": {"w": (8, np.abs(w).max(axis=(1, 2)) / 127.5,
-                                                np.zeros(6), True)}})
+    build = _write_build(
+        tmp_path,
+        {"y": {"w": (8, np.abs(w).max(axis=(1, 2)) / 127.5, np.zeros(6), True)}},
+    )
     model = _conv_model(w)
     quantised, n_act, n_w = replay.insert_qdq(model, replay.load_scales(build))
     assert (n_act, n_w) == (0, 1)

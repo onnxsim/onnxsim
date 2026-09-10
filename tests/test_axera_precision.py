@@ -16,7 +16,7 @@ import sys
 import numpy as np
 import onnx
 import onnx.parser
-from onnx import TensorProto, helper, numpy_helper
+from onnx import helper, numpy_helper
 
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
@@ -38,12 +38,12 @@ def _heavy_tailed(shape, seed=3):
 def _snr(ref, got):
     ref = np.asarray(ref, np.float64)
     err = ref - np.asarray(got, np.float64)
-    return 10 * np.log10((ref ** 2).sum() / max((err ** 2).sum(), 1e-30))
+    return 10 * np.log10((ref**2).sum() / max((err**2).sum(), 1e-30))
 
 
 def _model(body, initializer=(), opset=17, ir_version=10):
     model = onnx.parser.parse_model(
-        f"<ir_version: {ir_version}, opset_import: [\"\": {opset}]> {body}"
+        f'<ir_version: {ir_version}, opset_import: ["": {opset}]> {body}'
     )
     model.graph.initializer.extend(initializer)
     return model
@@ -104,7 +104,9 @@ def test_split_carries_far_more_than_one_int8_pass():
     w = _heavy_tailed((32, 32, 3))
     plain = _snr(w, precision.quantise_dequantise(w, axis=0))
     hi, lo = precision.split_weight(w, axis=0)
-    got = precision.compiler_view(hi, axis=0) + precision.quantise_dequantise(lo, axis=0)
+    got = precision.compiler_view(hi, axis=0) + precision.quantise_dequantise(
+        lo, axis=0
+    )
     assert 35 < plain < 42, plain
     assert _snr(w, got) > plain + 35
 
@@ -117,9 +119,12 @@ def test_the_residual_must_be_taken_against_the_compilers_view():
     hi = precision.quantise_dequantise(w, axis=0)
     naive_lo = w - hi
     naive = precision.compiler_view(hi, axis=0) + precision.quantise_dequantise(
-        naive_lo, axis=0)
+        naive_lo, axis=0
+    )
     _, lo = precision.split_weight(w, axis=0)
-    right = precision.compiler_view(hi, axis=0) + precision.quantise_dequantise(lo, axis=0)
+    right = precision.compiler_view(hi, axis=0) + precision.quantise_dequantise(
+        lo, axis=0
+    )
     assert _snr(w, right) > _snr(w, naive) + 25
 
 
@@ -148,8 +153,9 @@ def test_a_conv_becomes_two_convs_joined_by_an_add():
     assert add.input == list(hi.output) + list(lo.output)
     assert add.output[0] == "y"
     inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
-    got = precision.compiler_view(inits[hi.input[1]], axis=0) + \
-        precision.quantise_dequantise(inits[lo.input[1]], axis=0)
+    got = precision.compiler_view(
+        inits[hi.input[1]], axis=0
+    ) + precision.quantise_dequantise(inits[lo.input[1]], axis=0)
     assert _snr(w, got) > 70
     onnx.checker.check_model(model)
 
@@ -166,8 +172,12 @@ def test_the_split_graph_runs_and_stays_within_half_an_int8_step():
     after = _conv_model(w)
     assert precision.weight_residual_split(after) == 1
     x = np.random.default_rng(11).standard_normal((1, 4, 8)).astype(np.float32)
-    run = lambda m: ort.InferenceSession(
-        m.SerializeToString(), providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+
+    def run(m):
+        return ort.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]
+        ).run(None, {"x": x})[0]
+
     assert run(after).shape == run(before).shape
     # the miss is exactly the compiler's re-rounding of the high half, which is
     # bounded by half an INT8 step -- the same size as the error a plain INT8
@@ -234,6 +244,7 @@ def test_a_matmul_splits_on_its_last_axis():
     assert [n.op_type for n in model.graph.node] == ["MatMul", "MatMul", "Add"]
     inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     hi, lo, _ = model.graph.node
-    got = precision.compiler_view(inits[hi.input[1]], axis=1) + \
-        precision.quantise_dequantise(inits[lo.input[1]], axis=1)
+    got = precision.compiler_view(
+        inits[hi.input[1]], axis=1
+    ) + precision.quantise_dequantise(inits[lo.input[1]], axis=1)
     assert _snr(w, got) > 70
