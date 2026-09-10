@@ -5931,6 +5931,134 @@ bases and the per-tap input splits are allocator output, and the vocoder's own
 splits (`[80]`, then `[48, 32]`, then `[24, 56]` on consecutive taps of one
 layer) are the evidence that no rule is waiting to be found there.
 
+## Replacing the ONNX compiler at a fixed shape
+
+"How much of a CNN's mcode depends on its weights" above answers 96.2%
+weight-independent and stops there, because the remaining bytes were not
+understood and the weight table's layout was a pile of hand-derived rules.
+Both are now closed, and the result is a compiler replacement: **given
+reference builds at a shape, any weights at that shape emit a working
+`.axmodel` with no Pulsar2 in the loop.** Eight held-out weight sets produced
+weight tables byte-identical to Pulsar2's and device output bit-identical to
+Pulsar2's own build.
+
+### Learn the layout instead of deriving it
+
+This file derives seven weight layouts by hand -- gaps of 36, strides of 144,
+per-tap padding, polyphase reversal, a per-output-channel cost charged per
+*bit*. Each was worth deriving. None is a good foundation for an emitter,
+because every new shape or dtype adds another.
+
+They all have one thing in common: **each is a bit permutation.** A byte of
+`npu_params` mixes single bits from several codes, but every bit of the table
+is either constant for the shape, or equal to one specific bit of one specific
+code. So compile the same shape `k` times with different weights and read the
+permutation off: each table bit's column of `k` observed values is a
+signature, and the code bit with the same signature is where it came from.
+
+Naming one code bit out of `32*32*3*8 = 24,576` needs about 15 bits of
+signature. `k` builds give `k`, so the method's own failure mode is visible
+and countable -- it is the number of code bits sharing a signature:
+
+| builds | table bits mapped | constant | unexplained | colliding sources |
+| --- | --- | --- | --- | --- |
+| 8 | 26,006 | 13,225 | 0 | 24,129 |
+| 16 | 25,116 | 12,972 | 1,144 | 4,074 |
+| **48** | **24,576** | 12,937 | 1,719 | **0** |
+
+At 48 builds the mapped count is **exactly** `32*32*3*8`: every weight code
+bit appears in the table exactly once, and nothing is ambiguous. The 8- and
+16-build rows are the same method being honestly wrong, which is the point of
+measuring collisions rather than trusting the fit.
+
+### The 1,719 unexplained bits are the requantisation, in closed form
+
+They are one contiguous run -- bytes 4608 to 4864, which is `32 channels x
+8 bytes` -- and they are not copies of anything, they are computed. Read as
+float32 they are two vectors, and a quantised convolution says what they must
+be. Its output in code units is
+
+```
+y_code = zy + sum_i (x_code_i - zx) * q_i * (x_scale * w_scale / y_scale)
+```
+
+and the AX650N precomputes the constant half per output channel:
+
+| floats | meaning |
+| --- | --- |
+| `[0:C]` | `bias[c] = zy - zx * sum(q_c) * M_c` |
+| `[C:2C]` | `M_c = x_scale * w_scale_c / y_scale` |
+
+Across 48 builds x 32 channels the formula reproduces **every one** of the
+stored values to `6.1e-05` -- float32 rounding, nothing else.
+
+That closes the table: codes through the learned map, this block in closed
+form, everything else copied from the reference. Emitting eight held-out
+weight sets gives **0 differing bytes of 4904**, every time.
+
+### The mcode's weight-dependent bytes, and the seven that do not matter
+
+With 48 builds of one shape, 24 of the mcode's 2824 bytes move. Five of them
+are the output quantisation written down literally:
+
+| offsets | field |
+| --- | --- |
+| 1846, 1853, 1860, 1867 | little-endian float32 `y_scale`, four copies |
+| 1835 | one byte, `round(y_zero)` |
+
+The other seven -- 301, 303, 309, 311, 317, 319, 323, 325 -- hold a
+permutation of `0x10/0x20/0x30/0x40` with `0x13`/`0x23` separators, and 20
+distinct patterns appear across 48 builds. What chooses them is not known.
+**It also does not matter.** Every emitted model here left them at the
+*reference's* values, differing from Pulsar2's own build in 2 to 5 bytes, and
+the card returned bit-identical output all eight times. They are scheduling,
+not semantics.
+
+### On the card
+
+Reference: one build of `Conv(32, 32, 3)`. Target: eight weight sets it never
+saw. Nothing but `emitter.py` between them.
+
+| held-out | table bytes differing | mcode bytes differing | emitted | Pulsar2 | identical |
+| --- | --- | --- | --- | --- | --- |
+| s202 | 0 | 4 | 33.44 dB | 33.44 dB | yes |
+| s303 | 0 | 3 | 35.36 dB | 35.36 dB | yes |
+| s404 | 0 | 2 | 32.52 dB | 32.52 dB | yes |
+| s505 | 0 | 5 | 33.93 dB | 33.93 dB | yes |
+| s606 | 0 | 5 | 33.90 dB | 33.90 dB | yes |
+| s707 | 0 | 5 | 33.96 dB | 33.96 dB | yes |
+| s808 | 0 | 4 | 27.61 dB | 27.61 dB | yes |
+| s1040 | 0 | 3 | 35.45 dB | 35.45 dB | yes |
+
+Bit-identical, not correlated: `np.array_equal` on the returned float32.
+
+### Two builds of 48 that cannot be patched in place
+
+The mcode is a tagged byte stream, and twice in 48 builds a field's value was
+not written inline but escaped, shifting every byte after it:
+
+* one build's output zero point came out exactly **128**,
+* one build's `y_scale` had low byte **0x9e**.
+
+No rule tried here predicts which -- plenty of perfectly patchable builds
+carry bytes in `0x80..0x9f`, including the reference itself, whose zero point
+is `0x83`. So `learn_mcode` does not guess: it finds outliers by *re-emitting
+every training build and checking what survives*, records the values that
+actually failed, and `emit_mcode` refuses those. 46 of 48 re-emit exactly.
+
+A refusal is a real limit, not a formality: those two models need Pulsar2, or
+a nudge to the calibration range that moves the scale off the bad value.
+
+### What this does and does not replace
+
+It replaces the compiler's **weight handling**, which is what changes when a
+model is retrained, fine-tuned, quantisation-aware-trained, or pruned. It does
+not originate a shape: hidden size, channel count, kernel and layout still
+come from a reference build, exactly as `README.md`'s `llm_build` emitter
+above needs one. The reference is needed **once per shape**, and the number of
+builds it takes is measurable rather than guessed -- push `collisions()` to
+zero and the map is exact.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
@@ -6410,6 +6538,7 @@ CNN/LLM focus.
 | `precision.py` | `weight_residual_split()`: rewrites `Conv`/`MatMul`/`Gemm`/`ConvTranspose` as `op(x, W_hi) + op(x, W_lo)` so two INT8 weights carry ~16 bits between them, plus `quantise_dequantise()`/`compiler_view()` (Pulsar2's per-output-channel weight quantiser, and the re-rounding the residual has to be taken against), `weight_error_db()` and `split_op_types()` (the op types to promote to `U16`, without which the split does not pay). Measured +7.23 dB on the AX650N at 16-bit activations -- see above. |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `replay.py` | `load_scales()`/`insert_qdq()`/`replay()`: re-runs a float graph at the scales `pulsar2 build` recorded in `quant/quant_axmodel.json`, reproducing four real AX650N measurements to within 0.19 dB with no card and no rebuild. `surviving_edges()` drops the tensors the compiler fused away -- quantising those invents error the hardware never makes. Exact on an unfused graph, a lower bound on a fused one. |
+| `emitter.py` | `learn()`/`emit_axmodel()`: learns a shape's weight-table encoding as a bit permutation from k reference builds, instead of deriving its layout rules, then writes any new weights at that shape with no compiler in the loop -- byte-identical tables and bit-identical device output on eight held-out weight sets. `requant_block()` is the per-channel bias/multiplier in closed form; `learn_mcode()`/`emit_mcode()` find and rewrite the mcode's output scale and zero point, and report the streams that cannot be patched in place. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
