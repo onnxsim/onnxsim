@@ -5553,14 +5553,53 @@ which at 16 bits is ~86 dB of headroom against a 7.4 dB result. Nor is it a
 misalignment that would sound fine anyway: cross-correlating the two waveforms
 puts the best lag at exactly **0**, so the error is genuine and sample-wise.
 
-Roughly 78 dB is unaccounted for by tensor precision. The open hypothesis is
-the one widening tensors cannot touch: Pulsar2 evaluates nonlinearities by
-**lookup table** -- visible in the earlier `AxClip ... lut.output_dtype`
-failure -- and a LUT's resolution is fixed no matter what dtype surrounds it.
-This vocoder is unusually LUT-heavy: 29 Snake activations plus `Silu`,
-`RMSNormalization` and `Gelu`. That is a hypothesis and not a finding; the
-experiment that would settle it is `precision_analysis_mode: NPUBackend`,
-which exercises the real backend rather than PPQ's float simulation.
+Roughly 78 dB is unaccounted for by tensor precision. The hypothesis recorded
+here was the one widening tensors cannot touch: Pulsar2 evaluates
+nonlinearities by **lookup table**, whose resolution is fixed no matter what
+dtype surrounds it, and this vocoder is unusually LUT-heavy -- 29 Snake
+activations plus `Silu`, `RMSNormalization` and `Gelu`.
+
+**That hypothesis is wrong, and the experiment that killed it is simple.** Hold
+the depth constant and vary only the nonlinearity: sixteen convolutions, once
+bare, once with `Relu` between each pair, once with the vocoder's own Snake.
+
+| 16 convolutions deep | correlation | SNR |
+| --- | --- | --- |
+| bare, no activation | 0.99851 | 25.13 dB |
+| `Relu` | 0.99637 | 21.32 dB |
+| **Snake (`Sin`, LUT-backed)** | 0.99855 | **25.38 dB** |
+
+Snake is the *best* of the three. Fifteen lookup tables cost nothing
+measurable; if they were the problem, that row would be far the worst.
+
+### What it actually is: about 3 dB per doubling of depth
+
+| depth (bare convolutions) | SNR | change per doubling |
+| --- | --- | --- |
+| 4 | 31.47 dB | -- |
+| 8 | 28.42 dB | -3.05 |
+| 16 | 25.13 dB | -3.29 |
+| 32 | 20.04 dB | -5.09 |
+
+Three decibels per doubling is exactly what independent per-operation errors
+accumulating **linearly in energy** produce, and the first two steps sit on it
+almost exactly. The last is steeper, so past sixteen layers the errors begin to
+compound rather than merely add.
+
+Extrapolating that curve from 32 operations to the vocoder's 675 lands around
+7 dB. The device measured **7.37**. So the vocoder's ceiling is not its
+activations, not its calibration, and not its tensor widths -- it is simply
+675 quantised operations deep.
+
+The practical consequence is worth stating plainly, because it bounds
+everything else in this file: **on this hardware INT8 accuracy is set by depth,
+and the only lever that moves it is fewer quantised operations.** Weight
+precision does not (the scale search below finds nothing), activation width
+buys 4 dB and then plateaus, and the nonlinearities are free.
+
+A smaller observation from the same run: `Relu` is 4 dB *worse* than either
+bare or Snake. It zeroes half its activations, so the calibrated range then
+covers a distribution with a spike at zero and the codes near it are wasted.
 
 Which also corrects something said above: Pulsar2's precision analysis is
 **not** structurally blind to end-to-end behaviour. The default
