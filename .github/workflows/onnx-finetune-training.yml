@@ -104,6 +104,15 @@ jobs:
   distillation-graph-grad-native:
     name: graph_grad distillation (native, plain onnxruntime -- no --enable_training_apis)
     runs-on: ubuntu-24.04
+    # Caches the onnxsim wheel build's C++ compilation (onnx/onnx-optimizer/
+    # onnxsim's own sources) across runs, the same way build-and-test.yml's
+    # own onnxsim-building jobs already do -- without it this step alone is
+    # ~25-30 minutes of cold compilation every single run.
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -111,6 +120,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install build + test deps
         run: |
           sudo apt-get update
@@ -160,6 +170,11 @@ jobs:
   distillation-graph-grad-wasm:
     name: graph_grad distillation (wasm, via official onnxruntime-web -- no custom build)
     runs-on: ubuntu-24.04
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -170,8 +185,12 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "20"
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install build deps
-        run: pip install nanobind onnx numpy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          pip install nanobind onnx numpy
       - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see CLAUDE.md)
         run: pip install -e . --no-build-isolation
       - name: npm install (onnxruntime-web)
