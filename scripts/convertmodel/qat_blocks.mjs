@@ -68,6 +68,7 @@ export const DIFFERENTIABLE_OPS = new Set([
   "Identity",
   "InstanceNormalization",
   "LayerNormalization",
+  "Log",
   "MatMul",
   "MaxPool",
   "Mul",
