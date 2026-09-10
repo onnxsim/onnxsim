@@ -79,7 +79,17 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install deps (onnxruntime-training needs no source build -- see README.md)
-        run: pip install onnx numpy onnxruntime-training pytest
+        run: |
+          pip install onnx numpy onnxruntime-training pytest
+          # onnxruntime/training/__init__.py unconditionally imports its `optim`
+          # submodule, which unconditionally imports torch for its (unused here)
+          # apex/FP16 optimizer-modifier interop -- found by adding the sanity-check
+          # step below and reading its traceback: "ModuleNotFoundError: No module
+          # named 'torch'". Nothing this job actually exercises (generate_artifacts.py,
+          # onnxruntime.training.api) touches that code path, but the whole package
+          # fails to import without it regardless. CPU-only build: no GPU on this
+          # runner and the training itself runs on CPU (see README.md).
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Sanity-check onnxruntime.training.artifacts actually imports
         # test_distillation.py's own pytest.importorskip("onnxruntime.training.artifacts")
         # turns any ImportError here into a silent, all-tests-skipped run (pytest exit

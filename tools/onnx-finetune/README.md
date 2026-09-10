@@ -37,6 +37,15 @@ this particular distribution; match that version if you build `onnx-
 finetune` itself from source per the following, to keep the artifact
 format and IR version expectations aligned between the two.)
 
+`onnxruntime.training`'s own `__init__.py` unconditionally imports an `optim`
+submodule that unconditionally imports `torch` -- for an apex/FP16
+optimizer-modifier interop this tool never touches, but `pip install
+onnxruntime-training` does not pull `torch` in as a dependency, so a clean
+environment fails on `import onnxruntime.training.artifacts` with
+`ModuleNotFoundError: No module named 'torch'` until you install it too (a
+CPU-only build is enough: `pip install torch --index-url
+https://download.pytorch.org/whl/cpu`).
+
 `onnx-finetune` itself (the C++ CLI) and its WASM binding are a different
 story: neither the `pip install onnxruntime` wheels nor the official
 prebuilt release tarballs (the ones under GitHub Releases) include the
