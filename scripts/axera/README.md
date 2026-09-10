@@ -6049,6 +6049,41 @@ actually failed, and `emit_mcode` refuses those. 46 of 48 re-emit exactly.
 A refusal is a real limit, not a formality: those two models need Pulsar2, or
 a nudge to the calibration range that moves the scale off the bad value.
 
+### The same method on an `llm_build` layer
+
+The LLM path needs no new machinery, only more samples -- and it supplies them
+itself. Every layer of a build is the same shape with different weights, so one
+`llm_build` of SmolLM2-135M is thirty samples; two more builds on checkpoints
+with randomised 2-D weights make ninety.
+
+More are needed than for a convolution because unambiguity costs about twice
+the log of the code count, and a layer here holds 3,538,944 codes against a
+convolution's 3,072:
+
+| samples | table bits mapped | constant | unexplained | colliding sources |
+| --- | --- | --- | --- | --- |
+| 30 | 28,316,585 | 3,210,223 | 182,408 | 372,373 |
+| **54** | **28,311,552** | 3,209,913 | 187,751 | **0** |
+
+At 54 the mapped count is again *exactly* `3,538,944 * 8`: every weight code
+bit appears in the table once, and nothing is ambiguous. `llm_codes_of` is the
+quantiser it maps through -- `llm_build`'s own, not the convolution
+pipeline's.
+
+Trained on 82 samples and held out on eight whole layers, the emitted tables
+are **byte-exact everywhere except one localised remainder**: 27,000-odd bytes
+of 3,963,652, and **zero** wrong bytes outside it. That is 99.3% of an
+`llm_build` layer's weight table written from the checkpoint with no compiler.
+
+The remainder is 33,965 bytes in 13,824 runs of one to three bytes, laid out
+two bytes in every four from offset 4096 -- the shape of a half-width field in
+a full-width slot. It is not the per-row scale `-peak/128` in matmul order
+(one of 5,184 matches), and read as float32 it contains NaNs, so it is not a
+float array at that offset either. **Undecoded**, and until it is, this path
+emits a table that is 99.3% right rather than a model that runs -- unlike the
+convolution path above, where the last 1,719 bits turned out to be the
+requantisation in closed form and closed it completely.
+
 ### What this does and does not replace
 
 It replaces the compiler's **weight handling**, which is what changes when a

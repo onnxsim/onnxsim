@@ -275,3 +275,27 @@ def test_the_requant_block_is_the_quantised_convolutions_constant_term():
 def test_weight_scales_match_the_quantiser():
     w = _random_weights((6, 4, 3), 3)
     assert np.allclose(emitter.weight_scales(w), np.abs(w).max(axis=(1, 2)) / 127.5)
+
+
+def test_the_llm_quantiser_is_not_the_convolution_one():
+    """`llm_build` divides by 128, takes the scale from the *signed* peak and
+    negates it, and rounds ties toward +inf -- so a row's extreme weight lands
+    on code 0 and zero lands on 128."""
+    w = np.array([[-1.0, 0.5, 0.0, 0.25], [2.0, -1.0, 0.0, 0.5]], dtype=np.float32)
+    codes = emitter.llm_codes_of(w)
+    assert codes.dtype == np.uint8
+    # the extreme of each row is code 0, and an exact zero is 128
+    assert codes[0, 0] == 0 and codes[1, 0] == 0
+    assert codes[0, 2] == 128 and codes[1, 2] == 128
+    # and it differs from the convolution quantiser, which is symmetric
+    conv = emitter.codes_of(w.reshape(2, 4, 1))
+    assert not np.array_equal(conv.reshape(2, 4), codes)
+
+
+def test_the_llm_quantiser_puts_a_negative_peak_at_code_zero_too():
+    """The sign of the extreme is kept, not its magnitude: a row whose largest
+    weight is positive still lands that weight on 0."""
+    codes = emitter.llm_codes_of(np.array([[3.0, -1.0, 0.0]], dtype=np.float32))
+    assert codes[0, 0] == 0
+    assert codes[0, 2] == 128
+    assert codes[0, 1] > 128

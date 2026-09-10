@@ -61,6 +61,26 @@ def codes_of(w, bits=8, axis=0):
     return q.astype(np.uint8)
 
 
+def llm_codes_of(weights):
+    """The codes `pulsar2 llm_build` stores -- a different quantiser from `codes_of`.
+
+    Three things differ from the convolution pipeline's, and all three matter
+    (`README.md`, "The LLM path quantises differently"). The scale divides by
+    128, not 127.5. It is taken from the *signed* weight at the peak index and
+    then negated, so a row's extreme weight always lands on code 0 and zero
+    lands on 128, whichever sign that extreme has. And ties round toward
+    `+inf`, not to even.
+
+    The arithmetic happens in the checkpoint's own precision: pass a bfloat16
+    file's values already widened to float32, which is what they are.
+    """
+    w = np.asarray(weights, dtype=np.float32)
+    peak = w[np.arange(len(w)), np.abs(w).argmax(1)].astype(np.float32)
+    scale = (-peak / np.float32(128)).astype(np.float32)
+    codes = np.floor(w / scale[:, None] + np.float32(0.5)) + 128
+    return np.clip(codes, 0, 255).astype(np.uint8)
+
+
 def table_of(axmodel_path, name="npu_params"):
     """The raw weight table out of a compiled `.axmodel`."""
     model = onnx.load(axmodel_path, load_external_data=False)
@@ -77,12 +97,19 @@ def _bits(arr):
 
 
 def _signatures(bit_matrix):
-    """One integer per column, packing that column's value in every sample."""
+    """One key per column, packing that column's value in every sample.
+
+    Up to 64 samples this is a `uint64` array, which keeps the lookups
+    vectorised. Beyond that -- and the LLM path needs beyond that, because a
+    layer holds millions of codes and unambiguity costs about twice their log
+    -- the key becomes the packed bytes of the column.
+    """
     n = bit_matrix.shape[0]
-    if n > 63:
-        raise ValueError("more than 63 samples would overflow the signature")
-    weights = (1 << np.arange(n, dtype=np.uint64)).reshape(-1, 1)
-    return (bit_matrix.astype(np.uint64) * weights).sum(axis=0)
+    if n <= 64:
+        shifts = np.arange(n, dtype=np.uint64)
+        return (bit_matrix.astype(np.uint64) << shifts.reshape(-1, 1)).sum(axis=0)
+    packed = np.packbits(bit_matrix, axis=0, bitorder="little")
+    return [row.tobytes() for row in packed.T]
 
 
 def learn(code_samples, table_samples):
@@ -107,7 +134,8 @@ def learn(code_samples, table_samples):
 
     code_sig = _signatures(code_bits)
     table_sig = _signatures(table_bits)
-    all_zero, all_one = np.uint64(0), np.uint64((1 << n) - 1)
+    all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
+    all_one = _signatures(np.ones((n, 1), np.uint8))[0]
 
     lookup = {}
     for idx, sig in enumerate(code_sig):
@@ -139,7 +167,8 @@ def collisions(code_samples, origin):
     code_bits = _bits([c.ravel() for c in code_samples])
     sig = _signatures(code_bits)
     n = code_bits.shape[0]
-    all_zero, all_one = np.uint64(0), np.uint64((1 << n) - 1)
+    all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
+    all_one = _signatures(np.ones((n, 1), np.uint8))[0]
     counts = {}
     for s in sig:
         if s in (all_zero, all_one):
