@@ -797,7 +797,9 @@ def _qonnx_model(body, initializer=(), opset=21, ir_version=10):
     return model
 
 
-def _qonnx_activation_quant(signed=0, zero_point=LEARNED_ZP, scale=LEARNED_SCALE, bitwidth=8.0):
+def _qonnx_activation_quant(
+    signed=0, zero_point=LEARNED_ZP, scale=LEARNED_SCALE, bitwidth=8.0
+):
     """One MatMul whose activation arrives via a single QONNX ``Quant`` node
     instead of a QuantizeLinear/DequantizeLinear pair -- what
     ``brevitas.export.export_qonnx`` emits for a quantized activation.
@@ -885,9 +887,12 @@ def test_strip_existing_qdq_canonicalizes_a_quant_node():
     # W1 was rewired straight to the original float initializer, not
     # rematerialized -- unlike an integer-stored QDQ weight (scan shape 3),
     # a Quant node's own first input already is the float tensor.
-    assert np.array_equal(onnx.numpy_helper.to_array(
-        next(i for i in float_model.graph.initializer if i.name == "W1")
-    ), W1)
+    assert np.array_equal(
+        onnx.numpy_helper.to_array(
+            next(i for i in float_model.graph.initializer if i.name == "W1")
+        ),
+        W1,
+    )
 
 
 def test_qonnx_bitwidth_other_than_8_is_reported():
