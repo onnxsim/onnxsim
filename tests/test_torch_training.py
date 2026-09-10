@@ -134,6 +134,51 @@ def test_expand_dangling_aten_reduce_calls_leaves_a_dim_argument_call_alone():
     assert node.op_type == "aten_mean"
 
 
+def test_drop_unused_functions_removes_an_uncalled_function_definition():
+    """Regression test for a CI-only failure (Windows): a leftover, uncalled
+    ``FunctionProto`` -- ``onnx.inliner.inline_local_functions`` expands
+    call *sites* but does not necessarily prune the now-dead function
+    definition back out of ``model.functions`` -- whose own body carries a
+    newer opset (18) than the model's own ``opset_import`` (17) fails
+    ``onnx.checker.check_model`` even though nothing calls it anymore.
+
+    Built with ``onnx.helper`` rather than ``onnx.parser``: a FunctionProto
+    with its own, different ``opset_import`` attached to a model isn't
+    expressible in the parser's text format (CLAUDE.md's documented
+    fallback case).
+    """
+    reduce_mean_fn = onnx.helper.make_function(
+        domain="pkg.onnxscript.torch_lib",
+        fname="aten_mean",
+        inputs=["self"],
+        outputs=["result"],
+        nodes=[onnx.helper.make_node("ReduceMean", ["self"], ["result"], keepdims=0)],
+        opset_imports=[onnx.helper.make_opsetid("", 18)],
+    )
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Identity", ["x"], ["loss"])],
+        "agraph",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [4])],
+        [onnx.helper.make_tensor_value_info("loss", onnx.TensorProto.FLOAT, [4])],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("pkg.onnxscript.torch_lib", 1),
+        ],
+        functions=[reduce_mean_fn],
+    )
+    model.ir_version = 8
+
+    with pytest.raises(onnx.checker.ValidationError):
+        onnx.checker.check_model(model)
+
+    cleaned = torch_training._drop_unused_functions(model)
+    assert list(cleaned.functions) == []
+    onnx.checker.check_model(cleaned)
+
+
 def test_compile_torch_training_loop_trains_to_match_the_true_weight():
     module = _Regression()
     example, w_true, x, y = _example_and_batch()

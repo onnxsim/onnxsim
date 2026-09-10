@@ -195,6 +195,39 @@ def _expand_dangling_aten_reduce_calls(model: onnx.ModelProto) -> onnx.ModelProt
     return model
 
 
+def _drop_unused_functions(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Drops any ``FunctionProto`` in ``model.functions`` whose domain no
+    node in ``model.graph`` calls anymore.
+
+    ``onnx.inliner.inline_local_functions`` (:func:`_inline_local_functions`)
+    expands every call *site* into the function's own body nodes, but does
+    not necessarily also prune the now-uncalled ``FunctionProto`` definition
+    itself back out of ``model.functions`` -- observed directly on one CI
+    platform (Windows): a leftover, genuinely unused function definition
+    (its own body's ``ReduceMean`` node still carrying the exporter's native
+    opset, 18) fails ``onnx.checker.check_model`` against the model's own
+    ``opset_import`` (17, what :func:`export_torch_module_to_onnx` requested)
+    for the same ("", the standard ONNX) domain -- the same "a
+    ``FunctionProto``'s own ``opset_import`` must not exceed the model's"
+    constraint :mod:`onnxsim.compile_training` already documents for a
+    *called* function, tripped here by one nobody calls at all.
+
+    Only drops a function whose domain has zero remaining callers in the
+    graph -- run after :func:`_inline_local_functions` and
+    :func:`_expand_dangling_aten_reduce_calls`, both of which either expand
+    or rewrite away every genuine call site first, so what is left by this
+    point is dead weight only the checker can see, never a live call this
+    would break.
+    """
+    used_domains = {node.domain for node in model.graph.node if node.domain}
+    kept = [fn for fn in model.functions if fn.domain in used_domains]
+    if len(kept) == len(model.functions):
+        return model
+    del model.functions[:]
+    model.functions.extend(kept)
+    return model
+
+
 def _fold_full_reduction_squeeze(model: onnx.ModelProto) -> onnx.ModelProto:
     """Rewrites a full reduction's ``keepdims=1`` output immediately
     ``Squeeze``d back down to a scalar into one ``keepdims=0`` node.
@@ -411,12 +444,14 @@ def _export_via_dynamo(
 ) -> onnx.ModelProto:
     """The export core :func:`export_torch_module_to_onnx` and
     :func:`trace_torch_optimizer` both build on: ``torch.export``'s FX
-    graph, converted to ONNX and cleaned up (local functions inlined, the
-    full-reduction ``Squeeze`` folded, the opset-18-only
-    ``noop_with_empty_axes`` default stripped -- see each helper's own
-    docstring). No restriction on how many outputs ``module`` may have; the
-    "exactly one" rule is specific to a training loop's own loss and is
-    enforced by :func:`export_torch_module_to_onnx` itself, one layer up.
+    graph, converted to ONNX and cleaned up (local functions inlined, a
+    dangling ``aten_mean``/``aten_sum`` call expanded, any now-unused
+    function definition dropped, the full-reduction ``Squeeze`` folded, the
+    opset-18-only ``noop_with_empty_axes`` default stripped -- see each
+    helper's own docstring). No restriction on how many outputs ``module``
+    may have; the "exactly one" rule is specific to a training loop's own
+    loss and is enforced by :func:`export_torch_module_to_onnx` itself, one
+    layer up.
     """
     torch = _import_torch()
     if isinstance(example_inputs, Mapping):
@@ -488,6 +523,7 @@ def _export_via_dynamo(
                 ) from error
             model = _inline_local_functions(onnx.load(str(onnx_path)))
             model = _expand_dangling_aten_reduce_calls(model)
+            model = _drop_unused_functions(model)
             model = _fold_full_reduction_squeeze(model)
             return _strip_default_noop_with_empty_axes(model)
     finally:
