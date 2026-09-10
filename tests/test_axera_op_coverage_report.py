@@ -76,6 +76,65 @@ def test_the_table_partitions_the_whole_operator_set():
     assert 0.3 < len(table[op_coverage.ELIGIBLE]) / len(ops) < 0.6
 
 
+def test_dispatch_report_separates_the_two_naming_worlds(tmp_path):
+    """A `layer_configs` entry keyed on `op_types` reaches only the layers that
+    kept their ONNX node name. Pulsar2's fused operators appear as
+    `op_<n>:<name>` and are reachable solely by `layer_names` -- asking for
+    them by op type does not fail, it is silently ignored.
+
+    That trap cost several identical builds, so the report exists to make the
+    split visible before the config is written."""
+    import json
+
+    build = tmp_path / "out"
+    (build / "quant").mkdir(parents=True)
+    (build / "quant" / "quant_axmodel.json").write_text(
+        json.dumps(
+            {
+                "dispatchings": {
+                    "/decoder/conv/Conv": "AX_NPU_AX650_INT8",
+                    "/decoder/act/Mul": "AX_NPU_AX650_INT8",
+                    "op_49:onnx.FullyConnected": "AX_NPU_AX650_INT8",
+                    "op_75:onnx.RMSNormalization": "AX_NPU_AX650_INT8",
+                    "conv": "AX_NPU_LAMBERT_INT8",
+                }
+            }
+        )
+    )
+    targets, by_name = op_coverage.dispatch_report(str(build))
+    assert targets["AX_NPU_AX650_INT8"] == 4
+    # a second engine name is not an anomaly: it is what a different
+    # --target_hardware reports (LAMBERT is the AX8860's).
+    assert targets["AX_NPU_LAMBERT_INT8"] == 1
+    assert len(by_name["onnx"]) == 3
+    assert sorted(by_name["fused"]) == [
+        "op_49:onnx.FullyConnected",
+        "op_75:onnx.RMSNormalization",
+    ]
+
+
+def test_the_fused_prefix_is_load_bearing():
+    """Half the fused vocabulary shares a bare name with a real ai.onnx op.
+
+    `onnx.Mul`, `onnx.Gelu`, `onnx.LayerNormalization`, `onnx.RMSNormalization`
+    and `onnx.RotaryEmbedding` all strip to something ai.onnx defines -- so
+    `op_types: ["Mul"]` reaches ONNX `Mul` nodes and *not* the fused
+    `onnx.Mul`, which is a different operator that exists only after fusion.
+    The prefix is the only thing telling them apart, and no fused name matches
+    an ai.onnx type with its prefix intact.
+    """
+    onnx_ops = set(op_coverage.onnx_op_types())
+    assert not (op_coverage.FUSED_OPS & onnx_ops), "prefixed names must not collide"
+    shared = {n for n in op_coverage.FUSED_OPS if n.split(".", 1)[-1] in onnx_ops}
+    assert shared == {
+        "onnx.Mul",
+        "onnx.Gelu",
+        "onnx.LayerNormalization",
+        "onnx.RMSNormalization",
+        "onnx.RotaryEmbedding",
+    }, shared
+
+
 def test_model_usage_counts_nodes_without_loading_weights(tmp_path):
     """Op types do not depend on weights, and these graphs routinely carry
     hundreds of megabytes of external data, so the inventory must not need

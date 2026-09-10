@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import json
 import os
 import sys
 
@@ -92,10 +93,59 @@ def summarise(path):
     return total, eligible, blocked
 
 
+#: Pulsar2's own fused operator names, observed in real builds. They appear in
+#: a compiled model's `quant/quant_axmodel.json` as `op_<n>:<name>` and exist
+#: nowhere in the ONNX graph, which is what makes them unreachable by
+#: `layer_configs.op_types` -- that field matches ai.onnx names only.
+FUSED_OPS = frozenset(
+    {
+        "onnx.FullyConnected",
+        "onnx.Matmul",
+        "onnx.Mul",
+        "onnx.RMSNormalization",
+        "onnx.LayerNormalization",
+        "onnx.RotaryEmbedding",
+        "onnx.Silu",
+        "onnx.Gelu",
+        "onnx.pre_Reshape",
+        "onnx.pre_Transpose",
+    }
+)
+
+
+def dispatch_report(build_dir):
+    """What a finished build actually scheduled, from its own quant config.
+
+    Returns `(targets, by_name)`: how many layers went to each execution
+    engine, and the layers grouped by whether they kept their ONNX node name
+    or were fused into one of Pulsar2's own operators.
+
+    This is the report that would have prevented several wasted builds. A
+    `layer_configs` entry keyed on `op_types` reaches only the ONNX-named
+    group; the fused group can be targeted solely by `layer_names`, using the
+    names printed here. Asking for a precision change on a fused operator by
+    op type does not fail -- it is ignored, and the build succeeds unchanged.
+    """
+    path = os.path.join(build_dir, "quant", "quant_axmodel.json")
+    with open(path) as handle:
+        quant = json.load(handle)
+    targets = collections.Counter()
+    by_name = collections.defaultdict(list)
+    for layer, engine in (quant.get("dispatchings") or {}).items():
+        targets[engine] += 1
+        fused = layer.split(":", 1)[1] if ":" in layer else None
+        by_name["fused" if fused else "onnx"].append(layer)
+    return targets, dict(by_name)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("models", nargs="*", help="ONNX models to inventory")
     parser.add_argument("--csv", help="write the per-op table here")
+    parser.add_argument(
+        "--build-dir",
+        help="a finished pulsar2 output dir to report dispatch and fused-op names for",
+    )
     args = parser.parse_args(argv)
 
     table = coverage_table()
@@ -114,6 +164,18 @@ def main(argv=None):
             for op in onnx_op_types():
                 writer.writerow([op, classify(op)])
         print(f"wrote {args.csv}")
+
+    if args.build_dir:
+        targets, by_name = dispatch_report(args.build_dir)
+        print(f"\n{args.build_dir}: {sum(targets.values())} dispatched layers")
+        for engine, n in targets.most_common():
+            print(f"  {engine:28s} {n:6d}")
+        fused = by_name.get("fused", [])
+        print(f"  reachable by op_types : {len(by_name.get('onnx', [])):6d}")
+        print(f"  layer_names only      : {len(fused):6d}")
+        kinds = collections.Counter(f.split(":", 1)[1] for f in fused)
+        for name, n in kinds.most_common(10):
+            print(f"      {name:32s} {n:5d}")
 
     for path in args.models:
         total, eligible, blocked = summarise(path)
