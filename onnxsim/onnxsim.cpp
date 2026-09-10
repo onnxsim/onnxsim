@@ -45,6 +45,7 @@
 #include "onnxoptimizer/passes/logging.h"
 #include "partial_shape_eval.h"
 #include "profiler.h"
+#include "qonnx_schemas.h"
 #include "quantize_entry.h"
 
 onnx::ModelProto InferShapesOnce(const onnx::ModelProto& model) {
@@ -328,6 +329,9 @@ static onnx::ModelProto SimplifyImpl(
   // MMCVDeformConv2d/MMCVModulatedDeformConv2d, TRTBatchedNMS/
   // TRTBatchedRotatedNMS, bev_pool_v2).
   onnxsim::RegisterBevCustomOpSchemas();
+  // Likewise for QONNX/FINN's Quant/BipolarQuant/Trunc/FloatQuant, the
+  // fake-quantization ops Brevitas exports by default.
+  onnxsim::RegisterQonnxCustomOpSchemas();
   // Correct the determinism metadata of ops ONNX mis-annotates (e.g. Range) so
   // constant folding does not skip them.
   FixupSchemaDeterminism();

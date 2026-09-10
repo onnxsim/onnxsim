@@ -229,6 +229,20 @@ domain to get past validation (issues
 [#107](https://github.com/onnxsim/onnxsim/issues/107) and
 [#220](https://github.com/onnxsim/onnxsim/issues/220)).
 
+onnxsim also ships schemas out of the box for a few specific custom-op
+families, so shape inference propagates through them with no setup at all:
+ONNX Runtime's `com.microsoft` quantized/contrib ops, mmdeploy/mmcv/BEVDet's
+custom ops, and -- see
+[`docs/qonnx-brevitas-interop.md`](docs/qonnx-brevitas-interop.md) --
+[Brevitas](https://github.com/Xilinx/brevitas)'s native
+[QONNX](https://github.com/fastmachinelearning/qonnx) export format
+(`Quant`/`BipolarQuant`/`Trunc`/`FloatQuant`, in the `qonnx.custom_op.general`
+or `finn.custom_op.general` domain). A Brevitas QAT export's learned
+quantizers are also picked up by `onnxsim.qat_interop`'s ingest path
+(`quantize_static_keeping_qdq_scales`), the same as a QDQ-exported QAT
+model's -- see that doc and the "Quantization-aware fine-tuning" section
+below.
+
 If you describe your custom operator to ONNX with
 [`onnx.defs.register_schema`](https://onnx.ai/onnx/api/defs.html), onnxsim
 picks that schema up automatically: onnxsim links its own copy of ONNX, so its
@@ -1398,6 +1412,14 @@ no training-loop lifecycle -- the lifecycle stays the one onnxsim already has,
 a model in and a model out. Task-loss QAT remains out of scope; the design
 note is [`docs/qat.md`](docs/qat.md), which records both what was built and
 where the boundary is drawn.
+
+Already-trained parameters don't have to come from `apply_qat()` itself, either.
+`onnxsim.qat_interop.quantize_static_keeping_qdq_scales()` ingests a model a
+QAT trainer already produced -- standard QDQ, or (see
+[`docs/qonnx-brevitas-interop.md`](docs/qonnx-brevitas-interop.md))
+[Brevitas](https://github.com/Xilinx/brevitas)'s native QONNX `Quant` export
+-- and carries its learned scales/zero-points into onnxsim's own static
+quantization instead of silently re-deriving them from calibration.
 
 Two things here are genuinely new:
 

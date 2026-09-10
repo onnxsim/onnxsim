@@ -398,6 +398,65 @@ def test_round_trip_through_an_external_trainer(scheme):
     _check_and_run(result.model, FEEDS)
 
 
+def test_export_fake_quant_qonnx_emits_quant_nodes():
+    export = qi.export_fake_quant_qonnx(_float_matmul(), calibration_data=CALIBRATION)
+    node_kinds = [(n.op_type, n.domain) for n in export.model.graph.node]
+    assert node_kinds.count(("Quant", "qonnx.custom_op.general")) == 2
+    assert "QuantizeLinear" not in [n.op_type for n in export.model.graph.node]
+    assert "DequantizeLinear" not in [n.op_type for n in export.model.graph.node]
+    # export_fake_quant's own scale names are unaffected -- Quant's scale
+    # input is the same tensor, same convention; only the zero-point name
+    # changes (QONNX's is always a float tensor, never the QDQ pair's own
+    # integer-typed one).
+    assert export.learnable_scales == ("X_scale", "W1_scale")
+    assert export.learnable_zero_points == ("X_qonnx_zeropoint",)
+    inits = {i.name for i in export.model.graph.initializer}
+    assert set(export.learnable_scales) | set(export.learnable_zero_points) <= inits
+    # A plain (non-onnxsim) onnx.checker also accepts it: the graph is
+    # topologically valid and every Quant node's declared domain is
+    # registered in opset_import.
+    onnx.checker.check_model(export.model)
+    assert any(
+        oi.domain == "qonnx.custom_op.general" for oi in export.model.opset_import
+    )
+
+
+@pytest.mark.parametrize("scheme", ["int8", "int16"])
+def test_round_trip_through_an_external_trainer_qonnx(scheme):
+    # The QONNX-emitting counterpart of test_round_trip_through_an_external_
+    # trainer above: same claim (a trainer's moved scale survives ingest
+    # bit-exact), but through Quant nodes instead of QDQ pairs -- proving the
+    # egress and ingest halves of QONNX/Brevitas interop actually agree with
+    # each other, not just with themselves in isolation.
+    export = qi.export_fake_quant_qonnx(
+        _float_matmul(), scheme=scheme, calibration_data=CALIBRATION
+    )
+
+    trained = onnx.ModelProto()
+    trained.CopyFrom(export.model)
+    wanted = {}
+    for init in trained.graph.initializer:
+        if init.name not in export.learnable_scales:
+            continue
+        moved = (onnx.numpy_helper.to_array(init) * np.float32(0.6)).astype(np.float32)
+        init.CopyFrom(onnx.numpy_helper.from_array(moved, init.name))
+        wanted[init.name] = moved
+
+    result = qi.quantize_static_keeping_qdq_scales(
+        trained, calibration_data=CALIBRATION, scheme=scheme
+    )
+    assert result.calibration_ran is False
+    assert result.unpreserved == ()
+    assert result.scan.skipped == ()
+    assert all(a.is_qonnx_quant for a in result.scan.annotations)
+
+    scale, _ = _activation_params(result.model, "X")
+    assert np.array_equal(scale.reshape(-1), wanted["X_scale"].reshape(-1))
+    _, weight_scale = _weight_params(result.model, "Y")
+    assert np.array_equal(weight_scale, wanted["W1_scale"])
+    _check_and_run(result.model, FEEDS)
+
+
 def test_export_records_learnable_tensors_in_metadata_too():
     export = qi.export_fake_quant(_float_matmul(), calibration_data=CALIBRATION)
     props = {p.key: p.value for p in export.model.metadata_props}
@@ -774,3 +833,238 @@ def test_every_reported_reason_is_documented():
         seen.update(s.reason for s in result.unpreserved)
     assert seen
     assert seen <= set(qi.SKIP_REASONS)
+
+
+# --------------------------------------------------------------------------- #
+# QONNX/Brevitas ingest: a ``Quant`` node is a different graph shape than a
+# QuantizeLinear/DequantizeLinear pair (see qat_interop.py's own "QONNX/
+# Brevitas ingest" docstring section), so it gets its own small model helper --
+# ``_model`` above hardcodes ``opset_import: ["": opset]`` with no room for the
+# extra "qonnx.custom_op.general" domain a Quant node needs declared.
+# --------------------------------------------------------------------------- #
+def _qonnx_model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}, "qonnx.custom_op.general": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
+def _qonnx_activation_quant(
+    signed=0, zero_point=LEARNED_ZP, scale=LEARNED_SCALE, bitwidth=8.0
+):
+    """One MatMul whose activation arrives via a single QONNX ``Quant`` node
+    instead of a QuantizeLinear/DequantizeLinear pair -- what
+    ``brevitas.export.export_qonnx`` emits for a quantized activation.
+    """
+    return _qonnx_model(
+        f"""
+        g (float[2, 4] X) => (float[2, 6] Y)
+        {{
+          Xdq = qonnx.custom_op.general.Quant<signed = {signed}, narrow = 0>(X, x_scale, x_zp, x_bw)
+          Y = MatMul(Xdq, W1)
+        }}
+        """,
+        initializer=[
+            _f32(W1, "W1"),
+            _f32(scale, "x_scale"),
+            _f32(float(zero_point), "x_zp"),
+            _f32(bitwidth, "x_bw"),
+        ],
+    )
+
+
+def _qonnx_weight_quant(scale=0.01, zero_point=0.0, bitwidth=8.0):
+    """One MatMul whose weight arrives pre-wrapped in a QONNX ``Quant`` node --
+    what ``export_qonnx`` emits for a quantized (signed, symmetric) weight.
+    """
+    return _qonnx_model(
+        """
+        g (float[2, 4] X) => (float[2, 6] Y)
+        {
+          Wdq = qonnx.custom_op.general.Quant<signed = 1, narrow = 0>(W1, w_scale, w_zp, w_bw)
+          Y = MatMul(X, Wdq)
+        }
+        """,
+        initializer=[
+            _f32(W1, "W1"),
+            _f32(scale, "w_scale"),
+            _f32(zero_point, "w_zp"),
+            _f32(bitwidth, "w_bw"),
+        ],
+    )
+
+
+def test_qonnx_quant_is_detected_as_a_fourth_pattern_shape():
+    model = _qonnx_activation_quant()
+    scan = qi.find_existing_qdq(model)
+    assert [a.tensor_name for a in scan.annotations] == ["X"]
+    ann = scan.annotations[0]
+    assert ann.is_qonnx_quant is True
+    assert ann.role == "activation"
+    assert float(ann.scale) == np.float32(LEARNED_SCALE)
+    assert int(ann.zero_point) == LEARNED_ZP
+    assert ann.zero_point_dtype == onnx.TensorProto.UINT8
+
+
+def test_qonnx_quant_activation_survives_ingest():
+    result = qi.quantize_static_keeping_qdq_scales(
+        _qonnx_activation_quant(), calibration_data=CALIBRATION
+    )
+    assert result.preserved == ("X",)
+    assert result.recalibrated == ()
+    assert result.unpreserved == ()
+    scale, zero_point = _activation_params(result.model, "X")
+    assert float(scale) == np.float32(LEARNED_SCALE)
+    assert int(zero_point) == LEARNED_ZP
+    # The ingested model is an ordinary QDQ model: the Quant node is gone.
+    assert "Quant" not in [n.op_type for n in result.model.graph.node]
+    _check_and_run(result.model, FEEDS)
+
+
+def test_qonnx_quant_weight_survives_ingest():
+    result = qi.quantize_static_keeping_qdq_scales(
+        _qonnx_weight_quant(), calibration_data=CALIBRATION
+    )
+    assert "W1" in result.preserved
+    codes, scale = _weight_params(result.model, "Y")
+    assert np.allclose(scale, 0.01)
+    assert np.array_equal(codes, np.clip(np.round(W1 / 0.01), -127, 127))
+    _check_and_run(result.model, FEEDS)
+
+
+def test_strip_existing_qdq_canonicalizes_a_quant_node():
+    float_model, scan = qi.strip_existing_qdq(_qonnx_weight_quant())
+    assert [a.tensor_name for a in scan.annotations] == ["W1"]
+    assert [n.op_type for n in float_model.graph.node] == ["MatMul"]
+    # W1 was rewired straight to the original float initializer, not
+    # rematerialized -- unlike an integer-stored QDQ weight (scan shape 3),
+    # a Quant node's own first input already is the float tensor.
+    assert np.array_equal(
+        onnx.numpy_helper.to_array(
+            next(i for i in float_model.graph.initializer if i.name == "W1")
+        ),
+        W1,
+    )
+
+
+def test_qonnx_unsupported_bitwidth_is_reported():
+    model = _qonnx_activation_quant(bitwidth=4.0)
+    scan = qi.find_existing_qdq(model)
+    assert scan.annotations == ()
+    assert [s.reason for s in scan.skipped] == ["qonnx_bitwidth_unsupported"]
+
+
+def test_qonnx_16bit_activation_survives_ingest():
+    # onnxsim's other integer scheme (quantize_static_int16, uint16
+    # activations) is a real target too, not just the 8-bit default.
+    model = _qonnx_activation_quant(
+        signed=0, bitwidth=16.0, scale=0.0007, zero_point=40000
+    )
+    scan = qi.find_existing_qdq(model)
+    assert len(scan.annotations) == 1
+    assert scan.annotations[0].zero_point_dtype == onnx.TensorProto.UINT16
+
+    result = qi.quantize_static_keeping_qdq_scales(
+        model, calibration_data=CALIBRATION, scheme="int16"
+    )
+    assert result.preserved == ("X",)
+    scale, zero_point = _activation_params(result.model, "X")
+    assert float(scale) == np.float32(0.0007)
+    assert int(zero_point) == 40000
+    _check_and_run(result.model, FEEDS)
+
+
+def test_qonnx_16bit_signed_weight_is_reported_not_reinterpreted():
+    # 16-bit signed is a real (bitwidth, signed) combination -- just not one
+    # onnxsim's weight scheme (always 8-bit symmetric) can carry, so this is
+    # recognized and refused downstream, not at detection time.
+    model = _qonnx_weight_quant(bitwidth=16.0)
+    scan = qi.find_existing_qdq(model)
+    assert scan.annotations[0].zero_point_dtype == onnx.TensorProto.INT16
+
+    result = qi.quantize_static_keeping_qdq_scales(model, calibration_data=CALIBRATION)
+    assert result.preserved == ()
+    assert [(s.tensor_name, s.reason) for s in result.unpreserved] == [
+        ("W1", "weight_dtype_not_int8")
+    ]
+
+
+def test_qonnx_per_channel_weight_scale_survives_ingest():
+    # A per-output-channel weight quantizer -- the common case for a real
+    # Brevitas QuantConv2d/QuantLinear export -- with no `axis` attribute to
+    # read it off of: the scale's own (6,)-shape broadcasting against W1's
+    # (4, 6) is itself the claim that axis 1 (matching quantize_static's own
+    # emitted per-column axis) is the channel axis.
+    learned = (np.abs(W1).max(axis=0) / 127.0 * 0.8).astype(np.float32)
+    model = _qonnx_weight_quant(scale=learned, zero_point=np.zeros(6))
+    scan = qi.find_existing_qdq(model)
+    assert [(a.tensor_name, a.axis) for a in scan.annotations] == [("W1", 1)]
+
+    result = qi.quantize_static_keeping_qdq_scales(model, calibration_data=CALIBRATION)
+    assert "W1" in result.preserved
+    codes, scale = _weight_params(result.model, "Y")
+    assert np.array_equal(scale, learned)
+    assert np.array_equal(codes, np.clip(np.round(W1 / learned), -127, 127))
+    _check_and_run(result.model, FEEDS)
+
+
+def test_qonnx_multi_axis_scale_is_reported():
+    # A scale shaped like the whole weight (every axis non-1) broadcasts over
+    # more than one axis -- a per-block scale, which has no onnxsim
+    # counterpart, unlike the single-axis per-channel case above.
+    model = _qonnx_weight_quant(
+        scale=np.full((4, 6), 0.01), zero_point=np.zeros((4, 6))
+    )
+    scan = qi.find_existing_qdq(model)
+    assert scan.annotations == ()
+    assert [s.reason for s in scan.skipped] == ["qonnx_per_channel_scale_unsupported"]
+
+
+def test_qonnx_activation_per_channel_scale_is_reported():
+    # Unlike a weight, an activation has no static initializer this scan can
+    # read a real shape off of, so its per-channel scale is refused even
+    # though the shape itself would otherwise resolve to a single axis.
+    model = _qonnx_activation_quant()
+    for init in model.graph.initializer:
+        if init.name == "x_scale":
+            init.CopyFrom(_f32(np.full(4, LEARNED_SCALE), "x_scale"))
+    scan = qi.find_existing_qdq(model)
+    assert scan.annotations == ()
+    assert [s.reason for s in scan.skipped] == ["qonnx_per_channel_scale_unsupported"]
+
+
+def test_qonnx_non_integral_zero_point_is_reported():
+    model = _qonnx_activation_quant(zero_point=0)
+    for init in model.graph.initializer:
+        if init.name == "x_zp":
+            init.CopyFrom(_f32(0.5, "x_zp"))
+    scan = qi.find_existing_qdq(model)
+    assert scan.annotations == ()
+    assert [s.reason for s in scan.skipped] == ["qonnx_zero_point_not_integral"]
+
+
+def test_qonnx_bipolar_quant_is_recognized_but_unsupported():
+    model = _qonnx_model(
+        """
+        g (float[2, 4] X) => (float[2, 6] Y)
+        {
+          Xdq = qonnx.custom_op.general.BipolarQuant(X, x_scale)
+          Y = MatMul(Xdq, W1)
+        }
+        """,
+        initializer=[_f32(W1, "W1"), _f32(LEARNED_SCALE, "x_scale")],
+    )
+    scan = qi.find_existing_qdq(model)
+    assert scan.annotations == ()
+    assert [s.reason for s in scan.skipped] == ["qonnx_op_unsupported"]
+
+    result = qi.quantize_static_keeping_qdq_scales(model, num_calibration_samples=2)
+    # Refusing means leaving the node exactly where it is.
+    assert "BipolarQuant" in [n.op_type for n in result.model.graph.node]
