@@ -38,6 +38,7 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.compile_training import TrainingLoop, compile_training_loop
 from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
 from onnxsim.daq import apply_daq
@@ -345,6 +346,8 @@ __all__ = [
     "discover_qat_blocks",
     "QATBlock",
     "QATBlockResult",
+    "compile_training_loop",
+    "TrainingLoop",
     "quantize_static_keeping_qdq_scales",
     "export_fake_quant",
     "find_existing_qdq",
