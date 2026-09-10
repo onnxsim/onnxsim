@@ -80,6 +80,14 @@ jobs:
           python-version: "3.11"
       - name: Install deps (onnxruntime-training needs no source build -- see README.md)
         run: pip install onnx numpy onnxruntime-training pytest
+      - name: Sanity-check onnxruntime.training.artifacts actually imports
+        # test_distillation.py's own pytest.importorskip("onnxruntime.training.artifacts")
+        # turns any ImportError here into a silent, all-tests-skipped run (pytest exit
+        # code 5) -- which is the right behavior for a machine that genuinely lacks a
+        # training-enabled onnxruntime, but wrong for this job, whose entire point is
+        # installing exactly that. Importing it directly, uncaught, surfaces the real
+        # traceback in the CI log instead of a bare "1 skipped".
+        run: python3 -c "import onnxruntime.training.artifacts"
       - name: pytest tools/onnx-finetune/tests/test_distillation.py
         run: pytest tools/onnx-finetune/tests/test_distillation.py -v
 
