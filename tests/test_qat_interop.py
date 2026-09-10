@@ -826,12 +826,12 @@ def _qonnx_weight_quant(scale=0.01, zero_point=0.0, bitwidth=8.0):
     what ``export_qonnx`` emits for a quantized (signed, symmetric) weight.
     """
     return _qonnx_model(
-        f"""
+        """
         g (float[2, 4] X) => (float[2, 6] Y)
-        {{
+        {
           Wdq = qonnx.custom_op.general.Quant<signed = 1, narrow = 0>(W1, w_scale, w_zp, w_bw)
           Y = MatMul(X, Wdq)
-        }}
+        }
         """,
         initializer=[
             _f32(W1, "W1"),
