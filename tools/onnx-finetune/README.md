@@ -349,19 +349,19 @@ already use to avoid `onnxruntime.training` for LoRA and block-wise QAT), instea
 forward, loss, backward, and an Adam step all baked in -- runnable by repeatedly calling
 `session.run()`/`Run()` on a **plain, non-training** onnxruntime. No `pip install
 onnxruntime-training`, no from-source `--enable_training_apis` build, anywhere in this path --
-see that script's own module docstring for the full design writeup, including the one real
-trade-off it makes (a step graph's batch size is fixed at build time; `onnxruntime.training`'s
-graph tolerates a symbolic one).
+see that script's own module docstring for the full design writeup. The step graph's batch
+dimension is a `dim_param`, decided per call rather than fixed when the graph is built -- the
+same compiled graph runs any batch size, chosen freely each step via `--batch-size` below.
 
 ```sh
 # 1. Same teacher/student pair as above.
 python3 scripts/make_toy_classifier.py -o teacher.onnx --hidden-dim 32 --num-classes 4
 python3 scripts/make_toy_classifier.py -o student.onnx --hidden-dim 8  --num-classes 4
 
-# 2. One step graph, batch size fixed at build time. Also writes step.onnx.manifest.txt
+# 2. One step graph with a dynamic batch dimension. Also writes step.onnx.manifest.txt
 #    and step.onnx.initial_state.bin alongside it -- a non-Python caller (the native CLI
 #    below, or the wasm runner) needs both to actually run it.
-python3 scripts/generate_distillation_step_graph.py student.onnx -o step.onnx --batch-size 32
+python3 scripts/generate_distillation_step_graph.py student.onnx -o step.onnx
 
 # 3. Same synthetic data as above (int64 labels; this path builds its own one-hot matrix
 #    from them on the host, see the script's docstring on why that's not done in-graph).
@@ -369,11 +369,13 @@ python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samp
 
 # 4. Train with the plain-onnxruntime native tool (see "Building" below for ORT_HOME) --
 #    a completely separate binary from ./build/onnx-finetune, built against a *plain*
-#    onnxruntime (an official prebuilt release tarball works, no build at all).
+#    onnxruntime (an official prebuilt release tarball works, no build at all). --batch-size
+#    is just how many samples to feed per step -- freely choosable, and needn't divide
+#    --num-samples evenly (the last step of each epoch uses whatever is left).
 ./build/onnx-finetune-distill-step-graph \
   --step-graph step.onnx --teacher-model teacher.onnx \
   --train-input train_input.bin --train-target train_labels.bin --num-samples 2048 \
-  --epochs 20 --lr 0.01 --output-weights final_weights.bin
+  --batch-size 32 --epochs 20 --lr 0.01 --output-weights final_weights.bin
 
 # 5. Reassemble the trained weights into an ordinary, inference-ready .onnx -- the plain
 #    Ort::Session this tool uses has no ExportModelForInferencing equivalent, so this one
