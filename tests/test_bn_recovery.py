@@ -257,11 +257,9 @@ def test_find_recovered_bn_nodes_roundtrips_through_serialization():
 
 def test_recover_batch_norm_end_to_end_after_fusion():
     # The scenario from onnxsim.bn_recovery's own docstring: a graph whose
-    # BatchNormalization has already been folded into its preceding Conv
-    # (by onnxsim's own fuse_bn_into_conv, exercised here through
-    # onnxsim.simplify) still produces the exact same numbers after
-    # recover_batch_norm runs, since insert_identity_bn's own insertion is
-    # a numerical no-op.
+    # BatchNormalization has already been folded into its preceding Conv (by
+    # onnxsim's own fuse_bn_into_conv, exercised here through
+    # onnxsim.simplify).
     rng = np.random.default_rng(4)
     c_in, c_out = 3, 4
     w = rng.standard_normal((c_out, c_in, 3, 3)).astype(np.float32) * 0.2
@@ -300,18 +298,44 @@ def test_recover_batch_norm_end_to_end_after_fusion():
     fused_out = _run(fused, {"x": x})["y"]
     np.testing.assert_allclose(fused_out, original_out, rtol=1e-4, atol=1e-5)
 
-    recovered = recover_batch_norm(
-        fused,
-        calibration_data=[
-            {"x": rng.standard_normal((1, c_in, 8, 8)).astype(np.float32)}
-            for _ in range(4)
-        ],
-    )
+    # insert_identity_bn alone -- no calibration data, so no distribution
+    # assumption enters at all -- is exactly the numeric no-op the module's
+    # own docstring promises: the fused graph's own output is untouched.
+    structurally_recovered, _ = insert_identity_bn(fused)
+    onnx.checker.check_model(structurally_recovered)
+    assert "BatchNormalization" in {
+        n.op_type for n in structurally_recovered.graph.node
+    }
+    bare_out = _run(structurally_recovered, {"x": x})["y"]
+    np.testing.assert_allclose(bare_out, original_out, rtol=1e-4, atol=1e-5)
+
+    # recover_batch_norm's own closed-form calibration, with no target_model,
+    # deliberately fits the recovered node to *whatever distribution
+    # calibration_data carries* -- unrelated random data here -- so it is
+    # *not* expected to reproduce `original`'s own numbers (see this
+    # module's own docstring: recovering the *original* folded-away BN
+    # exactly is impossible by construction). What it should still do is
+    # produce a valid, structurally recovered model.
+    calib = [
+        {"x": rng.standard_normal((1, c_in, 8, 8)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    recovered = recover_batch_norm(fused, calibration_data=calib)
     onnx.checker.check_model(recovered)
     assert "BatchNormalization" in {n.op_type for n in recovered.graph.node}
 
-    recovered_out = _run(recovered, {"x": x})["y"]
-    np.testing.assert_allclose(recovered_out, original_out, rtol=1e-3, atol=1e-4)
+    # Pointing recover_batch_norm at `original` as target_model, though,
+    # asks it to match the recovered node's own output distribution back to
+    # `original`'s -- and since the fused graph's pre-recovery activation is
+    # already numerically identical to `original`'s own final output (shown
+    # above), that closed-form affine match closely reproduces it, including
+    # off the exact calibration inputs.
+    matched = recover_batch_norm(
+        fused, calibration_data=calib, target_model=original
+    )
+    onnx.checker.check_model(matched)
+    matched_out = _run(matched, {"x": x})["y"]
+    np.testing.assert_allclose(matched_out, original_out, rtol=1e-3, atol=1e-4)
 
 
 def test_recover_batch_norm_is_a_no_op_with_nothing_to_recover():
