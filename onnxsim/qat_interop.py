@@ -1,5 +1,14 @@
 """QAT interop: consume and produce fake-quant (QDQ) graphs without training.
 
+Also ingests Brevitas's native export format. Brevitas -- the PyTorch
+quantization-aware-training library FINN/Xilinx deployments are built on --
+does not export standard ``QuantizeLinear``/``DequantizeLinear`` by default;
+its primary path (``brevitas.export.export_qonnx``) emits QONNX's generic
+``Quant`` custom op instead (``qonnx.custom_op.general`` domain, or the
+older ``finn.custom_op.general``), so a Brevitas-trained model needs its own
+detection path into the same ingest pipeline. See "QONNX/Brevitas ingest"
+below for exactly what is and is not covered.
+
 This is "deliverable A" of ``docs/qat.md`` -- the half of quantization-aware
 training that is pure graph rewriting. Nothing here runs a training loop, and
 nothing here needs calibration data for a tensor whose quantization
@@ -78,6 +87,53 @@ static-quantization rewrite, so the model it returns may quantize more nodes
 than the input model did -- an export that fake-quantized only some of its
 layers comes back with the rest quantized too, from calibration.
 ``QdqIngestResult.recalibrated`` lists exactly those.
+
+QONNX/Brevitas ingest
+----------------------
+A QONNX ``Quant`` node is a single-node fake-quantizer: its first input is
+the float tensor being quantized directly (there is no separate integer
+tensor or producing ``QuantizeLinear`` to look for), and its own output is
+already the dequantized result -- so :func:`find_existing_qdq` treats one as
+a fourth pattern shape, alongside the three QDQ ones, and
+:class:`QdqAnnotation.is_qonnx_quant` marks it. Everything downstream
+(:func:`quantize_static_keeping_qdq_scales`'s writeback,
+:func:`strip_existing_qdq`'s canonicalization) is otherwise unchanged --
+from there on a QONNX-sourced annotation and a QDQ-sourced one are
+indistinguishable, because both are just "this float tensor's learned
+``(scale, zero_point)``" by the time canonicalization is done.
+
+What is covered: an 8-bit, per-tensor (scalar scale/zero-point) ``Quant``
+node with a constant ``scale``/``zeropoint``/``bitwidth``, in the
+``qonnx.custom_op.general`` or ``finn.custom_op.general`` domain --
+``signed=1`` maps to onnxsim's own symmetric int8 weight scheme,
+``signed=0`` to its uint8 activation scheme, exactly like an ordinary QDQ
+pair with that zero-point dtype.
+
+Not covered, deliberately, on top of the QDQ limitations above:
+
+- **Per-channel ``Quant`` scale** (the common case for a Brevitas
+  ``QuantConv2d``/``QuantLinear`` weight, e.g. a ``(Cout, 1, 1, 1)``-shaped
+  scale broadcasting against the weight). Unlike ``DequantizeLinear``'s
+  ``axis`` attribute, QONNX's ``Quant`` carries no axis annotation to check a
+  broadcast shape's claim against -- inferring one from the scale tensor's
+  own shape would be a guess, and this module does not guess. Reported as
+  ``qonnx_per_channel_scale_unsupported``; the weight falls back to
+  onnxsim's own round-to-nearest per-channel scale.
+- **Bit-widths other than 8** (the case QONNX/Brevitas exists for) have no
+  counterpart in onnxsim's own 8-bit-only schemes, so a ``Quant`` node whose
+  ``bitwidth`` input does not round to exactly 8 is reported
+  (``qonnx_bitwidth_unsupported``) rather than lossily re-quantized to a
+  width the export did not ask for.
+- **``BipolarQuant``, ``Trunc``, ``FloatQuant``** are recognized (so a model
+  using them is not silently mis-scanned as an ordinary float graph) but not
+  yet canonicalized -- reported as ``qonnx_op_unsupported``. None of onnxsim's
+  own quantization schemes are 1-bit, truncating, or float-grid, so there is
+  no scheme yet for any of them to round-trip into.
+- **A non-constant ``zeropoint``**, or one whose value is not itself
+  (numerically, within a small tolerance) an integer -- QONNX stores it as a
+  float tensor so it can be a trained value, but onnxsim's own QDQ
+  convention needs it to land on an actual integer code. Reported as
+  ``qonnx_zero_point_not_integral``.
 """
 
 import dataclasses
@@ -197,6 +253,27 @@ SKIP_REASONS: Dict[str, str] = {
         "the emitted scale/zero-point initializer is shared with another "
         "consumer, so overwriting it would change that consumer too"
     ),
+    # -- QONNX/Brevitas detection (see the module docstring's "QONNX/Brevitas
+    # ingest" section for the full picture) --
+    "qonnx_bitwidth_unsupported": (
+        "the Quant node's bitwidth input is not a constant that rounds to "
+        "8; onnxsim's own quantization schemes are 8-bit only"
+    ),
+    "qonnx_zero_point_not_integral": (
+        "the Quant node's zeropoint input is not a constant, or its value "
+        "is not (within tolerance) an integer code"
+    ),
+    "qonnx_per_channel_scale_unsupported": (
+        "the Quant node's scale is not a scalar; QONNX's Quant carries no "
+        "axis attribute to check a per-channel broadcast shape's claim "
+        "against, so this module does not guess one"
+    ),
+    "qonnx_op_unsupported": (
+        "this is a QONNX/FINN custom op this module recognizes but does not "
+        "yet canonicalize (BipolarQuant, Trunc, FloatQuant): none of "
+        "onnxsim's own quantization schemes are 1-bit, truncating, or "
+        "float-grid"
+    ),
 }
 
 # metadata_props keys :func:`export_fake_quant` stamps onto the model. See its
@@ -224,6 +301,17 @@ _SCHEMES = {
 # a QDQ pair it can re-emit from one it must leave alone.
 _QUANTIZED_OPS = ("MatMul", "Gemm", "Conv")
 
+# Domains QONNX/FINN's fake-quantization custom ops live in: the current
+# `qonnx` package name, and `finn.custom_op.general`, its predecessor under
+# the original FINN compiler's own custom-op package -- both still seen in
+# exports in the wild, and registered identically by onnxsim's own
+# RegisterQonnxCustomOpSchemas (onnxsim/qonnx_schemas.cpp).
+_QONNX_DOMAINS = ("qonnx.custom_op.general", "finn.custom_op.general")
+
+# Recognized but not yet canonicalized -- see the module docstring's
+# "QONNX/Brevitas ingest" section for why.
+_QONNX_UNSUPPORTED_OPS = ("BipolarQuant", "Trunc", "FloatQuant")
+
 
 @dataclasses.dataclass(frozen=True)
 class QdqAnnotation:
@@ -250,6 +338,12 @@ class QdqAnnotation:
     zero_point_name: Optional[str]  # None when the pair omitted the input
     quantize_node: Optional[str]  # output name of the QuantizeLinear, if any
     dequantize_node: str  # output name of the DequantizeLinear
+    # True for a QONNX/Brevitas ``Quant`` node (the module docstring's
+    # "QONNX/Brevitas ingest" section): one node plays both the
+    # QuantizeLinear and DequantizeLinear role at once, so ``quantize_node``
+    # is meaningless for it and ``_strip`` branches on this flag instead.
+    # Defaulted so every existing QDQ-pair call site is unaffected.
+    is_qonnx_quant: bool = False
 
     @property
     def per_tensor(self) -> bool:
@@ -613,10 +707,94 @@ def _scan_dequantize(
     )
 
 
+def _scan_quant_node(
+    node: onnx.NodeProto,
+    inits: Dict[str, onnx.TensorProto],
+    outputs: Set[str],
+    subgraph_reads: Set[str],
+) -> Union[QdqAnnotation, SkippedQdq, None]:
+    """One QONNX/FINN ``Quant`` node, read as an annotation or a refusal.
+
+    Unlike a QuantizeLinear/DequantizeLinear pair, a ``Quant`` node already
+    *is* both halves at once: its own first input (``X``) is the float
+    tensor being quantized -- there is no separate integer tensor, and hence
+    no producer to look up -- and its own output is the "quantize then
+    immediately dequantize back to float" result. ``tensor_name`` is
+    therefore just ``node.input[0]``, and canonicalizing the node away later
+    (``_strip``) is a plain rewire to it, with nothing to rematerialize.
+
+    ``None`` means "not a recognized shape" only where nothing was even
+    attempted; every other refusal comes back as a :class:`SkippedQdq`. See
+    the module docstring's "QONNX/Brevitas ingest" section for what counts as
+    recognized: 8-bit, per-tensor, with constant, integral parameters.
+    """
+    if not node.output or len(node.input) < 4:
+        return None
+    out_name = node.output[0]
+    tensor_name = node.input[0]
+
+    if out_name in outputs:
+        return SkippedQdq(tensor_name, "dequantize_output_is_graph_output", out_name)
+    if out_name in subgraph_reads or tensor_name in subgraph_reads:
+        return SkippedQdq(tensor_name, "referenced_in_subgraph", out_name)
+    # Unlike the QDQ "quantized tensor reused" check, there is no analogous
+    # hazard to check for here: canonicalizing a Quant node away rewires its
+    # consumers to `tensor_name` (its own first input) rather than deleting
+    # any tensor other code might still be reading.
+
+    scale_name, zp_name, bitwidth_name = node.input[1], node.input[2], node.input[3]
+    scale_init = inits.get(scale_name)
+    if scale_init is None:
+        return SkippedQdq(tensor_name, "scale_not_constant", out_name)
+    if scale_init.data_type != onnx.TensorProto.FLOAT:
+        return SkippedQdq(tensor_name, "unsupported_scale_dtype", out_name)
+    scale = onnx.numpy_helper.to_array(scale_init).astype(np.float64)
+    if scale.size != 1:
+        return SkippedQdq(tensor_name, "qonnx_per_channel_scale_unsupported", out_name)
+    if not np.all(np.isfinite(scale)) or not np.all(scale > 0):
+        return SkippedQdq(tensor_name, "non_positive_scale", out_name)
+
+    zp_init = inits.get(zp_name)
+    if zp_init is None:
+        return SkippedQdq(tensor_name, "zero_point_not_constant", out_name)
+    zero_point_f = onnx.numpy_helper.to_array(zp_init).astype(np.float64)
+    if zero_point_f.size != 1:
+        return SkippedQdq(tensor_name, "qonnx_per_channel_scale_unsupported", out_name)
+    zero_point_rounded = np.round(zero_point_f)
+    if not np.allclose(zero_point_f, zero_point_rounded, atol=1e-4):
+        return SkippedQdq(tensor_name, "qonnx_zero_point_not_integral", out_name)
+
+    bitwidth_init = inits.get(bitwidth_name)
+    if bitwidth_init is None:
+        return SkippedQdq(tensor_name, "qonnx_bitwidth_unsupported", out_name)
+    bitwidth = onnx.numpy_helper.to_array(bitwidth_init).astype(np.float64).reshape(-1)
+    if bitwidth.size != 1 or round(float(bitwidth[0])) != 8:
+        return SkippedQdq(tensor_name, "qonnx_bitwidth_unsupported", out_name)
+
+    signed_attr = _attr(node, "signed")
+    signed = bool(signed_attr.i) if signed_attr is not None else True
+    zero_point_dtype = onnx.TensorProto.INT8 if signed else onnx.TensorProto.UINT8
+
+    is_weight = tensor_name in inits
+    return QdqAnnotation(
+        tensor_name=tensor_name,
+        role="weight" if is_weight else "activation",
+        scale=np.asarray(scale, dtype=np.float32),
+        zero_point=zero_point_rounded.astype(np.int64),
+        zero_point_dtype=zero_point_dtype,
+        axis=None,
+        scale_name=scale_name,
+        zero_point_name=zp_name,
+        quantize_node=None,
+        dequantize_node=out_name,
+        is_qonnx_quant=True,
+    )
+
+
 def find_existing_qdq(model: Union[str, onnx.ModelProto]) -> QdqScan:
     """Detect the QuantizeLinear/DequantizeLinear pairs already in ``model``.
 
-    Three shapes are recognized, which between them cover what QAT exporters
+    Four shapes are recognized, which between them cover what QAT exporters
     and onnxsim's own :func:`onnxsim.quantize_static` emit:
 
     1. ``X -> QuantizeLinear -> DequantizeLinear -> ...`` where ``X`` is a
@@ -627,11 +805,17 @@ def find_existing_qdq(model: Union[str, onnx.ModelProto]) -> QdqScan:
     3. ``Wq (integer initializer) -> DequantizeLinear -> ...`` with no
        Quantize -- a weight already stored in its quantized form, which is
        what ONNX Runtime's quantizer and ``quantize_static`` produce.
+    4. ``X -> Quant -> ...`` (QONNX/FINN's single-node fake-quantizer, as
+       Brevitas exports by default) -- see the module docstring's
+       "QONNX/Brevitas ingest" section for exactly what is recognized.
+       ``BipolarQuant``/``Trunc``/``FloatQuant`` nodes are recognized too,
+       but always come back as a refusal (:data:`SKIP_REASONS`
+       ``"qonnx_op_unsupported"``), not an annotation.
 
     Nothing is modified. The scan is purely informational, which makes it the
     right entry point for "what did my trainer actually learn?" -- and it is
     also the first step of :func:`strip_existing_qdq` and
-    :func:`quantize_static_keeping_qdq_scales`, so the three always agree on
+    :func:`quantize_static_keeping_qdq_scales`, so all four always agree on
     what counts as a pair.
 
     :param model: onnx ModelProto object or file path
@@ -649,11 +833,24 @@ def find_existing_qdq(model: Union[str, onnx.ModelProto]) -> QdqScan:
     annotations: List[QdqAnnotation] = []
     skipped: List[SkippedQdq] = []
     for dq in graph.node:
-        if dq.op_type != "DequantizeLinear" or len(dq.input) < 2 or not dq.output:
+        if dq.op_type == "DequantizeLinear" and len(dq.input) >= 2 and dq.output:
+            found = _scan_dequantize(
+                dq, inits, producers, uses, outputs, subgraph_reads, shapes
+            )
+        elif dq.op_type == "Quant" and dq.domain in _QONNX_DOMAINS:
+            found = _scan_quant_node(dq, inits, outputs, subgraph_reads)
+        elif dq.op_type in _QONNX_UNSUPPORTED_OPS and dq.domain in _QONNX_DOMAINS:
+            # Recognized, so a model using them is not silently mis-scanned as
+            # an ordinary float graph -- but see the module docstring's
+            # "QONNX/Brevitas ingest" section for why none is canonicalized
+            # yet.
+            found = (
+                SkippedQdq(dq.input[0], "qonnx_op_unsupported", dq.output[0])
+                if dq.input and dq.output
+                else None
+            )
+        else:
             continue
-        found = _scan_dequantize(
-            dq, inits, producers, uses, outputs, subgraph_reads, shapes
-        )
         if isinstance(found, QdqAnnotation):
             annotations.append(found)
         elif isinstance(found, SkippedQdq):
@@ -712,11 +909,21 @@ def _strip(
     materialized: List[onnx.TensorProto] = []
 
     for ann in annotations:
-        dq = producers[ann.dequantize_node]
         drop_nodes.add(ann.dequantize_node)
         orphan_candidates.add(ann.scale_name)
         if ann.zero_point_name:
             orphan_candidates.add(ann.zero_point_name)
+        dq = producers[ann.dequantize_node]
+        if ann.is_qonnx_quant:
+            # A Quant node's own first input already *is* the float tensor
+            # (`ann.tensor_name`) -- there is no separate integer codes
+            # tensor to dequantize, unlike shape 3 below, so canonicalizing
+            # it away is a plain rewire, nothing to materialize. Its
+            # `bitwidth` input (position 3) is its own besides scale/
+            # zero_point, so it is an orphan candidate too.
+            orphan_candidates.add(dq.input[3])
+            rewire[ann.dequantize_node] = ann.tensor_name
+            continue
         if ann.quantize_node is not None:
             drop_nodes.add(ann.quantize_node)
             rewire[ann.dequantize_node] = ann.tensor_name

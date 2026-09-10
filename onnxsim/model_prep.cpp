@@ -15,6 +15,7 @@
 #include "onnx/checker.h"
 #include "onnx/defs/schema.h"
 #include "onnx/version_converter/convert.h"
+#include "qonnx_schemas.h"
 
 void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
   const size_t n_words = n / sizeof(uint64_t);
@@ -525,6 +526,7 @@ onnx::ModelProto ConvertOpsetVersion(onnx::ModelProto model,
 void PrepareSchemasForDebug(const onnx::ModelProto& model) {
   onnxsim::RegisterContribOpSchemas();
   onnxsim::RegisterBevCustomOpSchemas();
+  onnxsim::RegisterQonnxCustomOpSchemas();
   FixupSchemaDeterminism();
   RegisterCustomDefaultDomainOpSchemas(model);
 }
