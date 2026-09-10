@@ -427,7 +427,24 @@ def test_static_quantize_matmul_output_is_close_to_float_within_proved_bound():
     x_min, x_max = float(x.min()), float(x.max())
     quantized = _quantize_static(model, {"X": (x_min, x_max)})
 
-    sess = ort.InferenceSession(quantized.SerializeToString())
+    # Graph optimization disabled: by default onnxruntime silently fuses this
+    # QDQ chain (QuantizeLinear -> DequantizeLinear x2 -> MatMul) into a
+    # hardware-specific `MatMulIntegerToFloat` contrib kernel (confirmed via
+    # `sess_options.optimized_model_filepath`) -- a different code path than
+    # the literal node chain this pass's proof reasons about, and one whose
+    # own numeric behavior isn't part of this claim (see
+    # `onnxsim/ort_matmul_nbits_workaround.py`'s docstring and
+    # `tests/test_ort_matmul_nbits_workaround.py` for this suite's existing
+    # precedent of a real ORT graph-optimization fusion bug of exactly this
+    # shape). Disabling optimization here executes the graph exactly as the
+    # pass produced it.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        quantized.SerializeToString(),
+        sess_options=so,
+        providers=["CPUExecutionProvider"],
+    )
     (y_quant,) = sess.run(None, {"X": x})
 
     x_scale, _x_zp = _expected_asymmetric_uint8_quant_params(x_min, x_max)

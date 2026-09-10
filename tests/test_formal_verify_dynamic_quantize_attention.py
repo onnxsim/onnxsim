@@ -449,7 +449,20 @@ def test_dynamic_quantize_attention_qkv_projection_stays_close_to_float_within_p
     )
 
     x = (rng.standard_normal((rows, K)) * 2.0).astype(np.float32)
-    sess = ort.InferenceSession(proj_model.SerializeToString())
+    # Graph optimization disabled: by default onnxruntime silently fuses a
+    # QDQ-shaped MatMul chain like this one into a hardware-specific fused
+    # kernel, a different code path than the literal node chain this pass's
+    # proof reasons about -- see `tests/test_ort_matmul_nbits_workaround.py`'s
+    # docstring for this suite's existing precedent of a real ORT
+    # graph-optimization fusion bug of exactly this shape. Disabling
+    # optimization executes the graph exactly as constructed here.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        proj_model.SerializeToString(),
+        sess_options=so,
+        providers=["CPUExecutionProvider"],
+    )
     proj_quant, x_scale = sess.run(["Proj", "Xs"], {"X": x})
     x_scale = float(x_scale)
 

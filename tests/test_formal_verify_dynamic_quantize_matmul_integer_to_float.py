@@ -431,8 +431,18 @@ def test_dynamic_quantize_matmul_integer_to_float_output_is_close_to_float_withi
     for name in dql.output:
         exposed.graph.output.add().name = name
 
+    # Graph optimization disabled: by default onnxruntime can further fuse or
+    # otherwise transform even an already-fused MatMulIntegerToFloat graph
+    # into a hardware-specific code path different from the literal node
+    # chain this pass's proof reasons about -- see
+    # `tests/test_ort_matmul_nbits_workaround.py`'s docstring for this
+    # suite's existing precedent of a real ORT graph-optimization fusion bug
+    # of exactly this shape. Disabling optimization executes the graph
+    # exactly as the pass produced it.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     sess = ort.InferenceSession(
-        exposed.SerializeToString(), providers=["CPUExecutionProvider"]
+        exposed.SerializeToString(), sess_options=so, providers=["CPUExecutionProvider"]
     )
     output_names = [o.name for o in exposed.graph.output]
     results = dict(zip(output_names, sess.run(output_names, {"X": x})))

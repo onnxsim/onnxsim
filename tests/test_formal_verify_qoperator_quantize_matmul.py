@@ -476,7 +476,21 @@ def test_qoperator_quantize_matmul_output_is_close_to_float_within_proved_bound(
     y_min, y_max = float(y_float.min()), float(y_float.max())
     quantized = _quantize_qoperator(model, {"X": (x_min, x_max), "Y": (y_min, y_max)})
 
-    sess = ort.InferenceSession(quantized.SerializeToString())
+    # Graph optimization disabled: by default onnxruntime can fuse/transform
+    # a QDQ/QOperator-shaped MatMul chain like this one into a
+    # hardware-specific code path different from the literal node chain this
+    # pass's proof reasons about -- see
+    # `tests/test_ort_matmul_nbits_workaround.py`'s docstring for this
+    # suite's existing precedent of a real ORT graph-optimization fusion bug
+    # of exactly this shape. Disabling optimization executes the graph
+    # exactly as the pass produced it.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        quantized.SerializeToString(),
+        sess_options=so,
+        providers=["CPUExecutionProvider"],
+    )
     (y_quant,) = sess.run(None, {"X": x})
 
     x_scale, _x_zp = _expected_asymmetric_uint8_quant_params(x_min, x_max)

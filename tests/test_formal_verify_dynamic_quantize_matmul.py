@@ -438,7 +438,19 @@ def test_dynamic_quantize_matmul_output_is_close_to_float_within_proved_bound():
     for name in dql.output:
         exposed.graph.output.add().name = name
 
-    sess = ort.InferenceSession(exposed.SerializeToString())
+    # Graph optimization disabled: by default onnxruntime silently fuses this
+    # QDQ chain (DynamicQuantizeLinear -> MatMulInteger -> Cast -> Mul) into a
+    # hardware-specific fused kernel, a different code path than the literal
+    # node chain this pass's proof reasons about -- see
+    # `tests/test_ort_matmul_nbits_workaround.py`'s docstring for this
+    # suite's existing precedent of a real ORT graph-optimization fusion bug
+    # of exactly this shape. Disabling optimization executes the graph
+    # exactly as the pass produced it.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        exposed.SerializeToString(), sess_options=so, providers=["CPUExecutionProvider"]
+    )
     output_names = [o.name for o in exposed.graph.output]
     results = dict(zip(output_names, sess.run(output_names, {"X": x})))
     y_quant = results["Y"]
