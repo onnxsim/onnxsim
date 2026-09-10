@@ -643,6 +643,14 @@ def test_qoperator_quantize_conv_output_is_close_to_float_within_proved_bound():
     # optimization executes the graph exactly as the pass produced it.
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # Single-threaded: this suite has also observed CI-only (not locally
+    # reproducible) large violations of this proved bound for MatMulInteger/
+    # QLinearMatMul/QLinearConv-shaped quantized kernels even after widening
+    # the contraction dimension -- consistent with a real MLAS thread-
+    # partitioning correctness bug for certain (problem size, thread count)
+    # combinations rather than a SIMD-width issue alone. Forcing single-
+    # threaded execution removes that partitioning as a variable.
+    so.intra_op_num_threads = 1
     sess = ort.InferenceSession(
         quantized.SerializeToString(),
         sess_options=so,
@@ -729,6 +737,14 @@ def test_qoperator_quantize_conv_output_with_bias_is_close_to_float_within_prove
     # graph-optimization-fusion bug precedent this guards against.
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # Single-threaded: this suite has also observed CI-only (not locally
+    # reproducible) large violations of this proved bound for MatMulInteger/
+    # QLinearMatMul/QLinearConv-shaped quantized kernels even after widening
+    # the contraction dimension -- consistent with a real MLAS thread-
+    # partitioning correctness bug for certain (problem size, thread count)
+    # combinations rather than a SIMD-width issue alone. Forcing single-
+    # threaded execution removes that partitioning as a variable.
+    so.intra_op_num_threads = 1
     sess = ort.InferenceSession(
         quantized.SerializeToString(),
         sess_options=so,

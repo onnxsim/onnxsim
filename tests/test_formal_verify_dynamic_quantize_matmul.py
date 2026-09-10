@@ -458,6 +458,14 @@ def test_dynamic_quantize_matmul_output_is_close_to_float_within_proved_bound():
     # exactly as the pass produced it.
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # Single-threaded: this suite has also observed CI-only (not locally
+    # reproducible) large violations of this proved bound for MatMulInteger/
+    # QLinearMatMul/QLinearConv-shaped quantized kernels even after widening
+    # the contraction dimension -- consistent with a real MLAS thread-
+    # partitioning correctness bug for certain (problem size, thread count)
+    # combinations rather than a SIMD-width issue alone. Forcing single-
+    # threaded execution removes that partitioning as a variable.
+    so.intra_op_num_threads = 1
     sess = ort.InferenceSession(
         exposed.SerializeToString(), sess_options=so, providers=["CPUExecutionProvider"]
     )
