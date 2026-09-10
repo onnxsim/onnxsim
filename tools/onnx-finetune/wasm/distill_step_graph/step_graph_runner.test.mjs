@@ -46,7 +46,7 @@ function makeRng(seed) {
   };
 }
 
-test("step graph trains on plain onnxruntime-web (no training API)", { skip: ort === null && "onnxruntime-web not installed -- npm install to run this test" }, async () => {
+test("step graph trains on plain onnxruntime-web (no training API), across varying batch sizes", { skip: ort === null && "onnxruntime-web not installed -- npm install to run this test" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "onnx-finetune-distill-"));
   try {
     const teacherPath = join(dir, "teacher.onnx");
@@ -54,7 +54,6 @@ test("step graph trains on plain onnxruntime-web (no training API)", { skip: ort
     const stepPath = join(dir, "step.onnx");
     const inputDim = 8;
     const numClasses = 4;
-    const batchSize = 16;
 
     runPython("make_toy_classifier.py", [
       "-o", teacherPath, "--input-dim", String(inputDim), "--hidden-dim", "32",
@@ -64,12 +63,12 @@ test("step graph trains on plain onnxruntime-web (no training API)", { skip: ort
       "-o", studentPath, "--input-dim", String(inputDim), "--hidden-dim", "8",
       "--num-classes", String(numClasses), "--seed", "2",
     ]);
-    runPython("generate_distillation_step_graph.py", [
-      studentPath, "-o", stepPath, "--batch-size", String(batchSize),
-    ]);
+    // No --batch-size: the step graph's batch dimension is a dim_param,
+    // decided per step below, not fixed when the graph is built.
+    runPython("generate_distillation_step_graph.py", [studentPath, "-o", stepPath]);
 
     const manifest = parseManifest(readFileSync(`${stepPath}.manifest.txt`, "utf8"));
-    assert.equal(manifest.inputShape[0], batchSize);
+    assert.equal(manifest.inputShape[0], "batch");
     assert.equal(manifest.numClasses, numClasses);
 
     const stepGraphBytes = new Uint8Array(readFileSync(stepPath));
@@ -83,21 +82,39 @@ test("step graph trains on plain onnxruntime-web (no training API)", { skip: ort
 
     // A frozen, untrained-teacher-esque forward pass would need a second
     // onnxruntime-web session over teacher.onnx; not worth it for this
-    // smoke test -- a fixed, deterministic "teacher logits" array exercises
+    // smoke test -- a fixed, deterministic "teacher logits" pool exercises
     // exactly the same step-graph code path (the step graph does not care
     // where teacher_logits came from) with far less test setup.
     const rng = makeRng(42);
-    const rows = manifest.rows;
-    const batchInput = Float32Array.from({ length: batchSize * inputDim }, () => rng() * 2 - 1);
-    const teacherLogits = Float32Array.from({ length: rows * numClasses }, () => rng() * 2 - 1);
-    const labels = Array.from({ length: batchSize }, () => Math.floor(rng() * numClasses));
+    const poolSize = 64;
+    const inputPool = Float32Array.from({ length: poolSize * inputDim }, () => rng() * 2 - 1);
+    const teacherLogitsPool = Float32Array.from({ length: poolSize * numClasses }, () => rng() * 2 - 1);
+    const labelsPool = Array.from({ length: poolSize }, () => Math.floor(rng() * numClasses));
+
+    // Cycles through several sizes, including ones that don't evenly divide
+    // poolSize -- proof one compiled step graph really does take an
+    // arbitrary batch size, the same thing test_distillation_graph_grad.py's
+    // test_step_graph_trains_on_plain_onnxruntime checks on the Python side.
+    const batchSizes = [32, 8, 64, 1, 17];
 
     const losses = [];
     for (let t = 0; t < 50; ++t) {
+      const batchSize = batchSizes[t % batchSizes.length];
+      const indices = Array.from({ length: batchSize }, () => Math.floor(rng() * poolSize));
+      const batchInput = Float32Array.from(
+        { length: batchSize * inputDim },
+        (_, i) => inputPool[indices[Math.floor(i / inputDim)] * inputDim + (i % inputDim)],
+      );
+      const teacherLogits = Float32Array.from(
+        { length: batchSize * numClasses },
+        (_, i) => teacherLogitsPool[indices[Math.floor(i / numClasses)] * numClasses + (i % numClasses)],
+      );
+      const labels = indices.map((i) => labelsPool[i]);
+
       const { loss, state: nextState } = await session.step(
         manifest, state, batchInput, teacherLogits, labels, 0.05, t,
       );
-      assert.ok(Number.isFinite(loss), `loss is finite at step ${t}`);
+      assert.ok(Number.isFinite(loss), `loss is finite at step ${t} (batch size ${batchSize})`);
       losses.push(loss);
       state = nextState;
     }

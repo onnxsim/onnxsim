@@ -23,7 +23,27 @@
 // kept in lockstep by convention, not by shared code, the same relationship
 // graph_grad.py/.cpp document for themselves.
 
-/** Parses a `<step_graph>.manifest.txt` (see generate_distillation_step_graph.py). */
+// The one shape token generate_distillation_step_graph.py ever writes that
+// isn't a decimal integer -- see that script's write_manifest_and_initial_state
+// docstring. Only ever the leading (batch) entry of inputShape/
+// teacherLogitsShape; state/weight shapes are always fully static.
+const DYNAMIC_BATCH = "batch";
+
+function dimToken(tok) {
+  return tok === DYNAMIC_BATCH ? tok : Number(tok);
+}
+
+/** `tokens` (from `inputShape`/`teacherLogitsShape`) with the `"batch"`
+ * sentinel substituted by the batch size this particular step is actually
+ * using -- static entries pass through unchanged. */
+export function resolveShape(tokens, batchSize) {
+  return tokens.map((t) => (t === DYNAMIC_BATCH ? batchSize : t));
+}
+
+/** Parses a `<step_graph>.manifest.txt` (see generate_distillation_step_graph.py).
+ * `inputShape`/`teacherLogitsShape` entries are numbers, except the batch
+ * dimension, which comes back as the literal string `"batch"` -- resolve it
+ * per step with `resolveShape`, not by assuming a fixed size. */
 export function parseManifest(text) {
   const manifest = { state: [], weights: [] };
   for (const rawLine of text.split("\n")) {
@@ -31,11 +51,10 @@ export function parseManifest(text) {
     if (parts.length === 0) continue;
     const [tag, ...rest] = parts;
     if (tag === "input_name") manifest.inputName = rest[0];
-    else if (tag === "input_shape") manifest.inputShape = rest.map(Number);
+    else if (tag === "input_shape") manifest.inputShape = rest.map(dimToken);
     else if (tag === "teacher_logits_name") manifest.teacherLogitsName = rest[0];
-    else if (tag === "teacher_logits_shape") manifest.teacherLogitsShape = rest.map(Number);
+    else if (tag === "teacher_logits_shape") manifest.teacherLogitsShape = rest.map(dimToken);
     else if (tag === "labels_onehot_name") manifest.labelsOnehotName = rest[0];
-    else if (tag === "rows") manifest.rows = Number(rest[0]);
     else if (tag === "num_classes") manifest.numClasses = Number(rest[0]);
     else if (tag === "loss_name") manifest.lossName = rest[0];
     else if (tag === "state") {
@@ -103,22 +122,28 @@ export class StepGraphSession {
   }
 
   /** Runs one step: `batchInput`/`teacherLogits`/`labels` are this step's
-   * batch (Float32Array/Float32Array/Int32Array-or-Array-of-numbers, sized
-   * to the manifest's own fixed shapes -- a step graph's batch size is fixed
-   * at build time, see generate_distillation_step_graph.py's module
-   * docstring). Returns `{ loss, state }`, `state` ready to feed as next
-   * step's own state inputs. */
+   * batch (Float32Array/Float32Array/Int32Array-or-Array-of-numbers). The
+   * batch size is however many `labels` this call passes -- freely
+   * choosable step to step, since the step graph's batch dimension is a
+   * `dim_param`, decided at `run()` time rather than fixed when the graph
+   * was built (see generate_distillation_step_graph.py's module docstring).
+   * Returns `{ loss, state }`, `state` ready to feed as next step's own
+   * state inputs. */
   async step(manifest, state, batchInput, teacherLogits, labels, lr, t) {
     const { mCorrection, vCorrection } = adamBiasCorrections(t);
+    const batchSize = labels.length;
     const onehot = labelsToOnehot(labels, manifest.numClasses);
+    const inputShape = resolveShape(manifest.inputShape, batchSize);
+    const teacherLogitsShape = resolveShape(manifest.teacherLogitsShape, batchSize);
     const T = this.ort.Tensor;
     const feeds = {
-      [manifest.inputName]: new T("float32", batchInput, manifest.inputShape),
-      [manifest.teacherLogitsName]: new T("float32", teacherLogits, manifest.teacherLogitsShape),
-      [manifest.labelsOnehotName]: new T("float32", onehot, [manifest.rows, manifest.numClasses]),
+      [manifest.inputName]: new T("float32", batchInput, inputShape),
+      [manifest.teacherLogitsName]: new T("float32", teacherLogits, teacherLogitsShape),
+      [manifest.labelsOnehotName]: new T("float32", onehot, [batchSize, manifest.numClasses]),
       lr: new T("float32", new Float32Array([lr]), []),
       m_correction: new T("float32", new Float32Array([mCorrection]), []),
       v_correction: new T("float32", new Float32Array([vCorrection]), []),
+      batch_size: new T("float32", new Float32Array([batchSize]), []),
     };
     for (const { input, shape } of manifest.state) {
       feeds[input] = new T("float32", state[input], shape);
