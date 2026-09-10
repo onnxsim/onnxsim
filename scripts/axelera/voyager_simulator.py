@@ -10,19 +10,35 @@ Axera's Pulsar2, which only publishes an op-type list -- see
 those predicates against a node's actual (statically-known) shapes and
 constant inputs.
 
-**This is an estimate, from docs alone, with no execution behind it at
-all** -- read this before trusting any of its output:
+**This module itself is an estimate, from docs alone, with no execution
+behind it** -- read this before trusting any of its output:
 
-- **No compiler, no hardware, no numeric check.** Unlike `scripts/axera/
-  pulsar2_simulator.py`, there is no `simulate()`/numeric-comparison
-  function here at all, and this was never run against Voyager SDK's real
-  compiler. `deploy.py` needs `axelera-types`/`axelera-runtime`, proprietary
-  packages served only from Axelera's own private `axelera_runtime` package
-  index (see `installer_support.py` in a voyager-sdk checkout) -- not on
-  PyPI, not in the public git repo, and this environment has no credentials
-  for it. So there is no way to actually run Voyager SDK's compiler here,
-  not even its no-hardware `--pipe=quantized` calibration/quantization path.
-  Nothing below was checked against real compiler output.
+- **No compiler, no hardware, no numeric check -- in this module.** Unlike
+  `scripts/axera/pulsar2_simulator.py`, there is no `simulate()`/numeric-
+  comparison function here, and nothing in this file was checked against
+  real compiler output. That real check does exist, though, in the sibling
+  `voyager_backend.py` -- an earlier version of this docstring wrongly
+  claimed there was no way to run Voyager SDK's compiler at all, based on
+  the deprecated installer's `axelera_runtime`/private-index framing
+  (`installer_support.py`) and never re-tested against the current pip
+  path. That was a mistake: `axelera-rt`/`axelera-devkit` (providing
+  `axelera.compiler`) install from a genuinely public Artifactory PyPI
+  mirror with no login, exactly as `docs/user-guides/sdk-install.md`
+  documents -- confirmed by actually doing it. See `voyager_backend.py`'s
+  docstring for what running the real quantizer actually showed (including
+  a real cross-check of this module's own scraped constraint data -- the
+  real compiler's error message for a violated rule quotes the exact
+  constraint string `voyager_ops.py` carries). This module stays docs-only
+  by design -- it needs neither `axelera-rt` nor `axelera-devkit`, both
+  large optional installs -- and its own output should still be read as an
+  estimate, not a substitute for `voyager_backend.py` (better) or the real
+  `deploy.py` (authoritative) when either is available.
+- **A "Constrained" op used outside its rules was observed to hard-fail
+  quantization, not fall back to CPU** -- see `voyager_backend.py`'s
+  docstring. `onnx-support.md`'s own "falls back to host CPU" framing
+  describes *undocumented* op types; treat this module's `"violated"`
+  verdict accordingly (likely a `quantize()`-time error), not as "this
+  node just runs on the host instead".
 - **`evaluate_constraints()` is best-effort and fails closed.** It resolves
   a rule/allow_config expression's referenced names (a node's input shapes,
   constness, and constant values; its attributes; opset-17 ONNX-spec

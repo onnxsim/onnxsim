@@ -1370,13 +1370,17 @@ custom operators in the sense of the [Custom operators](#custom-operators)
 section above: `simplify()` preserves them -- with or without a schema
 registered for them -- and simplifies the rest of the graph around them.
 
-For a rough, no-hardware read on which operators in a model Voyager SDK's
+For a rough, no-install read on which operators in a model Voyager SDK's
 Metis AIPU compiler documents as accelerated versus CPU-fallback (and,
 for most "Constrained" operators, whether a node's actual attributes/shapes
 satisfy Axelera's own published per-operator constraints), see
-[`scripts/axelera/README.md`](scripts/axelera/README.md) -- built entirely
-from Voyager SDK's public docs, with no real compiler or hardware behind it
-(that README explains exactly why, and what that limits).
+[`scripts/axelera/README.md`](scripts/axelera/README.md) -- built from
+Voyager SDK's public docs. That directory also has a real-compiler backend
+(`voyager_backend.py`, an optional heavy install): running it confirmed
+onnxsim's Conv+BatchNorm fusion produces bit-identical quantized output
+through Voyager SDK's actual quantizer, and cross-checked the scraped
+constraint data against the real compiler's own error messages -- see that
+README for the full account, including what still needs real hardware.
 
 ## Quantization-aware fine-tuning
 

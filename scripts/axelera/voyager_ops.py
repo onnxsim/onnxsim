@@ -11,19 +11,22 @@ including formal `rule`/`allow_config` predicates for most "Constrained"
 operators -- not just an op-type support list. `voyager_op_support_data.py`
 (auto-generated, do not hand-edit) is a faithful transcription of that.
 
-**What this is not**: none of this was checked against Voyager SDK's actual
-compiler or real Metis hardware. Unlike `scripts/axera/pulsar2_ops.py`
-(which got to download a real, already-compiled `.axmodel` from a public
-model repo and hand-decode it), Voyager SDK's own compiler needs
-`axelera-types`/`axelera-runtime` -- proprietary packages served only from
-Axelera's own private `axelera_runtime` package index (see
-`installer_support.py` in a voyager-sdk checkout), not published to PyPI or
-included in the public git repo. There is no way to actually run
-`deploy.py`, even in its no-hardware `--pipe=quantized` mode, without
-credentials for that private index, which this environment does not have.
-So everything here is "what the docs say", not "what was observed the
-compiler actually do" -- see `voyager_simulator.py`'s docstring for how that
-shapes what it does and doesn't claim.
+**This data itself is untouched by any compiler run** -- it's a literal
+transcription of the docs, nothing more. But unlike an earlier version of
+this docstring claimed, the real compiler *is* reachable here: `axelera-rt`/
+`axelera-devkit` (providing `axelera.compiler`) install from a genuinely
+public Artifactory PyPI mirror with no login (`docs/user-guides/sdk-
+install.md`'s own documented command) -- the "proprietary, credentials-only"
+claim was based on the deprecated installer's `axelera_runtime` package name
+(`installer_support.py`) and was never re-tested against the current pip
+path. See `voyager_backend.py` for the real quantizer wrapper, and its
+docstring for a concrete finding that matters here: the real compiler's
+error message for a rule this data records (`Conv`'s `auto_pad ==
+"NOTSET"`) quotes that exact string back -- real, if narrow, confirmation
+that this transcription matches the compiler's actual internal check, not
+just its prose documentation. `voyager_simulator.py`'s docstring explains
+what that does and doesn't license this module's own (still real-compiler-
+free) `evaluate_constraints()` to claim.
 """
 
 from voyager_op_support_data import VOYAGER_OP_SUPPORT
