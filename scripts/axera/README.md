@@ -5704,6 +5704,55 @@ count all change the allocator's decisions, so a reference build at the target
 shape is still required -- from Pulsar2, once. Given one, retargeting to new
 weights needs no compiler at all.
 
+## How much of a CNN's mcode depends on its weights
+
+An `llm_build` layer's mcode is a constant -- layers of the same structure
+differ by one filename byte -- which is what makes cloning that path work. The
+convolutional equivalent had never been measured. Compiling one convolution
+three times answers it: two different weight seeds, and one with the same seed
+scaled by nine so the activation ranges move too.
+
+| compared with the reference | `npu_params` | mcode |
+| --- | --- | --- |
+| different weights (new seed) | 66.76% differ | **107 of 2824 bytes (3.79%)** |
+| proportional weights (9x scale) | 2.94% differ | **22 of 2824 bytes (0.78%)** |
+
+**A CNN's mcode is 96.2% independent of its weights**, and the proportional
+case explains its own row: scaling every weight by nine leaves the per-channel
+quantiser's codes *identical*, so only the scales move -- 2.94% of the weight
+table, and 22 mcode bytes.
+
+### Where the weight-dependent bytes are
+
+For proportional weights the runs bracket 1849, 1856, 1863 and 1870 -- exactly
+the four bfloat16 `y_scale` copies already decoded -- plus six single bytes
+near 303..326, the ordering bytes noted earlier. Nothing else.
+
+For genuinely different weights one more region moves, 1835..1936, and it has
+visible structure: a **seven-byte unit repeated four times**, of which the last
+four bytes (`3c 81 e4 03`) are identical between builds and the first three
+carry the whole difference. A 24-bit field, four copies, tracking the weights.
+
+That is the right shape for the requantisation multiplier in its real
+encoding -- the value the device demonstrably does *not* read as the float32
+it appears to be in the weight table. **It is not established as that**, and
+the arithmetic does not yet support the claim: the field's ratio between two
+weight sets is 1.0148 where `x_scale/y_scale` moves by 1.0438, and 8.69 where
+the output scale moves by 9.0. Recorded as a located lead, not a finding.
+
+### What this means for emitting a CNN
+
+Cloning is closer than it looked. Given a reference build of the same shape,
+producing a model for new weights needs: the weight table (decoded, all six
+encodings), the four `y_scale` words (decoded, device-verified writable), the
+six ordering bytes, and that 24-bit field. **Everything else -- 96.2% of the
+stream -- is shape, and can be copied.**
+
+What still cannot be done is originate a shape nobody has compiled. Block
+bases and the per-tap input splits are allocator output, and the vocoder's own
+splits (`[80]`, then `[48, 32]`, then `[24, 56]` on consecutive taps of one
+layer) are the evidence that no rule is waiting to be found there.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
