@@ -207,9 +207,7 @@ def find_recovered_bn_nodes(model: onnx.ModelProto) -> List[RecoveredBatchNorm]:
             continue
         scale_init = initializers.get(n.input[1])
         channels = (
-            int(scale_init.dims[0])
-            if scale_init is not None and scale_init.dims
-            else 0
+            int(scale_init.dims[0]) if scale_init is not None and scale_init.dims else 0
         )
         recovered.append(
             RecoveredBatchNorm(
@@ -277,9 +275,7 @@ def _insert_bn_after(
         )
     )
     graph.initializer.append(
-        onnx.numpy_helper.from_array(
-            np.ones(channels, dtype=np.float32), name=var_name
-        )
+        onnx.numpy_helper.from_array(np.ones(channels, dtype=np.float32), name=var_name)
     )
 
     node_name = _unique_name(f"{output_name}_bn_recovery", taken_names)
@@ -502,9 +498,7 @@ def calibrate_recovered_bn(
 
     calibrated = onnx.ModelProto()
     calibrated.CopyFrom(model)
-    initializer_index = {
-        t.name: i for i, t in enumerate(calibrated.graph.initializer)
-    }
+    initializer_index = {t.name: i for i, t in enumerate(calibrated.graph.initializer)}
 
     def _overwrite(name: str, arr: np.ndarray) -> None:
         idx = initializer_index.get(name)

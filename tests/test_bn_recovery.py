@@ -16,7 +16,6 @@ from onnx import parser
 
 import onnxsim
 from onnxsim.bn_recovery import (
-    RecoveredBatchNorm,
     _conv_output_channels,
     calibrate_recovered_bn,
     find_recoverable_convs,
@@ -317,8 +316,7 @@ def test_recover_batch_norm_end_to_end_after_fusion():
     # exactly is impossible by construction). What it should still do is
     # produce a valid, structurally recovered model.
     calib = [
-        {"x": rng.standard_normal((1, c_in, 8, 8)).astype(np.float32)}
-        for _ in range(4)
+        {"x": rng.standard_normal((1, c_in, 8, 8)).astype(np.float32)} for _ in range(4)
     ]
     recovered = recover_batch_norm(fused, calibration_data=calib)
     onnx.checker.check_model(recovered)
@@ -330,9 +328,7 @@ def test_recover_batch_norm_end_to_end_after_fusion():
     # already numerically identical to `original`'s own final output (shown
     # above), that closed-form affine match closely reproduces it, including
     # off the exact calibration inputs.
-    matched = recover_batch_norm(
-        fused, calibration_data=calib, target_model=original
-    )
+    matched = recover_batch_norm(fused, calibration_data=calib, target_model=original)
     onnx.checker.check_model(matched)
     matched_out = _run(matched, {"x": x})["y"]
     np.testing.assert_allclose(matched_out, original_out, rtol=1e-3, atol=1e-4)
