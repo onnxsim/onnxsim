@@ -1,0 +1,458 @@
+"""Tests for ``onnxsim.compile_training`` -- a ``torch.compile``-styled
+training loop built out of onnxsim's own grad templating
+(:mod:`onnxsim.graph_grad` for the backward pass, :mod:`onnxsim.qat_graph`
+for the optimizer and the step graph itself).
+
+The correctness claim under test is the same one ``tests/test_graph_grad.py``
+and ``tests/test_qat_graph.py`` already check piece by piece -- a correct
+backward pass composed with a correct Adam step trains a model -- so the
+focus here is the thing this module actually adds on top of those: the lazy
+compile-once-then-reuse calling convention, state threaded across independent
+calls rather than one fixed-length loop, and :meth:`TrainingLoop.export`.
+"""
+
+import numpy as np
+import onnx
+import onnx.numpy_helper
+import pytest
+from onnx import parser
+
+import onnxsim
+from onnxsim import backend, graph_grad
+from onnxsim.compile_training import CustomOptimizer
+
+ort = pytest.importorskip("onnxruntime")
+
+_HEADER = '<ir_version: 8, opset_import: ["": 17]>'
+
+#: Whether the installed onnxruntime actually offers CUDAExecutionProvider
+#: -- gates the CUDA zero-copy test below, the same way test_backend.py's
+#: own CUDA-conditional tests check this (there in reverse, to test the
+#: *unavailable*-provider error path).
+_CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
+
+
+def _model(body: str, initializer=()) -> onnx.ModelProto:
+    model = parser.parse_model(f"{_HEADER}\n{body}")
+    model.graph.initializer.extend(initializer)
+    return model
+
+
+def _f32(array: np.ndarray, name: str) -> onnx.TensorProto:
+    return onnx.numpy_helper.from_array(array.astype(np.float32), name)
+
+
+def _linear_model(rows: int = 8, k: int = 3, n: int = 2, seed: int = 0):
+    """``loss = mean((x @ w^T - y) ** 2)``, with ``w`` the trained parameter.
+
+    A well-determined linear regression: Adam should drive the loss down
+    substantially in a couple hundred steps, which is the correctness signal
+    the tests below rely on rather than a closed-form comparison.
+    """
+    rng = np.random.default_rng(seed)
+    model = _model(
+        f"""
+        agraph (float[{rows},{k}] x, float[{rows},{n}] y) => (float loss)
+        {{
+            wt = Transpose<perm=[1,0]>(w)
+            y_hat = MatMul(x, wt)
+            diff = Sub(y_hat, y)
+            sq = Mul(diff, diff)
+            loss = ReduceMean<keepdims=0>(sq)
+        }}
+        """,
+        initializer=[_f32(rng.standard_normal((n, k)) * 0.1, "w")],
+    )
+    onnx.checker.check_model(model)
+
+    w_true = rng.standard_normal((n, k)).astype(np.float32)
+    x = rng.standard_normal((rows, k)).astype(np.float32)
+    y = x @ w_true.T
+    return model, x, y
+
+
+def test_lazy_compile_then_reuse():
+    """``compiled`` flips only once the loop is actually called, and the
+    step graph/session built on that first call is what every later call
+    reuses -- torch.compile's own first-call-traces, later-calls-reuse shape.
+    """
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    assert not loop.compiled
+
+    first_loss = loop({"x": x, "y": y}, lr=1e-2)
+    assert loop.compiled
+    step, runner = loop._step, loop._runner
+
+    loop({"x": x, "y": y}, lr=1e-2)
+    assert loop._step is step
+    assert loop._runner is runner
+    assert isinstance(first_loss, float)
+
+
+def test_step_graph_and_initial_state_compile_without_running_a_step():
+    """:attr:`TrainingLoop.step_graph`/:attr:`TrainingLoop.initial_state` let
+    a caller get at the compiled artifact -- to run it through a different
+    runtime entirely, e.g. ``scripts/convertmodel``'s WebGPU CI fixtures --
+    without needing to run a step through this loop's own ``__call__``.
+    """
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    assert not loop.compiled
+
+    step = loop.step_graph
+    assert loop.compiled
+    assert "w" in step.state
+    assert step.loss_name == "loss"
+
+    state = loop.initial_state
+    assert set(state) == set(step.state)
+    np.testing.assert_array_equal(
+        state["w"], onnx.numpy_helper.to_array(model.graph.initializer[0])
+    )
+    # Every non-trained state entry (Adam's moments) starts at zero.
+    for name, value in state.items():
+        if name != "w":
+            assert np.all(value == 0.0)
+
+    # Reading it again after compiling does not run a step or otherwise
+    # change anything.
+    assert loop.step_graph is step
+    np.testing.assert_array_equal(state["w"], loop.initial_state["w"])
+
+
+def test_state_stays_an_ort_value_between_calls():
+    """The trained parameter and the optimizer's own moments never round-trip
+    through numpy between steps when onnxruntime is available -- see
+    ``onnxsim/compile_training.py``'s own module docstring on why. Reading
+    them out (:attr:`TrainingLoop.parameters`) still works exactly as before;
+    only the internal storage differs.
+    """
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    loop({"x": x, "y": y}, lr=5e-2)
+    assert loop._runner.supports_ort_values()
+    for value in loop._state.values():
+        assert not isinstance(value, np.ndarray)
+        assert hasattr(value, "numpy")  # an OrtValue
+    assert isinstance(loop.parameters()["w"], np.ndarray)
+
+
+def test_ort_value_and_numpy_paths_agree(monkeypatch):
+    """``__call__``'s two branches -- the onnxruntime ``OrtValue``/DLPack
+    path and the plain-numpy path used when onnxruntime is not installed --
+    must compute identical numbers; only how much gets copied between steps
+    differs. Forces the fallback via monkeypatch rather than actually
+    uninstalling onnxruntime, since this whole test file needs it either way.
+
+    The patch targets ``loop_numpy``'s own ``Runner`` instance, not the
+    class: patching the class would flip *every* loop's dispatch, including
+    ``loop_ort``'s, onto the numpy branch the moment it is applied -- exactly
+    the failure mode this test exists to catch, so it must not fall into it
+    itself.
+    """
+    model, x, y = _linear_model()
+    loop_ort = onnxsim.compile_training_loop(model, "loss", ("w",))
+
+    loop_numpy = onnxsim.compile_training_loop(model, "loss", ("w",))
+    loop_numpy.step_graph  # compile via the real, OrtValue-capable path first
+    monkeypatch.setattr(loop_numpy._runner, "supports_ort_values", lambda: False)
+    # ... then convert the state that compile produced back to plain numpy,
+    # matching what an actual no-onnxruntime compile would have stored.
+    loop_numpy._state = {k: v.numpy() for k, v in loop_numpy._state.items()}
+
+    for _ in range(20):
+        loss_ort = loop_ort({"x": x, "y": y}, lr=5e-2)
+        loss_numpy = loop_numpy({"x": x, "y": y}, lr=5e-2)
+        assert loss_ort == pytest.approx(loss_numpy, rel=1e-5)
+    np.testing.assert_allclose(
+        loop_ort.parameters()["w"], loop_numpy.parameters()["w"], rtol=1e-5
+    )
+    assert isinstance(loop_numpy._state["w"], np.ndarray)
+    assert not isinstance(loop_ort._state["w"], np.ndarray)
+
+
+def test_feeds_accept_a_dlpack_capable_array_directly():
+    """A feed value need not be a numpy array -- anything implementing
+    ``__dlpack__`` (here, a numpy array wrapped so only that protocol is
+    exposed, ruling out any other code path recognizing it) is accepted via
+    :func:`onnxsim.backend.as_ort_value` with no manual conversion."""
+
+    class _DlpackOnly:
+        """Exposes only ``__dlpack__``/``__dlpack_device__`` -- not
+        ``__array__`` or the buffer protocol -- so a numpy fallback path
+        that didn't actually go through DLPack would fail outright instead
+        of quietly working anyway."""
+
+        def __init__(self, array: np.ndarray) -> None:
+            self._array = array
+
+        def __dlpack__(self, *args, **kwargs):
+            return self._array.__dlpack__(*args, **kwargs)
+
+        def __dlpack_device__(self):
+            return self._array.__dlpack_device__()
+
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    losses = [
+        loop({"x": _DlpackOnly(x), "y": _DlpackOnly(y)}, lr=5e-2) for _ in range(50)
+    ]
+    assert losses[-1] < 0.5 * losses[0]
+
+
+@pytest.mark.skipif(
+    not _CUDA_AVAILABLE, reason="requires a CUDA-capable onnxruntime build + GPU"
+)
+def test_cuda_feeds_and_state_are_genuinely_device_resident():
+    """The CUDA half of this module's own docstring "**CUDA.**" claim,
+    checked against real device placement rather than just against the
+    numbers: with ``providers=["CUDAExecutionProvider", ...]`` and
+    CUDA-resident ``feeds``, a fed tensor is aliased (not copied) into the
+    step, and the trained parameter/optimizer-moment state is a genuinely
+    CUDA-resident ``OrtValue`` from the first call's own output onward --
+    not silently round-tripped through host memory every step.
+
+    Built with a bare ``OrtValue`` for ``feeds`` (via
+    ``ortvalue_from_numpy(..., "cuda", 0)``) rather than a torch CUDA
+    tensor, matching this test file's own no-torch convention
+    (:mod:`onnxsim.compile_training` itself has no torch dependency) --
+    ``OrtValue`` implements ``__dlpack__``/``__dlpack_device__`` itself, so
+    :func:`onnxsim.backend.as_ort_value` takes the exact same DLPack path
+    for it as it would for a torch CUDA tensor.
+    """
+    model, x, y = _linear_model()
+    x_cuda = ort.OrtValue.ortvalue_from_numpy(x, "cuda", 0)
+    y_cuda = ort.OrtValue.ortvalue_from_numpy(y, "cuda", 0)
+    x_ptr = x_cuda.data_ptr()
+
+    loop = onnxsim.compile_training_loop(
+        model,
+        "loss",
+        ("w",),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    loop({"x": x_cuda, "y": y_cuda}, lr=1e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
+
+    # as_ort_value's DLPack path aliases x_cuda's own buffer rather than
+    # copying it -- same device pointer before and after conversion.
+    assert backend.as_ort_value(x_cuda).data_ptr() == x_ptr
+
+    # And the state a second, independent call reads stays CUDA-resident --
+    # not just the first call's own output, coincidentally still on-device.
+    loop({"x": x_cuda, "y": y_cuda}, lr=1e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
+
+
+def test_training_loop_reduces_loss():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.02 * losses[0]
+    # Not just the last step: the loop should have made steady progress, not
+    # one lucky step among many bad ones.
+    assert np.mean(losses[-20:]) < 0.1 * np.mean(losses[:20])
+
+
+def test_sgd_momentum_optimizer_also_trains():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(
+        model, "loss", ("w",), optimizer="sgd_momentum"
+    )
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.1 * losses[0]
+
+
+def _hand_built_sgd_optimizer() -> CustomOptimizer:
+    """Plain (momentum-free, ``num_state=0``) SGD, built directly as an ONNX
+    ``ModelProto`` with ``onnx.parser`` -- no torch anywhere -- to check that
+    :class:`CustomOptimizer` is genuinely usable by any caller who can
+    produce a model matching its input/output contract, not just
+    ``onnxsim.torch_training.trace_torch_optimizer``. Traced shape ``[2,3]``
+    is arbitrary and unrelated to ``_linear_model``'s own ``w`` shape (also
+    ``[2,3]``, coincidentally) -- see :class:`CustomOptimizer`'s own
+    docstring for why that reuse across shapes is sound for an elementwise
+    update like this one.
+    """
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad, float lr)
+            => (float[2,3] new_param)
+        {{
+            step = Mul(lr, grad)
+            new_param = Sub(param, step)
+        }}
+        """
+    )
+    return CustomOptimizer(model=model, num_state=0)
+
+
+def _hand_built_momentum_optimizer() -> CustomOptimizer:
+    """Classic heavy-ball momentum SGD (``num_state=1``), reimplementing
+    :func:`onnxsim.qat_graph.sgd_momentum_update`'s own update rule by hand
+    as an ONNX model -- also exercises an initializer on the optimizer's own
+    model (``momentum_const``), which :func:`_custom_optimizer_function`
+    lowers to a ``Constant`` node since a ``FunctionProto`` has no
+    initializer list of its own.
+    """
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad, float[2,3] mom, float lr)
+            => (float[2,3] new_param, float[2,3] new_mom)
+        <float momentum_const = {{0.9}}>
+        {{
+            scaled_mom = Mul(momentum_const, mom)
+            new_mom = Add(scaled_mom, grad)
+            step = Mul(lr, new_mom)
+            new_param = Sub(param, step)
+        }}
+        """
+    )
+    return CustomOptimizer(model=model, num_state=1)
+
+
+def test_custom_optimizer_hand_built_sgd_trains():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(
+        model, "loss", ("w",), optimizer=_hand_built_sgd_optimizer()
+    )
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.02 * losses[0]
+
+
+def test_custom_optimizer_hand_built_momentum_trains_and_uses_its_own_initializer():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(
+        model, "loss", ("w",), optimizer=_hand_built_momentum_optimizer()
+    )
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.1 * losses[0]
+
+
+def test_custom_optimizer_wrong_input_count_is_refused():
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad) => (float[2,3] new_param)
+        {{
+            new_param = Identity(param)
+        }}
+        """
+    )
+    with pytest.raises(ValueError, match="inputs"):
+        CustomOptimizer(model=model, num_state=0)
+
+
+def test_custom_optimizer_wrong_output_count_is_refused():
+    model = parser.parse_model(
+        f"""{_HEADER}
+        agraph (float[2,3] param, float[2,3] grad, float lr)
+            => (float[2,3] new_param, float[2,3] extra)
+        {{
+            new_param = Identity(param)
+            extra = Identity(param)
+        }}
+        """
+    )
+    with pytest.raises(ValueError, match="outputs"):
+        CustomOptimizer(model=model, num_state=0)
+
+
+def test_export_reflects_trained_parameters():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    for _ in range(50):
+        loop({"x": x, "y": y}, lr=5e-2)
+
+    exported = loop.export()
+    onnx.checker.check_model(exported)
+    (w_init,) = [t for t in exported.graph.initializer if t.name == "w"]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(w_init), loop.parameters()["w"]
+    )
+    # And the exported model is a plain, ordinary forward model: running it
+    # reproduces the trained w's own prediction.
+    out = backend.run_model(exported, {"x": x, "y": y})
+    w = loop.parameters()["w"]
+    expected = float(np.mean((x @ w.T - y) ** 2))
+    assert out["loss"] == pytest.approx(expected, rel=1e-4)
+
+
+def test_export_before_any_call_is_the_original_model():
+    model, _, _ = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    exported = loop.export()
+    (w_before,) = [t for t in model.graph.initializer if t.name == "w"]
+    (w_after,) = [t for t in exported.graph.initializer if t.name == "w"]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(w_before), onnx.numpy_helper.to_array(w_after)
+    )
+
+
+def test_state_persists_across_independent_calls():
+    """Parameters keep moving from where the previous call left them, not
+    from the original model's initializer -- the state-threading contract a
+    real training loop needs, one call at a time rather than one fixed-length
+    ``run_step_graph`` loop."""
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+
+    loop({"x": x, "y": y}, lr=5e-2)
+    w_after_one = loop.parameters()["w"].copy()
+    loop({"x": x, "y": y}, lr=5e-2)
+    w_after_two = loop.parameters()["w"]
+
+    assert not np.allclose(w_after_one, w_after_two)
+
+
+def test_unknown_optimizer_is_refused_immediately():
+    model, _, _ = _linear_model()
+    with pytest.raises(ValueError, match="optimizer"):
+        onnxsim.compile_training_loop(model, "loss", ("w",), optimizer="rmsprop")
+
+
+def test_missing_parameter_is_refused():
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("not_a_param",))
+    with pytest.raises(ValueError, match="not_a_param"):
+        loop({"x": x, "y": y}, lr=1e-2)
+
+
+def test_non_scalar_loss_is_refused():
+    model = _model(
+        """
+        agraph (float[4,3] x) => (float[4,3] y)
+        {
+            y = Mul(x, w)
+        }
+        """,
+        initializer=[_f32(np.ones(3), "w")],
+    )
+    loop = onnxsim.compile_training_loop(model, "y", ("w",))
+    with pytest.raises(ValueError, match="scalar"):
+        loop({"x": np.zeros((4, 3), dtype=np.float32)}, lr=1e-2)
+
+
+def test_unsupported_op_is_refused_loudly():
+    """Softplus has no rule in :mod:`onnxsim.graph_grad`
+    (:data:`onnxsim.graph_grad.SUPPORTED_OPS`), so compiling a model that
+    uses it must fail loudly rather than silently skip differentiating it --
+    the same discipline :mod:`onnxsim.graph_grad`'s own docstring describes.
+    """
+    model = _model(
+        """
+        agraph (float[4,3] x) => (float loss)
+        {
+            scaled = Mul(x, w)
+            act = Softplus(scaled)
+            loss = ReduceMean<keepdims=0>(act)
+        }
+        """,
+        initializer=[_f32(np.ones(3), "w")],
+    )
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    with pytest.raises(graph_grad.UnsupportedOpError):
+        loop({"x": np.zeros((4, 3), dtype=np.float32)}, lr=1e-2)

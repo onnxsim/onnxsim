@@ -1,0 +1,363 @@
+"""Tests for ``onnxsim.torch_training`` -- exporting a real ``torch.nn.Module``
+via ``torch.export``'s FX graph and training it entirely on onnxsim's own
+grad templating (:mod:`onnxsim.compile_training`), never on ``torch.autograd``.
+
+Needs ``torch >= 2.5`` and ``onnxscript`` (the ``onnxsim[torch-training]``
+extra); skipped entirely otherwise, the same way the rest of this repo skips
+an optional-dependency-gated test file.
+"""
+
+import numpy as np
+import onnx
+import pytest
+
+from onnxsim import backend, graph_grad, torch_training
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("onnxscript")
+ort = pytest.importorskip("onnxruntime")
+
+#: Gates the CUDA zero-copy test below: needs both a CUDA-capable torch
+#: build with an actual GPU visible, and an onnxruntime build offering
+#: CUDAExecutionProvider.
+_CUDA_AVAILABLE = torch.cuda.is_available() and (
+    "CUDAExecutionProvider" in ort.get_available_providers()
+)
+
+
+class _Regression(torch.nn.Module):
+    """``loss = mean((x @ w^T - y) ** 2)``, the same objective
+    ``tests/test_compile_training.py``'s own ``_linear_model`` fits, now
+    authored as an ordinary torch module instead of ``onnx.parser`` text --
+    what this module's whole point is exercising.
+
+    Deliberately ``(diff * diff)``, not ``diff ** 2``: torch's dynamo
+    exporter lowers ``**`` to ``Pow``, which has no rule in
+    :mod:`onnxsim.graph_grad` (:data:`onnxsim.graph_grad.SUPPORTED_OPS`);
+    ``*`` lowers to ``Mul``, which does. That gap -- a real one, not a test
+    artifact -- is exercised directly in
+    ``test_pow_is_refused_with_the_ops_graph_grad_actually_differentiates``.
+    """
+
+    def __init__(self, n: int = 2, k: int = 3, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.w = torch.nn.Parameter(torch.randn(n, k, generator=g) * 0.1)
+
+    def forward(self, x, y):
+        y_hat = x @ self.w.T
+        diff = y_hat - y
+        return (diff * diff).mean()
+
+
+def _example_and_batch(rows=8, k=3, n=2, seed=1):
+    example = (torch.zeros(rows, k), torch.zeros(rows, n))
+    rng = np.random.default_rng(seed)
+    w_true = rng.standard_normal((n, k)).astype(np.float32)
+    x = rng.standard_normal((rows, k)).astype(np.float32)
+    y = x @ w_true.T
+    return example, w_true, x, y
+
+
+def test_export_produces_a_static_shape_onnx_model_named_w():
+    module = _Regression()
+    example, *_ = _example_and_batch()
+    model = torch_training.export_torch_module_to_onnx(
+        module, example, input_names=["x", "y"], output_names=("loss",)
+    )
+    onnx.checker.check_model(model)
+    assert [i.name for i in model.graph.input] == ["x", "y"]
+    assert [o.name for o in model.graph.output] == ["loss"]
+    # The parameter's own qualified name, unmangled -- what
+    # compile_torch_training_loop's params= default relies on.
+    assert [t.name for t in model.graph.initializer] == ["w"]
+    # Every op is one onnxsim.graph_grad can differentiate -- see _Regression's
+    # own docstring on why this is a real constraint, not automatic.
+    ops = {n.op_type for n in model.graph.node}
+    assert ops <= graph_grad.supported_ops()
+
+
+def test_export_folds_the_full_reduction_squeeze():
+    """``tensor.mean()`` with no explicit axis is exactly the decomposition
+    :func:`onnxsim.torch_training._fold_full_reduction_squeeze` exists for
+    (see its own docstring): a keepdims=1 ReduceMean immediately Squeezed
+    back to a scalar. Folded, no Squeeze should remain at all.
+    """
+    module = _Regression()
+    example, *_ = _example_and_batch()
+    model = torch_training.export_torch_module_to_onnx(module, example)
+    ops = [n.op_type for n in model.graph.node]
+    assert "Squeeze" not in ops
+    assert "ReduceMean" in ops
+
+
+def test_expand_dangling_aten_reduce_calls_rewrites_to_reducemean():
+    """Regression test for a CI-only failure (``ubuntu-24.04-arm``, ``cp311``):
+    a dangling call to a torch_lib ``aten_mean`` local function -- no
+    ``FunctionProto`` for it actually attached to the model, so
+    :func:`torch_training._inline_local_functions` has nothing to inline --
+    reaching :mod:`onnxsim.graph_grad` as an unrecognized op. Built directly
+    with ``onnx.parser`` (no torch involved) since the real failure needs a
+    torch/onnxscript/onnx combination not reproducible outside that CI
+    platform; this checks :func:`torch_training._expand_dangling_aten_reduce_calls`
+    itself performs the rewrite its own docstring describes.
+    """
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["": 17, "pkg.onnxscript.torch_lib": 1]>
+        agraph (float[4] x) => (float loss)
+        {
+            loss = pkg.onnxscript.torch_lib.aten_mean(x)
+        }
+        """
+    )
+    rewritten = torch_training._expand_dangling_aten_reduce_calls(model)
+    (node,) = rewritten.graph.node
+    assert node.op_type == "ReduceMean"
+    assert node.domain == ""
+    assert [a.name for a in node.attribute] == ["keepdims"]
+    assert node.attribute[0].i == 0
+
+
+def test_expand_dangling_aten_reduce_calls_leaves_a_dim_argument_call_alone():
+    """A call carrying more than one input (a ``dim``/``keepdim`` argument,
+    the ``aten_mean_dim`` overload's own shape) is not a full reduction and
+    must not be rewritten -- only the exact no-argument shape this
+    repository's own training modules ever produce is in scope, per
+    :func:`torch_training._expand_dangling_aten_reduce_calls`'s own
+    docstring.
+    """
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["": 17, "pkg.onnxscript.torch_lib": 1]>
+        agraph (float[4,4] x, int64[1] dim) => (float[4] loss)
+        {
+            loss = pkg.onnxscript.torch_lib.aten_mean(x, dim)
+        }
+        """
+    )
+    rewritten = torch_training._expand_dangling_aten_reduce_calls(model)
+    (node,) = rewritten.graph.node
+    assert node.op_type == "aten_mean"
+
+
+def test_drop_unused_functions_removes_an_uncalled_function_definition():
+    """Regression test for a CI-only failure (Windows): a leftover, uncalled
+    ``FunctionProto`` -- ``onnx.inliner.inline_local_functions`` expands
+    call *sites* but does not necessarily prune the now-dead function
+    definition back out of ``model.functions`` -- whose own body carries a
+    newer opset (18) than the model's own ``opset_import`` (17) fails
+    ``onnx.checker.check_model`` even though nothing calls it anymore.
+
+    Built with ``onnx.helper`` rather than ``onnx.parser``: a FunctionProto
+    with its own, different ``opset_import`` attached to a model isn't
+    expressible in the parser's text format (CLAUDE.md's documented
+    fallback case).
+    """
+    reduce_mean_fn = onnx.helper.make_function(
+        domain="pkg.onnxscript.torch_lib",
+        fname="aten_mean",
+        inputs=["self"],
+        outputs=["result"],
+        nodes=[onnx.helper.make_node("ReduceMean", ["self"], ["result"], keepdims=0)],
+        opset_imports=[onnx.helper.make_opsetid("", 18)],
+    )
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Identity", ["x"], ["loss"])],
+        "agraph",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [4])],
+        [onnx.helper.make_tensor_value_info("loss", onnx.TensorProto.FLOAT, [4])],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("pkg.onnxscript.torch_lib", 1),
+        ],
+        functions=[reduce_mean_fn],
+    )
+    model.ir_version = 8
+
+    with pytest.raises(onnx.checker.ValidationError):
+        onnx.checker.check_model(model)
+
+    cleaned = torch_training._drop_unused_functions(model)
+    assert list(cleaned.functions) == []
+    onnx.checker.check_model(cleaned)
+
+
+def test_compile_torch_training_loop_trains_to_match_the_true_weight():
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(module, example)
+
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 1e-6 * losses[0]
+    np.testing.assert_allclose(loop.parameters()["w"], w_true, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not _CUDA_AVAILABLE,
+    reason="requires a CUDA-capable torch build + onnxruntime + GPU",
+)
+def test_cuda_feeds_and_state_are_genuinely_device_resident():
+    """The real end-to-end version of the same claim
+    ``tests/test_compile_training.py``'s own CUDA test makes for a
+    hand-built ONNX model: a batch already on ``"cuda"`` (an ordinary torch
+    tensor, the shape a real ``DataLoader``-fed training loop actually has
+    -- see ``examples/torch_dataloader_training``) is aliased, not copied,
+    and the trained parameter/optimizer-moment state stays a genuinely
+    CUDA-resident ``OrtValue`` from the first call's own output onward. See
+    :mod:`onnxsim.compile_training`'s own module docstring, "**CUDA.**",
+    for the full claim and why the mechanism needs nothing torch- or
+    CUDA-specific of its own -- it is the same generic DLPack path
+    ``feeds`` always takes.
+    """
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module,
+        example,
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    x_cuda = torch.as_tensor(x, device="cuda")
+    y_cuda = torch.as_tensor(y, device="cuda")
+    x_ptr = x_cuda.data_ptr()
+
+    loop({"x": x_cuda, "y": y_cuda}, lr=5e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
+
+    # The batch tensor's own device buffer survives conversion unchanged --
+    # onnxruntime's OrtValue.from_dlpack aliased it rather than copying it.
+    assert backend.as_ort_value(x_cuda).data_ptr() == x_ptr
+
+    loop({"x": x_cuda, "y": y_cuda}, lr=5e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
+
+
+def test_params_default_to_named_parameters():
+    module = _Regression()
+    example, *_ = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(module, example)
+    assert loop.params == ("w",)
+
+
+def test_params_can_be_overridden_explicitly():
+    module = _Regression()
+    example, *_ = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(module, example, params=("w",))
+    assert loop.params == ("w",)
+
+
+def test_dict_example_inputs_are_accepted():
+    module = _Regression()
+    (x_ex, y_ex), w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(module, {"x": x_ex, "y": y_ex})
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(50)]
+    assert losses[-1] < 0.5 * losses[0]
+
+
+def test_sgd_momentum_optimizer_also_trains():
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module, example, optimizer="sgd_momentum"
+    )
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 0.1 * losses[0]
+
+
+def test_missing_param_name_is_refused_with_the_exported_initializers_listed():
+    module = _Regression()
+    example, *_ = _example_and_batch()
+    with pytest.raises(ValueError, match="not_a_param"):
+        torch_training.compile_torch_training_loop(
+            module, example, params=("not_a_param",)
+        )
+
+
+def test_output_names_must_be_exactly_one():
+    module = _Regression()
+    example, *_ = _example_and_batch()
+    with pytest.raises(ValueError, match="one loss output"):
+        torch_training.export_torch_module_to_onnx(
+            module, example, output_names=("loss", "extra")
+        )
+
+
+def test_trace_torch_optimizer_sgd_trains_to_match_the_true_weight():
+    """A hand-written, momentum-free SGD update, expressed as ordinary torch
+    arithmetic and traced with :func:`torch_training.trace_torch_optimizer`
+    -- the same kind of convergence check
+    ``test_sgd_momentum_optimizer_also_trains`` already applies to the
+    builtin ``"sgd_momentum"`` optimizer, now with a
+    :class:`onnxsim.compile_training.CustomOptimizer`. A looser bound than
+    ``test_compile_torch_training_loop_trains_to_match_the_true_weight``'s
+    own (that one uses Adam, whose adaptive step size converges much faster
+    per step than plain, fixed-step SGD does at the same learning rate).
+    """
+
+    def sgd(param, grad, lr):
+        return (param - lr * grad,)
+
+    optimizer = torch_training.trace_torch_optimizer(sgd, num_state=0)
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module, example, optimizer=optimizer
+    )
+
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 1e-3 * losses[0]
+
+
+def test_trace_torch_optimizer_adam_trains_with_multiple_state_buffers():
+    """A hand-written Adam reimplementation with ``num_state=2`` (``m`` and
+    ``v``), checking a traced optimizer with more than one state buffer
+    threads both correctly -- not just the single-state SGD case above.
+    """
+
+    def adam(param, grad, m, v, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        m_next = beta1 * m + (1 - beta1) * grad
+        v_next = beta2 * v + (1 - beta2) * grad * grad
+        step = lr * m_next / (v_next.sqrt() + eps)
+        return param - step, m_next, v_next
+
+    optimizer = torch_training.trace_torch_optimizer(adam, num_state=2)
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module, example, optimizer=optimizer
+    )
+
+    losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
+    assert losses[-1] < 1e-4 * losses[0]
+    np.testing.assert_allclose(loop.parameters()["w"], w_true, atol=1e-2)
+
+
+def test_pow_is_refused_with_the_ops_graph_grad_actually_differentiates():
+    """``**`` (``torch.pow``/``Tensor.__pow__``) lowers to ONNX ``Pow``, which
+    has no gradient rule in :mod:`onnxsim.graph_grad` -- see _Regression's own
+    docstring. Training such a module must fail loudly, the same discipline
+    ``tests/test_compile_training.py``'s own
+    ``test_unsupported_op_is_refused_loudly`` already covers for a
+    hand-written ONNX model; this is the same failure reached from a real
+    torch module instead.
+    """
+
+    class PowRegression(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(2, 3))
+
+        def forward(self, x, y):
+            diff = x @ self.w.T - y
+            return (diff**2).mean()
+
+    example, *_ = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(PowRegression(), example)
+    with pytest.raises(graph_grad.UnsupportedOpError):
+        loop.step_graph

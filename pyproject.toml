@@ -87,6 +87,20 @@ detectron2 = ["torch"]
 # onnxsim.export_sam2_model's docstring) -- do not substitute the unrelated,
 # unofficial same-named package that is on PyPI.
 sam2 = ["torch", "samexporter", "hydra-core"]
+# Needed by onnxsim.torch_training.compile_torch_training_loop(), which
+# exports a real torch.nn.Module to ONNX via torch.export's FX graph
+# (torch.onnx.export(..., dynamo=True)) and hands the result to
+# onnxsim.compile_training_loop -- training itself still runs entirely on
+# onnxsim's own graph_grad/qat_graph, never on torch autograd, so this is
+# the only onnxsim module that needs torch at all. >= 2.5 is a real floor,
+# not a copy of the other torch extras' unpinned ones: that is the release
+# the dynamo=True exporter argument landed in (it replaced the older,
+# separate torch.onnx.dynamo_export() function). onnxscript is torch.onnx's
+# own dynamo exporter's dependency, not onnxsim's -- torch.onnx.export(...,
+# dynamo=True) imports it lazily and fails with a bare "No module named
+# 'onnxscript'" if it is missing, so it is listed here too rather than left
+# for that confusing error to surface.
+torch-training = ["torch >= 2.5", "onnxscript"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"

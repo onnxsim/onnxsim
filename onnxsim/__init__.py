@@ -46,6 +46,7 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.compile_training import TrainingLoop, compile_training_loop
 from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
 from onnxsim.daq import apply_daq
@@ -307,6 +308,10 @@ from onnxsim.svdquant import apply_svdquant
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.tesseraq import apply_tesseraq
 from onnxsim.tflite_export import export_tflite
+from onnxsim.torch_training import (
+    compile_torch_training_loop,
+    export_torch_module_to_onnx,
+)
 from onnxsim.transformers_export import export_transformers_model
 from onnxsim.xnnpack_codegen import export_xnnpack_c, generate_xnnpack_c
 from onnxsim.zeroquant import apply_zeroquant
@@ -359,6 +364,10 @@ __all__ = [
     "discover_qat_blocks",
     "QATBlock",
     "QATBlockResult",
+    "compile_training_loop",
+    "TrainingLoop",
+    "compile_torch_training_loop",
+    "export_torch_module_to_onnx",
     "quantize_static_keeping_qdq_scales",
     "export_fake_quant",
     "find_existing_qdq",

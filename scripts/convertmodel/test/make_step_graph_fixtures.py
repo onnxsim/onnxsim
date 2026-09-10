@@ -48,7 +48,11 @@ generated here too but is not part of the ``step_graphs.json`` manifest or
 ``step_graph_ep.test.mjs``'s own EP-coverage measurement -- it is driven with
 *live* data (a real Hugging Face photo) by a different consumer,
 ``webgpu_hf_demo.test.mjs``; see that function's own docstring for why it
-needs its own file.
+needs its own file. ``step_train_loop_demo.onnx`` (``build_train_loop_demo``)
+is the same idea for ``onnxsim.compile_training_loop`` -- baked data this
+time, but still its own file, since it too is driven by a browser-only
+consumer (``webgpu_train_loop_demo.test.mjs``) rather than
+``step_graph_ep.test.mjs``.
 
 Regenerate (from this directory, with onnxsim importable from the repo root)::
 
@@ -73,7 +77,15 @@ HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str((HERE / ".." / ".." / "..").resolve()))
 
 import onnxruntime as ort  # noqa: E402
-from onnxsim import adaquant, adaround, graph_grad, qat_graph  # noqa: E402
+from onnx import parser  # noqa: E402
+
+from onnxsim import (  # noqa: E402
+    adaquant,
+    adaround,
+    compile_training_loop,
+    graph_grad,
+    qat_graph,
+)
 
 # One shared seed: every array below is drawn from it, so a regeneration with
 # unchanged builders produces byte-identical fixtures.
@@ -591,6 +603,81 @@ def build_qat_hf_demo(rng: np.random.Generator) -> Dict:
     )
 
 
+def build_train_loop_demo(rng: np.random.Generator) -> Dict:
+    """``onnxsim.compile_training_loop``'s own compiled step graph -- the one
+    fixture here not hand-assembled from ``graph_grad``/``qat_graph`` calls.
+    The four ``step_graphs.json`` builders above predate
+    ``onnxsim.compile_training``, and compose ``build_backward``/
+    ``adam_update``/``make_step_graph`` by hand for the same reason
+    ``build_qat_backward``'s docstring gives: a real ``onnxsim.qat`` block
+    would drag in machinery this file has no need of. ``compile_training_loop``
+    *is* that composition, packaged as the library's own public entry point,
+    so building this fixture by calling it directly is what dogfoods it --
+    the compiled step graph committed here is byte-for-byte what a caller of
+    the real API gets, not a hand-copied approximation of it.
+
+    A small linear regression -- ``y_hat = x @ w^T``, trained against a fixed
+    batch -- for the same "which gradient rules, not which realism" reason
+    ``build_qat_backward`` gives: ``Transpose``, ``MatMul``, ``Sub``, ``Mul``
+    and ``ReduceMean`` are all already covered by other fixtures, so nothing
+    new needs verifying operator-by-operator here. What is new is running the
+    *whole compiled artifact* -- forward, backward and Adam, produced by
+    ``compile_training_loop`` and never touched by hand -- through
+    onnxruntime-web on a real browser's WebGPU backend
+    (``webgpu_train_loop_demo.test.mjs``, macOS CI only; see that job's own
+    comment in ``.github/workflows/convertmodel-webgpu-demo.yml`` for why it
+    needs a real browser rather than plain Node, same reason
+    ``webgpu_hf_demo.test.mjs`` does).
+    """
+    rows, k, n = 8, 3, 2
+    forward = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["": 17]>
+        agraph (float[{rows},{k}] x, float[{rows},{n}] y) => (float loss)
+        {{
+            wt = Transpose<perm=[1,0]>(w)
+            y_hat = MatMul(x, wt)
+            diff = Sub(y_hat, y)
+            sq = Mul(diff, diff)
+            loss = ReduceMean<keepdims=0>(sq)
+        }}
+        """
+    )
+    forward.graph.initializer.append(
+        onnx.numpy_helper.from_array(_f32(rng.normal(scale=0.1, size=(n, k))), "w")
+    )
+
+    loop = compile_training_loop(forward, "loss", ("w",))
+    step = loop.step_graph  # compiles; does not run a step
+    state = loop.initial_state
+
+    w_true = _f32(rng.normal(size=(n, k)))
+    x = _f32(rng.normal(size=(rows, k)))
+    constants = {"x": x, "y": x @ w_true.T}
+
+    scalars = []
+    for t in range(NUM_STEPS):
+        values = {"lr": 0.1}
+        values.update(qat_graph.adam_bias_corrections(t))
+        scalars.append(values)
+
+    fixture = _package(
+        "train_loop_demo",
+        "step_train_loop_demo.onnx",
+        "onnxsim.compile_training_loop",
+        step,
+        constants,
+        state,
+        scalars,
+    )
+    (HERE / "step_train_loop_demo.json").write_text(json.dumps(fixture, indent=1) + "\n")
+    print(
+        "wrote step_train_loop_demo.onnx + step_train_loop_demo.json; loss "
+        f"{fixture['referenceLosses'][0]:.6g} -> {fixture['referenceLosses'][-1]:.6g}"
+    )
+    return fixture
+
+
 def build_qat_cifar10_pretrain(rng: np.random.Generator) -> Dict:
     """A batched two-layer QAT step graph pretrained on a small, fixed sample
     of real CIFAR-10 images -- ``build_qat_hf_demo``'s architecture widened
@@ -845,6 +932,16 @@ def main() -> None:
     # than joining step_graphs.json (see build_qat_hf_demo's own docstring).
     build_qat_hf_demo(np.random.default_rng(SEED))
     build_qat_cifar10_pretrain(np.random.default_rng(SEED))
+
+    # Also its own file, but for the opposite reason: build_train_loop_demo's
+    # data *is* baked (see its own docstring -- it dogfoods
+    # compile_training_loop, which needs no live network to demonstrate), so
+    # it could join step_graphs.json's replay-against-CPU comparison. It
+    # stays separate because its consumer, webgpu_train_loop_demo.test.mjs,
+    # requires a real browser (macOS CI) the way the two demos above do,
+    # unlike step_graph_ep.test.mjs's plain-Node, webgpu-is-only-attempted
+    # run of the shared manifest.
+    build_train_loop_demo(np.random.default_rng(SEED))
 
 
 if __name__ == "__main__":
