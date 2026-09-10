@@ -32,6 +32,15 @@ import onnx.numpy_helper
 import pytest
 from onnx.reference import ReferenceEvaluator
 
+# generate_distillation_step_graph.py needs the onnxsim package importable
+# (onnxsim.graph_grad/qat_graph) -- unlike test_distillation.py's sibling
+# onnxruntime.training checks, that means the *compiled* onnxsim extension,
+# not just a pip package (see CLAUDE.md). onnx-finetune-lora.yml's
+# lora-scripts job deliberately runs `pytest tools/onnx-finetune/tests`
+# without building onnxsim at all ("no compiled onnxsim extension needed"),
+# so this must skip there rather than error out at collection time.
+pytest.importorskip("onnxsim")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from generate_distillation_step_graph import (  # noqa: E402
     _build_forward_loss_and_grads,

@@ -33,7 +33,9 @@ pytest.importorskip("transformers")
 _DISTILL_PATH = os.path.join(
     os.path.dirname(__file__), "..", "examples", "llm_distillation", "distill.py"
 )
-_spec = importlib.util.spec_from_file_location("llm_distillation_distill", _DISTILL_PATH)
+_spec = importlib.util.spec_from_file_location(
+    "llm_distillation_distill", _DISTILL_PATH
+)
 distill = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(distill)
 

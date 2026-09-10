@@ -40,7 +40,12 @@ def test_generated_artifacts_load_and_have_clamped_ir_version(tmp_path, monkeypa
 
     generate_web_artifacts.main()
 
-    expected_files = {"teacher_model.onnx", "checkpoint", "training_model.onnx", "optimizer_model.onnx"}
+    expected_files = {
+        "teacher_model.onnx",
+        "checkpoint",
+        "training_model.onnx",
+        "optimizer_model.onnx",
+    }
     assert expected_files <= set(os.listdir(tmp_path))
     assert not (tmp_path / "eval_model.onnx").exists()
     assert not (tmp_path / "student_export.onnx").exists()
@@ -51,7 +56,10 @@ def test_generated_artifacts_load_and_have_clamped_ir_version(tmp_path, monkeypa
 
 
 def test_training_session_runs_a_real_step(tmp_path, monkeypatch):
-    ort = pytest.importorskip("onnxruntime.training.api", reason="needs onnxruntime-training's Python training API")
+    ort = pytest.importorskip(
+        "onnxruntime.training.api",
+        reason="needs onnxruntime-training's Python training API",
+    )
     import numpy as np
 
     monkeypatch.setattr(generate_web_artifacts, "ASSETS_DIR", str(tmp_path))
