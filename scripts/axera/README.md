@@ -5597,6 +5597,11 @@ and the only lever that moves it is fewer quantised operations.** Weight
 precision does not (the scale search below finds nothing), activation width
 buys 4 dB and then plateaus, and the nonlinearities are free.
 
+(That last sentence is too strong, and "Correction: weight precision *does*
+move it" below says how: re-spelling one convolution as two whose weights
+carry sixteen bits between them beats the depth law by 7 dB on the card, even
+though it doubles the operation count.)
+
 A smaller observation from the same run: `Relu` is 4 dB *worse* than either
 bare or Snake. It zeroes half its activations, so the calibrated range then
 covers a distribution with a spike at zero and the codes near it are wasted.
@@ -5606,6 +5611,179 @@ Which also corrects something said above: Pulsar2's precision analysis is
 `precision_analysis_mode` is `Reference`, which scores each layer against
 float inputs; `NPUBackend` is the other option. The earlier claim that the
 tool "cannot show this" should have been "does not show this by default".
+
+### Correction: weight precision *does* move it, but only in the right shape
+
+The claim just above -- that fewer quantised operations is the only lever --
+is too strong, and the thing that corrects it comes from
+`docs/ozaki-scheme-axera-handoff.md`. The Ozaki scheme splits a high-precision
+matrix into several low-precision components, runs a low-precision matmul on
+each, and sums them. That handoff note concluded the toolchain could not host
+it, because every documented way to pin a per-matmul scale is broken:
+`quant.highest_mix_precision` fails with `TileFailException` and `QuantONNX`'s
+QDQ path crashes Pulsar2's own PPQ pass on any `DequantizeLinear`-fed
+`MatMul`.
+
+**None of that is needed.** Split the weight and let the compiler's ordinary
+PTQ *derive* the two scales itself:
+
+```
+W_hi = the value Pulsar2's own quantiser lands on
+W_lo = W - W_hi                     # its peak is 255x smaller, per channel
+y    = conv(x, W_hi) + conv(x, W_lo)
+```
+
+Nothing asks for a scale. `W_lo`'s peak is 255x smaller, so per-tensor MinMax
+calibration gives the second convolution a 255x finer scale on its own. On a
+real conv weight the pair carries **79.5 dB** where one INT8 pass carries
+37.7 dB.
+
+`precision.py` is that rewrite, and `tests/test_axera_precision.py` pins it.
+
+#### First, a correction to how the weights are quantised at all
+
+The first error budget written for this was wrong, and wrong against something
+this repository already knew. `pulsar2_quantizer.py`'s docstring says it, read
+straight off a real `AxQuantizedConv`: activations are **per tensor,
+asymmetric U8**; weights are **per output channel, symmetric S8**. A build's
+own `quant/quant_axmodel.json` confirms both to the last digit:
+
+| tensor | policy | scale |
+| --- | --- | --- |
+| activation | `PER_TENSOR`, `ASYMMETRICAL`, `[0, 255]` | `(max - min) / 255`, `zp = round(-min/scale)` |
+| weight | `PER_CHANNEL`, `SYMMETRICAL`, `[-128, 127]` | `max\|w_c\| / 127.5`, `zp = 0` |
+
+That per-channel scale is worth about 8 dB by itself: on the same heavy-tailed
+weight, peak/rms is **14.7** per tensor but **5.6** per channel. A budget that
+assumes per-tensor weights therefore blames the weights for error they are not
+making -- and it produced a number, 3.28 dB against the vocoder's measured
+3.33 dB, close enough to look like confirmation. It was a coincidence.
+
+#### The trap: the quantiser is not idempotent
+
+The obvious residual, `W_lo = W - quantise(W)`, throws away most of the gain,
+and the reason is a half-step. A quantised channel's largest code is 127 where
+the scale assumed 127.5, so handing `W_hi` back to the compiler makes it
+derive a scale 0.4% smaller and re-round -- moving values by up to half a step,
+which is the same size as the error being corrected.
+
+| residual taken against | weight SNR |
+| --- | --- |
+| a per-*tensor* high half | 39.5 dB |
+| `W - quantise(W)` | 48.1 dB |
+| `W - compiler_view(quantise(W))` | **79.5 dB** |
+
+A hardware probe built the first way measured **no gain at all**, which is how
+the trap was found.
+
+#### On the AX650N, at two activation widths
+
+Sixteen convolutions deep, 32 channels, heavy-tailed weights, the same graph
+compiled and run on the card both ways:
+
+| activations | plain | split | change |
+| --- | --- | --- | --- |
+| U8 | 21.64 dB | 21.34 dB | **-0.30** |
+| U16 | 25.77 dB | **33.00 dB** | **+7.23** |
+
+**The split only pays when the join is wide.** It costs one extra
+convolution and one `Add`, so the output is requantised twice instead of once.
+At INT8 activations that second requantisation is worth more than the residual
+returns, and per-channel weight quantisation was already good enough that
+there was little to return. At 16-bit activations the requantisations get out
+of the way and the residual is worth 7 dB. So the `layer_configs` entry is
+part of the technique, not an optional extra -- `precision.split_op_types()`
+returns exactly the op types to promote, `Add` included.
+
+This is the first thing in this file to beat the depth law rather than obey
+it: the split *doubles* the convolution count and the result improves by 7 dB.
+Depth still sets the ceiling, but "fewer operations" is not the only way to
+move it -- fewer operations *carrying INT8-sized error* also works.
+
+#### And on the real vocoder it does not help
+
+Splitting all 126 weighted ops of the Audio8 decoder and building it the same
+way measured **6.95 dB against the unsplit build's 7.37** -- a small loss, not
+a gain. Which the budget above predicts, and it is worth being explicit about
+why, because it bounds where this technique is worth reaching for. On that
+graph the weights are not what is binding: per output channel they read
+`e_W = 36.5 dB` against `e_Y = 35.7`, so removing the weight term entirely
+cannot buy much, while the 126 extra `Add`s each pay a requantisation. The
+probe gains 7 dB because its weights are deliberately outlier-heavy and its
+graph is sixteen ops long; the vocoder's are neither.
+
+**So the rule is `e_W` versus `e_Y`, per layer, and it has to be measured.**
+`weight_error_db` gives the first from the weight alone;
+`replay.py` below gives the second from the build. Splitting everything is the
+wrong default -- `weight_residual_split(layers=...)` and `min_peak_to_rms`
+exist for that reason.
+
+#### And a calibration artifact that hid it for two builds
+
+The first two U16 probes measured +0.45 and +1.79 dB, and a simulator using
+the corrected quantisers agreed with the plain build to 0.02 dB while
+insisting the split should be worth far more. The gap was **clipping**: MinMax
+calibration ran on eight samples that did not include the evaluation input, so
+every variant clipped, and clipping error does not shrink with bit depth. It
+pinned all three variants at the same ~26 dB ceiling. With the evaluation
+input in the calibration set, the same simulation goes 25.79 -> 53.26 dB and
+the card goes 25.77 -> 33.00.
+
+Worth stating on its own, because it is cheaper than any of this: **a
+calibration set that does not cover the input costs more than the quantiser
+does, and no amount of bit depth buys it back.**
+
+#### The 20 dB that looked unexplained was the scales, and there is no floor
+
+The card reaching 33.00 where an idealised simulation says 53.26 looked like a
+hardware floor. It is not. `pulsar2 build` writes every scale it chose into
+`<output>/quant/quant_axmodel.json` -- bit width, policy, and a hash into a
+shared `values` table holding the scale and zero point. Feed *those* numbers
+back into the float graph instead of recomputing MinMax ranges, and the
+prediction lands on the measurement:
+
+| build | replayed offline | on the AX650N |
+| --- | --- | --- |
+| INT8 | 21.64 dB | 21.64 dB |
+| INT8, split weights | 21.15 dB | 21.34 dB |
+| U16 | 25.78 dB | 25.77 dB |
+| U16, split weights | **33.03 dB** | **33.00 dB** |
+
+Four builds, worst case 0.19 dB, two of them exact. **The card computes
+precisely the affine quantisation the compiler wrote down.** There is no
+unexplained numerical floor, and the gap was never the hardware -- it was that
+the compiler's chosen ranges are wider than an ideal MinMax fit, which is the
+calibration point above stated a second way.
+
+`replay.py` is that replay, spelled as ONNX arithmetic (`Div`, `Round`,
+`Clip`, `Mul`) rather than `QuantizeLinear`, because a UINT16 zero point needs
+opset 21 and bumping a real graph that far breaks ops whose signature moved on
+the way -- `ReduceMean`'s `axes` became an input at opset 18.
+
+The practical consequence: **accuracy on this NPU can be searched offline.**
+Precision configurations and calibration sets can be scored against a build's
+own quantisation table with no card and no rebuild.
+
+**Where it is not yet faithful: fusion.** On the full Audio8 decoder the
+replay reads 3.65 dB against the card's 7.37. `quant/quant_axmodel.onnx` is
+the graph Pulsar2 actually lowers, and 385 of the float graph's 1002 tensors
+are simply *not in it*, folded inside a fused `AxQuantizedRMSNorm`,
+`AxQuantizedRoPE` or `AxQuantizedFullyConnected`. Nothing on the card rounds
+those, so quantising them invents error: doing so read 1.12 dB. Filtering to
+the tensors that survive as edges recovers 2.5 dB of the 6.3.
+
+The obvious next filter does not settle it either. `AxReshape`, `AxSlice`,
+`AxTranspose`, `AxTile` and `AxPad` move codes without recomputing them, so
+arguably nothing rounds their output; dropping those too reads **23.40 dB**,
+overshooting as far as the first rule undershot. The two rules bracket the
+measurement instead of explaining it, and ten `Reshape` outputs on their own
+are worth 4.6 dB (3.65 -> 8.23), so a movement op's output is evidently
+rounded *sometimes*. Unresolved. `replay.py` defaults to the pessimistic rule
+-- a lower bound is more useful than a flattering guess -- and offers the
+strict one as `quantising_only=True`.
+
+So: exact on a graph the compiler does not fuse, and bracketing on one it
+does.
 
 ### The fused-op namespace, and how to see it before you trip on it
 
@@ -5752,6 +5930,169 @@ What still cannot be done is originate a shape nobody has compiled. Block
 bases and the per-tap input splits are allocator output, and the vocoder's own
 splits (`[80]`, then `[48, 32]`, then `[24, 56]` on consecutive taps of one
 layer) are the evidence that no rule is waiting to be found there.
+
+## Replacing the ONNX compiler at a fixed shape
+
+"How much of a CNN's mcode depends on its weights" above answers 96.2%
+weight-independent and stops there, because the remaining bytes were not
+understood and the weight table's layout was a pile of hand-derived rules.
+Both are now closed, and the result is a compiler replacement: **given
+reference builds at a shape, any weights at that shape emit a working
+`.axmodel` with no Pulsar2 in the loop.** Eight held-out weight sets produced
+weight tables byte-identical to Pulsar2's and device output bit-identical to
+Pulsar2's own build.
+
+### Learn the layout instead of deriving it
+
+This file derives seven weight layouts by hand -- gaps of 36, strides of 144,
+per-tap padding, polyphase reversal, a per-output-channel cost charged per
+*bit*. Each was worth deriving. None is a good foundation for an emitter,
+because every new shape or dtype adds another.
+
+They all have one thing in common: **each is a bit permutation.** A byte of
+`npu_params` mixes single bits from several codes, but every bit of the table
+is either constant for the shape, or equal to one specific bit of one specific
+code. So compile the same shape `k` times with different weights and read the
+permutation off: each table bit's column of `k` observed values is a
+signature, and the code bit with the same signature is where it came from.
+
+Naming one code bit out of `32*32*3*8 = 24,576` needs about 15 bits of
+signature. `k` builds give `k`, so the method's own failure mode is visible
+and countable -- it is the number of code bits sharing a signature:
+
+| builds | table bits mapped | constant | unexplained | colliding sources |
+| --- | --- | --- | --- | --- |
+| 8 | 26,006 | 13,225 | 0 | 24,129 |
+| 16 | 25,116 | 12,972 | 1,144 | 4,074 |
+| **48** | **24,576** | 12,937 | 1,719 | **0** |
+
+At 48 builds the mapped count is **exactly** `32*32*3*8`: every weight code
+bit appears in the table exactly once, and nothing is ambiguous. The 8- and
+16-build rows are the same method being honestly wrong, which is the point of
+measuring collisions rather than trusting the fit.
+
+### The 1,719 unexplained bits are the requantisation, in closed form
+
+They are one contiguous run -- bytes 4608 to 4864, which is `32 channels x
+8 bytes` -- and they are not copies of anything, they are computed. Read as
+float32 they are two vectors, and a quantised convolution says what they must
+be. Its output in code units is
+
+```
+y_code = zy + sum_i (x_code_i - zx) * q_i * (x_scale * w_scale / y_scale)
+```
+
+and the AX650N precomputes the constant half per output channel:
+
+| floats | meaning |
+| --- | --- |
+| `[0:C]` | `bias[c] = zy - zx * sum(q_c) * M_c` |
+| `[C:2C]` | `M_c = x_scale * w_scale_c / y_scale` |
+
+Across 48 builds x 32 channels the formula reproduces **every one** of the
+stored values to `6.1e-05` -- float32 rounding, nothing else.
+
+That closes the table: codes through the learned map, this block in closed
+form, everything else copied from the reference. Emitting eight held-out
+weight sets gives **0 differing bytes of 4904**, every time.
+
+### The mcode's weight-dependent bytes, and the seven that do not matter
+
+With 48 builds of one shape, 24 of the mcode's 2824 bytes move. Five of them
+are the output quantisation written down literally:
+
+| offsets | field |
+| --- | --- |
+| 1846, 1853, 1860, 1867 | little-endian float32 `y_scale`, four copies |
+| 1835 | one byte, `round(y_zero)` |
+
+The other seven -- 301, 303, 309, 311, 317, 319, 323, 325 -- hold a
+permutation of `0x10/0x20/0x30/0x40` with `0x13`/`0x23` separators, and 20
+distinct patterns appear across 48 builds. What chooses them is not known.
+**It also does not matter.** Every emitted model here left them at the
+*reference's* values, differing from Pulsar2's own build in 2 to 5 bytes, and
+the card returned bit-identical output all eight times. They are scheduling,
+not semantics.
+
+### On the card
+
+Reference: one build of `Conv(32, 32, 3)`. Target: eight weight sets it never
+saw. Nothing but `emitter.py` between them.
+
+| held-out | table bytes differing | mcode bytes differing | emitted | Pulsar2 | identical |
+| --- | --- | --- | --- | --- | --- |
+| s202 | 0 | 4 | 33.44 dB | 33.44 dB | yes |
+| s303 | 0 | 3 | 35.36 dB | 35.36 dB | yes |
+| s404 | 0 | 2 | 32.52 dB | 32.52 dB | yes |
+| s505 | 0 | 5 | 33.93 dB | 33.93 dB | yes |
+| s606 | 0 | 5 | 33.90 dB | 33.90 dB | yes |
+| s707 | 0 | 5 | 33.96 dB | 33.96 dB | yes |
+| s808 | 0 | 4 | 27.61 dB | 27.61 dB | yes |
+| s1040 | 0 | 3 | 35.45 dB | 35.45 dB | yes |
+
+Bit-identical, not correlated: `np.array_equal` on the returned float32.
+
+### Two builds of 48 that cannot be patched in place
+
+The mcode is a tagged byte stream, and twice in 48 builds a field's value was
+not written inline but escaped, shifting every byte after it:
+
+* one build's output zero point came out exactly **128**,
+* one build's `y_scale` had low byte **0x9e**.
+
+No rule tried here predicts which -- plenty of perfectly patchable builds
+carry bytes in `0x80..0x9f`, including the reference itself, whose zero point
+is `0x83`. So `learn_mcode` does not guess: it finds outliers by *re-emitting
+every training build and checking what survives*, records the values that
+actually failed, and `emit_mcode` refuses those. 46 of 48 re-emit exactly.
+
+A refusal is a real limit, not a formality: those two models need Pulsar2, or
+a nudge to the calibration range that moves the scale off the bad value.
+
+### The same method on an `llm_build` layer
+
+The LLM path needs no new machinery, only more samples -- and it supplies them
+itself. Every layer of a build is the same shape with different weights, so one
+`llm_build` of SmolLM2-135M is thirty samples; two more builds on checkpoints
+with randomised 2-D weights make ninety.
+
+More are needed than for a convolution because unambiguity costs about twice
+the log of the code count, and a layer here holds 3,538,944 codes against a
+convolution's 3,072:
+
+| samples | table bits mapped | constant | unexplained | colliding sources |
+| --- | --- | --- | --- | --- |
+| 30 | 28,316,585 | 3,210,223 | 182,408 | 372,373 |
+| **54** | **28,311,552** | 3,209,913 | 187,751 | **0** |
+
+At 54 the mapped count is again *exactly* `3,538,944 * 8`: every weight code
+bit appears in the table once, and nothing is ambiguous. `llm_codes_of` is the
+quantiser it maps through -- `llm_build`'s own, not the convolution
+pipeline's.
+
+Trained on 82 samples and held out on eight whole layers, the emitted tables
+are **byte-exact everywhere except one localised remainder**: 27,000-odd bytes
+of 3,963,652, and **zero** wrong bytes outside it. That is 99.3% of an
+`llm_build` layer's weight table written from the checkpoint with no compiler.
+
+The remainder is 33,965 bytes in 13,824 runs of one to three bytes, laid out
+two bytes in every four from offset 4096 -- the shape of a half-width field in
+a full-width slot. It is not the per-row scale `-peak/128` in matmul order
+(one of 5,184 matches), and read as float32 it contains NaNs, so it is not a
+float array at that offset either. **Undecoded**, and until it is, this path
+emits a table that is 99.3% right rather than a model that runs -- unlike the
+convolution path above, where the last 1,719 bits turned out to be the
+requantisation in closed form and closed it completely.
+
+### What this does and does not replace
+
+It replaces the compiler's **weight handling**, which is what changes when a
+model is retrained, fine-tuned, quantisation-aware-trained, or pruned. It does
+not originate a shape: hidden size, channel count, kernel and layout still
+come from a reference build, exactly as `README.md`'s `llm_build` emitter
+above needs one. The reference is needed **once per shape**, and the number of
+builds it takes is measurable rather than guessed -- push `collisions()` to
+zero and the map is exact.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
@@ -6229,7 +6570,10 @@ CNN/LLM focus.
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
 | `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf` (real CNN `neu mode` node shape) and `axera_llm_layer_leaf` (real per-layer LLM shape: two `neu mode` nodes sharing one initializer) -- no real device needed to exercise the corruption check in CI. |
 | `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects both `onnxruntime`'s availability and `onnxsim` itself actually being importable (a checkout with `onnxsim`'s compiled extension not yet built fails `import onnxsim`, not just the lazy `onnxruntime` import inside it -- both are caught the same way so this degrades gracefully instead of taking `pulsar2_simulator.py`'s `import` down with it). |
+| `precision.py` | `weight_residual_split()`: rewrites `Conv`/`MatMul`/`Gemm`/`ConvTranspose` as `op(x, W_hi) + op(x, W_lo)` so two INT8 weights carry ~16 bits between them, plus `quantise_dequantise()`/`compiler_view()` (Pulsar2's per-output-channel weight quantiser, and the re-rounding the residual has to be taken against), `weight_error_db()` and `split_op_types()` (the op types to promote to `U16`, without which the split does not pay). Measured +7.23 dB on the AX650N at 16-bit activations -- see above. |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
+| `replay.py` | `load_scales()`/`insert_qdq()`/`replay()`: re-runs a float graph at the scales `pulsar2 build` recorded in `quant/quant_axmodel.json`, reproducing four real AX650N measurements to within 0.19 dB with no card and no rebuild. `surviving_edges()` drops the tensors the compiler fused away -- quantising those invents error the hardware never makes. Exact on an unfused graph, a lower bound on a fused one. |
+| `emitter.py` | `learn()`/`emit_axmodel()`: learns a shape's weight-table encoding as a bit permutation from k reference builds, instead of deriving its layout rules, then writes any new weights at that shape with no compiler in the loop -- byte-identical tables and bit-identical device output on eight held-out weight sets. `requant_block()` is the per-channel bias/multiplier in closed form; `learn_mcode()`/`emit_mcode()` find and rewrite the mcode's output scale and zero point, and report the streams that cannot be patched in place. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
