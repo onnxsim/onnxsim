@@ -399,6 +399,14 @@ _CASES = {
         """,
         {"A": _positive},
     ),
+    "log": (
+        """
+        g (float[3,4] A) => (float[3,4] Y) {
+          Y = Log(A)
+        }
+        """,
+        {"A": _positive},
+    ),
     "transpose_default": (
         """
         g (float[2,3,4] A) => (float[4,3,2] Y) {

@@ -1,5 +1,18 @@
 # onnx-finetune-wasm
 
+**Distillation has a second, separate browser runner that avoids everything in this file's
+"Status" section below: `distill_step_graph/`.** It runs a step graph from
+`../scripts/generate_distillation_step_graph.py` (onnxsim's own graph_grad/qat_graph autodiff,
+not `onnxruntime.training`) via the *official* `onnxruntime-web` npm package's plain
+`ort.InferenceSession` -- no Embind wrapper, no custom Emscripten build, no
+`--enable_training_apis` at all, and it sidesteps the "memory access out of bounds" bug below
+entirely (that bug is in a training-op kernel this path never touches). See
+`../README.md`'s "Knowledge distillation (graph_grad)" section and
+`distill_step_graph/step_graph_runner.mjs`/`.test.mjs`. Everything below this point describes
+the *other* runner (`src/onnx_finetune_wasm.cpp`, the Embind wrapper around
+`Ort::TrainingSession`), which still needs the from-source build and still has this file's own
+unresolved memory bug -- unaffected by the addition above.
+
 Same training loop as `../src/main.cpp` (the native CLI), compiled to
 WebAssembly and exposed to JS via Embind instead of argv, so it can run
 fine-tuning entirely client-side in a browser tab.

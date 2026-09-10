@@ -5,32 +5,54 @@ name: onnx-finetune training (incl. distillation)
 # via onnxruntime.training.api -- both need a *training-enabled* onnxruntime,
 # not the plain onnxruntime that workflow installs.
 #
-# `pip install onnxruntime-training` (a separate, official PyPI distribution)
-# is enough for both -- no from-source onnxruntime build needed here. That's
-# deliberate: this job covers the Python side only. The native onnx-finetune
-# CLI and its WASM binding (tools/onnx-finetune/src/, wasm/src/) need actual
-# C++ headers and a linkable library with the training API exported, which no
-# pip package provides (verified: the onnxruntime-training wheel statically
-# links the training API into its Python-only pybind extension, with no
-# onnxruntime_training_cxx_api.h and no exported C API symbols) -- building
-# and testing those needs a genuine from-source onnxruntime build
-# (--enable_training_apis, ~20-40 min; ~25-40 min again for the WASM+JSEP
-# variant, see wasm/README.md), which used to run here but was removed as
-# not worth the CI cost: both tools/onnx-finetune/README.md and wasm/README.md
-# document that build recipe and how to run each tool by hand, but neither is
-# exercised by automation -- a regression in either would only surface on a
-# manual run, not in CI.
+# distillation-python: `pip install onnxruntime-training` (a separate,
+# official PyPI distribution) is enough -- no from-source onnxruntime build
+# needed. This covers the original onnxblock/onnxruntime.training-based
+# `--loss distillation` path (distillation_loss.py, generate_artifacts.py).
+#
+# distillation-graph-grad-native / -wasm: a second, independent distillation
+# path (scripts/generate_distillation_step_graph.py + src/distill_step_graph_
+# main.cpp + wasm/distill_step_graph/) that differentiates the KD loss with
+# onnxsim's own graph_grad/qat_graph autodiff instead of onnxruntime.training
+# -- see ../README.md's "Knowledge distillation (graph_grad)" section for the
+# full design writeup and why it exists alongside, not instead of, the
+# original path above (this repo's other --loss modes, and the native CLI's
+# TrainingSession-based src/main.cpp, still use onnxruntime.training; only
+# distillation has a second implementation). Its whole point is that the
+# resulting step graph runs on a *plain* onnxruntime/onnxruntime-web, so both
+# jobs stay cheap: a plain prebuilt onnxruntime release download (native) or
+# the official onnxruntime-web npm package (wasm), no --enable_training_apis
+# source build (~20-40 min; ~25-40 min again for the WASM+JSEP variant) like
+# the one that used to run here and was removed as not worth the CI cost --
+# see wasm/README.md's Status section. Both still build this repo's own
+# onnxsim wheel (ONNXSIM_BUILTIN_ORT=OFF, see the top-level CLAUDE.md note
+# that this does NOT build ONNX Runtime), since generate_distillation_step_
+# graph.py needs onnxsim.graph_grad/qat_graph importable.
+#
+# The original TrainingSession-based native CLI (src/main.cpp) and WASM
+# binding (wasm/src/onnx_finetune_wasm.cpp) -- every --loss mode except the
+# graph_grad path above -- still need that from-source build to compile at
+# all; both README.md and wasm/README.md document the recipe and how to run
+# each tool by hand, but neither is exercised by automation.
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
       - "tools/onnx-finetune/**"
+      - "onnxsim/graph_grad.py"
+      - "onnxsim/graph_grad.cpp"
+      - "onnxsim/graph_grad.h"
+      - "onnxsim/qat_graph.py"
       - ".github/workflows/onnx-finetune-training.yml"
   push:
     branches: [master]
     paths:
       - "tools/onnx-finetune/**"
+      - "onnxsim/graph_grad.py"
+      - "onnxsim/graph_grad.cpp"
+      - "onnxsim/graph_grad.h"
+      - "onnxsim/qat_graph.py"
       - ".github/workflows/onnx-finetune-training.yml"
 
 concurrency:
@@ -39,6 +61,11 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # Pinned so the three jobs below (native, wasm, and a human following
+  # README.md by hand) agree on which release to fetch.
+  PLAIN_ORT_VERSION: "1.19.2"
 
 jobs:
   distillation-python:
@@ -55,3 +82,83 @@ jobs:
         run: pip install onnx numpy onnxruntime-training pytest
       - name: pytest tools/onnx-finetune/tests/test_distillation.py
         run: pytest tools/onnx-finetune/tests/test_distillation.py -v
+
+  distillation-graph-grad-native:
+    name: graph_grad distillation (native, plain onnxruntime -- no --enable_training_apis)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install build + test deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          pip install nanobind onnx numpy onnxruntime pytest
+      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see CLAUDE.md)
+        run: pip install -e . --no-build-isolation
+      - name: pytest the Log VJP rule, its Python<->C++ parity, and the step-graph generator
+        run: |
+          pytest tests/test_graph_grad.py tests/test_graph_grad_registry.py \
+            tests/test_graph_grad_templates.py tests/test_qat_parity.py \
+            tools/onnx-finetune/tests/test_distillation_graph_grad.py -v
+      - name: Download a plain prebuilt onnxruntime release (no build at all)
+        run: |
+          curl -sSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${PLAIN_ORT_VERSION}/onnxruntime-linux-x64-${PLAIN_ORT_VERSION}.tgz"
+          tar xzf /tmp/ort.tgz -C /tmp
+      - name: Configure and build onnx-finetune-distill-step-graph
+        run: |
+          cmake -B tools/onnx-finetune/build tools/onnx-finetune \
+            -DORT_HOME=/tmp/onnxruntime-linux-x64-${PLAIN_ORT_VERSION}
+          cmake --build tools/onnx-finetune/build --target onnx-finetune-distill-step-graph
+      - name: "End to end: generate a step graph, train with the compiled CLI, reassemble the final model"
+        run: |
+          python3 tools/onnx-finetune/scripts/make_toy_classifier.py -o /tmp/teacher.onnx \
+            --input-dim 8 --hidden-dim 32 --num-classes 4 --seed 1
+          python3 tools/onnx-finetune/scripts/make_toy_classifier.py -o /tmp/student.onnx \
+            --input-dim 8 --hidden-dim 8 --num-classes 4 --seed 2
+          python3 tools/onnx-finetune/scripts/generate_distillation_step_graph.py \
+            /tmp/student.onnx -o /tmp/step.onnx --batch-size 32
+          python3 -c "
+          import numpy as np
+          rng = np.random.default_rng(0)
+          x = rng.standard_normal((256, 8)).astype(np.float32)
+          labels = rng.integers(0, 4, size=256).astype(np.int64)
+          x.tofile('/tmp/train_input.bin')
+          labels.tofile('/tmp/train_labels.bin')
+          "
+          tools/onnx-finetune/build/onnx-finetune-distill-step-graph \
+            --step-graph /tmp/step.onnx --teacher-model /tmp/teacher.onnx \
+            --train-input /tmp/train_input.bin --train-target /tmp/train_labels.bin \
+            --num-samples 256 --epochs 5 --lr 0.05 --log-every 4 \
+            --output-weights /tmp/final_weights.bin
+          python3 tools/onnx-finetune/scripts/apply_trained_weights.py \
+            /tmp/student.onnx /tmp/step.onnx.manifest.txt /tmp/final_weights.bin \
+            -o /tmp/student_trained.onnx
+
+  distillation-graph-grad-wasm:
+    name: graph_grad distillation (wasm, via official onnxruntime-web -- no custom build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - name: Install build deps
+        run: pip install nanobind onnx numpy
+      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see CLAUDE.md)
+        run: pip install -e . --no-build-isolation
+      - name: npm install (onnxruntime-web)
+        working-directory: tools/onnx-finetune/wasm/distill_step_graph
+        run: npm install
+      - name: "node --test (trains a step graph via the official onnxruntime-web package)"
+        working-directory: tools/onnx-finetune/wasm/distill_step_graph
+        run: npm test

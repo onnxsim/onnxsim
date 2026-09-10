@@ -1150,6 +1150,15 @@ std::vector<OptStr> GradSqrt(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Div(scaled, node.output(0))};
 }
 
+std::vector<OptStr> GradLog(Backward& ctx, const onnx::NodeProto& node,
+                            const std::string& g) {
+  // d/dx log(x) = g / x. Admitted for the log-softmax term a cross-entropy
+  // or knowledge-distillation loss needs (log(softmax(x)), built from this
+  // plus GradSoftmax rather than as a fused LogSoftmax rule of its own) --
+  // singular at x = 0 the same way GradSqrt is, and for the same reason.
+  return {ctx.b().Div(g, node.input(0))};
+}
+
 std::vector<OptStr> GradTranspose(Backward& ctx, const onnx::NodeProto& node,
                                   const std::string& g) {
   const int64_t rank = static_cast<int64_t>(ctx.ShapeOf(node.input(0)).size());
@@ -1853,6 +1862,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Identity", &GradIdentity},
           {"InstanceNormalization", &GradInstanceNormalization},
           {"LayerNormalization", &GradLayerNormalization},
+          {"Log", &GradLog},
           {"MatMul", &GradMatMul},
           {"MaxPool", &GradMaxPool},
           {"Mul", &GradMul},

@@ -81,6 +81,23 @@ cmake -B build \
 cmake --build build
 ```
 
+`onnx-finetune-distill-step-graph` (see "Knowledge distillation (graph_grad)" above) is a
+separate target with a much lighter requirement -- `ORT_HOME` pointing at *any* plain
+onnxruntime distribution that ships `onnxruntime_cxx_api.h` + `libonnxruntime`, no
+`--enable_training_apis` build needed at all:
+
+```sh
+# An official prebuilt release works -- no build, no ORT_SOURCE_DIR/ORT_BUILD_DIR.
+curl -sSL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz
+tar xzf ort.tgz
+cmake -B build -DORT_HOME=$PWD/onnxruntime-linux-x64-1.19.2
+cmake --build build --target onnx-finetune-distill-step-graph
+```
+
+Both `-DORT_SOURCE_DIR`/`-DORT_BUILD_DIR` and `-DORT_HOME` can be given to the same `cmake -B
+build` invocation to build both tools at once; each is independently optional (whichever
+you omit, that tool's target is simply skipped).
+
 ## Usage
 
 ```sh
@@ -311,6 +328,56 @@ unlike `examples/llm_distillation/`'s standalone PyTorch/ONNX Runtime Web demos 
 this repo (a ~1B/~162M-parameter causal-LM pair, and a browser-trained toy Llama respectively),
 which distill actual language models. Nothing here requires `torch`/`transformers`: only
 `onnx` + a training-enabled `onnxruntime`, same as every other `generate_artifacts.py` mode.
+
+### Knowledge distillation (graph_grad) -- no training-enabled ONNX Runtime at all
+
+A second, independent implementation of the same idea, existing alongside the one above rather
+than replacing it: `scripts/generate_distillation_step_graph.py` differentiates the whole
+student forward pass and the KD loss itself with onnxsim's own reverse-mode autodiff
+(`onnxsim.graph_grad`/`onnxsim.qat_graph` -- the same machinery `onnxsim.lora`/`onnxsim.qat`
+already use to avoid `onnxruntime.training` for LoRA and block-wise QAT), instead of
+`onnxruntime.training.artifacts`/`onnxblock`. The result is **one** ordinary ONNX graph --
+forward, loss, backward, and an Adam step all baked in -- runnable by repeatedly calling
+`session.run()`/`Run()` on a **plain, non-training** onnxruntime. No `pip install
+onnxruntime-training`, no from-source `--enable_training_apis` build, anywhere in this path --
+see that script's own module docstring for the full design writeup, including the one real
+trade-off it makes (a step graph's batch size is fixed at build time; `onnxruntime.training`'s
+graph tolerates a symbolic one).
+
+```sh
+# 1. Same teacher/student pair as above.
+python3 scripts/make_toy_classifier.py -o teacher.onnx --hidden-dim 32 --num-classes 4
+python3 scripts/make_toy_classifier.py -o student.onnx --hidden-dim 8  --num-classes 4
+
+# 2. One step graph, batch size fixed at build time. Also writes step.onnx.manifest.txt
+#    and step.onnx.initial_state.bin alongside it -- a non-Python caller (the native CLI
+#    below, or the wasm runner) needs both to actually run it.
+python3 scripts/generate_distillation_step_graph.py student.onnx -o step.onnx --batch-size 32
+
+# 3. Same synthetic data as above (int64 labels; this path builds its own one-hot matrix
+#    from them on the host, see the script's docstring on why that's not done in-graph).
+python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samples 2048
+
+# 4. Train with the plain-onnxruntime native tool (see "Building" below for ORT_HOME) --
+#    a completely separate binary from ./build/onnx-finetune, built against a *plain*
+#    onnxruntime (an official prebuilt release tarball works, no build at all).
+./build/onnx-finetune-distill-step-graph \
+  --step-graph step.onnx --teacher-model teacher.onnx \
+  --train-input train_input.bin --train-target train_labels.bin --num-samples 2048 \
+  --epochs 20 --lr 0.01 --output-weights final_weights.bin
+
+# 5. Reassemble the trained weights into an ordinary, inference-ready .onnx -- the plain
+#    Ort::Session this tool uses has no ExportModelForInferencing equivalent, so this one
+#    step stays in Python, the same division of labor the rest of this repo already uses.
+python3 scripts/apply_trained_weights.py student.onnx step.onnx.manifest.txt final_weights.bin \
+  -o distilled.onnx
+```
+
+Building `onnx-finetune-distill-step-graph` needs only `-DORT_HOME=/path/to/a/plain/onnxruntime`
+(see "Building onnx-finetune" below) -- unlike `onnx-finetune` itself, it never needs
+`ORT_SOURCE_DIR`/`ORT_BUILD_DIR`. The browser has its own runner too, built on the *official*
+`onnxruntime-web` npm package rather than a custom Emscripten build: see
+`wasm/distill_step_graph/`.
 
 ## CLI reference
 
