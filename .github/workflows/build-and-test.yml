@@ -28,13 +28,19 @@ jobs:
       # a master-branch push from a pull request inside the manylinux container.
       CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2 ONNXSIM_RELEASE GITHUB_EVENT_NAME GITHUB_REF
       CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
-      # z3-solver's own wheels for linux/aarch64 require manylinux_2_38 (a newer
-      # glibc than this job's manylinux_2_28 image provides), so pip falls back
-      # to building it from source there and that build fails -- omit it only
-      # on that one matrix leg; ubuntu-24.04 (manylinux_2_27 wheel) and
-      # macos-15 (macosx_13_0 wheel, matching CIBW_ENVIRONMENT's
-      # MACOSX_DEPLOYMENT_TARGET below) both have compatible prebuilt wheels.
-      CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors${{ matrix.os != 'ubuntu-24.04-arm' && ' z3-solver' || '' }}
+      # z3-solver is intentionally NOT installed on any of these per-platform/
+      # per-Python legs: tests/test_formal_verify_*.py's own shared helper
+      # (tests/_formal_verify_common.py) does `pytest.importorskip("z3")`, so
+      # without it those ~1000 Z3 proof tests are skipped here, not run --
+      # they'd otherwise re-run identically (same Z3 queries, same Python
+      # differential logic, no OS/arch/interpreter dependence) on every one of
+      # this matrix's legs, adding ~10 minutes to each for no additional
+      # coverage. They run exactly once instead, in the dedicated
+      # test_formal_verification job below (also why z3-solver's own missing
+      # linux/aarch64 wheel -- manylinux_2_38, newer glibc than this job's
+      # manylinux_2_28 image provides -- was never actually a concern for that
+      # job specifically: it doesn't install z3-solver at all).
+      CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
       CIBW_TEST_COMMAND: pytest -v ${{ matrix.pytest_args }} {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
       # Only build on Python 3 and skip 32-bit or musl builds
@@ -102,6 +108,44 @@ jobs:
         name: python-dist-${{ matrix.os }}-${{ matrix.py_ver }}
         path: ./wheelhouse/*.whl
       if: ${{ !contains(fromJSON('["cp313"]'), matrix.py_ver) }}
+
+  # Runs onnxsim's Z3-based translation-validation proof suite
+  # (tests/test_formal_verify_*.py, plus test_fusion_patterns.py and
+  # test_ort_matmul_nbits_workaround.py) exactly ONCE, against the already-
+  # built ubuntu-24.04/cp312 wheel -- these tests are otherwise skipped (via
+  # tests/_formal_verify_common.py's own `pytest.importorskip("z3")`) on every
+  # build_wheels/test_wheels_windows_cross leg, since the Z3 queries and
+  # differential logic they exercise have no OS/arch/interpreter dependence:
+  # running the same ~10-minute suite identically on every wheel platform
+  # would just multiply CI cost with no additional coverage.
+  test_formal_verification:
+    name: Formal verification (Z3 translation-validation proofs)
+    needs: build_wheels
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        # No submodules/full history needed -- only tests/ is read here, and
+        # the wheel downloaded below already has the compiled extension.
+      - uses: actions/download-artifact@v8
+        with:
+          # Matches build_wheels' own upload-artifact naming; ubuntu-24.04 +
+          # cp312 is always built (PRs included -- see build_wheels' own
+          # py_ver matrix), so this leg is always available to depend on.
+          name: python-dist-ubuntu-24.04-cp312
+          path: wheelhouse
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install onnxsim wheel + formal-verification test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest onnxruntime ml_dtypes z3-solver
+          python -m pip install wheelhouse/onnxsim-*.whl
+      - name: Verify onnxsim under test is the built wheel
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
+      - name: Run Z3 formal-verification proof suite
+        run: |
+          pytest -v tests/test_formal_verify_*.py tests/test_fusion_patterns.py tests/test_ort_matmul_nbits_workaround.py
 
   # Windows wheels are cross-compiled on a cheap Ubuntu runner with llvm-mingw
   # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
@@ -430,7 +474,7 @@ jobs:
   upload_pypi:
     if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'push' || github.event_name == 'release')
     name: Upload to PyPI
-    needs: [build_wheels, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
+    needs: [build_wheels, test_formal_verification, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
     runs-on: ubuntu-latest
     environment:
       name: pypi
