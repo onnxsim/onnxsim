@@ -133,6 +133,68 @@ def _inline_local_functions(model: onnx.ModelProto) -> onnx.ModelProto:
     return onnx.inliner.inline_local_functions(model)
 
 
+#: Local-function op names torch's dynamo exporter can emit for a full
+#: (no explicit axis) tensor reduction, mapped to the plain ONNX op they
+#: compute when called with exactly one input and one output -- see
+#: :func:`_expand_dangling_aten_reduce_calls`'s own docstring for why this
+#: rewrite, not :func:`_inline_local_functions`, is what actually resolves
+#: it on the one CI platform observed to need it.
+_DANGLING_ATEN_REDUCE_OPS = {"aten_mean": "ReduceMean", "aten_sum": "ReduceSum"}
+
+
+def _expand_dangling_aten_reduce_calls(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Rewrites a leftover call to a torch_lib ``aten_mean``/``aten_sum``
+    local function -- one :func:`_inline_local_functions` left behind
+    because no ``FunctionProto`` defining it was actually attached to the
+    model -- into the equivalent plain ``ReduceMean``/``ReduceSum`` node.
+
+    Observed on one CI platform only (``ubuntu-24.04-arm``, ``cp311``'s own
+    torch/onnxscript/onnx build), not reproducible in this repository's own
+    dev sandbox nor on the other platforms this same test suite runs
+    against: ``torch.onnx.export(..., opset_version=17)``'s own opset
+    downgrade -- the "model version conversion ... fallback ... onnx C API"
+    path logged whenever the dynamo exporter's own native opset (18) is
+    above the one requested -- apparently strips the called local
+    function's own ``FunctionProto`` out of ``model.functions`` on that
+    platform's onnx version while leaving the node that calls it in place.
+    :func:`_inline_local_functions` only acts when ``model.functions`` is
+    non-empty, so it has nothing left to inline by the time this runs, and
+    the dangling call would otherwise reach :mod:`onnxsim.graph_grad` as an
+    unrecognized op under a non-standard domain
+    (``onnxsim.graph_grad.UnsupportedOpError: no gradient rule for op type
+    'aten_mean'``) for the single most ordinary training module there is
+    (any ``forward`` ending in a plain ``.mean()``/``.sum()``).
+
+    Only rewrites a call with exactly one input and one output: the shape
+    ``tensor.mean()``/``tensor.sum()`` with no explicit axis -- the only
+    spelling this repository's own training modules use, and the one this
+    op name (not ``aten_mean_dim``, the overload torch_lib names for an
+    explicit ``dim=``) corresponds to -- lowers to when it is *not* already
+    the ``keepdims=1``-then-``Squeeze`` pair :func:`_fold_full_reduction_squeeze`
+    handles. A call carrying a ``dim``/``keepdim`` argument (more than one
+    input) is left alone; rewriting it as a full reduction would silently
+    compute a different value than what was actually requested.
+
+    A no-op, node for node, on a model with no such dangling call -- the
+    common case, and the only one this repository's own dev sandbox ever
+    produces.
+    """
+    for node in model.graph.node:
+        target = _DANGLING_ATEN_REDUCE_OPS.get(node.op_type)
+        if (
+            target is None
+            or not node.domain
+            or len(node.input) != 1
+            or len(node.output) != 1
+        ):
+            continue
+        node.op_type = target
+        node.domain = ""
+        del node.attribute[:]
+        node.attribute.append(onnx.helper.make_attribute("keepdims", 0))
+    return model
+
+
 def _fold_full_reduction_squeeze(model: onnx.ModelProto) -> onnx.ModelProto:
     """Rewrites a full reduction's ``keepdims=1`` output immediately
     ``Squeeze``d back down to a scalar into one ``keepdims=0`` node.
@@ -425,6 +487,7 @@ def _export_via_dynamo(
                     f"`pip install onnxscript`: {error}"
                 ) from error
             model = _inline_local_functions(onnx.load(str(onnx_path)))
+            model = _expand_dangling_aten_reduce_calls(model)
             model = _fold_full_reduction_squeeze(model)
             return _strip_default_noop_with_empty_axes(model)
     finally:

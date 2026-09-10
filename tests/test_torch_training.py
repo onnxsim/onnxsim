@@ -84,6 +84,56 @@ def test_export_folds_the_full_reduction_squeeze():
     assert "ReduceMean" in ops
 
 
+def test_expand_dangling_aten_reduce_calls_rewrites_to_reducemean():
+    """Regression test for a CI-only failure (``ubuntu-24.04-arm``, ``cp311``):
+    a dangling call to a torch_lib ``aten_mean`` local function -- no
+    ``FunctionProto`` for it actually attached to the model, so
+    :func:`torch_training._inline_local_functions` has nothing to inline --
+    reaching :mod:`onnxsim.graph_grad` as an unrecognized op. Built directly
+    with ``onnx.parser`` (no torch involved) since the real failure needs a
+    torch/onnxscript/onnx combination not reproducible outside that CI
+    platform; this checks :func:`torch_training._expand_dangling_aten_reduce_calls`
+    itself performs the rewrite its own docstring describes.
+    """
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["": 17, "pkg.onnxscript.torch_lib": 1]>
+        agraph (float[4] x) => (float loss)
+        {
+            loss = pkg.onnxscript.torch_lib.aten_mean(x)
+        }
+        """
+    )
+    rewritten = torch_training._expand_dangling_aten_reduce_calls(model)
+    (node,) = rewritten.graph.node
+    assert node.op_type == "ReduceMean"
+    assert node.domain == ""
+    assert [a.name for a in node.attribute] == ["keepdims"]
+    assert node.attribute[0].i == 0
+
+
+def test_expand_dangling_aten_reduce_calls_leaves_a_dim_argument_call_alone():
+    """A call carrying more than one input (a ``dim``/``keepdim`` argument,
+    the ``aten_mean_dim`` overload's own shape) is not a full reduction and
+    must not be rewritten -- only the exact no-argument shape this
+    repository's own training modules ever produce is in scope, per
+    :func:`torch_training._expand_dangling_aten_reduce_calls`'s own
+    docstring.
+    """
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["": 17, "pkg.onnxscript.torch_lib": 1]>
+        agraph (float[4,4] x, int64[1] dim) => (float[4] loss)
+        {
+            loss = pkg.onnxscript.torch_lib.aten_mean(x, dim)
+        }
+        """
+    )
+    rewritten = torch_training._expand_dangling_aten_reduce_calls(model)
+    (node,) = rewritten.graph.node
+    assert node.op_type == "aten_mean"
+
+
 def test_compile_torch_training_loop_trains_to_match_the_true_weight():
     module = _Regression()
     example, w_true, x, y = _example_and_batch()
