@@ -139,7 +139,12 @@ jobs:
       - name: Install onnxsim wheel + formal-verification test deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest onnxruntime ml_dtypes z3-solver
+          # pytest-rerunfailures backs the @pytest.mark.flaky(...) markers on
+          # the handful of differential checks tracking onnxsim#1316 (a real,
+          # not-locally-reproducible ONNX Runtime CPU-EP quantized-kernel
+          # flake) -- see those markers for why retrying is the right call
+          # instead of loosening the bound or skipping the check outright.
+          python -m pip install pytest pytest-rerunfailures onnxruntime ml_dtypes z3-solver
           python -m pip install wheelhouse/onnxsim-*.whl
       # Run from a neutral directory (matching test_wheels_windows_cross's own
       # established fix for the identical problem): the repo root's own
