@@ -1,17 +1,18 @@
 # onnx-finetune-wasm
 
-**Distillation has a second, separate browser runner that avoids everything in this file's
-"Status" section below: `distill_step_graph/`.** It runs a step graph from
-`../scripts/generate_distillation_step_graph.py` (onnxsim's own graph_grad/qat_graph autodiff,
-not `onnxruntime.training`) via the *official* `onnxruntime-web` npm package's plain
+**Knowledge distillation runs through a completely separate browser runner that avoids
+everything in this file's "Status" section below: `distill_step_graph/`.** It runs a step
+graph from `../scripts/generate_distillation_step_graph.py` (onnxsim's own graph_grad/qat_graph
+autodiff, not `onnxruntime.training`) via the *official* `onnxruntime-web` npm package's plain
 `ort.InferenceSession` -- no Embind wrapper, no custom Emscripten build, no
 `--enable_training_apis` at all, and it sidesteps the "memory access out of bounds" bug below
 entirely (that bug is in a training-op kernel this path never touches). See
-`../README.md`'s "Knowledge distillation (graph_grad)" section and
+`../README.md`'s "Knowledge distillation" section and
 `distill_step_graph/step_graph_runner.mjs`/`.test.mjs`. Everything below this point describes
 the *other* runner (`src/onnx_finetune_wasm.cpp`, the Embind wrapper around
-`Ort::TrainingSession`), which still needs the from-source build and still has this file's own
-unresolved memory bug -- unaffected by the addition above.
+`Ort::TrainingSession`), which still needs the from-source build, still has this file's own
+unresolved memory bug, and has no distillation support of its own at all -- for that, use
+`distill_step_graph/` instead.
 
 Same training loop as `../src/main.cpp` (the native CLI), compiled to
 WebAssembly and exposed to JS via Embind instead of argv, so it can run
@@ -78,13 +79,12 @@ the very first `trainStep()` call -- but now with a real, decodable error
 instead of an opaque pointer: `RuntimeError: memory access out of bounds`,
 thrown from inside a `dynCall`/`invoke_viiiii` trampoline (an indirect call
 into a training-op kernel). Reproduces at the smallest possible scale
-(`batch=1`, the plain 2-tensor non-distillation path, the exact toy
-regression model the README's own example uses) -- not something specific
-to distillation, larger batches, or JSEP. This looks like a genuine
-wasm32-compiled-kernel memory bug in this exact onnxruntime v1.19.2 +
-emsdk 3.1.59 combination, not an application-level bug in this file or
-`../src/main.cpp` (both build clean and are exercised end to end by the
-*native* CLI without issue -- see `../README.md`'s distillation section).
+(`batch=1`, the plain 2-tensor training path, the exact toy regression
+model the README's own example uses) -- not something specific to larger
+batches or JSEP. This looks like a genuine wasm32-compiled-kernel memory
+bug in this exact onnxruntime v1.19.2 + emsdk 3.1.59 combination, not an
+application-level bug in this file or `../src/main.cpp` (both build clean
+and are exercised end to end by the *native* CLI without issue).
 Root-causing further needs bisecting onnxruntime commits/emsdk versions
 with a symbol-level (`-g`) debug build, which is out of scope here;
 `.github/workflows/onnx-finetune-training.yml`'s wasm job runs this
@@ -116,24 +116,16 @@ native CLI's loop one-for-one:
 | `OptimizerStep` | `session.optimizerStep()` |
 | `LazyResetGrad` | `session.lazyResetGrad()` |
 | `ExportModelForInferencing` + `--output-names` | `session.exportModel(['name1', ...])` -> `Uint8Array` |
-| `--teacher-model` (distillation mode) | 5-argument constructor overload: `new Module.FinetuneSession(checkpointBytes, trainingModelBytes, evalModelBytes, optimizerModelBytes, teacherModelBytes)` |
-| soft/hard loss breakdown | `session.lastSubLosses()` -> `{soft, hard}` after `trainStep()` (`undefined` outside distillation mode) |
 
 Batch construction, shuffling, and the epoch loop live in JS
 (`example/app.js`) rather than C++, same division of responsibility as the
 native CLI (C++ owns the training step, the caller owns the data loop).
 
-Distillation mode (see `../README.md`'s "Knowledge distillation" section for
-the full CLI-side recipe) needs no change to `trainStep`'s own signature:
-`target` still means whatever the training graph's `labels` input expects
-(int64 class indices, marshaled as a `Float32Array` of whole numbers -- see
-`onnx_finetune_wasm.cpp`'s `trainStep` for why: Embind typed-array bindings
-don't make mixed-dtype-per-call convenient, so the float->int64 conversion
-happens in C++ instead of asking every caller to build an `Int32Array`/
-`BigInt64Array` themselves). `FinetuneSession` internally runs a second,
-plain inference session against the teacher on each step's `input` to
-produce `teacher_logits` and feeds all three tensors to `TrainStep`, exactly
-mirroring `main.cpp`'s `--teacher-model` handling.
+`trainStep`'s `target` always means whatever the training graph's `--loss`
+mode expects, marshaled as a `Float32Array` -- there is no int64-label
+support in this binding (only `--loss cross-entropy`/distillation artifacts
+would need that, and this binding has no distillation mode of its own; see
+the top of this file for the separate `distill_step_graph/` runner).
 
 ## Building
 

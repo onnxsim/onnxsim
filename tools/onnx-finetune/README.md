@@ -90,7 +90,7 @@ cmake -B build \
 cmake --build build
 ```
 
-`onnx-finetune-distill-step-graph` (see "Knowledge distillation (graph_grad)" above) is a
+`onnx-finetune-distill-step-graph` (see "Knowledge distillation" below) is a
 separate target with a much lighter requirement -- `ORT_HOME` pointing at *any* plain
 onnxruntime distribution that ships `onnxruntime_cxx_api.h` + `libonnxruntime`, no
 `--enable_training_apis` build needed at all:
@@ -281,13 +281,23 @@ and defeat the point of keeping it full precision. NF4 quantization only
 covers 2-D MatMul/vanilla-Gemm weights (see `onnxsim/nf4.py`), so a 1x1-Conv
 LoRA target stays full precision under `prepare_qlora.py` too.
 
-## Knowledge distillation
+## Knowledge distillation -- no training-enabled ONNX Runtime at all
 
 Train a small "student" classifier to mimic a larger "teacher" via knowledge distillation
 (Hinton et al. -- temperature-scaled soft-target cross-entropy, combined with the usual
-hard-label cross-entropy): `generate_artifacts.py --loss distillation` builds a custom loss
-graph (`scripts/distillation_loss.py`) that takes a second model's logits as an extra input,
-rather than one of the three plain `--loss` enum choices above.
+hard-label cross-entropy). Unlike every other loss mode in this tool,
+`scripts/generate_distillation_step_graph.py` differentiates the whole student forward pass
+and the KD loss itself with onnxsim's own reverse-mode autodiff (`onnxsim.graph_grad`/
+`onnxsim.qat_graph` -- the same machinery `onnxsim.lora`/`onnxsim.qat` already use to avoid
+`onnxruntime.training` for LoRA and block-wise QAT), instead of going through
+`generate_artifacts.py`/`onnxruntime.training.artifacts` at all. The result is **one**
+ordinary ONNX graph -- forward, loss, backward, and an Adam step all baked in -- runnable by
+repeatedly calling `session.run()`/`Run()` on a **plain, non-training** onnxruntime. No
+`pip install onnxruntime-training`, no from-source `--enable_training_apis` build, anywhere in
+this path -- see that script's own module docstring for the full design writeup. The step
+graph's batch dimension is a `dim_param`, decided per call rather than fixed when the graph is
+built -- the same compiled graph runs any batch size, chosen freely each step via
+`--batch-size` below.
 
 ```sh
 # 1. A teacher (bigger) and a student (smaller) classifier -- any two ONNX
@@ -296,75 +306,15 @@ rather than one of the three plain `--loss` enum choices above.
 python3 scripts/make_toy_classifier.py -o teacher.onnx --hidden-dim 32 --num-classes 4
 python3 scripts/make_toy_classifier.py -o student.onnx --hidden-dim 8  --num-classes 4
 
-# 2. Training artifacts for the student only -- the teacher never enters
-#    generate_artifacts.py at all; its logits are supplied at *train* time
-#    (step 4), not baked into the artifacts. --distill-temperature/--distill-alpha
-#    default to 2.0/0.5 (1.0 = pure distillation, 0.0 = plain supervised training).
-python3 scripts/generate_artifacts.py student.onnx -o artifacts \
-  --loss distillation --distill-temperature 2.0 --distill-alpha 0.5
-
-# 3. Labels are int64 class indices, not float32 -- make_synthetic_classification_data.py
-#    writes them in that layout (see make_synthetic_data.py for the plain-regression
-#    equivalent this tool's other --loss modes use).
-python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samples 2048
-
-# 4. Train: --teacher-model runs a plain frozen inference session against
-#    --teacher-model on each batch's input to supply teacher_logits, so
-#    --train-input/--train-target stay exactly the same two files any other
-#    --loss mode uses. --label-dtype int64 is required here (see below).
-./build/onnx-finetune \
-  --artifacts-dir artifacts --teacher-model teacher.onnx \
-  --train-input train_input.bin --train-target train_labels.bin --label-dtype int64 \
-  --input-dim 8 --target-dim 1 --num-samples 2048 \
-  --batch-size 32 --epochs 20 --lr 0.01 \
-  --output-model distilled.onnx --output-names logits
-```
-
-The training graph `--loss distillation` produces declares **three** external inputs at
-runtime, in this fixed order: the model's own input, `teacher_logits`, then `labels` -- not
-the usual two -- which is exactly what `--teacher-model` mode feeds (the ordinary two data
-files, plus a teacher forward pass computed internally each step). Training also exposes the
-soft/hard sub-losses as two extra outputs (`kd_soft_loss`/`kd_hard_loss`); `--log-every`'s
-printed line includes both automatically whenever `--teacher-model` is given.
-
-The WASM binding mirrors this one-for-one: pass a 5th argument (`teacherModelBytes`) to
-`new Module.FinetuneSession(...)` to enable distillation mode -- `trainStep()`'s own JS
-signature is unchanged, and `session.lastSubLosses()` returns `{soft, hard}` after each step
-(`undefined` outside distillation mode). See `wasm/README.md`.
-
-This is a general-purpose classification loss, not tied to any particular architecture --
-unlike `examples/llm_distillation/`'s standalone PyTorch/ONNX Runtime Web demos elsewhere in
-this repo (a ~1B/~162M-parameter causal-LM pair, and a browser-trained toy Llama respectively),
-which distill actual language models. Nothing here requires `torch`/`transformers`: only
-`onnx` + a training-enabled `onnxruntime`, same as every other `generate_artifacts.py` mode.
-
-### Knowledge distillation (graph_grad) -- no training-enabled ONNX Runtime at all
-
-A second, independent implementation of the same idea, existing alongside the one above rather
-than replacing it: `scripts/generate_distillation_step_graph.py` differentiates the whole
-student forward pass and the KD loss itself with onnxsim's own reverse-mode autodiff
-(`onnxsim.graph_grad`/`onnxsim.qat_graph` -- the same machinery `onnxsim.lora`/`onnxsim.qat`
-already use to avoid `onnxruntime.training` for LoRA and block-wise QAT), instead of
-`onnxruntime.training.artifacts`/`onnxblock`. The result is **one** ordinary ONNX graph --
-forward, loss, backward, and an Adam step all baked in -- runnable by repeatedly calling
-`session.run()`/`Run()` on a **plain, non-training** onnxruntime. No `pip install
-onnxruntime-training`, no from-source `--enable_training_apis` build, anywhere in this path --
-see that script's own module docstring for the full design writeup. The step graph's batch
-dimension is a `dim_param`, decided per call rather than fixed when the graph is built -- the
-same compiled graph runs any batch size, chosen freely each step via `--batch-size` below.
-
-```sh
-# 1. Same teacher/student pair as above.
-python3 scripts/make_toy_classifier.py -o teacher.onnx --hidden-dim 32 --num-classes 4
-python3 scripts/make_toy_classifier.py -o student.onnx --hidden-dim 8  --num-classes 4
-
 # 2. One step graph with a dynamic batch dimension. Also writes step.onnx.manifest.txt
 #    and step.onnx.initial_state.bin alongside it -- a non-Python caller (the native CLI
 #    below, or the wasm runner) needs both to actually run it.
 python3 scripts/generate_distillation_step_graph.py student.onnx -o step.onnx
 
-# 3. Same synthetic data as above (int64 labels; this path builds its own one-hot matrix
-#    from them on the host, see the script's docstring on why that's not done in-graph).
+# 3. Synthetic classification data: int64 labels (this path builds its own one-hot
+#    matrix from them on the host, see the script's docstring on why that's not
+#    done in-graph) -- see make_synthetic_data.py for the plain-regression
+#    equivalent this tool's other --loss modes use.
 python3 scripts/make_synthetic_classification_data.py --num-classes 4 --num-samples 2048
 
 # 4. Train with the plain-onnxruntime native tool (see "Building" below for ORT_HOME) --
@@ -390,6 +340,13 @@ Building `onnx-finetune-distill-step-graph` needs only `-DORT_HOME=/path/to/a/pl
 `onnxruntime-web` npm package rather than a custom Emscripten build: see
 `wasm/distill_step_graph/`.
 
+This is a general-purpose classification loss, not tied to any particular architecture --
+unlike `examples/llm_distillation/`'s standalone PyTorch/ONNX Runtime Web demos elsewhere in
+this repo (a ~1B/~162M-parameter causal-LM pair, and a browser-trained toy Llama respectively),
+which distill actual language models. Nothing here requires `torch`/`transformers`, or even a
+training-enabled `onnxruntime`: only `onnx` + `numpy` to build the step graph, and a plain
+`onnxruntime`/`onnxruntime-web` to run it.
+
 ## CLI reference
 
 | flag | required | description |
@@ -405,6 +362,8 @@ Building `onnx-finetune-distill-step-graph` needs only `-DORT_HOME=/path/to/a/pl
 | `--lr` | no (default 1e-3) | |
 | `--save-checkpoint` | no | also save the post-training checkpoint (for resuming training later) |
 | `--log-every` | no (default 50) | print loss every N steps; 0 disables |
-| `--label-dtype` | no (default `float32`) | `int64` for class-index labels (`--loss cross-entropy`/`distillation`) |
-| `--teacher-model` | no | enables distillation mode: path to a frozen teacher `.onnx`, run each step to produce `teacher_logits`. Requires `--label-dtype int64` and artifacts from `--loss distillation` |
-| `--teacher-output-name` | no | which of the teacher model's outputs to use; defaults to its sole output |
+| `--label-dtype` | no (default `float32`) | `int64` for class-index labels (`--loss cross-entropy`) |
+
+`onnx-finetune-distill-step-graph`'s own flags are different (no `--artifacts-dir`,
+`--input-dim`/`--target-dim`, `--output-names`, or `--label-dtype`) -- see its own `--help` or
+the "Knowledge distillation" section above.

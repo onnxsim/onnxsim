@@ -1,39 +1,36 @@
 name: onnx-finetune training (incl. distillation)
 
 # Covers what onnx-finetune-lora.yml deliberately doesn't: generate_artifacts.py
-# itself (every --loss mode, not just distillation) plus a real training step
-# via onnxruntime.training.api -- both need a *training-enabled* onnxruntime,
-# not the plain onnxruntime that workflow installs.
+# itself (every --loss mode) plus a real training step via
+# onnxruntime.training.api -- both need a *training-enabled* onnxruntime, not
+# the plain onnxruntime that workflow installs. Neither job below is that,
+# though: generate_artifacts.py itself isn't exercised by automation here
+# (README.md documents the from-source-build recipe for running it and
+# src/main.cpp/wasm/src/onnx_finetune_wasm.cpp by hand).
 #
-# distillation-python: `pip install onnxruntime-training` (a separate,
-# official PyPI distribution) is enough -- no from-source onnxruntime build
-# needed. This covers the original onnxblock/onnxruntime.training-based
-# `--loss distillation` path (distillation_loss.py, generate_artifacts.py).
-#
-# distillation-graph-grad-native / -wasm: a second, independent distillation
-# path (scripts/generate_distillation_step_graph.py + src/distill_step_graph_
-# main.cpp + wasm/distill_step_graph/) that differentiates the KD loss with
-# onnxsim's own graph_grad/qat_graph autodiff instead of onnxruntime.training
-# -- see ../README.md's "Knowledge distillation (graph_grad)" section for the
-# full design writeup and why it exists alongside, not instead of, the
-# original path above (this repo's other --loss modes, and the native CLI's
-# TrainingSession-based src/main.cpp, still use onnxruntime.training; only
-# distillation has a second implementation). Its whole point is that the
-# resulting step graph runs on a *plain* onnxruntime/onnxruntime-web, so both
-# jobs stay cheap: a plain prebuilt onnxruntime release download (native) or
-# the official onnxruntime-web npm package (wasm), no --enable_training_apis
+# distillation-graph-grad-native / -wasm: onnx-finetune's only distillation
+# implementation (scripts/generate_distillation_step_graph.py +
+# src/distill_step_graph_main.cpp + wasm/distill_step_graph/), differentiating
+# the KD loss with onnxsim's own graph_grad/qat_graph autodiff instead of
+# onnxruntime.training -- see ../README.md's "Knowledge distillation" section
+# for the full design writeup. Its whole point is that the resulting step
+# graph runs on a *plain* onnxruntime/onnxruntime-web, so both jobs stay
+# cheap: a plain prebuilt onnxruntime release download (native) or the
+# official onnxruntime-web npm package (wasm), no --enable_training_apis
 # source build (~20-40 min; ~25-40 min again for the WASM+JSEP variant) like
-# the one that used to run here and was removed as not worth the CI cost --
-# see wasm/README.md's Status section. Both still build this repo's own
-# onnxsim wheel (ONNXSIM_BUILTIN_ORT=OFF, see the top-level CLAUDE.md note
-# that this does NOT build ONNX Runtime), since generate_distillation_step_
-# graph.py needs onnxsim.graph_grad/qat_graph importable.
+# the one that used to run here (for the old onnxruntime.training-based
+# --loss distillation path this repo no longer has) and was removed as not
+# worth the CI cost -- see wasm/README.md's Status section. Both still build
+# this repo's own onnxsim wheel (ONNXSIM_BUILTIN_ORT=OFF, see the top-level
+# CLAUDE.md note that this does NOT build ONNX Runtime), since
+# generate_distillation_step_graph.py needs onnxsim.graph_grad/qat_graph
+# importable.
 #
-# The original TrainingSession-based native CLI (src/main.cpp) and WASM
-# binding (wasm/src/onnx_finetune_wasm.cpp) -- every --loss mode except the
-# graph_grad path above -- still need that from-source build to compile at
-# all; both README.md and wasm/README.md document the recipe and how to run
-# each tool by hand, but neither is exercised by automation.
+# The TrainingSession-based native CLI (src/main.cpp) and WASM binding
+# (wasm/src/onnx_finetune_wasm.cpp) -- every non-distillation --loss mode --
+# still need that from-source build to compile at all; both README.md and
+# wasm/README.md document the recipe and how to run each tool by hand, but
+# neither is exercised by automation.
 
 on:
   workflow_dispatch:
@@ -68,39 +65,6 @@ env:
   PLAIN_ORT_VERSION: "1.19.2"
 
 jobs:
-  distillation-python:
-    name: Python (generate_artifacts.py + a real training step)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - name: Install deps (onnxruntime-training needs no source build -- see README.md)
-        run: |
-          pip install onnx numpy onnxruntime-training pytest
-          # onnxruntime/training/__init__.py unconditionally imports its `optim`
-          # submodule, which unconditionally imports torch for its (unused here)
-          # apex/FP16 optimizer-modifier interop -- found by adding the sanity-check
-          # step below and reading its traceback: "ModuleNotFoundError: No module
-          # named 'torch'". Nothing this job actually exercises (generate_artifacts.py,
-          # onnxruntime.training.api) touches that code path, but the whole package
-          # fails to import without it regardless. CPU-only build: no GPU on this
-          # runner and the training itself runs on CPU (see README.md).
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - name: Sanity-check onnxruntime.training.artifacts actually imports
-        # test_distillation.py's own pytest.importorskip("onnxruntime.training.artifacts")
-        # turns any ImportError here into a silent, all-tests-skipped run (pytest exit
-        # code 5) -- which is the right behavior for a machine that genuinely lacks a
-        # training-enabled onnxruntime, but wrong for this job, whose entire point is
-        # installing exactly that. Importing it directly, uncaught, surfaces the real
-        # traceback in the CI log instead of a bare "1 skipped".
-        run: python3 -c "import onnxruntime.training.artifacts"
-      - name: pytest tools/onnx-finetune/tests/test_distillation.py
-        run: pytest tools/onnx-finetune/tests/test_distillation.py -v
-
   distillation-graph-grad-native:
     name: graph_grad distillation (native, plain onnxruntime -- no --enable_training_apis)
     runs-on: ubuntu-24.04
@@ -149,19 +113,22 @@ jobs:
           python3 tools/onnx-finetune/scripts/make_toy_classifier.py -o /tmp/student.onnx \
             --input-dim 8 --hidden-dim 8 --num-classes 4 --seed 2
           python3 tools/onnx-finetune/scripts/generate_distillation_step_graph.py \
-            /tmp/student.onnx -o /tmp/step.onnx --batch-size 32
+            /tmp/student.onnx -o /tmp/step.onnx
           python3 -c "
           import numpy as np
           rng = np.random.default_rng(0)
-          x = rng.standard_normal((256, 8)).astype(np.float32)
-          labels = rng.integers(0, 4, size=256).astype(np.int64)
+          x = rng.standard_normal((250, 8)).astype(np.float32)
+          labels = rng.integers(0, 4, size=250).astype(np.int64)
           x.tofile('/tmp/train_input.bin')
           labels.tofile('/tmp/train_labels.bin')
           "
+          # 250 samples, --batch-size 32 -- deliberately not an even split, to
+          # exercise the step graph's dynamic batch dimension on the last,
+          # smaller step of every epoch too.
           tools/onnx-finetune/build/onnx-finetune-distill-step-graph \
             --step-graph /tmp/step.onnx --teacher-model /tmp/teacher.onnx \
             --train-input /tmp/train_input.bin --train-target /tmp/train_labels.bin \
-            --num-samples 256 --epochs 5 --lr 0.05 --log-every 4 \
+            --num-samples 250 --batch-size 32 --epochs 5 --lr 0.05 --log-every 4 \
             --output-weights /tmp/final_weights.bin
           python3 tools/onnx-finetune/scripts/apply_trained_weights.py \
             /tmp/student.onnx /tmp/step.onnx.manifest.txt /tmp/final_weights.bin \
