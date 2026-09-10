@@ -20,9 +20,10 @@
                     input.disabled = false;
                     input.removeAttribute("title");
                 }
-                // The "Load from Hugging Face" controls share the same runtimes
-                // as the file picker, so enable them together.
-                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button"]) {
+                // The "Load from Hugging Face" controls and the nanochat demo
+                // button share the same runtimes as the file picker, so enable
+                // them together.
+                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button", "nanochat-demo-button"]) {
                     const el = document.getElementById(id);
                     if (el) {
                         el.disabled = false;

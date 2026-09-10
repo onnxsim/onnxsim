@@ -5475,6 +5475,223 @@ not a contradiction; it is the two things measuring different quantities.
 So: the path is open and the model is not usable as built. Getting audio out of
 it needs higher precision through part of the network, not another rewrite.
 
+## Mixed precision on the AX650: how to ask, and what it buys
+
+The Audio8 decoder runs but sounds poor (3.33 dB), and the diagnosis was
+accumulation across 675 quantised operations rather than any single bad layer.
+Pulsar2 does expose per-layer precision, so this is the obvious lever. Pulling
+it took four builds to aim correctly, because **three of the four ways to ask
+fail without saying so.**
+
+`quant.layer_configs` is the control -- not `mix_precision_configs`, which is
+an *output* field in `quant_axmodel.json`. Its schema is not in the CLI help;
+it came out of the protobuf validator, which prints every field name when
+handed one it does not recognise, and was confirmed against
+`/opt/pulsar2/yamain/config/build_config.proto` inside the image:
+
+```protobuf
+message LayerConfig {
+  string layer_name = 1;                   // or op_type / layer_names / op_types
+  repeated string start_tensor_names = 3;  // ...or a subgraph range
+  repeated string end_tensor_names = 4;
+  common.DataType data_type = 5;           // "option: U8, S8, U16, S16, FP32"
+}
+```
+
+**Note what is not there: FP16.** It exists in `common.DataType`, but the
+documented options for layer precision are `U8, S8, U16, S16, FP32`. The
+16-bit path on this hardware is U16/S16.
+
+### Three of the four selectors fail silently
+
+| selector | result |
+| --- | --- |
+| `op_types`, ONNX op names | works |
+| `op_types`, Pulsar2's fused names | **silently ignored** -- build succeeds, request vanishes |
+| `layer_names`, pre-fusion ONNX node names | loud error: "Op of name(...) doesn't exist in model" |
+| `layer_names`, post-fusion names | works |
+
+The second row is the dangerous one, and it cost two builds that were
+**byte-identical** to the one before them -- same bit-width histogram, same
+file hash -- while appearing to succeed. Pulsar2's fused operators
+(`onnx.FullyConnected`, `onnx.RMSNormalization`, `onnx.RotaryEmbedding`,
+`onnx.Silu`) live in a different namespace from ONNX op types, so exactly the
+layers that most needed precision were the ones `op_types` could not name.
+
+That is the third time this namespace split has bitten in one session --
+after `AxQuantizedSnake` (an op that exists only after fusion) and `Topk`
+versus `TopK`. Stated once, generally: **anything keyed on ONNX op names
+silently misses whatever the compiler fuses, and fails in the direction that
+looks like success.**
+
+The working recipe is therefore: build once, read the surviving names out of
+`<output>/quant/quant_axmodel.json`, then target those.
+
+### FP32 applies, and the backend will not always take it
+
+Asked correctly, `data_type: FP32` does apply -- 8-bit tensors dropped from 378
+to 160. The build then failed in the NPU backend with
+`TileFailException: AxLayerNorm`. The AX650 is an integer engine and a float
+LayerNorm has nowhere to run, so FP32 is best treated as a request the backend
+may refuse per op, with U16 as the dependable knob.
+
+### What precision actually bought
+
+| build | 8-bit tensors | correlation | SNR |
+| --- | --- | --- | --- |
+| INT8 throughout | 2037 | 0.808 | 3.33 dB |
+| `Conv` at 16-bit | 1807 | 0.813 | 3.44 dB |
+| every ONNX op type at 16-bit | 378 | **0.908** | **7.37 dB** |
+| plus the surviving layers at 16-bit | 244 | 0.906 | -- |
+
+Doubling the bit depth is worth 4 dB, and then it **plateaus**: the last 134
+tensors bought nothing at all.
+
+**And precision cannot be the remaining constraint.** The model's input is
+already 16-bit -- a feature map of range +/-10.2 and standard deviation 1.77,
+which at 16 bits is ~86 dB of headroom against a 7.4 dB result. Nor is it a
+misalignment that would sound fine anyway: cross-correlating the two waveforms
+puts the best lag at exactly **0**, so the error is genuine and sample-wise.
+
+Roughly 78 dB is unaccounted for by tensor precision. The hypothesis recorded
+here was the one widening tensors cannot touch: Pulsar2 evaluates
+nonlinearities by **lookup table**, whose resolution is fixed no matter what
+dtype surrounds it, and this vocoder is unusually LUT-heavy -- 29 Snake
+activations plus `Silu`, `RMSNormalization` and `Gelu`.
+
+**That hypothesis is wrong, and the experiment that killed it is simple.** Hold
+the depth constant and vary only the nonlinearity: sixteen convolutions, once
+bare, once with `Relu` between each pair, once with the vocoder's own Snake.
+
+| 16 convolutions deep | correlation | SNR |
+| --- | --- | --- |
+| bare, no activation | 0.99851 | 25.13 dB |
+| `Relu` | 0.99637 | 21.32 dB |
+| **Snake (`Sin`, LUT-backed)** | 0.99855 | **25.38 dB** |
+
+Snake is the *best* of the three. Fifteen lookup tables cost nothing
+measurable; if they were the problem, that row would be far the worst.
+
+### What it actually is: about 3 dB per doubling of depth
+
+| depth (bare convolutions) | SNR | change per doubling |
+| --- | --- | --- |
+| 4 | 31.47 dB | -- |
+| 8 | 28.42 dB | -3.05 |
+| 16 | 25.13 dB | -3.29 |
+| 32 | 20.04 dB | -5.09 |
+
+Three decibels per doubling is exactly what independent per-operation errors
+accumulating **linearly in energy** produce, and the first two steps sit on it
+almost exactly. The last is steeper, so past sixteen layers the errors begin to
+compound rather than merely add.
+
+Extrapolating that curve from 32 operations to the vocoder's 675 lands around
+7 dB. The device measured **7.37**. So the vocoder's ceiling is not its
+activations, not its calibration, and not its tensor widths -- it is simply
+675 quantised operations deep.
+
+The practical consequence is worth stating plainly, because it bounds
+everything else in this file: **on this hardware INT8 accuracy is set by depth,
+and the only lever that moves it is fewer quantised operations.** Weight
+precision does not (the scale search below finds nothing), activation width
+buys 4 dB and then plateaus, and the nonlinearities are free.
+
+A smaller observation from the same run: `Relu` is 4 dB *worse* than either
+bare or Snake. It zeroes half its activations, so the calibrated range then
+covers a distribution with a spike at zero and the codes near it are wasted.
+
+Which also corrects something said above: Pulsar2's precision analysis is
+**not** structurally blind to end-to-end behaviour. The default
+`precision_analysis_mode` is `Reference`, which scores each layer against
+float inputs; `NPUBackend` is the other option. The earlier claim that the
+tool "cannot show this" should have been "does not show this by default".
+
+## Dtype coverage: the weight dtype knob is inert, and the two layouts are one
+
+If precision has to be controlled from our side, the first question is what
+the weight table can even hold. Compiling one convolution at every dtype
+`layer_configs` accepts answers it, and the answer is blunt.
+
+| requested | effect on the weight table |
+| --- | --- |
+| `weight_data_type` = S8 / U8 / U16 / FP32 | **none** -- all four tables md5-identical to the default, and the INT8 layout reads 100% of the weights in every one |
+| `weight_data_type` = S16 | build fails: `TileFailException: AxQuantizedConv, not enough values to unpack` |
+| `data_type` (activations) = U16 / FP32 | the table changes shape, 4904 -> 3752 bytes for the same 3072 weights |
+
+**The knob that names weight precision does nothing.** Four requested dtypes,
+one byte-identical table. Weights are INT8 whatever you ask for -- which is the
+fourth silently-ignored setting this toolchain has produced in a session, and
+the most consequential, because it is the exact control anyone wanting
+higher-precision weights would reach for.
+
+### What activation width actually changes
+
+It switches the addressing. A single-weight probe on the 16-bit build:
+
+| probe | bytes | rule |
+| --- | --- | --- |
+| `i = 0`, `i = 1` | 0, 18 | plane gap **18**, two channels per byte |
+| `i = 2` | 1 | `slot = i/2` |
+| `k = 1` | 16 | `slot = (Cin/2)*k + i/2` |
+| `k = 2` | 86 | `72*(32//18) + 32%18` -- chunk **18**, stride **72** |
+| `o = 1` | 216 | `A = 72*ceil((Cin/2)*K/18)` |
+| `o = 16` | 36 | bit 4 of the output channel |
+
+Those are the `llm_build` constants exactly -- the layout recorded earlier as
+"the conv layout halved". Reading every weight with them: **100.000% exact.**
+
+**And that single shape was not enough.** Sweeping the shape says the formula
+above is *incomplete*: `Conv(64,64,3)` read 50% and `Conv(16,16,3)` read 0%.
+The missing piece is the super-block term, which `Cout = 32` never exercises --
+`o % 16` and one bit above it cover exactly 32 output channels, so a
+32-channel layer cannot reveal what bit 5 costs. Discovering the constants per
+shape instead of assuming them:
+
+| shape | `a` (and the formula's answer) | bit 4 | bit 5+ | exact |
+| --- | --- | --- | --- | --- |
+| `Conv(32,32,3)` | 216 (216) | 36 | -- | 32/32 |
+| `Conv(32,32,5)` | 360 (360) | 36 | -- | 32/32 |
+| `Conv(64,32,3)` | 216 (216) | 36 | **3456** | 64/64 |
+| `Conv(64,64,3)` | 432 (432) | 36 | **6912** | 64/64 |
+| `Conv(16,16,3)` | not found | -- | -- | 0/16 |
+
+`a = 72*ceil((Cin/2)*K/18)` holds in every case it was found, and the missing
+term is `top = 16*a` -- note *without* the `+512` that `llm_build` carries and
+the `+256` the 8-bit convolution layout carries. With it, four of five shapes
+read whole.
+
+`Cin = Cout = 16` does not, and that is consistent rather than mysterious: the
+8-bit layout has its own low-channel boundary, recorded above as "where the
+1-D layout stops: 32 channels".
+
+The lesson is the one this file keeps paying for: **one shape proves a formula
+fits, not that it is the formula.** A 32-channel convolution was structurally
+incapable of exposing the term that was missing.
+
+So the two layouts decoded separately in this file are **one layout at two
+scales**: gap 36 with stride 144 for 8-bit activations, gap 18 with stride 72
+for 16-bit, identical slot arithmetic either way.
+
+**And the quantiser is an independent choice from the addressing.** The 16-bit
+convolution table uses the halved *addressing* with the *convolution*
+quantiser (`peak/127.5`, zero point 128) -- 100% exact, against 47.8% for
+`llm_build`'s own (`-signed peak/128`). Layout and encoding vary separately,
+which is worth knowing before assuming that recognising one implies the other.
+
+### The coverage table
+
+| path | addressing | quantiser |
+| --- | --- | --- |
+| 1-D convolution, 8-bit activations | gap 36, stride 144 | `peak/127.5`, +128 |
+| 2-D convolution | four 2-bit planes | `peak/127.5`, +128 |
+| dilated / transposed | per tap / per polyphase | `peak/127.5`, +128 |
+| **1-D convolution, 16-bit activations** | **gap 18, stride 72** | `peak/127.5`, +128 |
+| `llm_build` | gap 18, stride 72 | `-signed peak/128`, ties up |
+
+Five encodings, all read exactly. What none of them offers is a weight wider
+than 8 bits.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

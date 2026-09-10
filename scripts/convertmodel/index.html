@@ -217,6 +217,23 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 </div>
             </div>
         </div>
+        <div id="nanochat-demo-loader" style="margin-top: 0.6em;">
+            <label>…or try the
+                <a href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">nanochat</a>
+                demo:</label>
+            <button id="nanochat-demo-button" type="button" disabled title="Loading WebAssembly runtime…">Load nanochat demo model</button>
+            <span id="nanochat-demo-status" role="status" aria-live="polite"></span>
+            <div class="note" style="margin-top: 0.25em;">
+                Loads <code>nanochat_wasm_demo.onnx</code> (bundled with this page,
+                34KB, no network fetch beyond this page itself) -- a tiny
+                nanochat-style GPT (rotary embeddings, QK norm, Group-Query
+                Attention, <code>relu²</code> MLP) exported unsimplified from
+                <a href="https://github.com/onnxsim/onnxsim/tree/master/scripts/nanochat" target="_blank" rel="noopener">scripts/nanochat</a>
+                (nanochat itself has no ONNX export path of its own -- see that
+                directory's README for why). Runs the same Simplify / Optimize /
+                Netron / Run-inference path as an uploaded file.
+            </div>
+        </div>
         <div id="backend-loader" style="margin-top: 0.6em;">
             <label for="backend-select">…or run an
                 <a href="https://github.com/onnx/onnx/tree/main/onnx/backend/test/data" target="_blank" rel="noopener">ONNX backend test case</a>:</label>
@@ -776,6 +793,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div id="dim-params-content"></div>
         <script type="module" src="./shapes_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
+        <script type="module" src="./nanochat_demo.mjs"></script>
         <script type="module" src="./share_url.mjs"></script>
 
         <h2 id="sec-console">Console outputs:</h2>
