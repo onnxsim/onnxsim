@@ -5597,6 +5597,11 @@ and the only lever that moves it is fewer quantised operations.** Weight
 precision does not (the scale search below finds nothing), activation width
 buys 4 dB and then plateaus, and the nonlinearities are free.
 
+(That last sentence is too strong, and "Correction: weight precision *does*
+move it" below says how: re-spelling one convolution as two whose weights
+carry sixteen bits between them beats the depth law by 7 dB on the card, even
+though it doubles the operation count.)
+
 A smaller observation from the same run: `Relu` is 4 dB *worse* than either
 bare or Snake. It zeroes half its activations, so the calibrated range then
 covers a distribution with a spike at zero and the codes near it are wasted.
@@ -5606,6 +5611,113 @@ Which also corrects something said above: Pulsar2's precision analysis is
 `precision_analysis_mode` is `Reference`, which scores each layer against
 float inputs; `NPUBackend` is the other option. The earlier claim that the
 tool "cannot show this" should have been "does not show this by default".
+
+### Correction: weight precision *does* move it, but only in the right shape
+
+The claim just above -- that fewer quantised operations is the only lever --
+is too strong, and the thing that corrects it comes from
+`docs/ozaki-scheme-axera-handoff.md`. The Ozaki scheme splits a high-precision
+matrix into several low-precision components, runs a low-precision matmul on
+each, and sums them. That handoff note concluded the toolchain could not host
+it, because every documented way to pin a per-matmul scale is broken:
+`quant.highest_mix_precision` fails with `TileFailException` and `QuantONNX`'s
+QDQ path crashes Pulsar2's own PPQ pass on any `DequantizeLinear`-fed
+`MatMul`.
+
+**None of that is needed.** Split the weight and let the compiler's ordinary
+PTQ *derive* the two scales itself:
+
+```
+W_hi = the value Pulsar2's own quantiser lands on
+W_lo = W - W_hi                     # its peak is 255x smaller, per channel
+y    = conv(x, W_hi) + conv(x, W_lo)
+```
+
+Nothing asks for a scale. `W_lo`'s peak is 255x smaller, so per-tensor MinMax
+calibration gives the second convolution a 255x finer scale on its own. On a
+real conv weight the pair carries **79.5 dB** where one INT8 pass carries
+37.7 dB.
+
+`precision.py` is that rewrite, and `tests/test_axera_precision.py` pins it.
+
+#### First, a correction to how the weights are quantised at all
+
+The first error budget written for this was wrong, and wrong against something
+this repository already knew. `pulsar2_quantizer.py`'s docstring says it, read
+straight off a real `AxQuantizedConv`: activations are **per tensor,
+asymmetric U8**; weights are **per output channel, symmetric S8**. A build's
+own `quant/quant_axmodel.json` confirms both to the last digit:
+
+| tensor | policy | scale |
+| --- | --- | --- |
+| activation | `PER_TENSOR`, `ASYMMETRICAL`, `[0, 255]` | `(max - min) / 255`, `zp = round(-min/scale)` |
+| weight | `PER_CHANNEL`, `SYMMETRICAL`, `[-128, 127]` | `max\|w_c\| / 127.5`, `zp = 0` |
+
+That per-channel scale is worth about 8 dB by itself: on the same heavy-tailed
+weight, peak/rms is **14.7** per tensor but **5.6** per channel. A budget that
+assumes per-tensor weights therefore blames the weights for error they are not
+making -- and it produced a number, 3.28 dB against the vocoder's measured
+3.33 dB, close enough to look like confirmation. It was a coincidence.
+
+#### The trap: the quantiser is not idempotent
+
+The obvious residual, `W_lo = W - quantise(W)`, throws away most of the gain,
+and the reason is a half-step. A quantised channel's largest code is 127 where
+the scale assumed 127.5, so handing `W_hi` back to the compiler makes it
+derive a scale 0.4% smaller and re-round -- moving values by up to half a step,
+which is the same size as the error being corrected.
+
+| residual taken against | weight SNR |
+| --- | --- |
+| a per-*tensor* high half | 39.5 dB |
+| `W - quantise(W)` | 48.1 dB |
+| `W - compiler_view(quantise(W))` | **79.5 dB** |
+
+A hardware probe built the first way measured **no gain at all**, which is how
+the trap was found.
+
+#### On the AX650N, at two activation widths
+
+Sixteen convolutions deep, 32 channels, heavy-tailed weights, the same graph
+compiled and run on the card both ways:
+
+| activations | plain | split | change |
+| --- | --- | --- | --- |
+| U8 | 21.64 dB | 21.34 dB | **-0.30** |
+| U16 | 25.77 dB | **33.00 dB** | **+7.23** |
+
+**The split only pays when the join is wide.** It costs one extra
+convolution and one `Add`, so the output is requantised twice instead of once.
+At INT8 activations that second requantisation is worth more than the residual
+returns, and per-channel weight quantisation was already good enough that
+there was little to return. At 16-bit activations the requantisations get out
+of the way and the residual is worth 7 dB. So the `layer_configs` entry is
+part of the technique, not an optional extra -- `precision.split_op_types()`
+returns exactly the op types to promote, `Add` included.
+
+This is the first thing in this file to beat the depth law rather than obey
+it: the split *doubles* the convolution count and the result improves by 7 dB.
+Depth still sets the ceiling, but "fewer operations" is not the only way to
+move it -- fewer operations *carrying INT8-sized error* also works.
+
+#### And a calibration artifact that hid it for two builds
+
+The first two U16 probes measured +0.45 and +1.79 dB, and a simulator using
+the corrected quantisers agreed with the plain build to 0.02 dB while
+insisting the split should be worth far more. The gap was **clipping**: MinMax
+calibration ran on eight samples that did not include the evaluation input, so
+every variant clipped, and clipping error does not shrink with bit depth. It
+pinned all three variants at the same ~26 dB ceiling. With the evaluation
+input in the calibration set, the same simulation goes 25.79 -> 53.26 dB and
+the card goes 25.77 -> 33.00.
+
+Worth stating on its own, because it is cheaper than any of this: **a
+calibration set that does not cover the input costs more than the quantiser
+does, and no amount of bit depth buys it back.**
+
+The card reaching 33.00 where the model says 53.26 leaves about 20 dB
+unexplained -- a floor that is not the weights (the same simulation with
+*exact* weights reads 71 dB) and not the activation width. That is open.
 
 ### The fused-op namespace, and how to see it before you trip on it
 
@@ -6229,6 +6341,7 @@ CNN/LLM focus.
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
 | `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf` (real CNN `neu mode` node shape) and `axera_llm_layer_leaf` (real per-layer LLM shape: two `neu mode` nodes sharing one initializer) -- no real device needed to exercise the corruption check in CI. |
 | `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects both `onnxruntime`'s availability and `onnxsim` itself actually being importable (a checkout with `onnxsim`'s compiled extension not yet built fails `import onnxsim`, not just the lazy `onnxruntime` import inside it -- both are caught the same way so this degrades gracefully instead of taking `pulsar2_simulator.py`'s `import` down with it). |
+| `precision.py` | `weight_residual_split()`: rewrites `Conv`/`MatMul`/`Gemm`/`ConvTranspose` as `op(x, W_hi) + op(x, W_lo)` so two INT8 weights carry ~16 bits between them, plus `quantise_dequantise()`/`compiler_view()` (Pulsar2's per-output-channel weight quantiser, and the re-rounding the residual has to be taken against), `weight_error_db()` and `split_op_types()` (the op types to promote to `U16`, without which the split does not pay). Measured +7.23 dB on the AX650N at 16-bit activations -- see above. |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
