@@ -111,6 +111,28 @@ def test_fused_away_tensors_are_dropped(tmp_path):
     assert replay.surviving_edges(build) == {"x", "y"}
 
 
+def test_quantising_only_drops_the_movement_ops(tmp_path):
+    """`AxReshape` and friends carry codes without recomputing them. Whether
+    the card rounds their output is unresolved -- the two rules bracket the one
+    measurement rather than settling it -- so the strict rule is opt-in and the
+    default stays on the pessimistic side."""
+    fused = onnx.parser.parse_model(
+        '<ir_version: 10, opset_import: ["": 17]>'
+        " g (float[1, 4, 8] x) => (float[1, 8, 4] moved) {"
+        "   y = Relu (x)"
+        "   moved = Transpose <perm = [0, 2, 1]> (y)"
+        " }"
+    )
+    for node in fused.graph.node:
+        node.op_type = "AxQuantizedRelu" if node.op_type == "Relu" else "AxTranspose"
+    build = _write_build(tmp_path, {
+        "op": {"x": (8, 0.03, 128.0, False),
+               "y": (8, 0.02, 128.0, False),
+               "moved": (8, 0.01, 128.0, False)}}, fused_graph=fused)
+    assert replay.surviving_edges(build) == {"x", "y", "moved"}
+    assert replay.surviving_edges(build, quantising_only=True) == {"x", "y"}
+
+
 def test_no_fused_graph_means_no_filter(tmp_path):
     build = _write_build(tmp_path, {"op": {"x": (8, 0.03, 128.0, False)}})
     assert replay.surviving_edges(build) is None

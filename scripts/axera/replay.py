@@ -47,16 +47,32 @@ from onnx import helper, numpy_helper
 _ACTIVATION_BITS = (8, 16)
 
 
-def surviving_edges(build_dir):
-    """Tensor names that are still real edges in the compiler's own graph.
+#: Ax op prefixes/names whose output the hardware actually rounds. Everything
+#: else in `quant_axmodel.onnx` -- `AxReshape`, `AxSlice`, `AxTranspose`,
+#: `AxTile`, `AxPad` -- moves codes around without re-quantising them.
+_QUANTISING = ("AxQuantized", "AxQuantizeLinear", "AxRequantizeLinear")
 
-    `quant/quant_axmodel.onnx` is what Pulsar2 actually lowers -- its own
-    `AxQuantized*` ops, with fusion already applied. On the Audio8 decoder 385
-    of the float graph's 1002 tensors are gone from it, folded inside a fused
-    op. Those tensors still have entries in `quant_axmodel.json`, but nothing
-    on the card ever rounds them, so quantising them in a replay invents error
-    the hardware does not make: doing so read 1.12 dB where the card measured
-    7.37.
+
+def surviving_edges(build_dir, quantising_only=False):
+    """Tensor names the card actually rounds, from the compiler's own graph.
+
+    `quant/quant_axmodel.onnx` is what Pulsar2 lowers -- its `AxQuantized*`
+    ops, fusion applied. Two kinds of tensor in `quant_axmodel.json` are not
+    rounded on the card and must not be rounded in a replay:
+
+    * **fused away.** 385 of the Audio8 decoder's 1002 tensors are simply not
+      in that graph, folded inside an `AxQuantizedRMSNorm` or
+      `AxQuantizedRoPE`. Rounding them read 1.12 dB against a measured 7.37.
+    * **moved, not computed** (`quantising_only`, off by default). `AxReshape`,
+      `AxSlice`, `AxTranspose`, `AxTile` and `AxPad` carry codes without
+      recomputing them, so arguably nothing rounds their output either. This
+      is *not* the default because on the decoder it overshoots as badly as
+      the first rule undershoots: 23.40 dB against the same measured 7.37,
+      and the two rules bracket it rather than settling it. Ten `Reshape`
+      outputs alone are worth 4.6 dB (3.65 -> 8.23), so a movement op's output
+      is clearly rounded *sometimes*. Which is unresolved; the default stays
+      on the pessimistic side, where the answer is a lower bound rather than a
+      flattering guess.
 
     Returns `None` if the file is absent, meaning "no filter".
     """
@@ -64,11 +80,12 @@ def surviving_edges(build_dir):
     if not os.path.exists(path):
         return None
     graph = onnx.load(path, load_external_data=False).graph
-    return ({o for node in graph.node for o in node.output}
+    return ({o for node in graph.node for o in node.output
+             if not quantising_only or node.op_type.startswith(_QUANTISING)}
             | {i.name for i in graph.input})
 
 
-def load_scales(build_dir, fused_aware=True):
+def load_scales(build_dir, fused_aware=True, quantising_only=False):
     """`{tensor: (bit_width, scale, zero_point, per_channel, axis)}` for a build.
 
     `quant_axmodel.json` stores one config per (op, tensor) pair and hashes
@@ -82,7 +99,7 @@ def load_scales(build_dir, fused_aware=True):
     path = os.path.join(build_dir, "quant", "quant_axmodel.json")
     with open(path) as fh:
         doc = json.load(fh)
-    keep = surviving_edges(build_dir) if fused_aware else None
+    keep = surviving_edges(build_dir, quantising_only) if fused_aware else None
     values = doc["values"]
     out = {}
     for cfg in doc["tensor_configs"].values():
@@ -232,11 +249,12 @@ def insert_qdq(model, scales):
     return model, n_act, n_w
 
 
-def replay(model, build_dir, feeds, fused_aware=True):
+def replay(model, build_dir, feeds, fused_aware=True, quantising_only=False):
     """Run `model` as the card will run it. Returns the graph's outputs."""
     import onnxruntime as ort
 
-    scales = load_scales(build_dir, fused_aware=fused_aware)
+    scales = load_scales(build_dir, fused_aware=fused_aware,
+                         quantising_only=quantising_only)
     quantised, _, _ = insert_qdq(model, scales)
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL

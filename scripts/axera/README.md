@@ -5747,15 +5747,25 @@ Precision configurations and calibration sets can be scored against a build's
 own quantisation table with no card and no rebuild.
 
 **Where it is not yet faithful: fusion.** On the full Audio8 decoder the
-replay reads 3.65 dB against the card's 7.37 -- pessimistic, and for a
-findable reason. `quant/quant_axmodel.onnx` is the graph Pulsar2 actually
-lowers, and 385 of the float graph's 1002 tensors are simply *not in it*,
-folded inside a fused `AxQuantizedRMSNorm`, `AxQuantizedRoPE` or
-`AxQuantizedFullyConnected`. Nothing on the card rounds those, so quantising
-them invents error: doing so read 1.12 dB. Filtering to the tensors that
-survive as edges recovers 2.5 dB of the 6.3, and the rest is presumably
-higher-precision arithmetic *inside* the fused ops. So the replay is exact on
-a graph the compiler does not fuse and a lower bound on one it does.
+replay reads 3.65 dB against the card's 7.37. `quant/quant_axmodel.onnx` is
+the graph Pulsar2 actually lowers, and 385 of the float graph's 1002 tensors
+are simply *not in it*, folded inside a fused `AxQuantizedRMSNorm`,
+`AxQuantizedRoPE` or `AxQuantizedFullyConnected`. Nothing on the card rounds
+those, so quantising them invents error: doing so read 1.12 dB. Filtering to
+the tensors that survive as edges recovers 2.5 dB of the 6.3.
+
+The obvious next filter does not settle it either. `AxReshape`, `AxSlice`,
+`AxTranspose`, `AxTile` and `AxPad` move codes without recomputing them, so
+arguably nothing rounds their output; dropping those too reads **23.40 dB**,
+overshooting as far as the first rule undershot. The two rules bracket the
+measurement instead of explaining it, and ten `Reshape` outputs on their own
+are worth 4.6 dB (3.65 -> 8.23), so a movement op's output is evidently
+rounded *sometimes*. Unresolved. `replay.py` defaults to the pessimistic rule
+-- a lower bound is more useful than a flattering guess -- and offers the
+strict one as `quantising_only=True`.
+
+So: exact on a graph the compiler does not fuse, and bracketing on one it
+does.
 
 ### The fused-op namespace, and how to see it before you trip on it
 
