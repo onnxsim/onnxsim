@@ -51,6 +51,7 @@ from typing import (
 )
 
 import onnx
+import onnx.inliner
 
 from onnxsim import backend
 from onnxsim.compile_training import TrainingLoop, compile_training_loop
@@ -65,6 +66,37 @@ ExampleInputs = Union[Tuple["torch.Tensor", ...], Mapping[str, "torch.Tensor"]]
 #: The two reductions torch's dynamo exporter lowers a full-tensor
 #: `.mean()`/`.sum()` to -- see :func:`_fold_full_reduction_squeeze`.
 _FULL_REDUCE_OPS = frozenset({"ReduceMean", "ReduceSum"})
+
+
+def _inline_local_functions(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Expands every model-local ``FunctionProto`` call site into its own
+    body nodes, via ``onnx.inliner.inline_local_functions`` -- the same call
+    :func:`onnxsim.qat_graph.make_step_graph` already makes to expand
+    :mod:`onnxsim.graph_grad`'s own templated rules before a step graph
+    reaches a runtime.
+
+    Which shape torch's dynamo exporter picks for a given op -- inline nodes
+    directly, or a call to a local function (observed for both ``ReduceMean``
+    and a whole ``aten::mean`` under different torch/onnxscript versions and
+    platforms) -- is an implementation detail of that exporter version, not
+    something a caller of ``torch.onnx.export`` controls. Left un-inlined, a
+    function call node's own op type is whatever onnxscript named the
+    function (``"aten_mean"``, not ``"ReduceMean"``), which
+    :mod:`onnxsim.graph_grad` has no rule for under either name -- not
+    because the operation is undifferentiable, but because it was never
+    asked to differentiate the ops the function actually contains. Inlining
+    first makes every version's export land at the same flat, function-free
+    graph, so :func:`_fold_full_reduction_squeeze` and
+    :func:`onnxsim.compile_training_loop`'s own differentiation see the same
+    nodes regardless of which shape this particular export happened to take.
+
+    A no-op, returning ``model`` unchanged, when there are no local
+    functions to expand at all -- the common case, and the only one
+    observed locally in this repository's own dev sandbox.
+    """
+    if not model.functions:
+        return model
+    return onnx.inliner.inline_local_functions(model)
 
 
 def _fold_full_reduction_squeeze(model: onnx.ModelProto) -> onnx.ModelProto:
@@ -329,7 +361,8 @@ def export_torch_module_to_onnx(
                     "`pip install onnxsim[torch-training]` or "
                     f"`pip install onnxscript`: {error}"
                 ) from error
-            model = _fold_full_reduction_squeeze(onnx.load(str(onnx_path)))
+            model = _inline_local_functions(onnx.load(str(onnx_path)))
+            model = _fold_full_reduction_squeeze(model)
             return _strip_default_noop_with_empty_axes(model)
     finally:
         module.train(was_training)
