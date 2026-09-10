@@ -36,8 +36,7 @@ constexpr const char* kDomains[] = {"qonnx.custom_op.general",
 // with ONNX's own float family.
 const std::vector<std::string>& FloatTypes() {
   static const std::vector<std::string> types = {
-      "tensor(float)", "tensor(float16)", "tensor(bfloat16)",
-      "tensor(double)"};
+      "tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(double)"};
   return types;
 }
 
@@ -60,9 +59,10 @@ void RegisterIfAbsent(OpSchema&& schema) {
 // float" node: it quantizes its first input to an integer (or minifloat)
 // grid parameterized by the remaining inputs/attributes and returns the
 // result of dequantizing that straight back, in place -- same shape, same
-// element type as the input being quantized. `propagateShapeAndTypeFromFirstInput`
-// (used the same way for `com.microsoft`'s QLinearSigmoid/QLinearLeakyRelu/
-// QLinearSoftmax in contrib_schemas.cpp) is exactly that contract.
+// element type as the input being quantized.
+// `propagateShapeAndTypeFromFirstInput` (used the same way for
+// `com.microsoft`'s QLinearSigmoid/QLinearLeakyRelu/ QLinearSoftmax in
+// contrib_schemas.cpp) is exactly that contract.
 OpSchema MakeQuantSchema(const char* domain) {
   return OpSchema()
       .SetName("Quant")
