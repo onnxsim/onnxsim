@@ -5650,6 +5650,60 @@ The dispatch column is worth reading too. Every layer here went to
 AX650 core. A CPU fallback would show up in exactly this column, which makes
 it the cheapest check that a model really is running where it is supposed to.
 
+## An emitter for the llm_build path
+
+For convolutional models, generating mcode is blocked: 25 of the 28 operand
+slots that move between builds hold allocator addresses, and nothing predicts
+them. The `llm_build` path is different, and the difference is measurable.
+
+**A layer's mcode is a constant.** Comparing consecutive per-layer files from a
+six-layer build:
+
+| comparison | bytes differing |
+| --- | --- |
+| l1 vs l2, l2 vs l3, l3 vs l4, l4 vs l5 | **1 of 30,400** (and 1 of 38,672) |
+
+One byte, and it is not an operand: it is the ASCII digit of the model's own
+filename embedded in the stream (`..._l1_together` -> `..._l2_together`). **Zero
+instruction bytes differ between layers.** So an emitter never has to compute an
+allocator address for this path -- it clones one layer and writes weights.
+
+**Layer 0 is not always one of them.** In that same build its weight table is
+665,220 bytes against 315,012 for every other layer, and its mcode differs
+throughout -- it carries something the others do not. In a two-layer,
+4096-hidden build layer 0 was *not* special and matched layer 1 to the byte. So
+the property is "layers of the same structure are interchangeable", and the
+sizes are what tell you which those are. Checking them costs nothing and
+assuming costs a wrong model.
+
+### Writing a layer's weights
+
+The test is byte identity against Pulsar2's own output, not a correlation:
+take layer 0's table, discover where each matmul lives using layer 0's known
+weights, then write **layer 1's** weights from the checkpoint into those
+addresses and compare with the table Pulsar2 produced for layer 1.
+
+| matmul | blocks | bytes written | matching Pulsar2 |
+| --- | --- | --- | --- |
+| q, k, v, o, gate, up | 8 each | 130,023,424 | all of them |
+| `down_proj` | 21 | 45,088,768 | all of them |
+| **total** | | **175,112,192** | **175,112,192** |
+
+**98.09% of the table, and not one wrong byte.** The writer skips rows it
+cannot verify rather than guessing, which is why the error count is zero
+rather than small.
+
+The remaining 1.91% was the rows whose offsets are not a sum of bit costs --
+`k_proj`'s bit 7 costs 830,464 alone but behaves as 569,344 when bit 8 is also
+set, and no additive model expresses that. It does not need one: discovering a
+base per group of 32 rows, at 32 vectorised scans for a 1024-row matmul, reads
+**1024/1024 rows**. The gap closes.
+
+**What this does not cover.** Hidden size, head count, context length and layer
+count all change the allocator's decisions, so a reference build at the target
+shape is still required -- from Pulsar2, once. Given one, retargeting to new
+weights needs no compiler at all.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
