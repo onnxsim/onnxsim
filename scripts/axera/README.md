@@ -5700,6 +5700,24 @@ it: the split *doubles* the convolution count and the result improves by 7 dB.
 Depth still sets the ceiling, but "fewer operations" is not the only way to
 move it -- fewer operations *carrying INT8-sized error* also works.
 
+#### And on the real vocoder it does not help
+
+Splitting all 126 weighted ops of the Audio8 decoder and building it the same
+way measured **6.95 dB against the unsplit build's 7.37** -- a small loss, not
+a gain. Which the budget above predicts, and it is worth being explicit about
+why, because it bounds where this technique is worth reaching for. On that
+graph the weights are not what is binding: per output channel they read
+`e_W = 36.5 dB` against `e_Y = 35.7`, so removing the weight term entirely
+cannot buy much, while the 126 extra `Add`s each pay a requantisation. The
+probe gains 7 dB because its weights are deliberately outlier-heavy and its
+graph is sixteen ops long; the vocoder's are neither.
+
+**So the rule is `e_W` versus `e_Y`, per layer, and it has to be measured.**
+`weight_error_db` gives the first from the weight alone;
+`replay.py` below gives the second from the build. Splitting everything is the
+wrong default -- `weight_residual_split(layers=...)` and `min_peak_to_rms`
+exist for that reason.
+
 #### And a calibration artifact that hid it for two builds
 
 The first two U16 probes measured +0.45 and +1.79 dB, and a simulator using
