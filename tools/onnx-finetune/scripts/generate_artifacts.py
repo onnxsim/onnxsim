@@ -20,17 +20,10 @@ import sys
 import onnx
 from onnxruntime.training import artifacts
 
-import distillation_loss
-
 LOSS_TYPES = {
     "mse": artifacts.LossType.MSELoss,
     "cross-entropy": artifacts.LossType.CrossEntropyLoss,
     "bce": artifacts.LossType.BCEWithLogitsLoss,
-    # "distillation" isn't a plain LossType enum value (it needs a second,
-    # frozen model's logits as an extra loss input) -- handled separately in
-    # main() via distillation_loss.build_distillation_loss_class(), but
-    # listed here too so it shows up in --loss's choices/help.
-    "distillation": None,
 }
 OPTIM_TYPES = {
     "adamw": artifacts.OptimType.AdamW,
@@ -83,26 +76,7 @@ def main():
     )
     p.add_argument("--loss", choices=LOSS_TYPES, default="mse")
     p.add_argument("--optimizer", choices=OPTIM_TYPES, default="adamw")
-    p.add_argument(
-        "--distill-temperature",
-        type=float,
-        default=2.0,
-        help="--loss distillation only: softmax temperature for the soft-target term (Hinton et al.)",
-    )
-    p.add_argument(
-        "--distill-alpha",
-        type=float,
-        default=0.5,
-        help="--loss distillation only: weight on the soft-target loss vs. the hard-label loss "
-        "(1.0 = pure distillation, 0.0 = plain supervised training on --labels alone)",
-    )
     args = p.parse_args()
-
-    if args.loss == "distillation":
-        if args.distill_temperature <= 0:
-            sys.exit("error: --distill-temperature must be > 0")
-    elif args.distill_temperature != 2.0 or args.distill_alpha != 0.5:
-        sys.exit("error: --distill-temperature/--distill-alpha only apply with --loss distillation")
 
     model = onnx.load(args.model)
     all_params = [i.name for i in model.graph.initializer]
@@ -133,40 +107,15 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.loss == "distillation":
-        DistillationLoss = distillation_loss.build_distillation_loss_class()
-        artifacts.generate_artifacts(
-            model,
-            requires_grad=trainable,
-            frozen_params=frozen,
-            loss=DistillationLoss(temperature=args.distill_temperature, alpha=args.distill_alpha),
-            optimizer=OPTIM_TYPES[args.optimizer],
-            artifact_directory=args.output_dir,
-            loss_input_names=[model.graph.output[0].name, "teacher_logits", "labels"],
-            # Expose the soft/hard sub-losses as extra training outputs too,
-            # for callers (onnx-finetune's --teacher-model mode) that want
-            # to log the breakdown rather than only the combined total.
-            additional_output_names=[
-                DistillationLoss.SOFT_LOSS_OUTPUT_NAME,
-                DistillationLoss.HARD_LOSS_OUTPUT_NAME,
-            ],
-        )
-        print(
-            f"wrote distillation training artifacts -> {args.output_dir} "
-            f"(temperature={args.distill_temperature}, alpha={args.distill_alpha}; "
-            f"training graph expects 3 external inputs at runtime: the model's own input, "
-            f"'teacher_logits', 'labels' -- see ../README.md's distillation section)"
-        )
-    else:
-        artifacts.generate_artifacts(
-            model,
-            requires_grad=trainable,
-            frozen_params=frozen,
-            loss=LOSS_TYPES[args.loss],
-            optimizer=OPTIM_TYPES[args.optimizer],
-            artifact_directory=args.output_dir,
-        )
-        print("wrote training artifacts ->", args.output_dir)
+    artifacts.generate_artifacts(
+        model,
+        requires_grad=trainable,
+        frozen_params=frozen,
+        loss=LOSS_TYPES[args.loss],
+        optimizer=OPTIM_TYPES[args.optimizer],
+        artifact_directory=args.output_dir,
+    )
+    print("wrote training artifacts ->", args.output_dir)
 
     for name in ("training_model.onnx", "eval_model.onnx", "optimizer_model.onnx"):
         _clamp_ir_version(os.path.join(args.output_dir, name))

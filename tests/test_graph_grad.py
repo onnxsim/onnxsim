@@ -2037,3 +2037,106 @@ def test_the_backward_composes_into_a_step_graph_that_trains():
     )
     assert losses[-1] < losses[0] * 1e-4
     np.testing.assert_allclose(final["w2"], w2_true, rtol=1e-2, atol=1e-2)
+
+
+# --- Dynamic (dim_param) axes ------------------------------------------
+#
+# tools/onnx-finetune/scripts/generate_distillation_step_graph.py is the
+# motivating caller: a step graph whose batch size is decided at Run() time,
+# not baked in when the graph was built. _Backward.shape()/reduce_to() and
+# _grad_reduce()'s own docstrings explain the mechanism (a str shape entry is
+# handled structurally, never arithmetically) and _grad_reduce's own
+# UnsupportedOpError case for ReduceMean; these two tests are the direct,
+# caller-independent check that both actually hold.
+
+
+def test_reduce_sum_over_a_dynamic_axis_matches_finite_differences():
+    """A ``ReduceSum`` reducing *every* axis of a ``[batch, 3]`` tensor
+    (``batch`` a ``dim_param``, not a number) to a scalar -- the same shape
+    the distillation step graph's own final loss reduction has -- still
+    differentiates correctly, checked the same way every other rule in this
+    file is: against an independent float64 finite difference. The forward
+    graph is built directly (not through ``_model``/``_check``, which assume
+    every shape is fully static, right down to using it to draw random feed
+    values) since a dynamic dim needs its own concrete size supplied by the
+    *caller*, not read off the graph.
+    """
+    forward = onnx.parser.parse_model(
+        f"{_HEADER}\n"
+        "g (float[batch,3] X) => (float[] Y) { Y = ReduceSum <keepdims = 0> (X) }"
+    )
+    shapes = {"X": ["batch", 3], "Y": []}
+
+    b = qat_graph.GraphBuilder("bw_")
+    grads = graph_grad.build_backward(
+        b, list(forward.graph.node), shapes, {"Y": "dY"}, ["X"]
+    )
+    nodes = list(forward.graph.node) + list(b.nodes)
+    nodes.append(onnx.helper.make_node("Identity", [grads["X"]], ["grad_X"]))
+    graph = onnx.helper.make_graph(
+        nodes,
+        "backward",
+        list(forward.graph.input)
+        + [onnx.helper.make_tensor_value_info("dY", onnx.TensorProto.FLOAT, [])],
+        [
+            onnx.helper.make_tensor_value_info(
+                "grad_X", onnx.TensorProto.FLOAT, ["batch", 3]
+            )
+        ],
+        initializer=list(forward.graph.initializer) + list(b.initializer),
+    )
+    built = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    built.ir_version = 8
+    onnx.checker.check_model(built)
+
+    rng = np.random.default_rng(0)
+    batch = 5
+    x = rng.standard_normal((batch, 3)).astype(np.float32)
+    dy = rng.standard_normal(()).astype(np.float32)
+
+    session = ort.InferenceSession(
+        built.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    analytic = session.run(["grad_X"], {"X": x, "dY": dy})[0]
+
+    # ReduceSum's own VJP is the constant dY broadcast over every element --
+    # independent of graph_grad entirely, the most direct possible reference.
+    expected = np.full_like(x, float(dy))
+    np.testing.assert_allclose(analytic, expected, rtol=1e-6, atol=1e-6)
+
+    # And the general finite-difference check, for good measure: perturb one
+    # element of x, re-run the *forward* op itself (no graph_grad involved),
+    # and confirm the numeric derivative agrees too.
+    def forward_sum(values):
+        return float(values.astype(np.float64).sum()) * float(dy)
+
+    i = (2, 1)
+    h = 1e-3
+    x64 = x.astype(np.float64)
+    x64[i] += h
+    plus = forward_sum(x64)
+    x64[i] -= 2 * h
+    minus = forward_sum(x64)
+    fd = (plus - minus) / (2 * h)
+    np.testing.assert_allclose(float(analytic[i]), fd, rtol=1e-3)
+
+
+def test_reduce_mean_over_a_dynamic_axis_is_refused():
+    """The one rule a dynamic axis genuinely breaks: ``ReduceMean``'s ``1/N``
+    is a build-time Python float, which a size only known at ``Run()`` time
+    cannot supply -- refused with :class:`graph_grad.UnsupportedOpError`
+    rather than guessed at (a wrong constant would still produce a
+    plausible-looking, silently-scaled-wrong gradient, exactly what this
+    module's own docstring says a refusal exists to avoid)."""
+    forward = onnx.parser.parse_model(
+        f"{_HEADER}\n"
+        "g (float[batch,3] X) => (float[] Y) { Y = ReduceMean <keepdims = 0> (X) }"
+    )
+    shapes = {"X": ["batch", 3], "Y": []}
+    b = qat_graph.GraphBuilder()
+    with pytest.raises(graph_grad.UnsupportedOpError, match="ReduceMean"):
+        graph_grad.build_backward(
+            b, list(forward.graph.node), shapes, {"Y": "dY"}, ["X"]
+        )

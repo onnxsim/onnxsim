@@ -40,6 +40,7 @@ struct Args {
   std::string train_input;
   std::string train_target;  // raw int64 class indices, num_samples of them
   int64_t num_samples = 0;
+  int64_t batch_size = 0;
   int64_t epochs = 10;
   double lr = 1e-3;
   int log_every = 50;
@@ -50,17 +51,20 @@ struct Args {
   std::fprintf(stderr,
       "usage: %s --step-graph FILE --teacher-model FILE\n"
       "          --train-input FILE --train-target FILE --num-samples N\n"
-      "          --output-weights FILE [--epochs N] [--lr F] [--log-every N]\n"
-      "          [--teacher-output-name NAME]\n\n"
+      "          --batch-size N --output-weights FILE\n"
+      "          [--epochs N] [--lr F] [--log-every N] [--teacher-output-name NAME]\n\n"
       "FILE is a step graph from scripts/generate_distillation_step_graph.py;\n"
       "FILE.manifest.txt and FILE.initial_state.bin (written alongside it) are\n"
       "read too. --train-input is a raw contiguous float32 binary file\n"
       "(num_samples * input_dim floats, input_dim from the manifest);\n"
       "--train-target is num_samples raw int64 class indices (turned into the\n"
       "one-hot matrix the step graph's loss expects, via the manifest's\n"
-      "num_classes). The batch size is whatever the step graph was built for\n"
-      "(the manifest's input_shape) -- there is no --batch-size here, since\n"
-      "the graph's own shapes are fixed at build time.\n\n"
+      "num_classes). --batch-size is how many samples to feed per step --\n"
+      "freely choosable, since the step graph's batch dimension is a dim_param\n"
+      "decided at Run() time (see the manifest's 'batch' shape tokens), not\n"
+      "fixed when the graph was built. The final step of each epoch uses\n"
+      "whatever is left when num_samples does not divide evenly by\n"
+      "--batch-size, rather than dropping it.\n\n"
       "Writes the final weights as a raw float32 blob to --output-weights, in\n"
       "the manifest's own order -- reassemble them into an inference-ready\n"
       ".onnx with scripts/apply_trained_weights.py.\n",
@@ -82,6 +86,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (arg == "--train-input") a.train_input = need(i);
     else if (arg == "--train-target") a.train_target = need(i);
     else if (arg == "--num-samples") a.num_samples = std::stoll(need(i));
+    else if (arg == "--batch-size") a.batch_size = std::stoll(need(i));
     else if (arg == "--epochs") a.epochs = std::stoll(need(i));
     else if (arg == "--lr") a.lr = std::stod(need(i));
     else if (arg == "--log-every") a.log_every = std::stoi(need(i));
@@ -93,7 +98,8 @@ Args ParseArgs(int argc, char** argv) {
     }
   }
   if (a.step_graph.empty() || a.teacher_model.empty() || a.train_input.empty() ||
-      a.train_target.empty() || a.num_samples <= 0 || a.output_weights.empty()) {
+      a.train_target.empty() || a.num_samples <= 0 || a.batch_size <= 0 ||
+      a.output_weights.empty()) {
     Usage(argv[0]);
   }
   return a;
@@ -147,13 +153,18 @@ std::string SoleIoName(const Ort::Session& session, bool is_input, const char* k
   return std::string(name.get());
 }
 
+// The one shape token generate_distillation_step_graph.py ever writes that
+// isn't a decimal integer -- see that script's write_manifest_and_initial_state
+// docstring. Only ever the leading (batch) entry of input_shape/
+// teacher_logits_shape; state/weight shapes are always fully static.
+constexpr const char* kDynamicBatchToken = "batch";
+
 struct StepGraphManifest {
   std::string input_name;
-  std::vector<int64_t> input_shape;
+  std::vector<std::string> input_shape;  // tokens: ints, or "batch" once
   std::string teacher_logits_name;
-  std::vector<int64_t> teacher_logits_shape;
+  std::vector<std::string> teacher_logits_shape;  // tokens, same convention
   std::string labels_onehot_name;
-  int64_t rows = 0;
   int64_t num_classes = 0;
   std::string loss_name;
   // {state input name, state output name, shape} -- covers a weight and its
@@ -179,17 +190,15 @@ StepGraphManifest ReadManifest(const std::string& path) {
     if (tag == "input_name") {
       iss >> m.input_name;
     } else if (tag == "input_shape") {
-      int64_t d;
-      while (iss >> d) m.input_shape.push_back(d);
+      std::string tok;
+      while (iss >> tok) m.input_shape.push_back(tok);
     } else if (tag == "teacher_logits_name") {
       iss >> m.teacher_logits_name;
     } else if (tag == "teacher_logits_shape") {
-      int64_t d;
-      while (iss >> d) m.teacher_logits_shape.push_back(d);
+      std::string tok;
+      while (iss >> tok) m.teacher_logits_shape.push_back(tok);
     } else if (tag == "labels_onehot_name") {
       iss >> m.labels_onehot_name;
-    } else if (tag == "rows") {
-      iss >> m.rows;
     } else if (tag == "num_classes") {
       iss >> m.num_classes;
     } else if (tag == "loss_name") {
@@ -223,13 +232,41 @@ int64_t Prod(const std::vector<int64_t>& shape) {
   return total;
 }
 
+// The product of every non-batch dimension of a shape-token list -- for
+// input_shape this is input_dim; for teacher_logits_shape/labels_onehot this
+// is num_classes (redundant with the manifest's own num_classes field, but
+// derived the same general way rather than assuming the token layout).
+int64_t StaticDimsProduct(const std::vector<std::string>& tokens) {
+  int64_t total = 1;
+  for (const auto& tok : tokens) {
+    if (tok != kDynamicBatchToken) total *= std::stoll(tok);
+  }
+  return total;
+}
+
+// tokens with kDynamicBatchToken substituted by the batch size this
+// particular step is actually using -- static entries pass through unchanged.
+std::vector<int64_t> ResolveShape(const std::vector<std::string>& tokens, int64_t batch_size) {
+  std::vector<int64_t> shape;
+  shape.reserve(tokens.size());
+  for (const auto& tok : tokens) {
+    shape.push_back(tok == kDynamicBatchToken ? batch_size : std::stoll(tok));
+  }
+  return shape;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   Args args = ParseArgs(argc, argv);
   StepGraphManifest manifest = ReadManifest(args.step_graph + ".manifest.txt");
-  const int64_t batch_size = manifest.input_shape.empty() ? 0 : manifest.input_shape[0];
-  const int64_t input_dim = batch_size > 0 ? Prod(manifest.input_shape) / batch_size : 0;
+  // The manifest's own shapes carry the "batch" dim_param sentinel, not a
+  // number -- the step graph's batch size is decided per call by
+  // --batch-size (and, for the last step of an epoch, by whatever is left),
+  // never read off the manifest. Only the non-batch dims are fixed.
+  const int64_t max_batch_size = args.batch_size;
+  const int64_t input_dim = StaticDimsProduct(manifest.input_shape);
+  const int64_t teacher_logits_dim = StaticDimsProduct(manifest.teacher_logits_shape);
 
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "onnx-finetune-distill-step-graph");
   Ort::SessionOptions session_options;
@@ -278,10 +315,15 @@ int main(int argc, char** argv) {
   std::iota(order.begin(), order.end(), 0);
   std::mt19937 rng(42);
 
-  std::vector<float> batch_input(static_cast<size_t>(batch_size) * input_dim);
-  std::vector<int64_t> batch_labels(static_cast<size_t>(batch_size));
-  std::vector<float> batch_teacher_logits(static_cast<size_t>(Prod(manifest.teacher_logits_shape)));
-  std::vector<float> batch_onehot(static_cast<size_t>(manifest.rows) * static_cast<size_t>(manifest.num_classes));
+  // Sized for the largest batch this run ever feeds (--batch-size); the last
+  // step of an epoch, when num_samples does not divide evenly, uses a
+  // smaller current_batch_size and just leaves the tail of each buffer
+  // unused -- proof the same compiled graph really does take an arbitrary
+  // batch size, not just the one it happened to be built against.
+  std::vector<float> batch_input(static_cast<size_t>(max_batch_size) * input_dim);
+  std::vector<int64_t> batch_labels(static_cast<size_t>(max_batch_size));
+  std::vector<float> batch_teacher_logits(static_cast<size_t>(max_batch_size) * teacher_logits_dim);
+  std::vector<float> batch_onehot(static_cast<size_t>(max_batch_size) * static_cast<size_t>(manifest.num_classes));
 
   std::vector<const char*> output_name_ptrs;
   output_name_ptrs.push_back(manifest.loss_name.c_str());
@@ -295,8 +337,14 @@ int main(int argc, char** argv) {
   for (int64_t epoch = 0; epoch < args.epochs; ++epoch) {
     std::shuffle(order.begin(), order.end(), rng);
 
-    for (int64_t start = 0; start + batch_size <= args.num_samples; start += batch_size) {
-      for (int64_t b = 0; b < batch_size; ++b) {
+    for (int64_t start = 0; start < args.num_samples; start += max_batch_size) {
+      const int64_t current_batch_size = std::min(max_batch_size, args.num_samples - start);
+      const std::vector<int64_t> input_shape = ResolveShape(manifest.input_shape, current_batch_size);
+      const std::vector<int64_t> teacher_logits_shape =
+          ResolveShape(manifest.teacher_logits_shape, current_batch_size);
+      const std::vector<int64_t> onehot_shape = {current_batch_size, manifest.num_classes};
+
+      for (int64_t b = 0; b < current_batch_size; ++b) {
         int64_t src = order[start + b];
         std::copy_n(inputs.begin() + src * input_dim, input_dim, batch_input.begin() + b * input_dim);
         batch_labels[b] = labels[src];
@@ -305,19 +353,19 @@ int main(int argc, char** argv) {
       const char* teacher_input_names[] = {teacher_input_name.c_str()};
       const char* teacher_output_names[] = {teacher_output_name.c_str()};
       Ort::Value teacher_input = Ort::Value::CreateTensor<float>(
-          mem_info, batch_input.data(), batch_input.size(),
-          manifest.input_shape.data(), manifest.input_shape.size());
+          mem_info, batch_input.data(), static_cast<size_t>(current_batch_size) * input_dim,
+          input_shape.data(), input_shape.size());
       auto teacher_outputs = teacher_session.Run(
           Ort::RunOptions{nullptr}, teacher_input_names, &teacher_input, 1, teacher_output_names, 1);
-      std::copy_n(teacher_outputs[0].GetTensorData<float>(), batch_teacher_logits.size(),
-                  batch_teacher_logits.begin());
+      std::copy_n(teacher_outputs[0].GetTensorData<float>(),
+                  static_cast<size_t>(current_batch_size) * teacher_logits_dim, batch_teacher_logits.begin());
 
       // The one-hot label matrix, built here on the host rather than in the
       // step graph itself -- see generate_distillation_step_graph.py's
       // module docstring on why (keeps Cast/Greater/Less, which have no
       // graph_grad VJP rule, out of the differentiated slice entirely).
-      std::fill(batch_onehot.begin(), batch_onehot.end(), 0.0f);
-      for (int64_t r = 0; r < manifest.rows && r < batch_size; ++r) {
+      std::fill_n(batch_onehot.begin(), static_cast<size_t>(current_batch_size) * manifest.num_classes, 0.0f);
+      for (int64_t r = 0; r < current_batch_size; ++r) {
         batch_onehot[static_cast<size_t>(r) * manifest.num_classes + batch_labels[r]] = 1.0f;
       }
 
@@ -325,20 +373,21 @@ int main(int argc, char** argv) {
       std::vector<const char*> feed_names;
       feed_names.push_back(manifest.input_name.c_str());
       feeds.push_back(Ort::Value::CreateTensor<float>(
-          mem_info, batch_input.data(), batch_input.size(),
-          manifest.input_shape.data(), manifest.input_shape.size()));
+          mem_info, batch_input.data(), static_cast<size_t>(current_batch_size) * input_dim,
+          input_shape.data(), input_shape.size()));
       feed_names.push_back(manifest.teacher_logits_name.c_str());
       feeds.push_back(Ort::Value::CreateTensor<float>(
-          mem_info, batch_teacher_logits.data(), batch_teacher_logits.size(),
-          manifest.teacher_logits_shape.data(), manifest.teacher_logits_shape.size()));
-      std::vector<int64_t> onehot_shape = {manifest.rows, manifest.num_classes};
+          mem_info, batch_teacher_logits.data(), static_cast<size_t>(current_batch_size) * teacher_logits_dim,
+          teacher_logits_shape.data(), teacher_logits_shape.size()));
       feed_names.push_back(manifest.labels_onehot_name.c_str());
       feeds.push_back(Ort::Value::CreateTensor<float>(
-          mem_info, batch_onehot.data(), batch_onehot.size(), onehot_shape.data(), onehot_shape.size()));
+          mem_info, batch_onehot.data(), static_cast<size_t>(current_batch_size) * manifest.num_classes,
+          onehot_shape.data(), onehot_shape.size()));
 
       float lr = static_cast<float>(args.lr);
       float m_correction = static_cast<float>(1.0 / (1.0 - std::pow(0.9, global_step + 1)));
       float v_correction = static_cast<float>(1.0 / (1.0 - std::pow(0.999, global_step + 1)));
+      float batch_size_f = static_cast<float>(current_batch_size);
       std::vector<int64_t> scalar_shape;  // rank 0
       feed_names.push_back("lr");
       feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &lr, 1, scalar_shape.data(), 0));
@@ -346,6 +395,8 @@ int main(int argc, char** argv) {
       feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &m_correction, 1, scalar_shape.data(), 0));
       feed_names.push_back("v_correction");
       feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &v_correction, 1, scalar_shape.data(), 0));
+      feed_names.push_back("batch_size");
+      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &batch_size_f, 1, scalar_shape.data(), 0));
 
       for (const auto& [state_input, state_output, shape] : manifest.state) {
         (void)state_output;
