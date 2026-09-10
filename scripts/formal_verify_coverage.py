@@ -42,6 +42,9 @@ _NOT_A_PASS = {
     "grad_matmul",
     "grad_gemm",
     "grad_conv",
+    # onnxsim::TryExactDivide (onnxsim/sym_expr.cpp) is a shape-arithmetic
+    # primitive, not an onnxoptimizer pass either.
+    "sym_expr_exact_divide",
 }
 
 
