@@ -390,19 +390,35 @@ def compile_torch_training_loop(
 
             def forward(self, x, y):
                 y_hat = x @ self.w.T
-                return ((y_hat - y) ** 2).mean()
+                diff = y_hat - y
+                return (diff * diff).mean()  # not diff ** 2 -- see below
 
         loop = onnxsim.compile_torch_training_loop(
             Regression(), (torch.zeros(8, 3), torch.zeros(8, 2))
         )
         for x, y in batches:
-            loss = loop({"x": x.numpy(), "y": y.numpy()}, lr=1e-3)
+            loss = loop({"x": x, "y": y}, lr=1e-3)  # torch tensors, straight in
 
     The returned :class:`~onnxsim.compile_training.TrainingLoop` is an
-    ordinary one -- its ``__call__`` still takes numpy feeds, exactly as
-    :func:`onnxsim.compile_training_loop` returns for a caller who already
-    had an ONNX model. Only *building* the loop goes through torch; running
-    it does not need torch installed at all, importable or not.
+    ordinary one -- :func:`onnxsim.compile_training_loop` returns the exact
+    same type for a caller who already had an ONNX model. Only *building*
+    the loop goes through torch; running it does not need torch installed at
+    all, importable or not. Its ``__call__`` accepts a torch tensor (CPU or
+    CUDA) directly, with no ``.numpy()`` needed and, when onnxruntime is
+    installed, no extra copy either -- see
+    :mod:`onnxsim.compile_training`'s own module docstring on the DLPack
+    path this goes through.
+
+    ``diff * diff``, not ``diff ** 2``, in the example above is not a style
+    choice: ``**`` lowers to ONNX ``Pow``, which
+    :data:`onnxsim.graph_grad.SUPPORTED_OPS` has no gradient rule for, so a
+    module written with it fails at :attr:`TrainingLoop.step_graph`'s first
+    compile with :class:`onnxsim.graph_grad.UnsupportedOpError` rather than
+    training something silently wrong -- the same discipline
+    :func:`onnxsim.compile_training_loop` already holds a hand-authored ONNX
+    model to. Write a real forward the way you would for any other export
+    target: preferring ops :func:`onnxsim.graph_grad.supported_ops` lists
+    over ones that merely compute the same thing.
 
     :param module: exported via :func:`export_torch_module_to_onnx`, whose
             own docstring covers ``module.forward``'s single-scalar-output

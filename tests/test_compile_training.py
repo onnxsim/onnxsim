@@ -114,6 +114,86 @@ def test_step_graph_and_initial_state_compile_without_running_a_step():
     np.testing.assert_array_equal(state["w"], loop.initial_state["w"])
 
 
+def test_state_stays_an_ort_value_between_calls():
+    """The trained parameter and the optimizer's own moments never round-trip
+    through numpy between steps when onnxruntime is available -- see
+    ``onnxsim/compile_training.py``'s own module docstring on why. Reading
+    them out (:attr:`TrainingLoop.parameters`) still works exactly as before;
+    only the internal storage differs.
+    """
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    loop({"x": x, "y": y}, lr=5e-2)
+    assert loop._runner.supports_ort_values()
+    for value in loop._state.values():
+        assert not isinstance(value, np.ndarray)
+        assert hasattr(value, "numpy")  # an OrtValue
+    assert isinstance(loop.parameters()["w"], np.ndarray)
+
+
+def test_ort_value_and_numpy_paths_agree(monkeypatch):
+    """``__call__``'s two branches -- the onnxruntime ``OrtValue``/DLPack
+    path and the plain-numpy path used when onnxruntime is not installed --
+    must compute identical numbers; only how much gets copied between steps
+    differs. Forces the fallback via monkeypatch rather than actually
+    uninstalling onnxruntime, since this whole test file needs it either way.
+
+    The patch targets ``loop_numpy``'s own ``Runner`` instance, not the
+    class: patching the class would flip *every* loop's dispatch, including
+    ``loop_ort``'s, onto the numpy branch the moment it is applied -- exactly
+    the failure mode this test exists to catch, so it must not fall into it
+    itself.
+    """
+    model, x, y = _linear_model()
+    loop_ort = onnxsim.compile_training_loop(model, "loss", ("w",))
+
+    loop_numpy = onnxsim.compile_training_loop(model, "loss", ("w",))
+    loop_numpy.step_graph  # compile via the real, OrtValue-capable path first
+    monkeypatch.setattr(loop_numpy._runner, "supports_ort_values", lambda: False)
+    # ... then convert the state that compile produced back to plain numpy,
+    # matching what an actual no-onnxruntime compile would have stored.
+    loop_numpy._state = {k: v.numpy() for k, v in loop_numpy._state.items()}
+
+    for _ in range(20):
+        loss_ort = loop_ort({"x": x, "y": y}, lr=5e-2)
+        loss_numpy = loop_numpy({"x": x, "y": y}, lr=5e-2)
+        assert loss_ort == pytest.approx(loss_numpy, rel=1e-5)
+    np.testing.assert_allclose(
+        loop_ort.parameters()["w"], loop_numpy.parameters()["w"], rtol=1e-5
+    )
+    assert isinstance(loop_numpy._state["w"], np.ndarray)
+    assert not isinstance(loop_ort._state["w"], np.ndarray)
+
+
+def test_feeds_accept_a_dlpack_capable_array_directly():
+    """A feed value need not be a numpy array -- anything implementing
+    ``__dlpack__`` (here, a numpy array wrapped so only that protocol is
+    exposed, ruling out any other code path recognizing it) is accepted via
+    :func:`onnxsim.backend.as_ort_value` with no manual conversion."""
+
+    class _DlpackOnly:
+        """Exposes only ``__dlpack__``/``__dlpack_device__`` -- not
+        ``__array__`` or the buffer protocol -- so a numpy fallback path
+        that didn't actually go through DLPack would fail outright instead
+        of quietly working anyway."""
+
+        def __init__(self, array: np.ndarray) -> None:
+            self._array = array
+
+        def __dlpack__(self, *args, **kwargs):
+            return self._array.__dlpack__(*args, **kwargs)
+
+        def __dlpack_device__(self):
+            return self._array.__dlpack_device__()
+
+    model, x, y = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    losses = [
+        loop({"x": _DlpackOnly(x), "y": _DlpackOnly(y)}, lr=5e-2) for _ in range(50)
+    ]
+    assert losses[-1] < 0.5 * losses[0]
+
+
 def test_training_loop_reduces_loss():
     model, x, y = _linear_model()
     loop = onnxsim.compile_training_loop(model, "loss", ("w",))

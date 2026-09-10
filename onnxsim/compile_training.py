@@ -26,12 +26,27 @@ top of :mod:`onnxsim.qat_graph`'s ``run_step_graph`` -- which already runs a
 fixed set of constants -- is the calling convention: a plain callable that
 compiles itself lazily on first use and takes a fresh batch of feeds on every
 call, the shape an ordinary training loop actually has.
+
+**Copying.** When onnxruntime is installed, :meth:`TrainingLoop.__call__`
+never round-trips the trained parameters or the optimizer's own moments
+through numpy between steps: they are kept as ``onnxruntime.OrtValue``
+(:func:`onnxsim.backend.as_ort_value`/:meth:`onnxsim.backend.Runner.run_with_ort_values`)
+and threaded straight from one step's output back in as the next step's
+input. ``feeds`` -- the batch itself -- takes the same path: anything that
+implements the DLPack protocol (a torch tensor, CPU or CUDA; a numpy array
+new enough to implement it) is bound by reference rather than copied into a
+fresh buffer first. A plain ``numpy.ndarray`` too old for ``__dlpack__``
+still only pays the one copy ``OrtValue.ortvalue_from_numpy`` needs (and on
+the CPU, not even that -- it aliases). Falls back to the plain numpy path
+automatically when onnxruntime is not installed (the reference-evaluator
+backend has no ``OrtValue``/DLPack concept at all); the numbers this returns
+are identical either way, only the copying differs.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
@@ -66,6 +81,15 @@ def _int_shape(shape: Sequence[Union[int, str]]) -> Tuple[int, ...]:
     module can never produce.
     """
     return tuple(int(d) for d in shape)
+
+
+def _to_numpy(value: Any) -> np.ndarray:
+    """``value`` as a plain ``numpy.ndarray``, whether it already is one or
+    is an ``onnxruntime.OrtValue`` (``TrainingLoop``'s own state, kept as
+    ``OrtValue`` between calls when onnxruntime supports it -- see this
+    module's docstring). A numpy array has no ``.numpy()`` method of its
+    own, which is what tells the two apart here."""
+    return value.numpy() if hasattr(value, "numpy") else value
 
 
 def _static_shapes_and_types(
@@ -155,7 +179,12 @@ class TrainingLoop:
 
     _step: Optional[qat_graph.StepGraph] = field(default=None, init=False, repr=False)
     _runner: Optional[backend.Runner] = field(default=None, init=False, repr=False)
-    _state: Dict[str, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    #: The state as onnxruntime last returned it: an ``OrtValue`` per entry
+    #: when :meth:`onnxsim.backend.Runner.supports_ort_values` (kept
+    #: device-resident between calls -- see this module's own docstring),
+    #: else a plain ``numpy.ndarray`` (the reference-evaluator fallback).
+    #: Read through :func:`_to_numpy`, never assumed to be either.
+    _state: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _t: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -206,9 +235,9 @@ class TrainingLoop:
         :attr:`parameters`'s own state on every call after that.
         """
         self.step_graph  # noqa: B018 -- triggers _compile() for its side effect
-        return dict(self._state)
+        return {k: _to_numpy(v) for k, v in self._state.items()}
 
-    def __call__(self, feeds: Dict[str, np.ndarray], lr: float) -> float:
+    def __call__(self, feeds: Dict[str, Any], lr: float) -> float:
         """Runs one step on ``feeds`` (the model's own non-trained input
         tensors, e.g. ``x``/``y``) at learning rate ``lr`` and returns the
         scalar loss.
@@ -217,11 +246,51 @@ class TrainingLoop:
         advances this instance's own trained-parameter and optimizer state by
         one step; :meth:`parameters` and :meth:`export` read the state as of
         the most recent call.
+
+        ``feeds``' values are usually ``numpy.ndarray``, but anything
+        implementing the DLPack protocol (a torch tensor, CPU or CUDA) is
+        accepted directly -- see this module's own docstring on why that
+        avoids a copy, and :func:`onnxsim.backend.as_ort_value` for exactly
+        what "implementing DLPack" buys here.
         """
         if self._runner is None:
             self._compile()
         assert self._step is not None and self._runner is not None
 
+        if self._runner.supports_ort_values():
+            return self._call_with_ort_values(feeds, lr)
+        return self._call_with_numpy(feeds, lr)
+
+    def _call_with_ort_values(self, feeds: Dict[str, Any], lr: float) -> float:
+        """:meth:`__call__`'s onnxruntime path: every tensor that crosses
+        into or out of this step is an ``OrtValue``, so the trained
+        parameters and the optimizer's own moments never touch numpy between
+        calls, and a DLPack-capable ``feeds`` value never gets copied into a
+        fresh buffer first. See this module's own docstring."""
+        assert self._step is not None and self._runner is not None
+        inputs = {k: backend.as_ort_value(v) for k, v in feeds.items()}
+        inputs.update(self._state)
+        inputs["lr"] = backend.as_ort_value(lr)
+        if self.optimizer == "adam":
+            for name, value in qat_graph.adam_bias_corrections(self._t).items():
+                inputs[name] = backend.as_ort_value(value)
+
+        out = self._runner.run_with_ort_values(inputs)
+        self._state = {
+            input_name: out[output_name]
+            for input_name, output_name in self._step.state.items()
+        }
+        self._t += 1
+        assert self._step.loss_name is not None
+        return float(out[self._step.loss_name].numpy())
+
+    def _call_with_numpy(self, feeds: Dict[str, Any], lr: float) -> float:
+        """:meth:`__call__`'s fallback path, for when onnxruntime is not
+        installed and every run therefore goes through the reference
+        evaluator, which has no ``OrtValue``/DLPack concept at all: plain
+        numpy in, plain numpy out, exactly as this loop worked before the
+        onnxruntime path existed."""
+        assert self._step is not None and self._runner is not None
         inputs = {k: np.asarray(v, dtype=np.float32) for k, v in feeds.items()}
         inputs.update(self._state)
         inputs["lr"] = np.asarray(lr, dtype=np.float32)
@@ -245,7 +314,7 @@ class TrainingLoop:
                 "parameters() is only available once the loop has compiled; "
                 "call the loop at least once first"
             )
-        return {name: self._state[name] for name in self.params}
+        return {name: _to_numpy(self._state[name]) for name in self.params}
 
     def export(self) -> onnx.ModelProto:
         """The forward model with each trained parameter's initializer
@@ -374,7 +443,13 @@ class TrainingLoop:
             output_names=list(self._step.state.values()) + [self.loss_output],
             providers=self.providers,
         )
-        self._state = initial_state
+        # Uploaded once, here, rather than on every call: from this point on
+        # __call__'s onnxruntime path never sees a numpy array for its own
+        # state again (see this module's own docstring).
+        if self._runner.supports_ort_values():
+            self._state = {k: backend.as_ort_value(v) for k, v in initial_state.items()}
+        else:
+            self._state = initial_state
         self._t = 0
 
 

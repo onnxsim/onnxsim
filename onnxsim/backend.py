@@ -40,6 +40,50 @@ def has_onnxruntime() -> bool:
     return _HAS_ONNXRUNTIME
 
 
+def as_ort_value(value: Any) -> Any:
+    """``value`` as an ``onnxruntime.OrtValue``, aliasing its memory via the
+    DLPack protocol (``__dlpack__``) when ``value`` implements it, instead of
+    copying it into a fresh buffer first.
+
+    A torch tensor (CPU *or* CUDA -- DLPack carries the device along with the
+    data) and, since NumPy 2.0, a plain ``numpy.ndarray`` both implement
+    ``__dlpack__``, so both take this path: ``OrtValue.from_dlpack`` builds
+    the ``OrtValue`` as a view over the exact same memory the caller already
+    has, on whichever device it is already on. Pairs with
+    :meth:`Runner.run_with_ort_values`, which is where the copy this actually
+    saves would otherwise happen -- see that method's own docstring for the
+    loop shape this is for.
+
+    Falls back to ``OrtValue.ortvalue_from_numpy`` (which itself aliases a
+    CPU array rather than copying it, so this is still zero-copy for the
+    ordinary case -- a plain ``numpy.ndarray`` old enough to lack
+    ``__dlpack__``) for anything that does not implement the protocol at all,
+    e.g. a bare Python ``float`` (a learning rate) or ``list``. A source that
+    *claims* ``__dlpack__`` support but fails when actually called (seen in
+    the wild for a 0-d/scalar array on some numpy/DLPack version pairings) is
+    not treated as fatal: caught, and retried through the same numpy
+    fallback, so a caller never has to know in advance which path a given
+    value needs.
+
+    Requires onnxruntime; check :func:`has_onnxruntime` first -- the
+    reference-evaluator fallback used when it is not installed has no
+    ``OrtValue``/DLPack concept at all, and this raises ``RuntimeError``
+    rather than silently returning something else in that case.
+    """
+    if not _HAS_ONNXRUNTIME:
+        raise RuntimeError(
+            "as_ort_value needs onnxruntime installed; the reference-evaluator "
+            "fallback (used when it is not) has no OrtValue/DLPack concept at "
+            "all -- check has_onnxruntime() first"
+        )
+    if hasattr(value, "__dlpack__"):
+        try:
+            return rt.OrtValue.from_dlpack(value)
+        except Exception:  # noqa: BLE001 -- any DLPack failure falls back below
+            pass
+    return rt.OrtValue.ortvalue_from_numpy(np.asarray(value, dtype=np.float32))
+
+
 def _ort_profile_prefix() -> Optional[str]:
     """The file prefix for onnxruntime's built-in session profiler, or ``None``
     when it is disabled.
@@ -545,6 +589,66 @@ class Runner:
             )
         else:
             outputs = cast(List[np.ndarray], self._sess.run(self._output_names, inputs))
+        return OrderedDict(zip(self._output_names, outputs))
+
+    def supports_ort_values(self) -> bool:
+        """Whether :meth:`run_with_ort_values` is usable at all.
+
+        onnxruntime only -- the reference-evaluator fallback (used when it is
+        not installed) has no ``OrtValue``/DLPack concept, so there is no
+        equivalent path to offer in that case. A caller in a loop that wants
+        the reduced-copying path when it is available and the ordinary
+        :meth:`__call__` path otherwise should check this once, rather than
+        catching the ``RuntimeError`` :meth:`run_with_ort_values` raises.
+        """
+        return _HAS_ONNXRUNTIME
+
+    def run_with_ort_values(self, inputs: Dict[str, Any]) -> "OrderedDict[str, Any]":
+        """Runs the model on already-built ``onnxruntime.OrtValue`` inputs
+        (see :func:`as_ort_value`) and returns ``OrtValue`` outputs.
+
+        The point is what this *avoids*: :meth:`__call__` takes and returns
+        plain numpy arrays, which is exactly right for a one-shot call but
+        means every tensor is copied into a fresh onnxruntime-owned buffer on
+        the way in and copied back out to numpy on the way out -- on every
+        single call. In a loop that feeds one step's own output (a trained
+        parameter, an optimizer moment) as the next step's input, neither
+        copy has to happen at all: build the inputs once with
+        :func:`as_ort_value` (aliasing the source via DLPack where the source
+        supports it, e.g. a torch tensor -- CPU or CUDA), and thread an
+        ``OrtValue`` output straight back in as the next call's input,
+        exactly as :meth:`onnxsim.compile_training.TrainingLoop.__call__`
+        does with its own trained-parameter/optimizer state. Only a tensor
+        the caller actually reads (a scalar loss, say) needs
+        ``.numpy()`` -- see ``onnxruntime.OrtValue.numpy()`` -- ever called
+        on it.
+
+        This is a different mechanism from :meth:`bind_loop`, not a
+        replacement for it: ``bind_loop`` pre-allocates fixed device buffers
+        for a loop whose *constants* never change and whose state shape is
+        known up front, entirely inside one ``IOBinding``. This method suits
+        a loop whose inputs are fresh, externally-owned tensors every call
+        (a training loop's own batch, arriving from a
+        ``torch.utils.data.DataLoader``) -- there is no fixed buffer to
+        allocate ahead of time for those, so the win here is skipping the
+        copy into and out of a *new* one each call, not skipping the
+        transfer entirely the way a bound constant does.
+
+        :param inputs: ``{input name: OrtValue}`` for every input the model
+                declares -- typically built with :func:`as_ort_value`.
+        :raises RuntimeError: if onnxruntime is not installed; check
+                :meth:`supports_ort_values` first.
+        """
+        if not _HAS_ONNXRUNTIME:
+            raise RuntimeError(
+                "run_with_ort_values needs onnxruntime installed; the "
+                "reference-evaluator fallback (used when it is not) has no "
+                "OrtValue/DLPack concept at all -- check supports_ort_values() "
+                "first"
+            )
+        outputs = self._sess.run_with_ort_values(
+            self._output_names, inputs, self._run_options
+        )
         return OrderedDict(zip(self._output_names, outputs))
 
     def bind_loop(
