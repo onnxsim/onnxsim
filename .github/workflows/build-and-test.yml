@@ -111,36 +111,47 @@ jobs:
 
   # Runs onnxsim's Z3-based translation-validation proof suite
   # (tests/test_formal_verify_*.py, plus test_fusion_patterns.py and
-  # test_ort_matmul_nbits_workaround.py) exactly ONCE, against the already-
-  # built ubuntu-24.04/cp312 wheel -- these tests are otherwise skipped (via
-  # tests/_formal_verify_common.py's own `pytest.importorskip("z3")`) on every
-  # build_wheels/test_wheels_windows_cross leg, since the Z3 queries and
-  # differential logic they exercise have no OS/arch/interpreter dependence:
-  # running the same ~10-minute suite identically on every wheel platform
-  # would just multiply CI cost with no additional coverage.
+  # test_ort_matmul_nbits_workaround.py) exactly ONCE -- these tests are
+  # otherwise skipped (via tests/_formal_verify_common.py's own
+  # `pytest.importorskip("z3")`) on every build_wheels/test_wheels_windows_cross
+  # leg, since the Z3 queries and differential logic they exercise have no
+  # OS/arch/interpreter dependence: running the same ~10-minute suite
+  # identically on every wheel platform would just multiply CI cost with no
+  # additional coverage.
+  #
+  # Deliberately does NOT `needs: build_wheels` / download one of its
+  # artifacts: a `needs` on a matrixed job waits for every leg of that matrix
+  # (including the slowest -- macOS), which put this suite on the release
+  # critical path behind wheel platforms it has no dependence on at all. It
+  # builds its own onnxsim extension instead, the same way build_sdist does
+  # (native `pip install .`, which setup.py already configures with
+  # -DONNXSIM_BUILTIN_ORT=OFF -- identical to what the wheel build ships), so
+  # it runs fully in parallel with build_wheels rather than serialized after
+  # it.
   test_formal_verification:
     name: Formal verification (Z3 translation-validation proofs)
-    needs: build_wheels
     runs-on: ubuntu-24.04
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: LLD
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
     steps:
       - uses: actions/checkout@v7
-        # No submodules/full history needed -- only tests/ is read here, and
-        # the wheel downloaded below already has the compiled extension.
-      - uses: actions/download-artifact@v8
         with:
-          # Matches build_wheels' own upload-artifact naming; ubuntu-24.04 +
-          # cp312 is always built (PRs included -- see build_wheels' own
-          # py_ver matrix), so this leg is always available to depend on.
-          name: python-dist-ubuntu-24.04-cp312
-          path: wheelhouse
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Install onnxsim wheel + formal-verification test deps
+      - name: Install formal-verification test deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest onnxruntime ml_dtypes z3-solver
-          python -m pip install wheelhouse/onnxsim-*.whl
+          python -m pip install ninja sccache pytest onnxruntime ml_dtypes z3-solver
+      - name: Build and install onnxsim
+        run: python -m pip install -v .
       # Run from a neutral directory (matching test_wheels_windows_cross's own
       # established fix for the identical problem): the repo root's own
       # ./onnxsim/ source package (a plain Python package directory, no
@@ -149,7 +160,7 @@ jobs:
       # finds pyproject.toml's [tool.pytest.ini_options] and tests/'s own
       # sibling-module imports (e.g. _formal_verify_common) by walking up from
       # the absolute test paths given below, so nothing else needs to change.
-      - name: Verify onnxsim under test is the built wheel
+      - name: Verify onnxsim under test is the freshly built extension
         working-directory: ${{ runner.temp }}
         run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
       - name: Run Z3 formal-verification proof suite
