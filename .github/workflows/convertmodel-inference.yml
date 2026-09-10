@@ -5,10 +5,17 @@ on:
     branches: ["master"]
     paths:
       - "scripts/convertmodel/**"
+      # test:qat-blocks (qat_blocks.test.mjs) reads this fixture straight out
+      # of onnxsim/, outside scripts/convertmodel/ -- so a rule-table change
+      # there (graph_grad.py/.cpp/.h regenerating it) needs to trigger this
+      # workflow too, or the JS test's own copy of the rule list can drift
+      # unnoticed until it fails on master.
+      - "onnxsim/qat_parity_fixtures.txt"
       - ".github/workflows/convertmodel-inference.yml"
   pull_request:
     paths:
       - "scripts/convertmodel/**"
+      - "onnxsim/qat_parity_fixtures.txt"
       - ".github/workflows/convertmodel-inference.yml"
   workflow_dispatch:
 
