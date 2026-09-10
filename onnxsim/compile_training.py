@@ -31,7 +31,7 @@ call, the shape an ordinary training loop actually has.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
@@ -54,14 +54,36 @@ _OPSET = 17
 _PREFIX = "trainstep__"
 
 
+def _int_shape(shape: Sequence[Union[int, str]]) -> Tuple[int, ...]:
+    """``shape`` as a plain ``Tuple[int, ...]``.
+
+    Every entry ``_static_shapes_and_types`` returns is already a real ``int``
+    (a dynamic ``str`` dimension is refused there before this module ever
+    sees it) -- this only narrows the type back down from the
+    ``Sequence[Union[int, str]]`` :func:`onnxsim.graph_grad.build_backward`'s
+    own ``shapes`` parameter needs, for the state/constants declarations
+    below that (unlike that call) have no reason to carry a dimension this
+    module can never produce.
+    """
+    return tuple(int(d) for d in shape)
+
+
 def _static_shapes_and_types(
     model: onnx.ModelProto,
-) -> Tuple[Dict[str, List[int]], Dict[str, int]]:
+) -> Tuple[Dict[str, Sequence[Union[int, str]]], Dict[str, int]]:
     """Every tensor's static shape and element type, via shape inference.
 
     Raises if inference itself fails, or if any tensor's shape is not fully
     static -- a step graph's shapes are fixed at build time, the same
     requirement every other caller of :mod:`onnxsim.qat_graph` already meets.
+
+    Typed ``Sequence[Union[int, str]]`` per tensor -- never actually a ``str``
+    entry here, since every dimension is checked static above -- only because
+    that is :func:`onnxsim.graph_grad.build_backward`'s own ``shapes``
+    parameter type (it accepts a symbolic ``dim_param`` from callers that
+    allow one) and ``Dict`` is invariant in its value type: a ``Dict[str,
+    List[int]]`` is not a ``Dict[str, Sequence[Union[int, str]]]`` as far as
+    mypy is concerned, even though every value satisfies it structurally.
     """
     try:
         inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
@@ -70,7 +92,7 @@ def _static_shapes_and_types(
             f"cannot statically infer the model's shapes at opset {_OPSET}: {error}"
         ) from error
 
-    shapes: Dict[str, List[int]] = {}
+    shapes: Dict[str, Sequence[Union[int, str]]] = {}
     elem_types: Dict[str, int] = {}
     for value in (
         list(inferred.graph.input)
@@ -306,7 +328,7 @@ class TrainingLoop:
 
         initial_state: Dict[str, np.ndarray] = {}
         for p in self.params:
-            w_shape = tuple(shapes[p])
+            w_shape = _int_shape(shapes[p])
             grad = grads[p]
             m_input = b.name("m")
             if self.optimizer == "adam":
@@ -335,7 +357,7 @@ class TrainingLoop:
             if shape is None:
                 raise ValueError(f"no static shape for model input {inp.name!r}")
             constants[inp.name] = (
-                tuple(shape),
+                _int_shape(shape),
                 elem_types.get(inp.name, onnx.TensorProto.FLOAT),
             )
 
