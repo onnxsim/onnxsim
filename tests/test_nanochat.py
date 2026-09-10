@@ -37,6 +37,7 @@ if _NANOCHAT_DIR not in sys.path:
     sys.path.insert(0, _NANOCHAT_DIR)
 
 from model import GPT, GPTConfig  # noqa: E402
+
 from onnxsim.test_utils import export_simplify_and_check_by_python_api  # noqa: E402
 
 
@@ -50,10 +51,17 @@ from onnxsim.test_utils import export_simplify_and_check_by_python_api  # noqa: 
 def test_nanochat_export_simplify(n_kv_head):
     torch.manual_seed(0)
     config = GPTConfig(
-        sequence_len=16, vocab_size=64, n_layer=2, n_head=4, n_kv_head=n_kv_head, n_embd=32
+        sequence_len=16,
+        vocab_size=64,
+        n_layer=2,
+        n_head=4,
+        n_kv_head=n_kv_head,
+        n_embd=32,
     )
     model = GPT(config, pad_vocab_size_to=8).eval()
-    dummy_input = torch.randint(0, config.vocab_size, (1, config.sequence_len), dtype=torch.long)
+    dummy_input = torch.randint(
+        0, config.vocab_size, (1, config.sequence_len), dtype=torch.long
+    )
 
     opt = export_simplify_and_check_by_python_api(
         model,
