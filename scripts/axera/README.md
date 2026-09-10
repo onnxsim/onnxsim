@@ -5607,90 +5607,48 @@ Which also corrects something said above: Pulsar2's precision analysis is
 float inputs; `NPUBackend` is the other option. The earlier claim that the
 tool "cannot show this" should have been "does not show this by default".
 
-## Dtype coverage: the weight dtype knob is inert, and the two layouts are one
+### The fused-op namespace, and how to see it before you trip on it
 
-If precision has to be controlled from our side, the first question is what
-the weight table can even hold. Compiling one convolution at every dtype
-`layer_configs` accepts answers it, and the answer is blunt.
+Three separate mistakes in this file share one cause: **Pulsar2's operator
+names are not ONNX's.** `AxQuantizedSnake` is an operator no graph contains,
+invented during fusion. `Topk` on the vendor's support list never matches
+ONNX's `TopK`. And `layer_configs.op_types` silently ignores every fused
+operator, which produced two builds byte-identical to the one before while
+appearing to succeed.
 
-| requested | effect on the weight table |
-| --- | --- |
-| `weight_data_type` = S8 / U8 / U16 / FP32 | **none** -- all four tables md5-identical to the default, and the INT8 layout reads 100% of the weights in every one |
-| `weight_data_type` = S16 | build fails: `TileFailException: AxQuantizedConv, not enough values to unpack` |
-| `data_type` (activations) = U16 / FP32 | the table changes shape, 4904 -> 3752 bytes for the same 3072 weights |
+A finished build already carries the map, in its own
+`quant/quant_axmodel.json`. `dispatchings` lists every scheduled layer against
+its execution engine, and the name says which world it belongs to:
 
-**The knob that names weight precision does nothing.** Four requested dtypes,
-one byte-identical table. Weights are INT8 whatever you ask for -- which is the
-fourth silently-ignored setting this toolchain has produced in a session, and
-the most consequential, because it is the exact control anyone wanting
-higher-precision weights would reach for.
+```
+op_coverage.py --build-dir <output>
+  659 dispatched layers
+  AX_NPU_AX650_INT8                  659
+  reachable by op_types :            508
+  layer_names only      :            151
+      onnx.FullyConnected             56
+      onnx.RMSNormalization           17
+      onnx.pre_Reshape                16
+      onnx.RotaryEmbedding            16
+      onnx.Silu                        8
+```
 
-### What activation width actually changes
+A layer that kept its ONNX node name can be targeted by `op_types`. One that
+was fused reads `op_<n>:<name>` and is reachable **only** by `layer_names`.
 
-It switches the addressing. A single-weight probe on the 16-bit build:
+**And the `onnx.` prefix is load-bearing.** Five of the ten fused names
+observed -- `onnx.Mul`, `onnx.Gelu`, `onnx.LayerNormalization`,
+`onnx.RMSNormalization`, `onnx.RotaryEmbedding` -- strip to something ai.onnx
+also defines. So `op_types: ["Mul"]` reaches ONNX `Mul` nodes and *not* the
+fused `onnx.Mul`, a different operator entirely. Two of the rest are spelling
+traps of their own: `onnx.Matmul` is not ONNX's `MatMul`, and `pre_Reshape` /
+`pre_Transpose` exist only as fusion artefacts.
 
-| probe | bytes | rule |
-| --- | --- | --- |
-| `i = 0`, `i = 1` | 0, 18 | plane gap **18**, two channels per byte |
-| `i = 2` | 1 | `slot = i/2` |
-| `k = 1` | 16 | `slot = (Cin/2)*k + i/2` |
-| `k = 2` | 86 | `72*(32//18) + 32%18` -- chunk **18**, stride **72** |
-| `o = 1` | 216 | `A = 72*ceil((Cin/2)*K/18)` |
-| `o = 16` | 36 | bit 4 of the output channel |
-
-Those are the `llm_build` constants exactly -- the layout recorded earlier as
-"the conv layout halved". Reading every weight with them: **100.000% exact.**
-
-**And that single shape was not enough.** Sweeping the shape says the formula
-above is *incomplete*: `Conv(64,64,3)` read 50% and `Conv(16,16,3)` read 0%.
-The missing piece is the super-block term, which `Cout = 32` never exercises --
-`o % 16` and one bit above it cover exactly 32 output channels, so a
-32-channel layer cannot reveal what bit 5 costs. Discovering the constants per
-shape instead of assuming them:
-
-| shape | `a` (and the formula's answer) | bit 4 | bit 5+ | exact |
-| --- | --- | --- | --- | --- |
-| `Conv(32,32,3)` | 216 (216) | 36 | -- | 32/32 |
-| `Conv(32,32,5)` | 360 (360) | 36 | -- | 32/32 |
-| `Conv(64,32,3)` | 216 (216) | 36 | **3456** | 64/64 |
-| `Conv(64,64,3)` | 432 (432) | 36 | **6912** | 64/64 |
-| `Conv(16,16,3)` | not found | -- | -- | 0/16 |
-
-`a = 72*ceil((Cin/2)*K/18)` holds in every case it was found, and the missing
-term is `top = 16*a` -- note *without* the `+512` that `llm_build` carries and
-the `+256` the 8-bit convolution layout carries. With it, four of five shapes
-read whole.
-
-`Cin = Cout = 16` does not, and that is consistent rather than mysterious: the
-8-bit layout has its own low-channel boundary, recorded above as "where the
-1-D layout stops: 32 channels".
-
-The lesson is the one this file keeps paying for: **one shape proves a formula
-fits, not that it is the formula.** A 32-channel convolution was structurally
-incapable of exposing the term that was missing.
-
-So the two layouts decoded separately in this file are **one layout at two
-scales**: gap 36 with stride 144 for 8-bit activations, gap 18 with stride 72
-for 16-bit, identical slot arithmetic either way.
-
-**And the quantiser is an independent choice from the addressing.** The 16-bit
-convolution table uses the halved *addressing* with the *convolution*
-quantiser (`peak/127.5`, zero point 128) -- 100% exact, against 47.8% for
-`llm_build`'s own (`-signed peak/128`). Layout and encoding vary separately,
-which is worth knowing before assuming that recognising one implies the other.
-
-### The coverage table
-
-| path | addressing | quantiser |
-| --- | --- | --- |
-| 1-D convolution, 8-bit activations | gap 36, stride 144 | `peak/127.5`, +128 |
-| 2-D convolution | four 2-bit planes | `peak/127.5`, +128 |
-| dilated / transposed | per tap / per polyphase | `peak/127.5`, +128 |
-| **1-D convolution, 16-bit activations** | **gap 18, stride 72** | `peak/127.5`, +128 |
-| `llm_build` | gap 18, stride 72 | `-signed peak/128`, ties up |
-
-Five encodings, all read exactly. What none of them offers is a weight wider
-than 8 bits.
+The dispatch column is worth reading too. Every layer here went to
+`AX_NPU_AX650_INT8`; the one other engine seen in this tree,
+`AX_NPU_LAMBERT_INT8`, comes from AX8860 builds rather than being a second
+AX650 core. A CPU fallback would show up in exactly this column, which makes
+it the cheapest check that a model really is running where it is supposed to.
 
 ## LLMs: a separate pipeline onnxsim has no hook into
 
