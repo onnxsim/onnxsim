@@ -25,6 +25,12 @@ ort = pytest.importorskip("onnxruntime")
 
 _HEADER = '<ir_version: 8, opset_import: ["": 17]>'
 
+#: Whether the installed onnxruntime actually offers CUDAExecutionProvider
+#: -- gates the CUDA zero-copy test below, the same way test_backend.py's
+#: own CUDA-conditional tests check this (there in reverse, to test the
+#: *unavailable*-provider error path).
+_CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
+
 
 def _model(body: str, initializer=()) -> onnx.ModelProto:
     model = parser.parse_model(f"{_HEADER}\n{body}")
@@ -193,6 +199,52 @@ def test_feeds_accept_a_dlpack_capable_array_directly():
         loop({"x": _DlpackOnly(x), "y": _DlpackOnly(y)}, lr=5e-2) for _ in range(50)
     ]
     assert losses[-1] < 0.5 * losses[0]
+
+
+@pytest.mark.skipif(
+    not _CUDA_AVAILABLE, reason="requires a CUDA-capable onnxruntime build + GPU"
+)
+def test_cuda_feeds_and_state_are_genuinely_device_resident():
+    """The CUDA half of this module's own docstring "**CUDA.**" claim,
+    checked against real device placement rather than just against the
+    numbers: with ``providers=["CUDAExecutionProvider", ...]`` and
+    CUDA-resident ``feeds``, a fed tensor is aliased (not copied) into the
+    step, and the trained parameter/optimizer-moment state is a genuinely
+    CUDA-resident ``OrtValue`` from the first call's own output onward --
+    not silently round-tripped through host memory every step.
+
+    Built with a bare ``OrtValue`` for ``feeds`` (via
+    ``ortvalue_from_numpy(..., "cuda", 0)``) rather than a torch CUDA
+    tensor, matching this test file's own no-torch convention
+    (:mod:`onnxsim.compile_training` itself has no torch dependency) --
+    ``OrtValue`` implements ``__dlpack__``/``__dlpack_device__`` itself, so
+    :func:`onnxsim.backend.as_ort_value` takes the exact same DLPack path
+    for it as it would for a torch CUDA tensor.
+    """
+    model, x, y = _linear_model()
+    x_cuda = ort.OrtValue.ortvalue_from_numpy(x, "cuda", 0)
+    y_cuda = ort.OrtValue.ortvalue_from_numpy(y, "cuda", 0)
+    x_ptr = x_cuda.data_ptr()
+
+    loop = onnxsim.compile_training_loop(
+        model,
+        "loss",
+        ("w",),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    loop({"x": x_cuda, "y": y_cuda}, lr=1e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
+
+    # as_ort_value's DLPack path aliases x_cuda's own buffer rather than
+    # copying it -- same device pointer before and after conversion.
+    assert backend.as_ort_value(x_cuda).data_ptr() == x_ptr
+
+    # And the state a second, independent call reads stays CUDA-resident --
+    # not just the first call's own output, coincidentally still on-device.
+    loop({"x": x_cuda, "y": y_cuda}, lr=1e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
 
 
 def test_training_loop_reduces_loss():

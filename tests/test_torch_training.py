@@ -11,11 +11,18 @@ import numpy as np
 import onnx
 import pytest
 
-from onnxsim import graph_grad, torch_training
+from onnxsim import backend, graph_grad, torch_training
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("onnxscript")
 ort = pytest.importorskip("onnxruntime")
+
+#: Gates the CUDA zero-copy test below: needs both a CUDA-capable torch
+#: build with an actual GPU visible, and an onnxruntime build offering
+#: CUDAExecutionProvider.
+_CUDA_AVAILABLE = torch.cuda.is_available() and (
+    "CUDAExecutionProvider" in ort.get_available_providers()
+)
 
 
 class _Regression(torch.nn.Module):
@@ -187,6 +194,48 @@ def test_compile_torch_training_loop_trains_to_match_the_true_weight():
     losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(300)]
     assert losses[-1] < 1e-6 * losses[0]
     np.testing.assert_allclose(loop.parameters()["w"], w_true, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not _CUDA_AVAILABLE,
+    reason="requires a CUDA-capable torch build + onnxruntime + GPU",
+)
+def test_cuda_feeds_and_state_are_genuinely_device_resident():
+    """The real end-to-end version of the same claim
+    ``tests/test_compile_training.py``'s own CUDA test makes for a
+    hand-built ONNX model: a batch already on ``"cuda"`` (an ordinary torch
+    tensor, the shape a real ``DataLoader``-fed training loop actually has
+    -- see ``examples/torch_dataloader_training``) is aliased, not copied,
+    and the trained parameter/optimizer-moment state stays a genuinely
+    CUDA-resident ``OrtValue`` from the first call's own output onward. See
+    :mod:`onnxsim.compile_training`'s own module docstring, "**CUDA.**",
+    for the full claim and why the mechanism needs nothing torch- or
+    CUDA-specific of its own -- it is the same generic DLPack path
+    ``feeds`` always takes.
+    """
+    module = _Regression()
+    example, w_true, x, y = _example_and_batch()
+    loop = torch_training.compile_torch_training_loop(
+        module,
+        example,
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    x_cuda = torch.as_tensor(x, device="cuda")
+    y_cuda = torch.as_tensor(y, device="cuda")
+    x_ptr = x_cuda.data_ptr()
+
+    loop({"x": x_cuda, "y": y_cuda}, lr=5e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
+
+    # The batch tensor's own device buffer survives conversion unchanged --
+    # onnxruntime's OrtValue.from_dlpack aliased it rather than copying it.
+    assert backend.as_ort_value(x_cuda).data_ptr() == x_ptr
+
+    loop({"x": x_cuda, "y": y_cuda}, lr=5e-2)
+    for value in loop._state.values():
+        assert value.device_name() == "cuda"
 
 
 def test_params_default_to_named_parameters():

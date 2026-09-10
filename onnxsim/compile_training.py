@@ -41,6 +41,46 @@ the CPU, not even that -- it aliases). Falls back to the plain numpy path
 automatically when onnxruntime is not installed (the reference-evaluator
 backend has no ``OrtValue``/DLPack concept at all); the numbers this returns
 are identical either way, only the copying differs.
+
+**CUDA.** Genuinely zero-copy end to end: pass
+``providers=["CUDAExecutionProvider", "CPUExecutionProvider"]`` (to
+:func:`compile_training_loop`/``onnxsim.compile_torch_training_loop``) and
+feed CUDA-resident tensors (a ``torch.Tensor`` already on ``"cuda"``, or any
+other object whose ``__dlpack_device__`` reports CUDA) -- ``as_ort_value``
+is device-agnostic, so this needs no CUDA-specific code of its own, only a
+CUDA-capable ``onnxruntime`` build and a session actually configured to run
+on it. There is exactly one unavoidable host round trip: the very first
+call uploads the forward model's own initializers (``TrainingLoop``'s
+initial state), which start out as ordinary host bytes inside the ONNX
+model -- there is no tensor on the caller's side yet to alias for those.
+From the first call's own outputs on, the trained parameters and optimizer
+moments are genuinely device-resident ``OrtValue``\\ s (onnxruntime's CUDA
+kernels produce them there, and nothing here ever calls ``.numpy()`` on
+them), so every call after the first pays no host transfer for the state at
+all -- only ``feeds`` and the tiny per-step scalars (``lr``, Adam's bias
+corrections) cross the bus, and a CUDA-resident ``feeds`` tensor skips even
+that. See ``tests/test_compile_training.py``'s and
+``tests/test_torch_training.py``'s own CUDA-gated tests (skipped without a
+CUDA-capable ``onnxruntime`` and GPU) for this asserted directly against
+``OrtValue.device_name()``.
+
+**MPS / WebGPU.** No zero-copy path exists between a PyTorch MPS tensor
+(Apple's Metal backend) and onnxruntime's WebGPU execution provider today,
+and that is not something this module can paper over. Two independent
+blockers: (1) DLPack device mismatch -- an MPS tensor's own
+``__dlpack_device__`` reports ``kDLMetal``, not ``kDLWebGPU``, so
+``OrtValue.from_dlpack`` would reject it outright even if onnxruntime's
+WebGPU EP accepted external buffers at all; (2) onnxruntime's WebGPU EP
+does not expose a public API to import an externally created GPU buffer the
+way the CUDA EP does via DLPack/``IOBinding`` -- its buffer manager is
+internal. This repository's own WebGPU testing
+(``scripts/convertmodel/test/webgpu_*_demo.test.mjs``) additionally runs
+onnxruntime-web inside a headless Chromium browser via Playwright -- a
+separate process from Python entirely -- so even a hypothetical MPS/WebGPU
+DLPack bridge would still have to cross a process boundary, which is a copy
+by construction. The practical option today is the same as for any other
+unsupported source device: let ``feeds``/parameters cross to host memory
+(``.cpu()``/``.numpy()``) before they reach this module.
 """
 
 from __future__ import annotations
