@@ -18,6 +18,7 @@ Neither needs Docker, a device, or the (large, optional) `axelera-rt`/
 `axelera-devkit` install `voyager_backend.py` wraps.
 """
 
+import importlib.util
 import os
 import sys
 
@@ -33,7 +34,20 @@ _AXELERA_DIR = os.path.join(
 if _AXELERA_DIR not in sys.path:
     sys.path.insert(0, _AXELERA_DIR)
 
-import legalize  # noqa: E402
+# scripts/axera/legalize.py and scripts/axelera/legalize.py are two different,
+# same-named modules -- a plain `import legalize` here would share one
+# `sys.modules["legalize"]` entry with tests/test_axera_legalize.py's own
+# `import legalize` (whichever of the two collects first "wins", silently
+# handing the other test file the wrong module). Load this one under a
+# private key instead, so the two never collide regardless of collection
+# order.
+_spec = importlib.util.spec_from_file_location(
+    "axelera_legalize", os.path.join(_AXELERA_DIR, "legalize.py")
+)
+legalize = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = legalize
+_spec.loader.exec_module(legalize)
+
 import voyager_simulator as sim  # noqa: E402
 
 
