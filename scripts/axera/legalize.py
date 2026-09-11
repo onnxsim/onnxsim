@@ -622,6 +622,37 @@ def global_pool_to_reduce(model):
     return changed
 
 
+def _unfusable_bias(model, name, width):
+    """A copy of bias `name` shaped `[1, width]` instead of `[width]`.
+
+    `MatMul(live) + Add(constant 1-D)` is exactly what
+    `fuse_matmul_add_bias_into_gemm` matches, and skipping that pass in
+    onnxsim is not enough -- **Pulsar2 runs its own optimizer and fuses it
+    back**, into a `Gemm` whose weight is live, which it then cannot lower.
+    It does not say so: the build dies inside PPQ's calibrator with
+    `ValueError('The truth value of an array with more than one element is
+    ambiguous')`, naming no node.
+
+    Measured on the four-node repro this was bisected down to: a 1-D constant
+    bias fails, the same values shaped `[1, N]` build, and so does an
+    `Identity` wedged between the `MatMul` and the `Add`. The reshape is the
+    better of the two -- it adds no node, and an `Identity` is exactly what a
+    later dead-code pass would remove, putting the bug back.
+    """
+    for init in model.graph.initializer:
+        if init.name != name:
+            continue
+        values = numpy_helper.to_array(init)
+        if values.ndim != 1:
+            return name
+        wide = _unique_name(model, f"{name}_rank2")
+        model.graph.initializer.append(
+            numpy_helper.from_array(values.reshape(1, -1), wide)
+        )
+        return wide
+    return name
+
+
 def gemm_to_matmul(model):
     """A `Gemm` whose `B` is a live tensor becomes `MatMul` (plus what it drops).
 
@@ -697,7 +728,7 @@ def gemm_to_matmul(model):
             )
             cur = nxt
         if len(node.input) >= 3:
-            c = node.input[2]
+            c = _unfusable_bias(model, node.input[2], 0)
             if beta != 1.0:
                 k = _unique_name(model, f"{stem}_beta")
                 model.graph.initializer.append(
@@ -723,7 +754,7 @@ def gemm_to_matmul(model):
     return changed
 
 
-def act_weight_conv_to_matmul(model):
+def act_weight_conv_to_matmul(model, fuse=True):
     """A `Conv` whose weight is a live tensor becomes one `MatMul` per tap.
 
     Pulsar2 has an op for a runtime weight -- the error names
@@ -822,6 +853,7 @@ def act_weight_conv_to_matmul(model):
         )
 
         acc = None
+        tap_x, tap_w = [], []
         taps = [()]
         for j in range(nd):
             taps = [t + (k,) for t in taps for k in range(ksize[j])]
@@ -857,28 +889,71 @@ def act_weight_conv_to_matmul(model):
                     name=_unique_name(model, f"{stem}_WR{label}"),
                 )
             )
-            prod = _unique_name(model, f"{stem}_m{label}")
+            tap_x.append(cur_x)
+            tap_w.append(flat)
+
+        # sum_k X_k @ W_k is one matmul over the concatenation:
+        #   [X_0 | ... | X_{K-1}] @ [W_0 ; ... ; W_{K-1}]
+        # exactly, because the taps share an output and differ only along the
+        # reduction axis. For a 3x3 that is 9 MatMuls and 8 Adds replaced by
+        # two Concats and one MatMul nine times deeper -- fewer nodes to
+        # schedule, and an arithmetic intensity the matrix unit can actually
+        # use. `fuse` exists so the unfused form stays reachable for
+        # bisecting a compiler that dislikes one of them.
+        if fuse and len(tap_x) > 1:
+            xcat = _unique_name(model, f"{stem}_xcat")
+            wcat = _unique_name(model, f"{stem}_wcat")
+            made.append(
+                helper.make_node(
+                    "Concat",
+                    tap_x,
+                    [xcat],
+                    axis=-1,
+                    name=_unique_name(model, f"{stem}_XC"),
+                )
+            )
+            made.append(
+                helper.make_node(
+                    "Concat",
+                    tap_w,
+                    [wcat],
+                    axis=0,
+                    name=_unique_name(model, f"{stem}_WC"),
+                )
+            )
+            acc = _unique_name(model, f"{stem}_mm")
             made.append(
                 helper.make_node(
                     "MatMul",
-                    [cur_x, flat],
-                    [prod],
-                    name=_unique_name(model, f"{stem}_MM{label}"),
+                    [xcat, wcat],
+                    [acc],
+                    name=_unique_name(model, f"{stem}_MM"),
                 )
             )
-            if acc is None:
-                acc = prod
-            else:
-                nxt = _unique_name(model, f"{stem}_a{label}")
+        else:
+            for i, (xk, wk) in enumerate(zip(tap_x, tap_w)):
+                prod = _unique_name(model, f"{stem}_m{i}")
                 made.append(
                     helper.make_node(
-                        "Add",
-                        [acc, prod],
-                        [nxt],
-                        name=_unique_name(model, f"{stem}_AD{label}"),
+                        "MatMul",
+                        [xk, wk],
+                        [prod],
+                        name=_unique_name(model, f"{stem}_MM{i}"),
                     )
                 )
-                acc = nxt
+                if acc is None:
+                    acc = prod
+                else:
+                    nxt = _unique_name(model, f"{stem}_a{i}")
+                    made.append(
+                        helper.make_node(
+                            "Add",
+                            [acc, prod],
+                            [nxt],
+                            name=_unique_name(model, f"{stem}_AD{i}"),
+                        )
+                    )
+                    acc = nxt
         # A bias is [Cout], which broadcasts onto the trailing axis exactly
         # where the taps land -- before the output is transposed back. The
         # 1x1 downsample convolutions in resnet18 carry one, and skipping
@@ -889,7 +964,7 @@ def act_weight_conv_to_matmul(model):
             made.append(
                 helper.make_node(
                     "Add",
-                    [acc, node.input[2]],
+                    [acc, _unfusable_bias(model, node.input[2], cout)],
                     [biased],
                     name=_unique_name(model, f"{stem}_B"),
                 )
