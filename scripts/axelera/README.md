@@ -99,6 +99,34 @@ if backend.has_axelera_compiler():
     print(result["bit_identical"], result["max_abs_diff"])
 ```
 
+## Legalizing: fixing what `evaluate_constraints()` finds
+
+`legalize.py` holds semantics-preserving rewrites for three of the scraped
+constraints -- the ones with a fix that's an exact rewrite, not just
+"avoid this op": `Conv`/`AveragePool`/`MaxPool`'s `auto_pad == "NOTSET"`
+requirement (this is the same rule the real compiler's own warning quoted
+back, above), `Gemm`'s `transA == 0`, and `MaxPool`'s `storage_order == 0`
+when the `Indices` output goes unused. See `legalize.py`'s module docstring
+for exactly what backs each rule and its real caveats (in particular:
+`gemm_transA_to_transpose`'s inserted `Transpose` is itself outside what
+the scraped `Transpose` rule covers for a rank-2 tensor).
+
+```python
+import legalize
+
+model = onnx.load("model.onnx")
+applied = legalize.legalize(model)  # {rule_name: sites changed}
+onnx.save(model, "model.legalized.onnx")
+```
+
+Or from the command line: `legalize.py in.onnx out.onnx`. `tests/
+test_axelera_legalize.py` checks each rule both structurally (against the
+ONNX operator spec's own `auto_pad` formula) and numerically (`onnx.
+reference.ReferenceEvaluator`, before vs. after), and cross-checks the
+`evaluate_constraints()` verdict flips from `"violated"` to `"ok"` where the
+rewrite is supposed to fully resolve a node -- none of that needs Docker,
+a device, or the optional `axelera-rt`/`axelera-devkit` install.
+
 ## Regenerating `voyager_op_support_data.py`
 
 The scraped data snapshot tracks whatever Voyager SDK checkout it was last
