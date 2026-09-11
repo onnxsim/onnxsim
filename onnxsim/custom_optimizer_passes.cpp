@@ -26,6 +26,7 @@
 #include "passes/eliminate_reshape_family_on_constant.h"
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
+#include "passes/explicit_auto_pad.h"
 #include "passes/fp6_llm.h"
 #include "passes/fuse_add_bias_into_conv.h"
 #include "passes/fuse_attention.h"
@@ -48,11 +49,13 @@
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
 #include "passes/fuse_split_gather_concat.h"
+#include "passes/gemm_transa_to_transpose.h"
 #include "passes/gguf_legacy_quant.h"
 #include "passes/gguf_q6_k.h"
 #include "passes/gguf_ternary_quant.h"
 #include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
+#include "passes/maxpool_rowmajor_when_indices_unused.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
@@ -142,6 +145,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateReshapeFamilyOnConstant>(registry);
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
+    RegisterOrReplace<p::ExplicitAutoPad>(registry);
     RegisterOrReplace<p::Fp6Llm>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
@@ -158,6 +162,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
+    RegisterOrReplace<p::GemmTransAToTranspose>(registry);
     RegisterOrReplace<p::GgufQ4_0>(registry);
     RegisterOrReplace<p::GgufQ4_1>(registry);
     RegisterOrReplace<p::GgufQ6K>(registry);
@@ -167,6 +172,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
     RegisterOrReplace<p::MagnitudePruningGlobal>(registry);
     RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
+    RegisterOrReplace<p::MaxPoolRowMajorWhenIndicesUnused>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);

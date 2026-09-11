@@ -99,6 +99,109 @@ if backend.has_axelera_compiler():
     print(result["bit_identical"], result["max_abs_diff"])
 ```
 
+## Legalizing: fixing what `evaluate_constraints()` finds
+
+`legalize.py` holds semantics-preserving rewrites for three of the scraped
+constraints -- the ones with a fix that's an exact rewrite, not just
+"avoid this op": `Conv`/`AveragePool`/`MaxPool`'s `auto_pad == "NOTSET"`
+requirement (this is the same rule the real compiler's own warning quoted
+back, above), `Gemm`'s `transA == 0`, and `MaxPool`'s `storage_order == 0`
+when the `Indices` output goes unused. See `legalize.py`'s module docstring
+for exactly what backs each rule and its real caveats (in particular:
+`gemm_transA_to_transpose`'s inserted `Transpose` is itself outside what
+the scraped `Transpose` rule covers for a rank-2 tensor).
+
+Run it **after** onnxsim's own simplify loop, not instead of it -- the same
+order `scripts/axera/README.md` found necessary (its Audio8 decoder walk-
+through gets the graph to float32 with fixed shapes via `onnxsim.simplify()`
+*before* any legalize rule runs). `explicit_auto_pad` in particular needs the
+input's spatial shape statically known, which is exactly what shape
+inference/constant folding inside `simplify()` resolves; handing it a graph
+`simplify()` hasn't already cleaned up just means more nodes it has to
+decline for a shape it can't yet see.
+
+```python
+import onnx
+import onnxsim
+import legalize
+
+model = onnx.load("model.onnx")
+model, ok = onnxsim.simplify(model)  # the simplify loop, run to a fixed point
+assert ok
+applied = legalize.legalize(model)  # ... then legalize what it left explicit
+onnx.save(model, "model.legalized.onnx")
+```
+
+Or from the command line: `python3 -m onnxsim in.onnx simplified.onnx` then
+`legalize.py simplified.onnx out.onnx`. `tests/
+test_axelera_legalize.py` checks each rule both structurally (against the
+ONNX operator spec's own `auto_pad` formula) and numerically (`onnx.
+reference.ReferenceEvaluator`, before vs. after), and cross-checks the
+`evaluate_constraints()` verdict flips from `"violated"` to `"ok"` where the
+rewrite is supposed to fully resolve a node -- none of that needs Docker,
+a device, or the optional `axelera-rt`/`axelera-devkit` install.
+
+### The same three rules, natively in onnxsim's own C++ core
+
+`legalize.py` is a standalone script over a bare `onnx.ModelProto` -- useful
+on its own, but Python-only and a separate pass over the graph. The same
+three rewrites also exist as onnxsim C++ passes
+(`onnxsim/passes/explicit_auto_pad.h`, `gemm_transa_to_transpose.h`,
+`maxpool_rowmajor_when_indices_unused.h`), registered as opt-in
+`PassType::Other` optimizers -- so any onnxsim binding (Python, C, Rust,
+npm/WASM), not just this script, can run them, and they run *inside*
+`simplify()`'s own fixed point rather than as a second pass after it:
+
+```python
+model, ok = onnxsim.simplify(
+    model,
+    extra_optimizers=[
+        "explicit_auto_pad",
+        "gemm_transA_to_transpose",
+        "maxpool_rowmajor_when_indices_unused",
+    ],
+)
+```
+
+or `onnxsim in.onnx out.onnx --enable-optimization explicit_auto_pad
+--enable-optimization gemm_transA_to_transpose --enable-optimization
+maxpool_rowmajor_when_indices_unused` from the CLI. See
+`tests/test_explicit_auto_pad.py`, `tests/test_gemm_transa_to_transpose.py`
+and `tests/test_maxpool_rowmajor_when_indices_unused.py` for their tests
+(same rules, `onnxsim.simplify`'s own `check_n` doing the numeric-
+equivalence check instead of a standalone `ReferenceEvaluator` round-trip).
+
+This needs the pass actually compiled into the `onnxsim` in use -- true
+from whatever release first ships it onward, or a local build off this
+repo's own source (see the top-level `README.md`/`CMakeLists.txt`; it is
+not a quick rebuild -- protobuf, ONNX and onnx-optimizer all compile from
+scratch). When that isn't available, or a rebuild is simply unwanted, the
+next section gets the same rules running inside `simplify()`'s fixed point
+without one.
+
+### Same rules, no rebuild: `custom_rewriter`
+
+`onnxsim.simplify` already takes a `custom_rewriter` callable, run as an
+extra stage inside its own simplification fixed point (interleaved with
+shape inference/constant folding, same as a compiled-in pass). `legalize.
+as_custom_rewriter()` adapts `legalize()` to that contract, so any
+already-installed `onnxsim` -- a plain `pip install onnxsim`, nothing built
+locally -- can run these three rules today:
+
+```python
+model, ok = onnxsim.simplify(
+    model, custom_rewriter=legalize.as_custom_rewriter()
+)
+```
+
+The tradeoff is per-round Python instead of a one-time-compiled C++ pass --
+immaterial next to the cost of shape inference/constant folding on most
+graphs, but worth knowing about. `custom_rewriter` and
+`extra_optimizers`/`function_rewrite_rules` are not mutually exclusive with
+each other in general, but passing this adapter *and* the native passes'
+names in the same `simplify()` call would just run each rule twice for no
+benefit -- pick one path per call.
+
 ## Regenerating `voyager_op_support_data.py`
 
 The scraped data snapshot tracks whatever Voyager SDK checkout it was last
