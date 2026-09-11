@@ -387,6 +387,85 @@ legalization than before. onnxsim#1332 now does this inside
 `qat_graph.make_step_graph()`; the Axera path assembles its `ModelProto` by
 hand and so calls `simplify()` itself, with the same skip list.
 
+## A different architecture: resnet50, first compile
+
+Everything above was resnet18d. The pipeline (`build_resident_train_step.py`,
+`legalize.TRAINING_RULES`, `_linearize_trainable_convs`) was written against
+that one shape; nothing in it names resnet18 specifically, but nothing had
+tried a second architecture either. resnet50d's `layer4` is bottleneck blocks
+(1x1 -> 3x3 -> 1x1, 2048-channel output) rather than resnet18's basic blocks
+(3x3 -> 3x3, 512-channel output) -- a real structural difference, not just
+"more of the same shape."
+
+**Scope chosen:** resnet50d, 64x64 input (same as resnet18d, deliberately --
+first compile of a new architecture is not the moment to also fight a bigger
+input), only `layer4.2` (the last bottleneck block: `conv1` 1x1
+`[512,2048,1,1]`, `conv2` 3x3 `[512,512,3,3]`, `conv3` 1x1 `[2048,512,1,1]`)
+plus `fc.weight` `[1000,2048]` trainable -- **not** the whole final stage
+(all three bottleneck blocks, ~3x the matmul-tap count). Given PR #1342 found
+Pulsar2's own compile time blowing up non-linearly well short of any runtime
+limit (70s -> 130s -> 386s -> >25 min with no result, batch 8 -> 16 -> 32 on
+the much smaller resnet18 graph), starting with a trainable tail sized to
+match resnet18's own (3 convs + `fc`, 6,504,448 trainable params against
+resnet18's 5,361,664 -- comparable scale, genuinely different block shape)
+was the deliberate choice over reaching for all of `layer4` on the first try.
+
+One export wrinkle worth recording: `timm.create_model('resnet50d', ...)`
+defaults to `zero_init_last=True` (the last BN in each residual block starts
+at gamma=0, a standard residual-net init trick). After BN-folding this makes
+every block's `conv3` weight fold to an **all-zero** tensor -- correct, not a
+bug, but onnxsim's own CSE then correctly notices all those all-zero tensors
+are identical and merges `layer4.0.conv3`, `layer4.1.conv3` and
+`layer4.2.conv3` into **one shared initializer**, which would have made
+`layer4.2`'s trainable weight secretly alias two other blocks' forward convs.
+`zero_init_last=False` avoids the degenerate collision; worth checking for on
+any future model export, since it recurs by construction wherever
+zero-init-residual is the default.
+
+**Built and verified on host:** 201 nodes (resnet18's comparable graph was
+210 -- genuinely similar scale despite resnet50 being a much deeper network
+overall, because the frozen backbone stays native `Conv` regardless of depth
+and only the trainable tail's node count depends on this pipeline). Central-
+difference check against the in-graph analytic gradient across all 4
+trainable tensors (24 sampled elements spanning both 1x1 convs, the 3x3, and
+`fc.weight`): **cosine similarity 0.99994**, confirming
+`_linearize_trainable_convs`'s im2col-as-gather identity generalizes to the
+bottleneck-block shapes with no resnet18-specific assumption breaking.
+
+**Compiled cleanly:** `pulsar2 build`, 57.8s (faster than resnet18's original
+97s, despite the deeper backbone -- number of *trainable* matmul taps
+dominates compile time more than total graph depth), one fused NPU subgraph,
+20.1 MB `.axmodel` (larger than resnet18's 6.6 MB, from the bigger frozen
+backbone's weights).
+
+**Ran on real hardware:** `resident_runner` (unmodified -- the I/O count (7
+in, 5 out) and positional state-pairing convention happened to match
+resnet18's exactly, since both trainable tails have 4 weights) gave
+**29.8 ms min / 32.2 ms avg per step**, essentially the same as resnet18's
+28.6 ms despite the much deeper frozen forward pass -- consistent with the
+quantize/dequantize tax being the dominant cost regardless of model depth
+(see "The quantize redundancy is real" above), not something resnet50's
+extra layers meaningfully add to.
+
+**Not verified:** the reported loss read exactly `0` every step. `resident_
+runner`'s built-in test batch is a fixed `memset(hx, 0x11, ...)`/`memset(hy,
+0x22, ...)` byte pattern (not real image data), which as float32 is ~1e-28 --
+effectively zero at both ends of the loss computation, so a `loss=0` reading
+is consistent with the quantizer correctly rounding a near-zero range to zero
+rather than a hardware/graph bug. This is the same caveat PR #1335's original
+resnet18 hardware run carried ("only checked coarsely... not the full
+per-tensor gradient cosine/SNR table") -- worth real image/label data through
+this same runner before trusting *on-device* numeric correctness, though the
+host-side finite-difference check above is materially more rigorous than
+what shipped with the original resnet18 work.
+
+**Recommendation for next time:** the pipeline needs no resnet50-specific
+changes -- the natural next step is either the remaining two bottleneck
+blocks of `layer4` (watch compile time; extrapolate from this block's 57.8s
+before jumping straight to all three) or real calibration data through
+`resident_runner` to settle the loss=0 question, not further architecture
+generalization work.
+
 ## What to do next
 
 1. **The FP32 gradient seed.** The one untried route past the dying gradient,
@@ -414,7 +493,10 @@ hand and so calls `simplify()` itself, with the same skip list.
    work per `Execute()` call, amortizing whatever fixed per-call overhead
    remains).
 3. **All 23 tensors, and 224x224.** Only the last four layers and a 64x64 input
-   have been built.
+   have been built for resnet18. (A different-architecture trial -- resnet50d
+   `layer4.2`, still 64x64 -- compiled and ran fine, see "A different
+   architecture: resnet50, first compile" above; the resolution/full-model
+   question above is still open for either architecture.)
 4. **An optimiser beyond SGD.** `qat_graph.adam_update` exists and has never
    been put through this path -- and now has a real in-graph-update precedent
    to extend (`build_resident_step` currently hand-rolls plain SGD rather

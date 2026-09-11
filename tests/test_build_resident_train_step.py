@@ -216,3 +216,91 @@ def test_linearize_trainable_convs_matches_conv_and_drops_the_weight_transpose()
         (got,) = _run(linearized, {"x": x}, ["y"])
         assert got.shape == ref.shape
         assert np.allclose(got, ref, atol=1e-4), (cin, cout, k, stride, pad, has_bias)
+
+
+def _bottleneck_model():
+    """`x -> 1x1 -> Relu -> 3x3 -> Relu -> 1x1 -> Flatten -> Gemm -> logits`:
+    a resnet50-style bottleneck block's conv shape (channel-reduce 1x1,
+    spatial 3x3, channel-expand 1x1, all three trainable and chained), rather
+    than the single isolated conv `test_linearize_trainable_convs_...` above
+    already covers. Exercises the same `_linearize_trainable_convs` path this
+    module's docstring describes, but for *multiple* trainable convs of
+    different kernel sizes feeding each other -- the shape a real resnet50
+    `layer4.2` block has and resnet18's basic blocks do not. See
+    `docs/axera-on-device-training-handoff.md`'s "A different architecture:
+    resnet50, first compile" section, which verified this same shape
+    combination on the real model (cosine 0.99994 against finite
+    differences); this is the from-scratch, hardware-free regression test for
+    it.
+    """
+    rng = np.random.default_rng(5)
+    w1 = (rng.standard_normal((4, 8, 1, 1)) * 0.2).astype(np.float32)  # reduce
+    w2 = (rng.standard_normal((4, 4, 3, 3)) * 0.2).astype(np.float32)  # spatial
+    w3 = (rng.standard_normal((8, 4, 1, 1)) * 0.2).astype(np.float32)  # expand
+    gw = (rng.standard_normal((5, 8 * 4 * 4)) * 0.1).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g (float[1,8,4,4] x) => (float[1,5] logits)
+        {
+          h1 = Conv<kernel_shape=[1,1]>(x, w1)
+          r1 = Relu(h1)
+          h2 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(r1, w2)
+          r2 = Relu(h2)
+          h3 = Conv<kernel_shape=[1,1]>(r2, w3)
+          r3 = Relu(h3)
+          f = Flatten<axis=1>(r3)
+          logits = Gemm<transB=1>(f, gw)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(w1, "w1"), _f32(w2, "w2"), _f32(w3, "w3"), _f32(gw, "gw")]
+    )
+    return model
+
+
+def test_bottleneck_block_gradient_matches_finite_differences():
+    """The full `build_resident_step` pipeline (not just
+    `_linearize_trainable_convs` in isolation) on a resnet50-bottleneck-
+    shaped chain of trainable convs, all promoted to state at once -- the
+    combination the isolated-conv test above doesn't exercise."""
+    forward = _bottleneck_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=5)
+    step_model, state = brts.build_resident_step(with_loss, params=["w1", "w2", "w3"])
+
+    initializers = {t.name: t for t in forward.graph.initializer}
+    w0 = {p: onnx.numpy_helper.to_array(initializers[p]) for p in state}
+
+    rng = np.random.default_rng(6)
+    x = rng.standard_normal((1, 8, 4, 4)).astype(np.float32)
+    y = rng.standard_normal((1, 5)).astype(np.float32)
+
+    out_names = [o.name for o in step_model.graph.output]
+    feeds = {"x": x, "y": y, "lr": np.array([1.0], np.float32), **w0}
+    outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
+    grads = {p: (w0[p] - outs[state[p]]).astype(np.float64) for p in state}
+
+    def loss_at(weights):
+        probe = onnx.ModelProto()
+        probe.CopyFrom(with_loss)
+        for init in probe.graph.initializer:
+            if init.name in weights:
+                init.CopyFrom(
+                    onnx.numpy_helper.from_array(weights[init.name], init.name)
+                )
+        (loss,) = _run(probe, {"x": x, "y": y}, ["loss"])
+        return float(loss)
+
+    for p in state:
+        d = rng.standard_normal(w0[p].shape).astype(np.float64)
+        eps = 1e-2 / (np.linalg.norm(d) + 1e-12)
+        w_plus, w_minus = dict(w0), dict(w0)
+        w_plus[p] = (w0[p].astype(np.float64) + eps * d).astype(np.float32)
+        w_minus[p] = (w0[p].astype(np.float64) - eps * d).astype(np.float32)
+        fd = (loss_at(w_plus) - loss_at(w_minus)) / (2 * eps)
+        predicted = float((grads[p] * d).sum())
+        assert predicted == pytest.approx(fd, rel=0.05, abs=1e-6), p
