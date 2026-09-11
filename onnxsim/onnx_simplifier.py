@@ -3399,7 +3399,9 @@ def simplify(
     check_atol: float = 1e-5,
     input_fill: str = "random",
     providers: Optional[Sequence[backend.Provider]] = None,
-    gemm_fusion_backend: Literal["ort_cpu", "unrestricted", "webgpu"] = "ort_cpu",
+    gemm_fusion_backend: Literal[
+        "ort_cpu", "unrestricted", "webgpu", "webnn"
+    ] = "ort_cpu",
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
@@ -3523,12 +3525,23 @@ def simplify(
             ``com.microsoft::Attention`` nodes using mask/past-present inputs,
             which onnxruntime-web's WebGPU Attention kernel does not yet
             accelerate and will silently run on a fallback execution provider
-            instead. Implemented in the C++ core via the
-            ``ONNXSIM_GEMM_FUSION_BACKEND`` environment variable (as ``"webgpu"``
-            is translated to ``"unrestricted"`` there, since that is the only
-            distinction the C++ side actually makes), so it works from every
-            binding; setting this argument simply sets that variable for the
-            call.
+            instead. ``"webnn"`` is likewise for models headed to
+            onnxruntime-web's WebNN execution provider, which delegates to the
+            platform's own ML stack (DirectML / Core ML / the platform NN API)
+            -- routinely used precisely for NPU/GPU FP16 (and lower-precision)
+            acceleration, not a naive fallback path -- so it is handled
+            identically to ``"unrestricted"`` too. Pair it with
+            :func:`onnxsim.check_webnn_support` on the simplified output,
+            which flags WebNN gaps this flag does not cover: INT64 graph
+            inputs/outputs and non-constant ``Reshape``/``Expand`` shape
+            inputs, both of which fall a node (or, for INT64 boundaries,
+            potentially the whole session) back to onnxruntime-web's ``wasm``
+            fallback instead of running on WebNN. Implemented in the C++ core
+            via the ``ONNXSIM_GEMM_FUSION_BACKEND`` environment variable (as
+            ``"webgpu"``/``"webnn"`` are translated to ``"unrestricted"``
+            there, since that is the only distinction the C++ side actually
+            makes), so it works from every binding; setting this argument
+            simply sets that variable for the call.
     :param profile: When set, profile every simplification fixed-point function
             (shape inference, the onnx-optimizer passes, constant folding and any
             custom rewriter) -- recording each one's wall-clock and CPU duration
@@ -3603,12 +3616,14 @@ def simplify(
     backend.validate_providers(providers)
 
     # The C++ core's ``ParseGemmFusionBackend`` (gemm_fusion_backend.cpp) only
-    # recognizes "ort_cpu"/"unrestricted" -- "webgpu" is a Python-facing alias
-    # for "unrestricted" (see this parameter's docstring for why they behave
-    # identically), translated here so the env var below always carries a name
-    # the C++ side understands.
+    # recognizes "ort_cpu"/"unrestricted" -- "webgpu"/"webnn" are Python-facing
+    # aliases for "unrestricted" (see this parameter's docstring for why they
+    # behave identically), translated here so the env var below always carries
+    # a name the C++ side understands.
     _gemm_fusion_backend_for_cpp = (
-        "unrestricted" if gemm_fusion_backend == "webgpu" else gemm_fusion_backend
+        "unrestricted"
+        if gemm_fusion_backend in ("webgpu", "webnn")
+        else gemm_fusion_backend
     )
 
     # ``target_opset_version="latest"`` resolves against the C++ core's own
