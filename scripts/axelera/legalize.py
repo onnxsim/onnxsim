@@ -58,6 +58,14 @@ scripting. See `tests/test_explicit_auto_pad.py`,
 `tests/test_maxpool_rowmajor_when_indices_unused.py` for the C++ passes'
 own tests.
 
+A third option needs neither a rebuild nor a standalone script step:
+`as_custom_rewriter()` adapts `legalize()` to `onnxsim.simplify`'s existing
+`custom_rewriter` parameter, so these rules run *inside* the same
+simplification fixed point from any already-installed `onnxsim` --
+`onnxsim.simplify(model, custom_rewriter=legalize.as_custom_rewriter())`.
+See that function's docstring for when to reach for it over
+`extra_optimizers`.
+
 Usage::
 
     legalize.py in.onnx out.onnx
@@ -278,6 +286,41 @@ def legalize(model, rules=None):
     for name in rules or RULES:
         applied[name] = RULES[name](model)
     return applied
+
+
+def as_custom_rewriter(rules=None):
+    """A callable usable as ``onnxsim.simplify(model, custom_rewriter=...)``.
+
+    `onnxsim.simplify` already accepts a `custom_rewriter`: "An optional
+    callable `ModelProto -> Optional[ModelProto]` run as an extra stage
+    inside onnxsim's simplification fixed point ... The callable may return
+    a new `ModelProto`, mutate and return `None`, or return `False` to
+    report that it rewrote nothing." This wraps `legalize()` to match that
+    contract exactly.
+
+    Why this exists alongside the native C++ passes
+    (`onnxsim/passes/explicit_auto_pad.h` and friends, opted into via
+    `extra_optimizers=[...]`): those need the *matching build* of `onnxsim`
+    -- the pass has to actually be compiled in, which is only true from
+    whatever release first ships it onward, or a local build off this
+    repo's own source tree. `custom_rewriter` needs neither: any
+    already-installed `onnxsim` (a plain `pip install onnxsim`, no rebuild)
+    can run these same three rules *today*, interleaved with onnxsim's own
+    shape inference/constant-folding fixed point exactly like a compiled-in
+    pass would be -- just executed in Python on each round instead of once
+    in C++. Prefer the native passes when the `onnxsim` in use already has
+    them (no per-round Python round-trip); reach for this adapter when it
+    doesn't and a rebuild isn't an option.
+
+    ``rules`` is the same optional list `legalize()` takes -- omit it to
+    apply every rule in `RULES`.
+    """
+
+    def rewriter(model):
+        applied = legalize(model, rules)
+        return None if any(applied.values()) else False
+
+    return rewriter
 
 
 def main(argv=None):

@@ -23,6 +23,7 @@ import sys
 
 import numpy as np
 import onnx
+import pytest
 from onnx import numpy_helper, parser
 from onnx.reference import ReferenceEvaluator
 
@@ -396,3 +397,81 @@ def test_legalize_reports_what_each_rule_changed():
     assert applied["explicit_auto_pad"] == 1
     assert applied["gemm_transA_to_transpose"] == 0
     assert applied["maxpool_rowmajor_when_indices_unused"] == 0
+
+
+# --- as_custom_rewriter() ---
+
+
+def _same_upper_conv_model():
+    w = numpy_helper.from_array(np.zeros((4, 4, 3, 3), np.float32), "w")
+    return _model(
+        """
+        g (float[1,4,10,10] x) => (float[1,4,?,?] y)
+        { y = Conv<kernel_shape = [3, 3], auto_pad = "SAME_UPPER">(x, w) }
+        """,
+        initializer=[w],
+    )
+
+
+def test_as_custom_rewriter_mutates_in_place_and_returns_none_when_changed():
+    """Matches `onnxsim.simplify`'s `custom_rewriter` contract: mutate
+    `model` and return `None` when something changed (as opposed to
+    returning a new `ModelProto`, the contract's other allowed form)."""
+    model = _same_upper_conv_model()
+    rewriter = legalize.as_custom_rewriter()
+    result = rewriter(model)
+    assert result is None
+    conv = model.graph.node[0]
+    assert any(a.name == "pads" for a in conv.attribute)
+
+
+def test_as_custom_rewriter_returns_false_when_nothing_changed():
+    """`custom_rewriter` returning `False` tells onnxsim's fixed point
+    nothing changed this round, so it can skip re-processing the model --
+    this is what lets `as_custom_rewriter()` be called repeatedly (as the
+    fixed point does) without looping forever re-declaring "changed"."""
+    model = _model(
+        """
+        g (float[4,8] a) => (float[4,4] y)
+        { y = Gemm(a, b) }
+        """,
+        initializer=[numpy_helper.from_array(np.zeros((8, 4), np.float32), "b")],
+    )
+    rewriter = legalize.as_custom_rewriter()
+    assert rewriter(model) is False
+    # Idempotent: a second call against an already-legalized model also
+    # reports no change, exactly like the fixed point's steady state.
+    changed_model = _same_upper_conv_model()
+    rewriter(changed_model)
+    assert rewriter(changed_model) is False
+
+
+def test_as_custom_rewriter_honors_an_explicit_rule_subset():
+    model = _same_upper_conv_model()
+    rewriter = legalize.as_custom_rewriter(rules=["gemm_transA_to_transpose"])
+    # SAME_UPPER only affects explicit_auto_pad, which wasn't asked for.
+    assert rewriter(model) is False
+    conv = model.graph.node[0]
+    assert not any(a.name == "pads" for a in conv.attribute)
+
+
+def test_as_custom_rewriter_used_by_onnxsim_simplify():
+    """End-to-end: the adapter actually works as `onnxsim.simplify`'s
+    `custom_rewriter`, with no `onnxsim` rebuild needed -- unlike the native
+    C++ passes (`tests/test_explicit_auto_pad.py` and friends), which need
+    the matching pass compiled into the `onnxsim` in use."""
+    onnxsim = pytest.importorskip("onnxsim")
+
+    model = _same_upper_conv_model()
+    x = np.zeros((1, 4, 10, 10), np.float32)
+    sim_model, ok = onnxsim.simplify(
+        model,
+        check_n=1,
+        input_data={"x": x},
+        custom_rewriter=legalize.as_custom_rewriter(),
+    )
+    assert ok
+    conv = next(n for n in sim_model.graph.node if n.op_type == "Conv")
+    assert not any(
+        a.name == "auto_pad" and a.s == b"SAME_UPPER" for a in conv.attribute
+    )

@@ -171,6 +171,37 @@ and `tests/test_maxpool_rowmajor_when_indices_unused.py` for their tests
 (same rules, `onnxsim.simplify`'s own `check_n` doing the numeric-
 equivalence check instead of a standalone `ReferenceEvaluator` round-trip).
 
+This needs the pass actually compiled into the `onnxsim` in use -- true
+from whatever release first ships it onward, or a local build off this
+repo's own source (see the top-level `README.md`/`CMakeLists.txt`; it is
+not a quick rebuild -- protobuf, ONNX and onnx-optimizer all compile from
+scratch). When that isn't available, or a rebuild is simply unwanted, the
+next section gets the same rules running inside `simplify()`'s fixed point
+without one.
+
+### Same rules, no rebuild: `custom_rewriter`
+
+`onnxsim.simplify` already takes a `custom_rewriter` callable, run as an
+extra stage inside its own simplification fixed point (interleaved with
+shape inference/constant folding, same as a compiled-in pass). `legalize.
+as_custom_rewriter()` adapts `legalize()` to that contract, so any
+already-installed `onnxsim` -- a plain `pip install onnxsim`, nothing built
+locally -- can run these three rules today:
+
+```python
+model, ok = onnxsim.simplify(
+    model, custom_rewriter=legalize.as_custom_rewriter()
+)
+```
+
+The tradeoff is per-round Python instead of a one-time-compiled C++ pass --
+immaterial next to the cost of shape inference/constant folding on most
+graphs, but worth knowing about. `custom_rewriter` and
+`extra_optimizers`/`function_rewrite_rules` are not mutually exclusive with
+each other in general, but passing this adapter *and* the native passes'
+names in the same `simplify()` call would just run each rule twice for no
+benefit -- pick one path per call.
+
 ## Regenerating `voyager_op_support_data.py`
 
 The scraped data snapshot tracks whatever Voyager SDK checkout it was last
