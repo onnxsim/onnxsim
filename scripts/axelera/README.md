@@ -111,15 +111,29 @@ for exactly what backs each rule and its real caveats (in particular:
 `gemm_transA_to_transpose`'s inserted `Transpose` is itself outside what
 the scraped `Transpose` rule covers for a rank-2 tensor).
 
+Run it **after** onnxsim's own simplify loop, not instead of it -- the same
+order `scripts/axera/README.md` found necessary (its Audio8 decoder walk-
+through gets the graph to float32 with fixed shapes via `onnxsim.simplify()`
+*before* any legalize rule runs). `explicit_auto_pad` in particular needs the
+input's spatial shape statically known, which is exactly what shape
+inference/constant folding inside `simplify()` resolves; handing it a graph
+`simplify()` hasn't already cleaned up just means more nodes it has to
+decline for a shape it can't yet see.
+
 ```python
+import onnx
+import onnxsim
 import legalize
 
 model = onnx.load("model.onnx")
-applied = legalize.legalize(model)  # {rule_name: sites changed}
+model, ok = onnxsim.simplify(model)  # the simplify loop, run to a fixed point
+assert ok
+applied = legalize.legalize(model)  # ... then legalize what it left explicit
 onnx.save(model, "model.legalized.onnx")
 ```
 
-Or from the command line: `legalize.py in.onnx out.onnx`. `tests/
+Or from the command line: `python3 -m onnxsim in.onnx simplified.onnx` then
+`legalize.py simplified.onnx out.onnx`. `tests/
 test_axelera_legalize.py` checks each rule both structurally (against the
 ONNX operator spec's own `auto_pad` formula) and numerically (`onnx.
 reference.ReferenceEvaluator`, before vs. after), and cross-checks the
