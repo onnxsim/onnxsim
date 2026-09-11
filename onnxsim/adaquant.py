@@ -380,7 +380,9 @@ def _sum_all(b: qat_graph.GraphBuilder, tensor: str) -> str:
     return b.op("ReduceSum", [tensor], keepdims=0)
 
 
-def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepGraph:
+def _build_adaquant_step_graph(
+    num_rows: int, n: int, k: int, simplify: bool = True
+) -> qat_graph.StepGraph:
     """One Adam step of :func:`_optimize_adaquant`, as an ONNX graph.
 
     Node for node the same computation the numpy loop performs -- the same
@@ -414,6 +416,11 @@ def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepG
     ``[n, k]``): the accelerator backends this exists for -- WebNN and the NPU
     execution providers -- compile a graph once and want static shapes, and a
     step graph is rebuilt per layer anyway.
+
+    ``simplify`` is forwarded to :func:`qat_graph.make_step_graph` unchanged
+    -- see :func:`onnxsim.adaround._build_rounding_step_graph`'s own note on
+    why ``scripts/convertmodel/test/make_step_graph_fixtures.py`` passes
+    ``False``.
     """
     b = qat_graph.GraphBuilder()
 
@@ -516,6 +523,7 @@ def _build_adaquant_step_graph(num_rows: int, n: int, k: int) -> qat_graph.StepG
         scalars=["w_lr", "a_lr", "reg_scale", "beta", "m_correction", "v_correction"],
         loss=b.mean_square(diff),
         name="onnxsim_adaquant_step",
+        simplify=simplify,
     )
 
 

@@ -118,6 +118,24 @@ DYNAMIC_BATCH = "batch"
 # section for why the loss needs it at all.
 BATCH_SIZE_INPUT = "batch_size"
 
+# Every name the loss/backward construction below introduces starts with
+# this, so it cannot collide with a tensor name carried over from the
+# caller's own student model -- the same convention onnxsim.qat's and
+# onnxsim.lora's own module-level ``_PREFIX`` document (qat.py: "Every name
+# this module introduces into the step graph starts here, so it cannot
+# collide with a tensor name carried over from the float model"). Without
+# it, ``GraphBuilder()``'s bare ``f"{hint}_{counter}"`` names (``mul_1``,
+# ``div_1``, ``reducesum_1``, ``axes_1``, ...) share one namespace with an
+# arbitrary externally-authored ``student`` model, which commonly contains
+# tensors named exactly that way (many exporters and prior
+# simplification/renaming passes use lowercase-op-type-plus-counter names).
+# A real collision does get caught loudly -- ``main()`` below calls
+# ``onnx.checker.check_model`` on the finished graph, which rejects a
+# resulting SSA violation -- but there is no reason to leave that failure
+# mode reachable at all when every sibling code path in this repo already
+# closes it this way.
+_PREFIX = "distill__"
+
 
 def labels_to_onehot(labels: np.ndarray, num_classes: int) -> np.ndarray:
     """The host-side half of the "no Cast/Greater/Less in the differentiated
@@ -301,7 +319,7 @@ def _build_forward_loss_and_grads(
             "static -- only the batch (leading) dimension may be dynamic"
         )
 
-    b = qat_graph.GraphBuilder()
+    b = qat_graph.GraphBuilder(_PREFIX)
     b.nodes.extend(dynamic.graph.node)
     # Deliberately not `b.initializer.extend(dynamic.graph.initializer)`:
     # every one of these becomes a step-graph *state* input below instead of

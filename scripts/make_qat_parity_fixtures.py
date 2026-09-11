@@ -268,6 +268,16 @@ def _case_step_graph() -> Dict[str, Any]:
         scalars=["lr", "mc", "vc"],
         loss=loss,
         per_step={"rows": ([2], int(onnx.TensorProto.INT64))},
+        # This fixture -- and the whole Python<->C++ parity comparison built
+        # on it, see this module's own docstring -- exists to pin the *raw*
+        # GraphBuilder emission (node op types, names and order) against
+        # onnxsim/qat_graph_builder.cpp's hand-ported equivalent, which does
+        # not link onnx-optimizer and so never simplifies its own output
+        # either. Simplifying here would compare onnx-optimizer's rewrite of
+        # the Python side against the untouched C++ side -- not the property
+        # this test wants -- so this is the one caller that always needs
+        # ``simplify=False``, independent of what the default is.
+        simplify=False,
     )
     graph = step.model.graph
     out = _describe(b)
@@ -408,6 +418,10 @@ def _case_planner() -> Dict[str, Any]:
         plan.output_name,
         (4, 32),
         False,
+        # Raw emission, not onnx-optimizer's rewrite of it -- see this
+        # function's own module docstring and _build_step_graph's own note
+        # on this parameter.
+        simplify=False,
     )
     graph = step.model.graph
     out = _describe_graph(graph)
