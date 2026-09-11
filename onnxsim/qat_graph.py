@@ -530,6 +530,7 @@ def make_step_graph(
     loss: Optional[str] = None,
     name: str = "onnxsim_step",
     per_step: Optional[Dict[str, Tuple[Sequence[int], int]]] = None,
+    simplify: bool = True,
 ) -> StepGraph:
     """Wraps ``b``'s accumulated nodes into a :class:`StepGraph`.
 
@@ -555,6 +556,27 @@ def make_step_graph(
             (``run_step_graph`` casts scalars to float32 and passes these
             through with the dtype the caller built them with) and because a
             scalar's shape and type never need saying.
+    :param simplify: run :func:`onnxsim.onnx_simplifier.simplify` over the
+            finished graph before returning it (the default). None of the
+            gradient rules in :mod:`onnxsim.graph_grad` or the primitives in
+            this module dead-code-eliminate or common-subexpression-eliminate
+            their own output -- :func:`onnxsim.graph_grad.build_backward`
+            computes a gradient for every input of every node it visits,
+            including one that heads nowhere (a non-target leaf like a
+            block's own activation input), and :class:`GraphBuilder`'s
+            ``const``/``int64_const`` never reuse an identical-valued
+            initializer -- so the raw graph carries real, measured waste
+            (dead ``Transpose``/``MatMul`` pairs, duplicate ``axes``/``shape``
+            constants) that would otherwise ship into every training step.
+            ``simplify()`` only ever touches the graph's internals: a step
+            graph's declared inputs and outputs are exactly ``constants``,
+            ``state``, ``scalars`` and ``per_step`` above, and ``simplify()``
+            preserves a model's declared input/output names, shapes and
+            dtypes, so ``state`` (an ``{input name: output name}`` mapping
+            :func:`run_step_graph` closes the loop with) stays valid
+            regardless of this flag. Pass ``False`` to get the graph exactly
+            as ``b`` and :func:`onnxsim.graph_grad.build_backward` emitted it
+            -- e.g. for a test asserting on that raw structure.
     """
     inputs = [
         onnx.helper.make_tensor_value_info(n, elem_type, list(shape))
@@ -602,6 +624,34 @@ def make_step_graph(
         # with the rest of this module exactly like a hand-written rule's
         # nodes always have.
         model = onnx.inliner.inline_local_functions(model)
+    if simplify:
+        # Lazy import: onnxsim.onnx_simplifier sits on top of most of this
+        # package (pruning, quantization, ...), while this module sits
+        # underneath most of it (graph_grad, adaround, adaquant, lora, qat,
+        # ...) -- importing it at module load time would risk a cycle for no
+        # benefit, since nothing here needs it before a caller actually asks
+        # for a step graph.
+        from onnxsim.onnx_simplifier import simplify as _simplify
+
+        # fuse_matmul_add_bias_into_gemm/fuse_transpose_into_gemm are onnx-
+        # optimizer's default fusions of exactly the "MatMul then Add a bias"
+        # and "Transpose then MatMul" shapes every rule in graph_grad.py and
+        # this module emits -- into a single Gemm node. That is a real
+        # simplification for an ordinary inference graph, and exactly wrong
+        # here: EP_FRIENDLY_OPS (this module, just above) and
+        # graph_grad.BACKWARD_OPS both deliberately exclude Gemm, so that a
+        # step graph stays runnable on WebGPU/WebNN/an NPU execution
+        # provider -- see this module's own module docstring and
+        # graph_grad.py's "arithmetic primitives, not fused ops" stance. Left
+        # unskipped, simplify() would silently reintroduce the one op every
+        # gradient rule here was written specifically to avoid.
+        model, _ = _simplify(
+            model,
+            skipped_optimizers=[
+                "fuse_matmul_add_bias_into_gemm",
+                "fuse_transpose_into_gemm",
+            ],
+        )
     return StepGraph(
         model=model,
         state={n: out for n, (_, out) in state.items()},

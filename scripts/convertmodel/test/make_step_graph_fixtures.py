@@ -180,7 +180,12 @@ def build_adaround(rng: np.random.Generator) -> Dict:
     # int4's code range, which is what apply_adaround runs on.
     n_min, n_max = -8.0, 7.0
 
-    step = adaround._build_rounding_step_graph(num_rows, n, k, n_min, n_max)
+    # simplify=False: this fixture exists to exercise raw op coverage on real
+    # execution providers (see this module's own docstring), so it needs
+    # every op this builder emits, unsimplified.
+    step = adaround._build_rounding_step_graph(
+        num_rows, n, k, n_min, n_max, simplify=False
+    )
 
     w = _f32(rng.normal(scale=0.5, size=(n, k)))
     scale = _f32(np.abs(w).max(axis=1, keepdims=True) / n_max + 1e-3)
@@ -221,7 +226,8 @@ def build_adaquant(rng: np.random.Generator) -> Dict:
     rank-0 state tensors, which are the shape an accelerator backend is most
     likely to be unhappy with."""
     num_rows, n, k = 8, 4, 8
-    step = adaquant._build_adaquant_step_graph(num_rows, n, k)
+    # simplify=False: see _case_adaround's own note above.
+    step = adaquant._build_adaquant_step_graph(num_rows, n, k, simplify=False)
 
     w = _f32(rng.normal(scale=0.5, size=(n, k)))
     scale_n = _f32(np.abs(w).max(axis=1) / 127.0 + 1e-4)
@@ -348,6 +354,8 @@ def build_qat_backward(rng: np.random.Generator) -> Dict:
         scalars=["lr", "m_correction", "v_correction"],
         loss=b.mean_square(diff),
         name="onnxsim_qat_backward_step",
+        # simplify=False: see _case_adaround's own note above.
+        simplify=False,
     )
 
     x = _f32(rng.normal(size=x_shape))
@@ -419,6 +427,8 @@ def build_minibatch(rng: np.random.Generator) -> Dict:
         per_step={index: ([batch], onnx.TensorProto.INT64)},
         loss=b.mean_square(diff),
         name="onnxsim_minibatch_step",
+        # simplify=False: see _case_adaround's own note above.
+        simplify=False,
     )
 
     x_all = _f32(rng.normal(size=(total, kin)))
@@ -532,6 +542,10 @@ def build_qat_hf_demo(rng: np.random.Generator) -> Dict:
         scalars=["lr", "m_correction", "v_correction"],
         loss=b.mean_square(diff),
         name="onnxsim_qat_hf_demo_step",
+        # simplify=False: see _case_adaround's own note above -- this whole
+        # file emits the library's raw builder output for the browser demo
+        # and Node tests to run directly, not a production-optimized graph.
+        simplify=False,
     )
     onnx.checker.check_model(step.model, full_check=True)
     onnx.save(step.model, HERE / "step_qat_hf_demo.onnx")
@@ -764,6 +778,8 @@ def build_qat_cifar10_pretrain(rng: np.random.Generator) -> Dict:
         scalars=["lr", "m_correction", "v_correction"],
         loss=b.mean_square(diff),
         name="onnxsim_qat_cifar10_pretrain_step",
+        # simplify=False: see _case_adaround's own note above.
+        simplify=False,
     )
     # make_step_graph only declares state outputs + the loss -- "y" (the raw
     # per-class prediction, needed for the browser's own end-of-run accuracy

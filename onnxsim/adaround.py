@@ -253,7 +253,7 @@ def _rounding_codes(
 
 
 def _build_rounding_step_graph(
-    num_rows: int, n: int, k: int, n_min: float, n_max: float
+    num_rows: int, n: int, k: int, n_min: float, n_max: float, simplify: bool = True
 ) -> qat_graph.StepGraph:
     """One Adam step of :func:`_optimize_rounding`, as an ONNX graph.
 
@@ -268,6 +268,12 @@ def _build_rounding_step_graph(
     ``[n, k]``): the accelerator backends this exists for -- WebNN, and the
     NPU execution providers -- compile a graph once and want static shapes,
     and a step graph is rebuilt per layer anyway.
+
+    ``simplify`` is forwarded to :func:`qat_graph.make_step_graph` unchanged.
+    ``scripts/convertmodel/test/make_step_graph_fixtures.py`` passes
+    ``False``: it feeds this exact graph to onnxruntime-web to verify
+    per-operator execution-provider coverage, so it needs every op this
+    function's raw emission actually contains, unsimplified.
     """
     b = qat_graph.GraphBuilder()
 
@@ -325,6 +331,7 @@ def _build_rounding_step_graph(
         scalars=["lr", "reg_scale", "beta", "m_correction", "v_correction"],
         loss=loss,
         name="onnxsim_adaround_step",
+        simplify=simplify,
     )
 
 

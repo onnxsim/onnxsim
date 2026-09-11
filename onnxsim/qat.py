@@ -1228,6 +1228,7 @@ def _build_step_graph(
     fake_quant: bool = True,
     preserve_sparsity: bool = False,
     optimizer: str = "adam",
+    simplify: bool = True,
 ) -> qat_graph.StepGraph:
     """The whole loop as one graph: fake-quant forward, block forward,
     reconstruction loss, backward, optimizer.
@@ -1270,6 +1271,14 @@ def _build_step_graph(
     gradient of 0 every step, Adam's ``m`` and ``v`` stay 0, its step is
     ``lr * 0 / (sqrt(0) + eps)`` -- exactly 0 -- and the parameter never moves.
     No clean-up pass at the end, and no drift in between.
+
+    ``simplify`` is forwarded to :func:`qat_graph.make_step_graph` unchanged
+    -- see that function's own docstring. The one caller in this repo that
+    needs ``False`` is ``scripts/make_qat_parity_fixtures.py``'s
+    ``_case_planner``, which pins this function's *raw* emission against
+    ``onnxsim/qat_entry.cpp``'s hand-ported equivalent (a C++ implementation
+    that, like ``qat_graph_builder.cpp``, never links onnx-optimizer); every
+    other caller wants the default.
 
     ``externals`` and ``block_output_shape`` are always the *whole*
     calibration set's arrays and shape. With ``batch`` set they become the
@@ -1591,6 +1600,7 @@ def _build_step_graph(
         loss=b.mean_square(diff),
         name="onnxsim_qat_step",
         per_step=per_step,
+        simplify=simplify,
     )
 
 
