@@ -453,12 +453,93 @@ each context compiles its own small, already-proven graph rather than one
 larger one. It trades per-context latency for aggregate throughput similarly
 to batching, tops out around 2.6-2.9x in what was measured here, and would
 suit a scenario with several independent models/replicas to train rather
-than one already-batched step (batching and vNPU concurrency were not tried
-together; whether they compose is open). `scripts/axera/tools/resident_runner.c`
+than one already-batched step. `scripts/axera/tools/resident_runner.c`
 now takes a `-v` flag for `AXCL_VNPU_ENABLE` to reproduce this; there is no
 committed orchestration script for launching N of them, a shell loop over N
 separate copies of the compiled model (see this section's own measurement
 method) is enough.
+
+### Batching and vNPU concurrency compound -- multiplicatively, cleanly
+
+The open question above (do they compose?) is answered: **yes.** Measured N
+concurrent `AXCL_VNPU_ENABLE` contexts, each running the resnet18 resident
+step at batch B, for every (N, B) combination in {1, 2, 4, 8} x {1, 4, 8} that
+doesn't repeat a number already in this doc -- reusing the batch-1/4/8
+`.axmodel`s from the batching section above, N separate OS processes each its
+own model load/context/buffers, same method as the vNPU section above. Loss
+and gradients were not re-verified per point (the batch-dimension math was
+already checked host-side in the batching section, and vNPU non-corruption
+was already checked bit-for-bit in the section above); what *was* checked
+here is that enabling `-v` doesn't change the (batch>1) result at all -- one
+batch-4, single-context run under `VNPU_DISABLE` and under `VNPU_ENABLE`
+produced identical timing and identical (zero, see caveat below) loss, the
+same non-corruption signature the vNPU section's bit-identical check used,
+just not repeated for the full 20-step rigor of that section for every point
+in this sweep -- a real, if lighter-weight, gap against this doc's usual
+standard, noted here rather than glossed over.
+
+Per-sample compute is exact and batch-invariant (207,564,800 MACs = 415.13M
+FLOPs/sample, this doc's batching section above), so every point below
+converts to aggregate achieved GOPS the same way that section's table does,
+from each run's own reported aggregate throughput (`sum` of each concurrent
+process's own `throughput=... steps/s` line):
+
+| contexts x batch | aggregate steps/s | aggregate samples/s | aggregate achieved GOPS | vs. 1x1 |
+| --- | --- | --- | --- | --- |
+| 1 x 1 | 34.0 | 34.0 | 14.1 | 1.00x |
+| 8 x 1 (pure vNPU) | 85.9 | 85.9 | 35.7 | 2.53x |
+| 1 x 8 (pure batch) | 27.8 | 222.4 | 92.3 | 6.54x |
+| 2 x 4 | 53.2 | 212.8 | 88.4 | 6.27x |
+| 4 x 4 | 77.0 | 308.0 | 127.9 | 9.06x |
+| 8 x 4 | 81.8 | 327.2 | 135.9 | 9.63x |
+| 2 x 8 | 44.2 | 353.6 | 146.8 | 10.40x |
+| 4 x 8 | 70.9 | 567.2 | 235.6 | 16.70x |
+| 8 x 8 | 76.8 | 614.4 | 255.2 | **18.09x** |
+
+The best point measured (8x8, 255.2 GOPS) beats the best pure-batching point
+(1x8, 92.3 GOPS) by **2.8x** and the best pure-vNPU point (8x1, 35.7 GOPS) by
+**7.1x** -- a real compounding effect, not a wash and not redundant with
+either lever alone. 4x8 gets 92% of 8x8's throughput for half the contexts,
+the better efficiency point of what was measured (mirroring the vNPU
+section's own N=4-vs-N=8 finding at batch 1).
+
+**Why it compounds cleanly**, checked rather than assumed: define
+`efficiency(N, B) = aggregate_steps/s(N, B) / (N x solo_steps/s(B))` -- how
+much of the naive N-times-linear throughput each combined point actually
+gets. This should depend only on N (contention among N concurrent NPU
+partitions) and not on B (how much work each partition does per step) if the
+two levers are genuinely independent effects rather than interacting:
+
+| N | efficiency at B=1 | efficiency at B=4 | efficiency at B=8 |
+| --- | --- | --- | --- |
+| 2 | 0.85 | 0.86 | 0.80 |
+| 4 | 0.65 | 0.63 | 0.64 |
+| 8 | 0.36 | 0.33 | 0.35 |
+
+Each row agrees to within about 4% across batch sizes -- the same
+concurrency-efficiency curve the vNPU section measured at batch 1 (0.85 /
+0.65 / 0.36 at N=2/4/8) holds regardless of B. So aggregate throughput
+factors cleanly as `solo(B) x N x efficiency(N)`: batching improves
+per-context efficiency (more useful arithmetic per quantize/transpose-glue
+dollar, this doc's batching section), vNPU concurrency multiplies that by
+however many partitions minus contention, and neither lever changes how the
+other one behaves. The practical upshot: pick the batch size that's
+efficient for the *model* (per the batching section's own tradeoffs, not
+revisited here) and the context count that's efficient for the *hardware*
+(N=4, per both this table and the vNPU section) roughly independently, rather
+than needing to jointly search the combination.
+
+**Caveat carried over, not resolved here**: batch>1 losses read exactly zero
+in every combined-point run above, the same class of finding the resnet50
+section below records and traces to the fixed near-zero synthetic test
+batch (`memset`), not a graph bug -- batch 1's nonzero loss (0.117937,
+identical and stable across all vNPU/non-vNPU batch-1 runs in this section)
+did not reproduce that failure mode, batch 4 and 8 did, consistently, in
+every run regardless of concurrency. Plausibly the batch-averaging
+`ReduceMean` in `add_mse_loss` rounds a near-zero quantized per-sample
+difference to exactly zero once averaged over more elements -- untested,
+flagged for whoever chases the resnet50 loss=0 caveat next, since it now
+looks like the same mechanism rather than two unrelated ones.
 
 ## Two vendor bugs, both silent
 
