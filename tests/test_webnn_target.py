@@ -154,9 +154,7 @@ def test_gemm_fusion_backend_webnn_matches_unrestricted():
         opset=17,
     )
 
-    model_unrestricted, _ = onnxsim.simplify(
-        model, gemm_fusion_backend="unrestricted"
-    )
+    model_unrestricted, _ = onnxsim.simplify(model, gemm_fusion_backend="unrestricted")
     model_webnn, _ = onnxsim.simplify(model, gemm_fusion_backend="webnn")
 
     ops_unrestricted = {n.op_type for n in model_unrestricted.graph.node}

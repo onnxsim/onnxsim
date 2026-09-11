@@ -140,9 +140,7 @@ def test_gemm_fusion_backend_webgpu_matches_unrestricted():
         opset=17,
     )
 
-    model_unrestricted, _ = onnxsim.simplify(
-        model, gemm_fusion_backend="unrestricted"
-    )
+    model_unrestricted, _ = onnxsim.simplify(model, gemm_fusion_backend="unrestricted")
     model_webgpu, _ = onnxsim.simplify(model, gemm_fusion_backend="webgpu")
     model_ort_cpu, _ = onnxsim.simplify(model, gemm_fusion_backend="ort_cpu")
 

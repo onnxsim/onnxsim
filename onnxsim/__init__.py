@@ -313,7 +313,10 @@ from onnxsim.torch_training import (
     export_torch_module_to_onnx,
 )
 from onnxsim.transformers_export import export_transformers_model
-from onnxsim.webgpu_target import check_webgpu_attention_support, estimate_webgpu_islands
+from onnxsim.webgpu_target import (
+    check_webgpu_attention_support,
+    estimate_webgpu_islands,
+)
 from onnxsim.webnn_target import check_webnn_support, estimate_webnn_islands
 from onnxsim.xnnpack_codegen import export_xnnpack_c, generate_xnnpack_c
 from onnxsim.zeroquant import apply_zeroquant
