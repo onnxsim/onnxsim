@@ -42,6 +42,22 @@ same output before and after. That is real, mechanical verification that
 the graph now reads as compliant and still computes the same thing; it is
 not a substitute for an actual `axelera.compiler` run.
 
+Each of these three rules also has a C++ counterpart in onnxsim's own core
+(`onnxsim/passes/explicit_auto_pad.h`, `gemm_transa_to_transpose.h`,
+`maxpool_rowmajor_when_indices_unused.h`), registered as opt-in
+`PassType::Other` optimizers -- `onnxsim.simplify(model,
+extra_optimizers=["explicit_auto_pad", "gemm_transA_to_transpose",
+"maxpool_rowmajor_when_indices_unused"])`, or `--enable-optimization
+<name>` from the CLI -- so the same rewrites are available from every
+onnxsim binding (Python, C, Rust, npm/WASM), not only as a script run
+against a standalone `onnx.ModelProto`. This file stays useful on its own:
+it needs nothing beyond the `onnx` package (no onnxsim build), and its
+module-level functions compose freely with `legalize()`/`RULES` for
+scripting. See `tests/test_explicit_auto_pad.py`,
+`tests/test_gemm_transa_to_transpose.py` and
+`tests/test_maxpool_rowmajor_when_indices_unused.py` for the C++ passes'
+own tests.
+
 Usage::
 
     legalize.py in.onnx out.onnx

@@ -141,6 +141,36 @@ reference.ReferenceEvaluator`, before vs. after), and cross-checks the
 rewrite is supposed to fully resolve a node -- none of that needs Docker,
 a device, or the optional `axelera-rt`/`axelera-devkit` install.
 
+### The same three rules, natively in onnxsim's own C++ core
+
+`legalize.py` is a standalone script over a bare `onnx.ModelProto` -- useful
+on its own, but Python-only and a separate pass over the graph. The same
+three rewrites also exist as onnxsim C++ passes
+(`onnxsim/passes/explicit_auto_pad.h`, `gemm_transa_to_transpose.h`,
+`maxpool_rowmajor_when_indices_unused.h`), registered as opt-in
+`PassType::Other` optimizers -- so any onnxsim binding (Python, C, Rust,
+npm/WASM), not just this script, can run them, and they run *inside*
+`simplify()`'s own fixed point rather than as a second pass after it:
+
+```python
+model, ok = onnxsim.simplify(
+    model,
+    extra_optimizers=[
+        "explicit_auto_pad",
+        "gemm_transA_to_transpose",
+        "maxpool_rowmajor_when_indices_unused",
+    ],
+)
+```
+
+or `onnxsim in.onnx out.onnx --enable-optimization explicit_auto_pad
+--enable-optimization gemm_transA_to_transpose --enable-optimization
+maxpool_rowmajor_when_indices_unused` from the CLI. See
+`tests/test_explicit_auto_pad.py`, `tests/test_gemm_transa_to_transpose.py`
+and `tests/test_maxpool_rowmajor_when_indices_unused.py` for their tests
+(same rules, `onnxsim.simplify`'s own `check_n` doing the numeric-
+equivalence check instead of a standalone `ReferenceEvaluator` round-trip).
+
 ## Regenerating `voyager_op_support_data.py`
 
 The scraped data snapshot tracks whatever Voyager SDK checkout it was last
