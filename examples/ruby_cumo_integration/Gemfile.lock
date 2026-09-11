@@ -1,0 +1,69 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    cumo (0.6.0)
+    ffi (1.17.4)
+    ffi (1.17.4-aarch64-linux-gnu)
+    ffi (1.17.4-aarch64-linux-musl)
+    ffi (1.17.4-arm-linux-gnu)
+    ffi (1.17.4-arm-linux-musl)
+    ffi (1.17.4-arm64-darwin)
+    ffi (1.17.4-x86-linux-gnu)
+    ffi (1.17.4-x86-linux-musl)
+    ffi (1.17.4-x86_64-darwin)
+    ffi (1.17.4-x86_64-linux-gnu)
+    ffi (1.17.4-x86_64-linux-musl)
+    numo-narray (0.9.2.1)
+    onnxruntime (0.11.7)
+      ffi
+    onnxruntime (0.11.7-aarch64-linux)
+      ffi
+    onnxruntime (0.11.7-arm64-darwin)
+      ffi
+    onnxruntime (0.11.7-x86_64-darwin)
+      ffi
+    onnxruntime (0.11.7-x86_64-linux)
+      ffi
+
+PLATFORMS
+  aarch64-linux
+  aarch64-linux-gnu
+  aarch64-linux-musl
+  arm-linux-gnu
+  arm-linux-musl
+  arm64-darwin
+  ruby
+  x86-linux-gnu
+  x86-linux-musl
+  x86_64-darwin
+  x86_64-linux-gnu
+  x86_64-linux-musl
+
+DEPENDENCIES
+  cumo
+  ffi (~> 1.16)
+  numo-narray
+  onnxruntime
+
+CHECKSUMS
+  cumo (0.6.0) sha256=1d13e2d84402bd9e0527c7a25ace2f40cf45a31dbe445176446be1ad273762ed
+  ffi (1.17.4) sha256=bcd1642e06f0d16fc9e09ac6d49c3a7298b9789bcb58127302f934e437d60acf
+  ffi (1.17.4-aarch64-linux-gnu) sha256=b208f06f91ffd8f5e1193da3cae3d2ccfc27fc36fba577baf698d26d91c080df
+  ffi (1.17.4-aarch64-linux-musl) sha256=9286b7a615f2676245283aef0a0a3b475ae3aae2bb5448baace630bb77b91f39
+  ffi (1.17.4-arm-linux-gnu) sha256=d6dbddf7cb77bf955411af5f187a65b8cd378cb003c15c05697f5feee1cb1564
+  ffi (1.17.4-arm-linux-musl) sha256=9d4838ded0465bef6e2426935f6bcc93134b6616785a84ffd2a3d82bc3cf6f95
+  ffi (1.17.4-arm64-darwin) sha256=19071aaf1419251b0a46852abf960e77330a3b334d13a4ab51d58b31a937001b
+  ffi (1.17.4-x86-linux-gnu) sha256=38e150df5f4ca555e25beca4090823ae09657bceded154e3c52f8631c1ed72cf
+  ffi (1.17.4-x86-linux-musl) sha256=fbeec0fc7c795bcf86f623bb18d31ea1820f7bd580e1703a3d3740d527437809
+  ffi (1.17.4-x86_64-darwin) sha256=aa70390523cf3235096cf64962b709b4cfbd5c082a2cb2ae714eb0fe2ccda496
+  ffi (1.17.4-x86_64-linux-gnu) sha256=9d3db14c2eae074b382fa9c083fe95aec6e0a1451da249eab096c34002bc752d
+  ffi (1.17.4-x86_64-linux-musl) sha256=3fdf9888483de005f8ef8d1cf2d3b20d86626af206cbf780f6a6a12439a9c49e
+  numo-narray (0.9.2.1) sha256=eed76b47eebe1288ffd878b387f1882f4863d8e6ab5dd61453768139e14adceb
+  onnxruntime (0.11.7) sha256=78cc514817f893c71afe6b461b42a8b6ac7a1f03fddc5ef22ba55b02ac7c84ad
+  onnxruntime (0.11.7-aarch64-linux) sha256=1102178e66ce876b223c5708110b5f4d768c97ba15ad6a4cbc89745025f9d70e
+  onnxruntime (0.11.7-arm64-darwin) sha256=802b5de13fbb91b6fcd20a6e45efbab80a84f222f0db02e65fd48e3078ac9099
+  onnxruntime (0.11.7-x86_64-darwin) sha256=ceaae53e1a36f975c109fc231f1804bb4603516f3566f3361499f2fe56b3db6d
+  onnxruntime (0.11.7-x86_64-linux) sha256=d0fd62243c1013d0c14b92dfde452865370ef158c46787f6520198b729558c1a
+
+BUNDLED WITH
+  4.0.9

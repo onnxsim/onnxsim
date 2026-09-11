@@ -1,0 +1,24 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+gem 'ffi', '~> 1.16'
+# https://github.com/ankane/onnxruntime-ruby -- runs the (un)simplified model
+# through a real ONNX Runtime session, as an independent reference check.
+# Vendors its own prebuilt ONNX Runtime binary (Linux x86-64/arm64, Windows;
+# see the gem's README for macOS) -- no separate ORT build needed for this
+# part, unlike onnxsim_c's own (see this directory's README).
+gem 'onnxruntime'
+# CPU fallback for cumo below, used automatically with no GPU (see
+# cumo_compat.rb) -- always installed, unlike cumo itself, since it needs no
+# special hardware.
+gem 'numo-narray'
+
+group :cuda do
+  # https://github.com/sonots/cumo -- GPU (CUDA) NArray, API-compatible with
+  # Numo::NArray above. Needs an NVIDIA GPU + CUDA 11.0+ just to install --
+  # skip this group on a machine (or CI runner) without one:
+  # `bundle config set --local without cuda && bundle install`. See this
+  # directory's README.
+  gem 'cumo'
+end

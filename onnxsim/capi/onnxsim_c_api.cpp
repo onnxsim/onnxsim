@@ -18,6 +18,7 @@
 #include "custom_optimizer_passes.h"
 #include "function_rewriter.h"
 #include "model_info.h"
+#include "onnx/defs/parser.h"
 #include "onnx/proto_utils.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
@@ -463,6 +464,49 @@ OnnxsimStatus onnxsim_simplify_path(
     return ONNXSIM_ERROR;
   } catch (...) {
     SetError(out_error, "unknown error while simplifying the model");
+    return ONNXSIM_ERROR;
+  }
+}
+
+OnnxsimStatus onnxsim_parse_model_text(const char* text, void** out_data,
+                                       size_t* out_size, char** out_error) {
+  if (out_data != nullptr) {
+    *out_data = nullptr;
+  }
+  if (out_size != nullptr) {
+    *out_size = 0;
+  }
+  if (out_error != nullptr) {
+    *out_error = nullptr;
+  }
+  if (text == nullptr) {
+    SetError(out_error, "onnxsim_parse_model_text: text is NULL");
+    return ONNXSIM_ERROR;
+  }
+  try {
+    onnx::ModelProto model;
+    onnx::OnnxParser parser(text);
+    const auto status = parser.Parse(model);
+    if (!status.IsOK()) {
+      SetError(out_error, status.ErrorMessage());
+      return ONNXSIM_ERROR;
+    }
+    std::string bytes;
+    if (!model.SerializeToString(&bytes)) {
+      SetError(out_error, "failed to serialize the parsed ModelProto");
+      return ONNXSIM_ERROR;
+    }
+    if (out_data != nullptr && out_size != nullptr &&
+        !CopyToBuffer(bytes, out_data, out_size)) {
+      SetError(out_error, "out of memory while returning the parsed model");
+      return ONNXSIM_ERROR;
+    }
+    return ONNXSIM_OK;
+  } catch (const std::exception& e) {
+    SetError(out_error, e.what());
+    return ONNXSIM_ERROR;
+  } catch (...) {
+    SetError(out_error, "unknown error while parsing the model text");
     return ONNXSIM_ERROR;
   }
 }

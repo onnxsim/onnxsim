@@ -1,0 +1,7 @@
+# train_and_export.rb's default output -- a run artifact, not a fixture.
+/trained_linear.onnx
+
+# Local `bundle config set --local without ...` choice (e.g. skipping cumo's
+# :cuda group on a machine with no GPU) -- per-checkout, not a project
+# default; see the README's "Prerequisites".
+/.bundle/

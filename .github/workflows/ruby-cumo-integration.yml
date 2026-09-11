@@ -1,0 +1,76 @@
+name: Ruby + cumo Integration
+
+# Builds onnxsim_c (the C ABI, onnxsim/capi/onnxsim_c_api.{h,cpp}) and runs
+# examples/ruby_cumo_integration/'s two scripts against it end to end:
+#
+#   - simplify_and_run.rb: parse ONNX text syntax (onnxsim_parse_model_text),
+#     simplify, and cross-check the result against a real ONNX Runtime
+#     session (the `onnxruntime` gem) and cumo.
+#   - train_and_export.rb: train a tiny linear regression with cumo, export
+#     and simplify the result, and cross-check it the same way.
+#
+# No GPU on this runner, so cumo itself is not installed (its Gemfile group,
+# `:cuda`, is skipped) -- both scripts fall back to Numo::NArray
+# (cumo_compat.rb), which is exactly the path this workflow exercises. See
+# examples/ruby_cumo_integration/README.md.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Weekly, Monday 08:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/ruby-cumo-integration.yml"
+      - "examples/ruby_cumo_integration/**"
+      - "onnxsim/capi/onnxsim_c_api.h"
+      - "onnxsim/capi/onnxsim_c_api.cpp"
+
+concurrency:
+  group: ruby-cumo-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ruby-cumo:
+    name: Simplify + train from Ruby via onnxsim_c
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Configure onnxsim_c (prebuilt ONNX Runtime)
+        run: |
+          cmake -B build \
+            -DONNXSIM_C_API=ON \
+            -DONNXSIM_BUILTIN_ORT=ON \
+            -DONNXSIM_PREBUILT_ORT=ON \
+            -DONNXSIM_PYTHON=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+      - name: Build onnxsim_c
+        run: cmake --build build --target onnxsim_c
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Install Ruby gems (no GPU on this runner -- skip cumo's :cuda group)
+        working-directory: examples/ruby_cumo_integration
+        run: |
+          bundle config set --local without cuda
+          bundle install
+      - name: Run the simplify example
+        working-directory: examples/ruby_cumo_integration
+        env:
+          ONNXSIM_LIB_DIR: ${{ github.workspace }}/build:${{ github.workspace }}/build/prebuilt-ort/onnxruntime-linux-x64-1.29.0/lib
+        run: bundle exec ruby simplify_and_run.rb
+      - name: Run the training example
+        working-directory: examples/ruby_cumo_integration
+        env:
+          ONNXSIM_LIB_DIR: ${{ github.workspace }}/build:${{ github.workspace }}/build/prebuilt-ort/onnxruntime-linux-x64-1.29.0/lib
+        run: bundle exec ruby train_and_export.rb "${{ runner.temp }}/trained_linear.onnx"

@@ -235,6 +235,28 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_path(
     void* rewrite_user_data, char** out_error);
 
 /*
+ * Parses `text` -- ONNX's textual IR syntax, the same format
+ * onnx.parser.parse_model reads in Python (see
+ * https://onnx.ai/onnx/repo-docs/Syntax.html and onnx/defs/parser.h's
+ * OnnxParser) -- into a serialized ONNX ModelProto. Lets a binding with no
+ * protobuf library of its own (e.g. this repo's Rust/Ruby samples) build a
+ * test or example model far more readably than hand-encoding protobuf bytes,
+ * the same way this codebase's own Python tests prefer onnx.parser over
+ * onnx.helper.make_node/make_graph/make_model chains.
+ *
+ * On ONNXSIM_OK, *out_data/*out_size receive a newly allocated buffer holding
+ * the serialized ModelProto; release it with onnxsim_free_buffer. On
+ * ONNXSIM_ERROR (a syntax error, most commonly), *out_error receives a
+ * newly allocated message describing where parsing failed; release it with
+ * onnxsim_free_string. Either out_* pointer may be NULL if the caller does
+ * not want that value.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_parse_model_text(const char* text,
+                                                     void** out_data,
+                                                     size_t* out_size,
+                                                     char** out_error);
+
+/*
  * Return the names of all available fuse/elimination optimizer passes as a
  * single NUL-terminated string with one pass name per line ('\n' separated).
  * Returns NULL on allocation failure. Release with onnxsim_free_string.
