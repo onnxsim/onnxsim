@@ -1,0 +1,104 @@
+name: convertmodel WebGPU/WebNN EP placement checks
+
+# Do onnxsim's own advisory checkers -- onnxsim/webgpu_target.py's
+# check_webgpu_attention_support and onnxsim/webnn_target.py's
+# check_webnn_support -- actually describe what a real browser's
+# onnxruntime-web does, or only what its docs say? Each checker's claim is
+# tested against a matched pair of tiny fixtures (test/make_ep_placement_fixtures.py):
+# a "flagged" one exercising the documented gap and a "clean" control that
+# isn't flagged, both run through onnxruntime-web with verbose EP-placement
+# logging on, so the assertion is "the flagged node measurably fell back off
+# the target EP while the control didn't" -- not just "it fell back somehow".
+#
+#   * test/webgpu_attention_placement.test.mjs -- REQUIRED. An
+#     `Attention`(mask_index) node must not run on WebGPU
+#     (JsExecutionProvider) while the same node without a mask does. Runs on
+#     a real GPU-backed browser for the same reason
+#     convertmodel-webgpu-demo.yml's jobs do (see that workflow's own
+#     comment) -- plain/headless Node has no navigator.gpu at all.
+#   * test/webnn_reshape_placement.test.mjs -- ATTEMPTED AND REPORTED, never
+#     required: docs/webnn.md is explicit that WebNN's browser support is
+#     still experimental and weakest off Windows, and nothing else in this
+#     repo has ever exercised a real WebNN backend in a browser. If this
+#     macOS runner's Chromium has no working WebNN device at all, the test
+#     reports that and exits 0 -- see that test file's own comment. Set
+#     ORT_REQUIRE_WEBNN=1 (via workflow_dispatch, edited in here, or a repo
+#     variable) once/if this is confirmed reliable in this repo's own CI.
+#
+# Scheduled + on demand, plus on PRs that touch the files either check
+# actually depends on -- same reasoning as convertmodel-webgpu-demo.yml.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC (weekly, offset from the training demos' 08:00)
+  workflow_dispatch:
+    inputs:
+      require_webnn:
+        description: "Fail the WebNN job if no WebNN device is reachable here (ORT_REQUIRE_WEBNN)"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - ".github/workflows/convertmodel-ep-placement.yml"
+      - "scripts/convertmodel/test/webgpu_attention_placement.test.mjs"
+      - "scripts/convertmodel/test/webnn_reshape_placement.test.mjs"
+      - "scripts/convertmodel/test/make_ep_placement_fixtures.py"
+      - "scripts/convertmodel/test/ep_placement_fixtures.json"
+      - "scripts/convertmodel/test/webgpu_attention_clean.onnx"
+      - "scripts/convertmodel/test/webgpu_attention_mask.onnx"
+      - "scripts/convertmodel/test/webnn_reshape_constant.onnx"
+      - "scripts/convertmodel/test/webnn_reshape_dynamic.onnx"
+      - "scripts/convertmodel/webnn.mjs"
+      - "scripts/convertmodel/ort_log_capture.mjs"
+      - "scripts/convertmodel/package.json"
+      - "onnxsim/webgpu_target.py"
+      - "onnxsim/webnn_target.py"
+      - "onnxsim/_ep_fragmentation.py"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  webgpu-attention-placement:
+    name: WebGPU Attention mask fallback (required)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU Attention EP-placement check
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-attention-placement
+
+  webnn-reshape-placement:
+    name: WebNN Reshape fallback (best-effort)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebNN Reshape EP-placement check
+        working-directory: scripts/convertmodel
+        env:
+          ORT_REQUIRE_WEBNN: ${{ inputs.require_webnn && '1' || '' }}
+        run: npm run test:webnn-reshape-placement

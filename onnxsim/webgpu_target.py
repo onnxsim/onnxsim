@@ -1,15 +1,35 @@
-"""Flags ``com.microsoft::Attention`` nodes that onnxruntime-web's WebGPU
-execution provider cannot actually accelerate.
+"""Flags ``com.microsoft::Attention`` nodes that crash onnxruntime-web's
+WebGPU execution provider instead of running on the GPU.
 
-onnxruntime-web's WebGPU backend lists both ``Attention`` and
-``MultiHeadAttention`` as supported ops, but its own operator table
-(``js/web/docs/webgpu-operators.md``) annotates both with "need implementing
-mask and past/present": the WebGPU kernel does not yet handle the
-``mask_index`` or ``past``/``present`` KV-cache inputs. A node using either
-one is still a *valid* graph -- ``onnx.checker`` has nothing to say about it
--- but at runtime onnxruntime-web falls back to a different execution
-provider (wasm/CPU) for that node instead of running it on the GPU, silently
-losing the acceleration a "webgpu target" simplification was meant to get.
+onnxruntime-web's WebGPU backend lists ``Attention`` as a supported op, but
+its own operator table (``js/web/docs/webgpu-operators.md``) annotates it
+with "need implementing mask and past/present": the WebGPU kernel does not
+yet handle the ``mask_index`` or ``past``/``present`` KV-cache inputs. A node
+using either one is still a *valid* graph -- ``onnx.checker`` has nothing to
+say about it.
+
+**This is not a graceful fallback.** It was originally documented here as
+one (matching how ORT's docs describe most operator-coverage gaps: the
+unsupported node quietly falls back to another execution provider), but
+running the actual check against onnxruntime-web 1.29 found otherwise: ONNX
+Runtime's partitioner assigns a node to WebGPU by op type alone --
+``GetCapability`` has no way to inspect *which optional inputs are wired
+up* -- so a ``mask_index``-bearing ``Attention`` node is still committed to
+WebGPU at partition time, and only fails once its kernel actually runs::
+
+    Error: [WebGPU] Kernel "[Attention] " failed. Error: Mask not supported
+
+This happens even with ``wasm`` listed as a fallback provider (verified in
+``scripts/convertmodel/test/webgpu_attention_placement.test.mjs``, which
+runs this exact scenario in a real browser): a fallback provider only
+catches nodes ``GetCapability`` declined outright, not ones that were
+accepted and then failed at ``Compute()``-time. So the real, measured
+consequence of this gap is ``session.run()`` throwing and the **whole
+session failing** -- not "just this node loses acceleration". This was only
+confirmed for ``mask_index`` (building a ``past``/``present`` KV-cache tensor
+for the same test needs more setup); ``past`` is grouped with the same "need
+implementing" note upstream, but is not separately, empirically re-verified
+here.
 
 :func:`onnxsim.fuse_attention <onnxsim.onnx_simplifier>`'s own fusion
 (``onnxsim/passes/fuse_attention.h``) never produces this shape itself -- it
@@ -26,13 +46,13 @@ the model is about to be shipped to a WebGPU-targeting caller -- not on the
 input model, since simplification could in principle still add or remove
 such a node.
 
-:func:`estimate_webgpu_islands` goes one step further: instead of just
-listing offending nodes, it estimates how many separate contiguous "WebGPU
-islands" they split the rest of the graph into, and how many device-copy
-boundaries result -- see ``onnxsim._ep_fragmentation`` for what that means
-and, importantly, what it does *not* claim to know (it isn't a full
-simulation of ONNX Runtime's partitioner -- only the specific gap this module
-checks for).
+:func:`estimate_webgpu_islands` estimates how many separate contiguous
+"WebGPU islands" a flagged node would split the rest of the graph into, and
+how many device-copy boundaries would result, *if* the node gracefully fell
+back the way ``onnxsim._ep_fragmentation`` assumes -- worth having for
+whatever future gap actually does fall back gracefully, but given the
+finding above, that model **understates** what actually happens for this
+specific, currently-checked gap: a crash, not a fallback with copy overhead.
 """
 
 from __future__ import annotations
@@ -77,9 +97,12 @@ def _flagged_attention_nodes(graph: onnx.GraphProto) -> List[Tuple[int, str]]:
                 i,
                 f"Attention node {node_label!r} has {' and '.join(unsupported)} "
                 "wired up; onnxruntime-web's WebGPU execution provider does not "
-                "yet implement mask/past-present support for Attention, so this "
-                "node will fall back to a different execution provider instead "
-                "of running on the GPU.",
+                "yet implement mask/past-present support for Attention, and "
+                "(verified for mask_index, see this module's docstring) this "
+                "is not a graceful fallback to another execution provider -- "
+                "the WebGPU kernel throws at runtime and the whole "
+                "session.run() call fails, even with wasm listed as a "
+                "fallback provider.",
             )
         )
     return flagged
@@ -89,16 +112,17 @@ def check_webgpu_attention_support(
     model: Union[str, onnx.ModelProto],
 ) -> List[str]:
     """Scans for ``com.microsoft::Attention`` nodes wired up with a
-    ``mask_index`` and/or ``past`` input -- the configuration
-    onnxruntime-web's WebGPU execution provider does not accelerate (see this
-    module's docstring).
+    ``mask_index`` and/or ``past`` input -- the configuration that crashes
+    onnxruntime-web's WebGPU execution provider at runtime rather than
+    running on the GPU (see this module's docstring for the mechanism, and
+    why "does not accelerate" understates it).
 
     :param model: the onnx ModelProto to inspect, or a file path
     :returns: one human-readable message per offending node (empty if none);
             each message names the node and which unsupported input(s) it
-            uses. This is advisory only -- it does not modify ``model`` or
-            raise, since the graph is still perfectly valid, just not
-            GPU-accelerated for that node.
+            uses. This is advisory only -- it does not modify ``model`` and it
+            does not itself raise (the graph is still perfectly valid ONNX),
+            but running the flagged node's model on WebGPU will.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)

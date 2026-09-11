@@ -20,8 +20,22 @@ already visible in this codebase or documented upstream:
   (``js/web/docs/webnn-operators.md``) documents both ops' shape input as
   required to be constant: Reshape's note reads "Input 'shape' should be a
   constant, 0 dimension value in 'shape' is not supported", Expand's reads
-  "'shape' input should be a constant". A dynamically computed shape (common
-  wherever a model isn't fully static) makes just that node fall back.
+  "'shape' input should be a constant". Neither note says what actually
+  happens if it isn't. Running the equivalent WebGPU/Attention gap
+  (``onnxsim.webgpu_target``) against a real onnxruntime-web build found that
+  kind of "unsupported input configuration, not unsupported op" gap tends to
+  throw at kernel-execution time rather than gracefully fall back --
+  ``GetCapability`` accepts the op by type alone and cannot see that a
+  specific input isn't constant. A one-off local run of this exact Reshape
+  case against an experimental WebNN backend (not on the target macOS/real-EP
+  hardware -- see ``scripts/convertmodel/test/webnn_reshape_placement.test.mjs``'s
+  own comment) reproduced a runtime failure for the dynamic-shape case and
+  not the constant one, consistent with that mechanism, though with different
+  wording ("MLTensor(s) doesn't match the expectation") than the upstream
+  note -- plausibly because a dynamic shape needs an extra runtime tensor the
+  WebNN graph builder didn't account for. Treat "falls back" below as
+  optimistic phrasing pending a confirmed run on real hardware: the more
+  likely outcome, by analogy, is the whole session failing.
 
 Both checks are necessarily heuristic: WebNN's actual operator/dtype support
 varies by backend (CPU/GPU/NPU), browser version, and is still evolving (see
@@ -102,7 +116,10 @@ def _flagged_reshape_expand_nodes(
                     f"{node.op_type} node {node_label!r} has a non-constant "
                     f"shape input ({shape_input!r}); onnxruntime-web's WebNN "
                     f"operator table requires {node.op_type}'s shape input to "
-                    "be constant, so this node will fall back off WebNN.",
+                    "be constant. This may not gracefully fall back off "
+                    "WebNN -- see this module's docstring for why the more "
+                    "likely outcome (by analogy with a confirmed, similar "
+                    "WebGPU gap) is the whole session failing at runtime.",
                 )
             )
     return flagged
@@ -131,11 +148,15 @@ def check_webnn_support(model: Union[str, onnx.ModelProto]) -> List[str]:
 def estimate_webnn_islands(model: Union[str, onnx.ModelProto]) -> IslandReport:
     """Estimates how much the non-constant-shape ``Reshape``/``Expand`` nodes
     :func:`check_webnn_support` flags fragment the rest of the graph into
-    separate WebNN-accelerated islands (see this module's docstring and
-    ``onnxsim._ep_fragmentation`` for the method and its limits: this only
-    accounts for that one gap, so it is a lower bound on real fragmentation,
-    not a full simulation of ONNX Runtime's partitioner, and it does not
-    factor in the separate INT64 graph-boundary gap at all).
+    separate WebNN-accelerated islands, *if* this gap gracefully falls back
+    the way ``onnxsim._ep_fragmentation`` assumes (see this module's
+    docstring: the more likely outcome, by analogy with a confirmed WebGPU
+    gap, is the whole session failing instead -- which this estimate would
+    then understate, the same way ``onnxsim.webgpu_target``'s equivalent
+    does). This only accounts for that one gap either way, so it is a lower
+    bound on real fragmentation, not a full simulation of ONNX Runtime's
+    partitioner, and it does not factor in the separate INT64 graph-boundary
+    gap at all.
 
     :param model: the onnx ModelProto to inspect, or a file path
     :returns: an :class:`onnxsim._ep_fragmentation.IslandReport`

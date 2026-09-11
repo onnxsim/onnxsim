@@ -40,7 +40,9 @@
     "coverage": "c8 npm run test:all",
     "test:webgpu-hf-demo": "node test/webgpu_hf_demo.test.mjs",
     "test:webgpu-cifar10": "node test/webgpu_cifar10_pretrain.test.mjs",
-    "test:webgpu-train-loop-demo": "node test/webgpu_train_loop_demo.test.mjs"
+    "test:webgpu-train-loop-demo": "node test/webgpu_train_loop_demo.test.mjs",
+    "test:webgpu-attention-placement": "node test/webgpu_attention_placement.test.mjs",
+    "test:webnn-reshape-placement": "node test/webnn_reshape_placement.test.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "^1.29.0"

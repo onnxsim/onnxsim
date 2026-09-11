@@ -1,0 +1,74 @@
+{
+  "webgpuAttention": {
+    "flaggedOp": "Attention",
+    "cases": {
+      "clean": {
+        "file": "webgpu_attention_clean.onnx",
+        "inputs": {
+          "x": {
+            "dims": [
+              1,
+              4,
+              8
+            ],
+            "dtype": "float32"
+          }
+        }
+      },
+      "mask": {
+        "file": "webgpu_attention_mask.onnx",
+        "inputs": {
+          "x": {
+            "dims": [
+              1,
+              4,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "mask_index": {
+            "dims": [
+              1
+            ],
+            "dtype": "int32"
+          }
+        }
+      }
+    }
+  },
+  "webnnReshape": {
+    "flaggedOp": "Reshape",
+    "cases": {
+      "clean": {
+        "file": "webnn_reshape_constant.onnx",
+        "inputs": {
+          "x": {
+            "dims": [
+              2,
+              3
+            ],
+            "dtype": "float32"
+          }
+        }
+      },
+      "dynamic": {
+        "file": "webnn_reshape_dynamic.onnx",
+        "inputs": {
+          "x": {
+            "dims": [
+              2,
+              3
+            ],
+            "dtype": "float32"
+          },
+          "like": {
+            "dims": [
+              6
+            ],
+            "dtype": "float32"
+          }
+        }
+      }
+    }
+  }
+}
