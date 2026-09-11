@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Garbage-collect old ``.dev`` releases from the TestPyPI project.
 
-Every push to ``master`` uploads the full wheel matrix to TestPyPI as a new
-``X.Y.Z.devN`` release (see ``.github/workflows/build-and-test.yml``). These
+Once a day (if ``master`` has new commits), plus any manually dispatched run,
+the full wheel matrix is uploaded to TestPyPI as a new ``X.Y.Z.devN`` release
+(see ``.github/workflows/build-and-test.yml``, ``upload_pypi``). These
 pile up quickly -- the recent ``0.6.5.dev*`` builds are ~375 MB each -- and
 TestPyPI enforces a 10 GB per-project limit. This script prunes the old dev
 builds so the project stays under the cap.

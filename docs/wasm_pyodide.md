@@ -332,7 +332,7 @@ path, and calls `_list_optimizers()` to confirm it's genuinely
 functional.
 
 **Wired into the release flow, but as a best-effort addition, not a
-blocking one**: `build_wheel_pyodide` runs on `push`/`release`/
+blocking one**: `build_wheel_pyodide` runs on `push`/`release`/`schedule`/
 `workflow_dispatch` (not a plain `pull_request` -- the underlying wasm32
 build is already functionally validated per-PR by the separate,
 path-filtered `pyodide-wasm.yml`; this job's own job is producing the
@@ -344,10 +344,11 @@ It runs with `continue-on-error: true`: this is genuinely new, first-time-
 in-CI automation (previously validated only once, by hand, at a now-
 outdated ABI epoch -- 314.0.5/`2026_0`, before the epoch-matching fix
 above), so a failure here must not hold back the native wheels every
-existing user actually depends on. A push to `master` already exercises
+existing user actually depends on. The daily schedule already exercises
 the whole thing for real, safely, before it ever matters: `upload_pypi`
-publishes push builds to Test PyPI, not the real index, so this job's
-first few real runs are a genuine dry run, not a live release gate.
+publishes scheduled (and manually dispatched) builds to Test PyPI, not the
+real index, so this job's first few real runs are a genuine dry run, not a
+live release gate.
 
 **Still an open question, not yet observed**: this is the first time this
 exact combination (`pyodide build` + the `ONNXSIM_WASM_SIDE_MODULE_RELINK`
