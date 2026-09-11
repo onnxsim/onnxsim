@@ -227,6 +227,24 @@ near-zero dummy batch's loss landed at 0.1416 on the card against 0.0972 from
 the fp32 host reference, the right order of magnitude for INT8 quantization
 noise on an untuned calibration set, not a wiring bug.
 
+**One level lower, also closed: `docs/axera-mcode-quantize-elimination-probe.md`**
+investigated whether the same redundancy could be removed by patching the
+*compiled mcode* directly (this project's reverse-engineered NPU
+command-queue codec, `scripts/axera/mcode.py`/`emitter.py`) rather than the
+ONNX graph. Confirmed the exact redundant pair at the instruction level
+(`fc.weight`'s two S8, same-scale/zeropoint `AxQuantizeLinear`s) but found
+the win available even in the best case is small (~1.5% of step cycles, not
+the 48.8-56.7% the op-type total suggests -- most of that total is the two
+trainable convolutions' *legitimately* different raw-layout vs.
+im2col-tap-layout quantizations, not redundant copies), and found a harder
+blocker than expected: recompiling the *identical* graph and calibration
+data a second time produced a **63%-different mcode blob** (and a different
+length), despite an identical compiler cost estimate (`max_cycle`) both
+times -- so any address-level patch would need to be rederived per build,
+not learned once. Concluded not feasible to pursue further with current
+understanding; see that doc for the full evidence and what would change the
+conclusion.
+
 ### The transpose/slice half was fixable, from the ONNX side -- 28% more
 
 Unlike the quantize half, the `AxTranspose`/`AxSlice` 26.3% *was* squarely
