@@ -82,7 +82,7 @@ from typing import Dict, Sequence, Tuple
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -106,6 +106,182 @@ _POST_BACKWARD_RULES = (
     "gemm_to_matmul",
     "act_weight_conv_to_matmul",
 )
+
+
+def _linearize_trainable_convs(
+    model: onnx.ModelProto, params: Sequence[str]
+) -> onnx.ModelProto:
+    """Rewrites each `Conv` node whose weight is in `params` from `Conv(x,
+    w)` into the *same* im2col-as-gather identity `onnxsim.graph_grad`'s own
+    `_grad_conv` already uses internally for this op's backward -- one
+    `Gather`/`Mul`(mask)/`MatMul`, no `Transpose` of the weight at all.
+
+    Why this exists, and why `legalize.act_weight_conv_to_matmul` is not
+    enough: this weight is about to become **state** -- an input *and* an
+    output of a graph run repeatedly by a resident runner that keeps state
+    device-side between calls (see this module's docstring). Left as a plain
+    `Conv(x, w)`, `act_weight_conv_to_matmul` legalizes it by transposing `w`
+    from `[Cout, Cin, k...]` into `[k..., Cin, Cout]` *inside the compiled
+    graph* -- correct for a one-shot inference graph, but on a real AX650N
+    that transpose is recomputed from scratch on every `Execute()` call even
+    though the weight barely changes step to step: measured (real hardware,
+    `pulsar2 build --compiler.npu_perf`) at 89.6% of the whole step's
+    `AxTranspose` cost and 13.3% of total NPU cycles, entirely from the two
+    512-channel trainable convs (`docs/axera-on-device-training-
+    handoff.md`'s "AxTranspose/AxSlice glue" section).
+
+    The fix is not to *move* that transpose to build time (an earlier
+    version of this function tried exactly that, pre-transposing the weight
+    once in host numpy and keeping state in the transposed layout -- it
+    numerically works, but `graph_grad.build_backward` cannot differentiate
+    the `Pad`/`Slice`/`Concat` nodes `act_weight_conv_to_matmul`'s own
+    construction needs, none of which have a gradient rule, built-in or
+    registerable without hand-writing three new ones). The fix is to **avoid
+    needing a weight transpose in the first place**: `_grad_conv`'s own
+    docstring spells out the identity --
+
+        col[c, t, o] = X[c, position(o, t)]      (im2col: one gather)
+        Y[m, o]      = sum_{c, t} W[m, c, t] * col[c, t, o]
+
+    -- where "W reshaped to `[M, C*K]`" is `w.reshape(Cout, -1)`, a plain
+    C-order reshape of the *original* `[Cout, Cin, k...]` layout with no
+    data movement at all, because `Cin` is already `W`'s second axis and
+    `k...` are already trailing -- unlike `act_weight_conv_to_matmul`'s
+    `[k..., Cin, Cout]`, which moves `Cout` from first to last. Building the
+    forward pass with this identity (reusing `graph_grad`'s own
+    `_conv_geometry`/`_im2col_indices` so the index/mask tables are exactly
+    the ones `_grad_conv` would derive for the same node) means: no weight
+    transpose ever appears, `Gather`/`Mul`/`MatMul`/`Reshape` are all
+    builtin-differentiable so `build_backward` needs no custom gradient
+    registration either, and the gradient it produces is already in `w`'s
+    original, unchanged shape -- so **state stays exactly the shape it
+    always was**, nothing above this function (`params`, `state`,
+    `shapes[p]`) changes at all.
+
+    A `Conv` this function declines (see `_conv_geometry`'s own refusals:
+    not 1-D/2-D, `auto_pad`, a geometry that does not reproduce its declared
+    output shape, ...; grouped convs are declined here directly, since the
+    identity above assumes `group=1`) is left untouched and still caught by
+    `act_weight_conv_to_matmul` later in `_POST_BACKWARD_RULES` -- this
+    function is an optimization for the common case (an ungrouped 1-D/2-D
+    conv, which is every trainable conv resnet18 has), not a superset of
+    that rule's coverage.
+    """
+    shapes = legalize._value_shapes(model)
+    initializers = {t.name: t for t in model.graph.initializer}
+    trained = set(params)
+    out_nodes = []
+    linearized = set()
+
+    for node in model.graph.node:
+        w = node.input[1] if node.op_type == "Conv" and len(node.input) > 1 else None
+        if w is None or w not in trained or not legalize._is_initializer(model, w):
+            out_nodes.append(node)
+            continue
+
+        w_array = numpy_helper.to_array(initializers[w])
+        x_shape, y_shape = shapes.get(node.input[0]), shapes.get(node.output[0])
+        if not x_shape or not y_shape:
+            out_nodes.append(node)
+            continue
+        try:
+            group, kernel, strides, dilations, pads_begin = graph_grad._conv_geometry(
+                node, tuple(x_shape), tuple(w_array.shape), tuple(y_shape)
+            )
+        except graph_grad.UnsupportedOpError:
+            out_nodes.append(node)
+            continue
+        if group != 1:
+            out_nodes.append(node)  # the reshape identity below assumes group=1
+            continue
+
+        cout, cin = int(w_array.shape[0]), int(w_array.shape[1])
+        in_dims, out_dims = [int(d) for d in x_shape[2:]], [int(d) for d in y_shape[2:]]
+        taps = graph_grad._prod(kernel)
+        in_count, out_count = graph_grad._prod(in_dims), graph_grad._prod(out_dims)
+        index, mask = graph_grad._im2col_indices(
+            in_dims, out_dims, kernel, strides, dilations, pads_begin
+        )
+
+        stem = node.name or node.output[0]
+        made = []
+
+        def const(array, hint):
+            name = legalize._unique_name(model, f"{stem}_{hint}")
+            model.graph.initializer.append(numpy_helper.from_array(array, name))
+            return name
+
+        def op(op_type, inputs, hint, **attrs):
+            out = legalize._unique_name(model, f"{stem}_{hint}")
+            made.append(
+                helper.make_node(
+                    op_type,
+                    inputs,
+                    [out],
+                    name=legalize._unique_name(model, f"{stem}_{hint.upper()}"),
+                    **attrs,
+                )
+            )
+            return out
+
+        batch = int(x_shape[0])
+        x3 = op(
+            "Reshape",
+            [node.input[0], const(np.array([batch, cin, in_count], np.int64), "x3s")],
+            "x3",
+        )
+        gathered = op(
+            "Gather",
+            [x3, const(np.array(index, np.int64), "idx")],
+            "gathered",
+            axis=2,
+        )
+        masked = op(
+            "Mul",
+            [
+                gathered,
+                const(mask.reshape(1, 1, taps * out_count).astype(np.float32), "mask"),
+            ],
+            "masked",
+        )
+        col = op(
+            "Reshape",
+            [masked, const(np.array([batch, cin * taps, out_count], np.int64), "cols")],
+            "col",
+        )
+        w2 = op(
+            "Reshape",
+            [w, const(np.array([cout, cin * taps], np.int64), "w2s")],
+            "w2",
+        )
+        y3 = op(
+            "MatMul", [w2, col], "mm"
+        )  # [Cout,C*K] x [batch,C*K,out] -> [batch,Cout,out]
+        if len(node.input) > 2 and node.input[2]:
+            bias4 = op(
+                "Reshape",
+                [node.input[2], const(np.array([1, cout, 1], np.int64), "bs")],
+                "bias3",
+            )
+            y3 = op("Add", [y3, bias4], "biased")
+        # [batch, Cout, out_count] -> [batch, Cout, *out_dims], the original
+        # Conv's own declared output shape/name.
+        made.append(
+            helper.make_node(
+                "Reshape",
+                [y3, const(np.array([batch, cout] + out_dims, np.int64), "ys")],
+                [node.output[0]],
+                name=legalize._unique_name(model, f"{stem}_Y"),
+            )
+        )
+
+        out_nodes.extend(made)
+        linearized.add(w)
+
+    if linearized:
+        del model.graph.node[:]
+        model.graph.node.extend(out_nodes)
+    return model
 
 
 def add_mse_loss(
@@ -170,6 +346,15 @@ def build_resident_step(
     legalize.avgpool_ceil_to_floor(model)
     legalize.flatten_to_reshape(model)
     legalize.global_pool_to_reduce(model)
+    onnx.checker.check_model(model)
+
+    # Pre-transpose any trainable Conv's weight into matmul layout now, in
+    # host numpy, once -- instead of leaving `act_weight_conv_to_matmul` to
+    # rebuild that transpose on the device every step. See
+    # `_linearize_trainable_convs`'s own docstring for the measured cost
+    # this removes; `params`'/`state`'s names are unaffected, only the
+    # linearized weights' shapes change.
+    model = _linearize_trainable_convs(model, params)
     onnx.checker.check_model(model)
 
     shapes, elem_types = _static_shapes_and_types(model)

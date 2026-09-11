@@ -113,7 +113,7 @@ Batch size is nearly free until it is not: batch 1 to 16 costs 0.38 ms
 (1.40 -> 1.78) for **12.6x** the throughput; batch 64 is worse *per sample*
 than 16.
 
-### Weights resident with in-graph updates: 5.2x, measured
+### Weights resident with in-graph updates: 7.0x, measured
 
 The 42.9 MB the resnet18 step moves is every trainable weight crossing the
 host boundary twice -- once in as a graph input, once back out as the
@@ -133,13 +133,16 @@ Same four tensors, same `resnet18d` shape, real AX650N, 30 timed steps after
 | --- | --- | --- |
 | baseline (host applies `w -= lr*grad`, 42.9 MB/step) | 200.6 ms | -- |
 | in-graph update, **non-resident** (`-n`: state round-tripped through host) | 114.8 ms | 110.6 ms |
-| in-graph update, **resident** (state copied device-to-device) | **38.3 ms** | 36.0 ms |
+| in-graph update, **resident** (state copied device-to-device) | 38.3 ms | 36.0 ms |
+| resident + `_linearize_trainable_convs` (no weight transpose) | **28.6 ms** | 26.3 ms |
 
-**5.2x**, not quite the "roughly 10x" estimated -- real, and short of the
-estimate for a real reason (below), not a measurement artifact: the
-non-resident row isolates that some of the win is just the in-graph update
-itself (fewer distinct tensors cross the wire even before residency helps),
-and the resident row is the full effect.
+**5.2x** from residency alone, not quite the "roughly 10x" estimated -- real,
+and short of the estimate for a real reason (below), not a measurement
+artifact: the non-resident row isolates that some of the win is just the
+in-graph update itself (fewer distinct tensors cross the wire even before
+residency helps), and the resident row is the full effect. Removing the
+weight-transpose tax (last row, see below) pushes the total to **7.0x**
+(200.6 ms -> 28.6 ms).
 
 A `--compiler.npu_perf` profile of the resident graph (`pulsar2_docker.
 build(profile=True)`, see `scripts/axera/README.md`'s "Real NPU profiling"
@@ -158,9 +161,62 @@ transpose/slice glue, not arithmetic** -- the tax `act_weight_conv_to_matmul`
 pays for turning a live-weight `Conv` into per-tap `MatMul`s (each tap needs
 its own `Slice` and `Transpose`, and apparently its own quantization
 boundary). Residency removed the *transfer* bottleneck; this is what is left,
-and it is now the bigger one. Untried: whether `fuse=True`'s single wide
-matmul-per-conv (already default) can be pushed further, or whether the
-per-tap quantize/dequantize pairs can be coalesced.
+and it is now the bigger one.
+
+### The quantize redundancy is real, and not fixable from the ONNX side
+
+Each trainable weight is read directly by **three** nodes -- the forward
+conv-as-matmul's weight-transpose, its own gradient's reshape, and the
+in-graph SGD `Sub` -- and Pulsar2 inserts a **separate `AxQuantizeLinear` per
+edge** rather than sharing one quantized copy: confirmed on the compiled
+graph, `fc.weight` and all three `layer4` weights are each quantized 2-3
+times, while **no ordinary multi-consumer activation in the same graph is
+ever requantized more than once**. Checking the quantize nodes' own
+parameters found the redundancy is partly real: two of the three edges for
+`layer4.1.conv1`'s weight (the forward-matmul path and the gradient-reshape
+path) quantize to the *identical* domain (`S8`, `scale=0.00209808`,
+`zeropoint=0`) -- genuinely the same computation, done twice. The third (the
+SGD-update `Sub`) quantizes to a different domain entirely (`U8`,
+`scale=0.00209251`, `zeropoint=128`), so that one is not redundant: the
+update path legitimately needs its own quantization range.
+
+**Tried and failed: routing all three edges through one shared node.** Two
+spellings, both mathematically identity and both checked bit-exact against
+the un-rewritten graph on host (`onnxruntime`, max abs diff `0.0`):
+
+| shared-node spelling | result |
+| --- | --- |
+| `Reshape(w, same_shape)` | no change |
+| `Mul(w, ones_like(w))` | no change |
+
+Both compiled to the **exact same 213-node optimized/quantized graph**
+(`frontend/optimized_quant_axmodel.onnx`) and the **exact same
+`max_cycle`** (31,369,216) as the unmodified graph -- Pulsar2's own frontend
+optimizer canonicalizes a same-shape `Reshape` and a multiply-by-a-literal-
+all-ones-constant as identities and removes them **before** its
+quantization-boundary insertion pass runs, independent of anything onnxsim
+did upstream (both variants only needed `onnxsim.simplify()`'s
+`eliminate_nop_reshape` to *not* run, which it didn't here since these were
+inserted after the last `simplify()` call -- and it made no difference,
+because Pulsar2 does the same collapse internally regardless). This is a
+different failure shape than the `Gemm`-reconstruction bug elsewhere in this
+document: that fix worked by changing *which pattern matches* (a 1-D bias
+vs. a `[1, N]` one); there is no equivalent lever here, because the thing
+being matched is generic identity-elimination, not a specific fusion
+pattern with a shape precondition to dodge.
+
+**So this one op-type share is confirmed structural, not an oversight
+onnxsim's graph shape controls.** Whatever decides Pulsar2 requantizes a
+live-weight input per direct consumer instead of per distinct
+(source, quantization-domain) pair is internal to Pulsar2's own frontend
+compiler; there is no ONNX-graph-level lever this project has access to that
+moves it. Not investigated: whether Pulsar2's `layer_configs` can pin one
+named intermediate's quantization domain such that two edges are *forced*
+into the same domain by construction rather than merely happening to match
+-- worth trying if this is revisited, but it wasn't tried here since the two
+redundant edges already match by calibration coincidence, not by any config
+this project controls, so forcing it would need to survive the same
+collapse just demonstrated.
 
 Correctness was checked the same way as the rest of this document -- a
 directional-derivative check against `onnxruntime` on host (not the on-device
@@ -170,6 +226,90 @@ no-hardware version of that check) -- and a coarse on-device sanity check: a
 near-zero dummy batch's loss landed at 0.1416 on the card against 0.0972 from
 the fp32 host reference, the right order of magnitude for INT8 quantization
 noise on an untuned calibration set, not a wiring bug.
+
+### The transpose/slice half was fixable, from the ONNX side -- 28% more
+
+Unlike the quantize half, the `AxTranspose`/`AxSlice` 26.3% *was* squarely
+onnxsim's own graph shape, and a real fix landed. The suspect going in was
+per-tap transpose duplication (`act_weight_conv_to_matmul` redoing the
+activation transpose once per tap instead of once per convolution) -- reading
+the rule directly showed that hypothesis was **wrong**: the transpose is
+already hoisted once per convolution, both for the activation and the weight.
+The actual cost was almost entirely (89.6% of the whole step's `AxTranspose`
+cycles) the **weight** transpose alone, `[Cout, Cin, k...] -> [k..., Cin,
+Cout]`, on exactly the two 512-channel trainable convs -- large enough
+(2.36 MB) that Pulsar2 shards it into 16 hardware sub-instructions per
+occurrence, each costing the same ~184K cycles, and it is recomputed from
+scratch on every `Execute()` even though the weight it operates on is now
+resident state that barely changes step to step.
+
+**Why not just pre-transpose the state once and keep it in that layout.**
+That was the first attempt, and it numerically works (a finite-difference
+check confirmed it) but is not what shipped: `act_weight_conv_to_matmul`'s
+own construction needs `Pad`/`Slice`/`Concat`, and `onnxsim.graph_grad` has
+no gradient rule for any of the three -- built-in or registerable without
+hand-writing three new ones (`graph_grad.register_gradient`/`custom_gradient`
+exist for exactly this, but three new rules is a materially bigger, riskier
+change than what actually fixed this).
+
+**What shipped instead: avoid needing a weight transpose at all.**
+`onnxsim.graph_grad._grad_conv` already differentiates a live-weight `Conv`
+without emitting a convolution, by the same im2col identity its own
+docstring spells out:
+
+```
+col[c, t, o] = X[c, position(o, t)]      (im2col: one Gather)
+Y[m, o]      = sum_{c, t} W[m, c, t] * col[c, t, o]
+```
+
+-- where `W` reshaped to `[M, C*K]` is `w.reshape(Cout, -1)`, a **free**
+C-order reshape of the weight's original `[Cout, Cin, k...]` layout (`Cin`
+is already the second axis, `k...` already trailing), unlike
+`act_weight_conv_to_matmul`'s `[k..., Cin, Cout]`, which moves `Cout` from
+first to last and is what actually costs. `build_resident_train_step.py`'s
+`_linearize_trainable_convs` now builds the **forward** pass this same way
+-- reusing `graph_grad`'s own `_conv_geometry`/`_im2col_indices` so the
+index/mask tables are exactly the ones `_grad_conv` would derive for the
+same node -- for every trainable `Conv`, *before* `build_backward` ever
+runs. Since `Gather`/`Mul`/`MatMul`/`Reshape` are all builtin-differentiable,
+`build_backward` needs no custom gradient registration at all, and the
+gradient comes out in `w`'s original, unchanged shape -- state stays exactly
+the shape it always was, `params`/`state`/`shapes[p]` unaffected.
+
+Verified on host first (`tests/test_build_resident_train_step.py`'s new
+`test_linearize_trainable_convs_matches_conv_and_drops_the_weight_transpose`:
+the two resnet18 geometries this actually has to handle -- a strided, biased
+1x1 downsample and a padded, stride-1, biased 3x3, with and without bias --
+matched plain `Conv` on `onnxruntime` to `1e-4`, and no `Transpose` reads the
+weight), then on real hardware, same calibration/build methodology as the
+quantize-half check above:
+
+| | max_cycle | step time (avg / min) |
+| --- | --- | --- |
+| before (weight-transpose per step) | 31,369,216 | 37.5 ms / 35.4 ms |
+| after (`_linearize_trainable_convs`) | 22,625,104 | **28.6 ms / 26.3 ms** |
+
+**-27.9% max_cycle, -23.6% step time** (28.07M vs the naive 45.56M cycle-sum
+this section's profile table was built from -- **-38.4%** by that metric).
+Fresh profile of the "after" graph: `AxTranspose` fell from 6,762,810 cycles
+(14.8% of the old total) to 228,012 (0.8% of the new, smaller total) --
+essentially gone, and better than the design aimed for: Pulsar2's own
+lowering turned the `Gather`s this rule emits into native `AxSlice`
+instructions wherever the index pattern was regular enough to allow it (no
+`AxGather` appears in the new profile at all), cheaper than asking for a
+`Gather` outright. `AxSlice` itself dropped too, 5,239,500 -> 3,550,346
+cycles. `AxQuantizeLinear`/`AxDequantizeLinear` are now the dominant cost by
+a wide margin (56.7% combined of the new, smaller total) -- `AxDequantizeLinear`
+is unchanged in absolute cycles (6,553,923, exactly the old number), which is
+the same structural quantize-per-consumer tax the previous section already
+found and closed; not reinvestigated here.
+
+Committed as `scripts/axera/build_resident_train_step.py`'s
+`_linearize_trainable_convs`, exercised by the new test above plus the
+existing `test_state_output_is_sgd_update_of_the_input`/
+`test_in_graph_gradient_matches_finite_differences` (unchanged, still
+passing -- this function changes nothing any test outside it observes,
+by design).
 
 ## Two vendor bugs, both silent
 
@@ -251,12 +391,28 @@ hand and so calls `simplify()` itself, with the same skip list.
 
 1. **The FP32 gradient seed.** The one untried route past the dying gradient,
    and the difference between a 5,000-step horizon and an open-ended one.
-2. ~~Weights resident with in-graph updates.~~ **Done: 5.2x** (200.6 ms ->
-   38.3 ms/step) -- see "Weights resident with in-graph updates" above.
-   What's left in this direction: the quantize/dequantize + transpose/slice
-   glue around `act_weight_conv_to_matmul`'s per-tap decomposition is now
-   *the* cost (75% of NPU cycles, per the profile above) -- worth another
-   pass on its own before reaching for anything else here.
+2. ~~Weights resident with in-graph updates.~~ **Done: 7.0x** (200.6 ms ->
+   28.6 ms/step) -- see "Weights resident with in-graph updates" above.
+   Residency alone was 5.2x; `_linearize_trainable_convs` (avoiding the
+   per-step weight transpose `act_weight_conv_to_matmul` was paying,
+   confirmed 89.6% of the whole step's `AxTranspose` cost) pushed it the
+   rest of the way. Both sub-bottlenecks the profile originally flagged are
+   now resolved one way or another: quantize/dequantize (48.8%) is
+   **confirmed structural** (Pulsar2's own optimizer, not onnxsim's graph
+   shape -- see "The quantize redundancy is real, and not fixable from the
+   ONNX side"); transpose/slice (26.3%) is **fixed** (see "The
+   transpose/slice half was fixable, from the ONNX side -- 28% more").
+   What's left in this direction: `AxQuantizeLinear`/`AxDequantizeLinear` are
+   now 56.7% of the (smaller) remaining total on a fresh profile of the fixed
+   graph -- `AxDequantizeLinear`'s absolute cycle count is unchanged from
+   before this fix (6,553,923, exactly), so it is very likely the same
+   structural tax already investigated and not a new lead; not
+   reinvestigated. No further concrete, well-scoped lever was found in the
+   op-type profile this iteration -- the next win in this direction, if
+   there is one, likely needs a different angle than "which op type costs
+   the most cycles" (e.g. batching more than one training step's worth of
+   work per `Execute()` call, amortizing whatever fixed per-call overhead
+   remains).
 3. **All 23 tensors, and 224x224.** Only the last four layers and a 64x64 input
    have been built.
 4. **An optimiser beyond SGD.** `qat_graph.adam_update` exists and has never

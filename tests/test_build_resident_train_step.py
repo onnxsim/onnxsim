@@ -161,3 +161,58 @@ def test_in_graph_gradient_matches_finite_differences():
         fd = (loss_at(w_plus) - loss_at(w_minus)) / (2 * eps)
         predicted = float((grads[p] * d).sum())
         assert predicted == pytest.approx(fd, rel=0.05, abs=1e-6), p
+
+
+def test_linearize_trainable_convs_matches_conv_and_drops_the_weight_transpose():
+    """`_linearize_trainable_convs`'s whole reason to exist:
+    `legalize.act_weight_conv_to_matmul` (run later, on the *step* graph)
+    legalizes a live-weight `Conv` by transposing its weight into matmul
+    layout -- measured on real AX650N hardware at 89.6% of the step's
+    `AxTranspose` cost, recomputed from scratch every step for a weight that
+    is now resident state and barely changes step to step
+    (`docs/axera-on-device-training-handoff.md`). This checks the
+    replacement directly: same numbers as `Conv` (including the two
+    resnet18 geometries this actually has to handle -- a strided, biased 1x1
+    downsample and a padded, stride-1, biased 3x3), and no `Transpose` node
+    reads the weight at all.
+    """
+    rng = np.random.default_rng(4)
+    for cin, cout, k, size, stride, pad, has_bias in (
+        (16, 32, 1, 8, 2, 0, True),  # resnet18's downsample conv
+        (16, 16, 3, 8, 1, 1, True),  # resnet18's 3x3 conv, post-BN-fold bias
+        (16, 16, 3, 8, 1, 1, False),  # no bias, the pre-fold shape
+    ):
+        out = (size + 2 * pad - k) // stride + 1
+        cw = (rng.standard_normal((cout, cin, k, k)) * 0.2).astype(np.float32)
+        cb = (rng.standard_normal(cout) * 0.1).astype(np.float32) if has_bias else None
+        model = parser.parse_model(
+            f"""
+            <
+              ir_version: 10,
+              opset_import: ["": 17]
+            >
+            g (float[1,{cin},{size},{size}] x) => (float[1,{cout},{out},{out}] y)
+            {{
+              y = Conv<kernel_shape=[{k},{k}], strides=[{stride},{stride}],
+                       pads=[{pad},{pad},{pad},{pad}]>(x, cw{", cb" if has_bias else ""})
+            }}
+            """
+        )
+        inits = [_f32(cw, "cw")]
+        if has_bias:
+            inits.append(_f32(cb, "cb"))
+        model.graph.initializer.extend(inits)
+
+        x = rng.standard_normal((1, cin, size, size)).astype(np.float32)
+        (ref,) = _run(model, {"x": x}, ["y"])
+
+        linearized = brts._linearize_trainable_convs(
+            onnx.shape_inference.infer_shapes(model), ["cw"]
+        )
+        onnx.checker.check_model(linearized)
+        assert not any(
+            n.op_type == "Transpose" and "cw" in n.input for n in linearized.graph.node
+        )
+        (got,) = _run(linearized, {"x": x}, ["y"])
+        assert got.shape == ref.shape
+        assert np.allclose(got, ref, atol=1e-4), (cin, cout, k, stride, pad, has_bias)
