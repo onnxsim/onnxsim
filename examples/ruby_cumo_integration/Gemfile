@@ -7,3 +7,9 @@ gem 'ffi', '~> 1.16'
 # Numo::NArray. Requires an NVIDIA GPU + CUDA 11.0+ to install and run; see
 # this directory's README.
 gem 'cumo'
+# https://github.com/ankane/onnxruntime-ruby -- runs the (un)simplified model
+# through a real ONNX Runtime session, as an independent reference check.
+# Vendors its own prebuilt ONNX Runtime binary (Linux x86-64/arm64, Windows;
+# see the gem's README for macOS) -- no separate ORT build needed for this
+# part, unlike onnxsim_c's own (see this directory's README).
+gem 'onnxruntime'

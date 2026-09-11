@@ -24,8 +24,19 @@ C ABI the [Rust bindings](../../rust/README.md) use:
 
 The folded constant is then loaded into a `Cumo::NArray` and used to run the
 simplified graph's one remaining node (`y = x + folded_c`) on the GPU via
-cumo, checking the result against what the *unsimplified* graph would have
-produced.
+cumo. That result is checked against two independent references: a real
+ONNX Runtime session (via the
+[`onnxruntime`](https://github.com/ankane/onnxruntime-ruby) gem) run on both
+the unsimplified *and* the simplified model -- the same "does it still
+compute the same result" claim this repo's other backend integrations make
+(see [`docs/dlpack-executor.md`](../../docs/dlpack-executor.md)'s TVM/Halide/
+nncase/tinygrad tests), now exercised from Ruby with a real ORT.
+
+This ORT is intentionally a separate story from onnxsim_c's own: the
+`onnxruntime` gem vendors its own prebuilt ONNX Runtime binary (see
+"Prerequisites" below), so running the model needs no native build at all --
+only *simplifying* it does, since onnxsim_c embeds ONNX Runtime as its own
+constant-folding backend at C++ compile time.
 
 ## Layout
 
@@ -71,15 +82,27 @@ if you'd rather simplify something real.
    set of options -- the library this sample needs is the same one.
 
 2. **Ruby gems**: `bundle install` (see `Gemfile`) -- `ffi` for the C API
-   binding, and [`cumo`](https://github.com/sonots/cumo) for the GPU-backed
-   `NArray`.
+   binding, [`onnxruntime`](https://github.com/ankane/onnxruntime-ruby) for
+   the independent reference check, and [`cumo`](https://github.com/sonots/cumo)
+   for the GPU-backed `NArray`.
+
+   `onnxruntime` needs nothing extra to install on Linux (x86-64/arm64) or
+   Windows -- it vendors a prebuilt ONNX Runtime CPU binary
+   (`OnnxRuntime.ffi_lib`, overridable) and "just works". On macOS it needs
+   `brew install onnxruntime` (Intel) or nothing (Apple Silicon, also
+   vendored); see its README for GPU execution providers
+   (`CUDAExecutionProvider`/`CoreMLExecutionProvider`), which need a
+   separately-downloaded GPU build pointed at via `OnnxRuntime.ffi_lib =`.
+   This is a completely different copy of ONNX Runtime from the one
+   `-DONNXSIM_BUILTIN_ORT=ON` links into `onnxsim_c` above -- no relation
+   between the two beyond both being ONNX Runtime.
 
    cumo needs an NVIDIA GPU (Compute Capability 3.5+), CUDA 11.0+, and
    optionally cuDNN 8.0+ to install and run -- it has no CPU-only mode. On a
    machine without one, `simplify_and_run.rb` falls back to
    [`Numo::NArray`](https://github.com/ruby-numo/numo-narray) (`gem install
    numo-narray`), cumo's CPU-only, constructor-for-constructor-compatible
-   counterpart, so steps 1-3 above (and the arithmetic in step 4) can still be
+   counterpart, so the whole pipeline (onnxruntime included) can still be
    exercised end to end without GPU hardware -- swap in a CUDA machine with
    `cumo` installed to run the real GPU path with no code changes.
 
@@ -95,15 +118,32 @@ convention the Rust bindings use) points at the directory holding
 file itself directly if you'd rather be exact. Expected output looks like:
 
 ```
+onnxruntime reference (unsimplified model): [111.0, 222.0, 333.0, 434.0]
+
 simplifying /tmp/.../sample_model.onnx -> /tmp/.../sample_model.simplified.onnx
 
-                ┌ The Difference ┐
-...op-count / size table...
-
++------------------+----------------+------------------+
+|                  | Original Model | Simplified Model |
++------------------+----------------+------------------+
+| Add              | 2              | 1 *              |
+| Constant         | 2              | 1 *              |
+| Model Size       | 198.0B         | 116.0B *         |
+| Initializers     | 2              | 1 *              |
+| MACs             | 0.0            | 0.0              |
+| FLOPs            | 0.0            | 0.0              |
+| Memory Access    | 96.0B          | 48.0B *          |
+| Memory Footprint | 80.0B          | 48.0B *          |
+| Compute Density  | 0.00 FLOP/Byte | 0.00 FLOP/Byte   |
++------------------+----------------+------------------+
+onnxruntime result (simplified model): [111.0, 222.0, 333.0, 434.0]
 folded initializer "folded_c": dtype=F32 shape=[4]
 cumo result (x + folded_c): [111.0, 222.0, 333.0, 434.0]
-OK: matches the unsimplified graph's reference output
+OK: onnxsim_c, onnxruntime and cumo all agree
 ```
+
+(Captured from an actual run against a locally built `onnxsim_c` -- with the
+`Cumo::NArray`-line coming from the `Numo::NArray` CPU fallback, since that
+run had no GPU.)
 
 To simplify your own model instead of the built-in sample, pass its path:
 
@@ -123,3 +163,7 @@ pointing it at an arbitrary model.)
   `Numo`/`Cumo` element type and are left unmapped.
 - `onnx_pb_writer.rb` only encodes what `build_sample_model.rb` needs
   (float32 tensors, `Add` nodes, no attributes) -- not a general ONNX writer.
+- The three-way result comparison in `simplify_and_run.rb` uses plain `==`/
+  `!=`, which is fine for the built-in sample model's exactly-representable
+  float32 values but not a general floating-point comparison; a model with
+  results that only agree up to rounding would need a tolerance instead.
