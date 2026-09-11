@@ -967,6 +967,48 @@ _CASES = {
         """,
         None,
     ),
+    # `Split` is a MultiOutputRule (`_MULTI_OUTPUT_RULES`, not `_RULES`) --
+    # both outputs consumed, equal sizes (opset 17 has no `split` attribute
+    # or `num_outputs`; omitting the optional `split` input means "divide
+    # evenly among however many outputs are named").
+    "split_add_both_outputs": (
+        """
+        g (float[4,6] A) => (float[4,3] Y) {
+          S0, S1 = Split <axis=1> (A)
+          Y = Add(S0, S1)
+        }
+        """,
+        None,
+    ),
+    # Uneven sizes (the `split` input, opset 13+) and a negative axis, with
+    # only *one* of the two outputs consumed -- exercises the "no term for a
+    # gradient-less output" path and the offset arithmetic for a piece that
+    # does not start at 0.
+    "split_uneven_negative_axis_one_output": (
+        """
+        g (float[2,6] A) => (float[2,4] Y)
+        <int64[2] sizes = {2, 4}>
+        {
+          S0, S1 = Split <axis=-1> (A, sizes)
+          Y = Identity(S1)
+        }
+        """,
+        None,
+    ),
+    # The split axis is not the last one -- the rule's own Transpose-to-last
+    # step actually has to move something, unlike the two cases above (both
+    # split their input's last axis).
+    "split_not_last_axis": (
+        """
+        g (float[6,4] A) => (float[4,4] Y)
+        <int64[2] sizes = {2, 4}>
+        {
+          S0, S1 = Split <axis=0> (A, sizes)
+          Y = Identity(S1)
+        }
+        """,
+        None,
+    ),
 }
 
 

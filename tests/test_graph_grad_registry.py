@@ -182,14 +182,18 @@ def test_supported_ops_stays_builtin_only_while_the_effective_set_grows():
     ``tests/test_qat_parity.py`` pins against ``qat_parity_fixtures.txt`` --
     it must never move just because some other test registered something, or
     that pin would become test-order-dependent. :func:`onnxsim.graph_grad.supported_ops`
-    is the one that reflects registrations."""
-    before = graph_grad.SUPPORTED_OPS
+    is the one that reflects registrations -- and, permanently, whatever is
+    in :data:`onnxsim.graph_grad._MULTI_OUTPUT_RULES` (``Split`` today),
+    which is why the "effective set" baseline below is `supported_ops()`
+    itself rather than the builtin-only constant."""
+    constant = graph_grad.SUPPORTED_OPS
+    before = graph_grad.supported_ops()
     with graph_grad.custom_gradient("Reciprocal", _grad_reciprocal):
-        assert graph_grad.SUPPORTED_OPS is before
+        assert graph_grad.SUPPORTED_OPS is constant
         assert "Reciprocal" not in graph_grad.SUPPORTED_OPS
         assert "Reciprocal" in graph_grad.supported_ops()
         assert graph_grad.supported_ops() == before | {"Reciprocal"}
-    assert graph_grad.SUPPORTED_OPS is before
+    assert graph_grad.SUPPORTED_OPS is constant
     assert graph_grad.supported_ops() == before
 
 

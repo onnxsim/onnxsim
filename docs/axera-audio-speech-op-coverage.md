@@ -72,7 +72,7 @@ simple. `Erf` is GELU's decomposed form -- `transformers`' export already
 emits the Erf-based GELU here, not the fused `Gelu` op, so the Gelu gap above
 does not block this model in practice.
 
-### wav2vec2 -- mostly clean, one open question
+### wav2vec2 -- one gap, now confirmed real (not "maybe")
 
 `transformers.Wav2Vec2Model(...)`, 228 nodes:
 
@@ -82,55 +82,124 @@ does not block this model in practice.
 | `Where`, `IsNaN`, `GreaterOrEqual`, `Equal`, `Expand`, `Slice`, `Cast`, `ConstantOfShape`, `Shape`, `Unsqueeze` | **no** |
 | `Constant` | needs no gradient |
 
-The second row is real but, on inspection, looks like attention-mask/padding
-construction from the `attention_mask` input (`Where`/`IsNaN` guard against
-`-inf` propagating through softmax on fully-masked rows, `Equal`/`GreaterOrEqual`
-build the boolean mask itself) -- a subgraph that depends only on the
-(non-trainable) input mask, not on any trainable weight, and so should never
-need differentiating if the trainable region is a tail of encoder layers
-downstream of where the mask is already folded in as an additive bias.
-**This is not proven here** -- it is a static op-list argument, not a traced
-backward slice. The concrete follow-up: pick a trainable tail (e.g. the last
-1-2 transformer layers, same recipe as resnet18's last-four-layers), run
-`build_backward` over just that slice, and confirm it never needs to touch
-the `Where`/mask subgraph. If the trainable slice is chosen the same way the
-resnet18 work chose its trainable tail (downstream of everything
-mask-related), this is very likely fine, but "likely" is doing real work in
-that sentence until someone runs it.
+The first pass of this survey guessed the `Where`/`IsNaN` row was probably
+confined to attention-mask *construction* -- upstream of, and excludable
+from, any trainable tail chosen downstream of it -- and flagged that as
+unproven. **It is disproven.** Tracing the real export (`onnx.load` +
+following each `Where`/`IsNaN` node's producer/consumer edges, not just its
+op-type membership) shows each of the two encoder layers has its own,
+per-layer `attn_weights = Where(IsNaN(attn_weights), 0, attn_weights)`
+sitting **directly between that layer's own `Softmax` and its own
+`MatMul` with `V`** --
+`/encoder/layers.{i}/attention/IsNaN` -> `/encoder/layers.{i}/attention/Where_1`
+-> `MatMul`. This is numerical-stability cleanup (a fully-masked row's
+softmax is uniform, not `NaN`, until floating-point cancellation makes it one
+in practice -- HF's own attention implementations guard against exactly
+this), and it is baked into *every* layer's own forward computation, not
+shared or hoisted out. So there is no way to choose a trainable tail that
+excludes it: even "the last layer only" (`V`'s projection, the output
+projection) needs a gradient through its own layer's `Where`, because that
+`Where`'s input and output are both fresh intermediates computed inside that
+layer -- unlike an external bias tensor merely *added* to the scores, there
+is nothing outside the layer to treat as an opaque boundary input instead.
+**wav2vec2 (the plain, non-Conformer model) cannot train through any tail
+that includes attention output until `Where` has a backward rule.** That
+rule is not hard -- `Where`'s gradient is `dX = mask * g`, `dY = (1-mask) *
+g` with `mask = Cast(condition, FLOAT)`, i.e. the same "boolean condition
+becomes a float 0/1 multiplied in, never re-emitted as `Where` itself"
+convention `graph_grad`'s own module docstring already states as a rule for
+every hand-written gradient here -- but it is real, unimplemented work, not
+a design workaround. Left for the next person who wants wav2vec2 itself
+(Whisper, below, remains gap-free and is still the better first trial).
 
-### Wav2Vec2-Conformer -- two real, specific gaps
+### Wav2Vec2-Conformer -- both gaps closed; one different, unresolved question
 
-`transformers.Wav2Vec2ConformerModel(...)`, 231 nodes. Same `Where`-family
-caveat as wav2vec2 above, plus two new, concrete blockers:
+`transformers.Wav2Vec2ConformerModel(...)`, 231 nodes. Two concrete blockers
+found by the first pass, **both fixed and verified on host** (no hardware
+needed for either -- both are onnxruntime-checked numerically, the same bar
+every other rule in this codebase holds itself to):
 
-- **A real depthwise `Conv`.** The conformer block's `conv_module` has
-  `/encoder/layers.0/conv_module/depthwise_conv/Conv` with **`group=32`**
-  (fully depthwise: `groups == channels`) sitting right next to two ordinary
-  `group=1` pointwise convs. If this convolution's weight were made
-  trainable, **neither `act_weight_conv_to_matmul` nor
-  `_linearize_trainable_convs` has any path for it** -- both decline
-  `group != 1` outright and fall through unlegalized, which would fail at
-  Pulsar2 build time exactly the way an un-legalized live-weight `Conv` did
-  for resnet18 before that rule existed. See "The depthwise-conv gap" below.
-- **`Split`, with no backward rule.** The conv module's gating
-  (`Split` + `Sigmoid` + `Mul`, a GLU) uses an op type absent from `_RULES`.
-  `Sigmoid` and `Mul` are both covered; `Split` alone is the gap. Unlike the
-  depthwise conv, this would be a small addition -- `Split`'s gradient is
-  just the reverse operation, `Concat` of the incoming per-output gradients
-  back along the same axis, which is itself already an op Pulsar2's own
-  compiler emits from `act_weight_conv_to_matmul`'s tap-fusion (`fuse=True`),
-  so it is at least a known-compilable op type on this hardware, just not
-  yet a registered gradient rule.
+- **A real depthwise `Conv`, group-legalization now handled.** The conformer
+  block's `conv_module` has `/encoder/layers.0/conv_module/depthwise_conv/Conv`
+  with **`group=32`** (fully depthwise: `groups == channels`) beside two
+  ordinary `group=1` pointwise convs. `scripts/axera/legalize.py`'s
+  `act_weight_conv_to_matmul` now legalizes `group > 1` too: each group's
+  own channel slice of the (already-transposed-once) activation and weight
+  runs through the exact same per-tap-matmul path as `group=1`, and the
+  per-group outputs concatenate back onto the `Cout` axis before the shared
+  bias add -- no new op types (`Slice`/`Concat` are already used for
+  tap-fusion and were already in this rule's own output vocabulary), and
+  `group=1` (resnet18, and every model this rule ran on before) takes the
+  exact pre-existing node sequence, unchanged, so nothing already shipped
+  moves. Verified against onnxruntime at >100 dB SNR for a fully depthwise
+  1-D case (`group == cin == cout`, the literal Conformer shape, both plain
+  and strided) and a grouped-not-depthwise 2-D case
+  (`tests/test_axera_training_legalize.py::test_a_grouped_live_weight_convolution_becomes_per_group_matmuls`,
+  plus a biased-grouped-conv case checking the bias broadcasts correctly
+  over the concatenated output). `_linearize_trainable_convs`
+  (`scripts/axera/build_resident_train_step.py`, PR #1336 -- open at the
+  time of this fix, not yet merged) still declines `group != 1` on purpose
+  and falls through to `act_weight_conv_to_matmul` for those convs, so a
+  Conformer trial gets full grouped-conv coverage today even before that
+  optimization is extended to match; extending it the same way would be a
+  pure speed win on top, not a correctness gap.
+- **`Split`, backward rule added.** The conv module's gating (`Split` +
+  `Sigmoid` + `Mul`, a GLU) used an op type absent from `graph_grad._RULES`.
+  `Sigmoid` and `Mul` were already covered; `Split` alone was the gap. Its
+  gradient is now `onnxsim.graph_grad._grad_split`, registered in a new
+  `_MULTI_OUTPUT_RULES` table (`build_backward`'s per-node dispatch now
+  checks this table first) rather than `_RULES`, because a rule for an op
+  with more than one *output* genuinely needs more than one incoming
+  gradient -- a different argument shape from every other rule in this
+  module, not a variant of the existing single-output `Rule` contract.
+  Deliberately **not** `Concat` of the incoming gradients (the textbook
+  VJP): `Concat` is not in `graph_grad.BACKWARD_OPS` (this module's own
+  WebGPU/WebNN/NPU-portable allowlist), and `tests/test_graph_grad.py`'s own
+  harness asserts every emitted backward op stays inside it. Instead, each
+  output's gradient is right-multiplied by a constant 0/1 selection matrix
+  (`E_i = eye(N)[offset_i : offset_i + size_i, :]`) after moving the split
+  axis to the last position (`Transpose`, skipped when already there) --
+  `MatMul`/`Add`/`Transpose` only, all three already in `BACKWARD_OPS`, so
+  no allowlist change was needed at all. `Split` is consequently visible
+  through `graph_grad.supported_ops()` (what QAT/LoRA block discovery
+  already keys off) but deliberately **not** in the parity-pinned
+  `SUPPORTED_OPS` constant, since it has no C++/WASM mirror yet -- a real,
+  stated limitation (Python-only today), not an oversight. Verified against
+  finite differences for: both outputs consumed (equal sizes), one output
+  consumed with the other zero-contributing (uneven sizes, negative axis),
+  and a non-last split axis (`tests/test_graph_grad.py::test_rule_matches_finite_differences[split_*]`,
+  6 cases).
+
+**What's still open for Conformer, and it is a different situation from
+plain wav2vec2's confirmed block above, not the same one:** Conformer's
+encoder layers also each have a `Where` node
+(`/encoder/layers.{i}/self_attn/Where`), but tracing it shows a different
+shape than wav2vec2's -- no `IsNaN` anywhere in the whole 231-node Conformer
+export (confirmed by listing every `Where`/`IsNaN`/`Equal`/`GreaterOrEqual`
+node in the real export), and this `Where`'s *condition* operand comes from
+`/encoder/Expand_1`, computed once outside the per-layer loop and shared,
+not recomputed per layer. That is the shape of an additive attention-mask
+bias built once and added into each layer's own scores (`Where(shared_cond,
+per-layer-scaled-value, 0)` -> `Add` to that layer's scores) -- the pattern
+the original first-pass guess was about, and which a trainable tail chosen
+downstream of the shared mask-bias tensor (treating it as an opaque external
+input to the slice, the same way a `discover_qat_blocks`-style boundary
+would) can plausibly route around. **This was not traced end-to-end the way
+wav2vec2's was** (time-boxed: the wav2vec2 case already gave a definitive,
+generalizable answer -- "does a `Where` ever sit between two internally-
+computed tensors with no external tensor to treat as a boundary" -- and
+Conformer's shares HF's attention code enough that resolving it precisely
+needs its own trace, not an inference from wav2vec2's). Flagged, not closed.
 
 ## What actually blocks each family, ranked by cost to fix
 
-| gap | blocks | fix, roughly |
-| --- | --- | --- |
-| Raw `Gelu` has no backward rule | only an exporter that emits fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | cheapest: a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
-| `Split` has no backward rule | Conformer's GLU gating only (not wav2vec2, not Whisper) | small: gradient of `Split` is `Concat` of the per-output gradients along the same axis |
-| Grouped/depthwise `Conv` has no forward-legalization path | Conformer's `conv_module` only (not wav2vec2, not Whisper -- neither uses a grouped conv anywhere) | real but bounded: `onnxsim.graph_grad._grad_conv`'s own docstring states groups "cost nothing extra" for the *backward* im2col-as-gather identity it already uses (the group axis splits out of the channel axis via reshape, and `MatMul` batches over it) -- the same generalization applied to `_linearize_trainable_convs`'s forward-side use of that identity (PR #1336) would very likely close this, since the underlying primitive already handles groups; it is un-extended, not fundamentally blocked |
-| `Where`/mask-construction ops have no backward rule | *maybe* wav2vec2 and Wav2Vec2-Conformer, if a trainable tail is chosen upstream of where the mask is folded in -- unconfirmed | not a fix, a design constraint: choose the trainable region downstream of all mask handling, the same way resnet18's trainable tail was chosen downstream of the frozen stem |
-| LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | any classic RNN-based ASR/TTS model, full stop | the largest lift here -- would need either a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled, so the primitives exist) or accepting only models that unroll their own recurrence in ONNX rather than emitting the fused `LSTM` op |
+| gap | status | blocks | fix |
+| --- | --- | --- | --- |
+| Grouped/depthwise `Conv` has no forward-legalization path | **fixed** (`scripts/axera/legalize.py`'s `act_weight_conv_to_matmul`) | was: Conformer's `conv_module` | per-group tap-matmul + `Concat` back onto `Cout`, `group=1` path untouched |
+| `Split` has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_split`, via the new `_MULTI_OUTPUT_RULES` table) | was: Conformer's GLU gating | `MatMul` against a constant 0/1 selection matrix per output, no `Concat`, stays inside `BACKWARD_OPS` |
+| `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **confirmed blocking**, not a design workaround | plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is still unresolved | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; not yet implemented |
+| Raw `Gelu` has no backward rule | open, low priority | only an exporter emitting fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
+| LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | open, largest lift | any classic RNN-based ASR/TTS model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
 
 ## Do the two silent vendor bugs generalize?
 
@@ -161,15 +230,28 @@ enough that a new architecture should not need to rediscover them:
 ## Recommendation: smallest real next trial
 
 **Whisper's encoder**, trainable tail = last 1-2 transformer layers (same
-shape as resnet18's "last four layers," frozen stem + trainable tail). It is
-the cleanest of the three surveyed: full op coverage confirmed with zero open
-questions (no `Where`-family uncertainty to resolve, no depthwise conv, no
-`Split`), and a fixed-length input (no attention-mask handling at all) that
-avoids the one thing this survey could not settle statically. wav2vec2 is the
-second choice, gated on confirming the `Where`-family ops stay off the
-trainable slice's backward path -- worth trying once the Whisper trial is
-working, not before. Wav2Vec2-Conformer needs the depthwise-conv and `Split`
-gaps closed first and should wait.
+shape as resnet18's "last four layers," frozen stem + trainable tail), still
+stands as the best first trial and is now *more* clearly so than the first
+pass thought: full op coverage confirmed with zero open questions, and a
+fixed-length input (no attention-mask handling at all) that sidesteps every
+`Where`-shaped question this survey has now spent real effort on for the
+other two families.
+
+The ranking below it changed. Wav2Vec2-Conformer's conv-module gaps
+(depthwise `Conv`, `Split`) are now **closed** -- it is Conformer's
+still-open, differently-shaped `Where` question (see above) that gates it
+next, not the conv-module work this pass finished. Plain wav2vec2 dropped
+from "second choice, likely fine" to **blocked**: its `Where`/`IsNaN`
+numerical-stability cleanup is confirmed to sit inside every encoder layer's
+own attention computation with no external tensor to route a trainable
+tail's boundary around, so it needs `Where`'s backward rule implemented
+before any tail including attention output can train, not just a careful
+choice of trainable region. Concretely, after Whisper: either implement
+`Where`'s backward rule (unblocks wav2vec2 outright, and is the same
+"boolean condition, not the op, becomes a float mask" work either way) or
+trace Conformer's shared-condition `Where` end-to-end to confirm it is
+excludable by block boundary (cheaper if it pans out, but unproven, and
+resolves only Conformer -- `Where`'s backward rule resolves both).
 
 ## Reproducing the exports
 

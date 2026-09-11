@@ -120,6 +120,121 @@ def test_a_live_weight_convolution_becomes_matmuls_in_1d_and_2d():
         }
 
 
+def _grouped_conv_live_weight_model(cin, cout, group, k, size, stride, pad, nd):
+    """A grouped/depthwise `Conv` with a *live* (runtime, non-initializer)
+    weight -- the shape a real audio model puts on the wire. Wav2Vec2-
+    Conformer's gated conv module uses a fully depthwise 1-D `Conv`
+    (`group == cin == cout`, per `docs/axera-audio-speech-op-coverage.md`);
+    built via `onnx.parser` per this repo's CLAUDE.md convention for new
+    test model-building code.
+    """
+    cin_pg = cin // group
+    out = (size + 2 * pad - k) // stride + 1
+    x_dims = ",".join(["1", str(cin)] + [str(size)] * nd)
+    w_dims = ",".join([str(cout), str(cin_pg)] + [str(k)] * nd)
+    y_dims = ",".join(["1", str(cout)] + [str(out)] * nd)
+    ks = ",".join([str(k)] * nd)
+    strides = ",".join([str(stride)] * nd)
+    pads = ",".join([str(pad)] * (2 * nd))
+    return onnx.parser.parse_model(f"""
+    <ir_version: 10, opset_import: ["": 17]>
+    g (float[{x_dims}] x, float[{w_dims}] w) => (float[{y_dims}] y)
+    {{
+        y = Conv<kernel_shape=[{ks}], strides=[{strides}], pads=[{pads}], group={group}>(x, w)
+    }}
+    """)
+
+
+def test_a_grouped_live_weight_convolution_becomes_per_group_matmuls():
+    """Depthwise/grouped convs are common in audio models (Wav2Vec2-
+    Conformer's gated conv module: a fully depthwise 1-D `Conv`,
+    `group == channels`) -- `act_weight_conv_to_matmul` must legalize these
+    too, not just `group=1`."""
+    rng = np.random.default_rng(7)
+    for nd, cin, cout, group, k, stride, pad in (
+        (1, 8, 8, 8, 3, 1, 1),  # fully depthwise, 1-D -- the Conformer shape
+        (2, 8, 16, 4, 3, 1, 1),  # grouped, not depthwise, 2-D
+        (1, 6, 6, 6, 5, 2, 2),  # depthwise, strided
+    ):
+        cin_pg = cin // group
+        model = _grouped_conv_live_weight_model(
+            cin, cout, group, k, 16, stride, pad, nd
+        )
+        feeds = {
+            "x": rng.standard_normal([1, cin] + [16] * nd).astype(np.float32),
+            "w": (rng.standard_normal([cout, cin_pg] + [k] * nd) * 0.2).astype(
+                np.float32
+            ),
+        }
+        ref = _run(model, feeds)[0]
+        after = onnx.ModelProto.FromString(model.SerializeToString())
+        assert legalize.act_weight_conv_to_matmul(after) == 1, (nd, cin, cout, group)
+        onnx.checker.check_model(after)
+        got = _run(after, feeds)[0]
+        assert got.shape == ref.shape
+        assert _snr(ref, got) > 100, (nd, cin, cout, group, _snr(ref, got))
+        # Same op vocabulary as the group=1 case -- just more Slice/Concat.
+        assert {n.op_type for n in after.graph.node} <= {
+            "Pad",
+            "Transpose",
+            "Slice",
+            "Reshape",
+            "MatMul",
+            "Add",
+            "Concat",
+        }
+
+
+def test_a_grouped_convolution_bias_broadcasts_over_the_full_concatenated_output():
+    """The bias add runs *after* the per-group outputs concatenate back onto
+    the full `Cout` axis, using the original unsliced `[Cout]` bias -- so a
+    grouped Conv's bias needs no group-aware slicing of its own, unlike the
+    activation/weight. Confirm that against onnxruntime rather than just
+    asserting the code takes that path."""
+    rng = np.random.default_rng(11)
+    cin, cout, group, k = 8, 16, 4, 3
+    bias = numpy_helper.from_array(rng.standard_normal(cout).astype(np.float32), "bb")
+    model = _model(
+        [
+            helper.make_node(
+                "Conv",
+                ["x", "w", "bb"],
+                ["y"],
+                kernel_shape=[k],
+                pads=[1, 1],
+                group=group,
+                name="c",
+            )
+        ],
+        {"x": [1, cin, 16], "w": [cout, cin // group, k]},
+        {"y": [1, cout, 16]},
+        [bias],
+    )
+    feeds = {
+        "x": rng.standard_normal((1, cin, 16)).astype(np.float32),
+        "w": (rng.standard_normal((cout, cin // group, k)) * 0.2).astype(np.float32),
+    }
+    ref = _run(model, feeds)[0]
+    assert legalize.act_weight_conv_to_matmul(model) == 1
+    onnx.checker.check_model(model)
+    assert _snr(ref, _run(model, feeds)[0]) > 100
+
+
+def test_a_grouped_convolution_whose_weight_is_constant_is_left_alone():
+    """Same fast-path guarantee as the ungrouped case: a constant weight
+    means an ordinary inference Conv, group or not, and this rule must not
+    touch it."""
+    w = numpy_helper.from_array(
+        np.random.default_rng(8).standard_normal((8, 1, 3)).astype(np.float32), "w"
+    )
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3], pads=[1, 1], group=8, name="c"
+    )
+    model = _model([node], {"x": [1, 8, 16]}, {"y": [1, 8, 16]}, initializer=[w])
+    assert legalize.act_weight_conv_to_matmul(model) == 0
+    assert [n.op_type for n in model.graph.node] == ["Conv"]
+
+
 def test_a_convolution_whose_weight_is_constant_is_left_alone():
     """Only a *live* weight is a problem; an ordinary inference convolution
     must keep its fast path."""
