@@ -273,6 +273,39 @@ def emit_mcode(reference_mcode, fields, y_scale, y_zero):
     return np.frombuffer(bytes(out), dtype=np.uint8)
 
 
+def nudge_output_quantisation(y_min, y_max, fields, bits=8, tries=64):
+    """A patchable `(scale, zero)` for an output range, widening it if needed.
+
+    Some values cannot be written into the stream in place, and `emit_mcode`
+    refuses those. That matters more than it sounds: anything that
+    recalibrates its output range as it goes -- a training loop, say -- makes
+    the zero point wander, and on the reference shape roughly one value in
+    fifty is unpatchable. Hitting one must not stop the run.
+
+    Widening the range by a fraction of a percent moves both the scale and the
+    zero point and costs a fraction of a decibel, so this walks outward until
+    the pair is one the stream accepts. Raises if nothing nearby works.
+    """
+    span = float(y_max) - float(y_min)
+    if span <= 0:
+        raise ValueError("empty output range")
+    levels = float(2**bits - 1)
+    bad = fields.get("unpatchable", {})
+    bad_zero = set(bad.get("zero", ()))
+    bad_low = set(bad.get("scale_low_byte", ()))
+    for i in range(tries):
+        grow = span * (1e-4 * i)
+        lo, hi = float(y_min) - grow / 2, float(y_max) + grow / 2
+        scale = np.float32((hi - lo) / levels)
+        zero = float(round(-lo / float(scale)))
+        if (int(zero) & 0xFF) in bad_zero:
+            continue
+        if scale.tobytes()[0] in bad_low:
+            continue
+        return float(scale), zero
+    raise ValueError("no patchable output quantisation near this range")
+
+
 def learn_mcode(mcodes, y_scales, y_zeros, min_agreement=0.9):
     """Find the mcode fields that follow the output quantisation.
 

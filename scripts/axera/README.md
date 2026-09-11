@@ -6094,6 +6094,176 @@ above needs one. The reference is needed **once per shape**, and the number of
 builds it takes is measurable rather than guessed -- push `collisions()` to
 zero and the map is exact.
 
+## Training on the card
+
+The AX650N has no gradient ops, no `Loop`/`Scan`/`If`, and no writable
+parameter memory -- `npu_dyn_params` is empty in all 60 compiled models here.
+So a training loop cannot live on the card. What *can*: `onnxsim.graph_grad`
+emits a backward pass as ordinary ONNX nodes, and **26 of its 28 differentiable
+op types are on `AX650_SUPPORTED_OPS`** with none on the confirmed-broken list.
+Compile forward, loss and backward as one model, keep float master weights on
+the host, and a training step is one `axcl_run_model` call.
+
+### It runs, and the loss comes down
+
+A 16-channel convolution trained against a teacher, gradient computed on the
+NPU, weight arriving as a runtime input:
+
+| step | card SNR | float host | gradient cosine | non-zero gradient |
+| --- | --- | --- | --- | --- |
+| 0 | -3.38 dB | -3.38 | 0.99974 | 99.3% |
+| 100 | 14.49 | 14.47 | 0.90292 | 76.6% |
+| 1000 | 33.64 | 44.63 | -- | 90.5% |
+| 2748 | **34.02** | -- | -- | -- |
+| 5000 | 34.02 | 111.35 | -- | **0.0%** |
+
+**The gradient dies.** It is an output tensor quantised at a range fixed when
+the model was built, so as the loss falls the true gradient shrinks below half
+a quantisation step and rounds to zero -- every entry, eventually. U8 dies at
+step ~1,000 and stalls at 30.88 dB; U16 dies at ~5,000 and stalls at 34.02.
+Widening buys a factor of five in steps and 3 dB and does not remove the
+mechanism. 34.02 dB is within 1.3 dB of this shape's INT8 *forward* floor, so
+past that there is nothing left to win anyway.
+
+**Loss scaling cannot fix it here, and the reason is worth stating.** The seed
+has to reach the graph as a tensor, and a tensor is quantised to a fixed range
+with linear levels: over `[1, 2**21]` a U8 seed has 255 evenly spaced levels,
+so a seed of 1.0 rounds to **zero** and multiplies the whole backward pass by
+nothing; calibrated narrowly it pins to a constant and scaling does nothing at
+all. A probe sweeping the seed from 1 to 2**24 returned bit-identical
+gradients at every value. A multiplicative scale meant to span decades cannot
+live in a linear fixed-point tensor. `finetune.py`'s `LossScaler` therefore
+**detects that it is having no effect and stands down**, which is what makes
+it safe to leave on by default.
+
+There is a second reason it would not work even with a float seed: fixed-point
+clipping is **silent and local**. It happens to intermediates that never reach
+an output, so a controller reading only the returned gradient sees a healthy
+tensor while the computation upstream is destroyed -- unlike fp16, where
+overflow makes an inf that propagates. A graph that wants reliable back-off
+has to export `ReduceMax(|t|)` on those tensors as extra outputs.
+
+### The loop was 800x slower than the card
+
+`axcl_run_model` costs ~580 ms per invocation -- process start, device open,
+model load -- plus 3 ms per inference, and the LXD plumbing around it adds
+another ~800 ms in `lxc exec` calls and file copies. AXCL exposes the
+load-once/run-many API (`axclrtEngineLoadFromFile` / `CreateContext` /
+`CreateIO` / `Execute`), so a ~120-line resident runner does the fixed work
+once and serves frames on stdin:
+
+| | per step |
+| --- | --- |
+| `axcl_run_model` per step | ~1400 ms |
+| resident runner, 16-channel step | **1.70 ms** |
+| resident runner, 1024x1024 step | 58.96 ms (12.58 MB at 213 MB/s) |
+
+That is **820x** on the small step: 20,000 training steps in 30 seconds
+instead of eight hours. The large step is no longer overhead-bound at all --
+it is pipe-bandwidth bound, and the fix is residency:
+
+| 1024x1024 step | ms | moved |
+| --- | --- | --- |
+| send every input, read every output | 63.13 | 12.583 MB |
+| weight resident on the card | 41.03 | 8.389 MB |
+| weight resident, gradient not read back | **29.79** | 4.194 MB |
+
+**Double buffering is not worth it.** Feeding an updated weight back by
+device-to-device copy (27.57 ms) and by swapping the two device pointers
+(28.97 ms) are indistinguishable from no feedback edge at all (27.64 ms) --
+a 4 MB copy inside the card's own DRAM is free, and the two
+`Set*BufferByIndex` calls a swap needs cost more than the copy it avoids. The
+card has 7040 MiB of CMM with 12 in use; what costs is crossing the host
+boundary, not moving data on the card.
+
+Batch size is nearly free until it is not:
+
+| batch | ms/step | samples/s |
+| --- | --- | --- |
+| 1 | 1.40 | 713 |
+| 16 | 1.78 | **8,998** |
+| 64 | 7.72 | 8,294 |
+| 256 | 18.45 | 13,872 |
+
+Batch 1 to 16 costs 0.38 ms for 12.6x the throughput. Past that it stops being
+free, and batch 64 is worse *per sample* than 16.
+
+### Eight rules that make a training graph legal
+
+Each answers a failure a real `pulsar2 build` produced, and `TRAINING_RULES`
+runs them in an order that works -- `inline_local_functions` first, because
+every later rule inspects op types and would look straight past a function
+call.
+
+| rule | the failure it answers |
+| --- | --- |
+| `inline_local_functions` | `KeyError('dont support GradAdd opr')` -- `GradAdd` is a local `FunctionProto`, not an op type |
+| `act_weight_conv_to_matmul` | `AxQuantizedActWeightConv, shapefn failed` -- the weight stays FP32 while the activation is U8 |
+| `gemm_to_matmul` | `NotImplementedError('Should fuse Gemm (two non-parameter inputs) to MatMul.')` |
+| `rank0_to_rank1` | `RuntimeError: zero-dimensional tensor ... cannot be concatenated` |
+| `neg_to_mul` | `Neg` is the one backward-pass op off the AX650 list |
+| `avgpool_ceil_to_floor` | `graph_grad` declines `ceil_mode=1` |
+| `flatten_to_reshape`, `global_pool_to_reduce` | no gradient rule, and none needed |
+
+`act_weight_conv_to_matmul` is the substantial one: `y[n,o,p] = sum_k
+w[o,i,k] * xpad[n,i,p*stride+k]`, so with the activation transposed to
+`[N, spatial..., Cin]` each tap is one `MatMul` against `w[..., k]` reshaped to
+`[Cin, Cout]`, and the taps are added. Stride becomes the tap slice's `step`.
+1-D and 2-D, any stride, with or without a bias; dilation and groups are
+declined rather than approximated. Every resnet18 shape reproduces
+onnxruntime to float rounding (135.7 dB at 3x3 stride 1, 135.5 at stride 2,
+320.6 at 1x1, 132.2 at the 7x7 stem).
+
+Two vendor divergences found on the way, both silent:
+
+* **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all
+  of them. Confirmed on the card: a `(1,16,32)` input returned 16 values where
+  onnxruntime returned 1. Any model with a bare `ReduceMean` -- mean pooling,
+  layer-norm statistics, most loss reductions -- is getting a wrong answer.
+  Every rule here names its axes explicitly.
+* **Simplification silently undoes legalization.** `fuse_matmul_add_bias_into_gemm`
+  puts the `Gemm` straight back, live weight and all, and Pulsar2 then fails
+  deep inside PPQ's calibrator with `ValueError('The truth value of an array
+  with more than one element is ambiguous')` -- naming no node and nothing
+  about `Gemm`. onnxsim#1332 skips that pass and `fuse_transpose_into_gemm`
+  upstream for the same reason on a different backend; `scripts/axera` does
+  not go through `make_step_graph`, so it skips them itself.
+
+Simplifying is worth a great deal on a gradient graph and nobody was doing it:
+the resnet18 training step goes **759 -> 236 nodes, 69% fewer**, check passing.
+`graph_grad` spells the chain rule out literally and the tap rewrite
+multiplies it, so consecutive taps slicing the same tensors collapse under
+common-subexpression elimination -- which means simplification is worth more
+*after* legalization than before.
+
+### Multi-layer training works; resnet18 does not compile yet
+
+Eight independent weight tensors, 2-D convolutions with strides, 702 nodes,
+every gradient correct against onnxruntime:
+
+| stack | nodes | gradient cosine per layer | step |
+| --- | --- | --- | --- |
+| 1 conv 2-D | 93 | 1.0 | 19.0 ms |
+| 3 convs, one strided | 267 | 1.0, 1.0, 1.0 | 8.5 ms |
+| 8 convs, two strided | 702 | 0.9987 ... 0.9979 (all eight) | 8.5 ms |
+
+resnet18d itself legalizes completely -- 56/56 nodes differentiable, every op
+type NPU-eligible, 236 nodes after simplification -- and **does not build**.
+It dies in PPQ's calibrator with the `truth value of an array` error above,
+and the bisection puts the trigger somewhere nobody has cornered yet:
+
+| probe | result |
+| --- | --- |
+| resnet18 forward, every weight constant | **builds** |
+| resnet18 forward, *one* weight a graph input, no backward at all | fails |
+| a live-operand `MatMul`, ranks 2 and 3, small and at the classifier's shape | builds |
+| `Transpose(live) -> MatMul`, and three variants of it | builds |
+| `Greater`/`Cast`/`Mul`, `Gather` against a big int64 index | builds |
+
+So it is not the gradient, not the conv rewrite, not the matmul rank, not the
+transpose, and not graph size -- every construct builds alone and the
+combination does not. That is where this stands.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
@@ -6574,6 +6744,7 @@ CNN/LLM focus.
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `replay.py` | `load_scales()`/`insert_qdq()`/`replay()`: re-runs a float graph at the scales `pulsar2 build` recorded in `quant/quant_axmodel.json`, reproducing four real AX650N measurements to within 0.19 dB with no card and no rebuild. `surviving_edges()` drops the tensors the compiler fused away -- quantising those invents error the hardware never makes. Exact on an unfused graph, a lower bound on a fused one. |
 | `emitter.py` | `learn()`/`emit_axmodel()`: learns a shape's weight-table encoding as a bit permutation from k reference builds, instead of deriving its layout rules, then writes any new weights at that shape with no compiler in the loop -- byte-identical tables and bit-identical device output on eight held-out weight sets. `requant_block()` is the per-channel bias/multiplier in closed form; `learn_mcode()`/`emit_mcode()` find and rewrite the mcode's output scale and zero point, and report the streams that cannot be patched in place. |
+| `finetune.py` | `LossScaler` and a `train()` loop for fine-tuning on the card. The scaler is on by default and **detects when it is having no effect and stands down** -- a multiplicative seed cannot survive linear fixed-point quantisation, which a device probe confirmed by returning bit-identical gradients for every seed from 1 to 2**24. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |

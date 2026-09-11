@@ -336,15 +336,650 @@ def filename_safe_io_names(model):
     return len(renamed)
 
 
+def neg_to_mul(model):
+    """`Neg(x)` becomes `Mul(x, -1)`.
+
+    `Neg` is the one op `onnxsim.graph_grad` emits that is absent from
+    `AX650_SUPPORTED_OPS` -- differentiating a subtraction produces exactly
+    one of them, so every backward pass hits it. The rewrite is exact.
+    """
+    changed = 0
+    for node in model.graph.node:
+        if node.op_type != "Neg":
+            continue
+        name = _unique_name(model, f"{node.name or node.output[0]}_minus_one")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array([-1.0], np.float32), name)
+        )
+        node.op_type = "Mul"
+        node.input.append(name)
+        changed += 1
+    return changed
+
+
+def _unique_name(model, stem):
+    taken = (
+        {i.name for i in model.graph.initializer}
+        | {n.name for n in model.graph.node if n.name}
+        | {o for n in model.graph.node for o in n.output}
+    )
+    name, k = stem, 0
+    while name in taken:
+        k += 1
+        name = f"{stem}_{k}"
+    return name
+
+
+def rank0_to_rank1(model):
+    """Graph outputs of rank 0 are given a trailing axis.
+
+    Pulsar2's calibration concatenates each tensor across the calibration
+    samples, and a rank-0 tensor cannot be concatenated -- the build dies with
+    `RuntimeError: zero-dimensional tensor (at position 0) cannot be
+    concatenated`. A scalar loss is the obvious way to hit this, and a
+    training graph always has one.
+
+    Only the declared rank changes; `ReduceMean`/`ReduceSum` grow a
+    `keepdims=1` instead of reducing away, which is the same number in a
+    1-element tensor.
+    """
+    scalars = {
+        v.name
+        for v in model.graph.output
+        if v.type.tensor_type.HasField("shape")
+        and len(v.type.tensor_type.shape.dim) == 0
+    }
+    if not scalars:
+        return 0
+    shapes = _value_shapes(model)
+    extra, changed = [], 0
+    for node in model.graph.node:
+        if not node.output or node.output[0] not in scalars:
+            continue
+        name = node.output[0]
+        if node.op_type in (
+            "ReduceMean",
+            "ReduceSum",
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceProd",
+        ):
+            for attr in node.attribute:
+                if attr.name == "keepdims":
+                    attr.i = 1
+                    break
+            else:
+                node.attribute.append(helper.make_attribute("keepdims", 1))
+            # ONNX reduces *every* axis when none is named. Pulsar2 does not:
+            # a `ReduceMean` over (1, 16, 32) with no `axes` came back shaped
+            # (1, 16, 1), which is the last axis alone. Name them, so the
+            # graph says what it means to both.
+            named = any(a.name == "axes" for a in node.attribute) or (
+                len(node.input) > 1 and node.input[1]
+            )
+            rank = len(shapes.get(node.input[0], ()))
+            if not named and rank:
+                _set_axes(model, node, range(rank))
+        # `keepdims=1` keeps *every* reduced axis, so the rank depends on the
+        # input's. Reshaping to [1] is exact whatever that turns out to be,
+        # and it is one more NPU-legal op.
+        inner = _unique_name(model, f"{name}_kept")
+        node.output[0] = inner
+        shape_name = _unique_name(model, f"{name}_shape1")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array([1], np.int64), shape_name)
+        )
+        extra.append(
+            (
+                node,
+                helper.make_node(
+                    "Reshape",
+                    [inner, shape_name],
+                    [name],
+                    name=_unique_name(model, f"{name}_R1"),
+                ),
+            )
+        )
+        changed += 1
+    if extra:
+        out = []
+        after = {id(producer): reshape for producer, reshape in extra}
+        for node in model.graph.node:
+            out.append(node)
+            if id(node) in after:
+                out.append(after[id(node)])
+        del model.graph.node[:]
+        model.graph.node.extend(out)
+    for value in model.graph.output:
+        if value.name in scalars:
+            value.type.tensor_type.shape.dim.add().dim_value = 1
+    return changed
+
+
+def _is_initializer(model, name):
+    return any(i.name == name for i in model.graph.initializer)
+
+
+def _opset(model, domain=""):
+    for entry in model.opset_import:
+        if (entry.domain or "") in (domain, "ai.onnx" if domain == "" else domain):
+            return entry.version
+    return 0
+
+
+def _set_axes(model, node, axes):
+    """Name a reduction's axes, as an attribute or an input by opset.
+
+    `axes` moved from attribute to input at opset 18, and `onnx.checker`
+    rejects the wrong one. Both forms matter here: resnet18d is opset 18,
+    the training graphs built by hand are opset 17.
+    """
+    node.attribute.extend([a for a in ()])
+    if _opset(model) >= 18:
+        name = _unique_name(model, f"{node.name or node.output[0]}_axes")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array(list(axes), np.int64), name)
+        )
+        while len(node.input) < 2:
+            node.input.append("")
+        node.input[1] = name
+    else:
+        node.attribute.append(helper.make_attribute("axes", list(axes)))
+
+
+def inline_local_functions(model):
+    """Expand the graph's own `FunctionProto` calls into ordinary nodes.
+
+    `onnxsim.graph_grad`'s templated rules emit calls to checked-in local
+    functions -- `GradAdd` and friends -- rather than open-coding them. Pulsar2
+    parses op *types*, and a call to a locally-defined function is not one:
+    eight `GradAdd` nodes are the only thing off the AX650 list in a legalized
+    resnet18 training step, and they are eight residual connections' gradient
+    accumulations, so they are not optional.
+
+    `onnx.inliner` expands them into what they always were -- here, `Identity`,
+    which the AX650 does support. Returns the number of function definitions
+    that were inlined away.
+    """
+    if not model.functions:
+        return 0
+    import onnx.inliner
+
+    # A locally-defined function lives in its own domain, and the model has to
+    # import that domain before anything -- checker or inliner -- will look at
+    # it. A graph assembled by hand from `graph_grad`'s output does not have
+    # the import, so add it rather than failing on "No opset import for domain".
+    have = {entry.domain: entry for entry in model.opset_import}
+    for fn in model.functions:
+        if fn.domain not in have:
+            entry = helper.make_opsetid(fn.domain, 1)
+            model.opset_import.append(entry)
+            have[fn.domain] = entry
+        # The inliner silently declines a function whose standard-domain opset
+        # disagrees with the model's -- it inlined nothing and left eight
+        # GradAdd calls for Pulsar2 to reject with "dont support GradAdd opr".
+        # The functions `graph_grad` ships declare opset 17; a graph built from
+        # a modern export declares 18.
+        for imp in fn.opset_import:
+            standard = have.get(imp.domain or "")
+            if standard is not None and (imp.domain or "") == "":
+                imp.version = standard.version
+    before = len(model.functions)
+    inlined = onnx.inliner.inline_local_functions(model)
+    model.CopyFrom(inlined)
+    return before - len(model.functions)
+
+
+def avgpool_ceil_to_floor(model):
+    """Clear `ceil_mode` on a pool where it changes nothing.
+
+    `onnxsim.graph_grad` declines `AveragePool`/`MaxPool` with `ceil_mode=1`
+    rather than approximating its ragged edge window -- which stops resnet18d
+    dead, because its downsample pools carry the flag. On an input the stride
+    divides evenly, ceil and floor agree exactly, so the flag is decoration
+    and dropping it is a no-op. Where they genuinely differ the node is left
+    alone and `graph_grad` still refuses, which is the honest outcome.
+    """
+    shapes = _value_shapes(model)
+    changed = 0
+    for node in model.graph.node:
+        if node.op_type not in ("AveragePool", "MaxPool"):
+            continue
+        attrs = {a.name: a for a in node.attribute}
+        if not (attrs.get("ceil_mode") and attrs["ceil_mode"].i):
+            continue
+        shape = shapes.get(node.input[0])
+        if shape is None or "kernel_shape" not in attrs:
+            continue
+        nd = len(attrs["kernel_shape"].ints)
+        kernel = list(attrs["kernel_shape"].ints)
+        strides = list(attrs["strides"].ints) if "strides" in attrs else [1] * nd
+        pads = list(attrs["pads"].ints) if "pads" in attrs else [0] * (2 * nd)
+        same = True
+        for j in range(nd):
+            span = shape[2 + j] + pads[j] + pads[j + nd] - kernel[j]
+            if span % strides[j]:
+                same = False  # ceil would keep a ragged final window
+                break
+        if not same:
+            continue
+        attrs["ceil_mode"].i = 0
+        changed += 1
+    return changed
+
+
+def flatten_to_reshape(model):
+    """`Flatten` becomes `Reshape`.
+
+    `onnxsim.graph_grad` has no rule for `Flatten` and does not need one: it
+    is a `Reshape`, which does have one. resnet18 has exactly one, between the
+    pooling and the classifier, and without this the whole graph is
+    undifferentiable for the sake of a no-op.
+    """
+    shapes = _value_shapes(model)
+    changed = 0
+    for node in model.graph.node:
+        if node.op_type != "Flatten":
+            continue
+        shape = shapes.get(node.input[0])
+        if shape is None:
+            continue
+        axis = next((a.i for a in node.attribute if a.name == "axis"), 1)
+        axis = axis if axis >= 0 else len(shape) + axis
+        head = int(np.prod(shape[:axis])) if axis else 1
+        name = _unique_name(model, f"{node.name or node.output[0]}_shape")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array([head, -1], np.int64), name)
+        )
+        node.op_type = "Reshape"
+        del node.attribute[:]
+        node.input.append(name)
+        changed += 1
+    return changed
+
+
+def global_pool_to_reduce(model):
+    """`GlobalAveragePool` becomes `ReduceMean` over the spatial axes.
+
+    Same reason as `flatten_to_reshape`: no gradient rule for the global form,
+    a perfectly good one for the reduction it is. The axes are named rather
+    than defaulted, because this hardware reduces only the last axis when a
+    reduction names none (see `rank0_to_rank1`).
+    """
+    shapes = _value_shapes(model)
+    changed = 0
+    for node in model.graph.node:
+        if node.op_type != "GlobalAveragePool":
+            continue
+        shape = shapes.get(node.input[0])
+        if shape is None or len(shape) < 3:
+            continue
+        node.op_type = "ReduceMean"
+        del node.attribute[:]
+        node.attribute.append(helper.make_attribute("keepdims", 1))
+        _set_axes(model, node, range(2, len(shape)))
+        changed += 1
+    return changed
+
+
+def gemm_to_matmul(model):
+    """A `Gemm` whose `B` is a live tensor becomes `MatMul` (plus what it drops).
+
+    Pulsar2 asks for this by name: a `Gemm` with two non-parameter inputs
+    fails the build with `NotImplementedError('Should fuse Gemm (two
+    non-parameter inputs) to MatMul.')`. A training graph produces them
+    wherever a fully-connected layer's weight is being learned rather than
+    baked in.
+
+    `transA`/`transB` become `Transpose`, `alpha`/`beta` become `Mul`, and `C`
+    becomes `Add` -- all NPU-legal, and all no-ops when left at their defaults.
+    """
+    out, changed = [], 0
+    for node in model.graph.node:
+        if (
+            node.op_type != "Gemm"
+            or len(node.input) < 2
+            or _is_initializer(model, node.input[1])
+        ):
+            out.append(node)
+            continue
+        attrs = {a.name: a for a in node.attribute}
+        alpha = attrs["alpha"].f if "alpha" in attrs else 1.0
+        beta = attrs["beta"].f if "beta" in attrs else 1.0
+        stem = node.name or node.output[0]
+        a, b = node.input[0], node.input[1]
+        made = []
+        if "transA" in attrs and attrs["transA"].i:
+            t = _unique_name(model, f"{stem}_at")
+            made.append(
+                helper.make_node(
+                    "Transpose",
+                    [a],
+                    [t],
+                    perm=[1, 0],
+                    name=_unique_name(model, f"{stem}_TA"),
+                )
+            )
+            a = t
+        if "transB" in attrs and attrs["transB"].i:
+            t = _unique_name(model, f"{stem}_bt")
+            made.append(
+                helper.make_node(
+                    "Transpose",
+                    [b],
+                    [t],
+                    perm=[1, 0],
+                    name=_unique_name(model, f"{stem}_TB"),
+                )
+            )
+            b = t
+        tail = node.output[0]
+        cur = (
+            tail
+            if (alpha == 1.0 and len(node.input) < 3)
+            else _unique_name(model, f"{stem}_mm")
+        )
+        made.append(
+            helper.make_node(
+                "MatMul", [a, b], [cur], name=_unique_name(model, f"{stem}_MM")
+            )
+        )
+        if alpha != 1.0:
+            k = _unique_name(model, f"{stem}_alpha")
+            model.graph.initializer.append(
+                numpy_helper.from_array(np.array([alpha], np.float32), k)
+            )
+            nxt = tail if len(node.input) < 3 else _unique_name(model, f"{stem}_sc")
+            made.append(
+                helper.make_node(
+                    "Mul", [cur, k], [nxt], name=_unique_name(model, f"{stem}_A")
+                )
+            )
+            cur = nxt
+        if len(node.input) >= 3:
+            c = node.input[2]
+            if beta != 1.0:
+                k = _unique_name(model, f"{stem}_beta")
+                model.graph.initializer.append(
+                    numpy_helper.from_array(np.array([beta], np.float32), k)
+                )
+                scaled = _unique_name(model, f"{stem}_cb")
+                made.append(
+                    helper.make_node(
+                        "Mul", [c, k], [scaled], name=_unique_name(model, f"{stem}_B")
+                    )
+                )
+                c = scaled
+            made.append(
+                helper.make_node(
+                    "Add", [cur, c], [tail], name=_unique_name(model, f"{stem}_C")
+                )
+            )
+        out.extend(made)
+        changed += 1
+    if changed:
+        del model.graph.node[:]
+        model.graph.node.extend(out)
+    return changed
+
+
+def act_weight_conv_to_matmul(model):
+    """A `Conv` whose weight is a live tensor becomes one `MatMul` per tap.
+
+    Pulsar2 has an op for a runtime weight -- the error names
+    `AxQuantizedActWeightConv` -- but it fails its own shape function with the
+    weight still `FP32` while the activation is already `U8`, in 1-D, in 1x1
+    and with `data_type: U8` forced; the 2-D case gets past the frontend and
+    dies in the backend instead. So the convolution has to be spelled as
+    matrix multiplies, which is the shape the compiler asks for elsewhere --
+    "Should fuse Gemm (two non-parameter inputs) to MatMul".
+
+    ``y[n,o,p] = sum_{i,k} w[o,i,k] * xpad[n,i,p*stride+k]``, so with the
+    activation transposed to `[N, spatial..., Cin]` each tap is one `MatMul`
+    against `w[..., k]` reshaped to `[Cin, Cout]`, and the taps are added.
+    Stride becomes the tap slice's `step`. Handles 1-D and 2-D, any stride,
+    dilation 1, group 1; anything else is declined rather than approximated.
+    """
+    shapes = _value_shapes(model)
+    out, changed = [], 0
+    for node in model.graph.node:
+        w = node.input[1] if len(node.input) > 1 else None
+        if node.op_type != "Conv" or w is None or _is_initializer(model, w):
+            out.append(node)
+            continue
+        wshape, xshape = shapes.get(w), shapes.get(node.input[0])
+        yshape = shapes.get(node.output[0])
+        attrs = {a.name: a for a in node.attribute}
+        if not wshape or not xshape or len(wshape) != len(xshape):
+            out.append(node)
+            continue
+        nd = len(wshape) - 2
+        if nd not in (1, 2):
+            out.append(node)
+            continue
+        dil = list(attrs["dilations"].ints) if "dilations" in attrs else [1] * nd
+        if any(d != 1 for d in dil) or (
+            "group" in attrs and attrs["group"].i not in (0, 1)
+        ):
+            out.append(node)
+            continue
+        strides = list(attrs["strides"].ints) if "strides" in attrs else [1] * nd
+        pads = list(attrs["pads"].ints) if "pads" in attrs else [0] * (2 * nd)
+        cout, cin = wshape[0], wshape[1]
+        ksize = wshape[2:]
+        spatial = xshape[2:]
+        outdim = [
+            (spatial[j] + pads[j] + pads[j + nd] - ksize[j]) // strides[j] + 1
+            for j in range(nd)
+        ]
+        if yshape and list(yshape[2:]) != outdim:
+            out.append(node)  # our geometry disagrees; do not guess
+            continue
+        stem = node.name or node.output[0]
+        made = []
+
+        src = node.input[0]
+        if any(pads):
+            padded = _unique_name(model, f"{stem}_pad")
+            pname = _unique_name(model, f"{stem}_pads")
+            begins = [0, 0] + pads[:nd]
+            ends = [0, 0] + pads[nd:]
+            model.graph.initializer.append(
+                numpy_helper.from_array(np.array(begins + ends, np.int64), pname)
+            )
+            made.append(
+                helper.make_node(
+                    "Pad", [src, pname], [padded], name=_unique_name(model, f"{stem}_P")
+                )
+            )
+            src = padded
+        # [N, C, spatial...] -> [N, spatial..., C]
+        xt = _unique_name(model, f"{stem}_xt")
+        made.append(
+            helper.make_node(
+                "Transpose",
+                [src],
+                [xt],
+                perm=[0] + list(range(2, nd + 2)) + [1],
+                name=_unique_name(model, f"{stem}_XT"),
+            )
+        )
+        # [Cout, Cin, k...] -> [k..., Cin, Cout]
+        wt = _unique_name(model, f"{stem}_wt")
+        made.append(
+            helper.make_node(
+                "Transpose",
+                [w],
+                [wt],
+                perm=list(range(2, nd + 2)) + [1, 0],
+                name=_unique_name(model, f"{stem}_WT"),
+            )
+        )
+
+        wshape_name = _unique_name(model, f"{stem}_wshape")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array([cin, cout], np.int64), wshape_name)
+        )
+
+        acc = None
+        taps = [()]
+        for j in range(nd):
+            taps = [t + (k,) for t in taps for k in range(ksize[j])]
+        for tap in taps:
+            label = "_".join(str(k) for k in tap)
+            cur_x, cur_w = xt, wt
+            for j, k in enumerate(tap):
+                nxt = _unique_name(model, f"{stem}_x{label}_{j}")
+                made.append(
+                    _slice(
+                        model,
+                        cur_x,
+                        nxt,
+                        1 + j,
+                        k,
+                        k + (outdim[j] - 1) * strides[j] + 1,
+                        f"{stem}_SX{label}_{j}",
+                        step=strides[j],
+                    )
+                )
+                cur_x = nxt
+                nxw = _unique_name(model, f"{stem}_w{label}_{j}")
+                made.append(
+                    _slice(model, cur_w, nxw, j, k, k + 1, f"{stem}_SW{label}_{j}")
+                )
+                cur_w = nxw
+            flat = _unique_name(model, f"{stem}_wf{label}")
+            made.append(
+                helper.make_node(
+                    "Reshape",
+                    [cur_w, wshape_name],
+                    [flat],
+                    name=_unique_name(model, f"{stem}_WR{label}"),
+                )
+            )
+            prod = _unique_name(model, f"{stem}_m{label}")
+            made.append(
+                helper.make_node(
+                    "MatMul",
+                    [cur_x, flat],
+                    [prod],
+                    name=_unique_name(model, f"{stem}_MM{label}"),
+                )
+            )
+            if acc is None:
+                acc = prod
+            else:
+                nxt = _unique_name(model, f"{stem}_a{label}")
+                made.append(
+                    helper.make_node(
+                        "Add",
+                        [acc, prod],
+                        [nxt],
+                        name=_unique_name(model, f"{stem}_AD{label}"),
+                    )
+                )
+                acc = nxt
+        # A bias is [Cout], which broadcasts onto the trailing axis exactly
+        # where the taps land -- before the output is transposed back. The
+        # 1x1 downsample convolutions in resnet18 carry one, and skipping
+        # them left a live-weight Conv for Pulsar2 to reject with
+        # "Hardware Op spec error ActWeightConv ... list index out of range".
+        if len(node.input) > 2 and node.input[2]:
+            biased = _unique_name(model, f"{stem}_biased")
+            made.append(
+                helper.make_node(
+                    "Add",
+                    [acc, node.input[2]],
+                    [biased],
+                    name=_unique_name(model, f"{stem}_B"),
+                )
+            )
+            acc = biased
+        # [N, spatial..., Cout] -> [N, Cout, spatial...]
+        made.append(
+            helper.make_node(
+                "Transpose",
+                [acc],
+                [node.output[0]],
+                perm=[0, nd + 1] + list(range(1, nd + 1)),
+                name=_unique_name(model, f"{stem}_YT"),
+            )
+        )
+        out.extend(made)
+        changed += 1
+    if changed:
+        del model.graph.node[:]
+        model.graph.node.extend(out)
+    return changed
+
+
+def _slice(model, src, dst, axis, start, end, stem, step=1):
+    names = []
+    fields = [("starts", start), ("ends", end), ("axes", axis)]
+    if step != 1:
+        fields.append(("steps", step))
+    for label, value in fields:
+        name = _unique_name(model, f"{stem}_{label}")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array([value], np.int64), name)
+        )
+        names.append(name)
+    return helper.make_node(
+        "Slice", [src] + names, [dst], name=_unique_name(model, stem)
+    )
+
+
+def _value_shapes(model):
+    inferred = model
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+    except Exception:
+        pass
+    shapes = {}
+    for value in (
+        list(inferred.graph.input)
+        + list(inferred.graph.value_info)
+        + list(inferred.graph.output)
+    ):
+        dims = value.type.tensor_type.shape.dim
+        if all(d.HasField("dim_value") for d in dims):
+            shapes[value.name] = [d.dim_value for d in dims]
+    for init in model.graph.initializer:
+        shapes[init.name] = list(init.dims)
+    return shapes
+
+
 #: Order matters. `dilated_conv_to_taps` consumes a convolution's `pads`
 #: attribute, so it has to run before `explicit_conv_padding` zeroes it.
 RULES = {
     "float16_to_float32": float16_to_float32,
     "pow2_to_mul": pow2_to_mul,
+    "neg_to_mul": neg_to_mul,
+    "rank0_to_rank1": rank0_to_rank1,
+    "inline_local_functions": inline_local_functions,
+    "avgpool_ceil_to_floor": avgpool_ceil_to_floor,
+    "flatten_to_reshape": flatten_to_reshape,
+    "global_pool_to_reduce": global_pool_to_reduce,
+    "gemm_to_matmul": gemm_to_matmul,
+    "act_weight_conv_to_matmul": act_weight_conv_to_matmul,
     "dilated_conv_to_taps": dilated_conv_to_taps,
     "explicit_conv_padding": explicit_conv_padding,
     "filename_safe_io_names": filename_safe_io_names,
 }
+
+#: The rules a graph needs to be a *training* step rather than an inference
+#: model: a live weight, a scalar loss, and the ops a backward pass emits.
+#: `onnxsim.graph_grad` produces all three.
+TRAINING_RULES = (
+    "inline_local_functions",
+    "avgpool_ceil_to_floor",
+    "flatten_to_reshape",
+    "global_pool_to_reduce",
+    "neg_to_mul",
+    "rank0_to_rank1",
+    "gemm_to_matmul",
+    "act_weight_conv_to_matmul",
+)
 
 
 def legalize(model, rules=None):
