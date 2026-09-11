@@ -313,6 +313,7 @@ from onnxsim.torch_training import (
     export_torch_module_to_onnx,
 )
 from onnxsim.transformers_export import export_transformers_model
+from onnxsim.webgpu_target import check_webgpu_attention_support
 from onnxsim.xnnpack_codegen import export_xnnpack_c, generate_xnnpack_c
 from onnxsim.zeroquant import apply_zeroquant
 
@@ -471,6 +472,7 @@ __all__ = [
     "PruningSensitivityReport",
     "PruningLayerSensitivity",
     "convert_matmul_to_gemm",
+    "check_webgpu_attention_support",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
