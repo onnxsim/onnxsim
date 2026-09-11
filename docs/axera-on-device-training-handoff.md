@@ -377,6 +377,71 @@ alone after that container was killed). Worth fixing in `pulsar2_docker.py`
 itself -- kill the container on `TimeoutExpired` -- if this sweep is
 revisited.
 
+### Execution overlap: async dispatch is unsupported here; concurrent vNPU contexts are real
+
+AXCL's headers (`/usr/include/axcl/axcl_rt_engine.h`) declare
+`axclrtEngineExecuteAsync(modelId, contextId, group, io, stream)` alongside
+the synchronous `axclrtEngineExecute` `resident_runner.c` uses, plus
+`axclrtCreateStream`/`axclrtSynchronizeStream`. **It does not work on this
+device/SDK build.** `axclrtCreateStream` succeeds, but every call to
+`axclrtEngineExecuteAsync` returns `AXCL_ERR_UNSUPPORT` (`0x4`), confirmed
+with a double-buffered variant built specifically to exercise it (overlapping
+the next step's `x`/`y` host-to-device copy with the current step's
+in-flight execute -- the only per-step host-side work in this benchmark with
+no dependency on the current step's output, and so the only thing that could
+legally overlap `Execute` without a data race). This is `axclhost` 2.25.0 on
+the PCIe-host path (the `axcl-vm` LXD VM this project's hardware work runs
+through); async execute may be implemented on a native/on-SoC build this
+project has not had access to, but on what's here, it is a documented,
+declared, non-functional API, not a missing feature to add around.
+
+**vNPU partitioning is real, and correctness holds.** `axclrtEngineInit`
+accepts `AXCL_VNPU_ENABLE` (and `_BIG_LITTLE`/`_LITTLE_BIG`) alongside the
+`AXCL_VNPU_DISABLE` `resident_runner.c` uses, splitting the NPU into
+concurrently-schedulable partitions. Confirmed non-corrupting first: 20 steps
+of the resnet50 step under `AXCL_VNPU_DISABLE` and under `AXCL_VNPU_ENABLE`
+produced bit-identical output (loss and the first four floats of
+`fc.weight'`, both `0, -0.0212390665, 0.0157326423, 0.0110128485`). Then
+measured concurrently -- N separate OS processes, each its own model load,
+context and device buffers, `AXCL_VNPU_ENABLE`, same resnet50 step as the
+batching table above:
+
+| concurrent contexts | aggregate throughput | vs. N=1 `VNPU_DISABLE` baseline | per-context throughput |
+| --- | --- | --- | --- |
+| 1 (`VNPU_DISABLE`) | 30.3 steps/s | 1.00x (baseline) | 30.3 |
+| 1 (`VNPU_ENABLE`) | 28.2 steps/s | 0.93x | 28.2 |
+| 2 | 51.6 steps/s | **1.70x** | ~25.8 each |
+| 4 | 79.0 steps/s | **2.61x** | ~19.8 each |
+| 8 | 86.5 steps/s | **2.86x** | ~10.8 each |
+
+This is genuine hardware concurrency, not queueing: at N=2 and N=4 each
+process's *own* reported per-step latency stays close to the solo
+`VNPU_ENABLE` figure (measured from inside that process, independent of what
+the other processes are doing) rather than roughly doubling/quadrupling the
+way it would if the partitions were only time-slicing one physical resource
+end to end. Scaling is real but not free and not unbounded: per-context
+throughput falls as concurrency rises (93% of solo at N=2, 70% at N=4, 36% at
+N=8), and the aggregate curve is clearly saturating between N=4 and N=8 (+9%
+aggregate for double the contexts, against +52% going from N=2 to N=4) --
+N=4 is the better efficiency point of what was measured, not N=8. Enabling
+`AXCL_VNPU_ENABLE` also costs ~7% off solo throughput versus `VNPU_DISABLE`
+even with nothing else running, which is the price of leaving partitioning on
+by default rather than only under real concurrent load.
+
+Net: **running several independent training-step contexts concurrently under
+vNPU partitioning is a real, orthogonal lever to batching** -- unlike batch
+16+ (this doc, above), it does not hit Pulsar2's compile-time wall, since
+each context compiles its own small, already-proven graph rather than one
+larger one. It trades per-context latency for aggregate throughput similarly
+to batching, tops out around 2.6-2.9x in what was measured here, and would
+suit a scenario with several independent models/replicas to train rather
+than one already-batched step (batching and vNPU concurrency were not tried
+together; whether they compose is open). `scripts/axera/tools/resident_runner.c`
+now takes a `-v` flag for `AXCL_VNPU_ENABLE` to reproduce this; there is no
+committed orchestration script for launching N of them, a shell loop over N
+separate copies of the compiled model (see this section's own measurement
+method) is enough.
+
 ## Two vendor bugs, both silent
 
 **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all of

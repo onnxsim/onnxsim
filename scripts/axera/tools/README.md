@@ -22,6 +22,13 @@ prefill cannot be timed with the shipped CLI. These talk to
   direct before/after comparison against the same compiled model -- see
   `docs/axera-on-device-training-handoff.md`'s "Weights resident with
   in-graph updates" section for the numbers this produced on a real AX650N.
+  `-v` runs with `AXCL_VNPU_ENABLE` instead of `AXCL_VNPU_DISABLE` --
+  confirmed non-corrupting, and the way to get real concurrent throughput:
+  run several copies of this binary at once (each against its own model-file
+  copy) and the NPU schedules them concurrently instead of serializing. See
+  the handoff doc's "Execution overlap" section for the scaling numbers and
+  for why `axclrtEngineExecuteAsync` -- AXCL's other overlap primitive --
+  is not an option (`AXCL_ERR_UNSUPPORT` on this device/SDK build).
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
@@ -36,6 +43,7 @@ gcc -O2 -std=c11 -I/usr/include/axcl -o resident_runner resident_runner.c \
     -L/usr/lib/axcl -laxcl_rt -Wl,-rpath,/usr/lib/axcl
 ./resident_runner train_step.axmodel 30       # resident (device-to-device)
 ./resident_runner train_step.axmodel 30 -n    # non-resident (host round trip)
+./resident_runner train_step.axmodel 30 -v    # AXCL_VNPU_ENABLE (run N copies concurrently for real throughput)
 ```
 
 Group 0's latency from `bench_shape_group` matches `axcl_run_model`'s to
