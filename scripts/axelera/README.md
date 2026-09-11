@@ -150,7 +150,11 @@ three rewrites also exist as onnxsim C++ passes
 `maxpool_rowmajor_when_indices_unused.h`), registered as opt-in
 `PassType::Other` optimizers -- so any onnxsim binding (Python, C, Rust,
 npm/WASM), not just this script, can run them, and they run *inside*
-`simplify()`'s own fixed point rather than as a second pass after it:
+`simplify()`'s own fixed point rather than as a second pass after it. Those
+core passes carry no Voyager/Axelera-specific knowledge at all -- they're
+generic ONNX-legal rewrites for a *kind* of backend limitation
+(explicit-padding-only, no `transA`, row-major-only `storage_order`); this
+directory is the legalizer that knows Voyager needs all three, and why:
 
 ```python
 model, ok = onnxsim.simplify(

@@ -22,10 +22,17 @@
 // dynamic axis) is left alone rather than guessed at. `Conv`'s
 // `kernel_shape` attribute is optional (inferrable from the weight tensor
 // `W`, which exporters routinely omit it in favor of), so this reads the
-// kernel from `W`'s shape when the attribute is absent, matching how
-// `AIPU`/NPU compilers that publish this same `auto_pad == "NOTSET"`
-// requirement (e.g. Axelera Voyager SDK's Metis compiler -- see
-// `scripts/axelera/legalize.py`'s Python counterpart of this rule) read it.
+// kernel from `W`'s shape when the attribute is absent -- the same place a
+// compiler that itself requires `auto_pad == "NOTSET"` would have to read
+// it from.
+//
+// A generic, target-agnostic legalization: many inference backends accept
+// only explicit padding and refuse (or silently mishandle) `SAME_*`/`VALID`
+// `auto_pad`. This pass carries no knowledge of any particular target; a
+// target-specific legalizer decides whether it needs this rewrite and opts
+// into it (see e.g. `scripts/axelera/legalize.py`, whose own docstring
+// records a real compiler that documents `auto_pad == "NOTSET"` as a hard
+// requirement).
 //
 // This is a pure graph-shape rewrite -- not a node-count reduction -- so it
 // is `PassType::Other` and never runs by default. Opt in with

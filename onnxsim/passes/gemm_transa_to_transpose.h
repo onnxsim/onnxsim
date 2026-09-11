@@ -12,9 +12,15 @@
 // `perm=[1, 0]` is always the right transpose -- `transA = 1` means
 // "transpose A before the matmul", and inserting the `Transpose` node ahead
 // of the `Gemm` is the same operation, spelled as two nodes instead of one
-// attribute. Some backends document `transA == 0` as a hard requirement
-// (e.g. Axelera Voyager SDK's Metis compiler -- see
-// `scripts/axelera/legalize.py`'s Python counterpart of this rule).
+// attribute.
+//
+// A generic, target-agnostic legalization: some inference backends only
+// implement (or only accelerate) `Gemm` with `transA == 0`, requiring any
+// transposition to already be a separate op. This pass carries no
+// knowledge of any particular target; a target-specific legalizer decides
+// whether it needs this rewrite and opts into it (see e.g.
+// `scripts/axelera/legalize.py`, whose own docstring records a real
+// compiler that documents `transA == 0` as a hard requirement).
 //
 // This is a pure graph-shape rewrite -- not a node-count reduction -- so it
 // is `PassType::Other` and never runs by default. Opt in with
