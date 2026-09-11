@@ -158,9 +158,62 @@ transpose/slice glue, not arithmetic** -- the tax `act_weight_conv_to_matmul`
 pays for turning a live-weight `Conv` into per-tap `MatMul`s (each tap needs
 its own `Slice` and `Transpose`, and apparently its own quantization
 boundary). Residency removed the *transfer* bottleneck; this is what is left,
-and it is now the bigger one. Untried: whether `fuse=True`'s single wide
-matmul-per-conv (already default) can be pushed further, or whether the
-per-tap quantize/dequantize pairs can be coalesced.
+and it is now the bigger one.
+
+### The quantize redundancy is real, and not fixable from the ONNX side
+
+Each trainable weight is read directly by **three** nodes -- the forward
+conv-as-matmul's weight-transpose, its own gradient's reshape, and the
+in-graph SGD `Sub` -- and Pulsar2 inserts a **separate `AxQuantizeLinear` per
+edge** rather than sharing one quantized copy: confirmed on the compiled
+graph, `fc.weight` and all three `layer4` weights are each quantized 2-3
+times, while **no ordinary multi-consumer activation in the same graph is
+ever requantized more than once**. Checking the quantize nodes' own
+parameters found the redundancy is partly real: two of the three edges for
+`layer4.1.conv1`'s weight (the forward-matmul path and the gradient-reshape
+path) quantize to the *identical* domain (`S8`, `scale=0.00209808`,
+`zeropoint=0`) -- genuinely the same computation, done twice. The third (the
+SGD-update `Sub`) quantizes to a different domain entirely (`U8`,
+`scale=0.00209251`, `zeropoint=128`), so that one is not redundant: the
+update path legitimately needs its own quantization range.
+
+**Tried and failed: routing all three edges through one shared node.** Two
+spellings, both mathematically identity and both checked bit-exact against
+the un-rewritten graph on host (`onnxruntime`, max abs diff `0.0`):
+
+| shared-node spelling | result |
+| --- | --- |
+| `Reshape(w, same_shape)` | no change |
+| `Mul(w, ones_like(w))` | no change |
+
+Both compiled to the **exact same 213-node optimized/quantized graph**
+(`frontend/optimized_quant_axmodel.onnx`) and the **exact same
+`max_cycle`** (31,369,216) as the unmodified graph -- Pulsar2's own frontend
+optimizer canonicalizes a same-shape `Reshape` and a multiply-by-a-literal-
+all-ones-constant as identities and removes them **before** its
+quantization-boundary insertion pass runs, independent of anything onnxsim
+did upstream (both variants only needed `onnxsim.simplify()`'s
+`eliminate_nop_reshape` to *not* run, which it didn't here since these were
+inserted after the last `simplify()` call -- and it made no difference,
+because Pulsar2 does the same collapse internally regardless). This is a
+different failure shape than the `Gemm`-reconstruction bug elsewhere in this
+document: that fix worked by changing *which pattern matches* (a 1-D bias
+vs. a `[1, N]` one); there is no equivalent lever here, because the thing
+being matched is generic identity-elimination, not a specific fusion
+pattern with a shape precondition to dodge.
+
+**So this one op-type share is confirmed structural, not an oversight
+onnxsim's graph shape controls.** Whatever decides Pulsar2 requantizes a
+live-weight input per direct consumer instead of per distinct
+(source, quantization-domain) pair is internal to Pulsar2's own frontend
+compiler; there is no ONNX-graph-level lever this project has access to that
+moves it. Not investigated: whether Pulsar2's `layer_configs` can pin one
+named intermediate's quantization domain such that two edges are *forced*
+into the same domain by construction rather than merely happening to match
+-- worth trying if this is revisited, but it wasn't tried here since the two
+redundant edges already match by calibration coincidence, not by any config
+this project controls, so forcing it would need to survive the same
+collapse just demonstrated.
 
 Correctness was checked the same way as the rest of this document -- a
 directional-derivative check against `onnxruntime` on host (not the on-device
@@ -255,8 +308,20 @@ hand and so calls `simplify()` itself, with the same skip list.
    38.3 ms/step) -- see "Weights resident with in-graph updates" above.
    What's left in this direction: the quantize/dequantize + transpose/slice
    glue around `act_weight_conv_to_matmul`'s per-tap decomposition is now
-   *the* cost (75% of NPU cycles, per the profile above) -- worth another
-   pass on its own before reaching for anything else here.
+   *the* cost (75% of NPU cycles, per the profile above). The
+   quantize/dequantize half (48.8%) was tried and is **confirmed structural**
+   -- see "The quantize redundancy is real, and not fixable from the ONNX
+   side" above, two independent fixes both silently collapsed by Pulsar2's
+   own optimizer. **Untried and the more promising remaining half: the
+   `AxTranspose`/`AxSlice` 26.3%.** `act_weight_conv_to_matmul` transposes
+   the activation to `[N, spatial..., Cin]` and slices out each of the K**2
+   taps -- worth checking whether the transpose is being redone once per tap
+   (K**2 transposes of overlapping data) when it could be hoisted to run
+   once per convolution, with every tap's `Slice` reading from that single
+   transposed tensor. Unlike the quantize case, this is squarely onnxsim's
+   own graph shape (the rule's own emission order), not something Pulsar2's
+   optimizer stands between -- a materially different kind of lever than the
+   one that just failed.
 3. **All 23 tensors, and 224x224.** Only the last four layers and a 64x64 input
    have been built.
 4. **An optimiser beyond SGD.** `qat_graph.adam_update` exists and has never
