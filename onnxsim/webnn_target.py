@@ -35,13 +35,25 @@ Meant to be called on the *output* of
 the model is about to be shipped to a WebNN-targeting caller -- not on the
 input model, since simplification could in principle still add or remove
 such a node.
+
+:func:`estimate_webnn_islands` goes one step further for the ``Reshape``/
+``Expand`` gap specifically: instead of just listing offending nodes, it
+estimates how many separate contiguous "WebNN islands" they split the rest of
+the graph into, and how many device-copy boundaries result -- see
+``onnxsim._ep_fragmentation`` for what that means and its limits. The INT64
+graph-boundary gap is deliberately excluded from that estimate: it is a
+whole-session risk (WebNN graph construction can fail entirely), not a
+single node falling back, so it doesn't fit the "one node cut out of an
+otherwise-contiguous island" model the estimate uses.
 """
 
 from __future__ import annotations
 
-from typing import List, Set, Union
+from typing import List, Set, Tuple, Union
 
 import onnx
+
+from onnxsim._ep_fragmentation import IslandReport, estimate_fragmentation
 
 
 def _constant_producing_names(graph: onnx.GraphProto) -> Set[str]:
@@ -50,6 +62,50 @@ def _constant_producing_names(graph: onnx.GraphProto) -> Set[str]:
         if node.op_type == "Constant" and node.output:
             names.add(node.output[0])
     return names
+
+
+def _int64_boundary_messages(graph: onnx.GraphProto) -> List[str]:
+    messages = []
+    for kind, values in (("input", graph.input), ("output", graph.output)):
+        for value_info in values:
+            tensor_type = value_info.type.tensor_type
+            if tensor_type.elem_type == onnx.TensorProto.INT64:
+                messages.append(
+                    f"Graph {kind} {value_info.name!r} is INT64; several "
+                    "WebNN backends (notably Core ML) do not support INT64 "
+                    "tensors, which can fail WebNN graph construction "
+                    "entirely and fall the whole session back to wasm "
+                    "rather than just this value."
+                )
+    return messages
+
+
+def _flagged_reshape_expand_nodes(
+    graph: onnx.GraphProto,
+) -> List[Tuple[int, str]]:
+    """Every ``Reshape``/``Expand`` node with a non-constant shape input, as
+    ``(node index in graph.node, message)`` pairs -- the single source of
+    truth both :func:`check_webnn_support` and :func:`estimate_webnn_islands`
+    build on.
+    """
+    constant_names = _constant_producing_names(graph)
+    flagged = []
+    for i, node in enumerate(graph.node):
+        if node.op_type not in ("Reshape", "Expand") or len(node.input) < 2:
+            continue
+        shape_input = node.input[1]
+        if shape_input and shape_input not in constant_names:
+            node_label = node.name or (node.output[0] if node.output else "<unnamed>")
+            flagged.append(
+                (
+                    i,
+                    f"{node.op_type} node {node_label!r} has a non-constant "
+                    f"shape input ({shape_input!r}); onnxruntime-web's WebNN "
+                    f"operator table requires {node.op_type}'s shape input to "
+                    "be constant, so this node will fall back off WebNN.",
+                )
+            )
+    return flagged
 
 
 def check_webnn_support(model: Union[str, onnx.ModelProto]) -> List[str]:
@@ -67,32 +123,24 @@ def check_webnn_support(model: Union[str, onnx.ModelProto]) -> List[str]:
         model = onnx.load(model, load_external_data=False)
 
     graph = model.graph
-    messages = []
+    return _int64_boundary_messages(graph) + [
+        msg for _, msg in _flagged_reshape_expand_nodes(graph)
+    ]
 
-    for kind, values in (("input", graph.input), ("output", graph.output)):
-        for value_info in values:
-            tensor_type = value_info.type.tensor_type
-            if tensor_type.elem_type == onnx.TensorProto.INT64:
-                messages.append(
-                    f"Graph {kind} {value_info.name!r} is INT64; several "
-                    "WebNN backends (notably Core ML) do not support INT64 "
-                    "tensors, which can fail WebNN graph construction "
-                    "entirely and fall the whole session back to wasm "
-                    "rather than just this value."
-                )
 
-    constant_names = _constant_producing_names(graph)
-    for node in graph.node:
-        if node.op_type not in ("Reshape", "Expand") or len(node.input) < 2:
-            continue
-        shape_input = node.input[1]
-        if shape_input and shape_input not in constant_names:
-            node_label = node.name or (node.output[0] if node.output else "<unnamed>")
-            messages.append(
-                f"{node.op_type} node {node_label!r} has a non-constant "
-                f"shape input ({shape_input!r}); onnxruntime-web's WebNN "
-                f"operator table requires {node.op_type}'s shape input to be "
-                "constant, so this node will fall back off WebNN."
-            )
+def estimate_webnn_islands(model: Union[str, onnx.ModelProto]) -> IslandReport:
+    """Estimates how much the non-constant-shape ``Reshape``/``Expand`` nodes
+    :func:`check_webnn_support` flags fragment the rest of the graph into
+    separate WebNN-accelerated islands (see this module's docstring and
+    ``onnxsim._ep_fragmentation`` for the method and its limits: this only
+    accounts for that one gap, so it is a lower bound on real fragmentation,
+    not a full simulation of ONNX Runtime's partitioner, and it does not
+    factor in the separate INT64 graph-boundary gap at all).
 
-    return messages
+    :param model: the onnx ModelProto to inspect, or a file path
+    :returns: an :class:`onnxsim._ep_fragmentation.IslandReport`
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    flagged = _flagged_reshape_expand_nodes(model.graph)
+    return estimate_fragmentation(model.graph, {i for i, _ in flagged})
