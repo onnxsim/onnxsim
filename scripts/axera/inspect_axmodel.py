@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Inspect a real Axera `.axmodel` file for the CPU/NPU boundary markers.
 
-Implements steps 2-4 of "Immediate next steps" in
-`../../../junk/axcl-axmodel-onnxsim-notes.md`, the handoff notes this whole
-`scripts/axera/` harness is based on: as of writing **no real `.axmodel` has
-been inspected**, so this script exists to actually do that the moment one is
-available, rather than continuing to guess.
+Implements steps 2-4 of the "Immediate next steps" described in the Axera
+compatibility notes in ``scripts/axera/README.md``. As of writing **no real
+`.axmodel` has been inspected**, so this script exists to actually do that the
+moment one is available, rather than continuing to guess.
 
 It:
 

@@ -2,9 +2,9 @@
 
 Verifies that `onnxsim`'s output stays friendly to **Pulsar2**, the compiler
 behind Axera's AXCL toolchain that turns an ONNX model into a `.axmodel` for
-the AX6xx/AX8xx NPU line. Based on the handoff notes at
-[`../../../junk/axcl-axmodel-onnxsim-notes.md`](../../../junk/axcl-axmodel-onnxsim-notes.md),
-and since verified against a real **AX650N** (PCIe, via the AXCL host driver
+the AX6xx/AX8xx NPU line. The evidence and limitations are recorded below,
+and the implementation has been verified against a real **AX650N** (PCIe, via
+the AXCL host driver
 and `axcl_run_model`) and a real compiled `.axmodel`
 (`AXERA-TECH/YOLOv8`'s `AX650/yolov8n_640x640_npu1.axmodel`).
 
