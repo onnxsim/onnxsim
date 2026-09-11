@@ -3399,7 +3399,9 @@ def simplify(
     check_atol: float = 1e-5,
     input_fill: str = "random",
     providers: Optional[Sequence[backend.Provider]] = None,
-    gemm_fusion_backend: Literal["ort_cpu", "unrestricted"] = "ort_cpu",
+    gemm_fusion_backend: Literal[
+        "ort_cpu", "unrestricted", "webgpu", "webnn"
+    ] = "ort_cpu",
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
@@ -3512,10 +3514,34 @@ def simplify(
             use it when the simplified model will run somewhere ORT CPU's FP16 Gemm
             slowness does not apply (a different runtime, a different execution
             provider such as CUDA, or an ONNX Runtime build with a real FP16 Gemm
-            kernel). Implemented in the C++ core via the
-            ``ONNXSIM_GEMM_FUSION_BACKEND`` environment variable, so it works from
-            every binding; setting this argument simply sets that variable for the
-            call.
+            kernel). ``"webgpu"`` is for models headed to onnxruntime-web's WebGPU
+            execution provider: unlike ORT's CPU EP, WebGPU has its own FP16 Gemm
+            kernel (including subgroup-matrix-accelerated paths on GPUs that
+            support them), so there is no CPU-specific naive-FP16 fallback to avoid
+            here -- it is handled identically to ``"unrestricted"`` (fuse
+            regardless of dtype). Pair it with
+            :func:`onnxsim.check_webgpu_attention_support` on the simplified
+            output, which flags a separate WebGPU gap this flag does not cover:
+            ``com.microsoft::Attention`` nodes using mask/past-present inputs,
+            which onnxruntime-web's WebGPU Attention kernel does not yet
+            accelerate and will silently run on a fallback execution provider
+            instead. ``"webnn"`` is likewise for models headed to
+            onnxruntime-web's WebNN execution provider, which delegates to the
+            platform's own ML stack (DirectML / Core ML / the platform NN API)
+            -- routinely used precisely for NPU/GPU FP16 (and lower-precision)
+            acceleration, not a naive fallback path -- so it is handled
+            identically to ``"unrestricted"`` too. Pair it with
+            :func:`onnxsim.check_webnn_support` on the simplified output,
+            which flags WebNN gaps this flag does not cover: INT64 graph
+            inputs/outputs and non-constant ``Reshape``/``Expand`` shape
+            inputs, both of which fall a node (or, for INT64 boundaries,
+            potentially the whole session) back to onnxruntime-web's ``wasm``
+            fallback instead of running on WebNN. Implemented in the C++ core
+            via the ``ONNXSIM_GEMM_FUSION_BACKEND`` environment variable (as
+            ``"webgpu"``/``"webnn"`` are translated to ``"unrestricted"``
+            there, since that is the only distinction the C++ side actually
+            makes), so it works from every binding; setting this argument
+            simply sets that variable for the call.
     :param profile: When set, profile every simplification fixed-point function
             (shape inference, the onnx-optimizer passes, constant folding and any
             custom rewriter) -- recording each one's wall-clock and CPU duration
@@ -3588,6 +3614,17 @@ def simplify(
     # degrade to no folding. Checking here turns a misconfigured provider (e.g.
     # CUDA requested without the onnxruntime-gpu build) into an immediate error.
     backend.validate_providers(providers)
+
+    # The C++ core's ``ParseGemmFusionBackend`` (gemm_fusion_backend.cpp) only
+    # recognizes "ort_cpu"/"unrestricted" -- "webgpu"/"webnn" are Python-facing
+    # aliases for "unrestricted" (see this parameter's docstring for why they
+    # behave identically), translated here so the env var below always carries
+    # a name the C++ side understands.
+    _gemm_fusion_backend_for_cpp = (
+        "unrestricted"
+        if gemm_fusion_backend in ("webgpu", "webnn")
+        else gemm_fusion_backend
+    )
 
     # ``target_opset_version="latest"`` resolves against the C++ core's own
     # compiled-in onnx schema registry (the same one ConvertOpsetVersion uses),
@@ -3710,7 +3747,7 @@ def simplify(
                 _fast_prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
                 os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
             _fast_prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
-            os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = gemm_fusion_backend
+            os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _gemm_fusion_backend_for_cpp
             try:
                 if isinstance(model, str):
                     # ``output_path`` given: write the result there directly instead of a
@@ -3904,7 +3941,7 @@ def simplify(
     # gemm_fusion_backend.h), restoring any prior value afterwards so this
     # does not leak into later calls in the same process.
     _prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
-    os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = gemm_fusion_backend
+    os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _gemm_fusion_backend_for_cpp
 
     # Turn on onnxruntime's own session profiler by setting ``ONNXSIM_ORT_PROFILE``
     # (read by the executor). It has two modes: ``ort_profile`` writes standalone
