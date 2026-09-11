@@ -283,10 +283,23 @@ def build(
     if os.path.exists(output_abs_dir):
         force_rmtree(output_abs_dir, work_dir, image)
 
+    # A name, not docker's own random one, so a timeout below can kill this
+    # specific container. Without `--rm` taking effect (it only fires on a
+    # *clean* exit -- irrelevant here, since what follows kills the container
+    # before that has a chance to happen) a timed-out build's container keeps
+    # running on the daemon after `subprocess.run` gives up waiting for its
+    # *client* process: confirmed real, it costs a full CPU core and several
+    # GB of RAM indefinitely and silently contaminates the timing of whatever
+    # build runs next, concurrently, on the same host (see
+    # `docs/axera-on-device-training-handoff.md`'s "Batching" section, which
+    # hit exactly this).
+    container_name = f"onnxsim-pulsar2-build-{os.getpid()}-{int(time.time() * 1000)}"
     cmd = [
         "docker",
         "run",
         "--rm",
+        "--name",
+        container_name,
         "-v",
         f"{work_dir}:/data",
         image,
@@ -307,6 +320,12 @@ def build(
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        subprocess.run(
+            ["docker", "kill", container_name],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
         return BuildResult(
             success=False, error=f"pulsar2 build timed out after {timeout}s"
         )

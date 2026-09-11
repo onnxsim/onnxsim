@@ -113,6 +113,71 @@ def test_state_output_is_sgd_update_of_the_input():
     assert np.array_equal(outs[state["gw"]], gw0)
 
 
+def test_set_batch_gradient_is_the_mean_of_per_sample_gradients():
+    """A batch-N step's gradient must equal the average of N independent
+    batch-1 steps' gradients -- the same relationship
+    `docs/axera-on-device-training-handoff.md`'s "Batching" section measured
+    on real AX650N hardware for resnet18, checked here on host for the same
+    reason every other in-graph-update property is: no docker, no device
+    needed to catch a batch-handling bug in `set_batch`/`add_mse_loss`
+    before it reaches the compiler.
+
+    Extracts each gradient as `w - w_next` at `lr=1` (the same trick
+    `test_state_output_is_sgd_update_of_the_input` relies on via `lr=0`, just
+    solved for the gradient instead of asserting a pass-through)."""
+    base = _forward_model()
+    initializers = {t.name: t for t in base.graph.initializer}
+    cw0 = onnx.numpy_helper.to_array(initializers["cw"])
+    gw0 = onnx.numpy_helper.to_array(initializers["gw"])
+
+    rng = np.random.default_rng(3)
+    n = 4
+    xs = rng.standard_normal((n, 1, 4, 4)).astype(np.float32)
+    ys = rng.standard_normal((n, 10)).astype(np.float32)
+    lr1 = np.array([1.0], np.float32)
+
+    model1 = brts.add_mse_loss(_forward_model(), "logits", num_classes=10)
+    step1, state1 = brts.build_resident_step(model1, params=["cw", "gw"])
+    onnx.checker.check_model(step1)
+    out_names1 = [o.name for o in step1.graph.output]
+
+    per_sample_grad = {"cw": [], "gw": []}
+    for i in range(n):
+        feeds = {
+            "x": xs[i : i + 1],
+            "y": ys[i : i + 1],
+            "lr": lr1,
+            "cw": cw0,
+            "gw": gw0,
+        }
+        outs = dict(zip(out_names1, _run(step1, feeds, out_names1)))
+        per_sample_grad["cw"].append(cw0 - outs[state1["cw"]])
+        per_sample_grad["gw"].append(gw0 - outs[state1["gw"]])
+    grad_avg = {p: np.mean(np.stack(g), axis=0) for p, g in per_sample_grad.items()}
+
+    forward_n = brts.set_batch(_forward_model(), n)
+    model_n = brts.add_mse_loss(forward_n, "logits", num_classes=10)
+    # `set_batch` must produce the same batch dimension `add_mse_loss` reads
+    # `y`'s shape from -- checked directly, not just implied by the numeric
+    # match below.
+    y_input = next(i for i in model_n.graph.input if i.name == "y")
+    assert [d.dim_value for d in y_input.type.tensor_type.shape.dim] == [n, 10]
+
+    step_n, state_n = brts.build_resident_step(model_n, params=["cw", "gw"])
+    onnx.checker.check_model(step_n)
+    out_names_n = [o.name for o in step_n.graph.output]
+    feeds_n = {"x": xs, "y": ys, "lr": lr1, "cw": cw0, "gw": gw0}
+    outs_n = dict(zip(out_names_n, _run(step_n, feeds_n, out_names_n)))
+
+    for p in ("cw", "gw"):
+        grad_batch = cw0 - outs_n[state_n[p]] if p == "cw" else gw0 - outs_n[state_n[p]]
+        assert np.allclose(grad_avg[p], grad_batch, atol=1e-5), p
+
+    # batch-N's step graph is the same shape/structure as batch-1's -- no
+    # extra nodes from taking a different code path for N != 1.
+    assert len(step_n.graph.node) == len(step1.graph.node)
+
+
 def test_in_graph_gradient_matches_finite_differences():
     """The gradient implied by the in-graph update (`grad = (w -
     w_next) / lr`) must agree with a numeric directional derivative of the
