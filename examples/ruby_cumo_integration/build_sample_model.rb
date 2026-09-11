@@ -10,36 +10,32 @@
 # node, leaving just `y = x + folded_c`. That's the change this sample's
 # simplify_and_run.rb demonstrates end to end.
 #
+# Written in ONNX's textual IR syntax (https://onnx.ai/onnx/repo-docs/Syntax.html
+# -- the same format onnx.parser.parse_model reads in Python, and the format
+# this repo's own tests prefer over onnx.helper.make_node/make_graph/make_model
+# chains, per the top-level CLAUDE.md) and parsed via onnxsim's own C API
+# (onnxsim_parse_model_text) -- no hand-rolled protobuf encoding, no Ruby
+# protobuf gem, no Python.
+#
 # Usage: ruby build_sample_model.rb [out_path]  (default: sample_model.onnx)
 
-require_relative 'onnx_pb_writer'
+require_relative 'onnxsim_capi'
 
-CONST_A = [1.0, 2.0, 3.0, 4.0].freeze
-CONST_B = [10.0, 20.0, 30.0, 30.0].freeze
+MODEL_TEXT = <<~ONNX
+  <
+    ir_version: 8,
+    opset_import: ["" : 13]
+  >
+  ruby_cumo_sample (float[4] x) => (float[4] y)
+  <float[4] const_a = {1.0, 2.0, 3.0, 4.0}, float[4] const_b = {10.0, 20.0, 30.0, 30.0}>
+  {
+    folded_c = Add(const_a, const_b)
+    y = Add(x, folded_c)
+  }
+ONNX
 
 def build_model
-  const_a = OnnxPbWriter.tensor_proto('const_a', CONST_A)
-  const_b = OnnxPbWriter.tensor_proto('const_b', CONST_B)
-
-  fold_node = OnnxPbWriter.node_proto(
-    op_type: 'Add', inputs: %w[const_a const_b], outputs: ['folded_c'], name: 'add_constants'
-  )
-  keep_node = OnnxPbWriter.node_proto(
-    op_type: 'Add', inputs: %w[x folded_c], outputs: ['y'], name: 'add_x'
-  )
-
-  x_input = OnnxPbWriter.value_info_proto('x', [CONST_A.size])
-  y_output = OnnxPbWriter.value_info_proto('y', [CONST_A.size])
-
-  graph = OnnxPbWriter.graph_proto(
-    name: 'ruby_cumo_sample',
-    nodes: [fold_node, keep_node],
-    initializers: [const_a, const_b],
-    inputs: [x_input],
-    outputs: [y_output]
-  )
-
-  OnnxPbWriter.model_proto(ir_version: 8, opset_version: 13, graph: graph)
+  OnnxsimCapi.parse_model_text(MODEL_TEXT)
 end
 
 if $PROGRAM_NAME == __FILE__

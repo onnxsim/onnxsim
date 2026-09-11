@@ -54,6 +54,11 @@ module OnnxsimCapi
     :pointer, :size_t, :pointer, :size_t, :pointer, :pointer
   ], :int
 
+  attach_function :onnxsim_parse_model_text, [
+    :string, :pointer, :pointer, :pointer
+  ], :int
+
+  attach_function :onnxsim_free_buffer, [:pointer], :void
   attach_function :onnxsim_free_string, [:pointer], :void
 
   # 1.5GB, onnxsim's own default (DEFAULT_TENSOR_SIZE_THRESHOLDHOLD in
@@ -69,6 +74,33 @@ module OnnxsimCapi
     str = ptr.read_string
     onnxsim_free_string(ptr)
     str
+  end
+
+  # Reads and frees a `void** out_data` / `size_t* out_size` pair as a
+  # binary Ruby String; nil if out_data is NULL.
+  def self.take_buffer(out_data_ptr, out_size_ptr)
+    ptr = out_data_ptr.read_pointer
+    return nil if ptr.null?
+
+    bytes = ptr.read_bytes(out_size_ptr.read_ulong)
+    onnxsim_free_buffer(ptr)
+    bytes
+  end
+
+  # Parses ONNX's textual IR syntax (the same format onnx.parser.parse_model
+  # reads in Python -- see onnxsim_parse_model_text's doc comment in
+  # onnxsim_c_api.h) into a serialized ModelProto, as a binary Ruby String.
+  # Raises RuntimeError with the parser's error message on a syntax error.
+  def self.parse_model_text(text)
+    out_data = FFI::MemoryPointer.new(:pointer)
+    out_size = FFI::MemoryPointer.new(:size_t)
+    out_error = FFI::MemoryPointer.new(:pointer)
+
+    status = onnxsim_parse_model_text(text, out_data, out_size, out_error)
+    error = take_string(out_error)
+    raise "onnxsim_parse_model_text failed: #{error}" if status != ONNXSIM_OK
+
+    take_buffer(out_data, out_size)
   end
 
   # Simplifies `in_path` into `out_path` with onnxsim's defaults (constant

@@ -6,16 +6,17 @@ Python, no Ruby protobuf gem, no `onnx`-alike Ruby gem -- using
 API-compatible with [`Numo::NArray`](https://github.com/ruby-numo/numo-narray))
 for the tensor side.
 
-It exercises three onnxsim features from Ruby via
+It exercises four onnxsim features from Ruby via
 [`onnxsim/capi/onnxsim_c_api.h`](../../onnxsim/capi/onnxsim_c_api.h), the same
 C ABI the [Rust bindings](../../rust/README.md) use:
 
-1. **Simplify** a small ONNX model (`onnxsim_simplify_path`) -- constant
-   folding collapses a foldable `Add` into a new initializer and drops the
-   node.
-2. **Diff** the before/after op counts (`onnxsim_model_info_diff`) -- the same
+1. **Parse** the sample model from ONNX's textual IR syntax
+   (`onnxsim_parse_model_text`) -- see "Why the text syntax?" below.
+2. **Simplify** it (`onnxsim_simplify_path`) -- constant folding collapses a
+   foldable `Add` into a new initializer and drops the node.
+3. **Diff** the before/after op counts (`onnxsim_model_info_diff`) -- the same
    report the `onnxsim` CLI prints.
-3. **Export** the simplified model to a standalone `.safetensors` archive
+4. **Export** the simplified model to a standalone `.safetensors` archive
    (`onnxsim_export_safetensors`, see [the main README's "Safetensors / GGUF
    archives" section](../../README.md#safetensors--gguf-archives)) and read
    its tensors back with a plain-Ruby reader -- the archive is the standard
@@ -42,25 +43,49 @@ constant-folding backend at C++ compile time.
 
 | File                       | Role                                                              |
 | --------------------------- | ------------------------------------------------------------------ |
-| `onnx_pb_writer.rb`         | Minimal, dependency-free ONNX protobuf writer (see below).         |
 | `onnxsim_capi.rb`           | FFI binding to `onnxsim_c`.                                        |
 | `safetensors_reader.rb`     | Plain-Ruby `.safetensors` reader (stdlib `json` only).             |
-| `build_sample_model.rb`     | Builds the tiny test model this sample simplifies.                 |
+| `build_sample_model.rb`     | The tiny test model this sample simplifies, as ONNX text syntax.   |
 | `simplify_and_run.rb`       | The end-to-end sample; run this one.                               |
 
 (No `lib/` subdirectory: the top-level `.gitignore`'s Python-oriented `lib/`
 entry would otherwise hide a Ruby `lib/` here too.)
 
-### Why a hand-rolled ONNX writer?
+### Why the text syntax?
 
-Building even a tiny test model needs *some* way to produce a serialized
-`ModelProto`. Rather than reach for Python or a Ruby protobuf gem, `onnx_pb_writer.rb` hand-encodes
-the handful of ONNX messages this sample needs (`ModelProto`/`GraphProto`/
-`NodeProto`/`TensorProto`/`ValueInfoProto`) directly against protobuf's wire
-format (tag + varint / length-delimited value) and onnx.proto3's stable field
-numbers -- keeping the whole sample, model included, to Ruby and cumo. Point
-`simplify_and_run.rb` at your own `.onnx` file instead (see "Running" below)
-if you'd rather simplify something real.
+`build_sample_model.rb` writes the test model in [ONNX's textual IR
+syntax](https://onnx.ai/onnx/repo-docs/Syntax.html) -- the same format
+`onnx.parser.parse_model` reads in Python, and what this repo's own tests
+prefer over `onnx.helper.make_node`/`make_graph`/`make_model` chains (see the
+top-level [`CLAUDE.md`](../../CLAUDE.md)) -- rather than building the graph
+field by field:
+
+```
+<
+  ir_version: 8,
+  opset_import: ["" : 13]
+>
+ruby_cumo_sample (float[4] x) => (float[4] y)
+<float[4] const_a = {1.0, 2.0, 3.0, 4.0}, float[4] const_b = {10.0, 20.0, 30.0, 30.0}>
+{
+  folded_c = Add(const_a, const_b)
+  y = Add(x, folded_c)
+}
+```
+
+Ruby has no `onnx.parser` of its own, so this only works because onnxsim's C
+API now exposes one: `onnxsim_parse_model_text` (added alongside this
+sample) wraps onnx's `OnnxParser::Parse<ModelProto>` -- the exact same parser
+Python's `onnx.parser.parse_model` calls, since onnx (and its parser) is
+always built regardless of `ONNXSIM_BUILTIN_ORT` (see the top-level
+`CLAUDE.md`) -- and hands back a serialized `ModelProto`, no protobuf library
+needed on the Ruby side. It's a small, generally useful addition to the
+shared C ABI: any binding with no protobuf tooling of its own -- this
+sample, but the same call is there for the [Rust bindings](../../rust/README.md)
+too, not just wired up on that side yet -- can get the same readable model
+construction Python's tests already have. Point `simplify_and_run.rb` at
+your own `.onnx` file instead (see "Running" below) if you'd rather simplify
+something real.
 
 ## Prerequisites
 
@@ -127,7 +152,7 @@ simplifying /tmp/.../sample_model.onnx -> /tmp/.../sample_model.simplified.onnx
 +------------------+----------------+------------------+
 | Add              | 2              | 1 *              |
 | Constant         | 2              | 1 *              |
-| Model Size       | 198.0B         | 116.0B *         |
+| Model Size       | 180.0B         | 118.0B *         |
 | Initializers     | 2              | 1 *              |
 | MACs             | 0.0            | 0.0              |
 | FLOPs            | 0.0            | 0.0              |
@@ -161,8 +186,6 @@ pointing it at an arbitrary model.)
   (`SAFETENSORS_DTYPE_TO_CUMO` in `simplify_and_run.rb`) covers the plain
   integer and `F32`/`F64` float dtypes. `F16`/`BF16` have no native
   `Numo`/`Cumo` element type and are left unmapped.
-- `onnx_pb_writer.rb` only encodes what `build_sample_model.rb` needs
-  (float32 tensors, `Add` nodes, no attributes) -- not a general ONNX writer.
 - The three-way result comparison in `simplify_and_run.rb` uses plain `==`/
   `!=`, which is fine for the built-in sample model's exactly-representable
   float32 values but not a general floating-point comparison; a model with

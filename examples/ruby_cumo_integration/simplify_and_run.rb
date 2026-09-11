@@ -31,7 +31,6 @@
 
 require 'tmpdir'
 
-require_relative 'onnx_pb_writer'
 require_relative 'onnxsim_capi'
 require_relative 'safetensors_reader'
 require_relative 'build_sample_model'
