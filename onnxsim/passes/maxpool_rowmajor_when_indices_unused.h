@@ -11,10 +11,14 @@
 // (row-major) whenever the optional `Indices` output isn't actually
 // consumed -- the attribute only orders that output (whether it's read out
 // row-major or column-major), so with no `Indices` consumer the two
-// settings compute the identical `Y`. Some backends document
-// `storage_order == 0` as a hard requirement (e.g. Axelera Voyager SDK's
-// Metis compiler -- see `scripts/axelera/legalize.py`'s Python counterpart
-// of this rule).
+// settings compute the identical `Y`.
+//
+// A generic, target-agnostic legalization: some inference backends only
+// implement (or only accelerate) `MaxPool` with `storage_order == 0`. This
+// pass carries no knowledge of any particular target; a target-specific
+// legalizer decides whether it needs this rewrite and opts into it (see
+// e.g. `scripts/axelera/legalize.py`, whose own docstring records a real
+// compiler that documents `storage_order == 0` as a hard requirement).
 //
 // This is a pure graph-shape rewrite -- so it is `PassType::Other` and
 // never runs by default. Opt in with

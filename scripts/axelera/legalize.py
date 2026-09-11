@@ -44,7 +44,13 @@ not a substitute for an actual `axelera.compiler` run.
 
 Each of these three rules also has a C++ counterpart in onnxsim's own core
 (`onnxsim/passes/explicit_auto_pad.h`, `gemm_transa_to_transpose.h`,
-`maxpool_rowmajor_when_indices_unused.h`), registered as opt-in
+`maxpool_rowmajor_when_indices_unused.h`). Those core passes are
+deliberately generic and target-agnostic -- they carry no mention of
+Voyager SDK or Axelera at all, only the ONNX-legal rewrite itself and the
+*kind* of backend limitation it answers (explicit-padding-only, `transA`-
+unsupported, row-major-only). This file is the legalizer: the place that
+knows *this* target needs all three, and why (the constraint text and
+evaluator above). Registered as opt-in
 `PassType::Other` optimizers -- `onnxsim.simplify(model,
 extra_optimizers=["explicit_auto_pad", "gemm_transA_to_transpose",
 "maxpool_rowmajor_when_indices_unused"])`, or `--enable-optimization
