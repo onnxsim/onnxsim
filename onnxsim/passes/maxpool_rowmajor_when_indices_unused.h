@@ -50,8 +50,7 @@ struct MaxPoolRowMajorWhenIndicesUnused final : public PredicateBasedPass {
     }
     // Indices is produced (a second output was declared) and consumed;
     // its ordering is observable, so leave storage_order alone.
-    return !(node->outputs().size() > 1 &&
-            !node->outputs()[1]->uses().empty());
+    return !(node->outputs().size() > 1 && !node->outputs()[1]->uses().empty());
   }
 
   bool runTransform(Node* node, Graph& graph,

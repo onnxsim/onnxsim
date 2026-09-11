@@ -45,8 +45,7 @@ struct GemmTransAToTranspose final : public PredicateBasedPass {
     if (node->kind() != kGemm || node->inputs().empty()) {
       return false;
     }
-    return GetValueFromAttrWithDefault<int64_t>(node, ktransA, int64_t(0)) !=
-           0;
+    return GetValueFromAttrWithDefault<int64_t>(node, ktransA, int64_t(0)) != 0;
   }
 
   bool runTransform(Node* node, Graph& graph,
