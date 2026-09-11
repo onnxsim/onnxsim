@@ -284,6 +284,36 @@ def _linearize_trainable_convs(
     return model
 
 
+def set_batch(model: onnx.ModelProto, batch: int) -> onnx.ModelProto:
+    """Returns a copy of `model` with its first input's leading (batch) dim
+    set to `batch`, and every cached shape downstream of it invalidated so
+    the next shape-inference pass (every caller in this module runs one --
+    `legalize._value_shapes`/`_static_shapes_and_types`) recomputes them
+    instead of reading stale ones.
+
+    `resnet18d_folded.onnx` (and any similarly-exported forward model) has no
+    batch-specific shape baked in anywhere downstream of `x`: pooling
+    (`AveragePool`/`GlobalAveragePool`), `Flatten`
+    (`legalize.flatten_to_reshape` reads the batch dim from the *current*
+    static shape at legalize time, not a constant), and `Gemm` are all
+    batch-preserving ops with no reshape target that names `1` explicitly.
+    So changing just the declared input shape and clearing the stale cached
+    ones is the whole fix -- see `docs/axera-on-device-training-
+    handoff.md`'s batch-scaling section for the real batch sweep this makes
+    possible.
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    g = out.graph
+    g.input[0].type.tensor_type.shape.dim[0].Clear()
+    g.input[0].type.tensor_type.shape.dim[0].dim_value = batch
+    del g.value_info[:]
+    for value in g.output:
+        if value.type.tensor_type.shape.dim:
+            value.type.tensor_type.shape.dim[0].Clear()
+    return out
+
+
 def add_mse_loss(
     model: onnx.ModelProto, logits: str, num_classes: int
 ) -> onnx.ModelProto:
@@ -294,12 +324,22 @@ def add_mse_loss(
     exactly, and is all this module needs to demonstrate the in-graph
     update -- swap in a different loss (cross-entropy, ...) by building one
     yourself and skipping this helper.
+
+    `y`'s batch dimension is read from `logits`'s own static shape (via shape
+    inference), not hardcoded to 1 -- `model`'s declared input batch size is
+    what determines the whole step graph's batch size (see
+    `docs/axera-on-device-training-handoff.md`'s batch-scaling section), and
+    `ReduceMean(axes=[0, 1])` below already averages over *both* the batch
+    and class axes regardless of what the batch dimension is, so nothing
+    else in this function is batch-size-specific.
     """
     out = onnx.ModelProto()
     out.CopyFrom(model)
     g = out.graph
+    logits_shape = legalize._value_shapes(model)[logits]
+    batch = int(logits_shape[0])
     g.input.append(
-        helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, num_classes])
+        helper.make_tensor_value_info("y", TensorProto.FLOAT, [batch, num_classes])
     )
     g.node.extend(
         [
@@ -449,9 +489,17 @@ def main(argv=None) -> int:
         dest="params",
         help="a trainable initializer's name; repeat for each",
     )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=None,
+        help="override the forward model's declared batch size (see set_batch)",
+    )
     args = parser.parse_args(argv)
 
     forward = onnx.load(args.forward_onnx)
+    if args.batch is not None:
+        forward = set_batch(forward, args.batch)
     with_loss = add_mse_loss(forward, args.logits, args.num_classes)
     step_model, state = build_resident_step(with_loss, args.params)
 

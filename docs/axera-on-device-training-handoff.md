@@ -311,6 +311,72 @@ existing `test_state_output_is_sgd_update_of_the_input`/
 passing -- this function changes nothing any test outside it observes,
 by design).
 
+### Batching: real, and confirms the "not enough arithmetic" diagnosis
+
+At batch 1, the resident step's own real op shapes (from a real
+`pulsar2 build --compiler.npu_perf` profile, the same one "The transpose/slice
+half" section's numbers came from) sum to 207,564,800 MACs of useful
+arithmetic -- confirmed against Pulsar2's own `group 0 QuantAxModel macs:`
+build-log line at batch 16/32/64, which reports exactly 16x/32x/64x that
+figure, so per-sample compute is exact and batch-invariant, as it should be
+for a network with no cross-sample interaction. Against the AX650N's rated
+**18 TOPS INT8**, batch-1's 415.13M FLOPs/step over a 26.9 ms (min) step is
+**15.4 GOPS achieved -- 0.086% of rated throughput.** That is not
+inefficiency at the achieved rate; it is that a 64x64, ~5.4M-trainable-param
+training step simply has too little arithmetic per call to occupy an 18 TOPS
+chip, and 44-83% of the cycles it does spend are quantize/transpose/slice
+glue rather than MACs (see the two sections above). Batching should raise
+achieved throughput roughly with batch size while adding much less than
+proportional latency -- confirmed here, not just assumed from an unrelated
+step elsewhere in this doc's own history:
+
+| batch | step time (min / avg) | samples/s | achieved GOPS (min) | rated-TOPS utilization |
+| --- | --- | --- | --- | --- |
+| 1  | 26.9 ms / 29.2 ms | 34.2  | 15.4  | 0.086% |
+| 4  | 27.2 ms / 30.4 ms | 131.6 (3.85x) | 61.0 (3.95x) | 0.339% |
+| 8  | 33.0 ms / 35.1 ms | 228.0 (6.67x) | 100.7 (6.52x) | 0.559% |
+
+Batch 1->4 is close to free (+0.3 ms min), matching this doc's earlier
+"nearly free" batching finding on an unrelated step shape. Batch 8 starts
+costing real latency (+6.1 ms min over batch 1) but throughput and achieved
+GOPS still scale faster than latency grows -- worth it if the training loop
+can actually use larger minibatches.
+
+**Batch 16 and above do not currently compile in practical time.** Offline
+`pulsar2 build` time (not step time -- this is the one-time compile cost, run
+once per model) grows sharply worse than the runtime cost does: 70 s (batch
+1) -> 130 s (batch 4) -> 386 s (batch 8) -> **did not finish within 900 s**
+at batch 16, confirmed still compiling and using a full CPU core at 25+
+minutes wall-clock when checked directly inside its (by-then-orphaned, see
+below) Docker container -- killed rather than let run indefinitely. Batch 32
+showed the identical pattern in isolation (no other build running
+concurrently) and was killed at the same ~25-minute mark, still short of any
+progress-bar stage past "calc input dependencies." Batch 64 was not
+meaningfully tested: its build was killed within its first two minutes to
+free the host for the batch-32 measurement above, so its short recorded time
+is an artifact of that intervention, not a real data point -- don't read
+"batch 64: 129.6 s" out of `compile_results.json` as a real number, it isn't
+one. Pulsar2's own per-batch reported MACs (`group 0 QuantAxModel macs:`
+being exactly `batch x 207,564,800` at 16/32/64, logged before compilation
+stalls) confirms these larger graphs and their bigger calibration sets were
+correctly built and handed to the compiler; the growth is somewhere in
+Pulsar2's own tiling/dependency-graph machinery (`build op serially`, `add
+ddr swap`, `calc input dependencies` stage counts grew from 2295/129802/... at
+batch 8 to noticeably larger at batch 32), not in anything onnxsim controls.
+
+**One operational note for whoever runs this again**: `pulsar2_docker.build()`'s
+`subprocess.run(..., timeout=...)` does not stop the underlying `docker run`
+container when it times out -- only the Python-side wait gives up. A timed-out
+build keeps consuming a full CPU core and several GB of RAM indefinitely
+unless the container is killed separately (`docker ps` / `docker kill`), and
+will silently contaminate the *next* build's timing if left running
+concurrently with it (this happened once while gathering the numbers above;
+the batch-32 build's early timing includes a period of contention with an
+orphaned batch-16 container, though its final ~25-minute figure was measured
+alone after that container was killed). Worth fixing in `pulsar2_docker.py`
+itself -- kill the container on `TimeoutExpired` -- if this sweep is
+revisited.
+
 ## Two vendor bugs, both silent
 
 **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all of
@@ -407,12 +473,14 @@ hand and so calls `simplify()` itself, with the same skip list.
    graph -- `AxDequantizeLinear`'s absolute cycle count is unchanged from
    before this fix (6,553,923, exactly), so it is very likely the same
    structural tax already investigated and not a new lead; not
-   reinvestigated. No further concrete, well-scoped lever was found in the
-   op-type profile this iteration -- the next win in this direction, if
-   there is one, likely needs a different angle than "which op type costs
-   the most cycles" (e.g. batching more than one training step's worth of
-   work per `Execute()` call, amortizing whatever fixed per-call overhead
-   remains).
+   reinvestigated. **Batching more than one training step's worth of work
+   per `Execute()` call -- done and confirmed real**, see "Batching: real,
+   and confirms the 'not enough arithmetic' diagnosis" above: batch 8 reaches
+   6.5x the achieved GOPS of batch 1 for +23% latency. The remaining lever in
+   this direction is now the *offline compile time* at batch >= 16, which
+   blows up (>25 min, no result) rather than the runtime step cost -- worth
+   a look at Pulsar2's own tiling/dependency stages if larger batches matter,
+   but this is a build-tooling problem now, not a graph-shape one.
 3. **All 23 tensors, and 224x224.** Only the last four layers and a 64x64 input
    have been built.
 4. **An optimiser beyond SGD.** `qat_graph.adam_update` exists and has never
