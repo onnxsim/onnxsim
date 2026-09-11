@@ -113,6 +113,64 @@ Batch size is nearly free until it is not: batch 1 to 16 costs 0.38 ms
 (1.40 -> 1.78) for **12.6x** the throughput; batch 64 is worse *per sample*
 than 16.
 
+### Weights resident with in-graph updates: 5.2x, measured
+
+The 42.9 MB the resnet18 step moves is every trainable weight crossing the
+host boundary twice -- once in as a graph input, once back out as the
+gradient the host then applies. `scripts/axera/build_resident_train_step.py`
+puts the update itself in the graph instead: each trained weight is a
+`qat_graph.StepGraph`-style *state* tensor (both input and output, `w_next =
+w - lr * grad` computed by ordinary `Mul`/`Sub` nodes), so
+`scripts/axera/tools/resident_runner.c` can copy each step's output buffer
+straight back into its own input buffer device-to-device and never send the
+weight across the host boundary at all -- only the batch (`x`, `y`) goes in
+and the scalar loss comes out.
+
+Same four tensors, same `resnet18d` shape, real AX650N, 30 timed steps after
+5 warmup:
+
+| | avg | min |
+| --- | --- | --- |
+| baseline (host applies `w -= lr*grad`, 42.9 MB/step) | 200.6 ms | -- |
+| in-graph update, **non-resident** (`-n`: state round-tripped through host) | 114.8 ms | 110.6 ms |
+| in-graph update, **resident** (state copied device-to-device) | **38.3 ms** | 36.0 ms |
+
+**5.2x**, not quite the "roughly 10x" estimated -- real, and short of the
+estimate for a real reason (below), not a measurement artifact: the
+non-resident row isolates that some of the win is just the in-graph update
+itself (fewer distinct tensors cross the wire even before residency helps),
+and the resident row is the full effect.
+
+A `--compiler.npu_perf` profile of the resident graph (`pulsar2_docker.
+build(profile=True)`, see `scripts/axera/README.md`'s "Real NPU profiling"
+section) explains the gap from 10x: op-type cycle share for this step is
+
+| op type | share of cycles |
+| --- | --- |
+| `AxQuantizeLinear` + `AxDequantizeLinear` | 48.8% |
+| `AxTranspose` + `AxSlice` | 26.3% |
+| `assign` (state write-back) | 6.7% |
+| `AxQuantizedMul`/`Sub`/`MatMul`/`ReduceSum` (the actual backward arithmetic + SGD update) | 16.2% |
+| `AxQuantizedConv` (the untouched forward convs) | 0.9% |
+
+**Three quarters of the NPU's own cycles are quantize/dequantize and
+transpose/slice glue, not arithmetic** -- the tax `act_weight_conv_to_matmul`
+pays for turning a live-weight `Conv` into per-tap `MatMul`s (each tap needs
+its own `Slice` and `Transpose`, and apparently its own quantization
+boundary). Residency removed the *transfer* bottleneck; this is what is left,
+and it is now the bigger one. Untried: whether `fuse=True`'s single wide
+matmul-per-conv (already default) can be pushed further, or whether the
+per-tap quantize/dequantize pairs can be coalesced.
+
+Correctness was checked the same way as the rest of this document -- a
+directional-derivative check against `onnxruntime` on host (not the on-device
+number itself, which was not re-measured to gradient precision this time;
+see `tests/test_build_resident_train_step.py` for the from-scratch,
+no-hardware version of that check) -- and a coarse on-device sanity check: a
+near-zero dummy batch's loss landed at 0.1416 on the card against 0.0972 from
+the fp32 host reference, the right order of magnitude for INT8 quantization
+noise on an untuned calibration set, not a wiring bug.
+
 ## Two vendor bugs, both silent
 
 **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all of
@@ -193,14 +251,21 @@ hand and so calls `simplify()` itself, with the same skip list.
 
 1. **The FP32 gradient seed.** The one untried route past the dying gradient,
    and the difference between a 5,000-step horizon and an open-ended one.
-2. **Weights resident with in-graph updates.** resnet18 moves 42.9 MB per step
-   purely because weights cross the wire. Put `w_next = w - lr*grad` in the
-   graph and bind it back device-to-device (the runner's `-b` already does
-   this) and only the batch crosses -- roughly 10x on step time.
+2. ~~Weights resident with in-graph updates.~~ **Done: 5.2x** (200.6 ms ->
+   38.3 ms/step) -- see "Weights resident with in-graph updates" above.
+   What's left in this direction: the quantize/dequantize + transpose/slice
+   glue around `act_weight_conv_to_matmul`'s per-tap decomposition is now
+   *the* cost (75% of NPU cycles, per the profile above) -- worth another
+   pass on its own before reaching for anything else here.
 3. **All 23 tensors, and 224x224.** Only the last four layers and a 64x64 input
    have been built.
 4. **An optimiser beyond SGD.** `qat_graph.adam_update` exists and has never
-   been put through this path.
+   been put through this path -- and now has a real in-graph-update precedent
+   to extend (`build_resident_step` currently hand-rolls plain SGD rather
+   than calling `qat_graph.sgd_momentum_update`/`adam_update`, specifically
+   to match `finetune.py`'s zero-momentum host loop; either builtin optimizer
+   would carry its own extra state tensor(s), which residency handles the
+   same way).
 5. **Does QAT through the card beat training in float and quantising?** On a
    single linear layer it bought +0.22 dB, which is a question the experiment
    could not answer -- a single layer has nothing to route around. The depth

@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Build a resnet18-shaped training-step graph with the weight update *in
+the graph*, for a resident runner to keep entirely device-side.
+
+`finetune.py`'s loop treats a compiled training step as a pure function:
+feed weights and a batch, get back a gradient, and do `w -= lr * grad` in
+host numpy. That means every trainable weight crosses the host<->device
+boundary twice a step (once as input, once as the returned gradient) for no
+reason but that the update lives off-device -- 42.9 MB of the resnet18
+step's 42.9 MB moved is exactly this, measured in
+`docs/axera-on-device-training-handoff.md`.
+
+This module builds a different graph for the same step: each trainable
+weight is a **state** tensor (`onnxsim.qat_graph.StepGraph`'s sense) that is
+both an input and an output, with `w_next = w - lr * grad` computed by
+ordinary `Mul`/`Sub` nodes inside the graph itself (plain SGD, no momentum --
+matching `finetune.train()`'s own host update exactly, so the two are
+directly comparable). A resident runner
+(`scripts/axera/tools/resident_runner.c`) can then bind each state output
+back to its own input's device buffer between `Execute()` calls and never
+send the weight across the host boundary at all; only the batch (`x`, `y`)
+goes in and the scalar loss comes out.
+
+Pipeline, and why the order matters:
+
+1. Append a scalar loss to the forward model (`Sub`/`Mul`/`ReduceMean`, with
+   explicit `axes` -- see `legalize.avgpool_ceil_to_floor`'s and
+   `global_pool_to_reduce`'s own docstrings for the vendor bug this dodges).
+2. Legalize *forward*-graph blockers that are differentiability blockers,
+   not just Pulsar2-compile-time ones: `avgpool_ceil_to_floor`,
+   `flatten_to_reshape`, `global_pool_to_reduce`. `onnxsim.graph_grad` has no
+   rule for `Flatten`/`GlobalAveragePool` and declines `ceil_mode=1`
+   outright, so these three must run *before* `build_backward`, not after
+   (unlike the rest of `legalize.TRAINING_RULES`, which only needs to run on
+   the finished step graph).
+3. `onnxsim.graph_grad.build_backward()` differentiates the (now legal)
+   forward+loss graph against the chosen trainable weights.
+4. Plain SGD, in-graph: `step = lr * grad; w_next = w - step` per weight,
+   via `onnxsim.qat_graph.GraphBuilder.mul`/`.sub` directly -- not
+   `qat_graph.sgd_momentum_update`, which always carries a momentum buffer
+   as extra state; this is the zero-momentum case `finetune.py`'s host loop
+   already implements, so there is nothing to gain from carrying one.
+5. `onnxsim.qat_graph.make_step_graph()` wraps it into a `StepGraph` and
+   simplifies with the same skip list `docs/axera-on-device-training-
+   handoff.md`'s "Simplify the gradient graph" section describes
+   (`fuse_matmul_add_bias_into_gemm`/`fuse_transpose_into_gemm` -- a training
+   graph's whole point is a *live* weight, and both fusions would rebuild
+   exactly the `Gemm`/transpose-into-`Gemm` shape this graph exists to
+   avoid).
+6. The remaining `legalize.TRAINING_RULES` (`inline_local_functions`,
+   `avgpool_ceil_to_floor` again for any pool the update graph itself
+   introduced, `neg_to_mul`, `rank0_to_rank1`, `gemm_to_matmul`,
+   `act_weight_conv_to_matmul`) make the *step* graph -- backward pass and
+   update included -- something `pulsar2 build` will actually lower.
+7. One more `onnxsim.simplify()` pass, same skip list: `act_weight_conv_to_
+   matmul`'s per-tap expansion multiplies node count, and consecutive taps
+   slicing the same tensors collapse under common-subexpression elimination
+   -- worth doing after legalization, not only before it (same finding the
+   handoff's own "Simplify the gradient graph" section records).
+
+One graph-construction quirk worth naming: `qat_graph.make_step_graph`
+declares every scalar input (here, just `lr`) at rank 0. Pulsar2's
+calibration step concatenates each input across calibration samples, and a
+rank-0 tensor cannot be concatenated -- the same failure
+`legalize.rank0_to_rank1` exists to fix for a rank-0 *output* (the loss).
+There is no equivalent rule for a rank-0 *input*, so this module reshapes
+`lr` to `[1]` directly after `make_step_graph` returns; broadcasting a `[1]`
+scalar against every weight's `Mul` is identical arithmetic.
+
+See `tests/test_build_resident_train_step.py` for a from-scratch synthetic
+model exercising this whole pipeline without resnet18 or real hardware, and
+`docs/axera-on-device-training-handoff.md` for the measured speed this
+bought on a real AX650N.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from typing import Dict, Sequence, Tuple
+
+import numpy as np
+import onnx
+from onnx import TensorProto, helper
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import legalize  # noqa: E402
+
+from onnxsim import graph_grad, qat_graph  # noqa: E402
+from onnxsim.compile_training import _static_shapes_and_types  # noqa: E402
+
+#: Applied to the *step* graph (forward + loss + backward + in-graph
+#: update), after `make_step_graph`'s own simplify. Mirrors
+#: `legalize.TRAINING_RULES` minus the three rules that had to run on the
+#: forward graph earlier, before differentiation -- see this module's
+#: docstring.
+_POST_BACKWARD_RULES = (
+    "inline_local_functions",
+    "avgpool_ceil_to_floor",
+    "neg_to_mul",
+    "rank0_to_rank1",
+    "gemm_to_matmul",
+    "act_weight_conv_to_matmul",
+)
+
+
+def add_mse_loss(
+    model: onnx.ModelProto, logits: str, num_classes: int
+) -> onnx.ModelProto:
+    """Returns a copy of `model` with a `y` input and a scalar MSE `loss`
+    output appended: `loss = mean((logits - y) ** 2)`.
+
+    A plain elementwise MSE is the simplest loss `graph_grad` differentiates
+    exactly, and is all this module needs to demonstrate the in-graph
+    update -- swap in a different loss (cross-entropy, ...) by building one
+    yourself and skipping this helper.
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    g = out.graph
+    g.input.append(
+        helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, num_classes])
+    )
+    g.node.extend(
+        [
+            helper.make_node("Sub", [logits, "y"], ["loss_diff"], name="loss_diff"),
+            helper.make_node(
+                "Mul", ["loss_diff", "loss_diff"], ["loss_sq"], name="loss_sq"
+            ),
+            helper.make_node(
+                "ReduceMean",
+                ["loss_sq"],
+                ["loss"],
+                name="loss_mean",
+                axes=[0, 1],
+                keepdims=0,
+            ),
+        ]
+    )
+    g.output.append(helper.make_tensor_value_info("loss", TensorProto.FLOAT, []))
+    return out
+
+
+def build_resident_step(
+    forward_and_loss: onnx.ModelProto,
+    params: Sequence[str],
+    loss_output: str = "loss",
+) -> Tuple[onnx.ModelProto, Dict[str, str]]:
+    """The full pipeline (this module's docstring, steps 2-7) over a forward
+    model that already has its loss appended (`add_mse_loss`, or your own).
+
+    :param params: names of `forward_and_loss`'s own float32 initializers to
+            train -- promoted to state (input *and* output) rather than left
+            as fixed initializers.
+    :returns: `(step_model, state)`, where `state` maps each trainable
+            weight's name to the output name carrying its updated value --
+            exactly `qat_graph.StepGraph.state`, restricted to `params`
+            (the optimizer's own extra state, if any, is not exposed here
+            since plain SGD carries none).
+    """
+    model = onnx.ModelProto()
+    model.CopyFrom(forward_and_loss)
+
+    # Forward-graph blockers that must be fixed before build_backward can
+    # even walk the graph -- see this module's docstring, step 2.
+    legalize.avgpool_ceil_to_floor(model)
+    legalize.flatten_to_reshape(model)
+    legalize.global_pool_to_reduce(model)
+    onnx.checker.check_model(model)
+
+    shapes, elem_types = _static_shapes_and_types(model)
+    initializers = {t.name: t for t in model.graph.initializer}
+    missing = [p for p in params if p not in initializers]
+    if missing:
+        raise ValueError(f"{missing} are not initializers of the forward model")
+
+    b = qat_graph.GraphBuilder(prefix="resident_step__")
+    b.nodes = list(model.graph.node)
+    trained = set(params)
+    b.initializer = [t for t in model.graph.initializer if t.name not in trained]
+
+    seed = b.const(np.array(1.0, dtype=np.float32), "loss_seed")
+    grads = graph_grad.build_backward(
+        b,
+        nodes=list(model.graph.node),
+        shapes=shapes,
+        grad_outputs={loss_output: seed},
+        targets=list(params),
+    )
+
+    state: Dict[str, Tuple[Sequence[int], str]] = {}
+    for p in params:
+        w_shape = tuple(int(d) for d in shapes[p])
+        step = b.mul("lr", grads[p])
+        w_next = b.sub(p, step)
+        state[p] = (w_shape, w_next)
+
+    constants: Dict[str, Tuple[Sequence[int], int]] = {}
+    for inp in model.graph.input:
+        if inp.name in initializers:
+            continue
+        shape = shapes.get(inp.name)
+        if shape is None:
+            raise ValueError(f"no static shape for model input {inp.name!r}")
+        constants[inp.name] = (
+            tuple(int(d) for d in shape),
+            elem_types.get(inp.name, TensorProto.FLOAT),
+        )
+
+    step_graph = qat_graph.make_step_graph(
+        b,
+        constants=constants,
+        state=state,
+        scalars=["lr"],
+        loss=loss_output,
+        name="resident_train_step",
+    )
+    step_model = step_graph.model
+
+    # rank0_to_rank1 only fixes a scalar *output* (the loss); a scalar
+    # *input* hits the identical Pulsar2 calibration failure -- see this
+    # module's own docstring.
+    for inp in step_model.graph.input:
+        if inp.name == "lr":
+            del inp.type.tensor_type.shape.dim[:]
+            inp.type.tensor_type.shape.dim.add().dim_value = 1
+
+    legalize.legalize(step_model, _POST_BACKWARD_RULES)
+    onnx.checker.check_model(step_model)
+
+    from onnxsim import simplify as _simplify
+
+    step_model, ok = _simplify(
+        step_model,
+        skipped_optimizers=[
+            "fuse_matmul_add_bias_into_gemm",
+            "fuse_transpose_into_gemm",
+        ],
+    )
+    if not ok:
+        raise RuntimeError("post-legalize simplify() failed its own correctness check")
+
+    return step_model, step_graph.state
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "forward_onnx", help="forward model, already simplified/BN-folded"
+    )
+    parser.add_argument("output_onnx")
+    parser.add_argument(
+        "--logits", default="logits", help="forward model's output tensor"
+    )
+    parser.add_argument("--num-classes", type=int, required=True)
+    parser.add_argument(
+        "--param",
+        action="append",
+        required=True,
+        dest="params",
+        help="a trainable initializer's name; repeat for each",
+    )
+    args = parser.parse_args(argv)
+
+    forward = onnx.load(args.forward_onnx)
+    with_loss = add_mse_loss(forward, args.logits, args.num_classes)
+    step_model, state = build_resident_step(with_loss, args.params)
+
+    print(f"step graph: {len(step_model.graph.node)} nodes")
+    for p, out_name in state.items():
+        print(f"  state: {p} -> {out_name}")
+    onnx.save(step_model, args.output_onnx)
+    print("wrote", args.output_onnx)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
