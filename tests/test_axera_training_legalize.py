@@ -108,6 +108,7 @@ def test_a_live_weight_convolution_becomes_matmuls_in_1d_and_2d():
         got = _run(after, feeds)[0]
         assert got.shape == ref.shape
         assert _snr(ref, got) > 100, (nd, k, stride, _snr(ref, got))
+        # `Concat` joins the taps into one wide MatMul; see `fuse` in the rule
         assert {n.op_type for n in after.graph.node} <= {
             "Pad",
             "Transpose",
@@ -115,6 +116,7 @@ def test_a_live_weight_convolution_becomes_matmuls_in_1d_and_2d():
             "Reshape",
             "MatMul",
             "Add",
+            "Concat",
         }
 
 
@@ -334,3 +336,92 @@ def test_training_rules_run_in_an_order_that_works():
     assert legalize.TRAINING_RULES[0] == "inline_local_functions"
     for name in legalize.TRAINING_RULES:
         assert name in legalize.RULES
+
+
+def test_a_constant_bias_is_reshaped_so_nothing_can_refuse_it():
+    """`MatMul(live) + Add(constant 1-D)` is what
+    `fuse_matmul_add_bias_into_gemm` matches, and skipping that pass in
+    onnxsim is not enough: Pulsar2 runs its own optimizer and fuses it back
+    into a `Gemm` whose weight is live, then dies in its calibrator naming no
+    node. Bisected to four nodes on real hardware; a 1-D constant bias fails
+    and the same values shaped `[1, N]` build."""
+    rng = np.random.default_rng(7)
+    bias = numpy_helper.from_array(rng.standard_normal(6).astype(np.float32), "c")
+    model = _model(
+        [helper.make_node("Gemm", ["a", "b", "c"], ["y"], transB=1, name="g")],
+        {"a": [5, 4], "b": [6, 4]},
+        {"y": [5, 6]},
+        [bias],
+    )
+    feeds = {
+        "a": rng.standard_normal((5, 4)).astype(np.float32),
+        "b": rng.standard_normal((6, 4)).astype(np.float32),
+    }
+    ref = _run(model, feeds)[0]
+    assert legalize.gemm_to_matmul(model) == 1
+    onnx.checker.check_model(model)
+    assert _snr(ref, _run(model, feeds)[0]) > 100
+
+    add = next(n for n in model.graph.node if n.op_type == "Add")
+    emitted = next(i for i in model.graph.initializer if i.name == add.input[1])
+    assert list(emitted.dims) == [1, 6], list(emitted.dims)
+    # the original is left alone -- other consumers may still want it
+    assert any(i.name == "c" and list(i.dims) == [6] for i in model.graph.initializer)
+
+
+def test_a_convolution_bias_gets_the_same_treatment():
+    rng = np.random.default_rng(8)
+    bias = numpy_helper.from_array(rng.standard_normal(6).astype(np.float32), "bb")
+    model = _model(
+        [
+            helper.make_node(
+                "Conv",
+                ["x", "w", "bb"],
+                ["y"],
+                kernel_shape=[3, 3],
+                pads=[1, 1, 1, 1],
+                name="c",
+            )
+        ],
+        {"x": [1, 8, 16, 16], "w": [6, 8, 3, 3]},
+        {"y": [1, 6, 16, 16]},
+        [bias],
+    )
+    feeds = {
+        "x": rng.standard_normal((1, 8, 16, 16)).astype(np.float32),
+        "w": (rng.standard_normal((6, 8, 3, 3)) * 0.2).astype(np.float32),
+    }
+    ref = _run(model, feeds)[0]
+    assert legalize.act_weight_conv_to_matmul(model) == 1
+    onnx.checker.check_model(model)
+    assert _snr(ref, _run(model, feeds)[0]) > 100
+    add = next(n for n in model.graph.node if n.op_type == "Add")
+    emitted = next(i for i in model.graph.initializer if i.name == add.input[1])
+    assert list(emitted.dims) == [1, 6]
+
+
+def test_the_taps_fuse_into_one_wide_matmul():
+    """`sum_k X_k @ W_k` is one matmul over the concatenation, exactly -- the
+    taps share an output and differ only along the reduction axis. Nine small
+    matmuls become one nine times deeper, which is what the matrix unit
+    rewards."""
+    rng = np.random.default_rng(9)
+    feeds = {
+        "x": rng.standard_normal((1, 8, 16, 16)).astype(np.float32),
+        "w": (rng.standard_normal((6, 8, 3, 3)) * 0.2).astype(np.float32),
+    }
+    counts = {}
+    for fuse in (False, True):
+        model = _conv(8, 6, 3, 16, 1, 1, 2)
+        ref = _run(model, feeds)[0]
+        assert legalize.act_weight_conv_to_matmul(model, fuse=fuse) == 1
+        onnx.checker.check_model(model)
+        got = _run(model, feeds)[0]
+        assert _snr(ref, got) > 100
+        counts[fuse] = (
+            len(model.graph.node),
+            sum(1 for n in model.graph.node if n.op_type == "MatMul"),
+        )
+    assert counts[True][1] == 1, counts
+    assert counts[False][1] == 9, counts
+    assert counts[True][0] < counts[False][0]
