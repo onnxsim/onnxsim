@@ -299,3 +299,32 @@ def test_the_llm_quantiser_puts_a_negative_peak_at_code_zero_too():
     assert codes[0, 0] == 0
     assert codes[0, 2] == 128
     assert codes[0, 1] > 128
+
+
+def test_an_unpatchable_output_quantisation_is_nudged_not_hit():
+    """Anything that recalibrates as it goes makes the zero point wander onto
+    a value the stream cannot hold. Widening the range a fraction of a percent
+    moves it off, which is cheaper than stopping."""
+    fields = {"unpatchable": {"zero": [128], "scale_low_byte": []}}
+    scale, zero = emitter.nudge_output_quantisation(-3.2, 3.2, fields)
+    assert zero != 128
+    # and the range it implies still covers the one asked for, barely wider
+    span = scale * 255
+    assert 6.4 <= span <= 6.4 * 1.01
+
+
+def test_a_range_that_needs_no_nudge_is_left_alone():
+    fields = {"unpatchable": {"zero": [128], "scale_low_byte": []}}
+    scale, zero = emitter.nudge_output_quantisation(-1.0, 2.0, fields)
+    assert scale == np.float32(3.0 / 255)
+    assert zero == round(1.0 / (3.0 / 255))
+
+
+def test_nudging_gives_up_rather_than_returning_something_wrong():
+    everything = {"unpatchable": {"zero": list(range(256)), "scale_low_byte": []}}
+    try:
+        emitter.nudge_output_quantisation(-1.0, 1.0, everything)
+    except ValueError as exc:
+        assert "patchable" in str(exc)
+    else:
+        raise AssertionError("should not have found one")
