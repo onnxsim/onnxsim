@@ -46,10 +46,33 @@ entry would otherwise hide a Ruby `lib/` here too.)
    library"](../../rust/README.md#building-the-native-library) for the full
    set of options -- the library both scripts need is the same one.
 
-2. **Ruby gems**: `bundle install` (see `Gemfile`) -- `ffi` for the C API
-   binding, [`onnxruntime`](https://github.com/ankane/onnxruntime-ruby) for
-   the independent reference check, and [`cumo`](https://github.com/sonots/cumo)
-   for the GPU-backed `NArray`.
+2. **Ruby gems** (see `Gemfile`): `ffi` for the C API binding,
+   [`onnxruntime`](https://github.com/ankane/onnxruntime-ruby) for the
+   independent reference check, [`numo-narray`](https://github.com/ruby-numo/numo-narray)
+   as cumo's CPU fallback, and [`cumo`](https://github.com/sonots/cumo)
+   itself (in its own `:cuda` Bundler group, since it needs a GPU just to
+   install -- see below).
+
+   On a machine with an NVIDIA GPU, CUDA 11.0+ and optionally cuDNN 8.0+
+   (what cumo itself needs -- it has no CPU-only mode):
+
+   ```sh
+   bundle install
+   ```
+
+   On a machine without one -- including CI -- skip the `:cuda` group so
+   `bundle install` doesn't fail trying to compile cumo's native extension:
+
+   ```sh
+   bundle config set --local without cuda
+   bundle install
+   ```
+
+   Either way `cumo_compat.rb` picks the right one at runtime: `Cumo` if the
+   gem installed and a GPU is actually there, `Numo::NArray` (cumo's
+   constructor-for-constructor-compatible counterpart) otherwise -- so both
+   scripts (onnxruntime included) run end to end either way, with no code
+   changes.
 
    `onnxruntime` needs nothing extra to install on Linux (x86-64/arm64) or
    Windows -- it vendors a prebuilt ONNX Runtime CPU binary
@@ -61,15 +84,6 @@ entry would otherwise hide a Ruby `lib/` here too.)
    This is a completely different copy of ONNX Runtime from the one
    `-DONNXSIM_BUILTIN_ORT=ON` links into `onnxsim_c` above -- no relation
    between the two beyond both being ONNX Runtime.
-
-   cumo needs an NVIDIA GPU (Compute Capability 3.5+), CUDA 11.0+, and
-   optionally cuDNN 8.0+ to install and run -- it has no CPU-only mode. On a
-   machine without one, `cumo_compat.rb` falls back to
-   [`Numo::NArray`](https://github.com/ruby-numo/numo-narray) (`gem install
-   numo-narray`), cumo's CPU-only, constructor-for-constructor-compatible
-   counterpart, so both scripts (onnxruntime included) can still be exercised
-   end to end without GPU hardware -- swap in a CUDA machine with `cumo`
-   installed to run the real GPU path with no code changes.
 
 ## Simplify example
 
@@ -249,6 +263,16 @@ mostly unchanged here since this model has nothing left to constant-fold;
 what it does show is onnxsim's own metadata/encoding normalization, which is
 why "Model Size" isn't marked `*` the way `simplify_and_run.rb`'s reclaimed
 bytes are.)
+
+## CI
+
+[`.github/workflows/ruby-cumo-integration.yml`](../../.github/workflows/ruby-cumo-integration.yml)
+builds `onnxsim_c` and runs both scripts on every PR that touches this
+directory or `onnxsim/capi/onnxsim_c_api.{h,cpp}`, plus a weekly schedule
+(catches breakage from a new `onnxruntime`/`cumo`/`numo-narray` gem release)
+and `workflow_dispatch`. The runner has no GPU, so it installs gems with
+`bundle config set --local without cuda` -- exactly the `Numo::NArray`
+fallback path described above, not a lighter stand-in for it.
 
 ## Limitations
 
