@@ -4,7 +4,7 @@
  * output is copied device-to-device back into the input buffer), and only
  * streams the batch (x, y) in and the loss out across the host boundary.
  *
- * Usage: resident_runner model.axmodel steps [warmup] [-n]
+ * Usage: resident_runner model.axmodel steps [warmup] [-n] [-v]
  *
  * -n: non-resident comparison mode. Instead of copying each step's updated
  * weight straight back device-to-device, round-trip it through a host
@@ -12,6 +12,18 @@
  * step graph as a stateless function, the same way the pre-residency design
  * did, would have to do. Isolates the residency win from the in-graph-update
  * graph-structure change itself.
+ *
+ * -v: run with AXCL_VNPU_ENABLE instead of AXCL_VNPU_DISABLE. Confirmed
+ * non-corrupting (bit-identical output against -disable on this model) and
+ * the lever for real concurrent throughput -- run several copies of this
+ * binary at once, each against its own model-file copy, and the NPU
+ * schedules them concurrently rather than serializing: aggregate throughput
+ * scales (measured 1.7x at 2 concurrent contexts, 2.6x at 4, saturating by
+ * 8) at the cost of per-context latency and ~7% off solo throughput even
+ * alone. See docs/axera-on-device-training-handoff.md's "Execution overlap"
+ * section for the numbers and for why axclrtEngineExecuteAsync (the other
+ * overlap primitive AXCL exposes) is not an option here -- it returns
+ * AXCL_ERR_UNSUPPORT on this device/SDK build.
  *
  * The model's own I/O order is fixed here rather than discovered generically
  * (see probe_io's dump): inputs x, y, _v_231, _v_233, _v_235, fc.weight, lr;
@@ -42,16 +54,22 @@ int main(int argc, char **argv) {
         return 2;
     }
     int steps = atoi(argv[2]);
-    int warmup = argc > 3 && strcmp(argv[3], "-n") != 0 ? atoi(argv[3]) : 5;
-    int non_resident = 0;
-    for (int i = 3; i < argc; i++) if (strcmp(argv[i], "-n") == 0) non_resident = 1;
-    fprintf(stderr, "mode: %s\n", non_resident ? "non-resident (host round trip)" : "resident (device-to-device)");
+    int warmup = 5;
+    int non_resident = 0, vnpu_enable = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "-n") == 0) non_resident = 1;
+        else if (strcmp(argv[i], "-v") == 0) vnpu_enable = 1;
+        else warmup = atoi(argv[i]);
+    }
+    fprintf(stderr, "mode: %s, %s\n",
+            non_resident ? "non-resident (host round trip)" : "resident (device-to-device)",
+            vnpu_enable ? "AXCL_VNPU_ENABLE" : "AXCL_VNPU_DISABLE");
 
     CK(axclInit(NULL));
     axclrtDeviceList devs; CK(axclrtGetDeviceList(&devs));
     if (!devs.num) { fprintf(stderr, "no device\n"); return 1; }
     CK(axclrtSetDevice(devs.devices[0]));
-    CK(axclrtEngineInit(AXCL_VNPU_DISABLE));
+    CK(axclrtEngineInit(vnpu_enable ? AXCL_VNPU_ENABLE : AXCL_VNPU_DISABLE));
 
     uint64_t modelId = 0, ctx = 0;
     CK(axclrtEngineLoadFromFile(argv[1], &modelId));
