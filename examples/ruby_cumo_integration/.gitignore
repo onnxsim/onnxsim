@@ -1,0 +1,2 @@
+# train_and_export.rb's default output -- a run artifact, not a fixture.
+/trained_linear.onnx

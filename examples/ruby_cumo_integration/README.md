@@ -4,9 +4,76 @@ An integration sample showing onnxsim consumed from **Ruby only** -- no
 Python, no Ruby protobuf gem, no `onnx`-alike Ruby gem -- using
 [cumo](https://github.com/sonots/cumo) (a GPU/CUDA-backed `NArray`,
 API-compatible with [`Numo::NArray`](https://github.com/ruby-numo/numo-narray))
-for the tensor side.
+for the tensor side. Two runnable scripts:
 
-It exercises four onnxsim features from Ruby via
+- **`simplify_and_run.rb`** -- simplify a small hand-written model and
+  cross-check it against a real ONNX Runtime session and cumo (see "Simplify
+  example" below).
+- **`train_and_export.rb`** -- train a tiny model with cumo doing the
+  gradient descent, then export and simplify it (see "Training example"
+  below).
+
+## Layout
+
+| File                       | Role                                                              |
+| --------------------------- | ------------------------------------------------------------------ |
+| `onnxsim_capi.rb`           | FFI binding to `onnxsim_c`.                                        |
+| `safetensors_reader.rb`     | Plain-Ruby `.safetensors` reader (stdlib `json` only).             |
+| `cumo_compat.rb`            | Requires cumo, falling back to Numo with no GPU (see below).       |
+| `build_sample_model.rb`     | The tiny test model `simplify_and_run.rb` simplifies, as ONNX text.|
+| `simplify_and_run.rb`       | The simplify example; run this one.                                |
+| `train_and_export.rb`       | The training example; run this one.                                |
+
+(No `lib/` subdirectory: the top-level `.gitignore`'s Python-oriented `lib/`
+entry would otherwise hide a Ruby `lib/` here too.)
+
+## Prerequisites
+
+1. **The `onnxsim_c` shared library**, built with the C API enabled (this
+   compiles the full onnxsim stack, including ONNX Runtime as a
+   constant-folding backend -- see the [top-level `CLAUDE.md`](../../CLAUDE.md)
+   for why that's unlike the Python wheel build):
+
+   ```sh
+   git submodule update --init --recursive
+   cmake -B build -DONNXSIM_C_API=ON -DONNXSIM_BUILTIN_ORT=ON -DONNXSIM_PREBUILT_ORT=ON
+   cmake --build build --target onnxsim_c
+   ```
+
+   `-DONNXSIM_PREBUILT_ORT=ON` links a released ONNX Runtime build instead of
+   compiling it from source (much faster the first time); drop it to build ORT
+   from source instead. See [`rust/README.md`'s "Building the native
+   library"](../../rust/README.md#building-the-native-library) for the full
+   set of options -- the library both scripts need is the same one.
+
+2. **Ruby gems**: `bundle install` (see `Gemfile`) -- `ffi` for the C API
+   binding, [`onnxruntime`](https://github.com/ankane/onnxruntime-ruby) for
+   the independent reference check, and [`cumo`](https://github.com/sonots/cumo)
+   for the GPU-backed `NArray`.
+
+   `onnxruntime` needs nothing extra to install on Linux (x86-64/arm64) or
+   Windows -- it vendors a prebuilt ONNX Runtime CPU binary
+   (`OnnxRuntime.ffi_lib`, overridable) and "just works". On macOS it needs
+   `brew install onnxruntime` (Intel) or nothing (Apple Silicon, also
+   vendored); see its README for GPU execution providers
+   (`CUDAExecutionProvider`/`CoreMLExecutionProvider`), which need a
+   separately-downloaded GPU build pointed at via `OnnxRuntime.ffi_lib =`.
+   This is a completely different copy of ONNX Runtime from the one
+   `-DONNXSIM_BUILTIN_ORT=ON` links into `onnxsim_c` above -- no relation
+   between the two beyond both being ONNX Runtime.
+
+   cumo needs an NVIDIA GPU (Compute Capability 3.5+), CUDA 11.0+, and
+   optionally cuDNN 8.0+ to install and run -- it has no CPU-only mode. On a
+   machine without one, `cumo_compat.rb` falls back to
+   [`Numo::NArray`](https://github.com/ruby-numo/numo-narray) (`gem install
+   numo-narray`), cumo's CPU-only, constructor-for-constructor-compatible
+   counterpart, so both scripts (onnxruntime included) can still be exercised
+   end to end without GPU hardware -- swap in a CUDA machine with `cumo`
+   installed to run the real GPU path with no code changes.
+
+## Simplify example
+
+`simplify_and_run.rb` exercises four onnxsim features from Ruby via
 [`onnxsim/capi/onnxsim_c_api.h`](../../onnxsim/capi/onnxsim_c_api.h), the same
 C ABI the [Rust bindings](../../rust/README.md) use:
 
@@ -34,22 +101,10 @@ compute the same result" claim this repo's other backend integrations make
 nncase/tinygrad tests), now exercised from Ruby with a real ORT.
 
 This ORT is intentionally a separate story from onnxsim_c's own: the
-`onnxruntime` gem vendors its own prebuilt ONNX Runtime binary (see
-"Prerequisites" below), so running the model needs no native build at all --
-only *simplifying* it does, since onnxsim_c embeds ONNX Runtime as its own
-constant-folding backend at C++ compile time.
-
-## Layout
-
-| File                       | Role                                                              |
-| --------------------------- | ------------------------------------------------------------------ |
-| `onnxsim_capi.rb`           | FFI binding to `onnxsim_c`.                                        |
-| `safetensors_reader.rb`     | Plain-Ruby `.safetensors` reader (stdlib `json` only).             |
-| `build_sample_model.rb`     | The tiny test model this sample simplifies, as ONNX text syntax.   |
-| `simplify_and_run.rb`       | The end-to-end sample; run this one.                               |
-
-(No `lib/` subdirectory: the top-level `.gitignore`'s Python-oriented `lib/`
-entry would otherwise hide a Ruby `lib/` here too.)
+`onnxruntime` gem vendors its own prebuilt ONNX Runtime binary, so running
+the model needs no native build at all -- only *simplifying* it does, since
+onnxsim_c embeds ONNX Runtime as its own constant-folding backend at C++
+compile time.
 
 ### Why the text syntax?
 
@@ -83,55 +138,12 @@ needed on the Ruby side. It's a small, generally useful addition to the
 shared C ABI: any binding with no protobuf tooling of its own -- this
 sample, but the same call is there for the [Rust bindings](../../rust/README.md)
 too, not just wired up on that side yet -- can get the same readable model
-construction Python's tests already have. Point `simplify_and_run.rb` at
-your own `.onnx` file instead (see "Running" below) if you'd rather simplify
-something real.
+construction Python's tests already have. Both scripts use it:
+`train_and_export.rb` (below) interpolates its *learned* weights into the
+same syntax. Point `simplify_and_run.rb` at your own `.onnx` file instead
+(see "Running" below) if you'd rather simplify something real.
 
-## Prerequisites
-
-1. **The `onnxsim_c` shared library**, built with the C API enabled (this
-   compiles the full onnxsim stack, including ONNX Runtime as a
-   constant-folding backend -- see the [top-level `CLAUDE.md`](../../CLAUDE.md)
-   for why that's unlike the Python wheel build):
-
-   ```sh
-   git submodule update --init --recursive
-   cmake -B build -DONNXSIM_C_API=ON -DONNXSIM_BUILTIN_ORT=ON -DONNXSIM_PREBUILT_ORT=ON
-   cmake --build build --target onnxsim_c
-   ```
-
-   `-DONNXSIM_PREBUILT_ORT=ON` links a released ONNX Runtime build instead of
-   compiling it from source (much faster the first time); drop it to build ORT
-   from source instead. See [`rust/README.md`'s "Building the native
-   library"](../../rust/README.md#building-the-native-library) for the full
-   set of options -- the library this sample needs is the same one.
-
-2. **Ruby gems**: `bundle install` (see `Gemfile`) -- `ffi` for the C API
-   binding, [`onnxruntime`](https://github.com/ankane/onnxruntime-ruby) for
-   the independent reference check, and [`cumo`](https://github.com/sonots/cumo)
-   for the GPU-backed `NArray`.
-
-   `onnxruntime` needs nothing extra to install on Linux (x86-64/arm64) or
-   Windows -- it vendors a prebuilt ONNX Runtime CPU binary
-   (`OnnxRuntime.ffi_lib`, overridable) and "just works". On macOS it needs
-   `brew install onnxruntime` (Intel) or nothing (Apple Silicon, also
-   vendored); see its README for GPU execution providers
-   (`CUDAExecutionProvider`/`CoreMLExecutionProvider`), which need a
-   separately-downloaded GPU build pointed at via `OnnxRuntime.ffi_lib =`.
-   This is a completely different copy of ONNX Runtime from the one
-   `-DONNXSIM_BUILTIN_ORT=ON` links into `onnxsim_c` above -- no relation
-   between the two beyond both being ONNX Runtime.
-
-   cumo needs an NVIDIA GPU (Compute Capability 3.5+), CUDA 11.0+, and
-   optionally cuDNN 8.0+ to install and run -- it has no CPU-only mode. On a
-   machine without one, `simplify_and_run.rb` falls back to
-   [`Numo::NArray`](https://github.com/ruby-numo/numo-narray) (`gem install
-   numo-narray`), cumo's CPU-only, constructor-for-constructor-compatible
-   counterpart, so the whole pipeline (onnxruntime included) can still be
-   exercised end to end without GPU hardware -- swap in a CUDA machine with
-   `cumo` installed to run the real GPU path with no code changes.
-
-## Running
+### Running
 
 ```sh
 ONNXSIM_LIB_DIR=../../build bundle exec ruby simplify_and_run.rb
@@ -167,7 +179,7 @@ OK: onnxsim_c, onnxruntime and cumo all agree
 ```
 
 (Captured from an actual run against a locally built `onnxsim_c` -- with the
-`Cumo::NArray`-line coming from the `Numo::NArray` CPU fallback, since that
+`cumo result` line coming from the `Numo::NArray` CPU fallback, since that
 run had no GPU.)
 
 To simplify your own model instead of the built-in sample, pass its path:
@@ -180,13 +192,77 @@ ONNXSIM_LIB_DIR=../../build bundle exec ruby simplify_and_run.rb /path/to/model.
 are specific to the built-in sample model -- read through the script before
 pointing it at an arbitrary model.)
 
+## Training example
+
+`train_and_export.rb` trains a one-input linear regression, `y = w*x + b`,
+against noise-free synthetic data (`y = 3*x + 2`) by hand-rolled gradient
+descent -- forward pass, MSE loss gradient, weight update, all as a handful
+of elementwise `Cumo::NArray` ops run every epoch. This is plain cumo code;
+onnxsim has no autodiff/training-graph feature of its own to drive from
+Ruby (unlike, say, the [dlpack-executor embeddability
+seam](../../docs/dlpack-executor.md)) -- it only enters once training is
+done and there is a model to build, simplify, and export:
+
+1. Interpolate the learned `w`/`b` into the same ONNX text syntax
+   `simplify_and_run.rb` uses (see "Why the text syntax?" above) and parse it
+   via `onnxsim_parse_model_text`.
+2. Simplify it (`onnxsim_simplify_path`) and print the before/after report
+   (`onnxsim_model_info_diff`).
+3. Run the simplified, trained model through a real ONNX Runtime session and
+   check it against cumo's own forward pass with the same learned weights --
+   the same cross-engine check `simplify_and_run.rb` makes, now on a model
+   this script trained itself.
+
+### Running
+
+```sh
+ONNXSIM_LIB_DIR=../../build bundle exec ruby train_and_export.rb
+```
+
+Writes the trained, simplified model to `trained_linear.onnx` in this
+directory by default (pass a path as the first argument to write elsewhere;
+it's `.gitignore`d here as a run artifact, not a fixture). Expected output:
+
+```
+epoch 0: loss=1421.5 w=0.4515 b=0.0335
+epoch 10000: loss=0.00723 w=3.0129 b=1.8234
+epoch 20000: loss=7.2e-05 w=3.0013 b=1.9824
+epoch 30000: loss=1.0e-06 w=3.0001 b=1.9982
+trained on cumo: w=3.000013 (true 3.0), b=1.999825 (true 2.0)
+
++------------------+----------------+------------------+
+|                  | Original Model | Simplified Model |
++------------------+----------------+------------------+
+| Add              | 1              | 1                |
+| Constant         | 2              | 2                |
+| Mul              | 1              | 1                |
+...
++------------------+----------------+------------------+
+onnxruntime prediction (simplified, trained model): [4.9998, 7.9999, ...]
+cumo prediction:                                     [4.9998, 7.9999, ...]
+OK: onnxruntime and cumo agree on the trained model (max diff 0.0)
+wrote /path/to/trained_linear.onnx (832 bytes)
+```
+
+(Also an actual run, `Numo::NArray` fallback again -- the op-count table is
+mostly unchanged here since this model has nothing left to constant-fold;
+what it does show is onnxsim's own metadata/encoding normalization, which is
+why "Model Size" isn't marked `*` the way `simplify_and_run.rb`'s reclaimed
+bytes are.)
+
 ## Limitations
 
 - The safetensors-to-`Cumo::NArray` dtype mapping
   (`SAFETENSORS_DTYPE_TO_CUMO` in `simplify_and_run.rb`) covers the plain
   integer and `F32`/`F64` float dtypes. `F16`/`BF16` have no native
   `Numo`/`Cumo` element type and are left unmapped.
-- The three-way result comparison in `simplify_and_run.rb` uses plain `==`/
-  `!=`, which is fine for the built-in sample model's exactly-representable
-  float32 values but not a general floating-point comparison; a model with
-  results that only agree up to rounding would need a tolerance instead.
+- `simplify_and_run.rb`'s three-way result comparison uses plain `==`/`!=`,
+  which is fine for the built-in sample model's exactly-representable
+  float32 values but not a general floating-point comparison.
+  `train_and_export.rb` needs (and uses) an actual tolerance instead, since
+  its weights are *learned*, not exactly-representable literals -- ORT's and
+  cumo's float32 `Mul`+`Add` can differ by a ULP or two.
+- `train_and_export.rb`'s gradient descent is deliberately the simplest
+  possible case (one feature, no bias term tricks, fixed learning rate/epoch
+  count tuned for this exact synthetic dataset) -- a starting point to adapt,
+  not a general training loop.

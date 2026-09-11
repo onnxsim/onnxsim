@@ -34,22 +34,9 @@ require 'tmpdir'
 require_relative 'onnxsim_capi'
 require_relative 'safetensors_reader'
 require_relative 'build_sample_model'
+require_relative 'cumo_compat'
 
 require 'onnxruntime'
-
-begin
-  require 'cumo/narray'
-rescue LoadError, RuntimeError => e
-  # LoadError: the gem isn't installed. RuntimeError (or a subclass): the gem
-  # is installed but its native extension couldn't find a CUDA-capable GPU at
-  # require time (e.g. "CUDA driver version is insufficient").
-  warn "cumo is not available (#{e.message}); install it on a CUDA-capable " \
-       'machine -- see this directory\'s README. Falling back to Numo::NArray ' \
-       '(cumo\'s CPU-only, API-compatible counterpart) so the rest of the ' \
-       'pipeline can still be exercised.'
-  require 'numo/narray'
-  Cumo = Numo unless defined?(Cumo)
-end
 
 SAFETENSORS_DTYPE_TO_CUMO = {
   'F32' => Cumo::SFloat,
