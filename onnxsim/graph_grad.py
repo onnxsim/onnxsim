@@ -1930,6 +1930,9 @@ def _grad_split(
             acc = term if acc is None else ctx.b.add(acc, term)
         offset += size
 
+    # at least one `g` is non-None (the all-None case already returned above),
+    # so the loop above set `acc` at least once.
+    assert acc is not None
     dx = acc if identity_perm else ctx.b.transpose(acc, inv_perm)
     return [dx] + [None] * (len(node.input) - 1)
 
