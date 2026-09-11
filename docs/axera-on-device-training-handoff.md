@@ -529,17 +529,49 @@ revisited here) and the context count that's efficient for the *hardware*
 (N=4, per both this table and the vNPU section) roughly independently, rather
 than needing to jointly search the combination.
 
-**Caveat carried over, not resolved here**: batch>1 losses read exactly zero
-in every combined-point run above, the same class of finding the resnet50
-section below records and traces to the fixed near-zero synthetic test
-batch (`memset`), not a graph bug -- batch 1's nonzero loss (0.117937,
-identical and stable across all vNPU/non-vNPU batch-1 runs in this section)
-did not reproduce that failure mode, batch 4 and 8 did, consistently, in
-every run regardless of concurrency. Plausibly the batch-averaging
-`ReduceMean` in `add_mse_loss` rounds a near-zero quantized per-sample
-difference to exactly zero once averaged over more elements -- untested,
-flagged for whoever chases the resnet50 loss=0 caveat next, since it now
-looks like the same mechanism rather than two unrelated ones.
+**The batch>1 loss=0 caveat above is resolved: it was a calibration-data
+bug, not a graph or hardware bug, and not the same mechanism as resnet50's
+loss=0 (below).**
+
+Every training-step compile so far (this section's, the batching section's,
+resnet50's) grew its own ad-hoc, uncommitted calibration-work-dir generator
+in a session scratchpad rather than a committed one. That generator's `y`
+one-hot label was placed by scattering a single `1.0` into the **flattened**
+`[batch, classes]` tensor (`arr.reshape(-1)[rng.integers(0, arr.size)] =
+1.0`) -- indistinguishable from a correct per-row one-hot at batch 1, but at
+batch>1 it leaves `(batch-1)/batch` of the rows an all-zero "label" in every
+one of the (few) calibration samples. That degenerate calibration data
+miscalibrated the `loss` output's quantization range enough to clip a real,
+non-degenerate runtime loss down to exactly 0.
+
+Confirmed directly, not just inferred: rebuilding a batch-4 step graph with
+an extra debug output tapping `loss_sq` (the per-sample-per-class squared
+error, *before* the batch-mean reduction) and running it on the real AX650N
+showed every row's per-sample value correctly non-zero and identical across
+all 4 rows (mean 0.0460, matching the memset input being bit-identical per
+row) -- proving the forward pass and per-sample loss are computed correctly
+on-device at batch>1. Only the final scalar reduction read 0. Two workaround
+spellings were tried and both still failed the same way (a `ReduceMean` split
+into two single-axis passes; a `MatMul` against a constant `1/N` averaging
+vector instead of any `ReduceMean` over the batch axis at all) -- ruling out
+"a specific `ReduceMean` spelling is broken" and pointing at the calibration
+range itself. Inspecting the actual calibration `y.tar` confirmed it: every
+sample had exactly one nonzero element total across all 4 rows, not one per
+row. Fixing the generator (one one-hot placed per row) and rebuilding the
+identical batch-4 graph with nothing else changed made the on-device loss
+read a real, consistent, non-zero `0.113021` across every step -- matching
+the same order of magnitude as batch 1's `0.117937`.
+
+The fixed generator is now committed as `scripts/axera/make_training_calib.py`
+(previously every compile re-derived its own copy from scratch, which is
+exactly how this bug shipped unnoticed across three PRs) with a regression
+test (`tests/test_make_training_calib.py`) pinning the per-row placement.
+
+**This does not explain resnet50's loss=0** (next section) -- that build's
+own calibration generator used a dense `N(0,1)` draw for `y`, not a one-hot,
+and is not degenerate the way this one was; its batch is 1 throughout, where
+this exact bug is invisible by construction. That caveat remains open; see
+its own note below for the current best guess and the concrete next step.
 
 ## Two vendor bugs, both silent
 
@@ -677,24 +709,45 @@ quantize/dequantize tax being the dominant cost regardless of model depth
 (see "The quantize redundancy is real" above), not something resnet50's
 extra layers meaningfully add to.
 
-**Not verified:** the reported loss read exactly `0` every step. `resident_
-runner`'s built-in test batch is a fixed `memset(hx, 0x11, ...)`/`memset(hy,
-0x22, ...)` byte pattern (not real image data), which as float32 is ~1e-28 --
-effectively zero at both ends of the loss computation, so a `loss=0` reading
-is consistent with the quantizer correctly rounding a near-zero range to zero
-rather than a hardware/graph bug. This is the same caveat PR #1335's original
-resnet18 hardware run carried ("only checked coarsely... not the full
-per-tensor gradient cosine/SNR table") -- worth real image/label data through
-this same runner before trusting *on-device* numeric correctness, though the
-host-side finite-difference check above is materially more rigorous than
-what shipped with the original resnet18 work.
+**Still not verified, and now a narrower, still-open question:** the
+reported loss read exactly `0` every step. `resident_runner`'s built-in test
+batch is a fixed `memset(hx, 0x11, ...)`/`memset(hy, 0x22, ...)` byte
+pattern (not real image data), ~1e-28 as float32 -- effectively zero at both
+ends of the loss computation.
+
+This is at batch 1, so it is **not** the batch-axis calibration bug the
+batching section above found and fixed (that bug is invisible by
+construction at batch 1 -- a single scattered one-hot in a one-row tensor is
+already a correct per-row one-hot). It also is not obviously the same root
+cause by inspection: resnet50's own calibration generator (a separate,
+equally ad-hoc scratchpad copy) draws `y` from `N(0, 1)` rather than a
+one-hot, and its actual calibration data checked out non-degenerate (dense,
+reasonable min/max/mean across every input tensor, no all-zero rows). So
+this remains the original, weaker hypothesis -- "the quantizer is correctly
+rounding a near-zero range to zero," plausible precisely *because* a
+`N(0,1)`-calibrated loss range is wide relative to the near-zero value a
+`memset` input actually produces, unlike the one-hot case above where the
+calibrated range was itself the bug -- but **unconfirmed**, the same
+"checked coarsely, not the full gradient table" caveat PR #1335's original
+resnet18 run carried.
+
+**The concrete next step, not yet done for resnet50:** the same technique
+that resolved the batching-section caveat -- rebuild with an extra debug
+output tapping the per-sample squared error before the final reduction, and
+compare it against the reported scalar `loss` on real hardware. If the
+tapped value is already nonzero and the reduction alone zeroes it, that
+would point at the same class of range-miscalibration mechanism (worth
+comparing the `y` calibration range against the runtime `memset` value
+directly, the same check that cracked the batching-section case); if the
+tapped value is *itself* near-zero, that confirms the original benign
+hypothesis and there is nothing to fix.
 
 **Recommendation for next time:** the pipeline needs no resnet50-specific
 changes -- the natural next step is either the remaining two bottleneck
 blocks of `layer4` (watch compile time; extrapolate from this block's 57.8s
-before jumping straight to all three) or real calibration data through
-`resident_runner` to settle the loss=0 question, not further architecture
-generalization work.
+before jumping straight to all three) or the debug-tap check above to settle
+resnet50's own loss=0 question, not further architecture generalization
+work.
 
 ## What to do next
 
