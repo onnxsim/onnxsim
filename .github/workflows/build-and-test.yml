@@ -8,11 +8,24 @@ on:
   pull_request:
   release:
     types: [published]
-  # Lets build_wheel_pyodide (which otherwise only runs on push/release, see
-  # its own comment) be exercised against a PR branch before merge -- same
-  # rationale as pyodide-wasm.yml and static.yml's own workflow_dispatch
-  # triggers.
+  # Test PyPI publishing (see upload_pypi) no longer happens on every master
+  # push -- it's driven by this daily schedule instead, so master gets at
+  # most one Test PyPI upload per day (skipped entirely if master hasn't
+  # moved since the last scheduled run). Time is arbitrary/off-peak.
+  schedule:
+    - cron: '0 3 * * *'
+  # Two purposes: (1) lets build_wheel_pyodide (which otherwise only runs on
+  # push/release/schedule, see its own comment) be exercised against a PR
+  # branch before merge -- same rationale as pyodide-wasm.yml and static.yml's
+  # own workflow_dispatch triggers; (2) with publish_test_pypi=true, lets a
+  # human force an on-demand Test PyPI upload from master outside the daily
+  # schedule (see upload_pypi).
   workflow_dispatch:
+    inputs:
+      publish_test_pypi:
+        description: 'Publish this run''s build to Test PyPI (master only)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -339,7 +352,7 @@ jobs:
   # wheel. See docs/wasm_pyodide.md's "Distributable wheel" section for the
   # full story and what's still new/first-time-in-CI about this.
   #
-  # Release-flow-only (push/release/workflow_dispatch), not a plain
+  # Release-flow-only (push/release/schedule/workflow_dispatch), not a plain
   # pull_request: the underlying wasm32 build is already functionally
   # validated per-PR by the separate, path-filtered pyodide-wasm.yml (build +
   # real Pyodide/Node import test). This job's only real job is producing the
@@ -347,10 +360,10 @@ jobs:
   # ~10min wasm cross-compile on every one of this repo's PRs (unlike
   # pyodide-wasm.yml, THIS workflow's own pull_request trigger has no path
   # filter at all) isn't worth paying for something with no release
-  # consequence until a tag exists. A push to master already exercises this
-  # for real, safely: upload_pypi below publishes push builds to Test PyPI,
-  # not the real index, so this gets a genuine dry run on every master push
-  # before it can ever gate an actual release.
+  # consequence until a tag exists. The daily schedule already exercises this
+  # for real, safely: upload_pypi below publishes scheduled (and manually
+  # dispatched) builds to Test PyPI, not the real index, so this gets a
+  # genuine dry run once a day before it can ever gate an actual release.
   #
   # continue-on-error: true -- this is new, first-time-in-CI automation (the
   # only prior validation was one hand-assembled wheel, at a now-outdated ABI
@@ -493,7 +506,7 @@ jobs:
           path: wheelhouse/onnxsim-*.whl
 
   upload_pypi:
-    if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'push' || github.event_name == 'release')
+    if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'release' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: Upload to PyPI
     needs: [build_wheels, test_formal_verification, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
     runs-on: ubuntu-latest
@@ -503,6 +516,29 @@ jobs:
     permissions:
       id-token: write
     steps:
+    # Test PyPI is no longer published on every master push -- only the daily
+    # `schedule` trigger (and an on-demand workflow_dispatch with
+    # publish_test_pypi=true, see the `on:` block) reach that step below. On
+    # a scheduled run, skip the actual upload entirely if master hasn't
+    # picked up any new commits since the last day (pypa/gh-action-pypi-publish
+    # would otherwise just fail re-uploading an unchanged .devN version).
+    # This checkout runs (and must run) before download-artifact below:
+    # actions/checkout cleans the workspace (git clean -ffdx) by default,
+    # which would otherwise delete the just-downloaded dist/ artifacts.
+    - name: Check out repository (commit-recency check for scheduled runs)
+      if: ${{ github.event_name == 'schedule' }}
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Check for new commits on master in the last day
+      id: commit_check
+      if: ${{ github.event_name == 'schedule' }}
+      run: |
+        if [ -n "$(git log -1 --since='24 hours ago' --format=%H)" ]; then
+          echo "has_new_commits=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "has_new_commits=false" >> "${GITHUB_OUTPUT}"
+        fi
     - uses: actions/download-artifact@v8
       with:
         # unpacks python-dist artifact into dist/
@@ -511,7 +547,12 @@ jobs:
         path: dist
         merge-multiple: true
     - name: Publish distribution 📦 to Test PyPI
-      if: ${{ github.ref == 'refs/heads/master' }}
+      if: >-
+        github.ref == 'refs/heads/master' &&
+        (
+          (github.event_name == 'schedule' && steps.commit_check.outputs.has_new_commits == 'true') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_test_pypi)
+        )
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         repository_url: https://test.pypi.org/legacy/
