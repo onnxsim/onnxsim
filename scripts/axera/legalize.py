@@ -769,7 +769,19 @@ def act_weight_conv_to_matmul(model, fuse=True):
     activation transposed to `[N, spatial..., Cin]` each tap is one `MatMul`
     against `w[..., k]` reshaped to `[Cin, Cout]`, and the taps are added.
     Stride becomes the tap slice's `step`. Handles 1-D and 2-D, any stride,
-    dilation 1, group 1; anything else is declined rather than approximated.
+    dilation 1, any `group`; anything else is declined rather than
+    approximated.
+
+    `group > 1` (a depthwise or otherwise grouped Conv, e.g. the gated conv
+    module in a Conformer-style audio-model block) runs the exact same
+    per-tap matmul once per group, against that group's own channel slice of
+    the (already-transposed-once) activation and weight, and concatenates
+    the per-group outputs back onto the `Cout` axis before the shared bias
+    add -- ONNX's own grouping semantics, since each output channel only
+    ever contracts against its own group's input channels. `group == 1`
+    (every model this rule has run on before grouped support was added,
+    including resnet18) takes the untouched original path: no extra
+    Slice/Concat, byte-identical node sequence to before.
     """
     shapes = _value_shapes(model)
     out, changed = [], 0
@@ -789,14 +801,23 @@ def act_weight_conv_to_matmul(model, fuse=True):
             out.append(node)
             continue
         dil = list(attrs["dilations"].ints) if "dilations" in attrs else [1] * nd
-        if any(d != 1 for d in dil) or (
-            "group" in attrs and attrs["group"].i not in (0, 1)
-        ):
+        if any(d != 1 for d in dil):
             out.append(node)
+            continue
+        group = attrs["group"].i if "group" in attrs else 1
+        if group == 0:  # ONNX default; a handful of exporters emit this literally
+            group = 1
+        cout, cin = wshape[0], wshape[1]
+        if (
+            group < 1
+            or xshape[1] % group != 0
+            or cout % group != 0
+            or xshape[1] // group != cin
+        ):
+            out.append(node)  # W's own channel count disagrees with group; do not guess
             continue
         strides = list(attrs["strides"].ints) if "strides" in attrs else [1] * nd
         pads = list(attrs["pads"].ints) if "pads" in attrs else [0] * (2 * nd)
-        cout, cin = wshape[0], wshape[1]
         ksize = wshape[2:]
         spatial = xshape[2:]
         outdim = [
@@ -847,113 +868,179 @@ def act_weight_conv_to_matmul(model, fuse=True):
             )
         )
 
-        wshape_name = _unique_name(model, f"{stem}_wshape")
-        model.graph.initializer.append(
-            numpy_helper.from_array(np.array([cin, cout], np.int64), wshape_name)
-        )
-
-        acc = None
-        tap_x, tap_w = [], []
         taps = [()]
         for j in range(nd):
             taps = [t + (k,) for t in taps for k in range(ksize[j])]
-        for tap in taps:
-            label = "_".join(str(k) for k in tap)
-            cur_x, cur_w = xt, wt
-            for j, k in enumerate(tap):
-                nxt = _unique_name(model, f"{stem}_x{label}_{j}")
+
+        def taps_matmul(x_src, w_src, cout_g, label_prefix):
+            """One group's `sum_tap X_tap @ W_tap` over `x_src`/`w_src`
+            (already sliced to this group's channels, `cin` wide on `x_src`'s
+            last axis and `w_src`'s second-to-last), producing `[N,
+            spatial..., cout_g]`. Identical to the whole (group=1) computation
+            below, just parameterized so `group > 1` can call it once per
+            group over group-sliced inputs -- see the call sites below."""
+            wshape_name = _unique_name(model, f"{label_prefix}_wshape")
+            model.graph.initializer.append(
+                numpy_helper.from_array(np.array([cin, cout_g], np.int64), wshape_name)
+            )
+            acc = None
+            tap_x, tap_w = [], []
+            for tap in taps:
+                label = "_".join(str(k) for k in tap)
+                cur_x, cur_w = x_src, w_src
+                for j, k in enumerate(tap):
+                    nxt = _unique_name(model, f"{label_prefix}_x{label}_{j}")
+                    made.append(
+                        _slice(
+                            model,
+                            cur_x,
+                            nxt,
+                            1 + j,
+                            k,
+                            k + (outdim[j] - 1) * strides[j] + 1,
+                            f"{label_prefix}_SX{label}_{j}",
+                            step=strides[j],
+                        )
+                    )
+                    cur_x = nxt
+                    nxw = _unique_name(model, f"{label_prefix}_w{label}_{j}")
+                    made.append(
+                        _slice(
+                            model,
+                            cur_w,
+                            nxw,
+                            j,
+                            k,
+                            k + 1,
+                            f"{label_prefix}_SW{label}_{j}",
+                        )
+                    )
+                    cur_w = nxw
+                flat = _unique_name(model, f"{label_prefix}_wf{label}")
                 made.append(
-                    _slice(
-                        model,
-                        cur_x,
-                        nxt,
-                        1 + j,
-                        k,
-                        k + (outdim[j] - 1) * strides[j] + 1,
-                        f"{stem}_SX{label}_{j}",
-                        step=strides[j],
+                    helper.make_node(
+                        "Reshape",
+                        [cur_w, wshape_name],
+                        [flat],
+                        name=_unique_name(model, f"{label_prefix}_WR{label}"),
                     )
                 )
-                cur_x = nxt
-                nxw = _unique_name(model, f"{stem}_w{label}_{j}")
-                made.append(
-                    _slice(model, cur_w, nxw, j, k, k + 1, f"{stem}_SW{label}_{j}")
-                )
-                cur_w = nxw
-            flat = _unique_name(model, f"{stem}_wf{label}")
-            made.append(
-                helper.make_node(
-                    "Reshape",
-                    [cur_w, wshape_name],
-                    [flat],
-                    name=_unique_name(model, f"{stem}_WR{label}"),
-                )
-            )
-            tap_x.append(cur_x)
-            tap_w.append(flat)
+                tap_x.append(cur_x)
+                tap_w.append(flat)
 
-        # sum_k X_k @ W_k is one matmul over the concatenation:
-        #   [X_0 | ... | X_{K-1}] @ [W_0 ; ... ; W_{K-1}]
-        # exactly, because the taps share an output and differ only along the
-        # reduction axis. For a 3x3 that is 9 MatMuls and 8 Adds replaced by
-        # two Concats and one MatMul nine times deeper -- fewer nodes to
-        # schedule, and an arithmetic intensity the matrix unit can actually
-        # use. `fuse` exists so the unfused form stays reachable for
-        # bisecting a compiler that dislikes one of them.
-        if fuse and len(tap_x) > 1:
-            xcat = _unique_name(model, f"{stem}_xcat")
-            wcat = _unique_name(model, f"{stem}_wcat")
-            made.append(
-                helper.make_node(
-                    "Concat",
-                    tap_x,
-                    [xcat],
-                    axis=-1,
-                    name=_unique_name(model, f"{stem}_XC"),
+            # sum_k X_k @ W_k is one matmul over the concatenation:
+            #   [X_0 | ... | X_{K-1}] @ [W_0 ; ... ; W_{K-1}]
+            # exactly, because the taps share an output and differ only along
+            # the reduction axis. For a 3x3 that is 9 MatMuls and 8 Adds
+            # replaced by two Concats and one MatMul nine times deeper --
+            # fewer nodes to schedule, and an arithmetic intensity the matrix
+            # unit can actually use. `fuse` exists so the unfused form stays
+            # reachable for bisecting a compiler that dislikes one of them.
+            if fuse and len(tap_x) > 1:
+                xcat = _unique_name(model, f"{label_prefix}_xcat")
+                wcat = _unique_name(model, f"{label_prefix}_wcat")
+                made.append(
+                    helper.make_node(
+                        "Concat",
+                        tap_x,
+                        [xcat],
+                        axis=-1,
+                        name=_unique_name(model, f"{label_prefix}_XC"),
+                    )
                 )
-            )
-            made.append(
-                helper.make_node(
-                    "Concat",
-                    tap_w,
-                    [wcat],
-                    axis=0,
-                    name=_unique_name(model, f"{stem}_WC"),
+                made.append(
+                    helper.make_node(
+                        "Concat",
+                        tap_w,
+                        [wcat],
+                        axis=0,
+                        name=_unique_name(model, f"{label_prefix}_WC"),
+                    )
                 )
-            )
-            acc = _unique_name(model, f"{stem}_mm")
-            made.append(
-                helper.make_node(
-                    "MatMul",
-                    [xcat, wcat],
-                    [acc],
-                    name=_unique_name(model, f"{stem}_MM"),
-                )
-            )
-        else:
-            for i, (xk, wk) in enumerate(zip(tap_x, tap_w)):
-                prod = _unique_name(model, f"{stem}_m{i}")
+                acc = _unique_name(model, f"{label_prefix}_mm")
                 made.append(
                     helper.make_node(
                         "MatMul",
-                        [xk, wk],
-                        [prod],
-                        name=_unique_name(model, f"{stem}_MM{i}"),
+                        [xcat, wcat],
+                        [acc],
+                        name=_unique_name(model, f"{label_prefix}_MM"),
                     )
                 )
-                if acc is None:
-                    acc = prod
-                else:
-                    nxt = _unique_name(model, f"{stem}_a{i}")
+            else:
+                for i, (xk, wk) in enumerate(zip(tap_x, tap_w)):
+                    prod = _unique_name(model, f"{label_prefix}_m{i}")
                     made.append(
                         helper.make_node(
-                            "Add",
-                            [acc, prod],
-                            [nxt],
-                            name=_unique_name(model, f"{stem}_AD{i}"),
+                            "MatMul",
+                            [xk, wk],
+                            [prod],
+                            name=_unique_name(model, f"{label_prefix}_MM{i}"),
                         )
                     )
-                    acc = nxt
+                    if acc is None:
+                        acc = prod
+                    else:
+                        nxt = _unique_name(model, f"{label_prefix}_a{i}")
+                        made.append(
+                            helper.make_node(
+                                "Add",
+                                [acc, prod],
+                                [nxt],
+                                name=_unique_name(model, f"{label_prefix}_AD{i}"),
+                            )
+                        )
+                        acc = nxt
+            return acc
+
+        if group == 1:
+            # Exactly the pre-group-support node sequence -- no extra
+            # Slice/Concat for the common case, so this path (resnet18's, and
+            # every model without a grouped Conv) is untouched.
+            acc = taps_matmul(xt, wt, cout, stem)
+        else:
+            # `x`'s channels split into `group` equal ranges on `xt`'s last
+            # axis; `w`'s *output* channels (the only axis `wt` has not
+            # already reduced to one group's worth -- its Cin axis is a
+            # group's `cin` by construction, since ONNX's Conv spec makes W's
+            # second dimension `Cin/group` regardless of `group`) split the
+            # same way on `wt`'s last axis. Each group only ever contracts
+            # against its own `cin` input channels, matching ONNX Conv's own
+            # grouping semantics; the per-group outputs are independent and
+            # simply concatenate back into the full `Cout` axis, which is
+            # exactly what a depthwise/grouped Conv computes.
+            cout_g = cout // group
+            group_accs = []
+            for g in range(group):
+                gstem = f"{stem}_g{g}"
+                xt_g = _unique_name(model, f"{gstem}_xg")
+                made.append(
+                    _slice(
+                        model, xt, xt_g, nd + 1, g * cin, (g + 1) * cin, f"{gstem}_SXG"
+                    )
+                )
+                wt_g = _unique_name(model, f"{gstem}_wg")
+                made.append(
+                    _slice(
+                        model,
+                        wt,
+                        wt_g,
+                        nd + 1,
+                        g * cout_g,
+                        (g + 1) * cout_g,
+                        f"{gstem}_SWG",
+                    )
+                )
+                group_accs.append(taps_matmul(xt_g, wt_g, cout_g, gstem))
+            acc = _unique_name(model, f"{stem}_gcat")
+            made.append(
+                helper.make_node(
+                    "Concat",
+                    group_accs,
+                    [acc],
+                    axis=-1,
+                    name=_unique_name(model, f"{stem}_GC"),
+                )
+            )
         # A bias is [Cout], which broadcasts onto the trailing axis exactly
         # where the taps land -- before the output is transposed back. The
         # 1x1 downsample convolutions in resnet18 carry one, and skipping

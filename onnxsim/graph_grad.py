@@ -338,6 +338,17 @@ class _Backward:
 # gradient -- a ``Reshape``'s shape operand, a ``Clip``'s bounds).
 Rule = Callable[[_Backward, onnx.NodeProto, str], List[Optional[str]]]
 
+# A multi-output rule takes one gradient *per node output* instead of one --
+# ``None`` in the same position where nothing downstream needs that output --
+# and otherwise returns exactly what :data:`Rule` does. Kept as a distinct
+# type (rather than widening :data:`Rule` itself) so every existing
+# single-output rule's shape stays exactly what it always was; see
+# :data:`_MULTI_OUTPUT_RULES` for why this is not just :data:`_CUSTOM_RULES`
+# with a wider value type.
+MultiOutputRule = Callable[
+    [_Backward, onnx.NodeProto, List[Optional[str]]], List[Optional[str]]
+]
+
 
 def _grad_matmul(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     a, b = node.input[0], node.input[1]
@@ -1811,6 +1822,149 @@ def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
     return [ddata, None]
 
 
+def _grad_split(
+    ctx: _Backward, node: onnx.NodeProto, gs: List[Optional[str]]
+) -> List[Optional[str]]:
+    """``Split``'s gradient, as one ``MatMul`` per output against a constant
+    0/1 selection matrix -- not a ``Concat`` of the incoming gradients, even
+    though that is the textbook VJP of a split-along-an-axis.
+
+    **Why not Concat.** It is not in :data:`BACKWARD_OPS` (this module's own
+    WebGPU/WebNN/NPU-portable op allowlist -- see that set's own comment),
+    and adding an op there is a real, separately-justified decision (see the
+    ``Conv``/``ConvTranspose`` note beside :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`
+    for the shape that justification takes) this rule does not need to
+    force, because the same result is reachable with what the allowlist
+    already has.
+
+    **The identity.** Move the split axis to the last position (a
+    ``Transpose``, skipped when it is already there) and "insert output
+    ``i``'s gradient at its own offset in a zero tensor the width of the
+    input" becomes "right-multiply by a constant selection matrix": for
+    output ``i`` with ``k_i`` entries starting at offset ``o_i`` (out of the
+    input's full width ``N`` along that axis), that matrix is ``E_i =
+    eye(N)[o_i : o_i + k_i, :]``, because ``g_i @ E_i`` places ``g_i``'s
+    ``k_i`` columns at columns ``[o_i, o_i + k_i)`` of an ``N``-wide result
+    and zero elsewhere -- exactly Split's adjoint (Split is a linear
+    projection; this is that projection's transpose). Outputs accumulate by
+    ``Add``; an output with no incoming gradient (nothing downstream needs
+    it) simply contributes no term rather than an explicit zero, which is
+    cheaper and still correct since ``Add`` needs nothing from a term that
+    was never there. The final ``Transpose`` (skipped under the same
+    condition as the first) restores the original axis order. Only
+    ``Transpose``/``MatMul``/``Add`` are used, all already in
+    :data:`BACKWARD_OPS` -- the same "arithmetic primitives, not fused ops"
+    discipline :func:`_grad_conv`'s own docstring states directly.
+
+    This is a :data:`MultiOutputRule`, not a :data:`Rule` -- ``Split`` is the
+    one op type in :data:`_MULTI_OUTPUT_RULES` rather than :data:`_RULES`,
+    which is where :func:`build_backward` looks first (see that function and
+    :data:`_MULTI_OUTPUT_RULES`'s own comment for why).
+
+    Geometry comes from each output's own *declared shape* (``ctx.shape``)
+    rather than parsing ``Split``'s ``split``-as-attribute (opset <13),
+    ``split``-as-optional-second-input (opset 13-17) or ``num_outputs``
+    attribute (opset 18+) spellings -- the same "derive from what the graph
+    actually says the shapes are, not from re-deriving the attribute that
+    produced them" discipline :func:`_conv_geometry`/:func:`_pool_geometry`
+    already use for exactly this reason (a misread attribute cannot survive
+    to become a wrong gradient), and it means this one rule needs no opset
+    branching at all.
+
+    Only ``node.input[0]`` (the tensor actually split) ever gets a gradient;
+    an optional second ``split`` sizes input (opset 13+) is an integer list,
+    not a function of anything float, the same "no gradient for a shape/axes
+    operand" convention every other rule with a non-differentiable extra
+    input already follows (``Reshape``'s ``shape``, ``Gather``'s ``indices``).
+
+    **What it costs.** Each ``E_i`` is ``k_i * N`` elements, materialized as
+    a constant initializer -- small for a modest channel-axis split (the
+    Conformer GLU gating this rule exists for splits one axis of a few
+    hundred channels into two), real and bounded for a very wide one, the
+    same cost :func:`_grad_conv`'s own index/mask tables carry and document
+    for the identical reason: no scatter op is in :data:`BACKWARD_OPS`, so a
+    constant selection stands in for one.
+    """
+    x = node.input[0]
+    in_shape = ctx.shape(x)
+    rank = len(in_shape)
+    axis = int(_attr(node, "axis", 0))
+    if axis < 0:
+        axis += rank
+    if axis < 0 or axis >= rank:
+        raise UnsupportedOpError(
+            f"Split's axis {axis} is out of range for a rank-{rank} input "
+            f"(node {node.output[0]!r})"
+        )
+    if all(g is None for g in gs):
+        return [None] * len(node.input)
+
+    width = int(in_shape[axis])
+    out_sizes = []
+    for out_name in node.output:
+        out_shape = ctx.shape(out_name)
+        if len(out_shape) != rank:
+            raise UnsupportedOpError(
+                f"Split output {out_name!r} has rank {len(out_shape)}, its "
+                f"input {x!r} has rank {rank} (node {node.output[0]!r})"
+            )
+        out_sizes.append(int(out_shape[axis]))
+    if sum(out_sizes) != width:
+        raise UnsupportedOpError(
+            f"Split's outputs sum to {sum(out_sizes)} along axis {axis}, but "
+            f"its input {x!r} has {width} there (node {node.output[0]!r})"
+        )
+
+    perm = [i for i in range(rank) if i != axis] + [axis]
+    identity_perm = perm == list(range(rank))
+    inv_perm = [perm.index(i) for i in range(rank)]
+
+    acc = None
+    offset = 0
+    for g, size in zip(gs, out_sizes):
+        if g is not None:
+            g_t = g if identity_perm else ctx.b.transpose(g, perm)
+            selector = np.zeros((size, width), dtype=np.float32)
+            selector[np.arange(size), offset + np.arange(size)] = 1.0
+            term = ctx.b.matmul(g_t, ctx.b.const(selector, "split_sel"))
+            acc = term if acc is None else ctx.b.add(acc, term)
+        offset += size
+
+    dx = acc if identity_perm else ctx.b.transpose(acc, inv_perm)
+    return [dx] + [None] * (len(node.input) - 1)
+
+
+# --- Multi-output rules --------------------------------------------------
+#
+# :data:`Rule` (and therefore :data:`_RULES`/:data:`SUPPORTED_OPS`) assumes
+# exactly one incoming gradient per node -- true of every builtin rule this
+# module has ever needed until now, and load-bearing elsewhere:
+# ``tests/test_qat_parity.py`` pins ``sorted(SUPPORTED_OPS)`` byte-for-byte
+# against a checked-in fixture that also has to match ``qat_entry.cpp``'s own
+# hardcoded C++ rule table -- see :data:`SUPPORTED_OPS`'s own comment. A rule
+# for an op with more than one *output* (``Split`` is the only one so far --
+# GLU gating in a Conformer-style audio-model block, see
+# ``docs/axera-audio-speech-op-coverage.md``) genuinely needs a different
+# argument shape (one gradient per output, not one), so it is kept in this
+# separate table rather than forced into :data:`_RULES`'s contract or
+# :data:`_CUSTOM_RULES`'s (which promises the *single-output* :data:`Rule`
+# signature to anything that reads it, e.g. a future caller iterating
+# ``_CUSTOM_RULES.values()`` expecting to call each with one ``g``).
+#
+# The direct consequence: an op registered here is **not** part of
+# :data:`SUPPORTED_OPS` and has **no C++/WASM mirror** -- differentiating it
+# is a Python-only capability today, the same divergence
+# :func:`register_gradient`'s docstring already warns ``override=True``
+# causes for a *builtin* op, just reached by a different door. It *is*
+# visible through :func:`supported_ops`, so QAT/LoRA block discovery
+# (``onnxsim.qat.discover_qat_blocks``/``onnxsim.lora.discover_lora_blocks``,
+# both already keyed off ``supported_ops()`` rather than the raw constant)
+# correctly treats a block containing it as differentiable.
+_MULTI_OUTPUT_RULES: Dict[str, MultiOutputRule] = {
+    "Split": _grad_split,
+}
+
+
 # --- Templated rules ---------------------------------------------------
 #
 # An alternative to hand-transcribing a rule's graph construction directly in
@@ -1972,11 +2126,12 @@ _CUSTOM_RULES: Dict[str, Rule] = {}
 
 
 def supported_ops() -> frozenset:
-    """:data:`SUPPORTED_OPS` (the builtin rules) unioned with every op type
-    currently registered via :func:`register_gradient`. This is the set
-    :func:`build_backward` (called the ordinary way, with ``rules=None``)
-    can actually differentiate right now."""
-    return SUPPORTED_OPS | frozenset(_CUSTOM_RULES)
+    """:data:`SUPPORTED_OPS` (the builtin single-output rules) unioned with
+    every op type currently registered via :func:`register_gradient` and
+    every op type in :data:`_MULTI_OUTPUT_RULES` (``Split`` today). This is
+    the set :func:`build_backward` (called the ordinary way, with
+    ``rules=None``) can actually differentiate right now."""
+    return SUPPORTED_OPS | frozenset(_CUSTOM_RULES) | frozenset(_MULTI_OUTPUT_RULES)
 
 
 def register_gradient(
@@ -2169,26 +2324,7 @@ def build_backward(
     ctx = _Backward(b, shapes)
     grads: Dict[str, str] = dict(grad_outputs)
 
-    for node in reversed(list(nodes)):
-        rule = rules.get(node.op_type)
-        if rule is None:
-            raise UnsupportedOpError(
-                f"no gradient rule for op type {node.op_type!r} "
-                f"(node {node.name or node.output[0]!r}); "
-                f"onnxsim.graph_grad differentiates {sorted(rules)}"
-            )
-        if len(node.output) != 1:
-            raise UnsupportedOpError(
-                f"{node.op_type} has {len(node.output)} outputs; only "
-                "single-output nodes are differentiated here"
-            )
-        g = grads.get(node.output[0])
-        if g is None:
-            # Nothing downstream depends on this node, so every gradient it
-            # would produce is zero. Emitting those zeros would be correct
-            # and pure waste.
-            continue
-        contributions = rule(ctx, node, g)
+    def accumulate(node: onnx.NodeProto, contributions: List[Optional[str]]) -> None:
         if len(contributions) != len(node.input):
             raise AssertionError(
                 f"the {node.op_type} rule returned {len(contributions)} gradients "
@@ -2205,6 +2341,47 @@ def build_backward(
             grads[name] = (
                 contribution if existing is None else b.add(existing, contribution)
             )
+
+    for node in reversed(list(nodes)):
+        multi_rule = _MULTI_OUTPUT_RULES.get(node.op_type)
+        if multi_rule is not None:
+            # A different dispatch path from the single-output one below:
+            # every one of this node's *outputs* may carry its own incoming
+            # gradient (or none), not just node.output[0] -- see
+            # :data:`_MULTI_OUTPUT_RULES`'s own comment for why this table is
+            # separate from :data:`_RULES`/:data:`_CUSTOM_RULES` rather than
+            # widening :data:`Rule`'s single-``g`` contract for everything.
+            gs = [grads.get(o) for o in node.output]
+            if all(g is None for g in gs):
+                # Nothing downstream depends on any output, so every
+                # gradient this node would produce is zero -- same "skip
+                # rather than emit waste" reasoning as the single-output
+                # path below, generalized to "none of the outputs" instead
+                # of "the one output".
+                continue
+            accumulate(node, multi_rule(ctx, node, gs))
+            continue
+
+        rule = rules.get(node.op_type)
+        if rule is None:
+            raise UnsupportedOpError(
+                f"no gradient rule for op type {node.op_type!r} "
+                f"(node {node.name or node.output[0]!r}); "
+                f"onnxsim.graph_grad differentiates {sorted(rules) + sorted(_MULTI_OUTPUT_RULES)}"
+            )
+        if len(node.output) != 1:
+            raise UnsupportedOpError(
+                f"{node.op_type} has {len(node.output)} outputs; only "
+                "single-output nodes are differentiated here (unless "
+                "registered in _MULTI_OUTPUT_RULES, checked above)"
+            )
+        g = grads.get(node.output[0])
+        if g is None:
+            # Nothing downstream depends on this node, so every gradient it
+            # would produce is zero. Emitting those zeros would be correct
+            # and pure waste.
+            continue
+        accumulate(node, rule(ctx, node, g))
 
     result: Dict[str, str] = {}
     for target in targets:
