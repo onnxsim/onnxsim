@@ -78,6 +78,74 @@ the returned gradient sees a healthy tensor while the computation upstream is
 destroyed -- unlike fp16, where overflow makes an inf that propagates. Reliable
 back-off needs the graph to export `ReduceMax(|t|)` on those tensors.
 
+### The FP32 seed, the quantizer's own internals, and two more levers -- one real, one dead
+
+Follow-on work (branches `axera-fp32-gradient-seed` / PR #1353, `axera-quantizer-
+reverse-engineering` / PR #1354, not yet merged as of this section) took the
+"untried way out" above further. Confirmed the FP32 seed is real but plateaus:
+forcing the seed's elementwise `Mul` to `data_type: "FP32"` rescues 0% -> 20% of
+gradient elements as scale grows, then stops, because the gradient itself comes
+out of a `MatMul` and `layer_configs`' `data_type` override does not apply to
+`MatMul`/`Conv` at all (confirmed directly in the compiler's own
+`quant_axmodel.json`: the request is recorded but silently downgraded to U8).
+Reverse-engineering Pulsar2's calibration algorithm from archival build data
+then confirmed the range is a function of calibration *data*, not graph
+structure -- and found two more untried config-surface levers, `output_data_type`
+(a `LayerConfig` field distinct from `data_type`) and calibrating deliberately
+for the gradient's expected late-training scale. Tested both directly, on a
+minimal isolated `y=x@w`/`dW=grad(loss,w)` probe (`scripts/axera/
+build_matmul_grad_probe.py`) rather than the full pipeline, for fast iteration:
+
+**`output_data_type: "FP32"` on the gradient `MatMul`: dead, more silently than
+`data_type`.** Pulsar2's own protobuf source
+(`/opt/pulsar2/axnn/yamain/config/build_config.proto`) documents this field's
+own comment as *"quantize data type for **Conv**"* -- a different, Conv-scoped
+control, not a generic per-layer output-precision override. Tried anyway,
+targeting the gradient MatMul both by `op_types: ["MatMul"]` and by its exact
+post-fusion `layer_name` (`matmul_14`): both compile successfully, and both
+leave `matmul_14`'s own tensor config **byte-for-byte identical** to the
+baseline's (`bit_width: 8, quant_min: 0, quant_max: 255`, identical hash) --
+and unlike the `data_type` case, `mix_precision_configs` doesn't even record
+the request (empty `{}` in every variant). The override isn't downgraded; it's
+not recognized for this op type at all.
+
+**Calibrating for the expected gradient scale: real, exact, and confirmed on
+real hardware -- but a one-shot, build-time trade, not an adaptive fix.**
+Compiled the identical probe twice, differing only in the calibration data
+supplied for `grad_seed` -- `1.0` (this thread's default so far) vs. `1e-4`
+(a late-training-scale stand-in). The compiler's own recorded output scale
+moved by **exactly 10,000.00x** (`0.0966 -> 9.659e-6`), matching the calibration
+ratio to five significant figures -- textbook linear MinMax, not an
+approximation. On real AX650N hardware, feeding both compiled models a real
+`grad_seed = 1e-4`:
+
+| model | seed | nonzero elements | dW[0] |
+| --- | --- | --- | --- |
+| baseline (calibrated for seed~1.0) | 1e-4 | **0/128** | 0 |
+| recalibrated (calibrated for seed~1e-4) | 1e-4 | **115/128** | -2.8977e-05 |
+| baseline | 1.0 | 115/128 | -0.28977 |
+| recalibrated | 1.0 | 115/128 | **-2.8977e-05** (identical to its own 1e-4 result) |
+
+The recalibrated model recovers the exact late-training gradient (`-2.8977e-05
+= -0.28977 x 1e-4`, matching the seed's own linearity precisely) at the scale
+it was built for. The fourth row is the real limit, not a footnote: fed the
+*old*, large seed, the recalibrated model returns the **identical, saturated**
+value it gives for the tiny seed -- it has lost the ability to represent large
+gradients, clipped at the top of its now-much-smaller range. **This settles
+the adaptive-vs-one-shot question directly**: a single compiled model cannot
+serve both an early-training and a late-training gradient scale at once. Real,
+practical shape of the win: calibrate for the training regime a given deployed
+model will actually run (a short fine-tuning run, or a specific stage of a
+longer one), or swap to a differently-calibrated recompiled model at defined
+checkpoints as training progresses -- not a continuously-adaptive per-step
+scheme, since nothing about Pulsar2's build-time calibration is revisitable at
+runtime.
+
+Combining both levers (recalibration + `output_data_type` override) produced a
+compiled model byte-identical in every quantization-relevant field to
+recalibration alone -- confirming, independently, that `output_data_type` truly
+contributes nothing on `MatMul`.
+
 ## Speed
 
 `axcl_run_model` costs ~580 ms per invocation (process start, device open,
