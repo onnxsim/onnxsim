@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Nine small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Ten small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -131,6 +131,21 @@ prefill cannot be timed with the shipped CLI. These talk to
   a resolution ceiling, not convergence" section for the real result.
   (a calibration-range regression, not a runner bug) -- see that same
   section before trusting a batch>1 run's loss/weight output.
+- `resnet50_realdata_runner.c` -- `resident_runner.c` (N_STATE=4, same I/O
+  layout: inputs `x y layer4.2.conv1.weight layer4.2.conv2.weight
+  layer4.2.conv3.weight fc.weight lr[grad_seed]`, outputs the four updated
+  states then `loss`) with `x`/`y` read from `<model>.x0`/`<model>.y0` host
+  files instead of `resident_runner.c`'s fixed `memset` pattern, and loss
+  printed every step rather than just the first 5 -- used to close the
+  "resnet50 never had batch>1 tested" gap
+  (`../build_resnet50_batch_step.py`, `docs/axera-on-device-training-
+  handoff.md`'s "resnet50 batch scaling" section) with an unambiguous,
+  monotonically-checkable real loss curve at each batch size, the same
+  reason `w2v2fe_runner_realdata.c` exists for its own model. Confirmed
+  real, non-degenerate training at batch 1/4/8 this way -- also settles
+  that section's own earlier "reported loss read exactly 0" caveat (a
+  `memset`-near-zero test input rounding to 0 under real calibration, not a
+  bug, the same conclusion resnet18's own memset runs already supported).
 - `w2v2_encoder_attn_runner.c` -- `w2v2fe_runner_realdata.c` with only the
   header comment and I/O names changed for
   `../build_w2v2_encoder_attn_step.py`'s own model: the first wav2vec2
