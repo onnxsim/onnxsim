@@ -15,7 +15,7 @@ import sys
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, numpy_helper, parser
+from onnx import numpy_helper, parser
 
 ort = pytest.importorskip("onnxruntime")
 
