@@ -770,3 +770,128 @@ other ceilings (PRs #1355/#1356's multi-phase calibration-swap, if the
 remaining gradient at this point is large enough to benefit from a
 narrower recalibrated range -- untested here, a real follow-on) rather than
 a hyperparameter change.
+
+### Multi-phase calibration swap breaks the plateau, then hits a new one -- real, but a one-shot gain, not a general fix
+
+The follow-on above, run for real. Direct evidence the plateau was a
+calibration-range problem, not a dead gradient: the frozen plateau loss
+value (`0.87024146`) was checked against the compiled model's own
+`quant_axmodel.json` -- the `loss` tensor's calibrated range
+(`scale=0.0044175`, representable span `255*scale=1.131`) versus the real
+observed loss trajectory across the whole 2,000-step run (`[0.8702,
+1.0293]`, span `0.159`) -- ~7x narrower than what was calibrated, meaning
+the quantizer was spending most of its 256 codes on loss values the model
+never actually produced once training got this far.
+
+**Built phase 2**: a new runner variant, `w2v2fe_runner_capture.c`, adds
+the missing ingredient no earlier run persisted -- it dumps the full
+trainable-weight tensor (not just its `w[0]` scalar readback) to disk at a
+window of late-training steps, plus the final state, so a real trajectory
+exists on disk to calibrate against. Ran it against the exact PR #1376
+compiled artifact for 1,700 steps (same `lr=100`, same seed), capturing the
+weight at steps 700/800/.../1600 -- squarely inside the plateau region --
+and the final state at step 1,699.
+
+`build_w2v2fe_mp_swap_phase2.py` rebuilds the same step graph and
+recalibrates the trainable weight against those 10 real captures, paired
+with the runner's own fixed, repeating `x0`/`y0` batch (not a diverse
+trajectory -- that fixed pair genuinely is the real runtime distribution
+here, since the runner reads `.x0`/`.y0` once and reuses them every step).
+A host check confirms this combination reproduces the real plateau loss
+almost exactly (`0.8717-0.8761` across the 10 captures, against the real
+hardware's `0.8702-0.8791` for the same step window) -- an earlier attempt
+that paired the same late-stage weight captures with an unrelated
+early-training `x`/`y` trajectory left the `loss` tensor's calibrated range
+essentially unchanged (`scale` moved by <1%), because the computed
+calibration loss never actually landed in the real plateau band either;
+matching the fixed real inputs, not just the weight, was what mattered.
+
+Compiled phase 2 for real (`pulsar2_docker.build`, same config shape as
+phase 1). The `loss` tensor's calibrated span narrowed from `1.131`
+(phase 1) to `0.876` (phase 2, `scale=0.0034355`) -- real, but a modest
+~1.3x, not the ~7x the raw trajectory span suggested, since MinMax still
+calibrates to the captures' own min/max rather than the tighter band a
+single fixed step would occupy.
+
+**Real hardware, seeded from phase 1's actual plateaued state
+(`w[0]=0.1833067536`, byte-identical, no restart from scratch)**: step 0
+on the phase-2 compile immediately reads `loss=0.862318` -- lower than
+phase 1's frozen `0.87024146`, a real, additional step of progress the
+first compile's calibration could not resolve. Running 2,000 more steps
+confirms this is not noise: loss alternates between exactly two values,
+`0.862318` and `0.865753`, both consistently below phase 1's plateau,
+never regressing back to `0.87024146` and never moving further.
+
+**Net**: the technique works -- swapping to a phase compiled with
+calibration matched to the real late-training distribution genuinely
+recovers real loss progress a stuck compile could not deliver, confirming
+PRs #1355/#1356's resnet18 result generalizes to a real trained model, not
+just their small Conv+Gemm demo. But it is a **one-shot gain, not a fix**:
+phase 2 hits its own new, finer resolution ceiling within single-digit
+steps (the same mechanism as phase 1's, just at smaller scale), and
+would need a phase 3 -- calibrated against phase 2's own new plateau
+trajectory -- to gain further. Each phase buys a fixed, shrinking amount of
+additional resolution, not unbounded continued training; whether repeated
+phases converge to the real minimum or hit diminishing returns quickly is
+unmeasured, a real follow-on.
+
+### Phase 3: same mechanism, but diminishing returns -- the technique hits a floor after one real gain
+
+The follow-on above, answered for real. First, confirmed phase 2's plateau
+is the *same class* of problem as phase 1's, not a new one: a fresh
+`w2v2fe_runner_capture.c` run against the real `w2v2_phase2.axmodel`
+(steps 5-24, squarely inside its plateau) shows real loss alternating
+between exactly two adjacent values, `0.862318` and `0.865753` -- a span
+of `0.0034356`, matching phase 2's own `quant_axmodel.json` `loss` scale
+(`0.0034355`) almost to the last digit. So phase 2's calibrated
+representable span (`255*scale=0.876`) is not ~7x too wide like phase 1's
+was -- it is ~255x too wide, the identical "MinMax calibrates to the
+captures' own min/max, not the far tighter band a continuing run settles
+into" mechanism as phase 1's, just compounded by another round. Not an
+SNR-floor problem like Whisper's; still a resolution-mismatch problem.
+
+**Built phase 3** (`build_w2v2fe_mp_swap_phase3.py`, same shape as phase
+2's generator): recalibrated the trainable weight against 20 real captures
+of phase 2's own trajectory (steps 5-24), paired with the same fixed
+`x0`/`y0` batch every phase has used. A host check confirms this
+combination reproduces the real plateau band closely (`0.8661-0.8702`
+across the 20 captures, against real hardware's `0.8623-0.8658` for the
+same steps). Compiled for real (`pulsar2_docker.build`, same config shape).
+
+**The recalibration barely moved anything this time.** Phase 3's `loss`
+scale came back `0.0034118` -- a change of under 1% from phase 2's
+`0.0034355`, despite calibrating against a genuinely different, directly
+relevant real trajectory (not the "unrelated x/y" bug this project has hit
+before). Unlike phase 1 -> 2's real ~23% narrowing (`1.131` -> `0.876`),
+phase 2 -> 3's calibration essentially reproduced the same representable
+span (`0.876` -> `0.870`).
+
+**Real hardware, seeded from phase 2's actual plateaued state
+(`w[0]=0.2563081682`, byte-identical continuation)**: 200 steps read loss
+alternating between exactly two values, `0.863183` and `0.866594` -- a
+span of `0.003411`, again matching the new build's own calibrated scale
+almost exactly, the same one-quantization-step signature as phase 2's own
+plateau. But this time there is **no net progress**: phase 3's low value
+(`0.863183`) is *higher* than phase 2's low value (`0.862318`) -- a real,
+if tiny, regression, not a gain. Plateaus within single-digit steps, same
+as phase 2 did.
+
+**Net across all three phases**: phase 1 -> 2 bought a real gain
+(`0.87024146` -> `0.862318`, `Δ=-0.00792`, ~14% of the whole PR #1376 run's
+total reduction, in one recalibration). Phase 2 -> 3 bought nothing
+(`0.862318` -> `0.863183`, `Δ=+0.00086`). **This settles the repeatability
+question the phase-2 writeup left open: the technique is a diminishing-
+returns, not-repeatable-indefinitely fix, not a "few large steps" one.**
+Each recalibration can only narrow the calibrated range by as much as the
+real variation still present in the captured trajectory allows -- and by
+phase 2, that variation had already collapsed to a single quantization
+step's worth of oscillation, leaving nothing left for a phase-3
+recalibration to exploit. The first swap worked because phase 1's real
+captures still spanned a meaningfully wide band (weight actively
+transitioning into its plateau); by the second swap, the captures
+themselves were already as narrow as the model's own resolution ceiling,
+so recalibrating against them just reproduces the same ceiling. Phases
+1/2/3's full artifacts and captures are on the AX650N VM
+(`/root/auto_phase1.axmodel`, `/root/w2v2_phase{2,3}.axmodel*`,
+`/root/w2v2_capture_p{2,3}/`) for any follow-on that wants to inspect them
+directly.

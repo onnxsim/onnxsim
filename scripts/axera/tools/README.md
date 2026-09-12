@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Ten small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Fourteen small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -131,6 +131,28 @@ prefill cannot be timed with the shipped CLI. These talk to
   a resolution ceiling, not convergence" section for the real result.
   (a calibration-range regression, not a runner bug) -- see that same
   section before trusting a batch>1 run's loss/weight output.
+- `w2v2fe_runner_capture.c` -- `w2v2fe_runner_realdata.c` variant built to
+  supply the one thing no earlier wav2vec2 run persisted: the full
+  trainable-weight tensor (not just its `w[0]` scalar readback) at a window
+  of late-training steps, plus the final state -- the real trajectory data
+  `../build_w2v2fe_mp_swap_phase2.py` needs to recalibrate against, since a
+  multi-phase calibration swap (PRs #1355/#1356's technique) needs real
+  late-stage values on disk, and nothing before this wrote any.
+  Usage: `w2v2fe_runner_capture model.axmodel steps warmup lr capture_start
+  capture_stride capture_count out_dir` -- writes `out_dir/w_capture_<i>.bin`
+  (raw float32, full weight tensor) for `capture_count` steps starting at
+  `capture_start` every `capture_stride` steps, `out_dir/loss_capture.txt`,
+  and `out_dir/final.state0` (the run's last weight state, in
+  `resident_runner.c`'s own `.state0` convention -- feed it straight to the
+  next phase's compile as its seed; also reused as-is to capture phase 2's
+  own trajectory for a phase-3 build). See the audio-speech coverage doc's
+  "Multi-phase calibration swap breaks the plateau, then hits a new one" and
+  "Phase 3" sections for the real result this produced: a genuine, confirmed
+  loss decrease past PR #1376's plateau on the first swap, but a
+  diminishing-returns, not-repeatable-indefinitely technique -- the second
+  swap (phase 2 -> 3) bought no further gain, since phase 2's own real
+  trajectory had already narrowed to a single quantization step with
+  nothing left for another recalibration to exploit.
 - `resnet50_realdata_runner.c` -- `resident_runner.c` (N_STATE=4, same I/O
   layout: inputs `x y layer4.2.conv1.weight layer4.2.conv2.weight
   layer4.2.conv3.weight fc.weight lr[grad_seed]`, outputs the four updated
