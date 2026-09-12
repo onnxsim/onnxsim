@@ -8,6 +8,7 @@ it should, and it does not change what the graph computes.
 Neither needs Docker or a card.
 """
 
+import importlib.util
 import os
 import sys
 
@@ -21,7 +22,19 @@ _AXERA_DIR = os.path.join(
 if _AXERA_DIR not in sys.path:
     sys.path.insert(0, _AXERA_DIR)
 
-import legalize  # noqa: E402
+# scripts/axera/legalize.py and scripts/axelera/legalize.py are two
+# different, same-named modules -- a plain `import legalize` here would
+# share one `sys.modules["legalize"]` entry with whichever of the two test
+# files collects first, silently handing this one the wrong module. Load
+# this one under a private key instead, so the two never collide regardless
+# of collection order (see tests/test_axelera_legalize.py, which already
+# does this on its own side of the same collision).
+_spec = importlib.util.spec_from_file_location(
+    "axera_legalize", os.path.join(_AXERA_DIR, "legalize.py")
+)
+legalize = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = legalize
+_spec.loader.exec_module(legalize)
 
 
 def _snake_model(dtype=TensorProto.FLOAT, exponent_as_initializer=True):
