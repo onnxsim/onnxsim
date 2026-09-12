@@ -88,6 +88,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from _local_import import ensure_repo_onnxsim  # noqa: E402
+
+ensure_repo_onnxsim()
+
 import legalize  # noqa: E402
 
 from onnxsim import graph_grad, qat_graph  # noqa: E402

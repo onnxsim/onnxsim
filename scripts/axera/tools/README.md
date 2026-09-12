@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Three small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Five small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -44,6 +44,12 @@ prefill cannot be timed with the shipped CLI. These talk to
   this found (a real update at step 0, then the gradient rounds to zero from
   step 1 on -- confirmed via a direct pre/post read of the raw state buffer,
   not the runner's own reporting path).
+- `mp_calib_swap_runner.c` -- runner for the multi-phase calibration-swap
+  demonstration (`docs/axera-on-device-training-handoff.md`'s "Multi-phase
+  calibration swap" section) against the small Conv+Gemm training step
+  `build_multiphase_calib_swap_probe.py` builds -- fixed I/O order (`x y cw
+  gw lr`), CLI `lr` and a `y` host file so the exact "does the update
+  survive" experiment can be run without rebuilding.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
