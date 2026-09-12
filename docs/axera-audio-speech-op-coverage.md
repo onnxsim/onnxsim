@@ -714,6 +714,63 @@ and batch=8; vNPU+batch composition is confirmed real but weaker and
 earlier-saturating than resnet18's own result -- both flagged follow-ons
 from PR #1373 are now closed.
 
+### 2,000 real steps: neither resnet18's clean death nor Whisper's, a third signature
+
+Every wav2vec2 run before this one was 8 real steps -- too short to know
+whether this model has the same eventual gradient-underflow ceiling
+resnet18 does (U8 dies ~step 1,000, U16 ~step 5,000, `docs/axera-on-device-
+training-handoff.md`'s ceiling section) before it matters in practice. Real
+AX650N hardware, batch=4, `lr=100`, the same working config as the section
+above, **2,000 real steps, ~39s wall-clock (51.3 steps/s)**:
+
+| step | loss |
+| --- | --- |
+| 0 | 1.0116 |
+| 100 | 0.896746 |
+| 300-700 | 0.879076 (flat) |
+| 800-1600 | 0.874659 (flat) |
+| 1700-1999 | 0.870241 (flat, including 203 consecutive bit-identical steps at the end) |
+
+Real, substantial progress through roughly the first 1,500 steps (a ~14%
+relative loss reduction), then the loss settles into a sequence of flat
+plateaus, each held for hundreds of steps before dropping to the next
+level -- not a smooth curve, and not resnet18's signature either (which
+goes to *exactly* zero gradient and stays there, output frozen for good).
+**The tracked weight (`w[0]`) keeps moving throughout, including during the
+final 200+-step loss plateau** -- bouncing between several distinct
+quantized values (`0.1425719261`, `0.1527556330`, `0.1629393399`,
+`0.1731230468`), never settling to one constant the way a genuinely dead
+gradient would leave it. So this is not resnet18's "gradient rounds to
+exactly zero, both loss and weight freeze for good" ceiling, and it
+survived vastly longer than Whisper's one-step death.
+
+**What it actually is, stated precisely rather than guessed**: with only
+final-loss and weight-readback instrumentation available (this runner
+doesn't expose the raw gradient's own nonzero-fraction the way `resident_
+runner.c`'s ceiling characterization did for resnet18), the two candidate
+explanations -- real learning continuing below the *loss output's own*
+quantization resolution at this stage, versus a genuinely stalled/oscillating
+gradient with only quantization noise moving the weight -- are not
+distinguishable from this data alone. Both are consistent with what's
+observed; picking between them needs the same debug-tap technique (`Reduce
+Max`/per-sample-loss, PR #1346, #1358) this project has already used
+elsewhere, not done here.
+
+**Does the multi-phase calibration-swap technique (PRs #1355/#1356) apply?**
+Unclear, and for a specific reason worth stating rather than assuming either
+way: that technique recalibrates the *gradient* tensor's own quantization
+range for a smaller expected magnitude. What's plateauing here is the
+*loss* output's readable resolution, not (as far as this data shows) the
+gradient's. If the real mechanism turns out to be the loss-output-resolution
+explanation, the applicable fix would be recalibrating the **loss** output's
+range for its late-training magnitude, not the gradient's -- a different
+tensor than the one PR #1355/#1356's technique targets, though the same
+general principle (recompile calibrated for the value's own late-training
+scale). If it turns out to be a genuinely stalled gradient instead, PR
+#1355/#1356's existing technique would be the direct fit. Settling which
+needs the gradient-nonzero-fraction instrumentation noted above -- a
+follow-on, not done here.
+
 ### The 2,000-step plateau (PR #1376) is a resolution ceiling, not convergence -- settled with a real lr-drop experiment
 
 PR #1376 ran this model for 2,000 real steps (batch=4, `lr=100`) and found
