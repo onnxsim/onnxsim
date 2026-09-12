@@ -79,6 +79,19 @@ int main(int argc, char **argv) {
     uint32_t ni = axclrtEngineGetNumInputs(info), no = axclrtEngineGetNumOutputs(info);
     fprintf(stderr, "inputs=%u outputs=%u\n", ni, no);
 
+    /* Real, verified-on-hardware API (unlike axclrtEngineExecuteAsync, this
+     * one actually works): the engine's own accounting of what it reserves
+     * for this model, queried by modelId now that it's loaded rather than
+     * shelling out to axcl-smi. Reports more than axcl-smi's own per-process
+     * column does (confirmed ~15.3 MiB here against axcl-smi's ~6.9 MiB for
+     * the same resnet18 model) -- this is the engine's planned budget, not
+     * a live-usage snapshot, so don't expect the two to match. */
+    int64_t sys_bytes = 0, cmm_bytes = 0;
+    CK(axclrtEngineGetUsageFromModelId(modelId, &sys_bytes, &cmm_bytes));
+    double cmm_mib = cmm_bytes / (1024.0 * 1024.0);
+    fprintf(stderr, "engine usage: sys=%lld B cmm=%.3f MiB\n",
+            (long long)sys_bytes, cmm_mib);
+
     axclrtEngineIO io; CK(axclrtEngineCreateIO(info, &io));
 
     /* input indices: 0=x 1=y 2.._v_231 3.._v_233 4.._v_235 5=fc.weight 6=lr
@@ -180,8 +193,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "step %d: %.3f ms  loss=%g\n", i, dt, loss_host);
     }
     double total = now_ms() - t_start;
-    printf("steps=%d min=%.3fms avg=%.3fms total=%.3fms throughput=%.1f steps/s\n",
-           steps, best, sum / steps, total, 1000.0 * steps / total);
+    printf("steps=%d min=%.3fms avg=%.3fms total=%.3fms throughput=%.1f steps/s cmm=%.3fMiB\n",
+           steps, best, sum / steps, total, 1000.0 * steps / total, cmm_mib);
 
     for (uint32_t i = 0; i < ni; i++) axclrtFree(in_bufs[i]);
     for (uint32_t i = 0; i < no; i++) axclrtFree(out_bufs[i]);
