@@ -709,3 +709,64 @@ trajectory -- to gain further. Each phase buys a fixed, shrinking amount of
 additional resolution, not unbounded continued training; whether repeated
 phases converge to the real minimum or hit diminishing returns quickly is
 unmeasured, a real follow-on.
+
+### Phase 3: same mechanism, but diminishing returns -- the technique hits a floor after one real gain
+
+The follow-on above, answered for real. First, confirmed phase 2's plateau
+is the *same class* of problem as phase 1's, not a new one: a fresh
+`w2v2fe_runner_capture.c` run against the real `w2v2_phase2.axmodel`
+(steps 5-24, squarely inside its plateau) shows real loss alternating
+between exactly two adjacent values, `0.862318` and `0.865753` -- a span
+of `0.0034356`, matching phase 2's own `quant_axmodel.json` `loss` scale
+(`0.0034355`) almost to the last digit. So phase 2's calibrated
+representable span (`255*scale=0.876`) is not ~7x too wide like phase 1's
+was -- it is ~255x too wide, the identical "MinMax calibrates to the
+captures' own min/max, not the far tighter band a continuing run settles
+into" mechanism as phase 1's, just compounded by another round. Not an
+SNR-floor problem like Whisper's; still a resolution-mismatch problem.
+
+**Built phase 3** (`build_w2v2fe_mp_swap_phase3.py`, same shape as phase
+2's generator): recalibrated the trainable weight against 20 real captures
+of phase 2's own trajectory (steps 5-24), paired with the same fixed
+`x0`/`y0` batch every phase has used. A host check confirms this
+combination reproduces the real plateau band closely (`0.8661-0.8702`
+across the 20 captures, against real hardware's `0.8623-0.8658` for the
+same steps). Compiled for real (`pulsar2_docker.build`, same config shape).
+
+**The recalibration barely moved anything this time.** Phase 3's `loss`
+scale came back `0.0034118` -- a change of under 1% from phase 2's
+`0.0034355`, despite calibrating against a genuinely different, directly
+relevant real trajectory (not the "unrelated x/y" bug this project has hit
+before). Unlike phase 1 -> 2's real ~23% narrowing (`1.131` -> `0.876`),
+phase 2 -> 3's calibration essentially reproduced the same representable
+span (`0.876` -> `0.870`).
+
+**Real hardware, seeded from phase 2's actual plateaued state
+(`w[0]=0.2563081682`, byte-identical continuation)**: 200 steps read loss
+alternating between exactly two values, `0.863183` and `0.866594` -- a
+span of `0.003411`, again matching the new build's own calibrated scale
+almost exactly, the same one-quantization-step signature as phase 2's own
+plateau. But this time there is **no net progress**: phase 3's low value
+(`0.863183`) is *higher* than phase 2's low value (`0.862318`) -- a real,
+if tiny, regression, not a gain. Plateaus within single-digit steps, same
+as phase 2 did.
+
+**Net across all three phases**: phase 1 -> 2 bought a real gain
+(`0.87024146` -> `0.862318`, `Δ=-0.00792`, ~14% of the whole PR #1376 run's
+total reduction, in one recalibration). Phase 2 -> 3 bought nothing
+(`0.862318` -> `0.863183`, `Δ=+0.00086`). **This settles the repeatability
+question the phase-2 writeup left open: the technique is a diminishing-
+returns, not-repeatable-indefinitely fix, not a "few large steps" one.**
+Each recalibration can only narrow the calibrated range by as much as the
+real variation still present in the captured trajectory allows -- and by
+phase 2, that variation had already collapsed to a single quantization
+step's worth of oscillation, leaving nothing left for a phase-3
+recalibration to exploit. The first swap worked because phase 1's real
+captures still spanned a meaningfully wide band (weight actively
+transitioning into its plateau); by the second swap, the captures
+themselves were already as narrow as the model's own resolution ceiling,
+so recalibrating against them just reproduces the same ceiling. Phases
+1/2/3's full artifacts and captures are on the AX650N VM
+(`/root/auto_phase1.axmodel`, `/root/w2v2_phase{2,3}.axmodel*`,
+`/root/w2v2_capture_p{2,3}/`) for any follow-on that wants to inspect them
+directly.
