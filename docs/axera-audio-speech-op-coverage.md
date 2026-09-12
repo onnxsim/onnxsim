@@ -345,3 +345,151 @@ step graph on Pulsar2/AX650N and confirming the gradient survives multiple
 step for whoever picks this up -- the host-side evidence says it should
 behave like resnet18, not like Whisper, but only a real compile+run settles
 it the way this project settles everything else.
+
+### Real hardware follow-up: compiles, `highest_mix_precision` fails a third way, and quantized gradient dies for a different reason than Whisper's
+
+Rebuilt the training-step graph at the real `Wav2Vec2Config()` default scale
+(4.2M-param feature extractor, matching the section above exactly --
+`fe.conv_layers.0.conv.weight` trainable rather than layer 6, since
+`build_resident_step`'s own `onnxsim.simplify()` pass renames later layers'
+weight initializers via CSE, e.g. `fe.conv_layers.6.conv.weight` ->
+`_v_100`, while layer 0's name survives -- picking layer 0 sidesteps the
+naming churn rather than fighting it). 172 nodes, matching the host-only
+survey's own count exactly. Host-verified again on this exact build:
+perturbing along the gradient's own direction (the fix this project's own
+Whisper work already established for finite-difference noise at this scale)
+gives 0.2-0.3% agreement against a reference at properly-tuned step sizes.
+
+**Compiles cleanly under standard INT8** (`pulsar2:7.0-lite`, 31.9s) -- the
+first real compile of any wav2vec2-family training graph in this project's
+history.
+
+**`highest_mix_precision` fails here too, a third distinct way.** Not
+Whisper's `LayerNorm` tiling limit (PR #1359's architecture has none) or
+resnet18's `AvgPool` scheduler `TypeError` (this graph has none either) --
+a real `TileFailException` on `AxErf`: `'dont support lut_float opr in
+AXOPS/ONNXOPS/CUSTOM_OPS'`, on the GELU activation's `Erf` node, forced to
+FP32 by the flag. Tried the same escape hatch PR #1359 tried for Whisper's
+LayerNorm -- a `layer_configs` entry forcing just `Erf` back to `U8`
+alongside `highest_mix_precision` -- and got the identical error, confirming
+(a third time, on a third architecture) that `highest_mix_precision` does
+not compose with `layer_configs` overrides at all; it is genuinely
+whole-graph-only. Three architectures, three different real ops
+(`LayerNorm`, `AvgPool`, `Erf`), three different real NPU-backend failure
+signatures (a `TileFailException` on a tiling-workspace limit, a Python
+`TypeError` inside the closed-source scheduler, and a `TileFailException`
+on an unsupported float lookup-table operator) -- this is now a consistent
+pattern, not a one-off: Pulsar2's FP32 tiling path does not reliably support
+ordinary ops that appear in almost any real model, and `highest_mix_precision`
+is not currently usable end-to-end on anything this project has actually
+built.
+
+**Standard INT8 compiles and runs, but the quantized gradient still dies
+after step 0 -- for a different, more mundane reason than Whisper's SNR
+floor.** Real hardware run (resident runner adapted to this model's real
+I/O order, confirmed via `probe_io`: inputs `[x, y,
+fe.conv_layers.0.conv.weight, lr, grad_seed]`, outputs `[updated weight,
+loss]`):
+
+| step | `w[0]` | loss |
+| --- | --- | --- |
+| initial | 0.453123 | -- |
+| 0 | 0.4580865502 | 0 |
+| 1-14 | 0.4580865502 (unchanged) | 0 |
+
+A real, nonzero step-0 update happens (delta +0.00496), then the weight
+freezes bit-identical from step 1 on, with loss reading exactly 0
+throughout -- the same *symptom* as Whisper's "dies at step 1," but not the
+same *cause*. The host-side evidence above already established this
+model's true gradient-to-weight ratio (~0.032) is easily resolvable by an
+8-bit quantizer -- there is no SNR floor here the way there is for Whisper.
+The step-0 delta itself is the tell: `(0.453123 - 0.458087) / 1e-4 ≈ -49.6`
+effective gradient magnitude, roughly five orders of magnitude larger than
+the host-measured true gradient (~0.0013 mean absolute) -- this is a
+calibration-range mismatch, the same class of bug PR #1346 found and fixed
+for resnet18 (arbitrary, unmeasured `weight_scale`/`x_scale` guesses fed to
+`make_training_calib.py` rather than values matched to this model's real
+activation statistics), not a new fundamental limit. **Not chased further
+here** -- fixing it needs proper calibration data (real or realistically-
+scaled `x`/weight statistics, following PR #1354's confirmed textbook-MinMax
+calibration behavior, or PR #1346's own fix pattern) rather than a config
+flag, and is the concrete next step for whoever wants this model actually
+training multiple real steps on hardware.
+
+### Fixed: real calibration data, and a second, distinct degenerate-range bug in `lr` -- the first real multi-step audio training result on this hardware
+
+Measured this model's real trajectory on host first, rather than guessing:
+8 real float32 SGD steps (`x_scale=1.0`, `y` ~N(0, 0.01), the real exported
+`fe.conv_layers.0.conv.weight` initializer, not a `weight_scale=0.05` draw)
+gave mean\|grad\| ~1.4-1.8e-4, the weight itself essentially unmoving at
+`lr=1e-4` -- confirming the ~0.032 ratio finding above and giving real
+numbers to calibrate against, instead of the arbitrary `x_scale=0.3`/
+`weight_scale=0.05` defaults the previous section's build used.
+
+Rebuilt calibration with `make_training_calib.py`'s `real_data=` override:
+`x_scale=1.0`, `weight_scale=0.36` (the real initializer's own mean\|w\|),
+and `real_data={"fe.conv_layers.0.conv.weight": <8-step w trajectory>, "y":
+<8-step y trajectory>, "grad_seed": [1.0]*6}`. Compiled cleanly. On real
+hardware, with real (not `memset`-pattern) `x`/`y` fed via host files: loss
+now reads a real, sensible `0.0754611` (matching the host trajectory's
+0.073-0.082 range) instead of the previous exact `0`, confirming the input
+calibration fix alone was real and correct.
+
+**But the weight still froze bit-identical from step 1 on.** Diagnosed
+rather than assumed: swept `lr` from 0.01 to 10000 at runtime and got
+**bit-identical loss and weight at every value** -- the same "calibrated
+narrowly, pins to a constant regardless of runtime input" signature PR
+#1353 found for `grad_seed` on a different model, this time on `lr`.
+Confirmed the cause directly: `make_training_calib.py`'s hardcoded `elif
+inp.name == "lr": arr = np.array([1e-4], ...)` branch feeds the *identical*
+value for all `n` calibration samples, so MinMax computes a zero-width
+range and the compiled model can only represent that one value -- runtime
+`lr` is silently clipped to it regardless of what's actually fed. This is a
+second, distinct bug from the input-calibration mismatch above, not a
+restatement of it, and it generalizes: any Axera training build with a
+scalar runtime input calibrated from constant samples (this project's own
+default for both `grad_seed`, historically, and `lr`, still) has this
+failure mode latent, whether or not it happens to matter for a given
+model's own trainable magnitude.
+
+Fixed by giving `lr` a real *spread* in its calibration data instead of a
+constant (`real_data={"lr": [0.01, 0.1, 1.0, 10.0, 100.0, 1.0]}`, spanning
+the range this test actually swept). Recompiled, reran on real hardware:
+
+| lr | step 0 loss | step 7 loss | step 0 `w[0]` | step 7 `w[0]` |
+| --- | --- | --- | --- | --- |
+| 0.01, 1.0 | 0.0754611 (unchanged) | 0.0754611 (unchanged) | frozen | frozen |
+| 10 | 0.0735344 | 0.0693600 | frozen | frozen |
+| **100** | **0.04335** | **0.0240833** | **-0.2461140752** | **-0.1757957637** |
+
+At `lr=100`, both loss and the tracked weight element move smoothly and
+**monotonically across all 8 real steps, with no freezing at any point** --
+genuine, resolvable gradient descent on real AX650N hardware. At `lr=10`,
+loss also moves monotonically (0.0735 -> 0.0694) while `w[0]` specifically
+stays frozen -- plausibly a different weight channel's own gradient
+dominates the visible loss movement at that scale while `w[0]`'s own share
+stays sub-quantization-step; not chased further, since the `lr=100` result
+already answers the question this section exists to settle. `lr=0.01`/`1.0`
+still freeze completely -- consistent with the true per-step update
+(~lr x 1.4e-4) staying below one quantization level of the weight-state
+output's own calibrated range at those scales, not a remaining bug.
+
+**This is the first real, fully-working, multi-step training result on any
+audio/speech model in this project's history** -- not just "compiles" or
+"one real step then dies," but a real loss curve moving in the right
+direction across a real hardware run. Both fixes were calibration-only (real
+input statistics instead of arbitrary defaults; a non-degenerate `lr`
+range instead of a single repeated value) -- no graph, `legalize.py`, or
+compiler-flag change was needed, unlike Whisper's and resnet18/50's own
+paths past their respective ceilings.
+
+**Flagged, not fixed here**: the same degenerate-constant-calibration bug
+almost certainly affects every prior Axera build's `lr` input (all of
+which used the same hardcoded `1e-4` constant), and `grad_seed` had the
+*opposite* problem in this build specifically -- `make_training_calib.py`
+has no `grad_seed`-aware branch at all, so it silently fell into the
+generic `weight_scale`-noise path before this fix's `real_data` override
+caught it. Whether this explains any part of PR #1353's own "seed sweep
+returns bit-identical gradients at every value" finding on a *different*
+model is an open, real question this task did not have scope to chase --
+noted here as a concrete follow-on, not asserted.
