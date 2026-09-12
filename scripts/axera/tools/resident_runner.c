@@ -95,13 +95,27 @@ int main(int argc, char **argv) {
     axclrtEngineIO io; CK(axclrtEngineCreateIO(info, &io));
 
     /* input indices: 0=x 1=y 2.._v_231 3.._v_233 4.._v_235 5=fc.weight 6=lr
+     * [7=grad_seed, only on a model built after grad_seed became a real
+     * graph input (onnxsim#1353) instead of a build-time constant -- every
+     * model this file has actually been run against so far predates that
+     * change and has exactly 7 inputs; ni==8 is handled so a future rebuild
+     * doesn't silently overflow the fixed-size arrays below or leave the
+     * seed unfed, but it has never been the case in this project's own
+     * measurements (confirmed against the real compiled r18_b1.axmodel)]
      * output indices: 0.._v_231' 1.._v_233' 2.._v_235' 3=fc.weight' 4=loss */
     const int state_in[N_STATE]  = {2, 3, 4, 5};
     const int state_out[N_STATE] = {0, 1, 2, 3};
     const int x_in = 0, y_in = 1, lr_in = 6, loss_out = 4;
+    const int seed_in = 7;
+    if (ni != 7 && ni != 8) {
+        fprintf(stderr, "unexpected input count %u (expected 7, or 8 with "
+                "grad_seed) -- this file's hardcoded I/O indices do not "
+                "necessarily match this model, refusing to guess\n", ni);
+        return 1;
+    }
 
-    void *in_bufs[7] = {0}, *out_bufs[5] = {0};
-    uint64_t in_sz[7], out_sz[5];
+    void *in_bufs[8] = {0}, *out_bufs[5] = {0};
+    uint64_t in_sz[8], out_sz[5];
 
     for (uint32_t i = 0; i < ni; i++) {
         in_sz[i] = axclrtEngineGetInputSizeByIndex(info, 0, i);
@@ -133,6 +147,10 @@ int main(int argc, char **argv) {
     {
         float lr = 1e-4f;
         CK(axclrtMemcpy(in_bufs[lr_in], &lr, sizeof(lr), AXCL_MEMCPY_HOST_TO_DEVICE));
+    }
+    if (ni == 8) {
+        float seed = 1.0f;
+        CK(axclrtMemcpy(in_bufs[seed_in], &seed, sizeof(seed), AXCL_MEMCPY_HOST_TO_DEVICE));
     }
 
     /* x/y: reused synthetic batch, re-uploaded every step exactly as a real

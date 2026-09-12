@@ -1503,6 +1503,55 @@ matched calibration/seed values end to end (the way PR #1356's original
 manual demo did), not freshly-drawn ones** -- a concrete, scoped next step,
 not a re-open of the mechanism's own correctness.
 
+### Audited: the "unfed grad_seed" scare -- real gap, zero actual impact
+
+PR #1360 (investigating resident-dataset `Gather` minibatching) noticed while
+writing its own `gather_runner.c` that neither `resident_runner.c` nor
+`whisper_resident_runner.c` allocates a `grad_seed` buffer and then feeds it
+-- raising a real worry: had every gradient-magnitude claim through those two
+runners, since `grad_seed` became a real graph input (#1353), been computed
+against an unintended, unwritten device buffer instead of the intended
+`1.0`? Checked directly on real hardware rather than reasoned about --
+
+**Every compiled model those two runners have ever actually been run
+against has exactly the input count their hardcoded indices expect, and
+none of them include `grad_seed` at all**, confirmed by loading each one and
+reading `axclrtEngineGetNumInputs` back: `r18_b1.axmodel` (resnet18 speed/
+batching/vNPU/memory work) reports **7** inputs; `whisper_step.axmodel` and
+`whisper_p1.axmodel` (the Whisper section above) report **17**; both match
+`resident_runner.c`'s and `whisper_resident_runner.c`'s own hardcoded
+layouts exactly, with no 8th/18th slot to leave unfed. These models all
+predate `grad_seed`'s promotion to a graph input in the code that built them
+(confirmed from `master`'s own merge order: PR #1357 merged *before* #1353,
+so the Whisper build it produced still had `grad_seed` baked in as
+`build_backward`'s old default constant, not a runtime input) -- so **the
+central claims in this project's history that route through these two
+runners, Whisper's step-0/step-1 death included, were never exposed to this
+bug and need no correction.** The `mp_calib_swap_auto_runner.c`
+multi-phase-controller demo above checks out the same way: its own compiled
+probe reports 5 inputs (`x y cw gw lr`), no `grad_seed` slot either.
+
+The worry wasn't baseless, though -- it correctly spotted a real, *latent*
+landmine rather than an active one. `build_resident_step()` on current
+`master` unconditionally adds `grad_seed` (`scalars=["lr", "grad_seed"]`),
+so a *fresh* rebuild of any of these graphs today would produce a model with
+one more input than these two runners' fixed-size `in_bufs[]` arrays have
+room for -- silently overflowing the array (not just leaving a buffer
+unfed), since neither runner previously checked `ni` against what it
+expected. Fixed proactively: both now bound-check `ni` against their known-
+good count (refusing to guess if it's neither that nor one more), size
+`in_bufs[]` for the one-more-input case, and feed `grad_seed=1.0` if it's
+present -- exactly `gather_runner.c`'s own already-correct pattern, which is
+what caught this in the first place. Re-ran both against the same real
+models above after the fix: identical numbers (resnet18 29ms/step,
+loss=0.117937; Whisper 245-246ms/step, loss=1.00265 constant across steps)
+-- confirms the fix is a no-op for every model these runners have actually
+been pointed at, and now safe to point at a newer one. (Also fixed, found
+along the way: `whisper_resident_runner.c`'s header comment describing its
+own I/O order was still resnet18's, left over from copying
+`resident_runner.c` -- the actual index constants in the body were always
+right, only the prose above them was stale.)
+
 ## What to do next
 
 1. ~~The FP32 gradient seed.~~ **Tested: real effect, not a full fix.** See

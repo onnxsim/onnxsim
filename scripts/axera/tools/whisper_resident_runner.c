@@ -26,10 +26,17 @@
  * AXCL_ERR_UNSUPPORT on this device/SDK build.
  *
  * The model's own I/O order is fixed here rather than discovered generically
- * (see probe_io's dump): inputs x, y, _v_231, _v_233, _v_235, fc.weight, lr;
- * outputs sub_950 (_v_231'), sub_952 (_v_233'), sub_954 (_v_235'),
- * sub_956 (fc.weight'), loss. State pairing is positional: input i (for
- * i in 2..5) pairs with output i-2.
+ * (see probe_io's dump): inputs input.1, y, 14 trainable-weight state
+ * tensors, lr [, grad_seed on a model built after grad_seed became a real
+ * graph input (onnxsim#1353) instead of a build-time constant -- the real
+ * Whisper `last_half` compiles this file has actually been run against all
+ * predate that change and have exactly 17 inputs, confirmed against the
+ * real compiled whisper_step.axmodel]; outputs are the 14 updated state
+ * tensors, then loss. State pairing is positional: input i (for i in
+ * 2..15) pairs with output i-2. (This comment used to describe resnet18's
+ * tensor names -- `_v_231` etc -- left over from copying resident_runner.c;
+ * this file's own N_STATE/index constants below were always Whisper's own
+ * shape, only the comment was stale.)
  */
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
@@ -99,9 +106,16 @@ int main(int argc, char **argv) {
     const int state_in[N_STATE]  = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     const int state_out[N_STATE] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
     const int x_in = 0, y_in = 1, lr_in = 16, loss_out = 14;
+    const int seed_in = 17;
+    if (ni != 17 && ni != 18) {
+        fprintf(stderr, "unexpected input count %u (expected 17, or 18 with "
+                "grad_seed) -- this file's hardcoded I/O indices do not "
+                "necessarily match this model, refusing to guess\n", ni);
+        return 1;
+    }
 
-    void *in_bufs[17] = {0}, *out_bufs[15] = {0};
-    uint64_t in_sz[17], out_sz[15];
+    void *in_bufs[18] = {0}, *out_bufs[15] = {0};
+    uint64_t in_sz[18], out_sz[15];
 
     for (uint32_t i = 0; i < ni; i++) {
         in_sz[i] = axclrtEngineGetInputSizeByIndex(info, 0, i);
@@ -133,6 +147,10 @@ int main(int argc, char **argv) {
     {
         float lr = 1e-4f;
         CK(axclrtMemcpy(in_bufs[lr_in], &lr, sizeof(lr), AXCL_MEMCPY_HOST_TO_DEVICE));
+    }
+    if (ni == 18) {
+        float seed = 1.0f;
+        CK(axclrtMemcpy(in_bufs[seed_in], &seed, sizeof(seed), AXCL_MEMCPY_HOST_TO_DEVICE));
     }
 
     /* x/y: reused synthetic batch, re-uploaded every step exactly as a real
