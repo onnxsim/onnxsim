@@ -293,7 +293,8 @@ needs its own trace, not an inference from wav2vec2's). Flagged, not closed.
 | `Split` has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_split`, via the new `_MULTI_OUTPUT_RULES` table) | was: Conformer's GLU gating | `MatMul` against a constant 0/1 selection matrix per output, no `Concat`, stays inside `BACKWARD_OPS` |
 | `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_where`/`_grad_is_nan`, via the new `_PYTHON_ONLY_RULES` table) | was: plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is a separate, still-open question (see below) | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; `IsNaN` itself gets a no-gradient rule so `build_backward` can walk over it inline |
 | Raw `Gelu` has no backward rule | open, low priority | only an exporter emitting fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
-| LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | open, largest lift, **real test bed now found** | any classic RNN-based ASR/TTS model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
+| `LSTM` has no backward rule; NPU-executable otherwise | open, largest lift, **real test bed now found** | any classic RNN-based ASR model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
+| `GRU` has no backward rule *and* is not NPU-executable at all | open, stricter than `LSTM`, **real test bed now found** | any classic RNN-based TTS/vocoder model | needs Pulsar2 to support `GRU` on-device first (closed-source, not fixable from this project's side) -- a backward rule alone would not be enough |
 
 ### A real LSTM test bed: NVIDIA Parakeet's own RNN-T prediction network
 
@@ -326,14 +327,48 @@ concrete real target the "open, largest lift" row above needed -- an actual
 LSTM-cell backward rule (or an unroll-based legalization route) can now be
 tested against a real published model, not just a hand-built probe.
 
-No real GRU-based architecture was found in an already-installed package
-(`transformers` has zero `nn.GRU` usage anywhere in its model zoo;
-`torchaudio`/`silero-vad`'s own GRU-based VAD model ships as a pretrained
-JIT/ONNX artifact requiring `torchaudio`, not a config-driven module fitting
-this project's tiny-random-init-export convention) -- lower priority than
-LSTM here regardless, since `nn.GRU` is structurally the same "opaque
-recurrent op, no legalization route" story and no current target model in
-this project's scope needs one.
+### A real GRU test bed too: DeepMind's WaveRNN vocoder -- a stricter gap than LSTM
+
+`transformers` has zero `nn.GRU` usage anywhere in its model zoo, and
+`silero-vad` (initially assumed to be GRU-based from its public reputation)
+turned out to use `nn.LSTMCell` in its current release, not `nn.GRU` --
+checked directly by loading it (`pip install torchaudio silero-vad`,
+`silero_vad.load_silero_vad(onnx=False)`, then inspecting the loaded
+`RecursiveScriptModule`'s printed module tree). `torchaudio.models.WaveRNN`
+is the real find: DeepMind's own WaveRNN vocoder ("Efficient Neural Audio
+Synthesis") has two real `nn.GRU` layers (`self.rnn1`, `self.rnn2` in
+`torchaudio/models/wavernn.py`) driving its autoregressive sample
+generation, with an ordinary config-driven constructor (`upsample_scales`,
+`n_rnn`, `n_freq`, ... all plain ints, no pretrained weights needed).
+`scripts/axera/build_wavernn_gru_probe.py` exports it at a tiny config
+(`n_rnn=16`, `n_freq=8`, `upsample_scales=[2, 2]`) the same way the LSTM
+probe above does.
+
+**A real, previously-only-assumed finding, now confirmed on a published
+architecture**: unlike `LSTM` (NPU-executable, only missing a backward
+rule), **`GRU` is not in `AX650_SUPPORTED_OPS` at all** -- both real
+`GRU` nodes in this export are absent from *both* tables. This is a
+strictly bigger gap than LSTM's: a GRU-containing model cannot even *run*
+on this hardware at inference, before training enters the picture at all,
+so a GRU backward rule alone would not be enough to unblock WaveRNN --
+Pulsar2's own NPU backend would need to gain `GRU` support first, something
+outside this project's control (closed-source compiler, same class of
+limitation as `IsNaN`'s own missing frontend support, PR #1384). Every
+other op in the export is either already covered (`Conv`, `MatMul`, `Add`,
+`Gather`, `Identity`, `Relu`, `Reshape`, `Transpose`) or, again, harmless
+shape/indexing scaffolding (`Concat`/`Constant`/`Expand`/`Slice`/`Squeeze`/
+`Tile`/`Unsqueeze`/`Shape`) around the upsampling network feeding the GRU
+stack -- confirming the gap is scoped to `GRU` itself, not something this
+export incidentally also needs.
+
+**Net for LSTM/GRU as a pair**: LSTM now has a real target model and only
+needs a backward rule (or an unroll route) to become trainable; GRU has a
+real target model too, but needs Pulsar2 to support the op on-device before
+a backward rule would even matter -- a strictly higher bar, and not
+something a legalization rule on this project's side can route around, the
+same "closed-source backend gap, not fixable from the ONNX side" verdict
+several other findings in this project (`IsNaN`, `output_data_type` on
+`MatMul`) already reached.
 
 ## Do the two silent vendor bugs generalize?
 
