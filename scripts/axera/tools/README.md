@@ -79,12 +79,18 @@ prefill cannot be timed with the shipped CLI. These talk to
   separate copy per shape the way the Whisper runner did. Explicitly feeds
   `grad_seed`, which neither `resident_runner.c` nor
   `whisper_resident_runner.c` actually does (both allocate its buffer but
-  never write it -- a real, separate latent gap found while building this).
-  See the handoff doc's "Trading free memory for throughput" section: the
-  baseline mode confirmed this project's established resnet18 numbers;
-  `-g` mode is written and correct but has nothing to run yet, since the
-  `Gather`-off-a-resident-dataset variant doesn't currently compile on real
-  hardware (a genuine Pulsar2 NPU-backend gap, not a bug in this runner).
+  never write it -- a real, separate latent gap found while building this,
+  still outstanding in those two). See the handoff doc's "Trading free
+  memory for throughput" section: the baseline mode confirmed this
+  project's established resnet18 numbers; `-g` mode is confirmed **working
+  on real hardware** for the pre-flattened-dataset workaround
+  (`../build_resident_dataset_gather_probe.py`), up to a real, measured
+  190-row OCM-capacity ceiling for that scope -- writes `int32_t` indices
+  (`-rN` sets the row count they're drawn mod), not the `int64_t` an
+  earlier version of this file wrote: Pulsar2 silently downcasts the ONNX
+  graph's declared `int64` `batch_index` input to `int32` on-device, so the
+  old code only half-initialized that buffer and reliably faulted
+  `axclrtEngineExecute` with `0x8030070c`.
 - `w2v2fe_runner.c` -- resident runner for `../build_w2v2_feature_extractor_step.py`'s
   training step (one trainable state tensor, its own I/O layout, real
   `probe_io`-confirmed). Compiles under standard INT8; `highest_mix_precision`
