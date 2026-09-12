@@ -48,8 +48,8 @@ from types import ModuleType
 
 
 def ensure_repo_onnxsim() -> None:
-    """Make ``import onnxsim`` resolve to *this checkout's own* ``onnxsim``,
-    not whatever ``onnxsim`` happens to be editable-installed globally.
+    """Make ``onnxsim``'s *pure-Python* submodules resolve to this checkout's
+    own ``onnxsim/`` first, without breaking the compiled extension.
 
     A real, confirmed hazard for any script here run from an isolated ``git
     worktree``: invoked directly (``python3 scripts/axera/foo.py``), a
@@ -64,17 +64,71 @@ def ensure_repo_onnxsim() -> None:
     actually asked. A worktree editing ``onnxsim/*.py`` and "host-verifying"
     the change by running one of these scripts is therefore silently
     exercising the *main checkout's* code, not its own, unless something
-    puts this worktree's own repo root ahead of that fallback on
-    ``sys.path`` first -- which is exactly what this function does.
+    puts this worktree's own repo root ahead of that fallback first.
 
-    Call this before any ``import onnxsim`` / ``from onnxsim import ...``,
-    as early in the script as possible.
+    **Must merge into the package's own ``__path__``, not replace resolution
+    on ``sys.path``.** An earlier version inserted the repo root at
+    ``sys.path[0]``, which makes ``importlib.machinery.PathFinder`` resolve
+    the top-level ``onnxsim`` package directly from this checkout's source
+    tree -- and once a package is found that way, every submodule import
+    (``onnxsim.onnxsim_cpp2py_export`` included) searches only *that*
+    package's own ``__path__``, never consulting ``sys.meta_path`` again.
+    The compiled extension is a build artifact, not a tracked source file --
+    it does not live in a plain checkout's ``onnxsim/`` directory the way
+    CI's `axera-integration.yml` `pulsar2-compat` job's own comment already
+    documents ("the repo root contains the `onnxsim/` source dir (no
+    compiled extension), which would shadow the installed wheel"). That job
+    deliberately runs from `runner.temp` to avoid exactly this -- and the
+    ``sys.path``-replacing version of this function broke that protection
+    anyway, since it does not look at ``cwd`` at all (confirmed: PR #1352
+    green, then this exact failure on every PR after it,
+    ``ModuleNotFoundError: No module named 'onnxsim.onnxsim_cpp2py_export'``
+    from `pulsar2-compat`'s `calibration.py` import).
+
+    The fix: import ``onnxsim`` first, however it would normally resolve
+    (the editable install's finder in a worktree, the properly-installed
+    wheel in CI) -- this is what discovers where the *real* compiled
+    extension lives. Then prepend this checkout's own ``onnxsim/`` directory
+    to the now-resolved package's ``__path__`` (not to ``sys.path``), so a
+    submodule search that reaches this checkout's directory finds its own
+    copy first, and one that doesn't (``onnxsim_cpp2py_export`` -- a plain
+    checkout never has the compiled extension) falls through to wherever
+    ``__path__``'s original entry already pointed, exactly as if this
+    function had never run.
+
+    **Known incomplete, confirmed by testing rather than assumed fixed**:
+    ``onnxsim/__init__.py`` eagerly imports the large majority of the
+    package's own submodules (``graph_grad`` included, transitively, via
+    other eagerly-imported modules like ``onnxsim.lora``) as part of running
+    ``import onnxsim`` itself -- before this function ever gets a chance to
+    touch ``__path__``. Those submodules are already bound in
+    ``sys.modules`` by the time the ``__path__`` prepend happens, so a later
+    ``import onnxsim.graph_grad`` returns the *already-resolved* module,
+    unaffected by this function -- confirmed directly: a worktree-invoked
+    script calling this still received the main checkout's
+    ``graph_grad.py``, not its own. This function therefore reliably
+    prevents the compiled-extension breakage above, and correctly redirects
+    any submodule that genuinely isn't already cached by the time it runs,
+    but does **not** reliably give a specific, heavily-imported submodule
+    (``graph_grad`` chief among them) worktree isolation. For a guaranteed
+    fix on one specific submodule, use :func:`fresh` instead -- e.g.
+    ``fresh("graph_grad", os.path.join(repo_root, "onnxsim"))`` -- the same
+    tool this module already uses for axera-local modules, which sidesteps
+    ``sys.modules``/``__path__`` entirely rather than trying to out-race
+    ``onnxsim/__init__.py``'s own eager imports.
+
+    Call this before any ``from onnxsim import ...``, as early in the
+    script as possible. A bare ``import onnxsim`` already happened by the
+    time this returns; that's required, not a side effect to avoid.
     """
-    repo_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    import onnxsim as _onnxsim
+
+    repo_onnxsim_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "onnxsim",
     )
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    if repo_onnxsim_dir not in _onnxsim.__path__:
+        _onnxsim.__path__.insert(0, repo_onnxsim_dir)
 
 
 def fresh(name: str, directory: str) -> ModuleType:

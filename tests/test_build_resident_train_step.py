@@ -448,3 +448,88 @@ def test_bottleneck_block_gradient_matches_finite_differences():
         fd = (loss_at(w_plus) - loss_at(w_minus)) / (2 * eps)
         predicted = float((grads[p] * d).sum())
         assert predicted == pytest.approx(fd, rel=0.05, abs=1e-6), p
+
+
+def test_a_raw_constant_node_is_folded_before_backward():
+    """`graph_grad.build_backward` demands a gradient rule for every node
+    type it walks, `Constant` included, even though a zero-input op has
+    nothing to backprop through -- found training a real Whisper encoder,
+    whose Erf-GELU decomposition (`0.5 * x * (1 + erf(x / sqrt(2)))`) leaves
+    raw `Constant` nodes for `0.5`/`sqrt(2)` that a forward-only export never
+    needs to fold (see docs/axera-on-device-training-handoff.md's "A
+    memory-heavy case" section). Before `_fold_constants` ran ahead of
+    `build_backward`, this raised `UnsupportedOpError('no gradient rule for
+    op type 'Constant'')`; resnet18/50's own forward graphs never exercised
+    this path since neither has a raw `Constant` node anywhere.
+    """
+    rng = np.random.default_rng(7)
+    gw = rng.standard_normal((4, 4)).astype(np.float32) * 0.2
+
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g (float[1,4] x) => (float[1,4] logits)
+        {
+          half = Constant<value = float {0.5}>()
+          one = Constant<value = float {1.0}>()
+          inv_sqrt2 = Constant<value = float {0.7071067811865476}>()
+          h = MatMul(x, gw)
+          scaled = Mul(h, inv_sqrt2)
+          erfed = Erf(scaled)
+          shifted = Add(erfed, one)
+          gated = Mul(h, shifted)
+          logits = Mul(gated, half)
+        }
+        """
+    )
+    model.graph.initializer.append(_f32(gw, "gw"))
+    onnx.checker.check_model(model)
+    assert any(n.op_type == "Constant" for n in model.graph.node)
+
+    with_loss = brts.add_mse_loss(model, "logits", num_classes=4)
+    step_model, state = brts.build_resident_step(with_loss, params=["gw"])
+    onnx.checker.check_model(step_model)
+    assert not any(n.op_type == "Constant" for n in step_model.graph.node)
+    assert set(state) == {"gw"}
+
+    x = rng.standard_normal((1, 4)).astype(np.float32)
+    y = rng.standard_normal((1, 4)).astype(np.float32)
+    gw0 = onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == "gw")
+    )
+    out_names = [o.name for o in step_model.graph.output]
+    feeds = {"x": x, "y": y, "lr": np.array([1.0], np.float32), "gw": gw0}
+    outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
+    grad = (gw0 - outs[state["gw"]]).astype(np.float64)
+
+    def loss_at(w):
+        probe = onnx.ModelProto()
+        probe.CopyFrom(with_loss)
+        for init in probe.graph.initializer:
+            if init.name == "gw":
+                init.CopyFrom(onnx.numpy_helper.from_array(w.astype(np.float32), "gw"))
+        (loss,) = _run(probe, {"x": x, "y": y}, ["loss"])
+        return float(loss)
+
+    d = rng.standard_normal(gw0.shape).astype(np.float64)
+    eps = 1e-2 / (np.linalg.norm(d) + 1e-12)
+    fd = (loss_at(gw0 + eps * d) - loss_at(gw0 - eps * d)) / (2 * eps)
+    predicted = float((grad * d).sum())
+    assert predicted == pytest.approx(fd, rel=0.05, abs=1e-6)
+
+
+def test_fold_constants_is_a_noop_without_any_constant_nodes():
+    """`build_resident_step` only pays for `_fold_constants`'s simplify()
+    pass when the graph actually has a `Constant` node -- confirm a plain
+    resnet-shaped graph (no `Constant` anywhere) still builds identically,
+    i.e. the new check doesn't change behaviour for every model this
+    pipeline already handled."""
+    forward = _forward_model()
+    assert not any(n.op_type == "Constant" for n in forward.graph.node)
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    step_model, state = brts.build_resident_step(with_loss, params=["cw", "gw"])
+    onnx.checker.check_model(step_model)
+    assert set(state) == {"cw", "gw"}

@@ -49,6 +49,17 @@ The gradient is an **output tensor**, quantised at a range fixed when the model
 was built. As training converges the true gradient shrinks below half a
 quantisation step and rounds to zero -- every entry, eventually.
 
+**`docs/axera-quantizer-reverse-engineering.md`** confirms, quantitatively, that
+Pulsar2's calibration is textbook asymmetric MinMax over the caller-supplied
+calibration data specifically (not graph structure) -- meaning recalibrating
+with late-training-scale (small) synthetic gradient values, entirely within
+Pulsar2's own sanctioned pipeline, is a real, untested candidate fix for this
+ceiling. That document also found `Conv` has a separate `output_data_type:
+"FP32"` override distinct from `layer_configs`' `data_type` override -- whether
+`MatMul` has the same is the most promising untried lever for a plateau found
+while pursuing loss scaling via an FP32 gradient seed (see the still-open PR
+that introduced that finding for the full context once merged).
+
 | gradient tensor | dies at | best SNR reached |
 | --- | --- | --- |
 | U8 | step ~1,000 | 30.88 dB |
@@ -237,6 +248,158 @@ either a Pulsar2 capability that doesn't exist in the config surface explored
 so far, or solving the compiler's own byte-level non-determinism first (a
 precondition for Angle 2 that this project has no access to, being
 closed-source) -- not a small follow-on to either angle tried here.
+
+### The FP32 seed, the quantizer's own internals, and two more levers -- one real, one dead
+
+Follow-on work (branches `axera-fp32-gradient-seed` / PR #1353, `axera-quantizer-
+reverse-engineering` / PR #1354, not yet merged as of this section) took the
+"untried way out" above further. Confirmed the FP32 seed is real but plateaus:
+forcing the seed's elementwise `Mul` to `data_type: "FP32"` rescues 0% -> 20% of
+gradient elements as scale grows, then stops, because the gradient itself comes
+out of a `MatMul` and `layer_configs`' `data_type` override does not apply to
+`MatMul`/`Conv` at all (confirmed directly in the compiler's own
+`quant_axmodel.json`: the request is recorded but silently downgraded to U8).
+Reverse-engineering Pulsar2's calibration algorithm from archival build data
+then confirmed the range is a function of calibration *data*, not graph
+structure -- and found two more untried config-surface levers, `output_data_type`
+(a `LayerConfig` field distinct from `data_type`) and calibrating deliberately
+for the gradient's expected late-training scale. Tested both directly, on a
+minimal isolated `y=x@w`/`dW=grad(loss,w)` probe (`scripts/axera/
+build_matmul_grad_probe.py`) rather than the full pipeline, for fast iteration:
+
+**`output_data_type: "FP32"` on the gradient `MatMul`: dead, more silently than
+`data_type`.** Pulsar2's own protobuf source
+(`/opt/pulsar2/axnn/yamain/config/build_config.proto`) documents this field's
+own comment as *"quantize data type for **Conv**"* -- a different, Conv-scoped
+control, not a generic per-layer output-precision override. Tried anyway,
+targeting the gradient MatMul both by `op_types: ["MatMul"]` and by its exact
+post-fusion `layer_name` (`matmul_14`): both compile successfully, and both
+leave `matmul_14`'s own tensor config **byte-for-byte identical** to the
+baseline's (`bit_width: 8, quant_min: 0, quant_max: 255`, identical hash) --
+and unlike the `data_type` case, `mix_precision_configs` doesn't even record
+the request (empty `{}` in every variant). The override isn't downgraded; it's
+not recognized for this op type at all.
+
+**Calibrating for the expected gradient scale: real, exact, and confirmed on
+real hardware -- but a one-shot, build-time trade, not an adaptive fix.**
+Compiled the identical probe twice, differing only in the calibration data
+supplied for `grad_seed` -- `1.0` (this thread's default so far) vs. `1e-4`
+(a late-training-scale stand-in). The compiler's own recorded output scale
+moved by **exactly 10,000.00x** (`0.0966 -> 9.659e-6`), matching the calibration
+ratio to five significant figures -- textbook linear MinMax, not an
+approximation. On real AX650N hardware, feeding both compiled models a real
+`grad_seed = 1e-4`:
+
+| model | seed | nonzero elements | dW[0] |
+| --- | --- | --- | --- |
+| baseline (calibrated for seed~1.0) | 1e-4 | **0/128** | 0 |
+| recalibrated (calibrated for seed~1e-4) | 1e-4 | **115/128** | -2.8977e-05 |
+| baseline | 1.0 | 115/128 | -0.28977 |
+| recalibrated | 1.0 | 115/128 | **-2.8977e-05** (identical to its own 1e-4 result) |
+
+The recalibrated model recovers the exact late-training gradient (`-2.8977e-05
+= -0.28977 x 1e-4`, matching the seed's own linearity precisely) at the scale
+it was built for. The fourth row is the real limit, not a footnote: fed the
+*old*, large seed, the recalibrated model returns the **identical, saturated**
+value it gives for the tiny seed -- it has lost the ability to represent large
+gradients, clipped at the top of its now-much-smaller range. **This settles
+the adaptive-vs-one-shot question directly**: a single compiled model cannot
+serve both an early-training and a late-training gradient scale at once. Real,
+practical shape of the win: calibrate for the training regime a given deployed
+model will actually run (a short fine-tuning run, or a specific stage of a
+longer one), or swap to a differently-calibrated recompiled model at defined
+checkpoints as training progresses -- not a continuously-adaptive per-step
+scheme, since nothing about Pulsar2's build-time calibration is revisitable at
+runtime.
+
+Combining both levers (recalibration + `output_data_type` override) produced a
+compiled model byte-identical in every quantization-relevant field to
+recalibration alone -- confirming, independently, that `output_data_type` truly
+contributes nothing on `MatMul`.
+
+### Multi-phase calibration swap: the mechanism, hardware-verified past the isolated probe
+
+Turned the recalibration lever above into a real, working demonstration
+rather than leaving it as a design note. Not on the full resnet18 pipeline --
+`resnet18d_folded.onnx` (the forward model earlier sections' compiles used) is
+no longer present in this session's scratch, and regenerating it (BN-folding
+included) was out of scope for the time this task had -- but on
+`tests/test_build_resident_train_step.py`'s own small real forward model
+(`x -> Conv -> Relu -> Flatten -> Gemm -> logits`, trainable `cw`/`gw`)
+through the **real, unmodified pipeline**
+(`add_mse_loss`/`build_resident_step`/`pulsar2_docker.build()`) -- a genuine
+multi-node training-step graph (35 nodes after simplify), not the single-`MatMul`
+isolated probe the levers above were tested on. `gb` (the Gemm bias) was left
+frozen: trained, it hits a real, separate compiler crash
+(`TileFailException("AxQuantizedSub, tuple index out of range")` on the SGD
+subtract for that specific tiny 10-element tensor) unrelated to anything this
+task investigated -- worth a bug report if this model shape is revisited, not
+chased further here.
+
+Built two compiles, identical graph, differing only in `make_training_calib`'s
+`weight_scale` (0.05 -- "early training" -- vs. 0.0005 -- "late training", the
+same 100x ratio methodology as the isolated-probe result above), each in
+**~15s** (this graph's own size, not resnet18's -- the batching section's
+70-450s figures don't apply here). Confirmed the compiler-recorded scales
+move by **exactly 100.00x** between the two builds, for both trainable
+tensors and their SGD-updated state outputs alike (`quant_axmodel.json`'s
+`tensor_configs`/`values`, same evidentiary method as the isolated-probe
+result):
+
+| tensor | phase 1 scale (weight_scale=0.05) | phase 2 scale (weight_scale=0.0005) | ratio |
+| --- | --- | --- | --- |
+| `cw` | 0.0012102693 | 1.2102693e-05 | 100.00x |
+| `cw`'s updated state | 0.0012102675 | 1.2102679e-05 | 100.00x |
+| `gw` | 0.0013282200 | 1.3282201e-05 | 100.00x |
+| `gw`'s updated state | 0.0013282195 | 1.3282196e-05 | 100.00x |
+
+This confirms the isolated probe's finding generalizes past one `MatMul` to a
+real multi-node graph with a real Conv, a real SGD update, and simplify()
+in the loop.
+
+**Real hardware demonstration**: fed the identical late-training-scale weight
+state (`cw`/`gw` values ~100x smaller than phase 1's own calibration) and the
+identical batch/lr into both compiled models, 5 steps each:
+
+| model | fed | `cw[0]` before | `cw[0]` after | relative update |
+| --- | --- | --- | --- | --- |
+| phase 1 (calibrated for scale 0.05) | late-scale weights | 0.000152358538 | **0** | dead |
+| phase 2 (calibrated for scale 0.0005) | the same late-scale weights | 0.000152358538 | **0.000157334827** | **1.03266x** |
+| phase 1 (reference) | its own matching early-scale weights | 0.0152358543 | 0.0157334786 | 1.03266x |
+
+Phase 2 recovers the **exact same relative update** (1.03266x) that phase 1
+gets on weights at its own calibrated scale -- a real, correctly-proportioned
+SGD step -- while phase 1 fed the same late-scale state loses it completely,
+landing on exactly zero. This is the "swap to a recalibrated model when the
+current one's gradient dies" mechanism working end to end: the same weight
+*values* handed from one compiled model to the next (via ordinary host-side
+files -- `resident_runner.c`'s existing `.state<k>` convention, no
+graph-level coupling between the two compiles needed), only the calibration
+differs.
+
+**What this does and doesn't prove.** This demonstrates the mechanism with
+one real transition (2 phases, chosen and swapped by hand) -- not a 3-phase
+sweep, and not an automatic controller. Real, open costs and questions for
+whoever builds on this:
+
+- **A phase swap costs a full recompile** -- ~15s on this small graph, and
+  per the batching section's own numbers, 70-450s+ on the real resnet18
+  pipeline. Not free, and not something to do every few steps.
+- **How many phases a genuinely long run needs, and where to place the
+  boundaries, is open.** This demo used one 100x jump because that's the
+  ratio already validated on the isolated probe; a real schedule would likely
+  want smaller, more numerous steps, chosen from the actual gradient-decay
+  curve of a real training run rather than picked by hand.
+- **Triggering is manual here.** `finetune.LossScaler`'s existing
+  `zero_fraction`/`DEFAULT_UNDERFLOW` detector is the natural fit for
+  deciding *when* to swap (its role changes from "grow/backoff a scale" to
+  "signal a model swap"), but wiring that up, and actually swapping the
+  running `resident_runner` process out from under a live loop, is
+  unbuilt.
+- **Hiding the recompile cost** (building phase N+1 speculatively while phase
+  N is still training, so the swap is instant when it's needed) is a real,
+  unexplored option given a spare CPU core and Docker daemon are cheap
+  relative to the AX650N itself.
 
 ## Speed
 
@@ -952,6 +1115,145 @@ blocks of `layer4` (watch compile time; extrapolate from this block's 57.8s
 before jumping straight to all three) or the debug-tap check above to settle
 resnet50's own loss=0 question, not further architecture generalization
 work.
+
+## A memory-heavy case: Whisper-base encoder training
+
+Every case above -- resnet18d and resnet50d, both at 64x64 input with a
+handful of trainable convs -- was chosen small enough to stay well clear of
+Pulsar2's own compile-time wall (batching section above), and consequently
+never put real pressure on device memory either (the "Device memory"
+section's worst case, 8-way vNPU concurrency, was still only 6.1% of the
+card's 7040 MiB CMM). This section is the opposite choice, deliberately: a
+real-size Whisper-base encoder, trained deep and at its real sequence length,
+specifically to have a genuine "memory matters here" case on hand -- the
+motivation being a parallel investigation into recomputation/checkpointing
+and graph-scheduling techniques for cutting training memory, which needs an
+example where memory is actually the constraint to have anything to bite on.
+
+**Model:** `transformers.WhisperModel` with `openai/whisper-base`'s real
+config (`d_model=512`, `encoder_layers=6`, `encoder_attention_heads=8`,
+`encoder_ffn_dim=2048`), encoder only, at its real, unmodified input size --
+3000 mel frames, `max_source_positions=1500` -- not a shrunk `max_source_
+positions` the way the audio-speech op-coverage survey used to keep its
+export small (`docs/axera-audio-speech-op-coverage.md`'s reproduction
+snippet uses `max_source_positions=32`). 20,590,592 encoder parameters
+total, exported via `torch.onnx.export(..., opset_version=17, dynamo=False)`
+-- 340 nodes, confirming the survey's op-coverage finding at real scale, not
+just its toy one: `Add`, `Constant`, `Conv` (the frozen stem only), `Div`,
+`Erf`, `Identity`, `LayerNormalization`, `MatMul`, `Mul`, `Reshape`,
+`Softmax`, `Transpose` -- Erf-GELU, not the fused `Gelu` op, exactly as the
+survey found, so the raw-`Gelu`-has-no-backward-rule gap it flagged does not
+apply here either.
+
+**Two scopes trained, both the whole width of every chosen layer** (unlike
+resnet18/50's single trainable conv/block) -- picked by taking a suffix of
+the model's own float32 initializers in first-use (= layer) order, not a
+name-based layer selector (the exporter only keeps meaningful names for
+`layers.0`'s own tensors; every other layer's weights get generic
+`onnx::MatMul_NNN` names, so "last K layers" was carved out positionally):
+
+| scope | tensors | trainable params | step-graph nodes |
+| --- | --- | --- | --- |
+| `last_half` (roughly the last 3 of 6 layers) | 14 | 11,534,336 | 521 |
+| `full_encoder` (everything but the frozen conv stem) | 28 | 20,431,360 | 905 |
+
+Building either needed one real fix to `build_resident_step`'s own
+pipeline-order assumption, not specific to Whisper: `graph_grad.
+build_backward` demands a gradient rule for **every** node type it walks,
+`Constant` included, even though a zero-input op has nothing to backprop
+through. Whisper's Erf-GELU decomposition leaves several per-layer `Constant`
+nodes (the `0.5`/`sqrt(2)` literals) that a plain forward export never folds
+away, and resnet18/50 never exercised this path because their forward graphs
+happen not to have any. Fix: run `onnxsim.simplify()` (same skip list as
+the pipeline's own final pass, `fuse_matmul_add_bias_into_gemm`/`fuse_
+transpose_into_gemm` skipped, so as not to reshuffle which initializer name
+carries which weight before `params` is chosen) *before* `build_backward`,
+then fold whatever `Constant` nodes CSE didn't fully eliminate by hand (a
+`Constant` node is an initializer wearing a node's clothes -- same
+`TensorProto`, no inputs). One more real trap the same fold step walked
+into: the fused-QKV projection's `Split` node takes its per-output sizes as
+a second, `int64` **input**, and after CSE merges the six layers' identical
+size-list constants into one shared initializer, a naive "any float-typed
+node input" trainable-candidate scan would be fine (`int64` is excluded by
+construction) -- but a differently-written scan that also picks up
+newly-hand-folded scalars (the GELU/attention-scale literals, which *are*
+float32) needs an explicit rank check (`len(dims) >= 1`) to exclude them: a
+weight always has rank >= 1, a decomposition constant never does.
+
+**Correctness, verified on host, both scopes.** Per-element finite
+differences turned out to be the wrong tool at this scale: a 900-node graph
+reducing over 1500 x 512-element tensors accumulates enough fp32 rounding
+noise that a single perturbed weight element's loss delta is swamped by
+noise at any reasonable epsilon (confirmed directly -- the "finite-difference
+gradient" for 5 of 6 first-tried elements was itself just fp32 ULP noise on
+the loss, an exact multiple of ~1.19e-7). The standard fix for graphs this
+size is a **directional** check instead of a per-element one: take the full
+gradient tensor the graph itself computed for one trainable weight
+(`g = w - w_next`, since `w_next = w - lr*grad`), step `t` units along `-g`,
+and confirm the loss falls by the amount local curvature predicts. Checked
+at `t` in `{1e4, 1e6, 1e8}` against 6 (`last_half`) and 8 (`full_encoder`)
+sampled tensors: **monotonic loss decrease at every step size below the
+point where a nonlinear network's local linear approximation should be
+expected to break down**, with actual-vs-predicted first-order drop ratios
+of 0.3-0.9 -- the right sign, the right order of magnitude, and the right
+qualitative shape (undershooting the linear prediction as curvature bends
+the descent, exactly what a locally-convex loss surface does), which is the
+standard evidence bar a directional gradient check is held to.
+
+**Real device memory, `last_half`:** compiled cleanly via `pulsar2_docker.
+build()` in 454.7s (7.6 min -- well inside the batching section's demonstrated
+wall, this is a bigger graph than any batch-scaling point that blew up past
+25 minutes there, but node *count* and matmul *shape* drive Pulsar2's compile
+time more than raw depth, the same finding the resnet50 section made), one
+fused NPU subgraph, 101,154,816,000 MACs per Pulsar2's own reported count,
+17.8 MB `.axmodel`. Queried with the real, verified `axclrtEngineGetUsage()`
+API (`docs/`'s own "Device memory" section above) straight from the compiled
+file, no device execution needed: **142.4 MiB CMM** -- 5.5-9.3x every case
+measured before it (resnet18 15.3 MiB, resnet50 25.7 MiB), and this is only
+the *half*-encoder scope.
+
+**`full_encoder` does not compile, and neither does the obvious fix.**
+Training every non-stem tensor promotes the LayerNorm affine (scale) that
+every one of the 13 `LayerNormalization` nodes shares -- PyTorch's default
+init (`weight=1`, `bias=0`) makes all 13 layers' affine params bit-identical,
+so CSE had already merged them into one shared initializer before any of
+this pipeline's own code ran. Promoting that one shared tensor to state
+therefore makes *every* `LayerNormalization` in the graph live at once, and
+Pulsar2's frontend hard-errors on it: `KeyError('layers.0.self_attn_layer_
+norm.weight')`, thrown from its own native-parser's reference-attribute
+lookup, not a graceful "unsupported" diagnostic -- a live-weight
+`LayerNormalization` is a real, unfixed gap in this pipeline's legalization
+coverage (`legalize.TRAINING_RULES` has no rule that does for `LayerNorm`
+what `_linearize_trainable_convs`/`act_weight_conv_to_matmul` do for `Conv`
+with a live weight). Freezing just that one shared tensor
+(`full_encoder_no_ln`, 27 of 28 tensors, 20,430,848 of 20,431,360
+params -- 99.998% of the same trainable weight, host-verified the same way,
+directional checks passing at the same ratios) gets past the frontend, but
+hits a **second, different** wall at the NPU backend's tiling stage:
+`TileFailException("AxQuantizedAdd, tuple index out of range")` on a
+`(2048,)`-shaped `Add` deep in the FFN's own SGD-update arithmetic --
+internal to Pulsar2's closed-source scheduler, not diagnosable from the ONNX
+side the way the frontend `KeyError` was, and not chased further here (this
+is where the resnet18 quantize/dequant work stopped too, at a comparable
+"the compiler's own internals, not ours" wall).
+
+**Where this leaves the recomputation/scheduling investigation:** one fully
+working, host-verified, **real-hardware-measured** case (`last_half`,
+142.4 MiB CMM, 5.5-9.3x every prior case) plus two well-diagnosed compile
+walls mapping out where the *bigger* scopes actually stop, rather than a
+vague "probably doesn't scale." Both walls are legalization/compiler gaps a
+future pass could plausibly close (a live-weight-`LayerNormalization` rule
+for the first; the second needs a Pulsar2-side bug report or a workaround
+that avoids whatever shape/dtype combination trips its tiler), not
+fundamental limits -- so `last_half`'s 142.4 MiB is a floor for how memory-
+heavy a real Whisper training case can get on this pipeline today, not a
+ceiling. The pipeline needed no Whisper-specific change to get this far
+beyond the `Constant`-folding fix above (now upstreamed into
+`build_resident_step` itself, not left as a one-off script) -- a real
+confirmation that `build_resident_train_step.py` generalizes past CNNs to
+attention architectures with no new legalization rules for anything that
+*did* compile, matching resnet50's own "no code changes needed" finding for
+a second architecture in a row.
 
 ## What to do next
 
