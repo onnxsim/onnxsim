@@ -401,6 +401,83 @@ whoever builds on this:
   unexplored option given a spare CPU core and Docker daemon are cheap
   relative to the AX650N itself.
 
+### Reducing the per-phase recompile cost: what actually drives it, and one real lever
+
+Real recompile cost matters at scale: at resnet18 batch 8's ~28.5 steps/s and
+a ~5,000-step-per-phase ceiling, one phase's own training time (~175 s) is
+*shorter* than its own recompile (70-450 s+ depending on batch) -- a long
+multi-phase run would spend more wall-clock recompiling than training.
+Investigated four ways to cut that cost, on a real resnet18 step graph
+(`resnet18d_folded.onnx`, last-4-layers trainable, rebuilt fresh from
+`scripts/axera/resnet18-dedupe-fanout` scratch since the earlier note that it
+was "no longer present" turned out to be about a different scratch dir):
+
+**1. Staged timing, real breakdown.** A real batch-1 build's own timestamped
+log splits cleanly: extract/frontend-optimize (~0.8 s), quant/calibration
+passes (~2 s), then **`compile npu subgraph` -- the NPU backend's own
+tiling/dependency/execution-unit-assignment scheduler -- for ~32 s** (`build
+op serially` 7 s, `calc output dependencies` 8 s, `assign eu heuristic` 9 s,
+`build jobs` 4 s), then `assemble model`/`fuse subgraph` for another ~12 s.
+**The NPU backend scheduling stage is where the time actually goes** -- not
+quantization/calibration, confirming (from the compiler's own log, not
+inference) that recalibration was never going to be free regardless of how
+it's triggered, because the expensive stage runs on the *quantized* graph
+regardless of what its calibration values are.
+
+**2. No documented mode skips it.** `pulsar2 build --help`'s full option
+list (`--quant.*`, `--compiler.*`, `--model_type {ONNX,QuantAxModel,
+QuantONNX}`) has no incremental-build, cache, or scheduler-reuse flag.
+`--model_type QuantAxModel` (feed an already-quantized graph in) would only
+skip the ~2 s quant stage, not the ~32 s scheduling stage that dominates --
+not worth pursuing for this specifically.
+
+**3. Determinism-pinning re-checked, still dead, now with a real number at
+this scale too.** Rebuilding the *identical* batch-1 graph+calibration twice
+produced `compiled.axmodel`s of different length (8,955,471 vs 8,955,431
+bytes) with 1.9% of the shared prefix differing -- confirms PR
+#1344/#1353's non-determinism finding generalizes to this model, and no
+`--seed`/determinism flag exists in the CLI to pin it. mcode-level
+patching remains dead for the reason already established: recompile noise
+and a genuine calibration change are not reliably distinguishable in size.
+
+**4. The frozen/trainable split: real, but not for the reason expected.**
+Hypothesis: since only the trainable tail's calibration changes between
+phases, compiling *only* the trainable tail (feeding the frozen backbone's
+boundary activation in as a graph input, frozen backbone compiled once and
+reused) should make the per-phase recompile track the tail's size, not the
+whole model's. Tested by cutting the graph at the real block boundary
+(`/layer3/layer3.1/act2/Relu_output_0`, the tensor feeding both layer4's
+main and shortcut branches) via manual forward-BFS extraction (`onnx.utils.
+extract_model` hit an internal topological-sort bug on this graph -- worked
+around, not investigated further, not this project's bug to fix) --
+**56-node frozen-included forward down to a 15-node tail-only forward, 136
+total step-graph nodes down to 95. Compile time: unchanged.** The NPU
+backend stage was still ~32 s (31.97 s vs. the full model's 31.95 s) --
+removing 41 frozen nodes bought **nothing**. Went further: cut all the way
+to *only* `fc.weight` trainable (a single `Gemm` forward, one node, 16-node
+step graph) -- **that** compiled in 16.7 s total, NPU backend stage collapsed
+to **0.18 s**. **The real driver isn't total node count or which part is
+frozen -- it's the trainable tail's own convolution-backward complexity**
+(the im2col-as-gather tap expansion `_linearize_trainable_convs` emits for
+each trained `Conv`, not anything in the frozen backbone). Splitting frozen
+from trainable is architecturally sound (AXCL can chain two resident models
+via a host-mediated device-to-device copy between `Execute()` calls, the
+same pattern this project's vNPU-concurrency work already uses for multiple
+resident models) but **doesn't save anything on its own** when the trainable
+tail still contains the expensive part -- confirmed by measurement, not
+assumed, so not prototyped further given it wouldn't pay off as hypothesized.
+
+**The one real, actionable lever this surfaced**: per-phase recompile cost
+scales with how many convolutions are in the *trainable* tail, not with
+model depth or total node count. A multi-phase schedule that trains fewer
+(or zero) convolutions per phase -- e.g. `fc.weight`-only phases, falling
+back to the full last-4-layers scope only for an initial or final phase --
+would make most phase transitions cost ~17 s instead of ~70-450 s+, at the
+price of a narrower trainable scope for those phases. Untested: whether
+`fc.weight`-only phases still rescue the gradient the way the 2-phase
+Conv+Gemm demo above did -- a real next step, not assumed to follow from
+this compile-time finding alone.
+
 ## Speed
 
 `axcl_run_model` costs ~580 ms per invocation (process start, device open,
