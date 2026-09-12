@@ -238,6 +238,85 @@ def test_a_student_identical_to_the_reference_has_nothing_to_learn():
     assert losses[0] == pytest.approx(0.0, abs=1e-12)
 
 
+def _upstream_shift_pair(rng, noise=0.5):
+    """A reference and a student sharing the block's own weight (``W2``) but
+    diverging *upstream* of it (``W1``) -- the shape of an accelerator-
+    specific change (e.g. a Resize node's mode swapped for one a deployment
+    target supports) feeding a trained layer, rather than a quantized or
+    pruned weight *inside* the block. ``block_input_name="H"`` below puts
+    the divergence entirely outside the block, so the block itself (``H`` ->
+    ``Y``) starts out byte-identical between the two models.
+    """
+    w1 = rng.normal(0, 0.3, (D, D)).astype(np.float32)
+    w2 = rng.normal(0, 0.3, (D, D)).astype(np.float32)
+    shifted_w1 = w1 + rng.normal(0, noise, w1.shape).astype(np.float32)
+    return _mlp(w1, w2), _mlp(shifted_w1, w2)
+
+
+def test_teacher_forced_inputs_true_cannot_fix_a_change_upstream_of_the_block():
+    """The default's blind spot, pinned the same way
+    ``test_a_student_identical_to_the_reference_has_nothing_to_learn`` pins
+    the whole-model-identical case.
+
+    ``teacher_forced_inputs`` defaults to ``True``: the block's own external
+    input (``H``) is captured from the *reference*, never the student, so
+    the student's block runs on exactly the reference's own activation --
+    and since ``W2`` already matches the reference's, it reproduces the
+    reference's ``Y`` exactly, however much ``W1`` (entirely outside the
+    block) has changed. A flat zero loss here is not a bug; it is this
+    option's documented scope.
+    """
+    rng = np.random.default_rng(40)
+    reference, student = _upstream_shift_pair(rng)
+    losses: list = []
+    onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "H",
+        "Y",
+        calibration_data=_data(rng),
+        num_iterations=50,
+        learning_rate=2e-2,
+        losses=losses,
+    )
+    assert all(loss == pytest.approx(0.0, abs=1e-9) for loss in losses)
+
+
+def test_teacher_forced_inputs_false_recovers_an_upstream_activation_shift():
+    """The capability ``teacher_forced_inputs=False`` adds: training the
+    block against the activation it will *actually* receive at inference,
+    not the reference's.
+
+    Same models as the test above -- ``W2`` starts identical, only ``W1``
+    (outside the block) differs -- but now the block's external input is
+    captured from the student, so there is something to learn from the
+    first step, and the block's own weight can move to partially compensate
+    for what changed upstream of it.
+    """
+    rng = np.random.default_rng(41)
+    reference, student = _upstream_shift_pair(rng)
+    data = _data(rng, batches=32)
+    held_out = _data(rng, batches=8)
+    before = _held_out_error(student, reference, held_out)
+
+    losses: list = []
+    tuned = onnxsim.apply_block_finetune(
+        reference,
+        student,
+        "H",
+        "Y",
+        calibration_data=data,
+        num_iterations=300,
+        learning_rate=2e-2,
+        teacher_forced_inputs=False,
+        losses=losses,
+    )
+    # Unlike the teacher-forced case above, there is a real objective here.
+    assert losses[0] > 1e-3
+    assert losses[-1] < losses[0] / 2
+    assert _held_out_error(tuned, reference, held_out) < before
+
+
 def test_the_master_weight_is_seeded_from_the_student_not_the_reference():
     """The semantic difference from :func:`onnxsim.apply_qat`, made visible.
 

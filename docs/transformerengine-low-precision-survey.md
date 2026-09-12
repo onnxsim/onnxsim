@@ -216,14 +216,85 @@ turns out too high on a real arithmetic-heavy graph.
   Weight-rounding-specific, not applicable to the activation/gradient
   problem this survey was scoped to, but worth knowing exists.
 
+## Follow-up: real-scale test, and `highest_mix_precision` does not survive contact with a real architecture
+
+Tested on the two real models this project actually cares about, not just
+the tiny probe above. **Both failed to compile -- with two different, real
+NPU-backend implementation limits, not a correctness or calibration
+problem.**
+
+**Whisper `last_half`** (the real 523-node, 11,534,336-trainable-param step
+graph from PR #1357/#1359): the standard INT8 build reproduced its
+established 460.3s compile time exactly (sanity-checking that nothing else
+had drifted). `highest_mix_precision: true` fails after 46.7s with a real
+`TileFailException` on the very first `AxLayerNorm`:
+
+```
+TileFailException("AxLayerNorm, ... output_dtype: 'FP32' ...
+    inputs: {'x': Tensor(FP32, ..., shape=(1, 1500, 512), ...)}
+    mem_limit: MemLimit(workspace=524288, max_mem_size=3141632)")
+```
+
+An FP32 LayerNorm over a real `(1, 1500, 512)` activation exceeds the NPU
+backend's own tiling workspace limit -- the same failure *class* PR #1351
+already found for `full_encoder`'s shared-LayerNorm case, now confirmed for
+a *different* reason (FP32 memory footprint, not a live-weight/CSE conflict)
+on the smaller `last_half` scope that otherwise compiles fine at INT8.
+Tried the obvious partial-FP32 workaround this doc's own "what this doesn't
+cover" section proposed -- a `layer_configs` entry forcing
+`LayerNormalization` back to `U8` alongside `highest_mix_precision: true` --
+and it does **not** compose: the identical error recurs, `output_dtype`
+still reads `'FP32'`. `highest_mix_precision` is confirmed non-overridable
+per-op, exactly as its blunt whole-graph behavior on the probe already
+suggested; there is no cheaper partial-FP32 build available this way.
+
+**resnet18** (the established 136-node, last-4-layers-trainable step graph):
+standard INT8 reproduced its established ~62-70s compile time (65.9s here).
+`highest_mix_precision: true` fails after 17.2s with a **different** real
+error -- not a tiling *limit* this time but an actual exception inside
+Pulsar2's own closed-source scheduler:
+
+```
+TileFailException("AxAvgPool, '>' not supported between instances of
+'list' and 'int' ...
+    attrs: {..., 'output_dtype': 'FP32'} ...")
+```
+
+A Python-level `TypeError` inside Pulsar2's own tiling code when it hits an
+`AvgPool` forced to FP32 -- resnet18d's own avgpool-downsample shortcut
+(this architecture family's own signature "d" variant trick, present in the
+frozen backbone every forward pass runs through, not something the trainable
+tail's own scope can avoid). This is a real bug in Pulsar2's FP32 handling
+for this op, not a resource limit or a configuration mistake.
+
+**Conclusion: `highest_mix_precision`'s exact-float-agreement result is real
+and reproducible on the tiny Conv+Gemm probe, but the mechanism does not
+currently survive on either real architecture this project has built a
+training step for.** Both failures are specific, named, real NPU-backend
+implementation gaps (an FP32 `LayerNorm` tiling-workspace limit; an FP32
+`AvgPool` internal `TypeError`) -- not evidence the *quantization math* is
+wrong, and not something a different calibration or graph restructuring on
+this project's side can route around, since the failure is inside Pulsar2's
+own closed-source scheduler reacting to `output_dtype: 'FP32'` on ops this
+project's real graphs already contain. The honest read: `highest_mix_precision`
+is a genuine, confirmed capability of the compiler, gated behind real bugs
+in its own FP32 tiling support for at least two ordinary op types (LayerNorm,
+AvgPool) that appear in almost any real model. Worth revisiting if a newer
+Pulsar2 release fixes either, or if a future task finds which *other* op
+types' FP32 paths are actually solid (the probe's `MatMul`/`Sub`/`Reshape`/
+etc. all worked) -- narrowly targeting `highest_mix_precision` at a subgraph
+that avoids `LayerNorm`/`AvgPool` entirely might still be viable, but that is
+untested and would need its own real check, not assumed from this result.
+
 ## What this doesn't cover
 
-- No real-graph-scale (resnet18/Whisper) timing measurement of
-  `highest_mix_precision` -- the single most important open question this
-  survey leaves, given how strong the correctness result is.
-- No test of `highest_mix_precision` against Whisper specifically, or of
-  whether `layer_configs` targeting composes with it to get a cheaper
-  partial-FP32 build.
+- Whether some other real model/subgraph shape -- one that avoids `LayerNorm`
+  and `AvgPool` specifically -- would let `highest_mix_precision` actually
+  compile and run at real scale. Not tested; the two architectures this
+  project actually has both hit one of these two ops.
+- Whether Pulsar2 7.0-lite is the only affected version, or whether a
+  different Pulsar2 release has more complete FP32 tiling support for these
+  ops -- not checked.
 - The `PER_BLOCK` policy question (whether it's requestable for a non-weight
   tensor via some mechanism not visible in `build_config.proto` alone) is
   left open, not resolved.

@@ -1713,10 +1713,23 @@ step time than the standard build (0.250ms vs. 0.266ms min). This is a
 stronger, more complete result than the FP32-seed plateau (PR #1353) or the
 build-time-locked calibration swap (PR #1355/#1356): no plateau, nothing to
 recompile per regime, exact float agreement, through the exact `MatMul`
-boundary nothing else reached. **Untested**: whether it holds its (apparent)
-speed at real graph scale (resnet18/Whisper) rather than this tiny probe's
-overhead-dominated regime, and whether it fixes Whisper's SNR-floor failure
-specifically -- the natural, concrete next step.
+boundary nothing else reached. **Tested at real scale, and it does not
+survive contact with either real architecture this project has.** Whisper
+`last_half` (523 nodes, 460.3s INT8 baseline reconfirmed) fails
+`highest_mix_precision` after 46.7s with a real `TileFailException` on the
+first `AxLayerNorm` -- an FP32 `(1,1500,512)` LayerNorm exceeds the NPU
+backend's own tiling workspace limit; a `layer_configs` attempt to force
+just that op back to `U8` does not compose (`highest_mix_precision`
+confirmed non-overridable per-op). resnet18 (136 nodes, 65.9s INT8 baseline
+reconfirmed) fails after 17.2s with a *different* real error -- an actual
+Python `TypeError` inside Pulsar2's own scheduler (`'>' not supported
+between instances of 'list' and 'int'`) when its `AvgPool` (resnet18d's own
+avgpool-downsample shortcut, in the frozen backbone, unavoidable) is forced
+to FP32. Both are real, named NPU-backend implementation gaps in Pulsar2's
+own FP32 tiling support -- not a quantization-math problem, and not
+something recalibration or graph restructuring on this project's side can
+route around. Full writeup and exact tracebacks:
+`docs/transformerengine-low-precision-survey.md`'s follow-up section.
 
 Also built, as a genuinely portable idea separated from TE's own
 CUDA-specific mechanism: `scripts/axera/amax_calibration.py`, a rolling

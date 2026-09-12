@@ -42,7 +42,19 @@ if HERE not in sys.path:
 import build_resident_train_step as brts  # noqa: E402
 
 
-def _export_feature_extractor(onnx_path: str) -> None:
+def _export_feature_extractor(onnx_path: str, batch: int = 1) -> None:
+    """Exports with a *static* leading dim of `batch` -- not a dynamic axis.
+
+    Every trainable-weight training-step graph in this pipeline (resnet18,
+    Whisper) is built from a static-batch export and gets its batch scaled
+    later via `build_resident_train_step.set_batch()`. That trick doesn't
+    apply cleanly here: `build()` below bakes a `flatten_shape` initializer
+    from the *exported* batch dim (the CNN feature extractor's per-sample
+    output length depends on the input's own static shape through several
+    strided Conv1D layers, unlike resnet18's pooling-then-Gemm tail, which
+    is batch-shape-agnostic downstream of `x`). So batch is a real *export*
+    parameter here, not a post-hoc graph edit -- see `build`'s own docstring.
+    """
     import torch
     import torch.nn as nn
     from transformers import Wav2Vec2Model
@@ -57,7 +69,7 @@ def _export_feature_extractor(onnx_path: str) -> None:
         def forward(self, x):
             return self.fe(x)
 
-    x = torch.randn(1, 4000)
+    x = torch.randn(batch, 4000)
     torch.onnx.export(
         Wrapped(fe),
         (x,),
@@ -100,11 +112,11 @@ def _unsqueeze_to_reshape(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
-def build(out_path: str, param: str = "fe.conv_layers.0.conv.weight"):
+def build(out_path: str, param: str = "fe.conv_layers.0.conv.weight", batch: int = 1):
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
-        _export_feature_extractor(f.name)
+        _export_feature_extractor(f.name, batch=batch)
         model = onnx.load(f.name)
 
     model = _unsqueeze_to_reshape(model)
@@ -146,8 +158,9 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("out_path")
     p.add_argument("--param", default="fe.conv_layers.0.conv.weight")
+    p.add_argument("--batch", type=int, default=1)
     args = p.parse_args(argv)
-    step_model, state = build(args.out_path, args.param)
+    step_model, state = build(args.out_path, args.param, batch=args.batch)
     print(f"wrote {args.out_path}: {len(step_model.graph.node)} nodes, state={state}")
     return 0
 

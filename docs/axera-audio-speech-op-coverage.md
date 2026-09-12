@@ -415,3 +415,176 @@ scaled `x`/weight statistics, following PR #1354's confirmed textbook-MinMax
 calibration behavior, or PR #1346's own fix pattern) rather than a config
 flag, and is the concrete next step for whoever wants this model actually
 training multiple real steps on hardware.
+
+### Fixed: real calibration data, and a second, distinct degenerate-range bug in `lr` -- the first real multi-step audio training result on this hardware
+
+Measured this model's real trajectory on host first, rather than guessing:
+8 real float32 SGD steps (`x_scale=1.0`, `y` ~N(0, 0.01), the real exported
+`fe.conv_layers.0.conv.weight` initializer, not a `weight_scale=0.05` draw)
+gave mean\|grad\| ~1.4-1.8e-4, the weight itself essentially unmoving at
+`lr=1e-4` -- confirming the ~0.032 ratio finding above and giving real
+numbers to calibrate against, instead of the arbitrary `x_scale=0.3`/
+`weight_scale=0.05` defaults the previous section's build used.
+
+Rebuilt calibration with `make_training_calib.py`'s `real_data=` override:
+`x_scale=1.0`, `weight_scale=0.36` (the real initializer's own mean\|w\|),
+and `real_data={"fe.conv_layers.0.conv.weight": <8-step w trajectory>, "y":
+<8-step y trajectory>, "grad_seed": [1.0]*6}`. Compiled cleanly. On real
+hardware, with real (not `memset`-pattern) `x`/`y` fed via host files: loss
+now reads a real, sensible `0.0754611` (matching the host trajectory's
+0.073-0.082 range) instead of the previous exact `0`, confirming the input
+calibration fix alone was real and correct.
+
+**But the weight still froze bit-identical from step 1 on.** Diagnosed
+rather than assumed: swept `lr` from 0.01 to 10000 at runtime and got
+**bit-identical loss and weight at every value** -- the same "calibrated
+narrowly, pins to a constant regardless of runtime input" signature PR
+#1353 found for `grad_seed` on a different model, this time on `lr`.
+Confirmed the cause directly: `make_training_calib.py`'s hardcoded `elif
+inp.name == "lr": arr = np.array([1e-4], ...)` branch feeds the *identical*
+value for all `n` calibration samples, so MinMax computes a zero-width
+range and the compiled model can only represent that one value -- runtime
+`lr` is silently clipped to it regardless of what's actually fed. This is a
+second, distinct bug from the input-calibration mismatch above, not a
+restatement of it, and it generalizes: any Axera training build with a
+scalar runtime input calibrated from constant samples (this project's own
+default for both `grad_seed`, historically, and `lr`, still) has this
+failure mode latent, whether or not it happens to matter for a given
+model's own trainable magnitude.
+
+Fixed by giving `lr` a real *spread* in its calibration data instead of a
+constant (`real_data={"lr": [0.01, 0.1, 1.0, 10.0, 100.0, 1.0]}`, spanning
+the range this test actually swept). Recompiled, reran on real hardware:
+
+| lr | step 0 loss | step 7 loss | step 0 `w[0]` | step 7 `w[0]` |
+| --- | --- | --- | --- | --- |
+| 0.01, 1.0 | 0.0754611 (unchanged) | 0.0754611 (unchanged) | frozen | frozen |
+| 10 | 0.0735344 | 0.0693600 | frozen | frozen |
+| **100** | **0.04335** | **0.0240833** | **-0.2461140752** | **-0.1757957637** |
+
+At `lr=100`, both loss and the tracked weight element move smoothly and
+**monotonically across all 8 real steps, with no freezing at any point** --
+genuine, resolvable gradient descent on real AX650N hardware. At `lr=10`,
+loss also moves monotonically (0.0735 -> 0.0694) while `w[0]` specifically
+stays frozen -- plausibly a different weight channel's own gradient
+dominates the visible loss movement at that scale while `w[0]`'s own share
+stays sub-quantization-step; not chased further, since the `lr=100` result
+already answers the question this section exists to settle. `lr=0.01`/`1.0`
+still freeze completely -- consistent with the true per-step update
+(~lr x 1.4e-4) staying below one quantization level of the weight-state
+output's own calibrated range at those scales, not a remaining bug.
+
+**This is the first real, fully-working, multi-step training result on any
+audio/speech model in this project's history** -- not just "compiles" or
+"one real step then dies," but a real loss curve moving in the right
+direction across a real hardware run. Both fixes were calibration-only (real
+input statistics instead of arbitrary defaults; a non-degenerate `lr`
+range instead of a single repeated value) -- no graph, `legalize.py`, or
+compiler-flag change was needed, unlike Whisper's and resnet18/50's own
+paths past their respective ceilings.
+
+**Flagged, not fixed here**: the same degenerate-constant-calibration bug
+almost certainly affects every prior Axera build's `lr` input (all of
+which used the same hardcoded `1e-4` constant), and `grad_seed` had the
+*opposite* problem in this build specifically -- `make_training_calib.py`
+has no `grad_seed`-aware branch at all, so it silently fell into the
+generic `weight_scale`-noise path before this fix's `real_data` override
+caught it. Whether this explains any part of PR #1353's own "seed sweep
+returns bit-identical gradients at every value" finding on a *different*
+model is an open, real question this task did not have scope to chase --
+noted here as a concrete follow-on, not asserted.
+
+### Batching and vNPU concurrency: vNPU compounds cleanly at batch=1, batching itself regresses correctness
+
+Applied this project's two already-proven speed levers (batching, PR #1342;
+vNPU concurrency, PR #1345/#1346) to the now-working feature-extractor case
+-- the first real audio model where this is worth trying.
+
+**Made the training-step graph batch-parametric.** Unlike resnet18's
+`set_batch()` (a post-hoc shape edit, since nothing downstream of `x` bakes
+a batch-specific constant), this model's `build()` computes a `flatten_shape`
+initializer from the *exported* batch dim -- Conv1D's per-sample output
+length threads through several strided layers before the manual flatten step,
+unlike resnet18's pooling-then-Gemm tail. So batch is a real **export**
+parameter here (`_export_feature_extractor(..., batch=N)`,
+`torch.randn(N, 4000)`), not a graph edit after the fact --
+`build_w2v2fe_batch_calib.py` is the new driver. Confirmed the raw export's
+own op sequence is identical at batch 1 and 4 (74 nodes, same op list) before
+trusting anything downstream. Host-verified the batched graph's gradient
+correctness the way `test_set_batch_gradient_is_the_mean_of_per_sample_
+gradients` already does for resnet18: batch=4's returned gradient matches
+the mean of four separately-run batch=1 gradients to 3.2e-5 relative error
+-- but only once every non-trainable layer's random initialization was
+pinned identical across the two builds (`torch.manual_seed(42)` before each
+export) -- the first attempt compared two *differently randomly initialized*
+models and failed at ~116% relative error, a test-methodology bug, not a
+graph bug, caught before it was mistaken for one.
+
+**Real hardware, batch=1 (correctness already confirmed above): both levers
+work.**
+
+| config | throughput | notes |
+| --- | --- | --- |
+| solo (`AXCL_VNPU_DISABLE`) | 164.3 steps/s | min 5.590ms/step |
+| 4x concurrent (`-v`) | 519.2 steps/s aggregate | 3.16x solo |
+| 8x concurrent (`-v`) | 607.9 steps/s aggregate | 3.70x solo |
+
+Confirmed non-corrupting first, the same check PR #1345 used: `-v` and
+non-`-v` runs of the same model produce bit-identical loss/weight
+trajectories, only step timing differs. The sub-linear scaling shape (3.16x
+at N=4, 3.70x at N=8, saturating) matches resnet18's own qualitative finding
+(2.53x at N=8) -- vNPU concurrency generalizes to this architecture.
+
+**Real hardware, batch=4/8: fixed -- a third calibration bug, same class as
+the first two, on a tensor nobody had calibrated at all.** Direct
+`quant_axmodel.json` inspection (the same method PR #1346/#1370 used)
+traced the frozen gradient to the raw pre-`lr`-scaling gradient tensor
+(`resident_step__reshape_406`, feeding `Mul_124: lr * grad`): its calibrated
+range was `[-5.4e-5, 6.8e-5]` (scale `4.79e-7`), while a real batch=4
+forward+backward at the intended `grad_seed=1.0` produces gradients up to
+`1.87e-3` -- **~27x too narrow**, saturating almost the entire tensor.
+Root cause: `grad_seed` (the backward-pass seed multiplying the *entire*
+gradient before it ever reaches this tensor) had **never been given
+`real_data` calibration anywhere in this pipeline, not even at batch=1** --
+it fell through to `make_training_calib.py`'s generic
+`weight_scale=0.05`-scaled random-draw branch, producing calibration values
+near 0 rather than the real runtime value of 1.0. Same bug *class* as PR
+#1370's `lr` fix (a scalar multiplier whose calibration was never matched to
+its real runtime usage) on a *different* scalar -- batch=1 happened not to
+manifest it (its naturally larger unbatched gradient apparently still fit
+inside the resulting undersized range), batch=4/8's more-averaged gradient
+did not.
+
+Fixed by adding `real_data` for `grad_seed` (jittered around 1.0, matching
+the `lr` fix's own pattern) to `build_w2v2fe_batch_calib.py`. Confirmed on
+the compiled model: the raw-gradient scale widened `4.79e-7 -> 1.41e-5`
+(~29x, matching the ~27x under-calibration found). **Real hardware, batch=4,
+8 steps, `lr=100`: loss moves smoothly and monotonically -- `1.02927 ->
+0.98068`** -- where it was bit-identical before. (The tracked weight
+readback itself steps in coarse ~0.0102 increments across a few repeated
+values -- expected, not a bug: that tensor's own state-output quantization
+scale is `0.01018`, so consecutive real updates smaller than one
+quantization step legitimately round to the same U8 code; loss, quantized
+far more finely relative to its own dynamic range, is the reliable signal
+here, the same distinction PR #1346's per-sample-vs-final-scalar debug tap
+already established.)
+
+Real step times, now trustworthy since correctness is confirmed at batch=4:
+
+| batch | step time (min/avg) | cmm |
+| --- | --- | --- |
+| 1 | 5.590ms / 5.865ms | 11.039 MiB |
+| 4 | 18.838ms / 19.353ms | 25.534 MiB |
+
+Batch=8 was not re-verified in this pass (the same `grad_seed` fix should
+apply identically, since the bug and fix are batch-size-independent in
+mechanism -- flagged as the remaining confirmation step, not assumed).
+vNPU+batching compounding was not re-checked here either -- both are now
+individually real, but composing them is a follow-on, not done in this pass.
+
+**Net**: three real calibration bugs found and fixed for this model across
+PRs #1367/#1370/this fix -- `x_scale`/`weight_scale` mismatch, degenerate
+constant-`lr` range, and now uncalibrated `grad_seed` -- all in the same
+family (a scalar or tensor whose calibration data was never matched to its
+real runtime distribution). Batching is now confirmed working at batch=4;
+batch=8 and vNPU+batch composition remain open, low-risk follow-ons.
