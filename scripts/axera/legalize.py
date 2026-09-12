@@ -342,6 +342,17 @@ def neg_to_mul(model):
     `Neg` is the one op `onnxsim.graph_grad` emits that is absent from
     `AX650_SUPPORTED_OPS` -- differentiating a subtraction produces exactly
     one of them, so every backward pass hits it. The rewrite is exact.
+
+    Also has a target-agnostic C++ counterpart in onnxsim's own core
+    (`onnxsim/passes/neg_to_mul.h`), usable from any binding via
+    `onnxsim.simplify(model, extra_optimizers=["neg_to_mul"])` -- see
+    `tests/test_neg_to_mul.py`. This module's own version stays: it needs
+    nothing beyond the `onnx` package (no onnxsim build), which
+    `legalize.py in.onnx out.onnx`'s standalone-script usage depends on.
+    Both versions assume `float32` (this one emits a `float32` constant
+    unconditionally; the core pass checks and declines other element types
+    rather than emitting a mismatched one) -- fine for this project's own
+    float32 training graphs, not a general-dtype guarantee either way.
     """
     changed = 0
     for node in model.graph.node:
