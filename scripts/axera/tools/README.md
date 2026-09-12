@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Seven small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Eight small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -71,6 +71,20 @@ prefill cannot be timed with the shipped CLI. These talk to
   `x`/`y` from fixed host files (`/root/whisper_x.bin`/`whisper_y.bin`) so
   the same batch can be reused across differently-calibrated compiles of
   the same graph shape.
+- `gather_runner.c` -- resident runner for the two I/O layouts
+  `build_resident_train_step.py`'s `add_resident_dataset()` work produces:
+  the plain baseline (`x y state[4] lr grad_seed`, `-g` omitted) and the
+  resident-dataset variant (`batch_index state[4] lr grad_seed`, `-g`) --
+  a single binary switches layout via the flag rather than needing a
+  separate copy per shape the way the Whisper runner did. Explicitly feeds
+  `grad_seed`, which neither `resident_runner.c` nor
+  `whisper_resident_runner.c` actually does (both allocate its buffer but
+  never write it -- a real, separate latent gap found while building this).
+  See the handoff doc's "Trading free memory for throughput" section: the
+  baseline mode confirmed this project's established resnet18 numbers;
+  `-g` mode is written and correct but has nothing to run yet, since the
+  `Gather`-off-a-resident-dataset variant doesn't currently compile on real
+  hardware (a genuine Pulsar2 NPU-backend gap, not a bug in this runner).
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):

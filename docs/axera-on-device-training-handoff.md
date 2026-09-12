@@ -1023,6 +1023,70 @@ likely what `axcl-smi`'s own aggregate row queries) exists but was **not**
 verified here -- flagged as an unconfirmed lead, not a fact, following this
 doc's own standard of not claiming a header's presence as working capability.
 
+### Trading free memory for throughput: `Gather` off a resident dataset -- a real Pulsar2 backend gap, not a shape or scale issue
+
+Given how much CMM sits idle even at 8-way vNPU concurrency (above), the
+obvious next question: could a training step stop re-uploading a fresh `x`/`y`
+batch every step (`resident_runner.c`'s main loop does this even though the
+weight *state* is already resident) by keeping a whole dataset resident
+on-device instead, and `Gather`-ing each step's minibatch rows from it --
+`onnxsim.qat_graph`'s own module docstring documents exactly this trade
+("the whole set stays resident and the graph selects rows"), never applied to
+this pipeline.
+
+`build_resident_train_step.add_resident_dataset()` does this: bakes a
+`[N, ...]` array in as a plain graph initializer and replaces `x`/`y` with
+`Gather(dataset, batch_index)`, so per-step host traffic drops to a handful of
+`int64` row indices. Host-verified exactly: gathered-minibatch training
+produces gradients and loss identical (rtol 1e-5) to feeding the same rows
+directly -- correctness is not in question.
+
+**It does not currently compile for real hardware, at any dataset size
+tried, and the reason is a genuine Pulsar2 NPU-backend gap, not a shape
+choice or a size threshold.** Built the real resnet18 (`onnx::Conv_268/271/
+274`, `fc.weight`, 5,361,664 trainable params, the same scope every resnet18
+result in this doc uses) both ways: a 136-node baseline (plain `x`/`y`) and a
+138-node `Gather` variant, at two dataset sizes -- 4096 rows (207.6 MiB, the
+size originally sized against the free-memory headroom) and 256 rows. The
+baseline compiled and ran cleanly (confirms nothing else regressed: 26.3 ms
+min / 28.7 ms avg per step, matching this doc's established batch-1 numbers).
+**Both `Gather` variants failed identically** in Pulsar2's NPU backend
+compiler:
+
+```
+op: AxGather, attrs = {'dim': 0, 'keepdim': 1, ...}
+input = {'x': Tensor(FP32, name=x_dataset, shape=(4096, 1, 2, 64), ...),
+         'indices': Tensor(S32, name=batch_index, shape=(1,), ...)}
+Exception: (unspecified, NPUBackendError)
+```
+
+Pulsar2's own frontend has already reshaped/tiled the `[N, 3, 64, 64]`
+dataset into an odd `[N, 1, k, 64]` shape (`k=2` at N=4096, `k=6` at N=256)
+before handing the `Gather` to its NPU backend -- the same "the compiler
+does its own opaque restructuring before this project's control resumes"
+pattern the mcode-quantize probe (above) already found for a different op.
+The identical failure at two very different `N` (4096 and 256, a 16x range)
+rules out a size/tiling threshold: this is `Gather` over a 4D,
+conv-activation-shaped resident tensor specifically, not a "too much data"
+problem -- `Gather` is otherwise a normal, supported op elsewhere in this
+pipeline (index-based weight/embedding lookups, the conv-as-matmul tap
+legalization), so the gap is scoped to this exact usage pattern, not the op
+in general.
+
+**Net**: the resident-dataset mechanism is real, correct, and committed
+(`add_resident_dataset()`, host-verified), but not yet usable on real
+hardware for a conv-shaped dataset -- a genuine Pulsar2 NPU-backend
+limitation to work around (e.g. gathering a pre-flattened `[N, 12288]` view
+instead of the native `[N,3,64,64]` shape, untried) or wait out, not
+something fixable from the ONNX side the way the transpose-glue and
+grouped-conv gaps were. `scripts/axera/tools/gather_runner.c` (this section's
+own runner) also fixed a real, separate latent bug found while building
+this: **neither `resident_runner.c` nor `whisper_resident_runner.c` actually
+feeds `grad_seed`** (added as a real graph input by the FP32-gradient-seed
+work above) -- both allocate its buffer but never write to it, leaving it as
+whatever device memory happened to contain. Worth fixing in both if either
+is used again for a real measurement rather than a correctness check.
+
 ## Two vendor bugs, both silent
 
 **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all of
