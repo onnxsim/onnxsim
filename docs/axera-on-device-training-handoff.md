@@ -793,6 +793,145 @@ before jumping straight to all three) or the debug-tap check above to settle
 resnet50's own loss=0 question, not further architecture generalization
 work.
 
+## A memory-heavy case: Whisper-base encoder training
+
+Every case above -- resnet18d and resnet50d, both at 64x64 input with a
+handful of trainable convs -- was chosen small enough to stay well clear of
+Pulsar2's own compile-time wall (batching section above), and consequently
+never put real pressure on device memory either (the "Device memory"
+section's worst case, 8-way vNPU concurrency, was still only 6.1% of the
+card's 7040 MiB CMM). This section is the opposite choice, deliberately: a
+real-size Whisper-base encoder, trained deep and at its real sequence length,
+specifically to have a genuine "memory matters here" case on hand -- the
+motivation being a parallel investigation into recomputation/checkpointing
+and graph-scheduling techniques for cutting training memory, which needs an
+example where memory is actually the constraint to have anything to bite on.
+
+**Model:** `transformers.WhisperModel` with `openai/whisper-base`'s real
+config (`d_model=512`, `encoder_layers=6`, `encoder_attention_heads=8`,
+`encoder_ffn_dim=2048`), encoder only, at its real, unmodified input size --
+3000 mel frames, `max_source_positions=1500` -- not a shrunk `max_source_
+positions` the way the audio-speech op-coverage survey used to keep its
+export small (`docs/axera-audio-speech-op-coverage.md`'s reproduction
+snippet uses `max_source_positions=32`). 20,590,592 encoder parameters
+total, exported via `torch.onnx.export(..., opset_version=17, dynamo=False)`
+-- 340 nodes, confirming the survey's op-coverage finding at real scale, not
+just its toy one: `Add`, `Constant`, `Conv` (the frozen stem only), `Div`,
+`Erf`, `Identity`, `LayerNormalization`, `MatMul`, `Mul`, `Reshape`,
+`Softmax`, `Transpose` -- Erf-GELU, not the fused `Gelu` op, exactly as the
+survey found, so the raw-`Gelu`-has-no-backward-rule gap it flagged does not
+apply here either.
+
+**Two scopes trained, both the whole width of every chosen layer** (unlike
+resnet18/50's single trainable conv/block) -- picked by taking a suffix of
+the model's own float32 initializers in first-use (= layer) order, not a
+name-based layer selector (the exporter only keeps meaningful names for
+`layers.0`'s own tensors; every other layer's weights get generic
+`onnx::MatMul_NNN` names, so "last K layers" was carved out positionally):
+
+| scope | tensors | trainable params | step-graph nodes |
+| --- | --- | --- | --- |
+| `last_half` (roughly the last 3 of 6 layers) | 14 | 11,534,336 | 521 |
+| `full_encoder` (everything but the frozen conv stem) | 28 | 20,431,360 | 905 |
+
+Building either needed one real fix to `build_resident_step`'s own
+pipeline-order assumption, not specific to Whisper: `graph_grad.
+build_backward` demands a gradient rule for **every** node type it walks,
+`Constant` included, even though a zero-input op has nothing to backprop
+through. Whisper's Erf-GELU decomposition leaves several per-layer `Constant`
+nodes (the `0.5`/`sqrt(2)` literals) that a plain forward export never folds
+away, and resnet18/50 never exercised this path because their forward graphs
+happen not to have any. Fix: run `onnxsim.simplify()` (same skip list as
+the pipeline's own final pass, `fuse_matmul_add_bias_into_gemm`/`fuse_
+transpose_into_gemm` skipped, so as not to reshuffle which initializer name
+carries which weight before `params` is chosen) *before* `build_backward`,
+then fold whatever `Constant` nodes CSE didn't fully eliminate by hand (a
+`Constant` node is an initializer wearing a node's clothes -- same
+`TensorProto`, no inputs). One more real trap the same fold step walked
+into: the fused-QKV projection's `Split` node takes its per-output sizes as
+a second, `int64` **input**, and after CSE merges the six layers' identical
+size-list constants into one shared initializer, a naive "any float-typed
+node input" trainable-candidate scan would be fine (`int64` is excluded by
+construction) -- but a differently-written scan that also picks up
+newly-hand-folded scalars (the GELU/attention-scale literals, which *are*
+float32) needs an explicit rank check (`len(dims) >= 1`) to exclude them: a
+weight always has rank >= 1, a decomposition constant never does.
+
+**Correctness, verified on host, both scopes.** Per-element finite
+differences turned out to be the wrong tool at this scale: a 900-node graph
+reducing over 1500 x 512-element tensors accumulates enough fp32 rounding
+noise that a single perturbed weight element's loss delta is swamped by
+noise at any reasonable epsilon (confirmed directly -- the "finite-difference
+gradient" for 5 of 6 first-tried elements was itself just fp32 ULP noise on
+the loss, an exact multiple of ~1.19e-7). The standard fix for graphs this
+size is a **directional** check instead of a per-element one: take the full
+gradient tensor the graph itself computed for one trainable weight
+(`g = w - w_next`, since `w_next = w - lr*grad`), step `t` units along `-g`,
+and confirm the loss falls by the amount local curvature predicts. Checked
+at `t` in `{1e4, 1e6, 1e8}` against 6 (`last_half`) and 8 (`full_encoder`)
+sampled tensors: **monotonic loss decrease at every step size below the
+point where a nonlinear network's local linear approximation should be
+expected to break down**, with actual-vs-predicted first-order drop ratios
+of 0.3-0.9 -- the right sign, the right order of magnitude, and the right
+qualitative shape (undershooting the linear prediction as curvature bends
+the descent, exactly what a locally-convex loss surface does), which is the
+standard evidence bar a directional gradient check is held to.
+
+**Real device memory, `last_half`:** compiled cleanly via `pulsar2_docker.
+build()` in 454.7s (7.6 min -- well inside the batching section's demonstrated
+wall, this is a bigger graph than any batch-scaling point that blew up past
+25 minutes there, but node *count* and matmul *shape* drive Pulsar2's compile
+time more than raw depth, the same finding the resnet50 section made), one
+fused NPU subgraph, 101,154,816,000 MACs per Pulsar2's own reported count,
+17.8 MB `.axmodel`. Queried with the real, verified `axclrtEngineGetUsage()`
+API (`docs/`'s own "Device memory" section above) straight from the compiled
+file, no device execution needed: **142.4 MiB CMM** -- 5.5-9.3x every case
+measured before it (resnet18 15.3 MiB, resnet50 25.7 MiB), and this is only
+the *half*-encoder scope.
+
+**`full_encoder` does not compile, and neither does the obvious fix.**
+Training every non-stem tensor promotes the LayerNorm affine (scale) that
+every one of the 13 `LayerNormalization` nodes shares -- PyTorch's default
+init (`weight=1`, `bias=0`) makes all 13 layers' affine params bit-identical,
+so CSE had already merged them into one shared initializer before any of
+this pipeline's own code ran. Promoting that one shared tensor to state
+therefore makes *every* `LayerNormalization` in the graph live at once, and
+Pulsar2's frontend hard-errors on it: `KeyError('layers.0.self_attn_layer_
+norm.weight')`, thrown from its own native-parser's reference-attribute
+lookup, not a graceful "unsupported" diagnostic -- a live-weight
+`LayerNormalization` is a real, unfixed gap in this pipeline's legalization
+coverage (`legalize.TRAINING_RULES` has no rule that does for `LayerNorm`
+what `_linearize_trainable_convs`/`act_weight_conv_to_matmul` do for `Conv`
+with a live weight). Freezing just that one shared tensor
+(`full_encoder_no_ln`, 27 of 28 tensors, 20,430,848 of 20,431,360
+params -- 99.998% of the same trainable weight, host-verified the same way,
+directional checks passing at the same ratios) gets past the frontend, but
+hits a **second, different** wall at the NPU backend's tiling stage:
+`TileFailException("AxQuantizedAdd, tuple index out of range")` on a
+`(2048,)`-shaped `Add` deep in the FFN's own SGD-update arithmetic --
+internal to Pulsar2's closed-source scheduler, not diagnosable from the ONNX
+side the way the frontend `KeyError` was, and not chased further here (this
+is where the resnet18 quantize/dequant work stopped too, at a comparable
+"the compiler's own internals, not ours" wall).
+
+**Where this leaves the recomputation/scheduling investigation:** one fully
+working, host-verified, **real-hardware-measured** case (`last_half`,
+142.4 MiB CMM, 5.5-9.3x every prior case) plus two well-diagnosed compile
+walls mapping out where the *bigger* scopes actually stop, rather than a
+vague "probably doesn't scale." Both walls are legalization/compiler gaps a
+future pass could plausibly close (a live-weight-`LayerNormalization` rule
+for the first; the second needs a Pulsar2-side bug report or a workaround
+that avoids whatever shape/dtype combination trips its tiler), not
+fundamental limits -- so `last_half`'s 142.4 MiB is a floor for how memory-
+heavy a real Whisper training case can get on this pipeline today, not a
+ceiling. The pipeline needed no Whisper-specific change to get this far
+beyond the `Constant`-folding fix above (now upstreamed into
+`build_resident_step` itself, not left as a one-off script) -- a real
+confirmation that `build_resident_train_step.py` generalizes past CNNs to
+attention architectures with no new legalization rules for anything that
+*did* compile, matching resnet50's own "no code changes needed" finding for
+a second architecture in a row.
+
 ## What to do next
 
 1. **The FP32 gradient seed.** The one untried route past the dying gradient,
