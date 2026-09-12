@@ -535,31 +535,56 @@ trajectories, only step timing differs. The sub-linear scaling shape (3.16x
 at N=4, 3.70x at N=8, saturating) matches resnet18's own qualitative finding
 (2.53x at N=8) -- vNPU concurrency generalizes to this architecture.
 
-**Real hardware, batch=4/8: compiles and times, but the gradient is
-completely dead -- a new, unfixed calibration-range regression, not a
-throughput result.** Both compiled cleanly (68.4s and 107.7s, well under the
-batch-16+ compile-time wall) and ran without error, but **loss is
-bit-identical across all 8 real steps at both batch sizes** (`1.11174`
-constant at batch=4, `1.10973` at batch=8) -- unlike batch=1, where loss
-moved smoothly every step. The calibration for both reused this model's own
-*batch-shaped* real trajectory (not stale batch=1 data), so this is not a
-repeat of the already-fixed generic-defaults or degenerate-constant-`lr`
-bugs -- something about batch>1's real quantization range specifically
-kills the gradient, not yet root-caused. Real step times measured anyway,
-since timing doesn't depend on numerical correctness, but they should **not**
-be read as "batching gives N.Nx throughput for training" the way resnet18's
-own batching section can be -- there is no confirmed-correct training
-happening at either batch size to be fast *at*:
+**Real hardware, batch=4/8: fixed -- a third calibration bug, same class as
+the first two, on a tensor nobody had calibrated at all.** Direct
+`quant_axmodel.json` inspection (the same method PR #1346/#1370 used)
+traced the frozen gradient to the raw pre-`lr`-scaling gradient tensor
+(`resident_step__reshape_406`, feeding `Mul_124: lr * grad`): its calibrated
+range was `[-5.4e-5, 6.8e-5]` (scale `4.79e-7`), while a real batch=4
+forward+backward at the intended `grad_seed=1.0` produces gradients up to
+`1.87e-3` -- **~27x too narrow**, saturating almost the entire tensor.
+Root cause: `grad_seed` (the backward-pass seed multiplying the *entire*
+gradient before it ever reaches this tensor) had **never been given
+`real_data` calibration anywhere in this pipeline, not even at batch=1** --
+it fell through to `make_training_calib.py`'s generic
+`weight_scale=0.05`-scaled random-draw branch, producing calibration values
+near 0 rather than the real runtime value of 1.0. Same bug *class* as PR
+#1370's `lr` fix (a scalar multiplier whose calibration was never matched to
+its real runtime usage) on a *different* scalar -- batch=1 happened not to
+manifest it (its naturally larger unbatched gradient apparently still fit
+inside the resulting undersized range), batch=4/8's more-averaged gradient
+did not.
+
+Fixed by adding `real_data` for `grad_seed` (jittered around 1.0, matching
+the `lr` fix's own pattern) to `build_w2v2fe_batch_calib.py`. Confirmed on
+the compiled model: the raw-gradient scale widened `4.79e-7 -> 1.41e-5`
+(~29x, matching the ~27x under-calibration found). **Real hardware, batch=4,
+8 steps, `lr=100`: loss moves smoothly and monotonically -- `1.02927 ->
+0.98068`** -- where it was bit-identical before. (The tracked weight
+readback itself steps in coarse ~0.0102 increments across a few repeated
+values -- expected, not a bug: that tensor's own state-output quantization
+scale is `0.01018`, so consecutive real updates smaller than one
+quantization step legitimately round to the same U8 code; loss, quantized
+far more finely relative to its own dynamic range, is the reliable signal
+here, the same distinction PR #1346's per-sample-vs-final-scalar debug tap
+already established.)
+
+Real step times, now trustworthy since correctness is confirmed at batch=4:
 
 | batch | step time (min/avg) | cmm |
 | --- | --- | --- |
 | 1 | 5.590ms / 5.865ms | 11.039 MiB |
-| 4 | 18.820ms / 18.891ms | 25.534 MiB |
-| 8 | 35.113ms / 35.270ms | 45.957 MiB |
+| 4 | 18.838ms / 19.353ms | 25.534 MiB |
 
-**Net**: vNPU concurrency is a real, confirmed, generalizable win for this
-architecture at batch=1. Batching needs its own dedicated diagnosis (likely
-the same class of investigation PR #1370 already did twice -- direct
-`quant_axmodel.json` inspection, an `lr`-style sweep -- applied to whichever
-tensor's calibrated range is wrong at batch>1) before it can be trusted here;
-flagged as the concrete next step, not chased further in this pass.
+Batch=8 was not re-verified in this pass (the same `grad_seed` fix should
+apply identically, since the bug and fix are batch-size-independent in
+mechanism -- flagged as the remaining confirmation step, not assumed).
+vNPU+batching compounding was not re-checked here either -- both are now
+individually real, but composing them is a follow-on, not done in this pass.
+
+**Net**: three real calibration bugs found and fixed for this model across
+PRs #1367/#1370/this fix -- `x_scale`/`weight_scale` mismatch, degenerate
+constant-`lr` range, and now uncalibrated `grad_seed` -- all in the same
+family (a scalar or tensor whose calibration data was never matched to its
+real runtime distribution). Batching is now confirmed working at batch=4;
+batch=8 and vNPU+batch composition remain open, low-risk follow-ons.

@@ -113,6 +113,22 @@ def main():
                 np.array([v], np.float32)
                 for v in [0.01, 0.1, 1.0, 10.0, 100.0, 1.0, 50.0, 100.0]
             ],
+            # grad_seed was never given real_data anywhere in this pipeline
+            # (not even at batch=1) -- it fell through to make_work_dir's
+            # generic weight_scale=0.05 random-draw branch, uncorrelated
+            # with its real runtime value (1.0). A real batch=4 forward+
+            # backward with grad_seed=1.0 and a fresh random weight
+            # (matching ws[0]'s own scale) produces a raw gradient up to
+            # ~1.9e-3 in magnitude -- but the compiled model's calibrated
+            # range for that same tensor was only [-5.4e-5, 6.8e-5], ~27x
+            # too narrow, because calibration saw grad_seed values near 0
+            # instead of 1.0. Same bug *class* as PR #1370's `lr` fix (a
+            # scalar multiplier whose calibration was never matched to its
+            # real runtime usage), on a different scalar.
+            "grad_seed": [
+                np.array([v], np.float32)
+                for v in [1.0, 0.9, 1.1, 1.0, 0.95, 1.05, 1.0, 1.0]
+            ],
         },
     )
     print("wrote calib work dir:", work_dir)
