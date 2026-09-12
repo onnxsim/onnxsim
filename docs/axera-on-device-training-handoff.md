@@ -1616,6 +1616,41 @@ own I/O order was still resnet18's, left over from copying
 `resident_runner.c` -- the actual index constants in the body were always
 right, only the prose above them was stale.)
 
+### Surveying NVIDIA TransformerEngine: one accidental discovery beats everything else tried
+
+Full writeup: `docs/transformerengine-low-precision-survey.md`. Most of
+TransformerEngine's real techniques don't port as designed -- its core
+mechanism (a runtime-adjustable FP8 scale, no recompile) is confirmed
+incompatible with Pulsar2's compile-time-baked quantisation, the same wall
+every recalibration-without-recompiling idea in this thread has hit. But
+checking *why*, against Pulsar2's own `build_config.proto`, surfaced a real,
+previously-untried field: **`quant.highest_mix_precision: true`**. Confirmed
+empirically (not from its name) to force **every op type in the graph,
+`MatMul` included**, to FP32 -- a blunt whole-graph override, not
+TE-style targeted mixed precision. Built and ran it on real AX650N hardware
+against the small multi-phase probe: it reproduces the exact `onnxruntime`
+float32 answer (`loss` and both trainable weights' updates match to
+displayed precision) where the standard INT8 build gets the **wrong sign**
+on both updates on the same feed -- and at this small scale, costs no more
+step time than the standard build (0.250ms vs. 0.266ms min). This is a
+stronger, more complete result than the FP32-seed plateau (PR #1353) or the
+build-time-locked calibration swap (PR #1355/#1356): no plateau, nothing to
+recompile per regime, exact float agreement, through the exact `MatMul`
+boundary nothing else reached. **Untested**: whether it holds its (apparent)
+speed at real graph scale (resnet18/Whisper) rather than this tiny probe's
+overhead-dominated regime, and whether it fixes Whisper's SNR-floor failure
+specifically -- the natural, concrete next step.
+
+Also built, as a genuinely portable idea separated from TE's own
+CUDA-specific mechanism: `scripts/axera/amax_calibration.py`, a rolling
+amax-history algorithm (TE's own statistic, applied to choosing multi-phase
+calibration *targets* instead of a hand-picked ratio) that answers this
+doc's own standing "how many phases, where do the boundaries go" question
+from a real trajectory -- and correctly reports zero boundaries for a
+trajectory shaped like Whisper's own real (flat, non-decaying) one, rather
+than recommending a schedule that would not have fixed Whisper's actual
+failure mode.
+
 ## What to do next
 
 1. ~~The FP32 gradient seed.~~ **Tested: real effect, not a full fix.** See
