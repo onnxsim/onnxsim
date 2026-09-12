@@ -127,6 +127,34 @@ Two things confirmed, one real limit found:
   characterization, so treat the *qualitative* finding (baseline doesn't scale
   correctly, FP32 does something real) as the transferable result, not the
   exact percentages.
+
+  **Retroactive check, prompted by two later, separate findings on a
+  different model** (`docs/axera-audio-speech-op-coverage.md`'s wav2vec2
+  work): a scalar input never given real, varied calibration data --
+  producing a degenerate MinMax range that silently clips/saturates the real
+  runtime value -- broke `lr` and then `grad_seed` there (a zero-width range
+  from identical calibration samples in one case, a generic small-random
+  default uncorrelated with the real runtime magnitude in the other). Worth
+  asking whether the *same* mechanism explains this "chaotic ratio" finding.
+  Rebuilt this exact probe fresh and inspected its `grad_seed` calibration
+  directly: with `make_training_calib.py`'s current generic fallback (no
+  `real_data`), `grad_seed`'s calibrated range comes out `[-0.039, 0.081]`
+  (`scale=0.00047`, `zero_point=83`, U8) -- the same class of narrow,
+  uncorrelated range as the two wav2vec2 bugs, on a fourth model/probe now.
+  But swept on real hardware (seed = 1, 100, 1000, 100,000 against this
+  fresh build), the result was **0% nonzero at every seed** -- bit-identical
+  zero, not the originally-reported 100%-nonzero-but-chaotic-ratio pattern.
+  **Inconclusive, not confirmed or refuted**: this rebuild's baseline
+  behavior does not match the one being explained closely enough to serve as
+  a stand-in for it, most likely because `make_training_calib.py`'s default
+  `x_scale`/`weight_scale` (and therefore the *output* `dW` tensor's own
+  calibrated range, separate from `grad_seed`'s) have been retuned by the
+  fixes this doc's own later sections describe, since PR #1353's original run
+  -- a moving target a fresh rebuild can't reproduce. The narrow-`grad_seed`-
+  calibration finding stands on its own as a fourth real instance of the
+  pattern (worth the same `real_data`/jitter treatment if this probe is
+  revisited), but it does not settle what specifically made the *original*
+  baseline's ratio chaotic rather than constant.
 * **It plateaus.** 20.1% nonzero at seed=1,000 and at seed=100,000 -- unchanged
   over two more orders of magnitude of seed. This is not the seed failing to
   reach the graph again; it is the *next* quantised boundary downstream taking
