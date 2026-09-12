@@ -4,9 +4,12 @@
  * fe.conv_layers.0.conv.weight, lr, grad_seed], outputs [updated weight,
  * loss] -- one trainable state tensor, unlike resnet18's four or Whisper's
  * fourteen, so this is its own small runner rather than a generalization of
- * resident_runner.c's N_STATE=4 layout.
+ * resident_runner.c's N_STATE=4 layout. Batch is not a runner concern: a
+ * batch>1 build just changes the .state0/.x0/.y0 file sizes this runner
+ * reads (in_sz[...] comes from the compiled model's own IOInfo), the loop
+ * itself is batch-size-agnostic.
  *
- * Usage: w2v2fe_runner model.axmodel steps [warmup]
+ * Usage: w2v2fe_runner model.axmodel steps [warmup] [lr] [-v]
  *
  * Seeds the trainable weight from <model.axmodel>.state0 (raw float32
  * bytes, matching resident_runner.c's convention) and prints w[0] alongside
@@ -15,6 +18,13 @@
  * project has needed twice before (PRs #1343/#1346's loss=0 investigations,
  * PR #1359's Whisper step-1 death) -- reading the raw state buffer, not
  * trusting the runner's own loss output alone.
+ *
+ * -v: AXCL_VNPU_ENABLE instead of AXCL_VNPU_DISABLE, same lever/methodology
+ * as resident_runner.c's own -v (PRs #1345/#1346) -- run several copies of
+ * this binary at once (each its own model-file copy) for real concurrent
+ * throughput. Also reports real device memory via
+ * axclrtEngineGetUsageFromModelId (PR #1347's tool), the same way
+ * resident_runner.c does.
  */
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
@@ -38,12 +48,18 @@ int main(int argc, char **argv) {
     }
     int steps = atoi(argv[2]);
     int warmup = argc > 3 ? atoi(argv[3]) : 3;
+    float lr_arg = argc > 4 ? (float)atof(argv[4]) : 1e-4f;
+    int vnpu_enable = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) vnpu_enable = 1;
+    }
 
     CK(axclInit(NULL));
     axclrtDeviceList devs; CK(axclrtGetDeviceList(&devs));
     if (!devs.num) { fprintf(stderr, "no device\n"); return 1; }
     CK(axclrtSetDevice(devs.devices[0]));
-    CK(axclrtEngineInit(AXCL_VNPU_DISABLE));
+    CK(axclrtEngineInit(vnpu_enable ? AXCL_VNPU_ENABLE : AXCL_VNPU_DISABLE));
+    fprintf(stderr, "vnpu: %s\n", vnpu_enable ? "AXCL_VNPU_ENABLE" : "AXCL_VNPU_DISABLE");
 
     uint64_t modelId = 0, ctx = 0;
     CK(axclrtEngineLoadFromFile(argv[1], &modelId));
@@ -52,6 +68,12 @@ int main(int argc, char **argv) {
     axclrtEngineIOInfo info; CK(axclrtEngineGetIOInfo(modelId, &info));
     uint32_t ni = axclrtEngineGetNumInputs(info), no = axclrtEngineGetNumOutputs(info);
     fprintf(stderr, "inputs=%u outputs=%u\n", ni, no);
+
+    int64_t sys_bytes = 0, cmm_bytes = 0;
+    CK(axclrtEngineGetUsageFromModelId(modelId, &sys_bytes, &cmm_bytes));
+    double cmm_mib = cmm_bytes / (1024.0 * 1024.0);
+    fprintf(stderr, "engine usage: sys=%lld B cmm=%.3f MiB\n",
+            (long long)sys_bytes, cmm_mib);
 
     axclrtEngineIO io; CK(axclrtEngineCreateIO(info, &io));
 
@@ -87,7 +109,7 @@ int main(int argc, char **argv) {
     CK(axclrtMemcpy(in_bufs[w_in], host, in_sz[w_in], AXCL_MEMCPY_HOST_TO_DEVICE));
     free(host);
 
-    { float lr = argc > 4 ? (float)atof(argv[4]) : 1e-4f; fprintf(stderr, "lr=%g\n", lr); CK(axclrtMemcpy(in_bufs[lr_in], &lr, sizeof(lr), AXCL_MEMCPY_HOST_TO_DEVICE)); }
+    { float lr = lr_arg; fprintf(stderr, "lr=%g\n", lr); CK(axclrtMemcpy(in_bufs[lr_in], &lr, sizeof(lr), AXCL_MEMCPY_HOST_TO_DEVICE)); }
     { float seed = 1.0f; CK(axclrtMemcpy(in_bufs[seed_in], &seed, sizeof(seed), AXCL_MEMCPY_HOST_TO_DEVICE)); }
 
     void *hx = malloc(in_sz[x_in]);
@@ -131,8 +153,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "step %d: %.3f ms  loss=%g  w[0]=%.10g\n", i, dt, loss_host, w0);
     }
     double total = now_ms() - t_start;
-    printf("steps=%d min=%.3fms avg=%.3fms total=%.3fms throughput=%.1f steps/s\n",
-           steps, best, sum / steps, total, 1000.0 * steps / total);
+    printf("steps=%d min=%.3fms avg=%.3fms total=%.3fms throughput=%.1f steps/s cmm=%.3fMiB\n",
+           steps, best, sum / steps, total, 1000.0 * steps / total, cmm_mib);
 
     for (uint32_t i = 0; i < ni; i++) axclrtFree(in_bufs[i]);
     for (uint32_t i = 0; i < no; i++) axclrtFree(out_bufs[i]);

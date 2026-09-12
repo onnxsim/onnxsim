@@ -493,3 +493,73 @@ caught it. Whether this explains any part of PR #1353's own "seed sweep
 returns bit-identical gradients at every value" finding on a *different*
 model is an open, real question this task did not have scope to chase --
 noted here as a concrete follow-on, not asserted.
+
+### Batching and vNPU concurrency: vNPU compounds cleanly at batch=1, batching itself regresses correctness
+
+Applied this project's two already-proven speed levers (batching, PR #1342;
+vNPU concurrency, PR #1345/#1346) to the now-working feature-extractor case
+-- the first real audio model where this is worth trying.
+
+**Made the training-step graph batch-parametric.** Unlike resnet18's
+`set_batch()` (a post-hoc shape edit, since nothing downstream of `x` bakes
+a batch-specific constant), this model's `build()` computes a `flatten_shape`
+initializer from the *exported* batch dim -- Conv1D's per-sample output
+length threads through several strided layers before the manual flatten step,
+unlike resnet18's pooling-then-Gemm tail. So batch is a real **export**
+parameter here (`_export_feature_extractor(..., batch=N)`,
+`torch.randn(N, 4000)`), not a graph edit after the fact --
+`build_w2v2fe_batch_calib.py` is the new driver. Confirmed the raw export's
+own op sequence is identical at batch 1 and 4 (74 nodes, same op list) before
+trusting anything downstream. Host-verified the batched graph's gradient
+correctness the way `test_set_batch_gradient_is_the_mean_of_per_sample_
+gradients` already does for resnet18: batch=4's returned gradient matches
+the mean of four separately-run batch=1 gradients to 3.2e-5 relative error
+-- but only once every non-trainable layer's random initialization was
+pinned identical across the two builds (`torch.manual_seed(42)` before each
+export) -- the first attempt compared two *differently randomly initialized*
+models and failed at ~116% relative error, a test-methodology bug, not a
+graph bug, caught before it was mistaken for one.
+
+**Real hardware, batch=1 (correctness already confirmed above): both levers
+work.**
+
+| config | throughput | notes |
+| --- | --- | --- |
+| solo (`AXCL_VNPU_DISABLE`) | 164.3 steps/s | min 5.590ms/step |
+| 4x concurrent (`-v`) | 519.2 steps/s aggregate | 3.16x solo |
+| 8x concurrent (`-v`) | 607.9 steps/s aggregate | 3.70x solo |
+
+Confirmed non-corrupting first, the same check PR #1345 used: `-v` and
+non-`-v` runs of the same model produce bit-identical loss/weight
+trajectories, only step timing differs. The sub-linear scaling shape (3.16x
+at N=4, 3.70x at N=8, saturating) matches resnet18's own qualitative finding
+(2.53x at N=8) -- vNPU concurrency generalizes to this architecture.
+
+**Real hardware, batch=4/8: compiles and times, but the gradient is
+completely dead -- a new, unfixed calibration-range regression, not a
+throughput result.** Both compiled cleanly (68.4s and 107.7s, well under the
+batch-16+ compile-time wall) and ran without error, but **loss is
+bit-identical across all 8 real steps at both batch sizes** (`1.11174`
+constant at batch=4, `1.10973` at batch=8) -- unlike batch=1, where loss
+moved smoothly every step. The calibration for both reused this model's own
+*batch-shaped* real trajectory (not stale batch=1 data), so this is not a
+repeat of the already-fixed generic-defaults or degenerate-constant-`lr`
+bugs -- something about batch>1's real quantization range specifically
+kills the gradient, not yet root-caused. Real step times measured anyway,
+since timing doesn't depend on numerical correctness, but they should **not**
+be read as "batching gives N.Nx throughput for training" the way resnet18's
+own batching section can be -- there is no confirmed-correct training
+happening at either batch size to be fast *at*:
+
+| batch | step time (min/avg) | cmm |
+| --- | --- | --- |
+| 1 | 5.590ms / 5.865ms | 11.039 MiB |
+| 4 | 18.820ms / 18.891ms | 25.534 MiB |
+| 8 | 35.113ms / 35.270ms | 45.957 MiB |
+
+**Net**: vNPU concurrency is a real, confirmed, generalizable win for this
+architecture at batch=1. Batching needs its own dedicated diagnosis (likely
+the same class of investigation PR #1370 already did twice -- direct
+`quant_axmodel.json` inspection, an `lr`-style sweep -- applied to whichever
+tensor's calibrated range is wrong at batch>1) before it can be trusted here;
+flagged as the concrete next step, not chased further in this pass.
