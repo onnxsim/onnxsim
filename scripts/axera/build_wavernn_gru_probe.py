@@ -20,6 +20,20 @@ executable, just missing a backward rule -- see the LSTM probe), **`GRU` is
 not in `scripts/axera/pulsar2_ops.py`'s `AX650_SUPPORTED_OPS` at all** --
 a strictly bigger gap than LSTM's, since a GRU-containing model cannot even
 *run* on this hardware at inference, before training enters the picture.
+Both are now closed via `legalize.py`'s `unroll_lstm`/`unroll_gru` -- see
+`docs/axera-audio-speech-op-coverage.md`'s "Both closed" section.
+
+**A known caveat with this exact export, unrelated to `GRU`**: the raw
+WaveRNN export this module produces loads and passes `onnx.checker`, but
+does not currently execute via onnxruntime on this torch/torchaudio version
+pairing -- a separate `torch.onnx` exporter bug (an `Unsqueeze` axis
+miscomputation inside `UpsampleNetwork`'s own export path), reproduced
+across every config size tried, not something this module's tiny config
+caused or `unroll_gru` can route around. The op-coverage finding above
+rests on static graph inspection (`onnx.checker` plus op-type enumeration),
+not a real end-to-end onnxruntime run of this exact graph; `unroll_gru`
+itself is verified independently (`tests/test_axera_legalize.py`) against a
+clean, executing `nn.GRU`-only export instead.
 
 Usage::
 

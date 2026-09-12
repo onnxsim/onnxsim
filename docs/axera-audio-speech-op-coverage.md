@@ -293,8 +293,8 @@ needs its own trace, not an inference from wav2vec2's). Flagged, not closed.
 | `Split` has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_split`, via the new `_MULTI_OUTPUT_RULES` table) | was: Conformer's GLU gating | `MatMul` against a constant 0/1 selection matrix per output, no `Concat`, stays inside `BACKWARD_OPS` |
 | `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_where`/`_grad_is_nan`, via the new `_PYTHON_ONLY_RULES` table) | was: plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is a separate, still-open question (see below) | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; `IsNaN` itself gets a no-gradient rule so `build_backward` can walk over it inline |
 | Raw `Gelu` has no backward rule | open, low priority | only an exporter emitting fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
-| `LSTM` has no backward rule; NPU-executable otherwise | open, largest lift, **real test bed now found** | any classic RNN-based ASR model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
-| `GRU` has no backward rule *and* is not NPU-executable at all | open, stricter than `LSTM`, **real test bed now found** | any classic RNN-based TTS/vocoder model | needs Pulsar2 to support `GRU` on-device first (closed-source, not fixable from this project's side) -- a backward rule alone would not be enough |
+| `LSTM` has no backward rule; NPU-executable otherwise | **fixed** (`scripts/axera/legalize.py`'s `unroll_lstm`) | was: any classic RNN-based ASR model | unrolled into its own per-timestep `MatMul`/`Sigmoid`/`Tanh`/`Mul`/`Add`/`Concat` gate arithmetic, every op already covered on both axes |
+| `GRU` has no backward rule *and* is not NPU-executable at all | **fixed** (`scripts/axera/legalize.py`'s `unroll_gru`) | was: any classic RNN-based TTS/vocoder model | same unroll as `LSTM`, and a strictly bigger win here: this is the only way a `GRU`-containing model runs on this hardware **at all**, training or not |
 
 ### A real LSTM test bed: NVIDIA Parakeet's own RNN-T prediction network
 
@@ -349,26 +349,93 @@ architecture**: unlike `LSTM` (NPU-executable, only missing a backward
 rule), **`GRU` is not in `AX650_SUPPORTED_OPS` at all** -- both real
 `GRU` nodes in this export are absent from *both* tables. This is a
 strictly bigger gap than LSTM's: a GRU-containing model cannot even *run*
-on this hardware at inference, before training enters the picture at all,
-so a GRU backward rule alone would not be enough to unblock WaveRNN --
-Pulsar2's own NPU backend would need to gain `GRU` support first, something
-outside this project's control (closed-source compiler, same class of
-limitation as `IsNaN`'s own missing frontend support, PR #1384). Every
-other op in the export is either already covered (`Conv`, `MatMul`, `Add`,
-`Gather`, `Identity`, `Relu`, `Reshape`, `Transpose`) or, again, harmless
-shape/indexing scaffolding (`Concat`/`Constant`/`Expand`/`Slice`/`Squeeze`/
-`Tile`/`Unsqueeze`/`Shape`) around the upsampling network feeding the GRU
-stack -- confirming the gap is scoped to `GRU` itself, not something this
-export incidentally also needs.
+on this hardware at inference, before training enters the picture at all.
+Every other op in the export is either already covered (`Conv`, `MatMul`,
+`Add`, `Gather`, `Identity`, `Relu`, `Reshape`, `Transpose`) or, again,
+harmless shape/indexing scaffolding (`Concat`/`Constant`/`Expand`/`Slice`/
+`Squeeze`/`Tile`/`Unsqueeze`/`Shape`) around the upsampling network feeding
+the GRU stack -- confirming the gap is scoped to `GRU` itself, not
+something this export incidentally also needs. (The WaveRNN export itself
+turned out to hit a separate, unrelated `torch.onnx` exporter bug at
+session -- an `Unsqueeze` axis miscomputation in `UpsampleNetwork`'s own
+export path, reproducible across every config size tried, on this
+torch/torchaudio version pairing -- so this op-coverage finding rests on
+static graph inspection (`onnx.checker` plus op-type enumeration), not a
+real onnxruntime execution of the *whole* WaveRNN graph; `unroll_gru`
+itself, below, is verified independently against a clean, executing
+`nn.GRU`-only export instead.)
 
-**Net for LSTM/GRU as a pair**: LSTM now has a real target model and only
-needs a backward rule (or an unroll route) to become trainable; GRU has a
-real target model too, but needs Pulsar2 to support the op on-device before
-a backward rule would even matter -- a strictly higher bar, and not
-something a legalization rule on this project's side can route around, the
-same "closed-source backend gap, not fixable from the ONNX side" verdict
-several other findings in this project (`IsNaN`, `output_data_type` on
-`MatMul`) already reached.
+### Both closed: `unroll_lstm`/`unroll_gru` legalize both ops into what the pipeline already covers
+
+The natural follow-up question once both gaps had real target models: is
+either op's math actually *reachable* with ops this pipeline already
+covers, the same way `act_weight_conv_to_matmul` routes a live-weight `Conv`
+into `MatMul`s? Both are. `LSTM`'s four gates and `GRU`'s three are each
+ordinary `Sigmoid`/`Tanh` activations over a sum of two `MatMul`s and a
+bias -- textbook, and every one of those op types was already confirmed
+covered on both axes (a `graph_grad` backward rule and NPU support) earlier
+in this doc. `scripts/axera/legalize.py`'s `unroll_lstm`/`unroll_gru`
+replace a forward, single-direction `LSTM`/`GRU` node with exactly that
+per-timestep arithmetic, verified numerically exact (float32 precision, not
+an approximation) three ways: against a hand-built native ONNX node,
+against a real `torch.onnx.export`-produced node with the module's own
+learned weights extracted directly from the graph, and end-to-end against
+the real Parakeet decoder probe above (`2.98e-8` max output difference
+after unrolling both of its LSTM layers).
+
+**Gate order and exact semantics were pinned down empirically, not assumed
+from the spec text** -- both operators' bias/gate layouts have real,
+easy-to-get-backwards subtleties (`LSTM`'s gate order is `i, o, f, c`, not
+PyTorch's own `i, f, g, o`; `GRU`'s `linear_before_reset=1` -- what
+`torch.onnx.export` always emits for `nn.GRU` -- applies the reset gate to
+`h @ Rh + Rbh` as a whole, not `(reset * h) @ Rh`, and an initial attempt
+assuming the opposite convention was off by up to `0.48` before the correct
+formula was found by testing every gate-order/reset-variant/update-variant
+combination against a real onnxruntime-executed native node). This is the
+same "checked directly, not derived from memory of the spec" discipline
+`docs/axera-on-device-training-handoff.md`'s ONNX `LSTM`/`GRU` gate-order
+notes elsewhere in this project already follow.
+
+**One real, separate gap this surfaced along the way**: differentiating
+through the unrolled `Y` (full sequence) output -- what both Parakeet's
+decoder and WaveRNN actually consume downstream, not just the final
+`Y_h`/`Y_c` state -- needs a gradient through the `Concat` that stacks each
+timestep's hidden state. `Concat` had no backward rule at all before this.
+Fixed as `onnxsim.graph_grad._grad_concat` (a new `_PYTHON_ONLY_RULES`
+entry, no C++/WASM mirror yet): one `Gather` per input, each pulling that
+input's own contiguous slice back out of the incoming gradient along the
+concat axis -- `Split`'s adjoint, reached a different way than
+`_grad_split`'s own selection-matrix `MatMul` (that rule's docstring
+explains why it couldn't reuse `Concat` for its own, opposite direction;
+`Gather` with a compile-time-constant, single-axis index range is squarely
+the shape of use this module's `BACKWARD_OPS` note already permits for
+`_grad_conv`'s own indexing, so nothing needed to be *added* to that
+allowlist). Verified against finite differences directly, and exercised
+end-to-end in `tests/test_axera_legalize.py`'s own differentiability test
+(`build_backward` reaching every one of an unrolled 2-layer LSTM's 8
+per-gate weight tensors through its stacked `Concat` output).
+
+**What actually gets trained changes.** `unroll_lstm`/`unroll_gru` split
+each op's packed `W`/`R` weight into one initializer per gate (four for
+LSTM, three for GRU) rather than leaving one packed tensor -- the same
+kind of topology change `act_weight_conv_to_matmul` already makes for a
+live-weight `Conv`. A resident training step built from an unrolled
+LSTM/GRU would train those per-gate tensors, not a single packed one; nothing
+downstream of this project's `build_resident_step()` convention currently
+teaches the trainable-weight finder to recognize the pre-split packed
+name, so this is host-verified only -- a real hardware run (compile,
+calibrate, train an unrolled decoder end to end) is the natural next step,
+not attempted here.
+
+**Net for LSTM/GRU as a pair**: both gaps are closed at the legalization
+level. `LSTM` needed only a backward rule's worth of arithmetic, already
+NPU-executable as the opaque op; `GRU`'s fix is the bigger win, since
+unrolling is now the *only* way a `GRU`-containing model runs on this
+hardware at all, sidestepping the "Pulsar2 itself would need to support the
+op" ceiling a native-op fix would have hit. Both are registered in
+`legalize.TRAINING_RULES`, running before `graph_grad.build_backward` sees
+the graph, the same slot `act_weight_conv_to_matmul` already occupies for
+its own live-weight rewrite.
 
 ## Do the two silent vendor bugs generalize?
 

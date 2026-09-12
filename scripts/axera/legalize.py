@@ -1174,6 +1174,353 @@ def _value_shapes(model):
     return shapes
 
 
+def _const_i64(model, stem, value):
+    name = _unique_name(model, stem)
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.array(value, dtype=np.int64), name)
+    )
+    return name
+
+
+def _gate_weight(model, stem, arr):
+    """Stores a precomputed, already-transposed 2-D gate weight (or bias) as
+    a new initializer, for `MatMul(x, w)` (not `MatMul(x, w.T)`) directly."""
+    name = _unique_name(model, stem)
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.ascontiguousarray(arr), name)
+    )
+    return name
+
+
+def _unroll_recurrent_node(model, node, shapes, n_gates, step_fn):
+    """Shared scaffolding for `unroll_lstm`/`unroll_gru`: validates the
+    node is in the supported shape (forward direction, static shapes,
+    initializer weights, no peephole/variable-length inputs), splits `W`/
+    `R`/`B` into per-gate 2-D matrices, builds the `Gather`-per-timestep
+    loop, and wires up whichever of the node's own outputs are actually
+    used. `step_fn(gates, h, c, t_nodes)` computes one timestep's `(h, c)`
+    from that step's per-gate `x @ Wg + h @ Rg + bias_g` pre-activations
+    (`c` is `None` for GRU) and appends any nodes it creates to `t_nodes`;
+    returns `None` for a shape this rule declines to handle (left
+    untouched, the same precedent every other shape-scoped rule here
+    follows -- e.g. `act_weight_conv_to_matmul`'s `group=1, dilation=1`).
+    """
+    attrs = {a.name: a for a in node.attribute}
+    direction = attrs["direction"].s.decode() if "direction" in attrs else "forward"
+    layout = attrs["layout"].i if "layout" in attrs else 0
+    if direction != "forward" or layout != 0:
+        return None  # bidirectional / reverse / batch-first: not seen, declined
+
+    x_name = node.input[0]
+    w_init = _initializer(model, node.input[1]) if len(node.input) > 1 else None
+    r_init = _initializer(model, node.input[2]) if len(node.input) > 2 else None
+    if w_init is None or r_init is None:
+        return None  # a live/trainable W or R: no target model needs this yet
+
+    b_init = None
+    if len(node.input) > 3 and node.input[3]:
+        b_init = _initializer(model, node.input[3])
+        if b_init is None:
+            return None  # a live/trainable bias: same, not a seen pattern
+    if len(node.input) > 4 and node.input[4]:
+        return None  # sequence_lens: variable-length batches, declined
+    if len(node.input) > 4 + n_gates:  # LSTM's peephole `P`, GRU has no 8th input
+        return None
+
+    x_shape = shapes.get(x_name)
+    if not x_shape or len(x_shape) != 3:
+        return None
+    seq_len, batch, _ = x_shape
+    hidden_size = attrs["hidden_size"].i if "hidden_size" in attrs else None
+    w = numpy_helper.to_array(w_init)[0]  # [n_gates*H, input_size]
+    r = numpy_helper.to_array(r_init)[0]  # [n_gates*H, H]
+    if hidden_size is None:
+        hidden_size = w.shape[0] // n_gates
+    h = hidden_size
+
+    def gate(mat, i):
+        return np.ascontiguousarray(mat[i * h : (i + 1) * h].T)  # already x@w form
+
+    w_gates = [gate(w, i) for i in range(n_gates)]
+    r_gates = [gate(r, i) for i in range(n_gates)]
+    if b_init is not None:
+        b = numpy_helper.to_array(b_init)[0]  # [2*n_gates*H] = Wb..., Rb...
+        wb_gates = [b[i * h : (i + 1) * h] for i in range(n_gates)]
+        rb_gates = [
+            b[(n_gates + i) * h : (n_gates + i + 1) * h] for i in range(n_gates)
+        ]
+    else:
+        wb_gates = rb_gates = [np.zeros(h, dtype=np.float32)] * n_gates
+
+    stem = node.name or node.output[0]
+    new_nodes = []
+
+    def initial_state(idx, label):
+        if len(node.input) > idx and node.input[idx]:
+            squeezed = _unique_name(model, f"{stem}_{label}0")
+            new_nodes.append(
+                helper.make_node(
+                    "Reshape",
+                    [
+                        node.input[idx],
+                        _const_i64(model, f"{stem}_{label}0_shape", [batch, h]),
+                    ],
+                    [squeezed],
+                    name=squeezed,
+                )
+            )
+            return squeezed
+        zero_name = _unique_name(model, f"{stem}_{label}0_zero")
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.zeros((batch, h), dtype=np.float32), zero_name)
+        )
+        return zero_name
+
+    h_state = initial_state(5, "h")
+    c_state = initial_state(6, "c") if n_gates == 4 else None
+
+    w_names = [_gate_weight(model, f"{stem}_w{i}", w_gates[i]) for i in range(n_gates)]
+    r_names = [_gate_weight(model, f"{stem}_r{i}", r_gates[i]) for i in range(n_gates)]
+    wb_names = [
+        _gate_weight(model, f"{stem}_wb{i}", wb_gates[i]) for i in range(n_gates)
+    ]
+    rb_names = [
+        _gate_weight(model, f"{stem}_rb{i}", rb_gates[i]) for i in range(n_gates)
+    ]
+
+    per_step_h = []
+    for t in range(seq_len):
+        t_idx = _const_i64(model, f"{stem}_t{t}", t)
+        xt = _unique_name(model, f"{stem}_x{t}")
+        new_nodes.append(
+            helper.make_node("Gather", [x_name, t_idx], [xt], name=xt, axis=0)
+        )
+        gates = []
+        for i in range(n_gates):
+            xw = _unique_name(model, f"{stem}_xw{t}_{i}")
+            hr = _unique_name(model, f"{stem}_hr{t}_{i}")
+            pre = _unique_name(model, f"{stem}_pre{t}_{i}")
+            new_nodes.append(
+                helper.make_node("MatMul", [xt, w_names[i]], [xw], name=xw)
+            )
+            new_nodes.append(
+                helper.make_node("MatMul", [h_state, r_names[i]], [hr], name=hr)
+            )
+            gates.append((xw, hr, wb_names[i], rb_names[i], pre))
+        h_state, c_state = step_fn(model, stem, t, gates, h_state, c_state, new_nodes)
+        per_step_h.append(h_state)
+
+    outs = list(node.output) + [""] * (3 - len(node.output))
+    if outs[0]:
+        unsq = []
+        for t, hv in enumerate(per_step_h):
+            u = _unique_name(model, f"{stem}_yu{t}")
+            new_nodes.append(
+                helper.make_node(
+                    "Reshape",
+                    [hv, _const_i64(model, f"{stem}_yu{t}_shape", [1, 1, batch, h])],
+                    [u],
+                    name=u,
+                )
+            )
+            unsq.append(u)
+        new_nodes.append(
+            helper.make_node("Concat", unsq, [outs[0]], name=f"{stem}_y", axis=0)
+        )
+    if outs[1]:
+        new_nodes.append(
+            helper.make_node(
+                "Reshape",
+                [h_state, _const_i64(model, f"{stem}_yh_shape", [1, batch, h])],
+                [outs[1]],
+                name=f"{stem}_yh",
+            )
+        )
+    if n_gates == 4 and outs[2]:
+        new_nodes.append(
+            helper.make_node(
+                "Reshape",
+                [c_state, _const_i64(model, f"{stem}_yc_shape", [1, batch, h])],
+                [outs[2]],
+                name=f"{stem}_yc",
+            )
+        )
+
+    # W/R/B's own values are already extracted into per-gate initializers
+    # above; the original packed tensors are now unused (split, not
+    # referenced by any remaining node).
+    orphaned = {w_init.name, r_init.name} | (
+        {b_init.name} if b_init is not None else set()
+    )
+    kept = [init for init in model.graph.initializer if init.name not in orphaned]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(kept)
+
+    return new_nodes
+
+
+def _lstm_step(model, stem, t, gates, h, c, new_nodes):
+    """ONNX `LSTM` semantics, gate order `i, o, f, c` (verified directly
+    against real `torch.onnx.export`-produced `LSTM` nodes)."""
+
+    def activate(op, idx):
+        xw, hr, wb, rb, pre = gates[idx]
+        s = _unique_name(model, f"{pre}_sum")
+        new_nodes.append(helper.make_node("Add", [xw, hr], [s], name=s))
+        s2 = _unique_name(model, f"{pre}_sum2")
+        new_nodes.append(helper.make_node("Add", [s, wb], [s2], name=s2))
+        s3 = _unique_name(model, f"{pre}_sum3")
+        new_nodes.append(helper.make_node("Add", [s2, rb], [s3], name=s3))
+        new_nodes.append(helper.make_node(op, [s3], [pre], name=pre))
+        return pre
+
+    it = activate("Sigmoid", 0)
+    ot = activate("Sigmoid", 1)
+    ft = activate("Sigmoid", 2)
+    ct_tilde = activate("Tanh", 3)
+
+    fc = _unique_name(model, f"{stem}_t{t}_fc")
+    new_nodes.append(helper.make_node("Mul", [ft, c], [fc], name=fc))
+    ic = _unique_name(model, f"{stem}_t{t}_ic")
+    new_nodes.append(helper.make_node("Mul", [it, ct_tilde], [ic], name=ic))
+    c_new = _unique_name(model, f"{stem}_t{t}_c")
+    new_nodes.append(helper.make_node("Add", [fc, ic], [c_new], name=c_new))
+    tanh_c = _unique_name(model, f"{stem}_t{t}_tanhc")
+    new_nodes.append(helper.make_node("Tanh", [c_new], [tanh_c], name=tanh_c))
+    h_new = _unique_name(model, f"{stem}_t{t}_h")
+    new_nodes.append(helper.make_node("Mul", [ot, tanh_c], [h_new], name=h_new))
+    return h_new, c_new
+
+
+def unroll_lstm(model):
+    """Replaces a forward, single-direction `LSTM` node with its own
+    per-timestep gate arithmetic -- `MatMul`/`Add`/`Sigmoid`/`Tanh`/`Mul`,
+    every one of which already has both a `graph_grad` backward rule and
+    NPU support (`AX650_SUPPORTED_OPS`), unlike the opaque `LSTM` op itself
+    (NPU-executable but with no backward rule at all --
+    `docs/axera-audio-speech-op-coverage.md`'s LSTM row).
+
+    Requires: static `[seq_length, batch, input_size]` input shape (shapes
+    are inferred internally, the same `dilated_conv_to_taps` precedent),
+    forward direction only, `W`/`R`/`B` as initializers, no peephole (`P`)
+    input, no `sequence_lens` input. A node outside this scope is left
+    untouched.
+
+    Numerically exact to float32 precision: verified directly against real
+    `torch.onnx.export`-produced `LSTM` nodes (gate order `i, o, f, c`,
+    bias layout `[Wb(i,o,f,c), Rb(i,o,f,c)]`), not derived from the ONNX
+    spec text alone.
+    """
+    shapes = _value_shapes(model)
+    out, changed = [], 0
+    for node in model.graph.node:
+        if node.op_type != "LSTM":
+            out.append(node)
+            continue
+        replacement = _unroll_recurrent_node(model, node, shapes, 4, _lstm_step)
+        if replacement is None:
+            out.append(node)
+            continue
+        out.extend(replacement)
+        changed += 1
+    if changed:
+        del model.graph.node[:]
+        model.graph.node.extend(out)
+    return changed
+
+
+def _gru_step(model, stem, t, gates, h, _c, new_nodes):
+    """ONNX `GRU` semantics with `linear_before_reset=1` (what real
+    `torch.onnx.export` always emits for `nn.GRU`), gate order `z, r, h` --
+    verified directly against a real export, not the spec text alone."""
+    zxw, zhr, zwb, zrb, zpre = gates[0]
+    rxw, rhr, rwb, rrb, rpre = gates[1]
+    nxw, nhr, nwb, nrb, npre = gates[2]
+
+    def gate_sum(op, xw, hr, wb, rb, pre):
+        s = _unique_name(model, f"{pre}_sum")
+        new_nodes.append(helper.make_node("Add", [xw, hr], [s], name=s))
+        s2 = _unique_name(model, f"{pre}_sum2")
+        new_nodes.append(helper.make_node("Add", [s, wb], [s2], name=s2))
+        s3 = _unique_name(model, f"{pre}_sum3")
+        new_nodes.append(helper.make_node("Add", [s2, rb], [s3], name=s3))
+        new_nodes.append(helper.make_node(op, [s3], [pre], name=pre))
+        return pre
+
+    zt = gate_sum("Sigmoid", zxw, zhr, zwb, zrb, zpre)
+    rt = gate_sum("Sigmoid", rxw, rhr, rwb, rrb, rpre)
+
+    # linear_before_reset=1: the reset gate scales (h @ Rh + Rbh) as a
+    # whole, added to the already-computed Wh/x term -- not `(rt*h) @ Rh`.
+    rc = _unique_name(model, f"{stem}_t{t}_rc")
+    new_nodes.append(helper.make_node("Add", [nhr, nrb], [rc], name=rc))
+    nxw_full = _unique_name(model, f"{stem}_t{t}_nxwfull")
+    new_nodes.append(helper.make_node("Add", [nxw, nwb], [nxw_full], name=nxw_full))
+    rn = _unique_name(model, f"{stem}_t{t}_rn")
+    new_nodes.append(helper.make_node("Mul", [rt, rc], [rn], name=rn))
+    n_pre = _unique_name(model, f"{stem}_t{t}_npre")
+    new_nodes.append(helper.make_node("Add", [nxw_full, rn], [n_pre], name=n_pre))
+    nt = npre
+    new_nodes.append(helper.make_node("Tanh", [n_pre], [nt], name=nt))
+
+    one_minus_z = _unique_name(model, f"{stem}_t{t}_1mz")
+    ones = _const_ones_like(model, f"{stem}_t{t}_ones", zt)
+    new_nodes.append(
+        helper.make_node("Sub", [ones, zt], [one_minus_z], name=one_minus_z)
+    )
+    a = _unique_name(model, f"{stem}_t{t}_a")
+    new_nodes.append(helper.make_node("Mul", [one_minus_z, nt], [a], name=a))
+    b = _unique_name(model, f"{stem}_t{t}_b")
+    new_nodes.append(helper.make_node("Mul", [zt, h], [b], name=b))
+    h_new = _unique_name(model, f"{stem}_t{t}_h")
+    new_nodes.append(helper.make_node("Add", [a, b], [h_new], name=h_new))
+    return h_new, None
+
+
+def _const_ones_like(model, stem, ref):
+    # `ref` is a runtime tensor (an activation), not a static shape -- a
+    # constant `1.0` broadcasts against it in `Sub` without needing its
+    # actual shape known ahead of time.
+    name = _unique_name(model, stem)
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.array(1.0, dtype=np.float32), name)
+    )
+    return name
+
+
+def unroll_gru(model):
+    """Replaces a forward, single-direction `GRU` node with its own
+    per-timestep gate arithmetic, the `GRU` counterpart of `unroll_lstm`.
+
+    A strictly bigger win than the LSTM case: `GRU` is not in
+    `AX650_SUPPORTED_OPS` at all (unlike `LSTM`, which at least runs at
+    inference), so this doesn't just add a backward rule -- it is the only
+    way a `GRU`-containing model runs on this hardware at all, training or
+    not. Same scope restrictions as `unroll_lstm` (forward direction,
+    static shapes, `W`/`R`/`B` as initializers, no `sequence_lens`).
+
+    Numerically exact to float32 precision: verified directly against a
+    real `torch.onnx.export`-produced `GRU` node, `linear_before_reset=1`
+    (what `nn.GRU` always exports), gate order `z, r, h`.
+    """
+    shapes = _value_shapes(model)
+    out, changed = [], 0
+    for node in model.graph.node:
+        if node.op_type != "GRU":
+            out.append(node)
+            continue
+        replacement = _unroll_recurrent_node(model, node, shapes, 3, _gru_step)
+        if replacement is None:
+            out.append(node)
+            continue
+        out.extend(replacement)
+        changed += 1
+    if changed:
+        del model.graph.node[:]
+        model.graph.node.extend(out)
+    return changed
+
+
 #: Order matters. `dilated_conv_to_taps` consumes a convolution's `pads`
 #: attribute, so it has to run before `explicit_conv_padding` zeroes it.
 RULES = {
@@ -1190,6 +1537,8 @@ RULES = {
     "dilated_conv_to_taps": dilated_conv_to_taps,
     "explicit_conv_padding": explicit_conv_padding,
     "filename_safe_io_names": filename_safe_io_names,
+    "unroll_lstm": unroll_lstm,
+    "unroll_gru": unroll_gru,
 }
 
 #: The rules a graph needs to be a *training* step rather than an inference
@@ -1204,6 +1553,8 @@ TRAINING_RULES = (
     "rank0_to_rank1",
     "gemm_to_matmul",
     "act_weight_conv_to_matmul",
+    "unroll_lstm",
+    "unroll_gru",
 )
 
 
