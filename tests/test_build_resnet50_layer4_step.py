@@ -38,9 +38,7 @@ def out_dir(tmp_path_factory):
 
 
 @pytest.mark.parametrize("scope", ["layer4_1_2", "layer4_all"])
-def test_build_step_produces_a_checked_step_graph_with_the_right_scope(
-    out_dir, scope
-):
+def test_build_step_produces_a_checked_step_graph_with_the_right_scope(out_dir, scope):
     step_path, state, params = m.build_step(out_dir, scope, batch=1)
     assert params == m.SCOPES[scope]
     assert set(state) == set(params)

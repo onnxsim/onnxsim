@@ -84,7 +84,9 @@ def test_downgrade_reduce_axes_to_attr_converts_input_to_attribute():
     axes_attr = next(a for a in reduce_after.attribute if a.name == "axes")
     assert list(axes_attr.ints) == [2, 3]
     assert not any(a.name == "noop_with_empty_axes" for a in reduce_after.attribute)
-    assert all((o.version if not o.domain else None) in (17, None) for o in out.opset_import)
+    assert all(
+        (o.version if not o.domain else None) in (17, None) for o in out.opset_import
+    )
     assert next(o.version for o in out.opset_import if not o.domain) == 17
 
     x = np.random.default_rng(0).standard_normal((1, 4, 3, 3)).astype(np.float32)
@@ -119,7 +121,9 @@ def _flatten_reshape_model(target_dims):
     w = numpy_helper.from_array(
         np.random.default_rng(1).standard_normal((8, 4)).astype(np.float32), "w"
     )
-    shape = numpy_helper.from_array(np.array(target_dims, dtype=np.int64), "shape_const")
+    shape = numpy_helper.from_array(
+        np.array(target_dims, dtype=np.int64), "shape_const"
+    )
     model = parser.parse_model(
         """
         <
