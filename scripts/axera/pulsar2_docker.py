@@ -73,11 +73,25 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from _local_import import ensure_repo_onnxsim  # noqa: E402
+
+# Fixed up here, at module import time, rather than beside the lazy `import
+# onnxsim` inside build()/build_from_hf_checkpoint() below: those run
+# whenever a caller happens to invoke them, which could be long after
+# sys.path has been rearranged by something else. See ensure_repo_onnxsim's
+# own docstring for the worktree hazard this avoids.
+ensure_repo_onnxsim()
 
 DEFAULT_IMAGE = "pulsar2:6.0-lite"
 
