@@ -527,6 +527,74 @@ def test_a_raw_constant_node_is_folded_before_backward():
     assert predicted == pytest.approx(fd, rel=0.05, abs=1e-6)
 
 
+def test_resident_dataset_gather_matches_feeding_the_same_rows_directly():
+    """`add_resident_dataset` replaces `x`/`y` with `Gather(dataset, index)`
+    off a resident constant. The whole point is that training on rows
+    `[i, j]` selected by `batch_index=[i, j]` computes exactly what feeding
+    `x=dataset[[i, j]]`/`y=dataset_y[[i, j]]` directly (the pre-existing,
+    per-step-re-upload pipeline) already does -- gradients included, not
+    just the forward pass."""
+    rng = np.random.default_rng(3)
+    forward = brts.set_batch(_forward_model(), batch=2)
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+
+    n_rows = 5
+    x_data = rng.standard_normal((n_rows, 1, 4, 4)).astype(np.float32)
+    y_data = rng.standard_normal((n_rows, 10)).astype(np.float32)
+    resident = brts.add_resident_dataset(with_loss, {"x": x_data, "y": y_data})
+    onnx.checker.check_model(resident)
+    assert not any(inp.name in ("x", "y") for inp in resident.graph.input)
+    assert any(inp.name == "batch_index" for inp in resident.graph.input)
+
+    step_model, state = brts.build_resident_step(resident, params=["cw", "gw"])
+    onnx.checker.check_model(step_model)
+
+    cw0 = onnx.numpy_helper.to_array(
+        next(t for t in forward.graph.initializer if t.name == "cw")
+    )
+    gw0 = onnx.numpy_helper.to_array(
+        next(t for t in forward.graph.initializer if t.name == "gw")
+    )
+    out_names = [o.name for o in step_model.graph.output]
+
+    idx = np.array([1, 3], dtype=np.int64)
+    feeds_gathered = {
+        "batch_index": idx,
+        "lr": np.array([1.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": cw0,
+        "gw": gw0,
+    }
+    outs_gathered = dict(zip(out_names, _run(step_model, feeds_gathered, out_names)))
+
+    # The reference: the *pre-gather* step graph, fed the same rows directly
+    # -- built from the same forward+loss model, just skipping
+    # add_resident_dataset entirely.
+    ref_step_model, ref_state = brts.build_resident_step(with_loss, params=["cw", "gw"])
+    ref_out_names = [o.name for o in ref_step_model.graph.output]
+    feeds_direct = {
+        "x": x_data[idx],
+        "y": y_data[idx],
+        "lr": np.array([1.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": cw0,
+        "gw": gw0,
+    }
+    outs_direct = dict(
+        zip(ref_out_names, _run(ref_step_model, feeds_direct, ref_out_names))
+    )
+
+    # Output tensor names differ (the gather graph has extra upstream nodes,
+    # so onnxsim's auto-generated names shift) -- compare by state's own
+    # mapping, and the shared loss name, not by raw output-name equality.
+    assert set(state) == set(ref_state)
+    for p in state:
+        np.testing.assert_allclose(
+            outs_gathered[state[p]], outs_direct[ref_state[p]], rtol=1e-5, atol=1e-6
+        )
+    np.testing.assert_allclose(outs_gathered["loss"], outs_direct["loss"], rtol=1e-5)
+
+
 def test_fold_constants_is_a_noop_without_any_constant_nodes():
     """`build_resident_step` only pays for `_fold_constants`'s simplify()
     pass when the graph actually has a `Constant` node -- confirm a plain
