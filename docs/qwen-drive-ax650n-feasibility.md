@@ -37,7 +37,7 @@ environment produced it. This settles nothing about the diffusion-loop
 static-graph question raised in the earlier config-only answer -- the
 question is moot until the code exists somewhere reachable.
 
-## The text/LLM backbone: real export failure, not a config guess
+## The text/LLM backbone: exports with `dynamo=True`, five real op gaps
 
 The backbone (`vlm_config.text_config`, `model_type: qwen3_5_text`) *is*
 real and released -- `Qwen3_5TextModel`, confirmed instantiable and runs a
@@ -65,16 +65,78 @@ opset version 18 is not supported
 ```
 
 `aten::diff` (discrete difference) shows up inside the Gated DeltaNet
-recurrence's reference implementation. The newer `torch.export`-based
-(`dynamo=True`) exporter was not tried to completion -- it needs `onnxscript`,
-not installed in this environment -- so whether ONNX's decomposition-based
-exporter handles `aten::diff` where the legacy tracer doesn't is a real,
-concrete, cheap next step (`pip install onnxscript` and retry), not answered
-here. As it stands with the tooling on hand: **the text backbone does not
-export**, full stop, and the earlier "linear attention ops are probably
-outside `AX650_SUPPORTED_OPS`" guess doesn't even get the chance to be
-checked -- the block is one step earlier, at PyTorch-to-ONNX, not at
-ONNX-to-Pulsar2.
+recurrence's reference implementation.
+
+**Update: `dynamo=True` clears `aten::diff` entirely -- it was a
+legacy-exporter gap, not a real one.** `pip install onnxscript` and
+`torch.onnx.export(..., dynamo=True)` on the identical model/inputs never
+even mentions `aten::diff` -- the newer `torch.export`-based exporter
+decomposes it into ONNX-expressible ops before op translation, where the
+legacy TorchScript tracer just gave up. It does hit one *different*, earlier
+blocker first: `torch.export` requires every input/output to be a
+pytree-registered type, and `Qwen3_5TextModel`'s default `use_cache=True`
+puts a `transformers.cache_utils.DynamicCache` in the output, which isn't
+registered -- `RuntimeError: Found <class
+'transformers.cache_utils.DynamicCache'> in output, which is not a known
+type`. Trivial workaround, not a real architectural constraint: wrap the
+model and call it with `use_cache=False` (a training step doesn't want an
+incremental-decode cache anyway -- this is exactly the same "training
+doesn't need KV-cache decode" point already made about the `pulsar2 build`
+vs. `pulsar2 llm_build` path choice elsewhere in this project's docs). With
+that wrapper, `dynamo=True` **exports cleanly end to end** -- graph capture,
+decompositions, ONNX translation, and the exporter's own graph optimizer all
+report success.
+
+The real op-coverage question is now answerable, and it looks a lot like the
+vision encoder's: real, but small. The raw export is 3124 nodes over 31
+unique op types; `onnxsim.simplify()` (with its own numeric check passing)
+takes it to 2917 nodes -- a much smaller reduction than the vision encoder's
+529-&gt;210, because most of this graph is Gated DeltaNet's actual chunked-scan
+arithmetic (`Transpose`/`Slice`/`Gather`/`ScatterElements`/`ScatterND`/`ReduceSum`
+in the hundreds each), not shape scaffolding, so there's little scaffolding
+for `simplify()` to remove:
+
+| | before `simplify()` | after `simplify()` |
+| --- | --- | --- |
+| nodes | 3124 | 2917 (check_ok=True) |
+| ops outside `AX650_SUPPORTED_OPS` | `CumSum`, `IsNaN`, `Neg`, `Reciprocal`, `Trilu` | same five, all survive |
+
+All five are load-bearing (they survive constant-folding/DCE, same standard
+the vision-encoder check used to separate real gaps from scaffolding):
+
+- `Neg` -- already solved, `legalize.py`'s existing `neg_to_mul` rule (same
+  one the vision encoder needs).
+- `CumSum` -- the same op the vision encoder's windowed-attention indexing
+  also needed; now confirmed to show up in a second, unrelated architecture
+  (Gated DeltaNet's chunked recurrence uses cumulative sums over the chunk
+  dimension), which raises its priority as a legalization rule worth writing
+  once, not a one-off.
+- `IsNaN` -- likely a numerical-stability guard somewhere in the reference
+  fallback kernel (not traced to the exact line); this is the same op family
+  the audio-speech survey (`docs/axera-audio-speech-op-coverage.md`) flagged
+  as having no `graph_grad` backward rule for wav2vec2's masking, though here
+  the question is forward op coverage on the NPU, not backward differentiability.
+- `Reciprocal` -- a new gap, not seen in any prior model checked in this
+  project. `Div` is covered by `AX650_SUPPORTED_OPS`, so a `Reciprocal(x)` ->
+  `Div(1, x)` rewrite is a plausible cheap legalization if this turns out to
+  matter, but that is a guess, not something tried here.
+- `Trilu` -- almost certainly the causal-attention mask's triangular
+  constant construction (`full_attention` layers need a causal mask; `Trilu`
+  is the standard ONNX op for building one). If it is applied to a
+  compile-time-constant shape, this may fold to a plain initializer under a
+  different simplify configuration or opset; not checked here.
+
+So: **the text/LLM backbone exports (with a one-line, semantically-irrelevant
+`use_cache=False` wrapper), and needs the same order of new legalization work
+as the vision encoder -- roughly four to five new/shared rules, not a
+fundamental blocker.** The original "linear attention ops are probably
+outside `AX650_SUPPORTED_OPS`" guess turns out to be not quite right either:
+none of the five gap ops are exotic linear-attention-specific primitives --
+`chunk_gated_delta_rule`'s actual arithmetic (`MatMul`, `Sigmoid`, `Softplus`,
+`Mul`/`Add`/`Sub`) is entirely within `AX650_SUPPORTED_OPS`. The gaps are in
+its indexing/bookkeeping (`CumSum`, `Reciprocal`, `Trilu`) and a stability
+guard (`IsNaN`), the same *category* of gap the vision encoder has, not a
+deeper architectural mismatch.
 
 ## The vision encoder: exports cleanly, four real op gaps survive `simplify()`
 
@@ -115,30 +177,43 @@ covered by anything in this project's existing legalization rules.
 | component | exports? | AX650 op coverage | verdict |
 | --- | --- | --- | --- |
 | planning head (diffusion expert) | **no** -- code doesn't exist in any released `transformers` | N/A | blocked entirely, upstream of any AX650 question |
-| text/LLM backbone | **no** -- `aten::diff` unsupported by the legacy exporter | not reached | blocked at PyTorch-to-ONNX; untried: `dynamo=True` + `onnxscript` |
+| text/LLM backbone | **yes**, with `dynamo=True` + a `use_cache=False` wrapper | 5 real gaps (`CumSum`, `IsNaN`, `Neg`, `Reciprocal`, `Trilu`), all fixable-shaped | viable in principle, needs ~4-5 new legalization rules |
 | vision encoder | **yes** | 4 real gaps (`CumSum`, `Mod`, `OneHot`, `Range`) + 1 known-solved (`Neg`) | closest to viable, still needs 4 new legalization rules |
 
-This sharpens, and partly reverses, the earlier config-only answer. The raw
-weight-memory arithmetic there (INT8 ~4.23 GiB plausible against the AX650N's
-~6.875 GiB CMM, INT4 ~2.11 GiB comfortable) was never the real question --
-two of the three components can't even be exported to ONNX today, by
-completely different mechanisms (missing model code vs. an unsupported
-PyTorch op), and the one that does export needs four new op-coverage rules
-that don't exist yet. "Does it fit" doesn't have a meaningful answer until
-those are addressed; weight size was never close to being the binding
-constraint.
+This sharpens, and this time strengthens rather than reverses, the picture:
+**two of the three real (i.e. code-exists) components now export and land on
+the same kind of gap** -- a handful of indexing/bookkeeping ops
+(`CumSum`/`Mod`/`OneHot`/`Range`/`Reciprocal`/`Trilu`) plus one
+already-solved op (`Neg`), not a deep architectural mismatch and not the
+exotic-linear-attention-op blocker the original config-only answer guessed
+at. `CumSum` recurring in *both* independently-checked components (windowed
+vision attention and the DeltaNet chunked recurrence) is the strongest signal
+in this whole investigation that it's worth writing one shared legalization
+rule rather than two one-offs. The planning head remains fully blocked, for
+a reason no amount of export-tooling cleverness fixes: the code to even
+instantiate it does not exist anywhere reachable.
+
+The raw weight-memory arithmetic from the original config-only answer (INT8
+~4.23 GiB plausible against the AX650N's ~6.875 GiB CMM, INT4 ~2.11 GiB
+comfortable) still hasn't been the binding constraint at any point in this
+investigation -- every blocker found so far has been at the export/op-coverage
+layer, not memory.
 
 ## What would actually move this forward, cheapest first
 
-1. `pip install onnxscript` and retry the text backbone with
-   `torch.onnx.export(..., dynamo=True)` -- five minutes, answers whether
-   `aten::diff` is a legacy-exporter gap or a real one.
-2. Trace `CumSum`/`Mod`/`OneHot` back to the exact vision-tower source lines
-   that emit them, to know whether they're avoidable by a different
-   windowing choice (same spirit as this project's own `avgpool_ceil_to_floor`
-   and `rank0_to_rank1` legalization rules -- answer a specific compiler
-   complaint, don't design a general rule speculatively) or need a genuine
-   new `graph_grad`/`legalize.py` rule each.
+1. **Done, this update**: `dynamo=True` + `onnxscript` clears `aten::diff`
+   for the text backbone; a `use_cache=False` wrapper clears the
+   `DynamicCache` pytree issue underneath it. Both were cheap (five minutes
+   each) and both worked.
+2. Write the `CumSum` legalization rule first, since it's now confirmed
+   load-bearing in two unrelated components -- highest leverage of anything
+   found across this whole investigation. Then `Mod`/`OneHot`/`Range`
+   (vision) and `Reciprocal`/`Trilu`/`IsNaN` (text backbone), each following
+   this project's established discipline of tracing back to the exact
+   compiler complaint before generalizing a rule (see `legalize.py`'s
+   `avgpool_ceil_to_floor`/`rank0_to_rank1` for the pattern) -- none of the
+   five new ops here were traced to exact source lines in this pass, so that
+   tracing is real remaining work, not a rubber stamp.
 3. The planning head has no cheap next step -- it needs the actual
    `qwen_drive` modeling code, which is not publicly available anywhere this
    check could reach.
