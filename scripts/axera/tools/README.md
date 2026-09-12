@@ -125,6 +125,24 @@ prefill cannot be timed with the shipped CLI. These talk to
   a resolution ceiling, not convergence" section for the real result.
   (a calibration-range regression, not a runner bug) -- see that same
   section before trusting a batch>1 run's loss/weight output.
+- `w2v2fe_runner_capture.c` -- `w2v2fe_runner_realdata.c` variant built to
+  supply the one thing no earlier wav2vec2 run persisted: the full
+  trainable-weight tensor (not just its `w[0]` scalar readback) at a window
+  of late-training steps, plus the final state -- the real trajectory data
+  `../build_w2v2fe_mp_swap_phase2.py` needs to recalibrate against, since a
+  multi-phase calibration swap (PRs #1355/#1356's technique) needs real
+  late-stage values on disk, and nothing before this wrote any.
+  Usage: `w2v2fe_runner_capture model.axmodel steps warmup lr capture_start
+  capture_stride capture_count out_dir` -- writes `out_dir/w_capture_<i>.bin`
+  (raw float32, full weight tensor) for `capture_count` steps starting at
+  `capture_start` every `capture_stride` steps, `out_dir/loss_capture.txt`,
+  and `out_dir/final.state0` (the run's last weight state, in
+  `resident_runner.c`'s own `.state0` convention -- feed it straight to a
+  phase-2 compile as its seed). See the audio-speech coverage doc's "Multi-
+  phase calibration swap breaks the plateau, then hits a new one" section
+  for the real result this produced: a genuine, confirmed loss decrease past
+  PR #1376's plateau, though phase 2 hits its own new resolution ceiling
+  quickly rather than resuming unbounded training.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
