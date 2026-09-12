@@ -1368,6 +1368,11 @@ before jumping straight to all three) or the debug-tap check above to settle
 resnet50's own loss=0 question, not further architecture generalization
 work.
 
+~~Both done.~~ The loss=0 question is settled below ("resnet50 batch
+scaling" section); the remaining `layer4` blocks are done further below
+("All three `layer4` bottleneck blocks" section) -- jumping straight to all
+three worked on the first attempt, no incremental step needed after all.
+
 ### resnet50 batch scaling: real, and it settles the loss=0 caveat too
 
 Every batch-scaling measurement so far in this doc (the "Batching" and
@@ -1497,6 +1502,83 @@ not just on resnet18 -- consistent with the compound-scaling section's own
 finding that the two levers are independent effects (vNPU contention depends
 on N, not on the model or its batch size), now confirmed on a second
 architecture rather than assumed to generalize.
+
+### All three `layer4` bottleneck blocks: the "remaining two blocks" recommendation, done directly
+
+The "resnet50, first compile" section above left an explicit next step
+unfinished: "the remaining two bottleneck blocks of `layer4` (watch compile
+time; extrapolate from this block's 57.8s before jumping straight to all
+three)". Rather than the cautious incremental route that sentence
+recommends, went straight to all three blocks (`layer4.0` + `layer4.1` +
+`layer4.2`'s main-path convs, 9 convs total, plus `fc.weight` -- 10
+trainable tensors, ~2.5x the original single-block scope's tap count; each
+block's shortcut/`downsample` conv stays frozen, matching `layer4.2`'s own
+original main-path-only scope choice) and it worked on the first attempt --
+the "watch compile time" caution turned out to be conservative here, not a
+real risk at this particular scope.
+
+**Built and verified on host:** 327 nodes (up from 201 for `layer4.2` alone,
+265 for a `layer4.1`+`layer4.2` two-block scope also built along the way --
+node count grows roughly linearly with trainable tap count across all three
+points, not the non-linear blowup the batch-size axis shows). Central-
+difference check on two of the ten trainable tensors (`layer4.0.conv1` and
+`layer4.0.conv2`, chosen as the two furthest from the loss and therefore the
+most exposed to any gradient-accumulation mistake across the wider scope):
+0.99992 and 0.99895 cosine similarity, confirming `_linearize_trainable_convs`
+still generalizes correctly at this scope.
+
+**Compiled cleanly:** `pulsar2 build`, batch 1, **184.6s** -- 3.2x the
+single-block scope's 57.8s for 2.5x the trainable tap count, comfortably
+short of the compile-time wall the batching sections above establish (which
+only bites well past this, e.g. resnet18 batch 32 at >25 minutes). One fused
+NPU subgraph, 11.7 MB `.axmodel`.
+
+**A new, real calibration-stability finding, not previously hit by any
+single-tensor scope:** a naive `lr` sweep across several orders of magnitude
+(1e-6 to 1e-2, matching the dynamic range `build_w2v2fe_batch_calib.py`'s own
+`lr=100`-based recipe used successfully for a *single* trainable tensor) blew
+up to `loss=9e8` at `lr=1e-2` and produced `NaN` weights by `lr>=1` when
+applied to a **compounding** real host trajectory across all ten tensors at
+once -- ten tensors' worth of gradient magnitude flowing through the same
+`lr` multiplier destabilizes far sooner than any single-tensor case in this
+project has needed to consider. Fixed by holding `lr` constant at `1e-4`
+(confirmed stable, real loss decrease step-over-step) for the whole real
+host trajectory used to seed calibration, and leaving `make_training_calib`'s
+own built-in default (a non-degenerate +/-0.1% jitter around `1e-4`) to
+provide the calibration range's actual variety rather than a real_data
+override -- the lesson generalizes: **a real_data host trajectory's own
+stability (not just its calibration non-degeneracy) becomes a real
+constraint once enough trainable tensors compound in a single SGD step**,
+something no earlier single- or four-tensor scope in this doc had reason to
+find.
+
+**Ran on real hardware:** a new `n_state`-parametric runner
+(`scripts/axera/tools/resnet_layer4_runner.c`, generalizing
+`resnet50_realdata_runner.c`'s hardcoded `N_STATE=4` to any trainable-tensor
+count via a runtime argument, same I/O layout convention otherwise) gave a
+real, monotonically non-increasing loss curve at batch 1, real host-trajectory
+calibration, `lr=1e-4`: `335.2 -> 167.6 -> 125.7 -> 125.7 -> 125.7 -> 125.7 ->
+83.8 -> 83.8 -> ...` (20 real steps, no zeros, no NaNs) -- the flat runs
+between drops are the same ordinary INT8 quantization-step plateau this doc's
+other resnet50/resnet18 sections already document, not a new finding. **76.5
+ms avg / 72.0 ms min per step**, roughly 2.5x `layer4.2`-alone's 29.8 ms,
+tracking the ~2.5x increase in trainable weight moved per step rather than
+the quantize/dequantize-tax-dominates-regardless-of-depth finding those
+earlier sections make (that finding was about *frozen* backbone depth, not
+trainable-tensor count, and does not contradict this). **32.5 MiB CMM** --
+still a small fraction of the card's 7040 MiB budget, consistent with every
+earlier case in this doc.
+
+**Net finding: scaling the trainable scope of a real architecture from one
+bottleneck block to all three "just worked" on the first real attempt**, with
+the only genuine new gap being the calibration-stability finding above (now
+documented for the next model that trains many tensors from one compounding
+host trajectory) -- not a pipeline change, a compile-time wall, or a backend
+bug. The two-block `layer4_1_2` intermediate scope
+(`scripts/axera/build_resnet50_layer4_step.py`'s other `SCOPES` entry) was
+built and host-verified but not compiled/run on hardware, since going
+straight to all three succeeded and made the intermediate case moot for this
+pass.
 
 ## A memory-heavy case: Whisper-base encoder training
 
