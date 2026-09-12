@@ -1368,6 +1368,136 @@ before jumping straight to all three) or the debug-tap check above to settle
 resnet50's own loss=0 question, not further architecture generalization
 work.
 
+### resnet50 batch scaling: real, and it settles the loss=0 caveat too
+
+Every batch-scaling measurement so far in this doc (the "Batching" and
+"Batching and vNPU concurrency compound" sections above) was resnet18 only;
+resnet50 had never had `batch>1` tested at all. Closed that gap directly,
+reusing `build_resident_train_step.set_batch` on the same `layer4.2` +
+`fc.weight` scope this section built, real host-trajectory calibration (this
+doc's own established fix for the lr/grad_seed degenerate-calibration bug
+class, PRs #1370/#1373 -- applied from the start here, not bolted on after a
+third repeat of that bug), and a `resident_runner.c` variant that reads real
+`x0`/`y0`/state files from disk (rather than resident_runner's own fixed
+`memset` test pattern) so the loss curve is unambiguous.
+
+**Three real export/pipeline gaps hit and fixed getting there, none specific
+to batch scaling itself:**
+
+1. The legacy TorchScript exporter (`dynamo=False`) that this doc's original
+   resnet50 compile presumably used loses real per-layer names for
+   `resnet50d`'s non-stem tensors the same way `build_whisper_train_step`'s
+   docstring already documents for Whisper's encoder layers (`layer4.2.
+   conv1.weight` etc. all come out as generic `onnx::Conv_NNN`) -- confirmed
+   directly here, not assumed from the Whisper case. `dynamo=True`
+   (torch.export-based) preserves real names throughout, at the cost of
+   landing on **opset 18** regardless of the requested `opset_version` (the
+   onnxscript version-converter's fallback to the ONNX C API fails on this
+   graph and silently leaves it at 18).
+2. `ReduceMean`'s `axes` moved from attribute to input at opset 18.
+   `legalize._set_axes` already exists for exactly this (its own docstring:
+   "resnet18d is opset 18, the training graphs built by hand are opset 17"),
+   but `onnxsim.qat_graph.make_step_graph` always declares its *own* output
+   model at a fixed opset 17 while copying node protos through verbatim --
+   so an axes-as-input `ReduceMean` surviving from an opset-18 forward
+   export into the step graph fails the opset-17 schema (`Node with schema
+   ReduceMean:13 has input size 2 not in range [min=1, max=1]`). Fixed by
+   downgrading every such node back to the attribute form (and the model's
+   declared opset to 17) right after export, before anything else touches
+   the graph -- a real, if narrow, pre-existing gap in the opset-18-forward
+   -> opset-17-step-graph pipeline that this project's resnet18/Whisper work
+   never happened to trigger.
+3. `timm`'s `SelectAdaptivePool2d.flatten` traces to `Reshape(mean, [1,
+   2048])` -- the *batch-1* value baked in as a literal constant by the
+   exporter's trace, since `set_batch` (by its own docstring) only rewrites
+   the declared *input* shape and clears stale `value_info`, not every
+   batch-shaped constant an exporter baked in downstream. At batch>1 this
+   reshapes a `[batch, 2048, 1, 1]` tensor into `[1, 2048]`, which
+   onnxruntime correctly refuses on element-count mismatch. Fixed by
+   rewriting that one Reshape's target to `[-1, 2048]` (the standard ONNX
+   "infer this dim" sentinel) before `set_batch` runs -- the same *class* of
+   fix `build_w2v2_feature_extractor_step.py` needed for wav2vec2's own
+   batch-dependent flatten shape (PR #1372), on a different architecture.
+
+None of these three are specific to batch scaling -- (1) and (2) would have
+hit the very first resnet50 compile too, had that session's export happened
+to use `dynamo=True`; (3) only bites at `batch>1`, and is the one genuinely
+new finding of that kind.
+
+**Host-verified before touching hardware**: central-difference check against
+the in-graph gradient at batch 1 (same methodology as this section's
+original 0.99994 result) -- **0.99987 directional cosine similarity** across
+the 4 trainable tensors, confirming the pipeline change didn't alter the
+gradient math.
+
+**Real batch sweep, real AX650N** (per-sample compute exactly batch-
+invariant -- Pulsar2's own `group 0 QuantAxModel macs:` line reads
+390,889,472 / 1,563,557,888 / 3,127,115,776 at batch 1/4/8, exactly 4x/8x
+batch 1's figure, matching resnet18's own batch-invariance finding):
+
+| batch | compile time | step time (min / avg) | samples/s | achieved GOPS (min) | rated-TOPS utilization |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 57.4s | 29.258 ms / 30.252 ms | 34.2 | 26.7 | 0.148% |
+| 4 | 117.4s | 31.081 ms / 31.748 ms | 128.7 (3.77x) | 100.6 (3.77x) | 0.559% |
+| 8 | 339.6s | 36.655 ms / 38.788 ms | 218.3 (6.39x) | 170.6 (6.39x) | 0.948% |
+
+Batch 1 is close to resnet18's own 29.8ms first-compile number (this
+section, above) as expected -- the quantize/dequantize tax dominating step
+time regardless of depth, this doc's earlier finding, applies here again.
+The batch-scaling shape itself closely mirrors resnet18's own table (3.85x/
+6.67x samples/s at batch 4/8): **resnet50's bottleneck-block architecture
+scales with batch size the same way resnet18's basic-block architecture
+does** -- not a foregone conclusion (a real structural difference was the
+whole reason this doc's earlier section called out resnet50 as a distinct
+architecture to test in the first place), but confirmed rather than assumed.
+Compile time again grows faster than linear (57s -> 117s -> 340s, a 5.9x
+cost for 8x the batch, close to resnet18's own 70s -> 130s -> 386s at the
+same batch sizes) -- consistent with the established, generic Pulsar2
+compile-time-wall finding, not something specific to this architecture.
+Batch 16+ was not attempted, per the generic wall already established on
+resnet18.
+
+**This also settles the "still not verified" loss=0 caveat** this section's
+first-compile subsection left open. Every run above used real host-
+trajectory data (real `x`/`y`/weight values crossing the host boundary, not
+resident_runner.c's `memset(0x11)`/`memset(0x22)` pattern), and every batch
+size read a real, monotonically decreasing loss across 30 real steps (e.g.
+batch 1: `501.66 -> 492.4 -> ... -> 441.55`, no zeros, no NaNs, no frozen
+steps beyond ordinary INT8 quantization-step plateaus). This confirms the
+original *weaker* hypothesis was the right one: the reported `loss=0` was
+the quantizer correctly rounding a `memset`-near-zero runtime input down to
+zero, not a calibration or graph bug -- the same conclusion reached for
+resnet18's own memset-input runs, just not previously confirmed for
+resnet50 specifically.
+
+**Bonus check: vNPU concurrency still composes with batch>1 on this
+architecture too.** The "Execution overlap" section above already measured
+resnet50's own vNPU concurrency scaling at batch=1 (2.86x aggregate at N=8);
+the open question was whether that composes with `batch>1` the clean way
+the "Batching and vNPU concurrency compound" section found for resnet18.
+One data point, not resnet18's full sweep: 4 concurrent
+`AXCL_VNPU_ENABLE` contexts, each at batch=8 (same method as that section --
+N separate OS processes, each its own model-file copy), against a
+batch=8 `AXCL_VNPU_ENABLE` solo baseline of 24.9 steps/s (vs. 25.8
+`VNPU_DISABLE`, the same ~3-4% partitioning tax found before):
+
+| point | aggregate steps/s | aggregate GOPS | vs. 1x1 baseline (26.7 GOPS) |
+| --- | --- | --- | --- |
+| 1x1 (batch=1, disable) | 34.2 | 26.7 | 1.00x |
+| 4x1 (pure vNPU, batch=1, from "Execution overlap" above) | 79.0 | -- | -- |
+| 1x8 (pure batch) | 218.3 | 170.6 | 6.39x |
+| 4x8 | 71.0 (17.8+17.5+17.8+17.9) | 444.1 | **16.6x** |
+
+`efficiency(N=4) = 71.0 / (4 x 24.9) = 0.71` -- close to, if a bit higher
+than, resnet18's own N=4 efficiency figures (0.65 at batch=1, 0.63-0.64 at
+batch 4/8, from the compound-scaling section's table), and the 16.6x
+combined figure lands almost exactly on resnet18's own 4x8 point (16.70x)
+despite the different block architecture. **Composition is real here too**,
+not just on resnet18 -- consistent with the compound-scaling section's own
+finding that the two levers are independent effects (vNPU contention depends
+on N, not on the model or its batch size), now confirmed on a second
+architecture rather than assumed to generalize.
+
 ## A memory-heavy case: Whisper-base encoder training
 
 Every case above -- resnet18d and resnet50d, both at 64x64 input with a
