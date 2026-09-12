@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Five small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Seven small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -50,6 +50,27 @@ prefill cannot be timed with the shipped CLI. These talk to
   `build_multiphase_calib_swap_probe.py` builds -- fixed I/O order (`x y cw
   gw lr`), CLI `lr` and a `y` host file so the exact "does the update
   survive" experiment can be run without rebuilding.
+- `mp_calib_swap_auto_runner.c` -- automatic-trigger variant of the above:
+  after every step, checks whether the update carries no signal (either
+  unchanged from its input, or crushed to hard zero -- the two distinct
+  death signatures this project's history has found) and, on death, dumps
+  the last-known-good state to host files and exits with a distinct code
+  instead of running a fixed step count for a human to inspect afterward.
+  An `inject_step` argument can swap in a different-scale state mid-run (to
+  exercise the detector without needing a real multi-thousand-step
+  convergence run first) -- see the handoff doc's "Recalibrating Whisper for
+  its real gradient scale" section for what a real run of this found:
+  the detection-and-handoff mechanism itself works correctly, though a
+  clean survives-then-recovers demonstration still needs matched
+  calibration/seed values end to end.
+- `whisper_state_probe.c` -- like `whisper_resident_runner.c`, but prints
+  one state tensor's raw device-buffer contents directly before/after each
+  step instead of trusting the loss, which this project's history has
+  repeatedly found can look constant while hiding either a real update or a
+  dead one underneath (see the handoff doc's Whisper sections). Reads
+  `x`/`y` from fixed host files (`/root/whisper_x.bin`/`whisper_y.bin`) so
+  the same batch can be reused across differently-calibrated compiles of
+  the same graph shape.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
