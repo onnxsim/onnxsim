@@ -136,9 +136,7 @@ def test_correct_bias_recovers_resize_mode_swap_bias():
         "Add",
     ]
 
-    before = onnxsim.measure_accuracy_drop(
-        float_model, swapped, calibration_data=calib
-    )
+    before = onnxsim.measure_accuracy_drop(float_model, swapped, calibration_data=calib)
     after = onnxsim.measure_accuracy_drop(
         float_model, corrected, calibration_data=calib
     )
