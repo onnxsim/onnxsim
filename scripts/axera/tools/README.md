@@ -182,6 +182,18 @@ prefill cannot be timed with the shipped CLI. These talk to
   that section's own earlier "reported loss read exactly 0" caveat (a
   `memset`-near-zero test input rounding to 0 under real calibration, not a
   bug, the same conclusion resnet18's own memset runs already supported).
+- `resnet_layer4_runner.c` -- generalizes `resnet50_realdata_runner.c`'s
+  fixed `N_STATE=4` (`layer4.2` + `fc.weight` only) to an arbitrary
+  trainable-tensor count via a CLI `n_state` argument, for
+  `../build_resnet50_layer4_step.py`'s `layer4_1_2` (7 states) and
+  `layer4_all` (10 states) scopes -- the "remaining two bottleneck blocks of
+  `layer4`" next step `docs/axera-on-device-training-handoff.md`'s resnet50
+  section named. Same I/O layout convention as every other resident runner
+  here (`qat_graph.make_step_graph`'s own ordering): inputs
+  `x y state_0..N-1 lr[grad_seed]`, outputs `state_0'..N-1' loss`. Confirmed
+  real, monotonically decreasing loss training all three `layer4` blocks at
+  once (10 states) on the first attempt -- see the handoff doc's "All three
+  `layer4` bottleneck blocks" section.
 - `w2v2_encoder_attn_runner.c` -- `w2v2fe_runner_realdata.c` with only the
   header comment and I/O names changed for
   `../build_w2v2_encoder_attn_step.py`'s own model: the first wav2vec2

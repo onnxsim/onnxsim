@@ -1417,16 +1417,14 @@ calibrated range was itself the bug -- but **unconfirmed**, the same
 "checked coarsely, not the full gradient table" caveat PR #1335's original
 resnet18 run carried.
 
-**The concrete next step, not yet done for resnet50:** the same technique
-that resolved the batching-section caveat -- rebuild with an extra debug
-output tapping the per-sample squared error before the final reduction, and
-compare it against the reported scalar `loss` on real hardware. If the
-tapped value is already nonzero and the reduction alone zeroes it, that
-would point at the same class of range-miscalibration mechanism (worth
-comparing the `y` calibration range against the runtime `memset` value
-directly, the same check that cracked the batching-section case); if the
-tapped value is *itself* near-zero, that confirms the original benign
-hypothesis and there is nothing to fix.
+**Settled by PR #1382 (resnet50 batch scaling): benign, as originally
+hypothesized.** Real, non-`memset` image data (the `<model>.x0`/`.y0` host
+files `resnet50_realdata_runner.c` reads) trains with a real, monotonically
+decreasing loss at every batch size tested -- the `loss=0` reading was
+specific to `resident_runner`'s own fixed `memset` test pattern rounding to
+zero under real calibration, exactly the same conclusion resnet18's own
+memset runs already supported. No debug-tap rebuild was needed once real
+data settled it directly.
 
 **Recommendation for next time:** the pipeline needs no resnet50-specific
 changes -- the natural next step is either the remaining two bottleneck
