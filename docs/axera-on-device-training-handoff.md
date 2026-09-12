@@ -276,6 +276,89 @@ Batch size is nearly free until it is not: batch 1 to 16 costs 0.38 ms
 (1.40 -> 1.78) for **12.6x** the throughput; batch 64 is worse *per sample*
 than 16.
 
+### Graph-computed calibration/saturation signals: the mechanism works, and it's redundant on the tensor everyone tried it on
+
+The original ceiling note above says the fix plainly: *"fixed-point clipping
+is silent and local... a graph that wants reliable back-off needs to export
+`ReduceMax(|t|)` on those tensors as extra outputs."* Nobody had built this
+until now. `scripts/axera/build_calib_signal_probe.py` adds it: an
+`Abs`+`ReduceMax` tap on the gradient tensor, exposed as a real extra graph
+output alongside the existing `state`/`loss` outputs (`qat_graph.make_step_graph`
+has no generic "extra output" parameter, so this reimplements
+`build_resident_step`'s body directly, the same choice
+`build_multiphase_calib_swap_probe.py`/`build_matmul_grad_probe.py` made for
+their own one-off experiments -- and adds the output *before* running
+`simplify()`, so common-subexpression/dead-code elimination has no chance to
+drop a branch that would otherwise head nowhere).
+
+**The mechanism is real and verified.** Both ops are on `AX650_SUPPORTED_OPS`
+(confirmed, not assumed). The graph survives `legalize`/`simplify` with the
+signal outputs intact -- `onnxsim.simplify()`'s own contract (preserve
+declared inputs/outputs) held exactly as documented. Cross-checked against an
+independent finite-difference gradient on host: the graph's own
+`ReduceMax(Abs(grad))` output matched `np.abs(finite_diff_grad).max()` to
+**0.02%** (ratio 0.9998), for both trainable tensors in a real (if small)
+Conv/Relu/Flatten/Gemm training step -- the tap is computing exactly what it
+says it computes.
+
+**But tapping the *final* gradient tensor -- the one everyone's first
+instinct reaches for, including this investigation's own first attempt --
+turns out to be redundant, and it's worth stating plainly why.** The host
+already reads the gradient tensor back directly, every step, to apply the
+SGD update. `np.abs(returned_grad).max()` is computable from data the host
+loop already has, with no graph change at all. Adding a graph-computed
+`ReduceMax` on that *same* tensor duplicates information already available,
+for the cost of an extra output (however cheap) -- it does not, and cannot,
+give a *leading* indicator of anything, because it is a direct function of a
+tensor the host was never blind to in the first place.
+
+**Where the technique actually pays for itself** is exactly where the
+original note said: on tensors that do *not* otherwise reach any declared
+output -- an intermediate accumulator inside the backward pass (e.g. the
+gradient-seed's own `Mul` output, or an intermediate reduction stage before
+the final gradient is assembled) that can silently saturate or underflow
+*without the final gradient revealing why*, since fixed-point clipping is
+local to wherever it happens, not visible downstream. This investigation's
+own test model -- a small, shallow Conv/Relu/Flatten/Gemm step, chosen
+deliberately for fast iteration the same way PRs #1353/#1355/#1356 did --
+does not have a rich enough backward chain to exhibit an intermediate that
+saturates independently of the final gradient it feeds; demonstrating the
+technique's *real* value needs a deeper graph (more layers between the
+instrumented intermediate and any existing output) than this probe has.
+**Verdict: the mechanism is proven and cheap to add; its value is unproven on
+this graph because this graph's backward pass has no hidden intermediate
+worth instrumenting** -- not because the idea is wrong, but because the toy
+model that makes iteration fast is also too shallow to need it. The natural
+next probe is a graph with real depth between an internal tensor and its
+nearest existing output (the real resnet18/Whisper backward passes both
+qualify) with the tap placed on something genuinely internal, not the final
+gradient.
+
+Real hardware was not needed to reach this verdict -- the redundancy argument
+holds from the tensor's own definition (it's the thing the host already
+reads), independent of anything Pulsar2's compiler does to it, so this stayed
+entirely host-side.
+
+**A related, second question -- deriving calibration data from something
+computed rather than hand-picked -- was not built, but the groundwork this
+thread already has makes the answer fairly confident without a new
+experiment.** PRs #1354/#1355 established, to textbook-MinMax precision and
+an exact 10,000x/100x calibration-ratio match on real hardware, that
+Pulsar2's calibration range is a direct, precise function of whatever
+calibration data is supplied -- the two prior probes' 0.05/0.0005 and
+100x-ratio choices were hand-picked round numbers, not derived from anything.
+Replacing that guess with the real magnitude trajectory a host-side float
+reference run of the same training step actually produces (record N float
+SGD steps' true gradient magnitudes, use the value the run has reached at
+each intended phase-transition point as that phase's calibration data,
+instead of guessing a round number) is a straightforward workflow change to
+`scripts/axera/make_training_calib.py`, not a new mechanism -- the underlying
+calibration-precision result is already proven. Left as a follow-on rather
+than built here: this needs its own real multi-phase build-and-swap run to
+show the *difference* a computed magnitude makes over a hand-picked one
+(which requires the AX650N/Docker toolchain), and this task's time went to
+verifying the graph-signal mechanism above instead.
+
 ### Weights resident with in-graph updates: 7.0x, measured
 
 The 42.9 MB the resnet18 step moves is every trainable weight crossing the
