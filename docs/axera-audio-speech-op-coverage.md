@@ -72,7 +72,7 @@ simple. `Erf` is GELU's decomposed form -- `transformers`' export already
 emits the Erf-based GELU here, not the fused `Gelu` op, so the Gelu gap above
 does not block this model in practice.
 
-### wav2vec2 -- one gap, now confirmed real (not "maybe")
+### wav2vec2 -- one gap, confirmed real and now fixed
 
 `transformers.Wav2Vec2Model(...)`, 228 nodes:
 
@@ -102,15 +102,45 @@ projection) needs a gradient through its own layer's `Where`, because that
 `Where`'s input and output are both fresh intermediates computed inside that
 layer -- unlike an external bias tensor merely *added* to the scores, there
 is nothing outside the layer to treat as an opaque boundary input instead.
-**wav2vec2 (the plain, non-Conformer model) cannot train through any tail
-that includes attention output until `Where` has a backward rule.** That
-rule is not hard -- `Where`'s gradient is `dX = mask * g`, `dY = (1-mask) *
-g` with `mask = Cast(condition, FLOAT)`, i.e. the same "boolean condition
+**wav2vec2 (the plain, non-Conformer model) could not train through any
+tail that includes attention output until `Where` had a backward rule --
+and now it can.** `Where`'s gradient is `dX = mask * g`, `dY = (1-mask) *
+g` with `mask = Cast(condition, FLOAT)`, the same "boolean condition
 becomes a float 0/1 multiplied in, never re-emitted as `Where` itself"
 convention `graph_grad`'s own module docstring already states as a rule for
-every hand-written gradient here -- but it is real, unimplemented work, not
-a design workaround. Left for the next person who wants wav2vec2 itself
-(Whisper, below, remains gap-free and is still the better first trial).
+every hand-written gradient here, and it is now `onnxsim.graph_grad`'s
+`_grad_where`. `IsNaN` itself got a companion rule (`_grad_is_nan`,
+returning no gradient) for a narrower but load-bearing reason: this
+per-layer guard sits *inline* in the forward slice between `Softmax` and
+`Where`, and `build_backward` requires a registered rule for every node
+type it walks -- including one no gradient reaches -- not just the ones a
+seed actually flows through, so differentiating a slice containing
+`IsNaN(attn_weights)` raised `UnsupportedOpError` even though nothing ever
+needed its own gradient.
+
+Both rules live in a new `_PYTHON_ONLY_RULES` table (not `_RULES`): neither
+has a C++/WASM mirror yet, so folding them into the parity-pinned
+`SUPPORTED_OPS` `tests/test_qat_parity.py` checks against `qat_entry.cpp`
+would be a claim about the browser path that is not yet true. They *are*
+picked up automatically by every ordinary `build_backward(..., rules=None)`
+call and are visible through `graph_grad.supported_ops()`, so QAT/LoRA
+block discovery already treats a block containing them as differentiable --
+see `_PYTHON_ONLY_RULES`'s own comment in `onnxsim/graph_grad.py` for the
+full rationale, which mirrors `_grad_split`'s pre-existing
+`_MULTI_OUTPUT_RULES` precedent for the same "real rule, no C++ port yet"
+situation.
+
+**Not yet done:** an actual trainable tail spanning wav2vec2's attention
+output, built and verified on real AX650N hardware -- every wav2vec2 build
+script in `scripts/axera/` today (`build_w2v2_feature_extractor_step.py`,
+`build_w2v2fe_batch_calib.py`) still only trains the convolutional feature
+extractor, which never touches this `Where`. The backward rule itself is
+tested against finite differences on host
+(`tests/test_graph_grad.py`'s `where_branch_select`, `where_broadcasts_x`,
+and `where_isnan_guard` cases -- the last one mirroring this exact
+`Where(IsNaN(x), 0, x)` shape), but building the encoder-with-attention step
+graph, calibrating it, and confirming it compiles and trains on the card is
+real, separate, next work.
 
 ### Wav2Vec2-Conformer -- both gaps closed; one different, unresolved question
 
@@ -197,7 +227,7 @@ needs its own trace, not an inference from wav2vec2's). Flagged, not closed.
 | --- | --- | --- | --- |
 | Grouped/depthwise `Conv` has no forward-legalization path | **fixed** (`scripts/axera/legalize.py`'s `act_weight_conv_to_matmul`) | was: Conformer's `conv_module` | per-group tap-matmul + `Concat` back onto `Cout`, `group=1` path untouched |
 | `Split` has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_split`, via the new `_MULTI_OUTPUT_RULES` table) | was: Conformer's GLU gating | `MatMul` against a constant 0/1 selection matrix per output, no `Concat`, stays inside `BACKWARD_OPS` |
-| `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **confirmed blocking**, not a design workaround | plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is still unresolved | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; not yet implemented |
+| `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_where`/`_grad_is_nan`, via the new `_PYTHON_ONLY_RULES` table) | was: plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is a separate, still-open question (see below) | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; `IsNaN` itself gets a no-gradient rule so `build_backward` can walk over it inline |
 | Raw `Gelu` has no backward rule | open, low priority | only an exporter emitting fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
 | LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | open, largest lift | any classic RNN-based ASR/TTS model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
 
@@ -237,21 +267,22 @@ fixed-length input (no attention-mask handling at all) that sidesteps every
 `Where`-shaped question this survey has now spent real effort on for the
 other two families.
 
-The ranking below it changed. Wav2Vec2-Conformer's conv-module gaps
-(depthwise `Conv`, `Split`) are now **closed** -- it is Conformer's
-still-open, differently-shaped `Where` question (see above) that gates it
-next, not the conv-module work this pass finished. Plain wav2vec2 dropped
-from "second choice, likely fine" to **blocked**: its `Where`/`IsNaN`
-numerical-stability cleanup is confirmed to sit inside every encoder layer's
-own attention computation with no external tensor to route a trainable
-tail's boundary around, so it needs `Where`'s backward rule implemented
-before any tail including attention output can train, not just a careful
-choice of trainable region. Concretely, after Whisper: either implement
-`Where`'s backward rule (unblocks wav2vec2 outright, and is the same
-"boolean condition, not the op, becomes a float mask" work either way) or
-trace Conformer's shared-condition `Where` end-to-end to confirm it is
-excludable by block boundary (cheaper if it pans out, but unproven, and
-resolves only Conformer -- `Where`'s backward rule resolves both).
+The ranking below it changed twice now. Wav2Vec2-Conformer's conv-module
+gaps (depthwise `Conv`, `Split`) are **closed**, and plain wav2vec2's own
+`Where`/`IsNaN` block is now **closed too** -- `onnxsim.graph_grad._grad_where`/
+`_grad_is_nan` (see the wav2vec2 section above) give both `Where`'s
+numerical-stability guard and Conformer's shared-condition `Where` a real
+backward rule, generically, regardless of which shape either usage takes.
+What is left is not implementing the rule (done) but *using* it: no
+`scripts/axera/` build script has yet built a wav2vec2 (or Conformer) step
+graph whose trainable tail spans attention output, so the concrete next
+step is that build-and-verify-on-hardware work, not further `graph_grad`
+coverage. Conformer's own shared-condition `Where` (see above) still has a
+narrower, separate open question -- whether its condition is in practice
+excludable by a careful block boundary, cheaper than differentiating
+through it at all -- but that is now an optimization question, not a
+blocker, since the rule handles either shape correctly if the boundary
+question is left unanswered.
 
 ## Reproducing the exports
 
