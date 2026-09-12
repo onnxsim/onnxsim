@@ -576,15 +576,45 @@ Real step times, now trustworthy since correctness is confirmed at batch=4:
 | 1 | 5.590ms / 5.865ms | 11.039 MiB |
 | 4 | 18.838ms / 19.353ms | 25.534 MiB |
 
-Batch=8 was not re-verified in this pass (the same `grad_seed` fix should
-apply identically, since the bug and fix are batch-size-independent in
-mechanism -- flagged as the remaining confirmation step, not assumed).
-vNPU+batching compounding was not re-checked here either -- both are now
-individually real, but composing them is a follow-on, not done in this pass.
+**Batch=8: re-verified with the `grad_seed` fix, confirmed working.** Same
+`build_w2v2fe_batch_calib.py` driver, `batch=8`. Real hardware, `lr=100`,
+8 steps: loss moves smoothly and monotonically, `1.03951 -> 1.00037`
+(plateauing over the last two steps at the same tracked-weight-quantization
+granularity already documented for batch=4 -- not a bug). Step time
+35.577ms min / 36.186ms avg, cmm 45.957 MiB.
+
+**vNPU + batching composition: real, but weaker than resnet18's, and
+saturates earlier.** `-v` at batch=8, N=1: bit-identical loss/weight
+trajectory vs. disabled, confirming non-corrupting at this batch size too
+(same check PRs #1345/#1346/#1372 already established at batch=1). Real
+concurrent throughput, batch=8, separate OS processes per context, all
+converging to the identical loss (`0.965574`) confirming correctness held
+under concurrency:
+
+| config | aggregate steps/s | aggregate samples/s | vs. batch=1,N=1 baseline (164.3 samples/s) |
+| --- | --- | --- | --- |
+| batch=8, N=1 | 27.3 | 218.4 | 1.33x |
+| batch=8, N=4 | 82.5 | 660.0 | 4.02x |
+| batch=8, N=8 | 85.6 | 684.8 | 4.17x |
+| batch=1, N=8 (PR #1372) | -- | 607.9 | 3.70x |
+
+Unlike resnet18 (PR #1346: 6.5x batching alone x 2.5x vNPU alone -> 18.1x
+combined, cleanly multiplicative), this model's batching gain alone is
+much smaller (1.33x, not 6.5x -- Conv1D quantize/glue overhead dominates
+differently here) and the combination **saturates by N=4** (660 -> 684.8
+samples/s from N=4 to N=8, a 3.8% gain for double the contexts) rather than
+continuing to scale to N=8 the way resnet18 did. Real, honest result: the
+two levers still both help, but this architecture's per-step compute at
+batch=8 already occupies enough of the NPU that fewer concurrent contexts
+saturate it, so the combination is additive-ish rather than cleanly
+multiplicative. Best practical point here is N=4 (nearly all of N=8's gain
+for half the contexts), not N=8.
 
 **Net**: three real calibration bugs found and fixed for this model across
-PRs #1367/#1370/this fix -- `x_scale`/`weight_scale` mismatch, degenerate
-constant-`lr` range, and now uncalibrated `grad_seed` -- all in the same
+PRs #1367/#1370/#1373 -- `x_scale`/`weight_scale` mismatch, degenerate
+constant-`lr` range, and uncalibrated `grad_seed` -- all in the same
 family (a scalar or tensor whose calibration data was never matched to its
-real runtime distribution). Batching is now confirmed working at batch=4;
-batch=8 and vNPU+batch composition remain open, low-risk follow-ons.
+real runtime distribution). Batching is now confirmed working at batch=4
+and batch=8; vNPU+batch composition is confirmed real but weaker and
+earlier-saturating than resnet18's own result -- both flagged follow-ons
+from PR #1373 are now closed.
