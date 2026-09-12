@@ -146,6 +146,90 @@ compiled model byte-identical in every quantization-relevant field to
 recalibration alone -- confirming, independently, that `output_data_type` truly
 contributes nothing on `MatMul`.
 
+### Multi-phase calibration swap: the mechanism, hardware-verified past the isolated probe
+
+Turned the recalibration lever above into a real, working demonstration
+rather than leaving it as a design note. Not on the full resnet18 pipeline --
+`resnet18d_folded.onnx` (the forward model earlier sections' compiles used) is
+no longer present in this session's scratch, and regenerating it (BN-folding
+included) was out of scope for the time this task had -- but on
+`tests/test_build_resident_train_step.py`'s own small real forward model
+(`x -> Conv -> Relu -> Flatten -> Gemm -> logits`, trainable `cw`/`gw`)
+through the **real, unmodified pipeline**
+(`add_mse_loss`/`build_resident_step`/`pulsar2_docker.build()`) -- a genuine
+multi-node training-step graph (35 nodes after simplify), not the single-`MatMul`
+isolated probe the levers above were tested on. `gb` (the Gemm bias) was left
+frozen: trained, it hits a real, separate compiler crash
+(`TileFailException("AxQuantizedSub, tuple index out of range")` on the SGD
+subtract for that specific tiny 10-element tensor) unrelated to anything this
+task investigated -- worth a bug report if this model shape is revisited, not
+chased further here.
+
+Built two compiles, identical graph, differing only in `make_training_calib`'s
+`weight_scale` (0.05 -- "early training" -- vs. 0.0005 -- "late training", the
+same 100x ratio methodology as the isolated-probe result above), each in
+**~15s** (this graph's own size, not resnet18's -- the batching section's
+70-450s figures don't apply here). Confirmed the compiler-recorded scales
+move by **exactly 100.00x** between the two builds, for both trainable
+tensors and their SGD-updated state outputs alike (`quant_axmodel.json`'s
+`tensor_configs`/`values`, same evidentiary method as the isolated-probe
+result):
+
+| tensor | phase 1 scale (weight_scale=0.05) | phase 2 scale (weight_scale=0.0005) | ratio |
+| --- | --- | --- | --- |
+| `cw` | 0.0012102693 | 1.2102693e-05 | 100.00x |
+| `cw`'s updated state | 0.0012102675 | 1.2102679e-05 | 100.00x |
+| `gw` | 0.0013282200 | 1.3282201e-05 | 100.00x |
+| `gw`'s updated state | 0.0013282195 | 1.3282196e-05 | 100.00x |
+
+This confirms the isolated probe's finding generalizes past one `MatMul` to a
+real multi-node graph with a real Conv, a real SGD update, and simplify()
+in the loop.
+
+**Real hardware demonstration**: fed the identical late-training-scale weight
+state (`cw`/`gw` values ~100x smaller than phase 1's own calibration) and the
+identical batch/lr into both compiled models, 5 steps each:
+
+| model | fed | `cw[0]` before | `cw[0]` after | relative update |
+| --- | --- | --- | --- | --- |
+| phase 1 (calibrated for scale 0.05) | late-scale weights | 0.000152358538 | **0** | dead |
+| phase 2 (calibrated for scale 0.0005) | the same late-scale weights | 0.000152358538 | **0.000157334827** | **1.03266x** |
+| phase 1 (reference) | its own matching early-scale weights | 0.0152358543 | 0.0157334786 | 1.03266x |
+
+Phase 2 recovers the **exact same relative update** (1.03266x) that phase 1
+gets on weights at its own calibrated scale -- a real, correctly-proportioned
+SGD step -- while phase 1 fed the same late-scale state loses it completely,
+landing on exactly zero. This is the "swap to a recalibrated model when the
+current one's gradient dies" mechanism working end to end: the same weight
+*values* handed from one compiled model to the next (via ordinary host-side
+files -- `resident_runner.c`'s existing `.state<k>` convention, no
+graph-level coupling between the two compiles needed), only the calibration
+differs.
+
+**What this does and doesn't prove.** This demonstrates the mechanism with
+one real transition (2 phases, chosen and swapped by hand) -- not a 3-phase
+sweep, and not an automatic controller. Real, open costs and questions for
+whoever builds on this:
+
+- **A phase swap costs a full recompile** -- ~15s on this small graph, and
+  per the batching section's own numbers, 70-450s+ on the real resnet18
+  pipeline. Not free, and not something to do every few steps.
+- **How many phases a genuinely long run needs, and where to place the
+  boundaries, is open.** This demo used one 100x jump because that's the
+  ratio already validated on the isolated probe; a real schedule would likely
+  want smaller, more numerous steps, chosen from the actual gradient-decay
+  curve of a real training run rather than picked by hand.
+- **Triggering is manual here.** `finetune.LossScaler`'s existing
+  `zero_fraction`/`DEFAULT_UNDERFLOW` detector is the natural fit for
+  deciding *when* to swap (its role changes from "grow/backoff a scale" to
+  "signal a model swap"), but wiring that up, and actually swapping the
+  running `resident_runner` process out from under a live loop, is
+  unbuilt.
+- **Hiding the recompile cost** (building phase N+1 speculatively while phase
+  N is still training, so the swap is instant when it's needed) is a real,
+  unexplored option given a spare CPU core and Docker daemon are cheap
+  relative to the AX650N itself.
+
 ## Speed
 
 `axcl_run_model` costs ~580 ms per invocation (process start, device open,
