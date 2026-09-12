@@ -56,6 +56,7 @@
 #include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
 #include "passes/maxpool_rowmajor_when_indices_unused.h"
+#include "passes/neg_to_mul.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
@@ -173,6 +174,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::MagnitudePruningGlobal>(registry);
     RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
     RegisterOrReplace<p::MaxPoolRowMajorWhenIndicesUnused>(registry);
+    RegisterOrReplace<p::NegToMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
