@@ -25,13 +25,18 @@ cloud GPU box is the usual fit.)
 Open [`cuda_feature_tests.ipynb`](cuda_feature_tests.ipynb) in Colab (use the
 badge at the top of the notebook, or upload it manually) and select a GPU
 runtime: `Runtime > Change runtime type > T4 GPU` (or any NVIDIA GPU). Then
-run the cells top to bottom -- the first cells install onnxsim from source
-and the GPU build of onnxruntime (`onnxruntime-gpu`).
+run the cells top to bottom. By default the install cell installs a
+pre-built wheel of the latest development build from
+[TestPyPI](https://test.pypi.org/project/onnxsim/) (published from `master`
+daily by CI -- no C++ toolchain needed) plus the GPU build of onnxruntime
+(`onnxruntime-gpu`). Set `BUILD_FROM_SOURCE = True` in that cell to instead
+build a specific `BRANCH`/tag from source, e.g. to exercise unreleased
+changes.
 
 It works the same way outside Colab: any Jupyter environment with an NVIDIA
 GPU and driver, `pip install onnxsim[onnxruntime] onnxruntime-gpu`, and the
-CUDA-specific cells run as-is (skip the `git clone`/`pip install -e` cell and
-just install onnxsim however you normally would).
+CUDA-specific cells run as-is (skip the install cell and just install
+onnxsim however you normally would).
 
 Each test prints `[PASS]`/`[FAIL]` as it runs and raises immediately on the
 first failure, so a red cell points straight at what broke; the final cell
