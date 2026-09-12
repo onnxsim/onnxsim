@@ -49,6 +49,17 @@ The gradient is an **output tensor**, quantised at a range fixed when the model
 was built. As training converges the true gradient shrinks below half a
 quantisation step and rounds to zero -- every entry, eventually.
 
+**`docs/axera-quantizer-reverse-engineering.md`** confirms, quantitatively, that
+Pulsar2's calibration is textbook asymmetric MinMax over the caller-supplied
+calibration data specifically (not graph structure) -- meaning recalibrating
+with late-training-scale (small) synthetic gradient values, entirely within
+Pulsar2's own sanctioned pipeline, is a real, untested candidate fix for this
+ceiling. That document also found `Conv` has a separate `output_data_type:
+"FP32"` override distinct from `layer_configs`' `data_type` override -- whether
+`MatMul` has the same is the most promising untried lever for a plateau found
+while pursuing loss scaling via an FP32 gradient seed (see the still-open PR
+that introduced that finding for the full context once merged).
+
 | gradient tensor | dies at | best SNR reached |
 | --- | --- | --- |
 | U8 | step ~1,000 | 30.88 dB |
