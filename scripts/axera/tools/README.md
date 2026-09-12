@@ -95,6 +95,15 @@ prefill cannot be timed with the shipped CLI. These talk to
   read-the-raw-state-buffer diagnostic this project has needed twice
   before to catch a gradient dying silently behind a healthy-looking loss
   output.
+- `w2v2fe_runner_realdata.c` -- `w2v2fe_runner.c` with `x`/`y` read from
+  `<model>.x0`/`<model>.y0` host files instead of a fixed `memset` pattern,
+  used to confirm real (not degenerate) inputs actually train once
+  calibration is fixed -- see the audio-speech coverage doc's "Fixed: real
+  calibration data" section for the real multi-step result this produced
+  and the two calibration bugs (input-scale mismatch, a degenerate constant
+  `lr` calibration range) it found along the way. `argv[4]` overrides `lr`
+  at runtime for sweeping it against the compiled model's own calibrated
+  range.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):

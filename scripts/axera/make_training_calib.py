@@ -141,7 +141,24 @@ def make_work_dir(
                         np.int64
                     )
                 elif inp.name == "lr":
-                    arr = np.array([1e-4], dtype=np.float32)
+                    # A tiny jitter, not an exact repeat: `n` *identical*
+                    # samples give MinMax a zero-width range, silently
+                    # pinning the runtime value to that one constant no
+                    # matter what is actually fed -- confirmed on real
+                    # hardware (a wav2vec2 feature-extractor build, "Fixed:
+                    # real calibration data..." section of
+                    # docs/axera-audio-speech-op-coverage.md): sweeping `lr`
+                    # from 0.01 to 10000 returned bit-identical loss/weights
+                    # at every value, the same "calibrated narrowly, pins to
+                    # a constant" signature PR #1353 found for `grad_seed`.
+                    # This default only avoids the *degenerate* (zero-width)
+                    # case -- it does not widen the range to whatever a
+                    # caller actually intends to sweep at runtime, which
+                    # `real_data={"lr": [...]}` remains the right tool for
+                    # (see this function's own `real_data` doc above).
+                    arr = np.array(
+                        [1e-4 * (1.0 + 1e-3 * rng.standard_normal())], dtype=np.float32
+                    )
                 elif inp.name == x_name:
                     arr = (rng.standard_normal(dims) * x_scale).astype(np.float32)
                 else:
