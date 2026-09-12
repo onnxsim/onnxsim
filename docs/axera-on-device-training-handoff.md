@@ -1693,6 +1693,54 @@ own I/O order was still resnet18's, left over from copying
 `resident_runner.c` -- the actual index constants in the body were always
 right, only the prose above them was stale.)
 
+### Surveying NVIDIA TransformerEngine: one accidental discovery beats everything else tried
+
+Full writeup: `docs/transformerengine-low-precision-survey.md`. Most of
+TransformerEngine's real techniques don't port as designed -- its core
+mechanism (a runtime-adjustable FP8 scale, no recompile) is confirmed
+incompatible with Pulsar2's compile-time-baked quantisation, the same wall
+every recalibration-without-recompiling idea in this thread has hit. But
+checking *why*, against Pulsar2's own `build_config.proto`, surfaced a real,
+previously-untried field: **`quant.highest_mix_precision: true`**. Confirmed
+empirically (not from its name) to force **every op type in the graph,
+`MatMul` included**, to FP32 -- a blunt whole-graph override, not
+TE-style targeted mixed precision. Built and ran it on real AX650N hardware
+against the small multi-phase probe: it reproduces the exact `onnxruntime`
+float32 answer (`loss` and both trainable weights' updates match to
+displayed precision) where the standard INT8 build gets the **wrong sign**
+on both updates on the same feed -- and at this small scale, costs no more
+step time than the standard build (0.250ms vs. 0.266ms min). This is a
+stronger, more complete result than the FP32-seed plateau (PR #1353) or the
+build-time-locked calibration swap (PR #1355/#1356): no plateau, nothing to
+recompile per regime, exact float agreement, through the exact `MatMul`
+boundary nothing else reached. **Tested at real scale, and it does not
+survive contact with either real architecture this project has.** Whisper
+`last_half` (523 nodes, 460.3s INT8 baseline reconfirmed) fails
+`highest_mix_precision` after 46.7s with a real `TileFailException` on the
+first `AxLayerNorm` -- an FP32 `(1,1500,512)` LayerNorm exceeds the NPU
+backend's own tiling workspace limit; a `layer_configs` attempt to force
+just that op back to `U8` does not compose (`highest_mix_precision`
+confirmed non-overridable per-op). resnet18 (136 nodes, 65.9s INT8 baseline
+reconfirmed) fails after 17.2s with a *different* real error -- an actual
+Python `TypeError` inside Pulsar2's own scheduler (`'>' not supported
+between instances of 'list' and 'int'`) when its `AvgPool` (resnet18d's own
+avgpool-downsample shortcut, in the frozen backbone, unavoidable) is forced
+to FP32. Both are real, named NPU-backend implementation gaps in Pulsar2's
+own FP32 tiling support -- not a quantization-math problem, and not
+something recalibration or graph restructuring on this project's side can
+route around. Full writeup and exact tracebacks:
+`docs/transformerengine-low-precision-survey.md`'s follow-up section.
+
+Also built, as a genuinely portable idea separated from TE's own
+CUDA-specific mechanism: `scripts/axera/amax_calibration.py`, a rolling
+amax-history algorithm (TE's own statistic, applied to choosing multi-phase
+calibration *targets* instead of a hand-picked ratio) that answers this
+doc's own standing "how many phases, where do the boundaries go" question
+from a real trajectory -- and correctly reports zero boundaries for a
+trajectory shaped like Whisper's own real (flat, non-decaying) one, rather
+than recommending a schedule that would not have fixed Whisper's actual
+failure mode.
+
 ## What to do next
 
 1. ~~The FP32 gradient seed.~~ **Tested: real effect, not a full fix.** See
