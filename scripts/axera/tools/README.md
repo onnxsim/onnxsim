@@ -137,12 +137,16 @@ prefill cannot be timed with the shipped CLI. These talk to
   (raw float32, full weight tensor) for `capture_count` steps starting at
   `capture_start` every `capture_stride` steps, `out_dir/loss_capture.txt`,
   and `out_dir/final.state0` (the run's last weight state, in
-  `resident_runner.c`'s own `.state0` convention -- feed it straight to a
-  phase-2 compile as its seed). See the audio-speech coverage doc's "Multi-
-  phase calibration swap breaks the plateau, then hits a new one" section
-  for the real result this produced: a genuine, confirmed loss decrease past
-  PR #1376's plateau, though phase 2 hits its own new resolution ceiling
-  quickly rather than resuming unbounded training.
+  `resident_runner.c`'s own `.state0` convention -- feed it straight to the
+  next phase's compile as its seed; also reused as-is to capture phase 2's
+  own trajectory for a phase-3 build). See the audio-speech coverage doc's
+  "Multi-phase calibration swap breaks the plateau, then hits a new one" and
+  "Phase 3" sections for the real result this produced: a genuine, confirmed
+  loss decrease past PR #1376's plateau on the first swap, but a
+  diminishing-returns, not-repeatable-indefinitely technique -- the second
+  swap (phase 2 -> 3) bought no further gain, since phase 2's own real
+  trajectory had already narrowed to a single quantization step with
+  nothing left for another recalibration to exploit.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
