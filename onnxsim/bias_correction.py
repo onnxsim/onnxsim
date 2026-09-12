@@ -16,20 +16,34 @@ variant, which estimates the same shift from BatchNorm statistics instead
 of running real data through the model, is not implemented here) and
 cancels it.
 
-For every Conv/Gemm/MatMul node present (by output tensor name) in both
-``float_model`` and ``quantized_model``, this runs both models on the same
-calibration data, measures each such layer's own per-output-channel mean
-error (``float_output - quantized_output``, independent of any other
+The same measurement applies to any output-preserving *algorithm* swap, not
+only quantization: e.g. a deployment target whose Resize kernel doesn't
+implement every interpolation mode, so onnxsim (or a downstream converter)
+rewrites a model's Resize node to a mode the accelerator does support. That
+rewrite is exact for some inputs and systematically off for others in a way
+that, like quantization rounding, tends to have a nonzero mean per channel
+-- ``correct_bias`` treats it identically to a quantized Conv/Gemm/MatMul's
+bias shift, measuring and cancelling it the same way. It does not (and
+cannot) recover a mode swap's non-systematic, input-dependent error --
+that would need real fine-tuning of downstream weights, not a constant
+offset.
+
+For every Conv/Gemm/MatMul/Resize node present (by output tensor name) in
+both ``float_model`` and ``quantized_model``, this runs both models on the
+same calibration data, measures each such layer's own per-output-channel
+mean error (``float_output - quantized_output``, independent of any other
 layer's correction -- not chained through progressively-corrected
 activations), and adds that as a constant per-channel offset right after
 the layer in ``quantized_model``. Adding a constant to an affine layer's
 output is exactly equivalent to folding it into that layer's bias, whatever
 internal shape the ``quantize_*`` scheme that produced it happens to use
 (a straight Conv/Gemm/MatMul weight-only rewrite, a multi-node dynamic-
-quantization chain, ...) -- so this needs no scheme-specific knowledge of
-where a bias tensor lives internally, only that the layer's own output
-tensor kept its original name, which every onnxsim ``quantize_*`` pass
-guarantees (downstream consumers are never rewired by name).
+quantization chain, a Resize mode substitution, ...) -- so this needs no
+scheme-specific knowledge of where a bias tensor lives internally, only
+that the layer's own output tensor kept its original name, which every
+onnxsim ``quantize_*`` pass (and any Resize-attribute rewrite that edits
+the node in place) guarantees (downstream consumers are never rewired by
+name).
 """
 
 from __future__ import annotations
@@ -43,12 +57,19 @@ from onnxsim import backend
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 
 # op_type -> the axis its own output tensor's "channel" dimension sits on.
-# Conv is always NCHW-style (batch, channel, spatial...), so channel is
-# axis 1 regardless of spatial rank. Gemm/MatMul put the output feature
-# dimension last regardless of transpose attributes (Gemm's output shape is
-# always [M, N] whatever transA/transB are; MatMul has no transpose
-# attributes at all), so channel is axis -1.
-_CORRECTABLE_OPS: Dict[str, int] = {"Conv": 1, "Gemm": -1, "MatMul": -1}
+# Conv and Resize are always NCHW-style (batch, channel, spatial...), so
+# channel is axis 1 regardless of spatial rank (this matches the same
+# assumption structured_pruning's MatchResizeChannelPassThrough makes about
+# Resize's layout). Gemm/MatMul put the output feature dimension last
+# regardless of transpose attributes (Gemm's output shape is always [M, N]
+# whatever transA/transB are; MatMul has no transpose attributes at all),
+# so channel is axis -1.
+_CORRECTABLE_OPS: Dict[str, int] = {
+    "Conv": 1,
+    "Gemm": -1,
+    "MatMul": -1,
+    "Resize": 1,
+}
 
 
 def _all_names(graph: onnx.GraphProto) -> Set[str]:
@@ -125,18 +146,23 @@ def correct_bias(
     correction_threshold: float = 1e-12,
 ) -> onnx.ModelProto:
     """Empirically corrects the per-channel output bias
-    ``quantized_model``'s Conv/Gemm/MatMul layers picked up from their own
-    weight quantization, using real calibration data run through both
-    models. See this module's own docstring for the technique.
+    ``quantized_model``'s Conv/Gemm/MatMul/Resize layers picked up from
+    their own weight quantization (or, for Resize, from an algorithm/mode
+    change), using real calibration data run through both models. See this
+    module's own docstring for the technique.
 
     :param float_model: the original (unquantized) onnx ModelProto or file
             path
-    :param quantized_model: a quantized version of ``float_model`` (onnx
-            ModelProto or file path), e.g. from :func:`onnxsim.quantize` or
-            any ``quantize_*`` function. Assumes ``quantized_model`` was
-            produced from ``float_model`` without renaming any
-            Conv/Gemm/MatMul node's own output tensor -- true of every
-            onnxsim ``quantize_*`` function.
+    :param quantized_model: a modified version of ``float_model`` (onnx
+            ModelProto or file path) whose Conv/Gemm/MatMul/Resize layers
+            keep their original output tensor names -- e.g. a quantized
+            model from :func:`onnxsim.quantize` or any ``quantize_*``
+            function, or a model with a Resize node's ``mode``/
+            ``coordinate_transformation_mode`` swapped for one an
+            accelerator supports. Assumes ``quantized_model`` was produced
+            from ``float_model`` without renaming any candidate node's own
+            output tensor -- true of every onnxsim ``quantize_*`` function
+            and of any in-place Resize-attribute rewrite.
     :param calibration_data: representative input batches to measure the
             correction on. Each batch is a ``{input_name: np.ndarray}``
             dict matching ``float_model``'s graph inputs -- see

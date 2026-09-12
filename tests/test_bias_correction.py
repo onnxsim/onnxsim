@@ -99,6 +99,56 @@ def test_correct_bias_recovers_known_injected_gemm_bias():
     assert after.worst_relative_l2 < 1e-5
 
 
+def _resize_model(mode, c=4, spatial=4, opset=19, ir_version=9):
+    scaled = spatial * 2
+    return _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] x) => (float[1,{c},{scaled},{scaled}] y)
+        {{
+          scales = Constant<value = float[4] {{1.0, 1.0, 2.0, 2.0}}>()
+          y = Resize<mode = "{mode}">(x, , scales)
+        }}
+        """,
+        opset=opset,
+        ir_version=ir_version,
+    )
+
+
+def test_correct_bias_recovers_resize_mode_swap_bias():
+    # Not a quantization scenario: `swapped` is `float_model` with its
+    # Resize's interpolation mode changed (e.g. because a deployment
+    # accelerator doesn't implement "linear"), which -- like quantization
+    # rounding -- leaves a systematic per-channel mean shift that
+    # correct_bias should measure and cancel.
+    float_model = _resize_model("linear")
+    swapped = _resize_model("nearest")
+
+    rng = np.random.default_rng(10)
+    calib = [
+        {"x": rng.standard_normal((1, 4, 4, 4)).astype(np.float32)} for _ in range(16)
+    ]
+
+    corrected = onnxsim.correct_bias(float_model, swapped, calibration_data=calib)
+    onnx.checker.check_model(corrected)
+    assert [n.op_type for n in corrected.graph.node] == [
+        "Constant",
+        "Resize",
+        "Add",
+    ]
+
+    before = onnxsim.measure_accuracy_drop(
+        float_model, swapped, calibration_data=calib
+    )
+    after = onnxsim.measure_accuracy_drop(
+        float_model, corrected, calibration_data=calib
+    )
+    # A per-channel constant can't undo a genuinely different resampling
+    # algorithm, only its systematic (mean) component -- so this only
+    # checks that correction never makes the measured error worse, not
+    # that it drives it to zero the way the injected-bias tests do.
+    assert after.worst_relative_l2 <= before.worst_relative_l2 + 1e-9
+
+
 def test_correct_bias_recovers_known_injected_conv_bias():
     rng = np.random.default_rng(2)
     c_in, c_out = 4, 6
