@@ -2116,6 +2116,7 @@ def apply_qat(
     fake_quant: bool = True,
     preserve_sparsity: bool = False,
     optimizer: str = "adam",
+    teacher_forced_inputs: bool = True,
 ) -> onnx.ModelProto:
     """Fine-tunes one block's quantized weights (and, opted in, its activation
     quantizers) against the float model's own
@@ -2399,6 +2400,33 @@ def apply_qat(
             and activation-quantizer state exist only when their own opt-in
             flags are on). Raises :class:`ValueError` if ``optimizer`` is
             neither of the two recognized strings.
+    :param teacher_forced_inputs: capture ``block_input_name`` and every
+            other externally-supplied tensor the block reads (see
+            :func:`_slice_block`) from ``float_model``, the default and the
+            approximation every block-wise reconstruction method here makes
+            (see this module's own docstring). Set to ``False`` to instead
+            capture them from ``quantized_model`` -- ``block_output_name``'s
+            target is still captured from ``float_model`` either way, since
+            reproducing the teacher's output is always the objective.
+
+            **This is what makes the block able to compensate for a change
+            upstream of it, not only inside it.** With the default
+            (``True``), training only ever sees the *teacher's* activation
+            entering the block, so it can only fix something the two models
+            disagree about *inside* the block (a quantized/pruned/rewritten
+            weight) -- if the block's own weights already agree, the loss is
+            zero from the first step and nothing trains, no matter how
+            different ``quantized_model``'s upstream computation is,
+            because the mismatch never reaches the block at all. With
+            ``False``, the block is trained on exactly the (possibly
+            distorted) activation it will actually receive at inference --
+            e.g. a Resize node upstream of the block having its ``mode``/
+            ``coordinate_transformation_mode`` swapped for a deployment
+            accelerator, which :func:`onnxsim.correct_bias`/
+            :func:`onnxsim.correct_spatial_bias` can only partially cancel
+            (a constant or coarse spatial offset, not a real function of the
+            input) -- so the block's weights can learn an actual
+            compensating function of that distortion instead.
     :returns: ``quantized_model`` with the block's quantized weight
             initializers (and, if ``learn_scales``, their scale
             initializers; if ``learn_activation_scales``, the activation
@@ -2436,18 +2464,28 @@ def apply_qat(
             float_model, num_samples=num_samples, seed=seed
         )
 
-    captured = _capture(
-        float_model,
-        sorted(set(plan.externals) | {plan.output_name}),
-        calibration_data,
-        providers,
-    )
+    if teacher_forced_inputs:
+        captured = _capture(
+            float_model,
+            sorted(set(plan.externals) | {plan.output_name}),
+            calibration_data,
+            providers,
+        )
+        external_values = {name: captured[name] for name in plan.externals}
+        teacher_output = captured[plan.output_name]
+    else:
+        external_values = _capture(
+            quantized_model, sorted(plan.externals), calibration_data, providers
+        )
+        teacher_output = _capture(
+            float_model, [plan.output_name], calibration_data, providers
+        )[plan.output_name]
     return _train_block(
         float_model,
         quantized_model,
         plan,
-        {name: captured[name] for name in plan.externals},
-        captured[plan.output_name],
+        external_values,
+        teacher_output,
         num_iterations=num_iterations,
         learning_rate=learning_rate,
         learn_scales=learn_scales,
@@ -3096,6 +3134,7 @@ def apply_block_finetune(
     step_providers: Optional[Sequence[backend.Provider]] = None,
     losses: Optional[List[float]] = None,
     preserve_sparsity: bool = False,
+    teacher_forced_inputs: bool = True,
 ) -> onnx.ModelProto:
     """Fine-tunes one block's float weights against a *reference* model's own
     output for that block -- :func:`apply_qat` with the quantizer taken out of
@@ -3110,11 +3149,14 @@ def apply_block_finetune(
     training framework: the same step graph, run the same way, on whatever
     execution provider ``step_providers`` names.
 
-    **The two models must differ, or there is nothing to learn.** The loss is
-    the student block's output against the reference's, so a student that *is*
-    the reference starts at zero loss and stays there. This is for the case
-    where something has already changed the model and the change cost
-    accuracy:
+    **The two models must differ somewhere the training actually sees, or
+    there is nothing to learn.** With the default ``teacher_forced_inputs``
+    (see :func:`apply_qat`, which this forwards to), the block always trains
+    on the *reference's* own activation entering it, so what has to differ
+    is the block's own weights -- a student that already has the
+    reference's weights there starts at zero loss and stays there. This is
+    for the case where something has already changed the model's weights
+    and the change cost accuracy:
 
     - a **structurally** pruned model
       (:func:`onnxsim.apply_structured_pruning`,
@@ -3133,6 +3175,35 @@ def apply_block_finetune(
       rewritten by any of this package's rounding passes;
     - a model already fine-tuned once, being tuned further against the
       original.
+
+    **With ``teacher_forced_inputs=False``,** the requirement moves upstream:
+    now it is ``model``'s own computation *before* the block that has to
+    differ from ``reference_model``'s, since that is what the block actually
+    trains against. This is for a change upstream of any trainable layer --
+    e.g. a Resize node's ``mode``/``coordinate_transformation_mode`` swapped
+    for a deployment accelerator, which leaves the block's own weights
+    identical between the two models (so the default, teacher-forced mode
+    is a guaranteed no-op here: see :func:`apply_qat`'s own docstring for
+    why) but changes what the block actually receives at inference.
+
+    **What this actually needs is downstream capacity, not proximity.**
+    Measured on a Resize mode swap (``linear`` -> ``nearest``) at three
+    positions in a small Conv stack, against the same held-out set
+    :func:`onnxsim.correct_spatial_bias` measured ~0% (or, with two more
+    Conv+ReLU stages between the swap and the trained block, ~2.5% *worse*
+    -- see that function's own module docstring) reduction on regardless of
+    position: with three trainable Conv layers between the swap and the
+    model's own output, ``teacher_forced_inputs=False`` recovered ~61%;
+    with only *one* trainable layer there, ~57% -- almost the same recovery
+    from far less remaining capacity, because one layer was already enough
+    to express a useful compensating function of this particular
+    distortion. The one configuration where it recovered nothing was not
+    "far from the swap" but **no trainable block at all**: with the Resize
+    as the model's own last op, there is no ``block_output_name`` downstream
+    of it to name, so there is nothing this parameter -- or any block-wise
+    method -- can be pointed at. That is a real ceiling worth knowing before
+    reaching for this: it is not a matter of degree that a longer run or a
+    different block boundary works around.
 
     It is *not* a way to fine-tune on new data or a new task: the objective is
     "reproduce what the reference model produced", which by construction
@@ -3218,6 +3289,12 @@ def apply_block_finetune(
             ``float_model``, which is the ordinary order anyway). Elements it
             holds are held exactly, not approximately -- see
             :func:`_build_step_graph` for why one ``Mul`` is enough.
+    :param teacher_forced_inputs: see :func:`apply_qat`, which this
+            forwards to unchanged. Leave at the default (``True``) to fix a
+            block whose *own weights* changed (pruning, a rounding pass);
+            set to ``False`` to fix a block whose weights are unchanged but
+            whose *upstream input* changed (see this docstring's own "two
+            models must differ" section above).
     :returns: ``model`` with the block's weight initializers rewritten. Every
             other byte is untouched.
     :raises ValueError: if the block cannot be discovered, is not closed at
@@ -3245,6 +3322,7 @@ def apply_block_finetune(
         losses=losses,
         fake_quant=False,
         preserve_sparsity=preserve_sparsity,
+        teacher_forced_inputs=teacher_forced_inputs,
     )
 
 
