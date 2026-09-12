@@ -588,3 +588,60 @@ constant-`lr` range, and now uncalibrated `grad_seed` -- all in the same
 family (a scalar or tensor whose calibration data was never matched to its
 real runtime distribution). Batching is now confirmed working at batch=4;
 batch=8 and vNPU+batch composition remain open, low-risk follow-ons.
+
+### The 2,000-step plateau (PR #1376) is a resolution ceiling, not convergence -- settled with a real lr-drop experiment
+
+PR #1376 ran this model for 2,000 real steps (batch=4, `lr=100`) and found
+real loss progress through ~step 1,500 (`1.0116 -> 0.870241`), then a flat
+plateau -- but with the tracked weight still visibly bouncing between a
+handful of quantized values through the plateau, unlike resnet18's clean
+frozen-solid gradient death. It left open which of two things this was:
+ordinary SGD convergence at an oversized `lr` (weight oscillates near a
+minimum, loss just can't show sub-quantization-step progress), or a
+genuinely degraded gradient signal.
+
+**Settled with a direct experiment**, reusing the exact compiled artifact
+and calibration from that run (`/tmp/w2v2_longrun_work/step.onnx.axmodel`,
+still on disk): a new runner variant
+(`scripts/axera/tools/w2v2fe_runner_lrdrop.c`) keeps the weight state
+device-resident continuously across a *single* run while switching `lr` by
+a host->device scalar write partway through -- no restart, no state
+round-trip. Ran 2,200 steps at `lr=100`, then dropped to `lr=1` (100x
+lower) at step 1,600, well inside the plateau:
+
+* **Steps 775-1,599 (`lr=100`)**: loss frozen bit-identical the entire
+  stretch (`0.87465894`, one single transition to `0.87024146` around step
+  1,575-1,599); the weight visibly hops between ~10 distinct U8-quantized
+  levels (`0.14257` ... `0.35643` ... back down), never settling.
+* **Steps 1,600-2,199 (`lr=1`)**: both loss *and* weight go completely
+  bit-identical for the full remaining 600 steps -- `loss=0.87024146`,
+  `w[0]=0.1833067536`, no movement at all.
+
+**Neither original hypothesis is quite right.** If this were ordinary
+convergence at an oversized `lr` (hypothesis 1), dropping `lr` should let
+the model resolve finer progress -- it should keep decreasing, more slowly.
+It didn't move at all. If it were simple SGD oscillation near a minimum,
+the *loss* landscape sampled across ~800 different weight values (steps
+775-1,600) should show *some* variation -- it never did, not once. The
+weight's visible movement at `lr=100` was not directed learning; it was a
+genuinely small underlying gradient, amplified by an oversized `lr` into
+steps just large enough to hop the weight's own U8 quantization boundary
+without ever producing a large enough *loss* change to clear the loss
+tensor's own (much coarser, at this point in training) quantization step.
+Drop `lr` back to a sane value and that same small gradient no longer moves
+the weight at all.
+
+This is its own, milder variant of the same family of problem as Whisper's
+SNR floor (PR #1359) -- the real signal is small relative to what this
+hardware's fixed-point representation can resolve -- but arrived at far
+later and far more mildly: this model got a genuine ~14% loss reduction
+over 1,500 real steps before hitting it, where Whisper hit an equivalent
+wall after exactly one step. Call it a **resolution ceiling**, not a dead
+gradient (resnet18's pattern: instant, total, every-tensor freeze) and not
+an SNR floor (Whisper's pattern: no real signal ever gets through at all).
+**No learning-rate change fixes this** (confirmed directly, not assumed) --
+whatever comes next would need the same class of fix explored for the
+other ceilings (PRs #1355/#1356's multi-phase calibration-swap, if the
+remaining gradient at this point is large enough to benefit from a
+narrower recalibrated range -- untested here, a real follow-on) rather than
+a hyperparameter change.
