@@ -1,3 +1,4 @@
+#include "bias_correction_entry.h"
 #include "lora_entry.h"
 #include "model_info.h"
 #include "onnx/checker.h"
@@ -1138,6 +1139,63 @@ em::val onnxsim_quantize_qoperator(const std::string &data, em::val names_ary,
 }
 
 // ---------------------------------------------------------------------------
+// Bias correction (onnxsim/bias_correction_entry.h) -- correct_bias/
+// correct_spatial_bias's graph-surgery half only, same division of labour as
+// static quantization above: onnxsim_list_correctable_outputs tells the page
+// which Conv/Gemm/MatMul/Resize outputs are even eligible (present, by name,
+// in both the float and modified model), the page runs both models through
+// onnxruntime-web on synthetic calibration data and measures each one's
+// per-channel or per-position mean error itself (bias_correction_calibration.mjs),
+// and onnxsim_apply_bias_corrections only splices the already-measured
+// numbers in.
+em::val onnxsim_list_correctable_outputs(const std::string &float_data,
+                                          const std::string &modified_data) {
+  onnx::ModelProto float_model, modified_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size()) ||
+      !modified_model.ParseFromArray(modified_data.data(),
+                                      modified_data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  em::val out = em::val::array();
+  const auto candidates = ListCorrectableOutputs(float_model, modified_model);
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    em::val entry = em::val::object();
+    entry.set("name", candidates[i].output_name);
+    entry.set("axis", static_cast<double>(candidates[i].axis));
+    entry.set("spatial", candidates[i].spatial);
+    out.set(i, entry);
+  }
+  return out;
+}
+
+// `corrections_ary` is a JS array of `{name, shape, data}` objects -- `shape`
+// the broadcast shape already reshaped to the output's own rank (e.g.
+// [1, C, 1, 1] per-channel, or [1, C, H, W] per-position), `data` its
+// row-major values (a plain array or Float32Array, either works through
+// vecFromJSArray) -- exactly what bias_correction_calibration.mjs measures.
+em::val onnxsim_apply_bias_corrections(const std::string &data,
+                                        em::val corrections_ary) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  const unsigned length = corrections_ary["length"].as<unsigned>();
+  std::vector<BiasCorrectionEntry> corrections;
+  corrections.reserve(length);
+  for (unsigned i = 0; i < length; ++i) {
+    em::val item = corrections_ary[i];
+    BiasCorrectionEntry entry;
+    entry.output_name = item["name"].as<std::string>();
+    entry.shape = em::vecFromJSArray<int64_t>(item["shape"]);
+    entry.data = em::vecFromJSArray<float>(item["data"]);
+    corrections.push_back(std::move(entry));
+  }
+  return SerializeModel(ApplyBiasCorrections(xmodel, corrections));
+}
+
+// ---------------------------------------------------------------------------
 // Block-wise QAT (onnxsim/qat_entry.h).
 //
 // Only the graph surgery crosses this boundary. Building the step graph is
@@ -1956,6 +2014,14 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_add_graph_outputs", &onnxsim_add_graph_outputs);
   function("onnxsim_quantize_static", &onnxsim_quantize_static);
   function("onnxsim_quantize_qoperator", &onnxsim_quantize_qoperator);
+
+  // Bias correction: list_correctable_outputs discovers which Conv/Gemm/
+  // MatMul/Resize outputs are eligible, apply_bias_corrections splices the
+  // page's own already-measured per-channel/per-position corrections in
+  // (see the doc comments above, and onnxsim/bias_correction_entry.h).
+  em::function("onnxsim_list_correctable_outputs",
+               &onnxsim_list_correctable_outputs);
+  function("onnxsim_apply_bias_corrections", &onnxsim_apply_bias_corrections);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on
   // onnxruntime-web, write the trained state back (see the doc comments

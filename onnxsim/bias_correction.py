@@ -65,6 +65,21 @@ that only helps when the calibration data actually has this shared spatial
 structure -- and can otherwise make things measurably worse by fitting
 position-wise noise -- it holds out part of the calibration data and only
 applies the correction where it verifiably reduces held-out error.
+
+Computational cost: both functions only ever run *forward* inference --
+``num_samples`` (default 8 for :func:`correct_bias`, 16 for
+:func:`correct_spatial_bias`) forward passes through each of the two
+models, no backward pass and no weight updates, so the total cost is
+~2x``num_samples`` ordinary inferences plus O(output size) numpy reductions
+(negligible next to that). That is orders of magnitude cheaper than actual
+fine-tuning (e.g. the LoRA/distillation path in ``tools/onnx-finetune``),
+which needs a backward pass and an optimizer step per batch, repeated over
+multiple epochs, and a training-capable ONNX Runtime build -- these
+functions need neither gradients nor a training build, only whatever
+inference backend :mod:`onnxsim.backend` already uses. The tradeoff is
+exactly the one documented above: this cheap path only recovers a
+systematic (mean, or spatially-consistent) shift, not the full error a
+real algorithm change can introduce.
 """
 
 from __future__ import annotations
