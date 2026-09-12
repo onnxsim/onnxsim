@@ -47,9 +47,23 @@ against real-device output.
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Dict, Iterable, Optional
 
 import onnx
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from _local_import import ensure_repo_onnxsim  # noqa: E402
+
+# See ensure_repo_onnxsim's own docstring: without this, `import onnxsim`
+# below silently resolves to whatever checkout is editable-installed
+# globally (the main checkout), not this file's own, when run from an
+# isolated worktree.
+ensure_repo_onnxsim()
 
 PULSAR2_QUANTIZER_AVAILABLE = False
 _UNAVAILABLE_REASON: Optional[str] = None
