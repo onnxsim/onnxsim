@@ -119,6 +119,19 @@ prefill cannot be timed with the shipped CLI. These talk to
   IOInfo), but batch>1 builds currently train incorrectly on real hardware
   (a calibration-range regression, not a runner bug) -- see that same
   section before trusting a batch>1 run's loss/weight output.
+- `w2v2_encoder_attn_runner.c` -- `w2v2fe_runner_realdata.c` with only the
+  header comment and I/O names changed for
+  `../build_w2v2_encoder_attn_step.py`'s own model: the first wav2vec2
+  build whose trainable tail spans attention output, exercising
+  `onnxsim.graph_grad._grad_where`/`_grad_is_nan` on real hardware (see the
+  audio-speech coverage doc's own real-hardware follow-up section). Same
+  I/O shape as `w2v2fe_runner_realdata.c` (one trainable state tensor), so
+  no new runner logic. `argv[4]` (`lr`) matters more here than it did
+  there: this model's real gradient is ~100-1000x smaller (two real
+  encoder layers deep), so it needs a correspondingly larger calibrated
+  `lr` to clear its own INT8 quantization step -- `lr=1` freezes the
+  weight after step 0, `lr=2000` (this model's own calibrated real
+  trajectory) moves it consistently every step.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
