@@ -27,6 +27,7 @@
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
 #include "passes/explicit_auto_pad.h"
+#include "passes/explicit_conv_padding.h"
 #include "passes/fp6_llm.h"
 #include "passes/fuse_add_bias_into_conv.h"
 #include "passes/fuse_attention.h"
@@ -57,6 +58,7 @@
 #include "passes/magnitude_pruning.h"
 #include "passes/maxpool_rowmajor_when_indices_unused.h"
 #include "passes/neg_to_mul.h"
+#include "passes/pow2_to_mul.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
@@ -147,6 +149,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
     RegisterOrReplace<p::ExplicitAutoPad>(registry);
+    RegisterOrReplace<p::ExplicitConvPadding>(registry);
     RegisterOrReplace<p::Fp6Llm>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
@@ -175,6 +178,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
     RegisterOrReplace<p::MaxPoolRowMajorWhenIndicesUnused>(registry);
     RegisterOrReplace<p::NegToMul>(registry);
+    RegisterOrReplace<p::Pow2ToMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
