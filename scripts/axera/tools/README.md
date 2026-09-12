@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Four small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Five small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -35,6 +35,15 @@ prefill cannot be timed with the shipped CLI. These talk to
   `axclrtEngineExecuteAsync`), see the handoff doc's "Device memory" section
   for what it reports versus `axcl-smi`'s own numbers, which don't match and
   aren't supposed to (one is a planned budget, the other a live snapshot).
+- `whisper_resident_runner.c` -- `resident_runner.c` with the I/O layout
+  changed for a Whisper `last_half` training step (14 trainable-weight state
+  tensors instead of resnet18's 4, same positional convention: inputs =
+  `[input.1, y, 14 state tensors, lr]`, outputs = `[14 updated state
+  tensors, loss]`) -- see `../build_whisper_train_step.py` and the handoff
+  doc's "`last_half` actually trains" section for what a real 30-step run on
+  this found (a real update at step 0, then the gradient rounds to zero from
+  step 1 on -- confirmed via a direct pre/post read of the raw state buffer,
+  not the runner's own reporting path).
 - `mp_calib_swap_runner.c` -- runner for the multi-phase calibration-swap
   demonstration (`docs/axera-on-device-training-handoff.md`'s "Multi-phase
   calibration swap" section) against the small Conv+Gemm training step

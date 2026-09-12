@@ -1178,6 +1178,64 @@ attention architectures with no new legalization rules for anything that
 *did* compile, matching resnet50's own "no code changes needed" finding for
 a second architecture in a row.
 
+### `last_half` actually trains -- a real 30-step run, and the gradient dies immediately
+
+Rebuilt `last_half` clean on current master (11,534,336 params, 521 nodes --
+identical to the numbers above) and ran it for real: 30 resident steps on the
+AX650N via a Whisper-shaped variant of `resident_runner.c`
+(`whisper_resident_runner.c`, new -- 14 trainable-weight state tensors
+instead of resnet18's 4, same positional convention, same device-to-device
+residency). `axclrtEngineGetUsage()` on the fresh build: **142.719 MiB CMM**,
+matching the earlier compile-only measurement (142.4 MiB) to within noise.
+**244.2 ms min / 246.8 ms avg per step, 4.1 steps/s** -- roughly 8.5x
+resnet18's 28.6ms and 8x resnet50's ~30ms, in line with a trainable slice an
+order of magnitude bigger processing a real 1500-token sequence rather than
+a 64x64 image.
+
+One calibration decision worth recording: `make_training_calib.py`'s default
+treats every name in `label_inputs` (`("y",)`) as a **2-D one-hot**
+classification target (`arr[row, rng.integers(0, classes)] = 1.0`). Whisper's
+`y` is a dense `[1, 1500, 512]` MSE regression target, not a classification
+label -- applying the one-hot logic to it would misinterpret `dims[1]` (1500)
+as a class count and stamp one axis-1 position's entire 512-vector to 1.0,
+reproducing the exact *class* of degenerate-calibration bug this tool exists
+to prevent, just in a shape it wasn't written for. Built with
+`label_inputs=()` instead, so `y` gets the same plausible-scale random draw
+every other non-`x`/`lr` input gets.
+
+**The loss reads bit-identical (`1.00265`) at every one of the 30 steps --
+investigated rather than assumed benign, given this exact symptom has been a
+real bug twice before in this thread (the batch>1 calibration bug, PR #1346;
+resnet50's still-open loss=0 case).** Instrumented the runner to read a
+state tensor's raw bytes immediately before and after `Execute()` on the
+first 3 steps. Result: **step 0 genuinely updates the weight**
+(`[0.0172792, 0.0410809, 0.0165219, -0.0651579]` ->
+`[0.0178826, 0.0417261, 0.0158957, -0.0655696]`, confirmed via
+device-to-host memcpy of the raw buffer, not the runner's own reporting
+path) -- **steps 1 through 29 are exactly byte-identical, before and
+after.** The residency plumbing is correct; the gradient itself rounds to
+exactly zero after one step. The loss's own apparent constancy is then
+consistent, not a separate bug: it reflects each step's *input* weights, a
+~1% shift in early-layer weights doesn't move a quantized MSE loss across a
+level boundary, and once the gradient dies at step 1 there is nothing left
+to move it at all.
+
+**This is the same mechanism `docs/axera-quantizer-reverse-engineering.md`
+and PR #1355 characterized in general, now confirmed on a real
+architecture** -- and it collapses far faster here than on any CNN case in
+this document (resnet18: ~1,000-5,000 steps; Whisper `last_half`: 1 step).
+The most likely reason, not confirmed by a second run: `y` and the 14
+trainable tensors were calibrated with a generic `weight_scale=0.05` random
+draw with no attempt to match Whisper's actual gradient magnitude through a
+much deeper backward pass and a real 1500-token attention mechanism, exactly
+the mismatch PR #1355 showed causes immediate death (its own probe read
+*zero* nonzero gradient elements when a model calibrated for one magnitude
+regime was fed a gradient from a different one). The calibration-scale-
+matched multi-phase technique from PR #1356 is a plausible, untried fix for
+this exact case -- not attempted here, out of this task's scope, but a
+direct, concrete next step rather than a vague "investigate quantization
+further."
+
 ## What to do next
 
 1. **The FP32 gradient seed.** The one untried route past the dying gradient,
