@@ -293,7 +293,47 @@ needs its own trace, not an inference from wav2vec2's). Flagged, not closed.
 | `Split` has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_split`, via the new `_MULTI_OUTPUT_RULES` table) | was: Conformer's GLU gating | `MatMul` against a constant 0/1 selection matrix per output, no `Concat`, stays inside `BACKWARD_OPS` |
 | `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_where`/`_grad_is_nan`, via the new `_PYTHON_ONLY_RULES` table) | was: plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is a separate, still-open question (see below) | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; `IsNaN` itself gets a no-gradient rule so `build_backward` can walk over it inline |
 | Raw `Gelu` has no backward rule | open, low priority | only an exporter emitting fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
-| LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | open, largest lift | any classic RNN-based ASR/TTS model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
+| LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | open, largest lift, **real test bed now found** | any classic RNN-based ASR/TTS model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
+
+### A real LSTM test bed: NVIDIA Parakeet's own RNN-T prediction network
+
+Every earlier LSTM check in this project used a synthetic `torch.nn.LSTM`
+wrapper -- real enough to confirm *the op itself* exports opaque, but not a
+published architecture. `transformers` (already this project's dependency
+for every other real-model export here) ships one:
+`transformers.models.parakeet.modeling_parakeet.ParakeetRNNTDecoder` is
+NVIDIA Parakeet's real RNN-Transducer "prediction network" -- a plain
+`nn.Embedding` -> 2-layer `nn.LSTM` -> `nn.Linear` decoder, no attention, no
+Conformer (that lives in the model's separate FastConformer encoder, not
+exported here). `scripts/axera/build_parakeet_lstm_probe.py` exports it at a
+tiny config (`vocab_size=64`, `decoder_hidden_size=32`,
+`num_decoder_layers=2`) and cross-references every resulting op type against
+`onnxsim.graph_grad`'s rule tables and `scripts/axera/pulsar2_ops.py`'s
+`AX650_SUPPORTED_OPS`, the same two tables this doc's whole survey uses.
+
+**Confirms the synthetic finding on a real architecture**: the 2-layer LSTM
+exports as **two separate opaque `LSTM` nodes** (one per layer, each with
+its own `hidden_size` attribute) -- both `LSTM`-typed nodes are in
+`AX650_SUPPORTED_OPS` (the NPU runs them fine at inference) and absent from
+every one of `graph_grad`'s rule tables (no backward rule), so
+`build_backward` cannot differentiate through either. Every other op in the
+export (`Gather`, `MatMul`, `Add`, `Transpose` have backward rules;
+`Concat`/`Constant`/`Expand`/`Squeeze`/`Unsqueeze`/`Shape` are pure
+shape/indexing plumbing around `h0`/`c0` initialization, not real
+weight-adjacent computation) is exactly the kind of scaffolding this
+project's other coverage checks have already found harmless. This is the
+concrete real target the "open, largest lift" row above needed -- an actual
+LSTM-cell backward rule (or an unroll-based legalization route) can now be
+tested against a real published model, not just a hand-built probe.
+
+No real GRU-based architecture was found in an already-installed package
+(`transformers` has zero `nn.GRU` usage anywhere in its model zoo;
+`torchaudio`/`silero-vad`'s own GRU-based VAD model ships as a pretrained
+JIT/ONNX artifact requiring `torchaudio`, not a config-driven module fitting
+this project's tiny-random-init-export convention) -- lower priority than
+LSTM here regardless, since `nn.GRU` is structurally the same "opaque
+recurrent op, no legalization route" story and no current target model in
+this project's scope needs one.
 
 ## Do the two silent vendor bugs generalize?
 
