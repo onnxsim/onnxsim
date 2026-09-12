@@ -501,7 +501,13 @@ def test_a_raw_constant_node_is_folded_before_backward():
         next(t for t in model.graph.initializer if t.name == "gw")
     )
     out_names = [o.name for o in step_model.graph.output]
-    feeds = {"x": x, "y": y, "lr": np.array([1.0], np.float32), "gw": gw0}
+    feeds = {
+        "x": x,
+        "y": y,
+        "lr": np.array([1.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "gw": gw0,
+    }
     outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
     grad = (gw0 - outs[state["gw"]]).astype(np.float64)
 
