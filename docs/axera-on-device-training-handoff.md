@@ -154,6 +154,90 @@ computation upstream is destroyed -- unlike fp16, where overflow makes an inf
 that propagates. Reliable back-off needs the graph to export `ReduceMax(|t|)`
 on those tensors.
 
+### Two more angles on controlling gradient quantization directly, both closed with real evidence
+
+Following the `MatMul`-boundary finding above, two further angles were tried
+against a small, purpose-built `MatMul`-only probe graph (`y = x @ w`,
+`loss = sum(y^2)`, `dW = grad(loss, w)` seeded by a real `grad_seed` runtime
+input -- isolates the exact node the ceiling lives at, smaller and faster to
+iterate than the Conv/Conv/Gemm probe above). Both close cleanly negative,
+with compiler-level evidence rather than speculation.
+
+**Angle 1: force the gradient-producing `MatMul`'s own output to `FP32` via
+`layer_configs`' `output_data_type` field** -- a real, separate proto field
+from `data_type` (which `MatMul` cannot use at all), documented for `Conv`
+("quantize weight type for Conv" / "quantize data type for Conv" in
+`build_config.proto`'s own comments) but not textually restricted to it.
+Tried both ways `layer_configs` can select a target: `op_types: ["MatMul"]`
+(matches every `MatMul` in the graph) and `layer_names: ["matmul_14"]` (the
+exact, confirmed post-fusion name of the gradient-producing node, read out of
+a first build's `quant_axmodel.json` per this doc's own established
+"build once, target the surviving name" method). **Both silently downgrade to
+U8.** `quant_axmodel.json`'s own `quant_config.mix_precision_configs` records
+the request (`{"MatMul": {"dtype": "U8"}}` -- not absent, so the selector
+matched something) but the *value* it settled on is `U8`, and `matmul_14`'s
+own `tensor_configs` entry confirms it: `bit_width: 8, quant_min: 0,
+quant_max: 255`. Pulsar2 acknowledges the request and refuses it, the same
+"asks may be silently downgraded" shape `scripts/axera/README.md`'s own
+LayerNorm/`TileFailException` finding already established for a different op,
+just via a quieter failure mode here (no build error, no exception -- only a
+config file that says "no").
+
+Decomposing the `MatMul` into `Mul` + `ReduceSum` (both being, in principle,
+individually-configurable ops) was considered but not built: `ReduceSum` is
+not on the confirmed `data_type: FP32`-eligible list (`LeakyRelu, Sigmoid,
+Relu, Add, Mul, Div, Sub, Concat, Softmax`, from this doc's own earlier
+finding), so the *reduction* -- the actual op whose output becomes the
+gradient tensor -- would still hit exactly the same quantized-output wall,
+just moved one node later. Combined with the `output_data_type` result
+above (Pulsar2 refuses a *specific, correctly-named* gradient-producing node
+an FP32 output), the wall looks structural rather than `MatMul`-specific:
+**whichever op produces the final gradient tensor, Pulsar2 quantizes its
+output, and `layer_configs` has no lever over that specific tensor's own
+output precision.**
+
+**Angle 2: skip fighting for FP32 upstream, and instead directly re-narrow
+the gradient output's already-quantized scale/zero-point post-hoc**, using
+`scripts/axera/emitter.py`'s existing `learn_mcode`/`nudge_output_quantisation`/
+`emit_mcode` machinery (built for a different original purpose -- writing new
+weights into a compiled `.axmodel` without recompiling). The idea: track the
+shrinking true gradient by periodically patching the compiled mcode's output
+quantization range, the same principle as loss scaling but applied to the
+*output* tensor's own quantization parameters rather than an input that has
+to survive an entire graph unmolested.
+
+**Closed by the same finding this doc's mcode-quantize-elimination section
+already made, now reproduced on a different, much smaller model**:
+`learn_mcode`'s whole method depends on Pulsar2 compiling the *same shape*
+close enough to byte-stably that a target value's own bytes (its scale/zero
+literal) can be told apart from everything else that also varies build to
+build. Tested directly: compiled the exact same probe graph, same
+calibration data, same config -- twice. **1,249 of the compiled mcode's 4,704
+bytes (26.6%) differ between the two identical-input builds.** For
+comparison, deliberately changing the calibration data's weight scale by 10x
+(to shift the real gradient range, which is what a re-narrowing patch would
+need to reliably target) moved a *similar* number of bytes (1,163 of 4,704,
+24.7%) -- meaning the noise floor from pure recompile non-determinism is as
+large as, or larger than, the signal from an actual, deliberate range change.
+There is no byte-level signal to separate "this moved because the target
+range changed" from "this moved because Pulsar2 recompiled the same inputs
+differently," on this model, with this method. This is not a smaller-model
+fluke: it is the identical mechanism PR #1344's mcode-quantize-elimination
+probe already found on the (larger, different) resnet18 training step,
+confirmed to generalize rather than being an artifact of that specific
+model's size or shape.
+
+**Net verdict on both angles: closed, not open questions.** Neither
+`layer_configs` nor post-hoc mcode patching gives real control over the
+gradient tensor's own output precision on this compiler. The FP32 seed
+(above) remains the only angle with a measured, real, if partial, effect --
+and it does nothing for the boundary these two angles were trying to reach
+past. Moving the ceiling further than the FP32 seed already does would need
+either a Pulsar2 capability that doesn't exist in the config surface explored
+so far, or solving the compiler's own byte-level non-determinism first (a
+precondition for Angle 2 that this project has no access to, being
+closed-source) -- not a small follow-on to either angle tried here.
+
 ## Speed
 
 `axcl_run_model` costs ~580 ms per invocation (process start, device open,
