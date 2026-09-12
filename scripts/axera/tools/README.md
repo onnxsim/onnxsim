@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Eight small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Nine small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -85,6 +85,16 @@ prefill cannot be timed with the shipped CLI. These talk to
   `-g` mode is written and correct but has nothing to run yet, since the
   `Gather`-off-a-resident-dataset variant doesn't currently compile on real
   hardware (a genuine Pulsar2 NPU-backend gap, not a bug in this runner).
+- `w2v2fe_runner.c` -- resident runner for `../build_w2v2_feature_extractor_step.py`'s
+  training step (one trainable state tensor, its own I/O layout, real
+  `probe_io`-confirmed). Compiles under standard INT8; `highest_mix_precision`
+  fails a third distinct way here (`AxErf`'s `lut_float` path, not
+  Whisper's `LayerNorm` tiling limit or resnet18's `AvgPool` scheduler
+  crash) -- see the audio-speech coverage doc's real-hardware follow-up
+  section. Prints `w[0]` alongside loss every step, the same
+  read-the-raw-state-buffer diagnostic this project has needed twice
+  before to catch a gradient dying silently behind a healthy-looking loss
+  output.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):

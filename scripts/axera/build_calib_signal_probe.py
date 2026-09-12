@@ -35,11 +35,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from _local_import import ensure_repo_onnxsim  # noqa: E402
+from _local_import import ensure_repo_onnxsim, fresh  # noqa: E402
 
 ensure_repo_onnxsim()
 
-import legalize  # noqa: E402
+# scripts/axera/legalize.py and scripts/axelera/legalize.py are two
+# different, same-named modules sharing one `sys.modules["legalize"]` entry
+# -- a plain `import legalize` risks silently getting axelera's copy if
+# something upstream already claimed that bare name. `fresh` reloads
+# directly from this file's own directory regardless of what's cached.
+legalize = fresh("legalize", HERE)
 
 from onnxsim import graph_grad, qat_graph  # noqa: E402
 

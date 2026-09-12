@@ -59,7 +59,14 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import build_resident_train_step as brts  # noqa: E402
-import legalize  # noqa: E402
+from _local_import import fresh  # noqa: E402
+
+# scripts/axera/legalize.py and scripts/axelera/legalize.py are two
+# different, same-named modules sharing one `sys.modules["legalize"]` entry
+# -- a plain `import legalize` risks silently getting axelera's copy if
+# something upstream already claimed that bare name. `fresh` reloads
+# directly from this file's own directory regardless of what's cached.
+legalize = fresh("legalize", HERE)
 
 _STEM = {"conv1.weight", "conv1.bias", "conv2.weight", "conv2.bias"}
 
