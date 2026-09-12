@@ -117,6 +117,18 @@ prefill cannot be timed with the shipped CLI. These talk to
   and vNPU concurrency" section has the full numbers. The loop itself is
   batch-size-agnostic (buffer sizes come from the compiled model's own
   IOInfo), but batch>1 builds currently train incorrectly on real hardware
+- `w2v2fe_runner_lrdrop.c` -- `w2v2fe_runner_realdata.c` variant built to
+  settle whether a long-run training plateau (PR #1376, 2,000 steps) was
+  ordinary SGD convergence at an oversized `lr` or a genuinely stalled
+  gradient. Keeps weight state device-resident continuously across a
+  *single* run while switching `lr` via a host->device scalar write at a
+  given step (`argv[3]`, between `argv[4]`'s and `argv[5]`'s two `lr`
+  values) -- no restart, no state round-trip, so the before/after comparison
+  is on the exact same resident state rather than two separate runs.
+  Usage: `w2v2fe_runner_lrdrop model.axmodel steps switch_step lr1 lr2
+  [warmup]`. Found a third distinct gradient-ceiling pattern this way --
+  see the audio-speech coverage doc's "The 2,000-step plateau (PR #1376) is
+  a resolution ceiling, not convergence" section for the real result.
   (a calibration-range regression, not a runner bug) -- see that same
   section before trusting a batch>1 run's loss/weight output.
 - `w2v2_encoder_attn_runner.c` -- `w2v2fe_runner_realdata.c` with only the
