@@ -1711,6 +1711,45 @@ def _grad_clip(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return [ctx.b.mul(g, mask)] + rest
 
 
+def _grad_where(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``Y = Where(cond, X, Z)`` selects ``X`` where ``cond`` is true and
+    ``Z`` otherwise, elementwise, with all three inputs broadcasting together
+    against the output.
+
+    ``cond`` never gets a gradient -- it is a boolean, not a function of
+    anything float, the same "no gradient for a shape/axes/indices operand"
+    convention ``Reshape``/``Gather``/``Split`` already follow here. The
+    incoming gradient is *split* between the two branches by a float 0/1
+    mask built from ``cond`` with ``Cast`` -- not re-emitted as another
+    ``Where``, which is deliberately absent from :data:`BACKWARD_OPS` (see
+    that set's own comment): this rule only ever emits ``Cast``/``Sub``/
+    ``Mul``, all three already in it.
+    """
+    cond, x, z = node.input
+    out = ctx.shape(node.output[0])
+    mask = ctx.b.op("Cast", [cond], to=onnx.TensorProto.FLOAT)
+    not_mask = ctx.b.sub(ctx.b.const(1.0), mask)
+    dx = ctx.reduce_to(ctx.b.mul(g, mask), out, ctx.shape(x))
+    dz = ctx.reduce_to(ctx.b.mul(g, not_mask), out, ctx.shape(z))
+    return [None, dx, dz]
+
+
+def _grad_is_nan(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``IsNaN`` produces a boolean and has no gradient of its own -- in
+    every real graph this rule exists for, its only consumer is a
+    ``Where``'s ``cond`` input, which itself takes no gradient either.
+
+    This rule's whole job is letting :func:`build_backward` walk over an
+    ``IsNaN`` node in a differentiated slice at all: that function requires
+    a registered rule for *every* node type it visits, including one no
+    gradient reaches (see its own docstring), so a numerical-stability guard
+    like ``attn = Where(IsNaN(attn), 0, attn)`` sitting inline in a forward
+    slice would otherwise raise :class:`UnsupportedOpError` even though
+    nothing downstream ever asks this node for a gradient.
+    """
+    return [None]
+
+
 def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """``Gather``'s gradient: a scatter-add into ``data``, ``indices`` itself
     untouched.
@@ -2103,6 +2142,26 @@ _RULES: Dict[str, Rule] = {
     "Transpose": _grad_transpose,
 }
 
+#: Single-output rules kept out of :data:`_RULES` for the same reason
+#: :data:`_MULTI_OUTPUT_RULES` is its own table (see that table's own
+#: comment): an op registered here has **no C++/WASM mirror** yet, so
+#: folding it into :data:`_RULES` would silently widen the parity-pinned
+#: :data:`SUPPORTED_OPS` that ``tests/test_qat_parity.py`` checks against
+#: ``qat_entry.cpp``'s hardcoded C++ rule table. Unlike
+#: :data:`_MULTI_OUTPUT_RULES`, every rule here is an ordinary
+#: single-``g`` :data:`Rule` -- ``Where``/``IsNaN`` (numerical-stability
+#: masking in wav2vec2's own attention output, see
+#: ``docs/axera-audio-speech-op-coverage.md``) each have exactly one output
+#: -- so the *only* reason they are not simply in :data:`_RULES` is the
+#: missing C++ port, not a signature mismatch. :func:`build_backward` merges
+#: this table into its default rule set right alongside :data:`_CUSTOM_RULES`,
+#: and :func:`supported_ops` includes it, so QAT/LoRA block discovery
+#: correctly treats a block containing ``Where``/``IsNaN`` as differentiable.
+_PYTHON_ONLY_RULES: Dict[str, Rule] = {
+    "IsNaN": _grad_is_nan,
+    "Where": _grad_where,
+}
+
 # The op types :func:`build_backward` can differentiate. Callers that pick
 # the slice themselves -- block discovery for QAT, say -- should test against
 # this rather than rediscovering the list by catching
@@ -2129,12 +2188,19 @@ _CUSTOM_RULES: Dict[str, Rule] = {}
 
 
 def supported_ops() -> frozenset:
-    """:data:`SUPPORTED_OPS` (the builtin single-output rules) unioned with
-    every op type currently registered via :func:`register_gradient` and
-    every op type in :data:`_MULTI_OUTPUT_RULES` (``Split`` today). This is
-    the set :func:`build_backward` (called the ordinary way, with
-    ``rules=None``) can actually differentiate right now."""
-    return SUPPORTED_OPS | frozenset(_CUSTOM_RULES) | frozenset(_MULTI_OUTPUT_RULES)
+    """:data:`SUPPORTED_OPS` (the builtin, parity-pinned single-output rules)
+    unioned with every op type currently registered via
+    :func:`register_gradient`, every op type in :data:`_MULTI_OUTPUT_RULES`
+    (``Split`` today), and every op type in :data:`_PYTHON_ONLY_RULES`
+    (``IsNaN``/``Where`` today). This is the set :func:`build_backward`
+    (called the ordinary way, with ``rules=None``) can actually
+    differentiate right now."""
+    return (
+        SUPPORTED_OPS
+        | frozenset(_CUSTOM_RULES)
+        | frozenset(_MULTI_OUTPUT_RULES)
+        | frozenset(_PYTHON_ONLY_RULES)
+    )
 
 
 def register_gradient(
@@ -2203,6 +2269,12 @@ def register_gradient(
                     "override=True to replace it (this affects Python-side "
                     "differentiation only -- see register_gradient's own "
                     "docstring for the C++/WASM divergence that implies)"
+                )
+            if op_type in _PYTHON_ONLY_RULES:
+                raise ValueError(
+                    f"{op_type!r} already has a builtin (Python-only) "
+                    "gradient rule; pass override=True to replace it (this "
+                    "affects Python-side differentiation only)"
                 )
             if op_type in _CUSTOM_RULES:
                 raise ValueError(
@@ -2323,7 +2395,9 @@ def build_backward(
             relationship :func:`torch.autograd.Function.backward` has to a
             custom torch op.
     """
-    rules = dict(_RULES, **_CUSTOM_RULES) if rules is None else rules
+    rules = (
+        dict(_RULES, **_PYTHON_ONLY_RULES, **_CUSTOM_RULES) if rules is None else rules
+    )
     ctx = _Backward(b, shapes)
     grads: Dict[str, str] = dict(grad_outputs)
 
