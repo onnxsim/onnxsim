@@ -19,7 +19,7 @@ from onnxsim.attention_quantization import apply_attention_quantization
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
 from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
-from onnxsim.bias_correction import correct_bias
+from onnxsim.bias_correction import correct_bias, correct_spatial_bias
 from onnxsim.billm import quantize_weight_only_billm
 from onnxsim.bn_recovery import (
     RecoveredBatchNorm,
@@ -333,6 +333,7 @@ __all__ = [
     "DEFAULT_QUANTIZATION_CANDIDATES",
     "cross_layer_equalize",
     "correct_bias",
+    "correct_spatial_bias",
     "apply_adaround",
     "apply_adaquant",
     "apply_tesseraq",

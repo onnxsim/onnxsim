@@ -44,6 +44,27 @@ that the layer's own output tensor kept its original name, which every
 onnxsim ``quantize_*`` pass (and any Resize-attribute rewrite that edits
 the node in place) guarantees (downstream consumers are never rewired by
 name).
+
+A geometric change to Resize (a different ``coordinate_transformation_mode``,
+or ``mode`` itself) mostly does *not* fit this model, though: the resampling
+error at a given output pixel depends on the local gradient of whatever the
+input happens to be at that spatial location, which is roughly as likely to
+push the value up as down. Averaged per channel over many differently-
+content calibration images, that error washes out to ~0 -- there is no
+"channel bias" for :func:`correct_bias` to find, however much calibration
+data it is given. What *does* survive averaging is the part of the error
+that is consistent by *position* rather than by content: deployments where
+the calibration images share spatial structure (a fixed-mount camera, a
+consistent framing/crop, a scene layout that recurs across samples --
+common in e.g. ADAS/robotics perception pipelines) see the same
+misalignment at the same output pixel across samples, which a per-channel
+constant still cannot represent but a per-*position* map can.
+:func:`correct_spatial_bias` measures exactly that: a coarse per-channel
+grid of position-wise mean error, smoothed back up to full resolution. Since
+that only helps when the calibration data actually has this shared spatial
+structure -- and can otherwise make things measurably worse by fitting
+position-wise noise -- it holds out part of the calibration data and only
+applies the correction where it verifiably reduces held-out error.
 """
 
 from __future__ import annotations
@@ -250,14 +271,19 @@ def correct_bias(
     return corrected
 
 
-def _apply_correction(
+def _splice_add_correction(
     model: onnx.ModelProto,
     output_name: str,
-    axis: int,
-    rank: int,
     correction: np.ndarray,
+    name_prefix: str,
     taken_names: Set[str],
 ) -> None:
+    """Renames ``output_name``'s producer to a fresh internal name, then
+    reinstates ``output_name`` as an ``Add`` of that renamed value with
+    ``correction`` (already broadcastable to the output's shape) -- so
+    ``output_name`` keeps resolving to the *corrected* value for every
+    downstream consumer and graph output alike.
+    """
     producer_idx = None
     output_index = None
     for idx, n in enumerate(model.graph.node):
@@ -270,24 +296,233 @@ def _apply_correction(
     if producer_idx is None:
         return  # shouldn't happen -- output_name came from this same graph
 
-    pre_correction_name = _unique_name(
-        f"{output_name}_bias_correction_pre", taken_names
-    )
+    pre_correction_name = _unique_name(f"{output_name}_{name_prefix}_pre", taken_names)
     model.graph.node[producer_idx].output[output_index] = pre_correction_name
 
-    ch_axis = axis if axis >= 0 else rank + axis
-    broadcast_shape = [1] * rank
-    broadcast_shape[ch_axis] = correction.shape[0]
-    scale_name = _unique_name(f"{output_name}_bias_correction", taken_names)
-    scale_tensor = onnx.numpy_helper.from_array(
-        correction.reshape(broadcast_shape), name=scale_name
-    )
+    scale_name = _unique_name(f"{output_name}_{name_prefix}", taken_names)
+    scale_tensor = onnx.numpy_helper.from_array(correction, name=scale_name)
     model.graph.initializer.append(scale_tensor)
 
     add_node = onnx.helper.make_node(
         "Add",
         [pre_correction_name, scale_name],
         [output_name],
-        name=_unique_name(f"{output_name}_bias_correction_add", taken_names),
+        name=_unique_name(f"{output_name}_{name_prefix}_add", taken_names),
     )
     model.graph.node.insert(producer_idx + 1, add_node)
+
+
+def _apply_correction(
+    model: onnx.ModelProto,
+    output_name: str,
+    axis: int,
+    rank: int,
+    correction: np.ndarray,
+    taken_names: Set[str],
+) -> None:
+    ch_axis = axis if axis >= 0 else rank + axis
+    broadcast_shape = [1] * rank
+    broadcast_shape[ch_axis] = correction.shape[0]
+    _splice_add_correction(
+        model,
+        output_name,
+        correction.reshape(broadcast_shape),
+        "bias_correction",
+        taken_names,
+    )
+
+
+def _block_average(array: np.ndarray, grid_h: int, grid_w: int) -> np.ndarray:
+    """Downsamples a ``[C, H, W]`` array to ``[C, grid_h, grid_w]`` by
+    averaging each of its (possibly unevenly sized, when ``H``/``W`` doesn't
+    divide evenly) rectangular blocks -- the coarse grid a spatial
+    correction is fit on, before being smoothed back up to full resolution.
+    """
+    row_blocks = np.array_split(np.arange(array.shape[1]), grid_h)
+    col_blocks = np.array_split(np.arange(array.shape[2]), grid_w)
+    coarse = np.empty((array.shape[0], grid_h, grid_w), dtype=array.dtype)
+    for i, rows in enumerate(row_blocks):
+        for j, cols in enumerate(col_blocks):
+            coarse[:, i, j] = array[:, rows][:, :, cols].mean(axis=(1, 2))
+    return coarse
+
+
+def _bilinear_upsample(grid: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Upsamples a ``[C, gh, gw]`` grid to ``[C, out_h, out_w]`` by bilinear
+    interpolation between grid-cell centers (edge cells extend flat past
+    their center, i.e. clamp-to-edge) -- turns a coarse, low-frequency
+    correction grid into a smooth full-resolution correction map with no
+    blockiness at the grid boundaries.
+    """
+    _, grid_h, grid_w = grid.shape
+    if grid_h == out_h and grid_w == out_w:
+        return grid
+
+    def _interp_coords(out_n: int, grid_n: int) -> tuple:
+        centers = (np.arange(out_n) + 0.5) * grid_n / out_n - 0.5
+        centers = np.clip(centers, 0, grid_n - 1)
+        lo = np.floor(centers).astype(np.int64)
+        hi = np.clip(lo + 1, 0, grid_n - 1)
+        weight = centers - lo
+        return lo, hi, weight
+
+    y0, y1, wy = _interp_coords(out_h, grid_h)
+    x0, x1, wx = _interp_coords(out_w, grid_w)
+    wy = wy[np.newaxis, :, np.newaxis]
+    wx = wx[np.newaxis, np.newaxis, :]
+
+    top = grid[:, y0][:, :, x0] * (1 - wx) + grid[:, y0][:, :, x1] * wx
+    bottom = grid[:, y1][:, :, x0] * (1 - wx) + grid[:, y1][:, :, x1] * wx
+    return top * (1 - wy) + bottom * wy
+
+
+def correct_spatial_bias(
+    float_model: Union[str, onnx.ModelProto],
+    modified_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 16,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    grid_size: int = 8,
+    validation_fraction: float = 0.3,
+) -> onnx.ModelProto:
+    """Empirically corrects the per-*position* output bias a Conv/Resize
+    layer in ``modified_model`` picked up from a spatially-structured
+    algorithm change (e.g. swapping a Resize node's ``mode`` or
+    ``coordinate_transformation_mode`` for one a deployment target
+    supports), when :func:`correct_bias`'s per-channel constant can't
+    represent it. See this module's own docstring for when this actually
+    helps versus when it's a no-op by construction.
+
+    Unlike :func:`correct_bias`, this only ever applies a correction it has
+    verified helps: ``calibration_data`` is split into a fit portion (used
+    to measure the correction) and a held-out validation portion, and a
+    layer's correction is applied only if it measurably reduces error on
+    the held-out portion. On calibration data with no shared spatial
+    structure across samples, every correction is expected to fail that
+    check and this is a no-op -- not "an accuracy knob left at a
+    conservative default", but the actual expected behavior, since a
+    correction that only fit noise would otherwise make held-out predictions
+    worse, not better.
+
+    :param float_model: the original onnx ModelProto or file path
+    :param modified_model: a modified version of ``float_model`` (onnx
+            ModelProto or file path) whose Conv/Resize layers keep their
+            original output tensor names -- see :func:`correct_bias`'s
+            ``quantized_model`` parameter, which this mirrors
+    :param calibration_data: representative input batches, ideally sharing
+            the deployment's actual spatial structure (e.g. real frames
+            from the same camera/mount, not independent random images) --
+            see :func:`correct_bias`
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted (note: random per-sample noise
+            has no shared spatial structure, so this default is only useful
+            for exercising the code path, not for a real correction)
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run both models on
+    :param grid_size: side length of the coarse per-channel grid fit before
+            smoothing back up to full resolution -- larger captures finer
+            spatial patterns but needs more calibration data to validate
+            reliably; clamped to the layer's actual output height/width
+    :param validation_fraction: fraction of ``calibration_data`` held out
+            to validate each layer's correction; the rest is used to fit it
+    :returns: ``modified_model`` with a per-position correction applied
+            after every Conv/Resize layer where one measurably reduces
+            held-out error
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(modified_model, str):
+        modified_model = onnx.load(modified_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    calibration_data = list(calibration_data)
+    if len(calibration_data) < 2:
+        return modified_model  # can't hold out a validation split
+
+    n_val = min(
+        max(1, round(len(calibration_data) * validation_fraction)),
+        len(calibration_data) - 1,
+    )
+    fit_data, val_data = calibration_data[:-n_val], calibration_data[-n_val:]
+
+    modified_outputs: Set[str] = set()
+    for n in modified_model.graph.node:
+        modified_outputs.update(n.output)
+
+    candidates = [
+        n.output[0]
+        for n in float_model.graph.node
+        if _CORRECTABLE_OPS.get(n.op_type) == 1
+        and n.output
+        and n.output[0] in modified_outputs
+    ]
+    if not candidates:
+        return modified_model
+
+    float_probe = _add_probe_outputs(float_model, candidates)
+    modified_probe = _add_probe_outputs(modified_model, candidates)
+
+    def _per_position_errors(data: Sequence[Tensors]) -> Dict[str, np.ndarray]:
+        sums: Dict[str, np.ndarray] = {}
+        counts: Dict[str, int] = {}
+        for batch in data:
+            float_out = backend.run_model(float_probe, batch, providers=providers)
+            modified_out = backend.run_model(modified_probe, batch, providers=providers)
+            for name in candidates:
+                f = np.asarray(float_out[name], dtype=np.float64)
+                q = np.asarray(modified_out[name], dtype=np.float64)
+                if f.shape != q.shape or f.ndim != 4:
+                    continue  # only NCHW-style, image-shaped outputs have a grid to fit
+                batch_sum = (f - q).sum(axis=0)  # [C, H, W]
+                if name in sums:
+                    sums[name] += batch_sum
+                    counts[name] += f.shape[0]
+                else:
+                    sums[name] = batch_sum
+                    counts[name] = f.shape[0]
+        return {name: total / counts[name] for name, total in sums.items()}
+
+    fit_mean_error = _per_position_errors(fit_data)
+    if not fit_mean_error:
+        return modified_model
+
+    corrections: Dict[str, np.ndarray] = {}
+    for name, mean_error in fit_mean_error.items():
+        _, h, w = mean_error.shape
+        gh, gw = min(grid_size, h), min(grid_size, w)
+        coarse = _block_average(mean_error, gh, gw)
+        corrections[name] = _bilinear_upsample(coarse, h, w).astype(np.float32)
+
+    sq_error_before: Dict[str, float] = {name: 0.0 for name in corrections}
+    sq_error_after: Dict[str, float] = {name: 0.0 for name in corrections}
+    for batch in val_data:
+        float_out = backend.run_model(float_probe, batch, providers=providers)
+        modified_out = backend.run_model(modified_probe, batch, providers=providers)
+        for name, correction in corrections.items():
+            f = np.asarray(float_out[name], dtype=np.float64)
+            q = np.asarray(modified_out[name], dtype=np.float64)
+            if f.shape != q.shape or f.ndim != 4:
+                continue
+            sq_error_before[name] += float(np.sum((f - q) ** 2))
+            sq_error_after[name] += float(np.sum((f - (q + correction)) ** 2))
+
+    accepted = {
+        name: correction
+        for name, correction in corrections.items()
+        if sq_error_after[name] < sq_error_before[name]
+    }
+    if not accepted:
+        return modified_model
+
+    corrected = onnx.ModelProto()
+    corrected.CopyFrom(modified_model)
+    taken_names = _all_names(corrected.graph)
+    for name, correction in accepted.items():
+        _splice_add_correction(
+            corrected, name, correction[np.newaxis], "spatial_correction", taken_names
+        )
+    return corrected
