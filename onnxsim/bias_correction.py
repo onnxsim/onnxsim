@@ -72,14 +72,39 @@ Computational cost: both functions only ever run *forward* inference --
 models, no backward pass and no weight updates, so the total cost is
 ~2x``num_samples`` ordinary inferences plus O(output size) numpy reductions
 (negligible next to that). That is orders of magnitude cheaper than actual
-fine-tuning (e.g. the LoRA/distillation path in ``tools/onnx-finetune``),
-which needs a backward pass and an optimizer step per batch, repeated over
-multiple epochs, and a training-capable ONNX Runtime build -- these
-functions need neither gradients nor a training build, only whatever
-inference backend :mod:`onnxsim.backend` already uses. The tradeoff is
-exactly the one documented above: this cheap path only recovers a
-systematic (mean, or spatially-consistent) shift, not the full error a
-real algorithm change can introduce.
+fine-tuning (e.g. the LoRA/distillation path in ``tools/onnx-finetune``, or
+:func:`onnxsim.apply_block_finetune` with ``teacher_forced_inputs=False``
+-- see that function's own docstring), which needs a backward pass and an
+optimizer step per batch, repeated over multiple epochs, and a
+training-capable ONNX Runtime build -- these functions need neither
+gradients nor a training build, only whatever inference backend
+:mod:`onnxsim.backend` already uses. The tradeoff is exactly the one
+documented above: this cheap path only recovers a systematic (mean, or
+spatially-consistent) shift, not the full error a real algorithm change
+can introduce.
+
+Measured on a Resize mode swap (``linear`` -> ``nearest``, a genuinely
+different resampling kernel, not just a coordinate offset) feeding a small
+downstream Conv stack: :func:`correct_spatial_bias` measured ~0% held-out
+error reduction regardless of how many trainable layers sat downstream of
+the swap, while :func:`onnxsim.apply_block_finetune` with
+``teacher_forced_inputs=False`` measured 57-61% -- fine-tuning's advantage
+here is not really about being "more powerful" in the abstract, it is that
+a trained weight can express an actual function of the distortion, which a
+constant or coarse spatial offset structurally cannot, whatever data it is
+fit on. **A held-out validation pass is not a correctness guarantee against
+a distribution the validation itself did not cover.** Measured on the same
+swap moved earlier in the network (two more Conv+ReLU stages between the
+correction point and the model's own final output): the correction *passed*
+its own internal held-out check (a split of the same calibration data) and
+still made a separately-generated held-out set's error ~2.5% worse -- more
+downstream nonlinearity between where the correction is measured and where
+the task's own error is ultimately judged apparently weakens how well an
+in-distribution validation split predicts true out-of-distribution
+behavior. The gate makes this a no-op in the common case, not a guarantee
+against every case; a caller with production-representative calibration
+*and* validation data (rather than one calibration set internally split)
+gets a meaningfully stronger check than the built-in default.
 """
 
 from __future__ import annotations

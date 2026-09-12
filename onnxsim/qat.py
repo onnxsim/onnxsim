@@ -3186,6 +3186,25 @@ def apply_block_finetune(
     is a guaranteed no-op here: see :func:`apply_qat`'s own docstring for
     why) but changes what the block actually receives at inference.
 
+    **What this actually needs is downstream capacity, not proximity.**
+    Measured on a Resize mode swap (``linear`` -> ``nearest``) at three
+    positions in a small Conv stack, against the same held-out set
+    :func:`onnxsim.correct_spatial_bias` measured ~0% (or, with two more
+    Conv+ReLU stages between the swap and the trained block, ~2.5% *worse*
+    -- see that function's own module docstring) reduction on regardless of
+    position: with three trainable Conv layers between the swap and the
+    model's own output, ``teacher_forced_inputs=False`` recovered ~61%;
+    with only *one* trainable layer there, ~57% -- almost the same recovery
+    from far less remaining capacity, because one layer was already enough
+    to express a useful compensating function of this particular
+    distortion. The one configuration where it recovered nothing was not
+    "far from the swap" but **no trainable block at all**: with the Resize
+    as the model's own last op, there is no ``block_output_name`` downstream
+    of it to name, so there is nothing this parameter -- or any block-wise
+    method -- can be pointed at. That is a real ceiling worth knowing before
+    reaching for this: it is not a matter of degree that a longer run or a
+    different block boundary works around.
+
     It is *not* a way to fine-tune on new data or a new task: the objective is
     "reproduce what the reference model produced", which by construction
     cannot exceed the reference. Fitting a different target needs a different
