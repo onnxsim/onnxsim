@@ -37,6 +37,16 @@ _BLOBS = {
     "conv64_k5_d2": (2824, 5, 2),
     "conv128_k7_d12": (10544, 5, 44),
     "piper_vocoder": (82216, 5, 199),
+    # A real *training*-step compile (wav2vec2's feature extractor, PR #1370)
+    # -- Gather/MatMul-heavy backward pass and in-graph SGD update, not a
+    # forward-only inference graph like the three above. Added specifically
+    # to confirm the structural rules (derived from inference-only fixtures)
+    # generalise rather than being over-fit -- see
+    # docs/axera-mcode-training-graph-coverage.md for the full analysis
+    # across four real training graphs (this one, resnet18, resnet50,
+    # Whisper), all of which pass cleanly with the same tag-frequency
+    # profile as the inference-only fixtures above.
+    "w2v2fe_training_step": (202976, 5, 533),
 }
 
 
