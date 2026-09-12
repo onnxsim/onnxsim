@@ -89,6 +89,158 @@ the returned gradient sees a healthy tensor while the computation upstream is
 destroyed -- unlike fp16, where overflow makes an inf that propagates. Reliable
 back-off needs the graph to export `ReduceMax(|t|)` on those tensors.
 
+### The FP32 seed, the quantizer's own internals, and two more levers -- one real, one dead
+
+Follow-on work (branches `axera-fp32-gradient-seed` / PR #1353, `axera-quantizer-
+reverse-engineering` / PR #1354, not yet merged as of this section) took the
+"untried way out" above further. Confirmed the FP32 seed is real but plateaus:
+forcing the seed's elementwise `Mul` to `data_type: "FP32"` rescues 0% -> 20% of
+gradient elements as scale grows, then stops, because the gradient itself comes
+out of a `MatMul` and `layer_configs`' `data_type` override does not apply to
+`MatMul`/`Conv` at all (confirmed directly in the compiler's own
+`quant_axmodel.json`: the request is recorded but silently downgraded to U8).
+Reverse-engineering Pulsar2's calibration algorithm from archival build data
+then confirmed the range is a function of calibration *data*, not graph
+structure -- and found two more untried config-surface levers, `output_data_type`
+(a `LayerConfig` field distinct from `data_type`) and calibrating deliberately
+for the gradient's expected late-training scale. Tested both directly, on a
+minimal isolated `y=x@w`/`dW=grad(loss,w)` probe (`scripts/axera/
+build_matmul_grad_probe.py`) rather than the full pipeline, for fast iteration:
+
+**`output_data_type: "FP32"` on the gradient `MatMul`: dead, more silently than
+`data_type`.** Pulsar2's own protobuf source
+(`/opt/pulsar2/axnn/yamain/config/build_config.proto`) documents this field's
+own comment as *"quantize data type for **Conv**"* -- a different, Conv-scoped
+control, not a generic per-layer output-precision override. Tried anyway,
+targeting the gradient MatMul both by `op_types: ["MatMul"]` and by its exact
+post-fusion `layer_name` (`matmul_14`): both compile successfully, and both
+leave `matmul_14`'s own tensor config **byte-for-byte identical** to the
+baseline's (`bit_width: 8, quant_min: 0, quant_max: 255`, identical hash) --
+and unlike the `data_type` case, `mix_precision_configs` doesn't even record
+the request (empty `{}` in every variant). The override isn't downgraded; it's
+not recognized for this op type at all.
+
+**Calibrating for the expected gradient scale: real, exact, and confirmed on
+real hardware -- but a one-shot, build-time trade, not an adaptive fix.**
+Compiled the identical probe twice, differing only in the calibration data
+supplied for `grad_seed` -- `1.0` (this thread's default so far) vs. `1e-4`
+(a late-training-scale stand-in). The compiler's own recorded output scale
+moved by **exactly 10,000.00x** (`0.0966 -> 9.659e-6`), matching the calibration
+ratio to five significant figures -- textbook linear MinMax, not an
+approximation. On real AX650N hardware, feeding both compiled models a real
+`grad_seed = 1e-4`:
+
+| model | seed | nonzero elements | dW[0] |
+| --- | --- | --- | --- |
+| baseline (calibrated for seed~1.0) | 1e-4 | **0/128** | 0 |
+| recalibrated (calibrated for seed~1e-4) | 1e-4 | **115/128** | -2.8977e-05 |
+| baseline | 1.0 | 115/128 | -0.28977 |
+| recalibrated | 1.0 | 115/128 | **-2.8977e-05** (identical to its own 1e-4 result) |
+
+The recalibrated model recovers the exact late-training gradient (`-2.8977e-05
+= -0.28977 x 1e-4`, matching the seed's own linearity precisely) at the scale
+it was built for. The fourth row is the real limit, not a footnote: fed the
+*old*, large seed, the recalibrated model returns the **identical, saturated**
+value it gives for the tiny seed -- it has lost the ability to represent large
+gradients, clipped at the top of its now-much-smaller range. **This settles
+the adaptive-vs-one-shot question directly**: a single compiled model cannot
+serve both an early-training and a late-training gradient scale at once. Real,
+practical shape of the win: calibrate for the training regime a given deployed
+model will actually run (a short fine-tuning run, or a specific stage of a
+longer one), or swap to a differently-calibrated recompiled model at defined
+checkpoints as training progresses -- not a continuously-adaptive per-step
+scheme, since nothing about Pulsar2's build-time calibration is revisitable at
+runtime.
+
+Combining both levers (recalibration + `output_data_type` override) produced a
+compiled model byte-identical in every quantization-relevant field to
+recalibration alone -- confirming, independently, that `output_data_type` truly
+contributes nothing on `MatMul`.
+
+### Multi-phase calibration swap: the mechanism, hardware-verified past the isolated probe
+
+Turned the recalibration lever above into a real, working demonstration
+rather than leaving it as a design note. Not on the full resnet18 pipeline --
+`resnet18d_folded.onnx` (the forward model earlier sections' compiles used) is
+no longer present in this session's scratch, and regenerating it (BN-folding
+included) was out of scope for the time this task had -- but on
+`tests/test_build_resident_train_step.py`'s own small real forward model
+(`x -> Conv -> Relu -> Flatten -> Gemm -> logits`, trainable `cw`/`gw`)
+through the **real, unmodified pipeline**
+(`add_mse_loss`/`build_resident_step`/`pulsar2_docker.build()`) -- a genuine
+multi-node training-step graph (35 nodes after simplify), not the single-`MatMul`
+isolated probe the levers above were tested on. `gb` (the Gemm bias) was left
+frozen: trained, it hits a real, separate compiler crash
+(`TileFailException("AxQuantizedSub, tuple index out of range")` on the SGD
+subtract for that specific tiny 10-element tensor) unrelated to anything this
+task investigated -- worth a bug report if this model shape is revisited, not
+chased further here.
+
+Built two compiles, identical graph, differing only in `make_training_calib`'s
+`weight_scale` (0.05 -- "early training" -- vs. 0.0005 -- "late training", the
+same 100x ratio methodology as the isolated-probe result above), each in
+**~15s** (this graph's own size, not resnet18's -- the batching section's
+70-450s figures don't apply here). Confirmed the compiler-recorded scales
+move by **exactly 100.00x** between the two builds, for both trainable
+tensors and their SGD-updated state outputs alike (`quant_axmodel.json`'s
+`tensor_configs`/`values`, same evidentiary method as the isolated-probe
+result):
+
+| tensor | phase 1 scale (weight_scale=0.05) | phase 2 scale (weight_scale=0.0005) | ratio |
+| --- | --- | --- | --- |
+| `cw` | 0.0012102693 | 1.2102693e-05 | 100.00x |
+| `cw`'s updated state | 0.0012102675 | 1.2102679e-05 | 100.00x |
+| `gw` | 0.0013282200 | 1.3282201e-05 | 100.00x |
+| `gw`'s updated state | 0.0013282195 | 1.3282196e-05 | 100.00x |
+
+This confirms the isolated probe's finding generalizes past one `MatMul` to a
+real multi-node graph with a real Conv, a real SGD update, and simplify()
+in the loop.
+
+**Real hardware demonstration**: fed the identical late-training-scale weight
+state (`cw`/`gw` values ~100x smaller than phase 1's own calibration) and the
+identical batch/lr into both compiled models, 5 steps each:
+
+| model | fed | `cw[0]` before | `cw[0]` after | relative update |
+| --- | --- | --- | --- | --- |
+| phase 1 (calibrated for scale 0.05) | late-scale weights | 0.000152358538 | **0** | dead |
+| phase 2 (calibrated for scale 0.0005) | the same late-scale weights | 0.000152358538 | **0.000157334827** | **1.03266x** |
+| phase 1 (reference) | its own matching early-scale weights | 0.0152358543 | 0.0157334786 | 1.03266x |
+
+Phase 2 recovers the **exact same relative update** (1.03266x) that phase 1
+gets on weights at its own calibrated scale -- a real, correctly-proportioned
+SGD step -- while phase 1 fed the same late-scale state loses it completely,
+landing on exactly zero. This is the "swap to a recalibrated model when the
+current one's gradient dies" mechanism working end to end: the same weight
+*values* handed from one compiled model to the next (via ordinary host-side
+files -- `resident_runner.c`'s existing `.state<k>` convention, no
+graph-level coupling between the two compiles needed), only the calibration
+differs.
+
+**What this does and doesn't prove.** This demonstrates the mechanism with
+one real transition (2 phases, chosen and swapped by hand) -- not a 3-phase
+sweep, and not an automatic controller. Real, open costs and questions for
+whoever builds on this:
+
+- **A phase swap costs a full recompile** -- ~15s on this small graph, and
+  per the batching section's own numbers, 70-450s+ on the real resnet18
+  pipeline. Not free, and not something to do every few steps.
+- **How many phases a genuinely long run needs, and where to place the
+  boundaries, is open.** This demo used one 100x jump because that's the
+  ratio already validated on the isolated probe; a real schedule would likely
+  want smaller, more numerous steps, chosen from the actual gradient-decay
+  curve of a real training run rather than picked by hand.
+- **Triggering is manual here.** `finetune.LossScaler`'s existing
+  `zero_fraction`/`DEFAULT_UNDERFLOW` detector is the natural fit for
+  deciding *when* to swap (its role changes from "grow/backoff a scale" to
+  "signal a model swap"), but wiring that up, and actually swapping the
+  running `resident_runner` process out from under a live loop, is
+  unbuilt.
+- **Hiding the recompile cost** (building phase N+1 speculatively while phase
+  N is still training, so the swap is instant when it's needed) is a real,
+  unexplored option given a spare CPU core and Docker daemon are cheap
+  relative to the AX650N itself.
+
 ## Speed
 
 `axcl_run_model` costs ~580 ms per invocation (process start, device open,
