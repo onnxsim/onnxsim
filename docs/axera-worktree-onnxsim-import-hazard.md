@@ -40,19 +40,62 @@ first on `sys.path`, so `PathFinder` finds and uses it directly and
 `_EditableFinder` is never consulted. The hazard is specific to **directly
 executing a `scripts/axera/*.py` file**, independent of `cwd`.
 
-## The fix
+## The fix, and a correction to the fix
 
-`scripts/axera/_local_import.py` gained `ensure_repo_onnxsim()`: inserts this
-checkout's own repository root (three directories up from
-`_local_import.py`'s own location) at the front of `sys.path`, so
-`PathFinder` finds this checkout's own `onnxsim` before the global fallback
-is ever reached. Called at module-import time (not lazily, inside a function
-that might run long after `sys.path` was last touched) in the three files
-that import `onnxsim`: `pulsar2_docker.py`, `pulsar2_quantizer.py`,
-`build_resident_train_step.py`.
+`scripts/axera/_local_import.py` gained `ensure_repo_onnxsim()`. The first
+version inserted this checkout's own repository root at the front of
+`sys.path`, so `PathFinder` would resolve the top-level `onnxsim` package
+directly from this checkout's source tree. Re-ran the two-worktree repro
+after that version and it worked: a script invoked from worktree B correctly
+crashed on worktree B's own marker.
 
-Re-ran the same two-worktree repro after the fix: a script invoked from
-worktree B now correctly crashes on worktree B's own marker.
+**That version broke CI on every PR merged after it** --
+`ModuleNotFoundError: No module named 'onnxsim.onnxsim_cpp2py_export'` in the
+`Pulsar2 compatibility check` job, on PRs (#1352, #1353) that never touched
+the code path it broke. Cause: once `PathFinder` resolves the top-level
+package from a plain checkout, `onnxsim.__path__` becomes just that
+checkout's `onnxsim/` directory -- and the compiled extension is a build
+artifact, not a tracked source file, so it isn't there. Every later
+submodule import (`onnxsim.onnxsim_cpp2py_export` included) searches only
+that `__path__`, never falling back to the `sys.meta_path` finder that used
+to serve it. The CI job's own workflow comment already documented exactly
+this risk ("the repo root contains the `onnxsim/` source dir (no compiled
+extension), which would shadow the installed wheel") and works around it by
+running from `runner.temp`, not the checkout -- a `cwd`-based protection the
+`sys.path`-inserting fix bypassed entirely, since it doesn't look at `cwd`.
+
+**Corrected**: import `onnxsim` first, however it would normally resolve (so
+whatever already-working resolution -- the editable install's finder in a
+worktree, the properly-installed wheel in CI -- gets to run and discover
+where the real compiled extension lives), then *prepend* this checkout's own
+`onnxsim/` directory to the already-resolved package's `__path__`, rather
+than replacing `sys.path`-level resolution. A submodule search now finds
+this checkout's own copy first if it has one, and falls through to the
+original entry (which does have the extension) if it doesn't.
+
+**This corrected version is safe, and confirmed weaker than first
+described.** Re-running the original two-worktree repro after the merge-based
+fix found a real limitation: `onnxsim/__init__.py` eagerly imports the large
+majority of the package (`graph_grad` included, transitively, through other
+eagerly-imported modules) as part of running `import onnxsim` itself -- before
+this function ever gets to touch `__path__`. Those submodules are already
+cached in `sys.modules`, unaffected by the later `__path__` prepend. Directly
+confirmed: a worktree-invoked script calling the fixed function still
+received the *main checkout's* `graph_grad.py`, not its own. The corrected
+version reliably stops the CI regression above and correctly redirects any
+submodule that genuinely isn't already cached by the time it runs, but does
+**not** reliably isolate `graph_grad` specifically -- the one submodule this
+whole investigation started because of. `_local_import.py`'s own docstring
+now says so plainly and points at `fresh()` (already used for axera-local
+`models`/`worker`) as the tool that actually guarantees isolation for one
+named submodule, for anyone who needs that guarantee rather than
+best-effort coverage.
+
+Given the audit below already found zero confirmed impact from the original
+hazard, stopping here -- safe, and better than nothing, rather than building
+a `sys.meta_path`-finder-based fix that intercepts `onnxsim`'s own spec
+before `__init__.py` runs -- was the right amount of engineering for a risk
+already shown to be low-impact in practice.
 
 **Not yet applied to `scripts/axera/build_whisper_train_step.py`** (added by
 the still-open Whisper training-case PR) -- that file imports `onnxsim`
