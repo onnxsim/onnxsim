@@ -103,7 +103,16 @@ prefill cannot be timed with the shipped CLI. These talk to
   and the two calibration bugs (input-scale mismatch, a degenerate constant
   `lr` calibration range) it found along the way. `argv[4]` overrides `lr`
   at runtime for sweeping it against the compiled model's own calibrated
-  range.
+  range. Also gained a `-v` flag (`AXCL_VNPU_ENABLE`, same lever/methodology
+  as `resident_runner.c`'s own -- PRs #1345/#1346) and real device-memory
+  reporting (`axclrtEngineGetUsageFromModelId`, PR #1347) -- confirmed
+  non-corrupting and 3.16x/3.70x aggregate throughput at N=4/8 concurrent
+  contexts on the batch=1 model, the audio-speech coverage doc's "Batching
+  and vNPU concurrency" section has the full numbers. The loop itself is
+  batch-size-agnostic (buffer sizes come from the compiled model's own
+  IOInfo), but batch>1 builds currently train incorrectly on real hardware
+  (a calibration-range regression, not a runner bug) -- see that same
+  section before trusting a batch>1 run's loss/weight output.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
