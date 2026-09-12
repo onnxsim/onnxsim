@@ -345,3 +345,73 @@ step graph on Pulsar2/AX650N and confirming the gradient survives multiple
 step for whoever picks this up -- the host-side evidence says it should
 behave like resnet18, not like Whisper, but only a real compile+run settles
 it the way this project settles everything else.
+
+### Real hardware follow-up: compiles, `highest_mix_precision` fails a third way, and quantized gradient dies for a different reason than Whisper's
+
+Rebuilt the training-step graph at the real `Wav2Vec2Config()` default scale
+(4.2M-param feature extractor, matching the section above exactly --
+`fe.conv_layers.0.conv.weight` trainable rather than layer 6, since
+`build_resident_step`'s own `onnxsim.simplify()` pass renames later layers'
+weight initializers via CSE, e.g. `fe.conv_layers.6.conv.weight` ->
+`_v_100`, while layer 0's name survives -- picking layer 0 sidesteps the
+naming churn rather than fighting it). 172 nodes, matching the host-only
+survey's own count exactly. Host-verified again on this exact build:
+perturbing along the gradient's own direction (the fix this project's own
+Whisper work already established for finite-difference noise at this scale)
+gives 0.2-0.3% agreement against a reference at properly-tuned step sizes.
+
+**Compiles cleanly under standard INT8** (`pulsar2:7.0-lite`, 31.9s) -- the
+first real compile of any wav2vec2-family training graph in this project's
+history.
+
+**`highest_mix_precision` fails here too, a third distinct way.** Not
+Whisper's `LayerNorm` tiling limit (PR #1359's architecture has none) or
+resnet18's `AvgPool` scheduler `TypeError` (this graph has none either) --
+a real `TileFailException` on `AxErf`: `'dont support lut_float opr in
+AXOPS/ONNXOPS/CUSTOM_OPS'`, on the GELU activation's `Erf` node, forced to
+FP32 by the flag. Tried the same escape hatch PR #1359 tried for Whisper's
+LayerNorm -- a `layer_configs` entry forcing just `Erf` back to `U8`
+alongside `highest_mix_precision` -- and got the identical error, confirming
+(a third time, on a third architecture) that `highest_mix_precision` does
+not compose with `layer_configs` overrides at all; it is genuinely
+whole-graph-only. Three architectures, three different real ops
+(`LayerNorm`, `AvgPool`, `Erf`), three different real NPU-backend failure
+signatures (a `TileFailException` on a tiling-workspace limit, a Python
+`TypeError` inside the closed-source scheduler, and a `TileFailException`
+on an unsupported float lookup-table operator) -- this is now a consistent
+pattern, not a one-off: Pulsar2's FP32 tiling path does not reliably support
+ordinary ops that appear in almost any real model, and `highest_mix_precision`
+is not currently usable end-to-end on anything this project has actually
+built.
+
+**Standard INT8 compiles and runs, but the quantized gradient still dies
+after step 0 -- for a different, more mundane reason than Whisper's SNR
+floor.** Real hardware run (resident runner adapted to this model's real
+I/O order, confirmed via `probe_io`: inputs `[x, y,
+fe.conv_layers.0.conv.weight, lr, grad_seed]`, outputs `[updated weight,
+loss]`):
+
+| step | `w[0]` | loss |
+| --- | --- | --- |
+| initial | 0.453123 | -- |
+| 0 | 0.4580865502 | 0 |
+| 1-14 | 0.4580865502 (unchanged) | 0 |
+
+A real, nonzero step-0 update happens (delta +0.00496), then the weight
+freezes bit-identical from step 1 on, with loss reading exactly 0
+throughout -- the same *symptom* as Whisper's "dies at step 1," but not the
+same *cause*. The host-side evidence above already established this
+model's true gradient-to-weight ratio (~0.032) is easily resolvable by an
+8-bit quantizer -- there is no SNR floor here the way there is for Whisper.
+The step-0 delta itself is the tell: `(0.453123 - 0.458087) / 1e-4 ≈ -49.6`
+effective gradient magnitude, roughly five orders of magnitude larger than
+the host-measured true gradient (~0.0013 mean absolute) -- this is a
+calibration-range mismatch, the same class of bug PR #1346 found and fixed
+for resnet18 (arbitrary, unmeasured `weight_scale`/`x_scale` guesses fed to
+`make_training_calib.py` rather than values matched to this model's real
+activation statistics), not a new fundamental limit. **Not chased further
+here** -- fixing it needs proper calibration data (real or realistically-
+scaled `x`/weight statistics, following PR #1354's confirmed textbook-MinMax
+calibration behavior, or PR #1346's own fix pattern) rather than a config
+flag, and is the concrete next step for whoever wants this model actually
+training multiple real steps on hardware.
