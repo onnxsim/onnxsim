@@ -573,6 +573,50 @@ and is not degenerate the way this one was; its batch is 1 throughout, where
 this exact bug is invisible by construction. That caveat remains open; see
 its own note below for the current best guess and the concrete next step.
 
+### Device memory: nowhere close to the constraint
+
+Measured with `axcl-smi` and cross-checked against a real API (below), not
+estimated from `.axmodel` file sizes:
+
+| state | CMM usage | vs. 7040 MiB total | NPU util |
+| --- | --- | --- | --- |
+| idle | 12 MiB | 0.2% | 0% |
+| resnet18, batch=1, one context | 69 MiB | 1.0% | 61% |
+| resnet18, batch=8, one context | 72 MiB | 1.0% | 65% |
+| resnet50, one context | 88 MiB | 1.3% | 61% |
+| 8 concurrent vNPU contexts, batch=8 each | 432 MiB | 6.1% | **100%** |
+
+Per-process CMM tracks the compiled `.axmodel` size directly (`axcl-smi`'s
+own per-PID column: ~6.9 MiB for resnet18's 6.6 MB file, ~19.6 MiB for
+resnet50's 20.1 MB file), plus a fixed per-context overhead of roughly
+45-57 MiB (I/O buffers, per-context firmware/task state) that does **not**
+get shared across concurrent vNPU contexts -- it compounds per context, which
+is most of why 8 contexts cost 432 MiB rather than 8 x 7 MiB = 56 MiB.
+
+The headline: even at 8-way vNPU concurrency saturating NPU compute (100%
+utilization, confirming the previous section's "saturating" finding), CMM
+usage is 6.1% of the card's total. Compute saturates *long* before memory
+would become a constraint at any concurrency level measured so far.
+
+**A real, working API for this**, found and verified on hardware rather than
+assumed from the header (`axclrtEngineExecuteAsync` was declared but
+`AXCL_ERR_UNSUPPORT` on this SDK, so header presence alone proves nothing):
+`axclrtEngineGetUsage(modelPath, &sysSize, &cmmSize)` reports the engine's
+own required-memory accounting **from the file path alone, before loading**;
+`axclrtEngineGetUsageFromMem`/`axclrtEngineGetUsageFromModelId` are the same
+query from an in-memory model buffer or an already-loaded `modelId`. Now
+wired into `resident_runner.c` (its stderr diagnostics and the parseable
+`cmm=...MiB` field on the final summary line), queried once per run right
+after load. One discrepancy worth flagging rather than resolving: this API
+reports a larger number than `axcl-smi`'s live per-process column for the
+same model (15.3 MiB vs. ~6.9 MiB for resnet18) -- read it as the engine's
+planned working-set budget, not a live-usage snapshot, and don't expect the
+two to match. A lower-level, system-wide family
+(`AXCL_SYS_MemQueryStatus`/`AXCL_SYS_MemGetPartitionInfo` in `axcl_sys.h`,
+likely what `axcl-smi`'s own aggregate row queries) exists but was **not**
+verified here -- flagged as an unconfirmed lead, not a fact, following this
+doc's own standard of not claiming a header's presence as working capability.
+
 ## Two vendor bugs, both silent
 
 **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all of

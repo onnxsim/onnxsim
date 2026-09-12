@@ -28,7 +28,13 @@ prefill cannot be timed with the shipped CLI. These talk to
   copy) and the NPU schedules them concurrently instead of serializing. See
   the handoff doc's "Execution overlap" section for the scaling numbers and
   for why `axclrtEngineExecuteAsync` -- AXCL's other overlap primitive --
-  is not an option (`AXCL_ERR_UNSUPPORT` on this device/SDK build).
+  is not an option (`AXCL_ERR_UNSUPPORT` on this device/SDK build). Also
+  reports device memory: `axclrtEngineGetUsageFromModelId()` is queried once
+  after load and printed both as a stderr diagnostic and as the `cmm=...MiB`
+  field on the final summary line -- confirmed real and working (unlike
+  `axclrtEngineExecuteAsync`), see the handoff doc's "Device memory" section
+  for what it reports versus `axcl-smi`'s own numbers, which don't match and
+  aren't supposed to (one is a planned budget, the other a live snapshot).
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
