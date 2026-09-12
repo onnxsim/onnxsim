@@ -2000,6 +2000,87 @@ own I/O order was still resnet18's, left over from copying
 `resident_runner.c` -- the actual index constants in the body were always
 right, only the prose above them was stale.)
 
+### The multi-thousand-step LossScaler run, attempted on Whisper's real graph -- blocked by a new NPU-backend crash, not a quantization-math wall
+
+Following up on this doc's own "not yet done" item: a real multi-thousand-step
+run with `finetune.LossScaler` driving `grad_seed` adaptively against the FP32
+override, on `last_half` itself rather than the small isolated probes the
+mechanism was previously validated on. `finetune.py`'s `LossScaler`/`train()`
+already implement exactly this adaptive loop (grow the scale on sustained
+underflow, back off and discard on saturation) -- it was never exercised
+against a real `grad_seed` graph input before, only designed against the
+pre-#1353 `ineffective`-stand-down path.
+
+**Before spending real compile time on thousands of steps, ran the cheaper,
+directly discriminating check first**: does a compiled `last_half`, with the
+FP32 elementwise override, survive past its established step-1 death at all,
+at any seed? A dead build makes a multi-thousand-step run pointless before it
+starts. Built `last_half` fresh (523 nodes, 14 trainable tensors, matching
+this doc's own established numbers), calibrated with the same real-scale
+method "Recalibrating Whisper for its real gradient scale"'s Attempt 1 used
+(real captured initializer values +0.1% jitter for the 14 state tensors,
+`label_inputs=()` for `y`), plus a wide `real_data` list for `grad_seed`
+itself spanning `1 -> 1e10` (`make_training_calib.py`'s existing "a real
+multi-step trajectory" list form, applied to widen a sweep range rather than
+calibrate an actual trajectory) -- avoiding the narrow-default-calibration bug
+class this doc's own retroactive check (above) flagged as a real risk for
+this exact tensor.
+
+**The baseline control reproduced the established result exactly**: compiled
+with no `layer_configs` override, ran on real AX650N hardware --
+`loss=1.00264454` at every step (matching the earlier "last_half actually
+trains" section's `1.00265` to five significant figures), a real step-0
+update, then bit-identical-zero from step 1 on, confirmed unmoved by sweeping
+`grad_seed` from 1 to 1e6 (identical output at both) -- the calibration setup
+reproduces prior work correctly before trusting what comes next.
+
+**The FP32-override build does not compile at all, on three independent
+`layer_configs` targets, each with the identical failure signature**:
+
+| `op_types` targeted | result |
+| --- | --- |
+| `Mul, Add, Sub, Div` | `NPUBackendError`: `KeyError('resident_step__div_72')` in `ddr_allocate` |
+| `Mul, Add, Sub` (no `Div`) | identical `KeyError('resident_step__div_72')` |
+| `Mul` alone | `KeyError('resident_step__mul_67')` -- different node, same crash site |
+
+All three fail inside Pulsar2's own closed-source scheduler
+(`axnn.yasched.test_onepass.ddr_allocate`), not in quantization or graph
+validation -- the compiler gets as far as building models per-subgraph
+(`graph2models`/`results2model`) before crashing on a `KeyError` for
+whichever node its own FP32 promotion touched, name confirming this is a real
+allocator bug reacting to the *marked* node, not a coincidence. **This is a
+new, distinct NPU-backend implementation gap from anything documented
+before** -- not the `MatMul`/`Conv` `data_type` rejection (that fails
+cleanly, downgrading to U8 with no crash), not `highest_mix_precision`'s
+`TileFailException` on `LayerNorm` tiling or resnet18's `AvgPool` scheduler
+`TypeError` (both also real crashes, but in different subsystems, on the
+*forward* graph's own ops, not this backward-pass DDR-allocation step) --
+a fourth, independently-discovered instance of the same overall pattern this
+project keeps finding: **a mechanism proven correct and safe on a small,
+isolated probe graph does not survive contact with a real, ~500-node
+architecture**, this time failing at compile time rather than silently
+producing wrong numbers.
+
+**Net**: the multi-thousand-step run itself was never reached, and correctly
+so -- there is no compiled FP32-seed build of Whisper's real graph to run it
+against, on this Pulsar2 version, with any `layer_configs` override tried.
+This also sharpens, rather than merely repeats, the standing "SNR floor"
+finding: even if this crash did not exist, the small-probe FP32-seed
+mechanism only ever rescues gradient elements up to the boundary where the
+protected elementwise chain feeds into an unprotected `MatMul` -- and
+Whisper's own true signal was already established (host, float, no
+quantization at all) to be 4-5 orders of magnitude below what INT8 can
+resolve, a much larger gap than the 0%->20.1% rescue effect the small probe
+demonstrated. So even a working compile would very likely have reproduced
+the same step-1 death, for the reason "Recalibrating Whisper for its real
+gradient scale" already established (accumulated INT8 precision loss through
+many intermediate backward-pass ops a seed applied only near the loss cannot
+reach) -- this compile crash forecloses confirming that directly, but does
+not on its own reopen the SNR-floor conclusion. Not chased further: routing
+around a closed-source scheduler's own `ddr_allocate` `KeyError` is not
+something this project's side of the stack can fix, the same verdict
+`highest_mix_precision`'s own real-architecture crashes already reached.
+
 ### Surveying NVIDIA TransformerEngine: one accidental discovery beats everything else tried
 
 Full writeup: `docs/transformerengine-low-precision-survey.md`. Most of
@@ -2058,9 +2139,17 @@ failure mode.
    (0% -> 20.1% nonzero over seed 1 -> 1,000 on a small test graph), but
    plateaus once the seed's value reaches the weight-gradient `MatMul` --
    `layer_configs`' `FP32` override is confirmed invalid for `MatMul`/`Conv`.
-   **Not yet done**: a real multi-thousand-step run with `LossScaler` driving
-   this seed adaptively, to quantify how far the ~1,000/~5,000-step ceiling
-   actually moves.
+   **Attempted on Whisper's real graph: blocked, not measured.** See "The
+   multi-thousand-step LossScaler run, attempted on Whisper's real graph"
+   above -- `layer_configs`' FP32 override, proven safe on the small probe,
+   crashes Pulsar2's own NPU-backend `ddr_allocate` step on `last_half`'s
+   real ~500-node graph, on every `op_types` combination tried. No compiled
+   build exists to run the adaptive `LossScaler` loop against. Given
+   Whisper's independently-established SNR floor (the true gradient is 4-5
+   orders of magnitude below INT8's resolution, a much larger gap than the
+   FP32-seed mechanism's own demonstrated rescue range), a working compile
+   would likely have reproduced the same step-1 death anyway -- this remains
+   the honest, unclosed state of the question, not a confirmed negative.
 2. ~~Weights resident with in-graph updates.~~ **Done: 7.0x** (200.6 ms ->
    28.6 ms/step) -- see "Weights resident with in-graph updates" above.
    Residency alone was 5.2x; `_linearize_trainable_convs` (avoiding the
