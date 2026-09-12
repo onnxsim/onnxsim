@@ -47,6 +47,36 @@ import sys
 from types import ModuleType
 
 
+def ensure_repo_onnxsim() -> None:
+    """Make ``import onnxsim`` resolve to *this checkout's own* ``onnxsim``,
+    not whatever ``onnxsim`` happens to be editable-installed globally.
+
+    A real, confirmed hazard for any script here run from an isolated ``git
+    worktree``: invoked directly (``python3 scripts/axera/foo.py``), a
+    script's ``sys.path[0]`` is its own ``scripts/axera`` directory, which
+    has no ``onnxsim`` package in it -- so the normal ``sys.path`` search
+    (``importlib.machinery.PathFinder``, tried first) finds nothing and
+    falls through to the editable install's own finder
+    (``sys.meta_path.append``ed, so tried *after* ``PathFinder`` -- checked
+    directly in the generated ``__editable___onnxsim_*_finder.py``), which
+    unconditionally maps ``onnxsim`` to the path recorded at ``pip install
+    -e .`` time -- the main checkout, regardless of which worktree's script
+    actually asked. A worktree editing ``onnxsim/*.py`` and "host-verifying"
+    the change by running one of these scripts is therefore silently
+    exercising the *main checkout's* code, not its own, unless something
+    puts this worktree's own repo root ahead of that fallback on
+    ``sys.path`` first -- which is exactly what this function does.
+
+    Call this before any ``import onnxsim`` / ``from onnxsim import ...``,
+    as early in the script as possible.
+    """
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
 def fresh(name: str, directory: str) -> ModuleType:
     """Import ``<directory>/<name>.py`` as module ``name``, bypassing both
     ``sys.modules`` caching and ``sys.path`` search-order ambiguity -- the

@@ -68,15 +68,91 @@ multiplicative scale meant to span decades cannot live in a linear fixed-point
 tensor. `finetune.LossScaler` therefore detects that it is having no effect and
 stands down.
 
-The untried way out: `layer_configs` accepts `data_type: "FP32"` for
-elementwise ops, and the seed feeds a `Mul`. If the seed and its consumer stay
-float, scaling should work. **Not tested.**
+### The FP32 gradient seed: tested, real, but it plateaus rather than opens the door
 
-A second obstacle waits behind it: fixed-point clipping is **silent and local**.
-It happens to intermediates that never reach an output, so a controller reading
-the returned gradient sees a healthy tensor while the computation upstream is
-destroyed -- unlike fp16, where overflow makes an inf that propagates. Reliable
-back-off needs the graph to export `ReduceMax(|t|)` on those tensors.
+The untried way out was: `layer_configs` accepts `data_type: "FP32"` for
+elementwise ops, and the seed feeds a `Mul`. If the seed and its consumer stay
+float, scaling should work. It does something real -- but not the open-ended
+fix the theory suggested, and the reason is itself a hard, documented Pulsar2
+limitation, not a bug in this repo.
+
+**First, a real infrastructure gap had to close before this was even
+testable.** `build_resident_step()`'s gradient seed was `b.const(1.0)` -- baked
+into the graph at *build* time, not a per-step input. No adaptive controller
+(`finetune.LossScaler`'s whole reason to exist) can vary a value that isn't a
+runtime input. Fixed: `grad_seed` is now a scalar graph input declared the
+same way `lr` is (`qat_graph.make_step_graph`'s `scalars=`), with a new host
+test (`test_grad_seed_is_a_runtime_input_that_linearly_scales_the_gradient`)
+confirming `build_backward`'s own linearity in its seed holds exactly on host
+before ever trusting an on-device number.
+
+**On real hardware, on a small from-scratch Conv/Conv/Gemm step graph** (not
+the full resnet18 pipeline -- built fresh to isolate the seed mechanism from
+every other speed/legalization change in this doc), two builds of the same
+graph via `pulsar2_docker.build(config_path=...)`, differing only in
+`quant.layer_configs: [{"op_types": ["Mul","Add","Sub","Div"], "data_type":
+"FP32"}]`:
+
+| build | seed=1 | seed=100 | seed=1,000 | seed=100,000 |
+| --- | --- | --- | --- | --- |
+| baseline | 100% nonzero | 100% nonzero | 100% nonzero | 100% nonzero |
+| FP32 elementwise | **0%** nonzero | 0.05% nonzero | **20.1%** nonzero | 20.1% nonzero |
+
+Two things confirmed, one real limit found:
+
+* **The FP32 override has a genuine, monotonic effect that tracks the seed.**
+  In the FP32 build, growing the seed from 1 to 1,000 rescues more and more
+  gradient elements from rounding to exactly zero (0% -> 0.05% -> 20.1%) --
+  precisely the signature loss scaling predicts, and precisely what "the seed
+  reaches the graph as a tensor pinned to a constant" (the original diagnosis)
+  would make impossible. This is real, on-device, hardware-measured evidence
+  the mechanism works, not a host simulation.
+* **The baseline is not simply "constant regardless of seed" on this smaller
+  graph** -- unlike the original resnet18 probe's bit-identical finding, here
+  the per-element ratio between seed=1,000 and seed=1 is chaotic (mean -14.8,
+  std 3701, over a supposed 1000x expected ratio) rather than either constant
+  or proportional. The seed reaches *something* without the FP32 override,
+  just not coherently -- a smaller, differently-shaped graph than the original
+  characterization, so treat the *qualitative* finding (baseline doesn't scale
+  correctly, FP32 does something real) as the transferable result, not the
+  exact percentages.
+* **It plateaus.** 20.1% nonzero at seed=1,000 and at seed=100,000 -- unchanged
+  over two more orders of magnitude of seed. This is not the seed failing to
+  reach the graph again; it is the *next* quantised boundary downstream taking
+  over as the limit. The weight gradient here is produced by a `MatMul`
+  (`dW = dOut^T @ X`, unavoidable for any linear/conv layer's gradient), and
+  `scripts/axera/README.md`'s own prior investigation into this exact
+  mechanism (a different session, a different model, same Pulsar2 version)
+  already confirmed `data_type: "FP32"` **is not a valid override for `MatMul`
+  or `Conv` at all** -- only a fixed, documented list of elementwise ops
+  (`LeakyRelu, Sigmoid, Relu, Add, Mul, Div, Sub, Concat, Softmax`) accepts it.
+  So the seed's own value survives as real FP32 through the `Reshape`/`Mul`
+  chain that first consumes it, but the moment it reaches the `MatMul` that
+  actually computes the gradient, that node's own INT8/16 quantisation --
+  which `layer_configs` cannot touch -- reimposes a ceiling. Growing the seed
+  further cannot rescue more elements past whatever that `MatMul`'s
+  activation/output quantisation can resolve.
+
+**Net effect on the original ceiling**: this should genuinely push U8's
+~1,000-step and U16's ~5,000-step death points further out (more of the
+gradient survives at a given true magnitude than before), but it does **not**
+make training open-ended the way a true floating-point gradient path would --
+the `MatMul` boundary means there is still *some* magnitude below which the
+gradient dies again, just a smaller one than today. **Not measured**: a real
+multi-thousand-step training run with `LossScaler` driving the seed adaptively
+against this FP32 build, to quantify exactly how much further the ceiling
+moves in steps/SNR -- a substantial follow-on this pass didn't reach, since
+establishing that the mechanism works at all (the infrastructure gap, the
+sweep, and the `MatMul` limit) filled the available time. That run, plus
+re-enabling `LossScaler` against a real `grad_seed` input instead of the
+`ineffective` stand-down path, is the concrete next step.
+
+A second obstacle waits behind it either way: fixed-point clipping is **silent
+and local**. It happens to intermediates that never reach an output, so a
+controller reading the returned gradient sees a healthy tensor while the
+computation upstream is destroyed -- unlike fp16, where overflow makes an inf
+that propagates. Reliable back-off needs the graph to export `ReduceMax(|t|)`
+on those tensors.
 
 ## Speed
 
@@ -795,8 +871,17 @@ work.
 
 ## What to do next
 
-1. **The FP32 gradient seed.** The one untried route past the dying gradient,
-   and the difference between a 5,000-step horizon and an open-ended one.
+1. ~~The FP32 gradient seed.~~ **Tested: real effect, not a full fix.** See
+   "The FP32 gradient seed: tested, real, but it plateaus rather than opens
+   the door" above -- `grad_seed` is now a runtime input (was baked in at
+   1.0), and forcing its consuming `Mul`/`Add`/`Sub`/`Div` chain to FP32
+   measurably rescues gradient elements from underflow as the seed grows
+   (0% -> 20.1% nonzero over seed 1 -> 1,000 on a small test graph), but
+   plateaus once the seed's value reaches the weight-gradient `MatMul` --
+   `layer_configs`' `FP32` override is confirmed invalid for `MatMul`/`Conv`.
+   **Not yet done**: a real multi-thousand-step run with `LossScaler` driving
+   this seed adaptively, to quantify how far the ~1,000/~5,000-step ceiling
+   actually moves.
 2. ~~Weights resident with in-graph updates.~~ **Done: 7.0x** (200.6 ms ->
    28.6 ms/step) -- see "Weights resident with in-graph updates" above.
    Residency alone was 5.2x; `_linearize_trainable_convs` (avoiding the

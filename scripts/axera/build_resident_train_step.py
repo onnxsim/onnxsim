@@ -88,6 +88,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from _local_import import ensure_repo_onnxsim  # noqa: E402
+
+ensure_repo_onnxsim()
+
 import legalize  # noqa: E402
 
 from onnxsim import graph_grad, qat_graph  # noqa: E402
@@ -408,12 +412,15 @@ def build_resident_step(
     trained = set(params)
     b.initializer = [t for t in model.graph.initializer if t.name not in trained]
 
-    seed = b.const(np.array(1.0, dtype=np.float32), "loss_seed")
+    # A runtime-fed scalar, not `b.const` -- baking the seed in at 1.0 is
+    # what made the original loss-scaling probe's finding possible in the
+    # first place (a constant can never be varied per step). Declared as a
+    # scalar graph input the same way "lr" is, below, via `scalars=`.
     grads = graph_grad.build_backward(
         b,
         nodes=list(model.graph.node),
         shapes=shapes,
-        grad_outputs={loss_output: seed},
+        grad_outputs={loss_output: "grad_seed"},
         targets=list(params),
     )
 
@@ -440,7 +447,7 @@ def build_resident_step(
         b,
         constants=constants,
         state=state,
-        scalars=["lr"],
+        scalars=["lr", "grad_seed"],
         loss=loss_output,
         name="resident_train_step",
     )
@@ -450,7 +457,7 @@ def build_resident_step(
     # *input* hits the identical Pulsar2 calibration failure -- see this
     # module's own docstring.
     for inp in step_model.graph.input:
-        if inp.name == "lr":
+        if inp.name in ("lr", "grad_seed"):
             del inp.type.tensor_type.shape.dim[:]
             inp.type.tensor_type.shape.dim.add().dim_value = 1
 

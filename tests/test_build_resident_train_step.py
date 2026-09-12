@@ -106,11 +106,70 @@ def test_state_output_is_sgd_update_of_the_input():
     x = rng.standard_normal((1, 1, 4, 4)).astype(np.float32)
     y = rng.standard_normal((1, 10)).astype(np.float32)
 
-    feeds = {"x": x, "y": y, "lr": np.array([0.0], np.float32), "cw": cw0, "gw": gw0}
+    feeds = {
+        "x": x,
+        "y": y,
+        "lr": np.array([0.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": cw0,
+        "gw": gw0,
+    }
     out_names = [o.name for o in step_model.graph.output]
     outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
     assert np.array_equal(outs[state["cw"]], cw0)
     assert np.array_equal(outs[state["gw"]], gw0)
+
+
+def test_grad_seed_is_a_runtime_input_that_linearly_scales_the_gradient():
+    """`grad_seed` used to be `b.const(1.0)` -- baked in at build time, so no
+    per-step loss-scaling controller could ever vary it (see
+    `docs/axera-on-device-training-handoff.md`'s "The ceiling: the gradient
+    dies" section for why that mattered: the whole point of loss scaling is
+    a runtime-varying multiplier). Now a real scalar graph input like `lr`.
+
+    `build_backward`'s gradient is linear in its seed by construction (the
+    seed is literally the initial dL/d(loss) the chain rule multiplies
+    through), so `grad_seed=S` must return exactly `S` times the
+    `grad_seed=1` gradient -- extracted via the same `w - w_next` at `lr=1`
+    trick `test_set_batch_gradient_is_the_mean_of_per_sample_gradients` uses.
+    This is what makes a non-1.0 seed value meaningful *before* it ever
+    reaches Pulsar2's calibration/`layer_configs` machinery: get this wrong
+    on host and no amount of on-device `FP32` layer config can save it.
+    """
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    step_model, state = brts.build_resident_step(with_loss, params=["cw", "gw"])
+    onnx.checker.check_model(step_model)
+
+    seed_input = next(i for i in step_model.graph.input if i.name == "grad_seed")
+    assert [d.dim_value for d in seed_input.type.tensor_type.shape.dim] == [1]
+
+    initializers = {t.name: t for t in forward.graph.initializer}
+    cw0 = onnx.numpy_helper.to_array(initializers["cw"])
+    gw0 = onnx.numpy_helper.to_array(initializers["gw"])
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((1, 1, 4, 4)).astype(np.float32)
+    y = rng.standard_normal((1, 10)).astype(np.float32)
+    out_names = [o.name for o in step_model.graph.output]
+
+    def grad_at(seed):
+        feeds = {
+            "x": x,
+            "y": y,
+            "lr": np.array([1.0], np.float32),
+            "grad_seed": np.array([seed], np.float32),
+            "cw": cw0,
+            "gw": gw0,
+        }
+        outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
+        return cw0 - outs[state["cw"]], gw0 - outs[state["gw"]]
+
+    cw_grad1, gw_grad1 = grad_at(1.0)
+    for scale in (1000.0, 2.0**16, 2.0**20):
+        cw_grad_s, gw_grad_s = grad_at(scale)
+        assert np.allclose(cw_grad_s, cw_grad1 * scale, rtol=1e-4), scale
+        assert np.allclose(gw_grad_s, gw_grad1 * scale, rtol=1e-4), scale
 
 
 def test_set_batch_gradient_is_the_mean_of_per_sample_gradients():
@@ -147,6 +206,7 @@ def test_set_batch_gradient_is_the_mean_of_per_sample_gradients():
             "x": xs[i : i + 1],
             "y": ys[i : i + 1],
             "lr": lr1,
+            "grad_seed": np.array([1.0], np.float32),
             "cw": cw0,
             "gw": gw0,
         }
@@ -166,7 +226,14 @@ def test_set_batch_gradient_is_the_mean_of_per_sample_gradients():
     step_n, state_n = brts.build_resident_step(model_n, params=["cw", "gw"])
     onnx.checker.check_model(step_n)
     out_names_n = [o.name for o in step_n.graph.output]
-    feeds_n = {"x": xs, "y": ys, "lr": lr1, "cw": cw0, "gw": gw0}
+    feeds_n = {
+        "x": xs,
+        "y": ys,
+        "lr": lr1,
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": cw0,
+        "gw": gw0,
+    }
     outs_n = dict(zip(out_names_n, _run(step_n, feeds_n, out_names_n)))
 
     for p in ("cw", "gw"):
@@ -197,7 +264,13 @@ def test_in_graph_gradient_matches_finite_differences():
     y = rng.standard_normal((1, 10)).astype(np.float32)
 
     out_names = [o.name for o in step_model.graph.output]
-    feeds = {"x": x, "y": y, "lr": np.array([1.0], np.float32), **w0}
+    feeds = {
+        "x": x,
+        "y": y,
+        "lr": np.array([1.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        **w0,
+    }
     outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
     grads = {p: (w0[p] - outs[state[p]]).astype(np.float64) for p in state}
 
@@ -345,7 +418,13 @@ def test_bottleneck_block_gradient_matches_finite_differences():
     y = rng.standard_normal((1, 5)).astype(np.float32)
 
     out_names = [o.name for o in step_model.graph.output]
-    feeds = {"x": x, "y": y, "lr": np.array([1.0], np.float32), **w0}
+    feeds = {
+        "x": x,
+        "y": y,
+        "lr": np.array([1.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        **w0,
+    }
     outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
     grads = {p: (w0[p] - outs[state[p]]).astype(np.float64) for p in state}
 
