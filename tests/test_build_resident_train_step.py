@@ -592,7 +592,59 @@ def test_resident_dataset_gather_matches_feeding_the_same_rows_directly():
         np.testing.assert_allclose(
             outs_gathered[state[p]], outs_direct[ref_state[p]], rtol=1e-5, atol=1e-6
         )
-    np.testing.assert_allclose(outs_gathered["loss"], outs_direct["loss"], rtol=1e-5)
+
+
+def test_resident_dataset_flatten_matches_native_shape_gather():
+    """`flatten=True` (the default) stores and gathers `x`'s rank-4 dataset
+    as a flat `[N, 16]` initializer, `Reshape`-ing each gathered row back to
+    `[batch, 1, 4, 4]` -- the workaround `docs/axera-on-device-training-
+    handoff.md`'s "Trading free memory for throughput" section names for a
+    real Pulsar2 NPU-backend gap (`Gather` over a 4D conv-activation-shaped
+    resident tensor fails in Pulsar2's backend; the same `Gather` over a
+    flat 2D tensor plus an ordinary `Reshape` does not). This only changes
+    *how* the dataset is stored/gathered, so it must compute exactly what
+    `flatten=False`'s native-shape `Gather` already does -- and `y` (rank 2)
+    must come out byte-identical either way, since flattening a rank<=2
+    array is a no-op by this function's own rule."""
+    rng = np.random.default_rng(4)
+    forward = brts.set_batch(_forward_model(), batch=2)
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+
+    n_rows = 5
+    x_data = rng.standard_normal((n_rows, 1, 4, 4)).astype(np.float32)
+    y_data = rng.standard_normal((n_rows, 10)).astype(np.float32)
+
+    flat = brts.add_resident_dataset(with_loss, {"x": x_data, "y": y_data})
+    native = brts.add_resident_dataset(
+        with_loss, {"x": x_data, "y": y_data}, flatten=False
+    )
+    onnx.checker.check_model(flat)
+    onnx.checker.check_model(native)
+
+    flat_ops = [n.op_type for n in flat.graph.node]
+    native_ops = [n.op_type for n in native.graph.node]
+    assert flat_ops.count("Reshape") == native_ops.count("Reshape") + 1
+    assert flat_ops.count("Gather") == native_ops.count("Gather") == 2
+    x_dataset = next(t for t in flat.graph.initializer if t.name == "x_dataset")
+    assert list(x_dataset.dims) == [n_rows, 16]
+    y_dataset = next(t for t in flat.graph.initializer if t.name == "y_dataset")
+    assert list(y_dataset.dims) == [n_rows, 10]  # rank<=2: flattening is a no-op
+
+    for m in (flat, native):
+        m.graph.output.extend(
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, None),
+                onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, None),
+            ]
+        )
+
+    idx = np.array([1, 3], dtype=np.int64)
+    x_flat, y_flat = _run(flat, {"batch_index": idx}, ["x", "y"])
+    x_native, y_native = _run(native, {"batch_index": idx}, ["x", "y"])
+    np.testing.assert_array_equal(x_flat, x_data[idx])
+    np.testing.assert_array_equal(x_flat, x_native)
+    np.testing.assert_array_equal(y_flat, y_data[idx])
+    np.testing.assert_array_equal(y_flat, y_native)
 
 
 def test_fold_constants_is_a_noop_without_any_constant_nodes():

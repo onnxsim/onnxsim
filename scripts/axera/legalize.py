@@ -110,6 +110,18 @@ def pow2_to_mul(model):
     at every size tried: `NoTilerException` on a `(1,384,28160)` tensor, and
     `OpBuildException: broadcast dim 2: 32 1536 mismatch` on a small one. The
     unfused `Sin`/`Mul`/`Div`/`Add` are each on the supported list.
+
+    Also has a target-agnostic C++ counterpart in onnxsim's own core
+    (`onnxsim/passes/pow2_to_mul.h`), usable from any binding via
+    `onnxsim.simplify(model, extra_optimizers=["pow2_to_mul"])` -- see
+    `tests/test_pow2_to_mul.py`. This module's own version stays: it needs
+    nothing beyond the `onnx` package (no onnxsim build), which
+    `legalize.py in.onnx out.onnx`'s standalone-script usage depends on. The
+    core pass is scoped to `float32` and a constant single-element exponent
+    (this Python version checks the exponent value the same way but doesn't
+    restrict the element type) -- fine for this project's own use, where
+    every Pulsar2-bound graph is float32 throughout (`float16_to_float32`
+    runs first in `TRAINING_RULES`/`RULES` when it doesn't).
     """
     changed = 0
     for node in model.graph.node:
@@ -136,6 +148,22 @@ def explicit_conv_padding(model):
 
     Semantics are unchanged: zero-padding explicitly and then convolving with
     no padding is what the attribute means.
+
+    This is not the same fix as `explicit_auto_pad`: that rule turns a
+    *symbolic* `auto_pad` mode (`SAME_UPPER`/`SAME_LOWER`/`VALID`) into
+    explicit `pads`; this rule starts from `pads` that are *already*
+    explicit and only acts when they are asymmetric. A `Conv` needs at most
+    one of the two -- `explicit_auto_pad` first if `auto_pad` is symbolic,
+    then this rule if what it produces (or what the graph already had) is
+    asymmetric.
+
+    Also has a target-agnostic C++ counterpart in onnxsim's own core
+    (`onnxsim/passes/explicit_conv_padding.h`), usable from any binding via
+    `onnxsim.simplify(model, extra_optimizers=["explicit_conv_padding"])` --
+    see `tests/test_explicit_conv_padding.py`. This module's own version
+    stays: it needs nothing beyond the `onnx` package (no onnxsim build),
+    which `legalize.py in.onnx out.onnx`'s standalone-script usage depends
+    on.
     """
     changed = 0
     nodes = list(model.graph.node)
