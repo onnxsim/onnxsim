@@ -12,6 +12,7 @@
 #include "passes/any_precision_llm.h"
 #include "passes/cross_layer_equalization.h"
 #include "passes/defuse_matmul_integer_to_float.h"
+#include "passes/dilated_conv_to_taps.h"
 #include "passes/double_quantization.h"
 #include "passes/dynamic_quantize_attention.h"
 #include "passes/dynamic_quantize_matmul.h"
@@ -27,6 +28,7 @@
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
 #include "passes/explicit_auto_pad.h"
+#include "passes/float16_to_float32.h"
 #include "passes/fp6_llm.h"
 #include "passes/fuse_add_bias_into_conv.h"
 #include "passes/fuse_attention.h"
@@ -70,6 +72,7 @@
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
 #include "passes/quarot.h"
+#include "passes/rank0_to_rank1.h"
 #include "passes/rewrite_arg_reduce_select_last_index.h"
 #include "passes/rewrite_bev_pool_to_scatter.h"
 #include "passes/rewrite_bool_where.h"
@@ -134,6 +137,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::AnyPrecisionLlm>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
+    RegisterOrReplace<p::DilatedConvToTaps>(registry);
     RegisterOrReplace<p::DoubleQuantization>(registry);
     RegisterOrReplace<p::DynamicQuantizeAttention>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
@@ -147,6 +151,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
     RegisterOrReplace<p::ExplicitAutoPad>(registry);
+    RegisterOrReplace<p::Float16ToFloat32Pass>(registry);
     RegisterOrReplace<p::Fp6Llm>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
@@ -188,6 +193,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);
     RegisterOrReplace<p::Quarot>(registry);
+    RegisterOrReplace<p::Rank0ToRank1>(registry);
     RegisterOrReplace<p::RewriteArgReduceSelectLastIndex>(registry);
     RegisterOrReplace<p::RewriteBevPoolToScatter>(registry);
     RegisterOrReplace<p::RewriteBoolWhere>(registry);

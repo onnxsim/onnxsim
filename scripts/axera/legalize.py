@@ -39,6 +39,13 @@ def float16_to_float32(model):
     codec decoder, against 1,174 `Constant` nodes -- produces a model ONNX
     Runtime rejects with "Type parameter (T) of Optype (Div) bound to
     different types (tensor(float) and tensor(float16))".
+
+    Also has a target-agnostic C++ counterpart in onnxsim's own core
+    (`onnxsim/passes/float16_to_float32.h`), usable from any binding via
+    `onnxsim.simplify(model, extra_optimizers=["float16_to_float32"])` --
+    see `tests/test_float16_to_float32.py`. This module's own version stays:
+    it needs nothing beyond the `onnx` package (no onnxsim build), which
+    `legalize.py in.onnx out.onnx`'s standalone-script usage depends on.
     """
     changed = 0
     for init in model.graph.initializer:
@@ -194,6 +201,16 @@ def dilated_conv_to_taps(model, min_dilation=2):
     dilated convolution as one block per tap already (see "A widely dilated
     convolution is K convolutions"), so the rewrite moves the graph towards
     what the compiler does internally rather than away from it.
+
+    Also has a target-agnostic C++ counterpart in onnxsim's own core
+    (`onnxsim/passes/dilated_conv_to_taps.h`), usable from any binding via
+    `onnxsim.simplify(model, extra_optimizers=["dilated_conv_to_taps"])` --
+    see `tests/test_dilated_conv_to_taps.py`. This module's own version
+    stays: it needs nothing beyond the `onnx` package (no onnxsim build),
+    which `legalize.py in.onnx out.onnx`'s standalone-script usage depends
+    on. The core pass fixes `min_dilation` at 2 rather than exposing it as a
+    parameter -- every call site in this project (and the vendor rule's own
+    tests) uses the default.
     """
     # Shapes are needed to size each tap's slice, and a graph that was cut out
     # of a larger one carries no `value_info` at all -- which made an earlier
@@ -393,6 +410,13 @@ def rank0_to_rank1(model):
     Only the declared rank changes; `ReduceMean`/`ReduceSum` grow a
     `keepdims=1` instead of reducing away, which is the same number in a
     1-element tensor.
+
+    Also has a target-agnostic C++ counterpart in onnxsim's own core
+    (`onnxsim/passes/rank0_to_rank1.h`), usable from any binding via
+    `onnxsim.simplify(model, extra_optimizers=["rank0_to_rank1"])` -- see
+    `tests/test_rank0_to_rank1.py`. This module's own version stays: it
+    needs nothing beyond the `onnx` package (no onnxsim build), which
+    `legalize.py in.onnx out.onnx`'s standalone-script usage depends on.
     """
     scalars = {
         v.name
