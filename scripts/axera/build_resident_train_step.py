@@ -365,6 +365,92 @@ def add_mse_loss(
     return out
 
 
+def add_resident_dataset(
+    model: onnx.ModelProto,
+    data: Dict[str, np.ndarray],
+    index_name: str = "batch_index",
+) -> onnx.ModelProto:
+    """Returns a copy of `model` with each of `data`'s named inputs replaced
+    by a `Gather` off a resident constant, selected by one shared per-step
+    index vector -- `onnxsim.qat_graph.GraphBuilder.gather_rows`'s pattern
+    (see its own docstring) applied to this pipeline for the first time.
+
+    Every training step measured for this pipeline so far re-uploads `x`/`y`
+    fresh every call (`resident_runner.c`'s main loop:
+    `axclrtMemcpy(in_bufs[x_in], hx, ..., AXCL_MEMCPY_HOST_TO_DEVICE)`, every
+    iteration) even though the trainable weights are already kept resident.
+    This is a different, complementary residency: `data[name]`'s full
+    `[N, ...]` array becomes a plain graph **initializer** -- baked into the
+    compiled `.axmodel` and resident on-device from load, the same way a
+    frozen conv weight already is, not merely "uploaded once" the way
+    `qat_graph`'s own `bind_loop` keeps a bound tensor resident for an
+    onnxruntime session. What crosses the host boundary each step is
+    `index_name`, a rank-1 `int64` of length `batch` (`batch` read from
+    `data[name]`'s *current* declared input shape, i.e. call this after
+    `set_batch`, not before) -- `qat_graph.minibatch_indices` already
+    generates the exact index stream this expects.
+
+    All of `data`'s tensors are gathered by the *same* `index_name` -- they
+    must therefore share row count `N` along axis 0 (true for any `x`/`y`
+    pair drawn from one dataset; not checked here beyond the `Gather`'s own
+    shape inference catching a mismatch).
+
+    Call this on the forward+loss model, before `build_resident_step`: the
+    replaced inputs must already be gone by the time `build_resident_step`
+    walks `model.graph.input` to decide the step graph's own per-step
+    constants, and `graph_grad.build_backward` needs the inserted `Gather`
+    nodes present in the graph it walks (Gather already has a rule --
+    `graph_grad._grad_gather`, exercised elsewhere in this pipeline for
+    conv-as-matmul taps -- so no new gradient machinery is needed; nothing
+    downstream ever asks for a gradient *of* the dataset or the index, since
+    neither is in `build_resident_step`'s `params`).
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    g = out.graph
+
+    kept_inputs = [inp for inp in g.input if inp.name not in data]
+    del g.input[:]
+    g.input.extend(kept_inputs)
+
+    batch = None
+    gathers = []
+    for name, array in data.items():
+        array = np.asarray(array, dtype=np.float32)
+        g.initializer.append(numpy_helper.from_array(array, f"{name}_dataset"))
+        gathers.append(
+            helper.make_node(
+                "Gather",
+                [f"{name}_dataset", index_name],
+                [name],
+                name=f"gather_{name}",
+                axis=0,
+            )
+        )
+        shape = legalize._value_shapes(model)[name]
+        if batch is None:
+            batch = int(shape[0])
+        elif batch != int(shape[0]):
+            raise ValueError(
+                f"{name!r}'s declared batch {shape[0]} doesn't match the "
+                f"other resident inputs' {batch} -- call set_batch first so "
+                "every gathered input agrees on batch size"
+            )
+
+    # Insert before every other node: the gathers must run before anything
+    # that reads `x`/`y` by name, and nothing in `data` depends on anything
+    # else in the graph, so the front of the list is always valid.
+    new_nodes = gathers + list(g.node)
+    del g.node[:]
+    g.node.extend(new_nodes)
+
+    g.input.append(
+        helper.make_tensor_value_info(index_name, TensorProto.INT64, [batch])
+    )
+    del g.value_info[:]
+    return out
+
+
 def _fold_constants(model: onnx.ModelProto) -> onnx.ModelProto:
     """Removes every `Constant` node, folding each into an initializer of
     the same name/value -- a `Constant` node is an initializer wearing a

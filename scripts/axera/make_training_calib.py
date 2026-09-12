@@ -51,6 +51,7 @@ def make_work_dir(
     x_scale: float = 0.3,
     weight_scale: float = 0.05,
     real_data: dict = None,
+    index_inputs: "dict[str, int] | None" = None,
 ) -> str:
     """Writes `work_dir/step.onnx`, `work_dir/dataset/*.tar` and
     `work_dir/config/*.json` for `pulsar2_docker.build(work_dir, "step.onnx",
@@ -83,7 +84,16 @@ def make_work_dir(
     :param n: calibration sample count. `x`/other inputs get a fresh random
             draw per sample; `lr` is constant; label inputs get a fresh
             per-row one-hot per sample.
+    :param index_inputs: ``{input name: row count}`` for an
+            `build_resident_train_step.add_resident_dataset`-style int64
+            batch-index input -- each calibration sample is `n_rows`
+            fresh `randint(0, n_rows)` indices, matching what
+            `qat_graph.minibatch_indices` feeds a real run. Without an
+            entry here, an int64 input would otherwise fall into the
+            float32 `weight_scale` branch below and produce the wrong
+            dtype entirely.
     """
+    index_inputs = index_inputs or {}
     os.makedirs(work_dir, exist_ok=True)
     os.makedirs(work_dir + "/dataset", exist_ok=True)
     os.makedirs(work_dir + "/config", exist_ok=True)
@@ -126,6 +136,10 @@ def make_work_dir(
                     batch, classes = dims[0], dims[1]
                     for row in range(batch):
                         arr[row, rng.integers(0, classes)] = 1.0
+                elif inp.name in index_inputs:
+                    arr = rng.integers(0, index_inputs[inp.name], size=dims).astype(
+                        np.int64
+                    )
                 elif inp.name == "lr":
                     arr = np.array([1e-4], dtype=np.float32)
                 elif inp.name == x_name:
