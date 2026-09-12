@@ -35,6 +35,15 @@ prefill cannot be timed with the shipped CLI. These talk to
   `axclrtEngineExecuteAsync`), see the handoff doc's "Device memory" section
   for what it reports versus `axcl-smi`'s own numbers, which don't match and
   aren't supposed to (one is a planned budget, the other a live snapshot).
+- `whisper_resident_runner.c` -- `resident_runner.c` with the I/O layout
+  changed for a Whisper `last_half` training step (14 trainable-weight state
+  tensors instead of resnet18's 4, same positional convention: inputs =
+  `[input.1, y, 14 state tensors, lr]`, outputs = `[14 updated state
+  tensors, loss]`) -- see `../build_whisper_train_step.py` and the handoff
+  doc's "`last_half` actually trains" section for what a real 30-step run on
+  this found (a real update at step 0, then the gradient rounds to zero from
+  step 1 on -- confirmed via a direct pre/post read of the raw state buffer,
+  not the runner's own reporting path).
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
