@@ -647,6 +647,49 @@ def test_resident_dataset_flatten_matches_native_shape_gather():
     np.testing.assert_array_equal(y_flat, y_native)
 
 
+def test_resident_dataset_shrinks_per_step_host_traffic_but_not_step_count():
+    """`docs/axera-on-device-training-handoff.md`'s "Trading free memory for
+    throughput" section measured this real-hardware A/B: resident-dataset
+    `Gather` cuts host-to-device traffic by four orders of magnitude
+    (one `int32` index vs. a full `x`/`y` batch) but real step time on the
+    card does not move -- NPU compute, not the host copy, is what a step
+    spends its time on. This test pins the *host-traffic* half of that claim
+    at the graph level (the timing half needs real hardware and lives only
+    in the doc): the gather graph's only per-step input is `batch_index`,
+    and it is far smaller than the `x`+`y` bytes the direct-feed graph
+    requires per step."""
+    rng = np.random.default_rng(5)
+    forward = brts.set_batch(_forward_model(), batch=2)
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+
+    n_rows = 190  # the real N=190 OCM ceiling this doc's section measured
+    x_data = rng.standard_normal((n_rows, 1, 4, 4)).astype(np.float32)
+    y_data = rng.standard_normal((n_rows, 10)).astype(np.float32)
+    resident = brts.add_resident_dataset(with_loss, {"x": x_data, "y": y_data})
+    step_model, _ = brts.build_resident_step(resident, params=["cw", "gw"])
+    ref_step_model, _ = brts.build_resident_step(with_loss, params=["cw", "gw"])
+
+    def per_step_bytes(model, names):
+        shapes = {i.name: i for i in model.graph.input}
+        total = 0
+        for name in names:
+            inp = shapes[name]
+            dtype = onnx.helper.tensor_dtype_to_np_dtype(inp.type.tensor_type.elem_type)
+            dims = [
+                d.dim_value if d.dim_value else 1
+                for d in inp.type.tensor_type.shape.dim
+            ]
+            total += int(np.prod(dims)) * np.dtype(dtype).itemsize
+        return total
+
+    gather_bytes = per_step_bytes(step_model, ["batch_index"])
+    direct_bytes = per_step_bytes(ref_step_model, ["x", "y"])
+    # This toy model's per-sample features are tiny (16 floats), so the
+    # ratio here is modest; the doc's real resnet18-probe measurement (much
+    # larger per-sample x/y) found a ~13,288x reduction (4 bytes vs. 53,152).
+    assert gather_bytes < direct_bytes / 5, (gather_bytes, direct_bytes)
+
+
 def test_fold_constants_is_a_noop_without_any_constant_nodes():
     """`build_resident_step` only pays for `_fold_constants`'s simplify()
     pass when the graph actually has a `Constant` node -- confirm a plain

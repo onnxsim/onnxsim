@@ -1259,6 +1259,52 @@ to contain. Still outstanding in both (this section's own fix only touched
 either if either is used again for a real measurement rather than a
 correctness check.
 
+**Final answer: the trade does not pay off, and a clean matched A/B on real
+hardware shows why.** This section opened on the question "could a training
+step stop re-uploading a fresh `x`/`y` batch every step ... by keeping a
+whole dataset resident on-device instead" -- i.e. trade the card's mostly-
+idle CMM (0.2-6.1% typical usage elsewhere in this doc) for less host-side
+traffic. Built the exact same resnet18 probe (`Conv_268/271/274`+`fc.weight`)
+two ways -- the gather variant at its N=190 ceiling, and a plain baseline
+with `x`/`y` as ordinary re-uploaded inputs, both run back to back on the
+same `gather_runner.c` (which reports both variants in the same units) --
+and the *host traffic* side of the trade is real and dramatic: gather mode
+copies **4 bytes** host-to-device per step (one `int32` `batch_index`),
+baseline copies **53,152 bytes** (`x`'s 49,152 + `y`'s 4,000) -- over four
+orders of magnitude less. But real step time does not move:
+
+| variant | min step | avg step | throughput | CMM |
+| --- | --- | --- | --- | --- |
+| baseline (x/y re-upload) | 29.7 / 31.3 ms | 32.5 / 32.6 ms | 30.7-30.8 steps/s | 11.8 MiB |
+| gather (resident dataset, N=190) | 30.6 / 31.5 ms | 33.0 / 33.3 ms | 30.0-30.3 steps/s | 30.2 MiB |
+
+(two runs of each, back to back, same process/model load each time -- the
+~2% gap is consistent across both pairs, not noise, but it runs the *wrong*
+direction: gather mode is very slightly slower, not faster, and spends
+2.6x the CMM to get there.) This is exactly what the memory-characterization
+section's own finding predicts: NPU compute time, not host-to-device copy of
+a few tens of kilobytes, is what a training step actually spends its time
+on, so eliminating that copy has nothing to buy against. The resident-
+dataset mechanism remains real, correct, and now compiles on real hardware
+up to N=190 rows -- a genuine engineering win over its original "does not
+compile at all" state -- but as a throughput lever specifically, for this
+probe's compute-bound regime, it is a wash at best. It would only be
+expected to help a step whose host-to-device copy is large enough to
+actually compete with NPU compute time (a much bigger per-step batch, or a
+model cheap enough on-NPU that copy time dominates) -- untried here, and a
+narrower, more speculative claim than this section originally set out to
+test.
+
+(Caveat on this specific measurement: the baseline `.axmodel` above was
+recompiled with `pulsar2:7.0-lite` after a disk-space incident wiped the
+locally cached `pulsar2:6.0-lite` image that originally built the gather
+variant's `.axmodel` -- so the two binaries being compared came from
+different Pulsar2 compiler versions, not just different graphs. Re-run with
+matched compiler versions if this ever needs to be load-bearing for a
+decision rather than a directional answer; the ~13,000x host-traffic
+reduction buying nothing in wall-clock time is large enough an effect that a
+compiler-version difference is very unlikely to be the explanation.)
+
 ## Two vendor bugs, both silent
 
 **`ReduceMean` with no `axes` reduces only the last axis.** ONNX reduces all of
