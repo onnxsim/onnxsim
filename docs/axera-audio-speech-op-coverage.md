@@ -273,3 +273,75 @@ wav2vec2 and Wav2Vec2-Conformer follow the same shape with
 config is what produces the `group=32` node above. None of these need
 pretrained weights -- random initialization is enough to get a real op graph,
 which is all this survey needed.
+
+## A smaller target than Whisper: wav2vec2's CNN feature extractor alone
+
+`docs/axera-on-device-training-handoff.md`'s Whisper section (PRs #1351/
+#1357/#1359) found that `whisper-base`'s encoder -- 6 real transformer
+layers, LayerNorm + attention + GELU-MLP each -- has a gradient that
+underflows an 8-bit quantizer structurally: the true per-step weight
+movement is 4-5 orders of magnitude smaller than the weight's own scale,
+confirmed by two independently-built calibrations landing on the identical
+result. That is not a calibration problem the multi-phase swap technique
+(PRs #1355/#1356) can fix. This asks whether a *shallower*, non-transformer
+real speech architecture avoids it.
+
+**`Wav2Vec2Model(Wav2Vec2Config()).feature_extractor`** -- the raw-waveform
+CNN front-end every wav2vec2/HuBERT/Conformer variant shares, 7 Conv1D
+layers (`conv_dim=(512,)*7`, strides `(5,2,2,2,2,2,2)`), 4.2M of the full
+model's 94.4M params, no attention, no LayerNorm chain, one
+`InstanceNormalization` per layer instead. Real op-coverage check (random
+init, `torch.onnx.export`, opset 17): raw export is `{Add, Constant, Conv,
+Div, Erf, InstanceNormalization, Mul, Reshape, Shape, Unsqueeze}`, all of
+which are in `AX650_SUPPORTED_OPS`; `onnxsim.simplify()` folds `Reshape`/
+`Shape` away as pure scaffolding (parallel to the vision-encoder finding
+above). Every remaining op except one has a `graph_grad` gradient rule
+already (`Add`, `Conv`, `Div`, `Erf`, `InstanceNormalization`, `Mul`).
+
+**The one gap**: `Unsqueeze` (adding the channel axis to the raw waveform
+input, `(1,16000) -> (1,1,16000)`) has no entry in `graph_grad.SUPPORTED_OPS`
+-- confirmed by a real `UnsupportedOpError` from `build_backward`. It sits
+only on the non-trainable input's own path, never between a target weight
+and the loss, but `build_backward` walks every node reachable from the loss
+regardless (per `onnxsim.qat_graph`'s own docstring: "a gradient for every
+input of every node it visits, including one that heads nowhere"), so it
+still needs a rule to build at all. **Not implemented as a `graph_grad`
+rule here** -- worked around the way `legalize.py`'s `flatten_to_reshape`
+already treats an equivalent case: `Unsqueeze` with a static input shape is
+exactly a `Reshape` to a known target shape (which does have a rule), so
+substituting the node before `build_backward` runs closes the gap with no
+new gradient machinery. A real `unsqueeze_to_reshape` legalize rule
+following that exact pattern is the concrete next step if this becomes a
+committed pipeline rather than a survey probe.
+
+**The gradient-magnitude evidence, the actual point of this check**: built
+the real training-step graph (forward -> flatten -> MSE loss ->
+`build_backward` -> in-graph SGD update, `conv_layers.0.conv.weight`
+trainable, 172 nodes) and ran 5 real float32 SGD steps on host, comparing
+`|grad|`'s mean against the weight's own mean magnitude at every step
+(`weight_scale=0.05`, this project's own convention):
+
+| step | loss | mean \|grad\| | mean \|weight\| | ratio |
+| --- | --- | --- | --- | --- |
+| 0 | 0.090749 | 0.0012737 | 0.0400694 | **0.0318** |
+| 4 | 0.090743 | 0.0012736 | 0.0400694 | **0.0318** |
+
+A finite-difference check on a real weight element confirmed the backward
+pass is correct (`0.0017314` analytic vs. `0.0017323` finite-difference,
+0.05% apart) before trusting the ratio above.
+
+**0.032 is roughly three orders of magnitude better than Whisper's ~1e-4 to
+1e-5** -- a gradient that's ~3% of the weight's own scale is squarely inside
+what an 8-bit quantizer resolves (this project's own working resnet18 case
+lives in a comparable regime), not buried under its noise floor the way
+Whisper's is. This is real, if indirect, support for the depth hypothesis:
+a 7-layer pure-CNN backward pass doesn't attenuate a gradient anywhere near
+as much as a 6-layer transformer's LayerNorm+attention chain does.
+
+**Not done here** (host-only survey task; real hardware was not confirmed
+free and this doesn't need it to answer the question above): compiling this
+step graph on Pulsar2/AX650N and confirming the gradient survives multiple
+*quantized* steps, not just the float reference. That's the natural next
+step for whoever picks this up -- the host-side evidence says it should
+behave like resnet18, not like Whisper, but only a real compile+run settles
+it the way this project settles everything else.
