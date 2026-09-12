@@ -1396,6 +1396,113 @@ this exact case -- not attempted here, out of this task's scope, but a
 direct, concrete next step rather than a vague "investigate quantization
 further."
 
+### Recalibrating Whisper for its real gradient scale: two attempts, one real finding, one working (if under-demonstrated) mechanism
+
+Following up on the previous section's own suggested next step ("the
+calibration-scale-matched multi-phase technique from PR #1356 is a
+plausible, untried fix for this exact case"). Two things were built and run
+for real; neither gave the clean "survives many steps" result hoped for, and
+the reason turned out to be more fundamental than a calibration-choice
+problem.
+
+**Measured Whisper's real gradient trajectory first, on host, in float --
+no guessing.** Ran `last_half`'s own step graph through `onnxruntime` (no
+quantization) for 40 real SGD steps at `lr=1e-2` against a **fixed** batch
+(real convergent training, not fresh-random-batch noise each step): the loss
+moves from 1.08926 to 1.08893 over all 40 steps, and the per-tensor gradient
+absmax stays essentially flat around 7e-5 to 1.3e-4 throughout -- **no
+significant decay**, unlike the framing "the gradient shrinks as training
+converges" implicitly assumes. A second run tracking the trainable tensors'
+own values step-by-step found the real per-step movement is tiny in
+absolute terms too: one tensor's absmax moved from 0.10320068 to 0.10320099
+over 7 real steps, a change of about 3e-7 against a baseline of ~0.1 --
+**roughly 4-5 orders of magnitude smaller than the weight's own scale.**
+
+**Two independent calibration attempts, both real-hardware-verified, died
+identically.** Built `last_half` twice via `pulsar2_docker.build()` (real
+compiles, ~460-480s each, matching this section's own earlier figure):
+
+- **Attempt 1**: calibrated the 14 trainable state tensors with their real
+  captured initializer values plus a small (0.1%) per-sample jitter, and a
+  real-scale `x`/`y` sample (extended `make_training_calib.py`'s
+  `make_work_dir` with a new `real_data=` parameter for this -- calibrating
+  a tensor against its own real values instead of an unrelated
+  `weight_scale`-scaled random draw, since a real trained/initialized
+  network's weights are structured, not i.i.d. random, and a random draw at
+  the same *scale* does not calibrate the same *gradient magnitude* a real
+  forward+backward pass through real weights produces).
+- **Attempt 2**: calibrated with the actual 7-step float trajectory measured
+  above (one real sample per real step, not a jittered single point) --
+  built specifically to rule out "the jitter was too narrow to cover real
+  per-step movement" as the cause.
+
+On real AX650N hardware (`whisper_state_probe.c`, new -- reads a state
+tensor's raw device buffer directly before/after each step, the same
+methodology the original "gradient dies immediately" finding used, rather
+than trusting the loss): **both attempts show the identical pattern** -- a
+real, substantial step-0 update (`max|delta|` ~3.67e-4, attempt 1; ~3.67e-4,
+attempt 2 -- indistinguishable between the two calibrations), then **exactly
+zero movement from step 1 onward**, both attempts, to 10 steps checked.
+
+**The real finding: this isn't a calibration-choice problem, it's an SNR
+floor.** The real step-0 hardware delta (~3.7e-4, implying an effective
+gradient around 0.037 at `lr=1e-2`) is 2-3 orders of magnitude *larger* than
+the true float-precision gradient measured on host (~1e-4, and the real
+per-step weight movement corresponds to an even smaller ~4e-6) -- meaning
+the "signal" INT8 quantization returns at step 0 is dominated by
+quantization error, not the true (much smaller) gradient, and by step 1
+whatever that noise settles to reads as exactly zero. Calibrating more
+precisely for the *real* weight/gradient scale cannot fix this: an 8-bit,
+256-level quantizer whose range must also cover the weight's own ~0.1 scale
+fundamentally cannot resolve a true signal 4-5 orders of magnitude smaller,
+regardless of how well the calibration data matches reality -- confirmed
+empirically by two differently-constructed, equally-well-matched
+calibrations landing on the identical result. This is a different, more
+specific mechanism than the general "the gradient shrinks and eventually
+underflows" ceiling documented earlier in this doc: here the true gradient
+is *already* below the noise floor at step 0, for a task (MSE regression
+against an unrelated random target, near initialization) whose true
+learning signal is inherently tiny -- not a symptom of training having
+progressed.
+
+**Built the automatic zero-fraction-triggered swap loop this thread's own
+findings have been asking for, and it correctly detects-and-swaps -- just
+not yet demonstrated over a *survives-then-dies* transition.**
+`mp_calib_swap_auto_runner.c` (new) runs a live resident loop that checks,
+after every step, whether the update collapsed to no signal (`>=99%` of a
+combined state vector either unchanged from its input or crushed to exactly
+zero -- covering *both* death signatures this project's history has found:
+`w_next == w`, PR #1357's Whisper case; `w_next` reading hard zero regardless
+of a nonzero `w`, PR #1356's own manual demo) and, on death, writes the
+last-known-good state to host files and exits with a distinct code, rather
+than running a fixed step count and having a human eyeball the printed
+numbers afterward (what `mp_calib_swap_runner.c`/PR #1356's own demonstration
+did). A Python orchestrator (`_work/auto_orchestrator.py`, not committed --
+one-off harness, not a reusable tool) runs phase 1, checks for the death
+exit code, and if seen, automatically launches phase 2 seeded from phase 1's
+own dumped handoff state -- no human-picked transition step anywhere in the
+loop.
+
+**Run for real** against fresh compiles of the same small Conv+Gemm probe
+`build_multiphase_calib_swap_probe.py` builds (~15s each, this graph's own
+size): the controller correctly detected death at step 1 of phase 1's run
+and automatically swapped to phase 2, seeded from the handoff state -- the
+detection-and-handoff mechanism itself worked exactly as designed, with no
+manual intervention. **But phase 2 also died at its own step 1**, so this
+run does not demonstrate a full "trains fine, then automatically recovers
+past a real death" cycle. Root cause, diagnosed rather than left a mystery:
+this run's seed weight values (`seed_cw_normal.bin`, freshly drawn for this
+task) were generated independently of `make_training_calib.py`'s own
+internal calibration draw for these two builds, rather than reusing PR
+#1356's own carefully-derived, confirmed-matching weight values -- so both
+phases' *own* calibration likely didn't match the fed-in weights closely
+enough to survive even their intended regime, independent of the
+zero-fraction controller's correctness. **The controller is proven; a clean
+survives-then-recovers demonstration needs the next attempt to reuse
+matched calibration/seed values end to end (the way PR #1356's original
+manual demo did), not freshly-drawn ones** -- a concrete, scoped next step,
+not a re-open of the mechanism's own correctness.
+
 ## What to do next
 
 1. ~~The FP32 gradient seed.~~ **Tested: real effect, not a full fix.** See
