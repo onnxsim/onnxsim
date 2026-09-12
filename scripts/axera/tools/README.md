@@ -79,12 +79,18 @@ prefill cannot be timed with the shipped CLI. These talk to
   separate copy per shape the way the Whisper runner did. Explicitly feeds
   `grad_seed`, which neither `resident_runner.c` nor
   `whisper_resident_runner.c` actually does (both allocate its buffer but
-  never write it -- a real, separate latent gap found while building this).
-  See the handoff doc's "Trading free memory for throughput" section: the
-  baseline mode confirmed this project's established resnet18 numbers;
-  `-g` mode is written and correct but has nothing to run yet, since the
-  `Gather`-off-a-resident-dataset variant doesn't currently compile on real
-  hardware (a genuine Pulsar2 NPU-backend gap, not a bug in this runner).
+  never write it -- a real, separate latent gap found while building this,
+  still outstanding in those two). See the handoff doc's "Trading free
+  memory for throughput" section: the baseline mode confirmed this
+  project's established resnet18 numbers; `-g` mode is confirmed **working
+  on real hardware** for the pre-flattened-dataset workaround
+  (`../build_resident_dataset_gather_probe.py`), up to a real, measured
+  190-row OCM-capacity ceiling for that scope -- writes `int32_t` indices
+  (`-rN` sets the row count they're drawn mod), not the `int64_t` an
+  earlier version of this file wrote: Pulsar2 silently downcasts the ONNX
+  graph's declared `int64` `batch_index` input to `int32` on-device, so the
+  old code only half-initialized that buffer and reliably faulted
+  `axclrtEngineExecute` with `0x8030070c`.
 - `w2v2fe_runner.c` -- resident runner for `../build_w2v2_feature_extractor_step.py`'s
   training step (one trainable state tensor, its own I/O layout, real
   `probe_io`-confirmed). Compiles under standard INT8; `highest_mix_precision`
@@ -113,6 +119,19 @@ prefill cannot be timed with the shipped CLI. These talk to
   IOInfo), but batch>1 builds currently train incorrectly on real hardware
   (a calibration-range regression, not a runner bug) -- see that same
   section before trusting a batch>1 run's loss/weight output.
+- `w2v2_encoder_attn_runner.c` -- `w2v2fe_runner_realdata.c` with only the
+  header comment and I/O names changed for
+  `../build_w2v2_encoder_attn_step.py`'s own model: the first wav2vec2
+  build whose trainable tail spans attention output, exercising
+  `onnxsim.graph_grad._grad_where`/`_grad_is_nan` on real hardware (see the
+  audio-speech coverage doc's own real-hardware follow-up section). Same
+  I/O shape as `w2v2fe_runner_realdata.c` (one trainable state tensor), so
+  no new runner logic. `argv[4]` (`lr`) matters more here than it did
+  there: this model's real gradient is ~100-1000x smaller (two real
+  encoder layers deep), so it needs a correspondingly larger calibrated
+  `lr` to clear its own INT8 quantization step -- `lr=1` freezes the
+  weight after step 0, `lr=2000` (this model's own calibrated real
+  trajectory) moves it consistently every step.
 
 Build and run them where the card is visible (inside the VM, if the device is
 passed through -- see `../vm/README.md`):
