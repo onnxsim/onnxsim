@@ -79,15 +79,175 @@ multiplicative scale meant to span decades cannot live in a linear fixed-point
 tensor. `finetune.LossScaler` therefore detects that it is having no effect and
 stands down.
 
-The untried way out: `layer_configs` accepts `data_type: "FP32"` for
-elementwise ops, and the seed feeds a `Mul`. If the seed and its consumer stay
-float, scaling should work. **Not tested.**
+### The FP32 gradient seed: tested, real, but it plateaus rather than opens the door
 
-A second obstacle waits behind it: fixed-point clipping is **silent and local**.
-It happens to intermediates that never reach an output, so a controller reading
-the returned gradient sees a healthy tensor while the computation upstream is
-destroyed -- unlike fp16, where overflow makes an inf that propagates. Reliable
-back-off needs the graph to export `ReduceMax(|t|)` on those tensors.
+The untried way out was: `layer_configs` accepts `data_type: "FP32"` for
+elementwise ops, and the seed feeds a `Mul`. If the seed and its consumer stay
+float, scaling should work. It does something real -- but not the open-ended
+fix the theory suggested, and the reason is itself a hard, documented Pulsar2
+limitation, not a bug in this repo.
+
+**First, a real infrastructure gap had to close before this was even
+testable.** `build_resident_step()`'s gradient seed was `b.const(1.0)` -- baked
+into the graph at *build* time, not a per-step input. No adaptive controller
+(`finetune.LossScaler`'s whole reason to exist) can vary a value that isn't a
+runtime input. Fixed: `grad_seed` is now a scalar graph input declared the
+same way `lr` is (`qat_graph.make_step_graph`'s `scalars=`), with a new host
+test (`test_grad_seed_is_a_runtime_input_that_linearly_scales_the_gradient`)
+confirming `build_backward`'s own linearity in its seed holds exactly on host
+before ever trusting an on-device number.
+
+**On real hardware, on a small from-scratch Conv/Conv/Gemm step graph** (not
+the full resnet18 pipeline -- built fresh to isolate the seed mechanism from
+every other speed/legalization change in this doc), two builds of the same
+graph via `pulsar2_docker.build(config_path=...)`, differing only in
+`quant.layer_configs: [{"op_types": ["Mul","Add","Sub","Div"], "data_type":
+"FP32"}]`:
+
+| build | seed=1 | seed=100 | seed=1,000 | seed=100,000 |
+| --- | --- | --- | --- | --- |
+| baseline | 100% nonzero | 100% nonzero | 100% nonzero | 100% nonzero |
+| FP32 elementwise | **0%** nonzero | 0.05% nonzero | **20.1%** nonzero | 20.1% nonzero |
+
+Two things confirmed, one real limit found:
+
+* **The FP32 override has a genuine, monotonic effect that tracks the seed.**
+  In the FP32 build, growing the seed from 1 to 1,000 rescues more and more
+  gradient elements from rounding to exactly zero (0% -> 0.05% -> 20.1%) --
+  precisely the signature loss scaling predicts, and precisely what "the seed
+  reaches the graph as a tensor pinned to a constant" (the original diagnosis)
+  would make impossible. This is real, on-device, hardware-measured evidence
+  the mechanism works, not a host simulation.
+* **The baseline is not simply "constant regardless of seed" on this smaller
+  graph** -- unlike the original resnet18 probe's bit-identical finding, here
+  the per-element ratio between seed=1,000 and seed=1 is chaotic (mean -14.8,
+  std 3701, over a supposed 1000x expected ratio) rather than either constant
+  or proportional. The seed reaches *something* without the FP32 override,
+  just not coherently -- a smaller, differently-shaped graph than the original
+  characterization, so treat the *qualitative* finding (baseline doesn't scale
+  correctly, FP32 does something real) as the transferable result, not the
+  exact percentages.
+* **It plateaus.** 20.1% nonzero at seed=1,000 and at seed=100,000 -- unchanged
+  over two more orders of magnitude of seed. This is not the seed failing to
+  reach the graph again; it is the *next* quantised boundary downstream taking
+  over as the limit. The weight gradient here is produced by a `MatMul`
+  (`dW = dOut^T @ X`, unavoidable for any linear/conv layer's gradient), and
+  `scripts/axera/README.md`'s own prior investigation into this exact
+  mechanism (a different session, a different model, same Pulsar2 version)
+  already confirmed `data_type: "FP32"` **is not a valid override for `MatMul`
+  or `Conv` at all** -- only a fixed, documented list of elementwise ops
+  (`LeakyRelu, Sigmoid, Relu, Add, Mul, Div, Sub, Concat, Softmax`) accepts it.
+  So the seed's own value survives as real FP32 through the `Reshape`/`Mul`
+  chain that first consumes it, but the moment it reaches the `MatMul` that
+  actually computes the gradient, that node's own INT8/16 quantisation --
+  which `layer_configs` cannot touch -- reimposes a ceiling. Growing the seed
+  further cannot rescue more elements past whatever that `MatMul`'s
+  activation/output quantisation can resolve.
+
+**Net effect on the original ceiling**: this should genuinely push U8's
+~1,000-step and U16's ~5,000-step death points further out (more of the
+gradient survives at a given true magnitude than before), but it does **not**
+make training open-ended the way a true floating-point gradient path would --
+the `MatMul` boundary means there is still *some* magnitude below which the
+gradient dies again, just a smaller one than today. **Not measured**: a real
+multi-thousand-step training run with `LossScaler` driving the seed adaptively
+against this FP32 build, to quantify exactly how much further the ceiling
+moves in steps/SNR -- a substantial follow-on this pass didn't reach, since
+establishing that the mechanism works at all (the infrastructure gap, the
+sweep, and the `MatMul` limit) filled the available time. That run, plus
+re-enabling `LossScaler` against a real `grad_seed` input instead of the
+`ineffective` stand-down path, is the concrete next step.
+
+A second obstacle waits behind it either way: fixed-point clipping is **silent
+and local**. It happens to intermediates that never reach an output, so a
+controller reading the returned gradient sees a healthy tensor while the
+computation upstream is destroyed -- unlike fp16, where overflow makes an inf
+that propagates. Reliable back-off needs the graph to export `ReduceMax(|t|)`
+on those tensors.
+
+### Two more angles on controlling gradient quantization directly, both closed with real evidence
+
+Following the `MatMul`-boundary finding above, two further angles were tried
+against a small, purpose-built `MatMul`-only probe graph (`y = x @ w`,
+`loss = sum(y^2)`, `dW = grad(loss, w)` seeded by a real `grad_seed` runtime
+input -- isolates the exact node the ceiling lives at, smaller and faster to
+iterate than the Conv/Conv/Gemm probe above). Both close cleanly negative,
+with compiler-level evidence rather than speculation.
+
+**Angle 1: force the gradient-producing `MatMul`'s own output to `FP32` via
+`layer_configs`' `output_data_type` field** -- a real, separate proto field
+from `data_type` (which `MatMul` cannot use at all), documented for `Conv`
+("quantize weight type for Conv" / "quantize data type for Conv" in
+`build_config.proto`'s own comments) but not textually restricted to it.
+Tried both ways `layer_configs` can select a target: `op_types: ["MatMul"]`
+(matches every `MatMul` in the graph) and `layer_names: ["matmul_14"]` (the
+exact, confirmed post-fusion name of the gradient-producing node, read out of
+a first build's `quant_axmodel.json` per this doc's own established
+"build once, target the surviving name" method). **Both silently downgrade to
+U8.** `quant_axmodel.json`'s own `quant_config.mix_precision_configs` records
+the request (`{"MatMul": {"dtype": "U8"}}` -- not absent, so the selector
+matched something) but the *value* it settled on is `U8`, and `matmul_14`'s
+own `tensor_configs` entry confirms it: `bit_width: 8, quant_min: 0,
+quant_max: 255`. Pulsar2 acknowledges the request and refuses it, the same
+"asks may be silently downgraded" shape `scripts/axera/README.md`'s own
+LayerNorm/`TileFailException` finding already established for a different op,
+just via a quieter failure mode here (no build error, no exception -- only a
+config file that says "no").
+
+Decomposing the `MatMul` into `Mul` + `ReduceSum` (both being, in principle,
+individually-configurable ops) was considered but not built: `ReduceSum` is
+not on the confirmed `data_type: FP32`-eligible list (`LeakyRelu, Sigmoid,
+Relu, Add, Mul, Div, Sub, Concat, Softmax`, from this doc's own earlier
+finding), so the *reduction* -- the actual op whose output becomes the
+gradient tensor -- would still hit exactly the same quantized-output wall,
+just moved one node later. Combined with the `output_data_type` result
+above (Pulsar2 refuses a *specific, correctly-named* gradient-producing node
+an FP32 output), the wall looks structural rather than `MatMul`-specific:
+**whichever op produces the final gradient tensor, Pulsar2 quantizes its
+output, and `layer_configs` has no lever over that specific tensor's own
+output precision.**
+
+**Angle 2: skip fighting for FP32 upstream, and instead directly re-narrow
+the gradient output's already-quantized scale/zero-point post-hoc**, using
+`scripts/axera/emitter.py`'s existing `learn_mcode`/`nudge_output_quantisation`/
+`emit_mcode` machinery (built for a different original purpose -- writing new
+weights into a compiled `.axmodel` without recompiling). The idea: track the
+shrinking true gradient by periodically patching the compiled mcode's output
+quantization range, the same principle as loss scaling but applied to the
+*output* tensor's own quantization parameters rather than an input that has
+to survive an entire graph unmolested.
+
+**Closed by the same finding this doc's mcode-quantize-elimination section
+already made, now reproduced on a different, much smaller model**:
+`learn_mcode`'s whole method depends on Pulsar2 compiling the *same shape*
+close enough to byte-stably that a target value's own bytes (its scale/zero
+literal) can be told apart from everything else that also varies build to
+build. Tested directly: compiled the exact same probe graph, same
+calibration data, same config -- twice. **1,249 of the compiled mcode's 4,704
+bytes (26.6%) differ between the two identical-input builds.** For
+comparison, deliberately changing the calibration data's weight scale by 10x
+(to shift the real gradient range, which is what a re-narrowing patch would
+need to reliably target) moved a *similar* number of bytes (1,163 of 4,704,
+24.7%) -- meaning the noise floor from pure recompile non-determinism is as
+large as, or larger than, the signal from an actual, deliberate range change.
+There is no byte-level signal to separate "this moved because the target
+range changed" from "this moved because Pulsar2 recompiled the same inputs
+differently," on this model, with this method. This is not a smaller-model
+fluke: it is the identical mechanism PR #1344's mcode-quantize-elimination
+probe already found on the (larger, different) resnet18 training step,
+confirmed to generalize rather than being an artifact of that specific
+model's size or shape.
+
+**Net verdict on both angles: closed, not open questions.** Neither
+`layer_configs` nor post-hoc mcode patching gives real control over the
+gradient tensor's own output precision on this compiler. The FP32 seed
+(above) remains the only angle with a measured, real, if partial, effect --
+and it does nothing for the boundary these two angles were trying to reach
+past. Moving the ceiling further than the FP32 seed already does would need
+either a Pulsar2 capability that doesn't exist in the config surface explored
+so far, or solving the compiler's own byte-level non-determinism first (a
+precondition for Angle 2 that this project has no access to, being
+closed-source) -- not a small follow-on to either angle tried here.
 
 ### The FP32 seed, the quantizer's own internals, and two more levers -- one real, one dead
 
@@ -1238,8 +1398,17 @@ further."
 
 ## What to do next
 
-1. **The FP32 gradient seed.** The one untried route past the dying gradient,
-   and the difference between a 5,000-step horizon and an open-ended one.
+1. ~~The FP32 gradient seed.~~ **Tested: real effect, not a full fix.** See
+   "The FP32 gradient seed: tested, real, but it plateaus rather than opens
+   the door" above -- `grad_seed` is now a runtime input (was baked in at
+   1.0), and forcing its consuming `Mul`/`Add`/`Sub`/`Div` chain to FP32
+   measurably rescues gradient elements from underflow as the seed grows
+   (0% -> 20.1% nonzero over seed 1 -> 1,000 on a small test graph), but
+   plateaus once the seed's value reaches the weight-gradient `MatMul` --
+   `layer_configs`' `FP32` override is confirmed invalid for `MatMul`/`Conv`.
+   **Not yet done**: a real multi-thousand-step run with `LossScaler` driving
+   this seed adaptively, to quantify how far the ~1,000/~5,000-step ceiling
+   actually moves.
 2. ~~Weights resident with in-graph updates.~~ **Done: 7.0x** (200.6 ms ->
    28.6 ms/step) -- see "Weights resident with in-graph updates" above.
    Residency alone was 5.2x; `_linearize_trainable_convs` (avoiding the
