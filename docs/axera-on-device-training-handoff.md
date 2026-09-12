@@ -127,6 +127,34 @@ Two things confirmed, one real limit found:
   characterization, so treat the *qualitative* finding (baseline doesn't scale
   correctly, FP32 does something real) as the transferable result, not the
   exact percentages.
+
+  **Retroactive check, prompted by two later, separate findings on a
+  different model** (`docs/axera-audio-speech-op-coverage.md`'s wav2vec2
+  work): a scalar input never given real, varied calibration data --
+  producing a degenerate MinMax range that silently clips/saturates the real
+  runtime value -- broke `lr` and then `grad_seed` there (a zero-width range
+  from identical calibration samples in one case, a generic small-random
+  default uncorrelated with the real runtime magnitude in the other). Worth
+  asking whether the *same* mechanism explains this "chaotic ratio" finding.
+  Rebuilt this exact probe fresh and inspected its `grad_seed` calibration
+  directly: with `make_training_calib.py`'s current generic fallback (no
+  `real_data`), `grad_seed`'s calibrated range comes out `[-0.039, 0.081]`
+  (`scale=0.00047`, `zero_point=83`, U8) -- the same class of narrow,
+  uncorrelated range as the two wav2vec2 bugs, on a fourth model/probe now.
+  But swept on real hardware (seed = 1, 100, 1000, 100,000 against this
+  fresh build), the result was **0% nonzero at every seed** -- bit-identical
+  zero, not the originally-reported 100%-nonzero-but-chaotic-ratio pattern.
+  **Inconclusive, not confirmed or refuted**: this rebuild's baseline
+  behavior does not match the one being explained closely enough to serve as
+  a stand-in for it, most likely because `make_training_calib.py`'s default
+  `x_scale`/`weight_scale` (and therefore the *output* `dW` tensor's own
+  calibrated range, separate from `grad_seed`'s) have been retuned by the
+  fixes this doc's own later sections describe, since PR #1353's original run
+  -- a moving target a fresh rebuild can't reproduce. The narrow-`grad_seed`-
+  calibration finding stands on its own as a fourth real instance of the
+  pattern (worth the same `real_data`/jitter treatment if this probe is
+  revisited), but it does not settle what specifically made the *original*
+  baseline's ratio chaotic rather than constant.
 * **It plateaus.** 20.1% nonzero at seed=1,000 and at seed=100,000 -- unchanged
   over two more orders of magnitude of seed. This is not the seed failing to
   reach the graph again; it is the *next* quantised boundary downstream taking
@@ -1150,19 +1178,86 @@ pipeline (index-based weight/embedding lookups, the conv-as-matmul tap
 legalization), so the gap is scoped to this exact usage pattern, not the op
 in general.
 
+**Update: the pre-flattened-view workaround this section named as untried
+works on real hardware, up to a real, exactly-characterized row-count
+ceiling.** `add_resident_dataset(..., flatten=True)` (the new default) now
+stores and gathers any rank>=3 array as a flat `[N, prod(shape[1:])]`
+initializer, `Reshape`-ing each gathered row back to its real shape
+immediately afterward -- an ordinary, separately-supported op, entirely
+inside the graph, no change to what data is stored or how the runner binds
+buffers. Rebuilt the exact same real resnet18d probe this section's original
+investigation used (`Conv_268/271/274` + `fc.weight`, 5,361,664 trainable
+params, 64x64 input) with the flattened dataset, at the same two sizes that
+failed identically before (4096, 256): **both still fail, but with a
+completely different, far more concrete error** -- no longer the opaque
+`NPUBackendError` this section originally reported, but a specific,
+quantified on-chip-memory (OCM) capacity assertion:
+
+```
+job io size > ocm size, AxGather
+    67108864 > 3141632          (N=4096)
+    op: gather_x
+    op_input: {'x': Tensor(FP32, name=x_dataset, shape=(4096, 12288), ...),
+               'indices': Tensor(S32, name=batch_index, shape=(1,), ...)}
+    job_io_ocm_tensor: [(Tensor(FP32, ..., shape=(4096, 4096), ...), 67108864)]
+```
+
+Pulsar2's `AxGather` backend materializes an `[N, 4096]`-shaped on-chip
+selection tensor regardless of the gathered row's real width (12288 here) --
+a fixed 4096-wide lane, apparently -- and that whole tensor must fit in one
+~3.14 MiB OCM budget alongside a few smaller fixed-size companions. Binary-
+searching `N` against this real hardware (not just the error message) found
+the exact boundary: **N=190 compiles and runs correctly on the card; N=191
+fails the same OCM assertion.** N=128 was also confirmed compiling and
+running correctly (real, non-zero, stable loss over 15 real steps, 24.1 MiB
+CMM, ~33 ms/step) before the boundary search narrowed it further to 190.
+
+This means the flattened-view fix **does** clear the original blocking gap
+(any conv-shaped resident dataset, at any size, failed identically before)
+and replaces it with a real, size-scoped ceiling: the flattened-dataset
+`Gather` pattern works for up to 190 resident rows of this shape (12288
+floats/row) -- comfortably enough for many real minibatch-index use cases,
+just not the original 4096-row "keep the free 207.6 MiB memory headroom
+resident" ambition that motivated this section in the first place. A
+dataset wanting more rows than the OCM ceiling allows would need either a
+narrower row width (the ceiling trades directly against row width, since
+the OCM tensor's size is `N * lane_width`) or splitting the resident dataset
+across multiple smaller `Gather`s, both untried here.
+
+**A second, separate latent bug found once compilation got past the OCM
+wall**: the ONNX graph declares `batch_index` as `int64` per
+`add_resident_dataset`'s own docstring, but Pulsar2's compiled `.axmodel`
+silently **downcasts it to `int32`** on-device (confirmed independently by
+the compiler's own calibration-time error message reporting `Tensor(S32,
+name=batch_index, ...)`, and by `probe_model_io` reporting the compiled
+input's size as 4 bytes for a declared-int64, shape-`[1]` tensor -- int64
+would be 8). `gather_runner.c` originally wrote `int64_t` indices into that
+now-4-byte buffer, half-initializing it with garbage that the NPU then read
+as an out-of-range row and faulted `axclrtEngineExecute` with `0x8030070c`
+on every attempt -- a clean compile followed by a hard runtime fault, not
+the "device stalled from an earlier bad run" pattern this doc's other
+sections have seen with that same error code (confirmed via `axcl-smi`
+showing a clean, idle device immediately before the fault, and the fault
+recurring identically on a fresh process/fresh model load). Fixed by writing
+`int32_t` indices instead; `gather_runner.c` also gained a `-rN` flag so its
+index generator can be told the real dataset row count (previously
+hardcoded to the original 4096, which would have produced out-of-range
+indices once the row count moved below that).
+
 **Net**: the resident-dataset mechanism is real, correct, and committed
-(`add_resident_dataset()`, host-verified), but not yet usable on real
-hardware for a conv-shaped dataset -- a genuine Pulsar2 NPU-backend
-limitation to work around (e.g. gathering a pre-flattened `[N, 12288]` view
-instead of the native `[N,3,64,64]` shape, untried) or wait out, not
-something fixable from the ONNX side the way the transpose-glue and
-grouped-conv gaps were. `scripts/axera/tools/gather_runner.c` (this section's
-own runner) also fixed a real, separate latent bug found while building
-this: **neither `resident_runner.c` nor `whisper_resident_runner.c` actually
-feeds `grad_seed`** (added as a real graph input by the FP32-gradient-seed
-work above) -- both allocate its buffer but never write to it, leaving it as
-whatever device memory happened to contain. Worth fixing in both if either
-is used again for a real measurement rather than a correctness check.
+(`add_resident_dataset()`, host-verified), and now genuinely **usable on
+real hardware** for a conv-shaped dataset up to a real, measured 190-row
+ceiling for this shape -- the pre-flattened-view fix this section originally
+named as untried is confirmed to work, not merely plausible. `scripts/axera/
+tools/gather_runner.c` (this section's own runner) also fixed a real,
+separate latent bug found while building this: **neither `resident_runner.c`
+nor `whisper_resident_runner.c` actually feeds `grad_seed`** (added as a
+real graph input by the FP32-gradient-seed work above) -- both allocate its
+buffer but never write to it, leaving it as whatever device memory happened
+to contain. Still outstanding in both (this section's own fix only touched
+`gather_runner.c`, which already fed it correctly) -- worth fixing in
+either if either is used again for a real measurement rather than a
+correctness check.
 
 ## Two vendor bugs, both silent
 

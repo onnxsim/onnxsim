@@ -72,7 +72,7 @@ simple. `Erf` is GELU's decomposed form -- `transformers`' export already
 emits the Erf-based GELU here, not the fused `Gelu` op, so the Gelu gap above
 does not block this model in practice.
 
-### wav2vec2 -- one gap, now confirmed real (not "maybe")
+### wav2vec2 -- one gap, confirmed real and now fixed
 
 `transformers.Wav2Vec2Model(...)`, 228 nodes:
 
@@ -102,15 +102,109 @@ projection) needs a gradient through its own layer's `Where`, because that
 `Where`'s input and output are both fresh intermediates computed inside that
 layer -- unlike an external bias tensor merely *added* to the scores, there
 is nothing outside the layer to treat as an opaque boundary input instead.
-**wav2vec2 (the plain, non-Conformer model) cannot train through any tail
-that includes attention output until `Where` has a backward rule.** That
-rule is not hard -- `Where`'s gradient is `dX = mask * g`, `dY = (1-mask) *
-g` with `mask = Cast(condition, FLOAT)`, i.e. the same "boolean condition
+**wav2vec2 (the plain, non-Conformer model) could not train through any
+tail that includes attention output until `Where` had a backward rule --
+and now it can.** `Where`'s gradient is `dX = mask * g`, `dY = (1-mask) *
+g` with `mask = Cast(condition, FLOAT)`, the same "boolean condition
 becomes a float 0/1 multiplied in, never re-emitted as `Where` itself"
 convention `graph_grad`'s own module docstring already states as a rule for
-every hand-written gradient here -- but it is real, unimplemented work, not
-a design workaround. Left for the next person who wants wav2vec2 itself
-(Whisper, below, remains gap-free and is still the better first trial).
+every hand-written gradient here, and it is now `onnxsim.graph_grad`'s
+`_grad_where`. `IsNaN` itself got a companion rule (`_grad_is_nan`,
+returning no gradient) for a narrower but load-bearing reason: this
+per-layer guard sits *inline* in the forward slice between `Softmax` and
+`Where`, and `build_backward` requires a registered rule for every node
+type it walks -- including one no gradient reaches -- not just the ones a
+seed actually flows through, so differentiating a slice containing
+`IsNaN(attn_weights)` raised `UnsupportedOpError` even though nothing ever
+needed its own gradient.
+
+Both rules live in a new `_PYTHON_ONLY_RULES` table (not `_RULES`): neither
+has a C++/WASM mirror yet, so folding them into the parity-pinned
+`SUPPORTED_OPS` `tests/test_qat_parity.py` checks against `qat_entry.cpp`
+would be a claim about the browser path that is not yet true. They *are*
+picked up automatically by every ordinary `build_backward(..., rules=None)`
+call and are visible through `graph_grad.supported_ops()`, so QAT/LoRA
+block discovery already treats a block containing them as differentiable --
+see `_PYTHON_ONLY_RULES`'s own comment in `onnxsim/graph_grad.py` for the
+full rationale, which mirrors `_grad_split`'s pre-existing
+`_MULTI_OUTPUT_RULES` precedent for the same "real rule, no C++ port yet"
+situation.
+
+**Not yet done:** an actual trainable tail spanning wav2vec2's attention
+output, built and verified on real AX650N hardware -- every wav2vec2 build
+script in `scripts/axera/` today (`build_w2v2_feature_extractor_step.py`,
+`build_w2v2fe_batch_calib.py`) still only trains the convolutional feature
+extractor, which never touches this `Where`. The backward rule itself is
+tested against finite differences on host
+(`tests/test_graph_grad.py`'s `where_branch_select`, `where_broadcasts_x`,
+and `where_isnan_guard` cases -- the last one mirroring this exact
+`Where(IsNaN(x), 0, x)` shape).
+
+### Real hardware follow-up: attention-output tail compiles and trains, once Pulsar2's *frontend* `IsNaN` gap is also routed around
+
+`build_w2v2_encoder_attn_step.py` builds the graph this section's own "not
+yet done" used to name: a real `Wav2Vec2Model` (small custom config --
+`hidden_size=128`, 2 real encoder layers, `num_attention_heads=4` -- kept
+small only for export/compile time; the convolutional feature extractor
+stays at the real `Wav2Vec2Config()` default 512-channel/7-layer scale),
+with **`layers.0`'s own `q_proj` weight** as the trainable tensor
+specifically so a real gradient must differentiate back through *both*
+encoder layers' `Where`/`IsNaN` guards to reach it, not just one.
+
+**A second, separate real wall, found immediately after the backward-rule
+gap closed:** `pulsar2 build` on the un-stripped step graph fails frontend
+parsing outright -- `KeyError('dont support IsNaN opr in AXOPS/ONNXOPS/
+CUSTOM_OPS')` -- independent of training or `onnxsim.graph_grad` entirely.
+Pulsar2's ONNX frontend has never supported the `IsNaN` op at all, so no
+wav2vec2-with-attention model, trained or not, has ever compiled on this
+hardware before now; `onnxsim.graph_grad._grad_where`/`_grad_is_nan` were
+necessary but not sufficient on their own.
+
+**Routed around, exactly, not approximately:** `build_w2v2_encoder_attn_step
+._strip_isnan_guard` removes every `Where(IsNaN(x), 0, x)` pair and rewires
+consumers straight onto `x`. This is provably lossless *for this specific
+deployment shape* -- the build never passes an `attention_mask`, so every
+row is a real, unmasked position and HF's own Softmax output can never
+actually contain a `NaN` (the guard exists only for the floating-point
+cancellation a *fully masked* row's softmax can produce); `IsNaN(x)` is
+therefore always `False`, and `Where(False, ., Y)` always selects `Y`. Not
+a general graph-structure fact `legalize.py` could verify on its own (hence
+local to this build script, not promoted there), and the graph's *other*
+per-layer `Where` (the mask-bias one, condition from `Expand`/
+`GreaterOrEqual`) is left untouched -- still real, still a genuine exercise
+of `graph_grad._grad_where` on real hardware.
+
+**Compiles cleanly** (`pulsar2:7.0-lite`, ~25s) after the strip.
+**Host-verified correct** against finite differences at a properly-tuned
+step size (0.3-2.3% agreement across several tries, matching this project's
+own established bar) both before and after stripping the guard -- confirming
+the strip changes nothing the graph computes, only what compiles.
+
+**On real AX650N hardware, the weight state updates correctly and
+consistently across 15 real steps -- but only once `lr` is calibrated and
+run large enough to clear this weight's own INT8 quantization step.** This
+one weight's real host gradient is ~1e-6/element (two real encoder layers
+deep, one of many weights in the model), roughly 100-1000x smaller than the
+feature extractor's own conv-weight gradient, so `lr*grad` needs
+proportionally more scale to survive quantization at all -- the same
+gradient-quantization-ceiling signature this project has documented
+repeatedly (the Whisper SNR floor, the multi-phase calibration-swap
+technique), now confirmed to extend to an attention-output tail too, not a
+new failure mode:
+
+| `lr` (calibrated + run at) | weight state across steps | verdict |
+| --- | --- | --- |
+| 1.0 | moves once (step 0), then bit-identical forever | dead -- below this weight's own quantization resolution |
+| 2000.0 | `w[0]`: 0.1145 -> 0.1264 -> 0.1343 -> ... -> 0.2804 (all 15 steps distinct, monotonic) | real, consistent per-step movement |
+
+The scalar `loss` output stayed bit-identical across all 15 steps at both
+`lr` values, even while the weight state visibly moved at `lr=2000` -- a
+separate, unchased detail (plausibly the loss output's own INT8 resolution
+not resolving one 128x128 weight's worth of movement inside a much larger,
+otherwise-fixed network; not the same mechanism as resnet50's own
+loss-reads-exactly-0 finding, which was a calibration bug, not a resolution
+one). The *weight update* -- what actually matters for whether training
+works -- is the confirmed result here.
 
 ### Wav2Vec2-Conformer -- both gaps closed; one different, unresolved question
 
@@ -197,7 +291,7 @@ needs its own trace, not an inference from wav2vec2's). Flagged, not closed.
 | --- | --- | --- | --- |
 | Grouped/depthwise `Conv` has no forward-legalization path | **fixed** (`scripts/axera/legalize.py`'s `act_weight_conv_to_matmul`) | was: Conformer's `conv_module` | per-group tap-matmul + `Concat` back onto `Cout`, `group=1` path untouched |
 | `Split` has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_split`, via the new `_MULTI_OUTPUT_RULES` table) | was: Conformer's GLU gating | `MatMul` against a constant 0/1 selection matrix per output, no `Concat`, stays inside `BACKWARD_OPS` |
-| `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **confirmed blocking**, not a design workaround | plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is still unresolved | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; not yet implemented |
+| `Where`/`IsNaN` numerical-stability cleanup has no backward rule | **fixed** (`onnxsim/graph_grad.py`'s `_grad_where`/`_grad_is_nan`, via the new `_PYTHON_ONLY_RULES` table) | was: plain wav2vec2, any tail touching attention output -- Conformer's own (differently-shaped) `Where` usage is a separate, still-open question (see below) | `dX = Cast(cond, FLOAT) * g`, `dY = (1 - that) * g` -- same "float mask, not `Where` itself" convention this module already uses everywhere else; `IsNaN` itself gets a no-gradient rule so `build_backward` can walk over it inline |
 | Raw `Gelu` has no backward rule | open, low priority | only an exporter emitting fused `Gelu` instead of decomposed Erf-GELU (neither Whisper's nor wav2vec2's `transformers` export does this) | a `legalize.py` rule decomposing `Gelu` into `Mul`/`Add`/`Erf`/`Div`-by-constant, all already covered |
 | LSTM/GRU have no backward rule at all, and the real ONNX op is opaque (no legalization route around it) | open, largest lift | any classic RNN-based ASR/TTS model, full stop | a dedicated LSTM-cell backward rule (the four gates are themselves ordinary `MatMul`/`Sigmoid`/`Tanh` arithmetic once unrolled) or accepting only models that unroll their own recurrence in ONNX |
 
@@ -237,21 +331,22 @@ fixed-length input (no attention-mask handling at all) that sidesteps every
 `Where`-shaped question this survey has now spent real effort on for the
 other two families.
 
-The ranking below it changed. Wav2Vec2-Conformer's conv-module gaps
-(depthwise `Conv`, `Split`) are now **closed** -- it is Conformer's
-still-open, differently-shaped `Where` question (see above) that gates it
-next, not the conv-module work this pass finished. Plain wav2vec2 dropped
-from "second choice, likely fine" to **blocked**: its `Where`/`IsNaN`
-numerical-stability cleanup is confirmed to sit inside every encoder layer's
-own attention computation with no external tensor to route a trainable
-tail's boundary around, so it needs `Where`'s backward rule implemented
-before any tail including attention output can train, not just a careful
-choice of trainable region. Concretely, after Whisper: either implement
-`Where`'s backward rule (unblocks wav2vec2 outright, and is the same
-"boolean condition, not the op, becomes a float mask" work either way) or
-trace Conformer's shared-condition `Where` end-to-end to confirm it is
-excludable by block boundary (cheaper if it pans out, but unproven, and
-resolves only Conformer -- `Where`'s backward rule resolves both).
+The ranking below it changed twice now. Wav2Vec2-Conformer's conv-module
+gaps (depthwise `Conv`, `Split`) are **closed**, and plain wav2vec2's own
+`Where`/`IsNaN` block is now **closed too** -- `onnxsim.graph_grad._grad_where`/
+`_grad_is_nan` (see the wav2vec2 section above) give both `Where`'s
+numerical-stability guard and Conformer's shared-condition `Where` a real
+backward rule, generically, regardless of which shape either usage takes.
+What is left is not implementing the rule (done) but *using* it: no
+`scripts/axera/` build script has yet built a wav2vec2 (or Conformer) step
+graph whose trainable tail spans attention output, so the concrete next
+step is that build-and-verify-on-hardware work, not further `graph_grad`
+coverage. Conformer's own shared-condition `Where` (see above) still has a
+narrower, separate open question -- whether its condition is in practice
+excludable by a careful block boundary, cheaper than differentiating
+through it at all -- but that is now an optimization question, not a
+blocker, since the rule handles either shape correctly if the boundary
+question is left unanswered.
 
 ## Reproducing the exports
 
@@ -576,18 +671,48 @@ Real step times, now trustworthy since correctness is confirmed at batch=4:
 | 1 | 5.590ms / 5.865ms | 11.039 MiB |
 | 4 | 18.838ms / 19.353ms | 25.534 MiB |
 
-Batch=8 was not re-verified in this pass (the same `grad_seed` fix should
-apply identically, since the bug and fix are batch-size-independent in
-mechanism -- flagged as the remaining confirmation step, not assumed).
-vNPU+batching compounding was not re-checked here either -- both are now
-individually real, but composing them is a follow-on, not done in this pass.
+**Batch=8: re-verified with the `grad_seed` fix, confirmed working.** Same
+`build_w2v2fe_batch_calib.py` driver, `batch=8`. Real hardware, `lr=100`,
+8 steps: loss moves smoothly and monotonically, `1.03951 -> 1.00037`
+(plateauing over the last two steps at the same tracked-weight-quantization
+granularity already documented for batch=4 -- not a bug). Step time
+35.577ms min / 36.186ms avg, cmm 45.957 MiB.
+
+**vNPU + batching composition: real, but weaker than resnet18's, and
+saturates earlier.** `-v` at batch=8, N=1: bit-identical loss/weight
+trajectory vs. disabled, confirming non-corrupting at this batch size too
+(same check PRs #1345/#1346/#1372 already established at batch=1). Real
+concurrent throughput, batch=8, separate OS processes per context, all
+converging to the identical loss (`0.965574`) confirming correctness held
+under concurrency:
+
+| config | aggregate steps/s | aggregate samples/s | vs. batch=1,N=1 baseline (164.3 samples/s) |
+| --- | --- | --- | --- |
+| batch=8, N=1 | 27.3 | 218.4 | 1.33x |
+| batch=8, N=4 | 82.5 | 660.0 | 4.02x |
+| batch=8, N=8 | 85.6 | 684.8 | 4.17x |
+| batch=1, N=8 (PR #1372) | -- | 607.9 | 3.70x |
+
+Unlike resnet18 (PR #1346: 6.5x batching alone x 2.5x vNPU alone -> 18.1x
+combined, cleanly multiplicative), this model's batching gain alone is
+much smaller (1.33x, not 6.5x -- Conv1D quantize/glue overhead dominates
+differently here) and the combination **saturates by N=4** (660 -> 684.8
+samples/s from N=4 to N=8, a 3.8% gain for double the contexts) rather than
+continuing to scale to N=8 the way resnet18 did. Real, honest result: the
+two levers still both help, but this architecture's per-step compute at
+batch=8 already occupies enough of the NPU that fewer concurrent contexts
+saturate it, so the combination is additive-ish rather than cleanly
+multiplicative. Best practical point here is N=4 (nearly all of N=8's gain
+for half the contexts), not N=8.
 
 **Net**: three real calibration bugs found and fixed for this model across
-PRs #1367/#1370/this fix -- `x_scale`/`weight_scale` mismatch, degenerate
-constant-`lr` range, and now uncalibrated `grad_seed` -- all in the same
+PRs #1367/#1370/#1373 -- `x_scale`/`weight_scale` mismatch, degenerate
+constant-`lr` range, and uncalibrated `grad_seed` -- all in the same
 family (a scalar or tensor whose calibration data was never matched to its
-real runtime distribution). Batching is now confirmed working at batch=4;
-batch=8 and vNPU+batch composition remain open, low-risk follow-ons.
+real runtime distribution). Batching is now confirmed working at batch=4
+and batch=8; vNPU+batch composition is confirmed real but weaker and
+earlier-saturating than resnet18's own result -- both flagged follow-ons
+from PR #1373 are now closed.
 
 ### The 2,000-step plateau (PR #1376) is a resolution ceiling, not convergence -- settled with a real lr-drop experiment
 

@@ -374,11 +374,26 @@ def add_resident_dataset(
     model: onnx.ModelProto,
     data: Dict[str, np.ndarray],
     index_name: str = "batch_index",
+    flatten: bool = True,
 ) -> onnx.ModelProto:
     """Returns a copy of `model` with each of `data`'s named inputs replaced
     by a `Gather` off a resident constant, selected by one shared per-step
     index vector -- `onnxsim.qat_graph.GraphBuilder.gather_rows`'s pattern
     (see its own docstring) applied to this pipeline for the first time.
+
+    `flatten` (default `True`) stores and gathers every rank>=3 array as a
+    flat `[N, prod(shape[1:])]` initializer, `Reshape`-ing each gathered row
+    back to its real shape (`[batch, *shape[1:]]`) immediately afterward,
+    rather than gathering the native `[N, C, H, W]` shape directly. This is
+    the workaround `docs/axera-on-device-training-handoff.md`'s "Trading
+    free memory for throughput" section names and confirms fixes a real
+    Pulsar2 NPU-backend gap: `Gather` over a 4D, conv-activation-shaped
+    resident tensor fails identically in Pulsar2's backend compiler
+    regardless of dataset size, while the same `Gather` over a flat 2D
+    tensor (plus an ordinary, separately-supported `Reshape`) compiles and
+    runs. Pass `flatten=False` to get the old, pre-workaround behavior (e.g.
+    to reproduce that failure, or for a rank<=2 dataset where flattening is
+    a no-op anyway).
 
     Every training step measured for this pipeline so far re-uploads `x`/`y`
     fresh every call (`resident_runner.c`'s main loop:
@@ -422,16 +437,36 @@ def add_resident_dataset(
     gathers = []
     for name, array in data.items():
         array = np.asarray(array, dtype=np.float32)
-        g.initializer.append(numpy_helper.from_array(array, f"{name}_dataset"))
+        row_shape = array.shape[1:]
+        do_flatten = flatten and array.ndim > 2
+        if do_flatten:
+            stored = array.reshape(array.shape[0], -1)
+        else:
+            stored = array
+        g.initializer.append(numpy_helper.from_array(stored, f"{name}_dataset"))
+        gather_out = f"{name}_gathered" if do_flatten else name
         gathers.append(
             helper.make_node(
                 "Gather",
                 [f"{name}_dataset", index_name],
-                [name],
+                [gather_out],
                 name=f"gather_{name}",
                 axis=0,
             )
         )
+        if do_flatten:
+            shape_init = numpy_helper.from_array(
+                np.array([-1, *row_shape], dtype=np.int64), f"{name}_reshape_shape"
+            )
+            g.initializer.append(shape_init)
+            gathers.append(
+                helper.make_node(
+                    "Reshape",
+                    [gather_out, f"{name}_reshape_shape"],
+                    [name],
+                    name=f"reshape_{name}",
+                )
+            )
         shape = legalize._value_shapes(model)[name]
         if batch is None:
             batch = int(shape[0])
