@@ -68,39 +68,95 @@ rewrite, target-agnostic, the vendor-specific "why" stays in the script)
   representation for `float64`/`float16`/integer `Neg`; the vendor script's
   own Python version has the identical latent limitation (it always emits a
   `float32` constant too), just without a guard that declines other types.
-- **`pow2_to_mul`** -- not ported this session (time-boxed to one complete
-  promotion per the task's own instruction), but the same class exactly:
-  `Pow(x, 2) -> Mul(x, x)`, exact, no vendor-specific formula in the
-  rewrite itself (the vendor-specific part is *why* -- avoiding a fused
-  `AxQuantizedSnake` activation that fails Pulsar2's tiler -- which would
-  stay in `scripts/axera/legalize.py`/its README exactly like the
-  precedent's own three rules keep their vendor rationale).
-- **`float16_to_float32`** -- promotable. Retyping an fp16 graph to fp32
-  throughout (initializers, `Constant` values, `Cast` targets, value_info)
-  is a generic normalization need for any tool/backend that only wants
-  fp32, not an AX650N-specific formula.
-- **`explicit_conv_padding`** -- promotable, and **not a duplicate of
-  axelera's `explicit_auto_pad`** despite the similar name: `explicit_auto_pad`
+- **`pow2_to_mul`**, **`explicit_conv_padding`** -- promoted on a separate
+  branch (`axera-legalize-more-rules`, PR #1378, open but not yet merged as
+  of this survey): `onnxsim/passes/pow2_to_mul.h`,
+  `onnxsim/passes/explicit_conv_padding.h`, both `PredicateBasedPass`. Not
+  re-verified here (this survey's own branch forked from `master`, which
+  does not yet contain that PR) -- noted for completeness, not part of this
+  round's work. `explicit_conv_padding` is **not a duplicate of axelera's
+  `explicit_auto_pad`** despite the similar name: `explicit_auto_pad`
   converts a symbolic `auto_pad` mode (`SAME_UPPER`/`SAME_LOWER`/`VALID`)
   into explicit `pads`; `explicit_conv_padding` converts an *already*-explicit
   but *asymmetric* `pads` attribute into a separate `Pad` node plus symmetric
   (zero) `pads` on the convolution. Different backend limitation (auto_pad
   support vs. asymmetric-padding support), genuinely worth two separate
   passes, not one.
-- **`dilated_conv_to_taps`** -- promotable. `y[t] = sum_j w[:,:,j] .
-  xp[t+j*d]` decomposed into one 1x1 conv per tap, summed, is exact and
-  carries no Pulsar2-specific math -- any backend without dilated-conv
-  support could use it. (The rule's own docstring notes it *also* happens to
-  match how the AX650N's weight table stores a dilated conv internally --
-  that's a bonus property of this target, not a dependency the rewrite has
-  on it.)
-- **`rank0_to_rank1`** -- promotable, on the same "generic rewrite,
-  vendor-specific why" split the precedent already established. A scalar
-  (rank-0) graph output getting a trailing axis is not itself
-  training-specific or AX650N-specific; the *reason* this project needs it
-  (Pulsar2's calibration step can't concatenate a rank-0 tensor across
-  samples, and a training graph's loss is always scalar) is specific and
-  stays put.
+- **`float16_to_float32`** -- **promoted this session**.
+  `onnxsim/passes/float16_to_float32.h`, registered, tested
+  (`tests/test_float16_to_float32.py`, 4 cases), cross-referenced from the
+  vendor's own docstring. Retyping an fp16 graph to fp32 throughout
+  (initializers, `Constant` values, `Cast` targets, every `Value`'s own
+  elemType) is a generic normalization need for any tool/backend that only
+  wants fp32, not an AX650N-specific formula -- and, unlike `neg_to_mul`/
+  `pow2_to_mul`/`explicit_conv_padding`, it is graph-*output*-driven rather
+  than node-pattern-driven (see the architecture note below), so it is a
+  `FullGraphBasedPass`, not a `PredicateBasedPass`.
+- **`dilated_conv_to_taps`** -- **promoted this session**.
+  `onnxsim/passes/dilated_conv_to_taps.h`, registered, tested
+  (`tests/test_dilated_conv_to_taps.py`, 7 cases -- three dilation/padding
+  combinations, a bias-added-exactly-once check, low-dilation and grouped-
+  conv skip cases, and the disabled-by-default case), cross-referenced from
+  the vendor's own docstring. `y[t] = sum_j w[:,:,j] . xp[t+j*d]` decomposed
+  into one 1x1 conv per tap, summed, is exact and carries no Pulsar2-specific
+  math -- any backend without dilated-conv support could use it. (The rule's
+  own docstring notes it *also* happens to match how the AX650N's weight
+  table stores a dilated conv internally -- that's a bonus property of this
+  target, not a dependency the rewrite has on it.) A `PredicateBasedPass`,
+  following `rewrite_deform_conv_to_gather.h`'s own precedent for "one node
+  becomes many" via `graph.create()`/`insertBefore()` (see the architecture
+  note below); `min_dilation` is fixed at 2 in the core pass rather than
+  exposed as a parameter, since every call site in this project uses the
+  vendor rule's own default.
+- **`rank0_to_rank1`** -- **promoted this session**.
+  `onnxsim/passes/rank0_to_rank1.h`, registered, tested
+  (`tests/test_rank0_to_rank1.py`, 6 cases, including both the attribute-
+  form and opset>=18 input-form of a Reduce*'s `axes`), cross-referenced
+  from the vendor's own docstring. A scalar (rank-0) graph output getting a
+  trailing axis is not itself training-specific or AX650N-specific; the
+  *reason* this project needs it (Pulsar2's calibration step can't
+  concatenate a rank-0 tensor across samples, and a training graph's loss is
+  always scalar) is specific and stays in the vendor script. Driven by the
+  graph's own output list, not a node pattern, so a `FullGraphBasedPass`,
+  the same split `float16_to_float32.h` uses.
+
+### An architecture note this survey exists to settle
+
+Before this session, three rules above (`float16_to_float32`,
+`dilated_conv_to_taps`, `rank0_to_rank1`) sat in "promotable" limbo without
+being ported, and it was worth checking first whether that was because they
+genuinely didn't fit anything onnxsim's C++ core already had, or simply
+hadn't been gotten to. They fit, on two different existing mechanisms, both
+real precedent already compiled into onnxsim before this session touched it:
+
+- **`PredicateBasedPass`** (`third_party/onnx-optimizer/onnxoptimizer/pass.h`)
+  -- the one every already-ported rule (`neg_to_mul`, `pow2_to_mul`,
+  `explicit_conv_padding`) uses: `patternMatchPredicate(Node*)` triggers a
+  per-node match, `runTransform(Node*, Graph&, NodeDestroyType&)` rewrites
+  it. Its `runTransform` receives the whole `Graph&`, not just the matched
+  node, so "one node becomes many" is not actually out of scope for it --
+  `onnxsim/passes/rewrite_deform_conv_to_gather.h` was already real
+  precedent for exactly that ("one node becomes dozens to low hundreds")
+  before this session, via `graph.create()` + `insertBefore()`. This is what
+  `dilated_conv_to_taps.h` follows.
+- **`FullGraphBasedPass`** (same header) -- "the most general pass which
+  allows the user to run a pass given only a graph," its own doc comment
+  says: `runPass(Graph&)` with no per-node predicate at all. Already real,
+  compiled-in precedent for this before this session too:
+  `onnxsim/passes/quantize_fp16.h` (and `quantize_fp8.h`/`quantize_bf16.h`/
+  `magnitude_pruning.h`) -- `quantize_fp16.h` in particular is close to a
+  mirror image of `float16_to_float32.h`'s own need (a whole-graph dtype
+  retype touching initializers, `Constant` values, and every `Value`'s own
+  elemType, including graph inputs/outputs). Both `float16_to_float32.h` and
+  `rank0_to_rank1.h` use this base class, registered into the same registry
+  via the same `RegisterOrReplace<T>` template as any `PredicateBasedPass`
+  (`custom_optimizer_passes.cpp` neither knows nor cares which base class a
+  pass uses).
+
+Net: nothing here needed new C++ pass infrastructure. The earlier
+"promotable, not yet ported" state was a scheduling gap (each of the
+three already-ported rules was one complete round-trip's worth of work,
+time-boxed one at a time), not an architectural one.
 
 ### Not a graph-rewrite pass -- doesn't fit `PredicateBasedPass`'s shape
 
@@ -159,19 +215,22 @@ These rules are correctly scoped to `scripts/axera`.
 `tests/test_axelera_legalize.py`, `tests/test_explicit_auto_pad.py`,
 `tests/test_gemm_transa_to_transpose.py`,
 `tests/test_maxpool_rowmajor_when_indices_unused.py`,
-`tests/test_neg_to_mul.py`, `tests/test_build_resident_train_step.py`: **77
-passed**, after the rebuild above. `ruff format`/`ruff check` clean on all
-touched Python; `clang-format` clean on the new C++.
+`tests/test_neg_to_mul.py`, `tests/test_quantize_fp16.py`,
+`tests/test_float16_to_float32.py`, `tests/test_rank0_to_rank1.py`,
+`tests/test_dilated_conv_to_taps.py`, `tests/test_build_resident_train_step.py`:
+**100 passed**, after an incremental rebuild (`pip install
+--no-build-isolation -e .`, ~25s) in a fresh worktree off `origin/master`.
+`ruff format`/`ruff check` clean on all touched Python; `clang-format` clean
+on all three new C++ headers and `custom_optimizer_passes.cpp`.
 
 ## What's left, if this is picked up further
 
-`pow2_to_mul`, `float16_to_float32`, `explicit_conv_padding`,
-`dilated_conv_to_taps` are classified as promotable above but not yet
-ported (time-boxed to one complete round-trip this session, per the task's
-own instruction to prioritize getting the survey right over rushing every
-promotion partially) -- each would follow `neg_to_mul.h`'s exact structure:
-new `onnxsim/passes/<name>.h`, register in `custom_optimizer_passes.cpp`,
-`onnx.parser`-based test in `tests/test_<name>.py`, a cross-reference
-paragraph added to the vendor function's docstring (Python implementation
-kept, not deleted, matching the standalone-usability constraint discussed
-above).
+Every rule classified "promotable" above is now ported (`pow2_to_mul` and
+`explicit_conv_padding` on PR #1378, not yet merged; `float16_to_float32`,
+`dilated_conv_to_taps`, `rank0_to_rank1` this session) -- nothing left in
+that category. What remains unported is the training-specific group
+(`inline_local_functions`, `avgpool_ceil_to_floor`, `flatten_to_reshape`,
+`global_pool_to_reduce`, `gemm_to_matmul`, `act_weight_conv_to_matmul`,
+`TRAINING_RULES`) and `filename_safe_io_names`, both deliberately scoped to
+stay in `scripts/axera` per the sections above -- there is no further
+"pick this up" item pending on the promotable side of this migration.
