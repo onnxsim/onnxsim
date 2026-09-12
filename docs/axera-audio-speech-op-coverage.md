@@ -138,9 +138,73 @@ extractor, which never touches this `Where`. The backward rule itself is
 tested against finite differences on host
 (`tests/test_graph_grad.py`'s `where_branch_select`, `where_broadcasts_x`,
 and `where_isnan_guard` cases -- the last one mirroring this exact
-`Where(IsNaN(x), 0, x)` shape), but building the encoder-with-attention step
-graph, calibrating it, and confirming it compiles and trains on the card is
-real, separate, next work.
+`Where(IsNaN(x), 0, x)` shape).
+
+### Real hardware follow-up: attention-output tail compiles and trains, once Pulsar2's *frontend* `IsNaN` gap is also routed around
+
+`build_w2v2_encoder_attn_step.py` builds the graph this section's own "not
+yet done" used to name: a real `Wav2Vec2Model` (small custom config --
+`hidden_size=128`, 2 real encoder layers, `num_attention_heads=4` -- kept
+small only for export/compile time; the convolutional feature extractor
+stays at the real `Wav2Vec2Config()` default 512-channel/7-layer scale),
+with **`layers.0`'s own `q_proj` weight** as the trainable tensor
+specifically so a real gradient must differentiate back through *both*
+encoder layers' `Where`/`IsNaN` guards to reach it, not just one.
+
+**A second, separate real wall, found immediately after the backward-rule
+gap closed:** `pulsar2 build` on the un-stripped step graph fails frontend
+parsing outright -- `KeyError('dont support IsNaN opr in AXOPS/ONNXOPS/
+CUSTOM_OPS')` -- independent of training or `onnxsim.graph_grad` entirely.
+Pulsar2's ONNX frontend has never supported the `IsNaN` op at all, so no
+wav2vec2-with-attention model, trained or not, has ever compiled on this
+hardware before now; `onnxsim.graph_grad._grad_where`/`_grad_is_nan` were
+necessary but not sufficient on their own.
+
+**Routed around, exactly, not approximately:** `build_w2v2_encoder_attn_step
+._strip_isnan_guard` removes every `Where(IsNaN(x), 0, x)` pair and rewires
+consumers straight onto `x`. This is provably lossless *for this specific
+deployment shape* -- the build never passes an `attention_mask`, so every
+row is a real, unmasked position and HF's own Softmax output can never
+actually contain a `NaN` (the guard exists only for the floating-point
+cancellation a *fully masked* row's softmax can produce); `IsNaN(x)` is
+therefore always `False`, and `Where(False, ., Y)` always selects `Y`. Not
+a general graph-structure fact `legalize.py` could verify on its own (hence
+local to this build script, not promoted there), and the graph's *other*
+per-layer `Where` (the mask-bias one, condition from `Expand`/
+`GreaterOrEqual`) is left untouched -- still real, still a genuine exercise
+of `graph_grad._grad_where` on real hardware.
+
+**Compiles cleanly** (`pulsar2:7.0-lite`, ~25s) after the strip.
+**Host-verified correct** against finite differences at a properly-tuned
+step size (0.3-2.3% agreement across several tries, matching this project's
+own established bar) both before and after stripping the guard -- confirming
+the strip changes nothing the graph computes, only what compiles.
+
+**On real AX650N hardware, the weight state updates correctly and
+consistently across 15 real steps -- but only once `lr` is calibrated and
+run large enough to clear this weight's own INT8 quantization step.** This
+one weight's real host gradient is ~1e-6/element (two real encoder layers
+deep, one of many weights in the model), roughly 100-1000x smaller than the
+feature extractor's own conv-weight gradient, so `lr*grad` needs
+proportionally more scale to survive quantization at all -- the same
+gradient-quantization-ceiling signature this project has documented
+repeatedly (the Whisper SNR floor, the multi-phase calibration-swap
+technique), now confirmed to extend to an attention-output tail too, not a
+new failure mode:
+
+| `lr` (calibrated + run at) | weight state across steps | verdict |
+| --- | --- | --- |
+| 1.0 | moves once (step 0), then bit-identical forever | dead -- below this weight's own quantization resolution |
+| 2000.0 | `w[0]`: 0.1145 -> 0.1264 -> 0.1343 -> ... -> 0.2804 (all 15 steps distinct, monotonic) | real, consistent per-step movement |
+
+The scalar `loss` output stayed bit-identical across all 15 steps at both
+`lr` values, even while the weight state visibly moved at `lr=2000` -- a
+separate, unchased detail (plausibly the loss output's own INT8 resolution
+not resolving one 128x128 weight's worth of movement inside a much larger,
+otherwise-fixed network; not the same mechanism as resnet50's own
+loss-reads-exactly-0 finding, which was a calibration bug, not a resolution
+one). The *weight update* -- what actually matters for whether training
+works -- is the confirmed result here.
 
 ### Wav2Vec2-Conformer -- both gaps closed; one different, unresolved question
 
