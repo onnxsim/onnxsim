@@ -361,6 +361,49 @@ def add_mse_loss(
     return out
 
 
+def _fold_constants(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Removes every `Constant` node, folding each into an initializer of
+    the same name/value -- a `Constant` node is an initializer wearing a
+    node's clothes: same `TensorProto`, no inputs.
+
+    Runs `onnxsim.simplify()` first (same skip list `build_resident_step`'s
+    own final simplify uses -- `fuse_matmul_add_bias_into_gemm`/`fuse_
+    transpose_into_gemm` skipped, so this doesn't reshuffle which
+    initializer name carries which weight before the caller picks `params`
+    by name), which folds most duplicate `Constant`s via CSE; whatever
+    survives that (not every model's constants collapse to a single shared
+    one) is folded here by hand, since `simplify()` does not guarantee zero
+    remain.
+    """
+    from onnxsim import simplify as _simplify
+
+    model, ok = _simplify(
+        model,
+        skipped_optimizers=[
+            "fuse_matmul_add_bias_into_gemm",
+            "fuse_transpose_into_gemm",
+        ],
+    )
+    if not ok:
+        raise RuntimeError(
+            "pre-backward constant-folding simplify() failed its own check"
+        )
+
+    fold_nodes = [n for n in model.graph.node if n.op_type == "Constant"]
+    if not fold_nodes:
+        return model
+    keep = [n for n in model.graph.node if n.op_type != "Constant"]
+    del model.graph.node[:]
+    model.graph.node.extend(keep)
+    for n in fold_nodes:
+        (attr,) = n.attribute
+        t = onnx.TensorProto()
+        t.CopyFrom(attr.t)
+        t.name = n.output[0]
+        model.graph.initializer.append(t)
+    return model
+
+
 def build_resident_step(
     forward_and_loss: onnx.ModelProto,
     params: Sequence[str],
@@ -387,6 +430,19 @@ def build_resident_step(
     legalize.flatten_to_reshape(model)
     legalize.global_pool_to_reduce(model)
     onnx.checker.check_model(model)
+
+    # A fourth forward-graph blocker, found training a Whisper encoder (see
+    # docs/axera-on-device-training-handoff.md's "A memory-heavy case"
+    # section): graph_grad.build_backward demands a gradient rule for every
+    # node type it walks, `Constant` included, even though a zero-input op
+    # has nothing to backprop through. resnet18d/resnet50d's forward exports
+    # never have one, but a raw Erf-GELU decomposition's `0.5`/`sqrt(2)`
+    # literals do, and no earlier step here folds them. Only pay for this
+    # (a simplify() pass over what may be a large graph) when there is
+    # something to fold.
+    if any(n.op_type == "Constant" for n in model.graph.node):
+        model = _fold_constants(model)
+        onnx.checker.check_model(model)
 
     # Pre-transpose any trainable Conv's weight into matmul layout now, in
     # host numpy, once -- instead of leaving `act_weight_conv_to_matmul` to
