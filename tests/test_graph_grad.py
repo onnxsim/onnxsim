@@ -1009,6 +1009,62 @@ _CASES = {
         """,
         None,
     ),
+    # `Where`/`IsNaN` are `_PYTHON_ONLY_RULES` (no C++/WASM mirror, see that
+    # table's own comment) rather than `_RULES` -- otherwise ordinary
+    # single-output rules, tested the same way every other rule here is.
+    #
+    # `cond` is spelled as a plain `bool` initializer (ONNX text format
+    # supports the dtype directly), never a graph input: a `Where` whose
+    # condition depends on the very value being perturbed would put the
+    # decision boundary itself in the differentiated path, which is not what
+    # this rule's gradient (a *fixed* mask multiplied in) means to test --
+    # `docs/axera-audio-speech-op-coverage.md`'s wav2vec2 finding this rule
+    # exists for is exactly this shape: a condition computed once, reused as
+    # a constant selector against the branch tensors.
+    "where_branch_select": (
+        """
+        g (float[3,4] X, float[3,4] Y) => (float[3,4] Out)
+        <bool[3,4] cond = {1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0}>
+        {
+          Out = Where(cond, X, Y)
+        }
+        """,
+        None,
+    ),
+    # `X` is narrower than the output and `cond`/`Y`; the rule's dX has to
+    # reduce back down through the broadcast the same way `_grad_add`'s does,
+    # not just multiply-by-mask and stop.
+    "where_broadcasts_x": (
+        """
+        g (float[4] X, float[3,4] Y) => (float[3,4] Out)
+        <bool[4] cond = {1, 0, 1, 0}>
+        {
+          Out = Where(cond, X, Y)
+        }
+        """,
+        None,
+    ),
+    # The real shape this pair of rules exists for (see
+    # `docs/axera-audio-speech-op-coverage.md`'s wav2vec2 finding):
+    # numerical-stability cleanup sitting inline in a forward slice,
+    # `Y = Where(IsNaN(X), 0, X)`. `X` is ordinary random data and so never
+    # actually NaN, which is the point of this case -- it exercises
+    # `build_backward` walking over a live `IsNaN` node whose own gradient
+    # nothing needs (only `_grad_is_nan`'s existence, not its body, is
+    # actually load-bearing here), while confirming the always-taken `Y`
+    # branch still gets exactly `dOut` through, i.e. this guard is a no-op
+    # for well-formed data, the same property the real wav2vec2 graph needs.
+    "where_isnan_guard": (
+        """
+        g (float[3,4] X) => (float[3,4] Out)
+        <float zero = {0.0}>
+        {
+          nan_mask = IsNaN(X)
+          Out = Where(nan_mask, zero, X)
+        }
+        """,
+        None,
+    ),
 }
 
 

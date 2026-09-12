@@ -7,8 +7,27 @@
  *   gather:   inputs = batch_index, state[4], lr, grad_seed (7 inputs)
  * outputs (both): state_out[4], loss (5 outputs)
  *
- * Usage: gather_runner model.axmodel steps [warmup] -g   (gather variant, batch_index is int64)
- *        gather_runner model.axmodel steps [warmup]      (baseline variant)
+ * Usage: gather_runner model.axmodel steps [warmup] [-g] [-rN]
+ *   -g    gather variant (batch_index input instead of x/y)
+ *   -rN   dataset row count to index into, e.g. -r128 (default 4096,
+ *         matching the original N=4096 investigation) -- indices are drawn
+ *         mod N, so this must match (or undershoot) the row count the
+ *         model was actually compiled/calibrated against, or the NPU reads
+ *         an out-of-range row and faults.
+ *
+ * `batch_index` is declared `int64` in the ONNX graph
+ * (`build_resident_train_step.add_resident_dataset`), but Pulsar2's
+ * compiled `.axmodel` silently downcasts it to **int32** -- confirmed via
+ * both the frontend's own calibration-time error message (`'indices':
+ * Tensor(S32, name=batch_index, ...)`) and `probe_model_io`'s reported
+ * input size (4 bytes for a declared-int64, shape-`[1]` tensor; int64 would
+ * be 8). Writing `int64_t` values into that 4-byte buffer (an earlier
+ * version of this file did) only half-initializes it, so the NPU reads a
+ * garbage index and faults `axclrtEngineExecute` with `0x8030070c` --
+ * found chasing `docs/axera-on-device-training-handoff.md`'s pre-flattened-
+ * Gather workaround once it got past the original compile-time blocker.
+ * This file writes `int32_t` indices to match what Pulsar2 actually
+ * expects on-device, regardless of the ONNX-declared dtype.
  */
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
@@ -32,8 +51,10 @@ int main(int argc, char **argv) {
     int steps = atoi(argv[2]);
     int warmup = 5;
     int gather_mode = 0;
+    int n_rows = 4096;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-g") == 0) gather_mode = 1;
+        else if (strncmp(argv[i], "-r", 2) == 0) n_rows = atoi(argv[i] + 2);
         else warmup = atoi(argv[i]);
     }
     fprintf(stderr, "mode: %s\n", gather_mode ? "gather (resident dataset)" : "baseline (x/y re-upload)");
@@ -105,9 +126,9 @@ int main(int argc, char **argv) {
     void *hx = NULL, *hy = NULL, *hidx = NULL;
     if (gather_mode) {
         hidx = malloc(in_sz[batch_index_in]);
-        int64_t *idx = (int64_t *)hidx;
-        uint64_t n_idx = in_sz[batch_index_in] / sizeof(int64_t);
-        for (uint64_t i = 0; i < n_idx; i++) idx[i] = (int64_t)(i % 4096);
+        int32_t *idx = (int32_t *)hidx;
+        uint64_t n_idx = in_sz[batch_index_in] / sizeof(int32_t);
+        for (uint64_t i = 0; i < n_idx; i++) idx[i] = (int32_t)(i % (uint64_t)n_rows);
     } else {
         hx = malloc(in_sz[x_in]);
         hy = malloc(in_sz[y_in]);
