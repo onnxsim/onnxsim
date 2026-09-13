@@ -619,11 +619,40 @@ def build_resident_step(
         targets=list(params),
     )
 
+    def _int64_const(values, hint):
+        name = b.name(hint)
+        b.initializer.append(
+            numpy_helper.from_array(np.array(values, dtype=np.int64), name)
+        )
+        return name
+
     state: Dict[str, Tuple[Sequence[int], str]] = {}
     for p in params:
         w_shape = tuple(int(d) for d in shapes[p])
-        step = b.mul("lr", grads[p])
-        w_next = b.sub(p, step)
+        if len(w_shape) == 1:
+            # Pulsar2's NPU backend tiler crashes compiling a rank-1 `Sub`
+            # (`TileFailException("AxQuantizedSub, tuple index out of
+            # range")`, confirmed on real hardware for both a 3- and a
+            # 32-element bias -- it's the *rank*, not the size). Every
+            # trainable tensor in this project's history before EDSR's own
+            # bias tensors happened to be rank>=2 (conv/matmul weights),
+            # which is why this was never hit until now. Side-stepped by
+            # doing the whole per-step update in rank-2 `[1, N]` space --
+            # neither the SGD math nor Pulsar2's own tiler cares about a
+            # leading size-1 axis, only about a bare rank-1 tensor
+            # specifically -- then reshaping the result back to the state
+            # tensor's own declared rank-1 shape.
+            n = w_shape[0]
+            shape2d = _int64_const([1, n], f"{p}_2d_shape")
+            shape1d = _int64_const([n], f"{p}_1d_shape")
+            p_2d = b.op("Reshape", [p, shape2d], hint=f"{p}_2d")
+            grad_2d = b.op("Reshape", [grads[p], shape2d], hint=f"{p}_grad_2d")
+            step_2d = b.mul("lr", grad_2d)
+            w_next_2d = b.sub(p_2d, step_2d)
+            w_next = b.op("Reshape", [w_next_2d, shape1d], hint=f"{p}_next")
+        else:
+            step = b.mul("lr", grads[p])
+            w_next = b.sub(p, step)
         state[p] = (w_shape, w_next)
 
     constants: Dict[str, Tuple[Sequence[int], int]] = {}

@@ -154,21 +154,22 @@ def trainable_scope(
     fuller, harder-to-reach scope; `"all"`: every trainable tensor.
 
     `weights_only` (default `False`) drops every rank-1 (bias) tensor from
-    the result. **Real hardware finding, not a style preference**: a
-    resident training step's in-graph SGD update (`w_next = w - lr *
-    grad`, an ordinary `Sub`) crashes Pulsar2's own NPU backend tiler on a
-    rank-1 operand -- confirmed on two different real compiles here (a
-    3-element and a 32-element bias, both `TileFailException("
-    AxQuantizedSub, tuple index out of range")`), so size is not the
-    trigger, rank is. `scope="tail"`/`"head"`/`"all"` all include real
-    bias tensors and will hit this on real hardware; every earlier domain
-    in this project happened to only train rank>=2 weight tensors, which
-    is almost certainly why this was never found before EDSR's own survey.
-    See `docs/axera-super-resolution-op-coverage.md`'s real-hardware
-    section for the confirmed compile/train result this scope produces,
-    and for a reshape-to-rank-2-and-back workaround idea that hit a
-    different (calibration/build-script, not backend) error on a first
-    attempt -- untried further, a real next step.
+    the result. **Originally a real hardware finding, now fixed
+    generically, not a style preference to keep**: a resident training
+    step's in-graph SGD update (`w_next = w - lr * grad`, an ordinary
+    `Sub`) used to crash Pulsar2's own NPU backend tiler on a rank-1
+    operand -- confirmed on two different real compiles here (a 3-element
+    and a 32-element bias, both `TileFailException("AxQuantizedSub, tuple
+    index out of range")`), so size was not the trigger, rank was; every
+    earlier domain in this project happened to only train rank>=2 weight
+    tensors, which is almost certainly why this was never found before
+    EDSR's own survey. **Fixed in
+    `build_resident_train_step.build_resident_step()` itself**, which now
+    reshapes any rank-1 state tensor's update to rank-2 around the `Sub`
+    transparently -- `weights_only=True` is no longer required for a
+    real compile, kept only as an option for a smaller/faster scope. See
+    `docs/axera-super-resolution-op-coverage.md`'s real-hardware section
+    for the confirmed compile/train result with biases included.
     """
     float_inits = {
         i.name

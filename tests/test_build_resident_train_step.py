@@ -120,6 +120,101 @@ def test_state_output_is_sgd_update_of_the_input():
     assert np.array_equal(outs[state["gw"]], gw0)
 
 
+def test_rank1_state_update_is_reshaped_around_the_sub():
+    """A rank-1 trainable tensor's in-graph SGD `Sub` crashes Pulsar2's own
+    NPU backend tiler on real hardware (`TileFailException("AxQuantizedSub,
+    tuple index out of range")`, confirmed on two different real bias
+    shapes -- `docs/axera-super-resolution-op-coverage.md`'s real-hardware
+    section). Sidestepped by reshaping the whole per-step update to rank-2
+    around the `Sub` and back afterward -- transparent to the state
+    tensor's own declared rank-1 shape at the graph's I/O boundary, checked
+    both structurally (the `Reshape`s exist) and numerically (the update
+    computes the identical value a bare rank-1 `Sub` would)."""
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    step_model, state = brts.build_resident_step(with_loss, params=["cw", "gw", "gb"])
+    onnx.checker.check_model(step_model)
+
+    gb_next = state["gb"]
+    reshape_out = next(n for n in step_model.graph.node if n.output[0] == gb_next)
+    assert reshape_out.op_type == "Reshape", "expected the final state back at rank 1"
+    sub_node = next(
+        n for n in step_model.graph.node if n.output[0] == reshape_out.input[0]
+    )
+    assert sub_node.op_type == "Sub"
+    # `simplify()` may fold away a reshape that turns out to be a no-op (a
+    # Gemm bias gradient's own "unbroadcast" step can already land at rank
+    # 2), so check the `Sub`'s *actual* operand ranks rather than assuming
+    # a specific intermediate reshape node survives -- the property this
+    # test cares about is that `Sub` itself never sees a bare rank-1
+    # tensor, not the exact node count it took to get there.
+    for operand in sub_node.input:
+        shape = next(
+            (
+                [d.dim_value for d in vi.type.tensor_type.shape.dim]
+                for vi in list(step_model.graph.value_info)
+                + list(step_model.graph.input)
+                if vi.name == operand
+            ),
+            None,
+        )
+        if shape is not None:
+            assert len(shape) != 1, f"{operand} feeds Sub as a bare rank-1 tensor"
+
+    initializers = {t.name: t for t in forward.graph.initializer}
+    cw0 = onnx.numpy_helper.to_array(initializers["cw"])
+    gw0 = onnx.numpy_helper.to_array(initializers["gw"])
+    gb0 = onnx.numpy_helper.to_array(initializers["gb"])
+
+    rng = np.random.default_rng(3)
+    x = rng.standard_normal((1, 1, 4, 4)).astype(np.float32)
+    y = rng.standard_normal((1, 10)).astype(np.float32)
+    lr = 0.1
+
+    feeds = {
+        "x": x,
+        "y": y,
+        "lr": np.array([lr], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": cw0,
+        "gw": gw0,
+        "gb": gb0,
+    }
+    out_names = [o.name for o in step_model.graph.output]
+    outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
+
+    # The update's implied gradient (`grad = (gb0 - gb_next) / lr`) must
+    # match a central-difference gradient of the *original* forward+loss
+    # graph's own loss w.r.t. `gb` -- independent of this module's own
+    # graph-building code, and of exactly which nodes survived `simplify()`.
+    # `with_loss` still has `gb` as a fixed initializer, not a real input --
+    # promote it to one so the loss can be probed at an offset value.
+    gb_as_input = onnx.ModelProto()
+    gb_as_input.CopyFrom(with_loss)
+    kept = [t for t in gb_as_input.graph.initializer if t.name != "gb"]
+    del gb_as_input.graph.initializer[:]
+    gb_as_input.graph.initializer.extend(kept)
+    gb_as_input.graph.input.append(
+        onnx.helper.make_tensor_value_info("gb", onnx.TensorProto.FLOAT, [10])
+    )
+
+    implied_grad = (gb0 - outs[gb_next]) / lr
+
+    def loss_at(gb_value):
+        (loss,) = _run(gb_as_input, {"x": x, "y": y, "gb": gb_value}, ["loss"])
+        return float(loss)
+
+    eps = 1e-3
+    numeric_grad = np.zeros_like(gb0)
+    for i in range(gb0.shape[0]):
+        plus, minus = gb0.copy(), gb0.copy()
+        plus[i] += eps
+        minus[i] -= eps
+        numeric_grad[i] = (loss_at(plus) - loss_at(minus)) / (2 * eps)
+
+    assert np.allclose(implied_grad, numeric_grad, atol=1e-3)
+
+
 def test_grad_seed_is_a_runtime_input_that_linearly_scales_the_gradient():
     """`grad_seed` used to be `b.const(1.0)` -- baked in at build time, so no
     per-step loss-scaling controller could ever vary it (see

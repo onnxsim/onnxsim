@@ -10,13 +10,16 @@ used, give `grad_seed` real values near 1.0) -- the same recipe that has
 turned every other "compiles but nothing moves" build in this project into
 "trains correctly."
 
-Defaults to `--scope tail --weights-only`, the one confirmed-compiling
-configuration on real hardware: `trainable_scope`'s own docstring has the
-full story, but in short, a rank-1 (bias) tensor's in-graph SGD update
-crashes Pulsar2's NPU backend tiler (`TileFailException("AxQuantizedSub,
-tuple index out of range")`), confirmed on two different bias shapes here.
-Pass `--scope tail` alone (without `--weights-only`) to reproduce that
-crash directly.
+Defaults to `--scope tail --weights-only`, the configuration confirmed
+first on real hardware. A rank-1 (bias) tensor's in-graph SGD update used
+to crash Pulsar2's NPU backend tiler (`TileFailException("AxQuantizedSub,
+tuple index out of range")`, confirmed on two different bias shapes here)
+-- **fixed generically in `build_resident_train_step.build_resident_step()`
+itself** (reshape the whole per-step update to rank-2 around the `Sub` and
+back), so `--scope tail --no-weights-only` (all four tensors, both `Conv`
+weights and both biases) now also compiles and trains correctly; see
+`docs/axera-super-resolution-op-coverage.md`'s real-hardware section for
+the numbers.
 
 A real, distinct calibration-degeneracy trap this domain's own input names
 surfaced (not present in any earlier model): `make_training_calib.
