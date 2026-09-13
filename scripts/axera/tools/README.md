@@ -1,6 +1,6 @@
 # AXCL runtime tools
 
-Fourteen small C programs against the AXCL engine API (`/usr/include/axcl`), for
+Sixteen small C programs against the AXCL engine API (`/usr/include/axcl`), for
 things `axcl_run_model` cannot do.
 
 `axcl_run_model` only ever runs a model's **first** shape group. An
@@ -71,6 +71,20 @@ prefill cannot be timed with the shipped CLI. These talk to
   `x`/`y` from fixed host files (`/root/whisper_x.bin`/`whisper_y.bin`) so
   the same batch can be reused across differently-calibrated compiles of
   the same graph shape.
+- `whisper_grad_seed_probe.c` -- `whisper_state_probe.c` plus a CLI-settable
+  `grad_seed` (the 18th input `build_resident_step()` now unconditionally
+  adds; bound-checks `ni` against 17-vs-18 the way `resident_runner.c`/
+  `gather_runner.c` do, so it also runs against an older 17-input model).
+  Usage: `whisper_grad_seed_probe model.axmodel steps grad_seed [lr]`. Built
+  to test the FP32 `grad_seed`/`finetune.LossScaler` mechanism against
+  Whisper's real `last_half` graph (`../build_whisper_grad_seed_calib.py`
+  builds matching calibration) -- see the handoff doc's "The
+  multi-thousand-step LossScaler run, attempted on Whisper's real graph"
+  section: the baseline reproduces the established step-1 death exactly and
+  is confirmed seed-insensitive (1 vs 1e6 identical), but no FP32-override
+  build of this graph compiles at all, on any `layer_configs` `op_types`
+  combination tried -- a new Pulsar2 NPU-backend `ddr_allocate` crash, not
+  something this probe's own runtime sweep ever got to exercise.
 - `gather_runner.c` -- resident runner for the two I/O layouts
   `build_resident_train_step.py`'s `add_resident_dataset()` work produces:
   the plain baseline (`x y state[4] lr grad_seed`, `-g` omitted) and the
@@ -168,6 +182,18 @@ prefill cannot be timed with the shipped CLI. These talk to
   that section's own earlier "reported loss read exactly 0" caveat (a
   `memset`-near-zero test input rounding to 0 under real calibration, not a
   bug, the same conclusion resnet18's own memset runs already supported).
+- `resnet_layer4_runner.c` -- generalizes `resnet50_realdata_runner.c`'s
+  fixed `N_STATE=4` (`layer4.2` + `fc.weight` only) to an arbitrary
+  trainable-tensor count via a CLI `n_state` argument, for
+  `../build_resnet50_layer4_step.py`'s `layer4_1_2` (7 states) and
+  `layer4_all` (10 states) scopes -- the "remaining two bottleneck blocks of
+  `layer4`" next step `docs/axera-on-device-training-handoff.md`'s resnet50
+  section named. Same I/O layout convention as every other resident runner
+  here (`qat_graph.make_step_graph`'s own ordering): inputs
+  `x y state_0..N-1 lr[grad_seed]`, outputs `state_0'..N-1' loss`. Confirmed
+  real, monotonically decreasing loss training all three `layer4` blocks at
+  once (10 states) on the first attempt -- see the handoff doc's "All three
+  `layer4` bottleneck blocks" section.
 - `w2v2_encoder_attn_runner.c` -- `w2v2fe_runner_realdata.c` with only the
   header comment and I/O names changed for
   `../build_w2v2_encoder_attn_step.py`'s own model: the first wav2vec2
