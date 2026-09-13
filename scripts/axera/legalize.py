@@ -560,35 +560,45 @@ def inline_local_functions(model):
     resnet18 training step, and they are eight residual connections' gradient
     accumulations, so they are not optional.
 
-    `onnx.inliner` expands them into what they always were -- here, `Identity`,
-    which the AX650 does support. Returns the number of function definitions
-    that were inlined away.
+    Delegates to `onnxsim.inline_local_functions` (added specifically for
+    this): it handles the same "a locally-defined function lives in its own
+    domain, and the model has to import that domain before anything --
+    checker or inliner -- will look at it" fixup this function used to do by
+    hand, uses onnx's own `convert_version=True` to reconcile an opset
+    mismatch (`graph_grad`'s functions declare opset 17; a graph built from a
+    modern export declares 18) rather than this module's old crude "just
+    overwrite the version number" hack, and -- the reason it is worth the
+    onnxsim dependency below -- raises if an `If`/`Loop`/`Scan` survives
+    inlining. A function whose body branches on a genuinely data-dependent
+    condition (not the compile-time-constant kind
+    `eliminate_if_with_const_cond` already collapses automatically) would
+    otherwise pass this rule silently and fail much later, opaquely, on
+    Pulsar2 or any other runtime that does not execute control flow.
+
+    `fuse_matmul_add_bias_into_gemm(_batched)`/`fuse_transpose_into_gemm` are
+    skipped in the simplify pass this runs: `gemm_to_matmul`/
+    `act_weight_conv_to_matmul`, later in `TRAINING_RULES`, exist specifically
+    to decompose `Gemm` away for this target, and would otherwise have to
+    undo a fusion this step just introduced.
+
+    Only imports `onnxsim` when there is actually a function to inline, so
+    `legalize.py in.onnx out.onnx`'s standalone (`onnx`-only) usage is
+    unaffected for the common case of a model with none. Returns the number
+    of function definitions that were inlined away.
     """
     if not model.functions:
         return 0
-    import onnx.inliner
+    import onnxsim
 
-    # A locally-defined function lives in its own domain, and the model has to
-    # import that domain before anything -- checker or inliner -- will look at
-    # it. A graph assembled by hand from `graph_grad`'s output does not have
-    # the import, so add it rather than failing on "No opset import for domain".
-    have = {entry.domain: entry for entry in model.opset_import}
-    for fn in model.functions:
-        if fn.domain not in have:
-            entry = helper.make_opsetid(fn.domain, 1)
-            model.opset_import.append(entry)
-            have[fn.domain] = entry
-        # The inliner silently declines a function whose standard-domain opset
-        # disagrees with the model's -- it inlined nothing and left eight
-        # GradAdd calls for Pulsar2 to reject with "dont support GradAdd opr".
-        # The functions `graph_grad` ships declare opset 17; a graph built from
-        # a modern export declares 18.
-        for imp in fn.opset_import:
-            standard = have.get(imp.domain or "")
-            if standard is not None and (imp.domain or "") == "":
-                imp.version = standard.version
     before = len(model.functions)
-    inlined = onnx.inliner.inline_local_functions(model)
+    inlined = onnxsim.inline_local_functions(
+        model,
+        skipped_optimizers=[
+            "fuse_matmul_add_bias_into_gemm",
+            "fuse_matmul_add_bias_into_gemm_batched",
+            "fuse_transpose_into_gemm",
+        ],
+    )
     model.CopyFrom(inlined)
     return before - len(model.functions)
 

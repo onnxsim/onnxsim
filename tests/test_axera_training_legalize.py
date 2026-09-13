@@ -458,6 +458,43 @@ def test_inlining_a_graph_with_no_functions_is_a_no_op():
     assert legalize.inline_local_functions(model) == 0
 
 
+def test_a_function_with_real_control_flow_raises_instead_of_shipping_an_if():
+    """Not every function inlines down to plain ops: one whose body branches
+    on a genuinely data-dependent condition leaves an `If` behind, and
+    Pulsar2 (like most ONNX runtimes) does not execute one. This has to fail
+    right here, loudly, rather than pass this rule silently and break far
+    later on the compiler with an opaque "unsupported op" error."""
+    model = onnx.parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "custom": 1]
+        >
+        agraph (float[4] X) => (float[4] Y) {
+          Y = custom.DynIdentity(X)
+        }
+        <
+          domain: "custom",
+          opset_import: ["": 18]
+        >
+        DynIdentity (x) => (y) {
+          summed = ReduceSum<keepdims=0>(x)
+          cond = Greater(summed, summed)
+          y = If<
+            then_branch = then_g () => (float[4] t) { t = Relu(x) },
+            else_branch = else_g () => (float[4] e) { e = Neg(x) }
+          >(cond)
+        }
+        """
+    )
+    try:
+        legalize.inline_local_functions(model)
+    except ValueError as error:
+        assert "If" in str(error)
+    else:
+        raise AssertionError("expected a ValueError naming the surviving If node")
+
+
 def test_training_rules_run_in_an_order_that_works():
     """`inline_local_functions` has to come first -- every later rule inspects
     op types and would look straight past a function call."""
