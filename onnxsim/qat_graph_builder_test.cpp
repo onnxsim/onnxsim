@@ -299,7 +299,8 @@ void AdamUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
   CheckEqual(out.param_next, "sub_19",
              "p' = p - lr*m_hat / (sqrt(v_hat) + eps)");
 
-  CheckEqual(b.nodes()[0].input(0), "c_1", "beta1 scales the old first moment");
+  CheckEqual(b.nodes()[0].input(0), "beta1_1",
+             "beta1 scales the old first moment");
   CheckEqual(b.nodes()[0].input(1), "m", "...against the incoming m");
   CheckEqual(b.nodes()[4].input(0), "g",
              "the squared gradient is g*g, not Pow");
@@ -345,7 +346,7 @@ void SgdMomentumUpdateEmitsTheDocumentedArithmeticInTheDocumentedOrder() {
   CheckEqual(out.mom_next, "add_3", "mom' = momentum*mom + g");
   CheckEqual(out.param_next, "sub_5", "p' = p - lr*mom'");
 
-  CheckEqual(b.nodes()[0].input(0), "c_1",
+  CheckEqual(b.nodes()[0].input(0), "momentum_1",
              "momentum scales the old momentum buffer");
   CheckEqual(b.nodes()[0].input(1), "mom", "...against the incoming mom");
   CheckEqual(b.nodes()[1].input(1), "g",

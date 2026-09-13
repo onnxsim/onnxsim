@@ -12,23 +12,23 @@ model_text   A = Relu(H)
 model_text   Y = MatMul(A, W2)
 model_text }
 case adam_update
-  init c_1 1 [] 0x3f666666
-  init c_2 1 [] 0x3f7fbe77
-  init c_3 1 [] 0x3dcccccd
-  init c_4 1 [] 0x3a83126f
-  init c_16 1 [] 0x322bcc77
-  node Mul [c_1,m] [mul_5] {}
-  node Mul [c_3,g] [mul_6] {}
+  init beta1_1 1 [] 0x3f666666
+  init beta2_2 1 [] 0x3f7fbe77
+  init one_minus_beta1_3 1 [] 0x3dcccccd
+  init one_minus_beta2_4 1 [] 0x3a83126f
+  init eps_16 1 [] 0x322bcc77
+  node Mul [beta1_1,m] [mul_5] {}
+  node Mul [one_minus_beta1_3,g] [mul_6] {}
   node Add [mul_5,mul_6] [add_7] {}
-  node Mul [c_2,v] [mul_8] {}
+  node Mul [beta2_2,v] [mul_8] {}
   node Mul [g,g] [mul_9] {}
-  node Mul [c_4,mul_9] [mul_10] {}
+  node Mul [one_minus_beta2_4,mul_9] [mul_10] {}
   node Add [mul_8,mul_10] [add_11] {}
   node Mul [add_7,mc] [mul_12] {}
   node Mul [add_11,vc] [mul_13] {}
   node Mul [lr,mul_12] [mul_14] {}
   node Sqrt [mul_13] [sqrt_15] {}
-  node Add [sqrt_15,c_16] [add_17] {}
+  node Add [sqrt_15,eps_16] [add_17] {}
   node Div [mul_14,add_17] [div_18] {}
   node Sub [p,div_18] [sub_19] {}
   result sub_19,add_7,add_11
@@ -80,11 +80,11 @@ case planner
   init qat__c_22 1 [] 0x40e00000
   init qat__c_27 1 [] 0x3c800000
   init qat__c_33 1 [] 0x00000000
-  init qat__c_42 1 [] 0x3f666666
-  init qat__c_43 1 [] 0x3f7fbe77
-  init qat__c_44 1 [] 0x3dcccccd
-  init qat__c_45 1 [] 0x3a83126f
-  init qat__c_57 1 [] 0x322bcc77
+  init qat__beta1_42 1 [] 0x3f666666
+  init qat__beta2_43 1 [] 0x3f7fbe77
+  init qat__one_minus_beta1_44 1 [] 0x3dcccccd
+  init qat__one_minus_beta2_45 1 [] 0x3a83126f
+  init qat__eps_57 1 [] 0x322bcc77
   node Reshape [qat__scale_1,qat__i64_2] [qat__reshape_3] {}
   node Mul [qat__reshape_3,qat__ones_4] [qat__mul_5] {}
   node Reshape [qat__mul_5,qat__i64_6] [qat__reshape_7] {}
@@ -119,18 +119,18 @@ case planner
   node Transpose [X] [qat__transpose_39] {perm=1,0}
   node MatMul [qat__transpose_39,qat__mul_36] [qat__matmul_40] {}
   node Mul [qat__matmul_40,qat__mul_25] [qat__mul_41] {}
-  node Mul [qat__c_42,qat__mw0] [qat__mul_46] {}
-  node Mul [qat__c_44,qat__mul_41] [qat__mul_47] {}
+  node Mul [qat__beta1_42,qat__mw0] [qat__mul_46] {}
+  node Mul [qat__one_minus_beta1_44,qat__mul_41] [qat__mul_47] {}
   node Add [qat__mul_46,qat__mul_47] [qat__add_48] {}
-  node Mul [qat__c_43,qat__vw0] [qat__mul_49] {}
+  node Mul [qat__beta2_43,qat__vw0] [qat__mul_49] {}
   node Mul [qat__mul_41,qat__mul_41] [qat__mul_50] {}
-  node Mul [qat__c_45,qat__mul_50] [qat__mul_51] {}
+  node Mul [qat__one_minus_beta2_45,qat__mul_50] [qat__mul_51] {}
   node Add [qat__mul_49,qat__mul_51] [qat__add_52] {}
   node Mul [qat__add_48,m_correction] [qat__mul_53] {}
   node Mul [qat__add_52,v_correction] [qat__mul_54] {}
   node Mul [qat__lr,qat__mul_53] [qat__mul_55] {}
   node Sqrt [qat__mul_54] [qat__sqrt_56] {}
-  node Add [qat__sqrt_56,qat__c_57] [qat__add_58] {}
+  node Add [qat__sqrt_56,qat__eps_57] [qat__add_58] {}
   node Div [qat__mul_55,qat__add_58] [qat__div_59] {}
   node Sub [qat__w0,qat__div_59] [qat__sub_60] {}
   node Mul [qat__sub_26,qat__sub_26] [qat__mul_61] {}
@@ -164,33 +164,33 @@ case round_to_nearest
   node Mul [sign_5,cast_6] [mul_7] {}
   result mul_7
 case sgd_momentum_update
-  init c_1 1 [] 0x3f666666
-  node Mul [c_1,mom] [mul_2] {}
+  init momentum_1 1 [] 0x3f666666
+  node Mul [momentum_1,mom] [mul_2] {}
   node Add [mul_2,g] [add_3] {}
   node Mul [lr,add_3] [mul_4] {}
   node Sub [p,mul_4] [sub_5] {}
   result sub_5,add_3
 case step_graph
-  init c_4 1 [] 0x3f666666
-  init c_5 1 [] 0x3f7fbe77
-  init c_6 1 [] 0x3dcccccd
-  init c_7 1 [] 0x3a83126f
-  init c_19 1 [] 0x322bcc77
+  init beta1_4 1 [] 0x3f666666
+  init beta2_5 1 [] 0x3f7fbe77
+  init one_minus_beta1_6 1 [] 0x3dcccccd
+  init one_minus_beta2_7 1 [] 0x3a83126f
+  init eps_19 1 [] 0x322bcc77
   node Sub [student,teacher] [sub_1] {}
   node Mul [sub_1,sub_1] [mul_2] {}
   node ReduceMean [mul_2] [reducemean_3] {keepdims=0}
-  node Mul [c_4,m] [mul_8] {}
-  node Mul [c_6,sub_1] [mul_9] {}
+  node Mul [beta1_4,m] [mul_8] {}
+  node Mul [one_minus_beta1_6,sub_1] [mul_9] {}
   node Add [mul_8,mul_9] [add_10] {}
-  node Mul [c_5,v] [mul_11] {}
+  node Mul [beta2_5,v] [mul_11] {}
   node Mul [sub_1,sub_1] [mul_12] {}
-  node Mul [c_7,mul_12] [mul_13] {}
+  node Mul [one_minus_beta2_7,mul_12] [mul_13] {}
   node Add [mul_11,mul_13] [add_14] {}
   node Mul [add_10,mc] [mul_15] {}
   node Mul [add_14,vc] [mul_16] {}
   node Mul [lr,mul_15] [mul_17] {}
   node Sqrt [mul_16] [sqrt_18] {}
-  node Add [sqrt_18,c_19] [add_20] {}
+  node Add [sqrt_18,eps_19] [add_20] {}
   node Div [mul_17,add_20] [div_21] {}
   node Sub [w,div_21] [sub_22] {}
   opset  17
