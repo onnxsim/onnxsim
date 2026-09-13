@@ -1090,6 +1090,31 @@ _CASES = {
         """,
         None,
     ),
+    # `nn.PixelShuffle`'s ONNX form -- the sub-pixel convolution upsampler
+    # every real super-resolution architecture surveyed
+    # (docs/axera-super-resolution-op-coverage.md) uses. `CRD` is
+    # what `torch.onnx.export` always emits for `nn.PixelShuffle`; `DCR`
+    # (TensorFlow's own convention) is covered too since `_grad_depth_to_
+    # space` branches on `mode` and a wrong branch would fail silently, not
+    # loudly -- exactly the class of mistake this project's LSTM/GRU gate-
+    # order work already found once (an initial `linear_before_reset`
+    # assumption off by up to 0.48).
+    "depth_to_space_crd": (
+        """
+        g (float[2,8,3,3] X) => (float[2,2,6,6] Y) {
+          Y = DepthToSpace <blocksize = 2, mode = "CRD"> (X)
+        }
+        """,
+        None,
+    ),
+    "depth_to_space_dcr": (
+        """
+        g (float[2,8,3,3] X) => (float[2,2,6,6] Y) {
+          Y = DepthToSpace <blocksize = 2, mode = "DCR"> (X)
+        }
+        """,
+        None,
+    ),
 }
 
 

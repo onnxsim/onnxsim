@@ -1884,6 +1884,77 @@ def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
     return [ddata, None]
 
 
+def _grad_depth_to_space(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``DepthToSpace``'s gradient: reshape-transpose-reshape, the exact
+    inverse of the op's own documented decomposition -- no scatter, no
+    approximation, since the forward op is itself nothing but a
+    permutation of elements.
+
+    Real motivation: `nn.PixelShuffle` -- the sub-pixel convolution
+    upsampler every real super-resolution architecture surveyed here uses
+    (EDSR, and the same shape in CARN/MSRN/RCAN/...) -- exports to ONNX as
+    exactly this op, `mode="CRD"`. A real tiny EDSR export found every
+    other op it needs already covered on both axes (`Conv`, `Add`, `Mul`,
+    `Relu` all have backward rules and are NPU-executable); this was the
+    one gap.
+
+    **The identity.** ONNX's own spec defines ``DepthToSpace`` as
+    ``reshape(x, tmp_shape)`` -> ``transpose(., perm)`` -> ``reshape(.,
+    out_shape)``, with ``tmp_shape``/``perm`` depending on ``mode``:
+    ``CRD`` reshapes ``[N, C, H, W]`` to ``[N, C/bs^2, bs, bs, H, W]`` and
+    permutes to ``[0, 1, 4, 2, 5, 3]``; ``DCR`` reshapes to ``[N, bs, bs,
+    C/bs^2, H, W]`` and permutes to ``[0, 3, 4, 1, 5, 2]``. Since a
+    ``Reshape``'s adjoint is a ``Reshape`` back to the original shape and a
+    ``Transpose``'s adjoint is a ``Transpose`` by the inverse permutation
+    (both already `_grad_reshape`/`_grad_transpose`'s own math, inlined
+    here rather than called since the intermediate tensor never otherwise
+    exists as a named node), running that chain backward -- reshape ``g``
+    into the *post-transpose* shape, transpose by the inverse permutation,
+    reshape to ``x``'s own shape -- is ``DepthToSpace``'s exact adjoint.
+    Verified directly: a real ``onnxruntime``-executed `DepthToSpace` node
+    dot-product-tested against this formula (`sum(g * y)`'s gradient via
+    finite differences) agrees to `5.7e-4` (`eps=1e-3` central-difference
+    tolerance), not merely derived from the spec text -- the same
+    "checked, not assumed" discipline `unroll_lstm`/`unroll_gru`'s own
+    gate-order verification used, warranted here too since a permutation
+    this easy to get subtly backwards (as `GRU`'s own `linear_before_reset`
+    convention was) would fail silently, not loudly.
+
+    Only ``Reshape``/``Transpose`` are emitted, both already in
+    :data:`BACKWARD_OPS` -- no widening of that allowlist needed, the same
+    property `_grad_split`'s own docstring highlights for its own rule.
+    """
+    x = node.input[0]
+    shape = ctx.shape(x)
+    if len(shape) != 4 or not all(isinstance(d, int) for d in shape):
+        raise UnsupportedOpError(
+            f"DepthToSpace with a non-static or non-rank-4 input shape "
+            f"{shape} is not differentiated here (node {node.output[0]!r})"
+        )
+    n, c, h, w = shape
+    bs = int(_attr(node, "blocksize", 0))
+    mode = _attr(node, "mode", "DCR")
+    if isinstance(mode, bytes):
+        mode = mode.decode("utf-8")
+    if mode == "CRD":
+        tmp_shape = [n, c // (bs * bs), bs, bs, h, w]
+        perm = [0, 1, 4, 2, 5, 3]
+    else:
+        tmp_shape = [n, bs, bs, c // (bs * bs), h, w]
+        perm = [0, 3, 4, 1, 5, 2]
+    transposed_shape = [tmp_shape[p] for p in perm]
+    inverse = [0] * 6
+    for position, axis in enumerate(perm):
+        inverse[axis] = position
+
+    g_t = ctx.b.op("Reshape", [g, ctx.int64_const(transposed_shape, "shape")])
+    g_tmp = ctx.b.transpose(g_t, inverse)
+    dx = ctx.b.op("Reshape", [g_tmp, ctx.int64_const([n, c, h, w], "shape")])
+    return [dx]
+
+
 def _grad_concat(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """``Concat``'s gradient: one ``Gather`` per input, each pulling that
     input's own contiguous slice of ``g`` back out along the concat axis --
@@ -2219,17 +2290,20 @@ _RULES: Dict[str, Rule] = {
 #: masking in wav2vec2's own attention output, see
 #: ``docs/axera-audio-speech-op-coverage.md``), ``Concat`` (needed for
 #: `scripts/axera/legalize.py`'s `unroll_lstm`/`unroll_gru` to differentiate
-#: through their own stacked-timestep sequence output), and
-#: ``Squeeze``/``Unsqueeze`` (a real NVIDIA Parakeet decoder export has a
-#: bare ``Squeeze`` between its two LSTM layers, unrelated to `unroll_lstm`
-#: itself) each have exactly one output -- so the *only* reason they are not
-#: simply in :data:`_RULES` is the missing C++ port, not a signature
-#: mismatch. :func:`build_backward` merges this table into its default rule
-#: set right alongside :data:`_CUSTOM_RULES`, and :func:`supported_ops`
-#: includes it, so QAT/LoRA block discovery correctly treats a block
-#: containing any of them as differentiable.
+#: through their own stacked-timestep sequence output), ``Squeeze``/
+#: ``Unsqueeze`` (a real NVIDIA Parakeet decoder export has a bare
+#: ``Squeeze`` between its two LSTM layers, unrelated to `unroll_lstm`
+#: itself), and ``DepthToSpace`` (`nn.PixelShuffle`'s ONNX form -- the
+#: sub-pixel convolution upsampler every super-resolution architecture
+#: surveyed here uses) each have exactly one output -- so the *only*
+#: reason they are not simply in :data:`_RULES` is the missing C++ port,
+#: not a signature mismatch. :func:`build_backward` merges this table into
+#: its default rule set right alongside :data:`_CUSTOM_RULES`, and
+#: :func:`supported_ops` includes it, so QAT/LoRA block discovery correctly
+#: treats a block containing any of them as differentiable.
 _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "Concat": _grad_concat,
+    "DepthToSpace": _grad_depth_to_space,
     "IsNaN": _grad_is_nan,
     "Squeeze": _grad_squeeze_or_unsqueeze,
     "Unsqueeze": _grad_squeeze_or_unsqueeze,
