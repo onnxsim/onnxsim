@@ -282,3 +282,257 @@ def test_legalize_reports_what_each_rule_changed():
     assert set(applied) == set(legalize.RULES)
     assert applied["pow2_to_mul"] == 1
     assert applied["float16_to_float32"] > 0
+
+
+def _lstm_model(seq=5, batch=2, inp=3, hid=4, with_bias=True, with_state=True):
+    """A forward, single-direction `LSTM` -- the shape a real
+    `torch.onnx.export`-produced decoder uses (`docs/axera-audio-speech-
+    op-coverage.md`'s LSTM section), with real random `W`/`R`/`B`/`h0`/`c0`
+    so onnxruntime actually exercises the gate arithmetic rather than
+    multiplying by zero.
+
+    Built with `onnx.helper` rather than the text format: the parser has no
+    syntax for an omitted optional input (`LSTM`'s `sequence_lens`, skipped
+    here via `''` at the protobuf level) -- the CLAUDE.md-documented
+    exception for a case the text form cannot express.
+    """
+    rng = np.random.RandomState(0)
+    w = rng.randn(1, 4 * hid, inp).astype(np.float32) * 0.3
+    r = rng.randn(1, 4 * hid, hid).astype(np.float32) * 0.3
+
+    inputs = ["x", "W", "R", "B" if with_bias else "", ""]
+    if with_state:
+        inputs += ["h0", "c0"]
+    node = helper.make_node("LSTM", inputs, ["y", "y_h", "y_c"], hidden_size=hid)
+
+    graph_inputs = [
+        helper.make_tensor_value_info("x", TensorProto.FLOAT, [seq, batch, inp])
+    ]
+    initializer = [numpy_helper.from_array(w, "W"), numpy_helper.from_array(r, "R")]
+    if with_bias:
+        b = rng.randn(1, 8 * hid).astype(np.float32) * 0.1
+        initializer.append(numpy_helper.from_array(b, "B"))
+    if with_state:
+        h0 = rng.randn(1, batch, hid).astype(np.float32)
+        c0 = rng.randn(1, batch, hid).astype(np.float32)
+        initializer += [
+            numpy_helper.from_array(h0, "h0"),
+            numpy_helper.from_array(c0, "c0"),
+        ]
+        graph_inputs += [
+            helper.make_tensor_value_info("h0", TensorProto.FLOAT, [1, batch, hid]),
+            helper.make_tensor_value_info("c0", TensorProto.FLOAT, [1, batch, hid]),
+        ]
+
+    graph = helper.make_graph(
+        [node],
+        "lstm_probe",
+        graph_inputs,
+        [
+            helper.make_tensor_value_info("y", TensorProto.FLOAT, [seq, 1, batch, hid]),
+            helper.make_tensor_value_info("y_h", TensorProto.FLOAT, [1, batch, hid]),
+            helper.make_tensor_value_info("y_c", TensorProto.FLOAT, [1, batch, hid]),
+        ],
+        initializer=initializer,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    return model
+
+
+def test_lstm_unrolls_into_already_covered_ops_and_computes_the_same_thing():
+    """The whole point: every op type left behind already has both a
+    `graph_grad` backward rule and NPU support, unlike the opaque `LSTM`
+    node it replaces (`docs/axera-audio-speech-op-coverage.md`'s LSTM
+    row)."""
+    ort = __import__("onnxruntime")
+    before = _lstm_model()
+    after = _lstm_model()
+    assert legalize.unroll_lstm(after) == 1
+    op_types = {n.op_type for n in after.graph.node}
+    assert "LSTM" not in op_types
+    assert op_types <= {
+        "Add",
+        "Concat",
+        "Gather",
+        "MatMul",
+        "Mul",
+        "Reshape",
+        "Sigmoid",
+        "Tanh",
+    }
+    onnx.checker.check_model(after)
+
+    x = np.random.RandomState(1).randn(5, 2, 3).astype(np.float32)
+    runs = []
+    for model in (before, after):
+        session = ort.InferenceSession(
+            model.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        runs.append(session.run(["y", "y_h", "y_c"], {"x": x}))
+    for name, r0, r1 in zip(("y", "y_h", "y_c"), runs[0], runs[1]):
+        assert np.allclose(r0, r1, atol=1e-5), (name, np.abs(r0 - r1).max())
+
+
+def test_lstm_unrolls_without_bias_or_initial_state_too():
+    """`B`/`h0`/`c0` are all optional ONNX `LSTM` inputs -- a real decoder
+    that never overrides the zero-initialized default state (the common
+    case) omits them, and the rule needs to default them to zero itself
+    rather than assume they are always present."""
+    ort = __import__("onnxruntime")
+    before = _lstm_model(with_bias=False, with_state=False)
+    after = _lstm_model(with_bias=False, with_state=False)
+    assert legalize.unroll_lstm(after) == 1
+    assert "LSTM" not in {n.op_type for n in after.graph.node}
+    onnx.checker.check_model(after)
+
+    x = np.random.RandomState(2).randn(5, 2, 3).astype(np.float32)
+    runs = [
+        ort.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]
+        ).run(["y", "y_h", "y_c"], {"x": x})
+        for m in (before, after)
+    ]
+    for name, r0, r1 in zip(("y", "y_h", "y_c"), runs[0], runs[1]):
+        assert np.allclose(r0, r1, atol=1e-5), (name, np.abs(r0 - r1).max())
+
+
+def test_bidirectional_lstm_is_left_untouched():
+    """Only the forward-direction shape every real target model in this
+    project uses is handled; a `direction="bidirectional"` node is declined
+    outright, the same precedent every other shape-scoped rule here
+    follows."""
+    model = _lstm_model()
+    for node in model.graph.node:
+        if node.op_type == "LSTM":
+            node.attribute.append(helper.make_attribute("direction", "bidirectional"))
+    assert legalize.unroll_lstm(model) == 0
+    assert [n.op_type for n in model.graph.node] == ["LSTM"]
+
+
+def _gru_model(seq=5, batch=2, inp=3, hid=4):
+    """A forward, single-direction `GRU` with `linear_before_reset=1` --
+    what real `torch.onnx.export` always emits for `nn.GRU`
+    (`docs/axera-audio-speech-op-coverage.md`'s GRU section).
+
+    Built with `onnx.helper` for the same reason `_lstm_model` is: the text
+    format cannot express `sequence_lens`'s omitted-optional-input `''`.
+    """
+    rng = np.random.RandomState(3)
+    w = rng.randn(1, 3 * hid, inp).astype(np.float32) * 0.3
+    r = rng.randn(1, 3 * hid, hid).astype(np.float32) * 0.3
+    b = rng.randn(1, 6 * hid).astype(np.float32) * 0.1
+    h0 = rng.randn(1, batch, hid).astype(np.float32)
+
+    node = helper.make_node(
+        "GRU",
+        ["x", "W", "R", "B", "", "h0"],
+        ["y", "y_h"],
+        hidden_size=hid,
+        linear_before_reset=1,
+    )
+    graph = helper.make_graph(
+        [node],
+        "gru_probe",
+        [
+            helper.make_tensor_value_info("x", TensorProto.FLOAT, [seq, batch, inp]),
+            helper.make_tensor_value_info("h0", TensorProto.FLOAT, [1, batch, hid]),
+        ],
+        [
+            helper.make_tensor_value_info("y", TensorProto.FLOAT, [seq, 1, batch, hid]),
+            helper.make_tensor_value_info("y_h", TensorProto.FLOAT, [1, batch, hid]),
+        ],
+        initializer=[
+            numpy_helper.from_array(w, "W"),
+            numpy_helper.from_array(r, "R"),
+            numpy_helper.from_array(b, "B"),
+            numpy_helper.from_array(h0, "h0"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    return model
+
+
+def test_gru_unrolls_into_already_covered_ops_and_computes_the_same_thing():
+    """The stricter of the two findings: unlike `LSTM`, `GRU` is not even
+    NPU-executable, so this is the only way a `GRU`-containing model runs
+    on this hardware at all, training or not."""
+    ort = __import__("onnxruntime")
+    before = _gru_model()
+    after = _gru_model()
+    assert legalize.unroll_gru(after) == 1
+    op_types = {n.op_type for n in after.graph.node}
+    assert "GRU" not in op_types
+    assert op_types <= {
+        "Add",
+        "Concat",
+        "Gather",
+        "MatMul",
+        "Mul",
+        "Reshape",
+        "Sigmoid",
+        "Sub",
+        "Tanh",
+    }
+    onnx.checker.check_model(after)
+
+    x = np.random.RandomState(4).randn(5, 2, 3).astype(np.float32)
+    runs = [
+        ort.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]
+        ).run(["y", "y_h"], {"x": x})
+        for m in (before, after)
+    ]
+    for name, r0, r1 in zip(("y", "y_h"), runs[0], runs[1]):
+        assert np.allclose(r0, r1, atol=1e-5), (name, np.abs(r0 - r1).max())
+
+
+def test_unrolled_lstm_is_fully_differentiable_through_its_stacked_output():
+    """The rule's whole point: `graph_grad.build_backward` must reach every
+    weight through the unrolled loop, including through the `Concat`-built
+    stacked-timestep `y` output every real decoder actually trains against
+    (Parakeet's own `lstm_output`, not `y_h`) -- exercising the new
+    `onnxsim.graph_grad._grad_concat` rule this same investigation added."""
+    from onnxsim import graph_grad
+
+    model = _lstm_model(seq=3, batch=1, inp=2, hid=2)
+    legalize.unroll_lstm(model)
+    onnx.checker.check_model(model)
+
+    inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+    shapes = {
+        vi.name: [d.dim_value for d in vi.type.tensor_type.shape.dim]
+        for vi in list(inferred.graph.value_info)
+        + list(inferred.graph.input)
+        + list(inferred.graph.output)
+    }
+    for init in model.graph.initializer:
+        shapes[init.name] = list(init.dims)
+
+    from onnxsim import qat_graph
+
+    b = qat_graph.GraphBuilder()
+    b.nodes = list(model.graph.node)
+    b.initializer = list(model.graph.initializer)
+    sq = b.mul("y", "y")
+    loss = b.op("ReduceSum", [sq], keepdims=0)
+    shapes[sq] = shapes["y"]
+    shapes[loss] = []
+
+    # `unroll_lstm` splits the original packed `W`/`R` into one initializer
+    # per gate (`_gate_weight`'s own naming, `<stem>_w<i>`/`<stem>_r<i>`) and
+    # drops the packed tensors entirely -- these are the real post-unroll
+    # trainable weights, not "W"/"R" themselves.
+    targets = [f"y_w{i}" for i in range(4)] + [f"y_r{i}" for i in range(4)]
+    assert {i.name for i in model.graph.initializer} >= set(targets)
+
+    grads = graph_grad.build_backward(
+        b,
+        nodes=list(b.nodes),
+        shapes=shapes,
+        grad_outputs={loss: "seed"},
+        targets=targets,
+    )
+    for name in targets:
+        assert grads[name] is not None, name

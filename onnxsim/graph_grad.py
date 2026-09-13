@@ -1861,6 +1861,49 @@ def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
     return [ddata, None]
 
 
+def _grad_concat(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``Concat``'s gradient: one ``Gather`` per input, each pulling that
+    input's own contiguous slice of ``g`` back out along the concat axis --
+    exactly ``Split``'s adjoint (:func:`_grad_split`'s own docstring), just
+    reached a different way.
+
+    ``Gather`` rather than ``Split``'s selection-matrix ``MatMul``: this
+    module's own admission note for ``Gather`` in :data:`BACKWARD_OPS`
+    describes precisely this shape of use -- "a single axis, a constant
+    int64 index, and no dependence of the *index* on any runtime value" --
+    since every input's offset and width along the concat axis are known at
+    build time, not computed from a runtime tensor. `_grad_split` could not
+    reuse ``Gather`` for its own, opposite direction (scattering one
+    incoming gradient *into* a zero-elsewhere result needs every other
+    output's width too, not just its own), which is why it reaches for
+    ``Transpose``/``MatMul``/``Add`` instead; here, extracting a contiguous
+    range straight out of ``g`` is exactly what ``Gather`` with a
+    consecutive-integer index list already does, with nothing left to
+    build.
+
+    Every dimension besides the concat axis must be static -- ``Gather``'s
+    ``axis`` and index values are baked in at build time, the same
+    requirement :func:`_grad_gather` and :func:`_grad_conv` already carry
+    for their own ``Gather`` emissions.
+    """
+    out_shape = ctx.shape(node.output[0])
+    axis = int(_attr(node, "axis", 0)) % len(out_shape)
+    grads: List[Optional[str]] = []
+    offset = 0
+    for inp in node.input:
+        shape = ctx.shape(inp)
+        width = shape[axis]
+        if not isinstance(width, int):
+            raise UnsupportedOpError(
+                f"Concat with a non-static size along axis {axis} is not "
+                f"differentiated here (node {node.output[0]!r}, input {inp!r})"
+            )
+        idx = ctx.int64_const(list(range(offset, offset + width)), "idx")
+        grads.append(ctx.b.op("Gather", [g, idx], axis=axis))
+        offset += width
+    return grads
+
+
 def _grad_split(
     ctx: _Backward, node: onnx.NodeProto, gs: List[Optional[str]]
 ) -> List[Optional[str]]:
@@ -2151,13 +2194,17 @@ _RULES: Dict[str, Rule] = {
 #: :data:`_MULTI_OUTPUT_RULES`, every rule here is an ordinary
 #: single-``g`` :data:`Rule` -- ``Where``/``IsNaN`` (numerical-stability
 #: masking in wav2vec2's own attention output, see
-#: ``docs/axera-audio-speech-op-coverage.md``) each have exactly one output
-#: -- so the *only* reason they are not simply in :data:`_RULES` is the
-#: missing C++ port, not a signature mismatch. :func:`build_backward` merges
-#: this table into its default rule set right alongside :data:`_CUSTOM_RULES`,
-#: and :func:`supported_ops` includes it, so QAT/LoRA block discovery
-#: correctly treats a block containing ``Where``/``IsNaN`` as differentiable.
+#: ``docs/axera-audio-speech-op-coverage.md``) and ``Concat`` (needed for
+#: `scripts/axera/legalize.py`'s `unroll_lstm`/`unroll_gru` to differentiate
+#: through their own stacked-timestep sequence output) each have exactly one
+#: output -- so the *only* reason they are not simply in :data:`_RULES` is
+#: the missing C++ port, not a signature mismatch. :func:`build_backward`
+#: merges this table into its default rule set right alongside
+#: :data:`_CUSTOM_RULES`, and :func:`supported_ops` includes it, so QAT/LoRA
+#: block discovery correctly treats a block containing
+#: ``Where``/``IsNaN``/``Concat`` as differentiable.
 _PYTHON_ONLY_RULES: Dict[str, Rule] = {
+    "Concat": _grad_concat,
     "IsNaN": _grad_is_nan,
     "Where": _grad_where,
 }
