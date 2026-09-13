@@ -504,11 +504,24 @@ def _fold_constants(model: onnx.ModelProto) -> onnx.ModelProto:
     survives that (not every model's constants collapse to a single shared
     one) is folded here by hand, since `simplify()` does not guarantee zero
     remain.
+
+    `initializers_as_constants=False`: this runs *before* `params` are
+    promoted to state I/O (still plain initializers at this point), and
+    `initializers_as_constants=True` (`simplify()`'s own default) lets the
+    optimizer fold/eliminate them as ordinary constant data -- found
+    concretely by `scripts/axera/legalize.py`'s `unroll_gru` output: with
+    the default, this call silently dropped the per-gate `W`/`R`
+    initializers `unroll_gru` had just created, no error, `build_resident_
+    step` only noticing several steps later when `params` could no longer
+    be found. `unroll_lstm`'s own output happened not to trigger this same
+    optimizer behavior, which is exactly the kind of silent, model-specific
+    failure this flag closes off generally rather than routing around once.
     """
     from onnxsim import simplify as _simplify
 
     model, ok = _simplify(
         model,
+        initializers_as_constants=False,
         skipped_optimizers=[
             "fuse_matmul_add_bias_into_gemm",
             "fuse_transpose_into_gemm",

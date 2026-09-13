@@ -1192,6 +1192,26 @@ def _gate_weight(model, stem, arr):
     return name
 
 
+def _is_zero_source(model, name):
+    """True if `name` is provably an all-zero tensor: either a zero-valued
+    initializer, or `Expand`/`Reshape`/`Squeeze`/`Unsqueeze` of one --
+    `torch.onnx.export`'s own idiom for "no explicit initial state given"
+    (`Expand(Constant(all-zero), shape)`), traced back through whatever
+    shape-only ops sit in between rather than matched against one exact
+    node shape, since different opset/torch versions have been observed to
+    spell the same "broadcast a zero scalar" idea slightly differently."""
+    producer = next((n for n in model.graph.node if name in n.output), None)
+    if producer is None:
+        init = _initializer(model, name)
+        return init is not None and not numpy_helper.to_array(init).any()
+    if producer.op_type == "Constant":
+        (attr,) = producer.attribute
+        return not numpy_helper.to_array(attr.t).any()
+    if producer.op_type in ("Expand", "Reshape", "Squeeze", "Unsqueeze", "Identity"):
+        return _is_zero_source(model, producer.input[0])
+    return False
+
+
 def _unroll_recurrent_node(model, node, shapes, n_gates, step_fn):
     """Shared scaffolding for `unroll_lstm`/`unroll_gru`: validates the
     node is in the supported shape (forward direction, static shapes,
@@ -1256,7 +1276,28 @@ def _unroll_recurrent_node(model, node, shapes, n_gates, step_fn):
     new_nodes = []
 
     def initial_state(idx, label):
-        if len(node.input) > idx and node.input[idx]:
+        # A real `torch.onnx.export` never emits a raw zero initializer for
+        # an unspecified initial state -- it emits `Expand(Constant(all-
+        # zero), shape)`, a live node chain that (as this function used to
+        # do) can be `Reshape`d through directly, but doing so leaves
+        # `onnxsim.simplify()` (the pass `build_resident_step`'s own
+        # `_fold_constants` runs before `params` are promoted to state I/O)
+        # to resolve that chain's shape and constant-fold it back down --
+        # which, for a `GRU` node specifically, was found to trigger a real
+        # optimizer bug that silently drops unrelated initializers
+        # (including the per-gate `W`/`R` weights this rule just created)
+        # along with whatever it was actually trying to fold. Detecting the
+        # zero-constant case directly and emitting a plain zero initializer
+        # of the already-known static `[batch, h]` shape ourselves sidesteps
+        # the whole fragile chain -- semantically identical (every real
+        # target model here starts from a zero hidden state; no target
+        # model needs a genuinely live initial-state input yet), and
+        # simpler regardless of which op triggered the bug.
+        if (
+            len(node.input) > idx
+            and node.input[idx]
+            and not _is_zero_source(model, node.input[idx])
+        ):
             squeezed = _unique_name(model, f"{stem}_{label}0")
             new_nodes.append(
                 helper.make_node(
@@ -1270,9 +1311,21 @@ def _unroll_recurrent_node(model, node, shapes, n_gates, step_fn):
                 )
             )
             return squeezed
-        zero_name = _unique_name(model, f"{stem}_{label}0_zero")
+        const_name = _unique_name(model, f"{stem}_{label}0_zero")
         model.graph.initializer.append(
-            numpy_helper.from_array(np.zeros((batch, h), dtype=np.float32), zero_name)
+            numpy_helper.from_array(np.zeros((batch, h), dtype=np.float32), const_name)
+        )
+        # An `Identity` wrapper, not the bare initializer name directly: the
+        # "live" branch above always returns a genuine node *output*
+        # (`Reshape`'s), never a raw initializer reference. `GRU`'s own
+        # `_gru_step` uses `h` both through a `MatMul` and directly in a
+        # plain elementwise `Mul` (`_lstm_step` never does the latter) --
+        # exposing a real Pulsar2 quantizer failure tracing a bare
+        # zero-valued initializer used both ways at once. Matching the live
+        # branch's shape (always a node output) sidesteps it.
+        zero_name = _unique_name(model, f"{stem}_{label}0")
+        new_nodes.append(
+            helper.make_node("Identity", [const_name], [zero_name], name=zero_name)
         )
         return zero_name
 
@@ -1452,19 +1505,33 @@ def _gru_step(model, stem, t, gates, h, _c, new_nodes):
 
     # linear_before_reset=1: the reset gate scales (h @ Rh + Rbh) as a
     # whole, added to the already-computed Wh/x term -- not `(rt*h) @ Rh`.
-    rc = _unique_name(model, f"{stem}_t{t}_rc")
-    new_nodes.append(helper.make_node("Add", [nhr, nrb], [rc], name=rc))
+    # Distributed as `rt*nhr + rt*nrb` rather than `rt*(nhr+nrb)`
+    # (mathematically identical): a real Pulsar2 PPQ quantizer limitation
+    # found compiling this exact rule -- `Add(nhr, nrb)` combines two
+    # operands neither of which is unambiguously "real" from the
+    # quantizer's own tracer's perspective at the very first timestep (`h`
+    # a compile-time-constant zero, `nrb` a plain bias initializer),
+    # unlike `_lstm_step`'s equivalent `Add(xw, hr)`, whose `xw` operand
+    # depends on the real sequence input and gives the tracer an
+    # unambiguous anchor immediately. Multiplying by `rt` (unambiguously
+    # real, itself downstream of the real input) before either `Add`
+    # instead gives every intermediate the same anchor `_lstm_step`'s own
+    # gates already have, at the cost of one extra `Mul`.
+    rn_h = _unique_name(model, f"{stem}_t{t}_rnh")
+    new_nodes.append(helper.make_node("Mul", [rt, nhr], [rn_h], name=rn_h))
+    rn_b = _unique_name(model, f"{stem}_t{t}_rnb")
+    new_nodes.append(helper.make_node("Mul", [rt, nrb], [rn_b], name=rn_b))
+    rn = _unique_name(model, f"{stem}_t{t}_rn")
+    new_nodes.append(helper.make_node("Add", [rn_h, rn_b], [rn], name=rn))
     nxw_full = _unique_name(model, f"{stem}_t{t}_nxwfull")
     new_nodes.append(helper.make_node("Add", [nxw, nwb], [nxw_full], name=nxw_full))
-    rn = _unique_name(model, f"{stem}_t{t}_rn")
-    new_nodes.append(helper.make_node("Mul", [rt, rc], [rn], name=rn))
     n_pre = _unique_name(model, f"{stem}_t{t}_npre")
     new_nodes.append(helper.make_node("Add", [nxw_full, rn], [n_pre], name=n_pre))
     nt = npre
     new_nodes.append(helper.make_node("Tanh", [n_pre], [nt], name=nt))
 
     one_minus_z = _unique_name(model, f"{stem}_t{t}_1mz")
-    ones = _const_ones_like(model, f"{stem}_t{t}_ones", zt)
+    ones = _shared_const_ones(model, stem)
     new_nodes.append(
         helper.make_node("Sub", [ones, zt], [one_minus_z], name=one_minus_z)
     )
@@ -1477,14 +1544,26 @@ def _gru_step(model, stem, t, gates, h, _c, new_nodes):
     return h_new, None
 
 
-def _const_ones_like(model, stem, ref):
-    # `ref` is a runtime tensor (an activation), not a static shape -- a
-    # constant `1.0` broadcasts against it in `Sub` without needing its
-    # actual shape known ahead of time.
-    name = _unique_name(model, stem)
-    model.graph.initializer.append(
-        numpy_helper.from_array(np.array(1.0, dtype=np.float32), name)
-    )
+def _shared_const_ones(model, stem):
+    """A scalar `1.0` initializer, created once per unrolled node (not once
+    per timestep) and reused for every step's `1 - z` term -- a rank-0
+    constant broadcasts against any shape, so the same tensor serves every
+    timestep. Creating a fresh, byte-identical `1.0` initializer per
+    timestep instead (an earlier version of this rule did) is not just
+    wasteful: it defeats `build_resident_step`'s own upstream constant-
+    folding pass in a way that silently drops unrelated initializers --
+    onnxsim's duplicate-initializer elimination collapses every
+    byte-identical constant onto one surviving name, and folding a graph
+    still built entirely from initializers (nothing promoted to a live
+    state input yet, at the point `build_resident_step` runs this) then
+    partially consumes real per-gate weight tensors along with the
+    duplicates it was actually targeting.
+    """
+    name = f"{stem}_ones"
+    if not any(init.name == name for init in model.graph.initializer):
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array(1.0, dtype=np.float32), name)
+        )
     return name
 
 

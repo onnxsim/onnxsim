@@ -1065,6 +1065,31 @@ _CASES = {
         """,
         None,
     ),
+    # Found real and load-bearing, not theoretical: a real NVIDIA Parakeet
+    # decoder export (docs/axera-audio-speech-op-coverage.md's LSTM/GRU
+    # section) has a bare `Squeeze` between its two LSTM layers that
+    # `build_backward` refused to walk over at all before `_grad_
+    # squeeze_or_unsqueeze` existed.
+    "squeeze": (
+        """
+        g (float[2,1,4] A) => (float[2,4] Y)
+        <int64[1] axes = {1}>
+        {
+          Y = Squeeze(A, axes)
+        }
+        """,
+        None,
+    ),
+    "unsqueeze": (
+        """
+        g (float[2,4] A) => (float[2,1,4] Y)
+        <int64[1] axes = {1}>
+        {
+          Y = Unsqueeze(A, axes)
+        }
+        """,
+        None,
+    ),
 }
 
 

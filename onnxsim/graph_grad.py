@@ -1750,6 +1750,29 @@ def _grad_is_nan(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[
     return [None]
 
 
+def _grad_squeeze_or_unsqueeze(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``Squeeze``/``Unsqueeze``'s gradient: both only remove or insert
+    size-1 axes, so -- exactly like :func:`_grad_reshape`, whose logic this
+    duplicates rather than shares only because the two are registered under
+    different op-type keys -- the adjoint is a ``Reshape`` of the incoming
+    gradient back to ``data``'s own shape. ``axes`` (opset 13+'s optional
+    second input, a tensor) gets no gradient, the same "shape/indices input
+    is not a function of anything float" convention every such second input
+    in this module already follows.
+
+    Found real and load-bearing, not a theoretical gap: NVIDIA Parakeet's
+    real RNN-T decoder export (`scripts/axera/build_parakeet_lstm_probe.py`)
+    has a `Squeeze` sitting between its two LSTM layers (unrelated to
+    `scripts/axera/legalize.py`'s `unroll_lstm`, which does not itself emit
+    one) that `build_backward` refused to walk over at all before this.
+    """
+    shape = ctx.shape(node.input[0])
+    grad = ctx.b.op("Reshape", [g, ctx.int64_const(shape, "shape")])
+    return [grad] + [None] * (len(node.input) - 1)
+
+
 def _grad_gather(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """``Gather``'s gradient: a scatter-add into ``data``, ``indices`` itself
     untouched.
@@ -2194,18 +2217,22 @@ _RULES: Dict[str, Rule] = {
 #: :data:`_MULTI_OUTPUT_RULES`, every rule here is an ordinary
 #: single-``g`` :data:`Rule` -- ``Where``/``IsNaN`` (numerical-stability
 #: masking in wav2vec2's own attention output, see
-#: ``docs/axera-audio-speech-op-coverage.md``) and ``Concat`` (needed for
+#: ``docs/axera-audio-speech-op-coverage.md``), ``Concat`` (needed for
 #: `scripts/axera/legalize.py`'s `unroll_lstm`/`unroll_gru` to differentiate
-#: through their own stacked-timestep sequence output) each have exactly one
-#: output -- so the *only* reason they are not simply in :data:`_RULES` is
-#: the missing C++ port, not a signature mismatch. :func:`build_backward`
-#: merges this table into its default rule set right alongside
-#: :data:`_CUSTOM_RULES`, and :func:`supported_ops` includes it, so QAT/LoRA
-#: block discovery correctly treats a block containing
-#: ``Where``/``IsNaN``/``Concat`` as differentiable.
+#: through their own stacked-timestep sequence output), and
+#: ``Squeeze``/``Unsqueeze`` (a real NVIDIA Parakeet decoder export has a
+#: bare ``Squeeze`` between its two LSTM layers, unrelated to `unroll_lstm`
+#: itself) each have exactly one output -- so the *only* reason they are not
+#: simply in :data:`_RULES` is the missing C++ port, not a signature
+#: mismatch. :func:`build_backward` merges this table into its default rule
+#: set right alongside :data:`_CUSTOM_RULES`, and :func:`supported_ops`
+#: includes it, so QAT/LoRA block discovery correctly treats a block
+#: containing any of them as differentiable.
 _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "Concat": _grad_concat,
     "IsNaN": _grad_is_nan,
+    "Squeeze": _grad_squeeze_or_unsqueeze,
+    "Unsqueeze": _grad_squeeze_or_unsqueeze,
     "Where": _grad_where,
 }
 
