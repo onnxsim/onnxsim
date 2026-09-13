@@ -123,25 +123,35 @@ trajectory actually used, `grad_seed` given real values near 1.0) and
 compiled the `tail` scope with real `pulsar2:7.0-lite`.
 
 **A new, real, generalizable Pulsar2 NPU-backend limitation, not an EDSR
-quirk**: compiling `tail`'s full 4-tensor scope (both `Conv` weights and
-both biases) fails -- `TileFailException("AxQuantizedSub, tuple index out
-of range")` on the in-graph SGD update (`w_next = w - lr * grad`, an
-ordinary `Sub`) for a **rank-1** operand. Confirmed on two different real
-compiles, isolating the trigger precisely: `tail.1.bias` (3 elements) and
-`tail.0.0.bias` (32 elements) both crash identically, so element count is
-not the cause -- rank is. Training only the two `Conv` **weights**
-(`--weights-only`, dropping both rank-1 biases) compiles successfully.
-**Every earlier real-hardware training in this project's history happened
-to only train rank>=2 weight tensors** -- resnet18/50's conv/fc weights,
-LSTM/GRU's per-gate weight matrices -- which is almost certainly why this
-was never found before EDSR's own survey put a bias tensor directly in a
-trainable scope for the first time. A reshape-to-rank-2-and-back
-workaround (wrap the `Sub` in `Reshape([1,N])`/`Sub`/`Reshape([N])`,
-sidestepping the crash entirely) was tried once, cleared the backend
-tiler issue, but hit a different, likely calibration/build-script-shaped
-error (`fetch_calibration_data`'s own `IndexError`) on a first attempt --
-untried further, a real, promising next step for whoever wants bias
-tensors trainable through this pipeline.
+quirk -- found, then fixed**: compiling `tail`'s full 4-tensor scope (both
+`Conv` weights and both biases) originally failed --
+`TileFailException("AxQuantizedSub, tuple index out of range")` on the
+in-graph SGD update (`w_next = w - lr * grad`, an ordinary `Sub`) for a
+**rank-1** operand. Confirmed on two different real compiles, isolating
+the trigger precisely: `tail.1.bias` (3 elements) and `tail.0.0.bias` (32
+elements) both crashed identically, so element count was not the cause --
+rank was. **Every earlier real-hardware training in this project's
+history happened to only train rank>=2 weight tensors** -- resnet18/50's
+conv/fc weights, LSTM/GRU's per-gate weight matrices -- which is almost
+certainly why this was never found before EDSR's own survey put a bias
+tensor directly in a trainable scope for the first time.
+
+**Fixed generically in `build_resident_step()` itself** (not an
+EDSR-specific patch): any rank-1 trainable tensor's whole per-step update
+now runs in rank-2 `[1, N]` space -- reshape in, `Mul`/`Sub`, reshape back
+-- transparent to the state tensor's own declared rank-1 shape at the
+step graph's I/O boundary, so calibration and every other caller see the
+exact same tensor shapes as before (the `fetch_calibration_data`
+`IndexError` an earlier attempt at this hit turned out to be an artifact
+of that attempt's own approach, not a real blocker of the reshape
+strategy itself -- calibrating the unchanged rank-1 I/O boundary directly,
+as `build_edsr_calib.py` already did, needed no special handling at all).
+Verified bit-exact against the un-reshaped math on host, and a dedicated
+regression test (`tests/test_build_resident_train_step.py`'s
+`test_rank1_state_update_is_reshaped_around_the_sub`) checks both the
+structural property (`Sub` never sees a bare rank-1 operand) and the
+numeric one (the implied gradient matches a central-difference check of
+the original graph, independent of `build_resident_step`'s own code).
 
 **Real numbers, `--scope tail --weights-only` (`tail.0.0.weight` +
 `tail.1.weight`, 58 nodes)**: compiles in **~30 seconds** (three real
@@ -156,6 +166,16 @@ mean `|grad|` for the two weights, measured directly) still rounds to
 zero under real INT8 quantization at that scale; `lr=10` diverges to NaN
 within a handful of real host SGD steps. `lr=1.0` is the confirmed
 working value, not a default guess.
+
+**With the rank-1 fix in place, `--scope tail` (all four tensors, both
+`Conv` weights and both biases, 72 nodes) now also compiles and trains on
+real hardware**: real `pulsar2:7.0-lite` build in **31.2s** (no
+compile-time cost from the extra reshapes), and real, monotonically
+decreasing loss at `lr=1.0` (`0.0914259 -> 0.0910601 -> 0.0906944 -> ... ->
+0.0895973` over 30 real steps, ~136 steps/s), confirmed genuinely
+gradient-driven via the same `lr=0` control (bit-identical loss across 10
+real steps). Bias tensors are trainable through this pipeline now, not
+just a documented future direction.
 
 **A second real gap found and fixed getting here, worth recording
 generically**: `export_edsr()`'s first version never seeded `torch`, so
@@ -176,9 +196,9 @@ EDSR does, so the same `DepthToSpace` coverage almost certainly transfers
 directly -- untried here, but a much smaller lift than EDSR's own first
 survey was, since the one real gap this domain has is now closed.
 
-The rank-1 `AxQuantizedSub` crash found above is not EDSR-specific --
+The rank-1 `AxQuantizedSub` crash found above was not EDSR-specific --
 any future domain training a bias tensor through this pipeline's in-graph
-SGD update will hit it. The reshape-to-rank-2-and-back workaround is the
-concrete next step for whoever wants bias tensors trainable generally,
-rather than working around it per-model as `trainable_scope`'s
-`weights_only` does here.
+SGD update would have hit it too. Already fixed generically in
+`build_resident_step()` itself (see "Real hardware" above), so no future
+domain needs its own per-model workaround the way `trainable_scope`'s
+`weights_only` flag did here before the fix.
