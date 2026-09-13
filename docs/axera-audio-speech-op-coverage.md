@@ -420,22 +420,62 @@ each op's packed `W`/`R` weight into one initializer per gate (four for
 LSTM, three for GRU) rather than leaving one packed tensor -- the same
 kind of topology change `act_weight_conv_to_matmul` already makes for a
 live-weight `Conv`. A resident training step built from an unrolled
-LSTM/GRU would train those per-gate tensors, not a single packed one; nothing
-downstream of this project's `build_resident_step()` convention currently
-teaches the trainable-weight finder to recognize the pre-split packed
-name, so this is host-verified only -- a real hardware run (compile,
-calibrate, train an unrolled decoder end to end) is the natural next step,
-not attempted here.
+LSTM/GRU trains those per-gate tensors, not a single packed one --
+correction to an earlier draft of this section: `build_resident_step()`
+needs nothing taught here at all, since `params` is already just a plain
+list of initializer names supplied by the caller, not an automatic
+finder; the real, if narrower, question settled below is whether
+`graph_grad.build_backward` can actually reach every one of those
+per-gate names once a real model's *other* forward-graph plumbing sits
+in the way.
+
+**Confirmed real, on real AX650N hardware.**
+`scripts/axera/build_parakeet_lstm_train_step.py` builds a resident step
+from the real Parakeet decoder (cut at its embedding-lookup output, fed
+straight to the unrolled LSTM stack -- `input_ids`' real `[batch, seq]`
+shape is a genuinely *batched* `Gather`, a case `graph_grad._grad_gather`'s
+own docstring declines on purpose to avoid a wrong-but-silent reshape, and
+nothing here needs the embedding table's own gradient anyway), training
+the first LSTM layer's 8 per-gate weights against `decoder_output` (the
+real `Concat`-built sequence output, not `Y_h`). Getting there surfaced one
+more real, load-bearing gap this doc's earlier sections did not need:
+`Squeeze` (a real node in Parakeet's own export, sitting between its two
+LSTM layers -- unrelated to anything `unroll_lstm` itself emits) had no
+`graph_grad` backward rule at all. Fixed as `onnxsim.graph_grad
+._grad_squeeze_or_unsqueeze` (a `Reshape` back to the input's own shape,
+identical math to `_grad_reshape`, registered for both `Squeeze` and
+`Unsqueeze`) -- the same "found real, fixed generically" pattern as every
+other gap this project's coverage checks have caught.
+
+With both fixes in place: real `pulsar2 build` (`pulsar2:7.0-lite`)
+compiled the 764-node unrolled step graph in **29 seconds** -- no compile-
+time blowup from the many small per-timestep nodes, the open question this
+section's own earlier draft flagged as worth watching. Real AX650N
+hardware, `lr=200` (a real host trajectory measured this layer's gradient
+at ~5.3e-6/element, two gates and a full second LSTM layer plus the output
+projector away from the loss -- comparable to wav2vec2's own "two real
+encoder layers deep" gradient scale elsewhere in this doc, and needing a
+similarly large `lr` to clear its own INT8 quantization step): **real,
+non-frozen loss** (`0.101409 -> 0.100904 -> ... -> 0.0998951`, settling into
+the same quantization-step plateau-with-occasional-noise signature this
+project's other real trainings runs show, not a smooth curve), 403 steps/s
+(2.4-2.5 ms/step). Confirmed genuine and `lr`-driven, not calibration noise
+on a frozen weight, the same control this project always runs: `lr=0`
+freezes the loss completely bit-identical across 10 real steps
+(`0.10494` every time), while `lr=200` visibly moves it.
 
 **Net for LSTM/GRU as a pair**: both gaps are closed at the legalization
-level. `LSTM` needed only a backward rule's worth of arithmetic, already
-NPU-executable as the opaque op; `GRU`'s fix is the bigger win, since
-unrolling is now the *only* way a `GRU`-containing model runs on this
-hardware at all, sidestepping the "Pulsar2 itself would need to support the
-op" ceiling a native-op fix would have hit. Both are registered in
-`legalize.TRAINING_RULES`, running before `graph_grad.build_backward` sees
-the graph, the same slot `act_weight_conv_to_matmul` already occupies for
-its own live-weight rewrite.
+level, and `LSTM`'s side is now confirmed end to end on real hardware, not
+just host-verified. `LSTM` needed only a backward rule's worth of
+arithmetic, already NPU-executable as the opaque op; `GRU`'s fix is the
+bigger win, since unrolling is now the *only* way a `GRU`-containing model
+runs on this hardware at all, sidestepping the "Pulsar2 itself would need
+to support the op" ceiling a native-op fix would have hit (not yet run on
+real hardware itself -- the natural remaining follow-on). Both are
+registered in `legalize.TRAINING_RULES`, running before
+`graph_grad.build_backward` sees the graph, the same slot
+`act_weight_conv_to_matmul` already occupies for its own live-weight
+rewrite.
 
 ## Do the two silent vendor bugs generalize?
 
