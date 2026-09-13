@@ -3369,6 +3369,117 @@ def quantize_fp8(
     )
 
 
+#: Ops most ONNX runtimes/NPU targets either refuse outright or support only
+#: partially -- what :func:`inline_local_functions` checks for after
+#: inlining and simplification. Matches the set the codebase already names
+#: informally elsewhere (e.g. :func:`quantize_fp8`'s own docstring above).
+_CONTROL_FLOW_OPS = frozenset({"If", "Loop", "Scan"})
+
+
+def inline_local_functions(
+    model: Union[str, onnx.ModelProto],
+    *,
+    convert_version: bool = True,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    skipped_optimizers: Optional[List[str]] = None,
+    extra_optimizers: Optional[List[str]] = None,
+) -> onnx.ModelProto:
+    """Inline every model-local function call, then verify no control flow
+    (``If``/``Loop``/``Scan``) survived.
+
+    :func:`simplify`'s own ``inline_functions=True`` already does the first
+    half of this -- inline, then run the full fixed point (shape inference,
+    constant folding, the optimizer's default pass set) so the result is not
+    left raw. That fixed point already includes onnx-optimizer's
+    ``eliminate_if_with_const_cond`` by default (see
+    ``tests/test_formal_verify_eliminate_if_with_const_cond.py`` for why it
+    is sound), so an ``If`` a function's body introduces is already
+    eliminated automatically *when its condition is resolvable at compile
+    time* -- collapsed into just the taken branch, inlined directly into the
+    parent graph.
+
+    What ``simplify(inline_functions=True)`` alone does not give you:
+
+    - A function living in its own domain needs that domain listed in the
+      model's own ``opset_import`` before the inliner -- or even
+      ``onnx.checker`` -- will look at it, which a model assembled by hand
+      (e.g. :mod:`onnxsim.qat_graph`'s ``GraphBuilder``) does not always
+      have; this fills it in first, so inlining does not silently no-op on a
+      hand-assembled graph the way it would otherwise.
+    - Confirmation that inlining actually finished the job: if a surviving
+      ``If``/``Loop``/``Scan``'s condition or trip count is not a compile-time
+      constant (real, data-dependent control flow), no pass can legally
+      eliminate it, and most ONNX runtimes -- particularly NPU/WebNN/WebGPU
+      execution providers -- do not execute it at all. Shipping that graph
+      to such a target fails at *inference* time with an opaque "unsupported
+      op" error, far from the inlining call that produced it. This raises
+      ``ValueError`` right here instead, naming exactly which node it is.
+
+    Returns a new :class:`onnx.ModelProto`; ``model`` is not modified.
+    Returns ``model`` unchanged (as a ``ModelProto`` if given a path) when it
+    has no local functions to inline.
+
+    :param model: onnx ModelProto object or file path
+    :param convert_version: passed to ``onnx.inliner.inline_local_functions``:
+            automatically convert a function's own opset version to the
+            model's before inlining it, rather than requiring them to
+            already match. Defaults to True, since a function is commonly
+            authored once, against a fixed opset, and then inlined into
+            models exported over time against a range of newer ones.
+    :param providers: forwarded to :func:`simplify` for its own constant
+            folding
+    :param skipped_optimizers: forwarded to :func:`simplify`
+    :param extra_optimizers: forwarded to :func:`simplify`
+    :raises ValueError: if an ``If``/``Loop``/``Scan`` node remains after
+            inlining and simplification -- see above
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if not model.functions:
+        return model
+
+    from onnx import inliner as onnx_inliner
+
+    # Every function's own domain has to be a model opset_import entry
+    # before the inliner will look at it at all -- see this function's own
+    # docstring. Copy first: onnx.inliner.inline_local_functions itself
+    # already returns a fresh ModelProto rather than mutating its argument,
+    # and this stays consistent with that instead of mutating the caller's
+    # model as a side effect of this fixup.
+    model = copy.deepcopy(model)
+    imported_domains = {entry.domain for entry in model.opset_import}
+    for fn in model.functions:
+        if fn.domain not in imported_domains:
+            model.opset_import.append(onnx.helper.make_opsetid(fn.domain, 1))
+            imported_domains.add(fn.domain)
+
+    inlined = onnx_inliner.inline_local_functions(
+        model, convert_version=convert_version
+    )
+    inlined, _ = simplify(
+        inlined,
+        skipped_optimizers=skipped_optimizers,
+        extra_optimizers=extra_optimizers,
+        providers=providers,
+    )
+
+    survivors = [
+        f"{node.op_type} {node.name!r}"
+        for node in inlined.graph.node
+        if node.op_type in _CONTROL_FLOW_OPS
+    ]
+    if survivors:
+        raise ValueError(
+            "inline_local_functions: control flow survived inlining and "
+            "simplification: " + ", ".join(survivors) + ". Most ONNX "
+            "runtimes do not execute If/Loop/Scan; this means a function's "
+            "condition or trip count is not a compile-time constant, so it "
+            "could not be eliminated automatically and needs a real fix "
+            "upstream rather than a legalizer pass."
+        )
+    return inlined
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
