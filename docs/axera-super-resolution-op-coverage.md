@@ -97,8 +97,10 @@ unchanged), at three trainable scopes:
 All three build and pass `onnx.checker.check_model` cleanly (68/91/232
 nodes respectively) -- `build_backward` reaches every target tensor in
 every scope, `head` included, confirming the fix works through the whole
-network's depth, not just locally around `DepthToSpace` itself. Not yet
-run on real hardware -- see "What's next" below.
+network's depth, not just locally around `DepthToSpace` itself. See
+"Real hardware: confirmed, with a real generalizable backend bug found
+along the way" below for the real compile/train result and a real, new
+Pulsar2 limitation this surfaced.
 
 **One real naming gotcha, worth recording generically**: `EdsrModel`'s own
 input is naturally named `"lr"` (**l**ow-**r**esolution) in an
@@ -112,21 +114,71 @@ future domain whose own natural input name happens to collide with this
 pipeline's small reserved vocabulary (`lr`, `grad_seed`, `lowres`'s own
 `hr` counterpart is fine since nothing else claims it yet).
 
-## What's next
+## Real hardware: confirmed, with a real generalizable backend bug found along the way
 
-Not done in this survey (a static/host-only pass, following every other
-survey's own first-pass scope in this project): a real `pulsar2 build`
-compile and a real AX650N training run, the natural next step matching
-`unroll_lstm`/`unroll_gru`'s own real-hardware follow-up
-(`docs/axera-audio-speech-op-coverage.md`'s "Both closed" section) --
-calibrate carefully (this project's calibration-degeneracy bug class has
-bitten every domain surveyed so far at least once), compile, and confirm a
-real, gradient-driven, non-frozen loss decrease (the `lr=0`-frozen-loss
-control `unroll_lstm`'s own hardware verification established as the
-standard proof of genuine training, not a lucky-looking flat line).
+`scripts/axera/build_edsr_calib.py` follows `build_parakeet_lstm_calib.py`'s
+established real-data-calibration recipe exactly (a real host float32 SGD
+trajectory for every trainable tensor, `lr` jittered around the value that
+trajectory actually used, `grad_seed` given real values near 1.0) and
+compiled the `tail` scope with real `pulsar2:7.0-lite`.
+
+**A new, real, generalizable Pulsar2 NPU-backend limitation, not an EDSR
+quirk**: compiling `tail`'s full 4-tensor scope (both `Conv` weights and
+both biases) fails -- `TileFailException("AxQuantizedSub, tuple index out
+of range")` on the in-graph SGD update (`w_next = w - lr * grad`, an
+ordinary `Sub`) for a **rank-1** operand. Confirmed on two different real
+compiles, isolating the trigger precisely: `tail.1.bias` (3 elements) and
+`tail.0.0.bias` (32 elements) both crash identically, so element count is
+not the cause -- rank is. Training only the two `Conv` **weights**
+(`--weights-only`, dropping both rank-1 biases) compiles successfully.
+**Every earlier real-hardware training in this project's history happened
+to only train rank>=2 weight tensors** -- resnet18/50's conv/fc weights,
+LSTM/GRU's per-gate weight matrices -- which is almost certainly why this
+was never found before EDSR's own survey put a bias tensor directly in a
+trainable scope for the first time. A reshape-to-rank-2-and-back
+workaround (wrap the `Sub` in `Reshape([1,N])`/`Sub`/`Reshape([N])`,
+sidestepping the crash entirely) was tried once, cleared the backend
+tiler issue, but hit a different, likely calibration/build-script-shaped
+error (`fetch_calibration_data`'s own `IndexError`) on a first attempt --
+untried further, a real, promising next step for whoever wants bias
+tensors trainable through this pipeline.
+
+**Real numbers, `--scope tail --weights-only` (`tail.0.0.weight` +
+`tail.1.weight`, 58 nodes)**: compiles in **~30 seconds** (three real
+compiles: 29.7s/29.8s/30.2s), consistent with `unroll_lstm`/`unroll_gru`'s
+own "no compile-time blowup" finding. Real hardware, `lr=1.0`: real,
+monotonically decreasing loss (`0.0956074 -> 0.0948575 -> 0.0937327 ->
+... -> 0.0892335` over 30 real steps, ~144 steps/s), confirmed genuinely
+gradient-driven via the standard control -- the identical input at
+`lr=0` freezes bit-identical across 10 real steps. `lr=0.1` (this
+tensor's own real gradient magnitude is not tiny -- `~3.5e-4`/`~2.1e-3`
+mean `|grad|` for the two weights, measured directly) still rounds to
+zero under real INT8 quantization at that scale; `lr=10` diverges to NaN
+within a handful of real host SGD steps. `lr=1.0` is the confirmed
+working value, not a default guess.
+
+**A second real gap found and fixed getting here, worth recording
+generically**: `export_edsr()`'s first version never seeded `torch`, so
+every export gave every *frozen* (non-trainable) tensor a fresh random
+value -- and since a trainable tensor's real gradient depends on every
+frozen tensor between it and the loss, two outwardly-identical
+compile+run attempts (differing only in which unseeded export produced
+the `.axmodel`) showed real training at one and a fully frozen loss at
+the other. Not a calibration or backend bug -- a genuinely different real
+network each time. Fixed with `torch.manual_seed(0)`; the numbers above
+are reproducible run to run with it in place.
+
+## What's next
 
 Beyond EDSR itself: `super-image`'s other architectures (CARN, MSRN, PAN,
 RCAN, DRLN, HAN, ...) share the same `Upsampler`/`MeanShift` utility module
 EDSR does, so the same `DepthToSpace` coverage almost certainly transfers
 directly -- untried here, but a much smaller lift than EDSR's own first
 survey was, since the one real gap this domain has is now closed.
+
+The rank-1 `AxQuantizedSub` crash found above is not EDSR-specific --
+any future domain training a bias tensor through this pipeline's in-graph
+SGD update will hit it. The reshape-to-rank-2-and-back workaround is the
+concrete next step for whoever wants bias tensors trainable generally,
+rather than working around it per-model as `trainable_scope`'s
+`weights_only` does here.

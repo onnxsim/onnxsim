@@ -67,11 +67,25 @@ LR_SIZE = 16
 
 
 def export_edsr(out_path: str) -> None:
-    """Writes a real, unmodified (tiny-config) EDSR to `out_path`."""
+    """Writes a real, unmodified (tiny-config) EDSR to `out_path`.
+
+    Seeded (`torch.manual_seed(0)`): a real, found-the-hard-way gap in an
+    earlier version of this function -- an unseeded export gives every
+    *frozen* (non-trainable) tensor a fresh random value each call, which
+    changes the actual gradient magnitude a trainable tensor downstream of
+    it sees. Two otherwise-identical real-hardware runs, differing only in
+    which unseeded export produced the compiled `.axmodel`, showed real
+    training at one and a fully frozen loss at the other -- not a
+    calibration or backend bug, just an unseeded random network genuinely
+    having different real gradients call to call. Seeding here is what
+    makes the real-hardware result in `docs/axera-super-resolution-op-
+    coverage.md` reproducible rather than a one-off.
+    """
     import torch
     from super_image.models.edsr.configuration_edsr import EdsrConfig
     from super_image.models.edsr.modeling_edsr import EdsrModel
 
+    torch.manual_seed(0)
     cfg = EdsrConfig(scale=SCALE, n_resblocks=N_RESBLOCKS, n_feats=N_FEATS, n_colors=3)
     model = EdsrModel(cfg).eval()
     lowres = torch.randn(1, 3, LR_SIZE, LR_SIZE)
@@ -127,7 +141,9 @@ def add_mse_loss_nchw(model: onnx.ModelProto, sr: str) -> onnx.ModelProto:
     return out
 
 
-def trainable_scope(fwd: onnx.ModelProto, scope: str = "tail") -> list:
+def trainable_scope(
+    fwd: onnx.ModelProto, scope: str = "tail", weights_only: bool = False
+) -> list:
     """`{scope}`'s float32 weight/bias initializers, in first-use order --
     `"tail"` (default): the upsampler's widening `Conv` plus the final
     color-channel `Conv`, the tensors closest to the newly-covered
@@ -136,12 +152,30 @@ def trainable_scope(fwd: onnx.ModelProto, scope: str = "tail") -> list:
     scope is chosen for); `"head"`: the first `Conv`, requiring a gradient
     through every residual block *and* `DepthToSpace` to reach it -- the
     fuller, harder-to-reach scope; `"all"`: every trainable tensor.
+
+    `weights_only` (default `False`) drops every rank-1 (bias) tensor from
+    the result. **Real hardware finding, not a style preference**: a
+    resident training step's in-graph SGD update (`w_next = w - lr *
+    grad`, an ordinary `Sub`) crashes Pulsar2's own NPU backend tiler on a
+    rank-1 operand -- confirmed on two different real compiles here (a
+    3-element and a 32-element bias, both `TileFailException("
+    AxQuantizedSub, tuple index out of range")`), so size is not the
+    trigger, rank is. `scope="tail"`/`"head"`/`"all"` all include real
+    bias tensors and will hit this on real hardware; every earlier domain
+    in this project happened to only train rank>=2 weight tensors, which
+    is almost certainly why this was never found before EDSR's own survey.
+    See `docs/axera-super-resolution-op-coverage.md`'s real-hardware
+    section for the confirmed compile/train result this scope produces,
+    and for a reshape-to-rank-2-and-back workaround idea that hit a
+    different (calibration/build-script, not backend) error on a first
+    attempt -- untried further, a real next step.
     """
     float_inits = {
         i.name
         for i in fwd.graph.initializer
         if i.data_type == TensorProto.FLOAT and len(i.dims) >= 1
     }
+    ranks = {i.name: len(i.dims) for i in fwd.graph.initializer}
     seen, seenset = [], set()
     for n in fwd.graph.node:
         for inp in n.input:
@@ -150,18 +184,30 @@ def trainable_scope(fwd: onnx.ModelProto, scope: str = "tail") -> list:
                 seen.append(inp)
 
     if scope == "all":
-        return seen
-    if scope == "head":
-        return [p for p in seen if p.startswith("head.")]
-    if scope == "tail":
-        return [p for p in seen if p.startswith("tail.")]
-    raise ValueError(f"unknown scope {scope!r}")
+        result = seen
+    elif scope == "head":
+        result = [p for p in seen if p.startswith("head.")]
+    elif scope == "tail":
+        result = [p for p in seen if p.startswith("tail.")]
+    else:
+        raise ValueError(f"unknown scope {scope!r}")
+    if weights_only:
+        result = [p for p in result if ranks[p] != 1]
+    return result
 
 
 def main(argv=None) -> int:
     parser_ = argparse.ArgumentParser(description=__doc__)
     parser_.add_argument("out_dir")
     parser_.add_argument("--scope", choices=["head", "tail", "all"], default="tail")
+    parser_.add_argument(
+        "--weights-only",
+        action="store_true",
+        help=(
+            "drop rank-1 (bias) tensors -- required for a real Pulsar2 "
+            "compile today, see trainable_scope()'s own docstring"
+        ),
+    )
     args = parser_.parse_args(argv)
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -172,7 +218,7 @@ def main(argv=None) -> int:
     sr_name = model.graph.output[0].name
     fwd = add_mse_loss_nchw(model, sr_name)
 
-    params = trainable_scope(fwd, args.scope)
+    params = trainable_scope(fwd, args.scope, weights_only=args.weights_only)
     print(f"=== {args.scope}: {len(params)} tensors ===")
     for p in params:
         print(" ", p)

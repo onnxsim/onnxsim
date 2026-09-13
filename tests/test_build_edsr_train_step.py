@@ -67,14 +67,17 @@ def test_mse_loss_reduces_over_every_axis_explicitly():
     assert list(axes_attr.ints) == [0, 1, 2, 3]
 
 
-def _fwd_with_params(names):
+def _fwd_with_params(names, shapes=None):
     """A model with one `Conv` per name in `names`, so `trainable_scope`
-    has real initializers to filter by prefix."""
+    has real initializers to filter by prefix. `shapes` (default: every
+    name gets a rank-1 `(1,)` tensor) maps a name to its own shape, for
+    `weights_only`'s rank filter."""
+    shapes = shapes or {}
     model = onnx.ModelProto()
     model.CopyFrom(_sr_model())
     for i, name in enumerate(names):
         model.graph.initializer.append(
-            numpy_helper.from_array(np.zeros((1,), np.float32), name)
+            numpy_helper.from_array(np.zeros(shapes.get(name, (1,)), np.float32), name)
         )
         model.graph.node.append(
             onnx.helper.make_node("Identity", [name], [f"unused_{i}"])
@@ -101,3 +104,30 @@ def test_trainable_scope_rejects_an_unknown_name():
         pass
     else:
         raise AssertionError("expected ValueError for an unknown scope")
+
+
+def test_trainable_scope_weights_only_drops_rank1_bias_tensors():
+    """Real hardware finding, not a style preference: a rank-1 tensor's
+    in-graph SGD `Sub` crashes Pulsar2's own NPU backend tiler
+    (`docs/axera-super-resolution-op-coverage.md`'s real-hardware
+    section) -- confirmed on two different bias shapes there, so this
+    filters by rank alone, not by name or size."""
+    fwd = _fwd_with_params(
+        ["tail.0.0.weight", "tail.0.0.bias", "tail.1.weight", "tail.1.bias"],
+        shapes={
+            "tail.0.0.weight": (32, 8, 3, 3),
+            "tail.0.0.bias": (32,),
+            "tail.1.weight": (3, 8, 3, 3),
+            "tail.1.bias": (3,),
+        },
+    )
+    assert m.trainable_scope(fwd, "tail", weights_only=True) == [
+        "tail.0.0.weight",
+        "tail.1.weight",
+    ]
+    assert m.trainable_scope(fwd, "tail", weights_only=False) == [
+        "tail.0.0.weight",
+        "tail.0.0.bias",
+        "tail.1.weight",
+        "tail.1.bias",
+    ]

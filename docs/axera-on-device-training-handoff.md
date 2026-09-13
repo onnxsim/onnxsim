@@ -1296,6 +1296,24 @@ back.
 **The general lesson:** a graph that needs an op *gone* must be shaped so
 nothing can put it back. Suppressing your own optimizer is half the job.
 
+**A third, found later: a rank-1 in-graph SGD update crashes the NPU
+backend tiler.** `docs/axera-super-resolution-op-coverage.md`'s real-
+hardware section: `w_next = w - lr * grad` (an ordinary `Sub`,
+`build_resident_step()`'s own in-graph update every resident training
+step in this project uses) fails with `TileFailException("AxQuantizedSub,
+tuple index out of range")` whenever `w` is rank-1 -- confirmed on two
+different bias shapes (3 and 32 elements), so rank is the trigger, not
+size. Every earlier real-hardware training in this project happened to
+only train rank>=2 weight tensors, which is why this was never found
+before EDSR's own survey put a bias tensor in a trainable scope for the
+first time. Likely the same family of fix as `_unfusable_bias` above --
+reshape to `[1, N]` around the op the backend cannot lower at the
+troublesome rank/shape -- and a first attempt at exactly that reshape did
+clear the tiler crash, but hit a different (calibration/build-script,
+not backend) error before a real compile finished; not chased to a
+working fix here, a real next step for whoever wants bias tensors
+trainable through this pipeline.
+
 ## The rules
 
 `legalize.TRAINING_RULES`, in an order that matters --
