@@ -1933,7 +1933,7 @@ def _grad_depth_to_space(
             f"DepthToSpace with a non-static or non-rank-4 input shape "
             f"{shape} is not differentiated here (node {node.output[0]!r})"
         )
-    n, c, h, w = shape
+    n, c, h, w = (int(d) for d in shape)
     bs = int(_attr(node, "blocksize", 0))
     mode = _attr(node, "mode", "DCR")
     if isinstance(mode, bytes):
