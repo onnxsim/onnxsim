@@ -647,6 +647,82 @@ def test_resident_dataset_flatten_matches_native_shape_gather():
     np.testing.assert_array_equal(y_flat, y_native)
 
 
+def test_fold_constants_preserves_every_initializer_a_real_bug_dropped():
+    """A real bug found building `scripts/axera/legalize.py`'s `unroll_gru`
+    onto real hardware (`docs/axera-audio-speech-op-coverage.md`'s "Both
+    closed" section): `_fold_constants`'s `onnxsim.simplify()` call, with
+    that function's own default `initializers_as_constants=True`, silently
+    *dropped* `unroll_gru`'s freshly-created per-gate `W`/`R` weight
+    initializers for this exact graph shape -- no error, `build_resident_
+    step` only failing several steps later, unable to find `params` by
+    name any more. `unroll_lstm`'s own output happened not to trigger the
+    same optimizer behavior, so this needs its own graph to catch a
+    regression -- a plain resnet-shaped model (`test_fold_constants_is_a_
+    noop_without_any_constant_nodes`, above) never exercises this path at
+    all, since it has no `Constant` node to trigger `_fold_constants` in
+    the first place.
+    """
+    from _local_import import fresh
+    from onnx import helper, numpy_helper
+
+    legalize = fresh("legalize", _AXERA_DIR)
+
+    seq, batch, inp, hid = 3, 1, 4, 4
+    rng = np.random.RandomState(0)
+    w = rng.randn(1, 3 * hid, inp).astype(np.float32) * 0.3
+    r = rng.randn(1, 3 * hid, hid).astype(np.float32) * 0.3
+    b = rng.randn(1, 6 * hid).astype(np.float32) * 0.1
+
+    gru = helper.make_node(
+        "GRU",
+        ["x", "W", "R", "B", "", ""],
+        ["gru_y", "gru_yh"],
+        hidden_size=hid,
+        linear_before_reset=1,
+        name="mygru",
+    )
+    # A real `Constant` node -- needed to trigger `_fold_constants` at all
+    # (it is a no-op, by design, on a graph without one).
+    one = helper.make_node(
+        "Constant",
+        [],
+        ["one"],
+        value=numpy_helper.from_array(np.array(1.0, np.float32)),
+    )
+    diff = helper.make_node("Sub", ["gru_y", "target"], ["diff"])
+    scaled = helper.make_node("Mul", ["diff", "one"], ["scaled"])
+    sq = helper.make_node("Mul", ["scaled", "scaled"], ["sq"])
+    loss = helper.make_node(
+        "ReduceMean", ["sq"], ["loss"], axes=[0, 1, 2, 3], keepdims=0
+    )
+    graph = helper.make_graph(
+        [gru, one, diff, scaled, sq, loss],
+        "g",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [seq, batch, inp]
+            ),
+            helper.make_tensor_value_info(
+                "target", onnx.TensorProto.FLOAT, [seq, 1, batch, hid]
+            ),
+        ],
+        [helper.make_tensor_value_info("loss", onnx.TensorProto.FLOAT, [])],
+        initializer=[_f32(w, "W"), _f32(r, "R"), _f32(b, "B")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    legalize.unroll_gru(model)
+    onnx.checker.check_model(model)
+
+    params = [f"mygru_w{i}" for i in range(3)] + [f"mygru_r{i}" for i in range(3)]
+    before_names = {i.name for i in model.graph.initializer}
+    assert set(params) <= before_names
+
+    step_model, state = brts.build_resident_step(model, params, loss_output="loss")
+    onnx.checker.check_model(step_model)
+    assert set(state) == set(params)
+
+
 def test_fold_constants_is_a_noop_without_any_constant_nodes():
     """`build_resident_step` only pays for `_fold_constants`'s simplify()
     pass when the graph actually has a `Constant` node -- confirm a plain

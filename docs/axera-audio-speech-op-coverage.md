@@ -464,18 +464,72 @@ on a frozen weight, the same control this project always runs: `lr=0`
 freezes the loss completely bit-identical across 10 real steps
 (`0.10494` every time), while `lr=200` visibly moves it.
 
+**`GRU` confirmed real, on real AX650N hardware too** -- the natural
+follow-on the previous paragraph named. `WaveRNN`'s own export still can't
+be used directly (its unrelated `torch.onnx` exporter bug, confirmed not a
+quick fix: reproduced identically across every opset 13-18 tried), so this
+used `scripts/axera/build_gru_decoder_probe.py` -- the same
+`nn.Embedding -> nn.GRU -> nn.Linear` decoder shape `ParakeetRNNTDecoder`
+uses, `nn.LSTM` swapped for `nn.GRU`, at the identical scale
+(`hidden_size=32`, 2 layers) for a direct comparison. `scripts/axera/
+build_gru_decoder_train_step.py`/`build_gru_decoder_calib.py` mirror the
+LSTM scripts exactly: cut at the embedding output, `unroll_gru`-legalized,
+6 per-gate weights (`z, r, h`) of the first GRU layer trained against the
+real `decoder_output`.
+
+Getting there surfaced two more real, generically-fixed gaps -- one on
+each side of the pipeline:
+
+- **A real host-side bug, found by `unroll_gru`'s output specifically**:
+  `build_resident_step`'s own pre-`build_backward` constant-folding pass
+  (`_fold_constants`) calls `onnxsim.simplify()` with that function's
+  default `initializers_as_constants=True` -- fine when `params` survive
+  untouched, but for this graph the optimizer silently *dropped* the
+  per-gate `W`/`R` initializers `unroll_gru` had just created (no error;
+  `build_resident_step` only noticed several steps later, unable to find
+  `params` by name any more). `unroll_lstm`'s own output happened not to
+  trigger the same optimizer behavior -- exactly the kind of silent,
+  model-specific failure worth closing off generally rather than routing
+  around once. Fixed by passing `initializers_as_constants=False`
+  explicitly at that call site.
+- **A real Pulsar2 PPQ quantizer limitation, found only once compilation
+  was reached**: the reset-gate term's own `Add(nhr, nrb)` (both operands
+  lacking an unambiguous "real, input-derived" tensor to anchor the
+  quantizer's platform-assignment tracer to, unlike `_lstm_step`'s
+  equivalent `Add(xw, hr)`, whose `xw` operand is obviously real) failed
+  to compile with `RuntimeError: Op Execution Error ... TargetPlatform.
+  UNSPECIFIED`, reproduced in a minimal, isolated unrolled-`GRU`-only step
+  graph (not specific to this decoder). Fixed losslessly by distributing
+  the multiplication algebraically -- `rt*(nhr+nrb)` computed as
+  `rt*nhr + rt*nrb` instead (identical by the distributive law), which
+  gives every intermediate an unambiguous real anchor (`rt`) the way
+  `_lstm_step`'s gates already have. Confirmed both changes preserve
+  `unroll_gru`'s own numerical exactness (`tests/test_axera_legalize.py`
+  unchanged, still passing) before compiling for real.
+
+With both fixed: real `pulsar2 build` (`pulsar2:7.0-lite`) compiled the
+646-node unrolled step graph in **26.6 seconds** -- comparable to `LSTM`'s
+own 29s, no compile-time blowup here either. Real AX650N hardware,
+`lr=200`: **real, non-frozen loss** (`0.0928868 -> 0.0910008 -> ... ->
+0.0867572` over the first dozen steps, then the same quantization-step
+plateau-with-noise signature every other real training in this project
+shows), ~480 steps/s (~2.0-2.1 ms/step). Confirmed genuinely gradient-driven
+with the same control every real result here uses: `lr=0` freezes the loss
+completely bit-identical across 10 real steps (`0.110333` every time),
+while `lr=200` visibly and immediately moves it.
+
 **Net for LSTM/GRU as a pair**: both gaps are closed at the legalization
-level, and `LSTM`'s side is now confirmed end to end on real hardware, not
-just host-verified. `LSTM` needed only a backward rule's worth of
-arithmetic, already NPU-executable as the opaque op; `GRU`'s fix is the
-bigger win, since unrolling is now the *only* way a `GRU`-containing model
-runs on this hardware at all, sidestepping the "Pulsar2 itself would need
-to support the op" ceiling a native-op fix would have hit (not yet run on
-real hardware itself -- the natural remaining follow-on). Both are
-registered in `legalize.TRAINING_RULES`, running before
-`graph_grad.build_backward` sees the graph, the same slot
-`act_weight_conv_to_matmul` already occupies for its own live-weight
-rewrite.
+level, and now confirmed end to end on real hardware, not just
+host-verified. `LSTM` needed only a backward rule's worth of arithmetic,
+already NPU-executable as the opaque op; `GRU`'s fix was the bigger win,
+since unrolling is the *only* way a `GRU`-containing model runs on this
+hardware at all, sidestepping the "Pulsar2 itself would need to support the
+op" ceiling a native-op fix would have hit -- and, unlike `LSTM`, needed one
+additional real fix (the distributive reset-gate reformulation above)
+before Pulsar2's own quantizer would accept it at all. Both are registered
+in `legalize.TRAINING_RULES`, running before `graph_grad.build_backward`
+sees the graph, the same slot `act_weight_conv_to_matmul` already occupies
+for its own live-weight rewrite.
 
 ## Do the two silent vendor bugs generalize?
 
