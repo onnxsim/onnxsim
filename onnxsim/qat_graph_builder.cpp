@@ -156,6 +156,16 @@ std::string GraphBuilder::Const(const std::vector<float>& values,
   return name;
 }
 
+std::string GraphBuilder::SharedConst(float value, const std::string& hint) {
+  uint32_t key = 0;
+  std::memcpy(&key, &value, sizeof(key));
+  auto it = shared_consts_.find(key);
+  if (it != shared_consts_.end()) return it->second;
+  const std::string name = Const(value, hint);
+  shared_consts_.emplace(key, name);
+  return name;
+}
+
 std::string GraphBuilder::ConstInt64(const std::vector<int64_t>& values,
                                      const std::string& hint) {
   const std::string name = Name(hint);
@@ -313,12 +323,12 @@ AdamOutputs AdamUpdate(GraphBuilder& b, const std::string& param,
                        const std::string& v, const std::string& lr,
                        const std::string& m_correction,
                        const std::string& v_correction, float eps) {
-  const std::string beta1 = b.Const(kAdamBeta1);
-  const std::string beta2 = b.Const(kAdamBeta2);
+  const std::string beta1 = b.SharedConst(kAdamBeta1, "beta1");
+  const std::string beta2 = b.SharedConst(kAdamBeta2, "beta2");
   const std::string one_minus_beta1 =
-      b.Const(static_cast<float>(1.0 - kBeta1Double));
+      b.SharedConst(static_cast<float>(1.0 - kBeta1Double), "one_minus_beta1");
   const std::string one_minus_beta2 =
-      b.Const(static_cast<float>(1.0 - kBeta2Double));
+      b.SharedConst(static_cast<float>(1.0 - kBeta2Double), "one_minus_beta2");
 
   // Every nesting in adam_update is flattened here for the argument-order
   // reason above; the left-to-right order of these locals *is* the Python's.
@@ -336,7 +346,7 @@ AdamOutputs AdamUpdate(GraphBuilder& b, const std::string& param,
 
   const std::string numerator = b.Mul(lr, m_hat);
   const std::string root = b.Sqrt(v_hat);
-  const std::string epsilon = b.Const(eps);
+  const std::string epsilon = b.SharedConst(eps, "eps");
   const std::string denominator = b.Add(root, epsilon);
   const std::string step = b.Div(numerator, denominator);
 
@@ -347,7 +357,7 @@ SgdMomentumOutputs SgdMomentumUpdate(GraphBuilder& b, const std::string& param,
                                      const std::string& grad,
                                      const std::string& mom,
                                      const std::string& lr, float momentum) {
-  const std::string momentum_const = b.Const(momentum);
+  const std::string momentum_const = b.SharedConst(momentum, "momentum");
 
   // Sequenced in the Python's left-to-right order, as AdamUpdate's own locals
   // above are: `b.add(b.mul(momentum_const, mom), grad)`.

@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -98,6 +99,17 @@ class GraphBuilder {
   std::string Const(const std::vector<float>& values,
                     const std::vector<int64_t>& dims,
                     const std::string& hint = "c");
+
+  // Like Const(float, hint), but returns the same initializer for an
+  // identical value requested more than once on this builder. Matches
+  // qat_graph.GraphBuilder.shared_const exactly: AdamUpdate/
+  // SgdMomentumUpdate use it for their own fixed hyperparameters (beta1,
+  // beta2, eps, momentum), which every caller re-derives from the same
+  // float on every call, once per trained parameter. The parity fixture
+  // compares tensor names bit-for-bit (see this class's own comment
+  // above), so this side must dedup identically -- same key, same hint --
+  // or the two emitters would number their initializers differently.
+  std::string SharedConst(float value, const std::string& hint = "c");
   // An int64 initializer -- the shape/axes operand form Reshape and the
   // opset-13 Reduce ops take as a tensor input rather than an attribute.
   std::string ConstInt64(const std::vector<int64_t>& values,
@@ -184,6 +196,8 @@ class GraphBuilder {
   std::set<std::pair<std::string, std::string>> function_ids_;
   std::string prefix_;
   int64_t counter_ = 0;
+  // Keyed by the float's raw bit pattern -- see SharedConst.
+  std::unordered_map<uint32_t, std::string> shared_consts_;
 };
 
 // Appends one Adam step to `b` and returns (param', m', v').

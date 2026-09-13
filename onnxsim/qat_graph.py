@@ -264,6 +264,7 @@ class GraphBuilder:
         self._function_ids: set = set()
         self._prefix = prefix
         self._counter = 0
+        self._shared_consts: Dict[Tuple[str, bytes], str] = {}
 
     def name(self, hint: str = "t") -> str:
         self._counter += 1
@@ -274,6 +275,30 @@ class GraphBuilder:
         array = np.asarray(value, dtype=np.float32)
         name = self.name(hint)
         self.initializer.append(onnx.numpy_helper.from_array(array, name))
+        return name
+
+    def shared_const(self, value, hint: str = "c") -> str:
+        """Like :meth:`const`, but returns the same initializer for an
+        identical (shape, value) requested more than once on this builder.
+
+        For a genuinely per-call constant, :meth:`const` is what every rule
+        in :mod:`onnxsim.graph_grad` already uses. This is for the opposite
+        case: a *shared* hyperparameter -- Adam's beta1/beta2/eps, SGD
+        momentum's own decay -- that :func:`adam_update`/
+        :func:`sgd_momentum_update` re-derive from the same Python float on
+        every call, once per trained parameter. Without interning, a step
+        graph training ``N`` parameters carries ``N`` duplicate copies of
+        each one, all needing :func:`onnxsim.onnx_simplifier.simplify`'s
+        CSE to merge back down after the fact; this avoids creating the
+        duplicates in the first place.
+        """
+        array = np.asarray(value, dtype=np.float32)
+        key = (array.shape, array.tobytes())
+        cached = self._shared_consts.get(key)
+        if cached is not None:
+            return cached
+        name = self.const(array, hint)
+        self._shared_consts[key] = name
         return name
 
     def op(
@@ -432,17 +457,24 @@ def adam_update(
     counter inside the graph: they are two host-side floats per step, so
     computing them outside costs nothing and keeps the graph free of the state
     that a ``Pow`` over a step counter would need.
+
+    beta1/beta2/eps are looked up with :meth:`GraphBuilder.shared_const`, not
+    :meth:`GraphBuilder.const`: a caller updating several parameters against
+    the same ``b`` (every caller in this codebase) passes the same three
+    Python floats to every call, so interning them avoids leaving one
+    duplicate initializer per parameter for simplify()'s CSE to merge back
+    down afterward.
     """
-    beta1 = b.const(ADAM_BETA1)
-    beta2 = b.const(ADAM_BETA2)
-    one_minus_beta1 = b.const(1.0 - ADAM_BETA1)
-    one_minus_beta2 = b.const(1.0 - ADAM_BETA2)
+    beta1 = b.shared_const(ADAM_BETA1, "beta1")
+    beta2 = b.shared_const(ADAM_BETA2, "beta2")
+    one_minus_beta1 = b.shared_const(1.0 - ADAM_BETA1, "one_minus_beta1")
+    one_minus_beta2 = b.shared_const(1.0 - ADAM_BETA2, "one_minus_beta2")
 
     m_next = b.add(b.mul(beta1, m), b.mul(one_minus_beta1, grad))
     v_next = b.add(b.mul(beta2, v), b.mul(one_minus_beta2, b.mul(grad, grad)))
     m_hat = b.mul(m_next, m_correction)
     v_hat = b.mul(v_next, v_correction)
-    step = b.div(b.mul(lr, m_hat), b.add(b.sqrt(v_hat), b.const(eps)))
+    step = b.div(b.mul(lr, m_hat), b.add(b.sqrt(v_hat), b.shared_const(eps, "eps")))
     param_next = b.sub(param, step)
     return param_next, m_next, v_next
 
@@ -468,12 +500,13 @@ def sgd_momentum_update(
         param' = param - lr * mom'
 
     ``momentum`` is a plain Python float baked into the graph as a constant
-    with :meth:`GraphBuilder.const`, exactly like ``eps`` in :func:`adam_update`
-    -- not a per-step scalar input the way ``lr`` is. This is a real,
-    deliberate limitation rather than an oversight: a step graph built with
-    this function can anneal ``lr`` from one step to the next (it is fed
-    fresh every call to :func:`run_step_graph`), but ``momentum`` is fixed for
-    the life of the graph -- changing it means building a new step graph.
+    with :meth:`GraphBuilder.shared_const`, exactly like ``eps`` in
+    :func:`adam_update` -- not a per-step scalar input the way ``lr`` is.
+    This is a real, deliberate limitation rather than an oversight: a step
+    graph built with this function can anneal ``lr`` from one step to the
+    next (it is fed fresh every call to :func:`run_step_graph`), but
+    ``momentum`` is fixed for the life of the graph -- changing it means
+    building a new step graph.
     Nothing in this optimizer's current callers needs a per-step momentum
     schedule, and keeping it a constant keeps the graph one input smaller.
 
@@ -491,11 +524,11 @@ def sgd_momentum_update(
     same slow warm-up plain SGD momentum has always had rather than paying
     for a correction the algebra does not need.
 
-    Uses only :meth:`GraphBuilder.const`/:meth:`add`/:meth:`mul`/:meth:`sub` --
-    no ``div``/``sqrt``, since there is no second moment or epsilon-guarded
-    denominator to compute.
+    Uses only :meth:`GraphBuilder.shared_const`/:meth:`add`/:meth:`mul`/
+    :meth:`sub` -- no ``div``/``sqrt``, since there is no second moment or
+    epsilon-guarded denominator to compute.
     """
-    momentum_const = b.const(momentum)
+    momentum_const = b.shared_const(momentum, "momentum")
     mom_next = b.add(b.mul(momentum_const, mom), grad)
     step = b.mul(lr, mom_next)
     param_next = b.sub(param, step)
