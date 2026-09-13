@@ -1249,15 +1249,16 @@ indices once the row count moved below that).
 real hardware** for a conv-shaped dataset up to a real, measured 190-row
 ceiling for this shape -- the pre-flattened-view fix this section originally
 named as untried is confirmed to work, not merely plausible. `scripts/axera/
-tools/gather_runner.c` (this section's own runner) also fixed a real,
-separate latent bug found while building this: **neither `resident_runner.c`
+tools/gather_runner.c` (this section's own runner) also flagged a real,
+separate latent bug while building this: **neither `resident_runner.c`
 nor `whisper_resident_runner.c` actually feeds `grad_seed`** (added as a
 real graph input by the FP32-gradient-seed work above) -- both allocate its
 buffer but never write to it, leaving it as whatever device memory happened
-to contain. Still outstanding in both (this section's own fix only touched
-`gather_runner.c`, which already fed it correctly) -- worth fixing in
-either if either is used again for a real measurement rather than a
-correctness check.
+to contain. **Audited below ("Audited: the 'unfed grad_seed' scare"
+section): a real gap, but zero actual impact** -- every model either
+runner has ever actually been run against predates `grad_seed`'s promotion
+to a graph input, so nothing this project has reported was affected. Both
+runners were fixed regardless, for any future rebuild.
 
 ## Two vendor bugs, both silent
 
