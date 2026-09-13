@@ -651,6 +651,18 @@ def make_step_graph(
                 "fuse_matmul_add_bias_into_gemm",
                 "fuse_transpose_into_gemm",
             ],
+            # A step graph's nodes all come from this module's and
+            # graph_grad's own hand-written op vocabulary (plain default-
+            # domain ops), never a caller's custom onnx.defs.register_schema
+            # operator -- and any local FunctionProto calls are already
+            # inlined above via onnx.inliner.inline_local_functions. So
+            # simplify()'s default schema-bridging scan of the *entire* onnx
+            # operator registry (import_onnx_schemas(), on by default to
+            # support custom ops elsewhere) never finds anything to import
+            # here, yet still costs a few milliseconds every call -- pure
+            # waste for a helper called once per layer/candidate in tight
+            # loops like adaround's and adaquant's.
+            import_custom_schemas=False,
         )
     return StepGraph(
         model=model,
