@@ -838,11 +838,20 @@ and the step uses loss scaling with eps=1e-3, since default fp16 compute
 zeroes Adam's 1e-8 epsilon and underflows small gradients (the same fp16
 backward-underflow class maderix documents).
 
-Measured on real hardware (M4 Mac mini, 1024-2048-1024 MLP, batch 256,
-~4.2M params): the whole step (forward + backward + Adam) places **100% on
-ANE**, and loss falls 0.80 -> 0.37 over 15 steps, tracking the CPU and
-ONNX-Runtime references. Per-step time is 10.3ms on ANE vs. 9.7ms CPU --
-~50MB of weights/moments cross the `predict()` boundary per step, so
-transfers dominate at this size; a resident-weight loop (maderix's IOSurface
-approach) would be needed to chase their throughput rather than just their
-placement.
+Measured on real hardware (M4 Mac mini), loss falls identically on both
+paths (e.g. 0.80 -> 0.37 over 15 steps at the default size, tracking the
+CPU and ONNX-Runtime references). Scaling the step up, the whole graph
+stays 100% ANE-placed at every size, and the NPU pulls ahead once compute
+dominates the per-step state traffic (~50MB at S1, ~800MB at S3):
+
+| Size (batch-dim-hidden-out, params) | CPU | ANE | Loss (both paths) |
+|---|---|---|---|
+| S1: 256-1024-2048-1024 (~4M) | 9.7ms | 10.3ms | 0.80 -> 0.37 |
+| S2: 512-2048-4096-2048 (~25M) | 50.6ms | 50.9ms | 0.79 -> 0.42 |
+| S3: 1024-2048-8192-2048 (~100M) | 133.1ms | 109.3ms | 0.79 -> 0.43 |
+
+Per-step time is dominated by weights/moments crossing the `predict()`
+boundary plus ~90us of dispatch per op (the floor `inmem_bench` measures),
+so these ratios understate in-place ANE compute -- a resident-weight loop
+(maderix's IOSurface approach) would be needed to chase their throughput
+rather than just their placement.
