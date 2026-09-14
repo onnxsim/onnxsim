@@ -441,6 +441,8 @@ single-step `predict()`:
 |---|---|---|---|---|---|
 | SmolLM2-135M fp32 | 0.3GB | ANE 77 / CPU 23 | 8.1ms | -- | 11-14ms |
 | SmolLM2-135M fp16 | 0.2GB | ANE 73 / CPU 27 | 7.9ms | -- | 11.4ms |
+| SmolLM2-135M int8 | 0.2GB | ANE + GPU dequant lane | 8.5ms | -- | 8.0ms |
+| SmolLM2-135M int4 | 79MB | ANE 47 / GPU 13 | 30.3ms | -- | 11.1ms |
 | Qwen2.5-0.5B fp16 | 1.2GB | ANE 61 / GPU 37 / CPU 2 | 19.2ms | 17.4ms | 19.4ms |
 | Qwen2.5-0.5B int8 | 0.6GB | ANE majority | 20.9ms | broken | **13.3ms** |
 | Qwen2.5-1.5B fp16 | 3.3GB | GPU 100 | 55.9ms | 42.9ms | 59.7ms (CPU fallback) |
@@ -448,13 +450,19 @@ single-step `predict()`:
 | SmolLM2-1.7B fp16 | 3.4GB | GPU 100 | 76.4ms | 59.5ms | 79.4ms (CPU fallback) |
 | SmolLM2-1.7B int8 | 1.7GB | ANE 43% | 78.2ms | broken | 92.6ms (CPU wins) |
 | Phi-3.5-mini fp16 | 7.1GB | GPU 100 | 272.2ms | 183.2ms | 237.2ms (CPU fallback) |
+| Phi-3.5-mini int8 | 3.6GB | GPU 100 | 6017ms (dequant hell) | 996.2ms | 474.1ms |
 
 Patterns: per-op misses are boundary glue (embedding `gather`s, output
 reshape/cast cluster, one bandwidth-bound vocab-head `matmul` -- 271/272
 matmuls sit on ANE); `--io-dtype fp16` does not move the ANE share
 (75.3% vs. 77.5%, noise); whole-graph GPU spill tracks weight size
 (~1.2GB split zone, 3.3GB+ fully GPU), and int8 pulls graphs back under
-ANE capacity. Phi-3.5 is a new architecture family for this pipeline
+ANE capacity -- except Phi-3.5, where int8 is a regression almost
+everywhere (GPU 996ms vs. fp16 183ms; int8-on-CPU pathologically slow at
+6s/step from per-step weight dequantization). int4 (135M only, needs an
+iOS18-built model -- post-hoc quantization of a lower-target model is
+refused outright) shrinks weights to 79MB with ANE still engaged but no
+latency win at this size, as dispatch-bound theory predicts. Phi-3.5 is a new architecture family for this pipeline
 (fused `qkv_proj` + partial rotary): its first real-device run failed plan
 build on an empty pass-through slice concatenated back (`[96:96]` of dim
 96, ORT-verified empty) that E5RT/MPS mis-shapes to 97 -- fixed by dropping
