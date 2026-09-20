@@ -505,6 +505,32 @@ def patch_site_a(
     return bytes(out)
 
 
+def patch_reshape_gather_scales(
+    reference_mcode: bytes,
+    old_x_scale: float,
+    new_x_scale: float,
+    old_z_scale: float,
+    new_z_scale: float,
+) -> bytes:
+    """Patch the decoded scale fields in a compiled Reshape+Gather stream.
+
+    The verified ``Reshape(X[8]->[2,4])+Gather(axis=1, indices=[0,2])``
+    reference contains site A's reciprocal input scale and the generalized
+    output-scale quad. This applies those two already-validated edits in
+    sequence. Reshape and Gather themselves are still carried by the
+    reference program: this does not synthesize their instructions or change
+    tensor shapes, indices, zero points, or allocation decisions.
+
+    Both scale fields are independently located as strict stride runs, so a
+    stream with a missing or ambiguous field fails instead of silently
+    emitting a plausible-looking result. The decode evidence is recorded in
+    ``tests/test_axera_reshape_gather_bwd_decode.py``; the underlying patch
+    primitives have fixture-level checks in ``tests/test_axera_tiny_emit.py``.
+    """
+    out = patch_site_a(reference_mcode, old_x_scale, new_x_scale)
+    return patch_output_quad(out, old_z_scale, new_z_scale)
+
+
 def matmul_a_quad_form(a_scale: float) -> str:
     """Which encoding MatMul's rank-3 batched ``A`` quad uses for this
     scale, per the closed-form rule in
