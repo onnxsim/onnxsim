@@ -179,6 +179,18 @@ firmware startup, and inference execution on the VM's NPU. It does not verify
 the training graph: the 1,104-node ONNX still fails before scheduling and has
 no `.axmodel`/MCode to run.
 
+A separate saved ResNet18 distillation step model is available at
+`t8-r18head2/wd/axmodel/compiled.axmodel`. It has 120 ONNX nodes, 13 inputs,
+and 7 outputs; the frozen ResNet18 forward path feeds an in-graph Adam update
+for the classifier weight and bias. I ran it in the VM using its saved
+calibration samples as actual inputs. It completed in 30.522 ms and returned
+all seven outputs. The updated classifier weight and bias differed from their
+inputs by up to `1.0002e-4` and `1.0000e-4`, respectively, consistent with a
+real state update. This AX650A-targeted artifact runs on the AX8850, but its
+trainable scope is only the classifier head; it does not close the requested
+64x64, last-four-layers training graph or the unresolved flatten fan-out
+schedule.
+
 The remaining work to close training-graph coverage is to rebuild the
 documented 64x64, last-four-layers training graph with the current builder,
 confirm the matching Pulsar2 target for the VM's AX8850, compile it, inspect
