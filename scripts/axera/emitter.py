@@ -137,6 +137,35 @@ def learn(code_samples, table_samples):
     all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
     all_one = _signatures(np.ones((n, 1), np.uint8))[0]
 
+    # For <=64 calibration builds each bit's complete sample history is one
+    # uint64. Resolve all code/table signatures in NumPy instead of inserting
+    # and looking up tens of millions of Python integers one at a time (real
+    # ResNet weight tables can contain that many candidate bits).
+    if n <= 64:
+        code_sig = np.asarray(code_sig, dtype=np.uint64)
+        table_sig = np.asarray(table_sig, dtype=np.uint64)
+        code_indices = np.flatnonzero((code_sig != all_zero) & (code_sig != all_one))
+        unique_sig, first = np.unique(code_sig[code_indices], return_index=True)
+        first = code_indices[first]
+
+        origin = np.full(table_bits.shape[1], CONST, dtype=np.int64)
+        const = np.zeros(table_bits.shape[1], dtype=np.uint8)
+        constant = (table_sig == all_zero) | (table_sig == all_one)
+        const[table_sig == all_one] = 1
+        candidates = np.flatnonzero(~constant)
+        if unique_sig.size:
+            slots = np.searchsorted(unique_sig, table_sig[candidates])
+            in_range = slots < unique_sig.size
+            matched = np.zeros(len(candidates), dtype=bool)
+            matched[in_range] = (
+                unique_sig[slots[in_range]] == table_sig[candidates[in_range]]
+            )
+            origin[candidates[matched]] = first[slots[matched]]
+        else:
+            matched = np.zeros(len(candidates), dtype=bool)
+        ambiguous = candidates[~matched]
+        return origin, const, ambiguous
+
     lookup = {}
     for idx, sig in enumerate(code_sig):
         if sig in (all_zero, all_one):
@@ -169,6 +198,17 @@ def collisions(code_samples, origin):
     n = code_bits.shape[0]
     all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
     all_one = _signatures(np.ones((n, 1), np.uint8))[0]
+    if n <= 64:
+        sig = np.asarray(sig, dtype=np.uint64)
+        informative = (sig != all_zero) & (sig != all_one)
+        unique_sig, counts = np.unique(sig[informative], return_counts=True)
+        used = origin[origin != CONST]
+        if not len(used):
+            return 0
+        used_sig = np.unique(sig[used])
+        slots = np.searchsorted(unique_sig, used_sig)
+        return int(np.sum(counts[slots] - 1))
+
     counts = {}
     for s in sig:
         if s in (all_zero, all_one):

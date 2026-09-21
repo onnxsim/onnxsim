@@ -339,8 +339,9 @@ def emit_add(reference_mcode: bytes, old_y_scale: float, new_y_scale: float) -> 
     ``a1``/bank-15 fields 96, 112 and 128. This edits those four-byte operands
     only. The reference must already have the target's shape, operand order,
     input scales and zero points; this does not synthesize Add's instruction
-    stream or adjust its input-side quantization fields. A missing, duplicate
-    or differently encoded field group is rejected.
+    stream or adjust its input-side quantization fields. Output zero point can
+    be patched separately with ``patch_add_output_zero_point``. A missing,
+    duplicate or differently encoded field group is rejected.
     """
     from mcode import FULL_RULE, decode, stream_bounds
 
@@ -367,6 +368,51 @@ def emit_add(reference_mcode: bytes, old_y_scale: float, new_y_scale: float) -> 
     for record in fields:
         at = record["at"] + 4
         out[at : at + 4] = new_word
+    return bytes(out)
+
+
+def patch_add_output_zero_point(
+    reference_mcode: bytes, old_zp_y: int, new_zp_y: int
+) -> bytes:
+    """Patch Add's decoded output zero point in an existing mcode template.
+
+    Add stores ``zp_y`` as the last payload byte of an S record at
+    ``reg=14, tag=131``. Another record at that locator has a fixed payload
+    ending in 4, so the old value must identify exactly one record; in
+    particular, ``old_zp_y == 4`` is intentionally refused. This changes only
+    the output zero point, preserving the template's shape, operand order and
+    input quantization. It does not synthesize Add instructions or establish
+    that this isolated field change matches a hardware rebuild.
+    """
+    from mcode import FULL_RULE, decode, stream_bounds
+
+    if any(
+        not isinstance(value, int) or not 0 <= value <= 255
+        for value in (old_zp_y, new_zp_y)
+    ):
+        raise ValueError("Add output zero points must be integers in [0, 255]")
+    if old_zp_y == 4:
+        raise ValueError("old_zp_y=4 is ambiguous with Add's fixed payload")
+
+    lo, hi = stream_bounds(reference_mcode)
+    records = decode(reference_mcode, start=lo, end=hi, **FULL_RULE)
+    locator = [
+        record
+        for record in records
+        if record.get("kind") == "S"
+        and record.get("reg") == 14
+        and record.get("tag") == 131
+    ]
+    matches = [record for record in locator if record["payload"][-1] == old_zp_y]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one Add zp_y match at reg=14/tag=131, found {len(matches)}"
+        )
+
+    record = matches[0]
+    out = bytearray(reference_mcode)
+    at = record["at"] + record["p"] + 1
+    out[at] = new_zp_y
     return bytes(out)
 
 
