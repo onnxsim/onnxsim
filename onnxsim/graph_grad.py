@@ -473,9 +473,7 @@ def _im2col_indices(
     if not tap_count or not out_count:
         return [], np.zeros(0, dtype=np.float32)
 
-    taps = np.stack(
-        np.unravel_index(np.arange(tap_count), tuple(kernel)), axis=1
-    )
+    taps = np.stack(np.unravel_index(np.arange(tap_count), tuple(kernel)), axis=1)
     positions = np.stack(
         np.unravel_index(np.arange(out_count), tuple(out_dims)), axis=1
     )
@@ -520,12 +518,8 @@ def _col2im_indices(
     if not tap_count or not in_count:
         return [], np.zeros(0, dtype=np.float32)
 
-    taps = np.stack(
-        np.unravel_index(np.arange(tap_count), tuple(kernel)), axis=1
-    )
-    positions = np.stack(
-        np.unravel_index(np.arange(in_count), tuple(in_dims)), axis=1
-    )
+    taps = np.stack(np.unravel_index(np.arange(tap_count), tuple(kernel)), axis=1)
+    positions = np.stack(np.unravel_index(np.arange(in_count), tuple(in_dims)), axis=1)
     flat = np.zeros((tap_count, in_count), dtype=np.int64)
     valid = np.ones((tap_count, in_count), dtype=bool)
     for axis in range(spatial):
