@@ -24,10 +24,12 @@ confirmed by direct UOp inspection against a real tinygrad install, not
 assumed from tinygrad's Python source -- these lowerings can and do
 change across tinygrad versions.
 
-None of the four new matchers has an ``emit_*`` counterpart yet (only
-Neg does, via ``emit_neg``) -- see each function's own docstring and
-tests/test_axera_tiny_emit.py for what tracing alone does and doesn't
-give you.
+The Add matcher now has a deliberately narrow ``emit_add`` counterpart: it
+can transplant the three confirmed output-scale fields in an existing Add
+template, while requiring the graph shape and input quantization to remain the
+same. Neg has its own scale patcher; the other matchers still describe graphs
+without claiming that their mcode can be synthesized. See each function's
+docstring for the exact boundary.
 
 ``patch_site_a`` and ``patch_matmul_a_scale`` (2026-09) generalize the
 site-A idea beyond Mul, to Gemm/Conv and MatMul's own operands -- the
@@ -326,6 +328,44 @@ def emit_neg(reference_mcode: bytes, old_scale: float, new_scale: float) -> byte
     out = bytearray(reference_mcode)
     for off in offsets:
         out[off : off + 4] = new
+    return bytes(out)
+
+
+def emit_add(reference_mcode: bytes, old_y_scale: float, new_y_scale: float) -> bytes:
+    """Patch Add's output scale in an existing two-input Add mcode template.
+
+    The confirmed Add encoding carries its direct output scale at the three
+    ``a1``/bank-15 fields 96, 112 and 128. This edits those four-byte operands
+    only. The reference must already have the target's shape, operand order,
+    input scales and zero points; this does not synthesize Add's instruction
+    stream or adjust its input-side quantization fields. A missing, duplicate
+    or differently encoded field group is rejected.
+    """
+    from mcode import FULL_RULE, decode, stream_bounds
+
+    if not all(math.isfinite(s) and s > 0.0 for s in (old_y_scale, new_y_scale)):
+        raise ValueError("Add output scales must be finite and positive")
+    old_word = struct.pack("<f", float(old_y_scale))
+    new_word = struct.pack("<f", float(new_y_scale))
+    lo, hi = stream_bounds(reference_mcode)
+    records = decode(reference_mcode, start=lo, end=hi, **FULL_RULE)
+    fields = [
+        record
+        for record in records
+        if record.get("kind") == "V"
+        and record.get("verb") == 0xA1
+        and record.get("bank") == 15
+        and record.get("field") in (96, 112, 128)
+    ]
+    if sorted(record["field"] for record in fields) != [96, 112, 128]:
+        raise ValueError("Add mcode must contain exactly fields 96, 112 and 128")
+    if any(record["operand"] != old_word for record in fields):
+        raise ValueError("Add output-scale fields do not all match old_y_scale")
+
+    out = bytearray(reference_mcode)
+    for record in fields:
+        at = record["at"] + 4
+        out[at : at + 4] = new_word
     return bytes(out)
 
 
