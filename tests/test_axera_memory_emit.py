@@ -4,11 +4,18 @@ import gzip
 import json
 import os
 import struct
+import sys
 
 import onnx
 import pytest
 
-from scripts.axera.memory_emit import emit_gather_axmodel, emit_slice_axmodel
+_AXERA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
+)
+if _AXERA_DIR not in sys.path:
+    sys.path.insert(0, _AXERA_DIR)
+
+from memory_emit import emit_gather_axmodel, emit_slice_axmodel  # noqa: E402
 
 _FIXTURE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
