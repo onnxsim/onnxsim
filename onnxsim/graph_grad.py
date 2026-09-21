@@ -1391,7 +1391,9 @@ def _grad_slice(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[s
                 f"Slice axes must be unique and in range (node {node.output[0]!r})"
             )
         if step <= 0:
-            raise UnsupportedOpError(f"Slice requires positive steps (node {node.output[0]!r})")
+            raise UnsupportedOpError(
+                f"Slice requires positive steps (node {node.output[0]!r})"
+            )
         size = int(in_shape[axis])
         # ONNX positive-step slicing clips both bounds to [0, size], after
         # translating negative bounds relative to the end of the axis.
@@ -1439,7 +1441,9 @@ def _grad_pad(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
             f"Pad mode {mode!r} is unsupported (node {node.output[0]!r})"
         )
     if len(node.input) < 2 or not node.input[1]:
-        raise UnsupportedOpError(f"Pad requires constant pads (node {node.output[0]!r})")
+        raise UnsupportedOpError(
+            f"Pad requires constant pads (node {node.output[0]!r})"
+        )
     pads = _constant_ints(ctx, node.input[1], node)
     in_shape = ctx.shape(node.input[0])
     if any(not isinstance(d, int) for d in in_shape):
