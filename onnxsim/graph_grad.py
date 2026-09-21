@@ -2340,9 +2340,7 @@ def _grad_inference_dropout(
     runtime or true value would require applying the sampled mask and scaling.
     """
     if len(node.input) > 2 and node.input[2]:
-        training = next(
-            (t for t in ctx.b.initializer if t.name == node.input[2]), None
-        )
+        training = next((t for t in ctx.b.initializer if t.name == node.input[2]), None)
         if training is None:
             raise UnsupportedOpError(
                 f"Dropout training_mode must be a constant false initializer "
@@ -2357,8 +2355,7 @@ def _grad_inference_dropout(
             ) from exc
         if value.dtype.kind != "b" or value.size != 1 or bool(value.reshape(-1)[0]):
             raise UnsupportedOpError(
-                f"Dropout training_mode must be scalar false "
-                f"(node {node.output[0]!r})"
+                f"Dropout training_mode must be scalar false (node {node.output[0]!r})"
             )
     return [gs[0]] + [None] * (len(node.input) - 1)
 
