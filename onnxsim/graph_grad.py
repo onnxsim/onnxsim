@@ -464,27 +464,33 @@ def _im2col_indices(
     ``[tap, output position]`` order: the index (with an invented tap pointing
     at element 0, since ONNX's ``Gather`` rejects an out-of-range index
     outright) and a 0/1 float mask that multiplies the invented ones away
-    afterwards.
+    afterwards. Coordinates are built per spatial axis with NumPy arrays,
+    avoiding nested Python iteration over every tap and output position.
     """
     spatial = len(in_dims)
     out_count = _prod(out_dims)
-    index = [0] * (_prod(kernel) * out_count)
-    mask = np.zeros(len(index), dtype=np.float32)
-    for tap in range(_prod(kernel)):
-        taps = _unflatten(tap, kernel)
-        for out in range(out_count):
-            position = _unflatten(out, out_dims)
-            flat = 0
-            for i in range(spatial):
-                p = position[i] * strides[i] - pads_begin[i] + taps[i] * dilations[i]
-                if p < 0 or p >= in_dims[i]:
-                    flat = -1
-                    break
-                flat = flat * in_dims[i] + p
-            if flat >= 0:
-                index[tap * out_count + out] = flat
-                mask[tap * out_count + out] = 1.0
-    return index, mask
+    tap_count = _prod(kernel)
+    if not tap_count or not out_count:
+        return [], np.zeros(0, dtype=np.float32)
+
+    taps = np.stack(
+        np.unravel_index(np.arange(tap_count), tuple(kernel)), axis=1
+    )
+    positions = np.stack(
+        np.unravel_index(np.arange(out_count), tuple(out_dims)), axis=1
+    )
+    flat = np.zeros((tap_count, out_count), dtype=np.int64)
+    valid = np.ones((tap_count, out_count), dtype=bool)
+    for axis in range(spatial):
+        pos = (
+            taps[:, axis, None] * dilations[axis]
+            + positions[None, :, axis] * strides[axis]
+            - pads_begin[axis]
+        )
+        valid &= (pos >= 0) & (pos < in_dims[axis])
+        flat = flat * in_dims[axis] + pos
+    flat[~valid] = 0
+    return flat.reshape(-1).tolist(), valid.reshape(-1).astype(np.float32)
 
 
 def _col2im_indices(
@@ -505,31 +511,35 @@ def _col2im_indices(
     an accumulation into overlapping windows. A stride greater than one makes
     the division inexact for most positions -- those are exactly the input
     elements that tap never touched -- and they are masked away like the
-    padded ones above.
+    padded ones above. NumPy builds tap and position coordinates without
+    Python iteration over every input entry.
     """
     spatial = len(in_dims)
     in_count = _prod(in_dims)
-    index = [0] * (_prod(kernel) * in_count)
-    mask = np.zeros(len(index), dtype=np.float32)
-    for tap in range(_prod(kernel)):
-        taps = _unflatten(tap, kernel)
-        for entry in range(in_count):
-            position = _unflatten(entry, in_dims)
-            flat = 0
-            for i in range(spatial):
-                shifted = position[i] + pads_begin[i] - taps[i] * dilations[i]
-                if shifted % strides[i] != 0:
-                    flat = -1
-                    break
-                o = shifted // strides[i]
-                if o < 0 or o >= out_dims[i]:
-                    flat = -1
-                    break
-                flat = flat * out_dims[i] + o
-            if flat >= 0:
-                index[tap * in_count + entry] = flat
-                mask[tap * in_count + entry] = 1.0
-    return index, mask
+    tap_count = _prod(kernel)
+    if not tap_count or not in_count:
+        return [], np.zeros(0, dtype=np.float32)
+
+    taps = np.stack(
+        np.unravel_index(np.arange(tap_count), tuple(kernel)), axis=1
+    )
+    positions = np.stack(
+        np.unravel_index(np.arange(in_count), tuple(in_dims)), axis=1
+    )
+    flat = np.zeros((tap_count, in_count), dtype=np.int64)
+    valid = np.ones((tap_count, in_count), dtype=bool)
+    for axis in range(spatial):
+        shifted = (
+            positions[None, :, axis]
+            + pads_begin[axis]
+            - taps[:, axis, None] * dilations[axis]
+        )
+        divisible = shifted % strides[axis] == 0
+        output_pos = shifted // strides[axis]
+        valid &= divisible & (output_pos >= 0) & (output_pos < out_dims[axis])
+        flat = flat * out_dims[axis] + output_pos
+    flat[~valid] = 0
+    return flat.reshape(-1).tolist(), valid.reshape(-1).astype(np.float32)
 
 
 def _conv_geometry(
