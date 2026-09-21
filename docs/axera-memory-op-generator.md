@@ -56,6 +56,19 @@ Both emitted variants ran on the AX8850 in `axcl-vm` with input
 returned `[[1,3,5,7]]`. The implementation rejects other starts and ends for
 step two.
 
+## Step-three Slice
+
+Pulsar2 builds of `[0:8:3]` and `[1:8:3]` also share an MCode template for
+the same output shape `[1,3]`. Their `npu_params` values are five copies of
+`start * 4`. Step-three MCode is structurally different from the step-one
+length-three build, so the emitter uses its own fixture at
+`scripts/axera/fixtures/slice_1x8_axis1_step3_len3.axmodel.gz`.
+
+Both emitted variants ran on the AX8850 in `axcl-vm` with input
+`[[0,1,2,3,4,5,6,7]]`; `[0:8:3]` returned `[[0,3,6]]` and `[1:8:3]`
+returned `[[1,4,7]]`. The implementation rejects other starts and ends for
+step three.
+
 ## Static Gather index retargeting
 
 The same module now has `emit_gather_axmodel(reference_path, output_path,

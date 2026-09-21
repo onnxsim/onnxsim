@@ -1,15 +1,16 @@
 """Small, evidence-scoped emitters for Axera memory-only operators.
 
 Pulsar2 7.0-lite emits measured AX650 ``Slice`` templates for ``X[1, 8]``
-(axis 1), covering step-one lengths 3/4 and step-two length 4. The operation's
+(axis 1), covering step-one lengths 3/4, step-two length 4, and step-three
+length 3. The operation's
 byte offset is stored in five repeated uint64 entries in ``npu_params`` and
 the output shape is stored in the ``neu mode`` node's ``outputs_info``
 attribute plus ONNX output metadata. Step-one length-three models use the
 measured length-four template; compiler-built length-three MCode has extra
 shape-specific bytes, but the patched template ran correctly for every tested
-start. Step two has its own compiled template and supports only ``[0:8:2]``
-and ``[1:8:2]``. Other ranks, axes, steps, and input shapes remain out of
-scope.
+start. Steps two and three each have their own compiled template; both support
+only starts 0 and 1 with end 8. Other ranks, axes, steps, and input shapes
+remain out of scope.
 
 It also retargets measured static ``Gather`` index vectors for
 ``X[1,8] -> Y[1,4]``. Their indices are stored in the compiled model's
@@ -22,7 +23,8 @@ region at offsets 301..325. Compiler-built length-three variants also change
 bytes 988, 1172, and 1584; emitted length-three models retain the length-four
 template and have been hardware-verified. Step-two starts 0 and 1 shared a
 second MCode template, with `npu_params` offsets 0 and 4 respectively; see the
-separate step-two fixture.
+separate step-two fixture. Step-three starts 0 and 1 shared a third MCode
+template, again with offsets 0 and 4; see the step-three fixture.
 """
 
 from __future__ import annotations
@@ -42,6 +44,9 @@ _SLICE_TEMPLATE = os.path.join(
 _SLICE_STEP2_TEMPLATE = os.path.join(
     _HERE, "fixtures", "slice_1x8_axis1_step2_len4.axmodel.gz"
 )
+_SLICE_STEP3_TEMPLATE = os.path.join(
+    _HERE, "fixtures", "slice_1x8_axis1_step3_len3.axmodel.gz"
+)
 _GATHER_TEMPLATE = os.path.join(_HERE, "fixtures", "gather_1x8_axis1_even4.axmodel.gz")
 _NOISE_START = 301
 _NOISE_END = 326
@@ -52,7 +57,7 @@ _GATHER_INPUT_WIDTH = 8
 def _supported_slice(start: int, end: int, step: int) -> bool:
     if step == 1:
         return end - start in (3, 4) and 0 <= start <= 4
-    return step == 2 and end == 8 and start in (0, 1)
+    return step in (2, 3) and end == 8 and start in (0, 1)
 
 
 def _initializer(model: onnx.ModelProto, name: str):
@@ -166,7 +171,8 @@ def emit_slice_axmodel(
 
     ``start``, ``end``, and ``step`` follow ONNX's positive-step, end-exclusive
     semantics. Step 1 supports output lengths 3/4 with starts 0..4. Step 2
-    supports only ``[0:8:2]`` and ``[1:8:2]``. The target output shape is
+    supports only ``[0:8:2]`` and ``[1:8:2]``; step 3 supports only
+    ``[0:8:3]`` and ``[1:8:3]``. The target output shape is
     ``[1, ceil((end - start) / step)]``. The five repeated offset words in
     ``npu_params`` and output shape metadata are updated; the matching
     characterized MCode template is retained byte-for-byte.
@@ -183,12 +189,16 @@ def emit_slice_axmodel(
     if not 0 <= start < end <= 8 or not _supported_slice(start, end, step):
         raise ValueError(
             "step 1 supports length 3/4 with start 0..4; step 2 supports "
-            "[0:8:2] and [1:8:2]; "
+            "[0:8:2]/[1:8:2]; step 3 supports [0:8:3]/[1:8:3]; "
             f"got [{start}, {end}:{step}]"
         )
 
     model = onnx.load(reference_path, load_external_data=False)
-    template_path = _SLICE_TEMPLATE if step == 1 else _SLICE_STEP2_TEMPLATE
+    template_path = {
+        1: _SLICE_TEMPLATE,
+        2: _SLICE_STEP2_TEMPLATE,
+        3: _SLICE_STEP3_TEMPLATE,
+    }[step]
     node, _ = _validate_slice_template(model, template_path)
     table = _initializer(model, "npu_params")
     table.raw_data = struct.pack("<5Q", *([start * 4] * 5))

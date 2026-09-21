@@ -3,20 +3,22 @@
 ## Current state
 
 The first narrow memory-op emitter is static float32 `Slice` support for an
-input shaped `[1, 8]`, axis 1, unit step. Its entry point is
+input shaped `[1, 8]`, axis 1, with measured steps 1, 2, and 3. Its entry point is
 `emit_slice_axmodel(reference_path, output_path, start=..., end=..., step=...)`
 in `scripts/axera/memory_emit.py`. Step 1 accepts length-three and length-four
-intervals with starts 0 through 4. Step 2 accepts `[0:8:2]` and `[1:8:2]`
-using a separate compiled fixture. It checks the reference model structure
-and normalized MCode before updating the parameter table and output-shape
-metadata. Compiler-built step-one length-three MCode has three additional
-shape-specific byte changes, but the retained length-four MCode was verified
-on device for every length-three start. Details and hardware results are in
+intervals with starts 0 through 4. Steps 2 and 3 each accept starts 0 or 1
+with end 8, using separate compiled fixtures. It checks the reference model
+structure and normalized MCode before updating the parameter table and
+output-shape metadata. Compiler-built step-one length-three MCode has three
+additional shape-specific byte changes, but the retained length-four MCode
+was verified on device for every length-three start. Details and hardware
+results are in
 [`axera-memory-op-generator.md`](axera-memory-op-generator.md).
 
 The model was built with Pulsar2 7.0-lite and run inside the LXD VM `axcl-vm`
-on AX8850 V3.6.5 firmware. Five length-three variants, two step-one
-length-four variants, and both step-two variants returned the expected values for input
+on AX8850 V3.6.5 firmware. Five step-one length-three variants, two step-one
+length-four variants, and both step-two and step-three variants returned the
+expected values for input
 `[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
 `tests/test_axera_memory_emit.py`.
 
@@ -46,11 +48,18 @@ failure came from using `[0,1,2,3,4,5,6,7]`, outside the calibration range
 at about 0.901. The NPU check is valid only for in-range inputs and this
 compiled quantization configuration.
 
+A length-two Gather (`indices=[0,3]`, output `[1,2]`) was compiled separately
+in `/home/takecheeze/npu-scratch/t_codegen_gather_len2`. Its parameter table
+shrinks to 48 bytes (six uint64 words), but its 2600-byte MCode differs from
+the length-four template across 916 bytes. No NPU run was made, so the current
+emitter remains restricted to four outputs; adding shorter outputs needs a
+separate compiled template and device check.
+
 ## Next steps
 
-1. Probe Gather output lengths and other axes only through compiler and device
-   checks. Keep runtime values inside the calibration range when comparing
-   against ONNX.
+1. Add Gather output lengths or axes only with separate compiled templates
+   where MCode changes, plus device checks. Keep runtime values inside the
+   calibration range when comparing against ONNX.
 2. Probe another memory operator from a compiler-supported graph with a
    consumer if possible; standalone terminal Reshape/Squeeze can fail in the
    scheduler. Compare exact rebuilds, then run emitted models on the NPU.
