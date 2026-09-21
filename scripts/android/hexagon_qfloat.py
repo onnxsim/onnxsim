@@ -140,12 +140,14 @@ def _rewrite_update(kind, store, a, b):
         total = _intrin(_HVX_INT, "vadd.qf16", _bits(load), product)
         value = _bits(total, "float16x64")
     else:
-        pair = _intrin(_HVX_PAIR, "vmpy.qf32.hf", _bits(a), _bits(b))
+        pair = tir.Var("pair", _HVX_PAIR)  # bind the widening product once for both halves
         acc = _bits(load, _HVX_PAIR)
-        halves = []
-        for part in (tir.op.vectorlow, tir.op.vectorhigh):
-            halves.append(_intrin(_HVX_INT, "vadd.qf32", part(_HVX_INT, acc), part(_HVX_INT, pair)))
-        value = _bits(tir.op.vectorcombine(_HVX_PAIR, halves[0], halves[1]), "float32x64")
+        halves = [
+            _intrin(_HVX_INT, "vadd.qf32", part(_HVX_INT, acc), part(_HVX_INT, pair))
+            for part in (tir.op.vectorlow, tir.op.vectorhigh)
+        ]
+        combined = _bits(tir.op.vectorcombine(_HVX_PAIR, halves[0], halves[1]), "float32x64")
+        value = tir.Let(pair, _intrin(_HVX_PAIR, "vmpy.qf32.hf", _bits(a), _bits(b)), combined)
     return tir.BufferStore(buf, value, indices)
 
 
@@ -153,13 +155,16 @@ def _rewrite_sum(store, partial_load):
     """acc(float32x64 pair) += widen(qf16 partial): multiply the partial by qf16 1.0."""
     one_hf = _intrin(_HVX_INT, "lvsplath", tir.const(0x3C00, "int32"))
     one_qf16 = _intrin(_HVX_INT, "vmpy.qf16.hf", one_hf, one_hf)
-    wide = _intrin(_HVX_PAIR, "vmpy.qf32.qf16", _bits(partial_load), one_qf16)
+    wide = tir.Var("wide", _HVX_PAIR)
     acc = _bits(tir.BufferLoad(store.buffer, store.indices), _HVX_PAIR)
     halves = [
         _intrin(_HVX_INT, "vadd.qf32", part(_HVX_INT, acc), part(_HVX_INT, wide))
         for part in (tir.op.vectorlow, tir.op.vectorhigh)
     ]
-    value = _bits(tir.op.vectorcombine(_HVX_PAIR, halves[0], halves[1]), "float32x64")
+    combined = _bits(tir.op.vectorcombine(_HVX_PAIR, halves[0], halves[1]), "float32x64")
+    value = tir.Let(
+        wide, _intrin(_HVX_PAIR, "vmpy.qf32.qf16", _bits(partial_load), one_qf16), combined
+    )
     return tir.BufferStore(store.buffer, value, store.indices)
 
 

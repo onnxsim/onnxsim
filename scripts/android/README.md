@@ -405,3 +405,38 @@ happens). The pass is a Python `prim_func_pass` in `scripts/android/`; moving it
 `src/target/llvm/codegen_hexagon.cc` / `tir.transform` would make it available without the
 build wrapper.
 
+### Testing the qfloat pass without a phone (hexagon-sim)
+
+`tests/test_hexagon_qfloat.py` and `.github/workflows/hexagon-qfloat.yml` test the pass the way
+hexagon-mlir tests its backend: by running compiled Hexagon code on the instruction-set
+simulator instead of a device. The tests need Apache TVM **v0.17.0** (the TE schedule API these
+scripts use was removed from newer releases and the `apache-tvm` wheels) built with LLVM's
+Hexagon target, and the Hexagon toolchain's `hexagon-clang`/`hexagon-sim`; the module skips when
+either is missing.
+
+- TIR-level tests lower plain TE schedules with the pass and check the intrinsics it emits
+  (`vmpy.qf32.sf`, widening `vmpy.qf32.hf`, `vmpy.qf16.hf`, `vconv`), that non-accumulating
+  reductions are untouched, and that argument buffers are offset-free and 128-byte aligned.
+- Simulator tests (`hexagon_sim_harness.py`) compile the mask-head ConvTranspose kernels with
+  the plain `llvm -mtriple=hexagon` target into an object, link a generated C harness
+  (DLTensor setup plus the three runtime hooks TVM's code imports) with `hexagon-clang`, run it
+  on `hexagon-sim`, and compare with NumPy: fp32, fp16-widening and chunked-qf16 kernels, plus
+  a stock-TVM control through the same harness. Deliberately swapping the widening read-back's
+  lane order makes them fail (error 0.17 vs tolerance 1e-3).
+- A cycle guard uses the simulator's deterministic pipeline-cycle count for one kernel call:
+  with the pass the kernels take 2.4x (fp32), 4.5x (fp16 widening) and 2.5x (chunked qf16)
+  fewer cycles than stock TVM, tracking the phone speedups above (1.8x / 5.1x / 2.0x).
+
+To run locally (paths for a TVM v0.17.0 source tree built into `build/`):
+
+```bash
+export PYTHONPATH=$TVM/python:scripts/android TVM_LIBRARY_PATH=$TVM/build
+export HEXAGON_TOOLS=/path/to/Tools   # Hexagon open-access toolchain or <SDK>/tools/HEXAGON_Tools/*/Tools
+pytest tests/test_hexagon_qfloat.py
+```
+
+The CI workflow builds TVM against `llvm-17-dev` from apt and downloads the public Hexagon
+open-access toolchain 19.0.02 (the same package hexagon-mlir installs; about 1.1 GB, 3 GB
+extracted); both are cached. `hexagon-sim` links `libncurses.so.5`, which current distros
+lack, so the harness shims it from `libncurses.so.6`.
+

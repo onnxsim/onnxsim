@@ -1,0 +1,112 @@
+name: Hexagon qfloat pass (TVM + hexagon-sim)
+
+# Tests scripts/android/hexagon_qfloat.py, a TIR pass that makes Apache TVM emit chained HVX
+# qfloat multiply-accumulate code (Hexagon's LLVM backend otherwise converts qf32/qf16 <-> IEEE
+# around every fp op). Like hexagon-mlir's CI, this runs the generated code on the Hexagon
+# simulator instead of a phone:
+#
+#   1. TIR-level tests: lower plain TE schedules with the pass and check the intrinsics.
+#   2. Numeric tests: compile the kernels with TVM to a Hexagon object, link a small C harness
+#      with hexagon-clang, run it on hexagon-sim, and compare with NumPy (plus a stock-TVM control).
+#
+# TVM is pinned to v0.17.0 (the TE schedule API and Hexagon target the scripts use are gone from
+# newer releases and from the apache-tvm wheels) and built against LLVM 17 from apt; the build and
+# the ~1.1 GB Hexagon open-access toolchain download are cached. hexagon-mlir downloads the same
+# public toolchain (softwarecenter.qualcomm.com) on a self-hosted runner; a hosted runner is
+# enough here because only the toolchain's clang + simulator are needed, not the full SDK.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/android/hexagon_*.py"
+      - "tests/test_hexagon_qfloat.py"
+      - ".github/workflows/hexagon-qfloat.yml"
+  push:
+    branches: [master]
+    paths:
+      - "scripts/android/hexagon_*.py"
+      - "tests/test_hexagon_qfloat.py"
+      - ".github/workflows/hexagon-qfloat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hexagon-qfloat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TVM_VERSION: "0.17.0"
+  TVM_URL: https://github.com/apache/tvm/releases/download/v0.17.0/apache-tvm-src-v0.17.0.tar.gz
+  HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
+  HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
+
+jobs:
+  hexagon-qfloat:
+    name: TVM qfloat pass on hexagon-sim
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install LLVM 17 (with the Hexagon target) and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends llvm-17-dev libzstd-dev ninja-build \
+            ccache libncurses6
+          llvm-config-17 --targets-built | tr ' ' '\n' | grep -x Hexagon
+          python -m pip install "numpy<2" ml_dtypes psutil cloudpickle tornado \
+            typing_extensions pytest setuptools
+
+      - name: Restore TVM build
+        id: tvm-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/tvm
+          key: tvm-${{ env.TVM_VERSION }}-llvm17-${{ runner.os }}-v1
+
+      - name: Build TVM v0.17.0
+        if: steps.tvm-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/tvm && cd ~/tvm
+          curl -fsSL "$TVM_URL" -o tvm-src.tar.gz
+          tar xzf tvm-src.tar.gz
+          mv apache-tvm-src-v* src
+          rm tvm-src.tar.gz
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_LLVM=/usr/bin/llvm-config-17 -DHIDE_PRIVATE_SYMBOLS=ON \
+            -DUSE_LIBBACKTRACE=OFF -DUSE_CUDA=OFF
+          cmake --build build --target tvm tvm_runtime
+
+      - name: Restore Hexagon toolchain
+        id: toolchain-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/hexagon-toolchain
+          key: hexagon-open-access-${{ env.HEXAGON_TOOLCHAIN_VERSION }}-v1
+
+      - name: Download Hexagon open-access toolchain
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/hexagon-toolchain && cd ~/hexagon-toolchain
+          curl -fsSL "$HEXAGON_TOOLCHAIN_URL" -o toolchain.tar.gz
+          tar xzf toolchain.tar.gz
+          rm toolchain.tar.gz
+
+      - name: Locate toolchain and verify tools
+        run: |
+          TOOLS=$(dirname "$(dirname "$(find ~/hexagon-toolchain -path '*/bin/hexagon-sim' | head -1)")")
+          echo "HEXAGON_TOOLS=$TOOLS" >> "$GITHUB_ENV"
+          ls "$TOOLS/bin" | grep -E '^hexagon-(clang|sim)$'
+
+      - name: Test the qfloat pass
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/scripts/android:$HOME/tvm/src/python"
+          export TVM_LIBRARY_PATH="$HOME/tvm/build"
+          python -c "import tvm; print('tvm', tvm.__version__)"
+          pytest -v tests/test_hexagon_qfloat.py
