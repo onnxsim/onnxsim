@@ -1,9 +1,9 @@
 # AX650 static Slice emitter
 
 `scripts/axera/memory_emit.py` adds a first narrow emitter for a data-movement
-operator: a compiled ONNX `Slice` with float input `[1, 8]`, axis 1, and step 1.
-It supports lengths 3 and 4 with starts 0 through 4; the input shape stays
-fixed.
+operator: a compiled ONNX `Slice` with float input `[1, 8]`, axis 1. For step 1
+it supports lengths 3 and 4 with starts 0 through 4. For step 2 it supports
+only `[0:8:2]` and `[1:8:2]`; the input shape stays fixed.
 
 ## What the compiler stores
 
@@ -19,7 +19,7 @@ NPU. The operation-specific fields are:
 - `npu_params` is five repeated little-endian `uint64` values, each equal to
   `start * 4` for this float32 input.
 - The `neu mode` node's `outputs_info` and the ONNX graph output shape contain
-  `[1, end - start]`.
+  the target slice shape.
 - `npu_dyn_params` is empty.
 
 The emitter checks the reference's one-node graph shape, table layout, and
@@ -42,6 +42,19 @@ lengths, and float32 offset encoding. It does not claim general Slice support,
 arbitrary memory-op generation, or an MCode interpreter. Regression coverage lives in
 `tests/test_axera_memory_emit.py`; the raw compiled reference is
 `scripts/axera/fixtures/slice_1x8_axis1_step1_len4.axmodel.gz`.
+
+## Step-two Slice
+
+Pulsar2 builds of `[0:8:2]` and `[1:8:2]` produced the same MCode, with the
+same five-word offset table rule (`start * 4`). The step-two program differs
+from step one at several instruction fields, so it has a separate compiled
+reference: `scripts/axera/fixtures/slice_1x8_axis1_step2_len4.axmodel.gz`.
+The emitter uses that template for either start and retains its MCode.
+
+Both emitted variants ran on the AX8850 in `axcl-vm` with input
+`[[0,1,2,3,4,5,6,7]]`; `[0:8:2]` returned `[[0,2,4,6]]` and `[1:8:2]`
+returned `[[1,3,5,7]]`. The implementation rejects other starts and ends for
+step two.
 
 ## Static Gather index retargeting
 

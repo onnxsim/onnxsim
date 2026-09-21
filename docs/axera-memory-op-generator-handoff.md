@@ -4,19 +4,19 @@
 
 The first narrow memory-op emitter is static float32 `Slice` support for an
 input shaped `[1, 8]`, axis 1, unit step. Its entry point is
-`emit_slice_axmodel(reference_path, output_path, start=..., end=...)` in
-`scripts/axera/memory_emit.py`. It accepts length-three and length-four
-intervals with starts 0 through 4. It checks the reference model structure
-and normalized length-four template MCode before updating the parameter
-table and output-shape metadata. Compiler-built length-three MCode has three
-additional shape-specific byte changes, but the retained length-four MCode
-was verified on device for every length-three start. Details and hardware
-results are in
+`emit_slice_axmodel(reference_path, output_path, start=..., end=..., step=...)`
+in `scripts/axera/memory_emit.py`. Step 1 accepts length-three and length-four
+intervals with starts 0 through 4. Step 2 accepts `[0:8:2]` and `[1:8:2]`
+using a separate compiled fixture. It checks the reference model structure
+and normalized MCode before updating the parameter table and output-shape
+metadata. Compiler-built step-one length-three MCode has three additional
+shape-specific byte changes, but the retained length-four MCode was verified
+on device for every length-three start. Details and hardware results are in
 [`axera-memory-op-generator.md`](axera-memory-op-generator.md).
 
 The model was built with Pulsar2 7.0-lite and run inside the LXD VM `axcl-vm`
-on AX8850 V3.6.5 firmware. Five length-three emitted variants and two
-length-four variants returned the expected values for input
+on AX8850 V3.6.5 firmware. Five length-three variants, two step-one
+length-four variants, and both step-two variants returned the expected values for input
 `[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
 `tests/test_axera_memory_emit.py`.
 

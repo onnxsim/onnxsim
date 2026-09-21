@@ -1,15 +1,15 @@
 """Small, evidence-scoped emitters for Axera memory-only operators.
 
-Pulsar2 7.0-lite emits the same MCode program for the tested AX650 ``Slice``
-shape ``X[1, 8] -> Y[1, 4]`` (axis 1, step 1), for starts 0 through 4. The
-operation's byte offset is stored in five repeated uint64 entries in
-``npu_params`` and the output shape is stored in the ``neu mode`` node's
-``outputs_info`` attribute plus ONNX output metadata. This module also emits
-verified length-three outputs by patching that length-four template's
-parameter and shape metadata. Compiler-built length-three MCode has additional
-shape-specific bytes, but the patched length-four stream has been run
-successfully for every tested length-three start. It deliberately does not
-generalize to other Slice ranks, axes, steps, or input shapes.
+Pulsar2 7.0-lite emits measured AX650 ``Slice`` templates for ``X[1, 8]``
+(axis 1), covering step-one lengths 3/4 and step-two length 4. The operation's
+byte offset is stored in five repeated uint64 entries in ``npu_params`` and
+the output shape is stored in the ``neu mode`` node's ``outputs_info``
+attribute plus ONNX output metadata. Step-one length-three models use the
+measured length-four template; compiler-built length-three MCode has extra
+shape-specific bytes, but the patched template ran correctly for every tested
+start. Step two has its own compiled template and supports only ``[0:8:2]``
+and ``[1:8:2]``. Other ranks, axes, steps, and input shapes remain out of
+scope.
 
 It also retargets measured static ``Gather`` index vectors for
 ``X[1,8] -> Y[1,4]``. Their indices are stored in the compiled model's
@@ -20,7 +20,9 @@ notes. The reference fixture was built with start=2/end=6. Length-four builds
 with starts 0..4 changed no MCode bytes outside the known compiler-noise
 region at offsets 301..325. Compiler-built length-three variants also change
 bytes 988, 1172, and 1584; emitted length-three models retain the length-four
-template and have been hardware-verified.
+template and have been hardware-verified. Step-two starts 0 and 1 shared a
+second MCode template, with `npu_params` offsets 0 and 4 respectively; see the
+separate step-two fixture.
 """
 
 from __future__ import annotations
@@ -37,6 +39,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SLICE_TEMPLATE = os.path.join(
     _HERE, "fixtures", "slice_1x8_axis1_step1_len4.axmodel.gz"
 )
+_SLICE_STEP2_TEMPLATE = os.path.join(
+    _HERE, "fixtures", "slice_1x8_axis1_step2_len4.axmodel.gz"
+)
 _GATHER_TEMPLATE = os.path.join(_HERE, "fixtures", "gather_1x8_axis1_even4.axmodel.gz")
 _NOISE_START = 301
 _NOISE_END = 326
@@ -44,8 +49,10 @@ _GATHER_INDEX_COUNT = 4
 _GATHER_INPUT_WIDTH = 8
 
 
-def _supported_interval(start: int, end: int) -> bool:
-    return end - start in (3, 4) and 0 <= start <= 4
+def _supported_slice(start: int, end: int, step: int) -> bool:
+    if step == 1:
+        return end - start in (3, 4) and 0 <= start <= 4
+    return step == 2 and end == 8 and start in (0, 1)
 
 
 def _initializer(model: onnx.ModelProto, name: str):
@@ -84,7 +91,9 @@ def _mcode(model: onnx.ModelProto) -> bytes:
     return bytes(matches[0].raw_data)
 
 
-def _validate_slice_template(model: onnx.ModelProto) -> tuple[onnx.NodeProto, int]:
+def _validate_slice_template(
+    model: onnx.ModelProto, template_path: str = _SLICE_TEMPLATE
+) -> tuple[onnx.NodeProto, int]:
     if len(model.graph.node) != 1 or model.graph.node[0].op_type != "neu mode":
         raise ValueError("reference must contain exactly one compiled 'neu mode' node")
     if list(model.graph.node[0].input) != ["x"] or list(model.graph.node[0].output) != [
@@ -115,9 +124,8 @@ def _validate_slice_template(model: onnx.ModelProto) -> tuple[onnx.NodeProto, in
             f"npu_params is not five equal float32 byte offsets: {offsets}"
         )
     source_start = offsets[0] // 4
-    source_end = source_start + output_shape[1]
-    if not _supported_interval(source_start, source_end):
-        raise ValueError("reference slice interval is outside the tested cases")
+    if not 0 <= source_start <= 4:
+        raise ValueError("reference slice start is outside the tested cases")
 
     dynamic = _initializer(model, "npu_dyn_params")
     if dynamic.raw_data or dynamic.dims != [0]:
@@ -133,7 +141,7 @@ def _validate_slice_template(model: onnx.ModelProto) -> tuple[onnx.NodeProto, in
     if outputs_info != {"y": ["FP32", output_shape]}:
         raise ValueError(f"outputs_info disagrees with output shape: {outputs_info!r}")
 
-    with gzip.open(_SLICE_TEMPLATE, "rb") as f:
+    with gzip.open(template_path, "rb") as f:
         expected = onnx.load_model_from_string(f.read())
     template_mcode = _mcode(expected)
     actual_mcode = _mcode(model)
@@ -152,33 +160,39 @@ def _validate_slice_template(model: onnx.ModelProto) -> tuple[onnx.NodeProto, in
 
 
 def emit_slice_axmodel(
-    reference_path: str, output_path: str, *, start: int, end: int
+    reference_path: str, output_path: str, *, start: int, end: int, step: int = 1
 ) -> str:
-    """Retarget a compiled ``Slice(x[1,8], axis=1, step=1)`` template.
+    """Retarget a compiled ``Slice(x[1,8], axis=1)`` template.
 
-    ``start`` and ``end`` follow ONNX's non-negative, end-exclusive semantics.
-    The target output has shape ``[1, end - start]``. Only the five repeated
-    offset words in ``npu_params`` and the output shape metadata are changed;
-    the characterized MCode stream is retained byte-for-byte.
+    ``start``, ``end``, and ``step`` follow ONNX's positive-step, end-exclusive
+    semantics. Step 1 supports output lengths 3/4 with starts 0..4. Step 2
+    supports only ``[0:8:2]`` and ``[1:8:2]``. The target output shape is
+    ``[1, ceil((end - start) / step)]``. The five repeated offset words in
+    ``npu_params`` and output shape metadata are updated; the matching
+    characterized MCode template is retained byte-for-byte.
 
     This API refuses unsupported layouts instead of extrapolating the
-    observed byte-offset rule to another rank/dtype/axis/step.
+    observed encoding to another rank/dtype/axis/step.
     """
     if any(
         not isinstance(value, int) or isinstance(value, bool) for value in (start, end)
     ):
         raise ValueError("start and end must be integers")
-    if not 0 <= start < end <= 8 or not _supported_interval(start, end):
+    if not isinstance(step, int) or isinstance(step, bool):
+        raise ValueError("step must be an integer")
+    if not 0 <= start < end <= 8 or not _supported_slice(start, end, step):
         raise ValueError(
-            "supported intervals have length 3 or 4 and start in [0, 4]; "
-            f"got [{start}, {end})"
+            "step 1 supports length 3/4 with start 0..4; step 2 supports "
+            "[0:8:2] and [1:8:2]; "
+            f"got [{start}, {end}:{step}]"
         )
 
     model = onnx.load(reference_path, load_external_data=False)
-    node, _ = _validate_slice_template(model)
+    template_path = _SLICE_TEMPLATE if step == 1 else _SLICE_STEP2_TEMPLATE
+    node, _ = _validate_slice_template(model, template_path)
     table = _initializer(model, "npu_params")
     table.raw_data = struct.pack("<5Q", *([start * 4] * 5))
-    target_shape = [1, end - start]
+    target_shape = [1, (end - start + step - 1) // step]
 
     outputs_info = next(
         (attr for attr in node.attribute if attr.name == "outputs_info"), None

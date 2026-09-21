@@ -24,6 +24,13 @@ _GATHER_FIXTURE = os.path.join(
     "fixtures",
     "gather_1x8_axis1_even4.axmodel.gz",
 )
+_SLICE_STEP2_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "scripts",
+    "axera",
+    "fixtures",
+    "slice_1x8_axis1_step2_len4.axmodel.gz",
+)
 
 
 def _fixture_path(tmp_path):
@@ -101,6 +108,13 @@ def _gather_fixture_path(tmp_path):
     return str(path)
 
 
+def _slice_step2_fixture_path(tmp_path):
+    path = tmp_path / "slice_step2_reference.axmodel"
+    with gzip.open(_SLICE_STEP2_FIXTURE, "rb") as source, path.open("wb") as target:
+        target.write(source.read())
+    return str(path)
+
+
 @pytest.mark.parametrize(
     "indices,expected_words",
     [
@@ -153,4 +167,42 @@ def test_emit_gather_rejects_reference_with_unmeasured_parameter_table(tmp_path)
     with pytest.raises(ValueError, match="padding"):
         emit_gather_axmodel(
             reference, str(tmp_path / "bad.axmodel"), indices=[1, 3, 5, 7]
+        )
+
+
+@pytest.mark.parametrize("start", [0, 1])
+def test_emit_slice_step2_retargets_offset_and_preserves_mcode(tmp_path, start):
+    reference = _slice_step2_fixture_path(tmp_path)
+    target = tmp_path / "slice_step2_target.axmodel"
+    source_model = onnx.load(reference, load_external_data=False)
+    source_mcode = bytes(_init(source_model, "subgraph_npu_0_b1_neu").raw_data)
+
+    emit_slice_axmodel(reference, str(target), start=start, end=8, step=2)
+
+    emitted = onnx.load(str(target), load_external_data=False)
+    assert (
+        struct.unpack("<5Q", _init(emitted, "npu_params").raw_data) == (start * 4,) * 5
+    )
+    assert bytes(_init(emitted, "subgraph_npu_0_b1_neu").raw_data) == source_mcode
+    assert [
+        d.dim_value for d in emitted.graph.output[0].type.tensor_type.shape.dim
+    ] == [1, 4]
+    assert json.loads(_attr(emitted.graph.node[0], "outputs_info")) == {
+        "y": ["FP32", [1, 4]]
+    }
+
+
+@pytest.mark.parametrize(
+    "start,end,step",
+    [(2, 8, 2), (0, 7, 2), (0, 8, 0), (0, 8, True)],
+)
+def test_emit_slice_rejects_unmeasured_step2_ranges(tmp_path, start, end, step):
+    reference = _slice_step2_fixture_path(tmp_path)
+    with pytest.raises(ValueError):
+        emit_slice_axmodel(
+            reference,
+            str(tmp_path / "bad_step2.axmodel"),
+            start=start,
+            end=end,
+            step=step,
         )
