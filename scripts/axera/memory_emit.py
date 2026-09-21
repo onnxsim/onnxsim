@@ -1,16 +1,15 @@
 """Small, evidence-scoped emitters for Axera memory-only operators.
 
 Pulsar2 7.0-lite emits measured AX650 ``Slice`` templates for ``X[1, 8]``
-(axis 1), covering step-one lengths 3/4, step-two length 4, and step-three
-length 3. The operation's
-byte offset is stored in five repeated uint64 entries in ``npu_params`` and
-the output shape is stored in the ``neu mode`` node's ``outputs_info``
-attribute plus ONNX output metadata. Step-one length-three models use the
-measured length-four template; compiler-built length-three MCode has extra
-shape-specific bytes, but the patched template ran correctly for every tested
-start. Steps two and three each have their own compiled template; both support
-only starts 0 and 1 with end 8. Other ranks, axes, steps, and input shapes
-remain out of scope.
+(axis 1), covering step-one lengths 3/4 and steps two through four. The
+operation's byte offset is stored in five repeated uint64 entries in
+``npu_params``; the output shape is stored in the ``neu mode`` node's
+``outputs_info`` attribute plus ONNX output metadata. Step-one length-three
+models use the measured length-four template; compiler-built length-three
+MCode has extra shape-specific bytes, but the patched template ran correctly
+for every tested start. Steps two through four each have their own compiled template; each
+supports only starts 0 and 1 with end 8. Other ranks, axes, steps, and input
+shapes remain out of scope.
 
 It also retargets measured static ``Gather`` index vectors for
 ``X[1,8] -> Y[1,4]``. Their indices are stored in the compiled model's
@@ -24,7 +23,8 @@ bytes 988, 1172, and 1584; emitted length-three models retain the length-four
 template and have been hardware-verified. Step-two starts 0 and 1 shared a
 second MCode template, with `npu_params` offsets 0 and 4 respectively; see the
 separate step-two fixture. Step-three starts 0 and 1 shared a third MCode
-template, again with offsets 0 and 4; see the step-three fixture.
+template, again with offsets 0 and 4; see the step-three fixture. Step-four
+starts 0 and 1 share a fourth template with offsets 0 and 4.
 """
 
 from __future__ import annotations
@@ -47,6 +47,9 @@ _SLICE_STEP2_TEMPLATE = os.path.join(
 _SLICE_STEP3_TEMPLATE = os.path.join(
     _HERE, "fixtures", "slice_1x8_axis1_step3_len3.axmodel.gz"
 )
+_SLICE_STEP4_TEMPLATE = os.path.join(
+    _HERE, "fixtures", "slice_1x8_axis1_step4_len2.axmodel.gz"
+)
 _GATHER_TEMPLATE = os.path.join(_HERE, "fixtures", "gather_1x8_axis1_even4.axmodel.gz")
 _NOISE_START = 301
 _NOISE_END = 326
@@ -57,7 +60,7 @@ _GATHER_INPUT_WIDTH = 8
 def _supported_slice(start: int, end: int, step: int) -> bool:
     if step == 1:
         return end - start in (3, 4) and 0 <= start <= 4
-    return step in (2, 3) and end == 8 and start in (0, 1)
+    return step in (2, 3, 4) and end == 8 and start in (0, 1)
 
 
 def _initializer(model: onnx.ModelProto, name: str):
@@ -172,7 +175,8 @@ def emit_slice_axmodel(
     ``start``, ``end``, and ``step`` follow ONNX's positive-step, end-exclusive
     semantics. Step 1 supports output lengths 3/4 with starts 0..4. Step 2
     supports only ``[0:8:2]`` and ``[1:8:2]``; step 3 supports only
-    ``[0:8:3]`` and ``[1:8:3]``. The target output shape is
+    ``[0:8:3]`` and ``[1:8:3]``; step 4 supports only ``[0:8:4]`` and
+    ``[1:8:4]``. The target output shape is
     ``[1, ceil((end - start) / step)]``. The five repeated offset words in
     ``npu_params`` and output shape metadata are updated; the matching
     characterized MCode template is retained byte-for-byte.
@@ -190,6 +194,7 @@ def emit_slice_axmodel(
         raise ValueError(
             "step 1 supports length 3/4 with start 0..4; step 2 supports "
             "[0:8:2]/[1:8:2]; step 3 supports [0:8:3]/[1:8:3]; "
+            "step 4 supports [0:8:4]/[1:8:4]; "
             f"got [{start}, {end}:{step}]"
         )
 
@@ -198,6 +203,7 @@ def emit_slice_axmodel(
         1: _SLICE_TEMPLATE,
         2: _SLICE_STEP2_TEMPLATE,
         3: _SLICE_STEP3_TEMPLATE,
+        4: _SLICE_STEP4_TEMPLATE,
     }[step]
     node, _ = _validate_slice_template(model, template_path)
     table = _initializer(model, "npu_params")

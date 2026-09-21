@@ -3,11 +3,12 @@
 ## Current state
 
 The first narrow memory-op emitter is static float32 `Slice` support for an
-input shaped `[1, 8]`, axis 1, with measured steps 1, 2, and 3. Its entry point is
+input shaped `[1, 8]`, axis 1, with measured steps 1 through 4. Its entry point
+is
 `emit_slice_axmodel(reference_path, output_path, start=..., end=..., step=...)`
 in `scripts/axera/memory_emit.py`. Step 1 accepts length-three and length-four
-intervals with starts 0 through 4. Steps 2 and 3 each accept starts 0 or 1
-with end 8, using separate compiled fixtures. It checks the reference model
+intervals with starts 0 through 4. Steps 2, 3, and 4 each accept starts 0 or
+1 with end 8, using separate compiled fixtures. It checks the reference model
 structure and normalized MCode before updating the parameter table and
 output-shape metadata. Compiler-built step-one length-three MCode has three
 additional shape-specific byte changes, but the retained length-four MCode
@@ -17,8 +18,8 @@ results are in
 
 The model was built with Pulsar2 7.0-lite and run inside the LXD VM `axcl-vm`
 on AX8850 V3.6.5 firmware. Five step-one length-three variants, two step-one
-length-four variants, and both step-two and step-three variants returned the
-expected values for input
+length-four variants, and both step-two, step-three, and step-four variants
+returned the expected values for input
 `[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
 `tests/test_axera_memory_emit.py`.
 
@@ -50,10 +51,13 @@ compiled quantization configuration.
 
 A length-two Gather (`indices=[0,3]`, output `[1,2]`) was compiled separately
 in `/home/takecheeze/npu-scratch/t_codegen_gather_len2`. Its parameter table
-shrinks to 48 bytes (six uint64 words), but its 2600-byte MCode differs from
-the length-four template across 916 bytes. No NPU run was made, so the current
-emitter remains restricted to four outputs; adding shorter outputs needs a
-separate compiled template and device check.
+shrinks to 48 bytes (12 uint32 words), but its 2600-byte MCode differs from
+the length-four template across 916 bytes. A length-three build in
+`/home/takecheeze/npu-scratch/t_codegen_gather_len3` uses 52 bytes (13 uint32
+words) and a 2664-byte MCode, also substantially different from length four.
+No NPU runs were made for these output lengths, so the emitter remains
+restricted to four outputs; shorter outputs need their own compiled template
+and device check.
 
 ## Next steps
 

@@ -45,6 +45,13 @@ _SLICE_STEP3_FIXTURE = os.path.join(
     "fixtures",
     "slice_1x8_axis1_step3_len3.axmodel.gz",
 )
+_SLICE_STEP4_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "scripts",
+    "axera",
+    "fixtures",
+    "slice_1x8_axis1_step4_len2.axmodel.gz",
+)
 
 
 def _fixture_path(tmp_path):
@@ -136,6 +143,13 @@ def _slice_step3_fixture_path(tmp_path):
     return str(path)
 
 
+def _slice_step4_fixture_path(tmp_path):
+    path = tmp_path / "slice_step4_reference.axmodel"
+    with gzip.open(_SLICE_STEP4_FIXTURE, "rb") as source, path.open("wb") as target:
+        target.write(source.read())
+    return str(path)
+
+
 @pytest.mark.parametrize(
     "indices,expected_words",
     [
@@ -215,14 +229,25 @@ def test_emit_slice_step2_retargets_offset_and_preserves_mcode(tmp_path, start):
 
 @pytest.mark.parametrize(
     "start,end,step",
-    [(2, 8, 2), (0, 7, 2), (0, 8, 0), (0, 8, True), (2, 8, 3), (0, 7, 3)],
+    [
+        (2, 8, 2),
+        (0, 7, 2),
+        (0, 8, 0),
+        (0, 8, True),
+        (2, 8, 3),
+        (0, 7, 3),
+        (2, 8, 4),
+        (0, 7, 4),
+    ],
 )
 def test_emit_slice_rejects_unmeasured_nonunit_ranges(tmp_path, start, end, step):
-    reference = (
-        _slice_step2_fixture_path(tmp_path)
-        if step == 2
-        else _slice_step3_fixture_path(tmp_path)
-    )
+    reference_for_step = {
+        1: _fixture_path,
+        2: _slice_step2_fixture_path,
+        3: _slice_step3_fixture_path,
+        4: _slice_step4_fixture_path,
+    }
+    reference = reference_for_step.get(step, _fixture_path)(tmp_path)
     with pytest.raises(ValueError):
         emit_slice_axmodel(
             reference,
@@ -252,4 +277,26 @@ def test_emit_slice_step3_retargets_offset_and_preserves_mcode(tmp_path, start):
     ] == [1, 3]
     assert json.loads(_attr(emitted.graph.node[0], "outputs_info")) == {
         "y": ["FP32", [1, 3]]
+    }
+
+
+@pytest.mark.parametrize("start", [0, 1])
+def test_emit_slice_step4_retargets_offset_and_preserves_mcode(tmp_path, start):
+    reference = _slice_step4_fixture_path(tmp_path)
+    target = tmp_path / "slice_step4_target.axmodel"
+    source_model = onnx.load(reference, load_external_data=False)
+    source_mcode = bytes(_init(source_model, "subgraph_npu_0_b1_neu").raw_data)
+
+    emit_slice_axmodel(reference, str(target), start=start, end=8, step=4)
+
+    emitted = onnx.load(str(target), load_external_data=False)
+    assert (
+        struct.unpack("<5Q", _init(emitted, "npu_params").raw_data) == (start * 4,) * 5
+    )
+    assert bytes(_init(emitted, "subgraph_npu_0_b1_neu").raw_data) == source_mcode
+    assert [
+        d.dim_value for d in emitted.graph.output[0].type.tensor_type.shape.dim
+    ] == [1, 2]
+    assert json.loads(_attr(emitted.graph.node[0], "outputs_info")) == {
+        "y": ["FP32", [1, 2]]
     }

@@ -2,8 +2,8 @@
 
 `scripts/axera/memory_emit.py` adds a first narrow emitter for a data-movement
 operator: a compiled ONNX `Slice` with float input `[1, 8]`, axis 1. For step 1
-it supports lengths 3 and 4 with starts 0 through 4. For step 2 it supports
-only `[0:8:2]` and `[1:8:2]`; the input shape stays fixed.
+it supports lengths 3 and 4 with starts 0 through 4. For steps 2 through 4 it
+supports only starts 0 or 1 with end 8; the input shape stays fixed.
 
 ## What the compiler stores
 
@@ -68,6 +68,17 @@ Both emitted variants ran on the AX8850 in `axcl-vm` with input
 `[[0,1,2,3,4,5,6,7]]`; `[0:8:3]` returned `[[0,3,6]]` and `[1:8:3]`
 returned `[[1,4,7]]`. The implementation rejects other starts and ends for
 step three.
+
+## Step-four Slice
+
+Pulsar2 builds of `[0:8:4]` and `[1:8:4]` share another MCode template for
+output shape `[1,2]`. The `npu_params` table again stores five copies of
+`start * 4`; the fixture is
+`scripts/axera/fixtures/slice_1x8_axis1_step4_len2.axmodel.gz`.
+
+Both emitted variants ran on the AX8850 in `axcl-vm` with input
+`[[0,1,2,3,4,5,6,7]]`; `[0:8:4]` returned `[[0,4]]` and `[1:8:4]` returned
+`[[1,5]]`. The implementation rejects other starts and ends for step four.
 
 ## Static Gather index retargeting
 
