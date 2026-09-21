@@ -1312,6 +1312,179 @@ def _grad_reshape(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
     return [ctx.b.op("Reshape", [g, ctx.int64_const(shape, "shape")]), None]
 
 
+def _constant_ints(ctx: _Backward, name: str, node: onnx.NodeProto) -> List[int]:
+    """Read an integer parameter tensor from an initializer.
+
+    Shape/index parameters used by the two rules below must be compile-time
+    constants. Keeping this lookup local avoids adding runtime shape plumbing
+    to the backward graph.
+    """
+    tensor = next((t for t in ctx.b.initializer if t.name == name), None)
+    if tensor is None:
+        raise UnsupportedOpError(
+            f"{node.op_type} parameter {name!r} must be a constant initializer "
+            f"(node {node.output[0]!r})"
+        )
+    try:
+        values = np.asarray(onnx.numpy_helper.to_array(tensor))
+    except Exception as exc:
+        raise UnsupportedOpError(
+            f"{node.op_type} parameter {name!r} is not a readable constant "
+            f"(node {node.output[0]!r})"
+        ) from exc
+    if values.dtype.kind not in "iu":
+        raise UnsupportedOpError(
+            f"{node.op_type} parameter {name!r} must have integer dtype "
+            f"(node {node.output[0]!r})"
+        )
+    return [int(v) for v in values.reshape(-1)]
+
+
+def _grad_slice(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """VJP of ONNX ``Slice`` using static, positive-step parameters.
+
+    The selected values are embedded back into the input shape by multiplying
+    along each sliced axis by a constant selection matrix. This uses only the
+    existing ``MatMul``/``Transpose`` vocabulary and does not materialize a
+    dense, input-sized scatter tensor. Dynamic parameters, negative steps and
+    non-static input dimensions are deliberately rejected.
+    """
+    rank = len(ctx.shape(node.input[0]))
+    if rank == 0:
+        raise UnsupportedOpError(
+            f"Slice of a scalar is not supported (node {node.output[0]!r})"
+        )
+
+    if len(node.input) < 3 or not node.input[1] or not node.input[2]:
+        starts = [int(v) for v in _attr(node, "starts", [])]
+        ends = [int(v) for v in _attr(node, "ends", [])]
+        axes = [int(v) for v in _attr(node, "axes", range(len(starts)))]
+        steps = [int(v) for v in _attr(node, "steps", [1] * len(starts))]
+    else:
+        starts = _constant_ints(ctx, node.input[1], node)
+        ends = _constant_ints(ctx, node.input[2], node)
+        axes = (
+            _constant_ints(ctx, node.input[3], node)
+            if len(node.input) > 3 and node.input[3]
+            else list(range(len(starts)))
+        )
+        steps = (
+            _constant_ints(ctx, node.input[4], node)
+            if len(node.input) > 4 and node.input[4]
+            else [1] * len(starts)
+        )
+    if not (len(starts) == len(ends) == len(axes) == len(steps)):
+        raise UnsupportedOpError(
+            f"Slice parameter lengths disagree (node {node.output[0]!r})"
+        )
+
+    in_shape = ctx.shape(node.input[0])
+    if any(not isinstance(d, int) for d in in_shape):
+        raise UnsupportedOpError(
+            f"Slice requires static input dimensions (node {node.output[0]!r})"
+        )
+    specs = {}
+    for start, end, axis, step in zip(starts, ends, axes, steps):
+        axis = axis + rank if axis < 0 else axis
+        if axis < 0 or axis >= rank or axis in specs:
+            raise UnsupportedOpError(
+                f"Slice axes must be unique and in range (node {node.output[0]!r})"
+            )
+        if step <= 0:
+            raise UnsupportedOpError(f"Slice requires positive steps (node {node.output[0]!r})")
+        size = int(in_shape[axis])
+        # ONNX positive-step slicing clips both bounds to [0, size], after
+        # translating negative bounds relative to the end of the axis.
+        start = max(0, min(size, start + size if start < 0 else start))
+        end = max(0, min(size, end + size if end < 0 else end))
+        specs[axis] = (start, end, step)
+
+    expected = ctx.shape(node.output[0])
+    actual_slice_sizes = []
+    for axis, dim in enumerate(in_shape):
+        start, end, step = specs.get(axis, (0, int(dim), 1))
+        actual_slice_sizes.append(len(range(start, end, step)))
+    if tuple(actual_slice_sizes) != tuple(expected):
+        raise UnsupportedOpError(
+            f"Slice parameters do not match inferred output shape {expected} "
+            f"(computed {tuple(actual_slice_sizes)}, node {node.output[0]!r})"
+        )
+
+    out = g
+    for axis, dim in enumerate(in_shape):
+        start, end, step = specs.get(axis, (0, int(dim), 1))
+        indices = list(range(start, end, step))
+        if len(indices) == int(dim):
+            continue
+        perm = [i for i in range(rank) if i != axis] + [axis]
+        inv_perm = [perm.index(i) for i in range(rank)]
+        if axis != rank - 1:
+            out = ctx.b.transpose(out, perm)
+        selector = np.zeros((len(indices), int(dim)), dtype=np.float32)
+        if indices:
+            selector[np.arange(len(indices)), indices] = 1.0
+        out = ctx.b.matmul(out, ctx.b.const(selector, "slice_vjp"))
+        if axis != rank - 1:
+            out = ctx.b.transpose(out, inv_perm)
+    return [out] + [None] * (len(node.input) - 1)
+
+
+def _grad_pad(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """VJP of static nonnegative constant-mode ``Pad`` via constant gathers."""
+    mode = _attr(node, "mode", "constant")
+    if isinstance(mode, bytes):
+        mode = mode.decode("utf-8")
+    if mode != "constant":
+        raise UnsupportedOpError(
+            f"Pad mode {mode!r} is unsupported (node {node.output[0]!r})"
+        )
+    if len(node.input) < 2 or not node.input[1]:
+        raise UnsupportedOpError(f"Pad requires constant pads (node {node.output[0]!r})")
+    pads = _constant_ints(ctx, node.input[1], node)
+    in_shape = ctx.shape(node.input[0])
+    if any(not isinstance(d, int) for d in in_shape):
+        raise UnsupportedOpError(
+            f"Pad requires static input dimensions (node {node.output[0]!r})"
+        )
+    rank = len(in_shape)
+    if len(pads) != 2 * rank:
+        raise UnsupportedOpError(
+            f"Pad requires 2*rank pad values (node {node.output[0]!r})"
+        )
+    begins, ends = pads[:rank], pads[rank:]
+    if any(p < 0 for p in pads):
+        raise UnsupportedOpError(
+            f"Pad with negative pads is unsupported (node {node.output[0]!r})"
+        )
+    if len(node.input) > 2 and node.input[2]:
+        value = next((t for t in ctx.b.initializer if t.name == node.input[2]), None)
+        if value is None:
+            raise UnsupportedOpError(
+                f"Pad constant_value must be a constant initializer "
+                f"(node {node.output[0]!r})"
+            )
+        if onnx.numpy_helper.to_array(value).size != 1:
+            raise UnsupportedOpError(
+                f"Pad constant_value must be scalar (node {node.output[0]!r})"
+            )
+    out_shape = ctx.shape(node.output[0])
+    expected = tuple(int(d) + begins[i] + ends[i] for i, d in enumerate(in_shape))
+    if expected != tuple(out_shape):
+        raise UnsupportedOpError(
+            f"Pad values do not match inferred output shape {out_shape} "
+            f"(computed {expected}, node {node.output[0]!r})"
+        )
+    out = g
+    for axis, (dim, begin) in enumerate(zip(in_shape, begins)):
+        indices = list(range(begin, begin + int(dim)))
+        if begin == 0 and ends[axis] == 0:
+            continue
+        out = ctx.b.op(
+            "Gather", [out, ctx.int64_const(indices, "pad_vjp_idx")], axis=axis
+        )
+    return [out] + [None] * (len(node.input) - 1)
+
+
 def _reduced_axes(
     node: onnx.NodeProto,
     in_shape: Tuple[Union[int, str], ...],
@@ -2468,7 +2641,9 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "DequantizeLinear": _grad_dequantize_linear,
     "DepthToSpace": _grad_depth_to_space,
     "IsNaN": _grad_is_nan,
+    "Pad": _grad_pad,
     "QuantizeLinear": _grad_quantize_linear,
+    "Slice": _grad_slice,
     "Squeeze": _grad_squeeze_or_unsqueeze,
     "Unsqueeze": _grad_squeeze_or_unsqueeze,
     "Where": _grad_where,
