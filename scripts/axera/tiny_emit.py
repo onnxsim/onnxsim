@@ -24,12 +24,12 @@ confirmed by direct UOp inspection against a real tinygrad install, not
 assumed from tinygrad's Python source -- these lowerings can and do
 change across tinygrad versions.
 
-The Add matcher now has a deliberately narrow ``emit_add`` counterpart: it
-can transplant the three confirmed output-scale fields in an existing Add
-template, while requiring the graph shape and input quantization to remain the
-same. Neg has its own scale patcher; the other matchers still describe graphs
-without claiming that their mcode can be synthesized. See each function's
-docstring for the exact boundary.
+The Add matcher and a corresponding Sub scale patcher can transplant the
+three confirmed output-scale fields in existing templates, while requiring
+the graph shape and input quantization to remain the same. Neg has its own
+scale patcher; the other matchers still describe graphs without claiming
+that their mcode can be synthesized. See each function's docstring for the
+exact boundary.
 
 ``patch_site_a`` and ``patch_matmul_a_scale`` (2026-09) generalize the
 site-A idea beyond Mul, to Gemm/Conv and MatMul's own operands -- the
@@ -332,21 +332,13 @@ def emit_neg(reference_mcode: bytes, old_scale: float, new_scale: float) -> byte
     return bytes(out)
 
 
-def emit_add(reference_mcode: bytes, old_y_scale: float, new_y_scale: float) -> bytes:
-    """Patch Add's output scale in an existing two-input Add mcode template.
-
-    The confirmed Add encoding carries its direct output scale at the three
-    ``a1``/bank-15 fields 96, 112 and 128. This edits those four-byte operands
-    only. The reference must already have the target's shape, operand order,
-    input scales and zero points; this does not synthesize Add's instruction
-    stream or adjust its input-side quantization fields. Output zero point can
-    be patched separately with ``patch_add_output_zero_point``. A missing,
-    duplicate or differently encoded field group is rejected.
-    """
+def _patch_additive_output_scale(
+    reference_mcode: bytes, old_y_scale: float, new_y_scale: float, op_name: str
+) -> bytes:
     from mcode import FULL_RULE, decode, stream_bounds
 
     if not all(math.isfinite(s) and s > 0.0 for s in (old_y_scale, new_y_scale)):
-        raise ValueError("Add output scales must be finite and positive")
+        raise ValueError(f"{op_name} output scales must be finite and positive")
     old_word = struct.pack("<f", float(old_y_scale))
     new_word = struct.pack("<f", float(new_y_scale))
     lo, hi = stream_bounds(reference_mcode)
@@ -358,16 +350,88 @@ def emit_add(reference_mcode: bytes, old_y_scale: float, new_y_scale: float) -> 
         and record.get("verb") == 0xA1
         and record.get("bank") == 15
         and record.get("field") in (96, 112, 128)
+        and record.get("operand") == old_word
     ]
     if sorted(record["field"] for record in fields) != [96, 112, 128]:
-        raise ValueError("Add mcode must contain exactly fields 96, 112 and 128")
-    if any(record["operand"] != old_word for record in fields):
-        raise ValueError("Add output-scale fields do not all match old_y_scale")
+        raise ValueError(
+            f"{op_name} mcode must contain exactly one output-scale operand"
+            " at fields 96, 112 and 128"
+        )
 
     out = bytearray(reference_mcode)
     for record in fields:
         at = record["at"] + 4
         out[at : at + 4] = new_word
+    return bytes(out)
+
+
+def emit_add(reference_mcode: bytes, old_y_scale: float, new_y_scale: float) -> bytes:
+    """Patch Add's output scale in an existing two-input Add mcode template.
+
+    The confirmed Add encoding carries its direct output scale at the three
+    ``a1``/bank-15 fields 96, 112 and 128. Those field IDs also carry other
+    scale families, so the patch selects by both field and exact old float32
+    operand. The reference must already have the target's shape, operand
+    order, input scales and zero points. Output zero point can be patched
+    separately with ``patch_add_output_zero_point``; this does not synthesize
+    Add instructions or update its input-side quantization fields.
+    """
+    return _patch_additive_output_scale(
+        reference_mcode, old_y_scale, new_y_scale, "Add"
+    )
+
+
+def patch_sub_output_scale(
+    reference_mcode: bytes, old_y_scale: float, new_y_scale: float
+) -> bytes:
+    """Patch Sub's output scale in an isolated two-input Sub template.
+
+    The tested Sub encoding shares Add's ``a1``/bank-15 output fields 96, 112
+    and 128. Since those IDs also carry an input reciprocal, the exact old
+    float32 operand is part of the match; a missing or ambiguous set is
+    refused. The reference's shape and input quantization must stay fixed.
+    Fixture evidence covers one shape, and this field patch has not been
+    confirmed against a changed-calibration hardware rebuild.
+    """
+    return _patch_additive_output_scale(
+        reference_mcode, old_y_scale, new_y_scale, "Sub"
+    )
+
+
+def _patch_elementwise_output_zero_point(
+    reference_mcode: bytes, old_zp_y: int, new_zp_y: int, op_name: str
+) -> bytes:
+    from mcode import FULL_RULE, decode, stream_bounds
+
+    if any(
+        not isinstance(value, int) or not 0 <= value <= 255
+        for value in (old_zp_y, new_zp_y)
+    ):
+        raise ValueError(
+            f"{op_name} output zero points must be integers in [0, 255]"
+        )
+    if old_zp_y == 4:
+        raise ValueError(f"old_zp_y=4 is ambiguous with {op_name}'s fixed payload")
+
+    lo, hi = stream_bounds(reference_mcode)
+    records = decode(reference_mcode, start=lo, end=hi, **FULL_RULE)
+    locator = [
+        record
+        for record in records
+        if record.get("kind") == "S"
+        and record.get("reg") == 14
+        and record.get("tag") == 131
+    ]
+    matches = [record for record in locator if record["payload"][-1] == old_zp_y]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one {op_name} zp_y match at reg=14/tag=131, found {len(matches)}"
+        )
+
+    record = matches[0]
+    out = bytearray(reference_mcode)
+    at = record["at"] + record["p"] + 1
+    out[at] = new_zp_y
     return bytes(out)
 
 
@@ -384,36 +448,24 @@ def patch_add_output_zero_point(
     input quantization. It does not synthesize Add instructions or establish
     that this isolated field change matches a hardware rebuild.
     """
-    from mcode import FULL_RULE, decode, stream_bounds
+    return _patch_elementwise_output_zero_point(
+        reference_mcode, old_zp_y, new_zp_y, "Add"
+    )
 
-    if any(
-        not isinstance(value, int) or not 0 <= value <= 255
-        for value in (old_zp_y, new_zp_y)
-    ):
-        raise ValueError("Add output zero points must be integers in [0, 255]")
-    if old_zp_y == 4:
-        raise ValueError("old_zp_y=4 is ambiguous with Add's fixed payload")
 
-    lo, hi = stream_bounds(reference_mcode)
-    records = decode(reference_mcode, start=lo, end=hi, **FULL_RULE)
-    locator = [
-        record
-        for record in records
-        if record.get("kind") == "S"
-        and record.get("reg") == 14
-        and record.get("tag") == 131
-    ]
-    matches = [record for record in locator if record["payload"][-1] == old_zp_y]
-    if len(matches) != 1:
-        raise ValueError(
-            f"expected one Add zp_y match at reg=14/tag=131, found {len(matches)}"
-        )
+def patch_sub_output_zero_point(
+    reference_mcode: bytes, old_zp_y: int, new_zp_y: int
+) -> bytes:
+    """Patch Sub's output zero point at its decoded ``reg=14, tag=131`` field.
 
-    record = matches[0]
-    out = bytearray(reference_mcode)
-    at = record["at"] + record["p"] + 1
-    out[at] = new_zp_y
-    return bytes(out)
+    Sub shares Add's locator and unrelated fixed-payload collision at 4.
+    Only a unique old-value match is changed; shape and input quantization
+    must stay fixed. This is an offline field patch, with no changed-scale
+    hardware validation.
+    """
+    return _patch_elementwise_output_zero_point(
+        reference_mcode, old_zp_y, new_zp_y, "Sub"
+    )
 
 
 def patch_matmul_gemm_output_zero_point(
