@@ -1327,6 +1327,33 @@ def _grad_leaky_relu(
     return [ctx.b.mul(g, derivative)]
 
 
+def _grad_elu(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """VJP of ONNX Elu, reusing the forward result on the negative branch."""
+    if len(node.input) != 1 or not node.input[0]:
+        raise UnsupportedOpError(
+            f"Elu requires exactly one data input (node {node.output[0]!r})"
+        )
+    alpha = _attr(node, "alpha", 1.0)
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise UnsupportedOpError(
+            f"Elu alpha must be a finite scalar (node {node.output[0]!r})"
+        )
+    alpha = float(alpha)
+    if not np.isfinite(alpha):
+        raise UnsupportedOpError(
+            f"Elu alpha must be a finite scalar (node {node.output[0]!r})"
+        )
+
+    negative = ctx.b.op("Less", [node.input[0], ctx.b.const(0.0, "elu_zero")])
+    negative_mask = ctx.b.op("Cast", [negative], to=onnx.TensorProto.FLOAT)
+    nonnegative_mask = ctx.b.sub(ctx.b.const(1.0, "elu_one"), negative_mask)
+    negative_derivative = ctx.b.add(node.output[0], ctx.b.const(alpha, "elu_alpha"))
+    derivative = ctx.b.add(
+        nonnegative_mask, ctx.b.mul(negative_mask, negative_derivative)
+    )
+    return [ctx.b.mul(g, derivative)]
+
+
 def _grad_softplus(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """VJP of ``Softplus(x) = log(1 + exp(x))`` as ``g * sigmoid(x)``.
 
@@ -2838,6 +2865,7 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "Concat": _grad_concat,
     "DequantizeLinear": _grad_dequantize_linear,
     "DepthToSpace": _grad_depth_to_space,
+    "Elu": _grad_elu,
     "Expand": _grad_expand,
     "IsNaN": _grad_is_nan,
     "LeakyRelu": _grad_leaky_relu,

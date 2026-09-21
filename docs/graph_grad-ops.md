@@ -98,6 +98,7 @@ once ported to C++; the only reason they live here is the missing mirror
 | `Concat` | one `Gather` per input, pulling that input's own contiguous slice of `g` back out along the concat axis (`Split`'s adjoint, reached the other way) | `_grad_concat` |
 | `DequantizeLinear` | straight-through: `dx = g` (paired with `QuantizeLinear` below) | `_grad_dequantize_linear` |
 | `DepthToSpace` | reshape-transpose-reshape, the exact inverse of the op's own decomposition -- for `nn.PixelShuffle` exports | `_grad_depth_to_space` |
+| `Elu` | `g` for `x >= 0`, otherwise `g * (y + alpha)` using the forward output; `alpha` defaults to 1 | `_grad_elu` |
 | `Expand` | sum `g` over axes broadcast from `data`; constant target shape and static compatible inferred dimensions only, no gradient for `shape` | `_grad_expand` |
 | `IsNaN` | no gradient (boolean output) | `_grad_is_nan` |
 | `LeakyRelu` | `g` on `x > 0`, otherwise `alpha * g`; chooses `alpha` at `x = 0` | `_grad_leaky_relu` |
