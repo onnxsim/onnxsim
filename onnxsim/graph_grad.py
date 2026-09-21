@@ -237,14 +237,21 @@ class _Backward:
     ) -> None:
         self.b = b
         self.shapes = shapes
+        # Shape metadata is fixed for one build_backward call; normalize on first use.
+        self._shape_cache: Dict[str, Tuple[Union[int, str], ...]] = {}
 
     def shape(self, name: str) -> Tuple[Union[int, str], ...]:
+        cached = self._shape_cache.get(name)
+        if cached is not None:
+            return cached
         if name not in self.shapes:
             raise ValueError(
                 f"no static shape given for tensor {name!r}; build_backward needs "
                 "the shape of every value the slice touches"
             )
-        return tuple(d if isinstance(d, str) else int(d) for d in self.shapes[name])
+        shape = tuple(d if isinstance(d, str) else int(d) for d in self.shapes[name])
+        self._shape_cache[name] = shape
+        return shape
 
     def int64_const(self, values: Sequence[Union[int, str]], hint: str = "i") -> str:
         """An int64 initializer, for the ``axes``/``shape`` inputs that
