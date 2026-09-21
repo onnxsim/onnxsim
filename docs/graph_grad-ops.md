@@ -100,11 +100,15 @@ once ported to C++; the only reason they live here is the missing mirror
 | `DepthToSpace` | reshape-transpose-reshape, the exact inverse of the op's own decomposition -- for `nn.PixelShuffle` exports | `_grad_depth_to_space` |
 | `IsNaN` | no gradient (boolean output) | `_grad_is_nan` |
 | `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only | `_grad_pad` |
+| `PRelu` | `dX = g` for `x >= 0`, `slope*g` for `x < 0`; `dSlope = sum(g*x)` over negative inputs, reduced to the scalar slope shape | `_grad_prelu_scalar` |
 | `QuantizeLinear` | straight-through: `dx = g`, no gradient for `scale`/`zero_point` (fake-quantization convention) | `_grad_quantize_linear` |
 | `Slice` | embed `g` into the input positions selected by static `starts`/`ends`/`axes`/positive `steps`, using constant selection `MatMul`s | `_grad_slice` |
 | `Squeeze` | `g` reshaped back to `data`'s own (pre-squeeze) shape | `_grad_squeeze_or_unsqueeze` |
 | `Unsqueeze` | same as `Squeeze`, the same reshape either direction | `_grad_squeeze_or_unsqueeze` |
 | `Where` | `g` masked by `Cast(cond)` and routed to whichever of the two data operands was selected; `cond` gets no gradient | `_grad_where` |
+
+`PRelu` currently accepts only a static slope shape containing one element
+(including a rank-0 scalar). Vector and per-channel slopes remain unsupported.
 
 ## Genuinely unsupported: control flow
 

@@ -1242,6 +1242,45 @@ def _grad_relu(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return [ctx.b.mul(g, ctx.b.greater_mask(node.input[0], 0.0))]
 
 
+def _grad_prelu_scalar(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """VJP of PRelu for a scalar (size-one) slope tensor only.
+
+    Restricting the slope to one element keeps its broadcast meaning stable
+    across ONNX's legacy and modern PRelu schemas. The strict ``x < 0`` mask
+    matches the ONNX function body, so ``x == 0`` follows the identity branch.
+    """
+    if len(node.input) != 2 or not node.input[0] or not node.input[1]:
+        raise UnsupportedOpError(
+            f"PRelu requires data and slope inputs (node {node.output[0]!r})"
+        )
+
+    x, slope = node.input
+    x_shape = ctx.shape(x)
+    slope_shape = ctx.shape(slope)
+    y_shape = ctx.shape(node.output[0])
+    if y_shape != x_shape:
+        raise UnsupportedOpError(
+            f"PRelu output shape {y_shape} does not match data shape {x_shape} "
+            f"(node {node.output[0]!r})"
+        )
+    if any(not isinstance(dim, int) or dim != 1 for dim in slope_shape):
+        raise UnsupportedOpError(
+            f"PRelu currently requires a scalar (size-one) slope, got "
+            f"shape {slope_shape} (node {node.output[0]!r})"
+        )
+
+    negative = ctx.b.op("Less", [x, ctx.b.const(0.0, "prelu_zero")])
+    negative_mask = ctx.b.op("Cast", [negative], to=onnx.TensorProto.FLOAT)
+    nonnegative_mask = ctx.b.sub(ctx.b.const(1.0, "prelu_one"), negative_mask)
+    dx_factor = ctx.b.add(nonnegative_mask, ctx.b.mul(negative_mask, slope))
+    dx = ctx.b.mul(g, dx_factor)
+    dslope_full = ctx.b.mul(ctx.b.mul(g, x), negative_mask)
+    dslope = ctx.reduce_to(dslope_full, y_shape, slope_shape)
+    return [dx, dslope]
+
+
 # Reference-only: _RULES wires "Sigmoid" to _grad_sigmoid_templated instead.
 def _grad_sigmoid(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # y (1 - y), from the forward output: the forward already computed the
@@ -2675,6 +2714,7 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "DepthToSpace": _grad_depth_to_space,
     "IsNaN": _grad_is_nan,
     "Pad": _grad_pad,
+    "PRelu": _grad_prelu_scalar,
     "QuantizeLinear": _grad_quantize_linear,
     "Slice": _grad_slice,
     "Squeeze": _grad_squeeze_or_unsqueeze,
