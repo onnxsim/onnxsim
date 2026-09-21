@@ -1314,6 +1314,24 @@ def _grad_leaky_relu(
     return [ctx.b.mul(g, derivative)]
 
 
+def _grad_softplus(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """VJP of ``Softplus(x) = log(1 + exp(x))`` as ``g * sigmoid(x)``.
+
+    Writing the sigmoid as ``1 / (1 + exp(-x))`` uses only operators in
+    :data:`BACKWARD_OPS` and avoids the cancellation in ``1 - exp(-y)`` for
+    very negative ``x``. Exponential overflow for very negative inputs maps
+    the already tiny float32 derivative to zero.
+    """
+    if len(node.input) != 1 or not node.input[0]:
+        raise UnsupportedOpError(
+            f"Softplus requires exactly one data input (node {node.output[0]!r})"
+        )
+    neg_x = ctx.b.op("Neg", [node.input[0]])
+    exp_neg_x = ctx.b.op("Exp", [neg_x])
+    denominator = ctx.b.add(ctx.b.const(1.0, "softplus_one"), exp_neg_x)
+    return [ctx.b.div(g, denominator)]
+
+
 # Reference-only: _RULES wires "Sigmoid" to _grad_sigmoid_templated instead.
 def _grad_sigmoid(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # y (1 - y), from the forward output: the forward already computed the
@@ -2751,6 +2769,7 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "PRelu": _grad_prelu_scalar,
     "QuantizeLinear": _grad_quantize_linear,
     "Slice": _grad_slice,
+    "Softplus": _grad_softplus,
     "Squeeze": _grad_squeeze_or_unsqueeze,
     "Unsqueeze": _grad_squeeze_or_unsqueeze,
     "Where": _grad_where,
