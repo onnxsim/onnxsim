@@ -183,14 +183,34 @@ def emit_table(reference_table, origin, codes):
 
     Bits the map calls `CONST` -- and anything it could not explain -- keep the
     reference's value, so the result is the reference table with exactly the
-    weight bits replaced.
+    weight bits replaced. Work one bit plane at a time: expanding both a large
+    reference table and a multi-million-element weight tensor with
+    `unpackbits()` creates several temporary arrays many times larger than the
+    model. Eight vector passes keep peak scratch space proportional to the
+    number of table bytes instead.
     """
-    table_bits = _bits([np.asarray(reference_table, dtype=np.uint8)])[0]
-    code_bits = _bits([np.asarray(codes, dtype=np.uint8).ravel()])[0]
-    mapped = origin != CONST
-    out = table_bits.copy()
-    out[mapped] = code_bits[origin[mapped]]
-    return np.packbits(out, bitorder="little")
+    table = np.asarray(reference_table, dtype=np.uint8).reshape(-1)
+    code = np.asarray(codes, dtype=np.uint8).reshape(-1)
+    origin = np.asarray(origin, dtype=np.int64).reshape(-1)
+    if origin.size != table.size * 8:
+        raise ValueError(
+            f"origin has {origin.size} bits for a {table.size}-byte table"
+        )
+    if np.any(origin < CONST) or np.any(origin >= code.size * 8):
+        raise ValueError("origin contains a code-bit index outside the code array")
+
+    out = table.copy()
+    for bit in range(8):
+        source = origin[bit::8]
+        mapped = source != CONST
+        if not np.any(mapped):
+            continue
+        dst = np.flatnonzero(mapped)
+        src = source[mapped]
+        value = (code[src >> 3] >> (src & 7)) & 1
+        mask = np.uint8(1 << bit)
+        out[dst] = (out[dst] & np.uint8(0xFF ^ int(mask))) | (value * mask)
+    return out
 
 
 def requant_block(codes, x_scale, x_zero, y_scale, y_zero, w_scale):

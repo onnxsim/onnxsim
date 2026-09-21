@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import threading
 
 import numpy as np
 import onnx
@@ -413,16 +414,32 @@ def neg_to_mul(model):
     return changed
 
 
+_name_state = threading.local()
+
+
+def _reset_name_cache(model):
+    """Start a fresh name-allocation pass for ``model``.
+
+    Legalization passes can add thousands of nodes. Rebuilding the complete
+    namespace in `_unique_name()` for every generated value made expansion
+    quadratic in graph size. Cache the namespace for one pass instead; each
+    allocated name is inserted immediately, including names whose protobuf
+    node/initializer is assembled locally and appended later.
+    """
+    _name_state.model = model
+    _name_state.taken = {i.name for i in model.graph.initializer}
+    _name_state.taken.update(n.name for n in model.graph.node if n.name)
+    _name_state.taken.update(o for n in model.graph.node for o in n.output)
+
+
 def _unique_name(model, stem):
-    taken = (
-        {i.name for i in model.graph.initializer}
-        | {n.name for n in model.graph.node if n.name}
-        | {o for n in model.graph.node for o in n.output}
-    )
+    if model is not getattr(_name_state, "model", None):
+        _reset_name_cache(model)
     name, k = stem, 0
-    while name in taken:
+    while name in _name_state.taken:
         k += 1
         name = f"{stem}_{k}"
+    _name_state.taken.add(name)
     return name
 
 
@@ -1651,6 +1668,10 @@ def legalize(model, rules=None):
     """Apply the named rules in order; returns `{rule: sites changed}`."""
     applied = collections.OrderedDict()
     for name in rules or RULES:
+        # Prior passes may have replaced nodes or added values without using
+        # `_unique_name()`. Reconcile once at the pass boundary, not once per
+        # generated tensor.
+        _reset_name_cache(model)
         applied[name] = RULES[name](model)
     return applied
 
