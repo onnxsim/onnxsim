@@ -9,19 +9,20 @@ from pathlib import Path
 
 import numpy as np
 import tvm
-from tvm.contrib.hexagon.build import HexagonLauncher
-from tvm.contrib.hexagon.tools import register_linker
-from tvm.rpc.tracker import Tracker
-from tvm.topi.testing import roi_align_nchw_python
-
 from test_tvm_hexagon_maskrcnn import (
+    _conv_module,
     _conv_transpose_module,
+    _cpu_conv,
     _hexagon_target,
     _model_workloads,
     _pool_module,
     _qdq_module,
     _resize_module,
 )
+from tvm.contrib.hexagon.build import HexagonLauncher
+from tvm.contrib.hexagon.tools import register_linker
+from tvm.rpc.tracker import Tracker
+from tvm.topi.testing import roi_align_nchw_python
 
 
 def _configure_linker():
@@ -35,7 +36,9 @@ def _configure_linker():
         "import subprocess, sys\n"
         f"clang = {str(clang_link)!r}\n"
         "args = ['-Wl,--export-dynamic' if x == '-export-dynamic' else x for x in sys.argv[1:]]\n"
-        "raise SystemExit(subprocess.call([clang, *args]))\n",
+        # Kernels only use C symbols; a dynamic libc++ dependency crashes on the DSP (see
+        # relink_hexagon_skel_static_libcxx.sh).
+        "raise SystemExit(subprocess.call([clang, '-nostdlib++', *args]))\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
@@ -51,7 +54,23 @@ def _cpu_result(module, arrays, output_specs):
 
 
 def _workload(op, workloads, rng, dsp_target, cpu_target, roi_batch):
-    if op == "pool":
+    if op.startswith("conv") and op != "conv_transpose":
+        # "conv0".."conv3": ResNet 1x1/3x3, FPN 3x3 and RoI mask-head 3x3 convolution + bias + ReLU.
+        name, shape, weight_shape, stride, pad_before, pad_after = workloads["convs"][
+            int(op[4:] or 0)
+        ]
+        dsp_module, output_shape = _conv_module(
+            name, shape, weight_shape, stride, pad_before, pad_after, dsp_target
+        )
+        arrays = [
+            rng.normal(0, 0.1, shape).astype("float32"),
+            rng.normal(0, 0.05, weight_shape).astype("float32"),
+            np.zeros((weight_shape[0],), dtype="float32"),
+        ]
+        specs = [(output_shape, "float32")]
+        expected = [_cpu_conv(*arrays, stride, pad_before, pad_after)]
+        compare = lambda got: np.testing.assert_allclose(got[0], expected[0], rtol=2e-3, atol=2e-3)
+    elif op == "pool":
         name, shape, kernel, stride, pads = next(
             case for case in workloads["pools"] if case[0] == "backbone_stem_maxpool"
         )
@@ -149,7 +168,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--device", default="239dbd8f")
     parser.add_argument("--roi-batch", type=int, default=8)
-    parser.add_argument("--ops", default="pool,resize,roi,deconv,qdq")
+    parser.add_argument("--ops", default="pool,resize,roi,deconv,qdq", help="also conv0..conv3")
     parser.add_argument("--repeat", type=int, default=5)
     args = parser.parse_args()
     _configure_linker()
