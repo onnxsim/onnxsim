@@ -258,7 +258,7 @@ class _Backward:
         slips through, the same "misbehave via a failed conversion" contract
         class ``_Backward``'s own docstring describes.
         """
-        array = np.asarray(list(values), dtype=np.int64)
+        array = np.asarray(values, dtype=np.int64)
         name = self.b.name(hint)
         self.b.initializer.append(onnx.numpy_helper.from_array(array, name))
         return name
