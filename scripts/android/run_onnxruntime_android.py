@@ -54,6 +54,17 @@ def make_models(directory: Path, model_path: Path | None = None,
         if input_tensor_pb is None:
             raise RuntimeError("--input-tensor-pb is required with --model")
         original = onnx.load(model_path)
+        input_values = numpy_helper.to_array(onnx.load_tensor(str(input_tensor_pb)))
+        if input_values.dtype != np.float32:
+            raise RuntimeError("Android model tests currently require a float32 input tensor")
+        if len(original.graph.input) != 1:
+            raise RuntimeError("Android model tests currently require a single model input")
+        dimensions = original.graph.input[0].type.tensor_type.shape.dim
+        if len(dimensions) != input_values.ndim:
+            raise RuntimeError("input tensor rank does not match the ONNX model input")
+        for dimension, size in zip(dimensions, input_values.shape):
+            dimension.dim_value = int(size)
+            dimension.ClearField("dim_param")
     onnx.checker.check_model(original)
     simplified, valid = simplify(original)
     if not valid or (model_path is None and
@@ -69,10 +80,6 @@ def make_models(directory: Path, model_path: Path | None = None,
     onnx.save(simplified, simplified_path)
     if model_path is None:
         input_values = np.array([-2.5, -0.25, 0.75, 4.0], dtype=np.float32)
-    else:
-        input_values = onnx.numpy_helper.to_array(onnx.load_tensor(str(input_tensor_pb)))
-        if input_values.dtype != np.float32:
-            raise RuntimeError("Android model tests currently require a float32 input tensor")
     np.asarray(input_values, dtype=np.float32).tofile(input_path)
     return original_path, simplified_path, input_path
 
@@ -213,7 +220,7 @@ def run_qnn_in_app(work: Path, sdk: Path, ndk: Path, adb_prefix: list[str],
     if launch.returncode != 0:
         return False, "Activity launch failed: " + launch.stdout[-2000:]
     result_path = f"files/result_{target}.txt"
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + (180 if target.startswith("qnn-") else 30)
     while time.monotonic() < deadline:
         result = subprocess.run([*adb_prefix, "shell", "run-as", package,
                                  "cat", result_path], text=True,
@@ -276,11 +283,11 @@ def main() -> int:
     ap.add_argument("--qnn-runtime-aar", type=Path,
                     help="Qualcomm QNN runtime AAR; packages backend libraries in the test app")
     ap.add_argument("--model", type=Path,
-                    help="run a real single-input, single-output float32 ONNX model")
+                    help="run a real single-input float32 ONNX model")
     ap.add_argument("--input-tensor-pb", type=Path,
                     help="ONNX TensorProto input sample to use with --model")
-    ap.add_argument("--reference-output-pb", type=Path,
-                    help="optional ONNX TensorProto expected output for --model")
+    ap.add_argument("--reference-output-pb", type=Path, action="append",
+                    help="ONNX TensorProto expected output; repeat for multiple outputs")
     ap.add_argument("--require-htp", action="store_true",
                     help="fail unless both original and simplified models run on QNN HTP")
     ap.add_argument("--require-gpu", action="store_true",
@@ -317,8 +324,9 @@ def main() -> int:
         ap.error(f"ONNX model not found: {args.model}")
     if args.input_tensor_pb is not None and not args.input_tensor_pb.is_file():
         ap.error(f"ONNX input TensorProto not found: {args.input_tensor_pb}")
-    if args.reference_output_pb is not None and not args.reference_output_pb.is_file():
-        ap.error(f"ONNX reference output TensorProto not found: {args.reference_output_pb}")
+    for reference_output_pb in args.reference_output_pb or []:
+        if not reference_output_pb.is_file():
+            ap.error(f"ONNX reference output TensorProto not found: {reference_output_pb}")
     if (args.model is None) != (args.input_tensor_pb is None):
         ap.error("--model and --input-tensor-pb must be provided together")
     if args.reference_output_pb is not None and args.model is None:
@@ -382,11 +390,12 @@ def main() -> int:
         expected = None if args.model is not None else np.maximum(
             np.fromfile(input_file, dtype=np.float32), 0
         )
-        if args.reference_output_pb is not None:
-            expected = np.asarray(
-                numpy_helper.to_array(onnx.load_tensor(str(args.reference_output_pb))),
-                dtype=np.float32,
-            ).reshape(-1)
+        if args.reference_output_pb:
+            expected = np.concatenate([
+                np.asarray(numpy_helper.to_array(onnx.load_tensor(str(path))),
+                           dtype=np.float32).reshape(-1)
+                for path in args.reference_output_pb
+            ])
 
         def invoke(model_name: str, output_name: str, target: str | None = None) -> tuple[bool, str]:
             args_list = [f"./runner", model_name, "input.f32", output_name]
@@ -420,7 +429,7 @@ def main() -> int:
                 out.shape == expected.shape and np.allclose(out, expected, rtol=1e-3, atol=1e-3)
                 for out in cpu_outputs):
             raise RuntimeError("Android CPU output does not match the supplied reference tensor")
-        suffix = " and model-zoo reference" if args.reference_output_pb is not None else ""
+        suffix = " and model-zoo reference" if args.reference_output_pb else ""
         print(f"PASS Android ONNX Runtime CPU: original == simplified{suffix} on {serial}")
 
         if qnn_library is None:

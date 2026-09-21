@@ -237,12 +237,19 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
       } else {
         session = std::make_unique<Ort::Session>(ort_env, model.c_str(), run_options);
       }
-      if (session->GetInputCount() != 1 || session->GetOutputCount() != 1) {
-        throw std::runtime_error("only single-input, single-output models are supported");
+      if (session->GetInputCount() != 1 || session->GetOutputCount() == 0) {
+        throw std::runtime_error("only single-input models with tensor outputs are supported");
       }
       Ort::AllocatorWithDefaultOptions allocator;
       auto input_name = session->GetInputNameAllocated(0, allocator);
-      auto output_name = session->GetOutputNameAllocated(0, allocator);
+      std::vector<Ort::AllocatedStringPtr> output_name_storage;
+      std::vector<const char*> output_names;
+      output_name_storage.reserve(session->GetOutputCount());
+      output_names.reserve(session->GetOutputCount());
+      for (size_t i = 0; i < session->GetOutputCount(); ++i) {
+        output_name_storage.push_back(session->GetOutputNameAllocated(i, allocator));
+        output_names.push_back(output_name_storage.back().get());
+      }
       auto input_info = session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
       auto shape = input_info.GetShape();
       for (auto& dimension : shape) {
@@ -257,22 +264,39 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
       auto tensor = Ort::Value::CreateTensor<float>(memory, input.data(), input.size(),
                                                      shape.data(), shape.size());
       const char* input_names[] = {input_name.get()};
-      const char* output_names[] = {output_name.get()};
       auto outputs = session->Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1,
-                                  output_names, 1);
+                                  output_names.data(), output_names.size());
       if ((target == "qnn-htp-fallback" || target == "nnapi-fallback") &&
           &run_options == &options) {
         auto profile_path = session->EndProfilingAllocated(allocator);
         device_diagnostics += " profile=" + std::string(profile_path.get()) + " ";
       }
-      if (outputs.size() != 1 || !outputs[0].IsTensor() ||
-          outputs[0].GetTensorTypeAndShapeInfo().GetElementType() !=
-              ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-        throw std::runtime_error("model must return one float32 tensor");
+      if (outputs.empty()) {
+        throw std::runtime_error("model returned no outputs");
       }
-      auto output_info = outputs[0].GetTensorTypeAndShapeInfo();
-      const float* data = outputs[0].GetTensorData<float>();
-      return std::vector<float>(data, data + output_info.GetElementCount());
+      std::vector<float> output_values;
+      for (const auto& output : outputs) {
+        if (!output.IsTensor()) throw std::runtime_error("model outputs must be tensors");
+        const auto output_info = output.GetTensorTypeAndShapeInfo();
+        const auto element_count = output_info.GetElementCount();
+        switch (output_info.GetElementType()) {
+          case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
+            const float* data = output.GetTensorData<float>();
+            output_values.insert(output_values.end(), data, data + element_count);
+            break;
+          }
+          case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
+            const int64_t* data = output.GetTensorData<int64_t>();
+            for (size_t i = 0; i < element_count; ++i) {
+              output_values.push_back(static_cast<float>(data[i]));
+            }
+            break;
+          }
+          default:
+            throw std::runtime_error("model output type must be float32 or int64");
+        }
+      }
+      return output_values;
     };
     Ort::SessionOptions cpu_options;
     cpu_options.SetIntraOpNumThreads(1);

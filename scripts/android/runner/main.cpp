@@ -28,12 +28,19 @@ int main(int argc, char** argv) {
     Ort::SessionOptions options;
     options.SetIntraOpNumThreads(1);
     Ort::Session session(env, argv[1], options);
-    if (session.GetInputCount() != 1 || session.GetOutputCount() != 1) {
-      throw std::runtime_error("only single-input, single-output models are supported");
+    if (session.GetInputCount() != 1 || session.GetOutputCount() == 0) {
+      throw std::runtime_error("only single-input models with tensor outputs are supported");
     }
     Ort::AllocatorWithDefaultOptions allocator;
     auto input_name = session.GetInputNameAllocated(0, allocator);
-    auto output_name = session.GetOutputNameAllocated(0, allocator);
+    std::vector<Ort::AllocatedStringPtr> output_name_storage;
+    std::vector<const char*> output_names;
+    output_name_storage.reserve(session.GetOutputCount());
+    output_names.reserve(session.GetOutputCount());
+    for (size_t i = 0; i < session.GetOutputCount(); ++i) {
+      output_name_storage.push_back(session.GetOutputNameAllocated(i, allocator));
+      output_names.push_back(output_name_storage.back().get());
+    }
     auto input_info = session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
     auto shape = input_info.GetShape();
     for (auto& dimension : shape) {
@@ -50,20 +57,36 @@ int main(int argc, char** argv) {
                                                    input_values.size(), shape.data(),
                                                    shape.size());
     const char* input_names[] = {input_name.get()};
-    const char* output_names[] = {output_name.get()};
     auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1,
-                               output_names, 1);
-    if (outputs.size() != 1 || !outputs[0].IsTensor()) {
-      throw std::runtime_error("model did not return one tensor");
+                               output_names.data(), output_names.size());
+    if (outputs.empty()) {
+      throw std::runtime_error("model returned no outputs");
     }
-    const auto info = outputs[0].GetTensorTypeAndShapeInfo();
-    if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-      throw std::runtime_error("model output must be a float32 tensor");
+    std::vector<float> output_values;
+    for (const auto& output : outputs) {
+      if (!output.IsTensor()) throw std::runtime_error("model outputs must be tensors");
+      const auto info = output.GetTensorTypeAndShapeInfo();
+      const auto element_count = info.GetElementCount();
+      switch (info.GetElementType()) {
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
+          const float* values = output.GetTensorData<float>();
+          output_values.insert(output_values.end(), values, values + element_count);
+          break;
+        }
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
+          const int64_t* values = output.GetTensorData<int64_t>();
+          for (size_t i = 0; i < element_count; ++i) {
+            output_values.push_back(static_cast<float>(values[i]));
+          }
+          break;
+        }
+        default:
+          throw std::runtime_error("model outputs must be float32 or int64 tensors");
+      }
     }
-    const float* values = outputs[0].GetTensorData<float>();
     std::ofstream output_file(argv[3], std::ios::binary);
-    output_file.write(reinterpret_cast<const char*>(values),
-                      info.GetElementCount() * sizeof(float));
+    output_file.write(reinterpret_cast<const char*>(output_values.data()),
+                      output_values.size() * sizeof(float));
     if (!output_file) throw std::runtime_error("failed to write output tensor");
     std::cerr << "PASS cpu " << argv[1] << '\n';
     return 0;

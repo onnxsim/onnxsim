@@ -46,7 +46,8 @@ Use `--require-nnapi-dsp` to require the explicit `qti-dsp` NNAPI compile and ru
 Use `--only-target qnn-htp` or `--only-target nnapi-no-cpu` (repeatable) to run
 selected accelerator targets. For a real model, pass `--model` with its sample
 `--input-tensor-pb`; `--reference-output-pb` additionally checks the CPU output
-against a published sample output.
+against a published sample output. Repeat that option in graph output order for
+multiple outputs. The Android runners currently accept float32 or int64 outputs.
 Android chooses among its available NNAPI hardware devices, so this check does
 not claim a specific GPU driver was selected. CPU is always required. Host build
 artifacts use a temporary directory unless `--work-dir` is provided; phone
