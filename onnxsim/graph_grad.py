@@ -1242,6 +1242,39 @@ def _grad_relu(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return [ctx.b.mul(g, ctx.b.greater_mask(node.input[0], 0.0))]
 
 
+def _grad_leaky_relu(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """VJP of LeakyRelu with the ONNX ``alpha`` slope on ``x <= 0``.
+
+    Keep Greater and Cast as explicit nodes, like :func:`_grad_relu`, so
+    compile_training can retarget the mask Cast when building fp16 backward
+    arithmetic. The strict comparison chooses ``alpha`` as the subgradient
+    at the nondifferentiable point ``x == 0``.
+    """
+    if len(node.input) != 1 or not node.input[0]:
+        raise UnsupportedOpError(
+            f"LeakyRelu requires exactly one data input (node {node.output[0]!r})"
+        )
+    alpha = _attr(node, "alpha", 0.01)
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise UnsupportedOpError(
+            f"LeakyRelu alpha must be a finite scalar (node {node.output[0]!r})"
+        )
+    alpha = float(alpha)
+    if not np.isfinite(alpha):
+        raise UnsupportedOpError(
+            f"LeakyRelu alpha must be a finite scalar (node {node.output[0]!r})"
+        )
+
+    gt = ctx.b.op("Greater", [node.input[0], ctx.b.const(0.0, "leaky_zero")])
+    positive = ctx.b.op("Cast", [gt], to=onnx.TensorProto.FLOAT)
+    nonpositive = ctx.b.sub(ctx.b.const(1.0, "leaky_one"), positive)
+    slope = ctx.b.mul(ctx.b.const(alpha, "leaky_alpha"), nonpositive)
+    derivative = ctx.b.add(positive, slope)
+    return [ctx.b.mul(g, derivative)]
+
+
 # Reference-only: _RULES wires "Sigmoid" to _grad_sigmoid_templated instead.
 def _grad_sigmoid(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # y (1 - y), from the forward output: the forward already computed the
@@ -2674,6 +2707,7 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "DequantizeLinear": _grad_dequantize_linear,
     "DepthToSpace": _grad_depth_to_space,
     "IsNaN": _grad_is_nan,
+    "LeakyRelu": _grad_leaky_relu,
     "Pad": _grad_pad,
     "QuantizeLinear": _grad_quantize_linear,
     "Slice": _grad_slice,

@@ -99,6 +99,7 @@ once ported to C++; the only reason they live here is the missing mirror
 | `DequantizeLinear` | straight-through: `dx = g` (paired with `QuantizeLinear` below) | `_grad_dequantize_linear` |
 | `DepthToSpace` | reshape-transpose-reshape, the exact inverse of the op's own decomposition -- for `nn.PixelShuffle` exports | `_grad_depth_to_space` |
 | `IsNaN` | no gradient (boolean output) | `_grad_is_nan` |
+| `LeakyRelu` | `g` on `x > 0`, otherwise `alpha * g`; chooses `alpha` at `x = 0` | `_grad_leaky_relu` |
 | `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only | `_grad_pad` |
 | `QuantizeLinear` | straight-through: `dx = g`, no gradient for `scale`/`zero_point` (fake-quantization convention) | `_grad_quantize_linear` |
 | `Slice` | embed `g` into the input positions selected by static `starts`/`ends`/`axes`/positive `steps`, using constant selection `MatMul`s | `_grad_slice` |
