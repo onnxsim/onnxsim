@@ -59,7 +59,28 @@ No NPU runs were made for these output lengths, so the emitter remains
 restricted to four outputs; shorter outputs need their own compiled template
 and device check.
 
+## Last-axis Gather for training shapes
+
+`emit_gather_last_axis_axmodel(...)` retargets `Gather(x[..., W], axis=-1)` for
+six measured `(input shape, index count)` pairs, up to `[1,1,8,196]` with 1764
+indices and `[1,1,4,70000]`. The table is N index words plus a
+shape-dependent tail that is preserved; MCode depends on shape and N only.
+Evidence, oracles, and the device run are in
+[`axera-memory-op-generator.md`](axera-memory-op-generator.md). Probe builds are
+under `/home/takecheeze/npu-scratch/t_train_gather` (build harness and device
+runner were scratch scripts; the recipe is `docker run pulsar2:7.0-lite pulsar2
+build` on a one-node Gather model with MinMax calibration, four uniform +/-0.9
+samples).
+
+The ResNet18 step's real Gathers are `[16,1,C,HW] -> [16,1,C,9*HW]`. Nothing at
+that scale (batch 16, C=64, N=28224) has been built or run yet.
+
 ## Next steps
+
+0. Build a Gather at a real training shape (e.g. `[16,1,64,3136]`, N=28224, or a
+   smaller batch/channel version) and see whether the tail and MCode still
+   depend only on shape/N. Then the same for the 170 Reshapes and 41
+   Transposes, which dominate the step's remaining memory ops.
 
 1. Add Gather output lengths or axes only with separate compiled templates
    where MCode changes, plus device checks. Keep runtime values inside the

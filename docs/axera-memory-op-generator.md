@@ -107,3 +107,43 @@ across the five patterns was 0.0032.
 
 This establishes index retargeting only for this graph shape and dtype. It
 does not support other axes or output lengths.
+
+## Last-axis Gather on training-shaped inputs
+
+`emit_gather_last_axis_axmodel(reference_path, output_path, indices=...)`
+extends the Gather emitter to `Gather(x[..., W], axis=-1)` on float32 inputs of
+rank 2 or more. This is the layout of the im2col tap gather in a legalized
+convolution backward: the ResNet18 training step (1104 nodes) contains 41 such
+Gathers, e.g. `[16,1,64,3136] -> [16,1,64,28224]` with 28,224 indices.
+
+Pulsar2 7.0-lite builds (AX650, MinMax calibration) showed:
+
+- `npu_params` starts with the N indices as little-endian uint32 words. What
+  follows depends on the shape, not the index values: ten zero words for most
+  shapes (`[1,8]`, `[1,1,4,16]`, `[1,1,4,256]`, `[2,1,4,16]`, `[1,1,8,196]`),
+  and a 105-word constant tiling table for a 70,000-wide axis. The emitter
+  replaces the first N words and keeps the rest of the reference's table.
+- The MCode depends on input shape, axis, and index count N, and not on index
+  values. Rebuilds with different indices differed only inside the known
+  301-325 noise window. That held for descending, duplicate, all-equal
+  (`[255]*8`), random, and values above 65535.
+- A different N or shape needs its own compiled template: `[1,8]` with N=8
+  (2600 B of MCode) and `[1,1,4,16]` with N=8 (2632 B) already differ.
+
+Six `(input shape, N)` pairs are measured and each has a committed fixture
+under `scripts/axera/fixtures/gather_*_axis3_*.axmodel.gz`. The emitter accepts
+only those pairs, and only when the reference's normalized MCode and table tail
+match the fixture. Two compiler-built variants (odd indices on `[1,1,4,16]`, a
+second random vector on `[1,1,8,196]`) are also committed as oracles: emitting
+from the first reference reproduces their `npu_params` exactly and their MCode
+outside the noise window.
+
+Device check (`axcl-vm`, AX8850 V3.6.5): one variant per template, two for
+`[1,1,4,16]`, using inputs in the calibration range (uniform in +/-0.8), all
+matching numpy Gather with maximum absolute error 0.0035, including the
+1764-index case (14,112 outputs) and indices up to 69999. A control run of the
+unmodified reference and a health run after each template were clean.
+
+This does not generate MCode for a new shape or count. That still requires a
+Pulsar2 build of the new shape, which is the next thing to characterize (how
+the MCode grows with N and with the leading dimensions).

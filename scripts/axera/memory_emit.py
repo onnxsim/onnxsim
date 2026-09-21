@@ -15,6 +15,12 @@ It also retargets measured static ``Gather`` index vectors for
 ``X[1,8] -> Y[1,4]``. Their indices are stored in the compiled model's
 ``npu_params`` table; other Gather shapes are out of scope.
 
+``emit_gather_last_axis_axmodel`` extends that to the training-graph shape
+family: ``Gather(x[..., W], axis=-1)`` on float32 inputs of rank >= 2 (the
+im2col tap gather of a legalized convolution backward). Each measured
+``(input shape, index count)`` pair has its own compiled template, because the
+MCode depends on the shape and count but not on index values.
+
 The evidence and hardware check are recorded in the Axera MCode coverage
 notes. The reference fixture was built with start=2/end=6. Length-four builds
 with starts 0..4 changed no MCode bytes outside the known compiler-noise
@@ -51,6 +57,16 @@ _SLICE_STEP4_TEMPLATE = os.path.join(
     _HERE, "fixtures", "slice_1x8_axis1_step4_len2.axmodel.gz"
 )
 _GATHER_TEMPLATE = os.path.join(_HERE, "fixtures", "gather_1x8_axis1_even4.axmodel.gz")
+# Measured last-axis Gather templates, keyed by (input shape, index count).
+# Each is a real Pulsar2 7.0-lite AX650 build of ``Gather(x, idx, axis=-1)``.
+_GATHER_LAST_AXIS_TEMPLATES = {
+    ((1, 1, 4, 16), 8): "gather_1x1x4x16_axis3_n8.axmodel.gz",
+    ((1, 1, 4, 16), 16): "gather_1x1x4x16_axis3_n16.axmodel.gz",
+    ((1, 1, 4, 256), 8): "gather_1x1x4x256_axis3_n8.axmodel.gz",
+    ((2, 1, 4, 16), 8): "gather_2x1x4x16_axis3_n8.axmodel.gz",
+    ((1, 1, 8, 196), 1764): "gather_1x1x8x196_axis3_n1764.axmodel.gz",
+    ((1, 1, 4, 70000), 8): "gather_1x1x4x70000_axis3_n8.axmodel.gz",
+}
 _NOISE_START = 301
 _NOISE_END = 326
 _GATHER_INDEX_COUNT = 4
@@ -315,6 +331,115 @@ def emit_gather_axmodel(
 
     table = _initializer(model, "npu_params")
     table.raw_data = struct.pack("<14I", *target_indices, *([0] * 10))
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    onnx.save(model, output_path)
+    return output_path
+
+
+def _load_gather_last_axis_template(key) -> onnx.ModelProto:
+    with gzip.open(
+        os.path.join(_HERE, "fixtures", _GATHER_LAST_AXIS_TEMPLATES[key]), "rb"
+    ) as f:
+        return onnx.load_model_from_string(f.read())
+
+
+def _param_words(model: onnx.ModelProto) -> tuple[int, ...]:
+    table = bytes(_initializer(model, "npu_params").raw_data)
+    if len(table) % 4:
+        raise ValueError(f"npu_params is not whole uint32 words: {len(table)} bytes")
+    return struct.unpack(f"<{len(table) // 4}I", table)
+
+
+def emit_gather_last_axis_axmodel(
+    reference_path: str, output_path: str, *, indices: Sequence[int]
+) -> str:
+    """Retarget a measured float32 ``Gather(x[..., W], axis=-1)`` template.
+
+    ``indices`` may be any values in ``[0, W)`` (duplicates and descending
+    order included) but must have exactly the index count the reference was
+    compiled for: the MCode is specific to the input shape and that count. The
+    first ``len(indices)`` little-endian uint32 words of ``npu_params`` hold
+    the indices; the words after them are shape-dependent (ten zeros for most
+    shapes, a tiling table for a very wide axis) and are preserved from the
+    reference. Only ``(input shape, count)`` pairs in
+    ``_GATHER_LAST_AXIS_TEMPLATES`` are accepted; the reference's normalized
+    MCode and table tail must match that pair's compiled fixture.
+    """
+    if isinstance(indices, (str, bytes)) or not isinstance(indices, Sequence):
+        raise ValueError("indices must be a sequence of integers")
+    target = tuple(indices)
+    if any(not isinstance(v, int) or isinstance(v, bool) for v in target):
+        raise ValueError("indices must contain integers")
+
+    model = onnx.load(reference_path, load_external_data=False)
+    if len(model.graph.node) != 1 or model.graph.node[0].op_type != "neu mode":
+        raise ValueError("reference must contain exactly one compiled 'neu mode' node")
+    if list(model.graph.node[0].input) != ["x"] or list(model.graph.node[0].output) != [
+        "y"
+    ]:
+        raise ValueError("reference NPU node must map input 'x' to output 'y'")
+    if [v.name for v in model.graph.input] != ["x"]:
+        raise ValueError("reference must have exactly one input named 'x'")
+    if [v.name for v in model.graph.output] != ["y"]:
+        raise ValueError("reference must have exactly one output named 'y'")
+    x_type = model.graph.input[0].type.tensor_type
+    if x_type.elem_type != onnx.TensorProto.FLOAT:
+        raise ValueError("reference input must be float32")
+    in_shape = tuple(d.dim_value for d in x_type.shape.dim)
+    out_shape = _output_dims(model.graph.output[0], "y")
+    if len(in_shape) < 2 or out_shape[:-1] != list(in_shape[:-1]):
+        raise ValueError(
+            f"reference is not a last-axis Gather: {in_shape}->{out_shape}"
+        )
+    count = out_shape[-1]
+
+    key = (in_shape, count)
+    if key not in _GATHER_LAST_AXIS_TEMPLATES:
+        measured = sorted(_GATHER_LAST_AXIS_TEMPLATES)
+        raise ValueError(
+            f"unmeasured Gather (input shape, index count) {key}; measured: {measured}"
+        )
+    if len(target) != count or any(not 0 <= v < in_shape[-1] for v in target):
+        raise ValueError(
+            f"indices must be {count} integers in the range [0, {in_shape[-1] - 1}]"
+        )
+
+    dynamic = _initializer(model, "npu_dyn_params")
+    if dynamic.raw_data or dynamic.dims != [0]:
+        raise ValueError("reference must have the empty npu_dyn_params initializer")
+    attrs = {
+        attr.name: onnx.helper.get_attribute_value(attr)
+        for attr in model.graph.node[0].attribute
+    }
+    outputs_info = json.loads(attrs.get("outputs_info", b"{}"))
+    if outputs_info != {"y": ["FP32", out_shape]}:
+        raise ValueError(f"outputs_info disagrees with output shape: {outputs_info!r}")
+
+    expected = _load_gather_last_axis_template(key)
+    template_words = _param_words(expected)
+    words = _param_words(model)
+    if len(words) != len(template_words) or words[count:] != template_words[count:]:
+        raise ValueError("reference npu_params tail does not match the measured layout")
+    if any(v >= in_shape[-1] for v in words[:count]):
+        raise ValueError("reference Gather index is out of bounds")
+
+    template_mcode = _mcode(expected)
+    actual_mcode = _mcode(model)
+    if len(actual_mcode) != len(template_mcode):
+        raise ValueError(
+            "reference MCode size does not match the known Gather template"
+        )
+    actual = bytearray(actual_mcode)
+    wanted = bytearray(template_mcode)
+    actual[_NOISE_START:_NOISE_END] = bytes(_NOISE_END - _NOISE_START)
+    wanted[_NOISE_START:_NOISE_END] = bytes(_NOISE_END - _NOISE_START)
+    if actual != wanted:
+        raise ValueError(
+            "reference MCode does not match the characterized Gather template"
+        )
+
+    table = _initializer(model, "npu_params")
+    table.raw_data = struct.pack(f"<{len(words)}I", *target, *words[count:])
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     onnx.save(model, output_path)
     return output_path
