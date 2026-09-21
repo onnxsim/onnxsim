@@ -323,10 +323,21 @@ def minmax_scale(samples) -> float:
     fits 4/9 builds), so this returns the scale only."""
     import numpy as np
 
-    flat = np.concatenate([np.asarray(s).reshape(-1) for s in samples]).astype(
-        np.float64
-    )
-    return float((flat.max() - flat.min()) / 255.0)
+    # Reduce each sample separately: concatenating calibration tensors makes
+    # a full extra copy of the dataset immediately before the float64 cast.
+    # This keeps peak temporary memory bounded by the largest sample while
+    # preserving the same float64 extrema and scale formula.
+    lo = hi = None
+    for sample in samples:
+        flat = np.asarray(sample).reshape(-1).astype(np.float64)
+        if flat.size == 0:
+            continue
+        sample_lo, sample_hi = flat.min(), flat.max()
+        lo = sample_lo if lo is None else np.minimum(lo, sample_lo)
+        hi = sample_hi if hi is None else np.maximum(hi, sample_hi)
+    if lo is None:
+        raise ValueError("minmax_scale requires at least one sample")
+    return float((hi - lo) / 255.0)
 
 
 def emit_neg(reference_mcode: bytes, old_scale: float, new_scale: float) -> bytes:
