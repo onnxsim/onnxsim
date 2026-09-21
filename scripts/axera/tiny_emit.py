@@ -286,6 +286,23 @@ def trace_sigmoid(tensor):
     return {"shape": list(uop.shape), "dtype": str(tensor.dtype)}
 
 
+def _find_all(mcode: bytes, pattern: bytes) -> list[int]:
+    """Return every possibly overlapping occurrence of ``pattern``.
+
+    ``bytes.find`` performs the scan in C and avoids allocating a short slice
+    at every candidate offset. Advance by one byte after a hit to preserve the
+    overlap behavior of the former offset-by-offset comparisons.
+    """
+    if not pattern:
+        raise ValueError("cannot search for an empty pattern")
+    hits = []
+    start = 0
+    while (found := mcode.find(pattern, start)) >= 0:
+        hits.append(found)
+        start = found + 1
+    return hits
+
+
 def find_scale_words(mcode: bytes, scale: float) -> list:
     """Offsets of every float32 occurrence of ``scale`` in the stream.
 
@@ -296,7 +313,7 @@ def find_scale_words(mcode: bytes, scale: float) -> list:
     if isinstance(mcode, bytearray):
         mcode = bytes(mcode)
     pat = struct.pack("<f", float(scale))
-    return [i for i in range(len(mcode) - 3) if mcode[i : i + 4] == pat]
+    return _find_all(mcode, pat)
 
 
 def minmax_scale(samples) -> float:
@@ -526,11 +543,7 @@ def _strided_run(mcode: bytes, pattern: bytes, stride: int, count: int = 4) -> l
     land on a perfect stride grid -- an incidental byte collision anywhere
     else in the stream fails loudly instead of patching half a slot family.
     """
-    hits = [
-        i
-        for i in range(len(mcode) - len(pattern) + 1)
-        if mcode[i : i + len(pattern)] == pattern
-    ]
+    hits = _find_all(mcode, pattern)
     if len(hits) != count or any(b - a != stride for a, b in zip(hits, hits[1:])):
         raise ValueError(
             f"pattern {pattern.hex()} hits {hits}: not a stride-{stride} x{count} run"
@@ -820,16 +833,13 @@ def patch_matmul_a_scale(
         return bytes(out)
     old_pat = struct.pack("<f", float(1.0 / old_a_scale))[:3]
     new_pat = struct.pack("<f", float(1.0 / new_a_scale))[:3]
-    hits = [
-        i
-        for i in range(len(reference_mcode) - 2)
-        if reference_mcode[i : i + 3] == old_pat
-    ]
+    hits = _find_all(reference_mcode, old_pat)
+    hit_set = set(hits)
     run = []
     for start in hits:
         candidate = [start]
         i = start + 6
-        while i in hits:
+        while i in hit_set:
             candidate.append(i)
             i += 6
         if len(candidate) == 4:
@@ -861,11 +871,7 @@ def patch_mul_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> byte
     if not 0 <= old_zp_x <= 255 or not 0 <= new_zp_x <= 255:
         raise ValueError(f"zp_x must be a uint8: old={old_zp_x!r} new={new_zp_x!r}")
     old_unit = bytes.fromhex("02101b") + bytes([old_zp_x]) + bytes.fromhex("8336")
-    hits = [
-        i
-        for i in range(len(reference_mcode) - len(old_unit) + 1)
-        if reference_mcode[i : i + len(old_unit)] == old_unit
-    ]
+    hits = _find_all(reference_mcode, old_unit)
     if len(hits) != 1:
         raise ValueError(
             f"literal zp_x unit for {old_zp_x} not found exactly once"
@@ -1073,11 +1079,7 @@ def emit_matmul_reg8_quad(reference_mcode: bytes, permutation) -> bytes:
             f"permutation must contain each of {sorted(_REG8_QUAD_CANDIDATES)} "
             f"exactly once, got {perm!r}"
         )
-    hits = [
-        i
-        for i in range(len(reference_mcode) - len(_REG8_QUAD_ANCHOR) + 1)
-        if reference_mcode[i : i + len(_REG8_QUAD_ANCHOR)] == _REG8_QUAD_ANCHOR
-    ]
+    hits = _find_all(reference_mcode, _REG8_QUAD_ANCHOR)
     if len(hits) != 1:
         raise ValueError(
             f"reg=8 quad anchor found {len(hits)} times in reference_mcode,"
@@ -1228,11 +1230,7 @@ def emit_conv_reg8_group(
     if slot1_tag not in (130, 132):
         raise ValueError(f"slot1 tag must be 130 or 132, got {slot1_tag!r}")
 
-    hits = [
-        i
-        for i in range(len(reference_mcode) - len(_CONV_REG8_ANCHOR) + 1)
-        if reference_mcode[i : i + len(_CONV_REG8_ANCHOR)] == _CONV_REG8_ANCHOR
-    ]
+    hits = _find_all(reference_mcode, _CONV_REG8_ANCHOR)
     if len(hits) != 1:
         raise ValueError(
             f"reg=170 anchor found {len(hits)} times in reference_mcode, expected"
