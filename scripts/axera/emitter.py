@@ -133,7 +133,6 @@ def learn(code_samples, table_samples):
         raise ValueError("need one table per code sample")
 
     code_sig = _signatures(code_bits)
-    table_sig = _signatures(table_bits)
     all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
     all_one = _signatures(np.ones((n, 1), np.uint8))[0]
 
@@ -143,7 +142,7 @@ def learn(code_samples, table_samples):
     # ResNet weight tables can contain that many candidate bits).
     if n <= 64:
         code_sig = np.asarray(code_sig, dtype=np.uint64)
-        table_sig = np.asarray(table_sig, dtype=np.uint64)
+        table_sig = np.asarray(_signatures(table_bits), dtype=np.uint64)
         code_indices = np.flatnonzero((code_sig != all_zero) & (code_sig != all_one))
         unique_sig, first = np.unique(code_sig[code_indices], return_index=True)
         first = code_indices[first]
@@ -172,6 +171,11 @@ def learn(code_samples, table_samples):
             continue  # this code bit is itself constant: uninformative
         lookup.setdefault(sig, idx)
 
+    # For the >64-sample path signatures are Python byte strings. Drop their
+    # source list before materializing the table signatures; the lookup owns
+    # exactly the keys it needs and the two very large lists need not coexist.
+    del code_sig
+    table_sig = _signatures(table_bits)
     origin = np.full(table_bits.shape[1], CONST, dtype=np.int64)
     const = np.zeros(table_bits.shape[1], dtype=np.uint8)
     ambiguous = []

@@ -165,7 +165,10 @@ def _linearize_trainable_convs(
     registration either, and the gradient it produces is already in `w`'s
     original, unchanged shape -- so **state stays exactly the shape it
     always was**, nothing above this function (`params`, `state`,
-    `shapes[p]`) changes at all.
+    `shapes[p]`) changes at all. Identical convolution geometries share the
+    same immutable index and mask initializers, avoiding duplicate large
+    constants and repeated index-table construction in multi-block training
+    graphs.
 
     A `Conv` this function declines (see `_conv_geometry`'s own refusals:
     not 1-D/2-D, `auto_pad`, a geometry that does not reproduce its declared
@@ -181,6 +184,7 @@ def _linearize_trainable_convs(
     trained = set(params)
     out_nodes = []
     linearized = set()
+    geometry_constants = {}
 
     for node in model.graph.node:
         w = node.input[1] if node.op_type == "Conv" and len(node.input) > 1 else None
@@ -208,8 +212,13 @@ def _linearize_trainable_convs(
         in_dims, out_dims = [int(d) for d in x_shape[2:]], [int(d) for d in y_shape[2:]]
         taps = graph_grad._prod(kernel)
         in_count, out_count = graph_grad._prod(in_dims), graph_grad._prod(out_dims)
-        index, mask = graph_grad._im2col_indices(
-            in_dims, out_dims, kernel, strides, dilations, pads_begin
+        geometry_key = (
+            tuple(in_dims),
+            tuple(out_dims),
+            tuple(kernel),
+            tuple(strides),
+            tuple(dilations),
+            tuple(pads_begin),
         )
 
         stem = node.name or node.output[0]
@@ -233,6 +242,17 @@ def _linearize_trainable_convs(
             )
             return out
 
+        index_mask_names = geometry_constants.get(geometry_key)
+        if index_mask_names is None:
+            index, mask = graph_grad._im2col_indices(
+                in_dims, out_dims, kernel, strides, dilations, pads_begin
+            )
+            index_name = const(np.asarray(index, np.int64), "idx")
+            mask_name = const(mask.reshape(1, 1, taps * out_count), "mask")
+            index_mask_names = (index_name, mask_name)
+            geometry_constants[geometry_key] = index_mask_names
+        index_name, mask_name = index_mask_names
+
         batch = int(x_shape[0])
         x3 = op(
             "Reshape",
@@ -241,7 +261,7 @@ def _linearize_trainable_convs(
         )
         gathered = op(
             "Gather",
-            [x3, const(np.array(index, np.int64), "idx")],
+            [x3, index_name],
             "gathered",
             axis=2,
         )
@@ -249,7 +269,7 @@ def _linearize_trainable_convs(
             "Mul",
             [
                 gathered,
-                const(mask.reshape(1, 1, taps * out_count).astype(np.float32), "mask"),
+                mask_name,
             ],
             "masked",
         )

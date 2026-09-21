@@ -416,6 +416,57 @@ def patch_add_output_zero_point(
     return bytes(out)
 
 
+def patch_matmul_gemm_output_zero_point(
+    reference_mcode: bytes, old_zp_y: int, new_zp_y: int
+) -> bytes:
+    """Patch the output zero point in an isolated Gemm/MatMul template.
+
+    Tested Gemm and MatMul builds store this byte as the last payload byte of
+    an S record at ``reg=120, tag=132``. The template must contain exactly one
+    such record whose payload ends in ``old_zp_y``; absent or ambiguous cases
+    are refused. In particular, builds with ``zp_y == 128`` omit this record,
+    so changing to or from that wire form requires a rebuild. Keep this helper
+    scoped to an isolated op stream: a full training graph can contain several
+    MatMuls, and this locator does not identify which node a record belongs to.
+
+    This patches one decoded field only. The evidence covers Gemm and MatMul
+    templates, not Conv, and does not establish bit-exact equivalence to a
+    Pulsar2 rebuild for changed calibration data.
+    """
+    from mcode import FULL_RULE, decode, stream_bounds
+
+    if any(
+        not isinstance(value, int) or not 0 <= value <= 255
+        for value in (old_zp_y, new_zp_y)
+    ):
+        raise ValueError("output zero points must be integers in [0, 255]")
+    if old_zp_y == 128 or new_zp_y == 128:
+        raise ValueError(
+            "Gemm/MatMul zp_y=128 uses a different form and cannot be patched in place"
+        )
+
+    lo, hi = stream_bounds(reference_mcode)
+    records = decode(reference_mcode, start=lo, end=hi, **FULL_RULE)
+    matches = [
+        record
+        for record in records
+        if record.get("kind") == "S"
+        and record.get("reg") == 120
+        and record.get("tag") == 132
+        and record["payload"][-1] == old_zp_y
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one Gemm/MatMul zp_y at reg=120/tag=132, found {len(matches)}"
+        )
+
+    record = matches[0]
+    out = bytearray(reference_mcode)
+    at = record["at"] + record["p"] + 1
+    out[at] = new_zp_y
+    return bytes(out)
+
+
 def _strided_run(mcode: bytes, pattern: bytes, stride: int, count: int = 4) -> list:
     """Offsets where ``pattern`` occurs as exactly ``count`` stride-run copies.
 
