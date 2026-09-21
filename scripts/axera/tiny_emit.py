@@ -109,8 +109,9 @@ are needed, and that combination also reproduces a real rebuild
 bit-exactly (second test in the hardware file). Two data points, not a
 general proof -- see the hardware test file's own docstring for exactly
 what is and isn't covered. tinygrad itself is an optional, lazily-imported
-dependency: everything else here needs only
-``numpy``.
+dependency. ``emit_add`` also loads ``mcode.py`` lazily for instruction
+boundary decoding, so that operation also requires ``onnx`` when called;
+``minmax_scale`` lazily uses NumPy.
 """
 
 from __future__ import annotations
