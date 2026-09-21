@@ -143,12 +143,15 @@ to close the graph operator-coverage side of this gap:
 | --- | ---: | ---: | --- |
 | ResNet18 train step | 1,104 | 1,103 (99.9%) | 1 `Squeeze` |
 
-That `Squeeze` is the ResNet classifier flatten (`[1,512,1,1]` to `[1,512]`)
-feeding `Gemm`. This is the exact fusion context already confirmed to build
-and run on AX650N in `pulsar2_ops.py`'s `AX650_CONFIRMED_BROKEN_OPS` notes;
-the known scheduler failure applies when `Squeeze`/`Reshape` is standalone,
-not when it feeds the classifier `Gemm`. Thus the surviving graph has no
-uncovered training op type for its ResNet18 forward or backward path.
+That `Squeeze` is the classifier flatten (`[16,512,1,1]` to `[16,512]`). Its
+output has two consumers: the forward classifier `Gemm` and a backward
+`Transpose`. `Squeeze -> Gemm` is the exact fusion context already confirmed
+to build and run on AX650N in `pulsar2_ops.py`'s
+`AX650_CONFIRMED_BROKEN_OPS` notes. However, the multi-consumer case has not
+been compiled, so it is not yet established that the scheduler can fuse the
+Gemm path while also serving the backward Transpose without materializing a
+standalone reshape-family op. The 99.9% figure is op-list coverage, not proof
+that this training graph is schedulable end to end.
 
 I reran the Pulsar2 7.0-lite build for this graph. Calibration completed, but
 the quantizer failed while building hardware-op configuration for
@@ -165,7 +168,8 @@ successful pipeline.
 The AXCL device runtime is not exposed in this VM (`/dev/axcl_host` is
 missing), so I could not run an emitted model on the NPU. The remaining work
 to close executable coverage is to rebuild the documented 64x64, last-four-
-layers training graph with the current builder, compile it, run it on an AX650N,
+layers training graph with the current builder, compile it, inspect the
+flatten's forward/backward fan-out in the scheduler trace, run it on an AX650N,
 and preserve its MCode stream as a fixture. The historical `r18_b1` structural
 check and the 99.9% static op-coverage result are useful evidence, but they do
 not substitute for that end-to-end run.
