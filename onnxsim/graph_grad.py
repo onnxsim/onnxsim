@@ -322,7 +322,8 @@ class _Backward:
                 "unbcast",
                 keepdims=1,
             )
-        summed = tuple(1 if i in set(axes) else d for i, d in enumerate(grad_shape))
+        axes_set = set(axes)
+        summed = tuple(1 if i in axes_set else d for i, d in enumerate(grad_shape))
         if summed != target_shape:
             out = self.b.op(
                 "Reshape", [out, self.int64_const(target_shape, "shape")], "unbcast"
