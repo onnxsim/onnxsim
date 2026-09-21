@@ -38,3 +38,31 @@ and float32 offset encoding. It does not claim general Slice support, arbitrary
 memory-op generation, or an MCode interpreter. Regression coverage lives in
 `tests/test_axera_memory_emit.py`; the raw compiled reference is
 `scripts/axera/fixtures/slice_1x8_axis1_step1_len4.axmodel.gz`.
+
+## Static Gather index retargeting
+
+The same module now has `emit_gather_axmodel(reference_path, output_path,
+indices=...)` for the measured float32 graph `Gather(x[1,8], axis=1)` with
+four outputs. It accepts four indices in `[0,7]`, including duplicates.
+Pulsar2 stores these indices as the first four little-endian uint32 words in a
+56-byte `npu_params` table and zero-fills the remaining ten words. The emitter
+checks the compiled graph, table, output metadata, empty dynamic-parameter
+table, and normalized MCode template before changing the four index words.
+
+The reference was built for AX650A with Pulsar2 7.0-lite. All five generated
+variants ran inside `axcl-vm` on AX8850 V3.6.5 firmware using
+input `[-0.8,-0.6,-0.4,-0.2,0.1,0.3,0.5,0.7]`. The even-index output had
+maximum absolute error 0.0029 against ONNX values; the odd-index output had
+maximum error 0.0032. This is consistent with the model's int8
+quantization. Inputs must remain within the calibration range: earlier runs
+with `[0,1,2,3,4,5,6,7]` saturated high values near 0.901 and made the Gather
+output appear incorrect.
+
+The compiler and NPU checks covered `[0,2,4,6]`, `[1,3,5,7]`, `[0,3,5,7]`,
+descending `[7,6,5,4]`, and duplicate `[7,7,0,0]`. Each compiled `npu_params`
+table contained those exact first four uint32 words; MCode changes relative to
+the even-index build stayed inside offsets 301–325. The largest NPU error
+across the five patterns was 0.0032.
+
+This establishes index retargeting only for this graph shape and dtype. It
+does not support other axes or output lengths.

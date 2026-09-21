@@ -9,6 +9,10 @@ uint64 entries in ``npu_params`` and the output shape is stored in the
 This module patches those fields on a compiled template. It deliberately
 does not generalize to other Slice ranks, axes, steps, or input shapes.
 
+It also retargets measured static ``Gather`` index vectors for
+``X[1,8] -> Y[1,4]``. Their indices are stored in the compiled model's
+``npu_params`` table; other Gather shapes are out of scope.
+
 The evidence and hardware check are recorded in the Axera MCode coverage
 notes. The reference fixture was built with start=2/end=6; builds with
 start=0..4 and lengths 3/4, including an exact-config rebuild, changed no
@@ -21,6 +25,7 @@ import gzip
 import json
 import os
 import struct
+from collections.abc import Sequence
 
 import onnx
 
@@ -28,8 +33,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SLICE_TEMPLATE = os.path.join(
     _HERE, "fixtures", "slice_1x8_axis1_step1_len4.axmodel.gz"
 )
+_GATHER_TEMPLATE = os.path.join(_HERE, "fixtures", "gather_1x8_axis1_even4.axmodel.gz")
 _NOISE_START = 301
 _NOISE_END = 326
+_GATHER_INDEX_COUNT = 4
+_GATHER_INPUT_WIDTH = 8
 
 
 def _supported_interval(start: int, end: int) -> bool:
@@ -83,8 +91,10 @@ def _validate_slice_template(model: onnx.ModelProto) -> tuple[onnx.NodeProto, in
         raise ValueError("reference must have exactly one input named 'x'")
     if [value.name for value in model.graph.output] != ["y"]:
         raise ValueError("reference must have exactly one output named 'y'")
-    if [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim] != [1, 8]:
-        raise ValueError("reference input must have shape [1, 8]")
+    if model.graph.input[0].type.tensor_type.elem_type != onnx.TensorProto.FLOAT or [
+        d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim
+    ] != [1, 8]:
+        raise ValueError("reference input must be float32 with shape [1, 8]")
 
     output_shape = _output_dims(model.graph.output[0], "y")
     if len(output_shape) != 2 or output_shape[0] != 1:
@@ -178,6 +188,99 @@ def emit_slice_axmodel(
         if value_info.name == "y":
             _set_dims(value_info, target_shape)
 
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    onnx.save(model, output_path)
+    return output_path
+
+
+def _gather_indices_from_params(model: onnx.ModelProto) -> tuple[int, ...]:
+    table = bytes(_initializer(model, "npu_params").raw_data)
+    if len(table) != 56:
+        raise ValueError(f"expected Gather's 56-byte npu_params, got {len(table)}")
+    words = struct.unpack("<14I", table)
+    if any(words[4:]):
+        raise ValueError("Gather parameter padding must contain only zeros")
+    indices = tuple(words[:_GATHER_INDEX_COUNT])
+    if any(index >= _GATHER_INPUT_WIDTH for index in indices):
+        raise ValueError(f"reference Gather index is out of bounds: {indices}")
+    return indices
+
+
+def emit_gather_axmodel(
+    reference_path: str, output_path: str, *, indices: Sequence[int]
+) -> str:
+    """Retarget the measured float32 ``Gather(x[1,8], axis=1)`` template.
+
+    The four indices may be any values in ``[0,7]``, including duplicates.
+    They occupy the first four little-endian uint32 words of a 56-byte
+    ``npu_params`` table; the remaining ten words are zero padding. This
+    encoding was checked against varied, descending, and duplicate index
+    vectors on the NPU. The compiled output shape and MCode do not change.
+    Other ranks, axes, and output lengths are rejected.
+    """
+    if isinstance(indices, (str, bytes)) or not isinstance(indices, Sequence):
+        raise ValueError("indices must be a sequence of four integers")
+    target_indices = tuple(indices)
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in target_indices
+    ):
+        raise ValueError("indices must contain integers")
+    if len(target_indices) != _GATHER_INDEX_COUNT or any(
+        not 0 <= value < _GATHER_INPUT_WIDTH for value in target_indices
+    ):
+        raise ValueError("indices must contain four integers in the range [0, 7]")
+
+    model = onnx.load(reference_path, load_external_data=False)
+    if len(model.graph.node) != 1 or model.graph.node[0].op_type != "neu mode":
+        raise ValueError("reference must contain exactly one compiled 'neu mode' node")
+    if list(model.graph.node[0].input) != ["x"] or list(model.graph.node[0].output) != [
+        "y"
+    ]:
+        raise ValueError("reference NPU node must map input 'x' to output 'y'")
+    if [value.name for value in model.graph.input] != ["x"]:
+        raise ValueError("reference must have exactly one input named 'x'")
+    if [value.name for value in model.graph.output] != ["y"]:
+        raise ValueError("reference must have exactly one output named 'y'")
+    if model.graph.input[0].type.tensor_type.elem_type != onnx.TensorProto.FLOAT or [
+        d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim
+    ] != [1, 8]:
+        raise ValueError("reference input must be float32 with shape [1, 8]")
+    if _output_dims(model.graph.output[0], "y") != [1, 4]:
+        raise ValueError("reference output must have shape [1, 4]")
+    _gather_indices_from_params(model)
+
+    dynamic = _initializer(model, "npu_dyn_params")
+    if dynamic.raw_data or dynamic.dims != [0]:
+        raise ValueError("reference must have the empty npu_dyn_params initializer")
+
+    attrs = {
+        attr.name: onnx.helper.get_attribute_value(attr)
+        for attr in model.graph.node[0].attribute
+    }
+    outputs_info = json.loads(attrs.get("outputs_info", b"{}"))
+    if outputs_info != {"y": ["FP32", [1, 4]]}:
+        raise ValueError(f"outputs_info disagrees with output shape: {outputs_info!r}")
+
+    with gzip.open(_GATHER_TEMPLATE, "rb") as f:
+        expected = onnx.load_model_from_string(f.read())
+    template_mcode = _mcode(expected)
+    actual_mcode = _mcode(model)
+    if len(actual_mcode) != len(template_mcode):
+        raise ValueError(
+            "reference MCode size does not match the known Gather template"
+        )
+    actual = bytearray(actual_mcode)
+    wanted = bytearray(template_mcode)
+    actual[_NOISE_START:_NOISE_END] = bytes(_NOISE_END - _NOISE_START)
+    wanted[_NOISE_START:_NOISE_END] = bytes(_NOISE_END - _NOISE_START)
+    if actual != wanted:
+        raise ValueError(
+            "reference MCode does not match the characterized Gather template"
+        )
+
+    table = _initializer(model, "npu_params")
+    table.raw_data = struct.pack("<14I", *target_indices, *([0] * 10))
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     onnx.save(model, output_path)
     return output_path

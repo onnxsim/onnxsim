@@ -8,7 +8,7 @@ import struct
 import onnx
 import pytest
 
-from scripts.axera.memory_emit import emit_slice_axmodel
+from scripts.axera.memory_emit import emit_gather_axmodel, emit_slice_axmodel
 
 _FIXTURE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
@@ -16,6 +16,13 @@ _FIXTURE = os.path.join(
     "axera",
     "fixtures",
     "slice_1x8_axis1_step1_len4.axmodel.gz",
+)
+_GATHER_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "scripts",
+    "axera",
+    "fixtures",
+    "gather_1x8_axis1_even4.axmodel.gz",
 )
 
 
@@ -75,4 +82,66 @@ def test_emit_slice_rejects_out_of_scope_ranges(tmp_path, start, end):
     with pytest.raises(ValueError):
         emit_slice_axmodel(
             reference, str(tmp_path / "bad.axmodel"), start=start, end=end
+        )
+
+
+def _gather_fixture_path(tmp_path):
+    path = tmp_path / "gather_reference.axmodel"
+    with gzip.open(_GATHER_FIXTURE, "rb") as source, path.open("wb") as target:
+        target.write(source.read())
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "indices,expected_words",
+    [
+        ([0, 2, 4, 6], (0, 2, 4, 6) + (0,) * 10),
+        ([1, 3, 5, 7], (1, 3, 5, 7) + (0,) * 10),
+        ([0, 3, 5, 7], (0, 3, 5, 7) + (0,) * 10),
+        ([7, 6, 5, 4], (7, 6, 5, 4) + (0,) * 10),
+        ([7, 7, 0, 0], (7, 7, 0, 0) + (0,) * 10),
+    ],
+)
+def test_emit_gather_retargets_measured_indices_and_preserves_mcode(
+    tmp_path, indices, expected_words
+):
+    reference = _gather_fixture_path(tmp_path)
+    target = tmp_path / "gather_target.axmodel"
+    source_model = onnx.load(reference, load_external_data=False)
+    source_mcode = bytes(_init(source_model, "subgraph_npu_0_b1_neu").raw_data)
+
+    emit_gather_axmodel(reference, str(target), indices=indices)
+
+    emitted = onnx.load(str(target), load_external_data=False)
+    assert struct.unpack("<14I", _init(emitted, "npu_params").raw_data) == (
+        expected_words
+    )
+    assert bytes(_init(emitted, "subgraph_npu_0_b1_neu").raw_data) == source_mcode
+    assert [
+        d.dim_value for d in emitted.graph.output[0].type.tensor_type.shape.dim
+    ] == [1, 4]
+    assert json.loads(_attr(emitted.graph.node[0], "outputs_info")) == {
+        "y": ["FP32", [1, 4]]
+    }
+
+
+@pytest.mark.parametrize(
+    "indices", [[0, 2, 4], [0, 2, 4, 8], [0, 2, 4, True], [0, 2, 4, 5, 6]]
+)
+def test_emit_gather_rejects_invalid_index_vectors(tmp_path, indices):
+    reference = _gather_fixture_path(tmp_path)
+    with pytest.raises(ValueError):
+        emit_gather_axmodel(reference, str(tmp_path / "bad.axmodel"), indices=indices)
+
+
+def test_emit_gather_rejects_reference_with_unmeasured_parameter_table(tmp_path):
+    reference = _gather_fixture_path(tmp_path)
+    model = onnx.load(reference, load_external_data=False)
+    table = _init(model, "npu_params")
+    table.raw_data = struct.pack("<14I", *range(14))
+    onnx.save(model, reference)
+
+    with pytest.raises(ValueError, match="padding"):
+        emit_gather_axmodel(
+            reference, str(tmp_path / "bad.axmodel"), indices=[1, 3, 5, 7]
         )

@@ -238,6 +238,75 @@ def test_patch_mul_output_quad_round_trips():
     assert out_and_back == blob
 
 
+_RESHAPE_GATHER_SCALE = 0.0076232957653701305
+_RESHAPE_GATHER_TARGET_SCALE = 0.02
+
+
+def test_patch_reshape_gather_scales_changes_only_verified_scale_fields():
+    blob = _blob("reshape_gather_fresh")
+    patched = tiny_emit.patch_reshape_gather_scales(
+        blob,
+        _RESHAPE_GATHER_SCALE,
+        _RESHAPE_GATHER_TARGET_SCALE,
+        _RESHAPE_GATHER_SCALE,
+        _RESHAPE_GATHER_TARGET_SCALE,
+    )
+
+    reciprocal = struct.pack("<f", 1.0 / _RESHAPE_GATHER_TARGET_SCALE)
+    output_scale = struct.pack("<f", _RESHAPE_GATHER_TARGET_SCALE)
+    assert tiny_emit._strided_run(patched, reciprocal, 8)
+    assert tiny_emit._strided_run(patched, output_scale, 7)
+
+    changed = {
+        i for i, (before, after) in enumerate(zip(blob, patched)) if before != after
+    }
+    expected = {
+        i
+        for offset, stride in ((1067, 8), (1377, 7))
+        for start in (offset + stride * index for index in range(4))
+        for i in range(start, start + 4)
+    }
+    assert changed == expected
+    assert check(patched) == []
+
+
+def test_patch_reshape_gather_scales_round_trips():
+    blob = _blob("reshape_gather_fresh")
+    patched = tiny_emit.patch_reshape_gather_scales(
+        blob,
+        _RESHAPE_GATHER_SCALE,
+        _RESHAPE_GATHER_TARGET_SCALE,
+        _RESHAPE_GATHER_SCALE,
+        _RESHAPE_GATHER_TARGET_SCALE,
+    )
+    restored = tiny_emit.patch_reshape_gather_scales(
+        patched,
+        _RESHAPE_GATHER_TARGET_SCALE,
+        _RESHAPE_GATHER_SCALE,
+        _RESHAPE_GATHER_TARGET_SCALE,
+        _RESHAPE_GATHER_SCALE,
+    )
+    assert restored == blob
+
+
+@pytest.mark.parametrize(
+    "old_x,old_z,new_x,new_z",
+    [
+        (_RESHAPE_GATHER_SCALE, 0.01, 0.02, 0.02),
+        (_RESHAPE_GATHER_SCALE, _RESHAPE_GATHER_SCALE, 0.02, 0.03),
+        (0.0, 0.0, 0.02, 0.02),
+        (_RESHAPE_GATHER_SCALE, _RESHAPE_GATHER_SCALE, float("nan"), float("nan")),
+    ],
+)
+def test_patch_reshape_gather_scales_rejects_invalid_scale_relations(
+    old_x, old_z, new_x, new_z
+):
+    with pytest.raises(ValueError):
+        tiny_emit.patch_reshape_gather_scales(
+            _blob("reshape_gather_fresh"), old_x, new_x, old_z, new_z
+        )
+
+
 def test_patch_mul_output_quad_rejects_bad_frame():
     # x_scale's own reciprocal-family words never carry the 03../8182
     # frame, so patching "the output scale" by a value that only happens
