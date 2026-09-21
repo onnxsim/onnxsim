@@ -1410,6 +1410,68 @@ def _constant_ints(ctx: _Backward, name: str, node: onnx.NodeProto) -> List[int]
     return [int(v) for v in values.reshape(-1)]
 
 
+def _grad_expand(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """VJP of ``Expand`` for constant target shapes and static dimensions.
+
+    The gradient sums over precisely the axes where the input was broadcast.
+    Require the shape initializer to agree with the inferred output geometry;
+    the shape tensor itself is an integer control input and has no gradient.
+    """
+    if len(node.input) != 2 or not node.input[0] or not node.input[1]:
+        raise UnsupportedOpError(
+            f"Expand requires data and shape inputs (node {node.output[0]!r})"
+        )
+    x, shape_name = node.input
+    target_shape = _constant_ints(ctx, shape_name, node)
+    shape_initializer = next(
+        (tensor for tensor in ctx.b.initializer if tensor.name == shape_name), None
+    )
+    assert shape_initializer is not None  # _constant_ints already checked this
+    shape_tensor_shape = tuple(int(dim) for dim in shape_initializer.dims)
+    if shape_tensor_shape != (len(target_shape),):
+        raise UnsupportedOpError(
+            f"Expand shape input must be a 1-D tensor with "
+            f"{len(target_shape)} elements, got {shape_tensor_shape} "
+            f"(node {node.output[0]!r})"
+        )
+    if shape_initializer.data_type != onnx.TensorProto.INT64:
+        raise UnsupportedOpError(
+            f"Expand shape input must have int64 dtype (node {node.output[0]!r})"
+        )
+    if any(dim < 0 for dim in target_shape):
+        raise UnsupportedOpError(
+            f"Expand target dimensions must be nonnegative, got {target_shape} "
+            f"(node {node.output[0]!r})"
+        )
+
+    x_shape = ctx.shape(x)
+    y_shape = ctx.shape(node.output[0])
+    if any(not isinstance(dim, int) for dim in (*x_shape, *y_shape)):
+        raise UnsupportedOpError(
+            f"Expand requires static data and output dimensions "
+            f"(node {node.output[0]!r})"
+        )
+
+    rank = max(len(x_shape), len(target_shape))
+    x_broadcast_shape = (1,) * (rank - len(x_shape)) + x_shape
+    target_broadcast_shape = (1,) * (rank - len(target_shape)) + tuple(target_shape)
+    expected_shape = []
+    for x_dim, target_dim in zip(x_broadcast_shape, target_broadcast_shape):
+        if x_dim != target_dim and x_dim != 1 and target_dim != 1:
+            raise UnsupportedOpError(
+                f"Expand data shape {x_shape} is incompatible with target "
+                f"shape {target_shape} (node {node.output[0]!r})"
+            )
+        expected_shape.append(target_dim if x_dim == 1 else x_dim)
+    if tuple(expected_shape) != tuple(y_shape):
+        raise UnsupportedOpError(
+            f"Expand inferred output shape {y_shape} disagrees with broadcast "
+            f"shape {tuple(expected_shape)} (node {node.output[0]!r})"
+        )
+
+    return [ctx.reduce_to(g, y_shape, x_shape), None]
+
+
 def _grad_slice(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """VJP of ONNX ``Slice`` using static, positive-step parameters.
 
@@ -2745,6 +2807,7 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "Concat": _grad_concat,
     "DequantizeLinear": _grad_dequantize_linear,
     "DepthToSpace": _grad_depth_to_space,
+    "Expand": _grad_expand,
     "IsNaN": _grad_is_nan,
     "LeakyRelu": _grad_leaky_relu,
     "Pad": _grad_pad,
