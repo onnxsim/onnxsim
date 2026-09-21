@@ -1063,6 +1063,43 @@ def _grad_averagepool(
     return [dx]
 
 
+def _grad_global_averagepool(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Broadcast each pooled gradient over static spatial dims, scaled by 1/N."""
+    if len(node.input) != 1 or not node.input[0]:
+        raise UnsupportedOpError(
+            "GlobalAveragePool requires exactly one data input "
+            f"(node {node.output[0]!r})"
+        )
+    x_shape = ctx.shape(node.input[0])
+    y_shape = ctx.shape(node.output[0])
+    rank = len(x_shape)
+    if rank < 3:
+        raise UnsupportedOpError(
+            f"GlobalAveragePool requires rank >= 3, got {x_shape} "
+            f"(node {node.output[0]!r})"
+        )
+    expected_output_shape = tuple(x_shape[:2]) + (1,) * (rank - 2)
+    if len(y_shape) != rank or y_shape != expected_output_shape:
+        raise UnsupportedOpError(
+            f"GlobalAveragePool output shape {y_shape} does not match "
+            f"expected {expected_output_shape} (node {node.output[0]!r})"
+        )
+    spatial_shape = x_shape[2:]
+    if any(not isinstance(dim, int) or dim <= 0 for dim in spatial_shape):
+        raise UnsupportedOpError(
+            f"GlobalAveragePool requires known positive spatial dimensions, "
+            f"got {spatial_shape} (node {node.output[0]!r})"
+        )
+
+    spatial_count = _prod(spatial_shape)
+    scale = np.full(
+        (1, 1, *spatial_shape), 1.0 / float(spatial_count), dtype=np.float32
+    )
+    return [ctx.b.mul(g, ctx.b.const(scale, "global_avg_pool_scale"))]
+
+
 def _grad_maxpool(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """``MaxPool``'s gradient: route ``dY`` to whichever input element each
     window's max came from.
@@ -2867,6 +2904,7 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "DepthToSpace": _grad_depth_to_space,
     "Elu": _grad_elu,
     "Expand": _grad_expand,
+    "GlobalAveragePool": _grad_global_averagepool,
     "IsNaN": _grad_is_nan,
     "LeakyRelu": _grad_leaky_relu,
     "Pad": _grad_pad,

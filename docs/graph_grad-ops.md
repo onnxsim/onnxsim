@@ -100,6 +100,7 @@ once ported to C++; the only reason they live here is the missing mirror
 | `DepthToSpace` | reshape-transpose-reshape, the exact inverse of the op's own decomposition -- for `nn.PixelShuffle` exports | `_grad_depth_to_space` |
 | `Elu` | `g` for `x >= 0`, otherwise `g * (y + alpha)` using the forward output; `alpha` defaults to 1 | `_grad_elu` |
 | `Expand` | sum `g` over axes broadcast from `data`; constant target shape and static compatible inferred dimensions only, no gradient for `shape` | `_grad_expand` |
+| `GlobalAveragePool` | broadcast `g` over static spatial dimensions and scale by their reciprocal product; rank >= 3 | `_grad_global_averagepool` |
 | `IsNaN` | no gradient (boolean output) | `_grad_is_nan` |
 | `LeakyRelu` | `g` on `x > 0`, otherwise `alpha * g`; chooses `alpha` at `x = 0` | `_grad_leaky_relu` |
 | `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only | `_grad_pad` |
