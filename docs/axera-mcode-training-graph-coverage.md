@@ -153,23 +153,37 @@ Gemm path while also serving the backward Transpose without materializing a
 standalone reshape-family op. The 99.9% figure is op-list coverage, not proof
 that this training graph is schedulable end to end.
 
-I reran the Pulsar2 7.0-lite build for this graph. Calibration completed, but
-the quantizer failed while building hardware-op configuration for
-`ActWeightConv` node `resnetv15_conv0_fwd` with `IndexError: list index out of
-range`; no `.axmodel` or MCode was emitted. The failing node is the stem Conv
-with a live weight input `[64,3,7,7]` and activation `[16,3,224,224]`. This
-failure occurs before compiler scheduling, so it is not evidence of a missing
-MCode schedule rule. It also differs from the documented successful training
-run (64x64 input, last four layers trainable), where trainable Convs are
-linearized before differentiation. The surviving 1,104-node graph has 133
-inputs and is a broader all-state, batch-16 graph; it does not use that
-successful pipeline.
+I reran the Pulsar2 7.0-lite build for this graph. With target AX650,
+calibration completed, but the quantizer failed while building hardware-op
+configuration for `ActWeightConv` node `resnetv15_conv0_fwd` with
+`IndexError: list index out of range`; no `.axmodel` or MCode was emitted.
+The failing node is the stem Conv with a live weight input `[64,3,7,7]` and
+activation `[16,3,224,224]`. This failure occurs before compiler scheduling,
+so it is not evidence of a missing MCode schedule rule. The Pulsar2 7.0-lite
+CLI does not list AX8850 as a target; its nearest listed family is AX8860. An
+AX8860-target retry advanced past the Conv hardware-op error, then failed in
+quantization with `ValueError: The truth value of an array with more than one
+element is ambiguous` in the MinMax observer. It still emitted no model.
+Neither failure reaches scheduling. The graph also differs from the
+documented successful training run (64x64 input, last four layers trainable),
+where trainable Convs are linearized before differentiation. The surviving
+1,104-node graph has 133 inputs and is a broader all-state, batch-16 graph; it
+does not use that successful pipeline.
 
-The AXCL device runtime is not exposed in this VM (`/dev/axcl_host` is
-missing), so I could not run an emitted model on the NPU. The remaining work
-to close executable coverage is to rebuild the documented 64x64, last-four-
-layers training graph with the current builder, compile it, inspect the
-flatten's forward/backward fan-out in the scheduler trace, run it on an AX650N,
-and preserve its MCode stream as a fixture. The historical `r18_b1` structural
-check and the 99.9% static op-coverage result are useful evidence, but they do
-not substitute for that end-to-end run.
+The device is now usable through the dedicated LXD VM. After restoring the
+PCI function to VFIO and restarting `axcl-vm`, its guest sees the card as an
+AX8850 with V3.6.5 firmware. I ran the available compiled ResNet18 inference
+model (`r18_term.axmodel`) there with one warmup and two measured runs; it
+completed at 1.554-1.569 ms (1.562 ms average). This verifies passthrough,
+firmware startup, and inference execution on the VM's NPU. It does not verify
+the training graph: the 1,104-node ONNX still fails before scheduling and has
+no `.axmodel`/MCode to run.
+
+The remaining work to close training-graph coverage is to rebuild the
+documented 64x64, last-four-layers training graph with the current builder,
+confirm the matching Pulsar2 target for the VM's AX8850, compile it, inspect
+the flatten's forward/backward fan-out in the scheduler trace, run it on the
+card, and preserve its MCode stream as a fixture. The historical `r18_b1`
+structural check, the successful ResNet18 inference run, and the 99.9% static
+op-coverage result are useful evidence, but they do not substitute for that
+training-step run.
