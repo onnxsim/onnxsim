@@ -335,3 +335,40 @@ How to read this:
   tensors between DSP and GPU are not measured. Hexagon kernels were compiled for `v73`
   while the SoC reports V69.
 
+## fp16 ConvTranspose on Hexagon
+
+`bench_tvm_hexagon_conv_transpose_fp16.py` repeats the mask-head ConvTranspose (`[8,256,14,14]`,
+2x2 kernel, stride 2) with fp16 activations, weights and output (NHWC, packed weights) on the
+connected phone. Errors are the max absolute error divided by the output's max magnitude,
+against an fp32 reference computed from the fp16-rounded operands; fp16 output rounding alone
+gives about 5e-4. Medians of three single invocations, layout copies and weight packing excluded.
+
+| Kernel | Time | Error | Notes |
+|---|---:|---:|---|
+| fp32, LLVM-generated (best) | 34.6 ms | 1e-6 | baseline from the fp32 section |
+| fp32, hand-written HVX qf32 | 12.8 ms | 1e-6 | `vmpy.qf32.sf` + `vadd.qf32` |
+| fp16, LLVM-generated, fp16 accumulate | 12.4 ms | 1.2e-2 | 64 lanes but qf16 conversions per op |
+| fp16, LLVM-generated, fp32 accumulate | 24.7 ms | 7e-4 | |
+| fp16, HVX `vmpy.qf16.hf` + `vadd.qf16` | 4.04 ms | 1.2e-2 | 64 MACs per vector op; fp16 accumulation over K=256 is too coarse |
+| fp16, HVX qf16 chunks of 8, widened into qf32 | **4.15 ms** | 2.0e-3 | `vmpy.qf32.qf16` by qf16 1.0 every 8 input channels |
+| fp16, HVX `vmpy.qf32.hf` widening, fp32 accumulate | 5.56 ms | 8.8e-4 | at the fp16-output rounding floor |
+
+So fp16 storage roughly triples the hand-written kernel's speed (12.8 to 4.2-5.6 ms) and is
+about 8x faster than the LLVM-generated fp32 path, with `hf` operands halving weight and
+activation traffic. Notes:
+
+- Accumulating 256 products in qf16 (the same precision class as LLVM's fp16 path) costs about
+  1.2% error; chunked qf16 with widening recovers most of it at almost no speed cost, and
+  the widening `vmpy.qf32.hf` form reaches the fp16 rounding floor at ~30% more time.
+- LLVM 19 has no `llvm.hexagon.V6.vmpy.rt.hf` intrinsic (the SDK headers do); the kernels use
+  `lvsplath` + `vmpy.qf16.hf` instead.
+- **Silent wrong results under register pressure.** Configurations with many live
+  accumulators (for example `--vectors 4 --pixel-blocks 2 --unrolls 4` for `qf32w`, or any
+  7-pixel block) return garbage (error >= 1) while the same tile shape with `--unrolls 1` or
+  `2` is correct, so the failure follows spilling/hoisted loads and was not root-caused. The
+  script marks any error above 5% as `** WRONG RESULT **`; only verified configurations are
+  quoted above (`--vectors 2 --pixel-blocks 2`).
+- The V69 phone has HVX `qf16`/`hf` instructions but no IEEE fp16 vector arithmetic, so fp16
+  kernels still convert through qf formats; fp16 activations would need matching fp16
+  layout-copy kernels to keep the whole path fp16 (not done).
+
