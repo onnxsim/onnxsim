@@ -2939,7 +2939,7 @@ def build_backward(
                 contribution if existing is None else b.add(existing, contribution)
             )
 
-    for node in reversed(list(nodes)):
+    for node in reversed(nodes):
         multi_rule = _MULTI_OUTPUT_RULES.get(node.op_type)
         if multi_rule is not None:
             # A different dispatch path from the single-output one below:
