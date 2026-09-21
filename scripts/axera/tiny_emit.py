@@ -113,6 +113,7 @@ dependency: everything else here needs only
 
 from __future__ import annotations
 
+import math
 import struct
 
 
@@ -526,7 +527,29 @@ def patch_reshape_gather_scales(
     emitting a plausible-looking result. The decode evidence is recorded in
     ``tests/test_axera_reshape_gather_bwd_decode.py``; the underlying patch
     primitives have fixture-level checks in ``tests/test_axera_tiny_emit.py``.
+
+    Reshape and Gather are data-movement ops in the confirmed graph, so they
+    preserve the quantization scale. Require the reference and requested
+    input/output scales to have identical float32 encodings; allowing them to
+    differ would make this patcher emit a byte-valid stream whose output
+    quantization metadata contradicts the bytes it moves.
     """
+    scales = {
+        "old_x_scale": float(old_x_scale),
+        "old_z_scale": float(old_z_scale),
+        "new_x_scale": float(new_x_scale),
+        "new_z_scale": float(new_z_scale),
+    }
+    words = {}
+    for name, value in scales.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive: {value!r}")
+        words[name] = struct.pack("<f", value)
+    if words["old_x_scale"] != words["old_z_scale"]:
+        raise ValueError("reference Reshape+Gather input/output scales must match")
+    if words["new_x_scale"] != words["new_z_scale"]:
+        raise ValueError("target Reshape+Gather input/output scales must match")
+
     out = patch_site_a(reference_mcode, old_x_scale, new_x_scale)
     return patch_output_quad(out, old_z_scale, new_z_scale)
 

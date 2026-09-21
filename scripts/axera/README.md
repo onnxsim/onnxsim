@@ -4612,11 +4612,15 @@ a TTS-specific hotfix, which may matter to the vocoder work above.
 
 ### The DSPs, and why they cannot close the gap to the rating
 
-**First, what the card is.** Three independent identifiers agree: the PCI
-device is `1f4b:0650`, the host firmware is `ax650_card.pac`, and `axcl-smi`
-reports `AX650N`. So the measurements above are AX650N measurements. (An
-M5Stack LLM-8850 is a different part -- AX8850, rated 24 TOPS INT8 -- and
-would present a different device ID and firmware.)
+**First, identify the card from the runtime, not the PCI ID or PAC filename.**
+M5Stack's [LLM-8850 software guide](https://docs.m5stack.switch-science.com/en/guide/ai_accelerator/llm-8850/m5_llm_8850_software_install)
+identifies PCI ID `1f4b:0650` as its AX8850 card, and its host package uses
+the `ax650_card.pac` filename. The updated M5Stack AXCL runtime reports the
+connected card as `AX8850`. Therefore those older identifiers alone are not
+enough to rule out the LLM-8850. The measurements in this section were
+recorded under an AX650N label based on those identifiers; their hardware
+provenance is uncertain and they should not be attributed to either chip
+until rerun with the board identity recorded.
 
 **The DSPs are real and programmable.** The AX650N carries **two Cadence
 Tensilica Vision Q7** cores alongside the NPU, and Cadence lists the part on
