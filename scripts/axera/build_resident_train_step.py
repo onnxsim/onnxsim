@@ -633,9 +633,12 @@ def build_resident_step(
     # what made the original loss-scaling probe's finding possible in the
     # first place (a constant can never be varied per step). Declared as a
     # scalar graph input the same way "lr" is, below, via `scalars=`.
+    # `b.nodes` is still just the forward graph here. build_backward walks
+    # its reverse sequence while appending gradient nodes only at the end,
+    # so passing this list directly avoids another full list of node refs.
     grads = graph_grad.build_backward(
         b,
-        nodes=list(model.graph.node),
+        nodes=b.nodes,
         shapes=shapes,
         grad_outputs={loss_output: "grad_seed"},
         targets=list(params),
