@@ -237,6 +237,11 @@ class _Backward:
     ) -> None:
         self.b = b
         self.shapes = shapes
+        # Forward constant operands are fixed during backward construction;
+        # preserve first-match behavior if a malformed graph repeats a name.
+        self._initializers: Dict[str, onnx.TensorProto] = {}
+        for tensor in b.initializer:
+            self._initializers.setdefault(tensor.name, tensor)
         # Shape metadata is fixed for one build_backward call; normalize on first use.
         self._shape_cache: Dict[str, Tuple[Union[int, str], ...]] = {}
 
@@ -1415,7 +1420,7 @@ def _constant_ints(ctx: _Backward, name: str, node: onnx.NodeProto) -> List[int]
     constants. Keeping this lookup local avoids adding runtime shape plumbing
     to the backward graph.
     """
-    tensor = next((t for t in ctx.b.initializer if t.name == name), None)
+    tensor = ctx._initializers.get(name)
     if tensor is None:
         raise UnsupportedOpError(
             f"{node.op_type} parameter {name!r} must be a constant initializer "
@@ -1619,7 +1624,7 @@ def _grad_pad(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
             f"Pad with negative pads is unsupported (node {node.output[0]!r})"
         )
     if len(node.input) > 2 and node.input[2]:
-        value = next((t for t in ctx.b.initializer if t.name == node.input[2]), None)
+        value = ctx._initializers.get(node.input[2])
         if value is None:
             raise UnsupportedOpError(
                 f"Pad constant_value must be a constant initializer "
@@ -2498,7 +2503,7 @@ def _grad_inference_dropout(
     runtime or true value would require applying the sampled mask and scaling.
     """
     if len(node.input) > 2 and node.input[2]:
-        training = next((t for t in ctx.b.initializer if t.name == node.input[2]), None)
+        training = ctx._initializers.get(node.input[2])
         if training is None:
             raise UnsupportedOpError(
                 f"Dropout training_mode must be a constant false initializer "
