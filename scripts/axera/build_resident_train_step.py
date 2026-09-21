@@ -139,15 +139,17 @@ def _linearize_trainable_convs(
     512-channel trainable convs (`docs/axera-on-device-training-
     handoff.md`'s "AxTranspose/AxSlice glue" section).
 
-    The fix is not to *move* that transpose to build time (an earlier
-    version of this function tried exactly that, pre-transposing the weight
-    once in host numpy and keeping state in the transposed layout -- it
-    numerically works, but `graph_grad.build_backward` cannot differentiate
-    the `Pad`/`Slice`/`Concat` nodes `act_weight_conv_to_matmul`'s own
-    construction needs, none of which have a gradient rule, built-in or
-    registerable without hand-writing three new ones). The fix is to **avoid
-    needing a weight transpose in the first place**: `_grad_conv`'s own
-    docstring spells out the identity --
+    An earlier version tried moving that transpose to build time by keeping
+    state in the transposed layout; a finite-difference check confirmed the
+    update numerics. At that time, backward construction also lacked the
+    `Pad`/`Slice`/`Concat` rules needed by `act_weight_conv_to_matmul`.
+    Static Python VJPs for those generated patterns now exist, so that
+    autodiff blocker is lifted. Pre-transposed state still requires expanding
+    the Conv before `build_backward` and changing state serialization to
+    permute weights on input/output; this builder does neither. For the
+    common ungrouped 1-D/2-D Conv case, the current fix is to **avoid needing
+    a weight transpose in the first place**: `_grad_conv`'s own docstring
+    spells out the identity --
 
         col[c, t, o] = X[c, position(o, t)]      (im2col: one gather)
         Y[m, o]      = sum_{c, t} W[m, c, t] * col[c, t, o]

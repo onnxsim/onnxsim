@@ -776,10 +776,14 @@ resident state that barely changes step to step.
 That was the first attempt, and it numerically works (a finite-difference
 check confirmed it) but is not what shipped: `act_weight_conv_to_matmul`'s
 own construction needs `Pad`/`Slice`/`Concat`, and `onnxsim.graph_grad` has
-no gradient rule for any of the three -- built-in or registerable without
-hand-writing three new ones (`graph_grad.register_gradient`/`custom_gradient`
-exist for exactly this, but three new rules is a materially bigger, riskier
-change than what actually fixed this).
+static Python gradient rules for these generated patterns now. That removes
+the original autodiff blocker, but does not make pre-transposed state a
+drop-in replacement: the Conv must be expanded before `build_backward`, and
+the runner must permute initial weights into state layout and outputs back to
+the source model's layout. The resident builder still uses the original
+layout and has not measured the alternate path on device. Its current
+im2col rewrite already removes the transpose for the common ungrouped
+trainable Conv case.
 
 **What shipped instead: avoid needing a weight transpose at all.**
 `onnxsim.graph_grad._grad_conv` already differentiates a live-weight `Conv`
