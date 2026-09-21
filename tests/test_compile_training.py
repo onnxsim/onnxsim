@@ -532,7 +532,7 @@ def test_non_scalar_loss_is_refused():
 
 
 def test_unsupported_op_is_refused_loudly():
-    """Softplus has no rule in :mod:`onnxsim.graph_grad`
+    """Sin has no rule in :mod:`onnxsim.graph_grad`
     (:data:`onnxsim.graph_grad.SUPPORTED_OPS`), so compiling a model that
     uses it must fail loudly rather than silently skip differentiating it --
     the same discipline :mod:`onnxsim.graph_grad`'s own docstring describes.
@@ -542,7 +542,7 @@ def test_unsupported_op_is_refused_loudly():
         agraph (float[4,3] x) => (float loss)
         {
             scaled = Mul(x, w)
-            act = Softplus(scaled)
+            act = Sin(scaled)
             loss = ReduceMean<keepdims=0>(act)
         }
         """,
