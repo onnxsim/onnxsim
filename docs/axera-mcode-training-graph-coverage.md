@@ -128,3 +128,44 @@ no runtime-adjustable handle into it; this doc's finding is the mcode-format
   weights without recompiling), which was never tested here but follows
   directly from Finding 2's own evidence -- a frozen weight in a training
   graph is not different from one in an inference graph.
+
+## ResNet18 training-graph coverage, with the surviving source graph
+
+The original `r18_b1.axmodel` used for Finding 1 is no longer present in the
+working tree or local Axera scratch directory, so its 190,800-byte stream
+cannot currently be pinned as a permanent fixture. The historical check above
+still records that exact real ResNet18 training stream passing `mcode.check()`;
+the committed training-stream regression fixture remains Wav2Vec2. I checked
+the surviving full ResNet18 training-step ONNX (`t2-r18/folded/wd/step.onnx`)
+to close the graph operator-coverage side of this gap:
+
+| graph | nodes | NPU-eligible nodes | remaining nodes |
+| --- | ---: | ---: | --- |
+| ResNet18 train step | 1,104 | 1,103 (99.9%) | 1 `Squeeze` |
+
+That `Squeeze` is the ResNet classifier flatten (`[1,512,1,1]` to `[1,512]`)
+feeding `Gemm`. This is the exact fusion context already confirmed to build
+and run on AX650N in `pulsar2_ops.py`'s `AX650_CONFIRMED_BROKEN_OPS` notes;
+the known scheduler failure applies when `Squeeze`/`Reshape` is standalone,
+not when it feeds the classifier `Gemm`. Thus the surviving graph has no
+uncovered training op type for its ResNet18 forward or backward path.
+
+I reran the Pulsar2 7.0-lite build for this graph. Calibration completed, but
+the quantizer failed while building hardware-op configuration for
+`ActWeightConv` node `resnetv15_conv0_fwd` with `IndexError: list index out of
+range`; no `.axmodel` or MCode was emitted. The failing node is the stem Conv
+with a live weight input `[64,3,7,7]` and activation `[16,3,224,224]`. This
+failure occurs before compiler scheduling, so it is not evidence of a missing
+MCode schedule rule. It also differs from the documented successful training
+run (64x64 input, last four layers trainable), where trainable Convs are
+linearized before differentiation. The surviving 1,104-node graph has 133
+inputs and is a broader all-state, batch-16 graph; it does not use that
+successful pipeline.
+
+The AXCL device runtime is not exposed in this VM (`/dev/axcl_host` is
+missing), so I could not run an emitted model on the NPU. The remaining work
+to close executable coverage is to rebuild the documented 64x64, last-four-
+layers training graph with the current builder, compile it, run it on an AX650N,
+and preserve its MCode stream as a fixture. The historical `r18_b1` structural
+check and the 99.9% static op-coverage result are useful evidence, but they do
+not substitute for that end-to-end run.

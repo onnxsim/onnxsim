@@ -1325,6 +1325,81 @@ one of the two convs' own commands rather than existing as its own
 identifiable unit, which is a real, useful negative constraint on where
 to look next.
 
+### A dilation change can switch the weight-buffer schedule
+
+A profiled, single-Conv pair (`k5_d3` and `k5_d4`) keeps the ONNX input
+`[1,4,16,16]`, weight shape `[4,4,5,5]`, and reported 102,400 MACs fixed;
+only symmetric dilation/padding changes, from 3/6 to 4/8. Pulsar2 7.0-lite
+does not just alter the convolution command in this pair. It selects a
+different weight-loading schedule:
+
+| | dilation 3 | dilation 4 |
+| --- | --- | --- |
+| `ld:param` events | 1, on `sdma4` | 2, on `sdma4` and `cv3` |
+| parameter source ranges | `params:[0:]` | `params:[0:]`, `params:[4736:]` |
+| OCM destination ranges | `[0:5888]` | `[0:4736]`, `[4736:9472]` |
+| compute jobs | `conv0` + `conv1` | `conv0` + `conv1` |
+| compute start / duration (trace units) | `651.3 / 897.5` | `634.75 / 737.5` |
+| compiler `max_cycle` | 2,118 | 1,941 |
+| Wbt bytes | 5,928 | 9,512 |
+
+At dilation 3, the one content-addressed parameter block feeds setup jobs on
+both compute engines. At dilation 4, two distinct hashes and adjacent OCM
+ranges appear; each engine's setup job depends on its own load. Both engines
+then read the same activation range and write the same output range. The
+profiler's estimate is 8.4% fewer cycles at dilation 4 despite the larger
+Wbt. These are compiler scheduling estimates, not on-device latency
+measurements.
+
+The MCode changes at the same boundary. Its five segment lengths change
+from `800, 800, 1184, 32, 352` to `832, 800, 1184, 256, 352`; its `a2`
+operands change from
+`13 00 40 00, 13 00 40 00, 12 00 20 82, 12 00 30 00, 12 00 40 00,
+22 00 40 00` to
+`13 00 30 00, 13 00 40 00, 12 00 20 82, 22 00 20 00, 12 00 30 00,
+22 00 30 c4, 12 00 40 00, 22 00 40 00`.
+The additional `22` records co-occur with the second weight block and its
+engine-local load, making them a good candidate for per-engine resource
+binding. This is a correlation only: it does not yet prove that an `a2`
+record names a DMA buffer or an engine. Two independent profiled d4 builds
+reproduced the same Wbt, segment lengths, `a2` sequence, engine split and
+1,941-cycle estimate; their MCode byte hashes differed, consistent with
+the small internal label noise characterized below.
+
+### `npu_mode` multiplies the job schedule; `a2` fields track the expansion
+
+To separate a shape-triggered change from a scheduler-mode change, the same
+dilation-4 graph was profiled with only `npu_mode` changed (`NPU1`, `NPU2`,
+`NPU3`). The mode sweep changes the schedule and its mcode substantially:
+
+| mode | MCode segments | `a2` records | parameter loads | Conv jobs | Conv lanes used | trace makespan |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| NPU1 | 5 | 8 | 2 | 2 | `conv0`, `conv1` | 1,940.6 |
+| NPU2 | 10 | 21 | 4 | 4 | `conv0`–`conv3` | 2,142.85 |
+| NPU3 | 15 | 27 | 5 | 6 | `conv2`–`conv5` | 2,646.45 |
+
+Segment count is exactly five per selected mode. The profiler assigns two,
+four and six Conv jobs respectively; the NPU3 jobs occupy three successive
+waves on four named lanes. More selected NPU units do not help this small
+graph in the compiler estimate: its trace makespan rises from 1,940.6 to
+2,646.45 as the scheduler creates more work partitions and parameter loads.
+This is a schedule-model result, not measured device latency.
+
+The packed `a2` operands also expand with the mode. Their first byte's high
+nibble spans 1..2, 1..3 and 1..4 for NPU1/2/3; their 16-byte-aligned third
+byte reaches `0x40`, `0x90` and `0xe0`, respectively. That is consistent
+with fields indexing scheduler slots or replicated resources. The parameter
+loads and MCode segments change at the same time, but the mapping is not
+one-to-one (NPU3 has five loads and six jobs), so neither nibble can yet be
+named as an engine ID or buffer index. The current evidence supports
+"schedule-dependent descriptor" for `a2`, not a decoded meaning.
+
+The next useful discriminator is a graph large enough to keep each mode's
+compute lanes busy while holding one op shape constant, then compare the
+`a2` groups with each lane's trace dependencies and parameter ranges. A
+device patch of one isolated field would be needed to promote the slot
+hypothesis to semantics.
+
 ### Following up on determinism: the label noise is functionally harmless, and stays small at real-model scale
 
 Two direct follow-ups to the determinism finding above, both confirmed
