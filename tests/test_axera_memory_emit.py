@@ -47,7 +47,16 @@ def _attr(node, name):
 
 @pytest.mark.parametrize(
     "start,end,expected_params,expected_shape",
-    [(0, 4, 0, [1, 4]), (1, 5, 4, [1, 4]), (2, 5, 8, [1, 3]), (4, 8, 16, [1, 4])],
+    [
+        (0, 3, 0, [1, 3]),
+        (0, 4, 0, [1, 4]),
+        (1, 4, 4, [1, 3]),
+        (1, 5, 4, [1, 4]),
+        (2, 5, 8, [1, 3]),
+        (3, 6, 12, [1, 3]),
+        (4, 7, 16, [1, 3]),
+        (4, 8, 16, [1, 4]),
+    ],
 )
 def test_emit_slice_retargets_offset_and_shape_but_preserves_mcode(
     tmp_path, start, end, expected_params, expected_shape
@@ -75,7 +84,7 @@ def test_emit_slice_retargets_offset_and_shape_but_preserves_mcode(
 
 @pytest.mark.parametrize(
     "start,end",
-    [(-1, 2), (2, 2), (5, 9), (1.0, 4), (0, 3), (3, 6), (0, 8)],
+    [(-1, 2), (2, 2), (5, 9), (1.0, 4), (0, 2), (2, 7), (0, 8)],
 )
 def test_emit_slice_rejects_out_of_scope_ranges(tmp_path, start, end):
     reference = _fixture_path(tmp_path)

@@ -5,20 +5,24 @@
 The first narrow memory-op emitter is static float32 `Slice` support for an
 input shaped `[1, 8]`, axis 1, unit step. Its entry point is
 `emit_slice_axmodel(reference_path, output_path, start=..., end=...)` in
-`scripts/axera/memory_emit.py`. It accepts the measured intervals `[0:4]`,
-`[1:5]`, `[2:6]`, `[3:7]`, `[4:8]`, and `[2:5]`; it checks the reference
-model structure and normalized MCode before updating the parameter table and
-output-shape metadata. Details and hardware results are in
+`scripts/axera/memory_emit.py`. It accepts length-three and length-four
+intervals with starts 0 through 4. It checks the reference model structure
+and normalized length-four template MCode before updating the parameter
+table and output-shape metadata. Compiler-built length-three MCode has three
+additional shape-specific byte changes, but the retained length-four MCode
+was verified on device for every length-three start. Details and hardware
+results are in
 [`axera-memory-op-generator.md`](axera-memory-op-generator.md).
 
 The model was built with Pulsar2 7.0-lite and run inside the LXD VM `axcl-vm`
-on AX8850 V3.6.5 firmware. Two emitted variants returned the expected values
-for input `[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
-`tests/test_axera_memory_emit.py` (11 cases passed).
+on AX8850 V3.6.5 firmware. Five length-three emitted variants and two
+length-four variants returned the expected values for input
+`[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
+`tests/test_axera_memory_emit.py`.
 
-Code and tests are on branch `codex/axera-slice-memory-emitter`, in commit
-`7a4d6ff2`. PR [#1723](https://github.com/onnxsim/onnxsim/pull/1723) is open
-with auto-merge enabled; check its CI status before building on this work.
+Code and tests are on branch `codex/axera-slice-memory-emitter`. PR
+[#1723](https://github.com/onnxsim/onnxsim/pull/1723) is open with auto-merge
+enabled; check its CI status before building on this work.
 The working tree also has unrelated changes under `third_party/onnx` and two
 untracked npm lockfiles under `tools/onnx-finetune/wasm/`; leave those alone.
 
@@ -44,10 +48,10 @@ compiled quantization configuration.
 
 ## Next steps
 
-1. Extend Gather only after compiling and device-checking each new index vector
-   or output length. Keep runtime values inside the calibration range when
-   comparing against ONNX.
-2. Probe a different memory operator from a compiler-supported graph with a
+1. Probe Gather output lengths and other axes only through compiler and device
+   checks. Keep runtime values inside the calibration range when comparing
+   against ONNX.
+2. Probe another memory operator from a compiler-supported graph with a
    consumer if possible; standalone terminal Reshape/Squeeze can fail in the
    scheduler. Compare exact rebuilds, then run emitted models on the NPU.
 3. Keep each emitter restricted to a measured graph family and reject

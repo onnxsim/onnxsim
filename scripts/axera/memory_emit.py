@@ -1,22 +1,26 @@
 """Small, evidence-scoped emitters for Axera memory-only operators.
 
 Pulsar2 7.0-lite emits the same MCode program for the tested AX650 ``Slice``
-shape ``X[1, 8] -> Y[1, n]`` (axis 1, step 1), for intervals ``[0:4]``,
-``[1:5]``, ``[2:6]``, ``[3:7]``, ``[4:8]``, and ``[2:5]``. The operation's
-byte offset is stored in five repeated
-uint64 entries in ``npu_params`` and the output shape is stored in the
-``neu mode`` node's ``outputs_info`` attribute plus ONNX output metadata.
-This module patches those fields on a compiled template. It deliberately
-does not generalize to other Slice ranks, axes, steps, or input shapes.
+shape ``X[1, 8] -> Y[1, 4]`` (axis 1, step 1), for starts 0 through 4. The
+operation's byte offset is stored in five repeated uint64 entries in
+``npu_params`` and the output shape is stored in the ``neu mode`` node's
+``outputs_info`` attribute plus ONNX output metadata. This module also emits
+verified length-three outputs by patching that length-four template's
+parameter and shape metadata. Compiler-built length-three MCode has additional
+shape-specific bytes, but the patched length-four stream has been run
+successfully for every tested length-three start. It deliberately does not
+generalize to other Slice ranks, axes, steps, or input shapes.
 
 It also retargets measured static ``Gather`` index vectors for
 ``X[1,8] -> Y[1,4]``. Their indices are stored in the compiled model's
 ``npu_params`` table; other Gather shapes are out of scope.
 
 The evidence and hardware check are recorded in the Axera MCode coverage
-notes. The reference fixture was built with start=2/end=6; builds with
-start=0..4 and lengths 3/4, including an exact-config rebuild, changed no
-MCode bytes outside the known compiler-noise region at offsets 301..325.
+notes. The reference fixture was built with start=2/end=6. Length-four builds
+with starts 0..4 changed no MCode bytes outside the known compiler-noise
+region at offsets 301..325. Compiler-built length-three variants also change
+bytes 988, 1172, and 1584; emitted length-three models retain the length-four
+template and have been hardware-verified.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ _GATHER_INPUT_WIDTH = 8
 
 
 def _supported_interval(start: int, end: int) -> bool:
-    return (end - start == 4 and 0 <= start <= 4) or (start == 2 and end == 5)
+    return end - start in (3, 4) and 0 <= start <= 4
 
 
 def _initializer(model: onnx.ModelProto, name: str):
@@ -166,8 +170,8 @@ def emit_slice_axmodel(
         raise ValueError("start and end must be integers")
     if not 0 <= start < end <= 8 or not _supported_interval(start, end):
         raise ValueError(
-            "supported intervals are [0:4], [1:5], [2:6], [3:7], [4:8], "
-            f"and [2:5]; got [{start}, {end})"
+            "supported intervals have length 3 or 4 and start in [0, 4]; "
+            f"got [{start}, {end})"
         )
 
     model = onnx.load(reference_path, load_external_data=False)
