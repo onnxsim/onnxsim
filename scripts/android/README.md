@@ -102,12 +102,22 @@ Mask R-CNN ONNX model. It compiles representative convolution + bias + ReLU,
 max-pooling, nearest-neighbor FPN resize, four-level 7x7 RoIAlign,
 mask-head 2x transpose convolution, and quantize/dequantize kernels for V73,
 runs them on the connected Hexagon DSP, and compares their results with
-TVM/LLVM CPU kernels or NumPy. The uint8 quantized values are checked exactly;
-dequantized floats allow a 1e-5 absolute tolerance for DSP floating-point
-rounding. The ROI workloads use a configurable synthetic proposal batch
-(default 8) because the model's ROI count is dynamic. Tensor values, weights,
-and regions are randomized. This checks individual kernels, not the full Mask
-R-CNN graph, model weights, QNN integration, or detector accuracy.
+TVM/LLVM CPU kernels or NumPy. The convolution schedule vectorizes eight
+contiguous output-width elements and parallelizes the remaining output tiles;
+pooling uses 32-wide output tiles, while resize, RoIAlign, and QDQ use
+Hexagon's vectorized/parallel injective schedule. On the tested V73 device,
+these schedules reduced representative kernel times versus the initial
+schedule by 5.7x for ResNet 3x3 convolution, 4.7x for mask-head transpose
+convolution, 2.5x for 56x56 RoIAlign, 3.5x for QDQ, 1.6x for resize, and 1.5x
+for max-pooling. These speedups compare the old and updated schedules on the
+same device, using the median of five single-invocation timings with buffers
+preallocated; they are per-kernel timings, not end-to-end model latency. The uint8 quantized
+values are checked exactly; dequantized floats allow a 1e-5 absolute tolerance
+for DSP floating-point rounding. The ROI workloads use a configurable
+synthetic proposal batch (default 8) because the model's ROI count is dynamic.
+Tensor values, weights, and regions are randomized. This checks individual
+kernels, not the full Mask R-CNN graph, model weights, QNN integration, or
+detector accuracy.
 
 The probe needs an Apache TVM build with Hexagon enabled, the matching Hexagon
 SDK/toolchain, and Python packages `onnx`, `numpy`, and TVM's dependencies. Set

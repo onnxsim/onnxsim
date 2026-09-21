@@ -263,10 +263,14 @@ def _conv_module(name, data_shape, weight_shape, stride, pad_before, pad_after, 
         name="relu",
     )
     schedule = topi.hexagon.schedule_conv2d(output, layout="NCHW")
-    # NCHW width is contiguous. The factor gives LLVM's Hexagon backend a
-    # vectorization opportunity on the V73 target, with tail handling as needed.
-    _, width_inner = schedule[conv].split(conv.op.axis[3], factor=32)
+    # Width is contiguous in NCHW. Small width vectors leave more independent
+    # outer tiles for the Hexagon worker pool than a single 32-wide vector.
+    n, channel, height, width = schedule[conv].op.axis
+    width_outer, width_inner = schedule[conv].split(width, factor=8)
+    outer = schedule[conv].fuse(n, channel, height, width_outer)
+    schedule[conv].reorder(outer, width_inner, *schedule[conv].op.reduce_axis)
     schedule[conv].vectorize(width_inner)
+    schedule[conv].parallel(outer)
     module = tvm.build(schedule, [x, weight, bias, output], target=target, name="main")
     return module, tuple(int(dim) for dim in output.shape)
 
@@ -283,7 +287,13 @@ def _pool_module(data_shape, kernel, stride, pads, target):
         ceil_mode=False,
         layout="NCHW",
     )
-    schedule = topi.hexagon.schedule_pool(output, layout="NCHW")
+    schedule = te.create_schedule(output.op)
+    n, channel, height, width = schedule[output].op.axis
+    width_outer, width_inner = schedule[output].split(width, factor=32)
+    outer = schedule[output].fuse(n, channel, height, width_outer)
+    schedule[output].reorder(outer, *schedule[output].op.reduce_axis, width_inner)
+    schedule[output].vectorize(width_inner)
+    schedule[output].parallel(outer)
     module = tvm.build(schedule, [x, output], target=target, name="main")
     return module, tuple(int(dim) for dim in output.shape)
 
@@ -299,7 +309,7 @@ def _resize_module(data_shape, size, coordinate_mode, rounding_mode, target):
         coordinate_transformation_mode=coordinate_mode,
         rounding_method=rounding_mode,
     )
-    schedule = te.create_schedule(output.op)
+    schedule = topi.hexagon.schedule_injective(output)
     module = tvm.build(schedule, [x, output], target=target, name="main")
     return module, tuple(int(dim) for dim in output.shape)
 
@@ -311,9 +321,9 @@ def _roi_align_module(data_shape, rois_shape, pooled_size, spatial_scale, sample
         data, rois, pooled_size, spatial_scale, mode.encode(), sample_ratio
     )
     # TVM 0.17 has no registered Hexagon Relay schedule for RoiAlign. Its TOPI
-    # compute is TE-based, so an explicit default TE schedule still lets the
-    # Hexagon code generator lower and execute this operator on its own.
-    schedule = te.create_schedule(output.op)
+    # compute is TE-based, so use Hexagon's injective schedule to vectorize and
+    # parallelize the independent output elements.
+    schedule = topi.hexagon.schedule_injective(output)
     module = tvm.build(schedule, [data, rois, output], target=target, name="main")
     return module, tuple(int(dim) for dim in output.shape)
 
@@ -336,6 +346,12 @@ def _conv_transpose_module(data_shape, weight_shape, stride, pads, output_paddin
         name="bias_add",
     )
     schedule = topi.hexagon.schedule_conv2d_transpose_nchw(biased)
+    n, channel, height, width = schedule[output].op.axis
+    width_outer, width_inner = schedule[output].split(width, factor=8)
+    outer = schedule[output].fuse(n, channel, height, width_outer)
+    schedule[output].reorder(outer, width_inner, *schedule[output].op.reduce_axis)
+    schedule[output].vectorize(width_inner)
+    schedule[output].parallel(outer)
     module = tvm.build(schedule, [data, weight, bias, biased], target=target, name="main")
     return module, tuple(int(dim) for dim in biased.shape)
 
@@ -355,7 +371,7 @@ def _qdq_module(data_shape, scale, zero_point, target):
         lambda *idx: (quantized[idx].astype("float32") - zero_point) * scale,
         name="dequantize_linear",
     )
-    schedule = te.create_schedule([quantized.op, dequantized.op])
+    schedule = topi.hexagon.schedule_injective([quantized, dequantized])
     module = tvm.build(schedule, [data, quantized, dequantized], target=target, name="main")
     return module
 
