@@ -498,6 +498,7 @@ def _col2im_indices(
     strides: Sequence[int],
     dilations: Sequence[int],
     pads_begin: Sequence[int],
+    tap_offset: int = 0,
 ) -> Tuple[List[int], np.ndarray]:
     """The same correspondence read the other way: which *output* position a
     given ``(kernel tap, input position)`` pair came from.
@@ -510,7 +511,9 @@ def _col2im_indices(
     the division inexact for most positions -- those are exactly the input
     elements that tap never touched -- and they are masked away like the
     padded ones above. NumPy builds tap and position coordinates without
-    Python iteration over every input entry.
+    Python iteration over every input entry. ``tap_offset`` adds that many
+    positions per tap block, including masked entries, for gather tables whose
+    tap blocks occupy separate flattened ranges.
     """
     spatial = len(in_dims)
     in_count = _prod(in_dims)
@@ -533,6 +536,8 @@ def _col2im_indices(
         valid &= divisible & (output_pos >= 0) & (output_pos < out_dims[axis])
         flat = flat * out_dims[axis] + output_pos
     flat[~valid] = 0
+    if tap_offset:
+        flat += np.arange(tap_count, dtype=np.int64)[:, None] * tap_offset
     return flat.reshape(-1).tolist(), valid.reshape(-1).astype(np.float32)
 
 
@@ -1146,15 +1151,8 @@ def _grad_maxpool(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
     )
 
     scatter_index, scatter_mask = _col2im_indices(
-        in_dims, out_dims, kernel, strides, dilations, pads
+        in_dims, out_dims, kernel, strides, dilations, pads, tap_offset=out_count
     )
-    # Offset each tap's block into its own slice of the flattened
-    # [taps, out_count] axis contrib2 holds -- see the docstring above.
-    for tap in range(taps):
-        base = tap * in_count
-        offset = tap * out_count
-        for entry in range(in_count):
-            scatter_index[base + entry] += offset
 
     gathered_back = ctx.b.op(
         "Gather", [contrib2, ctx.int64_const(scatter_index, "idx")], axis=1
