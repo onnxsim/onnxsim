@@ -2330,6 +2330,39 @@ def _grad_split(
     return [dx] + [None] * (len(node.input) - 1)
 
 
+def _grad_inference_dropout(
+    ctx: _Backward, node: onnx.NodeProto, gs: List[Optional[str]]
+) -> List[Optional[str]]:
+    """Inference-mode Dropout is an identity; its optional mask is discrete.
+
+    ONNX opset 12+ carries ``training_mode`` as an optional bool input. Only
+    differentiate when it is omitted or a constant false initializer; a
+    runtime or true value would require applying the sampled mask and scaling.
+    """
+    if len(node.input) > 2 and node.input[2]:
+        training = next(
+            (t for t in ctx.b.initializer if t.name == node.input[2]), None
+        )
+        if training is None:
+            raise UnsupportedOpError(
+                f"Dropout training_mode must be a constant false initializer "
+                f"(node {node.output[0]!r})"
+            )
+        try:
+            value = np.asarray(onnx.numpy_helper.to_array(training))
+        except Exception as exc:
+            raise UnsupportedOpError(
+                f"Dropout training_mode is not a readable constant "
+                f"(node {node.output[0]!r})"
+            ) from exc
+        if value.dtype.kind != "b" or value.size != 1 or bool(value.reshape(-1)[0]):
+            raise UnsupportedOpError(
+                f"Dropout training_mode must be scalar false "
+                f"(node {node.output[0]!r})"
+            )
+    return [gs[0]] + [None] * (len(node.input) - 1)
+
+
 # --- Multi-output rules --------------------------------------------------
 #
 # :data:`Rule` (and therefore :data:`_RULES`/:data:`SUPPORTED_OPS`) assumes
@@ -2338,8 +2371,8 @@ def _grad_split(
 # ``tests/test_qat_parity.py`` pins ``sorted(SUPPORTED_OPS)`` byte-for-byte
 # against a checked-in fixture that also has to match ``qat_entry.cpp``'s own
 # hardcoded C++ rule table -- see :data:`SUPPORTED_OPS`'s own comment. A rule
-# for an op with more than one *output* (``Split`` is the only one so far --
-# GLU gating in a Conformer-style audio-model block, see
+# for an op with more than one *output* (``Split`` and inference-mode
+# ``Dropout`` today; GLU gating in a Conformer-style audio-model block, see
 # ``docs/axera-audio-speech-op-coverage.md``) genuinely needs a different
 # argument shape (one gradient per output, not one), so it is kept in this
 # separate table rather than forced into :data:`_RULES`'s contract or
@@ -2357,6 +2390,7 @@ def _grad_split(
 # both already keyed off ``supported_ops()`` rather than the raw constant)
 # correctly treats a block containing it as differentiable.
 _MULTI_OUTPUT_RULES: Dict[str, MultiOutputRule] = {
+    "Dropout": _grad_inference_dropout,
     "Split": _grad_split,
 }
 

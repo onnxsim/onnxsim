@@ -80,7 +80,12 @@ template used to live.
 
 | ONNX op | VJP | Python rule | C++ rule |
 |---|---|---|---|
+| `Dropout` | identity for inference mode (omitted or constant-false `training_mode`); no gradient for optional mask, ratio, or mode inputs | `_grad_inference_dropout` | -- (Python only) |
 | `Split` | one `MatMul` per output against a constant 0/1 selection matrix (not a `Concat` of the incoming gradients -- `Concat` isn't in `BACKWARD_OPS`) | `_grad_split` | `GradSplit` |
+
+`Dropout` with a true or runtime `training_mode` remains unsupported. Its VJP
+would need the sampled dropout mask and training scale; treating that case as
+an identity would be incorrect.
 
 ## `_PYTHON_ONLY_RULES` -- no C++/WASM mirror yet
 
