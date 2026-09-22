@@ -277,3 +277,99 @@ on its own.
 steps, in order: (1) the small-channel 1x1 conv schedule (biggest lever, ~28% potential), (2) the
 resize2d scalar-index computation (~8%, smaller but likely simpler to fix).
 
+## Fixed: FPN resize2d, via an exact-2x integer fast path
+
+Root cause of the resize2d anomaly above: `topi.image.resize2d`'s `get_closest_index()`
+(`topi/image/resize.py`) calls `te.ceil`/`te.floor`/`te.round` **per output pixel** to convert a
+float source coordinate to an integer index. On Hexagon these lower to scalar libm calls per HVX
+lane -- same class of bug as an earlier Sigmoid fix in this project -- which serializes the whole
+op even though the surrounding loop is otherwise vectorized and parallel. `relay/op/image/_image.py`
+registers `image.resize2d`'s compute uniformly across all targets (no Hexagon-specific strategy
+exists), and it looks up `topi.image.resize2d` as a live module attribute at call time, so it can
+be monkeypatched without touching TVM itself.
+
+Mask R-CNN's FPN only ever resizes with `nearest_neighbor` + `half_pixel` +
+`round_prefer_floor`, always exactly 2x per axis. For that one case the float math collapses
+algebraically to integer indexing:
+
+```
+in_x = (out_x + 0.5) * 0.5 - 0.5          # get_inx, scale = in_w / out_w = 0.5
+idx  = ceil(in_x - 0.5) = ceil(out_x * 0.5 - 0.75) = out_x // 2   # verified exact, all out_x
+```
+
+`scripts/android/hexagon_resize2x.py` implements this: `is_exact_2x_nearest_half_pixel()` checks
+the four conditions above, `_nearest_2x()` builds a plain `te.compute` with `//2` indexing (no
+float ops at all) when they hold, and `resize2d_with_fast_path()` falls back to the stock
+`topi.image.resize2d` otherwise. `patch()` is a context manager that swaps
+`tvm.topi.image.resize2d` for the duration of a `relay.build()` call.
+
+Verified on-device, bit-exact (`np.array_equal` against the stock TVM output) at all three real
+FPN shapes:
+
+| Shape | Stock | Fast path | Speedup |
+|---|---:|---:|---:|
+| (1,256,25,34)->(50,68) | 29.7 ms | 3.3 ms | 8.9x |
+| (1,256,50,68)->(100,136) | 118.4 ms | 6.7 ms | 17.6x |
+| (1,256,100,136)->(200,272) | 451.0 ms | 27.9 ms | 16.2x |
+
+Then applied to the **real backbone build** (`FakeQuantizationToInteger` + `relay.build` of the
+full cached graph, not just the isolated op), and measured end-to-end on the phone, 5 runs each,
+against the same real input and the same host-ORT reference used throughout this README:
+
+| | Median wall time | max abs err vs. host ORT |
+|---|---:|---:|
+| Stock | 3724.6 ms | 1.025 |
+| With fast path | 3611.9 ms | 1.025 |
+
+**112.7 ms faster end-to-end (3.0%), byte-for-byte the same numerical error as stock** -- the fix
+changes nothing about correctness, only speed. Note this is much smaller than the isolated
+595.6 ms (7.8%) the ranked profile above would suggest: the isolated-timing methodology
+explicitly overshoots the fused-graph reality by ~2x (documented above), and here that gap is
+larger still because resize2d's cost is dwarfed in the real graph by the 1x1-conv memory-bound
+cost below, plus whatever cross-op scheduling overlap the isolated single-op benchmark can't
+capture. The lesson: isolated-op rankings are the right tool for *prioritizing what to look at*,
+not for *predicting the real-world payoff* of a fix -- always confirm on the full graph.
+
+## Diagnosed but not fixed: the 1x1-conv gap is memory-bound, not loop-overhead
+
+The "systemic pattern 1" finding above (small-channel 1x1 convs at 5.2 vs. 52.5 GMAC/s, 10.1x
+gap) originally hypothesized a **loop-overhead / register-tiling** cause: too few `ic_bn`=32-wide
+reduction chunks (2-4, when either channel count is <=128) to hide the vrmpy pipeline's per-chunk
+latency. Two targeted experiments on the slow shape (cin=64, cout=256 @ 200x272) both came back
+negative:
+
+- **`reg_n` sweep** (register-tile width for the output-width loop; values 4, 8, 16, 17, 31, 34,
+  68): flat at 3.48-3.49 GMAC/s across the whole range. No effect.
+- **Unrolling `ic_outer`** (the outer reduction-channel-chunk loop, via monkeypatching
+  `schedule_conv2d_NCHWc_int8` to add `s[conv_out].unroll(ic_outer)`): 257.0 ms stock vs. 256.5 ms
+  patched, correctness identical (`out_sum` bit-equal both ways). No effect.
+
+Both experiments manipulate register/instruction-level structure, and neither moved the needle --
+so the bottleneck isn't there. A follow-up test disentangled channel count from spatial size
+directly, and that's what mattered:
+
+| Config | Time | GMAC/s |
+|---|---:|---:|
+| cin=64,cout=256 @200x272 (the slow shape as found) | 254.1 ms | 3.51 |
+| cin=64,cout=256 @**50x68** (same channels, fast shape's spatial size) | 5.5 ms | **10.09** |
+| cin=256,cout=1024 @50x68 (the fast shape as found) | 43.7 ms | 20.39 |
+| cin=256,cout=1024 @**200x272** (same channels, slow shape's spatial size) | 1363.6 ms | **10.46** |
+
+Holding channels fixed and only shrinking spatial size (row 1 -> row 2) recovers most of the
+throughput (3.51 -> 10.09 GMAC/s); holding channels fixed at the *fast* shape's large values but
+inflating spatial size to the slow shape's (row 3 -> row 4) *tanks* throughput by roughly the same
+factor (20.39 -> 10.46 GMAC/s). Spatial size, not channel count, is the dominant variable --
+channel count still matters (10.09 vs. 20.39 at the same small spatial size), but roughly half as
+much.
+
+**Corrected diagnosis**: this is a memory-bandwidth / VTCM working-set cliff, not a loop-overhead
+problem. In `schedule_conv_NCHWc_cpu_common_int8` (`topi/generic/conv2d.py`, shared by Hexagon's
+`schedule_conv2d_NCHWc_int8`), the parallel/task axis is
+`s[C].fuse(batch, oc_chunk, oh)` -- `oc_chunk` (output-channel chunk) sits **outer** to the full
+spatial (`oh`) sweep. At large spatial resolutions the input feature map doesn't fit in VTCM/cache
+across that sweep, so it gets re-streamed from DRAM once per `oc_chunk` instead of once total --
+redundant DRAM traffic that scales with spatial size, exactly matching what the table shows. A
+real fix would swap the loop order so a cache-sized spatial tile is fully processed across all
+`oc_chunk`s before advancing (genuine cache blocking) -- that's a schedule rewrite, not a
+parameter tweak, and wasn't attempted this session.
+
