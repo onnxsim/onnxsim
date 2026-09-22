@@ -217,3 +217,63 @@ vectorizable int32 loop (or, since Mask R-CNN's FPN always upsamples by exactly 
 With 3-4 such FPN merges in the backbone, this is on the order of 100-150 ms of the 3.68s total
 (3-4%) -- not the dominant cost, but a disproportionate, well-isolated, likely-cheap-to-fix one.
 
+## Full backbone profile: what's actually slow, ranked
+
+`get_graph_debug_executor().run_individual()` turned out not to be a graph-size problem after
+all: it fails even on a 1-op graph, at the `GetFunction` stage (before `run_individual` is even
+called) -- this Hexagon RPC skeleton build most likely lacks `USE_PROFILER` support, not
+something fixable from the Python side. Worked around it the reliable way instead: extracted
+every unique layer shape from the backbone's ONNX graph (`onnx.shape_inference`), deduplicated
+(76 Conv nodes -> 37 unique shapes; ResNet-50 repeats bottleneck shapes across its 3/4/6/3
+blocks), built and timed each shape once on the phone as a standalone int8 module, and weighted
+by occurrence count -- plus the same for Resize/MaxPool/Add/Sigmoid. Isolated per-shape timings
+necessarily overshoot the real fused total (no cross-op layout/weight-prepacking sharing, no
+pipelining): the weighted sum is 7.62s vs. the measured 3.68s full backbone (2.07x). Use the
+**percentages**, not the absolute milliseconds, as the reliable signal; the full ranked table is
+in `conv_profile.json`/`noncon_profile.json`.
+
+Ranked by weighted contribution to the isolated-timing total (top entries, 89.9% of it):
+
+| Rank | Layer | Instances | GMAC/s | Share |
+|---|---|---:|---:|---:|
+| 1 | Conv 3x3 256->256 @200x272 | 2 | 49.3 | 17.1% |
+| 2 | Conv 1x1 64->256 @200x272 | 4 | **3.5** | 13.4% |
+| 3 | Conv 1x1 128->512 @100x136 | 4 | **6.0** | 7.8% |
+| 4 | resize2d nearest-neighbor @100x136->200x272 | 1 | -- | 5.9% |
+| 5 | Conv 1x1 256->256 @200x272 | 1 | 9.8 | 4.8% |
+| 7 | Conv 7x7 3->64 @800x1088 stride2 (stem) | 1 | 6.6 | 4.0% |
+| 13 | Conv 1x1 256->64 @200x272 | 2 | 7.6 | 3.1% |
+| 17 | resize2d @50x68->100x136 | 1 | -- | 1.5% |
+| 20 | Conv 1x1 256->12 @200x272 (RPN score head) | 1 | 2.0 | 1.1% |
+
+Two systemic patterns, aggregated across the whole ranked list (not just the visible top 20):
+
+1. **1x1 convolutions where either channel count is <=128** (25 of the 76 conv layer instances,
+   16 unique shapes) run at a blended **5.2 GMAC/s**, against **52.5 GMAC/s** for 3x3 convs with
+   >=256 channels on both sides -- a **10.1x** gap. These 25 layers alone are **31.5%** of the
+   isolated-timing total. If they matched the 3x3-conv throughput, they'd cost about 240 ms
+   instead of 2.4 s of isolated time (roughly 2.2s, ~28% of the total, in potential savings).
+   Not root-caused in this session, but the likely mechanism: `schedule_conv_NCHWc_cpu_common_int8`
+   packs channels into `ic_bn`=32-wide chunks for the vrmpy reduction; with cin or cout at 64 or
+   128 there are only 2-4 such chunks, too few to hide the vrmpy pipeline's per-chunk latency
+   (the same "reduction too shallow to hide latency" shape of problem as the earlier `tile_ow`
+   experiment, just along the channel axis instead of the spatial one -- and unlike `tile_ow`,
+   not yet tested with a fix). The RPN head convs (`cout` = 3 or 12, rank 20 and others further
+   down the list) are the extreme end of this: 0.3-2.0 GMAC/s.
+2. **The FPN `resize2d` upsamples** (ranks 4 and 17, plus a third smaller one not in the top 20):
+   confirmed to scale with size, not a fixed cost -- **595.6 ms total, 7.8%** of the isolated
+   sum, from just 3 layer instances. Root cause from the earlier session (scalar `ceilf` per
+   row/column in the coordinate transform) still stands and is now known to matter more than the
+   single-shape test suggested.
+
+Rank 1 (the single largest line item, 17.1%) is *not* an inefficiency to fix -- 49.3 GMAC/s is
+close to the best throughput measured anywhere in the backbone; it is simply an intrinsically
+large layer (3.2 GMAC per call, the biggest spatial resolution x channel count combination in
+the network). The stem conv (rank 7, cin=3) is a known-degenerate case for int8 vrmpy (3 input
+channels don't pack cleanly into the reduction) but is a single layer, so it is not high-leverage
+on its own.
+
+**If continuing this work**, the two systemic findings above are the concrete, prioritized next
+steps, in order: (1) the small-channel 1x1 conv schedule (biggest lever, ~28% potential), (2) the
+resize2d scalar-index computation (~8%, smaller but likely simpler to fix).
+
