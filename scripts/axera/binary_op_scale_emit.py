@@ -8,8 +8,9 @@ register records ``[verb][00][field][bank][value32]``. A calibration change at
 fixed zero points then touches only whole records (measured on held-out builds,
 ``docs/axera-binary-op-scale-emit.md``):
 
-* Each scale-derived float32 is written once per output lane, 8 lanes, on
-  registers ``0x0f50..0x0fc0`` (``0x0fd0..0x1040`` for Mul's divisor):
+* Each scale-derived float32 is written once per output lane (8 lanes) per
+  tile block, on registers ``0x0f50..0x0fc0`` (``0x0fd0..0x1040`` for Mul's
+  divisor); the block count depends on the shape, not the calibration:
 
   * all four ops: ``1/s_x``, ``1/s_z`` and ``s_y``;
   * Mul additionally ``s_y/(s_x*s_z)``;
@@ -23,7 +24,10 @@ fixed zero points then touches only whole records (measured on held-out builds,
   ``r * 2**-k < 1`` (so a ratio just below 1 stores 32768; one word when both
   round equal). Register ``0x1ea0`` in
   the TENG segment holds ``15 - k``. PR #1756's ``round(r * 32768)`` is the
-  ``k = 0`` case, valid while both ratios are below 1.
+  ``k = 0`` case, valid while both ratios are below 1. Registers
+  ``0x1ef0..0x1f20`` hold the int32 zero-point offset (``zp_offset``).
+* A re-encoded stream that pads to a different size is relaid out
+  (``relayout_segment``), as Pulsar2 itself does.
 
 What is **not** calibration: the compiled node's input order (``x, z`` or
 ``z, x``) is Pulsar2's own per-build choice. It moves the small slot numbers at

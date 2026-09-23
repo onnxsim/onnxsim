@@ -127,6 +127,10 @@ and it refuses zero-point changes.
 
 ## Binary ops: refused
 
+(Superseded: `binary_op_scale_emit.py` now retargets same-shape Add/Sub/Mul/Div
+on the decompressed records; see `docs/axera-binary-op-scale-emit.md`. This
+section records why in-place patching could not.)
+
 Controlled builds of Add, Sub, Mul and Div were made at `[64,64,3,3]`, a real
 step shape: a template and three held-out calibrations each, all zero points 0.
 The `x`/`z` ranges had different ratios (e.g. `[0,1.3]/[0,0.7]` vs

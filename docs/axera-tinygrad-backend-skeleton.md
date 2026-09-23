@@ -30,7 +30,7 @@ no device runs, no model exports. Module:
 | `TemplateCache.get_or_build` | `lookup` resolves to committed fixtures; a miss raises `NotImplementedError` (a miss needs a Pulsar2 build, out of scope) | fixture registries of the modules below |
 | `Edit.validate` / `apply` | `TemplateOnly` | Transpose, `transpose_real_shapes.py` (#1758) |
 | | `GatherIndexEdit` | last-axis Gather, `memory_emit.py` (19/19 step shapes incl. the chunked stem) |
-| | `ElementwiseScaleEdit` | Relu/Sqrt scale retarget, `elementwise_scale_emit.py` (#1840) |
+| | `ElementwiseScaleEdit` | Relu/Sqrt scale retarget, `elementwise_scale_emit.py` (#1840); same-shape Add/Sub/Mul/Div, `binary_op_scale_emit.py` (`docs/axera-binary-op-scale-emit.md`) |
 | | `ConvWeightEdit` | frozen-weight refresh, `conv_weight_learn.py` (#1769) and `conv_bias_requant.py` (#1771) |
 | `EditSet` | validates every edit against the resolved template before applying any | -- |
 | tile-table cross-check | `predicted_npu_params` | `dma_tile_predict.py`, `add_tile_predict.py`, `elementwise_two_input_tile_predict.py` |
@@ -56,8 +56,8 @@ nodes):
 | Status | Nodes | Which |
 | --- | --- | --- |
 | covered | 82 | Gather 41 (`GatherIndexEdit`), Transpose 41 (`TemplateOnly`) |
-| conditional | 74 | Relu 17 and Sqrt 39 (`ElementwiseScaleEdit`, only if the node's zero points are one of the template classes `x0,y0` / `x128,y128`); 18 bias-flatten Reshapes (fuse into a neighbour; `reshape_emit.py` covers Relu-neighbour pairs only) |
-| refused | 948 | Mul 397, Reshape 152, Add 144, Div 52, Sub 46, ReduceSum 44, MatMul 41, Conv 20, Cast 19, Greater 18, Sqrt 3, 12 others |
+| conditional | 324 | Relu 17 and Sqrt 39 (`ElementwiseScaleEdit`, only if the node's zero points are one of the template classes `x0,y0` / `x128,y128`); same-shape Add 101, Mul 63, Div 44, Sub 42 (`ElementwiseScaleEdit`, classes `x0,y0,z0` / `x128,y128,z128`, Div `x128,y128,z0`); 18 bias-flatten Reshapes (fuse into a neighbour; `reshape_emit.py` covers Relu-neighbour pairs only) |
+| refused | 698 | Mul 334, Reshape 152, ReduceSum 44, Add 43, MatMul 41, Conv 20, Cast 19, Greater 18, Div 8, Sub 4, Sqrt 3, 12 others |
 
 Refusal reasons are reported per node. The notable ones:
 
@@ -65,9 +65,12 @@ Refusal reasons are reported per node. The notable ones:
   downsample) match a template shape but are refused:
   their weights are graph inputs, i.e. training state, so a frozen-weight edit
   is not the training path. The other 15 have no validated template.
-- **Add/Sub/Mul/Div (639).** Their scale registers are decoded (#1837), but a
-  scale-ratio change rewrites compressed short units, so `elementwise_scale_emit`
-  refuses them (#1840). The short-unit encoding is the blocker.
+- **Add/Sub/Mul/Div (389 of 639 still refused).** 254 have a constant operand
+  and 132 a broadcast operand, which compile to different programs with no
+  templates yet; 3 sit at shapes not built (`[1,1]`, `[1024,9,3136]`,
+  `[16,64,112,112]`). The 250 same-shape nodes are served by
+  `binary_op_scale_emit.py`, which re-encodes the decompressed short units
+  (#1850); see `docs/axera-binary-op-scale-emit.md`.
 - **Sqrt (3).** `[512,512,3,3]` failed its held-out check in #1840.
 
 This is standalone coverage. Composition rewrites MCode (#1732, #1763, #1783,

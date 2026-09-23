@@ -21,6 +21,8 @@ _AXERA_DIR = os.path.join(
 if _AXERA_DIR not in sys.path:
     sys.path.insert(0, _AXERA_DIR)
 
+import binary_op_scale_emit as bse  # noqa: E402
+import binary_op_scale_validate as bsv  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
 import tinygrad_ax_backend as axb  # noqa: E402
 
@@ -135,6 +137,33 @@ def test_elementwise_scale_edit_reproduces_held_out_native_build(oracle):
     assert _init(model, "npu_params") == _init(native, "npu_params")
 
 
+_BINARY_ORACLES = os.path.join(bse.TEMPLATE_DIR, "oracles")
+with open(os.path.join(_BINARY_ORACLES, "index.json")) as _f:
+    _BINARY_ORACLE_INDEX = json.load(_f)
+
+
+@pytest.mark.parametrize(
+    "oracle",
+    [
+        n
+        for n in sorted(_BINARY_ORACLE_INDEX)
+        if _BINARY_ORACLE_INDEX[n]["shape"] in ([16, 64, 56, 56], [16, 128, 28, 28])
+    ],
+)
+def test_elementwise_scale_edit_reproduces_held_out_binary_build(oracle):
+    meta = _BINARY_ORACLE_INDEX[oracle]
+    zp = meta["zero_points"]
+    key = axb.TemplateKey(
+        meta["op"],
+        (tuple(meta["shape"]),),
+        calibration_class=",".join(f"{k}{v}" for k, v in sorted(zp.items())),
+    )
+    model = axb.EditSet([axb.ElementwiseScaleEdit(meta["scales"])]).build(key)
+    native = _load_gz(os.path.join(_BINARY_ORACLES, oracle))
+    r = bsv.compare(model, native)
+    assert r["params"] and r["segments"], r
+
+
 def test_relu_tile_prediction_matches_template():
     key = axb.TemplateKey("Relu", ((16, 128, 28, 28),), calibration_class="x0,y0")
     template = axb.TemplateCache().load(key)
@@ -235,7 +264,13 @@ def test_coverage_report_on_the_resnet18_step():
     assert report["per_op"]["Relu"] == {"conditional": 17}
     assert report["per_op"]["Sqrt"] == {"conditional": 39, "refused": 3}
     assert report["per_op"]["Conv"] == {"refused": 20}
-    assert report["totals"] == {"covered": 82, "conditional": 74, "refused": 948}
+    # same-shape binary ops: ElementwiseScaleEdit (binary_op_scale_emit.py);
+    # constant and broadcast operands stay refused
+    assert report["per_op"]["Add"] == {"conditional": 101, "refused": 43}
+    assert report["per_op"]["Sub"] == {"conditional": 42, "refused": 4}
+    assert report["per_op"]["Mul"] == {"conditional": 63, "refused": 334}
+    assert report["per_op"]["Div"] == {"conditional": 44, "refused": 8}
+    assert report["totals"] == {"covered": 82, "conditional": 324, "refused": 698}
 
 
 def test_trainable_conv_is_refused_even_with_a_template():

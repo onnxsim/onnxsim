@@ -12,7 +12,8 @@ names, and exposes tinygrad-facing classes built on the user's tinygrad fork
   structure, each by delegating to an existing emitter:
   ``GatherIndexEdit`` (``memory_emit.py``), ``TemplateOnly`` (Transpose,
   ``transpose_real_shapes.py``), ``ElementwiseScaleEdit`` (Relu/Sqrt,
-  ``elementwise_scale_emit.py``), ``ConvWeightEdit`` (``conv_weight_learn.py``,
+  ``elementwise_scale_emit.py``; same-shape Add/Sub/Mul/Div,
+  ``binary_op_scale_emit.py``), ``ConvWeightEdit`` (``conv_weight_learn.py``,
   ``conv_bias_requant.py``). ``predicted_npu_params`` exposes the tile-table
   predictors (``dma_tile_predict.py``, ``add_tile_predict.py``,
   ``elementwise_two_input_tile_predict.py``) as a cross-check.
@@ -48,6 +49,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import binary_op_scale_emit as bse  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
 import memory_emit  # noqa: E402
 import transpose_real_shapes  # noqa: E402
@@ -187,6 +189,13 @@ class TemplateCache:
             return TemplateEntry(
                 "elementwise", os.path.join(ew.TEMPLATE_DIR, meta["file"]), meta
             )
+        if op in bse.OPS:
+            (shape,) = key.shapes
+            zps = _zero_points_from_class(key.calibration_class)
+            _, meta = bse.load_template(op, shape, zps)
+            return TemplateEntry(
+                "binary", os.path.join(bse.TEMPLATE_DIR, meta["file"]), meta
+            )
         if op == "Conv":
             (shape,) = key.shapes
             ck = (
@@ -291,17 +300,31 @@ class GatherIndexEdit:
 
 @dataclasses.dataclass
 class ElementwiseScaleEdit:
-    """New per-tensor scales for a Relu/Sqrt template at the template's zero
-    points (``elementwise_scale_emit.py``, #1840)."""
+    """New per-tensor scales at the template's zero points: Relu/Sqrt
+    (``elementwise_scale_emit.py``, #1840) or same-shape Add/Sub/Mul/Div
+    (``binary_op_scale_emit.py``)."""
 
     scales: Mapping[str, float]
 
     def validate(self, key, entry):
+        if entry.kind == "binary":
+            bse.op_values(key.op, self.scales)  # raises on missing/invalid scales
+            return
         if entry.kind != "elementwise":
-            raise ValueError("ElementwiseScaleEdit applies only to Relu/Sqrt")
+            raise ValueError(
+                "ElementwiseScaleEdit applies only to Relu/Sqrt/Add/Sub/Mul/Div"
+            )
         ew.op_floats(key.op, self.scales)  # raises on missing/invalid scales
 
     def apply(self, key, entry, model):
+        if entry.kind == "binary":
+            return bse.emit_model(
+                model,
+                key.op,
+                entry.meta["scales"],
+                dict(self.scales),
+                entry.meta["zero_points"],
+            )
         init = _mcode_initializer(model)
         init.raw_data = ew.retarget(
             bytes(init.raw_data), key.op, entry.meta["scales"], dict(self.scales)
@@ -423,6 +446,13 @@ def predicted_npu_params(
 # --------------------------------------------------------------------------
 
 _ELEMENTWISE_ZP_CLASSES = ("x0,y0", "x128,y128")
+# Div's denominators in the step are positive (sqrt(v) + eps), hence z0.
+_BINARY_ZP_CLASSES = {
+    "Add": ("x0,y0,z0", "x128,y128,z128"),
+    "Sub": ("x0,y0,z0", "x128,y128,z128"),
+    "Mul": ("x0,y0,z0", "x128,y128,z128"),
+    "Div": ("x0,y0,z0", "x128,y128,z0"),
+}
 
 
 def extract_step_ops(onnx_path: str) -> list[dict]:
@@ -439,6 +469,7 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     ):
         shapes[v.name] = [d.dim_value for d in v.type.tensor_type.shape.dim]
     inits = {i.name: i for i in model.graph.initializer}
+    consts = {n.output[0] for n in model.graph.node if n.op_type == "Constant"}
     graph_inputs = {v.name for v in model.graph.input}
     records = []
     for node in model.graph.node:
@@ -462,6 +493,14 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
             rec["attrs"]["weight_is_graph_input"] = node.input[1] in graph_inputs
         elif node.op_type == "Reshape":
             rec["attrs"]["out"] = shapes.get(node.output[0], [])
+        elif node.op_type in bse.OPS:
+            a, b = node.input[:2]
+            if {a, b} & (set(inits) | consts):
+                rec["attrs"]["form"] = "const"
+            elif shapes.get(a) != shapes.get(b):
+                rec["attrs"]["form"] = "broadcast"
+            else:
+                rec["attrs"]["form"] = "same_shape"
         records.append(rec)
     return records
 
@@ -508,6 +547,27 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
         if op in ew.OPS:
             hits = []
             for zp in _ELEMENTWISE_ZP_CLASSES:
+                try:
+                    cache.lookup(key_for_record(rec, zp))
+                    hits.append(zp)
+                except ValueError:
+                    pass
+            if not hits:
+                raise ValueError("no template at this shape")
+            return (
+                "conditional",
+                f"ElementwiseScaleEdit if zero points are one of {hits}",
+            )
+        if op in bse.OPS:
+            form = attrs.get("form")
+            if form != "same_shape":
+                return (
+                    "refused",
+                    f"{op} with a {form} operand compiles to a different program; "
+                    "templates exist for two live same-shape inputs only",
+                )
+            hits = []
+            for zp in _BINARY_ZP_CLASSES[op]:
                 try:
                     cache.lookup(key_for_record(rec, zp))
                     hits.append(zp)
