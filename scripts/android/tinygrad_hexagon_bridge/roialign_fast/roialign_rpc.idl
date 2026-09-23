@@ -1,0 +1,8 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface roialign_rpc : remote_handle64 {
+  AEEResult run(in sequence<float> feat, in sequence<float> rois, in int32 H, in int32 W, in int32 C,
+                in int32 OH, in int32 OW, in int32 sr, in float scale, in int32 nthreads,
+                rout sequence<float> result, rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};

@@ -1,0 +1,12 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface fpn_rpc : remote_handle64 {
+  AEEResult transpose(in sequence<float> chw, in int32 C, in int32 HW, in int32 nthreads, in int32 mode,
+                      rout sequence<float> hwc, rout uint64 dsp_us);
+  AEEResult conv_out(in int32 level, in int32 layout, in sequence<octet> apad, in sequence<octet> wp,
+                     in sequence<int32> bias, rout sequence<float> result, rout uint64 dsp_us);
+  AEEResult roialign(in sequence<float> feat, in sequence<float> rois, in int32 H, in int32 W, in int32 C,
+                     in int32 OH, in int32 OW, in int32 sr, in float scale, in int32 nthreads,
+                     rout sequence<float> result, rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};

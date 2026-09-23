@@ -1446,6 +1446,256 @@ sizes, blocking, working-set-sensitive reduction orders); `MOCKDSP=1` remains th
 (no real hexagon-clang/hexagon-sim round trip) when only correctness verification is needed, or
 when candidates differ only in raw compute-instruction mix with comparable working sets.
 
+## RoiAlign, Stage 1: yes, data-dependent addressing is expressible -- no, it isn't fast yet
+
+`dynamic_ops_survey.md` (PR #1813) ranked `RoiAlign` the second most tractable of the four
+dynamic-shape ops in Mask R-CNN's "rest" graph, but flagged a genuine open question first: can
+this project's tinygrad/`custom_kernel` machinery express **data-dependent source addressing** at
+all -- every RoI's bilinear-sample feature-map location depends on that RoI's own runtime box
+coordinates, unlike every kernel built so far (`hex_gemm_kernel.py` through
+`hex_boxhead_gemm_kernel.py`), which all read from a compile-time-known, purely shape-derived
+address pattern.
+
+**Answer: yes**, and it needed no new UOp/`Ops` capability -- `Tensor.gather(dim, index)`
+(`tinygrad/mixin/op.py`) already exists as a first-class, backend-agnostic Tensor op. `hex_roialign_kernel.py`'s
+`roi_align_tensor()` rebuilds `scripts/android/maskrcnn_e2e/tinygrad_ops.py`'s exact NumPy
+`roi_align()` reference (avg pooling, `sampling_ratio=2`, matching this model's real RoiAlign node
+attributes) as `Tensor` composition, using `.gather()` for the four data-dependent bilinear-tap
+reads. Verified correct two ways against that same NumPy reference:
+
+| Path | max abs err |
+|---|---:|
+| Default device | 5.90e-06 |
+| `DEV=DSP MOCKDSP=1` (real `--target=hexagon` compile, `qemu-hexagon-static` execution) | 1.53e-05 |
+
+The second row is the one that mattered for this task -- it confirms the actual Hexagon-targeted
+compile+execute path handles this, not just tinygrad's generic default device. One real bug hit
+getting there, the same class `sigmoid` already established: the bilinear weight arrays are plain
+`np.arange`-derived arithmetic, which defaults to `float64` -- feeding that straight to `Tensor(...)`
+pulled in `__hexagon_muldf3`/`__hexagon_adddf3` (double-precision compiler-rt symbols, a different,
+larger set than the single-precision ones `sigmoid`'s `libgcc.a` fix covers), missing from the
+freestanding link. Fixed with an explicit `.astype(np.float32)` -- a bug in this file's own
+arithmetic, not a Hexagon/tinygrad limitation.
+
+**What this does not establish: speed.** `Tensor.gather()`'s real implementation
+(`index.unsqueeze(-1)._one_hot_along_dim(self.shape[dim]).where(x, 0)).sum(-1)`, read directly from
+`tinygrad/mixin/op.py`) is a **dense one-hot-mask-and-reduce over the whole gathered dimension**,
+not a genuine indirect/sparse load -- O(H*W) work per gathered pixel, not O(1). At real box-head
+scale (a ~200x272 feature map, 4 taps x 49 positions per ROI, up to 1000 ROIs) this would be
+enormously wasteful. A fast kernel needs real HVX indexed-load hardware -- confirmed present and
+compiler-accessible on this exact toolchain, not assumed: `__builtin_HEXAGON_V6_vgathermh_128B`
+(HVX vector gather) and `__builtin_HEXAGON_V6_vlutvvb_128B` (HVX vector lookup-table) both compile
+cleanly against `hexagon-clang -mcpu=hexagonv73 -mhvx=v73`. The concrete next step: a hand-written
+`custom_kernel` around one of those, with each RoI's sample addresses + bilinear weights computed
+host-side (cheap scalar arithmetic, per the survey's own hybrid-split design) and fed to the
+HVX-native instruction inside the kernel, padded to a compile-time-max ROI count the same way
+`hex_gemm_kernel.py`'s tiny-`cout` coverage and `hex_stem7x7_kernel.py`'s `cin=3` padding already
+established for a fixed-upper-bound trick.
+
+**Not done**: real hardware (this stayed at `MOCKDSP=1`/qemu correctness, matching the survey's own
+explicit permission for a correctness-only Stage-1 result); batching over more than one ROI
+(single-ROI correctness was this pass's whole scope); the HVX-native `vgather`/`vlutvvb` kernel
+itself.
+
+## RoiAlign, Stage 2: a real, fast kernel on the phone -- no gather instruction needed
+
+**Correction to Stage 1 first.** Stage 1's "dense one-hot-mask-and-reduce, O(H*W) per gathered
+pixel" description is what `Tensor.gather()` *builds*, not what tinygrad *emits*. Rendering Stage 1's
+kernel at a real shape (`DEBUG=4 DEV=DSP MOCKDSP=1`, P5 level, 25x34x256, one RoI) shows tinygrad's
+own rewrite rules fold the `one_hot(...).where(x, 0).sum()` pattern into a **direct indexed load**
+(`val = cond ? *(data2 + idx) : 0.0f`, the index read from a loaded tensor) -- no loop over H*W at
+all. So Stage 1 already did genuine indirect loads; what it lacked was vectorization (NCHW makes every
+tap a stride-850 scalar read per channel, and it was rendered for `-mhvx=v65`, which has no HVX fp32).
+
+**Design: the data dependence is per *pixel*, not per *lane*.** In a channels-last (H, W, C) feature
+map, each bilinear tap is C=256 contiguous floats -- 8 whole, aligned 128-byte HVX vectors. So the
+scalar core computes each sample's two rows/cols and four weights (cheap, runtime box coords), and the
+HVX unit does plain aligned `vmem` loads plus a 4-tap multiply-accumulate across channels. No per-lane
+gather is needed at all. `vgathermh`/`vgathermw` (checked in the SDK's `hvx_hexagon_protos.h`: per-lane
+16/32-bit offsets into a **VTCM** source region, result lands in VTCM) would be the wrong tool twice
+over: nothing here needs per-lane addresses, and the P2 feature map (55.7 MB) is an order of magnitude
+bigger than VTCM (single-digit MB). This is the same packed-channels insight that unblocked `maxpool`.
+The kernel is hand-written C (`roialign_fast/roialign_kernel.h`, header-only so host, qemu and the
+DSP skel compile identical code) rather than a tinygrad `custom_kernel`: its body is almost entirely
+data-dependent scalar control flow (float->int, clamps, bounds skips) around a trivial vector FMA,
+which in `custom_kernel` form would be one big `Ops.CUSTOM` string anyway.
+
+Exact ONNX semantics (opset-12 `RoiAlign`, no `coordinate_transformation_mode` attribute, i.e. no
+half-pixel offset; `avg`; `sampling_ratio=2`; clamp/skip rules) taken from the real model's 8 RoiAlign
+nodes, with **real inputs**: one COCO image (val2017 `000000000139`) through the full
+`MaskRCNN-12-qdq` in ONNX Runtime, capturing every RoiAlign node's real feature map, real RoIs and real
+output (`roialign_fast/dump_real_roialign_io.py`). Real call shapes: box head 43/111/218/628 RoIs at
+7x7 on P5/P4/P3/P2 (1000 total), mask head 1/3/22/74 at 14x14 (100 total), all fp32, C=256.
+
+**Verification, three levels, all 8 real calls:**
+
+| Level | Result |
+|---|---|
+| Host C (x86, same header) vs ORT's real outputs | bit-exact (max abs err 0) |
+| `qemu-hexagon-static`, Hexagon ISA, scalar fp32 (`-mhvx=v65`) | max abs err <= 9e-6 |
+| **Real hardware** (device `239dbd8f`, CDSP, HVX qf32, via a dedicated TVM-free FastRPC skel) | **max abs err <= 6.5e-5** (qf32 rounding), PASS at every call and thread count |
+
+qemu 8.2's Hexagon decoder can't execute the qfloat HVX instructions the vectorized build uses
+(`decode_packet: assertion failed`), hence the scalar build there; the real phone is the check for the
+vector build. The 55.7 MB P2 map didn't hit this project's ~32 MB transfer ceiling: the client
+allocates every buffer with `rpcmem_alloc` (ION-backed, mapped into the DSP rather than copied).
+
+**Speed, real hardware, all 8 real calls summed** (DSP-side time from `HAP_perf_get_time_us`, median
+of 5; FastRPC round trip adds ~0.3-0.5 ms per call):
+
+| | 1 thread | 4 threads |
+|---|---:|---:|
+| This kernel, plain | 137.1 ms | 44.7 ms |
+| This kernel, + `l2fetch` of the next bin's tap rows | **85.4 ms** | **27.1 ms** |
+| ONNX Runtime CPU **on the phone** (stock `onnxruntime-android` 1.26 arm64, C API) | 267.4 ms | 63.3 ms (default, all cores) |
+| ONNX Runtime CPU on the 32-thread desktop host (Ryzen AI Max+ 395), for scale | 86.2 ms | 11.5 ms (default) |
+
+So on the phone: **3.1x faster than one CPU thread, 2.3x faster than ORT using every CPU core**, which
+is how `rest.onnx` runs today. Split by head: box head 19.8 ms vs ORT 46.7 ms; mask head 7.3 ms vs
+16.6 ms. The kernel is memory-latency bound, not compute bound: the plain version spends ~500 cycles
+per sample against ~50 cycles of HVX work, a `HAP_power_set` TURBO/DCVS-off vote changed nothing
+(the DSP was already at full clock), and a one-bin-ahead 1-D `l2fetch` of the two 2-pixel row
+segments each sample reads cut time 1.6x -- except on the smallest (P5) level, whose 0.87 MB map is
+already cache-resident (flat to ~5% slower there). Threads split RoIs across QuRT threads, each holding
+the HVX unit (`qurt_hvx_lock`); 4 threads give 2.9-3.2x.
+
+For the record against Stage 1 on the only path Stage 1 ever ran (qemu, scalar, same single P5 RoI):
+1.00 M vs 1.49 M executed instructions -- 1.5x from the channels-last layout alone. The real speedup
+comes from HVX fp32 vectors, threads and prefetch, none of which Stage 1's `-mhvx=v65` rendering had;
+Stage 1 was never run on hardware.
+
+**Caveats, stated plainly:**
+- **Layout: now priced, see Stage 3 below.** The kernel reads channels-last features and writes
+  channels-last (R, OH, OW, C) output; ORT reads/writes NCHW. The output side is free in practice (the
+  fc6 box-head MatMul consumes the flattened crop, so its weight rows can be permuted offline). The
+  input side was unpriced here: converting the backbone's NCHW FPN maps costs 13.3 ms on the DSP, and
+  having the FPN output convs write channels-last directly costs ~2.3 ms instead -- measured, verified
+  and compared against a same-session ORT baseline in "RoiAlign, Stage 3".
+- One image's RoIs, fp32 only (the real model's RoiAlign inputs are dequantized fp32).
+- Not integrated into any pipeline; each call is a standalone FastRPC round trip.
+
+`roialign_fast/` reproduces everything: `dump_real_roialign_io.py` (real inputs/outputs from ORT),
+`gen_roialign_test_data.py` (channels-last binaries), `roialign_host_check.c`, `roialign_qemu.c`,
+`build.sh` (qaic + hexagon-clang/link + NDK client + adb run; `TURBO=1` adds the clock vote),
+`make_roialign_single_node_models.py` + `ort_roialign_bench.c` (the host and phone ORT baselines).
+
+## RoiAlign, Stage 3: pricing the channels-last layout, then removing its cost
+
+Stage 2's 2.3x assumed the FPN feature maps were already channels-last. This stage measures what
+getting them there actually costs, two ways, on the phone with real data.
+
+**Where the RoiAlign inputs come from.** Traced in the real `backbone.onnx`: each of the four
+RoiAlign feature maps (`391`/`423`/`455`/`487` = P5/P4/P3/P2, `spatial_scale` 1/32..1/4) is a
+**backbone graph output** that crosses the backbone/rest split as fp32 NCHW. Each is produced by
+`Conv` (the FPN 3x3 "output" conv, 256->256, pad 1) -> `QuantizeLinear` (uint8, per-tensor scale,
+zero point 128-133) -> `DequantizeLinear` (fp32). Weights are int8 symmetric (zero point 0), the bias
+is int32 at scale `s_in * s_w`, and the conv inputs are uint8 with zero points 125-127. ONNX Runtime
+fuses that QDQ pattern into `QLinearConv`, so its outputs come from exact integer accumulation plus a
+float requantize. `fpn_channels_last/capture_fpn_out.py` shows that an integer-only reimplementation
+reproduces ORT **bit for bit at all four levels**:
+- exact int32 accumulation, with the input zero point folded into the bias and the border padded
+  with that zero point;
+- `q = clamp(round_half_even(float(acc) * (s_in*s_w/s_out)) + zp)`;
+- `(q - zp) * s_out`.
+
+That is 0 uint8 mismatches out of 18.5 M values, and bit-identical fp32. It is also bit-identical to
+the maps Stage 2's RoiAlign data was captured from.
+
+**Two ways to get channels-last, both measured on the phone** (device `239dbd8f`, DSP-side time, six
+full runs, three with DCVS and three with a core+bus TURBO vote, which changed nothing measurable):
+
+1. **Keep the backbone as is and transpose its NCHW outputs.** `fpn_channels_last/layout_kernels.h`
+   transposes 32x32 fp32 blocks in HVX registers with five rounds of the perfect-shuffle trick:
+   `vshuff(.., -4)` word-zips rows i and i+16, and five rotations of the (row, col) index make a
+   transpose. It checks bit-exact against a scalar transpose under qemu at every level shape,
+   including the non-multiple-of-32 tails. All four maps (P2-P5, ~74 MB fp32):
+
+   | Transpose variant | ms (mean of 6, min-max) |
+   |---|---:|
+   | scalar, 1 thread | 224.0 (222.0-225.5) |
+   | HVX, 1 thread | 37.0 (36.8-37.2) |
+   | HVX, 4 threads (split by pixel range) | **13.3** (13.1-13.6) |
+   | HVX + next-block `l2fetch`, 4 threads | 13.3 (12.6-13.6) |
+   | HVX, channel-group-outer loop, 1 / 4 threads | 33.6 / 13.9 |
+
+   It is memory-bound: 4 threads help (2.8x), while prefetch and the other loop order don't. One
+   earlier cold first run measured P2 alone at ~28-30 ms, so the first call after the DSP has been
+   idle can pay ~2x.
+
+2. **Have the producer write channels-last.** `hex_conv3x3_fpnout_kernel.py` is
+   `hex_conv3x3_kernel.py`'s vrmpybusv conv, generated through tinygrad `custom_kernel` with the same
+   `ow_tile` reuse. It adds the requantize+dequantize epilogue above into its store, and a `layout`
+   switch:
+   - channels-last: each accumulator vector is 32 channels of one pixel, stored contiguously;
+   - NCHW: the same 32 lanes land H*W floats apart.
+
+   The epilogue runs as scalar IEEE fp32, with vectorization explicitly disabled. HVX fp32 on this
+   phone is qf32, which is not IEEE-rounded, and one ulp would lose bit-exactness. Run on the phone
+   with the real FPN conv inputs, weights and biases, all four levels, every run:
+   - The **NCHW output is bit-identical to ORT's real backbone output.**
+   - The channels-last output is bit-identical to every transpose variant's output.
+   - The qemu-hexagon run agreed at all four levels too.
+
+   The store layout is the only difference between the two variants:
+
+   | FPN output conv (fused epilogue, 1 thread) | channels-last store | NCHW store | delta |
+   |---|---:|---:|---:|
+   | P5 25x34 | 14.7 ms | 14.4 ms | +0.3 ms |
+   | P4 50x68 | 46.6 ms | 45.8 ms | +0.8 ms |
+   | P3 100x136 | 217.8 ms | 214.9 ms | +2.9 ms |
+   | P2 200x272 | 871.5 ms | 873.2 ms | -1.8 ms |
+   | **total** | 1150.7 ms | 1148.4 ms | **+2.3 ms** |
+
+   The conv's absolute time isn't part of this comparison. It is backbone work either way, runs
+   single-threaded here with a scalar epilogue, and isn't competing with TVM's multi-threaded
+   backbone in this table. The delta is what the layout costs.
+
+**End to end, RoiAlign side, all 8 real calls.** RoiAlign runs on the NHWC maps the fused conv
+produced (4 threads with prefetch): 27.8 ms (27.7-27.9), max abs err vs ORT's real outputs 6.5e-5, the
+same as Stage 2. ORT's CPU RoiAlign on the phone, which reads NCHW directly, was re-measured this
+session with Stage 2's own `ort_roialign_bench` at **57.3-59.5 ms** (mean 58.3; Stage 2 recorded
+63.3):
+
+| Path to RoiAlign output | ms | vs ORT (58.3 / 63.3) |
+|---|---:|---:|
+| ORT CPU RoiAlign on the phone (all cores, NCHW) | 58.3 | 1.00x |
+| Stage 2 kernel, maps assumed channels-last (layout unpriced) | 27.8 | 2.10x / 2.28x |
+| + separate HVX transpose of today's NCHW maps | 27.8 + 13.3 = **41.1** | **1.42x / 1.54x** |
+| FPN output convs write channels-last (fused) | 27.8 + 2.3 = **30.1** | **1.94x / 2.10x** |
+
+So the answer to "is the 2.3x real today" is **mostly no, and fixably yes.** With the existing NCHW
+backbone the transpose costs 13.3 ms, about 44% of the ~30 ms the kernel saves, leaving ~1.4-1.5x.
+With the producer writing channels-last, the win survives at ~1.9-2.1x, for a layout cost of about
+2 ms.
+
+One real bug on the way. The first fused-epilogue kernel read accumulator lanes as scalars straight
+out of tinygrad's `REG` placeholder, which renders as a plain 4-byte-aligned `int bufN[32]` that the
+reduction also accesses through 128-byte vector casts. That crashed `qemu-hexagon-static` outright. A
+standalone repro isolated it: the reduction alone, and a static-buffer harness, both ran fine, while
+any scalar read of that buffer crashed. Copying the accumulator into an explicitly
+`aligned(128)` local first fixed it.
+
+**Not done**:
+- The fused conv isn't wired into a TVM-free full-backbone run. The chain in "Running the full
+  backbone graph, TVM-free" stops at stage1/block1, far upstream of the FPN, so the ~2 ms figure is
+  for the verified producer at real shapes and real data, not a measured full pipeline.
+- The epilogue is scalar, for exact IEEE results. A qf32 HVX epilogue would be faster but not
+  bit-exact.
+- RoiAlign reading uint8 maps directly (4x less traffic for a latency/bandwidth-bound kernel) wasn't
+  tried. It interacts with how out-of-range samples contribute, since dequantize is affine and
+  skipped samples add 0 in fp32, not the zero point.
+
+`fpn_channels_last/` reproduces everything:
+- `capture_fpn_out.py` (real conv inputs/params/outputs from `backbone.onnx` in ORT, plus the
+  bit-exact epilogue check);
+- `gen_fpn_test_data.py` (phone binaries);
+- `layout_kernels.h` + `layout_qemu.c` (transpose and its qemu check);
+- `fpn_rpc.idl` / `fpn_impl.c` / `fpn_client.c` / `build.sh` (TVM-free FastRPC skel + client:
+  transpose, fused conv, RoiAlign, clock vote).
+
+The conv kernels themselves come from `../hex_conv3x3_fpnout_kernel.py --data fpn_out_real.npz --out
+$DATA/fpn_out_kernels.c`, which also runs all four levels under qemu against ORT.
+
 ## NonMaxSuppression: exact on all 85 real calls, faster than ORT for the per-level ones
 
 `dynamic_ops_survey.md` ranked NMS the hardest dynamic op (greedy selection is sequential, and it
@@ -1638,6 +1888,29 @@ since this model never uses them.
   shape ops in Mask R-CNN's `rest.onnx` (proposal decode, TopK, NonMaxSuppression, RoiAlign) could
   be ported to hand-written HVX kernels, with real shapes/dtypes/constants pulled from the actual
   graph and a ranked, honest difficulty assessment per op.
+- `hex_roialign_kernel.py` -- Stage 1 of `RoiAlign` (the "beyond the backbone" survey's
+  second-ranked target): confirms data-dependent source addressing is expressible via tinygrad's
+  existing `Tensor.gather()` (no new UOp capability needed) and runs correctly through the real
+  `DEV=DSP MOCKDSP=1` compile+qemu path, not just the default device. Correctness only -- the
+  generic `.gather()` lowers to a dense one-hot-mask-and-reduce, not real HVX indexed addressing;
+  see "RoiAlign, Stage 1" above for the concrete `vgathermh`/`vlutvvb`-based next step.
+  (Corrected in Stage 2: tinygrad already folds that pattern into a direct indexed load.)
+- `roialign_fast/` -- RoiAlign Stage 2: a hand-written channels-last HVX kernel
+  (`roialign_kernel.h`, plain + `l2fetch`-prefetching variants), its dedicated TVM-free FastRPC skel
+  (`roialign_rpc.idl`, `roialign_impl.c`, `roialign_client.c`, `build.sh`), real-input capture
+  (`dump_real_roialign_io.py`, `gen_roialign_test_data.py`), host/qemu checks
+  (`roialign_host_check.c`, `roialign_qemu.c`) and the ORT baselines
+  (`make_roialign_single_node_models.py`, `ort_roialign_bench.c`). Correct on the phone at all 8
+  real calls; 27.1 ms vs ORT's 63.3 ms on the phone's CPU. See "RoiAlign, Stage 2" above.
+- `hex_conv3x3_fpnout_kernel.py` -- the FPN 3x3 output conv (vrmpybusv, `ow_tile`) with ORT's
+  requantize+dequantize epilogue fused into its store, writing fp32 channels-last or NCHW. Bit-exact
+  vs ORT's real backbone outputs at all four levels, under qemu and on the phone; the channels-last
+  store costs ~2.3 ms more than NCHW across P2-P5. See "RoiAlign, Stage 3" above.
+- `fpn_channels_last/` -- RoiAlign Stage 3: real FPN-conv capture (`capture_fpn_out.py`), an HVX
+  NCHW->NHWC transpose (`layout_kernels.h`, qemu-checked by `layout_qemu.c`), and a TVM-free FastRPC
+  skel/client (`fpn_rpc.idl`, `fpn_impl.c`, `fpn_client.c`, `build.sh`) that prices the layout on the
+  phone: separate transpose 13.3 ms (RoiAlign side 1.42x vs ORT) vs. channels-last producer +2.3 ms
+  (1.94x). See "RoiAlign, Stage 3" above.
 - `nms/` -- NonMaxSuppression for all 85 real `rest.onnx` calls, exact against ONNX Runtime:
   `nms_kernel.h` (scalar and qfloat-HVX greedy kernels), its own FastRPC skel/client
   (`nms_rpc.idl`, `nms_impl.c`, `nms_client.c`, `build.sh`), host and qemu checks, real-input capture
