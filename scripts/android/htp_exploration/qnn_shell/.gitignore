@@ -1,0 +1,6 @@
+dl/
+libs/
+headers/
+qnn_run
+out_*.bin
+*.onnx

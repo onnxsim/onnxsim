@@ -119,6 +119,26 @@ against either the tiny probe model or the real backbone.
    real-backbone TVM/HVX baseline -- the comparison this whole exploration exists
    to make.
 
+## Result: the whole backbone runs on the HTP, 58 ms (`qnn_shell_findings.md`)
+
+Items 2 and 3 above are done. PR #1810's `libQnnHtp.so` "not found" wall was the *vendor's*
+copy being hidden from apps; bundling Qualcomm's own QNN runtime (`com.qualcomm.qti:qnn-runtime`
+2.50.0 from Maven Central, matching the QNN 2.50 the ORT QNN EP plugin 2.6.0 was built against)
+and driving it from a plain `adb shell` native harness (`qnn_shell/`) needs no root and no
+system-app status. All 578 backbone nodes run on the HTP (strict mode, no CPU fallback), in an
+unsigned PD with our own `libQnnHtpV69Skel.so`:
+
+| Backbone on the phone | steady state |
+|---|---:|
+| QNN HTP, burst | **53 ms** (~3.0 TMAC/s) |
+| QNN HTP, default | 57 ms |
+| ORT CPU, 4 threads | 635 ms |
+| TVM int8 on HVX | 3.7 s (43 GMAC/s) |
+
+Accuracy is in the same band as the TVM int8 pipeline (FPN max abs err 1.03 vs host ORT); on
+`cats.jpg` all 3 detections match the all-ORT pipeline (box IoU 0.986, mask IoU 0.982). Graph
+compile costs ~6 s per process; an EP-context model cuts session creation to ~440 ms.
+
 ## Files
 
 - `make_tiny_qdq_conv.py` -- builds the minimal QDQ int8 conv model used to
@@ -127,3 +147,8 @@ against either the tiny probe model or the real backbone.
   given model to HTP on this host (device enumeration, both the legacy
   `providers=[...]` API and the newer `SessionOptions.add_provider` API), and
   reports exactly where it fails.
+- `qnn_shell/` -- adb-shell native ORT + QNN EP harness: `fetch_libs.sh` (Maven downloads,
+  not committed), `run.sh` (build, push, run), `qnn_run.cpp`, `compare.py` (tensor-level vs host
+  ORT), `detect_compare.py` (detection-level through `rest.onnx`),
+  `make_tiny_qdq_conv_f32io.py` (smoke-test model). See `qnn_shell_findings.md`.
+- `qnn_shell_findings.md` -- the working HTP path and its measurements.
