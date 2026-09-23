@@ -1,0 +1,721 @@
+{
+  "380": {
+    "offset": 380,
+    "record_at": 380,
+    "kind": "raw",
+    "role": "first_byte",
+    "register": null,
+    "original": 10,
+    "classification": "FUNCTIONAL",
+    "max_abs_diff": 0.7976462841033936,
+    "health_ok": true
+  },
+  "381": {
+    "offset": 381,
+    "record_at": 381,
+    "kind": "raw",
+    "role": "first_byte",
+    "register": null,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "AXI0 Read Response Error",
+      "cause_class": "address",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "382": {
+    "offset": 382,
+    "record_at": 382,
+    "kind": "raw",
+    "role": "first_byte",
+    "register": null,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "AXI0 Read Response Error",
+      "cause_class": "address",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "383": {
+    "offset": 383,
+    "record_at": 383,
+    "kind": "raw",
+    "role": "first_byte",
+    "register": null,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "AXI0 Read Response Error",
+      "cause_class": "address",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 ff 00 00 00 ff 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "384": {
+    "offset": 384,
+    "record_at": 384,
+    "kind": "raw",
+    "role": "first_byte",
+    "register": null,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "AXI0 Read Response Error",
+      "cause_class": "address",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 ff ff ff 00 ff ff"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "385": {
+    "offset": 385,
+    "record_at": 385,
+    "kind": "V",
+    "role": "verb",
+    "register": 640,
+    "original": 161,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "Retrigger error",
+      "cause_class": "trigger_or_cmd",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 40,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 322,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 60,
+          "cmd": "00 00 00 00 00 00 00 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "386": {
+    "offset": 386,
+    "record_at": 385,
+    "kind": "V",
+    "role": "unit",
+    "register": 640,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "387": {
+    "offset": 387,
+    "record_at": 385,
+    "kind": "V",
+    "role": "reg_lo",
+    "register": 640,
+    "original": 128,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "388": {
+    "offset": 388,
+    "record_at": 385,
+    "kind": "V",
+    "role": "reg_hi",
+    "register": 640,
+    "original": 2,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "389": {
+    "offset": 389,
+    "record_at": 385,
+    "kind": "V",
+    "role": "value_byte0",
+    "register": 640,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "390": {
+    "offset": 390,
+    "record_at": 385,
+    "kind": "V",
+    "role": "value_byte1",
+    "register": 640,
+    "original": 1,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 95,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "391": {
+    "offset": 391,
+    "record_at": 385,
+    "kind": "V",
+    "role": "value_byte2",
+    "register": 640,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "Retrigger error",
+      "cause_class": "trigger_or_cmd",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 159,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "392": {
+    "offset": 392,
+    "record_at": 385,
+    "kind": "V",
+    "role": "value_byte3",
+    "register": 640,
+    "original": 0,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "393": {
+    "offset": 393,
+    "record_at": 393,
+    "kind": "V",
+    "role": "verb",
+    "register": 944,
+    "original": 161,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 170,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "394": {
+    "offset": 394,
+    "record_at": 393,
+    "kind": "V",
+    "role": "unit",
+    "register": 944,
+    "original": 0,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "395": {
+    "offset": 395,
+    "record_at": 393,
+    "kind": "V",
+    "role": "reg_lo",
+    "register": 944,
+    "original": 176,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "396": {
+    "offset": 396,
+    "record_at": 393,
+    "kind": "V",
+    "role": "reg_hi",
+    "register": 944,
+    "original": 3,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "397": {
+    "offset": 397,
+    "record_at": 393,
+    "kind": "V",
+    "role": "value_byte0",
+    "register": 944,
+    "original": 128,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "398": {
+    "offset": 398,
+    "record_at": 393,
+    "kind": "V",
+    "role": "value_byte1",
+    "register": 944,
+    "original": 252,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "399": {
+    "offset": 399,
+    "record_at": 393,
+    "kind": "V",
+    "role": "value_byte2",
+    "register": 944,
+    "original": 1,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "400": {
+    "offset": 400,
+    "record_at": 393,
+    "kind": "V",
+    "role": "value_byte3",
+    "register": 944,
+    "original": 16,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "401": {
+    "offset": 401,
+    "record_at": 401,
+    "kind": "V",
+    "role": "verb",
+    "register": 960,
+    "original": 161,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "402": {
+    "offset": 402,
+    "record_at": 401,
+    "kind": "V",
+    "role": "unit",
+    "register": 960,
+    "original": 0,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "403": {
+    "offset": 403,
+    "record_at": 401,
+    "kind": "V",
+    "role": "reg_lo",
+    "register": 960,
+    "original": 192,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "404": {
+    "offset": 404,
+    "record_at": 401,
+    "kind": "V",
+    "role": "reg_hi",
+    "register": 960,
+    "original": 3,
+    "classification": "INERT",
+    "health_ok": true
+  },
+  "405": {
+    "offset": 405,
+    "record_at": 401,
+    "kind": "V",
+    "role": "value_byte0",
+    "register": 960,
+    "original": 3,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": true,
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 40,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 285,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 60,
+          "cmd": "00 00 00 00 00 00 00 00"
+        }
+      ]
+    },
+    "health_ok": true
+  },
+  "406": {
+    "offset": 406,
+    "record_at": 401,
+    "kind": "V",
+    "role": "value_byte1",
+    "register": 960,
+    "original": 0,
+    "classification": "FAULT",
+    "fault_log": {
+      "timeout": false,
+      "engine": "TENG",
+      "eu": 9,
+      "cause": "AXI Write Response Error",
+      "cause_class": "address",
+      "active_eus": [
+        {
+          "eu": 0,
+          "q_head": 4,
+          "cmd": "00 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 1,
+          "q_head": 4,
+          "cmd": "a2 00 00 00 23 00 20 00"
+        },
+        {
+          "eu": 6,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        },
+        {
+          "eu": 9,
+          "q_head": 159,
+          "cmd": "a3 00 00 00 00 00 00 00"
+        },
+        {
+          "eu": 13,
+          "q_head": 2,
+          "cmd": "a2 00 00 00 13 00 20 00"
+        }
+      ]
+    },
+    "health_ok": false
+  }
+}
