@@ -9,7 +9,8 @@
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 #   MCC=<mcc.py work dir, e.g. ~/.cache/onnxsim-mcc/work> MOGE=<depth.py static dir, e.g. ~/.cache/onnxsim-mcc/moge>
-#       ./deploy.sh                 the MCC 3D mode (also needs the SAM mode's models: SAM=...)
+#   MCC_HMX=<../mcc_hmx/ref.py weights dir> ./deploy.sh   the MCC 3D mode (also needs the SAM mode's models: SAM=...);
+#                                   MCC_HMX: the DSP decoder's weights (the default decoder, opts dec=hmx)
 #   SR=<superres.py models dir, e.g. ~/.cache/superres/models> ./deploy.sh   the super-resolution mode
 #   GAME=<game_seq.py --out dir, e.g. ~/.cache/arm-nss/game> ./deploy.sh   the game-upscaling mode (NSS + NFRU)
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
@@ -98,6 +99,14 @@ if [ -n "${MCC:-}" ]; then
   for hw in 640x480 480x640; do "${A[@]}" push -q "$MOGE/model.$hw.t1200.onnx" "$STAGE/mcc/moge_$hw.onnx"; done
   for b in mcc_enc.onnx mcc_dec_q1024.onnx moge_640x480.onnx moge_480x640.onnx; do
     RA "cmp -s $STAGE/mcc/$b files/models/$b || { cp $STAGE/mcc/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# MCC 3D mode's DSP decoder (../mcc_hmx, ref.py weights --out <dir>): blk0..7.bin, head.bin -> mcc_hmx_*.bin
+if [ -n "${MCC_HMX:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/mcc"
+  for b in blk0 blk1 blk2 blk3 blk4 blk5 blk6 blk7 head; do
+    "${A[@]}" push -q "$MCC_HMX/$b.bin" "$STAGE/mcc/mcc_hmx_$b.bin"
+    RA "cmp -s $STAGE/mcc/mcc_hmx_$b.bin files/models/mcc_hmx_$b.bin || cp $STAGE/mcc/mcc_hmx_$b.bin files/models/"
   done
 fi
 # RT-DETR mode: the pieces from ../vision_models/rtdetr/msda_hvx/split.py (export + quant --policy

@@ -216,12 +216,12 @@ Phone budget for one photo -> 3D: MoGe 257 ms + MCC encoder 202 ms + ~36 x 64 ms
 ## Follow-ups
 
 - **Demo-app mode: built** -- `../../maskrcnn_demo_app` "MCC 3D" (photo -> tap (SAM mask) -> MoGe-2 -> MCC
-  -> rotatable colored point cloud, 2.5 s for the quest2 headset after "Decoder optimization"; see its
-  README). `app_check.py`
+  -> rotatable colored point cloud, 2.5 s for the quest2 headset after "Decoder optimization", 1.3 s with
+  the hand-written DSP decoder `../../mcc_hmx`; see its README). `app_check.py`
   checks the app's C++ prep and its reconstruction against this directory's pipeline. Still open: a
   gravity-aligned frame from the phone's accelerometer.
 - uint8 decoder: 29 ms a chunk (vs 47 w8a16) but 5-15% of the points wrong (see "Decoder optimization");
   would need QAT or a per-block sensitivity search. Encoder quantization needs a working calibration.
 
-- The decoder is dense attention + MLP over many queries: a natural target for the HMX GEMM
-  work (`codex/android-hmx-gemm`), not used here.
+- The decoder on HMX + HVX by hand: `../../mcc_hmx` (22 ms a 1024-query chunk vs QNN's 47 w8a16, at
+  fp16-level accuracy).

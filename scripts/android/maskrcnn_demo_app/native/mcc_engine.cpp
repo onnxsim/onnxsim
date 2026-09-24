@@ -13,8 +13,12 @@
 //      invalid -> -100, shrink, 8x8 windows.
 //   4. MCC encoder (mcc_enc.onnx = ../vision_models/mcc enc.onnx): img, xyz_win, valid -> the decoder's
 //      seen K/V [8, 16, 197, 32] each, once per reconstruction.
-//   5. MCC decoder chunks (mcc_dec_q1024.onnx, the w8a16 dec_opt.py a16c build: 47 vs 63 ms a chunk
-//      fp16): 1024 query points each against that K/V -> occupancy logit + color. Queries coarse-to-fine exactly as mcc.py recon: every point of the coarsest grid,
+//   5. MCC decoder chunks: 1024 query points each against that K/V -> occupancy logit + color. Default
+//      (opts dec=hmx): the hand-written DSP decoder of ../../mcc_hmx (HMX GEMMs + 4 HVX threads, a
+//      FastRPC skel, libmcc_hmx_rpc.so; weights mcc_hmx_blk0..7.bin + mcc_hmx_head.bin loaded once, the
+//      image's K/V packed here and sent once), ~22 ms a chunk, and the last chunk of a level only as
+//      long as it needs (multiples of 32 queries). dec=qnn: mcc_dec_q1024.onnx on the HTP through QNN
+//      (the w8a16 dec_opt.py a16c build: 47 ms a chunk). Queries coarse-to-fine exactly as mcc.py recon: every point of the coarsest grid,
 //      then at each finer level the 27-neighborhood of every cell with p > lo (default 15^3 -> 30^3 ->
 //      60^3, granularity 0.1, lo 0.1: recall >= 0.9975 of the dense grid's occupied points on the three
 //      references in ../vision_models/mcc/dec_opt.py, 13-20% fewer queries than 0.05). The result is
@@ -28,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <map>
@@ -37,6 +42,9 @@
 
 #include "htp_session.h"
 #include "yuv_upright.h"
+#include "remote.h"
+#include "mcc_hmx_rpc.h"
+#include "mcc_decoder.h" /* mb_pack_kv: the K/V tile layout the skel expects */
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MccDemo", __VA_ARGS__)
 
@@ -50,6 +58,7 @@ constexpr float kInf = std::numeric_limits<float>::infinity();
 demo::Htp g_htp;
 std::string g_dir, g_perf;
 std::unique_ptr<Ort::Session> g_sam_enc, g_sam_dec, g_enc, g_dec;
+remote_handle64 g_hmx = 0; /* the DSP decoder (dec=hmx) */
 std::map<std::string, std::unique_ptr<Ort::Session>> g_moge;  // per orientation, loaded on first use
 int g_w = 0, g_h = 0;                                          // working image
 std::vector<uint8_t> g_rgb, g_mask, g_q(S * S * 3);
@@ -307,7 +316,7 @@ void reconstruct(float* times, int* counts) {
   const double t3 = now_ms();
   dump("k.f32", k.data(), k.size() * 4);
   dump("v.f32", v.data(), v.size() * 4);
-  // decoder: one set of tensors, rebound per chunk
+  // decoder: one set of tensors, rebound per chunk (QNN), or the DSP decoder with this image's K/V
   std::vector<float> qx(Q * 3), qo(Q), qc(Q * 3);
   int64_t xs[3] = {1, Q, 3}, os[2] = {1, Q}, ks[4] = {8, 16, SEEN, 32};
   Ort::Value din[3] = {Ort::Value::CreateTensor<float>(cpu(), qx.data(), qx.size(), xs, 3),
@@ -317,6 +326,16 @@ void reconstruct(float* times, int* counts) {
                         Ort::Value::CreateTensor<float>(cpu(), qc.data(), qc.size(), xs, 3)};
   const char* din_n[] = {"xyz", "k", "v"};
   const char* dout_n[] = {"occ", "rgb"};
+  const int hmx_thr = std::stoi(g_opts["hmx_threads"]);
+  if (g_hmx) {
+    const size_t per = (size_t)2 * MB_HEADS * MB_ST * MB_TH; /* halfwords per block: K tiles, V tiles */
+    std::vector<mb_hf> kv(per * MB_BLOCKS);
+    mb_hf *kt[MB_BLOCKS], *vt[MB_BLOCKS];
+    for (int b = 0; b < MB_BLOCKS; b++) kt[b] = kv.data() + per * b, vt[b] = kt[b] + per / 2;
+    mb_pack_kv(kt, vt, k.data(), v.data());
+    const int rc = mcc_hmx_rpc_set_kv_tiles(g_hmx, kv.data(), (int)kv.size());
+    if (rc) throw std::runtime_error("mcc_hmx set_kv_tiles " + std::to_string(rc));
+  }
   std::vector<float> p, rgb, p_prev, rgb_prev;
   std::vector<uint8_t> want, q_prev;
   int n_prev = 0, nq = 0, nchunks = 0;
@@ -356,7 +375,15 @@ void reconstruct(float* times, int* counts) {
         const size_t idx[3] = {f / ((size_t)n * n), (f / n) % n, f % n};
         for (int t = 0; t < 3; ++t) qx[3 * r + t] = (float)((idx[t] - n / 2.0) / ((n / 2.0) / 3.0));
       }
-      g_dec->Run(Ort::RunOptions{nullptr}, din_n, din, 3, dout_n, dout, 2);
+      if (g_hmx) { /* only the rows this chunk uses, rounded up to 32 */
+        const int q = (int)((m + 31) / 32 * 32);
+        uint64 t[13];
+        int codes[6];
+        const int rc = mcc_hmx_rpc_decode(g_hmx, q, MB_V_ALL, hmx_thr, qx.data(), q * 3, qo.data(), q, qc.data(), q * 3, t, 13, codes, 6);
+        if (rc || codes[2] || !codes[0]) throw std::runtime_error("mcc_hmx decode rc " + std::to_string(rc) + " ctx " + std::to_string(codes[0]) +
+                                                                  " hmx lock " + std::to_string(codes[2]));
+      } else
+        g_dec->Run(Ort::RunOptions{nullptr}, din_n, din, 3, dout_n, dout, 2);
       for (size_t r = 0; r < m; ++r) {
         const size_t f = todo[s0 + r];
         p[f] = 1.f / (1.f + std::exp(-qo[r]));
@@ -419,14 +446,39 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_nat
                                                {"levels", "2"},
                                                {"lo", "0.1"},
                                                {"thr", "0.3"},
-                                               {"dump", "0"}});
+                                               {"dump", "0"},
+                                               {"dec", "hmx"},
+                                               {"hmx_threads", "4"}});
     g_dir = jstr(e, jdir);
     g_perf = g_opts["htp_performance_mode"];
     g_htp.init(jstr(e, jlib), "mcc");
     g_sam_enc = g_htp.session(g_dir, "sam_l0_enc", g_perf, "MccDemo");
     g_sam_dec = g_htp.session(g_dir, "sam_l0_dec", g_perf, "MccDemo");
     g_enc = g_htp.session(g_dir, "mcc_enc", g_perf, "MccDemo");
-    g_dec = g_htp.session(g_dir, "mcc_dec_q1024", g_perf, "MccDemo");
+    if (g_opts["dec"] == "hmx") {
+      if (!g_hmx) {
+        struct remote_rpc_control_unsigned_module up = {CDSP_DOMAIN_ID, 1};
+        remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &up, sizeof up);
+        if (mcc_hmx_rpc_open("file:///libmcc_hmx_rpc.so?mcc_hmx_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &g_hmx))
+          throw std::runtime_error("mcc_hmx_rpc_open failed (skel libmcc_hmx_rpc.so)");
+        int prc = 0;
+        mcc_hmx_rpc_perf_vote(g_hmx, 3, &prc); /* turbo + the HMX power vote (mandatory before HMX ops) */
+        const double t = now_ms();
+        auto load = [](const std::string& path) {
+          std::ifstream f(path, std::ios::binary);
+          if (!f) throw std::runtime_error("missing " + path);
+          return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        for (int b = 0; b < MB_BLOCKS; b++) {
+          auto blob = load(g_dir + "/mcc_hmx_blk" + std::to_string(b) + ".bin");
+          if (int rc = mcc_hmx_rpc_load_block(g_hmx, b, blob.data(), (int)blob.size())) throw std::runtime_error("mcc_hmx load_block " + std::to_string(rc));
+        }
+        auto head = load(g_dir + "/mcc_hmx_head.bin");
+        if (int rc = mcc_hmx_rpc_load_head(g_hmx, head.data(), (int)head.size())) throw std::runtime_error("mcc_hmx load_head " + std::to_string(rc));
+        LOGI("DSP decoder: weights loaded in %.0f ms", now_ms() - t);
+      }
+    } else
+      g_dec = g_htp.session(g_dir, "mcc_dec_q1024", g_perf, "MccDemo");
     return nullptr;
   } catch (const std::exception& ex) {
     return e->NewStringUTF(ex.what());

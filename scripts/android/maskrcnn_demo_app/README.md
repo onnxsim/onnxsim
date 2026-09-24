@@ -144,7 +144,7 @@ on the HTP from EP-context models:
 | monocular metric point map | MoGe-2 ViT-S, static 640x480 / 480x640 (`depth.py static`) | HTP, fp16 |
 | upstream `prep` + XYZ window partition (`model.py`) | ported to C++ | CPU |
 | encoder -> the decoder's seen K/V | MCC `enc.onnx` (`model.py` K/V-cache split) | HTP, fp16 |
-| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.1) | MCC `dec_q1024.a16c.onnx` (`dec_opt.py`), 1024 queries a run | HTP, w8a16 (color tail fp16) |
+| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.1) | the hand-written DSP decoder `../mcc_hmx` (HMX GEMMs + 4 HVX threads, FastRPC skel `libmcc_hmx_rpc.so`), up to 1024 queries a call; `--es opts dec=qnn`: MCC `dec_q1024.a16c.onnx` (`dec_opt.py`) | DSP (HMX + HVX, fp16); QNN: HTP w8a16 |
 
 - The working image is 480x640 (portrait) or 640x480 (landscape): camera frames (4:3) scaled, test
   images center-cropped to 3:4 / 4:3. MoGe-2's points are flipped into MCC's frame (y up, z toward the
@@ -155,7 +155,7 @@ on the HTP from EP-context models:
   "Next image" moves on. **camera:** live preview; a tap freezes the frame and segments, "Live" unfreezes.
 - 3D view: z-buffered colored splats of the points with p > 0.3; drag to turn, pinch to zoom; the photo
   with its mask sits in the corner.
-- Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge ./deploy.sh`
+- Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge MCC_HMX=<../mcc_hmx/ref.py weights dir> ./deploy.sh`
   (`mcc.py export --chunks 1024`, `dec_opt.py prep` + `quant --policy a16c`, `MCC_DEC=dec_q1024.onnx` for
   the fp16 decoder; `depth.py static` at `--h 640 --w 480` and `--h 480 --w 640`).
   Scripted: `--es image quest2.jpg --es tap 0.506,0.491 --ez recon true`; `--es opts` takes `gran`,
@@ -166,7 +166,7 @@ on the HTP from EP-context models:
 Phone (Xiaomi 12S), upstream's quest2 photo, the tap on the headset ("3D" pressed again on the same
 mask for the steady state):
 
-| | first version | optimized |
+| | first version | optimized (QNN w8a16 decoder) |
 |---|---:|---:|
 | SAM encoder (once per image) / decoder (per tap) | 43-53 / 12-15 | same |
 | MoGe-2 ViT-S 640x480 | 268-276 | 270-590, in the background: 5-12 waited |
@@ -177,6 +177,12 @@ mask for the steady state):
 | vs the dense host fp32 grid: recall / precision / chamfer / color L1 | 0.993 / 0.992 / 0.0008 / 0.46 | 0.990 / 0.988 / 0.0011 / 0.76 |
 | init, first launch (compiles MCC's two graphs) / later launches | 48.7 s / 1.6 s | ~49 s / 1.6 s |
 | MoGe-2 compile, first image per orientation (in the background now) | 17-24 s | same |
+
+**DSP decoder** (`../mcc_hmx`, now the default): the decoder chunks on the Hexagon DSP by hand -- every
+GEMM on HMX, softmax / LayerNorm / GELU on 4 HVX threads, activations in VTCM between steps -- 22 ms a
+1024-query chunk vs QNN's 47 (w8a16): decoder **1.06 s** (48 calls), **"3D" 1.30 s**, and closer to the
+float64 model than the w8a16 graph (recall 0.993, precision 0.992, chamfer 0.0008, color L1 0.43/255 vs
+the dense host fp32 grid). Details and the step-by-step timings in `../mcc_hmx/README.md`.
 
 The optimizations, one at a time (`../vision_models/mcc/dec_opt.py`, `README.md` "Decoder
 optimization" there for everything tried):

@@ -1,0 +1,27 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface mcc_hmx_rpc : remote_handle64 {
+  // bit 0 turbo, bit 1 HMX power vote (required before any HMX op)
+  long perf_vote(in long flags, rout long rc);
+  // keep block `idx`'s packed weights (ref.py pack_block) resident in the DSP heap
+  long load_block(in long idx, in sequence<uint8> blob);
+  // the decoder's ends (ref.py pack_head), resident
+  long load_head(in sequence<uint8> blob);
+  // one image's seen K / V (float [8, 16, 197, 32] each): packed into every block's K / V tiles
+  long set_kv(in sequence<float> k, in sequence<float> v);
+  // the same, already packed by the caller (mcc_decoder.h mb_pack_kv): per block 16 x 7 K tiles, then
+  // 16 x 7 V tiles, blocks in order
+  long set_kv_tiles(in sequence<uint16> tiles);
+  // the whole decoder on q query points (xyz: q x 3) -> occupancy logits (q) and colors (q x 3);
+  // times / codes as run()
+  long decode(in long q, in long hvx, in long nthr, in sequence<float> xyz, rout sequence<float> occ,
+              rout sequence<float> rgb, rout sequence<uint64> times, rout sequence<long> codes);
+  // run blocks 0..nblocks-1 on x (Q x 512 fp16 row-major) -> y; iters repeats (x restored each time).
+  // times: [0] us per iteration (the blocks only), [1..12] pcycles per phase (mcc_block.h MB_P_*, summed
+  // over blocks, last iteration, thread 0); codes: [0] ctx, [1] hvx lock (thread 0), [2] hmx lock, [3] vtcm
+  // bytes, [4] thread create, [5] hvx lock failures on helper threads
+  // hvx: mcc_block.h MB_V_* mask (which element-wise steps run on HVX instead of scalar C);
+  // nthr: threads (each an HVX context; thread 0 also drives HMX), 1..4
+  long run(in long q, in long nblocks, in long iters, in long hvx, in long nthr, in sequence<uint16> x, rout sequence<uint16> y,
+           rout sequence<uint64> times, rout sequence<long> codes);
+};

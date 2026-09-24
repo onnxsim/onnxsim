@@ -7,7 +7,8 @@
 # 1. ORT + QNN EP + Qualcomm QNN runtime libs (Maven Central) via ../htp_exploration/qnn_shell/fetch_libs.sh
 # 2. the three Hexagon FastRPC skels + their ARM stubs, built by ../e2e_pipeline/build.sh (BUILD_ONLY)
 # 3. native/maskrcnn_engine.cpp (includes ../e2e_pipeline/e2e_run.cpp) -> libmaskrcnn_demo.so,
-#    native/{yolo,sam,mcc,sr}_engine.cpp -> lib{yolo,sam,mcc,sr}_demo.so, native/rtdetr_engine.cpp (+ the ../msda_hvx
+#    native/{yolo,sam,sr}_engine.cpp -> lib{yolo,sam,sr}_demo.so, native/mcc_engine.cpp (+ the ../mcc_hmx
+#    decoder skel) -> libmcc_demo.so, libmcc_hmx_rpc.so, native/rtdetr_engine.cpp (+ the ../msda_hvx
 #    skel) -> librtdetr_demo.so, libmsda_rpc.so, native/game_engine.cpp (NSS + NFRU, OpenCL) -> libgame_demo.so
 # 4. everything into app/src/main/jniLibs/arm64-v8a, then gradle assembleDebug (offline).
 set -euo pipefail
@@ -30,12 +31,19 @@ INC=(-I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" -I "$HEXAGON
   "$B/e2e/rpn_glue.o" "$B/e2e/rpn_stub.o" "$B/e2e/roi_stub.o" "$B/e2e/roiu8_stub.o" \
   -L "$QS/libs" -lonnxruntime -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc \
   -ljnigraphics -llog -Wl,--no-undefined
-# YOLO, SAM, MCC and super-resolution modes: one engine library each (ORT + QNN EP only, no DSP skels)
-for e in yolo sam mcc sr; do
+# YOLO, SAM and super-resolution modes: one engine library each (ORT + QNN EP only, no DSP skels)
+for e in yolo sam sr; do
   "$NDK/aarch64-linux-android29-clang++" -O2 -std=c++17 -shared -fPIC -static-libstdc++ -I "$QS/headers" \
     -o "$J/lib${e}_demo.so" "$HERE/native/${e}_engine.cpp" -L "$QS/libs" -lonnxruntime -ljnigraphics -llog \
     -Wl,--no-undefined
 done
+# MCC 3D mode's DSP decoder (../mcc_hmx): its skel + stub, relinked into libmcc_demo.so (the loop above
+# built the QNN-only variant; this one replaces it)
+OUT="$B/mcc_hmx" NDK_CLANG="$NDK/aarch64-linux-android29-clang" "$HERE/../mcc_hmx/build.sh" >/dev/null
+"$NDK/aarch64-linux-android29-clang++" -O2 -std=c++17 -shared -fPIC -static-libstdc++ -I "$QS/headers" -I "$B/mcc_hmx" -I "$HERE/../mcc_hmx" \
+  "${INC[@]}" -o "$J/libmcc_demo.so" "$HERE/native/mcc_engine.cpp" "$B/mcc_hmx/mcc_hmx_stub.o" -L "$QS/libs" -lonnxruntime \
+  -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc -ljnigraphics -llog -Wl,--no-undefined
+cp "$B/mcc_hmx/mcc_hmx_rpc.so" "$J/libmcc_hmx_rpc.so"
 # Game-upscaling mode: NSS + NFRU (../vision_models/{nss,nfru}); their OpenCL kernel sources are compiled
 # in as strings (game_cl.h), the vendor libOpenCL.so is dlopen'ed at run time (../vision_models/nss/cl_dl.h;
 # CL_HEADERS: the Khronos OpenCL headers, default /usr/include)
