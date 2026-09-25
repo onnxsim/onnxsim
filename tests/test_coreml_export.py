@@ -628,6 +628,76 @@ def test_gemm_alpha_beta_transb_matches_onnxruntime():
     np.testing.assert_allclose(_mil_const_value(model), expected, rtol=1e-5, atol=1e-5)
 
 
+def test_dequantize_linear_per_channel_int32_bias_lowers_to_cast_mul():
+    # onnxsim.full_qdq emits exactly this shape for a QDQ Conv/Gemm bias:
+    # DequantizeLinear(int32[2], fp32[2] scale, int32[2] zero_point, axis=0).
+    # MIL's `dequantize` only accepts int8/uint8, and the old scalar-zero
+    # special case rejected the per-channel form outright -- which blocked
+    # every full_qdq graph. The cast+multiply is the real definition, and with
+    # a zero zero_point it is exact.
+    scale = numpy_helper.from_array(
+        np.array([0.02, 0.5], dtype=np.float32), name="scale"
+    )
+    zp = numpy_helper.from_array(np.array([0, 0], dtype=np.int32), name="zp")
+    model = _model(
+        """
+        dq32pc (int32[2,2] x, float[2] scale, int32[2] zp) => (float[2,2] y)
+        {
+            y = DequantizeLinear <axis=0> (x, scale, zp)
+        }
+        """,
+        initializer=[scale, zp],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    ops = [op.op_type for op in prog.functions["main"].operations]
+    # cast + mul, and no `dequantize` (which would reject int32).
+    assert "dequantize" not in ops
+    assert ops.count("cast") == 1 and ops.count("mul") == 1
+    # int32 -> fp32 (the cast) then the per-channel scale (the mul).
+    (cast,) = [op for op in prog.functions["main"].operations if op.op_type == "cast"]
+    (mul,) = [op for op in prog.functions["main"].operations if op.op_type == "mul"]
+    assert cast.inputs["dtype"].val == "fp32"
+    np.testing.assert_allclose(np.asarray(mul.inputs["y"].val), [0.02, 0.5], rtol=1e-6)
+
+
+def test_dequantize_linear_int32_nonzero_zero_point_adds_the_offset():
+    # A nonzero int32 zero point is (x - zp) * scale, so the lowering has to
+    # subtract rather than just scale. full_qdq only ever emits zero points,
+    # but the exporter must not silently drop a nonzero one.
+    scale = numpy_helper.from_array(
+        np.array([0.1, 0.2], dtype=np.float32), name="scale"
+    )
+    zp = numpy_helper.from_array(np.array([2, 4], dtype=np.int32), name="zp")
+    model = _model(
+        """
+        dq32off (int32[2,2] x, float[2] scale, int32[2] zp) => (float[2,2] y)
+        {
+            y = DequantizeLinear <axis=0> (x, scale, zp)
+        }
+        """,
+        initializer=[scale, zp],
+    )
+    ops = [
+        op.op_type
+        for op in coreml_export._build_mil_program(model, *coreml_export._import_mil())[
+            0
+        ]
+        .functions["main"]
+        .operations
+    ]
+    assert "dequantize" not in ops
+    assert ops.count("add") == 1
+
+
+def test_dequantize_linear_rejects_unsupported_zero_point_dtype():
+    # full_qdq's activation_dtype="uint16" emits int16/uint16 Q/DQ. That has no
+    # MIL Q/DQ form, and it is also outside the constant dtypes the translator
+    # carries, so it is refused -- explicitly at the constant, never silently
+    # reinterpreted as another width.
+    with pytest.raises(RuntimeError, match="Unsupported tensor dtype int16"):
+        coreml_export._as_mil_array(np.array([0], dtype=np.int16))
+
+
 def test_gemm_alpha_beta_fp16_matches_expected():
     # Regression test: the alpha/beta scale factors used to be created as a bare
     # Python float, which MIL infers as fp32 regardless of context -- multiplying

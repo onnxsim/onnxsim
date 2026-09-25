@@ -737,23 +737,39 @@ def _op_dequantize_linear(lowerer, node, ins, attrs):
     scale, zp, axis = _qdq_scale_and_zp(lowerer, node, ins, attrs, "DequantizeLinear")
     if zp is not None:
         zp_np_dtype = np.asarray(zp.val).dtype
-        # Some QDQ exports encode a zero int32 bias as DequantizeLinear
-        # (int32, scale, zero_point). Core ML's MIL dequantize only accepts
-        # int8/uint8, but this scalar-zero case is exactly a cast and multiply.
-        if (
-            zp_np_dtype == np.dtype(np.int32)
-            and np.asarray(zp.val).size == 1
-            and np.all(zp.val == 0)
-        ):
+        # A QDQ Conv/Gemm bias is int32 with its own per-channel scale, which
+        # MIL's `dequantize` does not accept (it only takes int8/uint8 input).
+        # Dequantizing an int32 zero-point bias is exactly a cast plus a
+        # scale-and-zero-point multiply, so lower it that way and let the
+        # broadcast happen in `mul`: the scale is 1-D along `axis` (Conv's
+        # output channels), and a bias is applied to the conv output, so
+        # broadcasting the (1-D scale, 1-D bias) pair over the NCHW output
+        # is what ONNX's own per-channel DequantizeLinear asks for.
+        if zp_np_dtype == np.dtype(np.int32):
+            zp_arr = np.asarray(zp.val)
             cast = lowerer.mb.cast(
                 x=x,
                 dtype=lowerer.types.builtin_to_string(scale.dtype),
                 name=lowerer.fresh_name(node, "cast"),
             )
-            return [lowerer.mb.mul(x=cast, y=scale, name=lowerer.fresh_name(node))]
+            scaled = lowerer.mb.mul(
+                x=cast, y=scale, name=lowerer.fresh_name(node, "scale")
+            )
+            if np.all(zp_arr == 0):
+                return [scaled]
+            zp_f = lowerer.make_const(
+                f"{node.output[0]}_zp_f32", zp_arr.astype(np.float32)
+            )
+            return [
+                lowerer.mb.add(
+                    x=scaled,
+                    y=zp_f,
+                    name=lowerer.fresh_name(node),
+                )
+            ]
         if zp_np_dtype not in (np.dtype(np.int8), np.dtype(np.uint8)):
             raise RuntimeError(
-                "DequantizeLinear 'zero_point' must be int8 or uint8 "
+                "DequantizeLinear 'zero_point' must be int8, uint8 or int32 "
                 f"(got {zp_np_dtype})"
             )
     kwargs = {
@@ -1859,6 +1875,28 @@ def _resolve_io_dtype(ct, io_dtype: Optional[str], convert_to: str, resolved_tar
     return "fp16", resolved_target
 
 
+def _raise_target_to_floor(ct, floor, resolved_target, reason: str, label: str):
+    """Raise ``resolved_target`` to at least ``floor``, or refuse an older one.
+
+    Shared by every per-feature deployment floor below. The ``max`` matters
+    when several features apply at once: each call must be free to *raise* the
+    target, never to lower it back to its own floor. A resolver that returned
+    its floor unconditionally would make a later, higher resolver read that
+    value as the caller's explicit choice and refuse to raise past it -- which
+    is exactly what a QDQ model with a nearest Resize did (iOS15 pinned by the
+    Resize rule, then rejected by the iOS17 QDQ rule).
+    """
+    if resolved_target is None:
+        return floor
+    if int(resolved_target) < int(floor):
+        raise RuntimeError(
+            f"{reason} needs minimum_deployment_target {label} or newer "
+            f"(got {resolved_target.name}); that Core ML op did not exist "
+            "before then."
+        )
+    return resolved_target
+
+
 def _resolve_state_target(ct, state, resolved_target):
     """Bump the deployment floor to iOS18 when states are requested.
 
@@ -1867,34 +1905,25 @@ def _resolve_state_target(ct, state, resolved_target):
     """
     if not state:
         return resolved_target
-    floor = ct.target.iOS18
-    if resolved_target is None:
-        return floor
-    if int(resolved_target) < int(floor):
-        raise RuntimeError(
-            f"state= needs minimum_deployment_target iOS18/macOS15 or newer "
-            f"(got {resolved_target.name}); Core ML states did not exist "
-            "before then."
-        )
-    return resolved_target
+    return _raise_target_to_floor(
+        ct, ct.target.iOS18, resolved_target, "state=", "iOS18/macOS15"
+    )
 
 
 def _resolve_gather_nd_target(ct, model: onnx.ModelProto, resolved_target):
-    floor = ct.target.iOS16
     uses_batch_dims = any(
         node.op_type == "GatherND" and int(_node_attrs(node).get("batch_dims", 0)) > 0
         for node in model.graph.node
     )
     if not uses_batch_dims:
         return resolved_target
-    if resolved_target is None:
-        return floor
-    if int(resolved_target) < int(floor):
-        raise RuntimeError(
-            f"GatherND with batch_dims > 0 needs minimum_deployment_target "
-            f"iOS16/macOS13 or newer (got {resolved_target.name})"
-        )
-    return resolved_target
+    return _raise_target_to_floor(
+        ct,
+        ct.target.iOS16,
+        resolved_target,
+        "GatherND with batch_dims > 0",
+        "iOS16/macOS13",
+    )
 
 
 def _resolve_resize_target(ct, model: onnx.ModelProto, resolved_target):
@@ -1912,16 +1941,9 @@ def _resolve_resize_target(ct, model: onnx.ModelProto, resolved_target):
         for node in model.graph.node
     ):
         return resolved_target
-    floor = ct.target.iOS15
-    if resolved_target is None:
-        return floor
-    if int(resolved_target) < int(floor):
-        raise RuntimeError(
-            f"nearest Resize needs minimum_deployment_target iOS15/macOS12 or "
-            f"newer (got {resolved_target.name}); Core ML's resize_nearest_neighbor "
-            f"op did not exist before then."
-        )
-    return resolved_target
+    return _raise_target_to_floor(
+        ct, ct.target.iOS15, resolved_target, "a nearest Resize", "iOS15/macOS12"
+    )
 
 
 def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
@@ -1938,16 +1960,13 @@ def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
         for node in model.graph.node
     ):
         return resolved_target
-    floor = ct.target.iOS17
-    if resolved_target is None:
-        return floor
-    if int(resolved_target) < int(floor):
-        raise RuntimeError(
-            "QuantizeLinear/DequantizeLinear need minimum_deployment_target "
-            f"iOS17/macOS14 or newer (got {resolved_target.name}); MIL's "
-            "`quantize`/`dequantize` ops did not exist before then."
-        )
-    return resolved_target
+    return _raise_target_to_floor(
+        ct,
+        ct.target.iOS17,
+        resolved_target,
+        "QuantizeLinear/DequantizeLinear",
+        "iOS17/macOS14",
+    )
 
 
 def convert_to_coreml(
@@ -2089,8 +2108,8 @@ def convert_to_coreml(
         ct, io_dtype, convert_to, resolved_target
     )
     resolved_target = _resolve_gather_nd_target(ct, model, resolved_target)
-    resolved_target = _resolve_resize_target(ct, model, resolved_target)
     resolved_target = _resolve_quantized_target(ct, model, resolved_target)
+    resolved_target = _resolve_resize_target(ct, model, resolved_target)
     resolved_target = _resolve_state_target(ct, state, resolved_target)
 
     prog, flexible_inputs = _build_mil_program(

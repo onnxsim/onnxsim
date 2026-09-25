@@ -138,6 +138,24 @@ uses the native kernel, and it requires iOS15/macOS12 or newer. On M4 this took
 Fast-BEV M0's encoder from 95.6 ms to 65.9 ms and its end-to-end Core ML chain
 from 174.3 ms to 143.9 ms, with ORT parity unchanged (cosine 1.0).
 
+The same gate also speeds up the YOLO detectors below, whose head upsample is an
+integer 2x nearest resize (FLOAT16, `ALL`, 8 runs after 3 warm-ups, same input
+and machine). A/B against the gather path, with score p99 error vs ONNX Runtime
+unchanged in both arms:
+
+| model | gather | native | speedup | score p99 error |
+|---|---:|---:|---:|---:|
+| YOLO11n | 4.66 ms | **2.74 ms** | 1.70x | 5.0e-5 |
+| YOLO26n | 4.80 ms | **2.37 ms** | 2.03x | 8.6e-6 |
+| YOLO26s | 9.45 ms | 9.54 ms | 0.99x (no change) | 1.7e-5 |
+
+YOLO26s is unchanged because its Resize input is not a whole-number
+replication, so it keeps the gathers; its head is large enough that the two
+`Resize` nodes are not on the critical path. Note these FLOAT16 latencies are
+lower than the `CPU_AND_NE` FLOAT16 numbers recorded in
+[`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md),
+which predate the native-Resize change; that file's accuracy notes still apply.
+
 ## rustnn WebNN vs. tinygrad benchmark (`benchmark_webnn_tinygrad.py`)
 
 Times small simplified models, per node and as a whole, on rustnn's native WebNN
