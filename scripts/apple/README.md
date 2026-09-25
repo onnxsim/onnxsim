@@ -126,6 +126,10 @@ produced by an earlier stage (for example, projection LUTs). Set `fuse` to an ob
 `{"stages": ["backbone", "head"], "backend": "coreml"}` to additionally measure
 one merged ONNX graph; the original per-stage and unfused end-to-end results
 remain in the report. The fused graph is written beside the JSON output.
+For Fast-BEV++ on M4, selecting all four Core ML stages with `ALL` measured
+97.4 ms for the fused graph versus 177.0 ms for the current Core ML/Metal-JIT
+hybrid; the fused result retained cosine 1.0 against ORT with maximum absolute
+error 1.1e-4.
 
 M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
 in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
