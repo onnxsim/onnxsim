@@ -129,7 +129,10 @@ remain in the report. The fused graph is written beside the JSON output.
 For Fast-BEV++ on M4, selecting all four Core ML stages with `ALL` measured
 97.4 ms for the fused graph versus 177.0 ms for the current Core ML/Metal-JIT
 hybrid; the fused result retained cosine 1.0 against ORT with maximum absolute
-error 1.1e-4.
+error 1.1e-4. An explicit `--compute-precision FLOAT16` run is much faster
+(38.7 ms for the Fast-BEV++ fused graph and 72.2 ms for the M0 fused graph),
+but changes task outputs materially (for example, Fast-BEV++ heatmap cosine
+0.9999967 and maximum absolute error 0.173), so FLOAT32 remains the default.
 
 M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
 in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
