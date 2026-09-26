@@ -711,6 +711,47 @@ def test_onnx_misc_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     )
 
 
+@needs_device
+@pytest.mark.parametrize(
+    "op, input_shape, template_key",
+    [
+        ("Greater", (16, 64, 112, 112), "GreaterCast:16x64x112x112"),
+    ],
+)
+def test_onnx_comparison_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
+    tmp_path, op, input_shape, template_key
+):
+    """Run calibration-free comparison/cast UOps through AXCL VM."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import misc_op_record_emit as misc
+    import tinygrad_ax_backend as axb
+    from tinygrad import Tensor
+
+    _, meta = misc.load_template(template_key)
+    schedule = tmp_path / f"onnx_{op.lower()}cast_to_uop.schedule.json"
+    root = (
+        (Tensor.empty(*input_shape) > 0).cast("float32")
+        if op == "Greater"
+        else (Tensor.empty(*input_shape) < 0).cast("float32")
+    ).uop
+    axmodel = axb.compile_uop(root, str(schedule))
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(-1.0, 1.0, input_shape).astype(np.float32)
+
+    with axcl_session.AXSession(
+        subdir=f"uop_{op.lower()}cast_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x])
+        finally:
+            session.unload(loaded)
+
+    want = (x > 0.0 if op == "Greater" else x < 0.0).astype(np.float32)
+    np.testing.assert_array_equal(got, want)
+
+
 class _EchoSession:
     """Stands in for AXSession: records each run's input shapes and returns
     the first input times two."""
