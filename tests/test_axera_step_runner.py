@@ -305,7 +305,8 @@ def test_onnx_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 
 @needs_device
-def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+@pytest.mark.parametrize("zero_point", [0, 128])
+def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path, zero_point):
     """Run an unfused standalone ReLU UOp through the AXCL VM."""
     pytest.importorskip("tinygrad")
     import axcl_session
@@ -313,7 +314,7 @@ def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     import tinygrad_ax_backend as axb
 
     shape = (16, 64, 56, 56)
-    _, meta = ew.load_template("Relu", shape, {"x": 0, "y": 0})
+    _, meta = ew.load_template("Relu", shape, {"x": zero_point, "y": zero_point})
     model = onnx.helper.make_model(
         onnx.helper.make_graph(
             [onnx.helper.make_node("Relu", ["x"], ["y"])],
@@ -323,7 +324,7 @@ def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path):
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
-    schedule = tmp_path / "standalone_relu_uop.schedule.json"
+    schedule = tmp_path / f"standalone_relu_uop_z{zero_point}.schedule.json"
     axmodel = axb.compile_onnx(
         model,
         str(schedule),
