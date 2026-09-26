@@ -80,4 +80,7 @@ if (ONNXSIM_REMOTE_ROS2)
   add_executable(onnx-remote-ros2-bridge ros2_bridge.cpp)
   target_link_libraries(onnx-remote-ros2-bridge PRIVATE onnx_remote_transport)
   ament_target_dependencies(onnx-remote-ros2-bridge rclcpp std_msgs std_srvs)
+  install(TARGETS onnx-remote-ros2-bridge
+          DESTINATION lib/${PROJECT_NAME})
+  ament_package()
 endif()

@@ -115,6 +115,40 @@ build/onnx-remote/onnx-remote-ros2-bridge \
   --ros-args -p remote_host:=runner.local -p remote_port:=39501
 ```
 
+For a reproducible development environment using `nix-ros-overlay`:
+
+```sh
+cd tools/onnx-remote
+nix develop
+cmake -S . -B build -DONNXSIM_REMOTE_ROS2=ON
+cmake --build build --target onnx-remote-ros2-bridge
+cmake --install build --prefix /tmp/onnx-remote-install
+```
+
+The flake currently pins the ROS2 Humble package set from nixpkgs. It does not
+replace the project toolchain; it only supplies CMake, `ament_cmake`, `rclcpp`,
+`std_msgs`, `std_srvs`, and the ROS2 CLI.
+
+### ROS2 runner discovery
+
+Set `auto_discover:=true` on a bridge that should select another bridge's
+remote worker automatically. Bridges publish transient-local JSON announcements
+on `onnx_remote/runners`, so late-joining nodes receive the latest endpoint:
+
+```sh
+build/onnx-remote-ros2-bridge --ros-args \
+  -p auto_discover:=true -p discovery_target:=tensorrt-cuda \
+  -p discovery_topic:=onnx_remote/runners
+```
+
+The announcing bridge can advertise a Tailscale address or DNS name with
+`advertise_host:=100.x.y.z`. Discovery is only the ROS2 control plane; tensor
+payloads still use the binary `run`/`result` topics and the selected bridge's
+TCP connection. Direct `remote_host`/`remote_port` remains the fallback when
+discovery is disabled. Announcement selection is target-filtered but does not
+provide authentication; use DDS security or a trusted ROS2 domain on shared
+networks.
+
 The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
 tensor and profile data remain binary rather than being converted to ROS
 messages.

@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>onnx_remote_transport</name>
+  <version>0.1.0</version>
+  <description>Binary ONNX remote executor transport and ROS2 bridge</description>
+  <maintainer email="onnxsim@users.noreply.github.com">onnxsim</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
