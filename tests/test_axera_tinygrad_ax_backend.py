@@ -298,6 +298,57 @@ def test_compile_onnx_frozen_conv_keeps_uop_shape_and_emits_mcode(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
 
 
+@pytest.mark.parametrize(
+    ("input_shape", "output_shape", "weight_shape", "pads", "strides"),
+    [
+        ((16, 64, 56, 56), (16, 128, 28, 28), (128, 64, 1, 1), (0, 0, 0, 0), (2, 2)),
+        ((16, 3, 224, 224), (16, 64, 112, 112), (64, 3, 7, 7), (3, 3, 3, 3), (2, 2)),
+    ],
+)
+def test_compile_onnx_frozen_conv_routes_all_validated_templates(
+    tmp_path, input_shape, output_shape, weight_shape, pads, strides
+):
+    rng = np.random.default_rng(sum(input_shape) + sum(weight_shape))
+    weights = rng.normal(0.0, 0.02, weight_shape).astype(np.float32)
+    bias = rng.normal(0.0, 0.01, (weight_shape[0],)).astype(np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv",
+                    ["x", "w", "b"],
+                    ["y"],
+                    pads=list(pads),
+                    strides=list(strides),
+                )
+            ],
+            "frozen_conv_template",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, input_shape
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, output_shape
+                )
+            ],
+            [numpy_helper.from_array(weights, "w"), numpy_helper.from_array(bias, "b")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv_template.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": {"x": 0.01, "y": 0.02}, "zero_points": {"x": 127, "y": 125}},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
+
+
 def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
