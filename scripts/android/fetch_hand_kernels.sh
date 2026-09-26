@@ -23,7 +23,7 @@ ANDROID="$(cd "$(dirname "$0")" && pwd)"
 TINYGRAD_REPO="${TINYGRAD_REPO:-https://github.com/onnxsim/tinygrad.git}"
 # Keep in step with .github/workflows/hexagon-tinygrad.yml (TINYGRAD_SHA). dsp-consolidated:
 # the whole Hexagon DSP stack, including test/external/dsp/hand/.
-TINYGRAD_SHA="${TINYGRAD_SHA:-54b20216f}"
+TINYGRAD_SHA="${TINYGRAD_SHA:-c817073e5558918ee08e7f7c0cfc638d8af41478}"
 HAND="test/external/dsp/hand"
 
 # header under scripts/android -> path under the fork's hand/

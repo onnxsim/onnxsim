@@ -38,16 +38,19 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # onnxsim/tinygrad branch hvx-vrmpy-mixed: the DSP renderer's HVX codegen (stage 1, 3167f8b6), the
-  # float-MAX __auto_type fix (fccd84cfa), qfloat (stage 2, hvx-qfloat 847af7eab) and the vrmpy GEMV TC
-  # (9aa4f66a1, onnxsim/tinygrad#5, which test_codegen_vrmpy_gemv checks). vrmpy-hexagon-support's merge
-  # of onnxsim/tinygrad#2 (62d98031) predates the float-MAX fix, and pinning it hangs
-  # test_codegen_float_max_chain_renders_linearly until the runner dies. Move this pin to
-  # vrmpy-hexagon-support once #3/#4/#5 are merged there.
   TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
-  # onnxsim/tinygrad hvx-hmx-qdq (PR #8, int8 :cm HMX TensorCore + fused requantization, stacked on #7 hvx-hmx-mcc and #6 hvx-hmx; contains
-  # 9aa4f66a1 vrmpy GEMV and fccd84cfa max-chain fix)
-  TINYGRAD_SHA: 3605e14cab6ece783bdfd04058ca17b1de4c29c2
+  # onnxsim/tinygrad dsp-consolidated (PR #11): the whole Hexagon DSP stack on one branch -- HVX codegen
+  # (3167f8b6), the vrmpy GEMV TC (9aa4f66a1), the float-MAX fix (fccd84cfa), qfloat (847af7eab), the HMX
+  # fp16 and int8 :cm tensor cores with fused requantization, and the hand-kernel oracles. That branch
+  # also carries its own CI (hexagon-dsp.yml), so the fork tests itself as well as being tested here.
+  #
+  # This replaces the stacked #1/#3/#4/#6/#7/#8/#9 PRs, which never had CI of their own (the fork had no
+  # registered workflows at all). #8 and #9 had diverged rather than stacked, so neither contained the
+  # other. Do NOT pin an older SHA: scripts/android/fetch_hand_kernels.sh links the hand kernel headers
+  # out of test/external/dsp/hand/, and 3605e14ca (#8's head, the previous pin) predates #9's reorganisation
+  # into hand/{hmx,roialign,rpn,msda,layout}/, so the fetch silently finds nothing and every test that
+  # compiles one of those drivers skips.
+  TINYGRAD_SHA: c817073e5558918ee08e7f7c0cfc638d8af41478
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 
@@ -122,7 +125,11 @@ jobs:
           HEXAGON_CLANG: clang-19
         run: |
           pytest -v -rs --durations=0 tests/test_hexagon_tinygrad.py | tee pytest.log
-          # every tool is installed here, so the only allowed skip is the reserved qfloat slot
-          if grep '^SKIPPED' pytest.log | grep -v 'reserved:'; then
+          # Every tool is installed here, so a skip means something is deliberately not collected rather
+          # than a tool being missing. Two are allowed: the reserved qfloat slot, and the hand-oracle
+          # check, which needs a v65 run and is covered by hexagon-dsp.yml's dsp-oracles job in the fork
+          # (at HVX_ARCH=v69 the fork's conftest sets collect_ignore for the qemu families, because qemu
+          # 8.2 cannot decode the qfloat ops MOCKDSP emits for v68+).
+          if grep '^SKIPPED' pytest.log | grep -vE 'reserved:|need a v65 run'; then
             echo "::error::unexpected skips (a tool was not found)"; exit 1
           fi
