@@ -203,10 +203,6 @@ class RemoteModelExecutor final : public ModelExecutor {
       artifact->id =
           "inline:" + std::to_string(std::hash<std::string>{}(serialized));
     }
-    if (options_.cache_compiled_models) {
-      std::lock_guard<std::mutex> lock(cache_mu_);
-      compiled_cache_[serialized] = artifact;
-    }
     if (options_.attach_compiled_artifact) {
       onnx_remote::Request load;
       load.op = options_.load_compiled_operation;
@@ -217,6 +213,13 @@ class RemoteModelExecutor final : public ModelExecutor {
       const uint16_t runner_port = options_.port;
       Exchange(load, runner_host, runner_port);
       artifact->bytes.clear();
+    }
+    // Publish only after an optional attach succeeds. If the runner rejects
+    // the artifact, a later retry must compile/attach again rather than
+    // reusing an artifact that onnxsim believes is resident remotely.
+    if (options_.cache_compiled_models) {
+      std::lock_guard<std::mutex> lock(cache_mu_);
+      compiled_cache_[serialized] = artifact;
     }
     return artifact;
   }

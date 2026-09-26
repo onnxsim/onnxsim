@@ -141,7 +141,7 @@ cmake -S tools/onnx-remote -B build/onnx-remote
 cmake --build build/onnx-remote --target onnx-remote-compiler
 build/onnx-remote/onnx-remote-compiler \
   --port 39502 --target qnn-htp --compiler-id qairt-2.31.0 \
-  --cache-dir /var/cache/onnxsim-qnn \
+  --cache-dir /var/cache/onnxsim-qnn --max-cache-bytes 1073741824 \
   --command 'qnn_compile_wrapper --input {input} --output {output} \
              --manifest {manifest} --target {target}'
 ```

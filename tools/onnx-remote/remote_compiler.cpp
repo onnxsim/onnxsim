@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <atomic>
+#include <algorithm>
 #include <csignal>
 #include <cstring>
 #include <cstdlib>
@@ -27,6 +28,7 @@ struct Options {
   std::string command;
   std::string target = "qnn-htp";
   std::string compiler_id = "unidentified";
+  uint64_t max_cache_bytes = 0;
 };
 
 std::atomic<uint64_t> cache_write_counter{0};
@@ -169,6 +171,48 @@ bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
   return true;
 }
 
+void enforce_cache_limit(const Options& options) {
+  if (options.cache_dir.empty() || options.max_cache_bytes == 0) return;
+  struct Entry {
+    fs::path complete;
+    fs::path artifact;
+    fs::path manifest;
+    uintmax_t bytes = 0;
+    fs::file_time_type modified{};
+  };
+  std::vector<Entry> entries;
+  uintmax_t total = 0;
+  std::error_code ec;
+  for (const auto& item : fs::directory_iterator(options.cache_dir, ec)) {
+    if (ec || !item.is_regular_file() || item.path().extension() != ".complete")
+      continue;
+    const fs::path complete = item.path();
+    const std::string stem = complete.stem().string();
+    Entry entry{complete, options.cache_dir / (stem + ".artifact"),
+                options.cache_dir / (stem + ".manifest")};
+    if (!fs::exists(entry.artifact, ec) || !fs::exists(entry.manifest, ec))
+      continue;
+    entry.bytes = fs::file_size(entry.artifact, ec);
+    if (ec) continue;
+    entry.bytes += fs::file_size(entry.manifest, ec);
+    if (ec) continue;
+    entry.modified = fs::last_write_time(entry.complete, ec);
+    if (ec) continue;
+    total += entry.bytes;
+    entries.push_back(std::move(entry));
+  }
+  if (total <= options.max_cache_bytes) return;
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry& a, const Entry& b) { return a.modified < b.modified; });
+  for (const Entry& entry : entries) {
+    if (total <= options.max_cache_bytes) break;
+    fs::remove(entry.complete, ec);
+    fs::remove(entry.artifact, ec);
+    fs::remove(entry.manifest, ec);
+    total = total > entry.bytes ? total - entry.bytes : 0;
+  }
+}
+
 std::string shell_quote(const std::string& value) {
   std::string result = "'";
   for (char c : value) {
@@ -270,6 +314,7 @@ Response compile(const Request& request, const Options& options) {
     fs::create_directories(options.cache_dir, ec);
     if (!ec) publish_cache(artifact_path, manifest_path, complete_path,
                            response.artifact, response.manifest, error);
+    enforce_cache_limit(options);
   }
   return response;
 }
@@ -287,9 +332,12 @@ bool parse_options(int argc, char** argv, Options& options) {
       options.target = argv[++i];
     } else if (argument == "--compiler-id" && i + 1 < argc) {
       options.compiler_id = argv[++i];
+    } else if (argument == "--max-cache-bytes" && i + 1 < argc) {
+      options.max_cache_bytes = std::strtoull(argv[++i], nullptr, 10);
     } else if (argument == "--help") {
       std::cout << "usage: onnx-remote-compiler [--port PORT] [--cache-dir DIR]"
-                   " [--target TARGET] [--compiler-id ID] [--command COMMAND]\n"
+                   " [--target TARGET] [--compiler-id ID]"
+                   " [--max-cache-bytes BYTES] [--command COMMAND]\n"
                    "COMMAND placeholders: {input} {output} {manifest} {target}\n"
                    "Without COMMAND, copies the model as a transport smoke-test artifact.\n";
       return false;
