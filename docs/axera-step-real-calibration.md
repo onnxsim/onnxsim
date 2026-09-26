@@ -74,6 +74,12 @@ are elided (`axera-zp-register-write-elision`).
 
 ## Coverage at the predicted calibration
 
+The current Pulsar-free UOp-to-mcode planner covers **570 of 1,104 nodes**
+at this calibration and refuses 534. This includes 42 live broadcast binary
+nodes (all `Mul` nodes in this step), which are emitted with a validated
+full-shape binary template and expanded at the segment boundary. The
+regression test in `tests/test_axera_step_calibration.py` pins this report.
+
 Master reported 120 covered / 562 conditional / 422 refused. Settling the
 conditionals against the predicted calibration:
 
