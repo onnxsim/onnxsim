@@ -15,7 +15,33 @@ collection, so the installed package is imported unchanged.
 """
 
 import os
+import pathlib
 import re
+import subprocess
+import sys
+
+_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_FETCH = _ROOT / "scripts" / "android" / "fetch_hand_kernels.sh"
+
+# The hand-written Hexagon kernel headers (HMX block/gemm/qconv, the ResNet runner, MSDA, the RPN family's
+# NMS/proposal-decode/TopK, RoiAlign fp32+u8, the FPN layout, and the HMX runtime) live in the onnxsim/tinygrad
+# fork's test/external/dsp/hand/, where they are the oracle that tinygrad's generated kernels are checked
+# against. scripts/android/ links them in rather than keeping a second copy -- see
+# scripts/android/fetch_hand_kernels.sh.
+#
+# This is done here, at collection time, rather than in a workflow step, because the tests that compile these
+# drivers (test_msda_hvx.py, test_hexagon_tinygrad.py) also run in the wheel jobs, which know nothing about
+# the hexagon setup. Doing it only in hexagon-tinygrad.yml left them failing with, for example,
+# "msda_io.h:15:10: fatal error: 'msda_shape.h' file not found".
+_ANDROID = _ROOT / "scripts" / "android"
+if not (_ANDROID / "msda_hvx" / "msda_shape.h").exists() and _FETCH.exists():
+    try:
+        subprocess.run([str(_FETCH)], check=True, capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(
+            f"warning: could not link the hand kernels ({e}); tests that #include one will fail to compile",
+            file=sys.stderr,
+        )
 
 # Filename patterns for the "axera" marker: Axera Pulsar2/AXCL NPU backend
 # tests. test_voyager_sdk_patterns.py doesn't follow the test_axera_*/

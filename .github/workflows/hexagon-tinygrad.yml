@@ -82,10 +82,8 @@ jobs:
 
       # The hand-written Hexagon kernel headers (RoiAlign, NMS, TopK, proposal decode, the HMX block /
       # gemm / qconv family, MSDA, the FPN layout) live in that fork's test/external/dsp/hand/ and are
-      # linked into scripts/android/ from here -- see scripts/android/fetch_hand_kernels.sh. Without
-      # this, every host_check / qemu test that #includes one fails to compile.
-      - name: Link the hand kernels from the fork
-        run: TINYGRAD_PATH="$TINYGRAD_PATH" TINYGRAD_SHA="$TINYGRAD_SHA" scripts/android/fetch_hand_kernels.sh
+      # linked into scripts/android/ by scripts/android/fetch_hand_kernels.sh, which tests/conftest.py
+      # calls at collection time -- these tests also run in the wheel jobs, which do not have the fork.
 
       # restore + save are separate steps so the ~1.1 GB download is kept even if the tests fail; a plain
       # actions/cache only saves when the whole job succeeds. Same key as the old TVM job's cache.
