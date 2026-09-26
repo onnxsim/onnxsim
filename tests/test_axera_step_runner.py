@@ -468,7 +468,7 @@ def test_onnx_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     x = rng.uniform(-0.02, 0.02, a_shape).astype(np.float32)
     z = rng.uniform(-0.02, 0.02, b_shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_matmul_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -551,7 +551,7 @@ def test_training_step_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path)
     x = rng.uniform(-0.02, 0.02, a_shape).astype(np.float32)
     z = rng.uniform(-0.02, 0.02, b_shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"training_matmul_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -595,10 +595,10 @@ def test_onnx_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     schedule = tmp_path / "onnx_add_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
-    x = rng.uniform(0.0, 1.0, shape).astype(np.float32)
-    z = rng.uniform(0.0, 1.0, shape).astype(np.float32)
+    x = rng.uniform(0.0, 0.3, shape).astype(np.float32)
+    z = rng.uniform(0.0, 0.3, shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_add_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -640,10 +640,13 @@ def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
     schedule = tmp_path / f"onnx_{op.lower()}_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
-    x = rng.uniform(0.1, 1.0, shape).astype(np.float32)
-    z = rng.uniform(0.2, 1.0, shape).astype(np.float32)
+    x_bounds, z_bounds = (
+        ((0.2, 0.3), (0.1, 0.2)) if op == "Sub" else ((0.1, 0.3), (0.1, 0.3))
+    )
+    x = rng.uniform(*x_bounds, shape).astype(np.float32)
+    z = rng.uniform(*z_bounds, shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_{op.lower()}_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -688,10 +691,10 @@ def test_onnx_broadcast_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     schedule = tmp_path / "onnx_broadcast_mul_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
-    x = rng.uniform(0.1, 1.0, source_shape).astype(np.float32)
-    z = rng.uniform(0.2, 1.0, broadcast_shape).astype(np.float32)
+    x = rng.uniform(0.1, 0.3, source_shape).astype(np.float32)
+    z = rng.uniform(0.1, 0.3, broadcast_shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_broadcast_mul_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, np.broadcast_to(z, source_shape)])
