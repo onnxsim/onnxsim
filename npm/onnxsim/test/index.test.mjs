@@ -89,9 +89,11 @@ import {
   quantizeWeightOnlyInt16,
   quantizeWeightOnlyMatMulNbits,
   quantizeWeightOnlyMxfp4,
+  setModelExecutorRunner,
   simplify,
   versions,
 } from "../index.mjs";
+import { makeOrtRunner } from "../ort_executor.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "..", "..", "scripts", "convertmodel", "test", "model.onnx");
@@ -157,6 +159,24 @@ try {
     assert.ok(v.onnxsim.length > 0);
     assert.equal(typeof v.onnx_optimizer, "string");
     assert.ok(v.onnx_optimizer.length > 0);
+  });
+
+  await check("custom executor hook runs constant folding through WASM", async () => {
+    const ort = await import("onnxruntime-web");
+    const dist = join(HERE, "..", "node_modules", "onnxruntime-web", "dist") + "/";
+    ort.env.wasm.wasmPaths = dist;
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.proxy = false;
+    const ortRunner = makeOrtRunner(ort);
+    let calls = 0;
+    await setModelExecutorRunner(async (...args) => {
+      calls += 1;
+      return ortRunner(...args);
+    });
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const { model } = await simplify(input, { constantFolding: true });
+    assert.ok(model.length > 0);
+    assert.ok(calls > 0, "constant folding did not call the custom executor");
   });
 
   // Data-free C++ passes: the fixture (MatMul+Add+Relu, X:[N,4], W:[4,3])
