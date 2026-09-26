@@ -27,6 +27,19 @@ payload-only format as raw UInt8 messages, so DORA does not need to understand
 the ONNX tensor schema. The adapter forwards to the existing TCP worker and
 can therefore be used with the reference or AXCL worker.
 
+## External compiler and artifact caching
+
+The native executor keeps the original model-per-run path as the default. With
+`RemoteExecutorOptions.compile_model=true`, each distinct serialized fold-group
+is compiled once and subsequent runs use the returned artifact ID. The
+compiler response may include an opaque manifest and inline artifact bytes.
+
+Caching is split deliberately: onnxsim owns a short-lived in-process cache to
+avoid compiling the same subgraph repeatedly during one simplification; the
+compiler/runner owns persistent artifact caching and compatibility validation.
+The latter is the only component that knows whether an artifact remains valid
+for a particular compiler, SDK, driver, device, and I/O ABI.
+
 ```python
 import numpy as np
 import onnxsim

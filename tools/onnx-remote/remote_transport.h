@@ -34,6 +34,11 @@ struct Request {
   // Optional serialized ONNX ModelProto. A model handle can be used instead
   // by leaving this empty and putting the handle in `op`.
   std::vector<uint8_t> model;
+  // External compiler/runner contract. `artifact_id` may refer to an artifact
+  // already cached by the worker; `artifact` is optional inline bytes for a
+  // stateless runner or first-use upload.
+  std::string artifact_id;
+  std::vector<uint8_t> artifact;
   std::vector<Tensor> inputs;
   ProfilingLevel profiling = ProfilingLevel::Off;
 };
@@ -43,6 +48,11 @@ struct Response {
   std::string error;
   std::vector<Tensor> outputs;
   std::vector<ProfileEvent> profile;
+  // A successful compile response returns these fields. The manifest is an
+  // opaque UTF-8 document (normally JSON/YAML) owned by the compiler.
+  std::string artifact_id;
+  std::vector<uint8_t> artifact;
+  std::string manifest;
 };
 
 // The implementation uses one request per connected socket. These limits are
@@ -52,10 +62,13 @@ constexpr uint32_t kMaxOpBytes = 128;
 constexpr uint32_t kMaxProfileNameBytes = 128;
 constexpr uint32_t kMaxProfileDetailBytes = 512;
 constexpr uint32_t kMaxProfileEvents = 256;
+constexpr uint32_t kMaxArtifactIdBytes = 256;
+constexpr uint32_t kMaxManifestBytes = 64 * 1024;
 constexpr uint32_t kMaxTensors = 32;
 constexpr uint32_t kMaxRank = 8;
 constexpr uint64_t kMaxTensorBytes = 256ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxMessageBytes = 512ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxArtifactBytes = kMaxMessageBytes;
 
 int listen_tcp(uint16_t port, int backlog = 16);
 int accept_tcp(int listener);

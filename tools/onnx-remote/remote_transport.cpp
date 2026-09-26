@@ -13,7 +13,7 @@ namespace onnx_remote {
 namespace {
 
 constexpr uint32_t kMagic = 0x4f525452u;  // ORTR
-constexpr uint16_t kVersion = 2;
+constexpr uint16_t kVersion = 3;
 constexpr uint16_t kRun = 1;
 constexpr uint16_t kOk = 2;
 constexpr uint16_t kError = 3;
@@ -177,8 +177,16 @@ bool encode_request_bytes(const Request& request, std::vector<char>& b,
   }
   put_u32(b, static_cast<uint32_t>(request.op.size()));
   b.insert(b.end(), request.op.begin(), request.op.end());
+  if (request.artifact_id.size() > kMaxArtifactIdBytes ||
+      request.artifact.size() > kMaxArtifactBytes) {
+    error = "artifact request too large";
+    return false;
+  }
+  put_string(b, request.artifact_id);
   put_u64(b, request.model.size());
   b.insert(b.end(), request.model.begin(), request.model.end());
+  put_u64(b, request.artifact.size());
+  b.insert(b.end(), request.artifact.begin(), request.artifact.end());
   put_u32(b, static_cast<uint32_t>(request.profiling));
   if (!encode_tensors(request.inputs, b, error)) return false;
   return b.size() <= kMaxMessageBytes;
@@ -194,6 +202,10 @@ bool decode_request_bytes(const std::vector<char>& b, Request& request,
   }
   request.op.assign(b.data() + at, op_len);
   at += op_len;
+  if (!take_string(b, at, kMaxArtifactIdBytes, request.artifact_id)) {
+    error = "invalid artifact id";
+    return false;
+  }
   uint64_t model_len;
   if (!take_u64(b, at, model_len) || model_len > kMaxMessageBytes ||
       at + model_len > b.size()) {
@@ -206,6 +218,18 @@ bool decode_request_bytes(const std::vector<char>& b, Request& request,
                 static_cast<size_t>(model_len));
   }
   at += static_cast<size_t>(model_len);
+  uint64_t artifact_len;
+  if (!take_u64(b, at, artifact_len) || artifact_len > kMaxArtifactBytes ||
+      at + artifact_len > b.size()) {
+    error = "invalid artifact payload";
+    return false;
+  }
+  request.artifact.resize(static_cast<size_t>(artifact_len));
+  if (artifact_len) {
+    std::memcpy(request.artifact.data(), b.data() + at,
+                static_cast<size_t>(artifact_len));
+  }
+  at += static_cast<size_t>(artifact_len);
   uint32_t profiling;
   if (!take_u32(b, at, profiling) ||
       profiling > static_cast<uint32_t>(ProfilingLevel::Detailed)) {
@@ -230,8 +254,21 @@ bool encode_response_bytes(const Response& response, std::vector<char>& b,
     b.insert(b.end(), response.error.begin(), response.error.end());
     return true;
   }
-  return encode_tensors(response.outputs, b, error) &&
-         encode_profile(response.profile, b, error);
+  if (response.artifact_id.size() > kMaxArtifactIdBytes ||
+      response.artifact.size() > kMaxArtifactBytes ||
+      response.manifest.size() > kMaxManifestBytes) {
+    error = "compile response metadata too large";
+    return false;
+  }
+  if (!encode_tensors(response.outputs, b, error) ||
+      !encode_profile(response.profile, b, error)) {
+    return false;
+  }
+  put_string(b, response.artifact_id);
+  put_string(b, response.manifest);
+  put_u64(b, response.artifact.size());
+  b.insert(b.end(), response.artifact.begin(), response.artifact.end());
+  return b.size() <= kMaxMessageBytes;
 }
 bool decode_response_bytes(const std::vector<char>& b, bool ok,
                            Response& response, std::string& error) {
@@ -249,8 +286,26 @@ bool decode_response_bytes(const std::vector<char>& b, bool ok,
   }
   response.ok = true;
   response.error.clear();
-  return decode_tensors(b, at, response.outputs, error) &&
-         decode_profile(b, at, response.profile, error) && at == b.size();
+  if (!decode_tensors(b, at, response.outputs, error) ||
+      !decode_profile(b, at, response.profile, error) ||
+      !take_string(b, at, kMaxArtifactIdBytes, response.artifact_id) ||
+      !take_string(b, at, kMaxManifestBytes, response.manifest)) {
+    if (error.empty()) error = "invalid compile response metadata";
+    return false;
+  }
+  uint64_t artifact_len;
+  if (!take_u64(b, at, artifact_len) || artifact_len > kMaxArtifactBytes ||
+      at + artifact_len > b.size()) {
+    error = "invalid compile response artifact";
+    return false;
+  }
+  response.artifact.resize(static_cast<size_t>(artifact_len));
+  if (artifact_len) {
+    std::memcpy(response.artifact.data(), b.data() + at,
+                static_cast<size_t>(artifact_len));
+  }
+  at += static_cast<size_t>(artifact_len);
+  return at == b.size();
 }
 bool send_message(int fd, uint16_t kind, const std::vector<char>& payload, std::string& error) {
   if (payload.size() > kMaxMessageBytes) { error = "message too large"; return false; }

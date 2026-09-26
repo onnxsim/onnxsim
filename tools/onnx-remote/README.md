@@ -96,6 +96,34 @@ send each constant-folding submodel to a worker without Python. The worker may
 run that model with native ONNX Runtime, an accelerator compiler, or translate
 it to a device-specific model handle.
 
+## External compiler contract
+
+The simple path remains the default:
+
+```text
+RUN(op=model-runner, model, tensors) -> outputs
+```
+
+An external compiler can be selected by setting `compile_model=true` in
+`RemoteExecutorOptions`. The executor then performs:
+
+```text
+COMPILE(model) -> artifact_id, artifact_bytes, manifest
+RUN_COMPILED(artifact_id, optional artifact_bytes, tensors) -> outputs
+```
+
+The manifest is opaque to the transport and should describe the compiler,
+target device, runtime/driver requirements, I/O ABI, shape constraints, and
+legalization profile. The existing transport only bounds and carries it.
+
+The native executor caches compiled artifacts in memory, keyed by the exact
+serialized fold-group model. This prevents repeated compilation within one
+onnxsim process. The compiler/runner should own the persistent device cache:
+it can validate the artifact ID against compiler version, SDK, driver, chip,
+and ABI, then reuse or reject it. `send_compiled_artifact=true` is the safe
+stateless default; a later load/attach handshake can send only `artifact_id`
+once the worker confirms its cache.
+
 ## AXCL worker
 
 On a machine with the AXCL SDK, configure with `-DONNX_REMOTE_AXCL=ON`.

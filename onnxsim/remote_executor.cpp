@@ -3,7 +3,9 @@
 #ifdef ONNXSIM_BUILTIN_REMOTE_EXECUTOR
 
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #include "profiler.h"
@@ -69,17 +71,20 @@ class RemoteModelExecutor final : public ModelExecutor {
   std::vector<DLManagedTensorPtr> Run(
       const onnx::ModelProto& model,
       const std::vector<const DLManagedTensor*>& inputs) const override {
-    onnx_remote::Request request;
-    request.op = options_.operation;
-    request.profiling = options_.profiling;
-    auto& profiler = onnxsim::Profiler::Instance();
-    const bool collect_profile =
-        profiler.enabled() &&
-        options_.profiling != onnx_remote::ProfilingLevel::Off;
-    const uint64_t profile_anchor =
-        collect_profile ? profiler.ElapsedMicros() : 0;
     const std::string serialized = model.SerializeAsString();
-    request.model.assign(serialized.begin(), serialized.end());
+    onnx_remote::Request request;
+    request.profiling = options_.profiling;
+    if (options_.compile_model) {
+      const auto artifact = GetOrCompile(serialized);
+      request.op = options_.compiled_operation;
+      request.artifact_id = artifact->id;
+      if (options_.send_compiled_artifact) {
+        request.artifact = artifact->bytes;
+      }
+    } else {
+      request.op = options_.operation;
+      request.model.assign(serialized.begin(), serialized.end());
+    }
     request.inputs.reserve(inputs.size());
     for (const DLManagedTensor* input : inputs) {
       const DLTensor& tensor = input->dl_tensor;
@@ -101,6 +106,32 @@ class RemoteModelExecutor final : public ModelExecutor {
       request.inputs.emplace_back(std::move(wire));
     }
 
+    const onnx_remote::Response response = Exchange(request);
+    std::vector<DLManagedTensorPtr> outputs;
+    outputs.reserve(response.outputs.size());
+    for (auto& output : response.outputs) {
+      auto owner = std::make_unique<OutputOwner>();
+      owner->data = std::move(output.data);
+      owner->shape = std::move(output.shape);
+      outputs.emplace_back(WrapOutput(owner.release()));
+    }
+    return outputs;
+  }
+
+ private:
+  struct CompiledArtifact {
+    std::string id;
+    std::vector<uint8_t> bytes;
+    std::string manifest;
+  };
+
+  onnx_remote::Response Exchange(const onnx_remote::Request& request) const {
+    auto& profiler = onnxsim::Profiler::Instance();
+    const bool collect_profile =
+        profiler.enabled() &&
+        options_.profiling != onnx_remote::ProfilingLevel::Off;
+    const uint64_t profile_anchor =
+        collect_profile ? profiler.ElapsedMicros() : 0;
     const int fd = onnx_remote::connect_tcp(options_.host, options_.port);
     if (fd < 0) throw std::runtime_error("remote executor: connection failed");
     std::string error;
@@ -129,20 +160,48 @@ class RemoteModelExecutor final : public ModelExecutor {
       throw std::runtime_error("remote executor: " +
                                (error.empty() ? response.error : error));
     }
-
-    std::vector<DLManagedTensorPtr> outputs;
-    outputs.reserve(response.outputs.size());
-    for (auto& output : response.outputs) {
-      auto owner = std::make_unique<OutputOwner>();
-      owner->data = std::move(output.data);
-      owner->shape = std::move(output.shape);
-      outputs.emplace_back(WrapOutput(owner.release()));
-    }
-    return outputs;
+    return response;
   }
 
- private:
+  std::shared_ptr<const CompiledArtifact> GetOrCompile(
+      const std::string& serialized) const {
+    if (options_.cache_compiled_models) {
+      std::lock_guard<std::mutex> lock(cache_mu_);
+      const auto it = compiled_cache_.find(serialized);
+      if (it != compiled_cache_.end()) return it->second;
+    }
+
+    onnx_remote::Request request;
+    request.op = options_.compile_operation;
+    request.model.assign(serialized.begin(), serialized.end());
+    request.profiling = options_.profiling;
+    const onnx_remote::Response response = Exchange(request);
+    if (response.artifact_id.empty() && response.artifact.empty()) {
+      throw std::runtime_error(
+          "remote compiler returned neither artifact_id nor artifact bytes");
+    }
+    auto artifact = std::make_shared<CompiledArtifact>();
+    artifact->id = response.artifact_id;
+    artifact->bytes = response.artifact;
+    artifact->manifest = response.manifest;
+    if (artifact->id.empty()) {
+      // An inline-only compiler can still be used by a stateless runner. This
+      // ID is process-local and is not a device cache key.
+      artifact->id =
+          "inline:" + std::to_string(std::hash<std::string>{}(serialized));
+    }
+    if (options_.cache_compiled_models) {
+      std::lock_guard<std::mutex> lock(cache_mu_);
+      compiled_cache_[serialized] = artifact;
+    }
+    return artifact;
+  }
+
   RemoteExecutorOptions options_;
+  mutable std::mutex cache_mu_;
+  mutable std::unordered_map<std::string,
+                             std::shared_ptr<const CompiledArtifact>>
+      compiled_cache_;
 };
 
 }  // namespace
