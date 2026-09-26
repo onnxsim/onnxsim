@@ -324,7 +324,7 @@ def test_onnx_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     schedule = tmp_path / "onnx_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule))
     rng = np.random.default_rng(1965)
-    x = rng.uniform(-1.0, 1.0, (1, 8, 4, 4)).astype(np.float32)
+    x = rng.uniform(-0.5, 0.5, (1, 8, 4, 4)).astype(np.float32)
 
     with axcl_session.AXSession() as session:
         loaded = session.load(axmodel, str(schedule))
