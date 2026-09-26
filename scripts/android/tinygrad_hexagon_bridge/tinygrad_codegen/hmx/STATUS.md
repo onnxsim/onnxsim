@@ -30,19 +30,10 @@ Full rebuild + phone run each:
 
 Both on by default, so neither is available as a win. They size what a new mechanism has to beat.
 
-**The requant's cost is still not measured**, and two attempts to measure it both failed:
-
-- `HMX_RQ=0` drops the epilogue, which makes the accumulator unreachable from the store, so
-  `_hmx_bail(9)` fires and the kernel falls back to scalar: 526,475 us (24x slower). That says
-  nothing about the requant.
-- `HMX_RQ_PROBE` (added to the fork) keeps the :cm path and drops only the requantize rows, but
-  on the phone it came out **slower** than the baseline - 22,508 us against 22,208 - and on
-  hexagon-sim it does not finish in 40 minutes. Removing rows reshapes the surrounding codegen
-  (the addq folding and the store chain), and that costs more than the requant saves, so the
-  delta is not the requant's cost. The flag is kept with a comment saying not to read a number
-  off it.
-
-To price it properly, keep the epilogue and replace only its body. Not written.
+**The requantization is 52 us - 0.2% of the graph** (HMX_RQ_STUB: the epilogue kept, only its
+arithmetic replaced; 22,328.6 us real against 22,277.0 stubbed, both arms from one tree, on the
+phone). So the QC_FAST accuracy trade does not need making: it buys 0.2%. Details, and the two
+wrong measurements that preceded it, in REQUANT.md.
 
 ## Measurement traps, both mine
 
@@ -80,8 +71,11 @@ far outside the expected class, so the emulation is wrong. It needs a real measu
 
 ## Open, in order of value
 
-1. Decide the `QC_FAST` accuracy trade - which first needs the requant's true cost, which in turn
-   needs a probe that replaces the epilogue body rather than removing it.
+1. ~~Decide the `QC_FAST` accuracy trade~~ - **closed, no trade needed.** The requantization is
+   **52 us, 0.2% of the graph** (HMX_RQ_STUB, both arms measured on the phone), so removing that
+   arithmetic with a host table buys 0.2% for ~5-8% of outputs landing 1 off. The
+   0.045-of-float64 contract stands. See REQUANT.md, including the two wrong measurements that came
+   first.
 2. The layer4 3x3 convs are 34.7% of phone time, and LAYER4_CONVS.md shows they are *not*
    obviously broken: 1.00x wasted MACs, better than the stem per MAC, weight path already on the
    quad optimisation. `HMX_I8_QUAD_A=0` on the phone says the activation pack is worth only

@@ -67,11 +67,34 @@ ORT away. I am not making that call unilaterally.
   (`fp16(512 m)`, `b + lrint(zy / m)`) is per-layer constant data that `qc_pack_params` builds
   on the host ... It belongs with the ONNX loader").
 
-## If this is taken forward
+## Measured: 52 us, 0.2% of the graph - so this trade is not worth taking
 
-1. Get the SDK, build, and **measure QC_FAST's error on the real ResNet-18 output** - the same
-   25088-output comparison the whole graph is checked with. Do not emulate it in numpy.
-2. Report it as "N% of outputs 1 off vs ORT" alongside QNN's 35.6%-off-by-one-or-more figure
-   for the same graph, so the two are comparable.
-3. Keep `QDQ_STEM_KPACK`-style flags: the exact path is the current behaviour and the default
-   until the accuracy trade is accepted explicitly.
+`HMX_RQ_STUB` (added to the tinygrad fork) keeps the whole epilogue - the bias add, the
+`|acc| > 2^24` flag, the two packs, the four stores - and replaces only the ORT-exact arithmetic
+(the per-lane normalization, the 24x24 product, the tie window) with a saturating pack. Both arms
+built from one tree, measured on the phone:
+
+| build | us |
+|---|---:|
+| real requantization | 22,328.6 |
+| arithmetic stubbed out | 22,277.0 |
+| **the requantization costs** | **52 us = 0.2%** |
+
+**`QC_FAST` is therefore not worth its accuracy cost on this graph.** It removes exactly the
+arithmetic that costs 0.2%. What is left in the epilogue - the stores and the flag reduction - is
+what the stub keeps, and that is where the time is. The 0.045-of-float64 contract can stand, and
+no decision is needed.
+
+That contradicts the HMX README's own bisection of the 3x3 family, which puts the requant at ~48%
+of it. Reconciling the two is the next thing to do here; until then the direct A/B on the device
+is the number to trust, for the same reason the per-kernel shares turned out to be wrong by up to
+1.5x (PHONE_PROFILE.md).
+
+### Two measurements of this that were wrong first
+
+- `HMX_RQ=0` drops the epilogue, the rewrite bails, and the kernel falls back to scalar: 24x
+  slower. It measures nothing about the requant.
+- An intermediate hand-edit reported **2,178 us (9.8%)** and looked decisive. It was measured
+  against a build from a *different* tinygrad tree than the one being edited - the change never
+  reached the compiled kernel. A large, clean, plausible number from a build that did not contain
+  the change. `HMX_RQ_STUB` exists so both arms come from one place.
