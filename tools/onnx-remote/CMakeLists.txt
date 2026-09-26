@@ -32,6 +32,12 @@ target_link_libraries(onnx-remote-client PRIVATE onnx_remote_transport)
 add_executable(onnx-remote-compiler remote_compiler.cpp)
 target_link_libraries(onnx-remote-compiler PRIVATE onnx_remote_transport)
 
+add_executable(onnx-remote-mock-runner remote_mock_runner.cpp)
+target_link_libraries(onnx-remote-mock-runner PRIVATE onnx_remote_transport)
+
+add_executable(onnx-remote-attach-test remote_attach_test.cpp)
+target_link_libraries(onnx-remote-attach-test PRIVATE onnx_remote_transport)
+
 if (BUILD_TESTING)
   add_executable(onnx-remote-transport-test remote_transport_test.cpp)
   target_link_libraries(onnx-remote-transport-test PRIVATE onnx_remote_transport)

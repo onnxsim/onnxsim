@@ -92,6 +92,11 @@ supported subgraph and send it as an operation/model handle over this
 transport.  The reference worker deliberately does not pretend to be that EP
 yet.
 
+`onnx-remote-mock-runner` and `onnx-remote-attach-test` provide a vendor-free
+test of the compiled-artifact handshake. The mock stores opaque artifact bytes
+on `load_compiled`, accepts ID-only `run_compiled`, and returns identity output
+with a profile event; it is for CI protocol coverage, not model execution.
+
 The transport also carries an optional serialized `ModelProto`. This is the
 native `onnxsim::ModelExecutor` integration point: a host-side executor can
 send each constant-folding submodel to a worker without Python. The worker may

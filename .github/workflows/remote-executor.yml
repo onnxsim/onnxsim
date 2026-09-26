@@ -44,6 +44,13 @@ jobs:
           trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
           sleep 0.2
           build/onnx-remote/onnx-remote-client --self-test
+      - name: Compiled artifact attach smoke test
+        run: |
+          build/onnx-remote/onnx-remote-mock-runner --port 39510 >"${RUNNER_TEMP}/mock-runner.log" 2>&1 &
+          mock_pid=$!
+          trap 'kill "$mock_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-attach-test 127.0.0.1 39510
       - name: Compiler service cache smoke test
         run: |
           python3 -c "from pathlib import Path; Path('${RUNNER_TEMP}/model.onnx').write_bytes(b'smoke-model')"
