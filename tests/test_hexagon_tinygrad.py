@@ -136,6 +136,17 @@ needs_host_cc = pytest.mark.skipif(
     clang() is None, reason="needs an LLVM clang with Hexagon + ld.lld"
 )
 
+# The hand-written kernel headers (RoiAlign, NMS, TopK, proposal decode, the HMX family, MSDA, the FPN
+# layout) live in the onnxsim/tinygrad fork and are linked into scripts/android/ by
+# scripts/android/fetch_hand_kernels.sh, which tests/conftest.py runs at collection time. That script is
+# not present in a built wheel, so under cibuildwheel -- which runs `pytest {project}/tests` against the
+# installed tree -- they cannot be materialised. Skip rather than fail: a missing header is a packaging
+# artefact, not a kernel regression. The hexagon job itself has the fork and does not hit this.
+needs_hand_kernels = pytest.mark.skipif(
+    not (BRIDGE / "roialign_fast" / "roialign_kernel.h").exists(),
+    reason="the hand Hexagon kernel headers are not linked in (run scripts/android/fetch_hand_kernels.sh)",
+)
+
 
 def hexagon_build(src: Path, out: Path, *flags: str, includes=(), extra=()) -> Path:
     cmd = [
@@ -399,6 +410,7 @@ def test_codegen_qlinear_add_exact(flags):
     hexagon_tools() is None,
     reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
 )
+@needs_hand_kernels
 def test_hand_hmx_kernels_are_tinygrad_oracles():
     """The hand-written HMX kernels (hmx_gemm fp16 GEMM, the QDQ-exact 1x1 / 3x3 convs) now live in the tinygrad fork as test
     oracles (test/external/dsp/hand): each is run next to tinygrad's lowering of the same op on hexagon-sim, bit-exact."""
@@ -484,6 +496,7 @@ def nms_data(tmp_path_factory):
     return out
 
 
+@needs_hand_kernels
 @needs_host_cc
 def test_nms_host_check(nms_data, tmp_path):
     exe = host_build(
@@ -493,6 +506,7 @@ def test_nms_host_check(nms_data, tmp_path):
     assert "PASS" in out
 
 
+@needs_hand_kernels
 @needs_qemu
 def test_nms_qemu(nms_data, tmp_path):
     exe = hexagon_build(
@@ -505,6 +519,7 @@ def test_nms_qemu(nms_data, tmp_path):
         run_qemu(exe, f"{nms_data}/{group}")
 
 
+@needs_hand_kernels
 @needs_host_cc
 def test_topk_host_stress(tmp_path):
     exe = host_build([BRIDGE / "topk" / "topk_host_check.c"], tmp_path / "topkhost")
@@ -520,6 +535,7 @@ def _topk_case(rng, n: int, k: int, distinct: int):
     return x, x[order], order.astype(np.int64)
 
 
+@needs_hand_kernels
 @needs_qemu
 def test_topk_qemu(tmp_path):
     exe = hexagon_build(
@@ -622,6 +638,7 @@ def roialign_data(tmp_path_factory):
     return out, calls
 
 
+@needs_hand_kernels
 @needs_host_cc
 def test_roialign_host_check(roialign_data, tmp_path):
     data, _ = roialign_data
@@ -632,6 +649,7 @@ def test_roialign_host_check(roialign_data, tmp_path):
     assert "PASS" in out
 
 
+@needs_hand_kernels
 @needs_qemu
 def test_roialign_qemu(roialign_data, tmp_path):
     data, calls = roialign_data
@@ -664,6 +682,7 @@ def proposal_decode_data(tmp_path_factory):
     return out, log
 
 
+@needs_hand_kernels
 def test_proposal_decode_selfcheck(proposal_decode_data):
     """No captured model in CI: both delta sources, the reference (division) path and both fast paths, and the
     off-grid fallback must agree bit for bit on synthetic grid anchors and random uint8 deltas."""
@@ -671,6 +690,7 @@ def test_proposal_decode_selfcheck(proposal_decode_data):
     assert "PASS" in log
 
 
+@needs_hand_kernels
 @needs_qemu
 def test_proposal_decode_qemu(proposal_decode_data, tmp_path):
     """The hexagon build under qemu vs the host reference path's output, per level."""
@@ -690,6 +710,7 @@ def test_proposal_decode_qemu(proposal_decode_data, tmp_path):
         run_qemu(exe, *files, a, k, h, w)
 
 
+@needs_hand_kernels
 @needs_host_cc
 def test_rpn_fused_builds(tmp_path):
     """Build-only: rpn_fused composes the TopK, proposal-decode and NMS kernels, each checked above. Running its

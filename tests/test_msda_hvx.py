@@ -28,6 +28,18 @@ torch = pytest.importorskip("torch")
 ANDROID = Path(__file__).resolve().parents[1] / "scripts" / "android"
 CORE = ANDROID / "msda_hvx"
 BEV = ANDROID / "vision_models" / "bevformer_tiny"
+
+# The hand-written kernel headers live in the onnxsim/tinygrad fork and are linked into scripts/android/
+# by scripts/android/fetch_hand_kernels.sh, which tests/conftest.py runs at collection time. That script
+# is not present in a built wheel (scripts/ is not shipped), so under cibuildwheel -- which runs
+# `pytest {project}/tests` against the installed tree -- the header cannot be materialised. Skip rather
+# than fail there: the driver would not compile, and a missing header is a packaging artefact, not a
+# kernel regression.
+needs_hand_kernels = pytest.mark.skipif(
+    not (CORE / "msda_shape.h").exists(),
+    reason="the hand MSDA kernel headers are not linked in (run scripts/android/fetch_hand_kernels.sh)",
+)
+
 for _p in (ANDROID, BEV, BEV / "msda_hvx", CORE):
     sys.path.insert(0, str(_p))
 
@@ -123,6 +135,7 @@ def _plain_env():
     }
 
 
+@needs_hand_kernels
 def test_scalar_body_on_host(tmp_path):
     cc = shutil.which(os.environ.get("CC", "cc"))
     if cc is None:
@@ -141,6 +154,7 @@ def test_scalar_body_on_host(tmp_path):
     )
 
 
+@needs_hand_kernels
 def test_hvx_body_on_hexagon_sim(tmp_path):
     import hexagon_sim_harness as harness
 
