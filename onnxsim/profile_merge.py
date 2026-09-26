@@ -33,7 +33,9 @@ def summarize_remote_events(profile_trace: dict) -> dict:
         "execute": {"count": 0, "duration_us": 0},
         "other": {"count": 0, "duration_us": 0},
     }
-    events = profile_trace.get("traceEvents", []) if isinstance(profile_trace, dict) else []
+    events = (
+        profile_trace.get("traceEvents", []) if isinstance(profile_trace, dict) else []
+    )
     for event in events:
         if not isinstance(event, dict) or event.get("ph") != "X":
             continue

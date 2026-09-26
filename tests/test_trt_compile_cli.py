@@ -49,7 +49,9 @@ def test_compile_writes_engine_and_profile_manifest(monkeypatch, tmp_path):
         )
     )
     monkeypatch.setitem(sys.modules, "trt_harness", fake_harness)
-    monkeypatch.setitem(sys.modules, "tensorrt", types.SimpleNamespace(__version__="10.mock"))
+    monkeypatch.setitem(
+        sys.modules, "tensorrt", types.SimpleNamespace(__version__="10.mock")
+    )
 
     adapter.compile_tensorrt(model, output, manifest, "trt-sm87", True, True, 256)
 
@@ -80,7 +82,9 @@ def test_large_layer_profile_is_bounded(monkeypatch, tmp_path):
             )
         ),
     )
-    monkeypatch.setitem(sys.modules, "tensorrt", types.SimpleNamespace(__version__="mock"))
+    monkeypatch.setitem(
+        sys.modules, "tensorrt", types.SimpleNamespace(__version__="mock")
+    )
 
     adapter.compile_tensorrt(model, output, manifest, "trt", False, False, 1)
 

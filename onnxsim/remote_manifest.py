@@ -66,12 +66,18 @@ def preflight_model(
     data = load_manifest(manifest)
     errors: list[str] = []
     target_data = data.get("target") if isinstance(data.get("target"), Mapping) else {}
-    artifact_data = data.get("artifact") if isinstance(data.get("artifact"), Mapping) else {}
-    compiler_data = data.get("compiler") if isinstance(data.get("compiler"), Mapping) else {}
+    artifact_data = (
+        data.get("artifact") if isinstance(data.get("artifact"), Mapping) else {}
+    )
+    compiler_data = (
+        data.get("compiler") if isinstance(data.get("compiler"), Mapping) else {}
+    )
     actual_target = target_data.get("device") or target_data.get("name")
     actual_format = artifact_data.get("format")
     if target and actual_target and target != actual_target:
-        errors.append(f"target mismatch: required {target!r}, manifest has {actual_target!r}")
+        errors.append(
+            f"target mismatch: required {target!r}, manifest has {actual_target!r}"
+        )
     if artifact_format and actual_format and artifact_format != actual_format:
         errors.append(
             f"artifact format mismatch: required {artifact_format!r}, manifest has {actual_format!r}"
@@ -85,7 +91,9 @@ def preflight_model(
     capabilities = data.get("capabilities")
     supported = capabilities.get("ops") if isinstance(capabilities, Mapping) else None
     supported_set = {str(op) for op in supported} if supported else set()
-    unsupported = sorted({op for op in _model_ops(model) if supported_set and op not in supported_set})
+    unsupported = sorted(
+        {op for op in _model_ops(model) if supported_set and op not in supported_set}
+    )
     if unsupported:
         errors.append("unsupported operators: " + ", ".join(unsupported))
     return RemotePreflightReport(
