@@ -796,11 +796,9 @@ void Profiler::Finish() {
   // remote device timeline is visible beside the host/RPC span.
   for (const auto& ev : impl_->external_events) {
     comma();
-    json << "{\"name\":\"" << JsonEscape(ev.name)
-         << "\",\"cat\":\"" << JsonEscape(ev.category)
-         << "\",\"ph\":\"X\",\"ts\":" << ev.ts_us
-         << ",\"dur\":" << ev.dur_us
-         << ",\"pid\":1,\"tid\":200000000,\"args\":"
+    json << "{\"name\":\"" << JsonEscape(ev.name) << "\",\"cat\":\""
+         << JsonEscape(ev.category) << "\",\"ph\":\"X\",\"ts\":" << ev.ts_us
+         << ",\"dur\":" << ev.dur_us << ",\"pid\":1,\"tid\":200000000,\"args\":"
          << (ev.args_json.empty() ? "{}" : ev.args_json) << "}";
   }
 

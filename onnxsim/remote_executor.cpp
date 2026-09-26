@@ -21,12 +21,24 @@ std::string JsonEscape(const std::string& value) {
   escaped.reserve(value.size() + 2);
   for (char c : value) {
     switch (c) {
-      case '"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      case '\n': escaped += "\\n"; break;
-      case '\r': escaped += "\\r"; break;
-      case '\t': escaped += "\\t"; break;
-      default: escaped += c; break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped += c;
+        break;
     }
   }
   return escaped;
@@ -61,23 +73,30 @@ class RemoteModelExecutor final : public ModelExecutor {
     request.op = options_.operation;
     request.profiling = options_.profiling;
     auto& profiler = onnxsim::Profiler::Instance();
-    const bool collect_profile = profiler.enabled() &&
-                                 options_.profiling != onnx_remote::ProfilingLevel::Off;
-    const uint64_t profile_anchor = collect_profile ? profiler.ElapsedMicros() : 0;
+    const bool collect_profile =
+        profiler.enabled() &&
+        options_.profiling != onnx_remote::ProfilingLevel::Off;
+    const uint64_t profile_anchor =
+        collect_profile ? profiler.ElapsedMicros() : 0;
     const std::string serialized = model.SerializeAsString();
     request.model.assign(serialized.begin(), serialized.end());
     request.inputs.reserve(inputs.size());
     for (const DLManagedTensor* input : inputs) {
       const DLTensor& tensor = input->dl_tensor;
-      if (tensor.device.device_type != kDLCPU || tensor.dtype.code != kDLFloat ||
-          tensor.dtype.bits != 32 || tensor.dtype.lanes != 1 || tensor.strides != nullptr) {
-        throw std::runtime_error("remote executor currently supports contiguous CPU float32 inputs only");
+      if (tensor.device.device_type != kDLCPU ||
+          tensor.dtype.code != kDLFloat || tensor.dtype.bits != 32 ||
+          tensor.dtype.lanes != 1 || tensor.strides != nullptr) {
+        throw std::runtime_error(
+            "remote executor currently supports contiguous CPU float32 inputs "
+            "only");
       }
       onnx_remote::Tensor wire;
       wire.shape.assign(tensor.shape, tensor.shape + tensor.ndim);
-      const auto* begin = static_cast<const float*>(tensor.data) + tensor.byte_offset / sizeof(float);
+      const auto* begin = static_cast<const float*>(tensor.data) +
+                          tensor.byte_offset / sizeof(float);
       size_t elements = 1;
-      for (int32_t i = 0; i < tensor.ndim; ++i) elements *= static_cast<size_t>(tensor.shape[i]);
+      for (int32_t i = 0; i < tensor.ndim; ++i)
+        elements *= static_cast<size_t>(tensor.shape[i]);
       wire.data.assign(begin, begin + elements);
       request.inputs.emplace_back(std::move(wire));
     }
@@ -88,7 +107,8 @@ class RemoteModelExecutor final : public ModelExecutor {
     onnx_remote::Response response;
     const uint64_t rpc_start = collect_profile ? profiler.ElapsedMicros() : 0;
     const bool sent = onnx_remote::send_request(fd, request, error);
-    const bool received = sent && onnx_remote::receive_response(fd, response, error);
+    const bool received =
+        sent && onnx_remote::receive_response(fd, response, error);
     const uint64_t rpc_end = collect_profile ? profiler.ElapsedMicros() : 0;
     onnx_remote::close_socket(fd);
     if (collect_profile) {
@@ -106,7 +126,8 @@ class RemoteModelExecutor final : public ModelExecutor {
       }
     }
     if (!received || !response.ok) {
-      throw std::runtime_error("remote executor: " + (error.empty() ? response.error : error));
+      throw std::runtime_error("remote executor: " +
+                               (error.empty() ? response.error : error));
     }
 
     std::vector<DLManagedTensorPtr> outputs;

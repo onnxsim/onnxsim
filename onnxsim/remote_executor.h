@@ -1,8 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
-#include <cstdint>
 
 #include "onnxsim.h"
 #include "remote_transport.h"
