@@ -124,6 +124,32 @@ and ABI, then reuse or reject it. `send_compiled_artifact=true` is the safe
 stateless default; a later load/attach handshake can send only `artifact_id`
 once the worker confirms its cache.
 
+### Standalone compiler service
+
+`onnx-remote-compiler` is a dependency-free compiler-side service for this
+contract. It is intended to run on a host with QAIRT/QNN installed while the
+runner stays on a Snapdragon or AX8850 device. The service owns a persistent
+on-disk cache; its key includes the serialized model, target, and configured
+compiler command and explicit compiler identity.
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote
+cmake --build build/onnx-remote --target onnx-remote-compiler
+build/onnx-remote/onnx-remote-compiler \
+  --port 39502 --target qnn-htp --compiler-id qairt-2.31.0 \
+  --cache-dir /var/cache/onnxsim-qnn \
+  --command 'qnn_compile_wrapper --input {input} --output {output} \
+             --manifest {manifest} --target {target}'
+```
+
+The command is trusted local configuration, not request data. It must write the
+compiled artifact to `{output}` and a bounded UTF-8 manifest to `{manifest}`;
+`{input}` is the received ONNX ModelProto. A no-command service copies the
+model into an artifact and is useful for validating networking and cache
+plumbing before installing QAIRT. A QNN wrapper can run the converter,
+backend-specific graph preparation, and context-binary generation as one
+command, while keeping those SDK-version-specific details out of onnxsim.
+
 ## AXCL worker
 
 On a machine with the AXCL SDK, configure with `-DONNX_REMOTE_AXCL=ON`.

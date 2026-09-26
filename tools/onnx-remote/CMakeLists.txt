@@ -27,6 +27,9 @@ target_link_libraries(onnx-remote-worker PRIVATE onnx_remote_transport)
 add_executable(onnx-remote-client remote_client.cpp)
 target_link_libraries(onnx-remote-client PRIVATE onnx_remote_transport)
 
+add_executable(onnx-remote-compiler remote_compiler.cpp)
+target_link_libraries(onnx-remote-compiler PRIVATE onnx_remote_transport)
+
 if (ONNX_REMOTE_AXCL)
   find_path(AXCL_INCLUDE_DIR axcl.h REQUIRED)
   find_library(AXCL_RT_LIBRARY axcl_rt REQUIRED)

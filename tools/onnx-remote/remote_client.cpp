@@ -2,7 +2,9 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 
 using namespace onnx_remote;
 
@@ -42,6 +44,27 @@ static int self_test() {
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--self-test") return self_test();
+  if (argc == 5 && std::string(argv[1]) == "--compile") {
+    std::ifstream input(argv[4], std::ios::binary);
+    if (!input) { std::cerr << "cannot open model\n"; return 1; }
+    Request request;
+    request.op = "compile";
+    request.model.assign(std::istreambuf_iterator<char>(input), {});
+    int fd = connect_tcp(argv[2], static_cast<uint16_t>(std::strtoul(argv[3], nullptr, 10)));
+    if (fd < 0) { std::cerr << "connect failed\n"; return 1; }
+    std::string error;
+    Response response;
+    bool ok = send_request(fd, request, error) && receive_response(fd, response, error);
+    close_socket(fd);
+    if (!ok || !response.ok) {
+      std::cerr << (error.empty() ? response.error : error) << '\n';
+      return 1;
+    }
+    std::cout << "artifact_id=" << response.artifact_id
+              << " bytes=" << response.artifact.size() << '\n'
+              << response.manifest << '\n';
+    return 0;
+  }
   if (argc != 4) { std::cerr << "usage: onnx-remote-client HOST PORT OP\n"; return 2; }
   int fd = connect_tcp(argv[1], static_cast<uint16_t>(std::strtoul(argv[2], nullptr, 10)));
   if (fd < 0) { std::cerr << "connect failed\n"; return 1; }
