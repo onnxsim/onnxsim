@@ -4,6 +4,8 @@
 #include <cerrno>
 #include <cstring>
 #include <netdb.h>
+#include <fcntl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -328,17 +330,47 @@ int listen_tcp(uint16_t port, int backlog) {
   return fd;
 }
 int accept_tcp(int listener) { return ::accept(listener, nullptr, nullptr); }
-int connect_tcp(const std::string& host, uint16_t port) {
+int connect_tcp_timeout(const std::string& host, uint16_t port,
+                        int timeout_ms) {
   addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
   addrinfo* result = nullptr; std::string service = std::to_string(port);
   if (::getaddrinfo(host.c_str(), service.c_str(), &hints, &result)) return -1;
   int fd = -1;
   for (addrinfo* p = result; p; p = p->ai_next) {
     fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (fd >= 0 && !::connect(fd, p->ai_addr, p->ai_addrlen)) break;
+    if (fd < 0) continue;
+    if (timeout_ms <= 0) {
+      if (!::connect(fd, p->ai_addr, p->ai_addrlen)) break;
+    } else {
+      const int flags = ::fcntl(fd, F_GETFL, 0);
+      if (flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+          !::connect(fd, p->ai_addr, p->ai_addrlen)) {
+        ::fcntl(fd, F_SETFL, flags);
+        break;
+      }
+      if (errno == EINPROGRESS && flags >= 0) {
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(fd, &writable);
+        timeval timeout{};
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+        const int ready = ::select(fd + 1, nullptr, &writable, nullptr, &timeout);
+        int socket_error = 0;
+        socklen_t error_size = sizeof(socket_error);
+        ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size);
+        if (ready > 0 && socket_error == 0) {
+          ::fcntl(fd, F_SETFL, flags);
+          break;
+        }
+      }
+    }
     if (fd >= 0) ::close(fd); fd = -1;
   }
   ::freeaddrinfo(result); return fd;
+}
+int connect_tcp(const std::string& host, uint16_t port) {
+  return connect_tcp_timeout(host, port, 0);
 }
 void close_socket(int fd) { if (fd >= 0) ::close(fd); }
 

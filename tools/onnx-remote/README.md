@@ -55,6 +55,8 @@ Run that smoke test while the worker is running:
   dtype or shape.
 * optional `Off`, `Summary`, or `Detailed` profiling in the request;
   profile timestamps are worker-relative and require no clock synchronization.
+* bounded connection setup when the native executor's `connect_timeout_ms` is
+  configured;
 
 Profile events are returned with the response rather than streamed. This keeps
 the constrained worker simple and is sufficient for a completed subgraph

@@ -73,6 +73,11 @@ constexpr uint64_t kMaxArtifactBytes = kMaxMessageBytes;
 int listen_tcp(uint16_t port, int backlog = 16);
 int accept_tcp(int listener);
 int connect_tcp(const std::string& host, uint16_t port);
+// A non-positive timeout preserves the blocking connect behavior. The timeout
+// is only for establishing the socket; callers may additionally configure
+// their own I/O deadline around send/receive.
+int connect_tcp_timeout(const std::string& host, uint16_t port,
+                        int timeout_ms);
 void close_socket(int fd);
 
 bool receive_request(int fd, Request& request, std::string& error);

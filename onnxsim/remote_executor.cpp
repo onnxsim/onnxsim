@@ -134,7 +134,8 @@ class RemoteModelExecutor final : public ModelExecutor {
         options_.profiling != onnx_remote::ProfilingLevel::Off;
     const uint64_t profile_anchor =
         collect_profile ? profiler.ElapsedMicros() : 0;
-    const int fd = onnx_remote::connect_tcp(host, port);
+    const int fd = onnx_remote::connect_tcp_timeout(
+        host, port, options_.connect_timeout_ms);
     if (fd < 0) throw std::runtime_error("remote executor: connection failed");
     std::string error;
     onnx_remote::Response response;
