@@ -3,6 +3,11 @@
 # skel (same pattern as ../native_transport/, separate interface so it doesn't touch that skel).
 # Needs the data produced by dump_real_roialign_io.py + gen_roialign_test_data.py in $DATA.
 set -euo pipefail
+
+# the hand-written kernel headers live in the tinygrad fork (test/external/dsp/hand/); this
+# links them in from the pinned revision if they are not present yet
+_d="$(dirname "$0")"; while [ ! -f "$_d/fetch_hand_kernels.sh" ] && [ "$_d" != / ]; do _d="$(dirname "$_d")"; done
+[ -f "$_d/fetch_hand_kernels.sh" ] && "$_d/fetch_hand_kernels.sh" >/dev/null
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}" "${DATA:?directory with calls.txt and callN_*.bin}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
 DEVICE_SERIAL="${DEVICE_SERIAL:-239dbd8f}"

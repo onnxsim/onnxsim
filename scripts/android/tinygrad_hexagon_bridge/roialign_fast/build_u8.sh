@@ -4,6 +4,11 @@
 # $DATA is one capture_merged_io.py image directory (meta.txt, l*_u8.bin, {box,mask}_{rois,rows}*.bin,
 # {box,mask}_ref_u8.bin). CONFIGS: comma list of flags (threads | 256*prefetch | 512*sort).
 set -euo pipefail
+
+# the hand-written kernel headers live in the tinygrad fork (test/external/dsp/hand/); this
+# links them in from the pinned revision if they are not present yet
+_d="$(dirname "$0")"; while [ ! -f "$_d/fetch_hand_kernels.sh" ] && [ "$_d" != / ]; do _d="$(dirname "$_d")"; done
+[ -f "$_d/fetch_hand_kernels.sh" ] && "$_d/fetch_hand_kernels.sh" >/dev/null
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}" "${DATA:?capture_merged_io.py image directory}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
 DEVICE_SERIAL="${DEVICE_SERIAL:-239dbd8f}"

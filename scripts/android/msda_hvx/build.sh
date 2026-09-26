@@ -6,6 +6,11 @@
 #   D: phone directory (default /data/local/tmp/msda_hvx-$USER). Run the phone part under the
 #   host's phone lock (e.g. PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./build.sh).
 set -euo pipefail
+
+# the hand-written kernel headers live in the tinygrad fork (test/external/dsp/hand/); this
+# links them in from the pinned revision if they are not present yet
+_d="$(dirname "$0")"; while [ ! -f "$_d/fetch_hand_kernels.sh" ] && [ "$_d" != / ]; do _d="$(dirname "$_d")"; done
+[ -f "$_d/fetch_hand_kernels.sh" ] && "$_d/fetch_hand_kernels.sh" >/dev/null
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
 DEVICE_SERIAL="${DEVICE_SERIAL:-${ANDROID_SERIAL:-239dbd8f}}"

@@ -244,3 +244,25 @@ tiny-random-mistral/
 # toolchain/library downloads and object files, not part of the repo.
 tools/onnx-cardputer-flash/firmware/runtime/.pio/
 tools/onnx-k210-flash/firmware/runtime/.pio/
+
+# Hand-written Hexagon kernel headers: these live in onnxsim/tinygrad's test/external/dsp/hand/,
+# where they are the oracle tinygrad's generated kernels are checked against. scripts/android/
+# links them in with fetch_hand_kernels.sh rather than holding a second copy.
+scripts/android/hmx_gemm/hmx_block.h
+scripts/android/hmx_gemm/hmx_gemm.h
+scripts/android/hmx_gemm/hmx_gemm_u8.h
+scripts/android/hmx_gemm/hmx_runtime.h
+scripts/android/hmx_gemm/hmx_qconv.h
+scripts/android/hmx_gemm/hmx_qconv3.h
+scripts/android/hmx_gemm/qc_case.h
+scripts/android/hmx_gemm/runner/rn_exec.h
+scripts/android/hmx_gemm/runner/rn_load.h
+scripts/android/hmx_gemm/runner/rn_model.h
+scripts/android/msda_hvx/msda_kernel.h
+scripts/android/msda_hvx/msda_shape.h
+scripts/android/tinygrad_hexagon_bridge/fpn_channels_last/layout_kernels.h
+scripts/android/tinygrad_hexagon_bridge/nms/nms_kernel.h
+scripts/android/tinygrad_hexagon_bridge/proposal_decode/pd_kernel.h
+scripts/android/tinygrad_hexagon_bridge/roialign_fast/roialign_kernel.h
+scripts/android/tinygrad_hexagon_bridge/roialign_fast/roialign_u8_kernel.h
+scripts/android/tinygrad_hexagon_bridge/topk/topk_kernel.h
