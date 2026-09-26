@@ -848,6 +848,45 @@ def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
 
 
+def test_compile_onnx_live_matmul_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("MatMul", ["x", "z"], ["y"])],
+            "onnx_live_matmul",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 1000]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, [1000, 512]
+                ),
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 512]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "onnx_matmul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {
+                "scales": {"x": 0.1, "z": 0.2, "y": 0.3},
+                # This measured MatMul template has a symmetric input view;
+                # changing x from zero to nonzero would require a different
+                # record layout and must remain refused.
+                "zero_points": {"x": 0, "z": 0, "y": 125},
+            },
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
+
+
 def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
     from tinygrad import Tensor
 
