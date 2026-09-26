@@ -115,6 +115,40 @@ def _retarget_schedule_names(
     schedule.update(retargeted)
 
 
+def _retarget_model_names(model: onnx.ModelProto, source: onnx.ModelProto) -> None:
+    """Retarget a measured template's public IO names to the source graph.
+
+    Emitters keep the names from their measured build (for example the FC
+    template uses ``distill__...`` names).  The mcode is independent of those
+    names, but an emitted ONNX model must still implement the source model's
+    input/output contract.  Only positional public IO names are changed;
+    extra side outputs exposed by a measured template remain untouched.
+    """
+    if len(model.graph.input) != len(source.graph.input) or len(
+        model.graph.output
+    ) != len(source.graph.output):
+        return
+    rename = {
+        new.name: old.name
+        for old, new in zip(source.graph.input, model.graph.input)
+        if old.name != new.name
+    }
+    rename.update(
+        {
+            new.name: old.name
+            for old, new in zip(source.graph.output, model.graph.output)
+            if old.name != new.name
+        }
+    )
+    if not rename:
+        return
+    for node in model.graph.node:
+        node.input[:] = [rename.get(name, name) for name in node.input]
+        node.output[:] = [rename.get(name, name) for name in node.output]
+    for value in (*model.graph.input, *model.graph.output, *model.graph.value_info):
+        value.name = rename.get(value.name, value.name)
+
+
 def _shape(value) -> tuple[int, ...]:
     return tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
 
@@ -828,13 +862,17 @@ def generate(
         compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
     if not os.path.exists(output_path):
         raise RuntimeError(f"generator did not produce {output_path}")
+    emitted = onnx.load(output_path, load_external_data=False)
+    source = onnx.load(source_path, load_external_data=False)
+    _retarget_model_names(emitted, source)
+    onnx.save(emitted, output_path)
     if schedule_path is not None:
         with open(schedule_path, encoding="utf-8") as stream:
             schedule = json.load(stream)
         _retarget_schedule_names(
             schedule,
-            onnx.load(output_path, load_external_data=False),
-            onnx.load(source_path, load_external_data=False),
+            emitted,
+            source,
         )
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule, stream, indent=2, sort_keys=True)

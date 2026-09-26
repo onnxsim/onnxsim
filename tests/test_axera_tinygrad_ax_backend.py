@@ -881,6 +881,8 @@ def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
 
 
@@ -920,6 +922,8 @@ def test_compile_onnx_live_matmul_through_uop_to_mcode(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
 
 
