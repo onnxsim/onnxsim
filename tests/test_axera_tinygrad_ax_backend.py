@@ -469,7 +469,7 @@ def test_compile_onnx_broadcast_mul_through_uop_to_mcode(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
-@pytest.mark.parametrize("op", ["Add", "Div"])
+@pytest.mark.parametrize("op", ["Add", "Div", "Sub"])
 def test_compile_onnx_live_binary_through_uop_to_mcode(tmp_path, op):
     model = onnx.helper.make_model(
         onnx.helper.make_graph(
