@@ -38,16 +38,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # onnxsim/tinygrad branch hvx-vrmpy-mixed: the DSP renderer's HVX codegen (stage 1, 3167f8b6), the
-  # float-MAX __auto_type fix (fccd84cfa), qfloat (stage 2, hvx-qfloat 847af7eab) and the vrmpy GEMV TC
-  # (9aa4f66a1, onnxsim/tinygrad#5, which test_codegen_vrmpy_gemv checks). vrmpy-hexagon-support's merge
-  # of onnxsim/tinygrad#2 (62d98031) predates the float-MAX fix, and pinning it hangs
-  # test_codegen_float_max_chain_renders_linearly until the runner dies. Move this pin to
-  # vrmpy-hexagon-support once #3/#4/#5 are merged there.
   TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
-  # onnxsim/tinygrad hvx-hmx-qdq (PR #8, int8 :cm HMX TensorCore + fused requantization, stacked on #7 hvx-hmx-mcc and #6 hvx-hmx; contains
-  # 9aa4f66a1 vrmpy GEMV and fccd84cfa max-chain fix)
-  TINYGRAD_SHA: 3605e14cab6ece783bdfd04058ca17b1de4c29c2
+  # onnxsim/tinygrad dsp-consolidated (PR #11): the whole Hexagon DSP stack on one branch -- HVX codegen
+  # (3167f8b6), the vrmpy GEMV TC (9aa4f66a1), the float-MAX fix (fccd84cfa), qfloat (847af7eab), the HMX
+  # fp16 and int8 :cm tensor cores with fused requantization (hvx-hmx / hvx-hmx-qdq), and the hand-kernel
+  # oracles (hand-kernel-oracles). That branch also carries its own CI (hexagon-dsp.yml), so this job tests
+  # the pipeline here while the fork tests itself.
+  #
+  # This replaces the stacked #1/#3/#4/#6/#7/#8/#9 PRs, which never had CI of their own (the fork had no
+  # registered workflows at all). #8 and #9 had diverged rather than stacked, so neither contained the other.
+  TINYGRAD_SHA: bc30c0bdb7a0c730fcb865ef2826380ae03dd162
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 
