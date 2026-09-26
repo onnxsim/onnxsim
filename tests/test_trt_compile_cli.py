@@ -61,3 +61,30 @@ def test_compile_writes_engine_and_profile_manifest(monkeypatch, tmp_path):
     assert data["profiling"]["n_layers"] == 2
     assert data["profiling"]["layers"][0]["tactic"] == "mock"
     assert data["options"]["workspace_mb"] == 256
+
+
+def test_large_layer_profile_is_bounded(monkeypatch, tmp_path):
+    adapter = load_adapter()
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"mock model")
+    output = tmp_path / "model.engine"
+    manifest = tmp_path / "manifest.json"
+    layers = [{"name": f"layer-{i}", "detail": "x" * 800} for i in range(500)]
+    monkeypatch.setitem(
+        sys.modules,
+        "trt_harness",
+        types.SimpleNamespace(
+            build_engine=lambda **kwargs: (
+                b"engine",
+                {"n_layers": len(layers), "layers": layers},
+            )
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt", types.SimpleNamespace(__version__="mock"))
+
+    adapter.compile_tensorrt(model, output, manifest, "trt", False, False, 1)
+
+    assert manifest.stat().st_size <= adapter.MAX_MANIFEST_BYTES
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    assert data["profiling"]["layers_total"] == 500
+    assert data["profiling"]["layers_truncated"] is True

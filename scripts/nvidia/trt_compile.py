@@ -15,6 +15,9 @@ import sys
 from pathlib import Path
 
 
+MAX_MANIFEST_BYTES = 64 * 1024
+
+
 def compile_tensorrt(
     input_path: Path,
     output_path: Path,
@@ -43,6 +46,14 @@ def compile_tensorrt(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(blob)
+    profiling = {
+        "verbosity": "detailed",
+        "build_s": info.get("build_s"),
+        "n_layers": info.get("n_layers"),
+        "n_int8_layers": info.get("n_int8_layers"),
+        "engine_bytes": info.get("engine_bytes"),
+        "layers": info.get("layers", []),
+    }
     manifest = {
         "schema_version": 1,
         "compiler": {
@@ -56,14 +67,7 @@ def compile_tensorrt(
         "capabilities": {"ops": [], "dtypes": []},
         "legalization": {"profile": target, "version": 1},
         "compile_host": {"system": platform.platform()},
-        "profiling": {
-            "verbosity": "detailed",
-            "build_s": info.get("build_s"),
-            "n_layers": info.get("n_layers"),
-            "n_int8_layers": info.get("n_int8_layers"),
-            "engine_bytes": info.get("engine_bytes"),
-            "layers": info.get("layers", []),
-        },
+        "profiling": profiling,
         "options": {
             "fp16": fp16,
             "int8": int8,
@@ -71,7 +75,35 @@ def compile_tensorrt(
             "workspace_mb": workspace_mb,
         },
     }
-    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    manifest_path.write_text(_bounded_json(manifest), encoding="utf-8")
+
+
+def _bounded_json(manifest: dict) -> str:
+    """Keep compiler responses below the native transport's manifest limit.
+
+    TensorRT's inspector can return thousands of layer records.  Keep the
+    aggregate counters and a deterministic prefix of those records so a
+    constrained runner still receives useful profiling data instead of a
+    compiler response that is rejected for being oversized.
+    """
+    profiling = manifest.get("profiling", {})
+    layers = list(profiling.get("layers", []))
+    profiling["layers_total"] = len(layers)
+    while layers:
+        profiling["layers"] = layers
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) <= MAX_MANIFEST_BYTES:
+            if len(layers) < profiling["layers_total"]:
+                profiling["layers_truncated"] = True
+                encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+            return encoded
+        layers.pop()
+    profiling["layers"] = []
+    profiling["layers_truncated"] = bool(profiling["layers_total"])
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_MANIFEST_BYTES:
+        raise RuntimeError("TensorRT manifest exceeds the 64 KiB transport limit")
+    return encoded
 
 
 def _trt_version() -> str:
