@@ -469,6 +469,39 @@ def test_compile_onnx_broadcast_mul_through_uop_to_mcode(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
+@pytest.mark.parametrize("op", ["Add", "Div"])
+def test_compile_onnx_live_binary_through_uop_to_mcode(tmp_path, op):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x", "z"], ["y"])],
+            f"onnx_live_{op.lower()}",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [1, 64]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, [1, 64]
+                ),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 64])],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template(op, (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / f"onnx_{op.lower()}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
+
+
 def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
