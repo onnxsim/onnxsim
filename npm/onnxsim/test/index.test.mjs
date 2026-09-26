@@ -4,8 +4,8 @@
 // -- see scripts/build_npm_package.sh, or .github/workflows/static.yml, which
 // runs this right after its own build via `npm test`.
 //
-// simplify() runs with constantFolding disabled here so the test never needs
-// onnxruntime-web's wasm assets located on disk (see docs/wasm_ort_web.md):
+// Most simplify() checks run with constantFolding disabled here so they never
+// need onnxruntime-web's wasm assets located on disk (see docs/wasm_ort_web.md):
 // this exercises the embind marshaling, shape inference, and onnx-optimizer
 // passes, not the onnxruntime-web constant-folding bridge -- that path is
 // covered by the convertmodel demo's own inference test
@@ -173,7 +173,23 @@ try {
       calls += 1;
       return ortRunner(...args);
     });
-    const input = new Uint8Array(readFileSync(FIXTURE));
+    // model.onnx is deliberately input-dependent and therefore has no
+    // constant-only fold group. This fixture contains a constant reshape and
+    // makes the callback assertion meaningful in the deployed WASM build.
+    const input = new Uint8Array(
+      readFileSync(
+        join(
+          HERE,
+          "..",
+          "..",
+          "..",
+          "scripts",
+          "convertmodel",
+          "test",
+          "webnn_reshape_constant.onnx",
+        ),
+      ),
+    );
     const { model } = await simplify(input, { constantFolding: true });
     assert.ok(model.length > 0);
     assert.ok(calls > 0, "constant folding did not call the custom executor");

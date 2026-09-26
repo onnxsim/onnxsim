@@ -9,7 +9,6 @@ import sys
 import types
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).parents[1] / "scripts" / "nvidia" / "trt_compile.py"
 
 

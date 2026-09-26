@@ -20,12 +20,6 @@ static bool same_shape(const Tensor& a, const Tensor& b) { return a.shape == b.s
 
 static Response execute(const Request& r) {
   Response out; out.ok = false;
-  for (const Tensor& input : r.inputs) {
-    if (input.dtype != 1) {
-      out.error = "reference worker supports float32 tensors only";
-      return out;
-    }
-  }
   const auto started = std::chrono::steady_clock::now();
   auto profile = [&](const char* name, uint64_t begin, uint64_t duration) {
     if (r.profiling != ProfilingLevel::Off) {
@@ -43,6 +37,10 @@ static Response execute(const Request& r) {
   }
   if (r.op == "relu") {
     if (r.inputs.size() != 1) { out.error = "relu expects one input"; return out; }
+    if (r.inputs[0].dtype != 1) {
+      out.error = "relu reference implementation supports float32 tensors only";
+      return out;
+    }
     Tensor y;
     execute_op([&] { y = r.inputs[0]; for (float& x : y.data) if (x < 0.0f) x = 0.0f; });
     out.outputs.push_back(std::move(y)); out.ok = true; return out;
@@ -50,6 +48,10 @@ static Response execute(const Request& r) {
   if (r.op == "add" || r.op == "mul") {
     if (r.inputs.size() != 2 || !same_shape(r.inputs[0], r.inputs[1])) {
       out.error = r.op + " expects two tensors with the same shape"; return out;
+    }
+    if (r.inputs[0].dtype != 1 || r.inputs[1].dtype != 1) {
+      out.error = r.op + " reference implementation supports float32 tensors only";
+      return out;
     }
     Tensor y = r.inputs[0];
     execute_op([&] {

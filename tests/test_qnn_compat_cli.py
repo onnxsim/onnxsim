@@ -9,7 +9,6 @@ import sys
 import types
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).parents[1] / "scripts" / "qualcomm" / "run_qnn_compat.py"
 COMPILER = Path(__file__).parents[1] / "scripts" / "qualcomm" / "qnn_compile.py"
 

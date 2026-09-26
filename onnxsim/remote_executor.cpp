@@ -10,13 +10,15 @@
 #include <utility>
 
 #include "profiler.h"
+#include "dlpack_bridge.h"
 #include "remote_transport.h"
 
 namespace {
 
 struct OutputOwner {
-  std::vector<float> data;
+  std::vector<uint8_t> data;
   std::vector<int64_t> shape;
+  DLDataType dtype{};
 };
 
 std::string JsonEscape(const std::string& value) {
@@ -52,7 +54,7 @@ DLManagedTensor* WrapOutput(OutputOwner* owner) {
   result->dl_tensor.data = owner->data.data();
   result->dl_tensor.device = DLDevice{kDLCPU, 0};
   result->dl_tensor.ndim = static_cast<int32_t>(owner->shape.size());
-  result->dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
+  result->dl_tensor.dtype = owner->dtype;
   result->dl_tensor.shape = owner->shape.data();
   result->dl_tensor.strides = nullptr;
   result->dl_tensor.byte_offset = 0;
@@ -109,21 +111,28 @@ class RemoteModelExecutor final : public ModelExecutor {
     request.inputs.reserve(inputs.size());
     for (const DLManagedTensor* input : inputs) {
       const DLTensor& tensor = input->dl_tensor;
+      int32_t onnx_dtype = 0;
       if (tensor.device.device_type != kDLCPU ||
-          tensor.dtype.code != kDLFloat || tensor.dtype.bits != 32 ||
-          tensor.dtype.lanes != 1 || tensor.strides != nullptr) {
+          tensor.dtype.lanes != 1 || tensor.strides != nullptr ||
+          !onnxsim::dlpack::TryDLToOnnx(tensor.dtype, &onnx_dtype)) {
         throw std::runtime_error(
-            "remote executor currently supports contiguous CPU float32 inputs "
-            "only");
+            "remote executor supports only contiguous CPU ONNX-compatible "
+            "tensors");
       }
       onnx_remote::Tensor wire;
+      wire.dtype = static_cast<uint8_t>(onnx_dtype);
       wire.shape.assign(tensor.shape, tensor.shape + tensor.ndim);
-      const auto* begin = static_cast<const float*>(tensor.data) +
-                          tensor.byte_offset / sizeof(float);
-      size_t elements = 1;
-      for (int32_t i = 0; i < tensor.ndim; ++i)
-        elements *= static_cast<size_t>(tensor.shape[i]);
-      wire.data.assign(begin, begin + elements);
+      const size_t nbytes = static_cast<size_t>(onnxsim::dlpack::NumElements(
+                                   tensor.shape, tensor.ndim)) *
+                            onnxsim::dlpack::SizeOf(tensor.dtype);
+      const auto* begin = static_cast<const uint8_t*>(tensor.data) +
+                          tensor.byte_offset;
+      if (onnx_dtype == onnx::TensorProto::FLOAT) {
+        const auto* floats = reinterpret_cast<const float*>(begin);
+        wire.data.assign(floats, floats + nbytes / sizeof(float));
+      } else {
+        wire.raw_data.assign(begin, begin + nbytes);
+      }
       request.inputs.emplace_back(std::move(wire));
     }
 
@@ -132,8 +141,19 @@ class RemoteModelExecutor final : public ModelExecutor {
     std::vector<DLManagedTensorPtr> outputs;
     outputs.reserve(response.outputs.size());
     for (auto& output : response.outputs) {
+      DLDataType dtype{};
+      if (!onnxsim::dlpack::TryOnnxToDL(output.dtype, &dtype)) {
+        throw std::runtime_error("remote executor returned unsupported dtype " +
+                                 std::to_string(output.dtype));
+      }
       auto owner = std::make_unique<OutputOwner>();
-      owner->data = std::move(output.data);
+      owner->dtype = dtype;
+      if (output.dtype == onnx::TensorProto::FLOAT) {
+        owner->data.resize(output.data.size() * sizeof(float));
+        std::memcpy(owner->data.data(), output.data.data(), owner->data.size());
+      } else {
+        owner->data = std::move(output.raw_data);
+      }
       owner->shape = std::move(output.shape);
       outputs.emplace_back(WrapOutput(owner.release()));
     }

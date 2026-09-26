@@ -15,9 +15,10 @@ client                         worker
 ```
 
 The first worker is a reference implementation for transport tests.  It
-implements `identity`, `relu`, `add`, and `mul` over float32 tensors.  It is
-not intended to be the production accelerator backend.  An AXCL worker can
-replace the operation callback while keeping the wire format unchanged.
+implements `identity` for every protocol dtype and `relu`, `add`, and `mul`
+over float32 tensors.  It is not intended to be the production accelerator
+backend.  An AXCL worker can replace the operation callback while keeping the
+wire format unchanged.
 
 ## Build
 
@@ -53,8 +54,8 @@ Run that smoke test while the worker is running:
 * one request per connection for simple failure isolation;
 * explicit operation and tensor metadata, so the remote side never guesses
   dtype or shape. Protocol v4 preserves raw little-endian payloads for
-  FLOAT16, BFLOAT16, integer, DOUBLE, and BOOL tensors; the reference worker
-  still executes float32 only.
+  FLOAT16, BFLOAT16, integer, DOUBLE, and BOOL tensors. The reference worker
+  executes typed identity and keeps arithmetic intentionally float32-only.
 * optional `Off`, `Summary`, or `Detailed` profiling in the request;
   profile timestamps are worker-relative and require no clock synchronization.
 * bounded connection setup when the native executor's `connect_timeout_ms` is

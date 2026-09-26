@@ -1,10 +1,9 @@
 """Dependency-light tests for remote compiler preflight and trace summaries."""
 
-from types import SimpleNamespace
-
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 
 def load_module(name):

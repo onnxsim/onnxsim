@@ -231,7 +231,7 @@ package's npmjs.com settings page, not in this repo.
   coarser batching is a likely optimization.
 - Only the dtypes above are bridged (same as the built-in executor); others throw
   a clear error.
-- Not wired for the `ONNXSIM_WASM_NODE` (NODERAWFS) build or a Node smoke test yet.
-- The npm package now has a fake-runtime contract test for the batched hook;
-  an end-to-end WASM folding test with onnxruntime-web loaded remains useful
-  for validating the Asyncify boundary itself.
+- The `ONNXSIM_WASM_NODE` (NODERAWFS) build still needs a dedicated smoke test.
+- The npm package has both a fake-runtime contract test and an end-to-end
+  folding test using `onnxruntime-web`; a browser-side remote-runner test is
+  still useful for validating a real network/worker boundary.
