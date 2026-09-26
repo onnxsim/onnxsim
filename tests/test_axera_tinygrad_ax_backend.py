@@ -349,6 +349,42 @@ def test_compile_onnx_frozen_conv_routes_all_validated_templates(
     assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
 
 
+def test_compile_onnx_frozen_conv_without_bias_emits_zero_bias_mcode(tmp_path):
+    weights = np.zeros((64, 64, 3, 3), dtype=np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1], strides=[1, 1]
+                )
+            ],
+            "frozen_conv_without_bias",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [numpy_helper.from_array(weights, "w")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv_without_bias.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": {"x": 0.01, "y": 0.02}, "zero_points": {"x": 127, "y": 125}},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
+
+
 def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
