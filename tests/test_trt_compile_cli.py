@@ -74,7 +74,7 @@ def test_large_layer_profile_is_bounded(monkeypatch, tmp_path):
         sys.modules,
         "trt_harness",
         types.SimpleNamespace(
-            build_engine=lambda **kwargs: (
+            build_engine=lambda *args, **kwargs: (
                 b"engine",
                 {"n_layers": len(layers), "layers": layers},
             )

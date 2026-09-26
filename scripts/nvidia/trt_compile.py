@@ -89,21 +89,16 @@ def _bounded_json(manifest: dict) -> str:
     profiling = manifest.get("profiling", {})
     layers = list(profiling.get("layers", []))
     profiling["layers_total"] = len(layers)
-    while layers:
+    while True:
         profiling["layers"] = layers
+        profiling["layers_truncated"] = len(layers) < profiling["layers_total"]
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
         if len(encoded.encode("utf-8")) <= MAX_MANIFEST_BYTES:
-            if len(layers) < profiling["layers_total"]:
-                profiling["layers_truncated"] = True
-                encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
             return encoded
+        if not layers:
+            break
         layers.pop()
-    profiling["layers"] = []
-    profiling["layers_truncated"] = bool(profiling["layers_total"])
-    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-    if len(encoded.encode("utf-8")) > MAX_MANIFEST_BYTES:
-        raise RuntimeError("TensorRT manifest exceeds the 64 KiB transport limit")
-    return encoded
+    raise RuntimeError("TensorRT manifest exceeds the 64 KiB transport limit")
 
 
 def _trt_version() -> str:
