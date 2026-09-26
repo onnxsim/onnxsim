@@ -110,6 +110,31 @@ One boundary, several adapters (`dlpack_bridge.h` holds the conversions):
 | `CApiModelExecutor` | capi/onnxsim_c_api.cpp | host receives borrowed `DLManagedTensor*` | host returns owned `DLManagedTensor*`, released via their deleters | host's choice |
 | `PyModelExecutor` | cpp2py_export.cc | `ToTensorProto` → bytes | bytes → `FromTensorProtoOwning` | protobuf round trip (see below) |
 | `XnnpackModelExecutor` | xnnpack_executor.cpp (`ONNXSIM_BUILTIN_XNNPACK`) | feed pointers passed straight to `xnn_setup_runtime_v2` as `xnn_external_value`s — **zero copy** | XNNPACK writes into an executor-allocated `std::vector<float>` (it has no ORT-style "hand back the session's buffer" mode) — **one copy at the boundary** (allocation, not a memcpy) | one allocation per output |
+| `RemoteModelExecutor` | remote_executor.cpp (`ONNXSIM_BUILTIN_REMOTE_EXECUTOR`) | serialized over the dependency-free remote transport | newly owned CPU float32 buffers | one network serialization/copy per input and output |
+
+### Native remote executor
+
+`GetRemoteModelExecutor()` is an opt-in C++ executor. It sends each
+constant-folding submodel as a serialized `ModelProto` together with its
+contiguous CPU float32 inputs. The endpoint returns output tensors, which are
+wrapped as owned DLPack tensors for the normal folding path. The default ORT
+executor is unchanged.
+
+Enable it with:
+
+```sh
+cmake -S . -B build \
+  -DONNXSIM_REMOTE_TRANSPORT=ON \
+  -DONNXSIM_BUILTIN_REMOTE_EXECUTOR=ON
+```
+
+Then include `onnxsim/remote_executor.h` and pass
+`*GetRemoteModelExecutor({"device-host", 39501})` to the C++ simplifier API.
+The worker is intentionally a separate process: the same client-side
+executor can talk to a native ONNX Runtime worker, an accelerator compiler, or
+the optional AXCL worker. The current first implementation supports float32
+CPU tensors; adding other dtypes is a protocol/backend extension rather than
+an ABI change to `ModelExecutor`.
 
 ### XNNPACK: an explicitly-partial backend, not a drop-in ORT replacement
 

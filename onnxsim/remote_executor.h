@@ -1,0 +1,29 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <cstdint>
+
+#include "onnxsim.h"
+
+// Native remote executor for constant folding. The remote endpoint receives
+// each fold-group ModelProto and its CPU tensors through the small transport in
+// tools/onnx-remote. It is opt-in: the built-in ORT executor remains the
+// default, and this declaration is available only with
+// ONNXSIM_BUILTIN_REMOTE_EXECUTOR.
+#ifdef ONNXSIM_BUILTIN_REMOTE_EXECUTOR
+
+struct RemoteExecutorOptions {
+  std::string host = "127.0.0.1";
+  uint16_t port = 39501;
+  int connect_timeout_ms = 5000;
+  // The operation is a backend selector. "onnx" conventionally means that
+  // the worker executes the serialized ModelProto; an AXCL adapter may use a
+  // model handle instead and leave model empty.
+  std::string operation = "onnx";
+};
+
+std::shared_ptr<const ModelExecutor> GetRemoteModelExecutor(
+    const RemoteExecutorOptions& options = {});
+
+#endif  // ONNXSIM_BUILTIN_REMOTE_EXECUTOR
