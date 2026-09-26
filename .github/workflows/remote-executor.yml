@@ -70,7 +70,11 @@ jobs:
           compiler_pid=$!
           trap 'kill "$compiler_pid" 2>/dev/null || true' EXIT
           sleep 0.2
-          build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx"
+          first=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          second=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          first_id=$(printf '%s\n' "$first" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
+          second_id=$(printf '%s\n' "$second" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
+          test -n "$first_id" && test "$first_id" = "$second_id"
           test -n "$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)"
 
   python-driver:

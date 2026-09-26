@@ -232,6 +232,6 @@ package's npmjs.com settings page, not in this repo.
 - Only the dtypes above are bridged (same as the built-in executor); others throw
   a clear error.
 - Not wired for the `ONNXSIM_WASM_NODE` (NODERAWFS) build or a Node smoke test yet.
-- The `JsModelExecutor` C++ / `ort_executor.mjs` bridge compiles but has not been
-  exercised at runtime yet; it needs a browser/Node folding test with
-  onnxruntime-web loaded (the JS runner registered on the Module).
+- The npm package now has a fake-runtime contract test for the batched hook;
+  an end-to-end WASM folding test with onnxruntime-web loaded remains useful
+  for validating the Asyncify boundary itself.
