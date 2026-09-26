@@ -62,8 +62,11 @@ async function setupOrtWebIfNeeded(runtime) {
     const ort = ortMod.default ?? ortMod;
     // Pull the matching wasm binaries from the same CDN directory.
     ort.env.wasm.wasmPaths = ORT_BASE;
-    // JsModelExecutor::Run reaches this via val::module_property("onnxsimOrtWebRun").
-    runtime.onnxsimOrtWebRun = makeOrtRunner(ort);
+    // The generic hook is used by default WASM builds. Keep the legacy alias
+    // for ORT_WEB builds and older generated modules.
+    const runner = makeOrtRunner(ort);
+    runtime.onnxsimModelExecutorRun = runner;
+    runtime.onnxsimOrtWebRun = runner;
 }
 
 create_onnxsim({

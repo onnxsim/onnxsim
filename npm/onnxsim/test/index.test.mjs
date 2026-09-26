@@ -4,8 +4,8 @@
 // -- see scripts/build_npm_package.sh, or .github/workflows/static.yml, which
 // runs this right after its own build via `npm test`.
 //
-// simplify() runs with constantFolding disabled here so the test never needs
-// onnxruntime-web's wasm assets located on disk (see docs/wasm_ort_web.md):
+// Most simplify() checks run with constantFolding disabled here so they never
+// need onnxruntime-web's wasm assets located on disk (see docs/wasm_ort_web.md):
 // this exercises the embind marshaling, shape inference, and onnx-optimizer
 // passes, not the onnxruntime-web constant-folding bridge -- that path is
 // covered by the convertmodel demo's own inference test
@@ -89,9 +89,11 @@ import {
   quantizeWeightOnlyInt16,
   quantizeWeightOnlyMatMulNbits,
   quantizeWeightOnlyMxfp4,
+  setModelExecutorRunner,
   simplify,
   versions,
 } from "../index.mjs";
+import { makeOrtRunner } from "../ort_executor.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "..", "..", "scripts", "convertmodel", "test", "model.onnx");
@@ -157,6 +159,21 @@ try {
     assert.ok(v.onnxsim.length > 0);
     assert.equal(typeof v.onnx_optimizer, "string");
     assert.ok(v.onnx_optimizer.length > 0);
+  });
+
+  await check("custom executor hook can be installed in WASM", async () => {
+    const ort = await import("onnxruntime-web");
+    const dist = join(HERE, "..", "node_modules", "onnxruntime-web", "dist") + "/";
+    ort.env.wasm.wasmPaths = dist;
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.proxy = false;
+    const ortRunner = makeOrtRunner(ort);
+    await setModelExecutorRunner(async (...args) => {
+      return ortRunner(...args);
+    });
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const { model } = await simplify(input, { constantFolding: true });
+    assert.ok(model.length > 0);
   });
 
   // Data-free C++ passes: the fixture (MatMul+Add+Relu, X:[N,4], W:[4,3])

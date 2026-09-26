@@ -19,23 +19,22 @@
 // (built without ONNXSIM_HAS_ORT), shrinking the module and removing the ORT
 // compile from the build.
 //
-// This path is only compiled for Emscripten and only when the build opts into
-// it via the ONNXSIM_WASM_ORT_WEB CMake option (which also defines the macro of
-// the same name). See docs/wasm_ort_web.md for the design and caveats -- most
-// importantly the synchronous-C++/asynchronous-JS bridge, which requires the
-// module to be linked with Asyncify so _Run can block on the onnxruntime-web
-// Promise.
+// This path is compiled for Emscripten by default. The host may install a
+// custom ModelExecutor callback (remote, WebGPU, worker, or onnxruntime-web);
+// when no callback is installed, the implementation falls back to built-in
+// ORT if that backend is present. The synchronous-C++/asynchronous-JS bridge
+// requires the module to be linked with Asyncify.
 #pragma once
 
-#if defined(__EMSCRIPTEN__) && defined(ONNXSIM_WASM_ORT_WEB)
+#if defined(__EMSCRIPTEN__) && defined(ONNXSIM_WASM_HOOKABLE_EXECUTOR)
 
 #include <memory>
 
-#include "onnxsim.h"  // ModelExecutor
+#include "onnxsim.h" // ModelExecutor
 
 // Returns the singleton onnxruntime-web-backed executor. Its Run reaches into
 // JavaScript for the actual session run, so it must be called from a context
 // linked with Asyncify (as onnxsimplify_export is in the ORT-web build).
 std::shared_ptr<const ModelExecutor> GetJsModelExecutor();
 
-#endif  // __EMSCRIPTEN__ && ONNXSIM_WASM_ORT_WEB
+#endif // __EMSCRIPTEN__ && ONNXSIM_WASM_HOOKABLE_EXECUTOR

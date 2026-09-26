@@ -89,6 +89,18 @@ class Profiler {
   // themselves, so that count is never computed when profiling is off.
   void RecordNodeCount(const std::string& loop, size_t node_count);
 
+  // Add an event produced by a remote executor or accelerator. ``ts_us`` is
+  // in this profiler's timeline, and ``args_json`` must be a JSON object (or
+  // empty for no arguments). This is intentionally separate from ProfiledScope
+  // because the event may have been measured by another process.
+  void RecordExternalEvent(const std::string& name, const std::string& category,
+                           uint64_t ts_us, uint64_t duration_us,
+                           const std::string& args_json = "{}");
+
+  // Elapsed wall-clock time since Enable(), in microseconds. Remote clients
+  // use this to anchor worker-relative timestamps in the local trace.
+  uint64_t ElapsedMicros() const;
+
  private:
   Profiler() = default;
   ~Profiler();

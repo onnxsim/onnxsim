@@ -7,6 +7,59 @@ host, or let `onnxsim.simplify` evaluate constant folding on that machine. It bo
 smaller protocol of its own. It is **not** wire-compatible with TVM's RPC; see
 [Relationship to TVM RPC](#relationship-to-tvm-rpc).
 
+The dependency-free native transport also supports optional worker-side
+profiling. `Off` adds no profile payload, `Summary` returns aggregate runner
+timings, and `Detailed` returns bounded events with request-relative timestamps.
+The host anchors those events into the onnxsim Chrome/Perfetto trace alongside
+the host-side `RemoteRPC` duration. This is suitable for constrained
+Snapdragon/AX8850 workers because the device needs neither a JSON library nor
+clock synchronization.
+
+The transport is independent of the control-plane protocol. A ROS2/rosbridge
+or DORA gateway can expose discovery, compile, run, and profile actions while
+forwarding the same binary tensor and profile payloads. Large tensors and
+traces should stay binary; use the control plane for metadata, request IDs,
+health, and progress.
+
+For DORA specifically, `tools/onnx-remote/onnx-remote-dora-node` is an optional
+C node adapter. Its `run` input and `result` output carry the transport's
+payload-only format as raw UInt8 messages, so DORA does not need to understand
+the ONNX tensor schema. The adapter forwards to the existing TCP worker and
+can therefore be used with the reference or AXCL worker.
+
+## External compiler and artifact caching
+
+The native executor keeps the original model-per-run path as the default. With
+`RemoteExecutorOptions.compile_model=true`, each distinct serialized fold-group
+is compiled once and subsequent runs use the returned artifact ID. The
+compiler response may include an opaque manifest and inline artifact bytes.
+
+Compilation and execution may use different endpoints: `compile_host` and
+`compile_port` select the compiler, while the existing `host` and `port` select
+the runner. An empty compiler host or zero compiler port falls back to the
+runner endpoint.
+
+Caching is split deliberately: onnxsim owns a short-lived in-process cache to
+avoid compiling the same subgraph repeatedly during one simplification; the
+compiler/runner owns persistent artifact caching and compatibility validation.
+The latter is the only component that knows whether an artifact remains valid
+for a particular compiler, SDK, driver, device, and I/O ABI.
+
+`tools/onnx-remote/onnx-remote-compiler` provides a small dependency-free
+compiler endpoint for this split. It accepts `COMPILE` requests, invokes a
+trusted command template with `{input}`, `{output}`, `{manifest}`, and
+`{target}` paths, and persists the resulting artifact and manifest. This is a
+convenient SNPE replacement boundary: a QAIRT/QNN wrapper can perform ONNX
+conversion, legalization, and context-binary generation on the compile host,
+while the execution host only receives the final artifact. The service has a
+passthrough mode for transport tests; it is not itself a QNN compiler.
+
+Compiled execution can optionally use a load/attach handshake: the host sends
+`load_compiled(artifact_id, artifact)` once to the runner, then sends
+`run_compiled(artifact_id, tensors)` without repeating the artifact bytes. The
+native executor keeps this disabled by default for stateless compatibility; set
+`attach_compiled_artifact=true` for a runner with persistent artifact storage.
+
 ```python
 import numpy as np
 import onnxsim

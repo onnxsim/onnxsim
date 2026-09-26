@@ -28,6 +28,7 @@ import argparse
 import csv
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -36,16 +37,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import models  # noqa: E402
-
 FAIL_STATUSES = {"qnn_regression", "simplify_error", "crash", "timeout", "error"}
 
 
-def run_one(model_name: str, timeout: int) -> dict:
+def run_one(model_name: str, timeout: int, onnx_path: str | None = None) -> dict:
     t0 = time.time()
     try:
         proc = subprocess.run(
-            [sys.executable, os.path.join(HERE, "worker.py"), model_name],
+            [
+                sys.executable,
+                os.path.join(HERE, "worker.py"),
+                model_name,
+                *([onnx_path] if onnx_path else []),
+            ],
             capture_output=True,
             text=True,
             timeout=None if timeout <= 0 else timeout,
@@ -80,6 +84,13 @@ def main() -> int:
         help="subset of model names to run (default: the whole suite)",
     )
     ap.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        metavar="MODEL.onnx",
+        help="also run an on-disk ONNX model (repeatable)",
+    )
+    ap.add_argument(
         "--timeout",
         type=int,
         default=600,
@@ -93,15 +104,25 @@ def main() -> int:
     ap.add_argument("--output", default="qnn-compat.csv")
     args = ap.parse_args()
 
-    selected = args.models or models.names()
-    print(f"QNN compatibility check | {len(selected)} models", flush=True)
+    selected = args.models or []
+    if not args.model and not selected:
+        import models
+
+        selected = models.names()
+    external = [(Path(path).stem, path) for path in args.model]
+    missing = [path for _, path in external if not os.path.isfile(path)]
+    if missing:
+        ap.error("ONNX model does not exist: " + ", ".join(missing))
+    total = len(selected) + len(external)
+    print(f"QNN compatibility check | {total} models", flush=True)
 
     rows = []
     failures = []
     skipped = 0
-    for i, name in enumerate(selected, 1):
-        print(f"[{i}/{len(selected)}] {name} ...", end=" ", flush=True)
-        r = run_one(name, args.timeout)
+    cases = [(name, None) for name in selected] + external
+    for i, (name, onnx_path) in enumerate(cases, 1):
+        print(f"[{i}/{total}] {name} ...", end=" ", flush=True)
+        r = run_one(name, args.timeout, onnx_path)
         rows.append(r)
         status = r.get("status")
         if status == "skipped":
@@ -138,7 +159,7 @@ def main() -> int:
             w.writerow(r)
     print(f"\nwrote {args.output} ({len(rows)} rows)", flush=True)
 
-    if skipped == len(selected):
+    if skipped == total:
         msg = "QNN EP unavailable on this host; all models skipped."
         if args.require_qnn:
             print(f"\n{msg} (--require-qnn set -> failing)", flush=True)

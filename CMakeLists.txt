@@ -40,7 +40,19 @@ option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
 option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
 option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" OFF)
+option(ONNXSIM_REMOTE_TRANSPORT "Build the dependency-free remote tensor transport and reference worker" OFF)
+option(ONNXSIM_REMOTE_DORA "Build the optional DORA C node adapter" OFF)
+option(ONNXSIM_BUILTIN_REMOTE_EXECUTOR "Bundle the native remote ModelExecutor (requires ONNXSIM_REMOTE_TRANSPORT)" OFF)
 option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
+if (EMSCRIPTEN)
+  option(ONNXSIM_WASM_HOOKABLE_EXECUTOR "Build the hookable JavaScript ModelExecutor bridge in the default WASM module" ON)
+else()
+  option(ONNXSIM_WASM_HOOKABLE_EXECUTOR "Build the hookable JavaScript ModelExecutor bridge in the default WASM module" OFF)
+endif()
+if (ONNXSIM_WASM_ORT_WEB)
+  set(ONNXSIM_WASM_HOOKABLE_EXECUTOR ON CACHE BOOL
+      "The ORT-web mode requires the hookable JavaScript executor" FORCE)
+endif()
 # Opt-in additional ModelExecutor backend (see onnxsim/xnnpack_executor.h and
 # docs/dlpack-executor.md): runs constant-folding fold groups through Google's
 # XNNPACK instead of ONNX Runtime, for a small, explicitly-supported subset of
@@ -157,6 +169,19 @@ add_subdirectory(third_party/onnx EXCLUDE_FROM_ALL)
 
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
+if (ONNXSIM_REMOTE_TRANSPORT)
+  add_subdirectory(tools/onnx-remote EXCLUDE_FROM_ALL)
+endif()
+if (ONNXSIM_REMOTE_DORA AND NOT ONNXSIM_REMOTE_TRANSPORT)
+  message(FATAL_ERROR "ONNXSIM_REMOTE_DORA requires ONNXSIM_REMOTE_TRANSPORT=ON")
+endif()
+if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR AND NOT ONNXSIM_REMOTE_TRANSPORT)
+  message(FATAL_ERROR "ONNXSIM_BUILTIN_REMOTE_EXECUTOR requires ONNXSIM_REMOTE_TRANSPORT=ON")
+endif()
+if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR AND EMSCRIPTEN)
+  message(FATAL_ERROR "ONNXSIM_BUILTIN_REMOTE_EXECUTOR is not supported for Emscripten")
+endif()
+
 # BLAKE3 (third_party/blake3, a git submodule pinned to a specific upstream
 # commit -- see .gitmodules / `git submodule status`, and LICENSE_A2 /
 # LICENSE_CC0 in that directory) backing TensorPool::ContentHash's default
@@ -181,6 +206,11 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_USE_NEON=0)
 
 add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
+
+if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
+  target_sources(onnxsim PRIVATE onnxsim/remote_executor.cpp)
+  target_compile_definitions(onnxsim PUBLIC ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
+endif()
 
 # ~50 self-contained LLM/PTQ quantization- and pruning-algorithm entry points
 # (see the ONNXSIM_NON_CORE_FEATURES option above for the rationale) --
@@ -216,6 +246,14 @@ if (ONNXSIM_BUILTIN_ORT)
   # `cmake --install` of the ExternalProject build -- see that file), so
   # onnxsim.cpp/dlpack_bridge.h include onnxruntime_cxx_api.h directly.
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+endif()
+if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
+  target_link_libraries(onnxsim onnx_remote_transport)
+  # remote_executor.h exposes the transport profiling level to native clients.
+  # Keep this explicit instead of relying on transitive include propagation so
+  # the option also works with older CMake/link interface behavior.
+  target_include_directories(onnxsim PRIVATE
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tools/onnx-remote)
 endif()
 if (ONNXSIM_BUILTIN_XNNPACK)
   # onnx_to_xnnpack_subgraph.cpp / xnnpack_executor.cpp include xnnpack.h
@@ -285,21 +323,23 @@ endfunction()
 
 if(EMSCRIPTEN)
   list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/interface.cpp)
-  if (ONNXSIM_WASM_ORT_WEB)
-    # The onnxruntime-web-backed executor (compiled only in this mode).
+  if (ONNXSIM_WASM_HOOKABLE_EXECUTOR)
+    # Hookable JavaScript executor; it falls back to built-in ORT when no
+    # callback is installed.
     list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/js_model_executor.cpp)
   endif()
 endif()
 
 # onnxsim_bin needs a constant-folding executor: GetBuiltinModelExecutor()
-# (ONNXSIM_HAS_ORT) natively, or GetJsModelExecutor() (ONNXSIM_WASM_ORT_WEB)
+# (ONNXSIM_HAS_ORT) natively, or GetJsModelExecutor()
+# (ONNXSIM_WASM_HOOKABLE_EXECUTOR) under Emscripten.
 # under Emscripten. With neither -- ONNXSIM_BUILTIN_ORT=OFF on a native,
 # non-Emscripten build, e.g. the Python wheel's own configure -- there is no
 # executor available at all, so exclude it from the default `all` target
 # rather than failing that build (setup.py already only ever targets
 # onnxsim_cpp2py_export explicitly; this just keeps a plain `cmake --build .`
 # from tripping over a target that cannot link in that configuration).
-if (ONNXSIM_HAS_ORT OR ONNXSIM_WASM_ORT_WEB)
+if (ONNXSIM_HAS_ORT OR ONNXSIM_WASM_ORT_WEB OR ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   add_executable(
     onnxsim_bin
     onnxsim/bin/onnxsim_bin.cpp
@@ -349,11 +389,11 @@ else()
   onnxsim_add_ort_rpath(onnxsim_bin)
 endif()
 
-if (ONNXSIM_WASM_ORT_WEB)
+if (ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   # interface.cpp / onnxsim_bin.cpp select GetJsModelExecutor() under this define
   # and js_model_executor.cpp implements it. onnxsim_bin.cpp lives in onnxsim/bin,
   # so add scripts/convertmodel to its include path to find js_model_executor.h.
-  target_compile_definitions(onnxsim_bin PRIVATE ONNXSIM_WASM_ORT_WEB)
+  target_compile_definitions(onnxsim_bin PRIVATE ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   target_include_directories(onnxsim_bin PRIVATE scripts/convertmodel)
   # JsModelExecutor::_Run blocks on an onnxruntime-web Promise via
   # emscripten::val::await(), which requires Asyncify. Asyncify also makes the
@@ -361,6 +401,12 @@ if (ONNXSIM_WASM_ORT_WEB)
   # larger Asyncify stack covers the deep Simplify -> RunOps -> _Run call chain
   # that is unwound and rewound across each fold group's await.
   target_link_options(onnxsim_bin PRIVATE "-sASYNCIFY" "-sASYNCIFY_STACK_SIZE=131072")
+endif()
+
+if (ONNXSIM_WASM_NODE)
+  # The Node build is intentionally separate from the browser module.  Keep
+  # host filesystem access opt-in so the published/browser WASM stays portable.
+  target_link_options(onnxsim_bin PRIVATE "-sNODERAWFS=1" "-sENVIRONMENT=node")
 endif()
 
 if (ONNXSIM_C_API)

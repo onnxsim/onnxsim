@@ -181,6 +181,14 @@ struct NodeCountSample {
   size_t node_count;
 };
 
+struct ExternalEvent {
+  std::string name;
+  std::string category;
+  uint64_t ts_us;
+  uint64_t dur_us;
+  std::string args_json;
+};
+
 // The calling thread's live span stack. File-scope thread_local so the header
 // stays free of <vector>.
 thread_local std::vector<Frame> g_stack;
@@ -196,6 +204,7 @@ struct Profiler::Impl {
   std::vector<Event> events;
   std::vector<Sample> samples;
   std::vector<NodeCountSample> node_counts;
+  std::vector<ExternalEvent> external_events;
   // Paths of ONNX Runtime's own per-session traces to merge at Finish().
   std::vector<std::string> ort_trace_paths;
 
@@ -334,6 +343,26 @@ void Profiler::RecordNodeCount(const std::string& loop, size_t node_count) {
   }
   std::lock_guard<std::mutex> lk(impl_->mu);
   impl_->node_counts.push_back({loop, impl_->NowUs(), node_count});
+}
+
+uint64_t Profiler::ElapsedMicros() const {
+  if (!enabled_ || impl_ == nullptr) {
+    return 0;
+  }
+  return impl_->NowUs();
+}
+
+void Profiler::RecordExternalEvent(const std::string& name,
+                                   const std::string& category, uint64_t ts_us,
+                                   uint64_t duration_us,
+                                   const std::string& args_json) {
+  if (!enabled_ || impl_ == nullptr) {
+    return;
+  }
+  ExternalEvent event{name, category, ts_us, duration_us,
+                      args_json.empty() ? "{}" : args_json};
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  impl_->external_events.push_back(std::move(event));
 }
 
 namespace {
@@ -721,6 +750,11 @@ void Profiler::Finish() {
   comma();
   json << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":0,"
           "\"args\":{\"name\":\"RSS (MiB)\"}}";
+  if (!impl_->external_events.empty()) {
+    comma();
+    json << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,"
+            "\"tid\":200000000,\"args\":{\"name\":\"remote device\"}}";
+  }
 
   // Name each worker track after the fact so the flame graph labels threads.
   std::unordered_map<uint64_t, bool> seen_tid;
@@ -755,6 +789,17 @@ void Profiler::Finish() {
     for (const auto& p : ort_paths) {
       std::remove(p.c_str());
     }
+  }
+
+  // Events measured by a remote runner are already aligned to the local
+  // profiler clock by the executor. Keep them on a separate track so the
+  // remote device timeline is visible beside the host/RPC span.
+  for (const auto& ev : impl_->external_events) {
+    comma();
+    json << "{\"name\":\"" << JsonEscape(ev.name) << "\",\"cat\":\""
+         << JsonEscape(ev.category) << "\",\"ph\":\"X\",\"ts\":" << ev.ts_us
+         << ",\"dur\":" << ev.dur_us << ",\"pid\":1,\"tid\":200000000,\"args\":"
+         << (ev.args_json.empty() ? "{}" : ev.args_json) << "}";
   }
 
   // The RSS-over-time curve as counter events (a track in the timeline).

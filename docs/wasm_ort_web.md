@@ -1,8 +1,35 @@
-# WASM constant folding via onnxruntime-web (experimental)
+# Hookable WASM constant folding
 
-**Status: experimental / work in progress.** Opt-in, `OFF` by default. The
-default WebAssembly build is unchanged. This document describes the design and
-how to build and test the variant.
+**Status: experimental / work in progress.** Emscripten builds include the
+hookable executor by default. The normal build still uses its built-in ONNX
+Runtime when no JavaScript callback is installed; the `ORT_WEB=ON` variant
+uses the same hook to delegate execution to `onnxruntime-web`.
+
+## Installing a custom executor
+
+The host can replace constant-folding execution by assigning a callback before
+calling the simplifier:
+
+```js
+runtime.onnxsimModelExecutorRun = async (modelBytes, inputsData, inputsMeta) => {
+  return await remoteRunner(modelBytes, inputsData, inputsMeta);
+};
+```
+
+For the npm wrapper, use its public helper:
+
+```js
+import { setModelExecutorRunner, simplify } from "onnxsim";
+
+await setModelExecutorRunner((modelBytes, inputsData, inputsMeta) =>
+  remoteRunner(modelBytes, inputsData, inputsMeta));
+const result = await simplify(model);
+```
+
+The callback may forward the batched payload to a remote runner, WebGPU, a
+worker, or an embedded accelerator. It returns `{ data, meta }`, synchronously
+or as a Promise. The legacy `runtime.onnxsimOrtWebRun` property remains
+accepted for compatibility.
 
 ## What this is
 
@@ -36,10 +63,10 @@ Simplify → RunOps → executor.Run(subModel, DLManagedTensor feeds)  (C++, onn
                         │
                         │  JsModelExecutor (js_model_executor.cpp)
                         │   - concat all feed bytes + a flat meta array (one copy each)
-                        │   - Module.onnxsimOrtWebRun(modelBytes, inputsData, inputsMeta)
+                        │   - Module.onnxsimModelExecutorRun(modelBytes, inputsData, inputsMeta)
                         │   - .await() the returned Promise  ← needs Asyncify
                         ▼
-        onnxsimOrtWebRun (ort_executor.mjs, makeOrtRunner)  (JS)
+        onnxsimModelExecutorRun (ort_executor.mjs, makeOrtRunner)  (JS)
                         │   - ort.InferenceSession.create(modelBytes)
                         │   - session.run(feeds)
                         ▼
@@ -51,7 +78,7 @@ The C++↔JS contract (see `js_model_executor.cpp` and `ort_executor.mjs`) is
 blob plus one flat metadata array, in both directions, so the number of embind
 round trips is O(1) rather than O(tensors × fields):
 
-- **Input**: `onnxsimOrtWebRun(modelBytes, inputsData, inputsMeta)`, where
+- **Input**: `onnxsimModelExecutorRun(modelBytes, inputsData, inputsMeta)`, where
   `inputsData` is every feed's raw little-endian bytes concatenated and
   `inputsMeta` is a `Float64Array` of `[dtype, ndim, dims...]` per feed
   (`dtype` = ONNX `TensorProto.DataType`).
@@ -97,7 +124,7 @@ fork is linked directly either way -- see CMakeLists.txt), compiles
 
 Deploy the resulting `onnxsim.js` / `onnxsim.wasm` next to the page as usual.
 `worker.js` detects the variant at runtime via `onnxsim_needs_ort_web()`, loads
-onnxruntime-web from the CDN, and registers `Module.onnxsimOrtWebRun` before the
+onnxruntime-web from the CDN, and registers `Module.onnxsimModelExecutorRun` before the
 first conversion. The built-in-ORT build reports `false` and the worker path is
 byte-for-byte the old behavior.
 
@@ -204,7 +231,9 @@ package's npmjs.com settings page, not in this repo.
   coarser batching is a likely optimization.
 - Only the dtypes above are bridged (same as the built-in executor); others throw
   a clear error.
-- Not wired for the `ONNXSIM_WASM_NODE` (NODERAWFS) build or a Node smoke test yet.
-- The `JsModelExecutor` C++ / `ort_executor.mjs` bridge compiles but has not been
-  exercised at runtime yet; it needs a browser/Node folding test with
-  onnxruntime-web loaded (the JS runner registered on the Module).
+- `build_wasm.sh ON` now forwards `ONNXSIM_WASM_NODE=ON` and enables
+  NODERAWFS/Node-only linking; run `node scripts/wasm_node_smoke.mjs
+  build-wasm-node-ON/onnxsim.js` after that build for the module smoke test.
+- The npm package has both a fake-runtime contract test and an end-to-end
+  folding test using `onnxruntime-web`; a browser-side remote-runner test is
+  still useful for validating a real network/worker boundary.

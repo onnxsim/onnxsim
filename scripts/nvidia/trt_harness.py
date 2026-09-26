@@ -9,6 +9,7 @@ script (run under the TensorRT interpreter) consumes them.
 
     python trt_harness.py build model.onnx [--fp16] [--int8]
     python trt_harness.py compare DIR [--fp16] [--int8]
+    python trt_harness.py profile model.engine [--iters 50]
 
 CUDA is reached through ``libcudart`` via ctypes so no pycuda / cuda-python
 install is needed.
@@ -184,15 +185,40 @@ def _cmd_compare(args):
     return rc
 
 
+def _cmd_profile(args):
+    """Measure a serialized engine and emit a runner-friendly JSON record."""
+    blob = Path(args.engine).read_bytes()
+    outputs, mean_ms = run_engine(blob, iters=args.iters, warmup=args.warmup)
+    result = {
+        "engine": str(args.engine),
+        "iterations": args.iters,
+        "warmup": args.warmup,
+        "mean_ms": round(mean_ms, 4),
+        "outputs": {
+            name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+            for name, value in outputs.items()
+        },
+    }
+    if args.json:
+        print(json.dumps(result, indent=1))
+    else:
+        print(f"engine: {args.engine}\nmean_ms: {result['mean_ms']}\n"
+              f"iterations: {args.iters}\nwarmup: {args.warmup}")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name, fn in (("build", _cmd_build), ("compare", _cmd_compare)):
+    for name, fn in (("build", _cmd_build), ("compare", _cmd_compare),
+                     ("profile", _cmd_profile)):
         sp = sub.add_parser(name)
-        sp.add_argument("onnx" if name == "build" else "dir")
+        sp.add_argument("onnx" if name == "build" else
+                        "dir" if name == "compare" else "engine")
         sp.add_argument("--fp16", action="store_true")
         sp.add_argument("--int8", action="store_true")
         sp.add_argument("--iters", type=int, default=50)
+        sp.add_argument("--warmup", type=int, default=10)
         sp.add_argument("--json", action="store_true")
         sp.set_defaults(fn=fn)
     args = p.parse_args(argv)

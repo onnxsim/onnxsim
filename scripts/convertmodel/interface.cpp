@@ -24,10 +24,11 @@
 #define ONNX_OPTIMIZER_VERSION_STRING "unknown"
 #endif
 
-// In the ORT-web build (ONNXSIM_WASM_ORT_WEB) onnxsim is compiled without
-// ONNXSIM_HAS_ORT -- no ONNX Runtime is linked in -- and constant folding is
-// delegated to the page's onnxruntime-web via this executor instead.
-#ifdef ONNXSIM_WASM_ORT_WEB
+// In a hookable WASM build (ONNXSIM_WASM_HOOKABLE_EXECUTOR), constant folding
+// can be delegated to a page-provided executor via this bridge. The ORT-web
+// variant is compiled without ONNXSIM_HAS_ORT; the default WASM build keeps
+// its built-in ORT fallback.
+#ifdef ONNXSIM_WASM_HOOKABLE_EXECUTOR
 #include "js_model_executor.h"
 #endif
 
@@ -292,7 +293,7 @@ em::val onnxsimplify_export(const std::string &data, em::val skip_optimizers,
   onnx::ModelProto optimized;
   try {
     optimized = Simplify(
-#ifdef ONNXSIM_WASM_ORT_WEB
+#ifdef ONNXSIM_WASM_HOOKABLE_EXECUTOR
         // Runs each fold group through the page's onnxruntime-web. Its Run
         // blocks on a JS Promise, so this whole function is Asyncified and
         // returns a Promise to JS (the worker awaits it).
@@ -832,7 +833,7 @@ em::val onnxsim_fold_constant(const std::string &data,
   }
   try {
     onnx::ModelProto folded = FoldConstantOnce(
-#ifdef ONNXSIM_WASM_ORT_WEB
+#ifdef ONNXSIM_WASM_HOOKABLE_EXECUTOR
         *GetJsModelExecutor(),
 #else
         *GetBuiltinModelExecutor(),
@@ -3096,7 +3097,7 @@ ParseCalibrationBatches(em::val batches_val) {
 // The executor calibration-driven passes run probe sub-models through --
 // the same selection fold_constant makes (see its own call site above).
 const ModelExecutor &CalibrationExecutor() {
-#ifdef ONNXSIM_WASM_ORT_WEB
+#ifdef ONNXSIM_WASM_HOOKABLE_EXECUTOR
   return *GetJsModelExecutor();
 #else
   return *GetBuiltinModelExecutor();

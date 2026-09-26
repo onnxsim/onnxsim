@@ -45,6 +45,16 @@ const { model, trace } = await simplify(input, {
 });
 ```
 
+Constant-folding subgraphs can be sent to a custom runner (for example a
+remote accelerator) with `setModelExecutorRunner`:
+
+```js
+import { setModelExecutorRunner } from "onnxsim";
+
+await setModelExecutorRunner((modelBytes, inputsData, inputsMeta) =>
+  remoteRunner(modelBytes, inputsData, inputsMeta));
+```
+
 ## Why not the native Python/C++ build?
 
 The Python package (`pip install onnxsim`) and the Rust crate use a native

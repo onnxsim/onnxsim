@@ -1,0 +1,97 @@
+name: Native remote executor
+
+on:
+  pull_request:
+    paths:
+      - "onnxsim/remote_executor.*"
+      - "onnxsim/profiler.*"
+      - "onnxsim/profile_merge.py"
+      - "onnxsim/remote_manifest.py"
+      - "tools/onnx-remote/**"
+      - "scripts/qualcomm/**"
+      - "scripts/nvidia/trt_compile.py"
+      - "tests/test_qnn_compat_cli.py"
+      - "tests/test_trt_compile_cli.py"
+      - "tests/test_remote_manifest.py"
+      - "docs/remote-manifest.md"
+      - ".github/workflows/remote-executor.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "onnxsim/remote_executor.*"
+      - "onnxsim/profiler.*"
+      - "onnxsim/profile_merge.py"
+      - "onnxsim/remote_manifest.py"
+      - "tools/onnx-remote/**"
+      - "scripts/qualcomm/**"
+      - "scripts/nvidia/trt_compile.py"
+      - "tests/test_qnn_compat_cli.py"
+      - "tests/test_trt_compile_cli.py"
+      - "tests/test_remote_manifest.py"
+      - "docs/remote-manifest.md"
+      - ".github/workflows/remote-executor.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transport:
+    name: transport and compiler service
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S tools/onnx-remote -B build/onnx-remote -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/onnx-remote -j2
+      - name: Unit tests
+        run: ctest --test-dir build/onnx-remote --output-on-failure
+      - name: Reference worker smoke test
+        run: |
+          build/onnx-remote/onnx-remote-worker --port 39501 >"${RUNNER_TEMP}/remote-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-client --self-test
+      - name: Compiled artifact attach smoke test
+        run: |
+          build/onnx-remote/onnx-remote-mock-runner --port 39510 >"${RUNNER_TEMP}/mock-runner.log" 2>&1 &
+          mock_pid=$!
+          trap 'kill "$mock_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-attach-test 127.0.0.1 39510
+      - name: Compiler service cache smoke test
+        run: |
+          python3 -c "from pathlib import Path; Path('${RUNNER_TEMP}/model.onnx').write_bytes(b'smoke-model')"
+          build/onnx-remote/onnx-remote-compiler \
+            --port 39502 --cache-dir "${RUNNER_TEMP}/compiler-cache" \
+            --compiler-id ci-passthrough >"${RUNNER_TEMP}/remote-compiler.log" 2>&1 &
+          compiler_pid=$!
+          trap 'kill "$compiler_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          first=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          second=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          first_id=$(printf '%s\n' "$first" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
+          second_id=$(printf '%s\n' "$second" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
+          test -n "$first_id" && test "$first_id" = "$second_id"
+          marker=$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)
+          artifact="${marker%.complete}.artifact"
+          test -n "$marker" && test -f "$artifact"
+          printf 'corrupt-cache-entry' >"$artifact"
+          recovered=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          recovered_bytes=$(printf '%s\n' "$recovered" | sed -n 's/^artifact_id=[^ ]* bytes=\([0-9]*\).*/\1/p')
+          test "$recovered_bytes" = 11
+
+  python-driver:
+    name: Qualcomm harness driver tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install pytest
+      - name: Run dependency-light tests
+        run: python -m pytest -q tests/test_qnn_compat_cli.py tests/test_trt_compile_cli.py tests/test_remote_manifest.py
