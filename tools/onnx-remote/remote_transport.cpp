@@ -15,7 +15,7 @@ namespace onnx_remote {
 namespace {
 
 constexpr uint32_t kMagic = 0x4f525452u;  // ORTR
-constexpr uint16_t kVersion = 3;
+constexpr uint16_t kVersion = 4;
 constexpr uint16_t kRun = 1;
 constexpr uint16_t kOk = 2;
 constexpr uint16_t kError = 3;
@@ -76,8 +76,34 @@ bool take_string(const std::vector<char>& b, size_t& at, uint32_t max_bytes,
   at += n;
   return true;
 }
+size_t dtype_bytes(uint8_t dtype) {
+  switch (dtype) {
+    case 1:  // FLOAT
+    case 6:  // INT32
+    case 12: // UINT32
+      return 4;
+    case 2:  // UINT8
+    case 3:  // INT8
+    case 9:  // BOOL
+      return 1;
+    case 4:  // UINT16
+    case 5:  // INT16
+    case 10: // FLOAT16
+    case 16: // BFLOAT16
+      return 2;
+    case 7:  // INT64
+    case 11: // DOUBLE
+    case 13: // UINT64
+      return 8;
+    default:
+      return 0;
+  }
+}
+
 bool checked_tensor(const Tensor& t, std::string& error) {
   if (t.shape.size() > kMaxRank) { error = "tensor rank exceeds limit"; return false; }
+  const size_t element_bytes = dtype_bytes(t.dtype);
+  if (element_bytes == 0) { error = "unsupported tensor dtype"; return false; }
   uint64_t elements = 1;
   for (int64_t d : t.shape) {
     if (d <= 0 || static_cast<uint64_t>(d) > kMaxTensorBytes ||
@@ -86,10 +112,15 @@ bool checked_tensor(const Tensor& t, std::string& error) {
     }
     elements *= static_cast<uint64_t>(d);
   }
-  if (elements * sizeof(float) != t.data.size() * sizeof(float)) {
-    error = "tensor shape/data size mismatch"; return false;
+  const uint64_t payload_bytes = elements * element_bytes;
+  if (t.dtype == 1) {
+    if (!t.raw_data.empty() || elements != t.data.size()) {
+      error = "float32 tensor shape/data size mismatch"; return false;
+    }
+  } else if (!t.data.empty() || payload_bytes != t.raw_data.size()) {
+    error = "raw tensor shape/data size mismatch"; return false;
   }
-  if (elements * sizeof(float) > kMaxTensorBytes) { error = "tensor too large"; return false; }
+  if (payload_bytes > kMaxTensorBytes) { error = "tensor too large"; return false; }
   return true;
 }
 bool encode_tensors(const std::vector<Tensor>& ts, std::vector<char>& b, std::string& error) {
@@ -97,11 +128,19 @@ bool encode_tensors(const std::vector<Tensor>& ts, std::vector<char>& b, std::st
   put_u32(b, static_cast<uint32_t>(ts.size()));
   for (const Tensor& t : ts) {
     if (!checked_tensor(t, error)) return false;
+    put_u32(b, t.dtype);
     put_u32(b, static_cast<uint32_t>(t.shape.size()));
     for (int64_t d : t.shape) put_u64(b, static_cast<uint64_t>(d));
-    put_u64(b, static_cast<uint64_t>(t.data.size()));
-    const auto* p = reinterpret_cast<const char*>(t.data.data());
-    b.insert(b.end(), p, p + t.data.size() * sizeof(float));
+    const uint64_t elements = t.dtype == 1 ? t.data.size()
+                                           : t.raw_data.size() / dtype_bytes(t.dtype);
+    put_u64(b, elements);
+    if (t.dtype == 1) {
+      const auto* p = reinterpret_cast<const char*>(t.data.data());
+      b.insert(b.end(), p, p + t.data.size() * sizeof(float));
+    } else {
+      const auto* p = reinterpret_cast<const char*>(t.raw_data.data());
+      b.insert(b.end(), p, p + t.raw_data.size());
+    }
   }
   return b.size() <= kMaxMessageBytes;
 }
@@ -110,7 +149,12 @@ bool decode_tensors(const std::vector<char>& b, size_t& at, std::vector<Tensor>&
   if (!take_u32(b, at, count) || count > kMaxTensors) { error = "invalid tensor count"; return false; }
   ts.resize(count);
   for (Tensor& t : ts) {
-    uint32_t rank; uint64_t n;
+    uint32_t dtype; uint32_t rank; uint64_t n;
+    if (!take_u32(b, at, dtype) || dtype > 255 ||
+        dtype_bytes(static_cast<uint8_t>(dtype)) == 0) {
+      error = "invalid tensor dtype"; return false;
+    }
+    t.dtype = static_cast<uint8_t>(dtype);
     if (!take_u32(b, at, rank) || rank > kMaxRank) { error = "invalid tensor rank"; return false; }
     t.shape.resize(rank); uint64_t elements = 1;
     for (auto& d : t.shape) {
@@ -120,11 +164,21 @@ bool decode_tensors(const std::vector<char>& b, size_t& at, std::vector<Tensor>&
       }
       d = static_cast<int64_t>(ud); elements *= ud;
     }
-    if (!take_u64(b, at, n) || n != elements || n * sizeof(float) > kMaxTensorBytes ||
-        at + n * sizeof(float) > b.size()) { error = "invalid tensor payload"; return false; }
-    t.data.resize(static_cast<size_t>(n));
-    std::memcpy(t.data.data(), b.data() + at, static_cast<size_t>(n) * sizeof(float));
-    at += static_cast<size_t>(n) * sizeof(float);
+    const size_t element_bytes = dtype_bytes(t.dtype);
+    if (!take_u64(b, at, n) || n != elements ||
+        n > kMaxTensorBytes / element_bytes ||
+        at + n * element_bytes > b.size()) {
+      error = "invalid tensor payload"; return false;
+    }
+    const size_t payload_bytes = static_cast<size_t>(n) * element_bytes;
+    if (t.dtype == 1) {
+      t.data.resize(static_cast<size_t>(n));
+      std::memcpy(t.data.data(), b.data() + at, payload_bytes);
+    } else {
+      t.raw_data.resize(payload_bytes);
+      std::memcpy(t.raw_data.data(), b.data() + at, payload_bytes);
+    }
+    at += payload_bytes;
   }
   return true;
 }

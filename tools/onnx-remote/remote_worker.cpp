@@ -20,6 +20,12 @@ static bool same_shape(const Tensor& a, const Tensor& b) { return a.shape == b.s
 
 static Response execute(const Request& r) {
   Response out; out.ok = false;
+  for (const Tensor& input : r.inputs) {
+    if (input.dtype != 1) {
+      out.error = "reference worker supports float32 tensors only";
+      return out;
+    }
+  }
   const auto started = std::chrono::steady_clock::now();
   auto profile = [&](const char* name, uint64_t begin, uint64_t duration) {
     if (r.profiling != ProfilingLevel::Off) {

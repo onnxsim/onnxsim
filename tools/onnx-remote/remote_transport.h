@@ -8,7 +8,13 @@ namespace onnx_remote {
 
 struct Tensor {
   std::vector<int64_t> shape;
+  // Float32 data remains the second aggregate member for source compatibility
+  // with the original transport API.
   std::vector<float> data;
+  // ONNX TensorProto.DataType value. Float32 is the default. Non-float
+  // tensors store their little-endian payload in raw_data.
+  uint8_t dtype = 1;
+  std::vector<uint8_t> raw_data;
 };
 
 enum class ProfilingLevel : uint8_t {

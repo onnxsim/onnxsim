@@ -134,9 +134,11 @@ options.port = 39501;`, and pass
 `*GetRemoteModelExecutor(options)` to the C++ simplifier API.
 The worker is intentionally a separate process: the same client-side
 executor can talk to a native ONNX Runtime worker, an accelerator compiler, or
-the optional AXCL worker. The current first implementation supports float32
-CPU tensors; adding other dtypes is a protocol/backend extension rather than
-an ABI change to `ModelExecutor`.
+the optional AXCL worker. The v4 wire protocol preserves ONNX dtype and raw
+bytes for FLOAT16, BFLOAT16, integer, DOUBLE, and BOOL tensors. The reference
+worker and native `RemoteModelExecutor` still intentionally execute float32
+only; vendor runners can consume the preserved typed payloads without changing
+the transport ABI.
 
 ### XNNPACK: an explicitly-partial backend, not a drop-in ORT replacement
 

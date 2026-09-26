@@ -31,6 +31,21 @@ int main() {
   assert(decoded_request.inputs[0].shape == request.inputs[0].shape);
   assert(decoded_request.inputs[0].data == request.inputs[0].data);
 
+  Request typed_request;
+  typed_request.op = "run_compiled";
+  Tensor fp16;
+  fp16.shape = {2};
+  fp16.dtype = 10;  // FLOAT16
+  fp16.raw_data = {0x00, 0x3c, 0x00, 0xc0};
+  typed_request.inputs.push_back(fp16);
+  assert(encode_request_payload(typed_request, payload, error));
+  Request decoded_typed;
+  assert(decode_request_payload(payload.data(), payload.size(), decoded_typed,
+                                error));
+  assert(decoded_typed.inputs[0].dtype == 10);
+  assert(decoded_typed.inputs[0].raw_data == fp16.raw_data);
+  assert(decoded_typed.inputs[0].data.empty());
+
   Response response;
   response.ok = true;
   response.outputs = request.inputs;
