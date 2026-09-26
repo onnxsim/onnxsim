@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "profiler.h"
 #include "remote_transport.h"
 
 namespace {
@@ -14,6 +15,22 @@ struct OutputOwner {
   std::vector<float> data;
   std::vector<int64_t> shape;
 };
+
+std::string JsonEscape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  for (char c : value) {
+    switch (c) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default: escaped += c; break;
+    }
+  }
+  return escaped;
+}
 
 DLManagedTensor* WrapOutput(OutputOwner* owner) {
   auto* result = new DLManagedTensor{};
@@ -42,6 +59,11 @@ class RemoteModelExecutor final : public ModelExecutor {
       const std::vector<const DLManagedTensor*>& inputs) const override {
     onnx_remote::Request request;
     request.op = options_.operation;
+    request.profiling = options_.profiling;
+    auto& profiler = onnxsim::Profiler::Instance();
+    const bool collect_profile = profiler.enabled() &&
+                                 options_.profiling != onnx_remote::ProfilingLevel::Off;
+    const uint64_t profile_anchor = collect_profile ? profiler.ElapsedMicros() : 0;
     const std::string serialized = model.SerializeAsString();
     request.model.assign(serialized.begin(), serialized.end());
     request.inputs.reserve(inputs.size());
@@ -64,9 +86,25 @@ class RemoteModelExecutor final : public ModelExecutor {
     if (fd < 0) throw std::runtime_error("remote executor: connection failed");
     std::string error;
     onnx_remote::Response response;
+    const uint64_t rpc_start = collect_profile ? profiler.ElapsedMicros() : 0;
     const bool sent = onnx_remote::send_request(fd, request, error);
     const bool received = sent && onnx_remote::receive_response(fd, response, error);
+    const uint64_t rpc_end = collect_profile ? profiler.ElapsedMicros() : 0;
     onnx_remote::close_socket(fd);
+    if (collect_profile) {
+      profiler.RecordExternalEvent(
+          "RemoteRPC", "remote_transport", rpc_start,
+          rpc_end >= rpc_start ? rpc_end - rpc_start : 0,
+          "{\"host\":\"" + JsonEscape(options_.host) + "\"}");
+      for (const auto& event : response.profile) {
+        profiler.RecordExternalEvent(
+            event.name, event.category, profile_anchor + event.start_us,
+            event.duration_us,
+            "{\"detail\":\"" + JsonEscape(event.detail) +
+                "\",\"remote_start_us\":" + std::to_string(event.start_us) +
+                "}");
+      }
+    }
     if (!received || !response.ok) {
       throw std::runtime_error("remote executor: " + (error.empty() ? response.error : error));
     }

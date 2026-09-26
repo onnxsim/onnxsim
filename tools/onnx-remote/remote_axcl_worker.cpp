@@ -15,11 +15,24 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>
 
 using namespace onnx_remote;
 
+static uint64_t elapsed_us(const std::chrono::steady_clock::time_point& start) {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start).count());
+}
+
 static Response execute_axmodel(const Request& request) {
   Response response;
+  const auto started = std::chrono::steady_clock::now();
+  auto add_profile = [&](const char* name, uint64_t begin, uint64_t duration,
+                         const char* detail) {
+    if (request.profiling != ProfilingLevel::Off) {
+      response.profile.push_back(ProfileEvent{name, "axcl", begin, duration, detail});
+    }
+  };
   uint64_t model = 0, context = 0;
   axclrtEngineIOInfo info = nullptr;
   axclrtEngineIO io = nullptr;
@@ -77,10 +90,18 @@ static Response execute_axmodel(const Request& request) {
     if (elements * sizeof(float) != output_bytes[i]) return fail("AXCL output shape/size mismatch");
     response.outputs[i].data.resize(static_cast<size_t>(elements));
   }
+  const uint64_t execute_begin = elapsed_us(started);
   if (axclrtEngineExecute(model, context, 0, io)) return fail("AXCL execute failed");
+  add_profile("axcl_execute", execute_begin,
+              elapsed_us(started) - execute_begin, "AXCL engine execution");
+  const uint64_t download_begin = elapsed_us(started);
   for (uint32_t i = 0; i < n_out; ++i)
     if (axclrtMemcpy(response.outputs[i].data.data(), outputs[i], output_bytes[i], AXCL_MEMCPY_DEVICE_TO_HOST))
       return fail("AXCL output download failed");
+  if (request.profiling == ProfilingLevel::Detailed) {
+    add_profile("axcl_download", download_begin,
+                elapsed_us(started) - download_begin, "device-to-host outputs");
+  }
   response.ok = true;
   for (void* p : inputs) axclrtFree(p);
   for (void* p : outputs) axclrtFree(p);

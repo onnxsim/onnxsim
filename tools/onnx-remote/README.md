@@ -35,6 +35,8 @@ cmake --build build/onnx-remote -j2
 The protocol library is also usable directly from a C++ remote execution
 provider.  `onnx-remote-client` is a small smoke-test client; it sends one
 input tensor containing `-2,-1,0,1,2` to `relu` and checks the response.
+The self-test also requests detailed profiling and checks that the worker
+returns at least one binary profile event.
 
 Run that smoke test while the worker is running:
 
@@ -51,6 +53,13 @@ Run that smoke test while the worker is running:
 * one request per connection for simple failure isolation;
 * explicit operation and tensor metadata, so the remote side never guesses
   dtype or shape.
+* optional `Off`, `Summary`, or `Detailed` profiling in the request;
+  profile timestamps are worker-relative and require no clock synchronization.
+
+Profile events are returned with the response rather than streamed. This keeps
+the constrained worker simple and is sufficient for a completed subgraph
+profile. A future ROS/HTTP gateway can stream progress separately while using
+the same event fields for the final trace.
 
 The next integration layer can make an ONNX Runtime plugin EP claim a maximal
 supported subgraph and send it as an operation/model handle over this

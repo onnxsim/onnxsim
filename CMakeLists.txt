@@ -236,6 +236,11 @@ if (ONNXSIM_BUILTIN_ORT)
 endif()
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
   target_link_libraries(onnxsim onnx_remote_transport)
+  # remote_executor.h exposes the transport profiling level to native clients.
+  # Keep this explicit instead of relying on transitive include propagation so
+  # the option also works with older CMake/link interface behavior.
+  target_include_directories(onnxsim PRIVATE
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tools/onnx-remote)
 endif()
 if (ONNXSIM_BUILTIN_XNNPACK)
   # onnx_to_xnnpack_subgraph.cpp / xnnpack_executor.cpp include xnnpack.h

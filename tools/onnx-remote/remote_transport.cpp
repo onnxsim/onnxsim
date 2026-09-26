@@ -13,7 +13,7 @@ namespace onnx_remote {
 namespace {
 
 constexpr uint32_t kMagic = 0x4f525452u;  // ORTR
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 2;
 constexpr uint16_t kRun = 1;
 constexpr uint16_t kOk = 2;
 constexpr uint16_t kError = 3;
@@ -61,6 +61,18 @@ void put_u32(std::vector<char>& b, uint32_t v) {
 }
 void put_u64(std::vector<char>& b, uint64_t v) {
   v = hton64(v); auto* p = reinterpret_cast<char*>(&v); b.insert(b.end(), p, p + 8);
+}
+void put_string(std::vector<char>& b, const std::string& value) {
+  put_u32(b, static_cast<uint32_t>(value.size()));
+  b.insert(b.end(), value.begin(), value.end());
+}
+bool take_string(const std::vector<char>& b, size_t& at, uint32_t max_bytes,
+                 std::string& out) {
+  uint32_t n;
+  if (!take_u32(b, at, n) || n > max_bytes || at + n > b.size()) return false;
+  out.assign(b.data() + at, n);
+  at += n;
+  return true;
 }
 bool checked_tensor(const Tensor& t, std::string& error) {
   if (t.shape.size() > kMaxRank) { error = "tensor rank exceeds limit"; return false; }
@@ -111,6 +123,49 @@ bool decode_tensors(const std::vector<char>& b, size_t& at, std::vector<Tensor>&
     t.data.resize(static_cast<size_t>(n));
     std::memcpy(t.data.data(), b.data() + at, static_cast<size_t>(n) * sizeof(float));
     at += static_cast<size_t>(n) * sizeof(float);
+  }
+  return true;
+}
+bool encode_profile(const std::vector<ProfileEvent>& events,
+                    std::vector<char>& b, std::string& error) {
+  if (events.size() > kMaxProfileEvents) {
+    error = "too many profile events";
+    return false;
+  }
+  put_u32(b, static_cast<uint32_t>(events.size()));
+  for (const ProfileEvent& event : events) {
+    if (event.name.empty() || event.name.size() > kMaxProfileNameBytes ||
+        event.category.size() > kMaxProfileNameBytes ||
+        event.detail.size() > kMaxProfileDetailBytes) {
+      error = "invalid profile event string";
+      return false;
+    }
+    put_string(b, event.name);
+    put_string(b, event.category);
+    put_u64(b, event.start_us);
+    put_u64(b, event.duration_us);
+    put_string(b, event.detail);
+  }
+  return b.size() <= kMaxMessageBytes;
+}
+bool decode_profile(const std::vector<char>& b, size_t& at,
+                    std::vector<ProfileEvent>& events, std::string& error) {
+  uint32_t count;
+  if (!take_u32(b, at, count) || count > kMaxProfileEvents) {
+    error = "invalid profile event count";
+    return false;
+  }
+  events.resize(count);
+  for (ProfileEvent& event : events) {
+    if (!take_string(b, at, kMaxProfileNameBytes, event.name) ||
+        event.name.empty() ||
+        !take_string(b, at, kMaxProfileNameBytes, event.category) ||
+        !take_u64(b, at, event.start_us) ||
+        !take_u64(b, at, event.duration_us) ||
+        !take_string(b, at, kMaxProfileDetailBytes, event.detail)) {
+      error = "invalid profile event";
+      return false;
+    }
   }
   return true;
 }
@@ -168,13 +223,19 @@ bool receive_request(int fd, Request& request, std::string& error) {
   request.model.resize(static_cast<size_t>(model_len));
   if (model_len) std::memcpy(request.model.data(), b.data() + at, static_cast<size_t>(model_len));
   at += static_cast<size_t>(model_len);
+  uint32_t profiling;
+  if (!take_u32(b, at, profiling) || profiling > static_cast<uint32_t>(ProfilingLevel::Detailed)) {
+    error = "invalid profiling level";
+    return false;
+  }
+  request.profiling = static_cast<ProfilingLevel>(profiling);
   if (!decode_tensors(b, at, request.inputs, error) || at != b.size()) { if (error.empty()) error = "trailing request bytes"; return false; }
   return true;
 }
 bool send_response(int fd, const Response& response, std::string& error) {
   std::vector<char> b;
   if (!response.ok) { put_u32(b, static_cast<uint32_t>(response.error.size())); b.insert(b.end(), response.error.begin(), response.error.end()); return send_message(fd, kError, b, error); }
-  if (!encode_tensors(response.outputs, b, error)) return false;
+  if (!encode_tensors(response.outputs, b, error) || !encode_profile(response.profile, b, error)) return false;
   return send_message(fd, kOk, b, error);
 }
 
@@ -184,6 +245,7 @@ bool send_request(int fd, const Request& request, std::string& error) {
   b.insert(b.end(), request.op.begin(), request.op.end());
   put_u64(b, request.model.size());
   b.insert(b.end(), request.model.begin(), request.model.end());
+  put_u32(b, static_cast<uint32_t>(request.profiling));
   if (!encode_tensors(request.inputs, b, error)) return false;
   return send_message(fd, kRun, b, error);
 }
@@ -205,7 +267,8 @@ bool receive_response(int fd, Response& response, std::string& error) {
     response.ok = false; response.error.assign(b.data() + at, len); return true;
   }
   response.ok = true; response.error.clear();
-  return decode_tensors(b, at, response.outputs, error) && at == b.size();
+  return decode_tensors(b, at, response.outputs, error) &&
+         decode_profile(b, at, response.profile, error) && at == b.size();
 }
 
 }  // namespace onnx_remote

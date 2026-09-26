@@ -7,6 +7,20 @@ host, or let `onnxsim.simplify` evaluate constant folding on that machine. It bo
 smaller protocol of its own. It is **not** wire-compatible with TVM's RPC; see
 [Relationship to TVM RPC](#relationship-to-tvm-rpc).
 
+The dependency-free native transport also supports optional worker-side
+profiling. `Off` adds no profile payload, `Summary` returns aggregate runner
+timings, and `Detailed` returns bounded events with request-relative timestamps.
+The host anchors those events into the onnxsim Chrome/Perfetto trace alongside
+the host-side `RemoteRPC` duration. This is suitable for constrained
+Snapdragon/AX8850 workers because the device needs neither a JSON library nor
+clock synchronization.
+
+The transport is independent of the control-plane protocol. A ROS2/rosbridge
+or DORA gateway can expose discovery, compile, run, and profile actions while
+forwarding the same binary tensor and profile payloads. Large tensors and
+traces should stay binary; use the control plane for metadata, request IDs,
+health, and progress.
+
 ```python
 import numpy as np
 import onnxsim

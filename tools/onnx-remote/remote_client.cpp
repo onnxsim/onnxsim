@@ -10,6 +10,7 @@ static int self_test() {
   int fd = connect_tcp("127.0.0.1", 39501);
   if (fd < 0) { std::cerr << "connect failed (start onnx-remote-worker --port 39501)\n"; return 1; }
   Request r; r.op = "relu"; r.inputs.push_back(Tensor{{5}, {-2, -1, 0, 1, 2}});
+  r.profiling = ProfilingLevel::Detailed;
   std::string error;
   if (!send_request(fd, r, error)) { std::cerr << error << '\n'; close_socket(fd); return 1; }
   Response response;
@@ -19,7 +20,9 @@ static int self_test() {
   const auto& got = response.outputs[0].data; const float want[] = {0, 0, 0, 1, 2};
   if (got.size() != 5) return 1;
   for (size_t i = 0; i < got.size(); ++i) if (std::fabs(got[i] - want[i]) > 1e-6f) return 1;
-  std::cout << "remote transport self-test passed\n"; close_socket(fd); return 0;
+  if (response.profile.empty() || response.profile[0].name != "relu") return 1;
+  std::cout << "remote transport self-test passed (profile events: "
+            << response.profile.size() << ")\n"; close_socket(fd); return 0;
 }
 
 int main(int argc, char** argv) {

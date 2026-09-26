@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "onnxsim.h"
+#include "remote_transport.h"
 
 // Native remote executor for constant folding. The remote endpoint receives
 // each fold-group ModelProto and its CPU tensors through the small transport in
@@ -21,6 +22,9 @@ struct RemoteExecutorOptions {
   // the worker executes the serialized ModelProto; an AXCL adapter may use a
   // model handle instead and leave model empty.
   std::string operation = "onnx";
+  // Off keeps profiling work at the minimum. Summary is suitable for
+  // constrained cards; Detailed may include one event per device operation.
+  onnx_remote::ProfilingLevel profiling = onnx_remote::ProfilingLevel::Off;
 };
 
 std::shared_ptr<const ModelExecutor> GetRemoteModelExecutor(
