@@ -647,6 +647,38 @@ def test_compile_onnx_softmax_through_uop_to_mcode(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "softmax"
 
 
+@pytest.mark.parametrize(
+    ("op", "shape", "template"),
+    [
+        ("Sqrt", (512, 512, 3, 3), "Sqrt:512x512x3x3"),
+        ("Log", (16, 1000), "Log:16x1000"),
+    ],
+)
+def test_compile_onnx_unary_through_uop_to_mcode(tmp_path, op, shape, template):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x"], ["y"])],
+            f"onnx_{op.lower()}",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = misc.load_template(template)
+    schedule = tmp_path / f"onnx_{op.lower()}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
+
+
 def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
