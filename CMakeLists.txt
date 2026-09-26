@@ -41,6 +41,7 @@ option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper an
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
 option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" OFF)
 option(ONNXSIM_REMOTE_TRANSPORT "Build the dependency-free remote tensor transport and reference worker" OFF)
+option(ONNXSIM_REMOTE_DORA "Build the optional DORA C node adapter" OFF)
 option(ONNXSIM_BUILTIN_REMOTE_EXECUTOR "Bundle the native remote ModelExecutor (requires ONNXSIM_REMOTE_TRANSPORT)" OFF)
 option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
 # Opt-in additional ModelExecutor backend (see onnxsim/xnnpack_executor.h and
@@ -161,6 +162,9 @@ add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
 if (ONNXSIM_REMOTE_TRANSPORT)
   add_subdirectory(tools/onnx-remote EXCLUDE_FROM_ALL)
+endif()
+if (ONNXSIM_REMOTE_DORA AND NOT ONNXSIM_REMOTE_TRANSPORT)
+  message(FATAL_ERROR "ONNXSIM_REMOTE_DORA requires ONNXSIM_REMOTE_TRANSPORT=ON")
 endif()
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR AND NOT ONNXSIM_REMOTE_TRANSPORT)
   message(FATAL_ERROR "ONNXSIM_BUILTIN_REMOTE_EXECUTOR requires ONNXSIM_REMOTE_TRANSPORT=ON")

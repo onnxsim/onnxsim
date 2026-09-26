@@ -7,11 +7,26 @@
 using namespace onnx_remote;
 
 static int self_test() {
+  Request payload_request;
+  payload_request.op = "relu";
+  payload_request.profiling = ProfilingLevel::Detailed;
+  payload_request.inputs.push_back(Tensor{{5}, {-2, -1, 0, 1, 2}});
+  std::vector<uint8_t> payload;
+  std::string error;
+  if (!encode_request_payload(payload_request, payload, error)) {
+    std::cerr << "request payload encode failed: " << error << '\n';
+    return 1;
+  }
+  Request decoded_request;
+  if (!decode_request_payload(payload.data(), payload.size(), decoded_request, error) ||
+      decoded_request.op != payload_request.op ||
+      decoded_request.profiling != payload_request.profiling) {
+    std::cerr << "request payload round-trip failed\n";
+    return 1;
+  }
   int fd = connect_tcp("127.0.0.1", 39501);
   if (fd < 0) { std::cerr << "connect failed (start onnx-remote-worker --port 39501)\n"; return 1; }
-  Request r; r.op = "relu"; r.inputs.push_back(Tensor{{5}, {-2, -1, 0, 1, 2}});
-  r.profiling = ProfilingLevel::Detailed;
-  std::string error;
+  Request r = payload_request;
   if (!send_request(fd, r, error)) { std::cerr << error << '\n'; close_socket(fd); return 1; }
   Response response;
   if (!receive_response(fd, response, error) || !response.ok || response.outputs.size() != 1) {

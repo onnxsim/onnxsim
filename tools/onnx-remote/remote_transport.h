@@ -67,4 +67,16 @@ bool send_request(int fd, const Request& request, std::string& error);
 bool receive_response(int fd, Response& response, std::string& error);
 bool send_response(int fd, const Response& response, std::string& error);
 
+// Payload-only helpers for message-oriented adapters such as DORA. The
+// returned bytes omit the TCP transport header; a DORA UInt8 message can carry
+// them directly as one `run` input or `result` output.
+bool encode_request_payload(const Request& request, std::vector<uint8_t>& payload,
+                            std::string& error);
+bool decode_request_payload(const uint8_t* data, size_t size, Request& request,
+                            std::string& error);
+bool encode_response_payload(const Response& response,
+                             std::vector<uint8_t>& payload, std::string& error);
+bool decode_response_payload(const uint8_t* data, size_t size,
+                             Response& response, std::string& error);
+
 }  // namespace onnx_remote

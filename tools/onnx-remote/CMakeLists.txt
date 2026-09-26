@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 project(onnx_remote_transport LANGUAGES CXX)
 
 option(ONNX_REMOTE_AXCL "Build the AXCL-backed remote worker" OFF)
+option(ONNXSIM_REMOTE_DORA "Build the DORA node adapter" OFF)
+set(DORA_NODE_API_INCLUDE_DIR "" CACHE PATH
+    "DORA C node API include directory (contains node_api.h)")
+set(DORA_NODE_API_LIBRARY "" CACHE FILEPATH
+    "DORA C node API static library")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,4 +35,20 @@ if (ONNX_REMOTE_AXCL)
   target_include_directories(onnx-remote-axcl-worker PRIVATE ${AXCL_INCLUDE_DIR})
   target_link_libraries(onnx-remote-axcl-worker PRIVATE
                         onnx_remote_transport ${AXCL_RT_LIBRARY} ${AXCL_SYS_LIBRARY})
+endif()
+
+if (ONNXSIM_REMOTE_DORA)
+  if (NOT DORA_NODE_API_INCLUDE_DIR OR NOT DORA_NODE_API_LIBRARY)
+    message(FATAL_ERROR
+      "ONNXSIM_REMOTE_DORA requires DORA_NODE_API_INCLUDE_DIR and "
+      "DORA_NODE_API_LIBRARY")
+  endif()
+  add_executable(onnx-remote-dora-node dora_node.cpp)
+  target_include_directories(onnx-remote-dora-node PRIVATE
+                             ${DORA_NODE_API_INCLUDE_DIR})
+  target_link_libraries(onnx-remote-dora-node PRIVATE
+                        onnx_remote_transport ${DORA_NODE_API_LIBRARY})
+  if (UNIX AND NOT APPLE)
+    target_link_libraries(onnx-remote-dora-node PRIVATE dl m rt pthread)
+  endif()
 endif()

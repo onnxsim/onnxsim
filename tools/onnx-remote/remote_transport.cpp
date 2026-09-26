@@ -169,6 +169,89 @@ bool decode_profile(const std::vector<char>& b, size_t& at,
   }
   return true;
 }
+bool encode_request_bytes(const Request& request, std::vector<char>& b,
+                          std::string& error) {
+  if (request.op.empty() || request.op.size() > kMaxOpBytes) {
+    error = "invalid operation";
+    return false;
+  }
+  put_u32(b, static_cast<uint32_t>(request.op.size()));
+  b.insert(b.end(), request.op.begin(), request.op.end());
+  put_u64(b, request.model.size());
+  b.insert(b.end(), request.model.begin(), request.model.end());
+  put_u32(b, static_cast<uint32_t>(request.profiling));
+  if (!encode_tensors(request.inputs, b, error)) return false;
+  return b.size() <= kMaxMessageBytes;
+}
+bool decode_request_bytes(const std::vector<char>& b, Request& request,
+                          std::string& error) {
+  size_t at = 0;
+  uint32_t op_len;
+  if (!take_u32(b, at, op_len) || op_len == 0 || op_len > kMaxOpBytes ||
+      at + op_len > b.size()) {
+    error = "invalid operation";
+    return false;
+  }
+  request.op.assign(b.data() + at, op_len);
+  at += op_len;
+  uint64_t model_len;
+  if (!take_u64(b, at, model_len) || model_len > kMaxMessageBytes ||
+      at + model_len > b.size()) {
+    error = "invalid model payload";
+    return false;
+  }
+  request.model.resize(static_cast<size_t>(model_len));
+  if (model_len) {
+    std::memcpy(request.model.data(), b.data() + at,
+                static_cast<size_t>(model_len));
+  }
+  at += static_cast<size_t>(model_len);
+  uint32_t profiling;
+  if (!take_u32(b, at, profiling) ||
+      profiling > static_cast<uint32_t>(ProfilingLevel::Detailed)) {
+    error = "invalid profiling level";
+    return false;
+  }
+  request.profiling = static_cast<ProfilingLevel>(profiling);
+  if (!decode_tensors(b, at, request.inputs, error) || at != b.size()) {
+    if (error.empty()) error = "trailing request bytes";
+    return false;
+  }
+  return true;
+}
+bool encode_response_bytes(const Response& response, std::vector<char>& b,
+                           std::string& error) {
+  if (!response.ok) {
+    if (response.error.size() > kMaxProfileDetailBytes * 4) {
+      error = "error response too large";
+      return false;
+    }
+    put_u32(b, static_cast<uint32_t>(response.error.size()));
+    b.insert(b.end(), response.error.begin(), response.error.end());
+    return true;
+  }
+  return encode_tensors(response.outputs, b, error) &&
+         encode_profile(response.profile, b, error);
+}
+bool decode_response_bytes(const std::vector<char>& b, bool ok,
+                           Response& response, std::string& error) {
+  size_t at = 0;
+  if (!ok) {
+    uint32_t len;
+    if (!take_u32(b, at, len) || len > kMaxProfileDetailBytes * 4 ||
+        at + len != b.size()) {
+      error = "invalid error response";
+      return false;
+    }
+    response.ok = false;
+    response.error.assign(b.data() + at, len);
+    return true;
+  }
+  response.ok = true;
+  response.error.clear();
+  return decode_tensors(b, at, response.outputs, error) &&
+         decode_profile(b, at, response.profile, error) && at == b.size();
+}
 bool send_message(int fd, uint16_t kind, const std::vector<char>& payload, std::string& error) {
   if (payload.size() > kMaxMessageBytes) { error = "message too large"; return false; }
   uint32_t magic = htonl(kMagic); uint16_t version = htons(kVersion), k = htons(kind);
@@ -213,40 +296,18 @@ bool receive_request(int fd, Request& request, std::string& error) {
     error = "invalid message header"; return false;
   }
   std::vector<char> b(static_cast<size_t>(ntoh64(n))); if (!b.empty() && !read_all(fd, b.data(), b.size())) { error = "truncated message"; return false; }
-  size_t at = 0; uint32_t op_len;
-  if (!take_u32(b, at, op_len) || op_len == 0 || op_len > kMaxOpBytes || at + op_len > b.size()) { error = "invalid operation"; return false; }
-  request.op.assign(b.data() + at, op_len); at += op_len;
-  uint64_t model_len;
-  if (!take_u64(b, at, model_len) || model_len > kMaxMessageBytes || at + model_len > b.size()) {
-    error = "invalid model payload"; return false;
-  }
-  request.model.resize(static_cast<size_t>(model_len));
-  if (model_len) std::memcpy(request.model.data(), b.data() + at, static_cast<size_t>(model_len));
-  at += static_cast<size_t>(model_len);
-  uint32_t profiling;
-  if (!take_u32(b, at, profiling) || profiling > static_cast<uint32_t>(ProfilingLevel::Detailed)) {
-    error = "invalid profiling level";
-    return false;
-  }
-  request.profiling = static_cast<ProfilingLevel>(profiling);
-  if (!decode_tensors(b, at, request.inputs, error) || at != b.size()) { if (error.empty()) error = "trailing request bytes"; return false; }
-  return true;
+  return decode_request_bytes(b, request, error);
 }
 bool send_response(int fd, const Response& response, std::string& error) {
   std::vector<char> b;
-  if (!response.ok) { put_u32(b, static_cast<uint32_t>(response.error.size())); b.insert(b.end(), response.error.begin(), response.error.end()); return send_message(fd, kError, b, error); }
-  if (!encode_tensors(response.outputs, b, error) || !encode_profile(response.profile, b, error)) return false;
+  if (!encode_response_bytes(response, b, error)) return false;
+  if (!response.ok) return send_message(fd, kError, b, error);
   return send_message(fd, kOk, b, error);
 }
 
 bool send_request(int fd, const Request& request, std::string& error) {
-  if (request.op.empty() || request.op.size() > kMaxOpBytes) { error = "invalid operation"; return false; }
-  std::vector<char> b; put_u32(b, static_cast<uint32_t>(request.op.size()));
-  b.insert(b.end(), request.op.begin(), request.op.end());
-  put_u64(b, request.model.size());
-  b.insert(b.end(), request.model.begin(), request.model.end());
-  put_u32(b, static_cast<uint32_t>(request.profiling));
-  if (!encode_tensors(request.inputs, b, error)) return false;
+  std::vector<char> b;
+  if (!encode_request_bytes(request, b, error)) return false;
   return send_message(fd, kRun, b, error);
 }
 
@@ -261,14 +322,63 @@ bool receive_response(int fd, Response& response, std::string& error) {
   }
   std::vector<char> b(static_cast<size_t>(n));
   if (!b.empty() && !read_all(fd, b.data(), b.size())) { error = "truncated response"; return false; }
-  size_t at = 0;
-  if (ntohs(kind) == kError) {
-    uint32_t len; if (!take_u32(b, at, len) || at + len != b.size()) { error = "invalid error response"; return false; }
-    response.ok = false; response.error.assign(b.data() + at, len); return true;
+  return decode_response_bytes(b, ntohs(kind) == kOk, response, error);
+}
+
+bool encode_request_payload(const Request& request, std::vector<uint8_t>& payload,
+                            std::string& error) {
+  std::vector<char> bytes;
+  if (!encode_request_bytes(request, bytes, error)) return false;
+  payload.clear();
+  payload.assign(bytes.begin(), bytes.end());
+  return true;
+}
+
+bool decode_request_payload(const uint8_t* data, size_t size, Request& request,
+                            std::string& error) {
+  if (size > kMaxMessageBytes || (size != 0 && data == nullptr)) {
+    error = "invalid request payload";
+    return false;
   }
-  response.ok = true; response.error.clear();
-  return decode_tensors(b, at, response.outputs, error) &&
-         decode_profile(b, at, response.profile, error) && at == b.size();
+  std::vector<char> bytes;
+  if (size != 0) {
+    bytes.assign(reinterpret_cast<const char*>(data),
+                 reinterpret_cast<const char*>(data) + size);
+  }
+  return decode_request_bytes(bytes, request, error);
+}
+
+bool encode_response_payload(const Response& response,
+                             std::vector<uint8_t>& payload, std::string& error) {
+  std::vector<char> bytes;
+  if (!encode_response_bytes(response, bytes, error)) return false;
+  payload.clear();
+  payload.reserve(bytes.size() + 1);
+  payload.push_back(response.ok ? 1 : 0);
+  payload.insert(payload.end(), bytes.begin(), bytes.end());
+  return true;
+}
+
+bool decode_response_payload(const uint8_t* data, size_t size,
+                             Response& response, std::string& error) {
+  if (size > kMaxMessageBytes || (size != 0 && data == nullptr)) {
+    error = "invalid response payload";
+    return false;
+  }
+  std::vector<char> bytes;
+  if (size != 0) {
+    bytes.assign(reinterpret_cast<const char*>(data),
+                 reinterpret_cast<const char*>(data) + size);
+  }
+  // Message-oriented adapters carry the response status as the first byte:
+  // 1 = OK, 0 = error, followed by the normal response payload.
+  if (bytes.empty()) {
+    error = "empty response payload";
+    return false;
+  }
+  const bool ok = bytes[0] != 0;
+  bytes.erase(bytes.begin());
+  return decode_response_bytes(bytes, ok, response, error);
 }
 
 }  // namespace onnx_remote

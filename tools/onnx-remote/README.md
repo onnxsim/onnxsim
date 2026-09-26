@@ -61,6 +61,30 @@ the constrained worker simple and is sufficient for a completed subgraph
 profile. A future ROS/HTTP gateway can stream progress separately while using
 the same event fields for the final trace.
 
+## DORA adapter
+
+The optional `onnx-remote-dora-node` is a standalone DORA C node. It accepts a
+UInt8 message named `run`, containing the payload produced by
+`encode_request_payload()`, forwards it to the normal TCP worker, and emits a
+UInt8 `result` message containing `encode_response_payload()` output. This
+keeps DORA's dataflow/discovery layer separate from the accelerator transport.
+
+Build it against a DORA C node API static library:
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote \
+  -DONNXSIM_REMOTE_DORA=ON \
+  -DDORA_NODE_API_INCLUDE_DIR=/path/to/dora/apis/c/node \
+  -DDORA_NODE_API_LIBRARY=/path/to/dora/target/release/libdora_node_api_c.a
+cmake --build build/onnx-remote --target onnx-remote-dora-node
+```
+
+Set `ONNXSIM_DORA_REMOTE_HOST` and `ONNXSIM_DORA_REMOTE_PORT` in the node's
+environment to select the native worker (defaults are `127.0.0.1:39501`). A
+minimal dataflow declares `run` as the node input and `result` as its output.
+The DORA node API carries raw UInt8 messages; tensor and profile serialization
+remain the same as the dependency-free transport.
+
 The next integration layer can make an ONNX Runtime plugin EP claim a maximal
 supported subgraph and send it as an operation/model handle over this
 transport.  The reference worker deliberately does not pretend to be that EP

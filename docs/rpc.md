@@ -21,6 +21,12 @@ forwarding the same binary tensor and profile payloads. Large tensors and
 traces should stay binary; use the control plane for metadata, request IDs,
 health, and progress.
 
+For DORA specifically, `tools/onnx-remote/onnx-remote-dora-node` is an optional
+C node adapter. Its `run` input and `result` output carry the transport's
+payload-only format as raw UInt8 messages, so DORA does not need to understand
+the ONNX tensor schema. The adapter forwards to the existing TCP worker and
+can therefore be used with the reference or AXCL worker.
+
 ```python
 import numpy as np
 import onnxsim
