@@ -17,6 +17,10 @@
 struct RemoteExecutorOptions {
   std::string host = "127.0.0.1";
   uint16_t port = 39501;
+  // The compiler may run on a separate host. Empty/zero preserves the
+  // execution endpoint above, so existing configurations remain unchanged.
+  std::string compile_host;
+  uint16_t compile_port = 0;
   int connect_timeout_ms = 5000;
   // The operation is a backend selector. "onnx" conventionally means that
   // the worker executes the serialized ModelProto; an AXCL adapter may use a

@@ -34,6 +34,11 @@ The native executor keeps the original model-per-run path as the default. With
 is compiled once and subsequent runs use the returned artifact ID. The
 compiler response may include an opaque manifest and inline artifact bytes.
 
+Compilation and execution may use different endpoints: `compile_host` and
+`compile_port` select the compiler, while the existing `host` and `port` select
+the runner. An empty compiler host or zero compiler port falls back to the
+runner endpoint.
+
 Caching is split deliberately: onnxsim owns a short-lived in-process cache to
 avoid compiling the same subgraph repeatedly during one simplification; the
 compiler/runner owns persistent artifact caching and compatibility validation.

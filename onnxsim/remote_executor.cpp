@@ -106,7 +106,8 @@ class RemoteModelExecutor final : public ModelExecutor {
       request.inputs.emplace_back(std::move(wire));
     }
 
-    const onnx_remote::Response response = Exchange(request);
+    const onnx_remote::Response response =
+        Exchange(request, options_.host, options_.port);
     std::vector<DLManagedTensorPtr> outputs;
     outputs.reserve(response.outputs.size());
     for (auto& output : response.outputs) {
@@ -125,14 +126,15 @@ class RemoteModelExecutor final : public ModelExecutor {
     std::string manifest;
   };
 
-  onnx_remote::Response Exchange(const onnx_remote::Request& request) const {
+  onnx_remote::Response Exchange(const onnx_remote::Request& request,
+                                 const std::string& host, uint16_t port) const {
     auto& profiler = onnxsim::Profiler::Instance();
     const bool collect_profile =
         profiler.enabled() &&
         options_.profiling != onnx_remote::ProfilingLevel::Off;
     const uint64_t profile_anchor =
         collect_profile ? profiler.ElapsedMicros() : 0;
-    const int fd = onnx_remote::connect_tcp(options_.host, options_.port);
+    const int fd = onnx_remote::connect_tcp(host, port);
     if (fd < 0) throw std::runtime_error("remote executor: connection failed");
     std::string error;
     onnx_remote::Response response;
@@ -146,7 +148,8 @@ class RemoteModelExecutor final : public ModelExecutor {
       profiler.RecordExternalEvent(
           "RemoteRPC", "remote_transport", rpc_start,
           rpc_end >= rpc_start ? rpc_end - rpc_start : 0,
-          "{\"host\":\"" + JsonEscape(options_.host) + "\"}");
+          "{\"host\":\"" + JsonEscape(host) +
+              "\",\"port\":" + std::to_string(port) + "}");
       for (const auto& event : response.profile) {
         profiler.RecordExternalEvent(
             event.name, event.category, profile_anchor + event.start_us,
@@ -175,7 +178,12 @@ class RemoteModelExecutor final : public ModelExecutor {
     request.op = options_.compile_operation;
     request.model.assign(serialized.begin(), serialized.end());
     request.profiling = options_.profiling;
-    const onnx_remote::Response response = Exchange(request);
+    const std::string compile_host =
+        options_.compile_host.empty() ? options_.host : options_.compile_host;
+    const uint16_t compile_port =
+        options_.compile_port == 0 ? options_.port : options_.compile_port;
+    const onnx_remote::Response response =
+        Exchange(request, compile_host, compile_port);
     if (response.artifact_id.empty() && response.artifact.empty()) {
       throw std::runtime_error(
           "remote compiler returned neither artifact_id nor artifact bytes");
