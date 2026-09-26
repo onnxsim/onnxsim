@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(onnx_remote_transport LANGUAGES CXX)
 
+include(CTest)
+
 option(ONNX_REMOTE_AXCL "Build the AXCL-backed remote worker" OFF)
 option(ONNXSIM_REMOTE_DORA "Build the DORA node adapter" OFF)
 set(DORA_NODE_API_INCLUDE_DIR "" CACHE PATH
@@ -29,6 +31,13 @@ target_link_libraries(onnx-remote-client PRIVATE onnx_remote_transport)
 
 add_executable(onnx-remote-compiler remote_compiler.cpp)
 target_link_libraries(onnx-remote-compiler PRIVATE onnx_remote_transport)
+
+if (BUILD_TESTING)
+  add_executable(onnx-remote-transport-test remote_transport_test.cpp)
+  target_link_libraries(onnx-remote-transport-test PRIVATE onnx_remote_transport)
+  add_test(NAME onnx-remote-transport-roundtrip
+           COMMAND onnx-remote-transport-test)
+endif()
 
 if (ONNX_REMOTE_AXCL)
   find_path(AXCL_INCLUDE_DIR axcl.h REQUIRED)

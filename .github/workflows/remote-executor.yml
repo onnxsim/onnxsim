@@ -1,0 +1,70 @@
+name: Native remote executor
+
+on:
+  pull_request:
+    paths:
+      - "onnxsim/remote_executor.*"
+      - "onnxsim/profiler.*"
+      - "tools/onnx-remote/**"
+      - "scripts/qualcomm/**"
+      - "tests/test_qnn_compat_cli.py"
+      - "docs/remote-manifest.md"
+      - ".github/workflows/remote-executor.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "onnxsim/remote_executor.*"
+      - "onnxsim/profiler.*"
+      - "tools/onnx-remote/**"
+      - "scripts/qualcomm/**"
+      - "tests/test_qnn_compat_cli.py"
+      - "docs/remote-manifest.md"
+      - ".github/workflows/remote-executor.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transport:
+    name: transport and compiler service
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S tools/onnx-remote -B build/onnx-remote -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/onnx-remote -j2
+      - name: Unit tests
+        run: ctest --test-dir build/onnx-remote --output-on-failure
+      - name: Reference worker smoke test
+        run: |
+          build/onnx-remote/onnx-remote-worker --port 39501 >"${RUNNER_TEMP}/remote-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-client --self-test
+      - name: Compiler service cache smoke test
+        run: |
+          python3 -c "from pathlib import Path; Path('${RUNNER_TEMP}/model.onnx').write_bytes(b'smoke-model')"
+          build/onnx-remote/onnx-remote-compiler \
+            --port 39502 --cache-dir "${RUNNER_TEMP}/compiler-cache" \
+            --compiler-id ci-passthrough >"${RUNNER_TEMP}/remote-compiler.log" 2>&1 &
+          compiler_pid=$!
+          trap 'kill "$compiler_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx"
+          test -n "$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)"
+
+  python-driver:
+    name: Qualcomm harness driver tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install pytest
+      - name: Run dependency-light tests
+        run: python -m pytest -q tests/test_qnn_compat_cli.py
