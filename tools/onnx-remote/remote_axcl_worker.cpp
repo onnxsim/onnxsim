@@ -178,13 +178,20 @@ static Response execute_axmodel(const Request& request) {
 }
 
 static Response execute_request(const Request& request) {
-  if (request.op != "run_compiled") return execute_axmodel(request);
+  if (request.op != "run_compiled" && request.op != "load_compiled")
+    return execute_axmodel(request);
   Request cached = request;
   std::string error;
   fs::path artifact_path;
   if (!materialize_artifact(request, artifact_path, error)) {
     Response response;
     response.error = error;
+    return response;
+  }
+  if (request.op == "load_compiled") {
+    Response response;
+    response.ok = true;
+    response.artifact_id = request.artifact_id;
     return response;
   }
   cached.op = artifact_path.string();

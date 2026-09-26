@@ -54,6 +54,12 @@ conversion, legalization, and context-binary generation on the compile host,
 while the execution host only receives the final artifact. The service has a
 passthrough mode for transport tests; it is not itself a QNN compiler.
 
+Compiled execution can optionally use a load/attach handshake: the host sends
+`load_compiled(artifact_id, artifact)` once to the runner, then sends
+`run_compiled(artifact_id, tensors)` without repeating the artifact bytes. The
+native executor keeps this disabled by default for stateless compatibility; set
+`attach_compiled_artifact=true` for a runner with persistent artifact storage.
+
 ```python
 import numpy as np
 import onnxsim

@@ -167,11 +167,13 @@ cmake -S tools/onnx-remote -B build/onnx-remote \
   -DAXCL_SYS_LIBRARY=/usr/lib/axcl/libaxcl_sys.so
 ```
 
-For the external compiler path, send `op=run_compiled`, an `artifact_id`, and
-the `.axmodel` bytes on the first request. The worker stores the artifact under
-`--cache-dir`; later requests may send only the same artifact ID. IDs are
+For the external compiler path, send `op=load_compiled`, an `artifact_id`, and
+the `.axmodel` bytes once. The worker stores the artifact under `--cache-dir`;
+later `op=run_compiled` requests may send only the same artifact ID. IDs are
 restricted to filename-safe characters, and artifact publication is atomic.
-This is the runner-side cache/load handshake used by the AX8850 path.
+This is the runner-side cache/load handshake used by the AX8850 path. A
+stateless runner can skip the load operation and continue sending bytes with
+each `run_compiled` request.
 
 The model is loaded for each request in this first correctness-oriented
 adapter.  That is deliberately simple and isolates model-load failures; a

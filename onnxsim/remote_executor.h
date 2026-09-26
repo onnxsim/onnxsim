@@ -22,6 +22,7 @@ struct RemoteExecutorOptions {
   std::string compile_host;
   uint16_t compile_port = 0;
   int connect_timeout_ms = 5000;
+  int io_timeout_ms = 0;
   // The operation is a backend selector. "onnx" conventionally means that
   // the worker executes the serialized ModelProto; an AXCL adapter may use a
   // model handle instead and leave model empty.
@@ -33,6 +34,11 @@ struct RemoteExecutorOptions {
   bool cache_compiled_models = true;
   std::string compile_operation = "compile";
   std::string compiled_operation = "run_compiled";
+  std::string load_compiled_operation = "load_compiled";
+  // Ask the runner to persist/attach an artifact once, then omit artifact
+  // bytes from subsequent compiled runs. This is opt-in because stateless
+  // runners only understand the inline artifact form.
+  bool attach_compiled_artifact = false;
   // Send artifact bytes with every compiled run. This is reliable for a
   // stateless worker; a future load/cache handshake can disable it.
   bool send_compiled_artifact = true;

@@ -372,6 +372,16 @@ int connect_tcp_timeout(const std::string& host, uint16_t port,
 int connect_tcp(const std::string& host, uint16_t port) {
   return connect_tcp_timeout(host, port, 0);
 }
+bool set_socket_io_timeout(int fd, int timeout_ms) {
+  if (fd < 0 || timeout_ms <= 0) return true;
+  timeval timeout{};
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  return ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
+             0 &&
+         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) ==
+             0;
+}
 void close_socket(int fd) { if (fd >= 0) ::close(fd); }
 
 bool receive_request(int fd, Request& request, std::string& error) {

@@ -137,6 +137,10 @@ class RemoteModelExecutor final : public ModelExecutor {
     const int fd = onnx_remote::connect_tcp_timeout(
         host, port, options_.connect_timeout_ms);
     if (fd < 0) throw std::runtime_error("remote executor: connection failed");
+    if (!onnx_remote::set_socket_io_timeout(fd, options_.io_timeout_ms)) {
+      onnx_remote::close_socket(fd);
+      throw std::runtime_error("remote executor: cannot set socket timeout");
+    }
     std::string error;
     onnx_remote::Response response;
     const uint64_t rpc_start = collect_profile ? profiler.ElapsedMicros() : 0;
@@ -202,6 +206,17 @@ class RemoteModelExecutor final : public ModelExecutor {
     if (options_.cache_compiled_models) {
       std::lock_guard<std::mutex> lock(cache_mu_);
       compiled_cache_[serialized] = artifact;
+    }
+    if (options_.attach_compiled_artifact) {
+      onnx_remote::Request load;
+      load.op = options_.load_compiled_operation;
+      load.artifact_id = artifact->id;
+      load.artifact = artifact->bytes;
+      load.profiling = options_.profiling;
+      const std::string runner_host = options_.host;
+      const uint16_t runner_port = options_.port;
+      Exchange(load, runner_host, runner_port);
+      artifact->bytes.clear();
     }
     return artifact;
   }

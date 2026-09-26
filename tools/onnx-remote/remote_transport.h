@@ -78,6 +78,9 @@ int connect_tcp(const std::string& host, uint16_t port);
 // their own I/O deadline around send/receive.
 int connect_tcp_timeout(const std::string& host, uint16_t port,
                         int timeout_ms);
+// Set send/receive deadlines on an established socket. A non-positive value
+// leaves the platform defaults unchanged.
+bool set_socket_io_timeout(int fd, int timeout_ms);
 void close_socket(int fd);
 
 bool receive_request(int fd, Request& request, std::string& error);
