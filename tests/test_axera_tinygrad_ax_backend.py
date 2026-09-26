@@ -502,6 +502,48 @@ def test_compile_onnx_live_binary_through_uop_to_mcode(tmp_path, op):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
 
 
+def test_compile_onnx_maxpool_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "MaxPool",
+                    ["x"],
+                    ["y"],
+                    kernel_shape=[3, 3],
+                    strides=[2, 2],
+                    pads=[1, 1, 1, 1],
+                )
+            ],
+            "onnx_maxpool",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 64, 112, 112]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = misc.load_template("MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1")
+    schedule = tmp_path / "onnx_maxpool.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "maxpool"
+
+
 def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
