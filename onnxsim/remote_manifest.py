@@ -49,6 +49,10 @@ def _model_ops(model: Any) -> list[str]:
     return [str(getattr(node, "op_type", "")) for node in nodes]
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def preflight_model(
     model: Any,
     manifest: str | Path | Mapping[str, Any],
@@ -65,13 +69,9 @@ def preflight_model(
     """
     data = load_manifest(manifest)
     errors: list[str] = []
-    target_data = data.get("target") if isinstance(data.get("target"), Mapping) else {}
-    artifact_data = (
-        data.get("artifact") if isinstance(data.get("artifact"), Mapping) else {}
-    )
-    compiler_data = (
-        data.get("compiler") if isinstance(data.get("compiler"), Mapping) else {}
-    )
+    target_data = _mapping(data.get("target"))
+    artifact_data = _mapping(data.get("artifact"))
+    compiler_data = _mapping(data.get("compiler"))
     actual_target = target_data.get("device") or target_data.get("name")
     actual_format = artifact_data.get("format")
     if target and actual_target and target != actual_target:

@@ -14,7 +14,7 @@ be unit-tested without building onnxsim's native extension.
 
 import json
 import os
-from typing import Dict, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple, cast
 
 # onnxruntime events are placed on their own tid range so they render as separate
 # tracks, clear of onnxsim's own span threads.
@@ -40,7 +40,10 @@ def summarize_remote_events(profile_trace: dict) -> dict:
         if not isinstance(event, dict) or event.get("ph") != "X":
             continue
         name = str(event.get("name", ""))
-        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        raw_args = event.get("args")
+        args: dict[str, Any] = (
+            cast(dict[str, Any], raw_args) if isinstance(raw_args, dict) else {}
+        )
         phase = args.get("phase")
         if phase not in summary:
             if name.startswith("RemoteRPC/compile"):

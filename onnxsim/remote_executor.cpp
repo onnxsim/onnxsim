@@ -10,8 +10,8 @@
 #include <unordered_map>
 #include <utility>
 
-#include "profiler.h"
 #include "dlpack_bridge.h"
+#include "profiler.h"
 #include "remote_transport.h"
 
 namespace {
@@ -99,7 +99,8 @@ class RemoteModelExecutor final : public ModelExecutor {
     }
     const std::string serialized = prepared.SerializeAsString();
     onnx_remote::Request request;
-    request.request_id = next_request_id.fetch_add(1, std::memory_order_relaxed);
+    request.request_id =
+        next_request_id.fetch_add(1, std::memory_order_relaxed);
     request.profiling = options_.profiling;
     if (options_.compile_model) {
       const auto artifact = GetOrCompile(serialized);
@@ -116,8 +117,8 @@ class RemoteModelExecutor final : public ModelExecutor {
     for (const DLManagedTensor* input : inputs) {
       const DLTensor& tensor = input->dl_tensor;
       int32_t onnx_dtype = 0;
-      if (tensor.device.device_type != kDLCPU ||
-          tensor.dtype.lanes != 1 || tensor.strides != nullptr ||
+      if (tensor.device.device_type != kDLCPU || tensor.dtype.lanes != 1 ||
+          tensor.strides != nullptr ||
           !onnxsim::dlpack::TryDLToOnnx(tensor.dtype, &onnx_dtype)) {
         throw std::runtime_error(
             "remote executor supports only contiguous CPU ONNX-compatible "
@@ -127,10 +128,10 @@ class RemoteModelExecutor final : public ModelExecutor {
       wire.dtype = static_cast<uint8_t>(onnx_dtype);
       wire.shape.assign(tensor.shape, tensor.shape + tensor.ndim);
       const size_t nbytes = static_cast<size_t>(onnxsim::dlpack::NumElements(
-                                   tensor.shape, tensor.ndim)) *
+                                tensor.shape, tensor.ndim)) *
                             onnxsim::dlpack::SizeOf(tensor.dtype);
-      const auto* begin = static_cast<const uint8_t*>(tensor.data) +
-                          tensor.byte_offset;
+      const auto* begin =
+          static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset;
       if (onnx_dtype == onnx::TensorProto::FLOAT) {
         const auto* floats = reinterpret_cast<const float*>(begin);
         wire.data.assign(floats, floats + nbytes / sizeof(float));
