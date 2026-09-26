@@ -133,6 +133,17 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
 
 
 @needs_step
+def test_plan_materializes_live_broadcast_binary_operands():
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segs, _ = sr.build_plan(model, sr.load_records(), calib)
+    broadcast = [s for s in segs if s.output_shape]
+    assert len(broadcast) == 42
+    assert all(s.input_shapes[-1] == (1,) for s in broadcast)
+    assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
+
+
+@needs_step
 def test_float_mode_reproduces_the_reference_step():
     model = sr.load_step()
     ref = sr.load_reference()

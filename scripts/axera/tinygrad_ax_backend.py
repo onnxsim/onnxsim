@@ -529,7 +529,18 @@ class TemplateCache:
     delegated to :mod:`template_model_generator` and never invokes Pulsar2.
     """
 
+    def __init__(self):
+        self._entries: dict[TemplateKey, TemplateEntry] = {}
+
     def lookup(self, key: TemplateKey) -> TemplateEntry:
+        cached = self._entries.get(key)
+        if cached is not None:
+            return cached
+        entry = self._lookup(key)
+        self._entries[key] = entry
+        return entry
+
+    def _lookup(self, key: TemplateKey) -> TemplateEntry:
         if key.toolchain != TOOLCHAIN:
             raise ValueError(f"no templates for toolchain {key.toolchain!r}")
         if key.dtypes != ("float32",):
@@ -1044,6 +1055,9 @@ def key_for_record(
     rec: Mapping, calibration_class: str = "", weight_dtype: str = ""
 ) -> TemplateKey:
     attrs = rec.get("attrs", {})
+    shapes = rec["shapes"]
+    if rec["op"] in bse.OPS and attrs.get("output_shape"):
+        shapes = [attrs["output_shape"]]
     keep: dict[str, Any] = {}
     if rec["op"] == "Transpose":
         keep["perm"] = tuple(attrs["perm"])
@@ -1056,7 +1070,7 @@ def key_for_record(
         keep["pads"] = tuple(attrs["pads"])
     return TemplateKey(
         op=rec["op"],
-        shapes=tuple(_tup(s) for s in rec["shapes"]),
+        shapes=tuple(_tup(s) for s in shapes),
         attrs=tuple(sorted(keep.items())),
         calibration_class=calibration_class,
         weight_dtype=weight_dtype,
@@ -1323,7 +1337,11 @@ def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
 
 
 def plan_at_calibration(
-    rec: Mapping, calib: Mapping, cache: TemplateCache | None = None
+    rec: Mapping,
+    calib: Mapping,
+    cache: TemplateCache | None = None,
+    *,
+    validate_live: bool = True,
 ) -> tuple[str, str]:
     """``plan_node`` with ``"conditional"`` settled against a real calibration
     (``step_calibration.calibrate``): ``"covered"`` when the node's predicted
@@ -1331,12 +1349,33 @@ def plan_at_calibration(
     ``recalibrate`` succeeds on the predicted scales), else ``"refused"``."""
     cache = cache or TemplateCache()
     status, detail = plan_node(rec, cache)
+    if (
+        status == "refused"
+        and rec.get("attrs", {}).get("form") == "broadcast"
+        and all(name in calib.get("tensors", {}) for name in rec.get("inputs", ())[:2])
+    ):
+        # A broadcast of live tensors can use the measured full-shape binary
+        # program after the smaller operand is expanded at the segment edge.
+        expanded = dict(rec)
+        expanded["shapes"] = [list(rec["shapes"][0])]
+        expanded["attrs"] = dict(rec.get("attrs", {}))
+        expanded["attrs"].update(
+            {"form": "same_shape", "output_shape": list(rec["shapes"][0])}
+        )
+        status, detail = plan_node(expanded, cache)
+        if status == "conditional":
+            rec = expanded
     if status != "conditional":
         return status, detail
     op, attrs = rec["op"], rec.get("attrs", {})
     try:
         live = mre.step_manifest()["nodes"].get(rec.get("name", ""))
         if live is not None and op in ("MatMul", "Gemm", "Conv"):
+            if not validate_live:
+                return "covered", (
+                    "matmul_record_emit.recalibrate deferred to segment emit "
+                    f"({live['template']})"
+                )
             return "covered", _at_calibration_matmul(rec, calib)
         key = attrs.get("misc_key")
         if key and (misc.load_index().get(key) or misc.equivalent_key(key)):

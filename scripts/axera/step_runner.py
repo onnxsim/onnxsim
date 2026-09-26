@@ -167,6 +167,8 @@ class Segment:
     # marks the inputs that carry the batch axis (step_template batch_split).
     batch_split: int = 1
     split: list[bool] = dataclasses.field(default_factory=list)
+    input_shapes: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
+    output_shape: tuple[int, ...] = ()
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -336,8 +338,25 @@ def _segment_for(
         def emit_ew():
             return axb.EditSet([axb.ElementwiseScaleEdit(sc)]).build(key)
 
+        input_shapes = [
+            tuple(int(d) for d in s)
+            for s in rec.get("attrs", {}).get("input_shapes", [])
+        ]
+        output_shape = tuple(
+            int(d) for d in rec.get("attrs", {}).get("output_shape", ())
+        )
         return Segment(
-            name, "elementwise", [name], live, outs, detail, emit_ew, q(live), q(outs)
+            name,
+            "elementwise",
+            [name],
+            live,
+            outs,
+            detail,
+            emit_ew,
+            q(live),
+            q(outs),
+            input_shapes=input_shapes,
+            output_shape=output_shape,
         )
 
     if op in ("Reshape", "Squeeze") and detail.startswith("reshape_record_emit"):
@@ -418,7 +437,13 @@ def build_plan(
     """NPU segments (only of ``kinds`` if given) and a per-node reason for
     every node left on the host."""
     cache = axb.TemplateCache()
-    plans = [axb.plan_at_calibration(r, calib, cache) for r in records]
+    # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
+    # required by the segment emitter below, so defer it to
+    # ``drop_unemittable`` instead of doing it once during planning and again
+    # while materializing the models.
+    plans = [
+        axb.plan_at_calibration(r, calib, cache, validate_live=False) for r in records
+    ]
     inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     consumers: dict[str, list[onnx.NodeProto]] = {}
     for n in model.graph.node:
@@ -428,7 +453,41 @@ def build_plan(
     host: dict[str, str] = {}
     taken: set[str] = set()
     candidates = []
+    value_shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
     for rec, (status, detail) in zip(records, plans):
+        if (
+            status in ("refused", "covered")
+            and rec["op"] in axb.bse.OPS
+            and rec.get("attrs", {}).get("form") == "broadcast"
+            and detail.startswith("ElementwiseScaleEdit")
+        ):
+            input_shapes = [value_shapes.get(t, ()) for t in rec["inputs"][:2]]
+            output_shape = value_shapes.get(rec["outputs"][0], ())
+            if (
+                output_shape
+                and all(input_shapes)
+                and all(t in calib.get("tensors", {}) for t in rec["inputs"][:2])
+            ):
+                # A full-shape binary template is semantically identical when
+                # a live operand is broadcast at the segment boundary. Keep
+                # constants and uncalibrated operands conservative.
+                expanded = dict(rec)
+                expanded["shapes"] = [list(output_shape)]
+                expanded["attrs"] = dict(rec.get("attrs", {}))
+                expanded["attrs"].update(
+                    {
+                        "form": "same_shape",
+                        "output_shape": list(output_shape),
+                        "input_shapes": [list(s) for s in input_shapes],
+                    }
+                )
+                status, detail = axb.plan_at_calibration(
+                    expanded, calib, cache, validate_live=False
+                )
+                rec = expanded
         if status != "covered":
             host[rec["name"]] = f"{status}: {detail}"
             continue
@@ -610,8 +669,17 @@ class StepRunner:
 
     def _sim(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         local = dict(env)
-        for t, qq in zip(seg.inputs, seg.in_q):
-            local[t] = fake_quant(local[t], *qq)
+        values = []
+        for j, (t, qq) in enumerate(zip(seg.inputs, seg.in_q)):
+            value = fake_quant(local[t], *qq)
+            values.append(value)
+        if seg.output_shape:
+            target = np.broadcast_shapes(*(value.shape for value in values))
+            for t, value in zip(seg.inputs, values):
+                local[t] = np.broadcast_to(value, target)
+        else:
+            for t, value in zip(seg.inputs, values):
+                local[t] = value
         for n in sorted(seg.nodes, key=self.index.get):
             node = self.by_name[n]
             for t, v in zip([t for t in node.output if t], self.host.run(node, local)):
@@ -626,6 +694,9 @@ class StepRunner:
         m = self.session.load(self.emitted(seg))
         try:
             ins = [np.asarray(env[t], dtype=np.float32) for t in seg.inputs]
+            if seg.output_shape:
+                target = np.broadcast_shapes(*(x.shape for x in ins))
+                ins = [np.broadcast_to(x, target) for x in ins]
             if seg.batch_split > 1:
                 parts = [
                     self.session.run(

@@ -92,6 +92,7 @@ import os
 import struct
 import sys
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 
 import numpy as np
 import onnx
@@ -523,6 +524,7 @@ def retarget(
     return mc
 
 
+@lru_cache(maxsize=None)
 def load_index(path: str = TEMPLATE_INDEX) -> dict:
     with open(path) as f:
         return json.load(f)

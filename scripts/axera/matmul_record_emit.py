@@ -57,7 +57,8 @@ import json
 import os
 import struct
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from functools import lru_cache
 
 import numpy as np
 import onnx
@@ -122,6 +123,7 @@ def build_paths(where: str) -> tuple[str, str]:
     raise FileNotFoundError(f"no quant json next to {where}")
 
 
+@lru_cache(maxsize=256)
 def load_model(path: str) -> onnx.ModelProto:
     return onnx.load_model_from_string(_read(path))
 
@@ -162,6 +164,7 @@ def quant_scales(quant: dict) -> Scales:
     return out
 
 
+@lru_cache(maxsize=256)
 def load_scales(path: str) -> Scales:
     return quant_scales(json.loads(_read(path)))
 
@@ -891,6 +894,7 @@ def emit_standalone_matmul(
     return recalibrate(model, old, new)[0]
 
 
+@lru_cache(maxsize=1)
 def step_manifest() -> dict:
     with open(os.path.join(STEP_TEMPLATE_DIR, "manifest.json")) as f:
         return json.load(f)

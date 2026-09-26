@@ -49,6 +49,7 @@ import os
 import struct
 import sys
 from collections.abc import Mapping
+from functools import lru_cache
 
 import numpy as np
 import onnx
@@ -61,6 +62,19 @@ import mcode  # noqa: E402
 
 TEMPLATE_DIR = os.path.join(_HERE, "fixtures", "elementwise_scale_emit")
 OPS = ("Relu", "Sqrt")
+
+
+@lru_cache(maxsize=1)
+def _template_index() -> dict:
+    with open(os.path.join(TEMPLATE_DIR, "index.json")) as f:
+        return json.load(f)
+
+
+def _load_index(template_dir: str) -> dict:
+    if template_dir == TEMPLATE_DIR:
+        return _template_index()
+    with open(os.path.join(template_dir, "index.json")) as f:
+        return json.load(f)
 
 
 def _f32(x: float) -> float:
@@ -238,8 +252,7 @@ def load_template(
     """``(model, meta)`` for a committed template, or ``ValueError`` if no
     validated template covers ``(op, shape, zero_points)``. ``zero_points``
     names every quantized tensor (``x``, ``y``)."""
-    with open(os.path.join(template_dir, "index.json")) as f:
-        index = json.load(f)
+    index = _load_index(template_dir)
     key = _key(op, shape, zero_points)
     if key not in index:
         raise ValueError(f"no validated template for {key}; have {sorted(index)}")
