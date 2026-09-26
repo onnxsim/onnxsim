@@ -1,6 +1,7 @@
 #include "remote_transport.h"
 
 #include <cerrno>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <cstdlib>
@@ -27,6 +28,8 @@ struct Options {
   std::string target = "qnn-htp";
   std::string compiler_id = "unidentified";
 };
+
+std::atomic<uint64_t> cache_write_counter{0};
 
 std::string hex_u64(uint64_t value) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -100,6 +103,49 @@ bool write_file(const fs::path& path, const std::vector<uint8_t>& bytes,
   if (!bytes.empty()) output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   if (!output) {
     error = "cannot write " + path.string();
+    return false;
+  }
+  return true;
+}
+
+bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
+                  const std::vector<uint8_t>& artifact,
+                  const std::string& manifest, std::string& error) {
+  // Never expose a partially written artifact to a second compiler process.
+  // The service is currently single-request-at-a-time, but the cache may be
+  // shared by multiple service instances on one compile host.
+  const auto suffix = ".tmp." + std::to_string(static_cast<long long>(getpid())) +
+                      "." + std::to_string(cache_write_counter.fetch_add(1));
+  const fs::path artifact_tmp = artifact_path.string() + suffix;
+  const fs::path manifest_tmp = manifest_path.string() + suffix;
+  if (!write_file(artifact_tmp, artifact, error)) return false;
+  {
+    std::ofstream output(manifest_tmp, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = "cannot write " + manifest_tmp.string();
+      fs::remove(artifact_tmp);
+      return false;
+    }
+    output << manifest;
+    if (!output) {
+      error = "cannot write " + manifest_tmp.string();
+      fs::remove(artifact_tmp);
+      fs::remove(manifest_tmp);
+      return false;
+    }
+  }
+  std::error_code ec;
+  fs::rename(artifact_tmp, artifact_path, ec);
+  if (ec) {
+    error = "cannot publish " + artifact_path.string() + ": " + ec.message();
+    fs::remove(artifact_tmp);
+    fs::remove(manifest_tmp);
+    return false;
+  }
+  fs::rename(manifest_tmp, manifest_path, ec);
+  if (ec) {
+    error = "cannot publish " + manifest_path.string() + ": " + ec.message();
+    fs::remove(manifest_tmp);
     return false;
   }
   return true;
@@ -198,10 +244,8 @@ Response compile(const Request& request, const Options& options) {
   if (!options.cache_dir.empty()) {
     std::error_code ec;
     fs::create_directories(options.cache_dir, ec);
-    if (!ec && write_file(artifact_path, response.artifact, error)) {
-      std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
-      if (manifest) manifest << response.manifest;
-    }
+    if (!ec) publish_cache(artifact_path, manifest_path, response.artifact,
+                           response.manifest, error);
   }
   return response;
 }

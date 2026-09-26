@@ -131,8 +131,9 @@ once the worker confirms its cache.
 `onnx-remote-compiler` is a dependency-free compiler-side service for this
 contract. It is intended to run on a host with QAIRT/QNN installed while the
 runner stays on a Snapdragon or AX8850 device. The service owns a persistent
-on-disk cache; its key includes the serialized model, target, and configured
-compiler command and explicit compiler identity.
+on-disk cache; its key includes the serialized model, target, configured
+compiler command, and explicit compiler identity. Cache files are published
+atomically so a second service instance cannot observe a partial artifact.
 
 ```sh
 cmake -S tools/onnx-remote -B build/onnx-remote
