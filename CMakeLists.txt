@@ -403,6 +403,12 @@ if (ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   target_link_options(onnxsim_bin PRIVATE "-sASYNCIFY" "-sASYNCIFY_STACK_SIZE=131072")
 endif()
 
+if (ONNXSIM_WASM_NODE)
+  # The Node build is intentionally separate from the browser module.  Keep
+  # host filesystem access opt-in so the published/browser WASM stays portable.
+  target_link_options(onnxsim_bin PRIVATE "-sNODERAWFS=1" "-sENVIRONMENT=node")
+endif()
+
 if (ONNXSIM_C_API)
   if (NOT ONNXSIM_BUILTIN_ORT)
     message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")

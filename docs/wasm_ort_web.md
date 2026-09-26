@@ -231,7 +231,9 @@ package's npmjs.com settings page, not in this repo.
   coarser batching is a likely optimization.
 - Only the dtypes above are bridged (same as the built-in executor); others throw
   a clear error.
-- The `ONNXSIM_WASM_NODE` (NODERAWFS) build still needs a dedicated smoke test.
+- `build_wasm.sh ON` now forwards `ONNXSIM_WASM_NODE=ON` and enables
+  NODERAWFS/Node-only linking; run `node scripts/wasm_node_smoke.mjs
+  build-wasm-node-ON/onnxsim.js` after that build for the module smoke test.
 - The npm package has both a fake-runtime contract test and an end-to-end
   folding test using `onnxruntime-web`; a browser-side remote-runner test is
   still useful for validating a real network/worker boundary.
