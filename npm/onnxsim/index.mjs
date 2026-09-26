@@ -1,10 +1,10 @@
 // Node.js wrapper around onnxsim's WebAssembly build.
 //
-// This package ships the ORT-web variant (see docs/wasm_ort_web.md in the
-// onnxsim repository): the wasm module links no ONNX Runtime and instead
-// delegates constant folding to onnxruntime-web, which is an ordinary npm
-// dependency here rather than a second copy of ONNX Runtime compiled into
-// the module. onnxsim.cjs / onnxsim.wasm / ort_executor.mjs are build
+// The WASM module has a hookable ModelExecutor bridge. This package currently
+// ships the ORT-web variant (see docs/wasm_ort_web.md): the module delegates
+// constant folding to onnxruntime-web, which is an ordinary npm dependency
+// rather than a second copy of ONNX Runtime compiled into the module.
+// onnxsim.cjs / onnxsim.wasm / ort_executor.mjs are build
 // artifacts staged in by scripts/stage_npm_package.sh (see that script and
 // .github/workflows/static.yml) — they are not checked into git.
 
@@ -41,12 +41,32 @@ function getRuntime() {
         runtime.onnxsim_needs_ort_web()
       ) {
         const ort = await import("onnxruntime-web");
-        runtime.onnxsimOrtWebRun = makeOrtRunner(ort.default ?? ort);
+        const runner = makeOrtRunner(ort.default ?? ort);
+        runtime.onnxsimModelExecutorRun = runner;
+        runtime.onnxsimOrtWebRun = runner;
       }
       return runtime;
     })();
   }
   return runtimePromise;
+}
+
+/**
+ * Install a custom runner for constant-folding subgraphs.
+ *
+ * The runner receives one serialized subgraph and a batched tensor payload:
+ * `(modelBytes, inputsData, inputsMeta) => Promise<{data, meta}>`.
+ * The metadata layout is documented in docs/wasm_ort_web.md. This can target
+ * a remote executor, WebGPU, or another browser/embedded runtime.
+ */
+export async function setModelExecutorRunner(runner) {
+  if (typeof runner !== "function") {
+    throw new TypeError("onnxsim: model executor runner must be a function");
+  }
+  const runtime = await getRuntime();
+  runtime.onnxsimModelExecutorRun = runner;
+  // Keep the old property populated for generated modules from older builds.
+  runtime.onnxsimOrtWebRun = runner;
 }
 
 function toBytes(model) {

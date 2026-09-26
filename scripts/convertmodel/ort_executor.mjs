@@ -3,7 +3,8 @@
 // When onnxsim's WASM module is built with ONNXSIM_WASM_ORT_WEB, its C++
 // constant folder does not link ONNX Runtime; instead JsModelExecutor::Run
 // (js_model_executor.cpp) calls a runner registered on the Emscripten Module as
-// `Module.onnxsimOrtWebRun`. This file builds that runner on top of an
+// `Module.onnxsimModelExecutorRun` (with the legacy
+// `Module.onnxsimOrtWebRun` alias). This file builds that runner on top of an
 // already-loaded `onnxruntime-web` module.
 //
 // Contract (must match js_model_executor.cpp) -- a *batched* crossing: rather

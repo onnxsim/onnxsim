@@ -44,6 +44,15 @@ option(ONNXSIM_REMOTE_TRANSPORT "Build the dependency-free remote tensor transpo
 option(ONNXSIM_REMOTE_DORA "Build the optional DORA C node adapter" OFF)
 option(ONNXSIM_BUILTIN_REMOTE_EXECUTOR "Bundle the native remote ModelExecutor (requires ONNXSIM_REMOTE_TRANSPORT)" OFF)
 option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
+if (EMSCRIPTEN)
+  option(ONNXSIM_WASM_HOOKABLE_EXECUTOR "Build the hookable JavaScript ModelExecutor bridge in the default WASM module" ON)
+else()
+  option(ONNXSIM_WASM_HOOKABLE_EXECUTOR "Build the hookable JavaScript ModelExecutor bridge in the default WASM module" OFF)
+endif()
+if (ONNXSIM_WASM_ORT_WEB)
+  set(ONNXSIM_WASM_HOOKABLE_EXECUTOR ON CACHE BOOL
+      "The ORT-web mode requires the hookable JavaScript executor" FORCE)
+endif()
 # Opt-in additional ModelExecutor backend (see onnxsim/xnnpack_executor.h and
 # docs/dlpack-executor.md): runs constant-folding fold groups through Google's
 # XNNPACK instead of ONNX Runtime, for a small, explicitly-supported subset of
@@ -314,21 +323,23 @@ endfunction()
 
 if(EMSCRIPTEN)
   list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/interface.cpp)
-  if (ONNXSIM_WASM_ORT_WEB)
-    # The onnxruntime-web-backed executor (compiled only in this mode).
+  if (ONNXSIM_WASM_HOOKABLE_EXECUTOR)
+    # Hookable JavaScript executor; it falls back to built-in ORT when no
+    # callback is installed.
     list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/js_model_executor.cpp)
   endif()
 endif()
 
 # onnxsim_bin needs a constant-folding executor: GetBuiltinModelExecutor()
-# (ONNXSIM_HAS_ORT) natively, or GetJsModelExecutor() (ONNXSIM_WASM_ORT_WEB)
+# (ONNXSIM_HAS_ORT) natively, or GetJsModelExecutor()
+# (ONNXSIM_WASM_HOOKABLE_EXECUTOR) under Emscripten.
 # under Emscripten. With neither -- ONNXSIM_BUILTIN_ORT=OFF on a native,
 # non-Emscripten build, e.g. the Python wheel's own configure -- there is no
 # executor available at all, so exclude it from the default `all` target
 # rather than failing that build (setup.py already only ever targets
 # onnxsim_cpp2py_export explicitly; this just keeps a plain `cmake --build .`
 # from tripping over a target that cannot link in that configuration).
-if (ONNXSIM_HAS_ORT OR ONNXSIM_WASM_ORT_WEB)
+if (ONNXSIM_HAS_ORT OR ONNXSIM_WASM_ORT_WEB OR ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   add_executable(
     onnxsim_bin
     onnxsim/bin/onnxsim_bin.cpp
@@ -378,11 +389,11 @@ else()
   onnxsim_add_ort_rpath(onnxsim_bin)
 endif()
 
-if (ONNXSIM_WASM_ORT_WEB)
+if (ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   # interface.cpp / onnxsim_bin.cpp select GetJsModelExecutor() under this define
   # and js_model_executor.cpp implements it. onnxsim_bin.cpp lives in onnxsim/bin,
   # so add scripts/convertmodel to its include path to find js_model_executor.h.
-  target_compile_definitions(onnxsim_bin PRIVATE ONNXSIM_WASM_ORT_WEB)
+  target_compile_definitions(onnxsim_bin PRIVATE ONNXSIM_WASM_HOOKABLE_EXECUTOR)
   target_include_directories(onnxsim_bin PRIVATE scripts/convertmodel)
   # JsModelExecutor::_Run blocks on an onnxruntime-web Promise via
   # emscripten::val::await(), which requires Asyncify. Asyncify also makes the
