@@ -127,6 +127,26 @@ produced by an earlier stage (for example, projection LUTs). Set `fuse` to an ob
 one merged ONNX graph; the original per-stage and unfused end-to-end results
 remain in the report. The fused graph is written beside the JSON output.
 
+Pass `--fallback-to-tinygrad` to keep measuring when a stage's chosen backend
+has no working runner -- a case Core ML genuinely cannot lower (RoiAlign's
+`average` mode, `NonZero`'s data-dependent output length), where the end-to-end
+number would otherwise just be an "unavailable" error. Such a stage is timed on
+a tinygrad Metal backend instead, Metal JIT first and eager second, and every
+substitution is listed under `backend_fallbacks` in the report:
+
+```json
+"backend_fallbacks": [
+  {"stage": "head", "requested_backend": "coreml",
+   "used_backend": "tinygrad_metal_jit"}
+]
+```
+
+It is opt-in and per stage: a stage whose selected backend did build is never
+swapped, and without the flag the manifest's choice stands unchanged. Note the
+fallback only helps where the *other* backend can run the op -- Mask R-CNN's
+remainder, for instance, still fails because tinygrad does not implement
+`NonMaxSuppression` or `RoiAlign` either.
+
 M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
 in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
 The Core ML translator lowers static nearest-neighbor Resize to Core ML's own

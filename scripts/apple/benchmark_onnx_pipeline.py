@@ -45,6 +45,53 @@ from onnx import compose
 
 BACKENDS = ("coreml", "tinygrad_metal", "tinygrad_metal_jit")
 
+# Backends tried, in order, when a stage's selected backend has no working
+# runner. Metal JIT first: on the graphs measured here it is 8-20x faster than
+# tinygrad's eager ONNX runner, which launches a kernel per op. Eager is the
+# fallback because it still runs the graph when JIT compilation fails.
+_FALLBACK_BACKENDS = ("tinygrad_metal_jit", "tinygrad_metal")
+
+
+def _resolve_backends(
+    names: List[str],
+    backend_map: Dict[str, str],
+    runners: Dict,
+    fallback: bool,
+) -> tuple[Dict[str, str], List[dict]]:
+    """Pick each stage's backend, optionally substituting one that has a runner.
+
+    Without ``fallback`` this is exactly the manifest's choice, so a stage whose
+    backend failed to convert still fails the end-to-end measurement (the
+    existing behaviour). With it, a stage whose selected backend has no runner
+    takes the first available backend from :data:`_FALLBACK_BACKENDS` instead.
+
+    Returns the per-stage choice plus one substitution record per stage that
+    changed, so the report never presents a fallback as a clean measurement of
+    the backend that was asked for.
+    """
+    selected = {name: backend_map.get(name, "coreml") for name in names}
+    if any(backend not in BACKENDS for backend in selected.values()):
+        raise ValueError(f"unsupported backend in {selected}")
+    if not fallback:
+        return selected, []
+    substitutions = []
+    for name in names:
+        wanted = selected[name]
+        if (name, wanted) in runners:
+            continue
+        for candidate in _FALLBACK_BACKENDS:
+            if (name, candidate) in runners:
+                selected[name] = candidate
+                substitutions.append(
+                    {
+                        "stage": name,
+                        "requested_backend": wanted,
+                        "used_backend": candidate,
+                    }
+                )
+                break
+    return selected, substitutions
+
 
 def _load_feeds(stage: dict, model_path: Path, seed: int) -> dict[str, np.ndarray]:
     feed_path = stage.get("feeds")
@@ -247,6 +294,7 @@ def run_pipeline(
     compute_precision: str,
     warmup: int,
     repeats: int,
+    fallback: bool = False,
 ) -> dict:
     spec = json.loads(manifest_path.read_text())
     stages = spec["stages"]
@@ -320,9 +368,7 @@ def run_pipeline(
                 record["backends"][backend] = {"error": f"{type(exc).__name__}: {exc}"}
         stage_records[name] = record
 
-    selected = {name: backend_map.get(name, "coreml") for name in names}
-    if any(backend not in BACKENDS for backend in selected.values()):
-        raise ValueError(f"unsupported backend in {selected}")
+    selected, substitutions = _resolve_backends(names, backend_map, runners, fallback)
 
     fused_result = None
     fuse_spec = spec.get("fuse")
@@ -448,6 +494,7 @@ def run_pipeline(
         "pipeline": spec.get("name", manifest_path.stem),
         "compute_units": compute_units,
         "compute_precision": compute_precision,
+        "backend_fallbacks": substitutions,
         "stages": stage_records,
         "end_to_end": pipeline_result,
         "fused": fused_result,
@@ -470,6 +517,14 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument(
+        "--fallback-to-tinygrad",
+        action="store_true",
+        help="when a stage's selected backend has no working runner (e.g. Core ML "
+        "cannot lower a RoiAlign or NonZero), time it on a tinygrad Metal backend "
+        "instead -- Metal JIT first, then eager -- and record the substitution "
+        "under 'backend_fallbacks' in the report",
+    )
     args = parser.parse_args()
     result = run_pipeline(
         args.manifest,
@@ -478,6 +533,7 @@ def main() -> None:
         args.compute_precision,
         args.warmup,
         args.repeats,
+        args.fallback_to_tinygrad,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
