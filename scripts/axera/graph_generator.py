@@ -21,6 +21,7 @@ import compose_emit
 import elementwise_scale_emit
 import matmul_record_emit
 import misc_op_record_emit
+import numpy as np
 import onnx
 import reshape_emit
 import transpose_real_shapes
@@ -442,14 +443,20 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             raise ValueError(
                 f"standalone {add.op_type} inputs must be the graph inputs"
             )
-        shape = values.get("x", ())
-        if not shape or values.get("z", ()) != shape:
+        input_shapes = (values.get("x", ()), values.get("z", ()))
+        if not all(input_shapes):
             raise ValueError(
-                f"standalone {add.op_type} requires equal static input shapes"
+                f"standalone {add.op_type} requires static input shapes"
             )
+        try:
+            shape = tuple(np.broadcast_shapes(*input_shapes))
+        except ValueError as exc:
+            raise ValueError(
+                f"standalone {add.op_type} inputs are not broadcast-compatible"
+            ) from exc
         if not model.graph.output or values.get(model.graph.output[0].name) != shape:
             raise ValueError(
-                f"standalone {add.op_type} output shape must match its inputs"
+                f"standalone {add.op_type} output shape must match its broadcast shape"
             )
         return GraphPlan(
             (

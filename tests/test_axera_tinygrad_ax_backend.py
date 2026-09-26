@@ -299,6 +299,35 @@ def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
+def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
+    Tensor = pytest.importorskip("tinygrad").Tensor
+
+    # The emitter uses the validated full-output-shape binary program. Runtime
+    # callers expand the smaller operand at the segment/device boundary.
+    root = (Tensor.empty(1, 64) * Tensor.empty(64)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Mul"]
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in lowered.graph.input
+    ] == [(1, 64), (64,)]
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "broadcast_mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in generated.graph.input
+    ] == [(1, 64), (1, 64)]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
 @pytest.mark.parametrize("op", ["sub", "div"])
 def test_lower_and_compile_tinygrad_compound_binary_uop_with_explicit_calibration(
     tmp_path, op

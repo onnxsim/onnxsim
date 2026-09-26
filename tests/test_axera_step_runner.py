@@ -655,6 +655,51 @@ def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
 
 
 @needs_device
+def test_onnx_broadcast_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Run a broadcast UOp through the full-shape AX binary template."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import binary_op_scale_emit as bse
+    import tinygrad_ax_backend as axb
+
+    source_shape, broadcast_shape = (1, 64), (64,)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Mul", ["x", "z"], ["y"])],
+            "onnx_broadcast_mul_to_uop_vm",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, source_shape
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, broadcast_shape
+                ),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, source_shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Mul", source_shape, {"x": 0, "y": 0, "z": 0})
+    calibration = {"scales": meta["scales"], "zero_points": meta["zero_points"]}
+    schedule = tmp_path / "onnx_broadcast_mul_to_uop.schedule.json"
+    axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(0.1, 1.0, source_shape).astype(np.float32)
+    z = rng.uniform(0.2, 1.0, broadcast_shape).astype(np.float32)
+
+    with axcl_session.AXSession() as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x, np.broadcast_to(z, source_shape)])
+        finally:
+            session.unload(loaded)
+
+    np.testing.assert_allclose(
+        got, x * z.reshape(1, 64), atol=float(meta["scales"]["y"]) * 1.5, rtol=0
+    )
+
+
+@needs_device
 @pytest.mark.parametrize(
     "op, input_shape, output_shape, attrs, template_key",
     [
