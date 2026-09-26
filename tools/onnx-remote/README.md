@@ -142,7 +142,8 @@ cmake --build build/onnx-remote --target onnx-remote-compiler
 build/onnx-remote/onnx-remote-compiler \
   --port 39502 --target qnn-htp --compiler-id qairt-2.31.0 \
   --cache-dir /var/cache/onnxsim-qnn --max-cache-bytes 1073741824 \
-  --command 'qnn_compile_wrapper --input {input} --output {output} \
+  --command 'python scripts/qualcomm/qnn_compile.py --input {input} \
+             --output {output} \
              --manifest {manifest} --target {target}'
 ```
 
@@ -153,6 +154,9 @@ model into an artifact and is useful for validating networking and cache
 plumbing before installing QAIRT. A QNN wrapper can run the converter,
 backend-specific graph preparation, and context-binary generation as one
 command, while keeping those SDK-version-specific details out of onnxsim.
+The repository's `scripts/qualcomm/qnn_compile.py` adapter uses the
+`onnxruntime-qnn` plugin to generate an embedded QNN EP-context ONNX artifact;
+set `QNN_BACKEND_PATH` or let the package select its bundled HTP backend.
 
 ## AXCL worker
 

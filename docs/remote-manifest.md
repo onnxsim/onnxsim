@@ -26,3 +26,10 @@ partition or legalize a fold subgraph before `COMPILE`.
 The manifest is deliberately versioned independently from the transport. A
 new manifest field must not require a wire-protocol version bump, while a
 change to tensor or artifact framing does.
+
+`scripts/qualcomm/qnn_compile.py` is the reference QNN adapter. It generates an
+embedded ONNX Runtime EP-context artifact and records the QNN runtime version,
+backend target, compiler host, and legalization profile in this manifest. It
+does not claim operator capabilities until the QNN graph has been compiled;
+the empty capability lists are intentional rather than an assertion that QNN
+supports no operators.

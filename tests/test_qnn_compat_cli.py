@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "qualcomm" / "run_qnn_compat.py"
+COMPILER = Path(__file__).parents[1] / "scripts" / "qualcomm" / "qnn_compile.py"
 
 
 def load_driver():
@@ -51,3 +52,14 @@ def test_driver_help_does_not_import_onnx():
         text=True,
     )
     assert "--model MODEL.onnx" in completed.stdout
+
+
+def test_qnn_compiler_help_does_not_import_qnn():
+    completed = subprocess.run(
+        ["python3", str(COMPILER), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--input INPUT" in completed.stdout
+    assert "--target TARGET" in completed.stdout
