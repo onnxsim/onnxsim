@@ -32,11 +32,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import gzip
+import hashlib
 import json
 import os
 import pickle
 import re
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -536,14 +538,53 @@ def build_plan(
 
 
 def drop_unemittable(
-    segs: Sequence[Segment], host: dict[str, str]
+    segs: Sequence[Segment],
+    host: dict[str, str],
+    emit_cache_dir: str | None = None,
 ) -> tuple[list[Segment], dict[str, bytes]]:
     """Emit every segment up front; one whose emitter refuses goes back to
-    the host with the emitter's reason."""
+    the host with the emitter's reason.  When ``emit_cache_dir`` is set,
+    emitted models are reused across training-graph preparations.  The key
+    includes calibration inputs/outputs and a format version, so a different
+    calibration or emitter format cannot reuse an old model."""
     keep, blobs = [], {}
+    if emit_cache_dir:
+        os.makedirs(emit_cache_dir, exist_ok=True)
     for seg in segs:
         try:
-            blobs[seg.name] = seg.emit().SerializeToString()
+            cache_path = None
+            if emit_cache_dir:
+                payload = {
+                    "version": 1,
+                    "name": seg.name,
+                    "kind": seg.kind,
+                    "nodes": seg.nodes,
+                    "inputs": seg.inputs,
+                    "outputs": seg.outputs,
+                    "detail": seg.detail,
+                    "in_q": seg.in_q,
+                    "out_q": seg.out_q,
+                    "input_shapes": seg.input_shapes,
+                    "output_shape": seg.output_shape,
+                }
+                digest = hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, default=list).encode()
+                ).hexdigest()
+                cache_path = os.path.join(emit_cache_dir, f"{digest}.axmodel")
+                if os.path.exists(cache_path):
+                    with open(cache_path, "rb") as f:
+                        blob = f.read()
+                    onnx.load_model_from_string(blob)
+                    blobs[seg.name] = blob
+                else:
+                    blob = seg.emit().SerializeToString()
+                    tmp = f"{cache_path}.tmp-{os.getpid()}"
+                    with open(tmp, "wb") as f:
+                        f.write(blob)
+                    os.replace(tmp, cache_path)
+                    blobs[seg.name] = blob
+            else:
+                blobs[seg.name] = seg.emit().SerializeToString()
         except Exception as exc:
             for n in seg.nodes:
                 host[n] = f"covered, but the emitter refused: {exc}"
@@ -990,6 +1031,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--emit-dir")
     p.add_argument(
+        "--emit-cache-dir",
+        default=os.path.join(tempfile.gettempdir(), "axera-step-emission-cache-v1"),
+        help="persistent cache for emitted segment models (set empty to disable)",
+    )
+    p.add_argument(
         "--limit", type=int, default=0, help="only the first N segments on the NPU"
     )
     p.add_argument("--only", help="comma-separated segment names to put on the NPU")
@@ -1050,7 +1096,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         segs = [sg for sg in segs if sg.name not in failed]
     if args.limit:
         segs = segs[: args.limit]
-    segs, blobs = drop_unemittable(segs, host)
+    segs, blobs = drop_unemittable(segs, host, args.emit_cache_dir or None)
     ref = load_reference()
     feeds = ref["feeds"]
     grad_names = gradient_tensors(model, ref["state_map"])

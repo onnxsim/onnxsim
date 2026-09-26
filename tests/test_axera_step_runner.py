@@ -143,6 +143,29 @@ def test_plan_materializes_live_broadcast_binary_operands():
     assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
 
 
+def test_emission_cache_reuses_a_validated_segment(tmp_path):
+    calls = 0
+
+    def emit():
+        nonlocal calls
+        calls += 1
+        return onnx.helper.make_model(onnx.helper.make_graph([], "cached", [], []))
+
+    segment = sr.Segment(
+        "cached_segment",
+        "test",
+        ["cached_node"],
+        [],
+        [],
+        "test",
+        emit,
+    )
+    first, _ = sr.drop_unemittable([segment], {}, str(tmp_path))
+    second, _ = sr.drop_unemittable([segment], {}, str(tmp_path))
+    assert first and second
+    assert calls == 1
+
+
 @needs_step
 def test_float_mode_reproduces_the_reference_step():
     model = sr.load_step()
