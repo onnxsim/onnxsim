@@ -109,6 +109,7 @@ bool write_file(const fs::path& path, const std::vector<uint8_t>& bytes,
 }
 
 bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
+                  const fs::path& complete_path,
                   const std::vector<uint8_t>& artifact,
                   const std::string& manifest, std::string& error) {
   // Never expose a partially written artifact to a second compiler process.
@@ -118,6 +119,8 @@ bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
                       "." + std::to_string(cache_write_counter.fetch_add(1));
   const fs::path artifact_tmp = artifact_path.string() + suffix;
   const fs::path manifest_tmp = manifest_path.string() + suffix;
+  const fs::path complete_tmp = complete_path.string() + suffix;
+  fs::remove(complete_path);
   if (!write_file(artifact_tmp, artifact, error)) return false;
   {
     std::ofstream output(manifest_tmp, std::ios::binary | std::ios::trunc);
@@ -140,12 +143,27 @@ bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
     error = "cannot publish " + artifact_path.string() + ": " + ec.message();
     fs::remove(artifact_tmp);
     fs::remove(manifest_tmp);
+    fs::remove(complete_tmp);
     return false;
   }
   fs::rename(manifest_tmp, manifest_path, ec);
   if (ec) {
     error = "cannot publish " + manifest_path.string() + ": " + ec.message();
     fs::remove(manifest_tmp);
+    fs::remove(complete_tmp);
+    return false;
+  }
+  std::ofstream complete(complete_tmp, std::ios::binary | std::ios::trunc);
+  if (!complete) {
+    error = "cannot write " + complete_tmp.string();
+    fs::remove(complete_tmp);
+    return false;
+  }
+  complete.close();
+  fs::rename(complete_tmp, complete_path, ec);
+  if (ec) {
+    error = "cannot publish " + complete_path.string() + ": " + ec.message();
+    fs::remove(complete_tmp);
     return false;
   }
   return true;
@@ -184,8 +202,9 @@ Response compile(const Request& request, const Options& options) {
   const std::string key = cache_key(request, options);
   const fs::path artifact_path = options.cache_dir / (key + ".artifact");
   const fs::path manifest_path = options.cache_dir / (key + ".manifest");
+  const fs::path complete_path = options.cache_dir / (key + ".complete");
   if (!options.cache_dir.empty() && fs::exists(artifact_path) &&
-      fs::exists(manifest_path)) {
+      fs::exists(manifest_path) && fs::exists(complete_path)) {
     std::string error;
     if (read_file(artifact_path, response.artifact, error) &&
         read_text(manifest_path, response.manifest)) {
@@ -244,8 +263,8 @@ Response compile(const Request& request, const Options& options) {
   if (!options.cache_dir.empty()) {
     std::error_code ec;
     fs::create_directories(options.cache_dir, ec);
-    if (!ec) publish_cache(artifact_path, manifest_path, response.artifact,
-                           response.manifest, error);
+    if (!ec) publish_cache(artifact_path, manifest_path, complete_path,
+                           response.artifact, response.manifest, error);
   }
   return response;
 }
