@@ -110,15 +110,15 @@ One boundary, several adapters (`dlpack_bridge.h` holds the conversions):
 | `CApiModelExecutor` | capi/onnxsim_c_api.cpp | host receives borrowed `DLManagedTensor*` | host returns owned `DLManagedTensor*`, released via their deleters | host's choice |
 | `PyModelExecutor` | cpp2py_export.cc | `ToTensorProto` → bytes | bytes → `FromTensorProtoOwning` | protobuf round trip (see below) |
 | `XnnpackModelExecutor` | xnnpack_executor.cpp (`ONNXSIM_BUILTIN_XNNPACK`) | feed pointers passed straight to `xnn_setup_runtime_v2` as `xnn_external_value`s — **zero copy** | XNNPACK writes into an executor-allocated `std::vector<float>` (it has no ORT-style "hand back the session's buffer" mode) — **one copy at the boundary** (allocation, not a memcpy) | one allocation per output |
-| `RemoteModelExecutor` | remote_executor.cpp (`ONNXSIM_BUILTIN_REMOTE_EXECUTOR`) | serialized over the dependency-free remote transport | newly owned CPU float32 buffers | one network serialization/copy per input and output |
+| `RemoteModelExecutor` | remote_executor.cpp (`ONNXSIM_BUILTIN_REMOTE_EXECUTOR`) | serialized over the dependency-free remote transport | newly owned CPU DLPack buffers | one network serialization/copy per input and output |
 
 ### Native remote executor
 
 `GetRemoteModelExecutor()` is an opt-in C++ executor. It sends each
 constant-folding submodel as a serialized `ModelProto` together with its
-contiguous CPU float32 inputs. The endpoint returns output tensors, which are
-wrapped as owned DLPack tensors for the normal folding path. The default ORT
-executor is unchanged.
+contiguous CPU inputs. ONNX-compatible DLPack dtypes are preserved on the wire;
+the endpoint returns output tensors, which are wrapped as owned DLPack tensors
+for the normal folding path. The default ORT executor is unchanged.
 
 Enable it with:
 
@@ -134,11 +134,11 @@ options.port = 39501;`, and pass
 `*GetRemoteModelExecutor(options)` to the C++ simplifier API.
 The worker is intentionally a separate process: the same client-side
 executor can talk to a native ONNX Runtime worker, an accelerator compiler, or
-the optional AXCL worker. The v4 wire protocol preserves ONNX dtype and raw
+the optional AXCL worker. The v5 wire protocol preserves ONNX dtype and raw
 bytes for FLOAT16, BFLOAT16, integer, DOUBLE, and BOOL tensors. The reference
-worker and native `RemoteModelExecutor` still intentionally execute float32
-only; vendor runners can consume the preserved typed payloads without changing
-the transport ABI.
+worker executes typed identity and keeps arithmetic float32-only; vendor
+runners can consume the preserved typed payloads without changing the
+transport ABI.
 
 ### XNNPACK: an explicitly-partial backend, not a drop-in ORT replacement
 
