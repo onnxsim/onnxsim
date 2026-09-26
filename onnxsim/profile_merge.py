@@ -21,6 +21,41 @@ from typing import Dict, Sequence, Tuple
 _ORT_TID_BASE = 1000
 
 
+def summarize_remote_events(profile_trace: dict) -> dict:
+    """Summarize remote compile/load/execute events in a Chrome trace.
+
+    Returns phase counts and wall-time totals in microseconds. This is useful
+    for CI reports and constrained UIs that cannot render the full trace.
+    """
+    summary = {
+        "compile": {"count": 0, "duration_us": 0},
+        "load": {"count": 0, "duration_us": 0},
+        "execute": {"count": 0, "duration_us": 0},
+        "other": {"count": 0, "duration_us": 0},
+    }
+    events = profile_trace.get("traceEvents", []) if isinstance(profile_trace, dict) else []
+    for event in events:
+        if not isinstance(event, dict) or event.get("ph") != "X":
+            continue
+        name = str(event.get("name", ""))
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        phase = args.get("phase")
+        if phase not in summary:
+            if name.startswith("RemoteRPC/compile"):
+                phase = "compile"
+            elif name.startswith("RemoteRPC/load"):
+                phase = "load"
+            elif name.startswith("RemoteRPC/execute"):
+                phase = "execute"
+            elif name.startswith("Remote"):
+                phase = "other"
+            else:
+                continue
+        summary[phase]["count"] += 1
+        summary[phase]["duration_us"] += max(0, int(event.get("dur", 0)))
+    return summary
+
+
 def merge_ort_traces(profile_trace: dict, ort_trace_paths: Sequence[str]) -> dict:
     """Splice onnxruntime session traces into an onnxsim ``profile`` trace.
 

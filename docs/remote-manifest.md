@@ -29,6 +29,12 @@ legalization callback. Native remote-executor callers can use that callback to
 rewrite a fold subgraph before `COMPILE`, then use `supported_ops` and a
 manifest validator to reject anything outside the target contract.
 
+Python-side integrations can use `onnxsim.remote_manifest.preflight_model()`
+and `legalize_for_manifest()` for the same policy without depending on a
+vendor SDK. Empty capability lists mean "unknown" and therefore do not reject
+operators; non-empty lists are enforced. `onnxsim.profile_merge` also exposes
+`summarize_remote_events()` for compact compile/load/execute timing reports.
+
 The manifest is deliberately versioned independently from the transport. A
 new manifest field must not require a wire-protocol version bump, while a
 change to tensor or artifact framing does.
