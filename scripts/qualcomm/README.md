@@ -67,7 +67,18 @@ pip install onnxruntime-qnn      # brings its own onnxruntime
 pip install .                    # or install an onnxsim wheel
 
 python scripts/qualcomm/run_qnn_compat.py --output qnn-compat.csv
+python scripts/qualcomm/run_qnn_compat.py \
+  --model /models/mobilenetv2-qdq.onnx \
+  --model /models/resnet50-qdq.onnx \
+  --output qnn-models.csv
 ```
+
+`--model` is repeatable and runs on-disk models through the same
+original-versus-simplified comparison as the built-in suite. For the HTP path,
+prefer fixed-shape, quantized/QDQ models: the QNN EP documents that HTP models
+must be quantized and that dynamic shapes are unsupported. A model that QNN
+cannot compile before simplification is reported as `unsupported`, while a
+model whose simplified graph regresses is a failure.
 
 The in-tree smoke test `tests/test_qnn_compat.py` reuses this harness and is
 skipped automatically when `onnxruntime-qnn` isn't installed.
