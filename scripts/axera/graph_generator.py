@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 
 import binary_op_scale_emit
 import compose_emit
+import elementwise_scale_emit
 import matmul_record_emit
 import misc_op_record_emit
 import onnx
@@ -183,6 +184,19 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                     position,
                 ),
             )
+        )
+    if len(nodes) == 1 and nodes[0].op_type == "Relu":
+        relu = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone Relu requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
+        if not shape or output_shape != shape or list(relu.input) != ["x"]:
+            raise ValueError("standalone Relu requires matching static x/y shapes")
+        return GraphPlan(
+            (GraphSegment("relu", ("x",), model.graph.output[0].name, shape, shape),)
         )
     if len(nodes) == 1 and nodes[0].op_type == "Transpose":
         transpose = nodes[0]
@@ -533,7 +547,19 @@ def generate(
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule.to_json(), stream, indent=2, sort_keys=True)
             stream.write("\n")
-    if plan.chain == "reshape_relu":
+    if plan.chain == "relu":
+        if calibration is None:
+            raise ValueError("standalone Relu generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError(
+                "Relu calibration requires scales and zero_points mappings"
+            )
+        elementwise_scale_emit.emit(
+            "Relu", plan.segments[0].input_shape, scales, zero_points, output_path
+        )
+    elif plan.chain == "reshape_relu":
         segment = plan.segments[0]
         reshape_emit.emit_fused_reshape_axmodel(
             segment.input_shape,

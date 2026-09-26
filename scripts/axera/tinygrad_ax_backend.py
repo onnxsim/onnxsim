@@ -2535,7 +2535,17 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         or float(false_value.val) != 0.0
     ):
         raise ValueError("AX UOp Relu branches are not in the supported canonical form")
-    if position == "before":
+    standalone = (
+        position == "before"
+        and data.op is Ops.RESHAPE
+        and len(data.src) >= 1
+        and data.src[0].op is Ops.ALLOC
+    )
+    if standalone:
+        source = data
+        source_shape = tuple(int(dim) for dim in data.shape)
+        target_shape = source_shape
+    elif position == "before":
         if (
             data.op is not Ops.RESHAPE
             or len(data.src) < 1
@@ -2566,7 +2576,9 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
 
     shape_name = "uop_reshape_shape"
     nodes = (
-        [
+        [onnx.helper.make_node("Relu", ["x"], ["y"])]
+        if standalone
+        else [
             onnx.helper.make_node("Reshape", ["x", shape_name], ["reshaped"]),
             onnx.helper.make_node("Relu", ["reshaped"], ["y"]),
         ]
@@ -2576,16 +2588,21 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             onnx.helper.make_node("Reshape", ["relu", shape_name], ["y"]),
         ]
     )
+    initializers = (
+        []
+        if standalone
+        else [
+            onnx.numpy_helper.from_array(
+                np.asarray(target_shape, dtype=np.int64), shape_name
+            )
+        ]
+    )
     graph = onnx.helper.make_graph(
         nodes,
         "tinygrad_uop_ax",
         [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, source_shape)],
         [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, target_shape)],
-        [
-            onnx.numpy_helper.from_array(
-                np.asarray(target_shape, dtype=np.int64), shape_name
-            )
-        ],
+        initializers,
     )
     return onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", 13)]

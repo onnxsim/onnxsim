@@ -197,6 +197,24 @@ def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
 
 
+def test_lower_and_compile_tinygrad_standalone_relu_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 64, 56, 56).relu().uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Relu"]
+    _, meta = ew.load_template("Relu", (16, 64, 56, 56), {"x": 0, "y": 0})
+    schedule = tmp_path / "relu.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+
+
 def test_compile_onnx_imports_through_tinygrad_uop_without_pulsar2(tmp_path):
     shape = numpy_helper.from_array(np.array([1, 1, 8, 16], dtype=np.int64), "shape")
     model = onnx.helper.make_model(

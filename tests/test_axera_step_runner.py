@@ -305,6 +305,39 @@ def test_onnx_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 
 @needs_device
+def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Run an unfused standalone ReLU UOp through the AXCL VM."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import elementwise_scale_emit as ew
+    import tinygrad_ax_backend as axb
+    from tinygrad import Tensor
+
+    shape = (16, 64, 56, 56)
+    root = Tensor.empty(*shape).relu().uop
+    _, meta = ew.load_template("Relu", shape, {"x": 0, "y": 0})
+    schedule = tmp_path / "standalone_relu_uop.schedule.json"
+    axmodel = axb.compile_uop(
+        root,
+        str(schedule),
+        {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+    )
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(-1.0, 1.0, shape).astype(np.float32)
+
+    with axcl_session.AXSession(subdir=f"uop_relu_{tmp_path.name}") as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x])
+        finally:
+            session.unload(loaded)
+
+    np.testing.assert_allclose(
+        got, np.maximum(x, 0.0), atol=meta["scales"]["y"] * 2, rtol=0
+    )
+
+
+@needs_device
 def test_onnx_transpose_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     """Run a verified real-shape Transpose through the replacement path."""
     pytest.importorskip("tinygrad")
