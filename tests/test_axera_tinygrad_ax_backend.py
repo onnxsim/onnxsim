@@ -413,6 +413,8 @@ def test_lower_and_compile_tinygrad_add_uop_with_explicit_calibration(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "add"
 
 
@@ -432,6 +434,8 @@ def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
