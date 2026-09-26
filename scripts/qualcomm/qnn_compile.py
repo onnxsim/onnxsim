@@ -33,6 +33,8 @@ def compile_qnn(input_path: Path, output_path: Path, manifest_path: Path,
     backend_path = os.environ.get("QNN_BACKEND_PATH") or qnn.get_qnn_htp_path()
     if not os.path.isfile(backend_path):
         raise RuntimeError(f"QNN backend library does not exist: {backend_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     session_options = ort.SessionOptions()
     session_options.log_severity_level = 3
