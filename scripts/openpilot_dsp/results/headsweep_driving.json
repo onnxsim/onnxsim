@@ -1,0 +1,27 @@
+{
+ "all16": 0.008385083638131618,
+ "all8": 0.026874691247940063,
+ "only8": {
+  "model/p_policy_model.temporal_hydra.final_layer": 0.02695424109697342,
+  "model/p_policy_model.temporal_hydra.in_layer": 0.014957199804484844,
+  "model/p_policy_model.temporal_hydra.res_layer": 0.00727426540106535,
+  "model/p_policy_model.temporal_hydra.resblock": 0.013811076991260052,
+  "model/p_policy_model.temporal_summarizer._desire_encode": 0.008381220512092113,
+  "model/p_policy_model.temporal_summarizer._traffic_encode": 0.008336554281413555,
+  "model/p_val_12": 0.00824242178350687,
+  "model/p_val_15": 0.009020311757922173,
+  "model/p_val_28": 0.00805564597249031,
+  "model/p_val_57": 0.008432417176663876,
+  "model/p_val_61": 0.008833222091197968,
+  "model/p_val_63": 0.009162436239421368,
+  "model/summarizer._infeats.0": 0.00983368419110775,
+  "model/summarizer._mu.weight": 0.007976868189871311,
+  "model/summarizer.resblock.block_a": 0.011171513237059116,
+  "model/summarizer.resblock.block_b": 0.007992898114025593,
+  "model/vision_model.no_bottleneck_policy.hydra": 0.008385083638131618,
+  "model/vision_model.no_bottleneck_policy.summarizer": 0.008385083638131618,
+  "model/vision_model.policy.hydra": 0.008385083638131618,
+  "model/vision_model.policy.summarizer": 0.008385083638131618,
+  "model/vision_model.vision._en": 0.008972743526101112
+ }
+}

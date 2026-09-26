@@ -4,12 +4,14 @@
 #   MODELS=<build_models.py --out dir> ./deploy.sh      models pushed from the host instead
 #   IMGS="a.jpg b.jpg ..." ./deploy.sh                  JPEGs for the "images" test mode
 #   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
+#   TG="<export_cl.py bundle dir, named <model>.tg> ..." ./deploy.sh   tinygrad engines (--es opts engine=tinygrad)
 #   RFDETR=<rfdetr export.py model, e.g. ~/.cache/onnxsim-rfdetr/work/nano@320.u8.onnx> ./deploy.sh
 #                                   the RF-DETR button (pushed as rfdetr_nano.onnx)
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 #   MCC=<mcc.py work dir, e.g. ~/.cache/onnxsim-mcc/work> MOGE=<depth.py static dir, e.g. ~/.cache/onnxsim-mcc/moge>
-#       ./deploy.sh                 the MCC 3D mode (also needs the SAM mode's models: SAM=...)
+#   MCC_HMX=<../mcc_hmx/ref.py weights dir> ./deploy.sh   the MCC 3D mode (also needs the SAM mode's models: SAM=...);
+#                                   MCC_HMX: the DSP decoder's weights (the default decoder, opts dec=hmx)
 #   SR=<superres.py models dir, e.g. ~/.cache/superres/models> ./deploy.sh   the super-resolution mode
 #   GAME=<game_seq.py --out dir, e.g. ~/.cache/arm-nss/game> ./deploy.sh   the game-upscaling mode (NSS + NFRU)
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
@@ -67,6 +69,16 @@ if [ -n "${YOLO:-}" ]; then
     RA "cmp -s $STAGE/yolo/$b files/models/$b || { cp $STAGE/yolo/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
 fi
+# tinygrad AOT OpenCL bundles (../tinygrad_aot/export_cl.py output dirs, named <model>.tg, e.g.
+# TG="yolo11n.tg"): what engine=tinygrad loads instead of the HTP session (--es opts engine=tinygrad)
+if [ -n "${TG:-}" ]; then
+  for d in $TG; do
+    b=$(basename "$d")
+    "${A[@]}" shell "mkdir -p $STAGE/tg/$b"
+    for f in kernels.cl plan.txt consts.bin meta.txt; do "${A[@]}" push -q "$d/$f" "$STAGE/tg/$b/"; done
+    RA "mkdir -p files/models/$b && for f in kernels.cl plan.txt consts.bin meta.txt; do cmp -s $STAGE/tg/$b/\$f files/models/$b/\$f || cp $STAGE/tg/$b/\$f files/models/$b/; done"
+  done
+fi
 # RF-DETR (the YOLO activity's post=detr): one strict-HTP model from ../vision_models/rfdetr (uint8
 # NHWC SxS in, logits + boxes out), stored as rfdetr_nano.onnx.
 if [ -n "${RFDETR:-}" ]; then
@@ -85,18 +97,27 @@ if [ -n "${SAM:-}" ]; then
     RA "cmp -s $STAGE/sam/$b files/models/$b || { cp $STAGE/sam/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
 fi
-# MCC 3D mode: MCC's pieces from ../vision_models/mcc (mcc.py export --chunks 1024; MCC=its work dir):
-# enc.onnx -> mcc_enc.onnx, dec_q1024.onnx -> mcc_dec_q1024.onnx; and MoGe-2 ViT-S in both orientations
+# MCC 3D mode: MCC's pieces from ../vision_models/mcc (mcc.py export --chunks 1024, then dec_opt.py prep +
+# quant --policy a16c; MCC=its work dir): enc.onnx -> mcc_enc.onnx, the w8a16 decoder dec_q1024.a16c.onnx
+# (MCC_DEC=dec_q1024.onnx for the fp16 one) -> mcc_dec_q1024.onnx; and MoGe-2 ViT-S in both orientations
 # (depth.py static --h 640 --w 480 and --h 480 --w 640; MOGE=their dir) -> moge_640x480.onnx,
 # moge_480x640.onnx. The segmentation is the SAM mode's sam_l0_enc/dec. EP-context models are compiled on
 # the app's first MCC launch (MoGe-2 on its first use per orientation).
 if [ -n "${MCC:-}" ]; then
   "${A[@]}" shell "mkdir -p $STAGE/mcc"
   "${A[@]}" push -q "$MCC/enc.onnx" "$STAGE/mcc/mcc_enc.onnx"
-  "${A[@]}" push -q "$MCC/dec_q1024.onnx" "$STAGE/mcc/mcc_dec_q1024.onnx"
+  "${A[@]}" push -q "$MCC/${MCC_DEC:-dec_q1024.a16c.onnx}" "$STAGE/mcc/mcc_dec_q1024.onnx"
   for hw in 640x480 480x640; do "${A[@]}" push -q "$MOGE/model.$hw.t1200.onnx" "$STAGE/mcc/moge_$hw.onnx"; done
   for b in mcc_enc.onnx mcc_dec_q1024.onnx moge_640x480.onnx moge_480x640.onnx; do
     RA "cmp -s $STAGE/mcc/$b files/models/$b || { cp $STAGE/mcc/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# MCC 3D mode's DSP decoder (../mcc_hmx, ref.py weights --out <dir>): blk0..7.bin, head.bin -> mcc_hmx_*.bin
+if [ -n "${MCC_HMX:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/mcc"
+  for b in blk0 blk1 blk2 blk3 blk4 blk5 blk6 blk7 head; do
+    "${A[@]}" push -q "$MCC_HMX/$b.bin" "$STAGE/mcc/mcc_hmx_$b.bin"
+    RA "cmp -s $STAGE/mcc/mcc_hmx_$b.bin files/models/mcc_hmx_$b.bin || cp $STAGE/mcc/mcc_hmx_$b.bin files/models/"
   done
 fi
 # RT-DETR mode: the pieces from ../vision_models/rtdetr/msda_hvx/split.py (export + quant --policy

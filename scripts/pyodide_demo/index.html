@@ -299,30 +299,6 @@
 (function () {
   "use strict";
 
-  // Matches exactly what static.yml's "Stage the Pyodide demo" step copies
-  // from onnxsim/*.py into onnxsim_src/ next to this page -- kept as an
-  // explicit list (not a directory listing, which a static file server
-  // can't give this page) so a file added there without updating this list
-  // fails loudly (a 404 during loadFullOnnxsim) rather than silently
-  // shipping an incomplete package.
-  const ONNXSIM_PURE_PY_FILES = [
-    "__init__.py",
-    "__main__.py",
-    // The rich-optional print/Table/Text shim model_info.py imports.
-    "_rich_compat.py",
-    "accuracy.py",
-    "backend.py",
-    "calibration.py",
-    "model_checking.py",
-    "model_info.py",
-    "onnx_simplifier.py",
-    "precision_estimator.py",
-    "profile_merge.py",
-    "profile_plot.py",
-    "test_utils.py",
-    "version.py",
-  ];
-
   const PASS_LABELS = {
     onnxsim_simplify: "onnxsim.simplify() (full pipeline)",
     quantize_weight_only: "Weight-only INT8 quantization",
@@ -377,9 +353,17 @@ await micropip.install(["onnx", "rich"])
 `);
     logStatus("onnx + rich installed", "ok");
 
-    logStatus(`fetching onnxsim's pure-Python package (${ONNXSIM_PURE_PY_FILES.length} files)...`, "active");
+    const manifestResp = await fetch("./onnxsim_src/files.json");
+    if (!manifestResp.ok) {
+      throw new Error(`fetch of onnxsim_src/files.json failed: HTTP ${manifestResp.status}`);
+    }
+    const purePyFiles = await manifestResp.json();
+    if (!Array.isArray(purePyFiles) || purePyFiles.some((name) => typeof name !== "string")) {
+      throw new Error("onnxsim_src/files.json is not a JSON array of Python filenames");
+    }
+    logStatus(`fetching onnxsim's pure-Python package (${purePyFiles.length} files)...`, "active");
     pyodide.FS.mkdirTree(`${sitePackages}/onnxsim`);
-    for (const name of ONNXSIM_PURE_PY_FILES) {
+    for (const name of purePyFiles) {
       const resp = await fetch(`./onnxsim_src/${name}`);
       if (!resp.ok) {
         throw new Error(`fetch of onnxsim_src/${name} failed: HTTP ${resp.status}`);

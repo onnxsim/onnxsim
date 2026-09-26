@@ -38,7 +38,7 @@ public class RtDetrActivity extends YoloActivity {
     }
 
     @Override
-    Engine.Result newResult() {
+    Engine.Result newResult(String model) {
         return new Engine.Result(RtDetrEngine.MAX_DET, false, RtDetrEngine.T_N, 0f);  // the engine thresholds
     }
 

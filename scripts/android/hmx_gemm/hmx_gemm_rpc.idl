@@ -1,7 +1,7 @@
 #include "AEEStdDef.idl"
 #include "remote.idl"
 interface hmx_gemm_rpc : remote_handle64 {
-  // bit 0 turbo, bit 1 HMX power vote (required before any HMX op)
+  // bit 0 turbo, bit 1 HMX power vote (required before any HMX op), bit 2 HMX_v2 clock vote at turbo
   long perf_vote(in long flags, rout long rc);
   // C = A . W + bias (fp16). mode 0: full (pack A, stream W tiles, unpack C) x iters;
   // mode 1: all W tiles resident in VTCM, time the MAC+store loop only x iters.
@@ -9,4 +9,46 @@ interface hmx_gemm_rpc : remote_handle64 {
   long gemm_f16(in long mode, in long M, in long K, in long N, in long iters, in sequence<uint16> a,
                 in sequence<uint16> wp, in sequence<uint16> bias, rout sequence<uint16> c,
                 rout sequence<uint64> times, rout sequence<long> codes);
+  // int8 cm path (hmx_gemm_u8.h): C = sat_u8(floor(max(A . W, 0) * scale / 512)), A uint8 [M, K],
+  // wp = hmx_pack_w_u8cm(W int8 [K, N]), scale fp16 [N]. mode 0: full GEMM x iters (pack A from DDR,
+  // stream W groups, unpack C); mode 1: same with W resident in VTCM (copied once, untimed);
+  // mode 2: MAC + store only, A and W resident (weight :deep, 64 columns per instruction);
+  // mode 3: as 2 without :deep (32 columns per instruction). times: [0] us, [1..3] pcycles per phase
+  // (pack A, W copy, MAC + store / unpack C) or [1] pcycles of the MAC loop.
+  long gemm_u8(in long mode, in long M, in long K, in long N, in long iters, in sequence<uint8> a,
+               in sequence<int8> wp, in sequence<uint16> scale, rout sequence<uint8> c,
+               rout sequence<uint64> times, rout sequence<long> codes);
+  // L chained C -> C int8 layers (1x1 convs / GEMMs over M rows) with activations kept in crouton form in VTCM
+  // (hmx_layer_u8cm): a = input [M, C] uint8, wp = L packed [C, C] weights, scale = L x C fp16, o = [M, C].
+  // flags bit 0: stream layer l+1's weights DDR -> VTCM on a second HVX thread while the HMX runs layer l
+  // (else copy each layer's weights just before it); bit 1: no weight copies at all (every layer reuses
+  // layer 0's weights: compute-only timing, output not checkable). The chain runs 1 + iters times; the first
+  // run's output is returned. times: [0] us of the first chain, [1] us of the next iters chains, [2] us the
+  // HMX thread waited for weights (all runs), [3] us to pack A.
+  long layers_u8(in long flags, in long M, in long C, in long L, in long iters, in sequence<uint8> a,
+                 in sequence<int8> wp, in sequence<uint16> scale, rout sequence<uint8> o,
+                 rout sequence<uint64> times, rout sequence<long> codes);
+  // QDQ 1x1 conv (hmx_qconv.h): a = uint8 [M, K] NHWC rows, wp = hmx_pack_w_u8cm(k-major weights),
+  // prm = N/32 qc_blk_t + qc_hdr_t (qc_pack_params), mode QC_FAST 0 / QC_EXACT 1. Runs iters times on
+  // crouton-form activations resident in VTCM; y = uint8 [M, N]. times: [0] us for iters convs, [1] us to
+  // pack A, [2] scalar-fixed 4-row groups (one conv).
+  long qconv(in long mode, in long M, in long K, in long N, in long iters, in sequence<uint8> a,
+             in sequence<int8> wp, in sequence<uint8> prm, rout sequence<uint8> y,
+             rout sequence<uint64> times, rout sequence<long> codes);
+  // QDQ 3x3 conv, pad 1, stride 1/2 (hmx_qconv3.h): xf = qc_flat_pack of the [H, W, C] input, wp = qc_pack_w3,
+  // prm as qconv (K = 9C); yf = the output flat buffer (qc_geom(Ho, Wo), N channels). times: [0] us for iters
+  // (prep + conv), [1] us of prep (shift copies / phase split / stitching) over iters, [2] scalar-fixed groups.
+  long qconv3(in long mode, in long H, in long W, in long C, in long N, in long stride, in long iters,
+              in sequence<uint8> xf, in sequence<int8> wp, in sequence<uint8> prm, rout sequence<uint8> yf,
+              rout sequence<uint64> times, rout sequence<long> codes);
+  // graph runner (runner/): rn_load keeps a planned model (runner/rn_model.h rn_model_t bytes) + its packed
+  // weights/params blob in the DSP heap and acquires its VTCM; rn_run executes it iters times in ONE call
+  // (input = the input tensor's flat buffer, output = the output tensor's); times: [0] us per run (average),
+  // [1 + i] us of op i in the last run, [1 + nops + 5i + j] conv phase j of op i; codes: [0] ctx, [1] hvx, [2] hmx, [3] scalar Add/requant fixes.
+  long rn_load(in sequence<uint8> model, in sequence<uint8> blob, rout sequence<long> codes);
+  long rn_run(in long mode, in long iters, in sequence<uint8> input, rout sequence<uint8> output,
+              rout sequence<uint64> times, rout sequence<long> codes);
+  long rn_unload();
+  // core / HMX clocks (Hz) as HAP_power_get reports them: [0] core, [1] hmx, [2] dcvs enabled
+  long clocks(rout sequence<long> v);
 };

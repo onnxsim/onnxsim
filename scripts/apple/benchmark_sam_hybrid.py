@@ -80,6 +80,7 @@ class _MetalRunner:
 def _coreml_runner(path: Path, compute_units: str, compute_precision: str,
                    package: Path):
     import coremltools as ct
+
     from onnxsim import export_coreml
 
     model = onnx.load(path)
@@ -115,6 +116,12 @@ def _coreml_runner(path: Path, compute_units: str, compute_precision: str,
         options["compute_precision"] = getattr(ct.precision, compute_precision)
     mlmodel = export_coreml(model, **options)
     output_names = [v.name for v in model.graph.output]
+    coreml_output_names = [v.name for v in mlmodel.get_spec().description.output]
+    if len(coreml_output_names) != len(output_names):
+        raise RuntimeError(
+            "Core ML output count differs from ONNX: "
+            f"{len(coreml_output_names)} vs {len(output_names)}"
+        )
 
     def predict(feeds):
         coreml_feeds = {
@@ -122,7 +129,9 @@ def _coreml_runner(path: Path, compute_units: str, compute_precision: str,
             for name, value in feeds.items()
         }
         result = mlmodel.predict(coreml_feeds)
-        return [np.asarray(result[name]) for name in output_names]
+        # coremltools may rename outputs that are not valid feature names
+        # (for example numeric COCO tensor identifiers such as "391").
+        return [np.asarray(result[name]) for name in coreml_output_names]
 
     return predict
 

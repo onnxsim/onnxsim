@@ -210,10 +210,67 @@ def grid_xyz(idx, n, world=3.0):
     return ((idx - n / 2.0) / ((n / 2.0) / world)).astype(np.float32)
 
 
-def cmd_recon(a):
-    """Encoder + adaptive coarse-to-fine decoder chunks on the phone, scored vs the dense ref."""
+def phone_recon(k, v, dec, name, loc, gran=0.1, levels=2, lo=0.05, chunk=1024, iters=4, kv_dtype="f32"):
+    """Adaptive coarse-to-fine decoder chunks on the phone for one K/V cache (already quantized when
+    kv_dtype is "u16"). Returns (p, rgb) on the target grid, the number of queries and the per-chunk
+    median ms."""
     import queries as Qs
 
+    n_target = int(round(6 / gran))
+    levels_n = [n_target >> s for s in range(levels, -1, -1)]  # coarse -> target
+    probs, dec_ms, n_q = {}, None, 0
+    p_prev = q_prev = None
+    for li, n in enumerate(levels_n):
+        if li == 0:
+            want, have = np.ones((n, n, n), bool), np.zeros((n, n, n), bool)
+        else:
+            have = Qs.embed(q_prev)
+            want = have | Qs.refine(p_prev > lo, n)
+        todo = np.argwhere(want & ~have)
+        p = np.zeros((n, n, n), np.float32)
+        if li:
+            p[::2, ::2, ::2] = p_prev
+        rgb = np.zeros((n, n, n, 3), np.float32)
+        if li:
+            rgb[::2, ::2, ::2] = probs[levels_n[li - 1]][1]
+        sets, idxs = [], []
+        for s0 in range(0, len(todo), chunk):
+            idx = todo[s0 : s0 + chunk]
+            x = np.zeros((1, chunk, 3), np.float32)
+            x[0, : len(idx)] = grid_xyz(idx, n)
+            sets.append([("xyz", x, "f32"), ("k", k, kv_dtype), ("v", v, kv_dtype)])
+            idxs.append(idx)
+        ms, outs = phone_sets(dec, name, sets, iters, loc / f"l{li}")
+        dec_ms = dec_ms or ms
+        for idx, (o, r) in zip(idxs, outs):
+            o, r = o.reshape(-1)[: len(idx)], r.reshape(-1, 3)[: len(idx)]
+            p[tuple(idx.T)] = 1 / (1 + np.exp(-o))
+            rgb[tuple(idx.T)] = r
+        n_q += len(todo)
+        probs[n] = (p, rgb)
+        p_prev, q_prev = p, want
+        print(f"level n={n}: {len(todo)} queries in {len(sets)} chunks")
+    return probs[n_target][0], probs[n_target][1], n_q, dec_ms
+
+
+def score(p, rgb, ref, thr=0.3):
+    """Reconstruction (p, rgb on the target grid) vs a dense fp32 reference npz (occ logits, rgb):
+    (recall, precision, chamfer, color L1 x255, points, reference points)."""
+    import queries as Qs
+
+    n = p.shape[0]
+    rp = 1 / (1 + np.exp(-ref["occ"].astype(np.float64))).reshape((n,) * 3)
+    rrgb = ref["rgb"].reshape((n,) * 3 + (3,))
+    occ_ref, occ = rp > thr, p > thr
+    both = occ_ref & occ
+    rec, prec = both.sum() / occ_ref.sum(), both.sum() / max(occ.sum(), 1)
+    ch = Qs.chamfer(Qs.coords(occ, n), Qs.coords(occ_ref, n))
+    col = np.abs(rgb[both] - rrgb[both]).mean() * 255
+    return rec, prec, ch, col, int(occ.sum()), int(occ_ref.sum())
+
+
+def cmd_recon(a):
+    """Encoder + adaptive coarse-to-fine decoder chunks on the phone, scored vs the dense ref."""
     inp = np.load(WORK / "inputs_quest2.npz")
     loc = WORK / "phone" / "recon"
     enc_ms, (k, v) = phone(
@@ -228,61 +285,16 @@ def cmd_recon(a):
         loc / "enc",
     )
     k, v = k.reshape(8, 16, 197, 32), v.reshape(8, 16, 197, 32)
-    n_target = int(round(6 / a.gran))
-    levels = [n_target >> s for s in range(a.levels, -1, -1)]  # coarse -> target
-    probs, dec_ms, n_q = {}, None, 0
-    p_prev = q_prev = None
-    for li, n in enumerate(levels):
-        if li == 0:
-            want, have = np.ones((n, n, n), bool), np.zeros((n, n, n), bool)
-        else:
-            have = Qs.embed(q_prev)
-            want = have | Qs.refine(p_prev > a.lo, n)
-        todo = np.argwhere(want & ~have)
-        p = np.zeros((n, n, n), np.float32)
-        if li:
-            p[::2, ::2, ::2] = p_prev
-        rgb = np.zeros((n, n, n, 3), np.float32)
-        if li:
-            rgb[::2, ::2, ::2] = probs[levels[li - 1]][1]
-        sets, idxs = [], []
-        for s0 in range(0, len(todo), a.chunk):
-            idx = todo[s0 : s0 + a.chunk]
-            x = np.zeros((1, a.chunk, 3), np.float32)
-            x[0, : len(idx)] = grid_xyz(idx, n)
-            sets.append([("xyz", x, "f32"), ("k", k, "f32"), ("v", v, "f32")])
-            idxs.append(idx)
-        ms, outs = phone_sets(
-            WORK / f"dec_q{a.chunk}.onnx",
-            f"dec_q{a.chunk}",
-            sets,
-            a.iters,
-            loc / f"l{li}",
-        )
-        dec_ms = dec_ms or ms
-        for idx, (o, r) in zip(idxs, outs):
-            o, r = o.reshape(-1)[: len(idx)], r.reshape(-1, 3)[: len(idx)]
-            p[tuple(idx.T)] = 1 / (1 + np.exp(-o))
-            rgb[tuple(idx.T)] = r
-        n_q += len(todo)
-        probs[n] = (p, rgb)
-        p_prev, q_prev = p, want
-        print(f"level n={n}: {len(todo)} queries in {len(sets)} chunks")
-    ref = np.load(WORK / f"ref_quest2_{a.gran}.npz")
-    rp = 1 / (1 + np.exp(-ref["occ"].astype(np.float64))).reshape((n_target,) * 3)
-    rrgb = ref["rgb"].reshape((n_target,) * 3 + (3,))
-    p, rgb = probs[n_target]
-    occ_ref, occ = rp > a.thr, p > a.thr
-    both = occ_ref & occ
-    rec, prec = both.sum() / occ_ref.sum(), both.sum() / max(occ.sum(), 1)
-    ch = Qs.chamfer(Qs.coords(occ, n_target), Qs.coords(occ_ref, n_target))
-    col = np.abs(rgb[both] - rrgb[both]).mean() * 255
+    p, rgb, n_q, dec_ms = phone_recon(
+        k, v, WORK / f"dec_q{a.chunk}.onnx", f"dec_q{a.chunk}", loc, a.gran, a.levels, a.lo, a.chunk, a.iters
+    )
+    rec, prec, ch, col, n_occ, n_ref = score(p, rgb, np.load(WORK / f"ref_quest2_{a.gran}.npz"), a.thr)
     t = enc_ms / 1e3 + n_q / a.chunk * dec_ms / 1e3
     print(
-        f"recon g={a.gran} levels={levels} lo={a.lo}: {n_q} queries; enc {enc_ms} ms + "
+        f"recon g={a.gran} levels={a.levels} lo={a.lo}: {n_q} queries; enc {enc_ms} ms + "
         f"{int(np.ceil(n_q / a.chunk))} x {dec_ms} ms chunks -> {t:.2f} s (steady-state); "
         f"vs dense host fp32: recall {rec:.4f} precision {prec:.4f} chamfer {ch:.4f} "
-        f"color L1 {col:.2f}/255 ({int(occ.sum())} vs {int(occ_ref.sum())} points)"
+        f"color L1 {col:.2f}/255 ({n_occ} vs {n_ref} points)"
     )
     np.savez(WORK / f"recon_{a.gran}_{a.levels}_{a.lo}.npz", p=p, rgb=rgb)
 

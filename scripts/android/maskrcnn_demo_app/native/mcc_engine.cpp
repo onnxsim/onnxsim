@@ -4,17 +4,25 @@
 //      mask. The working image is W x H = 480 x 640 (portrait) or 640 x 480 (landscape).
 //   2. MoGe-2 ViT-S (moge_<H>x<W>.onnx, ../vision_models/mcc/depth.py static): float NCHW image in
 //      [0, 1] -> metric point map "points" [1, H, W, 3] in the OpenCV camera frame; y and z are
-//      flipped into MCC's frame (x right, y up, z toward the viewer), as depth.py does.
+//      flipped into MCC's frame (x right, y up, z toward the viewer), as depth.py does. It needs only
+//      the image, so it starts on its own thread as soon as an image is encoded and runs while the
+//      user picks the object; "3D" waits for it (usually done by then).
 //   3. model.py prep() + xyz_windows() on the CPU: points outside the mask -> inf, scale by the mean
 //      per-axis std, center, crop to the mask box + 40 px, pad square, image bilinear -> 800 -> 224
 //      (normalized), points bilinear -> 112 (a non-finite tap makes a point invalid, as in torch),
 //      invalid -> -100, shrink, 8x8 windows.
 //   4. MCC encoder (mcc_enc.onnx = ../vision_models/mcc enc.onnx): img, xyz_win, valid -> the decoder's
 //      seen K/V [8, 16, 197, 32] each, once per reconstruction.
-//   5. MCC decoder chunks (mcc_dec_q1024.onnx): 1024 query points each against that K/V -> occupancy
-//      logit + color. Queries coarse-to-fine exactly as mcc.py recon: every point of the coarsest grid,
+//   5. MCC decoder chunks: 1024 query points each against that K/V -> occupancy logit + color. Default
+//      (opts dec=hmx): the hand-written DSP decoder of ../../mcc_hmx (HMX GEMMs + 4 HVX threads, a
+//      FastRPC skel, libmcc_hmx_rpc.so; weights mcc_hmx_blk0..7.bin + mcc_hmx_head.bin loaded once, the
+//      image's K/V packed here and sent once), ~22 ms a chunk, and the last chunk of a level only as
+//      long as it needs (multiples of 32 queries). dec=qnn: mcc_dec_q1024.onnx on the HTP through QNN
+//      (the w8a16 dec_opt.py a16c build: 47 ms a chunk). Queries coarse-to-fine exactly as mcc.py recon: every point of the coarsest grid,
 //      then at each finer level the 27-neighborhood of every cell with p > lo (default 15^3 -> 30^3 ->
-//      60^3, granularity 0.1). The result is the target grid's points with p > thr.
+//      60^3, granularity 0.1, lo 0.1: recall >= 0.9975 of the dense grid's occupied points on the three
+//      references in ../vision_models/mcc/dec_opt.py, 13-20% fewer queries than 0.05). The result is
+//      the target grid's points with p > thr.
 #include <jni.h>
 #include <android/bitmap.h>
 #include <android/log.h>
@@ -24,6 +32,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -32,6 +42,9 @@
 
 #include "htp_session.h"
 #include "yuv_upright.h"
+#include "remote.h"
+#include "mcc_hmx_rpc.h"
+#include "mcc_decoder.h" /* mb_pack_kv: the K/V tile layout the skel expects */
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MccDemo", __VA_ARGS__)
 
@@ -45,10 +58,13 @@ constexpr float kInf = std::numeric_limits<float>::infinity();
 demo::Htp g_htp;
 std::string g_dir, g_perf;
 std::unique_ptr<Ort::Session> g_sam_enc, g_sam_dec, g_enc, g_dec;
+remote_handle64 g_hmx = 0; /* the DSP decoder (dec=hmx) */
 std::map<std::string, std::unique_ptr<Ort::Session>> g_moge;  // per orientation, loaded on first use
 int g_w = 0, g_h = 0;                                          // working image
 std::vector<uint8_t> g_rgb, g_mask, g_q(S * S * 3);
 std::vector<float> g_emb(EMB), g_lr(4 * LR * LR);
+std::shared_future<std::vector<float>> g_moge_pts;  // the current image's MoGe-2 points (MCC frame)
+float g_moge_ms = 0;                                  // its run time (set by the MoGe thread)
 bool g_have_emb = false, g_have_mask = false;
 std::vector<float> g_pts;    // result: xyz per point
 std::vector<int32_t> g_col;  // result: ARGB per point
@@ -155,32 +171,42 @@ float sam_decode(float x, float y, float* iou) {
 }
 
 // ---- MoGe-2 + MCC -------------------------------------------------------------------------------
-Ort::Session& moge() {
-  const std::string stem = "moge_" + std::to_string(g_h) + "x" + std::to_string(g_w);
+// Runs on the MoGe thread only (g_moge is touched nowhere else).
+Ort::Session& moge(int w, int h) {
+  const std::string stem = "moge_" + std::to_string(h) + "x" + std::to_string(w);
   auto& s = g_moge[stem];
   if (!s) s = g_htp.session(g_dir, stem, g_perf, "MccDemo");
   return *s;
 }
 
-// working image -> MoGe points (H, W, 3), flipped into MCC's frame
-std::vector<float> moge_points() {
-  const size_t n = (size_t)g_w * g_h;
+// image (h, w, 3) -> MoGe points (h, w, 3), flipped into MCC's frame
+std::vector<float> moge_points(const std::vector<uint8_t>& rgb, int w, int h) {
+  const double t0 = now_ms();
+  const size_t n = (size_t)w * h;
   std::vector<float> img(3 * n), pts(3 * n), mk(n);
   for (size_t i = 0; i < n; ++i)
-    for (int c = 0; c < 3; ++c) img[c * n + i] = g_rgb[3 * i + c] / 255.f;
-  int64_t is[4] = {1, 3, g_h, g_w}, ps[4] = {1, g_h, g_w, 3}, ms[3] = {1, g_h, g_w};
+    for (int c = 0; c < 3; ++c) img[c * n + i] = rgb[3 * i + c] / 255.f;
+  int64_t is[4] = {1, 3, h, w}, ps[4] = {1, h, w, 3}, ms[3] = {1, h, w};
   Ort::Value in = Ort::Value::CreateTensor<float>(cpu(), img.data(), img.size(), is, 4);
   Ort::Value out[2] = {Ort::Value::CreateTensor<float>(cpu(), pts.data(), pts.size(), ps, 4),
                        Ort::Value::CreateTensor<float>(cpu(), mk.data(), mk.size(), ms, 3)};
   const char* in_n[] = {"image"};
   const char* out_n[] = {"points", "mask"};
-  moge().Run(Ort::RunOptions{nullptr}, in_n, &in, 1, out_n, out, 2);
+  moge(w, h).Run(Ort::RunOptions{nullptr}, in_n, &in, 1, out_n, out, 2);
   dump("moge_points.f32", pts.data(), pts.size() * 4);
   for (size_t i = 0; i < n; ++i) {  // OpenCV camera frame -> x right, y up, z toward the viewer
     pts[3 * i + 1] = -pts[3 * i + 1];
     pts[3 * i + 2] = -pts[3 * i + 2];
   }
+  g_moge_ms = (float)(now_ms() - t0);
+  LOGI("MoGe-2 %dx%d: %.1f ms (background)", w, h, g_moge_ms);
   return pts;
+}
+
+// A new working image: start its MoGe-2 run (after the previous one, which may still be running).
+void start_moge() {
+  if (g_moge_pts.valid()) g_moge_pts.wait();
+  g_moge_pts = std::async(std::launch::async, moge_points, g_rgb, g_w, g_h).share();
 }
 
 struct EncIn {
@@ -255,7 +281,8 @@ EncIn prep(std::vector<float> xyz) {
   return e;
 }
 
-// times: 0 MoGe, 1 prep, 2 encoder, 3 decoder (all chunks), 4 total; counts: queries, chunks, points
+// times: 0 MoGe-2 run (background), 1 waited for it, 2 prep, 3 encoder, 4 decoder (all chunks), 5 total;
+// counts: queries, chunks, points
 void reconstruct(float* times, int* counts) {
   if (!g_have_mask) throw std::runtime_error("tap an object first");
   const double t0 = now_ms();
@@ -266,7 +293,8 @@ void reconstruct(float* times, int* counts) {
   dump("dims.i32", dims, sizeof dims);
   dump("rgb.u8", g_rgb.data(), g_rgb.size());
   dump("mask.u8", g_mask.data(), g_mask.size());
-  std::vector<float> seen = moge_points();
+  if (!g_moge_pts.valid()) throw std::runtime_error("no image encoded yet");
+  std::vector<float> seen = g_moge_pts.get();  // a copy: the same image can be reconstructed again
   const double t1 = now_ms();
   EncIn e = prep(std::move(seen));
   const double t2 = now_ms();
@@ -288,7 +316,7 @@ void reconstruct(float* times, int* counts) {
   const double t3 = now_ms();
   dump("k.f32", k.data(), k.size() * 4);
   dump("v.f32", v.data(), v.size() * 4);
-  // decoder: one set of tensors, rebound per chunk
+  // decoder: one set of tensors, rebound per chunk (QNN), or the DSP decoder with this image's K/V
   std::vector<float> qx(Q * 3), qo(Q), qc(Q * 3);
   int64_t xs[3] = {1, Q, 3}, os[2] = {1, Q}, ks[4] = {8, 16, SEEN, 32};
   Ort::Value din[3] = {Ort::Value::CreateTensor<float>(cpu(), qx.data(), qx.size(), xs, 3),
@@ -298,6 +326,16 @@ void reconstruct(float* times, int* counts) {
                         Ort::Value::CreateTensor<float>(cpu(), qc.data(), qc.size(), xs, 3)};
   const char* din_n[] = {"xyz", "k", "v"};
   const char* dout_n[] = {"occ", "rgb"};
+  const int hmx_thr = std::stoi(g_opts["hmx_threads"]);
+  if (g_hmx) {
+    const size_t per = (size_t)2 * MB_HEADS * MB_ST * MB_TH; /* halfwords per block: K tiles, V tiles */
+    std::vector<mb_hf> kv(per * MB_BLOCKS);
+    mb_hf *kt[MB_BLOCKS], *vt[MB_BLOCKS];
+    for (int b = 0; b < MB_BLOCKS; b++) kt[b] = kv.data() + per * b, vt[b] = kt[b] + per / 2;
+    mb_pack_kv(kt, vt, k.data(), v.data());
+    const int rc = mcc_hmx_rpc_set_kv_tiles(g_hmx, kv.data(), (int)kv.size());
+    if (rc) throw std::runtime_error("mcc_hmx set_kv_tiles " + std::to_string(rc));
+  }
   std::vector<float> p, rgb, p_prev, rgb_prev;
   std::vector<uint8_t> want, q_prev;
   int n_prev = 0, nq = 0, nchunks = 0;
@@ -337,7 +375,15 @@ void reconstruct(float* times, int* counts) {
         const size_t idx[3] = {f / ((size_t)n * n), (f / n) % n, f % n};
         for (int t = 0; t < 3; ++t) qx[3 * r + t] = (float)((idx[t] - n / 2.0) / ((n / 2.0) / 3.0));
       }
-      g_dec->Run(Ort::RunOptions{nullptr}, din_n, din, 3, dout_n, dout, 2);
+      if (g_hmx) { /* only the rows this chunk uses, rounded up to 32 */
+        const int q = (int)((m + 31) / 32 * 32);
+        uint64 t[13];
+        int codes[6];
+        const int rc = mcc_hmx_rpc_decode(g_hmx, q, MB_V_ALL, hmx_thr, qx.data(), q * 3, qo.data(), q, qc.data(), q * 3, t, 13, codes, 6);
+        if (rc || codes[2] || !codes[0]) throw std::runtime_error("mcc_hmx decode rc " + std::to_string(rc) + " ctx " + std::to_string(codes[0]) +
+                                                                  " hmx lock " + std::to_string(codes[2]));
+      } else
+        g_dec->Run(Ort::RunOptions{nullptr}, din_n, din, 3, dout_n, dout, 2);
       for (size_t r = 0; r < m; ++r) {
         const size_t f = todo[s0 + r];
         p[f] = 1.f / (1.f + std::exp(-qo[r]));
@@ -362,7 +408,8 @@ void reconstruct(float* times, int* counts) {
         c |= (int32_t)std::lround(std::min(1.f, std::max(0.f, rgb_prev[3 * f + t])) * 255) << (16 - 8 * t);
       g_col.push_back(c);
     }
-  const float tt[5] = {(float)(t1 - t0), (float)(t2 - t1), (float)(t3 - t2), (float)(t4 - t3), (float)(now_ms() - t0)};
+  const float tt[6] = {g_moge_ms, (float)(t1 - t0), (float)(t2 - t1), (float)(t3 - t2), (float)(t4 - t3),
+                       (float)(now_ms() - t0)};
   memcpy(times, tt, sizeof tt);
   counts[0] = nq, counts[1] = nchunks, counts[2] = (int)g_col.size();
 }
@@ -397,16 +444,41 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_nat
     g_opts = demo::parse_opts(jstr(e, jopts), {{"htp_performance_mode", "burst"},
                                                {"gran", "0.1"},
                                                {"levels", "2"},
-                                               {"lo", "0.05"},
+                                               {"lo", "0.1"},
                                                {"thr", "0.3"},
-                                               {"dump", "0"}});
+                                               {"dump", "0"},
+                                               {"dec", "hmx"},
+                                               {"hmx_threads", "4"}});
     g_dir = jstr(e, jdir);
     g_perf = g_opts["htp_performance_mode"];
     g_htp.init(jstr(e, jlib), "mcc");
     g_sam_enc = g_htp.session(g_dir, "sam_l0_enc", g_perf, "MccDemo");
     g_sam_dec = g_htp.session(g_dir, "sam_l0_dec", g_perf, "MccDemo");
     g_enc = g_htp.session(g_dir, "mcc_enc", g_perf, "MccDemo");
-    g_dec = g_htp.session(g_dir, "mcc_dec_q1024", g_perf, "MccDemo");
+    if (g_opts["dec"] == "hmx") {
+      if (!g_hmx) {
+        struct remote_rpc_control_unsigned_module up = {CDSP_DOMAIN_ID, 1};
+        remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &up, sizeof up);
+        if (mcc_hmx_rpc_open("file:///libmcc_hmx_rpc.so?mcc_hmx_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &g_hmx))
+          throw std::runtime_error("mcc_hmx_rpc_open failed (skel libmcc_hmx_rpc.so)");
+        int prc = 0;
+        mcc_hmx_rpc_perf_vote(g_hmx, 3, &prc); /* turbo + the HMX power vote (mandatory before HMX ops) */
+        const double t = now_ms();
+        auto load = [](const std::string& path) {
+          std::ifstream f(path, std::ios::binary);
+          if (!f) throw std::runtime_error("missing " + path);
+          return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        for (int b = 0; b < MB_BLOCKS; b++) {
+          auto blob = load(g_dir + "/mcc_hmx_blk" + std::to_string(b) + ".bin");
+          if (int rc = mcc_hmx_rpc_load_block(g_hmx, b, blob.data(), (int)blob.size())) throw std::runtime_error("mcc_hmx load_block " + std::to_string(rc));
+        }
+        auto head = load(g_dir + "/mcc_hmx_head.bin");
+        if (int rc = mcc_hmx_rpc_load_head(g_hmx, head.data(), (int)head.size())) throw std::runtime_error("mcc_hmx load_head " + std::to_string(rc));
+        LOGI("DSP decoder: weights loaded in %.0f ms", now_ms() - t);
+      }
+    } else
+      g_dec = g_htp.session(g_dir, "mcc_dec_q1024", g_perf, "MccDemo");
     return nullptr;
   } catch (const std::exception& ex) {
     return e->NewStringUTF(ex.what());
@@ -436,6 +508,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_na
     });
     if (enc) {
       float t = sam_encode();
+      start_moge();
       e->SetFloatArrayRegion(jt, 0, 1, &t);
     }
     return JNI_TRUE;
@@ -457,6 +530,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_na
     for (int y = 0; y < g_h; ++y)
       for (int x = 0; x < g_w; ++x) memcpy(g_rgb.data() + ((size_t)y * g_w + x) * 3, d.px + (size_t)y * d.bi.stride + 4 * x, 3);
     float t = sam_encode();
+    start_moge();
     e->SetFloatArrayRegion(jt, 0, 1, &t);
     return JNI_TRUE;
   } catch (const std::exception& ex) {
@@ -487,16 +561,16 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_native
   }
 }
 
-// MoGe-2 + MCC for the current mask. times[5]: MoGe, prep, encoder, decoder, total ms; counts[3]:
-// queries, chunks, points. Returns the number of points, -1 on error.
+// MoGe-2 + MCC for the current mask. times[6]: MoGe-2 run, MoGe-2 wait, prep, encoder, decoder, total
+// ms; counts[3]: queries, chunks, points. Returns the number of points, -1 on error.
 extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_nativeReconstruct(JNIEnv* e, jclass,
                                                                                            jfloatArray jt, jintArray jc) {
   std::lock_guard<std::mutex> l(g_mu);
   try {
-    float t[5];
+    float t[6];
     int c[3];
     reconstruct(t, c);
-    e->SetFloatArrayRegion(jt, 0, 5, t);
+    e->SetFloatArrayRegion(jt, 0, 6, t);
     e->SetIntArrayRegion(jc, 0, 3, c);
     return c[2];
   } catch (const std::exception& ex) {

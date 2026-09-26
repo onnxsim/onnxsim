@@ -120,6 +120,15 @@ def _mil_const_value(model: onnx.ModelProto):
     return np.asarray(prog.functions["main"].outputs[0].val)
 
 
+def _mil_two_outputs(model: onnx.ModelProto):
+    """Like :func:`_mil_const_value` but for a two-output op, reading back each
+    of the graph's declared outputs in order."""
+    prog, _flexible_inputs = coreml_export._build_mil_program(
+        model, *coreml_export._import_mil()
+    )
+    return tuple(np.asarray(o.val) for o in prog.functions["main"].outputs)
+
+
 # ---------------------------------------------------------------------------
 # Basic conversion
 # ---------------------------------------------------------------------------
@@ -162,13 +171,17 @@ def test_convert_to_coreml_matches_export_coreml():
 
 
 def test_resize_nearest_asymmetric_floor_matches_onnx():
+    # 2x3 -> 3x5 repeats no input row/column a whole number of times, so this
+    # stays on the index-gather expansion MIL can constant-fold -- which is what
+    # lets this check the sampling rule numerically. The native-op fast path is
+    # covered separately by test_resize_nearest_repeating_uses_native_core_ml_op.
     x = numpy_helper.from_array(
-        np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), name="x"
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
     )
-    scales = numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), name="scales")
+    sizes = numpy_helper.from_array(np.array([1, 1, 3, 5], np.int64), name="sizes")
     node = onnx.helper.make_node(
         "Resize",
-        ["x", "", "scales"],
+        ["x", "", "", "sizes"],
         ["y"],
         mode="nearest",
         coordinate_transformation_mode="asymmetric",
@@ -178,17 +191,321 @@ def test_resize_nearest_asymmetric_floor_matches_onnx():
         [node],
         "nearest_resize",
         [],
-        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 4, 4])],
-        [x, scales],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 3, 5])],
+        [x, sizes],
     )
     model = onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
     )
     model.ir_version = 8
-    expected = np.repeat(
-        np.repeat(np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), 2, 2), 2, 3
-    )
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
     np.testing.assert_array_equal(_mil_const_value(model), expected)
+    # 2x3 -> 3x5 is not whole-column replication, so the gate keeps the gathers
+    # and these are the sampling rules the two modes must agree with.
+    np.testing.assert_array_equal(
+        expected[0, 0, 0],
+        np.array([1.0, 1.0, 2.0, 2.0, 3.0], dtype=np.float32),
+    )
+
+
+def test_resize_nearest_half_pixel_round_prefer_floor_matches_onnx():
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    sizes = numpy_helper.from_array(np.array([1, 1, 3, 5], np.int64), name="sizes")
+    node = onnx.helper.make_node(
+        "Resize",
+        ["x", "", "", "sizes"],
+        ["y"],
+        mode="nearest",
+        coordinate_transformation_mode="half_pixel",
+        nearest_mode="round_prefer_floor",
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "nearest_resize_half_pixel",
+        [],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 3, 5])],
+        [x, sizes],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+    np.testing.assert_array_equal(
+        expected[0, 0, 0],
+        np.array([1.0, 1.0, 2.0, 3.0, 3.0], dtype=np.float32),
+    )
+
+
+def test_resize_nearest_fixed_sizes_matches_onnxruntime():
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    model = _model(
+        """
+        nearest_sizes () => (float[1,1,3,4] y)
+        <int64[4] sizes = {1,1,3,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    expected = session.run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_linear_fixed_sizes_lowers_bilinear():
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    model = _model(
+        """
+        linear_sizes () => (float[1,1,4,5] y)
+        <int64[4] sizes = {1,1,4,5}>
+        {
+            y = Resize <mode="linear", coordinate_transformation_mode="half_pixel"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    (resize,) = [op for op in func.operations if op.op_type == "resize_bilinear"]
+    assert tuple(resize.outputs[0].shape) == (1, 1, 4, 5)
+    assert resize.inputs["target_size_height"].val == 4
+    assert resize.inputs["target_size_width"].val == 5
+    assert resize.inputs["sampling_mode"].val == "UNALIGN_CORNERS"
+
+
+def test_resize_nearest_repeating_uses_native_core_ml_op():
+    # A nearest upsample by an integer factor samples each input row/column a
+    # whole number of times, which is the case Core ML's own
+    # `resize_nearest_neighbor` reproduces exactly (measured against ONNX Runtime
+    # on 2x2->4x4, 3x4->6x8 and 4x4->8x8). That is a real kernel instead of a
+    # pair of index gathers materializing an intermediate feature map, which is
+    # what made a 4-level FPN expensive.
+    model = _model(
+        """
+        nearest_native (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <int64[4] sizes = {1,1,4,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="half_pixel", nearest_mode="round_prefer_floor"> (x, , , sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    ops = [op.op_type for op in func.operations]
+    assert ops.count("resize_nearest_neighbor") == 1
+    assert "gather" not in ops
+    (resize,) = [
+        op for op in func.operations if op.op_type == "resize_nearest_neighbor"
+    ]
+    assert resize.inputs["target_size_height"].val == 4
+    assert resize.inputs["target_size_width"].val == 4
+
+
+def test_resize_nearest_non_repeating_keeps_index_gathers():
+    # 2x3 -> 3x4 does not repeat every input row/column a whole number of
+    # times. Core ML's own op samples different positions there (verified on
+    # device), so the gate must fall back to the gather expansion rather than
+    # silently change results.
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    model = _model(
+        """
+        nearest_fallback () => (float[1,1,3,4] y)
+        <int64[4] sizes = {1,1,3,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    ops = [op.op_type for op in func.operations]
+    assert ops.count("gather") == 2
+    assert "resize_nearest_neighbor" not in ops
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_nearest_downscale_keeps_index_gathers():
+    # A downscale never repeats rows. Core ML's op does not reproduce ONNX's
+    # sampling rule for one (4x4 -> 2x2 measured a different first row on
+    # device), so this must stay on the gather path.
+    x = numpy_helper.from_array(
+        np.arange(1, 17, dtype=np.float32).reshape(1, 1, 4, 4), name="x"
+    )
+    model = _model(
+        """
+        nearest_down () => (float[1,1,2,2] y)
+        <int64[4] sizes = {1,1,2,2}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    ops = [op.op_type for op in func.operations]
+    assert ops.count("gather") == 2
+    assert "resize_nearest_neighbor" not in ops
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_nearest_index_gate_matches_integer_replication_only():
+    # The gate is the correctness argument for the native op, so pin its
+    # boundaries directly rather than only through a model.
+    up = np.array([0, 0, 1, 1], dtype=np.int32)
+    assert coreml_export._resize_nearest_is_repeating(2, up) is True
+    uneven = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)
+    assert coreml_export._resize_nearest_is_repeating(3, uneven) is True
+    # Not a whole-number replication, even though the indices look plausible.
+    assert (
+        coreml_export._resize_nearest_is_repeating(2, np.array([0, 1, 1], np.int32))
+        is False
+    )
+    # A downscale is never eligible.
+    assert (
+        coreml_export._resize_nearest_is_repeating(4, np.array([0, 2], np.int32))
+        is False
+    )
+    # Even an index array of the right length but wrong content is rejected.
+    assert (
+        coreml_export._resize_nearest_is_repeating(2, np.array([0, 1, 1, 1], np.int32))
+        is False
+    )
+
+
+def test_resize_nearest_raises_the_deployment_target_to_ios15():
+    # `resize_nearest_neighbor` is an iOS15 op, so a graph that may emit it has
+    # to build and convert at that target or newer.
+    model = _model(
+        """
+        nearest_target (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <int64[4] sizes = {1,1,4,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="half_pixel", nearest_mode="round_prefer_floor"> (x, , , sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model)
+    assert mlmodel.get_spec().specificationVersion >= int(ct.target.iOS15)
+
+    # An explicitly newer target is kept as-is.
+    higher = onnxsim.export_coreml(model, minimum_deployment_target="iOS17")
+    assert higher.get_spec().specificationVersion == int(ct.target.iOS17)
+
+
+def test_resize_nearest_below_ios15_raises():
+    model = _model(
+        """
+        nearest_old (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <int64[4] sizes = {1,1,4,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="half_pixel", nearest_mode="round_prefer_floor"> (x, , , sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    with pytest.raises(RuntimeError, match="iOS15/macOS12 or newer"):
+        coreml_export.convert_to_coreml(model, minimum_deployment_target="iOS14")
+
+
+def test_gather_nd_batch_dims_preserved():
+    x = numpy_helper.from_array(
+        np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4), name="x"
+    )
+    indices = numpy_helper.from_array(
+        np.array([[[0, 2], [1, 3]], [[2, 0], [3, 1]]], dtype=np.int64), name="indices"
+    )
+    model = _model(
+        "gathernd (float[2,3,4] x, int64[2,2,2] indices) "
+        "=> (float[2,2] y) { y = GatherND <batch_dims=1> (x, indices) }",
+        initializer=[x, indices],
+    )
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    prog, _ = coreml_export._build_mil_program(
+        model,
+        mb,
+        types,
+        Function,
+        Program,
+        RangeDim,
+        TensorType,
+        opset_version=ct.target.iOS16,
+    )
+    (gather,) = [
+        op for op in prog.functions["main"].operations if op.op_type == "gather_nd"
+    ]
+    assert gather.inputs["batch_dims"].val == 1
+    assert tuple(gather.outputs[0].shape) == (2, 2)
+    assert coreml_export._resolve_gather_nd_target(ct, model, None) == ct.target.iOS16
+    with pytest.raises(RuntimeError, match="iOS16/macOS13 or newer"):
+        coreml_export._resolve_gather_nd_target(ct, model, ct.target.iOS15)
+
+
+def test_expand_multidirectional_broadcast():
+    x = numpy_helper.from_array(
+        np.arange(1 * 8 * 20, dtype=np.float32).reshape(1, 8, 20), name="x"
+    )
+    model = _model(
+        "expand_mdi (float[1,8,20] x) => (float[6,8,20] y) "
+        "<int64[3] shape = {6,1,1}> { y = Expand (x, shape) }",
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    expected = session.run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_gather_nd_unbatched_does_not_require_ios16():
+    x = numpy_helper.from_array(
+        np.arange(2 * 3, dtype=np.float32).reshape(2, 3), name="x"
+    )
+    indices = numpy_helper.from_array(
+        np.array([[0, 2], [1, 0]], dtype=np.int64), name="indices"
+    )
+    model = _model(
+        "gathernd0 (float[2,3] x, int64[2,2] indices) "
+        "=> (float[2] y) { y = GatherND (x, indices) }",
+        initializer=[x, indices],
+    )
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    prog, _ = coreml_export._build_mil_program(
+        model, mb, types, Function, Program, RangeDim, TensorType
+    )
+    (gather,) = [
+        op for op in prog.functions["main"].operations if op.op_type == "gather_nd"
+    ]
+    assert "batch_dims" not in gather.inputs
+    assert tuple(gather.outputs[0].shape) == (2,)
+    assert coreml_export._resolve_gather_nd_target(ct, model, None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +637,269 @@ def test_gemm_alpha_beta_transb_matches_onnxruntime():
     np.testing.assert_allclose(_mil_const_value(model), expected, rtol=1e-5, atol=1e-5)
 
 
+def test_dequantize_linear_per_channel_int32_bias_lowers_to_cast_mul():
+    # onnxsim.full_qdq emits exactly this shape for a QDQ Conv/Gemm bias:
+    # DequantizeLinear(int32[2], fp32[2] scale, int32[2] zero_point, axis=0).
+    # MIL's `dequantize` only accepts int8/uint8, and the old scalar-zero
+    # special case rejected the per-channel form outright -- which blocked
+    # every full_qdq graph. The cast+multiply is the real definition, and with
+    # a zero zero_point it is exact.
+    scale = numpy_helper.from_array(
+        np.array([0.02, 0.5], dtype=np.float32), name="scale"
+    )
+    zp = numpy_helper.from_array(np.array([0, 0], dtype=np.int32), name="zp")
+    model = _model(
+        """
+        dq32pc (int32[2,2] x, float[2] scale, int32[2] zp) => (float[2,2] y)
+        {
+            y = DequantizeLinear <axis=0> (x, scale, zp)
+        }
+        """,
+        initializer=[scale, zp],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    ops = [op.op_type for op in prog.functions["main"].operations]
+    # cast + mul, and no `dequantize` (which would reject int32).
+    assert "dequantize" not in ops
+    assert ops.count("cast") == 1 and ops.count("mul") == 1
+    # int32 -> fp32 (the cast) then the per-channel scale (the mul).
+    (cast,) = [op for op in prog.functions["main"].operations if op.op_type == "cast"]
+    (mul,) = [op for op in prog.functions["main"].operations if op.op_type == "mul"]
+    assert cast.inputs["dtype"].val == "fp32"
+    np.testing.assert_allclose(np.asarray(mul.inputs["y"].val), [0.02, 0.5], rtol=1e-6)
+
+
+def test_dequantize_linear_int32_nonzero_zero_point_adds_the_offset():
+    # A nonzero int32 zero point is (x - zp) * scale, so the lowering has to
+    # subtract rather than just scale. full_qdq only ever emits zero points,
+    # but the exporter must not silently drop a nonzero one.
+    scale = numpy_helper.from_array(
+        np.array([0.1, 0.2], dtype=np.float32), name="scale"
+    )
+    zp = numpy_helper.from_array(np.array([2, 4], dtype=np.int32), name="zp")
+    model = _model(
+        """
+        dq32off (int32[2,2] x, float[2] scale, int32[2] zp) => (float[2,2] y)
+        {
+            y = DequantizeLinear <axis=0> (x, scale, zp)
+        }
+        """,
+        initializer=[scale, zp],
+    )
+    ops = [
+        op.op_type
+        for op in coreml_export._build_mil_program(model, *coreml_export._import_mil())[
+            0
+        ]
+        .functions["main"]
+        .operations
+    ]
+    assert "dequantize" not in ops
+    assert ops.count("add") == 1
+
+
+def test_dequantize_linear_rejects_unsupported_zero_point_dtype():
+    # full_qdq's activation_dtype="uint16" emits int16/uint16 Q/DQ. That has no
+    # MIL Q/DQ form, and it is also outside the constant dtypes the translator
+    # carries, so it is refused -- explicitly at the constant, never silently
+    # reinterpreted as another width.
+    with pytest.raises(RuntimeError, match="Unsupported tensor dtype int16"):
+        coreml_export._as_mil_array(np.array([0], dtype=np.int16))
+
+
+# ---------------------------------------------------------------------------
+# Detection-head ops: TopK / Less / ReduceMin / ReduceProd (Mask R-CNN's
+# proposal NMS and box head), plus explicit refusals for RoiAlign, NonZero and
+# higher-rank ScatterElements.
+# ---------------------------------------------------------------------------
+
+
+def test_topk_lowers_to_native_topk():
+    # MIL's `topk` has the same (values, indices) contract as ONNX TopK, so this
+    # is a 1:1 lowering. Check the wiring (k, axis, order) rather than only the
+    # op name, since a wrong axis or k would still "convert".
+    model = _model(
+        """
+        topk (float[2,10] x) => (float[2,3] values, int64[2,3] indices)
+        <int64[1] k = {3}>
+        {
+            values, indices = TopK <axis=-1> (x, k)
+        }
+        """
+    )
+    func, _ = _build_ops(model)
+    (topk,) = [op for op in func.operations if op.op_type == "topk"]
+    assert topk.inputs["k"].val == 3
+    assert topk.inputs["axis"].val == 1  # -1 resolved against rank 2
+    assert topk.inputs["ascending"].val is False
+    assert tuple(topk.outputs[0].shape) == (2, 3)
+    assert tuple(topk.outputs[1].shape) == (2, 3)
+
+
+def test_topk_rejects_largest_zero():
+    # largest=0 selects the k *smallest*; Core ML's top_k cannot express that
+    # without negating the input, so it must be refused rather than be wrong.
+    model = _model(
+        """
+        topk_small (float[2,10] x) => (float[2,3] v, int64[2,3] i)
+        <int64[1] k = {3}>
+        {
+            v, i = TopK <axis=-1, largest=0> (x, k)
+        }
+        """,
+    )
+    with pytest.raises(RuntimeError, match="largest=0"):
+        _build_ops(model)
+
+
+def test_topk_rejects_unsorted():
+    model = _model(
+        """
+        topk_unsorted (float[2,10] x) => (float[2,3] v, int64[2,3] i)
+        <int64[1] k = {3}>
+        {
+            v, i = TopK <axis=-1, sorted=0> (x, k)
+        }
+        """,
+    )
+    with pytest.raises(RuntimeError, match="sorted=0"):
+        _build_ops(model)
+
+
+def test_roi_align_average_mode_is_refused_with_a_reason():
+    # Mask R-CNN's head emits mode="average". Core ML's crop_resize is
+    # bilinear-only, so this must be refused with an explanation rather than
+    # silently converted to a different (wrong) sampling rule.
+    model = _model(
+        "roi (float[1,4,8,8] x, float[2,4] rois) => (float[2,4,7,7] y) "
+        "{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, "
+        'spatial_scale=1.0, mode="average"> (x, rois) }',
+    )
+    with pytest.raises(RuntimeError, match="crop_resize is bilinear-only"):
+        _build_ops(model)
+
+
+def test_roi_align_bilinear_mode_is_refused_with_a_reason():
+    # Even the bilinear case is not lowered yet (the rank-5 batch-indexed ROI
+    # layout is still missing), and it should say so rather than fail generically.
+    model = _model(
+        "roi_bl (float[1,4,8,8] x, float[2,4] rois) => (float[2,4,7,7] y) "
+        "{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, "
+        'spatial_scale=1.0, mode="bilinear"> (x, rois) }',
+    )
+    with pytest.raises(RuntimeError, match="rank-5 batch-indexed"):
+        _build_ops(model)
+
+
+def test_nonzero_is_refused_with_a_reason():
+    # NonZero's output length is the data-dependent nonzero count, which Core
+    # ML's static model I/O cannot express (and MIL has no nonzero op). It must
+    # be refused explicitly, not converted into a fixed-size approximation.
+    model = _model("nz (float[2,3] x) => (int64[2,N] y) { y = NonZero (x) }")
+    with pytest.raises(RuntimeError, match="data-dependent count of nonzero"):
+        _build_ops(model)
+
+
+def test_less_lowers_to_native_comparison():
+    x = numpy_helper.from_array(np.array([1.0, 5.0, 3.0], dtype=np.float32), name="x")
+    y = numpy_helper.from_array(np.array([2.0, 2.0, 2.0], dtype=np.float32), name="y")
+    model = _model("less () => (bool[3] out) { out = Less (x, y) }", initializer=[x, y])
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    (op,) = [o for o in prog.functions["main"].operations if o.op_type == "less"]
+    assert tuple(op.outputs[0].shape) == (3,)
+    np.testing.assert_array_equal(
+        _mil_const_value(model), np.array([True, False, False])
+    )
+
+
+def test_reduce_min_and_prod_match_onnx():
+    x = numpy_helper.from_array(
+        np.array([[[1.0, 5.0], [3.0, 2.0]]], dtype=np.float32), name="x"
+    )
+    model = _model(
+        """
+        red () => (float[1,1,2] mn, float[1,1,2] pr)
+        {
+            mn = ReduceMin <axes=[1]> (x)
+            pr = ReduceProd <axes=[1]> (x)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    ref_mn, ref_pr = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})
+    mn, pr = _mil_two_outputs(model)
+    np.testing.assert_allclose(mn, ref_mn, rtol=1e-6)
+    np.testing.assert_allclose(pr, ref_pr, rtol=1e-6)
+
+
+def test_scatter_elements_rank1_lowers_to_native_scatter():
+    # Only the rank-1 shape agrees between ONNX ScatterElements (indices of the
+    # same rank as data) and MIL's scatter (a 1-D index vector). ONNX's
+    # reduction="none" maps onto MIL's mode="update"; forwarding the ONNX name
+    # would silently be wrong, so the mapping is checked explicitly.
+    data = numpy_helper.from_array(np.zeros(6, dtype=np.float32), name="data")
+    indices = numpy_helper.from_array(
+        np.array([0, 2, 4], dtype=np.int64), name="indices"
+    )
+    updates = numpy_helper.from_array(
+        np.array([1.0, 2.0, 3.0], dtype=np.float32), name="updates"
+    )
+    model = _model(
+        "sc () => (float[6] out) { out = ScatterElements (data, indices, updates) }",
+        initializer=[data, indices, updates],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    (op,) = [o for o in prog.functions["main"].operations if o.op_type == "scatter"]
+    assert op.inputs["mode"].val == "update"
+    assert np.asarray(op.inputs["indices"].val).tolist() == [0, 2, 4]
+    assert tuple(op.outputs[0].shape) == (6,)
+    # MIL's constant folder does not evaluate `scatter`, so the numbers are
+    # checked against ONNX Runtime here and on the Core ML runtime in the
+    # macOS prediction job.
+    ref = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_allclose(
+        ref, np.array([1.0, 0.0, 2.0, 0.0, 3.0, 0.0], np.float32), rtol=1e-6
+    )
+
+
+def test_scatter_elements_higher_rank_is_refused_with_a_reason():
+    # Mask R-CNN's NMS scatters with 4-D indices. MIL's scatter cannot express
+    # that shape, so it must be refused rather than converted into something that
+    # runs but writes to the wrong positions.
+    data = numpy_helper.from_array(np.zeros((1, 4), dtype=np.float32), name="data")
+    indices = numpy_helper.from_array(
+        np.array([[0, 2]], dtype=np.int64), name="indices"
+    )
+    updates = numpy_helper.from_array(
+        np.array([[[1.0, 2.0]]], dtype=np.float32), name="updates"
+    )
+    model = _model(
+        "sc2 () => (float[1,4] out) "
+        "{ out = ScatterElements <axis=1> (data, indices, updates) }",
+        initializer=[data, indices, updates],
+    )
+    with pytest.raises(RuntimeError, match="1-D index vector"):
+        _build_ops(model)
+
+
+def test_scatter_elements_rejects_unknown_reduction():
+    data = numpy_helper.from_array(np.zeros(4, np.float32), name="data")
+    indices = numpy_helper.from_array(np.array([0], np.int64), name="indices")
+    updates = numpy_helper.from_array(np.array([1.0], np.float32), name="updates")
+    model = _model(
+        'sc () => (float[4] out) { out = ScatterElements <reduction="pow"> '
+        "(data, indices, updates) }",
+        initializer=[data, indices, updates],
+    )
+    with pytest.raises(RuntimeError, match="reduction='pow' is not supported"):
+        _build_ops(model)
+
+
 def test_gemm_alpha_beta_fp16_matches_expected():
     # Regression test: the alpha/beta scale factors used to be created as a bare
     # Python float, which MIL infers as fp32 regardless of context -- multiplying
@@ -417,6 +997,29 @@ def test_dequantize_linear_wiring_and_shape():
     ]
     assert tuple(dq.inputs["scale"].shape) == ()
     assert dq.inputs["zero_point"].val is not None
+    assert tuple(prog.functions["main"].outputs[0].shape) == (3,)
+
+
+def test_dequantize_linear_int32_zero_point_lowers_to_cast_mul():
+    # Mask R-CNN QDQ exports an int32 bias with a scalar zero point. MIL
+    # dequantize rejects int32, while cast-and-mul preserves this case.
+    x = np.array([-50, 0, 25], dtype=np.int32)
+    scale = np.array(0.02, dtype=np.float32)
+    zp = np.array(0, dtype=np.int32)
+    model = _model(
+        "dq32 () => (float[3] y) { y = DequantizeLinear (x, s, zp) }",
+        initializer=[
+            numpy_helper.from_array(x, name="x"),
+            numpy_helper.from_array(scale, name="s"),
+            numpy_helper.from_array(zp, name="zp"),
+        ],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    ops = prog.functions["main"].operations
+    assert [op.op_type for op in ops if op.op_type not in ("const", "identity")] == [
+        "cast",
+        "mul",
+    ]
     assert tuple(prog.functions["main"].outputs[0].shape) == (3,)
 
 

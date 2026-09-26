@@ -45,8 +45,9 @@ env:
   # test_codegen_float_max_chain_renders_linearly until the runner dies. Move this pin to
   # vrmpy-hexagon-support once #3/#4/#5 are merged there.
   TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
-  # onnxsim/tinygrad hvx-hmx (PR #6, HMX TensorCore; contains 9aa4f66a1 vrmpy GEMV and fccd84cfa max-chain fix)
-  TINYGRAD_SHA: 2798337ecb52a35a2c7b839a1552eff6114558db
+  # onnxsim/tinygrad hvx-hmx-qdq (PR #8, int8 :cm HMX TensorCore + fused requantization, stacked on #7 hvx-hmx-mcc and #6 hvx-hmx; contains
+  # 9aa4f66a1 vrmpy GEMV and fccd84cfa max-chain fix)
+  TINYGRAD_SHA: 3605e14cab6ece783bdfd04058ca17b1de4c29c2
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 

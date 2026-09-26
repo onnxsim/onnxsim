@@ -18,7 +18,6 @@ agents' device runs queue behind it rather than interleaving.
 
 from __future__ import annotations
 
-import fcntl
 import itertools
 import json
 import os
@@ -266,6 +265,8 @@ class AXSession:
         if not os.path.exists(os.path.join(self.host_dir, "axrun")):
             self.build_runner()
         if self._lock_wanted:
+            import fcntl  # POSIX-only; imported here so this module (and its tests) import on Windows
+
             self._lock_fd = open(LOCK, "w")
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
         self._proc = subprocess.Popen(
@@ -293,6 +294,8 @@ class AXSession:
                 self._proc.kill()
             self._proc = None
         if self._lock_fd is not None:
+            import fcntl
+
             fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
             self._lock_fd.close()
             self._lock_fd = None

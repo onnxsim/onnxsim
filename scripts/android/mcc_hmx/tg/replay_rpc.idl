@@ -1,0 +1,12 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface replay_rpc : remote_handle64 {
+  // bit 0 turbo, bit 1 HMX power vote (required before any HMX op)
+  long perf_vote(in long flags, rout long rc);
+  // a memory region's initial image (emit.py skel: regions.txt / r<idx>.bin)
+  long load_region(in long idx, in sequence<uint8> img);
+  // run the captured kernel sequence iters times; result: the output buffer; per_call: pcycles per call
+  // (summed over iters); times: [0] us per iteration; codes: [0] ctx, [1] hvx lock, [2] hmx lock, [3] thread
+  long run(in long iters, rout sequence<uint8> result, rout sequence<uint64> per_call, rout sequence<uint64> times,
+           rout sequence<long> codes);
+};

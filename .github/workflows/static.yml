@@ -260,6 +260,28 @@ jobs:
       - name: npm test && npm pack (unit tests + packaging smoke test, no publish/registry check)
         working-directory: npm/onnxsim
         run: npm test && npm pack
+
+      # Browser-level coverage for the actual converter page: load the built
+      # WASM module, convert the small fixture, then run the converted and
+      # original models through onnxruntime-web's WASM execution provider.
+      - name: Install converter browser-test dependencies
+        working-directory: scripts/convertmodel
+        run: npm install --no-audit --no-fund
+      - name: Install Chromium for converter browser test
+        working-directory: scripts/convertmodel
+        run: npx playwright install --with-deps chromium
+      - name: Convert a model and run WASM inference in Chromium
+        working-directory: scripts/convertmodel
+        env:
+          PLAYWRIGHT_SCREENSHOT: ${{ runner.temp }}/wasm-ui-failure.png
+        run: node test/browser_wasm_ui.test.mjs
+      - name: Upload converter browser failure screenshot
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-ui-browser-failure
+          path: ${{ runner.temp }}/wasm-ui-failure.png
+          if-no-files-found: ignore
       # This only *stages* the release -- it does not go live on its own.
       # `npm stage publish` uploads the tarball to a review queue instead of
       # the registry; a maintainer with 2FA still has to run
@@ -403,6 +425,11 @@ jobs:
             python3 setup.py create_version
             mkdir -p scripts/convertmodel/pyodide-demo/onnxsim_src
             cp onnxsim/*.py scripts/convertmodel/pyodide-demo/onnxsim_src/
+            python3 - <<'PY' > scripts/convertmodel/pyodide-demo/onnxsim_src/files.json
+            import json
+            from pathlib import Path
+            print(json.dumps(sorted(p.name for p in Path("onnxsim").glob("*.py"))))
+            PY
             echo "staged Pyodide demo at scripts/convertmodel/pyodide-demo/"
           fi
 

@@ -35,9 +35,13 @@ else:
 import numpy as np  # noqa: E402
 from tinygrad import Tensor, dtypes  # noqa: E402
 from tinygrad.renderer.cstyle import ClangRenderer  # noqa: E402
+from tinygrad.runtime import ops_dsp  # noqa: E402
 
+# the DSP renderer's own render() (onnxsim/tinygrad hvx-hmx on: the HMX rewrite runs there first) doesn't go through
+# ClangRenderer.render, so hook the DSP class itself
+_Renderer = ops_dsp.DSPRenderer if "render" in vars(ops_dsp.DSPRenderer) else ClangRenderer
 captured: list[str] = []
-_render = ClangRenderer.render
+_render = _Renderer.render
 
 
 def _capture(self, uops):
@@ -46,7 +50,7 @@ def _capture(self, uops):
     return src
 
 
-ClangRenderer.render = _capture
+_Renderer.render = _capture
 VEC = re.compile(
     r"typedef\s+([\w ]+?)\s+\w+\s+__attribute__\(\(aligned\(\d+\),ext_vector_type\((\d+)\)\)\)"
 )

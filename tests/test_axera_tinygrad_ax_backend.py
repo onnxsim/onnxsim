@@ -17,6 +17,11 @@ import onnx
 import pytest
 from onnx import numpy_helper, parser
 
+# The UOp-lowering tests import tinygrad inside the test body (the backend pulls in the Axera emitters
+# from sys.path first, so a module-level import would run before that). Skip the module when tinygrad is
+# absent instead of letting every one of them fail on the import: the coverage job does not install it.
+_tinygrad = pytest.importorskip("tinygrad", reason="tinygrad is not installed")
+
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
 )
@@ -186,7 +191,7 @@ def test_compiler_request_runs_measured_generator_without_pulsar2(tmp_path):
 
 
 def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = Tensor.empty(1, 8, 4, 4).reshape(1, 1, 8, 16).relu().uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -245,7 +250,7 @@ def test_compile_onnx_imports_through_tinygrad_uop_without_pulsar2(tmp_path):
 
 
 def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = Tensor.empty(1, 8, 4, 4).relu().reshape(1, 1, 8, 16).uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -257,7 +262,7 @@ def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
 
 
 def test_lower_and_compile_tinygrad_add_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = (Tensor.empty(1, 64) + Tensor.empty(1, 64)).uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -276,7 +281,7 @@ def test_lower_and_compile_tinygrad_add_uop_with_explicit_calibration(tmp_path):
 
 
 def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = (Tensor.empty(1, 64) * Tensor.empty(1, 64)).uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -298,7 +303,7 @@ def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
 def test_lower_and_compile_tinygrad_compound_binary_uop_with_explicit_calibration(
     tmp_path, op
 ):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     left, right = Tensor.empty(1, 64), Tensor.empty(1, 64)
     root = (left - right if op == "sub" else left / right).uop
@@ -318,7 +323,7 @@ def test_lower_and_compile_tinygrad_compound_binary_uop_with_explicit_calibratio
 
 
 def test_lower_and_compile_tinygrad_neg_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = (-Tensor.empty(1, 1)).uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -343,7 +348,7 @@ def test_lower_and_compile_tinygrad_neg_uop_with_explicit_calibration(tmp_path):
 def test_lower_and_compile_tinygrad_misc_uop_with_explicit_calibration(
     tmp_path, op, shape
 ):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     tensor = Tensor.empty(*shape)
     root = (tensor.sqrt() if op == "sqrt" else tensor.log()).uop
@@ -363,7 +368,7 @@ def test_lower_and_compile_tinygrad_misc_uop_with_explicit_calibration(
 
 
 def test_lower_and_compile_tinygrad_softmax_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = Tensor.empty(16, 1000).softmax().uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -382,7 +387,7 @@ def test_lower_and_compile_tinygrad_softmax_uop_with_explicit_calibration(tmp_pa
 
 
 def test_lower_and_compile_tinygrad_reducemean_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = Tensor.empty(16, 512, 7, 7).mean(axis=(2, 3), keepdim=True).uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -401,7 +406,7 @@ def test_lower_and_compile_tinygrad_reducemean_uop_with_explicit_calibration(tmp
 
 
 def test_lower_and_compile_tinygrad_reducesum_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = Tensor.empty(16, 64, 112, 112).sum(axis=(0, 2, 3)).uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -420,7 +425,7 @@ def test_lower_and_compile_tinygrad_reducesum_uop_with_explicit_calibration(tmp_
 
 
 def test_lower_and_compile_tinygrad_maxpool_uop_with_explicit_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = (
         Tensor.empty(16, 64, 112, 112)
@@ -443,7 +448,7 @@ def test_lower_and_compile_tinygrad_maxpool_uop_with_explicit_calibration(tmp_pa
 
 
 def test_lower_and_compile_tinygrad_greatercast_uop_without_calibration(tmp_path):
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     root = (Tensor.empty(16, 64, 112, 112) > 0).cast("float32").uop
     lowered = axb.lower_uop_to_onnx(root)
@@ -813,7 +818,7 @@ def test_lower_tinygrad_dilated_conv_uop_to_onnx():
 
 
 def test_lower_uop_rejects_unvalidated_pattern():
-    from tinygrad import Tensor
+    Tensor = pytest.importorskip("tinygrad").Tensor
 
     with pytest.raises(IndexError, match="shape mismatch"):
         axb.lower_uop_to_onnx((Tensor.empty(4) + Tensor.empty(5)).uop)
@@ -1137,6 +1142,7 @@ def test_tinygrad_compiler_seam():
     src = axb.build_request(_gather_key(), [axb.GatherIndexEdit(list(range(8)))])
     out = classes["AXCompiler"]().compile_cached(src)
     assert out == axb.compile_request(src)
+    pytest.importorskip("tinygrad")
     from tinygrad.device import Allocator, Program
 
     assert issubclass(classes["AXProgram"], Program)
@@ -1146,6 +1152,7 @@ def test_tinygrad_compiler_seam():
 def test_ax_allocator_is_host_visible():
     """AX buffers are host-staged: tinygrad reads and writes them without a
     copy program, so a covered op's inputs/outputs need no device for this."""
+    pytest.importorskip("tinygrad")
     pytest.importorskip("tinygrad")
     from tinygrad.device import Buffer
     from tinygrad.dtype import dtypes

@@ -22,8 +22,9 @@ final class MccEngine {
     /** Tap (working pixels) -> mask (W x H, 1 inside), iou[4]; returns the SAM slot, -1 on error. */
     static native int nativeSegment(float x, float y, byte[] mask, float[] iou, float[] times);
     /**
-     * MoGe-2 + MCC on the current mask. times: MoGe, prep, encoder, decoder, total ms; counts:
-     * queries, decoder chunks, points. Returns the point count, -1 on error.
+     * MoGe-2 + MCC on the current mask. times: MoGe-2 run (it starts in the background when the image
+     * is encoded), waited for it, prep, encoder, decoder, total ms; counts: queries, decoder chunks,
+     * points. Returns the point count, -1 on error.
      */
     static native int nativeReconstruct(float[] times, int[] counts);
     /** The last reconstruction's points: xyz (3 per point) and ARGB colors. */

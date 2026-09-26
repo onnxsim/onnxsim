@@ -9,7 +9,7 @@ MD="$(cd "$1" && pwd)"
 ITERS="${2:-15}"
 PERF="${3:-burst}"
 DEV="${DEVICE_SERIAL:-239dbd8f}"
-R=/data/local/tmp/qnn_ceiling
+R="${REMOTE_DIR:-/data/local/tmp/qnn_ceiling}"
 QS="$HERE/../qnn_shell"
 NDK_CXX="${NDK_CXX:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++}"
 [ -d "$QS/libs" ] || "$QS/fetch_libs.sh"

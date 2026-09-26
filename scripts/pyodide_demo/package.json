@@ -1,0 +1,11 @@
+{
+  "name": "onnxsim-pyodide-demo-browser-test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node browser_test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

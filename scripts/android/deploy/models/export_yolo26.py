@@ -3,6 +3,9 @@
 
     export_yolo26.py <out.onnx> <weights.pt name> <sha256> [head|end2end]
 
+Also exports the -seg models (yolo26n-seg.pt, yolo11n-seg.pt): output0 then carries 32 mask
+coefficients after the class scores, and output1 is the (1, 32, 160, 160) prototypes.
+
 Downloads the official Ultralytics weights (github.com/ultralytics/assets, release v8.4.0),
 checks the sha256, and exports ONNX (opset 17, 640x640, static, not simplified -- the `simplify`
 stage runs onnxsim):

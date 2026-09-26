@@ -1,0 +1,744 @@
+{
+ "rows": [
+  [
+   "model/node_linear",
+   1,
+   1024,
+   2048,
+   259108,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_1",
+   1,
+   2048,
+   512,
+   164108,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_2",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_3",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_4",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_5",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_6",
+   1,
+   512,
+   512,
+   44672,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_7",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_8",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_9",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_10",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_12",
+   1,
+   512,
+   64,
+   18756,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_13",
+   1,
+   512,
+   16,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_14",
+   1,
+   512,
+   16,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_15",
+   1,
+   512,
+   32,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_16",
+   1,
+   512,
+   64,
+   18756,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_19",
+   1,
+   64,
+   64,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_20",
+   1,
+   64,
+   64,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_21",
+   1,
+   16,
+   16,
+   4622,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_22",
+   1,
+   16,
+   16,
+   4622,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_23",
+   1,
+   16,
+   16,
+   4622,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_24",
+   1,
+   16,
+   16,
+   4622,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_25",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_26",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_27",
+   1,
+   64,
+   64,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_28",
+   1,
+   64,
+   64,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_30",
+   1,
+   64,
+   144,
+   6986,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_31",
+   1,
+   16,
+   3,
+   4622,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_32",
+   1,
+   16,
+   8,
+   4622,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_33",
+   1,
+   32,
+   264,
+   7074,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_34",
+   1,
+   64,
+   528,
+   10752,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_35",
+   1,
+   2048,
+   512,
+   164108,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_36",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_37",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_38",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_39",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_40",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_41",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_42",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_43",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_44",
+   1,
+   512,
+   64,
+   18756,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_45",
+   1,
+   512,
+   32,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_46",
+   1,
+   512,
+   32,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_47",
+   1,
+   512,
+   32,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_48",
+   1,
+   512,
+   32,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_50",
+   1,
+   64,
+   64,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_51",
+   1,
+   64,
+   64,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_52",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_53",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_54",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_55",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_56",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_57",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_58",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_59",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_62",
+   1,
+   64,
+   55,
+   6012,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_63",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_64",
+   1,
+   32,
+   12,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_65",
+   1,
+   32,
+   12,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_66",
+   1,
+   32,
+   6,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_68",
+   1,
+   2048,
+   512,
+   164108,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_69",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_70",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_71",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_72",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/node_linear_73",
+   1,
+   512,
+   512,
+   44672,
+   "w16 est"
+  ],
+  [
+   "model/p_node_MatMul_13",
+   9,
+   512,
+   512,
+   359422,
+   "w16 est"
+  ],
+  [
+   "model/p_node_MatMul_16",
+   9,
+   512,
+   512,
+   359422,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_2",
+   1,
+   200,
+   512,
+   20656,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_3",
+   1,
+   512,
+   512,
+   44672,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_4",
+   1,
+   2,
+   512,
+   6932,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_5",
+   1,
+   512,
+   512,
+   44672,
+   "w16 est"
+  ],
+  [
+   "model/p_node_MatMul_27",
+   9,
+   512,
+   1536,
+   955924,
+   "w16 est"
+  ],
+  [
+   "model/p_node_MatMul_56",
+   9,
+   512,
+   512,
+   359422,
+   "w16 est"
+  ],
+  [
+   "model/p_node_MatMul_58",
+   9,
+   512,
+   2048,
+   1254144,
+   "w16 est"
+  ],
+  [
+   "model/p_node_MatMul_60",
+   9,
+   2048,
+   512,
+   2096456,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_10",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_11",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_12",
+   1,
+   512,
+   1024,
+   74020,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_13",
+   1,
+   1024,
+   512,
+   84390,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_14",
+   1,
+   512,
+   256,
+   29842,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_15",
+   1,
+   512,
+   32,
+   16768,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_16",
+   1,
+   256,
+   256,
+   16782,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_17",
+   1,
+   256,
+   256,
+   16782,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_18",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_19",
+   1,
+   32,
+   32,
+   5008,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_20",
+   1,
+   256,
+   990,
+   39064,
+   "w16 est"
+  ],
+  [
+   "model/p_node_linear_21",
+   1,
+   32,
+   8,
+   5008,
+   "w16 est"
+  ]
+ ],
+ "total_cycles": 8716064,
+ "ms": 8.716064,
+ "weight_bytes": 46943328,
+ "other": [
+  [
+   "model/p_node_matmul",
+   [
+    1,
+    8,
+    9,
+    64
+   ],
+   [
+    1,
+    8,
+    64,
+    9
+   ]
+  ],
+  [
+   "model/p_node_matmul_1",
+   [
+    1,
+    8,
+    9,
+    9
+   ],
+   [
+    1,
+    8,
+    9,
+    64
+   ]
+  ]
+ ],
+ "a16": true
+}

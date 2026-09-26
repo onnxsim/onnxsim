@@ -53,13 +53,16 @@ final class Engine {
     /**
      * One frame's output, in the displayed frame's pixel coordinates (for Mask R-CNN: model-input
      * pixels, image top-left aligned in 1088x800). Also used by the YOLO mode: no masks
-     * (masks.length == 0), its own score threshold and timing slots.
+     * (masks.length == 0) or, for the -seg models, maskSide x maskSide per detection; its own score
+     * threshold and timing slots.
      */
     static final class Result {
         final float[] boxes, scores, masks, times;
         final int[] labels;
         final int[] ndet = new int[1];
         final float thresh;
+        final int maskSide;  // each detection's mask: maskSide x maskSide probabilities over its box
+        boolean colorByInstance;  // the overlay colours each detection apart (crowds of one class), not by class
         int n;
         long id;
         Bitmap frame;   // the (resized) frame the result belongs to
@@ -69,10 +72,15 @@ final class Engine {
         }
 
         Result(int maxDet, boolean withMasks, int nTimes, float thresh) {
+            this(maxDet, withMasks ? 28 : 0, nTimes, thresh);
+        }
+
+        Result(int maxDet, int maskSide, int nTimes, float thresh) {
+            this.maskSide = maskSide;
             boxes = new float[4 * maxDet];
             labels = new int[maxDet];
             scores = new float[maxDet];
-            masks = new float[withMasks ? 784 * maxDet : 0];
+            masks = new float[maskSide * maskSide * maxDet];
             times = new float[nTimes];
             this.thresh = thresh;
         }

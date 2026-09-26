@@ -1,0 +1,43 @@
+# Ultralytics YOLO26n-seg instance segmentation, 640x640: conv net + NMS-free one-to-one head + mask
+# prototypes on the HTP; the head's top-k selection and the mask assembly (coefficients x prototypes,
+# cropped to the box) on the CPU, in the demo app (../maskrcnn_demo_app/native/yolo_engine.cpp).
+# AGPL-3.0 weights, as the detection models'.
+name: yolo26n-seg
+fetch:
+  # official weights (github.com/ultralytics/assets v8.4.0, sha256-pinned), exported by the pinned
+  # recipe: output0 (1, 4 + 80 + 32, 8400) = x1,y1,x2,y2 + sigmoid scores + mask coefficients,
+  # output1 (1, 32, 160, 160) = mask prototypes
+  script: export_yolo26.py
+  args: [yolo26n-seg.pt, 361fbfabab285c3237700b6bb91d7ecfa602cd945fffda8dbe1242829b71e73f, head]
+inputs:
+  images: {shape: [1, 3, 640, 640]}
+preprocess: {kind: letterbox, size: [640, 640], pad: 114}
+calibration:
+  # 64 COCO val2017 images (a fixed, arbitrary slice of the val ids), downloaded once
+  coco_val2017: [139, 285, 632, 724, 776, 785, 802, 872, 885, 1000, 1268, 1296, 1353, 1425, 1490,
+                 1503, 1532, 1584, 1675, 1761, 1818, 1993, 2006, 2149, 2153, 2157, 2261, 2299, 2431,
+                 2473, 2532, 2587, 2592, 2685, 2923, 3156, 3255, 3501, 3553, 3845, 3934, 4134, 4395,
+                 4495, 4765, 4795, 5001, 5037, 5060, 5193, 5477, 5503, 5529, 5586, 5600, 5992, 6012,
+                 6040, 6213, 6460, 6471, 6614, 6723, 6763]
+eval:
+  coco_val2017: [7088, 7108, 7278, 7281, 7386, 7511, 7574, 7784, 7795, 7816, 7818, 7888, 7977, 7991,
+                 8021, 8211, 8277, 8532, 8629, 8690]
+quantize:
+  enabled: true
+  # as yolo26n.yaml (percentile 99.999, the class-logit path at its exact range)
+  calibration_method: percentile
+  percentile: 99.999
+  minmax_tensors: ["/model.23/one2one_cv3.*.2/Conv_output_0", "/model.23/Reshape_[345]_output_0",
+                   "/model.23/Concat_1_output_0"]
+  per_channel: true
+  activation: uint8
+  # output0 concatenates box pixels (0..640), class probabilities (0..1) and mask coefficients: one
+  # uint8 scale for all zeroes every score, so keep that last Concat in float
+  exclude_nodes: [/model.23/Concat_4]
+rewrites:
+  - {name: uint8_input, layout: nhwc}
+pipeline:
+  qnn: {htp_performance_mode: burst}
+  host_quantize: true
+bench: {warmup: 3, reps: 20, cpu_threads: 4}
+accuracy: {kind: tensor}

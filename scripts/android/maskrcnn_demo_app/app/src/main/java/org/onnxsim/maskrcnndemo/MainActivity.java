@@ -72,6 +72,7 @@ public class MainActivity extends Activity {
 
     /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
     static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"},
+            {"YOLO26n-seg", "yolo", "yolo26n-seg"}, {"YOLO11n-seg", "yolo", "yolo11n-seg"},
             {"RT-DETR", "rtdetr", ""}, {"RF-DETR", "yolo", "rfdetr_nano"}, {"SAM", "sam", ""}, {"MCC 3D", "mcc", ""},
             {"Super-res", "sr", ""}, {"Game upscaling", "game", ""}};
 
@@ -91,9 +92,9 @@ public class MainActivity extends Activity {
         root.addView(preview, new FrameLayout.LayoutParams(320, 240, Gravity.BOTTOM | Gravity.END));
         setContentView(root);
 
-        root.addView(modelBar(), new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END));
         String mode = getIntent().getStringExtra("mode");
         cameraMode = mode == null || mode.equals("camera");
+        root.addView(modelBar(), new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END));
         final String pipe = getIntent().getStringExtra("pipe") != null ? getIntent().getStringExtra("pipe") : DEFAULT_PIPE;
         final String opts = getIntent().getStringExtra("opts") != null ? getIntent().getStringExtra("opts") : DEFAULT_OPTS;
         final boolean overlap = getIntent().getBooleanExtra("overlap", false);
@@ -136,6 +137,26 @@ public class MainActivity extends Activity {
             b.setOnClickListener(v -> switchTo(m[1], m[2]));
             bar.addView(b);
         }
+        // camera <-> test images for the current model (switching models keeps the mode, so this is the only way
+        // between them without adb)
+        android.widget.Button mode = new android.widget.Button(this);
+        mode.setText(cameraMode ? "Images" : "Camera");
+        mode.setAllCaps(false);
+        mode.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
+        mode.setMinWidth(0);
+        mode.setMinimumWidth(0);
+        mode.setAlpha(0.8f);
+        mode.setOnClickListener(v -> {  // the same activity again, in a new process (RelaunchActivity)
+            android.content.Intent i = new android.content.Intent(this, RelaunchActivity.class);
+            i.putExtra("target", getClass().getName());
+            i.putExtra("pid", android.os.Process.myPid());
+            i.putExtra("mode", cameraMode ? "images" : "camera");
+            String model = getIntent().getStringExtra("model");
+            if (model != null) i.putExtra("model", model);
+            startActivity(i);
+            finish();
+        });
+        bar.addView(mode, 0);  // first: visible without scrolling
         android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
         sv.addView(bar);
         return sv;  // scrolls if the buttons don't fit (portrait)

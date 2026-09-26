@@ -1,8 +1,10 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
-Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, RF-DETR, SAM, MCC 3D, Super-res and Game
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, YOLO26n-seg / YOLO11n-seg (instance masks), RT-DETR, RF-DETR, SAM, MCC 3D, Super-res and Game
 upscaling, each engine in its own process (one model loaded at a time); see the YOLO, RT-DETR, SAM, MCC,
-super-resolution and game-upscaling sections below for the newer modes.
+super-resolution and game-upscaling sections below for the newer modes. The first button, "Camera" / "Images",
+switches the current model between the live camera and the test images (restarting it in a fresh process,
+`RelaunchActivity`); the model buttons keep the current mode.
 
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
 (Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
@@ -48,11 +50,51 @@ Measured on the phone (medians of the app's running averages, under the shared p
 
 <img src="docs/yolo26n_images.jpg" width="240" alt="YOLO26n on COCO val2017 #139 in the app">
 
+**tinygrad engine** (`--es opts engine=tinygrad`): the same model as a tinygrad ahead-of-time OpenCL bundle
+(`../tinygrad_aot`, deployed with `TG=<bundle>/yolo11n.tg ./deploy.sh`) on the Adreno GPU, same input and
+post-processing. YOLO11n, test images: **44.3 ms** inference, 16.2 FPS end to end (vs the HTP's 2.58 ms / 94 FPS), and
+closer to fp32 than the int8 HTP graph (90/91 vs 79/91 fp32 detections matched on 20 COCO images, 0 vs 21 extra
+boxes); YOLO26n 44.8 ms, YOLO26n-seg / YOLO11n-seg 86-88 / 82-84 ms (masks included), all closer to fp32 than
+the int8 HTP graphs; details in `../tinygrad_aot/README.md`. QNN stays the default engine.
+
 Inference alone would allow ~110 FPS from the camera and ~330 FPS from decoded images; end to end is
 bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI draw per frame.
 The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads of the 90-degree
 rotation, as in the Mask R-CNN path. Box placement was checked visually on COCO val2017 #139.
 YOLO26's end-to-end top-k is cheaper than YOLO11's NMS here too (0.3 vs 0.6 ms on images).
+
+## Instance segmentation: YOLO26n-seg / YOLO11n-seg
+
+The "YOLO26n-seg" / "YOLO11n-seg" buttons run Ultralytics' segmentation models in the YOLO mode
+(same activity, camera path and HTP session; `../deploy/models/yolo26n-seg.yaml`, `yolo11n-seg.yaml`).
+The HTP graph adds 32 mask coefficients per anchor to the head output, `(1, 4+80+32, 8400)`, and a
+second output with the `(1, 32, 160, 160)` mask prototypes. `yolo_engine.cpp` picks boxes as for the
+detection models (YOLO26's NMS-free top-k, YOLO11's NMS). For each shown detection it combines the
+prototypes with the coefficients over the prototype cells the box covers, samples a 40x40 grid over
+the box (bilinear on the logits, then the sigmoid: Ultralytics' `process_mask`, box-cropped), and the
+overlay blends that into the box. Seg models colour detections by instance, not class, so a crowd of
+one class stays readable.
+
+- Models: `ULTRALYTICS_PYTHON=<venv with ultralytics> ../deploy/deploy.py ../deploy/models/yolo26n-seg.yaml
+  --stages fetch,simplify,quantize,rewrite,post,pipe` (and `yolo11n-seg.yaml`), then
+  `YOLO="<deploy work>/yolo26n-seg/pipe/yolo26n-seg.onnx <deploy work>/yolo11n-seg/pipe/yolo11n-seg.onnx" ./deploy.sh`.
+- Quantization as the detection models' (percentile 99.999 + the class-logit path at its range for
+  YOLO26, mse for YOLO11), the final `Concat` of boxes / scores / coefficients in float.
+
+On the phone (medians of the running averages):
+
+| model, mode | end-to-end FPS | inference | pre | HTP | post (incl. masks) |
+|---|---:|---:|---:|---:|---:|
+| YOLO26n-seg, test images | 85 | 4.1 ms | 0.1 | 3.4 | 0.7 |
+| YOLO11n-seg, test images | 70 | 4.7 ms | 0.1 | 3.4 | 1.2 |
+| YOLO26n-seg, camera, fixed 30 FPS AE | 30 (camera-capped) | 8.7-9.0 ms | 4.2-4.3 | 3.9-4.0 | 0.6-0.7 |
+
+Host check of the int8 HTP graph vs fp32 on the 20 eval images (the app's decode in numpy,
+`seg_check.py <deploy work> <name> [--ultralytics]`): YOLO26n-seg matches 69/84 fp32 detections (class + box IoU > 0.5) with mask IoU
+median 0.955 (10th percentile 0.84); YOLO11n-seg 78/91, median 0.922 (10th percentile 0.71). The
+decode itself agrees with Ultralytics' `predict` masks at IoU 0.96-0.98.
+
+<img src="docs/yolo11n_seg_images.jpg" width="240" alt="YOLO11n-seg on a COCO val2017 image in the app">
 
 ## RT-DETR mode (RT-DETR-r18, NMS-free, HTP + HVX)
 
@@ -103,6 +145,9 @@ Measured on the phone under the shared phone lock (the app's running averages):
 
 <img src="docs/rfdetr_images.jpg" width="240" alt="RF-DETR-Nano on a COCO image in the app">
 
+`--es opts engine=tinygrad` runs `rfdetr_nano.tg` (`../tinygrad_aot`) on the Adreno instead: 267 ms (3.3 FPS), same
+detections above threshold as fp32 on COCO #139.
+
 ## SAM mode (tap to segment, EfficientViT-SAM-L0)
 
 The "SAM" button runs Segment Anything (`SamActivity`, its own process `:sam`,
@@ -144,41 +189,62 @@ on the HTP from EP-context models:
 | monocular metric point map | MoGe-2 ViT-S, static 640x480 / 480x640 (`depth.py static`) | HTP, fp16 |
 | upstream `prep` + XYZ window partition (`model.py`) | ported to C++ | CPU |
 | encoder -> the decoder's seen K/V | MCC `enc.onnx` (`model.py` K/V-cache split) | HTP, fp16 |
-| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.05) | MCC `dec_q1024.onnx`, 1024 queries a run | HTP, fp16 |
+| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.1) | the hand-written DSP decoder `../mcc_hmx` (HMX GEMMs + 4 HVX threads, FastRPC skel `libmcc_hmx_rpc.so`), up to 1024 queries a call; `--es opts dec=qnn`: MCC `dec_q1024.a16c.onnx` (`dec_opt.py`) | DSP (HMX + HVX, fp16); QNN: HTP w8a16 |
 
 - The working image is 480x640 (portrait) or 640x480 (landscape): camera frames (4:3) scaled, test
   images center-cropped to 3:4 / 4:3. MoGe-2's points are flipped into MCC's frame (y up, z toward the
-  viewer), as `depth.py` does; there is no gravity alignment yet (see `../vision_models/mcc` on the
+  viewer), as `depth.py` does. MoGe-2 needs only the image, so it starts on its own thread when an image
+  is encoded and is done by the time "3D" is pressed. There is no gravity alignment yet (see `../vision_models/mcc` on the
   17.5 deg rotation this leaves against the iPhone demo cloud).
 - **images:** the test images; tap an object (SAM mask in blue), "3D" reconstructs, "Photo" goes back,
-  "Next image" moves on. **camera:** live preview; a tap freezes the frame and segments, "Live" unfreezes.
+  "Next image" moves on. **camera:** live preview; one tap captures the object under it -- freezes the frame, segments
+  it and reconstructs it (1.2-1.7 s, MoGe-2 then runs while the tap is segmented, so ~0.42 s of it is waited for);
+  taps on the frozen photo re-segment ("3D" rebuilds), "Live" goes back to the preview.
 - 3D view: z-buffered colored splats of the points with p > 0.3; drag to turn, pinch to zoom; the photo
   with its mask sits in the corner.
-- Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge ./deploy.sh`
-  (`mcc.py export --chunks 1024`; `depth.py static` at `--h 640 --w 480` and `--h 480 --w 640`).
+- Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge MCC_HMX=<../mcc_hmx/ref.py weights dir> ./deploy.sh`
+  (`mcc.py export --chunks 1024`, `dec_opt.py prep` + `quant --policy a16c`, `MCC_DEC=dec_q1024.onnx` for
+  the fp16 decoder; `depth.py static` at `--h 640 --w 480` and `--h 480 --w 640`).
   Scripted: `--es image quest2.jpg --es tap 0.506,0.491 --ez recon true`; `--es opts` takes `gran`,
-  `levels`, `lo`, `thr` (defaults 0.1 / 2 / 0.05 / 0.3) and `dump=1`.
+  `levels`, `lo`, `thr` (defaults 0.1 / 2 / 0.1 / 0.3) and `dump=1`.
 - **License:** MCC's code and weights are CC BY-NC 4.0 (non-commercial); nothing of it is in the APK,
   `deploy.sh` pushes the exported models. The screenshot's input is upstream MCC's `demo/quest2.jpg`.
 
-Phone (Xiaomi 12S), upstream's quest2 photo, the tap on the headset:
+Phone (Xiaomi 12S), upstream's quest2 photo, the tap on the headset ("3D" pressed again on the same
+mask for the steady state):
 
-| | ms |
-|---|---:|
-| SAM encoder (once per image) / decoder (per tap) | 43-53 / 12-15 |
-| MoGe-2 ViT-S 640x480 | 268-276 |
-| prep (C++) | 6-21 |
-| MCC encoder | 205-207 |
-| MCC decoder, 59 chunks x 1024 queries (59,212 of the 216,000 dense queries), 64 ms a chunk | 3,340-3,790 |
-| **total, "3D" to points** (19,652 points; smaller objects need fewer chunks: 1.6 s at 17) | **3.9-4.3 s** |
-| init, first launch (compiles MCC's two graphs: encoder 42 s, decoder 5.5 s) / later launches | 48.7 s / 1.6 s |
-| MoGe-2 compile, first "3D" per orientation | 17-24 s |
+| | first version | optimized (QNN w8a16 decoder) |
+|---|---:|---:|
+| SAM encoder (once per image) / decoder (per tap) | 43-53 / 12-15 | same |
+| MoGe-2 ViT-S 640x480 | 268-276 | 270-590, in the background: 5-12 waited |
+| prep (C++) | 6-21 | 12-24 |
+| MCC encoder | 205-207 | 203-206 |
+| MCC decoder chunks x ms (queries: coarse-to-fine refine threshold 0.05 -> 0.1) | 59 x 64 (59,212) | 48 x 46.6 (47,317) |
+| **total, "3D" to points** (19,652-19,666 points) | **3.9-4.3 s** | **2.48-2.52 s** |
+| vs the dense host fp32 grid: recall / precision / chamfer / color L1 | 0.993 / 0.992 / 0.0008 / 0.46 | 0.990 / 0.988 / 0.0011 / 0.76 |
+| init, first launch (compiles MCC's two graphs) / later launches | 48.7 s / 1.6 s | ~49 s / 1.6 s |
+| MoGe-2 compile, first image per orientation (in the background now) | 17-24 s | same |
+
+**DSP decoder** (`../mcc_hmx`, now the default): the decoder chunks on the Hexagon DSP by hand -- every
+GEMM on HMX, softmax / LayerNorm / GELU on 4 HVX threads, activations in VTCM between steps -- 22 ms a
+1024-query chunk vs QNN's 47 (w8a16): decoder **1.06 s** (48 calls), **"3D" 1.30 s**, and closer to the
+float64 model than the w8a16 graph (recall 0.993, precision 0.992, chamfer 0.0008, color L1 0.43/255 vs
+the dense host fp32 grid). Details and the step-by-step timings in `../mcc_hmx/README.md`.
+
+The optimizations, one at a time (`../vision_models/mcc/dec_opt.py`, `README.md` "Decoder
+optimization" there for everything tried):
+- **w8a16 decoder** (`onnxsim.full_qdq`, uint16 activations, int8 weights, the color head's
+  temperature-0.1 softmax kept fp16): 63 -> 47 ms a chunk. The per-op profile had softmax at 44% of the
+  fp16 chunk; quantizing only softmax (or softmax + Gelu) is *slower* (72 / 83 ms: the fp16 <-> int16
+  conversions around it), the whole graph has to go integer.
+- **refine threshold `lo` 0.05 -> 0.1**: 13-20% fewer queries, recall >= 0.9975 of the dense grid's
+  occupied points on all three references (exact: host dense grids).
+- **MoGe-2 off the critical path**: it only needs the image, so it runs while the user taps.
 
 **Checked against the Python pipeline** (`../vision_models/mcc/app_check.py` on the app's `dump=1`
 tensors -- its own mask and MoGe-2 points): the C++ prep's image input is identical (max abs 0), the
 valid-point pattern identical, xyz within 1.9e-6; the phone encoder's K / V cos 0.999985 / 0.99988 vs
-host fp32; the coarse-to-fine phone reconstruction vs the dense host fp32 grid: recall 0.993, precision
-0.992, chamfer 0.0008, color L1 0.46/255 (19,652 vs 19,634 points).
+host fp32; the reconstruction vs the dense host fp32 grid in the table above.
 
 <img src="docs/mcc_quest2.jpg" width="480" alt="MCC 3D mode: the headset's reconstruction from the photo's viewpoint and turned to show its far side">
 

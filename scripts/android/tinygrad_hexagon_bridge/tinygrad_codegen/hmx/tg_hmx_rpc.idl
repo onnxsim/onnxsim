@@ -3,6 +3,7 @@
 interface tg_hmx_rpc : remote_handle64 {
   // run the tinygrad-generated HMX kernel (tg_kernel.c) iters times on a worker thread holding HVX + HMX
   // times[0] = total us; codes: [0] power rc, [1] compute_res ctx, [2] hvx lock, [3] hmx lock, [4] vtcm bytes, [5] thread
-  long run(in long iters, in sequence<uint16> a, in sequence<uint16> b, rout sequence<uint16> c,
+  // a, b, c as bytes (tg_kernel.h: fp16 or u8 / s8 / int32)
+  long run(in long iters, in sequence<uint8> a, in sequence<uint8> b, rout sequence<uint8> c,
            rout sequence<uint64> times, rout sequence<long> codes);
 };

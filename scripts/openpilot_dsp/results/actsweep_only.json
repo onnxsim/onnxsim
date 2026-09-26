@@ -1,0 +1,201 @@
+{
+ "base": 0.008223234675824642,
+ "windows": [
+  {
+   "nodes": [
+    "node_cat",
+    "model/node_cat",
+    "model/node_sub",
+    "model/node_div",
+    "model/node_conv2d",
+    "model/node_gelu"
+   ],
+   "plan_err": 0.006899086758494377
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_1",
+    "model/node_gelu_1",
+    "model/node_conv2d_2",
+    "model/node_gelu_2",
+    "model/node_conv2d_3",
+    "model/node_Conv_173"
+   ],
+   "plan_err": 0.007189404219388962
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_5",
+    "model/node_gelu_3",
+    "model/node_conv2d_6",
+    "model/node_mul",
+    "model/node_add",
+    "model/node_conv2d_7"
+   ],
+   "plan_err": 0.0015707944985479116
+  },
+  {
+   "nodes": [
+    "model/node_Conv_175",
+    "model/node_conv2d_9",
+    "model/node_gelu_4",
+    "model/node_conv2d_10",
+    "model/node_mul_1",
+    "model/node_add_1"
+   ],
+   "plan_err": 0.0015662836376577616
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_11",
+    "model/node_conv2d_12",
+    "model/node_gelu_5",
+    "model/node_conv2d_13",
+    "model/node_Conv_177",
+    "model/node_conv2d_15"
+   ],
+   "plan_err": 0.0019029350951313972
+  },
+  {
+   "nodes": [
+    "model/node_gelu_6",
+    "model/node_conv2d_16",
+    "model/node_mul_2",
+    "model/node_add_2",
+    "model/node_conv2d_17",
+    "model/node_Conv_179"
+   ],
+   "plan_err": 0.0016784312902018428
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_19",
+    "model/node_gelu_7",
+    "model/node_conv2d_20",
+    "model/node_mul_3",
+    "model/node_add_3",
+    "model/node_conv2d_21"
+   ],
+   "plan_err": 0.0024364509154111147
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_22",
+    "model/node_gelu_8",
+    "model/node_conv2d_23",
+    "model/node_Conv_181",
+    "model/node_conv2d_25",
+    "model/node_gelu_9"
+   ],
+   "plan_err": 0.002484699012711644
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_26",
+    "model/node_mul_4",
+    "model/node_add_4",
+    "model/node_conv2d_27",
+    "model/node_Conv_183",
+    "model/node_conv2d_29"
+   ],
+   "plan_err": 0.0017570314230397344
+  },
+  {
+   "nodes": [
+    "model/node_gelu_10",
+    "model/node_conv2d_30",
+    "model/node_mul_5",
+    "model/node_add_5",
+    "model/node_conv2d_31",
+    "model/node_Conv_185"
+   ],
+   "plan_err": 0.0016748582711443305
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_33",
+    "model/node_gelu_11",
+    "model/node_conv2d_34",
+    "model/node_mul_6",
+    "model/node_add_6",
+    "model/node_conv2d_35"
+   ],
+   "plan_err": 0.001673028920777142
+  },
+  {
+   "nodes": [
+    "model/node_Conv_187",
+    "model/node_conv2d_37",
+    "model/node_gelu_12",
+    "model/node_conv2d_38",
+    "model/node_mul_7",
+    "model/node_add_7"
+   ],
+   "plan_err": 0.001724072266370058
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_39",
+    "model/node_Conv_189",
+    "model/node_conv2d_41",
+    "model/node_gelu_13",
+    "model/node_conv2d_42",
+    "model/node_mul_8"
+   ],
+   "plan_err": 0.0017055176431313157
+  },
+  {
+   "nodes": [
+    "model/node_add_8",
+    "model/node_conv2d_43",
+    "model/node_Conv_191",
+    "model/node_conv2d_45",
+    "model/node_gelu_14",
+    "model/node_conv2d_46"
+   ],
+   "plan_err": 0.0017306936206296086
+  },
+  {
+   "nodes": [
+    "model/node_mul_9",
+    "model/node_add_9",
+    "model/node_conv2d_47",
+    "model/node_conv2d_48",
+    "model/node_gelu_15",
+    "model/node_conv2d_49"
+   ],
+   "plan_err": 0.001609748462215066
+  },
+  {
+   "nodes": [
+    "model/node_Conv_193",
+    "model/node_conv2d_51",
+    "model/node_gelu_16",
+    "model/node_conv2d_52",
+    "model/node_mul_10",
+    "model/node_add_10"
+   ],
+   "plan_err": 0.001667428994551301
+  },
+  {
+   "nodes": [
+    "model/node_conv2d_53",
+    "model/node_Conv_195",
+    "model/node_conv2d_55",
+    "model/node_gelu_17",
+    "model/node_conv2d_56",
+    "model/node_mul_11"
+   ],
+   "plan_err": 0.002074862364679575
+  },
+  {
+   "nodes": [
+    "model/node_add_11",
+    "model/node_conv2d_57",
+    "model/node_conv2d_58",
+    "model/node_conv2d_59"
+   ],
+   "plan_err": 0.002464097924530506
+  }
+ ]
+}

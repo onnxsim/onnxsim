@@ -38,6 +38,7 @@ on:
       - "docs/wasm_pyodide.md"
       - "scripts/pyodide_smoke_test.mjs"
       - "scripts/pyodide_demo/**"
+      - "scripts/convertmodel/test/model.onnx"
       - "CMakeLists.txt"
       - "cmake/**"
       - "onnxsim/**"
@@ -228,6 +229,46 @@ jobs:
         run: |
           cd /tmp/pyodide-smoke-test-env
           node ./pyodide_smoke_test.mjs "${SO_PATH}" "${GITHUB_WORKSPACE}/onnxsim"
+
+      # --- Browser UI smoke test -------------------------------------------
+      # Test the page users actually load, not only the extension under Node.
+      # The page is staged exactly like static.yml stages it for deployment,
+      # then served over HTTP because the UI fetches its .so and Python files.
+      - name: Stage the Pyodide demo for browser testing
+        run: |
+          DEMO_ROOT="${RUNNER_TEMP}/pyodide-demo"
+          rm -rf "${DEMO_ROOT}"
+          mkdir -p "${DEMO_ROOT}/onnxsim_src"
+          cp scripts/pyodide_demo/index.html "${DEMO_ROOT}/"
+          cp "${SO_PATH}" "${DEMO_ROOT}/onnxsim_cpp2py_export.abi3.so"
+          cp scripts/convertmodel/test/model.onnx "${DEMO_ROOT}/model.onnx"
+          cp onnxsim/*.py "${DEMO_ROOT}/onnxsim_src/"
+          python - <<'PY' > "${DEMO_ROOT}/onnxsim_src/files.json"
+          import json
+          from pathlib import Path
+          print(json.dumps(sorted(p.name for p in Path("onnxsim").glob("*.py"))))
+          PY
+          echo "DEMO_ROOT=${DEMO_ROOT}" >> "$GITHUB_ENV"
+
+      - name: Install Playwright and Chromium
+        working-directory: scripts/pyodide_demo
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Run the Pyodide demo in Chromium
+        working-directory: scripts/pyodide_demo
+        env:
+          PLAYWRIGHT_SCREENSHOT: ${{ runner.temp }}/pyodide-demo-failure.png
+        run: node browser_test.mjs "${DEMO_ROOT}" "${DEMO_ROOT}/model.onnx"
+
+      - name: Upload browser failure screenshot
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyodide-demo-browser-failure
+          path: ${{ runner.temp }}/pyodide-demo-failure.png
+          if-no-files-found: ignore
 
       # scripts/pyodide_demo/index.html fetches this module at runtime rather
       # than it being committed (it's gitignored like every other *.so in this

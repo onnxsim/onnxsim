@@ -15,9 +15,11 @@ import java.util.Locale;
  * YOLO mode (its own process, see the manifest): a deploy-pipeline YOLO model (yolo26n / yolo11n,
  * ../deploy) on the HTP, from the camera or the test images, with boxes, labels and an FPS panel.
  * Same camera path and extras as MainActivity, plus
- *   model   yolo26n (default), yolo11n or rfdetr_nano: <files>/models/<model>.onnx
+ *   model   yolo26n (default), yolo11n, yolo26n-seg, yolo11n-seg (instance masks) or rfdetr_nano:
+ *           <files>/models/<model>.onnx
  *   opts    YoloEngine options, e.g. "conf=0.25" (post=end2end for yolo26*, detr for rfdetr*,
- *           nms otherwise)
+ *           nms otherwise); "engine=tinygrad" runs <files>/models/<model>.tg, the tinygrad AOT OpenCL bundle
+ *           (../tinygrad_aot), on the Adreno GPU instead of the HTP
  * The model buttons switch YOLO models in place (the engine re-inits its HTP session).
  */
 public class YoloActivity extends MainActivity {
@@ -41,7 +43,12 @@ public class YoloActivity extends MainActivity {
                         : "post=nms;" + opts);
     }
 
-    Engine.Result newResult() {
+    Engine.Result newResult(String model) {
+        if (model.contains("-seg")) {
+            Engine.Result r = new Engine.Result(YoloEngine.SEG_MAX_DET, YoloEngine.MASK_SIDE, YoloEngine.T_N, 0.25f);
+            r.colorByInstance = true;
+            return r;
+        }
         return new Engine.Result(YoloEngine.MAX_DET, false, YoloEngine.T_N, 0.25f);
     }
 
@@ -59,7 +66,10 @@ public class YoloActivity extends MainActivity {
 
     /** One line of per-stage times from the running averages of Result.times. */
     String stages(double[] avg) {
-        return String.format(Locale.US, "pre %.1f  htp %.2f  post %.2f ms", avg[YoloEngine.T_PRE], avg[YoloEngine.T_HTP],
+        // engine=tinygrad (tinygrad AOT OpenCL bundle on the Adreno) reports its inference in the same slot
+        String opts = getIntent().getStringExtra("opts");
+        String eng = opts != null && opts.contains("engine=tinygrad") ? "tinygrad gpu" : "htp";
+        return String.format(Locale.US, "pre %.1f  %s %.2f  post %.2f ms", avg[YoloEngine.T_PRE], eng, avg[YoloEngine.T_HTP],
                 avg[YoloEngine.T_POST]);
     }
 
@@ -116,7 +126,7 @@ public class YoloActivity extends MainActivity {
                 cur = want;
                 nDone = 0;
             }
-            Engine.Result r = newResult();
+            Engine.Result r = newResult(cur);
             if (avg == null) avg = new double[r.times.length];
             try {
                 if (cameraMode) {

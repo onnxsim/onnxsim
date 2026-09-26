@@ -21,7 +21,7 @@ android {
         jniLibs {
             useLegacyPackaging true   // extract to nativeLibraryDir: the DSP loads skels by path
             // Hexagon ELF skels: never let the (ARM) strip step touch them
-            keepDebugSymbols += ["**/libQnnHtpV69Skel.so", "**/librpn_rpc.so", "**/libroialign_rpc.so", "**/libroialign_u8_rpc.so", "**/libmsda_rpc.so"]
+            keepDebugSymbols += ["**/libQnnHtpV69Skel.so", "**/librpn_rpc.so", "**/libroialign_rpc.so", "**/libroialign_u8_rpc.so", "**/libmsda_rpc.so", "**/libmcc_hmx_rpc.so"]
         }
     }
 

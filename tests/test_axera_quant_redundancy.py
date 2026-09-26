@@ -48,6 +48,4 @@ def test_duplicate_dequantizers_are_safe_candidates():
     )
     report = quant_redundancy.analyze(model)
     assert report["safe_duplicate_removals"] == 2
-    assert any(
-        group["canonical"] == "dx" for group in report["duplicate_groups"]
-    )
+    assert any(group["canonical"] == "dx" for group in report["duplicate_groups"])

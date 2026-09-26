@@ -87,6 +87,44 @@ decoder chunks, scored against the dense host fp32 grid):
 "Steady state" = encoder + chunks x per-chunk median; `phone.sh` starts one process per chunk
 set (session load dominates its wall time), an app keeps one session.
 
+## Decoder optimization (`dec_opt.py`)
+
+The demo app's MCC mode spends ~85% of a reconstruction in decoder chunks. `dec_opt.py` builds
+variants and scores each end to end: the phone runs the whole coarse-to-fine reconstruction for a K/V
+cache, scored against that cache's dense host fp32 grid. Calibration on quest2 (iPhone points), held
+out: **spyro** (upstream demo, a different object) and **quest2m** (the demo app's own run on quest2.jpg:
+SAM mask + MoGe-2 points). `prep` also records each set's exact coarse-to-fine query set; calibration
+samples chunks from it (the surface-heavy distribution the phone queries).
+
+| decoder (1024-query chunk) | ms / chunk | spyro recall / precision | quest2m recall / precision | color L1 /255 |
+|---|---:|---|---|---|
+| fp16 (baseline) | 63 | 0.998 / 0.999 | 0.999 / 0.999 | 0.16-0.21 |
+| uint16 QDQ around Softmax only | 72 | 0.998 / 0.994 | 0.999 / 0.997 | 0.12-0.21 |
+| uint16 around Softmax + Gelu | 83 | 0.998 / 0.995 | 0.999 / 0.997 | 0.10-0.22 |
+| w8a16 whole graph | 47 | 0.994 / 0.989 | 0.993 / 0.991 | **88-92 (broken)** |
+| **w8a16, color tail fp16 (`a16c`)** | **47** | 0.994 / 0.989 | 0.993 / 0.991 | 0.65-0.90 |
+| `a16c`, K/V ranges pinned (+-16 / +-8) | 47 | 0.989 / 0.984 | 0.991 / 0.991 | 0.80-1.35 |
+| `a16c`, pinned + uint16 K/V graph inputs | 47 | same | same | same |
+| `a16c`, MLP hidden uint8 | 54 | 0.993 / 0.987 | 0.991 / 0.989 | 0.84-1.34 |
+| `a16c` at 512 / 2048 queries a chunk | 30 / 175 (59 / 85 us a query) | | 0.992 / 0.992, 0.994 / 0.991 | |
+| w8a8 (color tail fp16) | 29 | 0.977 / 0.854 | 0.956 / 0.912 | 3.7-7.0 |
+| w8a8 + uint16 islands (xyz embed / attention / residual / output head / MLP, alone and combined) | 29-54 | <= 0.982 / <= 0.869 | <= 0.962 / <= 0.916 | 3.3-6.9 |
+| w8a8, MSE calibration | 29 | | 0.944 / 0.915 | 3.9 |
+
+- **Softmax (44% of an fp16 chunk) can't be fixed locally**: QDQ islands add fp16 <-> int conversions
+  that cost more than they save; only a whole-graph integer decoder is faster.
+- **The color head needs float**: logits / 0.1 into a 256-way softmax is nearly one-hot, and uint16
+  there gives L1 ~90/255 while occupancy is fine.
+- **uint8 loses 5-15% precision (extra points) wherever the uint16 islands go**: the error is spread over
+  the 8 blocks, not in one tensor group; `a16c` is the pick.
+- Quantized K/V inputs save nothing measurable (the per-chunk K/V conversion is not the cost).
+- 1024 stays the chunk size: 2048 falls off a cliff (the 16 x Q x 198 attention intermediate outgrows
+  on-chip memory).
+- **Encoder**: w8a16 (`quant-enc`) is only 172 vs 201 ms and breaks it (K cos 0.85, recall 0.08), so it
+  stays fp16.
+- **Refine threshold** (exact, from the dense host grids): `lo` 0.1 queries 13-20% fewer points than 0.05
+  with recall >= 0.9975 on all three sets (0.15: 20-31% fewer, recall 0.992 on spyro); the app uses 0.1.
+
 ## NU-MCC: evaluated, MCC stays the phone target
 
 [NU-MCC](https://arxiv.org/abs/2307.09112) (Lionar et al., NeurIPS 2023; `sail-sg/numcc`, code
@@ -171,16 +209,19 @@ Phone budget for one photo -> 3D: MoGe 257 ms + MCC encoder 202 ms + ~36 x 64 ms
 | `numcc_ref.py` | NU-MCC upstream inference on the host, same input, cost/accuracy comparison |
 | `depth.py` | MoGe-2 static-shape ONNX (+ erf-GELU -> Gelu), MCC fed MoGe vs iPhone points |
 | `queries.py` | query-reduction strategies scored exactly against the dense references |
+| `dec_opt.py` | decoder/encoder variants (quantization policies, chunk sizes) scored end to end on the phone vs dense host references |
 | `app_check.py` | the demo app's MCC mode (its `dump=1` tensors) vs `model.prep` + the host fp32 model |
 | `phone.sh` | one ONNX piece on the phone (ORT + QNN EP), under the shared phone lock; md5-skips unchanged inputs |
 
 ## Follow-ups
 
 - **Demo-app mode: built** -- `../../maskrcnn_demo_app` "MCC 3D" (photo -> tap (SAM mask) -> MoGe-2 -> MCC
-  -> rotatable colored point cloud, 3.9-4.3 s for the quest2 headset; see its README). `app_check.py`
+  -> rotatable colored point cloud, 2.5 s for the quest2 headset after "Decoder optimization", 1.3 s with
+  the hand-written DSP decoder `../../mcc_hmx`; see its README). `app_check.py`
   checks the app's C++ prep and its reconstruction against this directory's pipeline. Still open: a
   gravity-aligned frame from the phone's accelerometer.
-- uint8/int8 decoder and encoder (`onnxsim.full_qdq`, uint8 NHWC image input) -- fp16 only so far.
+- uint8 decoder: 29 ms a chunk (vs 47 w8a16) but 5-15% of the points wrong (see "Decoder optimization");
+  would need QAT or a per-block sensitivity search. Encoder quantization needs a working calibration.
 
-- The decoder is dense attention + MLP over many queries: a natural target for the HMX GEMM
-  work (`codex/android-hmx-gemm`), not used here.
+- The decoder on HMX + HVX by hand: `../../mcc_hmx` (22 ms a 1024-query chunk vs QNN's 47 w8a16, at
+  fp16-level accuracy).

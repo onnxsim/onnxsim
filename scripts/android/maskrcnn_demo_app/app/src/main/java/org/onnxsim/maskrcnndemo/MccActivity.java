@@ -24,7 +24,8 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * MCC single-image 3D reconstruction (its own process, see the manifest; mcc_engine.cpp): tap an
  * object to segment it (SAM), then "3D" runs MoGe-2 (monocular point map) and MCC (encoder + a
  * coarse-to-fine decoder) and shows the reconstructed colored points, turned by dragging.
- *   camera: live preview; a tap freezes that frame (SAM encoder) and segments; "Live" unfreezes.
+ *   camera: live preview; a tap captures the object under it: freezes that frame (SAM encoder), segments it and
+ *           reconstructs it in 3D. Taps on the frozen photo re-segment ("3D" then rebuilds); "Live" goes back.
  *   images: the test images, center-cropped to 3:4 / 4:3; "Next image" moves on.
  * Extras: "tap" ("fx,fy", fractions of the frame) taps after each encode and "recon" (boolean) then
  * reconstructs (scripted runs); "image" (a file name in imgs) starts there; "opts" (mcc_engine.cpp: gran,
@@ -34,6 +35,7 @@ public class MccActivity extends MainActivity {
     private static final String TAG = "MccDemo";
     private final ConcurrentLinkedQueue<float[]> taps = new ConcurrentLinkedQueue<>();
     private volatile boolean frozen, next, reconRequested;
+    private boolean captureRecon;  // worker thread only
     private PointCloudView cloud;
     private Button view3d;
 
@@ -137,7 +139,7 @@ public class MccActivity extends MainActivity {
         int img = 0;
         for (int i = 0; i < images.size(); i++)
             if (images.get(i).getName().equals(getIntent().getStringExtra("image"))) img = i;
-        float[] et = new float[1], dt = new float[1], iou = new float[4], rt = new float[5];
+        float[] et = new float[1], dt = new float[1], iou = new float[4], rt = new float[6];
         int[] rc = new int[3];
         byte[] mask = null;
         Engine.Result r = null;  // the working image on screen
@@ -155,9 +157,10 @@ public class MccActivity extends MainActivity {
                     needEncode = true;
                 }
                 float[] tap = taps.poll();
-                if (cameraMode && !frozen && tap != null) {  // a tap on the live preview: freeze + encode it
+                if (cameraMode && !frozen && tap != null) {  // a tap on the live preview: freeze, encode, segment, 3D
                     frozen = true;
                     needEncode = true;
+                    captureRecon = true;
                 }
                 if (cameraMode && (!frozen || needEncode)) {
                     Image im = reader != null ? reader.acquireLatestImage() : null;
@@ -183,7 +186,7 @@ public class MccActivity extends MainActivity {
                     maskBmp = null;
                     mx = -1;
                     if (!needEncode) {
-                        overlay.update(r, "MCC 3D  camera: live preview\ntap an object to freeze the frame and segment it",
+                        overlay.update(r, "MCC 3D  camera: live preview\ntap an object to capture it in 3D",
                                 null, 0, 0, -1, -1);
                         continue;
                     }
@@ -231,6 +234,10 @@ public class MccActivity extends MainActivity {
                     overlay.update(r, photoLine, maskBmp, maskBmp != null ? maskBmp.getWidth() : 0,
                             maskBmp != null ? maskBmp.getHeight() : 0, mx, my);
                 }
+                if (captureRecon && mx >= 0) {  // the capturing tap: its mask straight into 3D
+                    captureRecon = false;
+                    reconRequested = true;
+                }
                 if (autoRecon && !autoReconDone && mx >= 0) {
                     autoReconDone = true;
                     reconRequested = true;
@@ -253,12 +260,13 @@ public class MccActivity extends MainActivity {
                     int[] col = new int[n];
                     MccEngine.nativePoints(xyz, col);
                     String s = String.format(Locale.US,
-                            "MCC 3D  %d points (granularity %.2f)\nMoGe-2 %.0f ms  prep %.0f ms  MCC encoder %.0f ms\n"
-                                    + "MCC decoder %.0f ms (%d queries, %d x 1024 chunks)\ntotal %.2f s   drag to turn, pinch to zoom",
-                            n, gran, rt[0], rt[1], rt[2], rt[3], rc[0], rc[1], rt[4] / 1000);
+                            "MCC 3D  %d points (granularity %.2f)\nMoGe-2 %.0f ms (in the background, waited %.0f ms)\n"
+                                    + "prep %.0f ms  MCC encoder %.0f ms\nMCC decoder %.0f ms (%d queries, %d x 1024)\n"
+                                    + "total %.2f s   drag to turn, pinch to zoom",
+                            n, gran, rt[0], rt[1], rt[2], rt[3], rt[4], rc[0], rc[1], rt[5] / 1000);
                     Log.i(TAG, String.format(Locale.US,
-                            "recon: %d points; MoGe %.1f prep %.1f encoder %.1f decoder %.1f (%d queries, %d chunks) total %.1f ms",
-                            n, rt[0], rt[1], rt[2], rt[3], rc[0], rc[1], rt[4]));
+                            "recon: %d points; MoGe %.1f (waited %.1f) prep %.1f encoder %.1f decoder %.1f (%d queries, %d chunks) total %.1f ms",
+                            n, rt[0], rt[1], rt[2], rt[3], rt[4], rc[0], rc[1], rt[5]));
                     cloud.setPoints(xyz, col, gran, thumbnail(r.frame, maskBmp), s);
                     showCloud(true);
                     overlay.setStats(photoLine);

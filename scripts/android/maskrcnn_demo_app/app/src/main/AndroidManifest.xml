@@ -50,6 +50,12 @@
             android:exported="true"
             android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
+        <!-- the Camera / Images button: restarts an engine activity once its (dying) process is gone -->
+        <activity
+            android:name=".RelaunchActivity"
+            android:process=":relaunch"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <activity
             android:name=".GameActivity"
             android:process=":game"

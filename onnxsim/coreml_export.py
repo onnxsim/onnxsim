@@ -352,6 +352,9 @@ for _onnx_op, _mil_op in [
     ("Identity", "identity"),
     ("Sin", "sin"),
     ("Cos", "cos"),
+    ("Abs", "abs"),
+    ("Floor", "floor"),
+    ("Round", "round"),
 ]:
     _OP_HANDLERS[_onnx_op] = _simple_unary(_mil_op)
 
@@ -362,7 +365,9 @@ for _onnx_op, _mil_op in [
     ("Div", "real_div"),
     ("Pow", "pow"),
     ("Equal", "equal"),
+    ("Less", "less"),
     ("LessOrEqual", "less_equal"),
+    ("GreaterOrEqual", "greater_equal"),
     ("Greater", "greater"),
     ("And", "logical_and"),
 ]:
@@ -374,13 +379,70 @@ def _lower_not(lowerer, node, ins, attrs):
     return [lowerer.mb.logical_not(x=ins[0], name=lowerer.fresh_name(node))]
 
 
+def _resize_nearest_indices(
+    input_size: int,
+    output_size: int,
+    scale: float,
+    coordinate_mode: str,
+    nearest_mode: str,
+) -> np.ndarray:
+    """The source index each output position samples, for one spatial axis.
+
+    Shared by the gather expansion below and the ``resize_nearest_neighbor``
+    eligibility check, so both describe the same sampling rule.
+    """
+    output = np.arange(output_size, dtype=np.float64)
+    if coordinate_mode == "asymmetric":
+        source = output / scale
+    elif coordinate_mode == "half_pixel":
+        source = (output + 0.5) / scale - 0.5
+    else:
+        raise RuntimeError(
+            f"Resize nearest coordinate_transformation_mode {coordinate_mode!r} "
+            f"is not supported"
+        )
+    if nearest_mode == "floor":
+        indices = np.floor(source)
+    elif nearest_mode == "ceil":
+        indices = np.ceil(source)
+    elif nearest_mode == "round_prefer_floor":
+        indices = np.ceil(source - 0.5)
+    elif nearest_mode == "round_prefer_ceil":
+        indices = np.floor(source + 0.5)
+    else:
+        raise RuntimeError(f"Resize nearest_mode {nearest_mode!r} is not supported")
+    return np.clip(indices, 0, input_size - 1).astype(np.int32)
+
+
+def _resize_nearest_is_repeating(input_size: int, indices: np.ndarray) -> bool:
+    """Whether this nearest Resize is a pure integer replication of the input.
+
+    ``resize_nearest_neighbor`` is a real Core ML kernel rather than a pair of
+    index gathers materializing an intermediate feature map, but it implements
+    its own fixed sampling rule, and `scripts/apple/README.md`'s Resize note
+    records why these were gathers in the first place (a Core ML resize runtime
+    limitation). So rather than assume the two rules agree, this requires the
+    strongest case where agreement is provable and was measured on Core ML: every
+    input position repeated a whole number of times (``2x2 -> 4x4``,
+    ``3x4 -> 6x8``, ``4x4 -> 8x8`` all match ONNX Runtime exactly).
+
+    Non-integer factors are deliberately excluded rather than compared against an
+    assumed formula: measured on Core ML, a downscale (``4x4 -> 2x2``) or a
+    fractional upscale (``2x2 -> 3x3``) samples *different* rows than ONNX does.
+    Those keep the gather path, so the documented "preserves ONNX's sampling
+    rule" property cannot regress.
+    """
+    output_size = int(indices.size)
+    if output_size % input_size or output_size < input_size:
+        return False
+    repeats = output_size // input_size
+    expected = np.repeat(np.arange(input_size, dtype=np.int32), repeats)
+    return bool(np.array_equal(indices, expected))
+
+
 @_register("Resize")
 def _lower_resize(lowerer, node, ins, attrs):
     """Lower static 2-D ONNX Resize ops used by CNN feature pyramids."""
-    if len(ins) < 3 or ins[2] is None or ins[2].val is None:
-        raise RuntimeError(
-            "Resize requires constant scales; dynamic sizes are not supported"
-        )
     if len(ins[0].shape) != 4:
         raise RuntimeError(
             f"Resize expects NCHW rank 4 input, got rank {len(ins[0].shape)}"
@@ -395,33 +457,88 @@ def _lower_resize(lowerer, node, ins, attrs):
         "half_pixel": "UNALIGN_CORNERS",
         "align_corners": "ALIGN_CORNERS",
     }
-    scales = np.asarray(ins[2].val).reshape(-1)
-    if scales.size != 4 or not np.all(scales[:2] == 1):
-        raise RuntimeError(
-            f"Resize only supports N/C scale 1, got scales {scales.tolist()}"
-        )
     height, width = ins[0].shape[-2:]
     if not all(isinstance(d, (int, np.integer)) for d in (height, width)):
         raise RuntimeError("Resize requires static spatial dimensions")
-    target_height = int(round(int(height) * float(scales[-2])))
-    target_width = int(round(int(width) * float(scales[-1])))
+
+    sizes_in = ins[3] if len(ins) > 3 and ins[3] is not None else None
+    scales_in = ins[2] if len(ins) > 2 and ins[2] is not None else None
+    if sizes_in is not None:
+        if sizes_in.val is None:
+            raise RuntimeError("Resize requires a compile-time-constant 'sizes' input")
+        sizes = np.asarray(sizes_in.val).reshape(-1)
+        if sizes.size != 4:
+            raise RuntimeError(f"Resize 'sizes' must have 4 entries, got {sizes.size}")
+        target_size = [int(v) for v in sizes]
+        input_shape = tuple(ins[0].shape)
+        if any(
+            isinstance(d, (int, np.integer)) and target_size[axis] != int(d)
+            for axis, d in enumerate(input_shape[:2])
+        ):
+            raise RuntimeError(
+                "Resize only supports unchanged N/C dimensions, got input shape "
+                f"{input_shape} and sizes {sizes.tolist()}"
+            )
+        target_height, target_width = target_size[-2:]
+        if target_height <= 0 or target_width <= 0:
+            raise RuntimeError(
+                f"Resize output sizes must be positive, got {sizes.tolist()}"
+            )
+        scales = np.array(
+            [
+                1.0,
+                1.0,
+                target_height / float(height),
+                target_width / float(width),
+            ],
+            dtype=np.float64,
+        )
+    elif scales_in is not None:
+        if scales_in.val is None:
+            raise RuntimeError("Resize requires a compile-time-constant 'scales' input")
+        scales = np.asarray(scales_in.val).reshape(-1)
+        if scales.size != 4:
+            raise RuntimeError(
+                f"Resize 'scales' must have 4 entries, got {scales.size}"
+            )
+        if not np.all(scales[:2] == 1):
+            raise RuntimeError(
+                f"Resize only supports N/C scale 1, got scales {scales.tolist()}"
+            )
+        if scales[-2] <= 0 or scales[-1] <= 0:
+            raise RuntimeError(
+                f"Resize spatial scales must be positive, got {scales.tolist()}"
+            )
+        target_height = int(round(int(height) * float(scales[-2])))
+        target_width = int(round(int(width) * float(scales[-1])))
+    else:
+        raise RuntimeError(
+            "Resize needs a compile-time-constant 'sizes' or 'scales' input"
+        )
+
     resize_name = lowerer.fresh_name(node)
     if mode == "nearest":
         nearest_mode = attrs.get("nearest_mode", b"round_prefer_floor")
         if isinstance(nearest_mode, bytes):
             nearest_mode = nearest_mode.decode()
-        if coordinate_mode != "asymmetric" or nearest_mode != "floor":
-            raise RuntimeError(
-                "Resize nearest only supports asymmetric coordinates with floor rounding"
-            )
-        height_indices = np.minimum(
-            np.floor(np.arange(target_height) / scales[-2]).astype(np.int32),
-            int(height) - 1,
+
+        height_indices = _resize_nearest_indices(
+            int(height), target_height, scales[-2], coordinate_mode, nearest_mode
         )
-        width_indices = np.minimum(
-            np.floor(np.arange(target_width) / scales[-1]).astype(np.int32),
-            int(width) - 1,
+        width_indices = _resize_nearest_indices(
+            int(width), target_width, scales[-1], coordinate_mode, nearest_mode
         )
+        if _resize_nearest_is_repeating(
+            int(height), height_indices
+        ) and _resize_nearest_is_repeating(int(width), width_indices):
+            return [
+                lowerer.mb.resize_nearest_neighbor(
+                    x=ins[0],
+                    target_size_height=target_height,
+                    target_size_width=target_width,
+                    name=resize_name,
+                )
+            ]
         height_index_var = lowerer.make_const(
             resize_name + "_height_indices", height_indices
         )
@@ -621,9 +738,39 @@ def _op_dequantize_linear(lowerer, node, ins, attrs):
     scale, zp, axis = _qdq_scale_and_zp(lowerer, node, ins, attrs, "DequantizeLinear")
     if zp is not None:
         zp_np_dtype = np.asarray(zp.val).dtype
+        # A QDQ Conv/Gemm bias is int32 with its own per-channel scale, which
+        # MIL's `dequantize` does not accept (it only takes int8/uint8 input).
+        # Dequantizing an int32 zero-point bias is exactly a cast plus a
+        # scale-and-zero-point multiply, so lower it that way and let the
+        # broadcast happen in `mul`: the scale is 1-D along `axis` (Conv's
+        # output channels), and a bias is applied to the conv output, so
+        # broadcasting the (1-D scale, 1-D bias) pair over the NCHW output
+        # is what ONNX's own per-channel DequantizeLinear asks for.
+        if zp_np_dtype == np.dtype(np.int32):
+            zp_arr = np.asarray(zp.val)
+            cast = lowerer.mb.cast(
+                x=x,
+                dtype=lowerer.types.builtin_to_string(scale.dtype),
+                name=lowerer.fresh_name(node, "cast"),
+            )
+            scaled = lowerer.mb.mul(
+                x=cast, y=scale, name=lowerer.fresh_name(node, "scale")
+            )
+            if np.all(zp_arr == 0):
+                return [scaled]
+            zp_f = lowerer.make_const(
+                f"{node.output[0]}_zp_f32", zp_arr.astype(np.float32)
+            )
+            return [
+                lowerer.mb.add(
+                    x=scaled,
+                    y=zp_f,
+                    name=lowerer.fresh_name(node),
+                )
+            ]
         if zp_np_dtype not in (np.dtype(np.int8), np.dtype(np.uint8)):
             raise RuntimeError(
-                "DequantizeLinear 'zero_point' must be int8 or uint8 "
+                "DequantizeLinear 'zero_point' must be int8, uint8 or int32 "
                 f"(got {zp_np_dtype})"
             )
     kwargs = {
@@ -682,15 +829,27 @@ def _op_expand(lowerer, node, ins, attrs):
     if shape_var.val is not None:
         target = [int(v) for v in shape_var.val]
         x_shape = list(x.shape)
-        pad = len(target) - len(x_shape)
-        if pad > 0:
-            x_shape = [1] * pad + x_shape
+        aligned_target = (
+            [1] * (len(x_shape) - len(target)) + target
+            if len(target) < len(x_shape)
+            else target
+        )
+        if len(target) > len(x_shape):
+            x_shape = [1] * (len(target) - len(x_shape)) + x_shape
             x = lowerer.mb.reshape(
                 x=x, shape=x_shape, name=lowerer.fresh_name(node, "reshape")
             )
-        # ONNX Expand's broadcast rule (each axis is either 1 or already equal to
-        # the target) maps directly onto `tile`'s integer repeat-count per axis.
-        reps = [t // s for s, t in zip(x_shape, target)]
+            aligned_target = target
+        if any(not isinstance(s, (int, np.integer)) or s < 1 for s in x_shape):
+            raise RuntimeError("Expand requires static positive input dimensions")
+        if any(
+            s not in (1, t) and t not in (1, s) for s, t in zip(x_shape, aligned_target)
+        ):
+            raise RuntimeError(
+                f"Expand shapes are not broadcast-compatible: {x_shape} -> {target}"
+            )
+        output_shape = [max(s, t) for s, t in zip(x_shape, aligned_target)]
+        reps = [o // s for s, o in zip(x_shape, output_shape)]
         return [lowerer.mb.tile(x=x, reps=reps, name=lowerer.fresh_name(node))]
 
     # The target shape is itself only known at runtime (e.g. it depends on a KV
@@ -1045,6 +1204,11 @@ def _reduce(mil_name: str):
 _OP_HANDLERS["ReduceMean"] = _reduce("reduce_mean")
 _OP_HANDLERS["ReduceSum"] = _reduce("reduce_sum")
 _OP_HANDLERS["ReduceMax"] = _reduce("reduce_max")
+# MIL's `reduce_min` is a true elementwise minimum reduction over `axes`, the
+# same contract as ONNX ReduceMin, so it needs no lowering of its own. Mask
+# R-CNN's ROI head uses it to clamp a score/size tensor.
+_OP_HANDLERS["ReduceMin"] = _reduce("reduce_min")
+_OP_HANDLERS["ReduceProd"] = _reduce("reduce_prod")
 
 
 @_register("Reshape")
@@ -1363,6 +1527,147 @@ def _op_slice(lowerer, node, ins, attrs):
     ]
 
 
+@_register("NonZero")
+def _op_nonzero(lowerer, node, ins, attrs):
+    """NonZero is refused with its reason.
+
+    ONNX NonZero returns a 2-D `[rank, N]` tensor whose length N is the number
+    of nonzero elements -- a data-dependent shape. Every Core ML model input
+    and output has a static shape, and MIL has no nonzero op, so there is no
+    way to express this that does not either invent a fixed N (silently
+    truncating or padding the result) or fail at run time. Mask R-CNN's NMS
+    uses it to compact a boolean keep-mask; that stage has to stay elsewhere.
+    """
+    raise RuntimeError(
+        "NonZero is not supported by the Core ML exporter: its output length is "
+        "the data-dependent count of nonzero elements, and Core ML model I/O "
+        "requires static shapes (MIL has no nonzero op to lower onto). Replace it "
+        "with a fixed-size form, e.g. a top_k over the mask, or keep this stage on "
+        "another backend."
+    )
+
+
+@_register("ScatterElements")
+def _op_scatter_elements(lowerer, node, ins, attrs):
+    """ScatterElements -> MIL `scatter`, but only for the shape ONNX and MIL
+    actually agree on.
+
+    MIL's `scatter` takes a **1-D** `indices` vector and writes `updates[i]`
+    into `data[..., indices[i], ...]`. ONNX ScatterElements instead requires
+    `indices` to have the *same rank as data*, writing `updates[..., i, ...]` at
+    every `indices[..., i, ...]` position. The two coincide only when `data` is
+    rank 1; for anything higher-rank (which is what detectors emit -- Mask
+    R-CNN's NMS uses 4-D indices) the shapes do not line up, so forwarding would
+    silently change the result and is refused with the reason instead.
+    """
+    data, indices, updates = ins[0], ins[1], ins[2]
+    axis = int(attrs.get("axis", 0))
+    if axis < 0:
+        axis += data.rank
+    if data.rank != 1 or int(indices.rank) != 1:
+        raise RuntimeError(
+            f"ScatterElements with rank-{data.rank} data and rank-"
+            f"{int(indices.rank)} indices is not supported: Core ML's scatter "
+            "indexes with a 1-D index vector, while ONNX ScatterElements requires "
+            "indices of the same rank as data. Only the rank-1 case is lowered."
+        )
+    # ONNX spells this `reduction` ("none" = plain overwrite); MIL calls the
+    # same thing `mode` and spells the plain overwrite "update".
+    reduction = attrs.get("reduction", b"none")
+    if isinstance(reduction, bytes):
+        reduction = reduction.decode()
+    mil_mode = {
+        "none": "update",
+        "add": "add",
+        "mul": "mul",
+        "max": "max",
+        "min": "min",
+    }
+    if reduction not in mil_mode:
+        raise RuntimeError(
+            f"ScatterElements reduction={reduction!r} is not supported (supported: "
+            + ", ".join(sorted(mil_mode))
+        )
+    return [
+        lowerer.mb.scatter(
+            data=data,
+            indices=indices,
+            updates=updates,
+            axis=axis,
+            mode=mil_mode[reduction],
+            name=lowerer.fresh_name(node),
+        )
+    ]
+
+
+@_register("RoiAlign")
+def _op_roi_align(lowerer, node, ins, attrs):
+    """RoiAlign is refused with the reason, rather than left to a bare
+    "unsupported op".
+
+    Core ML's nearest equivalent, MIL's `crop_resize`, is bilinear-only. ONNX
+    RoiAlign defaults to ``mode="average"`` (pooling over ``sampling_ratio``
+    samples per bin), which is what Mask R-CNN's detector head emits -- and that
+    is *not* bilinear sampling. Mapping `average` onto `crop_resize` would
+    convert and run while quietly producing different numbers, so every mode is
+    refused here, each with the reason it cannot be lowered today.
+    """
+    mode = attrs.get("mode", b"average")
+    if isinstance(mode, bytes):
+        mode = mode.decode()
+    if mode != "bilinear":
+        raise RuntimeError(
+            f"RoiAlign with mode={mode!r} is not supported: Core ML's crop_resize "
+            "is bilinear-only, and mapping ONNX's 'average' pooling onto it would "
+            "silently change the sampled values. Re-export with mode='bilinear', or "
+            "keep this stage on another backend."
+        )
+    raise RuntimeError(
+        "RoiAlign with mode='bilinear' is not supported yet: it still needs "
+        "lowering onto Core ML's crop_resize, including the rank-5 batch-indexed "
+        "ROI layout ONNX does not use."
+    )
+
+
+@_register("TopK")
+def _op_topk(lowerer, node, ins, attrs):
+    """ONNX TopK -> MIL `topk`, which has the same two-output contract.
+
+    Mask R-CNN's NMS head uses this to keep the highest-scoring proposals.
+    ONNX's two non-default attributes are rejected explicitly rather than
+    approximated: `largest=0` (the k *smallest*) would need the input negated
+    and the indices remapped, and `sorted=0` (unsorted values) has no MIL
+    equivalent because `topk` always returns descending order.
+    """
+    if not bool(attrs.get("largest", 1)):
+        raise RuntimeError(
+            "TopK with largest=0 is not supported; Core ML's top_k returns the "
+            "largest k values only (negate the input and invert the comparison "
+            "to select the smallest k)"
+        )
+    if not bool(attrs.get("sorted", 1)):
+        raise RuntimeError(
+            "TopK with sorted=0 is not supported; Core ML's top_k always returns "
+            "its k values in sorted order"
+        )
+    x = ins[0]
+    axis = int(attrs.get("axis", -1))
+    if axis < 0:
+        axis += x.rank
+    k = ins[1] if len(ins) > 1 and ins[1] is not None else None
+    if k is None or k.val is None:
+        raise RuntimeError("TopK needs a compile-time-constant 'k' input")
+    k_val = int(np.asarray(k.val).reshape(-1)[0])
+    values, indices = lowerer.mb.topk(
+        x=x,
+        k=k_val,
+        axis=axis,
+        ascending=False,
+        name=lowerer.fresh_name(node),
+    )
+    return [values, indices]
+
+
 @_register("Gather")
 def _op_gather(lowerer, node, ins, attrs):
     x, indices = ins[0], ins[1]
@@ -1384,6 +1689,16 @@ def _op_gather(lowerer, node, ins, attrs):
     if is_bool:
         out = lowerer.mb.cast(x=out, dtype="bool", name=lowerer.fresh_name(node))
     return [out]
+
+
+@_register("GatherND")
+def _op_gather_nd(lowerer, node, ins, attrs):
+    x, indices = ins[:2]
+    batch_dims = int(attrs.get("batch_dims", 0))
+    kwargs = {"x": x, "indices": indices, "name": lowerer.fresh_name(node)}
+    if batch_dims:
+        kwargs["batch_dims"] = batch_dims
+    return [lowerer.mb.gather_nd(**kwargs)]
 
 
 @_register("Tile")
@@ -1707,6 +2022,28 @@ def _resolve_io_dtype(ct, io_dtype: Optional[str], convert_to: str, resolved_tar
     return "fp16", resolved_target
 
 
+def _raise_target_to_floor(ct, floor, resolved_target, reason: str, label: str):
+    """Raise ``resolved_target`` to at least ``floor``, or refuse an older one.
+
+    Shared by every per-feature deployment floor below. The ``max`` matters
+    when several features apply at once: each call must be free to *raise* the
+    target, never to lower it back to its own floor. A resolver that returned
+    its floor unconditionally would make a later, higher resolver read that
+    value as the caller's explicit choice and refuse to raise past it -- which
+    is exactly what a QDQ model with a nearest Resize did (iOS15 pinned by the
+    Resize rule, then rejected by the iOS17 QDQ rule).
+    """
+    if resolved_target is None:
+        return floor
+    if int(resolved_target) < int(floor):
+        raise RuntimeError(
+            f"{reason} needs minimum_deployment_target {label} or newer "
+            f"(got {resolved_target.name}); that Core ML op did not exist "
+            "before then."
+        )
+    return resolved_target
+
+
 def _resolve_state_target(ct, state, resolved_target):
     """Bump the deployment floor to iOS18 when states are requested.
 
@@ -1715,16 +2052,45 @@ def _resolve_state_target(ct, state, resolved_target):
     """
     if not state:
         return resolved_target
-    floor = ct.target.iOS18
-    if resolved_target is None:
-        return floor
-    if int(resolved_target) < int(floor):
-        raise RuntimeError(
-            f"state= needs minimum_deployment_target iOS18/macOS15 or newer "
-            f"(got {resolved_target.name}); Core ML states did not exist "
-            "before then."
-        )
-    return resolved_target
+    return _raise_target_to_floor(
+        ct, ct.target.iOS18, resolved_target, "state=", "iOS18/macOS15"
+    )
+
+
+def _resolve_gather_nd_target(ct, model: onnx.ModelProto, resolved_target):
+    uses_batch_dims = any(
+        node.op_type == "GatherND" and int(_node_attrs(node).get("batch_dims", 0)) > 0
+        for node in model.graph.node
+    )
+    if not uses_batch_dims:
+        return resolved_target
+    return _raise_target_to_floor(
+        ct,
+        ct.target.iOS16,
+        resolved_target,
+        "GatherND with batch_dims > 0",
+        "iOS16/macOS13",
+    )
+
+
+def _resolve_resize_target(ct, model: onnx.ModelProto, resolved_target):
+    """Bump the deployment floor to iOS15 when the graph has a nearest Resize.
+
+    The fast path emits MIL's `resize_nearest_neighbor` (iOS15), so a graph that
+    may take it must both build and convert at that target or newer. The check is
+    deliberately coarse -- a nearest Resize that ends up ineligible and lowered to
+    gathers still raises the floor -- same trade-off (and same reason: keeping the
+    predicate stateless) as `_resolve_gather_nd_target` above.
+    """
+    if not any(
+        node.op_type == "Resize"
+        and _node_attrs(node).get("mode", "nearest") == "nearest"
+        for node in model.graph.node
+    ):
+        return resolved_target
+    return _raise_target_to_floor(
+        ct, ct.target.iOS15, resolved_target, "a nearest Resize", "iOS15/macOS12"
+    )
 
 
 def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
@@ -1741,16 +2107,13 @@ def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
         for node in model.graph.node
     ):
         return resolved_target
-    floor = ct.target.iOS17
-    if resolved_target is None:
-        return floor
-    if int(resolved_target) < int(floor):
-        raise RuntimeError(
-            "QuantizeLinear/DequantizeLinear need minimum_deployment_target "
-            f"iOS17/macOS14 or newer (got {resolved_target.name}); MIL's "
-            "`quantize`/`dequantize` ops did not exist before then."
-        )
-    return resolved_target
+    return _raise_target_to_floor(
+        ct,
+        ct.target.iOS17,
+        resolved_target,
+        "QuantizeLinear/DequantizeLinear",
+        "iOS17/macOS14",
+    )
 
 
 def convert_to_coreml(
@@ -1787,6 +2150,10 @@ def convert_to_coreml(
     minimum_deployment_target:
         Minimum OS version the model must run on, e.g. ``"iOS16"``/``"macOS13"``, or a
         ``coremltools.target`` member. Left at coremltools' own default when ``None``.
+        Raised automatically when the graph needs a newer op: a nearest ``Resize``
+        (iOS15), a batched ``GatherND`` or fp16 I/O (iOS16), QDQ nodes (iOS17), or
+        ``state=`` (iOS18). An explicitly older target is refused rather than
+        producing a model ``coremlcompiler`` would reject.
     skip_model_load:
         Skip compiling/loading the produced model for prediction (default ``True``).
         Compiling requires Apple's Core ML toolchain and only succeeds on macOS; leave
@@ -1887,7 +2254,9 @@ def convert_to_coreml(
     io_dtype, resolved_target = _resolve_io_dtype(
         ct, io_dtype, convert_to, resolved_target
     )
+    resolved_target = _resolve_gather_nd_target(ct, model, resolved_target)
     resolved_target = _resolve_quantized_target(ct, model, resolved_target)
+    resolved_target = _resolve_resize_target(ct, model, resolved_target)
     resolved_target = _resolve_state_target(ct, state, resolved_target)
 
     prog, flexible_inputs = _build_mil_program(

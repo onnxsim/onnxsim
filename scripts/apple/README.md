@@ -116,15 +116,45 @@ python scripts/apple/benchmark_onnx_pipeline.py pipeline.json \
 ```
 
 Each stage is reported against ONNX Runtime CPU for Core ML, eager tinygrad
-Metal, and tinygrad Metal JIT. The selected per-stage backends are then timed
-end to end, including tensor handoffs. The existing SAM-specific runner below
-adds SAM image resizing and prompt setup on top of this backend comparison.
+Metal, and tinygrad Metal JIT. The staged benchmark defaults Core ML to
+`ALL`, allowing its CPU, GPU, or Neural Engine placement logic to choose per
+operation; pass `--compute-units CPU_AND_NE` for an ANE-only comparison. The
+selected per-stage backends are then timed end to end, including tensor
+handoffs. Set
+`input_connections` for inputs that are shared by multiple stages but are not
+produced by an earlier stage (for example, projection LUTs). Set `fuse` to an object such as
+`{"stages": ["backbone", "head"], "backend": "coreml"}` to additionally measure
+one merged ONNX graph; the original per-stage and unfused end-to-end results
+remain in the report. The fused graph is written beside the JSON output.
 
 M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
 in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
-The Core ML translator lowers the models' static nearest-neighbor Resize
-(`asymmetric` coordinates, `floor` rounding) to constant index gathers, which
-preserves ONNX's sampling rule and avoids a Core ML resize runtime limitation.
+The Core ML translator lowers static nearest-neighbor Resize to Core ML's own
+`resize_nearest_neighbor` when the resize is a whole-number replication of its
+input, and otherwise to constant index gathers, which preserve ONNX's sampling
+rule. The gate is deliberate: measured on Core ML, a downscale or a fractional
+upscale samples *different* rows than ONNX does, so only the replication case
+uses the native kernel, and it requires iOS15/macOS12 or newer. On M4 this took
+Fast-BEV M0's encoder from 95.6 ms to 65.9 ms and its end-to-end Core ML chain
+from 174.3 ms to 143.9 ms, with ORT parity unchanged (cosine 1.0).
+
+The same gate also speeds up the YOLO detectors below, whose head upsample is an
+integer 2x nearest resize (FLOAT16, `ALL`, 8 runs after 3 warm-ups, same input
+and machine). A/B against the gather path, with score p99 error vs ONNX Runtime
+unchanged in both arms:
+
+| model | gather | native | speedup | score p99 error |
+|---|---:|---:|---:|---:|
+| YOLO11n | 4.66 ms | **2.74 ms** | 1.70x | 5.0e-5 |
+| YOLO26n | 4.80 ms | **2.37 ms** | 2.03x | 8.6e-6 |
+| YOLO26s | 9.45 ms | 9.54 ms | 0.99x (no change) | 1.7e-5 |
+
+YOLO26s is unchanged because its Resize input is not a whole-number
+replication, so it keeps the gathers; its head is large enough that the two
+`Resize` nodes are not on the critical path. Note these FLOAT16 latencies are
+lower than the `CPU_AND_NE` FLOAT16 numbers recorded in
+[`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md),
+which predate the native-Resize change; that file's accuracy notes still apply.
 
 ## rustnn WebNN vs. tinygrad benchmark (`benchmark_webnn_tinygrad.py`)
 

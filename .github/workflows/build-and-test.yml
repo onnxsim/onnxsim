@@ -244,6 +244,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ninja sccache pytest onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors ml_dtypes
           python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+          # tests/test_axera_tinygrad_ax_backend.py runs the tinygrad UOp
+          # lowerings, which need the onnxsim/tinygrad fork at
+          # TINYGRAD_FORK_SHA (scripts/axera/tinygrad_ax_backend.py) -- PyPI
+          # tinygrad has neither Ops.ALLOC nor tinygrad.device.BufferStorage,
+          # so a plain `pip install tinygrad` would just move the 15 failures
+          # to different errors. Same pin docs/axera-tinygrad-backend-skeleton.md
+          # records.
+          python -m pip install "tinygrad@https://github.com/onnxsim/tinygrad/archive/ba00cbb3c6b8a6bcbee04c22cb4a0b0b9cee216e.tar.gz"
       - name: Build and install onnxsim
         run: python -m pip install -v .
       # Run from a neutral directory, same reason as test_formal_verification

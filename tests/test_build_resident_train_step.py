@@ -109,10 +109,14 @@ def test_prune_dead_values_keeps_outputs_and_removes_dead_branches():
         [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
         [_f32(np.ones((1,), dtype=np.float32), "live_weight"), dead_weight],
     )
-    model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
     assert brts._prune_dead_values(model) == (1, 1)
     assert [node.output[0] for node in model.graph.node] == ["y"]
-    assert [initializer.name for initializer in model.graph.initializer] == ["live_weight"]
+    assert [initializer.name for initializer in model.graph.initializer] == [
+        "live_weight"
+    ]
     onnx.checker.check_model(model)
 
 
