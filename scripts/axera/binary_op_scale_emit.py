@@ -52,6 +52,7 @@ import struct
 import sys
 from collections import Counter
 from collections.abc import Mapping
+from functools import lru_cache
 
 import numpy as np
 import onnx
@@ -72,6 +73,19 @@ OFFSET_REGS = tuple(range(0x1EF0, 0x1F30, 0x10))
 # inputs are (z, x); the output slot (0x03d0=6) and zero entries stay put
 ORDER_SWAP = {0x03D0: {2: 4, 4: 2}, 0x02B0: {1: 3, 3: 1}}
 TEMPLATE_DIR = os.path.join(_HERE, "fixtures", "binary_op_scale_emit")
+
+
+@lru_cache(maxsize=1)
+def _template_index() -> dict:
+    with open(os.path.join(TEMPLATE_DIR, "index.json")) as f:
+        return json.load(f)
+
+
+def _load_index(template_dir: str) -> dict:
+    if template_dir == TEMPLATE_DIR:
+        return _template_index()
+    with open(os.path.join(template_dir, "index.json")) as f:
+        return json.load(f)
 
 
 def _f32(x: float) -> float:
@@ -419,8 +433,7 @@ def template_shape(shape) -> list[int]:
 
 
 def load_template(op: str, shape, zero_points, template_dir: str = TEMPLATE_DIR):
-    with open(os.path.join(template_dir, "index.json")) as f:
-        index = json.load(f)
+    index = _load_index(template_dir)
     key = _key(op, template_shape(shape), zero_points)
     if key not in index:
         raise ValueError(f"no validated template for {key}; have {sorted(index)}")

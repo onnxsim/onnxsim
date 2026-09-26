@@ -529,7 +529,18 @@ class TemplateCache:
     delegated to :mod:`template_model_generator` and never invokes Pulsar2.
     """
 
+    def __init__(self):
+        self._entries: dict[TemplateKey, TemplateEntry] = {}
+
     def lookup(self, key: TemplateKey) -> TemplateEntry:
+        cached = self._entries.get(key)
+        if cached is not None:
+            return cached
+        entry = self._lookup(key)
+        self._entries[key] = entry
+        return entry
+
+    def _lookup(self, key: TemplateKey) -> TemplateEntry:
         if key.toolchain != TOOLCHAIN:
             raise ValueError(f"no templates for toolchain {key.toolchain!r}")
         if key.dtypes != ("float32",):
@@ -1044,6 +1055,9 @@ def key_for_record(
     rec: Mapping, calibration_class: str = "", weight_dtype: str = ""
 ) -> TemplateKey:
     attrs = rec.get("attrs", {})
+    shapes = rec["shapes"]
+    if rec["op"] in bse.OPS and attrs.get("output_shape"):
+        shapes = [attrs["output_shape"]]
     keep: dict[str, Any] = {}
     if rec["op"] == "Transpose":
         keep["perm"] = tuple(attrs["perm"])
@@ -1056,7 +1070,7 @@ def key_for_record(
         keep["pads"] = tuple(attrs["pads"])
     return TemplateKey(
         op=rec["op"],
-        shapes=tuple(_tup(s) for s in rec["shapes"]),
+        shapes=tuple(_tup(s) for s in shapes),
         attrs=tuple(sorted(keep.items())),
         calibration_class=calibration_class,
         weight_dtype=weight_dtype,
@@ -1323,7 +1337,11 @@ def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
 
 
 def plan_at_calibration(
-    rec: Mapping, calib: Mapping, cache: TemplateCache | None = None
+    rec: Mapping,
+    calib: Mapping,
+    cache: TemplateCache | None = None,
+    *,
+    validate_live: bool = True,
 ) -> tuple[str, str]:
     """``plan_node`` with ``"conditional"`` settled against a real calibration
     (``step_calibration.calibrate``): ``"covered"`` when the node's predicted
@@ -1331,12 +1349,33 @@ def plan_at_calibration(
     ``recalibrate`` succeeds on the predicted scales), else ``"refused"``."""
     cache = cache or TemplateCache()
     status, detail = plan_node(rec, cache)
+    if (
+        status == "refused"
+        and rec.get("attrs", {}).get("form") == "broadcast"
+        and all(name in calib.get("tensors", {}) for name in rec.get("inputs", ())[:2])
+    ):
+        # A broadcast of live tensors can use the measured full-shape binary
+        # program after the smaller operand is expanded at the segment edge.
+        expanded = dict(rec)
+        expanded["shapes"] = [list(rec["shapes"][0])]
+        expanded["attrs"] = dict(rec.get("attrs", {}))
+        expanded["attrs"].update(
+            {"form": "same_shape", "output_shape": list(rec["shapes"][0])}
+        )
+        status, detail = plan_node(expanded, cache)
+        if status == "conditional":
+            rec = expanded
     if status != "conditional":
         return status, detail
     op, attrs = rec["op"], rec.get("attrs", {})
     try:
         live = mre.step_manifest()["nodes"].get(rec.get("name", ""))
         if live is not None and op in ("MatMul", "Gemm", "Conv"):
+            if not validate_live:
+                return "covered", (
+                    "matmul_record_emit.recalibrate deferred to segment emit "
+                    f"({live['template']})"
+                )
             return "covered", _at_calibration_matmul(rec, calib)
         key = attrs.get("misc_key")
         if key and (misc.load_index().get(key) or misc.equivalent_key(key)):
@@ -2535,7 +2574,17 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         or float(false_value.val) != 0.0
     ):
         raise ValueError("AX UOp Relu branches are not in the supported canonical form")
-    if position == "before":
+    standalone = (
+        position == "before"
+        and data.op is Ops.RESHAPE
+        and len(data.src) >= 1
+        and data.src[0].op is Ops.ALLOC
+    )
+    if standalone:
+        source = data
+        source_shape = tuple(int(dim) for dim in data.shape)
+        target_shape = source_shape
+    elif position == "before":
         if (
             data.op is not Ops.RESHAPE
             or len(data.src) < 1
@@ -2566,7 +2615,9 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
 
     shape_name = "uop_reshape_shape"
     nodes = (
-        [
+        [onnx.helper.make_node("Relu", ["x"], ["y"])]
+        if standalone
+        else [
             onnx.helper.make_node("Reshape", ["x", shape_name], ["reshaped"]),
             onnx.helper.make_node("Relu", ["reshaped"], ["y"]),
         ]
@@ -2576,16 +2627,21 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             onnx.helper.make_node("Reshape", ["relu", shape_name], ["y"]),
         ]
     )
+    initializers = (
+        []
+        if standalone
+        else [
+            onnx.numpy_helper.from_array(
+                np.asarray(target_shape, dtype=np.int64), shape_name
+            )
+        ]
+    )
     graph = onnx.helper.make_graph(
         nodes,
         "tinygrad_uop_ax",
         [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, source_shape)],
         [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, target_shape)],
-        [
-            onnx.numpy_helper.from_array(
-                np.asarray(target_shape, dtype=np.int64), shape_name
-            )
-        ],
+        initializers,
     )
     return onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
@@ -2717,11 +2773,38 @@ def compile_onnx(
     unsupported shapes and graph forms raise from :func:`compile_uop` rather
     than falling back to Pulsar2.
     """
-    return compile_uop(
-        onnx_to_uop(model_or_path),
-        schedule_path=schedule_path,
-        calibration=calibration,
-    )
+    root = onnx_to_uop(model_or_path)
+    if isinstance(model_or_path, onnx.ModelProto):
+        source_model = model_or_path
+    elif isinstance(model_or_path, (bytes, bytearray, memoryview)):
+        source_model = onnx.load_model_from_string(bytes(model_or_path))
+    else:
+        source_model = onnx.load(os.fspath(model_or_path), load_external_data=False)
+    # UOp intentionally represents Conv weights as runtime allocations, and a
+    # biased Conv is canonicalized as Conv + constant Add. For a frozen ONNX
+    # model, retain the source initializer so the validated ConvWeightEdit can
+    # encode it into the committed mcode template.
+    if (
+        len(source_model.graph.node) == 1
+        and source_model.graph.node[0].op_type == "Conv"
+        and len(source_model.graph.node[0].input) >= 2
+        and any(
+            init.name == source_model.graph.node[0].input[1]
+            for init in source_model.graph.initializer
+        )
+    ):
+        import graph_generator
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "frozen_conv.onnx")
+            output = os.path.join(directory, "frozen_conv.axmodel")
+            onnx.save(source_model, source)
+            graph_generator.generate(
+                source, output, schedule_path=schedule_path, calibration=calibration
+            )
+            with open(output, "rb") as stream:
+                return stream.read()
+    return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
 
 
 def apply_policy(
@@ -2895,6 +2978,28 @@ def tinygrad_classes() -> dict[str, type]:
             self.session = ax_session()
             self.model = self.session.load(self.obj)
 
+        @staticmethod
+        def _stage_input(buffer, spec):
+            """Shape or broadcast a tinygrad input to the emitted model IO.
+
+            Binary templates are emitted at the full output shape because the
+            AX mcode has no separate broadcast instruction.  A scalar (or
+            another smaller broadcastable input) can therefore arrive in a
+            tinygrad buffer with fewer elements than the template expects.
+            """
+            raw = np.frombuffer(buffer, np.uint8, count=memoryview(buffer).nbytes).view(
+                spec.dtype
+            )
+            expected = int(np.prod(spec.shape, dtype=np.int64))
+            if raw.size == expected:
+                return raw.reshape(spec.shape)
+            try:
+                return np.broadcast_to(raw, spec.shape).copy()
+            except ValueError as exc:
+                raise ValueError(
+                    f"input has {raw.size} elements, cannot broadcast to {spec.shape}"
+                ) from exc
+
         def __call__(
             self,
             *bufs,
@@ -2910,8 +3015,7 @@ def tinygrad_classes() -> dict[str, type]:
                     f"model has {n_out} outputs + {len(m.inputs)} inputs, got {len(bufs)} buffers"
                 )
             ins = [
-                np.frombuffer(b, np.uint8, count=spec.nbytes).view(spec.dtype)
-                for b, spec in zip(bufs[n_out:], m.inputs)
+                self._stage_input(b, spec) for b, spec in zip(bufs[n_out:], m.inputs)
             ]
             before = self.session.exec_us
             outs = self.session.run(m, ins)

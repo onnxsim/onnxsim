@@ -254,7 +254,7 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"covered": 528, "refused": 576}
+_EXPECTED_TOTALS = {"covered": 570, "refused": 534}
 _EXPECTED_PER_OP = {
     "Add": {"covered": 43, "refused": 101},
     "Conv": {"covered": 20},
@@ -263,7 +263,9 @@ _EXPECTED_PER_OP = {
     "Log": {"covered": 2},
     "MatMul": {"covered": 41},
     "MaxPool": {"covered": 1},
-    "Mul": {"covered": 19, "refused": 378},
+    # Live broadcast binary templates cover the 42 calibrated broadcast Muls
+    # that were previously refused by the standalone-shape check.
+    "Mul": {"covered": 61, "refused": 336},
     "ReduceMean": {"covered": 1},
     "Neg": {"covered": 2},
     "ReduceSum": {"covered": 44},

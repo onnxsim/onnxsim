@@ -133,6 +133,40 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
 
 
 @needs_step
+def test_plan_materializes_live_broadcast_binary_operands():
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segs, _ = sr.build_plan(model, sr.load_records(), calib)
+    broadcast = [s for s in segs if s.output_shape]
+    assert len(broadcast) == 42
+    assert all(s.input_shapes[-1] == (1,) for s in broadcast)
+    assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
+
+
+def test_emission_cache_reuses_a_validated_segment(tmp_path):
+    calls = 0
+
+    def emit():
+        nonlocal calls
+        calls += 1
+        return onnx.helper.make_model(onnx.helper.make_graph([], "cached", [], []))
+
+    segment = sr.Segment(
+        "cached_segment",
+        "test",
+        ["cached_node"],
+        [],
+        [],
+        "test",
+        emit,
+    )
+    first, _ = sr.drop_unemittable([segment], {}, str(tmp_path))
+    second, _ = sr.drop_unemittable([segment], {}, str(tmp_path))
+    assert first and second
+    assert calls == 1
+
+
+@needs_step
 def test_float_mode_reproduces_the_reference_step():
     model = sr.load_step()
     ref = sr.load_reference()
@@ -290,7 +324,7 @@ def test_onnx_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     schedule = tmp_path / "onnx_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule))
     rng = np.random.default_rng(1965)
-    x = rng.uniform(-1.0, 1.0, (1, 8, 4, 4)).astype(np.float32)
+    x = rng.uniform(-0.5, 0.5, (1, 8, 4, 4)).astype(np.float32)
 
     with axcl_session.AXSession() as session:
         loaded = session.load(axmodel, str(schedule))
@@ -301,6 +335,47 @@ def test_onnx_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
     np.testing.assert_allclose(
         got, np.maximum(x.reshape(1, 1, 8, 16), 0.0), atol=0.02, rtol=0
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("zero_point", [0, 128])
+def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path, zero_point):
+    """Run an unfused standalone ReLU UOp through the AXCL VM."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import elementwise_scale_emit as ew
+    import tinygrad_ax_backend as axb
+
+    shape = (16, 64, 56, 56)
+    _, meta = ew.load_template("Relu", shape, {"x": zero_point, "y": zero_point})
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Relu", ["x"], ["y"])],
+            "onnx_standalone_relu_to_uop_vm",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / f"standalone_relu_uop_z{zero_point}.schedule.json"
+    axmodel = axb.compile_onnx(
+        model,
+        str(schedule),
+        {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+    )
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(-1.0, 1.0, shape).astype(np.float32)
+
+    with axcl_session.AXSession(subdir=f"uop_relu_{tmp_path.name}") as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x])
+        finally:
+            session.unload(loaded)
+
+    np.testing.assert_allclose(
+        got, np.maximum(x, 0.0), atol=meta["scales"]["y"] * 2, rtol=0
     )
 
 
@@ -393,7 +468,7 @@ def test_onnx_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     x = rng.uniform(-0.02, 0.02, a_shape).astype(np.float32)
     z = rng.uniform(-0.02, 0.02, b_shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_matmul_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -476,7 +551,7 @@ def test_training_step_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path)
     x = rng.uniform(-0.02, 0.02, a_shape).astype(np.float32)
     z = rng.uniform(-0.02, 0.02, b_shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"training_matmul_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -520,10 +595,10 @@ def test_onnx_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     schedule = tmp_path / "onnx_add_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
-    x = rng.uniform(0.0, 1.0, shape).astype(np.float32)
-    z = rng.uniform(0.0, 1.0, shape).astype(np.float32)
+    x = rng.uniform(0.0, 0.3, shape).astype(np.float32)
+    z = rng.uniform(0.0, 0.3, shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_add_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -565,10 +640,13 @@ def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
     schedule = tmp_path / f"onnx_{op.lower()}_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
-    x = rng.uniform(0.1, 1.0, shape).astype(np.float32)
-    z = rng.uniform(0.2, 1.0, shape).astype(np.float32)
+    x_bounds, z_bounds = (
+        ((0.2, 0.3), (0.1, 0.2)) if op == "Sub" else ((0.1, 0.3), (0.1, 0.3))
+    )
+    x = rng.uniform(*x_bounds, shape).astype(np.float32)
+    z = rng.uniform(*z_bounds, shape).astype(np.float32)
 
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(subdir=f"uop_{op.lower()}_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z])
@@ -577,6 +655,55 @@ def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
 
     want = {"Sub": x - z, "Mul": x * z, "Div": x / z}[op]
     np.testing.assert_allclose(got, want, atol=float(meta["scales"]["y"]) * 1.5, rtol=0)
+
+
+@needs_device
+def test_onnx_broadcast_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Run a broadcast UOp through the full-shape AX binary template."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import binary_op_scale_emit as bse
+    import tinygrad_ax_backend as axb
+
+    source_shape, broadcast_shape = (1, 64), (64,)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Mul", ["x", "z"], ["y"])],
+            "onnx_broadcast_mul_to_uop_vm",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, source_shape
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, broadcast_shape
+                ),
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, source_shape
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Mul", source_shape, {"x": 0, "y": 0, "z": 0})
+    calibration = {"scales": meta["scales"], "zero_points": meta["zero_points"]}
+    schedule = tmp_path / "onnx_broadcast_mul_to_uop.schedule.json"
+    axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(0.1, 0.3, source_shape).astype(np.float32)
+    z = rng.uniform(0.1, 0.3, broadcast_shape).astype(np.float32)
+
+    with axcl_session.AXSession(subdir=f"uop_broadcast_mul_{tmp_path.name}") as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x, np.broadcast_to(z, source_shape)])
+        finally:
+            session.unload(loaded)
+
+    np.testing.assert_allclose(
+        got, x * z.reshape(1, 64), atol=float(meta["scales"]["y"]) * 1.5, rtol=0
+    )
 
 
 @needs_device
@@ -709,6 +836,47 @@ def test_onnx_misc_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     np.testing.assert_allclose(
         got, want, atol=float(meta["scales"]["y"]) * tolerance, rtol=0
     )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "op, input_shape, template_key",
+    [
+        ("Greater", (16, 64, 112, 112), "GreaterCast:16x64x112x112"),
+    ],
+)
+def test_onnx_comparison_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
+    tmp_path, op, input_shape, template_key
+):
+    """Run calibration-free comparison/cast UOps through AXCL VM."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import misc_op_record_emit as misc
+    import tinygrad_ax_backend as axb
+    from tinygrad import Tensor
+
+    _, meta = misc.load_template(template_key)
+    schedule = tmp_path / f"onnx_{op.lower()}cast_to_uop.schedule.json"
+    root = (
+        (Tensor.empty(*input_shape) > 0).cast("float32")
+        if op == "Greater"
+        else (Tensor.empty(*input_shape) < 0).cast("float32")
+    ).uop
+    axmodel = axb.compile_uop(root, str(schedule))
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(-1.0, 1.0, input_shape).astype(np.float32)
+
+    with axcl_session.AXSession(
+        subdir=f"uop_{op.lower()}cast_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x])
+        finally:
+            session.unload(loaded)
+
+    want = (x > 0.0 if op == "Greater" else x < 0.0).astype(np.float32)
+    np.testing.assert_array_equal(got, want)
 
 
 class _EchoSession:

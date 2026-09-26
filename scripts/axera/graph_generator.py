@@ -18,8 +18,10 @@ from collections.abc import Mapping, Sequence
 
 import binary_op_scale_emit
 import compose_emit
+import elementwise_scale_emit
 import matmul_record_emit
 import misc_op_record_emit
+import numpy as np
 import onnx
 import reshape_emit
 import transpose_real_shapes
@@ -113,6 +115,40 @@ def _retarget_schedule_names(
     schedule.update(retargeted)
 
 
+def _retarget_model_names(model: onnx.ModelProto, source: onnx.ModelProto) -> None:
+    """Retarget a measured template's public IO names to the source graph.
+
+    Emitters keep the names from their measured build (for example the FC
+    template uses ``distill__...`` names).  The mcode is independent of those
+    names, but an emitted ONNX model must still implement the source model's
+    input/output contract.  Only positional public IO names are changed;
+    extra side outputs exposed by a measured template remain untouched.
+    """
+    if len(model.graph.input) != len(source.graph.input) or len(
+        model.graph.output
+    ) != len(source.graph.output):
+        return
+    rename = {
+        new.name: old.name
+        for old, new in zip(source.graph.input, model.graph.input)
+        if old.name != new.name
+    }
+    rename.update(
+        {
+            new.name: old.name
+            for old, new in zip(source.graph.output, model.graph.output)
+            if old.name != new.name
+        }
+    )
+    if not rename:
+        return
+    for node in model.graph.node:
+        node.input[:] = [rename.get(name, name) for name in node.input]
+        node.output[:] = [rename.get(name, name) for name in node.output]
+    for value in (*model.graph.input, *model.graph.output, *model.graph.value_info):
+        value.name = rename.get(value.name, value.name)
+
+
 def _shape(value) -> tuple[int, ...]:
     return tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
 
@@ -183,6 +219,19 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                     position,
                 ),
             )
+        )
+    if len(nodes) == 1 and nodes[0].op_type == "Relu":
+        relu = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone Relu requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
+        if not shape or output_shape != shape or list(relu.input) != ["x"]:
+            raise ValueError("standalone Relu requires matching static x/y shapes")
+        return GraphPlan(
+            (GraphSegment("relu", ("x",), model.graph.output[0].name, shape, shape),)
         )
     if len(nodes) == 1 and nodes[0].op_type == "Transpose":
         transpose = nodes[0]
@@ -297,6 +346,59 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             (
                 GraphSegment(
                     "maxpool", ("x",), model.graph.output[0].name, shape, output_shape
+                ),
+            )
+        )
+    if len(nodes) == 1 and nodes[0].op_type == "Conv":
+        conv = nodes[0]
+        init = _initializer_map(model)
+        if len(model.graph.input) != 1 or model.graph.input[0].name != conv.input[0]:
+            raise ValueError("standalone Conv requires one runtime input named x")
+        if conv.input[1] not in init:
+            raise ValueError("standalone Conv requires a frozen weight initializer")
+        shape = values.get(conv.input[0], ())
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
+        weight_shape = tuple(int(d) for d in init[conv.input[1]].dims)
+        attrs = _attrs(conv)
+        strides = tuple(attrs.get("strides", (1, 1)))
+        pads = tuple(attrs.get("pads", (0, 0, 0, 0)))
+        dilations = tuple(attrs.get("dilations", (1, 1)))
+        if (
+            not shape
+            or not output_shape
+            or len(conv.input) not in (2, 3)
+            or (len(conv.input) == 3 and conv.input[2] not in init)
+            or attrs.get("group", 1) != 1
+            or dilations != (1, 1)
+        ):
+            raise ValueError("standalone Conv is not a validated frozen-weight form")
+        # Resolve the exact committed Conv template now, before generation.
+        # The emitter deliberately refuses every unmeasured shape/stride/pad.
+        from tinygrad_ax_backend import TemplateCache, TemplateKey
+
+        TemplateCache().lookup(
+            TemplateKey(
+                "Conv",
+                (tuple(shape),),
+                (
+                    ("pads", pads),
+                    ("strides", strides),
+                    ("w", weight_shape),
+                ),
+                weight_dtype="s8",
+            )
+        )
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "conv",
+                    (conv.input[0],),
+                    model.graph.output[0].name,
+                    tuple(shape),
+                    tuple(output_shape),
+                    operand_shape=weight_shape,
                 ),
             )
         )
@@ -428,14 +530,18 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             raise ValueError(
                 f"standalone {add.op_type} inputs must be the graph inputs"
             )
-        shape = values.get("x", ())
-        if not shape or values.get("z", ()) != shape:
+        input_shapes = (values.get("x", ()), values.get("z", ()))
+        if not all(input_shapes):
+            raise ValueError(f"standalone {add.op_type} requires static input shapes")
+        try:
+            shape = tuple(np.broadcast_shapes(*input_shapes))
+        except ValueError as exc:
             raise ValueError(
-                f"standalone {add.op_type} requires equal static input shapes"
-            )
+                f"standalone {add.op_type} inputs are not broadcast-compatible"
+            ) from exc
         if not model.graph.output or values.get(model.graph.output[0].name) != shape:
             raise ValueError(
-                f"standalone {add.op_type} output shape must match its inputs"
+                f"standalone {add.op_type} output shape must match its broadcast shape"
             )
         return GraphPlan(
             (
@@ -533,7 +639,19 @@ def generate(
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule.to_json(), stream, indent=2, sort_keys=True)
             stream.write("\n")
-    if plan.chain == "reshape_relu":
+    if plan.chain == "relu":
+        if calibration is None:
+            raise ValueError("standalone Relu generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError(
+                "Relu calibration requires scales and zero_points mappings"
+            )
+        elementwise_scale_emit.emit(
+            "Relu", plan.segments[0].input_shape, scales, zero_points, output_path
+        )
+    elif plan.chain == "reshape_relu":
         segment = plan.segments[0]
         reshape_emit.emit_fused_reshape_axmodel(
             segment.input_shape,
@@ -639,6 +757,49 @@ def generate(
             zero_points=zero_points,
         )
         onnx.save(model, output_path)
+    elif plan.chain == "conv":
+        if calibration is None:
+            raise ValueError("standalone Conv generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError(
+                "Conv calibration requires scales and zero_points mappings"
+            )
+        import tinygrad_ax_backend as axb
+
+        node = model.graph.node[0]
+        init = _initializer_map(model)
+        weights = numpy_helper.to_array(init[node.input[1]]).astype(np.float32)
+        bias = (
+            numpy_helper.to_array(init[node.input[2]]).astype(np.float32)
+            if len(node.input) == 3
+            else np.zeros(weights.shape[0], dtype=np.float32)
+        )
+        attrs = _attrs(node)
+        key = axb.TemplateKey(
+            "Conv",
+            (plan.segments[0].input_shape,),
+            (
+                ("pads", tuple(attrs.get("pads", (0, 0, 0, 0)))),
+                ("strides", tuple(attrs.get("strides", (1, 1)))),
+                ("w", tuple(weights.shape)),
+            ),
+            weight_dtype="s8",
+        )
+        generated = axb.EditSet(
+            [
+                axb.ConvWeightEdit(
+                    weights,
+                    bias,
+                    float(scales["x"]),
+                    float(zero_points["x"]),
+                    float(scales["y"]),
+                    float(zero_points["y"]),
+                )
+            ]
+        ).build(key)
+        onnx.save(generated, output_path)
     elif plan.chain in ("greatercast", "lesscast"):
         model = misc_op_record_emit.emit_spec(
             plan.chain.title().replace("cast", "Cast"),
@@ -701,13 +862,17 @@ def generate(
         compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
     if not os.path.exists(output_path):
         raise RuntimeError(f"generator did not produce {output_path}")
+    emitted = onnx.load(output_path, load_external_data=False)
+    source = onnx.load(source_path, load_external_data=False)
+    _retarget_model_names(emitted, source)
+    onnx.save(emitted, output_path)
     if schedule_path is not None:
         with open(schedule_path, encoding="utf-8") as stream:
             schedule = json.load(stream)
         _retarget_schedule_names(
             schedule,
-            onnx.load(output_path, load_external_data=False),
-            onnx.load(source_path, load_external_data=False),
+            emitted,
+            source,
         )
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule, stream, indent=2, sort_keys=True)
