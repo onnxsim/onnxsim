@@ -47,7 +47,7 @@ env:
   #
   # This replaces the stacked #1/#3/#4/#6/#7/#8/#9 PRs, which never had CI of their own (the fork had no
   # registered workflows at all). #8 and #9 had diverged rather than stacked, so neither contained the other.
-  TINYGRAD_SHA: bc30c0bdb7a0c730fcb865ef2826380ae03dd162
+  TINYGRAD_SHA: bc0b9c3722d16138ad7f598c04c2a5770036eb04
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 
