@@ -7,7 +7,9 @@ on:
       - "onnxsim/profiler.*"
       - "tools/onnx-remote/**"
       - "scripts/qualcomm/**"
+      - "scripts/nvidia/trt_compile.py"
       - "tests/test_qnn_compat_cli.py"
+      - "tests/test_trt_compile_cli.py"
       - "docs/remote-manifest.md"
       - ".github/workflows/remote-executor.yml"
   push:
@@ -17,7 +19,9 @@ on:
       - "onnxsim/profiler.*"
       - "tools/onnx-remote/**"
       - "scripts/qualcomm/**"
+      - "scripts/nvidia/trt_compile.py"
       - "tests/test_qnn_compat_cli.py"
+      - "tests/test_trt_compile_cli.py"
       - "docs/remote-manifest.md"
       - ".github/workflows/remote-executor.yml"
 
@@ -74,4 +78,4 @@ jobs:
       - name: Install test dependency
         run: python -m pip install pytest
       - name: Run dependency-light tests
-        run: python -m pytest -q tests/test_qnn_compat_cli.py
+        run: python -m pytest -q tests/test_qnn_compat_cli.py tests/test_trt_compile_cli.py

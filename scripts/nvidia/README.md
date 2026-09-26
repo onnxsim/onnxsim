@@ -7,6 +7,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 |---|---|---|
 | `qdq_pairs.py` | onnxsim (Python >= 3.11) | writes `<name>.orig.onnx` / `<name>.sim.onnx` pairs |
 | `trt_harness.py` | system Python with `tensorrt` | builds engines, dumps per-layer tactic/precision, times inference, compares orig vs sim outputs |
+| `trt_compile.py` | system Python with `tensorrt` | external compiler-service adapter; writes a serialized engine and profiling manifest |
 | `modelopt_pipeline.py` | onnxsim + `nvidia-modelopt[onnx]` | fixes batch, runs `simplify()` and ModelOpt INT8 quantization on a real model, with an un-simplified control |
 | `bench_trtexec.py` | any (stdlib) | builds/times every variant with `trtexec` and prints a table |
 | `imagenette_data.py` | any with Pillow | preprocesses Imagenette (real ImageNet images, 10 classes) into val + calibration `.npy` sets |
@@ -26,6 +27,7 @@ needs Python >= 3.11; models are exchanged as `.onnx` files.
 python3.12 scripts/nvidia/qdq_pairs.py /tmp/pairs                      # onnxsim venv
 python3.10 scripts/nvidia/trt_harness.py compare /tmp/pairs --int8 --fp16   # tensorrt venv
 python3.10 scripts/nvidia/trt_harness.py build model.onnx --int8            # per-layer detail
+python3.10 scripts/nvidia/trt_harness.py profile model.engine --json       # runtime latency record
 ```
 
 The TensorRT venv needs `onnx` and `numpy<2` (`uv venv --system-site-packages` picks up

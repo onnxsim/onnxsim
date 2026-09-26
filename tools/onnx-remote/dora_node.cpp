@@ -32,16 +32,25 @@ uint16_t env_port() {
   return port > 0 && port <= 65535 ? static_cast<uint16_t>(port) : 39501;
 }
 
+int env_timeout(const char* name, int fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return fallback;
+  const long timeout = std::strtol(value, nullptr, 10);
+  return timeout > 0 && timeout <= 3600000 ? static_cast<int>(timeout) : fallback;
+}
+
 bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
              std::string& error) {
   Request request;
   if (!decode_request_payload(data, size, request, error)) return false;
-  const int fd = connect_tcp(env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1"),
-                             env_port());
+  const int fd = connect_tcp_timeout(
+      env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1"), env_port(),
+      env_timeout("ONNXSIM_DORA_CONNECT_TIMEOUT_MS", 2000));
   if (fd < 0) {
     error = "DORA adapter: remote worker connection failed";
     return false;
   }
+  set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0));
   Response response;
   const bool sent = send_request(fd, request, error);
   const bool received = sent && receive_response(fd, response, error);
@@ -70,6 +79,17 @@ int main() {
   if (context == nullptr) {
     std::cerr << "failed to initialize DORA context\n";
     return 1;
+  }
+
+  if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
+    const char status[] = "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v3\"}";
+    const char capabilities[] =
+        "{\"schema_version\":1,\"payload\":\"binary-uint8\","
+        "\"operations\":[\"run\",\"compile\",\"load_compiled\","
+        "\"run_compiled\"]}";
+    dora_send_output(context, "status", 6, status, sizeof(status) - 1);
+    dora_send_output(context, "capabilities", 12, capabilities,
+                     sizeof(capabilities) - 1);
   }
 
   for (;;) {

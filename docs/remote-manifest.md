@@ -16,6 +16,11 @@ emit a UTF-8 JSON document with the following stable top-level contract:
 }
 ```
 
+For TensorRT, the reference adapter uses `artifact.format` equal to
+`tensorrt-engine` and includes a `profiling` object with engine build time,
+layer count, selected tactics, and TensorRT's detailed layer metadata. This is
+compile-time profiling; runtime latency remains a runner-side measurement.
+
 The compiler owns the meaning of `artifact.format` and `artifact.abi`. A
 runner must reject an artifact when its compiler ID, target backend/device,
 runtime ABI, or required I/O contract does not match. `capabilities.ops` and

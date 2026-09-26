@@ -5,6 +5,7 @@ include(CTest)
 
 option(ONNX_REMOTE_AXCL "Build the AXCL-backed remote worker" OFF)
 option(ONNXSIM_REMOTE_DORA "Build the DORA node adapter" OFF)
+option(ONNXSIM_REMOTE_ROS2 "Build the optional ROS2 binary bridge" OFF)
 set(DORA_NODE_API_INCLUDE_DIR "" CACHE PATH
     "DORA C node API include directory (contains node_api.h)")
 set(DORA_NODE_API_LIBRARY "" CACHE FILEPATH
@@ -69,4 +70,14 @@ if (ONNXSIM_REMOTE_DORA)
   if (UNIX AND NOT APPLE)
     target_link_libraries(onnx-remote-dora-node PRIVATE dl m rt pthread)
   endif()
+endif()
+
+if (ONNXSIM_REMOTE_ROS2)
+  find_package(ament_cmake REQUIRED)
+  find_package(rclcpp REQUIRED)
+  find_package(std_msgs REQUIRED)
+  find_package(std_srvs REQUIRED)
+  add_executable(onnx-remote-ros2-bridge ros2_bridge.cpp)
+  target_link_libraries(onnx-remote-ros2-bridge PRIVATE onnx_remote_transport)
+  ament_target_dependencies(onnx-remote-ros2-bridge rclcpp std_msgs std_srvs)
 endif()

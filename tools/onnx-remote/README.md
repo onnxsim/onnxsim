@@ -92,6 +92,33 @@ supported subgraph and send it as an operation/model handle over this
 transport.  The reference worker deliberately does not pretend to be that EP
 yet.
 
+Set `ONNXSIM_DORA_ANNOUNCE=1` and declare optional `status` and `capabilities`
+outputs to publish readiness and the binary protocol capability document. The
+adapter also accepts `ONNXSIM_DORA_CONNECT_TIMEOUT_MS` and
+`ONNXSIM_DORA_IO_TIMEOUT_MS` for unreliable links.
+
+## ROS2 bridge
+
+The optional `onnx-remote-ros2-bridge` uses ROS2 only for discovery and control:
+`run` and `result` are `std_msgs/UInt8MultiArray`, while `health` and
+`capabilities` are `std_srvs/Trigger` services. The UInt8 payload is exactly
+the DORA/native payload format, so a ROS2 graph, DORA graph, or direct TCP
+client can share the same worker.
+
+Build inside a sourced ROS2 workspace:
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote \
+  -DONNXSIM_REMOTE_ROS2=ON
+cmake --build build/onnx-remote --target onnx-remote-ros2-bridge
+build/onnx-remote/onnx-remote-ros2-bridge \
+  --ros-args -p remote_host:=runner.local -p remote_port:=39501
+```
+
+The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
+tensor and profile data remain binary rather than being converted to ROS
+messages.
+
 `onnx-remote-mock-runner` and `onnx-remote-attach-test` provide a vendor-free
 test of the compiled-artifact handshake. The mock stores opaque artifact bytes
 on `load_compiled`, accepts ID-only `run_compiled`, and returns identity output
@@ -162,6 +189,27 @@ command, while keeping those SDK-version-specific details out of onnxsim.
 The repository's `scripts/qualcomm/qnn_compile.py` adapter uses the
 `onnxruntime-qnn` plugin to generate an embedded QNN EP-context ONNX artifact;
 set `QNN_BACKEND_PATH` or let the package select its bundled HTP backend.
+
+TensorRT can use the same compiler service contract on an NVIDIA/Jetson compile
+host. The adapter records TensorRT's detailed engine-inspector layer and tactic
+metadata in the manifest, while the serialized engine is the artifact sent to a
+TensorRT-capable runner:
+
+```sh
+build/onnx-remote/onnx-remote-compiler \
+  --port 39503 --target tensorrt-cuda --compiler-id tensorrt-10 \
+  --cache-dir /var/cache/onnxsim-tensorrt \
+  --command 'python3 scripts/nvidia/trt_compile.py --input {input} \
+             --output {output} --manifest {manifest} --target {target} \
+             --fp16'
+```
+
+The TensorRT Python environment must provide `tensorrt`, `onnx`, NumPy, and the
+CUDA runtime. `scripts/nvidia/trt_harness.py` remains the reference runner and
+reports mean execution time; its engine inspector data is also retained in the
+compiled manifest for remote profiling. TensorRT engine blobs are generally
+specific to the TensorRT/CUDA/GPU combination, so the runner should validate the
+compiler ID, target, and driver/runtime ABI before loading a cache hit.
 
 ## AXCL worker
 
