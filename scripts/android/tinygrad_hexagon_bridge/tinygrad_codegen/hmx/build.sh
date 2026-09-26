@@ -5,11 +5,18 @@ set -euo pipefail
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}" "${TINYGRAD:?}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
 PY="${PY:-python3}"; HEX_ARCH=v69
-SRC="$(cd "$(dirname "$0")" && pwd)"; HMX_GEMM="$SRC/../../../hmx_gemm"
+SRC="$(cd "$(dirname "$0")" && pwd)"
+# hmx_runtime.h moved to the tinygrad fork (test/external/dsp/hand/hmx/), where it sits next to the
+# kernels that need it. It used to be read from scripts/android/hmx_gemm/, which no longer has it
+# since the hand-kernel consolidation (#1978). TINYGRAD is that checkout; fall back to the other
+# build.sh siblings' convention if it is unset.
+HMX_RT="$TINYGRAD/test/external/dsp/hand/hmx/hmx_runtime.h"
+[ -f "$HMX_RT" ] || HMX_RT="$SRC/../../../hmx_gemm/hmx_runtime.h"
+[ -f "$HMX_RT" ] || { echo "cannot find hmx_runtime.h (looked in $HMX_RT); see HEXAGON_SDK.md" >&2; exit 1; }
 OUT="${OUT:-$SRC/build}"; mkdir -p "$OUT"
 HMX=1 DEV=DSP MOCKDSP=1 TC=1 TC_OPT=1 HVX_ARCH=v69 CC="${CC:-clang-19}" PYTHONPATH="$TINYGRAD" "$PY" "$SRC/gen_kernel.py" "$1" "$2" "$3" "$OUT" "${@:4}"
 cd "$OUT"
-cp "$SRC"/tg_hmx_rpc.idl "$SRC"/tg_hmx_impl.c "$SRC"/tg_hmx_client.c "$HMX_GEMM"/hmx_runtime.h .
+cp "$SRC"/tg_hmx_rpc.idl "$SRC"/tg_hmx_impl.c "$SRC"/tg_hmx_client.c "$HMX_RT" .
 "$HEXAGON_SDK_ROOT/ipc/fastrpc/qaic/Ubuntu/qaic" -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" tg_hmx_rpc.idl
 INC=(-I . -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef")
 QURT_INC=(-I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/qurt" -I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/posix")
