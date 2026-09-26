@@ -6,8 +6,6 @@
 // dataflow/discovery lifecycle; the existing TCP worker remains responsible
 // for model execution and accelerator-specific profiling.
 
-#include "remote_transport.h"
-
 #include <node_api.h>
 
 #include <cstdlib>
@@ -15,6 +13,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include "remote_transport.h"
 
 using namespace onnx_remote;
 
@@ -36,13 +36,15 @@ int env_timeout(const char* name, int fallback) {
   const char* value = std::getenv(name);
   if (value == nullptr || *value == '\0') return fallback;
   const long timeout = std::strtol(value, nullptr, 10);
-  return timeout > 0 && timeout <= 3600000 ? static_cast<int>(timeout) : fallback;
+  return timeout > 0 && timeout <= 3600000 ? static_cast<int>(timeout)
+                                           : fallback;
 }
 
 bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
-             std::string& error) {
+             uint64_t& request_id, std::string& error) {
   Request request;
   if (!decode_request_payload(data, size, request, error)) return false;
+  request_id = request.request_id;
   const int fd = connect_tcp_timeout(
       env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1"), env_port(),
       env_timeout("ONNXSIM_DORA_CONNECT_TIMEOUT_MS", 2000));
@@ -59,15 +61,18 @@ bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
   return encode_response_payload(response, result, error);
 }
 
-void report_error(void* context, const std::string& error) {
+void report_error(void* context, const std::string& error,
+                  uint64_t request_id = 0) {
   dora_log(context, "error", 5, error.data(), error.size());
   Response response;
   response.ok = false;
+  response.request_id = request_id;
   response.error = error;
   std::vector<uint8_t> payload;
   std::string encode_error;
   if (encode_response_payload(response, payload, encode_error)) {
-    dora_send_output(context, "result", 6, reinterpret_cast<const char*>(payload.data()),
+    dora_send_output(context, "result", 6,
+                     reinterpret_cast<const char*>(payload.data()),
                      payload.size());
   }
 }
@@ -82,7 +87,11 @@ int main() {
   }
 
   if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
-    const char status[] = "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v5\",\"tensor_dtypes\":[\"float32\",\"float16\",\"bfloat16\",\"int8\",\"uint8\",\"int16\",\"uint16\",\"int32\",\"int64\",\"uint32\",\"uint64\",\"double\",\"bool\"]}";
+    const char status[] =
+        "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v5\",\"tensor_"
+        "dtypes\":[\"float32\",\"float16\",\"bfloat16\",\"int8\",\"uint8\","
+        "\"int16\",\"uint16\",\"int32\",\"int64\",\"uint32\",\"uint64\","
+        "\"double\",\"bool\"]}";
     const char capabilities[] =
         "{\"schema_version\":1,\"payload\":\"binary-uint8\","
         "\"operations\":[\"run\",\"compile\",\"load_compiled\","
@@ -111,18 +120,24 @@ int main() {
     size_t data_len = 0;
     read_dora_input_id(event, &id, &id_len);
     read_dora_input_data(event, &data, &data_len);
-    const bool is_run = id != nullptr && id_len == 3 && std::memcmp(id, "run", 3) == 0;
+    const bool is_run =
+        id != nullptr && id_len == 3 && std::memcmp(id, "run", 3) == 0;
     if (is_run && data != nullptr) {
       std::vector<uint8_t> result;
+      uint64_t request_id = 0;
       std::string error;
-      if (forward(reinterpret_cast<const uint8_t*>(data), data_len, result, error)) {
+      if (forward(reinterpret_cast<const uint8_t*>(data), data_len, result,
+                  request_id, error)) {
         if (dora_send_output(context, "result", 6,
                              reinterpret_cast<const char*>(result.data()),
                              result.size()) != 0) {
-          report_error(context, "DORA adapter: result output failed");
+          report_error(context, "DORA adapter: result output failed",
+                       request_id);
         }
       } else {
-        report_error(context, error.empty() ? "DORA adapter: request failed" : error);
+        report_error(context,
+                     error.empty() ? "DORA adapter: request failed" : error,
+                     request_id);
       }
     }
     free_dora_event(event);

@@ -1,18 +1,17 @@
 // Optional ROS2 control-plane bridge for the dependency-free ONNX transport.
 // Tensor/profile payloads stay binary UInt8 messages; ROS2 only supplies
 // discovery, health, and capability services.
-#include "remote_transport.h"
-
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
-
-#include <algorithm>
-#include <chrono>
-#include <cstdlib>
 #include <string>
 #include <vector>
+
+#include "remote_transport.h"
 
 using namespace std::chrono_literals;
 using UInt8MultiArray = std_msgs::msg::UInt8MultiArray;
@@ -20,7 +19,7 @@ using String = std_msgs::msg::String;
 using Trigger = std_srvs::srv::Trigger;
 
 class OnnxRemoteBridge final : public rclcpp::Node {
-public:
+ public:
   OnnxRemoteBridge() : Node("onnx_remote_bridge") {
     host_ = declare_parameter<std::string>("remote_host", "127.0.0.1");
     port_ = declare_parameter<int>("remote_port", 39501);
@@ -33,7 +32,8 @@ public:
                                                       "onnx_remote/runners");
     discovery_target_ = declare_parameter<std::string>("discovery_target", "");
     announce_period_ms_ = declare_parameter<int>("announce_period_ms", 5000);
-    discovery_timeout_ms_ = declare_parameter<int>("discovery_timeout_ms", 15000);
+    discovery_timeout_ms_ =
+        declare_parameter<int>("discovery_timeout_ms", 15000);
     advertise_host_ = declare_parameter<std::string>("advertise_host", host_);
     runner_id_ = declare_parameter<std::string>("runner_id", get_name());
     result_ = create_publisher<UInt8MultiArray>("result", rclcpp::QoS(10));
@@ -76,13 +76,12 @@ public:
     });
   }
 
-private:
-  static std::string json_string(const std::string &json,
-                                 const std::string &key) {
+ private:
+  static std::string json_string(const std::string& json,
+                                 const std::string& key) {
     const std::string marker = "\"" + key + "\":\"";
     const size_t start = json.find(marker);
-    if (start == std::string::npos)
-      return {};
+    if (start == std::string::npos) return {};
     const size_t value_start = start + marker.size();
     const size_t end = json.find('"', value_start);
     return end == std::string::npos
@@ -90,11 +89,10 @@ private:
                : json.substr(value_start, end - value_start);
   }
 
-  static int json_int(const std::string &json, const std::string &key) {
+  static int json_int(const std::string& json, const std::string& key) {
     const std::string marker = "\"" + key + "\":";
     const size_t start = json.find(marker);
-    if (start == std::string::npos)
-      return 0;
+    if (start == std::string::npos) return 0;
     const size_t value_start = start + marker.size();
     return std::atoi(json.c_str() + value_start);
   }
@@ -110,19 +108,15 @@ private:
     discovery_->publish(std::move(message));
   }
 
-  void discover(const String::SharedPtr &message) {
-    if (!auto_discover_)
-      return;
+  void discover(const String::SharedPtr& message) {
+    if (!auto_discover_) return;
     const std::string id = json_string(message->data, "runner_id");
-    if (id.empty() || id == runner_id_)
-      return;
+    if (id.empty() || id == runner_id_) return;
     const std::string target = json_string(message->data, "target");
-    if (!discovery_target_.empty() && target != discovery_target_)
-      return;
+    if (!discovery_target_.empty() && target != discovery_target_) return;
     const std::string host = json_string(message->data, "host");
     const int port = json_int(message->data, "port");
-    if (host.empty() || port <= 0 || port > 65535)
-      return;
+    if (host.empty() || port <= 0 || port > 65535) return;
     host_ = host;
     port_ = port;
     last_discovery_ = std::chrono::steady_clock::now();
@@ -132,12 +126,10 @@ private:
   }
 
   void expire_discovery() {
-    if (!auto_discover_ || !discovered_ || discovery_timeout_ms_ <= 0)
-      return;
+    if (!auto_discover_ || !discovered_ || discovery_timeout_ms_ <= 0) return;
     const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - last_discovery_);
-    if (age.count() <= discovery_timeout_ms_)
-      return;
+    if (age.count() <= discovery_timeout_ms_) return;
     RCLCPP_WARN(get_logger(), "discovered runner expired after %ld ms",
                 static_cast<long>(age.count()));
     host_ = configured_host_;
@@ -145,7 +137,7 @@ private:
     discovered_ = false;
   }
 
-  void forward(const UInt8MultiArray::SharedPtr &message) {
+  void forward(const UInt8MultiArray::SharedPtr& message) {
     onnx_remote::Request request;
     std::string error;
     if (!onnx_remote::decode_request_payload(
@@ -156,7 +148,8 @@ private:
     const int fd = onnx_remote::connect_tcp_timeout(
         host_, static_cast<uint16_t>(port_), connect_timeout_ms_);
     if (fd < 0) {
-      publish_error("ROS2 bridge: remote worker connection failed");
+      publish_error("ROS2 bridge: remote worker connection failed",
+                    request.request_id);
       return;
     }
     onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_);
@@ -166,7 +159,8 @@ private:
         sent && onnx_remote::receive_response(fd, response, error);
     onnx_remote::close_socket(fd);
     if (!received) {
-      publish_error(error.empty() ? "remote worker request failed" : error);
+      publish_error(error.empty() ? "remote worker request failed" : error,
+                    request.request_id);
       return;
     }
     std::vector<uint8_t> payload;
@@ -179,8 +173,9 @@ private:
     result_->publish(std::move(output));
   }
 
-  void publish_error(const std::string &error) {
+  void publish_error(const std::string& error, uint64_t request_id = 0) {
     onnx_remote::Response response;
+    response.request_id = request_id;
     response.error = error;
     std::vector<uint8_t> payload;
     std::string encode_error;
@@ -218,7 +213,7 @@ private:
   rclcpp::Service<Trigger>::SharedPtr capabilities_;
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<OnnxRemoteBridge>());
   rclcpp::shutdown();
