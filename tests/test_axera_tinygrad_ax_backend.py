@@ -1171,6 +1171,18 @@ def test_tinygrad_compiler_seam():
     src = axb.build_request(_gather_key(), [axb.GatherIndexEdit(list(range(8)))])
     out = classes["AXCompiler"]().compile_cached(src)
     assert out == axb.compile_request(src)
+
+
+def test_ax_program_stages_scalar_broadcast_input():
+    pytest.importorskip("tinygrad")
+    classes = axb.tinygrad_classes()
+    spec = dataclasses.make_dataclass("Spec", [("shape", tuple), ("dtype", object)])(
+        (1, 64), np.dtype(np.float32)
+    )
+    scalar = np.array([2.0], dtype=np.float32)
+    got = classes["AXProgram"]._stage_input(scalar, spec)
+    assert got.shape == (1, 64)
+    assert np.all(got == 2.0)
     pytest.importorskip("tinygrad")
     from tinygrad.device import Allocator, Program
 

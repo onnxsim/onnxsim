@@ -2951,6 +2951,28 @@ def tinygrad_classes() -> dict[str, type]:
             self.session = ax_session()
             self.model = self.session.load(self.obj)
 
+        @staticmethod
+        def _stage_input(buffer, spec):
+            """Shape or broadcast a tinygrad input to the emitted model IO.
+
+            Binary templates are emitted at the full output shape because the
+            AX mcode has no separate broadcast instruction.  A scalar (or
+            another smaller broadcastable input) can therefore arrive in a
+            tinygrad buffer with fewer elements than the template expects.
+            """
+            raw = np.frombuffer(
+                buffer, np.uint8, count=memoryview(buffer).nbytes
+            ).view(spec.dtype)
+            expected = int(np.prod(spec.shape, dtype=np.int64))
+            if raw.size == expected:
+                return raw.reshape(spec.shape)
+            try:
+                return np.broadcast_to(raw, spec.shape).copy()
+            except ValueError as exc:
+                raise ValueError(
+                    f"input has {raw.size} elements, cannot broadcast to {spec.shape}"
+                ) from exc
+
         def __call__(
             self,
             *bufs,
@@ -2965,10 +2987,7 @@ def tinygrad_classes() -> dict[str, type]:
                 raise ValueError(
                     f"model has {n_out} outputs + {len(m.inputs)} inputs, got {len(bufs)} buffers"
                 )
-            ins = [
-                np.frombuffer(b, np.uint8, count=spec.nbytes).view(spec.dtype)
-                for b, spec in zip(bufs[n_out:], m.inputs)
-            ]
+            ins = [self._stage_input(b, spec) for b, spec in zip(bufs[n_out:], m.inputs)]
             before = self.session.exec_us
             outs = self.session.run(m, ins)
             for b, y in zip(bufs[:n_out], outs):
