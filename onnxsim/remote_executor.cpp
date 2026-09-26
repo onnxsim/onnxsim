@@ -2,6 +2,7 @@
 
 #ifdef ONNXSIM_BUILTIN_REMOTE_EXECUTOR
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -71,7 +72,27 @@ class RemoteModelExecutor final : public ModelExecutor {
   std::vector<DLManagedTensorPtr> Run(
       const onnx::ModelProto& model,
       const std::vector<const DLManagedTensor*>& inputs) const override {
-    const std::string serialized = model.SerializeAsString();
+    onnx::ModelProto prepared = model;
+    const std::string target = options_.target;
+    std::string legalize_error;
+    if (options_.legalizer &&
+        !options_.legalizer(prepared, target, legalize_error)) {
+      throw std::runtime_error("remote executor legalization: " +
+                               legalize_error);
+    }
+    if (!options_.supported_ops.empty()) {
+      for (const auto& node : prepared.graph().node()) {
+        if (std::find(options_.supported_ops.begin(),
+                      options_.supported_ops.end(),
+                      node.op_type()) == options_.supported_ops.end()) {
+          throw std::runtime_error(
+              "remote executor unsupported op after "
+              "legalization: " +
+              node.op_type());
+        }
+      }
+    }
+    const std::string serialized = prepared.SerializeAsString();
     onnx_remote::Request request;
     request.profiling = options_.profiling;
     if (options_.compile_model) {
@@ -107,7 +128,7 @@ class RemoteModelExecutor final : public ModelExecutor {
     }
 
     const onnx_remote::Response response =
-        Exchange(request, options_.host, options_.port);
+        Exchange(request, options_.host, options_.port, "execute");
     std::vector<DLManagedTensorPtr> outputs;
     outputs.reserve(response.outputs.size());
     for (auto& output : response.outputs) {
@@ -127,7 +148,8 @@ class RemoteModelExecutor final : public ModelExecutor {
   };
 
   onnx_remote::Response Exchange(const onnx_remote::Request& request,
-                                 const std::string& host, uint16_t port) const {
+                                 const std::string& host, uint16_t port,
+                                 const char* phase) const {
     auto& profiler = onnxsim::Profiler::Instance();
     const bool collect_profile =
         profiler.enabled() &&
@@ -151,17 +173,18 @@ class RemoteModelExecutor final : public ModelExecutor {
     onnx_remote::close_socket(fd);
     if (collect_profile) {
       profiler.RecordExternalEvent(
-          "RemoteRPC", "remote_transport", rpc_start,
+          std::string("RemoteRPC/") + phase, "remote_transport", rpc_start,
           rpc_end >= rpc_start ? rpc_end - rpc_start : 0,
           "{\"host\":\"" + JsonEscape(host) +
-              "\",\"port\":" + std::to_string(port) + "}");
+              "\",\"port\":" + std::to_string(port) + ",\"phase\":\"" +
+              JsonEscape(phase) + "\"}");
       for (const auto& event : response.profile) {
         profiler.RecordExternalEvent(
             event.name, event.category, profile_anchor + event.start_us,
             event.duration_us,
-            "{\"detail\":\"" + JsonEscape(event.detail) +
-                "\",\"remote_start_us\":" + std::to_string(event.start_us) +
-                "}");
+            "{\"detail\":\"" + JsonEscape(event.detail) + "\",\"phase\":\"" +
+                JsonEscape(phase) + "\",\"remote_start_us\":" +
+                std::to_string(event.start_us) + "}");
       }
     }
     if (!received || !response.ok) {
@@ -188,7 +211,13 @@ class RemoteModelExecutor final : public ModelExecutor {
     const uint16_t compile_port =
         options_.compile_port == 0 ? options_.port : options_.compile_port;
     const onnx_remote::Response response =
-        Exchange(request, compile_host, compile_port);
+        Exchange(request, compile_host, compile_port, "compile");
+    std::string manifest_error;
+    if (options_.manifest_validator &&
+        !options_.manifest_validator(response.manifest, manifest_error)) {
+      throw std::runtime_error("remote executor manifest validation: " +
+                               manifest_error);
+    }
     if (response.artifact_id.empty() && response.artifact.empty()) {
       throw std::runtime_error(
           "remote compiler returned neither artifact_id nor artifact bytes");
@@ -203,6 +232,15 @@ class RemoteModelExecutor final : public ModelExecutor {
       artifact->id =
           "inline:" + std::to_string(std::hash<std::string>{}(serialized));
     }
+    if (auto& profiler = onnxsim::Profiler::Instance();
+        profiler.enabled() &&
+        options_.profiling != onnx_remote::ProfilingLevel::Off) {
+      profiler.RecordExternalEvent(
+          "RemoteArtifactReady", "remote_compile", profiler.ElapsedMicros(), 0,
+          "{\"artifact_id\":\"" + JsonEscape(artifact->id) + "\",\"bytes\":" +
+              std::to_string(artifact->bytes.size()) + ",\"manifest_bytes\":" +
+              std::to_string(artifact->manifest.size()) + "}");
+    }
     if (options_.attach_compiled_artifact) {
       onnx_remote::Request load;
       load.op = options_.load_compiled_operation;
@@ -211,7 +249,16 @@ class RemoteModelExecutor final : public ModelExecutor {
       load.profiling = options_.profiling;
       const std::string runner_host = options_.host;
       const uint16_t runner_port = options_.port;
-      Exchange(load, runner_host, runner_port);
+      Exchange(load, runner_host, runner_port, "load");
+      if (auto& profiler = onnxsim::Profiler::Instance();
+          profiler.enabled() &&
+          options_.profiling != onnx_remote::ProfilingLevel::Off) {
+        profiler.RecordExternalEvent(
+            "RemoteArtifactAttached", "remote_compile",
+            profiler.ElapsedMicros(), 0,
+            "{\"artifact_id\":\"" + JsonEscape(artifact->id) +
+                "\",\"bytes\":" + std::to_string(artifact->bytes.size()) + "}");
+      }
       artifact->bytes.clear();
     }
     // Publish only after an optional attach succeeds. If the runner rejects

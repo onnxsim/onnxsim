@@ -128,8 +128,10 @@ cmake -S . -B build \
   -DONNXSIM_BUILTIN_REMOTE_EXECUTOR=ON
 ```
 
-Then include `onnxsim/remote_executor.h` and pass
-`*GetRemoteModelExecutor({"device-host", 39501})` to the C++ simplifier API.
+Then include `onnxsim/remote_executor.h`, configure
+`RemoteExecutorOptions options; options.host = "device-host";
+options.port = 39501;`, and pass
+`*GetRemoteModelExecutor(options)` to the C++ simplifier API.
 The worker is intentionally a separate process: the same client-side
 executor can talk to a native ONNX Runtime worker, an accelerator compiler, or
 the optional AXCL worker. The current first implementation supports float32

@@ -25,8 +25,9 @@ The compiler owns the meaning of `artifact.format` and `artifact.abi`. A
 runner must reject an artifact when its compiler ID, target backend/device,
 runtime ABI, or required I/O contract does not match. `capabilities.ops` and
 `capabilities.dtypes` are advisory until onnxsim is given an explicit
-legalization callback; they are intended for a future preflight pass that can
-partition or legalize a fold subgraph before `COMPILE`.
+legalization callback. Native remote-executor callers can use that callback to
+rewrite a fold subgraph before `COMPILE`, then use `supported_ops` and a
+manifest validator to reject anything outside the target contract.
 
 The manifest is deliberately versioned independently from the transport. A
 new manifest field must not require a wire-protocol version bump, while a

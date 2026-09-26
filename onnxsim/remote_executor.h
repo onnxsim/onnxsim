@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "onnxsim.h"
 #include "remote_transport.h"
@@ -13,6 +15,18 @@
 // default, and this declaration is available only with
 // ONNXSIM_BUILTIN_REMOTE_EXECUTOR.
 #ifdef ONNXSIM_BUILTIN_REMOTE_EXECUTOR
+
+// A legalizer may rewrite a fold-group model before it is serialized for the
+// compiler/runner. It returns false with a short reason when the target cannot
+// accept the graph. This keeps vendor-specific rewrites out of the transport.
+using RemoteLegalizer = std::function<bool(
+    onnx::ModelProto&, const std::string& target, std::string& error)>;
+
+// Called after an external compiler returns its manifest and before the
+// artifact enters the process cache. A caller can reject a stale or
+// incompatible compiler result without teaching the transport JSON.
+using RemoteManifestValidator =
+    std::function<bool(const std::string& manifest, std::string& error)>;
 
 struct RemoteExecutorOptions {
   std::string host = "127.0.0.1";
@@ -45,6 +59,17 @@ struct RemoteExecutorOptions {
   // Off keeps profiling work at the minimum. Summary is suitable for
   // constrained cards; Detailed may include one event per device operation.
   onnx_remote::ProfilingLevel profiling = onnx_remote::ProfilingLevel::Off;
+  // Stable compiler/runner target name passed to the legalization hook. The
+  // compiler service's --target value should normally match this string.
+  std::string target = "generic";
+  // Optional target-specific graph legalization and post-compile manifest
+  // validation. Both hooks are deliberately dependency-free; applications can
+  // parse the manifest with their own JSON library or use a small allow-list.
+  RemoteLegalizer legalizer;
+  RemoteManifestValidator manifest_validator;
+  // If non-empty, every remaining node after legalization must use one of
+  // these operator types. This is a cheap preflight for constrained runners.
+  std::vector<std::string> supported_ops;
 };
 
 std::shared_ptr<const ModelExecutor> GetRemoteModelExecutor(

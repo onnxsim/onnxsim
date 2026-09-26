@@ -150,6 +150,16 @@ The manifest is opaque to the transport and should describe the compiler,
 target device, runtime/driver requirements, I/O ABI, shape constraints, and
 legalization profile. The existing transport only bounds and carries it.
 
+Native callers can add a legalization preflight through
+`RemoteExecutorOptions::legalizer`. It receives a mutable fold-group
+`ModelProto` and the configured `target`, and can rewrite it or return a short
+reason for rejection. `supported_ops` then performs a dependency-free
+allow-list check on the rewritten graph. For compiled execution,
+`manifest_validator` runs before the artifact enters the process cache, so a
+caller can reject a compiler result whose backend, ABI, chip, or legalization
+profile is incompatible. These hooks intentionally leave JSON and vendor
+rewrites outside the transport library.
+
 The native executor caches compiled artifacts in memory, keyed by the exact
 serialized fold-group model. This prevents repeated compilation within one
 onnxsim process. The compiler/runner should own the persistent device cache:
@@ -210,6 +220,12 @@ reports mean execution time; its engine inspector data is also retained in the
 compiled manifest for remote profiling. TensorRT engine blobs are generally
 specific to the TensorRT/CUDA/GPU combination, so the runner should validate the
 compiler ID, target, and driver/runtime ABI before loading a cache hit.
+
+When onnxsim profiling is enabled, remote traces emit separate
+`RemoteRPC/compile`, `RemoteRPC/load`, and `RemoteRPC/execute` events. Worker
+events retain their accelerator category and gain a `phase` argument; compiled
+artifacts add `RemoteArtifactReady` and `RemoteArtifactAttached` metadata
+events. They use the same Chrome Trace/Perfetto output as local spans.
 
 ## AXCL worker
 
