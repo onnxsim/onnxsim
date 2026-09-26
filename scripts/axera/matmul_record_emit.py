@@ -125,7 +125,9 @@ def build_paths(where: str) -> tuple[str, str]:
 
 @lru_cache(maxsize=256)
 def load_model(path: str) -> onnx.ModelProto:
-    return onnx.load_model_from_string(_read(path))
+    model = onnx.load_model_from_string(_read(path))
+    _MODEL_PATHS[id(model)] = path
+    return model
 
 
 I8 = "#i8"
@@ -133,6 +135,8 @@ I8 = "#i8"
 MatMul is requantized by it to symmetric int8, and that consumer's view
 (``quant_min`` -128, its own scale) is a separate scale the MatMul's lanes
 use (``1/s`` of it in a dW chain whose activation also has a uint8 use)."""
+
+_MODEL_PATHS: dict[int, str] = {}
 
 
 def quant_scales(quant: dict) -> Scales:
@@ -167,6 +171,20 @@ def quant_scales(quant: dict) -> Scales:
 @lru_cache(maxsize=256)
 def load_scales(path: str) -> Scales:
     return quant_scales(json.loads(_read(path)))
+
+
+def _scales_key(scales: Scales) -> tuple[tuple[str, float, float], ...]:
+    return tuple(
+        sorted(
+            (name, float(value[0]), float(value[1])) for name, value in scales.items()
+        )
+    )
+
+
+@lru_cache(maxsize=256)
+def _located(path: str, scales_key: tuple[tuple[str, float, float], ...]) -> dict:
+    scales = {name: (scale, zero_point) for name, scale, zero_point in scales_key}
+    return locate(load_model(path), scales)
 
 
 def params_of(model: onnx.ModelProto) -> bytes:
@@ -715,7 +733,8 @@ def recalibrate(
             f"tensors that share a quantization in the template part at the new "
             f"scales: {sorted(split[0])[:4]}; roles name one of them for all"
         )
-    found = locate(model, old)
+    path = _MODEL_PATHS.get(id(model))
+    found = _located(path, _scales_key(old)) if path is not None else locate(model, old)
     segs = [bytearray(s) for s in found["segments"]]
     changed: set[int] = set()
     for si, off, reg, value, roles in found["records"]:
