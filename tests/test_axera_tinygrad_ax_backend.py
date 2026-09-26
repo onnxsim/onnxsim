@@ -439,6 +439,36 @@ def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
+def test_compile_onnx_broadcast_mul_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Mul", ["x", "z"], ["y"])],
+            "onnx_broadcast_mul",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [1, 64]
+                ),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, [64]),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 64])],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "onnx_broadcast_mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
 def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
