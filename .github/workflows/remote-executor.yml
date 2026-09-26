@@ -75,7 +75,13 @@ jobs:
           first_id=$(printf '%s\n' "$first" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
           second_id=$(printf '%s\n' "$second" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
           test -n "$first_id" && test "$first_id" = "$second_id"
-          test -n "$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)"
+          marker=$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)
+          artifact="${marker%.complete}.artifact"
+          test -n "$marker" && test -f "$artifact"
+          printf 'corrupt-cache-entry' >"$artifact"
+          recovered=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          recovered_bytes=$(printf '%s\n' "$recovered" | sed -n 's/^artifact_id=[^ ]* bytes=\([0-9]*\).*/\1/p')
+          test "$recovered_bytes" = 11
 
   python-driver:
     name: Qualcomm harness driver tests

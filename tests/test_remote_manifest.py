@@ -67,6 +67,39 @@ def test_legalization_reaches_manifest_supported_form():
     assert report.ok
 
 
+def test_manifest_selects_and_validates_legalization_passes():
+    model = model_with_ops("Unsupported")
+    manifest = {
+        "capabilities": {"ops": ["Relu"]},
+        "legalization": {"passes": ["rewrite"]},
+    }
+    calls = []
+
+    def rewrite(m):
+        calls.append("rewrite")
+        m.graph.node[0].op_type = "Relu"
+        return 0
+
+    report = legalize_for_manifest(
+        model,
+        manifest,
+        [
+            ("unused", lambda _m: (_ for _ in ()).throw(AssertionError())),
+            ("rewrite", rewrite),
+        ],
+    )
+    assert report.ok
+    assert calls == ["rewrite"]
+
+    missing = legalize_for_manifest(
+        model_with_ops("Unsupported"),
+        {"legalization": {"passes": ["missing"]}},
+        [("rewrite", rewrite)],
+    )
+    assert not missing.ok
+    assert "missing" in missing.errors[0]
+
+
 def test_empty_capabilities_are_unknown():
     report = preflight_model(model_with_ops("Anything"), {"capabilities": {"ops": []}})
     assert report.ok

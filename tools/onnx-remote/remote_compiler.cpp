@@ -46,10 +46,11 @@ std::string hex_u64(uint64_t value) {
 // This is an artifact cache key, not a security digest. Two independent FNV-1a
 // streams make accidental collisions sufficiently unlikely for a local cache,
 // while keeping this worker dependency-free on small compile hosts.
-std::string cache_key(const Request& request, const Options& options) {
+template <typename Add>
+std::string digest_with(Add add) {
   uint64_t a = 1469598103934665603ull;
   uint64_t b = 1099511628211ull;
-  auto add = [&](const void* data, size_t size) {
+  add([&](const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < size; ++i) {
       a ^= bytes[i];
@@ -57,12 +58,25 @@ std::string cache_key(const Request& request, const Options& options) {
       b ^= static_cast<uint64_t>(bytes[i]) + 0x9d;
       b *= 14029467366897019727ull;
     }
-  };
-  add(options.target.data(), options.target.size());
-  add(options.compiler_id.data(), options.compiler_id.size());
-  add(options.command.data(), options.command.size());
-  add(request.model.data(), request.model.size());
+  });
   return hex_u64(a) + hex_u64(b);
+}
+
+std::string cache_key(const Request& request, const Options& options) {
+  return digest_with([&](auto add) {
+    add(options.target.data(), options.target.size());
+    add(options.compiler_id.data(), options.compiler_id.size());
+    add(options.command.data(), options.command.size());
+    add(request.model.data(), request.model.size());
+  });
+}
+
+std::string cache_content_digest(const std::vector<uint8_t>& artifact,
+                                 const std::string& manifest) {
+  return digest_with([&](auto add) {
+    add(artifact.data(), artifact.size());
+    add(manifest.data(), manifest.size());
+  });
 }
 
 bool read_file(const fs::path& path, std::vector<uint8_t>& bytes, std::string& error) {
@@ -161,6 +175,7 @@ bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
     fs::remove(complete_tmp);
     return false;
   }
+  complete << cache_content_digest(artifact, manifest) << '\n';
   complete.close();
   fs::rename(complete_tmp, complete_path, ec);
   if (ec) {
@@ -250,13 +265,23 @@ Response compile(const Request& request, const Options& options) {
   if (!options.cache_dir.empty() && fs::exists(artifact_path) &&
       fs::exists(manifest_path) && fs::exists(complete_path)) {
     std::string error;
+    std::string marker;
     if (read_file(artifact_path, response.artifact, error) &&
-        read_text(manifest_path, response.manifest)) {
+        read_text(manifest_path, response.manifest) &&
+        read_text(complete_path, marker) &&
+        marker == cache_content_digest(response.artifact, response.manifest) + "\n") {
       response.ok = true;
       response.artifact_id = key;
       return response;
     }
+    // A stale or interrupted entry is never trusted. It is removed before
+    // recompilation so a failed publish cannot be mistaken for a cache hit.
     response.artifact.clear();
+    response.manifest.clear();
+    std::error_code stale_ec;
+    fs::remove(complete_path, stale_ec);
+    fs::remove(artifact_path, stale_ec);
+    fs::remove(manifest_path, stale_ec);
   }
 
   fs::path work_dir;

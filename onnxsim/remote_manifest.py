@@ -121,6 +121,26 @@ def legalize_for_manifest(
     """
     if max_rounds <= 0:
         raise ValueError("max_rounds must be positive")
+    data = load_manifest(manifest)
+    legalization = data.get("legalization")
+    requested = (
+        legalization.get("passes") if isinstance(legalization, Mapping) else None
+    )
+    if requested is not None:
+        requested_names = {str(name) for name in requested}
+        available = {name: apply_pass for name, apply_pass in passes}
+        missing = sorted(requested_names - available.keys())
+        if missing:
+            report = preflight_model(model, data, target=target)
+            report.ok = False
+            report.errors.append(
+                "manifest requested unavailable legalization passes: "
+                + ", ".join(missing)
+            )
+            return report
+        passes = tuple(
+            (name, available[name]) for name in requested if name in available
+        )
     for _round in range(max_rounds):
         round_changed = False
         for _name, apply_pass in passes:

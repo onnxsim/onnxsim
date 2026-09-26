@@ -24,6 +24,8 @@ public:
   OnnxRemoteBridge() : Node("onnx_remote_bridge") {
     host_ = declare_parameter<std::string>("remote_host", "127.0.0.1");
     port_ = declare_parameter<int>("remote_port", 39501);
+    configured_host_ = host_;
+    configured_port_ = port_;
     connect_timeout_ms_ = declare_parameter<int>("connect_timeout_ms", 2000);
     io_timeout_ms_ = declare_parameter<int>("io_timeout_ms", 0);
     auto_discover_ = declare_parameter<bool>("auto_discover", false);
@@ -31,6 +33,7 @@ public:
                                                       "onnx_remote/runners");
     discovery_target_ = declare_parameter<std::string>("discovery_target", "");
     announce_period_ms_ = declare_parameter<int>("announce_period_ms", 5000);
+    discovery_timeout_ms_ = declare_parameter<int>("discovery_timeout_ms", 15000);
     advertise_host_ = declare_parameter<std::string>("advertise_host", host_);
     runner_id_ = declare_parameter<std::string>("runner_id", get_name());
     result_ = create_publisher<UInt8MultiArray>("result", rclcpp::QoS(10));
@@ -41,7 +44,10 @@ public:
         [this](const String::SharedPtr message) { discover(message); });
     announce_timer_ = create_wall_timer(
         std::chrono::milliseconds(std::max(100, announce_period_ms_)),
-        [this]() { announce(); });
+        [this]() {
+          expire_discovery();
+          announce();
+        });
     run_ = create_subscription<UInt8MultiArray>(
         "run", rclcpp::QoS(10),
         [this](const UInt8MultiArray::SharedPtr message) { forward(message); });
@@ -119,9 +125,24 @@ private:
       return;
     host_ = host;
     port_ = port;
+    last_discovery_ = std::chrono::steady_clock::now();
+    discovered_ = true;
     RCLCPP_INFO(get_logger(), "auto-discovered runner %s at %s:%d", id.c_str(),
                 host_.c_str(), port_);
-    auto_discover_ = false;
+  }
+
+  void expire_discovery() {
+    if (!auto_discover_ || !discovered_ || discovery_timeout_ms_ <= 0)
+      return;
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - last_discovery_);
+    if (age.count() <= discovery_timeout_ms_)
+      return;
+    RCLCPP_WARN(get_logger(), "discovered runner expired after %ld ms",
+                static_cast<long>(age.count()));
+    host_ = configured_host_;
+    port_ = configured_port_;
+    discovered_ = false;
   }
 
   void forward(const UInt8MultiArray::SharedPtr &message) {
@@ -175,10 +196,15 @@ private:
 
   std::string host_;
   int port_;
+  std::string configured_host_;
+  int configured_port_;
   int connect_timeout_ms_;
   int io_timeout_ms_;
   bool auto_discover_;
   int announce_period_ms_ = 5000;
+  int discovery_timeout_ms_ = 15000;
+  bool discovered_ = false;
+  std::chrono::steady_clock::time_point last_discovery_{};
   std::string discovery_topic_;
   std::string discovery_target_;
   std::string advertise_host_;
