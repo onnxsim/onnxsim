@@ -17,6 +17,11 @@ import onnx
 import pytest
 from onnx import numpy_helper, parser
 
+# The UOp-lowering tests import tinygrad inside the test body (the backend pulls in the Axera emitters
+# from sys.path first, so a module-level import would run before that). Skip the module when tinygrad is
+# absent instead of letting every one of them fail on the import: the coverage job does not install it.
+_tinygrad = pytest.importorskip("tinygrad", reason="tinygrad is not installed")
+
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
 )
