@@ -17,6 +17,73 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(PIPELINE)
 
 
+def test_resolve_backends_defaults_to_manifest_choice():
+    # Without --fallback-to-tinygrad the manifest's choice stands even when that
+    # backend has no runner, so a Core ML measurement can never silently become a
+    # tinygrad one.
+    runners = {("head", "coreml"): object()}
+    selected, subs = PIPELINE._resolve_backends(
+        ["head"], {"head": "coreml"}, runners, False
+    )
+    assert selected == {"head": "coreml"}
+    assert subs == []
+
+
+def test_resolve_backends_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="unsupported backend"):
+        PIPELINE._resolve_backends(["head"], {"head": "nope"}, {}, False)
+
+
+def test_resolve_backends_prefers_jit_then_eager():
+    # A stage whose Core ML runner is missing (e.g. RoiAlign cannot be lowered)
+    # falls back to Metal JIT when that built, and to eager otherwise.
+    runners = {("head", "tinygrad_metal_jit"): object()}
+    selected, subs = PIPELINE._resolve_backends(
+        ["head"], {"head": "coreml"}, runners, True
+    )
+    assert selected == {"head": "tinygrad_metal_jit"}
+    assert subs == [
+        {
+            "stage": "head",
+            "requested_backend": "coreml",
+            "used_backend": "tinygrad_metal_jit",
+        }
+    ]
+
+    runners = {("head", "tinygrad_metal"): object()}
+    selected, subs = PIPELINE._resolve_backends(
+        ["head"], {"head": "coreml"}, runners, True
+    )
+    assert selected == {"head": "tinygrad_metal"}
+    assert subs[0]["used_backend"] == "tinygrad_metal"
+
+
+def test_resolve_backends_leaves_working_stages_alone():
+    # Fallback is per stage and only for stages that actually failed, so a
+    # working Core ML stage is never swapped out.
+    runners = {
+        ("backbone", "coreml"): object(),
+        ("head", "tinygrad_metal_jit"): object(),
+    }
+    selected, subs = PIPELINE._resolve_backends(
+        ["backbone", "head"],
+        {"backbone": "coreml", "head": "coreml"},
+        runners,
+        True,
+    )
+    assert selected == {"backbone": "coreml", "head": "tinygrad_metal_jit"}
+    assert [s["stage"] for s in subs] == ["head"]
+
+
+def test_resolve_backends_leaves_unfixable_stage_for_the_error_path():
+    # If no tinygrad backend has a runner either, the stage keeps its requested
+    # backend and the existing "selected backend unavailable" error still fires
+    # (that check looks runners up by the selected name).
+    selected, subs = PIPELINE._resolve_backends(["head"], {"head": "coreml"}, {}, True)
+    assert selected == {"head": "coreml"}
+    assert subs == []
+
+
 def _two_input_model(name, input_names, output_name):
     graph = onnx.helper.make_graph(
         [onnx.helper.make_node("Add", input_names, [output_name])],
