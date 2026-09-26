@@ -2482,15 +2482,6 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
 
     binary_op = None
     left = right = None
-
-    def const_value(node):
-        """Return a scalar constant hidden behind tinygrad's dtype Cast."""
-        if node.op is Ops.CONST:
-            return float(node.arg)
-        if node.op is Ops.CAST and len(node.src) == 1 and node.src[0].op is Ops.CONST:
-            return float(node.src[0].arg)
-        return None
-
     if root.op is Ops.ADD and len(root.src) == 2:
         left, right = root.src
         if (
@@ -2517,9 +2508,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         left_shape = tuple(int(dim) for dim in left.shape)
         right_shape = tuple(int(dim) for dim in right.shape)
         shape = tuple(int(dim) for dim in root.shape)
-        right_constant_value = const_value(right)
-        right_is_constant = right_constant_value is not None
-        if not left_shape or (not right_shape and not right_is_constant):
+        if not left_shape or not right_shape:
             raise ValueError(
                 f"AX UOp {binary_op} lowering requires non-empty static operand shapes"
             )
@@ -2533,21 +2522,9 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             raise ValueError(
                 f"AX UOp {binary_op} output shape {shape} does not match broadcast shape {broadcast_shape}"
             )
-        left_const = left.op is Ops.CONST
-        right_const = right_is_constant
-        if left_const and right_const:
+        if not alloc_backed_view(left) or not alloc_backed_view(right):
             raise ValueError(
-                f"AX UOp {binary_op} lowering requires at least one runtime operand"
-            )
-        if left_const:
-            raise ValueError(
-                f"AX UOp {binary_op} constant lowering requires the runtime operand first"
-            )
-        if not alloc_backed_view(left) or (
-            not right_const and not alloc_backed_view(right)
-        ):
-            raise ValueError(
-                f"AX UOp {binary_op} lowering requires an ALLOC-backed runtime input"
+                f"AX UOp {binary_op} lowering requires ALLOC-backed inputs"
             )
         if str(root.dtype).split(".")[-1] != "float":
             raise ValueError(
@@ -2557,28 +2534,18 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             raise ValueError(
                 f"AX UOp {binary_op} lowering requires positive static shapes"
             )
-        graph_inputs = [
-            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, left_shape)
-        ]
-        initializers = []
-        if right_const:
-            initializers.append(
-                onnx.numpy_helper.from_array(
-                    np.asarray(right_constant_value, dtype=np.float32), "z"
-                )
-            )
-        else:
-            graph_inputs.append(
-                onnx.helper.make_tensor_value_info(
-                    "z", onnx.TensorProto.FLOAT, right_shape
-                )
-            )
         graph = onnx.helper.make_graph(
             [onnx.helper.make_node(binary_op, ["x", "z"], ["y"])],
             f"tinygrad_uop_{binary_op.lower()}_ax",
-            graph_inputs,
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, left_shape
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, right_shape
+                ),
+            ],
             [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
-            initializers,
         )
         return onnx.helper.make_model(
             graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
