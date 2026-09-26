@@ -10,6 +10,7 @@ using namespace onnx_remote;
 
 static int self_test() {
   Request payload_request;
+  payload_request.request_id = 7;
   payload_request.op = "relu";
   payload_request.profiling = ProfilingLevel::Detailed;
   payload_request.inputs.push_back(Tensor{{5}, {-2, -1, 0, 1, 2}});
@@ -33,6 +34,11 @@ static int self_test() {
   Response response;
   if (!receive_response(fd, response, error) || !response.ok || response.outputs.size() != 1) {
     std::cerr << (error.empty() ? response.error : error) << '\n'; close_socket(fd); return 1;
+  }
+  if (response.request_id != payload_request.request_id) {
+    std::cerr << "response request id mismatch\n";
+    close_socket(fd);
+    return 1;
   }
   const auto& got = response.outputs[0].data; const float want[] = {0, 0, 0, 1, 2};
   if (got.size() != 5) return 1;
