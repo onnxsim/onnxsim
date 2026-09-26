@@ -311,14 +311,21 @@ def test_standalone_relu_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     import axcl_session
     import elementwise_scale_emit as ew
     import tinygrad_ax_backend as axb
-    from tinygrad import Tensor
 
     shape = (16, 64, 56, 56)
-    root = Tensor.empty(*shape).relu().uop
     _, meta = ew.load_template("Relu", shape, {"x": 0, "y": 0})
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Relu", ["x"], ["y"])],
+            "onnx_standalone_relu_to_uop_vm",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
     schedule = tmp_path / "standalone_relu_uop.schedule.json"
-    axmodel = axb.compile_uop(
-        root,
+    axmodel = axb.compile_onnx(
+        model,
         str(schedule),
         {"scales": meta["scales"], "zero_points": meta["zero_points"]},
     )
