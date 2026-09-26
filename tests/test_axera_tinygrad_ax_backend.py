@@ -469,6 +469,43 @@ def test_compile_onnx_broadcast_mul_through_uop_to_mcode(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
+def test_compile_onnx_constant_mul_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Mul", ["input", "scale"], ["output"])],
+            "onnx_constant_mul",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "input", onnx.TensorProto.FLOAT, [1, 64]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "output", onnx.TensorProto.FLOAT, [1, 64]
+                )
+            ],
+            [onnx.numpy_helper.from_array(np.asarray(0.5, np.float32), "scale")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "onnx_constant_mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    # The UOp bridge uses canonical x/y names; graph-level ONNX generation
+    # retains arbitrary source names separately.
+    assert [value.name for value in generated.graph.input] == ["x"]
+    constant = next(value for value in generated.graph.initializer if value.name == "z")
+    assert list(constant.dims) == [1, 64]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
 @pytest.mark.parametrize("op", ["Add", "Div", "Sub"])
 def test_compile_onnx_live_binary_through_uop_to_mcode(tmp_path, op):
     model = onnx.helper.make_model(

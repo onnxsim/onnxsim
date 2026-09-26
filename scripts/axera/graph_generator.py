@@ -161,6 +161,83 @@ def _initializer_map(model: onnx.ModelProto) -> dict[str, onnx.TensorProto]:
     return {item.name: item for item in model.graph.initializer}
 
 
+def _constant_binary_calibration(
+    model: onnx.ModelProto,
+    op: str,
+    scales: Mapping[str, float],
+    zero_points: Mapping[str, int],
+) -> tuple[dict[str, float], dict[str, int], np.ndarray, str]:
+    """Complete calibration for the conservative constant-binary path.
+
+    The measured binary programs are full-shape programs: they do not accept
+    an ONNX broadcast input at runtime.  A constant operand can therefore be
+    expanded once at generation time.  Keep the quantization choice equally
+    conservative: only the two symmetric classes already validated by the
+    binary emitter are accepted, and the runtime operand must be first (the
+    latter matters for non-commutative Sub/Div).
+    """
+    node = model.graph.node[0]
+    init = _initializer_map(model)
+    runtime = [name for name in node.input if name not in init]
+    constants = [name for name in node.input if name in init]
+    if len(runtime) != 1 or len(constants) != 1 or node.input[0] != runtime[0]:
+        raise ValueError(
+            f"standalone {op} constant form requires runtime operand first and "
+            "one initializer operand"
+        )
+    if not all(name in scales for name in ("x", "y")) or not all(
+        name in zero_points for name in ("x", "y")
+    ):
+        raise ValueError(f"{op} constant form requires x/y calibration")
+    zx, zy = int(zero_points["x"]), int(zero_points["y"])
+    if zx == zy == 0:
+        zz = 0
+    elif zx == zy == 128 and op != "Div":
+        zz = 128
+    else:
+        raise ValueError(
+            f"{op} constant form needs a validated zero-point class, got x{zx},y{zy}"
+        )
+    value = numpy_helper.to_array(init[constants[0]]).astype(np.float32)
+    output_shape = _shape(model.graph.output[0])
+    try:
+        expanded = np.broadcast_to(value, output_shape).copy()
+    except ValueError as exc:
+        raise ValueError(f"{op} constant is not broadcast-compatible") from exc
+    if not np.all(np.isfinite(expanded)):
+        raise ValueError(f"{op} constant must contain finite float32 values")
+    maximum = float(np.max(np.abs(expanded))) if expanded.size else 0.0
+    zscale = float(scales["x"]) if maximum == 0.0 else maximum / 127.0
+    return (
+        {"x": float(scales["x"]), "z": zscale, "y": float(scales["y"])},
+        {"x": zx, "z": zz, "y": zy},
+        expanded,
+        constants[0],
+    )
+
+
+def _materialize_constant_binary(
+    emitted: onnx.ModelProto,
+    source: onnx.ModelProto,
+    value: np.ndarray,
+    source_constant: str,
+) -> None:
+    """Turn the measured template's second input into an ONNX initializer."""
+    source_init = _initializer_map(source)
+    if source_constant not in source_init:
+        raise ValueError(f"missing source constant {source_constant!r}")
+    input_names = [item.name for item in emitted.graph.input]
+    if input_names != ["x", "z"]:
+        raise ValueError(f"binary template has unexpected inputs {input_names}")
+    for item in emitted.graph.input:
+        if item.name == "z":
+            emitted.graph.input.remove(item)
+            break
+    emitted.graph.initializer.append(
+        numpy_helper.from_array(np.asarray(value, dtype=np.float32), "z")
+    )
+
+
 def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     """Recognize and schedule one measured composed graph.
 
@@ -516,6 +593,45 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         )
     if len(nodes) == 1 and nodes[0].op_type in ("Add", "Sub", "Mul", "Div"):
         add = nodes[0]
+        init = _initializer_map(model)
+        runtime_inputs = [
+            item.name for item in model.graph.input if item.name not in init
+        ]
+        if (
+            len(runtime_inputs) == 1
+            and len(add.input) == 2
+            and add.input[0] == runtime_inputs[0]
+            and add.input[1] in init
+        ):
+            input_shape = values.get(runtime_inputs[0], ())
+            constant_shape = tuple(int(d) for d in init[add.input[1]].dims)
+            output_shape = (
+                values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+            )
+            if not input_shape or not output_shape:
+                raise ValueError(f"standalone {add.op_type} requires static shapes")
+            try:
+                shape = tuple(np.broadcast_shapes(input_shape, constant_shape))
+            except ValueError as exc:
+                raise ValueError(
+                    f"standalone {add.op_type} inputs are not broadcast-compatible"
+                ) from exc
+            if output_shape != shape:
+                raise ValueError(
+                    f"standalone {add.op_type} output shape must match its broadcast shape"
+                )
+            return GraphPlan(
+                (
+                    GraphSegment(
+                        add.op_type.lower(),
+                        (runtime_inputs[0],),
+                        model.graph.output[0].name,
+                        shape,
+                        shape,
+                        operand_shape=constant_shape,
+                    ),
+                )
+            )
         if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != [
             "x",
             "z",
@@ -628,6 +744,7 @@ def generate(
     """
     model = onnx.load(source_path, load_external_data=False)
     plan = schedule_graph(model)
+    constant_binary: tuple[np.ndarray, str] | None = None
     if schedule_path is not None:
         # Keep schedule generation on the same validated source model and
         # avoid making the schedule a second, independently maintained plan.
@@ -844,12 +961,14 @@ def generate(
             raise ValueError(
                 f"{plan.chain.title()} calibration requires scales and zero_points mappings"
             )
+        segment = plan.segments[0]
+        if len(model.graph.input) == 1:
+            scales, zero_points, value, source_constant = _constant_binary_calibration(
+                model, plan.chain.title(), scales, zero_points
+            )
+            constant_binary = (value, source_constant)
         binary_op_scale_emit.emit(
-            plan.chain.title(),
-            plan.segments[0].input_shape,
-            scales,
-            zero_points,
-            output_path,
+            plan.chain.title(), segment.output_shape, scales, zero_points, output_path
         )
     else:
         if indices is None:
@@ -864,6 +983,8 @@ def generate(
         raise RuntimeError(f"generator did not produce {output_path}")
     emitted = onnx.load(output_path, load_external_data=False)
     source = onnx.load(source_path, load_external_data=False)
+    if constant_binary is not None:
+        _materialize_constant_binary(emitted, source, *constant_binary)
     _retarget_model_names(emitted, source)
     onnx.save(emitted, output_path)
     if schedule_path is not None:
