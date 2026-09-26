@@ -675,7 +675,11 @@ def test_onnx_broadcast_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
                     "z", onnx.TensorProto.FLOAT, broadcast_shape
                 ),
             ],
-            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, source_shape)],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, source_shape
+                )
+            ],
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
