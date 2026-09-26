@@ -544,6 +544,43 @@ def test_compile_onnx_maxpool_through_uop_to_mcode(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "maxpool"
 
 
+def test_compile_onnx_reducemean_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "ReduceMean", ["x"], ["y"], axes=[2, 3], keepdims=1
+                )
+            ],
+            "onnx_reducemean",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 512, 7, 7]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 512, 1, 1]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = misc.load_template("ReduceMean:16x512x7x7:axes2,3:k1")
+    schedule = tmp_path / "onnx_reducemean.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducemean"
+
+
 def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
