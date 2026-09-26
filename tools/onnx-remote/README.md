@@ -53,7 +53,7 @@ Run that smoke test while the worker is running:
 * no dynamic dependency on Python or protobuf;
 * one request per connection for simple failure isolation;
 * explicit operation and tensor metadata, so the remote side never guesses
-  dtype or shape. Protocol v4 preserves raw little-endian payloads for
+  dtype or shape. Protocol v5 preserves raw little-endian payloads for
   FLOAT16, BFLOAT16, integer, DOUBLE, and BOOL tensors. The reference worker
   executes typed identity and keeps arithmetic intentionally float32-only.
 * optional `Off`, `Summary`, or `Detailed` profiling in the request;

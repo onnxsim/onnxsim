@@ -36,6 +36,9 @@ struct ProfileEvent {
 };
 
 struct Request {
+  // Caller-owned correlation token. Zero is valid for simple one-shot users;
+  // native clients should assign a non-zero value when multiplexing.
+  uint64_t request_id = 0;
   std::string op;
   // Optional serialized ONNX ModelProto. A model handle can be used instead
   // by leaving this empty and putting the handle in `op`.
@@ -50,6 +53,8 @@ struct Request {
 };
 
 struct Response {
+  // Echoes Request::request_id, including on error responses.
+  uint64_t request_id = 0;
   bool ok = false;
   std::string error;
   std::vector<Tensor> outputs;

@@ -82,7 +82,7 @@ int main() {
   }
 
   if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
-    const char status[] = "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v4\",\"tensor_dtypes\":[\"float32\",\"float16\",\"bfloat16\",\"int8\",\"uint8\",\"int16\",\"uint16\",\"int32\",\"int64\",\"uint32\",\"uint64\",\"double\",\"bool\"]}";
+    const char status[] = "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v5\",\"tensor_dtypes\":[\"float32\",\"float16\",\"bfloat16\",\"int8\",\"uint8\",\"int16\",\"uint16\",\"int32\",\"int64\",\"uint32\",\"uint64\",\"double\",\"bool\"]}";
     const char capabilities[] =
         "{\"schema_version\":1,\"payload\":\"binary-uint8\","
         "\"operations\":[\"run\",\"compile\",\"load_compiled\","

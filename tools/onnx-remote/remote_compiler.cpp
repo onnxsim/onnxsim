@@ -249,6 +249,7 @@ std::string replace_all(std::string command, const std::string& token,
 
 Response compile(const Request& request, const Options& options) {
   Response response;
+  response.request_id = request.request_id;
   if (request.op != "compile") {
     response.error = "compiler service only accepts op=compile";
     return response;

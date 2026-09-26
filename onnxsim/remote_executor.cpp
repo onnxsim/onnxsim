@@ -3,6 +3,7 @@
 #ifdef ONNXSIM_BUILTIN_REMOTE_EXECUTOR
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -14,6 +15,8 @@
 #include "remote_transport.h"
 
 namespace {
+
+std::atomic<uint64_t> next_request_id{1};
 
 struct OutputOwner {
   std::vector<uint8_t> data;
@@ -96,6 +99,7 @@ class RemoteModelExecutor final : public ModelExecutor {
     }
     const std::string serialized = prepared.SerializeAsString();
     onnx_remote::Request request;
+    request.request_id = next_request_id.fetch_add(1, std::memory_order_relaxed);
     request.profiling = options_.profiling;
     if (options_.compile_model) {
       const auto artifact = GetOrCompile(serialized);
@@ -170,6 +174,11 @@ class RemoteModelExecutor final : public ModelExecutor {
   onnx_remote::Response Exchange(const onnx_remote::Request& request,
                                  const std::string& host, uint16_t port,
                                  const char* phase) const {
+    onnx_remote::Request wire_request = request;
+    if (wire_request.request_id == 0) {
+      wire_request.request_id =
+          next_request_id.fetch_add(1, std::memory_order_relaxed);
+    }
     auto& profiler = onnxsim::Profiler::Instance();
     const bool collect_profile =
         profiler.enabled() &&
@@ -186,7 +195,7 @@ class RemoteModelExecutor final : public ModelExecutor {
     std::string error;
     onnx_remote::Response response;
     const uint64_t rpc_start = collect_profile ? profiler.ElapsedMicros() : 0;
-    const bool sent = onnx_remote::send_request(fd, request, error);
+    const bool sent = onnx_remote::send_request(fd, wire_request, error);
     const bool received =
         sent && onnx_remote::receive_response(fd, response, error);
     const uint64_t rpc_end = collect_profile ? profiler.ElapsedMicros() : 0;
@@ -210,6 +219,9 @@ class RemoteModelExecutor final : public ModelExecutor {
     if (!received || !response.ok) {
       throw std::runtime_error("remote executor: " +
                                (error.empty() ? response.error : error));
+    }
+    if (response.request_id != wire_request.request_id) {
+      throw std::runtime_error("remote executor: response request id mismatch");
     }
     return response;
   }

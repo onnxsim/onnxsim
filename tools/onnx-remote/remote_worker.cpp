@@ -19,7 +19,7 @@ static uint64_t micros_since(
 static bool same_shape(const Tensor& a, const Tensor& b) { return a.shape == b.shape; }
 
 static Response execute(const Request& r) {
-  Response out; out.ok = false;
+  Response out; out.request_id = r.request_id; out.ok = false;
   const auto started = std::chrono::steady_clock::now();
   auto profile = [&](const char* name, uint64_t begin, uint64_t duration) {
     if (r.profiling != ProfilingLevel::Off) {

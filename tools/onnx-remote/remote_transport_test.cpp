@@ -9,6 +9,7 @@ using namespace onnx_remote;
 
 int main() {
   Request request;
+  request.request_id = 42;
   request.op = "run_compiled";
   request.artifact_id = "qairt-test-1";
   request.model = {0x01, 0x02, 0x03};
@@ -23,6 +24,7 @@ int main() {
   assert(decode_request_payload(payload.data(), payload.size(), decoded_request,
                                 error));
   assert(decoded_request.op == request.op);
+  assert(decoded_request.request_id == request.request_id);
   assert(decoded_request.artifact_id == request.artifact_id);
   assert(decoded_request.model == request.model);
   assert(decoded_request.artifact == request.artifact);
@@ -47,6 +49,7 @@ int main() {
   assert(decoded_typed.inputs[0].data.empty());
 
   Response response;
+  response.request_id = request.request_id;
   response.ok = true;
   response.outputs = request.inputs;
   response.profile.push_back(
@@ -59,6 +62,7 @@ int main() {
   assert(decode_response_payload(payload.data(), payload.size(),
                                 decoded_response, error));
   assert(decoded_response.ok);
+  assert(decoded_response.request_id == response.request_id);
   assert(decoded_response.outputs[0].data == response.outputs[0].data);
   assert(decoded_response.profile.size() == 1);
   assert(decoded_response.profile[0].duration_us == 34);

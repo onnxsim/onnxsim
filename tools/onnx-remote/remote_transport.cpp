@@ -15,7 +15,7 @@ namespace onnx_remote {
 namespace {
 
 constexpr uint32_t kMagic = 0x4f525452u;  // ORTR
-constexpr uint16_t kVersion = 4;
+constexpr uint16_t kVersion = 5;
 constexpr uint16_t kRun = 1;
 constexpr uint16_t kOk = 2;
 constexpr uint16_t kError = 3;
@@ -231,6 +231,7 @@ bool encode_request_bytes(const Request& request, std::vector<char>& b,
     error = "invalid operation";
     return false;
   }
+  put_u64(b, request.request_id);
   put_u32(b, static_cast<uint32_t>(request.op.size()));
   b.insert(b.end(), request.op.begin(), request.op.end());
   if (request.artifact_id.size() > kMaxArtifactIdBytes ||
@@ -250,6 +251,10 @@ bool encode_request_bytes(const Request& request, std::vector<char>& b,
 bool decode_request_bytes(const std::vector<char>& b, Request& request,
                           std::string& error) {
   size_t at = 0;
+  if (!take_u64(b, at, request.request_id)) {
+    error = "missing request id";
+    return false;
+  }
   uint32_t op_len;
   if (!take_u32(b, at, op_len) || op_len == 0 || op_len > kMaxOpBytes ||
       at + op_len > b.size()) {
@@ -301,6 +306,7 @@ bool decode_request_bytes(const std::vector<char>& b, Request& request,
 }
 bool encode_response_bytes(const Response& response, std::vector<char>& b,
                            std::string& error) {
+  put_u64(b, response.request_id);
   if (!response.ok) {
     if (response.error.size() > kMaxProfileDetailBytes * 4) {
       error = "error response too large";
@@ -329,6 +335,10 @@ bool encode_response_bytes(const Response& response, std::vector<char>& b,
 bool decode_response_bytes(const std::vector<char>& b, bool ok,
                            Response& response, std::string& error) {
   size_t at = 0;
+  if (!take_u64(b, at, response.request_id)) {
+    error = "missing response request id";
+    return false;
+  }
   if (!ok) {
     uint32_t len;
     if (!take_u32(b, at, len) || len > kMaxProfileDetailBytes * 4 ||

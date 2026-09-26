@@ -72,7 +72,7 @@ public:
                                         response) {
       response->success = true;
       response->message =
-          R"({"schema_version":1,"transport":"onnx-remote-v4","payload":"binary-uint8","profiling":["off","summary","detailed"],"operations":["run","compile","load_compiled","run_compiled"],"tensor_dtypes":["float32","float16","bfloat16","int8","uint8","int16","uint16","int32","int64","uint32","uint64","double","bool"]})";
+          R"({"schema_version":1,"transport":"onnx-remote-v5","payload":"binary-uint8","profiling":["off","summary","detailed"],"operations":["run","compile","load_compiled","run_compiled"],"tensor_dtypes":["float32","float16","bfloat16","int8","uint8","int16","uint16","int32","int64","uint32","uint64","double","bool"]})";
     });
   }
 
@@ -105,7 +105,7 @@ private:
                    "\",\"host\":\"" + advertise_host_ +
                    "\",\"port\":" + std::to_string(port_) + ",\"target\":\"" +
                    discovery_target_ +
-                   "\",\"transport\":\"onnx-remote-v4\","
+                   "\",\"transport\":\"onnx-remote-v5\","
                    "\"profiling\":[\"off\",\"summary\",\"detailed\"]}";
     discovery_->publish(std::move(message));
   }

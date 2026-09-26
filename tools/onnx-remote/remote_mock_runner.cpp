@@ -15,6 +15,7 @@ static std::mutex artifacts_mutex;
 
 static Response execute(const Request& request) {
   Response response;
+  response.request_id = request.request_id;
   if (request.op == "load_compiled") {
     if (request.artifact_id.empty() || request.artifact.empty()) {
       response.error = "load_compiled requires artifact_id and artifact";
