@@ -12,12 +12,80 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <chrono>
 
+#include <unistd.h>
+
 using namespace onnx_remote;
+namespace fs = std::filesystem;
+
+static fs::path g_cache_dir;
+
+static bool valid_artifact_id(const std::string& id) {
+  if (id.empty() || id.size() > kMaxArtifactIdBytes) return false;
+  for (char c : id) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+      return false;
+  }
+  return true;
+}
+
+static bool materialize_artifact(const Request& request, fs::path& path,
+                                 std::string& error) {
+  if (!valid_artifact_id(request.artifact_id)) {
+    error = "invalid AXCL artifact id";
+    return false;
+  }
+  if (g_cache_dir.empty()) {
+    error = "AXCL artifact cache is not configured";
+    return false;
+  }
+  std::error_code ec;
+  fs::create_directories(g_cache_dir, ec);
+  if (ec) {
+    error = "cannot create AXCL artifact cache: " + ec.message();
+    return false;
+  }
+  path = g_cache_dir / (request.artifact_id + ".axmodel");
+  if (!request.artifact.empty()) {
+    if (request.artifact.size() > kMaxArtifactBytes) {
+      error = "AXCL artifact exceeds transport limit";
+      return false;
+    }
+    const fs::path temporary = path.string() + ".tmp." +
+                               std::to_string(static_cast<long long>(::getpid()));
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = "cannot write AXCL artifact cache";
+      return false;
+    }
+    output.write(reinterpret_cast<const char*>(request.artifact.data()),
+                 static_cast<std::streamsize>(request.artifact.size()));
+    output.close();
+    if (!output) {
+      fs::remove(temporary);
+      error = "cannot write AXCL artifact cache";
+      return false;
+    }
+    fs::rename(temporary, path, ec);
+    if (ec) {
+      fs::remove(temporary);
+      error = "cannot publish AXCL artifact: " + ec.message();
+      return false;
+    }
+  }
+  if (!fs::is_regular_file(path, ec) || ec) {
+    error = "AXCL artifact is not cached: " + request.artifact_id;
+    return false;
+  }
+  return true;
+}
 
 static uint64_t elapsed_us(const std::chrono::steady_clock::time_point& start) {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -109,11 +177,30 @@ static Response execute_axmodel(const Request& request) {
   return response;
 }
 
+static Response execute_request(const Request& request) {
+  if (request.op != "run_compiled") return execute_axmodel(request);
+  Request cached = request;
+  std::string error;
+  fs::path artifact_path;
+  if (!materialize_artifact(request, artifact_path, error)) {
+    Response response;
+    response.error = error;
+    return response;
+  }
+  cached.op = artifact_path.string();
+  return execute_axmodel(cached);
+}
+
 int main(int argc, char** argv) {
   uint16_t port = 39501;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoul(argv[++i]));
-    else if (std::string(argv[i]) == "--help") { std::cout << "usage: onnx-remote-axcl-worker [--port PORT]\n"; return 0; }
+    else if (std::string(argv[i]) == "--cache-dir" && i + 1 < argc) g_cache_dir = argv[++i];
+    else if (std::string(argv[i]) == "--help") {
+      std::cout << "usage: onnx-remote-axcl-worker [--port PORT]"
+                   " [--cache-dir DIR]\n";
+      return 0;
+    }
     else { std::cerr << "unknown argument: " << argv[i] << '\n'; return 2; }
   }
   std::signal(SIGPIPE, SIG_IGN);
@@ -131,7 +218,7 @@ int main(int argc, char** argv) {
     int fd = accept_tcp(listener); if (fd < 0) continue;
     Request request; Response response; std::string error;
     if (!receive_request(fd, request, error)) { response.error = error; }
-    else response = execute_axmodel(request);
+    else response = execute_request(request);
     if (!send_response(fd, response, error)) std::cerr << "response failed: " << error << '\n';
     close_socket(fd);
   }

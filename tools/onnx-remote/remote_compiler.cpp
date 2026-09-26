@@ -235,9 +235,14 @@ Response compile(const Request& request, const Options& options) {
     // Useful for validating transport, caching, and runner integration before
     // the proprietary QNN/QAIRT compiler is installed.
     response.artifact = request.model;
-    response.manifest = "{\"backend\":\"passthrough\",\"target\":\"" +
-                        options.target + "\",\"compiler_id\":\"" +
-                        options.compiler_id + "\"}";
+    response.manifest =
+        "{\"schema_version\":1,\"compiler\":{\"name\":\"passthrough\","
+        "\"version\":\"0\",\"id\":\"" + options.compiler_id +
+        "\"},\"target\":{\"backend\":\"passthrough\",\"device\":\"" +
+        options.target + "\"},\"artifact\":{\"format\":\"onnx\","
+        "\"abi\":\"none\"},\"io\":{\"dtype\":\"float32\"},"
+        "\"capabilities\":{\"ops\":[],\"dtypes\":[\"float32\"]},"
+        "\"legalization\":{\"profile\":\"none\",\"version\":1}}";
   } else if (!write_file(input_path, request.model, error)) {
     response.error = error;
   } else {
