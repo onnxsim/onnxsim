@@ -249,6 +249,55 @@ def test_compile_onnx_imports_through_tinygrad_uop_without_pulsar2(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
 
 
+def test_compile_onnx_frozen_conv_keeps_uop_shape_and_emits_mcode(tmp_path):
+    rng = np.random.default_rng(1965)
+    weights = rng.normal(0.0, 0.02, (64, 64, 3, 3)).astype(np.float32)
+    bias = rng.normal(0.0, 0.01, (64,)).astype(np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv",
+                    ["x", "w", "b"],
+                    ["y"],
+                    pads=[1, 1, 1, 1],
+                    strides=[1, 1],
+                )
+            ],
+            "frozen_conv_to_uop",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [
+                numpy_helper.from_array(weights, "w"),
+                numpy_helper.from_array(bias, "b"),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {
+                "scales": {"x": 0.007058821618556976, "y": 0.03239550068974495},
+                "zero_points": {"x": 127, "y": 125},
+            },
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert list(generated.graph.output[0].type.tensor_type.shape.dim)[0].dim_value == 16
+    assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
+
+
 def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 

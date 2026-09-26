@@ -315,6 +315,59 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
+    if len(nodes) == 1 and nodes[0].op_type == "Conv":
+        conv = nodes[0]
+        init = _initializer_map(model)
+        if len(model.graph.input) != 1 or model.graph.input[0].name != conv.input[0]:
+            raise ValueError("standalone Conv requires one runtime input named x")
+        if conv.input[1] not in init:
+            raise ValueError("standalone Conv requires a frozen weight initializer")
+        shape = values.get(conv.input[0], ())
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
+        weight_shape = tuple(int(d) for d in init[conv.input[1]].dims)
+        attrs = _attrs(conv)
+        strides = tuple(attrs.get("strides", (1, 1)))
+        pads = tuple(attrs.get("pads", (0, 0, 0, 0)))
+        dilations = tuple(attrs.get("dilations", (1, 1)))
+        if (
+            not shape
+            or not output_shape
+            or len(conv.input) not in (2, 3)
+            or (len(conv.input) == 3 and conv.input[2] not in init)
+            or attrs.get("group", 1) != 1
+            or dilations != (1, 1)
+        ):
+            raise ValueError("standalone Conv is not a validated frozen-weight form")
+        # Resolve the exact committed Conv template now, before generation.
+        # The emitter deliberately refuses every unmeasured shape/stride/pad.
+        from tinygrad_ax_backend import TemplateCache, TemplateKey
+
+        TemplateCache().lookup(
+            TemplateKey(
+                "Conv",
+                (tuple(shape),),
+                (
+                    ("pads", pads),
+                    ("strides", strides),
+                    ("w", weight_shape),
+                ),
+                weight_dtype="s8",
+            )
+        )
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "conv",
+                    (conv.input[0],),
+                    model.graph.output[0].name,
+                    tuple(shape),
+                    tuple(output_shape),
+                    operand_shape=weight_shape,
+                ),
+            )
+        )
     if (
         len(nodes) == 2
         and nodes[0].op_type in ("Greater", "Less")
@@ -445,9 +498,7 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             )
         input_shapes = (values.get("x", ()), values.get("z", ()))
         if not all(input_shapes):
-            raise ValueError(
-                f"standalone {add.op_type} requires static input shapes"
-            )
+            raise ValueError(f"standalone {add.op_type} requires static input shapes")
         try:
             shape = tuple(np.broadcast_shapes(*input_shapes))
         except ValueError as exc:
@@ -672,6 +723,49 @@ def generate(
             zero_points=zero_points,
         )
         onnx.save(model, output_path)
+    elif plan.chain == "conv":
+        if calibration is None:
+            raise ValueError("standalone Conv generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError(
+                "Conv calibration requires scales and zero_points mappings"
+            )
+        import tinygrad_ax_backend as axb
+
+        node = model.graph.node[0]
+        init = _initializer_map(model)
+        weights = numpy_helper.to_array(init[node.input[1]]).astype(np.float32)
+        bias = (
+            numpy_helper.to_array(init[node.input[2]]).astype(np.float32)
+            if len(node.input) == 3
+            else np.zeros(weights.shape[0], dtype=np.float32)
+        )
+        attrs = _attrs(node)
+        key = axb.TemplateKey(
+            "Conv",
+            (plan.segments[0].input_shape,),
+            (
+                ("pads", tuple(attrs.get("pads", (0, 0, 0, 0)))),
+                ("strides", tuple(attrs.get("strides", (1, 1)))),
+                ("w", tuple(weights.shape)),
+            ),
+            weight_dtype="s8",
+        )
+        generated = axb.EditSet(
+            [
+                axb.ConvWeightEdit(
+                    weights,
+                    bias,
+                    float(scales["x"]),
+                    float(zero_points["x"]),
+                    float(scales["y"]),
+                    float(zero_points["y"]),
+                )
+            ]
+        ).build(key)
+        onnx.save(generated, output_path)
     elif plan.chain in ("greatercast", "lesscast"):
         model = misc_op_record_emit.emit_spec(
             plan.chain.title().replace("cast", "Cast"),

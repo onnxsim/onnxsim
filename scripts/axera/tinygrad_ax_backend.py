@@ -2773,11 +2773,38 @@ def compile_onnx(
     unsupported shapes and graph forms raise from :func:`compile_uop` rather
     than falling back to Pulsar2.
     """
-    return compile_uop(
-        onnx_to_uop(model_or_path),
-        schedule_path=schedule_path,
-        calibration=calibration,
-    )
+    root = onnx_to_uop(model_or_path)
+    if isinstance(model_or_path, onnx.ModelProto):
+        source_model = model_or_path
+    elif isinstance(model_or_path, (bytes, bytearray, memoryview)):
+        source_model = onnx.load_model_from_string(bytes(model_or_path))
+    else:
+        source_model = onnx.load(os.fspath(model_or_path), load_external_data=False)
+    # UOp intentionally represents Conv weights as runtime allocations, and a
+    # biased Conv is canonicalized as Conv + constant Add. For a frozen ONNX
+    # model, retain the source initializer so the validated ConvWeightEdit can
+    # encode it into the committed mcode template.
+    if (
+        len(source_model.graph.node) == 1
+        and source_model.graph.node[0].op_type == "Conv"
+        and len(source_model.graph.node[0].input) >= 2
+        and any(
+            init.name == source_model.graph.node[0].input[1]
+            for init in source_model.graph.initializer
+        )
+    ):
+        import graph_generator
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "frozen_conv.onnx")
+            output = os.path.join(directory, "frozen_conv.axmodel")
+            onnx.save(source_model, source)
+            graph_generator.generate(
+                source, output, schedule_path=schedule_path, calibration=calibration
+            )
+            with open(output, "rb") as stream:
+                return stream.read()
+    return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
 
 
 def apply_policy(
@@ -2960,9 +2987,9 @@ def tinygrad_classes() -> dict[str, type]:
             another smaller broadcastable input) can therefore arrive in a
             tinygrad buffer with fewer elements than the template expects.
             """
-            raw = np.frombuffer(
-                buffer, np.uint8, count=memoryview(buffer).nbytes
-            ).view(spec.dtype)
+            raw = np.frombuffer(buffer, np.uint8, count=memoryview(buffer).nbytes).view(
+                spec.dtype
+            )
             expected = int(np.prod(spec.shape, dtype=np.int64))
             if raw.size == expected:
                 return raw.reshape(spec.shape)
@@ -2987,7 +3014,9 @@ def tinygrad_classes() -> dict[str, type]:
                 raise ValueError(
                     f"model has {n_out} outputs + {len(m.inputs)} inputs, got {len(bufs)} buffers"
                 )
-            ins = [self._stage_input(b, spec) for b, spec in zip(bufs[n_out:], m.inputs)]
+            ins = [
+                self._stage_input(b, spec) for b, spec in zip(bufs[n_out:], m.inputs)
+            ]
             before = self.session.exec_us
             outs = self.session.run(m, ins)
             for b, y in zip(bufs[:n_out], outs):
