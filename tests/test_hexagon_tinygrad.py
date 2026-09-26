@@ -36,10 +36,34 @@ BRIDGE = (
     / "tinygrad_hexagon_bridge"
 )
 CI_DIR = BRIDGE / "ci"
+sys.path.insert(0, str(BRIDGE / "tinygrad_codegen"))
+from hexagon_target import (  # noqa: E402
+    SNAPDRAGON_845,
+    configure_tinygrad_environment,
+    get_target,
+)
+
 TIMEOUT = 1800
 
 
 # ----------------------------------------------------------------------------------------- tools
+
+
+def test_snapdragon_845_hexagon_target_profile():
+    target = get_target("845")
+    assert target is SNAPDRAGON_845
+    assert target.mcpu == "hexagonv65"
+    assert target.hvx == "v65"
+    assert target.simulator_arch == "v68"
+    assert target.clang_flags == (
+        "--target=hexagon",
+        "-mcpu=hexagonv65",
+        "-mhvx=v65",
+        "-mhvx-length=128b",
+    )
+    env = configure_tinygrad_environment(target)
+    assert env["HVX_ARCH"] == "v65"
+    assert env["HEXSIM_ARCH"] == "v68"
 
 
 def _run(cmd, cwd=None, env=None, timeout=TIMEOUT) -> subprocess.CompletedProcess:
@@ -94,9 +118,7 @@ def clang() -> str | None:
         probe = _run(
             [
                 path,
-                "--target=hexagon",
-                "-mcpu=hexagonv65",
-                "-mhvx=v65",
+                *SNAPDRAGON_845.clang_flags,
                 "-x",
                 "c",
                 "-c",

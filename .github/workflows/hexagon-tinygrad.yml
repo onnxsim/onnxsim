@@ -123,6 +123,7 @@ jobs:
         shell: bash  # -o pipefail: the default `bash -e` would let tee swallow pytest's exit code
         env:
           HEXAGON_CLANG: clang-19
+          TINYGRAD_HEXAGON_TARGET: snapdragon845
         run: |
           pytest -v -rs --durations=0 tests/test_hexagon_tinygrad.py | tee pytest.log
           # Every tool is installed here, so a skip means something is deliberately not collected rather

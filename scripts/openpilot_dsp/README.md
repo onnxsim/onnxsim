@@ -6,7 +6,14 @@ run them on the comma device's Adreno 630 GPU. SNPE's DSP runtime used to run th
 This directory asks whether that can be done again without SNPE, with our own int8 HVX kernels on the
 845's V65 cDSP. The GPU would then be free for other work.
 
-**No 845 device was used.** Every number below is one of:
+**No 845 device was used.** Until one is available, V65 work follows two
+simulation rules:
+
+- QEMU is the correctness target and runs the generated `hexagonv65` binary.
+- Hexagon-sim is used only for relative timing, with `-mv68` as the closest
+  available pipeline proxy; tinygrad lowering remains `HVX_ARCH=v65`.
+
+Every number below is one of:
 
 - **measured on the host**: ONNX Runtime accuracy on real route frames, or hexagon-sim cycles;
 - **measured on the device in the route's own logs**: `modelExecutionTime` from the comma device that
@@ -185,6 +192,31 @@ tinygrad at openpilot's pinned commit `9d0446a` has a DSP backend (`tinygrad/run
 - it compiles `--target=hexagon -mcpu=hexagonv65 -mhvx=v65 -nostdlib`;
 - on the device it talks to `/dev/adsprpc-smd` + ION directly and boots `/dsp/cdsp/fastrpc_shell_3`;
 - `MOCKDSP=1` runs the same code under `qemu-hexagon`.
+
+## 6. Generic SNPE replacement boundary
+
+`tinygrad_runner.py` provides a small session adapter with the same model IO
+surface used by `run_models.py`: `get_inputs()`, `get_outputs()`, and `run()`.
+It accepts any ONNX graph that the pinned tinygrad `OnnxRunner` supports, not
+just the driving and DM models. A generic model can be checked with:
+
+```bash
+DEV=DSP MOCKDSP=1 python scripts/openpilot_dsp/tinygrad_runner.py \
+  model.onnx inputs.npz outputs.npz --target snapdragon845
+```
+
+The `.npz` keys must match ONNX input names. `evaluate.py --backend tinygrad`
+uses the same adapter for the recurrent driving model and the DM model, so
+accuracy comparisons share the existing openpilot output metrics.
+
+On a real Snapdragon 845, use `DEV=DSP` without `MOCKDSP=1`; the target still
+must be `snapdragon845`, while the tinygrad runtime uses the phone's `/dev/ion`
+and FastRPC devices. A host check should keep `MOCKDSP=1` enabled.
+
+This replaces the SNPE model-execution API, not its proprietary DSP transport:
+on a host, `MOCKDSP=1` uses qemu; on a Snapdragon 845, the tinygrad DSP runtime
+still needs a working FastRPC/ION integration and signed DSP deployment. The
+adapter intentionally keeps that transport separate from generic model IO.
 
 Its CI benchmark (`benchmark.yml`, job `testqualcommdsp`) runs an int8 MobileNetV2 with `DEV=DSP NOOPT=1`
 on a self-hosted **comma4** runner, with a `testsig-*.so` symlinked in. So the signed-PD route through
@@ -425,6 +457,46 @@ activations still float:
 Only the cheaper config fits the 20 Hz budget on one cDSP at the assumed clock. That is before the
 unmodeled dw↔pw layout conversions (§7, ~5%) and head epilogues. Its error is 15x fp16's on plan and
 40x on lead.
+
+## 9. Tinygrad DSP kernel search
+
+`tinygrad_codegen/dsp_autotune.py` searches the first DSP-specific tuning
+space: `BEAM=0,1,2,4` crossed with HVX prefetch distances `1024,2048,4096`,
+plus `NOOPT=1`. Each candidate is isolated in a fresh
+process, checked for exact results under V65-compatible QEMU, then timed under
+the V68 Hexagon-sim pipeline proxy. Results are cached so later runs only test
+new candidates:
+
+```bash
+PYTHONPATH=<tinygrad> HEXAGON_TOOLS=<Tools> \
+python scripts/android/tinygrad_hexagon_bridge/tinygrad_codegen/dsp_autotune.py \
+  --target snapdragon845 --cache v65-tinygrad-tuning.json
+```
+
+This is the initial search layer. The next candidate dimensions should be
+DSP-specific schedule choices—HVX width, output-channel tile, reduction tile,
+prefetch distance, and layout—rather than simply increasing BEAM. The winning
+configuration can then be passed into the generic tinygrad runner or promoted
+to a dedicated `custom_kernel` implementation.
+
+The handwritten kernel corpus now also includes the int32 per-channel
+bias-add required between V65 convolution accumulation and requantization;
+`tinygrad_codegen/gen_kernels.py` compares it against ordinary tinygrad code.
+
+For a usable openpilot-facing execution path, `openpilot_runner.py` keeps the
+driving model's recurrent state as DSP tensors instead of copying every state
+buffer through NumPy. It supports warmup, per-frame timing, route `.npz`
+inputs, and the autotuner cache:
+
+```bash
+DEV=DSP MOCKDSP=1 python scripts/openpilot_dsp/openpilot_runner.py \
+  dmonitoring_model.onnx inputs_seg8.npz dm_outputs.npz \
+  --kind dm --warmup 3 --target snapdragon845 \
+  --tuning v65-tinygrad-tuning.json
+```
+
+Use `MOCKDSP=1` for V65 QEMU validation; omit it on a phone with the required
+tinygrad FastRPC/ION runtime setup.
 
 ## Going on device (plan)
 

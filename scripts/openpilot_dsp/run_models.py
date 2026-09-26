@@ -64,6 +64,13 @@ def session(path, threads=8):
     return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
 
 
+def tinygrad_session(path, device="DSP", target="snapdragon845"):
+    """Create the generic tinygrad session used as the SNPE replacement path."""
+    from tinygrad_runner import TinygradSession
+
+    return TinygradSession(path, device, target)
+
+
 def run_driving(sess, road, n):
     ins = {i.name: i for i in sess.get_inputs()}
     ft = lambda name: np.float16 if "float16" in ins[name].type else np.float32  # noqa: E731

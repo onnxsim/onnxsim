@@ -40,9 +40,22 @@ DM_HEADS = [
 ]
 
 
-def run(kind, model, seg, inputs_dir, threads):
+def run(
+    kind,
+    model,
+    seg,
+    inputs_dir,
+    threads,
+    backend="ort",
+    device="DSP",
+    target="snapdragon845",
+):
     d = np.load(os.path.join(inputs_dir, f"inputs_seg{seg}.npz"))
-    s = run_models.session(model, threads)
+    s = (
+        run_models.session(model, threads)
+        if backend == "ort"
+        else run_models.tinygrad_session(model, device, target)
+    )
     if kind == "driving":
         return run_models.run_driving(s, d["road"], len(d["road"]))
     calib = [float(v) for v in SEG_CALIB[seg].split(",")]
@@ -100,6 +113,9 @@ def main():
     ap.add_argument("--segments", default="8,5")
     ap.add_argument("--inputs-dir", default=".")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--backend", choices=["ort", "tinygrad"], default="ort")
+    ap.add_argument("--device", default="DSP")
+    ap.add_argument("--target", default="snapdragon845")
     ap.add_argument("--json", help="append results to this JSON file")
     args = ap.parse_args()
     fp32 = args.fp32 or (
@@ -123,10 +139,31 @@ def main():
         for seg in args.segments.split(","):
             refp = os.path.join(args.inputs_dir, f"ref_{args.kind}_fp32_s{seg}.npy")
             if not os.path.exists(refp):
-                np.save(refp, run(args.kind, fp32, seg, args.inputs_dir, args.threads))
+                np.save(
+                    refp,
+                    run(
+                        args.kind,
+                        fp32,
+                        seg,
+                        args.inputs_dir,
+                        args.threads,
+                        args.backend,
+                        args.device,
+                        args.target,
+                    ),
+                )
             row[seg] = metric(
                 np.load(refp),
-                run(args.kind, path, seg, args.inputs_dir, args.threads),
+                run(
+                    args.kind,
+                    path,
+                    seg,
+                    args.inputs_dir,
+                    args.threads,
+                    args.backend,
+                    args.device,
+                    args.target,
+                ),
                 slices,
             )
         results[name] = row

@@ -54,9 +54,11 @@ Findings:
    matmul measured 1.0 ms and 7.6 ms in different runs), so read that column as indicative; the
    GPU kernel times were stable to a few percent.
 
-### tinygrad's Hexagon renderer (mock DSP, QEMU)
+### tinygrad's Hexagon renderer (Snapdragon 845 / mock DSP, QEMU)
 
-Kernels compiled with `clang --target=hexagon -mcpu=hexagonv65 -mhvx=v65` and run under
+`TINYGRAD_HEXAGON_TARGET=snapdragon845` selects the Snapdragon 845's Hexagon
+685 / V65 HVX profile. Kernels are compiled with `clang --target=hexagon
+-mcpu=hexagonv65 -mhvx=v65 -mhvx-length=128b` and run under
 `qemu-hexagon-static`; the "time" is an instruction count, reported per multiply-add:
 
 | Workload | instructions | instructions per MAC |

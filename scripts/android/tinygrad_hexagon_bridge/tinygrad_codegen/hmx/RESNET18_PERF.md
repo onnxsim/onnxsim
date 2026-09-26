@@ -86,24 +86,50 @@ flat by `__hmx_i8_copy_a` (the contiguous 2 KB copy the README credits for 24.2 
 Under option 3 the 10 phase-pixels of a lane group span ~3 grid rows, so the A pack becomes
 a strided gather. The stem alone packs 202 panels x 2 phases x 16 blocks x 2 KB = 12.9 MB
 of A; the README puts whole-graph activation packing at ~150k pcycles, so even a 3x gather
-cost is well covered by the 3.5M saved. **Net: clearly positive, and the plan is sound
-enough to implement.**
+cost is well covered by the 3.5M saved. **Net: clearly positive.**
 
-## Implementation shape
+> **This estimate turned out to be wrong - see "Tried" below.** Packing 64 phase-pixels x 3
+> channels needs exactly 192 lanes = 6 blocks of 32 (100% lane use, no padding, 2.67x fewer
+> MACs), but the gather costs 46.4M pcycles, not the ~150k this section assumed, and the
+> result is 2.9x slower. The reasoning error is identified in the "Tried" section; the
+> analysis of where the 3.59x goes is unaffected.
 
-`tinygrad/nn/onnx_qdq.py` builds the stem as a `(1, Hs*Ws, 32)` phase-split grid and
-`_conv` reshapes `v` to `(P64, 1, k, k, Cb, 32)`. For the stem specifically (`self.ops[0]`,
-`sk` window) the 32 lanes must be re-packed from 4 phases x 8 channels into 10 phase-pixels
-x 3 channels, which means:
+## Tried: packing other taps into the spare K lanes (does not pay)
 
-- `_build_consts`: the `wk = np.zeros((sk, sk, 2, 2, 8, N))` stem weight packing has to
-  become a lane map over (tap, phase, channel) -> lane, with 2 padding lanes per block.
-- `__call__`: the `S` phase-split construction has to emit the new lane order.
-- `ops_dsp.py`: a new `__hmx_i8_pack_a*` for the strided A gather (the existing
-  `__hmx_i8_copy_a` assumes one contiguous 2 KB).
+The plan above was implemented on a `stem-kpack` branch of the fork
+(`tinygrad/nn/onnx_qdq.py`, `QDQ_STEM_KPACK=1`, the 2x2 phase split's 4 phases x 8 padded
+channels replaced by 64 phase-pixels x 3 real channels = `kp = 4*sk*sk` phase-pixels,
+`kb = kp*xin.c/32 = 6` K blocks of 32 instead of 16 blocks):
 
-Note the A tile is 64 rows x 32 bytes and the `:cm` op is 32(M)x64(N)x32(K), so the 64 A
-rows are two M-tiles. The lane re-pack has to hold for both.
+- **Numerically exact.** 0/25088 off ORT, and identical to the old layout in a standalone
+  numpy check over a 16x16x3 stem (0 mismatches of 1024).
+- **2.67x fewer MACs, as predicted** - but **2.9x SLOWER overall**: 68,918,887 pcycles
+  against the baseline's 23,945,103.
+
+| kernel | pcycles | share | note |
+|---|---:|---:|---|
+| `E_12928_32_6` (new) | 46,377,606 | **67.3%** | the gather, materialized as its own kernel |
+| `r_2_202_..._6` (stem) | 6,707,880 | 9.7% | was 6,320,833 with 16 K blocks |
+| everything else | ~15.8M | | unchanged |
+
+**Why.** The K lanes of an A tile row were 4 phase-pixels of *one* grid row, so the whole
+2 KB tile was one contiguous `__hmx_i8_copy_a`. With the lanes spanning the window, one row
+gathers from ~3 grid rows, which tinygrad materialises as a separate copy
+(`E_12928_32_6`, 12928 x 32 x 6 bytes = 2.5 MB) - and the stem conv itself only went from
+6.32M to 6.71M, i.e. the 2.67x MAC saving was entirely eaten by losing the contiguous copy.
+
+The estimate in "The stem lever, worked out" was wrong: it priced the strided gather against
+a whole-graph ~150k pcycles for activation packing, but the stem's A operand alone is
+202 panels x 2 phases x 16 blocks x 2 KB = 12.9 MB, and gathering it costs ~3.6x what the
+flat copy did. Saving 4.3M pcycles of MACs and paying 46.4M for the gather is a large net
+loss.
+
+**What this says about the lever.** Removing the stem's wasted MACs needs the *pack* to stay
+flat, not just the MAC count to drop. That means the wasted lanes have to be filled from
+data already contiguous in memory - the hand kernel's crouton layout, where a 3x3 conv is
+`:single` windows over shifted copies of an already-packed 2 KB activation. That is a
+graph-level layout change (the README's own next step), not a re-lane-packing of the same
+grid. The branch was dropped rather than kept behind a flag.
 
 ## The three layer4 convs (23.4%)
 

@@ -36,7 +36,7 @@ if __name__ == "__main__":
   p = argparse.ArgumentParser()
   p.add_argument("--size", choices=["small", "real"], default="real")
   p.add_argument("--out", default="kernels.h")
-  p.add_argument("--ops", default="add,maxpool,requant")
+  p.add_argument("--ops", default="add,bias_add,relu,maxpool,requant")
   a = p.parse_args()
   out_dir = os.path.dirname(os.path.abspath(a.out))
   typedefs: list[str] = []
