@@ -46,3 +46,4 @@ Build each like `harness.cc`; run on the phone under `phone-run`.
 - `cl_vs_wg.cc` -- the same microbenchmarks in **OpenCL** (libOpenCL.so loaded with dlopen, Khronos headers only): `cl_vs_wg info|warm S|peak|bw|gemm|conv|hint|hold S`.
   FMA peak (float/half/half2/half4), load bandwidth (buffer float4/half4/half8, image2d RGBA32F/RGBA16F), register-tile GEMM and direct 3x3 conv in
   buffer/image and f32/f16 variants, the `cl_qcom_perf_hint` experiment. Compare with `peak`, `bw`, `gemm`, `conv_alt` in the same session (see `../../WEBGPU_SURVEY.md`).
+- `layouts.cc` -- memory-layout study for conv/GEMM (activation: NHWC / NC4HW4 / 4x4-tiled / textures / packed f16; weights: HWIO / output-blocked / vec4-over-k dot / textures / packed f16; column- vs pixel-major thread map) with an interleaved head-to-head phase: `layouts conv KH Cin Cout H | pad | xform`. Raw output: `layouts_results.txt`.

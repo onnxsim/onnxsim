@@ -807,3 +807,53 @@ which is why all WebGPU figures in this section come from a build with a 4 s war
 **Practical consequences.** For an OpenCL-free stack: (a) use textures for the B operand / conv input in ORT's WebGPU EP (the `tt` design is 1.3-1.5x the
 buffer design here); (b) keep f16 storage with f32 accumulation (packed loads) rather than f16 arithmetic; (c) the remaining gap (OpenCL image kernels
 480 vs WebGPU 330-380 at f32, and all of half arithmetic) needs either OpenCL itself (tinygrad's OpenCL backend, TVM OpenCL) or a driver that lowers WGSL `f16` well.
+
+## Memory layouts for conv / GEMM on the Adreno 730 (`dawn_repro/layouts.cc`)
+
+One register-tile implicit-GEMM generator (scalar accumulators, TMxNV vec4 outputs per thread, no workgroup memory) run with different
+layouts: activations NHWC (ORT's), NC4HW4 `[C/4][HW]`, 4x4-pixel tiles (`z4`, thread order follows the tiles), RGBA32F/RGBA16F textures
+(`texa`: x = channel block, y = pixel; `texb`: x = ix*C4+c4, y = iy), packed f16 buffers (`nhwc16`, `nc416`); weights HWIO `[K][N4]` (ORT's),
+output-blocked `[N4][K]` (`ok4`), vec4-over-k with `dot()` (`nk4`), RGBA32F/RGBA16F textures x = n4, y = k (`texw`, `texw16`), packed f16 over n
+(`w16`); thread maps `colx` (x = channel group) and `rowx` (x = pixels, coalesced). Math is always f32 (f16 layouts unpack to f32).
+Batch 1, stride 1, warm GPU (>= 5 s burn), every candidate checked against a double CPU reference (rel. error <= 3e-6, computed from the
+f16-rounded operands for f16 layouts). The table is the **interleaved head-to-head** (the 12 best layouts of a layer timed in alternation,
+6 rounds, min per kernel): a sequential sweep is misleading here because the GPU clock drifts during a long run and other jobs share the phone (the same
+nhwc/hwio kernel read 185 GFLOPS early in one sweep and 108 late in another). Raw output: `dawn_repro/layouts_results.txt`.
+
+Min time over 6 interleaved rounds (ms); "ORT-like" = NHWC f32 buffer activations + HWIO f32 buffer weights, best tile config:
+
+| layer | ORT-like | nhwc + weights in f32 texture | nhwc + weights in f16 texture | best layout found |
+|---|---|---|---|---|
+| 1x1 64->256 @56 | 0.954 | 0.718 (1.33x) | 0.621 (1.54x) | **0.439** (2.17x): f16 texture act + f16 texture weights |
+| 1x1 512->128 @28 | 0.604 | 0.384 (1.57x, nc4 act) | 0.397 (1.52x) | **0.342** (1.77x): f16 texture act + f16 texture weights |
+| 1x1 1024->256 @14 | 1.348 | — | 0.849 (1.59x) | **0.648** (2.08x): f16 texture act + f16 texture weights |
+| 3x3 64 @56 | 1.240 | 0.784 (1.58x) | 0.741 (1.67x) | **0.685** (1.81x): packed-f16 nc4 act + f16 texture weights, rowx |
+| 3x3 128 @28 | 2.498 | 1.445 (1.73x) | 1.273 (1.96x) | **1.165** (2.14x): packed-f16 nhwc act + f16 texture weights |
+| 3x3 256 @14 | 1.558 | 1.200 (1.30x) | 0.785 (1.98x) | **0.706** (2.21x): f16 texture act + f16 texture weights |
+
+Findings:
+
+1. **Weights through a texture are the one layout change that matters**: 1.3-1.7x with f32 RGBA32F, 1.5-2.0x with RGBA16F (half the bytes; the texture
+   unit converts to f32 on load, so no f16 arithmetic and no accuracy change beyond rounding the weights to f16). The weight stream is the hot load in a
+   register-tile conv (every thread re-reads the full K x N slab) and the texture path has the higher read throughput (240 vs 163 GB/s buffer).
+2. **Activation layout is second order**: NHWC vs NC4HW4 vs 4x4-tiled are within about 10% of each other with buffer weights (z4 is +8% on 3x3 @56 and
+   -10..-50% on smaller maps, NC4HW4 is not consistently better, `texb` is worse than `texa`). Activations in a texture (`texa`, x = channel block, y = pixel)
+   gain 5-25% over the buffer, and RGBA16F activations stack with f16 weights for the best rows above.
+3. **Packed-f16 activation buffers** help only together with texture weights (nhwc16/texw16 vs nhwc/texw16: -10%..+14%); with buffer weights they are noise.
+4. **Weight buffer variants lose**: output-blocked `[N4][K]` (`ok4`) is 0.95-1.2x slower than HWIO, vec4-over-k with `dot()` (`nk4`) is 1.5-2.6x slower
+   (and 10x+ on 3x3 because of the taps addressing). Packed f16 weights in a buffer (`w16`) are between the f32 buffer and the f16 texture.
+5. **Thread map**: `colx` (x = channel group) wins except for 3x3 @56 where `rowx` (pixels along x) with TM4 NV4 is best; rowx with NHWC buffers reads strided
+   and is otherwise 10-40% worse.
+6. **Channel padding does not help** (1x1 @28, tiny problem so ~40-70 GFLOPS): 100 -> 104/112/128 channels changes padded GFLOPS by +0..+22% but loses 5-25% of
+   *useful* GFLOPS; padding beyond the vec4 multiple (x4) is pure cost. 60 -> 64 (x8..x32) is a wash.
+7. **Layout conversion is not free**: NHWC -> NC4HW4 runs at 16-34 GB/s (0.02-0.4 ms for ResNet activations), NC4HW4 -> NHWC is a scatter at 3-17 GB/s
+   (0.04-2.4 ms, e.g. 2.4 ms for 256 ch @56). A per-layer layout switch costs as much as the conv it would speed up, and the activation layouts are within ~10% of each
+   other, so the activation layout should stay NHWC end to end (as ORT has it).
+
+Recommendation, ranked: (1) keep prepacked conv/GEMM **weights in an RGBA16F (or RGBA32F) 2D texture** `[K][N/4]` and read them with `textureLoad`; (2) keep NHWC
+activations (optionally f16 RGBA textures between layers if the graph is f16 anyway); (3) `colx` thread map, `rowx` only for wide 3x3 maps; (4) do not pad channels past a
+multiple of 4; (5) do not switch activation layouts between layers. Estimated ORT end-to-end effect: **unverified**. The microbenchmark baseline is the same
+register-tile kernel with buffer weights, so the 1.3-2.0x per layer is a pure weight-load effect, but ORT's Conv2dMM stages weights through workgroup memory, ORT's Program
+API has no texture inputs, and earlier register-tile microbenchmark gains did not carry over into the network. If even half of the per-layer gain on the weight-heavy layers
+carried over, ResNet-50 (about 80% conv time) would drop roughly 10-20%; treat 5-10% as the realistic expectation until an ORT prototype (texture weights in the Winograd GEMM
+stage, which is a plain register-tile GEMM, is the cheapest place to try it) confirms it.
