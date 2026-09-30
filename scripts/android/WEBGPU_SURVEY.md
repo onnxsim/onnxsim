@@ -510,3 +510,33 @@ way. Two runs each on the Adreno 730 (ms; "x direct" = time / best direct regist
 - Recommended choice: F(4,3) for tile counts >= ~150 (64ch@56 and larger feature maps), F(2,3) below that, direct for < 64 channels. At 56x56 the
   end-to-end gain is bounded: ResNet-50 has only a few such layers, and in the ORT experiment the 56x56 layers added little over the smaller ones, so the expected
   network gain from F(4,3) is small (well under 1 ms of 61).
+
+## Winograd with f16 intermediates (standalone microbenchmark, `dawn_repro/conv_alt_f16.cc`)
+
+Same 3x3 Winograd F(2,3) pipeline as above, but the transformed tensors V (input) and U (weights) are stored packed f16 (8 halves per
+`vec4<u32>`), the 16 batched GEMMs unpack to f32 and accumulate in f32, and M is either f32 or packed f16. Graph input and output stay
+f32, so it would drop into ORT's Conv without an f16 graph (the input transform rounds, the output transform reads f16/f32). U is
+computed on the host and not timed (ORT caches it). Best of a few tile configs per pipeline, one submission of 10 repetitions,
+Cin = Cout = C, 0.231 GFLOP each. relerr = max|err| / max|ref| over 300 sampled outputs vs a double-precision direct convolution.
+The phone was busy, so absolute times are ~1.5-2x higher than in the section above; compare only within a row.
+
+| layer | f32 pipeline (ms) | f16 V,U + f32 M (ms, relerr) | f16 V,U,M (ms, relerr) |
+|---|---|---|---|
+| 64ch @ 56x56 | 1.88 (6e-7) | **0.93 (1.4e-3)** = 2.0x | **0.76 (1.8e-3)** = 2.5x |
+| 128ch @ 28x28 | 1.49 (4e-7) | **0.85 (8.0e-4)** = 1.8x | **0.65 (1.3e-3)** = 2.3x |
+| 256ch @ 14x14 | 1.63 (1.1e-6) | **0.94 (1.0e-3)** = 1.7x | 0.99 (1.5e-3) = 1.7x |
+| 512ch @ 7x7 | 1.49 (7e-7) | 1.26 (1.0e-3) = 1.2x | 1.33 (1.2e-3) = 1.1x |
+
+With post-ReLU-like (nonnegative) input the speedups are 1.9x/1.7x/1.6x/1.15x (M f32) and the errors 1.7e-3, 9e-4, 2e-3, 1.2e-3.
+
+- The GEMM stage is what shrinks (half the bytes per load and the same f32 fma count): 1.5 -> 0.46 ms at 64ch@56, 1.3 -> 0.75 at 128ch@28.
+  The transforms cost the same (input 0.05-0.21 ms, output 0.03-0.16 ms). Packing M as f16 helps only where the output transform and the
+  GEMM store dominate (56x56 and 28x28); at 14x14 and 7x7 keeping M in f32 is as fast or faster.
+- Accuracy is ~1e-3 relative to the largest output (8e-4 .. 2.2e-3), i.e. f16 rounding of V and U (2^-11 each) accumulated over K; the f32
+  pipeline is at 1e-6. That is the usual f16-inference error level, but it is NOT "f32 conv results": an f16 path would need to be
+  opt-in (or limited to models already run in f16), and needs an accuracy check on a real network (logits / detection boxes), not just
+  random data.
+- Speed potential in ORT: the 3x3 layers of ResNet-50 go from ~1.5 ms to ~0.9 ms per 0.231-GFLOP layer in the standalone pipeline; the
+  earlier Winograd integration shows the standalone ratios carry over only in part (the register-tile GEMM did not), so expect a fraction of
+  this. Worth trying because it needs only two changed transforms and a p16-style GEMM stage inside the existing four programs, with the
+  weight transform (cached) writing packed f16; the memory footprint of V, U, M also halves.
