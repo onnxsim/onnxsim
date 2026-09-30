@@ -1,0 +1,430 @@
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.cc b/onnxruntime/core/providers/webgpu/nn/conv.cc
+index d980f81..18cf253 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv.cc
+@@ -281,6 +281,11 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+     ORT_RETURN_IF_ERROR(TransposeKernel(context, kernel, kernel_shape, &transposed_kernel, perm));
+     conv_kernel = &transposed_kernel;
+   }
++  if (is_channels_last && conv_attrs_.group == 1 && strides[0] == 1 && strides[1] == 1 && dilations[0] == 1 && dilations[1] == 1 && input_shape.NumDimensions() == 4) {
++    bool applied = false;
++    ORT_RETURN_IF_ERROR(TryApplyWinogradConv(context, activation_, input, conv_kernel, bias, pads, output, applied));
++    if (applied) return Status::OK();
++  }
+   auto dim_a_outer = static_cast<uint32_t>(is_channels_last ? output_height * output_width : output_channels);
+   auto dim_b_outer = static_cast<uint32_t>(is_channels_last ? output_channels : output_height * output_width);
+   auto dim_inner = static_cast<uint32_t>(kernel_height * kernel_width * input_channels);
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.h b/onnxruntime/core/providers/webgpu/nn/conv.h
+index 5bf94a4..e7cfd25 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv.h
+@@ -32,6 +32,7 @@ class Conv : public WebGpuKernel {
+  protected:
+   ConvAttributes conv_attrs_;
+   Activation activation_;
++  mutable std::unique_ptr<Tensor> winograd_u_;  // Winograd-transformed weights, cached when the kernel is a prepacked initializer
+   std::unique_ptr<Tensor> transposed_kernel_;  // should only have value when `is_initializer` AND `is_4D` AND `is_NHWC`
+ };
+ 
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+index a1ea470..b4481bf 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+@@ -1,5 +1,6 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ #include <iterator>
+@@ -162,6 +163,59 @@ Status Conv2dMMProgram::GenerateShaderCode(ShaderHelper& shader) const {
+       << Conv2dCommonSnippet(x, w, activation_, "x_element_t", element_size_[0], element_size_[1], element_size_[2]);
+   std::string data_type = "x_element_t";
+ 
++  if (reg_tile_) {
++    const int R = static_cast<int>(elements_per_thread_[1]);
++    // thread = 8 output rows x 8 output channels (2 vec4), 64 scalar accumulators; A/B read straight from global memory
++    auto& b = shader.MainFunctionBody();
++    // same logical id computation as InitializeLogicalWorkgroupIDAndGlobalID (gemm_utils.cc, not exported)
++    b << "  let logical_workgroup_id_z = workgroup_idx / (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y);\n"
++      << "  let logical_workgroup_id_y = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) / uniforms.logical_dispatch_x;\n"
++      << "  let logical_workgroup_id_x = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) % uniforms.logical_dispatch_x;\n"
++      << "  let logical_workgroup_id = vec3u(logical_workgroup_id_x, logical_workgroup_id_y, logical_workgroup_id_z);\n"
++      << "  const workgroupSize = vec3u(workgroup_size_x, workgroup_size_y, workgroup_size_z);\n"
++      << "  let logical_global_id = logical_workgroup_id * workgroupSize + local_id;\n";
++    b << "  let row0 = i32(logical_global_id.y) * " << R << ";\n"
++      << "  let col0 = i32(logical_global_id.x) * 2;\n"
++      << "  let batch = i32(logical_global_id.z);\n"
++      << "  let inCh4 = i32(uniforms.w_shape[2]) / 4;\n"
++      << "  let kH = i32(uniforms.w_shape[0]);\n"
++      << "  let kW = i32(uniforms.w_shape[1]);\n"
++      << "  let cout4 = i32(uniforms.w_shape[3]);\n"
++      << "  let outW = i32(uniforms.result_shape[2]);\n"
++      << "  let xH = i32(uniforms.x_shape[1]);\n"
++      << "  let xW = i32(uniforms.x_shape[2]);\n";
++    for (int m = 0; m < R; m++)
++      b << "  let rv" << m << " = row0 + " << m << " < i32(uniforms.dim_a_outer);\n"
++        << "  let yb" << m << " = ((row0 + " << m << ") / outW) * i32(uniforms.strides[0]) - i32(uniforms.pads[0]);\n"
++        << "  let xb" << m << " = ((row0 + " << m << ") % outW) * i32(uniforms.strides[1]) - i32(uniforms.pads[1]);\n"
++        << "  var off" << m << " = 0;\n";
++    for (int m = 0; m < R; m++)
++      for (int c = 0; c < 8; c++) b << "  var c" << m << "_" << c << " = 0.0;\n";
++    b << "  if (col0 < cout4) {\n"
++      << "  for (var wr = 0; wr < kH; wr++) {\n"
++      << "  for (var wc = 0; wc < kW; wc++) {\n";
++    for (int m = 0; m < R; m++)
++      b << "    { let xr = yb" << m << " + i32(uniforms.dilations[0]) * wr; let xc = xb" << m << " + i32(uniforms.dilations[1]) * wc;\n"
++        << "      off" << m << " = select(-1, ((batch * xH + xr) * xW + xc) * inCh4, rv" << m << " && xr >= 0 && xr < xH && xc >= 0 && xc < xW); }\n";
++    b << "    let kBase = (wr * kW + wc) * inCh4 * 4;\n"
++      << "    for (var c4 = 0; c4 < inCh4; c4++) {\n";
++    for (int m = 0; m < R; m++)
++      b << "      var a" << m << " = vec4<x_element_t>(0.0); if (off" << m << " >= 0) { a" << m << " = " << x.GetByOffset("u32(off" + std::to_string(m) + " + c4)") << "; }\n";
++    for (int kk = 0; kk < 4; kk++) {
++      for (int n = 0; n < 2; n++)
++        b << "      let b" << kk << "_" << n << " = " << w.GetByOffset("u32((kBase + c4 * 4 + " + std::to_string(kk) + ") * cout4 + col0 + " + std::to_string(n) + ")") << ";\n";
++      for (int m = 0; m < R; m++)
++        for (int n = 0; n < 2; n++)
++          for (int j = 0; j < 4; j++)
++            b << "      c" << m << "_" << n * 4 + j << " = fma(a" << m << "[" << kk << "], b" << kk << "_" << n << "[" << j << "], c" << m << "_" << n * 4 + j << ");\n";
++    }
++    b << "    }\n  }\n  }\n  }\n";
++    for (int m = 0; m < R; m++)
++      for (int n = 0; n < 2; n++)
++        b << "  mm_write(batch, row0 + " << m << ", col0 + " << n << ", vec4<x_element_t>(c" << m << "_" << n * 4 << ", c" << m << "_" << n * 4 + 1 << ", c" << m << "_" << n * 4 + 2 << ", c" << m << "_" << n * 4 + 3 << "));\n";
++    return Status::OK();
++  }
++
+   return is_vec4_ ? MakeMatMulPackedVec4Source(shader, elements_per_thread_, WorkgroupSizeX(), WorkgroupSizeY(), data_type, /* batch_dims = */ nullptr, /* transpose_a = */ !is_channels_last_, /* transpose_b = */ false, 1.0f, true, 4, tile_inner_)
+                   : MakeMatMulPackedSource(shader, elements_per_thread_, WorkgroupSizeX(), WorkgroupSizeY(), data_type, /* batch_dims = */ nullptr, /*transpose_a = */ !is_channels_last_, /* transpose_b = */ false, 1.0f, true, tile_inner_, /* split_t = */ false, 0);
+ }
+@@ -184,8 +238,13 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
+   // TODO: fine tune size
+   const auto dispatch_x = is_channels_last ? output_channels : output_width * output_height;
+   const auto dispatch_y = is_channels_last ? output_width * output_height : output_channels;
+-  std::vector<uint32_t> workgroup_size = {8, 8, 1};
+-  InlinedVector<int64_t> elements_per_thread = {4, static_cast<int64_t>(dim_a_outer <= 8 ? 1 : 4), 1};
++  // register-tile path: vec4 NHWC with 4 input channels per load (Cin % 4 == 0), 16x4 threads x (8 rows x 8 channels)
++  static const int reg_mode = [] { const char* e = std::getenv("ORT_WEBGPU_CONV_REGTILE"); return e == nullptr ? 0 : std::atoi(e); }();
++  const int64_t ksz = input_output_shapes[1][0] * input_output_shapes[1][1];
++  const bool reg_env = reg_mode == 1 || (reg_mode == 2 && ksz == 1) || (reg_mode == 3 && ksz > 1);
++  const bool reg_tile = reg_env && is_vec4 && is_channels_last && in_channels % 4 == 0 && output_channels % 8 == 0 && dim_a_outer >= 32;
++  std::vector<uint32_t> workgroup_size = reg_tile ? std::vector<uint32_t>{16, 4, 1} : std::vector<uint32_t>{8, 8, 1};
++  InlinedVector<int64_t> elements_per_thread = reg_tile ? InlinedVector<int64_t>{8, static_cast<int64_t>(std::getenv("ORT_WEBGPU_CONV_REGTILE_ROWS") ? std::atoi(std::getenv("ORT_WEBGPU_CONV_REGTILE_ROWS")) : 8), 1} : InlinedVector<int64_t>{4, static_cast<int64_t>(dim_a_outer <= 8 ? 1 : 4), 1};
+   auto integer_ceil = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
+ 
+   const std::vector<uint32_t> dispatch = {
+@@ -208,6 +267,7 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
+   TensorShape reduced_input_shape = ReduceShapeByComponents(input_output_shapes[0], input_components);
+   TensorShape reduced_weight_shape = ReduceShapeByComponents(input_output_shapes[1], components);
+   TensorShape reduced_output_shape = ReduceShapeByComponents(input_output_shapes[has_bias ? 3 : 2], components);
++  program.reg_tile_ = reg_tile;
+   program.AddInputs({{input, ProgramTensorMetadataDependency::TypeAndRank, reduced_input_shape, input_components}, {weight, ProgramTensorMetadataDependency::TypeAndRank, reduced_weight_shape, components}});
+   if (has_bias) {
+     TensorShape reduced_bias_shape = ReduceShapeByComponents(input_output_shapes[2], components);
+@@ -219,7 +279,7 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
+     return oss.str();
+   };
+ 
+-  program.CacheHint(activation.ToString(), is_channels_last, stringify({inner_element_size, static_cast<uint32_t>(is_vec4 ? 1 : 0), fit_a_outer, fit_b_outer, fit_inner, tile_a_outer, tile_b_outer, tile_inner, static_cast<uint32_t>(components)}))
++  program.CacheHint(activation.ToString(), is_channels_last, stringify({inner_element_size, static_cast<uint32_t>(is_vec4 ? 1 : 0), fit_a_outer, fit_b_outer, fit_inner, tile_a_outer, tile_b_outer, tile_inner, static_cast<uint32_t>(components), static_cast<uint32_t>(reg_tile)}))
+       .AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, reduced_output_shape, components})
+       .SetDispatchGroupSize(dispatch[0], dispatch[1], dispatch[2])
+       .SetWorkgroupSize(workgroup_size[0], workgroup_size[1], workgroup_size[2])
+@@ -238,3 +298,196 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
+ 
+ }  // namespace webgpu
+ }  // namespace onnxruntime
++
++namespace onnxruntime {
++namespace webgpu {
++
++namespace {
++// G (4x3) of Winograd F(2,3): rows {1,0,0},{.5,.5,.5},{.5,-.5,.5},{0,0,1}
++const char* kG[4][3] = {{"1.0", "0.0", "0.0"}, {"0.5", "0.5", "0.5"}, {"0.5", "-0.5", "0.5"}, {"0.0", "0.0", "1.0"}};
++}  // namespace
++
++Status ConvWinogradProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  auto S = [](int v) { return std::to_string(v); };
++  if (stage_ == 0) {
++    const auto& w = shader.AddInput("w", ShaderUsage::UseUniform);
++    const auto& u = shader.AddOutput("u", ShaderUsage::UseUniform);
++    auto& b = shader.MainFunctionBody();
++    b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++      << "  let cin = uniforms.c4 * 4u;\n  let ci = global_idx / uniforms.co4;\n  let cq = global_idx % uniforms.co4;\n";
++    for (int a = 0; a < 3; a++)
++      for (int c = 0; c < 3; c++) b << "  let g" << a << c << " = " << w.GetByOffset("(" + S(a * 3 + c) + "u * cin + ci) * uniforms.co4 + cq") << ";\n";
++    // t[r][c] = sum_a G[r][a] g[a][c]
++    for (int r = 0; r < 4; r++)
++      for (int c = 0; c < 3; c++) {
++        b << "  let t" << r << c << " = ";
++        for (int a = 0; a < 3; a++) b << (a ? " + " : "") << "g" << a << c << " * " << kG[r][a];
++        b << ";\n";
++      }
++    for (int r = 0; r < 4; r++)
++      for (int c = 0; c < 4; c++) {
++        b << "  " << u.SetByOffset("(" + S(r * 4 + c) + "u * cin + ci) * uniforms.co4 + cq", [&] {
++          std::string e;
++          for (int k = 0; k < 3; k++) e += std::string(k ? " + " : "") + "t" + S(r) + S(k) + " * " + kG[c][k];
++          return e;
++        }())
++          << "\n";
++      }
++    return Status::OK();
++  }
++  if (stage_ == 1) {
++    const auto& x = shader.AddInput("x", ShaderUsage::UseUniform);
++    const auto& v = shader.AddOutput("v", ShaderUsage::UseUniform);
++    auto& b = shader.MainFunctionBody();
++    b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++      << "  let cq = global_idx % uniforms.c4;\n  let t = global_idx / uniforms.c4;\n"
++      << "  let bi = t / uniforms.tiles_per_img;\n  let tt = t % uniforms.tiles_per_img;\n"
++      << "  let ty = i32(tt / uniforms.tw);\n  let tx = i32(tt % uniforms.tw);\n";
++    for (int r = 0; r < 4; r++)
++      for (int c = 0; c < 4; c++)
++        b << "  var d" << r << c << " = vec4<f32>(0.0);\n  { let iy = 2 * ty + " << r << " - i32(uniforms.pad_h); let ix = 2 * tx + " << c << " - i32(uniforms.pad_w);\n"
++          << "    if (iy >= 0 && iy < i32(uniforms.h) && ix >= 0 && ix < i32(uniforms.w)) { d" << r << c << " = "
++          << x.GetByOffset("((bi * uniforms.h + u32(iy)) * uniforms.w + u32(ix)) * uniforms.c4 + cq") << "; } }\n";
++    for (int c = 0; c < 4; c++)
++      b << "  let s0" << c << " = d0" << c << " - d2" << c << "; let s1" << c << " = d1" << c << " + d2" << c << "; let s2" << c << " = d2" << c << " - d1" << c << "; let s3" << c << " = d1" << c << " - d3" << c << ";\n";
++    for (int r = 0; r < 4; r++) {
++      std::string q = S(r);
++      std::string vals[4] = {"s" + q + "0 - s" + q + "2", "s" + q + "1 + s" + q + "2", "s" + q + "2 - s" + q + "1", "s" + q + "1 - s" + q + "3"};
++      for (int c = 0; c < 4; c++) b << "  " << v.SetByOffset(S(r * 4 + c) + "u * uniforms.total + global_idx", vals[c]) << "\n";
++    }
++    return Status::OK();
++  }
++  if (stage_ == 2) {
++    const auto& a = shader.AddInput("a", ShaderUsage::UseUniform);
++    const auto& bb = shader.AddInput("b", ShaderUsage::UseUniform);
++    const auto& m = shader.AddOutput("m", ShaderUsage::UseUniform);
++    auto& b = shader.MainFunctionBody();
++    b << "  let logical_workgroup_id_z = workgroup_idx / (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y);\n"
++      << "  let logical_workgroup_id_y = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) / uniforms.logical_dispatch_x;\n"
++      << "  let logical_workgroup_id_x = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) % uniforms.logical_dispatch_x;\n"
++      << "  let logical_workgroup_id = vec3u(logical_workgroup_id_x, logical_workgroup_id_y, logical_workgroup_id_z);\n"
++      << "  const workgroupSize = vec3u(workgroup_size_x, workgroup_size_y, workgroup_size_z);\n"
++      << "  let logical_global_id = logical_workgroup_id * workgroupSize + local_id;\n"
++      << "  let e = logical_global_id.z;\n  let cin = uniforms.c4 * 4u;\n"
++      << "  let row0 = logical_global_id.y * " << tm_ << "u;\n  let col0 = logical_global_id.x * " << nv_ << "u;\n";
++    for (uint32_t i = 0; i < tm_; i++) b << "  let ar" << i << " = min(row0 + " << i << "u, uniforms.ntiles - 1u);\n";
++    for (uint32_t i = 0; i < nv_; i++) b << "  let bc" << i << " = min(col0 + " << i << "u, uniforms.co4 - 1u);\n";
++    for (uint32_t i = 0; i < tm_; i++)
++      for (uint32_t j = 0; j < 4 * nv_; j++) b << "  var c" << i << "_" << j << " = 0.0;\n";
++    b << "  for (var k4 = 0u; k4 < uniforms.c4; k4++) {\n";
++    for (uint32_t i = 0; i < tm_; i++) b << "    let a" << i << " = " << a.GetByOffset("(e * uniforms.ntiles + ar" + std::to_string(i) + ") * uniforms.c4 + k4") << ";\n";
++    for (int kk = 0; kk < 4; kk++) {
++      for (uint32_t n = 0; n < nv_; n++) b << "    let b" << kk << "_" << n << " = " << bb.GetByOffset("(e * cin + k4 * 4u + " + S(kk) + "u) * uniforms.co4 + bc" + std::to_string(n)) << ";\n";
++      for (uint32_t i = 0; i < tm_; i++)
++        for (uint32_t n = 0; n < nv_; n++)
++          for (int j = 0; j < 4; j++)
++            b << "    c" << i << "_" << n * 4 + j << " = fma(a" << i << "[" << kk << "], b" << kk << "_" << n << "[" << j << "], c" << i << "_" << n * 4 + j << ");\n";
++    }
++    b << "  }\n";
++    for (uint32_t i = 0; i < tm_; i++)
++      for (uint32_t n = 0; n < nv_; n++)
++        b << "  if (row0 + " << i << "u < uniforms.ntiles && col0 + " << n << "u < uniforms.co4) { "
++          << m.SetByOffset("(e * uniforms.ntiles + row0 + " + std::to_string(i) + "u) * uniforms.co4 + col0 + " + std::to_string(n) + "u",
++                           "vec4<f32>(c" + std::to_string(i) + "_" + std::to_string(n * 4) + ", c" + std::to_string(i) + "_" + std::to_string(n * 4 + 1) + ", c" + std::to_string(i) + "_" + std::to_string(n * 4 + 2) + ", c" + std::to_string(i) + "_" + std::to_string(n * 4 + 3) + ")")
++          << " }\n";
++    return Status::OK();
++  }
++  // stage 3: output transform + bias + activation
++  const auto& m = shader.AddInput("m", ShaderUsage::UseUniform);
++  const ShaderVariableHelper* bias = has_bias_ ? &shader.AddInput("bias", ShaderUsage::UseUniform) : nullptr;
++  const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform);
++  auto& b = shader.MainFunctionBody();
++  b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++    << "  let cq = global_idx % uniforms.co4;\n  let t = global_idx / uniforms.co4;\n"
++    << "  let bi = t / uniforms.tiles_per_img;\n  let tt = t % uniforms.tiles_per_img;\n"
++    << "  let ty = tt / uniforms.tw;\n  let tx = tt % uniforms.tw;\n";
++  for (int r = 0; r < 4; r++)
++    for (int c = 0; c < 4; c++) b << "  let m" << r << c << " = " << m.GetByOffset(S(r * 4 + c) + "u * uniforms.total + global_idx") << ";\n";
++  for (int c = 0; c < 4; c++)
++    b << "  let s0" << c << " = m0" << c << " + m1" << c << " + m2" << c << "; let s1" << c << " = m1" << c << " - m2" << c << " - m3" << c << ";\n";
++  if (bias) b << "  let bv = " << bias->GetByOffset("cq") << ";\n";
++  const std::string act = GetActivationSnippet(activation_, "vec4<f32>", "f32");
++  for (int r = 0; r < 2; r++) {
++    std::string q = S(r);
++    std::string ys[2] = {"s" + q + "0 + s" + q + "1 + s" + q + "2", "s" + q + "1 - s" + q + "2 - s" + q + "3"};
++    for (int c = 0; c < 2; c++) {
++      b << "  { let oy = ty * 2u + " << r << "u; let ox = tx * 2u + " << c << "u; if (oy < uniforms.oh && ox < uniforms.ow) {\n"
++        << "    var value = " << ys[c] << ";\n"
++        << (bias ? "    value = value + bv;\n" : "") << "    " << act << "\n    "
++        << y.SetByOffset("((bi * uniforms.oh + oy) * uniforms.ow + ox) * uniforms.co4 + cq", "value") << "\n  } }\n";
++    }
++  }
++  return Status::OK();
++}
++
++Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, std::unique_ptr<Tensor>* u_cache) {
++  applied = false;
++  static const int mode = [] { const char* e = std::getenv("ORT_WEBGPU_CONV_WINOGRAD"); return e ? std::atoi(e) : 1; }();
++  if (mode == 0 || !input->IsDataType<float>()) return Status::OK();
++  const auto& ks = kernel->Shape();  // HWIO
++  const auto& is = input->Shape();
++  const auto& os = output->Shape();
++  if (ks.NumDimensions() != 4 || ks[0] != 3 || ks[1] != 3 || is.NumDimensions() != 4) return Status::OK();
++  const int64_t cin = ks[2], cout = ks[3];
++  if (cin % 4 != 0 || cout % 4 != 0 || cin != is[3] || os[3] != cout) return Status::OK();
++  static const auto env = [](const char* n, uint32_t d) { const char* e = std::getenv(n); return e ? static_cast<uint32_t>(std::atoi(e)) : d; };
++  static const uint32_t tm = env("ORT_WEBGPU_WINO_TM", 4), nv = env("ORT_WEBGPU_WINO_NV", 2), wx = env("ORT_WEBGPU_WINO_WX", 16), wy = env("ORT_WEBGPU_WINO_WY", 4);
++  static const int64_t min_hw = env("ORT_WEBGPU_WINO_MINHW", 0), max_hw = env("ORT_WEBGPU_WINO_MAXHW", 1 << 20);
++  static const int64_t min_c = env("ORT_WEBGPU_WINO_MINC", 64);
++  if (std::min(cin, cout) < min_c) return Status::OK();
++  if (os[1] < min_hw || os[1] > max_hw) return Status::OK();
++  const uint32_t n = static_cast<uint32_t>(is[0]), h = static_cast<uint32_t>(is[1]), w = static_cast<uint32_t>(is[2]);
++  const uint32_t oh = static_cast<uint32_t>(os[1]), ow = static_cast<uint32_t>(os[2]);
++  const uint32_t c4 = static_cast<uint32_t>(cin / 4), co4 = static_cast<uint32_t>(cout / 4);
++  const uint32_t th = (oh + 1) / 2, tw = (ow + 1) / 2, tpi = th * tw, nt = n * tpi;
++  auto* dt = input->DataType();
++  const bool have_u = u_cache && *u_cache;
++  Tensor u_local;
++  if (!have_u) u_local = context.CreateGPUTensor(dt, TensorShape({16, cin, cout}));
++  Tensor* up = have_u ? u_cache->get() : &u_local;
++  Tensor v = context.CreateGPUTensor(dt, TensorShape({16, static_cast<int64_t>(nt), cin}));
++  Tensor m = context.CreateGPUTensor(dt, TensorShape({16, static_cast<int64_t>(nt), cout}));
++  auto red = [](const TensorShape& s) {
++    TensorShapeVector d = s.AsShapeVector();
++    d.back() /= 4;
++    return TensorShape(d);
++  };
++#define WINO_UNIFORMS(total, dx, dy, dz) \
++  {{total}, {h}, {w}, {c4}, {co4}, {tw}, {nt}, {oh}, {ow}, {pads[0]}, {pads[1]}, {tpi}, {dx}, {dy}, {dz}}
++  auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
++  const auto M = ProgramTensorMetadataDependency::TypeAndRank;
++  if (!have_u) {
++    ConvWinogradProgram p(0, activation, false, tm, nv, wx, wy);
++    uint32_t total = c4 * 4 * co4;
++    p.AddInput({kernel, M, red(ks), 4}).AddOutput({up, M, red(up->Shape()), 4}).CacheHint("w").SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
++    ORT_RETURN_IF_ERROR(context.RunProgram(p));
++    if (u_cache) { *u_cache = std::make_unique<Tensor>(std::move(u_local)); up = u_cache->get(); }
++  }
++  {
++    ConvWinogradProgram p(1, activation, false, tm, nv, wx, wy);
++    uint32_t total = nt * c4;
++    p.AddInput({input, M, red(is), 4}).AddOutput({&v, M, red(v.Shape()), 4}).CacheHint("i").SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
++    ORT_RETURN_IF_ERROR(context.RunProgram(p));
++  }
++  {
++    ConvWinogradProgram p(2, activation, false, tm, nv, wx, wy);
++    uint32_t gx = ceil_div(ceil_div(co4, nv), wx), gy = ceil_div(nt, tm * wy);
++    p.AddInput({&v, M, red(v.Shape()), 4}).AddInput({up, M, red(up->Shape()), 4}).AddOutput({&m, M, red(m.Shape()), 4})
++        .CacheHint("g" + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy))
++        .SetDispatchGroupSize(gx, gy, 16).SetWorkgroupSize(wx, wy, 1).AddUniformVariables(WINO_UNIFORMS(0, gx, gy, 16));
++    ORT_RETURN_IF_ERROR(context.RunProgram(p));
++  }
++  {
++    ConvWinogradProgram p(3, activation, bias != nullptr, tm, nv, wx, wy);
++    uint32_t total = nt * co4;
++    p.AddInput({&m, M, red(m.Shape()), 4});
++    if (bias) p.AddInput({bias, M, red(bias->Shape()), 4});
++    p.AddOutput({output, M, red(os), 4}).CacheHint("o," + activation.ToString() + std::to_string(bias != nullptr)).SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
++    ORT_RETURN_IF_ERROR(context.RunProgram(p));
++  }
++  applied = true;
++  return Status::OK();
++}
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+index e161bff..fa378cd 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+@@ -31,6 +31,8 @@ class Conv2dMMProgram final : public Program<Conv2dMMProgram> {
+ 
+   std::string Conv2dCommonSnippet(const ShaderVariableHelper& x, const ShaderVariableHelper& w, const Activation& activation, std::string data_type, uint32_t inner_element_size_x = 4, uint32_t inner_element_size_w = 4, uint32_t inner_element_size = 4) const;
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
++  // Register-tile main loop (8 rows x 2 vec4 cols per thread, scalar accumulators, no workgroup memory).
++  bool reg_tile_ = false;
+ 
+   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+       {"dim_a_outer", ProgramUniformVariableDataType::Uint32},
+@@ -58,5 +60,39 @@ class Conv2dMMProgram final : public Program<Conv2dMMProgram> {
+ 
+ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::vector<const Tensor*>& inputs, const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations, Tensor* output, uint32_t dim_a_outer, uint32_t dim_b_outer, uint32_t dim_inner, bool is_channels_last, const std::vector<TensorShape>& modified_input_output_shapes);
+ 
++
++// Winograd F(2,3) for 3x3 stride-1 NHWC fp32 convs: weight transform, input transform, 16 batched GEMMs, output transform (+bias, activation).
++class ConvWinogradProgram final : public Program<ConvWinogradProgram> {
++ public:
++  ConvWinogradProgram(int stage, const Activation& activation, bool has_bias, uint32_t tm, uint32_t nv, uint32_t wx, uint32_t wy)
++      : Program("ConvWinograd"), stage_(stage), activation_(activation), has_bias_(has_bias), tm_(tm), nv_(nv), wx_(wx), wy_(wy) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"total", ProgramUniformVariableDataType::Uint32},
++      {"h", ProgramUniformVariableDataType::Uint32},
++      {"w", ProgramUniformVariableDataType::Uint32},
++      {"c4", ProgramUniformVariableDataType::Uint32},
++      {"co4", ProgramUniformVariableDataType::Uint32},
++      {"tw", ProgramUniformVariableDataType::Uint32},
++      {"ntiles", ProgramUniformVariableDataType::Uint32},
++      {"oh", ProgramUniformVariableDataType::Uint32},
++      {"ow", ProgramUniformVariableDataType::Uint32},
++      {"pad_h", ProgramUniformVariableDataType::Uint32},
++      {"pad_w", ProgramUniformVariableDataType::Uint32},
++      {"tiles_per_img", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_x", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_y", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_z", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  int stage_;  // 0 weight transform, 1 input transform, 2 batched GEMM, 3 output transform
++  const Activation& activation_;
++  bool has_bias_;
++  uint32_t tm_, nv_, wx_, wy_;
++};
++
++// Returns true (and runs the four programs) when the conv qualifies; `kernel` is HWIO [3,3,Cin,Cout].
++Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, std::unique_ptr<Tensor>* u_cache = nullptr);
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc b/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
+index aa0caab..49153de 100644
+--- a/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
++++ b/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
+@@ -30,6 +30,9 @@ Status GetFusedActivationAttr(const OpKernelInfo& info, Activation& activation)
+       } else if (activation_type == "HardSigmoid") {
+         activation.activation_kind_ = ActivationKind::HardSigmoid;
+         activation_params_count = 2;
++      } else if (activation_type == "QuickGelu") {
++        activation.activation_kind_ = ActivationKind::QuickGelu;
++        activation_params_count = 1;
+       } else {
+         return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "unimplemented activation: " + activation_type);
+       }
+@@ -75,6 +78,9 @@ std::string GetActivationSnippet(const Activation& activation, std::string value
+              " * value, value, value >= " + value_type_cast(0.0) + ");";
+     case ActivationKind::Tanh:
+       return "value = tanh(value);";
++    case ActivationKind::QuickGelu:
++      // x * sigmoid(alpha * x) = x / (1 + exp(-alpha * x)); exp overflows to +inf for very negative x, giving -0, which is right.
++      return "value = value / (" + value_type_cast(1.0) + " + exp(-" + base_type_cast(activation.activation_params_.QuickGelu.alpha_) + " * value));";
+     default:
+       return "";
+   }
+diff --git a/onnxruntime/core/providers/webgpu/nn/fuse_utils.h b/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
+index fad7d3d..3b3ce91 100644
+--- a/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
++++ b/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
+@@ -19,7 +19,8 @@ enum class ActivationKind {
+   Clip,
+   HardSigmoid,
+   LeakyRelu,
+-  Tanh
++  Tanh,
++  QuickGelu  // x * sigmoid(alpha * x); alpha = 1 is SiLU/Swish
+ };
+ 
+ using Activation = struct Activation {
+@@ -42,6 +43,9 @@ using Activation = struct Activation {
+       float alpha_;
+       float beta_;
+     } HardSigmoid;
++    struct {
++      float alpha_;
++    } QuickGelu;
+     float values_[2];
+   };
+   ActivationParameters activation_params_ = {};

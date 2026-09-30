@@ -462,3 +462,30 @@ Rows per thread (`ORT_WEBGPU_CONV_REGTILE_ROWS`, default 8; fewer rows = fewer a
 1x1 convs only: 8 rows 71.8, 4 rows 71.0, 2 rows 71.9. So register pressure explains part of the 3x3 loss, but no setting beats ORT's
 shared-memory tile (67.0 ms), and the 1x1 layers do not react to the tile at all -- in the network they are not limited by the GEMM inner loop
 the way the back-to-back microbenchmark is (which also re-reads cache-resident operands).
+
+## Winograd F(2,3) Conv in ORT's WebGPU EP (works: ResNet-50 -9%, SAM-L0 encoder -13%, RT-DETR pre -13%)
+
+`webgpu_ops/ort_conv_winograd.patch` (on ORT `125ea21` + transpose -> missing_ops -> silu_fusion; it also contains the register-tile
+experiment above, so apply it *instead of* `ort_conv2d_regtile_experiment.patch`) adds a Winograd path to `Conv` for NHWC fp32,
+group 1, 3x3, stride 1, dilation 1, Cin and Cout multiples of 4 and min(Cin, Cout) >= 64. Four programs run per conv: weight
+transform (cached in the kernel when the weights are a prepacked initializer), input transform (4x4 tiles of 2x2 outputs),
+16 batched GEMMs (`[16][tiles][Cin] x [16][Cin][Cout]`, TM=4 tiles x 2 vec4 channels per thread, workgroup 16x4, scalar accumulators),
+and the output transform with bias and the fused activation. Environment knobs: `ORT_WEBGPU_CONV_WINOGRAD=0` disables it,
+`ORT_WEBGPU_WINO_{TM,NV,WX,WY,MINC,MINHW,MAXHW}` tune it.
+
+Correct on the phone: logits/outputs match the CPU EP to <= 5e-5 relative on ResNet-50, YOLO11n/26n, SAM-L0 encoder and the
+single-conv models (with bias, ReLU and SiLU epilogues); the 235-op sweep still passes.
+
+| model | ORT default (ms) | Winograd (ms) |
+|---|---|---|
+| ResNet-50 | 66.7 / 67.5 | **61.4 / 60.9** |
+| SAM-L0 encoder | 441 / 442 | **383 / 382** |
+| RT-DETR pre | 396 / 399 | **344 / 347** |
+| YOLO11n | 71.8 / 71.3 | 73.0 / 72.0 (neutral) |
+| YOLO26n | 64.8 / 64.4 | 64.3 / 65.3 (neutral) |
+
+Two runs each, phone median. The min-channel rule matters: with no threshold YOLO11n/26n get 10-15% *slower* (their 3x3 convs have
+16-64 channels at high resolution, where the 4x-larger transformed tensors cost more than the multiplications saved). Restricting to
+the small feature maps (<= 28) still keeps most of the ResNet gain; the 56x56 layers add little. GEMM tile sweep: TM=4, NV=1 or 2
+are equal (61.0-61.3 ms), TM=8 is 70+ ms. This is the first change in this investigation that makes the WebGPU EP faster on the
+end-to-end ResNet, and it agrees with the standalone `conv_alt.cc` result.
