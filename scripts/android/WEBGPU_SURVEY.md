@@ -400,3 +400,42 @@ The 4-pixel vec4 kernel is 2.0-2.4x faster than the naive one on all four shapes
 the buffer-bandwidth ceiling and ~10x over the traffic floor, so depthwise is latency/issue-bound (27 dependent-ish loads per thread) rather than
 bandwidth-bound; the obvious next steps (wider workgroups, staging the window through workgroup memory, f16 storage) were not tried. Depthwise
 convs are ~10% of YOLO11n's GPU time, so even a 2x kernel is worth ~5% there. These are standalone kernels, not integrated into ORT.
+
+## Register-tile GEMM vs ORT's shared-memory design, f16 storage, subgroups (Adreno 730, 2026-10-01)
+
+Standalone GEMM microbenchmark (`dawn_repro/gemm.cc`, Dawn toggles `RB=off VMM=1` like ORT, best of 3 runs, warm GPU, ResNet-50 GEMM shapes).
+`sh` = ORT's shared-memory tile design (TM=4, 8x8 workgroup); `sc` = register tile, scalar accumulators (TM=8, NV=2, 8x8 outputs per thread);
+`p16` = same register tile with A/B stored as packed f16 (one vec4<u32> load = 8 values, unpacked to f32, f32 accumulate; TM=4, NV=2).
+
+First session (GPU cold-clean, phone otherwise idle), GFLOPS:
+
+| M x N x K | `sh` (ORT design) | `sc` TM=8 NV=2 (best wg) |
+|---|---|---|
+| 784x512x128 | 174 | 282 |
+| 3136x256x64 | 161 | 273 |
+| 784x128x1152 | 177 | 255 |
+| 196x256x2304 | 155 | 224 |
+| 196x1024x256 | 162 | 249 |
+| 49x512x4608 | 132 | 211 |
+
+`sc` beats the ORT design by 1.4-1.7x on every shape (fp32 storage, so it is a like-for-like comparison). The best workgroup shape varies
+per shape (784x128x1152: 16x4 = 255, 32x4 = 141), so a per-shape choice matters.
+
+Second session, run back to back (the phone was shared with tuning jobs and ran ~30-40% slower in absolute terms, so compare only within this table):
+
+| M x N x K | `sh` | `sc` TM=8 NV=2 | `p16` TM=4 NV=2 (best wg) | `sg` (subgroup shuffle) |
+|---|---|---|---|---|
+| 784x512x128 | 111 | 135 | **180** | 2 |
+| 3136x256x64 | 109 | 134 | **179** | n/a (K%128) |
+| 784x128x1152 | 92 | 123 | **178** | 15 (wrong) |
+| 196x256x2304 | 114 | 119 | **182** | 20 (wrong) |
+| 196x1024x256 | 88 | 136 | **195** | 4 (wrong) |
+| 49x512x4608 | 86 | 131 | **150** | 21 (wrong) |
+
+- **f16 storage helps**: `p16` is 1.15-1.5x faster than the fp32 register tile and 1.6-2.0x faster than the ORT-style tile, and the register footprint
+  drops so TM=4 NV=2 (not TM=8) is the best tile. Errors are at f16-rounded-input level (reference uses the rounded inputs; max abs error 2e-7..1e-5).
+  It halves weight/activation traffic, which is the bottleneck, but it needs f16 activations and weights in memory (conversion passes, or an f16 graph),
+  and an earlier run of a peak-f16-arithmetic kernel was slower than f32 -- only the *storage* is what wins.
+- **Subgroups do not help**: the adapter exposes `Subgroups`, but the `sg` variant (lane l loads one A vec4 and the row group shuffles it with
+  `subgroupShuffle`) runs 8-90x slower than `p16` and fails validation on 5 of 6 shapes (wrong when the workgroup x-extent does not line up
+  with the hardware subgroup / control flow is not uniform enough). The Adreno shuffle path is not a substitute for the A broadcast the cache already does.

@@ -35,9 +35,9 @@ Build each like `harness.cc`; run on the phone under `phone-run`.
 
 - `peak.cc` -- FMA throughput: `peak f32|f16 WORKGROUPS ITERS [VEC CHAINS WG]` (986 GFLOPS fp32 at 64 scalar chains).
 - `bw.cc` -- vec4 load bandwidth: `bw buf|tex|lds WORKING_SET_KB ITERS` (buffer ~163 GB/s, texture ~240, workgroup memory 200-277).
-- `gemm.cc` -- GEMM design variants: `gemm sh|reg|sc|tx|tt|nc4 M N K REPS [TM NV WX WY]`; `RB=off VMM=1` mirror ORT's Dawn toggles.
+- `gemm.cc` -- GEMM design variants: `gemm sh|reg|sc|p16|sg|tx|tt|nc4 M N K REPS [TM NV WX WY]`; `RB=off VMM=1` mirror ORT's Dawn toggles.
   `sh` shared-memory tiles (ORT's design), `reg`/`sc` register tiles with vec4/scalar accumulators, `tx`/`tt` A (and B) through
-  textures, `nc4` NC4HW4-style coalesced layout. REPS>1 keeps the whole GPU busy (throughput); REPS=1 is one real layer's latency.
+  textures, `nc4` NC4HW4-style coalesced layout, `p16` A/B stored as packed f16 (unpacked to f32, f32 accumulate), `sg` `p16` with A shared across a row group through `subgroupShuffle`. REPS>1 keeps the whole GPU busy (throughput); REPS=1 is one real layer's latency.
 - `chain.cc` -- dispatch overhead: `chain dep|ind N ELEMS [PASSES SUBMIT_EVERY]` (a dependent 4096-element dispatch costs ~6 us
   of GPU time and ~2 us of CPU in Dawn directly).
 - `conv_alt.cc` -- Winograd F(2,3) vs direct register-tile 3x3 conv, and depthwise 3x3 variants: `conv_alt conv|dw C H` (see `../../WEBGPU_SURVEY.md`).
