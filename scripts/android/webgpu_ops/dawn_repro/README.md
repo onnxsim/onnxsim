@@ -41,3 +41,4 @@ Build each like `harness.cc`; run on the phone under `phone-run`.
 - `chain.cc` -- dispatch overhead: `chain dep|ind N ELEMS [PASSES SUBMIT_EVERY]` (a dependent 4096-element dispatch costs ~6 us
   of GPU time and ~2 us of CPU in Dawn directly).
 - `conv_alt.cc` -- Winograd F(2,3) vs direct register-tile 3x3 conv, and depthwise 3x3 variants: `conv_alt conv|dw C H` (see `../../WEBGPU_SURVEY.md`).
+- `conv_s2.cc` -- 3x3 stride-2 pad-1 NHWC conv (ResNet-50 v1.5 downsampling): direct implicit GEMM vs a polyphase hybrid Winograd (25 mults per 2x2 output tile instead of 36): `conv_s2 C H`.

@@ -540,3 +540,24 @@ With post-ReLU-like (nonnegative) input the speedups are 1.9x/1.7x/1.6x/1.15x (M
   earlier Winograd integration shows the standalone ratios carry over only in part (the register-tile GEMM did not), so expect a fraction of
   this. Worth trying because it needs only two changed transforms and a p16-style GEMM stage inside the existing four programs, with the
   weight transform (cached) writing packed f16; the memory footprint of V, U, M also halves.
+
+## Stride-2 3x3 convs: polyphase Winograd microbenchmark (small gain)
+
+`webgpu_ops/dawn_repro/conv_s2.cc` (standalone Dawn kernels, not in ORT) compares, for the 3x3 stride-2 pad-1 NHWC fp32 convs of
+ResNet-50 v1.5 (Cin = Cout = C, 0.231 GFLOP each), the direct register-tile implicit GEMM with a *polyphase hybrid Winograd*.
+Splitting the input into even/odd phases gives `o[y] = w1 xe[y] + w0 xo[y-1] + w2 xo[y]` per dimension: the two-tap part uses F(2,2)
+(3 mults per 2 outputs), the one-tap part is direct (2 mults), 5 mults per 2 outputs, so 25 per 2x2 output tile instead of 36 (0.69x).
+The input transform makes only 1.56x more data than the image (vs 4x for stride-1 F(2,3)); 25 batched GEMMs follow, then the output
+transform. Outputs match a double-precision CPU reference (relative error <= 2.3e-6). Best of 7 tile configs per algorithm, two runs:
+
+| layer | direct (ms) | polyphase (ms) | polyphase/direct | of which GEMM (ms) |
+|---|---|---|---|---|
+| 128ch 56->28 | 1.37 / 1.41 | 1.18 / 1.33 | 0.87 / 0.94 | 0.91 / 0.96 |
+| 256ch 28->14 | 1.47 / 1.48 | 1.38 / 1.36 | 0.94 / 0.92 | 1.36 / 1.30 |
+| 512ch 14->7 | 1.89 / 1.78 | 1.69 / 1.55 | 0.90 / 0.87 | 1.34 / 1.38 |
+| 64ch 112->56 | 1.80 / 1.74 | 1.39 / 1.45 | 0.77 / 0.84 | 0.88 / 0.95 |
+
+It is 6-23% faster than direct (>10% on 512ch and 64ch, borderline on the others), a gain of 0.1-0.2 ms per layer, much less than the
+stride-1 Winograd gain because the multiplication saving is only 1.44x. ResNet-50 has only three such convs (128@56, 256@28,
+512@14), so this is worth about 0.4-0.5 ms of ~61 ms (<1%); YOLO-style networks have more stride-2 convs but with fewer channels,
+where the transforms would eat the gain. Not worth integrating into ORT unless a network has many wide stride-2 convs.
