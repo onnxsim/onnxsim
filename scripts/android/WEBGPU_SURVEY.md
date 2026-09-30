@@ -857,3 +857,15 @@ register-tile kernel with buffer weights, so the 1.3-2.0x per layer is a pure we
 API has no texture inputs, and earlier register-tile microbenchmark gains did not carry over into the network. If even half of the per-layer gain on the weight-heavy layers
 carried over, ResNet-50 (about 80% conv time) would drop roughly 10-20%; treat 5-10% as the realistic expectation until an ORT prototype (texture weights in the Winograd GEMM
 stage, which is a plain register-tile GEMM, is the cheapest place to try it) confirms it.
+
+## Winograd weights in a texture (`ORT_WEBGPU_WINO_TEX=16`; ResNet-50 -4%, SAM-L0 -8%, RT-DETR pre -10%)
+
+Follows the layout study: the weight stream is the hot load, and texture reads are faster than storage-buffer reads. ORT's Program API had
+no texture bindings, so `webgpu_ops/ort_webgpu_extra_texture.patch` adds one optional extra 2D texture per program (`ProgramBase::SetExtraTexture`:
+write-only storage texture or sampled unfilterable-float texture, bound after the buffers and the uniform; `ComputeContextBase::Device()`).
+`ort_conv_winograd.patch` uses it: the weight-transform program `textureStore`s U (16*Cin rows x Cout/4 texels, RGBA16F or RGBA32F) and the
+GEMM stage `textureLoad`s it (cached across runs for prepacked weights; requires Cin <= 512). Phone medians (Gelu fusion on), buffer weights -> RGBA16F texture:
+ResNet-50 60.4 -> **58.2 ms**, SAM-L0 encoder 371 -> **343**, RT-DETR pre 345 -> **309**; TM=4 NV=1 WG 16x8 is marginally better for ResNet (57.3).
+RGBA32F texture is not faster (63.7 ms). Cost: weights are rounded to f16 (ResNet-50 logits 1.3e-3 relative vs 8e-7; top-1 unchanged), so it is opt-in,
+like the f16-intermediates mode (the two are not combined yet). Far below the 1.8-2.2x per layer of the standalone layout study, consistent with
+earlier standalone gains only partly transferring. Applying the patches: transpose -> missing_ops -> silu_fusion -> gelu_fusion -> extra_texture -> conv_winograd.

@@ -1,0 +1,143 @@
+diff --git a/onnxruntime/core/providers/webgpu/compute_context.h b/onnxruntime/core/providers/webgpu/compute_context.h
+index adbbb75..c874f19 100644
+--- a/onnxruntime/core/providers/webgpu/compute_context.h
++++ b/onnxruntime/core/providers/webgpu/compute_context.h
+@@ -67,6 +67,10 @@ class ComputeContextBase {
+   // Get various information from the WebGPU context.
+   //
+ 
++  inline const wgpu::Device& Device() const {
++    return webgpu_context_.Device();
++  }
++
+   inline const wgpu::AdapterInfo& AdapterInfo() const {
+     return webgpu_context_.AdapterInfo();
+   }
+diff --git a/onnxruntime/core/providers/webgpu/program.h b/onnxruntime/core/providers/webgpu/program.h
+index 736111d..25bb4ea 100644
+--- a/onnxruntime/core/providers/webgpu/program.h
++++ b/onnxruntime/core/providers/webgpu/program.h
+@@ -21,6 +21,7 @@
+ #endif  // _MSC_VER
+ 
+ #include "core/common/common.h"
++#include "core/providers/webgpu/webgpu_external_header.h"
+ #include "core/common/safeint.h"
+ #include "core/framework/tensor.h"
+ 
+@@ -292,6 +293,18 @@ class ProgramBase {
+     return *this;
+   }
+ 
++  // Bind one extra 2D texture after the buffer/uniform bindings (binding index = number of buffer bindings).
++  // `storage_write`: write-only storage texture; otherwise a sampled (textureLoad) unfilterable-float texture.
++  ProgramBase& SetExtraTexture(WGPUTextureView view, WGPUTextureFormat format, bool storage_write) {
++    extra_texture_view_ = view;
++    extra_texture_format_ = format;
++    extra_texture_storage_ = storage_write;
++    return *this;
++  }
++  inline WGPUTextureView ExtraTextureView() const { return extra_texture_view_; }
++  inline WGPUTextureFormat ExtraTextureFormat() const { return extra_texture_format_; }
++  inline bool ExtraTextureStorage() const { return extra_texture_storage_; }
++
+   // add a program input
+   ProgramBase& AddInput(ProgramInput&& input);
+   // add multiple program inputs
+@@ -378,6 +391,10 @@ class ProgramBase {
+   std::string name_;
+   ProgramMetadata metadata_;
+ 
++  WGPUTextureView extra_texture_view_ = nullptr;
++  WGPUTextureFormat extra_texture_format_ = WGPUTextureFormat_Undefined;
++  bool extra_texture_storage_ = false;
++
+   std::string cache_hint_;
+   std::vector<ProgramInput> inputs_;
+   std::vector<ProgramOutput> outputs_;
+diff --git a/onnxruntime/core/providers/webgpu/program_manager.cc b/onnxruntime/core/providers/webgpu/program_manager.cc
+index 73e10b6..904fa78 100644
+--- a/onnxruntime/core/providers/webgpu/program_manager.cc
++++ b/onnxruntime/core/providers/webgpu/program_manager.cc
+@@ -98,7 +98,7 @@ wgpu::PipelineLayout ProgramManager::CreatePipelineLayout(const ProgramBase& pro
+                   [](const ProgramUniformVariableValue& uniform) { return uniform.length > 0; });
+ 
+   std::vector<wgpu::BindGroupLayoutEntry> bind_group_layout_entries;
+-  bind_group_layout_entries.reserve(storage_binding_count + (has_uniform_binding ? 1 : 0));
++  bind_group_layout_entries.reserve(storage_binding_count + (has_uniform_binding ? 1 : 0) + 1);
+   uint32_t binding = 0;
+   auto append_buffer_bindings = [&bind_group_layout_entries, &binding](std::span<const uint32_t> segments,
+                                                                        wgpu::BufferBindingType type) {
+@@ -122,6 +122,21 @@ wgpu::PipelineLayout ProgramManager::CreatePipelineLayout(const ProgramBase& pro
+     bind_group_layout_entries.push_back(entry);
+   }
+ 
++  if (program.ExtraTextureView() != nullptr) {
++    wgpu::BindGroupLayoutEntry entry{};
++    entry.binding = binding++;
++    entry.visibility = wgpu::ShaderStage::Compute;
++    if (program.ExtraTextureStorage()) {
++      entry.storageTexture.access = wgpu::StorageTextureAccess::WriteOnly;
++      entry.storageTexture.format = static_cast<wgpu::TextureFormat>(program.ExtraTextureFormat());
++      entry.storageTexture.viewDimension = wgpu::TextureViewDimension::e2D;
++    } else {
++      entry.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
++      entry.texture.viewDimension = wgpu::TextureViewDimension::e2D;
++    }
++    bind_group_layout_entries.push_back(entry);
++  }
++
+   ORT_ENFORCE(binding <= webgpu_context_.DeviceLimits().maxBindingsPerBindGroup,
+               "Number of bind group entries (", binding,
+               ") exceeds device limit (", webgpu_context_.DeviceLimits().maxBindingsPerBindGroup, ").");
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.cc b/onnxruntime/core/providers/webgpu/webgpu_context.cc
+index 1c7fa44..83e66cd 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_context.cc
++++ b/onnxruntime/core/providers/webgpu/webgpu_context.cc
+@@ -665,7 +665,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
+     command.compute_pipeline = program_artifact->compute_pipeline;
+   }
+   command.bind_group = CreateBindGroup(bind_buffers, bind_buffers_segments,
+-                                       *bind_group_layout, program.Name());
++                                       *bind_group_layout, program.Name(), program.ExtraTextureView());
+   command.pending_build = std::move(pending_build);
+   if (uniform_buffer) {
+     // The bind group owns a reference now, so return the allocator's reference immediately.
+@@ -1018,7 +1018,8 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr) {
+ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bind_buffers,
+                                                const std::vector<uint32_t>& bind_buffers_segments,
+                                                const wgpu::BindGroupLayout& bind_group_layout,
+-                                               std::string_view label) const {
++                                               std::string_view label,
++                                               WGPUTextureView extra_texture_view) const {
+   uint32_t entry_index = 0;
+   std::vector<WGPUBindGroupEntry> bind_group_entries;
+ 
+@@ -1043,6 +1044,13 @@ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bi
+     }
+   }
+ 
++  if (extra_texture_view != nullptr) {
++    WGPUBindGroupEntry tex_entry{};
++    tex_entry.binding = entry_index++;
++    tex_entry.textureView = extra_texture_view;
++    bind_group_entries.push_back(tex_entry);
++  }
++
+   ORT_ENFORCE(entry_index <= device_limits_.maxBindingsPerBindGroup, "Number of bind group entries (", entry_index,
+               ") exceeds device limit (", device_limits_.maxBindingsPerBindGroup, ").");
+ 
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.h b/onnxruntime/core/providers/webgpu/webgpu_context.h
+index ed0fa99..a27ba38 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_context.h
++++ b/onnxruntime/core/providers/webgpu/webgpu_context.h
+@@ -360,7 +360,8 @@ class WebGpuContext final {
+   wgpu::BindGroup CreateBindGroup(const std::vector<WGPUBuffer>& bind_buffers,
+                                   const std::vector<uint32_t>& bind_buffers_segments,
+                                   const wgpu::BindGroupLayout& bind_group_layout,
+-                                  std::string_view label) const;
++                                  std::string_view label,
++                                  WGPUTextureView extra_texture_view = nullptr) const;
+   void DispatchCommand(const webgpu::CapturedCommandInfo& command);
+   Status EncodeDeferredDispatches();
+ 
