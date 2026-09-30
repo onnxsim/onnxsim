@@ -503,8 +503,7 @@ way. Two runs each on the Adreno 730 (ms; "x direct" = time / best direct regist
 | 256ch @ 14x14 | 1.50 / 1.47 | **0.86 / 0.97** | 1.01 / 1.12 | 1.17 / 1.15 | 1e-6 / 1e-5 |
 | 512ch @ 7x7 | 1.97 / 1.76 | **0.80 / 0.78** | 1.63 / 1.72 | 2.05 / 2.22 | 8e-7 / 6e-6 |
 
-- F(4,3) does 36/16 = 2.25x fewer multiplies than direct (vs 4/9 -> 2.25x for F(2,3): 16 products per 4 outputs, i.e. 4x fewer than direct 36; F(4,3): 36 per 16 outputs = 4x...
-  precisely: direct 9 MACs/output, F(2,3) 4, F(4,3) 2.25) but it needs 36 GEMMs with 4x fewer rows each. It only wins where there are many
+- Multiplies per output pixel and channel pair: direct 9, F(2,3) 4, F(4,3) 2.25, but F(4,3) needs 36 GEMMs with 4x fewer rows each. It only wins where there are many
   tiles: 56x56 (196 tiles) by ~15%; 28x28 (49 tiles) is a tie; at 14x14 (16 tiles) and 7x7 (4 tiles) the GEMMs are too small to fill the GPU and
   F(4,3) is 15% / 2x slower than F(2,3). The transforms are minor (0.05-0.15 ms per stage; the F(4,3) input transform is a little dearer, the output transform cheaper).
 - Accuracy: F(4,3) has ~10x the error of F(2,3) (5e-6..1e-5 vs 4e-7..1e-6 relative to the max output, fp32); fine in fp32, but it would not be safe in fp16.
