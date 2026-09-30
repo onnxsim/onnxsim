@@ -502,6 +502,26 @@ Tensor-core kernels in driving: 51.2 -> 39.1 ms. Not tried: weight-prefetch tuni
 between the two byte planes of an A16 activation. The compiler cache key is the fork commit: an uncommitted change re-serves the
 cached artifact, so commit before measuring.
 
+**Fixed-point requantization (`ONNX_QDQ_REQUANT`, on by default in `compile_v65.sh`; lossy).** A Conv whose only consumer is a
+QuantizeLinear with per-tensor u8/u16 parameters used to leave the accumulators to scalar float kernels (v65 has no HVX float:
+about 28 ms of driving's elementwise time). It now returns the quantized tensor itself from int32 fixed-point arithmetic
+(`qconv_v65.requant_plan`): 15-bit multipliers with a hi/lo split multiply, exact per-term zero-point centering, and a plan that
+checks every partial sum stays under 2^30 from the weights' L1 norms and computes a per-channel error bound in output steps
+(`REQUANT_LOG=1` prints it). Maps under 32 pixels keep the float epilogue. A STACK of whole vectors now renders as a
+shufflevector concatenation (a 128-lane int32 row loaded as two 64-lane halves was rebuilt from 128 scalar reads: int32 -> uint16
+narrowing 114 -> 5 us). Merged build, pinned clock, driving hmix / DM DSP ms: 139.5 / 71.7 without, **127.2 / 68.3** with it.
+Held-out route segments 8 / 5 (`evaluate.py --backend phone`, mixed-head model), without -> with it:
+
+| | plan lateral (m) | lead prob err | lead agreement | lead distance err (m) |
+|---|---:|---:|---:|---:|
+| without | 0.01397 / 0.01704 | 5.36e-3 / 2.85e-4 | 0.993 / 1 | 0.682 / 0.549 |
+| with `ONNX_QDQ_REQUANT=1` | 0.01424 / 0.01667 | 5.56e-3 / 2.90e-4 | 0.993 / 1 | 0.696 / 0.554 |
+
+Plan error is 0.3 mm worse on segment 8 and 0.4 mm better on segment 5; the lead outputs are 2-4% worse on segment 8. Outputs are no
+longer byte-identical to the lossless build, so a regression check against a previous artifact needs a tolerance. Pass
+`ONNX_QDQ_REQUANT=0` to get the lossless build back. (The accuracy run was on the requant branch before its merge with the other
+lossless changes of this round, which do not change the numerics.)
+
 **FastRPC calls and data.** An inference is one FastRPC call (`tg_graph_run` runs all 371 kernel calls on the DSP), so there are no
 calls left to fuse. What crosses it is data: the recurrent state (`state_*_q` in, `next_state_*_q` out, 2.2 MB each way for driving)
 used to be copied through FastRPC every call. Now the emitter records which output slices feed which input regions (`G_NSTATE`,

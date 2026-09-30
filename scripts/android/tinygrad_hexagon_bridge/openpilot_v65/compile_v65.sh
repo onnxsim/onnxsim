@@ -19,7 +19,7 @@ for kv in "$@"; do case "$kv" in *=*) ;; *) echo "compile_v65.sh: expected KEY=V
 work=$(mktemp -d "${TMPDIR:-/tmp}/onnxsim-v65-XXXXXX")
 trap 'rm -rf "$work"' EXIT
 export MOCKDSP=1 DEV=DSP CONV_PAD_MATERIALIZE=1 DSP_V65_HW=1 DSP_THREADS="${DSP_THREADS:-4}" NOLOCALS=1 BEAM=0 CC="${CC:-clang-19}" \
-  FLOAT16=0 ONNX_FP16_AS_FP32=1 BENCH_RUNS=1 COMPILE3_SKIP_SELFTEST=1 DSP_ALL_INPUTS=1 ALL_OUTPUTS=2 DSP_V65_VGATHER=1 DSP_V65_PERF_VOTE=3 PYTHONUNBUFFERED=1 \
+  FLOAT16=0 ONNX_FP16_AS_FP32=1 BENCH_RUNS=1 COMPILE3_SKIP_SELFTEST=1 DSP_ALL_INPUTS=1 ALL_OUTPUTS=2 DSP_V65_VGATHER=1 DSP_V65_PERF_VOTE=3 ONNX_QDQ_REQUANT=1 PYTHONUNBUFFERED=1 \
   PYTHONPATH="$TINYGRAD_ROOT/examples/openpilot:$TINYGRAD_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 for kv in "$@"; do export "${kv?}"; done  # after the defaults, so an extra can override one
 log="$work/compile.log"
