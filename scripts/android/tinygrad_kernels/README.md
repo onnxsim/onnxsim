@@ -32,6 +32,7 @@ Generation needs no GPU: tinygrad's lowering runs offline (the `"WEBGPU"` device
 export PYTHONPATH=<tinygrad 0.14 checkout>:scripts/android/tinygrad_kernels
 python scripts/android/tinygrad_kernels/gen.py OUT mm:784x512x128 conv:1,256,14,14,256,3,3,1,1 --candidates 40
 python scripts/android/tinygrad_kernels/tune.py OUT mm:784x512x128 --rounds 5 --beam 4 --backend vulkan
+# with register-tile seeds (16-64 accumulators/thread), which one-step BEAM rarely reaches: add --tiles 100 --max-new 60
 ```
 
 Build the runners with the NDK (`tgrun_vk`: `-lvulkan -static-libstdc++`; `tgrun_dawn`: link the static Dawn/Tint/abseil/spirv
@@ -79,3 +80,36 @@ times in a back-to-back batch of dependent dispatches (single-dispatch latency i
 - For context, ORT's WebGPU Conv/MatMul kernels run ResNet-50's layers at roughly 120-175 GFLOPS (`../WEBGPU_SURVEY.md`; profiler GPU
   timestamps per dispatch, a different timing method, so only roughly comparable). The tuned tinygrad kernels are in the same range: ahead on the
   GEMM/1x1 shapes (~200 GFLOPS) and behind on the 14x14 3x3 conv (92 vs ~124).
+
+## Register-tile seeds (2026-10-01)
+
+The hand-written GEMM in `../webgpu_ops/dawn_repro/gemm.cc` reaches 255-282 GFLOPS with scalar accumulators and an 8x8 output tile per
+thread (64 accumulators), against ~175 for an ORT-style shared-memory GEMM in the same session. `tune.py` above stopped at ~200 because
+BEAM adds one Opt per round from a one-thread-per-output kernel and rarely gets to that tile. `tgk.tile_candidates` (`tune.py --tiles N`)
+now seeds round 1 with random `UPCAST a x b` (a*b = 16/32/64 accumulators over two global axes) + `UNROLL` + `LOCAL` (32-256 invocations)
+combinations that tinygrad accepts, then the usual beam continues from the best ones. The tuner needs no other change; the TM=8,NV=2 tile is
+`UPCAST axis0 8, UPCAST axis1 8` and is found on mm 784x512x128 and 3136x256x64.
+
+Re-tuned with `--tiles 100 --max-new 60 --rounds 3 --beam 4`. Warm re-run of the tinygrad default, the new best and the previous best in one
+session (GFLOPS from per-dispatch times; the phone was slower/noisier than in the first table, so compare within a row, not against the table above):
+
+| problem | default (Vulkan) | new best, Vulkan / Dawn | previous best, Vulkan / Dawn | tuner-time reading (Vulkan) |
+|---|---|---|---|---|
+| mm 784x512x128 | 60 | 196 / 142 | 179 / 151 | 253 |
+| mm 3136x256x64 | 61 | **212** / **183** | 184 / 159 | 265 |
+| mm 784x128x1152 | 76 | **138 / 120** | 92 / 80 | 160 |
+| mm 196x256x2304 | 38 | 122 / 120 | **133 / 136** (kept) | 134 |
+| mm 196x1024x256 (new) | 42 | 161 / 137 | - | 177 |
+| mm 49x512x4608 (new) | 25 | 120 / 118 | - | 125 |
+| conv 64->256 1x1 @56 | 61 | 197 / 193 | 193 / 175 | 253 |
+| conv 64 3x3 @56 | 77 | **162 / 164** | 135 / 155 | 201 |
+| conv 128 3x3 @28 | 46 | 57 / 101 | **110 / 146** (kept) | 109 |
+| conv 256 3x3 @14 | 6 | 96 / 85 | 96 / 86 (kept) | 94 |
+
+- `best/<problem>/` holds the winner of each row (new for 7 problems, the previous kernel for the last three).
+- The tuner's own readings (253-265 GFLOPS on the 1x1/GEMM shapes) approach the hand kernel's 282 but do not survive a warm re-run (196-212):
+  round-0/round-N readings on this phone drift by 20-25% with GPU clock state, so only same-session comparisons mean anything.
+- What still separates tinygrad from the hand kernel: tinygrad requires every LOCAL/UPCAST factor to divide the axis (M=784 or 196 gives
+  only small workgroup factors, the hand kernel guards the tail instead) and it cannot vectorize the B loads across the 8 columns in the
+  way the hand kernel does. On 784x128x1152 (hand 255) and 196x256x2304 (hand 224) that leaves it at 120-140.
+- Not done: a multi-kernel (whole-network) runner; every problem here is still a single kernel.

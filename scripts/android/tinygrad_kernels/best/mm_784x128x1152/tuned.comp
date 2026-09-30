@@ -1,21 +1,17 @@
 #version 450
 #define INFINITY uintBitsToFloat(0x7f800000u)
 #define NAN uintBitsToFloat(0x7fc00000u)
-// kernel: r_49_2_4_8_4_4_4_2_72_4
-layout(local_size_x=4, local_size_y=8, local_size_z=4) in;
+// kernel: r_49_16_2_8_4_2_1152
+layout(local_size_x=16, local_size_y=2, local_size_z=1) in;
 layout(std430, set=0, binding=0) buffer B0 { float data0_100352[]; };
 layout(std430, set=0, binding=1) buffer B1 { float data1_903168[]; };
 layout(std430, set=0, binding=2) buffer B2 { float data2_147456[]; };
-shared float buf2[4096];
 void main() {
-  float buf0[32];
-  float buf1[32];
-  int gidx0 = int(gl_WorkGroupID.x); /* 2 */
-  int gidx1 = int(gl_WorkGroupID.y); /* 49 */
-  int lidx0 = int(gl_LocalInvocationID.x); /* 4 */
-  int lidx1 = int(gl_LocalInvocationID.y); /* 8 */
-  int lidx2 = int(gl_LocalInvocationID.z); /* 4 */
-  int alu0 = ((gidx0<<6)+(lidx1<<3));
+  float buf0[64];
+  int gidx0 = int(gl_WorkGroupID.x); /* 49 */
+  int lidx0 = int(gl_LocalInvocationID.x); /* 16 */
+  int lidx1 = int(gl_LocalInvocationID.y); /* 2 */
+  int alu0 = (lidx0<<3);
   buf0[0] = 0.0f;
   buf0[1] = 0.0f;
   buf0[2] = 0.0f;
@@ -48,321 +44,185 @@ void main() {
   buf0[29] = 0.0f;
   buf0[30] = 0.0f;
   buf0[31] = 0.0f;
-  for (int Ridx0 = 0; Ridx0 < 72; Ridx0++) {
-    int alu33 = ((gidx1*18432)+(lidx0*4608)+(lidx2<<2)+(Ridx0<<4));
-    float val0 = data1_903168[(alu33+1)];
-    float val1 = data1_903168[(alu33+2)];
-    float val2 = data1_903168[(alu33+3)];
-    float val3 = data1_903168[(alu33+1152)];
-    float val4 = data1_903168[(alu33+1153)];
-    float val5 = data1_903168[(alu33+1154)];
-    float val6 = data1_903168[(alu33+1155)];
-    float val7 = data1_903168[(alu33+2304)];
-    float val8 = data1_903168[(alu33+2305)];
-    float val9 = data1_903168[(alu33+2306)];
-    float val10 = data1_903168[(alu33+2307)];
-    float val11 = data1_903168[(alu33+3456)];
-    float val12 = data1_903168[(alu33+3457)];
-    float val13 = data1_903168[(alu33+3458)];
-    float val14 = data1_903168[(alu33+3459)];
-    float val15 = data1_903168[alu33];
-    int alu34 = (alu0+(lidx2<<9)+(Ridx0<<11));
-    float val16 = data2_147456[(alu34+1)];
-    float val17 = data2_147456[(alu34+2)];
-    float val18 = data2_147456[(alu34+3)];
-    float val19 = data2_147456[(alu34+4)];
-    float val20 = data2_147456[(alu34+5)];
-    float val21 = data2_147456[(alu34+6)];
-    float val22 = data2_147456[(alu34+7)];
-    float val23 = data2_147456[(alu34+128)];
-    float val24 = data2_147456[(alu34+129)];
-    float val25 = data2_147456[(alu34+130)];
-    float val26 = data2_147456[(alu34+131)];
-    float val27 = data2_147456[(alu34+132)];
-    float val28 = data2_147456[(alu34+133)];
-    float val29 = data2_147456[(alu34+134)];
-    float val30 = data2_147456[(alu34+135)];
-    float val31 = data2_147456[(alu34+256)];
-    float val32 = data2_147456[(alu34+257)];
-    float val33 = data2_147456[(alu34+258)];
-    float val34 = data2_147456[(alu34+259)];
-    float val35 = data2_147456[(alu34+260)];
-    float val36 = data2_147456[(alu34+261)];
-    float val37 = data2_147456[(alu34+262)];
-    float val38 = data2_147456[(alu34+263)];
-    float val39 = data2_147456[(alu34+384)];
-    float val40 = data2_147456[(alu34+385)];
-    float val41 = data2_147456[(alu34+386)];
-    float val42 = data2_147456[(alu34+387)];
-    float val43 = data2_147456[(alu34+388)];
-    float val44 = data2_147456[(alu34+389)];
-    float val45 = data2_147456[(alu34+390)];
-    float val46 = data2_147456[(alu34+391)];
-    float val47 = data2_147456[alu34];
-    buf0[0] = (buf0[0]+((val15*val47)+(val0*val23)+(val1*val31)+(val2*val39)));
-    buf0[1] = (buf0[1]+((val3*val47)+(val4*val23)+(val5*val31)+(val6*val39)));
-    buf0[2] = (buf0[2]+((val7*val47)+(val8*val23)+(val9*val31)+(val10*val39)));
-    buf0[3] = (buf0[3]+((val11*val47)+(val12*val23)+(val13*val31)+(val14*val39)));
-    buf0[4] = (buf0[4]+((val15*val16)+(val0*val24)+(val1*val32)+(val2*val40)));
-    buf0[5] = (buf0[5]+((val3*val16)+(val4*val24)+(val5*val32)+(val6*val40)));
-    buf0[6] = (buf0[6]+((val7*val16)+(val8*val24)+(val9*val32)+(val10*val40)));
-    buf0[7] = (buf0[7]+((val11*val16)+(val12*val24)+(val13*val32)+(val14*val40)));
-    buf0[8] = (buf0[8]+((val15*val17)+(val0*val25)+(val1*val33)+(val2*val41)));
-    buf0[9] = (buf0[9]+((val3*val17)+(val4*val25)+(val5*val33)+(val6*val41)));
-    buf0[10] = (buf0[10]+((val7*val17)+(val8*val25)+(val9*val33)+(val10*val41)));
-    buf0[11] = (buf0[11]+((val11*val17)+(val12*val25)+(val13*val33)+(val14*val41)));
-    buf0[12] = (buf0[12]+((val15*val18)+(val0*val26)+(val1*val34)+(val2*val42)));
-    buf0[13] = (buf0[13]+((val3*val18)+(val4*val26)+(val5*val34)+(val6*val42)));
-    buf0[14] = (buf0[14]+((val7*val18)+(val8*val26)+(val9*val34)+(val10*val42)));
-    buf0[15] = (buf0[15]+((val11*val18)+(val12*val26)+(val13*val34)+(val14*val42)));
-    buf0[16] = (buf0[16]+((val15*val19)+(val0*val27)+(val1*val35)+(val2*val43)));
-    buf0[17] = (buf0[17]+((val3*val19)+(val4*val27)+(val5*val35)+(val6*val43)));
-    buf0[18] = (buf0[18]+((val7*val19)+(val8*val27)+(val9*val35)+(val10*val43)));
-    buf0[19] = (buf0[19]+((val11*val19)+(val12*val27)+(val13*val35)+(val14*val43)));
-    buf0[20] = (buf0[20]+((val15*val20)+(val0*val28)+(val1*val36)+(val2*val44)));
-    buf0[21] = (buf0[21]+((val3*val20)+(val4*val28)+(val5*val36)+(val6*val44)));
-    buf0[22] = (buf0[22]+((val7*val20)+(val8*val28)+(val9*val36)+(val10*val44)));
-    buf0[23] = (buf0[23]+((val11*val20)+(val12*val28)+(val13*val36)+(val14*val44)));
-    buf0[24] = (buf0[24]+((val15*val21)+(val0*val29)+(val1*val37)+(val2*val45)));
-    buf0[25] = (buf0[25]+((val3*val21)+(val4*val29)+(val5*val37)+(val6*val45)));
-    buf0[26] = (buf0[26]+((val7*val21)+(val8*val29)+(val9*val37)+(val10*val45)));
-    buf0[27] = (buf0[27]+((val11*val21)+(val12*val29)+(val13*val37)+(val14*val45)));
-    buf0[28] = (buf0[28]+((val15*val22)+(val0*val30)+(val1*val38)+(val2*val46)));
-    buf0[29] = (buf0[29]+((val3*val22)+(val4*val30)+(val5*val38)+(val6*val46)));
-    buf0[30] = (buf0[30]+((val7*val22)+(val8*val30)+(val9*val38)+(val10*val46)));
-    buf0[31] = (buf0[31]+((val11*val22)+(val12*val30)+(val13*val38)+(val14*val46)));
+  buf0[32] = 0.0f;
+  buf0[33] = 0.0f;
+  buf0[34] = 0.0f;
+  buf0[35] = 0.0f;
+  buf0[36] = 0.0f;
+  buf0[37] = 0.0f;
+  buf0[38] = 0.0f;
+  buf0[39] = 0.0f;
+  buf0[40] = 0.0f;
+  buf0[41] = 0.0f;
+  buf0[42] = 0.0f;
+  buf0[43] = 0.0f;
+  buf0[44] = 0.0f;
+  buf0[45] = 0.0f;
+  buf0[46] = 0.0f;
+  buf0[47] = 0.0f;
+  buf0[48] = 0.0f;
+  buf0[49] = 0.0f;
+  buf0[50] = 0.0f;
+  buf0[51] = 0.0f;
+  buf0[52] = 0.0f;
+  buf0[53] = 0.0f;
+  buf0[54] = 0.0f;
+  buf0[55] = 0.0f;
+  buf0[56] = 0.0f;
+  buf0[57] = 0.0f;
+  buf0[58] = 0.0f;
+  buf0[59] = 0.0f;
+  buf0[60] = 0.0f;
+  buf0[61] = 0.0f;
+  buf0[62] = 0.0f;
+  buf0[63] = 0.0f;
+  for (int Ridx0 = 0; Ridx0 < 1152; Ridx0++) {
+    int alu65 = ((gidx0*18432)+(lidx1*9216)+Ridx0);
+    float val0 = data1_903168[(alu65+1152)];
+    float val1 = data1_903168[(alu65+2304)];
+    float val2 = data1_903168[(alu65+3456)];
+    float val3 = data1_903168[(alu65+4608)];
+    float val4 = data1_903168[(alu65+5760)];
+    float val5 = data1_903168[(alu65+6912)];
+    float val6 = data1_903168[(alu65+8064)];
+    float val7 = data1_903168[alu65];
+    int alu66 = (alu0+(Ridx0<<7));
+    float val8 = data2_147456[(alu66+1)];
+    float val9 = data2_147456[(alu66+2)];
+    float val10 = data2_147456[(alu66+3)];
+    float val11 = data2_147456[(alu66+4)];
+    float val12 = data2_147456[(alu66+5)];
+    float val13 = data2_147456[(alu66+6)];
+    float val14 = data2_147456[(alu66+7)];
+    float val15 = data2_147456[alu66];
+    buf0[0] = (buf0[0]+(val7*val15));
+    buf0[1] = (buf0[1]+(val7*val8));
+    buf0[2] = (buf0[2]+(val7*val9));
+    buf0[3] = (buf0[3]+(val7*val10));
+    buf0[4] = (buf0[4]+(val7*val11));
+    buf0[5] = (buf0[5]+(val7*val12));
+    buf0[6] = (buf0[6]+(val7*val13));
+    buf0[7] = (buf0[7]+(val7*val14));
+    buf0[8] = (buf0[8]+(val0*val15));
+    buf0[9] = (buf0[9]+(val0*val8));
+    buf0[10] = (buf0[10]+(val0*val9));
+    buf0[11] = (buf0[11]+(val0*val10));
+    buf0[12] = (buf0[12]+(val0*val11));
+    buf0[13] = (buf0[13]+(val0*val12));
+    buf0[14] = (buf0[14]+(val0*val13));
+    buf0[15] = (buf0[15]+(val0*val14));
+    buf0[16] = (buf0[16]+(val1*val15));
+    buf0[17] = (buf0[17]+(val1*val8));
+    buf0[18] = (buf0[18]+(val1*val9));
+    buf0[19] = (buf0[19]+(val1*val10));
+    buf0[20] = (buf0[20]+(val1*val11));
+    buf0[21] = (buf0[21]+(val1*val12));
+    buf0[22] = (buf0[22]+(val1*val13));
+    buf0[23] = (buf0[23]+(val1*val14));
+    buf0[24] = (buf0[24]+(val2*val15));
+    buf0[25] = (buf0[25]+(val2*val8));
+    buf0[26] = (buf0[26]+(val2*val9));
+    buf0[27] = (buf0[27]+(val2*val10));
+    buf0[28] = (buf0[28]+(val2*val11));
+    buf0[29] = (buf0[29]+(val2*val12));
+    buf0[30] = (buf0[30]+(val2*val13));
+    buf0[31] = (buf0[31]+(val2*val14));
+    buf0[32] = (buf0[32]+(val3*val15));
+    buf0[33] = (buf0[33]+(val3*val8));
+    buf0[34] = (buf0[34]+(val3*val9));
+    buf0[35] = (buf0[35]+(val3*val10));
+    buf0[36] = (buf0[36]+(val3*val11));
+    buf0[37] = (buf0[37]+(val3*val12));
+    buf0[38] = (buf0[38]+(val3*val13));
+    buf0[39] = (buf0[39]+(val3*val14));
+    buf0[40] = (buf0[40]+(val4*val15));
+    buf0[41] = (buf0[41]+(val4*val8));
+    buf0[42] = (buf0[42]+(val4*val9));
+    buf0[43] = (buf0[43]+(val4*val10));
+    buf0[44] = (buf0[44]+(val4*val11));
+    buf0[45] = (buf0[45]+(val4*val12));
+    buf0[46] = (buf0[46]+(val4*val13));
+    buf0[47] = (buf0[47]+(val4*val14));
+    buf0[48] = (buf0[48]+(val5*val15));
+    buf0[49] = (buf0[49]+(val5*val8));
+    buf0[50] = (buf0[50]+(val5*val9));
+    buf0[51] = (buf0[51]+(val5*val10));
+    buf0[52] = (buf0[52]+(val5*val11));
+    buf0[53] = (buf0[53]+(val5*val12));
+    buf0[54] = (buf0[54]+(val5*val13));
+    buf0[55] = (buf0[55]+(val5*val14));
+    buf0[56] = (buf0[56]+(val6*val15));
+    buf0[57] = (buf0[57]+(val6*val8));
+    buf0[58] = (buf0[58]+(val6*val9));
+    buf0[59] = (buf0[59]+(val6*val10));
+    buf0[60] = (buf0[60]+(val6*val11));
+    buf0[61] = (buf0[61]+(val6*val12));
+    buf0[62] = (buf0[62]+(val6*val13));
+    buf0[63] = (buf0[63]+(val6*val14));
   }
-  int alu68 = (lidx1<<7);
-  int alu69 = (lidx0<<10);
-  int alu70 = (alu68+(lidx2<<5)+alu69);
-  buf2[(alu70+1)] = buf0[1];
-  buf2[(alu70+2)] = buf0[2];
-  buf2[(alu70+3)] = buf0[3];
-  buf2[(alu70+4)] = buf0[4];
-  buf2[(alu70+5)] = buf0[5];
-  buf2[(alu70+6)] = buf0[6];
-  buf2[(alu70+7)] = buf0[7];
-  buf2[(alu70+8)] = buf0[8];
-  buf2[(alu70+9)] = buf0[9];
-  buf2[(alu70+10)] = buf0[10];
-  buf2[(alu70+11)] = buf0[11];
-  buf2[(alu70+12)] = buf0[12];
-  buf2[(alu70+13)] = buf0[13];
-  buf2[(alu70+14)] = buf0[14];
-  buf2[(alu70+15)] = buf0[15];
-  buf2[(alu70+16)] = buf0[16];
-  buf2[(alu70+17)] = buf0[17];
-  buf2[(alu70+18)] = buf0[18];
-  buf2[(alu70+19)] = buf0[19];
-  buf2[(alu70+20)] = buf0[20];
-  buf2[(alu70+21)] = buf0[21];
-  buf2[(alu70+22)] = buf0[22];
-  buf2[(alu70+23)] = buf0[23];
-  buf2[(alu70+24)] = buf0[24];
-  buf2[(alu70+25)] = buf0[25];
-  buf2[(alu70+26)] = buf0[26];
-  buf2[(alu70+27)] = buf0[27];
-  buf2[(alu70+28)] = buf0[28];
-  buf2[(alu70+29)] = buf0[29];
-  buf2[(alu70+30)] = buf0[30];
-  buf2[(alu70+31)] = buf0[31];
-  buf2[alu70] = buf0[0];
-  memoryBarrierShared(); barrier();
-  buf1[0] = 0.0f;
-  buf1[1] = 0.0f;
-  buf1[2] = 0.0f;
-  buf1[3] = 0.0f;
-  buf1[4] = 0.0f;
-  buf1[5] = 0.0f;
-  buf1[6] = 0.0f;
-  buf1[7] = 0.0f;
-  buf1[8] = 0.0f;
-  buf1[9] = 0.0f;
-  buf1[10] = 0.0f;
-  buf1[11] = 0.0f;
-  buf1[12] = 0.0f;
-  buf1[13] = 0.0f;
-  buf1[14] = 0.0f;
-  buf1[15] = 0.0f;
-  buf1[16] = 0.0f;
-  buf1[17] = 0.0f;
-  buf1[18] = 0.0f;
-  buf1[19] = 0.0f;
-  buf1[20] = 0.0f;
-  buf1[21] = 0.0f;
-  buf1[22] = 0.0f;
-  buf1[23] = 0.0f;
-  buf1[24] = 0.0f;
-  buf1[25] = 0.0f;
-  buf1[26] = 0.0f;
-  buf1[27] = 0.0f;
-  buf1[28] = 0.0f;
-  buf1[29] = 0.0f;
-  buf1[30] = 0.0f;
-  buf1[31] = 0.0f;
-  for (int Ridx108 = 0; Ridx108 < 4; Ridx108++) {
-    int alu136 = (alu68+(Ridx108<<5)+alu69);
-    float val48 = buf2[(alu136+1)];
-    float val49 = buf2[(alu136+2)];
-    float val50 = buf2[(alu136+3)];
-    float val51 = buf2[(alu136+4)];
-    float val52 = buf2[(alu136+5)];
-    float val53 = buf2[(alu136+6)];
-    float val54 = buf2[(alu136+7)];
-    float val55 = buf2[(alu136+8)];
-    float val56 = buf2[(alu136+9)];
-    float val57 = buf2[(alu136+10)];
-    float val58 = buf2[(alu136+11)];
-    float val59 = buf2[(alu136+12)];
-    float val60 = buf2[(alu136+13)];
-    float val61 = buf2[(alu136+14)];
-    float val62 = buf2[(alu136+15)];
-    float val63 = buf2[(alu136+16)];
-    float val64 = buf2[(alu136+17)];
-    float val65 = buf2[(alu136+18)];
-    float val66 = buf2[(alu136+19)];
-    float val67 = buf2[(alu136+20)];
-    float val68 = buf2[(alu136+21)];
-    float val69 = buf2[(alu136+22)];
-    float val70 = buf2[(alu136+23)];
-    float val71 = buf2[(alu136+24)];
-    float val72 = buf2[(alu136+25)];
-    float val73 = buf2[(alu136+26)];
-    float val74 = buf2[(alu136+27)];
-    float val75 = buf2[(alu136+28)];
-    float val76 = buf2[(alu136+29)];
-    float val77 = buf2[(alu136+30)];
-    float val78 = buf2[(alu136+31)];
-    float val79 = buf2[alu136];
-    buf1[0] = (buf1[0]+val79);
-    buf1[1] = (buf1[1]+val48);
-    buf1[2] = (buf1[2]+val49);
-    buf1[3] = (buf1[3]+val50);
-    buf1[4] = (buf1[4]+val51);
-    buf1[5] = (buf1[5]+val52);
-    buf1[6] = (buf1[6]+val53);
-    buf1[7] = (buf1[7]+val54);
-    buf1[8] = (buf1[8]+val55);
-    buf1[9] = (buf1[9]+val56);
-    buf1[10] = (buf1[10]+val57);
-    buf1[11] = (buf1[11]+val58);
-    buf1[12] = (buf1[12]+val59);
-    buf1[13] = (buf1[13]+val60);
-    buf1[14] = (buf1[14]+val61);
-    buf1[15] = (buf1[15]+val62);
-    buf1[16] = (buf1[16]+val63);
-    buf1[17] = (buf1[17]+val64);
-    buf1[18] = (buf1[18]+val65);
-    buf1[19] = (buf1[19]+val66);
-    buf1[20] = (buf1[20]+val67);
-    buf1[21] = (buf1[21]+val68);
-    buf1[22] = (buf1[22]+val69);
-    buf1[23] = (buf1[23]+val70);
-    buf1[24] = (buf1[24]+val71);
-    buf1[25] = (buf1[25]+val72);
-    buf1[26] = (buf1[26]+val73);
-    buf1[27] = (buf1[27]+val74);
-    buf1[28] = (buf1[28]+val75);
-    buf1[29] = (buf1[29]+val76);
-    buf1[30] = (buf1[30]+val77);
-    buf1[31] = (buf1[31]+val78);
-  }
-  int alu170 = (alu0+(gidx1<<11)+(lidx0<<9));
-  bool alu171 = (lidx2==0);
-  if (alu171) {
-    data0_100352[(alu170+1)] = buf1[4];
-  }
-  if (alu171) {
-    data0_100352[(alu170+2)] = buf1[8];
-  }
-  if (alu171) {
-    data0_100352[(alu170+3)] = buf1[12];
-  }
-  if (alu171) {
-    data0_100352[(alu170+4)] = buf1[16];
-  }
-  if (alu171) {
-    data0_100352[(alu170+5)] = buf1[20];
-  }
-  if (alu171) {
-    data0_100352[(alu170+6)] = buf1[24];
-  }
-  if (alu171) {
-    data0_100352[(alu170+7)] = buf1[28];
-  }
-  if (alu171) {
-    data0_100352[(alu170+128)] = buf1[1];
-  }
-  if (alu171) {
-    data0_100352[(alu170+129)] = buf1[5];
-  }
-  if (alu171) {
-    data0_100352[(alu170+130)] = buf1[9];
-  }
-  if (alu171) {
-    data0_100352[(alu170+131)] = buf1[13];
-  }
-  if (alu171) {
-    data0_100352[(alu170+132)] = buf1[17];
-  }
-  if (alu171) {
-    data0_100352[(alu170+133)] = buf1[21];
-  }
-  if (alu171) {
-    data0_100352[(alu170+134)] = buf1[25];
-  }
-  if (alu171) {
-    data0_100352[(alu170+135)] = buf1[29];
-  }
-  if (alu171) {
-    data0_100352[(alu170+256)] = buf1[2];
-  }
-  if (alu171) {
-    data0_100352[(alu170+257)] = buf1[6];
-  }
-  if (alu171) {
-    data0_100352[(alu170+258)] = buf1[10];
-  }
-  if (alu171) {
-    data0_100352[(alu170+259)] = buf1[14];
-  }
-  if (alu171) {
-    data0_100352[(alu170+260)] = buf1[18];
-  }
-  if (alu171) {
-    data0_100352[(alu170+261)] = buf1[22];
-  }
-  if (alu171) {
-    data0_100352[(alu170+262)] = buf1[26];
-  }
-  if (alu171) {
-    data0_100352[(alu170+263)] = buf1[30];
-  }
-  if (alu171) {
-    data0_100352[(alu170+384)] = buf1[3];
-  }
-  if (alu171) {
-    data0_100352[(alu170+385)] = buf1[7];
-  }
-  if (alu171) {
-    data0_100352[(alu170+386)] = buf1[11];
-  }
-  if (alu171) {
-    data0_100352[(alu170+387)] = buf1[15];
-  }
-  if (alu171) {
-    data0_100352[(alu170+388)] = buf1[19];
-  }
-  if (alu171) {
-    data0_100352[(alu170+389)] = buf1[23];
-  }
-  if (alu171) {
-    data0_100352[(alu170+390)] = buf1[27];
-  }
-  if (alu171) {
-    data0_100352[(alu170+391)] = buf1[31];
-  }
-  if (alu171) {
-    data0_100352[alu170] = buf1[0];
-  }
+  int alu132 = ((gidx0<<11)+(lidx1<<10)+alu0);
+  data0_100352[(alu132+1)] = buf0[1];
+  data0_100352[(alu132+2)] = buf0[2];
+  data0_100352[(alu132+3)] = buf0[3];
+  data0_100352[(alu132+4)] = buf0[4];
+  data0_100352[(alu132+5)] = buf0[5];
+  data0_100352[(alu132+6)] = buf0[6];
+  data0_100352[(alu132+7)] = buf0[7];
+  data0_100352[(alu132+128)] = buf0[8];
+  data0_100352[(alu132+129)] = buf0[9];
+  data0_100352[(alu132+130)] = buf0[10];
+  data0_100352[(alu132+131)] = buf0[11];
+  data0_100352[(alu132+132)] = buf0[12];
+  data0_100352[(alu132+133)] = buf0[13];
+  data0_100352[(alu132+134)] = buf0[14];
+  data0_100352[(alu132+135)] = buf0[15];
+  data0_100352[(alu132+256)] = buf0[16];
+  data0_100352[(alu132+257)] = buf0[17];
+  data0_100352[(alu132+258)] = buf0[18];
+  data0_100352[(alu132+259)] = buf0[19];
+  data0_100352[(alu132+260)] = buf0[20];
+  data0_100352[(alu132+261)] = buf0[21];
+  data0_100352[(alu132+262)] = buf0[22];
+  data0_100352[(alu132+263)] = buf0[23];
+  data0_100352[(alu132+384)] = buf0[24];
+  data0_100352[(alu132+385)] = buf0[25];
+  data0_100352[(alu132+386)] = buf0[26];
+  data0_100352[(alu132+387)] = buf0[27];
+  data0_100352[(alu132+388)] = buf0[28];
+  data0_100352[(alu132+389)] = buf0[29];
+  data0_100352[(alu132+390)] = buf0[30];
+  data0_100352[(alu132+391)] = buf0[31];
+  data0_100352[(alu132+512)] = buf0[32];
+  data0_100352[(alu132+513)] = buf0[33];
+  data0_100352[(alu132+514)] = buf0[34];
+  data0_100352[(alu132+515)] = buf0[35];
+  data0_100352[(alu132+516)] = buf0[36];
+  data0_100352[(alu132+517)] = buf0[37];
+  data0_100352[(alu132+518)] = buf0[38];
+  data0_100352[(alu132+519)] = buf0[39];
+  data0_100352[(alu132+640)] = buf0[40];
+  data0_100352[(alu132+641)] = buf0[41];
+  data0_100352[(alu132+642)] = buf0[42];
+  data0_100352[(alu132+643)] = buf0[43];
+  data0_100352[(alu132+644)] = buf0[44];
+  data0_100352[(alu132+645)] = buf0[45];
+  data0_100352[(alu132+646)] = buf0[46];
+  data0_100352[(alu132+647)] = buf0[47];
+  data0_100352[(alu132+768)] = buf0[48];
+  data0_100352[(alu132+769)] = buf0[49];
+  data0_100352[(alu132+770)] = buf0[50];
+  data0_100352[(alu132+771)] = buf0[51];
+  data0_100352[(alu132+772)] = buf0[52];
+  data0_100352[(alu132+773)] = buf0[53];
+  data0_100352[(alu132+774)] = buf0[54];
+  data0_100352[(alu132+775)] = buf0[55];
+  data0_100352[(alu132+896)] = buf0[56];
+  data0_100352[(alu132+897)] = buf0[57];
+  data0_100352[(alu132+898)] = buf0[58];
+  data0_100352[(alu132+899)] = buf0[59];
+  data0_100352[(alu132+900)] = buf0[60];
+  data0_100352[(alu132+901)] = buf0[61];
+  data0_100352[(alu132+902)] = buf0[62];
+  data0_100352[(alu132+903)] = buf0[63];
+  data0_100352[alu132] = buf0[0];
 }
