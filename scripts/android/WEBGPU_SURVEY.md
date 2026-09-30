@@ -698,3 +698,41 @@ cost), **Conv+Add(+ReLU) residual epilogue** (all conv models: 1.1-2.2 ms, 1.5-3
 elimination** in the YOLO family (~4 ms of 64-72 ms, 5-6%, but a much larger change: it needs a layout pass, not a shader epilogue). Dispatch-count
 reduction alone (graph capture, persistent kernels) tops out at the 13 us floor: 1.7-3.7 ms per run, and graph capture already recovers 8 of the
 13 us. RT-DETR's TopK/Tile CPU round trip is a further ~2-4 ms worth removing with a WebGPU `Tile`/`Unsqueeze` (small, self-contained).
+
+## GPU clock after idle: real, large, and not fixable from user space (`dawn_repro/clock.cc`, `bench.cc` `SLEEP_MS`)
+
+Question: does the Adreno 730 run at a lower effective clock in network-like workloads than in the back-to-back microbenchmarks? Yes -- not
+because of dispatch structure, but because of idle time. Workload: the register-tile fp32 GEMM 784x512x128 (`sc` TM=8 NV=2, 32x4), 0.103 GFLOP.
+
+| pattern (Dawn/Vulkan, warm) | GFLOPS |
+|---|---|
+| one batched dispatch (z=32) | 126-183 (noisy: depends on the clock state it starts in) |
+| 100 dependent dispatches, one submission | 193-197 |
+| 100 GEMMs interleaved with a cheap elementwise dispatch each | 192-197 (elementwise alone: 1.7 ms of 53) |
+| submit N GEMMs, wait, repeat (no idle): N=1 / 2 / 4 / 8 / 32 / 100 | 104-118 / 160 / 157 / 165-181 / 183-192 / 198-202 |
+| same, but submit everything ahead and wait once | 184-192 (N=1), 203-214 (N>=2) |
+
+So dispatch granularity costs nothing (interleaving and dependent chains are free) and the only structural loss is synchronising on every
+submission (~0.35-0.45 ms CPU round trip per wait; ORT syncs once per inference so it does not pay this). The clock effect is separate:
+
+- After >= 100 ms with the GPU idle, 100 GEMMs run at **98 GFLOPS instead of 193** (105 ms instead of 53 ms). After 20 ms idle: 166-169; after 5 ms: no loss.
+- The slow state does not clear quickly under load: 20-GEMM submissions after 1 s idle run at 1.3 ms/GEMM (vs 0.50 at full clock) for ~3 s of
+  continuous work and are still improving at 8 s (0.64 ms/GEMM at t = 8 s). With an inference-like duty cycle (20 GEMMs = ~10 ms of work, then a 20 ms sleep) it
+  **never ramps**: 1.5 ms/GEMM, i.e. 3x slower than the microbenchmark, for the whole 6 s (2 runs).
+- Same in ORT (`bench.cc` now honours `SLEEP_MS`, an idle gap after each timed inference), ResNet-50 median with the Winograd path (ORT default in brackets):
+
+  | idle between inferences | 0 ms | 5 ms | 20 ms | 50 ms | 200 ms |
+  |---|---|---|---|---|---|
+  | Winograd | 61.4 | 61.4 | 73.8 | 74.4 | **125.1** |
+  | ORT default conv | 67.5 | 67.5 | 75.3 | 73.5 | **148.2** |
+
+  A model called once per 20-200 ms therefore runs 20-100% slower than every benchmark in this document (all of which run inferences back to back);
+  Winograd keeps its advantage but the absolute gain shrinks at low duty cycles (e.g. 148 -> 125 ms at 200 ms idle).
+- Keep-alive tricks do not help. A second device on another thread issuing a continuous tiny-dispatch stream, or one tiny dispatch every 5 ms or 1 ms, leaves the
+  inference-like pattern at 1.5 ms/GEMM (8 runs, all within noise of the no-keep-alive case). The governor evidently needs real shader load, not submissions;
+  a genuinely saturating background kernel would ramp the clock only by time-slicing away the throughput it is meant to protect. Reading or pinning the clock needs
+  root (`/sys/class/kgsl`), which is out of scope here.
+
+Consequences: (1) any latency claim for a once-per-frame GPU model should be measured with the real frame gap, (2) batching or pipelining consecutive
+inferences so the GPU never idles > ~10 ms is the only lever found (throughput-style use), (3) the microbenchmark-to-network gap seen earlier (e.g. the register-tile
+conv) is not explained by this effect, since back-to-back ORT runs are at full clock (61 ms Winograd run has no idle).

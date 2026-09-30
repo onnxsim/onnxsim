@@ -9,6 +9,7 @@
 // uniform [0,1) (or a 0..255 ramp if the name/type suggests an image), int64/int32 -> 1, uint8 -> ramp,
 // bool -> false. Dynamic dims become 1. Prints cold-first-run, median, mean, min, p90 in ms and the
 // number of nodes that ran on each EP (from the profiler, when PROFILE=1).
+#include <unistd.h>
 #include <onnxruntime_c_api.h>
 
 #include <algorithm>
@@ -237,6 +238,7 @@ int main(int argc, char** argv) {
     double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - (sync_s ? sync_base : 0.0);
     if (it == 0) cold = d;
     if (it >= warm) ms.push_back(d);
+    if (const char* sl = getenv("SLEEP_MS")) usleep(static_cast<useconds_t>(atof(sl) * 1000));  // idle gap between inferences (GPU clock experiment)
     if ((it == 0 && !dump.empty()) || (it == warm + iters - 1 && !dumplast.empty())) {
       const std::string& dump = it == 0 && !::dump_first.empty() ? ::dump_first : dumplast;
       for (size_t o = 0; o < nout; o++) {
