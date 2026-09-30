@@ -85,7 +85,7 @@ static string dotExpr(const string& v, const string& a, const string& b) {
   if (v == "unp") return "dot(unpack4xI8(" + a + "), unpack4xI8(" + b + "))";
   return "dot4e(" + a + ", " + b + ")";
 }
-static string header(const string& v) { return string(v == "dot" || v == "unp" ? "requires packed_4x8_integer_dot_product;\n" : "") + (v == "emu" ? DOT4E : ""); }
+static string header(const string& v) { return string(v == "dot" || v == "unp" || v == "f8" ? "requires packed_4x8_integer_dot_product;\n" : "") + (v == "emu" ? DOT4E : ""); }
 
 static int info() {
   wgpu::AdapterInfo ai{}; ad.GetInfo(&ai);
@@ -116,7 +116,7 @@ static int peak(const string& v, uint32_t WG, uint32_t ITERS) {
   s += "  for (var i = 0u; i < " + to_string(ITERS) + "u; i++) {\n";
   for (int c = 0; c < CH; c++) {
     string k = "K[" + to_string(c / 4) + "]." + "xyzw"[c % 4];
-    if (f32) s += "    a" + to_string(c) + " = fma(x, bitcast<f32>(" + k + " & 0x3fffffffu | 0x3f000000u), a" + to_string(c) + ");\n";
+    if (f32) s += "    a" + to_string(c) + " = fma(x, bitcast<f32>((" + k + " & 0x3fffffffu) | 0x3f000000u), a" + to_string(c) + ");\n";
     else s += "    a" + to_string(c) + " += " + dotExpr(v, "x", k) + ";\n";
   }
   if (f32) s += "    x = x * 1.0000001 + 0.0001;\n"; else s += "    x = x * 1664525u + 1013904223u;\n";
@@ -151,21 +151,28 @@ static int gemm(const string& v, uint32_t M, uint32_t N, uint32_t K, uint32_t RE
        "  let col4 = g.x * " + to_string(NV) + "u;\n  let row0 = g.y * " + to_string(TM) + "u;\n  let K16 = u.K / 16u; let N4 = u.N / 4u;\n";
   for (int m = 0; m < TM; m++) s += "  let ar" + to_string(m) + " = min(row0 + " + to_string(m) + "u, u.M - 1u);\n";
   for (int n = 0; n < NV; n++) s += "  let bc" + to_string(n) + " = min(col4 + " + to_string(n) + "u, N4 - 1u);\n";
-  for (int m = 0; m < TM; m++) for (int c = 0; c < TN; c++) s += "  var c" + to_string(m) + "_" + to_string(c) + " = 0;\n";
+  const bool F8 = v == "f8";
+  for (int m = 0; m < TM; m++) for (int c = 0; c < TN; c++) s += "  var c" + to_string(m) + "_" + to_string(c) + (F8 ? " = 0.0;\n" : " = 0;\n");
   s += "  for (var k16 = 0u; k16 < K16; k16++) {\n";
   for (int m = 0; m < TM; m++) s += "    let a" + to_string(m) + " = A[ar" + to_string(m) + " * K16 + k16];\n";
   for (int kk = 0; kk < 4; kk++) {
     for (int n = 0; n < NV; n++) s += "    let b" + to_string(kk) + "_" + to_string(n) + " = B[(k16 * 4u + " + to_string(kk) + "u) * N4 + bc" + to_string(n) + "];\n";
-    for (int m = 0; m < TM; m++) for (int n = 0; n < NV; n++) for (int j = 0; j < 4; j++)
-      s += "    c" + to_string(m) + "_" + to_string(n * 4 + j) + " += " + dotExpr(v, "a" + to_string(m) + "." + "xyzw"[kk], "b" + to_string(kk) + "_" + to_string(n) + "." + "xyzw"[j]) + ";\n";
+    if (F8) {  // int8 storage, f32 arithmetic: unpack + convert once per operand, dot() in f32
+      for (int m = 0; m < TM; m++) s += "    let fa" + to_string(kk) + "_" + to_string(m) + " = vec4<f32>(unpack4xI8(a" + to_string(m) + "." + "xyzw"[kk] + "));\n";
+      for (int n = 0; n < NV; n++) for (int j = 0; j < 4; j++) s += "    let fb" + to_string(kk) + "_" + to_string(n * 4 + j) + " = vec4<f32>(unpack4xI8(b" + to_string(kk) + "_" + to_string(n) + "." + "xyzw"[j] + "));\n";
+      for (int m = 0; m < TM; m++) for (int c = 0; c < TN; c++)
+        s += "    c" + to_string(m) + "_" + to_string(c) + " += dot(fa" + to_string(kk) + "_" + to_string(m) + ", fb" + to_string(kk) + "_" + to_string(c) + ");\n";
+    } else {
+      for (int m = 0; m < TM; m++) for (int n = 0; n < NV; n++) for (int j = 0; j < 4; j++)
+        s += "    c" + to_string(m) + "_" + to_string(n * 4 + j) + " += " + dotExpr(v, "a" + to_string(m) + "." + "xyzw"[kk], "b" + to_string(kk) + "_" + to_string(n) + "." + "xyzw"[j]) + ";\n";
+    }
   }
   s += "  }\n";
   for (int n = 0; n < NV; n++) s += "  let sc" + to_string(n) + " = S[bc" + to_string(n) + "];\n";
   for (int m = 0; m < TM; m++) for (int n = 0; n < NV; n++) {
-    string c = "c" + to_string(m) + "_" + to_string(n * 4);
-    (void)c;
     string p = "c" + to_string(m) + "_";
-    s += "  if (row0 + " + to_string(m) + "u < u.M && col4 + " + to_string(n) + "u < N4) { C[(g.z * u.M + row0 + " + to_string(m) + "u) * N4 + col4 + " + to_string(n) + "u] = q(" + p + to_string(n * 4) + ", sc" + to_string(n) + ".x) | (q(" + p + to_string(n * 4 + 1) + ", sc" + to_string(n) + ".y) << 8u) | (q(" + p + to_string(n * 4 + 2) + ", sc" + to_string(n) + ".z) << 16u) | (q(" + p + to_string(n * 4 + 3) + ", sc" + to_string(n) + ".w) << 24u); }\n";
+    auto Q = [&](int j, char comp) { return "q(" + string(F8 ? "i32(" : "(") + p + to_string(n * 4 + j) + "), sc" + to_string(n) + "." + comp + ")"; };
+    s += "  if (row0 + " + to_string(m) + "u < u.M && col4 + " + to_string(n) + "u < N4) { C[(g.z * u.M + row0 + " + to_string(m) + "u) * N4 + col4 + " + to_string(n) + "u] = " + Q(0, 'x') + " | (" + Q(1, 'y') + " << 8u) | (" + Q(2, 'z') + " << 16u) | (" + Q(3, 'w') + " << 24u); }\n";
   }
   s += "}\n";
   wgpu::ComputePipeline pl; if (!compile(s, pl)) return 1;

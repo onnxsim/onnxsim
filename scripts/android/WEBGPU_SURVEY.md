@@ -876,3 +876,35 @@ earlier standalone gains only partly transferring. Applying the patches: transpo
 but is not faster than either alone. Phone medians (ms): ResNet-50 60.5 (neither) / 57.8 (texture) / 57.7 (f16 V) / 58.2 (both);
 SAM-L0 encoder 343 (texture) / 345 (both); RT-DETR pre 312 (texture) / 316 (both). Both modes remove the same GEMM-stage load traffic, and the four
 Winograd stages are now limited by the transforms and dispatch overheads rather than by the GEMM loads, so stacking them does not help.
+
+## int8 on the Adreno 730 through WebGPU (`dawn_repro/int8.cc`)
+
+**The driver has no int8 dot product.** `vk_int8_query.cc`: Vulkan 1.1.128, `VK_KHR_8bit_storage` and `VK_KHR_shader_float16_int8` (shaderInt8 = 1) are present,
+but not `VK_KHR_shader_integer_dot_product` (shaderIntegerDotProduct = 0). Dawn exposes the WGSL feature `packed_4x8_integer_dot_product` anyway and Tint
+polyfills `dot4I8Packed`: `dot4I8Packed`, `dot(unpack4xI8, unpack4xI8)` and a hand-written extractBits multiply-add all run at the same 30.1 G dot4/s = 241 GOPS int8
+(peak kernel, 16 independent chains), i.e. ~120 G int8 MAC/s against 493 G fp32 FMA/s (750-775 GFLOPS measured in that session; 986 earlier). So int8 arithmetic in
+WGSL is ~4x *slower* than fp32 per MAC on this GPU; an int8 GEMM with `dot4I8Packed` runs at 130-160 GOPS, no better than the f32 register-tile kernel.
+
+**int8 storage with f32 arithmetic is what works.** Variant `f8`: A and B packed 4 x int8 per u32 (16 k per vec4 load for A, 4 columns x 4 k per vec4 load for B), `unpack4xI8` +
+convert once per operand, `dot()` in f32 (exact for int8 data while sums stay < 2^24), per-channel `clamp(round(acc * scale[n]), -128, 127)` epilogue packed 4 outputs per u32 (a QLinearConv-style
+requantize). Loads are 4x smaller than f32 and 2x smaller than packed f16. Correct against an exact CPU integer reference (0 wrong of 600 samples per case, all shapes). Same
+session, best tile per variant (the phone was shared and slow: f32 `sc` read 92-146 GFLOPS instead of the usual 200-280, so read ratios, not absolute values; `RB=off VMM=1`, 5 s warm-up for the int8 binary):
+
+| GEMM (M N K) | f32 `sc` | p16 (f16 storage) | int8 `dot` (polyfill) | int8 `f8` (TM=4 NV=1) | f8 / f32 | f8 / p16 |
+|---|---|---|---|---|---|---|
+| 784 512 128 | 146 | 172-195 | 141-159 | **358** (wg 16x8) | 2.5x | 2.0x |
+| 3136 256 64 | 131 | 166 | 136 | **329-346** | 2.6x | 2.0x |
+| 784 128 1152 | 116 | 180 | 142 | **308** | 2.7x | 1.7x |
+| 196 256 2304 | 95 | 154-160 | 136 | **324** (wg 32x4) | 3.4x | 2.0x |
+
+Caveats: `f8` is very sensitive to the tile: the 64-accumulator tile (TM=8 NV=2) spills and runs at 5-6 GOPS, TM=4 NV=2 gives 120-138, TM=4 NV=1 with a 16x8 or 32x4 workgroup gives 300-360 (and
+some workgroup shapes swing by 2x between shapes), so a real kernel needs a per-shape tile table. All GOPS are 2*M*N*K/time and count int8 MACs like f32 FMAs.
+
+**ResNet-50 estimate (not measured in ORT).** Conv MACs: 1x1 2.12 G (36 layers, 51%), 3x3 1.85 G (16 layers, 45%), 7x7 stem 0.12 G. 1x1 convs are plain GEMMs and would take the `f8` kernel
+(2.0-2.7x over f32, 17.5 M activation elements = 17.5 MB int8 instead of 70 MB f32). The 3x3 layers already use f32 Winograd, which is ~1.6x faster than a direct kernel, while a direct int8 3x3 conv
+pays the gather penalty (~30% below a plain GEMM), so it would be roughly on par with Winograd f32: leave them in f32 and fuse the (de)quantize into the neighbouring epilogues (the 1x1 requantize
+epilogue and the Winograd output transform) so no standalone Q/DQ dispatches appear; residual Adds would need an int8 or dequantize-add kernel. With the ~25 ms that the 1x1 layers take of the current ~58 ms:
+full microbenchmark gain -> ~11-12 ms (58 -> ~44 ms), half of it transferring (as with earlier GEMM results) -> ~17 ms (58 -> ~50 ms). That is -12% to -24% on ResNet-50, for
+mixed-precision PTQ accuracy (int8 activations on the 1x1 layers) that must be checked per model. **Integration cost is high:** the ORT WebGPU EP has no QLinearConv / ConvInteger kernel, so it needs
+a new kernel, QDQ-fusion registration for the EP, per-shape tile tuning and a calibration flow; it is worth doing only if int8 accuracy is acceptable for the target models. The cheaper
+intermediate step is weights-only int8 (dequantize in the kernel), which cuts weight traffic 4x but leaves activations f32.
