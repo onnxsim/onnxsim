@@ -489,3 +489,25 @@ Two runs each, phone median. The min-channel rule matters: with no threshold YOL
 the small feature maps (<= 28) still keeps most of the ResNet gain; the 56x56 layers add little. GEMM tile sweep: TM=4, NV=1 or 2
 are equal (61.0-61.3 ms), TM=8 is 70+ ms. This is the first change in this investigation that makes the WebGPU EP faster on the
 end-to-end ResNet, and it agrees with the standalone `conv_alt.cc` result.
+
+## Winograd F(4,3) vs F(2,3) (standalone, `dawn_repro/conv_alt43.cc`)
+
+Same harness as `conv_alt.cc` (NHWC fp32, batch 1, pad 1, Cin=Cout=C, best of a GEMM tile sweep per algorithm), with one generic
+transform generator so F(2,3) and F(4,3) (6x6 tiles -> 4x4 outputs, 36 batched GEMMs, points 0, +-1, +-2, inf) are timed the same
+way. Two runs each on the Adreno 730 (ms; "x direct" = time / best direct register-tile conv):
+
+| layer | direct | F(2,3) | F(4,3) | F(4,3)/F(2,3) | relerr F(2,3) / F(4,3) |
+|---|---|---|---|---|---|
+| 64ch @ 56x56 | 1.32 / 1.40 | 0.94 / 0.79 | **0.81 / 0.67** | 0.86 / 0.85 | 6e-7 / 1e-5 |
+| 128ch @ 28x28 | 1.38 / 1.34 | 1.11 / 1.00 | 1.06 / 1.03 | 0.95 / 1.03 | 4e-7 / 5e-6 |
+| 256ch @ 14x14 | 1.50 / 1.47 | **0.86 / 0.97** | 1.01 / 1.12 | 1.17 / 1.15 | 1e-6 / 1e-5 |
+| 512ch @ 7x7 | 1.97 / 1.76 | **0.80 / 0.78** | 1.63 / 1.72 | 2.05 / 2.22 | 8e-7 / 6e-6 |
+
+- F(4,3) does 36/16 = 2.25x fewer multiplies than direct (vs 4/9 -> 2.25x for F(2,3): 16 products per 4 outputs, i.e. 4x fewer than direct 36; F(4,3): 36 per 16 outputs = 4x...
+  precisely: direct 9 MACs/output, F(2,3) 4, F(4,3) 2.25) but it needs 36 GEMMs with 4x fewer rows each. It only wins where there are many
+  tiles: 56x56 (196 tiles) by ~15%; 28x28 (49 tiles) is a tie; at 14x14 (16 tiles) and 7x7 (4 tiles) the GEMMs are too small to fill the GPU and
+  F(4,3) is 15% / 2x slower than F(2,3). The transforms are minor (0.05-0.15 ms per stage; the F(4,3) input transform is a little dearer, the output transform cheaper).
+- Accuracy: F(4,3) has ~10x the error of F(2,3) (5e-6..1e-5 vs 4e-7..1e-6 relative to the max output, fp32); fine in fp32, but it would not be safe in fp16.
+- Recommended choice: F(4,3) for tile counts >= ~150 (64ch@56 and larger feature maps), F(2,3) below that, direct for < 64 channels. At 56x56 the
+  end-to-end gain is bounded: ResNet-50 has only a few such layers, and in the ORT experiment the 56x56 layers added little over the smaller ones, so the expected
+  network gain from F(4,3) is small (well under 1 ms of 61).
