@@ -908,3 +908,35 @@ full microbenchmark gain -> ~11-12 ms (58 -> ~44 ms), half of it transferring (a
 mixed-precision PTQ accuracy (int8 activations on the 1x1 layers) that must be checked per model. **Integration cost is high:** the ORT WebGPU EP has no QLinearConv / ConvInteger kernel, so it needs
 a new kernel, QDQ-fusion registration for the EP, per-shape tile tuning and a calibration flow; it is worth doing only if int8 accuracy is acceptable for the target models. The cheaper
 intermediate step is weights-only int8 (dequantize in the kernel), which cuts weight traffic 4x but leaves activations f32.
+
+## fp16 graphs on ORT's WebGPU EP (stock fp16 kernels, phone, 2026-10-01)
+
+Scripts: `webgpu_ops/fp16/` (`convert_fp16.py`: `onnxconverter_common.float16.convert_float_to_float16(keep_io_types=True)`; `conv_only_fp16.py`,
+`conv_kind_fp16.py`: fp16 only around selected Convs; `run_fp16.sh`). Same ORT build and GPU as the fp32 numbers (Winograd default on, which only
+applies to fp32 tensors, so fp16 graphs take ORT's stock fp16 paths), >= 5 s warm-up, medians. Graph I/O stays fp32.
+
+| model | fp32 (Winograd etc.) | fp16 graph | error vs fp32 (same build) |
+|---|---|---|---|
+| ResNet-50 | 61.2 ms | **55.3 ms** (-10%) | logits rms 3.6e-3, max 8e-3; top-1 911 = fp32 = CPU |
+| YOLO11n | 72.0 ms | **59.7 ms** (-17%) | rms 1.9e-3, max 2.3e-2 of the output range |
+| SAM-L0 encoder | 370 ms | 340 ms | **all NaN** |
+| RT-DETR pre | 343 ms | 318 ms | **all NaN** (outputs 0-4), outputs 5/6 wrong |
+
+- **No CPU fallbacks** in the fp16 graphs of ResNet-50 (279 nodes), YOLO11n (558) and SAM (525) (profiler); RT-DETR pre keeps the same 9 CPU nodes as fp32
+  (`Unsqueeze` x3, `Tile` x6). So the stock fp16 Conv/MatMul path is complete; the fp16 win is 10-17% on the two models that survive, compared with
+  Winograd + texture weights at 58 ms on ResNet-50 (the paths do not combine: Winograd is fp32-only).
+- **SAM-L0 and RT-DETR are not usable in fp16 with the stock kernels, and the timings above are void.** Bisecting SAM (33 intermediate outputs): the first
+  NaNs appear in the third stage's MLP Gelu after the linear-attention `MatMul`/`Add` (values up to ~500); `LayerNormalization`/`Softmax`/`Div`/`Erf`/`Gelu`/`MatMul`/`Gemm`
+  kept in fp32 (op block lists) did not remove them. Converting **only Convs** to fp16 (fp32 elsewhere, Casts around each Conv) isolates it to the **group=1 1x1 convs**:
+  fp16 on just those 40 convs gives rms error **0.62** (and 351 ms, i.e. fast because wrong), fp16 on the 11 group-1 3x3 convs 1.2e-2, on the 18 grouped convs 1.7e-2.
+  ORT's 1x1 fp16 path is the MatMul-style kernel with f16 accumulators, which loses the sum over K = 256-3072 once activations reach tens to hundreds.
+  Wrapping fp16 around Conv only (no other fp16 ops) is also no faster: SAM 382 ms and RT-DETR 342 ms with Casts, vs 370 / 343 fp32.
+- **Implication for this investigation:** the lower-precision route that works here is f16 *storage* with f32 *accumulation* (the `p16` GEMM, the f16 Winograd
+  intermediates and the RGBA16F texture weights above), not ORT's f16-accumulating kernels. A fp16 activation graph would need ORT's Conv/MatMul shaders changed
+  to accumulate in f32 before it is safe on attention-heavy models.
+- **Weight-only fp16 (fp16 initializers + runtime `Cast` to fp32) could not be measured:** keeping the initializers as graph inputs (so ORT cannot fold the Cast back
+  to fp32) makes the phone `bench` crash on load (the same model runs in host onnxruntime), and with the Casts folded it is just the fp32 model. A runtime Cast would
+  also add a write+read of the fp32 weights, the opposite of a bandwidth saving; the useful version of the idea is the texture-weights result (RGBA16F weights read
+  directly by the GEMM).
+- Recommendation: keep fp32 as the default. fp16 graphs are a 10-17% win for ResNet/YOLO-style convnets but need a per-model accuracy check and are broken on
+  SAM/RT-DETR until the f16 kernels accumulate in f32.
