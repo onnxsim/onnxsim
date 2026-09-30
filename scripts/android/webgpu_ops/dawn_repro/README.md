@@ -42,3 +42,4 @@ Build each like `harness.cc`; run on the phone under `phone-run`.
   of GPU time and ~2 us of CPU in Dawn directly).
 - `conv_alt.cc` -- Winograd F(2,3) vs direct register-tile 3x3 conv, and depthwise 3x3 variants: `conv_alt conv|dw C H` (see `../../WEBGPU_SURVEY.md`).
 - `conv_s2.cc` -- 3x3 stride-2 pad-1 NHWC conv (ResNet-50 v1.5 downsampling): direct implicit GEMM vs a polyphase hybrid Winograd (25 mults per 2x2 output tile instead of 36): `conv_s2 C H`.
+- `conv_f16io.cc` -- whole-conv packed-f16 path (f16 activations + weights, f32 accumulate, bias+ReLU, packed f16 out) vs the f32 register tile on ResNet 1x1/3x3 shapes, plus a 10-layer error-accumulation chain: `conv_f16io pw Cin Cout H | c3 C H | chain C H L`. Build like `conv_alt.cc`.

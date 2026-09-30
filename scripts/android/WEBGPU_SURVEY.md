@@ -571,3 +571,54 @@ YOLO26n 64.3 -> 64.4 (unaffected). Cost is accuracy: ResNet-50 logits differ fro
 8e-7 for the f32 Winograd path, hence opt-in. Together with Winograd: ResNet-50 67 -> 58 ms (-14%), SAM-L0 441 -> 354 (-20%), RT-DETR pre 397 -> 318 (-20%).
 
 Not worth integrating (standalone results above): F(4,3) (wins only at 56x56, <1 ms of ResNet-50) and polyphase stride-2 Winograd (~0.4 ms of ResNet-50).
+
+## Whole-conv packed-f16 path (f16 activations + weights, f32 accumulate) -- microbenchmark, `dawn_repro/conv_f16io.cc`
+
+Question: if the *graph* ran f16 (activations and weights packed 8 halves per `vec4<u32>`, f32 accumulators, bias+ReLU epilogue and packed-f16
+output), how much faster would the ResNet-50 conv classes get, and is the accuracy plausible? Same design as the earlier `p16` GEMM, applied
+to whole convs: 1x1 as NHWC GEMMs and a direct 3x3 (implicit GEMM, 9 taps), each swept over TM 2/4/8 x 6 workgroup shapes; the f32 baseline
+is the best of the seven f32 register-tile configs of `conv_alt.cc` (no epilogue, so it is slightly favoured). Random non-negative
+activations, He-uniform weights, batch 1, Dawn with ORT's toggles (`RB=off VMM=1`), best of 10 batches of 10 back-to-back dispatches.
+
+**The phone was in a slow/noisy state for this session** (the f32 register-tile kernels ran at 70-100 GFLOPS on the 1x1 shapes, against 200+ in
+the cleanest earlier runs), and the 64->256@56 case swung 0.29 -> 0.68 ms between two runs, so read the ranges of two full runs and the ratios,
+not the absolute GFLOPS.
+
+| conv | GFLOP | f32 reg-tile (ms) | f16io packed (ms) | f16io / f32 time | ORT-style `sh` GEMM (ms, gemm.cc, same session, 1x1 only) |
+|---|---|---|---|---|---|
+| 1x1 64->256 @56 | 0.103 | 1.06-1.08 | 0.29-0.68 | 0.27-0.63 | 1.20 |
+| 1x1 256->64 @56 | 0.103 | 1.19-1.20 | 0.47 | 0.39 | 1.00 |
+| 1x1 512->128 @28 | 0.103 | 1.09-1.29 | 0.68-0.80 | 0.62 | 0.88 |
+| 1x1 1024->256 @14 | 0.103 | 1.45-1.50 | 0.96-1.00 | 0.67 | 1.00 |
+| 1x1 2048->512 @7 | 0.103 | 1.02-1.18 | 0.63-0.86 | 0.62-0.73 | 1.20 |
+| 3x3 64 @56 | 0.231 | 1.32-1.39 | 1.12-1.32 | 0.85-0.95 | -- |
+| 3x3 128 @28 | 0.231 | 1.31-1.41 | 0.91-0.95 | 0.65-0.69 | -- |
+| 3x3 256 @14 | 0.231 | 1.44-1.50 | 1.07-1.10 | 0.72-0.76 | -- |
+| 3x3 512 @7 | 0.231 | 1.70-1.88 | 1.25-1.29 | 0.66-0.74 | -- |
+
+(`sh` = classic shared-memory tile, TM=4 x 4 outputs/thread, workgroup 8x8, REPS-batched throughput timing, so only roughly comparable.)
+
+- The packed-f16 kernels are **1.4-1.6x faster than the f32 register tile on the deep/narrow layers (1x1 at 28/14/7, all 3x3 at <= 28x28)**, up to
+  2-3x on the wide-M 1x1 layers (56x56), and only ~1.1x on the 3x3 at 56x56 (compute-bound there, the gather dominates). Best f16io throughput
+  in this state: 150-350 GFLOPS on 1x1 (best 352), 175-254 on 3x3.
+- **Accuracy, single layer** (300 sampled outputs vs an f64 reference computed from the *original f32* data, so input, weight and output
+  rounding all count): max relative error 4.9e-4 - 9.6e-4 (rms 4-6e-4), i.e. one f16 rounding of the output (2^-11 = 4.9e-4); the f32 kernels sit at 1e-6.
+- **Accuracy, 10 stacked 3x3 layers** (He-init random weights, biases, ReLU; f16 activations *between* layers; error vs an f64 chain of the same
+  weights): the error grows roughly linearly with depth, ~4e-4 per layer:
+
+  | layer | 1 | 2 | 3 | 5 | 7 | 10 |
+  |---|---|---|---|---|---|---|
+  | C=64 @28, max / rms | 6.2e-4 / 5.0e-4 | 1.1e-3 / 8.3e-4 | 1.6e-3 / 1.3e-3 | 2.0e-3 / 2.0e-3 | 3.1e-3 / 2.7e-3 | **4.5e-3 / 3.8e-3** |
+  | C=128 @28 | 7.7e-4 / 5.1e-4 | 1.1e-3 / 8.3e-4 | 1.4e-3 / 1.1e-3 | 2.2e-3 / 1.8e-3 | 2.9e-3 / 2.5e-3 | 4.1e-3 / 3.6e-3 |
+  | C=256 @14 | 8.1e-4 / 5.2e-4 | 1.2e-3 / 8.4e-4 | 1.5e-3 / 1.2e-3 | 2.2e-3 / 1.9e-3 | 2.6e-3 / 2.6e-3 | 3.9e-3 / 3.7e-3 |
+
+  Extrapolated linearly to ResNet-50's ~50 convs that is ~2e-2 relative rms on the deepest activations (residual adds and BatchNorm folded into
+  the weights do not add much, but were not modelled). That is the usual size of an f16 inference error: top-1 is normally unchanged but the output is not
+  close to bit-exact and it needs a per-model accuracy check; keep the f32 path as the default.
+- **Estimate for ResNet-50 end to end** (from the per-class ratios and ~55% of the FLOPs in 1x1 convs, ~40% in 3x3): conv time x ~0.65 on the 1x1
+  layers and x ~0.75-0.8 on the 3x3 layers if the standalone ratios carried over, i.e. **roughly 20-25% of the conv time, ~10-15 ms of ORT's 61 ms**
+  (58 ms with the f16 Winograd intermediates). But the register-tile GEMM lesson applies: its standalone gain (1.4-1.7x) did not transfer into
+  ORT's Conv2dMM at all (1x1 layers got slightly slower), and here the ORT Winograd path already takes over most 3x3 layers, so a realistic in-network
+  gain is a fraction of this -- I would expect **~5-8%**, and it needs an f16 graph (or f16 activation tensors between fused convs) plus an
+  accuracy gate, which is a larger change than the Winograd-internal f16 already integrated. Worth a prototype only for the 1x1 layers (56x56 -> 14x14),
+  where the ratio is best.
