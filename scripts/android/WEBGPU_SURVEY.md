@@ -745,3 +745,65 @@ output stage. The SAM-L0 encoder has 30 Conv -> Gelu(tanh) pairs (1x1, 3x3 and d
 CPU EP to 5e-5, and the encoder goes 382 -> 372 ms (Winograd f32 on). `gen_new_op_tests.py` gained Conv+Gelu (both variants, 5 conv kinds) and Winograd
 (plain, bias+ReLU, tanh-Gelu, no pad, asymmetric pad) cases; the sweep is 299 OK, 0 wrong. `ort_conv_winograd.patch` now contains only the four
 `nn/conv*` files (the earlier version wrongly repeated the `fuse_utils` hunks from the SiLU patch).
+
+## Why Adreno OpenCL beats WebGPU/Vulkan: the same work in both (`dawn_repro/cl_vs_wg.cc`)
+
+Adreno 730, OpenCL 3.0 driver (compiler E031.38.11.11), 4 compute units, extensions incl. `cl_khr_fp16`, `cl_khr_subgroups`, `cl_qcom_perf_hint`,
+`cl_qcom_ml_ops`, `cl_qcom_dot_product8`, `cl_qcom_subgroup_shuffle`, `cl_qcom_reqd_sub_group_size`, `cl_qcom_recordable_queues`,
+`cl_qcom_accelerated_image_ops`. Same kernels (register-tile GEMM, scalar accumulators, TM=8 NV=2), same inputs, same session, OpenCL runs
+after a 3 s warm-up, WebGPU runs via `gemm_w` (gemm.cc with a 4 s in-process warm-up). Phone noise is +-20%, so read ratios; best of several sweeps.
+
+**Traps first.** (1) OpenCL `fma()` is emulated: ~1000x slower than `mad()`/`a*b+c` (a 2^18-thread fma loop never finished in 20 min). (2) 64 float
+accumulator chains in one thread spill (141 vs 866 GFLOPS at 32 chains). (3) `-cl-fast-relaxed-math` / `-cl-mad-enable` change nothing.
+
+| measurement | OpenCL | WebGPU (Dawn/Vulkan) |
+|---|---|---|
+| FMA peak f32 (32 chains, mad) | 866 GFLOPS | 988 (64 chains, fma) |
+| FMA peak f16 scalar / half2 / half4 | **1001 / 1624 / 1412** | 307-313 (scalar, vec2) |
+| load bandwidth, buffer float4 | 97 GB/s (6 G loads/s) | 164 GB/s (10 G/s) |
+| load, image RGBA32F | 145 GB/s (9 G texels/s) | 240 GB/s (15 G/s) |
+| load, image RGBA16F (`read_imagef` or `read_imageh`) | 138-204 GB/s, **17-25 G texels/s** | not measured |
+| buffer half4 (convert) | 76-80 GB/s (9-10 G loads/s); `vload_half4` 19 GB/s | -- |
+
+| GEMM (GFLOPS) | 784x512x128 | 3136x256x64 | 196x256x2304 |
+|---|---|---|---|
+| OpenCL f32, buffers | 197-201 | 196-199 | 160-164 |
+| OpenCL f32, B as image | **474-482** | **463-487** | **382-399** |
+| OpenCL f16 storage, buffers, f32 acc | 232 | 214-220 | 219-221 |
+| OpenCL f16 images, f32 acc | 413-446 | 381-385 | 342-360 |
+| OpenCL f16 images, f16 acc (error 5e-3..3.5e-2) | 583-621 | 537-544 | 512-572 |
+| WebGPU `sh` (ORT design) | 169 | 158 | 153 |
+| WebGPU `sc` f32 buffers | 219-264 | 230-268 | 161-247 |
+| WebGPU `p16` packed f16 | 192-221 | 164-207 | 159-417 (noisy) |
+| WebGPU `tt` (A and B in textures) | 327-383 | 201-325 | 163-259 |
+
+| direct 3x3 conv (GFLOPS) | 64ch @56 | 256ch @14 |
+|---|---|---|
+| OpenCL f32 buffers | 109 | 80 |
+| OpenCL f32 images (X and weights) | 228 | 157-163 |
+| OpenCL f16 images, f32 acc | 306 | 176 |
+| OpenCL f16 images, f16 acc (err 6e-3..8e-3) | 353 | 217 |
+| WebGPU `conv_alt` direct (buffers) | 169-179 | 156-158 |
+
+**Ranked explanation of the OpenCL advantage**
+1. **The texture/image path (biggest).** OpenCL's own *buffer* kernels are not better than WebGPU's (97 vs 164 GB/s, conv 109 vs 175 GFLOPS): reading the B
+   operand (and the conv input) through `image2d` roughly doubles OpenCL's GEMM (200 -> 480 GFLOPS) and its conv. A WebGPU kernel that uses textures
+   (`tt`) recovers most of this (327-383 vs 480), so this part is obtainable in WebGPU, but ORT's Conv/MatMul use storage buffers only.
+2. **Half storage in images.** RGBA16F texels double the texel rate (17-25 G/s vs 9 G/s for RGBA32F) and halve the bytes: 380-450 (f32 acc) vs 480 f32 images; with
+   f16 accumulation 510-620. The f32-accumulate path keeps the accuracy of the f32 kernels (error ~1e-6 from the half-rounded inputs); f16 accumulation does not (5e-3 to 3.5e-2).
+3. **Half ALU rate.** OpenCL `half` mad reaches 1000 (scalar) to 1624 GFLOPS (half2), 1.2-1.9x the f32 rate, while Vulkan/WGSL f16 arithmetic runs at 310
+   (0.3x of f32, reproducible with f16 scalar and vec2). This is a driver/compiler difference in how each API lowers 16-bit math, and it is the one piece WebGPU cannot reach today.
+4. **Precision of the comparison.** The earlier "OpenCL 1.5x faster" network comparison was fp16 OpenCL vs fp32 WebGPU; items 1-3 show that most of the gap is
+   explained by images and half, not by a slower WebGPU runtime (dispatch overhead is ~13 us, ~3-5% of a run).
+5. **Compiler flags: nothing.** `-cl-fast-relaxed-math`, `-cl-mad-enable` give identical times; only avoiding `fma()` matters.
+
+**GPU clock: OpenCL can pin it without root.** `cl_qcom_perf_hint` (`clSetPerfHintQCOM(context, CL_PERF_HINT_HIGH_QCOM)`, exported by libOpenCL.so) removes the
+post-idle slowdown in an OpenCL process: after >= 200 ms idle the default (NORMAL) hint runs a 32-chain mad kernel at 240-260 GFLOPS for the whole next 600 ms (and
+for 3 s), HIGH runs 440-480 in the first 100 ms window and 515-530 afterwards, for every idle time from 0 to 3 s (back-to-back it is 510-560 either way). The hint
+from a separate idle OpenCL process does **not** speed up a concurrently started WebGPU process (cold `gemm` 120-145 GFLOPS with and without it), so it helps only
+OpenCL work in the same context. Cold starts matter: the WebGPU `gemm` tool without an in-process warm-up measures 120-170 GFLOPS where the warmed-up numbers above are 220-270,
+which is why all WebGPU figures in this section come from a build with a 4 s warm-up.
+
+**Practical consequences.** For an OpenCL-free stack: (a) use textures for the B operand / conv input in ORT's WebGPU EP (the `tt` design is 1.3-1.5x the
+buffer design here); (b) keep f16 storage with f32 accumulation (packed loads) rather than f16 arithmetic; (c) the remaining gap (OpenCL image kernels
+480 vs WebGPU 330-380 at f32, and all of half arithmetic) needs either OpenCL itself (tinygrad's OpenCL backend, TVM OpenCL) or a driver that lowers WGSL `f16` well.
