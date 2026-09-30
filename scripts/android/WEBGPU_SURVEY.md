@@ -736,3 +736,12 @@ submission (~0.35-0.45 ms CPU round trip per wait; ORT syncs once per inference 
 Consequences: (1) any latency claim for a once-per-frame GPU model should be measured with the real frame gap, (2) batching or pipelining consecutive
 inferences so the GPU never idles > ~10 ms is the only lever found (throughput-style use), (3) the microbenchmark-to-network gap seen earlier (e.g. the register-tile
 conv) is not explained by this effect, since back-to-back ORT runs are at full clock (61 ms Winograd run has no idle).
+
+## Conv + Gelu epilogue fusion (SAM-L0 encoder -3%)
+
+`webgpu_ops/ort_conv_gelu_fusion.patch` (applies after `ort_conv_silu_fusion.patch`) lets ConvActivationFusion fuse an opset-20 `Gelu` (exact erf
+or `approximate="tanh"`, passed as an activation parameter) into the WebGPU Conv epilogue, in the MatMul path, Conv2dMM, GroupedConv and the Winograd
+output stage. The SAM-L0 encoder has 30 Conv -> Gelu(tanh) pairs (1x1, 3x3 and depthwise): all 30 Gelu nodes disappear, the outputs still match the
+CPU EP to 5e-5, and the encoder goes 382 -> 372 ms (Winograd f32 on). `gen_new_op_tests.py` gained Conv+Gelu (both variants, 5 conv kinds) and Winograd
+(plain, bias+ReLU, tanh-Gelu, no pad, asymmetric pad) cases; the sweep is 299 OK, 0 wrong. `ort_conv_winograd.patch` now contains only the four
+`nn/conv*` files (the earlier version wrongly repeated the `fuse_utils` hunks from the SiLU patch).

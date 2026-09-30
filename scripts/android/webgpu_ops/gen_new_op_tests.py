@@ -185,3 +185,31 @@ _mk_ms(
         "B": (_rng.standard_normal(32) * 0.5).astype("f"),
     },
 )
+
+# Conv + Gelu (exact erf and approximate="tanh"): fused into the WebGPU Conv epilogue (ConvActivationFusion + Gelu).
+for _n, (_conv, _ws, _nb) in _cases.items():
+    for _ap in ("none", "tanh"):
+        _inits = {"W0": _w0, "W": (_rng.standard_normal(_ws) * 0.2).astype("f")}
+        if _nb:
+            _inits["B"] = (_rng.standard_normal(_nb) * 0.5).astype("f")
+        _mk_ms(f"v_ConvGelu_{_ap}_{_n}", _stem + _conv + f'\nY=Gelu<approximate="{_ap}">(C)', _inits)
+
+# Winograd F(2,3) path (3x3, stride 1, Cin and Cout >= 64): plain, bias, ReLU, tanh-Gelu epilogues; odd sizes and no-pad variants.
+_w64 = (_rng.standard_normal((64, 3, 3, 3)) * 0.3).astype("f")
+_stem64 = "A=Conv<pads=[1,1,1,1]>(X,W0)\nR=Relu(A)\n"
+for _n, (_conv, _epi) in {
+    "plain": ("C=Conv<pads=[1,1,1,1]>(R,W)", "Y=Identity(C)"),
+    "bias_relu": ("C=Conv<pads=[1,1,1,1]>(R,W,B)", "Y=Relu(C)"),
+    "gelu_tanh": ("C=Conv<pads=[1,1,1,1]>(R,W,B)", 'Y=Gelu<approximate="tanh">(C)'),
+    "nopad": ("C=Conv(R,W,B)", "Y=Identity(C)"),
+    "pad0_1": ("C=Conv<pads=[0,1,0,1]>(R,W,B)", "Y=Identity(C)"),
+}.items():
+    _mk_ms(
+        f"v_Winograd_{_n}",
+        _stem64 + _conv + "\n" + _epi,
+        {
+            "W0": _w64,
+            "W": (_rng.standard_normal((64, 64, 3, 3)) * 0.05).astype("f"),
+            "B": (_rng.standard_normal(64) * 0.5).astype("f"),
+        },
+    )
