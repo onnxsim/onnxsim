@@ -457,3 +457,8 @@ than ORT's shared-memory tile, although the same design is 1.4-1.7x faster as a 
 The standalone GEMM gain does not transfer: even the 1x1 layers (pure GEMMs) lose ~5 ms. Untested explanations: register
 pressure on the 3x3 kernel, and lower GPU clocks between short dependent dispatches than in the back-to-back batches the
 microbenchmark uses. The profiler's per-dispatch timestamps were not usable for a per-layer split.
+
+Rows per thread (`ORT_WEBGPU_CONV_REGTILE_ROWS`, default 8; fewer rows = fewer accumulators): 3x3 convs only: 8 rows 116.7 ms, 4 rows 88.4, 2 rows 82.7;
+1x1 convs only: 8 rows 71.8, 4 rows 71.0, 2 rows 71.9. So register pressure explains part of the 3x3 loss, but no setting beats ORT's
+shared-memory tile (67.0 ms), and the 1x1 layers do not react to the tile at all -- in the network they are not limited by the GEMM inner loop
+the way the back-to-back microbenchmark is (which also re-reads cache-resident operands).

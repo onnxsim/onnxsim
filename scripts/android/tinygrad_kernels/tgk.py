@@ -6,13 +6,16 @@ lowering runs offline, the "WEBGPU" device string is only a tag threaded through
 onnxsim/webgpu_tinygrad_codegen.py for the details of this trick).
 """
 
+import itertools
 import os
+import random
 import re
 import subprocess
 
 import numpy as np
 from tinygrad import Tensor
 from tinygrad.codegen import to_program
+from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.codegen.opt.postrange import Scheduler
 from tinygrad.codegen.opt.search import get_kernel_actions
 from tinygrad.helpers import Target
@@ -154,6 +157,48 @@ def one_step_candidates(state):
         (repr(c.applied_opts), c)
         for c in get_kernel_actions(state, include_0=True).values()
     ]
+
+
+def tile_candidates(ast, max_n=120, seed=0, accs=(16, 32, 64), invocations=(32, 256)):
+    """Register-tile seeds BEAM's one-step search cannot reach in a few rounds: UPCAST two global axes (i, j) by (a, b) so a*b scalar
+    accumulators live in each thread (64 = the 8x8 tile of the hand-written 260-280 GFLOPS GEMM), UNROLL the reduce axis, then
+    LOCAL two global axes into a workgroup of `invocations` threads. Returns [(opts_repr, Scheduler)], sampled to max_n."""
+    base = base_scheduler(ast)
+    ng = sum(1 for t in base.axis_types if t.name == "GLOBAL")
+    combos = []
+    for i, j in itertools.permutations(range(ng), 2):
+        for a, b in itertools.product((1, 2, 4, 8), repeat=2):
+            if a * b not in accs:
+                continue
+            for u in (1, 2, 4, 8):
+                for lx, ly in itertools.product((1, 2, 4, 8, 16, 32, 64), repeat=2):
+                    if not invocations[0] <= lx * ly <= invocations[1]:
+                        continue
+                    for li, lj in itertools.permutations(range(ng), 2):
+                        combos.append((i, j, a, b, u, li, lj, lx, ly))
+    random.Random(seed).shuffle(combos)
+    out, seen = [], set()
+    for i, j, a, b, u, li, lj, lx, ly in combos:
+        opts = [Opt(OptOps.UPCAST, i, a), Opt(OptOps.UPCAST, j if j != i else i, b)]
+        if u > 1:
+            opts.append(Opt(OptOps.UNROLL, 0, u))
+        opts += [Opt(OptOps.LOCAL, li, lx), Opt(OptOps.LOCAL, lj, ly)]
+        opts = [o for o in opts if o.arg > 1]
+        key = repr(opts)
+        if key in seen:
+            continue
+        seen.add(key)
+        s = base_scheduler(ast)
+        try:
+            for o in opts:
+                s.apply_opt(o)
+            s.copy().get_optimized_ast()
+        except Exception:
+            continue
+        out.append((key, s))
+        if len(out) >= max_n:
+            break
+    return out
 
 
 def compile_spirv(glsl_path, spv_path):

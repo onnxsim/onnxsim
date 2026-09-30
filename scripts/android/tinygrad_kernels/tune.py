@@ -62,6 +62,13 @@ def main():
     ap.add_argument(
         "--max-new", type=int, default=200, help="cap on candidates rendered per round"
     )
+    ap.add_argument(
+        "--tiles",
+        type=int,
+        default=0,
+        help="also time this many register-tile seeds (tgk.tile_candidates: 16-64 scalar accumulators per thread) in round 1",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="sampling seed for --tiles")
     args = ap.parse_args()
     p = tgk.parse_problem(args.problem)
     low = tgk.Lowered(p)
@@ -85,13 +92,17 @@ def main():
     count = 0
     for rnd in range(1, args.rounds + 1):
         new = []
+        if rnd == 1 and args.tiles:
+            for opts, cand in tgk.tile_candidates(low.ast, args.tiles, args.seed):
+                seen[opts] = True
+                new.append((opts, cand))
         for _, st in frontier:
             for opts, cand in tgk.one_step_candidates(st):
                 if opts in seen:
                     continue
                 seen[opts] = True
                 new.append((opts, cand))
-        new = new[: args.max_new]
+        new = new[: args.max_new + (args.tiles if rnd == 1 else 0)]
         names = []
         for opts, cand in new:
             vname = f"t{count}"
