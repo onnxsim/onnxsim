@@ -561,3 +561,13 @@ It is 6-23% faster than direct (>10% on 512ch and 64ch, borderline on the others
 stride-1 Winograd gain because the multiplication saving is only 1.44x. ResNet-50 has only three such convs (128@56, 256@28,
 512@14), so this is worth about 0.4-0.5 ms of ~61 ms (<1%); YOLO-style networks have more stride-2 convs but with fewer channels,
 where the transforms would eat the gain. Not worth integrating into ORT unless a network has many wide stride-2 convs.
+
+## Winograd with f16 intermediates in ORT (opt-in, `ORT_WEBGPU_WINO_F16=1`)
+
+`ort_conv_winograd.patch` now also has an f16 mode (Cin, Cout multiples of 8): the weight and input transforms write V and U as packed
+f16 (`uint32` tensors, 8 halves per vec4), the 16 batched GEMMs read them and accumulate in f32 (M stays f32), so graph tensors stay
+f32. Phone medians, f32 Winograd -> f16 intermediates: ResNet-50 61.1 -> **57.9 ms**, SAM-L0 encoder 382 -> **354**, RT-DETR pre 345 -> **318**,
+YOLO26n 64.3 -> 64.4 (unaffected). Cost is accuracy: ResNet-50 logits differ from the CPU by 1.9e-3 relative (top-1 unchanged), against
+8e-7 for the f32 Winograd path, hence opt-in. Together with Winograd: ResNet-50 67 -> 58 ms (-14%), SAM-L0 441 -> 354 (-20%), RT-DETR pre 397 -> 318 (-20%).
+
+Not worth integrating (standalone results above): F(4,3) (wins only at 56x56, <1 ms of ResNet-50) and polyphase stride-2 Winograd (~0.4 ms of ResNet-50).

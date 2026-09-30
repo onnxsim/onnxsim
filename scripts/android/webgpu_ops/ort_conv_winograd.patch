@@ -27,7 +27,7 @@ index 5bf94a4..e7cfd25 100644
  };
  
 diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
-index a1ea470..b4481bf 100644
+index a1ea470..f5c8608 100644
 --- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 +++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 @@ -1,5 +1,6 @@
@@ -130,7 +130,7 @@ index a1ea470..b4481bf 100644
        .AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, reduced_output_shape, components})
        .SetDispatchGroupSize(dispatch[0], dispatch[1], dispatch[2])
        .SetWorkgroupSize(workgroup_size[0], workgroup_size[1], workgroup_size[2])
-@@ -238,3 +298,196 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
+@@ -238,3 +298,302 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
  
  }  // namespace webgpu
  }  // namespace onnxruntime
@@ -145,6 +145,109 @@ index a1ea470..b4481bf 100644
 +
 +Status ConvWinogradProgram::GenerateShaderCode(ShaderHelper& shader) const {
 +  auto S = [](int v) { return std::to_string(v); };
++  if (f16_ && stage_ < 3) {
++    auto pk = [](const std::string& v) { return "vec2<u32>(pack2x16float(" + v + ".xy), pack2x16float(" + v + ".zw))"; };
++    if (stage_ == 0) {
++      const auto& w = shader.AddInput("w", ShaderUsage::UseUniform);
++      const auto& u = shader.AddOutput("u", ShaderUsage::UseUniform);
++      auto& b = shader.MainFunctionBody();
++      b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++        << "  let cin = uniforms.c4 * 4u;\n  let co8 = uniforms.co4 / 2u;\n  let ci = global_idx / co8;\n  let cq8 = global_idx % co8;\n";
++      for (int hh = 0; hh < 2; hh++) {
++        std::string H = S(hh);
++        for (int a = 0; a < 3; a++)
++          for (int c = 0; c < 3; c++) b << "  let g" << a << c << "_" << H << " = " << w.GetByOffset("(" + S(a * 3 + c) + "u * cin + ci) * uniforms.co4 + cq8 * 2u + " + H + "u") << ";\n";
++        for (int r = 0; r < 4; r++)
++          for (int c = 0; c < 3; c++) {
++            b << "  let t" << r << c << "_" << H << " = ";
++            for (int a = 0; a < 3; a++) b << (a ? " + " : "") << "g" << a << c << "_" << H << " * " << kG[r][a];
++            b << ";\n";
++          }
++        for (int r = 0; r < 4; r++)
++          for (int c = 0; c < 4; c++) {
++            b << "  let u" << r << c << "_" << H << " = ";
++            for (int k = 0; k < 3; k++) b << (k ? " + " : "") << "t" << r << k << "_" << H << " * " << kG[c][k];
++            b << ";\n";
++          }
++      }
++      for (int r = 0; r < 4; r++)
++        for (int c = 0; c < 4; c++)
++          b << "  " << u.SetByOffset("(" + S(r * 4 + c) + "u * cin + ci) * co8 + cq8",
++                                     "vec4<u32>(pack2x16float(u" + S(r) + S(c) + "_0.xy), pack2x16float(u" + S(r) + S(c) + "_0.zw), pack2x16float(u" + S(r) + S(c) + "_1.xy), pack2x16float(u" + S(r) + S(c) + "_1.zw))")
++            << "\n";
++      return Status::OK();
++    }
++    if (stage_ == 1) {
++      const auto& x = shader.AddInput("x", ShaderUsage::UseUniform);
++      const auto& v = shader.AddOutput("v", ShaderUsage::UseUniform);
++      auto& b = shader.MainFunctionBody();
++      b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++        << "  let c8 = uniforms.c4 / 2u;\n  let cq = global_idx % c8;\n  let t = global_idx / c8;\n"
++        << "  let bi = t / uniforms.tiles_per_img;\n  let tt = t % uniforms.tiles_per_img;\n"
++        << "  let ty = i32(tt / uniforms.tw);\n  let tx = i32(tt % uniforms.tw);\n";
++      for (int hh = 0; hh < 2; hh++) {
++        std::string H = S(hh);
++        for (int r = 0; r < 4; r++)
++          for (int c = 0; c < 4; c++)
++            b << "  var d" << r << c << "_" << H << " = vec4<f32>(0.0);\n  { let iy = 2 * ty + " << r << " - i32(uniforms.pad_h); let ix = 2 * tx + " << c << " - i32(uniforms.pad_w);\n"
++              << "    if (iy >= 0 && iy < i32(uniforms.h) && ix >= 0 && ix < i32(uniforms.w)) { d" << r << c << "_" << H << " = "
++              << x.GetByOffset("((bi * uniforms.h + u32(iy)) * uniforms.w + u32(ix)) * uniforms.c4 + cq * 2u + " + H + "u") << "; } }\n";
++        for (int c = 0; c < 4; c++)
++          b << "  let s0" << c << "_" << H << " = d0" << c << "_" << H << " - d2" << c << "_" << H << "; let s1" << c << "_" << H << " = d1" << c << "_" << H << " + d2" << c << "_" << H
++            << "; let s2" << c << "_" << H << " = d2" << c << "_" << H << " - d1" << c << "_" << H << "; let s3" << c << "_" << H << " = d1" << c << "_" << H << " - d3" << c << "_" << H << ";\n";
++      }
++      for (int r = 0; r < 4; r++) {
++        std::string q = S(r);
++        for (int c = 0; c < 4; c++) {
++          std::string vals[2];
++          for (int hh = 0; hh < 2; hh++) {
++            std::string H = "_" + S(hh);
++            std::string e[4] = {"s" + q + "0" + H + " - s" + q + "2" + H, "s" + q + "1" + H + " + s" + q + "2" + H, "s" + q + "2" + H + " - s" + q + "1" + H, "s" + q + "1" + H + " - s" + q + "3" + H};
++            vals[hh] = "(" + e[c] + ")";
++          }
++          b << "  { let p0 = " << vals[0] << "; let p1 = " << vals[1] << "; "
++            << v.SetByOffset(S(r * 4 + c) + "u * uniforms.total + global_idx", "vec4<u32>(pack2x16float(p0.xy), pack2x16float(p0.zw), pack2x16float(p1.xy), pack2x16float(p1.zw))") << " }\n";
++        }
++      }
++      return Status::OK();
++    }
++    // stage 2: GEMM over packed f16 V and U, f32 accumulators, M in f32 (vec4)
++    const auto& a = shader.AddInput("a", ShaderUsage::UseUniform);
++    const auto& bb = shader.AddInput("b", ShaderUsage::UseUniform);
++    const auto& m = shader.AddOutput("m", ShaderUsage::UseUniform);
++    auto& b = shader.MainFunctionBody();
++    b << "  let logical_workgroup_id_z = workgroup_idx / (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y);\n"
++      << "  let logical_workgroup_id_y = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) / uniforms.logical_dispatch_x;\n"
++      << "  let logical_workgroup_id_x = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) % uniforms.logical_dispatch_x;\n"
++      << "  let logical_workgroup_id = vec3u(logical_workgroup_id_x, logical_workgroup_id_y, logical_workgroup_id_z);\n"
++      << "  const workgroupSize = vec3u(workgroup_size_x, workgroup_size_y, workgroup_size_z);\n"
++      << "  let logical_global_id = logical_workgroup_id * workgroupSize + local_id;\n"
++      << "  let e = logical_global_id.z;\n  let cin = uniforms.c4 * 4u;\n  let c8 = uniforms.c4 / 2u;\n  let co8 = uniforms.co4 / 2u;\n"
++      << "  let row0 = logical_global_id.y * " << tm_ << "u;\n  let col8 = min(logical_global_id.x, co8 - 1u);\n";
++    for (uint32_t i = 0; i < tm_; i++) b << "  let ar" << i << " = min(row0 + " << i << "u, uniforms.ntiles - 1u);\n";
++    for (uint32_t i = 0; i < tm_; i++)
++      for (int j = 0; j < 8; j++) b << "  var c" << i << "_" << j << " = 0.0;\n";
++    b << "  for (var k8 = 0u; k8 < c8; k8++) {\n";
++    for (uint32_t i = 0; i < tm_; i++) b << "    let a" << i << " = " << a.GetByOffset("(e * uniforms.ntiles + ar" + std::to_string(i) + ") * c8 + k8") << ";\n";
++    for (int kk = 0; kk < 8; kk++) {
++      b << "    let bw" << kk << " = " << bb.GetByOffset("(e * cin + k8 * 8u + " + S(kk) + "u) * co8 + col8") << ";\n";
++      b << "    let bp" << kk << "_0 = unpack2x16float(bw" << kk << ".x); let bp" << kk << "_1 = unpack2x16float(bw" << kk << ".y); let bp" << kk << "_2 = unpack2x16float(bw" << kk << ".z); let bp" << kk << "_3 = unpack2x16float(bw" << kk << ".w);\n";
++      for (uint32_t i = 0; i < tm_; i++) {
++        std::string av = "unpack2x16float(a" + std::to_string(i) + "." + "xyzw"[kk / 2] + ")." + (kk % 2 ? "y" : "x");
++        b << "    { let av = " << av << ";\n";
++        for (int j = 0; j < 8; j++) b << "      c" << i << "_" << j << " = fma(av, bp" << kk << "_" << j / 2 << "." << (j % 2 ? "y" : "x") << ", c" << i << "_" << j << ");\n";
++        b << "    }\n";
++      }
++    }
++    b << "  }\n";
++    for (uint32_t i = 0; i < tm_; i++)
++      for (int n = 0; n < 2; n++)
++        b << "  if (row0 + " << i << "u < uniforms.ntiles && logical_global_id.x < co8) { "
++          << m.SetByOffset("(e * uniforms.ntiles + row0 + " + std::to_string(i) + "u) * uniforms.co4 + col8 * 2u + " + std::to_string(n) + "u",
++                           "vec4<f32>(c" + std::to_string(i) + "_" + std::to_string(n * 4) + ", c" + std::to_string(i) + "_" + std::to_string(n * 4 + 1) + ", c" + std::to_string(i) + "_" + std::to_string(n * 4 + 2) + ", c" + std::to_string(i) + "_" + std::to_string(n * 4 + 3) + ")")
++          << " }\n";
++    return Status::OK();
++  }
 +  if (stage_ == 0) {
 +    const auto& w = shader.AddInput("w", ShaderUsage::UseUniform);
 +    const auto& u = shader.AddOutput("u", ShaderUsage::UseUniform);
@@ -258,6 +361,7 @@ index a1ea470..b4481bf 100644
 +
 +Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, std::unique_ptr<Tensor>* u_cache) {
 +  applied = false;
++  static const bool use_f16 = std::getenv("ORT_WEBGPU_WINO_F16") && std::atoi(std::getenv("ORT_WEBGPU_WINO_F16")) != 0;
 +  static const int mode = [] { const char* e = std::getenv("ORT_WEBGPU_CONV_WINOGRAD"); return e ? std::atoi(e) : 1; }();
 +  if (mode == 0 || !input->IsDataType<float>()) return Status::OK();
 +  const auto& ks = kernel->Shape();  // HWIO
@@ -276,12 +380,14 @@ index a1ea470..b4481bf 100644
 +  const uint32_t oh = static_cast<uint32_t>(os[1]), ow = static_cast<uint32_t>(os[2]);
 +  const uint32_t c4 = static_cast<uint32_t>(cin / 4), co4 = static_cast<uint32_t>(cout / 4);
 +  const uint32_t th = (oh + 1) / 2, tw = (ow + 1) / 2, tpi = th * tw, nt = n * tpi;
++  const bool f16 = use_f16 && cin % 8 == 0 && cout % 8 == 0;
 +  auto* dt = input->DataType();
++  auto* u32t = DataTypeImpl::GetType<uint32_t>();
 +  const bool have_u = u_cache && *u_cache;
 +  Tensor u_local;
-+  if (!have_u) u_local = context.CreateGPUTensor(dt, TensorShape({16, cin, cout}));
++  if (!have_u) u_local = context.CreateGPUTensor(f16 ? u32t : dt, TensorShape({16, cin, f16 ? cout / 2 : cout}));
 +  Tensor* up = have_u ? u_cache->get() : &u_local;
-+  Tensor v = context.CreateGPUTensor(dt, TensorShape({16, static_cast<int64_t>(nt), cin}));
++  Tensor v = context.CreateGPUTensor(f16 ? u32t : dt, TensorShape({16, static_cast<int64_t>(nt), f16 ? cin / 2 : cin}));
 +  Tensor m = context.CreateGPUTensor(dt, TensorShape({16, static_cast<int64_t>(nt), cout}));
 +  auto red = [](const TensorShape& s) {
 +    TensorShapeVector d = s.AsShapeVector();
@@ -293,23 +399,23 @@ index a1ea470..b4481bf 100644
 +  auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
 +  const auto M = ProgramTensorMetadataDependency::TypeAndRank;
 +  if (!have_u) {
-+    ConvWinogradProgram p(0, activation, false, tm, nv, wx, wy);
-+    uint32_t total = c4 * 4 * co4;
-+    p.AddInput({kernel, M, red(ks), 4}).AddOutput({up, M, red(up->Shape()), 4}).CacheHint("w").SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
++    ConvWinogradProgram p(0, activation, false, tm, nv, wx, wy, f16);
++    uint32_t total = f16 ? c4 * 4 * (co4 / 2) : c4 * 4 * co4;
++    p.AddInput({kernel, M, red(ks), 4}).AddOutput({up, M, red(up->Shape()), 4}).CacheHint(f16 ? "w16" : "w").SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
 +    ORT_RETURN_IF_ERROR(context.RunProgram(p));
 +    if (u_cache) { *u_cache = std::make_unique<Tensor>(std::move(u_local)); up = u_cache->get(); }
 +  }
 +  {
-+    ConvWinogradProgram p(1, activation, false, tm, nv, wx, wy);
-+    uint32_t total = nt * c4;
-+    p.AddInput({input, M, red(is), 4}).AddOutput({&v, M, red(v.Shape()), 4}).CacheHint("i").SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
++    ConvWinogradProgram p(1, activation, false, tm, nv, wx, wy, f16);
++    uint32_t total = f16 ? nt * (c4 / 2) : nt * c4;
++    p.AddInput({input, M, red(is), 4}).AddOutput({&v, M, red(v.Shape()), 4}).CacheHint(f16 ? "i16" : "i").SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
 +    ORT_RETURN_IF_ERROR(context.RunProgram(p));
 +  }
 +  {
-+    ConvWinogradProgram p(2, activation, false, tm, nv, wx, wy);
-+    uint32_t gx = ceil_div(ceil_div(co4, nv), wx), gy = ceil_div(nt, tm * wy);
++    ConvWinogradProgram p(2, activation, false, tm, nv, wx, wy, f16);
++    uint32_t gx = f16 ? ceil_div(co4 / 2, wx) : ceil_div(ceil_div(co4, nv), wx), gy = ceil_div(nt, tm * wy);
 +    p.AddInput({&v, M, red(v.Shape()), 4}).AddInput({up, M, red(up->Shape()), 4}).AddOutput({&m, M, red(m.Shape()), 4})
-+        .CacheHint("g" + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy))
++        .CacheHint(std::string(f16 ? "h" : "g") + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy))
 +        .SetDispatchGroupSize(gx, gy, 16).SetWorkgroupSize(wx, wy, 1).AddUniformVariables(WINO_UNIFORMS(0, gx, gy, 16));
 +    ORT_RETURN_IF_ERROR(context.RunProgram(p));
 +  }
@@ -328,7 +434,7 @@ index a1ea470..b4481bf 100644
 +}  // namespace webgpu
 +}  // namespace onnxruntime
 diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
-index e161bff..fa378cd 100644
+index e161bff..bf16f4f 100644
 --- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
 +++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
 @@ -31,6 +31,8 @@ class Conv2dMMProgram final : public Program<Conv2dMMProgram> {
@@ -340,7 +446,7 @@ index e161bff..fa378cd 100644
  
    WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
        {"dim_a_outer", ProgramUniformVariableDataType::Uint32},
-@@ -58,5 +60,39 @@ class Conv2dMMProgram final : public Program<Conv2dMMProgram> {
+@@ -58,5 +60,40 @@ class Conv2dMMProgram final : public Program<Conv2dMMProgram> {
  
  Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::vector<const Tensor*>& inputs, const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations, Tensor* output, uint32_t dim_a_outer, uint32_t dim_b_outer, uint32_t dim_inner, bool is_channels_last, const std::vector<TensorShape>& modified_input_output_shapes);
  
@@ -348,8 +454,8 @@ index e161bff..fa378cd 100644
 +// Winograd F(2,3) for 3x3 stride-1 NHWC fp32 convs: weight transform, input transform, 16 batched GEMMs, output transform (+bias, activation).
 +class ConvWinogradProgram final : public Program<ConvWinogradProgram> {
 + public:
-+  ConvWinogradProgram(int stage, const Activation& activation, bool has_bias, uint32_t tm, uint32_t nv, uint32_t wx, uint32_t wy)
-+      : Program("ConvWinograd"), stage_(stage), activation_(activation), has_bias_(has_bias), tm_(tm), nv_(nv), wx_(wx), wy_(wy) {}
++  ConvWinogradProgram(int stage, const Activation& activation, bool has_bias, uint32_t tm, uint32_t nv, uint32_t wx, uint32_t wy, bool f16 = false)
++      : Program("ConvWinograd"), stage_(stage), activation_(activation), has_bias_(has_bias), tm_(tm), nv_(nv), wx_(wx), wy_(wy), f16_(f16) {}
 +  Status GenerateShaderCode(ShaderHelper& sh) const override;
 +  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
 +      {"total", ProgramUniformVariableDataType::Uint32},
@@ -373,6 +479,7 @@ index e161bff..fa378cd 100644
 +  const Activation& activation_;
 +  bool has_bias_;
 +  uint32_t tm_, nv_, wx_, wy_;
++  bool f16_;  // V and U stored as packed f16 (uint32 tensors), GEMM accumulates in f32
 +};
 +
 +// Returns true (and runs the four programs) when the conv qualifies; `kernel` is HWIO [3,3,Cin,Cout].
