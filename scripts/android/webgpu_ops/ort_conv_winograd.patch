@@ -35,7 +35,7 @@ index 5bf94a4..c93ab75 100644
  };
  
 diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
-index a1ea470..50b80e4 100644
+index a1ea470..8b08006 100644
 --- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 +++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 @@ -1,5 +1,6 @@
@@ -138,7 +138,7 @@ index a1ea470..50b80e4 100644
        .AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, reduced_output_shape, components})
        .SetDispatchGroupSize(dispatch[0], dispatch[1], dispatch[2])
        .SetWorkgroupSize(workgroup_size[0], workgroup_size[1], workgroup_size[2])
-@@ -238,3 +298,394 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
+@@ -238,3 +298,411 @@ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::v
  
  }  // namespace webgpu
  }  // namespace onnxruntime
@@ -195,6 +195,21 @@ index a1ea470..50b80e4 100644
 +    for (uint32_t i = 0; i < nv_; i++) b << "  let bc" << i << " = min(col0 + " << i << "u, uniforms.co4 - 1u);\n";
 +    for (uint32_t i = 0; i < tm_; i++)
 +      for (uint32_t j = 0; j < 4 * nv_; j++) b << "  var c" << i << "_" << j << " = 0.0;\n";
++    if (f16_) {
++      // A (V) is packed f16: 8 k values per vec4<u32>; B from the texture, f32 accumulation
++      b << "  for (var k8 = 0u; k8 < uniforms.c4 / 2u; k8++) {\n";
++      for (uint32_t i = 0; i < tm_; i++) b << "    let a" << i << " = " << a.GetByOffset("(e * uniforms.ntiles + ar" + std::to_string(i) + ") * (uniforms.c4 / 2u) + k8") << ";\n";
++      for (int kk = 0; kk < 8; kk++) {
++        for (uint32_t n = 0; n < nv_; n++) b << "    let b" << kk << "_" << n << " = textureLoad(utex, vec2<i32>(i32(bc" << n << "), i32(e * cin + k8 * 8u + " << kk << "u)), 0);\n";
++        for (uint32_t i = 0; i < tm_; i++) {
++          b << "    { let av = unpack2x16float(a" << i << "." << "xyzw"[kk / 2] << ")." << (kk % 2 ? "y" : "x") << ";\n";
++          for (uint32_t n = 0; n < nv_; n++)
++            for (int j = 0; j < 4; j++) b << "      c" << i << "_" << n * 4 + j << " = fma(av, b" << kk << "_" << n << "[" << j << "], c" << i << "_" << n * 4 + j << ");\n";
++          b << "    }\n";
++        }
++      }
++      b << "  }\n";
++    } else {
 +    b << "  for (var k4 = 0u; k4 < uniforms.c4; k4++) {\n";
 +    for (uint32_t i = 0; i < tm_; i++) b << "    let a" << i << " = " << a.GetByOffset("(e * uniforms.ntiles + ar" + std::to_string(i) + ") * uniforms.c4 + k4") << ";\n";
 +    for (int kk = 0; kk < 4; kk++) {
@@ -205,6 +220,7 @@ index a1ea470..50b80e4 100644
 +            b << "    c" << i << "_" << n * 4 + j << " = fma(a" << i << "[" << kk << "], b" << kk << "_" << n << "[" << j << "], c" << i << "_" << n * 4 + j << ");\n";
 +    }
 +    b << "  }\n";
++    }
 +    for (uint32_t i = 0; i < tm_; i++)
 +      for (uint32_t n = 0; n < nv_; n++)
 +        b << "  if (row0 + " << i << "u < uniforms.ntiles && col0 + " << n << "u < uniforms.co4) { "
@@ -452,7 +468,8 @@ index a1ea470..50b80e4 100644
 +  auto* dt = input->DataType();
 +  auto* u32t = DataTypeImpl::GetType<uint32_t>();
 +  static const uint32_t tex_mode = env("ORT_WEBGPU_WINO_TEX", 0);  // 0: weights in a buffer; 16/32: RGBA16F/RGBA32F texture
-+  const bool use_tex = (tex_mode == 16 || tex_mode == 32) && !f16 && cin <= 512 && co4 <= 8192;
++  const bool use_tex = (tex_mode == 16 || tex_mode == 32) && cin <= 512 && co4 <= 8192;
++  const bool f16_v = f16 && use_tex;  // packed-f16 V with texture weights (weights not packed)
 +  const int tex_fmt_bits = use_tex ? static_cast<int>(tex_mode) : 0;
 +  const bool have_u = u_cache && (use_tex ? u_cache->valid : static_cast<bool>(u_cache->u));
 +  Tensor u_local;
@@ -485,8 +502,8 @@ index a1ea470..50b80e4 100644
 +  auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
 +  const auto M = ProgramTensorMetadataDependency::TypeAndRank;
 +  if (!have_u) {
-+    ConvWinogradProgram p(0, activation, false, tm, nv, wx, wy, f16, tex_fmt_bits);
-+    uint32_t total = f16 ? c4 * 4 * (co4 / 2) : c4 * 4 * co4;
++    ConvWinogradProgram p(0, activation, false, tm, nv, wx, wy, f16 && !use_tex, tex_fmt_bits);
++    uint32_t total = (f16 && !use_tex) ? c4 * 4 * (co4 / 2) : c4 * 4 * co4;
 +    if (use_tex) {
 +      Tensor dummy = context.CreateGPUTensor(dt, TensorShape({4}));
 +      p.AddInput({kernel, M, red(ks), 4}).AddOutput({&dummy, M, TensorShape({1}), 4}).SetExtraTexture(view_local.Get(), wfmt, true).CacheHint(tex_mode == 16 ? "wt16" : "wt32");
@@ -507,7 +524,7 @@ index a1ea470..50b80e4 100644
 +  }
 +  {
 +    ConvWinogradProgram p(2, activation, false, tm, nv, wx, wy, f16, tex_fmt_bits);
-+    uint32_t gx = f16 ? ceil_div(co4 / 2, wx) : ceil_div(ceil_div(co4, nv), wx), gy = ceil_div(nt, tm * wy);
++    uint32_t gx = (f16 && !use_tex) ? ceil_div(co4 / 2, wx) : ceil_div(ceil_div(co4, nv), wx), gy = ceil_div(nt, tm * wy);
 +    p.AddInput({&v, M, red(v.Shape()), 4});
 +    if (use_tex) {
 +      p.SetExtraTexture(view_local.Get(), wfmt, false);
@@ -515,7 +532,7 @@ index a1ea470..50b80e4 100644
 +      p.AddInput({up, M, red(up->Shape()), 4});
 +    }
 +    p.AddOutput({&m, M, red(m.Shape()), 4})
-+        .CacheHint(std::string(f16 ? "h" : use_tex ? "t" : "g") + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy) + "," + std::to_string(tex_fmt_bits))
++        .CacheHint(std::string(f16_v ? "ht" : f16 ? "h" : use_tex ? "t" : "g") + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy) + "," + std::to_string(tex_fmt_bits))
 +        .SetDispatchGroupSize(gx, gy, 16).SetWorkgroupSize(wx, wy, 1).AddUniformVariables(WINO_UNIFORMS(0, gx, gy, 16));
 +    ORT_RETURN_IF_ERROR(context.RunProgram(p));
 +  }

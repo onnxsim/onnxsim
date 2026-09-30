@@ -869,3 +869,10 @@ ResNet-50 60.4 -> **58.2 ms**, SAM-L0 encoder 371 -> **343**, RT-DETR pre 345 ->
 RGBA32F texture is not faster (63.7 ms). Cost: weights are rounded to f16 (ResNet-50 logits 1.3e-3 relative vs 8e-7; top-1 unchanged), so it is opt-in,
 like the f16-intermediates mode (the two are not combined yet). Far below the 1.8-2.2x per layer of the standalone layout study, consistent with
 earlier standalone gains only partly transferring. Applying the patches: transpose -> missing_ops -> silu_fusion -> gelu_fusion -> extra_texture -> conv_winograd.
+
+### Texture weights + f16 intermediates together: no extra gain
+
+`ORT_WEBGPU_WINO_F16=1 ORT_WEBGPU_WINO_TEX=16` (packed-f16 V, RGBA16F texture U) works (ResNet-50 logits 1.8e-3 from the CPU, top-1 unchanged)
+but is not faster than either alone. Phone medians (ms): ResNet-50 60.5 (neither) / 57.8 (texture) / 57.7 (f16 V) / 58.2 (both);
+SAM-L0 encoder 343 (texture) / 345 (both); RT-DETR pre 312 (texture) / 316 (both). Both modes remove the same GEMM-stage load traffic, and the four
+Winograd stages are now limited by the transforms and dispatch overheads rather than by the GEMM loads, so stacking them does not help.
