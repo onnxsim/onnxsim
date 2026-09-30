@@ -439,3 +439,21 @@ Second session, run back to back (the phone was shared with tuning jobs and ran 
 - **Subgroups do not help**: the adapter exposes `Subgroups`, but the `sg` variant (lane l loads one A vec4 and the row group shuffles it with
   `subgroupShuffle`) runs 8-90x slower than `p16` and fails validation on 5 of 6 shapes (wrong when the workgroup x-extent does not line up
   with the hardware subgroup / control flow is not uniform enough). The Adreno shuffle path is not a substitute for the A broadcast the cache already does.
+
+## Register-tile Conv2dMM inside ORT (negative result)
+
+`webgpu_ops/ort_conv2d_regtile_experiment.patch` (on ORT `125ea21` + the base patch stack) adds an opt-in Conv2dMM main loop:
+8 output pixels x 8 output channels per thread (64 scalar accumulators, workgroup 16x4, no workgroup memory), with the
+im2col address math hoisted out of the channel loop. It is correct (ResNet-50 logits match the CPU to 5.6e-7) but slower
+than ORT's shared-memory tile, although the same design is 1.4-1.7x faster as a standalone GEMM (see the GEMM section above).
+
+| `ORT_WEBGPU_CONV_REGTILE` | ResNet-50 median (ms) |
+|---|---|
+| 0 (default, ORT tile) | 67.0 |
+| 2 (1x1 convs only) | 71.8 |
+| 3 (3x3 convs only) | 116.7 |
+| 1 (all convs) | 120 |
+
+The standalone GEMM gain does not transfer: even the 1x1 layers (pure GEMMs) lose ~5 ms. Untested explanations: register
+pressure on the 3x3 kernel, and lower GPU clocks between short dependent dispatches than in the back-to-back batches the
+microbenchmark uses. The profiler's per-dispatch timestamps were not usable for a per-layer split.
