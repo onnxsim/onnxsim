@@ -1,0 +1,2 @@
+variant default r_8_49_8_16_4_4_16_4 49 8 1 8 16 1 | tinygrad default heuristics
+variant t142 r_7_7_2_8_4_2_2_4_4_2_2_16_4 2 7 7 32 2 2 | [Opt(op=OptOps.UPCAST, axis=2, arg=4), Opt(op=OptOps.UPCAST, axis=0, arg=4), Opt(op=OptOps.UNROLL, axis=0, arg=4), Opt(op=OptOps.LOCAL, axis=0, arg=8), Opt(op=OptOps.LOCAL, axis=1, arg=8), Opt(op=OptOps.LOCAL, axis=2, arg=2), Opt(op=OptOps.LOCAL, axis=0, arg=2), Opt(op=OptOps.UPCAST, axis=0, arg=2), Opt(op=OptOps.UPCAST, axis=4, arg=2), Opt(op=OptOps.SWAP, axis=0, arg=2)]
