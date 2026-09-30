@@ -507,9 +507,15 @@ calls left to fuse. What crosses it is data: the recurrent state (`state_*_q` in
 used to be copied through FastRPC every call. Now the emitter records which output slices feed which input regions (`G_NSTATE`,
 `G_ST_*` in `graph.h`, `state` records in `program.txt`), the skel loops the slices back on the DSP after every run, and
 `tg_graph_run`'s new `flags` argument leaves resident state out of the input and the output transfer. The gap between the runner's
-call and the DSP loop for driving: 6.2 -> 3.7 ms (RPC-inclusive 161-164 -> 157 ms); DM 2.4 -> 2.0 ms. Outputs are byte-identical
-and `--resident` checks the resident path bit for bit against sending the state back. What is left in the 3.7 ms: the camera frame
-(393 KB in), the DSP-side loop-back copy (2.2 MB), creating the graph and helper threads on every run, and the VTCM setup.
+call and the DSP loop for driving: 6.2 -> 3.5 ms (RPC-inclusive 161-164 -> 157 ms). Outputs are byte-identical and `--resident`
+checks the resident path bit for bit against sending the state back.
+
+The rest of the 3.5 ms was measured with phase stamps inside `tg_graph_run` (not in the tree): the state loop-back copy 2.45 ms
+(2.2 MB, so libc `memcpy` ran at about 0.9 GB/s), the input copy 0.47 ms for driving and 1.15 ms for DM (1.4 MB), graph thread
+creation 0.02 ms, output copy 0.02 ms, FastRPC marshalling about 0.5 ms. VTCM setup is once per load and helper threads persist,
+so neither was a per-run cost. The copies now run on the graph thread (it holds the HVX lock) with 128-byte vector loads and
+stores and `dcfetch` ahead: the gap is **1.0 ms** for both (driving 142.3 ms call / 141.3 ms DSP loop, DM 72.0 / 71.2 ms), outputs
+identical. What is left is FastRPC marshalling; `rpcmem` zero-copy buffers would only trim part of that.
 
 **DSP clock vote (`DSP_V65_PERF_VOTE`, level 3 by default in `compile_v65.sh`).** The skel never voted for DSP power, so the cDSP ran
 at whatever DCVS chose for a light FastRPC client: identical runs of the same artifact ranged from 144 to 192 ms for driving and
