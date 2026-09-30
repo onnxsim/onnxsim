@@ -622,3 +622,79 @@ not the absolute GFLOPS.
   gain is a fraction of this -- I would expect **~5-8%**, and it needs an f16 graph (or f16 activation tensors between fused convs) plus an
   accuracy gate, which is a larger change than the Winograd-internal f16 already integrated. Worth a prototype only for the 1x1 layers (56x56 -> 14x14),
   where the ratio is best.
+
+## Dispatch counts, per-dispatch floor and fusion/elimination targets (wall-clock measured)
+
+Scripts: `webgpu_ops/dispatch_floor.py` (chains of N trivial `Add`s), `profile_breakdown.py` + `fusion_estimate.py` (from `PROFILE=` json of
+`bench.cc`). Current phone build (Winograd f32 on). The profiler's per-node durations only tell node order/type here (they sum to 10-30 ms on a
+60-350 ms model); every time below is either a wall-clock median or an estimate built from a wall-clock-calibrated cost model, and is labelled so.
+
+**Per-dispatch floor (wall clock, `chain_N.onnx`, 4096 floats, so no bandwidth cost).**
+
+| N chained Adds | plain Run (ms) | IO-binding + sync | graph capture (ms) |
+|---|---|---|---|
+| 1 | 0.32 | 0.27 | 0.03 |
+| 50 | 1.08 | 1.09 | 0.27 |
+| 100 | 1.69 | 1.71 | 0.52 |
+| 200 | 3.07 | 3.07 | 1.03 |
+| 400 | 5.49 | 5.59 | 2.02 |
+
+Slope: **~13 us per dispatch** without graph capture (ORT node overhead + Dawn command recording, the CPU side), **~5 us** with capture (the
+GPU-side floor). So the "0.19 ms per node" floor seen in ResNet-50 is not per-dispatch overhead: it is the convs' own time. A network with ~130-280
+dispatches pays only 1.7-3.7 ms (3-5%) of pure dispatch floor. With 3.2 MB tensors (`chb`, 800k floats) an `Add` costs ~0.25-0.28 ms each
+(9.6 MB moved -> ~35-45 GB/s effective, DRAM-resident constants), 0.22 ms with graph capture, i.e. elementwise ops on big activations cost
+memory traffic, not dispatch overhead. Calibration on ResNet-50 with ablated graphs (wall clock, 3 runs each): 61.1 ms full, 60.5 without the
+post-Add ReLU (`r50_norelu`), **58.9 without both Add and ReLU (`r50_noaddrelu`)**: 32 nodes / 44 MB of outputs cost 2.2-2.4 ms
+(~50 GB/s effective + 13 us per node). Cost model used below: `13 us + moved_bytes / 50 GB/s` per removed node (2x the output size for a copy or
+unary op, 3x for a binary op).
+
+(This corrects the earlier "residual Add+ReLU is worth <=0.5%" note: removing both is worth ~3.5-4% of ResNet-50, though fusing them into the
+convolution epilogue can only recover part of it -- the residual operand is still read -- an upper bound of ~2 ms / 3.3%.)
+
+**Dispatches and node types per run** (nodes from the profile, no-dispatch = Reshape/Unsqueeze/Squeeze/Flatten; Winograd adds 3 dispatches per
+eligible conv, counted from the ONNX graph: 3x3, stride 1, group 1, min(Cin,Cout) >= 64).
+
+| model | graph nodes | no-dispatch | Winograd convs | est. dispatches | 13 us floor (ms) |
+|---|---|---|---|---|---|
+| resnet50 | 91 | 1 | 13 | 129 | 1.7 |
+| yolo11n | 180 | 8 | 14 | 214 | 2.8 |
+| yolo26n | 210 | 12 | 6 | 216 | 2.8 |
+| rtdetr_pre | 247 | 37 | 25 | 282 | 3.7 |
+| rtdetr_mid0 / mid1 | 64 | 19 | 0 | 45 | 0.6 |
+| rtdetr_post | 30 | 8 | 0 | 22 | 0.3 |
+| sam_l0_enc | 204 | 8 | 6 | 214 | 2.8 |
+
+Op mix (node counts): ResNet-50 Conv 53, Add 16, Relu 16 (the residual Add and post-Add ReLU are separate dispatches; Conv+ReLU inside the blocks is
+fused), Transpose 2. YOLO11n Conv 88, Concat 23, Add 16, Transpose 16, Split 11, MaxPool 3, Resize 2. YOLO26n Conv 102, Concat 23, Transpose 22, Add 21,
+Split 11, MatMul 4. RT-DETR pre Conv 69, Reshape 36, Add 30, Transpose 24 (57 MB of outputs), Gemm 22, QuickGelu 12, Concat 5, plus **3 CPU-EP nodes**
+(`Unsqueeze`, 2x `Tile`) and 2 `MemcpyFromHost` + 1 `MemcpyToHost` after `TopK`: a mid-graph sync (the GPU queue is drained, the CPU runs three
+tiny nodes, the result is uploaded again), roughly 2-4 ms of bubble/copies on a 345 ms model by node durations. SAM-L0 encoder Conv 73, **Gelu 30 (all
+directly after a Conv, not fused)**, Add 25, Slice 20, Transpose 13, Pad 6, MatMul 8. The RT-DETR mid/post stages are Gemm/Reshape/Relu graphs of 22-45 dispatches:
+nothing worth fusing (<0.4 ms).
+
+**Upper-bound savings from removing dispatches/traffic** (cost model above; "n" = nodes that would disappear):
+
+| model (wall-clock) | target | n | est. saving |
+|---|---|---|---|
+| ResNet-50 (61 ms) | 1. Conv+residual Add epilogue | 16 | 1.1 ms |
+| | 2. Post-Add ReLU into the same epilogue | 16 | 1.1 ms |
+| | 3. the two layout Transposes | 2 | 0.05 ms |
+| YOLO11n (72 ms) | 1. Concat elimination (producers write channel slices) | 23 | 1.9 ms |
+| | 2. Transpose elimination (Conv>Transpose>Reshape attention layouts, NCHW/NHWC) | 16 | 1.2 ms |
+| | 3. Split as strided views | 11 | 0.8 ms |
+| YOLO26n (64 ms) | 1. Concat elimination | 23 | 1.7 ms |
+| | 2. Transpose elimination | 22 | 1.2 ms |
+| | 3. Split as strided views | 11 | 0.6 ms |
+| RT-DETR pre (345 ms) | 1. Transpose elimination (24, 57 MB) | 24 | 2.6 ms |
+| | 2. Conv+residual Add epilogue | 20 | 1.9 ms |
+| | 3. Concat elimination (5, 29 MB) | 5 | 1.2 ms |
+| SAM-L0 encoder (354 ms) | 1. **Gelu into the 1x1 Conv epilogue** (Conv->Gelu x30, large MLP tensors) | 30 | **10.0 ms** |
+| | 2. Conv+residual Add epilogue | 20 | 2.0 ms |
+| | 3. Transpose elimination / Slice | 13 / 20 | 1.2 / 0.9 ms |
+
+These are upper bounds (a fused epilogue still reads its second operand, and channel-slice writes are strided) -- expect 50-70% of them in
+practice. Ranked by wall-clock value for one implementation effort: **Conv+Gelu epilogue** (SAM, ~2.8% of the model, ~1.5-2% after the epilogue
+cost), **Conv+Add(+ReLU) residual epilogue** (all conv models: 1.1-2.2 ms, 1.5-3.5% on ResNet-50/RT-DETR), then **Concat/Split/Transpose
+elimination** in the YOLO family (~4 ms of 64-72 ms, 5-6%, but a much larger change: it needs a layout pass, not a shader epilogue). Dispatch-count
+reduction alone (graph capture, persistent kernels) tops out at the 13 us floor: 1.7-3.7 ms per run, and graph capture already recovers 8 of the
+13 us. RT-DETR's TopK/Tile CPU round trip is a further ~2-4 ms worth removing with a WebGPU `Tile`/`Unsqueeze` (small, self-contained).
