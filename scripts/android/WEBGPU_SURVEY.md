@@ -358,3 +358,45 @@ SAM-L0 decoder 65.1 -> 58.1 (-11%), RT-DETR `pre` 396.9 -> 373.1 (-6%). YOLO11n 
 2x upsample) nodes, which the EP explicitly keeps out of NHWC (`ShouldConvertDataLayoutForOp`, kernels commented out). An NHWC Resize is
 feasible (the nearest path is already axis-generic; the bilinear/trilinear/cubic paths hard-code the last two axes as spatial, so they would
 need a transposing fallback) and would remove those 4 Transposes (~1.2 ms of GPU time, an estimated 1-2%); not done.
+
+## Winograd and depthwise microbenchmarks (2026-10-01)
+
+`dawn_repro/conv_alt.cc` (`conv_alt conv C H`, `conv_alt dw C H`; Dawn toggles like ORT: robustness off, Vulkan memory model) compares, per
+ResNet-50 3x3 shape (batch 1, NHWC, fp32, all 0.231 GFLOP), a **direct** conv (implicit GEMM with the `sc` scalar-accumulator register-tile
+design, 3x3 gather in the A load) against **Winograd F(2,3)** (input transform -> 16 batched register-tile GEMMs -> output transform;
+weights are transformed offline, 16/9 of the weight memory). Each is swept over 7 (TM, NV, workgroup) configs; the best is shown. Whole
+sequences run back to back (10 per submission, best of 10); outputs match a double-precision CPU reference (max relative error <= 2e-6 for both).
+Two full runs, ms (GFLOPS-equivalent = direct-conv FLOPs / time):
+
+| layer | direct, run 1 / run 2 | Winograd, run 1 / run 2 | Winograd / direct time |
+|---|---|---|---|
+| 64ch @ 56x56 | 1.34 / 1.26 ms (172 / 183) | 1.01 / 0.87 (229 / 265) | 0.75 / 0.69 |
+| 128ch @ 28x28 | 1.36 / 1.42 (170 / 162) | 1.17 / 0.72 (198 / 319) | 0.86 / 0.51 |
+| 256ch @ 14x14 | 1.49 / 1.40 (155 / 165) | 1.06 / 0.75 (218 / 309) | 0.71 / 0.53 |
+| 512ch @ 7x7 | 1.91 / 1.86 (121 / 125) | 0.91 / 0.82 (254 / 283) | 0.48 / 0.44 |
+
+- **Winograd wins on every ResNet 3x3 shape**, by 1.15-2.3x depending on the shape (run-to-run noise on the phone is large, ~20-40% on the
+  28x28 and 14x14 rows, so quote ranges, not points); it wins most on the small, channel-heavy late layers (7x7: ~2.2x) where the direct
+  kernel has few rows to tile. The GEMM dominates (0.58-0.84 ms); the transforms cost 0.03-0.16 ms each (largest at 56x56).
+- Its batched GEMMs run at only 137-177 GFLOPS on the reduced work (K = Cin is short, 16 small dispatches per layer), well below the 255-282
+  of the large standalone GEMMs, so tuning the GEMM stage further (larger tiles, fewer z-slices per workgroup) has headroom.
+- The direct implicit-GEMM conv reaches 121-183 GFLOPS, below the 255 of the same tile as a plain GEMM: the gather (per-row validity, base
+  index per tap) costs ~30%.
+- Not measured: fusing the transforms with neighbouring ops (input transform into the previous layer's epilogue, output transform +
+  bias/activation/residual), which is where a real Winograd Conv would recover more; F(4,3) (fewer multiplies but larger transforms and
+  worse fp32 conditioning); f16.
+
+**Depthwise 3x3** (YOLO-like: 64@160, 128@80, 256@40, 512@20, NHWC), naive ORT-style (one scalar output per thread, 9 bounds-checked loads)
+vs vec4-channel kernels producing 1/2/4/8 adjacent x-pixels per thread from one shared input window:
+
+| shape | traffic floor at 163 GB/s | naive | vec4, 1 px | vec4, 2 px | vec4, 4 px | vec4, 8 px |
+|---|---|---|---|---|---|---|
+| 64ch @ 160 | 0.08 ms | 2.18 ms | 1.97 | 1.15 | **0.93** | 1.15 |
+| 128ch @ 80 | 0.04 | 1.23 | 0.93 | 0.59 | **0.45** | 0.56 |
+| 256ch @ 40 | 0.02 | 0.61 | 0.54 | 0.35 | **0.25** | 0.26 |
+| 512ch @ 20 | 0.01 | 0.27 | 0.26 | 0.17 | **0.13** | 0.14 |
+
+The 4-pixel vec4 kernel is 2.0-2.4x faster than the naive one on all four shapes (correct to 1e-7). It still moves only 12-15 GB/s, ~10x under
+the buffer-bandwidth ceiling and ~10x over the traffic floor, so depthwise is latency/issue-bound (27 dependent-ish loads per thread) rather than
+bandwidth-bound; the obvious next steps (wider workgroups, staging the window through workgroup memory, f16 storage) were not tried. Depthwise
+convs are ~10% of YOLO11n's GPU time, so even a 2x kernel is worth ~5% there. These are standalone kernels, not integrated into ORT.

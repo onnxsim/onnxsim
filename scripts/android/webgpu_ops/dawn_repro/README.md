@@ -40,3 +40,4 @@ Build each like `harness.cc`; run on the phone under `phone-run`.
   textures, `nc4` NC4HW4-style coalesced layout. REPS>1 keeps the whole GPU busy (throughput); REPS=1 is one real layer's latency.
 - `chain.cc` -- dispatch overhead: `chain dep|ind N ELEMS [PASSES SUBMIT_EVERY]` (a dependent 4096-element dispatch costs ~6 us
   of GPU time and ~2 us of CPU in Dawn directly).
+- `conv_alt.cc` -- Winograd F(2,3) vs direct register-tile 3x3 conv, and depthwise 3x3 variants: `conv_alt conv|dw C H` (see `../../WEBGPU_SURVEY.md`).
