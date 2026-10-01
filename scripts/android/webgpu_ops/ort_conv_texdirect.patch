@@ -1,0 +1,237 @@
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.cc b/onnxruntime/core/providers/webgpu/nn/conv.cc
+index c3f8b0c..54d952e 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv.cc
+@@ -304,6 +304,12 @@ Status Conv<is_channels_last, is_fused>::ComputeImpl(ComputeContext& context, co
+     ORT_RETURN_IF_ERROR(TryApplyWinogradConv(context, activation, input, conv_kernel, bias, pads, output, applied, kernel_is_prepacked ? &winograd_u_ : nullptr, residual));
+     if (applied) return Status::OK();
+   }
++  if (is_channels_last && conv_attrs_.group == 1 && input_shape.NumDimensions() == 4) {
++    bool applied = false;
++    ORT_RETURN_IF_ERROR(TryApplyTexDirectConv(context, activation, input, conv_kernel, bias, pads, strides, dilations, output, applied,
++                                              kernel_is_prepacked ? &texdirect_w_ : nullptr, residual, /*one_by_one_ok=*/true));
++    if (applied) return Status::OK();
++  }
+   if (residual != nullptr) return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "WEBGPU_CONV_RESIDUAL_UNSUPPORTED");
+   auto dim_a_outer = static_cast<uint32_t>(is_channels_last ? output_height * output_width : output_channels);
+   auto dim_b_outer = static_cast<uint32_t>(is_channels_last ? output_channels : output_height * output_width);
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.h b/onnxruntime/core/providers/webgpu/nn/conv.h
+index becc205..8902c53 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv.h
+@@ -34,7 +34,8 @@ class Conv : public WebGpuKernel {
+  protected:
+   ConvAttributes conv_attrs_;
+   Activation activation_;
+-  mutable WinogradWeightCache winograd_u_;  // Winograd-transformed weights, cached when the kernel is a prepacked initializer
++  mutable WinogradWeightCache winograd_u_;
++  mutable WinogradWeightCache texdirect_w_;  // RGBA16F weight texture of the direct texture-weight conv  // Winograd-transformed weights, cached when the kernel is a prepacked initializer
+   std::unique_ptr<Tensor> transposed_kernel_;  // should only have value when `is_initializer` AND `is_4D` AND `is_NHWC`
+ };
+ 
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+index 5deb1e8..fed5dd1 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+@@ -730,3 +730,150 @@ Status ConvResidualAddProgram::GenerateShaderCode(ShaderHelper& shader) const {
+ 
+ }  // namespace webgpu
+ }  // namespace onnxruntime
++
++namespace onnxruntime {
++namespace webgpu {
++
++Status ConvTexDirectProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  if (stage_ == 0) {
++    const auto& w = shader.AddInput("w", ShaderUsage::UseUniform);
++    shader.AddOutput("dummy", ShaderUsage::UseUniform);
++    shader.AdditionalImplementation() << "@group(0) @binding(3) var wtex : texture_storage_2d<rgba16float, write>;\n";
++    shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.npix")
++                              << "  let row = global_idx / uniforms.co4;\n  let cx = global_idx % uniforms.co4;\n"
++                              << "  textureStore(wtex, vec2<i32>(i32(cx), i32(row)), " << w.GetByOffset("global_idx") << ");\n";
++    return Status::OK();
++  }
++  const auto& x = shader.AddInput("x", ShaderUsage::UseUniform);
++  const ShaderVariableHelper* bias = has_bias_ ? &shader.AddInput("bias", ShaderUsage::UseUniform) : nullptr;
++  const ShaderVariableHelper* resid = has_residual_ ? &shader.AddInput("residual", ShaderUsage::UseUniform) : nullptr;
++  const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform);
++  const int tex_binding = 1 + (has_bias_ ? 1 : 0) + (has_residual_ ? 1 : 0) + 1 + 1;
++  shader.AdditionalImplementation() << "@group(0) @binding(" << tex_binding << ") var wtex : texture_2d<f32>;\n";
++  auto& b = shader.MainFunctionBody();
++  b << "  let logical_workgroup_id_z = workgroup_idx / (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y);\n"
++    << "  let logical_workgroup_id_y = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) / uniforms.logical_dispatch_x;\n"
++    << "  let logical_workgroup_id_x = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) % uniforms.logical_dispatch_x;\n"
++    << "  let logical_workgroup_id = vec3u(logical_workgroup_id_x, logical_workgroup_id_y, logical_workgroup_id_z);\n"
++    << "  const workgroupSize = vec3u(workgroup_size_x, workgroup_size_y, workgroup_size_z);\n"
++    << "  let logical_global_id = logical_workgroup_id * workgroupSize + local_id;\n"
++    << (pixels_fast_ ? "  let col0 = logical_global_id.y * " + std::to_string(nv_) + "u;\n  let p0 = logical_global_id.x * " + std::to_string(tm_) + "u;\n"
++                     : "  let col0 = logical_global_id.x * " + std::to_string(nv_) + "u;\n  let p0 = logical_global_id.y * " + std::to_string(tm_) + "u;\n")
++    << "  let cin = uniforms.c4 * 4u;\n";
++  for (uint32_t m = 0; m < tm_; m++) {
++    b << "  let pv" << m << " = p0 + " << m << "u < uniforms.npix;\n"
++      << "  let pp" << m << " = min(p0 + " << m << "u, uniforms.npix - 1u);\n"
++      << "  let bb" << m << " = pp" << m << " / (uniforms.oh * uniforms.ow);\n"
++      << "  let rr" << m << " = pp" << m << " % (uniforms.oh * uniforms.ow);\n"
++      << "  let iy" << m << " = i32((rr" << m << " / uniforms.ow) * uniforms.sh) - i32(uniforms.ph);\n"
++      << "  let ix" << m << " = i32((rr" << m << " % uniforms.ow) * uniforms.sw) - i32(uniforms.pw);\n"
++      << "  var off" << m << " = 0;\n";
++  }
++  for (uint32_t m = 0; m < tm_; m++)
++    for (uint32_t j = 0; j < 4 * nv_; j++) b << "  var c" << m << "_" << j << " = 0.0;\n";
++  b << "  if (col0 < uniforms.co4) {\n"
++    << "  for (var ky = 0u; ky < uniforms.kh; ky++) {\n  for (var kx = 0u; kx < uniforms.kw; kx++) {\n";
++  for (uint32_t m = 0; m < tm_; m++)
++    b << "    { let yy = iy" << m << " + i32(ky * uniforms.dh); let xx = ix" << m << " + i32(kx * uniforms.dw);\n"
++      << "      off" << m << " = select(-1, ((i32(bb" << m << ") * i32(uniforms.h) + yy) * i32(uniforms.w) + xx) * i32(uniforms.c4), pv" << m
++      << " && yy >= 0 && yy < i32(uniforms.h) && xx >= 0 && xx < i32(uniforms.w)); }\n";
++  b << "    let tapbase = (ky * uniforms.kw + kx) * cin;\n"
++    << "    for (var c4i = 0u; c4i < uniforms.c4; c4i++) {\n";
++  for (uint32_t m = 0; m < tm_; m++)
++    b << "      var a" << m << " = vec4<f32>(0.0); if (off" << m << " >= 0) { a" << m << " = " << x.GetByOffset("u32(off" + std::to_string(m) + ") + c4i") << "; }\n";
++  for (int kk = 0; kk < 4; kk++) {
++    for (uint32_t n = 0; n < nv_; n++)
++      b << "      let w" << kk << "_" << n << " = textureLoad(wtex, vec2<i32>(i32(min(col0 + " << n << "u, uniforms.co4 - 1u)), i32(tapbase + c4i * 4u + " << kk << "u)), 0);\n";
++    for (uint32_t m = 0; m < tm_; m++)
++      for (uint32_t n = 0; n < nv_; n++)
++        for (int j = 0; j < 4; j++)
++          b << "      c" << m << "_" << n * 4 + j << " = fma(a" << m << "[" << kk << "], w" << kk << "_" << n << "[" << j << "], c" << m << "_" << n * 4 + j << ");\n";
++  }
++  b << "    }\n  }\n  }\n  }\n";
++  const std::string act = GetActivationSnippet(activation_, "vec4<f32>", "f32");
++  for (uint32_t m = 0; m < tm_; m++)
++    for (uint32_t n = 0; n < nv_; n++) {
++      b << "  if (pv" << m << " && col0 + " << n << "u < uniforms.co4) {\n    var value = vec4<f32>(c" << m << "_" << n * 4 << ", c" << m << "_" << n * 4 + 1 << ", c" << m << "_" << n * 4 + 2 << ", c" << m << "_" << n * 4 + 3 << ");\n";
++      if (bias) b << "    value = value + " << bias->GetByOffset("col0 + " + std::to_string(n) + "u") << ";\n";
++      if (resid) b << "    value = value + " << resid->GetByOffset("pp" + std::to_string(m) + " * uniforms.co4 + col0 + " + std::to_string(n) + "u") << ";\n";
++      b << "    " << act << "\n    " << y.SetByOffset("pp" + std::to_string(m) + " * uniforms.co4 + col0 + " + std::to_string(n) + "u", "value") << "\n  }\n";
++    }
++  return Status::OK();
++}
++
++Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias,
++                             const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations,
++                             Tensor* output, bool& applied, WinogradWeightCache* w_cache, const Tensor* residual, bool one_by_one_ok) {
++  applied = false;
++  static const auto env = [](const char* n, uint32_t d) { const char* e = std::getenv(n); return e ? static_cast<uint32_t>(std::atoi(e)) : d; };
++  static const uint32_t mode = env("ORT_WEBGPU_CONV_TEXDIRECT", 0);  // 0 off, 1 non-1x1 convs, 2 also 1x1
++  if (mode == 0 || !input->IsDataType<float>()) return Status::OK();
++  const auto& ks = kernel->Shape();  // HWIO
++  const auto& is = input->Shape();
++  const auto& os = output->Shape();
++  if (ks.NumDimensions() != 4 || is.NumDimensions() != 4) return Status::OK();
++  const bool one = ks[0] == 1 && ks[1] == 1;
++  if ((one && (mode < 2 || !one_by_one_ok))) return Status::OK();
++  const int64_t cin = ks[2], cout = ks[3];
++  if (cin % 4 != 0 || cout % 4 != 0 || cin != is[3] || os[3] != cout) return Status::OK();
++  static const int64_t max_c = env("ORT_WEBGPU_TEXDIRECT_MAXC", 64);
++  if (std::max(cin, cout) > max_c) return Status::OK();
++  const int64_t rows = ks[0] * ks[1] * cin;
++  if (rows > 8192 || cout / 4 > 8192) return Status::OK();
++  static const uint32_t tm = env("ORT_WEBGPU_TEXDIRECT_TM", 2), nv = env("ORT_WEBGPU_TEXDIRECT_NV", 2), wx = env("ORT_WEBGPU_TEXDIRECT_WX", 32), wy = env("ORT_WEBGPU_TEXDIRECT_WY", 2);
++  const uint32_t co4 = static_cast<uint32_t>(cout / 4), c4 = static_cast<uint32_t>(cin / 4);
++  const uint32_t npix = static_cast<uint32_t>(os[0] * os[1] * os[2]);
++  auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
++  const auto M = ProgramTensorMetadataDependency::TypeAndRank;
++  auto red = [](const TensorShape& s) {
++    TensorShapeVector d = s.AsShapeVector();
++    d.back() /= 4;
++    return TensorShape(d);
++  };
++  const bool have_w = w_cache && w_cache->valid;
++  wgpu::Texture tex_local;
++  wgpu::TextureView view_local;
++  if (have_w) {
++    view_local = w_cache->view;
++  } else {
++    wgpu::TextureDescriptor td{};
++    td.size = {co4, static_cast<uint32_t>(rows), 1};
++    td.format = wgpu::TextureFormat::RGBA16Float;
++    td.usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
++    tex_local = context.Device().CreateTexture(&td);
++    view_local = tex_local.CreateView();
++    ConvTexDirectProgram p0(0, activation, false, false, tm, nv);
++    Tensor dummy = context.CreateGPUTensor(input->DataType(), TensorShape({4}));
++    const uint32_t total = static_cast<uint32_t>(rows) * co4;
++    p0.AddInput({kernel, M, red(ks), 4}).AddOutput({&dummy, M, TensorShape({1}), 4})
++        .SetExtraTexture(view_local.Get(), static_cast<WGPUTextureFormat>(wgpu::TextureFormat::RGBA16Float), true)
++        .CacheHint("w").SetDispatchGroupSize(ceil_div(total, 64))
++        .AddUniformVariables({{total}, {0u}, {0u}, {c4}, {co4}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {1u}, {1u}, {1u}});
++    ORT_RETURN_IF_ERROR(context.RunProgram(p0));
++    if (w_cache) {
++      w_cache->tex = tex_local;
++      w_cache->view = view_local;
++      w_cache->valid = true;
++    }
++  }
++  static const bool pixels_fast = env("ORT_WEBGPU_TEXDIRECT_ORDER", 1) != 0;
++  const uint32_t gx = pixels_fast ? ceil_div(npix, tm * wx) : ceil_div(ceil_div(co4, nv), wx);
++  const uint32_t gy = pixels_fast ? ceil_div(ceil_div(co4, nv), wy) : ceil_div(npix, tm * wy);
++  ConvTexDirectProgram p(1, activation, bias != nullptr, residual != nullptr, tm, nv, pixels_fast);
++  p.AddInput({input, M, red(is), 4});
++  if (bias) p.AddInput({bias, M, red(bias->Shape()), 4});
++  if (residual) p.AddInput({residual, M, red(os), 4});
++  p.AddOutput({output, M, red(os), 4})
++      .SetExtraTexture(view_local.Get(), static_cast<WGPUTextureFormat>(wgpu::TextureFormat::RGBA16Float), false)
++      .CacheHint(activation.ToString(), std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy) + "," + std::to_string(pixels_fast), bias != nullptr, residual != nullptr)
++      .SetDispatchGroupSize(gx, gy, 1)
++      .SetWorkgroupSize(wx, wy, 1)
++      .AddUniformVariables({{npix}, {static_cast<uint32_t>(is[1])}, {static_cast<uint32_t>(is[2])}, {c4}, {co4}, {static_cast<uint32_t>(os[1])}, {static_cast<uint32_t>(os[2])},
++                            {static_cast<uint32_t>(ks[0])}, {static_cast<uint32_t>(ks[1])}, {strides[0]}, {strides[1]}, {pads[0]}, {pads[1]}, {dilations[0]}, {dilations[1]}, {gx}, {gy}, {1u}});
++  ORT_RETURN_IF_ERROR(context.RunProgram(p));
++  applied = true;
++  return Status::OK();
++}
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+index 0d13a7c..3b6b7fd 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+@@ -118,5 +118,46 @@ class ConvWinogradProgram final : public Program<ConvWinogradProgram> {
+ // Returns true (and runs the four programs) when the conv qualifies; `kernel` is HWIO [3,3,Cin,Cout].
+ Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, WinogradWeightCache* u_cache = nullptr, const Tensor* residual = nullptr);
+ 
++
++// Direct (non-Winograd) NHWC vec4 convolution with the weights in an RGBA16F texture (read with textureLoad): register-tiled,
++// TM output pixels x NV vec4 output channels per thread, f32 math. Stage 0 uploads the HWIO weights into the texture.
++class ConvTexDirectProgram final : public Program<ConvTexDirectProgram> {
++ public:
++  ConvTexDirectProgram(int stage, const Activation& activation, bool has_bias, bool has_residual, uint32_t tm, uint32_t nv, bool pixels_fast = false)
++      : Program("ConvTexDirect"), stage_(stage), activation_(activation), has_bias_(has_bias), has_residual_(has_residual), tm_(tm), nv_(nv), pixels_fast_(pixels_fast) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"npix", ProgramUniformVariableDataType::Uint32},
++      {"h", ProgramUniformVariableDataType::Uint32},
++      {"w", ProgramUniformVariableDataType::Uint32},
++      {"c4", ProgramUniformVariableDataType::Uint32},
++      {"co4", ProgramUniformVariableDataType::Uint32},
++      {"oh", ProgramUniformVariableDataType::Uint32},
++      {"ow", ProgramUniformVariableDataType::Uint32},
++      {"kh", ProgramUniformVariableDataType::Uint32},
++      {"kw", ProgramUniformVariableDataType::Uint32},
++      {"sh", ProgramUniformVariableDataType::Uint32},
++      {"sw", ProgramUniformVariableDataType::Uint32},
++      {"ph", ProgramUniformVariableDataType::Uint32},
++      {"pw", ProgramUniformVariableDataType::Uint32},
++      {"dh", ProgramUniformVariableDataType::Uint32},
++      {"dw", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_x", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_y", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_z", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  int stage_;  // 0: weights buffer -> RGBA16F texture, 1: convolution
++  const Activation& activation_;
++  bool has_bias_, has_residual_;
++  uint32_t tm_, nv_;
++  bool pixels_fast_;  // threads along x cover output pixels (activation loads coalesce), along y output channels
++};
++
++// Runs the texture-weight direct conv when it applies (float32, group 1, NHWC, Cin and Cout multiples of 4, weight rows <= 8192).
++Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias,
++                             const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations,
++                             Tensor* output, bool& applied, WinogradWeightCache* w_cache, const Tensor* residual, bool one_by_one_ok);
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime

@@ -1181,3 +1181,20 @@ in ORT is cancelled by the optimizer so it cannot be chained; at the layout stud
 Default rule set `split_conv,head,resize_convt`, 6 interleaved rounds, medians (min): **YOLO11n 72.1 (70.3) -> 69.4 (68.2) ms, -3.7%; YOLO26n 63.6 (63.0) -> 63.0 (62.8), within noise**; run-to-run noise on the phone is about +-0.7 ms.
 So graph rewrites recover only a quarter of the ~8 ms the Concats and Splits cost; getting the rest needs the producer kernels to write straight into their slice of the Concat output (and the consumer Conv to read a channel-offset
 view for Split), i.e. strided/offset input and output support in the WebGPU Conv/MatMul programs.
+
+## Texture-weight direct conv for low-channel convs in ORT (`ORT_WEBGPU_CONV_TEXDIRECT=1`; YOLO26n -7%, YOLO11n -3%)
+
+Follows the `conv_tex_direct` microbenchmark (texture-fed direct convs 1.8-2.1x over a Conv2dMM replica on YOLO shapes). `webgpu_ops/ort_conv_texdirect.patch` (last in the stack,
+after `ort_conv_add_fusion.patch`) adds `ConvTexDirectProgram`: a register-tiled NHWC vec4 direct convolution whose weights live in an RGBA16F texture
+(uploaded once from the HWIO kernel and cached for prepacked weights; the bias, residual and activation epilogues are fused). It replaces ORT's Conv2dMM for non-1x1 convs with
+Cin, Cout multiples of 4 that Winograd does not take (stride 2, < 64 channels), only when max(Cin, Cout) <= `ORT_WEBGPU_TEXDIRECT_MAXC` (default 64). Env: `ORT_WEBGPU_CONV_TEXDIRECT` (0 off = default, 1 on, 2 also 1x1 stride-1 convs, which still take the MatMul path first so mode 2 is not wired
+there yet), `ORT_WEBGPU_TEXDIRECT_{TM,NV,WX,WY,ORDER,MAXC}`.
+
+Tile choice mattered far more than in the microbenchmark: YOLO11n with the first guess (4 pixels x 1 vec4 channel, channels along x) was **+43% slower** (104 ms), pixels along x brought it to 92, and the best of ~17 configurations
+(2 pixels x 2 vec4 channels, workgroup 32x2, pixels along x) to ~70 ms. Applying it to every conv up to 256 channels is neutral or slightly negative on ResNet/SAM and +4% on RT-DETR, so it is restricted to <= 64 channels.
+
+Phone medians, off -> on (defaults above; fp32 activations, f16-rounded weights): YOLO26n 63.8/63.3 -> **58.9/59.5 ms**, YOLO11n 70.9/72.1 -> **69.0/69.7**, RT-DETR pre 335 -> 336 (unchanged), ResNet-50 and SAM unchanged. Outputs vs the CPU EP: YOLO11n 2.6e-3, YOLO26n 1.8e-3 (weights rounded to f16),
+sweep 311 OK / 0 wrong. A per-shape tile table, a texture-activation path and the 1x1 case are the remaining headroom (the microbenchmark promised 11-20% on YOLO11n; the network got 3%).
+
+### Graph rewrites for YOLO (exact, no kernel change)
+`webgpu_ops/yolo_graph_opt.py` (default rules `split_conv,head,resize_convt`): YOLO11n 72.1 -> 69.4 ms, YOLO26n unchanged; outputs within 1.5e-6.
