@@ -957,3 +957,31 @@ The fp16-graph run above suspected that ORT's fp16 1x1 conv accumulates in f16. 
 So accumulation precision is not the cause of the NaNs; f32 accumulation costs 4-14% and buys little accuracy, hence opt-in. The NaN source in SAM/RT-DETR is still
 open (first NaN is at the third-stage MLP Gelu, where values reach ~500; the tanh-Gelu's x^3 overflows f16 above |x| ~ 40, and other f16 intermediates in the
 attention blocks may overflow too -- not isolated).
+
+## Conv + residual Add (+ReLU) fusion, and the Winograd weight cache that was not being used
+
+`webgpu_ops/ort_conv_add_fusion.patch` (last in the stack: transpose -> missing_ops -> silu_fusion -> gelu_fusion -> extra_texture -> f16_f32_accumulate
+-> conv_winograd -> conv_add_fusion):
+- **Graph:** `ConvActivationFusion` gets a WebGPU-only rule that fuses `Conv(NHWC internal, with bias) -> Add(same-shape residual)` into
+  `com.microsoft::NhwcFusedConv(X, W, B, Z)` (the existing contrib schema, which already has the optional residual input `Z`); the existing Conv+activation
+  rule then also fuses a following ReLU into the NhwcFusedConv (`activation` attribute; order is act(conv + bias + Z)). `ORT_WEBGPU_CONV_ADD_FUSION=0` disables it.
+- **Kernel:** the WebGPU `NhwcFusedConv` kernel reuses `Conv<true, true>`. The residual is applied natively in the vec4 channels-last MatMul path (1x1 convs)
+  and in the Winograd output stage; every other conv kind (Conv2dMM 3x3 with < 64 channels, stride-2, grouped/depthwise, Im2col, odd channel counts) runs the
+  convolution without its activation into a temporary and then one `ConvResidualAdd` program does act(a + z), so the result is always correct.
+- ResNet-50 loses all 48 Add and 48 Relu dispatches. `gen_new_op_tests.py` has 12 Conv+Add(+ReLU) cases covering the native and fallback paths; sweep: 311 OK, 0 wrong
+  (the first run caught a real bug: the Winograd call site was not passing the residual).
+- **Also fixed:** the call site of the Winograd path never passed the weight cache (`winograd_u_`; a silently non-matching `replace` earlier), so the weight transform and the
+  texture creation ran on every inference. With the cache in place the transform runs once.
+
+Phone medians (fp32 logits within 8e-7 of the CPU, top-1 unchanged), add fusion off -> on, weights cached:
+
+| model | before this change | add fusion + weight cache | + `ORT_WEBGPU_WINO_TEX=16` |
+|---|---|---|---|
+| ResNet-50 | 61.7 ms | **55.2-56.7 ms** | 53.8 ms |
+| YOLO11n | 75.8 | 73.3 (fusion alone -3%) | 71.5 |
+| YOLO26n | 66.2 | 65.1 | -- |
+| SAM-L0 encoder | 370 | 369 | 337 |
+| RT-DETR pre | 357 | 346 | 312 |
+
+(The phone was a few percent slower this session than in earlier tables, so compare within a row.) ORT's default conv was 67 ms on ResNet-50, i.e. fp32-exact ResNet-50 is now
+~17% faster than stock and ~20% faster with texture weights.

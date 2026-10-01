@@ -213,3 +213,41 @@ for _n, (_conv, _epi) in {
             "B": (_rng.standard_normal(64) * 0.5).astype("f"),
         },
     )
+
+# Conv + residual Add (+ReLU): fused by ConvActivationFusion's WebGPU rule into NhwcFusedConv(X, W, B, Z) (+activation). Native
+# paths: vec4 1x1 MatMul and Winograd; every other conv kind goes through the generic conv -> add+activation fallback.
+_res_cases = {
+    "1x1": ("pads=[0,0,0,0]", (32, 16, 1, 1), (32, 16, 1, 1)),
+    "1x1_odd": ("pads=[0,0,0,0]", (34, 16, 1, 1), (34, 16, 1, 1)),
+    "3x3": ("pads=[1,1,1,1]", (32, 16, 3, 3), (32, 16, 3, 3)),
+    "1x1_s2": ("pads=[0,0,0,0],strides=[2,2]", (32, 16, 1, 1), (32, 16, 1, 1)),
+    "dw": ("pads=[1,1,1,1],group=16", (16, 1, 3, 3), (16, 1, 3, 3)),
+}
+for _n, (_attrs, _ws, _wzs) in _res_cases.items():
+    for _act in ("none", "relu"):
+        _tail = "A2=Add(C,Z)\nY=Relu(A2)" if _act == "relu" else "Y=Add(C,Z)"
+        _mk_ms(
+            f"v_ConvAdd_{_act}_{_n}",
+            _stem + f"C=Conv<{_attrs}>(R,W,B)\nZ=Conv<{_attrs}>(R,WZ,BZ)\n" + _tail,
+            {
+                "W0": _w0,
+                "W": (_rng.standard_normal(_ws) * 0.2).astype("f"),
+                "B": (_rng.standard_normal(_ws[0]) * 0.5).astype("f"),
+                "WZ": (_rng.standard_normal(_wzs) * 0.2).astype("f"),
+                "BZ": (_rng.standard_normal(_wzs[0]) * 0.5).astype("f"),
+            },
+        )
+# Winograd-eligible (64 channels) with a residual, with and without ReLU
+for _act in ("none", "relu"):
+    _tail = "A2=Add(C,Z)\nY=Relu(A2)" if _act == "relu" else "Y=Add(C,Z)"
+    _mk_ms(
+        f"v_ConvAdd_{_act}_winograd",
+        _stem64 + "C=Conv<pads=[1,1,1,1]>(R,W,B)\nZ=Conv<pads=[1,1,1,1]>(R,WZ,BZ)\n" + _tail,
+        {
+            "W0": _w64,
+            "W": (_rng.standard_normal((64, 64, 3, 3)) * 0.05).astype("f"),
+            "B": (_rng.standard_normal(64) * 0.5).astype("f"),
+            "WZ": (_rng.standard_normal((64, 64, 3, 3)) * 0.05).astype("f"),
+            "BZ": (_rng.standard_normal(64) * 0.5).astype("f"),
+        },
+    )
