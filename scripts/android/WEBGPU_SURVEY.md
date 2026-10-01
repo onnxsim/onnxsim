@@ -996,3 +996,55 @@ provider option `enableInt64` is on (the kernels exist; `Tile` and `Unsqueeze` r
 Not done: an NHWC Resize (YOLO has 4 Transposes around its 2 nearest-neighbour Resizes, est. 1-2%). The nearest-neighbour shader is already layout-generic and UpsampleBase already validates
 NHWC scales, but `ShouldConvertDataLayoutForOp` decides per op type, not per attribute, so registering an NHWC Resize would also route non-antialiased bicubic Resizes into an NHWC kernel
 that rejects them -- a regression for those models that is not worth ~1.5% on YOLO.
+
+## tinygrad Adreno OpenCL vs the ORT WebGPU stack (one session, 2026-10-01)
+
+tinygrad bundles exported on the phone (`scripts/android/tinygrad_aot`, `DEV=CL`, `--adreno`, tinygrad's default heuristics, no BEAM) and run with `tg_cl_bench`
+(150 iterations after warm-up, wall time includes the input upload and output readback; "GPU" is the sum of the per-kernel OpenCL event times of one run).
+ORT WebGPU is the current stack (Winograd + Conv/Add/ReLU/Gelu fusion + weight cache; fp32 unless noted), same session, 60 warm-up runs. The phone ran ~8-10%
+slower than in the earlier tables of this document (ORT ResNet-50 62.5 ms here against ~56 earlier), so compare within the table. Scripts and raw per-kernel
+profiles: `scripts/android/tinygrad_aot/compare_webgpu/`. Inputs: ResNet-50 with a static 1x3x224x224 input; the YOLO11n float twin (NHWC 0..255 float input).
+SAM-L0 and RT-DETR were not attempted: a YOLO11n fp32 export alone took 26 minutes of on-phone compile.
+
+| model | tinygrad OpenCL fp16 images | tinygrad fp32 images | tinygrad fp32 buffers | ORT WebGPU fp32 | ORT + texture weights (f16 weights) | ORT fp16 graph |
+|---|---|---|---|---|---|---|
+| ResNet-50 | 84-85 ms (GPU 80.7, 64 calls) | 116-117 (GPU 113-123) | 460-472 (GPU 455, 51 calls) | **62.4 / 62.6** | **58.2 / 59.4** | 55.9 / 61.4 |
+| YOLO11n | **53.3** (min 45.8; GPU 38-43, 122 calls) | 57.2 (GPU 51-53) | 441 (GPU 426, 94 calls) | 76.7 / 76.9 | 71.5 / 74.9 | 64.4 / 69.4 |
+
+Accuracy of the tinygrad bundles against ORT CPU fp32 on the same input: fp32 images/buffers match to 3e-7 rms (ResNet-50 logits 5e-7 max, YOLO11n 5e-6 max);
+fp16 images: ResNet-50 3.7e-3 rms / 1.05e-2 max-relative, top-1 unchanged; YOLO11n 1.3e-3 rms / 1.1e-2 max. (ORT's fp32 path is exact to 8e-7; its texture-weight mode is 1.3e-3.)
+
+**ResNet-50: ORT is faster.** tinygrad fp16 is 1.4x slower than ORT fp32 and tinygrad fp32 (images) 1.9x slower; on YOLO11n tinygrad is 1.2-1.4x *faster* than ORT fp32/fp16.
+Where the time goes (one ResNet-50 run):
+
+| kernel class | count | tinygrad fp16 (GPU ms) | tinygrad fp32 images | ORT WebGPU (wall-based estimate) |
+|---|---|---|---|---|
+| 3x3 convs | 16 | **42.4** (64@56 3x1.03, 128@28 0.54+3x0.93, 256@14 1.85+5x2.21, 512@7 4.9+2x9.1) | 61.5 | ~27 (chains below), Winograd |
+| 7x7 stem | 1 | 2.8 | 3.0 | n/a |
+| 1x1 convs + pools + fc (`r_` kernels) | 34 | 34.9 | 47.9 | rest of the 58-62 ms |
+| elementwise (`E_`) | 13 | 0.7 | 0.9 | (fused away) |
+
+ORT's per-3x3 cost cannot be read from its profiler (its per-dispatch GPU timestamps sum to ~12 ms of a 58 ms run), so I timed chains of 2 and 10 identical convs
+(Conv+ReLU, one model per shape, `(T10 - T2) / 8` per conv, +-30% noise): 64@56 1.2, 128@28 1.8, 256@14 2.0, 512@7 1.4 ms (texture weights: 2.1 / 1.5 / 2.0 / 1.1; noisy),
+which weighted by ResNet-50's 3/4/6/3 3x3 convs gives ~27 ms against tinygrad's 42 ms fp16. 1x1 pairs in the same chain test: 1.15 (256<->64 @56), 1.6 (512<->128 @28), 2.15 (1024<->256 @14),
+2.2 ms (2048<->512 @7) per conv for ORT.
+
+What explains the gaps:
+- **The image2d (texture) path is worth ~4x for tinygrad**, the same finding as the layout study: the *same* kernels on plain fp32 buffers take 472 ms against 117 ms with
+  `image2d_t` (ResNet-50), 441 vs 57 ms (YOLO11n). tinygrad reads weights and activations through the texture cache with RGBA texels (4 channels/load); that is what
+  `ORT_WEBGPU_WINO_TEX` copies for the Winograd weights only, and ORT's other kernels still read storage buffers. fp16 on top of images is 1.4x (ResNet-50) / 1.2-1.4x (YOLO11n).
+- **Algorithm choice decides ResNet-50**: tinygrad runs every 3x3 as a direct conv, ORT as Winograd (16 convs, 2.25x fewer multiplies). The direct 3x3 kernels are good where
+  the grid is large (64@56: 1.03 ms = 225 GFLOPS fp16) and poor where it is small: 512@7 takes 9.1 ms (25 GFLOPS; grid 128x7x7 groups of 16 threads, 49 x 128 work-items per
+  channel block) and 256@14 2.2 ms (105 GFLOPS) -- the three 7x7 3x3 convs alone are 23 ms of tinygrad's 81. tinygrad's default heuristic is not BEAM-tuned here
+  (`export_cl.py` only BEAM-searches kernels the vendor compiler rejects); the repo's earlier tuning runs show 2x on such kernels.
+- **YOLO11n favours tinygrad** because its 3x3 convs are low-channel/high-resolution (Winograd is off below 64 channels in ORT, where its stock Conv2dMM shared-memory path
+  runs on fp32 buffers), exactly where direct convs on fp16 images are strong; tinygrad's 36 3x3 kernels total 20.5 ms fp16, 30 ms fp32.
+- **Fusion/dispatch count** is a minor factor: tinygrad's ResNet-50 is 64 calls (bias, ReLU, residual Add all inside the conv kernels; only 13 tiny `E_` kernels, 0.7 ms) with
+  GPU time 95% of wall; ORT is ~130 dispatches after our fusions (13 us floor each ~ 1.7 ms) plus 3 more per Winograd conv.
+- tinygrad's launch shapes: local sizes are 16-128 invocations (e.g. `l=4x2x16`, `l=16x1x1`, `l=32x4x1`), 4 output channels per thread via RGBA writes, K unrolled x4;
+  weights are repacked once at load into fp16 images (54 `init` calls) -- the same idea as ORT's prepacked/cached transformed weights.
+
+What ORT/WebGPU could copy: (1) read activations as well as weights through textures (ORT's Program API now allows one extra texture; a texture *tensor* type would be needed for
+activations), (2) fp16 texel storage with f32 math, (3) tinygrad's direct 3x3 for the low-channel/high-resolution convs where Winograd is off (YOLO). Three tinygrad kernels are
+extracted in `scripts/android/tinygrad_aot/r50_kernels/` (OpenCL C plus the `plan.txt` launch line): the 3x3 64@56 conv (`r_14_7_4_2_16_4_4_16_3_3_4`, 1.03 ms), the 3x3 256@14 conv
+(`..._v44`, 2.21 ms) and a 1x1 conv fused with its residual add and ReLU (`r_8_49_32_4_4_64_4`, 0.86 ms).
