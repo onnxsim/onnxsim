@@ -1,0 +1,209 @@
+== 3x3 s1 32>32 @40 (x4)  [3x3 s1 32>32 @40]  0.029 GFLOP, out 40x40x32
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           0.640     0.752       46     1.00x  4.9e-07
+  R     tm4 nv1 wg4x2x16 oc-slow       0.764     0.820       39     0.84x  4.9e-07
+  W16   tm4 nv1 wg4x2x16 oc-slow       0.440     0.528       67     1.45x  5.6e-07
+  W32   tm4 nv1 wg16x2x4 oc-fast       0.543     0.588       54     1.18x  4.9e-07
+  B16   tm4 nv1 wg16x2x4 oc-fast       0.324     0.410       91     1.98x  4.1e-07
+  B32   tm4 nv1 wg8x2x4 oc-slow        0.418     0.461       71     1.53x  4.9e-07
+  B16o  tm4 nv1 wg4x2x8 oc-fast        0.274     0.303      107     2.33x  5.6e-04
+  D     tm4 nv1 wg4x2x8 oc-slow        0.304     0.318       97     2.10x  5.6e-04
+  convert buffer->tex16 0.018 ms, ->tex32 0.026 ms (activation 200.0 KB f32)
+== 3x3 s1 32>64 @40 (x2)  [3x3 s1 32>64 @40]  0.059 GFLOP, out 40x40x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.156     1.266       51     1.00x  4.3e-07
+  R     tm4 nv2 wg2x4x4 oc-slow        1.249     1.431       47     0.92x  4.3e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        0.696     0.765       85     1.66x  7.3e-07
+  W32   tm4 nv1 wg8x2x4 oc-slow        0.986     1.337       60     1.17x  4.3e-07
+  B16   tm4 nv1 wg4x2x8 oc-fast        0.564     0.632      105     2.05x  3.9e-07
+  B32   tm4 nv1 wg8x2x4 oc-slow        0.780     0.851       76     1.48x  4.3e-07
+  B16o  tm4 nv1 wg4x2x8 oc-fast        0.543     0.620      109     2.13x  5.8e-04
+  D     tm4 nv1 wg8x2x8 oc-slow        0.493     0.584      120     2.34x  5.8e-04
+  convert buffer->tex16 0.020 ms, ->tex32 0.018 ms (activation 200.0 KB f32)
+== 3x3 s1 64>32 @40 (x2)  [3x3 s1 64>32 @40]  0.059 GFLOP, out 40x40x32
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.209     1.331       49     1.00x  9.1e-07
+  R     tm4 nv1 wg8x2x4 oc-slow        1.421     1.698       42     0.85x  9.1e-07
+  W16   tm4 nv1 wg4x2x16 oc-slow       0.931     1.053       63     1.30x  8.4e-07
+  W32   tm4 nv1 wg4x2x8 oc-fast        1.200     1.271       49     1.01x  9.1e-07
+  B16   tm4 nv1 wg16x2x4 oc-fast       0.614     0.748       96     1.97x  6.9e-07
+  B32   tm4 nv1 wg4x2x16 oc-slow       0.779     0.890       76     1.55x  9.1e-07
+  B16o  tm4 nv1 wg16x2x4 oc-fast       0.617     0.682       96     1.96x  5.7e-04
+  D     tm4 nv1 wg8x2x8 oc-slow        0.621     0.692       95     1.95x  5.7e-04
+  convert buffer->tex16 0.033 ms, ->tex32 0.041 ms (activation 400.0 KB f32)
+== 3x3 s1 16>32 @80 (x2)  [3x3 s1 16>32 @80]  0.059 GFLOP, out 80x80x32
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.431     1.665       41     1.00x  2.4e-07
+  R     tm4 nv2 wg2x4x4 oc-slow        1.130     1.195       52     1.27x  2.4e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        0.737     0.854       80     1.94x  4.1e-07
+  W32   tm4 nv2 wg4x2x4 oc-fast        0.925     1.087       64     1.55x  2.4e-07
+  B16   tm4 nv1 wg4x2x8 oc-fast        0.523     0.586      113     2.73x  2.9e-07
+  B32   tm4 nv1 wg2x4x8 oc-slow        0.810     0.849       73     1.77x  2.4e-07
+  B16o  tm4 nv1 wg8x2x4 oc-slow        0.494     0.556      119     2.90x  5.3e-04
+  D     tm4 nv1 wg8x2x8 oc-slow        0.547     0.602      108     2.61x  5.3e-04
+  convert buffer->tex16 0.030 ms, ->tex32 0.041 ms (activation 400.0 KB f32)
+== 3x3 s1 32>16 @80 (x2)  [3x3 s1 32>16 @80]  0.059 GFLOP, out 80x80x16
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           2.345     2.633       25     1.00x  4.8e-07
+  R     tm4 nv1 wg4x2x16 oc-slow       1.443     1.551       41     1.62x  4.8e-07
+  W16   tm4 nv1 wg4x2x16 oc-slow       0.969     1.025       61     2.42x  4.3e-07
+  W32   tm4 nv1 wg4x2x16 oc-slow       0.967     1.253       61     2.42x  4.8e-07
+  B16   tm4 nv1 wg4x2x8 oc-fast        0.981     1.039       60     2.39x  2.8e-07
+  B32   tm4 nv1 wg4x2x16 oc-slow       1.188     1.329       50     1.97x  4.8e-07
+  B16o  tm4 nv1 wg2x4x8 oc-slow        0.862     1.019       68     2.72x  4.6e-04
+  D     tm4 nv1 wg8x2x8 oc-slow        0.908     1.001       65     2.58x  4.6e-04
+  convert buffer->tex16 0.057 ms, ->tex32 0.089 ms (activation 800.0 KB f32)
+== 3x3 s1 8>16 @160  [3x3 s1 8>16 @160]  0.059 GFLOP, out 160x160x16
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           3.063     3.395       19     1.00x  2.1e-07
+  R     tm4 nv1 wg8x2x4 oc-slow        1.085     1.254       54     2.82x  2.1e-07
+  W16   tm4 nv1 wg4x2x16 oc-slow       0.995     1.164       59     3.08x  3.0e-07
+  W32   tm4 nv1 wg2x4x8 oc-slow        0.987     1.178       60     3.10x  2.1e-07
+  B16   tm4 nv1 wg16x2x4 oc-fast       0.513     0.560      115     5.96x  2.1e-07
+  B32   tm4 nv1 wg8x2x4 oc-slow        0.639     0.764       92     4.79x  2.1e-07
+  B16o  tm4 nv1 wg16x2x4 oc-fast       0.520     0.553      113     5.89x  5.7e-04
+  D     tm4 nv1 wg4x4x8 oc-slow        0.542     0.584      109     5.65x  5.7e-04
+  convert buffer->tex16 0.052 ms, ->tex32 0.074 ms (activation 800.0 KB f32)
+== 3x3 s1 16>8 @160  [3x3 s1 16>8 @160]  0.059 GFLOP, out 160x160x8
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           3.566     4.498       17     1.00x  3.2e-07
+  R     tm4 nv1 wg8x2x4 oc-slow        0.998     1.191       59     3.57x  3.2e-07
+  W16   tm4 nv1 wg4x2x16 oc-slow       1.400     1.523       42     2.55x  4.2e-07
+  W32   tm4 nv1 wg4x2x16 oc-slow       1.371     1.420       43     2.60x  3.2e-07
+  B16   tm4 nv1 wg16x2x4 oc-fast       0.864     0.954       68     4.13x  6.5e-07
+  B32   tm4 nv1 wg4x2x16 oc-slow       1.374     1.627       43     2.60x  3.2e-07
+  B16o  tm4 nv1 wg16x2x4 oc-fast       0.719     0.909       82     4.96x  7.7e-04
+  D     tm4 nv1 wg4x4x8 oc-slow        0.723     0.744       82     4.93x  7.7e-04
+  convert buffer->tex16 0.084 ms, ->tex32 0.143 ms (activation 1600.0 KB f32)
+== 3x3 s2 16>32 @320  [3x3 s2 16>32 @320]  0.236 GFLOP, out 160x160x32
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           4.605     5.186       51     1.00x  3.8e-07
+  R     tm4 nv1 wg8x2x4 oc-slow        3.927     4.723       60     1.17x  3.8e-07
+  W16   tm4 nv1 wg4x2x8 oc-fast        2.467     2.757       96     1.87x  3.7e-07
+  W32   tm4 nv1 wg16x2x4 oc-fast       3.007     3.453       78     1.53x  3.8e-07
+  B16   tm4 nv2 wg4x2x4 oc-fast        2.845     3.371       83     1.62x  4.7e-07
+  B32   tm4 nv2 wg4x2x4 oc-fast        4.242     5.027       56     1.09x  3.8e-07
+  B16o  tm4 nv2 wg4x2x4 oc-fast        2.849     3.351       83     1.62x  4.7e-04
+  D     tm4 nv1 wg4x2x16 oc-slow       3.626     4.130       65     1.27x  4.7e-04
+  convert buffer->tex16 0.310 ms, ->tex32 0.884 ms (activation 6400.0 KB f32)
+== 3x3 s2 64>64 @160  [3x3 s2 64>64 @160]  0.472 GFLOP, out 80x80x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           3.936     4.592      120     1.00x  6.3e-07
+  R     tm4 nv1 wg8x2x4 oc-slow        3.915     5.435      121     1.01x  6.3e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        2.293     2.837      206     1.72x  5.6e-07
+  W32   tm4 nv1 wg2x4x8 oc-slow        2.923     4.193      161     1.35x  6.3e-07
+  B16   tm4 nv2 wg4x2x4 oc-fast        3.168     4.037      149     1.24x  8.5e-07
+  B32   tm4 nv2 wg4x2x4 oc-fast        4.363     5.688      108     0.90x  6.3e-07
+  B16o  tm4 nv1 wg4x2x8 oc-fast        4.952     6.314       95     0.79x  5.8e-04
+  D     tm4 nv1 wg4x2x8 oc-slow        4.048     5.554      117     0.97x  5.8e-04
+  convert buffer->tex16 0.505 ms, ->tex32 2.669 ms (activation 6400.0 KB f32)
+== 3x3 s2 64>64 @80  [3x3 s2 64>64 @80]  0.118 GFLOP, out 40x40x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           2.666     2.738       44     1.00x  7.7e-07
+  R     tm4 nv2 wg4x2x4 oc-fast        2.399     2.611       49     1.11x  7.7e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        1.443     1.535       82     1.85x  5.3e-07
+  W32   tm4 nv2 wg4x2x4 oc-fast        2.019     2.325       58     1.32x  7.7e-07
+  B16   tm4 nv1 wg4x2x16 oc-slow       1.417     1.517       83     1.88x  4.8e-07
+  B32   tm4 nv1 wg4x2x8 oc-fast        1.460     1.836       81     1.83x  7.7e-07
+  B16o  tm8 nv1 wg4x1x16 oc-slow       1.249     1.367       94     2.13x  5.5e-04
+  D     tm4 nv1 wg4x2x8 oc-slow        1.183     1.382      100     2.25x  5.5e-04
+  convert buffer->tex16 0.098 ms, ->tex32 0.278 ms (activation 1600.0 KB f32)
+== 3x3 s2 128>128 @80  [3x3 s2 128>128 @80]  0.472 GFLOP, out 40x40x128
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           4.277     4.838      110     1.00x  1.1e-06
+  R     tm4 nv1 wg8x2x4 oc-slow        4.673     5.265      101     0.92x  1.1e-06
+  W16   tm2 nv2 wg8x2x4 oc-fast        2.883     3.198      164     1.48x  8.7e-07
+  W32   tm4 nv1 wg2x4x8 oc-slow        3.892     4.816      121     1.10x  1.1e-06
+  B16   tm4 nv1 wg4x2x8 oc-fast        2.459     2.664      192     1.74x  1.1e-06
+  B32   tm4 nv2 wg4x2x4 oc-fast        3.268     3.797      144     1.31x  1.1e-06
+  B16o  tm2 nv2 wg8x2x4 oc-fast        2.104     2.374      224     2.03x  5.1e-04
+  D     tm4 nv1 wg4x2x16 oc-slow       3.533     3.939      134     1.21x  5.1e-04
+  convert buffer->tex16 0.243 ms, ->tex32 1.155 ms (activation 3200.0 KB f32)
+== 3x3 s2 128>128 @40  [3x3 s2 128>128 @40]  0.118 GFLOP, out 20x20x128
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.727     2.060       68     1.00x  7.5e-07
+  R     tm4 nv1 wg4x2x8 oc-fast        1.523     1.804       77     1.13x  7.5e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        0.912     1.162      129     1.89x  8.9e-07
+  W32   tm4 nv1 wg16x2x4 oc-fast       1.528     1.738       77     1.13x  7.5e-07
+  B16   tm4 nv1 wg4x2x8 oc-fast        0.940     1.075      125     1.84x  8.1e-07
+  B32   tm4 nv1 wg16x2x4 oc-fast       1.035     1.268      114     1.67x  7.5e-07
+  B16o  tm4 nv1 wg4x2x8 oc-fast        0.924     1.093      128     1.87x  5.3e-04
+  D     tm4 nv1 wg4x2x8 oc-slow        0.877     1.027      134     1.97x  5.3e-04
+  convert buffer->tex16 0.038 ms, ->tex32 0.120 ms (activation 800.0 KB f32)
+== 3x3 s2 128>256 @40  [3x3 s2 128>256 @40]  0.236 GFLOP, out 20x20x256
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           5.582     6.569       42     1.00x  1.2e-06
+  R     tm4 nv2 wg4x2x4 oc-fast        5.235     6.094       45     1.07x  1.2e-06
+  W16   tm2 nv2 wg8x2x4 oc-fast        3.111     3.454       76     1.79x  9.7e-07
+  W32   tm4 nv2 wg4x2x4 oc-fast        4.628     5.497       51     1.21x  1.2e-06
+  B16   tm4 nv1 wg4x2x8 oc-fast        2.398     2.682       98     2.33x  8.8e-07
+  B32   tm4 nv1 wg4x2x16 oc-slow       3.901     4.275       60     1.43x  1.2e-06
+  B16o  tm4 nv1 wg4x2x8 oc-fast        2.288     2.744      103     2.44x  5.8e-04
+  D     tm4 nv1 wg4x2x8 oc-slow        2.616     2.919       90     2.13x  5.8e-04
+  convert buffer->tex16 0.054 ms, ->tex32 0.158 ms (activation 800.0 KB f32)
+== 3x3 s1 64>64 @80 (Winograd)  [3x3 s1 64>64 @80]  0.472 GFLOP, out 80x80x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           6.679     7.635       71     1.00x  7.3e-07
+  R     tm4 nv1 wg8x2x4 oc-slow        7.502     8.762       63     0.89x  7.3e-07
+  W16   tm4 nv1 wg16x2x4 oc-fast       4.646     5.645      102     1.44x  5.2e-07
+  W32   tm4 nv1 wg8x2x4 oc-slow        5.666     6.410       83     1.18x  7.3e-07
+  B16   tm4 nv1 wg16x2x4 oc-fast       2.728     3.337      173     2.45x  4.7e-07
+  B32   tm4 nv1 wg4x2x8 oc-fast        4.414     4.785      107     1.51x  7.3e-07
+  B16o  tm4 nv1 wg8x2x4 oc-slow        2.899     3.189      163     2.30x  5.2e-04
+  D     tm4 nv1 wg4x2x16 oc-slow       2.724     3.109      173     2.45x  5.2e-04
+  convert buffer->tex16 0.079 ms, ->tex32 0.239 ms (activation 1600.0 KB f32)
+== 3x3 s1 64>64 @20 (Winograd)  [3x3 s1 64>64 @20]  0.029 GFLOP, out 20x20x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           0.758     0.825       39     1.00x  6.5e-07
+  R     tm4 nv1 wg4x2x8 oc-fast        0.738     0.827       40     1.03x  6.5e-07
+  W16   tm4 nv1 wg4x2x16 oc-slow       0.537     0.643       55     1.41x  6.2e-07
+  W32   tm4 nv1 wg4x2x8 oc-fast        0.551     0.589       54     1.38x  6.5e-07
+  B16   tm2 nv2 wg8x2x4 oc-fast        0.428     0.489       69     1.77x  6.2e-07
+  B32   tm4 nv1 wg4x2x8 oc-fast        0.498     0.537       59     1.52x  6.5e-07
+  B16o  tm4 nv1 wg4x2x16 oc-slow       0.353     0.391       84     2.15x  5.8e-04
+  D     tm4 nv1 wg4x2x8 oc-slow        0.389     0.436       76     1.95x  5.8e-04
+  convert buffer->tex16 0.012 ms, ->tex32 0.012 ms (activation 100.0 KB f32)
+== 1x1 192>128 @40 (x4)  [1x1 s1 192>128 @40]  0.079 GFLOP, out 40x40x128
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.580     1.828       50     1.00x  4.2e-07
+  R     tm4 nv2 wg4x2x4 oc-fast        1.340     1.605       59     1.18x  4.2e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        0.931     1.025       85     1.70x  5.2e-07
+  W32   tm4 nv2 wg4x2x4 oc-fast        1.056     1.113       74     1.50x  4.2e-07
+  B16   tm4 nv1 wg8x2x4 oc-slow        0.647     0.735      122     2.44x  5.3e-07
+  B32   tm8 nv1 wg4x1x16 oc-slow       0.854     1.001       92     1.85x  4.2e-07
+  B16o  tm4 nv1 wg16x2x4 oc-fast       0.676     0.695      116     2.34x  5.8e-04
+  D     tm4 nv1 wg8x2x8 oc-slow        0.669     0.754      118     2.36x  5.8e-04
+  convert buffer->tex16 0.088 ms, ->tex32 0.335 ms (activation 1200.0 KB f32)
+== 1x1 384>256 @20 (x3)  [1x1 s1 384>256 @20]  0.079 GFLOP, out 20x20x256
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.652     2.004       48     1.00x  6.9e-07
+  R     tm8 nv1 wg4x1x16 oc-slow       1.658     1.977       47     1.00x  6.9e-07
+  W16   tm2 nv2 wg8x2x4 oc-fast        1.067     1.184       74     1.55x  6.5e-07
+  W32   tm4 nv2 wg4x2x4 oc-fast        1.330     1.422       59     1.24x  6.9e-07
+  B16   tm8 nv1 wg4x1x16 oc-slow       0.857     0.987       92     1.93x  5.3e-07
+  B32   tm8 nv1 wg4x1x16 oc-slow       0.998     1.302       79     1.66x  6.9e-07
+  B16o  tm4 nv1 wg4x2x16 oc-slow       0.855     0.902       92     1.93x  5.8e-04
+  D     tm4 nv1 wg4x2x16 oc-slow       0.880     0.955       89     1.88x  5.8e-04
+  convert buffer->tex16 0.046 ms, ->tex32 0.168 ms (activation 600.0 KB f32)
+== 1x1 256>64 @80  [1x1 s1 256>64 @80]  0.210 GFLOP, out 80x80x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           3.836     4.372       55     1.00x  4.2e-07
+  R     tm4 nv2 wg2x4x4 oc-slow        3.324     3.836       63     1.15x  4.2e-07
+  W16   tm4 nv2 wg4x2x4 oc-fast        2.280     2.696       92     1.68x  4.7e-07
+  W32   tm4 nv2 wg4x2x4 oc-fast        2.323     3.091       90     1.65x  4.2e-07
+  B16   tm4 nv1 wg8x2x4 oc-slow        1.542     1.776      136     2.49x  6.0e-07
+  B32   tm8 nv1 wg4x1x16 oc-slow       1.918     2.345      109     2.00x  4.2e-07
+  B16o  tm4 nv1 wg8x2x4 oc-slow        1.613     1.808      130     2.38x  5.4e-04
+  D     tm4 nv1 wg4x2x16 oc-slow       1.564     1.844      134     2.45x  5.4e-04
+  convert buffer->tex16 0.839 ms, ->tex32 4.682 ms (activation 6400.0 KB f32)
+== 1x1 64>64 @80 (x2)  [1x1 s1 64>64 @80]  0.052 GFLOP, out 80x80x64
+  var   config                        min ms    median   GFLOPS vs A(min)  relerr
+  A     ORT Conv2dMM replica           1.056     1.191       50     1.00x  1.9e-07
+  R     tm4 nv2 wg4x2x4 oc-fast        0.853     0.993       61     1.24x  1.9e-07
+  W16   tm4 nv2 wg2x4x4 oc-slow        0.629     0.769       83     1.68x  2.2e-07
+  W32   tm8 nv1 wg4x1x16 oc-slow       0.710     0.956       74     1.49x  1.9e-07
+  B16   tm4 nv1 wg4x2x8 oc-fast        0.400     0.462      131     2.64x  2.7e-07
+  B32   tm8 nv1 wg4x1x16 oc-slow       0.523     0.603      100     2.02x  1.9e-07
+  B16o  tm4 nv1 wg4x2x8 oc-fast        0.444     0.475      118     2.38x  5.9e-04
+  D     tm4 nv1 wg8x2x8 oc-slow        0.390     0.449      135     2.71x  5.9e-04
+  convert buffer->tex16 0.100 ms, ->tex32 0.279 ms (activation 1600.0 KB f32)

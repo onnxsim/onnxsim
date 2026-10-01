@@ -1089,3 +1089,68 @@ all finite; the four query outputs (`h`, `off`, `w`, `ref`) differ by 0.2-0.7 be
 
 **Conclusion.** fp16 is not worth enabling for these two models: both need fp32 islands covering the interesting parts of the network and the result is no faster than the fp32 graph with Winograd + texture weights. The two real, reusable findings are
 (a) `onnxconverter_common` turns tiny epsilons (1e-15) into subnormals that the GPU flushes to zero: always clamp epsilons to a normal f16 (>= 6.1e-5) in fp16 graphs, and (b) trained 1x1 layers with sum|wx| / |y| in the thousands need f32 accumulation *and* f32 inputs.
+
+## Texture-fed direct convs for YOLO's non-Winograd shapes (`dawn_repro/conv_tex_direct.cc`)
+
+Where ORT's Winograd is off (stride 2, or min(Cin, Cout) < 64), YOLO11n's 3x3 convs and its 1x1 convs run through the Conv2dMM / MatMul shared-memory tile. This benchmark
+takes 19 shapes from the YOLO11n graph (shape-inferred `yolo11n.onnx`; counts in brackets are how often the shape occurs) and times, ABAB-interleaved (9 rounds, min and median, GPU warmed for
+5 s, every non-ORT variant swept over 5-10 tile/workgroup configurations), against `A` = a replica of ORT's Conv2dMM vec4 shader (8x8 workgroup, 4 rows x 1 vec4 per thread, 32x32x32 shared tiles, im2col
+gather in `mm_readA`): `R` direct register-tile conv, buffer in / buffer weights; `W16` / `W32` weights in an RGBA16F / RGBA32F texture (x = Cout/4, y = tap*Cin + c), activations still a buffer;
+`B16` / `B32` activations (x = w*C4 + c4, y = h) and weights in textures, buffer output; `B16o` as `B16` with the output also written to an RGBA16F texture; `D` the tinygrad strategy from
+`tinygrad_aot/r50_kernels` (4 pixels along x x 1 vec4 of output channels per thread, output-channel index slowest in the workgroup so weight loads are uniform across a wave), texture in / weights / out.
+All of them compute in f32 and match a double-precision CPU reference on the data they read (1e-7 .. 1e-6; 5e-4 when the output is stored as RGBA16F, which is the f16 rounding of the result).
+Min ms per dispatch (raw output with medians, configs and GFLOPS: `dawn_repro/conv_tex_direct_results.txt`):
+
+| shape (x count) | A (ORT replica) | R | W16 | B16 | B16o | D | best vs A | buffer->tex16 copy |
+|---|---|---|---|---|---|---|---|---|
+| 3x3 s1 32>32 @40 (x4) | 0.640 | 0.764 | 0.440 | 0.324 | 0.274 | 0.304 | 2.3x | 0.018 |
+| 3x3 s1 32>64 @40 (x2) | 1.156 | 1.249 | 0.696 | 0.564 | 0.543 | 0.493 | 2.3x | 0.020 |
+| 3x3 s1 64>32 @40 (x2) | 1.209 | 1.421 | 0.931 | 0.614 | 0.617 | 0.621 | 2.0x | 0.033 |
+| 3x3 s1 16>32 @80 (x2) | 1.431 | 1.130 | 0.737 | 0.523 | 0.494 | 0.547 | 2.9x | 0.030 |
+| 3x3 s1 32>16 @80 (x2) | 2.345 | 1.443 | 0.969 | 0.981 | 0.862 | 0.908 | 2.7x | 0.057 |
+| 3x3 s1 8>16 @160 | 3.063 | 1.085 | 0.995 | 0.513 | 0.520 | 0.542 | 6.0x | 0.052 |
+| 3x3 s1 16>8 @160 | 3.566 | 0.998 | 1.400 | 0.864 | 0.719 | 0.723 | 5.0x | 0.084 |
+| 3x3 s2 16>32 @320 | 4.605 | 3.927 | 2.467 | 2.845 | 2.849 | 3.626 | 1.9x | 0.310 |
+| 3x3 s2 64>64 @160 | 3.936 | 3.915 | 2.293 | 3.168 | 4.952 | 4.048 | 1.7x | 0.505 |
+| 3x3 s2 64>64 @80 | 2.666 | 2.399 | 1.443 | 1.417 | 1.249 | 1.183 | 2.3x | 0.098 |
+| 3x3 s2 128>128 @80 | 4.277 | 4.673 | 2.883 | 2.459 | 2.104 | 3.533 | 2.0x | 0.243 |
+| 3x3 s2 128>128 @40 | 1.727 | 1.523 | 0.912 | 0.940 | 0.924 | 0.877 | 2.0x | 0.038 |
+| 3x3 s2 128>256 @40 | 5.582 | 5.235 | 3.111 | 2.398 | 2.288 | 2.616 | 2.4x | 0.054 |
+| 1x1 192>128 @40 (x4) | 1.580 | 1.340 | 0.931 | 0.647 | 0.676 | 0.669 | 2.4x | 0.088 |
+| 1x1 384>256 @20 (x3) | 1.652 | 1.658 | 1.067 | 0.857 | 0.855 | 0.880 | 1.9x | 0.046 |
+| 1x1 256>64 @80 | 3.836 | 3.324 | 2.280 | 1.542 | 1.613 | 1.564 | 2.5x | 0.839 |
+| 1x1 64>64 @80 (x2) | 1.056 | 0.853 | 0.629 | 0.400 | 0.444 | 0.390 | 2.7x | 0.100 |
+
+(Context rows, shapes ORT runs with Winograd today: 3x3 s1 64>64 @80 x2: A 6.68 -> B16 2.73 / D 2.72 ms; 64>64 @20 x9: A 0.76 -> B16o 0.35 ms.)
+
+Weighted by how often each shape occurs in YOLO11n (17 listed shapes, 61.5 ms of the replica's time; YOLO11n takes ~72 ms in ORT, so this is where its time is):
+
+| variant | ms | speed-up vs A |
+|---|---|---|
+| R (direct, buffers) | 52.7 | 1.17x |
+| W16 (texture weights only, buffer activations) | 34.4 | 1.79x |
+| B16 (texture activations + weights, no conversion cost) | 28.8 | 2.14x |
+| B16 + a buffer->tex16 copy before every conv (worst case) | 32.0 | 1.92x |
+| B16o (producers also write textures) | 29.5 | 2.08x |
+| D (tinygrad-like, textures in/out) | 31.2 | 1.97x |
+| B32 (RGBA32F textures) | 38.4 | 1.60x |
+
+What this says:
+- **Textures are the whole effect.** The plain direct register-tile conv on buffers (`R`) is only 1.17x the ORT replica; moving the weights into an RGBA16F texture takes it to 1.79x, activations as well to 2.14x. RGBA32F textures are
+  worth less (1.60x): the RGBA16F texels halve the bytes per fetch. It is the same ordering as the OpenCL study (images >> buffers), and the low-channel layers gain most (8>16 @160: 6.0x, 16>32 @80: 2.9x).
+- **Weights in a texture are two thirds of it and need no new tensor type.** `W16` keeps buffer activations and already gets 1.79x. ORT's Program API has had a
+  (single) extra texture slot since the Winograd change, and weights are the one tensor that can be converted once at prepack time, so a direct register-tile 3x3 / 1x1 kernel with RGBA16F weights is a drop-in replacement for the
+  Conv2dMM fallback with no layout or producer changes (cost: weights rounded to f16, ~1e-3 on the logits as for the Winograd texture-weights mode).
+- **Texture activations are worth another 1.2x, and the conversion is cheap.** A buffer->RGBA16F copy of the layer input costs 0.01-0.1 ms for 15 of the 19 shapes (0.3-0.8 ms for the 6.4 MB activations of the 320x320
+  stem and the @80/@160 64-channel layers), so even converting in front of every conv leaves 1.92x. Break-even (A - B16 - copy) is positive for all 19 shapes; the weakest is 3x3 s2 64>64 @160 (+0.26 ms), the
+  strongest 3x3 s2 128>256 @40 (+3.1 ms). Having producers write textures (`B16o`) is free in the kernel itself (2.08x vs 2.14x) but would need a texture output on every producer (elementwise ops, Concat, Split, ...),
+  so it only pays once a layout pass owns the whole chain.
+- **The tinygrad-style kernel (`D`) is not better than a tuned sweep.** Its fixed shape (4 pixels x 1 vec4, channel index slowest) wins on 6 shapes and loses clearly on the stride-2 128>128 @80 and 16>32 @320 layers
+  (3.5 vs 2.1, 3.6 vs 2.8 ms); the best configuration differs per shape (TM 2-8, NV 1-2, oc-fast vs oc-slow), so a per-shape table is needed, as for the GEMM kernels.
+- **Stride 2 is not special**: the same 1.7-2.4x holds with the im2col gather done in the kernel; ORT's replica pays for it in `mm_readA` (integer div/mod per element) and in the shared-memory staging.
+
+**Would a texture path pay off in ORT for YOLO?** Yes, and the cheapest version is the weights-only one. Upper bound from this microbenchmark: 61.5 -> 34.4 ms (weights only) / 28.8-32 ms (activations too) of
+YOLO11n's ~72 ms. Earlier standalone gains transferred to the network only partly (register-tile GEMM: not at all; weights in a texture: 1.5-2.0x per layer in the layout study -> 4-10% end to end on ResNet-50/SAM/RT-DETR), and the replica
+is not ORT's shader (ORT adds bias/SiLU epilogues and its dispatch overhead), so I would expect 8-15 ms (11-20%) on YOLO11n from a texture-weights direct conv (to be measured), and a further few percent from texture
+activations. Not measured here: depthwise convs (YOLO11n has none), the bias/SiLU epilogue, cross-layer producer chains.
+
