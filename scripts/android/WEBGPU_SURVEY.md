@@ -1048,3 +1048,44 @@ What ORT/WebGPU could copy: (1) read activations as well as weights through text
 activations), (2) fp16 texel storage with f32 math, (3) tinygrad's direct 3x3 for the low-channel/high-resolution convs where Winograd is off (YOLO). Three tinygrad kernels are
 extracted in `scripts/android/tinygrad_aot/r50_kernels/` (OpenCL C plus the `plan.txt` launch line): the 3x3 64@56 conv (`r_14_7_4_2_16_4_4_16_3_3_4`, 1.03 ms), the 3x3 256@14 conv
 (`..._v44`, 2.21 ms) and a 1x1 conv fused with its residual add and ReLU (`r_8_49_32_4_4_64_4`, 0.86 ms).
+
+## Root cause of the fp16 NaNs / errors on SAM-L0 and RT-DETR (ORT WebGPU, phone, 2026-10-01)
+
+Tools: `webgpu_ops/fp16/nan/` (host fp32 reference ranges `ranges.py`, per-conv fp16 sensitivity `rank_conv.py`, bisect `bis2.py`/`cmpbis.py`, island variants
+`variants*.py`, isolated 1x1 conv `mkiso.py`); `bench` now accepts `INPUT_BIN=<raw file>` to run a real photo instead of LCG noise (all numbers below use a real
+photo; error = rel-l2 of the output vs the CPU EP fp32). The result is **three independent causes, only two of them fixable with fp32 islands**:
+
+1. **SAM NaN = the linear-attention epsilon.** `Div(num, Add(den, 1e-15))` (4 blocks, `context_module/main/Add` + `Div`): the converter truncates 1e-15 to 1e-7, a subnormal f16 that the GPU
+   flushes to 0, and where the denominator is exactly 0 (the ReLU kernel features of a token are all 0: 1 of 8192 in block `stages.4/op_list.2`) it computes 0/0 = NaN, which then spreads through
+   the next Conv and Gelu. Keeping just those 8 nodes (4 Add + 4 Div) in fp32 removes **all** NaNs (`n_attn`). Nothing overflows in SAM: the largest fp32 intermediate is 1061 (Slice/MatMul of the
+   linear attention), so the earlier "Gelu x^3 overflow" and "values ~500" suspicions were wrong; keeping the 30 Gelu in fp32 changes nothing about the NaNs.
+2. **SAM accuracy = f16 accumulation over cancelling sums, concentrated in 10 layers.** The 10 group-1 1x1 `point_conv` layers with K >= 1024 (stages 3 and 4: 4 + 5 + 1) have trained weights whose products nearly cancel: the median ratio sum|w*x| / |y| is 2000-5000
+   (partial sums up to 2200 for outputs of ~5, bias up to 117). Host emulation of one layer (`stages.3/op_list.0/main/point_conv`, K=2048): f16 operands with f32 accumulation 1.8% error, f16
+   accumulation (what ORT's kernel does) 17-47% depending on the layer; the other 30 1x1 convs are 1e-3..4e-3 even with f16 accumulation. An isolated random-data 1x1 conv of the same shape is fine (K=2048: 6.6e-3 default, 8e-4 with f32 accumulate), so
+   it is the data, not the kernel. `ORT_WEBGPU_F16_ACC32=1` (the f32-accumulation patch) therefore does help once the NaN is gone, which is why it looked useless before.
+3. **Remaining SAM error is f16 operand rounding amplified by the same cancellation.** Even with those 10 convs in fp32, their fp16-rounded inputs give 3% per layer, and it compounds.
+
+SAM-L0 encoder, fp16 variants on the photo (phone medians; fp32 graph 337-370 ms depending on the texture-weight setting):
+
+| fp32 islands | accumulate | error vs fp32 | latency |
+|---|---|---|---|
+| none | f16 | NaN | 352 ms |
+| none | f32 | NaN | 418 ms |
+| 4 Add + 4 Div (attention eps) | f16 | 5.5e-1 | 344 ms |
+| 4 Add + 4 Div | f32 | 7.5e-2 | 406 ms |
+| + 10 cancelling 1x1 convs | f16 | 6.6e-2 | 351 ms |
+| + 10 cancelling 1x1 convs | f32 | 4.9e-2 | 414 ms |
+| + their depthwise conv + Gelu producers (38 nodes) | f32 | **3.2e-2** | 420 ms |
+| + 30 Gelu in fp32 too | f32 | 3.8e-2 | 445 ms |
+
+**No configuration reaches 1e-2** and the ones that do not produce garbage are not faster than the fp32 graph (337 ms with Winograd + texture weights). SAM stays fp32. If an fp16 SAM is ever needed: islands for the attention eps (mandatory),
+the 10 point_conv layers and f32 accumulation get 3% embeddings error at ~the fp32 latency; the real fix is quantization-aware or a per-layer scaled fp16 export, not a runtime option.
+
+**RT-DETR pre: NaN = genuine f16 overflow.** In the fp32 reference the backbone's last stage (`stages.3/layers.1` Conv, 1.4e5, then 3.4e6 after the second conv/Add) feeds the AIFI transformer, whose q/k projections are 2.4e6-7.3e6 and whose
+`self_attn/MatMul` reaches **1.9e12** (inputs 1e6 times 1e6 before the 1/sqrt(d) scaling); everything beyond 65504 becomes inf in f16, and Softmax then returns NaN. The values collapse again at the first LayerNormalization (3.6). The contiguous island
+nodes 37-65 of the fp32 node list (3 Conv, Add, 8 Reshape, 5 Transpose, 4 Gemm, 2 Mul, 2 MatMul, Softmax, LayerNorm: 29 nodes) fixes every NaN. Results (fp32 island + f32 accumulate): the three 8400x256 memory outputs 1.2e-2 relative,
+all finite; the four query outputs (`h`, `off`, `w`, `ref`) differ by 0.2-0.7 because the top-300 query selection picks different queries under f16, so they cannot be compared elementwise. Latency 345 ms (f16 accumulate) / 381-393 ms (f32 accumulate) against 312-345 ms fp32, i.e. no gain either.
+`ORT_WEBGPU_F16_ACC32=1` matters here too (4e-2 -> 1e-2 on the memory outputs).
+
+**Conclusion.** fp16 is not worth enabling for these two models: both need fp32 islands covering the interesting parts of the network and the result is no faster than the fp32 graph with Winograd + texture weights. The two real, reusable findings are
+(a) `onnxconverter_common` turns tiny epsilons (1e-15) into subnormals that the GPU flushes to zero: always clamp epsilons to a normal f16 (>= 6.1e-5) in fp16 graphs, and (b) trained 1x1 layers with sum|wx| / |y| in the thousands need f32 accumulation *and* f32 inputs.

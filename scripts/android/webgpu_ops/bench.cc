@@ -172,6 +172,13 @@ int main(int argc, char** argv) {
         default: break;
       }
     }
+    if (i == 0 && getenv("INPUT_BIN")) {  // real input (raw file, exactly the input tensor's bytes) instead of the LCG noise
+      FILE* f = fopen(getenv("INPUT_BIN"), "rb");
+      if (!f) { fprintf(stderr, "cannot open INPUT_BIN\n"); return 2; }
+      size_t got = fread(bufs[i].data(), 1, bufs[i].size(), f);
+      fclose(f);
+      if (got != bufs[i].size()) { fprintf(stderr, "INPUT_BIN size mismatch %zu vs %zu\n", got, bufs[i].size()); return 2; }
+    }
     CK(g->CreateTensorWithDataAsOrtValue(mi, bufs[i].data(), bufs[i].size(), dims.data(), nd, et, &in_vals[i]));
     g->ReleaseTypeInfo(ti);
   }
