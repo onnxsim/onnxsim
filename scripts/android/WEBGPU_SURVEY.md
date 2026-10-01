@@ -985,3 +985,14 @@ Phone medians (fp32 logits within 8e-7 of the CPU, top-1 unchanged), add fusion 
 
 (The phone was a few percent slower this session than in earlier tables, so compare within a row.) ORT's default conv was 67 ms on ResNet-50, i.e. fp32-exact ResNet-50 is now
 ~17% faster than stock and ~20% faster with texture weights.
+
+## RT-DETR CPU round trip: `enableInt64=1` removes it without a code change
+
+RT-DETR `pre` keeps 3 `Unsqueeze` + 6 `Tile` nodes on the CPU EP because they consume the int64 `TopK` indices and the WebGPU EP only registers int64 kernels when the
+provider option `enableInt64` is on (the kernels exist; `Tile` and `Unsqueeze` register conditionally). With `enableInt64=1` (provider option key
+`ep.webgpuexecutionprovider.enableInt64`; `bench` takes it as `enableInt64=1`) no node of `pre` falls back to the CPU and the model goes 343 -> **337 ms**
+(two runs: 342.9/343.0 -> 338.2/335.7); `mid0` 18.7 -> 19.3 and `post` 11.6 -> 11.5 ms (unchanged, no CPU nodes). So: turn the option on for models whose int64 index tensors feed shape/gather-style ops.
+
+Not done: an NHWC Resize (YOLO has 4 Transposes around its 2 nearest-neighbour Resizes, est. 1-2%). The nearest-neighbour shader is already layout-generic and UpsampleBase already validates
+NHWC scales, but `ShouldConvertDataLayoutForOp` decides per op type, not per attribute, so registering an NHWC Resize would also route non-antialiased bicubic Resizes into an NHWC kernel
+that rejects them -- a regression for those models that is not worth ~1.5% on YOLO.
