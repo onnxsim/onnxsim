@@ -1198,3 +1198,15 @@ sweep 311 OK / 0 wrong. A per-shape tile table, a texture-activation path and th
 
 ### Graph rewrites for YOLO (exact, no kernel change)
 `webgpu_ops/yolo_graph_opt.py` (default rules `split_conv,head,resize_convt`): YOLO11n 72.1 -> 69.4 ms, YOLO26n unchanged; outputs within 1.5e-6.
+
+## Vec4 fast paths for last-axis Concat and Split (`ort_concat_split_vec4.patch`, exact, on by default)
+
+ORT's WebGPU Concat/Split move one scalar per thread and recompute rank-N indices with divisions in the shader. For NHWC activations the channel axis is the last one, so when every piece (and the
+tensor) is a multiple of 4 wide and the type is f32/f16, `ConcatLastAxisVec4Program` / `SplitLastAxisVec4Program` copy vec4s with a flat `(outer, c4)` index (`ORT_WEBGPU_CONCAT_VEC4=0` / `ORT_WEBGPU_SPLIT_VEC4=0`
+disable them; Concat up to the shader's input limit, Split up to 6 outputs). Phone medians (off -> on): YOLO11n 70.4/72.2 -> **68.7/68.8 ms**, YOLO26n 63.3/64.5 -> **61.5/61.9**, RT-DETR pre unchanged within noise (335-346 either way),
+SAM unchanged. Bit-exact copies; sweep 317 OK / 0 wrong with 6 new last-axis Concat/Split cases (`gen_new_op_tests.py`). This captures about 3-4 ms of the ~8 ms the graph analysis attributed to Concat+Split; the rest needs producers writing
+into their Concat slice or consumers reading channel-offset views.
+
+## Texture direct conv: per-shape tile table and the 1x1 case
+`ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..."` overrides the tile per conv shape, `ORT_WEBGPU_TEXDIRECT_LOG=1` prints the shapes the path takes, and `ORT_WEBGPU_CONV_TEXDIRECT=2` also routes 1x1 stride-1 convs
+through it (before they reach the MatMul path). With the default tile, mode 2 is neutral to slightly negative (YOLO11n 66.8 -> 67.9/69.1 ms at MAXC 64, ResNet-50 57.0 -> 57.9 at MAXC 256, 60.5-60.8 at 2048); per-shape results are in the tuning section if the tuning job has finished.

@@ -1,8 +1,36 @@
 diff --git a/onnxruntime/core/providers/webgpu/nn/conv.cc b/onnxruntime/core/providers/webgpu/nn/conv.cc
-index c3f8b0c..54d952e 100644
+index c3f8b0c..cddcb9a 100644
 --- a/onnxruntime/core/providers/webgpu/nn/conv.cc
 +++ b/onnxruntime/core/providers/webgpu/nn/conv.cc
-@@ -304,6 +304,12 @@ Status Conv<is_channels_last, is_fused>::ComputeImpl(ComputeContext& context, co
+@@ -219,6 +219,27 @@ Status Conv<is_channels_last, is_fused>::ComputeImpl(ComputeContext& context, co
+     return context.RunProgram(program);
+   }
+ 
++  if (is_channels_last && conv_attrs_.group == 1 && input_shape.NumDimensions() == 4 && kernel_height == 1 && kernel_width == 1 &&
++      pads[0] == 0 && pads[1] == 0 && strides[0] == 1 && strides[1] == 1) {
++    // texture-weight direct conv for 1x1 stride-1 (ORT_WEBGPU_CONV_TEXDIRECT=2)
++    Tensor tk;
++    const Tensor* hwio = kernel;
++    bool want = false;
++    {
++      static const int m = [] { const char* e = std::getenv("ORT_WEBGPU_CONV_TEXDIRECT"); return e ? std::atoi(e) : 0; }();
++      want = m >= 2;
++    }
++    if (want) {
++      if (!kernel_is_prepacked) {
++        ORT_RETURN_IF_ERROR(TransposeKernel(context, kernel, kernel_shape, &tk, perm));
++        hwio = &tk;
++      }
++      bool applied = false;
++      ORT_RETURN_IF_ERROR(TryApplyTexDirectConv(context, activation, input, hwio, bias, pads, strides, dilations, output, applied,
++                                                kernel_is_prepacked ? &texdirect_w_ : nullptr, residual, /*one_by_one_ok=*/true));
++      if (applied) return Status::OK();
++    }
++  }
+   const auto same_size = is_channels_last && input_height == kernel_height && input_width == kernel_width && pads[0] == 0 && pads[1] == 0;
+   if (same_size || (kernel_height == 1 && kernel_width == 1 && pads[0] == 0 && pads[1] == 0 && strides[0] == 1 && strides[1] == 1)) {
+     Tensor transposed_kernel;
+@@ -304,6 +325,12 @@ Status Conv<is_channels_last, is_fused>::ComputeImpl(ComputeContext& context, co
      ORT_RETURN_IF_ERROR(TryApplyWinogradConv(context, activation, input, conv_kernel, bias, pads, output, applied, kernel_is_prepacked ? &winograd_u_ : nullptr, residual));
      if (applied) return Status::OK();
    }
@@ -30,10 +58,17 @@ index becc205..8902c53 100644
  };
  
 diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
-index 5deb1e8..fed5dd1 100644
+index 5deb1e8..9352eab 100644
 --- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 +++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
-@@ -730,3 +730,150 @@ Status ConvResidualAddProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -1,5 +1,6 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
++#include <cstdio>
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
+@@ -730,3 +731,180 @@ Status ConvResidualAddProgram::GenerateShaderCode(ShaderHelper& shader) const {
  
  }  // namespace webgpu
  }  // namespace onnxruntime
@@ -127,7 +162,38 @@ index 5deb1e8..fed5dd1 100644
 +  if (std::max(cin, cout) > max_c) return Status::OK();
 +  const int64_t rows = ks[0] * ks[1] * cin;
 +  if (rows > 8192 || cout / 4 > 8192) return Status::OK();
-+  static const uint32_t tm = env("ORT_WEBGPU_TEXDIRECT_TM", 2), nv = env("ORT_WEBGPU_TEXDIRECT_NV", 2), wx = env("ORT_WEBGPU_TEXDIRECT_WX", 32), wy = env("ORT_WEBGPU_TEXDIRECT_WY", 2);
++  static const uint32_t tm_def = env("ORT_WEBGPU_TEXDIRECT_TM", 2), nv_def = env("ORT_WEBGPU_TEXDIRECT_NV", 2), wx_def = env("ORT_WEBGPU_TEXDIRECT_WX", 32), wy_def = env("ORT_WEBGPU_TEXDIRECT_WY", 2);
++  static const bool pixels_fast_def = env("ORT_WEBGPU_TEXDIRECT_ORDER", 1) != 0;
++  // optional per-shape tile table: ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..." (first match wins)
++  uint32_t tm = tm_def, nv = nv_def, wx = wx_def, wy = wy_def;
++  bool pixels_fast = pixels_fast_def;
++  {
++    static const std::string table = [] { const char* e = std::getenv("ORT_WEBGPU_TEXDIRECT_TABLE"); return std::string(e ? e : ""); }();
++    if (!table.empty()) {
++      const std::string key = std::to_string(ks[0]) + ":" + std::to_string(strides[0]) + ":" + std::to_string(cin) + ":" + std::to_string(cout) + ":" + std::to_string(os[2]);
++      size_t pos = 0;
++      while (pos < table.size()) {
++        size_t end = table.find(';', pos);
++        if (end == std::string::npos) end = table.size();
++        const std::string ent = table.substr(pos, end - pos);
++        pos = end + 1;
++        const size_t eq = ent.find('=');
++        if (eq == std::string::npos || ent.substr(0, eq) != key) continue;
++        unsigned a, b2, c, d, o;
++        if (std::sscanf(ent.c_str() + eq + 1, "%u,%u,%u,%u,%u", &a, &b2, &c, &d, &o) == 5) {
++          tm = a;
++          nv = b2;
++          wx = c;
++          wy = d;
++          pixels_fast = o != 0;
++        }
++        break;
++      }
++    }
++  }
++  if (std::getenv("ORT_WEBGPU_TEXDIRECT_LOG") != nullptr) {
++    std::fprintf(stderr, "TEXDIRECT %lld:%lld:%lld:%lld:%lld\n", static_cast<long long>(ks[0]), static_cast<long long>(strides[0]), static_cast<long long>(cin), static_cast<long long>(cout), static_cast<long long>(os[2]));
++  }
 +  const uint32_t co4 = static_cast<uint32_t>(cout / 4), c4 = static_cast<uint32_t>(cin / 4);
 +  const uint32_t npix = static_cast<uint32_t>(os[0] * os[1] * os[2]);
 +  auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
@@ -163,7 +229,6 @@ index 5deb1e8..fed5dd1 100644
 +      w_cache->valid = true;
 +    }
 +  }
-+  static const bool pixels_fast = env("ORT_WEBGPU_TEXDIRECT_ORDER", 1) != 0;
 +  const uint32_t gx = pixels_fast ? ceil_div(npix, tm * wx) : ceil_div(ceil_div(co4, nv), wx);
 +  const uint32_t gy = pixels_fast ? ceil_div(ceil_div(co4, nv), wy) : ceil_div(npix, tm * wy);
 +  ConvTexDirectProgram p(1, activation, bias != nullptr, residual != nullptr, tm, nv, pixels_fast);

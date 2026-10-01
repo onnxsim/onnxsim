@@ -251,3 +251,13 @@ for _act in ("none", "relu"):
             "BZ": (_rng.standard_normal(64) * 0.5).astype("f"),
         },
     )
+
+# Last-axis Concat / Split with channel counts that are multiples of 4 (vec4 fast paths) and ones that are not (scalar fallback)
+_tr = _stem + "T=Transpose<perm=[0,2,3,1]>(R)\nS2=Mul(T,K2)\nS3=Add(T,K3)\n"
+_kinit = {"W0": _w0, "K2": np.float32(2.0), "K3": np.float32(0.5)}
+_mk_ms("v_ConcatLast_vec4_2", _tr + "Y=Concat<axis=3>(T,S2)", _kinit)
+_mk_ms("v_ConcatLast_vec4_3", _tr + "Y=Concat<axis=3>(T,S2,S3)", _kinit)
+_mk_ms("v_ConcatLast_vec4_4", _tr + "C1=Concat<axis=3>(T,S2)\nC2=Concat<axis=3>(S3,T)\nY=Concat<axis=3>(C1,C2,T)", _kinit)
+_mk_ms("v_SplitLast_vec4_2", _tr + "A1,A2=Split<axis=3,num_outputs=2>(T)\nY=Add(A1,A2)", _kinit)
+_mk_ms("v_SplitLast_vec4_uneven", _tr + "A1,A2=Split<axis=3>(T,SZ)\nM1=Mul(A1,K2)\nY=Concat<axis=3>(A2,M1)", {**_kinit, "SZ": np.array([4, 12], dtype="i8")})
+_mk_ms("v_SplitLast_odd", _tr + "A1,A2=Split<axis=3>(T,SZ)\nY=Concat<axis=3>(A2,A1)", {**_kinit, "SZ": np.array([6, 10], dtype="i8")})
