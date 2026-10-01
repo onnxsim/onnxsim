@@ -1154,3 +1154,30 @@ YOLO11n's ~72 ms. Earlier standalone gains transferred to the network only partl
 is not ORT's shader (ORT adds bias/SiLU epilogues and its dispatch overhead), so I would expect 8-15 ms (11-20%) on YOLO11n from a texture-weights direct conv (to be measured), and a further few percent from texture
 activations. Not measured here: depthwise convs (YOLO11n has none), the bias/SiLU epilogue, cross-layer producer chains.
 
+
+## YOLO Concat / Split / Transpose: what they cost and which exact rewrites pay (`webgpu_ops/yolo_graph_opt.py`)
+
+**What is in the graph** (YOLO11n; YOLO26n has the same 23 Concat / 11 Split):
+- 23 Concat: 8 C2f/C3k2 block concats `[s0, s1, bottleneck outs] -> 1x1 cv2`, 3 inner `(Add, Conv) -> Conv`, 1 PSA `(Split, Add) -> Conv`, 1 SPPF `(x, mp1, mp2, mp3) -> Conv`,
+  2 neck skips `(Resize, Conv) -> Conv`, 2 neck down-path `(Conv, Conv) -> Conv`, then the head: 3 `(box 64, cls 80) -> Reshape`, 1 over scales, 2 decode. 17 of them feed exactly one 1x1 Conv.
+- 11 Split: 9 are the `cv1 Conv+SiLU -> Split(2 halves)` of the C2f blocks, 1 is the PSA qkv split, 1 the head `(64, 80)` split.
+- 16 Transposes in ORT's NHWC graph (~21.5 MB of tensors): 4 sit around the 2 nearest-neighbour Resizes (which have no NHWC kernel: `Conv -> T -> Resize -> Concat -> T -> Conv`,
+  moving 0.4 + 0.8 + 2.5 + 6.6 MB), 3 are the head's Concat -> Reshape, the rest are in the PSA attention and the DFL.
+
+**Cost of the ops** (wall clock, chains of Split->Concat pairs at the model's real shapes, slope between 2 and 40 pairs; NCHW as in the model):
+a pair costs 0.78 ms at 3.3 MB, 0.63 at 1.6 MB, 0.38 at 0.8 MB, 0.21 at 0.4 MB, 0.85 at 4.8 MB (8-23 GB/s moved), i.e. ~0.1-0.4 ms per Concat or Split.
+Summed over the model's actual tensor sizes: **23 Concats ~5.4 ms (YOLO26n 5.0), 11 Splits ~2.4 ms (2.1)**, together ~11% of the 72 ms. An in-situ upper bound for removing the 17 Concat->1x1 Conv
+(feeding each Conv from its first input only, i.e. also cheaper Convs; wrong output, timing only): YOLO11n 72.3 -> 63.6 ms, YOLO26n 63.7 -> 55.7 ms. Transposes: a Transpose pair
+in ORT is cancelled by the optimizer so it cannot be chained; at the layout study's 10-17 GB/s the 16 cost ~2.5-4.5 ms (estimate, not measured in situ).
+(A first in-situ probe that kept the Concat alive through a ReduceMean to an extra graph output was invalid: the 17 ReduceMeans + readbacks added 20 ms.)
+
+**Exact rewrites** (`python yolo_graph_opt.py in.onnx out.onnx --rules ...`, outputs identical to <= 1.5e-6 relative on a photo, fp32 reassociation only):
+- `split_conv`: `Conv+SiLU -> Split(2)` => two Convs on the halves of the weights. Removes 9 Splits, adds 9 Convs: **no gain** (YOLO11n 72.6 vs 72.3 ms, YOLO26n 63.3 vs 63.1): the extra Conv dispatch costs what the Split did.
+- `head` (YOLO11n only; YOLO26n's head is already split): Reshape box and cls separately and Concat over scales per branch => 3 Concat + 1 Split fewer: **-0.8 ms** (71.5 vs 72.3).
+- `resize_convt`: nearest 2x Resize => depthwise ConvTranspose(kernel 2, stride 2, ones), which has an NHWC kernel, so ORT's 4 Transposes around the Resizes disappear: **-2.4 ms (-3.3%)** on YOLO11n
+  (72.3 -> 69.9); no change on YOLO26n (63.2 vs 63.1), whose Resize neighbours are different.
+- `concat_conv`: Concat -> 1x1 Conv => sum of per-input partial Convs chained with Add (ORT's Conv+Add fusion folds the sums in): fewer copies but more Conv dispatches; **-1.6 ms on YOLO11n alone (70.7 vs 72.3) and -1.0 on YOLO26n alone (62.1 vs 63.1), but not additive** with the others (YOLO11n 70.0 with all four rules vs 69.1 without it).
+
+Default rule set `split_conv,head,resize_convt`, 6 interleaved rounds, medians (min): **YOLO11n 72.1 (70.3) -> 69.4 (68.2) ms, -3.7%; YOLO26n 63.6 (63.0) -> 63.0 (62.8), within noise**; run-to-run noise on the phone is about +-0.7 ms.
+So graph rewrites recover only a quarter of the ~8 ms the Concats and Splits cost; getting the rest needs the producer kernels to write straight into their slice of the Concat output (and the consumer Conv to read a channel-offset
+view for Split), i.e. strided/offset input and output support in the WebGPU Conv/MatMul programs.
