@@ -1210,3 +1210,43 @@ into their Concat slice or consumers reading channel-offset views.
 ## Texture direct conv: per-shape tile table and the 1x1 case
 `ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..."` overrides the tile per conv shape, `ORT_WEBGPU_TEXDIRECT_LOG=1` prints the shapes the path takes, and `ORT_WEBGPU_CONV_TEXDIRECT=2` also routes 1x1 stride-1 convs
 through it (before they reach the MatMul path). With the default tile, mode 2 is neutral to slightly negative (YOLO11n 66.8 -> 67.9/69.1 ms at MAXC 64, ResNet-50 57.0 -> 57.9 at MAXC 256, 60.5-60.8 at 2048); per-shape results are in the tuning section if the tuning job has finished.
+
+## Tile tuning of the texture-weight direct conv on the real network (stride-2 tile + larger MAXC: YOLO26n -12%, YOLO11n -9%)
+
+Scripts, tables and raw logs: `webgpu_ops/texdirect_tune/` (`tune.py` per-shape ABAB search, `tune_class.py` class-wise search, `validate.py` interleaved whole-setting comparison,
+`accuracy.py`). Everything runs against the already-built library through its env controls (no ORT rebuild): `ORT_WEBGPU_CONV_TEXDIRECT`, `ORT_WEBGPU_TEXDIRECT_MAXC`,
+`ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..."`.
+
+**Per-layer search does not work end to end.** Timing one layer's tile change in a 70 ms model has a noise floor of ~0.5 ms (the same tile read -0.3..+0.5 ms in different pairs) and
+a layer's whole contribution is 0.2-1 ms, so a single-shape search (ABAB, 14 timed runs, 12 candidates, 1 shape: 2.5 min each) found nothing. Grouping the shapes of a model by (kernel, stride, output width)
+and changing a whole class at once gave a usable signal (candidate accepted only if it beat the default by >0.3 ms in both ABAB pairs):
+
+| class (model) | default 2,2,32x2,pixels-fast | best | gain |
+|---|---|---|---|
+| all stride-1 3x3 classes (YOLO11n w40/80/160, YOLO26n w40/80/160) | already best | -- | 0 |
+| stride-1 3x3 w20 (YOLO26n, 16->16) | | 4,2,32,2,1 | 1.0 ms (single layer; not confirmed) |
+| stride-2 3x3, w40 (YOLO11n and YOLO26n, 64->64 and 128->128) | | 2,2,16,8,1 | 0.9 / 0.9 / 1.7 ms |
+| stride-2 3x3, w80 / w20 (YOLO11n, up to 256 ch) | | 2,2,16,8,1 | 1.2 / 1.1 ms |
+| stride-1 1x1 (mode 2) w40, w160 (YOLO11n) | | 2,1,16,4,1 / 2,1,32,2,1 | 0.8 / 0.7 ms |
+
+The one reproducible rule: **every stride-2 3x3 conv wants a 16x8 workgroup (2 pixels x 2 vec4 channels, pixels along x)**; the stride-1 default (32x2) is already the best. The remaining acceptances are
+within the noise (one ms-scale gain per class, nothing on the neighbouring tile variants).
+
+**Whole-setting validation** (interleaved rounds, 4 x median of 14 runs after warm-up; spread between rounds <= 0.5 ms; "+s2" = stride-2 convs use 2,2,16,8,1):
+
+| setting | YOLO11n | YOLO26n | ResNet-50 | SAM-L0 enc | RT-DETR pre |
+|---|---|---|---|---|---|
+| baseline (`TEXDIRECT=0`) | 71.5 | 62.8 | 56.2 | 367.7 | 338.0 |
+| mode 1, MAXC 64 (previous default of the opt-in) | 68.5 | 58.4 | 56.2 | 365.2 | 341.0 |
+| mode 1, MAXC 64 + s2 | 67.2 | 57.4 | -- | -- | -- |
+| mode 1, MAXC 256 + s2 | 66.0 | 55.1 | -- | 365.3 | 338.0 |
+| **mode 1, MAXC 512 + s2** | **65.3 (-8.6%)** | **55.0 (-12.4%)** | **54.9 (-2.3%)** | **357.3 (-2.8%)** | 335.9 (-0.6%) |
+| mode 2 (1x1 too), MAXC 128 + s2 + 1x1 tiles | 66.4 | 55.0 | -- | -- | -- |
+
+Findings: (1) raising MAXC from 64 to 512 is what pays (the 128-256-channel stride-2 convs, which otherwise fall back to Conv2dMM), but only together with the 16x8 tile -- with the
+default tile MAXC 256 was neutral on ResNet/SAM and -4% on RT-DETR; (2) the 1x1 stride-1 texture path (mode 2) is not better than mode 1 + s2 (it loses 1.1 ms on YOLO11n, ties on YOLO26n);
+(3) the gain is largest for the YOLO models, which have many stride-2 downsampling convs.
+
+**Recommended setting**: `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=512` with the stride-2 tile 2,2,16,8,1 as the built-in default for `stride > 1` (until the source default is changed, pass it through the table
+string built by `validate.py: stride2_table`). Accuracy vs the CPU EP (max relative difference of the outputs; weights rounded to f16): YOLO11n 3.1e-3 (stock WebGPU 2.2e-6), YOLO26n 2.1e-3 (9.3e-7), ResNet-50 1.8e-4 (8.1e-7).
+Not tuned (time): the 1x1 stride-2 convs of ResNet-50 and the `nv`/`tm` axes for MAXC > 64 beyond one class each.

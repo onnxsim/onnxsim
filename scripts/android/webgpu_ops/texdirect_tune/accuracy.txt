@@ -1,0 +1,6 @@
+yolo11n stock ORT WebGPU max rel diff vs CPU: 2.24e-06
+yolo11n texdirect m1c512+s2 max rel diff vs CPU: 3.12e-03
+yolo26n stock ORT WebGPU max rel diff vs CPU: 9.30e-07
+yolo26n texdirect m1c512+s2 max rel diff vs CPU: 2.10e-03
+resnet50 stock ORT WebGPU max rel diff vs CPU: 8.06e-07
+resnet50 texdirect m1c512+s2 max rel diff vs CPU: 1.76e-04

@@ -14,8 +14,10 @@ MODELS = {
     "yolo11n": ("m/yolo11n.onnx", "enableInt64=1"),
     "yolo26n": ("m/yolo26n.onnx", "enableInt64=1"),
     "resnet50": ("m/resnet50.onnx", "shape=pixel_values:1,3,224,224"),
+    "rtdetr_pre": ("m/rtdetr_pre.onnx", "enableInt64=1"),
+    "sam_l0_enc": ("m/sam_l0_enc.onnx", ""),
 }
-WARM0 = {"yolo11n": 80, "yolo26n": 90, "resnet50": 90}
+WARM0 = {"yolo11n": 80, "yolo26n": 90, "resnet50": 90, "rtdetr_pre": 18, "sam_l0_enc": 15}
 ITERS = 14
 
 
