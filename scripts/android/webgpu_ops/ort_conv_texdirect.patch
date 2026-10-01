@@ -58,7 +58,7 @@ index becc205..8902c53 100644
  };
  
 diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
-index 5deb1e8..9352eab 100644
+index 5deb1e8..329a9fc 100644
 --- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 +++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
 @@ -1,5 +1,6 @@
@@ -68,7 +68,7 @@ index 5deb1e8..9352eab 100644
  #include <cstdlib>
  #include <string>
  #include <vector>
-@@ -730,3 +731,180 @@ Status ConvResidualAddProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -730,3 +731,187 @@ Status ConvResidualAddProgram::GenerateShaderCode(ShaderHelper& shader) const {
  
  }  // namespace webgpu
  }  // namespace onnxruntime
@@ -158,7 +158,7 @@ index 5deb1e8..9352eab 100644
 +  if ((one && (mode < 2 || !one_by_one_ok))) return Status::OK();
 +  const int64_t cin = ks[2], cout = ks[3];
 +  if (cin % 4 != 0 || cout % 4 != 0 || cin != is[3] || os[3] != cout) return Status::OK();
-+  static const int64_t max_c = env("ORT_WEBGPU_TEXDIRECT_MAXC", 64);
++  static const int64_t max_c = env("ORT_WEBGPU_TEXDIRECT_MAXC", 512);
 +  if (std::max(cin, cout) > max_c) return Status::OK();
 +  const int64_t rows = ks[0] * ks[1] * cin;
 +  if (rows > 8192 || cout / 4 > 8192) return Status::OK();
@@ -167,6 +167,13 @@ index 5deb1e8..9352eab 100644
 +  // optional per-shape tile table: ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..." (first match wins)
 +  uint32_t tm = tm_def, nv = nv_def, wx = wx_def, wy = wy_def;
 +  bool pixels_fast = pixels_fast_def;
++  if (strides[0] == 2 && strides[1] == 2 && std::getenv("ORT_WEBGPU_TEXDIRECT_TM") == nullptr) {
++    // tuned on YOLO11n/26n/ResNet-50: every stride-2 class prefers a 16x8 workgroup
++    tm = 2;
++    nv = 2;
++    wx = 16;
++    wy = 8;
++  }
 +  {
 +    static const std::string table = [] { const char* e = std::getenv("ORT_WEBGPU_TEXDIRECT_TABLE"); return std::string(e ? e : ""); }();
 +    if (!table.empty()) {

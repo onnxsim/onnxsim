@@ -1250,3 +1250,7 @@ default tile MAXC 256 was neutral on ResNet/SAM and -4% on RT-DETR; (2) the 1x1 
 **Recommended setting**: `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=512` with the stride-2 tile 2,2,16,8,1 as the built-in default for `stride > 1` (until the source default is changed, pass it through the table
 string built by `validate.py: stride2_table`). Accuracy vs the CPU EP (max relative difference of the outputs; weights rounded to f16): YOLO11n 3.1e-3 (stock WebGPU 2.2e-6), YOLO26n 2.1e-3 (9.3e-7), ResNet-50 1.8e-4 (8.1e-7).
 Not tuned (time): the 1x1 stride-2 convs of ResNet-50 and the `nv`/`tm` axes for MAXC > 64 beyond one class each.
+
+### Texture direct conv: tuned defaults (from the class-wise tuning above)
+`ort_conv_texdirect.patch` now defaults `ORT_WEBGPU_TEXDIRECT_MAXC` to 512 and uses the 16x8 workgroup (`2,2,16,8,1`) for every stride-2 conv (override with the table or `ORT_WEBGPU_TEXDIRECT_TM`); the mode stays opt-in (`ORT_WEBGPU_CONV_TEXDIRECT=1`) because the
+weights are rounded to f16. Phone medians in a final session (two runs, off -> on): YOLO26n 62.4/61.3 -> **57.8/54.2 ms**, YOLO11n 69.0/71.4 -> 71.1/65.9 (noisy; the tuning job measured 71.5 -> 65.3), ResNet-50 57.4/57.1 -> **55.9/56.5**, SAM-L0 encoder 365.7/367.4 -> **357.7/358.0**, RT-DETR pre unchanged (334/337 -> 337/336).
