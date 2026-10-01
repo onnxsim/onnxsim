@@ -940,3 +940,20 @@ applies to fp32 tensors, so fp16 graphs take ORT's stock fp16 paths), >= 5 s war
   directly by the GEMM).
 - Recommendation: keep fp32 as the default. fp16 graphs are a 10-17% win for ResNet/YOLO-style convnets but need a per-model accuracy check and are broken on
   SAM/RT-DETR until the f16 kernels accumulate in f32.
+
+## f32 accumulation in ORT's fp16 MatMul/Conv2dMM: does not fix the SAM / RT-DETR NaNs (opt-in, `ORT_WEBGPU_F16_ACC32=1`)
+
+The fp16-graph run above suspected that ORT's fp16 1x1 conv accumulates in f16. `webgpu_ops/ort_f16_f32_accumulate.patch` (apply before
+`ort_conv_winograd.patch`, which calls the new `f32_accumulate` argument) makes the vec4 packed MatMul/Conv2dMM accumulators f32 for fp16 inputs
+(non-transposed, alpha 1, no split-K). Result on the fp16 graphs (phone medians; error vs the CPU EP):
+
+| model | f16 accumulate | f32 accumulate |
+|---|---|---|
+| ResNet-50 | 58.0 ms, 9.8e-3 | 60.3 ms, 8.3e-3 |
+| YOLO11n | 60.7 ms, 1.4e-2 | 65.0 ms, 1.1e-2 |
+| SAM-L0 encoder | 355 ms, NaN | 405 ms, NaN |
+| RT-DETR pre | 322 ms, NaN | 368 ms, NaN |
+
+So accumulation precision is not the cause of the NaNs; f32 accumulation costs 4-14% and buys little accuracy, hence opt-in. The NaN source in SAM/RT-DETR is still
+open (first NaN is at the third-stage MLP Gelu, where values reach ~500; the tanh-Gelu's x^3 overflows f16 above |x| ~ 40, and other f16 intermediates in the
+attention blocks may overflow too -- not isolated).
