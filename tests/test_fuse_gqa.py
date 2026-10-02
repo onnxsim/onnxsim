@@ -22,6 +22,7 @@ import pytest
 from onnx import parser
 
 import onnxsim
+from onnxsim import model_checking
 
 # A bare ``import onnxruntime`` would fail collection (not skip the test) on
 # platforms onnxruntime doesn't ship wheels for; the fused output is a
@@ -39,11 +40,13 @@ def _i64(array, name):
 
 def _causal_mask(seq_len):
     mask = np.zeros((1, 1, seq_len, seq_len), dtype=np.float32)
-    mask[0, 0][np.triu_indices(seq_len, k=1)] = -3.0e38
+    mask[0, 0][np.triu_indices(seq_len, k=1)] = -np.inf
     return mask
 
 
-def _gqa_model(B=2, S=6, NH=8, NKV=2, Dh=16, mask=None, mask_is_input=False):
+def _gqa_model(
+    B=2, S=6, NH=8, NKV=2, Dh=16, mask=None, mask_is_input=False, scale=None
+):
     # Builds Y = Linear(ctx) where ctx is a causal GQA/MQA self-attention
     # context: separate Q/K/V nn.Linear-style (bias-free) projections,
     # head-split, K/V's repeat_kv broadcast up to Q's head count, scaled
@@ -64,9 +67,12 @@ def _gqa_model(B=2, S=6, NH=8, NKV=2, Dh=16, mask=None, mask_is_input=False):
         _i64([2], "unsq_axes"),
         _i64([B, NKV, n_rep, S, Dh], "expand_shape"),
         _i64([B, NH, S, Dh], "merge_shape"),
-        _f32(np.array(float(Dh) ** 0.5), "sqrt_dh"),
         _i64([B, S, H], "shape_ctx"),
     ]
+    if scale is None:
+        inits.append(_f32(np.array(float(Dh) ** 0.5), "sqrt_dh"))
+    else:
+        inits.append(_f32(np.array(scale), "score_scale"))
 
     def repeat_kv_body(raw_name, prefix):
         return f"""
@@ -89,8 +95,12 @@ def _gqa_model(B=2, S=6, NH=8, NKV=2, Dh=16, mask=None, mask_is_input=False):
     v_raw = Transpose<perm = [0, 2, 1, 3]>(v_r)
     {repeat_kv_body("v_raw", "v")}
     qk = MatMul(q_t, k_t)
-    scores = Div(qk, sqrt_dh)
     """
+    body += (
+        "scores = Div(qk, sqrt_dh)\n"
+        if scale is None
+        else "scores = Mul(qk, score_scale)\n"
+    )
 
     inputs = [f"float[{B},{S},{H}] x"]
     if mask is None:
@@ -187,6 +197,26 @@ def test_fuse_gqa_multi_query():
     _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
 
 
+def test_fuse_gqa_declines_zero_scale():
+    B, S, NH, NKV, Dh = 2, 5, 4, 1, 8
+    model = _gqa_model(
+        B=B,
+        S=S,
+        NH=NH,
+        NKV=NKV,
+        Dh=Dh,
+        mask=_causal_mask(S),
+        scale=0.0,
+    )
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    assert _op_counts(simplified)["GroupQueryAttention"] == 0
+    x = np.random.default_rng(8).standard_normal((B, S, NH * Dh)).astype(np.float32)
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"x": x}, verbose=False
+    )
+
+
 def test_fuse_gqa_declines_without_mask():
     # Bidirectional (no additive mask at all): GroupQueryAttention always
     # applies causal masking internally with no way to disable it, so this
@@ -216,6 +246,20 @@ def test_fuse_gqa_declines_non_causal_mask():
     rng = np.random.default_rng(2)
     x = rng.standard_normal((B, S, NH * Dh)).astype(np.float32)
     _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
+
+
+def test_fuse_gqa_declines_finite_causal_penalty():
+    B, S, NH, NKV, Dh = 2, 5, 4, 1, 8
+    mask = _causal_mask(S)
+    mask[np.isneginf(mask)] = -1e30
+    model = _gqa_model(B=B, S=S, NH=NH, NKV=NKV, Dh=Dh, mask=mask)
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    assert _op_counts(simplified)["GroupQueryAttention"] == 0
+    x = np.random.default_rng(9).standard_normal((B, S, NH * Dh)).astype(np.float32)
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"x": x}, verbose=False
+    )
 
 
 def test_fuse_gqa_declines_runtime_mask():

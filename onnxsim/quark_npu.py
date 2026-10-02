@@ -657,7 +657,19 @@ def simulate_dpu(
     shapes: Optional[Dict[str, List[int]]] = None
     if on("ConvertAvgPoolToDPUVersion") or on("ConvertReduceMeanToDPUVersion"):
         try:
-            inferred = onnx.shape_inference.infer_shapes(model)
+            probe = model
+            for o in model.opset_import:
+                if o.domain in ("", "ai.onnx") and o.version < 10:
+                    # (the graph already holds Q/DQ nodes, which are opset 10 ops
+                    # and would stop shape inference below that; the shapes of
+                    # the float ops do not depend on it)
+                    probe = onnx.ModelProto()
+                    probe.CopyFrom(model)
+                    for po in probe.opset_import:
+                        if po.domain in ("", "ai.onnx"):
+                            po.version = 10
+                    break
+            inferred = onnx.shape_inference.infer_shapes(probe)
             shapes = {
                 vi.name: [d.dim_value for d in vi.type.tensor_type.shape.dim]
                 # (Quark looks shapes up in ``value_info`` alone: a graph input

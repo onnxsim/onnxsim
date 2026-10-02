@@ -340,8 +340,33 @@ inline bool MatchRopeApply(Node* n, RopeMatch& m) {
 // fuse pass' own orphaned nodes can otherwise survive in the "simplified"
 // output for an extra iteration, or indefinitely if nothing else in the
 // default pass set happens to fire that round.
-inline void MaybeAppendSharedChain(const RopeMatch& m,
+inline bool IsGraphOutput(const Graph& graph, const Value* value) {
+  for (const Value* output : graph.outputs()) {
+    if (output == value) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool NodeHasGraphOutput(const Graph& graph, const Node* node) {
+  for (const Value* output : node->outputs()) {
+    if (IsGraphOutput(graph, output)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline void MaybeAppendSharedChain(const Graph& graph, const RopeMatch& m,
                                    std::vector<Node*>& dead_chain) {
+  if (NodeHasGraphOutput(graph, m.cos_unsq) ||
+      NodeHasGraphOutput(graph, m.sin_unsq) ||
+      NodeHasGraphOutput(graph, m.cos_n) ||
+      NodeHasGraphOutput(graph, m.sin_n) ||
+      NodeHasGraphOutput(graph, m.concat_n)) {
+    return;
+  }
   Value* cos_bcast = m.cos_unsq->output();
   Value* sin_bcast = m.sin_unsq->output();
   auto sole_use_is = [](Value* v, Node* only_user) {
@@ -387,7 +412,12 @@ struct FuseRope final : public PredicateBasedPass {
       return false;
     }
     ONNX_ASSERT(!m.dead_chain.empty());
-    MaybeAppendSharedChain(m, m.dead_chain);
+    for (const Node* dead : m.dead_chain) {
+      if (NodeHasGraphOutput(graph, dead)) {
+        return false;
+      }
+    }
+    MaybeAppendSharedChain(graph, m, m.dead_chain);
 
     Node* cos_half = graph.create(Symbol("Cos"), 1);
     cos_half->addInput(m.angle);

@@ -112,6 +112,11 @@ struct FuseReshapeFamily final : public PredicateBasedPass {
     // fuse_consecutive_reshapes.h's file comment for the full rationale.
     const bool has_zero = std::any_of(shape.begin(), shape.end(),
                                       [](int64_t d) { return d == 0; });
+    if (has_zero && seen_unknown) {
+      // allowzero=1 makes a literal zero mean zero, but ONNX forbids using
+      // that spelling together with Reshape's inferred-dimension sentinel.
+      return false;
+    }
     if (has_zero && getOpsetVersion(graph) < 14) {
       return false;
     }

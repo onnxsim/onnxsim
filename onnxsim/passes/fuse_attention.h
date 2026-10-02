@@ -245,6 +245,12 @@ inline bool MatchScaledQKMatMul(Value* scores, Value*& q_side, Value*& k_side,
     }
   }
   if (qk != nullptr) {
+    // ORT's fused Attention/GQA operators reserve an attribute value of zero
+    // for their default 1/sqrt(head_size) scale. It cannot encode a source
+    // computation whose effective multiplier rounds to float zero.
+    if (static_cast<float>(scale) == 0.0f) {
+      return false;
+    }
     if (qk->uses().size() != 1 || !CheckKind(qk, kMatMul)) {
       return false;
     }
@@ -293,6 +299,10 @@ inline bool MatchScaledQKMatMul(Value* scores, Value*& q_side, Value*& k_side,
       1e-6 * std::max(std::fabs(c[0]), std::fabs(c[1]))) {
     return false;
   }
+  const double combined_scale = c[0] * c[1];
+  if (static_cast<float>(combined_scale) == 0.0f) {
+    return false;
+  }
   // scores_node (the qk MatMul) consumes both muls' outputs: destroy it
   // first, then its two (now-unused) producers.
   dead_chain.push_back(scores_node);
@@ -300,7 +310,7 @@ inline bool MatchScaledQKMatMul(Value* scores, Value*& q_side, Value*& k_side,
   dead_chain.push_back(muls[1]);
   q_side = operand[0];
   k_side = operand[1];
-  scale = c[0] * c[1];
+  scale = combined_scale;
   return true;
 }
 

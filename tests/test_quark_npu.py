@@ -646,7 +646,7 @@ def test_reduce_range_keeps_weights_to_the_reduced_grid():
     a = {t.name: numpy_helper.to_array(t) for t in full.graph.initializer}
     b = {t.name: numpy_helper.to_array(t) for t in reduced.graph.initializer}
     scales = [k for k in a if k.endswith("/scale") and a[k].size == 1]
-    ratios = {round(float(b[k] / a[k]), 3) for k in scales}
+    ratios = {round((b[k] / a[k]).item(), 3) for k in scales}
     assert ratios == {1.0, round(127 / 64, 3)}
 
 

@@ -236,6 +236,22 @@ def _hard_sigmoid_ok(node: onnx.NodeProto) -> bool:
     return bool(alpha and beta)
 
 
+def opset_unquantized_ops(model: onnx.ModelProto) -> "frozenset[str]":
+    """Op types ONNX Runtime's QDQ operator quantizers (which Quark's registries
+    reuse) leave alone for the model's default-domain opset: ``MaxPool`` below
+    opset 12 (int8 / uint8 ``MaxPool`` arrived with opset 12) and ``Resize`` below
+    opset 11 (``QDQMaxPool`` / ``QDQResize`` just return)."""
+    opset = next(
+        (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")), 0
+    )
+    out = set()
+    if opset < 12:
+        out.add("MaxPool")
+    if opset < 11:
+        out.add("Resize")
+    return frozenset(out)
+
+
 def skipped_nodes(
     model: onnx.ModelProto,
     op_types: "Optional[Iterable[str]]",
@@ -243,6 +259,7 @@ def skipped_nodes(
     force_no_input_check: bool = True,
     direct_pool: bool = False,
     order: Optional[Sequence[onnx.NodeProto]] = None,
+    unquantized_ops: Iterable[str] = (),
 ) -> Set[str]:
     """Names (first outputs, for unnamed nodes) of the nodes in ``op_types`` whose
     Quark op quantizer marks nothing, visiting the nodes in ``order`` (default:
@@ -254,11 +271,15 @@ def skipped_nodes(
       scheme) whose input is unmarked, unless ``force_no_input_check``; likewise a
       ``Gather`` and a ``Where``;
     - a ``LayerNormalization`` whose input is unmarked, unless ``force_no_input_check``;
-    - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5``.
+    - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5``;
+    - any node whose op type is in ``unquantized_ops`` (ONNX Runtime's
+      ``QDQMaxPool`` / ``QDQResize`` return without marking anything below opset
+      12 / 11: see :func:`opset_unquantized_ops`).
 
     Everything else marks its inputs and outputs."""
     types = None if op_types is None else set(op_types)
     excl = set(excluded)
+    unquantized = set(unquantized_ops)
     inits = {t.name for t in model.graph.initializer}
     nodes = list(order) if order is not None else quark_node_order(model)
     direct = set(_DIRECT_OPS) | {"Resize", "MaxPool"}
@@ -282,6 +303,9 @@ def skipped_nodes(
         if types is not None and n.op_type not in types:
             continue
         if n.name in excl or (n.output and n.output[0] in excl):
+            continue
+        if n.op_type in unquantized:
+            skipped.add(key(n))
             continue
         ins = [x for x in n.input if x]
         outs = [x for x in n.output if x]
@@ -339,5 +363,6 @@ __all__: Any = [
     "quark_qdq_sorted",
     "quark_sort_inplace",
     "quark_sorted",
+    "opset_unquantized_ops",
     "skipped_nodes",
 ]

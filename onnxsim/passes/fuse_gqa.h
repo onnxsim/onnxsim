@@ -172,7 +172,7 @@ inline bool MatchRepeatKV(Value* wrapped, Value*& raw, int64_t& n_rep,
 // Verifies `mask` is a *constant* float32 tensor of shape [1, 1, seq_len,
 // seq_len] matching the standard additive causal pattern exactly: 0.0 on
 // and below the diagonal (position j can attend to position i for j <= i),
-// a very large negative value strictly above it. `GroupQueryAttention`
+// negative infinity strictly above it. `GroupQueryAttention`
 // already applies exactly this masking internally and unconditionally (see
 // this file's top comment), so a real causal mask is redundant to pass
 // through explicitly -- but *some* mask must be present and provably
@@ -193,7 +193,6 @@ inline bool VerifyCausalMaskConstant(Value* mask, int64_t seq_len) {
   if (static_cast<int64_t>(data.size()) != seq_len * seq_len) {
     return false;
   }
-  constexpr float kMaskedThreshold = -1e30f;
   for (int64_t i = 0; i < seq_len; ++i) {
     for (int64_t j = 0; j < seq_len; ++j) {
       const float v = data[static_cast<size_t>(i * seq_len + j)];
@@ -201,7 +200,7 @@ inline bool VerifyCausalMaskConstant(Value* mask, int64_t seq_len) {
         if (v != 0.0f) {
           return false;
         }
-      } else if (v > kMaskedThreshold) {
+      } else if (!std::isinf(v) || v >= 0.0f) {
         return false;
       }
     }
