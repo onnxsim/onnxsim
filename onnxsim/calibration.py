@@ -1112,15 +1112,14 @@ def collect_calibration_stats(
     # Pass 1: exact running (min, max) -- all "minmax" needs, and the fixed
     # histogram range for the others.
     ranges = stats.observed
-    sums: Dict[str, List[float]] = {}  # name -> [sum min, sum max, batches]
+    per_batch: Dict[str, Tuple[List, List]] = {}  # name -> (batch mins, batch maxes)
     for batch in calibration_data:
         for name, arr in outputs_of(batch):
             batch_min = float(arr.min())
             batch_max = float(arr.max())
-            acc = sums.setdefault(name, [0.0, 0.0, 0.0])
-            acc[0] += batch_min
-            acc[1] += batch_max
-            acc[2] += 1
+            lists = per_batch.setdefault(name, ([], []))
+            lists[0].append(arr.min())
+            lists[1].append(arr.max())
             if pof2_histograms:
                 stats.pof2_histograms.setdefault(name, _Pof2Histogram()).add(arr)
             if quark_hist is not None:
@@ -1134,7 +1133,12 @@ def collect_calibration_stats(
                 ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
             else:
                 ranges[name] = (batch_min, batch_max)
-    stats.mean_observed = {n: (a / c, b / c) for n, (a, b, c) in sums.items()}
+    # (the mean of the per-batch extremes, in the tensor's own precision like
+    # ONNX Runtime's ``np.nanmean`` over its batches)
+    stats.mean_observed = {
+        n: (float(np.nanmean(np.array(lo))), float(np.nanmean(np.array(hi))))
+        for n, (lo, hi) in per_batch.items()
+    }
     if not histograms:
         return stats
 
