@@ -3,10 +3,13 @@ MatMul template from scales alone must reproduce a native Pulsar2 build at
 the target calibration, record for record and npu_params byte for byte, and
 must refuse what it cannot explain."""
 
+import gzip
+import json
 import os
 import struct
 import sys
 
+import onnx
 import pytest
 
 _AXERA = os.path.join(
@@ -18,6 +21,7 @@ if _AXERA not in sys.path:
 import matmul_record_emit as mre  # noqa: E402
 import short_unit_codec as codec  # noqa: E402
 import step_recalibrate as sr  # noqa: E402
+import u16_chain  # noqa: E402
 
 FIX = os.path.join(_AXERA, "fixtures")
 HERE = os.path.join(FIX, "matmul_record_emit")
@@ -291,3 +295,30 @@ def test_u16_conv3x3_chain_recalibrates_to_the_native_build(src, dst):
 def test_u16_conv3x3_chain_refuses_a_zero_point_layout_change():
     with pytest.raises(mre.CalibrationError, match="zero point goes between"):
         mre.recalibrate(CONV3X3["v0"][0], CONV3X3["v0"][1], CONV3X3["v2"][1])
+
+
+def test_derive_ranges_gives_every_member_of_a_measured_group_its_range():
+    """A measured tensor sets the range of every tensor Pulsar2 groups with it (a
+    Pad, Transpose or Slice passes the same values on), so the scales predicted for
+    the group move together and by the measured factor."""
+    quant = os.path.join(HERE, "u16conv3x3_v0.quant.json.gz")
+    q = json.loads(gzip.open(quant).read())
+    scales = CONV3X3["v0"][1]
+    sub = onnx.ModelProto()  # no nodes: only the grouping is exercised
+    act = next(t for t in scales if t.endswith("stage1_activation1"))
+    group = [t for t in scales if scales[t] == scales[act]]
+    assert len(group) > 3  # the activation, its Pad/Transpose/Slice outputs
+    lo, hi = (
+        -2.0 * 32767.5 * scales[act][0],
+        2.0 * 32767.5 * scales[act][0],
+    )  # 2x its range
+    derived = u16_chain.derive_ranges(sub, q, scales, {act: (lo, hi)})
+    assert all(derived[t] == (lo, hi) for t in group)
+    pred = u16_chain.predict_scales16(q, derived)
+    for t in group:
+        assert pred[t][0] == pytest.approx(2.0 * scales[t][0], rel=1e-6)
+    # a group with no measured member keeps its template scale
+    rest = [t for t in scales if scales[t] != scales[act] and t in pred]
+    assert rest and all(
+        pred[t][0] == pytest.approx(scales[t][0], rel=1e-6) for t in rest
+    )
