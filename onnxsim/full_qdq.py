@@ -352,8 +352,12 @@ def _is_quantized_node(
     exclude_op_types: set,
     exclude_nodes: set,
     skip_nodes: Optional[set] = None,
+    contrib_ops: Optional[set] = None,
 ) -> bool:
-    if n.domain not in ("", "ai.onnx") or n.op_type in _NEVER_QUANTIZED:
+    if (
+        n.domain not in ("", "ai.onnx")
+        and not (n.domain == "com.microsoft" and n.op_type in (contrib_ops or ()))
+    ) or n.op_type in _NEVER_QUANTIZED:
         return False
     if op_types is not None and n.op_type not in op_types:
         return False
@@ -447,6 +451,7 @@ def quantize_full_qdq(
     weight_symmetric: bool = True,
     shared_ops: Iterable[str] = (),
     float_clamp_input: bool = False,
+    contrib_ops: Iterable[str] = (),
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -596,6 +601,10 @@ def quantize_full_qdq(
             that is *not* itself quantized (outside ``op_types``) -- Quark's
             "remove Q/DQ between Gemm and Relu" in its NPU transformer
             scheme. (``fold_relu`` handles the quantized-Relu case.)
+    :param contrib_ops: op types whose ``com.microsoft`` version is quantized
+            like the ``ai.onnx`` one (Quark's quantizers go by op type, not by
+            domain: the contrib ``Gelu`` its fusion writes is quantized). Other
+            ``com.microsoft`` nodes are left alone, as is any node of another domain.
     :returns: the quantized ModelProto
     """
     if weight_dtype not in ("int8", "int16", "uint8"):
@@ -624,6 +633,7 @@ def quantize_full_qdq(
     op_types = set(op_types) if op_types is not None else None
     exclude_op_types, exclude_nodes = set(exclude_op_types), set(exclude_nodes)
     skip_set = set(skip_nodes)
+    contrib_set = set(contrib_ops)
 
     floats = _float_tensor_names(m)
     inits = {i.name: i for i in g.initializer}
@@ -637,7 +647,9 @@ def quantize_full_qdq(
     qnodes = [
         n
         for n in g.node
-        if _is_quantized_node(n, op_types, exclude_op_types, exclude_nodes, skip_set)
+        if _is_quantized_node(
+            n, op_types, exclude_op_types, exclude_nodes, skip_set, contrib_set
+        )
     ]
     qnode_ids = {id(n) for n in qnodes}
 
@@ -656,7 +668,7 @@ def quantize_full_qdq(
     # runs quantized, which is what an op_types list asks for everywhere else.)
     for n in g.node if excluded_nodes_stay_float else ():
         if id(n) in qnode_ids or not _is_quantized_node(
-            n, op_types, set(), set(), skip_set
+            n, op_types, set(), set(), skip_set, contrib_set
         ):
             continue
         ins = [x for x in _data_inputs(n, inits) if x in floats and x not in inits]

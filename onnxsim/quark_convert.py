@@ -608,6 +608,7 @@ def graph_cleanup(
     slim_config: Optional[Dict[str, Any]] = None,
     copy_bias_ops: Optional[Sequence[str]] = ("Conv", "ConvTranspose", "Gemm"),
     fold_bn: Optional[bool] = None,
+    fuse: Optional[Dict[str, Any]] = None,
 ) -> onnx.ModelProto:
     """What Quark's float-model optimizers (onnxslim's ``SimplifyModel`` and ONNX
     Runtime's ``OptimizeModel``, ``optimize``) do that changes what is
@@ -625,13 +626,25 @@ def graph_cleanup(
     (Quark's ``CopyBiasInit``; it does so for the min / max, entropy, percentile
     and distribution calibrations only -- not for the power-of-two ones, where a
     shared bias is quantized once, with its first reader's scales -- so the caller
-    passes ``None`` there)."""
+    passes ``None`` there).
+
+    ``fuse`` (keyword flags of :func:`onnxsim.quark_fusions.apply_fusions`:
+    ``instance_norm`` / ``l2_norm`` / ``layer_norm`` / ``gelu``) runs Quark's own
+    operator fusions after the two optimizers and before its BatchNorm folding, where
+    Quark runs them; ``None`` leaves them out. Where ONNX Runtime's basic optimizer is
+    only reproduced (not run), its LayerNormalization / Gelu fusions are reproduced
+    too, with the nodes it writes."""
+    from onnxsim.quark_fusions import apply_fusions
+
     if not runtime:
         out = remove_identity(model)
         if simplify:
             out = fuse_pad(out, pools=False, shared=True)
         if optimize:
             out = fuse_pad(out, pools=True, shared=False)
+            out = apply_fusions(out, instance_norm=False, l2_norm=False, style="ort")
+        if fuse is not None:
+            out = apply_fusions(out, **fuse)
         return fold_batch_norm(out, transposed_and_gemm=True)
     out = model
     if simplify:
@@ -651,8 +664,11 @@ def graph_cleanup(
             )
             out = fold_batch_norm(out)
             out = eliminate_duplicate_nodes(out)
+            out = apply_fusions(out, instance_norm=False, l2_norm=False, style="ort")
         else:
             out = optimized
+    if fuse is not None:
+        out = apply_fusions(out, **fuse)
     # Quark's own optimizer: BN after a ConvTranspose / Gemm, and after a Concat of
     # convolutions, when ``FoldBatchNorm`` (default: ``OptimizeModel``) is on
     if optimize if fold_bn is None else fold_bn:

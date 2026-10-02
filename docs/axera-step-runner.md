@@ -869,3 +869,54 @@ downloading the state: device-side min/max reductions are the missing piece.
 the largest are `MatMul_471` (the stem convolution's weight gradient, FP32: 0.37 s),
 the three stage-4 forward Convs (about 0.2 s each), `Gather_457` (0.19 s) and
 `MatMul_121` (0.17 s).
+
+### Ranges measured on the device (`--train-recal device`)
+
+A long run needs per-step ranges for the 16-bit chains without downloading the state.
+What exists and is verified:
+
+- **A device min/max model** (`u16_chain.amax_model`): the NPU reduces only the last
+  axis, so a tensor of any shape is read as `[numel]`, reshaped to `[R, C]` and
+  reduced twice (`[R,1]` -> `[1,R]` -> `[1,1]`), FP32, output `[max, min]`. Exact on
+  the AX8850 for sizes from 64 to 37.7 M elements (26 ms for the largest); 38 sizes
+  cover the step's chains (`build_amax_models.py`).
+- **Measurement in the resident path** (`StepRunner._measure`, `collect_amax`): after
+  each chain runs, its inputs and output are reduced on the device and the `[1,2]`
+  results read back at the end of the step (about 250 tiny reads).
+- **`u16_chain.derive_ranges`**: the chain's other tensors from what was measured.
+  Tensors Pulsar2 groups into one quantization share the measured member's range;
+  a mean (`ReduceMean`) is bounded by its input's range; an Add's unmeasured input
+  (the MatMul output) follows the output's factor; the rest scale by the factor of the
+  tensors they depend on. **`BAKED` tensors (a gather mask) always keep their template
+  scale**: deriving one from the margin changed its scale without re-quantizing its
+  baked data and broke the dX chains (0.815 at step 1).
+- Offline `check_derive_ranges.py` and `check_delayed_derive.py` compare derived with
+  exact scales on later dataset steps.
+
+**What is not solved.** On the dataset's own states, recalibrating the chains with
+*derived* ranges (`--u16-recal derived`) is below recalibrating them with *exact*
+ranges: at margin 2.0, gradient cosine 0.980 / 0.959 / 0.922 at steps 1 / 2 / 3
+against 0.994 / 0.997 / 0.997 (exact ranges at the same margin; at margin 4.0 the
+exact-range policy still gives 0.991 / 0.995 / 0.997, so headroom is not the cause).
+In the device-driven loop over eight steps the result is 0.936 .. 0.962 at steps
+1 .. 5 (static degrades to 0.573 by step 7, exact holds 0.989 to 0.996). What was
+ruled out: the record emitter (exact against native builds at 2x, 3x and 0.5x scale
+ratios); the margin; the MatMul-output estimate (an interval bound, a factor
+estimate, and the *exact* `mm`/`m0` range each gave the same result); the derived
+code path (running the `delayed` policy on the derived policy's own blobs reproduces
+0.98355 / 0.96100 exactly, so the emitted models carry it). Swapping in the derived
+blobs for only the forward Convs reproduces the whole drop at step 1, for stages 2
+and 3 (0.992 and 0.988) and not stage 1 or 4, but no single chain explains it, and
+the blobs differ from the exact policy's by 1e-5 in scale in a few lanes (zero-point
+offsets and multiplier lanes). Perturbing every blob by 1e-4 through the margin moves
+the gradient cosine by at most 0.0003. At step 2, nine forward chains' derived
+`mm`/`m0` scale is 5 to 18% below the exact one and the dX chains' gather outputs are up
+to 2x above it.
+
+So: the on-device measurement is exact and recalibration with exact ranges holds a long
+run, but the derived ranges lose 0.01 to 0.07 of gradient cosine against exact ones for a
+reason not yet found. A fast long-run path would need either that residual understood or
+more tensors measured directly. Debug hooks left in `step_runner.py`: `RECAL_DUMP`
+(write each chain's emitted blob and applied scales), `RECAL_LOAD`/`RECAL_LOAD_ONLY`
+(run another policy's blobs for the matching chains), `DERIVED_EXACT_MM`,
+`--recal-chains`, `--train-recal-diag`.

@@ -268,9 +268,10 @@ def skipped_nodes(
 
     - a ``Relu`` / ``Clip`` whose input no earlier node marked;
     - a ``Reshape`` / ``Transpose`` / ``Squeeze`` / ``Unsqueeze`` / ``Resize`` /
-      ``MaxPool`` / ``LayerNormalization`` (and ``AveragePool`` with ``direct_pool``, ONNX Runtime's plain
+      ``MaxPool`` (and ``AveragePool`` with ``direct_pool``, ONNX Runtime's plain
       scheme) whose input is unmarked, unless ``force_no_input_check``; likewise a
       ``Gather`` and a ``Where``;
+    - a ``LayerNormalization`` whose input is unmarked, unless ``force_no_input_check``;
     - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5`` (only with
       ``npu_registry``: Quark's ``QDQHardSigmoid`` belongs to the NPU CNN registry,
       the plain quantizer marks a HardSigmoid like any other op);
@@ -284,7 +285,7 @@ def skipped_nodes(
     unquantized = set(unquantized_ops)
     inits = {t.name for t in model.graph.initializer}
     nodes = list(order) if order is not None else quark_node_order(model)
-    direct = set(_DIRECT_OPS) | {"Resize", "MaxPool", "LayerNormalization"}
+    direct = set(_DIRECT_OPS) | {"Resize", "MaxPool"}
     if direct_pool:
         direct.add("AveragePool")
     marked: Set[str] = set()
@@ -294,7 +295,10 @@ def skipped_nodes(
         return n.name or (n.output[0] if n.output else "")
 
     for n in nodes:
-        if n.domain not in ("", "ai.onnx") or n.op_type in (
+        # (Quark's quantizers go by op type: the contrib ``Gelu`` its FuseGelu
+        # writes is visited like the ai.onnx one)
+        contrib_gelu = n.domain == "com.microsoft" and n.op_type == "Gelu"
+        if (n.domain not in ("", "ai.onnx") and not contrib_gelu) or n.op_type in (
             "QuantizeLinear",
             "DequantizeLinear",
         ):
@@ -333,6 +337,13 @@ def skipped_nodes(
                 marked.update(ins[1:3] + outs)
             elif len(ins) > 2 and ins[1] in marked and ins[2] in marked:
                 marked.update(outs)
+            else:
+                skipped.add(key(n))
+        elif op == "LayerNormalization":
+            # (QDQLayerNorm: without ForceQuantizeNoInputCheck it touches nothing --
+            # scale and bias included -- unless its input is already marked)
+            if force_no_input_check or (ins and ins[0] in marked):
+                marked.update(ins + outs[:1])
             else:
                 skipped.add(key(n))
         elif op == "HardSigmoid" and npu_registry:
