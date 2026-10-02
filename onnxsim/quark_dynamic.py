@@ -13,7 +13,10 @@ become per-tensor integers, activations are quantized at run time.
 
 Weights: ``uint8`` asymmetric (Quark's default, zero point ``round(-min /
 scale)``) or ``int8`` symmetric (zero point 0). ``DynamicQuantizeLinear`` is
-uint8 asymmetric by definition. Needs opset >= 11.
+uint8 asymmetric by definition. Below opset 11 (no ``DynamicQuantizeLinear``) the
+scale and zero point are computed with ``ReduceMin`` / ``ReduceMax`` / ``Sub`` /
+``Div`` / ``Floor`` / ``Cast`` nodes and a ``QuantizeLinear``, as ONNX Runtime's
+quantizer (and Quark) do; ``MatMulInteger`` / ``ConvInteger`` need opset 10.
 
 Independent implementation; the node pattern, naming and weight parameters
 were checked against Quark's output (``tests/test_quark_parity.py``).
@@ -34,13 +37,16 @@ def _weight_params(w: np.ndarray, weight_dtype: str):
         scale = absmax / 127.0
         q = np.clip(np.round(w / scale), -127, 127).astype(np.int8)
         return q, np.float32(scale), np.int8(0), TensorProto.INT8
-    lo, hi = min(float(w.min()), 0.0), max(float(w.max()), 0.0)
-    scale = (hi - lo) / 255.0
+    # (float32 arithmetic, as ONNX Runtime's ``compute_scale_zp`` does on float32
+    # weights: the scale differs from a float64 quotient in the last bit)
+    lo = np.float32(min(float(w.min()), 0.0))
+    hi = np.float32(max(float(w.max()), 0.0))
+    scale = np.float32((hi - lo) / np.float32(255.0))
     if not scale > 0:
-        scale = 1.0
-    zp = int(np.clip(round(-lo / scale), 0, 255))
+        scale = np.float32(1.0)
+    zp = int(np.clip(np.round(-lo / scale), 0, 255))
     q = np.clip(np.round(w / scale) + zp, 0, 255).astype(np.uint8)
-    return q, np.float32(scale), np.uint8(zp), TensorProto.UINT8
+    return q, scale, np.uint8(zp), TensorProto.UINT8
 
 
 def quantize_dynamic_integer(
@@ -61,8 +67,9 @@ def quantize_dynamic_integer(
     opset = next(
         (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")), 0
     )
-    if opset < 11:
-        raise ValueError("dynamic quantization needs opset >= 11")
+    # (below opset 11 there is no DynamicQuantizeLinear: ONNX Runtime's quantizer,
+    # and Quark's, compute the scale and zero point with ordinary operators)
+    fused = opset >= 11
     allowed = set(op_types) if op_types is not None else {"MatMul", "Conv", "Gemm"}
     skip: Set[str] = set(exclude_nodes)
 
@@ -106,17 +113,69 @@ def quantize_dynamic_integer(
             )
         return done_weights[wname]
 
+    unfused_consts: List[str] = []
+
+    def unfused_scale_and_zero_point(x: str) -> List[onnx.NodeProto]:
+        """ONNX Runtime's ``_get_dynamic_input_quantization_params_uint8``:
+        ``scale = (max - min) / 255``, ``zero_point = cast(floor((0 - min) / scale))``."""
+        if not unfused_consts:
+            unfused_consts.extend(["fixed_quantization_range_uint8", "fixed_zero"])
+            for name, value in zip(unfused_consts, (255.0, 0.0)):
+                new_inits.append(
+                    helper.make_tensor(name, TensorProto.FLOAT, [], [value])
+                )
+        scale, zero_point = x + "_scale", x + "_zero_point"
+        rmin, rmax = x + "_ReduceMin", x + "_ReduceMax"
+        scale_sub, zp_sub = x + "_scale_Sub", x + "_zero_point_Sub"
+        zp_div, zp_floor = x + "_zero_point_Div", x + "_zero_point_Floor"
+        return [
+            helper.make_node("ReduceMin", [x], [rmin + ":0"], rmin, keepdims=0),
+            helper.make_node("ReduceMax", [x], [rmax + ":0"], rmax, keepdims=0),
+            helper.make_node(
+                "Sub", [rmax + ":0", rmin + ":0"], [scale_sub + ":0"], scale_sub
+            ),
+            helper.make_node(
+                "Div",
+                [scale_sub + ":0", "fixed_quantization_range_uint8"],
+                [scale],
+                x + "_scale_Div",
+            ),
+            helper.make_node(
+                "Sub", ["fixed_zero", rmin + ":0"], [zp_sub + ":0"], zp_sub
+            ),
+            helper.make_node("Div", [zp_sub + ":0", scale], [zp_div + ":0"], zp_div),
+            helper.make_node("Floor", [zp_div + ":0"], [zp_floor + ":0"], zp_floor),
+            helper.make_node(
+                "Cast",
+                [zp_floor + ":0"],
+                [zero_point],
+                x + "_zero_point_Cast",
+                to=TensorProto.UINT8,
+            ),
+        ]
+
     def dynamic_input(x: str, cache: Dict[str, tuple]):
         if x not in cache:
             names = (x + "_quantized", x + "_scale", x + "_zero_point")
-            out_nodes.append(
-                helper.make_node(
-                    "DynamicQuantizeLinear",
-                    [x],
-                    list(names),
-                    name=x + "_QuantizeLinear",
+            if fused:
+                out_nodes.append(
+                    helper.make_node(
+                        "DynamicQuantizeLinear",
+                        [x],
+                        list(names),
+                        name=x + "_QuantizeLinear",
+                    )
                 )
-            )
+            else:
+                out_nodes.extend(unfused_scale_and_zero_point(x))
+                out_nodes.append(
+                    helper.make_node(
+                        "QuantizeLinear",
+                        [x, names[1], names[2]],
+                        [names[0]],
+                        name=x + "_QuantizeLinear",
+                    )
+                )
             cache[x] = names
         return cache[x]
 
