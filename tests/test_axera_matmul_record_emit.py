@@ -9,6 +9,7 @@ import os
 import struct
 import sys
 
+import onnx
 import pytest
 
 _AXERA = os.path.join(
@@ -20,6 +21,7 @@ if _AXERA not in sys.path:
 import matmul_record_emit as mre  # noqa: E402
 import short_unit_codec as codec  # noqa: E402
 import step_recalibrate as sr  # noqa: E402
+import u16_chain  # noqa: E402
 
 FIX = os.path.join(_AXERA, "fixtures")
 HERE = os.path.join(FIX, "matmul_record_emit")
@@ -299,10 +301,6 @@ def test_derive_ranges_gives_every_member_of_a_measured_group_its_range():
     """A measured tensor sets the range of every tensor Pulsar2 groups with it (a
     Pad, Transpose or Slice passes the same values on), so the scales predicted for
     the group move together and by the measured factor."""
-    import onnx
-
-    import u16_chain
-
     quant = os.path.join(HERE, "u16conv3x3_v0.quant.json.gz")
     q = json.loads(gzip.open(quant).read())
     scales = CONV3X3["v0"][1]
