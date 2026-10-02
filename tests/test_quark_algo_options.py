@@ -538,11 +538,11 @@ def test_amp_pinned_targets_apply_to_the_named_candidates_only():
 
 def test_amp_boundaries_are_dual_only_when_asked():
     kw = dict(targets=[("uint16", None)], include_layers=["n2_Gemm"])
-    single = {n.name for n in _amp(**kw).model.graph.node if "/as_" in n.name}
+    single = {n.name for n in _amp(**kw).model.graph.node if "_additional_" in n.name}
     dual = {
         n.name
         for n in _amp(dual_quant_nodes=True, **kw).model.graph.node
-        if "/as_" in n.name
+        if "_additional_" in n.name
     }
     assert not single and dual
 

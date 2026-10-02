@@ -368,10 +368,11 @@ def apply_fake_quant_format(
             instead of inserting a node on them
     :param fold_fn: ``f(array, axis) -> array``, the numpy fake-quantizer
     :param exclude: node names / first-output names left entirely alone
-    :param const_dtype: a block format for the *constants* (weights and biases)
-            while the activations use ``dtype`` -- Quark's ``BF16_BFP16`` /
-            ``BF16_MXINT8`` (bfloat16 activations, block-format constants).
-            Axes are refined as for that block format.
+    :param const_dtype: a block format or ``float16`` / ``bfloat16`` for the
+            *constants* (weights and biases) while the activations use ``dtype``
+            -- Quark's ``BF16_BFP16`` / ``BF16_MXINT8`` (bfloat16 activations,
+            block-format constants), or any other mix of the two kinds. Axes
+            are refined as for that block format.
     :param quantize_all_ops: for ``float16`` / ``bfloat16``: also quantize the
             wider op set of Quark's ``FP16`` / ``BF16`` presets
             (``QuantizeAllOpTypes``); False gives the block formats' op
@@ -384,7 +385,8 @@ def apply_fake_quant_format(
     if not half:
         node_spec(dtype)  # validates the block format
     if const_dtype is not None:
-        node_spec(const_dtype)
+        if const_dtype not in HALF_DTYPES:
+            node_spec(const_dtype)  # validates the block format
         if fold_weights or not activations:
             raise ValueError("const_dtype nodes cannot be combined with folding")
     m = onnx.ModelProto()
@@ -417,6 +419,10 @@ def apply_fake_quant_format(
 
     def fake_quant(t: str, src: str, dst: str) -> List[onnx.NodeProto]:
         """The node(s) quantizing tensor ``t``: ``src`` -> ``dst``."""
+        if const_dtype in HALF_DTYPES and t in plan.inits:
+            nodes, extra = _make_half_pair(const_dtype, src, dst, t)
+            g.initializer.extend(extra)
+            return nodes
         if const_dtype is not None and t in plan.inits:
             return [
                 _make_node(

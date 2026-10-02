@@ -433,10 +433,71 @@ def test_half_and_block_baselines_mix_into_integer_layers_without_calibration_da
         assert all(np.isfinite(o[0]).all() for o in out_vals)
 
 
-def test_float_and_block_mixes_refuse_dual_quant_nodes():
-    target = qc.QLayerConfig(activation=qc.BFP16Spec(), weight=qc.BFP16Spec())
-    with pytest.raises(NotImplementedError, match="dual_quant_nodes"):
-        _quantize(_amp_config(qc.UInt8Spec, qc.Int8Spec, target, dual_quant_nodes=True))
+def _extra_pairs(model):
+    return sorted(n.name for n in model.graph.node if "_additional_" in n.name)
+
+
+@pytest.mark.parametrize(
+    "target_spec",
+    [qc.BFP16Spec, qc.BFloat16Spec, qc.Float16Spec, qc.MXInt8Spec, qc.XInt8Spec],
+    ids=["bfp16", "bfloat16", "float16", "mxint8", "pof2"],
+)
+def test_dual_quant_nodes_cover_half_block_and_pof2_mixes(target_spec):
+    """Quark inserts the boundary quantizers into the *final* mixed model for
+    every kind of mix (candidates are scored without them)."""
+    target = qc.QLayerConfig(activation=target_spec(), weight=target_spec())
+    kw = dict(include_layers=["n2_Gemm"])
+    _, single = _quantize(_amp_config(qc.UInt8Spec, qc.Int8Spec, target, **kw))
+    q, dual = _quantize(
+        _amp_config(qc.UInt8Spec, qc.Int8Spec, target, dual_quant_nodes=True, **kw)
+    )
+    assert not _extra_pairs(single)
+    # t1 (into n2) and h2 (out of n2) cross the boundary
+    assert len(_extra_pairs(dual)) >= 2
+    assert q.last_auto_mixprecision.moved == ["n2_Gemm"]
+    # the model is otherwise the one without boundary nodes
+    plain = [n.op_type for n in single.graph.node]
+    kept = [n.op_type for n in dual.graph.node if "_additional_" not in n.name]
+    assert sorted(kept) == sorted(plain)
+
+
+def test_dual_quant_nodes_over_a_float_baseline():
+    target = qc.QLayerConfig(activation=qc.Int8Spec(), weight=qc.Int8Spec())
+    _, dual = _quantize(
+        _amp_config(
+            qc.BFloat16Spec,
+            qc.BFloat16Spec,
+            target,
+            include_layers=["n2_Gemm"],
+            dual_quant_nodes=True,
+        )
+    )
+    assert _extra_pairs(dual)
+
+
+def test_dual_boundary_pair_is_requantized_to_the_neighbour_precision():
+    """A tensor that goes from a uint8 producer to a uint16 consumer is first
+    quantized to uint8 again (its own calibrated range), then to uint16."""
+    target = qc.QLayerConfig(activation=qc.UInt16Spec(), weight=qc.Int8Spec())
+    _, dual = _quantize(
+        _amp_config(
+            qc.UInt8Spec,
+            qc.Int8Spec,
+            target,
+            include_layers=["n2_Gemm"],
+            dual_quant_nodes=True,
+        )
+    )
+    inits = {t.name: numpy_helper.to_array(t) for t in dual.graph.initializer}
+    extra = [
+        n
+        for n in dual.graph.node
+        if "_additional_" in n.name and n.op_type == "QuantizeLinear"
+    ]
+    assert len(extra) == 2
+    for q in extra:
+        assert inits[q.input[2]].dtype == np.uint8
+        assert inits[q.input[1]].dtype == np.float32 and inits[q.input[1]].shape == ()
 
 
 # -- scoring conventions ----------------------------------------------------------------

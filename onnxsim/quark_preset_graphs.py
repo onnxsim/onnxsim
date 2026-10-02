@@ -63,6 +63,40 @@ def apply_block_activations_int8_constants(
     """``act_dtype`` (a block format) fake-quantization on the activations,
     int8 symmetric per-tensor constants (see the module docstring).
     Quark's BatchNormalization -> Conv folding is not replicated."""
+    return apply_fake_quant_int_constants(model, act_dtype, "int8", exclude)
+
+
+_INT_WEIGHT_OPS = ("Conv", "ConvTranspose", "Gemm")
+
+
+def apply_fake_quant_int_constants(
+    model: onnx.ModelProto,
+    act_dtype: str,
+    const_dtype: str = "int8",
+    exclude: Sequence[str] = (),
+    attr_overrides: Optional[Dict[str, Dict[str, object]]] = None,
+    weight_symmetric: Optional[bool] = None,
+    int32_bias: bool = True,
+    quantize_bias: bool = True,
+) -> onnx.ModelProto:
+    """Fake-quantization in ``act_dtype`` (a block format or ``float16`` /
+    ``bfloat16``) on the activations, ``int8`` / ``uint8`` per-tensor constants
+    read through a ``com.microsoft`` ``DequantizeLinear`` (the offline-quantized
+    form Quark's integer weight path emits).
+
+    The weights take ``compute_scale_zp`` over their own range (symmetric by
+    default for int8, asymmetric for uint8). A bias is stored int32 with scale
+    ``weight scale * 1.0`` -- the half-precision activations' scale is 1.0 --
+    when ``int32_bias`` and the activations are ``float16`` / ``bfloat16``;
+    behind block-format activations (which have no scale) it is quantized like a
+    weight, from its own range. ``quantize_bias=False`` leaves biases float.
+    """
+    from onnxsim.quark_fakequant_graph import HALF_DTYPES
+    from onnxsim.quark_mixing import compute_scale_zp
+
+    if const_dtype not in ("int8", "uint8"):
+        raise ValueError("const_dtype must be int8 or uint8")
+    sym = const_dtype == "int8" if weight_symmetric is None else weight_symmetric
     plan = _Plan(model)
     work = onnx.ModelProto()
     work.CopyFrom(model)
@@ -74,33 +108,81 @@ def apply_block_activations_int8_constants(
         fold_weights=True,
         fold_fn=lambda a, ax: a,  # constants are handled below, not folded
         exclude=exclude,
+        quantize_all_ops=False,
+        attr_overrides=attr_overrides,
     )
     g = m.graph
     inits = {t.name: t for t in g.initializer}
+    half_act = act_dtype in HALF_DTYPES
+    np_dtype = np.int8 if const_dtype == "int8" else np.uint8
+    qmin, qmax = (-128, 127) if const_dtype == "int8" else (0, 255)
+    bias_of: Dict[str, str] = {}  # bias constant -> its weight constant
+    for n in model.graph.node:
+        if n.op_type in _INT_WEIGHT_OPS and len(n.input) > 2 and n.input[2]:
+            bias_of.setdefault(n.input[2], n.input[1])
     rename: Dict[str, str] = {}
     new_nodes: List[onnx.NodeProto] = []
-    for c in consts:
-        w = numpy_helper.to_array(inits[c]).astype(np.float32)
-        amax = float(np.max(np.abs(w))) if w.size else 0.0
-        scale = np.float32(amax / 127.0) if amax > 0 else np.float32(1.0)
-        q = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
-        g.initializer.extend(
-            [
-                numpy_helper.from_array(q, c + "_quantized"),
-                numpy_helper.from_array(np.array(scale, np.float32), c + "_scale"),
-                numpy_helper.from_array(np.array(0, np.int8), c + "_zero_point"),
-            ]
-        )
+    weight_scale: Dict[str, np.float32] = {}
+
+    def emit(
+        c: str,
+        codes: np.ndarray,
+        scale: np.ndarray,
+        zp: np.ndarray,
+        tag: str = "",
+    ) -> None:
+        """The codes ``<c>_quantized`` read through a DequantizeLinear (the
+        int32 biases name their scale / zero point ``<c>_quantized_*``)."""
+        names = [c + "_quantized", c + tag + "_scale", c + tag + "_zero_point"]
+        for name, arr in zip(names, (codes, scale, zp)):
+            g.initializer.append(numpy_helper.from_array(arr, name))
         rename[c] = c + DQ_SUFFIX
         new_nodes.append(
             onnx.helper.make_node(
                 "DequantizeLinear",
-                [c + "_quantized", c + "_scale", c + "_zero_point"],
+                names,
                 [rename[c]],
                 name=c + "_DequantizeLinear",
                 domain=MS_DOMAIN,
             )
         )
+
+    def own_range(w: np.ndarray):
+        if not w.size:
+            return np.array(0, np_dtype), np.array(1.0, np.float32)
+        return compute_scale_zp(
+            np.asarray(w.min(), np.float32),
+            np.asarray(w.max(), np.float32),
+            const_dtype,
+            bool(sym),
+        )
+
+    # weights first: an int32 bias takes its weight's scale
+    for c in sorted(consts, key=lambda t: t in bias_of):
+        w = numpy_helper.to_array(inits[c]).astype(np.float32)
+        if c in bias_of:
+            if not quantize_bias:
+                continue
+            if half_act and int32_bias:
+                if bias_of[c] not in weight_scale:
+                    continue  # its weight stays float
+                scale = np.float32(np.float32(1.0) * weight_scale[bias_of[c]])
+                q = np.clip(np.round(w / scale), -(2**31), 2**31 - 1).astype(np.int32)
+                emit(
+                    c,
+                    q,
+                    np.array([scale], np.float32),
+                    np.array(0, np.int32),
+                    "_quantized",
+                )
+                continue
+        zp, scale = own_range(w)
+        scale = np.asarray(scale, np.float32).reshape(())
+        zp = np.asarray(zp, np_dtype).reshape(())
+        q = np.clip(np.round(w / scale) + zp.astype(np.float32), qmin, qmax)
+        if c not in bias_of:
+            weight_scale[c] = np.float32(scale)
+        emit(c, q.astype(np_dtype), scale, zp)
     for n in g.node:
         for i, x in enumerate(n.input):
             if x in rename:
