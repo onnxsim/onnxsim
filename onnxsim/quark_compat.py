@@ -104,9 +104,19 @@ names and preset *meanings*, not copied.
   ``UseRuntimeOptimizers=False``) onnxsim's own reproductions of the BatchNorm,
   Pad, Identity and HardSwish passes are used. The calibration session runs with
   ONNX Runtime's optimizations off, as Quark's does (a fused or re-laid-out graph
-  moves values across histogram bin edges). Not reproduced: the
-  ``fuse_instance_norm`` / ``fuse_l2_norm`` / ``fuse_layer_norm`` / ``fuse_gelu``
-  pattern fusions, and opset < 13 models.
+  moves values across histogram bin edges). Quark's own operator fusions run
+  after them (:mod:`onnxsim.quark_fusions`, ``tests/test_quark_fusions_parity.py``;
+  on by default, in every preset, also with ``OptimizeModel`` off): the
+  TensorFlow-style InstanceNorm -> ``InstanceNormalization`` (``FuseInstanceNorm``),
+  the ``ReduceSum`` / ``Max`` / ``Reciprocal`` L2 normalization ->
+  ``LpNormalization`` (``FuseL2Norm``), the decomposed LayerNorm ->
+  ``LayerNormalization`` (``FuseLayerNorm``, opset >= 17) and the erf Gelu -> the
+  ``com.microsoft`` ``Gelu`` (``FuseGelu``, opset >= 20); ``SkipPreprocess`` skips them
+  and the other pre-processing, ``ConvertOpsetVersion`` runs before them. ONNX Runtime's
+  own optimizer fuses a torch LayerNorm / Gelu first (``UseRuntimeOptimizers=False``
+  stands in for that too). The float pre-processing is not run for the block-format,
+  bfloat16 / float16 and ``MATMUL_NBITS`` flows (nor are the fusions there). Not
+  reproduced: opset < 13 models.
 - Q/DQ placement and quantizer options follow Quark's rules
   (:func:`onnxsim.full_qdq.quantize_full_qdq`, ``tests/test_quark_parity.py``):
   the Q/DQ pair between a Conv / Add / MaxPool / AveragePool /
@@ -352,8 +362,11 @@ names and preset *meanings*, not copied.
   ``CalibMovingAverage``, ``CalibDataSize``, ``NumBins``, ``NumQuantizedBins``,
   ``LWPMetric``, ``PercentileCandidates``), ``RemoveQDQConv{Relu,Clip,LeakyRelu,
   PRelu,Gelu}``, ``RemoveQDQInstanceNorm``, ``FoldRelu``, ``Align{Concat,Pool,
-  Pad,Slice,Transpose,Reshape}``, ``ActivationSymmetric``, ``WeightSymmetric``
-  and ``QuantizeBias`` (see above).
+  Pad,Slice,Transpose,Reshape}``, ``ActivationSymmetric``, ``WeightSymmetric``,
+  ``QuantizeBias``, and the pre-processing options of the integer presets
+  (``OptimizeModel``, ``SimplifyModel``, ``Fuse{InstanceNorm,L2Norm,LayerNorm,Gelu}``,
+  ``FoldBatchNorm``, ``ConvertOpsetVersion``, ``SkipPreprocess``,
+  ``QuantizeAllOpTypes``; see above).
 """
 
 from __future__ import annotations
@@ -991,6 +1004,9 @@ _PRESETS.update(
             Int32Bias=False,
             DedicatedQDQPair=True,
             QuantizeAllOpTypes=True,
+            # (VINT8 is the one Quark preset that leaves it off: a LayerNormalization
+            # or data-movement op fed by a graph input stays float)
+            ForceQuantizeNoInputCheck=False,
         ),
         "S16S16_MIXED_S8S8": lambda: _s16s16_mixed_s8s8(),
         "INT8_CNN_DEFAULT": lambda: QConfig(
@@ -2216,7 +2232,31 @@ class ModelQuantizer:
                 "ReduceRange is not supported with the NPU CNN scheme (power-of-two "
                 "scales); Quark refuses it too"
             )
-        if opts.get("OptimizeModel", True) or opts.get("SimplifyModel", True):
+        # Quark's operator fusions (``optimize_model``, after onnxslim and ONNX
+        # Runtime's optimizer, whether or not those ran): on by default, opset >= 17
+        # (LayerNorm) / >= 20 (Gelu), see :mod:`onnxsim.quark_fusions`
+        fuse: Dict[str, Any] = {
+            "instance_norm": bool(opts.get("FuseInstanceNorm", True)),
+            "l2_norm": bool(opts.get("FuseL2Norm", True)),
+            "layer_norm": bool(opts.get("FuseLayerNorm", True)),
+            "gelu": bool(opts.get("FuseGelu", True)),
+        }
+        # (``SkipPreprocess``: none of Quark's float-graph pre-processing runs, before
+        # the algorithms or after them)
+        skip_pre = bool(opts.get("SkipPreprocess", False))
+        target_opset = opts.get("ConvertOpsetVersion")
+        if not skip_pre and isinstance(target_opset, int):
+            # Quark's first pre-processing step; a failed conversion is a warning
+            # and the model goes on as it is
+            from onnxsim.quark_tools import convert_opset_version
+
+            try:
+                work = convert_opset_version(work, target_opset)
+            except ValueError as e:
+                self._approx(f"opset conversion skipped: {e}")
+        if skip_pre:
+            pass
+        elif opts.get("OptimizeModel", True) or opts.get("SimplifyModel", True):
             # Quark first runs onnxslim and ONNX Runtime's graph optimizer on the
             # float model (BN folds, Pad fusion, ...)
             from onnxsim.quark_convert import expand_hardswish, graph_cleanup
@@ -2241,7 +2281,12 @@ class ModelQuantizer:
                     in ("minmse_pof2", "nonoverflow", "layerwise_percentile")
                     else opts.get("CopyBiasInit", ("Conv", "ConvTranspose", "Gemm"))
                 ),
+                fuse=fuse,
             )
+        else:
+            from onnxsim.quark_fusions import apply_fusions
+
+            work = apply_fusions(work, **fuse)
         # (Quark's fusion / folding passes end with its own topological sort)
         from onnxsim.quark_marking import quark_sorted as _quark_sorted
 
@@ -2269,9 +2314,10 @@ class ModelQuantizer:
         conv_default = bool(
             npu_cnn or self._extended(act, wt) or opts.get("NPUTransformer")
         )
-        work = convert_for_npu(
-            work, opts, lambda n: n.name not in keep, default=conv_default
-        )
+        if not skip_pre:
+            work = convert_for_npu(
+                work, opts, lambda n: n.name not in keep, default=conv_default
+            )
         # Quark topologically sorts the float graph (with its own sort) before the
         # quantizer visits it, and quantizes the op types of its registries only
         from onnxsim.quark_marking import quark_op_types, quark_sorted, skipped_nodes
@@ -2279,10 +2325,16 @@ class ModelQuantizer:
         work = quark_sorted(work)
         ext = self._extended(act, wt)
         cnn_types: "Optional[set[str]]" = None
-        if op_types is None and not opts.get("QuantizeAllOpTypes"):
+        if op_types is None:
             cnn_types = set(
                 quark_op_types(npu_cnn or ext, opts.get("ExtraOpTypesToQuantize") or ())
             )
+            if opts.get("QuantizeAllOpTypes"):
+                # (Quark lists the op types of the model as given, before its
+                # pre-processing: an op type that only a conversion or fusion
+                # introduces and no registry has -- Slice, LpNormalization -- is
+                # not on the list)
+                cnn_types |= {n.op_type for n in model.graph.node}
             if opts.get("ConvertBNToConv", conv_default):
                 cnn_types.add("BatchNormalization")
         scope_types = op_types if op_types is not None else cnn_types
@@ -2312,6 +2364,8 @@ class ModelQuantizer:
                 else _without_batch_norm(work, op_types)
             ),
             float_clamp_input=op_types is not None,
+            # (the contrib Gelu Quark's FuseGelu writes is quantized by op type)
+            contrib_ops=("Gelu",),
             exclude_nodes=exclude,
             skip_nodes=skip_nodes,
             method=cal_method,
