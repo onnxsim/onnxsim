@@ -381,9 +381,28 @@ def _random_gemm_graph(seed):
                 "layernorm",
                 "transpose2",
                 "sigmoid",
+                "gemm_nobias",
+                "gemm_alpha",
+                "matmul_left",
+                "gemm_shared",
             ]
         )
-        if k == "gemm":
+        if k == "gemm_nobias":
+            emit("Gemm", [pick(), const(16, 16)])
+        elif k == "gemm_alpha":
+            emit(
+                "Gemm",
+                [pick(), const(16, 16), const(16)],
+                "<alpha=0.5, beta=2.0>",
+            )
+        elif k == "matmul_left":
+            # a constant first operand: [4, 4] x [4, 16]
+            emit("MatMul", [const(4, 4), pick()])
+        elif k == "gemm_shared":
+            if "ws" not in inits:
+                inits["ws"] = (nrng.standard_normal((16, 16)) * 0.4).astype(np.float32)
+            emit("Gemm", [pick(), "ws"])
+        elif k == "gemm":
             emit("Gemm", [pick(), const(16, 16), const(16)])
         elif k == "gemm_t":
             emit("Gemm", [pick(), const(16, 16), const(16)], "<transB=1>")
@@ -448,7 +467,7 @@ def _named_init(name, scale=1.0):
     ).astype(np.float32)
 
 
-def _model8(body, **over):
+def _model8(body, outputs=("y",), **over):
     """A parser-built model on ``[1, 8, 8, 8]``. ``w<k>`` / ``u<k>`` / ``b<k>`` names
     in the body get a deterministic initializer (``over[name]`` is a factor to scale
     it by, or the array itself); the usual constants (``lo``, ``hi6``, ...) too."""
@@ -460,7 +479,9 @@ def _model8(body, **over):
         sl1=np.array([0.25], np.float32),
     )
     m = parser.parse_model(
-        '<ir_version: 9, opset_import: ["": 17]> g (float[1,8,8,8] x) => (float y) {'
+        '<ir_version: 9, opset_import: ["": 17]> g (float[1,8,8,8] x) => ('
+        + ", ".join(f"float {o}" for o in outputs)
+        + ") {"
         + body
         + "}"
     )
@@ -493,8 +514,8 @@ def _q_scales(model):
     return out
 
 
-def _both(body, preset, tmp_path, extra=None, batches=4, **over):
-    model = _model8(body, **over)
+def _both(body, preset, tmp_path, extra=None, batches=4, outputs=("y",), **over):
+    model = _model8(body, outputs, **over)
     data = P._data((1, 8, 8, 8), n=batches)
     q, m = _same(model, data, tmp_path, preset, extra)
     P._assert_same_graph(q, m, f"{preset}")
@@ -668,6 +689,48 @@ def test_vint8_gives_every_input_slot_of_a_reader_a_pair(tmp_path):
             if n.op_type == "QuantizeLinear" and n.input[0] == "x"
         ]
         assert len(pairs) == 3
+
+
+def test_vint8_graph_output_read_by_several_nodes_stays_float(tmp_path):
+    """A graph output that two quantized nodes read: each reader gets its own Q/DQ
+    pair, the graph output itself is the float tensor (not a DQ)."""
+    q, m = _both(
+        "c0 = Conv(x, w1, b1)\n s = Sigmoid(c0)\n r = Relu(c0)\n y = Add(s, r)",
+        "VINT8",
+        tmp_path,
+        outputs=("y", "c0"),
+    )
+    for model in (q, m):
+        by_out = {o: n for n in model.graph.node for o in n.output}
+        assert by_out["c0"].op_type == "Conv"
+        quantizers = [
+            n
+            for n in model.graph.node
+            if n.op_type == "QuantizeLinear" and n.input[0] == "c0"
+        ]
+        assert len(quantizers) == 2
+
+
+@pytest.mark.parametrize("preset", ["VINT8", "U8S8_AAWS", "S8S8_AAWS"])
+def test_a_relu_clip_chain_propagates_the_range_two_steps(preset, tmp_path):
+    """Quark runs ONNX Runtime's ``adjust_tensor_ranges`` twice, so the input of a
+    ``Relu -> Clip(0, 6)`` pair takes the *Clip* output's range, not the Relu's."""
+    q, m = _both(
+        "c0 = Conv(x, w1, b1)\n r = Relu(c0)\n k = Clip(r, lo, hi6)\n y = Conv(k, w2, b2)",
+        preset,
+        tmp_path,
+        extra={
+            "RemoveQDQConvRelu": False,
+            "RemoveQDQConvClip": False,
+            "FoldRelu": False,
+        },
+        w1=6.0,
+        b1=np.full(8, 2.0, np.float32),
+    )
+    if preset == "VINT8":  # (the others fold or drop the Q/DQ pairs in between)
+        for model in (q, m):
+            scales = _q_scales(model)
+            assert scales["c0"] == scales["k"]
 
 
 @pytest.mark.parametrize("slope", ["sl8", "sl1"])

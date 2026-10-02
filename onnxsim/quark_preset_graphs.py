@@ -603,8 +603,22 @@ def dedicate_qdq_pairs(
         users = list({id(u): u for u in readers}.values())
         # (Quark's list: one entry per input slot of a node it quantizes)
         slots = [u for u in readers if receiving(u)]
-        if len(slots) < 2 or dq.output[0] in outputs:
+        if len(slots) < 2:
             continue
+        if dq.output[0] in outputs:
+            # a graph output read by several quantized nodes: each gets its own
+            # pair and the graph output stays the float tensor (Quark's
+            # dedicated branch comes before its graph-output one)
+            raw = q.input[0]
+            for n in nodes:
+                if n is dq:
+                    continue
+                for i, x in enumerate(n.input):
+                    if x == raw:
+                        n.input[i] = dq.output[0]
+                for i, x in enumerate(n.output):
+                    if x == raw:
+                        n.output[i] = dq.output[0]
         drop.update((id(q), id(dq)))
         first_slot: Dict[int, int] = {}
         pairs: List[onnx.NodeProto] = []

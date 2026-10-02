@@ -659,21 +659,29 @@ def quantize_full_qdq(
     )
     producer = {o: n for n in g.node for o in n.output}
     if adjust_activation_ranges:
-        for r in qnodes:
-            if (
-                r.op_type in ("Relu", "Clip")
-                and len(consumers[r.input[0]]) == 1
-                and r.input[0] in ranges
-                and r.output[0] in ranges
-            ):
-                ranges[r.input[0]] = ranges[r.output[0]]
+        # (Quark runs ONNX Runtime's ``adjust_tensor_ranges`` twice -- once when
+        # the quantizer is built, once when it quantizes -- so a chain of
+        # Relu / Clip nodes propagates its range two steps)
+        for _ in range(2):
+            for r in qnodes:
+                if (
+                    r.op_type in ("Relu", "Clip")
+                    and len(consumers[r.input[0]]) == 1
+                    and r.input[0] in ranges
+                    and r.output[0] in ranges
+                ):
+                    ranges[r.input[0]] = ranges[r.output[0]]
     if fold_node and (fold_relu or quark_rules):
         fold_ops = ("Relu", "Clip") if quark_rules else ("Relu",)
+        folded_into: Dict[int, onnx.NodeProto] = {}  # removed activation -> producer
         for r in qnodes:
             if r.op_type not in fold_ops:
                 continue
             src = r.input[0]
             p = producer.get(src)
+            # (a Relu / Clip behind an already folded one folds into the same producer)
+            while p is not None and id(p) in folded_into:
+                p = folded_into[id(p)]
             if (
                 p is None
                 or id(p) not in qnode_ids
@@ -685,8 +693,7 @@ def quantize_full_qdq(
             for k, o in enumerate(p.output):
                 if o == src:
                     p.output[k] = r.output[0]
-            # a Relu / Clip that follows a folded one folds into the same producer
-            producer[r.output[0]] = p
+            folded_into[id(r)] = p
             if not quark_rules:
                 ranges[r.output[0]] = (0.0, max(ranges[r.output[0]][1], 0.0))
             elif r.op_type == "Relu" and ranges[r.output[0]][0] < 0:
@@ -992,11 +999,41 @@ def quantize_full_qdq(
         lo, hi = _REDUCED_RANGES[dt] if reduce_range else _DTYPES[dt][2:]
         return int(lo), int(hi)
 
-    def int8_tensor_dq(x: str, w: np.ndarray) -> str:
+    def int8_tensor_dq(x: str, w: np.ndarray, per_row: bool = False) -> str:
         """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
         constant ``x``; returns the DQ output name. With asymmetric (or uint8)
         weights it is the weights' grid instead (Quark treats these constants
-        as weights)."""
+        as weights). ``per_row``: one scale per index of axis 0 instead (Quark's
+        per-channel mode for a bias or a PReLU slope)."""
+        if per_row and w.ndim >= 1 and w.shape[0] > 1:
+            qm = w_range("int8")[1]
+            rows = w.reshape(w.shape[0], -1)
+            if p2_search:
+                s = np.array([pof2_minmse_weight_scale(r) for r in rows], np.float32)
+            else:
+                s = (np.maximum(np.abs(rows).max(axis=1), 1e-12) / qm).astype(
+                    np.float32
+                )
+                if p2:
+                    s = (2.0 ** np.ceil(np.log2(s))).astype(np.float32)
+            q = np.clip(
+                np.round(w / s.reshape((-1,) + (1,) * (w.ndim - 1))), -qm, qm
+            ).astype(np.int8)
+            base = fresh(x)
+            add_init(base + "/int8", q)
+            add_init(base + "/scale", s)
+            add_init(base + "/zp", np.zeros(s.shape, np.int8))
+            out = base + "/dq"
+            act_nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [base + "/int8", base + "/scale", base + "/zp"],
+                    [out],
+                    name=out,
+                    axis=0,
+                )
+            )
+            return out
         if not p2 and (not weight_symmetric or weight_dtype == "uint8"):
             dt = "uint8" if weight_dtype == "uint8" else "int8"
             lo, hi = w_range(dt)
@@ -1180,7 +1217,7 @@ def quantize_full_qdq(
             ):
                 key = ("b8", x, None)
                 if key not in cache:
-                    cache[key] = int8_tensor_dq(x, w)
+                    cache[key] = int8_tensor_dq(x, w, per_row=per_channel)
                 n.input[k] = cache[key]
             elif (
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
@@ -1251,7 +1288,11 @@ def quantize_full_qdq(
             ):
                 key = ("c8", x, None)
                 if key not in cache:
-                    cache[key] = int8_tensor_dq(x, w)
+                    cache[key] = int8_tensor_dq(
+                        x,
+                        w,
+                        per_row=per_channel and n.op_type == "PRelu" and w.ndim > 1,
+                    )
                 n.input[k] = cache[key]
             else:
                 key = ("c", x, None)

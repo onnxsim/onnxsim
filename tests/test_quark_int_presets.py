@@ -40,6 +40,7 @@ def _model(body, shape=(1, 8, 8, 8), **over):
     consts = dict(
         lo=np.array(0.0, np.float32),
         hi6=np.array(6.0, np.float32),
+        hi1=np.array(1.0, np.float32),
         sp44=np.array([4, 4], np.int64),
         sl8=np.linspace(0.05, 0.4, 8, dtype=np.float32).reshape(8, 1, 1),
     )
@@ -366,3 +367,15 @@ def test_the_batch_extremes_are_averaged_in_float32():
     assert ranges["y"] == (0.0, float(np.nanmean(maxima)))
     assert ranges["y"][1] == 2.126560926437378
     assert ranges["y"][1] != float(maxima.astype(np.float64).mean())
+
+
+def test_a_relu_clip_chain_propagates_the_range_two_steps():
+    """Quark runs ONNX Runtime's ``adjust_tensor_ranges`` twice: the input of
+    ``Relu -> Clip(0, 1)`` takes the range of the Clip's output."""
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n r = Relu(c0)\n k = Clip(r, lo, hi1)\n y = Conv(k, w2, b2)",
+        w1=20.0,
+        b1=np.full(8, 2.0, np.float32),
+    )
+    params = _q_params(_quantize(model, "VINT8"))
+    assert params["c0"] == params["k"]  # (one step: the Relu's range, reaching past 1)

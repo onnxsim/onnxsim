@@ -2351,8 +2351,12 @@ class ModelQuantizer:
             ),
             int8_constants=True,
             reduce_range=bool(opts.get("ReduceRange", False)),
+            # (Quark applies it to the extended quantizer only: elsewhere it warns
+            # and does nothing)
             align_eltwise_dtype=bool(
                 self.config.extra_options.get("AlignEltwiseQuantType")
+                and self._extended(act, wt)
+                and not npu_cnn
             ),
             softmax_unit_range=True,
             tensor_dtypes=t_dtypes or None,
