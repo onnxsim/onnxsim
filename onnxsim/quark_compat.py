@@ -2112,14 +2112,24 @@ class ModelQuantizer:
                 quantized = bias_post(quantized)
             skip_names = set(exclude)
             if npu_cnn:
+                from onnxsim.quark_marking import quark_qdq_sorted
                 from onnxsim.quark_npu import apply_npu_cnn_rewrites
 
+                # Quark sorts the Q/DQ graph (``topological_sort`` again, after it
+                # has pruned the Q/DQ pairs) before the rewrites visit it
+                quantized = quark_qdq_sorted(quantized)
                 quantized = apply_npu_cnn_rewrites(
                     quantized,
                     opts,
                     _activation_rules(opts, act_sym, False, True)["remove_qdq_after"],
                     lambda n: n.name not in skip_names,
                 )
+                if not opts.get("OnnxsimKeepQuarkNodeOrder", False):
+                    # Quark's DPU nodes sit at the end of the node list; give the
+                    # graph the topological order ONNX requires
+                    from onnxsim.full_qdq import _toposort
+
+                    _toposort(quantized.graph)
             if opts.get("ConvertClipToRelu", False):
                 from onnxsim.quark_convert import convert_clip_to_relu
 

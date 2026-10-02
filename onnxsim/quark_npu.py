@@ -477,28 +477,26 @@ def adjust_quantize_info(
 # -- DPU simulation ----------------------------------------------------------------
 
 
-def _insert_mul(
-    graph: onnx.GraphProto, index: int, node: onnx.NodeProto, scale: float
-) -> int:
-    """Put ``Mul(node output, scale)`` right after ``node`` (index ``index``),
-    under the original output name; returns the index of the next node."""
+def _insert_mul(graph: onnx.GraphProto, node: onnx.NodeProto, scale: float) -> None:
+    """Quark's ``insert_mul``: ``Mul(node output, scale)`` under the original
+    output name, its ``Constant`` and the ``Mul`` appended at the end of the
+    graph (where the refinement passes, visiting nodes in list order, find
+    them)."""
     out = node.output[0]
     pre = out + "_Mul"
     const = out + "_Scale"
     if not node.name:
         node.name = out
     node.output[0] = pre
-    graph.node.insert(
-        index + 1,
+    graph.node.append(
         helper.make_node(
             "Constant",
             [],
             [const],
             value=helper.make_tensor("scale", TensorProto.FLOAT, [], [scale]),
-        ),
+        )
     )
-    graph.node.insert(index + 2, helper.make_node("Mul", [pre, const], [out], name=pre))
-    return index + 3
+    graph.node.append(helper.make_node("Mul", [pre, const], [out], name=pre))
 
 
 def _float_source(producers: Dict[str, onnx.NodeProto], tensor: str) -> str:
@@ -525,35 +523,8 @@ def simulate_dpu(
 
     g = model.graph
     skip = nodes_to_skip or set()
-    if on("ConvertLeakyReluToDPUVersion"):
-        for n in g.node:
-            if n.op_type == "LeakyRelu" and should_simulate(n):
-                for a in n.attribute:
-                    if a.name == "alpha":
-                        a.f = dpu_leaky_relu_alpha(a.f)
-    if on("ConvertSigmoidToHardSigmoid"):
-        for i, n in enumerate(list(g.node)):
-            if n.op_type == "Sigmoid" and should_simulate(n):
-                new = helper.make_node(
-                    "HardSigmoid", list(n.input), list(n.output), name=n.name
-                )
-                new.attribute.append(helper.make_attribute("alpha", 1.0 / 6.0))
-                idx = list(g.node).index(n)
-                g.node.remove(n)
-                g.node.insert(idx, new)
-    if on("ConvertHardSigmoidToDPUVersion"):
-        i = 0
-        while i < len(g.node):
-            n = g.node[i]
-            if (
-                n.op_type == "HardSigmoid"
-                and _is_hard_sigmoid(n)
-                and n.name not in skip
-            ):
-                i = _insert_mul(g, i, n, HARD_SIGMOID_SCALE)
-            else:
-                i += 1
-    producers = {o: n for n in g.node for o in n.output}
+    # (shapes are those of the graph before any rewrite -- Quark's ``value_info``
+    # -- as the appended nodes leave the graph out of order)
     shapes: Optional[Dict[str, List[int]]] = None
     if on("ConvertAvgPoolToDPUVersion") or on("ConvertReduceMeanToDPUVersion"):
         try:
@@ -567,12 +538,34 @@ def simulate_dpu(
             }
         except Exception:  # pragma: no cover - shape inference failure
             shapes = {}
+    if on("ConvertLeakyReluToDPUVersion"):
+        for n in g.node:
+            if n.op_type == "LeakyRelu" and should_simulate(n):
+                for a in n.attribute:
+                    if a.name == "alpha":
+                        a.f = dpu_leaky_relu_alpha(a.f)
+    if on("ConvertSigmoidToHardSigmoid"):
+        # (the replacement is appended at the end of the graph, as in Quark)
+        for n in list(g.node):
+            if n.op_type == "Sigmoid" and should_simulate(n):
+                new = helper.make_node(
+                    "HardSigmoid", list(n.input), list(n.output), name=n.name
+                )
+                new.attribute.append(helper.make_attribute("alpha", 1.0 / 6.0))
+                g.node.append(new)
+                g.node.remove(n)
+    if on("ConvertHardSigmoidToDPUVersion"):
+        for n in list(g.node):
+            if (
+                n.op_type == "HardSigmoid"
+                and _is_hard_sigmoid(n)
+                and n.name not in skip
+            ):
+                _insert_mul(g, n, HARD_SIGMOID_SCALE)
+    producers = {o: n for n in g.node for o in n.output}
     if on("ConvertAvgPoolToDPUVersion"):
-        i = 0
-        while i < len(g.node):
-            n = g.node[i]
+        for n in list(g.node):
             if n.op_type not in _AVG_POOLS or not should_simulate(n):
-                i += 1
                 continue
             kh = kw = 0
             ok = False
@@ -580,7 +573,6 @@ def simulate_dpu(
                 src = _float_source(producers, n.input[0])
                 shape = (shapes or {}).get(src)
                 if not shape:
-                    i += 1
                     continue
                 if len(shape) == 4 and shape[2] == shape[3]:
                     ok, kh, kw = True, shape[2], shape[3]
@@ -592,15 +584,10 @@ def simulate_dpu(
                 if ks and len(ks) == 2 and ks[0] == ks[1]:
                     ok, kh, kw = True, ks[0], ks[1]
             if ok and kh * kw > 0:
-                i = _insert_mul(g, i, n, avg_pool_dpu_scale(kh, kw))
-            else:
-                i += 1
+                _insert_mul(g, n, avg_pool_dpu_scale(kh, kw))
     if on("ConvertReduceMeanToDPUVersion"):
-        i = 0
-        while i < len(g.node):
-            n = g.node[i]
+        for n in list(g.node):
             if n.op_type != "ReduceMean" or not should_simulate(n):
-                i += 1
                 continue
             src = _float_source(producers, n.input[0])
             shape = (shapes or {}).get(src)
@@ -618,9 +605,7 @@ def simulate_dpu(
                 for a in axes:
                     rec *= shape[a]
                 if rec > 0:
-                    i = _insert_mul(g, i, n, reciprocal_dpu_scale(rec))
-                    continue
-            i += 1
+                    _insert_mul(g, n, reciprocal_dpu_scale(rec))
     if on("ConvertClipToDPUVersion"):
         inits = {t.name: t for t in g.initializer}
         for n in g.node:

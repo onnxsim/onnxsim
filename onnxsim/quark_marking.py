@@ -101,17 +101,15 @@ def quark_op_types(
     return frozenset(types)
 
 
-def quark_node_order(model: onnx.ModelProto) -> List[onnx.NodeProto]:
-    """The nodes of ``model`` in the order of Quark's (ONNX Runtime's)
-    ``ONNXModel.topological_sort``. Raises ``ValueError`` on a cycle."""
+def _order_indices(model: onnx.ModelProto) -> List[int]:
     nodes = list(model.graph.node)
     deps_count = [0] * len(nodes)
     deps_to_nodes: Dict[str, List[int]] = {}
-    ordered: List[onnx.NodeProto] = []
+    ordered: List[int] = []
     for idx, node in enumerate(nodes):
         deps_count[idx] = sum(1 for x in node.input if x)
         if deps_count[idx] == 0:
-            ordered.append(node)
+            ordered.append(idx)
             continue
         for name in node.input:
             if name:
@@ -123,18 +121,25 @@ def quark_node_order(model: onnx.ModelProto) -> List[onnx.NodeProto]:
         for idx in deps_to_nodes.get(name, ()):
             deps_count[idx] -= 1
             if deps_count[idx] == 0:
-                ordered.append(nodes[idx])
+                ordered.append(idx)
     start = 0
     while start < len(ordered):
-        for out in ordered[start].output:
+        for out in nodes[ordered[start]].output:
             for idx in deps_to_nodes.get(out, ()):
                 deps_count[idx] -= 1
                 if deps_count[idx] == 0:
-                    ordered.append(nodes[idx])
+                    ordered.append(idx)
         start += 1
     if len(ordered) != len(nodes):
         raise ValueError("Graph is not a DAG")
     return ordered
+
+
+def quark_node_order(model: onnx.ModelProto) -> List[onnx.NodeProto]:
+    """The nodes of ``model`` in the order of Quark's (ONNX Runtime's)
+    ``ONNXModel.topological_sort``. Raises ``ValueError`` on a cycle."""
+    nodes = list(model.graph.node)
+    return [nodes[i] for i in _order_indices(model)]
 
 
 def quark_sorted(model: onnx.ModelProto) -> onnx.ModelProto:
@@ -148,6 +153,67 @@ def quark_sorted(model: onnx.ModelProto) -> onnx.ModelProto:
     nodes = [onnx.NodeProto() for _ in order]
     for dst, src in zip(nodes, order):
         dst.CopyFrom(src)
+    del out.graph.node[:]
+    out.graph.node.extend(nodes)
+    return out
+
+
+def _quark_names(model: onnx.ModelProto) -> Dict[str, str]:
+    """``{initializer name: the name Quark gives it}`` for the scale, zero-point
+    and quantized-data initializers of the Q/DQ pairs of a quantized ``model``
+    built by :func:`onnxsim.full_qdq.quantize_full_qdq` (Quark names them after
+    the tensor: ``<t>_scale`` / ``<t>_zero_point``, and ``<w>_quantized`` /
+    ``<w>_scale`` / ``<w>_zero_point`` for a constant; an int32 bias's are
+    ``<b>_quantized_scale`` / ``<b>_quantized_zero_point``)."""
+    inits = {t.name for t in model.graph.initializer}
+    rename: Dict[str, str] = {}
+
+    def tensor_of(name: str) -> str:
+        return name.split("/qdq")[0]
+
+    for n in model.graph.node:
+        if n.op_type not in ("QuantizeLinear", "DequantizeLinear") or len(n.input) < 3:
+            continue
+        data, scale, zp = n.input[0], n.input[1], n.input[2]
+        if data in inits:  # a constant: DQ of the stored integer codes
+            base = tensor_of(data)
+            int32 = data.endswith("/int32")
+            rename.setdefault(data, base + "_quantized")
+            rename.setdefault(
+                scale, base + ("_quantized_scale" if int32 else "_scale")
+            )
+            rename.setdefault(
+                zp, base + ("_quantized_zero_point" if int32 else "_zero_point")
+            )
+        elif n.op_type == "QuantizeLinear":
+            base = data[:-2] if data.endswith("/f") else data
+            rename.setdefault(scale, base + "_scale")
+            rename.setdefault(zp, base + "_zero_point")
+    return rename
+
+
+def quark_qdq_sorted(model: onnx.ModelProto) -> onnx.ModelProto:
+    """A copy of a quantized ``model`` with its nodes in the order Quark's own
+    ``topological_sort`` gives the equivalent graph: the sort seeds on the
+    alphabetical order of the initializer and input names, so it is run on a
+    copy whose Q/DQ parameters carry Quark's names."""
+    tmp = onnx.ModelProto()
+    tmp.CopyFrom(model)
+    rename = _quark_names(tmp)
+    for t in tmp.graph.initializer:
+        t.name = rename.get(t.name, t.name)
+    for n in tmp.graph.node:
+        for k, x in enumerate(n.input):
+            n.input[k] = rename.get(x, x)
+    try:
+        order = _order_indices(tmp)
+    except ValueError:  # pragma: no cover - not a DAG
+        return model
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    nodes = [onnx.NodeProto() for _ in order]
+    for dst, i in zip(nodes, order):
+        dst.CopyFrom(model.graph.node[i])
     del out.graph.node[:]
     out.graph.node.extend(nodes)
     return out
@@ -249,6 +315,7 @@ __all__: Any = [
     "QUARK_QDQ_OP_TYPES",
     "quark_node_order",
     "quark_op_types",
+    "quark_qdq_sorted",
     "quark_sorted",
     "skipped_nodes",
 ]
