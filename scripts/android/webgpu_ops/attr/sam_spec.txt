@@ -1,0 +1,23 @@
+control_self|SELF
+Conv1x1|clsx=Conv 1x1
+Conv3x3_dense_s1|clsx=Conv 3x3 dense
+Conv3x3_dense_s2|clsx=Conv 3x3 dense s2
+Conv_dw3x3_s1|clsx=Conv dw 3x3
+Conv_dw3x3_s2|clsx=Conv dw 3x3 s2
+LinAttn_aggregate_convs|clsx=Conv dw 5x5,clsx=Conv grouped(g=48) 1x1,cls=Conv grouped(g=256),cls=Conv grouped(g=512),cls=Conv grouped(g=1024)
+MatMul_linattn|op=MatMul
+Div_Relu|op=Div,op=Relu
+Pad|op=Pad
+Slice|op=Slice
+Concat|op=Concat
+Transpose|op=Transpose
+Add_Sub|op=Add,op=Sub
+LayerNorm_DepthToSpace|op=LayerNormalization,op=DepthToSpace
+node5_3x3s2_32to512|idx=5-5
+node9_3x3s2_64to1024|idx=9-9
+node7_3x3_64to256|idx=7-7
+node11_3x3_128to512|idx=11-11
+stage_final_3x3x4_256|idx=143-149
+stem_3x3_32_idx3_4|idx=3-4
+Conv1x1_expand6144_idx34|idx=34-34
+Conv1x1_idx13_2048|idx=13-13

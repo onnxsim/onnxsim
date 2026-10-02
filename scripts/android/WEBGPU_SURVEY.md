@@ -1297,3 +1297,64 @@ ORT's GroupedConv computes one scalar output per thread with kh*kw scalar loads 
 `ORT_WEBGPU_DEPTHWISE_PIXELS` (default 4, 0 = off) consecutive output pixels per thread; bias and activation are fused. SAM-L0 encoder (18 grouped convs): 365.1/365.7 -> **357.9/357.1 ms** (pixels 2: 358.3, 8: 358.7/360.0), outputs 5e-5 from the CPU EP as before; sweep 317 OK / 0 wrong.
 This is the standalone kernel of `conv_alt.cc` (2.0-2.4x faster than the naive kernel) landing as a ~2% network gain: depthwise convs are a small share of SAM's time.
 Applies after `ort_concat_split_vec4.patch`.
+
+## Where the time goes in SAM-L0 encoder and RT-DETR `pre` (attribution by ablation + isolated op costs)
+
+Tools: `webgpu_ops/attr/` (`ops.py`, `shapes.py`, `classify.py` list/classify the nodes of a saved optimized graph, `ablate.py` + `run_ablation.py` replace op classes by cheap stand-ins and time
+end-to-end ABAB on the phone, `opbench.py`/`opbench_report.py` time every distinct op at its real shapes in isolation, `standin_cost.py`, `bench_attr.cc`). Library = the stack of this PR before the depthwise patch
+(Winograd + add fusion + vec4 Concat/Split + texdirect code, texdirect off), `enableInt64=1`, warm >= 16 runs, 4 interleaved rounds per variant, control noise +-0.5 ms (SAM) / +-3 ms (RT-DETR).
+Optimized graphs: SAM 154 nodes (73 Conv/NhwcFusedConv), RT-DETR 211 nodes (69 Conv/NhwcFusedConv, 22 Gemm, 24 Transpose, 36 Reshape); total 69.6 / 59.4 GFLOP, so both run at ~175-195 GFLOPS average.
+
+### Method notes (what bit)
+- ORT removes `Mul(x, 1)` chains and merges identical copies of a node (CSE), so same-shape stand-ins are free and isolated copies need `OPT_LEVEL0` (`bench_attr` env) to be timed; a channel-expanding stand-in (Slice + 4x Concat) costs 1.1-2.4 ms per node on 8-33 MB tensors (`results/standin_cost.log`), which is why single-node ablations of expanding convs under-report.
+- A stand-in must keep every other dynamic input alive (otherwise ORT prunes the producers and the 'saving' contains a whole branch): `ablate.py` consumes the largest same-shape input and feeds the others to tiny `Reshape->Slice` graph outputs. The first version of the Mul/Add numbers (50 ms) was this artifact.
+- RT-DETR's tail (TopK -> Gather of 300 queries) is data dependent, so ablating upstream values changes its work: the 300-row Gemm/decoder ablations are not trustworthy (one measured -21 ms); that part is reported from isolated op costs.
+- The saved optimized RT-DETR graph runs 361 ms against 334 ms for the original model (same stack), so RT-DETR ablation percentages are on a graph that is 8% slower; the sum of the pieces overshoots the 358 ms baseline by ~10% (removed nodes also remove dispatch gaps).
+- Single-node ablations had occasional +40-60 ms outlier runs; medians/minima of 4 rounds are reported. Single-node results for idx 7, 11 and the two 32-channel stem convs were unstable (0..-17 ms); their group results are consistent (below).
+
+### SAM-L0 encoder (365 ms baseline; 512x512 input, 154 nodes)
+| class (ablated) | nodes | GFLOP | ms removed | eff. GFLOPS |
+|---|---|---|---|---|
+| Conv 1x1 (incl. fused Gelu epilogue) | 40 | 27.9 | **143.5** | 194 |
+| Conv 3x3 dense stride 1 (6 Winograd 100 ms + 2 stem 32-ch convs ~15 ms) | 8 | 31.4 | **114.6** | 274 (Winograd-equivalent) |
+| Conv 3x3 dense stride 2 (32->512 and 64->1024 are 22-26 ms each) | 3 | 9.8 | **43.0** | 227 |
+| depthwise 3x3 s1 / s2 | 8 / 2 | 0.13 / 0.07 | 5.0 / 2.0 | memory-bound (59 / 73 MB) |
+| linear-attention conv aggregates (dw 5x5, 1xN/Nx1, g=48 1x1) | 12 | 0.2 | 8.7 | |
+| MatMul / Slice / Concat / Transpose / Div+Relu / Pad | 8 / 20 / 4 / 13 / 12 / 6 | | 3.8 / 3.6 / 4.4 / 1.3 / 0.8 / 0.1 | |
+| all non-conv linear-attention glue together | 50 | | 2.6 (ablation) - 27.6 (isolated sum, incl. ~0.46 ms/op harness floor not removable by a stand-in) | |
+Convs are ~82-88% of the time. Isolated op costs (floor-corrected, `results/opbench_results.txt`): 12 strided Slices 6.0 ms, Transposes 8.3 ms (e.g. [1,16,16,3072]->NCHW 1.0 ms each x4), MatMul 6.0 ms, Pad 2.5, LayerNorm 1.1, Concat 0.8, elementwise 2.3 ms.
+
+### RT-DETR `pre` (358 ms on the saved graph; 640x640 input, 211 nodes)
+| class | nodes | GFLOP | ms | note |
+|---|---|---|---|---|
+| Conv 3x3 dense stride 1 | 27 | 39.1 | **194** (ablation) | 64-ch @160x160 stage: 5 nodes 77 ms (~120 GFLOPS-equivalent), 128-ch @80x80: 43 ms, neck @80: 43 ms, 256/512 @40/20: 81 ms (~260) |
+| Conv 3x3 dense stride 2 | 6 | 5.4 | 57 | |
+| Conv 1x1 | 36 | 6.9 | 57 (+-8) | ~120 GFLOPS: small K and many tiny maps |
+| Gemm [8400,256]x[256,N] | 8 | 6.9 | 50 (ablation) / 36 (isolated: 6 x 5.1 ms + 2 x 2.0) | 214 GFLOPS |
+| Gemm 400-row encoder FFN / 300-row decoder | 6 / 8 | 1.0 | 21 / (unreliable) ; isolated 7.4 | |
+| Transposes (NCHW<->NHWC, token layouts) | 22 | | 13.9 isolated (ablation 5-16) | 8-17 GB/s: [1,256,8400]->[1,8400,256] 2.0 ms, [1,512,80,80]->NHWC 2.6 ms |
+| Gather with a scalar index (= a copy) / TopK / ReduceMax / GatherElements | 7 / 1 / 1 / 2 | | 4.8 + 7.4 total isolated | [1,8400,256]->[8400,256] 1.6 ms each x3 |
+| NCHW Concat axis 1 / Resize nearest / Pad / Tile | 5 / 2 / | | 7.8 isolated | [1,256,80,80]x2 Concat 2.7 ms, Resize 40->80 2.0 ms |
+| LayerNorm, Softmax (3), SkipLayerNorm | 7 | | 4.7 isolated | LN [1,8400,256] 2.1 ms |
+| attention MatMuls (4) | 4 | 0.3 | 4.0 isolated | |
+| elementwise Add/Mul/Div/Relu/Sigmoid/Erf | 30 | | 3.6 isolated | the manual-Gelu chain and 7 scalar Mul/Div on [400,1024] are 0.25-0.4 ms each |
+Isolated non-conv total: **90.6 ms (Gemm/MatMul 52, Transpose 14, Gather/TopK/Reduce 7, Concat/Resize/Pad/Tile 8, LN/Softmax 5, elementwise 4)** -- about 27% of the model.
+
+### Measured now (env only, no code): RT-DETR large-map convs
+`ORT_WEBGPU_WINO_MAXHW=100` (Winograd only for output maps <= 100, so the 160x160/320x320 convs take the non-Winograd path), original `rtdetr_pre`, 4 interleaved rounds (ms, `results/rtdetr_wino_texdirect_hw.log`):
+default 336.8/343.8/332.7/336.9; Winograd<=100: 329.9/329.8/328.9/328.7 (**-2.4%**); Winograd<=100 + `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=512`: 327.5/326.8/330.2/327.0 (**-3%**);
+Winograd<=60 (80x80 maps direct too): 363 (+8%); texdirect alone with Winograd everywhere: 334-339 (no gain). So Winograd is right at 80x80 and below and wrong above; the high-res 64-channel layers are memory-bound either way (Winograd's 4x-expanded V/M tensors; K = 64 is too small to amortize loads).
+
+### Ranked targets (expected saving = measured share x what a good kernel could do given the ceilings in this file; only the first RT-DETR item is measured)
+**SAM-L0 encoder (365 ms)**
+1. Conv 1x1, 143 ms at 194 GFLOPS (ceiling for a register-tile GEMM here ~260-280): a per-shape tuned MatMul tile / texture weights / f16 weights should reach ~240 GFLOPS -> **-25 to -30 ms (7-8%)**. Many of the 40 are MBConv expand/project convs with 16x16 or 32x32 maps and K up to 6144: split-K or a different tile for tiny maps is part of it.
+2. 3x3 stride-2 (43 ms at 227 GFLOPS, 22-26 ms each for the 32->512 / 64->1024 layers): polyphase Winograd (1.44x fewer multiplies, `conv_s2.cc`) ~ -10 to -13 ms; `ORT_WEBGPU_CONV_TEXDIRECT=1` already takes ~9 ms of it.
+3. Linear-attention glue: 12 strided Slices + 4 Transposes + 8 MatMuls + 6 Pads + Div/Relu + Concat sum to 25-28 ms isolated (every op is a separate 0.3-1.0 ms dispatch on a 2-8 MB tensor): one fused kernel (ReLU linear attention over the 256-ch/33-row tiles) -> **-12 to -15 ms (3-4%)**. The 32-channel stem convs (2 x 1.2 GFLOP, ~15 ms together) are next (texdirect, -5 ms).
+Winograd'd 3x3 (100 ms for 29 GFLOP-equivalent) and the depthwise convs (7 ms) are already near their ceilings; Concat/Transpose/LN together are < 5 ms.
+
+**RT-DETR pre (335 ms original / 358 saved graph)**
+1. High-resolution 3x3 convs (320x320, 160x160, 80x80 maps with 32-128 channels, ~120-180 GFLOPS vs 260 elsewhere, ~100+ ms): measured -8 to -10 ms from Winograd<=100 + texdirect (env above, can be a default heuristic: output map <= 80x80 -> Winograd, larger -> direct); a fused Winograd (input transform -> GEMM -> output transform per tile block without the 4x-expanded V/M tensors) or a tuned direct kernel for K = 32-64 should win 20-40 ms more (unmeasured).
+2. Gemm [8400,256]x[256,256] x6 (31 ms isolated, 214 GFLOPS) + the 400/300-row Gemms (7 ms): register-tile GEMM / f16 or texture weights -> **-8 to -12 ms**.
+3. Data movement, ~35 ms isolated (Transposes 14 at 8-17 GB/s, scalar-index Gather 4.8, NCHW Concat/Resize 5, LayerNorm 2.1, ReduceMax/TopK 2): a shared-memory/vec4 Transpose at ~60-100 GB/s (the ceiling here), a Gather-with-scalar-index lowered to an alias or one vec4 copy, and keeping the hybrid encoder in NHWC (NHWC Resize/Concat) -> **-18 to -22 ms (5-6%)**. Each of these is also 13 us per dispatch of the 211-node graph.
+4. Smaller: attention Softmax/MatMul/LN ~10 ms (fusing Softmax into the MatMul reads ~ -3), the 7 scalar Mul/Div on [400,1024] (manual Gelu: one fused elementwise pass -1 ms).
+(The depthwise vec4 patch landed after these measurements and lowers the SAM numbers by ~8 ms.)
