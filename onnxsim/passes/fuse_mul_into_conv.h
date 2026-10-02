@@ -151,6 +151,20 @@ struct FuseMulIntoConv final : public PredicateBasedPass {
     // the weight.
     Value* bias_scale = scale;
     Value* weight_scale = scale;
+    if (!per_channel && has_bias && s_sizes.size() > 1) {
+      // A singleton tensor is scalar-valued for broadcasting, but Conv's
+      // optional bias must remain rank 1.  Flatten shapes such as [1,1,1,1]
+      // before multiplying them into the [C] bias.
+      Node* reshape = graph.create(kReshape, 1);
+      reshape->addInput(scale);
+      Tensor shape_t;
+      shape_t.elem_type() = TensorProto_DataType_INT64;
+      shape_t.sizes().push_back(1);
+      shape_t.int64s().push_back(1);
+      reshape->addInput(graph.addInitializerAndCreateValue(shape_t));
+      reshape->insertBefore(conv);
+      bias_scale = reshape->output();
+    }
     if (per_channel) {
       // Flatten the scale to [C].
       Value* scale_1d = scale;

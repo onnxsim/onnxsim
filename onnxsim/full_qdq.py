@@ -460,7 +460,11 @@ def quantize_full_qdq(
             opset < 21 models get ``com.microsoft`` Q/DQ, which ONNX Runtime
             and its QNN execution provider accept), or the signed ``"int8"`` /
             ``"int16"`` (zero point 0)
-    :param per_channel: int8 weights per output channel (default) or per tensor
+    :param per_channel: int8 weights per output channel (default) or per tensor.
+            Per channel needs a ``DequantizeLinear`` ``axis``, so a model below
+            opset 13 raises (as Quark does); pass ``per_channel=False`` there --
+            such models are quantized in place with per-tensor Q/DQ nodes (no
+            ``axis``; the opset is never converted)
     :param op_types: only quantize nodes of these op types (default: all)
     :param exclude_op_types: never quantize nodes of these op types
     :param exclude_nodes: node names (or first-output names) to keep in float
@@ -902,9 +906,10 @@ def quantize_full_qdq(
         qp_history = qp_history[:1]
 
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
-    if opset < 13:
+    if per_channel and opset < 13:
+        # (Quark's message: a per-channel DequantizeLinear needs its ``axis``)
         raise ValueError(
-            "full-graph QDQ needs opset >= 13 (per-channel DequantizeLinear)"
+            "Per-Channel support with QDQ format requires onnx opset version 13 or above."
         )
 
     def domain_of(dt: str) -> str:
@@ -1371,6 +1376,9 @@ def quantize_full_qdq(
                 )
                 if sx is None or ws is None:
                     continue  # weight or input not quantized: keep a float bias
+                # (per-tensor weights: one scale and no ``axis`` -- Quark's form,
+                # and the only one a DequantizeLinear below opset 13 can express)
+                per_tensor = ws.size == 1
                 s = (sx * np.broadcast_to(ws, w.shape)).astype(np.float32)
                 if gemm_beta != 1.0:
                     s = (s * np.float32(gemm_beta)).astype(np.float32)
@@ -1399,8 +1407,12 @@ def quantize_full_qdq(
                         s = prod
                 base = fresh(x)
                 add_init(base + "/int32", q)
-                add_init(base + "/scale", s)
-                add_init(base + "/zp", np.zeros(s.shape, np.int32))
+                if per_tensor:
+                    add_init(base + "/scale", s[:1])
+                    add_init(base + "/zp", np.array(0, np.int32))
+                else:
+                    add_init(base + "/scale", s)
+                    add_init(base + "/zp", np.zeros(s.shape, np.int32))
                 out = base + "/dq"
                 act_nodes.append(
                     helper.make_node(
@@ -1408,7 +1420,7 @@ def quantize_full_qdq(
                         [base + "/int32", base + "/scale", base + "/zp"],
                         [out],
                         name=out,
-                        axis=0,
+                        **({} if per_tensor else {"axis": 0}),
                     )
                 )
                 cache[("b32", x)] = out

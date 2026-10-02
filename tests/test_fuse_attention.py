@@ -31,6 +31,7 @@ import pytest
 from onnx import parser
 
 import onnxsim
+from onnxsim import model_checking
 
 # A bare ``import onnxruntime`` would fail collection (not skip the test) on
 # platforms onnxruntime doesn't ship wheels for (e.g. s390x); the fused
@@ -101,6 +102,7 @@ def _attention_model(
     kv_source="x",
     seed=0,
     opset=17,
+    scale=None,
 ):
     # Builds: Y = Linear(ctx, Wout[, Bout]) where ctx is the fused-away
     # self-attention context -- see fuse_attention.h's own top-of-file
@@ -127,7 +129,9 @@ def _attention_model(
         inits.append(_f32(np.array(float(Dh) ** 0.5), "divisor"))
         body += "scores = Div(qk, divisor)\n"
     else:
-        inits.append(_f32(np.array(float(Dh) ** -0.5), "mult"))
+        if scale is None:
+            scale = float(Dh) ** -0.5
+        inits.append(_f32(np.array(scale), "mult"))
         body += "scores = Mul(qk, mult)\n"
     body += "attn = Softmax<axis = -1>(scores)\n"
     body += f"ctx0 = MatMul(attn, {v_t})\n"
@@ -233,6 +237,18 @@ def test_fuse_attention_mul_scale():
     rng = np.random.default_rng(2)
     x = rng.standard_normal((B, S, H)).astype(np.float32)
     _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
+
+
+def test_fuse_attention_declines_zero_scale():
+    B, S, H = 2, 4, 16
+    model = _attention_model(B=B, S=S, H=H, NH=2, bias=True, scale_op="Mul", scale=0.0)
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    assert _op_counts(simplified)["Attention"] == 0
+    x = np.random.default_rng(20).standard_normal((B, S, H)).astype(np.float32)
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"x": x}, verbose=False
+    )
 
 
 def test_fuse_attention_different_v_hidden_size():

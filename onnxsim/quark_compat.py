@@ -106,7 +106,24 @@ names and preset *meanings*, not copied.
   ONNX Runtime's optimizations off, as Quark's does (a fused or re-laid-out graph
   moves values across histogram bin edges). Not reproduced: the
   ``fuse_instance_norm`` / ``fuse_l2_norm`` / ``fuse_layer_norm`` / ``fuse_gelu``
-  pattern fusions, and opset < 13 models.
+  pattern fusions.
+- Models with a default-domain opset below 13 are quantized in place like Quark
+  does (``tests/test_quark_low_opset_parity.py``): the opset is never converted,
+  per-tensor Q/DQ carry no ``axis`` (the bias DequantizeLinear gets Quark's
+  one-element scale and scalar zero point), a per-channel configuration
+  (``extra_options["PerChannel"]``) raises Quark's ``Per-Channel support with QDQ
+  format requires onnx opset version 13 or above.``, ``MaxPool`` is left alone
+  below opset 12 and ``Resize`` below opset 11 (ONNX Runtime's QDQ operator
+  quantizers, reused by Quark's registries, return without marking anything),
+  and the ``com.microsoft`` / ``com.amd.quark`` operator sets are registered
+  on every quantized model. Quark's extended quantizer (``A8W8`` and the 16-bit
+  presets) emits ``com.microsoft`` Q/DQ nodes. GPTQ re-grids the weights per
+  tensor there, and ``UINT8_DYNAMIC_QUANT`` below opset 11 computes each
+  activation's scale and zero point with ordinary operators (no
+  ``DynamicQuantizeLinear``), as Quark does. ``extra_options["ConvertOpsetVersion"]``
+  converts the opset first, like Quark's pre-processing (which is how a per-channel
+  configuration is reached from such a model). Not covered below opset 13: the
+  legacy AdaQuant engine's per-channel mode.
 - Q/DQ placement and quantizer options follow Quark's rules
   (:func:`onnxsim.full_qdq.quantize_full_qdq`, ``tests/test_quark_parity.py``):
   the Q/DQ pair between a Conv / Add / MaxPool / AveragePool /
@@ -1180,6 +1197,46 @@ _FASTFT_PRESET = {
 # -- quantizer -----------------------------------------------------------------
 
 
+def _default_opset(model: onnx.ModelProto) -> int:
+    """The model's default-domain opset (0 when it has none)."""
+    return next(
+        (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")), 0
+    )
+
+
+def _qdq_to_ms_domain(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Quark's extended quantizer (its ``A8W8`` and 16-bit presets) emits custom
+    Q/DQ nodes and ends by converting them to the ``com.microsoft`` ones
+    (``_convert_qdq_nodes``): every ``QuantizeLinear`` / ``DequantizeLinear`` whose
+    zero point is an int8 / uint8 / int16 / uint16 / int32 initializer, except an
+    int32 ``QuantizeLinear`` and an int32 ``DequantizeLinear`` with a non-zero
+    zero point (which the ``com.microsoft`` ops do not support). Works in place;
+    the ``com.microsoft`` operator set is registered by the caller."""
+    inits = {t.name: t for t in model.graph.initializer}
+    types = (
+        onnx.TensorProto.INT8,
+        onnx.TensorProto.UINT8,
+        onnx.TensorProto.INT16,
+        onnx.TensorProto.UINT16,
+        onnx.TensorProto.INT32,
+    )
+    for n in model.graph.node:
+        if n.op_type not in ("QuantizeLinear", "DequantizeLinear"):
+            continue
+        if n.domain not in ("", "ai.onnx"):
+            continue
+        zp = inits.get(n.input[2]) if len(n.input) > 2 else None
+        if zp is None or zp.data_type not in types:
+            continue
+        if zp.data_type == onnx.TensorProto.INT32:
+            if n.op_type == "QuantizeLinear":
+                continue
+            if np.count_nonzero(onnx.numpy_helper.to_array(zp)) != 0:
+                continue
+        n.domain = "com.microsoft"
+    return model
+
+
 class ModelQuantizer:
     """Mirror of ``quark.onnx.ModelQuantizer``.
 
@@ -1249,6 +1306,23 @@ class ModelQuantizer:
 
         if isinstance(model_input, str):
             model_input = onnx.load(model_input)
+
+        # Quark's pre-processing converts the opset first when asked to
+        # (``ConvertOpsetVersion``; it warns and skips when the converter fails).
+        # Without it a model is quantized in place, whatever its opset.
+        target = cfg.extra_options.get("ConvertOpsetVersion")
+        if isinstance(target, int):
+            from onnxsim.quark_tools import convert_opset_version
+
+            try:
+                model_input = convert_opset_version(model_input, target)
+            except ValueError as e:
+                warnings.warn(
+                    f"onnxsim.quark_compat: failed to convert the opset version "
+                    f"({e}), skipping the conversion",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         half = act.dtype in ("float16", "bfloat16")
         if half and cfg.extra_options.get("ConvertToHalf"):
@@ -1890,8 +1964,16 @@ class ModelQuantizer:
         group_size = int(p.get("group_size", -1))
         sym = bool(p.get("weight_symmetric", True))
         mse = bool(p.get("mse", False))
+        low_opset = _default_opset(quantized) < 13
         requantize = (
-            bits != 8 or group_size != -1 or not sym or mse or "per_channel" in p
+            bits != 8
+            or group_size != -1
+            or not sym
+            or mse
+            or "per_channel" in p
+            # (below opset 13 the Q/DQ weights are per tensor: there are no
+            # per-channel scales to keep)
+            or low_opset
         )
         if requantize:
             self._approx(
@@ -2257,7 +2339,13 @@ class ModelQuantizer:
         legacy_adaquant = "adaquant" in by_name and by_name["adaquant"].params.get(
             "legacy_engine"
         )
-        if not per_channel and ("gptq" in by_name or legacy_adaquant):
+        if (
+            not per_channel
+            and ("gptq" in by_name or legacy_adaquant)
+            # (a DequantizeLinear has no ``axis`` below opset 13, which Quark's
+            # per-channel mode raises for: GPTQ re-grids the weights itself there)
+            and not (_default_opset(model) < 13 and not legacy_adaquant)
+        ):
             per_channel = True
             self._approx("weights quantized per channel (needed by the algorithm)")
 
@@ -2266,6 +2354,11 @@ class ModelQuantizer:
         float_model = model
         work = model
         npu_cnn = bool(act.pof2 and wt.pof2 and opts.get("EnableNPUCnn", True))
+        if npu_cnn and bool(opts.get("PerChannel", False)):
+            raise ValueError(
+                "Only per-tensor quantization is supported when enable_npu_cnn=True, "
+                "`per_channel` must be set to False."
+            )
         if opts.get("ReduceRange") and npu_cnn:
             raise ValueError(
                 "ReduceRange is not supported with the NPU CNN scheme (power-of-two "
@@ -2329,7 +2422,12 @@ class ModelQuantizer:
         )
         # Quark topologically sorts the float graph (with its own sort) before the
         # quantizer visits it, and quantizes the op types of its registries only
-        from onnxsim.quark_marking import quark_op_types, quark_sorted, skipped_nodes
+        from onnxsim.quark_marking import (
+            opset_unquantized_ops,
+            quark_op_types,
+            quark_sorted,
+            skipped_nodes,
+        )
 
         work = quark_sorted(work)
         ext = self._extended(act, wt)
@@ -2353,6 +2451,7 @@ class ModelQuantizer:
             force_no_input_check=bool(opts.get("ForceQuantizeNoInputCheck", True)),
             direct_pool=not (ext or npu_cnn),
             npu_registry=bool(ext or npu_cnn),
+            unquantized_ops=opset_unquantized_ops(work),
         )
         # Quark adds BatchNormalization to the op types it quantizes when it
         # converts BNs; without ConvertBNToConv a leftover one stays float
@@ -2462,6 +2561,10 @@ class ModelQuantizer:
                         and (scope_types is None or n.op_type in scope_types)
                     },
                 )
+            if ext and mixed_algo is not None:
+                # (the extended quantizer converts its Q/DQ nodes before
+                # AutoMixprecision re-quantizes layers with standard ones)
+                q = _qdq_to_ms_domain(q)
             return q
 
         bias_post = self._base_bias_post(work, act, wt)
@@ -2532,6 +2635,14 @@ class ModelQuantizer:
                 ),
                 quark_scale=not opts.get("BiasCorrectionStoredScale", False),
             )
+        if ext and mixed_algo is None:
+            quantized = _qdq_to_ms_domain(quantized)
+        # Quark registers the ``com.microsoft`` and ``com.amd.quark`` operator sets
+        # on every model it quantizes (``set_parameters_and_domain``)
+        have = {o.domain for o in quantized.opset_import}
+        for domain in ("com.microsoft", "com.amd.quark"):
+            if domain not in have:
+                quantized.opset_import.append(onnx.helper.make_opsetid(domain, 1))
         return quantized
 
 

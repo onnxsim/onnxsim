@@ -133,7 +133,7 @@ struct FuseRMSNorm final : public PredicateBasedPass {
     double d;
     if (FetchSoleValueOfTensor(v, d)) {
       out = static_cast<float>(d);
-      return true;
+      return static_cast<double>(out) == d;
     }
     // fp16/bf16 models carry their eps / 2 / 1 constants in the model's own
     // type; FetchSoleValueOfTensor<T> only matches an exact elem_type.

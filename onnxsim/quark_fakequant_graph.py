@@ -49,6 +49,8 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
+from onnxsim.quark_marking import opset_unquantized_ops
+
 COP_DOMAIN = "com.amd.quark"
 DQ_SUFFIX = "_DequantizeLinear_Output"
 Q_INPUT_SUFFIX = "_QuantizeLinear_Input"
@@ -206,6 +208,9 @@ def _attr(node: onnx.NodeProto, name: str, default):
 class _Plan:
     def __init__(self, model: onnx.ModelProto) -> None:
         self.inits = {t.name: t for t in model.graph.initializer}
+        # (ONNX Runtime's QDQ MaxPool / Resize quantizers, which Quark's flows
+        # reuse, do nothing below opset 12 / 11)
+        self.gated = opset_unquantized_ops(model)
         inferred = onnx.shape_inference.infer_shapes(model)
         self.elem: Dict[str, int] = {}
         for vi in (
@@ -234,6 +239,8 @@ class _Plan:
                 q.append(name)
 
         for n in model.graph.node:
+            if n.op_type in self.gated:
+                continue
             if n.op_type in ACTIVE_OPS or n.op_type in (extra_active or ()):
                 # Resize's roi / scales / sizes are parameters, not data.
                 for x in n.input[:1] if n.op_type == "Resize" else n.input:
