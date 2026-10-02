@@ -86,10 +86,18 @@ struct FuseLayerNorm final : public PredicateBasedPass {
     return false;
   }
 
-  static bool IsScalarConstantApprox(Value* v, double target,
-                                     double tol = 1e-3) {
+  static bool IsScalarConstantExact(Value* v, double target) {
+    const Tensor* t = FetchConstantTensor(v);
+    if (t == nullptr) {
+      return false;
+    }
     double val = 0.0;
-    return ExtractScalarConstant(v, val) && std::fabs(val - target) < tol;
+    if (!ExtractScalarConstant(v, val)) {
+      return false;
+    }
+    return t->elem_type() == TensorProto_DataType_FLOAT
+               ? static_cast<float>(val) == static_cast<float>(target)
+               : val == target;
   }
 
   // Splits a 2-input commutative node into (the operand that is a scalar
@@ -198,6 +206,9 @@ struct FuseLayerNorm final : public PredicateBasedPass {
     if (!ExtractScalarConstant(eps_v, eps)) {
       return false;
     }
+    if (static_cast<double>(static_cast<float>(eps)) != eps) {
+      return false;
+    }
     Node* var_node = var->node();
     if (!ReducesLastAxisKeepdims(var_node)) {
       return false;
@@ -221,7 +232,7 @@ struct FuseLayerNorm final : public PredicateBasedPass {
       }
     } else if (sq_node->kind() == kPow) {
       if (sq_node->inputs().size() != 2 || sq_node->input(0) != diff ||
-          !IsScalarConstantApprox(sq_node->input(1), 2.0)) {
+          !IsScalarConstantExact(sq_node->input(1), 2.0)) {
         return false;
       }
     } else {

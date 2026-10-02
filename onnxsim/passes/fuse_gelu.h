@@ -15,10 +15,8 @@
 // with the decomposition (a caller wanting the fusion can convert the model
 // to opset >= 20 first via ``Simplify``'s ``target_opset_version``).
 //
-// The constants (0.5, 1, sqrt(2)) are matched within a small tolerance rather
-// than exactly, since they are often baked in as float32 (whose nearest
-// representable sqrt(2) already differs from the double literal in the last
-// bit) or produced by a tracer that rounds them.
+// Formula constants must equal the nearest representation in their source
+// tensor type; nearby values describe a different computation.
 
 #pragma once
 
@@ -68,10 +66,18 @@ struct FuseGelu final : public PredicateBasedPass {
     return false;
   }
 
-  static bool IsScalarConstantApprox(Value* v, double target,
-                                     double tol = 1e-3) {
+  static bool IsScalarConstantExact(Value* v, double target) {
+    const Tensor* t = FetchConstantTensor(v);
+    if (t == nullptr) {
+      return false;
+    }
     double val = 0.0;
-    return ExtractScalarConstant(v, val) && std::fabs(val - target) < tol;
+    if (!ExtractScalarConstant(v, val)) {
+      return false;
+    }
+    return t->elem_type() == TensorProto_DataType_FLOAT
+               ? static_cast<float>(val) == static_cast<float>(target)
+               : val == target;
   }
 
   // Given a 2-input commutative node, returns the non-constant operand in
@@ -82,8 +88,8 @@ struct FuseGelu final : public PredicateBasedPass {
     }
     Value* a = n->input(0);
     Value* b = n->input(1);
-    const bool a_is = IsScalarConstantApprox(a, target);
-    const bool b_is = IsScalarConstantApprox(b, target);
+    const bool a_is = IsScalarConstantExact(a, target);
+    const bool b_is = IsScalarConstantExact(b, target);
     if (a_is == b_is) {
       return false;  // need exactly one match (rules out both/neither).
     }
@@ -140,7 +146,7 @@ struct FuseGelu final : public PredicateBasedPass {
       if (t0_node->input(0) != cand_x) {
         continue;
       }
-      if (!IsScalarConstantApprox(t0_node->input(1), std::sqrt(2.0))) {
+      if (!IsScalarConstantExact(t0_node->input(1), std::sqrt(2.0))) {
         continue;
       }
       m.x = cand_x;

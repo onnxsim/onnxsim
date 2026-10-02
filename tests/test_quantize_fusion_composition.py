@@ -81,7 +81,7 @@ def _assert_close(float_outputs, quant_outputs, tol=0.1):
 
 def _causal_mask(seq_len):
     mask = np.zeros((1, 1, seq_len, seq_len), dtype=np.float32)
-    mask[0, 0][np.triu_indices(seq_len, k=1)] = -3.0e38
+    mask[0, 0][np.triu_indices(seq_len, k=1)] = -np.inf
     return mask
 
 
@@ -300,7 +300,7 @@ class _TorchGQAAttention(nn.Module):
         # internally and unconditionally; see fuse_gqa.h's own top comment).
         mask = torch.zeros(1, 1, seq_len, seq_len)
         mask.masked_fill_(
-            torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool(), -3.0e38
+            torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool(), -torch.inf
         )
         self.register_buffer("mask", mask, persistent=True)
 
