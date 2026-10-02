@@ -10,6 +10,7 @@ AdaRound is stochastic in Quark, so only error metrics are compared.
 """
 
 import contextlib
+import copy
 import io
 import tempfile
 import warnings
@@ -305,7 +306,9 @@ def _quark_gptq_pipeline(model, data, preset):
 
     d = tempfile.mkdtemp()
     onnx.save(model, d + "/m.onnx")
-    cfg = QConfig.get_default_config(preset)
+    # (the presets are shared objects and ``quantize_model`` merges the
+    # algorithm's options into the config's extra_options: work on a copy)
+    cfg = copy.deepcopy(QConfig.get_default_config(preset))
     cfg.global_quant_config.include_cle = False
     with _Quiet():
         ModelQuantizer(cfg).quantize_model(
