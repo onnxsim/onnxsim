@@ -270,6 +270,7 @@ def skipped_nodes(
       ``MaxPool`` (and ``AveragePool`` with ``direct_pool``, ONNX Runtime's plain
       scheme) whose input is unmarked, unless ``force_no_input_check``; likewise a
       ``Gather`` and a ``Where``;
+    - a ``LayerNormalization`` whose input is unmarked, unless ``force_no_input_check``;
     - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5``;
     - any node whose op type is in ``unquantized_ops`` (ONNX Runtime's
       ``QDQMaxPool`` / ``QDQResize`` return without marking anything below opset
@@ -291,7 +292,10 @@ def skipped_nodes(
         return n.name or (n.output[0] if n.output else "")
 
     for n in nodes:
-        if n.domain not in ("", "ai.onnx") or n.op_type in (
+        # (Quark's quantizers go by op type: the contrib ``Gelu`` its FuseGelu
+        # writes is visited like the ai.onnx one)
+        contrib_gelu = n.domain == "com.microsoft" and n.op_type == "Gelu"
+        if (n.domain not in ("", "ai.onnx") and not contrib_gelu) or n.op_type in (
             "QuantizeLinear",
             "DequantizeLinear",
         ):
@@ -330,6 +334,13 @@ def skipped_nodes(
                 marked.update(ins[1:3] + outs)
             elif len(ins) > 2 and ins[1] in marked and ins[2] in marked:
                 marked.update(outs)
+            else:
+                skipped.add(key(n))
+        elif op == "LayerNormalization":
+            # (QDQLayerNorm: without ForceQuantizeNoInputCheck it touches nothing --
+            # scale and bias included -- unless its input is already marked)
+            if force_no_input_check or (ins and ins[0] in marked):
+                marked.update(ins + outs[:1])
             else:
                 skipped.add(key(n))
         elif op == "HardSigmoid":

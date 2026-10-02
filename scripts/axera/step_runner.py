@@ -1819,7 +1819,12 @@ class StepRunner:
         self.prefix = "d"
         self.staged_time: dict[str, float] = {}  # segment -> seconds on the staged path
         self.expand_dir: str | None = None  # cache dir for device Expand models
+        # device min/max of the named chains' inputs and output (``--train-recal device``)
+        self.amax_segs: set[str] = set()
+        self._amax_pending: list[tuple[str, str, str]] = []  # (segment, tensor, device name)
         self._expand_blobs: dict[tuple, bytes | None] = {}
+        self._amax_blobs: dict[int, bytes] = {}
+        self._shapes: dict[str, tuple] = {}
         # segment name -> (device Transpose blobs, final shape) for the 16-bit
         # chains whose trailing Transpose runs on the device
         self.post_chain: dict[str, tuple[list[bytes], tuple[int, ...]]] = {}
@@ -1964,6 +1969,47 @@ class StepRunner:
         if not cached:
             self.session.unload(m)
 
+    def _measure(self, seg: Segment, in_names: Sequence[str], out_name: str) -> None:
+        """Queue device min/max reductions of ``seg``'s inputs and output (their
+        results are read by ``collect_amax`` at the end of the run)."""
+        import u16_chain
+
+        for k, (t, dev) in enumerate([*zip(seg.inputs, in_names), (seg.outputs[0], out_name)]):
+            shape = self._tensor_shape(t, dev)
+            numel = int(np.prod(shape))
+            blob = self._amax_blobs.get(numel)
+            if blob is None:
+                blob = self._amax_blobs[numel] = u16_chain.amax_blob(self.expand_dir, numel)
+            em, ecached = self._load_blob(blob)
+            try:
+                tag = f"a:{seg.name}:{k}"
+                self.session.run_t(em, [dev], [tag])
+            finally:
+                self._release(em, ecached)
+            self._amax_pending.append((seg.name, t, tag))
+
+    def _tensor_shape(self, t: str, dev: str) -> tuple:
+        sh = self._shapes.get(t)
+        if sh is None:
+            sh = self._shapes[t] = tuple(
+                d.dim_value
+                for v in (*self.model.graph.input, *self.model.graph.value_info, *self.model.graph.output)
+                if v.name == t
+                for d in v.type.tensor_type.shape.dim
+            )
+        return sh
+
+    def collect_amax(self) -> dict[str, dict[str, tuple[float, float]]]:
+        """Read the queued min/max results: ``{segment: {tensor: (min, max)}}``."""
+        self.session.sync()
+        out: dict[str, dict[str, tuple[float, float]]] = {}
+        for seg, t, tag in self._amax_pending:
+            a = self.session.tget(tag, np.float32, (1, 2))
+            self.session.tdel(tag)
+            out.setdefault(seg, {})[t] = (float(a[0, 1]), float(a[0, 0]))
+        self._amax_pending = []
+        return out
+
     def _expand_blob(self, src: tuple, dst: tuple) -> bytes | None:
         """The compiled device Expand model ``src`` -> ``dst`` (built once)."""
         key = (src, dst)
@@ -2079,6 +2125,8 @@ class StepRunner:
                         self._release(tm, tcached)
                     self.session.tdel(cur)
                     cur = nxt
+            if seg.name in self.amax_segs:
+                self._measure(seg, names, outs[0])
         finally:
             self._release(m, cached)
             for name in temps:
@@ -2864,6 +2912,7 @@ def run_recal_steps(
     steps: Sequence[int],
     margin: float,
     probe_nodes: Sequence[str] = (),
+    recal_pattern: str = "",
 ) -> list[dict]:
     """Run training steps of the calibration dataset on the device with the
     16-bit MatMul/Conv chains recalibrated per step (``policy``):
@@ -2909,11 +2958,26 @@ def run_recal_steps(
             ranges[name] = u16_chain.chain_ranges(
                 info["sub"], _chain_samples(info, fouts)
             )
-            if policy == "static" or (policy == "delayed" and not prev_ranges):
+            if recal_pattern and not re.search(recal_pattern, name):
+                continue  # this chain keeps its template (bisecting a policy)
+            if policy == "derived":
+                # only what the device can measure (the chain's inputs and output) is
+                # kept; the rest is derived (u16_chain.derive_ranges)
+                out_t = [o.name for o in info["sub"].graph.output][0]
+                keep_exact = [*info["inputs"], out_t]
+                if os.environ.get("DERIVED_EXACT_MM"):  # diagnostic: measure mm too
+                    keep_exact += [t for t in ranges[name] if t.endswith(("_mm", "_m0"))]
+                ranges[name] = u16_chain.derive_ranges(
+                    info["sub"],
+                    info["path"] + ".quant.json",
+                    templates[name][1],
+                    {t: ranges[name][t] for t in keep_exact},
+                )
+            if policy == "static" or (policy in ("delayed", "derived") and not prev_ranges):
                 runner._emitted.pop(name + "__recal", None)
                 continue
             use = ranges[name] if policy == "exact" else prev_ranges[name]
-            m = margin if policy == "delayed" else 1.0
+            m = margin if policy in ("delayed", "derived") else 1.0
             quant = info["path"] + ".quant.json"
             tmpl, tscales = templates[name]
             new = u16_chain.predict_scales16(quant, use, m)
@@ -2924,6 +2988,20 @@ def run_recal_steps(
                     tmpl, tscales, {t: new.get(t, tscales[t]) for t in tscales}
                 )
                 runner._emitted[name] = out.SerializeToString()
+                load = os.environ.get("RECAL_LOAD")  # diagnostic: use another run's blob
+                if (
+                    load
+                    and re.search(os.environ.get("RECAL_LOAD_ONLY", "."), name)
+                    and os.path.exists(f"{load}_{k}_{name}.axmodel")
+                ):
+                    with open(f"{load}_{k}_{name}.axmodel", "rb") as f:
+                        runner._emitted[name] = f.read()
+                if os.environ.get("RECAL_DUMP"):
+                    os.makedirs(os.environ["RECAL_DUMP"], exist_ok=True)
+                    with open(os.path.join(os.environ["RECAL_DUMP"], f"{policy}_{k}_{name}.scales.json"), "w") as f:
+                        json.dump({t: [float(a), float(b)] for t, (a, b) in {t: new.get(t, tscales[t]) for t in tscales}.items()}, f)
+                    with open(os.path.join(os.environ["RECAL_DUMP"], f"{policy}_{k}_{name}.axmodel"), "wb") as f:
+                        f.write(runner._emitted[name])
                 moved += 1
             except Exception as exc:  # keep the template's scales
                 runner._emitted[name] = open(info["path"], "rb").read()
@@ -3052,6 +3130,7 @@ def run_train_loop(
     recal: str = "static",
     u16_info: Mapping[str, Mapping] | None = None,
     margin: float = 1.3,
+    diag: bool = False,
 ) -> list[dict]:
     """Train on the device across ``steps`` of the calibration dataset with the
     weights and Adam state staying on the device: step k's updated state tensors
@@ -3086,7 +3165,28 @@ def run_train_loop(
         runner.prefix = f"d{i % 2}"
         keep = [loss_name] + (list(grad_names.values()) if validate else [])
         chains_moved = chains_refused = 0
-        if recal != "static" and u16_info:
+        if recal == "device" and u16_info:
+            runner.amax_segs = set(u16_info)
+            if prev_ranges:  # ranges derived from the previous step's measurements
+                chains_moved, chains_refused = apply_chain_scales(
+                    runner, u16_info, templates, prev_ranges, margin
+                )
+                if diag:  # how far the derived scales are from the exact ones
+                    cur = {w: session.tget(t.name, t.dtype, t.shape) for w, t in dev_state.items()}
+                    rfeeds = {t: v for t, v in data.items() if t not in sm}
+                    rfeeds.update(cur)
+                    need = {t for inf in u16_info.values() for t in inf["inputs"]}
+                    routs, _ = StepRunner(model, []).run(rfeeds, "float", keep=sorted(need))
+                    worst = []
+                    for n, inf in u16_info.items():
+                        q = inf["path"] + ".quant.json"
+                        ex = u16_chain.predict_scales16(q, u16_chain.chain_ranges(inf["sub"], _chain_samples(inf, routs)))
+                        pr = u16_chain.predict_scales16(q, prev_ranges[n], margin)
+                        worst += [(pr[t][0] / ex[t][0], n, t) for t in ex if t in pr and ex[t][0] > 0]
+                    worst.sort()
+                    print(f"  diag step {k}: derived/exact scale, smallest 8:", [(round(r, 3), n[-22:], t[-18:]) for r, n, t in worst[:8]], flush=True)
+                    print(f"  diag step {k}: chains with a tensor below 1.0: {len({n for r, n, t in worst if r < 1.0})} of {len(u16_info)}", flush=True)
+        elif recal != "static" and u16_info:
             # ranges of every chain tensor at the state this step starts from: a
             # float step on that state (the state is downloaded for it). exact uses
             # them now; delayed uses the previous step's, widened by ``margin``.
@@ -3118,6 +3218,14 @@ def run_train_loop(
             keep_device=[sm[w] for w in sm],
         )
         wall = time.time() - t0
+        if recal == "device" and u16_info:
+            meas = runner.collect_amax()
+            prev_ranges = {}
+            for n, inf in u16_info.items():
+                quant = inf["path"] + ".quant.json"
+                prev_ranges[n] = u16_chain.derive_ranges(
+                    inf["sub"], quant, templates[n][1], meas.get(n, {})
+                )
         timing = {k: (v[0], round(v[1], 2)) for k, v in session.timing.items()}
         if i == len(steps) - 1 and session.exec_by_tag is not None:
             top = sorted(session.exec_by_tag.items(), key=lambda kv: -kv[1])
@@ -3450,9 +3558,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--u16-margin-factor", type=float, default=1.3)
     p.add_argument(
+        "--train-margin",
+        type=float,
+        default=2.0,
+        help="headroom of --train-recal device/delayed over the previous step's "
+        "ranges: gradient outputs move by about 2x between steps",
+    )
+    p.add_argument(
         "--u16-recal",
         default="",
-        choices=["", "static", "delayed", "exact"],
+        choices=["", "static", "delayed", "derived", "exact"],
         help="run --steps with the MatMul/Conv 16-bit chains recalibrated per "
         "step onto the scales predicted from: static = the reference batch "
         "(no recalibration), delayed = the previous step's ranges with "
@@ -3473,18 +3588,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--train-recal",
         default="static",
-        choices=["static", "delayed", "exact"],
-        help="with --train-steps: move the 16-bit MatMul/Conv chains per step onto "
+        choices=["static", "delayed", "exact", "device"],
+        help="with --train-steps (device: the previous step's ranges measured on the device, no state download): move the 16-bit MatMul/Conv chains per step onto "
         "scales from the ranges of the state the step starts from (exact), the "
         "previous step's ranges times --u16-margin-factor (delayed), or keep the "
         "reference-batch templates (static). Evaluates the ranges with a float step "
         "on the downloaded state, so it is a measurement, not a fast path",
     )
     p.add_argument(
+        "--train-recal-diag",
+        action="store_true",
+        help="with --train-recal device: each step, compare the derived scales with "
+        "the exact ones (a float step on the downloaded state) and print the worst",
+    )
+    p.add_argument(
         "--train-validate",
         action="store_true",
         help="with --train-steps: also run a float chain and report how the "
         "device loop follows it (downloads gradients and weights every step)",
+    )
+    p.add_argument(
+        "--recal-chains",
+        default="",
+        metavar="REGEX",
+        help="with --u16-recal: only the chains whose name matches are recalibrated "
+        "(the others keep their templates)",
     )
     p.add_argument(
         "--steps",
@@ -3685,7 +3813,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.train_validate,
                 args.train_recal,
                 u16_info,
-                args.u16_margin_factor,
+                args.train_margin,
+                args.train_recal_diag,
             )
             runner.release_models()
         with open(args.out, "w") as f:
@@ -3706,6 +3835,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 [int(x) for x in args.steps.split(",")],
                 args.u16_margin_factor,
                 [x for x in args.probe_nodes.split(",") if x],
+                args.recal_chains,
             )
         with open(args.out, "w") as f:
             json.dump(results, f, indent=1)
