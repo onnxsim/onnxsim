@@ -1486,3 +1486,16 @@ Convs are ~60-70% of the time; the rest is data movement. From the isolated-op m
 3. **1x1 MatMul-path rate** (ResNet-50 ~28 ms at ~130 GFLOPS vs the ~210 the Winograd convs reach; YOLO M 13.5 ms): kernel change, -8 to -12 ms on ResNet-50, -3 to -4 on YOLO. The texture direct kernel in mode 2 is neutral with class-tuned tiles on these shapes; the untried parts are the 4-wide K unroll and cooperative weight loading into workgroup memory suggested by the 1x1 tuning job, or exact RGBA32F weights (K >= 1024 only today).
 4. Winograd stage fusion (input transform into the producer's epilogue, output transform into the consumer): -0.5 to -1 ms per model (the dispatch floor of the 4-program Winograd path is ~0.7 ms on ResNet-50 and ~0.7 on YOLO11n); graph capture already removes most of the floor.
 5. Everything else is small: T/M2 stride-2 convs run at 160-240 GFLOPS (fine), the stem is ~1 ms, the head elementwise ops and attention MatMul/Softmax ~2-3 ms on YOLO11n.
+
+## Fused Concat -> 1x1 conv (`ort_concat_conv.patch`, opt-in `ORT_WEBGPU_CONCAT_CONV=1`, work in progress)
+
+New contrib op `com.microsoft::NhwcConcatConv1x1(W, B, X0..Xn-1)` (schema in `nhwc_schema_defs.cc`, WebGPU kernel `contrib_ops/webgpu/concat_conv.cc`, `ConvConcatTexProgram` in `conv2d_mm.cc`): a ConvActivationFusion rule folds
+`Concat(axis=-1) -> 1x1 stride-1 Conv` (constant float weight, with bias, 2-6 inputs, every channel count a multiple of 4) into one op that reads each concat input directly and keeps the weights in an RGBA16F/32F texture (cached; exact RGBA32F when K >= 1024); the activation rule then fuses the following ReLU/SiLU.
+YOLO11n fuses 15 convs, YOLO26n 17. First measurements with an untuned tile (2 pixels x 2 vec4 channels, 32x2; env `ORT_WEBGPU_CONCATCONV_{TM,NV,WX,WY,TABLE,LOG}`), medians (ms):
+
+| model | off | fused, texdirect off | texdirect 1, fused off | texdirect 1, fused on |
+|---|---|---|---|---|
+| YOLO11n | 70.5/70.2 | **69.0/68.7** | 64.8/63.7 | 61.9/67.2 (noisy) |
+| YOLO26n | 61.9/61.2 | 59.8/63.2 | 55.0/53.1 | 65.9/64.8 (**worse**) |
+
+Accuracy vs the CPU EP: YOLO11n 3.9e-3, YOLO26n 1.2e-3 (f16 weights). As with the 1x1 texdirect convs the default tile is wrong for many 1x1 classes (the earlier tuning needed per-class tiles); the class-wise tuning of this op was handed to a separate job.
