@@ -486,6 +486,8 @@ def requantize_biases_int8(
     exclude_layers: Sequence[str] = (),
     power_of_two: bool = False,
     dtype: str = "int8",
+    per_channel: bool = False,
+    symmetric: bool = True,
 ) -> onnx.ModelProto:
     """Replace the int32 bias (``input_scale * weight_scale``) of every
     promoted node by Quark's ``Int32Bias=False`` form: the bias quantized like
@@ -493,7 +495,8 @@ def requantize_biases_int8(
     scale ``max|b| / qmax`` (rounded up to a power of two with
     ``power_of_two``, as Quark's ``VINT8``), zero point 0. The codes come from
     the float model's bias (the int32 form is too coarse to recover them
-    from)."""
+    from). ``per_channel``: one scale per element (``axis=0``); a not
+    ``symmetric`` bias takes the asymmetric grid over its range."""
     qmax = {"int8": 127, "int16": 32767}[dtype]
     np_dt = {"int8": np.int8, "int16": np.int16}[dtype]
     opset = next(
@@ -529,24 +532,39 @@ def requantize_biases_int8(
             b = numpy_helper.to_array(q).astype(np.float64) * numpy_helper.to_array(
                 inits[dq.input[1]]
             ).astype(np.float64)
-        amax = float(np.max(np.abs(b))) if b.size else 0.0
-        scale = np.float32(amax / qmax) if amax > 0 else np.float32(1.0)
-        if power_of_two and amax > 0:
-            scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
         names = (base + "_quantized", base + "_scale", base + "_zero_point")
+        if per_channel and b.ndim == 1 and b.size > 1:
+            scale = (np.maximum(np.abs(b), 1e-12) / qmax).astype(np.float32)
+            if power_of_two:
+                scale = (2.0 ** np.ceil(np.log2(scale))).astype(np.float32)
+            codes = np.clip(np.round(b / scale), -qmax, qmax).astype(np_dt)
+            zero = np.zeros(scale.shape, np_dt)
+        elif not symmetric and not power_of_two:
+            from onnxsim.full_qdq import _weight_qparams
+
+            s32, z = _weight_qparams(b.min(), b.max(), -qmax - 1, qmax, False)
+            scale = np.float32(s32)
+            codes = np.clip(np.round(b / scale) + z, -qmax, qmax).astype(np_dt)
+            zero = np.array(z, np_dt)
+        else:
+            amax = float(np.max(np.abs(b))) if b.size else 0.0
+            scale = np.float32(amax / qmax) if amax > 0 else np.float32(1.0)
+            if power_of_two and amax > 0:
+                scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
+            codes = np.clip(np.round(b / scale), -qmax - 1, qmax).astype(np_dt)
+            zero = np.array(0, np_dt)
         g.initializer.extend(
             [
-                numpy_helper.from_array(
-                    np.clip(np.round(b / scale), -qmax - 1, qmax).astype(np_dt),
-                    names[0],
-                ),
-                numpy_helper.from_array(np.array(scale, np.float32), names[1]),
-                numpy_helper.from_array(np.array(0, np_dt), names[2]),
+                numpy_helper.from_array(codes, names[0]),
+                numpy_helper.from_array(np.asarray(scale, np.float32), names[1]),
+                numpy_helper.from_array(zero, names[2]),
             ]
         )
         drop.update(dq.input)
         dq.input[:] = list(names)
         del dq.attribute[:]
+        if per_channel and b.ndim == 1 and b.size > 1:
+            dq.attribute.append(onnx.helper.make_attribute("axis", 0))
         dq.domain = "com.microsoft" if ms else ""
     if ms and not any(o.domain == "com.microsoft" for o in m.opset_import):
         m.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))

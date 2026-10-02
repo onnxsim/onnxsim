@@ -14,6 +14,7 @@ import re
 import zlib
 
 import numpy as np
+import onnx
 import pytest
 import test_quark_xint8_parity as P  # noqa: E402  (also sets up the Quark imports)
 from onnx import numpy_helper, parser
@@ -35,8 +36,30 @@ PRESETS = (
 _run_in_tmp_dir = P._run_in_tmp_dir  # the autouse fixture (Quark writes scratch files)
 
 
+def _quark_run(model, data, tmp_path, preset, extra=None):
+    """Quark's preset (``PerChannel`` is an attribute of its quantization config, not
+    an option; onnxsim reads it from ``extra_options``)."""
+    import contextlib
+    import copy
+    import io
+
+    from quark.onnx import ModelQuantizer, QConfig
+
+    extra = dict(extra or {})
+    cfg = copy.deepcopy(QConfig.get_default_config(preset))
+    cfg.global_quant_config.include_cle = False
+    cfg.global_quant_config.per_channel = bool(extra.pop("PerChannel", False))
+    cfg.global_quant_config.extra_options.update(extra)
+    src, dst = str(tmp_path / "src.onnx"), str(tmp_path / "dst.onnx")
+    onnx.save(model, src)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        ModelQuantizer(cfg).quantize_model(src, dst, P._reader(data))
+    return onnx.load(dst)
+
+
 def _same(model, data, tmp_path, preset, extra=None):
-    q = P._quark_preset(model, data, tmp_path, preset=preset, extra=extra)
+    q = _quark_run(model, data, tmp_path, preset, extra)
     m = P._mine_preset(model, data, preset=preset, extra=extra)
     return q, m
 
@@ -320,7 +343,7 @@ def _random_graph_ext(seed, big=False, rich=False):
         # a few intermediate tensors are graph outputs too
         cands = [t for t in tensors[1:] if t != cur]
         extra_outs = rng.sample(cands, min(len(cands), rng.randint(0, 2)))
-    outs = ", ".join(["float y"] + [f"float {t}" for t in extra_outs])
+    outs = ", ".join(["float y"] + [f"float[1,8,8,8] {t}" for t in extra_outs])
     m = parser.parse_model(
         f'<ir_version: 9, opset_import: ["": 17]> g (float[1,8,8,8] x) => ({outs}) {{'
         + "\n".join(lines)
@@ -731,6 +754,123 @@ def test_a_relu_clip_chain_propagates_the_range_two_steps(preset, tmp_path):
         for model in (q, m):
             scales = _q_scales(model)
             assert scales["c0"] == scales["k"]
+
+
+@pytest.mark.parametrize("preset", ["A16W8", "A8W8"])
+def test_asymmetric_eltwise_constants_keep_to_the_symmetric_code_range(
+    preset, tmp_path
+):
+    """With ``WeightSymmetric=False`` the constants an eltwise op reads (quantized
+    like weights, in the activation type) are asymmetric: the smallest element maps
+    to ``-qmax``, not to the type's ``-qmax - 1`` (Quark clips them like its
+    weights)."""
+    q, m = _both(
+        "c0 = Conv(x, w1, b1)\n s = Sigmoid(c0)\n m = Mul(s, cm)\n y = Conv(m, w2, b2)",
+        preset,
+        tmp_path,
+        extra={"WeightSymmetric": False, "AlignEltwiseQuantType": True},
+        cm=np.linspace(-1.0, 3.0, 8, dtype=np.float32).reshape(1, 8, 1, 1),
+    )
+    inits = P._inits(q)
+    by_out = {o: n for n in q.graph.node for o in n.output}
+    mul = next(n for n in q.graph.node if n.op_type == "Mul")
+    codes = inits[by_out[mul.input[1]].input[0]]
+    assert codes.min() == -np.iinfo(codes.dtype).max
+
+
+@pytest.mark.parametrize("preset", ["U16S8_AAWS", "S8S8_AAWS"])
+def test_eltwise_constants_are_symmetric_whatever_the_activation_symmetry(
+    preset, tmp_path
+):
+    """... and the constants of an eltwise op follow ``WeightSymmetric``, not the
+    (asymmetric) activations'; ``AlignEltwiseQuantType`` acts under the extended
+    quantizer only (``U16S8_AAWS``), elsewhere Quark warns and ignores it."""
+    _both(
+        "c0 = Conv(x, w1, b1)\n s = Sigmoid(c0)\n m = Mul(s, cm)\n y = Conv(m, w2, b2)",
+        preset,
+        tmp_path,
+        extra={"AlignEltwiseQuantType": True},
+        cm=np.linspace(-1.0, 3.0, 8, dtype=np.float32).reshape(1, 8, 1, 1),
+    )
+
+
+@pytest.mark.parametrize("preset", ["A8W8", "U8S8_AAWS", "A16W8"])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"Int32Bias": False, "PerChannel": True},
+        {"Int32Bias": False, "WeightSymmetric": False},
+    ],
+    ids=["per_channel", "asymmetric"],
+)
+def test_int8_biases_follow_per_channel_and_weight_symmetry(preset, extra, tmp_path):
+    """``Int32Bias=False``: the bias is quantized like a weight -- one scale per
+    element with ``PerChannel``, the asymmetric grid with ``WeightSymmetric=False``."""
+    _both(
+        "c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)",
+        preset,
+        tmp_path,
+        extra=extra,
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"PerChannel": True}, {"WeightSymmetric": False}],
+    ids=["per_channel", "asymmetric"],
+)
+def test_vint8_int8_biases_and_weights_follow_per_channel_and_weight_symmetry(
+    extra, tmp_path
+):
+    """The power-of-two flavour: a per-channel int8 bias takes one MinMSE scale per
+    element; asymmetric weights and biases take the zero point of the min / max
+    scale at the nearest position and the best scale around it at that zero point."""
+    _both(
+        "c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)",
+        "VINT8",
+        tmp_path,
+        extra=extra,
+        w1=1.5,
+        b1=1.5,
+    )
+
+
+def test_per_channel_quantizes_a_prelu_slope_per_row_unless_power_of_two(tmp_path):
+    q, m = _both(
+        "c0 = Conv(x, w1, b1)\n r = PRelu(c0, sl8)\n y = Conv(r, w2, b2)",
+        "A8W8",
+        tmp_path,
+        extra={"PerChannel": True},
+    )
+    for model in (q, m):
+        by_out = {o: n for n in model.graph.node for o in n.output}
+        prelu = next(n for n in model.graph.node if n.op_type == "PRelu")
+        slope = by_out[prelu.input[1]]
+        assert [a.i for a in slope.attribute if a.name == "axis"] == [0]
+    _both(
+        "c0 = Conv(x, w1, b1)\n r = PRelu(c0, sl8)\n y = Conv(r, w2, b2)",
+        "VINT8",
+        tmp_path,
+        extra={"PerChannel": True},
+    )
+
+
+@pytest.mark.parametrize("preset", ["A8W8", "A16W8"])
+def test_ops_without_a_quantizer_of_their_own_calibrate_their_output_alone(
+    preset, tmp_path
+):
+    """Flatten (not in Quark's registries; ``QuantizeAllOpTypes`` hands it to the
+    default operator quantizer) keeps its own range: a pool alignment that moves its
+    input's parameters leaves its output's alone."""
+    _both(
+        "c0 = Conv(x, w1, b1)\n g = GlobalAveragePool(c0)\n f = Flatten(g)\n"
+        " y = Gemm(f, wg, bg)",
+        preset,
+        tmp_path,
+        extra={"AlignPool": True, "QuantizeAllOpTypes": True},
+        wg=np.linspace(-1.0, 1.0, 32, dtype=np.float32).reshape(8, 4),
+        bg=np.linspace(-0.5, 0.5, 4, dtype=np.float32),
+    )
 
 
 @pytest.mark.parametrize("slope", ["sl8", "sl1"])

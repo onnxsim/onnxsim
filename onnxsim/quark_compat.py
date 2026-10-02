@@ -136,6 +136,28 @@ names and preset *meanings*, not copied.
   refused with ``XINT8`` (Quark refuses it too) and with power-of-two weights
   otherwise. Not implemented: ``AlignEltwise`` beyond ``AlignEltwiseQuantType``
   and the 16-bit ``AlignPool`` etc. for ``XINT8``.
+- The details the other integer presets (``A8W8``, ``A16W8``, ``VINT8``, the
+  ``*_AAWS`` ones, ``INT8_CNN_DEFAULT``, the transformer ones) depend on, all
+  checked against Quark 0.13 on randomized graphs (``tests/test_quark_int_presets_parity.py``):
+  ONNX Runtime's ``adjust_tensor_ranges`` runs twice (a Relu / Clip chain passes
+  its range two steps); the extended quantizer's alignment rewrites the shared
+  scale / zero-point initializers in place (a MaxPool output that shares its
+  input's moves with it) and its ``adjust_bias_scale`` re-quantizes the int32
+  biases with truncation after every alignment round; ``AlignEltwiseQuantType``
+  (extended quantizer only) gives every eltwise input its own parameters instead of
+  sharing; an all-zero activation range is scale 1 / zero point 0 for every
+  integer type; int32 biases saturate at the int32 limits; a Softmax gets the
+  unit range only when the quantizer quantizes it (not in the transformer
+  scheme); ``CalibMovingAverage`` averages the batch extremes in float32.
+  ``VINT8`` does not force data-movement ops on an unmarked input to quantize,
+  quantizes the op types of the model it is handed (so not the Slices
+  ``ConvertSplitToSlice`` makes), quantizes a PRelu slope like a weight, and
+  with ``DedicatedQDQPair`` gives each *quantized* reader (each input slot of
+  it) its own Q/DQ pair -- other readers see the float tensor, and a graph output
+  read by several of them stays float. Not reproduced: ``VINT8`` with
+  ``ActivationSymmetric=False`` / ``WeightSymmetric=False``, and Quark's
+  failures on graphs its own pre-processing breaks (an ``x - mean(y)`` pattern
+  its InstanceNormalization fusion chokes on).
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
   (``input_tensors``, or the deprecated ``activation``) and outputs
@@ -449,6 +471,19 @@ def _without_batch_norm(
     return types - {"BatchNormalization"}
 
 
+#: ops onnxsim's own flows share quantization parameters across but Quark's default
+#: operator quantizer (``QDQOperatorBase``) calibrates input and output separately
+_OWN_RANGE_OPS = (
+    "Flatten",
+    "Expand",
+    "Tile",
+    "Identity",
+    "GridSample",
+    "DepthToSpace",
+    "SpaceToDepth",
+)
+
+
 def _activation_rules(
     opts: Dict[str, Any], symmetric: bool, extended: bool, npu_cnn: bool
 ) -> Dict[str, Any]:
@@ -498,7 +533,11 @@ def _activation_rules(
         # outputs calibrated on their own: Slice always, Split under the extended
         # quantizer only (ONNX Runtime's Split shares the input's parameters,
         # which the plain and the power-of-two quantizer keep)
-        "unshared_ops": ("Slice", "Split") if extended else ("Slice",),
+        # (and so are the ops its plain operator quantizer handles -- the default one,
+        # which gives input and output their own ranges -- that onnxsim's own flows
+        # would share: Flatten, Expand, Tile, Identity, ...)
+        "unshared_ops": (("Slice", "Split") if extended else ("Slice",))
+        + _OWN_RANGE_OPS,
         # ... and ONNX Runtime's plain quantizer gives AveragePool its input's
         "shared_ops": () if extended or npu_cnn else ("AveragePool",),
     }
@@ -2046,6 +2085,8 @@ class ModelQuantizer:
             ("Conv", "ConvTranspose", "Gemm"),
             power_of_two=pof2,
             dtype=bits,
+            per_channel=bool(opts.get("PerChannel", False)),
+            symmetric=bool(opts.get("WeightSymmetric", wt.symmetric)),
         )
 
     def _auto_mixprecision(

@@ -185,6 +185,29 @@ def _quark_pof2_params(
     return float(pof2), new_zp
 
 
+def _pof2_minmse_asymmetric(w: np.ndarray) -> Tuple[float, int]:
+    """``(scale, zero_point)`` of an int8 weight (or bias) tensor on Quark's
+    asymmetric power-of-two MinMSE grid: the zero point of the min / max scale
+    taken to the nearest fixed-point position, and, around that position, the
+    candidate scale ``2^-(p-1) ... 2^-(p+3)`` with the least squared error *at
+    that zero point*; codes are clipped to ``[-127, 127]``."""
+    data = np.asarray(w, dtype=np.float32).ravel()
+    if not data.size:
+        return 1.0, 0
+    base, zp = _quark_pof2_params(
+        float(data.min()), float(data.max()), -128, 127, False
+    )
+    pos = int(np.rint(-np.log2(min(max(base, 2.0**-127), 2.0**127))))
+    best, best_s = np.float32("inf"), np.float32(base)
+    for i in range(5):
+        cand = np.float32(2.0 ** -(pos + i - 1))
+        q = np.clip(np.round(data / cand) + np.float32(zp), -127, 127)
+        diff = np.sum(((q - np.float32(zp)) * cand - data) ** 2, dtype=np.float32)
+        if diff < best:
+            best, best_s = diff, cand
+    return float(best_s), zp
+
+
 _TINY = float(np.finfo(np.float32).tiny)
 
 
@@ -1034,6 +1057,23 @@ def quantize_full_qdq(
                 )
             )
             return out
+        if p2_search and not weight_symmetric and weight_dtype == "int8":
+            s32, z = _pof2_minmse_asymmetric(w)
+            q = np.clip(np.round(w / np.float32(s32)) + z, -127, 127).astype(np.int8)
+            base = fresh(x)
+            add_init(base + "/int8", q)
+            add_init(base + "/scale", np.array(s32, np.float32))
+            add_init(base + "/zp", np.array(z, np.int8))
+            out = base + "/dq"
+            act_nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [base + "/int8", base + "/scale", base + "/zp"],
+                    [out],
+                    name=out,
+                )
+            )
+            return out
         if not p2 and (not weight_symmetric or weight_dtype == "uint8"):
             dt = "uint8" if weight_dtype == "uint8" else "int8"
             lo, hi = w_range(dt)
@@ -1134,7 +1174,16 @@ def quantize_full_qdq(
                     w_np = _DTYPES[weight_dtype][1]
                     wmin, wmax = w_range(weight_dtype)
                     w_max = wmax
-                    if not weight_symmetric or weight_dtype == "uint8":
+                    if (
+                        p2_search
+                        and not weight_symmetric
+                        and weight_dtype == "int8"
+                        and axis is None
+                    ):
+                        s32, z = _pof2_minmse_asymmetric(w)
+                        s, zp = np.array(s32, np.float32), np.array(z, w_np)
+                        q = np.clip(np.round(w / s) + z, -w_max, w_max).astype(w_np)
+                    elif not weight_symmetric or weight_dtype == "uint8":
                         clip_lo = max(wmin, -w_max)  # Quark: symmetric code range
                         if axis is None:
                             s32, z = _weight_qparams(
@@ -1291,16 +1340,19 @@ def quantize_full_qdq(
                     cache[key] = int8_tensor_dq(
                         x,
                         w,
-                        per_row=per_channel and n.op_type == "PRelu" and w.ndim > 1,
+                        per_row=per_channel
+                        and not p2
+                        and n.op_type == "PRelu"
+                        and w.ndim > 1,
                     )
                 n.input[k] = cache[key]
             else:
                 key = ("c", x, None)
                 if key not in cache:
-                    s, zp = _qparams(
-                        w.min(), w.max(), qmin, qmax, sym and weight_symmetric, p2
-                    )
-                    q = np.clip(np.round(w / s) + zp, qmin, qmax).astype(act_np)
+                    s, zp = _qparams(w.min(), w.max(), qmin, qmax, weight_symmetric, p2)
+                    # (the symmetric code range, like Quark's weights: no -128 / -32768)
+                    q = np.clip(np.round(w / s) + zp, max(qmin, -qmax), qmax)
+                    q = q.astype(act_np)
                     base = fresh(x)
                     add_init(base + "/q", q)
                     add_init(base + "/scale", np.array(s, np.float32))

@@ -379,3 +379,91 @@ def test_a_relu_clip_chain_propagates_the_range_two_steps():
     )
     params = _q_params(_quantize(model, "VINT8"))
     assert params["c0"] == params["k"]  # (one step: the Relu's range, reaching past 1)
+
+
+def _dq_of(model, name):
+    by_out = {o: n for n in model.graph.node for o in n.output}
+    inits = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
+    dq = by_out[name]
+    return dq, inits[dq.input[0]], inits[dq.input[1]], inits[dq.input[2]]
+
+
+@pytest.mark.parametrize("preset", ["A16W8", "A8W8"])
+def test_asymmetric_eltwise_constants_clip_to_the_symmetric_code_range(preset):
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n s = Sigmoid(c0)\n m = Mul(s, cm)\n y = Conv(m, w2, b2)",
+        cm=np.linspace(-1.0, 3.0, 8, dtype=np.float32).reshape(1, 8, 1, 1),
+    )
+    q = _quantize(
+        model, preset, extra={"WeightSymmetric": False, "AlignEltwiseQuantType": True}
+    )
+    mul = next(n for n in q.graph.node if n.op_type == "Mul")
+    _, codes, _, zp = _dq_of(q, mul.input[1])
+    assert codes.min() == -np.iinfo(codes.dtype).max and zp != 0
+
+
+def test_align_eltwise_quant_type_is_ignored_outside_the_extended_quantizer():
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n s = Sigmoid(c0)\n m = Mul(s, cm)\n y = Conv(m, w2, b2)",
+        cm=np.linspace(-1.0, 3.0, 8, dtype=np.float32).reshape(1, 8, 1, 1),
+    )
+    on = _quantize(model, "S8S8_AAWS", extra={"AlignEltwiseQuantType": True})
+    off = _quantize(model, "S8S8_AAWS")
+    assert on.SerializeToString() == off.SerializeToString()
+
+
+def test_int8_bias_per_channel_has_a_scale_for_every_element():
+    model = _model("c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)")
+    q = _quantize(model, "A8W8", extra={"Int32Bias": False, "PerChannel": True})
+    conv = [n for n in q.graph.node if n.op_type == "Conv"][0]
+    dq, codes, scale, zp = _dq_of(q, conv.input[2])
+    assert codes.dtype == np.int8 and scale.shape == (8,) == zp.shape
+    assert [a.i for a in dq.attribute if a.name == "axis"] == [0]
+    assert (np.abs(codes) == 127).all()  # (each element is its own channel)
+
+
+def test_int8_bias_asymmetric_has_a_zero_point():
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)", b1=np.full(8, 1.0, np.float32)
+    )
+    q = _quantize(model, "A8W8", extra={"Int32Bias": False, "WeightSymmetric": False})
+    conv = [n for n in q.graph.node if n.op_type == "Conv"][0]
+    _, codes, scale, zp = _dq_of(q, conv.input[2])
+    assert codes.dtype == np.int8 and int(zp) != 0
+
+
+def test_vint8_asymmetric_weights_take_the_power_of_two_zero_point():
+    model = _model("c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)", w1=1.5, b1=1.5)
+    q = _quantize(model, "VINT8", extra={"WeightSymmetric": False})
+    conv = [n for n in q.graph.node if n.op_type == "Conv"][0]
+    for k in (1, 2):
+        _, codes, scale, zp = _dq_of(q, conv.input[k])
+        assert float(scale) == 2.0 ** round(np.log2(float(scale)))
+        assert int(zp) != 0 and codes.min() >= -127
+
+
+def test_per_channel_gives_a_prelu_slope_a_scale_per_row():
+    model = _model("c0 = Conv(x, w1, b1)\n r = PRelu(c0, sl8)\n y = Conv(r, w2, b2)")
+    q = _quantize(model, "A8W8", extra={"PerChannel": True})
+    prelu = next(n for n in q.graph.node if n.op_type == "PRelu")
+    dq, codes, scale, zp = _dq_of(q, prelu.input[1])
+    assert scale.shape == (8,) and [a.i for a in dq.attribute if a.name == "axis"] == [
+        0
+    ]
+    # ... but not under the power-of-two schemes (VINT8)
+    q = _quantize(model, "VINT8", extra={"PerChannel": True})
+    prelu = next(n for n in q.graph.node if n.op_type == "PRelu")
+    _, _, scale, _ = _dq_of(q, prelu.input[1])
+    assert scale.shape == ()
+
+
+def test_flatten_keeps_its_own_range_when_a_pool_alignment_moves_its_input():
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n g = GlobalAveragePool(c0)\n f = Flatten(g)\n y = Gemm(f, wg, bg)",
+        wg=np.linspace(-1.0, 1.0, 32, dtype=np.float32).reshape(8, 4),
+        bg=np.linspace(-0.5, 0.5, 4, dtype=np.float32),
+    )
+    q = _quantize(model, "A8W8", extra={"AlignPool": True, "QuantizeAllOpTypes": True})
+    params = _q_params(q)
+    assert params["g"] == params["c0"]  # (AlignPool: the pool takes its input's)
+    assert "f" in params and params["f"] != params["g"]
