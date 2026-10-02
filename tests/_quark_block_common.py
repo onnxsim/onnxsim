@@ -202,6 +202,19 @@ def shared_bias() -> onnx.ModelProto:
     )
 
 
+def tiny_constants() -> onnx.ModelProto:
+    """Constants outside bfloat16's normal range: Quark's BF16 preset clips them into it
+    (a zero stays zero); the other formats leave them alone."""
+    rng = np.random.default_rng(17)
+    w = (rng.standard_normal((4, 3, 3, 3)) * 0.4).astype(F32)
+    w.reshape(-1)[:3] = [1e-39, 0.0, -3e-39]
+    b = np.array([0.5, 1e-40, 0.0, 3.4e38], F32)
+    return _model(
+        "y = Conv(x, w, b)",
+        [numpy_helper.from_array(w, "w"), numpy_helper.from_array(b, "b")],
+    )
+
+
 def split_concat() -> onnx.ModelProto:
     rng = np.random.default_rng(13)
     return _model(
@@ -300,6 +313,7 @@ PATTERNS: Dict[str, Callable[[], onnx.ModelProto]] = {
         clip_bare,
         clip_relu6,
         shared_bias,
+        tiny_constants,
         split_concat,
         leaky_conv,
         movement_chain,

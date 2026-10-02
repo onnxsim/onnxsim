@@ -564,12 +564,32 @@ def apply_fake_quant_format(
     else:
         quantized = plan.quantized_tensors(work, extra)
     if half:
-        fused = _fused_activation_inputs(work, plan.inits, remove_after)
+        # (structural rules of Quark's post-processing: they read the whole graph, the
+        # excluded nodes included)
+        fused = _fused_activation_inputs(m, plan.inits, remove_after)
         quantized = [t for t in quantized if t not in fused]
-    axes = _refine_axes(work, set(quantized), plan.inits)
+    axes = _refine_axes(m, set(quantized), plan.inits)
     roots = plan.share_roots(work, quantized, marking) if marking is not None else {}
     consts = [t for t in quantized if t in plan.inits]
     acts = [t for t in quantized if t not in plan.inits]
+    if marking is not None and dtype == "bfloat16" and const_dtype is None:
+        # Quark's bfloat16 constants "avoid the NaN issue due to overflow": a tensor
+        # with a magnitude outside bfloat16's normal range is clipped into it (a zero
+        # stays zero)
+        for c in consts:
+            w = numpy_helper.to_array(plan.inits[c])
+            if (
+                w.dtype.kind == "f"
+                and w.size
+                and (
+                    np.max(np.abs(w)) > 3.38953139e38
+                    or np.min(np.abs(w)) < 1.17549435e-38
+                )
+            ):
+                clipped = (
+                    np.sign(w) * np.clip(np.abs(w), 1.17549435e-38, 3.38953139e38)
+                ).astype(w.dtype)
+                plan.inits[c].CopyFrom(numpy_helper.from_array(clipped, c))
 
     def fake_quant(t: str, src: str, dst: str) -> List[onnx.NodeProto]:
         """The node(s) quantizing tensor ``t``: ``src`` -> ``dst``."""

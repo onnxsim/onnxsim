@@ -98,7 +98,7 @@ _MATMUL_NBITS = {
 }
 
 
-def _quark(model, data, tmp_path, preset, extra=None, optimize=None):
+def _quark(model, data, tmp_path, preset, extra=None, optimize=None, exclude=()):
     """Quark's preset as ``QConfig.get_default_config`` hands it out (a private copy;
     CLE off, which onnxsim leaves to a ``CLEConfig``). ``optimize`` is its
     ``optimize_model`` field (the ``OptimizeModel`` extra option is ignored by the
@@ -111,6 +111,7 @@ def _quark(model, data, tmp_path, preset, extra=None, optimize=None):
     if optimize is not None:
         g.optimize_model = optimize
     g.extra_options = {**g.extra_options, **(extra or {})}
+    g.nodes_to_exclude = list(exclude)
     src, dst = str(tmp_path / "src.onnx"), str(tmp_path / "dst.onnx")
     onnx.save(model, src)
     with (
@@ -121,8 +122,9 @@ def _quark(model, data, tmp_path, preset, extra=None, optimize=None):
     return onnx.load(dst)
 
 
-def _mine(model, data, preset, extra=None, optimize=None):
+def _mine(model, data, preset, extra=None, optimize=None, exclude=()):
     cfg = qc.QConfig.get_default_config(preset)
+    cfg.exclude = list(exclude)
     cfg.extra_options.update(extra or {})
     if optimize is not None:
         cfg.extra_options["OptimizeModel"] = optimize
@@ -134,7 +136,7 @@ def _mine(model, data, preset, extra=None, optimize=None):
         )
 
 
-def _both(name_or_model, preset, tmp_path, extra=None, optimize=None):
+def _both(name_or_model, preset, tmp_path, extra=None, optimize=None, exclude=()):
     model = (
         PATTERNS[name_or_model]() if isinstance(name_or_model, str) else name_or_model
     )
@@ -142,8 +144,8 @@ def _both(name_or_model, preset, tmp_path, extra=None, optimize=None):
     extra = dict(extra or {})
     if preset == "MATMUL_NBITS":
         extra = {**_MATMUL_NBITS, **extra}
-    q = _quark(model, data, tmp_path, preset, extra, optimize)
-    m = _mine(model, data, preset, extra, optimize)
+    q = _quark(model, data, tmp_path, preset, extra, optimize, exclude)
+    m = _mine(model, data, preset, extra, optimize, exclude)
     return model, data, q, m
 
 
@@ -271,7 +273,10 @@ _BLOCK = [
     "MXINT8",
 ]
 _HALF = ["BF16", "FP16"]
-_ALL = _BLOCK + _HALF + ["MATMUL_NBITS"]
+#: bfloat16 activations over block-format constants, block-format activations over
+#: int8 constants
+_MIXED = ["BF16_BFP16", "BF16_MXINT8", "MX9_INT8"]
+_ALL = _BLOCK + _HALF + _MIXED + ["MATMUL_NBITS"]
 #: one preset per family for the rest of the patterns
 _FAMILIES = ["BFP16", "MXINT8", "BF16", "FP16", "MATMUL_NBITS"]
 _CORE = ["conv_bn", "block20", "clip_bare", "reducemean"]
@@ -413,3 +418,47 @@ def test_decomposed_norm_and_gelu_follow_the_opset(build, preset, tmp_path):
     assert ("LayerNormalization" in got) == (build is not block13)
     assert ("Gelu" in got) == (build is block20)
     _assert_same_outputs(q, m, data, build.__name__)
+
+
+@pytest.mark.parametrize("name", ["bn_concat", "convt_bn", "gemm_bn"])
+def test_int_flow_leaves_a_quantized_batch_norm_to_the_quantizer(name, tmp_path):
+    """The same rule in the integer flows: with ``QuantizeAllOpTypes`` the
+    BatchNormalization is on Quark's op list, so its own folding passes skip it."""
+    from _quark_fusion_common import _graph_diff
+
+    _, data, q, m = _both(name, "XINT8", tmp_path, {"QuantizeAllOpTypes": True})
+    # (the integer flows' names are not Quark's: compared by content, as in the
+    # fusions' parity tests)
+    assert not _graph_diff(q, m), f"{name}: {_graph_diff(q, m)}"
+    assert "BatchNormalization" not in ops(q) or name == "gemm_bn"
+    _assert_same_outputs(q, m, data, name)
+
+
+def _named(model):
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    for i, n in enumerate(out.graph.node):
+        n.name = f"n{i}_{n.op_type}"
+    return out
+
+
+@pytest.mark.parametrize("preset", ["BFP16", "BF16", "FP16"])
+@pytest.mark.parametrize(
+    "name",
+    ["conv_bn", "matmul_add", "clip_relu6", "hardswish", "reducemean", "pad_conv"],
+)
+@pytest.mark.parametrize("which", ["first", "last", "first_two", "middle"])
+def test_excluded_nodes_match_quark(name, which, preset, tmp_path):
+    """An excluded node quantizes none of its tensors, but the structural rules of
+    Quark's post-processing (the Q/DQ pair before a ReLU, the block axis of a MatMul)
+    still read it."""
+    model = _named(PATTERNS[name]())
+    names = [n.name for n in model.graph.node]
+    exclude = {
+        "first": names[:1],
+        "last": names[-1:],
+        "first_two": names[:2],
+        "middle": [names[len(names) // 2]],
+    }[which]
+    _, data, q, m = _both(model, preset, tmp_path, exclude=exclude)
+    _assert_same(q, m, f"{name} {preset} exclude {exclude}")

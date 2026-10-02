@@ -339,3 +339,16 @@ def test_outputs_of_the_rewritten_float_graph_are_unchanged():
         np.testing.assert_allclose(
             run(out), run(model), rtol=1e-4, atol=1e-5, err_msg=name
         )
+
+
+def test_bfloat16_constants_outside_the_normal_range_are_clipped_like_quark():
+    out = _quantize("BF16", PATTERNS["tiny_constants"]())
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in out.graph.initializer}
+    lo = np.float32(1.17549435e-38)
+    np.testing.assert_array_equal(inits["w"].reshape(-1)[:3], [lo, 0.0, -lo])
+    np.testing.assert_array_equal(inits["b"][1:3], [lo, 0.0])
+    assert inits["b"][3] == np.float32(3.38953139e38)
+    for preset in ("FP16", "BFP16"):
+        out = _quantize(preset, PATTERNS["tiny_constants"]())
+        w = {t.name: onnx.numpy_helper.to_array(t) for t in out.graph.initializer}["w"]
+        assert w.reshape(-1)[0] == np.float32(1e-39)

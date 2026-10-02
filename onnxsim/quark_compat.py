@@ -2642,10 +2642,20 @@ class ModelQuantizer:
                 "scales); Quark refuses it too"
             )
         skip_pre = bool(opts.get("SkipPreprocess", False))
+        static_types = (
+            op_types
+            if op_types is not None
+            else self._static_op_types(
+                model,
+                extended=npu_cnn or self._extended(act, wt),
+                quantize_all=bool(opts.get("QuantizeAllOpTypes")),
+            )
+        )
         work = self._float_preprocess(
             work,
             copy_bias=self._calib_method(act)
             not in ("minmse_pof2", "nonoverflow", "layerwise_percentile"),
+            keep_bn=_quantized_batch_norms(model, static_types, exclude),
         )
         # Quark's order: CLE (stem equalization first), SmoothQuant, Quarot
         if "cle" in by_name:
