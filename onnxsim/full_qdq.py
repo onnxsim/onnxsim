@@ -430,6 +430,7 @@ def quantize_full_qdq(
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
     ort_gemm_beta: bool = False,
+    prelu_slope_per_row: bool = False,
     excluded_nodes_stay_float: bool = True,
     adjust_bias_scale: Optional[bool] = None,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
@@ -526,6 +527,9 @@ def quantize_full_qdq(
             consumers read the float value. ``False``: ONNX Runtime's (and
             Quark's) behaviour, the quantizer only does not mark the node -- its
             neighbours still put Q/DQ pairs around it
+    :param prelu_slope_per_row: with ``per_channel``, a PRelu slope of rank > 1
+            gets one scale per row (Quark's ``QDQPRelu``, in its NPU registry --
+            the extended quantizer); otherwise per tensor
     :param adjust_bias_scale: Quark's ``adjust_bias_scale`` for the int32 biases:
             ``None`` -- run it after each round of the ``align_ops`` loop (if
             any); ``True`` -- also once without any alignment (its extended
@@ -596,8 +600,6 @@ def quantize_full_qdq(
     if symmetric_activations is None:
         symmetric_activations = qmin < 0
     sym, p2 = symmetric_activations, power_of_two
-    if method == "minmse_pof2" and not sym:
-        raise ValueError("method 'minmse_pof2' needs symmetric activations")
     p2_search = p2 and pof2_mode == "minmse"
     tensor_symmetric = dict(tensor_symmetric or {})
     if isinstance(model, str):
@@ -1052,10 +1054,14 @@ def quantize_full_qdq(
         if per_row and w.ndim >= 1 and w.shape[0] > 1:
             qm = w_range("int8")[1]
             rows = w.reshape(w.shape[0], -1)
-            if not weight_symmetric and not p2:
-                sz = [
-                    _weight_qparams(r.min(), r.max(), -qm - 1, qm, False) for r in rows
-                ]
+            if not weight_symmetric and (not p2 or p2_search):
+                if p2:
+                    sz = [_pof2_minmse_asymmetric(r) for r in rows]
+                else:
+                    sz = [
+                        _weight_qparams(r.min(), r.max(), -qm - 1, qm, False)
+                        for r in rows
+                    ]
                 s = np.array([a for a, _ in sz], np.float32)
                 z = np.array([b for _, b in sz], np.int8)
                 shape = (-1,) + (1,) * (w.ndim - 1)
@@ -1230,15 +1236,24 @@ def quantize_full_qdq(
                     w_np = _DTYPES[weight_dtype][1]
                     wmin, wmax = w_range(weight_dtype)
                     w_max = wmax
-                    if (
-                        p2_search
-                        and not weight_symmetric
-                        and weight_dtype == "int8"
-                        and axis is None
-                    ):
-                        s32, z = _pof2_minmse_asymmetric(w)
-                        s, zp = np.array(s32, np.float32), np.array(z, w_np)
-                        q = np.clip(np.round(w / s) + z, -w_max, w_max).astype(w_np)
+                    if p2_search and not weight_symmetric and weight_dtype == "int8":
+                        if axis is None:
+                            s32, z = _pof2_minmse_asymmetric(w)
+                            s, zp = np.array(s32, np.float32), np.array(z, w_np)
+                            q = np.clip(np.round(w / s) + z, -w_max, w_max)
+                        else:
+                            chans = np.moveaxis(w, axis, 0).reshape(w.shape[axis], -1)
+                            sz = [_pof2_minmse_asymmetric(c) for c in chans]
+                            s = np.array([a for a, _ in sz], np.float32)
+                            zp = np.array([b for _, b in sz], w_np)
+                            shape = [1] * w.ndim
+                            shape[axis] = -1
+                            q = np.clip(
+                                np.round(w / s.reshape(shape)) + zp.reshape(shape),
+                                -w_max,
+                                w_max,
+                            )
+                        q = q.astype(w_np)
                     elif not weight_symmetric or weight_dtype == "uint8":
                         clip_lo = max(wmin, -w_max)  # Quark: symmetric code range
                         if axis is None:
@@ -1399,6 +1414,7 @@ def quantize_full_qdq(
                         x,
                         w,
                         per_row=per_channel
+                        and prelu_slope_per_row
                         and not p2
                         and n.op_type == "PRelu"
                         and w.ndim > 1,

@@ -516,3 +516,26 @@ def test_vint8_layer_normalization_on_an_unmarked_input_is_left_alone():
     )
     q = _quantize(m, "VINT8", _data((4, 16)))
     assert [n.op_type for n in q.graph.node] == ["LayerNormalization"]
+
+
+def test_vint8_with_asymmetric_activations_keeps_the_symmetric_minmse_grid():
+    """Quark's MinMSE power-of-two calibration reports symmetric ranges whatever
+    ``ActivationSymmetric`` says, so the (asymmetric) quantizer finds zero points of
+    0 -- except for a Softmax, whose output Quark sets to the range (0, 1)."""
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n s = Softmax<axis=1>(c0)\n y = Conv(s, w2, b2)"
+    )
+    q = _quantize(model, "VINT8", extra={"ActivationSymmetric": False})
+    params = _q_params(q)
+    assert params["c0"][1] == 0 and params["x"][1] == 0
+    assert params["s"][1] != 0
+
+
+def test_vint8_per_channel_asymmetric_weights_and_biases_have_a_zero_point_each():
+    model = _model("c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)", w1=1.5, b1=1.5)
+    q = _quantize(model, "VINT8", extra={"PerChannel": True, "WeightSymmetric": False})
+    conv = [n for n in q.graph.node if n.op_type == "Conv"][0]
+    for k in (1, 2):
+        dq, codes, scale, zp = _dq_of(q, conv.input[k])
+        assert scale.shape == zp.shape == (8,) and (zp != 0).any()
+        assert np.all(2.0 ** np.round(np.log2(scale)) == scale)  # (powers of two)

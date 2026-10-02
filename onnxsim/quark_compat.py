@@ -154,10 +154,15 @@ names and preset *meanings*, not copied.
   ``ConvertSplitToSlice`` makes), quantizes a PRelu slope like a weight, and
   with ``DedicatedQDQPair`` gives each *quantized* reader (each input slot of
   it) its own Q/DQ pair -- other readers see the float tensor, and a graph output
-  read by several of them stays float. Not reproduced: ``VINT8`` with
-  ``ActivationSymmetric=False`` / ``WeightSymmetric=False``, and Quark's
-  failures on graphs its own pre-processing breaks (an ``x - mean(y)`` pattern
-  its InstanceNormalization fusion chokes on).
+  read by several of them stays float. Also: an excluded node is only left
+  unmarked (its quantized neighbours still wrap it in Q/DQ pairs); a ``Gemm``
+  ``beta`` moves into the int32 bias scale (ONNX Runtime's ``QDQGemm``);
+  ``Int32Bias=False`` biases follow ``PerChannel`` (one scale per element) and
+  ``WeightSymmetric=False``; an asymmetric power-of-two weight takes the zero
+  point of the min / max scale and the best MinMSE scale around it; a PRelu slope
+  is per row under ``PerChannel`` with the extended quantizer. Not reproduced:
+  Quark's failures on graphs its own pre-processing breaks (an ``x - mean(y)``
+  pattern its InstanceNormalization fusion chokes on).
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
   (``input_tensors``, or the deprecated ``activation``) and outputs
@@ -2395,6 +2400,7 @@ class ModelQuantizer:
             # (Quark applies it to the extended quantizer only: elsewhere it warns
             # and does nothing)
             ort_gemm_beta=True,
+            prelu_slope_per_row=self._extended(act, wt),
             excluded_nodes_stay_float=False,
             # (the extended quantizer's refinement -- alignment, then the bias
             # scale adjustment -- always runs)

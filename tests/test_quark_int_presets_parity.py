@@ -829,8 +829,18 @@ def test_int8_biases_follow_per_channel_and_weight_symmetry(preset, extra, tmp_p
 
 @pytest.mark.parametrize(
     "extra",
-    [{"PerChannel": True}, {"WeightSymmetric": False}],
-    ids=["per_channel", "asymmetric"],
+    [
+        {"PerChannel": True},
+        {"WeightSymmetric": False},
+        {"PerChannel": True, "WeightSymmetric": False},
+        {"ActivationSymmetric": False},
+    ],
+    ids=[
+        "per_channel",
+        "asymmetric",
+        "per_channel_asymmetric",
+        "asymmetric_activations",
+    ],
 )
 def test_vint8_int8_biases_and_weights_follow_per_channel_and_weight_symmetry(
     extra, tmp_path
@@ -845,6 +855,19 @@ def test_vint8_int8_biases_and_weights_follow_per_channel_and_weight_symmetry(
         extra=extra,
         w1=1.5,
         b1=1.5,
+    )
+
+
+def test_a_plain_quantizer_quantizes_a_prelu_slope_per_tensor_even_per_channel(
+    tmp_path,
+):
+    """Only the extended quantizer's ``QDQPRelu`` goes per row; the default operator
+    quantizer ``QuantizeAllOpTypes`` hands a PRelu to quantizes the slope per tensor."""
+    _both(
+        "c0 = Conv(x, w1, b1)\n r = PRelu(c0, sl8)\n y = Conv(r, w2, b2)",
+        "S8S8_AAWS",
+        tmp_path,
+        extra={"PerChannel": True, "QuantizeAllOpTypes": True},
     )
 
 
