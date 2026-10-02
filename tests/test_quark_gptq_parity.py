@@ -10,6 +10,7 @@ AdaRound is stochastic in Quark, so only error metrics are compared.
 """
 
 import contextlib
+import copy
 import io
 import tempfile
 import warnings
@@ -288,3 +289,81 @@ def test_adaround_drop_ratio_end_to_end_error_tracks_quarks(mlp, drop_ratio):
     assert mine == pytest.approx(quark, rel=0.15)
     assert 0.8 * plain < mine < 1.2 * plain
     assert 0.8 * plain < quark < 1.2 * plain
+
+
+# -- GPTQ whatever the preset's weight dtype -----------------------------------------------
+
+_WEIGHT_DTYPE_PRESETS = ["A8W8", "A16W8", "U8U8_AAWA", "U8S8_AAWS", "INT16_CNN_DEFAULT"]
+
+
+def _quark_gptq_pipeline(model, data, preset):
+    """Quark's end-to-end GPTQ run (the algorithm list of the old config API)."""
+    from onnxruntime.quantization import CalibrationDataReader
+    from quark.onnx.quantization.config.algorithm import GPTQConfig
+
+    class R(_Reader, CalibrationDataReader):
+        pass
+
+    d = tempfile.mkdtemp()
+    onnx.save(model, d + "/m.onnx")
+    # (the presets are shared objects and ``quantize_model`` merges the
+    # algorithm's options into the config's extra_options: work on a copy)
+    cfg = copy.deepcopy(QConfig.get_default_config(preset))
+    cfg.global_quant_config.include_cle = False
+    with _Quiet():
+        ModelQuantizer(cfg).quantize_model(
+            d + "/m.onnx", d + "/q.onnx", R(data), algorithms=[GPTQConfig()]
+        )
+    return onnx.load(d + "/q.onnx")
+
+
+def _weight_grid(model, name):
+    """``(codes - zero_point, scale)`` of a weight, whatever the naming scheme."""
+    inits = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
+    dq = next(
+        n
+        for n in model.graph.node
+        if n.op_type == "DequantizeLinear" and n.input[0].startswith(name)
+    )
+    codes, scale = inits[dq.input[0]], inits[dq.input[1]]
+    zp = inits[dq.input[2]] if len(dq.input) > 2 else np.zeros((), np.int64)
+    return codes.astype(np.int64) - zp.astype(np.int64), np.asarray(scale, np.float64)
+
+
+def test_gptq_ignores_the_presets_weight_dtype_in_quark_and_here(mlp):
+    """Quark's GPTQ never raises for int16 / uint8 / asymmetric weight presets:
+    it re-grids the float weights to 8 bits (a weight-only uint8 graph) whatever
+    the preset says, so every preset ends up with the same weights. So does
+    the compat layer (it raised for int16 weights and approximated uint8)."""
+    model, data = mlp
+    quark = {p: _quark_gptq_pipeline(model, data, p) for p in _WEIGHT_DTYPE_PRESETS}
+    for p, q in quark.items():
+        assert {
+            t.data_type for t in q.graph.initializer if t.name.endswith("_quantized")
+        } == {onnx.TensorProto.UINT8}, p
+    mine = {}
+    for p in _WEIGHT_DTYPE_PRESETS:
+        cfg = qc.QConfig.get_default_config(p)
+        cfg.algo_config = [qc.GPTQConfig(per_channel=False)]  # Quark's own default
+        quantizer = qc.ModelQuantizer(cfg)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mine[p] = quantizer.quantize_model(
+                model, calibration_data_reader=_Reader(data)
+            )
+        assert len(quantizer.last_weight_rounding["gptq"]) == 2, p
+    ref = "A8W8"
+    for name in ("w1", "w2"):
+        q_ref, _ = _weight_grid(quark[ref], name)
+        m_ref, _ = _weight_grid(mine[ref], name)
+        for p in _WEIGHT_DTYPE_PRESETS:
+            q_codes, q_scale = _weight_grid(quark[p], name)
+            m_codes, m_scale = _weight_grid(mine[p], name)
+            np.testing.assert_array_equal(q_codes, q_ref)  # Quark: dtype-blind
+            np.testing.assert_array_equal(m_codes, m_ref)  # and so are we
+            # the grid is Quark's: one per-tensor scale (repeated per column there)
+            np.testing.assert_allclose(
+                m_scale.reshape(-1)[0], q_scale.reshape(-1)[0], rtol=1e-6
+            )
+        # error propagation moves some codes, never by more than a few steps
+        assert np.abs(m_ref - q_ref).max() <= 8

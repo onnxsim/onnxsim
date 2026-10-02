@@ -283,8 +283,12 @@ names and preset *meanings*, not copied.
   trains nothing). No effect on the numbers, so accepted and ignored:
   ``optim_device`` / ``infer_device`` / ``pin_memory`` / ``use_gds`` /
   ``log_period`` / ``cache_dir`` and ``mem_opt_level`` 0 vs 1 (probed against
-  Quark: identical codes); ``SaveAndRestore`` is a Quark checkpoint file (when
-  one exists Quark trains only the layers recorded in it) and is not read.
+  Quark: identical codes). ``extra_options["SaveAndRestore"]`` (a JSON file) is
+  Quark's checkpoint: the layer reached is written before every layer
+  (``model_to_finetune`` next to it, ``layers_to_finetune``) and an existing file
+  restricts training to the layers it lists, from the *original* quantized model
+  (Quark drops the model it loads); the calibration ranges Quark also keeps in that
+  file are not written.
   ``ref_model_path`` must be a float model. Layers Quark's torch modules cannot
   handle are skipped exactly where Quark skips them (``auto_pad``,
   ``ConvTranspose`` with ``output_padding`` / ``output_shape`` or asymmetric
@@ -301,7 +305,9 @@ names and preset *meanings*, not copied.
   :func:`onnxsim.apply_adaquant` (a different algorithm: rounding relaxation
   plus a learnable activation range). GPTQ is in
   :mod:`onnxsim.quark_weight_rounding` (Conv / Gemm / MatMul, guarded so a
-  layer's reconstruction error never gets worse).
+  layer's reconstruction error never gets worse). Like Quark's GPTQ (which never
+  raises for them) it runs for int16 / uint8 weight presets too, re-gridding the
+  float weights to 8 bits whatever the preset's weight dtype.
   GPTQ with
   ``bits`` / ``group_size`` / ``per_channel`` / ``mse`` / ``weight_symmetric``
   set re-grids the weights the way Quark's GPTQ does (``bits``-bit codes,
@@ -1174,9 +1180,11 @@ class ModelQuantizer:
 
         if wt.is_dynamic:
             raise NotImplementedError("dynamic weight quantization is not supported")
-        # GPTQ works on int8 weight codes; AdaRound / AdaQuant (Quark's
+        # Quark's GPTQ re-grids the float weights to 8 bits whatever the preset's
+        # weight dtype (probed: it never raises for int16 / uint8 weights), so
+        # it runs for every integer weight dtype; AdaRound / AdaQuant (its
         # FastFinetune) take any integer weight grid
-        can_run = _RUNNABLE_ALGOS - ({"gptq"} if wt.dtype == "int16" else set())
+        can_run = _RUNNABLE_ALGOS
         unsupported = [a.name for a in cfg.algo_config if a.name not in can_run]
         if unsupported and not ignore_unsupported_algos:
             raise NotImplementedError(
@@ -1729,7 +1737,13 @@ class ModelQuantizer:
         ``OutputQDQ`` on). ``guard`` (an onnxsim addition, default on) keeps a
         layer's new codes only if its block reconstruction error did not get
         worse; ``guard=False`` is Quark's behaviour."""
-        from onnxsim.quark_finetune import TARGET_OPS, FinetuneOptions, finetune
+        from onnxsim.quark_finetune import (
+            TARGET_OPS,
+            FinetuneOptions,
+            finetune,
+            load_saved_layers,
+            save_checkpoint,
+        )
 
         p = dict(algo.params)
         dropped = [k for k in _FASTFT_NOT_FORWARDED if k in p]
@@ -1779,13 +1793,33 @@ class ModelQuantizer:
         )
         self._approx(
             f"{name} is a numpy port of Quark's FastFinetune loop: mini-batches "
-            "come from numpy's generator instead of torch.randperm and the "
-            "arithmetic is float64, so results match Quark statistically "
+            "come from numpy's generator instead of torch.randperm"
+            + (
+                " and the arithmetic is float32 in torch's order (MatMul / "
+                "Gemm layers are bit-identical, convolutions and norms differ "
+                "in the last bit)"
+                if name == "adaquant"
+                else " and the arithmetic is float64"
+            )
+            + ", so results match Quark statistically "
             "(bit for bit given the same mini-batch indices)"
         )
         # update_bias: only AdaQuant reads it, as in Quark.
+        # ``SaveAndRestore`` (a JSON checkpoint file): Quark writes the layer it
+        # reached before every layer and, when the file already exists, trains
+        # only the layers it lists
+        saver = self.config.extra_options.get("SaveAndRestore")
+        layers = load_saved_layers(saver)
+        checkpoint = (
+            (lambda i, n, m: save_checkpoint(saver, i, n, m)) if saver else None
+        )
         out, self.last_weight_rounding[name] = finetune(
-            float_model, quantized, calibration, opt
+            float_model,
+            quantized,
+            calibration,
+            opt,
+            layers=layers,
+            checkpoint=checkpoint,
         )
         return out
 
@@ -2126,15 +2160,20 @@ class ModelQuantizer:
 
         if wt.dtype not in ("int8", "uint8", "int16"):
             raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
-        # GPTQ and the legacy AdaQuant engine work on int8 weight codes; Quark's
-        # FastFinetune (AdaRound, AdaQuant) trains any integer weight grid
+        # GPTQ and the legacy AdaQuant engine work on int8 weight codes (Quark's
+        # GPTQ ignores the preset's weight dtype and emits an 8-bit grid; its
+        # FastFinetune -- AdaRound, AdaQuant -- trains any integer weight grid)
         int8_only = any(
             a.name == "gptq" or (a.name == "adaquant" and a.params.get("legacy_engine"))
             for a in algos
         )
         uint8_weights = wt.dtype == "uint8" and not int8_only
-        if wt.dtype == "uint8" and not uint8_weights:
-            self._approx("weights quantized int8-symmetric instead of uint8")
+        int16_weights = wt.dtype == "int16" and not int8_only
+        if wt.dtype in ("uint8", "int16") and int8_only:
+            self._approx(
+                f"weights quantized int8-symmetric instead of {wt.dtype} "
+                "(GPTQ / the legacy AdaQuant engine work on int8 codes)"
+            )
         act_dtype = self._int_act_dtype(act)
 
         calibration = _drain_reader(reader)
@@ -2281,7 +2320,7 @@ class ModelQuantizer:
             power_of_two=act.pof2 or wt.pof2,
             per_channel=per_channel,
             weight_dtype=(
-                "int16" if wt.dtype == "int16" else "uint8" if uint8_weights else "int8"
+                "int16" if int16_weights else "uint8" if uint8_weights else "int8"
             ),
             weight_symmetric=bool(
                 opts.get("WeightSymmetric", wt.symmetric or int8_only)
@@ -2363,6 +2402,7 @@ class ModelQuantizer:
             from onnxsim.adaquant import apply_adaquant
 
             params = by_name["adaquant"].params
+            before = quantized.SerializeToString()
             quantized = apply_adaquant(
                 float_model,
                 quantized,
@@ -2373,6 +2413,12 @@ class ModelQuantizer:
                     if key in params
                 },
             )
+            if quantized.SerializeToString() == before:
+                self._approx(
+                    "the legacy AdaQuant engine found no layer it can optimize "
+                    "(it needs onnxsim's int8-weight / uint8-activation layout): "
+                    "the model is unchanged"
+                )
         elif "adaquant" in by_name:
             quantized = self._finetune(
                 "adaquant", float_model, quantized, calibration, by_name["adaquant"]
