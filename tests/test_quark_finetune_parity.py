@@ -347,6 +347,7 @@ def _options(ff):
         beta_range=ff.get("BetaRange", (20.0, 2.0)),
         parallel=ff.get("Parallel", False),
         select_max_mem_layer=ff.get("SelectMaxMemLayer", False),
+        selective_update=ff.get("SelectiveUpdate", False),
         guard=False,
     )
 

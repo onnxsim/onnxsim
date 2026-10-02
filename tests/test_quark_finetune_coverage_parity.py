@@ -30,8 +30,10 @@ statistically there.
 """
 
 import copy
+import json
 import re
 import warnings
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -121,11 +123,12 @@ def _opts(ff):
     return o
 
 
-def _replay(model, data, q, ff):
+def _replay(model, data, q, ff, selected=None):
     """The ``finetune`` keyword arguments that replay Quark's torch stream:
     ``randperm`` / ``rand_like``, the construction of every layer's module (also
     those Quark fails to train), the ``DataLoader`` seeds of ``MemOptLevel=2``
-    and the random bias of a bias-less ``Gemm``."""
+    and the random bias of a bias-less ``Gemm``. ``selected``: the layer indices
+    Quark trains (it builds no module, and draws nothing, for the others)."""
     with P._Quiet():
         sg = P.Subgraph(
             copy.deepcopy(model),
@@ -137,6 +140,7 @@ def _replay(model, data, q, ff):
         P.setup_seed(ff["FixedSeed"])
     names = list(sg.subgraph_qmodel.keys())
     done = [0]
+    construct_all = bool(ff.get("SelectMaxMemLayer", False))
     state = {"first": True, "persistent": False}
     bs = ff.get("BatchSize", 1)
     persistent = (bs if 1 <= bs <= len(data) else 1) > 1
@@ -152,23 +156,37 @@ def _replay(model, data, q, ff):
         g.manual_seed(seed)
         return torch.randperm(n, generator=g).numpy()
 
+    def build(i):
+        with P._Quiet():
+            bias = sg.f_bias_list[i]
+            try:
+                return P.convert_onnx_to_torch(
+                    sg.subgraph_qmodel_list[i],
+                    np.array(sg.f_weight_list[i]),
+                    None if bias is None else np.array(bias).reshape(-1),
+                )
+            except Exception:  # Quark cannot convert it (and draws nothing)
+                return None
+
     def hook(_layer, name):
         state["first"], state["persistent"] = True, persistent
         j = names.index(name)
         module = None
-        while done[0] <= j:
-            i = done[0]
-            done[0] += 1
-            with P._Quiet():
-                bias = sg.f_bias_list[i]
-                try:
-                    module = P.convert_onnx_to_torch(
-                        sg.subgraph_qmodel_list[i],
-                        np.array(sg.f_weight_list[i]),
-                        None if bias is None else np.array(bias).reshape(-1),
-                    )
-                except Exception:  # Quark cannot convert it (and draws nothing)
-                    module = None
+        if construct_all:
+            # SelectMaxMemLayer's memory estimate builds every layer's module
+            # up front; the layer that trains builds its own once more
+            if not state.get("all"):
+                state["all"] = True
+                for i in range(len(names)):
+                    build(i)
+            module = build(j)
+        else:
+            while done[0] <= j:
+                i = done[0]
+                done[0] += 1
+                if selected is not None and i not in selected:
+                    continue
+                module = build(i)
         if module is not None and sg.f_bias_list[j] is None:
             lin = getattr(module._module, "bias", None)
             if lin is not None:
@@ -570,6 +588,287 @@ def test_gemm_trans_a_is_skipped_by_both_when_the_matmul_does_not_fit(bs, n_batc
     )
 
 
+def _trans_a_shape(k, m, n=4, n_batches=1):
+    rng = np.random.default_rng(3)
+    model, _ = _model(
+        "y = Gemm<transA=1>(x, w1, b1)",
+        [_w(rng, "w1", k, n), _w(rng, "b1", n, scale=0.1)],
+        (k, m),
+        io=f"float[{k},{m}] x) => (float y",
+    )
+    data = [
+        {"x": np.random.default_rng(5 + i).standard_normal((k, m)).astype(np.float32)}
+        for i in range(n_batches)
+    ]
+    return model, data
+
+
+@pytest.mark.parametrize("m", [1, 3])
+@pytest.mark.parametrize("bs", [1, 3])
+@pytest.mark.parametrize("algorithm", ["adaround", "adaquant"])
+def test_gemm_trans_a_on_a_single_row_sample_trains_through_a_broadcast_target(
+    m, bs, algorithm
+):
+    """``K == 1``: the only sample is one row, Quark's module outputs ``[M, N]``
+    and subtracts the ``[1, N]`` target row -- torch broadcasts that, the
+    size-1 axis matches, so it trains (the loss and its gradient sum over the
+    broadcast rows)."""
+    model, data = _trans_a_shape(1, m)
+    extra = dict(NumIterations=60, BatchSize=bs)
+    if algorithm == "adaquant":
+        extra.update(LearningRate=1e-3, UpdateBias=True)
+    quark_out, mine, q, reports, trace, log = _both(
+        model, data, P._ff(algorithm, **extra), preset="A8W8"
+    )
+    assert "was optimized from" in log and len(reports) == 1  # both trained
+    assert max(_mismatch(quark_out, mine).values()) == 0.0
+    if algorithm == "adaquant":  # (AdaRound happens to keep the codes here)
+        assert _changed(q, quark_out)
+
+
+@pytest.mark.parametrize("k, bs", [(2, 1), (3, 2), (3, 3)])
+def test_gemm_trans_a_with_fewer_target_rows_than_samples_is_skipped_like_quark(k, bs):
+    """``M == 1``: ``K`` samples but a single target row; Quark's ``torch.cat``
+    over the target list fails once the mini-batch draws a sample >= 1 and the
+    layer is skipped (ours raised an IndexError)."""
+    model, data = _trans_a_shape(k, 1)
+    ff = P._ff("adaround", NumIterations=20, BatchSize=bs)
+    quark_out, mine, q, reports, _, log = _both(model, data, ff, preset="A8W8")
+    assert "was optimized from" not in log and reports == []
+    assert not _changed(q, quark_out) and not _changed(q, mine)
+
+
+@pytest.mark.parametrize("kind", ["A", "B", "C", "D", "E", "F"])
+def test_select_max_mem_layer_trains_the_same_codes_as_quark(kind):
+    """With the estimate's torch stream replayed (it builds every layer's module
+    up front), the one layer SelectMaxMemLayer trains gets Quark's exact codes."""
+    model, data, q = P._prepared(kind)
+    ff = P._ff("adaround", SelectMaxMemLayer=True, NumIterations=40)
+    quark_out, mine, q, reports, *_ = _both(model, data, ff, q)
+    assert len(reports) == 1 and _changed(q, quark_out)
+    assert max(_mismatch(quark_out, mine).values()) == 0.0
+
+
+# -- SelectiveUpdate: Quark drops a module's result in two places ------------------------------
+
+_SELECTIVE = [
+    # (kind, algorithm, FastFinetune overrides, Quark ends up with the model untouched)
+    ("A", "adaround", dict(NumIterations=30), False),
+    ("E", "adaround", dict(NumIterations=30), False),
+    ("F", "adaround", dict(NumIterations=30), False),
+    ("A", "adaround", dict(NumIterations=3, LearningRate=0.001), True),
+    ("E", "adaquant", dict(NumIterations=30, LearningRate=1e-3, UpdateBias=True), False),
+    ("F", "adaquant", dict(NumIterations=30, LearningRate=1e-3, UpdateBias=True), False),
+    ("A", "adaquant", dict(NumIterations=30, LearningRate=0.5, UpdateBias=True), True),
+    ("F", "adaquant", dict(NumIterations=30, LearningRate=0.5, UpdateBias=True), True),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "kind, algorithm, extra, untouched",
+    [pytest.param(*c, id=f"{c[0]}-{c[1]}-{i}") for i, c in enumerate(_SELECTIVE)],
+)
+def test_selective_update_drops_what_quark_drops(kind, algorithm, extra, untouched):
+    """Quark checks twice: per module (the error after training is worse than
+    the *initial* one of the hard-rounded float weight: the module's weight and
+    bias are not exported) and, after every layer, the whole model's average L2
+    distance to the float model. Both are mirrored (the first one is not in its
+    ``DataLoader`` loop); layers whose result got dropped are those the codes of
+    which Quark leaves alone."""
+    model, data, q = P._prepared(kind)
+    ff = P._ff(algorithm, SelectiveUpdate=True, **extra)
+    quark_out, mine, q, reports, _, log = _both(model, data, ff, q)
+    assert "Selective update for fast finetune" in log
+    assert bool(_changed(q, quark_out)) != untouched
+    assert max(_mismatch(quark_out, mine).values()) == 0.0
+
+
+def test_selective_update_is_not_applied_per_module_in_the_dataloader_loop():
+    """``MemOptLevel=2`` warns "Selective update is not supported currently in
+    this optimizer": no per-module drop (the whole-model check still runs)."""
+    model, data, q = P._prepared("A")
+    ff = P._ff(
+        "adaquant", SelectiveUpdate=True, MemOptLevel=2, NumWorkers=1,
+        NumIterations=10, LearningRate=0.5, BatchSize=1, UpdateBias=True,
+    )  # fmt: skip
+    quark_out, mine, q, *_ = _both(model, data, ff, q)
+    assert max(_mismatch(quark_out, mine).values()) == 0.0
+
+
+# -- SaveAndRestore: Quark's checkpoint file -------------------------------------------------
+
+
+def _saver_quark(model, data, q, ff, saver, **extra):
+    with P._Quiet() as buf:
+        out = P.fast_finetune(
+            copy.deepcopy(model),
+            copy.deepcopy(q),
+            False,
+            P._Reader(data),
+            {"FastFinetune": ff, "SaveAndRestore": str(saver), **extra},
+        )
+    return out, buf.getvalue()
+
+
+def _saver_ours(model, data, q, ff, saver, selected=None, **kw):
+    layers = qf.load_saved_layers(saver)
+    if selected is None:
+        selected = layers
+    kwargs = _replay(model, data, q, ff, selected=selected)
+    return qf.finetune(
+        model,
+        q,
+        data,
+        _opts(ff),
+        layers=layers,
+        checkpoint=lambda i, n, m: qf.save_checkpoint(saver, i, n, m),
+        **kwargs,
+        **kw,
+    )[0]
+
+
+def _json(path):
+    return json.loads(Path(path).read_text())
+
+
+def test_save_and_restore_writes_the_same_checkpoint_and_resumes_the_same_layers(
+    tmp_path,
+):
+    """Quark writes ``model_to_finetune`` (the model before the layer it is on)
+    and ``layers_to_finetune`` (that layer to the last one) before training each
+    layer; when the file exists, it trains only the listed layers -- on top of
+    the *original* quantized model, since the model it loads is dropped."""
+    model, data, q = P._prepared("A")
+    ff = P._ff("adaround", NumIterations=30, BatchSize=2)
+    (tmp_path / "q").mkdir()
+    (tmp_path / "m").mkdir()
+    sq, sm = tmp_path / "q" / "state.json", tmp_path / "m" / "state.json"
+    zero = {k: 0.0 for k in _codes_all(q)}
+
+    # run 1: no file yet -> every layer trains, the checkpoint is left at the last
+    quark1, _ = _saver_quark(model, data, q, ff, sq)
+    mine1 = _saver_ours(model, data, q, ff, sm)
+    assert _mismatch(quark1, mine1) == zero
+    jq, jm = _json(sq), _json(sm)
+    assert jq["layers_to_finetune"] == jm["layers_to_finetune"] == [2]
+    assert jq["model_to_finetune"] == str(tmp_path / "q" / "state.onnx")
+    assert jm["model_to_finetune"] == str(tmp_path / "m" / "state.onnx")
+    saved_q = onnx.load(jq["model_to_finetune"])
+    saved_m = onnx.load(jm["model_to_finetune"])
+    assert _mismatch(saved_q, saved_m) == zero
+    # the checkpoint model is the one *before* layer 2: layers 0 and 1 trained
+    moved = _changed(q, saved_q)
+    assert {"w1_quantized", "w2_quantized"} <= set(moved)
+    assert "w3_quantized" not in moved
+
+    # run 2: the file exists -> only layer 2, from the original quantized model
+    quark2, log2 = _saver_quark(model, data, q, ff, sq)
+    mine2 = _saver_ours(model, data, q, ff, sm)
+    assert log2.count("will be optimized by") == 1
+    assert set(_changed(q, quark2)) == {"w3_quantized"}
+    assert _mismatch(quark2, mine2) == zero
+
+
+@pytest.mark.parametrize("layers", [[0, 2], [2, 0], [1], [1, 1], [5, 0]])
+def test_save_and_restore_trains_exactly_the_layers_the_file_lists(tmp_path, layers):
+    model, data, q = P._prepared("A")
+    ff = P._ff("adaround", NumIterations=30, BatchSize=2)
+    sq = tmp_path / "state.json"
+    sq.write_text(json.dumps({"layers_to_finetune": layers}))
+    quark, log = _saver_quark(model, data, q, ff, sq)
+    sq.write_text(json.dumps({"layers_to_finetune": layers}))  # (Quark rewrote it)
+    mine = _saver_ours(model, data, q, ff, sq)
+    trained = {i for i in layers if i < 3}
+    assert log.count("will be optimized by") == len(trained)
+    assert set(_changed(q, quark)) == {f"w{i + 1}_quantized" for i in trained}
+    assert _mismatch(quark, mine) == {k: 0.0 for k in _codes_all(q)}
+
+
+def test_save_and_restore_list_overrides_select_max_mem_layer(tmp_path):
+    model, data, q = P._prepared("A")
+    ff = P._ff("adaround", NumIterations=30, BatchSize=2, SelectMaxMemLayer=True)
+    sq = tmp_path / "state.json"
+    sq.write_text(json.dumps({"layers_to_finetune": [0]}))
+    quark, log = _saver_quark(model, data, q, ff, sq)
+    sq.write_text(json.dumps({"layers_to_finetune": [0]}))
+    mine = _saver_ours(model, data, q, ff, sq)
+    assert set(_changed(q, quark)) == {"w1_quantized"}
+    assert _mismatch(quark, mine) == {k: 0.0 for k in _codes_all(q)}
+
+
+@pytest.mark.parametrize("content", [{}, {"layers_to_finetune": []}, {"x": 1}])
+def test_save_and_restore_file_without_a_layer_list_trains_every_layer(
+    tmp_path, content
+):
+    model, data, q = P._prepared("A")
+    ff = P._ff("adaround", NumIterations=30, BatchSize=2)
+    sq = tmp_path / "state.json"
+    sq.write_text(json.dumps(content))
+    quark, log = _saver_quark(model, data, q, ff, sq)
+    sq.write_text(json.dumps(content))
+    mine = _saver_ours(model, data, q, ff, sq)
+    assert log.count("will be optimized by") == 3
+    assert _mismatch(quark, mine) == {k: 0.0 for k in _codes_all(q)}
+
+
+def test_save_and_restore_keeps_the_other_keys_and_names_a_non_json_checkpoint(
+    tmp_path, monkeypatch
+):
+    model, data, q = P._prepared("A")
+    ff = P._ff("adaround", NumIterations=5, BatchSize=2)
+    for sub in ("q", "m"):
+        d = tmp_path / sub
+        d.mkdir()
+        monkeypatch.chdir(d)
+        saver = d / "state.ckpt"
+        saver.write_text(json.dumps({"tensors_range": {"x": [0, 1]}, "keep": 7}))
+        if sub == "q":
+            _saver_quark(model, data, q, ff, saver)
+        else:
+            _saver_ours(model, data, q, ff, saver, selected=[0, 1, 2])
+        j = _json(saver)
+        assert j["keep"] == 7 and j["tensors_range"] == {"x": [0, 1]}
+        assert j["model_to_finetune"] == "model_to_finetune.onnx"  # relative, in cwd
+        assert j["layers_to_finetune"] == [2]
+        assert (d / "model_to_finetune.onnx").exists()
+
+
+def test_save_and_restore_raises_when_the_saved_model_is_missing(tmp_path):
+    model, data, q = P._prepared("A")
+    ff = P._ff("adaround", NumIterations=5, BatchSize=2)
+    sq = tmp_path / "state.json"
+    sq.write_text(
+        json.dumps(
+            {
+                "model_to_finetune": str(tmp_path / "gone.onnx"),
+                "layers_to_finetune": [0],
+            }
+        )
+    )
+    with pytest.raises(Exception) as quark_err:
+        _saver_quark(model, data, q, ff, sq)
+    with pytest.raises(type(quark_err.value)):
+        qf.load_saved_layers(sq)
+
+
+def test_quantizer_resumes_from_save_and_restore_like_quark(tmp_path):
+    """End to end through ``QConfig`` extra_options: the first run leaves the
+    checkpoint, the second trains only the layer it names."""
+    model, data = P._build("A")
+    saver = tmp_path / "state.json"
+    cfg = qc.QConfig.get_default_config("A8W8_ADAROUND")
+    cfg.algo_config[0].params.update(num_iterations=30, batch_size=2, early_stop=False)
+    cfg.extra_options["SaveAndRestore"] = str(saver)
+    quantizer = qc.ModelQuantizer(cfg)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        quantizer.quantize_model(model, calibration_data_reader=P._Reader(data))
+        assert _json(saver)["layers_to_finetune"] == [2]
+        assert (tmp_path / "state.onnx").exists()
+        quantizer.quantize_model(model, calibration_data_reader=P._Reader(data))
+    assert len(quantizer.last_weight_rounding["adaround"]) == 1
+
+
 # -- Clip / activation fallbacks (Quark's own graphs, edited) ------------------------------
 
 
@@ -733,6 +1032,200 @@ def test_int16_weights_run_end_to_end_like_quarks_accurate_preset():
     )[0]
     x = np.random.default_rng(9).standard_normal((64, 3, 8, 8)).astype(np.float32)
     assert P._e2e(model, mine, x) == pytest.approx(P._e2e(model, quark, x), rel=0.02)
+
+
+# -- a Relu folded into the output quantizer (INT8_CNN_DEFAULT) -----------------------------
+
+
+def _relu_chain(kind):
+    r = np.random.default_rng(3)
+    if kind == "matmul":
+        return _model(
+            "h = MatMul(x, w1)\n t = Relu(h)\n y = MatMul(t, w2)",
+            [_w(r, "w1", 8, 6), _w(r, "w2", 6, 4)],
+            (8, 8),
+        )
+    if kind == "gemm":
+        return _model(
+            "h = Gemm(x, w1, b1)\n t = Relu(h)\n y = Gemm<transB=1>(t, w2, b2)",
+            [
+                _w(r, "w1", 8, 6),
+                _w(r, "b1", 6, scale=0.1),
+                _w(r, "w2", 4, 6),
+                _w(r, "b2", 4, scale=0.1),
+            ],
+            (8, 8),
+        )
+    return _model(
+        "c1 = Conv<pads=[1,1,1,1]>(x, w1, b1)\n r = Relu(c1)\n"
+        "y = Conv<pads=[1,1,1,1]>(r, w2, b2)",
+        [
+            _w(r, "w1", 4, 3, 3, 3),
+            _w(r, "b1", 4, scale=0.1),
+            _w(r, "w2", 4, 4, 3, 3),
+            _w(r, "b2", 4, scale=0.1),
+        ],
+        (6, 3, 6, 6),
+    )
+
+
+def _first_losses(log):
+    """The reconstruction loss of iteration 0 of every layer, from Quark's log."""
+    out = []
+    for m in re.finditer(
+        r"(?:adaround|adaquant) iterations=0, lr=[\d.e-]+, loss=([\d.]+)"
+        r"(?: \(Recons loss=([\d.]+))?",
+        log,
+    ):
+        out.append(float(m.group(2) or m.group(1)))
+    return out
+
+
+@pytest.mark.parametrize("kind", ["matmul", "gemm", "conv"])
+@pytest.mark.parametrize("algorithm", ["adaround", "adaquant"])
+@pytest.mark.parametrize(
+    "extra", [{}, dict(OutputQDQ=True, BatchSize=3)], ids=["plain", "outqdq"]
+)
+def test_relu_folded_into_the_output_quantizer_is_trained_pre_relu_like_quark(
+    kind, algorithm, extra
+):
+    """INT8_CNN_DEFAULT folds the Relu after a MatMul / Gemm / Conv into the
+    output quantizer (its range starts at 0), so Quark's block has no Relu and
+    its float target is the *pre*-Relu output. Our first iteration has Quark's
+    loss in every layer (it would not with a kept Relu: the target would be the
+    Relu output) and, where the arithmetic can be bit-identical, the codes are
+    Quark's. With an output Q/DQ on a bias-carrying layer they are not: every
+    float32 ULP in a conv / bias add can flip an 8-bit output code, which the
+    training amplifies (the same noise as the ``B`` rows of the AdaRound
+    table), so those are compared on the loss and the layers trained."""
+    model, data = _relu_chain(kind)
+    q = P._quark_quantize(model, data, "INT8_CNN_DEFAULT")[0]
+    assert not [n for n in q.graph.node if n.op_type == "Relu"]  # really folded
+    extra = dict(extra)
+    if algorithm == "adaquant":
+        extra.update(LearningRate=1e-3, NumIterations=30, UpdateBias=kind != "matmul")
+    else:
+        extra.update(NumIterations=40)
+    ff = P._ff(algorithm, **extra)
+    quark_out, mine, q, reports, trace, log = _both(model, data, ff, q)
+    assert _changed(q, quark_out)
+    quark_first = _first_losses(log)
+    assert len(quark_first) == len(trace) == len(reports) == 2
+    noisy = kind != "matmul" and "OutputQDQ" in extra
+    # (a noisy first layer hands slightly different inputs to the second)
+    for qloss, t in list(zip(quark_first, trace))[: 1 if noisy else 2]:
+        assert t[0][1] == pytest.approx(qloss, rel=1e-4, abs=1e-6)
+    if not noisy:
+        assert max(_mismatch(quark_out, mine).values()) == 0.0
+
+
+# -- AdaQuant in float32, in torch's operation order ----------------------------------------
+
+
+def _numpy_matmul_agrees_with_torch():
+    """The bit-identical claims below hold where numpy's float32 ``@`` rounds
+    exactly like torch's (BLAS dependent: it does for these block shapes on the
+    machines this was developed on, and does not for others, e.g. a 2 x 128 by
+    128 x 4 product)."""
+    r = np.random.default_rng(0)
+    for m, k, n in [(4, 32, 32), (32, 4, 32), (4, 32, 16), (32, 4, 16), (16, 32, 32)]:
+        a, b = (r.standard_normal(sh).astype(np.float32) for sh in [(m, k), (k, n)])
+        if not np.array_equal(
+            a @ b, (torch.from_numpy(a) @ torch.from_numpy(b)).numpy()
+        ):
+            return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "preset, lr, iterations",
+    [
+        ("INT16_CNN_DEFAULT", 1e-5, 10),
+        ("INT16_CNN_DEFAULT", 1e-5, 100),
+        ("INT16_CNN_DEFAULT", 1e-5, 300),
+        ("A8W8", 1e-5, 300),
+        ("A8W8", 1e-4, 200),
+    ],
+)
+def test_adaquant_on_matmul_layers_is_bit_identical_even_for_16_bit_weights(
+    preset, lr, iterations
+):
+    """AdaQuant on 16-bit weights is chaotic: a float32 ULP in the forward pass
+    flips ~0.4 % of the codes per layer within a few iterations (float64 does:
+    1.8 % / 15 % of the two layers of this model after 10). Run in float32 in
+    torch's order (``round`` / ``clamp`` quantizer, ``norm ** 2`` autograd,
+    ``torch.optim.Adam``'s ``lerp`` / ``addcmul`` / ``addcdiv``) the codes are
+    Quark's to the last bit on MatMul / Gemm layers."""
+    if not _numpy_matmul_agrees_with_torch():
+        pytest.skip("numpy's float32 matmul does not round like torch's here")
+    model, data, _ = P._prepared("F")
+    q = P._quark_quantize(model, data, preset)[0]
+    ff = P._ff(
+        "adaquant", LearningRate=lr, NumIterations=iterations, BatchSize=4,
+        UpdateBias=False,
+    )  # fmt: skip
+    quark_out, mine, q, *_ = _both(model, data, ff, q, preset=preset)
+    assert len(_changed(q, quark_out)) == 2  # it really trained both layers
+    assert _mismatch(quark_out, mine) == {k: 0.0 for k in _codes_all(q)}
+    # ... where float64 arithmetic is off by several codes
+    f64 = _opts(ff)
+    f64.float32 = False
+    other, _ = qf.finetune(model, q, data, f64, **_replay(model, data, q, ff))
+    assert iterations > 10 or _changed(quark_out, other)
+
+
+def test_the_float32_pieces_round_like_torch():
+    """The building blocks of the float32 AdaQuant loop against torch itself."""
+    r = np.random.default_rng(1)
+    f32 = np.float32
+    # the straight-through weight quantizer: round / clamp / (q - zp) * scale
+    from quark.onnx.algorithm.finetuning.create_torch.base_qdq_quantizers import (
+        INTQuantizer,
+    )
+
+    w = (r.standard_normal((6, 7)) * 0.4).astype(f32)
+    scale, zp = f32(0.0031), 3
+    quant = INTQuantizer(
+        torch.tensor(scale), torch.tensor(zp, dtype=torch.int64),
+        torch.tensor(-128), torch.tensor(127),
+    )  # fmt: skip
+    qc_ = qf._QConst(
+        "w", np.zeros(w.shape, np.int8), np.full(w.shape, scale, np.float64),
+        np.full(w.shape, float(zp)), -128.0, 127.0,
+    )  # fmt: skip
+    got, _ = qc_.ste32(w)
+    np.testing.assert_array_equal(got, quant(torch.from_numpy(w)).numpy())
+    # the reconstruction loss and its gradient through torch's autograd (the
+    # norm's reduction order is torch's own, so allow a few float32 ULPs)
+    blk = qf._Block(
+        "b", "MatMul", qf._MatMulOp(False), np.zeros((3, 2)), None, None, None, None,  # type: ignore[arg-type]
+        1.0, 1.0, None, "x", "x", "y", None, None,
+    )  # fmt: skip
+    for shape in [(4, 32), (6, 16), (3, 8)]:
+        y = (r.standard_normal(shape) * 1e-2).astype(f32)
+        ref = (r.standard_normal(shape) * 1e-2).astype(f32)
+        t = torch.from_numpy(y.copy()).requires_grad_(True)
+        loss = (torch.norm(t - torch.from_numpy(ref), p="fro", dim=1) ** 2).mean()
+        loss.backward()
+        # an identity "input": the weight gradient is the output gradient
+        l32, grad, _ = qf._recon_grad32(
+            blk, (np.eye(shape[0], dtype=f32), y, y, None), y, ref
+        )
+        np.testing.assert_allclose(grad, t.grad.numpy(), rtol=2e-6, atol=1e-9)
+        assert l32 == pytest.approx(float(loss), rel=1e-6)
+    # torch.optim.Adam: lerp / mul + addcmul / sqrt-div-add / addcdiv
+    p = r.standard_normal(500).astype(f32)
+    pt = torch.nn.Parameter(torch.from_numpy(p.copy()))
+    opt = torch.optim.Adam([pt], lr=1e-3)
+    m, v = np.zeros(500, f32), np.zeros(500, f32)
+    for step in range(8):
+        g = (r.standard_normal(500) * 10 ** r.uniform(-4, 0)).astype(f32)
+        pt.grad = torch.from_numpy(g.copy())
+        opt.step()
+        p = qf._adam_step32(p, g, m, v, step, 1e-3)
+    # (torch's vectorized sqrt is Sleef's 0.5001-ULP one, not IEEE's)
+    np.testing.assert_allclose(p, pt.detach().numpy(), rtol=0, atol=2e-6)
+    assert np.mean(p == pt.detach().numpy()) > 0.7
 
 
 # -- MemOptLevel=2 (Quark's DataLoader loop) ------------------------------------------------
