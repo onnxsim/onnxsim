@@ -482,7 +482,13 @@ def _activation_rules(
         "fold_activation": (not symmetric)
         and (bool(opts.get("FoldRelu", False)) if extended else True),
         "adjust_activation_ranges": True,
-        "quantize_prelu_slope": extended or npu_cnn,
+        # (a plain quantizer reaches a PRelu only when the op type was asked for --
+        # QuantizeAllOpTypes / ExtraOpTypesToQuantize -- and then quantizes every
+        # input of it, the slope among them)
+        "quantize_prelu_slope": extended
+        or npu_cnn
+        or bool(opts.get("QuantizeAllOpTypes"))
+        or "PRelu" in (opts.get("ExtraOpTypesToQuantize") or ()),
         "align_ops": [
             op
             for key, ops in _ALIGN_OPTIONS
@@ -991,6 +997,9 @@ _PRESETS.update(
             Int32Bias=False,
             DedicatedQDQPair=True,
             QuantizeAllOpTypes=True,
+            # (unlike the other presets, VINT8 does not force the data-movement
+            # and activation ops to quantize when their input is not marked)
+            ForceQuantizeNoInputCheck=False,
         ),
         "S16S16_MIXED_S8S8": lambda: _s16s16_mixed_s8s8(),
         "INT8_CNN_DEFAULT": lambda: QConfig(
@@ -2279,10 +2288,14 @@ class ModelQuantizer:
         work = quark_sorted(work)
         ext = self._extended(act, wt)
         cnn_types: "Optional[set[str]]" = None
-        if op_types is None and not opts.get("QuantizeAllOpTypes"):
+        if op_types is None:
             cnn_types = set(
                 quark_op_types(npu_cnn or ext, opts.get("ExtraOpTypesToQuantize") or ())
             )
+            if opts.get("QuantizeAllOpTypes"):
+                # (the op types of the model as it is handed in: the ones its
+                # pre-processing creates -- Slice for a Split -- are not among them)
+                cnn_types |= {n.op_type for n in model.graph.node}
             if opts.get("ConvertBNToConv", conv_default):
                 cnn_types.add("BatchNormalization")
         scope_types = op_types if op_types is not None else cnn_types
@@ -2293,6 +2306,7 @@ class ModelQuantizer:
             # (every Quark preset sets it; a bare QConfig does not)
             force_no_input_check=bool(opts.get("ForceQuantizeNoInputCheck", True)),
             direct_pool=not (ext or npu_cnn),
+            npu_registry=bool(ext or npu_cnn),
         )
         # Quark adds BatchNormalization to the op types it quantizes when it
         # converts BNs; without ConvertBNToConv a leftover one stays float
@@ -2376,7 +2390,17 @@ class ModelQuantizer:
             if opts.get("DedicatedQDQPair", False):
                 from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
 
-                q = dedicate_qdq_pairs(q)
+                keep = set(skip_names)
+                q = dedicate_qdq_pairs(
+                    q,
+                    {
+                        n.name
+                        for n in work.graph.node
+                        if n.name
+                        and n.name not in keep
+                        and (scope_types is None or n.op_type in scope_types)
+                    },
+                )
             return q
 
         bias_post = self._base_bias_post(work, act, wt)

@@ -560,11 +560,19 @@ def requantize_biases_int8(
 # -- VINT8 ---------------------------------------------------------------------------
 
 
-def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
+def dedicate_qdq_pairs(
+    model: onnx.ModelProto, receivers: Optional[Set[str]] = None
+) -> onnx.ModelProto:
     """Quark's ``DedicatedQDQPair``: an activation ``Q -> DQ`` pair read by
     several nodes is replaced by one pair (same scale and zero point) per
     consumer, so each consumer owns the quantizer in front of it. The DQ of a
-    graph output stays as it is."""
+    graph output stays as it is.
+
+    Quark counts the *quantized* nodes that read the tensor (``receivers``: their
+    names, default every named node; a node reading the tensor twice counts
+    twice, and takes the first pair -- the other is left unused): with more than
+    one, only those get a pair and any other reader sees the float tensor; with
+    one or none the single pair stays in front of every reader."""
     m = onnx.ModelProto()
     m.CopyFrom(model)
     g = m.graph
@@ -583,15 +591,24 @@ def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
     taken = {x for n in nodes for x in list(n.input) + list(n.output)} | inits
     drop: Set[int] = set()
     inserts: Dict[int, List[onnx.NodeProto]] = {}  # id(consumer) -> nodes before it
+
+    def receiving(u: onnx.NodeProto) -> bool:
+        return receivers is None or not u.name or u.name in receivers
+
     for dq in nodes:
         if dq.op_type != "DequantizeLinear" or dq.input[0] not in q_by_out:
             continue
         q = q_by_out[dq.input[0]]
-        users = list({id(u): u for u in consumers.get(dq.output[0], [])}.values())
-        if len(users) < 2 or dq.output[0] in outputs:
+        readers = consumers.get(dq.output[0], [])  # one entry per input slot
+        users = list({id(u): u for u in readers}.values())
+        # (Quark's list: one entry per input slot of a node it quantizes)
+        slots = [u for u in readers if receiving(u)]
+        if len(slots) < 2 or dq.output[0] in outputs:
             continue
         drop.update((id(q), id(dq)))
-        for k, u in enumerate(users, 1):
+        first_slot: Dict[int, int] = {}
+        pairs: List[onnx.NodeProto] = []
+        for k, u in enumerate(slots, 1):
             qn, dqn = onnx.NodeProto(), onnx.NodeProto()
             qn.CopyFrom(q)
             dqn.CopyFrom(dq)
@@ -601,10 +618,22 @@ def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
             dqn.output[0] = f"{dq.output[0]}_{k}"
             if qn.output[0] in taken or dqn.output[0] in taken:
                 raise ValueError(f"tensor name clash while duplicating {dq.name}")
-            for i, x in enumerate(u.input):
-                if x == dq.output[0]:
-                    u.input[i] = dqn.output[0]
-            inserts.setdefault(id(u), []).extend([qn, dqn])
+            if id(u) not in first_slot:
+                first_slot[id(u)] = k
+                for i, x in enumerate(u.input):
+                    if x == dq.output[0]:
+                        u.input[i] = dqn.output[0]
+                inserts.setdefault(id(u), []).extend([qn, dqn])
+            else:
+                pairs.extend([qn, dqn])  # a second slot of the same node: unused
+        for u in users:
+            if not receiving(u):
+                for i, x in enumerate(u.input):
+                    if x == dq.output[0]:
+                        u.input[i] = q.input[0]
+        if pairs:
+            # (placed in front of the first node that reads the tensor)
+            inserts.setdefault(id(users[0]), []).extend(pairs)
     if not drop:
         return m
     final: List[onnx.NodeProto] = []

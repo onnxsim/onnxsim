@@ -185,6 +185,9 @@ def _quark_pof2_params(
     return float(pof2), new_zp
 
 
+_TINY = float(np.finfo(np.float32).tiny)
+
+
 def _qparams(
     lo: float,
     hi: float,
@@ -220,15 +223,15 @@ def _qparams(
             return float(np.float32(scale64)), zp
         scale = absmax / half
         zp = 0 if qmin < 0 else half + 1
-        if not scale > 0:
-            return 1.0, zp
+        if scale < _TINY:
+            return 1.0, 0  # (Quark's compute_scale_zp for an all-zero range)
         return (_pof2(scale) if power_of_two else scale), zp
     # Quark's compute_scale_zp: the range is float32 and its width is taken in
     # float32 before the float64 division
     lo32, hi32 = np.float32(lo), np.float32(hi)
     scale = float(np.float64(hi32 - lo32) / np.float64(qmax - qmin))
-    if not scale > 0:
-        return 1.0, qmin
+    if scale < _TINY:
+        return 1.0, 0  # (Quark's compute_scale_zp for an all-zero range)
     if power_of_two:
         scale = _pof2(scale)
     zp = int(np.clip(round(qmin - lo / scale), qmin, qmax))
@@ -638,7 +641,8 @@ def quantize_full_qdq(
     if softmax_unit_range:
         act_set0 = set(acts)
         for n in g.node:
-            if n.op_type == "Softmax":
+            # (only a Softmax the quantizer quantizes: ``should_quantize_node``)
+            if n.op_type == "Softmax" and id(n) in qnode_ids:
                 for o in n.output:
                     if o in act_set0:
                         ranges[o] = (0.0, 1.0)
@@ -681,6 +685,8 @@ def quantize_full_qdq(
             for k, o in enumerate(p.output):
                 if o == src:
                     p.output[k] = r.output[0]
+            # a Relu / Clip that follows a folded one folds into the same producer
+            producer[r.output[0]] = p
             if not quark_rules:
                 ranges[r.output[0]] = (0.0, max(ranges[r.output[0]][1], 0.0))
             elif r.op_type == "Relu" and ranges[r.output[0]][0] < 0:
@@ -792,6 +798,14 @@ def quantize_full_qdq(
     for x in graph_inputs:
         if x in seen and x in ranges:
             set_qp(x)
+    # Quark's ``AlignEltwiseQuantType`` puts a ``TensorQuantOverrides`` entry on
+    # every input of an eltwise op, and a tensor with an override (or whose
+    # provider has one) is quantized with its own parameters instead of sharing
+    override_tensors = (
+        {x for n in g.node if n.op_type in _ELTWISE_OPS for x in n.input}
+        if align_eltwise_dtype
+        else set()
+    )
     for n in g.node:
         if id(n) in removed:
             continue
@@ -809,6 +823,8 @@ def quantize_full_qdq(
                     and o not in tensor_dtypes
                     and o not in folded
                     and n.op_type not in unshared
+                    and o not in override_tensors
+                    and n.input[0] not in override_tensors
                 ):
                     qp[o], qdt[o] = qp[n.input[0]], qdt[n.input[0]]
                     share_root[o] = share_root.get(n.input[0], n.input[0])
@@ -816,8 +832,13 @@ def quantize_full_qdq(
             if x in seen and x not in qp and x in ranges and x not in inits:
                 set_qp(x)
 
+    # the activation parameters after every round of Quark's alignment loop (the
+    # first entry: as calibrated), which the int32 biases are re-quantized against
+    qp_history: List[Dict[str, Tuple[float, int]]] = [dict(qp)]
     if align_ops:
-        _align_qparams(g, set(align_ops), set(acts) | graph_inputs, qp, qdt)
+        qp_history += _align_qparams(
+            g, set(align_ops), set(acts) | graph_inputs, qp, qdt, share_root
+        )
 
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
     if opset < 13:
@@ -1019,10 +1040,11 @@ def quantize_full_qdq(
         )
         return out
 
-    def act_scale(x: str) -> Optional[float]:
-        if x not in qp and x.endswith("/dq"):
+    def act_scale(x: str, params: Optional[Dict] = None) -> Optional[float]:
+        params = qp if params is None else params
+        if x not in params and x.endswith("/dq"):
             x = x[: -len("/dq")]  # a graph input, rewired to its DQ above
-        return qp[x][0] if x in qp else None
+        return params[x][0] if x in params else None
 
     # Constant inputs of quantized nodes that form a real QDQ unit (every float activation
     # input dequantized): a lone DQ on a weight of a float node would strand it on the CPU.
@@ -1170,7 +1192,7 @@ def quantize_full_qdq(
                     n.input[k] = cache[("b32", x)]
                     continue
                 w_dq = n.input[1]
-                sx = act_scale(n.input[0])
+                sx = act_scale(n.input[0], qp_history[0])
                 w_scale_name = (
                     w_dq[: -len("/dq")] + "/scale" if w_dq.endswith("/dq") else None
                 )
@@ -1191,9 +1213,23 @@ def quantize_full_qdq(
                 # int16 scales)
                 q = np.clip(
                     np.round(w.astype(np.float64) / s.astype(np.float64)),
-                    -(2**31) + 1,
+                    -(2**31),
                     2**31 - 1,
                 ).astype(np.int32)
+                # Quark's ``adjust_bias_scale``, after every round of its alignment
+                # loop: a bias whose scale is no longer input scale * weight scale
+                # (the input's parameters moved) is divided by the ratio and
+                # truncated, and takes the new scale -- unless one element still
+                # matches
+                ws32 = np.broadcast_to(ws, w.shape).astype(np.float32)
+                for params in qp_history[1:]:
+                    sx_i = act_scale(n.input[0], params)
+                    if sx_i is None:
+                        break
+                    prod = (np.float32(sx_i) * ws32).astype(np.float32)
+                    if np.all(prod != s):
+                        q = (q / (prod / s)).astype(np.int32)
+                        s = prod
                 base = fresh(x)
                 add_init(base + "/int32", q)
                 add_init(base + "/scale", s)
@@ -1290,9 +1326,18 @@ def _align_qparams(
     has_qdq: set,
     qp: Dict[str, Tuple[float, int]],
     qdt: Dict[str, str],
-) -> None:
+    share_root: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Tuple[float, int]]]:
     """Quark's ``align_quantize_info`` on the chosen parameters (see
-    ``quantize_full_qdq``'s ``align_ops``)."""
+    ``quantize_full_qdq``'s ``align_ops``). Tensors that share their parameter
+    initializers (``share_root``: a data-movement op's output and its input) move
+    together, as the initializer is rewritten in place in Quark. Returns the
+    parameters after each round of the loop."""
+    share_root = share_root or {}
+    history: List[Dict[str, Tuple[float, int]]] = []
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for t in list(qp):
+        groups[share_root.get(t, t)].append(t)
 
     def copy(src: str, dst: str) -> bool:
         if (
@@ -1304,7 +1349,8 @@ def _align_qparams(
             or qp[src] == qp[dst]
         ):
             return False
-        qp[dst] = qp[src]
+        for t in groups[share_root.get(dst, dst)]:
+            qp[t] = qp[src]
         return True
 
     for _ in range(5):
@@ -1322,8 +1368,10 @@ def _align_qparams(
                 elif n.input and n.input[0] in has_qdq:
                     for o in n.output:
                         changed |= copy(n.input[0], o)
+        history.append(dict(qp))
         if not changed:
-            return
+            break
+    return history
 
 
 def _toposort(g: onnx.GraphProto) -> None:
