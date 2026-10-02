@@ -37,11 +37,20 @@ The lookups (which Q/DQ node is "the input position of this node": the one
 producing its first input, through a ``Pad`` for a pool; "the output position":
 the first Q/DQ reading its output, through the DPU ``Mul`` of a pool /
 ``HardSigmoid`` or a following Relu-like node whose Q/DQ was removed) follow
-Quark's, including its first-match-in-graph-order rule. Not reproduced:
-``ConvertSoftmaxToDPUVersion`` / ``ConvertInstanceNormToDPUVersion`` (off by
-default; Quark's integer softmax emulation and a custom operator), and the
-order-dependence on Quark's node order (positions are visited in this graph's
-node order, which can differ from Quark's topologically re-sorted one).
+Quark's, including its first-match-in-graph-order rule.
+
+The passes visit the nodes in list order, so the order matters: the caller
+(:mod:`onnxsim.quark_compat`) first sorts the Q/DQ graph the way Quark's
+``topological_sort`` does (:func:`onnxsim.quark_marking.quark_qdq_sorted`), and the
+rewrites append their nodes at the end of the list like Quark's ``insert_mul``: the
+``HardSigmoid`` that replaces a ``Sigmoid``, then each ``Constant`` + ``Mul``. Pool and
+``ReduceMean`` shapes come from the graph as it was before any rewrite
+(``value_info``; a graph input or output has none, and its pool / mean is left alone).
+
+``ConvertSoftmaxToDPUVersion`` (:func:`softmax_dpu_nodes`: the bfloat16
+polynomial exponential, the sum and a division) and
+``ConvertInstanceNormToDPUVersion`` (``ExtendedInstanceNormalization`` of the
+``com.amd.quark`` domain, a custom operator) are opt-in like in Quark.
 """
 
 from __future__ import annotations
@@ -85,6 +94,8 @@ _SIMULATE_DEFAULTS = {
     "ConvertHardSigmoidToDPUVersion": True,
     "ConvertAvgPoolToDPUVersion": True,
     "ConvertReduceMeanToDPUVersion": True,
+    "ConvertSoftmaxToDPUVersion": False,
+    "ConvertInstanceNormToDPUVersion": False,
     "ConvertClipToDPUVersion": False,
 }
 
@@ -477,39 +488,155 @@ def adjust_quantize_info(
 # -- DPU simulation ----------------------------------------------------------------
 
 
-def _insert_mul(
-    graph: onnx.GraphProto, index: int, node: onnx.NodeProto, scale: float
-) -> int:
-    """Put ``Mul(node output, scale)`` right after ``node`` (index ``index``),
-    under the original output name; returns the index of the next node."""
+def _insert_mul(graph: onnx.GraphProto, node: onnx.NodeProto, scale: float) -> None:
+    """Quark's ``insert_mul``: ``Mul(node output, scale)`` under the original
+    output name, its ``Constant`` and the ``Mul`` appended at the end of the
+    graph (where the refinement passes, visiting nodes in list order, find
+    them)."""
     out = node.output[0]
     pre = out + "_Mul"
     const = out + "_Scale"
     if not node.name:
         node.name = out
     node.output[0] = pre
-    graph.node.insert(
-        index + 1,
+    graph.node.append(
         helper.make_node(
             "Constant",
             [],
             [const],
             value=helper.make_tensor("scale", TensorProto.FLOAT, [], [scale]),
-        ),
+        )
     )
-    graph.node.insert(index + 2, helper.make_node("Mul", [pre, const], [out], name=pre))
-    return index + 3
+    graph.node.append(helper.make_node("Mul", [pre, const], [out], name=pre))
 
 
-def _float_source(producers: Dict[str, onnx.NodeProto], tensor: str) -> str:
-    """The float tensor behind ``tensor``: through its DQ and the Q before it."""
+def _float_source(
+    producers: Dict[str, onnx.NodeProto],
+    tensor: str,
+    graph_outputs: Sequence[str] = (),
+) -> str:
+    """The float tensor behind ``tensor``: through its DQ and the Q before it.
+    ``""`` (no shape known) for a graph output, which Quark's ``value_info``
+    does not list."""
     p = producers.get(tensor)
     if p is not None and p.op_type == "DequantizeLinear":
+        if tensor in graph_outputs:
+            return ""
         tensor = p.input[0]
         q = producers.get(tensor)
         if q is not None:
             tensor = q.input[0]
     return tensor
+
+
+def softmax_dpu_nodes(node: onnx.NodeProto, opset: int) -> List[onnx.NodeProto]:
+    """The nodes Quark's ``SimulateDPUSoftmax`` replaces a ``Softmax`` with: an
+    exponential from a degree-3 polynomial around ``x - floor(x / ln 2) * ln 2``
+    scaled by ``2 ** floor(x / ln 2)``, the sum over the softmax axis and a
+    division, every step in bfloat16 as the DPU does (Newton-Raphson reciprocal
+    left out, as there). ``[]`` below opset 7."""
+    if opset < 7:
+        return []
+    axis = -1
+    for a in node.attribute:
+        if a.name == "axis":
+            axis = a.i
+    sm = node.name
+    bf16, f32 = TensorProto.BFLOAT16, TensorProto.FLOAT
+    out: List[onnx.NodeProto] = []
+
+    def const(name: str, dtype: int, dims: List[int], vals: List[Any]) -> str:
+        out.append(
+            helper.make_node(
+                "Constant",
+                [],
+                [name + "_output"],
+                name=name,
+                value=helper.make_tensor(name + "_value", dtype, dims, vals),
+            )
+        )
+        return name
+
+    def op(op_type: str, name: str, ins: Sequence[str], **attrs: Any) -> str:
+        out.append(
+            helper.make_node(
+                op_type,
+                [i + "_output" for i in ins],
+                [name + "_output"],
+                name=name,
+                **attrs,
+            )
+        )
+        return name
+
+    # exp by polynomial approximation
+    ns = sm + "/exp_poly"
+    out.append(
+        helper.make_node(
+            "Cast",
+            [node.input[0]],
+            [ns + "/round/cast_output"],
+            name=ns + "/round/cast",
+            to=bf16,
+        )
+    )
+    cast0 = ns + "/round/cast"
+    rcp = const(ns + "/round/rcp_ln2", bf16, [], [1.4426950408889634])
+    mul0 = op("Mul", ns + "/round/mul", [cast0, rcp])
+    rnd = op("Floor", ns + "/round/round", [mul0])
+    ln2 = const(ns + "/modulo/ln2", bf16, [], [0.6931471805599453])
+    mul1 = op("Mul", ns + "/modulo/mul", [rnd, ln2])
+    sub1 = op("Sub", ns + "/modulo/sub", [cast0, mul1])
+    pa = ns + "/poly_approx"
+    c1 = op("Cast", pa + "/cast_1", [sub1], to=f32)
+    a3 = const(pa + "/alpha_3", bf16, [], [0.21875])
+    c2 = op("Cast", pa + "/cast_2", [a3], to=f32)
+    m2 = op("Mul", pa + "/mul_2", [c1, c2])
+    a2 = const(pa + "/alpha_2", bf16, [], [0.486328125])
+    c3 = op("Cast", pa + "/cast_3", [a2], to=f32)
+    ad0 = op("Add", pa + "/add", [m2, c3])
+    c4 = op("Cast", pa + "/cast_4", [ad0], to=bf16)
+    c5 = op("Cast", pa + "/cast_5", [c4], to=f32)
+    m3 = op("Mul", pa + "/mul_3", [c1, c5])
+    a1 = const(pa + "/alpha_1", bf16, [], [1.0])
+    c6 = op("Cast", pa + "/cast_6", [a1], to=f32)
+    ad1 = op("Add", pa + "/add_1", [m3, c6])
+    c7 = op("Cast", pa + "/cast_7", [ad1], to=bf16)
+    c8 = op("Cast", pa + "/cast_8", [c7], to=f32)
+    m4 = op("Mul", pa + "/mul_4", [c1, c8])
+    a0 = const(pa + "/alpha_0", bf16, [], [1.0])
+    c9 = op("Cast", pa + "/cast_9", [a0], to=f32)
+    ad2 = op("Add", pa + "/add_2", [m4, c9])
+    c10 = op("Cast", pa + "/cast_10", [ad2], to=bf16)
+    px = const(ns + "/pow/pow/x", bf16, [], [2.0])
+    pw = op("Pow", ns + "/pow/pow", [px, rnd])
+    exp_x = op("Mul", ns + "/exp_x", [pw, c10])
+    # the sum over the axis, in bfloat16
+    es = sm + "/exp_sum"
+    if opset <= 12:
+        sm_sum = op("ReduceSum", es + "/sum", [exp_x], axes=[axis], keepdims=1)
+    else:
+        ax = const(es + "/sum/reduction_indices", TensorProto.INT64, [1], [axis])
+        sm_sum = op("ReduceSum", es + "/sum", [exp_x, ax], keepdims=1)
+    total = op("Cast", es + "/cast_reduce_sum_out_16", [sm_sum], to=bf16)
+    div = op("Div", sm + "/div", [exp_x, total])
+    out.append(
+        helper.make_node(
+            "Cast",
+            [div + "_output"],
+            [node.output[0]],
+            name=sm + "/output_cast",
+            to=f32,
+        )
+    )
+    return out
+
+
+def _softmax_opset(model: onnx.ModelProto) -> int:
+    for o in model.opset_import:
+        if o.domain in ("", "ai.onnx"):
+            return int(o.version)
+    return 0
 
 
 def simulate_dpu(
@@ -525,6 +652,21 @@ def simulate_dpu(
 
     g = model.graph
     skip = nodes_to_skip or set()
+    # (shapes are those of the graph before any rewrite -- Quark's ``value_info``
+    # -- as the appended nodes leave the graph out of order)
+    shapes: Optional[Dict[str, List[int]]] = None
+    if on("ConvertAvgPoolToDPUVersion") or on("ConvertReduceMeanToDPUVersion"):
+        try:
+            inferred = onnx.shape_inference.infer_shapes(model)
+            shapes = {
+                vi.name: [d.dim_value for d in vi.type.tensor_type.shape.dim]
+                # (Quark looks shapes up in ``value_info`` alone: a graph input
+                # or output has none, and its pool / mean is left unconverted)
+                for vi in inferred.graph.value_info
+                if vi.type.HasField("tensor_type")
+            }
+        except Exception:  # pragma: no cover - shape inference failure
+            shapes = {}
     if on("ConvertLeakyReluToDPUVersion"):
         for n in g.node:
             if n.op_type == "LeakyRelu" and should_simulate(n):
@@ -532,53 +674,35 @@ def simulate_dpu(
                     if a.name == "alpha":
                         a.f = dpu_leaky_relu_alpha(a.f)
     if on("ConvertSigmoidToHardSigmoid"):
-        for i, n in enumerate(list(g.node)):
+        # (the replacement is appended at the end of the graph, as in Quark)
+        for n in list(g.node):
             if n.op_type == "Sigmoid" and should_simulate(n):
                 new = helper.make_node(
                     "HardSigmoid", list(n.input), list(n.output), name=n.name
                 )
                 new.attribute.append(helper.make_attribute("alpha", 1.0 / 6.0))
-                idx = list(g.node).index(n)
+                g.node.append(new)
                 g.node.remove(n)
-                g.node.insert(idx, new)
     if on("ConvertHardSigmoidToDPUVersion"):
-        i = 0
-        while i < len(g.node):
-            n = g.node[i]
+        for n in list(g.node):
             if (
                 n.op_type == "HardSigmoid"
                 and _is_hard_sigmoid(n)
                 and n.name not in skip
             ):
-                i = _insert_mul(g, i, n, HARD_SIGMOID_SCALE)
-            else:
-                i += 1
+                _insert_mul(g, n, HARD_SIGMOID_SCALE)
     producers = {o: n for n in g.node for o in n.output}
-    shapes: Optional[Dict[str, List[int]]] = None
-    if on("ConvertAvgPoolToDPUVersion") or on("ConvertReduceMeanToDPUVersion"):
-        try:
-            inferred = onnx.shape_inference.infer_shapes(model)
-            shapes = {
-                vi.name: [d.dim_value for d in vi.type.tensor_type.shape.dim]
-                for vi in list(inferred.graph.value_info) + list(inferred.graph.input)
-                if vi.type.HasField("tensor_type")
-            }
-        except Exception:  # pragma: no cover - shape inference failure
-            shapes = {}
+    out_names = [o.name for o in g.output]
     if on("ConvertAvgPoolToDPUVersion"):
-        i = 0
-        while i < len(g.node):
-            n = g.node[i]
+        for n in list(g.node):
             if n.op_type not in _AVG_POOLS or not should_simulate(n):
-                i += 1
                 continue
             kh = kw = 0
             ok = False
             if n.op_type == "GlobalAveragePool":
-                src = _float_source(producers, n.input[0])
+                src = _float_source(producers, n.input[0], out_names)
                 shape = (shapes or {}).get(src)
                 if not shape:
-                    i += 1
                     continue
                 if len(shape) == 4 and shape[2] == shape[3]:
                     ok, kh, kw = True, shape[2], shape[3]
@@ -590,17 +714,12 @@ def simulate_dpu(
                 if ks and len(ks) == 2 and ks[0] == ks[1]:
                     ok, kh, kw = True, ks[0], ks[1]
             if ok and kh * kw > 0:
-                i = _insert_mul(g, i, n, avg_pool_dpu_scale(kh, kw))
-            else:
-                i += 1
+                _insert_mul(g, n, avg_pool_dpu_scale(kh, kw))
     if on("ConvertReduceMeanToDPUVersion"):
-        i = 0
-        while i < len(g.node):
-            n = g.node[i]
+        for n in list(g.node):
             if n.op_type != "ReduceMean" or not should_simulate(n):
-                i += 1
                 continue
-            src = _float_source(producers, n.input[0])
+            src = _float_source(producers, n.input[0], out_names)
             shape = (shapes or {}).get(src)
             axes = None
             if len(n.input) == 1:
@@ -616,9 +735,37 @@ def simulate_dpu(
                 for a in axes:
                     rec *= shape[a]
                 if rec > 0:
-                    i = _insert_mul(g, i, n, reciprocal_dpu_scale(rec))
-                    continue
-            i += 1
+                    _insert_mul(g, n, reciprocal_dpu_scale(rec))
+    if on("ConvertSoftmaxToDPUVersion"):
+        opset = _softmax_opset(model)
+        for n in [n for n in g.node if n.op_type == "Softmax" and should_simulate(n)]:
+            replacement = softmax_dpu_nodes(n, opset)
+            if replacement:
+                g.node.remove(n)
+                g.node.extend(replacement)
+    if on("ConvertInstanceNormToDPUVersion"):
+        todo = [n for n in g.node if n.op_type == "InstanceNormalization"]
+        new_nodes = []
+        for n in todo:
+            if not should_simulate(n):
+                continue
+            eps = next((a.f for a in n.attribute if a.name == "epsilon"), 1e-5)
+            new_nodes.append(
+                helper.make_node(
+                    "ExtendedInstanceNormalization",
+                    list(n.input),
+                    list(n.output),
+                    name=n.name,
+                    domain="com.amd.quark",
+                    epsilon=eps,
+                )
+            )
+            g.node.remove(n)
+        g.node.extend(new_nodes)
+        if new_nodes and not any(
+            o.domain == "com.amd.quark" for o in model.opset_import
+        ):
+            model.opset_import.append(helper.make_opsetid("com.amd.quark", 1))
     if on("ConvertClipToDPUVersion"):
         inits = {t.name: t for t in g.initializer}
         for n in g.node:
@@ -696,4 +843,5 @@ __all__: Any = [
     "reciprocal_dpu_scale",
     "scale2pos",
     "simulate_dpu",
+    "softmax_dpu_nodes",
 ]

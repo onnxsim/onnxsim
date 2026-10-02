@@ -1116,3 +1116,531 @@ def test_reduce_range_is_refused_with_the_npu_cnn_scheme(tmp_path):
         _quark_preset(model, data, tmp_path, reduce_range=True)
     with pytest.raises(ValueError, match="ReduceRange"):
         _mine_preset(model, data, extra={"ReduceRange": True})
+
+
+# == Edge cases: op-type list, marking order, optimizer passes, DPU conversions ============
+#
+# What Quark's quantizer does beyond a node's neighbours: it quantizes the op types of
+# its registries only, visits the nodes in its own topological order, and leaves a
+# Relu / Clip alone whose input no earlier node marked. Before it, ONNX Runtime's graph
+# optimizer (and onnxslim) have rewritten the float graph.
+
+import random  # noqa: E402
+
+_NEW_INITS = dict(
+    ca=np.linspace(-0.5, 0.75, 8, dtype=np.float32).reshape(1, 8, 1, 1),
+    cm=np.linspace(0.5, 1.5, 8, dtype=np.float32).reshape(1, 8, 1, 1),
+    cs=np.array(2.0, np.float32),
+    cz=np.array(0.0, np.float32),
+    co=np.array(1.0, np.float32),
+    cn=np.array(0.5, np.float32),
+    cbig=np.array(100.0, np.float32),
+    sh=np.array([1, 3, 144], np.int64),
+    shs=np.array([1, 3, 12, 12], np.int64),
+    sfull=np.array([0], np.int64),
+    efull=np.array([9999], np.int64),
+    ax0=np.array([1], np.int64),
+    isc=(1 + np.linspace(0, 0.5, 8)).astype(np.float32),
+    ibi=np.linspace(-0.5, 0.5, 8, dtype=np.float32),
+    wgf=np.linspace(-1, 1, 3 * 12 * 12 * 4, dtype=np.float32).reshape(432, 4) * 0.05,
+    bgf=np.array([0.1, -0.2, 0.3, 0.0], np.float32),
+)
+
+
+def _edge(body, opset=17, shape=SHAPE, **over):
+    return _build(body, {**_NEW_INITS, **over}, opset=opset, shape=shape)
+
+
+def _same_as_quark(model, tmp_path, preset="XINT8", extra=None):
+    shape = tuple(d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim)
+    data = _data(shape)
+    q = _quark_preset(model, data, tmp_path, preset=preset, extra=extra)
+    m = _mine_preset(model, data, preset=preset, extra=extra)
+    return q, m, data
+
+
+@pytest.mark.parametrize(
+    "preset", ["XINT8", "VINT8", "A8W8", "U8S8_AAWS", "S8S8_AAWS", "A16W8"]
+)
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Flatten is no op type of Quark's registries: only its consumer quantizes
+        # the tensor, whatever feeds the Flatten
+        "f = Flatten(x)\n y = Gemm(f, wgf, bgf)",
+        # a Relu / Clip whose input nothing has marked is not quantized; its output is
+        # (for the Conv) but its input stays float
+        "c = Clip(x, lo, hi6)\n y = Conv(c, w1, b1)",
+        "r = Relu(x)\n y = Conv(r, w1, b1)",
+    ],
+    ids=["flatten", "clip", "relu"],
+)
+def test_ops_fed_by_a_graph_input_are_placed_like_quark(body, preset, tmp_path):
+    model = _edge(body)
+    q, m, data = _same_as_quark(model, tmp_path, preset)
+    if preset in ("XINT8", "VINT8"):
+        _assert_same_graph(q, m, body)
+    else:
+        _assert_close_graph(q, m, body)
+    # not vacuous: the input of the Flatten / Clip / Relu has no Q/DQ pair of its own
+    # (VINT8 quantizes every op type, so it has one at a Flatten there)
+    first = next(n for n in q.graph.node if n.op_type in ("Flatten", "Clip", "Relu"))
+    assert (first.input[0] == "x") == (
+        not (preset == "VINT8" and first.op_type == "Flatten")
+    )
+
+
+def test_a_relu_next_to_a_conv_reading_the_same_input_depends_on_the_order(tmp_path):
+    """Order matters: Quark's sort releases the readers of ``x`` in file order, so a
+    ``Relu`` listed after the ``Conv`` finds its input marked and one listed before
+    it does not."""
+    for body in (
+        "c = Conv(x, wid, bid)\n r = Relu(x)\n y = Add(c, r)",
+        "r = Relu(x)\n c = Conv(x, wid, bid)\n y = Add(c, r)",
+    ):
+        model = _edge(
+            body,
+            wid=np.eye(3, dtype=np.float32).reshape(3, 3, 1, 1),
+            bid=np.zeros(3, np.float32),
+        )
+        q, m, _ = _same_as_quark(model, tmp_path)
+        _assert_same_graph(q, m, body)
+
+
+def test_ops_outside_quarks_registries_quantize_nothing(tmp_path):
+    """``Neg`` / ``Exp`` / ``Abs`` are no registry op: their neighbours' quantizers
+    mark the tensors they touch, and the op itself shares nothing."""
+    for body in (
+        "c = Conv(x, w1, b1)\n n = Neg(c)\n y = Conv(n, w2, b2)",
+        "c = Conv(x, w1, b1)\n n = Abs(c)\n r = Relu(n)\n y = Conv(r, w2, b2)",
+        "c = Conv(x, w1, b1)\n n = Exp(c)\n y = Conv(n, w2, b2)",
+    ):
+        model = _edge(body)
+        q, m, _ = _same_as_quark(model, tmp_path)
+        _assert_same_graph(q, m, body)
+
+
+def test_pad_constant_value_is_quantized_like_a_weight(tmp_path):
+    """Quark quantizes ``Pad``'s ``constant_value`` input (int8, power of two)."""
+    pad = "c0 = Conv(x, w1, b1)\n p = Pad(c0, pads, cn)\n y = Conv(p, w2b, b2b)"
+    rng = np.random.default_rng(5)
+    model = _edge(
+        pad,
+        w2b=_w(rng, 2, 8, 3, 3),
+        b2b=_w(rng, 2),
+        pads=np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64),
+    )
+    q, m, _ = _same_as_quark(model, tmp_path)
+    _assert_same_graph(q, m, "pad constant")
+    consts = [
+        n
+        for n in q.graph.node
+        if n.op_type == "DequantizeLinear" and n.input[0].startswith("cn")
+    ]
+    assert len(consts) == 1, "the pad value is quantized in Quark's graph"
+    # a zero value is fused into the Conv by ONNX Runtime and leaves no Pad
+    model0 = _edge(pad.replace("cn", "cz"), w2b=_w(rng, 2, 8, 3, 3), b2b=_w(rng, 2))
+    q0, m0, _ = _same_as_quark(model0, tmp_path)
+    _assert_same_graph(q0, m0, "pad zero")
+    assert "Pad" not in [n.op_type for n in q0.graph.node]
+
+
+def test_align_pad_matters_in_quark_and_is_reproduced(tmp_path):
+    """A ``Pad`` that fills with a value far outside the data's range: its output
+    grid is coarser than its input's, and AlignPad moves the *input* to it."""
+    rng = np.random.default_rng(1)
+    model = _edge(
+        "c0 = Conv(x, w1, b1)\n p = Pad(c0, pads, cbig)\n y = Conv(p, w2b, b2b)",
+        w2b=_w(rng, 2, 8, 3, 3),
+        b2b=_w(rng, 2),
+        pads=np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64),
+    )
+    data = _data(SHAPE)
+    on = _quark_preset(model, data, tmp_path)
+    off = _quark_preset(model, data, tmp_path, extra={"AlignPad": False})
+    assert _graph_diff(on, off), "AlignPad changes Quark's graph here"
+    _assert_same_graph(on, _mine_preset(model, data), "AlignPad on")
+    _assert_same_graph(
+        off, _mine_preset(model, data, extra={"AlignPad": False}), "AlignPad off"
+    )
+
+
+@pytest.mark.parametrize(
+    "body, extra",
+    [
+        (
+            "c0 = Conv(x, w1, b1)\n s = Softmax<axis=1>(c0)\n y = Conv(s, w2, b2)",
+            {"ConvertSoftmaxToDPUVersion": True},
+        ),
+        (
+            "c0 = Conv(x, w1, b1)\n s = Softmax<axis=3>(c0)\n y = Conv(s, w2, b2)",
+            {"ConvertSoftmaxToDPUVersion": True},
+        ),
+        (
+            "c0 = Conv(x, w1, b1)\n s = InstanceNormalization<epsilon=0.001>(c0, isc, ibi)\n y = Conv(s, w2, b2)",
+            {"ConvertInstanceNormToDPUVersion": True},
+        ),
+        # (without the option an InstanceNormalization's bias is an int8 constant like a Conv's)
+        (
+            "c0 = Conv(x, w1, b1)\n s = InstanceNormalization<epsilon=0.001>(c0, isc, ibi)\n y = Conv(s, w2, b2)",
+            {},
+        ),
+    ],
+    ids=["softmax", "softmax_last", "instance_norm", "instance_norm_plain"],
+)
+def test_softmax_and_instance_norm_dpu_versions_match_quark(body, extra, tmp_path):
+    model = _edge(body, opset=13)
+    q, m, _ = _same_as_quark(model, tmp_path, extra=extra)
+    _assert_same_graph(q, m, body)
+    ops = [n.op_type for n in q.graph.node]
+    if "ConvertSoftmaxToDPUVersion" in extra:
+        assert "Softmax" not in ops and "Floor" in ops and "ReduceSum" in ops
+    if "ConvertInstanceNormToDPUVersion" in extra:
+        assert "ExtendedInstanceNormalization" in ops
+
+
+_OPT_PATTERNS = {
+    "relu_clip": "r = Relu(c0)\n c = Clip(r, lo, hi6)\n y = Conv(c, w2, b2)",
+    "conv_add_const": "a = Add(c0, ca)\n y = Conv(a, w2, b2)",
+    "conv_mul_const": "a = Mul(c0, cm)\n y = Conv(a, w2, b2)",
+    "conv_mul_scalar": "a = Mul(c0, cs)\n y = Conv(a, w2, b2)",
+    "mul_one": "a = Mul(c0, co)\n y = Conv(a, w2, b2)",
+    "add_zero": "a = Add(c0, cz)\n y = Conv(a, w2, b2)",
+    "add_chain": "a = Add(c0, ca)\n b = Add(a, ca)\n y = Conv(b, w2, b2)",
+    "dropout": "d = Dropout(c0)\n y = Conv(d, w2, b2)",
+    "cast_same": "d = Cast<to=1>(c0)\n y = Conv(d, w2, b2)",
+    "transposes": "t = Transpose<perm=[0,2,3,1]>(c0)\n u = Transpose<perm=[0,3,1,2]>(t)\n y = Conv(u, w2, b2)",
+    "dup_relu": "r1 = Relu(c0)\n r2 = Relu(c0)\n s = Add(r1, r2)\n y = Conv(s, w2, b2)",
+    "dup_sigmoid": "r1 = Sigmoid(c0)\n r2 = Sigmoid(c0)\n s = Mul(r1, r2)\n y = Conv(s, w2, b2)",
+    "dup_maxpool": "r1 = MaxPool<kernel_shape=[2,2]>(c0)\n r2 = MaxPool<kernel_shape=[2,2]>(c0)\n s = Add(r1, r2)\n y = Conv(s, w2, b2)",
+    "dup_conv": "c1 = Conv(x, w1, b1)\n s = Add(c0, c1)\n y = Conv(s, w2, b2)",
+    "const_fold_weight": "w = Mul(w1, cs)\n y = Conv(x, w, b1)",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_OPT_PATTERNS))
+def test_ort_graph_optimizations_match_quark(name, tmp_path):
+    """The float graph Quark quantizes has been through ONNX Runtime's basic graph
+    optimizer (and onnxslim): constant folding, Conv + Add / Mul, Relu + Clip,
+    no-op and duplicate node removal, ..."""
+    body = _OPT_PATTERNS[name]
+    if "c0" in body and name != "const_fold_weight":
+        body = "c0 = Conv(x, w1, b1)\n" + body
+    model = _edge(body)
+    q, m, data = _same_as_quark(model, tmp_path)
+    _assert_same_graph(q, m, name)
+    x = data[0]["x"]
+    np.testing.assert_array_equal(_ort(m, x), _ort(q, x))
+
+
+@pytest.mark.parametrize("pof2", [True, False])
+def test_shared_bias_follows_quarks_copy_bias_init(pof2, tmp_path):
+    """Two Convs read one bias: a power-of-two calibration quantizes it once, with
+    the first Conv's scales (both read that DQ); the others copy it per Conv
+    first (``CopyBiasInit``) and quantize each."""
+    rng = np.random.default_rng(2)
+    body = (
+        "a = Conv(x, w1, b1)\n r = Relu(a)\n y1 = Conv(r, w2s, b2)\n"
+        " z = Conv(r, w3s, b2)\n y = Add(y1, z)"
+    )
+    model = _edge(
+        body,
+        w2s=_w(rng, 8, 8, 1, 1),
+        w3s=_w(rng, 8, 8, 1, 1, scale=0.1),
+        b2=_w(rng, 8, scale=3),
+    )
+    preset = "XINT8" if pof2 else "A8W8"
+    extra = {"Int32Bias": True} if pof2 else None
+    q, m, _ = _same_as_quark(model, tmp_path, preset, extra)
+    if pof2:
+        _assert_same_graph(q, m, "shared bias")
+    else:
+        _assert_close_graph(q, m, "shared bias")
+    n_bias = sum(
+        1
+        for n in q.graph.node
+        if n.op_type == "DequantizeLinear"
+        and n.input[0].startswith(("b1", "b2", "dup"))
+    )
+    assert n_bias == (2 if pof2 else 3)
+
+
+def test_an_all_zero_activation_gets_quarks_scale(tmp_path):
+    """The histogram of a constant-zero tensor has zero point 0 in Quark (not the
+    centre), which doubles the scale the symmetric uint8 quantizer ends up with."""
+    model = _edge("s = Sub(x, x)\n y = Conv(s, w1, b1)")
+    q, m, _ = _same_as_quark(model, tmp_path)
+    _assert_same_graph(q, m, "zeros")
+
+
+# -- random graphs ------------------------------------------------------------------------
+
+
+def _random_graph(seed, big=False):
+    """A random DAG of NPU-style ops on ``[1, 8, 8, 8]`` tensors, weights and biases
+    scaled by random powers of two (so the position passes have work to do)."""
+    rng = random.Random(seed)
+    nrng = np.random.default_rng(seed)
+    inits = {"lo": np.array(0.0, np.float32), "hi6": np.array(6.0, np.float32)}
+    lines, tensors, uses = [], ["x"], {"x": 0}
+    counter = [0]
+
+    def name(prefix="t"):
+        counter[0] += 1
+        return f"{prefix}{counter[0]}"
+
+    def pow2(lo=-6, hi=4):
+        return np.float32(2.0 ** rng.randint(lo, hi))
+
+    def weight(*shape):
+        n = name("w")
+        inits[n] = (nrng.standard_normal(shape) * 0.4 * pow2(-6, 3)).astype(np.float32)
+        return n
+
+    def bias():
+        n = name("b")
+        inits[n] = (nrng.standard_normal(8) * 0.5 * pow2(-8, 4)).astype(np.float32)
+        return n
+
+    def pick():
+        t = rng.choice(tensors[-4:] if rng.random() < 0.7 else tensors)
+        uses[t] = uses.get(t, 0) + 1
+        return t
+
+    def emit(op, ins, attrs="", register=True):
+        out = name()
+        lines.append(f"{out} = {op}{attrs}({', '.join(ins)})")
+        if register:
+            tensors.append(out)
+            uses[out] = 0
+        return out
+
+    ops = [
+        "conv3",
+        "conv1",
+        "relu",
+        "add",
+        "sub",
+        "mul",
+        "concat",
+        "maxpool",
+        "avgpool",
+        "sigmoid",
+        "swish",
+        "leaky",
+        "clip6",
+        "gap_mul",
+    ]
+    if big:
+        ops += ["concat3", "conv3", "conv1", "add", "concat"]
+    for _ in range(rng.randint(10, 20) if big else rng.randint(5, 11)):
+        k = rng.choice(ops)
+        if k == "conv3":
+            emit("Conv", [pick(), weight(8, 8, 3, 3), bias()], "<pads=[1,1,1,1]>")
+        elif k == "conv1":
+            emit("Conv", [pick(), weight(8, 8, 1, 1), bias()])
+        elif k == "relu":
+            emit("Relu", [pick()])
+        elif k in ("add", "sub", "mul"):
+            a = pick()
+            others = [t for t in tensors if t != a]
+            if not others:
+                emit("Relu", [a])
+                continue
+            emit({"add": "Add", "sub": "Sub", "mul": "Mul"}[k], [a, rng.choice(others)])
+        elif k in ("concat", "concat3"):
+            ins = [pick() for _ in range(2 if k == "concat" else 3)]
+            c = emit("Concat", ins, "<axis=1>", register=False)
+            emit("Conv", [c, weight(8, 8 * len(ins), 1, 1), bias()])
+        elif k == "maxpool":
+            emit(
+                "MaxPool", [pick()], "<kernel_shape=[3,3],pads=[1,1,1,1],strides=[1,1]>"
+            )
+        elif k == "avgpool":
+            emit(
+                "AveragePool",
+                [pick()],
+                "<kernel_shape=[3,3],pads=[1,1,1,1],strides=[1,1]>",
+            )
+        elif k == "sigmoid":
+            emit("Sigmoid", [pick()])
+        elif k == "swish":
+            a = pick()
+            emit("Mul", [a, emit("Sigmoid", [a], register=False)])
+        elif k == "leaky":
+            emit("LeakyRelu", [pick()], "<alpha=0.1>")
+        elif k == "clip6":
+            emit("Clip", [pick(), "lo", "hi6"])
+        elif k == "gap_mul":
+            a = pick()
+            emit("Mul", [a, emit("GlobalAveragePool", [a], register=False)])
+    leaves = [t for t in tensors[1:] if uses.get(t, 0) == 0]
+    cur = leaves[0]
+    for leaf in leaves[1:]:
+        if rng.random() < 0.5:
+            cur = emit("Add", [cur, leaf])
+        else:
+            cat = emit("Concat", [cur, leaf], "<axis=1>", register=False)
+            cur = emit("Conv", [cat, weight(8, 16, 1, 1), bias()])
+    lines.append(f"y = Conv({cur}, wf, bf)")
+    inits["wf"] = (nrng.standard_normal((4, 8, 1, 1)) * 0.4 * pow2()).astype(np.float32)
+    inits["bf"] = (nrng.standard_normal(4) * 0.5 * pow2()).astype(np.float32)
+    m = parser.parse_model(
+        '<ir_version: 9, opset_import: ["": 17]> g (float[1,8,8,8] x) => (float y) {'
+        + "\n".join(lines)
+        + "}"
+    )
+    m.graph.initializer.extend(numpy_helper.from_array(v, k) for k, v in inits.items())
+    return _named(m), (1, 8, 8, 8)
+
+
+def _shuffled(model, seed):
+    """The same graph with its nodes in another valid topological order."""
+    rng = random.Random(seed)
+    avail = {i.name for i in model.graph.input} | {
+        t.name for t in model.graph.initializer
+    }
+    pending, order = list(model.graph.node), []
+    while pending:
+        node = rng.choice([n for n in pending if all(x in avail for x in n.input)])
+        pending.remove(node)
+        order.append(node)
+        avail |= set(node.output)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    del out.graph.node[:]
+    out.graph.node.extend(order)
+    return out
+
+
+@pytest.mark.parametrize("shuffle", [False, True], ids=["file_order", "shuffled"])
+@pytest.mark.parametrize("seed", range(36))
+def test_random_xint8_graphs_match_quark(seed, shuffle, tmp_path):
+    model, shape = _random_graph(seed, big=bool(seed % 2))
+    if shuffle:
+        model = _shuffled(model, seed)
+    data = _data(shape, seed=seed + 7)
+    q = _quark_preset(model, data, tmp_path)
+    m = _mine_preset(model, data)
+    _assert_same_graph(q, m, f"random graph #{seed}")
+    x = data[0]["x"]
+    np.testing.assert_array_equal(_ort(m, x), _ort(q, x))
+
+
+def _order_key(n):
+    def base(t):
+        t = re.sub(r"/qdq\d+/(int8|int32|uint8|q)$", "", t)
+        t = t[:-4] if t.endswith("_Mul") else t
+        for suffix in (
+            "_QuantizeLinear_Output",
+            "_DequantizeLinear_Output",
+            "_QuantizeLinear_Input",
+            "_quantized",
+            "/dq",
+            "/q",
+            "/f",
+        ):
+            if t.endswith(suffix):
+                t = t[: -len(suffix)]
+        return re.sub(r"/qdq\d+$", "", t)
+
+    if n.op_type in ("QuantizeLinear", "DequantizeLinear"):
+        return n.op_type[0] + ":" + base(n.input[0])
+    return n.op_type + ":" + base(n.output[0])
+
+
+@pytest.mark.parametrize("seed", range(0, 24, 2))
+def test_node_order_of_the_quantized_graph_is_quarks(seed, tmp_path):
+    """Quark sorts the float graph and, again, the Q/DQ graph with its own
+    ``topological_sort`` (seeded on the alphabetical order of the initializer names),
+    appends the DPU nodes, and visits that order in its position passes."""
+    model, shape = _random_graph(seed, big=True)
+    data = _data(shape, seed=seed + 7)
+    extra = {"OnnxsimKeepQuarkNodeOrder": True}
+    q = _quark_preset(model, data, tmp_path, extra=extra)
+    m = _mine_preset(model, data, extra=extra)
+
+    def keys(model):
+        return [_order_key(n) for n in model.graph.node if n.op_type != "Constant"]
+
+    assert keys(m) == keys(q)
+
+
+def _bn16():
+    rng = np.random.default_rng(4)
+    return dict(
+        g16=(1 + _w(rng, 16, scale=0.3)).astype(np.float32),
+        bb16=_w(rng, 16),
+        bm16=_w(rng, 16),
+        bv16=(1 + np.abs(_w(rng, 16))).astype(np.float32),
+    )
+
+
+@pytest.mark.parametrize("bias", [True, False], ids=["bias", "no_bias"])
+@pytest.mark.parametrize("extra", [{}, {"FoldBatchNorm": False}], ids=["fold", "keep"])
+def test_batch_norm_after_a_concat_is_folded_like_quark(bias, extra, tmp_path):
+    """Quark folds a BatchNormalization after a Concat of Convs into each of them
+    (the channel slice each produces) -- ONNX Runtime does not."""
+    ins = ", w1, b1" if bias else ", w1"
+    ins3 = ", w3, b3" if bias else ", w3"
+    model = _edge(
+        f"a = Conv(x{ins})\n b = Conv(x{ins3})\n k = Concat<axis=1>(a, b)\n"
+        " n = BatchNormalization(k, g16, bb16, bm16, bv16)\n y = Conv(n, w4, b4)",
+        **_bn16(),
+    )
+    q, m, data = _same_as_quark(model, tmp_path, extra=extra)
+    _assert_same_graph(q, m, f"bias={bias} {extra}")
+    ops = [n.op_type for n in q.graph.node]
+    assert ("BatchNormalization" in ops or "Conv" in ops) and (
+        extra == {} or ops.count("Conv") == 4
+    )
+    x = data[0]["x"]
+    np.testing.assert_array_equal(_ort(m, x), _ort(q, x))
+
+
+_MLP_OPT = {
+    # ONNX Runtime fuses a MatMul + Add into a Gemm, Reshapes into one, folds a no-op Div
+    "matmul_add": "m = MatMul(x, wm)\n y = Add(m, bm)",
+    "matmul_add_gemm": "m = MatMul(x, wm)\n a = Add(m, bm)\n r = Relu(a)\n y = Gemm(r, wm2, bm2)",
+    "reshape_chain": "g = Gemm(x, wm, bm)\n r = Reshape(g, shr)\n s = Reshape(r, shs2)\n y = Gemm(s, wm2, bm2)",
+    "gemm_no_op_div": "g = Gemm(x, wm, bm)\n a = Div(g, co)\n y = Gemm(a, wm2, bm2)",
+}
+
+
+@pytest.mark.parametrize("preset", ["XINT8", "A8W8"])
+@pytest.mark.parametrize("name", sorted(_MLP_OPT))
+def test_gemm_graph_optimizations_match_quark(name, preset, tmp_path):
+    rng = np.random.default_rng(6)
+    model = _edge(
+        _MLP_OPT[name],
+        shape=(3, 16),
+        wm=_w(rng, 16, 8),
+        bm=_w(rng, 8),
+        wm2=_w(rng, 8, 4),
+        bm2=_w(rng, 4),
+        shr=np.array([3, 4, 2], np.int64),
+        shs2=np.array([3, 8], np.int64),
+    )
+    q, m, _ = _same_as_quark(model, tmp_path, preset)
+    if preset == "XINT8":
+        _assert_same_graph(q, m, name)
+    else:
+        _assert_close_graph(q, m, name)
+
+
+def test_a_quantized_constant_replaces_the_initializer_for_every_reader(tmp_path):
+    """The ``constant_value`` of a Pad that a Clip also reads as its minimum: Quark's
+    quantizer swaps the initializer for its DQ in *all* the nodes that read it."""
+    rng = np.random.default_rng(5)
+    model = _edge(
+        "c0 = Conv(x, w1, b1)\n p = Pad(c0, pads, cn)\n q = Conv(p, w2b, b2b)\n"
+        " y = Clip(q, cn, hi6)",
+        w2b=_w(rng, 2, 8, 3, 3),
+        b2b=_w(rng, 2),
+        pads=np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64),
+    )
+    q, m, _ = _same_as_quark(model, tmp_path)
+    _assert_same_graph(q, m, "shared constant")
+    clip = next(n for n in q.graph.node if n.op_type == "Clip")
+    by_out = {o: n for n in q.graph.node for o in n.output}
+    assert by_out[clip.input[1]].op_type == "DequantizeLinear"

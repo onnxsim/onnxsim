@@ -9,6 +9,7 @@ import onnx
 import pytest
 from onnx import numpy_helper, parser
 
+from onnxsim import calibration as cal
 from onnxsim import quark_bias_correction as qbc
 from onnxsim import quark_compat as qc
 from onnxsim import quark_convert as conv
@@ -725,3 +726,469 @@ def test_batch_norm_that_stays_is_not_quantized():
     assert _ops(q).count("Conv") == 2  # the Conv after it is still quantized
     converted = _xint8(model, preset="XINT8")
     assert "BatchNormalization" not in _ops(converted)
+
+
+# == Edge cases: Quark's op-type list and node order, optimizer passes, DPU nodes ==========
+
+from onnxsim import quark_marking as marking  # noqa: E402
+
+
+def _graph(body, inits=(), opset=17, inp="float[1,4,4,4] x"):
+    model = parser.parse_model(
+        f"""<ir_version: 9, opset_import: ["": {opset}]>
+        g ({inp}) => (float y) {{ {body} }}"""
+    )
+    model.graph.initializer.extend(inits)
+    for i, n in enumerate(model.graph.node):
+        n.name = f"n{i}_{n.op_type}"
+    return model
+
+
+def test_quarks_op_type_lists():
+    base = marking.quark_op_types(False)
+    cnn = marking.quark_op_types(True, extra=["Exp"])
+    assert {"Conv", "Gemm", "Relu", "Clip", "Reshape", "MaxPool", "Softmax"} <= base
+    assert not {"Flatten", "Neg", "Exp", "Sub", "Slice", "PRelu"} & base
+    assert {"Sub", "Slice", "PRelu", "HardSigmoid", "ReduceMean", "Exp"} <= cnn
+    assert "Flatten" not in cnn
+
+
+def test_node_order_is_the_topological_sort_of_onnx_runtime():
+    """Quark sorts with ``ONNXModel.topological_sort`` -- constants first, then the
+    nodes the *alphabetically sorted* inputs and initializers release, then breadth
+    first."""
+    from onnxruntime.quantization.onnx_model import ONNXModel
+
+    rng = np.random.default_rng(0)
+    for seed in range(12):
+        r = np.random.default_rng(seed)
+        names = ["zw", "aw", "mw", "bb"]
+        lines = ["k = Constant<value_float=2.0>()"]
+        tensors = ["x", "k"]
+        for i in range(int(r.integers(6, 14))):
+            a, b = r.choice(tensors, 2)
+            kind = int(r.integers(0, 3))
+            if kind == 0:
+                lines.append(f"t{i} = Add({a}, {b})")
+            elif kind == 1:
+                lines.append(f"t{i} = Mul({a}, {r.choice(names)})")
+            else:
+                lines.append(f"t{i} = Relu({a})")
+            tensors.append(f"t{i}")
+        lines.append(f"y = Add({tensors[-1]}, aw)")
+        inits = [
+            numpy_helper.from_array(
+                rng.standard_normal((1, 4, 4, 4)).astype(np.float32), n
+            )
+            for n in names
+        ]
+        model = _graph("\n".join(lines), inits)
+        for i, n in enumerate(model.graph.node):  # a different file order
+            n.name = f"n{i}"
+        ref = onnx.ModelProto()
+        ref.CopyFrom(model)
+        wrapped = ONNXModel(ref)
+        wrapped.topological_sort()
+        want = [(n.op_type, n.output[0]) for n in ref.graph.node]
+        got = [(n.op_type, n.output[0]) for n in marking.quark_node_order(model)]
+        assert got == want
+        assert [n.output[0] for n in marking.quark_sorted(model).graph.node] == [
+            o for _, o in want
+        ]
+
+
+def test_a_relu_or_clip_is_skipped_when_no_earlier_node_marked_its_input():
+    lo = numpy_helper.from_array(np.array(0.0, np.float32), "lo")
+    hi = numpy_helper.from_array(np.array(6.0, np.float32), "hi")
+    w = numpy_helper.from_array(np.ones((4, 4, 1, 1), np.float32), "w")
+    types = marking.quark_op_types(True)
+
+    def skipped(body, **kw):
+        model = _graph(body, [lo, hi, w])
+        return marking.skipped_nodes(model, types, **kw)
+
+    assert skipped("r = Relu(x)\n y = Conv(r, w)") == {"n0_Relu"}
+    assert skipped("c = Clip(x, lo, hi)\n y = Conv(c, w)") == {"n0_Clip"}
+    # a Conv visited first marks x for the Relu (the sort releases the readers of an
+    # input in file order: whichever is listed first is visited first)
+    assert skipped("c = Conv(x, w)\n r = Relu(x)\n y = Add(c, r)") == set()
+    assert skipped("r = Relu(x)\n c = Conv(x, w)\n y = Add(c, r)") == {"n0_Relu"}
+    # an op outside the registries marks nothing: its consumer finds an unmarked input
+    assert skipped("n = Neg(x)\n r = Relu(n)\n y = Conv(r, w)") == {"n1_Relu"}
+    # data movement: skipped without ForceQuantizeNoInputCheck when unmarked
+    body = "t = Transpose<perm=[0,1,3,2]>(x)\n y = Conv(t, w)"
+    assert skipped(body) == set()
+    assert skipped(body, force_no_input_check=False) == {"n0_Transpose"}
+    # a HardSigmoid that is not 1/6, 0.5 is never quantized
+    hs = "h = HardSigmoid<alpha=0.2>(x)\n y = Conv(h, w)"
+    assert skipped(hs) == {"n0_HardSigmoid"}
+
+
+def test_xint8_leaves_the_input_of_an_unmarked_clip_and_of_a_flatten_float():
+    lo = numpy_helper.from_array(np.array(0.0, np.float32), "lo")
+    hi = numpy_helper.from_array(np.array(6.0, np.float32), "hi")
+    rng = np.random.default_rng(0)
+    w = numpy_helper.from_array(_w(rng, 4, 3, 3, 3), "w")
+    b = numpy_helper.from_array(_w(rng, 4), "b")
+    wg = numpy_helper.from_array(_w(rng, 432, 4), "wg")
+    shape = (1, 3, 12, 12)
+    for body, op in (
+        ("c = Clip(x, lo, hi)\n y = Conv(c, w, b)", "Clip"),
+        ("f = Flatten(x)\n y = Gemm(f, wg)", "Flatten"),
+    ):
+        model = _graph(body, [lo, hi, w, b, wg], inp=f"float{list(shape)} x")
+        q = _xint8(model)
+        node = next(n for n in q.graph.node if n.op_type == op)
+        assert node.input[0] == "x", "no Q/DQ pair on the graph input"
+        # its *output* is quantized, for the consumer
+        reader = next(n for n in q.graph.node if node.output[0] in n.input)
+        assert reader.op_type == "QuantizeLinear"
+    # ... while a Conv reading the same input marks it for everyone
+    model = _graph(
+        "c = Conv<pads=[1,1,1,1]>(x, w, b)\n r = Relu(x)\n y = Concat<axis=1>(c, r)",
+        [w, b],
+        inp=f"float{list(shape)} x",
+    )
+    q = _xint8(model)
+    relu = next(n for n in q.graph.node if n.op_type == "Relu")
+    assert relu.input[0] != "x"
+
+
+def test_pad_constant_value_is_quantized_and_align_pad_follows_it():
+    rng = np.random.default_rng(1)
+    pads = numpy_helper.from_array(np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64), "pads")
+    big = numpy_helper.from_array(np.array(100.0, np.float32), "big")
+    inits = [
+        pads,
+        big,
+        numpy_helper.from_array(_w(rng, 4, 3, 3, 3), "w1"),
+        numpy_helper.from_array(_w(rng, 4), "b1"),
+        numpy_helper.from_array(_w(rng, 2, 4, 3, 3), "w2"),
+        numpy_helper.from_array(_w(rng, 2), "b2"),
+    ]
+    model = _graph(
+        "c0 = Conv(x, w1, b1)\n p = Pad(c0, pads, big)\n y = Conv(p, w2, b2)",
+        inits,
+        inp=f"float{list(SHAPE)} x",
+    )
+    on = _xint8(model)
+    off = _xint8(model, {"AlignPad": False})
+    # the value is an int8 constant (its DQ reads codes, scale 2**-k), not float
+    pad = next(n for n in on.graph.node if n.op_type == "Pad")
+    by_out = {o: n for n in on.graph.node for o in n.output}
+    assert by_out[pad.input[2]].op_type == "DequantizeLinear"
+
+    def scale(model, tensor_prefix):
+        inits = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
+        q = next(
+            n
+            for n in model.graph.node
+            if n.op_type == "QuantizeLinear" and n.input[0].startswith(tensor_prefix)
+        )
+        return float(inits[q.input[1]])
+
+    # Pad's output grid is coarse (100), its input's was fine: AlignPad moves the input
+    assert scale(off, "c0") < scale(off, "p") == scale(on, "p")
+    assert scale(on, "c0") == scale(on, "p")
+
+
+def test_all_zero_unsigned_activation_scale():
+    h = cal._Pof2Histogram()
+    h.add(np.zeros(64, np.float32))
+    assert h.scale("uint8") == 4.0  # Quark: threshold [0, 255 * 2], read as 2 * 2
+    assert h.scale("int8") == 2.0
+
+
+def test_calibration_session_runs_without_graph_optimizations(monkeypatch):
+    import onnxruntime as ort
+
+    seen = []
+    real = ort.InferenceSession
+
+    def spy(model, sess_options=None, *a, **k):
+        if not sess_options.optimized_model_filepath:  # (not the cleanup session)
+            seen.append(sess_options.graph_optimization_level)
+        return real(model, sess_options, *a, **k)
+
+    monkeypatch.setattr(ort, "InferenceSession", spy)
+    rng = np.random.default_rng(0)
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n y = Conv(c0, w2, b2)",
+        _convs(rng)[:2] + _convs(rng)[2:4],
+    )
+    _xint8(model)
+    assert seen and all(
+        level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL for level in seen
+    )
+
+
+def test_softmax_dpu_nodes():
+    node = parser.parse_node("s = Softmax<axis=1>(c)")
+    node.name = "sm"
+    new = npu.softmax_dpu_nodes(node, 13)
+    ops = [n.op_type for n in new]
+    assert ops.count("Floor") == 1 and ops.count("Pow") == 1 and ops.count("Div") == 1
+    assert "Softmax" not in ops and ops[-1] == "Cast"
+    assert new[-1].output == ["s"] and new[0].input == ["c"]
+    consts = [n for n in new if n.op_type == "Constant"]
+    assert {c.attribute[0].t.data_type for c in consts} == {
+        onnx.TensorProto.BFLOAT16,
+        onnx.TensorProto.INT64,
+    }
+    # before opset 13 the axes are an attribute; below opset 7 nothing is converted
+    old = npu.softmax_dpu_nodes(node, 11)
+    rs = next(n for n in old if n.op_type == "ReduceSum")
+    assert (
+        len(rs.input) == 1
+        and next(a.ints[0] for a in rs.attribute if a.name == "axes") == 1
+    )
+    assert npu.softmax_dpu_nodes(node, 6) == []
+
+
+def test_softmax_and_instance_norm_dpu_versions_are_opt_in():
+    rng = np.random.default_rng(0)
+    inits = _convs(rng) + [
+        numpy_helper.from_array((1 + _w(rng, 8)).astype(np.float32), "sc"),
+        numpy_helper.from_array(_w(rng, 8), "bi"),
+    ]
+    sm = _model(
+        "c0 = Conv(x, w1, b1)\n s = Softmax<axis=1>(c0)\n y = Conv(s, w2, b2)",
+        inits,
+        opset=13,
+    )
+    inn = _model(
+        "c0 = Conv(x, w1, b1)\n s = InstanceNormalization<epsilon=0.001>(c0, sc, bi)\n y = Conv(s, w2, b2)",
+        inits,
+        opset=13,
+    )
+    assert "Softmax" in _ops(_xint8(sm))
+    q = _xint8(sm, {"ConvertSoftmaxToDPUVersion": True})
+    assert "Softmax" not in _ops(q) and "Floor" in _ops(q)
+    assert "InstanceNormalization" in _ops(_xint8(inn))
+    q = _xint8(inn, {"ConvertInstanceNormToDPUVersion": True})
+    ext = next(n for n in q.graph.node if n.op_type == "ExtendedInstanceNormalization")
+    assert ext.domain == "com.amd.quark"
+    assert next(a.f for a in ext.attribute if a.name == "epsilon") == pytest.approx(
+        0.001
+    )
+    assert any(o.domain == "com.amd.quark" for o in q.opset_import)
+
+
+def test_instance_norm_bias_is_an_int8_constant_under_xint8():
+    rng = np.random.default_rng(0)
+    inits = _convs(rng) + [
+        numpy_helper.from_array((1 + _w(rng, 8)).astype(np.float32), "sc"),
+        numpy_helper.from_array(_w(rng, 8), "bi"),
+    ]
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n s = InstanceNormalization(c0, sc, bi)\n y = Conv(s, w2, b2)",
+        inits,
+        opset=13,
+    )
+    q = _xint8(model)
+    codes = {
+        t.name: t.data_type
+        for t in q.graph.initializer
+        if t.name.startswith("bi") and t.name.endswith(("/int8", "/int32"))
+    }
+    assert set(codes.values()) == {onnx.TensorProto.INT8}
+    with_int32 = _xint8(model, {"Int32Bias": True})
+    assert any(
+        t.data_type == onnx.TensorProto.INT32
+        for t in with_int32.graph.initializer
+        if t.name.startswith("bi")
+    )
+
+
+def test_dpu_nodes_are_appended_and_pool_shapes_come_from_the_unrewritten_graph():
+    """Quark's ``insert_mul`` appends the ``Constant`` and ``Mul`` at the end of the
+    node list, and a ``Sigmoid`` becomes a ``HardSigmoid`` appended there too; the
+    shape of a pool's input is looked up in the graph as it was before."""
+    rng = np.random.default_rng(0)
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n s = Sigmoid(c0)\n p = GlobalAveragePool(s)\n"
+        " m = Mul(s, p)\n y = Conv(m, w5, b5)",
+        _convs(rng),
+    )
+    q = _xint8(model, {"OnnxsimKeepQuarkNodeOrder": True})
+    ops = [n.op_type for n in q.graph.node]
+    assert ops[-4:] == ["HardSigmoid", "Constant", "Mul", "Constant"] or ops[-5:] == [
+        "HardSigmoid",
+        "Constant",
+        "Mul",
+        "Constant",
+        "Mul",
+    ]
+    # both the HardSigmoid and the pool got their DPU Mul
+    assert [
+        n.op_type
+        for n in q.graph.node
+        if n.op_type == "Mul" and n.input[1].endswith("_Scale")
+    ] == ["Mul", "Mul"]
+    ordered = _xint8(model)  # default: topologically sorted again
+    assert "HardSigmoid" in _ops(ordered)
+    onnx.checker.check_model(ordered)
+
+
+def test_quark_qdq_sorted_follows_quarks_parameter_names():
+    """The sort seeds on the alphabetical order of the initializer names, so it is
+    run on a copy with Quark's names (``<w>_scale`` ...) for the Q/DQ parameters."""
+    rng = np.random.default_rng(0)
+    twin = [
+        numpy_helper.from_array(_w(rng, 8, 3, 3, 3), "w1b"),
+        numpy_helper.from_array(_w(rng, 8), "b1b"),
+    ]
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n c1 = Conv(x, w1b, b1b)\n y = Add(c0, c1)",
+        _convs(rng) + twin,
+    )
+    cfg = qc.QConfig.get_default_config("XINT8")
+    cfg.extra_options["OnnxsimKeepQuarkNodeOrder"] = True
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        q = qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_Reader(_data())
+        )
+    again = marking.quark_qdq_sorted(q)
+    assert [n.output[0] for n in again.graph.node] == [
+        n.output[0] for n in q.graph.node
+    ]
+    assert marking._quark_names(q)  # every Q/DQ parameter has a Quark-style name
+    names = set(marking._quark_names(q).values())
+    assert {"w1_quantized", "w1_scale", "x_scale", "x_zero_point"} <= names
+
+
+def test_a_shared_int32_bias_is_quantized_once_with_the_first_readers_scales():
+    rng = np.random.default_rng(2)
+    inits = [
+        numpy_helper.from_array(_w(rng, 8, 3, 3, 3), "w1"),
+        numpy_helper.from_array(_w(rng, 8), "b1"),
+        numpy_helper.from_array(_w(rng, 8, 8, 1, 1), "w2"),
+        numpy_helper.from_array(_w(rng, 8, 8, 1, 1, scale=0.1), "w3"),
+        numpy_helper.from_array(_w(rng, 8, scale=3), "bs"),
+    ]
+    model = _model(
+        "a = Conv(x, w1, b1)\n r = Relu(a)\n y1 = Conv(r, w2, bs)\n z = Conv(r, w3, bs)\n"
+        " y = Add(y1, z)",
+        inits,
+    )
+    q = _xint8(model, {"Int32Bias": True})
+    convs = [n for n in q.graph.node if n.op_type == "Conv"]
+    assert convs[1].input[2] == convs[2].input[2], "both read one bias DQ"
+    # (a copy per Conv under non-power-of-two calibrations, Quark's CopyBiasInit)
+    a8 = _xint8(model, preset="A8W8")
+    convs = [n for n in a8.graph.node if n.op_type == "Conv"]
+    assert convs[1].input[2] != convs[2].input[2]
+
+
+# -- the float-graph optimizer steps ------------------------------------------------
+
+
+def test_remove_input_init_and_duplicate_shared_biases():
+    rng = np.random.default_rng(0)
+    model = _model(
+        "a = Conv(x, w1, b1)\n y = Conv(a, w3, b1)",
+        [
+            numpy_helper.from_array(_w(rng, 8, 3, 3, 3), "w1"),
+            numpy_helper.from_array(_w(rng, 8), "b1"),
+            numpy_helper.from_array(_w(rng, 8, 8, 1, 1), "w3"),
+        ],
+    )
+    model.graph.input.append(onnx.helper.make_tensor_value_info("w1", 1, [8, 3, 3, 3]))
+    out = conv.remove_input_init(model)
+    assert [i.name for i in out.graph.input] == ["x"]
+    dup = conv.duplicate_shared_biases(model)
+    convs = [n for n in dup.graph.node if n.op_type == "Conv"]
+    assert convs[0].input[2] == "b1" and convs[1].input[2] == "duplicatedb12"
+    inits = {t.name: numpy_helper.to_array(t) for t in dup.graph.initializer}
+    np.testing.assert_array_equal(inits["b1"], inits["duplicatedb12"])
+
+
+def test_onnx_runtime_optimizer_folds_what_the_reproductions_do_not():
+    pytest.importorskip("onnxruntime")
+    rng = np.random.default_rng(0)
+    extra = [
+        numpy_helper.from_array(_w(rng, 1, 8, 1, 1), "ca"),
+        numpy_helper.from_array(np.array(0.0, np.float32), "lo"),
+        numpy_helper.from_array(np.array(6.0, np.float32), "hi"),
+    ]
+    for body, want in (
+        (
+            "c0 = Conv(x, w1, b1)\n a = Add(c0, ca)\n y = Conv(a, w2, b2)",
+            ["Conv", "Conv"],
+        ),
+        (
+            "c0 = Conv(x, w1, b1)\n r = Relu(c0)\n c = Clip(r, lo, hi)\n y = Conv(c, w2, b2)",
+            ["Conv", "Clip", "Conv"],
+        ),
+        (
+            "c0 = Conv(x, w1, b1)\n r1 = Relu(c0)\n r2 = Relu(c0)\n s = Add(r1, r2)\n y = Conv(s, w2, b2)",
+            ["Conv", "Relu", "Add", "Conv"],
+        ),
+    ):
+        model = _model(body, _convs() + extra)
+        got = conv.graph_cleanup(model, runtime=True)
+        assert sorted(n.op_type for n in got.graph.node) == sorted(want), body
+        python_only = conv.graph_cleanup(model)
+        assert len(python_only.graph.node) > len(got.graph.node)
+        x = _data(n=1)[0]["x"]
+        np.testing.assert_allclose(_run(got, x), _run(model, x), rtol=1e-5, atol=1e-5)
+
+
+def test_batch_norm_after_a_concat_folds_into_each_convolution():
+    rng = np.random.default_rng(3)
+    inits = [
+        numpy_helper.from_array(_w(rng, 8, 3, 3, 3), "w1"),
+        numpy_helper.from_array(_w(rng, 8, 3, 3, 3), "w3"),
+        numpy_helper.from_array(_w(rng, 8), "b3"),
+        numpy_helper.from_array(_w(rng, 2, 16, 1, 1), "w4"),
+        numpy_helper.from_array(_w(rng, 2), "b4"),
+    ] + _bn_inits(rng, c=16)
+    model = _model(
+        "a = Conv(x, w1)\n b = Conv(x, w3, b3)\n k = Concat<axis=1>(a, b)\n"
+        " n = BatchNormalization(k, bs, bb, bm, bv)\n y = Conv(n, w4, b4)",
+        inits,
+    )
+    out = conv.fold_batch_norm_after_concat(model)
+    assert [n.op_type for n in out.graph.node] == ["Conv", "Conv", "Concat", "Conv"]
+    x = _data(n=1)[0]["x"]
+    # (Quark's epsilon default is 1e-10 against ONNX's 1e-5)
+    np.testing.assert_allclose(_run(out, x), _run(model, x), rtol=1e-3, atol=1e-4)
+    assert len(out.graph.node[0].input) == 3, "the bias-free Conv got one"
+    # an unfoldable parent (a Relu) leaves the BatchNormalization
+    blocked = _model(
+        "a = Conv(x, w1)\n r = Relu(a)\n b = Conv(x, w3, b3)\n k = Concat<axis=1>(r, b)\n"
+        " n = BatchNormalization(k, bs, bb, bm, bv)\n y = Conv(n, w4, b4)",
+        inits,
+    )
+    assert "BatchNormalization" in [
+        n.op_type for n in conv.fold_batch_norm_after_concat(blocked).graph.node
+    ]
+
+
+def test_the_python_reproductions_stand_in_for_a_missing_optimizer(monkeypatch):
+    """Without ONNX Runtime (or onnxslim) -- or with ``UseRuntimeOptimizers=False`` --
+    the BatchNorm / Pad / Identity / HardSwish reproductions are used."""
+    rng = np.random.default_rng(1)
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n b = BatchNormalization(c0, bs, bb, bm, bv)\n"
+        " h = HardSwish(b)\n i = Identity(h)\n y = Conv(i, w2, b2)",
+        _convs(rng) + _bn_inits(rng),
+    )
+    twice = _model(
+        "c0 = Conv(x, w1, b1)\n r1 = Relu(c0)\n r2 = Relu(c0)\n s = Add(r1, r2)\n y = Conv(s, w2, b2)",
+        _convs(rng),
+    )
+    deduped = conv.eliminate_duplicate_nodes(twice)
+    assert [n.op_type for n in deduped.graph.node] == ["Conv", "Relu", "Add", "Conv"]
+    assert list(deduped.graph.node[2].input) == ["r1", "r1"]
+    monkeypatch.setattr(conv, "ort_basic_optimize", lambda m: None)
+    monkeypatch.setattr(conv, "onnxslim_simplify", lambda m, c=None: None)
+    got = conv.graph_cleanup(model, runtime=True)
+    ops = [n.op_type for n in got.graph.node]
+    assert "HardSwish" not in ops and "Identity" not in ops
+    assert "BatchNormalization" not in ops and ops.count("Conv") == 2
+    q = _xint8(model, {"UseRuntimeOptimizers": False})
+    assert "HardSwish" not in _ops(q) and "Identity" not in _ops(q)
+    x = _data(n=1)[0]["x"]
+    np.testing.assert_allclose(_run(got, x), _run(model, x), rtol=1e-3, atol=1e-4)

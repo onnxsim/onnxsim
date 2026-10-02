@@ -86,7 +86,7 @@ _DATA_INPUTS = {
     "Unsqueeze": (0,),
     "Gather": (0,),
     "Resize": (0,),
-    "Pad": (0,),
+    "Pad": (0, 2),
     "Clip": (0,),
     "TopK": (0,),
     "ReduceMean": (0,),
@@ -149,6 +149,42 @@ def _pof2(scale: float) -> float:
     return float(2.0 ** np.ceil(np.log2(scale) - 1e-9)) if scale > 0 else scale
 
 
+# Quark's symmetric integer ranges (``get_qmin_qmax_for_qType(symmetric=True)``)
+_QUARK_SYMMETRIC_RANGE = {
+    (-128, 127): (-127, 127),
+    (-32768, 32767): (-32767, 32767),
+}
+
+
+def _quark_pof2_params(
+    lo: float, hi: float, qmin: int, qmax: int, symmetric: bool
+) -> Tuple[float, int]:
+    """``(scale, zero_point)`` of Quark's ``compute_scale_zp`` with a power-of-two
+    method: the min / max scale (float32 range, float64 division) taken to the
+    *nearest* fixed-point position -- not rounded up -- with the zero point
+    recomputed for it. Ranges the MinMSE search produced come out exact; a range
+    set by hand (a Softmax output's ``(0, 1)``) is rounded, not covered."""
+    if symmetric:
+        qmin, qmax = _QUARK_SYMMETRIC_RANGE.get((qmin, qmax), (qmin, qmax))
+    rmin, rmax = np.float32(min(lo, 0.0)), np.float32(max(hi, 0.0))
+    if symmetric:
+        absmax = np.maximum(np.abs(rmin), np.abs(rmax))
+        rmin, rmax = -absmax, absmax
+    scale = np.float64(rmax - rmin) / np.float64(qmax - qmin)
+    if scale < np.finfo(np.float32).tiny:
+        scale32, zp = np.float32(1.0), 0
+    else:
+        zp = int(np.round(qmin - np.float64(rmin) / scale))
+        scale32 = np.float32(scale)
+    pos = int(np.rint(-np.log2(min(max(float(scale32), 2.0**-127), 2.0**127))))
+    pof2 = np.float32(2.0**-pos)
+    new_rmin = np.minimum((np.float32(qmin) - np.float32(zp)) * pof2, np.float32(0))
+    new_zp = int(np.round(np.float32(qmin) - new_rmin / pof2))
+    if symmetric and qmin == 0 and qmax == 255 and new_zp == 127:
+        new_zp = 128  # (the hardware wants the zero point centred)
+    return float(pof2), new_zp
+
+
 def _qparams(
     lo: float,
     hi: float,
@@ -156,12 +192,17 @@ def _qparams(
     qmax: int,
     symmetric: bool = False,
     power_of_two: bool = False,
+    quark_rounding: bool = False,
 ) -> Tuple[float, int]:
     """``(scale, zero_point)`` for the range ``[lo, hi]`` (always including 0).
 
     ``symmetric``: ``scale = absmax / half-range`` with the zero point in the
     middle of the integer range -- 0 for signed types, 128 / 32768 for unsigned
-    ones. ``power_of_two`` rounds the scale up to a power of two."""
+    ones. ``power_of_two`` rounds the scale up to a power of two;
+    ``quark_rounding`` (with it) takes the nearest position instead, as Quark's
+    power-of-two ``compute_scale_zp`` does."""
+    if power_of_two and quark_rounding:
+        return _quark_pof2_params(float(lo), float(hi), qmin, qmax, symmetric)
     lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
     if symmetric:
         absmax = max(-lo, hi)
@@ -284,10 +325,13 @@ def _is_quantized_node(
     op_types: Optional[set],
     exclude_op_types: set,
     exclude_nodes: set,
+    skip_nodes: Optional[set] = None,
 ) -> bool:
     if n.domain not in ("", "ai.onnx") or n.op_type in _NEVER_QUANTIZED:
         return False
     if op_types is not None and n.op_type not in op_types:
+        return False
+    if skip_nodes and (n.name in skip_nodes or n.output[0] in skip_nodes):
         return False
     return (
         n.op_type not in exclude_op_types
@@ -296,9 +340,24 @@ def _is_quantized_node(
     )
 
 
-def _data_inputs(n: onnx.NodeProto) -> List[str]:
+def _data_inputs(
+    n: onnx.NodeProto, inits: Optional[Dict[str, TensorProto]] = None
+) -> List[str]:
+    """The inputs of ``n`` that carry data. With ``inits``, the bias of a Conv /
+    ConvTranspose / Gemm that is not a constant is left out as well: Quark's
+    quantizers only quantize a bias that is a weight (a Gemm whose ONNX Runtime
+    fused ``C`` is an activation keeps it float)."""
     idx = _DATA_INPUTS.get(n.op_type)
-    return [x for i, x in enumerate(n.input) if x and (idx is None or i in idx)]
+    out = [x for i, x in enumerate(n.input) if x and (idx is None or i in idx)]
+    if (
+        inits is not None
+        and n.op_type in ("Conv", "ConvTranspose", "Gemm")
+        and len(n.input) > 2
+        and n.input[2]
+        and n.input[2] not in inits
+    ):
+        out = [x for x in out if x != n.input[2] or x in n.input[:2]]
+    return out
 
 
 def _is_clamp(n: onnx.NodeProto, inits: Dict[str, TensorProto]) -> bool:
@@ -328,6 +387,7 @@ def quantize_full_qdq(
     op_types: Optional[Iterable[str]] = None,
     exclude_op_types: Iterable[str] = (),
     exclude_nodes: Iterable[str] = (),
+    skip_nodes: Iterable[str] = (),
     fold_relu: bool = True,
     method: str = "minmax",
     providers: Optional[Sequence[str]] = None,
@@ -373,6 +433,10 @@ def quantize_full_qdq(
     :param op_types: only quantize nodes of these op types (default: all)
     :param exclude_op_types: never quantize nodes of these op types
     :param exclude_nodes: node names (or first-output names) to keep in float
+    :param skip_nodes: node names (or first-output names) a quantizer would
+            leave alone like a node outside ``op_types`` (it marks none of its
+            tensors; its neighbours' quantizers still do), e.g. Quark's
+            ``Relu`` / ``Clip`` fed by an unquantized tensor
     :param fold_relu: fold a Relu into its quantized producer's output Q (not
             done with symmetric activations: their zero point is centred)
     :param method: calibration method, passed to
@@ -502,6 +566,7 @@ def quantize_full_qdq(
     g = m.graph
     op_types = set(op_types) if op_types is not None else None
     exclude_op_types, exclude_nodes = set(exclude_op_types), set(exclude_nodes)
+    skip_set = set(skip_nodes)
 
     floats = _float_tensor_names(m)
     inits = {i.name: i for i in g.initializer}
@@ -515,7 +580,7 @@ def quantize_full_qdq(
     qnodes = [
         n
         for n in g.node
-        if _is_quantized_node(n, op_types, exclude_op_types, exclude_nodes)
+        if _is_quantized_node(n, op_types, exclude_op_types, exclude_nodes, skip_set)
     ]
     qnode_ids = {id(n) for n in qnodes}
 
@@ -523,7 +588,7 @@ def quantize_full_qdq(
     acts = []
     seen = set()
     for n in qnodes:
-        for x in _data_inputs(n) + [o for o in n.output if o]:
+        for x in _data_inputs(n, inits) + [o for o in n.output if o]:
             if x in floats and x not in inits and x not in seen:
                 seen.add(x)
                 acts.append(x)
@@ -533,9 +598,11 @@ def quantize_full_qdq(
     # (A node merely outside ``op_types`` is left alone: sandwiched between quantized nodes it
     # runs quantized, which is what an op_types list asks for everywhere else.)
     for n in g.node:
-        if id(n) in qnode_ids or not _is_quantized_node(n, op_types, set(), set()):
+        if id(n) in qnode_ids or not _is_quantized_node(
+            n, op_types, set(), set(), skip_set
+        ):
             continue
-        ins = [x for x in _data_inputs(n) if x in floats and x not in inits]
+        ins = [x for x in _data_inputs(n, inits) if x in floats and x not in inits]
         outs = [o for o in n.output if o and o in floats]
         if (
             ins
@@ -652,6 +719,8 @@ def quantize_full_qdq(
                 and p.op_type in producer_ops
                 and p.output[0] == src
                 and len(consumers[src]) == 1
+                # (a graph output's Q input is renamed: Quark's pair stays)
+                and src not in graph_outputs
                 and (c.op_type != "Clip" or _clip_bounds(c, inits) in _CLIP_BOUNDS)
             ):
                 skip.add(src)
@@ -665,6 +734,7 @@ def quantize_full_qdq(
                 and p.op_type == "Pad"
                 and p.output[0] == c.input[0]
                 and len(consumers[c.input[0]]) == 1
+                and c.input[0] not in graph_outputs
             ):
                 skip.add(c.input[0])
         acts = [a for a in acts if a not in skip]
@@ -703,10 +773,20 @@ def quantize_full_qdq(
         raise ValueError(f"unsupported dtype in tensor_dtypes: {t!r}")
     qp: Dict[str, Tuple[float, int]] = {}
     qdt: Dict[str, str] = {}
+    # tensors whose parameters were taken from another tensor's (a data-movement
+    # op's output): they use the same scale / zero-point initializers, as in
+    # Quark's graphs, so a later position move reaches all of them
+    share_root: Dict[str, str] = {}
 
     def set_qp(x: str) -> None:
         dt = tensor_dtypes.get(x, activation_dtype)
-        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], tensor_symmetric.get(x, sym), p2)
+        qp[x] = _qparams(
+            *ranges[x],
+            *_DTYPES[dt][2:],
+            tensor_symmetric.get(x, sym),
+            p2,
+            quark_rounding=p2_search,
+        )
         qdt[x] = dt
 
     for x in graph_inputs:
@@ -731,6 +811,7 @@ def quantize_full_qdq(
                     and n.op_type not in unshared
                 ):
                     qp[o], qdt[o] = qp[n.input[0]], qdt[n.input[0]]
+                    share_root[o] = share_root.get(n.input[0], n.input[0])
         for x in list(n.input) + list(n.output):
             if x in seen and x not in qp and x in ranges and x not in inits:
                 set_qp(x)
@@ -768,13 +849,20 @@ def quantize_full_qdq(
     # original name, so every consumer (and a graph output) reads the dequantized value.
     act_nodes: List[onnx.NodeProto] = []
     rename: Dict[str, str] = {}
+    shared_init_names: Dict[str, Tuple[str, str]] = {}
     for a in acts:
         if a not in qp:
             continue
         s, zp = qp[a]
         dom = domain_of(qdt[a])
-        sn = add_init(fresh(a) + "/scale", np.array(s, np.float32))
-        zn = add_init(fresh(a) + "/zp", np.array(zp, _DTYPES[qdt[a]][1]))
+        root = share_root.get(a, a)
+        if root != a and qp.get(root) == qp[a] and root in shared_init_names:
+            sn, zn = shared_init_names[root]
+        else:
+            sn = add_init(fresh(a) + "/scale", np.array(s, np.float32))
+            zn = add_init(fresh(a) + "/zp", np.array(zp, _DTYPES[qdt[a]][1]))
+            if qp.get(root) == qp[a]:
+                shared_init_names.setdefault(root, (sn, zn))
         q_out = a + "/q"
         if a in graph_inputs:
             dq_out = a + "/dq"
@@ -847,7 +935,13 @@ def quantize_full_qdq(
             ckey = (src, node_dt)
             if ckey not in converted:
                 c = f"{src}/as_{node_dt}"
-                sc, zc = _qparams(*ranges[src], *_DTYPES[node_dt][2:], sym, p2)
+                sc, zc = _qparams(
+                    *ranges[src],
+                    *_DTYPES[node_dt][2:],
+                    sym,
+                    p2,
+                    quark_rounding=p2_search,
+                )
                 qp[c], qdt[c] = (sc, zc), node_dt
                 sn = add_init(fresh(c) + "/scale", np.array(sc, np.float32))
                 zn = add_init(fresh(c) + "/zp", np.array(zc, _DTYPES[node_dt][1]))
@@ -934,19 +1028,20 @@ def quantize_full_qdq(
     # input dequantized): a lone DQ on a weight of a float node would strand it on the CPU.
     cache: Dict[Tuple, str] = {}
     act_set = set(acts) | set(act_extra)
+    before = {id(n): list(n.input) for n in qnodes}
     for n in qnodes:
         if id(n) in removed:
             continue
         slope_only = False
         if not all(
             x in act_set and x in qp
-            for x in _data_inputs(n)
+            for x in _data_inputs(n, inits)
             if x in floats and x not in inits
         ):
             if not (quantize_prelu_slope and n.op_type == "PRelu"):
                 continue
             slope_only = True
-        data = set(_data_inputs(n))
+        data = set(_data_inputs(n, inits))
         for k, x in enumerate(list(n.input)):
             if slope_only and k != 1:
                 continue
@@ -1053,7 +1148,10 @@ def quantize_full_qdq(
                     cache[key] = out
                 n.input[k] = cache[key]
             elif (
-                n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                (
+                    n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                    or (n.op_type == "InstanceNormalization" and int8_constants)
+                )
                 and k == 2
                 and w.ndim == 1
                 and int8_bias
@@ -1066,6 +1164,11 @@ def quantize_full_qdq(
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
                 or (n.op_type == "InstanceNormalization" and int8_constants)
             ) and (k == 2 and w.ndim == 1):
+                if ("b32", x) in cache:
+                    # a bias several nodes read is quantized once, with the scales
+                    # of the first of them (Quark's ``bias_to_quantize``)
+                    n.input[k] = cache[("b32", x)]
+                    continue
                 w_dq = n.input[1]
                 sx = act_scale(n.input[0])
                 w_scale_name = (
@@ -1105,6 +1208,7 @@ def quantize_full_qdq(
                         axis=0,
                     )
                 )
+                cache[("b32", x)] = out
                 n.input[k] = out
             elif int8_constants and not (
                 align_eltwise_dtype and n.op_type in _ELTWISE_OPS
@@ -1137,6 +1241,19 @@ def quantize_full_qdq(
                     cache[key] = out
                 n.input[k] = cache[key]
 
+    # a quantized constant is replaced by its DQ in *every* node that reads it
+    # (Quark's ``replace_input_of_all_nodes``): a shared initializer is not left
+    # float for a node outside the QDQ unit, a Clip's bound or an excluded Conv
+    const_dq: Dict[str, str] = {}
+    for n in qnodes:
+        for k, orig in enumerate(before[id(n)]):
+            if orig in inits and n.input[k] != orig:
+                const_dq.setdefault(orig, n.input[k])
+    if const_dq:
+        for n in g.node:
+            for k, x in enumerate(n.input):
+                if x in const_dq:
+                    n.input[k] = const_dq[x]
     for n in g.node:
         for k, o in enumerate(n.output):
             if o in rename:
