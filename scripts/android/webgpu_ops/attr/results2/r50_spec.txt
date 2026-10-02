@@ -1,0 +1,17 @@
+control_self|SELF
+W_ow56|clsx=Conv W 3x3 s1 ow56
+W_ow28|clsx=Conv W 3x3 s1 ow28
+W_ow14|clsx=Conv W 3x3 s1 ow14
+W_ow7|clsx=Conv W 3x3 s1 ow7
+W_all|cls=Conv W 3x3
+T_s2_3x3|cls=Conv T 3x3
+M_ow56|clsx=Conv M 1x1 s1 ow56
+M_ow28|clsx=Conv M 1x1 s1 ow28
+M_ow14|clsx=Conv M 1x1 s1 ow14
+M_ow7|clsx=Conv M 1x1 s1 ow7
+M_all|cls=Conv M 1x1 s1
+M2_s2_1x1|cls=Conv M2
+stem7x7|cls=Conv S
+MaxPool|op=MaxPool
+Gemm|op=Gemm
+Transpose|op=Transpose

@@ -1448,3 +1448,41 @@ The fused linear-attention prototype (`dawn_repro/linattn.cc`, 3.2x per block, ~
 Final interleaved check on the current library (`ORT_WEBGPU_CONV_TEXDIRECT=1`, defaults MAXC 1024, stride-2 tile 16x8, `enableInt64=1`; medians, two sessions), texdirect off -> on:
 YOLO11n 68.5/68.9 -> **62.8/63.7 ms (-8%)**, SAM-L0 encoder 357.2/357.6 -> **341.6/340.6 (-5%)**, ResNet-50 56.3/57.1 -> **55.6/55.5**, RT-DETR pre 330.0/336.3 -> 334.9/334.1 (no gain). Restricting Winograd to >= 96 channels (`ORT_WEBGPU_WINO_MINC=96`) helps RT-DETR
 (321.9/329.2, about -2.5%) but costs SAM 10 ms, so it is not a default. The fused `ReluLinearAttention` op is not pursued: the prototype saves ~7 ms of SAM, and an NCHW contrib op would add two layout Transposes per block (3 MB each) in the NHWC-converted graph, leaving ~1% net.
+
+## What is left after the optimizations: ResNet-50, YOLO11n, YOLO26n attribution (current library, `ORT_WEBGPU_CONV_TEXDIRECT=1`, `enableInt64=1`)
+
+Setup: library at `f2901170` + MAXC 1024 default, own phone dir; baselines 55.2 (ResNet-50), 63.1 (YOLO11n), 52.3 ms (YOLO26n). Saved optimized graphs (59 / 177 / 204 nodes) classified by the code path each conv takes
+(`attr/classify2.py`: W = Winograd, T = texture-weight direct conv, M = 1x1 stride-1 MatMul path with the fused residual epilogue, M2 = 1x1 stride-2, S = stem, D = depthwise vec4), then ABAB ablations (`attr/run_ablation2.py`, `ablate2.py`: an extra input without a
+profile shape, e.g. the fused residual, is kept alive now). Raw rows: `attr/results2/`. Caveat as before: the stand-in costs one copy pass (more for channel-expanding convs; replacing **all** 58 ResNet-50 nodes still takes 22 ms), so "saved" is a lower bound of the op's cost; for
+Concat/Transpose/Add the stand-in (Slice/flat Reshape copies of the other layout) costs *more* than the op, which gives negative "saved" values (Concat -5.1/-9.6, Transpose -11.4 on YOLO11n/26n): those rows are artifacts, so the data-movement costs below come from the isolated-op measurements of the Concat/Split analysis instead.
+The chain method (`attr/chains.py`, N=2 vs N=10 identical convs, `chainrun2.sh`) was too noisy to use here (a 1x1 64>256@56 chain pair read 1.6 ms/conv against 0.4 ms in the real graph: input upload/readback and the first-run clock state dominate the N=2 end); its raw output is kept in `attr/results2/chain_results.txt`.
+
+**ResNet-50 (55.2 ms, 8.18 GFLOP = 148 GFLOPS average).** ms removed, with the conv's own GFLOP (direct-equivalent) and the implied effective rate (saved + a stand-in allowance of ~0.15 ms per same-shape node):
+
+| class | nodes | GFLOP | removed ms | effective GFLOPS |
+|---|---|---|---|---|
+| W 3x3 s1 (Winograd; 64@56 3.7, 128@28 1.4, 256@14 4.9, 512@7 1.5) | 13 | 3.01 | 12.1 | ~210 |
+| M 1x1 s1 (56: 3.3, 28: 4.5, 14: 8.1, 7: 3.4) incl. fused residual+ReLU | 33 | 3.62 | 20.8 (lower bound; ~28 by subtraction) | 130-175 |
+| M2 1x1 s2 | 3 | 0.62 | 2.9 | ~200 |
+| T 3x3 s2 | 3 | 0.69 | 4.4 | ~160 |
+| stem 7x7 s2 (3 channels) | 1 | 0.24 | 0.4 (stand-in is costly; true cost ~1 ms) | ~250? |
+| MaxPool / Gemm / Transpose x2 / GAP | 5 | ~0 | 0.5 / 0.8 / 0.0 / -- | -- |
+
+Convs are ~95% of the time. The 1x1 MatMul path is the biggest class and the slowest one per FLOP (the Winograd 3x3s reach ~210 GFLOPS direct-equivalent). Estimated dispatches: ~97 (13 Winograd convs x 4 programs + 40 single-program convs + 5), i.e. ~1.3 ms (2.3%) at the 13 us floor.
+
+**YOLO11n (63.1 ms, 6.54 GFLOP) / YOLO26n (52.1 ms, 5.48 GFLOP)** ms removed (11n / 26n): W 3x3 10.7 / 1.6; T 3x3 s1 4.6 / 7.0; T 3x3 s2 7.3 / 7.3; M 1x1 13.5 / 10.4; depthwise 1.0 / -0.3; MaxPool 1.4 / 1.7; attention MatMul+Softmax 3.1 / -0.7 (stand-in artifacts); Resize 0.3 / 0.1.
+Convs are ~60-70% of the time; the rest is data movement. From the isolated-op measurements: Concat ~5.4 / 5.0 ms (23 nodes), Split ~2.4 / 2.1 (11), Transposes ~2.5-4.5 (16 / 22), plus Reshape (8 / 12), Add (13 / 15) and the head elementwise ops: about 11-14 ms of YOLO11n has nothing to do with convolution. Estimated dispatches ~215 / ~240 (~2.8 / 3.1 ms at 13 us = 4.5% / 6%).
+
+**tinygrad fp16 OpenCL on the same models** (GPU kernel time by kernel class, `attr/tg_classes.py` over the earlier profiles): ResNet-50 3x3 convs 42.4 ms (16 kernels, ~87 GFLOPS direct) vs ORT W+T ~16.5 ms (2.6x faster in ORT); 1x1 convs + pooling + fc 34.9 ms (34 kernels) vs ORT M+M2+misc ~25-30 ms (similar, ORT slightly ahead); stem 2.8 vs ~1; elementwise 0.7 (ORT fuses it). YOLO11n: 3x3 convs 19.2 ms (33 kernels) vs ORT W+T 22.6 ms (+ stand-in correction ~25); other `r_` kernels (1x1, pooling, attention) 17.5 ms vs ORT M 13.5-17; elementwise 1.7;
+**tinygrad has no Concat, Split, Transpose or Reshape kernels at all** (122 kernels, 38.4 ms GPU, 41.7 ms wall) while ORT spends ~11-14 ms of YOLO11n on them. That, not the convolution kernels, is the remaining YOLO gap; ResNet-50 is already ahead of tinygrad (55 vs 84 ms).
+
+**Measured without any ORT build** (3 interleaved rounds; medians):
+- *Graph capture* (`enableGraphCapture=1`, `iobind=1`, `RunWithBinding` with `gpu_graph_id=0`; timed with the `sync=tiny.onnx` trick, plain run through the same IO-binding path): **YOLO11n 63.2 -> 56.5 ms (-10.6%)**, **YOLO26n 52.5 -> 46.5 (-11.4%)**, ResNet-50 55.4 -> 53.2/54.8/54.7 (-1..-4%). It needs the application to use IO binding; the benefit grows with the dispatch count.
+- *YOLO graph rewrite* (`yolo_graph_opt.py`, default rules `split_conv,head,resize_convt`) on the current stack: YOLO11n 62.5/63.7/62.6 -> **61.6/61.8/61.5 (-1.5%)**, YOLO26n 52.6/52.3/52.6 -> **52.1/51.9/51.9 (-1%)**; adding `concat_conv` is slower (63.0 / 53.3).
+
+**Ranked next optimizations (expected ms saved, how):**
+1. **Concat/Split/Transpose out of the YOLO graphs** (YOLO11n -8 to -10 ms, YOLO26n -8): kernel-level, nothing in the graph can do it exactly: a multi-input 1x1 conv (K loop over several buffers; the `concat_conv` rewrite is a graph version of this and loses because it adds dispatches), producers writing into their slice of the Concat output (needs buffer aliasing in the EP), an NHWC Resize (-1.5, blocked by the per-op layout decision), vec4 Transpose. The vec4 Concat/Split fast paths already took ~3-4 ms of the ~8.
+2. **Graph capture in the application** (YOLO -10..-11%, ResNet -1..-4%): no ORT build, API/session-option only; already measured above.
+3. **1x1 MatMul-path rate** (ResNet-50 ~28 ms at ~130 GFLOPS vs the ~210 the Winograd convs reach; YOLO M 13.5 ms): kernel change, -8 to -12 ms on ResNet-50, -3 to -4 on YOLO. The texture direct kernel in mode 2 is neutral with class-tuned tiles on these shapes; the untried parts are the 4-wide K unroll and cooperative weight loading into workgroup memory suggested by the 1x1 tuning job, or exact RGBA32F weights (K >= 1024 only today).
+4. Winograd stage fusion (input transform into the producer's epilogue, output transform into the consumer): -0.5 to -1 ms per model (the dispatch floor of the 4-program Winograd path is ~0.7 ms on ResNet-50 and ~0.7 on YOLO11n); graph capture already removes most of the floor.
+5. Everything else is small: T/M2 stride-2 convs run at 160-240 GFLOPS (fine), the stem is ~1 ms, the head elementwise ops and attention MatMul/Softmax ~2-3 ms on YOLO11n.
