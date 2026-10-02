@@ -327,23 +327,28 @@ def _float_tensor_names(model: onnx.ModelProto) -> set:
     return floats
 
 
-def _constants_to_initializers(model: onnx.ModelProto) -> None:
+def _constants_to_initializers(
+    model: onnx.ModelProto, keep: Optional[set] = None
+) -> None:
+    """Fold the ``Constant`` nodes into initializers, except those producing a
+    tensor of ``keep``."""
     g = model.graph
-    keep = []
+    kept = []
     for n in g.node:
         if (
             n.op_type == "Constant"
             and len(n.attribute) == 1
             and n.attribute[0].name == "value"
+            and not (keep and n.output[0] in keep)
         ):
             t = onnx.TensorProto()
             t.CopyFrom(n.attribute[0].t)
             t.name = n.output[0]
             g.initializer.append(t)
         else:
-            keep.append(n)
+            kept.append(n)
     del g.node[:]
-    g.node.extend(keep)
+    g.node.extend(kept)
 
 
 def _is_quantized_node(
@@ -353,11 +358,14 @@ def _is_quantized_node(
     exclude_nodes: set,
     skip_nodes: Optional[set] = None,
     contrib_ops: Optional[set] = None,
+    constants: bool = False,
 ) -> bool:
     if (
         n.domain not in ("", "ai.onnx")
         and not (n.domain == "com.microsoft" and n.op_type in (contrib_ops or ()))
-    ) or n.op_type in _NEVER_QUANTIZED:
+    ) or (
+        n.op_type in _NEVER_QUANTIZED and not (constants and n.op_type == "Constant")
+    ):
         return False
     if op_types is not None and n.op_type not in op_types:
         return False
@@ -374,14 +382,14 @@ def _data_inputs(
     n: onnx.NodeProto, inits: Optional[Dict[str, TensorProto]] = None
 ) -> List[str]:
     """The inputs of ``n`` that carry data. With ``inits``, the bias of a Conv /
-    ConvTranspose / Gemm that is not a constant is left out as well: Quark's
+    ConvTranspose / Gemm / InstanceNormalization that is not a constant is left out as well: Quark's
     quantizers only quantize a bias that is a weight (a Gemm whose ONNX Runtime
     fused ``C`` is an activation keeps it float)."""
     idx = _DATA_INPUTS.get(n.op_type)
     out = [x for i, x in enumerate(n.input) if x and (idx is None or i in idx)]
     if (
         inits is not None
-        and n.op_type in ("Conv", "ConvTranspose", "Gemm")
+        and n.op_type in ("Conv", "ConvTranspose", "Gemm", "InstanceNormalization")
         and len(n.input) > 2
         and n.input[2]
         and n.input[2] not in inits
@@ -452,6 +460,7 @@ def quantize_full_qdq(
     shared_ops: Iterable[str] = (),
     float_clamp_input: bool = False,
     contrib_ops: Iterable[str] = (),
+    keep_constants: Union[bool, Iterable[str]] = False,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -605,6 +614,15 @@ def quantize_full_qdq(
             like the ``ai.onnx`` one (Quark's quantizers go by op type, not by
             domain: the contrib ``Gelu`` its fusion writes is quantized). Other
             ``com.microsoft`` nodes are left alone, as is any node of another domain.
+    :param keep_constants: leave the ``Constant`` nodes of the graph as they are
+            instead of folding them into initializers first (what Quark does when
+            neither its ``OptimizeModel`` nor its ``SimplifyModel`` pass runs): a
+            ``Constant`` output is then a float activation like any other tensor
+            -- a Conv weight or a Mul operand gets a calibrated ``Q -> DQ`` pair
+            around it, the bias of a Conv / Gemm (not an initializer) stays as it is.
+            An iterable of tensor names keeps just the ``Constant`` nodes producing
+            them (the ones Quark's own conversions add after its graph optimizers
+            have run, e.g. the ``Slice`` parameters of a converted ``Split``)
     :returns: the quantized ModelProto
     """
     if weight_dtype not in ("int8", "int16", "uint8"):
@@ -627,7 +645,12 @@ def quantize_full_qdq(
         model = onnx.load(model)
     m = onnx.ModelProto()
     m.CopyFrom(model)
-    _constants_to_initializers(m)
+    keep_all = keep_constants is True
+    if not keep_all:
+        _constants_to_initializers(
+            m,
+            set() if keep_constants is False else set(keep_constants),  # type: ignore[arg-type]
+        )
     m = onnx.shape_inference.infer_shapes(m)
     g = m.graph
     op_types = set(op_types) if op_types is not None else None
@@ -648,7 +671,15 @@ def quantize_full_qdq(
         n
         for n in g.node
         if _is_quantized_node(
-            n, op_types, exclude_op_types, exclude_nodes, skip_set, contrib_set
+            n,
+            op_types,
+            exclude_op_types,
+            exclude_nodes,
+            skip_set,
+            contrib_set,
+            # (a kept ``Constant`` is quantized as an op when the op types name it:
+            # Quark's ``QuantizeAllOpTypes`` lists every op type of the model)
+            constants=keep_all and op_types is not None,
         )
     ]
     qnode_ids = {id(n) for n in qnodes}
@@ -1116,6 +1147,10 @@ def quantize_full_qdq(
                 )
                 if p2:
                     s = (2.0 ** np.ceil(np.log2(s))).astype(np.float32)
+                else:  # (all-zero rows: scale 1, as above)
+                    s = np.where(np.abs(rows).max(axis=1) > 0, s, 1.0).astype(
+                        np.float32
+                    )
             q = np.clip(
                 np.round(w / s.reshape((-1,) + (1,) * (w.ndim - 1))), -qm, qm
             ).astype(np.int8)
@@ -1175,8 +1210,10 @@ def quantize_full_qdq(
         if p2_search:
             s = pof2_minmse_weight_scale(w)
         else:
-            s = max(float(np.abs(w).max()), 1e-12) / w_range("int8")[1]
-            s = _pof2(s) if p2 else s
+            amax = float(np.abs(w).max())
+            s = max(amax, 1e-12) / w_range("int8")[1]
+            # (an all-zero constant: ONNX Runtime's ``compute_scale_zp`` gives scale 1)
+            s = _pof2(s) if p2 else (s if amax > 0 else 1.0)
         qm = w_range("int8")[1]
         q = np.clip(np.round(w / np.float32(s)), -qm, qm).astype(np.int8)
         base = fresh(x)
