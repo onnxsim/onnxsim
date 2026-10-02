@@ -196,13 +196,13 @@ def test_a_target_equal_to_the_base_precision_still_requantizes_weights():
     assert res.moved
 
 
-def test_unsupported_constant_precisions_are_refused():
+def test_unsupported_precisions_are_refused():
     with pytest.raises(ValueError, match="dtypes"):
         amp.auto_mixprecision(
             _mlp(),
             _data(),
             base_dtype="uint8",
-            targets=[amp.TargetSpec(weight=("float16", None))],
+            targets=[amp.TargetSpec(weight=("int4", None))],
         )
 
 
@@ -275,16 +275,168 @@ def test_target_symmetry_follows_the_global_specs_like_quark():
     assert inits[q.input[2]] != 0  # an asymmetric int16 zero point
 
 
-def test_power_of_two_target_weights_are_refused():
+def _pof2(x):
+    return float(np.log2(x)) == int(np.log2(x))
+
+
+def test_power_of_two_target_weights_round_the_scale_to_a_power_of_two():
     target = qc.QLayerConfig(activation=qc.UInt16Spec(), weight=qc.XInt8Spec())
-    with pytest.raises(NotImplementedError, match="power-of-two"):
-        _quantize(_amp_config(qc.UInt8Spec, qc.Int8Spec, target))
+    _, out = _quantize(
+        _amp_config(qc.UInt8Spec, qc.Int8Spec, target, include_layers=["n2_Gemm"])
+    )
+    codes, scale, zp, _ = _dq_const(out, "n2_Gemm", 1)
+    assert codes.dtype == np.int8 and scale.shape == () and _pof2(float(scale))
+    # Quark rounds in the log domain: to the *nearest* power of two, which can be
+    # below the scale that just covers the range
+    _, plain = _quantize(
+        _amp_config(
+            qc.UInt8Spec,
+            qc.Int8Spec,
+            qc.QLayerConfig(activation=qc.UInt16Spec(), weight=qc.Int8Spec()),
+            include_layers=["n2_Gemm"],
+        )
+    )
+    raw = float(_dq_const(plain, "n2_Gemm", 1)[1])
+    assert float(scale) == 2.0 ** -int(np.rint(-np.log2(raw)))
+    # the other layers keep their (non power-of-two) int8 weights
+    assert not _pof2(float(_dq_const(out, "n0_Gemm", 1)[1]))
 
 
-def test_float_targets_over_an_integer_base_are_refused():
+def test_power_of_two_target_activations_are_rounded_too():
+    target = qc.QLayerConfig(activation=qc.XInt8Spec(), weight=qc.Int8Spec())
+    _, out = _quantize(
+        _amp_config(qc.UInt8Spec, qc.Int8Spec, target, include_layers=["n2_Gemm"])
+    )
+    assert _pof2(float(_dq_scale(out, "t1"))) and _pof2(float(_dq_scale(out, "h2")))
+    assert not _pof2(float(_dq_scale(out, "h1")))
+
+
+def _chains(model):
+    """``{node: ([quantizer op types behind each input], [after each output])}``."""
+    prod = {o: n for n in model.graph.node for o in n.output}
+    cons = {}
+    for n in model.graph.node:
+        for x in n.input:
+            cons.setdefault(x, []).append(n)
+    quant = {
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "ExtendedQuantizeLinear",
+        "ExtendedDequantizeLinear",
+        "BFPQuantizeDequantize",
+        "MXQuantizeDequantize",
+    }
+    out = {}
+    for n in model.graph.node:
+        if n.op_type in quant:
+            continue
+        ins = []
+        for x in n.input:
+            chain, cur = [], x
+            while cur in prod and prod[cur].op_type in quant:
+                chain.append(prod[cur].op_type)
+                cur = prod[cur].input[0]
+            ins.append(chain)
+        outs = []
+        for o in n.output:
+            chain, cur = [], o
+            while True:
+                nxt = [c for c in cons.get(cur, []) if c.op_type in quant]
+                if not nxt:
+                    break
+                chain.append(nxt[0].op_type)
+                cur = nxt[0].output[0]
+            outs.append(chain)
+        out[n.name] = (ins, outs)
+    return out
+
+
+def test_block_and_half_targets_over_an_integer_base_edit_the_quantizers_in_place():
+    for dtype, op in (
+        (qc.BFP16Spec, "BFPQuantizeDequantize"),
+        (qc.MXInt8Spec, "MXQuantizeDequantize"),
+    ):
+        target = qc.QLayerConfig(activation=dtype(), weight=dtype())
+        _, out = _quantize(
+            _amp_config(qc.UInt8Spec, qc.Int8Spec, target, include_layers=["n2_Gemm"])
+        )
+        chains = _chains(out)
+        # the moved layer: every activation and its weight go through one block node
+        assert chains["n2_Gemm"][0][:2] == [[op], [op]]
+        assert chains["n2_Gemm"][1] == [[op]]
+        # the bias keeps its (int32) quantizer; the neighbours are untouched
+        assert chains["n2_Gemm"][0][2] == ["DequantizeLinear"]
+        assert chains["n0_Gemm"][0][0] == ["DequantizeLinear", "QuantizeLinear"]
+        assert chains["n0_Gemm"][0][1] == ["DequantizeLinear"]
+        onnx.checker.check_model(out)
+        # the weight is dequantized from its int8 codes first, then block-quantized
+        w = next(t for t in out.graph.initializer if t.name.endswith("_float_Mixed"))
+        assert numpy_helper.to_array(w).dtype == np.float32
+    for dtype in (qc.BFloat16Spec, qc.Float16Spec):
+        target = qc.QLayerConfig(activation=dtype(), weight=dtype())
+        _, out = _quantize(
+            _amp_config(qc.UInt8Spec, qc.Int8Spec, target, include_layers=["n2_Gemm"])
+        )
+        ext = ["ExtendedDequantizeLinear", "ExtendedQuantizeLinear"]
+        chains = _chains(out)
+        assert chains["n2_Gemm"][0][0] == ext and chains["n2_Gemm"][1] == [ext[::-1]]
+        assert chains["n2_Gemm"][0][1] == ["ExtendedDequantizeLinear"]  # folded weight
+        assert chains["n0_Gemm"][0][0] == ["DequantizeLinear", "QuantizeLinear"]
+        inits = {t.name: t for t in out.graph.initializer}
+        dq = next(
+            n
+            for n in out.graph.node
+            if n.op_type == "ExtendedDequantizeLinear"
+            and inits.get(n.input[0]) is not None
+        )
+        half = {
+            qc.BFloat16Spec: onnx.TensorProto.BFLOAT16,
+            qc.Float16Spec: onnx.TensorProto.FLOAT16,
+        }
+        assert inits[dq.input[0]].data_type == half[dtype]  # the weight codes
+        assert float(numpy_helper.to_array(inits[dq.input[1]])) == 1.0  # scale 1
+        assert any(o.domain == "com.amd.quark" for o in out.opset_import)
+
+
+def test_half_and_block_baselines_mix_into_integer_layers_without_calibration_data():
+    # no calibration is run for these formats: Quark's fake range [0, 1] sizes
+    # the integer activations, the (float) weights their own range
+    for base in (qc.BFloat16Spec, qc.BFP16Spec, qc.MXInt8Spec):
+        cfg = qc.QConfig(
+            global_config=qc.QLayerConfig(activation=base(), weight=base()),
+            algo_config=[
+                qc.AutoMixprecisionConfig(
+                    target_layer_config=qc.QLayerConfig(
+                        activation=qc.UInt8Spec(), weight=qc.Int8Spec()
+                    ),
+                    include_layers=["n2_Gemm"],
+                )
+            ],
+        )
+        _, out = _quantize(cfg)
+        chains = _chains(out)
+        assert chains["n2_Gemm"][0][0] == ["DequantizeLinear", "QuantizeLinear"]
+        # (the baseline's weight keeps its Q on the float constant)
+        assert chains["n2_Gemm"][0][1] == ["DequantizeLinear", "QuantizeLinear"]
+        assert chains["n0_Gemm"][0][0][0] != "DequantizeLinear"  # still the base
+        inits = {t.name: numpy_helper.to_array(t) for t in out.graph.initializer}
+        q = next(
+            n
+            for n in out.graph.node
+            if n.op_type == "QuantizeLinear" and n.input[0].startswith("t1")
+        )
+        # range [0, 1], symmetric like the global activation spec (Quark's
+        # ActivationSymmetric): a uint8 grid centred on 128 spanning +-1
+        assert float(inits[q.input[1]]) == np.float32(2.0 / 255)
+        assert int(inits[q.input[2]]) == 128
+        out_vals = run_fake_quantized(out, _data())
+        assert all(np.isfinite(o[0]).all() for o in out_vals)
+
+
+def test_float_and_block_mixes_refuse_dual_quant_nodes():
     target = qc.QLayerConfig(activation=qc.BFP16Spec(), weight=qc.BFP16Spec())
-    with pytest.raises(NotImplementedError, match="unsupported"):
-        _quantize(_amp_config(qc.UInt8Spec, qc.Int8Spec, target))
+    with pytest.raises(NotImplementedError, match="dual_quant_nodes"):
+        _quantize(_amp_config(qc.UInt8Spec, qc.Int8Spec, target, dual_quant_nodes=True))
 
 
 # -- scoring conventions ----------------------------------------------------------------
@@ -574,3 +726,308 @@ def test_dedicate_dq_nodes_copies_a_shared_dequantizer_per_reader():
         if n.op_type in ("Relu", "Neg", "Identity")
     }
     assert reads == {"Relu": "d", "Neg": "d_1", "Identity": "d_2"}
+
+
+# -- unpromoted layers keep Quark's bias scale shape ----------------------------------
+
+
+def test_unpromoted_int32_bias_scale_is_a_one_element_vector():
+    target = qc.QLayerConfig(activation=qc.UInt16Spec(), weight=qc.Int8Spec())
+    _, out = _quantize(
+        _amp_config(qc.UInt8Spec, qc.Int8Spec, target, include_layers=["n2_Gemm"])
+    )
+    shapes = {}
+    for node in ("n0_Gemm", "n2_Gemm", "n4_Gemm"):
+        _, scale, zp, _ = _dq_const(out, node, 2)
+        shapes[node] = (scale.shape, zp.shape)
+    # Quark: a baseline per-tensor bias scale is a one-element vector, the
+    # refreshed scale of a promoted layer (input scale * weight scale) a scalar
+    assert shapes == {"n0_Gemm": ((1,), ()), "n2_Gemm": ((), ()), "n4_Gemm": ((1,), ())}
+
+
+# -- Quark's scale / zero point arithmetic -------------------------------------------------
+
+
+def test_compute_scale_zp_follows_quarks_formulas():
+    from onnxsim.quark_mixing import compute_scale_zp, compute_scale_zp_fp
+
+    f32 = lambda v: np.array(v, np.float32)  # noqa: E731
+    zp, scale = compute_scale_zp(f32(-1.0), f32(2.0), "uint8", False)
+    assert scale == np.float32(3.0 / 255) and zp == 85 and zp.dtype == np.uint8
+    zp, scale = compute_scale_zp(f32(-1.0), f32(2.0), "int8", True)
+    assert scale == np.float32(4.0 / 254) and zp == 0 and zp.dtype == np.int8
+    # symmetric uint8: the zero point 127 is bumped to 128
+    zp, _ = compute_scale_zp(f32(-1.0), f32(1.0), "uint8", True)
+    assert zp == 128
+    # power-of-two scales round in the log domain (to the nearest, not the next)
+    zp, scale = compute_scale_zp(f32(-1.0), f32(2.0), "int8", True, pof2=True)
+    assert scale == np.float32(2.0**-6) and zp == 0
+    zp, scale = compute_scale_zp(f32(0.0), f32(3.0), "uint8", False, pof2=True)
+    assert scale == np.float32(2.0**-6)  # 3 / 255 = 0.0118 -> 2**-6.4 -> 2**-6
+    assert zp == 0
+    # half types: scale 1, zero point 0 (symmetric) or the type's lowest value
+    zp, scale = compute_scale_zp_fp(f32(-3.0), f32(5.0), "bfloat16", True)
+    assert scale == 1.0 and float(np.asarray(zp, np.float32)) == 0.0
+    zp, scale = compute_scale_zp_fp(f32(-3.0), f32(5.0), "float16", False)
+    assert scale == 1.0 and float(zp) == -65504.0 + 3.0 or float(zp) == -65504.0
+    zp, _ = compute_scale_zp_fp(f32(0.0), f32(5.0), "bfloat16", False)
+    assert float(np.asarray(zp, np.float32)) == float(np.float32(-3.38953139e38))
+
+
+# -- shared scale / zero point initializers -------------------------------------------------
+
+
+def _shared_qdq_graph():
+    """x -> Q/DQ(s, z) -> Transpose -> Q/DQ(s, z: the same initializers) -> MatMul(w):
+    what ONNX Runtime's quantizer builds around a pass-through op."""
+    m = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[4,4] x) => (float[4,4] y)
+        <float s = {0.0625}, uint8 z = {128}>
+        {
+            qa = QuantizeLinear(x, s, z)
+            da = DequantizeLinear(qa, s, z)
+            t = Transpose<perm=[1,0]>(da)
+            qb = QuantizeLinear(t, s, z)
+            db = DequantizeLinear(qb, s, z)
+            y = MatMul(db, w)
+        }
+        """
+    )
+    m.graph.initializer.append(
+        numpy_helper.from_array(np.eye(4, dtype=np.float32) * 0.5, "w")
+    )
+    for n, name in zip(m.graph.node, ("qa", "da", "tr", "qb", "db", "mm")):
+        n.name = name
+    return m
+
+
+@pytest.mark.parametrize("mode", ["propagate", "unshare"])
+def test_shared_params_follow_the_promoted_pair_only_in_propagate_mode(mode):
+    from onnxsim.quark_mixing import QuarkMixer
+
+    ranges = {"t": (-2.0, 3.0), "x": (-1.0, 1.0)}
+    mixer = QuarkMixer(_shared_qdq_graph(), ranges, mode)
+    mixer.promote_node("mm", amp.TargetSpec(inputs=("uint16", False)))
+    out = mixer.result()
+    inits = {t.name: numpy_helper.to_array(t) for t in out.graph.initializer}
+    nodes = {n.name: n for n in out.graph.node}
+    for name in ("qb", "db"):  # the promoted pair, whatever the mode
+        assert nodes[name].domain == "com.microsoft"
+        assert inits[nodes[name].input[2]].dtype == np.uint16
+    want = (-2.0, 3.0)  # the promoted tensor's range sets the new scale
+    assert inits[nodes["db"].input[1]] == np.float32((want[1] - want[0]) / 65535)
+    if mode == "propagate":
+        # the other pair reads the same (rewritten) initializers: same domain,
+        # same new values
+        assert nodes["qa"].input[1:] == nodes["qb"].input[1:]
+        assert nodes["qa"].domain == nodes["da"].domain == "com.microsoft"
+    else:
+        # the pair got its own copy; the first one still reads the originals
+        assert nodes["qb"].input[1:] != nodes["qa"].input[1:]
+        assert nodes["qa"].domain == nodes["da"].domain == ""
+        assert inits[nodes["qa"].input[2]].dtype == np.uint8
+        assert inits[nodes["qa"].input[1]] == np.float32(0.0625)
+    onnx.checker.check_model(out)
+
+
+def test_baseline_pass_through_quantizers_share_initializers_like_quarks():
+    # conv -> MaxPool: ONNX Runtime's quantizer gives the pool's output quantizer
+    # the conv output's scale / zero point initializers
+    m = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[1,1,6,6] x) => (float[1,1,3,3] y)
+        {
+            c = Conv<pads=[1,1,1,1]>(x, w)
+            y = MaxPool<kernel_shape=[2,2],strides=[2,2]>(c)
+        }
+        """
+    )
+    m.graph.initializer.append(
+        numpy_helper.from_array(
+            np.random.default_rng(0).standard_normal((1, 1, 3, 3)).astype(np.float32),
+            "w",
+        )
+    )
+    for n in m.graph.node:
+        n.name = n.op_type.lower()
+    data = [
+        {"x": np.random.default_rng(i).standard_normal((1, 1, 6, 6)).astype(np.float32)}
+        for i in range(3)
+    ]
+    res = amp.auto_mixprecision(
+        m,
+        data,
+        base_dtype="uint8",
+        target_dtype="uint16",
+        target_op_types=("Conv",),
+        metric_threshold=0,
+    )
+    nodes = {n.name: n for n in res.model.graph.node if n.op_type == "MaxPool"}
+    prod = {o: n for n in res.model.graph.node for o in n.output}
+    cons = {x: n for n in res.model.graph.node for x in n.input}
+    pool = nodes["maxpool"]
+    pair_after = cons[pool.output[0]]  # the pool's output Q
+    pair_before = prod[prod[pool.input[0]].input[0]]  # the conv output's Q
+    assert pair_after.op_type == pair_before.op_type == "QuantizeLinear"
+    assert pair_after.input[1:] == pair_before.input[1:]
+    # propagate (Quark's default): promoting the conv output moved the pool's too
+    zp = {t.name: t for t in res.model.graph.initializer}[pair_after.input[2]]
+    assert zp.data_type == onnx.TensorProto.UINT16
+    assert pair_after.domain == "com.microsoft"
+    unshared = amp.auto_mixprecision(
+        m,
+        data,
+        base_dtype="uint8",
+        target_dtype="uint16",
+        target_op_types=("Conv",),
+        metric_threshold=0,
+        shared_param_mode="unshare",
+    )
+    cons_u = {x: n for n in unshared.model.graph.node for x in n.input}
+    pool_u = next(n for n in unshared.model.graph.node if n.op_type == "MaxPool")
+    assert cons_u[pool_u.output[0]].domain == ""  # the pool's quantizer stays uint8
+
+
+def test_shared_param_mode_is_validated():
+    with pytest.raises(ValueError, match="shared_param_mode"):
+        amp.auto_mixprecision(
+            _mlp(),
+            _data(),
+            base_dtype="uint8",
+            target_dtype="uint16",
+            shared_param_mode="share",
+        )
+
+
+# -- the sensitivity cache: Quark's key, Quark's schema -------------------------------------
+
+# Quark 0.13's cache_key of its quantized baseline of ``_mlp`` for these requests
+# (read from the file its AutoMixprecision wrote; pins the naming reproduced in
+# onnxsim.quark_amp_cache)
+_QUARK_KEYS = {
+    "u8-u16": (
+        (qc.UInt8Spec, qc.Int8Spec),
+        (qc.UInt16Spec, qc.Int8Spec),
+        "685165232fb00e448cddbaf9ef05ed26369387301100fed4ed63d6ce3318c141",
+    ),
+    "bf16-int8": (
+        (qc.BFloat16Spec, qc.BFloat16Spec),
+        (qc.Int8Spec, qc.Int8Spec),
+        "20c66bdab16aa60a49a0d101097ebdf4069cd2903bc83a09750a14b3583736c8",
+    ),
+    "bfp16-mxint8": (
+        (qc.BFP16Spec, qc.BFP16Spec),
+        (qc.MXInt8Spec, qc.MXInt8Spec),
+        "1b65a86389e566b9602aea38dfacc14bae72b91774091a38214dc6369df4fb54",
+    ),
+    "u8-xint8": (
+        (qc.UInt8Spec, qc.Int8Spec),
+        (qc.XInt8Spec, qc.XInt8Spec),
+        "0d6f28c894cabc339c685489212925a702f7c5a2fe1c917604089b66248ae477",
+    ),
+}
+
+
+def _cfg_of(case, **params):
+    (a, w), (ta, tw), _ = _QUARK_KEYS[case]
+    return _amp_config(
+        a, w, qc.QLayerConfig(activation=ta(), weight=tw()), data_size=3, **params
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_QUARK_KEYS))
+def test_cache_is_written_under_quarks_key(case, tmp_path):
+    cache = tmp_path / "c.json"
+    _quantize(_cfg_of(case, metric_threshold=None, sensitivity_cache_file=str(cache)))
+    doc = json.loads(cache.read_text())
+    assert doc["cache_key"] == _QUARK_KEYS[case][2]
+    assert {"name", "candidate_nodes", "score", "all_config_scores", "enabled"} <= set(
+        doc["results"][0]
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_QUARK_KEYS))
+def test_a_cache_quark_wrote_is_read_not_recomputed(case, tmp_path):
+    """A file in Quark's schema and under Quark's key drives the mixing: its
+    ranking (not a recomputed one) and its ``enabled`` pins."""
+    rows = [
+        # scores no computation reproduces: only a read of the file puts n4 first
+        dict(name="n4_Gemm", candidate_nodes=["n4_Gemm"], score=0.001),
+        dict(name="n0_Gemm", candidate_nodes=["n0_Gemm"], score=0.002, enabled=False),
+        dict(name="n2_Gemm", candidate_nodes=["n2_Gemm"], score=0.003),
+    ]
+    doc = dict(
+        version="0.13",
+        cache_key=_QUARK_KEYS[case][2],
+        results=[
+            {
+                "all_config_scores": [r["score"]],
+                "best_config_index": 0,
+                "enabled": True,
+                **r,
+            }
+            for r in rows
+        ],
+    )
+    cache = tmp_path / "quark.json"
+    cache.write_text(json.dumps(doc))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        q, _ = _quantize(_cfg_of(case, sensitivity_cache_file=str(cache)))
+    assert not [w for w in caught if "stale" in str(w.message)]
+    res = q.last_auto_mixprecision
+    assert [r.name for r in res.ranked] == ["n4_Gemm", "n0_Gemm", "n2_Gemm"]
+    assert res.moved == ["n4_Gemm", "n2_Gemm"]  # n0 is pinned
+    assert json.loads(cache.read_text()) == doc  # read, not rewritten
+
+
+def test_a_cache_under_another_key_is_stale_and_recomputed(tmp_path):
+    cache = tmp_path / "c.json"
+    doc = dict(
+        version="0.13",
+        cache_key="0" * 64,
+        results=[
+            dict(
+                name="n4_Gemm",
+                candidate_nodes=["n4_Gemm"],
+                score=0.0,
+                all_config_scores=[0.0],
+                best_config_index=0,
+                enabled=False,
+            )
+        ],
+    )
+    cache.write_text(json.dumps(doc))
+    q = qc.ModelQuantizer(_cfg_of("u8-u16", sensitivity_cache_file=str(cache)))
+    with pytest.warns(UserWarning, match="stale"):
+        q.quantize_model(_mlp(), calibration_data_reader=_data())
+    assert len(q.last_auto_mixprecision.ranked) == 3
+    assert "n4_Gemm" in q.last_auto_mixprecision.moved  # the bogus pin is gone
+    assert json.loads(cache.read_text())["cache_key"] == _QUARK_KEYS["u8-u16"][2]
+
+
+def test_a_changed_request_changes_the_key():
+    from onnxsim.quark_amp_cache import quark_cache_key
+
+    base = _baseline(targets=[("uint16", None)])
+    t16 = qc.QLayerConfig(activation=qc.UInt16Spec(), weight=qc.Int8Spec())
+    t8 = qc.QLayerConfig(activation=qc.Int8Spec(), weight=qc.Int8Spec())
+    ops = ("Conv", "ConvTranspose", "Gemm", "MatMul")
+    keys = {
+        quark_cache_key(base, t16, ops),
+        quark_cache_key(base, t8, ops),
+        quark_cache_key(base, t16, ops[:2]),
+        quark_cache_key(base, t16, ops, include_layers=["n0_Gemm"]),
+        quark_cache_key(base, t16, ops, exclude_layers=["n0_Gemm"]),
+        quark_cache_key(base, [t16, t8], ops),
+        quark_cache_key(base, {t16: []}, ops),
+    }
+    assert len(keys) == 7
+    assert quark_cache_key(base, t16, ops[::-1]) == quark_cache_key(base, t16, ops)
+    # the spelling of the activation spec matters (``input_tensors`` is not
+    # ``activation``), as in Quark's ``QLayerConfig.to_dict``
+    spelled = qc.QLayerConfig(input_tensors=qc.UInt16Spec(), weight=qc.Int8Spec())
+    assert quark_cache_key(base, spelled, ops) != quark_cache_key(base, t16, ops)
