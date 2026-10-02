@@ -113,14 +113,37 @@ def test_preset_is_wired_through_the_shim():
         qc.ModelQuantizer(cfg).quantize_model(m)
 
 
-def test_input_model_is_not_modified_and_opset_checked():
+@pytest.mark.parametrize("opset", [9, 10])
+def test_below_opset_11_the_scale_and_zero_point_are_computed_by_nodes(opset):
+    # no DynamicQuantizeLinear (an opset 11 operator): ONNX Runtime's unfused
+    # pattern, which is what Quark emits (tests/test_quark_low_opset_parity.py)
+    m = _model("y = MatMul(x, w)", {"w": W})
+    m.opset_import[0].version = opset
+    q = quantize_dynamic_integer(m)
+    ops = _ops(q)
+    assert "DynamicQuantizeLinear" not in ops
+    assert ops[:9] == [
+        "ReduceMin",
+        "ReduceMax",
+        "Sub",
+        "Div",
+        "Sub",
+        "Div",
+        "Floor",
+        "Cast",
+        "QuantizeLinear",
+    ]
+    assert ops.count("MatMulInteger") == 1
+    inits = {t.name: numpy_helper.to_array(t) for t in q.graph.initializer}
+    assert inits["fixed_quantization_range_uint8"] == 255.0
+    assert inits["fixed_zero"] == 0.0
+
+
+def test_input_model_is_not_modified_and_arguments_checked():
     m = _model("y = MatMul(x, w)", {"w": W})
     before = m.SerializeToString()
     quantize_dynamic_integer(m)
     assert m.SerializeToString() == before
-    m.opset_import[0].version = 9
-    with pytest.raises(ValueError, match="opset"):
-        quantize_dynamic_integer(m)
     with pytest.raises(ValueError, match="weight_dtype"):
         quantize_dynamic_integer(
             _model("y = MatMul(x, w)", {"w": W}), weight_dtype="int4"
