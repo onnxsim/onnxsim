@@ -1377,3 +1377,51 @@ Numerics: fp32 is required (the reference has exactly zero denominators: num = d
 Integration plan: (1) ONNX-level rewrite or ORT graph transformer matching `Reshape -> {Slice x3} -> Relu(q), Relu(k) -> Transpose(k), Pad(v, 1.0 on axis 2) -> MatMul(vpad, k^T) -> MatMul(., q) -> Slice x2 -> Add(eps) -> Div -> Reshape`
 (EfficientViT `LiteMLA`) to a contrib op `LinearAttention`-style node `(qkv NCHW or NHWC, eps) -> out` with attrs heads, dim, eps; the WebGPU EP already registers a contrib `LinearAttention` kernel (different semantics, for LLM state), so use a new name (e.g. `ReluLinearAttention`);
 (2) the kernel reads the NHWC qkv conv output (the NHWC layout transformer already supplies it) and writes NHWC; (3) general N: split count NS = ceil(N/tile) with the partial buffer as scratch, dim and heads as shader constants. Gain is ~2% of SAM (7 ms of 357), so it is a lower priority than the 1x1-conv work; the pattern also matters for other EfficientViT models.
+
+## 1x1 stride-1 classes of SAM-L0 and RT-DETR on the texture direct conv (class-wise tile search)
+
+Setup: `webgpu_ops/texdirect_tune/tune_1x1.py` (class-wise search like `tune_class.py`, own phone dir and library copy, shorter timed runs: SAM 6 warm-up + 8 timed per run), screen with `screen.py`, validation with `validate_1x1.py`; tables in `TABLE_*.txt`, per-class logs in `log_1x1_*.txt`.
+Accept rule as before (> 0.3 ms better than the mode's default tile in both ABAB pairs). Classes are (kernel, stride=1, output width); candidate space: all 14 workgroup shapes with wx*wy <= 256 x order 0/1, then tm in {1,4,8}, then nv in {1,4,8}.
+
+Whole-model screen with the default tile (medians of 4 interleaved rounds, ms; `enableInt64=1`; MAXC 512 unless stated):
+
+| model | base (`TEXDIRECT=0`) | mode 1, MAXC 512 | mode 1, MAXC 1024 | mode 2, MAXC 512 | mode 2, MAXC 1024 | mode 2, MAXC 2048 |
+|---|---|---|---|---|---|---|
+| SAM-L0 encoder | 357.9 | 349.3 | **341.1** | 356.0 | 353.3 | 358.0 |
+| RT-DETR pre | 341.2 | 336.1 | 335.4 | 354.1 | 353.6 | 354.3 |
+
+- **MAXC 1024 is the SAM win for mode 1**: it adds the 64->1024 stride-2 3x3 conv (Winograd cannot take it, the buffer Conv2dMM is slow): -16.8 ms, accuracy 9.2e-4 max / 5.9e-4 rms vs the CPU EP (f16 weights).
+- Mode 2 with the default tile (2,2,32,2,1) is *slower* than stock on both models for the 1x1 convs; the tile has to be fitted per class.
+
+Tuned 1x1 / dense-3x3 stride-1 classes (best tile `tm,nv,wx,wy,order`, gain vs the mode-2 default tile for that class):
+
+| SAM-L0 enc class (shapes) | tile | gain |
+|---|---|---|
+| k1 w64 (1024>128, 128>256, 256>256 x5, 512>128) | 2,2,8,16,1 | 11.1 ms |
+| k1 w32 (1024>256 x4, 256>1024 x4, 256>256) | 2,2,16,8,0 | 10.7 |
+| k1 w16 (1024>512 x4, 512>256) | 2,2,32,4,0 | 3.4 |
+| k1 w128 (256>64, 512>64) | 2,2,8,16,0 | 5.4 |
+| k3 w256 (32>32 x2) | 2,2,32,4,1 | 4.0 |
+
+| RT-DETR pre class | tile | gain vs mode-2 default |
+|---|---|---|
+| k1 w20 (6 shapes) | 2,2,8,8,1 | 7.6 ms |
+| k1 w40 (4) | 2,2,32,4,1 | 17.7 |
+| k1 w80 (5) | 2,2,16,8,0 | 25.2 |
+| k1 w160 (64>64) | 2,2,64,1,0 | 12.8 |
+| k3 w320 (32>32, 32>64) | 2,2,8,16,1 | 20.5 |
+
+Whole-setting validation (5 interleaved rounds, medians, ms):
+
+| model | base | mode 1, MAXC 1024 | mode 2, MAXC 1024, default tile | mode 2, MAXC 1024 + tuned table |
+|---|---|---|---|---|
+| SAM-L0 encoder | 358.4 | 341.8 (-16.6) | 352.6 | **322.8 (-35.6, -9.9%)** |
+| RT-DETR pre | 336.9 | 336.4 (-0.4) | 350.5 (+13.6) | 336.8 (-0.1) |
+
+- **RT-DETR: no gain from 1x1 on the texture path.** The tuned tiles only recover what the default tile lost (the 1x1 convs are as fast as ORT's MatMul path, not faster). Keep mode 1 (it is neutral to -5 ms, MAXC 512/1024 equal).
+- **SAM: 322.8 ms, but only with a large accuracy cost.** Output vs the CPU EP: stock WebGPU 5.1e-5 max, mode 1 MAXC 1024 9.2e-4 max (5.9e-4 rms), mode 2 MAXC 256 2.2e-3 max (2.8e-3 rms), mode 2 MAXC 512 2.2e-3 / 2.8e-3, **mode 2 MAXC 1024 + table 7.6e-2 max (4.1e-2 rms)**. The big-K 1x1 convs (K = 1024-2048) have the cancelling weights found in the fp16 NaN job; rounding them to f16 is what costs the accuracy. Per-setting time/accuracy on SAM (ms, ms saved vs 357.4, rms error): mode 1 c1024 341.8 (-15.6, 5.9e-4); mode 2 c256 + table 349.2 (-8.2, 2.8e-3); mode 2 c512 + table **339.4 (-18.1, 2.8e-3)**; mode 2 c1024 + table 322.0 (-35.4, 4.1e-2).
+- MAXC 2048 (adds the 512>1536, 128>2048 and 2048>256 shapes) is slower (326 ms, and unstable 315/360 ms when those shapes inherit their class tile) -- not adopted.
+
+**Recommended:** `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=1024` for both models (SAM -16 ms, 6e-4 rms; RT-DETR neutral to -5 ms). If ~3e-3 rms is acceptable on SAM, mode 2 with MAXC 512 and the table in `TABLE_sam_l0_enc_m2_c1024.txt` (the MAXC filter drops the 1024-channel entries) gives -18 ms.
+The -35 ms setting needs an accurate weight path: a code change, not implemented here -- an RGBA32F weight texture variant for `ConvTexDirectProgram` (the layout study measured RGBA32F textures at 1.5-1.7x a buffer kernel vs 1.8-2.1x for RGBA16F, so most of the gain should remain with exact f32 weights), selected per layer when K >= 1024 or by an env switch.
+Other kernel ideas that this search could not express with tm/nv/workgroup knobs: a 4-wide K unroll inside the c4 loop with the 4 weight texels of a k4 group fetched first (the loop is latency-bound at tm*nv = 4 accumulators/lane), and cooperative loading of the weight texels into workgroup memory for pixels-fast mappings (all lanes of a workgroup row read the same weight texel).
