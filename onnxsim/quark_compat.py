@@ -84,12 +84,29 @@ names and preset *meanings*, not copied.
   Identity removal (``OptimizeModel`` / ``SimplifyModel``); these conversions are
   also on for the extended (``A8W8`` ...) and transformer flows, and follow
   their options in ``VINT8`` (whose ``ConvertClipToRelu`` is implemented too).
-  Not reproduced: ``ConvertSoftmaxToDPUVersion`` / ``ConvertInstanceNormToDPUVersion``
-  (off by default), the order-dependence of Quark's position passes on its
-  node order, ONNX Runtime's other graph optimizations, and the placement of
-  the first Q/DQ pair when a ``Flatten`` / ``Clip`` is fed by a graph input
-  (Quark leaves the input float and quantizes the op's output; onnxsim
-  quantizes the input -- numerically equivalent for ``Flatten``).
+  Also reproduced (``tests/test_quark_xint8_parity.py``): ``ConvertSoftmaxToDPUVersion``
+  (the bfloat16 exponential / sum / division chain) and
+  ``ConvertInstanceNormToDPUVersion`` (``ExtendedInstanceNormalization``); the
+  op types Quark quantizes (its registries only: a ``Flatten`` or ``Neg`` marks
+  nothing); the order-dependent rule that leaves a ``Relu`` / ``Clip`` whose input
+  no earlier node marked as a plain float node (so one fed by a graph input keeps
+  that input float); the node order of Quark's own topological sort -- of the float
+  graph and again of the Q/DQ graph, with the DPU nodes appended at its end, which
+  the position passes visit (:mod:`onnxsim.quark_marking`); ``Pad``'s
+  ``constant_value`` quantized like a weight; a shared bias quantized once (or
+  copied per node under ``CopyBiasInit`` for the non-power-of-two calibrations);
+  the zero point and scale of an all-zero activation. Quark's float-graph
+  optimizers are run for real when installed (onnxslim's ``slim``, then ONNX
+  Runtime's basic graph optimizations with ``ConstantSharing`` off, then Quark's
+  own BatchNorm folding after a ConvTranspose / Gemm / Concat), so constant
+  folding, Conv + Add / Mul, Relu + Clip, MatMul + Add -> Gemm, no-op and
+  duplicated node removal are Quark's; without them (or with
+  ``UseRuntimeOptimizers=False``) onnxsim's own reproductions of the BatchNorm,
+  Pad, Identity and HardSwish passes are used. The calibration session runs with
+  ONNX Runtime's optimizations off, as Quark's does (a fused or re-laid-out graph
+  moves values across histogram bin edges). Not reproduced: the
+  ``fuse_instance_norm`` / ``fuse_l2_norm`` / ``fuse_layer_norm`` / ``fuse_gelu``
+  pattern fusions, and opset < 13 models.
 - Q/DQ placement and quantizer options follow Quark's rules
   (:func:`onnxsim.full_qdq.quantize_full_qdq`, ``tests/test_quark_parity.py``):
   the Q/DQ pair between a Conv / Add / MaxPool / AveragePool /
@@ -1992,6 +2009,9 @@ class ModelQuantizer:
                 bool(opts.get("SimplifyModel", True)),
                 runtime=runtime,
                 slim_config=opts.get("SimplifyModelOptions"),
+                fold_bn=bool(
+                    opts.get("FoldBatchNorm", opts.get("OptimizeModel", True))
+                ),
                 copy_bias_ops=(
                     None
                     if self._calib_method(act)
@@ -1999,6 +2019,10 @@ class ModelQuantizer:
                     else opts.get("CopyBiasInit", ("Conv", "ConvTranspose", "Gemm"))
                 ),
             )
+        # (Quark's fusion / folding passes end with its own topological sort)
+        from onnxsim.quark_marking import quark_sorted as _quark_sorted
+
+        work = _quark_sorted(work)
         # Quark's order: CLE (stem equalization first), SmoothQuant, Quarot
         if "cle" in by_name:
             from onnxsim.quark_equalization import apply_cle_config
@@ -2034,9 +2058,7 @@ class ModelQuantizer:
         cnn_types: "Optional[set[str]]" = None
         if op_types is None and not opts.get("QuantizeAllOpTypes"):
             cnn_types = set(
-                quark_op_types(
-                    npu_cnn or ext, opts.get("ExtraOpTypesToQuantize") or ()
-                )
+                quark_op_types(npu_cnn or ext, opts.get("ExtraOpTypesToQuantize") or ())
             )
             if opts.get("ConvertBNToConv", conv_default):
                 cnn_types.add("BatchNormalization")
@@ -2095,7 +2117,7 @@ class ModelQuantizer:
             align_eltwise_dtype=bool(
                 self.config.extra_options.get("AlignEltwiseQuantType")
             ),
-            softmax_unit_range=not act.pof2,
+            softmax_unit_range=True,
             tensor_dtypes=t_dtypes or None,
             tensor_symmetric=t_sym or None,
         )

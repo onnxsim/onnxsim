@@ -90,9 +90,7 @@ QUARK_NPU_CNN_OP_TYPES = frozenset(
 _DIRECT_OPS = ("Reshape", "Transpose", "Squeeze", "Unsqueeze")
 
 
-def quark_op_types(
-    npu_cnn_ops: bool, extra: Iterable[str] = ()
-) -> "frozenset[str]":
+def quark_op_types(npu_cnn_ops: bool, extra: Iterable[str] = ()) -> "frozenset[str]":
     """Quark's default ``op_types_to_quantize`` (``get_static_op_types``)."""
     types = set(QUARK_QDQ_OP_TYPES)
     if npu_cnn_ops:
@@ -142,6 +140,20 @@ def quark_node_order(model: onnx.ModelProto) -> List[onnx.NodeProto]:
     return [nodes[i] for i in _order_indices(model)]
 
 
+def quark_sort_inplace(model: onnx.ModelProto) -> None:
+    """Reorder the nodes of ``model`` in place as :func:`quark_node_order` says
+    (a cycle leaves it as it is)."""
+    try:
+        order = _order_indices(model)
+    except ValueError:  # pragma: no cover - not a DAG
+        return
+    nodes = [onnx.NodeProto() for _ in order]
+    for dst, i in zip(nodes, order):
+        dst.CopyFrom(model.graph.node[i])
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+
+
 def quark_sorted(model: onnx.ModelProto) -> onnx.ModelProto:
     """A copy of ``model`` with its nodes in :func:`quark_node_order`."""
     out = onnx.ModelProto()
@@ -179,9 +191,7 @@ def _quark_names(model: onnx.ModelProto) -> Dict[str, str]:
             base = tensor_of(data)
             int32 = data.endswith("/int32")
             rename.setdefault(data, base + "_quantized")
-            rename.setdefault(
-                scale, base + ("_quantized_scale" if int32 else "_scale")
-            )
+            rename.setdefault(scale, base + ("_quantized_scale" if int32 else "_scale"))
             rename.setdefault(
                 zp, base + ("_quantized_zero_point" if int32 else "_zero_point")
             )
@@ -316,6 +326,7 @@ __all__: Any = [
     "quark_node_order",
     "quark_op_types",
     "quark_qdq_sorted",
+    "quark_sort_inplace",
     "quark_sorted",
     "skipped_nodes",
 ]

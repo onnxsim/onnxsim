@@ -1159,7 +1159,9 @@ def _same_as_quark(model, tmp_path, preset="XINT8", extra=None):
     return q, m, data
 
 
-@pytest.mark.parametrize("preset", ["XINT8", "VINT8", "A8W8", "U8S8_AAWS", "S8S8_AAWS", "A16W8"])
+@pytest.mark.parametrize(
+    "preset", ["XINT8", "VINT8", "A8W8", "U8S8_AAWS", "S8S8_AAWS", "A16W8"]
+)
 @pytest.mark.parametrize(
     "body",
     [
@@ -1188,9 +1190,10 @@ def test_ops_fed_by_a_graph_input_are_placed_like_quark(body, preset, tmp_path):
     )
 
 
-def test_a_relu_after_a_conv_that_reads_the_same_input_is_quantized(tmp_path):
-    """Order matters: ``Conv(x)`` is visited first (Quark's sort releases the nodes
-    of ``x`` in file order), so the ``Relu`` finds its input marked."""
+def test_a_relu_next_to_a_conv_reading_the_same_input_depends_on_the_order(tmp_path):
+    """Order matters: Quark's sort releases the readers of ``x`` in file order, so a
+    ``Relu`` listed after the ``Conv`` finds its input marked and one listed before
+    it does not."""
     for body in (
         "c = Conv(x, wid, bid)\n r = Relu(x)\n y = Add(c, r)",
         "r = Relu(x)\n c = Conv(x, wid, bid)\n y = Add(c, r)",
@@ -1265,8 +1268,14 @@ def test_align_pad_matters_in_quark_and_is_reproduced(tmp_path):
 @pytest.mark.parametrize(
     "body, extra",
     [
-        ("c0 = Conv(x, w1, b1)\n s = Softmax<axis=1>(c0)\n y = Conv(s, w2, b2)", {"ConvertSoftmaxToDPUVersion": True}),
-        ("c0 = Conv(x, w1, b1)\n s = Softmax<axis=3>(c0)\n y = Conv(s, w2, b2)", {"ConvertSoftmaxToDPUVersion": True}),
+        (
+            "c0 = Conv(x, w1, b1)\n s = Softmax<axis=1>(c0)\n y = Conv(s, w2, b2)",
+            {"ConvertSoftmaxToDPUVersion": True},
+        ),
+        (
+            "c0 = Conv(x, w1, b1)\n s = Softmax<axis=3>(c0)\n y = Conv(s, w2, b2)",
+            {"ConvertSoftmaxToDPUVersion": True},
+        ),
         (
             "c0 = Conv(x, w1, b1)\n s = InstanceNormalization<epsilon=0.001>(c0, isc, ibi)\n y = Conv(s, w2, b2)",
             {"ConvertInstanceNormToDPUVersion": True},
@@ -1350,7 +1359,8 @@ def test_shared_bias_follows_quarks_copy_bias_init(pof2, tmp_path):
     n_bias = sum(
         1
         for n in q.graph.node
-        if n.op_type == "DequantizeLinear" and n.input[0].startswith(("b1", "b2", "dup"))
+        if n.op_type == "DequantizeLinear"
+        and n.input[0].startswith(("b1", "b2", "dup"))
     )
     assert n_bias == (2 if pof2 else 3)
 
@@ -1406,8 +1416,20 @@ def _random_graph(seed, big=False):
         return out
 
     ops = [
-        "conv3", "conv1", "relu", "add", "sub", "mul", "concat", "maxpool",
-        "avgpool", "sigmoid", "swish", "leaky", "clip6", "gap_mul",
+        "conv3",
+        "conv1",
+        "relu",
+        "add",
+        "sub",
+        "mul",
+        "concat",
+        "maxpool",
+        "avgpool",
+        "sigmoid",
+        "swish",
+        "leaky",
+        "clip6",
+        "gap_mul",
     ]
     if big:
         ops += ["concat3", "conv3", "conv1", "add", "concat"]
@@ -1431,9 +1453,15 @@ def _random_graph(seed, big=False):
             c = emit("Concat", ins, "<axis=1>", register=False)
             emit("Conv", [c, weight(8, 8 * len(ins), 1, 1), bias()])
         elif k == "maxpool":
-            emit("MaxPool", [pick()], "<kernel_shape=[3,3],pads=[1,1,1,1],strides=[1,1]>")
+            emit(
+                "MaxPool", [pick()], "<kernel_shape=[3,3],pads=[1,1,1,1],strides=[1,1]>"
+            )
         elif k == "avgpool":
-            emit("AveragePool", [pick()], "<kernel_shape=[3,3],pads=[1,1,1,1],strides=[1,1]>")
+            emit(
+                "AveragePool",
+                [pick()],
+                "<kernel_shape=[3,3],pads=[1,1,1,1],strides=[1,1]>",
+            )
         elif k == "sigmoid":
             emit("Sigmoid", [pick()])
         elif k == "swish":
@@ -1469,7 +1497,9 @@ def _random_graph(seed, big=False):
 def _shuffled(model, seed):
     """The same graph with its nodes in another valid topological order."""
     rng = random.Random(seed)
-    avail = {i.name for i in model.graph.input} | {t.name for t in model.graph.initializer}
+    avail = {i.name for i in model.graph.input} | {
+        t.name for t in model.graph.initializer
+    }
     pending, order = list(model.graph.node), []
     while pending:
         node = rng.choice([n for n in pending if all(x in avail for x in n.input)])
@@ -1531,10 +1561,86 @@ def test_node_order_of_the_quantized_graph_is_quarks(seed, tmp_path):
     m = _mine_preset(model, data, extra=extra)
 
     def keys(model):
-        return [
-            _order_key(n)
-            for n in model.graph.node
-            if n.op_type != "Constant"
-        ]
+        return [_order_key(n) for n in model.graph.node if n.op_type != "Constant"]
 
     assert keys(m) == keys(q)
+
+
+def _bn16():
+    rng = np.random.default_rng(4)
+    return dict(
+        g16=(1 + _w(rng, 16, scale=0.3)).astype(np.float32),
+        bb16=_w(rng, 16),
+        bm16=_w(rng, 16),
+        bv16=(1 + np.abs(_w(rng, 16))).astype(np.float32),
+    )
+
+
+@pytest.mark.parametrize("bias", [True, False], ids=["bias", "no_bias"])
+@pytest.mark.parametrize("extra", [{}, {"FoldBatchNorm": False}], ids=["fold", "keep"])
+def test_batch_norm_after_a_concat_is_folded_like_quark(bias, extra, tmp_path):
+    """Quark folds a BatchNormalization after a Concat of Convs into each of them
+    (the channel slice each produces) -- ONNX Runtime does not."""
+    ins = ", w1, b1" if bias else ", w1"
+    ins3 = ", w3, b3" if bias else ", w3"
+    model = _edge(
+        f"a = Conv(x{ins})\n b = Conv(x{ins3})\n k = Concat<axis=1>(a, b)\n"
+        " n = BatchNormalization(k, g16, bb16, bm16, bv16)\n y = Conv(n, w4, b4)",
+        **_bn16(),
+    )
+    q, m, data = _same_as_quark(model, tmp_path, extra=extra)
+    _assert_same_graph(q, m, f"bias={bias} {extra}")
+    ops = [n.op_type for n in q.graph.node]
+    assert ("BatchNormalization" in ops or "Conv" in ops) and (
+        extra == {} or ops.count("Conv") == 4
+    )
+    x = data[0]["x"]
+    np.testing.assert_array_equal(_ort(m, x), _ort(q, x))
+
+
+_MLP_OPT = {
+    # ONNX Runtime fuses a MatMul + Add into a Gemm, Reshapes into one, folds a no-op Div
+    "matmul_add": "m = MatMul(x, wm)\n y = Add(m, bm)",
+    "matmul_add_gemm": "m = MatMul(x, wm)\n a = Add(m, bm)\n r = Relu(a)\n y = Gemm(r, wm2, bm2)",
+    "reshape_chain": "g = Gemm(x, wm, bm)\n r = Reshape(g, shr)\n s = Reshape(r, shs2)\n y = Gemm(s, wm2, bm2)",
+    "gemm_no_op_div": "g = Gemm(x, wm, bm)\n a = Div(g, co)\n y = Gemm(a, wm2, bm2)",
+}
+
+
+@pytest.mark.parametrize("preset", ["XINT8", "A8W8"])
+@pytest.mark.parametrize("name", sorted(_MLP_OPT))
+def test_gemm_graph_optimizations_match_quark(name, preset, tmp_path):
+    rng = np.random.default_rng(6)
+    model = _edge(
+        _MLP_OPT[name],
+        shape=(3, 16),
+        wm=_w(rng, 16, 8),
+        bm=_w(rng, 8),
+        wm2=_w(rng, 8, 4),
+        bm2=_w(rng, 4),
+        shr=np.array([3, 4, 2], np.int64),
+        shs2=np.array([3, 8], np.int64),
+    )
+    q, m, _ = _same_as_quark(model, tmp_path, preset)
+    if preset == "XINT8":
+        _assert_same_graph(q, m, name)
+    else:
+        _assert_close_graph(q, m, name)
+
+
+def test_a_quantized_constant_replaces_the_initializer_for_every_reader(tmp_path):
+    """The ``constant_value`` of a Pad that a Clip also reads as its minimum: Quark's
+    quantizer swaps the initializer for its DQ in *all* the nodes that read it."""
+    rng = np.random.default_rng(5)
+    model = _edge(
+        "c0 = Conv(x, w1, b1)\n p = Pad(c0, pads, cn)\n q = Conv(p, w2b, b2b)\n"
+        " y = Clip(q, cn, hi6)",
+        w2b=_w(rng, 2, 8, 3, 3),
+        b2b=_w(rng, 2),
+        pads=np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64),
+    )
+    q, m, _ = _same_as_quark(model, tmp_path)
+    _assert_same_graph(q, m, "shared constant")
+    clip = next(n for n in q.graph.node if n.op_type == "Clip")
+    by_out = {o: n for n in q.graph.node for o in n.output}
+    assert by_out[clip.input[1]].op_type == "DequantizeLinear"

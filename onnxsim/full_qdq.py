@@ -149,6 +149,42 @@ def _pof2(scale: float) -> float:
     return float(2.0 ** np.ceil(np.log2(scale) - 1e-9)) if scale > 0 else scale
 
 
+# Quark's symmetric integer ranges (``get_qmin_qmax_for_qType(symmetric=True)``)
+_QUARK_SYMMETRIC_RANGE = {
+    (-128, 127): (-127, 127),
+    (-32768, 32767): (-32767, 32767),
+}
+
+
+def _quark_pof2_params(
+    lo: float, hi: float, qmin: int, qmax: int, symmetric: bool
+) -> Tuple[float, int]:
+    """``(scale, zero_point)`` of Quark's ``compute_scale_zp`` with a power-of-two
+    method: the min / max scale (float32 range, float64 division) taken to the
+    *nearest* fixed-point position -- not rounded up -- with the zero point
+    recomputed for it. Ranges the MinMSE search produced come out exact; a range
+    set by hand (a Softmax output's ``(0, 1)``) is rounded, not covered."""
+    if symmetric:
+        qmin, qmax = _QUARK_SYMMETRIC_RANGE.get((qmin, qmax), (qmin, qmax))
+    rmin, rmax = np.float32(min(lo, 0.0)), np.float32(max(hi, 0.0))
+    if symmetric:
+        absmax = np.maximum(np.abs(rmin), np.abs(rmax))
+        rmin, rmax = -absmax, absmax
+    scale = np.float64(rmax - rmin) / np.float64(qmax - qmin)
+    if scale < np.finfo(np.float32).tiny:
+        scale32, zp = np.float32(1.0), 0
+    else:
+        zp = int(np.round(qmin - np.float64(rmin) / scale))
+        scale32 = np.float32(scale)
+    pos = int(np.rint(-np.log2(min(max(float(scale32), 2.0**-127), 2.0**127))))
+    pof2 = np.float32(2.0**-pos)
+    new_rmin = np.minimum((np.float32(qmin) - np.float32(zp)) * pof2, np.float32(0))
+    new_zp = int(np.round(np.float32(qmin) - new_rmin / pof2))
+    if symmetric and qmin == 0 and qmax == 255 and new_zp == 127:
+        new_zp = 128  # (the hardware wants the zero point centred)
+    return float(pof2), new_zp
+
+
 def _qparams(
     lo: float,
     hi: float,
@@ -156,12 +192,17 @@ def _qparams(
     qmax: int,
     symmetric: bool = False,
     power_of_two: bool = False,
+    quark_rounding: bool = False,
 ) -> Tuple[float, int]:
     """``(scale, zero_point)`` for the range ``[lo, hi]`` (always including 0).
 
     ``symmetric``: ``scale = absmax / half-range`` with the zero point in the
     middle of the integer range -- 0 for signed types, 128 / 32768 for unsigned
-    ones. ``power_of_two`` rounds the scale up to a power of two."""
+    ones. ``power_of_two`` rounds the scale up to a power of two;
+    ``quark_rounding`` (with it) takes the nearest position instead, as Quark's
+    power-of-two ``compute_scale_zp`` does."""
+    if power_of_two and quark_rounding:
+        return _quark_pof2_params(float(lo), float(hi), qmin, qmax, symmetric)
     lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
     if symmetric:
         absmax = max(-lo, hi)
@@ -299,9 +340,24 @@ def _is_quantized_node(
     )
 
 
-def _data_inputs(n: onnx.NodeProto) -> List[str]:
+def _data_inputs(
+    n: onnx.NodeProto, inits: Optional[Dict[str, TensorProto]] = None
+) -> List[str]:
+    """The inputs of ``n`` that carry data. With ``inits``, the bias of a Conv /
+    ConvTranspose / Gemm that is not a constant is left out as well: Quark's
+    quantizers only quantize a bias that is a weight (a Gemm whose ONNX Runtime
+    fused ``C`` is an activation keeps it float)."""
     idx = _DATA_INPUTS.get(n.op_type)
-    return [x for i, x in enumerate(n.input) if x and (idx is None or i in idx)]
+    out = [x for i, x in enumerate(n.input) if x and (idx is None or i in idx)]
+    if (
+        inits is not None
+        and n.op_type in ("Conv", "ConvTranspose", "Gemm")
+        and len(n.input) > 2
+        and n.input[2]
+        and n.input[2] not in inits
+    ):
+        out = [x for x in out if x != n.input[2] or x in n.input[:2]]
+    return out
 
 
 def _is_clamp(n: onnx.NodeProto, inits: Dict[str, TensorProto]) -> bool:
@@ -532,7 +588,7 @@ def quantize_full_qdq(
     acts = []
     seen = set()
     for n in qnodes:
-        for x in _data_inputs(n) + [o for o in n.output if o]:
+        for x in _data_inputs(n, inits) + [o for o in n.output if o]:
             if x in floats and x not in inits and x not in seen:
                 seen.add(x)
                 acts.append(x)
@@ -546,7 +602,7 @@ def quantize_full_qdq(
             n, op_types, set(), set(), skip_set
         ):
             continue
-        ins = [x for x in _data_inputs(n) if x in floats and x not in inits]
+        ins = [x for x in _data_inputs(n, inits) if x in floats and x not in inits]
         outs = [o for o in n.output if o and o in floats]
         if (
             ins
@@ -663,6 +719,8 @@ def quantize_full_qdq(
                 and p.op_type in producer_ops
                 and p.output[0] == src
                 and len(consumers[src]) == 1
+                # (a graph output's Q input is renamed: Quark's pair stays)
+                and src not in graph_outputs
                 and (c.op_type != "Clip" or _clip_bounds(c, inits) in _CLIP_BOUNDS)
             ):
                 skip.add(src)
@@ -676,6 +734,7 @@ def quantize_full_qdq(
                 and p.op_type == "Pad"
                 and p.output[0] == c.input[0]
                 and len(consumers[c.input[0]]) == 1
+                and c.input[0] not in graph_outputs
             ):
                 skip.add(c.input[0])
         acts = [a for a in acts if a not in skip]
@@ -721,7 +780,13 @@ def quantize_full_qdq(
 
     def set_qp(x: str) -> None:
         dt = tensor_dtypes.get(x, activation_dtype)
-        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], tensor_symmetric.get(x, sym), p2)
+        qp[x] = _qparams(
+            *ranges[x],
+            *_DTYPES[dt][2:],
+            tensor_symmetric.get(x, sym),
+            p2,
+            quark_rounding=p2_search,
+        )
         qdt[x] = dt
 
     for x in graph_inputs:
@@ -870,7 +935,13 @@ def quantize_full_qdq(
             ckey = (src, node_dt)
             if ckey not in converted:
                 c = f"{src}/as_{node_dt}"
-                sc, zc = _qparams(*ranges[src], *_DTYPES[node_dt][2:], sym, p2)
+                sc, zc = _qparams(
+                    *ranges[src],
+                    *_DTYPES[node_dt][2:],
+                    sym,
+                    p2,
+                    quark_rounding=p2_search,
+                )
                 qp[c], qdt[c] = (sc, zc), node_dt
                 sn = add_init(fresh(c) + "/scale", np.array(sc, np.float32))
                 zn = add_init(fresh(c) + "/zp", np.array(zc, _DTYPES[node_dt][1]))
@@ -957,19 +1028,20 @@ def quantize_full_qdq(
     # input dequantized): a lone DQ on a weight of a float node would strand it on the CPU.
     cache: Dict[Tuple, str] = {}
     act_set = set(acts) | set(act_extra)
+    before = {id(n): list(n.input) for n in qnodes}
     for n in qnodes:
         if id(n) in removed:
             continue
         slope_only = False
         if not all(
             x in act_set and x in qp
-            for x in _data_inputs(n)
+            for x in _data_inputs(n, inits)
             if x in floats and x not in inits
         ):
             if not (quantize_prelu_slope and n.op_type == "PRelu"):
                 continue
             slope_only = True
-        data = set(_data_inputs(n))
+        data = set(_data_inputs(n, inits))
         for k, x in enumerate(list(n.input)):
             if slope_only and k != 1:
                 continue
@@ -1169,6 +1241,19 @@ def quantize_full_qdq(
                     cache[key] = out
                 n.input[k] = cache[key]
 
+    # a quantized constant is replaced by its DQ in *every* node that reads it
+    # (Quark's ``replace_input_of_all_nodes``): a shared initializer is not left
+    # float for a node outside the QDQ unit, a Clip's bound or an excluded Conv
+    const_dq: Dict[str, str] = {}
+    for n in qnodes:
+        for k, orig in enumerate(before[id(n)]):
+            if orig in inits and n.input[k] != orig:
+                const_dq.setdefault(orig, n.input[k])
+    if const_dq:
+        for n in g.node:
+            for k, x in enumerate(n.input):
+                if x in const_dq:
+                    n.input[k] = const_dq[x]
     for n in g.node:
         for k, o in enumerate(n.output):
             if o in rename:

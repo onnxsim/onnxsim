@@ -37,11 +37,20 @@ The lookups (which Q/DQ node is "the input position of this node": the one
 producing its first input, through a ``Pad`` for a pool; "the output position":
 the first Q/DQ reading its output, through the DPU ``Mul`` of a pool /
 ``HardSigmoid`` or a following Relu-like node whose Q/DQ was removed) follow
-Quark's, including its first-match-in-graph-order rule. Not reproduced:
-``ConvertSoftmaxToDPUVersion`` / ``ConvertInstanceNormToDPUVersion`` (off by
-default; Quark's integer softmax emulation and a custom operator), and the
-order-dependence on Quark's node order (positions are visited in this graph's
-node order, which can differ from Quark's topologically re-sorted one).
+Quark's, including its first-match-in-graph-order rule.
+
+The passes visit the nodes in list order, so the order matters: the caller
+(:mod:`onnxsim.quark_compat`) first sorts the Q/DQ graph the way Quark's
+``topological_sort`` does (:func:`onnxsim.quark_marking.quark_qdq_sorted`), and the
+rewrites append their nodes at the end of the list like Quark's ``insert_mul``: the
+``HardSigmoid`` that replaces a ``Sigmoid``, then each ``Constant`` + ``Mul``. Pool and
+``ReduceMean`` shapes come from the graph as it was before any rewrite
+(``value_info``; a graph input or output has none, and its pool / mean is left alone).
+
+``ConvertSoftmaxToDPUVersion`` (:func:`softmax_dpu_nodes`: the bfloat16
+polynomial exponential, the sum and a division) and
+``ConvertInstanceNormToDPUVersion`` (``ExtendedInstanceNormalization`` of the
+``com.amd.quark`` domain, a custom operator) are opt-in like in Quark.
 """
 
 from __future__ import annotations
@@ -501,10 +510,18 @@ def _insert_mul(graph: onnx.GraphProto, node: onnx.NodeProto, scale: float) -> N
     graph.node.append(helper.make_node("Mul", [pre, const], [out], name=pre))
 
 
-def _float_source(producers: Dict[str, onnx.NodeProto], tensor: str) -> str:
-    """The float tensor behind ``tensor``: through its DQ and the Q before it."""
+def _float_source(
+    producers: Dict[str, onnx.NodeProto],
+    tensor: str,
+    graph_outputs: Sequence[str] = (),
+) -> str:
+    """The float tensor behind ``tensor``: through its DQ and the Q before it.
+    ``""`` (no shape known) for a graph output, which Quark's ``value_info``
+    does not list."""
     p = producers.get(tensor)
     if p is not None and p.op_type == "DequantizeLinear":
+        if tensor in graph_outputs:
+            return ""
         tensor = p.input[0]
         q = producers.get(tensor)
         if q is not None:
@@ -543,7 +560,11 @@ def softmax_dpu_nodes(node: onnx.NodeProto, opset: int) -> List[onnx.NodeProto]:
     def op(op_type: str, name: str, ins: Sequence[str], **attrs: Any) -> str:
         out.append(
             helper.make_node(
-                op_type, [i + "_output" for i in ins], [name + "_output"], name=name, **attrs
+                op_type,
+                [i + "_output" for i in ins],
+                [name + "_output"],
+                name=name,
+                **attrs,
             )
         )
         return name
@@ -552,7 +573,11 @@ def softmax_dpu_nodes(node: onnx.NodeProto, opset: int) -> List[onnx.NodeProto]:
     ns = sm + "/exp_poly"
     out.append(
         helper.make_node(
-            "Cast", [node.input[0]], [ns + "/round/cast_output"], name=ns + "/round/cast", to=bf16
+            "Cast",
+            [node.input[0]],
+            [ns + "/round/cast_output"],
+            name=ns + "/round/cast",
+            to=bf16,
         )
     )
     cast0 = ns + "/round/cast"
@@ -589,9 +614,7 @@ def softmax_dpu_nodes(node: onnx.NodeProto, opset: int) -> List[onnx.NodeProto]:
     # the sum over the axis, in bfloat16
     es = sm + "/exp_sum"
     if opset <= 12:
-        sm_sum = op(
-            "ReduceSum", es + "/sum", [exp_x], axes=[axis], keepdims=1
-        )
+        sm_sum = op("ReduceSum", es + "/sum", [exp_x], axes=[axis], keepdims=1)
     else:
         ax = const(es + "/sum/reduction_indices", TensorProto.INT64, [1], [axis])
         sm_sum = op("ReduceSum", es + "/sum", [exp_x, ax], keepdims=1)
@@ -669,6 +692,7 @@ def simulate_dpu(
             ):
                 _insert_mul(g, n, HARD_SIGMOID_SCALE)
     producers = {o: n for n in g.node for o in n.output}
+    out_names = [o.name for o in g.output]
     if on("ConvertAvgPoolToDPUVersion"):
         for n in list(g.node):
             if n.op_type not in _AVG_POOLS or not should_simulate(n):
@@ -676,7 +700,7 @@ def simulate_dpu(
             kh = kw = 0
             ok = False
             if n.op_type == "GlobalAveragePool":
-                src = _float_source(producers, n.input[0])
+                src = _float_source(producers, n.input[0], out_names)
                 shape = (shapes or {}).get(src)
                 if not shape:
                     continue
@@ -695,7 +719,7 @@ def simulate_dpu(
         for n in list(g.node):
             if n.op_type != "ReduceMean" or not should_simulate(n):
                 continue
-            src = _float_source(producers, n.input[0])
+            src = _float_source(producers, n.input[0], out_names)
             shape = (shapes or {}).get(src)
             axes = None
             if len(n.input) == 1:
@@ -738,7 +762,9 @@ def simulate_dpu(
             )
             g.node.remove(n)
         g.node.extend(new_nodes)
-        if new_nodes and not any(o.domain == "com.amd.quark" for o in model.opset_import):
+        if new_nodes and not any(
+            o.domain == "com.amd.quark" for o in model.opset_import
+        ):
             model.opset_import.append(helper.make_opsetid("com.amd.quark", 1))
     if on("ConvertClipToDPUVersion"):
         inits = {t.name: t for t in g.initializer}
