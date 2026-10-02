@@ -1171,6 +1171,7 @@ def calibrate(
     quark_num_bins: Optional[int] = None,
     percentile_candidates: Sequence[float] = (99.99, 99.999, 99.99999),
     lwp_metric: str = "mae",
+    exact_session: Optional[bool] = None,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Run the float ``model`` over every batch in ``calibration_data`` through
@@ -1297,6 +1298,9 @@ def calibrate(
             AMD Quark's calibrators of those names, scale-for-scale (see
             :mod:`onnxsim.quark_calibration`); ``"entropy"`` / ``"percentile"``
             above are onnxsim's own variants and differ from them.
+    :param exact_session: run the calibration session with ONNX Runtime's graph
+            optimizations off, as Quark's calibrators do (default: on for
+            ``"minmse_pof2"`` and the Quark methods, off otherwise)
     :returns: ``{tensor_name: (min, max)}`` for every tensor
             ``onnxsim_cpp2py_export.list_quantizable_activations`` reports
             (or ``tensor_names``), plus ``extra_tensor_names`` if given
@@ -1336,6 +1340,13 @@ def calibrate(
         histograms=method not in ("minmax", "minmax_mean", "minmse_pof2"),
         num_bins=num_bins,
         pof2_histograms=method == "minmse_pof2",
+        # (Quark calibrates on an unoptimized graph: ONNX Runtime's fusions and
+        # NCHWc layout change the order of float operations, which is enough to
+        # move a value across a histogram bin edge and flip a near-tied MinMSE
+        # candidate)
+        exact_session=(
+            method == "minmse_pof2" if exact_session is None else exact_session
+        ),
     )
     if method in ("minmax", "minmax_mean") and range_symmetric:
         out = dict(stats.mean_observed if method == "minmax_mean" else stats.observed)

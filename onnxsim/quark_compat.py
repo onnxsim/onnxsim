@@ -497,6 +497,13 @@ def _calibration_args(
     return method, kw
 
 
+def _exact(options: Dict[str, Any]) -> Dict[str, Any]:
+    """``options`` with the calibration session run unoptimized, as Quark's
+    calibrators run it (ONNX Runtime's fusions change the order of float
+    operations, enough to move a value across a histogram bin edge)."""
+    return {"exact_session": True, **options}
+
+
 def _spec(
     name: str,
     dtype: str,
@@ -1866,7 +1873,7 @@ class ModelQuantizer:
             metric_output_index=p.get("metric_output_index", 0),
             data_size=data_size,
             method=cal_method,
-            calibrate_options=cal_options,
+            calibrate_options=_exact(cal_options),
         )
         self.last_auto_mixprecision = res
         return res.model
@@ -2063,7 +2070,7 @@ class ModelQuantizer:
             exclude_nodes=exclude,
             skip_nodes=skip_nodes,
             method=cal_method,
-            calibrate_options=cal_options,
+            calibrate_options=_exact(cal_options),
             symmetric_activations=act_sym,
             power_of_two=act.pof2 or wt.pof2,
             per_channel=per_channel,

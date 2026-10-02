@@ -85,6 +85,8 @@ _SIMULATE_DEFAULTS = {
     "ConvertHardSigmoidToDPUVersion": True,
     "ConvertAvgPoolToDPUVersion": True,
     "ConvertReduceMeanToDPUVersion": True,
+    "ConvertSoftmaxToDPUVersion": False,
+    "ConvertInstanceNormToDPUVersion": False,
     "ConvertClipToDPUVersion": False,
 }
 
@@ -510,6 +512,110 @@ def _float_source(producers: Dict[str, onnx.NodeProto], tensor: str) -> str:
     return tensor
 
 
+def softmax_dpu_nodes(node: onnx.NodeProto, opset: int) -> List[onnx.NodeProto]:
+    """The nodes Quark's ``SimulateDPUSoftmax`` replaces a ``Softmax`` with: an
+    exponential from a degree-3 polynomial around ``x - floor(x / ln 2) * ln 2``
+    scaled by ``2 ** floor(x / ln 2)``, the sum over the softmax axis and a
+    division, every step in bfloat16 as the DPU does (Newton-Raphson reciprocal
+    left out, as there). ``[]`` below opset 7."""
+    if opset < 7:
+        return []
+    axis = -1
+    for a in node.attribute:
+        if a.name == "axis":
+            axis = a.i
+    sm = node.name
+    bf16, f32 = TensorProto.BFLOAT16, TensorProto.FLOAT
+    out: List[onnx.NodeProto] = []
+
+    def const(name: str, dtype: int, dims: List[int], vals: List[Any]) -> str:
+        out.append(
+            helper.make_node(
+                "Constant",
+                [],
+                [name + "_output"],
+                name=name,
+                value=helper.make_tensor(name + "_value", dtype, dims, vals),
+            )
+        )
+        return name
+
+    def op(op_type: str, name: str, ins: Sequence[str], **attrs: Any) -> str:
+        out.append(
+            helper.make_node(
+                op_type, [i + "_output" for i in ins], [name + "_output"], name=name, **attrs
+            )
+        )
+        return name
+
+    # exp by polynomial approximation
+    ns = sm + "/exp_poly"
+    out.append(
+        helper.make_node(
+            "Cast", [node.input[0]], [ns + "/round/cast_output"], name=ns + "/round/cast", to=bf16
+        )
+    )
+    cast0 = ns + "/round/cast"
+    rcp = const(ns + "/round/rcp_ln2", bf16, [], [1.4426950408889634])
+    mul0 = op("Mul", ns + "/round/mul", [cast0, rcp])
+    rnd = op("Floor", ns + "/round/round", [mul0])
+    ln2 = const(ns + "/modulo/ln2", bf16, [], [0.6931471805599453])
+    mul1 = op("Mul", ns + "/modulo/mul", [rnd, ln2])
+    sub1 = op("Sub", ns + "/modulo/sub", [cast0, mul1])
+    pa = ns + "/poly_approx"
+    c1 = op("Cast", pa + "/cast_1", [sub1], to=f32)
+    a3 = const(pa + "/alpha_3", bf16, [], [0.21875])
+    c2 = op("Cast", pa + "/cast_2", [a3], to=f32)
+    m2 = op("Mul", pa + "/mul_2", [c1, c2])
+    a2 = const(pa + "/alpha_2", bf16, [], [0.486328125])
+    c3 = op("Cast", pa + "/cast_3", [a2], to=f32)
+    ad0 = op("Add", pa + "/add", [m2, c3])
+    c4 = op("Cast", pa + "/cast_4", [ad0], to=bf16)
+    c5 = op("Cast", pa + "/cast_5", [c4], to=f32)
+    m3 = op("Mul", pa + "/mul_3", [c1, c5])
+    a1 = const(pa + "/alpha_1", bf16, [], [1.0])
+    c6 = op("Cast", pa + "/cast_6", [a1], to=f32)
+    ad1 = op("Add", pa + "/add_1", [m3, c6])
+    c7 = op("Cast", pa + "/cast_7", [ad1], to=bf16)
+    c8 = op("Cast", pa + "/cast_8", [c7], to=f32)
+    m4 = op("Mul", pa + "/mul_4", [c1, c8])
+    a0 = const(pa + "/alpha_0", bf16, [], [1.0])
+    c9 = op("Cast", pa + "/cast_9", [a0], to=f32)
+    ad2 = op("Add", pa + "/add_2", [m4, c9])
+    c10 = op("Cast", pa + "/cast_10", [ad2], to=bf16)
+    px = const(ns + "/pow/pow/x", bf16, [], [2.0])
+    pw = op("Pow", ns + "/pow/pow", [px, rnd])
+    exp_x = op("Mul", ns + "/exp_x", [pw, c10])
+    # the sum over the axis, in bfloat16
+    es = sm + "/exp_sum"
+    if opset <= 12:
+        sm_sum = op(
+            "ReduceSum", es + "/sum", [exp_x], axes=[axis], keepdims=1
+        )
+    else:
+        ax = const(es + "/sum/reduction_indices", TensorProto.INT64, [1], [axis])
+        sm_sum = op("ReduceSum", es + "/sum", [exp_x, ax], keepdims=1)
+    total = op("Cast", es + "/cast_reduce_sum_out_16", [sm_sum], to=bf16)
+    div = op("Div", sm + "/div", [exp_x, total])
+    out.append(
+        helper.make_node(
+            "Cast",
+            [div + "_output"],
+            [node.output[0]],
+            name=sm + "/output_cast",
+            to=f32,
+        )
+    )
+    return out
+
+
+def _softmax_opset(model: onnx.ModelProto) -> int:
+    for o in model.opset_import:
+        if o.domain in ("", "ai.onnx"):
+            return int(o.version)
+    return 0
+
+
 def simulate_dpu(
     model: onnx.ModelProto,
     should_simulate: Callable[[onnx.NodeProto], bool],
@@ -606,6 +712,34 @@ def simulate_dpu(
                     rec *= shape[a]
                 if rec > 0:
                     _insert_mul(g, n, reciprocal_dpu_scale(rec))
+    if on("ConvertSoftmaxToDPUVersion"):
+        opset = _softmax_opset(model)
+        for n in [n for n in g.node if n.op_type == "Softmax" and should_simulate(n)]:
+            replacement = softmax_dpu_nodes(n, opset)
+            if replacement:
+                g.node.remove(n)
+                g.node.extend(replacement)
+    if on("ConvertInstanceNormToDPUVersion"):
+        todo = [n for n in g.node if n.op_type == "InstanceNormalization"]
+        new_nodes = []
+        for n in todo:
+            if not should_simulate(n):
+                continue
+            eps = next((a.f for a in n.attribute if a.name == "epsilon"), 1e-5)
+            new_nodes.append(
+                helper.make_node(
+                    "ExtendedInstanceNormalization",
+                    list(n.input),
+                    list(n.output),
+                    name=n.name,
+                    domain="com.amd.quark",
+                    epsilon=eps,
+                )
+            )
+            g.node.remove(n)
+        g.node.extend(new_nodes)
+        if new_nodes and not any(o.domain == "com.amd.quark" for o in model.opset_import):
+            model.opset_import.append(helper.make_opsetid("com.amd.quark", 1))
     if on("ConvertClipToDPUVersion"):
         inits = {t.name: t for t in g.initializer}
         for n in g.node:
@@ -683,4 +817,5 @@ __all__: Any = [
     "reciprocal_dpu_scale",
     "scale2pos",
     "simulate_dpu",
+    "softmax_dpu_nodes",
 ]

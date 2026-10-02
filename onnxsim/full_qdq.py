@@ -1076,7 +1076,10 @@ def quantize_full_qdq(
                     cache[key] = out
                 n.input[k] = cache[key]
             elif (
-                n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                (
+                    n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                    or (n.op_type == "InstanceNormalization" and int8_constants)
+                )
                 and k == 2
                 and w.ndim == 1
                 and int8_bias
