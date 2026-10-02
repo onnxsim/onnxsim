@@ -46,20 +46,42 @@ candidates on that many threads; ``no_input_qdq_shared`` keeps nodes whose
 input activation is read by several nodes out of the mixing step.
 
 **Scope.** What a candidate moves is a :class:`TargetSpec`, read from Quark's
-``QLayerConfig``: the activation inputs / outputs (integer types
-:func:`quantize_full_qdq` supports), the constant weight and the constant bias.
-Activations are re-quantized with the per-tensor dtype override of
-:func:`quantize_full_qdq` (exact against Quark's in-place edit); weights and
-biases are then edited the way Quark's ``MixingStrategy`` does, by
-:func:`apply_layer_mixing` -- weights re-quantized per tensor from their
-already quantized values, int32 bias scales refreshed to ``input_scale *
-weight_scale`` with truncated codes, nodes that do not move keep the baseline's
-bias. Candidates are scored with ONNX Runtime's graph optimizations off (as
-Quark does -- it fuses QDQ into integer kernels otherwise). ``dual_quant_nodes``
+``QLayerConfig``: the activation inputs / outputs, the constant weight and the
+constant bias, each at a precision of any kind -- an integer type (a
+power-of-two scale included), ``float16`` / ``bfloat16``, or a BFP / MX block
+format. As in Quark, the candidate is not re-quantized: the *quantized
+baseline* is edited in place by :class:`onnxsim.quark_mixing.QuarkMixer` (a
+port of ``MixingStrategy``: new scales and zero points from the calibrated
+range, the float / dequantized constant, or Quark's fake ``[0, 1]`` range for
+float / block baselines; a Q/DQ pair swapped for a ``BFPQuantizeDequantize`` /
+``MXQuantizeDequantize`` node and back; int32 bias scales refreshed to
+``input_scale * weight_scale`` with truncated codes), which is what makes the
+result bit-identical to Quark's whichever way the precisions go.
+:func:`auto_mixprecision_from_baseline` runs the same flow on a baseline that
+is not integer QDQ (``float16`` / ``bfloat16`` / BFP / MX fake-quantized
+models from :mod:`onnxsim.quark_fakequant_graph`). The baseline is shaped like
+Quark's where the mixing step can tell: an unpromoted layer keeps its
+per-tensor int32 bias scale as a one-element vector, and the output quantizer
+of a pass-through op (``Transpose``, ``Reshape``, ``MaxPool``, ``Split``, ...)
+reads the *same* scale / zero point initializers as the quantizer behind its
+input, so ``shared_param_mode`` (``"propagate"``: the partner quantizer follows
+the promoted one; ``"unshare"``: the promoted pair gets its own copy) behaves
+as in Quark. Candidates are scored with ONNX Runtime's graph optimizations off
+(as Quark does -- it fuses QDQ into integer kernels otherwise); models with
+``com.amd.quark`` custom ops run on
+:func:`onnxsim.quark_fakequant_eval.run_fake_quantized`. ``dual_quant_nodes``
 adds a converting Q/DQ pair in front of every consumer whose precision differs
 from the tensor's (Quark's boundary insertion, but with onnxsim's own scale /
-zero point for the pair); ``shared_param_mode`` has no meaning here (every
-tensor has its own scale / zero point initializers).
+zero point for the pair); it needs a re-quantization of the tensors, so it is
+integer-only (:func:`apply_layer_mixing` is that path's weight / bias
+editing).
+
+**Sensitivity cache.** ``cache_file`` is Quark's JSON. Through
+``quark_compat`` it is written under Quark's own key (a digest of the quantized
+baseline's graph, the target config and the layer filters, see
+:mod:`onnxsim.quark_amp_cache`), so Quark reads a ranking onnxsim wrote and
+onnxsim reads one Quark wrote; called directly (``cache_key_fn=None``) the
+key is this module's own fingerprint.
 
 :func:`auto_mixprecision_blocks` is the same flow for a bfloat16 model whose
 candidates move to a block format (``BF16_MIXED_BFP16`` / ``_MXINT8``).
@@ -386,6 +408,25 @@ def _node_tensors(model: onnx.ModelProto) -> Dict[str, Tuple[List[str], List[str
     return out
 
 
+def _name_unnamed_nodes(model: onnx.ModelProto) -> onnx.ModelProto:
+    """``model`` with every unnamed node named after its first output (its
+    candidate key): the in-place edits find a candidate in the quantized
+    baseline by name, and the quantizer keeps node names."""
+    if all(n.name for n in model.graph.node):
+        return model
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    taken = {n.name for n in m.graph.node if n.name}
+    for n in m.graph.node:
+        if not n.name and n.output:
+            name = n.output[0]
+            while name in taken:
+                name += "_"
+            n.name = name
+            taken.add(name)
+    return m
+
+
 def _candidate_nodes(
     model: onnx.ModelProto,
     target_op_types: Sequence[str],
@@ -465,15 +506,18 @@ def save_sensitivity(
 
 def load_sensitivity(
     path: Union[str, Path],
-    key: str,
+    key: Union[str, Sequence[str]],
     node_tensors: Dict[str, Tuple[List[str], List[str]]],
 ) -> Optional[List[SensitivityResult]]:
     """Read a cache written by :func:`save_sensitivity` (or by Quark); ``None``
-    -- with a warning -- when its fingerprint is not ``key``. A Quark-written
-    file therefore never matches (the fingerprint covers the quantized graph
-    layout) and is recomputed."""
+    -- with a warning -- when its fingerprint is not ``key`` (or one of the
+    ``key`` strings). Quark's own key (see :mod:`onnxsim.quark_amp_cache`) is
+    among those the ``quark_compat`` flows pass, so a ranking Quark wrote for
+    the same quantized baseline and configuration is read instead of
+    recomputed."""
     payload = json.loads(Path(path).read_text())
-    if payload.get("cache_key") != key:
+    keys = [key] if isinstance(key, str) else list(key)
+    if payload.get("cache_key") not in keys:
         warnings.warn(
             f"sensitivity cache {path} is stale (model or configuration "
             "changed); recomputing",
@@ -548,6 +592,241 @@ def _requantize_constant(
     zp_np = np.asarray(zp, dtype=np_dt).reshape(())
     codes = np.clip(np.round(values / scale_np + zp_np), qmin, qmax).astype(np_dt)
     return codes, scale_np, zp_np
+
+
+def _check_target(spec: TargetSpec) -> None:
+    """Refuse precisions neither the integer re-quantization nor
+    :class:`onnxsim.quark_mixing.QuarkMixer` knows."""
+    from onnxsim import quark_mixing as qm
+
+    for prec in (spec.inputs, spec.outputs, spec.weight, spec.bias):
+        if prec is None:
+            continue
+        try:
+            kind = qm.kind_of(prec[0])
+        except ValueError:
+            kind = ""
+        if kind == "" or (kind == "int" and prec[0] not in _NP_DTYPES):
+            raise ValueError(
+                f"dtypes must be {tuple(_NP_DTYPES)}, float16 / bfloat16 or a "
+                f"block format (bfp16, mx4/6/9, mxint8, mxfp*), got {prec[0]!r}"
+            )
+
+
+def _needs_mixer(spec: TargetSpec) -> bool:
+    """Whether a target is outside what re-quantizing with another integer
+    dtype does: a half / block precision, or a power-of-two scale."""
+    from onnxsim import quark_mixing as qm
+
+    for prec in (spec.inputs, spec.outputs, spec.weight, spec.bias):
+        if prec is None:
+            continue
+        if qm.kind_of(prec[0]) != "int" or qm.unpack(prec)[2]:
+            return True
+    return False
+
+
+def _resolve_symmetry(spec: TargetSpec, act: bool, wt: bool) -> TargetSpec:
+    """``spec`` with every ``symmetric=None`` replaced (``act`` for the
+    activation slots, ``wt`` for weight and bias)."""
+
+    def fix(prec: Optional[Precision], default: bool) -> Optional[Precision]:
+        if prec is None or prec[1] is not None:
+            return prec
+        return (prec[0], default, *prec[2:])
+
+    return TargetSpec(
+        inputs=fix(spec.inputs, act),
+        outputs=fix(spec.outputs, act),
+        weight=fix(spec.weight, wt),
+        bias=fix(spec.bias, wt),
+    )
+
+
+def _range_lookup(ranges: Mapping[str, Tuple[float, float]]):
+    """``f(float tensor name) -> range``: the quantizer's float tensor is the
+    calibrated tensor's ``<name>/f`` copy."""
+
+    def lookup(name: str):
+        r = ranges.get(name)
+        if r is None and name.endswith("/f"):
+            r = ranges.get(name[:-2])
+        return r
+
+    return lookup
+
+
+_BIAS_NODES = ("Conv", "ConvTranspose", "Gemm")
+
+#: ops whose output quantizer ONNX Runtime's QDQ quantizer (hence Quark's
+#: baseline) points at the scale / zero point initializers of the quantizer
+#: behind their input (probed; ``AveragePool`` joins them for the plain
+#: quantizer, see ``_activation_rules``'s ``shared_ops``)
+_QDQ_SHARING_OPS = frozenset(
+    {
+        "Reshape",
+        "Transpose",
+        "Squeeze",
+        "Unsqueeze",
+        "Split",
+        "Resize",
+        "Gather",
+        "MaxPool",
+    }
+)
+
+
+def _normalize_bias_params(
+    model: onnx.ModelProto, wide: bool = False
+) -> onnx.ModelProto:
+    """Quark stores a per-tensor int32 bias scale as a one-element vector and
+    its zero point as a scalar (the layers AutoMixprecision does not touch keep
+    that); a per-channel one stays a vector. With 16-bit activations or weights
+    (``wide``, opset below 21) its int32 bias dequantizer is the
+    ``com.microsoft`` one. Edits ``model`` in place."""
+    inits = {t.name: t for t in model.graph.initializer}
+    prod = {o: n for n in model.graph.node for o in n.output}
+    for n in model.graph.node:
+        if n.op_type not in _BIAS_NODES or len(n.input) < 3 or not n.input[2]:
+            continue
+        bdq, wdq = prod.get(n.input[2]), prod.get(n.input[1])
+        if (
+            bdq is None
+            or wdq is None
+            or "DequantizeLinear"
+            not in (
+                bdq.op_type,
+                wdq.op_type,
+            )
+        ):
+            continue
+        if bdq.op_type != "DequantizeLinear" or wdq.op_type != "DequantizeLinear":
+            continue
+        if len(bdq.input) < 3 or bdq.input[0] not in inits:
+            continue
+        if _dtype_name_of(inits, bdq.input[2]) != "int32":
+            continue
+        if wide:
+            bdq.domain = "com.microsoft"
+        if wdq.input[1] not in inits or inits[wdq.input[1]].dims not in ([], [1]):
+            continue
+        scale = numpy_helper.to_array(inits[bdq.input[1]])
+        zp = numpy_helper.to_array(inits[bdq.input[2]])
+        if scale.size < 1 or not np.all(scale == scale.reshape(-1)[0]):
+            continue
+        if not np.all(zp == zp.reshape(-1)[0]):
+            continue
+        inits[bdq.input[1]].CopyFrom(
+            numpy_helper.from_array(scale.reshape(-1)[:1].copy(), bdq.input[1])
+        )
+        inits[bdq.input[2]].CopyFrom(
+            numpy_helper.from_array(zp.reshape(-1)[0].copy(), bdq.input[2])
+        )
+    if wide and not any(o.domain == "com.microsoft" for o in model.opset_import):
+        model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def _share_qparams(model: onnx.ModelProto, ops: Sequence[str]) -> onnx.ModelProto:
+    """Make the output quantizer of a pass-through op (``Transpose``,
+    ``Reshape``, ``MaxPool``, ...) read the scale / zero point *initializers* of
+    the quantizer behind its input, as ONNX Runtime's QDQ quantizer (hence
+    Quark's baseline) does: the quantizers then share them, which is what
+    ``shared_param_mode`` of the mixing step is about. Only quantizers whose
+    parameters are already equal are rewired. Edits ``model`` in place."""
+    inits = {t.name: t for t in model.graph.initializer}
+    prod = {o: n for n in model.graph.node for o in n.output}
+    cons: Dict[str, List[onnx.NodeProto]] = {}
+    for n in model.graph.node:
+        for x in n.input:
+            cons.setdefault(x, []).append(n)
+
+    def pair_behind(tensor: str):
+        dq = prod.get(tensor)
+        if dq is None or dq.op_type != "DequantizeLinear" or len(dq.input) < 3:
+            return None
+        q = prod.get(dq.input[0])
+        if q is None or q.op_type != "QuantizeLinear" or len(q.input) < 3:
+            return None
+        return q, dq
+
+    def same(a: str, b: str) -> bool:
+        ta, tb = inits.get(a), inits.get(b)
+        return (
+            ta is not None
+            and tb is not None
+            and ta.data_type == tb.data_type
+            and numpy_helper.to_array(ta).shape == numpy_helper.to_array(tb).shape
+            and bool(np.all(numpy_helper.to_array(ta) == numpy_helper.to_array(tb)))
+        )
+
+    for n in model.graph.node:
+        if n.op_type not in ops or not n.input or not n.input[0]:
+            continue
+        src = pair_behind(n.input[0])
+        if src is None:
+            continue
+        q_a = src[0]
+        for o in n.output:
+            users = cons.get(o, [])
+            if len(users) != 1 or users[0].op_type != "QuantizeLinear":
+                continue
+            q_o = users[0]
+            dqs = cons.get(q_o.output[0], [])
+            if (
+                len(dqs) != 1
+                or dqs[0].op_type != "DequantizeLinear"
+                or len(q_o.input) < 3
+            ):
+                continue
+            dq_o = dqs[0]
+            if len(dq_o.input) < 3 or q_o.input[1:3] != dq_o.input[1:3]:
+                continue
+            if not (
+                same(q_o.input[1], q_a.input[1]) and same(q_o.input[2], q_a.input[2])
+            ):
+                continue
+            for node in (q_o, dq_o):
+                node.input[1], node.input[2] = q_a.input[1], q_a.input[2]
+    used = {x for n in model.graph.node for x in n.input}
+    keep = [t for t in model.graph.initializer if t.name in used]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(keep)
+    return model
+
+
+def _has_custom_ops(model: onnx.ModelProto) -> bool:
+    return any(n.domain == "com.amd.quark" for n in model.graph.node)
+
+
+def _make_runner(
+    eval_data: Sequence[Dict[str, np.ndarray]],
+    metric_output_index: Optional[int],
+    providers: Sequence[str],
+) -> Callable[[onnx.ModelProto], Outputs]:
+    """``run(model) -> outputs[batch][output]`` the way Quark scores a model:
+    ONNX Runtime with every graph optimization off (it otherwise fuses QDQ
+    into integer kernels, which changes a quantized model's numerics); a model
+    with ``com.amd.quark`` custom ops runs on
+    :func:`onnxsim.quark_fakequant_eval.run_fake_quantized` (the same ONNX
+    Runtime kernels, with Quark's ops evaluated bit-exactly in numpy)."""
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+
+    def pick(outs: List[np.ndarray]) -> List[np.ndarray]:
+        return [outs[metric_output_index]] if metric_output_index is not None else outs
+
+    def run(m: onnx.ModelProto) -> Outputs:
+        if _has_custom_ops(m):
+            from onnxsim.quark_fakequant_eval import run_fake_quantized
+
+            return [pick(o) for o in run_fake_quantized(m, eval_data)]
+        sess = ort.InferenceSession(m.SerializeToString(), so, providers=providers)
+        return [pick(sess.run(None, batch)) for batch in eval_data]
+
+    return run
 
 
 def apply_layer_mixing(
@@ -729,6 +1008,8 @@ def auto_mixprecision(
     quantize_kwargs: Optional[Dict[str, Any]] = None,
     calibrate_options: Optional[Dict[str, Any]] = None,
     post_quantize: Optional[Callable[[onnx.ModelProto], onnx.ModelProto]] = None,
+    shared_param_mode: str = "propagate",
+    cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
 ) -> AutoMixprecisionResult:
     """Mixed-precision quantization of ``model`` (see the module docstring).
 
@@ -766,7 +1047,16 @@ def auto_mixprecision(
             scoring (``0`` = all)
     :param post_quantize: applied to every :func:`quantize_full_qdq` result
             (baseline and trials) before mixing, e.g. a bias re-quantization
+    :param shared_param_mode: Quark's ``"propagate"`` / ``"unshare"`` for the
+            scale / zero point initializers a promoted Q/DQ pair shares with
+            other nodes
+    :param cache_key_fn: ``f(baseline model) -> str``, the key a
+            ``cache_file`` is written under and also read with (besides this
+            module's own fingerprint) -- Quark's, from
+            :func:`onnxsim.quark_amp_cache.quark_cache_key`
     """
+    if shared_param_mode not in ("propagate", "unshare"):
+        raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
     if targets is None:
         if target_dtype is None:
             raise ValueError("target_dtype or targets is required")
@@ -780,20 +1070,13 @@ def auto_mixprecision(
         raise ValueError(f"dtypes must be in {_DTYPES}")
     pinned: Dict[str, Target] = dict(candidate_targets or {})
     for t in [*targets, *pinned.values()]:
-        spec = as_target_spec(t)
-        for prec in (spec.inputs, spec.outputs):
-            if prec is not None and prec[0] not in _DTYPES:
-                raise ValueError(f"dtypes must be in {_DTYPES}")
-        for prec in (spec.weight, spec.bias):
-            if prec is not None and prec[0] not in _NP_DTYPES:
-                raise ValueError(f"dtypes must be in {tuple(_NP_DTYPES)}")
+        _check_target(as_target_spec(t))
     if optimize not in ("speed", "quality"):
         raise ValueError("optimize must be 'speed' or 'quality'")
     if not calibration_data:
         raise ValueError("calibration_data is required")
     metric_fn = resolve_metric(metric, metric_distance_fn, metric_evaluate_fn)
-
-    import onnxruntime as ort
+    model = _name_unnamed_nodes(model)
 
     from onnxsim.calibration import calibrate
     from onnxsim.full_qdq import quantize_full_qdq
@@ -801,21 +1084,7 @@ def auto_mixprecision(
     prov = list(providers) if providers else ["CPUExecutionProvider"]
     eval_data = list(calibration_data)[: data_size or None]
 
-    # Quark scores with every graph optimization off: ORT otherwise fuses QDQ
-    # into integer kernels, which changes a quantized model's numerics (and with
-    # it near-tied rankings)
-    so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-
-    def run(m: onnx.ModelProto) -> Outputs:
-        sess = ort.InferenceSession(m.SerializeToString(), so, providers=prov)
-        res: Outputs = []
-        for batch in eval_data:
-            outs = sess.run(None, batch)
-            res.append(
-                [outs[metric_output_index]] if metric_output_index is not None else outs
-            )
-        return res
+    run = _make_runner(eval_data, metric_output_index, prov)
 
     float_out = run(model)
 
@@ -886,11 +1155,46 @@ def auto_mixprecision(
         for k, (ins, outs) in node_tensors.items()
     }
 
+    opset = next(
+        (o.version for o in baseline_model.opset_import if o.domain in ("", "ai.onnx")),
+        0,
+    )
+    baseline_model = _normalize_bias_params(
+        baseline_model,
+        wide=opset < 21
+        and (base_dtype in _WIDE or base_kw.get("weight_dtype") in _WIDE),
+    )
+    baseline_model = _share_qparams(
+        baseline_model,
+        sorted(_QDQ_SHARING_OPS | set(base_kw.get("shared_ops", ()))),
+    )
+    act_sym = base_kw.get("symmetric_activations")
+    if act_sym is None:
+        act_sym = not base_dtype.startswith("u")
+    wt_sym = bool(base_kw.get("weight_symmetric", True))
+    range_of = _range_lookup(ranges)
+
     def quantize(moved: Dict[str, TargetSpec]) -> onnx.ModelProto:
-        q = quantize_acts(moved) if moved else baseline_model
-        return (
-            apply_layer_mixing(q, baseline_model, list(moved.items())) if moved else q
-        )
+        if not moved:
+            return baseline_model
+        needs = any(_needs_mixer(s) for s in moved.values())
+        if needs and dual_quant_nodes:
+            raise NotImplementedError(
+                "dual_quant_nodes is not supported for half / block / "
+                "power-of-two targets"
+            )
+        if not dual_quant_nodes:
+            # Quark edits the quantized baseline in place (no re-quantization),
+            # which is what the mixer does; boundary pairs of dual_quant_nodes
+            # need a re-quantization of the tensors instead
+            from onnxsim.quark_mixing import QuarkMixer
+
+            mixer = QuarkMixer(baseline_model, range_of, shared_param_mode)
+            for node, spec in moved.items():
+                mixer.promote_node(node, _resolve_symmetry(spec, act_sym, wt_sym))
+            return mixer.result()
+        q = quantize_acts(moved)
+        return apply_layer_mixing(q, baseline_model, list(moved.items()))
 
     def score_of(moved: Dict[str, TargetSpec]):
         q = quantize(moved)
@@ -912,6 +1216,7 @@ def auto_mixprecision(
         no_input_qdq_shared=no_input_qdq_shared,
         metric_threshold=metric_threshold,
         optimize=optimize,
+        cache_key_fn=cache_key_fn,
     )
 
 
@@ -932,6 +1237,7 @@ def _search(
     no_input_qdq_shared: bool,
     metric_threshold: Optional[float],
     optimize: str,
+    cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
 ) -> AutoMixprecisionResult:
     """Quark's AMP driver over ``score_of(moved) -> (model, score)``:
     baseline score, the threshold pre-check, the (cached) sensitivity ranking,
@@ -977,9 +1283,15 @@ def _search(
         exclude_layers,
         subgraphs,
     )
+    # ``cache_key_fn(baseline)`` is Quark's own key for the quantized baseline:
+    # a cache is written with it (so Quark reads it) and read under it or under
+    # this module's fingerprint
+    quark_key = cache_key_fn(baseline) if cache_key_fn is not None else None
+    write_key = quark_key or key
+    accepted = [k for k in (quark_key, key) if k]
     ranked: Optional[List[SensitivityResult]] = None
     if cache_file is not None and Path(cache_file).exists():
-        ranked = load_sensitivity(cache_file, key, node_tensors)
+        ranked = load_sensitivity(cache_file, accepted, node_tensors)
     if ranked is None:
 
         def score_group(item: Tuple[str, List[str]]) -> SensitivityResult:
@@ -1005,7 +1317,7 @@ def _search(
             scored = [score_group(g) for g in groups]
         ranked = sorted(scored, key=lambda c: c.score)
         if cache_file is not None:
-            save_sensitivity(ranked, cache_file, key)
+            save_sensitivity(ranked, cache_file, write_key)
     result.ranked = ranked
 
     if metric_threshold is None or not result.ranked:
@@ -1059,6 +1371,7 @@ def auto_mixprecision_blocks(
     worker_num: int = 1,
     no_input_qdq_shared: bool = False,
     dual_quant_nodes: bool = True,
+    cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
 ) -> AutoMixprecisionResult:
     """Quark's AutoMixprecision for a bfloat16 model whose candidates move to a
     block format (``BF16_MIXED_BFP16`` / ``BF16_MIXED_MXINT8``): the same
@@ -1133,10 +1446,114 @@ def auto_mixprecision_blocks(
         no_input_qdq_shared=no_input_qdq_shared,
         metric_threshold=metric_threshold,
         optimize=optimize,
+        cache_key_fn=cache_key_fn,
     )
     if result.moved_nodes:
         result.model = build(result.moved_nodes, dual_quant_nodes)
     return result
+
+
+def auto_mixprecision_from_baseline(
+    model: onnx.ModelProto,
+    calibration_data: Sequence[Dict[str, np.ndarray]],
+    baseline: onnx.ModelProto,
+    targets: Sequence[Target],
+    candidate_targets: Optional[Mapping[str, Target]] = None,
+    ranges: Optional[Mapping[str, Tuple[float, float]]] = None,
+    base_label: str = "baseline",
+    target_op_types: Sequence[str] = ("Conv", "ConvTranspose", "Gemm", "MatMul"),
+    include_layers: Sequence[str] = (),
+    exclude_layers: Sequence[str] = (),
+    metric: str = "l2",
+    metric_distance_fn: Optional[MetricFn] = None,
+    metric_evaluate_fn: Optional[Callable[[Outputs], float]] = None,
+    metric_threshold: Optional[float] = 0.0,
+    optimize: str = "speed",
+    metric_output_index: Optional[int] = 0,
+    data_size: int = 0,
+    subgraphs: Optional[Sequence[Tuple[str, Sequence[str]]]] = None,
+    cache_file: Optional[Union[str, Path]] = None,
+    worker_num: int = 1,
+    no_input_qdq_shared: bool = False,
+    activation_symmetric: bool = True,
+    weight_symmetric: bool = True,
+    shared_param_mode: str = "propagate",
+    cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
+) -> AutoMixprecisionResult:
+    """Quark's AutoMixprecision over a *given* quantized baseline of any kind --
+    a ``float16`` / ``bfloat16`` / BFP / MX fake-quantized model (see
+    :mod:`onnxsim.quark_fakequant_graph`) or an integer QDQ one -- with targets
+    of any kind (:class:`TargetSpec` entries): the same ranking and greedy
+    mixing as :func:`auto_mixprecision`, the edits those of
+    :class:`onnxsim.quark_mixing.QuarkMixer` on ``baseline``.
+
+    :param model: the float model (its outputs are the reference)
+    :param baseline: the quantized model to promote candidates in; its node
+            names must be those of ``model``
+    :param ranges: calibrated ranges of the activations; ``None`` is Quark's
+            fake calibration ``[0, 1]`` of every tensor, which it uses (instead
+            of calibrating) whenever the baseline is a float / block format
+    :param base_label: names the baseline in the cache fingerprint
+    :param activation_symmetric: Quark's ``ActivationSymmetric`` (the global
+            activation spec's symmetry, which wins over a target spec's own)
+    :param weight_symmetric: likewise ``WeightSymmetric``
+    """
+    from onnxsim.quark_mixing import QuarkMixer, fake_ranges
+
+    if optimize not in ("speed", "quality"):
+        raise ValueError("optimize must be 'speed' or 'quality'")
+    if shared_param_mode not in ("propagate", "unshare"):
+        raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
+    if not calibration_data:
+        raise ValueError("calibration_data is required")
+    targets = list(targets)
+    if not targets:
+        raise ValueError("targets must not be empty")
+    pinned: Dict[str, Target] = dict(candidate_targets or {})
+    for t in [*targets, *pinned.values()]:
+        _check_target(as_target_spec(t))
+    metric_fn = resolve_metric(metric, metric_distance_fn, metric_evaluate_fn)
+    eval_data = list(calibration_data)[: data_size or None]
+    run = _make_runner(eval_data, metric_output_index, ["CPUExecutionProvider"])
+    float_out = run(model)
+    range_of = (
+        _range_lookup(ranges)
+        if ranges is not None
+        else _range_lookup(fake_ranges(model))
+    )
+
+    def score_of(moved: Dict[str, TargetSpec]):
+        if not moved:
+            return baseline, metric_fn(float_out, run(baseline))
+        mixer = QuarkMixer(baseline, range_of, shared_param_mode)
+        for node, spec in moved.items():
+            mixer.promote_node(
+                node, _resolve_symmetry(spec, activation_symmetric, weight_symmetric)
+            )
+        q = mixer.result()
+        return q, metric_fn(float_out, run(q))
+
+    node_tensors: Dict[str, Tuple[List[str], List[str]]] = {
+        _node_key(n): ([], []) for n in model.graph.node
+    }
+    return _search(
+        model,
+        base_label,
+        targets,
+        pinned,
+        score_of,
+        node_tensors,
+        target_op_types=tuple(target_op_types),
+        include_layers=include_layers,
+        exclude_layers=exclude_layers,
+        subgraphs=subgraphs,
+        cache_file=cache_file,
+        worker_num=worker_num,
+        no_input_qdq_shared=no_input_qdq_shared,
+        metric_threshold=metric_threshold,
+        optimize=optimize,
+        cache_key_fn=cache_key_fn,
+    )
 
 
 def _shared_inputs(model: onnx.ModelProto) -> Set[str]:
@@ -1161,6 +1578,7 @@ __all__: Any = [
     "SubgraphSpec",
     "auto_mixprecision",
     "auto_mixprecision_blocks",
+    "auto_mixprecision_from_baseline",
     "apply_layer_mixing",
     "TargetSpec",
     "cosine_metric",

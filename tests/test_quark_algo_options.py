@@ -531,9 +531,7 @@ def test_amp_pinned_targets_apply_to_the_named_candidates_only():
     assert dts["t1"] == dts["h2"] == {"INT16"}  # n2's input and output
     assert dts["h1"] == {"UINT16"}
     with pytest.raises(ValueError, match="dtypes"):
-        _amp(
-            targets=[("uint16", None)], candidate_targets={"n0_Gemm": ("float16", None)}
-        )
+        _amp(targets=[("uint16", None)], candidate_targets={"n0_Gemm": ("int4", None)})
     with pytest.raises(ValueError, match="target_dtype or targets"):
         _amp()
 
