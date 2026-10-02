@@ -330,6 +330,10 @@ def predict_scales16(
     info: dict[str, Mapping] = {}
     for per_op in quant_json["tensor_configs"].values():
         for t, v in per_op.items():
+            # a BAKED tensor (a constant such as a gather mask) has its values
+            # quantized into the model: its scale cannot change
+            if v["state"] == "BAKED":
+                continue
             if t not in info or v["state"] != "OVERLAPPED":
                 info[t] = v
     group: dict[int, list[float]] = {}
@@ -404,3 +408,145 @@ def expand_model(src: Sequence[int], dst: Sequence[int]) -> onnx.ModelProto:
     )
     m.ir_version = 8
     return m
+
+
+def derive_ranges(
+    sub: onnx.ModelProto,
+    quant_json: str | Mapping,
+    scales: Mapping[str, tuple[float, float]],
+    measured: Mapping[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Ranges for every tensor of a chain when only some are measured.
+
+    ``scales`` are the template's ``(scale, zero point)`` per tensor, which give
+    the range each was calibrated on (symmetric: +-scale * 32767.5; unsigned:
+    ``-zp * scale .. (65535 - zp) * scale``). Tensors Pulsar2 groups into one
+    quantization (a Transpose, Slice or Reshape passes the same values on) share
+    their dominator's range, so **every member of a group with a measured tensor takes
+    that measured range**. A group with no measured member keeps its template range
+    scaled by how much the groups it depends on moved: a MatMul/Conv/Mul output by the
+    product of its inputs' factors, an Add/Sub output by the larger, any other op by
+    the larger of its inputs; a factor is the ratio of a measured group's extent
+    (max |x|) to its template extent."""
+    import json
+
+    if not isinstance(quant_json, Mapping):
+        with open(quant_json) as f:
+            quant_json = json.load(f)
+    dom: dict[str, int] = {}
+    sym: dict[str, bool] = {}
+    baked: set[str] = set()
+    for per_op in quant_json["tensor_configs"].values():
+        for t, v in per_op.items():
+            if v["state"] == "BAKED":
+                baked.add(t)
+            elif v["bit_width"] == 16 and (t not in dom or v["state"] != "OVERLAPPED"):
+                dom[t] = v["dominator"]
+                sym[t] = v["quant_min"] < 0
+    tmpl: dict[str, tuple[float, float]] = {}
+    for t, (sc, z) in scales.items():
+        if t in baked:
+            continue
+        tmpl[t] = (
+            (-sc * 32767.5, sc * 32767.5) if sym.get(t, z == 0) else (-z * sc, (65535 - z) * sc)
+        )
+    ext = lambda r: max(abs(r[0]), abs(r[1]))  # noqa: E731
+    group_range: dict[int, tuple[float, float]] = {}
+    for t, r in measured.items():
+        if t in dom:
+            g = group_range.setdefault(dom[t], tuple(r))
+            group_range[dom[t]] = (min(g[0], r[0]), max(g[1], r[1]))
+    # An average of values in [lo, hi] lies in [lo, hi]: a ReduceMean/pool output is
+    # bounded by its input's measured range (scaling the template range by the input's
+    # factor is wrong: a mean does not move like the maximum).
+    for node in sub.graph.node:
+        if node.op_type in ("ReduceMean", "GlobalAveragePool", "AveragePool") and node.output:
+            ri = group_range.get(dom.get(node.input[0]))
+            if ri is not None and node.output[0] in dom and dom[node.output[0]] not in group_range:
+                group_range[dom[node.output[0]]] = ri
+    # An Add's unmeasured input (a MatMul's output, before the bias) moves with the
+    # Add's measured output: its template range scaled by the output's factor. (An
+    # interval bound, out - bias, is safe but up to 1.9x too wide, which cost
+    # gradient cosine; across the forward Convs the scaled estimate is within
+    # 0.72-1.13 of the real extent, and the headroom covers the undershoot.)
+    for node in reversed(sub.graph.node):
+        if node.op_type != "Add" or len(node.input) != 2 or not node.output:
+            continue
+        y, a, b = node.output[0], node.input[0], node.input[1]
+        ry = group_range.get(dom.get(y))
+        if ry is None or y not in tmpl or ext(tmpl[y]) <= 0:
+            continue
+        fy = ext(ry) / ext(tmpl[y])
+        for u in (a, b):
+            if u in dom and u in tmpl and dom[u] not in group_range:
+                group_range[dom[u]] = (tmpl[u][0] * fy, tmpl[u][1] * fy)
+    f: dict[str, float] = {}
+    for t in tmpl:
+        g = dom.get(t)
+        if g in group_range and ext(tmpl[t]) > 0:
+            f[t] = ext(group_range[g]) / ext(tmpl[t])
+    mult_ops = {"MatMul", "Gemm", "Conv", "Mul"}
+    for node in sub.graph.node:
+        ins = [f[t] if t in f else 1.0 for t in node.input if t]
+        for o in node.output:
+            if o in f:
+                continue
+            f[o] = ins[0] * ins[1] if node.op_type in mult_ops and len(ins) >= 2 else max(ins or [1.0])
+    out: dict[str, tuple[float, float]] = {}
+    for t, r in tmpl.items():
+        g = dom.get(t)
+        if g in group_range:
+            out[t] = group_range[g]
+        else:
+            k = f.get(t, 1.0)
+            out[t] = (r[0] * k, r[1] * k)
+    return out
+
+
+def amax_model(numel: int) -> onnx.ModelProto:
+    """A model returning ``[[max, min]]`` of a float32 tensor of ``numel``
+    elements, input shape ``[numel]`` (bytes are bytes, so it reads any tensor of
+    that size). The NPU reduces only the last axis, so the tensor is reshaped to
+    ``[R, C]`` and reduced twice (``[R, 1]`` -> ``[1, R]`` -> ``[1, 1]``)."""
+    from onnx import TensorProto, helper, numpy_helper
+
+    c = next(d for d in range(min(numel, 4096), 0, -1) if numel % d == 0)
+    r = numel // c
+    init = [
+        numpy_helper.from_array(np.array([r, c], np.int64), "s2d"),
+        numpy_helper.from_array(np.array([1, r], np.int64), "s1r"),
+    ]
+    nodes = [
+        helper.make_node("Reshape", ["x", "s2d"], ["x2"], name="rs"),
+        helper.make_node("ReduceMax", ["x2"], ["mx"], name="mx", keepdims=1, axes=[1]),
+        helper.make_node("ReduceMin", ["x2"], ["mn"], name="mn", keepdims=1, axes=[1]),
+        helper.make_node("Reshape", ["mx", "s1r"], ["mxr"], name="r1"),
+        helper.make_node("Reshape", ["mn", "s1r"], ["mnr"], name="r2"),
+        helper.make_node("ReduceMax", ["mxr"], ["mx2"], name="mx2", keepdims=1, axes=[1]),
+        helper.make_node("ReduceMin", ["mnr"], ["mn2"], name="mn2", keepdims=1, axes=[1]),
+        helper.make_node("Concat", ["mx2", "mn2"], ["y"], name="cc", axis=1),
+    ]
+    m = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "amax",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [numel])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2])],
+            initializer=init,
+        ),
+        opset_imports=[helper.make_opsetid("", 13)],
+    )
+    m.ir_version = 8
+    return m
+
+
+def amax_blob(cache_dir: str, numel: int) -> bytes:
+    """The compiled amax model for ``numel`` elements (built once, cached)."""
+    return cached_chain_axmodel(
+        cache_dir,
+        os.path.join(cache_dir, "work"),
+        "amax",
+        amax_model(numel),
+        {"x": np.ones([numel], np.float32)},
+        "FP32",
+    )
