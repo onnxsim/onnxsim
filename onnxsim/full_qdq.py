@@ -430,6 +430,7 @@ def quantize_full_qdq(
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
     ort_gemm_beta: bool = False,
+    excluded_nodes_stay_float: bool = True,
     adjust_bias_scale: Optional[bool] = None,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
     calibrate_options: Optional[Dict[str, object]] = None,
@@ -519,6 +520,12 @@ def quantize_full_qdq(
             ``Gemm`` with a constant bias gets ``beta = 1`` and the beta moves into
             the int32 bias scale (``input scale * weight scale * beta``) -- the
             bias then stands for the original bias, not ``beta`` times it
+    :param excluded_nodes_stay_float: an explicitly excluded node whose data
+            inputs are all quantized and whose outputs would all be quantized
+            (it would form a QDQ unit and run quantized) stays float, its
+            consumers read the float value. ``False``: ONNX Runtime's (and
+            Quark's) behaviour, the quantizer only does not mark the node -- its
+            neighbours still put Q/DQ pairs around it
     :param adjust_bias_scale: Quark's ``adjust_bias_scale`` for the int32 biases:
             ``None`` -- run it after each round of the ``align_ops`` loop (if
             any); ``True`` -- also once without any alignment (its extended
@@ -633,7 +640,7 @@ def quantize_full_qdq(
     # its outputs unquantized; its consumers then read the float value (and run float too).
     # (A node merely outside ``op_types`` is left alone: sandwiched between quantized nodes it
     # runs quantized, which is what an op_types list asks for everywhere else.)
-    for n in g.node:
+    for n in g.node if excluded_nodes_stay_float else ():
         if id(n) in qnode_ids or not _is_quantized_node(
             n, op_types, set(), set(), skip_set
         ):
@@ -1045,6 +1052,31 @@ def quantize_full_qdq(
         if per_row and w.ndim >= 1 and w.shape[0] > 1:
             qm = w_range("int8")[1]
             rows = w.reshape(w.shape[0], -1)
+            if not weight_symmetric and not p2:
+                sz = [
+                    _weight_qparams(r.min(), r.max(), -qm - 1, qm, False) for r in rows
+                ]
+                s = np.array([a for a, _ in sz], np.float32)
+                z = np.array([b for _, b in sz], np.int8)
+                shape = (-1,) + (1,) * (w.ndim - 1)
+                q = np.clip(
+                    np.round(w / s.reshape(shape)) + z.reshape(shape), -qm, qm
+                ).astype(np.int8)
+                base = fresh(x)
+                add_init(base + "/int8", q)
+                add_init(base + "/scale", s)
+                add_init(base + "/zp", z)
+                out = base + "/dq"
+                act_nodes.append(
+                    helper.make_node(
+                        "DequantizeLinear",
+                        [base + "/int8", base + "/scale", base + "/zp"],
+                        [out],
+                        name=out,
+                        axis=0,
+                    )
+                )
+                return out
             if p2_search:
                 s = np.array([pof2_minmse_weight_scale(r) for r in rows], np.float32)
             else:

@@ -2395,6 +2395,7 @@ class ModelQuantizer:
             # (Quark applies it to the extended quantizer only: elsewhere it warns
             # and does nothing)
             ort_gemm_beta=True,
+            excluded_nodes_stay_float=False,
             # (the extended quantizer's refinement -- alignment, then the bias
             # scale adjustment -- always runs)
             adjust_bias_scale=(

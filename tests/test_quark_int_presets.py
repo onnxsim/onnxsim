@@ -75,9 +75,10 @@ class _Reader:
         pass
 
 
-def _quantize(model, preset, data=None, extra=None):
+def _quantize(model, preset, data=None, extra=None, exclude=()):
     cfg = qc.QConfig.get_default_config(preset)
     cfg.extra_options.update(extra or {})
+    cfg.exclude = list(exclude)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return qc.ModelQuantizer(cfg).quantize_model(
@@ -484,3 +485,34 @@ def test_gemm_beta_moves_into_the_int32_bias_scale(preset):
     act, wt = _dq_of(q, gemm.input[0]), _dq_of(q, gemm.input[1])
     want = (act[2] * wt[2] * np.float32(2.0)).astype(np.float32)
     np.testing.assert_array_equal(scale, want)
+
+
+@pytest.mark.parametrize("preset", ["A8W8", "S8S8_AAWS", "VINT8"])
+def test_an_excluded_node_between_quantized_ones_is_wrapped_by_their_pairs(preset):
+    """The quantizer only does not mark an excluded node; the Conv behind it is
+    quantized in full, with a Q/DQ pair on the excluded node's output."""
+    model = _model(
+        "c0 = Conv(x, w1, b1)\n c1 = Conv(c0, w2, b2)\n y = Conv(c1, w3, b3)"
+    )
+    q = _quantize(model, preset, exclude=["n1_Conv"])
+    params = _q_params(q)
+    assert {"c0", "c1"} <= set(params)
+    convs = [n for n in q.graph.node if n.op_type == "Conv"]
+    by_out = {o: n for n in q.graph.node for o in n.output}
+    # the excluded one keeps float weights, the others read dequantized ones
+    assert convs[1].input[1] not in by_out  # (a float initializer)
+    assert by_out[convs[2].input[1]].op_type == "DequantizeLinear"
+
+
+def test_vint8_layer_normalization_on_an_unmarked_input_is_left_alone():
+    rng = np.random.default_rng(0)
+    m = parser.parse_model(
+        '<ir_version: 9, opset_import: ["": 17]> g (float[4,16] x) => (float y) '
+        "{ y = LayerNormalization<axis=-1>(x, s1, b1) }"
+    )
+    m.graph.initializer.extend(
+        numpy_helper.from_array(rng.standard_normal(16).astype(np.float32), n)
+        for n in ("s1", "b1")
+    )
+    q = _quantize(m, "VINT8", _data((4, 16)))
+    assert [n.op_type for n in q.graph.node] == ["LayerNormalization"]

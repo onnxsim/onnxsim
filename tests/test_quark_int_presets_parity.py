@@ -11,6 +11,7 @@ helpers are the ones of ``test_quark_xint8_parity.py``.
 
 import random
 import re
+import warnings
 import zlib
 
 import numpy as np
@@ -18,6 +19,8 @@ import onnx
 import pytest
 import test_quark_xint8_parity as P  # noqa: E402  (also sets up the Quark imports)
 from onnx import numpy_helper, parser
+
+from onnxsim import quark_compat as qc  # noqa: E402
 
 pytestmark = P.pytestmark
 
@@ -36,7 +39,7 @@ PRESETS = (
 _run_in_tmp_dir = P._run_in_tmp_dir  # the autouse fixture (Quark writes scratch files)
 
 
-def _quark_run(model, data, tmp_path, preset, extra=None):
+def _quark_run(model, data, tmp_path, preset, extra=None, exclude=()):
     """Quark's preset (``PerChannel`` is an attribute of its quantization config, not
     an option; onnxsim reads it from ``extra_options``)."""
     import contextlib
@@ -49,6 +52,7 @@ def _quark_run(model, data, tmp_path, preset, extra=None):
     cfg = copy.deepcopy(QConfig.get_default_config(preset))
     cfg.global_quant_config.include_cle = False
     cfg.global_quant_config.per_channel = bool(extra.pop("PerChannel", False))
+    cfg.global_quant_config.nodes_to_exclude = list(exclude)
     cfg.global_quant_config.extra_options.update(extra)
     src, dst = str(tmp_path / "src.onnx"), str(tmp_path / "dst.onnx")
     onnx.save(model, src)
@@ -58,9 +62,16 @@ def _quark_run(model, data, tmp_path, preset, extra=None):
     return onnx.load(dst)
 
 
-def _same(model, data, tmp_path, preset, extra=None):
-    q = _quark_run(model, data, tmp_path, preset, extra)
-    m = P._mine_preset(model, data, preset=preset, extra=extra)
+def _same(model, data, tmp_path, preset, extra=None, exclude=()):
+    q = _quark_run(model, data, tmp_path, preset, extra, exclude)
+    cfg = qc.QConfig.get_default_config(preset)
+    cfg.extra_options.update(extra or {})
+    cfg.exclude = list(exclude)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=P._reader(data)
+        )
     return q, m
 
 
@@ -88,8 +99,8 @@ def _assert_same_outputs(m, q, x):
         np.testing.assert_allclose(a, b, atol=1e-5)
 
 
-def _check(model, data, tmp_path, preset, msg="", extra=None):
-    q, m = _same(model, data, tmp_path, preset, extra)
+def _check(model, data, tmp_path, preset, msg="", extra=None, exclude=()):
+    q, m = _same(model, data, tmp_path, preset, extra, exclude)
     P._assert_same_graph(q, m, f"{preset} {msg}")
     _assert_same_outputs(m, q, data[0]["x"])
     return q, m
@@ -537,10 +548,12 @@ def _q_scales(model):
     return out
 
 
-def _both(body, preset, tmp_path, extra=None, batches=4, outputs=("y",), **over):
+def _both(
+    body, preset, tmp_path, extra=None, batches=4, outputs=("y",), exclude=(), **over
+):
     model = _model8(body, outputs, **over)
     data = P._data((1, 8, 8, 8), n=batches)
-    q, m = _same(model, data, tmp_path, preset, extra)
+    q, m = _same(model, data, tmp_path, preset, extra, exclude)
     P._assert_same_graph(q, m, f"{preset}")
     _assert_same_outputs(m, q, data[0]["x"])
     return q, m
@@ -873,6 +886,49 @@ def test_ops_without_a_quantizer_of_their_own_calibrate_their_output_alone(
     )
 
 
+@pytest.mark.parametrize("preset", ["A8W8", "S8S8_AAWS", "VINT8"])
+def test_an_excluded_node_between_quantized_ones_is_wrapped_not_kept_float(
+    preset, tmp_path
+):
+    """The quantizer only skips marking an excluded node; its quantized neighbours
+    still put Q/DQ pairs around it (the next Conv is quantized in full)."""
+    q, m = _both(
+        "c0 = Conv(x, w1, b1)\n c1 = Conv(c0, w2, b2)\n y = Conv(c1, w3, b3)",
+        preset,
+        tmp_path,
+        exclude=["n1_Conv"],
+    )
+    for model in (q, m):
+        scales = _q_scales(model)
+        assert {"c0", "c1"} <= set(scales)
+
+
+def test_a_matmul_without_a_constant_b_is_excluded_from_the_transformer_scheme(
+    tmp_path,
+):
+    """... which is how a ``MatMul`` with a constant *first* operand (not a weight)
+    is left out of ``INT8_TRANSFORMER_DEFAULT``: the Gemm behind it is quantized."""
+    model = _gemm_model("g = Gemm(x, w1, b1)\n t = MatMul(a1, g)\n y = Gemm(t, w3, b1)")
+    data = P._data((4, 16))
+    q, m = _same(model, data, tmp_path, "INT8_TRANSFORMER_DEFAULT")
+    P._assert_same_graph(q, m, "constant-A MatMul")
+    for graph in (q, m):
+        assert "t" in _q_scales(graph)
+
+
+def test_vint8_layer_normalization_needs_a_marked_input(tmp_path):
+    """Like the data-movement ops, ``QDQLayerNorm`` with ``ForceQuantizeNoInputCheck``
+    off (VINT8) quantizes nothing -- not even its scale and bias -- when its input
+    is unmarked (here the graph input)."""
+    model = _gemm_model("y = LayerNormalization<axis=-1>(x, s1, b1)")
+    data = P._data((4, 16))
+    q, m = _same(model, data, tmp_path, "VINT8")
+    P._assert_same_graph(q, m, "LayerNormalization on the graph input")
+    for graph in (q, m):
+        ln = next(n for n in graph.graph.node if n.op_type == "LayerNormalization")
+        assert ln.input[0] == "x"
+
+
 @pytest.mark.parametrize("slope", ["sl8", "sl1"])
 def test_vint8_quantizes_the_prelu_slope(slope, tmp_path):
     """With ``QuantizeAllOpTypes`` a PRelu reaches the plain quantizer, which
@@ -939,8 +995,16 @@ def _gemm_model(body, rng=None):
         + body
         + "}"
     )
-    shapes = {"w1": (16, 16), "b1": (16,), "w2": (16, 4), "b2": (4,), "w3": (16, 16)}
-    for name in dict.fromkeys(re.findall(r"\b[wb]\d\b", body)):
+    shapes = {
+        "w1": (16, 16),
+        "b1": (16,),
+        "w2": (16, 4),
+        "b2": (4,),
+        "w3": (16, 16),
+        "s1": (16,),
+        "a1": (4, 4),
+    }
+    for name in dict.fromkeys(re.findall(r"\b[wbsa]\d\b", body)):
         m.graph.initializer.append(
             numpy_helper.from_array(
                 (rng.standard_normal(shapes[name]) * 0.5).astype(np.float32), name

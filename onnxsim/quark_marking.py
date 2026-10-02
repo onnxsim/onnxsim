@@ -251,7 +251,7 @@ def skipped_nodes(
 
     - a ``Relu`` / ``Clip`` whose input no earlier node marked;
     - a ``Reshape`` / ``Transpose`` / ``Squeeze`` / ``Unsqueeze`` / ``Resize`` /
-      ``MaxPool`` (and ``AveragePool`` with ``direct_pool``, ONNX Runtime's plain
+      ``MaxPool`` / ``LayerNormalization`` (and ``AveragePool`` with ``direct_pool``, ONNX Runtime's plain
       scheme) whose input is unmarked, unless ``force_no_input_check``; likewise a
       ``Gather`` and a ``Where``;
     - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5`` (only with
@@ -263,7 +263,7 @@ def skipped_nodes(
     excl = set(excluded)
     inits = {t.name for t in model.graph.initializer}
     nodes = list(order) if order is not None else quark_node_order(model)
-    direct = set(_DIRECT_OPS) | {"Resize", "MaxPool"}
+    direct = set(_DIRECT_OPS) | {"Resize", "MaxPool", "LayerNormalization"}
     if direct_pool:
         direct.add("AveragePool")
     marked: Set[str] = set()
