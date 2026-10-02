@@ -21,12 +21,22 @@ AdaRound run are identical. Probed with ``amd-quark`` 0.13:
   other shapes, every layer with ``NumWorkers=0`` and ``MemOptLevel=2``, every
   layer with ``DynamicBatch`` on batches of more than one sample;
 * aborted by Quark and here: ``SelectMaxMemLayer`` next to an unconvertible
-  layer or an unusable ``DynamicBatch``.
+  layer or an unusable ``DynamicBatch``;
+* a ``Relu`` folded into the output quantizer (``INT8_CNN_DEFAULT``): Quark's
+  block has no Relu and trains against the float *pre*-Relu output;
+* a size-1 axis that matches under torch's broadcasting (``Gemm`` ``transA`` on
+  one row: trains), a target with fewer rows than samples (skipped);
+* ``SaveAndRestore`` (the checkpoint it writes, the layers it restores),
+  ``SelectiveUpdate`` (per module and over the whole model), ``TargetOpType``
+  and the ``SelectMaxMemLayer`` pick (replaying its up-front module builds);
+* GPTQ ignores the preset's weight dtype (``tests/test_quark_gptq_parity.py``).
 
-AdaQuant is chaotic (see the other file) and compared on short runs only; on
-16-bit weights the float32 rounding of the trained weights decides single codes
-(~0.4 % of them per layer at each rounding boundary), so it is compared
-statistically there.
+AdaQuant is chaotic: a float32 ULP flips a rounded code, which later iterations
+amplify. Run in float32 in torch's operation order it is bit-identical to
+Quark's on ``MatMul`` / ``Gemm`` layers (also on 16-bit weights, hundreds of
+iterations); ``Conv`` / norm layers and ``Gelu`` / ``Tanh`` differ in the last
+float32 bit (torch's oneDNN / vectorized kernels accumulate in another order),
+so those -- and larger learning rates -- are compared statistically.
 """
 
 import copy
@@ -120,6 +130,7 @@ def _opts(ff):
     o.mem_opt_level = ff.get("MemOptLevel", 1)
     o.num_workers = ff.get("NumWorkers", 1)
     o.dynamic_batch = ff.get("DynamicBatch", False)
+    o.target_ops = tuple(ff.get("TargetOpType", qf.TARGET_OPS))
     return o
 
 
@@ -646,6 +657,26 @@ def test_select_max_mem_layer_trains_the_same_codes_as_quark(kind):
     ff = P._ff("adaround", SelectMaxMemLayer=True, NumIterations=40)
     quark_out, mine, q, reports, *_ = _both(model, data, ff, q)
     assert len(reports) == 1 and _changed(q, quark_out)
+    assert max(_mismatch(quark_out, mine).values()) == 0.0
+
+
+@pytest.mark.parametrize(
+    "kind, ops",
+    [
+        ("A", ["Conv"]),
+        ("A", ["Gemm"]),
+        ("B", ["ConvTranspose", "InstanceNormalization"]),
+        ("C", ["MatMul"]),
+        ("C", ["LayerNormalization"]),
+        ("A", ["Conv", "NotAnOp"]),
+    ],
+)
+def test_target_op_type_restricts_the_layers_like_quarks(kind, ops):
+    model, data, q = P._prepared(kind)
+    ff = P._ff("adaround", NumIterations=30, TargetOpType=ops)
+    quark_out, mine, q, reports, _, log = _both(model, data, ff, q)
+    trained = log.count("will be optimized by")
+    assert trained == len(reports) and 0 < trained < 3 + (kind == "B")
     assert max(_mismatch(quark_out, mine).values()) == 0.0
 
 
