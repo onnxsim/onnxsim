@@ -1358,3 +1358,6 @@ Winograd'd 3x3 (100 ms for 29 GFLOP-equivalent) and the depthwise convs (7 ms) a
 3. Data movement, ~35 ms isolated (Transposes 14 at 8-17 GB/s, scalar-index Gather 4.8, NCHW Concat/Resize 5, LayerNorm 2.1, ReduceMax/TopK 2): a shared-memory/vec4 Transpose at ~60-100 GB/s (the ceiling here), a Gather-with-scalar-index lowered to an alias or one vec4 copy, and keeping the hybrid encoder in NHWC (NHWC Resize/Concat) -> **-18 to -22 ms (5-6%)**. Each of these is also 13 us per dispatch of the 211-node graph.
 4. Smaller: attention Softmax/MatMul/LN ~10 ms (fusing Softmax into the MatMul reads ~ -3), the 7 scalar Mul/Div on [400,1024] (manual Gelu: one fused elementwise pass -1 ms).
 (The depthwise vec4 patch landed after these measurements and lowers the SAM numbers by ~8 ms.)
+
+### Winograd output-size cap re-check
+The attribution job measured RT-DETR pre -2.4% with `ORT_WEBGPU_WINO_MAXHW=100` on its library. On the current library (texture/depthwise/concat patches in) the cap is neutral for RT-DETR (332.3/332.1 vs 332.3/333.2), neutral for ResNet-50 and YOLO11n, and **+6 ms worse on SAM** (364.0 vs 357.8), so the default stays uncapped.
