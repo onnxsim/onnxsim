@@ -1649,6 +1649,35 @@ def test_float32_quantizer_matches_a_float32_reference():
     np.testing.assert_array_equal(qc_.encode32(w), np.clip(q, -128, 127))
 
 
+def test_clamp_gradient_is_half_at_a_bound_like_torchs_tensor_clamp():
+    """Quark's quantizers call ``torch.clamp(q, min_q, max_q)`` with tensor
+    bounds, whose backward gives *half* the gradient to an element exactly on a
+    bound (a scalar-bound clamp gives it none)."""
+    f = np.float32
+    q = np.array([-129.0, -128.0, -127.0, 0.0, 126.0, 127.0, 128.0], f)
+    got = qf._clamp_grad(q, f(-127), f(127))
+    np.testing.assert_array_equal(got, [0.0, 0.0, 0.5, 1.0, 1.0, 0.5, 0.0])
+    assert got.dtype == np.float32
+    got64 = qf._clamp_grad(q.astype(np.float64), -127.0, 127.0)
+    assert got64.dtype == np.float64
+
+
+def test_a_weight_on_the_edge_of_its_grid_gets_half_the_straight_through_gradient():
+    # a power-of-two scale puts the largest weight exactly on code 127
+    w = np.array([[127 / 64, 0.3, -0.7, 1.0]], np.float32)
+    qconst = qf._QConst(
+        "w",
+        np.zeros(w.shape, np.int8),
+        np.full(w.shape, 1 / 64),
+        np.zeros(w.shape),
+        -128.0,
+        127.0,
+    )
+    for ste in (qconst.ste, qconst.ste32):
+        _, mask = ste(w)
+        np.testing.assert_array_equal(mask[0], [0.5, 1.0, 1.0, 1.0])
+
+
 def test_float32_adam_step_is_adams_update_in_float32():
     r = np.random.default_rng(6)
     p = r.standard_normal(50).astype(np.float32)

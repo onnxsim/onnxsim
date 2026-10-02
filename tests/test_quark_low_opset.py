@@ -619,3 +619,108 @@ def test_failed_opset_conversion_is_skipped_with_a_warning():
             model, calibration_data_reader=_Reader(_data(shape))
         )
     assert _default_opset(q) == 11
+
+
+# -- algorithms below opset 13 --------------------------------------------------------------
+
+
+def _algo_quantize(model, shape, algos, preset="A8W8"):
+    cfg = qc.QConfig.get_default_config(preset)
+    cfg.algo_config = list(algos)
+    quantizer = qc.ModelQuantizer(cfg)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = quantizer.quantize_model(
+            model, calibration_data_reader=_Reader(_data(shape))
+        )
+    return quantizer, out
+
+
+@pytest.mark.parametrize("opset", [11, 12])
+def test_legacy_adaquant_does_not_turn_per_channel_below_opset_13(opset):
+    """The legacy engine needs per-channel weights, which a DequantizeLinear
+    cannot express below opset 13. Quark raises for a per-channel *request*
+    there; an algorithm's own need is no request, so the weights stay per
+    tensor, the engine finds no layer and leaves the quantized model as is."""
+    model, shape = mlp(opset)
+    quantizer, out = _algo_quantize(
+        model, shape, [qc.AdaQuantConfig(legacy_engine=True, num_iterations=2)]
+    )
+    plain = _quantize(model, "A8W8", shape)
+    assert out.SerializeToString() == plain.SerializeToString()
+    notes = " ".join(quantizer.last_approximations)
+    assert "needs per-channel weights" in notes and "no layer it can optimize" in notes
+    assert not any(a.name == "axis" for n in _qdq(out) for a in n.attribute)
+
+
+def test_legacy_adaquant_still_goes_per_channel_from_opset_13():
+    model, shape = mlp(13)
+    quantizer, out = _algo_quantize(
+        model, shape, [qc.AdaQuantConfig(legacy_engine=True, num_iterations=2)]
+    )
+    assert any("per channel" in a for a in quantizer.last_approximations)
+    axes = {a.i for n in _qdq(out) for a in n.attribute if a.name == "axis"}
+    assert 1 in axes or 0 in axes
+
+
+@pytest.mark.parametrize("opset", [11, 12])
+def test_an_explicit_per_channel_request_with_the_legacy_engine_still_raises(opset):
+    model, shape = mlp(opset)
+    cfg = qc.QConfig.get_default_config("A8W8")
+    cfg.extra_options["PerChannel"] = True
+    cfg.algo_config = [qc.AdaQuantConfig(legacy_engine=True, num_iterations=2)]
+    with pytest.raises(ValueError, match="requires onnx opset version 13"):
+        qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_Reader(_data(shape))
+        )
+
+
+@pytest.mark.parametrize("opset", [11, 12])
+@pytest.mark.parametrize("algo", ["adaround", "adaquant"])
+def test_weight_rounding_algorithms_run_below_opset_13(algo, opset):
+    """Per-tensor Q/DQ without ``axis`` is all FastFinetune needs: it trains the
+    Gemm layers and the model keeps its opset."""
+    model, shape = mlp(opset)
+    for i, n in enumerate(model.graph.node):
+        n.name = f"n{i}"
+    cls = qc.AdaRoundConfig if algo == "adaround" else qc.AdaQuantConfig
+    lr = {"adaround": 0.1, "adaquant": 1e-3}[algo]
+    quantizer, out = _algo_quantize(
+        model,
+        shape,
+        [
+            cls(
+                num_iterations=20,
+                batch_size=2,
+                early_stop=False,
+                learning_rate=lr,
+                guard=False,  # (keep the trained codes whatever their error)
+            )
+        ],
+    )
+    assert _default_opset(out) == opset
+    assert len(quantizer.last_weight_rounding[algo]) == 2
+    base = _quantize(model, "A8W8", shape)
+    codes = lambda m: {  # noqa: E731
+        t.name: numpy_helper.to_array(t)
+        for t in m.graph.initializer
+        if t.data_type == 3 and len(t.dims) == 2
+    }
+    assert any(not np.array_equal(codes(out)[k], codes(base)[k]) for k in codes(base))
+
+
+@pytest.mark.parametrize("opset", [11, 12])
+def test_cle_and_smoothquant_run_below_opset_13(opset):
+    model, shape = conv_relu_pool(opset)
+    cfg = qc.QConfig.get_default_config("A8W8")
+    cfg.algo_config = [qc.CLEConfig()]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cle = qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_Reader(_data(shape))
+        )
+    assert _default_opset(cle) == opset
+    model, shape = matmul_add(opset)
+    _, sq = _algo_quantize(model, shape, [qc.SmoothQuantConfig(alpha=0.5)])
+    assert _default_opset(sq) == opset
+    assert "Mul" in _op_types(sq)  # the smoothing scales

@@ -1092,3 +1092,260 @@ def test_a_changed_request_changes_the_key():
     # ``activation``), as in Quark's ``QLayerConfig.to_dict``
     spelled = qc.QLayerConfig(input_tensors=qc.UInt16Spec(), weight=qc.Int8Spec())
     assert quark_cache_key(base, spelled, ops) != quark_cache_key(base, t16, ops)
+
+
+# -- the boundary quantizers of ``dual_quant_nodes`` (Quark's post-processing) ------------------
+
+
+def _boundary_model():
+    """``x -> Q/DQ(uint8) -> Neg -> Q/DQ(uint16) -> Relu``: Neg is the layer
+    that was promoted from uint8 to uint16 outputs."""
+    m = parser.parse_model(
+        """<ir_version: 9, opset_import: ["": 13]>
+        g (float[2,4] x) => (float[2,4] y) {
+            xq = QuantizeLinear(x, s8, z8)
+            xd = DequantizeLinear(xq, s8, z8)
+            a = Neg(xd)
+            aq = QuantizeLinear(a, s16, z16)
+            ad = DequantizeLinear(aq, s16, z16)
+            y = Relu(ad)
+        }"""
+    )
+    for i, n in enumerate(m.graph.node):
+        n.name = f"n{i}_{n.op_type}"
+    m.graph.initializer.extend(
+        [
+            numpy_helper.from_array(np.float32(0.01), "s8"),
+            numpy_helper.from_array(np.uint8(3), "z8"),
+            numpy_helper.from_array(np.float32(0.0002), "s16"),
+            numpy_helper.from_array(np.uint16(7), "z16"),
+        ]
+    )
+    return m
+
+
+def test_boundary_pass_inserts_the_neighbours_precision_in_front_of_a_promoted_node():
+    from onnxsim.quark_boundary_qdq import insert_boundary_quant_nodes
+    from onnxsim.quark_mixing import compute_scale_zp
+
+    ranges = {"xd": (-1.0, 3.0), "a": (-3.0, 1.0)}
+    out = insert_boundary_quant_nodes(
+        _boundary_model(),
+        ranges.get,
+        promoted_tensors={"a"},
+        promoted_nodes={"n2_Neg"},
+    )
+    extra = [n for n in out.graph.node if "_additional_" in n.name]
+    assert [n.op_type for n in extra] == ["QuantizeLinear", "DequantizeLinear"]
+    inits = {t.name: numpy_helper.to_array(t) for t in out.graph.initializer}
+    q, dq = extra
+    # the template is Neg's promoted output quantizer: a uint16 pair, with a
+    # scale / zero point computed from the range of the tensor in front of Neg
+    zp, scale = compute_scale_zp(
+        np.float32(-1.0), np.float32(3.0), "uint16", symmetric=False
+    )
+    assert inits[q.input[2]].dtype == np.uint16
+    assert inits[q.input[1]] == scale and inits[q.input[2]] == zp
+    assert (dq.input[1], dq.input[2]) == (q.input[1], q.input[2])
+    neg = next(n for n in out.graph.node if n.op_type == "Neg")
+    assert neg.input[0] == dq.output[0] and q.input[0] == "xd"
+    # the other quantizers are untouched
+    assert len(out.graph.node) == len(_boundary_model().graph.node) + 2
+
+
+def test_boundary_pass_does_nothing_without_a_boundary_or_a_promotion():
+    from onnxsim.quark_boundary_qdq import insert_boundary_quant_nodes
+
+    model = _boundary_model()
+    # nothing promoted: no tensor has an override, so no template is found
+    same = insert_boundary_quant_nodes(model, {}.get)
+    assert [n.name for n in same.graph.node] == [n.name for n in model.graph.node]
+    # a node whose quantizers all agree needs no extra pair
+    flat = _boundary_model()
+    for n in flat.graph.node:
+        n.input[:] = [
+            "s8" if x == "s16" else "z8" if x == "z16" else x for x in n.input
+        ]
+    out = insert_boundary_quant_nodes(
+        flat, {}.get, promoted_tensors={"a"}, promoted_nodes={"n2_Neg"}
+    )
+    assert not [n for n in out.graph.node if "_additional_" in n.name]
+
+
+def test_boundary_pass_keeps_the_template_scale_for_a_tensor_without_a_range():
+    from onnxsim.quark_boundary_qdq import insert_boundary_quant_nodes
+
+    out = insert_boundary_quant_nodes(
+        _boundary_model(),
+        {}.get,
+        promoted_tensors={"a"},
+        promoted_nodes={"n2_Neg"},
+    )
+    q = next(n for n in out.graph.node if n.name.endswith("_additional_QuantizeLinear"))
+    assert (q.input[1], q.input[2]) == ("s16", "z16")  # shared with the template
+
+
+def test_dual_quant_nodes_leave_the_scored_models_alone():
+    """Quark scores the candidates without the boundary pairs and inserts them
+    into the final model only."""
+    target = qc.QLayerConfig(activation=qc.UInt16Spec(), weight=qc.Int8Spec())
+    kw = dict(include_layers=["n2_Gemm"])
+    q, _ = _quantize(_amp_config(qc.UInt8Spec, qc.Int8Spec, target, **kw))
+    q2, dual = _quantize(
+        _amp_config(qc.UInt8Spec, qc.Int8Spec, target, dual_quant_nodes=True, **kw)
+    )
+    assert q.last_auto_mixprecision.baseline_score == pytest.approx(
+        q2.last_auto_mixprecision.baseline_score
+    )
+    assert [c.score for c in q.last_auto_mixprecision.ranked] == [
+        c.score for c in q2.last_auto_mixprecision.ranked
+    ]
+    assert _extra_pairs(dual)
+
+
+def test_dual_quant_nodes_are_not_added_to_a_threshold_free_analysis():
+    target = qc.QLayerConfig(activation=qc.BFloat16Spec(), weight=qc.BFloat16Spec())
+    _, out = _quantize(
+        _amp_config(
+            qc.UInt8Spec,
+            qc.Int8Spec,
+            target,
+            metric_threshold=None,
+            dual_quant_nodes=True,
+        )
+    )
+    assert not _extra_pairs(out)  # Quark returns the baseline before mixing
+
+
+# -- half / block activations over any constant format --------------------------------------
+
+
+def _generic(act, wt, **extra):
+    cfg = qc.QConfig(
+        global_config=qc.QLayerConfig(activation=act(), weight=wt()), **extra
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return qc.ModelQuantizer(cfg).quantize_model(
+            _mlp(), calibration_data_reader=_data()
+        )
+
+
+def _fn_nodes(model):
+    return [
+        n
+        for n in model.graph.node
+        if n.op_type in ("BFPQuantizeDequantize", "MXQuantizeDequantize")
+    ]
+
+
+def _fn_attrs(node):
+    return {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+
+
+@pytest.mark.parametrize(
+    "wt, op",
+    [
+        (qc.BFP16Spec, "BFPQuantizeDequantize"),
+        (qc.MX4Spec, "BFPQuantizeDequantize"),
+        (qc.MX9Spec, "BFPQuantizeDequantize"),
+        (qc.MXInt8Spec, "MXQuantizeDequantize"),
+        (qc.MXFP4E2M1Spec, "MXQuantizeDequantize"),
+    ],
+)
+def test_block_constants_under_half_activations_use_quarks_default_attributes(wt, op):
+    """Quark's quantizer picks the node by the constant's format family and
+    fills in its plain defaults (``rounding_mode`` 0, 16-bit ``to_bfp`` /
+    ``int8`` MX) -- the format-specific attributes only reach a pair of the
+    *same* ``MX*`` format."""
+    out = _generic(qc.BFloat16Spec, wt)
+    consts = [n for n in _fn_nodes(out) if n.input[0] in {"w1", "w2", "w3"}]
+    assert consts and {n.op_type for n in consts} == {op}
+    for n in consts:
+        a = _fn_attrs(n)
+        assert a["rounding_mode"] == 0
+        if op == "BFPQuantizeDequantize":
+            assert (a["bfp_method"], a["bit_width"], a["block_size"]) == (
+                b"to_bfp",
+                16,
+                8,
+            )
+        else:
+            assert (a["element_dtype"], a["block_size"]) == (b"int8", 32)
+
+
+def test_a_pair_of_the_same_mx_format_gets_its_own_attributes():
+    out = _generic(qc.MX4Spec, qc.MX4Spec)
+    a = _fn_attrs(_fn_nodes(out)[0])
+    assert (a["bfp_method"], a["bit_width"], a["rounding_mode"]) == (
+        b"to_bfp_prime",
+        11,
+        2,
+    )
+    mixed = _generic(qc.MX4Spec, qc.MX6Spec)
+    a = _fn_attrs(_fn_nodes(mixed)[0])
+    assert (a["bfp_method"], a["bit_width"], a["rounding_mode"]) == (b"to_bfp", 16, 0)
+
+
+def test_an_explicit_bfp_attributes_option_wins_over_the_defaults():
+    out = _generic(
+        qc.BFloat16Spec,
+        qc.BFP16Spec,
+        BFPAttributes=dict(bit_width=12, rounding_mode=2),
+    )
+    consts = [n for n in _fn_nodes(out) if n.input[0] in {"w1", "w2", "w3"}]
+    got = {(_fn_attrs(n)["bit_width"], _fn_attrs(n)["rounding_mode"]) for n in consts}
+    assert got == {(12, 2)}
+
+
+@pytest.mark.parametrize("wt", [qc.Int8Spec, qc.UInt8Spec])
+@pytest.mark.parametrize("act", [qc.BFloat16Spec, qc.Float16Spec, qc.BFP16Spec])
+def test_integer_constants_under_half_and_block_activations(act, wt):
+    """Weights are offline per-tensor integer codes behind a ``DequantizeLinear``;
+    a bias is int32 on the weight's scale behind half-precision activations
+    (their scale is 1.0) and quantized like a weight behind block ones."""
+    out = _generic(act, wt)
+    inits = {t.name: numpy_helper.to_array(t) for t in out.graph.initializer}
+    want = np.int8 if wt is qc.Int8Spec else np.uint8
+    assert inits["w1_quantized"].dtype == want
+    assert inits["w1_scale"].shape == () and inits["w1_scale"].dtype == np.float32
+    if act is qc.BFP16Spec:
+        assert inits["b1_quantized"].dtype == want
+    else:
+        assert inits["b1_quantized"].dtype == np.int32
+        np.testing.assert_array_equal(
+            inits["b1_quantized_scale"], np.array([inits["w1_scale"]], np.float32)
+        )
+        assert inits["b1_quantized_zero_point"] == 0
+    # the codes are the float weights on that grid
+    w = _w(np.random.default_rng(0), D, D, scale=1.5)
+    deq = (
+        inits["w1_quantized"].astype(np.float32)
+        - inits["w1_zero_point"].astype(np.float32)
+    ) * inits["w1_scale"]
+    assert np.abs(deq - w).max() <= float(inits["w1_scale"]) / 2 + 1e-6
+
+
+def test_integer_activations_over_half_or_block_constants_are_refused():
+    with pytest.raises(NotImplementedError, match="integer activations"):
+        _generic(qc.Int8Spec, qc.BFloat16Spec)
+
+
+@pytest.mark.parametrize(
+    "act, wt",
+    [
+        (qc.BFloat16Spec, qc.MX6Spec),
+        (qc.BFloat16Spec, qc.Float16Spec),
+        (qc.Float16Spec, qc.BFloat16Spec),
+        (qc.BFP16Spec, qc.MXInt8Spec),
+        (qc.MX4Spec, qc.BFloat16Spec),
+        (qc.BFP16Spec, qc.Int8Spec),
+    ],
+)
+def test_auto_mixprecision_over_a_mixed_format_baseline_runs(act, wt):
+    target = qc.QLayerConfig(activation=qc.Int8Spec(), weight=qc.Int8Spec())
+    q, out = _quantize(
+        _amp_config(act, wt, target, include_layers=["n2_Gemm"], dual_quant_nodes=True)
+    )
+    assert q.last_auto_mixprecision.moved == ["n2_Gemm"]
+    assert _extra_pairs(out)

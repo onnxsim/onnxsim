@@ -239,6 +239,20 @@ class FinetuneOptions:
 # -- quantized constants & activation quantizers -----------------------------------------
 
 
+def _clamp_grad(q: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """The gradient factor of ``torch.clamp(q, min_q, max_q)`` with *tensor*
+    bounds, which is what Quark's integer quantizers call: 1 inside, 0 outside
+    and 0.5 *at* a bound (torch splits the gradient of a tie between the input
+    and the bound, unlike the scalar-bound ``clamp`` that gives 0 there). The
+    largest weight of a per-tensor symmetric grid sits exactly on ``hi`` --
+    one halved gradient is enough to move its code (and, by Adam's per-element
+    normalization, the codes around it) away from a run that treats the tie as
+    inside."""
+    inside = (q > lo) & (q < hi)
+    tie = (q == lo) | (q == hi)
+    return np.where(inside, 1.0, np.where(tie, 0.5, 0.0)).astype(q.dtype, copy=False)
+
+
 @dataclass
 class _QConst:
     """A weight / bias quantized as ``DequantizeLinear(int codes, scale, zp)``."""
@@ -257,7 +271,7 @@ class _QConst:
     def ste(self, w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Quantize-dequantize with Quark's straight-through gradient mask."""
         q = np.round(w / self.scale) + self.zp
-        mask = (q >= self.lo) & (q <= self.hi)
+        mask = _clamp_grad(q, self.lo, self.hi)
         return (np.clip(q, self.lo, self.hi) - self.zp) * self.scale, mask
 
     def encode(self, w: np.ndarray) -> np.ndarray:
@@ -269,7 +283,7 @@ class _QConst:
         f32 = np.float32
         s, z = self.scale.astype(f32), self.zp.astype(f32)
         q = np.round(w.astype(f32) / s) + z
-        mask = (q >= self.lo) & (q <= self.hi)
+        mask = _clamp_grad(q, f32(self.lo), f32(self.hi))
         return (np.clip(q, f32(self.lo), f32(self.hi)) - z) * s, mask
 
     def encode32(self, w: np.ndarray) -> np.ndarray:
@@ -308,7 +322,7 @@ class _ActQ:
         y = (np.clip(q, f32(self.lo), f32(self.hi)) - f32(self.zp)) * f32(self.scale)
         return (
             y if x.dtype == f32 else y.astype(np.float64),
-            (q >= self.lo) & (q <= self.hi),
+            _clamp_grad(q, f32(self.lo), f32(self.hi)),
         )
 
 
@@ -1476,7 +1490,7 @@ def _train_block(
         round_loss = 0.0
         grads: List[np.ndarray]
         if adaround:
-            dq_mask = (raw_q >= lo) & (raw_q <= hi)
+            dq_mask = _clamp_grad(raw_q, lo, hi)
             dh = dw_hat * scale * dq_mask
             h_mask = (raw_h > 0.0) & (raw_h < 1.0)
             dh_dalpha = np.where(h_mask, sig * (1.0 - sig) * (_ZETA - _GAMMA), 0.0)

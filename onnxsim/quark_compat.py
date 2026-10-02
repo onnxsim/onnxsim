@@ -248,7 +248,13 @@ names and preset *meanings*, not copied.
   ``tests/test_quark_amp_parity.py`` compares the whole quantizer structure and
   the outputs bit for bit with Quark for the mixes it lists. A
   ``QuantizeBias=False`` bfloat16 baseline with a block target (the
-  ``BF16_MIXED_*`` presets) keeps its dedicated flow.
+  ``BF16_MIXED_*`` presets) keeps its dedicated flow. A half / block baseline
+  takes any constant format: activations in ``float16`` / ``bfloat16`` / BFP /
+  MX with weights in any half, block, ``int8`` or ``uint8`` format (Quark's
+  quantizer picks the node kind of every tensor from its own dtype; the BFP / MX
+  attributes are its plain defaults unless the activation and weight formats are
+  the same ``MX*`` format or ``BFPAttributes`` / ``MXAttributes`` say so);
+  integer activations over half / block weights are not implemented.
   ``target_layer_config`` as one ``QLayerConfig``, a list (each candidate takes
   its best-scoring config) or ``{QLayerConfig: [node names]}``; ``subgraph_json``
   partitions (a missing file is ignored, as in Quark), a
@@ -261,8 +267,11 @@ names and preset *meanings*, not copied.
   op such as ``Transpose`` or ``MaxPool``; the baseline shares them as ONNX
   Runtime's quantizer does) and ``dual_quant_nodes`` -- on the int16 -> int8
   promotion (``S16S16_MIXED_S8S8``) and the block-format presets
-  (``BF16_MIXED_BFP16`` / ``_MXINT8``) too; boundary pairs exist for integer
-  mixes only (a half / block / power-of-two mix raises with them). Candidates
+  (``BF16_MIXED_BFP16`` / ``_MXINT8``) too. ``dual_quant_nodes`` is Quark's
+  post-processing of the *final* mixed model (candidates are scored without
+  it, see :mod:`onnxsim.quark_boundary_qdq`) and works for every mix -- integer,
+  half, block and power-of-two, over an integer or a float / block baseline --
+  graph for graph and bit for bit. Candidates
   are scored like Quark's analysis does: ONNX Runtime with every graph
   optimization off, over ``data_size + 1`` calibration batches (so the default
   ``0`` scores one batch, whatever "0 = all" says), which is what makes the
@@ -2355,15 +2364,21 @@ class ModelQuantizer:
         legacy_adaquant = "adaquant" in by_name and by_name["adaquant"].params.get(
             "legacy_engine"
         )
-        if (
-            not per_channel
-            and ("gptq" in by_name or legacy_adaquant)
-            # (a DequantizeLinear has no ``axis`` below opset 13, which Quark's
-            # per-channel mode raises for: GPTQ re-grids the weights itself there)
-            and not (_default_opset(model) < 13 and not legacy_adaquant)
-        ):
+        needs_axis = not per_channel and ("gptq" in by_name or legacy_adaquant)
+        if needs_axis and _default_opset(model) >= 13:
             per_channel = True
             self._approx("weights quantized per channel (needed by the algorithm)")
+        elif needs_axis and legacy_adaquant:
+            # A DequantizeLinear has no ``axis`` below opset 13, so per-channel
+            # weights cannot be written there (Quark raises for a per-channel
+            # *request* -- an algorithm's own need is no request). GPTQ re-grids
+            # the weights itself; the legacy engine only knows the per-channel
+            # layout, finds no layer and leaves the model as quantized.
+            self._approx(
+                "the legacy AdaQuant engine needs per-channel weights, which "
+                "DequantizeLinear cannot express below opset 13: weights stay "
+                "per tensor"
+            )
 
         # Float -> float pre-quantization passes (quantize_full_qdq is fed
         # the transformed model; the untouched one stays the reference).

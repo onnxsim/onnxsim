@@ -69,12 +69,13 @@ the promoted one; ``"unshare"``: the promoted pair gets its own copy) behaves
 as in Quark. Candidates are scored with ONNX Runtime's graph optimizations off
 (as Quark does -- it fuses QDQ into integer kernels otherwise); models with
 ``com.amd.quark`` custom ops run on
-:func:`onnxsim.quark_fakequant_eval.run_fake_quantized`. ``dual_quant_nodes``
-adds a converting Q/DQ pair in front of every consumer whose precision differs
-from the tensor's (Quark's boundary insertion, but with onnxsim's own scale /
-zero point for the pair); it needs a re-quantization of the tensors, so it is
-integer-only (:func:`apply_layer_mixing` is that path's weight / bias
-editing).
+:func:`onnxsim.quark_fakequant_eval.run_fake_quantized`. ``dual_quant_nodes`` is
+Quark's post-processing of the final mixed model
+(:func:`onnxsim.quark_boundary_qdq.insert_boundary_quant_nodes`): the candidates
+are scored without it and an extra Q/DQ pair (or block node) goes in front of
+every stage that differs from its node's template stage, for every kind of mix.
+(:func:`apply_layer_mixing` is the older, re-quantizing way to edit weights and
+biases; the mixer above does not use it.)
 
 **Sensitivity cache.** ``cache_file`` is Quark's JSON. Through
 ``quark_compat`` it is written under Quark's own key (a digest of the quantized
@@ -1031,9 +1032,10 @@ def auto_mixprecision(
     :param cache_file: JSON file for the sensitivity ranking: reused when its
             fingerprint matches, written otherwise
     :param worker_num: threads used to score candidates
-    :param dual_quant_nodes: re-quantize (an extra Q/DQ pair) a tensor for a
-            consumer whose precision differs; off, such a node consumes one
-            precision and produces the other, as Quark does
+    :param dual_quant_nodes: insert Quark's boundary quantizers into the final
+            model (an extra Q/DQ pair, or block node, in front of every stage
+            whose precision differs from its node's template stage); off, a
+            promoted node simply consumes one precision and produces the other
     :param quantize_kwargs: keyword arguments of the :func:`quantize_full_qdq`
             call that makes the baseline (``calibration_data`` / ``activation_dtype``
             / ``ranges`` / ``convert_inputs`` are taken from here); its own
