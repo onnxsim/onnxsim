@@ -1254,3 +1254,39 @@ Not tuned (time): the 1x1 stride-2 convs of ResNet-50 and the `nv`/`tm` axes for
 ### Texture direct conv: tuned defaults (from the class-wise tuning above)
 `ort_conv_texdirect.patch` now defaults `ORT_WEBGPU_TEXDIRECT_MAXC` to 512 and uses the 16x8 workgroup (`2,2,16,8,1`) for every stride-2 conv (override with the table or `ORT_WEBGPU_TEXDIRECT_TM`); the mode stays opt-in (`ORT_WEBGPU_CONV_TEXDIRECT=1`) because the
 weights are rounded to f16. Phone medians in a final session (two runs, off -> on): YOLO26n 62.4/61.3 -> **57.8/54.2 ms**, YOLO11n 69.0/71.4 -> 71.1/65.9 (noisy; the tuning job measured 71.5 -> 65.3), ResNet-50 57.4/57.1 -> **55.9/56.5**, SAM-L0 encoder 365.7/367.4 -> **357.7/358.0**, RT-DETR pre unchanged (334/337 -> 337/336).
+
+## Weight-only int8/int4 for 1x1 convs through ORT WebGPU's existing MatMulNBits (no ORT change): not a win
+
+`webgpu_ops/nbits/rewrite_1x1_nbits.py` rewrites every stride-1, unpadded, ungrouped 1x1 Conv with a constant weight into
+`Transpose(0,2,3,1) -> com.microsoft::MatMulNBits (symmetric block-wise, bits 4 or 8) -> [bias] -> Transpose(0,3,1,2)` and leaves the rest of the NCHW model alone. ORT's layout transformer and transpose optimizer cancel the
+transposes (per run the optimized graph keeps the same 2 Transposes as the original ResNet-50). Options: `--bits 4|8 --block 32|64|128 --fuse-bias` (conv bias as MatMulNBits input 5) `--accuracy-level 4` (the kernel's DP4A path)
+`--drop-bias` (timing only). Convs with K % block != 0 are skipped: ResNet-50 33/33 rewritten at block 32 and 64 (28 at 128); YOLO11n 38 of 46 (block 32), 35 (64), 23 (128); YOLO26n 45 of 55, 39, 24.
+Scripts: `run_lat*.sh` (ABAB-interleaved medians, 60 warm-up + 15 timed runs, 3 rounds), `run_acc.sh`. All 1x1 MatMulNBits nodes run on the WebGPU EP (no CPU fallback).
+
+**Latency** (phone medians over 3 rounds, ms; ORT defaults: Winograd + add fusion, `enableInt64=1`; the three rounds agree within 0.5 ms):
+
+| model | ORT default | q8 b32 (separate bias Add) | q8 b32 fused bias | q4 b32 fused bias | q8 b64 / b128 | q8 b32 DP4A (`accuracy_level=4`) |
+|---|---|---|---|---|---|---|
+| ResNet-50 | 56.4 | 56.1 | **54.8** (-2.8%) | **54.0** (-4.3%) | 240.6 / 182.2 | 78.0 |
+| YOLO11n | 71.0 | 71.7 | 71.9 (+1.3%) | 72.0 (+1.4%) | 167.2 / 120.5 | 79.4 |
+| YOLO26n | 62.3 | 64.9 | 63.9 (+2.6%) | 62.7 (+0.6%) | 160.2 / 117.1 | 72.4 |
+
+(q4 b64 / b128 are 282 / 199 ms on ResNet-50; the same shape on YOLO. Dropping the bias entirely is as fast as fusing it, so the bias Add is not the cost.)
+
+- **Only block size 32 is usable**: ORT's WebGPU MatMulNBits has its fast path (wide-tile program) for block 32; block 64 and 128 fall to a generic kernel that is 3-5x slower than the conv it replaces.
+- **DP4A is not faster here**: `accuracy_level=4` selects the int8-activation DP4A program (taken only when K % 128 == 0), but the Adreno has no hardware dot4 (earlier int8 microbenchmark), so ResNet-50 goes 54.6 -> 78 ms.
+- **The gain is small even where it exists**: at block 32 the weight-only kernel replaces ORT's 1x1 conv path at about the same speed (ResNet-50 -3% / -4% with int8 / int4 weights; YOLO +1..3%). The int8/int4 weights cut weight bytes 4x/8x, but the dequant ALU, the K-split reduction in the MatMulNBits kernel and the lost fusions eat the saving.
+- **Fusions lost**: each rewritten conv loses Conv+bias+residual-Add+ReLU epilogue fusion (ResNet-50: the 48 `NhwcFusedConv` -> separate residual `Add` and `Relu`) and, on YOLO, the Conv+SiLU epilogue (the `QuickGelu` nodes reappear: 32 per run). Graph nodes per run (profile of 3 runs / 3): ResNet-50 59 -> 140, YOLO11n 177 -> 249, YOLO26n 204 -> 291.
+
+**Accuracy** (vs ORT CPU fp32; real photo `models/photo640.npy` on host, and the phone `bench` seeded random input, max relative difference of the output):
+
+| | q8 b32 | q8 b128 | q4 b32 | q4 b128 |
+|---|---|---|---|---|
+| ResNet-50, photo: logits rel max / top-1 / top-5 overlap | 4.7e-2 / same (444) / 4 of 5 | 4.2e-2 / changed (738) / 5 | 7.0e-1 / changed (522) / 0 | 5.8e-1 / changed (64) / 1 |
+| ResNet-50, phone random input: rel max / top-1 | 6.7e-2 / same | 2.8e-2 / same | 6.0e-1 / changed | 3.3e-1 / changed |
+| YOLO11n, photo: output rel max (box coordinates dominate) / score>0.25 anchors kept | 3.3e-2 / 30 of 30 | | 5.2e-1 / 21 of 30 (22 found, 1 new) | |
+| YOLO26n, photo | 3.4e-2 / 4 of 4 | | 4.1e-1 / 0 of 4 (3 found) | |
+
+Round-to-nearest symmetric int4 without calibration (no GPTQ/AWQ) destroys these conv nets; int8 weights keep the decision on ResNet-50/YOLO but with 3-5e-2 logit error, far worse than the f16-weight texture path (1e-3).
+
+**Conclusion**: weight-only int8/int4 through the existing MatMulNBits is not worth it for 1x1 convs on this GPU: at best 3-4% on ResNet-50 (with accuracy loss) and neutral-to-negative on YOLO. The weight stream is already well served by the RGBA16F texture weights (1.5-2x per layer, 1e-3 error). What a native fused kernel could add beyond this rewrite: (1) keep the Conv+bias+residual+activation epilogue (recovers the +80 dispatches per ResNet-50 run and the SiLU fusion, about the 4-5 ms that separate Add/ReLU passes cost on YOLO/ResNet), (2) read int8 weights from a texture (R8/RGBA8 `unorm` texels convert to f32 for free in the texture unit, no shader unpack ALU) with f32 math, which is the same trick that made the f16 texture weights work and halves the weight bytes again, (3) per-output-channel (not per-32-block) scales applied once in the epilogue, which removes the per-block multiply from the inner loop. I would expect at most ~5-8% on ResNet-50 from such a kernel, mostly from (1) and (2), at the cost of an int8 calibration/accuracy flow; not measured.
