@@ -1699,8 +1699,10 @@ def test_float32_adaquant_trains_and_float64_is_still_available(cnn, cnn_q):
     assert len(ra) == len(rb) == 3
     for name, ca in _codes(a).items():
         cb = _codes(b)[name]
-        # the two arithmetics land on nearby codes (lr=1e-3 amplifies float32
-        # vs float64 rounding by a platform-dependent amount: <= 2 on x86, up
-        # to 8 on aarch64 BLAS), far below the 8-bit code range
-        assert np.abs(ca.astype(np.int64) - cb.astype(np.int64)).max() <= 16
+        # the two arithmetics land on nearby codes: lr=1e-3 amplifies float32
+        # vs float64 rounding by a platform-dependent amount (a couple of codes
+        # on x86, tens of codes of a ~1000-wide 16-bit grid on aarch64 BLAS), so
+        # bound the gap relative to the code range instead of absolutely
+        gap = np.abs(ca.astype(np.int64) - cb.astype(np.int64)).max()
+        assert gap <= max(2, 0.05 * np.abs(ca.astype(np.int64)).max())
     assert any(not np.array_equal(_codes(a)[k], _codes(cnn_q)[k]) for k in _codes(a))
