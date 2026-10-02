@@ -1425,3 +1425,20 @@ Whole-setting validation (5 interleaved rounds, medians, ms):
 **Recommended:** `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=1024` for both models (SAM -16 ms, 6e-4 rms; RT-DETR neutral to -5 ms). If ~3e-3 rms is acceptable on SAM, mode 2 with MAXC 512 and the table in `TABLE_sam_l0_enc_m2_c1024.txt` (the MAXC filter drops the 1024-channel entries) gives -18 ms.
 The -35 ms setting needs an accurate weight path: a code change, not implemented here -- an RGBA32F weight texture variant for `ConvTexDirectProgram` (the layout study measured RGBA32F textures at 1.5-1.7x a buffer kernel vs 1.8-2.1x for RGBA16F, so most of the gain should remain with exact f32 weights), selected per layer when K >= 1024 or by an env switch.
 Other kernel ideas that this search could not express with tm/nv/workgroup knobs: a 4-wide K unroll inside the c4 loop with the 4 weight texels of a k4 group fetched first (the loop is latency-bound at tm*nv = 4 accumulators/lane), and cooperative loading of the weight texels into workgroup memory for pixels-fast mappings (all lanes of a workgroup row read the same weight texel).
+
+## Exact (RGBA32F) weight textures for large K: SAM-L0 encoder -32 ms (`ort_conv_texdirect_f32w.patch`)
+
+The 1x1 tuning job's best SAM setting (mode 2, MAXC 1024, class table `texdirect_tune/TABLE_sam_l0_enc_m2_c1024.txt`) was -35 ms but 4.1e-2 rms from the CPU EP, because f16-rounded weights hurt the large-K 1x1 convs (K 1024-2048). This patch
+(applies after `ort_conv_depthwise_vec4.patch`) stores the weights of convs with Cin >= `ORT_WEBGPU_TEXDIRECT_F32_MINK` (default 1024) in an RGBA32F texture (exact) and the rest in RGBA16F; the default `ORT_WEBGPU_TEXDIRECT_MAXC` is now 1024.
+SAM-L0 encoder, two interleaved sessions (ms; error vs CPU EP, max rel / rms):
+
+| setting | ms | error |
+|---|---|---|
+| stock (`TEXDIRECT=0`) | 357.7 / 358.2 | 5.1e-5 / 3.4e-5 |
+| mode 1, MAXC 1024 | 341.0 / 342.8 | 9.2e-4 / 5.9e-4 |
+| mode 2 + table, all f16 weights | 322.8 / 322.5 | 7.6e-2 / 4.1e-2 |
+| **mode 2 + table, f32 weights for Cin >= 1024** | **325.7 / 326.4** | **2.2e-3 / 2.8e-3** |
+| same, f32 for Cin >= 512 | 328.0 / 328.5 | 2.3e-3 / 2.7e-3 |
+
+So `ORT_WEBGPU_CONV_TEXDIRECT=2 ORT_WEBGPU_TEXDIRECT_MAXC=1024 ORT_WEBGPU_TEXDIRECT_TABLE=$(cat texdirect_tune/TABLE_sam_l0_enc_m2_c1024.txt)` gives -9% on the SAM-L0 encoder at 2.8e-3 rms; mode 1 alone (no table) gives -4.7% at 5.9e-4. RT-DETR pre gains nothing from the 1x1 path (336.8 -> 336.8) and is unchanged by mode 1.
+The fused linear-attention prototype (`dawn_repro/linattn.cc`, 3.2x per block, ~7 ms of SAM) is the next candidate.
