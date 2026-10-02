@@ -1442,3 +1442,9 @@ SAM-L0 encoder, two interleaved sessions (ms; error vs CPU EP, max rel / rms):
 
 So `ORT_WEBGPU_CONV_TEXDIRECT=2 ORT_WEBGPU_TEXDIRECT_MAXC=1024 ORT_WEBGPU_TEXDIRECT_TABLE=$(cat texdirect_tune/TABLE_sam_l0_enc_m2_c1024.txt)` gives -9% on the SAM-L0 encoder at 2.8e-3 rms; mode 1 alone (no table) gives -4.7% at 5.9e-4. RT-DETR pre gains nothing from the 1x1 path (336.8 -> 336.8) and is unchanged by mode 1.
 The fused linear-attention prototype (`dawn_repro/linattn.cc`, 3.2x per block, ~7 ms of SAM) is the next candidate.
+
+## Recommended opt-in with everything in (texdirect mode 1, MAXC 1024)
+
+Final interleaved check on the current library (`ORT_WEBGPU_CONV_TEXDIRECT=1`, defaults MAXC 1024, stride-2 tile 16x8, `enableInt64=1`; medians, two sessions), texdirect off -> on:
+YOLO11n 68.5/68.9 -> **62.8/63.7 ms (-8%)**, SAM-L0 encoder 357.2/357.6 -> **341.6/340.6 (-5%)**, ResNet-50 56.3/57.1 -> **55.6/55.5**, RT-DETR pre 330.0/336.3 -> 334.9/334.1 (no gain). Restricting Winograd to >= 96 channels (`ORT_WEBGPU_WINO_MINC=96`) helps RT-DETR
+(321.9/329.2, about -2.5%) but costs SAM 10 ms, so it is not a default. The fused `ReluLinearAttention` op is not pursued: the prototype saves ~7 ms of SAM, and an NCHW contrib op would add two layout Transposes per block (3 MB each) in the NHWC-converted graph, leaving ~1% net.
