@@ -86,7 +86,7 @@ _DATA_INPUTS = {
     "Unsqueeze": (0,),
     "Gather": (0,),
     "Resize": (0,),
-    "Pad": (0,),
+    "Pad": (0, 2),
     "Clip": (0,),
     "TopK": (0,),
     "ReduceMean": (0,),
@@ -284,10 +284,13 @@ def _is_quantized_node(
     op_types: Optional[set],
     exclude_op_types: set,
     exclude_nodes: set,
+    skip_nodes: Optional[set] = None,
 ) -> bool:
     if n.domain not in ("", "ai.onnx") or n.op_type in _NEVER_QUANTIZED:
         return False
     if op_types is not None and n.op_type not in op_types:
+        return False
+    if skip_nodes and (n.name in skip_nodes or n.output[0] in skip_nodes):
         return False
     return (
         n.op_type not in exclude_op_types
@@ -328,6 +331,7 @@ def quantize_full_qdq(
     op_types: Optional[Iterable[str]] = None,
     exclude_op_types: Iterable[str] = (),
     exclude_nodes: Iterable[str] = (),
+    skip_nodes: Iterable[str] = (),
     fold_relu: bool = True,
     method: str = "minmax",
     providers: Optional[Sequence[str]] = None,
@@ -373,6 +377,10 @@ def quantize_full_qdq(
     :param op_types: only quantize nodes of these op types (default: all)
     :param exclude_op_types: never quantize nodes of these op types
     :param exclude_nodes: node names (or first-output names) to keep in float
+    :param skip_nodes: node names (or first-output names) a quantizer would
+            leave alone like a node outside ``op_types`` (it marks none of its
+            tensors; its neighbours' quantizers still do), e.g. Quark's
+            ``Relu`` / ``Clip`` fed by an unquantized tensor
     :param fold_relu: fold a Relu into its quantized producer's output Q (not
             done with symmetric activations: their zero point is centred)
     :param method: calibration method, passed to
@@ -502,6 +510,7 @@ def quantize_full_qdq(
     g = m.graph
     op_types = set(op_types) if op_types is not None else None
     exclude_op_types, exclude_nodes = set(exclude_op_types), set(exclude_nodes)
+    skip_set = set(skip_nodes)
 
     floats = _float_tensor_names(m)
     inits = {i.name: i for i in g.initializer}
@@ -515,7 +524,7 @@ def quantize_full_qdq(
     qnodes = [
         n
         for n in g.node
-        if _is_quantized_node(n, op_types, exclude_op_types, exclude_nodes)
+        if _is_quantized_node(n, op_types, exclude_op_types, exclude_nodes, skip_set)
     ]
     qnode_ids = {id(n) for n in qnodes}
 
@@ -533,7 +542,9 @@ def quantize_full_qdq(
     # (A node merely outside ``op_types`` is left alone: sandwiched between quantized nodes it
     # runs quantized, which is what an op_types list asks for everywhere else.)
     for n in g.node:
-        if id(n) in qnode_ids or not _is_quantized_node(n, op_types, set(), set()):
+        if id(n) in qnode_ids or not _is_quantized_node(
+            n, op_types, set(), set(), skip_set
+        ):
             continue
         ins = [x for x in _data_inputs(n) if x in floats and x not in inits]
         outs = [o for o in n.output if o and o in floats]
@@ -703,6 +714,10 @@ def quantize_full_qdq(
         raise ValueError(f"unsupported dtype in tensor_dtypes: {t!r}")
     qp: Dict[str, Tuple[float, int]] = {}
     qdt: Dict[str, str] = {}
+    # tensors whose parameters were taken from another tensor's (a data-movement
+    # op's output): they use the same scale / zero-point initializers, as in
+    # Quark's graphs, so a later position move reaches all of them
+    share_root: Dict[str, str] = {}
 
     def set_qp(x: str) -> None:
         dt = tensor_dtypes.get(x, activation_dtype)
@@ -731,6 +746,7 @@ def quantize_full_qdq(
                     and n.op_type not in unshared
                 ):
                     qp[o], qdt[o] = qp[n.input[0]], qdt[n.input[0]]
+                    share_root[o] = share_root.get(n.input[0], n.input[0])
         for x in list(n.input) + list(n.output):
             if x in seen and x not in qp and x in ranges and x not in inits:
                 set_qp(x)
@@ -768,13 +784,20 @@ def quantize_full_qdq(
     # original name, so every consumer (and a graph output) reads the dequantized value.
     act_nodes: List[onnx.NodeProto] = []
     rename: Dict[str, str] = {}
+    shared_init_names: Dict[str, Tuple[str, str]] = {}
     for a in acts:
         if a not in qp:
             continue
         s, zp = qp[a]
         dom = domain_of(qdt[a])
-        sn = add_init(fresh(a) + "/scale", np.array(s, np.float32))
-        zn = add_init(fresh(a) + "/zp", np.array(zp, _DTYPES[qdt[a]][1]))
+        root = share_root.get(a, a)
+        if root != a and qp.get(root) == qp[a] and root in shared_init_names:
+            sn, zn = shared_init_names[root]
+        else:
+            sn = add_init(fresh(a) + "/scale", np.array(s, np.float32))
+            zn = add_init(fresh(a) + "/zp", np.array(zp, _DTYPES[qdt[a]][1]))
+            if qp.get(root) == qp[a]:
+                shared_init_names.setdefault(root, (sn, zn))
         q_out = a + "/q"
         if a in graph_inputs:
             dq_out = a + "/dq"
@@ -1066,6 +1089,11 @@ def quantize_full_qdq(
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
                 or (n.op_type == "InstanceNormalization" and int8_constants)
             ) and (k == 2 and w.ndim == 1):
+                if ("b32", x) in cache:
+                    # a bias several nodes read is quantized once, with the scales
+                    # of the first of them (Quark's ``bias_to_quantize``)
+                    n.input[k] = cache[("b32", x)]
+                    continue
                 w_dq = n.input[1]
                 sx = act_scale(n.input[0])
                 w_scale_name = (
@@ -1105,6 +1133,7 @@ def quantize_full_qdq(
                         axis=0,
                     )
                 )
+                cache[("b32", x)] = out
                 n.input[k] = out
             elif int8_constants and not (
                 align_eltwise_dtype and n.op_type in _ELTWISE_OPS

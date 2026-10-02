@@ -1974,12 +1974,23 @@ class ModelQuantizer:
             # float model (BN folds, Pad fusion, ...)
             from onnxsim.quark_convert import expand_hardswish, graph_cleanup
 
-            if opts.get("OptimizeModel", True):
+            # (``UseRuntimeOptimizers`` False: onnxsim's own reproductions of
+            # the passes, for environments where Quark's would not be found)
+            runtime = bool(opts.get("UseRuntimeOptimizers", True))
+            if opts.get("OptimizeModel", True) and not runtime:
                 work = expand_hardswish(work)
             work = graph_cleanup(
                 work,
                 bool(opts.get("OptimizeModel", True)),
                 bool(opts.get("SimplifyModel", True)),
+                runtime=runtime,
+                slim_config=opts.get("SimplifyModelOptions"),
+                copy_bias_ops=(
+                    None
+                    if self._calib_method(act)
+                    in ("minmse_pof2", "nonoverflow", "layerwise_percentile")
+                    else opts.get("CopyBiasInit", ("Conv", "ConvTranspose", "Gemm"))
+                ),
             )
         # Quark's order: CLE (stem equalization first), SmoothQuant, Quarot
         if "cle" in by_name:
@@ -2007,6 +2018,30 @@ class ModelQuantizer:
         work = convert_for_npu(
             work, opts, lambda n: n.name not in keep, default=conv_default
         )
+        # Quark topologically sorts the float graph (with its own sort) before the
+        # quantizer visits it, and quantizes the op types of its registries only
+        from onnxsim.quark_marking import quark_op_types, quark_sorted, skipped_nodes
+
+        work = quark_sorted(work)
+        ext = self._extended(act, wt)
+        cnn_types: "Optional[set[str]]" = None
+        if op_types is None and not opts.get("QuantizeAllOpTypes"):
+            cnn_types = set(
+                quark_op_types(
+                    npu_cnn or ext, opts.get("ExtraOpTypesToQuantize") or ()
+                )
+            )
+            if opts.get("ConvertBNToConv", conv_default):
+                cnn_types.add("BatchNormalization")
+        scope_types = op_types if op_types is not None else cnn_types
+        skip_nodes = skipped_nodes(
+            work,
+            scope_types,
+            exclude,
+            # (every Quark preset sets it; a bare QConfig does not)
+            force_no_input_check=bool(opts.get("ForceQuantizeNoInputCheck", True)),
+            direct_pool=not (ext or npu_cnn),
+        )
         # Quark adds BatchNormalization to the op types it quantizes when it
         # converts BNs; without ConvertBNToConv a leftover one stays float
         bn_quantized = bool(opts.get("ConvertBNToConv", conv_default))
@@ -2019,9 +2054,14 @@ class ModelQuantizer:
         qkw: Dict[str, Any] = dict(
             calibration_data=calibration[:cal_size] if cal_size else calibration,
             activation_dtype=act_dtype,
-            op_types=op_types if bn_quantized else _without_batch_norm(work, op_types),
+            op_types=(
+                scope_types
+                if bn_quantized or scope_types is not None
+                else _without_batch_norm(work, op_types)
+            ),
             float_clamp_input=op_types is not None,
             exclude_nodes=exclude,
+            skip_nodes=skip_nodes,
             method=cal_method,
             calibrate_options=cal_options,
             symmetric_activations=act_sym,

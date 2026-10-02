@@ -560,7 +560,9 @@ def simulate_dpu(
             inferred = onnx.shape_inference.infer_shapes(model)
             shapes = {
                 vi.name: [d.dim_value for d in vi.type.tensor_type.shape.dim]
-                for vi in list(inferred.graph.value_info) + list(inferred.graph.input)
+                # (Quark looks shapes up in ``value_info`` alone: a graph input
+                # or output has none, and its pool / mean is left unconverted)
+                for vi in inferred.graph.value_info
                 if vi.type.HasField("tensor_type")
             }
         except Exception:  # pragma: no cover - shape inference failure

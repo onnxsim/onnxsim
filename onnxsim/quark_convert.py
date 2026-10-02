@@ -34,7 +34,7 @@ clipping at 6.
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 import onnx
@@ -348,19 +348,151 @@ def remove_identity(model: onnx.ModelProto) -> onnx.ModelProto:
     return out
 
 
+def remove_input_init(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Quark's ``RemoveInputInit``: initializers that are also listed as graph
+    inputs stop being inputs (ONNX Runtime does not fold what is overridable)."""
+    out = _copy(model)
+    g = out.graph
+    names = {t.name for t in g.initializer}
+    keep = [i for i in g.input if i.name not in names]
+    del g.input[:]
+    g.input.extend(keep)
+    if out.ir_version < 4:
+        out.ir_version = 7
+    return out
+
+
+def duplicate_shared_biases(
+    model: onnx.ModelProto,
+    op_types: Sequence[str] = ("Conv", "ConvTranspose", "Gemm"),
+) -> onnx.ModelProto:
+    """Quark's ``CopyBiasInit``: a bias initializer read by several ``Conv`` /
+    ``ConvTranspose`` / ``Gemm`` nodes is copied, so that each of them owns one
+    (the first reader keeps the original, later ones read ``duplicated<name><k>``)
+    and each is quantized on its own."""
+    out = _copy(model)
+    g = out.graph
+    inits = {t.name: t for t in g.initializer}
+    used: Dict[str, int] = {}
+    for n in g.node:
+        if n.op_type not in op_types or len(n.input) < 3:
+            continue
+        name = n.input[2]
+        if name not in inits:
+            continue
+        if name in used:
+            used[name] += 1
+            new = onnx.TensorProto()
+            new.CopyFrom(inits[name])
+            new.name = f"duplicated{name}{used[name]}"
+            n.input[2] = new.name
+            g.initializer.append(new)
+        else:
+            used[name] = 1
+    return out
+
+
+def onnxslim_simplify(
+    model: onnx.ModelProto, config: Optional[Dict[str, Any]] = None
+) -> Optional[onnx.ModelProto]:
+    """Quark's ``SimplifyModel``: ``onnxslim.slim`` on the model, ``None`` when
+    onnxslim is not installed or fails (Quark then keeps the model as it is)."""
+    try:
+        from onnxslim import slim
+    except Exception:
+        return None
+    try:
+        result = slim(model, **(config or {}))
+    except Exception:
+        return None
+    return result if isinstance(result, onnx.ModelProto) else None
+
+
+def ort_basic_optimize(model: onnx.ModelProto) -> Optional[onnx.ModelProto]:
+    """Quark's ``OptimizeModel`` first stage: ONNX Runtime's basic graph
+    optimizations (constant folding, Conv + Add / Mul / BatchNorm folding, Relu
+    + Clip, redundant-node elimination, common sub-expression elimination, Pad
+    fusion, ...; ``ConstantSharing`` off, as Quark runs it). ``None`` when
+    onnxruntime is missing or cannot load the model."""
+    try:
+        import onnxruntime as ort
+    except Exception:
+        return None
+    import os
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "optimized_model.onnx")
+            so = ort.SessionOptions()
+            so.optimized_model_filepath = path
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+            so.log_severity_level = 4
+            try:
+                ort.InferenceSession(
+                    model.SerializeToString(),
+                    so,
+                    providers=["CPUExecutionProvider"],
+                    disabled_optimizers=["ConstantSharing"],
+                )
+            except TypeError:  # pragma: no cover - onnxruntime < 1.10
+                ort.InferenceSession(
+                    model.SerializeToString(), so, providers=["CPUExecutionProvider"]
+                )
+            return onnx.load(path)
+    except Exception:
+        return None
+
+
 def graph_cleanup(
-    model: onnx.ModelProto, optimize: bool = True, simplify: bool = True
+    model: onnx.ModelProto,
+    optimize: bool = True,
+    simplify: bool = True,
+    runtime: bool = False,
+    slim_config: Optional[Dict[str, Any]] = None,
+    copy_bias_ops: Optional[Sequence[str]] = ("Conv", "ConvTranspose", "Gemm"),
 ) -> onnx.ModelProto:
     """What Quark's float-model optimizers (onnxslim's ``SimplifyModel`` and ONNX
     Runtime's ``OptimizeModel``, ``optimize``) do that changes what is
     quantized: ``Identity`` removal, Pad fusion into a ``Conv`` and BatchNorm
     folding into a ``Conv`` / ``ConvTranspose`` / ``Gemm``. (Pad fusion into an ``AveragePool`` and HardSwish
-    inlining, :func:`expand_hardswish`, are ONNX Runtime's alone.)"""
-    out = remove_identity(model)
+    inlining, :func:`expand_hardswish`, are ONNX Runtime's alone.)
+
+    ``runtime=True`` runs the real optimizers where they are installed, in
+    Quark's order (onnxslim, then ``RemoveInputInit`` and ``CopyBiasInit``, then
+    ONNX Runtime's basic level) and falls back to the Python reproductions above
+    for the one that is missing -- ONNX Runtime also folds constants, merges
+    ``Conv`` + ``Add`` / ``Mul``, fuses ``Relu`` + ``Clip``, drops no-op nodes
+    and merges duplicated nodes, which the reproductions do not.
+    ``copy_bias_ops`` are the op types whose shared bias is copied per node
+    (Quark's ``CopyBiasInit``; it does so for the min / max, entropy, percentile
+    and distribution calibrations only -- not for the power-of-two ones, where a
+    shared bias is quantized once, with its first reader's scales -- so the caller
+    passes ``None`` there)."""
+    if not runtime:
+        out = remove_identity(model)
+        if simplify:
+            out = fuse_pad(out, pools=False, shared=True)
+        if optimize:
+            out = fuse_pad(out, pools=True, shared=False)
+        return fold_batch_norm(out, transposed_and_gemm=True)
+    out = model
     if simplify:
-        out = fuse_pad(out, pools=False, shared=True)
+        slimmed = onnxslim_simplify(out, slim_config)
+        if slimmed is None:
+            out = fuse_pad(remove_identity(out), pools=False, shared=True)
+        else:
+            out = slimmed
+    out = remove_input_init(out)
+    if copy_bias_ops:
+        out = duplicate_shared_biases(out, copy_bias_ops)
     if optimize:
-        out = fuse_pad(out, pools=True, shared=False)
+        optimized = ort_basic_optimize(out)
+        if optimized is None:
+            out = fuse_pad(remove_identity(expand_hardswish(out)), pools=True, shared=False)
+            out = fold_batch_norm(out)
+        else:
+            out = optimized
     return fold_batch_norm(out, transposed_and_gemm=True)
 
 
@@ -610,9 +742,13 @@ def convert_clip_to_relu(
 __all__: Any = [
     "convert_clip_to_relu",
     "convert_for_npu",
+    "duplicate_shared_biases",
     "expand_hardswish",
     "fold_batch_norm",
     "fuse_pad",
     "graph_cleanup",
+    "onnxslim_simplify",
+    "ort_basic_optimize",
     "remove_identity",
+    "remove_input_init",
 ]

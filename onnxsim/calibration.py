@@ -625,6 +625,11 @@ class _Pof2Histogram:
             diff = float(np.sum(h64 * (c64 - dq) ** 2))
             if diff < best:
                 best, best_s = diff, s
+        if qmin == 0 and zp == 0:
+            # an all-zero tensor: Quark's zero point is 0 (not the centre), so
+            # its threshold range is [0, qmax * s], which the symmetric
+            # quantizer then reads as twice the scale
+            return float(2 * best_s)
         return float(best_s)
 
 
