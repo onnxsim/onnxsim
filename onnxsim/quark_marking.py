@@ -260,6 +260,7 @@ def skipped_nodes(
     direct_pool: bool = False,
     order: Optional[Sequence[onnx.NodeProto]] = None,
     unquantized_ops: Iterable[str] = (),
+    marked_out: "Optional[List[str]]" = None,
 ) -> Set[str]:
     """Names (first outputs, for unnamed nodes) of the nodes in ``op_types`` whose
     Quark op quantizer marks nothing, visiting the nodes in ``order`` (default:
@@ -276,7 +277,8 @@ def skipped_nodes(
       ``QDQMaxPool`` / ``QDQResize`` return without marking anything below opset
       12 / 11: see :func:`opset_unquantized_ops`).
 
-    Everything else marks its inputs and outputs."""
+    Everything else marks its inputs and outputs. ``marked_out``, when given, is
+    filled with the marked tensors in the order the nodes marked them."""
     types = None if op_types is None else set(op_types)
     excl = set(excluded)
     unquantized = set(unquantized_ops)
@@ -287,6 +289,17 @@ def skipped_nodes(
         direct.add("AveragePool")
     marked: Set[str] = set()
     skipped: Set[str] = set()
+
+    class _Marks(set):  # a set that also records the order tensors were added in
+        def update(self, *others: Iterable[str]) -> None:  # type: ignore[override]
+            for names in others:
+                for x in names:
+                    if x not in self:
+                        self.add(x)
+                        if marked_out is not None:
+                            marked_out.append(x)
+
+    marked = _Marks()
 
     def key(n: onnx.NodeProto) -> str:
         return n.name or (n.output[0] if n.output else "")
@@ -350,6 +363,10 @@ def skipped_nodes(
                 skipped.add(key(n))
         elif op == "Split":
             marked.update(ins[:1] + outs)
+        elif op in ("Conv", "ConvTranspose", "Gemm"):
+            # (QDQConv / QDQGemm: the weight and the bias are quantized as such, so
+            # only when they are initializers)
+            marked.update(ins[:1] + [x for x in ins[1:3] if x in inits] + outs)
         else:
             marked.update(ins + outs)
     return skipped
