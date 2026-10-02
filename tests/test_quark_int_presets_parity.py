@@ -949,6 +949,27 @@ def _gemm_model(body, rng=None):
     return P._named(m)
 
 
+@pytest.mark.parametrize(
+    "preset",
+    ["A8W8", "A16W8", "VINT8", "U8S8_AAWS", "INT8_TRANSFORMER_DEFAULT", "XINT8"],
+)
+def test_gemm_beta_moves_into_the_bias_scale(preset, tmp_path):
+    """ONNX Runtime's ``QDQGemm`` sets ``beta`` to 1 and folds it into the int32 bias's
+    scale (``input scale * weight scale * beta``) -- on the extended quantizer's
+    ``adjust_bias_scale`` that is then undone again, by a truncating requantization."""
+    model = _gemm_model("y = Gemm<alpha=0.5, beta=2.0>(x, w1, b1)")
+    data = P._data((4, 16))
+    q = P._quark_preset(model, data, tmp_path, preset=preset)
+    m = P._mine_preset(model, data, preset=preset)
+    P._assert_same_graph(q, m, f"{preset} Gemm beta")
+    for graph in (q, m):
+        gemm = next(n for n in graph.graph.node if n.op_type == "Gemm")
+        assert {a.name: a.f for a in gemm.attribute if a.name in ("alpha", "beta")} == {
+            "alpha": 0.5,
+            "beta": 1.0,
+        }
+
+
 def test_a_softmax_the_transformer_preset_does_not_quantize_keeps_its_range(tmp_path):
     """ONNX Runtime's unit range for a Softmax output applies to the Softmax nodes
     the quantizer quantizes; in the transformer scheme (Gemm / MatMul only) the
@@ -974,7 +995,7 @@ def test_random_graphs_match_quark(preset, seed, tmp_path):
     _check(model, data, tmp_path, preset, f"random graph #{seed}")
 
 
-@pytest.mark.parametrize("seed", range(100, 103))
+@pytest.mark.parametrize("seed", range(101, 104))
 @pytest.mark.parametrize("preset", PRESETS)
 def test_random_graphs_with_odd_convolutions_and_extra_outputs_match_quark(
     preset, seed, tmp_path

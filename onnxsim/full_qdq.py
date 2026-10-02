@@ -429,6 +429,8 @@ def quantize_full_qdq(
     reduce_range: bool = False,
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
+    ort_gemm_beta: bool = False,
+    adjust_bias_scale: Optional[bool] = None,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
     calibrate_options: Optional[Dict[str, object]] = None,
     remove_qdq_after: Optional[Iterable[str]] = None,
@@ -513,6 +515,14 @@ def quantize_full_qdq(
     :param align_eltwise_dtype: with ``int8_constants``, constant operands of
             Add / Sub / Mul / Div / Min / Max keep the activation dtype
             (Quark's ``AlignEltwiseQuantType``, set by its ``A16W8`` presets)
+    :param ort_gemm_beta: ONNX Runtime's ``QDQGemm`` (Quark's): a quantized
+            ``Gemm`` with a constant bias gets ``beta = 1`` and the beta moves into
+            the int32 bias scale (``input scale * weight scale * beta``) -- the
+            bias then stands for the original bias, not ``beta`` times it
+    :param adjust_bias_scale: Quark's ``adjust_bias_scale`` for the int32 biases:
+            ``None`` -- run it after each round of the ``align_ops`` loop (if
+            any); ``True`` -- also once without any alignment (its extended
+            quantizer's refinement always runs); ``False`` -- never
     :param softmax_unit_range: calibrate every Softmax output to exactly
             ``(0, 1)`` instead of its observed range (what ONNX Runtime's QDQ
             quantizer, and so Quark's non-power-of-two presets, do)
@@ -869,6 +879,10 @@ def quantize_full_qdq(
         qp_history += _align_qparams(
             g, set(align_ops), set(acts) | graph_inputs, qp, qdt, share_root
         )
+    elif adjust_bias_scale:
+        qp_history.append(dict(qp))
+    if adjust_bias_scale is False:
+        qp_history = qp_history[:1]
 
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
     if opset < 13:
@@ -1131,6 +1145,16 @@ def quantize_full_qdq(
     for n in qnodes:
         if id(n) in removed:
             continue
+        gemm_beta = 1.0
+        if (
+            ort_gemm_beta
+            and n.op_type == "Gemm"
+            and len(n.input) == 3
+            and n.input[2] in inits
+        ):
+            for a in n.attribute:
+                if a.name == "beta":
+                    gemm_beta, a.f = float(a.f), 1.0
         slope_only = False
         if not all(
             x in act_set and x in qp
@@ -1293,6 +1317,8 @@ def quantize_full_qdq(
                 if sx is None or ws is None:
                     continue  # weight or input not quantized: keep a float bias
                 s = (sx * np.broadcast_to(ws, w.shape)).astype(np.float32)
+                if gemm_beta != 1.0:
+                    s = (s * np.float32(gemm_beta)).astype(np.float32)
                 s = np.maximum(s, 1e-30)
                 # float64 division, as ONNX Runtime's quantize_bias_static does: a
                 # float32 quotient loses integer precision above 2**24 (int16 x

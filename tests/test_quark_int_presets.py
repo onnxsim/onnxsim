@@ -385,7 +385,7 @@ def _dq_of(model, name):
     by_out = {o: n for n in model.graph.node for o in n.output}
     inits = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
     dq = by_out[name]
-    return dq, inits[dq.input[0]], inits[dq.input[1]], inits[dq.input[2]]
+    return dq, inits.get(dq.input[0]), inits[dq.input[1]], inits[dq.input[2]]
 
 
 @pytest.mark.parametrize("preset", ["A16W8", "A8W8"])
@@ -467,3 +467,20 @@ def test_flatten_keeps_its_own_range_when_a_pool_alignment_moves_its_input():
     params = _q_params(q)
     assert params["g"] == params["c0"]  # (AlignPool: the pool takes its input's)
     assert "f" in params and params["f"] != params["g"]
+
+
+@pytest.mark.parametrize("preset", ["S8S8_AAWS", "INT8_TRANSFORMER_DEFAULT", "XINT8"])
+def test_gemm_beta_moves_into_the_int32_bias_scale(preset):
+    model = _gemm_model("y = Gemm<alpha=0.5, beta=2.0>(x, w1, b1)")
+    q = _quantize(model, preset, _data((4, 16)))
+    gemm = next(n for n in q.graph.node if n.op_type == "Gemm")
+    assert {a.name: a.f for a in gemm.attribute if a.name in ("alpha", "beta")} == {
+        "alpha": 0.5,
+        "beta": 1.0,
+    }
+    if preset == "XINT8":
+        return  # (int8 biases: no scale of input * weight * beta)
+    dq, codes, scale, _ = _dq_of(q, gemm.input[2])
+    act, wt = _dq_of(q, gemm.input[0]), _dq_of(q, gemm.input[1])
+    want = (act[2] * wt[2] * np.float32(2.0)).astype(np.float32)
+    np.testing.assert_array_equal(scale, want)

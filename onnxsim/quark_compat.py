@@ -2394,6 +2394,14 @@ class ModelQuantizer:
             reduce_range=bool(opts.get("ReduceRange", False)),
             # (Quark applies it to the extended quantizer only: elsewhere it warns
             # and does nothing)
+            ort_gemm_beta=True,
+            # (the extended quantizer's refinement -- alignment, then the bias
+            # scale adjustment -- always runs)
+            adjust_bias_scale=(
+                bool(opts.get("AdjustBiasScale", True))
+                if self._extended(act, wt) and not npu_cnn
+                else None
+            ),
             align_eltwise_dtype=bool(
                 self.config.extra_options.get("AlignEltwiseQuantType")
                 and self._extended(act, wt)
