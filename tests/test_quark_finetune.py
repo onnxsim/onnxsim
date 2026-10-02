@@ -3,6 +3,9 @@ Quark's ``FastFinetune`` (AdaRound / AdaQuant). The comparison with the real
 package lives in ``tests/test_quark_finetune_parity.py``.
 """
 
+import json
+import warnings
+
 import numpy as np
 import onnx
 import onnxruntime as ort
@@ -323,15 +326,18 @@ def test_block_loss_is_input_qdq_weight_bias_and_optionally_output_qdq():
     assert expected[True] != pytest.approx(expected[False], rel=1e-3)
 
 
-def test_relu_folded_into_the_output_quantizer_is_trained_as_conv_plus_relu(cnn, cnn_q):
-    # quantize_full_qdq drops the Relu and lets the output Q's range clamp at
-    # 0; Quark's graphs keep the Relu node, so the block must target the float
-    # *Relu* output, or output_qdq would chase negative float values
+def test_relu_folded_into_the_output_quantizer_is_trained_against_the_pre_relu_output(
+    cnn, cnn_q
+):
+    # quantize_full_qdq drops the Relu and lets the output Q's range clamp at 0
+    # (Quark's INT8_CNN_DEFAULT does the same). There is no Relu node left, so
+    # Quark's block ends at the op's own output and its float target is the
+    # float model's *pre-Relu* tensor
     model, _ = cnn
     assert [n.op_type for n in cnn_q.graph.node if n.op_type == "Relu"] == []
     blocks = qf._find_blocks(model, cnn_q, qf.FinetuneOptions())
-    assert [type(b.act).__name__ for b in blocks] == ["_Relu", "_Relu", "NoneType"]
-    assert [b.f_end for b in blocks] == ["r", "r2", "y"]
+    assert [type(b.act).__name__ for b in blocks] == ["NoneType"] * 3
+    assert [b.f_end for b in blocks] == ["c1", "c2", "y"]
 
 
 def test_blocks_found_for_every_target_op_type():
@@ -1383,15 +1389,36 @@ def test_finetune_options_accept_asymmetric_uint8_weights(cnn):
         assert q.last_weight_rounding[algo().name]
 
 
-def test_gptq_still_needs_int8_weights():
-    cfg = qc.QConfig.get_default_config("INT16_CNN_DEFAULT")
+@pytest.mark.parametrize("preset", ["INT16_CNN_DEFAULT", "U8U8_AAWA"])
+def test_gptq_runs_on_int16_and_uint8_weight_presets_like_quarks(preset):
+    # Quark's GPTQ re-grids the float weights to 8 bits whatever the preset's
+    # weight dtype and never raises: the weights end up int8 here
+    cfg = qc.QConfig.get_default_config(preset)
     cfg.algo_config = [qc.GPTQConfig()]
     model = _model("y = Gemm(x, w)", [_w("w", 8, 4)], io="float[N,8] x) => (float y")
-    with pytest.raises(NotImplementedError, match="gptq"):
-        qc.ModelQuantizer(cfg).quantize_model(
-            model,
-            calibration_data_reader=_Reader([{"x": np.ones((2, 8), np.float32)}]),
-        )
+    quantizer = qc.ModelQuantizer(cfg)
+    out = quantizer.quantize_model(
+        model, calibration_data_reader=_Reader([{"x": np.ones((2, 8), np.float32)}])
+    )
+    assert [r.op for r in quantizer.last_weight_rounding["gptq"]] == ["Gemm"]
+    wq = [
+        numpy_helper.to_array(t)
+        for t in out.graph.initializer
+        if t.name.startswith("w/")
+    ]
+    assert any(a.dtype == np.int8 and a.shape == (8, 4) for a in wq)
+    assert any("instead of" in a for a in quantizer.last_approximations)
+
+
+def test_legacy_adaquant_that_matches_no_layer_says_so():
+    cfg = qc.QConfig.get_default_config("INT16_CNN_DEFAULT")
+    cfg.algo_config = [qc.AdaQuantConfig(legacy_engine=True, num_iterations=2)]
+    model = _model("y = Gemm(x, w)", [_w("w", 8, 4)], io="float[N,8] x) => (float y")
+    quantizer = qc.ModelQuantizer(cfg)
+    quantizer.quantize_model(
+        model, calibration_data_reader=_Reader([{"x": np.ones((2, 8), np.float32)}])
+    )
+    assert any("no layer it can optimize" in a for a in quantizer.last_approximations)
 
 
 def test_matmul_on_a_4d_activation_is_a_block_like_in_quark():
@@ -1407,3 +1434,275 @@ def test_matmul_on_a_4d_activation_is_a_block_like_in_quark():
     )
     assert [rep.op for rep in reports] == ["MatMul", "MatMul"]
     assert all(rep.error_after <= rep.error_before for rep in reports)
+
+
+# -- size-1 broadcasting like torch's ``quant - float`` ----------------------------------------
+
+
+def test_diff_broadcasts_size_one_axes_and_skips_other_mismatches():
+    a, b = np.ones((4, 3)), np.arange(3.0).reshape(1, 3)
+    np.testing.assert_array_equal(qf._diff(a, b), a - b)
+    np.testing.assert_array_equal(qf._diff(b, a), b - a)  # (the other way round)
+    with pytest.raises(qf._SkipLayer):
+        qf._diff(np.ones((4, 3)), np.ones((2, 3)))
+
+
+def test_unbroadcast_sums_back_over_the_broadcast_axes():
+    g = np.arange(24.0).reshape(2, 3, 4)
+    np.testing.assert_array_equal(qf._unbroadcast(g, (2, 3, 4)), g)
+    np.testing.assert_array_equal(
+        qf._unbroadcast(g, (1, 3, 4)), g.sum(0, keepdims=True)
+    )
+    np.testing.assert_array_equal(
+        qf._unbroadcast(g, (2, 1, 4)), g.sum(1, keepdims=True)
+    )
+    np.testing.assert_array_equal(qf._unbroadcast(g, (4,)), g.sum((0, 1)))
+
+
+@pytest.mark.parametrize("out_rows, ref_rows", [(5, 1), (1, 5)])
+def test_reconstruction_gradient_through_a_broadcast_target_is_exact(
+    out_rows, ref_rows
+):
+    # the block output and its target differ along a size-1 axis: the loss is
+    # that of the broadcast difference and the gradient w.r.t. the *output* sums
+    # over the broadcast rows (checked by finite differences; an identity
+    # "input" makes the weight gradient the output gradient)
+    r = np.random.default_rng(3)
+    blk = qf._Block(
+        "b", "MatMul", qf._MatMulOp(False), np.zeros((3, 2)), None, None, None, None,  # type: ignore[arg-type]
+        1.0, 1.0, None, "x", "x", "y", None, None,
+    )  # fmt: skip
+    y = r.standard_normal((out_rows, 3))
+    ref = r.standard_normal((ref_rows, 3))
+
+    def loss_of(yy):
+        big = yy - ref
+        return np.sum(big**2) / big.shape[0]
+
+    loss, dy, _ = qf._recon_grad(blk, (np.eye(out_rows), y, y, None), y, ref)
+    assert loss == pytest.approx(loss_of(y))
+    num = np.zeros_like(y)
+    for idx in np.ndindex(*y.shape):
+        d = np.zeros_like(y)
+        d[idx] = 1e-6
+        num[idx] = (loss_of(y + d) - loss_of(y - d)) / 2e-6
+    np.testing.assert_allclose(dy, num, rtol=1e-5, atol=1e-8)
+
+
+def test_a_target_with_fewer_rows_than_the_samples_skips_the_layer():
+    # Gemm(transA) on x[K, 1]: K samples but one target row -- Quark's torch.cat
+    # fails once the mini-batch draws a sample >= 1 (ours raised an IndexError)
+    k = 3
+    r = np.random.default_rng(4)
+    model = _model(
+        "y = Gemm<transA=1>(x, w1, b1)",
+        [_w("w1", k, 4, rng=r), _w("b1", 4, scale=0.1, rng=r)],
+        io=f"float[{k},1] x) => (float y",
+    )
+    data = [{"x": r.standard_normal((k, 1)).astype(np.float32)}]
+    q = _qdq(model, data)
+    out, reports = qf.finetune(
+        model, q, data, qf.FinetuneOptions(num_iterations=10, batch_size=2)
+    )
+    assert reports == [] and out.SerializeToString() == q.SerializeToString()
+
+
+# -- SaveAndRestore ----------------------------------------------------------------------------
+
+
+def test_save_checkpoint_writes_what_quark_writes(tmp_path):
+    model = _model("y = Gemm(x, w)", [_w("w", 4, 2)], io="float[N,4] x) => (float y")
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps({"tensors_range": {"x": [0, 1]}, "model_to_finetune": "old"})
+    )
+    qf.save_checkpoint(str(path), 1, 4, model)
+    saved = json.loads(path.read_text())
+    assert saved["tensors_range"] == {"x": [0, 1]}
+    assert saved["layers_to_finetune"] == [1, 2, 3]
+    assert saved["model_to_finetune"] == str(tmp_path / "state.onnx")
+    assert (
+        onnx.load(saved["model_to_finetune"]).SerializeToString()
+        == model.SerializeToString()
+    )
+
+
+def test_load_saved_layers(tmp_path):
+    model = _model("y = Gemm(x, w)", [_w("w", 4, 2)], io="float[N,4] x) => (float y")
+    path = tmp_path / "state.json"
+    assert qf.load_saved_layers(str(path)) is None  # no file yet
+    assert qf.load_saved_layers(None) is None
+    path.write_text(json.dumps({"layers_to_finetune": []}))
+    assert qf.load_saved_layers(str(path)) is None  # an empty list means "all"
+    path.write_text(json.dumps({"layers_to_finetune": [2, 0]}))
+    assert qf.load_saved_layers(str(path)) == [2, 0]
+    # Quark loads the saved model it then ignores: a missing file raises
+    path.write_text(json.dumps({"model_to_finetune": str(tmp_path / "gone.onnx")}))
+    with pytest.raises(Exception):  # noqa: B017 (onnx's own file error)
+        qf.load_saved_layers(str(path))
+    onnx.save(model, str(tmp_path / "there.onnx"))
+    path.write_text(json.dumps({"model_to_finetune": str(tmp_path / "there.onnx")}))
+    assert qf.load_saved_layers(str(path)) is None
+
+
+def test_finetune_layers_and_checkpoint_follow_quarks_loop(cnn, cnn_q):
+    model, data = cnn
+    seen = []
+    opt = qf.FinetuneOptions(num_iterations=5, batch_size=2, guard=False)
+    out, reports = qf.finetune(
+        model, cnn_q, data, opt, layers=[2, 0, 7, 0],
+        checkpoint=lambda i, n, m: seen.append((i, n, len(m.graph.node))),
+    )  # fmt: skip
+    assert [r.name for r in reports] == [
+        b.name for i, b in enumerate(qf._find_blocks(model, cnn_q, opt)) if i in (0, 2)
+    ]
+    assert [s[:2] for s in seen] == [(0, 3), (2, 3)]  # ascending, once, in range
+    # a list overrides select_max_mem_layer, which would pick one layer only
+    opt2 = qf.FinetuneOptions(
+        num_iterations=5, batch_size=2, select_max_mem_layer=True, guard=False
+    )
+    _, reports = qf.finetune(model, cnn_q, data, opt2, layers=[0, 1, 2])
+    assert len(reports) == 3
+
+
+def test_quantizer_writes_and_reads_the_save_and_restore_file(tmp_path, cnn):
+    model, data = cnn
+    saver = tmp_path / "state.json"
+    cfg = qc.QConfig.get_default_config("A8W8_ADAROUND")
+    cfg.algo_config[0].params.update(num_iterations=5, batch_size=2, early_stop=False)
+    cfg.extra_options["SaveAndRestore"] = str(saver)
+    quantizer = qc.ModelQuantizer(cfg)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        quantizer.quantize_model(model, calibration_data_reader=_Reader(list(data)))
+        assert len(quantizer.last_weight_rounding["adaround"]) == 3
+        assert json.loads(saver.read_text())["layers_to_finetune"] == [2]
+        assert (tmp_path / "state.onnx").exists()
+        quantizer.quantize_model(model, calibration_data_reader=_Reader(list(data)))
+    assert len(quantizer.last_weight_rounding["adaround"]) == 1
+
+
+# -- selective update, per module ---------------------------------------------------------------
+
+
+def test_selective_update_drops_a_module_whose_error_got_worse_than_its_initial(
+    cnn, cnn_q
+):
+    model, data = cnn
+    # a huge learning rate wrecks every layer's reconstruction error
+    opt = qf.FinetuneOptions(
+        algorithm="adaquant", num_iterations=20, learning_rate=0.5, batch_size=2,
+        selective_update=False, guard=False,
+    )  # fmt: skip
+    plain, plain_reports = qf.finetune(model, cnn_q, data, opt)
+    assert all(r.accepted for r in plain_reports)
+    opt.selective_update = True
+    out, reports = qf.finetune(model, cnn_q, data, opt)
+    assert not all(r.accepted for r in reports)
+    for r in reports:  # a dropped module leaves its codes alone
+        assert r.accepted or r.error_after == r.error_before
+    dropped = [r.name for r in reports if not r.accepted]
+    codes_in, codes_out = _codes(cnn_q), _codes(out)
+    weight_of = {b.name: b.qw.name for b in qf._find_blocks(model, cnn_q, opt)}
+    assert dropped
+    for d in dropped:
+        np.testing.assert_array_equal(codes_in[weight_of[d]], codes_out[weight_of[d]])
+
+
+def test_selective_update_does_not_apply_per_module_in_the_dataloader_loop(mlp_ll):
+    model, data, q = mlp_ll
+    opt = qf.FinetuneOptions(
+        algorithm="adaquant", num_iterations=10, learning_rate=0.5, batch_size=1,
+        mem_opt_level=2, selective_update=False, guard=False,
+    )  # fmt: skip
+    out_plain, _ = qf.finetune(model, q, data, opt)
+    opt.selective_update = True
+    out_sel, _ = qf.finetune(model, q, data, opt)
+    # (the whole-model L2 check can still drop layers, but a per-module check
+    # would drop *these* ones: with lr 0.5 both layers' errors get worse)
+    assert _codes(out_sel).keys() == _codes(out_plain).keys()
+
+
+# -- float32 AdaQuant -----------------------------------------------------------------------------
+
+
+def test_float32_defaults_to_adaquant_only():
+    assert qf.FinetuneOptions(algorithm="adaquant").use_float32()
+    assert not qf.FinetuneOptions(algorithm="adaround").use_float32()
+    assert not qf.FinetuneOptions(algorithm="adaquant", float32=False).use_float32()
+    assert qf.FinetuneOptions(algorithm="adaround", float32=True).use_float32()
+
+
+def test_float32_quantizer_matches_a_float32_reference():
+    r = np.random.default_rng(5)
+    w = (r.standard_normal((6, 5)) * 0.3).astype(np.float32)
+    scale = np.full(w.shape, 0.011, np.float64)
+    qc_ = qf._QConst(
+        "w", np.zeros(w.shape, np.int8), scale, np.zeros(w.shape), -128.0, 127.0
+    )
+    f = np.float32
+    q = np.round(w / f(0.011))
+    ref = np.clip(q, f(-128), f(127)) * f(0.011)
+    got, mask = qc_.ste32(w)
+    assert got.dtype == np.float32 and mask.all()
+    np.testing.assert_array_equal(got, ref)
+    np.testing.assert_array_equal(qc_.encode32(w), np.clip(q, -128, 127))
+
+
+def test_float32_adam_step_is_adams_update_in_float32():
+    r = np.random.default_rng(6)
+    p = r.standard_normal(50).astype(np.float32)
+    m, v = np.zeros(50, np.float32), np.zeros(50, np.float32)
+    pe, me, ve = p.astype(np.float64), np.zeros(50), np.zeros(50)
+    for t in range(5):
+        g = r.standard_normal(50).astype(np.float32) * 1e-2
+        p = qf._adam_step32(p, g, m, v, t, 1e-3)
+        pe = qf._adam_step(pe, g.astype(np.float64), me, ve, t, 1e-3)
+        assert p.dtype == np.float32
+    np.testing.assert_allclose(p, pe, rtol=0, atol=1e-6)
+
+
+def test_float32_loss_gradient_is_two_err_over_n_up_to_rounding():
+    r = np.random.default_rng(8)
+    blk = qf._Block(
+        "b", "MatMul", qf._MatMulOp(False), np.zeros((3, 2)), None, None, None, None,  # type: ignore[arg-type]
+        1.0, 1.0, None, "x", "x", "y", None, None,
+    )  # fmt: skip
+    x = r.standard_normal((4, 3)).astype(np.float32)
+    y = r.standard_normal((4, 3)).astype(np.float32)
+    ref = r.standard_normal((4, 3)).astype(np.float32)
+    cache = (x, y, y, None)
+    l32, dw32, _ = qf._recon_grad32(blk, cache, y, ref)
+    l64, dw64, _ = qf._recon_grad(
+        blk,
+        (x.astype(np.float64), y, y, None),
+        y.astype(np.float64),
+        ref.astype(np.float64),
+    )
+    assert dw32.dtype == np.float32
+    assert l32 == pytest.approx(l64, rel=1e-5)
+    np.testing.assert_allclose(dw32, dw64, rtol=1e-5, atol=1e-6)
+
+
+def test_float32_adaquant_trains_and_float64_is_still_available(cnn, cnn_q):
+    model, data = cnn
+    kw = dict(
+        algorithm="adaquant",
+        num_iterations=20,
+        batch_size=2,
+        learning_rate=1e-3,
+        guard=False,
+        update_bias=True,
+    )
+    a, ra = qf.finetune(model, cnn_q, data, qf.FinetuneOptions(**kw))
+    b, rb = qf.finetune(model, cnn_q, data, qf.FinetuneOptions(**kw, float32=False))
+    assert len(ra) == len(rb) == 3
+    for name, ca in _codes(a).items():
+        cb = _codes(b)[name]
+        # the two arithmetics land on nearby codes: lr=1e-3 amplifies float32
+        # vs float64 rounding by a platform-dependent amount (a couple of codes
+        # on x86, tens of codes of a ~1000-wide 16-bit grid on aarch64 BLAS), so
+        # bound the gap relative to the code range instead of absolutely
+        gap = np.abs(ca.astype(np.int64) - cb.astype(np.int64)).max()
+        assert gap <= max(2, 0.05 * np.abs(ca.astype(np.int64)).max())
+    assert any(not np.array_equal(_codes(a)[k], _codes(cnn_q)[k]) for k in _codes(a))

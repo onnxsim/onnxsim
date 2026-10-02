@@ -5,7 +5,7 @@ This is a port of ``quark.onnx.algorithm.finetuning`` (read from the
 *training loop*, the same *loss* and the same option names / defaults, so that
 ``QConfig`` algo configs (``AdaRoundConfig`` / ``AdaQuantConfig``) mean the
 same thing here as there. Quark runs it on torch; here every gradient is
-hand-derived numpy (float64), so results agree with Quark's *statistically*
+hand-derived numpy (float64; float32 in torch's order for AdaQuant), so results agree with Quark's *statistically*
 (its mini-batches come from ``torch.randperm``), and **exactly** when given the
 same mini-batch indices (``tests/test_quark_finetune_parity.py`` feeds torch's
 own ``randperm`` stream through ``perm_fn``).
@@ -17,6 +17,10 @@ tensor in front of the layer's *input* ``QuantizeLinear`` to the layer's
 output: input Q/DQ, weight Q/DQ, the op, the (quantized) bias, an optional
 following activation (``Relu``, ``PRelu``, ``LeakyRelu``, ``Clip``,
 ``Sigmoid``, ``Tanh``, ``Gelu``, ``Softmax``) and -- with ``output_qdq`` -- the output Q/DQ.
+A ``Relu`` that was folded into the output quantizer (its range starts at 0, as
+in Quark's ``INT8_CNN_DEFAULT`` on a ``MatMul`` / ``Gemm`` / ``Conv`` model) is
+*not* a node any more, so the block ends at the op's own output and, as in
+Quark, its target is the float model's *pre*-Relu tensor.
 The training target is the *float* model's tensor at the same block output,
 the input is the quantized model's pre-quantization tensor (``drop_ratio`` mixes
 it element-wise with the float model's) and the loss is Quark's
@@ -58,7 +62,12 @@ Quark skips them (its driver logs the failure and goes on; probed against
 * a layer whose first forward does not fit its target (``Gemm`` with ``transA``
   only fits when there is one calibration batch whose two axes and the
   mini-batch are all of the same size -- there it *trains*, the "samples" being
-  the rows of ``A``, and so does this port).
+  the rows of ``A``, and so does this port). Torch *broadcasts* ``quant - float``,
+  so an output that differs from its target only along size-1 axes trains too
+  (``transA`` on a single one-row sample: the ``[M, N]`` output minus the
+  ``[1, N]`` target row; the loss sums over the broadcast rows) and so does this
+  port; a target with fewer rows than there are samples (``transA`` with
+  ``M == 1``) fails Quark's ``torch.cat`` and the layer is skipped.
 
 What Quark *does* train, and this port reproduces bit for bit given its random
 stream: 1-D / 2-D / 3-D ``Conv`` and ``ConvTranspose`` (``ConvTranspose`` also
@@ -74,6 +83,24 @@ axis 1 whenever that axis has the bias' length. Activation fake-quantization is
 done in float32 like torch's, which keeps its rounding decisions for 16-bit
 codes (float64 would not).
 
+``AdaQuant`` runs its whole loop in float32 in torch's operation order
+(``FinetuneOptions.float32``, on by default for AdaQuant): the straight-through
+quantizer (``round`` / ``clamp`` / ``(q - zp) * scale``, divided by the scale
+again on the way back), the ``(norm(err, dim=1) ** 2).mean()`` autograd chain
+(``(err / norm) * (2 * norm / N)``) and ``torch.optim.Adam`` (``lerp`` /
+``addcmul`` / ``addcdiv``). Probed against Quark, that is what the chaos of 16-bit
+AdaQuant (a float32 ULP in the forward pass flips ~0.4 % of the codes per
+layer) needs: ``MatMul`` / ``Gemm`` layers come out *bit-identical* to Quark's
+(10 to 300 iterations on int16 and int8 weights), where float64 arithmetic is off by 2-15 %
+of the codes after 10 iterations. What cannot be exact: ``Conv`` / ``ConvTranspose``
+(torch's oneDNN accumulates in an order numpy's im2col product does not
+reproduce), the norm layers and ``Gelu`` / ``Tanh`` / ``Sigmoid`` (their float32
+kernels differ in the last bit), a numpy whose BLAS rounds differently from torch's
+for a given product shape, and torch's vectorized ``sqrt`` (Sleef's 0.5001-ULP one
+differs from IEEE's in ~0.7 % of the values, 1 ULP, inside Adam's denominator);
+there AdaQuant stays chaotic, compare it statistically. AdaRound agrees in float64
+already, so it keeps it.
+
 ``MemOptLevel=2`` is a different training loop in Quark (its ``DataLoader``
 path): samples are whole calibration *batches* (``np.load(f).squeeze(0)``),
 epochs of ``len // batch_size`` shuffled mini-batches of which the last is never
@@ -83,12 +110,28 @@ every layer (``DataLoader`` options); all of it is mirrored. ``DynamicBatch``
 only works in Quark for readers that yield one sample per batch (otherwise ONNX
 Runtime rejects the input for every layer) and is a no-op then.
 
+``SelectiveUpdate`` is checked twice, as in Quark: per module (when the error
+after training is worse than the *initial* one of the hard-rounded float weight,
+the module's weight and bias are dropped; its ``DataLoader`` loop has no such
+check) and after every layer on the whole model's average L2 distance to the
+float one.
+
+``SaveAndRestore`` (:func:`load_saved_layers`, :func:`save_checkpoint`): before
+each layer Quark writes ``model_to_finetune`` (the model so far, to ``<json
+path>.onnx``) and ``layers_to_finetune`` (this layer to the last) into the JSON
+file, and when the file already exists it trains only the layers it lists --
+on top of the *original* quantized model: the model it loads from the file is
+dropped (its ``Subgraph`` was built before), so a resume does not continue from the
+saved weights. ``SelectMaxMemLayer`` builds every layer's torch module up front
+(it draws torch's random numbers; the restored list overrides its choice).
+
 Not replicated (no effect on the numbers, or out of scope): ``optim_device`` /
 ``infer_device`` / ``pin_memory`` / ``use_gds`` / ``log_period`` / ``cache_dir``
 and ``mem_opt_level`` 0 vs 1 (only choose where tensors are cached and which
-device runs them; probed: identical codes), and ``SaveAndRestore`` (a
-checkpoint file of Quark's: when one exists Quark trains only the layers it
-lists). Calibration batches with a leading axis > 1 at ``MemOptLevel=2`` are
+device runs them; probed: identical codes). At ``MemOptLevel=2`` Quark does not
+check that the quantized and float inputs have the same shape when
+``DropRatio`` is 1 (the float input is unused then); this port skips the
+layer. Calibration batches with a leading axis > 1 at ``MemOptLevel=2`` are
 mirrored only as far as the numpy ops reach (``Conv`` fails in Quark and is
 skipped here; ``MatMul`` / ``Gemm`` / norms train on the stacked batches). A
 bias-less ``Gemm`` draws its Linear bias from numpy's generator unless a test
@@ -100,7 +143,9 @@ error on all samples did not get worse, which Quark has no equivalent of.
 from __future__ import annotations
 
 import itertools
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -175,11 +220,20 @@ class FinetuneOptions:
     target_ops: Sequence[str] = TARGET_OPS
     seed: int = 1705472343
     guard: bool = True
+    #: run AdaQuant's training loop in float32 in torch's operation order
+    #: (``None``: on for AdaQuant, which is chaotic enough that float64 noise
+    #: flips codes; AdaRound agrees with Quark in float64 already)
+    float32: Optional[bool] = None
 
     def lr(self) -> float:
         if self.learning_rate is not None:
             return float(self.learning_rate)
         return 1e-5 if self.algorithm == "adaquant" else 0.1
+
+    def use_float32(self) -> bool:
+        if self.float32 is not None:
+            return bool(self.float32)
+        return self.algorithm == "adaquant"
 
 
 # -- quantized constants & activation quantizers -----------------------------------------
@@ -209,6 +263,20 @@ class _QConst:
     def encode(self, w: np.ndarray) -> np.ndarray:
         return np.clip(np.round(w / self.scale) + self.zp, self.lo, self.hi)
 
+    def ste32(self, w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """:meth:`ste` as torch's float32 quantizer computes it (``round(w /
+        scale) + zp``, ``clamp``, ``(q - zp) * scale``, every op in float32)."""
+        f32 = np.float32
+        s, z = self.scale.astype(f32), self.zp.astype(f32)
+        q = np.round(w.astype(f32) / s) + z
+        mask = (q >= self.lo) & (q <= self.hi)
+        return (np.clip(q, f32(self.lo), f32(self.hi)) - z) * s, mask
+
+    def encode32(self, w: np.ndarray) -> np.ndarray:
+        f32 = np.float32
+        q = np.round(w.astype(f32) / self.scale.astype(f32)) + self.zp.astype(f32)
+        return np.clip(q, f32(self.lo), f32(self.hi)).astype(np.float64)
+
 
 @dataclass
 class _ActQ:
@@ -231,13 +299,17 @@ class _ActQ:
     def fq(self, x: np.ndarray) -> np.ndarray:
         f32 = np.float32
         q = np.clip(self._q(x), f32(self.lo), f32(self.hi))
-        return ((q - f32(self.zp)) * f32(self.scale)).astype(np.float64)
+        y = (q - f32(self.zp)) * f32(self.scale)
+        return y if x.dtype == f32 else y.astype(np.float64)
 
     def fq_mask(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         f32 = np.float32
         q = self._q(x)
         y = (np.clip(q, f32(self.lo), f32(self.hi)) - f32(self.zp)) * f32(self.scale)
-        return y.astype(np.float64), (q >= self.lo) & (q <= self.hi)
+        return (
+            y if x.dtype == f32 else y.astype(np.float64),
+            (q >= self.lo) & (q <= self.hi),
+        )
 
 
 def _broadcast(
@@ -521,7 +593,7 @@ class _ConvTransposeOp(_Op):
         sp, ksize = x.shape[2:], w.shape[2:]
         cg, og = c // g, w.shape[1]
         full = self._full(sp, ksize)
-        buf = np.zeros((b, g * og, *full))
+        buf = np.zeros((b, g * og, *full), dtype=x.dtype)
         for gi in range(g):
             cols = np.tensordot(
                 x[:, gi * cg : (gi + 1) * cg],
@@ -543,11 +615,11 @@ class _ConvTransposeOp(_Op):
         b, c = x.shape[:2]
         sp, ksize = x.shape[2:], wshape[2:]
         cg, og = c // g, wshape[1]
-        dfull = np.zeros((b, g * og, *full))
+        dfull = np.zeros((b, g * og, *full), dtype=dy.dtype)
         crop = tuple(slice(p0, full[i] - p1) for i, (p0, p1) in enumerate(self.crop))
         dfull[(slice(None), slice(None)) + crop] = dy
         axes = [0, *range(2, 2 + nd)]
-        dw = np.empty((c, og, *ksize))
+        dw = np.empty((c, og, *ksize), dtype=dy.dtype)
         for gi in range(g):
             xg = x[:, gi * cg : (gi + 1) * cg]
             dview = dfull[:, gi * og : (gi + 1) * og]
@@ -599,7 +671,7 @@ class _InstanceNormOp(_Op):
 
 
 def _erf(x: np.ndarray) -> np.ndarray:
-    return np.vectorize(math.erf, otypes=[np.float64])(x)
+    return np.vectorize(math.erf, otypes=[np.float64])(x).astype(x.dtype)
 
 
 class _Act:
@@ -987,21 +1059,11 @@ def _make_block(
         if act is None or fcons is None or fcons.op_type != cons.op_type:
             return None
         f_end, tail = fcons.output[0], cons.output[0]
-    elif cons.op_type == "QuantizeLinear" and len(cons.input) > 2:
-        # A Relu folded into the output quantizer (``fold_relu``: the Q range
-        # starts at 0): Quark's own graphs keep the Relu node, so the block it
-        # trains is conv + Relu against the float *Relu* output
-        fcons = f_cons.get(fn.output[0])
-        zp = q_inits.get(cons.input[2])
-        if (
-            fcons is not None
-            and fcons.op_type == "Relu"
-            and zp is not None
-            and zp.data_type in _RANGES
-            and float(numpy_helper.to_array(zp).reshape(-1)[0])
-            == _RANGES[zp.data_type][0]
-        ):
-            act, f_end = _Relu(), fcons.output[0]
+    # A Relu folded into the output quantizer (``fold_relu``: the Q range starts
+    # at 0, e.g. INT8_CNN_DEFAULT on a MatMul / Gemm model) leaves no Relu node
+    # in the quantized graph: Quark's block ends at the op's own output (or the
+    # output Q/DQ) and its target is the float *pre-Relu* output (the float
+    # node's output tensor), so the block is trained without an activation.
     if opt.output_qdq:
         nxt = q_cons.get(tail)
         if nxt is not None and nxt.op_type == "QuantizeLinear":
@@ -1112,6 +1174,28 @@ class _SkipLayer(Exception):
     shapes do not fit), which its driver logs and skips."""
 
 
+def _adam_step32(p, g, m, v, t, lr):
+    """``torch.optim.Adam`` on a float32 CPU tensor, op for op: ``exp_avg.lerp_``,
+    ``exp_avg_sq.mul_().addcmul_()``, ``denom = (sqrt(v) / sqrt(bc2)) + eps``,
+    ``param.addcdiv_(exp_avg, denom, value=-lr / bc1)``."""
+    f32 = np.float32
+    w = f32(1.0 - 0.9)
+    m[...] = m + w * (g - m)  # lerp, weight < 0.5
+    v[...] = v * f32(0.999)
+    v[...] = v + (f32(1.0 - 0.999) * g) * g
+    step = t + 1
+    bc1 = 1.0 - 0.9**step
+    bc2 = 1.0 - 0.999**step
+    denom = np.sqrt(v) / f32(math.sqrt(bc2)) + f32(1e-8)
+    return p + (f32(-(lr / bc1)) * m) / denom
+
+
+def _sigmoid32(a: np.ndarray) -> np.ndarray:
+    """``torch.sigmoid`` on a float32 tensor."""
+    f32 = np.float32
+    return f32(1.0) / (f32(1.0) + np.exp(-a.astype(f32)))
+
+
 def _adam_step(p, g, m, v, t, lr):
     m *= 0.9
     m += 0.1 * g
@@ -1143,12 +1227,33 @@ def _block_forward(
             z = blk.op.add_bias(z, bias * blk.b_beta)
     except ValueError as e:  # numpy's shape mismatch is torch's RuntimeError
         raise _SkipLayer(str(e)) from e
-    a = z if blk.act is None else blk.act.forward(z)
+    a = z if blk.act is None else blk.act.forward(z).astype(z.dtype, copy=False)
     mask = None
     y = a
     if blk.out_q is not None:
         y, mask = blk.out_q.fq_mask(a)
     return y, (ctx, z, a, mask)
+
+
+def _unbroadcast(g: np.ndarray, shape: Tuple[int, ...]) -> np.ndarray:
+    """Sum ``g`` back to ``shape`` over the axes numpy broadcast."""
+    while g.ndim > len(shape):
+        g = g.sum(axis=0)
+    for ax, n in enumerate(shape):
+        if n == 1 and g.shape[ax] != 1:
+            g = g.sum(axis=ax, keepdims=True)
+    return g
+
+
+def _diff(y: np.ndarray, y_ref: np.ndarray) -> np.ndarray:
+    """``y - y_ref`` as torch computes it: it broadcasts, so a block output
+    that differs from its target only along size-1 axes still trains (Quark
+    does, e.g. a ``Gemm`` with ``transA`` on a single one-row sample); any other
+    mismatch is the RuntimeError its driver logs and skips."""
+    try:
+        return y - y_ref
+    except ValueError as e:
+        raise _SkipLayer(f"output {y.shape} vs target {y_ref.shape}") from e
 
 
 def _recon_grad(
@@ -1157,17 +1262,53 @@ def _recon_grad(
     """Quark's loss ``mean(sum((y - y_ref)^2, dim=1))`` and the gradients of it
     w.r.t. the quantized-weight tensor and the bias."""
     ctx, z, a, mask = cache
-    if y.shape != y_ref.shape:
-        raise _SkipLayer(f"output {y.shape} vs target {y_ref.shape}")
-    err = y - y_ref
+    err = _diff(y, y_ref)
+    if err.ndim < 2:
+        raise _SkipLayer("loss needs at least two dimensions")
     denom = err.size / err.shape[1]
     loss = float(np.sum(err * err) / denom)
-    dy = 2.0 * err / denom
+    dy = _unbroadcast(2.0 * err / denom, y.shape)
     if mask is not None:
         dy = dy * mask
     dz = dy if blk.act is None else blk.act.backward(z, a, dy)
     dw = blk.op.backward(ctx, dz) * blk.w_alpha
     db = blk.op.bias_grad(dz) * blk.b_beta
+    return loss, dw, db
+
+
+def _recon_grad32(
+    blk: _Block, cache, y: np.ndarray, y_ref: np.ndarray
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """:func:`_recon_grad` the way torch's float32 autograd evaluates
+    ``(torch.norm(err, 'fro', dim=1) ** 2).mean()``: ``mean`` hands ``1 / N``
+    down, ``pow`` multiplies it by ``2 * norm``, and ``norm`` returns
+    ``(err / norm) * grad`` (zero where the norm is) -- the same number as
+    ``2 err / N`` up to the float32 rounding of every step, which is what flips
+    16-bit codes."""
+    f32 = np.float32
+    ctx, z, a, mask = cache
+    err = _diff(y.astype(f32, copy=False), y_ref.astype(f32, copy=False))
+    if err.ndim < 2:
+        raise _SkipLayer("loss needs at least two dimensions")
+    n_out = err.size // err.shape[1]
+    norm = np.sqrt((err * err).sum(axis=1, dtype=f32)).astype(f32)
+    loss = float((norm * norm).mean(dtype=f32))
+    g = f32(1.0) / f32(n_out)
+    nshape = list(err.shape)
+    nshape[1] = 1
+    norm_k = norm.reshape(nshape)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dy = np.where(
+            norm_k == 0,
+            f32(0.0),
+            (err / norm_k) * ((g * (f32(2.0) * norm)).reshape(nshape)),
+        ).astype(f32)
+    dy = _unbroadcast(dy, y.shape)
+    if mask is not None:
+        dy = dy * mask
+    dz = dy if blk.act is None else blk.act.backward(z, a, dy).astype(f32, copy=False)
+    dw = blk.op.backward(ctx, dz) * f32(blk.w_alpha)
+    db = blk.op.bias_grad(dz) * f32(blk.b_beta)
     return loss, dw, db
 
 
@@ -1178,13 +1319,15 @@ def _eval_error(
     w_hat: np.ndarray,
     bias: Optional[np.ndarray],
 ) -> float:
-    """Quark's ``_calc_recons_metrics``: plain MSE over every element."""
+    """Quark's ``_calc_recons_metrics``: ``F.mse_loss`` over every element, on all
+    samples at once (a ``Gemm`` with ``transA`` multiplies *across* samples, so
+    those are not chunked)."""
+    step = x_all.shape[0] if getattr(blk.op, "ta", False) else 64
     tot, count = 0.0, 0
-    for i in range(0, x_all.shape[0], 64):
-        y, _ = _block_forward(blk, x_all[i : i + 64], w_hat, bias)
-        if y.shape != y_all[i : i + 64].shape:
-            raise _SkipLayer(f"output {y.shape} vs target {y_all[i : i + 64].shape}")
-        d = y - y_all[i : i + 64]
+    for i in range(0, x_all.shape[0], step):
+        y, _ = _block_forward(blk, x_all[i : i + step], w_hat, bias)
+        ref = y_all if step == x_all.shape[0] else y_all[i : i + step]
+        d = _diff(y, ref)
         tot += float(np.sum(d * d))
         count += d.size
     return tot / max(count, 1)
@@ -1195,6 +1338,7 @@ class _Trained:
     codes: np.ndarray
     bias_codes: Optional[np.ndarray] = None
     err_rtn: float = 0.0  # Quark's "initial" error (hard-rounded float weight)
+    err_final: float = 0.0  # its error after training (hard rounding)
     iterations: int = 0
 
 
@@ -1212,6 +1356,10 @@ def _train_block(
     qw = blk.qw
     s_total = xq.shape[0]
     adaround = opt.algorithm == "adaround"
+    f32 = np.float32
+    use32 = (not adaround) and opt.use_float32()
+    if use32:  # torch's tensors: float32 from the data on
+        xq, xf, yf = (a.astype(f32) for a in (xq, xf, yf))
     in_fq = (lambda x: x) if blk.in_q is None else blk.in_q.fq
     x_eval = in_fq(xq)
     # the bias the layer is trained with: Quark feeds the float bias through
@@ -1219,6 +1367,14 @@ def _train_block(
     # updates it)
     b_float = blk.b_float
     bias_fq = blk.b_plain if blk.qb is None else blk.qb.ste(blk.b_float)[0]  # type: ignore[arg-type]
+    if use32:
+        bias_fq = (
+            None
+            if bias_fq is None
+            else (bias_fq if blk.qb is None else blk.qb.ste32(blk.b_float)[0]).astype(
+                f32
+            )  # type: ignore[arg-type,union-attr]
+        )
 
     num_iter = int(opt.num_iterations)
     lr = opt.lr()
@@ -1229,7 +1385,6 @@ def _train_block(
     # grid (every channel's largest weight) lands on either side of the
     # floor, and the rectified sigmoid there on either side of 0, by ULP
     # noise that decides whether it is ever allowed to move -- so mirror it
-    f32 = np.float32
     wd32 = w.astype(f32) / scale.astype(f32)
     floor_w = np.floor(wd32).astype(np.float64)
     diff32 = wd32 - np.floor(wd32)
@@ -1259,9 +1414,9 @@ def _train_block(
         alpha = -np.log(f32(_ZETA - _GAMMA) / (diff32 - f32(_GAMMA)) - f32(1.0))
         params = [alpha.astype(np.float64)]
     else:
-        wv = w.copy()
+        wv = w.astype(f32) if use32 else w.copy()
         bv = (
-            b_float.copy()
+            (b_float.astype(f32) if use32 else b_float.copy())
             if (opt.update_bias and blk.qb is not None and b_float is not None)
             else None
         )
@@ -1287,16 +1442,25 @@ def _train_block(
             xqb, xfb = xq[idx], xf[idx]
             u = rand_fn(xqb.shape) if rand_fn is not None else rng.random(xqb.shape)
             x_in = in_fq(np.where(u < opt.drop_ratio, xqb, xfb))
-        y_ref = yf[idx]
+        try:
+            y_ref = yf[idx]
+        except IndexError as e:  # fewer target rows than samples: Quark's
+            raise _SkipLayer(str(e)) from e  # torch.cat fails, layer skipped
 
         if adaround:
-            sig32 = f32(1.0) / (f32(1.0) + np.exp(-params[0].astype(f32)))
+            sig32 = _sigmoid32(params[0])
             raw_h = (sig32 * f32(_ZETA - _GAMMA) + f32(_GAMMA)).astype(np.float64)
             sig = sig32.astype(np.float64)
             h = np.clip(raw_h, 0.0, 1.0)
             raw_q = floor_w + h + zp
             w_hat = (np.clip(raw_q, lo, hi) - zp) * scale
             bias = bias_fq
+        elif use32:
+            w_hat, wmask = qw.ste32(params[0])
+            if len(params) > 1:
+                bias, bmask = blk.qb.ste32(params[1])  # type: ignore[union-attr]
+            else:
+                bias, bmask = bias_fq, None
         else:
             w_hat, wmask = qw.ste(params[0])
             if len(params) > 1:
@@ -1305,7 +1469,9 @@ def _train_block(
                 bias, bmask = bias_fq, None
 
         y, cache = _block_forward(blk, x_in, w_hat, bias)
-        recons, dw_hat, db = _recon_grad(blk, cache, y, y_ref)
+        recons, dw_hat, db = (_recon_grad32 if use32 else _recon_grad)(
+            blk, cache, y, y_ref
+        )
 
         round_loss = 0.0
         grads: List[np.ndarray]
@@ -1324,6 +1490,15 @@ def _train_block(
                 grads = [(dw_hat * scale * dq_mask + dreg) * dh_dalpha]
             else:
                 grads = [dh * dh_dalpha]
+        elif use32:
+            # torch: out = (clamp(...) - zp) * scale, divided by scale again on
+            # the way back to the weight; the clamp lets the gradient through
+            # where lo <= q <= hi
+            s32 = qw.scale.astype(f32)
+            grads = [((dw_hat * s32) * wmask) / s32]
+            if len(params) > 1:
+                sb = blk.qb.scale.astype(f32)  # type: ignore[union-attr]
+                grads.append(((db * sb) * bmask) / sb)  # type: ignore[operator]
         else:
             grads = [dw_hat * wmask]
             if len(params) > 1:
@@ -1334,7 +1509,8 @@ def _train_block(
 
     def _step(it: int, grads: List[np.ndarray]) -> None:
         for k, p in enumerate(params):
-            params[k] = _adam_step(p, grads[k], ms[k], vs[k], it, lr)
+            step = _adam_step32 if use32 else _adam_step
+            params[k] = step(p, grads[k], ms[k], vs[k], it, lr)
 
     done = 0
     if opt.mem_opt_level != 2:
@@ -1391,11 +1567,69 @@ def _train_block(
         done = it
 
     if adaround:
-        new_codes = np.clip(floor_w + (params[0] >= 0) + zp, lo, hi)
-        return _Trained(new_codes, None, err0, done)
-    codes = qw.encode(params[0])
-    bcodes = blk.qb.encode(params[1]) if len(params) > 1 else None  # type: ignore[union-attr]
-    return _Trained(codes, bcodes, err0, done)
+        codes = np.clip(floor_w + (params[0] >= 0) + zp, lo, hi)
+        bcodes = None
+        w_final, b_final = qw.dequant(codes), bias_fq
+    else:
+        enc = (lambda q, v: q.encode32(v)) if use32 else (lambda q, v: q.encode(v))
+        ste = (lambda q, v: q.ste32(v)[0]) if use32 else (lambda q, v: q.ste(v)[0])
+        codes = enc(qw, params[0])
+        bcodes = enc(blk.qb, params[1]) if len(params) > 1 else None
+        w_final = qw.dequant(codes)
+        b_final = ste(blk.qb, params[1]) if len(params) > 1 else bias_fq
+    err_final = 0.0
+    if opt.selective_update and opt.mem_opt_level != 2:
+        err_final = _eval_error(blk, x_eval, yf, w_final, b_final)
+    return _Trained(codes, bcodes, err0, err_final, done)
+
+
+# -- Quark's ``SaveAndRestore`` checkpoint file ---------------------------------------------
+
+
+def load_saved_layers(path: Any) -> Optional[List[int]]:
+    """What Quark's ``fast_finetune`` restores from ``extra_options
+    ["SaveAndRestore"]``: when the JSON file exists, the layer indices it lists
+    under ``"layers_to_finetune"`` (``None`` if absent or empty: then every
+    layer trains). Quark also loads the ``"model_to_finetune"`` ONNX file the
+    JSON names -- which raises if it is missing -- but then drops the model:
+    its ``Subgraph`` was built from the original quantized model, so resuming
+    does *not* continue from the saved weights, it only skips the layers
+    before the one the previous run had reached."""
+    if not path or not os.path.exists(str(path)):
+        return None
+    with open(str(path)) as f:
+        saved = json.load(f)
+    model_path = saved.get("model_to_finetune")
+    if model_path is not None:
+        onnx.load(model_path)
+    layers = saved.get("layers_to_finetune")
+    return [int(i) for i in layers] if layers else None
+
+
+def save_checkpoint(
+    path: Any, index: int, n_layers: int, model: onnx.ModelProto
+) -> None:
+    """Quark's checkpoint before it fine-tunes layer ``index``: the JSON file
+    gets ``"model_to_finetune"`` (``<path>.onnx`` for a ``.json`` path, else
+    ``model_to_finetune.onnx`` in the working directory) and
+    ``"layers_to_finetune"`` (``index .. n_layers - 1``) -- other keys of an
+    existing file are kept -- and the current model is written to that ONNX
+    file."""
+    path = str(path)
+    model_path = (
+        path.replace(".json", ".onnx")
+        if path.endswith(".json")
+        else "model_to_finetune.onnx"
+    )
+    saved: Dict[str, Any] = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            saved = json.load(f)
+    saved["model_to_finetune"] = model_path
+    saved["layers_to_finetune"] = list(range(index, n_layers))
+    with open(path, "w") as f:
+        json.dump(saved, f, indent=2)
+    onnx.save(model, model_path)
 
 
 # -- the driver --------------------------------------------------------------------------------------
@@ -1457,6 +1691,8 @@ def finetune(
     trace: Optional[List[List[Tuple[int, float, float]]]] = None,
     rand_fn: Optional[Callable[[Tuple[int, ...]], np.ndarray]] = None,
     block_hook: Optional[Callable[[int, str], Optional[Dict[str, np.ndarray]]]] = None,
+    layers: Optional[Sequence[int]] = None,
+    checkpoint: Optional[Callable[[int, int, onnx.ModelProto], None]] = None,
 ) -> Tuple[onnx.ModelProto, List[LayerReport]]:
     """Quark ``FastFinetune`` over a QDQ model (see the module docstring).
 
@@ -1475,6 +1711,11 @@ def finetune(
     a test replay Quark's torch random stream); it may return
     ``{"phantom_bias": array}``, the bias torch drew for a bias-less ``Gemm``
     (otherwise numpy draws one).
+
+    ``layers`` restricts training to those block indices (Quark's restored
+    ``SaveAndRestore`` list; it also overrides ``select_max_mem_layer``) and
+    ``checkpoint(index, n_blocks, model)`` is called before each selected block
+    with the model as it stands (see :func:`save_checkpoint`).
     """
     opt = options or FinetuneOptions()
     if opt.algorithm not in ("adaround", "adaquant"):
@@ -1518,7 +1759,11 @@ def finetune(
     mix_rng = np.random.default_rng([opt.seed, 1])
 
     f_cache: Dict[str, np.ndarray] = {}
-    if opt.select_max_mem_layer:
+    all_blocks = blocks
+    selected = list(range(len(all_blocks)))
+    if layers:  # a restored checkpoint wins over everything else
+        selected = [int(i) for i in layers]
+    elif opt.select_max_mem_layer:
         # Quark estimates every block from the first float calibration batch
         # and finetunes the most memory-hungry one only
         probe = _capture(
@@ -1532,7 +1777,10 @@ def finetune(
             _estimate_memory(b, probe[b.f_end].shape, probe[b.f_start].shape)
             for b in blocks
         ]
-        blocks = [blocks[int(np.argmax(mems))]]
+        selected = [int(np.argmax(mems))]
+    # Quark walks its layer list in order and skips those not selected
+    todo = [(i, all_blocks[i]) for i in sorted(set(selected)) if 0 <= i < len(blocks)]
+    blocks = [b for _, b in todo]
     if opt.mem_opt_level == 0:
         f_cache = _capture(
             float_model,
@@ -1564,7 +1812,9 @@ def finetune(
         )
 
     reports: List[LayerReport] = []
-    for blk in blocks:
+    for blk_index, blk in todo:
+        if checkpoint is not None:
+            checkpoint(blk_index, len(all_blocks), out)
         level2 = opt.mem_opt_level == 2
         fc = f_cache or _capture(
             float_model,
@@ -1594,7 +1844,7 @@ def finetune(
             trace.append(layer_trace)
         extras = None
         if block_hook is not None:
-            extras = block_hook(blocks.index(blk), blk.name)
+            extras = block_hook(blk_index, blk.name)
         if blk.phantom_bias is not None:
             drawn = extras.get("phantom_bias") if isinstance(extras, dict) else None
             if drawn is None:
@@ -1620,6 +1870,15 @@ def finetune(
             new_bias = cur_bias
         after = _eval_error(blk, x_eval, yf, qw.dequant(res.codes), new_bias)
         accepted = after <= before or not opt.guard
+        if (
+            opt.selective_update
+            and opt.mem_opt_level != 2
+            and res.err_final - res.err_rtn > 0
+        ):
+            # Quark's per-module SelectiveUpdate: when the module's error got
+            # worse than its initial (hard-rounded float weight) one it drops
+            # the new weight and bias (its DataLoader loop has no such check)
+            accepted = False
         changed = float(np.mean(res.codes != qw.codes))
         undo: List[Tuple[str, onnx.TensorProto]] = []
         if accepted:
@@ -1655,4 +1914,10 @@ def finetune(
     return out, reports
 
 
-__all__ = ["FinetuneOptions", "TARGET_OPS", "finetune"]
+__all__ = [
+    "FinetuneOptions",
+    "TARGET_OPS",
+    "finetune",
+    "load_saved_layers",
+    "save_checkpoint",
+]
