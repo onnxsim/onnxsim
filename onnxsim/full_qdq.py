@@ -132,6 +132,13 @@ _DTYPES = {
     "int8": (TensorProto.INT8, np.int8, -128, 127),
     "int16": (TensorProto.INT16, np.int16, -32768, 32767),
 }
+# the code ranges ``reduce_range`` leaves weights (Quark's reduced-range table)
+_REDUCED_RANGES = {
+    "int8": (-64, 64),
+    "uint8": (0, 127),
+    "int16": (-16384, 16384),
+    "uint16": (0, 32767),
+}
 _WIDE_DTYPES = ("uint16", "int16")  # need com.microsoft Q/DQ below opset 21
 
 
@@ -333,6 +340,7 @@ def quantize_full_qdq(
     pof2_mode: str = "ceil",
     int8_bias: bool = False,
     int8_constants: bool = False,
+    reduce_range: bool = False,
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
@@ -404,6 +412,11 @@ def quantize_full_qdq(
             per-tensor scale (a power of two under ``power_of_two``) instead
             of int32 with ``input_scale * weight_scale`` -- what Quark's
             ``XINT8`` emits
+    :param reduce_range: Quark's legacy ``reduce_range``: weights (and the other
+            constants quantized like weights) use the reduced code range --
+            ``[-64, 64]`` for int8, ``[0, 127]`` for uint8, ``[-16384, 16384]``
+            for int16 -- instead of the full one; activations and the biases'
+            ``input * weight`` scales follow. Not with ``power_of_two``.
     :param int8_constants: quantize the other constant inputs of quantized
             nodes (a LayerNorm scale, a Mul operand, ...) to per-tensor
             symmetric int8 like weights, instead of the activation dtype
@@ -468,6 +481,8 @@ def quantize_full_qdq(
         raise ValueError(f"unsupported weight_dtype: {weight_dtype!r}")
     if activation_dtype not in _DTYPES:
         raise ValueError(f"unsupported activation_dtype: {activation_dtype!r}")
+    if reduce_range and power_of_two:
+        raise NotImplementedError("reduce_range with power-of-two weights")
     if pof2_mode not in ("ceil", "minmse"):
         raise ValueError(f"pof2_mode must be 'ceil' or 'minmse', got {pof2_mode!r}")
     act_type, act_np, qmin, qmax = _DTYPES[activation_dtype]
@@ -640,6 +655,18 @@ def quantize_full_qdq(
                 and (c.op_type != "Clip" or _clip_bounds(c, inits) in _CLIP_BOUNDS)
             ):
                 skip.add(src)
+        # ... and so is a Pad's, when its only consumer is an (Average) pool
+        for c in g.node:
+            if c.op_type not in ("AveragePool", "GlobalAveragePool") or not c.input:
+                continue
+            p = producer.get(c.input[0])
+            if (
+                p is not None
+                and p.op_type == "Pad"
+                and p.output[0] == c.input[0]
+                and len(consumers[c.input[0]]) == 1
+            ):
+                skip.add(c.input[0])
         acts = [a for a in acts if a not in skip]
     elif fold_relu and centred:
         # A centred zero point cannot clamp at zero, so the Relu stays; instead
@@ -845,6 +872,11 @@ def quantize_full_qdq(
                 act_extra.append(c)
             n.input[k] = converted[ckey]
 
+    def w_range(dt: str) -> Tuple[int, int]:
+        """``(qmin, qmax)`` of the weight grid (``reduce_range`` shrinks it)."""
+        lo, hi = _REDUCED_RANGES[dt] if reduce_range else _DTYPES[dt][2:]
+        return int(lo), int(hi)
+
     def int8_tensor_dq(x: str, w: np.ndarray) -> str:
         """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
         constant ``x``; returns the DQ output name. With asymmetric (or uint8)
@@ -852,7 +884,7 @@ def quantize_full_qdq(
         as weights)."""
         if not p2 and (not weight_symmetric or weight_dtype == "uint8"):
             dt = "uint8" if weight_dtype == "uint8" else "int8"
-            lo, hi = _DTYPES[dt][2:]
+            lo, hi = w_range(dt)
             s32, z = _weight_qparams(w.min(), w.max(), lo, hi, weight_symmetric)
             # (Quark clips to the symmetric code range, so a grid's lowest code
             # -128 is never produced)
@@ -874,9 +906,10 @@ def quantize_full_qdq(
         if p2_search:
             s = pof2_minmse_weight_scale(w)
         else:
-            s = max(float(np.abs(w).max()), 1e-12) / 127.0
+            s = max(float(np.abs(w).max()), 1e-12) / w_range("int8")[1]
             s = _pof2(s) if p2 else s
-        q = np.clip(np.round(w / np.float32(s)), -127, 127).astype(np.int8)
+        qm = w_range("int8")[1]
+        q = np.clip(np.round(w / np.float32(s)), -qm, qm).astype(np.int8)
         base = fresh(x)
         add_init(base + "/int8", q)
         add_init(base + "/scale", np.array(s, np.float32))
@@ -945,9 +978,9 @@ def quantize_full_qdq(
                 key = ("w", x, axis)
                 if key not in cache:
                     w_np = _DTYPES[weight_dtype][1]
-                    w_max = _DTYPES[weight_dtype][3]
+                    wmin, wmax = w_range(weight_dtype)
+                    w_max = wmax
                     if not weight_symmetric or weight_dtype == "uint8":
-                        wmin, wmax = _DTYPES[weight_dtype][2:]
                         clip_lo = max(wmin, -w_max)  # Quark: symmetric code range
                         if axis is None:
                             s32, z = _weight_qparams(

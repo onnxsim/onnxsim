@@ -65,9 +65,31 @@ names and preset *meanings*, not copied.
   folds the Relu node onto that centred grid, which no longer clamps -- onnxsim
   reproduces the graph and warns. Not matched: Quark's non-power-of-two
   ``MinMSE`` (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which
-  is what :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for
-  ``XINT8`` (shift/cut adjustment, ``AlignConcat`` between pof2 grids,
-  ``AveragePool`` -> Mul) are not reproduced.
+  is what :class:`CalibMethod` maps it to).
+- ``XINT8`` (power-of-two activations and weights, ``EnableNPUCnn``): Quark's
+  NPU CNN quantizer also simulates the DPU and moves the power-of-two
+  positions to the compiler's limits; :mod:`onnxsim.quark_npu` reproduces it
+  graph for graph (``tests/test_quark_xint8_parity.py``): ``AveragePool`` /
+  ``GlobalAveragePool`` / ``ReduceMean`` -> followed by a ``Mul``,
+  ``Sigmoid`` -> ``HardSigmoid`` + ``Mul``, ``LeakyRelu`` alpha in 1/256,
+  ``AlignConcat`` / ``AlignPool`` / ``AlignPad`` / ``AlignSlice`` to the smaller
+  position and the ``AdjustShiftCut`` / ``Bias`` / ``Read`` / ``Write`` /
+  ``HardSigmoid`` / ``Swish`` passes (options ``SimulateDPU``,
+  ``NPULimitationCheck``, ``MaxLoopNum``, ``Convert*ToDPUVersion`` ...). The
+  float graph is converted first like Quark's pre-processing
+  (:mod:`onnxsim.quark_convert`): BatchNorm folded into a Conv or turned into a
+  depthwise Conv (``ConvertBNToConv``), ``ReduceMean`` -> ``GlobalAveragePool``,
+  a large ``GlobalAveragePool`` split (``SplitLargeKernelPool``), ``Split`` ->
+  ``Slice`` (``ConvertSplitToSlice``), Pad fusion, HardSwish inlining and
+  Identity removal (``OptimizeModel`` / ``SimplifyModel``); these conversions are
+  also on for the extended (``A8W8`` ...) and transformer flows, and follow
+  their options in ``VINT8`` (whose ``ConvertClipToRelu`` is implemented too).
+  Not reproduced: ``ConvertSoftmaxToDPUVersion`` / ``ConvertInstanceNormToDPUVersion``
+  (off by default), the order-dependence of Quark's position passes on its
+  node order, ONNX Runtime's other graph optimizations, and the placement of
+  the first Q/DQ pair when a ``Flatten`` / ``Clip`` is fed by a graph input
+  (Quark leaves the input float and quantizes the op's output; onnxsim
+  quantizes the input -- numerically equivalent for ``Flatten``).
 - Q/DQ placement and quantizer options follow Quark's rules
   (:func:`onnxsim.full_qdq.quantize_full_qdq`, ``tests/test_quark_parity.py``):
   the Q/DQ pair between a Conv / Add / MaxPool / AveragePool /
@@ -90,9 +112,12 @@ names and preset *meanings*, not copied.
   output, Pool / Slice outputs from their input). Quark's ``Slice`` (and, under
   the extended quantizer, ``Split``) outputs are calibrated on their own, its
   plain quantizer's ``AveragePool`` shares its input's parameters, and an
-  InstanceNormalization bias is an int32 bias. Not implemented: ``ReduceRange``
-  (a legacy ``QuantizationConfig`` attribute, not an option), ``AlignEltwise``
-  beyond ``AlignEltwiseQuantType``, the ``Convert*`` / ``Adjust*`` NPU rewrites,
+  InstanceNormalization bias is an int32 bias. ``extra_options["ReduceRange"]``
+  is Quark's legacy ``QuantizationConfig.reduce_range``: weights (and the
+  constants quantized like weights) keep to the reduced code range, ``[-64,
+  64]`` for int8, ``[0, 127]`` for uint8; activations are untouched. It is
+  refused with ``XINT8`` (Quark refuses it too) and with power-of-two weights
+  otherwise. Not implemented: ``AlignEltwise`` beyond ``AlignEltwiseQuantType``
   and the 16-bit ``AlignPool`` etc. for ``XINT8``.
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
@@ -162,8 +187,13 @@ names and preset *meanings*, not copied.
   (:mod:`onnxsim.quark_bias_correction`) rewrites the quantized *bias* of
   every Conv / Gemm that has one, from the layer-local float - quantized
   output mean, exactly as Quark does (integer biases equal Quark's for
-  ``MinMax`` / ``Percentile`` calibration; with power-of-two calibration Quark
-  re-derives the bias scale without storing it, which is not reproduced).
+  ``MinMax`` / ``Percentile`` calibration; the other histogram calibrators
+  leave the biases alone, like Quark). With power-of-two calibration (``XINT8``)
+  Quark re-derives the bias scale through its power-of-two quantizer without
+  storing it, so the integer codes and the stored scale disagree wherever the
+  fresh scale differs -- a Quark quirk that is reproduced for parity (identical
+  codes, with a warning); ``extra_options["BiasCorrectionStoredScale"]=True``
+  writes codes for the stored scale instead, i.e. what the float intent says.
   AutoMixprecision replaces the plain quantization step with
   :func:`onnxsim.quark_auto_mixprecision.auto_mixprecision` and mixes what
   Quark's ``MixingStrategy`` mixes: a target ``QLayerConfig``'s ``activation``
@@ -370,8 +400,23 @@ _ALIGN_OPTIONS = (
 )
 
 
+def _without_batch_norm(
+    model: onnx.ModelProto, op_types: "Optional[set[str]]"
+) -> "Optional[set[str]]":
+    """``op_types`` without ``BatchNormalization`` (every op type of the model
+    when ``None``) if the model still has one: Quark quantizes BatchNorms only
+    when it converts them (``ConvertBNToConv``), so one left over otherwise stays
+    float between its quantized neighbours."""
+    if not any(n.op_type == "BatchNormalization" for n in model.graph.node):
+        return op_types
+    types = (
+        set(op_types) if op_types is not None else {n.op_type for n in model.graph.node}
+    )
+    return types - {"BatchNormalization"}
+
+
 def _activation_rules(
-    opts: Dict[str, Any], symmetric: bool, extended: bool, pof2: bool
+    opts: Dict[str, Any], symmetric: bool, extended: bool, npu_cnn: bool
 ) -> Dict[str, Any]:
     """:func:`onnxsim.full_qdq.quantize_full_qdq` keywords for Quark's
     Q/DQ-removal options: ``RemoveQDQConvRelu`` / ``ConvClip`` (default on),
@@ -403,18 +448,19 @@ def _activation_rules(
         "fold_activation": (not symmetric)
         and (bool(opts.get("FoldRelu", False)) if extended else True),
         "adjust_activation_ranges": True,
-        "quantize_prelu_slope": extended or pof2,
+        "quantize_prelu_slope": extended or npu_cnn,
         "align_ops": [
             op
             for key, ops in _ALIGN_OPTIONS
             if extended and opts.get(key, False)
             for op in ops
         ],
-        # outputs calibrated on their own: Slice always, Split except under the
-        # plain quantizer (ONNX Runtime's Split shares the input's parameters)
-        "unshared_ops": ("Slice", "Split") if extended or pof2 else ("Slice",),
+        # outputs calibrated on their own: Slice always, Split under the extended
+        # quantizer only (ONNX Runtime's Split shares the input's parameters,
+        # which the plain and the power-of-two quantizer keep)
+        "unshared_ops": ("Slice", "Split") if extended else ("Slice",),
         # ... and ONNX Runtime's plain quantizer gives AveragePool its input's
-        "shared_ops": () if extended or pof2 else ("AveragePool",),
+        "shared_ops": () if extended or npu_cnn else ("AveragePool",),
     }
 
 
@@ -882,7 +928,18 @@ _PRESETS.update(
         # deployment flavour of XINT8; Quark has no ADAROUND/ADAQUANT variant).
         "VINT8": lambda: QConfig(
             _layer(XInt8Spec, XInt8Spec),
+            OptimizeModel=False,
+            EnableNPUCnn=False,
+            ConvertBNToConv=True,
+            ConvertClipToRelu=True,
+            ConvertSplitToSlice=True,
+            SplitLargeKernelPool=False,
+            ReplaceClip6Relu=True,
+            ConvertReduceMeanToGlobalAvgPool=False,
+            RemoveQDQConvClip=False,
+            RemoveQDQConvPRelu=False,
             RemoveQDQConvRelu=False,
+            RemoveQDQConvLeakyRelu=False,
             Int32Bias=False,
             DedicatedQDQPair=True,
             QuantizeAllOpTypes=True,
@@ -1945,6 +2002,24 @@ class ModelQuantizer:
         # the transformed model; the untouched one stays the reference).
         float_model = model
         work = model
+        npu_cnn = bool(act.pof2 and wt.pof2 and opts.get("EnableNPUCnn", True))
+        if opts.get("ReduceRange") and npu_cnn:
+            raise ValueError(
+                "ReduceRange is not supported with the NPU CNN scheme (power-of-two "
+                "scales); Quark refuses it too"
+            )
+        if opts.get("OptimizeModel", True) or opts.get("SimplifyModel", True):
+            # Quark first runs onnxslim and ONNX Runtime's graph optimizer on the
+            # float model (BN folds, Pad fusion, ...)
+            from onnxsim.quark_convert import expand_hardswish, graph_cleanup
+
+            if opts.get("OptimizeModel", True):
+                work = expand_hardswish(work)
+            work = graph_cleanup(
+                work,
+                bool(opts.get("OptimizeModel", True)),
+                bool(opts.get("SimplifyModel", True)),
+            )
         # Quark's order: CLE (stem equalization first), SmoothQuant, Quarot
         if "cle" in by_name:
             from onnxsim.quark_equalization import apply_cle_config
@@ -1960,6 +2035,20 @@ class ModelQuantizer:
             )
         if "quarot" in by_name:
             work = self._quarot(work, by_name["quarot"])
+        # the compiler-oriented conversions are on by default for these flows (and
+        # follow their own options elsewhere, as in VINT8)
+        from onnxsim.quark_convert import convert_for_npu
+
+        keep = set(exclude)
+        conv_default = bool(
+            npu_cnn or self._extended(act, wt) or opts.get("NPUTransformer")
+        )
+        work = convert_for_npu(
+            work, opts, lambda n: n.name not in keep, default=conv_default
+        )
+        # Quark adds BatchNormalization to the op types it quantizes when it
+        # converts BNs; without ConvertBNToConv a leftover one stays float
+        bn_quantized = bool(opts.get("ConvertBNToConv", conv_default))
         if work is not model:
             float_model = work
 
@@ -1969,7 +2058,7 @@ class ModelQuantizer:
         qkw: Dict[str, Any] = dict(
             calibration_data=calibration[:cal_size] if cal_size else calibration,
             activation_dtype=act_dtype,
-            op_types=op_types,
+            op_types=op_types if bn_quantized else _without_batch_norm(work, op_types),
             float_clamp_input=op_types is not None,
             exclude_nodes=exclude,
             method=cal_method,
@@ -1984,12 +2073,17 @@ class ModelQuantizer:
                 opts.get("WeightSymmetric", wt.symmetric or int8_only)
             ),
             quantize_bias=bool(opts.get("QuantizeBias", True)),
-            **_activation_rules(opts, act_sym, self._extended(act, wt), act.pof2),
+            **_activation_rules(opts, act_sym, self._extended(act, wt), npu_cnn),
             # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
             # weights and int8 biases (``Int32Bias=True`` keeps int32)
             pof2_mode="minmse" if wt.pof2 else "ceil",
-            int8_bias=wt.pof2 and not self.config.extra_options.get("Int32Bias"),
+            # (the NPU quantizer keeps int8 biases unless Int32Bias; the others int32
+            # unless Int32Bias=False)
+            int8_bias=bool(
+                wt.pof2 and (not opts["Int32Bias"] if "Int32Bias" in opts else npu_cnn)
+            ),
             int8_constants=True,
+            reduce_range=bool(opts.get("ReduceRange", False)),
             align_eltwise_dtype=bool(
                 self.config.extra_options.get("AlignEltwiseQuantType")
             ),
@@ -2015,6 +2109,22 @@ class ModelQuantizer:
             bias_post = self._base_bias_post(work, act, wt)
             if bias_post is not None:
                 quantized = bias_post(quantized)
+            skip_names = set(exclude)
+            if npu_cnn:
+                from onnxsim.quark_npu import apply_npu_cnn_rewrites
+
+                quantized = apply_npu_cnn_rewrites(
+                    quantized,
+                    opts,
+                    _activation_rules(opts, act_sym, False, True)["remove_qdq_after"],
+                    lambda n: n.name not in skip_names,
+                )
+            if opts.get("ConvertClipToRelu", False):
+                from onnxsim.quark_convert import convert_clip_to_relu
+
+                quantized = convert_clip_to_relu(
+                    quantized, lambda n: n.name not in skip_names
+                )
             if opts.get("DedicatedQDQPair", False):
                 from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
 
@@ -2055,11 +2165,20 @@ class ModelQuantizer:
         if "bias_correction" in by_name:
             from onnxsim.quark_bias_correction import correct_bias_quark
 
+            cm = self._calib_method(act)
             quantized = correct_bias_quark(
                 float_model,
                 quantized,
                 calibration,
-                activation_symmetric=bool(opts.get("ActivationSymmetric", False)),
+                activation_symmetric=bool(opts.get("ActivationSymmetric", act_sym)),
+                method=(
+                    "pof2"
+                    if act.pof2 or cm in ("minmse_pof2", "nonoverflow")
+                    else "minmax"
+                    if cm.startswith(("minmax", "percentile", "onnxsim:percentile"))
+                    else "none"
+                ),
+                quark_scale=not opts.get("BiasCorrectionStoredScale", False),
             )
         return quantized
 
