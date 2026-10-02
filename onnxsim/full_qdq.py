@@ -430,6 +430,7 @@ def quantize_full_qdq(
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
     ort_gemm_beta: bool = False,
+    asymmetric_minmse_pof2: bool = False,
     prelu_slope_per_row: bool = False,
     excluded_nodes_stay_float: bool = True,
     adjust_bias_scale: Optional[bool] = None,
@@ -530,6 +531,11 @@ def quantize_full_qdq(
     :param prelu_slope_per_row: with ``per_channel``, a PRelu slope of rank > 1
             gets one scale per row (Quark's ``QDQPRelu``, in its NPU registry --
             the extended quantizer); otherwise per tensor
+    :param asymmetric_minmse_pof2: allow ``method="minmse_pof2"`` with asymmetric
+            activations: Quark's MinMSE calibration reports its (symmetric)
+            ranges whatever ``ActivationSymmetric`` says, and the asymmetric
+            quantizer formula then finds zero points of 0 (Softmax outputs
+            excepted, which ONNX Runtime sets to ``(0, 1)``)
     :param adjust_bias_scale: Quark's ``adjust_bias_scale`` for the int32 biases:
             ``None`` -- run it after each round of the ``align_ops`` loop (if
             any); ``True`` -- also once without any alignment (its extended
@@ -600,6 +606,8 @@ def quantize_full_qdq(
     if symmetric_activations is None:
         symmetric_activations = qmin < 0
     sym, p2 = symmetric_activations, power_of_two
+    if method == "minmse_pof2" and not sym and not asymmetric_minmse_pof2:
+        raise ValueError("method 'minmse_pof2' needs symmetric activations")
     p2_search = p2 and pof2_mode == "minmse"
     tensor_symmetric = dict(tensor_symmetric or {})
     if isinstance(model, str):

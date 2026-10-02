@@ -2400,6 +2400,7 @@ class ModelQuantizer:
             # (Quark applies it to the extended quantizer only: elsewhere it warns
             # and does nothing)
             ort_gemm_beta=True,
+            asymmetric_minmse_pof2=True,
             prelu_slope_per_row=self._extended(act, wt),
             excluded_nodes_stay_float=False,
             # (the extended quantizer's refinement -- alignment, then the bias
