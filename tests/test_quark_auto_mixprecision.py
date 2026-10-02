@@ -111,6 +111,30 @@ def _run(model, data, **kw):
     return amp.auto_mixprecision(model, data, **kw)
 
 
+def _same_quantized_model(a, b, data):
+    """The two models quantize the same way: the same operators and, under
+    ONNX Runtime without graph optimizations, bit-identical outputs. (The mixing
+    step edits the quantized baseline in place, so a model is no longer
+    byte-equal to a fresh ``quantize_full_qdq`` result: its nodes are named and
+    ordered differently.)"""
+    import onnxruntime as ort
+
+    assert sorted(n.op_type for n in a.graph.node) == sorted(
+        n.op_type for n in b.graph.node
+    )
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sa, sb = (
+        ort.InferenceSession(
+            m.SerializeToString(), so, providers=["CPUExecutionProvider"]
+        )
+        for m in (a, b)
+    )
+    for feed in data:
+        for x, y in zip(sa.run(None, feed), sb.run(None, feed)):
+            np.testing.assert_array_equal(x, y)
+
+
 def _all_tensors(result):
     return {t for c in result.ranked for t in c.tensors}
 
@@ -127,7 +151,7 @@ def test_sensitivity_is_ranked_ascending_over_all_matmuls(model, data):
     # sensitivity only: the baseline model comes back untouched, nothing moved
     assert r.moved == [] and r.final_score == r.baseline_score
     base = quantize_full_qdq(model, calibration_data=data, activation_dtype="uint8")
-    assert r.model.SerializeToString() == base.SerializeToString()
+    _same_quantized_model(r.model, base, data)
 
 
 def test_threshold_zero_moves_every_candidate(model, data):
@@ -139,7 +163,7 @@ def test_threshold_zero_moves_every_candidate(model, data):
         activation_dtype="uint8",
         tensor_dtypes={t: "uint16" for t in _all_tensors(r)},
     )
-    assert r.model.SerializeToString() == expected.SerializeToString()
+    _same_quantized_model(r.model, expected, data)
     assert r.final_score < r.baseline_score  # more activation bits -> closer to float
 
 
@@ -171,7 +195,8 @@ def test_quality_returns_the_baseline_when_it_already_meets_the_threshold(model,
         metric_threshold=1e9,
     )
     base = quantize_full_qdq(model, calibration_data=data, activation_dtype="uint8")
-    assert r.moved == [] and r.model.SerializeToString() == base.SerializeToString()
+    assert r.moved == []
+    _same_quantized_model(r.model, base, data)
     assert r.final_score == r.baseline_score
 
 

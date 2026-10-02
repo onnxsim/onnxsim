@@ -196,29 +196,46 @@ names and preset *meanings*, not copied.
   writes codes for the stored scale instead, i.e. what the float intent says.
   AutoMixprecision replaces the plain quantization step with
   :func:`onnxsim.quark_auto_mixprecision.auto_mixprecision` and mixes what
-  Quark's ``MixingStrategy`` mixes: a target ``QLayerConfig``'s ``activation``
-  moves a layer's activation inputs *and* outputs, ``input_tensors`` /
-  ``output_tensors`` one side each, ``weight`` / ``bias`` the constants (a
-  weight is re-quantized per tensor from its *already quantized* values, the
-  int32 bias scale is refreshed to ``input_scale * weight_scale`` and its codes
-  truncated, a layer that does not move keeps its baseline bias). Integer
-  activation, weight and bias dtypes (int8 / uint8 / int16 / uint16; power-of-two
-  target weights and float / block targets over an integer base raise).
+  Quark's ``MixingStrategy`` mixes, by the same in-place edit of the quantized
+  baseline (:class:`onnxsim.quark_mixing.QuarkMixer`): a target
+  ``QLayerConfig``'s ``activation`` moves a layer's activation inputs *and*
+  outputs, ``input_tensors`` / ``output_tensors`` one side each, ``weight`` /
+  ``bias`` the constants (a weight is re-quantized per tensor from its
+  *already quantized* values, the int32 bias scale is refreshed to
+  ``input_scale * weight_scale`` and its codes truncated, a layer that does not
+  move keeps its baseline bias -- as a one-element scale vector, as in Quark).
+  Every slot can go to any precision: integer (int8 / uint8 / int16 / uint16,
+  power-of-two scales -- a ``PowerOf2`` scale type or ``MinMSE`` calibration --
+  rounded as Quark's ``PowerOfTwoMethod`` does), ``float16`` / ``bfloat16`` (an
+  ``ExtendedQuantizeLinear`` / ``ExtendedDequantizeLinear`` pair, scale 1) or a
+  BFP / MX block format (a ``com.amd.quark`` node), over an integer baseline or
+  a ``float16`` / ``bfloat16`` / BFP / MX one (its Quark baseline, with Quark's
+  fake ``[0, 1]`` ranges and its default ``BFPAttributes`` / ``MXAttributes``);
+  ``tests/test_quark_amp_parity.py`` compares the whole quantizer structure and
+  the outputs bit for bit with Quark for the mixes it lists. A
+  ``QuantizeBias=False`` bfloat16 baseline with a block target (the
+  ``BF16_MIXED_*`` presets) keeps its dedicated flow.
   ``target_layer_config`` as one ``QLayerConfig``, a list (each candidate takes
   its best-scoring config) or ``{QLayerConfig: [node names]}``; ``subgraph_json``
   partitions (a missing file is ignored, as in Quark), a
-  ``sensitivity_cache_file`` (Quark's JSON schema; ``"enabled": false`` pins a
-  layer), ``worker_num`` threads, ``no_input_qdq_shared`` and
-  ``dual_quant_nodes`` -- on the int16 -> int8 promotion
-  (``S16S16_MIXED_S8S8``) and the block-format presets
-  (``BF16_MIXED_BFP16`` / ``_MXINT8``) too. Candidates are scored like Quark's
-  analysis does: ONNX Runtime with every graph optimization off, over
-  ``data_size + 1`` calibration batches (so the default ``0`` scores one batch,
-  whatever "0 = all" says), which is what makes the ranking, the cache's scores
-  and the moved layers equal to Quark's, bit for bit on the int path. A block
-  format's models run on :func:`onnxsim.quark_fakequant_eval.run_fake_quantized`
-  (ONNX Runtime for the ordinary ops, bit-exact numpy for the ``com.amd.quark``
-  ones). ``shared_param_mode`` is validated and otherwise meaningless here.
+  ``sensitivity_cache_file`` (Quark's JSON schema *and* key: Quark reads a
+  ranking onnxsim wrote and onnxsim one Quark wrote, see
+  :mod:`onnxsim.quark_amp_cache`; ``"enabled": false`` pins a layer),
+  ``worker_num`` threads, ``no_input_qdq_shared`` and ``shared_param_mode``
+  (Quark's ``"propagate"`` / ``"unshare"`` for the scale / zero point
+  initializers a promoted quantizer shares with the ones around a pass-through
+  op such as ``Transpose`` or ``MaxPool``; the baseline shares them as ONNX
+  Runtime's quantizer does) and ``dual_quant_nodes`` -- on the int16 -> int8
+  promotion (``S16S16_MIXED_S8S8``) and the block-format presets
+  (``BF16_MIXED_BFP16`` / ``_MXINT8``) too; boundary pairs exist for integer
+  mixes only (a half / block / power-of-two mix raises with them). Candidates
+  are scored like Quark's analysis does: ONNX Runtime with every graph
+  optimization off, over ``data_size + 1`` calibration batches (so the default
+  ``0`` scores one batch, whatever "0 = all" says), which is what makes the
+  ranking, the cache's scores and the moved layers equal to Quark's, bit for
+  bit. A model with ``com.amd.quark`` nodes runs on
+  :func:`onnxsim.quark_fakequant_eval.run_fake_quantized` (ONNX Runtime for the
+  ordinary ops, bit-exact numpy for the ``com.amd.quark`` ones).
   AdaRound and AdaQuant are Quark's ``FastFinetune``
   (:mod:`onnxsim.quark_finetune`, a numpy port of ``quark.onnx.algorithm.
   finetuning``): per Conv / ConvTranspose / Gemm / MatMul / InstanceNorm /
@@ -526,19 +543,19 @@ Int16Spec = _spec("Int16Spec", "int16", True, calibration_method=_PCT_DEFAULT)
 UInt16Spec = _spec("UInt16Spec", "uint16", False, calibration_method=_PCT_DEFAULT)
 XInt8Spec = _spec("XInt8Spec", "int8", True, True, "minmse_pof2")
 XUInt8Spec = _spec("XUInt8Spec", "uint8", True, True, "minmse_pof2")
-Float16Spec = _spec("Float16Spec", "float16", False)
-BFloat16Spec = _spec("BFloat16Spec", "bfloat16", False)
-BFP16Spec = _spec("BFP16Spec", "bfp16", False)
-MX4Spec = _spec("MX4Spec", "mx4", False)
-MX6Spec = _spec("MX6Spec", "mx6", False)
-MX9Spec = _spec("MX9Spec", "mx9", False)
+Float16Spec = _spec("Float16Spec", "float16", True)
+BFloat16Spec = _spec("BFloat16Spec", "bfloat16", True)
+BFP16Spec = _spec("BFP16Spec", "bfp16", True)
+MX4Spec = _spec("MX4Spec", "mx4", True)
+MX6Spec = _spec("MX6Spec", "mx6", True)
+MX9Spec = _spec("MX9Spec", "mx9", True)
 
-MXFP4E2M1Spec = _spec("MXFP4E2M1Spec", "mxfp4_e2m1", False)
-MXFP6E3M2Spec = _spec("MXFP6E3M2Spec", "mxfp6_e3m2", False)
-MXFP6E2M3Spec = _spec("MXFP6E2M3Spec", "mxfp6_e2m3", False)
-MXFP8E5M2Spec = _spec("MXFP8E5M2Spec", "mxfp8_e5m2", False)
-MXFP8E4M3Spec = _spec("MXFP8E4M3Spec", "mxfp8_e4m3", False)
-MXInt8Spec = _spec("MXInt8Spec", "mxint8", False)
+MXFP4E2M1Spec = _spec("MXFP4E2M1Spec", "mxfp4_e2m1", True)
+MXFP6E3M2Spec = _spec("MXFP6E3M2Spec", "mxfp6_e3m2", True)
+MXFP6E2M3Spec = _spec("MXFP6E2M3Spec", "mxfp6_e2m3", True)
+MXFP8E5M2Spec = _spec("MXFP8E5M2Spec", "mxfp8_e5m2", True)
+MXFP8E4M3Spec = _spec("MXFP8E4M3Spec", "mxfp8_e4m3", True)
+MXInt8Spec = _spec("MXInt8Spec", "mxint8", True)
 
 
 def _block_fn(dtype: str) -> Optional[Callable[[np.ndarray, int], np.ndarray]]:
@@ -789,7 +806,12 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
     "BF16": lambda: QConfig(_layer(BFloat16Spec, BFloat16Spec)),
-    "BFP16": lambda: QConfig(_layer(BFP16Spec, BFP16Spec)),
+    "BFP16": lambda: QConfig(
+        _layer(BFP16Spec, BFP16Spec),
+        BFPAttributes=dict(
+            bfp_method="to_bfp", axis=1, bit_width=16, block_size=8, rounding_mode=2
+        ),
+    ),
     "MX4": lambda: QConfig(_layer(MX4Spec, MX4Spec)),
     "MX6": lambda: QConfig(_layer(MX6Spec, MX6Spec)),
     "MX9": lambda: QConfig(_layer(MX9Spec, MX9Spec)),
@@ -869,8 +891,10 @@ def _s16s16_mixed_s8s8() -> QConfig:
         ),
         algo_config=[
             AutoMixprecisionConfig(
+                # (Quark's preset spells Int8Spec() throughout: the activation's
+                # asymmetry comes from the global spec, via ActivationSymmetric)
                 target_layer_config=QLayerConfig(
-                    input_tensors=Int8Spec(symmetric=False),
+                    input_tensors=Int8Spec(),
                     weight=Int8Spec(),
                     bias=Int8Spec(),
                 ),
@@ -886,7 +910,7 @@ def _mixed_block(block: Callable[[], QSpec], *algos: AlgoConfig) -> QConfig:
     """bfloat16 everywhere, every Conv / Gemm / MatMul promoted to ``block``
     (Quark: AutoMixprecision with the metric threshold disabled, dual nodes at
     the boundaries, biases left unquantized)."""
-    target = QLayerConfig(activation=block(), weight=block())
+    target = QLayerConfig(input_tensors=block(), weight=block(), bias=block())
     return QConfig(
         _layer(BFloat16Spec, BFloat16Spec),
         algo_config=[
@@ -1157,6 +1181,12 @@ class ModelQuantizer:
             result = self._quantize_mixed_block(
                 model_input, act, ignore_unsupported_algos, calibration_data_reader
             )
+        elif (wt.dtype in _FAKEQUANT_DTYPES or act.dtype in _FAKEQUANT_DTYPES) and any(
+            a.name == "auto_mixprecision" for a in cfg.algo_config
+        ):
+            result = self._amp_on_fakequant_base(
+                model_input, act, wt, ignore_unsupported_algos, calibration_data_reader
+            )
         elif act.is_dynamic:
             result = self._quantize_dynamic(model_input, act, wt)
         elif wt.dtype in _FAKEQUANT_DTYPES or act.dtype in _FAKEQUANT_DTYPES:
@@ -1259,6 +1289,8 @@ class ModelQuantizer:
         layers use a block format (``BF16_MIXED_BFP16`` / ``_MXINT8``), if any."""
         if act.dtype != "bfloat16":
             return None
+        if self.config.extra_options.get("QuantizeBias", True) is not False:
+            return None  # the presets leave biases alone; see _amp_on_fakequant_base
         for a in self.config.algo_config:
             t = a.params.get("target_layer_config")
             if (
@@ -1380,6 +1412,149 @@ class ModelQuantizer:
             worker_num=p.get("worker_num", 1),
             no_input_qdq_shared=bool(p.get("no_input_qdq_shared", False)),
             dual_quant_nodes=bool(p.get("dual_quant_nodes", False)),
+            cache_key_fn=self._amp_cache_key_fn(p),
+        )
+        self.last_auto_mixprecision = res
+        return res.model
+
+    def _amp_cache_key_fn(
+        self, p: Dict[str, Any]
+    ) -> "Callable[[onnx.ModelProto], str]":
+        """``f(baseline) -> str``: Quark's sensitivity-cache key for this
+        AutoMixprecision request (see :mod:`onnxsim.quark_amp_cache`)."""
+        from onnxsim.quark_amp_cache import quark_cache_key
+
+        target = p.get("target_layer_config")
+        ops = tuple(p.get("target_op_type") or PROMOTABLE_OPS)
+        include = list(p.get("include_layers") or ())
+        exclude = list(p.get("exclude_layers") or ())
+        return lambda baseline: quark_cache_key(baseline, target, ops, include, exclude)
+
+    def _block_attr_overrides(
+        self, act: QSpec, wt: QSpec
+    ) -> "Dict[str, Dict[str, Any]]":
+        """What Quark's quantizer puts on the block-format nodes of a *generic*
+        ``QLayerConfig`` baseline, beyond :func:`~onnxsim.quark_fakequant_graph.node_spec`
+        (the presets' values): the ``BFPAttributes`` / ``MXAttributes`` extra
+        options update its default attributes, and a BFP16 baseline without
+        them uses the default ``rounding_mode`` 0 (the presets set 2)."""
+        opts = self.config.extra_options
+        dts = {act.dtype, wt.dtype}
+        mixed = act.dtype != wt.dtype
+        if mixed and dts & set(_BLOCK_DTYPES) - {"bfp16", "mxint8"}:
+            raise NotImplementedError(
+                f"AutoMixprecision over a {act.dtype}/{wt.dtype} baseline: Quark "
+                "gives such a mix its default block attributes only for BFP16 / "
+                "MXInt8 constants"
+            )
+        over: "Dict[str, Dict[str, Any]]" = {}
+        if opts.get("BFPAttributes") is not None:
+            over["BFPQuantizeDequantize"] = dict(opts["BFPAttributes"])
+        elif "bfp16" in dts:
+            over["BFPQuantizeDequantize"] = {"rounding_mode": 0}
+        if opts.get("MXAttributes") is not None:
+            over["MXQuantizeDequantize"] = dict(opts["MXAttributes"])
+        elif mixed and "mxint8" in dts:
+            over["MXQuantizeDequantize"] = {"rounding_mode": 0}
+        return over
+
+    def _amp_on_fakequant_base(
+        self,
+        model: onnx.ModelProto,
+        act: QSpec,
+        wt: QSpec,
+        ignore_unsupported: bool,
+        reader: Any = None,
+    ) -> onnx.ModelProto:
+        """AutoMixprecision over a ``float16`` / ``bfloat16`` / BFP / MX baseline
+        (built as the plain preset would, see :meth:`_quantize_block`), with
+        targets of any precision: Quark's in-place surgery on the baseline, the
+        calibration being its fake ``[0, 1]`` ranges (no calibration is run for
+        these formats)."""
+        from onnxsim.quark_auto_mixprecision import (
+            auto_mixprecision_from_baseline,
+            parse_subgraph_json,
+        )
+        from onnxsim.quark_preset_graphs import _with_node_names
+
+        cfg = self.config
+        opts = cfg.extra_options
+        algo = next(a for a in cfg.algo_config if a.name == "auto_mixprecision")
+        others = [a.name for a in cfg.algo_config if a is not algo]
+        if others and not ignore_unsupported:
+            raise NotImplementedError(
+                f"algo_config [{', '.join(others)}] is not applied with "
+                f"{act.dtype}/{wt.dtype} baselines; pass "
+                "ignore_unsupported_algos=True to quantize without it"
+            )
+        if not opts.get("BlockFormatActivations", True) or opts.get(
+            "BlockFormatFoldWeights", False
+        ):
+            raise NotImplementedError(
+                "AutoMixprecision needs the baseline's quantizer nodes: "
+                "BlockFormatActivations=False / BlockFormatFoldWeights=True are "
+                "not supported"
+            )
+        p = algo.params
+        if p.get("dual_quant_nodes", False):
+            raise NotImplementedError(
+                "dual_quant_nodes is not supported for half / block / integer "
+                "mixes over a float / block baseline"
+            )
+        shared_mode = p.get("shared_param_mode", "propagate")
+        if shared_mode not in ("propagate", "unshare"):
+            raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
+        calibration = _drain_reader(reader)
+        if not calibration:
+            raise ValueError(
+                "calibration_data_reader is required to score the AutoMixprecision "
+                "candidates"
+            )
+        model = _with_node_names(model)
+        baseline = self._quantize_block(
+            model, act, wt, self._block_attr_overrides(act, wt)
+        )
+        targets, pinned = self._amp_targets(p.get("target_layer_config"))
+        subgraphs = None
+        sg_path = p.get("subgraph_json")
+        if sg_path is not None:
+            if Path(sg_path).exists():
+                specs = parse_subgraph_json(sg_path, model, model)
+                subgraphs = [(sg.name, sg.resolved_nodes) for sg in specs]
+            else:  # Quark checks ``Path(subgraph_json).exists()`` and moves on
+                self._approx(
+                    f"subgraph_json {sg_path!r} does not exist: ignored, as Quark does"
+                )
+        self._approx(
+            f"AutoMixprecision over a {act.dtype}/{wt.dtype} baseline: candidates "
+            "are scored on the ONNX reference evaluator for Quark's custom ops "
+            "(ONNX Runtime for the rest); tensor ranges are Quark's fake [0, 1]"
+        )
+        res = auto_mixprecision_from_baseline(
+            model,
+            calibration,
+            baseline,
+            targets,
+            candidate_targets=pinned,
+            base_label=f"{act.dtype}/{wt.dtype}",
+            target_op_types=tuple(p.get("target_op_type") or PROMOTABLE_OPS),
+            include_layers=p.get("include_layers") or (),
+            exclude_layers=p.get("exclude_layers") or (),
+            metric=p.get("metric_default", "l2"),
+            metric_distance_fn=p.get("metric_distance_fn"),
+            metric_evaluate_fn=p.get("metric_evaluate_fn"),
+            metric_threshold=p.get("metric_threshold", 0),
+            optimize=p.get("metric_optimize_object", "speed"),
+            metric_output_index=p.get("metric_output_index", 0),
+            data_size=int(p.get("data_size", 0)) + 1,
+            subgraphs=subgraphs,
+            cache_file=p.get("sensitivity_cache_file"),
+            worker_num=p.get("worker_num", 1),
+            no_input_qdq_shared=bool(p.get("no_input_qdq_shared", False)),
+            activation_symmetric=bool(opts.get("ActivationSymmetric", act.symmetric)),
+            weight_symmetric=bool(opts.get("WeightSymmetric", wt.symmetric)),
+            shared_param_mode=shared_mode,
+            cache_key_fn=self._amp_cache_key_fn(p),
         )
         self.last_auto_mixprecision = res
         return res.model
@@ -1415,7 +1590,11 @@ class ModelQuantizer:
         )
 
     def _quantize_block(
-        self, model: onnx.ModelProto, act: QSpec, wt: QSpec
+        self,
+        model: onnx.ModelProto,
+        act: QSpec,
+        wt: QSpec,
+        attr_overrides: "Optional[Dict[str, Dict[str, Any]]]" = None,
     ) -> onnx.ModelProto:
         from onnxsim.quark_fakequant_graph import apply_fake_quant_format
 
@@ -1463,6 +1642,7 @@ class ModelQuantizer:
             fold_fn=fn,
             exclude=exclude,
             const_dtype=wt.dtype if mixed and quantize_acts and not fold else None,
+            attr_overrides=attr_overrides,
         )
 
     def _extended(self, act: QSpec, wt: QSpec) -> bool:
@@ -1718,14 +1898,17 @@ class ModelQuantizer:
         g_wt = self.config.global_config.weight
         assert g_act is not None and g_wt is not None
 
-        def prec(spec: Optional[QSpec], role: str) -> "Optional[tuple[str, bool]]":
+        def prec(spec: Optional[QSpec], role: str) -> "Optional[tuple[Any, ...]]":
             if spec is None:
                 return None
-            if spec.pof2 and role != "activation":
+            from onnxsim.quark_mixing import kind_of
+
+            try:
+                kind_of(spec.dtype)
+            except ValueError:
                 raise NotImplementedError(
-                    f"target_layer_config {role} with a power-of-two scale is not "
-                    "supported"
-                )
+                    f"target_layer_config {role} dtype {spec.dtype} is not supported"
+                ) from None
             # Quark's ``extra_options`` carry the *global* spec's symmetry as
             # ``ActivationSymmetric`` / ``WeightSymmetric``, and those win over
             # the target spec's own (a bias spec always keeps its own)
@@ -1734,12 +1917,10 @@ class ModelQuantizer:
             sym = spec.symmetric
             if role in key:
                 sym = bool(opts.get(key[role], glob[role]))
-            if role == "activation":
-                return self._int_act_dtype(spec), sym
-            if spec.dtype not in ("int8", "uint8", "int16", "uint16"):
-                raise NotImplementedError(
-                    f"target_layer_config {role} dtype {spec.dtype} is not supported"
-                )
+            # a power-of-two scale (Quark's ``PowerOfTwoMethod``: a PowerOf2
+            # scale type or the MinMSE calibration) rounds the new scale
+            if spec.pof2 or spec.calibration_method == "minmse_pof2":
+                return spec.dtype, sym, True
             return spec.dtype, sym
 
         def spec_of(cfg: Any) -> TargetSpec:
@@ -1827,7 +2008,8 @@ class ModelQuantizer:
                 self._approx(
                     f"subgraph_json {sg_path!r} does not exist: ignored, as Quark does"
                 )
-        if p.get("shared_param_mode", "propagate") not in ("propagate", "unshare"):
+        shared_mode = p.get("shared_param_mode", "propagate")
+        if shared_mode not in ("propagate", "unshare"):
             raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
         self._approx(
             "AutoMixprecision: activation, weight and bias precisions are mixed "
@@ -1867,6 +2049,8 @@ class ModelQuantizer:
             data_size=data_size,
             method=cal_method,
             calibrate_options=cal_options,
+            shared_param_mode=shared_mode,
+            cache_key_fn=self._amp_cache_key_fn(p),
         )
         self.last_auto_mixprecision = res
         return res.model
@@ -2053,7 +2237,31 @@ class ModelQuantizer:
             tensor_symmetric=t_sym or None,
         )
         mixed_algo = by_name.get("auto_mixprecision")
-        base_bias = self._base_bias_post(work, act, wt) if mixed_algo else None
+        skip_names = set(exclude)
+
+        def finish(q: onnx.ModelProto) -> onnx.ModelProto:
+            """Quark's quantizer-side rewrites that follow the Q/DQ insertion
+            (and so come *before* AutoMixprecision, which edits their result)."""
+            if npu_cnn:
+                from onnxsim.quark_npu import apply_npu_cnn_rewrites
+
+                q = apply_npu_cnn_rewrites(
+                    q,
+                    opts,
+                    _activation_rules(opts, act_sym, False, True)["remove_qdq_after"],
+                    lambda n: n.name not in skip_names,
+                )
+            if opts.get("ConvertClipToRelu", False):
+                from onnxsim.quark_convert import convert_clip_to_relu
+
+                q = convert_clip_to_relu(q, lambda n: n.name not in skip_names)
+            if opts.get("DedicatedQDQPair", False):
+                from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
+
+                q = dedicate_qdq_pairs(q)
+            return q
+
+        bias_post = self._base_bias_post(work, act, wt)
         if mixed_algo is not None:
             quantized = self._auto_mixprecision(
                 work,
@@ -2063,33 +2271,13 @@ class ModelQuantizer:
                 exclude,
                 mixed_algo,
                 qkw,
-                base_bias,
+                (lambda q: finish(bias_post(q) if bias_post is not None else q)),
             )
         else:
             quantized = quantize_full_qdq(work, **qkw)
-            bias_post = self._base_bias_post(work, act, wt)
             if bias_post is not None:
                 quantized = bias_post(quantized)
-            skip_names = set(exclude)
-            if npu_cnn:
-                from onnxsim.quark_npu import apply_npu_cnn_rewrites
-
-                quantized = apply_npu_cnn_rewrites(
-                    quantized,
-                    opts,
-                    _activation_rules(opts, act_sym, False, True)["remove_qdq_after"],
-                    lambda n: n.name not in skip_names,
-                )
-            if opts.get("ConvertClipToRelu", False):
-                from onnxsim.quark_convert import convert_clip_to_relu
-
-                quantized = convert_clip_to_relu(
-                    quantized, lambda n: n.name not in skip_names
-                )
-            if opts.get("DedicatedQDQPair", False):
-                from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
-
-                quantized = dedicate_qdq_pairs(quantized)
+            quantized = finish(quantized)
 
         # Post-quantization passes, which compare against the float model.
         if "adaquant" in by_name and by_name["adaquant"].params.get("legacy_engine"):

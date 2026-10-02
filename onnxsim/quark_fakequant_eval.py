@@ -206,6 +206,12 @@ def run_fake_quantized(
             types[v.name] = v.type.tensor_type.elem_type
     except Exception:  # types are only hints for the segment boundaries
         pass
+    # shape inference knows no ``com.microsoft`` QuantizeLinear (16-bit codes):
+    # a quantizer's output is typed by its zero point (uint8 without one)
+    for n in g.node:
+        if n.op_type == "QuantizeLinear" and n.output:
+            zp = inits.get(n.input[2]) if len(n.input) > 2 else None
+            types[n.output[0]] = zp.data_type if zp is not None else TensorProto.UINT8
 
     # plan: ordinary runs and single custom nodes, in order
     plan: List[Any] = []

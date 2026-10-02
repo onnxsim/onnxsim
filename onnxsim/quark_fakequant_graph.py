@@ -43,7 +43,7 @@ the BFP/MX presets) and its handling of ops outside the lists above.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import onnx
@@ -142,8 +142,20 @@ HALF_DTYPES = {
 }
 
 
-def _make_node(dtype: str, x: str, y: str, axis: int, name: str) -> onnx.NodeProto:
+def _make_node(
+    dtype: str,
+    x: str,
+    y: str,
+    axis: int,
+    name: str,
+    overrides: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> onnx.NodeProto:
     op, attrs = node_spec(dtype, axis)
+    # Quark's ``BFPAttributes`` / ``MXAttributes`` extra options update the
+    # node's default attributes (the block axis is refined afterwards anyway)
+    attrs.update(
+        {k: v for k, v in (overrides or {}).get(op, {}).items() if k != "axis"}
+    )
     return onnx.helper.make_node(
         op,
         [x],
@@ -335,6 +347,7 @@ def apply_fake_quant_format(
     exclude: Sequence[str] = (),
     const_dtype: Optional[str] = None,
     quantize_all_ops: bool = True,
+    attr_overrides: Optional[Mapping[str, Mapping[str, object]]] = None,
 ) -> onnx.ModelProto:
     """Return ``model`` with fake-quantization nodes inserted (see the module
     docstring).
@@ -357,6 +370,8 @@ def apply_fake_quant_format(
             (``QuantizeAllOpTypes``); False gives the block formats' op
             coverage with half-precision quantizers. Always off with
             ``const_dtype``.
+    :param attr_overrides: ``{op type: {attribute: value}}`` applied to the
+            block-format nodes (Quark's ``BFPAttributes`` / ``MXAttributes``)
     """
     half = dtype in HALF_DTYPES
     if not half:
@@ -396,12 +411,25 @@ def apply_fake_quant_format(
     def fake_quant(t: str, src: str, dst: str) -> List[onnx.NodeProto]:
         """The node(s) quantizing tensor ``t``: ``src`` -> ``dst``."""
         if const_dtype is not None and t in plan.inits:
-            return [_make_node(const_dtype, src, dst, axes[t], t + "_DequantizeLinear")]
+            return [
+                _make_node(
+                    const_dtype,
+                    src,
+                    dst,
+                    axes[t],
+                    t + "_DequantizeLinear",
+                    attr_overrides,
+                )
+            ]
         if half:
             nodes, extra = _make_half_pair(dtype, src, dst, t)
             g.initializer.extend(extra)
             return nodes
-        return [_make_node(dtype, src, dst, axes[t], t + "_DequantizeLinear")]
+        return [
+            _make_node(
+                dtype, src, dst, axes[t], t + "_DequantizeLinear", attr_overrides
+            )
+        ]
 
     in_rename: Dict[str, str] = {}  # tensor -> what its consumers read instead
     out_rename: Dict[str, str] = {}  # graph output -> what its producer writes
