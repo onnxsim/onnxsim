@@ -1361,3 +1361,19 @@ Winograd'd 3x3 (100 ms for 29 GFLOP-equivalent) and the depthwise convs (7 ms) a
 
 ### Winograd output-size cap re-check
 The attribution job measured RT-DETR pre -2.4% with `ORT_WEBGPU_WINO_MAXHW=100` on its library. On the current library (texture/depthwise/concat patches in) the cap is neutral for RT-DETR (332.3/332.1 vs 332.3/333.2), neutral for ResNet-50 and YOLO11n, and **+6 ms worse on SAM** (364.0 vs 357.8), so the default stays uncapped.
+
+## Fused ReLU linear attention (EfficientViT-SAM): 3.2x per block, ~7 ms of the SAM encoder (`dawn_repro/linattn.cc`)
+
+The SAM-L0 encoder has **4** linear-attention blocks (`stages.4/op_list.1-4`), each B=1, heads=32, dim=32, N=256 (16x16 map): qkv [1,3072,16,16] -> Reshape [1,32,96,256] -> q/k/v Slices, ReLU on q and k, Transpose(k), Pad(v) to 33 rows with ones,
+MatMul [32,33,256]x[32,256,32], MatMul [32,33,32]x[32,32,256], Slice num/den, Add(den, 1e-15), Div. `linattn.cc` replicates ORT's 15-dispatch chain (scalar-per-thread kernels; MatMuls as naive reductions, so a best-effort replica, not ORT's tiled
+shader) and a 2-dispatch fused version: (1) per (head, N-quarter) shared-memory tiles of relu(k) and v give partial KV (33x32) sums; (2) per (head, 64 pixels) sum the 4 partials into shared memory, read q straight from the NHWC qkv buffer with relu on load, compute
+num/den and write NHWC [N][heads*dim] (the layout the proj conv reads). Both match a double CPU reference (chain 5.1e-7, fused 4.1e-7, no non-finite values even with exactly-zero denominators).
+
+Phone, warm (5 s warm-up), min of 12 ABAB rounds, per block: back-to-back **chain 2.52 ms -> fused 0.80 ms (3.2x)**; single-block latency 3.29 -> 0.96 ms. Four blocks: 10.1 -> 3.2 ms, **about 7 ms saved of ~357 ms (2%)**. The chain's cost is dispatch count and
+the two naive MatMuls (0.64 + 0.47 ms); the elementwise steps are 0.09-0.1 ms each (13 us floor plus ~50 GB/s on 1 MB). The fused kernels run 0.43 + 0.38 ms; kernel 2 is bound by the 32x32 per-thread FMA loop (not tuned; a vec4/register-tile version could reach ~0.2 ms).
+
+Numerics: fp32 is required (the reference has exactly zero denominators: num = den = 0 there, so the +1e-15 epsilon must stay representable; in f16 it flushes to zero -> 0/0 NaN, the SAM fp16 failure found earlier). Keep the epsilon as a runtime f32 constant, never converted.
+
+Integration plan: (1) ONNX-level rewrite or ORT graph transformer matching `Reshape -> {Slice x3} -> Relu(q), Relu(k) -> Transpose(k), Pad(v, 1.0 on axis 2) -> MatMul(vpad, k^T) -> MatMul(., q) -> Slice x2 -> Add(eps) -> Div -> Reshape`
+(EfficientViT `LiteMLA`) to a contrib op `LinearAttention`-style node `(qkv NCHW or NHWC, eps) -> out` with attrs heads, dim, eps; the WebGPU EP already registers a contrib `LinearAttention` kernel (different semantics, for LLM state), so use a new name (e.g. `ReluLinearAttention`);
+(2) the kernel reads the NHWC qkv conv output (the NHWC layout transformer already supplies it) and writes NHWC; (3) general N: split count NS = ceil(N/tile) with the partial buffer as scratch, dim and heads as shader constants. Gain is ~2% of SAM (7 ms of 357), so it is a lower priority than the 1x1-conv work; the pattern also matters for other EfficientViT models.
