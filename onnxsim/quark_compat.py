@@ -1408,6 +1408,26 @@ def _default_opset(model: onnx.ModelProto) -> int:
     )
 
 
+def _convert_requested_opset(
+    model: onnx.ModelProto, opts: Dict[str, Any]
+) -> onnx.ModelProto:
+    target = opts.get("ConvertOpsetVersion")
+    if not isinstance(target, int) or opts.get("SkipPreprocess", False):
+        return model
+    from onnxsim.quark_tools import convert_opset_version
+
+    try:
+        return convert_opset_version(model, target)
+    except ValueError as e:
+        warnings.warn(
+            f"onnxsim.quark_compat: failed to convert the opset version "
+            f"({e}), skipping the conversion",
+            UserWarning,
+            stacklevel=2,
+        )
+        return model
+
+
 def _qdq_to_ms_domain(model: onnx.ModelProto) -> onnx.ModelProto:
     """Quark's extended quantizer (its ``A8W8`` and 16-bit presets) emits custom
     Q/DQ nodes and ends by converting them to the ``com.microsoft`` ones
@@ -1533,20 +1553,12 @@ class ModelQuantizer:
         target = cfg.extra_options.get("ConvertOpsetVersion")
         if (
             isinstance(target, int)
-            and not block_flow
+            # Static integer flows convert inside _float_preprocess, after
+            # checking whether any nodes are quantizable.
+            and not (block_flow or (not fake and not act.is_dynamic))
             and not cfg.extra_options.get("SkipPreprocess", False)
         ):
-            from onnxsim.quark_tools import convert_opset_version
-
-            try:
-                model_input = convert_opset_version(model_input, target)
-            except ValueError as e:
-                warnings.warn(
-                    f"onnxsim.quark_compat: failed to convert the opset version "
-                    f"({e}), skipping the conversion",
-                    UserWarning,
-                    stacklevel=2,
-                )
+            model_input = _convert_requested_opset(model_input, cfg.extra_options)
 
         half = act.dtype in ("float16", "bfloat16")
         if half and cfg.extra_options.get("ConvertToHalf"):
@@ -2041,7 +2053,9 @@ class ModelQuantizer:
         from onnxsim.quark_fakequant_graph import apply_fake_quant_format
 
         opts = self.config.extra_options
-        exclude = [e for e in self.config.exclude if isinstance(e, str)]
+        exclude = _match_nodes(
+            model, [e for e in self.config.exclude if isinstance(e, (str, tuple))]
+        )
         if act.dtype not in _FAKEQUANT_DTYPES:
             raise NotImplementedError(
                 f"{act.dtype} activations over {wt.dtype} weights: integer "
@@ -2801,9 +2815,6 @@ class ModelQuantizer:
             )
         act_dtype = self._int_act_dtype(act)
 
-        calibration = _drain_reader(reader)
-        if not calibration:
-            raise ValueError("calibration_data_reader is required for integer presets")
         exclude = _match_nodes(
             model, [e for e in self.config.exclude if isinstance(e, (str, tuple))]
         )
@@ -2813,15 +2824,27 @@ class ModelQuantizer:
         opts = self.config.extra_options
         op_types, scope_excluded = self._transformer_scope(model)
         exclude += scope_excluded
-        if op_types is not None and not any(
-            n.op_type in op_types and (n.name or n.output[0]) not in set(exclude)
-            for n in model.graph.node
-        ):
+        npu_cnn = bool(act.pof2 and wt.pof2 and opts.get("EnableNPUCnn", True))
+        static_types = (
+            op_types
+            if op_types is not None
+            else self._static_op_types(
+                model,
+                extended=npu_cnn or self._extended(act, wt),
+                quantize_all=bool(opts.get("QuantizeAllOpTypes")),
+            )
+        )
+        if not _quantizable(model, static_types, exclude):
             # Quark: "No quantizable ops in this model" -- the float graph comes
-            # back as it is (its Constant nodes unfolded), in Quark's node order
+            # back as it is (its Constant nodes unfolded). The transformer scope
+            # already sorts the graph when it identifies weight MatMuls.
             from onnxsim.quark_marking import quark_sorted
 
-            return quark_sorted(model)
+            return quark_sorted(model) if op_types is not None else model
+        model = _convert_requested_opset(model, opts)
+        calibration = _drain_reader(reader)
+        if not calibration:
+            raise ValueError("calibration_data_reader is required for integer presets")
         by_name = {a.name: a for a in algos}
 
         # Quark's presets quantize weights per tensor; the weight-rounding
@@ -2850,7 +2873,6 @@ class ModelQuantizer:
         # the transformed model; the untouched one stays the reference).
         float_model = model
         work = model
-        npu_cnn = bool(act.pof2 and wt.pof2 and opts.get("EnableNPUCnn", True))
         if npu_cnn and bool(opts.get("PerChannel", False)):
             raise ValueError(
                 "Only per-tensor quantization is supported when enable_npu_cnn=True, "
@@ -2862,15 +2884,6 @@ class ModelQuantizer:
                 "scales); Quark refuses it too"
             )
         skip_pre = bool(opts.get("SkipPreprocess", False))
-        static_types = (
-            op_types
-            if op_types is not None
-            else self._static_op_types(
-                model,
-                extended=npu_cnn or self._extended(act, wt),
-                quantize_all=bool(opts.get("QuantizeAllOpTypes")),
-            )
-        )
         work = self._float_preprocess(
             work,
             copy_bias=self._calib_method(act)
