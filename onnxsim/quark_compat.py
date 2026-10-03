@@ -137,8 +137,9 @@ names and preset *meanings*, not copied.
   input's scale and zero point, a Conv / MatMul / Gemm / ... output before a ReLU-like
   op and a ``Pad`` before a pool go without a pair (``RemoveQDQConv*``), unused
   constants are dropped, and the ``opset_import`` list is Quark's (the model's, then
-  ``com.microsoft``, then ``com.amd.quark``). Not covered: float16 *input* models
-  (Quark's ``QuantizeFP16`` mode), and the output of a ``Gather`` on a constant table
+  ``com.microsoft``, then ``com.amd.quark``). Float16 input models use Quark's
+  ``QuantizeFP16`` mode; ``UseFP32Scale`` converts internal FP16 tensors and adds
+  Casts at the model interface. Not covered: the output of a ``Gather`` on a constant table
   in the mixed presets (``BF16_BFP16``,
   ``MX9_INT8``) is quantized with the baseline format instead of the table's.
 - Models with a default-domain opset below 13 are quantized in place like Quark
