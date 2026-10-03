@@ -3042,6 +3042,7 @@ class ModelQuantizer:
 
                 q = convert_clip_to_relu(q, lambda n: n.name not in skip_names)
             if opts.get("DedicatedQDQPair", False):
+                from onnxsim.quark_marking import quark_node_order
                 from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
 
                 keep = set(skip_names)
@@ -3054,6 +3055,7 @@ class ModelQuantizer:
                         and n.name not in keep
                         and (scope_types is None or n.op_type in scope_types)
                     },
+                    receiver_order=[n.name for n in quark_node_order(work)],
                 )
             if self._keeps_constants() and not npu_cnn:
                 # (the Constant nodes lead the list, as in Quark's graph, whose own
