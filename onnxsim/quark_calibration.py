@@ -32,7 +32,7 @@ _F32 = np.float32
 
 def _as_f32(arr: np.ndarray) -> np.ndarray:
     a = np.asarray(arr).ravel()
-    return a if a.dtype == np.float32 else a.astype(np.float32)
+    return a if a.dtype in (np.float32, np.float16) else a.astype(np.float32)
 
 
 class QuarkHistogram:
@@ -60,10 +60,11 @@ class QuarkHistogram:
             self._add_signed(data, lo, hi)
 
     def _add_absolute(self, data: np.ndarray, lo: Any, hi: Any) -> None:
-        mag = np.absolute(data)
+        orig_dtype = data.dtype
+        mag = np.absolute(data).astype(np.float32)
         if self.hist is None or self.edges is None:
             hist, edges = np.histogram(mag, bins=self.num_bins)
-            self.hist, self.edges = hist, edges.astype(np.float32)
+            self.hist, self.edges = hist, edges.astype(orig_dtype)
             self.rmin, self.rmax = lo, hi
             return
         edges = self.edges
@@ -74,7 +75,7 @@ class QuarkHistogram:
             edges = np.hstack((edges, extra))
         hist, new_edges = np.histogram(mag, bins=edges)
         hist[: len(self.hist)] += self.hist
-        self.hist, self.edges = hist, new_edges.astype(np.float32)
+        self.hist, self.edges = hist, new_edges.astype(orig_dtype)
         self.rmin, self.rmax = min(self.rmin, lo), max(self.rmax, hi)
 
     def _add_signed(self, data: np.ndarray, lo: Any, hi: Any) -> None:

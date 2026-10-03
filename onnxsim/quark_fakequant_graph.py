@@ -261,7 +261,10 @@ class _Plan:
             self.elem[name] = t.data_type
 
     def is_float(self, name: str) -> bool:
-        return bool(name) and self.elem.get(name) == onnx.TensorProto.FLOAT
+        return bool(name) and self.elem.get(name) in (
+            onnx.TensorProto.FLOAT,
+            onnx.TensorProto.FLOAT16,
+        )
 
     def quantized_tensors(
         self, model: onnx.ModelProto, extra_active: Optional[Set[str]] = None
@@ -612,6 +615,15 @@ def apply_fake_quant_format(
             ]
         if half:
             nodes, extra = _make_half_pair(dtype, src, dst, t, roots.get(t))
+            if t in plan.inits and plan.elem.get(t) == onnx.TensorProto.FLOAT16:
+                for initializer in extra:
+                    if initializer.data_type == onnx.TensorProto.FLOAT:
+                        initializer.CopyFrom(
+                            numpy_helper.from_array(
+                                numpy_helper.to_array(initializer).astype(np.float16),
+                                initializer.name,
+                            )
+                        )
             g.initializer.extend(extra)
             return nodes
         return [
