@@ -139,9 +139,9 @@ names and preset *meanings*, not copied.
   constants are dropped, and the ``opset_import`` list is Quark's (the model's, then
   ``com.microsoft``, then ``com.amd.quark``). Not covered: float16 *input* models
   (Quark's ``QuantizeFP16`` mode), the ``AutoMixprecision`` presets
-  (``BF16_MIXED_*``, ``tests/test_quark_amp_parity.py``) run no pre-processing, and the
-  output of a ``Gather`` on a constant table in the mixed presets (``BF16_BFP16``,
-  ``MX9_INT8``) is quantized with the baseline format instead of the table's.
+  (``BF16_MIXED_*``, ``tests/test_quark_amp_parity.py``) run no pre-processing.
+  The output of a ``Gather`` on a constant table in mixed presets (``BF16_BFP16``,
+  ``MX9_INT8``) inherits the table's format and quantization parameters.
 - Models with a default-domain opset below 13 are quantized in place like Quark
   does (``tests/test_quark_low_opset_parity.py``): the opset is never converted,
   per-tensor Q/DQ carry no ``axis`` (the bias DequantizeLinear gets Quark's

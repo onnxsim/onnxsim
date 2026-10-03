@@ -595,28 +595,23 @@ def apply_fake_quant_format(
 
     def fake_quant(t: str, src: str, dst: str) -> List[onnx.NodeProto]:
         """The node(s) quantizing tensor ``t``: ``src`` -> ``dst``."""
-        if const_dtype in HALF_DTYPES and t in plan.inits:
-            nodes, extra = _make_half_pair(const_dtype, src, dst, t)
-            g.initializer.extend(extra)
-            return nodes
-        if const_dtype is not None and t in plan.inits:
-            return [
-                _make_node(
-                    const_dtype,
-                    src,
-                    dst,
-                    axes[t],
-                    t + "_DequantizeLinear",
-                    attr_overrides,
-                )
-            ]
-        if half:
-            nodes, extra = _make_half_pair(dtype, src, dst, t, roots.get(t))
+        root = roots.get(t, t)
+        tensor_dtype = (
+            const_dtype if const_dtype is not None and root in plan.inits else dtype
+        )
+        if tensor_dtype in HALF_DTYPES:
+            nodes, extra = _make_half_pair(tensor_dtype, src, dst, t, roots.get(t))
             g.initializer.extend(extra)
             return nodes
         return [
             _make_node(
-                dtype, src, dst, axes[t], t + "_DequantizeLinear", attr_overrides
+                tensor_dtype,
+                src,
+                dst,
+                # Quark creates a sharing functional node without axis refinement.
+                1 if t in roots and root in plan.inits else axes[t],
+                t + "_DequantizeLinear",
+                attr_overrides,
             )
         ]
 
