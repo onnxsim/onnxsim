@@ -408,12 +408,12 @@ off-the-shelf "convert this ONNX model" call left to lean on, so onnxsim ships
 its own ONNX-to-MIL translator and hands the result to coremltools'
 MIL-to-Core-ML backend to produce the actual model. It covers a practical
 subset of ONNX ops (conv/pooling/normalization, matmul/gemm, elementwise math,
-reshapes, reductions, and more — see `coreml_export.SUPPORTED_ONNX_OPS`); a
-node whose op isn't supported raises a clear error naming the op, rather than
-silently producing a wrong model. Feeding in a *simplified* model is the point,
-same as with MLIR export: onnxsim's constant folding turns more of the graph
-into plain initializers, so more of it lands on the translator's supported-op
-list.
+reshapes, reductions, GridSample, and more — see
+`coreml_export.SUPPORTED_ONNX_OPS`); a node whose op isn't supported raises a
+clear error naming the op, rather than silently producing a wrong model. Feeding
+in a *simplified* model is the point, same as with MLIR export: onnxsim's
+constant folding turns more of the graph into plain initializers, so more of it
+lands on the translator's supported-op list.
 
 coremltools is **optional**, just like onnxruntime for constant folding: it
 isn't imported unless you actually export to Core ML.
@@ -559,6 +559,40 @@ decoding), pass `flex_ops=True` (CLI: `--tflite-flex`) to partition those
 kernels to TensorFlow Flex on the CPU while everything else stays a TFLite
 builtin. A Flex model cannot target the Edge TPU (`flex_ops` is mutually
 exclusive with `--tflite-int8`).
+
+### Einsum is decomposed before any of this
+
+None of the hand-written translators (Core ML, TFLite, WebNN) has an `Einsum`
+kernel, and a surprising share of real graphs are made of it: PyTorch emits it
+for linear layers, attention projections, and ray/sample contractions, which is
+most of a NeRF, MLP or attention graph. Rather than teach each translator the
+op, onnxsim rewrites the batched-matrix-multiply form once, at the ONNX level,
+on the way into every one of them (`onnxsim/einsum_decompose.py`):
+
+```
+Einsum(bnc,cd->bnd)  ->  MatMul        # already in matmul order, no transpose
+Einsum(bij,bjk->bik) ->  MatMul        # shared batch axis leads both operands
+Einsum(mj,nj->mn)    ->  Transpose, MatMul
+```
+
+The rewrite is exact: ONNX `MatMul` computes `A[batch, m, k] @ B[batch, k, n]`,
+which is by construction the einsum's own output order, so no output-side
+reshape or transpose is ever needed and an operand already in matmul order
+contributes no `Transpose`.
+
+Deliberately *not* rewritten: a diagonal, a trace, an outer product, a
+reduction to a scalar, or a batch axis only one operand carries. Those are left
+exactly as they were, so the exporter still raises its usual "unsupported op"
+error naming the op -- never a silently wrong model. `backend="onnx2tf"` and
+the MLIR path, which delegate, cover those without this caveat.
+
+The function is importable on its own if you want the rewrite without exporting:
+
+```python
+from onnxsim.einsum_decompose import decompose_einsum
+
+model = decompose_einsum(model)
+```
 
 ### A broader-coverage backend: onnx2tf
 

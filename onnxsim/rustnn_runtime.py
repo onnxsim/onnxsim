@@ -45,6 +45,8 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
+from .einsum_decompose import decompose_einsum
+
 __all__ = [
     "WEBNN_SUPPORTED_OPS",
     "WebnnLoweringError",
@@ -933,6 +935,9 @@ def _build(
     the Core ML path flattened (see below)."""
     coreml = _is_coreml(context)
     builder = context.create_graph_builder()
+    # Batch-matmul einsums become Transpose/MatMul, which WebNN has kernels for;
+    # anything left over still raises its usual unsupported-op error.
+    model = decompose_einsum(model)
     lowering = _Lowering(builder, model.graph, input_shapes or {}, coreml=coreml)
     for node in model.graph.node:
         try:
