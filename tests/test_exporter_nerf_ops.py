@@ -354,9 +354,7 @@ def _gridsample_model(
     """A GridSample with both inputs as initializers, so MIL can fold it."""
     from onnx import helper
 
-    out_shape = [int(x.shape[0]), int(x.shape[1])] + [
-        int(d) for d in grid.shape[1:-1]
-    ]
+    out_shape = [int(x.shape[0]), int(x.shape[1])] + [int(d) for d in grid.shape[1:-1]]
     graph = helper.make_graph(
         [
             helper.make_node(
@@ -415,7 +413,7 @@ def test_coreml_gridsample_lowers_to_well_formed_mil(
     pytest.importorskip("coremltools", reason="coremltools is not installed")
     rng = np.random.default_rng(0)
     x = rng.random(x_shape).astype(np.float32)
-    grid = (rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5)
+    grid = rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5
     model = _gridsample_model(x, grid, mode, padding_mode, align_corners)
 
     main = _mil_program(model)
@@ -444,8 +442,6 @@ def _replay_gridsample_mil(main, inputs):
     values = {}
     for op in main.operations:
         kind = op.op_type
-        # `op.inputs` is a name -> Var mapping and `op.outputs` a list of Vars.
-        ins = {k: v.name for k, v in op.inputs.items()}
 
         def get(key):
             var = op.inputs[key]
@@ -485,15 +481,14 @@ def _replay_gridsample_mil(main, inputs):
 def test_coreml_gridsample_sampling_matches_onnx_reference():
     """The emitted Core ML sampling graph reproduces ONNX's own GridSample."""
     pytest.importorskip("coremltools", reason="coremltools is not installed")
-    from onnx.reference import ReferenceEvaluator
-
     from onnx import helper
+    from onnx.reference import ReferenceEvaluator
 
     rng = np.random.default_rng(0)
     for x_shape, grid_shape, mode, padding_mode, align_corners in GRIDSAMPLE_CASES:
         x = rng.random(x_shape).astype(np.float32)
         # Deliberately sample outside [-1, 1] so the padding path is exercised.
-        grid = (rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5)
+        grid = rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5
         model = _gridsample_model(x, grid, mode, padding_mode, align_corners)
         main = _mil_program(model)
 
@@ -502,14 +497,20 @@ def test_coreml_gridsample_sampling_matches_onnx_reference():
         got = _replay_gridsample_mil(main, {"x": x})
 
         node = helper.make_node(
-            "GridSample", ["X", "G"], ["Y"],
+            "GridSample",
+            ["X", "G"],
+            ["Y"],
             mode="linear" if mode == "bilinear" else mode,
-            padding_mode=padding_mode, align_corners=int(align_corners),
+            padding_mode=padding_mode,
+            align_corners=int(align_corners),
         )
         g = helper.make_graph(
-            [node], "gs",
-            [helper.make_tensor_value_info("X", F, list(x_shape)),
-             helper.make_tensor_value_info("G", F, list(grid_shape))],
+            [node],
+            "gs",
+            [
+                helper.make_tensor_value_info("X", F, list(x_shape)),
+                helper.make_tensor_value_info("G", F, list(grid_shape)),
+            ],
             [helper.make_tensor_value_info("Y", F, None)],
         )
         ref_model = helper.make_model(g, opset_imports=[helper.make_opsetid("", 20)])
@@ -561,7 +562,7 @@ def test_grid_sample_plan_is_referenceable_without_coremltools():
     from onnxsim.gridsample_plan import grid_sample_plan
 
     rng = np.random.default_rng(0)
-    grid = (rng.random((2, 3, 3, 2)).astype(np.float32) * 3.0 - 1.5)
+    grid = rng.random((2, 3, 3, 2)).astype(np.float32) * 3.0 - 1.5
     bilinear = grid_sample_plan((2, 3, 8, 8), (2, 3, 3, 2), grid)
     nearest = grid_sample_plan((2, 3, 8, 8), (2, 3, 3, 2), grid, mode="nearest")
     assert len(bilinear) == 4  # 2-D -> 4 corners
@@ -593,16 +594,15 @@ def test_grid_sample_plan_matches_onnx_reference():
     exporters also consume), so a bug in either the plan or one of its two
     consumers shows up here as a mismatch rather than cancelling out.
     """
-    from onnx.reference import ReferenceEvaluator
-
     from onnx import helper
+    from onnx.reference import ReferenceEvaluator
 
     from onnxsim.gridsample_plan import grid_sample_plan
 
     rng = np.random.default_rng(0)
     for x_shape, grid_shape, mode, padding_mode, align_corners in GRIDSAMPLE_CASES:
         x = rng.random(x_shape).astype(np.float32)
-        grid = (rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5)
+        grid = rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5
         plan = grid_sample_plan(
             x_shape, grid_shape, grid, mode, padding_mode, align_corners
         )
@@ -626,14 +626,20 @@ def test_grid_sample_plan_matches_onnx_reference():
             acc = acc + term
 
         node = helper.make_node(
-            "GridSample", ["X", "G"], ["Y"],
+            "GridSample",
+            ["X", "G"],
+            ["Y"],
             mode="linear" if mode == "bilinear" else mode,
-            padding_mode=padding_mode, align_corners=int(align_corners),
+            padding_mode=padding_mode,
+            align_corners=int(align_corners),
         )
         graph = helper.make_graph(
-            [node], "gs",
-            [helper.make_tensor_value_info("X", F, list(x_shape)),
-             helper.make_tensor_value_info("G", F, list(grid_shape))],
+            [node],
+            "gs",
+            [
+                helper.make_tensor_value_info("X", F, list(x_shape)),
+                helper.make_tensor_value_info("G", F, list(grid_shape)),
+            ],
             [helper.make_tensor_value_info("Y", F, None)],
         )
         ref_model = helper.make_model(
