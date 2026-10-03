@@ -319,6 +319,49 @@ def test_the_pre_processing_is_in_the_graphs(tmp_path):
     assert "ReduceMean" in ops(q)
 
 
+@pytest.mark.parametrize("preset", ["BF16_MIXED_BFP16", "BF16_MIXED_MXINT8"])
+@pytest.mark.parametrize(
+    "name", ["conv_bn", "identity", "pad_conv", "matmul_add", "reducemean", "block20"]
+)
+@pytest.mark.parametrize("skip", [False, True])
+def test_mixed_bf16_preprocessing_matches_quark(preset, name, skip, tmp_path):
+    # ORT retains registered custom domains in optimized float models. Register
+    # them before either optimizer runs so both see the same domain registry.
+    model = PATTERNS[name]()
+    for i, node in enumerate(model.graph.node):
+        node.name = f"n{i}_{node.op_type}"
+    if _ops_lib():
+        _ort(model, calibration_data(model)[0]["x"])
+    _, data, q, m = _both(model, preset, tmp_path, {"SkipPreprocess": skip})
+    _assert_same(q, m, f"{name} {preset} SkipPreprocess={skip}")
+    _assert_same_outputs(q, m, data, f"{name} {preset} SkipPreprocess={skip}")
+
+
+@pytest.mark.parametrize("preset", ["BF16_MIXED_BFP16", "BF16_MIXED_MXINT8"])
+@pytest.mark.parametrize(
+    "name, extra, optimize",
+    [
+        ("conv_bn", {"RemoveQDQConvRelu": False}, None),
+        ("pad_conv", {"ForceQuantizeNoInputCheck": True, "SkipPreprocess": True}, None),
+        ("reducemean", {"ConvertReduceMeanToGlobalAvgPool": False}, None),
+        ("block17", {"ConvertOpsetVersion": 20}, None),
+        ("conv_bn", {"SimplifyModel": False}, False),
+        ("bn_concat", {"QuantizeAllOpTypes": True}, None),
+    ],
+)
+def test_mixed_bf16_preprocessing_options_match_quark(
+    preset, name, extra, optimize, tmp_path
+):
+    model = PATTERNS[name]()
+    for i, node in enumerate(model.graph.node):
+        node.name = f"n{i}_{node.op_type}"
+    if _ops_lib():
+        _ort(model, calibration_data(model)[0]["x"])
+    _, data, q, m = _both(model, preset, tmp_path, extra, optimize)
+    _assert_same(q, m, f"{name} {preset} {extra} optimize={optimize}")
+    _assert_same_outputs(q, m, data, f"{name} {preset} {extra}")
+
+
 # -- options -------------------------------------------------------------------------------------
 
 _OPTION_CASES = [
@@ -369,7 +412,17 @@ def test_options_match_quark(extra, optimize, name, preset, tmp_path):
     _assert_same_outputs(q, m, data, f"{name} {preset} {extra}")
 
 
-@pytest.mark.parametrize("preset", ["BFP16", "MXFP4E2M1", "FP16", "MATMUL_NBITS"])
+@pytest.mark.parametrize(
+    "preset",
+    [
+        "BFP16",
+        "MXFP4E2M1",
+        "FP16",
+        "MATMUL_NBITS",
+        "BF16_MIXED_BFP16",
+        "BF16_MIXED_MXINT8",
+    ],
+)
 @pytest.mark.parametrize("target", [None, 20])
 def test_a_model_with_nothing_to_quantize_comes_back_as_given(preset, target, tmp_path):
     """Quark checks for quantizable ops before pre-processing: this model is returned
