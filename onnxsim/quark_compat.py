@@ -1499,6 +1499,7 @@ class ModelQuantizer:
         self._overrides_applied = False
         self.last_auto_mixprecision = None
         self.last_weight_rounding = {}
+        self._quantize_fp16 = False
         cfg.global_config = cfg.global_config.resolved()
         act, wt = cfg.global_config.activation, cfg.global_config.weight
         assert act is not None and wt is not None  # resolved() fills both
