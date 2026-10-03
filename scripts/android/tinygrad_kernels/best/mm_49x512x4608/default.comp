@@ -1,0 +1,52 @@
+#version 450
+#define INFINITY uintBitsToFloat(0x7f800000u)
+#define NAN uintBitsToFloat(0x7fc00000u)
+// kernel: r_49_8_16_4_1152_4
+layout(local_size_x=16, local_size_y=1, local_size_z=1) in;
+layout(std430, set=0, binding=0) buffer B0 { float data0_25088[]; };
+layout(std430, set=0, binding=1) buffer B1 { float data1_225792[]; };
+layout(std430, set=0, binding=2) buffer B2 { float data2_2359296[]; };
+void main() {
+  float buf0[4];
+  int gidx0 = int(gl_WorkGroupID.x); /* 8 */
+  int gidx1 = int(gl_WorkGroupID.y); /* 49 */
+  int lidx0 = int(gl_LocalInvocationID.x); /* 16 */
+  int alu0 = ((gidx0<<6)+(lidx0<<2));
+  buf0[0] = 0.0f;
+  buf0[1] = 0.0f;
+  buf0[2] = 0.0f;
+  buf0[3] = 0.0f;
+  for (int Ridx0 = 0; Ridx0 < 1152; Ridx0++) {
+    int alu5 = ((gidx1*4608)+(Ridx0<<2));
+    float val0 = data1_225792[(alu5+1)];
+    float val1 = data1_225792[(alu5+2)];
+    float val2 = data1_225792[(alu5+3)];
+    float val3 = data1_225792[alu5];
+    int alu6 = (alu0+(Ridx0<<11));
+    float val4 = data2_2359296[(alu6+1)];
+    float val5 = data2_2359296[(alu6+2)];
+    float val6 = data2_2359296[(alu6+3)];
+    float val7 = data2_2359296[(alu6+512)];
+    float val8 = data2_2359296[(alu6+513)];
+    float val9 = data2_2359296[(alu6+514)];
+    float val10 = data2_2359296[(alu6+515)];
+    float val11 = data2_2359296[(alu6+1024)];
+    float val12 = data2_2359296[(alu6+1025)];
+    float val13 = data2_2359296[(alu6+1026)];
+    float val14 = data2_2359296[(alu6+1027)];
+    float val15 = data2_2359296[(alu6+1536)];
+    float val16 = data2_2359296[(alu6+1537)];
+    float val17 = data2_2359296[(alu6+1538)];
+    float val18 = data2_2359296[(alu6+1539)];
+    float val19 = data2_2359296[alu6];
+    buf0[0] = (buf0[0]+((val3*val19)+(val0*val7)+(val1*val11)+(val2*val15)));
+    buf0[1] = (buf0[1]+((val3*val4)+(val0*val8)+(val1*val12)+(val2*val16)));
+    buf0[2] = (buf0[2]+((val3*val5)+(val0*val9)+(val1*val13)+(val2*val17)));
+    buf0[3] = (buf0[3]+((val3*val6)+(val0*val10)+(val1*val14)+(val2*val18)));
+  }
+  int alu12 = (alu0+(gidx1<<9));
+  data0_25088[(alu12+1)] = buf0[1];
+  data0_25088[(alu12+2)] = buf0[2];
+  data0_25088[(alu12+3)] = buf0[3];
+  data0_25088[alu12] = buf0[0];
+}

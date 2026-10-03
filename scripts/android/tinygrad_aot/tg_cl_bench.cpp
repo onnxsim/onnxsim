@@ -59,7 +59,13 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
       std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return sum[a] > sum[b]; });
       printf("GPU kernel time %.2f ms total; top kernels:\n", tot);
-      for (size_t j = 0; j < std::min<size_t>(12, idx.size()); j++)
+      if (getenv("TG_PROFILE_ALL")) {
+        printf("in call order:\n");
+        for (size_t i = 0; i < sum.size(); i++)
+          printf("  #%-3zu %7.3f ms  %-40s g=%zux%zux%zu l=%zux%zux%zu\n", i, sum[i], m.calls[i].name.c_str(), m.calls[i].g[0], m.calls[i].g[1], m.calls[i].g[2],
+                 m.calls[i].l[0], m.calls[i].l[1], m.calls[i].l[2]);
+      }
+      for (size_t j = 0; j < (getenv("TG_PROFILE_ALL") ? idx.size() : std::min<size_t>(12, idx.size())); j++)
         printf("  %6.3f ms  %-40s g=%zux%zux%zu l=%zux%zux%zu\n", sum[idx[j]], m.calls[idx[j]].name.c_str(), m.calls[idx[j]].g[0],
                m.calls[idx[j]].g[1], m.calls[idx[j]].g[2], m.calls[idx[j]].l[0], m.calls[idx[j]].l[1], m.calls[idx[j]].l[2]);
     }

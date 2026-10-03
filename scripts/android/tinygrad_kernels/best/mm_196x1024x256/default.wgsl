@@ -1,0 +1,100 @@
+fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+@group(0) @binding(0)
+var<uniform> INFINITY : f32;
+@group(0) @binding(1)var<storage,read_write>data0_200704:array<f32>;
+@group(0) @binding(2)var<storage,read_write>data1_50176:array<f32>;
+@group(0) @binding(3)var<storage,read_write>data2_262144:array<f32>;
+@compute @workgroup_size(16) fn r_49_16_16_4_4_64_4(@builtin(workgroup_id) gindex: vec3<u32>,@builtin(local_invocation_id) lindex: vec3<u32>) {
+  var buf0: array<f32,16>;
+  var gidx0 = i32(gindex.x); /* 16 */
+  var gidx1 = i32(gindex.y); /* 49 */
+  var lidx0 = i32(lindex.x); /* 16 */
+  var cast0 = bitcast<u32>(gidx1);
+  var alu0 = (bitcast<i32>((bitcast<u32>(gidx0)<<6u))+bitcast<i32>((bitcast<u32>(lidx0)<<2u)));
+  buf0[0] = 0.0f;
+  buf0[1] = 0.0f;
+  buf0[2] = 0.0f;
+  buf0[3] = 0.0f;
+  buf0[4] = 0.0f;
+  buf0[5] = 0.0f;
+  buf0[6] = 0.0f;
+  buf0[7] = 0.0f;
+  buf0[8] = 0.0f;
+  buf0[9] = 0.0f;
+  buf0[10] = 0.0f;
+  buf0[11] = 0.0f;
+  buf0[12] = 0.0f;
+  buf0[13] = 0.0f;
+  buf0[14] = 0.0f;
+  buf0[15] = 0.0f;
+  for (var Ridx0 = 0; Ridx0 < 64; Ridx0++) {
+    var cast1 = bitcast<u32>(Ridx0);
+    var alu17 = (bitcast<i32>((cast0<<10u))+bitcast<i32>((cast1<<2u)));
+    var val0 = data1_50176[alu17];
+    var val1 = data1_50176[(alu17+1)];
+    var val2 = data1_50176[(alu17+2)];
+    var val3 = data1_50176[(alu17+3)];
+    var val4 = data1_50176[(alu17+256)];
+    var val5 = data1_50176[(alu17+257)];
+    var val6 = data1_50176[(alu17+258)];
+    var val7 = data1_50176[(alu17+259)];
+    var val8 = data1_50176[(alu17+512)];
+    var val9 = data1_50176[(alu17+513)];
+    var val10 = data1_50176[(alu17+514)];
+    var val11 = data1_50176[(alu17+515)];
+    var val12 = data1_50176[(alu17+768)];
+    var val13 = data1_50176[(alu17+769)];
+    var val14 = data1_50176[(alu17+770)];
+    var val15 = data1_50176[(alu17+771)];
+    var alu18 = (alu0+bitcast<i32>((cast1<<12u)));
+    var val16 = data2_262144[alu18];
+    var val17 = data2_262144[(alu18+1)];
+    var val18 = data2_262144[(alu18+2)];
+    var val19 = data2_262144[(alu18+3)];
+    var val20 = data2_262144[(alu18+1024)];
+    var val21 = data2_262144[(alu18+1025)];
+    var val22 = data2_262144[(alu18+1026)];
+    var val23 = data2_262144[(alu18+1027)];
+    var val24 = data2_262144[(alu18+2048)];
+    var val25 = data2_262144[(alu18+2049)];
+    var val26 = data2_262144[(alu18+2050)];
+    var val27 = data2_262144[(alu18+2051)];
+    var val28 = data2_262144[(alu18+3072)];
+    var val29 = data2_262144[(alu18+3073)];
+    var val30 = data2_262144[(alu18+3074)];
+    var val31 = data2_262144[(alu18+3075)];
+    buf0[0] = (buf0[0]+((val0*val16)+(val1*val20)+(val2*val24)+(val3*val28)));
+    buf0[1] = (buf0[1]+((val4*val16)+(val5*val20)+(val6*val24)+(val7*val28)));
+    buf0[2] = (buf0[2]+((val8*val16)+(val9*val20)+(val10*val24)+(val11*val28)));
+    buf0[3] = (buf0[3]+((val12*val16)+(val13*val20)+(val14*val24)+(val15*val28)));
+    buf0[4] = (buf0[4]+((val0*val17)+(val1*val21)+(val2*val25)+(val3*val29)));
+    buf0[5] = (buf0[5]+((val4*val17)+(val5*val21)+(val6*val25)+(val7*val29)));
+    buf0[6] = (buf0[6]+((val8*val17)+(val9*val21)+(val10*val25)+(val11*val29)));
+    buf0[7] = (buf0[7]+((val12*val17)+(val13*val21)+(val14*val25)+(val15*val29)));
+    buf0[8] = (buf0[8]+((val0*val18)+(val1*val22)+(val2*val26)+(val3*val30)));
+    buf0[9] = (buf0[9]+((val4*val18)+(val5*val22)+(val6*val26)+(val7*val30)));
+    buf0[10] = (buf0[10]+((val8*val18)+(val9*val22)+(val10*val26)+(val11*val30)));
+    buf0[11] = (buf0[11]+((val12*val18)+(val13*val22)+(val14*val26)+(val15*val30)));
+    buf0[12] = (buf0[12]+((val0*val19)+(val1*val23)+(val2*val27)+(val3*val31)));
+    buf0[13] = (buf0[13]+((val4*val19)+(val5*val23)+(val6*val27)+(val7*val31)));
+    buf0[14] = (buf0[14]+((val8*val19)+(val9*val23)+(val10*val27)+(val11*val31)));
+    buf0[15] = (buf0[15]+((val12*val19)+(val13*val23)+(val14*val27)+(val15*val31)));
+  }
+  var alu36 = (alu0+bitcast<i32>((cast0<<12u)));
+  data0_200704[alu36] = buf0[0];
+  data0_200704[(alu36+1)] = buf0[4];
+  data0_200704[(alu36+2)] = buf0[8];
+  data0_200704[(alu36+3)] = buf0[12];
+  data0_200704[(alu36+1024)] = buf0[1];
+  data0_200704[(alu36+1025)] = buf0[5];
+  data0_200704[(alu36+1026)] = buf0[9];
+  data0_200704[(alu36+1027)] = buf0[13];
+  data0_200704[(alu36+2048)] = buf0[2];
+  data0_200704[(alu36+2049)] = buf0[6];
+  data0_200704[(alu36+2050)] = buf0[10];
+  data0_200704[(alu36+2051)] = buf0[14];
+  data0_200704[(alu36+3072)] = buf0[3];
+  data0_200704[(alu36+3073)] = buf0[7];
+  data0_200704[(alu36+3074)] = buf0[11];
+  data0_200704[(alu36+3075)] = buf0[15];
+}

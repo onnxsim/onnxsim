@@ -1,0 +1,602 @@
+######## lay2_1x1_64_256_56
+== 1x1 conv Cin=64 Cout=256 56x56  (M=3136 N=256 K=64, 0.103 GFLOP)
+-- phase 1: activation layouts (weights hwio)
+  a=nhwc    w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.871 ms med=0.985 ms    118 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.008 ms med=1.285 ms    102 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.950 ms med=1.054 ms    108 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.119 ms med=1.260 ms     92 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.997 ms med=1.153 ms    103 GFLOPS(min) err=2.3e-07
+  a=nc4     w=hwio    o=nc4  colx TM8 NV2 16x4      min=0.904 ms med=1.079 ms    114 GFLOPS(min) err=2.3e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV2 16x4      min=1.092 ms med=1.394 ms     94 GFLOPS(min) err=2.3e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV4 8x8       min=1.082 ms med=1.362 ms     95 GFLOPS(min) err=2.3e-07
+  a=nc4     w=hwio    o=nc4  rowx TM8 NV2 32x4      min=1.062 ms med=1.209 ms     97 GFLOPS(min) err=2.3e-07
+  a=nc4     w=hwio    o=nc4  rowx TM4 NV4 32x2      min=1.069 ms med=1.286 ms     96 GFLOPS(min) err=2.3e-07
+  a=z4      w=hwio    o=z4   colx TM8 NV2 16x4      min=1.001 ms med=1.142 ms    103 GFLOPS(min) err=2.3e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV2 16x4      min=1.127 ms med=1.295 ms     91 GFLOPS(min) err=2.3e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV4 8x8       min=1.140 ms med=1.247 ms     90 GFLOPS(min) err=2.3e-07
+  a=z4      w=hwio    o=z4   rowx TM8 NV2 32x4      min=1.195 ms med=1.321 ms     86 GFLOPS(min) err=2.3e-07
+  a=z4      w=hwio    o=z4   rowx TM4 NV4 32x2      min=0.954 ms med=1.101 ms    108 GFLOPS(min) err=2.3e-07
+  a=texa    w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.945 ms med=1.168 ms    109 GFLOPS(min) err=2.3e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.027 ms med=1.101 ms    100 GFLOPS(min) err=2.3e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.053 ms med=1.141 ms     98 GFLOPS(min) err=2.3e-07
+  a=texa    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.238 ms med=1.332 ms     83 GFLOPS(min) err=2.3e-07
+  a=texa    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.091 ms med=1.198 ms     94 GFLOPS(min) err=2.3e-07
+  a=texb    w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.591 ms med=1.863 ms     65 GFLOPS(min) err=2.3e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.041 ms med=1.176 ms     99 GFLOPS(min) err=2.3e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.072 ms med=1.246 ms     96 GFLOPS(min) err=2.3e-07
+  a=texb    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.466 ms med=1.688 ms     70 GFLOPS(min) err=2.3e-07
+  a=texb    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.138 ms med=1.324 ms     90 GFLOPS(min) err=2.3e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.946 ms med=1.013 ms    109 GFLOPS(min) err=2.5e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.961 ms med=1.118 ms    107 GFLOPS(min) err=2.5e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.892 ms med=0.986 ms    115 GFLOPS(min) err=2.5e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.048 ms med=1.137 ms     98 GFLOPS(min) err=2.5e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.752 ms med=0.884 ms    137 GFLOPS(min) err=2.5e-07
+  a=nc416   w=hwio    o=nc4  colx TM8 NV2 16x4      min=0.925 ms med=1.002 ms    111 GFLOPS(min) err=2.5e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV2 16x4      min=0.893 ms med=0.976 ms    115 GFLOPS(min) err=2.5e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV4 8x8       min=0.774 ms med=0.857 ms    133 GFLOPS(min) err=2.5e-07
+  a=nc416   w=hwio    o=nc4  rowx TM8 NV2 32x4      min=0.836 ms med=0.941 ms    123 GFLOPS(min) err=2.5e-07
+  a=nc416   w=hwio    o=nc4  rowx TM4 NV4 32x2      min=0.735 ms med=0.875 ms    140 GFLOPS(min) err=2.5e-07
+  a=texa16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.797 ms med=0.889 ms    129 GFLOPS(min) err=2.5e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.733 ms med=0.859 ms    140 GFLOPS(min) err=2.5e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.905 ms med=1.113 ms    114 GFLOPS(min) err=2.5e-07
+  a=texa16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.020 ms med=1.138 ms    101 GFLOPS(min) err=2.5e-07
+  a=texa16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.992 ms med=1.122 ms    104 GFLOPS(min) err=2.5e-07
+-- phase 2: weight layouts (top 2 configs of nhwc and nc4 activations)
+  a=nhwc    w=ok4     o=nhwc colx TM8 NV2 16x4      min=0.791 ms med=0.879 ms    130 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=ok4     o=nhwc colx TM4 NV4 8x8       min=0.946 ms med=1.133 ms    109 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=nk4     o=nhwc colx TM8 NV2 16x4      min=1.205 ms med=1.357 ms     85 GFLOPS(min) err=1.2e-07
+  a=nhwc    w=nk4     o=nhwc colx TM4 NV4 8x8       min=3.657 ms med=4.149 ms     28 GFLOPS(min) err=1.2e-07
+  a=nhwc    w=texw    o=nhwc colx TM8 NV2 16x4      min=0.643 ms med=0.752 ms    160 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=texw    o=nhwc colx TM4 NV4 8x8       min=0.609 ms med=0.721 ms    169 GFLOPS(min) err=2.3e-07
+  a=nhwc    w=texw16  o=nhwc colx TM8 NV2 16x4      min=0.604 ms med=0.740 ms    170 GFLOPS(min) err=3.3e-07
+  a=nhwc    w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.582 ms med=0.666 ms    176 GFLOPS(min) err=3.3e-07
+  a=nc4     w=ok4     o=nc4  colx TM8 NV2 16x4      min=0.887 ms med=1.122 ms    116 GFLOPS(min) err=2.3e-07
+  a=nc4     w=ok4     o=nc4  rowx TM8 NV2 32x4      min=0.923 ms med=1.060 ms    111 GFLOPS(min) err=2.3e-07
+  a=nc4     w=nk4     o=nc4  colx TM8 NV2 16x4      min=1.328 ms med=1.470 ms     77 GFLOPS(min) err=1.2e-07
+  a=nc4     w=nk4     o=nc4  rowx TM8 NV2 32x4      min=1.383 ms med=1.623 ms     74 GFLOPS(min) err=1.2e-07
+  a=nc4     w=texw    o=nc4  colx TM8 NV2 16x4      min=0.845 ms med=0.917 ms    122 GFLOPS(min) err=2.3e-07
+  a=nc4     w=texw    o=nc4  rowx TM8 NV2 32x4      min=0.945 ms med=1.027 ms    109 GFLOPS(min) err=2.3e-07
+  a=nc4     w=texw16  o=nc4  colx TM8 NV2 16x4      min=0.839 ms med=0.997 ms    122 GFLOPS(min) err=3.3e-07
+  a=nc4     w=texw16  o=nc4  rowx TM8 NV2 32x4      min=0.975 ms med=1.070 ms    105 GFLOPS(min) err=3.3e-07
+-- phase 3: packed f16 weights x f16 activations (NV=2 configs)
+  a=nhwc16  w=w16     o=nhwc colx TM8 NV2 16x4      min=1.146 ms med=1.236 ms     90 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=w16     o=nhwc colx TM4 NV2 16x4      min=0.668 ms med=0.716 ms    154 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=1.050 ms med=1.190 ms     98 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=0.678 ms med=0.770 ms    151 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.630 ms med=0.681 ms    163 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.499 ms med=0.534 ms    206 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=0.744 ms med=0.845 ms    138 GFLOPS(min) err=1.7e-07
+  a=nhwc16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.563 ms med=0.625 ms    183 GFLOPS(min) err=1.7e-07
+  a=nc416   w=w16     o=nc4  colx TM8 NV2 16x4      min=1.157 ms med=1.300 ms     89 GFLOPS(min) err=1.7e-07
+  a=nc416   w=w16     o=nc4  colx TM4 NV2 16x4      min=0.644 ms med=0.742 ms    160 GFLOPS(min) err=1.7e-07
+  a=nc416   w=w16     o=nc4  rowx TM8 NV2 32x4      min=1.274 ms med=1.412 ms     81 GFLOPS(min) err=1.7e-07
+  a=nc416   w=texw16  o=nc4  colx TM8 NV2 16x4      min=0.653 ms med=0.769 ms    157 GFLOPS(min) err=1.7e-07
+  a=nc416   w=texw16  o=nc4  colx TM4 NV2 16x4      min=0.586 ms med=0.651 ms    175 GFLOPS(min) err=1.7e-07
+  a=nc416   w=texw16  o=nc4  colx TM4 NV4 8x8       min=0.565 ms med=0.606 ms    182 GFLOPS(min) err=1.7e-07
+  a=nc416   w=texw16  o=nc4  rowx TM8 NV2 32x4      min=0.599 ms med=0.643 ms    172 GFLOPS(min) err=1.7e-07
+  a=nc416   w=texw16  o=nc4  rowx TM4 NV4 32x2      min=0.417 ms med=0.476 ms    246 GFLOPS(min) err=1.7e-07
+  a=texa16  w=w16     o=nhwc colx TM8 NV2 16x4      min=0.559 ms med=0.585 ms    184 GFLOPS(min) err=1.7e-07
+  a=texa16  w=w16     o=nhwc colx TM4 NV2 16x4      min=0.367 ms med=0.390 ms    280 GFLOPS(min) err=1.7e-07
+  a=texa16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=0.758 ms med=0.827 ms    136 GFLOPS(min) err=1.7e-07
+  a=texa16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=0.493 ms med=0.552 ms    208 GFLOPS(min) err=1.7e-07
+  a=texa16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.333 ms med=0.380 ms    309 GFLOPS(min) err=1.7e-07
+  a=texa16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.416 ms med=0.481 ms    247 GFLOPS(min) err=1.7e-07
+  a=texa16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=0.612 ms med=0.684 ms    168 GFLOPS(min) err=1.7e-07
+  a=texa16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.449 ms med=0.515 ms    229 GFLOPS(min) err=1.7e-07
+-- best per (activation, weight) layout, GFLOPS by min time
+-- phase 4: interleaved head-to-head (6 rounds; min over rounds / median of per-round mins)
+H2H 1x1 C64>256@56  texa16 /texw16  colx TM4 NV2 16x4      min 0.439 ms  med 0.458 ms    234 GFLOPS(min)
+H2H 1x1 C64>256@56  texa16 /w16     colx TM4 NV2 16x4      min 0.544 ms  med 0.570 ms    189 GFLOPS(min)
+H2H 1x1 C64>256@56  nc416  /w16     colx TM4 NV2 16x4      min 0.558 ms  med 0.684 ms    184 GFLOPS(min)
+H2H 1x1 C64>256@56  nc416  /texw16  rowx TM4 NV4 32x2      min 0.565 ms  med 0.601 ms    182 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc16 /texw16  colx TM4 NV4 8x8       min 0.576 ms  med 0.645 ms    178 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc16 /w16     colx TM4 NV2 16x4      min 0.615 ms  med 0.679 ms    167 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc   /texw16  colx TM4 NV4 8x8       min 0.621 ms  med 0.670 ms    165 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc   /texw    colx TM4 NV4 8x8       min 0.718 ms  med 0.757 ms    143 GFLOPS(min)
+H2H 1x1 C64>256@56  texa16 /hwio    colx TM4 NV2 16x4      min 0.829 ms  med 0.927 ms    124 GFLOPS(min)
+H2H 1x1 C64>256@56  nc416  /hwio    rowx TM4 NV4 32x2      min 0.877 ms  med 1.013 ms    117 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc   /ok4     colx TM8 NV2 16x4      min 0.924 ms  med 0.972 ms    111 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc   /hwio    colx TM8 NV2 16x4      min 0.954 ms  med 1.025 ms    108 GFLOPS(min)
+H2H 1x1 C64>256@56  nhwc16 /hwio    rowx TM4 NV4 32x2      min 1.021 ms  med 1.034 ms    101 GFLOPS(min)
+######## lay2_1x1_512_128_28
+== 1x1 conv Cin=512 Cout=128 28x28  (M=784 N=128 K=512, 0.103 GFLOP)
+-- phase 1: activation layouts (weights hwio)
+  a=nhwc    w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.794 ms med=0.857 ms    129 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.874 ms med=0.969 ms    118 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.807 ms med=0.846 ms    127 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=0.813 ms med=0.892 ms    126 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.010 ms med=1.150 ms    102 GFLOPS(min) err=7.6e-07
+  a=nc4     w=hwio    o=nc4  colx TM8 NV2 16x4      min=0.914 ms med=1.018 ms    112 GFLOPS(min) err=7.6e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV2 16x4      min=1.044 ms med=1.123 ms     98 GFLOPS(min) err=7.6e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV4 8x8       min=0.808 ms med=0.929 ms    127 GFLOPS(min) err=7.6e-07
+  a=nc4     w=hwio    o=nc4  rowx TM8 NV2 32x4      min=0.949 ms med=1.066 ms    108 GFLOPS(min) err=7.6e-07
+  a=nc4     w=hwio    o=nc4  rowx TM4 NV4 32x2      min=0.822 ms med=0.875 ms    125 GFLOPS(min) err=7.6e-07
+  a=z4      w=hwio    o=z4   colx TM8 NV2 16x4      min=0.830 ms med=0.987 ms    124 GFLOPS(min) err=7.6e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV2 16x4      min=0.840 ms med=0.910 ms    122 GFLOPS(min) err=7.6e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV4 8x8       min=0.806 ms med=0.854 ms    127 GFLOPS(min) err=7.6e-07
+  a=z4      w=hwio    o=z4   rowx TM8 NV2 32x4      min=0.796 ms med=0.940 ms    129 GFLOPS(min) err=7.6e-07
+  a=z4      w=hwio    o=z4   rowx TM4 NV4 32x2      min=1.021 ms med=1.144 ms    101 GFLOPS(min) err=7.6e-07
+  a=texa    w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.991 ms med=1.250 ms    104 GFLOPS(min) err=7.6e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.768 ms med=0.898 ms    134 GFLOPS(min) err=7.6e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.718 ms med=0.813 ms    143 GFLOPS(min) err=7.6e-07
+  a=texa    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=0.949 ms med=1.034 ms    108 GFLOPS(min) err=7.6e-07
+  a=texa    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.780 ms med=0.895 ms    132 GFLOPS(min) err=7.6e-07
+  a=texb    w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.999 ms med=1.131 ms    103 GFLOPS(min) err=7.6e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.844 ms med=0.964 ms    122 GFLOPS(min) err=7.6e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.768 ms med=0.835 ms    134 GFLOPS(min) err=7.6e-07
+  a=texb    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=0.844 ms med=0.932 ms    122 GFLOPS(min) err=7.6e-07
+  a=texb    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.788 ms med=0.949 ms    130 GFLOPS(min) err=7.6e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.738 ms med=0.846 ms    139 GFLOPS(min) err=7.3e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.784 ms med=0.832 ms    131 GFLOPS(min) err=7.3e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.752 ms med=0.838 ms    137 GFLOPS(min) err=7.3e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=0.768 ms med=0.818 ms    134 GFLOPS(min) err=7.3e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.959 ms med=1.074 ms    107 GFLOPS(min) err=7.3e-07
+  a=nc416   w=hwio    o=nc4  colx TM8 NV2 16x4      min=0.852 ms med=0.931 ms    121 GFLOPS(min) err=7.3e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV2 16x4      min=0.730 ms med=0.783 ms    141 GFLOPS(min) err=7.3e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV4 8x8       min=1.118 ms med=1.302 ms     92 GFLOPS(min) err=7.3e-07
+  a=nc416   w=hwio    o=nc4  rowx TM8 NV2 32x4      min=1.102 ms med=1.307 ms     93 GFLOPS(min) err=7.3e-07
+  a=nc416   w=hwio    o=nc4  rowx TM4 NV4 32x2      min=1.138 ms med=1.274 ms     90 GFLOPS(min) err=7.3e-07
+  a=texa16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.211 ms med=1.417 ms     85 GFLOPS(min) err=7.3e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.989 ms med=1.185 ms    104 GFLOPS(min) err=7.3e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.107 ms med=1.205 ms     93 GFLOPS(min) err=7.3e-07
+  a=texa16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.340 ms med=1.479 ms     77 GFLOPS(min) err=7.3e-07
+  a=texa16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.260 ms med=1.398 ms     82 GFLOPS(min) err=7.3e-07
+-- phase 2: weight layouts (top 2 configs of nhwc and nc4 activations)
+  a=nhwc    w=ok4     o=nhwc colx TM8 NV2 16x4      min=1.101 ms med=1.236 ms     93 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=ok4     o=nhwc colx TM4 NV4 8x8       min=1.226 ms med=1.380 ms     84 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=nk4     o=nhwc colx TM8 NV2 16x4      min=1.651 ms med=1.982 ms     62 GFLOPS(min) err=3.5e-07
+  a=nhwc    w=nk4     o=nhwc colx TM4 NV4 8x8       min=6.766 ms med=7.974 ms     15 GFLOPS(min) err=3.5e-07
+  a=nhwc    w=texw    o=nhwc colx TM8 NV2 16x4      min=1.078 ms med=1.137 ms     95 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=texw    o=nhwc colx TM4 NV4 8x8       min=0.896 ms med=0.998 ms    115 GFLOPS(min) err=7.6e-07
+  a=nhwc    w=texw16  o=nhwc colx TM8 NV2 16x4      min=1.009 ms med=1.075 ms    102 GFLOPS(min) err=9.1e-07
+  a=nhwc    w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.743 ms med=0.850 ms    138 GFLOPS(min) err=9.1e-07
+  a=nc4     w=ok4     o=nc4  colx TM4 NV4 8x8       min=1.107 ms med=1.222 ms     93 GFLOPS(min) err=7.6e-07
+  a=nc4     w=ok4     o=nc4  rowx TM4 NV4 32x2      min=1.127 ms med=1.398 ms     91 GFLOPS(min) err=7.6e-07
+  a=nc4     w=nk4     o=nc4  colx TM4 NV4 8x8       min=6.901 ms med=7.407 ms     15 GFLOPS(min) err=3.5e-07
+  a=nc4     w=nk4     o=nc4  rowx TM4 NV4 32x2      min=6.880 ms med=8.457 ms     15 GFLOPS(min) err=3.5e-07
+  a=nc4     w=texw    o=nc4  colx TM4 NV4 8x8       min=0.696 ms med=0.865 ms    148 GFLOPS(min) err=7.6e-07
+  a=nc4     w=texw    o=nc4  rowx TM4 NV4 32x2      min=0.700 ms med=0.781 ms    147 GFLOPS(min) err=7.6e-07
+  a=nc4     w=texw16  o=nc4  colx TM4 NV4 8x8       min=0.703 ms med=0.840 ms    146 GFLOPS(min) err=9.1e-07
+  a=nc4     w=texw16  o=nc4  rowx TM4 NV4 32x2      min=0.695 ms med=0.807 ms    148 GFLOPS(min) err=9.1e-07
+-- phase 3: packed f16 weights x f16 activations (NV=2 configs)
+  a=nhwc16  w=w16     o=nhwc colx TM8 NV2 16x4      min=1.223 ms med=1.306 ms     84 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=w16     o=nhwc colx TM4 NV2 16x4      min=0.912 ms med=1.045 ms    113 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=1.217 ms med=1.448 ms     84 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=1.015 ms med=1.075 ms    101 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.825 ms med=0.987 ms    125 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.700 ms med=0.774 ms    147 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=1.019 ms med=1.160 ms    101 GFLOPS(min) err=7.5e-07
+  a=nhwc16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.655 ms med=0.726 ms    157 GFLOPS(min) err=7.5e-07
+  a=nc416   w=w16     o=nc4  colx TM8 NV2 16x4      min=1.252 ms med=1.505 ms     82 GFLOPS(min) err=7.5e-07
+  a=nc416   w=w16     o=nc4  colx TM4 NV2 16x4      min=0.929 ms med=1.132 ms    111 GFLOPS(min) err=7.5e-07
+  a=nc416   w=w16     o=nc4  rowx TM8 NV2 32x4      min=1.544 ms med=1.654 ms     67 GFLOPS(min) err=7.5e-07
+  a=nc416   w=texw16  o=nc4  colx TM8 NV2 16x4      min=0.877 ms med=0.986 ms    117 GFLOPS(min) err=7.5e-07
+  a=nc416   w=texw16  o=nc4  colx TM4 NV2 16x4      min=0.823 ms med=0.920 ms    125 GFLOPS(min) err=7.5e-07
+  a=nc416   w=texw16  o=nc4  colx TM4 NV4 8x8       min=0.706 ms med=0.749 ms    146 GFLOPS(min) err=7.5e-07
+  a=nc416   w=texw16  o=nc4  rowx TM8 NV2 32x4      min=0.859 ms med=1.024 ms    120 GFLOPS(min) err=7.5e-07
+  a=nc416   w=texw16  o=nc4  rowx TM4 NV4 32x2      min=0.711 ms med=0.798 ms    145 GFLOPS(min) err=7.5e-07
+  a=texa16  w=w16     o=nhwc colx TM8 NV2 16x4      min=1.198 ms med=1.325 ms     86 GFLOPS(min) err=7.5e-07
+  a=texa16  w=w16     o=nhwc colx TM4 NV2 16x4      min=0.712 ms med=0.852 ms    144 GFLOPS(min) err=7.5e-07
+  a=texa16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=1.271 ms med=1.424 ms     81 GFLOPS(min) err=7.5e-07
+  a=texa16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=0.970 ms med=1.131 ms    106 GFLOPS(min) err=7.5e-07
+  a=texa16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.616 ms med=0.703 ms    167 GFLOPS(min) err=7.5e-07
+  a=texa16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.858 ms med=0.895 ms    120 GFLOPS(min) err=7.5e-07
+  a=texa16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=1.329 ms med=1.479 ms     77 GFLOPS(min) err=7.5e-07
+  a=texa16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.728 ms med=0.809 ms    141 GFLOPS(min) err=7.5e-07
+-- best per (activation, weight) layout, GFLOPS by min time
+-- phase 4: interleaved head-to-head (6 rounds; min over rounds / median of per-round mins)
+H2H 1x1 C512>128@28  texa16 /texw16  colx TM4 NV2 16x4      min 0.342 ms  med 0.602 ms    301 GFLOPS(min)
+H2H 1x1 C512>128@28  nc416  /texw16  colx TM4 NV4 8x8       min 0.350 ms  med 0.437 ms    294 GFLOPS(min)
+H2H 1x1 C512>128@28  texa16 /w16     colx TM4 NV2 16x4      min 0.359 ms  med 0.441 ms    286 GFLOPS(min)
+H2H 1x1 C512>128@28  nc4    /texw    colx TM4 NV4 8x8       min 0.384 ms  med 0.509 ms    268 GFLOPS(min)
+H2H 1x1 C512>128@28  nhwc   /texw16  colx TM4 NV4 8x8       min 0.397 ms  med 0.491 ms    259 GFLOPS(min)
+H2H 1x1 C512>128@28  nc4    /texw16  rowx TM4 NV4 32x2      min 0.423 ms  med 0.523 ms    243 GFLOPS(min)
+H2H 1x1 C512>128@28  nhwc16 /texw16  rowx TM4 NV4 32x2      min 0.517 ms  med 0.763 ms    199 GFLOPS(min)
+H2H 1x1 C512>128@28  nc416  /hwio    colx TM4 NV2 16x4      min 0.527 ms  med 0.672 ms    195 GFLOPS(min)
+H2H 1x1 C512>128@28  texa   /hwio    colx TM4 NV4 8x8       min 0.535 ms  med 0.706 ms    192 GFLOPS(min)
+H2H 1x1 C512>128@28  nhwc16 /hwio    colx TM8 NV2 16x4      min 0.556 ms  med 0.700 ms    185 GFLOPS(min)
+H2H 1x1 C512>128@28  texb   /hwio    colx TM4 NV4 8x8       min 0.591 ms  med 0.697 ms    174 GFLOPS(min)
+H2H 1x1 C512>128@28  nhwc   /hwio    colx TM8 NV2 16x4      min 0.604 ms  med 0.815 ms    170 GFLOPS(min)
+######## lay2_1x1_1024_256_14
+== 1x1 conv Cin=1024 Cout=256 14x14  (M=196 N=256 K=1024, 0.103 GFLOP)
+-- phase 1: activation layouts (weights hwio)
+  a=nhwc    w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.920 ms med=1.026 ms    112 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.657 ms med=0.705 ms    156 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.763 ms med=0.898 ms    135 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=0.857 ms med=0.978 ms    120 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.753 ms med=0.870 ms    136 GFLOPS(min) err=2.2e-06
+  a=nc4     w=hwio    o=nc4  colx TM8 NV2 16x4      min=0.853 ms med=0.974 ms    120 GFLOPS(min) err=2.2e-06
+  a=nc4     w=hwio    o=nc4  colx TM4 NV2 16x4      min=0.652 ms med=0.727 ms    158 GFLOPS(min) err=2.2e-06
+  a=nc4     w=hwio    o=nc4  colx TM4 NV4 8x8       min=0.656 ms med=0.740 ms    157 GFLOPS(min) err=2.2e-06
+  a=nc4     w=hwio    o=nc4  rowx TM8 NV2 32x4      min=0.911 ms med=1.026 ms    113 GFLOPS(min) err=2.2e-06
+  a=nc4     w=hwio    o=nc4  rowx TM4 NV4 32x2      min=0.730 ms med=0.787 ms    141 GFLOPS(min) err=2.2e-06
+  a=texa    w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.154 ms med=1.266 ms     89 GFLOPS(min) err=2.2e-06
+  a=texa    w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.567 ms med=0.618 ms    181 GFLOPS(min) err=2.2e-06
+  a=texa    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.700 ms med=0.765 ms    147 GFLOPS(min) err=2.2e-06
+  a=texa    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.107 ms med=1.224 ms     93 GFLOPS(min) err=2.2e-06
+  a=texa    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.779 ms med=0.875 ms    132 GFLOPS(min) err=2.2e-06
+  a=texb    w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.150 ms med=1.287 ms     89 GFLOPS(min) err=2.2e-06
+  a=texb    w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.558 ms med=0.616 ms    184 GFLOPS(min) err=2.2e-06
+  a=texb    w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.655 ms med=0.782 ms    157 GFLOPS(min) err=2.2e-06
+  a=texb    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.167 ms med=1.273 ms     88 GFLOPS(min) err=2.2e-06
+  a=texb    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.672 ms med=0.755 ms    153 GFLOPS(min) err=2.2e-06
+  a=nhwc16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.900 ms med=1.063 ms    114 GFLOPS(min) err=2.0e-06
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.538 ms med=0.613 ms    191 GFLOPS(min) err=2.0e-06
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.646 ms med=0.690 ms    159 GFLOPS(min) err=2.0e-06
+  a=nhwc16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=0.971 ms med=0.992 ms    106 GFLOPS(min) err=2.0e-06
+  a=nhwc16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.698 ms med=0.775 ms    147 GFLOPS(min) err=2.0e-06
+  a=nc416   w=hwio    o=nc4  colx TM8 NV2 16x4      min=0.929 ms med=1.027 ms    111 GFLOPS(min) err=2.0e-06
+  a=nc416   w=hwio    o=nc4  colx TM4 NV2 16x4      min=0.553 ms med=0.625 ms    186 GFLOPS(min) err=2.0e-06
+  a=nc416   w=hwio    o=nc4  colx TM4 NV4 8x8       min=0.662 ms med=0.747 ms    155 GFLOPS(min) err=2.0e-06
+  a=nc416   w=hwio    o=nc4  rowx TM8 NV2 32x4      min=0.912 ms med=1.058 ms    113 GFLOPS(min) err=2.0e-06
+  a=nc416   w=hwio    o=nc4  rowx TM4 NV4 32x2      min=0.654 ms med=0.766 ms    157 GFLOPS(min) err=2.0e-06
+  a=texa16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=0.940 ms med=1.167 ms    109 GFLOPS(min) err=2.0e-06
+  a=texa16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=0.511 ms med=0.566 ms    201 GFLOPS(min) err=2.0e-06
+  a=texa16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=0.661 ms med=0.727 ms    155 GFLOPS(min) err=2.0e-06
+  a=texa16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.013 ms med=1.096 ms    101 GFLOPS(min) err=2.0e-06
+  a=texa16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=0.742 ms med=0.815 ms    138 GFLOPS(min) err=2.0e-06
+-- phase 2: weight layouts (top 2 configs of nhwc and nc4 activations)
+  a=nhwc    w=ok4     o=nhwc colx TM4 NV2 16x4      min=0.736 ms med=0.850 ms    140 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=ok4     o=nhwc rowx TM4 NV4 32x2      min=0.896 ms med=1.057 ms    115 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=nk4     o=nhwc colx TM4 NV2 16x4      min=1.044 ms med=1.171 ms     98 GFLOPS(min) err=8.6e-07
+  a=nhwc    w=nk4     o=nhwc rowx TM4 NV4 32x2      min=4.748 ms med=5.167 ms     22 GFLOPS(min) err=8.6e-07
+  a=nhwc    w=texw    o=nhwc colx TM4 NV2 16x4      min=0.658 ms med=0.787 ms    156 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=texw    o=nhwc rowx TM4 NV4 32x2      min=0.935 ms med=1.059 ms    110 GFLOPS(min) err=2.2e-06
+  a=nhwc    w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.633 ms med=0.717 ms    162 GFLOPS(min) err=3.2e-06
+  a=nhwc    w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.912 ms med=1.012 ms    113 GFLOPS(min) err=3.2e-06
+  a=nc4     w=ok4     o=nc4  colx TM4 NV2 16x4      min=0.944 ms med=1.051 ms    109 GFLOPS(min) err=2.2e-06
+  a=nc4     w=ok4     o=nc4  colx TM4 NV4 8x8       min=1.050 ms med=1.184 ms     98 GFLOPS(min) err=2.2e-06
+  a=nc4     w=nk4     o=nc4  colx TM4 NV2 16x4      min=1.016 ms med=1.144 ms    101 GFLOPS(min) err=8.6e-07
+  a=nc4     w=nk4     o=nc4  colx TM4 NV4 8x8       min=5.168 ms med=6.004 ms     20 GFLOPS(min) err=8.6e-07
+  a=nc4     w=texw    o=nc4  colx TM4 NV2 16x4      min=0.688 ms med=0.853 ms    149 GFLOPS(min) err=2.2e-06
+  a=nc4     w=texw    o=nc4  colx TM4 NV4 8x8       min=0.923 ms med=1.058 ms    111 GFLOPS(min) err=2.2e-06
+  a=nc4     w=texw16  o=nc4  colx TM4 NV2 16x4      min=0.498 ms med=0.543 ms    206 GFLOPS(min) err=3.2e-06
+  a=nc4     w=texw16  o=nc4  colx TM4 NV4 8x8       min=0.755 ms med=0.820 ms    136 GFLOPS(min) err=3.2e-06
+-- phase 3: packed f16 weights x f16 activations (NV=2 configs)
+  a=nhwc16  w=w16     o=nhwc colx TM8 NV2 16x4      min=1.465 ms med=1.721 ms     70 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=w16     o=nhwc colx TM4 NV2 16x4      min=0.645 ms med=0.784 ms    159 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=1.464 ms med=1.683 ms     70 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=1.039 ms med=1.096 ms     99 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.597 ms med=0.660 ms    172 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.659 ms med=0.790 ms    156 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=0.853 ms med=0.981 ms    120 GFLOPS(min) err=1.9e-06
+  a=nhwc16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.687 ms med=0.787 ms    150 GFLOPS(min) err=1.9e-06
+  a=nc416   w=w16     o=nc4  colx TM8 NV2 16x4      min=1.272 ms med=1.431 ms     81 GFLOPS(min) err=1.9e-06
+  a=nc416   w=w16     o=nc4  colx TM4 NV2 16x4      min=0.618 ms med=0.718 ms    166 GFLOPS(min) err=1.9e-06
+  a=nc416   w=w16     o=nc4  rowx TM8 NV2 32x4      min=1.214 ms med=1.424 ms     85 GFLOPS(min) err=1.9e-06
+  a=nc416   w=texw16  o=nc4  colx TM8 NV2 16x4      min=1.084 ms med=1.136 ms     95 GFLOPS(min) err=1.9e-06
+  a=nc416   w=texw16  o=nc4  colx TM4 NV2 16x4      min=0.572 ms med=0.687 ms    180 GFLOPS(min) err=1.9e-06
+  a=nc416   w=texw16  o=nc4  colx TM4 NV4 8x8       min=0.669 ms med=0.741 ms    154 GFLOPS(min) err=1.9e-06
+  a=nc416   w=texw16  o=nc4  rowx TM8 NV2 32x4      min=0.886 ms med=0.979 ms    116 GFLOPS(min) err=1.9e-06
+  a=nc416   w=texw16  o=nc4  rowx TM4 NV4 32x2      min=0.748 ms med=0.787 ms    137 GFLOPS(min) err=1.9e-06
+  a=texa16  w=w16     o=nhwc colx TM8 NV2 16x4      min=1.271 ms med=1.537 ms     81 GFLOPS(min) err=1.9e-06
+  a=texa16  w=w16     o=nhwc colx TM4 NV2 16x4      min=0.517 ms med=0.543 ms    199 GFLOPS(min) err=1.9e-06
+  a=texa16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=1.319 ms med=1.466 ms     78 GFLOPS(min) err=1.9e-06
+  a=texa16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=0.823 ms med=0.924 ms    125 GFLOPS(min) err=1.9e-06
+  a=texa16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=0.415 ms med=0.470 ms    247 GFLOPS(min) err=1.9e-06
+  a=texa16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=0.687 ms med=0.803 ms    149 GFLOPS(min) err=1.9e-06
+  a=texa16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=0.906 ms med=1.015 ms    113 GFLOPS(min) err=1.9e-06
+  a=texa16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=0.602 ms med=0.732 ms    171 GFLOPS(min) err=1.9e-06
+-- best per (activation, weight) layout, GFLOPS by min time
+-- phase 4: interleaved head-to-head (6 rounds; min over rounds / median of per-round mins)
+H2H 1x1 C1024>256@14  texa16 /texw16  colx TM4 NV2 16x4      min 0.648 ms  med 0.718 ms    159 GFLOPS(min)
+H2H 1x1 C1024>256@14  texa16 /w16     colx TM4 NV2 16x4      min 0.714 ms  med 0.964 ms    144 GFLOPS(min)
+H2H 1x1 C1024>256@14  nc4    /texw16  colx TM4 NV2 16x4      min 0.740 ms  med 0.776 ms    139 GFLOPS(min)
+H2H 1x1 C1024>256@14  nhwc   /texw16  colx TM4 NV2 16x4      min 0.849 ms  med 1.001 ms    121 GFLOPS(min)
+H2H 1x1 C1024>256@14  nhwc16 /texw16  colx TM4 NV2 16x4      min 0.904 ms  med 1.019 ms    114 GFLOPS(min)
+H2H 1x1 C1024>256@14  nc416  /texw16  colx TM4 NV2 16x4      min 0.946 ms  med 0.993 ms    109 GFLOPS(min)
+H2H 1x1 C1024>256@14  texa16 /hwio    colx TM4 NV2 16x4      min 0.957 ms  med 1.107 ms    107 GFLOPS(min)
+H2H 1x1 C1024>256@14  nc416  /w16     colx TM4 NV2 16x4      min 1.001 ms  med 1.089 ms    103 GFLOPS(min)
+H2H 1x1 C1024>256@14  nhwc16 /hwio    colx TM4 NV2 16x4      min 1.055 ms  med 1.237 ms     97 GFLOPS(min)
+H2H 1x1 C1024>256@14  nc416  /hwio    colx TM4 NV2 16x4      min 1.137 ms  med 1.310 ms     90 GFLOPS(min)
+H2H 1x1 C1024>256@14  texb   /hwio    colx TM4 NV2 16x4      min 1.172 ms  med 1.225 ms     88 GFLOPS(min)
+H2H 1x1 C1024>256@14  texa   /hwio    colx TM4 NV2 16x4      min 1.229 ms  med 1.314 ms     84 GFLOPS(min)
+H2H 1x1 C1024>256@14  nhwc   /hwio    colx TM4 NV2 16x4      min 1.348 ms  med 1.529 ms     76 GFLOPS(min)
+######## lay2_3x3_64_64_56
+== 3x3 conv Cin=64 Cout=64 56x56  (M=3136 N=64 K=576, 0.231 GFLOP)
+-- phase 1: activation layouts (weights hwio)
+  a=nhwc    w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.336 ms med=2.613 ms     99 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.402 ms med=2.717 ms     96 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV4 8x8       min=2.203 ms med=2.418 ms    105 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.712 ms med=1.876 ms    135 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.150 ms med=1.240 ms    201 GFLOPS(min) err=6.4e-07
+  a=nc4     w=hwio    o=nc4  colx TM8 NV2 16x4      min=2.894 ms med=3.226 ms     80 GFLOPS(min) err=6.4e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV2 16x4      min=2.344 ms med=2.502 ms     99 GFLOPS(min) err=6.4e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV4 8x8       min=2.192 ms med=2.456 ms    105 GFLOPS(min) err=6.4e-07
+  a=nc4     w=hwio    o=nc4  rowx TM8 NV2 32x4      min=1.388 ms med=1.552 ms    167 GFLOPS(min) err=6.4e-07
+  a=nc4     w=hwio    o=nc4  rowx TM4 NV4 32x2      min=1.100 ms med=1.228 ms    210 GFLOPS(min) err=6.4e-07
+  a=z4      w=hwio    o=z4   colx TM8 NV2 16x4      min=2.405 ms med=2.539 ms     96 GFLOPS(min) err=6.4e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV2 16x4      min=2.335 ms med=2.601 ms     99 GFLOPS(min) err=6.4e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV4 8x8       min=2.203 ms med=2.422 ms    105 GFLOPS(min) err=6.4e-07
+  a=z4      w=hwio    o=z4   rowx TM8 NV2 32x4      min=1.724 ms med=1.839 ms    134 GFLOPS(min) err=6.4e-07
+  a=z4      w=hwio    o=z4   rowx TM4 NV4 32x2      min=1.080 ms med=1.323 ms    214 GFLOPS(min) err=6.4e-07
+  a=texa    w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.617 ms med=2.896 ms     88 GFLOPS(min) err=6.4e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.206 ms med=2.568 ms    105 GFLOPS(min) err=6.4e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV4 8x8       min=2.115 ms med=2.402 ms    109 GFLOPS(min) err=6.4e-07
+  a=texa    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.638 ms med=1.846 ms    141 GFLOPS(min) err=6.4e-07
+  a=texa    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.213 ms med=1.351 ms    191 GFLOPS(min) err=6.4e-07
+  a=texb    w=hwio    o=nhwc colx TM8 NV2 16x4      min=3.303 ms med=3.761 ms     70 GFLOPS(min) err=6.4e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.262 ms med=2.646 ms    102 GFLOPS(min) err=6.4e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV4 8x8       min=2.082 ms med=2.318 ms    111 GFLOPS(min) err=6.4e-07
+  a=texb    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=2.129 ms med=2.448 ms    109 GFLOPS(min) err=6.4e-07
+  a=texb    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=2.905 ms med=3.372 ms     80 GFLOPS(min) err=6.4e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=4.966 ms med=5.719 ms     47 GFLOPS(min) err=6.0e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=5.034 ms med=5.524 ms     46 GFLOPS(min) err=6.0e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=4.025 ms med=4.517 ms     57 GFLOPS(min) err=6.0e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=3.072 ms med=3.365 ms     75 GFLOPS(min) err=6.0e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=2.246 ms med=2.663 ms    103 GFLOPS(min) err=6.0e-07
+  a=nc416   w=hwio    o=nc4  colx TM8 NV2 16x4      min=4.807 ms med=5.549 ms     48 GFLOPS(min) err=6.0e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV2 16x4      min=4.782 ms med=5.511 ms     48 GFLOPS(min) err=6.0e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV4 8x8       min=4.776 ms med=5.441 ms     48 GFLOPS(min) err=6.0e-07
+  a=nc416   w=hwio    o=nc4  rowx TM8 NV2 32x4      min=3.411 ms med=3.841 ms     68 GFLOPS(min) err=6.0e-07
+  a=nc416   w=hwio    o=nc4  rowx TM4 NV4 32x2      min=2.305 ms med=2.451 ms    100 GFLOPS(min) err=6.0e-07
+  a=texa16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=5.012 ms med=5.665 ms     46 GFLOPS(min) err=6.0e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=4.374 ms med=4.735 ms     53 GFLOPS(min) err=6.0e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=4.544 ms med=5.189 ms     51 GFLOPS(min) err=6.0e-07
+  a=texa16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=2.945 ms med=3.218 ms     79 GFLOPS(min) err=6.0e-07
+  a=texa16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=2.148 ms med=2.533 ms    108 GFLOPS(min) err=6.0e-07
+-- phase 2: weight layouts (top 2 configs of nhwc and nc4 activations)
+  a=nhwc    w=ok4     o=nhwc rowx TM4 NV4 32x2      min=2.629 ms med=2.970 ms     88 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=ok4     o=nhwc rowx TM8 NV2 32x4      min=3.145 ms med=3.489 ms     74 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=texw    o=nhwc rowx TM4 NV4 32x2      min=1.619 ms med=1.771 ms    143 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=texw    o=nhwc rowx TM8 NV2 32x4      min=3.054 ms med=3.515 ms     76 GFLOPS(min) err=6.4e-07
+  a=nhwc    w=texw16  o=nhwc rowx TM4 NV4 32x2      min=1.464 ms med=1.649 ms    158 GFLOPS(min) err=8.3e-07
+  a=nhwc    w=texw16  o=nhwc rowx TM8 NV2 32x4      min=2.930 ms med=3.398 ms     79 GFLOPS(min) err=8.3e-07
+  a=nc4     w=ok4     o=nc4  rowx TM4 NV4 32x2      min=2.559 ms med=2.971 ms     90 GFLOPS(min) err=6.4e-07
+  a=nc4     w=ok4     o=nc4  rowx TM8 NV2 32x4      min=2.778 ms med=3.215 ms     83 GFLOPS(min) err=6.4e-07
+  a=nc4     w=texw    o=nc4  rowx TM4 NV4 32x2      min=1.719 ms med=1.990 ms    134 GFLOPS(min) err=6.4e-07
+  a=nc4     w=texw    o=nc4  rowx TM8 NV2 32x4      min=2.376 ms med=2.825 ms     97 GFLOPS(min) err=6.4e-07
+  a=nc4     w=texw16  o=nc4  rowx TM4 NV4 32x2      min=1.399 ms med=1.669 ms    165 GFLOPS(min) err=8.3e-07
+  a=nc4     w=texw16  o=nc4  rowx TM8 NV2 32x4      min=2.116 ms med=2.330 ms    109 GFLOPS(min) err=8.3e-07
+-- phase 3: packed f16 weights x f16 activations (NV=2 configs)
+  a=nhwc16  w=w16     o=nhwc colx TM8 NV2 16x4      min=4.897 ms med=5.584 ms     47 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=w16     o=nhwc colx TM4 NV2 16x4      min=2.958 ms med=3.660 ms     78 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=3.486 ms med=3.829 ms     66 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=3.980 ms med=4.438 ms     58 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=3.068 ms med=3.547 ms     75 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=2.518 ms med=2.872 ms     92 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=2.551 ms med=2.870 ms     91 GFLOPS(min) err=9.5e-07
+  a=nhwc16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=1.469 ms med=1.776 ms    157 GFLOPS(min) err=9.5e-07
+  a=nc416   w=w16     o=nc4  colx TM8 NV2 16x4      min=5.081 ms med=5.731 ms     46 GFLOPS(min) err=9.5e-07
+  a=nc416   w=w16     o=nc4  colx TM4 NV2 16x4      min=2.994 ms med=3.481 ms     77 GFLOPS(min) err=9.5e-07
+  a=nc416   w=w16     o=nc4  rowx TM8 NV2 32x4      min=3.777 ms med=4.476 ms     61 GFLOPS(min) err=9.5e-07
+  a=nc416   w=texw16  o=nc4  colx TM8 NV2 16x4      min=3.473 ms med=4.157 ms     67 GFLOPS(min) err=9.5e-07
+  a=nc416   w=texw16  o=nc4  colx TM4 NV2 16x4      min=3.020 ms med=3.283 ms     77 GFLOPS(min) err=9.5e-07
+  a=nc416   w=texw16  o=nc4  colx TM4 NV4 8x8       min=2.460 ms med=2.689 ms     94 GFLOPS(min) err=9.5e-07
+  a=nc416   w=texw16  o=nc4  rowx TM8 NV2 32x4      min=2.702 ms med=2.869 ms     86 GFLOPS(min) err=9.5e-07
+  a=nc416   w=texw16  o=nc4  rowx TM4 NV4 32x2      min=1.388 ms med=1.505 ms    167 GFLOPS(min) err=9.5e-07
+  a=texa16  w=w16     o=nhwc colx TM8 NV2 16x4      min=5.075 ms med=6.233 ms     46 GFLOPS(min) err=9.5e-07
+  a=texa16  w=w16     o=nhwc colx TM4 NV2 16x4      min=2.950 ms med=3.429 ms     78 GFLOPS(min) err=9.5e-07
+  a=texa16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=2.962 ms med=3.487 ms     78 GFLOPS(min) err=9.5e-07
+  a=texa16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=3.743 ms med=4.468 ms     62 GFLOPS(min) err=9.5e-07
+  a=texa16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=2.311 ms med=2.669 ms    100 GFLOPS(min) err=9.5e-07
+  a=texa16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=2.536 ms med=3.131 ms     91 GFLOPS(min) err=9.5e-07
+  a=texa16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=2.426 ms med=2.587 ms     95 GFLOPS(min) err=9.5e-07
+  a=texa16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=1.334 ms med=1.603 ms    173 GFLOPS(min) err=9.5e-07
+-- best per (activation, weight) layout, GFLOPS by min time
+-- phase 4: interleaved head-to-head (6 rounds; min over rounds / median of per-round mins)
+H2H 3x3 C64>64@56  nc416  /texw16  rowx TM4 NV4 32x2      min 0.685 ms  med 0.806 ms    338 GFLOPS(min)
+H2H 3x3 C64>64@56  texa16 /texw16  rowx TM4 NV4 32x2      min 0.725 ms  med 0.842 ms    319 GFLOPS(min)
+H2H 3x3 C64>64@56  nhwc   /texw16  rowx TM4 NV4 32x2      min 0.741 ms  med 0.849 ms    312 GFLOPS(min)
+H2H 3x3 C64>64@56  nhwc16 /texw16  rowx TM4 NV4 32x2      min 0.763 ms  med 0.920 ms    303 GFLOPS(min)
+H2H 3x3 C64>64@56  nc4    /texw16  rowx TM4 NV4 32x2      min 0.781 ms  med 0.923 ms    296 GFLOPS(min)
+H2H 3x3 C64>64@56  nhwc   /texw    rowx TM4 NV4 32x2      min 0.784 ms  med 0.946 ms    295 GFLOPS(min)
+H2H 3x3 C64>64@56  nc4    /texw    rowx TM4 NV4 32x2      min 0.895 ms  med 1.054 ms    258 GFLOPS(min)
+H2H 3x3 C64>64@56  z4     /hwio    rowx TM4 NV4 32x2      min 1.154 ms  med 1.445 ms    200 GFLOPS(min)
+H2H 3x3 C64>64@56  nhwc   /hwio    rowx TM4 NV4 32x2      min 1.240 ms  med 1.410 ms    186 GFLOPS(min)
+H2H 3x3 C64>64@56  texa   /hwio    rowx TM4 NV4 32x2      min 1.244 ms  med 1.363 ms    186 GFLOPS(min)
+H2H 3x3 C64>64@56  nc4    /hwio    rowx TM4 NV4 32x2      min 1.297 ms  med 1.430 ms    178 GFLOPS(min)
+H2H 3x3 C64>64@56  texb   /hwio    colx TM4 NV4 8x8       min 2.410 ms  med 2.811 ms     96 GFLOPS(min)
+######## lay2_3x3_128_128_28
+== 3x3 conv Cin=128 Cout=128 28x28  (M=784 N=128 K=1152, 0.231 GFLOP)
+-- phase 1: activation layouts (weights hwio)
+  a=nhwc    w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.251 ms med=1.333 ms    185 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.519 ms med=1.526 ms    152 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.198 ms med=1.245 ms    193 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.603 ms med=1.775 ms    144 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.309 ms med=1.376 ms    177 GFLOPS(min) err=8.4e-07
+  a=nc4     w=hwio    o=nc4  colx TM8 NV2 16x4      min=1.305 ms med=1.498 ms    177 GFLOPS(min) err=8.4e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV2 16x4      min=1.669 ms med=1.991 ms    139 GFLOPS(min) err=8.4e-07
+  a=nc4     w=hwio    o=nc4  colx TM4 NV4 8x8       min=1.229 ms med=1.295 ms    188 GFLOPS(min) err=8.4e-07
+  a=nc4     w=hwio    o=nc4  rowx TM8 NV2 32x4      min=1.386 ms med=1.532 ms    167 GFLOPS(min) err=8.4e-07
+  a=nc4     w=hwio    o=nc4  rowx TM4 NV4 32x2      min=1.268 ms med=1.451 ms    182 GFLOPS(min) err=8.4e-07
+  a=z4      w=hwio    o=z4   colx TM8 NV2 16x4      min=1.177 ms med=1.337 ms    196 GFLOPS(min) err=8.4e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV2 16x4      min=1.510 ms med=1.649 ms    153 GFLOPS(min) err=8.4e-07
+  a=z4      w=hwio    o=z4   colx TM4 NV4 8x8       min=1.213 ms med=1.355 ms    191 GFLOPS(min) err=8.4e-07
+  a=z4      w=hwio    o=z4   rowx TM8 NV2 32x4      min=1.580 ms med=1.761 ms    146 GFLOPS(min) err=8.4e-07
+  a=z4      w=hwio    o=z4   rowx TM4 NV4 32x2      min=1.282 ms med=1.389 ms    180 GFLOPS(min) err=8.4e-07
+  a=texa    w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.296 ms med=1.386 ms    178 GFLOPS(min) err=8.4e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.374 ms med=1.559 ms    168 GFLOPS(min) err=8.4e-07
+  a=texa    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.180 ms med=1.240 ms    196 GFLOPS(min) err=8.4e-07
+  a=texa    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.150 ms med=1.316 ms    201 GFLOPS(min) err=8.4e-07
+  a=texa    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.192 ms med=1.350 ms    194 GFLOPS(min) err=8.4e-07
+  a=texb    w=hwio    o=nhwc colx TM8 NV2 16x4      min=1.319 ms med=1.441 ms    175 GFLOPS(min) err=8.4e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.414 ms med=1.599 ms    163 GFLOPS(min) err=8.4e-07
+  a=texb    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.082 ms med=1.291 ms    214 GFLOPS(min) err=8.4e-07
+  a=texb    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=1.321 ms med=1.501 ms    175 GFLOPS(min) err=8.4e-07
+  a=texb    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.455 ms med=1.590 ms    159 GFLOPS(min) err=8.4e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.792 ms med=3.030 ms     83 GFLOPS(min) err=8.3e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.244 ms med=2.568 ms    103 GFLOPS(min) err=8.3e-07
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=2.485 ms med=2.712 ms     93 GFLOPS(min) err=8.3e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=3.412 ms med=3.690 ms     68 GFLOPS(min) err=8.3e-07
+  a=nhwc16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=2.607 ms med=2.998 ms     89 GFLOPS(min) err=8.3e-07
+  a=nc416   w=hwio    o=nc4  colx TM8 NV2 16x4      min=2.348 ms med=2.563 ms     98 GFLOPS(min) err=8.3e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV2 16x4      min=2.451 ms med=2.720 ms     94 GFLOPS(min) err=8.3e-07
+  a=nc416   w=hwio    o=nc4  colx TM4 NV4 8x8       min=2.643 ms med=3.016 ms     87 GFLOPS(min) err=8.3e-07
+  a=nc416   w=hwio    o=nc4  rowx TM8 NV2 32x4      min=3.458 ms med=3.887 ms     67 GFLOPS(min) err=8.3e-07
+  a=nc416   w=hwio    o=nc4  rowx TM4 NV4 32x2      min=2.529 ms med=2.868 ms     91 GFLOPS(min) err=8.3e-07
+  a=texa16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.494 ms med=2.793 ms     93 GFLOPS(min) err=8.3e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.839 ms med=3.414 ms     81 GFLOPS(min) err=8.3e-07
+  a=texa16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=2.436 ms med=2.747 ms     95 GFLOPS(min) err=8.3e-07
+  a=texa16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=2.282 ms med=2.444 ms    101 GFLOPS(min) err=8.3e-07
+  a=texa16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=2.128 ms med=2.465 ms    109 GFLOPS(min) err=8.3e-07
+-- phase 2: weight layouts (top 2 configs of nhwc and nc4 activations)
+  a=nhwc    w=ok4     o=nhwc colx TM4 NV4 8x8       min=2.237 ms med=2.515 ms    103 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=ok4     o=nhwc colx TM8 NV2 16x4      min=1.796 ms med=2.144 ms    129 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=texw    o=nhwc colx TM4 NV4 8x8       min=1.235 ms med=1.380 ms    187 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=texw    o=nhwc colx TM8 NV2 16x4      min=1.787 ms med=2.143 ms    129 GFLOPS(min) err=8.4e-07
+  a=nhwc    w=texw16  o=nhwc colx TM4 NV4 8x8       min=1.145 ms med=1.325 ms    202 GFLOPS(min) err=1.1e-06
+  a=nhwc    w=texw16  o=nhwc colx TM8 NV2 16x4      min=1.711 ms med=1.834 ms    135 GFLOPS(min) err=1.1e-06
+  a=nc4     w=ok4     o=nc4  colx TM4 NV4 8x8       min=1.766 ms med=2.035 ms    131 GFLOPS(min) err=8.4e-07
+  a=nc4     w=ok4     o=nc4  rowx TM4 NV4 32x2      min=1.787 ms med=2.045 ms    129 GFLOPS(min) err=8.4e-07
+  a=nc4     w=texw    o=nc4  colx TM4 NV4 8x8       min=1.166 ms med=1.287 ms    198 GFLOPS(min) err=8.4e-07
+  a=nc4     w=texw    o=nc4  rowx TM4 NV4 32x2      min=1.251 ms med=1.545 ms    185 GFLOPS(min) err=8.4e-07
+  a=nc4     w=texw16  o=nc4  colx TM4 NV4 8x8       min=1.009 ms med=1.175 ms    229 GFLOPS(min) err=1.1e-06
+  a=nc4     w=texw16  o=nc4  rowx TM4 NV4 32x2      min=1.083 ms med=1.218 ms    213 GFLOPS(min) err=1.1e-06
+-- phase 3: packed f16 weights x f16 activations (NV=2 configs)
+  a=nhwc16  w=w16     o=nhwc colx TM8 NV2 16x4      min=2.715 ms med=3.051 ms     85 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=w16     o=nhwc colx TM4 NV2 16x4      min=2.131 ms med=2.389 ms    109 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=3.278 ms med=3.484 ms     71 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=1.877 ms med=2.094 ms    123 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=1.504 ms med=1.757 ms    154 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=1.422 ms med=1.680 ms    163 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=2.473 ms med=2.846 ms     93 GFLOPS(min) err=1.3e-06
+  a=nhwc16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=1.457 ms med=1.535 ms    159 GFLOPS(min) err=1.3e-06
+  a=nc416   w=w16     o=nc4  colx TM8 NV2 16x4      min=2.508 ms med=2.893 ms     92 GFLOPS(min) err=1.3e-06
+  a=nc416   w=w16     o=nc4  colx TM4 NV2 16x4      min=2.106 ms med=2.482 ms    110 GFLOPS(min) err=1.3e-06
+  a=nc416   w=w16     o=nc4  rowx TM8 NV2 32x4      min=3.382 ms med=3.887 ms     68 GFLOPS(min) err=1.3e-06
+  a=nc416   w=texw16  o=nc4  colx TM8 NV2 16x4      min=1.932 ms med=2.379 ms    120 GFLOPS(min) err=1.3e-06
+  a=nc416   w=texw16  o=nc4  colx TM4 NV2 16x4      min=1.685 ms med=1.904 ms    137 GFLOPS(min) err=1.3e-06
+  a=nc416   w=texw16  o=nc4  colx TM4 NV4 8x8       min=1.551 ms med=1.744 ms    149 GFLOPS(min) err=1.3e-06
+  a=nc416   w=texw16  o=nc4  rowx TM8 NV2 32x4      min=2.411 ms med=2.756 ms     96 GFLOPS(min) err=1.3e-06
+  a=nc416   w=texw16  o=nc4  rowx TM4 NV4 32x2      min=1.476 ms med=1.715 ms    157 GFLOPS(min) err=1.3e-06
+  a=texa16  w=w16     o=nhwc colx TM8 NV2 16x4      min=2.634 ms med=3.214 ms     88 GFLOPS(min) err=1.3e-06
+  a=texa16  w=w16     o=nhwc colx TM4 NV2 16x4      min=2.137 ms med=2.354 ms    108 GFLOPS(min) err=1.3e-06
+  a=texa16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=2.605 ms med=3.046 ms     89 GFLOPS(min) err=1.3e-06
+  a=texa16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=2.056 ms med=2.410 ms    112 GFLOPS(min) err=1.3e-06
+  a=texa16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=1.704 ms med=1.894 ms    136 GFLOPS(min) err=1.3e-06
+  a=texa16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=1.533 ms med=1.732 ms    151 GFLOPS(min) err=1.3e-06
+  a=texa16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=2.445 ms med=2.759 ms     95 GFLOPS(min) err=1.3e-06
+  a=texa16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=1.632 ms med=1.767 ms    142 GFLOPS(min) err=1.3e-06
+-- best per (activation, weight) layout, GFLOPS by min time
+-- phase 4: interleaved head-to-head (6 rounds; min over rounds / median of per-round mins)
+H2H 3x3 C128>128@28  nhwc16 /texw16  colx TM4 NV4 8x8       min 1.165 ms  med 1.391 ms    198 GFLOPS(min)
+H2H 3x3 C128>128@28  nc416  /texw16  rowx TM4 NV4 32x2      min 1.187 ms  med 1.416 ms    195 GFLOPS(min)
+H2H 3x3 C128>128@28  nc4    /texw16  colx TM4 NV4 8x8       min 1.267 ms  med 1.460 ms    182 GFLOPS(min)
+H2H 3x3 C128>128@28  nhwc   /texw16  colx TM4 NV4 8x8       min 1.273 ms  med 1.590 ms    182 GFLOPS(min)
+H2H 3x3 C128>128@28  texa16 /texw16  colx TM4 NV4 8x8       min 1.303 ms  med 1.551 ms    177 GFLOPS(min)
+H2H 3x3 C128>128@28  nhwc   /texw    colx TM4 NV4 8x8       min 1.445 ms  med 1.740 ms    160 GFLOPS(min)
+H2H 3x3 C128>128@28  nc4    /texw    colx TM4 NV4 8x8       min 1.478 ms  med 1.773 ms    156 GFLOPS(min)
+H2H 3x3 C128>128@28  texb   /hwio    colx TM4 NV4 8x8       min 1.995 ms  med 2.453 ms    116 GFLOPS(min)
+H2H 3x3 C128>128@28  texa   /hwio    rowx TM8 NV2 32x4      min 2.002 ms  med 2.573 ms    115 GFLOPS(min)
+H2H 3x3 C128>128@28  nc4    /hwio    colx TM4 NV4 8x8       min 2.199 ms  med 2.501 ms    105 GFLOPS(min)
+H2H 3x3 C128>128@28  z4     /hwio    colx TM8 NV2 16x4      min 2.287 ms  med 2.689 ms    101 GFLOPS(min)
+H2H 3x3 C128>128@28  nhwc   /hwio    colx TM4 NV4 8x8       min 2.498 ms  med 2.683 ms     93 GFLOPS(min)
+######## lay2_3x3_256_256_14
+== 3x3 conv Cin=256 Cout=256 14x14  (M=196 N=256 K=2304, 0.231 GFLOP)
+-- phase 1: activation layouts (weights hwio)
+  a=nhwc    w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.463 ms med=2.659 ms     94 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.476 ms med=1.711 ms    157 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.586 ms med=1.749 ms    146 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=2.161 ms med=2.450 ms    107 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=2.006 ms med=2.261 ms    115 GFLOPS(min) err=1.4e-06
+  a=nc4     w=hwio    o=nc4  colx TM8 NV2 16x4      min=2.008 ms med=2.544 ms    115 GFLOPS(min) err=1.4e-06
+  a=nc4     w=hwio    o=nc4  colx TM4 NV2 16x4      min=1.546 ms med=1.755 ms    150 GFLOPS(min) err=1.4e-06
+  a=nc4     w=hwio    o=nc4  colx TM4 NV4 8x8       min=1.571 ms med=1.762 ms    147 GFLOPS(min) err=1.4e-06
+  a=nc4     w=hwio    o=nc4  rowx TM8 NV2 32x4      min=2.205 ms med=2.588 ms    105 GFLOPS(min) err=1.4e-06
+  a=nc4     w=hwio    o=nc4  rowx TM4 NV4 32x2      min=1.784 ms med=2.057 ms    130 GFLOPS(min) err=1.4e-06
+  a=texa    w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.412 ms med=2.650 ms     96 GFLOPS(min) err=1.4e-06
+  a=texa    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.202 ms med=1.314 ms    192 GFLOPS(min) err=1.4e-06
+  a=texa    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.413 ms med=1.635 ms    164 GFLOPS(min) err=1.4e-06
+  a=texa    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=2.418 ms med=2.742 ms     96 GFLOPS(min) err=1.4e-06
+  a=texa    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.745 ms med=1.919 ms    133 GFLOPS(min) err=1.4e-06
+  a=texb    w=hwio    o=nhwc colx TM8 NV2 16x4      min=2.585 ms med=2.726 ms     89 GFLOPS(min) err=1.4e-06
+  a=texb    w=hwio    o=nhwc colx TM4 NV2 16x4      min=1.222 ms med=1.345 ms    189 GFLOPS(min) err=1.4e-06
+  a=texb    w=hwio    o=nhwc colx TM4 NV4 8x8       min=1.720 ms med=1.925 ms    134 GFLOPS(min) err=1.4e-06
+  a=texb    w=hwio    o=nhwc rowx TM8 NV2 32x4      min=2.368 ms med=2.613 ms     98 GFLOPS(min) err=1.4e-06
+  a=texb    w=hwio    o=nhwc rowx TM4 NV4 32x2      min=1.716 ms med=2.006 ms    135 GFLOPS(min) err=1.4e-06
+  a=nhwc16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=5.172 ms med=6.101 ms     45 GFLOPS(min) err=1.7e-06
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.923 ms med=3.112 ms     79 GFLOPS(min) err=1.7e-06
+  a=nhwc16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=3.720 ms med=4.039 ms     62 GFLOPS(min) err=1.7e-06
+  a=nhwc16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=4.461 ms med=5.036 ms     52 GFLOPS(min) err=1.7e-06
+  a=nhwc16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=3.331 ms med=4.028 ms     69 GFLOPS(min) err=1.7e-06
+  a=nc416   w=hwio    o=nc4  colx TM8 NV2 16x4      min=4.682 ms med=5.575 ms     49 GFLOPS(min) err=1.7e-06
+  a=nc416   w=hwio    o=nc4  colx TM4 NV2 16x4      min=2.849 ms med=3.242 ms     81 GFLOPS(min) err=1.7e-06
+  a=nc416   w=hwio    o=nc4  colx TM4 NV4 8x8       min=3.112 ms med=3.343 ms     74 GFLOPS(min) err=1.7e-06
+  a=nc416   w=hwio    o=nc4  rowx TM8 NV2 32x4      min=6.939 ms med=7.636 ms     33 GFLOPS(min) err=1.7e-06
+  a=nc416   w=hwio    o=nc4  rowx TM4 NV4 32x2      min=3.722 ms med=4.066 ms     62 GFLOPS(min) err=1.7e-06
+  a=texa16  w=hwio    o=nhwc colx TM8 NV2 16x4      min=5.026 ms med=5.839 ms     46 GFLOPS(min) err=1.7e-06
+  a=texa16  w=hwio    o=nhwc colx TM4 NV2 16x4      min=2.734 ms med=2.901 ms     85 GFLOPS(min) err=1.7e-06
+  a=texa16  w=hwio    o=nhwc colx TM4 NV4 8x8       min=3.064 ms med=3.404 ms     75 GFLOPS(min) err=1.7e-06
+  a=texa16  w=hwio    o=nhwc rowx TM8 NV2 32x4      min=4.236 ms med=4.467 ms     55 GFLOPS(min) err=1.7e-06
+  a=texa16  w=hwio    o=nhwc rowx TM4 NV4 32x2      min=3.640 ms med=4.191 ms     64 GFLOPS(min) err=1.7e-06
+-- phase 2: weight layouts (top 2 configs of nhwc and nc4 activations)
+  a=nhwc    w=ok4     o=nhwc colx TM4 NV2 16x4      min=3.153 ms med=3.668 ms     73 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=ok4     o=nhwc colx TM4 NV4 8x8       min=3.276 ms med=3.723 ms     71 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=texw    o=nhwc colx TM4 NV2 16x4      min=2.106 ms med=2.369 ms    110 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=texw    o=nhwc colx TM4 NV4 8x8       min=3.240 ms med=3.586 ms     71 GFLOPS(min) err=1.4e-06
+  a=nhwc    w=texw16  o=nhwc colx TM4 NV2 16x4      min=1.608 ms med=1.897 ms    144 GFLOPS(min) err=2.8e-06
+  a=nhwc    w=texw16  o=nhwc colx TM4 NV4 8x8       min=2.116 ms med=2.376 ms    109 GFLOPS(min) err=2.8e-06
+  a=nc4     w=ok4     o=nc4  colx TM4 NV2 16x4      min=2.935 ms med=3.476 ms     79 GFLOPS(min) err=1.4e-06
+  a=nc4     w=ok4     o=nc4  colx TM4 NV4 8x8       min=3.176 ms med=3.984 ms     73 GFLOPS(min) err=1.4e-06
+  a=nc4     w=texw    o=nc4  colx TM4 NV2 16x4      min=2.019 ms med=2.400 ms    115 GFLOPS(min) err=1.4e-06
+  a=nc4     w=texw    o=nc4  colx TM4 NV4 8x8       min=2.739 ms med=3.107 ms     84 GFLOPS(min) err=1.4e-06
+  a=nc4     w=texw16  o=nc4  colx TM4 NV2 16x4      min=1.624 ms med=1.910 ms    142 GFLOPS(min) err=2.8e-06
+  a=nc4     w=texw16  o=nc4  colx TM4 NV4 8x8       min=2.384 ms med=2.686 ms     97 GFLOPS(min) err=2.8e-06
+-- phase 3: packed f16 weights x f16 activations (NV=2 configs)
+  a=nhwc16  w=w16     o=nhwc colx TM8 NV2 16x4      min=4.329 ms med=5.719 ms     53 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=w16     o=nhwc colx TM4 NV2 16x4      min=2.305 ms med=2.502 ms    100 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=4.865 ms med=5.512 ms     48 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=3.683 ms med=4.211 ms     63 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=1.874 ms med=2.137 ms    123 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=2.254 ms med=2.567 ms    103 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=3.343 ms med=4.109 ms     69 GFLOPS(min) err=1.8e-06
+  a=nhwc16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=2.121 ms med=2.321 ms    109 GFLOPS(min) err=1.8e-06
+  a=nc416   w=w16     o=nc4  colx TM8 NV2 16x4      min=5.067 ms med=5.658 ms     46 GFLOPS(min) err=1.8e-06
+  a=nc416   w=w16     o=nc4  colx TM4 NV2 16x4      min=2.538 ms med=2.918 ms     91 GFLOPS(min) err=1.8e-06
+  a=nc416   w=w16     o=nc4  rowx TM8 NV2 32x4      min=4.741 ms med=5.371 ms     49 GFLOPS(min) err=1.8e-06
+  a=nc416   w=texw16  o=nc4  colx TM8 NV2 16x4      min=3.566 ms med=4.288 ms     65 GFLOPS(min) err=1.8e-06
+  a=nc416   w=texw16  o=nc4  colx TM4 NV2 16x4      min=2.112 ms med=2.422 ms    110 GFLOPS(min) err=1.8e-06
+  a=nc416   w=texw16  o=nc4  colx TM4 NV4 8x8       min=2.395 ms med=2.739 ms     97 GFLOPS(min) err=1.8e-06
+  a=nc416   w=texw16  o=nc4  rowx TM8 NV2 32x4      min=5.403 ms med=6.146 ms     43 GFLOPS(min) err=1.8e-06
+  a=nc416   w=texw16  o=nc4  rowx TM4 NV4 32x2      min=2.396 ms med=2.656 ms     96 GFLOPS(min) err=1.8e-06
+  a=texa16  w=w16     o=nhwc colx TM8 NV2 16x4      min=5.263 ms med=5.626 ms     44 GFLOPS(min) err=1.8e-06
+  a=texa16  w=w16     o=nhwc colx TM4 NV2 16x4      min=2.242 ms med=2.492 ms    103 GFLOPS(min) err=1.8e-06
+  a=texa16  w=w16     o=nhwc rowx TM8 NV2 32x4      min=5.487 ms med=6.188 ms     42 GFLOPS(min) err=1.8e-06
+  a=texa16  w=texw16  o=nhwc colx TM8 NV2 16x4      min=2.927 ms med=3.348 ms     79 GFLOPS(min) err=1.8e-06
+  a=texa16  w=texw16  o=nhwc colx TM4 NV2 16x4      min=1.526 ms med=1.703 ms    152 GFLOPS(min) err=1.8e-06
+  a=texa16  w=texw16  o=nhwc colx TM4 NV4 8x8       min=2.079 ms med=2.292 ms    111 GFLOPS(min) err=1.8e-06
+  a=texa16  w=texw16  o=nhwc rowx TM8 NV2 32x4      min=3.410 ms med=3.830 ms     68 GFLOPS(min) err=1.8e-06
+  a=texa16  w=texw16  o=nhwc rowx TM4 NV4 32x2      min=1.986 ms med=2.294 ms    116 GFLOPS(min) err=1.8e-06
+-- best per (activation, weight) layout, GFLOPS by min time
+-- phase 4: interleaved head-to-head (6 rounds; min over rounds / median of per-round mins)
+H2H 3x3 C256>256@14  texa16 /texw16  colx TM4 NV2 16x4      min 0.706 ms  med 0.989 ms    328 GFLOPS(min)
+H2H 3x3 C256>256@14  nhwc   /texw16  colx TM4 NV2 16x4      min 0.785 ms  med 1.064 ms    294 GFLOPS(min)
+H2H 3x3 C256>256@14  nc4    /texw16  colx TM4 NV2 16x4      min 0.848 ms  med 1.216 ms    273 GFLOPS(min)
+H2H 3x3 C256>256@14  nhwc16 /texw16  colx TM4 NV2 16x4      min 0.856 ms  med 1.093 ms    270 GFLOPS(min)
+H2H 3x3 C256>256@14  nc416  /texw16  colx TM4 NV2 16x4      min 1.049 ms  med 1.168 ms    220 GFLOPS(min)
+H2H 3x3 C256>256@14  texa16 /w16     colx TM4 NV2 16x4      min 1.060 ms  med 1.184 ms    218 GFLOPS(min)
+H2H 3x3 C256>256@14  nc4    /texw    colx TM4 NV2 16x4      min 1.086 ms  med 1.330 ms    213 GFLOPS(min)
+H2H 3x3 C256>256@14  nhwc   /texw    colx TM4 NV2 16x4      min 1.200 ms  med 1.329 ms    193 GFLOPS(min)
+H2H 3x3 C256>256@14  texa   /hwio    colx TM4 NV2 16x4      min 1.248 ms  med 1.581 ms    185 GFLOPS(min)
+H2H 3x3 C256>256@14  texb   /hwio    colx TM4 NV2 16x4      min 1.263 ms  med 1.584 ms    183 GFLOPS(min)
+H2H 3x3 C256>256@14  nc4    /hwio    colx TM4 NV2 16x4      min 1.526 ms  med 1.854 ms    151 GFLOPS(min)
+H2H 3x3 C256>256@14  nhwc   /hwio    colx TM4 NV2 16x4      min 1.558 ms  med 1.893 ms    148 GFLOPS(min)
+######## lay2_misc
+== channel padding, 1x1 conv 28x28, Cin=Cout=100 logical
+  pad to x4  -> 100 channels: best colx TM8 NV2 16x4 0.321 ms  padded 49 GFLOPS  useful 49 GFLOPS
+  pad to x8  -> 104 channels: best colx TM8 NV2 16x4 0.325 ms  padded 52 GFLOPS  useful 48 GFLOPS
+  pad to x16 -> 112 channels: best colx TM8 NV2 16x4 0.348 ms  padded 57 GFLOPS  useful 45 GFLOPS
+  pad to x32 -> 128 channels: best colx TM8 NV2 16x4 0.426 ms  padded 60 GFLOPS  useful 37 GFLOPS
+== channel padding, 1x1 conv 28x28, Cin=Cout=60 logical
+  pad to x4  ->  60 channels: best colx TM8 NV2 16x4 0.148 ms  padded 38 GFLOPS  useful 38 GFLOPS
+  pad to x8  ->  64 channels: best colx TM8 NV2 16x4 0.150 ms  padded 43 GFLOPS  useful 38 GFLOPS
+  pad to x16 ->  64 channels: best colx TM8 NV2 16x4 0.152 ms  padded 42 GFLOPS  useful 37 GFLOPS
+  pad to x32 ->  64 channels: best colx TM8 NV2 16x4 0.161 ms  padded 40 GFLOPS  useful 35 GFLOPS
+== channel padding, 1x1 conv 28x28, Cin=Cout=96 logical
+  pad to x4  ->  96 channels: best colx TM8 NV2 16x4 0.230 ms  padded 63 GFLOPS  useful 63 GFLOPS
+  pad to x8  ->  96 channels: best colx TM4 NV4 8x8 0.208 ms  padded 69 GFLOPS  useful 69 GFLOPS
+  pad to x16 ->  96 channels: best colx TM8 NV2 16x4 0.220 ms  padded 66 GFLOPS  useful 66 GFLOPS
+  pad to x32 ->  96 channels: best colx TM8 NV2 16x4 0.225 ms  padded 64 GFLOPS  useful 64 GFLOPS
+xform nhwc->nc4 C=64 56x56 (1.61 MB moved): min 0.072 ms med 0.083 ms  22 GB/s
+xform nc4->nhwc C=64 56x56 (1.61 MB moved): min 0.106 ms med 0.111 ms  15 GB/s
+xform nhwc->nc4 C=256 56x56 (6.42 MB moved): min 0.283 ms med 0.312 ms  23 GB/s
+xform nc4->nhwc C=256 56x56 (6.42 MB moved): min 2.432 ms med 2.809 ms  3 GB/s
+xform nhwc->nc4 C=128 28x28 (0.80 MB moved): min 0.032 ms med 0.042 ms  25 GB/s
+xform nc4->nhwc C=128 28x28 (0.80 MB moved): min 0.049 ms med 0.051 ms  16 GB/s
+xform nhwc->nc4 C=512 28x28 (3.21 MB moved): min 0.098 ms med 0.103 ms  33 GB/s
+xform nc4->nhwc C=512 28x28 (3.21 MB moved): min 0.558 ms med 0.655 ms  6 GB/s
+xform nhwc->nc4 C=256 14x14 (0.40 MB moved): min 0.024 ms med 0.025 ms  16 GB/s
+xform nc4->nhwc C=256 14x14 (0.40 MB moved): min 0.037 ms med 0.038 ms  11 GB/s
+xform nhwc->nc4 C=1024 14x14 (1.61 MB moved): min 0.072 ms med 0.073 ms  22 GB/s
+xform nc4->nhwc C=1024 14x14 (1.61 MB moved): min 0.124 ms med 0.143 ms  13 GB/s

@@ -1,0 +1,7 @@
+M_ow56|clsx=Conv M 1x1 s1 ow56
+M_ow28|clsx=Conv M 1x1 s1 ow28
+M_ow14|clsx=Conv M 1x1 s1 ow14
+M_ow7|clsx=Conv M 1x1 s1 ow7
+M_all|cls=Conv M 1x1 s1
+M2_s2_1x1|cls=Conv M2
+all_conv_1x1_and_s2|cls=Conv M,cls=Conv T
