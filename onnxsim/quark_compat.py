@@ -162,6 +162,33 @@ names and preset *meanings*, not copied.
   refused with ``XINT8`` (Quark refuses it too) and with power-of-two weights
   otherwise. Not implemented: ``AlignEltwise`` beyond ``AlignEltwiseQuantType``
   and the 16-bit ``AlignPool`` etc. for ``XINT8``.
+- The details the other integer presets (``A8W8``, ``A16W8``, ``VINT8``, the
+  ``*_AAWS`` ones, ``INT8_CNN_DEFAULT``, the transformer ones) depend on, all
+  checked against Quark 0.13 on randomized graphs (``tests/test_quark_int_presets_parity.py``):
+  ONNX Runtime's ``adjust_tensor_ranges`` runs twice (a Relu / Clip chain passes
+  its range two steps); the extended quantizer's alignment rewrites the shared
+  scale / zero-point initializers in place (a MaxPool output that shares its
+  input's moves with it) and its ``adjust_bias_scale`` re-quantizes the int32
+  biases with truncation after every alignment round; ``AlignEltwiseQuantType``
+  (extended quantizer only) gives every eltwise input its own parameters instead of
+  sharing; an all-zero activation range is scale 1 / zero point 0 for every
+  integer type; int32 biases saturate at the int32 limits; a Softmax gets the
+  unit range only when the quantizer quantizes it (not in the transformer
+  scheme); ``CalibMovingAverage`` averages the batch extremes in float32.
+  ``VINT8`` does not force data-movement ops on an unmarked input to quantize,
+  quantizes the op types of the model it is handed (so not the Slices
+  ``ConvertSplitToSlice`` makes), quantizes a PRelu slope like a weight, and
+  with ``DedicatedQDQPair`` gives each *quantized* reader (each input slot of
+  it) its own Q/DQ pair -- other readers see the float tensor, and a graph output
+  read by several of them stays float. Also: an excluded node is only left
+  unmarked (its quantized neighbours still wrap it in Q/DQ pairs); a ``Gemm``
+  ``beta`` moves into the int32 bias scale (ONNX Runtime's ``QDQGemm``);
+  ``Int32Bias=False`` biases follow ``PerChannel`` (one scale per element) and
+  ``WeightSymmetric=False``; an asymmetric power-of-two weight takes the zero
+  point of the min / max scale and the best MinMSE scale around it; a PRelu slope
+  is per row under ``PerChannel`` with the extended quantizer. Not reproduced:
+  Quark's failures on graphs its own pre-processing breaks (an ``x - mean(y)``
+  pattern its InstanceNormalization fusion chokes on).
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
   (``input_tensors``, or the deprecated ``activation``) and outputs
@@ -487,6 +514,19 @@ def _without_batch_norm(
     return types - {"BatchNormalization"}
 
 
+#: ops onnxsim's own flows share quantization parameters across but Quark's default
+#: operator quantizer (``QDQOperatorBase``) calibrates input and output separately
+_OWN_RANGE_OPS = (
+    "Flatten",
+    "Expand",
+    "Tile",
+    "Identity",
+    "GridSample",
+    "DepthToSpace",
+    "SpaceToDepth",
+)
+
+
 def _activation_rules(
     opts: Dict[str, Any], symmetric: bool, extended: bool, npu_cnn: bool
 ) -> Dict[str, Any]:
@@ -520,7 +560,13 @@ def _activation_rules(
         "fold_activation": (not symmetric)
         and (bool(opts.get("FoldRelu", False)) if extended else True),
         "adjust_activation_ranges": True,
-        "quantize_prelu_slope": extended or npu_cnn,
+        # (a plain quantizer reaches a PRelu only when the op type was asked for --
+        # QuantizeAllOpTypes / ExtraOpTypesToQuantize -- and then quantizes every
+        # input of it, the slope among them)
+        "quantize_prelu_slope": extended
+        or npu_cnn
+        or bool(opts.get("QuantizeAllOpTypes"))
+        or "PRelu" in (opts.get("ExtraOpTypesToQuantize") or ()),
         "align_ops": [
             op
             for key, ops in _ALIGN_OPTIONS
@@ -530,7 +576,11 @@ def _activation_rules(
         # outputs calibrated on their own: Slice always, Split under the extended
         # quantizer only (ONNX Runtime's Split shares the input's parameters,
         # which the plain and the power-of-two quantizer keep)
-        "unshared_ops": ("Slice", "Split") if extended else ("Slice",),
+        # (and so are the ops its plain operator quantizer handles -- the default one,
+        # which gives input and output their own ranges -- that onnxsim's own flows
+        # would share: Flatten, Expand, Tile, Identity, ...)
+        "unshared_ops": (("Slice", "Split") if extended else ("Slice",))
+        + _OWN_RANGE_OPS,
         # ... and ONNX Runtime's plain quantizer gives AveragePool its input's
         "shared_ops": () if extended or npu_cnn else ("AveragePool",),
     }
@@ -2214,6 +2264,8 @@ class ModelQuantizer:
             ("Conv", "ConvTranspose", "Gemm"),
             power_of_two=pof2,
             dtype=bits,
+            per_channel=bool(opts.get("PerChannel", False)),
+            symmetric=bool(opts.get("WeightSymmetric", wt.symmetric)),
         )
 
     def _auto_mixprecision(
@@ -2528,6 +2580,7 @@ class ModelQuantizer:
             # (every Quark preset sets it; a bare QConfig does not)
             force_no_input_check=bool(opts.get("ForceQuantizeNoInputCheck", True)),
             direct_pool=not (ext or npu_cnn),
+            npu_registry=bool(ext or npu_cnn),
             unquantized_ops=opset_unquantized_ops(work),
         )
         # Quark adds BatchNormalization to the op types it quantizes when it
@@ -2575,8 +2628,23 @@ class ModelQuantizer:
             ),
             int8_constants=True,
             reduce_range=bool(opts.get("ReduceRange", False)),
+            # (Quark applies it to the extended quantizer only: elsewhere it warns
+            # and does nothing)
+            ort_gemm_beta=True,
+            asymmetric_minmse_pof2=True,
+            prelu_slope_per_row=self._extended(act, wt),
+            excluded_nodes_stay_float=False,
+            # (the extended quantizer's refinement -- alignment, then the bias
+            # scale adjustment -- always runs)
+            adjust_bias_scale=(
+                bool(opts.get("AdjustBiasScale", True))
+                if self._extended(act, wt) and not npu_cnn
+                else None
+            ),
             align_eltwise_dtype=bool(
                 self.config.extra_options.get("AlignEltwiseQuantType")
+                and self._extended(act, wt)
+                and not npu_cnn
             ),
             softmax_unit_range=True,
             tensor_dtypes=t_dtypes or None,
@@ -2614,7 +2682,17 @@ class ModelQuantizer:
             if opts.get("DedicatedQDQPair", False):
                 from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
 
-                q = dedicate_qdq_pairs(q)
+                keep = set(skip_names)
+                q = dedicate_qdq_pairs(
+                    q,
+                    {
+                        n.name
+                        for n in work.graph.node
+                        if n.name
+                        and n.name not in keep
+                        and (scope_types is None or n.op_type in scope_types)
+                    },
+                )
             if ext and mixed_algo is not None:
                 # (the extended quantizer converts its Q/DQ nodes before
                 # AutoMixprecision re-quantizes layers with standard ones)

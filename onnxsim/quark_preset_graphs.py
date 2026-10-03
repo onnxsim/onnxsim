@@ -568,6 +568,8 @@ def requantize_biases_int8(
     exclude_layers: Sequence[str] = (),
     power_of_two: bool = False,
     dtype: str = "int8",
+    per_channel: bool = False,
+    symmetric: bool = True,
 ) -> onnx.ModelProto:
     """Replace the int32 bias (``input_scale * weight_scale``) of every
     promoted node by Quark's ``Int32Bias=False`` form: the bias quantized like
@@ -575,7 +577,8 @@ def requantize_biases_int8(
     scale ``max|b| / qmax`` (rounded up to a power of two with
     ``power_of_two``, as Quark's ``VINT8``), zero point 0. The codes come from
     the float model's bias (the int32 form is too coarse to recover them
-    from)."""
+    from). ``per_channel``: one scale per element (``axis=0``); a not
+    ``symmetric`` bias takes the asymmetric grid over its range."""
     qmax = {"int8": 127, "int16": 32767}[dtype]
     np_dt = {"int8": np.int8, "int16": np.int16}[dtype]
     opset = next(
@@ -611,24 +614,39 @@ def requantize_biases_int8(
             b = numpy_helper.to_array(q).astype(np.float64) * numpy_helper.to_array(
                 inits[dq.input[1]]
             ).astype(np.float64)
-        amax = float(np.max(np.abs(b))) if b.size else 0.0
-        scale = np.float32(amax / qmax) if amax > 0 else np.float32(1.0)
-        if power_of_two and amax > 0:
-            scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
         names = (base + "_quantized", base + "_scale", base + "_zero_point")
+        if per_channel and b.ndim == 1 and b.size > 1:
+            scale = (np.maximum(np.abs(b), 1e-12) / qmax).astype(np.float32)
+            if power_of_two:
+                scale = (2.0 ** np.ceil(np.log2(scale))).astype(np.float32)
+            codes = np.clip(np.round(b / scale), -qmax, qmax).astype(np_dt)
+            zero = np.zeros(scale.shape, np_dt)
+        elif not symmetric and not power_of_two:
+            from onnxsim.full_qdq import _weight_qparams
+
+            s32, z = _weight_qparams(b.min(), b.max(), -qmax - 1, qmax, False)
+            scale = np.float32(s32)
+            codes = np.clip(np.round(b / scale) + z, -qmax, qmax).astype(np_dt)
+            zero = np.array(z, np_dt)
+        else:
+            amax = float(np.max(np.abs(b))) if b.size else 0.0
+            scale = np.float32(amax / qmax) if amax > 0 else np.float32(1.0)
+            if power_of_two and amax > 0:
+                scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
+            codes = np.clip(np.round(b / scale), -qmax - 1, qmax).astype(np_dt)
+            zero = np.array(0, np_dt)
         g.initializer.extend(
             [
-                numpy_helper.from_array(
-                    np.clip(np.round(b / scale), -qmax - 1, qmax).astype(np_dt),
-                    names[0],
-                ),
-                numpy_helper.from_array(np.array(scale, np.float32), names[1]),
-                numpy_helper.from_array(np.array(0, np_dt), names[2]),
+                numpy_helper.from_array(codes, names[0]),
+                numpy_helper.from_array(np.asarray(scale, np.float32), names[1]),
+                numpy_helper.from_array(zero, names[2]),
             ]
         )
         drop.update(dq.input)
         dq.input[:] = list(names)
         del dq.attribute[:]
+        if per_channel and b.ndim == 1 and b.size > 1:
+            dq.attribute.append(onnx.helper.make_attribute("axis", 0))
         dq.domain = "com.microsoft" if ms else ""
     if ms and not any(o.domain == "com.microsoft" for o in m.opset_import):
         m.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
@@ -642,11 +660,19 @@ def requantize_biases_int8(
 # -- VINT8 ---------------------------------------------------------------------------
 
 
-def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
+def dedicate_qdq_pairs(
+    model: onnx.ModelProto, receivers: Optional[Set[str]] = None
+) -> onnx.ModelProto:
     """Quark's ``DedicatedQDQPair``: an activation ``Q -> DQ`` pair read by
     several nodes is replaced by one pair (same scale and zero point) per
     consumer, so each consumer owns the quantizer in front of it. The DQ of a
-    graph output stays as it is."""
+    graph output stays as it is.
+
+    Quark counts the *quantized* nodes that read the tensor (``receivers``: their
+    names, default every named node; a node reading the tensor twice counts
+    twice, and takes the first pair -- the other is left unused): with more than
+    one, only those get a pair and any other reader sees the float tensor; with
+    one or none the single pair stays in front of every reader."""
     m = onnx.ModelProto()
     m.CopyFrom(model)
     g = m.graph
@@ -665,15 +691,38 @@ def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
     taken = {x for n in nodes for x in list(n.input) + list(n.output)} | inits
     drop: Set[int] = set()
     inserts: Dict[int, List[onnx.NodeProto]] = {}  # id(consumer) -> nodes before it
+
+    def receiving(u: onnx.NodeProto) -> bool:
+        return receivers is None or not u.name or u.name in receivers
+
     for dq in nodes:
         if dq.op_type != "DequantizeLinear" or dq.input[0] not in q_by_out:
             continue
         q = q_by_out[dq.input[0]]
-        users = list({id(u): u for u in consumers.get(dq.output[0], [])}.values())
-        if len(users) < 2 or dq.output[0] in outputs:
+        readers = consumers.get(dq.output[0], [])  # one entry per input slot
+        users = list({id(u): u for u in readers}.values())
+        # (Quark's list: one entry per input slot of a node it quantizes)
+        slots = [u for u in readers if receiving(u)]
+        if len(slots) < 2:
             continue
+        if dq.output[0] in outputs:
+            # a graph output read by several quantized nodes: each gets its own
+            # pair and the graph output stays the float tensor (Quark's
+            # dedicated branch comes before its graph-output one)
+            raw = q.input[0]
+            for n in nodes:
+                if n is dq:
+                    continue
+                for i, x in enumerate(n.input):
+                    if x == raw:
+                        n.input[i] = dq.output[0]
+                for i, x in enumerate(n.output):
+                    if x == raw:
+                        n.output[i] = dq.output[0]
         drop.update((id(q), id(dq)))
-        for k, u in enumerate(users, 1):
+        first_slot: Dict[int, int] = {}
+        pairs: List[onnx.NodeProto] = []
+        for k, u in enumerate(slots, 1):
             qn, dqn = onnx.NodeProto(), onnx.NodeProto()
             qn.CopyFrom(q)
             dqn.CopyFrom(dq)
@@ -683,10 +732,22 @@ def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
             dqn.output[0] = f"{dq.output[0]}_{k}"
             if qn.output[0] in taken or dqn.output[0] in taken:
                 raise ValueError(f"tensor name clash while duplicating {dq.name}")
-            for i, x in enumerate(u.input):
-                if x == dq.output[0]:
-                    u.input[i] = dqn.output[0]
-            inserts.setdefault(id(u), []).extend([qn, dqn])
+            if id(u) not in first_slot:
+                first_slot[id(u)] = k
+                for i, x in enumerate(u.input):
+                    if x == dq.output[0]:
+                        u.input[i] = dqn.output[0]
+                inserts.setdefault(id(u), []).extend([qn, dqn])
+            else:
+                pairs.extend([qn, dqn])  # a second slot of the same node: unused
+        for u in users:
+            if not receiving(u):
+                for i, x in enumerate(u.input):
+                    if x == dq.output[0]:
+                        u.input[i] = q.input[0]
+        if pairs:
+            # (placed in front of the first node that reads the tensor)
+            inserts.setdefault(id(users[0]), []).extend(pairs)
     if not drop:
         return m
     final: List[onnx.NodeProto] = []
