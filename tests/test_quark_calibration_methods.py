@@ -640,10 +640,13 @@ def test_presets_carry_quarks_extra_options():
         "FoldRelu": True,
         "AlignConcat": True,
         "AlignSlice": False,
+        # the input-marking default Quark's legacy presets carry
+        "ForceQuantizeNoInputCheck": True,
     }
     a16 = qc.QConfig.get_default_config("A16W8")
     assert a16.extra_options["AlignEltwiseQuantType"] is True
     assert a16.extra_options["AlignConcat"] is True
     assert qc.QConfig.get_default_config("S16S8_ASWS").extra_options == {
-        "ActivationSymmetric": True
+        "ActivationSymmetric": True,
+        "ForceQuantizeNoInputCheck": True,
     }
