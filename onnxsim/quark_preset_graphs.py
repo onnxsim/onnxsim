@@ -29,7 +29,7 @@ re-checked against the installed ``amd-quark`` by ``tests/test_quark_parity.py``
 
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import onnx
@@ -334,6 +334,8 @@ def apply_mixed_block_format(
     include_layers: Sequence[str] = (),
     exclude_layers: Sequence[str] = (),
     dual_nodes: bool = True,
+    marking: Optional[Mapping[str, object]] = None,
+    remove_after: Optional[Iterable[str]] = None,
 ) -> onnx.ModelProto:
     """Quark's ``BF16_MIXED_<block_dtype>``: a bfloat16 fake-quantized model
     (biases left alone) whose ``Conv`` / ``ConvTranspose`` / ``Gemm`` /
@@ -352,6 +354,9 @@ def apply_mixed_block_format(
     bfloat16 pair behind the block node. ``dual_nodes=False`` (Quark's
     ``DualQuantNodes=False``, and the model its sensitivity analysis scores)
     skips the boundaries and only swaps the promoted nodes' own slots.
+    ``marking`` and ``remove_after`` select the baseline tensors with the same
+    rules as :func:`apply_fake_quant_format`; with ``marking`` the promoted graph
+    is cleaned and sorted like Quark's, including unused quantization parameters.
     """
     # Quark identifies candidate layers by node name (and misbehaves on unnamed
     # nodes); give every unnamed node a unique name so that all are promoted.
@@ -362,9 +367,21 @@ def apply_mixed_block_format(
         | {v.name for v in model.graph.output}
     )
     m = apply_fake_quant_format(
-        model, "bfloat16", exclude=exclude, quantize_all_ops=False
+        model,
+        "bfloat16",
+        exclude=exclude,
+        quantize_all_ops=False,
+        marking=marking,
+        remove_after=remove_after,
     )
     _drop_bias_quantizers(m)
+
+    def finish() -> onnx.ModelProto:
+        if marking is None:
+            return m
+        drop_unused_initializers(m)
+        return quark_sorted(m)
+
     g = m.graph
     inits = {t.name: t for t in g.initializer}
     nodes: List[onnx.NodeProto] = list(g.node)
@@ -422,7 +439,7 @@ def apply_mixed_block_format(
                 prod.name += "_Mixed"
                 promoted_tensors.add(prod.input[0])
     if not promoted_nodes:
-        return m
+        return finish()
     nodes = [
         replaced_at.get(id(n), n)
         for n in nodes
@@ -431,7 +448,7 @@ def apply_mixed_block_format(
     if not dual_nodes:  # Quark's ``DualQuantNodes=False``: the promoted slots only
         del g.node[:]
         g.node.extend(nodes)
-        return m
+        return finish()
 
     # -- dual nodes at the precision boundaries ------------------------------------
     producer = {o: n for n in nodes for o in n.output}
@@ -607,7 +624,7 @@ def apply_mixed_block_format(
         final.append(n)
     del g.node[:]
     g.node.extend(final)
-    return m
+    return finish()
 
 
 # -- Int32Bias=False (S16S16_MIXED_S8S8, VINT8) -------------------------------------
