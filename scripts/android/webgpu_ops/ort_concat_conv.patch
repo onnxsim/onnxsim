@@ -1,0 +1,474 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/concat_conv.cc b/onnxruntime/contrib_ops/webgpu/concat_conv.cc
+new file mode 100644
+index 0000000..57e6cf6
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/concat_conv.cc
+@@ -0,0 +1,71 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_supported_types.h"
++#include "core/providers/webgpu/webgpu_kernel.h"
++#include "core/providers/webgpu/nn/conv2d_mm.h"
++#include "core/providers/webgpu/nn/fuse_utils.h"
++#include "core/providers/webgpu/tensor/transpose.h"
++#include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++using onnxruntime::webgpu::ComputeContext;
++using onnxruntime::webgpu::ComputeContextBase;
++using onnxruntime::webgpu::WebGpuKernel;
++using onnxruntime::webgpu::Activation;
++using onnxruntime::webgpu::WinogradWeightCache;
++using onnxruntime::webgpu::RunConcatConv1x1;
++using onnxruntime::webgpu::GetFusedActivationAttr;
++
++// Produced by ConvActivationFusion's WebGPU rule: Concat(axis=-1) -> 1x1 Conv. Inputs: W [M, C, 1, 1], B [M], X0..Xn-1 (NHWC float).
++class NhwcConcatConv1x1 final : public WebGpuKernel {
++ public:
++  NhwcConcatConv1x1(const OpKernelInfo& info) : WebGpuKernel(info) {
++    ORT_ENFORCE(GetFusedActivationAttr(info, activation_).IsOK());
++  }
++
++  Status PrePackInternal(ComputeContextBase& context, const Tensor& tensor, int input_idx, AllocatorPtr alloc, bool& is_packed) override {
++    is_packed = false;
++    if (input_idx != 0 || tensor.Shape().NumDimensions() != 4) return Status::OK();
++    const InlinedVector<size_t> perm{2, 3, 1, 0};  // [M, C, 1, 1] -> [1, 1, C, M]
++    const auto& s = tensor.Shape();
++    TensorShape ts({s[2], s[3], s[1], s[0]});
++    hwio_ = std::make_unique<Tensor>(tensor.DataType(), ts, alloc);
++    ORT_RETURN_IF_ERROR(onnxruntime::webgpu::Transpose::DoTranspose(context, perm, tensor, *hwio_));
++    is_packed = true;
++    return Status::OK();
++  }
++
++  Status ComputeInternal(ComputeContext& context) const override {
++    ORT_ENFORCE(hwio_ != nullptr, "NhwcConcatConv1x1 needs a constant weight (prepacked).");
++    std::vector<const Tensor*> xs;
++    for (int i = 2; i < context.InputCount(); i++) xs.push_back(context.Input<Tensor>(i));
++    const auto* bias = context.Input<Tensor>(1);
++    TensorShapeVector os = xs[0]->Shape().AsShapeVector();
++    os.back() = hwio_->Shape()[3];
++    Tensor* y = context.Output(0, TensorShape(os));
++    return RunConcatConv1x1(context, activation_, xs, hwio_.get(), bias, y, &w_cache_);
++  }
++
++ private:
++  Activation activation_;
++  std::unique_ptr<Tensor> hwio_;
++  mutable WinogradWeightCache w_cache_;
++};
++
++ONNX_OPERATOR_KERNEL_EX(
++    NhwcConcatConv1x1,
++    kMSDomain,
++    1,
++    kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create())
++        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
++    NhwcConcatConv1x1);
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+index 395004d..dfde994 100644
+--- a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
++++ b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+@@ -30,6 +30,7 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, GatherBlockQuantized)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, FusedConv)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, NhwcFusedConv)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, NhwcConcatConv1x1)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, Gelu)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, LinearAttention)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MatMulBnb4)>,
+diff --git a/onnxruntime/core/graph/contrib_ops/ms_opset.h b/onnxruntime/core/graph/contrib_ops/ms_opset.h
+index accfcf2..ea23fe3 100644
+--- a/onnxruntime/core/graph/contrib_ops/ms_opset.h
++++ b/onnxruntime/core/graph/contrib_ops/ms_opset.h
+@@ -14,6 +14,7 @@ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, QLinearAveragePool);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, QLinearConv);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NhwcConv);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NhwcFusedConv);
++class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NhwcConcatConv1x1);
+ 
+ // Quantization ops
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, DequantizeLinear);
+@@ -137,6 +138,7 @@ class OpSet_Microsoft_ver1 {
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, QLinearConv)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NhwcConv)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NhwcFusedConv)>());
++    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NhwcConcatConv1x1)>());
+ 
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, DequantizeLinear)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, DequantizeBFP)>());
+diff --git a/onnxruntime/core/graph/contrib_ops/nhwc_schema_defs.cc b/onnxruntime/core/graph/contrib_ops/nhwc_schema_defs.cc
+index cb015a3..8f3b17f 100644
+--- a/onnxruntime/core/graph/contrib_ops/nhwc_schema_defs.cc
++++ b/onnxruntime/core/graph/contrib_ops/nhwc_schema_defs.cc
+@@ -423,5 +423,35 @@ NhwcFusedConv is a Conv operator with optional activation and add operators fuse
+                                   convPoolShapeInferenceNhwc(ctx, true, false, 0, 1);
+                                 }));
+ 
++
++ONNX_MS_OPERATOR_SET_SCHEMA(NhwcConcatConv1x1, 1,
++                            OpSchema()
++                                .SetDoc(R"DOC(
++A 1x1 stride-1 Conv applied to the channel-wise Concat of its variadic inputs X (channels-last), without materialising the Concat.
++Y = activation(Conv(Concat(X..., axis=-1), W, B)). W is in the ONNX filter layout [M, sum(C_i), 1, 1].
++)DOC")
++                                .Attr("auto_pad", "", AttributeProto::STRING, std::string("NOTSET"))
++                                .Attr("kernel_shape", "", AttributeProto::INTS, OPTIONAL_VALUE)
++                                .Attr("dilations", "", AttributeProto::INTS, OPTIONAL_VALUE)
++                                .Attr("strides", "", AttributeProto::INTS, OPTIONAL_VALUE)
++                                .Attr("pads", "", AttributeProto::INTS, OPTIONAL_VALUE)
++                                .Attr("group", "", AttributeProto::INT, static_cast<int64_t>(1))
++                                .Attr("activation", "", AttributeProto::STRING, OPTIONAL_VALUE)
++                                .Attr("activation_params", "", AttributeProto::FLOATS, OPTIONAL_VALUE)
++                                .Input(0, "W", "Weights [M, C, 1, 1] with C = sum of the input channel counts.", "T")
++                                .Input(1, "B", "Bias [M].", "T")
++                                .Input(2, "X", "Channels-last inputs [N, H, W, C_i].", "T", OpSchema::Variadic)
++                                .Output(0, "Y", "Output [N, H, W, M].", "T")
++                                .TypeConstraint("T", {"tensor(float16)", "tensor(float)"}, "Constrain input and output types to float tensors")
++                                .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
++                                  ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 2, 0);
++                                  if (ctx.getNumInputs() < 3 || !hasInputShape(ctx, 0) || !hasInputShape(ctx, 2)) return;
++                                  auto* out = ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
++                                  const auto& x = getInputShape(ctx, 2);
++                                  const auto& w = getInputShape(ctx, 0);
++                                  for (int i = 0; i < x.dim_size() - 1; i++) *out->add_dim() = x.dim(i);
++                                  *out->add_dim() = w.dim(0);
++                                }));
++
+ }  // namespace contrib
+ }  // namespace onnxruntime
+diff --git a/onnxruntime/core/optimizer/conv_activation_fusion.cc b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+index 2a32e7e..295deb4 100644
+--- a/onnxruntime/core/optimizer/conv_activation_fusion.cc
++++ b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+@@ -75,7 +75,7 @@ class ConvActivationSelector : public NodeSelector {
+   std::optional<NodesToOptimizeIndices> Select(const GraphViewer& graph_viewer, const Node& node) const override {
+     const std::string_view node_ep = node.GetExecutionProviderType();
+     // an NhwcFusedConv (WebGPU Conv+Add output) can still take an activation, but only one
+-    if (node.OpType() == "NhwcFusedConv" &&
++    if ((node.OpType() == "NhwcFusedConv" || node.OpType() == "NhwcConcatConv1x1") &&
+         (node_ep != kWebGpuExecutionProvider || graph_utils::GetNodeAttribute(node, "activation") != nullptr)) {
+       return std::nullopt;
+     }
+@@ -174,6 +174,59 @@ class ConvAddNhwcSelector : public NodeSelector {
+     return builder.Build();
+   }
+ };
++
++// WebGPU only (opt-in, ORT_WEBGPU_CONCAT_CONV=1): Concat(axis = last) -> 1x1 stride-1 Conv (NHWC internal domain, constant weight, with bias)
++// => com.microsoft::NhwcConcatConv1x1(W, B, X0..Xn-1), which never materialises the concat.
++class ConcatConvSelector : public NodeSelector {
++ public:
++  std::optional<NodesToOptimizeIndices> Select(const GraphViewer& graph_viewer, const Node& node) const override {
++    if (node.GetExecutionProviderType() != kWebGpuExecutionProvider) return std::nullopt;
++    static const bool enabled = [] { const char* e = std::getenv("ORT_WEBGPU_CONCAT_CONV"); return e != nullptr && e[0] == '1'; }();
++    if (!enabled) return std::nullopt;
++    const auto& defs = node.InputDefs();
++    if (defs.size() != 3 || !defs[2]->Exists() || graph_utils::GetNodeAttribute(node, "activation") != nullptr) return std::nullopt;
++    const auto* group = graph_utils::GetNodeAttribute(node, "group");
++    if (group != nullptr && group->i() != 1) return std::nullopt;
++    for (const char* a : {"strides", "dilations", "pads"}) {
++      const auto* attr = graph_utils::GetNodeAttribute(node, a);
++      if (attr != nullptr) {
++        const bool want_zero = std::string_view(a) == "pads";
++        for (int64_t v : attr->ints()) {
++          if (v != (want_zero ? 0 : 1)) return std::nullopt;
++        }
++      }
++    }
++    const auto* w = graph_viewer.GetConstantInitializer(defs[1]->Name());
++    if (w == nullptr || w->dims_size() != 4 || w->dims(2) != 1 || w->dims(3) != 1 || w->dims(0) % 4 != 0 ||
++        w->data_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
++      return std::nullopt;
++    }
++    const Node* concat = graph_viewer.GetProducerNode(defs[0]->Name());
++    if (concat == nullptr || concat->OpType() != "Concat" || concat->Domain() != kOnnxDomain ||
++        concat->GetExecutionProviderType() != kWebGpuExecutionProvider || concat->GetOutputEdgesCount() != 1 ||
++        graph_viewer.NodeProducesGraphOutput(*concat)) {
++      return std::nullopt;
++    }
++    const auto* axis = graph_utils::GetNodeAttribute(*concat, "axis");
++    if (axis == nullptr || (axis->i() != 3 && axis->i() != -1)) return std::nullopt;
++    const size_t n = concat->InputDefs().size();
++    if (n < 2 || n > 6) return std::nullopt;
++    int64_t total = 0;
++    for (const auto* in : concat->InputDefs()) {
++      const auto* shape = in->Shape();
++      if (shape == nullptr || shape->dim_size() != 4 || !utils::HasDimValue(shape->dim(3)) || shape->dim(3).dim_value() % 4 != 0 ||
++          !HasElementDataType(*in, ONNX_NAMESPACE::TensorProto_DataType_FLOAT)) {
++        return std::nullopt;
++      }
++      total += shape->dim(3).dim_value();
++    }
++    if (total != w->dims(1) || total > 8192) return std::nullopt;
++    NodesToOptimizeIndicesBuilder builder{};
++    builder.target_node = node.Index();
++    builder.input_nodes.push_back(concat->Index());
++    return builder.Build();
++  }
++};
+ }  // namespace selectors
+ #endif  // !defined(ORT_MINIMAL_BUILD)
+ 
+@@ -194,6 +247,9 @@ class FuseConvActivationAction : public ReplaceWithNew {
+       if (op_type == "NhwcConv" || op_type == "NhwcFusedConv") {
+         return "NhwcFusedConv";
+       }
++      if (op_type == "NhwcConcatConv1x1") {
++        return "NhwcConcatConv1x1";
++      }
+       if (op_type == "FusedConv") {
+         return "FusedConv";
+       }
+@@ -280,6 +336,23 @@ class FuseConvAddNhwcAction : public ReplaceWithNew {
+     };
+   }
+ };
++
++class FuseConcatConvAction : public ReplaceWithNew {
++ private:
++  std::string OpType(const RuntimeState&) const override { return "NhwcConcatConv1x1"; }
++  std::string Domain(const RuntimeState&) const override { return kMSDomain; }
++  NodeAttributes ExtraAttributes(const RuntimeState&) const override { return {}; }
++  std::vector<NodeAndMoveInfo> ValueMoves(const RuntimeState&) const override {
++    const NTO::NodeLocation conv_loc{NTO::NodeType::kTarget, 0};
++    const NTO::NodeLocation concat_loc{NTO::NodeType::kInput, 0};
++    return {
++        MoveAndAppend(conv_loc, ArgType::kInput, 1, ArgType::kInput),  // W
++        MoveAndAppend(conv_loc, ArgType::kInput, 2, ArgType::kInput),  // B
++        MoveAll(concat_loc, ArgType::kInput),                          // X0..Xn-1
++        MoveAll(conv_loc, ArgType::kOutput),
++    };
++  }
++};
+ }  // namespace actions
+ 
+ void RegisterConvActivationFusionRules(SelectorActionRegistry& registry) {
+@@ -289,9 +362,10 @@ void RegisterConvActivationFusionRules(SelectorActionRegistry& registry) {
+   const std::string msInternalNHWCDomainConv = SelectorActionRegistry::OpVersionsMapKey("Conv", kMSInternalNHWCDomain);
+   const std::string msDomainConv = SelectorActionRegistry::OpVersionsMapKey("NhwcConv", kMSDomain);
+   const std::string msDomainFusedConv = SelectorActionRegistry::OpVersionsMapKey("NhwcFusedConv", kMSDomain);
++  const std::string msDomainConcatConv = SelectorActionRegistry::OpVersionsMapKey("NhwcConcatConv1x1", kMSDomain);
+   auto selector = std::make_unique<selectors::ConvActivationSelector>();
+ 
+-  registry.RegisterSelectorAndAction(name, {{"Conv", {1, 11, 22}}, {msInternalNHWCDomainConv, {1, 11, 22}}, {msDomainConv, {1}}, {msDomainFusedConv, {1}}},
++  registry.RegisterSelectorAndAction(name, {{"Conv", {1, 11, 22}}, {msInternalNHWCDomainConv, {1, 11, 22}}, {msDomainConv, {1}}, {msDomainFusedConv, {1}}, {msDomainConcatConv, {1}}},
+                                      std::move(selector), std::move(action));
+ #else
+   registry.RegisterAction(name, std::move(action));
+@@ -309,8 +383,20 @@ void RegisterConvAddNhwcFusionRules(SelectorActionRegistry& registry) {
+ #endif
+ }
+ 
++void RegisterConcatConvFusionRules(SelectorActionRegistry& registry) {
++  auto action = std::make_unique<actions::FuseConcatConvAction>();
++#if !defined(ORT_MINIMAL_BUILD)
++  const std::string msInternalNHWCDomainConv = SelectorActionRegistry::OpVersionsMapKey("Conv", kMSInternalNHWCDomain);
++  auto selector = std::make_unique<selectors::ConcatConvSelector>();
++  registry.RegisterSelectorAndAction("ConcatConv", {{msInternalNHWCDomainConv, {1, 11, 22}}}, std::move(selector), std::move(action));
++#else
++  registry.RegisterAction("ConcatConv", std::move(action));
++#endif
++}
++
+ SelectorActionRegistry CreateSelectorActionRegistry() {
+   SelectorActionRegistry registry{};
++  RegisterConcatConvFusionRules(registry);
+   RegisterConvActivationFusionRules(registry);
+   RegisterConvAddNhwcFusionRules(registry);
+   return registry;
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+index 168681b..6b3a7de 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+@@ -990,3 +990,144 @@ Status TryApplyDepthwiseConv(ComputeContext& context, const Activation& activati
+ 
+ }  // namespace webgpu
+ }  // namespace onnxruntime
++
++namespace onnxruntime {
++namespace webgpu {
++
++Status ConvConcatTexProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  std::vector<const ShaderVariableHelper*> xs;
++  for (uint32_t i = 0; i < n_inputs_; i++) xs.push_back(&shader.AddInput("x" + std::to_string(i), ShaderUsage::UseUniform));
++  const ShaderVariableHelper* bias = has_bias_ ? &shader.AddInput("bias", ShaderUsage::UseUniform) : nullptr;
++  const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform);
++  const int tex_binding = static_cast<int>(n_inputs_) + (has_bias_ ? 1 : 0) + 1 + 1;
++  shader.AdditionalImplementation() << "@group(0) @binding(" << tex_binding << ") var wtex : texture_2d<f32>;\n";
++  auto& b = shader.MainFunctionBody();
++  b << "  let logical_workgroup_id_z = workgroup_idx / (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y);\n"
++    << "  let logical_workgroup_id_y = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) / uniforms.logical_dispatch_x;\n"
++    << "  let logical_workgroup_id_x = (workgroup_idx % (uniforms.logical_dispatch_x * uniforms.logical_dispatch_y)) % uniforms.logical_dispatch_x;\n"
++    << "  let logical_workgroup_id = vec3u(logical_workgroup_id_x, logical_workgroup_id_y, logical_workgroup_id_z);\n"
++    << "  const workgroupSize = vec3u(workgroup_size_x, workgroup_size_y, workgroup_size_z);\n"
++    << "  let logical_global_id = logical_workgroup_id * workgroupSize + local_id;\n"
++    << "  let col0 = logical_global_id.y * " << nv_ << "u;\n  let p0 = logical_global_id.x * " << tm_ << "u;\n";
++  for (uint32_t m = 0; m < tm_; m++)
++    b << "  let pv" << m << " = p0 + " << m << "u < uniforms.npix;\n  let pp" << m << " = min(p0 + " << m << "u, uniforms.npix - 1u);\n";
++  for (uint32_t m = 0; m < tm_; m++)
++    for (uint32_t j = 0; j < 4 * nv_; j++) b << "  var c" << m << "_" << j << " = 0.0;\n";
++  b << "  if (col0 < uniforms.co4) {\n";
++  for (uint32_t i = 0; i < n_inputs_; i++) {
++    const std::string c4i = GetElementAt("uniforms.c4s", std::to_string(i), static_cast<int>(n_inputs_));
++    // rows of this input in the weight texture start at the sum of the previous inputs' channels
++    std::string rowstart = "0u";
++    for (uint32_t k = 0; k < i; k++) rowstart += " + 4u * " + GetElementAt("uniforms.c4s", std::to_string(k), static_cast<int>(n_inputs_));
++    b << "    for (var ci = 0u; ci < " << c4i << "; ci++) {\n";
++    for (uint32_t m = 0; m < tm_; m++) b << "      let a" << m << " = " << xs[i]->GetByOffset("pp" + std::to_string(m) + " * " + c4i + " + ci") << ";\n";
++    for (int kk = 0; kk < 4; kk++) {
++      for (uint32_t n = 0; n < nv_; n++)
++        b << "      let w" << kk << "_" << n << " = textureLoad(wtex, vec2<i32>(i32(min(col0 + " << n << "u, uniforms.co4 - 1u)), i32(" << rowstart << " + ci * 4u + " << kk << "u)), 0);\n";
++      for (uint32_t m = 0; m < tm_; m++)
++        for (uint32_t n = 0; n < nv_; n++)
++          for (int j = 0; j < 4; j++)
++            b << "      c" << m << "_" << n * 4 + j << " = fma(a" << m << "[" << kk << "], w" << kk << "_" << n << "[" << j << "], c" << m << "_" << n * 4 + j << ");\n";
++    }
++    b << "    }\n";
++  }
++  b << "  }\n";
++  const std::string act = GetActivationSnippet(activation_, "vec4<f32>", "f32");
++  for (uint32_t m = 0; m < tm_; m++)
++    for (uint32_t n = 0; n < nv_; n++) {
++      b << "  if (pv" << m << " && col0 + " << n << "u < uniforms.co4) {\n    var value = vec4<f32>(c" << m << "_" << n * 4 << ", c" << m << "_" << n * 4 + 1 << ", c" << m << "_" << n * 4 + 2 << ", c" << m << "_" << n * 4 + 3 << ");\n";
++      if (bias) b << "    value = value + " << bias->GetByOffset("col0 + " + std::to_string(n) + "u") << ";\n";
++      b << "    " << act << "\n    " << y.SetByOffset("pp" + std::to_string(m) + " * uniforms.co4 + col0 + " + std::to_string(n) + "u", "value") << "\n  }\n";
++    }
++  return Status::OK();
++}
++
++Status RunConcatConv1x1(ComputeContext& context, const Activation& activation, const std::vector<const Tensor*>& inputs, const Tensor* hwio, const Tensor* bias,
++                        Tensor* output, WinogradWeightCache* w_cache) {
++  static const auto env = [](const char* n, uint32_t d) { const char* e = std::getenv(n); return e ? static_cast<uint32_t>(std::atoi(e)) : d; };
++  static const uint32_t tm_def = env("ORT_WEBGPU_CONCATCONV_TM", 2), nv_def = env("ORT_WEBGPU_CONCATCONV_NV", 2), wx_def = env("ORT_WEBGPU_CONCATCONV_WX", 32), wy_def = env("ORT_WEBGPU_CONCATCONV_WY", 2);
++  static const int64_t f32_min_k = env("ORT_WEBGPU_TEXDIRECT_F32_MINK", 1024);
++  const auto& hs = hwio->Shape();  // [1,1,K,Cout]
++  const int64_t rows = hs[2], cout = hs[3];
++  uint32_t tm = tm_def, nv = nv_def, wx = wx_def, wy = wy_def;
++  {
++    // optional per-shape table ORT_WEBGPU_CONCATCONV_TABLE="cin:cout:ow=tm,nv,wx,wy;..." (pixels always along x)
++    static const std::string table = [] { const char* e = std::getenv("ORT_WEBGPU_CONCATCONV_TABLE"); return std::string(e ? e : ""); }();
++    if (!table.empty()) {
++      const std::string key = std::to_string(rows) + ":" + std::to_string(cout) + ":" + std::to_string(output->Shape()[2]);
++      size_t pos = 0;
++      while (pos < table.size()) {
++        size_t end = table.find(';', pos);
++        if (end == std::string::npos) end = table.size();
++        const std::string ent = table.substr(pos, end - pos);
++        pos = end + 1;
++        const size_t eq = ent.find('=');
++        if (eq == std::string::npos || ent.substr(0, eq) != key) continue;
++        unsigned a, b2, c, d;
++        if (std::sscanf(ent.c_str() + eq + 1, "%u,%u,%u,%u", &a, &b2, &c, &d) == 4) {
++          tm = a;
++          nv = b2;
++          wx = c;
++          wy = d;
++        }
++        break;
++      }
++    }
++    if (std::getenv("ORT_WEBGPU_CONCATCONV_LOG") != nullptr) {
++      std::fprintf(stderr, "CONCATCONV %lld:%lld:%lld\n", static_cast<long long>(rows), static_cast<long long>(cout), static_cast<long long>(output->Shape()[2]));
++    }
++  }
++  const uint32_t co4 = static_cast<uint32_t>(cout / 4);
++  const auto& os = output->Shape();
++  const uint32_t npix = static_cast<uint32_t>(os.Size() / cout);
++  const bool f32w = rows >= f32_min_k;
++  const wgpu::TextureFormat wfmt = f32w ? wgpu::TextureFormat::RGBA32Float : wgpu::TextureFormat::RGBA16Float;
++  auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
++  const auto M = ProgramTensorMetadataDependency::TypeAndRank;
++  auto red = [](const TensorShape& s) {
++    TensorShapeVector d = s.AsShapeVector();
++    d.back() /= 4;
++    return TensorShape(d);
++  };
++  wgpu::Texture tex_local;
++  wgpu::TextureView view;
++  if (w_cache && w_cache->valid) {
++    view = w_cache->view;
++  } else {
++    wgpu::TextureDescriptor td{};
++    td.size = {co4, static_cast<uint32_t>(rows), 1};
++    td.format = wfmt;
++    td.usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
++    tex_local = context.Device().CreateTexture(&td);
++    view = tex_local.CreateView();
++    ConvTexDirectProgram p0(0, activation, false, false, tm, nv, false, f32w);
++    Tensor dummy = context.CreateGPUTensor(hwio->DataType(), TensorShape({4}));
++    const uint32_t total = static_cast<uint32_t>(rows) * co4;
++    p0.AddInput({hwio, M, red(hs), 4}).AddOutput({&dummy, M, TensorShape({1}), 4})
++        .SetExtraTexture(view.Get(), static_cast<WGPUTextureFormat>(wfmt), true)
++        .CacheHint(f32w ? "w32" : "w").SetDispatchGroupSize(ceil_div(total, 64))
++        .AddUniformVariables({{total}, {0u}, {0u}, {static_cast<uint32_t>(rows / 4)}, {co4}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {1u}, {1u}, {1u}});
++    ORT_RETURN_IF_ERROR(context.RunProgram(p0));
++    if (w_cache) {
++      w_cache->tex = tex_local;
++      w_cache->view = view;
++      w_cache->valid = true;
++    }
++  }
++  std::vector<uint32_t> c4s;
++  for (const auto* x : inputs) c4s.push_back(static_cast<uint32_t>(x->Shape()[x->Shape().NumDimensions() - 1] / 4));
++  const uint32_t gx = ceil_div(npix, tm * wx), gy = ceil_div(ceil_div(co4, nv), wy);
++  ConvConcatTexProgram p(activation, bias != nullptr, static_cast<uint32_t>(inputs.size()), tm, nv);
++  for (const auto* x : inputs) p.AddInput({x, M, red(x->Shape()), 4});
++  if (bias) p.AddInput({bias, M, red(bias->Shape()), 4});
++  p.AddOutput({output, M, red(os), 4})
++      .SetExtraTexture(view.Get(), static_cast<WGPUTextureFormat>(wfmt), false)
++      .CacheHint(activation.ToString(), std::to_string(inputs.size()) + "," + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy) + "," + std::to_string(f32w), bias != nullptr)
++      .SetDispatchGroupSize(gx, gy, 1)
++      .SetWorkgroupSize(wx, wy, 1)
++      .AddUniformVariables({{npix}, {co4}, gsl::span<const uint32_t>(c4s.data(), c4s.size()), {0u}, {gx}, {gy}, {1u}});
++  return context.RunProgram(p);
++}
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+index 7b81448..152c135 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+@@ -194,5 +194,31 @@ Status TryApplyDepthwiseConv(ComputeContext& context, const Activation& activati
+                              const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations,
+                              Tensor* output, bool& applied);
+ 
++
++// 1x1 stride-1 conv over the channel-concat of several NHWC vec4 inputs (the concat is never materialised); weights in an RGBA16F/RGBA32F texture.
++class ConvConcatTexProgram final : public Program<ConvConcatTexProgram> {
++ public:
++  ConvConcatTexProgram(const Activation& activation, bool has_bias, uint32_t n_inputs, uint32_t tm, uint32_t nv)
++      : Program("ConvConcatTex"), activation_(activation), has_bias_(has_bias), n_inputs_(n_inputs), tm_(tm), nv_(nv) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"npix", ProgramUniformVariableDataType::Uint32},
++      {"co4", ProgramUniformVariableDataType::Uint32},
++      {"c4s", ProgramUniformVariableDataType::Uint32},
++      {"rows0", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_x", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_y", ProgramUniformVariableDataType::Uint32},
++      {"logical_dispatch_z", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  const Activation& activation_;
++  bool has_bias_;
++  uint32_t n_inputs_, tm_, nv_;
++};
++
++// inputs: NHWC float tensors whose channel counts are multiples of 4; hwio: [1,1,sum(C),Cout] weights (buffer). Creates/reuses the weight texture in `w_cache`.
++Status RunConcatConv1x1(ComputeContext& context, const Activation& activation, const std::vector<const Tensor*>& inputs, const Tensor* hwio, const Tensor* bias,
++                        Tensor* output, WinogradWeightCache* w_cache);
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime
