@@ -461,6 +461,9 @@ def quantize_full_qdq(
     float_clamp_input: bool = False,
     contrib_ops: Iterable[str] = (),
     keep_constants: Union[bool, Iterable[str]] = False,
+    fake_weight_dtype: Optional[str] = None,
+    fake_weight_attributes: Optional[Dict[str, Dict[str, object]]] = None,
+    fake_int32_bias: bool = False,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -980,8 +983,51 @@ def quantize_full_qdq(
     act_nodes: List[onnx.NodeProto] = []
     rename: Dict[str, str] = {}
     shared_init_names: Dict[str, Tuple[str, str]] = {}
+    fake_roots: Dict[str, str] = {}
+    fake_axes: Dict[str, int] = {}
+    if fake_weight_dtype is not None:
+        from onnxsim.quark_fakequant_graph import _Plan, _refine_axes
+
+        plan = _Plan(m)
+        fake_axes = _refine_axes(m, floats, inits)
+        plan.skipped = skip_set | exclude_nodes
+        marked = list(acts) + [
+            x for n in qnodes for x in n.input if x in inits and x in floats
+        ]
+        fake_roots = {
+            t: root
+            for t, root in plan.share_roots(m, marked, {"op_types": op_types}).items()
+            if root in inits
+        }
     for a in acts:
         if a not in qp:
+            continue
+        if a in fake_roots:
+            from onnxsim.quark_fakequant_graph import (
+                HALF_DTYPES,
+                _make_half_pair,
+                _make_node,
+            )
+
+            source = a + "/f"
+            rename[a] = source
+            if fake_weight_dtype in HALF_DTYPES:
+                pair, extra = _make_half_pair(
+                    fake_weight_dtype, source, a, a, fake_roots[a]
+                )
+                act_nodes.extend(pair)
+                new_inits.extend(extra)
+            else:
+                act_nodes.append(
+                    _make_node(
+                        fake_weight_dtype,
+                        source,
+                        a,
+                        1,
+                        a + "/DQ",
+                        fake_weight_attributes,
+                    )
+                )
             continue
         s, zp = qp[a]
         dom = domain_of(qdt[a])
@@ -1101,12 +1147,52 @@ def quantize_full_qdq(
         lo, hi = _REDUCED_RANGES[dt] if reduce_range else _DTYPES[dt][2:]
         return int(lo), int(hi)
 
+    fake_cache: Dict[str, str] = {}
+
+    def fake_constant(x: str) -> str:
+        from onnxsim.quark_fakequant_graph import (
+            COP_DOMAIN,
+            HALF_DTYPES,
+            _make_half_pair,
+            _make_node,
+        )
+
+        if x in fake_cache:
+            return fake_cache[x]
+        assert fake_weight_dtype is not None
+        base = fresh(x)
+        out = base + "/dq"
+        if fake_weight_dtype in HALF_DTYPES:
+            nodes, extra = _make_half_pair(fake_weight_dtype, x, out, x)
+            act_nodes.extend(nodes)
+            new_inits.extend(extra)
+            # The bias path identifies the weight's scale by its DQ output.
+            if fake_int32_bias:
+                add_init(base + "/scale", np.array(1.0, np.float32))
+        else:
+            act_nodes.append(
+                _make_node(
+                    fake_weight_dtype,
+                    x,
+                    out,
+                    fake_axes[x],
+                    base + "/DQ",
+                    fake_weight_attributes,
+                )
+            )
+        if not any(o.domain == COP_DOMAIN for o in m.opset_import):
+            m.opset_import.append(helper.make_opsetid(COP_DOMAIN, 1))
+        fake_cache[x] = out
+        return out
+
     def int8_tensor_dq(x: str, w: np.ndarray, per_row: bool = False) -> str:
         """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
         constant ``x``; returns the DQ output name. With asymmetric (or uint8)
         weights it is the weights' grid instead (Quark treats these constants
         as weights). ``per_row``: one scale per index of axis 0 instead (Quark's
         per-channel mode for a bias or a PReLU slope)."""
+        if fake_weight_dtype is not None:
+            return fake_constant(x)
         if per_row and w.ndim >= 1 and w.shape[0] > 1:
             qm = w_range("int8")[1]
             rows = w.reshape(w.shape[0], -1)
@@ -1291,6 +1377,14 @@ def quantize_full_qdq(
             ):
                 continue
             w = numpy_helper.to_array(inits[x]).astype(np.float32)
+            if fake_weight_dtype is not None and not (
+                fake_int32_bias
+                and k == 2
+                and n.op_type
+                in ("Conv", "ConvTranspose", "Gemm", "InstanceNormalization")
+            ):
+                n.input[k] = fake_constant(x)
+                continue
             if n.op_type in _WEIGHT_AXIS_OPS and k == 1:
                 axis = _weight_axis(n, w.ndim) if per_channel else None
                 key = ("w", x, axis)
