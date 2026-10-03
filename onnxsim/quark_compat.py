@@ -1623,7 +1623,13 @@ class ModelQuantizer:
                     f"({act.dtype}/{wt.dtype}); pass ignore_unsupported_algos=True "
                     "to quantize without it"
                 )
-            result = self._quantize_block(model_input, act, wt)
+            result = (
+                self._quantize_block(model_input, act, wt)
+                if act.dtype in _FAKEQUANT_DTYPES
+                else self._quantize_int(
+                    model_input, act, wt, calibration_data_reader, []
+                )
+            )
         else:
             result = self._quantize_int(
                 model_input, act, wt, calibration_data_reader, runnable
@@ -2554,6 +2560,8 @@ class ModelQuantizer:
         ``Int32Bias=False`` asks for (a bias quantized like a weight, in the
         weight's dtype); ``None`` when biases stay int32."""
         opts = self.config.extra_options
+        if wt.dtype in _FAKEQUANT_DTYPES:
+            return None
         if opts.get("Int32Bias", True) is not False or not opts.get(
             "QuantizeBias", True
         ):
@@ -2838,7 +2846,10 @@ class ModelQuantizer:
     ) -> onnx.ModelProto:
         from onnxsim.full_qdq import quantize_full_qdq
 
-        if wt.dtype not in ("int8", "uint8", "int16"):
+        if (
+            wt.dtype not in ("int8", "uint8", "int16")
+            and wt.dtype not in _FAKEQUANT_DTYPES
+        ):
             raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
         # GPTQ and the legacy AdaQuant engine work on int8 weight codes (Quark's
         # GPTQ ignores the preset's weight dtype and emits an 8-bit grid; its
@@ -3037,6 +3048,12 @@ class ModelQuantizer:
         cal_size = int(opts.get("CalibDataSize") or 0)
         act_sym = bool(opts.get("ActivationSymmetric", act.symmetric))
         qkw: Dict[str, Any] = dict(
+            fake_weight_dtype=wt.dtype if wt.dtype in _FAKEQUANT_DTYPES else None,
+            fake_weight_attributes=self._block_attr_overrides(act, wt)
+            if wt.dtype in _FAKEQUANT_DTYPES
+            else None,
+            fake_int32_bias=bool(opts.get("Int32Bias", False))
+            and wt.dtype in ("float16", "bfloat16"),
             quark_fp16=getattr(self, "_quantize_fp16", False),
             keep_constants=True if self._keeps_constants() else converted_constants,
             calibration_data=calibration[:cal_size] if cal_size else calibration,
