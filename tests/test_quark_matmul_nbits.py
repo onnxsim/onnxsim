@@ -533,6 +533,9 @@ def test_preset_exclude_bits_and_matmul_add_note():
         "h = MatMul(x, w1)\n y = Add(h, b)", [("w1", (64, 16)), ("b", (16,))]
     )
     cfg = qc.QConfig.get_default_config("MATMUL_NBITS")
+    # (without ONNX Runtime's optimizer here nothing fuses the pair; with it, the
+    # Gemm is left alone as in Quark: tests/test_quark_block_preproc_parity.py)
+    cfg.extra_options["UseRuntimeOptimizers"] = False
     with pytest.warns(UserWarning, match="Gemm"):
         qc.ModelQuantizer(cfg).quantize_model(
             model, calibration_data_reader=[{"x": np.zeros((3, 64), np.float32)}]
