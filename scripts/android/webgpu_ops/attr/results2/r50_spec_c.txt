@@ -1,0 +1,4 @@
+T_s2_3x3|cls=Conv T 3x3
+stem7x7|cls=Conv S
+all_ops_standin|op=Conv,op=NhwcFusedConv,op=MaxPool,op=Gemm,op=Transpose,op=GlobalAveragePool
+all_conv_only|op=Conv,op=NhwcFusedConv

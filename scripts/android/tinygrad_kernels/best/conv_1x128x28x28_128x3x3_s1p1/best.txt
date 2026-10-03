@@ -1,0 +1,4 @@
+backend vulkan
+best t173 166.5 GFLOPS
+opts [Opt(op=OptOps.LOCAL, axis=0, arg=32), Opt(op=OptOps.UPCAST, axis=2, arg=7), Opt(op=OptOps.UPCAST, axis=2, arg=0), Opt(op=OptOps.UNROLL, axis=2, arg=0), Opt(op=OptOps.LOCAL, axis=1, arg=2)]
+rounds default=88.7 t2=102.1 t37=98.9 t69=100.6 t157=131.3 t173=166.5

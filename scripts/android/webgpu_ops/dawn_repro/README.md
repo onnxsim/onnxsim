@@ -35,8 +35,19 @@ Build each like `harness.cc`; run on the phone under `phone-run`.
 
 - `peak.cc` -- FMA throughput: `peak f32|f16 WORKGROUPS ITERS [VEC CHAINS WG]` (986 GFLOPS fp32 at 64 scalar chains).
 - `bw.cc` -- vec4 load bandwidth: `bw buf|tex|lds WORKING_SET_KB ITERS` (buffer ~163 GB/s, texture ~240, workgroup memory 200-277).
-- `gemm.cc` -- GEMM design variants: `gemm sh|reg|sc|tx|tt|nc4 M N K REPS [TM NV WX WY]`; `RB=off VMM=1` mirror ORT's Dawn toggles.
+- `gemm.cc` -- GEMM design variants: `gemm sh|reg|sc|p16|sg|tx|tt|nc4 M N K REPS [TM NV WX WY]`; `RB=off VMM=1` mirror ORT's Dawn toggles.
   `sh` shared-memory tiles (ORT's design), `reg`/`sc` register tiles with vec4/scalar accumulators, `tx`/`tt` A (and B) through
-  textures, `nc4` NC4HW4-style coalesced layout. REPS>1 keeps the whole GPU busy (throughput); REPS=1 is one real layer's latency.
+  textures, `nc4` NC4HW4-style coalesced layout, `p16` A/B stored as packed f16 (unpacked to f32, f32 accumulate), `sg` `p16` with A shared across a row group through `subgroupShuffle`. REPS>1 keeps the whole GPU busy (throughput); REPS=1 is one real layer's latency.
 - `chain.cc` -- dispatch overhead: `chain dep|ind N ELEMS [PASSES SUBMIT_EVERY]` (a dependent 4096-element dispatch costs ~6 us
   of GPU time and ~2 us of CPU in Dawn directly).
+- `conv_alt.cc` -- Winograd F(2,3) vs direct register-tile 3x3 conv, and depthwise 3x3 variants: `conv_alt conv|dw C H` (see `../../WEBGPU_SURVEY.md`).
+- `conv_s2.cc` -- 3x3 stride-2 pad-1 NHWC conv (ResNet-50 v1.5 downsampling): direct implicit GEMM vs a polyphase hybrid Winograd (25 mults per 2x2 output tile instead of 36): `conv_s2 C H`.
+- `conv_f16io.cc` -- whole-conv packed-f16 path (f16 activations + weights, f32 accumulate, bias+ReLU, packed f16 out) vs the f32 register tile on ResNet 1x1/3x3 shapes, plus a 10-layer error-accumulation chain: `conv_f16io pw Cin Cout H | c3 C H | chain C H L`. Build like `conv_alt.cc`.
+- `cl_vs_wg.cc` -- the same microbenchmarks in **OpenCL** (libOpenCL.so loaded with dlopen, Khronos headers only): `cl_vs_wg info|warm S|peak|bw|gemm|conv|hint|hold S`.
+  FMA peak (float/half/half2/half4), load bandwidth (buffer float4/half4/half8, image2d RGBA32F/RGBA16F), register-tile GEMM and direct 3x3 conv in
+  buffer/image and f32/f16 variants, the `cl_qcom_perf_hint` experiment. Compare with `peak`, `bw`, `gemm`, `conv_alt` in the same session (see `../../WEBGPU_SURVEY.md`).
+- `layouts.cc` -- memory-layout study for conv/GEMM (activation: NHWC / NC4HW4 / 4x4-tiled / textures / packed f16; weights: HWIO / output-blocked / vec4-over-k dot / textures / packed f16; column- vs pixel-major thread map) with an interleaved head-to-head phase: `layouts conv KH Cin Cout H | pad | xform`. Raw output: `layouts_results.txt`.
+- `int8.cc` -- int8 study: `int8 info | peak dot|unp|emu|f32 | gemm dot|unp|emu|f8 M N K REPS [TM NV WX WY]` (K % 16 == 0). `dot` = `dot4I8Packed`, `unp` = `dot(unpack4xI8, unpack4xI8)`, `emu` = extractBits multiply-add, `f8` = int8 storage with f32 arithmetic;
+  i32/f32 accumulators, per-channel requantize epilogue to packed int8, exact CPU integer reference. `vk_int8_query.cc` lists the Vulkan int8 / dot-product extensions and features of the device. Results in `../../WEBGPU_SURVEY.md`.
+- `conv_tex_direct.cc` -- direct 3x3 / 1x1 convs with textures for the shapes where ORT's Winograd is off (YOLO11n low-channel high-resolution and stride-2 convs): a replica of ORT's Conv2dMM shader (`A`) vs register-tile direct convs with buffer or RGBA16F/RGBA32F texture weights and activations (`R`, `W16`, `W32`, `B16`, `B32`, `B16o`) and a tinygrad-style kernel (`D`), ABAB-interleaved, plus the buffer->texture conversion cost: `conv_tex_direct list | run IDX [ROUNDS] | conv KS STRIDE CIN COUT H [ROUNDS]` (`WARM=seconds`). Raw output of all 19 shapes: `conv_tex_direct_results.txt`.
+

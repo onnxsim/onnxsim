@@ -358,3 +358,1164 @@ SAM-L0 decoder 65.1 -> 58.1 (-11%), RT-DETR `pre` 396.9 -> 373.1 (-6%). YOLO11n 
 2x upsample) nodes, which the EP explicitly keeps out of NHWC (`ShouldConvertDataLayoutForOp`, kernels commented out). An NHWC Resize is
 feasible (the nearest path is already axis-generic; the bilinear/trilinear/cubic paths hard-code the last two axes as spatial, so they would
 need a transposing fallback) and would remove those 4 Transposes (~1.2 ms of GPU time, an estimated 1-2%); not done.
+
+## Winograd and depthwise microbenchmarks (2026-10-01)
+
+`dawn_repro/conv_alt.cc` (`conv_alt conv C H`, `conv_alt dw C H`; Dawn toggles like ORT: robustness off, Vulkan memory model) compares, per
+ResNet-50 3x3 shape (batch 1, NHWC, fp32, all 0.231 GFLOP), a **direct** conv (implicit GEMM with the `sc` scalar-accumulator register-tile
+design, 3x3 gather in the A load) against **Winograd F(2,3)** (input transform -> 16 batched register-tile GEMMs -> output transform;
+weights are transformed offline, 16/9 of the weight memory). Each is swept over 7 (TM, NV, workgroup) configs; the best is shown. Whole
+sequences run back to back (10 per submission, best of 10); outputs match a double-precision CPU reference (max relative error <= 2e-6 for both).
+Two full runs, ms (GFLOPS-equivalent = direct-conv FLOPs / time):
+
+| layer | direct, run 1 / run 2 | Winograd, run 1 / run 2 | Winograd / direct time |
+|---|---|---|---|
+| 64ch @ 56x56 | 1.34 / 1.26 ms (172 / 183) | 1.01 / 0.87 (229 / 265) | 0.75 / 0.69 |
+| 128ch @ 28x28 | 1.36 / 1.42 (170 / 162) | 1.17 / 0.72 (198 / 319) | 0.86 / 0.51 |
+| 256ch @ 14x14 | 1.49 / 1.40 (155 / 165) | 1.06 / 0.75 (218 / 309) | 0.71 / 0.53 |
+| 512ch @ 7x7 | 1.91 / 1.86 (121 / 125) | 0.91 / 0.82 (254 / 283) | 0.48 / 0.44 |
+
+- **Winograd wins on every ResNet 3x3 shape**, by 1.15-2.3x depending on the shape (run-to-run noise on the phone is large, ~20-40% on the
+  28x28 and 14x14 rows, so quote ranges, not points); it wins most on the small, channel-heavy late layers (7x7: ~2.2x) where the direct
+  kernel has few rows to tile. The GEMM dominates (0.58-0.84 ms); the transforms cost 0.03-0.16 ms each (largest at 56x56).
+- Its batched GEMMs run at only 137-177 GFLOPS on the reduced work (K = Cin is short, 16 small dispatches per layer), well below the 255-282
+  of the large standalone GEMMs, so tuning the GEMM stage further (larger tiles, fewer z-slices per workgroup) has headroom.
+- The direct implicit-GEMM conv reaches 121-183 GFLOPS, below the 255 of the same tile as a plain GEMM: the gather (per-row validity, base
+  index per tap) costs ~30%.
+- Not measured: fusing the transforms with neighbouring ops (input transform into the previous layer's epilogue, output transform +
+  bias/activation/residual), which is where a real Winograd Conv would recover more; F(4,3) (fewer multiplies but larger transforms and
+  worse fp32 conditioning); f16.
+
+**Depthwise 3x3** (YOLO-like: 64@160, 128@80, 256@40, 512@20, NHWC), naive ORT-style (one scalar output per thread, 9 bounds-checked loads)
+vs vec4-channel kernels producing 1/2/4/8 adjacent x-pixels per thread from one shared input window:
+
+| shape | traffic floor at 163 GB/s | naive | vec4, 1 px | vec4, 2 px | vec4, 4 px | vec4, 8 px |
+|---|---|---|---|---|---|---|
+| 64ch @ 160 | 0.08 ms | 2.18 ms | 1.97 | 1.15 | **0.93** | 1.15 |
+| 128ch @ 80 | 0.04 | 1.23 | 0.93 | 0.59 | **0.45** | 0.56 |
+| 256ch @ 40 | 0.02 | 0.61 | 0.54 | 0.35 | **0.25** | 0.26 |
+| 512ch @ 20 | 0.01 | 0.27 | 0.26 | 0.17 | **0.13** | 0.14 |
+
+The 4-pixel vec4 kernel is 2.0-2.4x faster than the naive one on all four shapes (correct to 1e-7). It still moves only 12-15 GB/s, ~10x under
+the buffer-bandwidth ceiling and ~10x over the traffic floor, so depthwise is latency/issue-bound (27 dependent-ish loads per thread) rather than
+bandwidth-bound; the obvious next steps (wider workgroups, staging the window through workgroup memory, f16 storage) were not tried. Depthwise
+convs are ~10% of YOLO11n's GPU time, so even a 2x kernel is worth ~5% there. These are standalone kernels, not integrated into ORT.
+
+## Register-tile GEMM vs ORT's shared-memory design, f16 storage, subgroups (Adreno 730, 2026-10-01)
+
+Standalone GEMM microbenchmark (`dawn_repro/gemm.cc`, Dawn toggles `RB=off VMM=1` like ORT, best of 3 runs, warm GPU, ResNet-50 GEMM shapes).
+`sh` = ORT's shared-memory tile design (TM=4, 8x8 workgroup); `sc` = register tile, scalar accumulators (TM=8, NV=2, 8x8 outputs per thread);
+`p16` = same register tile with A/B stored as packed f16 (one vec4<u32> load = 8 values, unpacked to f32, f32 accumulate; TM=4, NV=2).
+
+First session (GPU cold-clean, phone otherwise idle), GFLOPS:
+
+| M x N x K | `sh` (ORT design) | `sc` TM=8 NV=2 (best wg) |
+|---|---|---|
+| 784x512x128 | 174 | 282 |
+| 3136x256x64 | 161 | 273 |
+| 784x128x1152 | 177 | 255 |
+| 196x256x2304 | 155 | 224 |
+| 196x1024x256 | 162 | 249 |
+| 49x512x4608 | 132 | 211 |
+
+`sc` beats the ORT design by 1.4-1.7x on every shape (fp32 storage, so it is a like-for-like comparison). The best workgroup shape varies
+per shape (784x128x1152: 16x4 = 255, 32x4 = 141), so a per-shape choice matters.
+
+Second session, run back to back (the phone was shared with tuning jobs and ran ~30-40% slower in absolute terms, so compare only within this table):
+
+| M x N x K | `sh` | `sc` TM=8 NV=2 | `p16` TM=4 NV=2 (best wg) | `sg` (subgroup shuffle) |
+|---|---|---|---|---|
+| 784x512x128 | 111 | 135 | **180** | 2 |
+| 3136x256x64 | 109 | 134 | **179** | n/a (K%128) |
+| 784x128x1152 | 92 | 123 | **178** | 15 (wrong) |
+| 196x256x2304 | 114 | 119 | **182** | 20 (wrong) |
+| 196x1024x256 | 88 | 136 | **195** | 4 (wrong) |
+| 49x512x4608 | 86 | 131 | **150** | 21 (wrong) |
+
+- **f16 storage helps**: `p16` is 1.15-1.5x faster than the fp32 register tile and 1.6-2.0x faster than the ORT-style tile, and the register footprint
+  drops so TM=4 NV=2 (not TM=8) is the best tile. Errors are at f16-rounded-input level (reference uses the rounded inputs; max abs error 2e-7..1e-5).
+  It halves weight/activation traffic, which is the bottleneck, but it needs f16 activations and weights in memory (conversion passes, or an f16 graph),
+  and an earlier run of a peak-f16-arithmetic kernel was slower than f32 -- only the *storage* is what wins.
+- **Subgroups do not help**: the adapter exposes `Subgroups`, but the `sg` variant (lane l loads one A vec4 and the row group shuffles it with
+  `subgroupShuffle`) runs 8-90x slower than `p16` and fails validation on 5 of 6 shapes (wrong when the workgroup x-extent does not line up
+  with the hardware subgroup / control flow is not uniform enough). The Adreno shuffle path is not a substitute for the A broadcast the cache already does.
+
+## Register-tile Conv2dMM inside ORT (negative result)
+
+`webgpu_ops/ort_conv2d_regtile_experiment.patch` (on ORT `125ea21` + the base patch stack) adds an opt-in Conv2dMM main loop:
+8 output pixels x 8 output channels per thread (64 scalar accumulators, workgroup 16x4, no workgroup memory), with the
+im2col address math hoisted out of the channel loop. It is correct (ResNet-50 logits match the CPU to 5.6e-7) but slower
+than ORT's shared-memory tile, although the same design is 1.4-1.7x faster as a standalone GEMM (see the GEMM section above).
+
+| `ORT_WEBGPU_CONV_REGTILE` | ResNet-50 median (ms) |
+|---|---|
+| 0 (default, ORT tile) | 67.0 |
+| 2 (1x1 convs only) | 71.8 |
+| 3 (3x3 convs only) | 116.7 |
+| 1 (all convs) | 120 |
+
+The standalone GEMM gain does not transfer: even the 1x1 layers (pure GEMMs) lose ~5 ms. Untested explanations: register
+pressure on the 3x3 kernel, and lower GPU clocks between short dependent dispatches than in the back-to-back batches the
+microbenchmark uses. The profiler's per-dispatch timestamps were not usable for a per-layer split.
+
+Rows per thread (`ORT_WEBGPU_CONV_REGTILE_ROWS`, default 8; fewer rows = fewer accumulators): 3x3 convs only: 8 rows 116.7 ms, 4 rows 88.4, 2 rows 82.7;
+1x1 convs only: 8 rows 71.8, 4 rows 71.0, 2 rows 71.9. So register pressure explains part of the 3x3 loss, but no setting beats ORT's
+shared-memory tile (67.0 ms), and the 1x1 layers do not react to the tile at all -- in the network they are not limited by the GEMM inner loop
+the way the back-to-back microbenchmark is (which also re-reads cache-resident operands).
+
+## Winograd F(2,3) Conv in ORT's WebGPU EP (works: ResNet-50 -9%, SAM-L0 encoder -13%, RT-DETR pre -13%)
+
+`webgpu_ops/ort_conv_winograd.patch` (on ORT `125ea21` + transpose -> missing_ops -> silu_fusion; it also contains the register-tile
+experiment above, so apply it *instead of* `ort_conv2d_regtile_experiment.patch`) adds a Winograd path to `Conv` for NHWC fp32,
+group 1, 3x3, stride 1, dilation 1, Cin and Cout multiples of 4 and min(Cin, Cout) >= 64. Four programs run per conv: weight
+transform (cached in the kernel when the weights are a prepacked initializer), input transform (4x4 tiles of 2x2 outputs),
+16 batched GEMMs (`[16][tiles][Cin] x [16][Cin][Cout]`, TM=4 tiles x 2 vec4 channels per thread, workgroup 16x4, scalar accumulators),
+and the output transform with bias and the fused activation. Environment knobs: `ORT_WEBGPU_CONV_WINOGRAD=0` disables it,
+`ORT_WEBGPU_WINO_{TM,NV,WX,WY,MINC,MINHW,MAXHW}` tune it.
+
+Correct on the phone: logits/outputs match the CPU EP to <= 5e-5 relative on ResNet-50, YOLO11n/26n, SAM-L0 encoder and the
+single-conv models (with bias, ReLU and SiLU epilogues); the 235-op sweep still passes.
+
+| model | ORT default (ms) | Winograd (ms) |
+|---|---|---|
+| ResNet-50 | 66.7 / 67.5 | **61.4 / 60.9** |
+| SAM-L0 encoder | 441 / 442 | **383 / 382** |
+| RT-DETR pre | 396 / 399 | **344 / 347** |
+| YOLO11n | 71.8 / 71.3 | 73.0 / 72.0 (neutral) |
+| YOLO26n | 64.8 / 64.4 | 64.3 / 65.3 (neutral) |
+
+Two runs each, phone median. The min-channel rule matters: with no threshold YOLO11n/26n get 10-15% *slower* (their 3x3 convs have
+16-64 channels at high resolution, where the 4x-larger transformed tensors cost more than the multiplications saved). Restricting to
+the small feature maps (<= 28) still keeps most of the ResNet gain; the 56x56 layers add little. GEMM tile sweep: TM=4, NV=1 or 2
+are equal (61.0-61.3 ms), TM=8 is 70+ ms. This is the first change in this investigation that makes the WebGPU EP faster on the
+end-to-end ResNet, and it agrees with the standalone `conv_alt.cc` result.
+
+## Winograd F(4,3) vs F(2,3) (standalone, `dawn_repro/conv_alt43.cc`)
+
+Same harness as `conv_alt.cc` (NHWC fp32, batch 1, pad 1, Cin=Cout=C, best of a GEMM tile sweep per algorithm), with one generic
+transform generator so F(2,3) and F(4,3) (6x6 tiles -> 4x4 outputs, 36 batched GEMMs, points 0, +-1, +-2, inf) are timed the same
+way. Two runs each on the Adreno 730 (ms; "x direct" = time / best direct register-tile conv):
+
+| layer | direct | F(2,3) | F(4,3) | F(4,3)/F(2,3) | relerr F(2,3) / F(4,3) |
+|---|---|---|---|---|---|
+| 64ch @ 56x56 | 1.32 / 1.40 | 0.94 / 0.79 | **0.81 / 0.67** | 0.86 / 0.85 | 6e-7 / 1e-5 |
+| 128ch @ 28x28 | 1.38 / 1.34 | 1.11 / 1.00 | 1.06 / 1.03 | 0.95 / 1.03 | 4e-7 / 5e-6 |
+| 256ch @ 14x14 | 1.50 / 1.47 | **0.86 / 0.97** | 1.01 / 1.12 | 1.17 / 1.15 | 1e-6 / 1e-5 |
+| 512ch @ 7x7 | 1.97 / 1.76 | **0.80 / 0.78** | 1.63 / 1.72 | 2.05 / 2.22 | 8e-7 / 6e-6 |
+
+- Multiplies per output pixel and channel pair: direct 9, F(2,3) 4, F(4,3) 2.25, but F(4,3) needs 36 GEMMs with 4x fewer rows each. It only wins where there are many
+  tiles: 56x56 (196 tiles) by ~15%; 28x28 (49 tiles) is a tie; at 14x14 (16 tiles) and 7x7 (4 tiles) the GEMMs are too small to fill the GPU and
+  F(4,3) is 15% / 2x slower than F(2,3). The transforms are minor (0.05-0.15 ms per stage; the F(4,3) input transform is a little dearer, the output transform cheaper).
+- Accuracy: F(4,3) has ~10x the error of F(2,3) (5e-6..1e-5 vs 4e-7..1e-6 relative to the max output, fp32); fine in fp32, but it would not be safe in fp16.
+- Recommended choice: F(4,3) for tile counts >= ~150 (64ch@56 and larger feature maps), F(2,3) below that, direct for < 64 channels. At 56x56 the
+  end-to-end gain is bounded: ResNet-50 has only a few such layers, and in the ORT experiment the 56x56 layers added little over the smaller ones, so the expected
+  network gain from F(4,3) is small (well under 1 ms of 61).
+
+## Winograd with f16 intermediates (standalone microbenchmark, `dawn_repro/conv_alt_f16.cc`)
+
+Same 3x3 Winograd F(2,3) pipeline as above, but the transformed tensors V (input) and U (weights) are stored packed f16 (8 halves per
+`vec4<u32>`), the 16 batched GEMMs unpack to f32 and accumulate in f32, and M is either f32 or packed f16. Graph input and output stay
+f32, so it would drop into ORT's Conv without an f16 graph (the input transform rounds, the output transform reads f16/f32). U is
+computed on the host and not timed (ORT caches it). Best of a few tile configs per pipeline, one submission of 10 repetitions,
+Cin = Cout = C, 0.231 GFLOP each. relerr = max|err| / max|ref| over 300 sampled outputs vs a double-precision direct convolution.
+The phone was busy, so absolute times are ~1.5-2x higher than in the section above; compare only within a row.
+
+| layer | f32 pipeline (ms) | f16 V,U + f32 M (ms, relerr) | f16 V,U,M (ms, relerr) |
+|---|---|---|---|
+| 64ch @ 56x56 | 1.88 (6e-7) | **0.93 (1.4e-3)** = 2.0x | **0.76 (1.8e-3)** = 2.5x |
+| 128ch @ 28x28 | 1.49 (4e-7) | **0.85 (8.0e-4)** = 1.8x | **0.65 (1.3e-3)** = 2.3x |
+| 256ch @ 14x14 | 1.63 (1.1e-6) | **0.94 (1.0e-3)** = 1.7x | 0.99 (1.5e-3) = 1.7x |
+| 512ch @ 7x7 | 1.49 (7e-7) | 1.26 (1.0e-3) = 1.2x | 1.33 (1.2e-3) = 1.1x |
+
+With post-ReLU-like (nonnegative) input the speedups are 1.9x/1.7x/1.6x/1.15x (M f32) and the errors 1.7e-3, 9e-4, 2e-3, 1.2e-3.
+
+- The GEMM stage is what shrinks (half the bytes per load and the same f32 fma count): 1.5 -> 0.46 ms at 64ch@56, 1.3 -> 0.75 at 128ch@28.
+  The transforms cost the same (input 0.05-0.21 ms, output 0.03-0.16 ms). Packing M as f16 helps only where the output transform and the
+  GEMM store dominate (56x56 and 28x28); at 14x14 and 7x7 keeping M in f32 is as fast or faster.
+- Accuracy is ~1e-3 relative to the largest output (8e-4 .. 2.2e-3), i.e. f16 rounding of V and U (2^-11 each) accumulated over K; the f32
+  pipeline is at 1e-6. That is the usual f16-inference error level, but it is NOT "f32 conv results": an f16 path would need to be
+  opt-in (or limited to models already run in f16), and needs an accuracy check on a real network (logits / detection boxes), not just
+  random data.
+- Speed potential in ORT: the 3x3 layers of ResNet-50 go from ~1.5 ms to ~0.9 ms per 0.231-GFLOP layer in the standalone pipeline; the
+  earlier Winograd integration shows the standalone ratios carry over only in part (the register-tile GEMM did not), so expect a fraction of
+  this. Worth trying because it needs only two changed transforms and a p16-style GEMM stage inside the existing four programs, with the
+  weight transform (cached) writing packed f16; the memory footprint of V, U, M also halves.
+
+## Stride-2 3x3 convs: polyphase Winograd microbenchmark (small gain)
+
+`webgpu_ops/dawn_repro/conv_s2.cc` (standalone Dawn kernels, not in ORT) compares, for the 3x3 stride-2 pad-1 NHWC fp32 convs of
+ResNet-50 v1.5 (Cin = Cout = C, 0.231 GFLOP each), the direct register-tile implicit GEMM with a *polyphase hybrid Winograd*.
+Splitting the input into even/odd phases gives `o[y] = w1 xe[y] + w0 xo[y-1] + w2 xo[y]` per dimension: the two-tap part uses F(2,2)
+(3 mults per 2 outputs), the one-tap part is direct (2 mults), 5 mults per 2 outputs, so 25 per 2x2 output tile instead of 36 (0.69x).
+The input transform makes only 1.56x more data than the image (vs 4x for stride-1 F(2,3)); 25 batched GEMMs follow, then the output
+transform. Outputs match a double-precision CPU reference (relative error <= 2.3e-6). Best of 7 tile configs per algorithm, two runs:
+
+| layer | direct (ms) | polyphase (ms) | polyphase/direct | of which GEMM (ms) |
+|---|---|---|---|---|
+| 128ch 56->28 | 1.37 / 1.41 | 1.18 / 1.33 | 0.87 / 0.94 | 0.91 / 0.96 |
+| 256ch 28->14 | 1.47 / 1.48 | 1.38 / 1.36 | 0.94 / 0.92 | 1.36 / 1.30 |
+| 512ch 14->7 | 1.89 / 1.78 | 1.69 / 1.55 | 0.90 / 0.87 | 1.34 / 1.38 |
+| 64ch 112->56 | 1.80 / 1.74 | 1.39 / 1.45 | 0.77 / 0.84 | 0.88 / 0.95 |
+
+It is 6-23% faster than direct (>10% on 512ch and 64ch, borderline on the others), a gain of 0.1-0.2 ms per layer, much less than the
+stride-1 Winograd gain because the multiplication saving is only 1.44x. ResNet-50 has only three such convs (128@56, 256@28,
+512@14), so this is worth about 0.4-0.5 ms of ~61 ms (<1%); YOLO-style networks have more stride-2 convs but with fewer channels,
+where the transforms would eat the gain. Not worth integrating into ORT unless a network has many wide stride-2 convs.
+
+## Winograd with f16 intermediates in ORT (opt-in, `ORT_WEBGPU_WINO_F16=1`)
+
+`ort_conv_winograd.patch` now also has an f16 mode (Cin, Cout multiples of 8): the weight and input transforms write V and U as packed
+f16 (`uint32` tensors, 8 halves per vec4), the 16 batched GEMMs read them and accumulate in f32 (M stays f32), so graph tensors stay
+f32. Phone medians, f32 Winograd -> f16 intermediates: ResNet-50 61.1 -> **57.9 ms**, SAM-L0 encoder 382 -> **354**, RT-DETR pre 345 -> **318**,
+YOLO26n 64.3 -> 64.4 (unaffected). Cost is accuracy: ResNet-50 logits differ from the CPU by 1.9e-3 relative (top-1 unchanged), against
+8e-7 for the f32 Winograd path, hence opt-in. Together with Winograd: ResNet-50 67 -> 58 ms (-14%), SAM-L0 441 -> 354 (-20%), RT-DETR pre 397 -> 318 (-20%).
+
+Not worth integrating (standalone results above): F(4,3) (wins only at 56x56, <1 ms of ResNet-50) and polyphase stride-2 Winograd (~0.4 ms of ResNet-50).
+
+## Whole-conv packed-f16 path (f16 activations + weights, f32 accumulate) -- microbenchmark, `dawn_repro/conv_f16io.cc`
+
+Question: if the *graph* ran f16 (activations and weights packed 8 halves per `vec4<u32>`, f32 accumulators, bias+ReLU epilogue and packed-f16
+output), how much faster would the ResNet-50 conv classes get, and is the accuracy plausible? Same design as the earlier `p16` GEMM, applied
+to whole convs: 1x1 as NHWC GEMMs and a direct 3x3 (implicit GEMM, 9 taps), each swept over TM 2/4/8 x 6 workgroup shapes; the f32 baseline
+is the best of the seven f32 register-tile configs of `conv_alt.cc` (no epilogue, so it is slightly favoured). Random non-negative
+activations, He-uniform weights, batch 1, Dawn with ORT's toggles (`RB=off VMM=1`), best of 10 batches of 10 back-to-back dispatches.
+
+**The phone was in a slow/noisy state for this session** (the f32 register-tile kernels ran at 70-100 GFLOPS on the 1x1 shapes, against 200+ in
+the cleanest earlier runs), and the 64->256@56 case swung 0.29 -> 0.68 ms between two runs, so read the ranges of two full runs and the ratios,
+not the absolute GFLOPS.
+
+| conv | GFLOP | f32 reg-tile (ms) | f16io packed (ms) | f16io / f32 time | ORT-style `sh` GEMM (ms, gemm.cc, same session, 1x1 only) |
+|---|---|---|---|---|---|
+| 1x1 64->256 @56 | 0.103 | 1.06-1.08 | 0.29-0.68 | 0.27-0.63 | 1.20 |
+| 1x1 256->64 @56 | 0.103 | 1.19-1.20 | 0.47 | 0.39 | 1.00 |
+| 1x1 512->128 @28 | 0.103 | 1.09-1.29 | 0.68-0.80 | 0.62 | 0.88 |
+| 1x1 1024->256 @14 | 0.103 | 1.45-1.50 | 0.96-1.00 | 0.67 | 1.00 |
+| 1x1 2048->512 @7 | 0.103 | 1.02-1.18 | 0.63-0.86 | 0.62-0.73 | 1.20 |
+| 3x3 64 @56 | 0.231 | 1.32-1.39 | 1.12-1.32 | 0.85-0.95 | -- |
+| 3x3 128 @28 | 0.231 | 1.31-1.41 | 0.91-0.95 | 0.65-0.69 | -- |
+| 3x3 256 @14 | 0.231 | 1.44-1.50 | 1.07-1.10 | 0.72-0.76 | -- |
+| 3x3 512 @7 | 0.231 | 1.70-1.88 | 1.25-1.29 | 0.66-0.74 | -- |
+
+(`sh` = classic shared-memory tile, TM=4 x 4 outputs/thread, workgroup 8x8, REPS-batched throughput timing, so only roughly comparable.)
+
+- The packed-f16 kernels are **1.4-1.6x faster than the f32 register tile on the deep/narrow layers (1x1 at 28/14/7, all 3x3 at <= 28x28)**, up to
+  2-3x on the wide-M 1x1 layers (56x56), and only ~1.1x on the 3x3 at 56x56 (compute-bound there, the gather dominates). Best f16io throughput
+  in this state: 150-350 GFLOPS on 1x1 (best 352), 175-254 on 3x3.
+- **Accuracy, single layer** (300 sampled outputs vs an f64 reference computed from the *original f32* data, so input, weight and output
+  rounding all count): max relative error 4.9e-4 - 9.6e-4 (rms 4-6e-4), i.e. one f16 rounding of the output (2^-11 = 4.9e-4); the f32 kernels sit at 1e-6.
+- **Accuracy, 10 stacked 3x3 layers** (He-init random weights, biases, ReLU; f16 activations *between* layers; error vs an f64 chain of the same
+  weights): the error grows roughly linearly with depth, ~4e-4 per layer:
+
+  | layer | 1 | 2 | 3 | 5 | 7 | 10 |
+  |---|---|---|---|---|---|---|
+  | C=64 @28, max / rms | 6.2e-4 / 5.0e-4 | 1.1e-3 / 8.3e-4 | 1.6e-3 / 1.3e-3 | 2.0e-3 / 2.0e-3 | 3.1e-3 / 2.7e-3 | **4.5e-3 / 3.8e-3** |
+  | C=128 @28 | 7.7e-4 / 5.1e-4 | 1.1e-3 / 8.3e-4 | 1.4e-3 / 1.1e-3 | 2.2e-3 / 1.8e-3 | 2.9e-3 / 2.5e-3 | 4.1e-3 / 3.6e-3 |
+  | C=256 @14 | 8.1e-4 / 5.2e-4 | 1.2e-3 / 8.4e-4 | 1.5e-3 / 1.2e-3 | 2.2e-3 / 1.9e-3 | 2.6e-3 / 2.6e-3 | 3.9e-3 / 3.7e-3 |
+
+  Extrapolated linearly to ResNet-50's ~50 convs that is ~2e-2 relative rms on the deepest activations (residual adds and BatchNorm folded into
+  the weights do not add much, but were not modelled). That is the usual size of an f16 inference error: top-1 is normally unchanged but the output is not
+  close to bit-exact and it needs a per-model accuracy check; keep the f32 path as the default.
+- **Estimate for ResNet-50 end to end** (from the per-class ratios and ~55% of the FLOPs in 1x1 convs, ~40% in 3x3): conv time x ~0.65 on the 1x1
+  layers and x ~0.75-0.8 on the 3x3 layers if the standalone ratios carried over, i.e. **roughly 20-25% of the conv time, ~10-15 ms of ORT's 61 ms**
+  (58 ms with the f16 Winograd intermediates). But the register-tile GEMM lesson applies: its standalone gain (1.4-1.7x) did not transfer into
+  ORT's Conv2dMM at all (1x1 layers got slightly slower), and here the ORT Winograd path already takes over most 3x3 layers, so a realistic in-network
+  gain is a fraction of this -- I would expect **~5-8%**, and it needs an f16 graph (or f16 activation tensors between fused convs) plus an
+  accuracy gate, which is a larger change than the Winograd-internal f16 already integrated. Worth a prototype only for the 1x1 layers (56x56 -> 14x14),
+  where the ratio is best.
+
+## Dispatch counts, per-dispatch floor and fusion/elimination targets (wall-clock measured)
+
+Scripts: `webgpu_ops/dispatch_floor.py` (chains of N trivial `Add`s), `profile_breakdown.py` + `fusion_estimate.py` (from `PROFILE=` json of
+`bench.cc`). Current phone build (Winograd f32 on). The profiler's per-node durations only tell node order/type here (they sum to 10-30 ms on a
+60-350 ms model); every time below is either a wall-clock median or an estimate built from a wall-clock-calibrated cost model, and is labelled so.
+
+**Per-dispatch floor (wall clock, `chain_N.onnx`, 4096 floats, so no bandwidth cost).**
+
+| N chained Adds | plain Run (ms) | IO-binding + sync | graph capture (ms) |
+|---|---|---|---|
+| 1 | 0.32 | 0.27 | 0.03 |
+| 50 | 1.08 | 1.09 | 0.27 |
+| 100 | 1.69 | 1.71 | 0.52 |
+| 200 | 3.07 | 3.07 | 1.03 |
+| 400 | 5.49 | 5.59 | 2.02 |
+
+Slope: **~13 us per dispatch** without graph capture (ORT node overhead + Dawn command recording, the CPU side), **~5 us** with capture (the
+GPU-side floor). So the "0.19 ms per node" floor seen in ResNet-50 is not per-dispatch overhead: it is the convs' own time. A network with ~130-280
+dispatches pays only 1.7-3.7 ms (3-5%) of pure dispatch floor. With 3.2 MB tensors (`chb`, 800k floats) an `Add` costs ~0.25-0.28 ms each
+(9.6 MB moved -> ~35-45 GB/s effective, DRAM-resident constants), 0.22 ms with graph capture, i.e. elementwise ops on big activations cost
+memory traffic, not dispatch overhead. Calibration on ResNet-50 with ablated graphs (wall clock, 3 runs each): 61.1 ms full, 60.5 without the
+post-Add ReLU (`r50_norelu`), **58.9 without both Add and ReLU (`r50_noaddrelu`)**: 32 nodes / 44 MB of outputs cost 2.2-2.4 ms
+(~50 GB/s effective + 13 us per node). Cost model used below: `13 us + moved_bytes / 50 GB/s` per removed node (2x the output size for a copy or
+unary op, 3x for a binary op).
+
+(This corrects the earlier "residual Add+ReLU is worth <=0.5%" note: removing both is worth ~3.5-4% of ResNet-50, though fusing them into the
+convolution epilogue can only recover part of it -- the residual operand is still read -- an upper bound of ~2 ms / 3.3%.)
+
+**Dispatches and node types per run** (nodes from the profile, no-dispatch = Reshape/Unsqueeze/Squeeze/Flatten; Winograd adds 3 dispatches per
+eligible conv, counted from the ONNX graph: 3x3, stride 1, group 1, min(Cin,Cout) >= 64).
+
+| model | graph nodes | no-dispatch | Winograd convs | est. dispatches | 13 us floor (ms) |
+|---|---|---|---|---|---|
+| resnet50 | 91 | 1 | 13 | 129 | 1.7 |
+| yolo11n | 180 | 8 | 14 | 214 | 2.8 |
+| yolo26n | 210 | 12 | 6 | 216 | 2.8 |
+| rtdetr_pre | 247 | 37 | 25 | 282 | 3.7 |
+| rtdetr_mid0 / mid1 | 64 | 19 | 0 | 45 | 0.6 |
+| rtdetr_post | 30 | 8 | 0 | 22 | 0.3 |
+| sam_l0_enc | 204 | 8 | 6 | 214 | 2.8 |
+
+Op mix (node counts): ResNet-50 Conv 53, Add 16, Relu 16 (the residual Add and post-Add ReLU are separate dispatches; Conv+ReLU inside the blocks is
+fused), Transpose 2. YOLO11n Conv 88, Concat 23, Add 16, Transpose 16, Split 11, MaxPool 3, Resize 2. YOLO26n Conv 102, Concat 23, Transpose 22, Add 21,
+Split 11, MatMul 4. RT-DETR pre Conv 69, Reshape 36, Add 30, Transpose 24 (57 MB of outputs), Gemm 22, QuickGelu 12, Concat 5, plus **3 CPU-EP nodes**
+(`Unsqueeze`, 2x `Tile`) and 2 `MemcpyFromHost` + 1 `MemcpyToHost` after `TopK`: a mid-graph sync (the GPU queue is drained, the CPU runs three
+tiny nodes, the result is uploaded again), roughly 2-4 ms of bubble/copies on a 345 ms model by node durations. SAM-L0 encoder Conv 73, **Gelu 30 (all
+directly after a Conv, not fused)**, Add 25, Slice 20, Transpose 13, Pad 6, MatMul 8. The RT-DETR mid/post stages are Gemm/Reshape/Relu graphs of 22-45 dispatches:
+nothing worth fusing (<0.4 ms).
+
+**Upper-bound savings from removing dispatches/traffic** (cost model above; "n" = nodes that would disappear):
+
+| model (wall-clock) | target | n | est. saving |
+|---|---|---|---|
+| ResNet-50 (61 ms) | 1. Conv+residual Add epilogue | 16 | 1.1 ms |
+| | 2. Post-Add ReLU into the same epilogue | 16 | 1.1 ms |
+| | 3. the two layout Transposes | 2 | 0.05 ms |
+| YOLO11n (72 ms) | 1. Concat elimination (producers write channel slices) | 23 | 1.9 ms |
+| | 2. Transpose elimination (Conv>Transpose>Reshape attention layouts, NCHW/NHWC) | 16 | 1.2 ms |
+| | 3. Split as strided views | 11 | 0.8 ms |
+| YOLO26n (64 ms) | 1. Concat elimination | 23 | 1.7 ms |
+| | 2. Transpose elimination | 22 | 1.2 ms |
+| | 3. Split as strided views | 11 | 0.6 ms |
+| RT-DETR pre (345 ms) | 1. Transpose elimination (24, 57 MB) | 24 | 2.6 ms |
+| | 2. Conv+residual Add epilogue | 20 | 1.9 ms |
+| | 3. Concat elimination (5, 29 MB) | 5 | 1.2 ms |
+| SAM-L0 encoder (354 ms) | 1. **Gelu into the 1x1 Conv epilogue** (Conv->Gelu x30, large MLP tensors) | 30 | **10.0 ms** |
+| | 2. Conv+residual Add epilogue | 20 | 2.0 ms |
+| | 3. Transpose elimination / Slice | 13 / 20 | 1.2 / 0.9 ms |
+
+These are upper bounds (a fused epilogue still reads its second operand, and channel-slice writes are strided) -- expect 50-70% of them in
+practice. Ranked by wall-clock value for one implementation effort: **Conv+Gelu epilogue** (SAM, ~2.8% of the model, ~1.5-2% after the epilogue
+cost), **Conv+Add(+ReLU) residual epilogue** (all conv models: 1.1-2.2 ms, 1.5-3.5% on ResNet-50/RT-DETR), then **Concat/Split/Transpose
+elimination** in the YOLO family (~4 ms of 64-72 ms, 5-6%, but a much larger change: it needs a layout pass, not a shader epilogue). Dispatch-count
+reduction alone (graph capture, persistent kernels) tops out at the 13 us floor: 1.7-3.7 ms per run, and graph capture already recovers 8 of the
+13 us. RT-DETR's TopK/Tile CPU round trip is a further ~2-4 ms worth removing with a WebGPU `Tile`/`Unsqueeze` (small, self-contained).
+
+## GPU clock after idle: real, large, and not fixable from user space (`dawn_repro/clock.cc`, `bench.cc` `SLEEP_MS`)
+
+Question: does the Adreno 730 run at a lower effective clock in network-like workloads than in the back-to-back microbenchmarks? Yes -- not
+because of dispatch structure, but because of idle time. Workload: the register-tile fp32 GEMM 784x512x128 (`sc` TM=8 NV=2, 32x4), 0.103 GFLOP.
+
+| pattern (Dawn/Vulkan, warm) | GFLOPS |
+|---|---|
+| one batched dispatch (z=32) | 126-183 (noisy: depends on the clock state it starts in) |
+| 100 dependent dispatches, one submission | 193-197 |
+| 100 GEMMs interleaved with a cheap elementwise dispatch each | 192-197 (elementwise alone: 1.7 ms of 53) |
+| submit N GEMMs, wait, repeat (no idle): N=1 / 2 / 4 / 8 / 32 / 100 | 104-118 / 160 / 157 / 165-181 / 183-192 / 198-202 |
+| same, but submit everything ahead and wait once | 184-192 (N=1), 203-214 (N>=2) |
+
+So dispatch granularity costs nothing (interleaving and dependent chains are free) and the only structural loss is synchronising on every
+submission (~0.35-0.45 ms CPU round trip per wait; ORT syncs once per inference so it does not pay this). The clock effect is separate:
+
+- After >= 100 ms with the GPU idle, 100 GEMMs run at **98 GFLOPS instead of 193** (105 ms instead of 53 ms). After 20 ms idle: 166-169; after 5 ms: no loss.
+- The slow state does not clear quickly under load: 20-GEMM submissions after 1 s idle run at 1.3 ms/GEMM (vs 0.50 at full clock) for ~3 s of
+  continuous work and are still improving at 8 s (0.64 ms/GEMM at t = 8 s). With an inference-like duty cycle (20 GEMMs = ~10 ms of work, then a 20 ms sleep) it
+  **never ramps**: 1.5 ms/GEMM, i.e. 3x slower than the microbenchmark, for the whole 6 s (2 runs).
+- Same in ORT (`bench.cc` now honours `SLEEP_MS`, an idle gap after each timed inference), ResNet-50 median with the Winograd path (ORT default in brackets):
+
+  | idle between inferences | 0 ms | 5 ms | 20 ms | 50 ms | 200 ms |
+  |---|---|---|---|---|---|
+  | Winograd | 61.4 | 61.4 | 73.8 | 74.4 | **125.1** |
+  | ORT default conv | 67.5 | 67.5 | 75.3 | 73.5 | **148.2** |
+
+  A model called once per 20-200 ms therefore runs 20-100% slower than every benchmark in this document (all of which run inferences back to back);
+  Winograd keeps its advantage but the absolute gain shrinks at low duty cycles (e.g. 148 -> 125 ms at 200 ms idle).
+- Keep-alive tricks do not help. A second device on another thread issuing a continuous tiny-dispatch stream, or one tiny dispatch every 5 ms or 1 ms, leaves the
+  inference-like pattern at 1.5 ms/GEMM (8 runs, all within noise of the no-keep-alive case). The governor evidently needs real shader load, not submissions;
+  a genuinely saturating background kernel would ramp the clock only by time-slicing away the throughput it is meant to protect. Reading or pinning the clock needs
+  root (`/sys/class/kgsl`), which is out of scope here.
+
+Consequences: (1) any latency claim for a once-per-frame GPU model should be measured with the real frame gap, (2) batching or pipelining consecutive
+inferences so the GPU never idles > ~10 ms is the only lever found (throughput-style use), (3) the microbenchmark-to-network gap seen earlier (e.g. the register-tile
+conv) is not explained by this effect, since back-to-back ORT runs are at full clock (61 ms Winograd run has no idle).
+
+## Conv + Gelu epilogue fusion (SAM-L0 encoder -3%)
+
+`webgpu_ops/ort_conv_gelu_fusion.patch` (applies after `ort_conv_silu_fusion.patch`) lets ConvActivationFusion fuse an opset-20 `Gelu` (exact erf
+or `approximate="tanh"`, passed as an activation parameter) into the WebGPU Conv epilogue, in the MatMul path, Conv2dMM, GroupedConv and the Winograd
+output stage. The SAM-L0 encoder has 30 Conv -> Gelu(tanh) pairs (1x1, 3x3 and depthwise): all 30 Gelu nodes disappear, the outputs still match the
+CPU EP to 5e-5, and the encoder goes 382 -> 372 ms (Winograd f32 on). `gen_new_op_tests.py` gained Conv+Gelu (both variants, 5 conv kinds) and Winograd
+(plain, bias+ReLU, tanh-Gelu, no pad, asymmetric pad) cases; the sweep is 299 OK, 0 wrong. `ort_conv_winograd.patch` now contains only the four
+`nn/conv*` files (the earlier version wrongly repeated the `fuse_utils` hunks from the SiLU patch).
+
+## Why Adreno OpenCL beats WebGPU/Vulkan: the same work in both (`dawn_repro/cl_vs_wg.cc`)
+
+Adreno 730, OpenCL 3.0 driver (compiler E031.38.11.11), 4 compute units, extensions incl. `cl_khr_fp16`, `cl_khr_subgroups`, `cl_qcom_perf_hint`,
+`cl_qcom_ml_ops`, `cl_qcom_dot_product8`, `cl_qcom_subgroup_shuffle`, `cl_qcom_reqd_sub_group_size`, `cl_qcom_recordable_queues`,
+`cl_qcom_accelerated_image_ops`. Same kernels (register-tile GEMM, scalar accumulators, TM=8 NV=2), same inputs, same session, OpenCL runs
+after a 3 s warm-up, WebGPU runs via `gemm_w` (gemm.cc with a 4 s in-process warm-up). Phone noise is +-20%, so read ratios; best of several sweeps.
+
+**Traps first.** (1) OpenCL `fma()` is emulated: ~1000x slower than `mad()`/`a*b+c` (a 2^18-thread fma loop never finished in 20 min). (2) 64 float
+accumulator chains in one thread spill (141 vs 866 GFLOPS at 32 chains). (3) `-cl-fast-relaxed-math` / `-cl-mad-enable` change nothing.
+
+| measurement | OpenCL | WebGPU (Dawn/Vulkan) |
+|---|---|---|
+| FMA peak f32 (32 chains, mad) | 866 GFLOPS | 988 (64 chains, fma) |
+| FMA peak f16 scalar / half2 / half4 | **1001 / 1624 / 1412** | 307-313 (scalar, vec2) |
+| load bandwidth, buffer float4 | 97 GB/s (6 G loads/s) | 164 GB/s (10 G/s) |
+| load, image RGBA32F | 145 GB/s (9 G texels/s) | 240 GB/s (15 G/s) |
+| load, image RGBA16F (`read_imagef` or `read_imageh`) | 138-204 GB/s, **17-25 G texels/s** | not measured |
+| buffer half4 (convert) | 76-80 GB/s (9-10 G loads/s); `vload_half4` 19 GB/s | -- |
+
+| GEMM (GFLOPS) | 784x512x128 | 3136x256x64 | 196x256x2304 |
+|---|---|---|---|
+| OpenCL f32, buffers | 197-201 | 196-199 | 160-164 |
+| OpenCL f32, B as image | **474-482** | **463-487** | **382-399** |
+| OpenCL f16 storage, buffers, f32 acc | 232 | 214-220 | 219-221 |
+| OpenCL f16 images, f32 acc | 413-446 | 381-385 | 342-360 |
+| OpenCL f16 images, f16 acc (error 5e-3..3.5e-2) | 583-621 | 537-544 | 512-572 |
+| WebGPU `sh` (ORT design) | 169 | 158 | 153 |
+| WebGPU `sc` f32 buffers | 219-264 | 230-268 | 161-247 |
+| WebGPU `p16` packed f16 | 192-221 | 164-207 | 159-417 (noisy) |
+| WebGPU `tt` (A and B in textures) | 327-383 | 201-325 | 163-259 |
+
+| direct 3x3 conv (GFLOPS) | 64ch @56 | 256ch @14 |
+|---|---|---|
+| OpenCL f32 buffers | 109 | 80 |
+| OpenCL f32 images (X and weights) | 228 | 157-163 |
+| OpenCL f16 images, f32 acc | 306 | 176 |
+| OpenCL f16 images, f16 acc (err 6e-3..8e-3) | 353 | 217 |
+| WebGPU `conv_alt` direct (buffers) | 169-179 | 156-158 |
+
+**Ranked explanation of the OpenCL advantage**
+1. **The texture/image path (biggest).** OpenCL's own *buffer* kernels are not better than WebGPU's (97 vs 164 GB/s, conv 109 vs 175 GFLOPS): reading the B
+   operand (and the conv input) through `image2d` roughly doubles OpenCL's GEMM (200 -> 480 GFLOPS) and its conv. A WebGPU kernel that uses textures
+   (`tt`) recovers most of this (327-383 vs 480), so this part is obtainable in WebGPU, but ORT's Conv/MatMul use storage buffers only.
+2. **Half storage in images.** RGBA16F texels double the texel rate (17-25 G/s vs 9 G/s for RGBA32F) and halve the bytes: 380-450 (f32 acc) vs 480 f32 images; with
+   f16 accumulation 510-620. The f32-accumulate path keeps the accuracy of the f32 kernels (error ~1e-6 from the half-rounded inputs); f16 accumulation does not (5e-3 to 3.5e-2).
+3. **Half ALU rate.** OpenCL `half` mad reaches 1000 (scalar) to 1624 GFLOPS (half2), 1.2-1.9x the f32 rate, while Vulkan/WGSL f16 arithmetic runs at 310
+   (0.3x of f32, reproducible with f16 scalar and vec2). This is a driver/compiler difference in how each API lowers 16-bit math, and it is the one piece WebGPU cannot reach today.
+4. **Precision of the comparison.** The earlier "OpenCL 1.5x faster" network comparison was fp16 OpenCL vs fp32 WebGPU; items 1-3 show that most of the gap is
+   explained by images and half, not by a slower WebGPU runtime (dispatch overhead is ~13 us, ~3-5% of a run).
+5. **Compiler flags: nothing.** `-cl-fast-relaxed-math`, `-cl-mad-enable` give identical times; only avoiding `fma()` matters.
+
+**GPU clock: OpenCL can pin it without root.** `cl_qcom_perf_hint` (`clSetPerfHintQCOM(context, CL_PERF_HINT_HIGH_QCOM)`, exported by libOpenCL.so) removes the
+post-idle slowdown in an OpenCL process: after >= 200 ms idle the default (NORMAL) hint runs a 32-chain mad kernel at 240-260 GFLOPS for the whole next 600 ms (and
+for 3 s), HIGH runs 440-480 in the first 100 ms window and 515-530 afterwards, for every idle time from 0 to 3 s (back-to-back it is 510-560 either way). The hint
+from a separate idle OpenCL process does **not** speed up a concurrently started WebGPU process (cold `gemm` 120-145 GFLOPS with and without it), so it helps only
+OpenCL work in the same context. Cold starts matter: the WebGPU `gemm` tool without an in-process warm-up measures 120-170 GFLOPS where the warmed-up numbers above are 220-270,
+which is why all WebGPU figures in this section come from a build with a 4 s warm-up.
+
+**Practical consequences.** For an OpenCL-free stack: (a) use textures for the B operand / conv input in ORT's WebGPU EP (the `tt` design is 1.3-1.5x the
+buffer design here); (b) keep f16 storage with f32 accumulation (packed loads) rather than f16 arithmetic; (c) the remaining gap (OpenCL image kernels
+480 vs WebGPU 330-380 at f32, and all of half arithmetic) needs either OpenCL itself (tinygrad's OpenCL backend, TVM OpenCL) or a driver that lowers WGSL `f16` well.
+
+## Memory layouts for conv / GEMM on the Adreno 730 (`dawn_repro/layouts.cc`)
+
+One register-tile implicit-GEMM generator (scalar accumulators, TMxNV vec4 outputs per thread, no workgroup memory) run with different
+layouts: activations NHWC (ORT's), NC4HW4 `[C/4][HW]`, 4x4-pixel tiles (`z4`, thread order follows the tiles), RGBA32F/RGBA16F textures
+(`texa`: x = channel block, y = pixel; `texb`: x = ix*C4+c4, y = iy), packed f16 buffers (`nhwc16`, `nc416`); weights HWIO `[K][N4]` (ORT's),
+output-blocked `[N4][K]` (`ok4`), vec4-over-k with `dot()` (`nk4`), RGBA32F/RGBA16F textures x = n4, y = k (`texw`, `texw16`), packed f16 over n
+(`w16`); thread maps `colx` (x = channel group) and `rowx` (x = pixels, coalesced). Math is always f32 (f16 layouts unpack to f32).
+Batch 1, stride 1, warm GPU (>= 5 s burn), every candidate checked against a double CPU reference (rel. error <= 3e-6, computed from the
+f16-rounded operands for f16 layouts). The table is the **interleaved head-to-head** (the 12 best layouts of a layer timed in alternation,
+6 rounds, min per kernel): a sequential sweep is misleading here because the GPU clock drifts during a long run and other jobs share the phone (the same
+nhwc/hwio kernel read 185 GFLOPS early in one sweep and 108 late in another). Raw output: `dawn_repro/layouts_results.txt`.
+
+Min time over 6 interleaved rounds (ms); "ORT-like" = NHWC f32 buffer activations + HWIO f32 buffer weights, best tile config:
+
+| layer | ORT-like | nhwc + weights in f32 texture | nhwc + weights in f16 texture | best layout found |
+|---|---|---|---|---|
+| 1x1 64->256 @56 | 0.954 | 0.718 (1.33x) | 0.621 (1.54x) | **0.439** (2.17x): f16 texture act + f16 texture weights |
+| 1x1 512->128 @28 | 0.604 | 0.384 (1.57x, nc4 act) | 0.397 (1.52x) | **0.342** (1.77x): f16 texture act + f16 texture weights |
+| 1x1 1024->256 @14 | 1.348 | — | 0.849 (1.59x) | **0.648** (2.08x): f16 texture act + f16 texture weights |
+| 3x3 64 @56 | 1.240 | 0.784 (1.58x) | 0.741 (1.67x) | **0.685** (1.81x): packed-f16 nc4 act + f16 texture weights, rowx |
+| 3x3 128 @28 | 2.498 | 1.445 (1.73x) | 1.273 (1.96x) | **1.165** (2.14x): packed-f16 nhwc act + f16 texture weights |
+| 3x3 256 @14 | 1.558 | 1.200 (1.30x) | 0.785 (1.98x) | **0.706** (2.21x): f16 texture act + f16 texture weights |
+
+Findings:
+
+1. **Weights through a texture are the one layout change that matters**: 1.3-1.7x with f32 RGBA32F, 1.5-2.0x with RGBA16F (half the bytes; the texture
+   unit converts to f32 on load, so no f16 arithmetic and no accuracy change beyond rounding the weights to f16). The weight stream is the hot load in a
+   register-tile conv (every thread re-reads the full K x N slab) and the texture path has the higher read throughput (240 vs 163 GB/s buffer).
+2. **Activation layout is second order**: NHWC vs NC4HW4 vs 4x4-tiled are within about 10% of each other with buffer weights (z4 is +8% on 3x3 @56 and
+   -10..-50% on smaller maps, NC4HW4 is not consistently better, `texb` is worse than `texa`). Activations in a texture (`texa`, x = channel block, y = pixel)
+   gain 5-25% over the buffer, and RGBA16F activations stack with f16 weights for the best rows above.
+3. **Packed-f16 activation buffers** help only together with texture weights (nhwc16/texw16 vs nhwc/texw16: -10%..+14%); with buffer weights they are noise.
+4. **Weight buffer variants lose**: output-blocked `[N4][K]` (`ok4`) is 0.95-1.2x slower than HWIO, vec4-over-k with `dot()` (`nk4`) is 1.5-2.6x slower
+   (and 10x+ on 3x3 because of the taps addressing). Packed f16 weights in a buffer (`w16`) are between the f32 buffer and the f16 texture.
+5. **Thread map**: `colx` (x = channel group) wins except for 3x3 @56 where `rowx` (pixels along x) with TM4 NV4 is best; rowx with NHWC buffers reads strided
+   and is otherwise 10-40% worse.
+6. **Channel padding does not help** (1x1 @28, tiny problem so ~40-70 GFLOPS): 100 -> 104/112/128 channels changes padded GFLOPS by +0..+22% but loses 5-25% of
+   *useful* GFLOPS; padding beyond the vec4 multiple (x4) is pure cost. 60 -> 64 (x8..x32) is a wash.
+7. **Layout conversion is not free**: NHWC -> NC4HW4 runs at 16-34 GB/s (0.02-0.4 ms for ResNet activations), NC4HW4 -> NHWC is a scatter at 3-17 GB/s
+   (0.04-2.4 ms, e.g. 2.4 ms for 256 ch @56). A per-layer layout switch costs as much as the conv it would speed up, and the activation layouts are within ~10% of each
+   other, so the activation layout should stay NHWC end to end (as ORT has it).
+
+Recommendation, ranked: (1) keep prepacked conv/GEMM **weights in an RGBA16F (or RGBA32F) 2D texture** `[K][N/4]` and read them with `textureLoad`; (2) keep NHWC
+activations (optionally f16 RGBA textures between layers if the graph is f16 anyway); (3) `colx` thread map, `rowx` only for wide 3x3 maps; (4) do not pad channels past a
+multiple of 4; (5) do not switch activation layouts between layers. Estimated ORT end-to-end effect: **unverified**. The microbenchmark baseline is the same
+register-tile kernel with buffer weights, so the 1.3-2.0x per layer is a pure weight-load effect, but ORT's Conv2dMM stages weights through workgroup memory, ORT's Program
+API has no texture inputs, and earlier register-tile microbenchmark gains did not carry over into the network. If even half of the per-layer gain on the weight-heavy layers
+carried over, ResNet-50 (about 80% conv time) would drop roughly 10-20%; treat 5-10% as the realistic expectation until an ORT prototype (texture weights in the Winograd GEMM
+stage, which is a plain register-tile GEMM, is the cheapest place to try it) confirms it.
+
+## Winograd weights in a texture (`ORT_WEBGPU_WINO_TEX=16`; ResNet-50 -4%, SAM-L0 -8%, RT-DETR pre -10%)
+
+Follows the layout study: the weight stream is the hot load, and texture reads are faster than storage-buffer reads. ORT's Program API had
+no texture bindings, so `webgpu_ops/ort_webgpu_extra_texture.patch` adds one optional extra 2D texture per program (`ProgramBase::SetExtraTexture`:
+write-only storage texture or sampled unfilterable-float texture, bound after the buffers and the uniform; `ComputeContextBase::Device()`).
+`ort_conv_winograd.patch` uses it: the weight-transform program `textureStore`s U (16*Cin rows x Cout/4 texels, RGBA16F or RGBA32F) and the
+GEMM stage `textureLoad`s it (cached across runs for prepacked weights; requires Cin <= 512). Phone medians (Gelu fusion on), buffer weights -> RGBA16F texture:
+ResNet-50 60.4 -> **58.2 ms**, SAM-L0 encoder 371 -> **343**, RT-DETR pre 345 -> **309**; TM=4 NV=1 WG 16x8 is marginally better for ResNet (57.3).
+RGBA32F texture is not faster (63.7 ms). Cost: weights are rounded to f16 (ResNet-50 logits 1.3e-3 relative vs 8e-7; top-1 unchanged), so it is opt-in,
+like the f16-intermediates mode (the two are not combined yet). Far below the 1.8-2.2x per layer of the standalone layout study, consistent with
+earlier standalone gains only partly transferring. Applying the patches: transpose -> missing_ops -> silu_fusion -> gelu_fusion -> extra_texture -> conv_winograd.
+
+### Texture weights + f16 intermediates together: no extra gain
+
+`ORT_WEBGPU_WINO_F16=1 ORT_WEBGPU_WINO_TEX=16` (packed-f16 V, RGBA16F texture U) works (ResNet-50 logits 1.8e-3 from the CPU, top-1 unchanged)
+but is not faster than either alone. Phone medians (ms): ResNet-50 60.5 (neither) / 57.8 (texture) / 57.7 (f16 V) / 58.2 (both);
+SAM-L0 encoder 343 (texture) / 345 (both); RT-DETR pre 312 (texture) / 316 (both). Both modes remove the same GEMM-stage load traffic, and the four
+Winograd stages are now limited by the transforms and dispatch overheads rather than by the GEMM loads, so stacking them does not help.
+
+## int8 on the Adreno 730 through WebGPU (`dawn_repro/int8.cc`)
+
+**The driver has no int8 dot product.** `vk_int8_query.cc`: Vulkan 1.1.128, `VK_KHR_8bit_storage` and `VK_KHR_shader_float16_int8` (shaderInt8 = 1) are present,
+but not `VK_KHR_shader_integer_dot_product` (shaderIntegerDotProduct = 0). Dawn exposes the WGSL feature `packed_4x8_integer_dot_product` anyway and Tint
+polyfills `dot4I8Packed`: `dot4I8Packed`, `dot(unpack4xI8, unpack4xI8)` and a hand-written extractBits multiply-add all run at the same 30.1 G dot4/s = 241 GOPS int8
+(peak kernel, 16 independent chains), i.e. ~120 G int8 MAC/s against 493 G fp32 FMA/s (750-775 GFLOPS measured in that session; 986 earlier). So int8 arithmetic in
+WGSL is ~4x *slower* than fp32 per MAC on this GPU; an int8 GEMM with `dot4I8Packed` runs at 130-160 GOPS, no better than the f32 register-tile kernel.
+
+**int8 storage with f32 arithmetic is what works.** Variant `f8`: A and B packed 4 x int8 per u32 (16 k per vec4 load for A, 4 columns x 4 k per vec4 load for B), `unpack4xI8` +
+convert once per operand, `dot()` in f32 (exact for int8 data while sums stay < 2^24), per-channel `clamp(round(acc * scale[n]), -128, 127)` epilogue packed 4 outputs per u32 (a QLinearConv-style
+requantize). Loads are 4x smaller than f32 and 2x smaller than packed f16. Correct against an exact CPU integer reference (0 wrong of 600 samples per case, all shapes). Same
+session, best tile per variant (the phone was shared and slow: f32 `sc` read 92-146 GFLOPS instead of the usual 200-280, so read ratios, not absolute values; `RB=off VMM=1`, 5 s warm-up for the int8 binary):
+
+| GEMM (M N K) | f32 `sc` | p16 (f16 storage) | int8 `dot` (polyfill) | int8 `f8` (TM=4 NV=1) | f8 / f32 | f8 / p16 |
+|---|---|---|---|---|---|---|
+| 784 512 128 | 146 | 172-195 | 141-159 | **358** (wg 16x8) | 2.5x | 2.0x |
+| 3136 256 64 | 131 | 166 | 136 | **329-346** | 2.6x | 2.0x |
+| 784 128 1152 | 116 | 180 | 142 | **308** | 2.7x | 1.7x |
+| 196 256 2304 | 95 | 154-160 | 136 | **324** (wg 32x4) | 3.4x | 2.0x |
+
+Caveats: `f8` is very sensitive to the tile: the 64-accumulator tile (TM=8 NV=2) spills and runs at 5-6 GOPS, TM=4 NV=2 gives 120-138, TM=4 NV=1 with a 16x8 or 32x4 workgroup gives 300-360 (and
+some workgroup shapes swing by 2x between shapes), so a real kernel needs a per-shape tile table. All GOPS are 2*M*N*K/time and count int8 MACs like f32 FMAs.
+
+**ResNet-50 estimate (not measured in ORT).** Conv MACs: 1x1 2.12 G (36 layers, 51%), 3x3 1.85 G (16 layers, 45%), 7x7 stem 0.12 G. 1x1 convs are plain GEMMs and would take the `f8` kernel
+(2.0-2.7x over f32, 17.5 M activation elements = 17.5 MB int8 instead of 70 MB f32). The 3x3 layers already use f32 Winograd, which is ~1.6x faster than a direct kernel, while a direct int8 3x3 conv
+pays the gather penalty (~30% below a plain GEMM), so it would be roughly on par with Winograd f32: leave them in f32 and fuse the (de)quantize into the neighbouring epilogues (the 1x1 requantize
+epilogue and the Winograd output transform) so no standalone Q/DQ dispatches appear; residual Adds would need an int8 or dequantize-add kernel. With the ~25 ms that the 1x1 layers take of the current ~58 ms:
+full microbenchmark gain -> ~11-12 ms (58 -> ~44 ms), half of it transferring (as with earlier GEMM results) -> ~17 ms (58 -> ~50 ms). That is -12% to -24% on ResNet-50, for
+mixed-precision PTQ accuracy (int8 activations on the 1x1 layers) that must be checked per model. **Integration cost is high:** the ORT WebGPU EP has no QLinearConv / ConvInteger kernel, so it needs
+a new kernel, QDQ-fusion registration for the EP, per-shape tile tuning and a calibration flow; it is worth doing only if int8 accuracy is acceptable for the target models. The cheaper
+intermediate step is weights-only int8 (dequantize in the kernel), which cuts weight traffic 4x but leaves activations f32.
+
+## fp16 graphs on ORT's WebGPU EP (stock fp16 kernels, phone, 2026-10-01)
+
+Scripts: `webgpu_ops/fp16/` (`convert_fp16.py`: `onnxconverter_common.float16.convert_float_to_float16(keep_io_types=True)`; `conv_only_fp16.py`,
+`conv_kind_fp16.py`: fp16 only around selected Convs; `run_fp16.sh`). Same ORT build and GPU as the fp32 numbers (Winograd default on, which only
+applies to fp32 tensors, so fp16 graphs take ORT's stock fp16 paths), >= 5 s warm-up, medians. Graph I/O stays fp32.
+
+| model | fp32 (Winograd etc.) | fp16 graph | error vs fp32 (same build) |
+|---|---|---|---|
+| ResNet-50 | 61.2 ms | **55.3 ms** (-10%) | logits rms 3.6e-3, max 8e-3; top-1 911 = fp32 = CPU |
+| YOLO11n | 72.0 ms | **59.7 ms** (-17%) | rms 1.9e-3, max 2.3e-2 of the output range |
+| SAM-L0 encoder | 370 ms | 340 ms | **all NaN** |
+| RT-DETR pre | 343 ms | 318 ms | **all NaN** (outputs 0-4), outputs 5/6 wrong |
+
+- **No CPU fallbacks** in the fp16 graphs of ResNet-50 (279 nodes), YOLO11n (558) and SAM (525) (profiler); RT-DETR pre keeps the same 9 CPU nodes as fp32
+  (`Unsqueeze` x3, `Tile` x6). So the stock fp16 Conv/MatMul path is complete; the fp16 win is 10-17% on the two models that survive, compared with
+  Winograd + texture weights at 58 ms on ResNet-50 (the paths do not combine: Winograd is fp32-only).
+- **SAM-L0 and RT-DETR are not usable in fp16 with the stock kernels, and the timings above are void.** Bisecting SAM (33 intermediate outputs): the first
+  NaNs appear in the third stage's MLP Gelu after the linear-attention `MatMul`/`Add` (values up to ~500); `LayerNormalization`/`Softmax`/`Div`/`Erf`/`Gelu`/`MatMul`/`Gemm`
+  kept in fp32 (op block lists) did not remove them. Converting **only Convs** to fp16 (fp32 elsewhere, Casts around each Conv) isolates it to the **group=1 1x1 convs**:
+  fp16 on just those 40 convs gives rms error **0.62** (and 351 ms, i.e. fast because wrong), fp16 on the 11 group-1 3x3 convs 1.2e-2, on the 18 grouped convs 1.7e-2.
+  ORT's 1x1 fp16 path is the MatMul-style kernel with f16 accumulators, which loses the sum over K = 256-3072 once activations reach tens to hundreds.
+  Wrapping fp16 around Conv only (no other fp16 ops) is also no faster: SAM 382 ms and RT-DETR 342 ms with Casts, vs 370 / 343 fp32.
+- **Implication for this investigation:** the lower-precision route that works here is f16 *storage* with f32 *accumulation* (the `p16` GEMM, the f16 Winograd
+  intermediates and the RGBA16F texture weights above), not ORT's f16-accumulating kernels. A fp16 activation graph would need ORT's Conv/MatMul shaders changed
+  to accumulate in f32 before it is safe on attention-heavy models.
+- **Weight-only fp16 (fp16 initializers + runtime `Cast` to fp32) could not be measured:** keeping the initializers as graph inputs (so ORT cannot fold the Cast back
+  to fp32) makes the phone `bench` crash on load (the same model runs in host onnxruntime), and with the Casts folded it is just the fp32 model. A runtime Cast would
+  also add a write+read of the fp32 weights, the opposite of a bandwidth saving; the useful version of the idea is the texture-weights result (RGBA16F weights read
+  directly by the GEMM).
+- Recommendation: keep fp32 as the default. fp16 graphs are a 10-17% win for ResNet/YOLO-style convnets but need a per-model accuracy check and are broken on
+  SAM/RT-DETR until the f16 kernels accumulate in f32.
+
+## f32 accumulation in ORT's fp16 MatMul/Conv2dMM: does not fix the SAM / RT-DETR NaNs (opt-in, `ORT_WEBGPU_F16_ACC32=1`)
+
+The fp16-graph run above suspected that ORT's fp16 1x1 conv accumulates in f16. `webgpu_ops/ort_f16_f32_accumulate.patch` (apply before
+`ort_conv_winograd.patch`, which calls the new `f32_accumulate` argument) makes the vec4 packed MatMul/Conv2dMM accumulators f32 for fp16 inputs
+(non-transposed, alpha 1, no split-K). Result on the fp16 graphs (phone medians; error vs the CPU EP):
+
+| model | f16 accumulate | f32 accumulate |
+|---|---|---|
+| ResNet-50 | 58.0 ms, 9.8e-3 | 60.3 ms, 8.3e-3 |
+| YOLO11n | 60.7 ms, 1.4e-2 | 65.0 ms, 1.1e-2 |
+| SAM-L0 encoder | 355 ms, NaN | 405 ms, NaN |
+| RT-DETR pre | 322 ms, NaN | 368 ms, NaN |
+
+So accumulation precision is not the cause of the NaNs; f32 accumulation costs 4-14% and buys little accuracy, hence opt-in. The NaN source in SAM/RT-DETR is still
+open (first NaN is at the third-stage MLP Gelu, where values reach ~500; the tanh-Gelu's x^3 overflows f16 above |x| ~ 40, and other f16 intermediates in the
+attention blocks may overflow too -- not isolated).
+
+## Conv + residual Add (+ReLU) fusion, and the Winograd weight cache that was not being used
+
+`webgpu_ops/ort_conv_add_fusion.patch` (last in the stack: transpose -> missing_ops -> silu_fusion -> gelu_fusion -> extra_texture -> f16_f32_accumulate
+-> conv_winograd -> conv_add_fusion):
+- **Graph:** `ConvActivationFusion` gets a WebGPU-only rule that fuses `Conv(NHWC internal, with bias) -> Add(same-shape residual)` into
+  `com.microsoft::NhwcFusedConv(X, W, B, Z)` (the existing contrib schema, which already has the optional residual input `Z`); the existing Conv+activation
+  rule then also fuses a following ReLU into the NhwcFusedConv (`activation` attribute; order is act(conv + bias + Z)). `ORT_WEBGPU_CONV_ADD_FUSION=0` disables it.
+- **Kernel:** the WebGPU `NhwcFusedConv` kernel reuses `Conv<true, true>`. The residual is applied natively in the vec4 channels-last MatMul path (1x1 convs)
+  and in the Winograd output stage; every other conv kind (Conv2dMM 3x3 with < 64 channels, stride-2, grouped/depthwise, Im2col, odd channel counts) runs the
+  convolution without its activation into a temporary and then one `ConvResidualAdd` program does act(a + z), so the result is always correct.
+- ResNet-50 loses all 48 Add and 48 Relu dispatches. `gen_new_op_tests.py` has 12 Conv+Add(+ReLU) cases covering the native and fallback paths; sweep: 311 OK, 0 wrong
+  (the first run caught a real bug: the Winograd call site was not passing the residual).
+- **Also fixed:** the call site of the Winograd path never passed the weight cache (`winograd_u_`; a silently non-matching `replace` earlier), so the weight transform and the
+  texture creation ran on every inference. With the cache in place the transform runs once.
+
+Phone medians (fp32 logits within 8e-7 of the CPU, top-1 unchanged), add fusion off -> on, weights cached:
+
+| model | before this change | add fusion + weight cache | + `ORT_WEBGPU_WINO_TEX=16` |
+|---|---|---|---|
+| ResNet-50 | 61.7 ms | **55.2-56.7 ms** | 53.8 ms |
+| YOLO11n | 75.8 | 73.3 (fusion alone -3%) | 71.5 |
+| YOLO26n | 66.2 | 65.1 | -- |
+| SAM-L0 encoder | 370 | 369 | 337 |
+| RT-DETR pre | 357 | 346 | 312 |
+
+(The phone was a few percent slower this session than in earlier tables, so compare within a row.) ORT's default conv was 67 ms on ResNet-50, i.e. fp32-exact ResNet-50 is now
+~17% faster than stock and ~20% faster with texture weights.
+
+## RT-DETR CPU round trip: `enableInt64=1` removes it without a code change
+
+RT-DETR `pre` keeps 3 `Unsqueeze` + 6 `Tile` nodes on the CPU EP because they consume the int64 `TopK` indices and the WebGPU EP only registers int64 kernels when the
+provider option `enableInt64` is on (the kernels exist; `Tile` and `Unsqueeze` register conditionally). With `enableInt64=1` (provider option key
+`ep.webgpuexecutionprovider.enableInt64`; `bench` takes it as `enableInt64=1`) no node of `pre` falls back to the CPU and the model goes 343 -> **337 ms**
+(two runs: 342.9/343.0 -> 338.2/335.7); `mid0` 18.7 -> 19.3 and `post` 11.6 -> 11.5 ms (unchanged, no CPU nodes). So: turn the option on for models whose int64 index tensors feed shape/gather-style ops.
+
+Not done: an NHWC Resize (YOLO has 4 Transposes around its 2 nearest-neighbour Resizes, est. 1-2%). The nearest-neighbour shader is already layout-generic and UpsampleBase already validates
+NHWC scales, but `ShouldConvertDataLayoutForOp` decides per op type, not per attribute, so registering an NHWC Resize would also route non-antialiased bicubic Resizes into an NHWC kernel
+that rejects them -- a regression for those models that is not worth ~1.5% on YOLO.
+
+## tinygrad Adreno OpenCL vs the ORT WebGPU stack (one session, 2026-10-01)
+
+tinygrad bundles exported on the phone (`scripts/android/tinygrad_aot`, `DEV=CL`, `--adreno`, tinygrad's default heuristics, no BEAM) and run with `tg_cl_bench`
+(150 iterations after warm-up, wall time includes the input upload and output readback; "GPU" is the sum of the per-kernel OpenCL event times of one run).
+ORT WebGPU is the current stack (Winograd + Conv/Add/ReLU/Gelu fusion + weight cache; fp32 unless noted), same session, 60 warm-up runs. The phone ran ~8-10%
+slower than in the earlier tables of this document (ORT ResNet-50 62.5 ms here against ~56 earlier), so compare within the table. Scripts and raw per-kernel
+profiles: `scripts/android/tinygrad_aot/compare_webgpu/`. Inputs: ResNet-50 with a static 1x3x224x224 input; the YOLO11n float twin (NHWC 0..255 float input).
+SAM-L0 and RT-DETR were not attempted: a YOLO11n fp32 export alone took 26 minutes of on-phone compile.
+
+| model | tinygrad OpenCL fp16 images | tinygrad fp32 images | tinygrad fp32 buffers | ORT WebGPU fp32 | ORT + texture weights (f16 weights) | ORT fp16 graph |
+|---|---|---|---|---|---|---|
+| ResNet-50 | 84-85 ms (GPU 80.7, 64 calls) | 116-117 (GPU 113-123) | 460-472 (GPU 455, 51 calls) | **62.4 / 62.6** | **58.2 / 59.4** | 55.9 / 61.4 |
+| YOLO11n | **53.3** (min 45.8; GPU 38-43, 122 calls) | 57.2 (GPU 51-53) | 441 (GPU 426, 94 calls) | 76.7 / 76.9 | 71.5 / 74.9 | 64.4 / 69.4 |
+
+Accuracy of the tinygrad bundles against ORT CPU fp32 on the same input: fp32 images/buffers match to 3e-7 rms (ResNet-50 logits 5e-7 max, YOLO11n 5e-6 max);
+fp16 images: ResNet-50 3.7e-3 rms / 1.05e-2 max-relative, top-1 unchanged; YOLO11n 1.3e-3 rms / 1.1e-2 max. (ORT's fp32 path is exact to 8e-7; its texture-weight mode is 1.3e-3.)
+
+**ResNet-50: ORT is faster.** tinygrad fp16 is 1.4x slower than ORT fp32 and tinygrad fp32 (images) 1.9x slower; on YOLO11n tinygrad is 1.2-1.4x *faster* than ORT fp32/fp16.
+Where the time goes (one ResNet-50 run):
+
+| kernel class | count | tinygrad fp16 (GPU ms) | tinygrad fp32 images | ORT WebGPU (wall-based estimate) |
+|---|---|---|---|---|
+| 3x3 convs | 16 | **42.4** (64@56 3x1.03, 128@28 0.54+3x0.93, 256@14 1.85+5x2.21, 512@7 4.9+2x9.1) | 61.5 | ~27 (chains below), Winograd |
+| 7x7 stem | 1 | 2.8 | 3.0 | n/a |
+| 1x1 convs + pools + fc (`r_` kernels) | 34 | 34.9 | 47.9 | rest of the 58-62 ms |
+| elementwise (`E_`) | 13 | 0.7 | 0.9 | (fused away) |
+
+ORT's per-3x3 cost cannot be read from its profiler (its per-dispatch GPU timestamps sum to ~12 ms of a 58 ms run), so I timed chains of 2 and 10 identical convs
+(Conv+ReLU, one model per shape, `(T10 - T2) / 8` per conv, +-30% noise): 64@56 1.2, 128@28 1.8, 256@14 2.0, 512@7 1.4 ms (texture weights: 2.1 / 1.5 / 2.0 / 1.1; noisy),
+which weighted by ResNet-50's 3/4/6/3 3x3 convs gives ~27 ms against tinygrad's 42 ms fp16. 1x1 pairs in the same chain test: 1.15 (256<->64 @56), 1.6 (512<->128 @28), 2.15 (1024<->256 @14),
+2.2 ms (2048<->512 @7) per conv for ORT.
+
+What explains the gaps:
+- **The image2d (texture) path is worth ~4x for tinygrad**, the same finding as the layout study: the *same* kernels on plain fp32 buffers take 472 ms against 117 ms with
+  `image2d_t` (ResNet-50), 441 vs 57 ms (YOLO11n). tinygrad reads weights and activations through the texture cache with RGBA texels (4 channels/load); that is what
+  `ORT_WEBGPU_WINO_TEX` copies for the Winograd weights only, and ORT's other kernels still read storage buffers. fp16 on top of images is 1.4x (ResNet-50) / 1.2-1.4x (YOLO11n).
+- **Algorithm choice decides ResNet-50**: tinygrad runs every 3x3 as a direct conv, ORT as Winograd (16 convs, 2.25x fewer multiplies). The direct 3x3 kernels are good where
+  the grid is large (64@56: 1.03 ms = 225 GFLOPS fp16) and poor where it is small: 512@7 takes 9.1 ms (25 GFLOPS; grid 128x7x7 groups of 16 threads, 49 x 128 work-items per
+  channel block) and 256@14 2.2 ms (105 GFLOPS) -- the three 7x7 3x3 convs alone are 23 ms of tinygrad's 81. tinygrad's default heuristic is not BEAM-tuned here
+  (`export_cl.py` only BEAM-searches kernels the vendor compiler rejects); the repo's earlier tuning runs show 2x on such kernels.
+- **YOLO11n favours tinygrad** because its 3x3 convs are low-channel/high-resolution (Winograd is off below 64 channels in ORT, where its stock Conv2dMM shared-memory path
+  runs on fp32 buffers), exactly where direct convs on fp16 images are strong; tinygrad's 36 3x3 kernels total 20.5 ms fp16, 30 ms fp32.
+- **Fusion/dispatch count** is a minor factor: tinygrad's ResNet-50 is 64 calls (bias, ReLU, residual Add all inside the conv kernels; only 13 tiny `E_` kernels, 0.7 ms) with
+  GPU time 95% of wall; ORT is ~130 dispatches after our fusions (13 us floor each ~ 1.7 ms) plus 3 more per Winograd conv.
+- tinygrad's launch shapes: local sizes are 16-128 invocations (e.g. `l=4x2x16`, `l=16x1x1`, `l=32x4x1`), 4 output channels per thread via RGBA writes, K unrolled x4;
+  weights are repacked once at load into fp16 images (54 `init` calls) -- the same idea as ORT's prepacked/cached transformed weights.
+
+What ORT/WebGPU could copy: (1) read activations as well as weights through textures (ORT's Program API now allows one extra texture; a texture *tensor* type would be needed for
+activations), (2) fp16 texel storage with f32 math, (3) tinygrad's direct 3x3 for the low-channel/high-resolution convs where Winograd is off (YOLO). Three tinygrad kernels are
+extracted in `scripts/android/tinygrad_aot/r50_kernels/` (OpenCL C plus the `plan.txt` launch line): the 3x3 64@56 conv (`r_14_7_4_2_16_4_4_16_3_3_4`, 1.03 ms), the 3x3 256@14 conv
+(`..._v44`, 2.21 ms) and a 1x1 conv fused with its residual add and ReLU (`r_8_49_32_4_4_64_4`, 0.86 ms).
+
+## Root cause of the fp16 NaNs / errors on SAM-L0 and RT-DETR (ORT WebGPU, phone, 2026-10-01)
+
+Tools: `webgpu_ops/fp16/nan/` (host fp32 reference ranges `ranges.py`, per-conv fp16 sensitivity `rank_conv.py`, bisect `bis2.py`/`cmpbis.py`, island variants
+`variants*.py`, isolated 1x1 conv `mkiso.py`); `bench` now accepts `INPUT_BIN=<raw file>` to run a real photo instead of LCG noise (all numbers below use a real
+photo; error = rel-l2 of the output vs the CPU EP fp32). The result is **three independent causes, only two of them fixable with fp32 islands**:
+
+1. **SAM NaN = the linear-attention epsilon.** `Div(num, Add(den, 1e-15))` (4 blocks, `context_module/main/Add` + `Div`): the converter truncates 1e-15 to 1e-7, a subnormal f16 that the GPU
+   flushes to 0, and where the denominator is exactly 0 (the ReLU kernel features of a token are all 0: 1 of 8192 in block `stages.4/op_list.2`) it computes 0/0 = NaN, which then spreads through
+   the next Conv and Gelu. Keeping just those 8 nodes (4 Add + 4 Div) in fp32 removes **all** NaNs (`n_attn`). Nothing overflows in SAM: the largest fp32 intermediate is 1061 (Slice/MatMul of the
+   linear attention), so the earlier "Gelu x^3 overflow" and "values ~500" suspicions were wrong; keeping the 30 Gelu in fp32 changes nothing about the NaNs.
+2. **SAM accuracy = f16 accumulation over cancelling sums, concentrated in 10 layers.** The 10 group-1 1x1 `point_conv` layers with K >= 1024 (stages 3 and 4: 4 + 5 + 1) have trained weights whose products nearly cancel: the median ratio sum|w*x| / |y| is 2000-5000
+   (partial sums up to 2200 for outputs of ~5, bias up to 117). Host emulation of one layer (`stages.3/op_list.0/main/point_conv`, K=2048): f16 operands with f32 accumulation 1.8% error, f16
+   accumulation (what ORT's kernel does) 17-47% depending on the layer; the other 30 1x1 convs are 1e-3..4e-3 even with f16 accumulation. An isolated random-data 1x1 conv of the same shape is fine (K=2048: 6.6e-3 default, 8e-4 with f32 accumulate), so
+   it is the data, not the kernel. `ORT_WEBGPU_F16_ACC32=1` (the f32-accumulation patch) therefore does help once the NaN is gone, which is why it looked useless before.
+3. **Remaining SAM error is f16 operand rounding amplified by the same cancellation.** Even with those 10 convs in fp32, their fp16-rounded inputs give 3% per layer, and it compounds.
+
+SAM-L0 encoder, fp16 variants on the photo (phone medians; fp32 graph 337-370 ms depending on the texture-weight setting):
+
+| fp32 islands | accumulate | error vs fp32 | latency |
+|---|---|---|---|
+| none | f16 | NaN | 352 ms |
+| none | f32 | NaN | 418 ms |
+| 4 Add + 4 Div (attention eps) | f16 | 5.5e-1 | 344 ms |
+| 4 Add + 4 Div | f32 | 7.5e-2 | 406 ms |
+| + 10 cancelling 1x1 convs | f16 | 6.6e-2 | 351 ms |
+| + 10 cancelling 1x1 convs | f32 | 4.9e-2 | 414 ms |
+| + their depthwise conv + Gelu producers (38 nodes) | f32 | **3.2e-2** | 420 ms |
+| + 30 Gelu in fp32 too | f32 | 3.8e-2 | 445 ms |
+
+**No configuration reaches 1e-2** and the ones that do not produce garbage are not faster than the fp32 graph (337 ms with Winograd + texture weights). SAM stays fp32. If an fp16 SAM is ever needed: islands for the attention eps (mandatory),
+the 10 point_conv layers and f32 accumulation get 3% embeddings error at ~the fp32 latency; the real fix is quantization-aware or a per-layer scaled fp16 export, not a runtime option.
+
+**RT-DETR pre: NaN = genuine f16 overflow.** In the fp32 reference the backbone's last stage (`stages.3/layers.1` Conv, 1.4e5, then 3.4e6 after the second conv/Add) feeds the AIFI transformer, whose q/k projections are 2.4e6-7.3e6 and whose
+`self_attn/MatMul` reaches **1.9e12** (inputs 1e6 times 1e6 before the 1/sqrt(d) scaling); everything beyond 65504 becomes inf in f16, and Softmax then returns NaN. The values collapse again at the first LayerNormalization (3.6). The contiguous island
+nodes 37-65 of the fp32 node list (3 Conv, Add, 8 Reshape, 5 Transpose, 4 Gemm, 2 Mul, 2 MatMul, Softmax, LayerNorm: 29 nodes) fixes every NaN. Results (fp32 island + f32 accumulate): the three 8400x256 memory outputs 1.2e-2 relative,
+all finite; the four query outputs (`h`, `off`, `w`, `ref`) differ by 0.2-0.7 because the top-300 query selection picks different queries under f16, so they cannot be compared elementwise. Latency 345 ms (f16 accumulate) / 381-393 ms (f32 accumulate) against 312-345 ms fp32, i.e. no gain either.
+`ORT_WEBGPU_F16_ACC32=1` matters here too (4e-2 -> 1e-2 on the memory outputs).
+
+**Conclusion.** fp16 is not worth enabling for these two models: both need fp32 islands covering the interesting parts of the network and the result is no faster than the fp32 graph with Winograd + texture weights. The two real, reusable findings are
+(a) `onnxconverter_common` turns tiny epsilons (1e-15) into subnormals that the GPU flushes to zero: always clamp epsilons to a normal f16 (>= 6.1e-5) in fp16 graphs, and (b) trained 1x1 layers with sum|wx| / |y| in the thousands need f32 accumulation *and* f32 inputs.
+
+## Texture-fed direct convs for YOLO's non-Winograd shapes (`dawn_repro/conv_tex_direct.cc`)
+
+Where ORT's Winograd is off (stride 2, or min(Cin, Cout) < 64), YOLO11n's 3x3 convs and its 1x1 convs run through the Conv2dMM / MatMul shared-memory tile. This benchmark
+takes 19 shapes from the YOLO11n graph (shape-inferred `yolo11n.onnx`; counts in brackets are how often the shape occurs) and times, ABAB-interleaved (9 rounds, min and median, GPU warmed for
+5 s, every non-ORT variant swept over 5-10 tile/workgroup configurations), against `A` = a replica of ORT's Conv2dMM vec4 shader (8x8 workgroup, 4 rows x 1 vec4 per thread, 32x32x32 shared tiles, im2col
+gather in `mm_readA`): `R` direct register-tile conv, buffer in / buffer weights; `W16` / `W32` weights in an RGBA16F / RGBA32F texture (x = Cout/4, y = tap*Cin + c), activations still a buffer;
+`B16` / `B32` activations (x = w*C4 + c4, y = h) and weights in textures, buffer output; `B16o` as `B16` with the output also written to an RGBA16F texture; `D` the tinygrad strategy from
+`tinygrad_aot/r50_kernels` (4 pixels along x x 1 vec4 of output channels per thread, output-channel index slowest in the workgroup so weight loads are uniform across a wave), texture in / weights / out.
+All of them compute in f32 and match a double-precision CPU reference on the data they read (1e-7 .. 1e-6; 5e-4 when the output is stored as RGBA16F, which is the f16 rounding of the result).
+Min ms per dispatch (raw output with medians, configs and GFLOPS: `dawn_repro/conv_tex_direct_results.txt`):
+
+| shape (x count) | A (ORT replica) | R | W16 | B16 | B16o | D | best vs A | buffer->tex16 copy |
+|---|---|---|---|---|---|---|---|---|
+| 3x3 s1 32>32 @40 (x4) | 0.640 | 0.764 | 0.440 | 0.324 | 0.274 | 0.304 | 2.3x | 0.018 |
+| 3x3 s1 32>64 @40 (x2) | 1.156 | 1.249 | 0.696 | 0.564 | 0.543 | 0.493 | 2.3x | 0.020 |
+| 3x3 s1 64>32 @40 (x2) | 1.209 | 1.421 | 0.931 | 0.614 | 0.617 | 0.621 | 2.0x | 0.033 |
+| 3x3 s1 16>32 @80 (x2) | 1.431 | 1.130 | 0.737 | 0.523 | 0.494 | 0.547 | 2.9x | 0.030 |
+| 3x3 s1 32>16 @80 (x2) | 2.345 | 1.443 | 0.969 | 0.981 | 0.862 | 0.908 | 2.7x | 0.057 |
+| 3x3 s1 8>16 @160 | 3.063 | 1.085 | 0.995 | 0.513 | 0.520 | 0.542 | 6.0x | 0.052 |
+| 3x3 s1 16>8 @160 | 3.566 | 0.998 | 1.400 | 0.864 | 0.719 | 0.723 | 5.0x | 0.084 |
+| 3x3 s2 16>32 @320 | 4.605 | 3.927 | 2.467 | 2.845 | 2.849 | 3.626 | 1.9x | 0.310 |
+| 3x3 s2 64>64 @160 | 3.936 | 3.915 | 2.293 | 3.168 | 4.952 | 4.048 | 1.7x | 0.505 |
+| 3x3 s2 64>64 @80 | 2.666 | 2.399 | 1.443 | 1.417 | 1.249 | 1.183 | 2.3x | 0.098 |
+| 3x3 s2 128>128 @80 | 4.277 | 4.673 | 2.883 | 2.459 | 2.104 | 3.533 | 2.0x | 0.243 |
+| 3x3 s2 128>128 @40 | 1.727 | 1.523 | 0.912 | 0.940 | 0.924 | 0.877 | 2.0x | 0.038 |
+| 3x3 s2 128>256 @40 | 5.582 | 5.235 | 3.111 | 2.398 | 2.288 | 2.616 | 2.4x | 0.054 |
+| 1x1 192>128 @40 (x4) | 1.580 | 1.340 | 0.931 | 0.647 | 0.676 | 0.669 | 2.4x | 0.088 |
+| 1x1 384>256 @20 (x3) | 1.652 | 1.658 | 1.067 | 0.857 | 0.855 | 0.880 | 1.9x | 0.046 |
+| 1x1 256>64 @80 | 3.836 | 3.324 | 2.280 | 1.542 | 1.613 | 1.564 | 2.5x | 0.839 |
+| 1x1 64>64 @80 (x2) | 1.056 | 0.853 | 0.629 | 0.400 | 0.444 | 0.390 | 2.7x | 0.100 |
+
+(Context rows, shapes ORT runs with Winograd today: 3x3 s1 64>64 @80 x2: A 6.68 -> B16 2.73 / D 2.72 ms; 64>64 @20 x9: A 0.76 -> B16o 0.35 ms.)
+
+Weighted by how often each shape occurs in YOLO11n (17 listed shapes, 61.5 ms of the replica's time; YOLO11n takes ~72 ms in ORT, so this is where its time is):
+
+| variant | ms | speed-up vs A |
+|---|---|---|
+| R (direct, buffers) | 52.7 | 1.17x |
+| W16 (texture weights only, buffer activations) | 34.4 | 1.79x |
+| B16 (texture activations + weights, no conversion cost) | 28.8 | 2.14x |
+| B16 + a buffer->tex16 copy before every conv (worst case) | 32.0 | 1.92x |
+| B16o (producers also write textures) | 29.5 | 2.08x |
+| D (tinygrad-like, textures in/out) | 31.2 | 1.97x |
+| B32 (RGBA32F textures) | 38.4 | 1.60x |
+
+What this says:
+- **Textures are the whole effect.** The plain direct register-tile conv on buffers (`R`) is only 1.17x the ORT replica; moving the weights into an RGBA16F texture takes it to 1.79x, activations as well to 2.14x. RGBA32F textures are
+  worth less (1.60x): the RGBA16F texels halve the bytes per fetch. It is the same ordering as the OpenCL study (images >> buffers), and the low-channel layers gain most (8>16 @160: 6.0x, 16>32 @80: 2.9x).
+- **Weights in a texture are two thirds of it and need no new tensor type.** `W16` keeps buffer activations and already gets 1.79x. ORT's Program API has had a
+  (single) extra texture slot since the Winograd change, and weights are the one tensor that can be converted once at prepack time, so a direct register-tile 3x3 / 1x1 kernel with RGBA16F weights is a drop-in replacement for the
+  Conv2dMM fallback with no layout or producer changes (cost: weights rounded to f16, ~1e-3 on the logits as for the Winograd texture-weights mode).
+- **Texture activations are worth another 1.2x, and the conversion is cheap.** A buffer->RGBA16F copy of the layer input costs 0.01-0.1 ms for 15 of the 19 shapes (0.3-0.8 ms for the 6.4 MB activations of the 320x320
+  stem and the @80/@160 64-channel layers), so even converting in front of every conv leaves 1.92x. Break-even (A - B16 - copy) is positive for all 19 shapes; the weakest is 3x3 s2 64>64 @160 (+0.26 ms), the
+  strongest 3x3 s2 128>256 @40 (+3.1 ms). Having producers write textures (`B16o`) is free in the kernel itself (2.08x vs 2.14x) but would need a texture output on every producer (elementwise ops, Concat, Split, ...),
+  so it only pays once a layout pass owns the whole chain.
+- **The tinygrad-style kernel (`D`) is not better than a tuned sweep.** Its fixed shape (4 pixels x 1 vec4, channel index slowest) wins on 6 shapes and loses clearly on the stride-2 128>128 @80 and 16>32 @320 layers
+  (3.5 vs 2.1, 3.6 vs 2.8 ms); the best configuration differs per shape (TM 2-8, NV 1-2, oc-fast vs oc-slow), so a per-shape table is needed, as for the GEMM kernels.
+- **Stride 2 is not special**: the same 1.7-2.4x holds with the im2col gather done in the kernel; ORT's replica pays for it in `mm_readA` (integer div/mod per element) and in the shared-memory staging.
+
+**Would a texture path pay off in ORT for YOLO?** Yes, and the cheapest version is the weights-only one. Upper bound from this microbenchmark: 61.5 -> 34.4 ms (weights only) / 28.8-32 ms (activations too) of
+YOLO11n's ~72 ms. Earlier standalone gains transferred to the network only partly (register-tile GEMM: not at all; weights in a texture: 1.5-2.0x per layer in the layout study -> 4-10% end to end on ResNet-50/SAM/RT-DETR), and the replica
+is not ORT's shader (ORT adds bias/SiLU epilogues and its dispatch overhead), so I would expect 8-15 ms (11-20%) on YOLO11n from a texture-weights direct conv (to be measured), and a further few percent from texture
+activations. Not measured here: depthwise convs (YOLO11n has none), the bias/SiLU epilogue, cross-layer producer chains.
+
+
+## YOLO Concat / Split / Transpose: what they cost and which exact rewrites pay (`webgpu_ops/yolo_graph_opt.py`)
+
+**What is in the graph** (YOLO11n; YOLO26n has the same 23 Concat / 11 Split):
+- 23 Concat: 8 C2f/C3k2 block concats `[s0, s1, bottleneck outs] -> 1x1 cv2`, 3 inner `(Add, Conv) -> Conv`, 1 PSA `(Split, Add) -> Conv`, 1 SPPF `(x, mp1, mp2, mp3) -> Conv`,
+  2 neck skips `(Resize, Conv) -> Conv`, 2 neck down-path `(Conv, Conv) -> Conv`, then the head: 3 `(box 64, cls 80) -> Reshape`, 1 over scales, 2 decode. 17 of them feed exactly one 1x1 Conv.
+- 11 Split: 9 are the `cv1 Conv+SiLU -> Split(2 halves)` of the C2f blocks, 1 is the PSA qkv split, 1 the head `(64, 80)` split.
+- 16 Transposes in ORT's NHWC graph (~21.5 MB of tensors): 4 sit around the 2 nearest-neighbour Resizes (which have no NHWC kernel: `Conv -> T -> Resize -> Concat -> T -> Conv`,
+  moving 0.4 + 0.8 + 2.5 + 6.6 MB), 3 are the head's Concat -> Reshape, the rest are in the PSA attention and the DFL.
+
+**Cost of the ops** (wall clock, chains of Split->Concat pairs at the model's real shapes, slope between 2 and 40 pairs; NCHW as in the model):
+a pair costs 0.78 ms at 3.3 MB, 0.63 at 1.6 MB, 0.38 at 0.8 MB, 0.21 at 0.4 MB, 0.85 at 4.8 MB (8-23 GB/s moved), i.e. ~0.1-0.4 ms per Concat or Split.
+Summed over the model's actual tensor sizes: **23 Concats ~5.4 ms (YOLO26n 5.0), 11 Splits ~2.4 ms (2.1)**, together ~11% of the 72 ms. An in-situ upper bound for removing the 17 Concat->1x1 Conv
+(feeding each Conv from its first input only, i.e. also cheaper Convs; wrong output, timing only): YOLO11n 72.3 -> 63.6 ms, YOLO26n 63.7 -> 55.7 ms. Transposes: a Transpose pair
+in ORT is cancelled by the optimizer so it cannot be chained; at the layout study's 10-17 GB/s the 16 cost ~2.5-4.5 ms (estimate, not measured in situ).
+(A first in-situ probe that kept the Concat alive through a ReduceMean to an extra graph output was invalid: the 17 ReduceMeans + readbacks added 20 ms.)
+
+**Exact rewrites** (`python yolo_graph_opt.py in.onnx out.onnx --rules ...`, outputs identical to <= 1.5e-6 relative on a photo, fp32 reassociation only):
+- `split_conv`: `Conv+SiLU -> Split(2)` => two Convs on the halves of the weights. Removes 9 Splits, adds 9 Convs: **no gain** (YOLO11n 72.6 vs 72.3 ms, YOLO26n 63.3 vs 63.1): the extra Conv dispatch costs what the Split did.
+- `head` (YOLO11n only; YOLO26n's head is already split): Reshape box and cls separately and Concat over scales per branch => 3 Concat + 1 Split fewer: **-0.8 ms** (71.5 vs 72.3).
+- `resize_convt`: nearest 2x Resize => depthwise ConvTranspose(kernel 2, stride 2, ones), which has an NHWC kernel, so ORT's 4 Transposes around the Resizes disappear: **-2.4 ms (-3.3%)** on YOLO11n
+  (72.3 -> 69.9); no change on YOLO26n (63.2 vs 63.1), whose Resize neighbours are different.
+- `concat_conv`: Concat -> 1x1 Conv => sum of per-input partial Convs chained with Add (ORT's Conv+Add fusion folds the sums in): fewer copies but more Conv dispatches; **-1.6 ms on YOLO11n alone (70.7 vs 72.3) and -1.0 on YOLO26n alone (62.1 vs 63.1), but not additive** with the others (YOLO11n 70.0 with all four rules vs 69.1 without it).
+
+Default rule set `split_conv,head,resize_convt`, 6 interleaved rounds, medians (min): **YOLO11n 72.1 (70.3) -> 69.4 (68.2) ms, -3.7%; YOLO26n 63.6 (63.0) -> 63.0 (62.8), within noise**; run-to-run noise on the phone is about +-0.7 ms.
+So graph rewrites recover only a quarter of the ~8 ms the Concats and Splits cost; getting the rest needs the producer kernels to write straight into their slice of the Concat output (and the consumer Conv to read a channel-offset
+view for Split), i.e. strided/offset input and output support in the WebGPU Conv/MatMul programs.
+
+## Texture-weight direct conv for low-channel convs in ORT (`ORT_WEBGPU_CONV_TEXDIRECT=1`; YOLO26n -7%, YOLO11n -3%)
+
+Follows the `conv_tex_direct` microbenchmark (texture-fed direct convs 1.8-2.1x over a Conv2dMM replica on YOLO shapes). `webgpu_ops/ort_conv_texdirect.patch` (last in the stack,
+after `ort_conv_add_fusion.patch`) adds `ConvTexDirectProgram`: a register-tiled NHWC vec4 direct convolution whose weights live in an RGBA16F texture
+(uploaded once from the HWIO kernel and cached for prepacked weights; the bias, residual and activation epilogues are fused). It replaces ORT's Conv2dMM for non-1x1 convs with
+Cin, Cout multiples of 4 that Winograd does not take (stride 2, < 64 channels), only when max(Cin, Cout) <= `ORT_WEBGPU_TEXDIRECT_MAXC` (default 64). Env: `ORT_WEBGPU_CONV_TEXDIRECT` (0 off = default, 1 on, 2 also 1x1 stride-1 convs, which still take the MatMul path first so mode 2 is not wired
+there yet), `ORT_WEBGPU_TEXDIRECT_{TM,NV,WX,WY,ORDER,MAXC}`.
+
+Tile choice mattered far more than in the microbenchmark: YOLO11n with the first guess (4 pixels x 1 vec4 channel, channels along x) was **+43% slower** (104 ms), pixels along x brought it to 92, and the best of ~17 configurations
+(2 pixels x 2 vec4 channels, workgroup 32x2, pixels along x) to ~70 ms. Applying it to every conv up to 256 channels is neutral or slightly negative on ResNet/SAM and +4% on RT-DETR, so it is restricted to <= 64 channels.
+
+Phone medians, off -> on (defaults above; fp32 activations, f16-rounded weights): YOLO26n 63.8/63.3 -> **58.9/59.5 ms**, YOLO11n 70.9/72.1 -> **69.0/69.7**, RT-DETR pre 335 -> 336 (unchanged), ResNet-50 and SAM unchanged. Outputs vs the CPU EP: YOLO11n 2.6e-3, YOLO26n 1.8e-3 (weights rounded to f16),
+sweep 311 OK / 0 wrong. A per-shape tile table, a texture-activation path and the 1x1 case are the remaining headroom (the microbenchmark promised 11-20% on YOLO11n; the network got 3%).
+
+### Graph rewrites for YOLO (exact, no kernel change)
+`webgpu_ops/yolo_graph_opt.py` (default rules `split_conv,head,resize_convt`): YOLO11n 72.1 -> 69.4 ms, YOLO26n unchanged; outputs within 1.5e-6.
+
+## Vec4 fast paths for last-axis Concat and Split (`ort_concat_split_vec4.patch`, exact, on by default)
+
+ORT's WebGPU Concat/Split move one scalar per thread and recompute rank-N indices with divisions in the shader. For NHWC activations the channel axis is the last one, so when every piece (and the
+tensor) is a multiple of 4 wide and the type is f32/f16, `ConcatLastAxisVec4Program` / `SplitLastAxisVec4Program` copy vec4s with a flat `(outer, c4)` index (`ORT_WEBGPU_CONCAT_VEC4=0` / `ORT_WEBGPU_SPLIT_VEC4=0`
+disable them; Concat up to the shader's input limit, Split up to 6 outputs). Phone medians (off -> on): YOLO11n 70.4/72.2 -> **68.7/68.8 ms**, YOLO26n 63.3/64.5 -> **61.5/61.9**, RT-DETR pre unchanged within noise (335-346 either way),
+SAM unchanged. Bit-exact copies; sweep 317 OK / 0 wrong with 6 new last-axis Concat/Split cases (`gen_new_op_tests.py`). This captures about 3-4 ms of the ~8 ms the graph analysis attributed to Concat+Split; the rest needs producers writing
+into their Concat slice or consumers reading channel-offset views.
+
+## Texture direct conv: per-shape tile table and the 1x1 case
+`ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..."` overrides the tile per conv shape, `ORT_WEBGPU_TEXDIRECT_LOG=1` prints the shapes the path takes, and `ORT_WEBGPU_CONV_TEXDIRECT=2` also routes 1x1 stride-1 convs
+through it (before they reach the MatMul path). With the default tile, mode 2 is neutral to slightly negative (YOLO11n 66.8 -> 67.9/69.1 ms at MAXC 64, ResNet-50 57.0 -> 57.9 at MAXC 256, 60.5-60.8 at 2048); per-shape results are in the tuning section if the tuning job has finished.
+
+## Tile tuning of the texture-weight direct conv on the real network (stride-2 tile + larger MAXC: YOLO26n -12%, YOLO11n -9%)
+
+Scripts, tables and raw logs: `webgpu_ops/texdirect_tune/` (`tune.py` per-shape ABAB search, `tune_class.py` class-wise search, `validate.py` interleaved whole-setting comparison,
+`accuracy.py`). Everything runs against the already-built library through its env controls (no ORT rebuild): `ORT_WEBGPU_CONV_TEXDIRECT`, `ORT_WEBGPU_TEXDIRECT_MAXC`,
+`ORT_WEBGPU_TEXDIRECT_TABLE="kh:stride:cin:cout:ow=tm,nv,wx,wy,order;..."`.
+
+**Per-layer search does not work end to end.** Timing one layer's tile change in a 70 ms model has a noise floor of ~0.5 ms (the same tile read -0.3..+0.5 ms in different pairs) and
+a layer's whole contribution is 0.2-1 ms, so a single-shape search (ABAB, 14 timed runs, 12 candidates, 1 shape: 2.5 min each) found nothing. Grouping the shapes of a model by (kernel, stride, output width)
+and changing a whole class at once gave a usable signal (candidate accepted only if it beat the default by >0.3 ms in both ABAB pairs):
+
+| class (model) | default 2,2,32x2,pixels-fast | best | gain |
+|---|---|---|---|
+| all stride-1 3x3 classes (YOLO11n w40/80/160, YOLO26n w40/80/160) | already best | -- | 0 |
+| stride-1 3x3 w20 (YOLO26n, 16->16) | | 4,2,32,2,1 | 1.0 ms (single layer; not confirmed) |
+| stride-2 3x3, w40 (YOLO11n and YOLO26n, 64->64 and 128->128) | | 2,2,16,8,1 | 0.9 / 0.9 / 1.7 ms |
+| stride-2 3x3, w80 / w20 (YOLO11n, up to 256 ch) | | 2,2,16,8,1 | 1.2 / 1.1 ms |
+| stride-1 1x1 (mode 2) w40, w160 (YOLO11n) | | 2,1,16,4,1 / 2,1,32,2,1 | 0.8 / 0.7 ms |
+
+The one reproducible rule: **every stride-2 3x3 conv wants a 16x8 workgroup (2 pixels x 2 vec4 channels, pixels along x)**; the stride-1 default (32x2) is already the best. The remaining acceptances are
+within the noise (one ms-scale gain per class, nothing on the neighbouring tile variants).
+
+**Whole-setting validation** (interleaved rounds, 4 x median of 14 runs after warm-up; spread between rounds <= 0.5 ms; "+s2" = stride-2 convs use 2,2,16,8,1):
+
+| setting | YOLO11n | YOLO26n | ResNet-50 | SAM-L0 enc | RT-DETR pre |
+|---|---|---|---|---|---|
+| baseline (`TEXDIRECT=0`) | 71.5 | 62.8 | 56.2 | 367.7 | 338.0 |
+| mode 1, MAXC 64 (previous default of the opt-in) | 68.5 | 58.4 | 56.2 | 365.2 | 341.0 |
+| mode 1, MAXC 64 + s2 | 67.2 | 57.4 | -- | -- | -- |
+| mode 1, MAXC 256 + s2 | 66.0 | 55.1 | -- | 365.3 | 338.0 |
+| **mode 1, MAXC 512 + s2** | **65.3 (-8.6%)** | **55.0 (-12.4%)** | **54.9 (-2.3%)** | **357.3 (-2.8%)** | 335.9 (-0.6%) |
+| mode 2 (1x1 too), MAXC 128 + s2 + 1x1 tiles | 66.4 | 55.0 | -- | -- | -- |
+
+Findings: (1) raising MAXC from 64 to 512 is what pays (the 128-256-channel stride-2 convs, which otherwise fall back to Conv2dMM), but only together with the 16x8 tile -- with the
+default tile MAXC 256 was neutral on ResNet/SAM and -4% on RT-DETR; (2) the 1x1 stride-1 texture path (mode 2) is not better than mode 1 + s2 (it loses 1.1 ms on YOLO11n, ties on YOLO26n);
+(3) the gain is largest for the YOLO models, which have many stride-2 downsampling convs.
+
+**Recommended setting**: `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=512` with the stride-2 tile 2,2,16,8,1 as the built-in default for `stride > 1` (until the source default is changed, pass it through the table
+string built by `validate.py: stride2_table`). Accuracy vs the CPU EP (max relative difference of the outputs; weights rounded to f16): YOLO11n 3.1e-3 (stock WebGPU 2.2e-6), YOLO26n 2.1e-3 (9.3e-7), ResNet-50 1.8e-4 (8.1e-7).
+Not tuned (time): the 1x1 stride-2 convs of ResNet-50 and the `nv`/`tm` axes for MAXC > 64 beyond one class each.
+
+### Texture direct conv: tuned defaults (from the class-wise tuning above)
+`ort_conv_texdirect.patch` now defaults `ORT_WEBGPU_TEXDIRECT_MAXC` to 512 and uses the 16x8 workgroup (`2,2,16,8,1`) for every stride-2 conv (override with the table or `ORT_WEBGPU_TEXDIRECT_TM`); the mode stays opt-in (`ORT_WEBGPU_CONV_TEXDIRECT=1`) because the
+weights are rounded to f16. Phone medians in a final session (two runs, off -> on): YOLO26n 62.4/61.3 -> **57.8/54.2 ms**, YOLO11n 69.0/71.4 -> 71.1/65.9 (noisy; the tuning job measured 71.5 -> 65.3), ResNet-50 57.4/57.1 -> **55.9/56.5**, SAM-L0 encoder 365.7/367.4 -> **357.7/358.0**, RT-DETR pre unchanged (334/337 -> 337/336).
+
+## Weight-only int8/int4 for 1x1 convs through ORT WebGPU's existing MatMulNBits (no ORT change): not a win
+
+`webgpu_ops/nbits/rewrite_1x1_nbits.py` rewrites every stride-1, unpadded, ungrouped 1x1 Conv with a constant weight into
+`Transpose(0,2,3,1) -> com.microsoft::MatMulNBits (symmetric block-wise, bits 4 or 8) -> [bias] -> Transpose(0,3,1,2)` and leaves the rest of the NCHW model alone. ORT's layout transformer and transpose optimizer cancel the
+transposes (per run the optimized graph keeps the same 2 Transposes as the original ResNet-50). Options: `--bits 4|8 --block 32|64|128 --fuse-bias` (conv bias as MatMulNBits input 5) `--accuracy-level 4` (the kernel's DP4A path)
+`--drop-bias` (timing only). Convs with K % block != 0 are skipped: ResNet-50 33/33 rewritten at block 32 and 64 (28 at 128); YOLO11n 38 of 46 (block 32), 35 (64), 23 (128); YOLO26n 45 of 55, 39, 24.
+Scripts: `run_lat*.sh` (ABAB-interleaved medians, 60 warm-up + 15 timed runs, 3 rounds), `run_acc.sh`. All 1x1 MatMulNBits nodes run on the WebGPU EP (no CPU fallback).
+
+**Latency** (phone medians over 3 rounds, ms; ORT defaults: Winograd + add fusion, `enableInt64=1`; the three rounds agree within 0.5 ms):
+
+| model | ORT default | q8 b32 (separate bias Add) | q8 b32 fused bias | q4 b32 fused bias | q8 b64 / b128 | q8 b32 DP4A (`accuracy_level=4`) |
+|---|---|---|---|---|---|---|
+| ResNet-50 | 56.4 | 56.1 | **54.8** (-2.8%) | **54.0** (-4.3%) | 240.6 / 182.2 | 78.0 |
+| YOLO11n | 71.0 | 71.7 | 71.9 (+1.3%) | 72.0 (+1.4%) | 167.2 / 120.5 | 79.4 |
+| YOLO26n | 62.3 | 64.9 | 63.9 (+2.6%) | 62.7 (+0.6%) | 160.2 / 117.1 | 72.4 |
+
+(q4 b64 / b128 are 282 / 199 ms on ResNet-50; the same shape on YOLO. Dropping the bias entirely is as fast as fusing it, so the bias Add is not the cost.)
+
+- **Only block size 32 is usable**: ORT's WebGPU MatMulNBits has its fast path (wide-tile program) for block 32; block 64 and 128 fall to a generic kernel that is 3-5x slower than the conv it replaces.
+- **DP4A is not faster here**: `accuracy_level=4` selects the int8-activation DP4A program (taken only when K % 128 == 0), but the Adreno has no hardware dot4 (earlier int8 microbenchmark), so ResNet-50 goes 54.6 -> 78 ms.
+- **The gain is small even where it exists**: at block 32 the weight-only kernel replaces ORT's 1x1 conv path at about the same speed (ResNet-50 -3% / -4% with int8 / int4 weights; YOLO +1..3%). The int8/int4 weights cut weight bytes 4x/8x, but the dequant ALU, the K-split reduction in the MatMulNBits kernel and the lost fusions eat the saving.
+- **Fusions lost**: each rewritten conv loses Conv+bias+residual-Add+ReLU epilogue fusion (ResNet-50: the 48 `NhwcFusedConv` -> separate residual `Add` and `Relu`) and, on YOLO, the Conv+SiLU epilogue (the `QuickGelu` nodes reappear: 32 per run). Graph nodes per run (profile of 3 runs / 3): ResNet-50 59 -> 140, YOLO11n 177 -> 249, YOLO26n 204 -> 291.
+
+**Accuracy** (vs ORT CPU fp32; real photo `models/photo640.npy` on host, and the phone `bench` seeded random input, max relative difference of the output):
+
+| | q8 b32 | q8 b128 | q4 b32 | q4 b128 |
+|---|---|---|---|---|
+| ResNet-50, photo: logits rel max / top-1 / top-5 overlap | 4.7e-2 / same (444) / 4 of 5 | 4.2e-2 / changed (738) / 5 | 7.0e-1 / changed (522) / 0 | 5.8e-1 / changed (64) / 1 |
+| ResNet-50, phone random input: rel max / top-1 | 6.7e-2 / same | 2.8e-2 / same | 6.0e-1 / changed | 3.3e-1 / changed |
+| YOLO11n, photo: output rel max (box coordinates dominate) / score>0.25 anchors kept | 3.3e-2 / 30 of 30 | | 5.2e-1 / 21 of 30 (22 found, 1 new) | |
+| YOLO26n, photo | 3.4e-2 / 4 of 4 | | 4.1e-1 / 0 of 4 (3 found) | |
+
+Round-to-nearest symmetric int4 without calibration (no GPTQ/AWQ) destroys these conv nets; int8 weights keep the decision on ResNet-50/YOLO but with 3-5e-2 logit error, far worse than the f16-weight texture path (1e-3).
+
+**Conclusion**: weight-only int8/int4 through the existing MatMulNBits is not worth it for 1x1 convs on this GPU: at best 3-4% on ResNet-50 (with accuracy loss) and neutral-to-negative on YOLO. The weight stream is already well served by the RGBA16F texture weights (1.5-2x per layer, 1e-3 error). What a native fused kernel could add beyond this rewrite: (1) keep the Conv+bias+residual+activation epilogue (recovers the +80 dispatches per ResNet-50 run and the SiLU fusion, about the 4-5 ms that separate Add/ReLU passes cost on YOLO/ResNet), (2) read int8 weights from a texture (R8/RGBA8 `unorm` texels convert to f32 for free in the texture unit, no shader unpack ALU) with f32 math, which is the same trick that made the f16 texture weights work and halves the weight bytes again, (3) per-output-channel (not per-32-block) scales applied once in the epilogue, which removes the per-block multiply from the inner loop. I would expect at most ~5-8% on ResNet-50 from such a kernel, mostly from (1) and (2), at the cost of an int8 calibration/accuracy flow; not measured.
+
+## Depthwise conv with vec4 channels (`ort_conv_depthwise_vec4.patch`, exact, on by default)
+
+ORT's GroupedConv computes one scalar output per thread with kh*kw scalar loads (components = 1 when there is one channel per group). For channels-last depthwise convs (group == Cin == Cout, Cout a multiple of 4, f32) `ConvDepthwiseVec4Program` loads vec4 channels and produces
+`ORT_WEBGPU_DEPTHWISE_PIXELS` (default 4, 0 = off) consecutive output pixels per thread; bias and activation are fused. SAM-L0 encoder (18 grouped convs): 365.1/365.7 -> **357.9/357.1 ms** (pixels 2: 358.3, 8: 358.7/360.0), outputs 5e-5 from the CPU EP as before; sweep 317 OK / 0 wrong.
+This is the standalone kernel of `conv_alt.cc` (2.0-2.4x faster than the naive kernel) landing as a ~2% network gain: depthwise convs are a small share of SAM's time.
+Applies after `ort_concat_split_vec4.patch`.
+
+## Where the time goes in SAM-L0 encoder and RT-DETR `pre` (attribution by ablation + isolated op costs)
+
+Tools: `webgpu_ops/attr/` (`ops.py`, `shapes.py`, `classify.py` list/classify the nodes of a saved optimized graph, `ablate.py` + `run_ablation.py` replace op classes by cheap stand-ins and time
+end-to-end ABAB on the phone, `opbench.py`/`opbench_report.py` time every distinct op at its real shapes in isolation, `standin_cost.py`, `bench_attr.cc`). Library = the stack of this PR before the depthwise patch
+(Winograd + add fusion + vec4 Concat/Split + texdirect code, texdirect off), `enableInt64=1`, warm >= 16 runs, 4 interleaved rounds per variant, control noise +-0.5 ms (SAM) / +-3 ms (RT-DETR).
+Optimized graphs: SAM 154 nodes (73 Conv/NhwcFusedConv), RT-DETR 211 nodes (69 Conv/NhwcFusedConv, 22 Gemm, 24 Transpose, 36 Reshape); total 69.6 / 59.4 GFLOP, so both run at ~175-195 GFLOPS average.
+
+### Method notes (what bit)
+- ORT removes `Mul(x, 1)` chains and merges identical copies of a node (CSE), so same-shape stand-ins are free and isolated copies need `OPT_LEVEL0` (`bench_attr` env) to be timed; a channel-expanding stand-in (Slice + 4x Concat) costs 1.1-2.4 ms per node on 8-33 MB tensors (`results/standin_cost.log`), which is why single-node ablations of expanding convs under-report.
+- A stand-in must keep every other dynamic input alive (otherwise ORT prunes the producers and the 'saving' contains a whole branch): `ablate.py` consumes the largest same-shape input and feeds the others to tiny `Reshape->Slice` graph outputs. The first version of the Mul/Add numbers (50 ms) was this artifact.
+- RT-DETR's tail (TopK -> Gather of 300 queries) is data dependent, so ablating upstream values changes its work: the 300-row Gemm/decoder ablations are not trustworthy (one measured -21 ms); that part is reported from isolated op costs.
+- The saved optimized RT-DETR graph runs 361 ms against 334 ms for the original model (same stack), so RT-DETR ablation percentages are on a graph that is 8% slower; the sum of the pieces overshoots the 358 ms baseline by ~10% (removed nodes also remove dispatch gaps).
+- Single-node ablations had occasional +40-60 ms outlier runs; medians/minima of 4 rounds are reported. Single-node results for idx 7, 11 and the two 32-channel stem convs were unstable (0..-17 ms); their group results are consistent (below).
+
+### SAM-L0 encoder (365 ms baseline; 512x512 input, 154 nodes)
+| class (ablated) | nodes | GFLOP | ms removed | eff. GFLOPS |
+|---|---|---|---|---|
+| Conv 1x1 (incl. fused Gelu epilogue) | 40 | 27.9 | **143.5** | 194 |
+| Conv 3x3 dense stride 1 (6 Winograd 100 ms + 2 stem 32-ch convs ~15 ms) | 8 | 31.4 | **114.6** | 274 (Winograd-equivalent) |
+| Conv 3x3 dense stride 2 (32->512 and 64->1024 are 22-26 ms each) | 3 | 9.8 | **43.0** | 227 |
+| depthwise 3x3 s1 / s2 | 8 / 2 | 0.13 / 0.07 | 5.0 / 2.0 | memory-bound (59 / 73 MB) |
+| linear-attention conv aggregates (dw 5x5, 1xN/Nx1, g=48 1x1) | 12 | 0.2 | 8.7 | |
+| MatMul / Slice / Concat / Transpose / Div+Relu / Pad | 8 / 20 / 4 / 13 / 12 / 6 | | 3.8 / 3.6 / 4.4 / 1.3 / 0.8 / 0.1 | |
+| all non-conv linear-attention glue together | 50 | | 2.6 (ablation) - 27.6 (isolated sum, incl. ~0.46 ms/op harness floor not removable by a stand-in) | |
+Convs are ~82-88% of the time. Isolated op costs (floor-corrected, `results/opbench_results.txt`): 12 strided Slices 6.0 ms, Transposes 8.3 ms (e.g. [1,16,16,3072]->NCHW 1.0 ms each x4), MatMul 6.0 ms, Pad 2.5, LayerNorm 1.1, Concat 0.8, elementwise 2.3 ms.
+
+### RT-DETR `pre` (358 ms on the saved graph; 640x640 input, 211 nodes)
+| class | nodes | GFLOP | ms | note |
+|---|---|---|---|---|
+| Conv 3x3 dense stride 1 | 27 | 39.1 | **194** (ablation) | 64-ch @160x160 stage: 5 nodes 77 ms (~120 GFLOPS-equivalent), 128-ch @80x80: 43 ms, neck @80: 43 ms, 256/512 @40/20: 81 ms (~260) |
+| Conv 3x3 dense stride 2 | 6 | 5.4 | 57 | |
+| Conv 1x1 | 36 | 6.9 | 57 (+-8) | ~120 GFLOPS: small K and many tiny maps |
+| Gemm [8400,256]x[256,N] | 8 | 6.9 | 50 (ablation) / 36 (isolated: 6 x 5.1 ms + 2 x 2.0) | 214 GFLOPS |
+| Gemm 400-row encoder FFN / 300-row decoder | 6 / 8 | 1.0 | 21 / (unreliable) ; isolated 7.4 | |
+| Transposes (NCHW<->NHWC, token layouts) | 22 | | 13.9 isolated (ablation 5-16) | 8-17 GB/s: [1,256,8400]->[1,8400,256] 2.0 ms, [1,512,80,80]->NHWC 2.6 ms |
+| Gather with a scalar index (= a copy) / TopK / ReduceMax / GatherElements | 7 / 1 / 1 / 2 | | 4.8 + 7.4 total isolated | [1,8400,256]->[8400,256] 1.6 ms each x3 |
+| NCHW Concat axis 1 / Resize nearest / Pad / Tile | 5 / 2 / | | 7.8 isolated | [1,256,80,80]x2 Concat 2.7 ms, Resize 40->80 2.0 ms |
+| LayerNorm, Softmax (3), SkipLayerNorm | 7 | | 4.7 isolated | LN [1,8400,256] 2.1 ms |
+| attention MatMuls (4) | 4 | 0.3 | 4.0 isolated | |
+| elementwise Add/Mul/Div/Relu/Sigmoid/Erf | 30 | | 3.6 isolated | the manual-Gelu chain and 7 scalar Mul/Div on [400,1024] are 0.25-0.4 ms each |
+Isolated non-conv total: **90.6 ms (Gemm/MatMul 52, Transpose 14, Gather/TopK/Reduce 7, Concat/Resize/Pad/Tile 8, LN/Softmax 5, elementwise 4)** -- about 27% of the model.
+
+### Measured now (env only, no code): RT-DETR large-map convs
+`ORT_WEBGPU_WINO_MAXHW=100` (Winograd only for output maps <= 100, so the 160x160/320x320 convs take the non-Winograd path), original `rtdetr_pre`, 4 interleaved rounds (ms, `results/rtdetr_wino_texdirect_hw.log`):
+default 336.8/343.8/332.7/336.9; Winograd<=100: 329.9/329.8/328.9/328.7 (**-2.4%**); Winograd<=100 + `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=512`: 327.5/326.8/330.2/327.0 (**-3%**);
+Winograd<=60 (80x80 maps direct too): 363 (+8%); texdirect alone with Winograd everywhere: 334-339 (no gain). So Winograd is right at 80x80 and below and wrong above; the high-res 64-channel layers are memory-bound either way (Winograd's 4x-expanded V/M tensors; K = 64 is too small to amortize loads).
+
+### Ranked targets (expected saving = measured share x what a good kernel could do given the ceilings in this file; only the first RT-DETR item is measured)
+**SAM-L0 encoder (365 ms)**
+1. Conv 1x1, 143 ms at 194 GFLOPS (ceiling for a register-tile GEMM here ~260-280): a per-shape tuned MatMul tile / texture weights / f16 weights should reach ~240 GFLOPS -> **-25 to -30 ms (7-8%)**. Many of the 40 are MBConv expand/project convs with 16x16 or 32x32 maps and K up to 6144: split-K or a different tile for tiny maps is part of it.
+2. 3x3 stride-2 (43 ms at 227 GFLOPS, 22-26 ms each for the 32->512 / 64->1024 layers): polyphase Winograd (1.44x fewer multiplies, `conv_s2.cc`) ~ -10 to -13 ms; `ORT_WEBGPU_CONV_TEXDIRECT=1` already takes ~9 ms of it.
+3. Linear-attention glue: 12 strided Slices + 4 Transposes + 8 MatMuls + 6 Pads + Div/Relu + Concat sum to 25-28 ms isolated (every op is a separate 0.3-1.0 ms dispatch on a 2-8 MB tensor): one fused kernel (ReLU linear attention over the 256-ch/33-row tiles) -> **-12 to -15 ms (3-4%)**. The 32-channel stem convs (2 x 1.2 GFLOP, ~15 ms together) are next (texdirect, -5 ms).
+Winograd'd 3x3 (100 ms for 29 GFLOP-equivalent) and the depthwise convs (7 ms) are already near their ceilings; Concat/Transpose/LN together are < 5 ms.
+
+**RT-DETR pre (335 ms original / 358 saved graph)**
+1. High-resolution 3x3 convs (320x320, 160x160, 80x80 maps with 32-128 channels, ~120-180 GFLOPS vs 260 elsewhere, ~100+ ms): measured -8 to -10 ms from Winograd<=100 + texdirect (env above, can be a default heuristic: output map <= 80x80 -> Winograd, larger -> direct); a fused Winograd (input transform -> GEMM -> output transform per tile block without the 4x-expanded V/M tensors) or a tuned direct kernel for K = 32-64 should win 20-40 ms more (unmeasured).
+2. Gemm [8400,256]x[256,256] x6 (31 ms isolated, 214 GFLOPS) + the 400/300-row Gemms (7 ms): register-tile GEMM / f16 or texture weights -> **-8 to -12 ms**.
+3. Data movement, ~35 ms isolated (Transposes 14 at 8-17 GB/s, scalar-index Gather 4.8, NCHW Concat/Resize 5, LayerNorm 2.1, ReduceMax/TopK 2): a shared-memory/vec4 Transpose at ~60-100 GB/s (the ceiling here), a Gather-with-scalar-index lowered to an alias or one vec4 copy, and keeping the hybrid encoder in NHWC (NHWC Resize/Concat) -> **-18 to -22 ms (5-6%)**. Each of these is also 13 us per dispatch of the 211-node graph.
+4. Smaller: attention Softmax/MatMul/LN ~10 ms (fusing Softmax into the MatMul reads ~ -3), the 7 scalar Mul/Div on [400,1024] (manual Gelu: one fused elementwise pass -1 ms).
+(The depthwise vec4 patch landed after these measurements and lowers the SAM numbers by ~8 ms.)
+
+### Winograd output-size cap re-check
+The attribution job measured RT-DETR pre -2.4% with `ORT_WEBGPU_WINO_MAXHW=100` on its library. On the current library (texture/depthwise/concat patches in) the cap is neutral for RT-DETR (332.3/332.1 vs 332.3/333.2), neutral for ResNet-50 and YOLO11n, and **+6 ms worse on SAM** (364.0 vs 357.8), so the default stays uncapped.
+
+## Fused ReLU linear attention (EfficientViT-SAM): 3.2x per block, ~7 ms of the SAM encoder (`dawn_repro/linattn.cc`)
+
+The SAM-L0 encoder has **4** linear-attention blocks (`stages.4/op_list.1-4`), each B=1, heads=32, dim=32, N=256 (16x16 map): qkv [1,3072,16,16] -> Reshape [1,32,96,256] -> q/k/v Slices, ReLU on q and k, Transpose(k), Pad(v) to 33 rows with ones,
+MatMul [32,33,256]x[32,256,32], MatMul [32,33,32]x[32,32,256], Slice num/den, Add(den, 1e-15), Div. `linattn.cc` replicates ORT's 15-dispatch chain (scalar-per-thread kernels; MatMuls as naive reductions, so a best-effort replica, not ORT's tiled
+shader) and a 2-dispatch fused version: (1) per (head, N-quarter) shared-memory tiles of relu(k) and v give partial KV (33x32) sums; (2) per (head, 64 pixels) sum the 4 partials into shared memory, read q straight from the NHWC qkv buffer with relu on load, compute
+num/den and write NHWC [N][heads*dim] (the layout the proj conv reads). Both match a double CPU reference (chain 5.1e-7, fused 4.1e-7, no non-finite values even with exactly-zero denominators).
+
+Phone, warm (5 s warm-up), min of 12 ABAB rounds, per block: back-to-back **chain 2.52 ms -> fused 0.80 ms (3.2x)**; single-block latency 3.29 -> 0.96 ms. Four blocks: 10.1 -> 3.2 ms, **about 7 ms saved of ~357 ms (2%)**. The chain's cost is dispatch count and
+the two naive MatMuls (0.64 + 0.47 ms); the elementwise steps are 0.09-0.1 ms each (13 us floor plus ~50 GB/s on 1 MB). The fused kernels run 0.43 + 0.38 ms; kernel 2 is bound by the 32x32 per-thread FMA loop (not tuned; a vec4/register-tile version could reach ~0.2 ms).
+
+Numerics: fp32 is required (the reference has exactly zero denominators: num = den = 0 there, so the +1e-15 epsilon must stay representable; in f16 it flushes to zero -> 0/0 NaN, the SAM fp16 failure found earlier). Keep the epsilon as a runtime f32 constant, never converted.
+
+Integration plan: (1) ONNX-level rewrite or ORT graph transformer matching `Reshape -> {Slice x3} -> Relu(q), Relu(k) -> Transpose(k), Pad(v, 1.0 on axis 2) -> MatMul(vpad, k^T) -> MatMul(., q) -> Slice x2 -> Add(eps) -> Div -> Reshape`
+(EfficientViT `LiteMLA`) to a contrib op `LinearAttention`-style node `(qkv NCHW or NHWC, eps) -> out` with attrs heads, dim, eps; the WebGPU EP already registers a contrib `LinearAttention` kernel (different semantics, for LLM state), so use a new name (e.g. `ReluLinearAttention`);
+(2) the kernel reads the NHWC qkv conv output (the NHWC layout transformer already supplies it) and writes NHWC; (3) general N: split count NS = ceil(N/tile) with the partial buffer as scratch, dim and heads as shader constants. Gain is ~2% of SAM (7 ms of 357), so it is a lower priority than the 1x1-conv work; the pattern also matters for other EfficientViT models.
+
+## 1x1 stride-1 classes of SAM-L0 and RT-DETR on the texture direct conv (class-wise tile search)
+
+Setup: `webgpu_ops/texdirect_tune/tune_1x1.py` (class-wise search like `tune_class.py`, own phone dir and library copy, shorter timed runs: SAM 6 warm-up + 8 timed per run), screen with `screen.py`, validation with `validate_1x1.py`; tables in `TABLE_*.txt`, per-class logs in `log_1x1_*.txt`.
+Accept rule as before (> 0.3 ms better than the mode's default tile in both ABAB pairs). Classes are (kernel, stride=1, output width); candidate space: all 14 workgroup shapes with wx*wy <= 256 x order 0/1, then tm in {1,4,8}, then nv in {1,4,8}.
+
+Whole-model screen with the default tile (medians of 4 interleaved rounds, ms; `enableInt64=1`; MAXC 512 unless stated):
+
+| model | base (`TEXDIRECT=0`) | mode 1, MAXC 512 | mode 1, MAXC 1024 | mode 2, MAXC 512 | mode 2, MAXC 1024 | mode 2, MAXC 2048 |
+|---|---|---|---|---|---|---|
+| SAM-L0 encoder | 357.9 | 349.3 | **341.1** | 356.0 | 353.3 | 358.0 |
+| RT-DETR pre | 341.2 | 336.1 | 335.4 | 354.1 | 353.6 | 354.3 |
+
+- **MAXC 1024 is the SAM win for mode 1**: it adds the 64->1024 stride-2 3x3 conv (Winograd cannot take it, the buffer Conv2dMM is slow): -16.8 ms, accuracy 9.2e-4 max / 5.9e-4 rms vs the CPU EP (f16 weights).
+- Mode 2 with the default tile (2,2,32,2,1) is *slower* than stock on both models for the 1x1 convs; the tile has to be fitted per class.
+
+Tuned 1x1 / dense-3x3 stride-1 classes (best tile `tm,nv,wx,wy,order`, gain vs the mode-2 default tile for that class):
+
+| SAM-L0 enc class (shapes) | tile | gain |
+|---|---|---|
+| k1 w64 (1024>128, 128>256, 256>256 x5, 512>128) | 2,2,8,16,1 | 11.1 ms |
+| k1 w32 (1024>256 x4, 256>1024 x4, 256>256) | 2,2,16,8,0 | 10.7 |
+| k1 w16 (1024>512 x4, 512>256) | 2,2,32,4,0 | 3.4 |
+| k1 w128 (256>64, 512>64) | 2,2,8,16,0 | 5.4 |
+| k3 w256 (32>32 x2) | 2,2,32,4,1 | 4.0 |
+
+| RT-DETR pre class | tile | gain vs mode-2 default |
+|---|---|---|
+| k1 w20 (6 shapes) | 2,2,8,8,1 | 7.6 ms |
+| k1 w40 (4) | 2,2,32,4,1 | 17.7 |
+| k1 w80 (5) | 2,2,16,8,0 | 25.2 |
+| k1 w160 (64>64) | 2,2,64,1,0 | 12.8 |
+| k3 w320 (32>32, 32>64) | 2,2,8,16,1 | 20.5 |
+
+Whole-setting validation (5 interleaved rounds, medians, ms):
+
+| model | base | mode 1, MAXC 1024 | mode 2, MAXC 1024, default tile | mode 2, MAXC 1024 + tuned table |
+|---|---|---|---|---|
+| SAM-L0 encoder | 358.4 | 341.8 (-16.6) | 352.6 | **322.8 (-35.6, -9.9%)** |
+| RT-DETR pre | 336.9 | 336.4 (-0.4) | 350.5 (+13.6) | 336.8 (-0.1) |
+
+- **RT-DETR: no gain from 1x1 on the texture path.** The tuned tiles only recover what the default tile lost (the 1x1 convs are as fast as ORT's MatMul path, not faster). Keep mode 1 (it is neutral to -5 ms, MAXC 512/1024 equal).
+- **SAM: 322.8 ms, but only with a large accuracy cost.** Output vs the CPU EP: stock WebGPU 5.1e-5 max, mode 1 MAXC 1024 9.2e-4 max (5.9e-4 rms), mode 2 MAXC 256 2.2e-3 max (2.8e-3 rms), mode 2 MAXC 512 2.2e-3 / 2.8e-3, **mode 2 MAXC 1024 + table 7.6e-2 max (4.1e-2 rms)**. The big-K 1x1 convs (K = 1024-2048) have the cancelling weights found in the fp16 NaN job; rounding them to f16 is what costs the accuracy. Per-setting time/accuracy on SAM (ms, ms saved vs 357.4, rms error): mode 1 c1024 341.8 (-15.6, 5.9e-4); mode 2 c256 + table 349.2 (-8.2, 2.8e-3); mode 2 c512 + table **339.4 (-18.1, 2.8e-3)**; mode 2 c1024 + table 322.0 (-35.4, 4.1e-2).
+- MAXC 2048 (adds the 512>1536, 128>2048 and 2048>256 shapes) is slower (326 ms, and unstable 315/360 ms when those shapes inherit their class tile) -- not adopted.
+
+**Recommended:** `ORT_WEBGPU_CONV_TEXDIRECT=1 ORT_WEBGPU_TEXDIRECT_MAXC=1024` for both models (SAM -16 ms, 6e-4 rms; RT-DETR neutral to -5 ms). If ~3e-3 rms is acceptable on SAM, mode 2 with MAXC 512 and the table in `TABLE_sam_l0_enc_m2_c1024.txt` (the MAXC filter drops the 1024-channel entries) gives -18 ms.
+The -35 ms setting needs an accurate weight path: a code change, not implemented here -- an RGBA32F weight texture variant for `ConvTexDirectProgram` (the layout study measured RGBA32F textures at 1.5-1.7x a buffer kernel vs 1.8-2.1x for RGBA16F, so most of the gain should remain with exact f32 weights), selected per layer when K >= 1024 or by an env switch.
+Other kernel ideas that this search could not express with tm/nv/workgroup knobs: a 4-wide K unroll inside the c4 loop with the 4 weight texels of a k4 group fetched first (the loop is latency-bound at tm*nv = 4 accumulators/lane), and cooperative loading of the weight texels into workgroup memory for pixels-fast mappings (all lanes of a workgroup row read the same weight texel).
+
+## Exact (RGBA32F) weight textures for large K: SAM-L0 encoder -32 ms (`ort_conv_texdirect_f32w.patch`)
+
+The 1x1 tuning job's best SAM setting (mode 2, MAXC 1024, class table `texdirect_tune/TABLE_sam_l0_enc_m2_c1024.txt`) was -35 ms but 4.1e-2 rms from the CPU EP, because f16-rounded weights hurt the large-K 1x1 convs (K 1024-2048). This patch
+(applies after `ort_conv_depthwise_vec4.patch`) stores the weights of convs with Cin >= `ORT_WEBGPU_TEXDIRECT_F32_MINK` (default 1024) in an RGBA32F texture (exact) and the rest in RGBA16F; the default `ORT_WEBGPU_TEXDIRECT_MAXC` is now 1024.
+SAM-L0 encoder, two interleaved sessions (ms; error vs CPU EP, max rel / rms):
+
+| setting | ms | error |
+|---|---|---|
+| stock (`TEXDIRECT=0`) | 357.7 / 358.2 | 5.1e-5 / 3.4e-5 |
+| mode 1, MAXC 1024 | 341.0 / 342.8 | 9.2e-4 / 5.9e-4 |
+| mode 2 + table, all f16 weights | 322.8 / 322.5 | 7.6e-2 / 4.1e-2 |
+| **mode 2 + table, f32 weights for Cin >= 1024** | **325.7 / 326.4** | **2.2e-3 / 2.8e-3** |
+| same, f32 for Cin >= 512 | 328.0 / 328.5 | 2.3e-3 / 2.7e-3 |
+
+So `ORT_WEBGPU_CONV_TEXDIRECT=2 ORT_WEBGPU_TEXDIRECT_MAXC=1024 ORT_WEBGPU_TEXDIRECT_TABLE=$(cat texdirect_tune/TABLE_sam_l0_enc_m2_c1024.txt)` gives -9% on the SAM-L0 encoder at 2.8e-3 rms; mode 1 alone (no table) gives -4.7% at 5.9e-4. RT-DETR pre gains nothing from the 1x1 path (336.8 -> 336.8) and is unchanged by mode 1.
+The fused linear-attention prototype (`dawn_repro/linattn.cc`, 3.2x per block, ~7 ms of SAM) is the next candidate.
+
+## Recommended opt-in with everything in (texdirect mode 1, MAXC 1024)
+
+Final interleaved check on the current library (`ORT_WEBGPU_CONV_TEXDIRECT=1`, defaults MAXC 1024, stride-2 tile 16x8, `enableInt64=1`; medians, two sessions), texdirect off -> on:
+YOLO11n 68.5/68.9 -> **62.8/63.7 ms (-8%)**, SAM-L0 encoder 357.2/357.6 -> **341.6/340.6 (-5%)**, ResNet-50 56.3/57.1 -> **55.6/55.5**, RT-DETR pre 330.0/336.3 -> 334.9/334.1 (no gain). Restricting Winograd to >= 96 channels (`ORT_WEBGPU_WINO_MINC=96`) helps RT-DETR
+(321.9/329.2, about -2.5%) but costs SAM 10 ms, so it is not a default. The fused `ReluLinearAttention` op is not pursued: the prototype saves ~7 ms of SAM, and an NCHW contrib op would add two layout Transposes per block (3 MB each) in the NHWC-converted graph, leaving ~1% net.
+
+## What is left after the optimizations: ResNet-50, YOLO11n, YOLO26n attribution (current library, `ORT_WEBGPU_CONV_TEXDIRECT=1`, `enableInt64=1`)
+
+Setup: library at `f2901170` + MAXC 1024 default, own phone dir; baselines 55.2 (ResNet-50), 63.1 (YOLO11n), 52.3 ms (YOLO26n). Saved optimized graphs (59 / 177 / 204 nodes) classified by the code path each conv takes
+(`attr/classify2.py`: W = Winograd, T = texture-weight direct conv, M = 1x1 stride-1 MatMul path with the fused residual epilogue, M2 = 1x1 stride-2, S = stem, D = depthwise vec4), then ABAB ablations (`attr/run_ablation2.py`, `ablate2.py`: an extra input without a
+profile shape, e.g. the fused residual, is kept alive now). Raw rows: `attr/results2/`. Caveat as before: the stand-in costs one copy pass (more for channel-expanding convs; replacing **all** 58 ResNet-50 nodes still takes 22 ms), so "saved" is a lower bound of the op's cost; for
+Concat/Transpose/Add the stand-in (Slice/flat Reshape copies of the other layout) costs *more* than the op, which gives negative "saved" values (Concat -5.1/-9.6, Transpose -11.4 on YOLO11n/26n): those rows are artifacts, so the data-movement costs below come from the isolated-op measurements of the Concat/Split analysis instead.
+The chain method (`attr/chains.py`, N=2 vs N=10 identical convs, `chainrun2.sh`) was too noisy to use here (a 1x1 64>256@56 chain pair read 1.6 ms/conv against 0.4 ms in the real graph: input upload/readback and the first-run clock state dominate the N=2 end); its raw output is kept in `attr/results2/chain_results.txt`.
+
+**ResNet-50 (55.2 ms, 8.18 GFLOP = 148 GFLOPS average).** ms removed, with the conv's own GFLOP (direct-equivalent) and the implied effective rate (saved + a stand-in allowance of ~0.15 ms per same-shape node):
+
+| class | nodes | GFLOP | removed ms | effective GFLOPS |
+|---|---|---|---|---|
+| W 3x3 s1 (Winograd; 64@56 3.7, 128@28 1.4, 256@14 4.9, 512@7 1.5) | 13 | 3.01 | 12.1 | ~210 |
+| M 1x1 s1 (56: 3.3, 28: 4.5, 14: 8.1, 7: 3.4) incl. fused residual+ReLU | 33 | 3.62 | 20.8 (lower bound; ~28 by subtraction) | 130-175 |
+| M2 1x1 s2 | 3 | 0.62 | 2.9 | ~200 |
+| T 3x3 s2 | 3 | 0.69 | 4.4 | ~160 |
+| stem 7x7 s2 (3 channels) | 1 | 0.24 | 0.4 (stand-in is costly; true cost ~1 ms) | ~250? |
+| MaxPool / Gemm / Transpose x2 / GAP | 5 | ~0 | 0.5 / 0.8 / 0.0 / -- | -- |
+
+Convs are ~95% of the time. The 1x1 MatMul path is the biggest class and the slowest one per FLOP (the Winograd 3x3s reach ~210 GFLOPS direct-equivalent). Estimated dispatches: ~97 (13 Winograd convs x 4 programs + 40 single-program convs + 5), i.e. ~1.3 ms (2.3%) at the 13 us floor.
+
+**YOLO11n (63.1 ms, 6.54 GFLOP) / YOLO26n (52.1 ms, 5.48 GFLOP)** ms removed (11n / 26n): W 3x3 10.7 / 1.6; T 3x3 s1 4.6 / 7.0; T 3x3 s2 7.3 / 7.3; M 1x1 13.5 / 10.4; depthwise 1.0 / -0.3; MaxPool 1.4 / 1.7; attention MatMul+Softmax 3.1 / -0.7 (stand-in artifacts); Resize 0.3 / 0.1.
+Convs are ~60-70% of the time; the rest is data movement. From the isolated-op measurements: Concat ~5.4 / 5.0 ms (23 nodes), Split ~2.4 / 2.1 (11), Transposes ~2.5-4.5 (16 / 22), plus Reshape (8 / 12), Add (13 / 15) and the head elementwise ops: about 11-14 ms of YOLO11n has nothing to do with convolution. Estimated dispatches ~215 / ~240 (~2.8 / 3.1 ms at 13 us = 4.5% / 6%).
+
+**tinygrad fp16 OpenCL on the same models** (GPU kernel time by kernel class, `attr/tg_classes.py` over the earlier profiles): ResNet-50 3x3 convs 42.4 ms (16 kernels, ~87 GFLOPS direct) vs ORT W+T ~16.5 ms (2.6x faster in ORT); 1x1 convs + pooling + fc 34.9 ms (34 kernels) vs ORT M+M2+misc ~25-30 ms (similar, ORT slightly ahead); stem 2.8 vs ~1; elementwise 0.7 (ORT fuses it). YOLO11n: 3x3 convs 19.2 ms (33 kernels) vs ORT W+T 22.6 ms (+ stand-in correction ~25); other `r_` kernels (1x1, pooling, attention) 17.5 ms vs ORT M 13.5-17; elementwise 1.7;
+**tinygrad has no Concat, Split, Transpose or Reshape kernels at all** (122 kernels, 38.4 ms GPU, 41.7 ms wall) while ORT spends ~11-14 ms of YOLO11n on them. That, not the convolution kernels, is the remaining YOLO gap; ResNet-50 is already ahead of tinygrad (55 vs 84 ms).
+
+**Measured without any ORT build** (3 interleaved rounds; medians):
+- *Graph capture* (`enableGraphCapture=1`, `iobind=1`, `RunWithBinding` with `gpu_graph_id=0`; timed with the `sync=tiny.onnx` trick, plain run through the same IO-binding path): **YOLO11n 63.2 -> 56.5 ms (-10.6%)**, **YOLO26n 52.5 -> 46.5 (-11.4%)**, ResNet-50 55.4 -> 53.2/54.8/54.7 (-1..-4%). It needs the application to use IO binding; the benefit grows with the dispatch count.
+- *YOLO graph rewrite* (`yolo_graph_opt.py`, default rules `split_conv,head,resize_convt`) on the current stack: YOLO11n 62.5/63.7/62.6 -> **61.6/61.8/61.5 (-1.5%)**, YOLO26n 52.6/52.3/52.6 -> **52.1/51.9/51.9 (-1%)**; adding `concat_conv` is slower (63.0 / 53.3).
+
+**Ranked next optimizations (expected ms saved, how):**
+1. **Concat/Split/Transpose out of the YOLO graphs** (YOLO11n -8 to -10 ms, YOLO26n -8): kernel-level, nothing in the graph can do it exactly: a multi-input 1x1 conv (K loop over several buffers; the `concat_conv` rewrite is a graph version of this and loses because it adds dispatches), producers writing into their slice of the Concat output (needs buffer aliasing in the EP), an NHWC Resize (-1.5, blocked by the per-op layout decision), vec4 Transpose. The vec4 Concat/Split fast paths already took ~3-4 ms of the ~8.
+2. **Graph capture in the application** (YOLO -10..-11%, ResNet -1..-4%): no ORT build, API/session-option only; already measured above.
+3. **1x1 MatMul-path rate** (ResNet-50 ~28 ms at ~130 GFLOPS vs the ~210 the Winograd convs reach; YOLO M 13.5 ms): kernel change, -8 to -12 ms on ResNet-50, -3 to -4 on YOLO. The texture direct kernel in mode 2 is neutral with class-tuned tiles on these shapes; the untried parts are the 4-wide K unroll and cooperative weight loading into workgroup memory suggested by the 1x1 tuning job, or exact RGBA32F weights (K >= 1024 only today).
+4. Winograd stage fusion (input transform into the producer's epilogue, output transform into the consumer): -0.5 to -1 ms per model (the dispatch floor of the 4-program Winograd path is ~0.7 ms on ResNet-50 and ~0.7 on YOLO11n); graph capture already removes most of the floor.
+5. Everything else is small: T/M2 stride-2 convs run at 160-240 GFLOPS (fine), the stem is ~1 ms, the head elementwise ops and attention MatMul/Softmax ~2-3 ms on YOLO11n.
+
+## Fused Concat -> 1x1 conv (`ort_concat_conv.patch`, opt-in `ORT_WEBGPU_CONCAT_CONV=1`, work in progress)
+
+New contrib op `com.microsoft::NhwcConcatConv1x1(W, B, X0..Xn-1)` (schema in `nhwc_schema_defs.cc`, WebGPU kernel `contrib_ops/webgpu/concat_conv.cc`, `ConvConcatTexProgram` in `conv2d_mm.cc`): a ConvActivationFusion rule folds
+`Concat(axis=-1) -> 1x1 stride-1 Conv` (constant float weight, with bias, 2-6 inputs, every channel count a multiple of 4) into one op that reads each concat input directly and keeps the weights in an RGBA16F/32F texture (cached; exact RGBA32F when K >= 1024); the activation rule then fuses the following ReLU/SiLU.
+YOLO11n fuses 15 convs, YOLO26n 17. First measurements with an untuned tile (2 pixels x 2 vec4 channels, 32x2; env `ORT_WEBGPU_CONCATCONV_{TM,NV,WX,WY,TABLE,LOG}`), medians (ms):
+
+| model | off | fused, texdirect off | texdirect 1, fused off | texdirect 1, fused on |
+|---|---|---|---|---|
+| YOLO11n | 70.5/70.2 | **69.0/68.7** | 64.8/63.7 | 61.9/67.2 (noisy) |
+| YOLO26n | 61.9/61.2 | 59.8/63.2 | 55.0/53.1 | 65.9/64.8 (**worse**) |
+
+Accuracy vs the CPU EP: YOLO11n 3.9e-3, YOLO26n 1.2e-3 (f16 weights). As with the 1x1 texdirect convs the default tile is wrong for many 1x1 classes (the earlier tuning needed per-class tiles); the class-wise tuning of this op was handed to a separate job.
+
+## Fused Concat -> 1x1 conv (`NhwcConcatConv1x1`, `ORT_WEBGPU_CONCAT_CONV=1`): it beats the unfused texture path, tuning adds ~0.3-0.8 ms
+
+Phone medians on a private library copy, warm (60-90 warm-up runs, the clock ramped; the 2-warm-up numbers measured earlier were distorted by a cold clock),
+5 interleaved rounds (ms; `scripts/android/webgpu_ops/texdirect_tune/validate_cc.txt`, `ref_cc.txt`):
+
+| setting | YOLO11n | YOLO26n |
+|---|---|---|
+| unfused, `TEXDIRECT=1` (Concat vec4 kernel + texture conv) | 63.0 | 52.1 |
+| fused, default tile (2,2,32,2), `TEXDIRECT=1` | 61.1 | 49.8 |
+| **fused + class table, `TEXDIRECT=1`** | **60.9** | **49.0** |
+| fused, default tile, `TEXDIRECT=0` | 66.7 | 57.8 |
+| fused + class table, `TEXDIRECT=0` | 66.1 | 57.1 |
+
+So the fused op wins over the unfused path in both texture settings (-2.0 / -2.3 ms at the default tile in `TEXDIRECT=1`; the earlier "+3/+10 ms" reading was a cold-clock artifact of 2 warm-up runs).
+Class-wise tile search (`tune_cc.py`, classes by output width; accept > 0.3 ms in both ABAB pairs; logs `log_cc_*.txt`, tables `TABLE_cc_yolo11n.txt`, `TABLE_cc_yolo26n.txt`):
+YOLO11n w20 `2,2,32,4` (+3.3 ms in the screen, +0.3 end to end), w40 `2,2,16,4`, w160 `2,2,128,1`, w80 keeps the default; YOLO26n w20 `2,2,8,16` (+1.0), w160 `2,2,32,4` (+0.7), w40/w80 keep the default.
+Whole-setting gain from the tables: -0.3 (YOLO11n) and -0.8 ms (YOLO26n). Accuracy vs the CPU EP (max rel / rms): YOLO11n fused+table 5.8e-3 / 5.5e-4 (unfused `TEXDIRECT=1`: 3.1e-3 / 3.0e-4), YOLO26n 2.1e-3 / 2.6e-4 (unfused 2.1e-3 / 2.2e-4);
+the fused op rounds all its (up to 6) concat convs' weights to f16, texdirect only those with <= 1024 channels.
+Why the gain is small beyond removing the Concat: the K loop is serial over the inputs with 4-8 accumulators per lane (latency bound); a 4-wide K unroll that fetches the four weight texels before the FMAs and workgroup-memory weight sharing for the pixels-along-x mapping would be the next step (not implemented).
