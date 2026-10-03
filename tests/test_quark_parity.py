@@ -2670,6 +2670,16 @@ def test_matmul_nbits_quark_default_fuses_matmul_add_into_gemm(tmp_path):
     assert [n.op_type for n in q.graph.node] == ["Gemm", "Relu", "MatMulNBits"]
     cfg = qc.QConfig.get_default_config("MATMUL_NBITS")
     cfg.extra_options["MatMulNBitsParams"]["GroupSize"] = 32
+    # onnxsim runs the same pre-processing now (ONNX Runtime's MatMulAddFusion)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = qc.ModelQuantizer(cfg).quantize_model(model, calibration_data_reader=data)
+    assert [n.op_type for n in m.graph.node] == ["Gemm", "Relu", "MatMulNBits"]
+    for k in ("w2_Q4", "w2_scales"):
+        np.testing.assert_array_equal(_nb_inits(m)[k], _nb_inits(q)[k])
+    # without ONNX Runtime's optimizer the pair stays: the MatMul is converted, with
+    # a note, and its last layer is Quark's, tensor for tensor
+    cfg.extra_options["UseRuntimeOptimizers"] = False
     with pytest.warns(UserWarning, match="Gemm"):
         m = qc.ModelQuantizer(cfg).quantize_model(model, calibration_data_reader=data)
     assert [n.op_type for n in m.graph.node] == [
@@ -2678,9 +2688,6 @@ def test_matmul_nbits_quark_default_fuses_matmul_add_into_gemm(tmp_path):
         "Relu",
         "MatMulNBits",
     ]
-    # ... and its last layer is Quark's, tensor for tensor
-    for k in ("w2_Q4", "w2_scales"):
-        np.testing.assert_array_equal(_nb_inits(m)[k], _nb_inits(q)[k])
     x = np.random.default_rng(7).standard_normal((3, 64)).astype(np.float32)
     ref = _run(model, x)
     assert np.linalg.norm(_run(m, x) - ref) / np.linalg.norm(ref) < 0.3

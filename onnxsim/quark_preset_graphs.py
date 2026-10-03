@@ -29,7 +29,7 @@ re-checked against the installed ``amd-quark`` by ``tests/test_quark_parity.py``
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import onnx
@@ -42,6 +42,7 @@ from onnxsim.quark_fakequant_graph import (
     _Plan,
     apply_fake_quant_format,
 )
+from onnxsim.quark_marking import quark_sorted
 
 MS_DOMAIN = "com.microsoft"
 PROMOTABLE_OPS = ("Conv", "ConvTranspose", "Gemm", "MatMul")
@@ -59,14 +60,26 @@ def apply_block_activations_int8_constants(
     model: onnx.ModelProto,
     act_dtype: str,
     exclude: Sequence[str] = (),
+    marking: Optional[Mapping[str, object]] = None,
 ) -> onnx.ModelProto:
     """``act_dtype`` (a block format) fake-quantization on the activations,
-    int8 symmetric per-tensor constants (see the module docstring).
-    Quark's BatchNormalization -> Conv folding is not replicated."""
+    int8 symmetric per-tensor constants (see the module docstring); ``marking``
+    as for :func:`apply_fake_quant_format`."""
     plan = _Plan(model)
     work = onnx.ModelProto()
     work.CopyFrom(model)
-    consts = [t for t in plan.quantized_tensors(work) if t in plan.inits]
+    if marking is not None:
+        consts = [
+            t
+            for t in plan.marked_tensors(
+                work,
+                marking.get("op_types"),  # type: ignore[arg-type]
+                bool(marking.get("force_no_input_check", False)),
+            )
+            if t in plan.inits
+        ]
+    else:
+        consts = [t for t in plan.quantized_tensors(work) if t in plan.inits]
     m = apply_fake_quant_format(
         model,
         act_dtype,
@@ -74,6 +87,7 @@ def apply_block_activations_int8_constants(
         fold_weights=True,
         fold_fn=lambda a, ax: a,  # constants are handled below, not folded
         exclude=exclude,
+        marking=marking,
     )
     g = m.graph
     inits = {t.name: t for t in g.initializer}
@@ -114,7 +128,8 @@ def apply_block_activations_int8_constants(
     g.node.extend(new_nodes + nodes)
     if new_nodes:
         _add_opset(m, MS_DOMAIN)
-    return m
+    # (Quark's quantizers end with its own topological sort)
+    return quark_sorted(m) if marking is not None else m
 
 
 # -- BF16_MIXED_* -----------------------------------------------------------------

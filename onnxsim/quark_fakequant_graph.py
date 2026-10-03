@@ -36,20 +36,36 @@ dimension: ``MatMul`` A -> ``-1`` (its output follows), ``MatMul`` B -> ``-2``
 (or ``rank - 2`` for a constant), ``Gemm`` A / B by ``transA`` / ``transB``,
 ``Softmax`` input -> the softmax axis; a 1-D constant (bias) uses axis 0.
 
-Not replicated: Quark's model pre-processing (it folds ``BatchNormalization``
-into ``Conv``, rewrites ``ReduceMean`` as ``GlobalAveragePool``, runs CLE for
-the BFP/MX presets) and its handling of ops outside the lists above.
+With ``marking`` (what :class:`onnxsim.quark_compat.ModelQuantizer` passes) the
+tensors are picked by Quark's own marking walk
+(:func:`onnxsim.quark_marking.skipped_nodes`) instead of these lists, and the
+result goes through Quark's topological sort, ``clean_initializers`` and -- for the
+float16 / bfloat16 pairs -- Quark's scale / zero point sharing (a data-movement op's
+output reads its input's) and its Q/DQ removal rules. The model pre-processing
+(BatchNormalization folding, ``ReduceMean`` -> ``GlobalAveragePool``, ...) is
+:meth:`ModelQuantizer._preprocess_block_flow`'s, before this module sees the graph;
+CLE is left to a ``CLEConfig``.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import numpy as np
 import onnx
 from onnx import numpy_helper
 
-from onnxsim.quark_marking import opset_unquantized_ops
+from onnxsim.quark_marking import opset_unquantized_ops, quark_sorted, skipped_nodes
 
 COP_DOMAIN = "com.amd.quark"
 DQ_SUFFIX = "_DequantizeLinear_Output"
@@ -88,6 +104,21 @@ PASS_THROUGH_OPS = {
     "Squeeze",
     "Unsqueeze",
     "Resize",
+}
+
+
+# Ops whose quantizer gives the output the input's quantization parameters
+# (ONNX Runtime's QDQDirect8BitOp / QDQResize / QDQMaxPool / QDQSplit, which
+# Quark's registry reuses)
+_SHARING_OPS = {
+    "Reshape",
+    "Transpose",
+    "Squeeze",
+    "Unsqueeze",
+    "Resize",
+    "MaxPool",
+    "Split",
+    "Gather",
 }
 
 
@@ -169,11 +200,13 @@ def _make_node(
 
 
 def _make_half_pair(
-    dtype: str, x: str, y: str, tensor: str
+    dtype: str, x: str, y: str, tensor: str, share: Optional[str] = None
 ) -> Tuple[List[onnx.NodeProto], List[onnx.TensorProto]]:
     """Quark's fp16 / bf16 fake quantization of ``tensor``: Q then DQ with
-    scale 1.0 and a zero point of 0 in ``dtype``; ``x`` -> ``y``."""
-    scale, zp = tensor + "_scale", tensor + "_zero_point"
+    scale 1.0 and a zero point of 0 in ``dtype``; ``x`` -> ``y``. ``share`` is the
+    tensor whose scale and zero-point initializers ``tensor`` reads instead of
+    its own (a data-movement op's output), which then add none."""
+    scale, zp = (share or tensor) + "_scale", (share or tensor) + "_zero_point"
     qout = tensor + "_QuantizeLinear_Output"
     nodes = [
         onnx.helper.make_node(
@@ -191,10 +224,14 @@ def _make_half_pair(
             domain=COP_DOMAIN,
         ),
     ]
-    inits = [
-        numpy_helper.from_array(np.array(1.0, dtype=np.float32), scale),
-        onnx.helper.make_tensor(zp, HALF_DTYPES[dtype], [], [0.0]),
-    ]
+    inits = (
+        []
+        if share
+        else [
+            numpy_helper.from_array(np.array(1.0, dtype=np.float32), scale),
+            onnx.helper.make_tensor(zp, HALF_DTYPES[dtype], [], [0.0]),
+        ]
+    )
     return nodes, inits
 
 
@@ -211,6 +248,7 @@ class _Plan:
         # (ONNX Runtime's QDQ MaxPool / Resize quantizers, which Quark's flows
         # reuse, do nothing below opset 12 / 11)
         self.gated = opset_unquantized_ops(model)
+        self.skipped: Set[str] = set()
         inferred = onnx.shape_inference.infer_shapes(model)
         self.elem: Dict[str, int] = {}
         for vi in (
@@ -260,6 +298,59 @@ class _Plan:
         # that op's input; nothing to do for its own input (not quantized).
         return q
 
+    def share_roots(
+        self,
+        model: onnx.ModelProto,
+        quantized: Sequence[str],
+        marking: Mapping[str, object],
+    ) -> Dict[str, str]:
+        """``{tensor: the tensor whose quantization parameters it reuses}``: the
+        output of a data-movement op (Quark's ``quantize_output_same_as_input``,
+        the QDQ direct / resize / pool / split quantizers) whose input is quantized
+        too reads that input's scale and zero point, the chain's first tensor's."""
+        qset = set(quantized)
+        types = marking.get("op_types")
+        roots: Dict[str, str] = {}
+        for n in model.graph.node:
+            if (
+                n.op_type in _SHARING_OPS
+                and n.input
+                and n.input[0] in qset
+                and (n.name or (n.output[0] if n.output else "")) not in self.skipped
+                and (types is None or n.op_type in types)  # type: ignore[operator]
+            ):
+                for o in n.output:
+                    if o in qset:
+                        roots[o] = roots.get(n.input[0], n.input[0])
+        return roots
+
+    def marked_tensors(
+        self,
+        model: onnx.ModelProto,
+        op_types: Optional[Iterable[str]],
+        force_no_input_check: bool,
+    ) -> List[str]:
+        """Quark's marking (:func:`onnxsim.quark_marking.skipped_nodes`, the walk its
+        op quantizers make over the nodes of the sorted graph): the float tensors of
+        every node whose op type is in ``op_types`` and that does not skip itself,
+        in the order the nodes marked them."""
+        order: List[str] = []
+        self.skipped = skipped_nodes(
+            model,
+            op_types,
+            force_no_input_check=force_no_input_check,
+            order=list(model.graph.node),
+            unquantized_ops=self.gated,
+            marked_out=order,
+        )
+        out: List[str] = []
+        seen: Set[str] = set()
+        for name in order:
+            if name not in seen and self.is_float(name):
+                seen.add(name)
+                out.append(name)
+        return out
+
 
 # Quark drops the fake-quant pair between a producer and a directly following
 # ReLU-like activation in its Q/DQ-based flows (FP16/BF16 here), since the
@@ -290,9 +381,18 @@ def _is_relu_clip(node: onnx.NodeProto, inits: Dict[str, onnx.TensorProto]) -> b
 
 
 def _fused_activation_inputs(
-    model: onnx.ModelProto, inits: Dict[str, onnx.TensorProto]
+    model: onnx.ModelProto,
+    inits: Dict[str, onnx.TensorProto],
+    remove_after: Optional[Iterable[str]] = None,
 ) -> Set[str]:
-    """Tensors written by a producer and read only by one ReLU-like node."""
+    """Tensors Quark leaves without a Q/DQ pair (``get_annotate_tensors``): one
+    written by a producer and read only by one ReLU-like node (``remove_after``:
+    the op types among ``Relu`` / ``Clip`` / ``LeakyRelu`` / ``PRelu`` its
+    ``RemoveQDQConv*`` options keep on, default all), and a ``Pad``'s read only by
+    an (Average) pool."""
+    activations = (
+        set(_FUSE_ACTIVATIONS | {"Clip"}) if remove_after is None else set(remove_after)
+    )
     consumers: Dict[str, List[onnx.NodeProto]] = {}
     for n in model.graph.node:
         for x in n.input:
@@ -307,11 +407,24 @@ def _fused_activation_inputs(
     for n in model.graph.node:
         if not n.input or n.input[0] not in producer_out:
             continue
-        if not (n.op_type in _FUSE_ACTIVATIONS or _is_relu_clip(n, inits)):
+        if not (
+            (n.op_type in _FUSE_ACTIVATIONS and n.op_type in activations)
+            or ("Clip" in activations and _is_relu_clip(n, inits))
+        ):
             continue
         t = n.input[0]
         if len(consumers.get(t, [])) == 1 and t not in graph_outputs:
             out.add(t)
+    pad_out = {n.output[0] for n in model.graph.node if n.op_type == "Pad" and n.output}
+    for n in model.graph.node:
+        if (
+            n.op_type in ("AveragePool", "GlobalAveragePool")
+            and n.input
+            and n.input[0] in pad_out
+        ):
+            t = n.input[0]
+            if len(consumers.get(t, [])) == 1 and t not in graph_outputs:
+                out.add(t)
     return out
 
 
@@ -345,6 +458,32 @@ def _refine_axes(
     return axis
 
 
+def drop_unused_initializers(model: onnx.ModelProto) -> None:
+    """Quark's ``clean_initializers``: drop the constants (and graph inputs of the
+    same name) nothing reads."""
+    used = {o.name for o in model.graph.output}
+
+    def walk(g: onnx.GraphProto) -> None:
+        for n in g.node:
+            used.update(x for x in n.input if x)
+            for a in n.attribute:
+                if a.type == onnx.AttributeProto.GRAPH:
+                    walk(a.g)
+                elif a.type == onnx.AttributeProto.GRAPHS:
+                    for sub in a.graphs:
+                        walk(sub)
+
+    walk(model.graph)
+    keep = [t for t in model.graph.initializer if t.name in used]
+    if len(keep) != len(model.graph.initializer):
+        gone = {t.name for t in model.graph.initializer} - {t.name for t in keep}
+        del model.graph.initializer[:]
+        model.graph.initializer.extend(keep)
+        inputs = [i for i in model.graph.input if i.name not in gone]
+        del model.graph.input[:]
+        model.graph.input.extend(inputs)
+
+
 def apply_fake_quant_format(
     model: onnx.ModelProto,
     dtype: str,
@@ -355,6 +494,8 @@ def apply_fake_quant_format(
     const_dtype: Optional[str] = None,
     quantize_all_ops: bool = True,
     attr_overrides: Optional[Mapping[str, Mapping[str, object]]] = None,
+    marking: Optional[Mapping[str, object]] = None,
+    remove_after: Optional[Iterable[str]] = None,
 ) -> onnx.ModelProto:
     """Return ``model`` with fake-quantization nodes inserted (see the module
     docstring).
@@ -379,6 +520,13 @@ def apply_fake_quant_format(
             ``const_dtype``.
     :param attr_overrides: ``{op type: {attribute: value}}`` applied to the
             block-format nodes (Quark's ``BFPAttributes`` / ``MXAttributes``)
+    :param marking: ``{"op_types": ..., "force_no_input_check": bool}``: pick the
+            tensors with Quark's own marking walk (the op types its quantizer is
+            asked to quantize, whether its direct ops go without an input check)
+            instead of the fixed op lists above
+    :param remove_after: for the half-precision pairs, the activation op types
+            (``Relu`` / ``Clip`` / ``LeakyRelu`` / ``PRelu``) whose producer's output
+            goes without a pair (Quark's ``RemoveQDQConv*`` options); default all
     """
     half = dtype in HALF_DTYPES
     if not half:
@@ -407,13 +555,41 @@ def apply_fake_quant_format(
 
     plan = _Plan(m)
     extra = HALF_EXTRA_OPS.get(dtype) if quantize_all_ops and not const_dtype else None
-    quantized = plan.quantized_tensors(work, extra)
+    if marking is not None:
+        quantized = plan.marked_tensors(
+            work,
+            marking.get("op_types"),  # type: ignore[arg-type]
+            bool(marking.get("force_no_input_check", True)),
+        )
+    else:
+        quantized = plan.quantized_tensors(work, extra)
     if half:
-        fused = _fused_activation_inputs(work, plan.inits)
+        # (structural rules of Quark's post-processing: they read the whole graph, the
+        # excluded nodes included)
+        fused = _fused_activation_inputs(m, plan.inits, remove_after)
         quantized = [t for t in quantized if t not in fused]
-    axes = _refine_axes(work, set(quantized), plan.inits)
+    axes = _refine_axes(m, set(quantized), plan.inits)
+    roots = plan.share_roots(work, quantized, marking) if marking is not None else {}
     consts = [t for t in quantized if t in plan.inits]
     acts = [t for t in quantized if t not in plan.inits]
+    if marking is not None and dtype == "bfloat16" and const_dtype is None:
+        # Quark's bfloat16 constants "avoid the NaN issue due to overflow": a tensor
+        # with a magnitude outside bfloat16's normal range is clipped into it (a zero
+        # stays zero)
+        for c in consts:
+            w = numpy_helper.to_array(plan.inits[c])
+            if (
+                w.dtype.kind == "f"
+                and w.size
+                and (
+                    np.max(np.abs(w)) > 3.38953139e38
+                    or np.min(np.abs(w)) < 1.17549435e-38
+                )
+            ):
+                clipped = (
+                    np.sign(w) * np.clip(np.abs(w), 1.17549435e-38, 3.38953139e38)
+                ).astype(w.dtype)
+                plan.inits[c].CopyFrom(numpy_helper.from_array(clipped, c))
 
     def fake_quant(t: str, src: str, dst: str) -> List[onnx.NodeProto]:
         """The node(s) quantizing tensor ``t``: ``src`` -> ``dst``."""
@@ -429,7 +605,7 @@ def apply_fake_quant_format(
                 )
             ]
         if half:
-            nodes, extra = _make_half_pair(dtype, src, dst, t)
+            nodes, extra = _make_half_pair(dtype, src, dst, t, roots.get(t))
             g.initializer.extend(extra)
             return nodes
         return [
@@ -494,7 +670,12 @@ def apply_fake_quant_format(
         o.domain == COP_DOMAIN for o in m.opset_import
     ):
         m.opset_import.append(onnx.helper.make_opsetid(COP_DOMAIN, 1))
-    return m
+    if marking is not None:
+        # (Quark's quantizers end with ``clean_initializers``: a constant nothing
+        # reads any more -- one the pre-processing left behind -- is dropped)
+        drop_unused_initializers(m)
+    # (Quark's quantizers end with its own topological sort)
+    return quark_sorted(m)
 
 
 __all__ = [
@@ -504,5 +685,6 @@ __all__ = [
     "HALF_DTYPES",
     "HALF_EXTRA_OPS",
     "apply_fake_quant_format",
+    "drop_unused_initializers",
     "node_spec",
 ]

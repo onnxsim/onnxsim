@@ -232,19 +232,24 @@ def fold_batch_norm(
     return out
 
 
-def fold_batch_norm_after_concat(model: onnx.ModelProto) -> onnx.ModelProto:
+def fold_batch_norm_after_concat(
+    model: onnx.ModelProto, skip: Optional[Set[str]] = None
+) -> onnx.ModelProto:
     """Quark's ``fold_batch_norm_after_concat``: a ``BatchNormalization`` whose
     input is a ``Concat`` of ``Conv`` / ``ConvTranspose`` / ``Gemm`` outputs (all
     with constant weights) is folded into those, each taking its slice of the
     channels, and the ``Concat`` takes over the BN's output. Like Quark's, it checks
     neither the ``Concat`` axis nor how many nodes read the convolutions, and uses the
-    last producer's op type for every slice."""
+    last producer's op type for every slice. ``skip`` names BNs it leaves alone."""
+    skip = skip or set()
     out = _copy(model)
     g = out.graph
     inits = {t.name: t for t in g.initializer}
     remove: List[onnx.NodeProto] = []
     for bn in list(g.node):
         if bn.op_type != "BatchNormalization" or len(bn.input) != 5:
+            continue
+        if bn.name in skip:
             continue
         producers = {o: n for n in g.node for o in n.output}
         concat = producers.get(bn.input[0])
@@ -609,6 +614,7 @@ def graph_cleanup(
     copy_bias_ops: Optional[Sequence[str]] = ("Conv", "ConvTranspose", "Gemm"),
     fold_bn: Optional[bool] = None,
     fuse: Optional[Dict[str, Any]] = None,
+    keep_bn: Optional[Set[str]] = None,
 ) -> onnx.ModelProto:
     """What Quark's float-model optimizers (onnxslim's ``SimplifyModel`` and ONNX
     Runtime's ``OptimizeModel``, ``optimize``) do that changes what is
@@ -633,7 +639,12 @@ def graph_cleanup(
     operator fusions after the two optimizers and before its BatchNorm folding, where
     Quark runs them; ``None`` leaves them out. Where ONNX Runtime's basic optimizer is
     only reproduced (not run), its LayerNormalization / Gelu fusions are reproduced
-    too, with the nodes it writes."""
+    too, with the nodes it writes.
+
+    ``keep_bn`` names the ``BatchNormalization`` nodes Quark's quantizer is asked to
+    quantize (their op type is on its list: ``QuantizeAllOpTypes``, an extra op type):
+    its own folding passes leave exactly those alone -- ONNX Runtime's still fold a
+    Conv + BN."""
     from onnxsim.quark_fusions import apply_fusions
 
     if not runtime:
@@ -645,7 +656,13 @@ def graph_cleanup(
             out = apply_fusions(out, instance_norm=False, l2_norm=False, style="ort")
         if fuse is not None:
             out = apply_fusions(out, **fuse)
-        return fold_batch_norm(out, transposed_and_gemm=True)
+        if keep_bn:
+            # (ONNX Runtime's Conv + BN fusion is not Quark's pass)
+            out = fold_batch_norm(out)
+        out = fold_batch_norm(out, keep_bn, transposed_and_gemm=True)
+        if optimize if fold_bn is None else fold_bn:
+            out = fold_batch_norm_after_concat(out, keep_bn)
+        return out
     out = model
     if simplify:
         slimmed = onnxslim_simplify(out, slim_config)
@@ -672,8 +689,8 @@ def graph_cleanup(
     # Quark's own optimizer: BN after a ConvTranspose / Gemm, and after a Concat of
     # convolutions, when ``FoldBatchNorm`` (default: ``OptimizeModel``) is on
     if optimize if fold_bn is None else fold_bn:
-        out = fold_batch_norm(out, transposed_and_gemm=True)
-        out = fold_batch_norm_after_concat(out)
+        out = fold_batch_norm(out, keep_bn, transposed_and_gemm=True)
+        out = fold_batch_norm_after_concat(out, keep_bn)
     return out
 
 
