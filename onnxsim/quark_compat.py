@@ -138,9 +138,8 @@ names and preset *meanings*, not copied.
   op and a ``Pad`` before a pool go without a pair (``RemoveQDQConv*``), unused
   constants are dropped, and the ``opset_import`` list is Quark's (the model's, then
   ``com.microsoft``, then ``com.amd.quark``). Not covered: float16 *input* models
-  (Quark's ``QuantizeFP16`` mode), the ``AutoMixprecision`` presets
-  (``BF16_MIXED_*``, ``tests/test_quark_amp_parity.py``) run no pre-processing, and the
-  output of a ``Gather`` on a constant table in the mixed presets (``BF16_BFP16``,
+  (Quark's ``QuantizeFP16`` mode), and the output of a ``Gather`` on a constant table
+  in the mixed presets (``BF16_BFP16``,
   ``MX9_INT8``) is quantized with the baseline format instead of the table's.
 - Models with a default-domain opset below 13 are quantized in place like Quark
   does (``tests/test_quark_low_opset_parity.py``): the opset is never converted,
@@ -483,6 +482,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -1524,8 +1524,10 @@ class ModelQuantizer:
                 act.dtype in ("float16", "bfloat16")
                 and cfg.extra_options.get("ConvertToHalf")
             )
-            and self._mixed_block_target(act) is None
-            and not any(a.name == "auto_mixprecision" for a in cfg.algo_config)
+            and (
+                self._mixed_block_target(act) is not None
+                or not any(a.name == "auto_mixprecision" for a in cfg.algo_config)
+            )
             and not act.is_dynamic
         )
         target = cfg.extra_options.get("ConvertOpsetVersion")
@@ -1707,12 +1709,51 @@ class ModelQuantizer:
         ignore_unsupported: bool,
         reader: Any = None,
     ) -> onnx.ModelProto:
-        result = self._mix_block_formats(model, act, ignore_unsupported, reader)
+        # The mixed presets quantize the preprocessed BF16 graph, just like the
+        # plain block flows. Candidate names and scores use this graph too.
+        exclude = _match_nodes(
+            model, [e for e in self.config.exclude if isinstance(e, (str, tuple))]
+        )
+        op_types = self._static_op_types(
+            model,
+            quantize_all=bool(self.config.extra_options.get("QuantizeAllOpTypes")),
+        )
+        if not _quantizable(model, op_types, exclude):
+            return model
+        model = _register_domains(
+            self._preprocess_block_flow(model, exclude, True, op_types)
+        )
+        opts = self.config.extra_options
+        result = self._mix_block_formats(
+            model,
+            act,
+            ignore_unsupported,
+            reader,
+            exclude=exclude,
+            marking={
+                "op_types": op_types,
+                "force_no_input_check": bool(
+                    opts.get("ForceQuantizeNoInputCheck", False)
+                ),
+            },
+            remove_after=[
+                op
+                for op, option in (
+                    ("Relu", "RemoveQDQConvRelu"),
+                    ("Clip", "RemoveQDQConvClip"),
+                    ("LeakyRelu", "RemoveQDQConvLeakyRelu"),
+                    ("PRelu", "RemoveQDQConvPRelu"),
+                )
+                if opts.get(option, True)
+            ],
+        )
         if self.config.extra_options.get("DedicateDQNode"):
             from onnxsim.quark_preset_graphs import dedicate_dq_nodes
 
             result = dedicate_dq_nodes(result)
-        return result
+        from onnxsim.quark_marking import quark_sorted
+
+        return quark_sorted(result)
 
     def _mix_block_formats(
         self,
@@ -1720,6 +1761,9 @@ class ModelQuantizer:
         act: QSpec,
         ignore_unsupported: bool,
         reader: Any = None,
+        exclude: Sequence[str] = (),
+        marking: "Optional[Mapping[str, object]]" = None,
+        remove_after: "Optional[Iterable[str]]" = None,
     ) -> onnx.ModelProto:
         from onnxsim.quark_preset_graphs import apply_mixed_block_format
 
@@ -1733,7 +1777,6 @@ class ModelQuantizer:
                 f"algo_config [{', '.join(others)}] is not applied to block formats; "
                 "pass ignore_unsupported_algos=True to quantize without it"
             )
-        exclude = [e for e in self.config.exclude if isinstance(e, str)]
         ops = tuple(p.get("target_op_type") or PROMOTABLE_OPS)
         if p.get("shared_param_mode", "propagate") not in ("propagate", "unshare"):
             raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
@@ -1775,6 +1818,8 @@ class ModelQuantizer:
                 include_layers=p.get("include_layers") or (),
                 exclude_layers=[*(p.get("exclude_layers") or ()), *skipped],
                 dual_nodes=bool(p.get("dual_quant_nodes", False)),
+                marking=marking,
+                remove_after=remove_after,
             )
         from onnxsim.quark_auto_mixprecision import auto_mixprecision_blocks
 
@@ -1811,6 +1856,8 @@ class ModelQuantizer:
             no_input_qdq_shared=bool(p.get("no_input_qdq_shared", False)),
             dual_quant_nodes=bool(p.get("dual_quant_nodes", False)),
             cache_key_fn=self._amp_cache_key_fn(p),
+            marking=marking,
+            remove_after=remove_after,
         )
         self.last_auto_mixprecision = res
         return res.model

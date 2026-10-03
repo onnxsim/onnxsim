@@ -100,6 +100,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -1389,6 +1390,8 @@ def auto_mixprecision_blocks(
     no_input_qdq_shared: bool = False,
     dual_quant_nodes: bool = True,
     cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
+    marking: Optional[Mapping[str, object]] = None,
+    remove_after: Optional[Iterable[str]] = None,
 ) -> AutoMixprecisionResult:
     """Quark's AutoMixprecision for a bfloat16 model whose candidates move to a
     block format (``BF16_MIXED_BFP16`` / ``BF16_MIXED_MXINT8``): the same
@@ -1436,6 +1439,8 @@ def auto_mixprecision_blocks(
             target_ops=ops,
             include_layers=list(nodes) or ["\0no-such-layer"],
             dual_nodes=dual,
+            marking=marking,
+            remove_after=remove_after,
         )
 
     def score_of(moved: Dict[str, TargetSpec]):
