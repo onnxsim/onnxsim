@@ -287,6 +287,9 @@ def skipped_nodes(
     unquantized = set(unquantized_ops)
     inits = {t.name for t in model.graph.initializer}
     nodes = list(order) if order is not None else quark_node_order(model)
+    constant_outputs = {
+        o for n in model.graph.node if n.op_type == "Constant" for o in n.output
+    }
     direct = set(_DIRECT_OPS) | {"Resize", "MaxPool"}
     if direct_pool:
         direct.add("AveragePool")
@@ -367,9 +370,14 @@ def skipped_nodes(
         elif op == "Split":
             marked.update(ins[:1] + outs)
         elif op in ("Conv", "ConvTranspose", "Gemm"):
-            # (QDQConv / QDQGemm: the weight and the bias are quantized as such, so
-            # only when they are initializers)
-            marked.update(ins[:1] + [x for x in ins[1:3] if x in inits] + outs)
+            # A surviving Constant weight is quantized as an activation. Bias
+            # quantization still requires an initializer.
+            marked.update(
+                ins[:1]
+                + [x for x in ins[1:2] if x in inits or x in constant_outputs]
+                + [x for x in ins[2:3] if x in inits]
+                + outs
+            )
         else:
             marked.update(ins + outs)
     return skipped

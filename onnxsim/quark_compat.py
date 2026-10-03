@@ -137,8 +137,9 @@ names and preset *meanings*, not copied.
   input's scale and zero point, a Conv / MatMul / Gemm / ... output before a ReLU-like
   op and a ``Pad`` before a pool go without a pair (``RemoveQDQConv*``), unused
   constants are dropped, and the ``opset_import`` list is Quark's (the model's, then
-  ``com.microsoft``, then ``com.amd.quark``). Not covered: float16 *input* models
-  (Quark's ``QuantizeFP16`` mode), and the output of a ``Gather`` on a constant table
+  ``com.microsoft``, then ``com.amd.quark``). Float16 input models use Quark's
+  ``QuantizeFP16`` mode; ``UseFP32Scale`` converts internal FP16 tensors and adds
+  Casts at the model interface. Not covered: the output of a ``Gather`` on a constant table
   in the mixed presets (``BF16_BFP16``,
   ``MX9_INT8``) is quantized with the baseline format instead of the table's.
 - Models with a default-domain opset below 13 are quantized in place like Quark
@@ -1498,6 +1499,7 @@ class ModelQuantizer:
         self._overrides_applied = False
         self.last_auto_mixprecision = None
         self.last_weight_rounding = {}
+        self._quantize_fp16 = False
         cfg.global_config = cfg.global_config.resolved()
         act, wt = cfg.global_config.activation, cfg.global_config.weight
         assert act is not None and wt is not None  # resolved() fills both
@@ -1530,6 +1532,11 @@ class ModelQuantizer:
 
         if isinstance(model_input, str):
             model_input = onnx.load(model_input)
+        from onnxsim.quark_fp16 import is_fp16_model
+
+        self._quantize_fp16 = bool(
+            cfg.extra_options.get("QuantizeFP16", False) or is_fp16_model(model_input)
+        )
 
         # Quark's pre-processing converts the opset first when asked to
         # (``ConvertOpsetVersion``; it warns and skips when the converter fails).
@@ -1604,6 +1611,19 @@ class ModelQuantizer:
                 model_input, act, wt, calibration_data_reader, runnable
             )
 
+        if (
+            self._quantize_fp16
+            and cfg.extra_options.get("UseFP32Scale", True)
+            and result is not model_input
+        ):
+            from onnxsim.quark_fp16 import convert_fp16_scale_to_fp32
+
+            result = convert_fp16_scale_to_fp32(
+                result,
+                exclude=_match_nodes(
+                    model_input, [e for e in cfg.exclude if isinstance(e, (str, tuple))]
+                ),
+            )
         if (
             cfg.specific_layer_config or cfg.layer_type_config
         ) and not self._overrides_applied:
@@ -2293,7 +2313,8 @@ class ModelQuantizer:
                 "Gemm layers are bit-identical, convolutions and norms differ "
                 "in the last bit)"
                 if name == "adaquant"
-                else " and the arithmetic is float64"
+                else " and the arithmetic is float32 for 16-bit weight grids, "
+                "float64 otherwise"
             )
             + ", so results match Quark statistically "
             "(bit for bit given the same mini-batch indices)"
@@ -2683,6 +2704,8 @@ class ModelQuantizer:
         opts = self.config.extra_options
         if opts.get("SkipPreprocess", False):
             return quark_sorted(model)
+        if getattr(self, "_quantize_fp16", False):
+            opts = {**opts, "OptimizeModel": False}
         work = model
         # Quark's operator fusions (``optimize_model``, after onnxslim and ONNX
         # Runtime's optimizer, whether or not those ran): on by default, opset >= 17
@@ -3012,6 +3035,7 @@ class ModelQuantizer:
             else None,
             fake_int32_bias=bool(opts.get("Int32Bias", False))
             and wt.dtype in ("float16", "bfloat16"),
+            quark_fp16=getattr(self, "_quantize_fp16", False),
             keep_constants=True if self._keeps_constants() else converted_constants,
             calibration_data=calibration[:cal_size] if cal_size else calibration,
             activation_dtype=act_dtype,
@@ -3119,6 +3143,7 @@ class ModelQuantizer:
 
                 q = convert_clip_to_relu(q, lambda n: n.name not in skip_names)
             if opts.get("DedicatedQDQPair", False):
+                from onnxsim.quark_marking import quark_node_order
                 from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
 
                 keep = set(skip_names)
@@ -3131,6 +3156,7 @@ class ModelQuantizer:
                         and n.name not in keep
                         and (scope_types is None or n.op_type in scope_types)
                     },
+                    receiver_order=[n.name for n in quark_node_order(work)],
                 )
             if self._keeps_constants() and not npu_cnn:
                 # (the Constant nodes lead the list, as in Quark's graph, whose own

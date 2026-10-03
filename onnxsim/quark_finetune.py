@@ -98,8 +98,10 @@ reproduce), the norm layers and ``Gelu`` / ``Tanh`` / ``Sigmoid`` (their float32
 kernels differ in the last bit), a numpy whose BLAS rounds differently from torch's
 for a given product shape, and torch's vectorized ``sqrt`` (Sleef's 0.5001-ULP one
 differs from IEEE's in ~0.7 % of the values, 1 ULP, inside Adam's denominator);
-there AdaQuant stays chaotic, compare it statistically. AdaRound agrees in float64
-already, so it keeps it.
+there AdaQuant stays chaotic, compare it statistically. AdaRound uses float32
+for 16-bit weight grids, where rounding its soft codes in float64 can change a
+final code; 8-bit grids keep the float64 path. ``FinetuneOptions.float32`` can
+explicitly select either arithmetic for either algorithm.
 
 ``MemOptLevel=2`` is a different training loop in Quark (its ``DataLoader``
 path): samples are whole calibration *batches* (``np.load(f).squeeze(0)``),
@@ -220,9 +222,8 @@ class FinetuneOptions:
     target_ops: Sequence[str] = TARGET_OPS
     seed: int = 1705472343
     guard: bool = True
-    #: run AdaQuant's training loop in float32 in torch's operation order
-    #: (``None``: on for AdaQuant, which is chaotic enough that float64 noise
-    #: flips codes; AdaRound agrees with Quark in float64 already)
+    #: run the training loop in float32 in torch's operation order
+    #: (``None``: on for AdaQuant and for AdaRound on 16-bit weight grids)
     float32: Optional[bool] = None
 
     def lr(self) -> float:
@@ -1371,7 +1372,9 @@ def _train_block(
     s_total = xq.shape[0]
     adaround = opt.algorithm == "adaround"
     f32 = np.float32
-    use32 = (not adaround) and opt.use_float32()
+    use32 = opt.use_float32() or (
+        adaround and opt.float32 is None and qw.hi - qw.lo > 255
+    )
     if use32:  # torch's tensors: float32 from the data on
         xq, xf, yf = (a.astype(f32) for a in (xq, xf, yf))
     in_fq = (lambda x: x) if blk.in_q is None else blk.in_q.fq
@@ -1400,7 +1403,9 @@ def _train_block(
     # floor, and the rectified sigmoid there on either side of 0, by ULP
     # noise that decides whether it is ever allowed to move -- so mirror it
     wd32 = w.astype(f32) / scale.astype(f32)
-    floor_w = np.floor(wd32).astype(np.float64)
+    floor_w = np.floor(wd32).astype(f32 if use32 else np.float64)
+    if use32:
+        scale, zp = scale.astype(f32), zp.astype(f32)
     diff32 = wd32 - np.floor(wd32)
     # initial (hard-rounded float weight) error: drives LRAdjust
     w_rtn = (np.clip(floor_w + (diff32 >= 0.5) + zp, lo, hi) - zp) * scale
@@ -1426,7 +1431,7 @@ def _train_block(
     # parameters
     if adaround:
         alpha = -np.log(f32(_ZETA - _GAMMA) / (diff32 - f32(_GAMMA)) - f32(1.0))
-        params = [alpha.astype(np.float64)]
+        params = [alpha.astype(f32 if use32 else np.float64)]
     else:
         wv = w.astype(f32) if use32 else w.copy()
         bv = (
@@ -1463,8 +1468,9 @@ def _train_block(
 
         if adaround:
             sig32 = _sigmoid32(params[0])
-            raw_h = (sig32 * f32(_ZETA - _GAMMA) + f32(_GAMMA)).astype(np.float64)
-            sig = sig32.astype(np.float64)
+            arithmetic = f32 if use32 else np.float64
+            raw_h = (sig32 * f32(_ZETA - _GAMMA) + f32(_GAMMA)).astype(arithmetic)
+            sig = sig32.astype(arithmetic)
             h = np.clip(raw_h, 0.0, 1.0)
             raw_q = floor_w + h + zp
             w_hat = (np.clip(raw_q, lo, hi) - zp) * scale

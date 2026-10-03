@@ -315,6 +315,28 @@ def _weight_axis(node: onnx.NodeProto, rank: int) -> Optional[int]:
     return 1  # MatMul [K, N]
 
 
+def _fp16_qparams(lo, hi, qmin: int, qmax: int, symmetric: bool):
+    """Quark's FP16 range arithmetic and FP16-stored scale."""
+    lo = np.minimum(np.float16(lo), np.float16(0))
+    hi = np.maximum(np.float16(hi), np.float16(0))
+    if symmetric:
+        a = np.maximum(np.abs(lo), np.abs(hi))
+        lo, hi = -a, a
+        if qmin < 0:
+            qmin = -qmax
+    scale = np.float64(hi - lo) / np.float64(qmax - qmin)
+    if scale < np.finfo(np.float16).tiny:
+        return np.float16(1), 0
+    zp = (
+        int(np.round((qmin + qmax) / 2))
+        if symmetric
+        else int(np.round(np.float64(qmin) - np.float64(lo) / scale))
+    )
+    if symmetric and qmin == 0 and qmax == 255 and zp == 127:
+        zp = 128
+    return np.float16(scale), zp
+
+
 def _float_tensor_names(model: onnx.ModelProto) -> set:
     g = model.graph
     floats = set()
@@ -322,7 +344,7 @@ def _float_tensor_names(model: onnx.ModelProto) -> set:
         if vi.type.tensor_type.elem_type in (TensorProto.FLOAT, TensorProto.FLOAT16):
             floats.add(vi.name)
     for init in g.initializer:
-        if init.data_type == TensorProto.FLOAT:
+        if init.data_type in (TensorProto.FLOAT, TensorProto.FLOAT16):
             floats.add(init.name)
     return floats
 
@@ -464,6 +486,7 @@ def quantize_full_qdq(
     fake_weight_dtype: Optional[str] = None,
     fake_weight_attributes: Optional[Dict[str, Dict[str, object]]] = None,
     fake_int32_bias: bool = False,
+    quark_fp16: bool = False,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -901,6 +924,10 @@ def quantize_full_qdq(
             quark_rounding=p2_search,
         )
         qdt[x] = dt
+        if quark_fp16 and not p2:
+            qp[x] = _fp16_qparams(
+                *ranges[x], *_DTYPES[dt][2:], tensor_symmetric.get(x, sym)
+            )
 
     for x in graph_inputs:
         if x in seen and x in ranges:
@@ -975,6 +1002,8 @@ def quantize_full_qdq(
         return f"{base}/qdq{uid[0]}"
 
     def add_init(name: str, arr: np.ndarray) -> str:
+        if quark_fp16 and arr.dtype == np.float32:
+            arr = arr.astype(np.float16)
         new_inits.append(numpy_helper.from_array(arr, name))
         return name
 
@@ -1374,7 +1403,7 @@ def quantize_full_qdq(
             if (
                 x not in inits
                 or x not in data
-                or inits[x].data_type != TensorProto.FLOAT
+                or inits[x].data_type not in (TensorProto.FLOAT, TensorProto.FLOAT16)
             ):
                 continue
             w = numpy_helper.to_array(inits[x]).astype(np.float32)
@@ -1465,6 +1494,43 @@ def quantize_full_qdq(
                             np.round(w / s.reshape(shape)), -w_max, w_max
                         ).astype(w_np)
                         zp = np.zeros(s.shape, w_np)
+                    if quark_fp16:
+                        half_w = w.astype(np.float16)
+                        if axis is None:
+                            if not p2:
+                                sc, z = _fp16_qparams(
+                                    half_w.min(),
+                                    half_w.max(),
+                                    wmin,
+                                    wmax,
+                                    weight_symmetric,
+                                )
+                                s, zp = np.array(sc, np.float16), np.array(z, w_np)
+                            else:
+                                s = s.astype(np.float16)
+                            q = np.clip(
+                                np.round(w / s) + zp, max(wmin, -wmax), wmax
+                            ).astype(w_np)
+                        else:
+                            channels = np.moveaxis(half_w, axis, 0)
+                            if not p2:
+                                sz = [
+                                    _fp16_qparams(
+                                        c.min(), c.max(), wmin, wmax, weight_symmetric
+                                    )
+                                    for c in channels
+                                ]
+                                s = np.array([a for a, _ in sz], np.float16)
+                                zp = np.array([b for _, b in sz], w_np)
+                            else:
+                                s = s.astype(np.float16)
+                            shape = [1] * w.ndim
+                            shape[axis] = -1
+                            q = np.clip(
+                                np.round(w / s.reshape(shape)) + zp.reshape(shape),
+                                max(wmin, -wmax),
+                                wmax,
+                            ).astype(w_np)
                     base = fresh(x)
                     add_init(base + f"/{weight_dtype}", q)
                     add_init(base + "/scale", s)
@@ -1546,6 +1612,10 @@ def quantize_full_qdq(
                     if sx_i is None:
                         break
                     prod = (np.float32(sx_i) * ws32).astype(np.float32)
+                    if quark_fp16:
+                        prod = (np.float16(sx_i) * ws32.astype(np.float16)).astype(
+                            np.float32
+                        )
                     if np.all(prod != s):
                         q = (q / (prod / s)).astype(np.int32)
                         s = prod
