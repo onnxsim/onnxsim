@@ -1036,11 +1036,35 @@ class QConfig:
     def get_default_config(config_name: str) -> "QConfig":
         """Preset by Quark name (``"A8W8"``, ``"XINT8"``, ``"BF16"``, ...)."""
         try:
-            return _PRESETS[config_name]()
+            config = _PRESETS[config_name]()
         except KeyError:
             raise ValueError(
                 f"unknown preset {config_name!r}; known: {sorted(_PRESETS)}"
             ) from None
+        base = config_name.removesuffix("_ADAROUND").removesuffix("_ADAQUANT")
+        # These legacy presets explicitly enable input marking; a generic
+        # QConfig and the block/mixed presets use Quark's False default.
+        if base in (
+            "XINT8",
+            "A8W8",
+            "A16W8",
+            "S8S8_AAWS",
+            "U8S8_AAWS",
+            "U8U8_AAWA",
+            "S16S8_ASWS",
+            "U16S8_AAWS",
+            "S16S16_MIXED_S8S8",
+            "INT8_CNN_DEFAULT",
+            "INT16_CNN_DEFAULT",
+            "INT8_CNN_ACCURATE",
+            "INT16_CNN_ACCURATE",
+            "FP16",
+            "BF16",
+        ):
+            config.extra_options.setdefault("ForceQuantizeNoInputCheck", True)
+        if base == "BF16":
+            config.extra_options.setdefault("QuantizeAllOpTypes", True)
+        return config
 
 
 def _layer(act: type, wt: type, **act_kwargs: Any) -> QLayerConfig:
@@ -2001,16 +2025,12 @@ class ModelQuantizer:
                 "activations need a calibrated integer quantizer next to the "
                 "half / block weights"
             )
-        block_consts = act.dtype == "bfloat16" and wt.dtype in _BLOCK_DTYPES
         # Quark's FP16 / BF16 presets set ``ForceQuantizeNoInputCheck`` (BF16 also
         # ``QuantizeAllOpTypes``, the op types of the model as given); the block
         # formats set neither. The extended quantizer's registry is NPU CNN's.
-        half_preset = act.dtype in ("float16", "bfloat16") and not block_consts
         op_types = self._static_op_types(
             model,
-            quantize_all=bool(
-                opts.get("QuantizeAllOpTypes", act.dtype == "bfloat16" and half_preset)
-            ),
+            quantize_all=bool(opts.get("QuantizeAllOpTypes", False)),
         )
         if not _quantizable(model, op_types, exclude):
             # Quark: "No quantizable ops in this model" -- returned as given, before
@@ -2028,9 +2048,7 @@ class ModelQuantizer:
             op_types = op_types | {"BatchNormalization"}
         marking = {
             "op_types": op_types,
-            "force_no_input_check": bool(
-                opts.get("ForceQuantizeNoInputCheck", half_preset)
-            ),
+            "force_no_input_check": bool(opts.get("ForceQuantizeNoInputCheck", False)),
         }
         if attr_overrides is None:
             attr_overrides = self._block_attr_overrides(act, wt)
@@ -2919,8 +2937,9 @@ class ModelQuantizer:
             work,
             scope_types,
             exclude,
-            # (every Quark preset sets it; a bare QConfig does not)
-            force_no_input_check=bool(opts.get("ForceQuantizeNoInputCheck", True)),
+            # Presets that require it set the option explicitly; generic QConfig
+            # keeps an unmarked graph input float.
+            force_no_input_check=bool(opts.get("ForceQuantizeNoInputCheck", False)),
             direct_pool=not (ext or npu_cnn),
             npu_registry=bool(ext or npu_cnn),
             unquantized_ops=opset_unquantized_ops(work),
