@@ -55,6 +55,8 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
+from .einsum_decompose import decompose_einsum
+
 _TFLITE_INSTALL_HINT = (
     "TensorFlow is required to export TFLite models but is not installed. "
     "Install it with `pip install tensorflow` (or `tensorflow-cpu`)."
@@ -533,6 +535,8 @@ for _onnx_op, _tf_name in [
     ("Exp", "exp"),
     ("Log", "math.log"),
     ("Erf", "math.erf"),
+    ("Sin", "math.sin"),
+    ("Cos", "math.cos"),
     ("Softplus", "math.softplus"),
     ("Atan", "math.atan"),
     ("Identity", "identity"),
@@ -2212,6 +2216,10 @@ def _resolve_inference_dtype(inference_io_dtype: Any, tf: Any) -> Any:
 
 
 def _build_concrete_function(model: onnx.ModelProto, tf, io_layout: str = "nchw"):
+    # Batch-matmul einsums become Transpose/MatMul, which TFLite has builtin
+    # kernels for; anything left over still raises its usual unsupported-op
+    # error naming the op.
+    model = decompose_einsum(model)
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
     nhwc = _validate_io_layout(io_layout) == "nhwc"
