@@ -1011,6 +1011,7 @@ def quantize_full_qdq(
 
             source = a + "/f"
             rename[a] = source
+            assert fake_weight_dtype is not None
             if fake_weight_dtype in HALF_DTYPES:
                 pair, extra = _make_half_pair(
                     fake_weight_dtype, source, a, a, fake_roots[a]

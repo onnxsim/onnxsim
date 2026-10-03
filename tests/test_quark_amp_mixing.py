@@ -1326,9 +1326,24 @@ def test_integer_constants_under_half_and_block_activations(act, wt):
     assert np.abs(deq - w).max() <= float(inits["w1_scale"]) / 2 + 1e-6
 
 
-def test_integer_activations_over_half_or_block_constants_are_refused():
-    with pytest.raises(NotImplementedError, match="integer activations"):
-        _generic(qc.Int8Spec, qc.BFloat16Spec)
+@pytest.mark.parametrize("act", [qc.Int8Spec, qc.UInt8Spec, qc.Int16Spec])
+def test_integer_activations_over_half_or_block_constants_run(act):
+    """Integer activations keep their calibrated Q/DQ pairs; the half-format
+    constants get an ``ExtendedQuantizeLinear`` / ``ExtendedDequantizeLinear``
+    pair each, so the graph runs through Quark's extended Q/DQ ops."""
+    out = _generic(act, qc.BFloat16Spec)
+    assert not _fn_nodes(out)
+    # every constant of the graph (the three weights and the three biases)
+    const_q = {
+        n.output[0] for n in out.graph.node if n.op_type == "ExtendedQuantizeLinear"
+    }
+    assert const_q == {
+        f"{c}_QuantizeLinear_Output" for c in ("w1", "b1", "w2", "b2", "w3", "b3")
+    }
+    # the activations keep the plain, calibrated integer Q/DQ pairs
+    for n in out.graph.node:
+        if n.op_type in ("QuantizeLinear", "DequantizeLinear"):
+            assert all(not x.endswith("_QuantizeLinear_Output") for x in n.input)
 
 
 @pytest.mark.parametrize(
