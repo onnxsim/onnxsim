@@ -1510,6 +1510,11 @@ class ModelQuantizer:
 
         if isinstance(model_input, str):
             model_input = onnx.load(model_input)
+        from onnxsim.quark_fp16 import is_fp16_model
+
+        self._quantize_fp16 = bool(
+            cfg.extra_options.get("QuantizeFP16", False) or is_fp16_model(model_input)
+        )
 
         # Quark's pre-processing converts the opset first when asked to
         # (``ConvertOpsetVersion``; it warns and skips when the converter fails).
@@ -1584,6 +1589,19 @@ class ModelQuantizer:
                 model_input, act, wt, calibration_data_reader, runnable
             )
 
+        if (
+            self._quantize_fp16
+            and cfg.extra_options.get("UseFP32Scale", True)
+            and result is not model_input
+        ):
+            from onnxsim.quark_fp16 import convert_fp16_scale_to_fp32
+
+            result = convert_fp16_scale_to_fp32(
+                result,
+                exclude=_match_nodes(
+                    model_input, [e for e in cfg.exclude if isinstance(e, (str, tuple))]
+                ),
+            )
         if (
             cfg.specific_layer_config or cfg.layer_type_config
         ) and not self._overrides_applied:
@@ -2614,6 +2632,8 @@ class ModelQuantizer:
         opts = self.config.extra_options
         if opts.get("SkipPreprocess", False):
             return quark_sorted(model)
+        if getattr(self, "_quantize_fp16", False):
+            opts = {**opts, "OptimizeModel": False}
         work = model
         # Quark's operator fusions (``optimize_model``, after onnxslim and ONNX
         # Runtime's optimizer, whether or not those ran): on by default, opset >= 17
@@ -2935,6 +2955,7 @@ class ModelQuantizer:
         cal_size = int(opts.get("CalibDataSize") or 0)
         act_sym = bool(opts.get("ActivationSymmetric", act.symmetric))
         qkw: Dict[str, Any] = dict(
+            quark_fp16=getattr(self, "_quantize_fp16", False),
             keep_constants=True if self._keeps_constants() else converted_constants,
             calibration_data=calibration[:cal_size] if cal_size else calibration,
             activation_dtype=act_dtype,
