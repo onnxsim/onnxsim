@@ -1216,7 +1216,10 @@ def test_activation_fake_quantization_is_float32_like_torchs():
         np.testing.assert_array_equal(a.fq(x), ref.astype(np.float64))
         y, mask = a.fq_mask(x)
         np.testing.assert_array_equal(y, ref.astype(np.float64))
-        assert mask.dtype == bool
+        # (the gradient mask is 1 inside the clamp range, 0 outside and 0.5 on a
+        # bound, as torch.clamp with tensor bounds does)
+        assert mask.dtype == np.float32
+        assert set(np.unique(mask)) <= {0.0, 0.5, 1.0}
 
 
 # -- MemOptLevel 2 (Quark's DataLoader loop), NumWorkers, DynamicBatch -------------------
