@@ -86,9 +86,7 @@ def _build_tap(
     ``(N, flat)`` row layout every emitted constant uses.
     """
     idx = np.zeros((n, flat, xd + 1), dtype=np.int32)
-    idx[..., 0] = np.broadcast_to(
-        np.arange(n, dtype=np.int32).reshape(n, 1), (n, flat)
-    )
+    idx[..., 0] = np.broadcast_to(np.arange(n, dtype=np.int32).reshape(n, 1), (n, flat))
     if padding_mode == "zeros":
         # Validity is decided by the *raw* coordinate; the gather below reads a
         # clamped one, so an out-of-range corner contributes a real (clamped)
@@ -141,6 +139,8 @@ def grid_sample_plan(
     scoord = _source_coordinates(grid, dims, xd, align_corners)
 
     bilinear = mode in ("bilinear", "linear")
+    # Only a bilinear tap weighs its corner, so `frac` stays empty for nearest.
+    frac: List[np.ndarray] = []
     if bilinear:
         base = [np.floor(c) for c in scoord]
         frac = [c - b for c, b in zip(scoord, base)]
@@ -148,7 +148,6 @@ def grid_sample_plan(
     else:
         # nearest: a single tap at the rounded coordinate (ties-to-even, per ONNX).
         base = [np.rint(c) for c in scoord]
-        frac = None
         combos = [()]
 
     plan: List[GridSampleTap] = []
@@ -163,9 +162,9 @@ def grid_sample_plan(
         weight = np.ones((n, flat), dtype=np.float32)
         if bilinear:
             for j in range(xd):
-                weight = weight * (
-                    frac[j] if combo[j] else 1 - frac[j]
-                ).reshape(n, flat)
+                weight = weight * (frac[j] if combo[j] else 1 - frac[j]).reshape(
+                    n, flat
+                )
         valid = np.ones((n, flat), dtype=bool)
         plan.append(
             _build_tap(corners_flat, dims, xd, n, flat, padding_mode, weight, valid)

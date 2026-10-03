@@ -51,8 +51,10 @@ def _equation(node: onnx.NodeProto) -> str:
 
 def _is_label_run(term: str) -> bool:
     """True if ``term`` is a run of distinct lowercase ASCII letters."""
-    return bool(term) and all("a" <= c <= "z" for c in term) and len(set(term)) == len(
-        term
+    return (
+        bool(term)
+        and all("a" <= c <= "z" for c in term)
+        and len(set(term)) == len(term)
     )
 
 
