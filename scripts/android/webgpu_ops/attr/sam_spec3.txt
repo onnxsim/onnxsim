@@ -1,0 +1,9 @@
+MatMul_linattn|op=MatMul
+Div_Relu|op=Div,op=Relu
+Slice|op=Slice
+Concat|op=Concat
+Transpose|op=Transpose
+Add_Sub|op=Add,op=Sub
+Pad|op=Pad
+LayerNorm_DepthToSpace|op=LayerNormalization,op=DepthToSpace
+linattn_whole_nonconv|op=MatMul,op=Div,op=Relu,op=Pad,op=Slice,op=Concat

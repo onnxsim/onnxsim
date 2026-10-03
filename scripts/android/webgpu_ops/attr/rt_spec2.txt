@@ -1,0 +1,8 @@
+mul_bcast_138|idx=138-138
+adds_feature|idx=87-87,idx=102-102,idx=114-114,idx=126-126
+gelu_manual_65_69|idx=65-69
+transposes_nchw_nhwc|idx=18-18,idx=26-26,idx=34-34,idx=75-75,idx=78-78,idx=90-90,idx=93-93,idx=129-129,idx=132-132,idx=135-135
+conv3x3_160_stage|idx=6-10
+conv3x3_80_stage|idx=14-16
+conv3x3_80_neck|idx=96-100
+conv3x3_40_20_stage|idx=22-32

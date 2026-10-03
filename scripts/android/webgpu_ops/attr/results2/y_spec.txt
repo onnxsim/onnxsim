@@ -1,0 +1,18 @@
+control_self|SELF
+W_3x3|cls=Conv W 3x3
+T_3x3_s1|cls=Conv T 3x3 s1
+T_3x3_s2|cls=Conv T 3x3 s2
+M_1x1_s1|cls=Conv M 1x1 s1
+stem_3x3|cls=Conv S
+dw_3x3|cls=Conv D
+Concat|op=Concat
+Split|op=Split
+Transpose|op=Transpose
+Add|op=Add
+Reshape|op=Reshape
+Resize|op=Resize
+MaxPool|op=MaxPool
+attn_MatMul_Softmax|op=MatMul,op=Softmax
+head_elementwise|op=Sigmoid,op=Mul,op=Sub,op=Div,op=Slice
+all_conv|op=Conv,op=NhwcFusedConv
+all_nodes_standin|op=Conv,op=NhwcFusedConv,op=Concat,op=Split,op=Transpose,op=Add,op=Reshape,op=Resize,op=MaxPool,op=MatMul,op=Softmax,op=Sigmoid,op=Mul,op=Sub,op=Div,op=Slice

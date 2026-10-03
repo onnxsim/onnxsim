@@ -1,0 +1,94 @@
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+index 750f53e..168681b 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+@@ -739,7 +739,7 @@ Status ConvTexDirectProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   if (stage_ == 0) {
+     const auto& w = shader.AddInput("w", ShaderUsage::UseUniform);
+     shader.AddOutput("dummy", ShaderUsage::UseUniform);
+-    shader.AdditionalImplementation() << "@group(0) @binding(3) var wtex : texture_storage_2d<rgba16float, write>;\n";
++    shader.AdditionalImplementation() << "@group(0) @binding(3) var wtex : texture_storage_2d<" << (f32_weights_ ? "rgba32float" : "rgba16float") << ", write>;\n";
+     shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.npix")
+                               << "  let row = global_idx / uniforms.co4;\n  let cx = global_idx % uniforms.co4;\n"
+                               << "  textureStore(wtex, vec2<i32>(i32(cx), i32(row)), " << w.GetByOffset("global_idx") << ");\n";
+@@ -817,7 +817,7 @@ Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activati
+   if ((one && (mode < 2 || !one_by_one_ok))) return Status::OK();
+   const int64_t cin = ks[2], cout = ks[3];
+   if (cin % 4 != 0 || cout % 4 != 0 || cin != is[3] || os[3] != cout) return Status::OK();
+-  static const int64_t max_c = env("ORT_WEBGPU_TEXDIRECT_MAXC", 512);
++  static const int64_t max_c = env("ORT_WEBGPU_TEXDIRECT_MAXC", 1024);
+   if (std::max(cin, cout) > max_c) return Status::OK();
+   const int64_t rows = ks[0] * ks[1] * cin;
+   if (rows > 8192 || cout / 4 > 8192) return Status::OK();
+@@ -869,6 +869,10 @@ Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activati
+     d.back() /= 4;
+     return TensorShape(d);
+   };
++  // exact RGBA32F weights for large K (f16-rounded weights hurt convs whose products nearly cancel), RGBA16F otherwise
++  static const int64_t f32_min_k = env("ORT_WEBGPU_TEXDIRECT_F32_MINK", 1024);
++  const bool f32w = cin >= f32_min_k;
++  const wgpu::TextureFormat wfmt_enum = f32w ? wgpu::TextureFormat::RGBA32Float : wgpu::TextureFormat::RGBA16Float;
+   const bool have_w = w_cache && w_cache->valid;
+   wgpu::Texture tex_local;
+   wgpu::TextureView view_local;
+@@ -877,16 +881,16 @@ Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activati
+   } else {
+     wgpu::TextureDescriptor td{};
+     td.size = {co4, static_cast<uint32_t>(rows), 1};
+-    td.format = wgpu::TextureFormat::RGBA16Float;
++    td.format = wfmt_enum;
+     td.usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
+     tex_local = context.Device().CreateTexture(&td);
+     view_local = tex_local.CreateView();
+-    ConvTexDirectProgram p0(0, activation, false, false, tm, nv);
++    ConvTexDirectProgram p0(0, activation, false, false, tm, nv, false, f32w);
+     Tensor dummy = context.CreateGPUTensor(input->DataType(), TensorShape({4}));
+     const uint32_t total = static_cast<uint32_t>(rows) * co4;
+     p0.AddInput({kernel, M, red(ks), 4}).AddOutput({&dummy, M, TensorShape({1}), 4})
+-        .SetExtraTexture(view_local.Get(), static_cast<WGPUTextureFormat>(wgpu::TextureFormat::RGBA16Float), true)
+-        .CacheHint("w").SetDispatchGroupSize(ceil_div(total, 64))
++        .SetExtraTexture(view_local.Get(), static_cast<WGPUTextureFormat>(wfmt_enum), true)
++        .CacheHint(f32w ? "w32" : "w").SetDispatchGroupSize(ceil_div(total, 64))
+         .AddUniformVariables({{total}, {0u}, {0u}, {c4}, {co4}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {0u}, {1u}, {1u}, {1u}});
+     ORT_RETURN_IF_ERROR(context.RunProgram(p0));
+     if (w_cache) {
+@@ -897,13 +901,13 @@ Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activati
+   }
+   const uint32_t gx = pixels_fast ? ceil_div(npix, tm * wx) : ceil_div(ceil_div(co4, nv), wx);
+   const uint32_t gy = pixels_fast ? ceil_div(ceil_div(co4, nv), wy) : ceil_div(npix, tm * wy);
+-  ConvTexDirectProgram p(1, activation, bias != nullptr, residual != nullptr, tm, nv, pixels_fast);
++  ConvTexDirectProgram p(1, activation, bias != nullptr, residual != nullptr, tm, nv, pixels_fast, f32w);
+   p.AddInput({input, M, red(is), 4});
+   if (bias) p.AddInput({bias, M, red(bias->Shape()), 4});
+   if (residual) p.AddInput({residual, M, red(os), 4});
+   p.AddOutput({output, M, red(os), 4})
+-      .SetExtraTexture(view_local.Get(), static_cast<WGPUTextureFormat>(wgpu::TextureFormat::RGBA16Float), false)
+-      .CacheHint(activation.ToString(), std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy) + "," + std::to_string(pixels_fast), bias != nullptr, residual != nullptr)
++      .SetExtraTexture(view_local.Get(), static_cast<WGPUTextureFormat>(wfmt_enum), false)
++      .CacheHint(activation.ToString(), std::to_string(f32w) + "," + std::to_string(tm) + "," + std::to_string(nv) + "," + std::to_string(wx) + "," + std::to_string(wy) + "," + std::to_string(pixels_fast), bias != nullptr, residual != nullptr)
+       .SetDispatchGroupSize(gx, gy, 1)
+       .SetWorkgroupSize(wx, wy, 1)
+       .AddUniformVariables({{npix}, {static_cast<uint32_t>(is[1])}, {static_cast<uint32_t>(is[2])}, {c4}, {co4}, {static_cast<uint32_t>(os[1])}, {static_cast<uint32_t>(os[2])},
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+index 83154fd..7b81448 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+@@ -123,8 +123,8 @@ Status TryApplyWinogradConv(ComputeContext& context, const Activation& activatio
+ // TM output pixels x NV vec4 output channels per thread, f32 math. Stage 0 uploads the HWIO weights into the texture.
+ class ConvTexDirectProgram final : public Program<ConvTexDirectProgram> {
+  public:
+-  ConvTexDirectProgram(int stage, const Activation& activation, bool has_bias, bool has_residual, uint32_t tm, uint32_t nv, bool pixels_fast = false)
+-      : Program("ConvTexDirect"), stage_(stage), activation_(activation), has_bias_(has_bias), has_residual_(has_residual), tm_(tm), nv_(nv), pixels_fast_(pixels_fast) {}
++  ConvTexDirectProgram(int stage, const Activation& activation, bool has_bias, bool has_residual, uint32_t tm, uint32_t nv, bool pixels_fast = false, bool f32_weights = false)
++      : Program("ConvTexDirect"), stage_(stage), activation_(activation), has_bias_(has_bias), has_residual_(has_residual), tm_(tm), nv_(nv), pixels_fast_(pixels_fast), f32_weights_(f32_weights) {}
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
+   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+       {"npix", ProgramUniformVariableDataType::Uint32},
+@@ -151,6 +151,7 @@ class ConvTexDirectProgram final : public Program<ConvTexDirectProgram> {
+   const Activation& activation_;
+   bool has_bias_, has_residual_;
+   uint32_t tm_, nv_;
++  bool f32_weights_;  // weight texture is RGBA32F instead of RGBA16F (exact weights; used for large K)
+   bool pixels_fast_;  // threads along x cover output pixels (activation loads coalesce), along y output channels
+ };
+ 

@@ -185,3 +185,79 @@ _mk_ms(
         "B": (_rng.standard_normal(32) * 0.5).astype("f"),
     },
 )
+
+# Conv + Gelu (exact erf and approximate="tanh"): fused into the WebGPU Conv epilogue (ConvActivationFusion + Gelu).
+for _n, (_conv, _ws, _nb) in _cases.items():
+    for _ap in ("none", "tanh"):
+        _inits = {"W0": _w0, "W": (_rng.standard_normal(_ws) * 0.2).astype("f")}
+        if _nb:
+            _inits["B"] = (_rng.standard_normal(_nb) * 0.5).astype("f")
+        _mk_ms(f"v_ConvGelu_{_ap}_{_n}", _stem + _conv + f'\nY=Gelu<approximate="{_ap}">(C)', _inits)
+
+# Winograd F(2,3) path (3x3, stride 1, Cin and Cout >= 64): plain, bias, ReLU, tanh-Gelu epilogues; odd sizes and no-pad variants.
+_w64 = (_rng.standard_normal((64, 3, 3, 3)) * 0.3).astype("f")
+_stem64 = "A=Conv<pads=[1,1,1,1]>(X,W0)\nR=Relu(A)\n"
+for _n, (_conv, _epi) in {
+    "plain": ("C=Conv<pads=[1,1,1,1]>(R,W)", "Y=Identity(C)"),
+    "bias_relu": ("C=Conv<pads=[1,1,1,1]>(R,W,B)", "Y=Relu(C)"),
+    "gelu_tanh": ("C=Conv<pads=[1,1,1,1]>(R,W,B)", 'Y=Gelu<approximate="tanh">(C)'),
+    "nopad": ("C=Conv(R,W,B)", "Y=Identity(C)"),
+    "pad0_1": ("C=Conv<pads=[0,1,0,1]>(R,W,B)", "Y=Identity(C)"),
+}.items():
+    _mk_ms(
+        f"v_Winograd_{_n}",
+        _stem64 + _conv + "\n" + _epi,
+        {
+            "W0": _w64,
+            "W": (_rng.standard_normal((64, 64, 3, 3)) * 0.05).astype("f"),
+            "B": (_rng.standard_normal(64) * 0.5).astype("f"),
+        },
+    )
+
+# Conv + residual Add (+ReLU): fused by ConvActivationFusion's WebGPU rule into NhwcFusedConv(X, W, B, Z) (+activation). Native
+# paths: vec4 1x1 MatMul and Winograd; every other conv kind goes through the generic conv -> add+activation fallback.
+_res_cases = {
+    "1x1": ("pads=[0,0,0,0]", (32, 16, 1, 1), (32, 16, 1, 1)),
+    "1x1_odd": ("pads=[0,0,0,0]", (34, 16, 1, 1), (34, 16, 1, 1)),
+    "3x3": ("pads=[1,1,1,1]", (32, 16, 3, 3), (32, 16, 3, 3)),
+    "1x1_s2": ("pads=[0,0,0,0],strides=[2,2]", (32, 16, 1, 1), (32, 16, 1, 1)),
+    "dw": ("pads=[1,1,1,1],group=16", (16, 1, 3, 3), (16, 1, 3, 3)),
+}
+for _n, (_attrs, _ws, _wzs) in _res_cases.items():
+    for _act in ("none", "relu"):
+        _tail = "A2=Add(C,Z)\nY=Relu(A2)" if _act == "relu" else "Y=Add(C,Z)"
+        _mk_ms(
+            f"v_ConvAdd_{_act}_{_n}",
+            _stem + f"C=Conv<{_attrs}>(R,W,B)\nZ=Conv<{_attrs}>(R,WZ,BZ)\n" + _tail,
+            {
+                "W0": _w0,
+                "W": (_rng.standard_normal(_ws) * 0.2).astype("f"),
+                "B": (_rng.standard_normal(_ws[0]) * 0.5).astype("f"),
+                "WZ": (_rng.standard_normal(_wzs) * 0.2).astype("f"),
+                "BZ": (_rng.standard_normal(_wzs[0]) * 0.5).astype("f"),
+            },
+        )
+# Winograd-eligible (64 channels) with a residual, with and without ReLU
+for _act in ("none", "relu"):
+    _tail = "A2=Add(C,Z)\nY=Relu(A2)" if _act == "relu" else "Y=Add(C,Z)"
+    _mk_ms(
+        f"v_ConvAdd_{_act}_winograd",
+        _stem64 + "C=Conv<pads=[1,1,1,1]>(R,W,B)\nZ=Conv<pads=[1,1,1,1]>(R,WZ,BZ)\n" + _tail,
+        {
+            "W0": _w64,
+            "W": (_rng.standard_normal((64, 64, 3, 3)) * 0.05).astype("f"),
+            "B": (_rng.standard_normal(64) * 0.5).astype("f"),
+            "WZ": (_rng.standard_normal((64, 64, 3, 3)) * 0.05).astype("f"),
+            "BZ": (_rng.standard_normal(64) * 0.5).astype("f"),
+        },
+    )
+
+# Last-axis Concat / Split with channel counts that are multiples of 4 (vec4 fast paths) and ones that are not (scalar fallback)
+_tr = _stem + "T=Transpose<perm=[0,2,3,1]>(R)\nS2=Mul(T,K2)\nS3=Add(T,K3)\n"
+_kinit = {"W0": _w0, "K2": np.float32(2.0), "K3": np.float32(0.5)}
+_mk_ms("v_ConcatLast_vec4_2", _tr + "Y=Concat<axis=3>(T,S2)", _kinit)
+_mk_ms("v_ConcatLast_vec4_3", _tr + "Y=Concat<axis=3>(T,S2,S3)", _kinit)
+_mk_ms("v_ConcatLast_vec4_4", _tr + "C1=Concat<axis=3>(T,S2)\nC2=Concat<axis=3>(S3,T)\nY=Concat<axis=3>(C1,C2,T)", _kinit)
+_mk_ms("v_SplitLast_vec4_2", _tr + "A1,A2=Split<axis=3,num_outputs=2>(T)\nY=Add(A1,A2)", _kinit)
+_mk_ms("v_SplitLast_vec4_uneven", _tr + "A1,A2=Split<axis=3>(T,SZ)\nM1=Mul(A1,K2)\nY=Concat<axis=3>(A2,M1)", {**_kinit, "SZ": np.array([4, 12], dtype="i8")})
+_mk_ms("v_SplitLast_odd", _tr + "A1,A2=Split<axis=3>(T,SZ)\nY=Concat<axis=3>(A2,A1)", {**_kinit, "SZ": np.array([6, 10], dtype="i8")})
