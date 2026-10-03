@@ -1,0 +1,139 @@
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.cc b/onnxruntime/core/providers/webgpu/nn/conv.cc
+index cddcb9a..8605b95 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv.cc
+@@ -199,6 +199,11 @@ Status Conv<is_channels_last, is_fused>::ComputeImpl(ComputeContext& context, co
+       }
+       inputs[1] = grouped_kernel;
+       modified_input_output_shapes[1] = grouped_kernel->Shape();
++      if (input_shape.NumDimensions() == 4 && conv_attrs_.group == input_channels && conv_attrs_.group == output_channels) {
++        bool applied = false;
++        ORT_RETURN_IF_ERROR(TryApplyDepthwiseConv(context, activation, input, grouped_kernel, bias, pads, strides, dilations, output, applied));
++        if (applied) return Status::OK();
++      }
+     }
+     auto output_channels_per_group = output_channels / conv_attrs_.group;
+     auto components = static_cast<int>(is_channels_last && output_channels_per_group >= 4 ? GetMaxComponents(output_channels) : 1);
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+index 329a9fc..750f53e 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+@@ -915,3 +915,74 @@ Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activati
+ 
+ }  // namespace webgpu
+ }  // namespace onnxruntime
++
++namespace onnxruntime {
++namespace webgpu {
++
++Status ConvDepthwiseVec4Program::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& x = shader.AddInput("x", ShaderUsage::UseUniform);
++  const auto& w = shader.AddInput("w", ShaderUsage::UseUniform);
++  const ShaderVariableHelper* bias = has_bias_ ? &shader.AddInput("bias", ShaderUsage::UseUniform) : nullptr;
++  const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform);
++  auto& b = shader.MainFunctionBody();
++  b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++    << "  let c4i = global_idx % uniforms.c4;\n  var t = global_idx / uniforms.c4;\n"
++    << "  let oxg = t % uniforms.nxg;\n  t = t / uniforms.nxg;\n  let oy = t % uniforms.oh;\n  let bi = t / uniforms.oh;\n"
++    << "  let ox0 = oxg * " << pixels_ << "u;\n";
++  for (uint32_t p = 0; p < pixels_; p++) b << "  var a" << p << " = vec4<f32>(0.0);\n";
++  b << "  for (var ky = 0u; ky < uniforms.kh; ky++) {\n"
++    << "    let iy = i32(oy * uniforms.sh) - i32(uniforms.ph) + i32(ky * uniforms.dh);\n"
++    << "    if (iy < 0 || iy >= i32(uniforms.h)) { continue; }\n"
++    << "    let rowbase = (bi * uniforms.h + u32(iy)) * uniforms.w;\n"
++    << "    for (var kx = 0u; kx < uniforms.kw; kx++) {\n"
++    << "      let wv = " << w.GetByOffset("(ky * uniforms.kw + kx) * uniforms.c4 + c4i") << ";\n";
++  for (uint32_t p = 0; p < pixels_; p++)
++    b << "      { let ix = i32((ox0 + " << p << "u) * uniforms.sw) - i32(uniforms.pw) + i32(kx * uniforms.dw);\n"
++      << "        if (ix >= 0 && ix < i32(uniforms.w)) { a" << p << " = a" << p << " + " << x.GetByOffset("(rowbase + u32(ix)) * uniforms.c4 + c4i") << " * wv; } }\n";
++  b << "    }\n  }\n";
++  const std::string act = GetActivationSnippet(activation_, "vec4<f32>", "f32");
++  for (uint32_t p = 0; p < pixels_; p++) {
++    b << "  if (ox0 + " << p << "u < uniforms.ow) {\n    var value = a" << p << ";\n";
++    if (bias) b << "    value = value + " << bias->GetByOffset("c4i") << ";\n";
++    b << "    " << act << "\n    " << y.SetByOffset("((bi * uniforms.oh + oy) * uniforms.ow + ox0 + " + std::to_string(p) + "u) * uniforms.c4 + c4i", "value") << "\n  }\n";
++  }
++  return Status::OK();
++}
++
++Status TryApplyDepthwiseConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias,
++                             const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations,
++                             Tensor* output, bool& applied) {
++  applied = false;
++  static const auto env = [](const char* n, uint32_t d) { const char* e = std::getenv(n); return e ? static_cast<uint32_t>(std::atoi(e)) : d; };
++  static const uint32_t pixels = env("ORT_WEBGPU_DEPTHWISE_PIXELS", 4);  // 0 disables
++  if (pixels == 0 || !input->IsDataType<float>()) return Status::OK();
++  const auto& ks = kernel->Shape();
++  const auto& is = input->Shape();
++  const auto& os = output->Shape();
++  if (ks.NumDimensions() != 4 || is.NumDimensions() != 4 || ks[2] != 1) return Status::OK();
++  const int64_t c = ks[3];
++  if (c % 4 != 0 || is[3] != c || os[3] != c) return Status::OK();
++  const uint32_t c4 = static_cast<uint32_t>(c / 4), ow = static_cast<uint32_t>(os[2]);
++  const uint32_t nxg = (ow + pixels - 1) / pixels;
++  const uint32_t total = static_cast<uint32_t>(os[0]) * static_cast<uint32_t>(os[1]) * nxg * c4;
++  auto red = [](const TensorShape& s) {
++    TensorShapeVector d = s.AsShapeVector();
++    d.back() /= 4;
++    return TensorShape(d);
++  };
++  const auto M = ProgramTensorMetadataDependency::TypeAndRank;
++  ConvDepthwiseVec4Program p(activation, bias != nullptr, pixels);
++  p.AddInput({input, M, red(is), 4}).AddInput({kernel, M, red(ks), 4});
++  if (bias) p.AddInput({bias, M, red(bias->Shape()), 4});
++  p.AddOutput({output, M, red(os), 4})
++      .CacheHint(activation.ToString(), pixels, bias != nullptr)
++      .SetDispatchGroupSize((total + 63) / 64)
++      .AddUniformVariables({{total}, {static_cast<uint32_t>(is[1])}, {static_cast<uint32_t>(is[2])}, {c4}, {static_cast<uint32_t>(os[1])}, {ow},
++                            {static_cast<uint32_t>(ks[0])}, {static_cast<uint32_t>(ks[1])}, {strides[0]}, {strides[1]}, {pads[0]}, {pads[1]}, {dilations[0]}, {dilations[1]}, {nxg}});
++  ORT_RETURN_IF_ERROR(context.RunProgram(p));
++  applied = true;
++  return Status::OK();
++}
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+index 3b6b7fd..83154fd 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+@@ -159,5 +159,39 @@ Status TryApplyTexDirectConv(ComputeContext& context, const Activation& activati
+                              const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations,
+                              Tensor* output, bool& applied, WinogradWeightCache* w_cache, const Tensor* residual, bool one_by_one_ok);
+ 
++
++// Depthwise (group == Cin == Cout) NHWC convolution with vec4 channels: each thread produces P consecutive output pixels of one vec4 of channels.
++class ConvDepthwiseVec4Program final : public Program<ConvDepthwiseVec4Program> {
++ public:
++  ConvDepthwiseVec4Program(const Activation& activation, bool has_bias, uint32_t pixels)
++      : Program("ConvDepthwiseVec4"), activation_(activation), has_bias_(has_bias), pixels_(pixels) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"total", ProgramUniformVariableDataType::Uint32},
++      {"h", ProgramUniformVariableDataType::Uint32},
++      {"w", ProgramUniformVariableDataType::Uint32},
++      {"c4", ProgramUniformVariableDataType::Uint32},
++      {"oh", ProgramUniformVariableDataType::Uint32},
++      {"ow", ProgramUniformVariableDataType::Uint32},
++      {"kh", ProgramUniformVariableDataType::Uint32},
++      {"kw", ProgramUniformVariableDataType::Uint32},
++      {"sh", ProgramUniformVariableDataType::Uint32},
++      {"sw", ProgramUniformVariableDataType::Uint32},
++      {"ph", ProgramUniformVariableDataType::Uint32},
++      {"pw", ProgramUniformVariableDataType::Uint32},
++      {"dh", ProgramUniformVariableDataType::Uint32},
++      {"dw", ProgramUniformVariableDataType::Uint32},
++      {"nxg", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  const Activation& activation_;
++  bool has_bias_;
++  uint32_t pixels_;
++};
++
++Status TryApplyDepthwiseConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel /*HWIO [kh,kw,1,C]*/, const Tensor* bias,
++                             const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations,
++                             Tensor* output, bool& applied);
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime

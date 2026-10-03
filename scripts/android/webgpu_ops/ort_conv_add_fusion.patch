@@ -1,0 +1,587 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/fused_conv.cc b/onnxruntime/contrib_ops/webgpu/fused_conv.cc
+index e6b7ac3..9c9fc2d 100644
+--- a/onnxruntime/contrib_ops/webgpu/fused_conv.cc
++++ b/onnxruntime/contrib_ops/webgpu/fused_conv.cc
+@@ -28,6 +28,16 @@ ONNX_OPERATOR_KERNEL_EX(
+         .TypeConstraint("T", onnxruntime::webgpu::WebGpuSupportedFloatTypes()),
+     FusedConv<false>);
+ 
++// NHWC variant: produced by ConvActivationFusion's WebGPU Conv+Add rule (4th input = residual).
++ONNX_OPERATOR_KERNEL_EX(
++    NhwcFusedConv,
++    kMSDomain,
++    1,
++    kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create())
++        .TypeConstraint("T", onnxruntime::webgpu::WebGpuSupportedFloatTypes()),
++    FusedConv<true>);
++
+ }  // namespace webgpu
+ }  // namespace contrib
+ }  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+index e827f20..395004d 100644
+--- a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
++++ b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+@@ -29,6 +29,7 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, FastGelu)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, GatherBlockQuantized)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, FusedConv)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, NhwcFusedConv)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, Gelu)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, LinearAttention)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MatMulBnb4)>,
+diff --git a/onnxruntime/core/optimizer/conv_activation_fusion.cc b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+index 3aff3b9..2a32e7e 100644
+--- a/onnxruntime/core/optimizer/conv_activation_fusion.cc
++++ b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+@@ -3,6 +3,7 @@
+ 
+ #include "core/optimizer/conv_activation_fusion.h"
+ 
++#include <cstdlib>
+ #include <string_view>
+ #include <string>
+ #include "core/common/inlined_containers.h"
+@@ -73,6 +74,11 @@ class ConvActivationSelector : public NodeSelector {
+ 
+   std::optional<NodesToOptimizeIndices> Select(const GraphViewer& graph_viewer, const Node& node) const override {
+     const std::string_view node_ep = node.GetExecutionProviderType();
++    // an NhwcFusedConv (WebGPU Conv+Add output) can still take an activation, but only one
++    if (node.OpType() == "NhwcFusedConv" &&
++        (node_ep != kWebGpuExecutionProvider || graph_utils::GetNodeAttribute(node, "activation") != nullptr)) {
++      return std::nullopt;
++    }
+     const auto* next_node = GetLoneConsumerNode(graph_viewer, node);
+     if (!next_node ||
+         next_node->GetExecutionProviderType() != node_ep) {
+@@ -133,6 +139,41 @@ class ConvActivationSelector : public NodeSelector {
+   }
+ };
+ 
++
++// WebGPU only: Conv (NHWC internal domain, with bias) -> Add(residual) => Conv with the residual as a 4th input.
++class ConvAddNhwcSelector : public NodeSelector {
++ public:
++  std::optional<NodesToOptimizeIndices> Select(const GraphViewer& graph_viewer, const Node& node) const override {
++    if (node.GetExecutionProviderType() != kWebGpuExecutionProvider) return std::nullopt;
++    static const bool enabled = [] { const char* e = std::getenv("ORT_WEBGPU_CONV_ADD_FUSION"); return e == nullptr || e[0] != '0'; }();
++    if (!enabled) return std::nullopt;
++    if (node.InputDefs().size() != 3 || !node.InputDefs()[2]->Exists() ||
++        graph_utils::GetNodeAttribute(node, "activation") != nullptr) {
++      return std::nullopt;
++    }
++    const auto* add = GetLoneConsumerNode(graph_viewer, node);
++    if (add == nullptr || add->GetExecutionProviderType() != kWebGpuExecutionProvider ||
++        !graph_utils::IsSupportedOptypeVersionAndDomain(*add, "Add", {7, 13, 14}) || add->InputDefs().size() != 2) {
++      return std::nullopt;
++    }
++    const auto* conv_out = node.OutputDefs()[0];
++    const auto* z = add->InputDefs()[1 - node.OutputEdgesBegin()->GetDstArgIndex()];
++    const auto* sa = conv_out->Shape();
++    const auto* sz = z->Shape();
++    if (sa == nullptr || sz == nullptr || sa->dim_size() != 4 || sz->dim_size() != 4) return std::nullopt;
++    for (int i = 0; i < 4; i++) {
++      const auto& da = sa->dim(i);
++      const auto& dz = sz->dim(i);
++      const bool same_value = utils::HasDimValue(da) && utils::HasDimValue(dz) && da.dim_value() == dz.dim_value();
++      const bool same_param = utils::HasDimParam(da) && utils::HasDimParam(dz) && da.dim_param() == dz.dim_param();
++      if (!same_value && !same_param) return std::nullopt;
++    }
++    NodesToOptimizeIndicesBuilder builder{};
++    builder.target_node = node.Index();
++    builder.output_nodes.push_back(add->Index());
++    return builder.Build();
++  }
++};
+ }  // namespace selectors
+ #endif  // !defined(ORT_MINIMAL_BUILD)
+ 
+@@ -221,6 +262,24 @@ class FuseConvActivationAction : public ReplaceWithNew {
+   }
+ };
+ 
++
++class FuseConvAddNhwcAction : public ReplaceWithNew {
++ private:
++  std::string OpType(const RuntimeState&) const override { return "NhwcFusedConv"; }
++  std::string Domain(const RuntimeState&) const override { return kMSDomain; }
++  NodeAttributes ExtraAttributes(const RuntimeState&) const override { return {}; }
++  std::vector<NodeAndMoveInfo> ValueMoves(const RuntimeState& state) const override {
++    const auto& conv = state.selected_nodes.Target();
++    const auto add_input_idx = 1 - conv.OutputEdgesBegin()->GetDstArgIndex();
++    const NTO::NodeLocation conv_loc{NTO::NodeType::kTarget, 0};
++    const NTO::NodeLocation add_loc{NTO::NodeType::kOutput, 0};
++    return {
++        MoveAll(conv_loc, ArgType::kInput),
++        MoveAndAppend(add_loc, ArgType::kInput, add_input_idx, ArgType::kInput),
++        MoveAll(add_loc, ArgType::kOutput),
++    };
++  }
++};
+ }  // namespace actions
+ 
+ void RegisterConvActivationFusionRules(SelectorActionRegistry& registry) {
+@@ -229,18 +288,31 @@ void RegisterConvActivationFusionRules(SelectorActionRegistry& registry) {
+ #if !defined(ORT_MINIMAL_BUILD)
+   const std::string msInternalNHWCDomainConv = SelectorActionRegistry::OpVersionsMapKey("Conv", kMSInternalNHWCDomain);
+   const std::string msDomainConv = SelectorActionRegistry::OpVersionsMapKey("NhwcConv", kMSDomain);
++  const std::string msDomainFusedConv = SelectorActionRegistry::OpVersionsMapKey("NhwcFusedConv", kMSDomain);
+   auto selector = std::make_unique<selectors::ConvActivationSelector>();
+ 
+-  registry.RegisterSelectorAndAction(name, {{"Conv", {1, 11, 22}}, {msInternalNHWCDomainConv, {1, 11, 22}}, {msDomainConv, {1}}},
++  registry.RegisterSelectorAndAction(name, {{"Conv", {1, 11, 22}}, {msInternalNHWCDomainConv, {1, 11, 22}}, {msDomainConv, {1}}, {msDomainFusedConv, {1}}},
+                                      std::move(selector), std::move(action));
+ #else
+   registry.RegisterAction(name, std::move(action));
+ #endif
+ }
+ 
++void RegisterConvAddNhwcFusionRules(SelectorActionRegistry& registry) {
++  auto action = std::make_unique<actions::FuseConvAddNhwcAction>();
++#if !defined(ORT_MINIMAL_BUILD)
++  const std::string msInternalNHWCDomainConv = SelectorActionRegistry::OpVersionsMapKey("Conv", kMSInternalNHWCDomain);
++  auto selector = std::make_unique<selectors::ConvAddNhwcSelector>();
++  registry.RegisterSelectorAndAction("ConvAddNhwc", {{msInternalNHWCDomainConv, {1, 11, 22}}}, std::move(selector), std::move(action));
++#else
++  registry.RegisterAction("ConvAddNhwc", std::move(action));
++#endif
++}
++
+ SelectorActionRegistry CreateSelectorActionRegistry() {
+   SelectorActionRegistry registry{};
+   RegisterConvActivationFusionRules(registry);
++  RegisterConvAddNhwcFusionRules(registry);
+   return registry;
+ }
+ 
+diff --git a/onnxruntime/core/providers/webgpu/math/gemm_utils.cc b/onnxruntime/core/providers/webgpu/math/gemm_utils.cc
+index 101a851..e28c632 100644
+--- a/onnxruntime/core/providers/webgpu/math/gemm_utils.cc
++++ b/onnxruntime/core/providers/webgpu/math/gemm_utils.cc
+@@ -42,11 +42,16 @@ void HandleMaybeBiasForMatMul(ShaderHelper& shader,
+                               const ShaderVariableHelper& output,
+                               const ShaderVariableHelper* bias,
+                               std::string activation_snippet,
+-                              bool is_channels_last) {
++                              bool is_channels_last,
++                              const ShaderVariableHelper* residual = nullptr) {
+   shader.AdditionalImplementation() << "    let coords = vec3(u32(batch), u32(row), u32(colIn));\n";
+   if (bias != nullptr) {
+     shader.AdditionalImplementation() << "    value = value + output_value_t(" << (is_channels_last ? bias->GetByOffset("colIn") : bias->GetByOffset("row")) << ");\n";
+   }
++  if (residual != nullptr) {
++    // same layout as the output: [batch, M, N / components]
++    shader.AdditionalImplementation() << "    value = value + output_value_t(" << residual->GetByOffset("(u32(batch) * uniforms.dim_a_outer + u32(row)) * (uniforms.dim_b_outer / " + std::to_string(output.NumComponents()) + "u) + u32(colIn)") << ");\n";
++  }
+   shader.AdditionalImplementation() << "    " << activation_snippet << "\n"
+                                     << "    " << output.SetByIndices("coords", "value") << "\n";
+ }
+@@ -193,9 +198,10 @@ void MatMulWriteFnSourceForMatMul(ShaderHelper& shader,
+                                   const ShaderVariableHelper& output,
+                                   const ShaderVariableHelper* bias,
+                                   std::string activation_snippet,
+-                                  bool is_channels_last) {
++                                  bool is_channels_last,
++                                  const ShaderVariableHelper* residual) {
+   EmitMatMulWriteFnHeader(shader, output);
+-  HandleMaybeBiasForMatMul(shader, output, bias, activation_snippet, is_channels_last);
++  HandleMaybeBiasForMatMul(shader, output, bias, activation_snippet, is_channels_last, residual);
+   EmitMatMulWriteFnFooter(shader);
+ }
+ 
+diff --git a/onnxruntime/core/providers/webgpu/math/gemm_utils.h b/onnxruntime/core/providers/webgpu/math/gemm_utils.h
+index e9ae211..52e9e73 100644
+--- a/onnxruntime/core/providers/webgpu/math/gemm_utils.h
++++ b/onnxruntime/core/providers/webgpu/math/gemm_utils.h
+@@ -19,7 +19,8 @@ void MatMulWriteFnSourceForMatMul(ShaderHelper& shader,
+                                   const ShaderVariableHelper& output,
+                                   const ShaderVariableHelper* bias,
+                                   std::string activation_snippet,
+-                                  bool is_channels_last);
++                                  bool is_channels_last,
++                                  const ShaderVariableHelper* residual = nullptr);
+ 
+ void MatMulWriteFnSourceForGemm(ShaderHelper& shader,
+                                 const ShaderVariableHelper& output,
+diff --git a/onnxruntime/core/providers/webgpu/math/matmul.cc b/onnxruntime/core/providers/webgpu/math/matmul.cc
+index b3299e5..abf712a 100644
+--- a/onnxruntime/core/providers/webgpu/math/matmul.cc
++++ b/onnxruntime/core/providers/webgpu/math/matmul.cc
+@@ -200,7 +200,8 @@ Status MatMul::ComputeInternal(ComputeContext& context) const {
+ Status ComputeMatMul(ComputeContext* context,
+                      const Activation& activation, std::vector<const Tensor*>& inputs, Tensor* output_tensor, bool is_channels_last,
+                      const TensorShape& input_a_reshape,
+-                     const TensorShape& input_b_reshape) {
++                     const TensorShape& input_b_reshape,
++                     const Tensor* residual) {
+   const auto* a = inputs[0];
+   const auto* b = inputs[1];
+   bool has_bias = inputs.size() > 2;
+@@ -273,7 +274,7 @@ Status ComputeMatMul(ComputeContext* context,
+   uint32_t splits_per_batch = 1;
+ 
+   // Current Split-K implementation relies on atomic operations, which are not deterministic.
+-  if (!context->KernelContext().GetUseDeterministicCompute()) {
++  if (!context->KernelContext().GetUseDeterministicCompute() && residual == nullptr) {
+     const SplitKConfig& split_k_config = context->GetSplitKConfig();
+     const bool need_split_k = split_k_config.UseSplitK(is_vec4, activation.activation_kind_, batch_size, dim_a_outer, dim_b_outer, dim_inner, is_channels_last);
+     if (need_split_k) {
+@@ -308,9 +309,10 @@ Status ComputeMatMul(ComputeContext* context,
+ 
+   MatMulProgram matmul_program{activation, use_bias_in_matmul, is_vec4, elements_per_thread, is_channels_last, split_dim_inner};
+   static const bool f32acc_on = std::getenv("ORT_WEBGPU_F16_ACC32") != nullptr;  // opt-in: slower, barely more accurate
++  matmul_program.has_residual_ = residual != nullptr;
+   matmul_program.f32_acc_ = f32acc_on && a->IsDataType<MLFloat16>();
+   matmul_program
+-      .CacheHint(activation.ToString(), absl::StrJoin(elements_per_thread, "-"), std::to_string(is_vec4), components, is_channels_last, split_dim_inner)
++      .CacheHint(activation.ToString(), absl::StrJoin(elements_per_thread, "-"), std::to_string(is_vec4), components, is_channels_last, split_dim_inner, residual != nullptr)
+       .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, a_shape_temp, components},
+                   {b, ProgramTensorMetadataDependency::TypeAndRank, b_shape_temp, components}})
+       .AddUniformVariables({{dim_a_outer}, {dim_b_outer}, {dim_inner}, {dispatch_x}, {dispatch_y}, {dispatch_z}, {splits_per_batch}})
+@@ -324,6 +326,10 @@ Status ComputeMatMul(ComputeContext* context,
+     TensorShape reduced_bias_shape = ReduceShapeByComponents(bias->Shape(), bias_components);
+     matmul_program.AddInput({bias, ProgramTensorMetadataDependency::Rank, reduced_bias_shape, bias_components});
+   }
++  if (residual != nullptr) {
++    ORT_ENFORCE(is_channels_last && is_vec4, "MatMul residual needs channels-last vec4 layout.");
++    matmul_program.AddInput({residual, ProgramTensorMetadataDependency::Rank, output_shape_temp, components});
++  }
+ 
+   return context->RunProgram(matmul_program);
+ }
+diff --git a/onnxruntime/core/providers/webgpu/math/matmul.h b/onnxruntime/core/providers/webgpu/math/matmul.h
+index 7628f60..74be628 100644
+--- a/onnxruntime/core/providers/webgpu/math/matmul.h
++++ b/onnxruntime/core/providers/webgpu/math/matmul.h
+@@ -19,7 +19,9 @@ namespace webgpu {
+ 
+ Status ComputeMatMul(ComputeContext* context, const Activation& activation, std::vector<const Tensor*>& inputs, Tensor* output, bool is_channels_last = true,
+                      const TensorShape& input_a_reshape = TensorShape(),
+-                     const TensorShape& input_b_reshape = TensorShape());
++                     const TensorShape& input_b_reshape = TensorShape(),
++                     // optional addend with the output's shape, added after the bias and before the activation
++                     const Tensor* residual = nullptr);
+ 
+ MatMulFillBiasOrZeroBeforeSplitKProgram CreateMatMulFillBiasOrZeroBeforeSplitKProgram(
+     const Tensor* bias,
+diff --git a/onnxruntime/core/providers/webgpu/math/matmul_packed.cc b/onnxruntime/core/providers/webgpu/math/matmul_packed.cc
+index d5a3312..426e9bb 100644
+--- a/onnxruntime/core/providers/webgpu/math/matmul_packed.cc
++++ b/onnxruntime/core/providers/webgpu/math/matmul_packed.cc
+@@ -30,6 +30,10 @@ Status MatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   if (has_bias_) {
+     bias = &shader.AddInput("bias", ShaderUsage::UseUniform);
+   }
++  const ShaderVariableHelper* residual = nullptr;
++  if (has_residual_) {
++    residual = &shader.AddInput("residual", ShaderUsage::UseUniform);
++  }
+   std::string apply_activation = GetActivationSnippet(activation_, "output_value_t", "output_element_t");
+   ProgramVariableDataType output_var_type = this->Outputs()[0].var_type;
+   // declare the read and write functions
+@@ -37,7 +41,7 @@ Status MatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   if (need_split_k) {
+     MatMulWriteFnSourceWithSplitK(shader, output, /*is_gemm = */ false, output_var_type);
+   } else {
+-    MatMulWriteFnSourceForMatMul(shader, output, bias, apply_activation, is_channels_last_);
++    MatMulWriteFnSourceForMatMul(shader, output, bias, apply_activation, is_channels_last_, residual);
+   }
+   std::string data_type = "a_element_t";
+   // generate the main function
+diff --git a/onnxruntime/core/providers/webgpu/math/matmul_packed.h b/onnxruntime/core/providers/webgpu/math/matmul_packed.h
+index 0fd33fb..6e7c46c 100644
+--- a/onnxruntime/core/providers/webgpu/math/matmul_packed.h
++++ b/onnxruntime/core/providers/webgpu/math/matmul_packed.h
+@@ -31,6 +31,7 @@ class MatMulProgram final : public Program<MatMulProgram> {
+                                           {"splits_per_batch", ProgramUniformVariableDataType::Uint32});
+ 
+   bool NeedSplitK() const;
++  bool has_residual_ = false;  // an extra input "residual" with the output layout is added before the activation
+   bool f32_acc_ = false;  // fp16 inputs accumulate in f32
+ 
+  private:
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.cc b/onnxruntime/core/providers/webgpu/nn/conv.cc
+index 18cf253..c3f8b0c 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv.cc
+@@ -28,7 +28,7 @@ Status TransposeKernel(ComputeContext& context, const Tensor* kernel, const Tens
+ }
+ 
+ template <bool is_channels_last, bool is_fused>
+-Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context) const {
++Status Conv<is_channels_last, is_fused>::ComputeImpl(ComputeContext& context, const Activation& activation, const Tensor* residual, Tensor* tmp_output) const {
+   bool has_bias = context.InputCount() > 2;
+   const auto* input = context.Input<Tensor>(0);
+   const Tensor* kernel = nullptr;
+@@ -71,7 +71,13 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+     output_shape_vector.insert(output_shape_vector.begin() + 1, output_channels);
+   }
+   auto output_shape = TensorShape(output_shape_vector);
+-  auto* output = context.Output(0, output_shape);
++  Tensor* output;
++  if (tmp_output != nullptr) {
++    *tmp_output = context.CreateGPUTensor(input->DataType(), output_shape);
++    output = tmp_output;
++  } else {
++    output = context.Output(0, output_shape);
++  }
+   std::vector<uint32_t> strides;
+   std::vector<uint32_t> pads;
+   std::vector<uint32_t> dilations;
+@@ -100,8 +106,8 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+     const auto x_height = static_cast<uint32_t>(input_shape[is_channels_last ? 2 : 3]);
+     const auto x_width = static_cast<uint32_t>(input_shape[is_channels_last ? 3 : 4]);
+     const auto x_channels = static_cast<uint32_t>(input_shape[is_channels_last ? 4 : 1]);
+-    Conv3DNaiveProgram program(activation_, has_bias, is_channels_last);
+-    program.CacheHint(activation_.ToString(), std::to_string(is_channels_last))
++    Conv3DNaiveProgram program(activation, has_bias, is_channels_last);
++    program.CacheHint(activation.ToString(), std::to_string(is_channels_last))
+         .AddInput({input, ProgramTensorMetadataDependency::TypeAndRank, input_shape, 1})
+         .AddInput({kernel, ProgramTensorMetadataDependency::TypeAndRank, kernel_shape, 1})
+         .AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, output_shape, 1})
+@@ -160,9 +166,17 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+   // For SAME_LOWER: head gets more padding ((pad_needed + 1) / 2)
+   std::vector<uint32_t> updated_pads{pads[0], pads[1]};
+ 
++  if (residual != nullptr && CanApplyIm2ColMatMulProgram(context,
++                                  is_channels_last,
++                                  activation.activation_kind_ != ActivationKind::None,
++                                  kernel_shape,
++                                  onnxruntime::narrow<uint32_t>(conv_attrs_.group),
++                                  kernel->DataType())) {
++    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "WEBGPU_CONV_RESIDUAL_UNSUPPORTED");
++  }
+   if (CanApplyIm2ColMatMulProgram(context,
+                                   is_channels_last,
+-                                  activation_.activation_kind_ != ActivationKind::None,
++                                  activation.activation_kind_ != ActivationKind::None,
+                                   kernel_shape,
+                                   onnxruntime::narrow<uint32_t>(conv_attrs_.group),
+                                   kernel->DataType())) {
+@@ -175,6 +189,7 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+   }
+ 
+   if (conv_attrs_.group > 1) {
++    if (residual != nullptr) return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "WEBGPU_CONV_RESIDUAL_UNSUPPORTED");
+     Tensor transposed_kernel;
+     if (is_channels_last) {
+       const Tensor* grouped_kernel = kernel;
+@@ -188,10 +203,10 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+     auto output_channels_per_group = output_channels / conv_attrs_.group;
+     auto components = static_cast<int>(is_channels_last && output_channels_per_group >= 4 ? GetMaxComponents(output_channels) : 1);
+     auto output_size = output_shape.Size() / components;
+-    GroupedConvProgram program(activation_, has_bias, is_channels_last);
++    GroupedConvProgram program(activation, has_bias, is_channels_last);
+     auto reduced_kernel_shape = ReduceShapeByComponents(modified_input_output_shapes[1], components);
+     auto reduced_output_shape = ReduceShapeByComponents(modified_input_output_shapes[has_bias ? 3 : 2], components);
+-    program.CacheHint(activation_.ToString(), std::to_string(components), std::to_string(is_channels_last))
++    program.CacheHint(activation.ToString(), std::to_string(components), std::to_string(is_channels_last))
+         .AddInput({inputs[0], ProgramTensorMetadataDependency::TypeAndRank, modified_input_output_shapes[0], 1})
+         .AddInput({inputs[1], ProgramTensorMetadataDependency::TypeAndRank, reduced_kernel_shape, components})
+         .AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, reduced_output_shape, components})
+@@ -249,6 +264,9 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+     auto N = matmul_output_shape[2];
+     auto matmul_first_input_numdims = matmul_input_reshapes[0].NumDimensions();
+     auto K = matmul_input_reshapes[0].GetDims()[matmul_first_input_numdims - 1];
++    if (residual != nullptr && (!is_channels_last || same_size || (N < 8 && K < 8) || N % 4 != 0 || K % 4 != 0)) {
++      return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "WEBGPU_CONV_RESIDUAL_UNSUPPORTED");
++    }
+     if (N < 8 && K < 8) {
+       const auto components = GetMaxComponents(N);
+       const auto a_components = GetMaxComponents(K);
+@@ -256,7 +274,7 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+       uint32_t output_size = static_cast<uint32_t>(output_shape.Size() / components / output_number);
+       const size_t output_rank = matmul_output_shape.NumDimensions();
+       TensorShape outer_dims = output_rank > 2 ? matmul_output_shape.Slice(0, output_rank - 2) : TensorShape({});
+-      MatMulNaiveProgram program(activation_, output_rank, output_number, has_bias, is_channels_last);
++      MatMulNaiveProgram program(activation, output_rank, output_number, has_bias, is_channels_last);
+       program
+           .CacheHint(std::to_string(components), std::to_string(a_components), std::to_string(output_number))
+           .AddInputs({{matmul_inputs[0], ProgramTensorMetadataDependency::TypeAndRank, ReduceShapeByComponents(matmul_input_reshapes[0], a_components), int(a_components)},
+@@ -271,7 +289,7 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+           .AddUniformVariables({{output_size}, {static_cast<uint32_t>(matmul_output_shape[1])}, {static_cast<uint32_t>(matmul_output_shape[2])}, {static_cast<uint32_t>(K)}});
+       return context.RunProgram(program);
+     } else {
+-      return ComputeMatMul(&context, activation_, matmul_inputs, output, is_channels_last, matmul_input_reshapes[0], matmul_input_reshapes[1]);
++      return ComputeMatMul(&context, activation, matmul_inputs, output, is_channels_last, matmul_input_reshapes[0], matmul_input_reshapes[1], residual);
+     }
+   }
+   // Transpose weights when necessary
+@@ -283,19 +301,49 @@ Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context
+   }
+   if (is_channels_last && conv_attrs_.group == 1 && strides[0] == 1 && strides[1] == 1 && dilations[0] == 1 && dilations[1] == 1 && input_shape.NumDimensions() == 4) {
+     bool applied = false;
+-    ORT_RETURN_IF_ERROR(TryApplyWinogradConv(context, activation_, input, conv_kernel, bias, pads, output, applied));
++    ORT_RETURN_IF_ERROR(TryApplyWinogradConv(context, activation, input, conv_kernel, bias, pads, output, applied, kernel_is_prepacked ? &winograd_u_ : nullptr, residual));
+     if (applied) return Status::OK();
+   }
++  if (residual != nullptr) return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "WEBGPU_CONV_RESIDUAL_UNSUPPORTED");
+   auto dim_a_outer = static_cast<uint32_t>(is_channels_last ? output_height * output_width : output_channels);
+   auto dim_b_outer = static_cast<uint32_t>(is_channels_last ? output_channels : output_height * output_width);
+   auto dim_inner = static_cast<uint32_t>(kernel_height * kernel_width * input_channels);
+   inputs[1] = conv_kernel;
+   TensorShape transposed_kernel_shape = conv_kernel->Shape();
+   modified_input_output_shapes[1] = transposed_kernel_shape;
+-  Conv2dMMProgram conv2d_mm_program = CreateConv2dMMProgram(activation_, inputs, pads, strides, dilations, output, dim_a_outer, dim_b_outer, dim_inner, is_channels_last, modified_input_output_shapes);
++  Conv2dMMProgram conv2d_mm_program = CreateConv2dMMProgram(activation, inputs, pads, strides, dilations, output, dim_a_outer, dim_b_outer, dim_inner, is_channels_last, modified_input_output_shapes);
+   return context.RunProgram(conv2d_mm_program);
+ }
+ 
++template <bool is_channels_last, bool is_fused>
++Status Conv<is_channels_last, is_fused>::ComputeInternal(ComputeContext& context) const {
++  // A fused residual (4th input, from ConvActivationFusion's Conv+Add rule): out = activation(conv + bias + residual).
++  const Tensor* residual = context.InputCount() > 3 ? context.Input<Tensor>(3) : nullptr;
++  if (residual == nullptr) {
++    return ComputeImpl(context, activation_, nullptr, nullptr);
++  }
++  Status st = ComputeImpl(context, activation_, residual, nullptr);
++  if (st.IsOK() || st.Code() != common::NOT_IMPLEMENTED || st.ErrorMessage() != "WEBGPU_CONV_RESIDUAL_UNSUPPORTED") {
++    return st;
++  }
++  // Generic path: run the convolution without the activation into a temporary, then add + activate in one pass.
++  Tensor tmp;
++  ORT_RETURN_IF_ERROR(ComputeImpl(context, Activation(), nullptr, &tmp));
++  auto* output = context.Output(0, tmp.Shape());
++  const int64_t size = tmp.Shape().Size();
++  const int components = (size % 4 == 0 && tmp.Shape()[tmp.Shape().NumDimensions() - 1] % 4 == 0) ? 4 : 1;
++  const auto reduced = ReduceShapeByComponents(tmp.Shape(), components);
++  ConvResidualAddProgram program(activation_);
++  const auto total = static_cast<uint32_t>(size / components);
++  program.CacheHint(activation_.ToString(), components)
++      .AddInput({&tmp, ProgramTensorMetadataDependency::TypeAndRank, reduced, components})
++      .AddInput({residual, ProgramTensorMetadataDependency::TypeAndRank, reduced, components})
++      .AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, reduced, components})
++      .SetDispatchGroupSize((total + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++      .AddUniformVariables({{total}});
++  return context.RunProgram(program);
++}
++
+ template <bool is_channels_last, bool is_fused>
+ Status Conv<is_channels_last, is_fused>::PrePackInternal(ComputeContextBase& context,
+                                                          const Tensor& tensor,
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv.h b/onnxruntime/core/providers/webgpu/nn/conv.h
+index c93ab75..becc205 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv.h
+@@ -23,6 +23,7 @@ class Conv : public WebGpuKernel {
+     }
+   }
+   Status ComputeInternal(ComputeContext& context) const override;
++  Status ComputeImpl(ComputeContext& context, const Activation& activation, const Tensor* residual, Tensor* tmp_output) const;
+ 
+   Status PrePackInternal(ComputeContextBase& context,
+                          const Tensor& tensor,
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+index 3eee00c..5deb1e8 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.cc
+@@ -576,6 +576,7 @@ Status ConvWinogradProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   // stage 3: output transform + bias + activation
+   const auto& m = shader.AddInput("m", ShaderUsage::UseUniform);
+   const ShaderVariableHelper* bias = has_bias_ ? &shader.AddInput("bias", ShaderUsage::UseUniform) : nullptr;
++  const ShaderVariableHelper* resid = has_residual_ ? &shader.AddInput("residual", ShaderUsage::UseUniform) : nullptr;
+   const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform);
+   auto& b = shader.MainFunctionBody();
+   b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
+@@ -594,14 +595,16 @@ Status ConvWinogradProgram::GenerateShaderCode(ShaderHelper& shader) const {
+     for (int c = 0; c < 2; c++) {
+       b << "  { let oy = ty * 2u + " << r << "u; let ox = tx * 2u + " << c << "u; if (oy < uniforms.oh && ox < uniforms.ow) {\n"
+         << "    var value = " << ys[c] << ";\n"
+-        << (bias ? "    value = value + bv;\n" : "") << "    " << act << "\n    "
++        << (bias ? "    value = value + bv;\n" : "")
++        << (resid ? "    value = value + " + resid->GetByOffset("((bi * uniforms.oh + oy) * uniforms.ow + ox) * uniforms.co4 + cq") + ";\n" : "")
++        << "    " << act << "\n    "
+         << y.SetByOffset("((bi * uniforms.oh + oy) * uniforms.ow + ox) * uniforms.co4 + cq", "value") << "\n  } }\n";
+     }
+   }
+   return Status::OK();
+ }
+ 
+-Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, WinogradWeightCache* u_cache) {
++Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, WinogradWeightCache* u_cache, const Tensor* residual) {
+   applied = false;
+   static const bool use_f16 = std::getenv("ORT_WEBGPU_WINO_F16") && std::atoi(std::getenv("ORT_WEBGPU_WINO_F16")) != 0;
+   static const int mode = [] { const char* e = std::getenv("ORT_WEBGPU_CONV_WINOGRAD"); return e ? std::atoi(e) : 1; }();
+@@ -696,10 +699,12 @@ Status TryApplyWinogradConv(ComputeContext& context, const Activation& activatio
+   }
+   {
+     ConvWinogradProgram p(3, activation, bias != nullptr, tm, nv, wx, wy);
++    p.SetResidual(residual != nullptr);
+     uint32_t total = nt * co4;
+     p.AddInput({&m, M, red(m.Shape()), 4});
+     if (bias) p.AddInput({bias, M, red(bias->Shape()), 4});
+-    p.AddOutput({output, M, red(os), 4}).CacheHint("o," + activation.ToString() + std::to_string(bias != nullptr)).SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
++    if (residual) p.AddInput({residual, M, red(os), 4});
++    p.AddOutput({output, M, red(os), 4}).CacheHint("o," + activation.ToString() + std::to_string(bias != nullptr) + std::to_string(residual != nullptr)).SetDispatchGroupSize(ceil_div(total, 64)).AddUniformVariables(WINO_UNIFORMS(total, 1, 1, 1));
+     ORT_RETURN_IF_ERROR(context.RunProgram(p));
+   }
+   applied = true;
+@@ -708,3 +713,20 @@ Status TryApplyWinogradConv(ComputeContext& context, const Activation& activatio
+ 
+ }  // namespace webgpu
+ }  // namespace onnxruntime
++
++namespace onnxruntime {
++namespace webgpu {
++
++Status ConvResidualAddProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& a = shader.AddInput("a", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
++  const auto& z = shader.AddInput("z", ShaderUsage::UseUniform);
++  const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform);
++  shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.total")
++                            << "  var value = " << a.GetByOffset("global_idx") << " + " << z.GetByOffset("global_idx") << ";\n"
++                            << "  " << GetActivationSnippet(activation_, "a_value_t", "a_element_t") << "\n"
++                            << "  " << y.SetByOffset("global_idx", "value") << "\n";
++  return Status::OK();
++}
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+index 421b786..0d13a7c 100644
+--- a/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
++++ b/onnxruntime/core/providers/webgpu/nn/conv2d_mm.h
+@@ -62,6 +62,17 @@ class Conv2dMMProgram final : public Program<Conv2dMMProgram> {
+ Conv2dMMProgram CreateConv2dMMProgram(const Activation& activation, const std::vector<const Tensor*>& inputs, const std::vector<uint32_t>& pads, const std::vector<uint32_t>& strides, const std::vector<uint32_t>& dilations, Tensor* output, uint32_t dim_a_outer, uint32_t dim_b_outer, uint32_t dim_inner, bool is_channels_last, const std::vector<TensorShape>& modified_input_output_shapes);
+ 
+ 
++// out = activation(a + z), elementwise; the generic fallback for a Conv with a fused residual input.
++class ConvResidualAddProgram final : public Program<ConvResidualAddProgram> {
++ public:
++  explicit ConvResidualAddProgram(const Activation& activation) : Program("ConvResidualAdd"), activation_(activation) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"total", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  const Activation& activation_;
++};
++
+ // Winograd-transformed weights kept across runs when the kernel is a prepacked initializer.
+ struct WinogradWeightCache {
+   std::unique_ptr<Tensor> u;  // buffer form
+@@ -76,6 +87,7 @@ class ConvWinogradProgram final : public Program<ConvWinogradProgram> {
+   ConvWinogradProgram(int stage, const Activation& activation, bool has_bias, uint32_t tm, uint32_t nv, uint32_t wx, uint32_t wy, bool f16 = false, int tex = 0)
+       : Program("ConvWinograd"), stage_(stage), activation_(activation), has_bias_(has_bias), tm_(tm), nv_(nv), wx_(wx), wy_(wy), f16_(f16), tex_(tex) {}
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
++  void SetResidual(bool v) { has_residual_ = v; }
+   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+       {"total", ProgramUniformVariableDataType::Uint32},
+       {"h", ProgramUniformVariableDataType::Uint32},
+@@ -94,6 +106,7 @@ class ConvWinogradProgram final : public Program<ConvWinogradProgram> {
+       {"logical_dispatch_z", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
++  bool has_residual_ = false;  // stage 3 adds an input "residual" (output layout) after the bias, before the activation
+   int stage_;  // 0 weight transform, 1 input transform, 2 batched GEMM, 3 output transform
+   const Activation& activation_;
+   bool has_bias_;
+@@ -103,7 +116,7 @@ class ConvWinogradProgram final : public Program<ConvWinogradProgram> {
+ };
+ 
+ // Returns true (and runs the four programs) when the conv qualifies; `kernel` is HWIO [3,3,Cin,Cout].
+-Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, WinogradWeightCache* u_cache = nullptr);
++Status TryApplyWinogradConv(ComputeContext& context, const Activation& activation, const Tensor* input, const Tensor* kernel, const Tensor* bias, const std::vector<uint32_t>& pads, Tensor* output, bool& applied, WinogradWeightCache* u_cache = nullptr, const Tensor* residual = nullptr);
+ 
+ }  // namespace webgpu
+ }  // namespace onnxruntime
