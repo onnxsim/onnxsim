@@ -2226,7 +2226,8 @@ class ModelQuantizer:
                 "Gemm layers are bit-identical, convolutions and norms differ "
                 "in the last bit)"
                 if name == "adaquant"
-                else " and the arithmetic is float64"
+                else " and the arithmetic is float32 for 16-bit weight grids, "
+                "float64 otherwise"
             )
             + ", so results match Quark statistically "
             "(bit for bit given the same mini-batch indices)"
