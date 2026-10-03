@@ -30,6 +30,7 @@ from onnxsim.quark_marking import quark_sorted
 
 _BLOCK = ["BFP16", "MX4", "MX9", "MXFP4E2M1", "MXFP8E4M3", "MXINT8"]
 _HALF = ["BF16", "FP16"]
+_AMP = ["BF16_MIXED_BFP16", "BF16_MIXED_MXINT8"]
 
 
 def _quantize(preset, model, runtime=False, **extra):
@@ -65,6 +66,52 @@ def _quantized_tensors(model):
 
 
 # -- the float graph Quark quantizes --------------------------------------------------------
+
+
+@pytest.mark.parametrize("preset", _AMP)
+@pytest.mark.parametrize(
+    "name, gone, now",
+    [
+        ("conv_bn", "BatchNormalization", "Conv"),
+        ("identity", "Identity", "Conv"),
+        ("pad_conv", "Pad", "Conv"),
+        ("matmul_add", "Add", "Gemm"),
+        ("reducemean", "ReduceMean", "GlobalAveragePool"),
+        ("block20", "Erf", "Gelu"),
+    ],
+)
+def test_mixed_bf16_promotes_the_preprocessed_graph(preset, name, gone, now):
+    model = PATTERNS[name]()
+    # MatMul + Add folding is supplied by the runtime optimizer.
+    out = _quantize(preset, model, runtime=name == "matmul_add")
+    assert gone not in ops(out) and now in ops(out)
+    block_op = (
+        "BFPQuantizeDequantize" if preset.endswith("BFP16") else "MXQuantizeDequantize"
+    )
+    producers = {o: n for n in out.graph.node for o in n.output}
+    for node in out.graph.node:
+        if node.op_type in ("Conv", "ConvTranspose", "Gemm", "MatMul"):
+            assert producers[node.input[1]].op_type == block_op
+    used = {x for n in out.graph.node for x in n.input}
+    used.update(v.name for v in out.graph.output)
+    assert all(t.name in used for t in out.graph.initializer)
+    # Quantization preserves the caller's float graph.
+    assert gone in ops(model)
+
+
+@pytest.mark.parametrize("preset", _AMP)
+def test_mixed_bf16_skip_preprocess_keeps_the_original_graph_and_opset(preset):
+    out = _quantize(preset, block17(), SkipPreprocess=True, ConvertOpsetVersion=20)
+    assert {"Pow", "ReduceMean", "Erf"} <= set(ops(out))
+    assert "LayerNormalization" not in ops(out)
+    assert next(o.version for o in out.opset_import if o.domain == "") == 17
+
+
+@pytest.mark.parametrize("preset", _AMP)
+def test_mixed_bf16_returns_a_model_with_nothing_to_quantize_unchanged(preset):
+    model = identity_only()
+    out = _quantize(preset, model, ConvertOpsetVersion=20)
+    assert out.SerializeToString() == model.SerializeToString()
 
 
 @pytest.mark.parametrize("preset", _BLOCK + _HALF)
