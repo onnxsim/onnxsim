@@ -1,0 +1,79 @@
+diff --git a/onnxruntime/core/optimizer/conv_activation_fusion.cc b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+index ef8a5f3..3aff3b9 100644
+--- a/onnxruntime/core/optimizer/conv_activation_fusion.cc
++++ b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+@@ -85,6 +85,11 @@ class ConvActivationSelector : public NodeSelector {
+           graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "QuickGelu", {1}, kMSDomain)) {
+         return true;
+       }
++      // Gelu (opset 20, exact erf or approximate="tanh") in the WebGPU Conv epilogue.
++      if (node_ep == kWebGpuExecutionProvider &&
++          graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Gelu", {20})) {
++        return true;
++      }
+       if (graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Relu", {6, 13, 14}) ||
+           graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Sigmoid", {6, 13}) ||
+           graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Tanh", {6, 13}) ||
+@@ -182,6 +187,9 @@ class FuseConvActivationAction : public ReplaceWithNew {
+                   "Failed to get Clip min/max constants.");
+       activation_params.push_back(min);
+       activation_params.push_back(max);
++    } else if (activation_op_type == "Gelu") {
++      const auto* approx_attr = graph_utils::GetNodeAttribute(*activation, "approximate");
++      activation_params.push_back(approx_attr != nullptr && approx_attr->s() == "tanh" ? 1.0f : 0.0f);
+     } else if (activation_op_type == "QuickGelu") {
+       const auto* alpha_attr = graph_utils::GetNodeAttribute(*activation, "alpha");
+       activation_params.push_back(alpha_attr == nullptr ? 1.702f : alpha_attr->f());  // 1.702 is the QuickGelu default
+diff --git a/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc b/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
+index 49153de..7e4d9da 100644
+--- a/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
++++ b/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
+@@ -30,6 +30,9 @@ Status GetFusedActivationAttr(const OpKernelInfo& info, Activation& activation)
+       } else if (activation_type == "HardSigmoid") {
+         activation.activation_kind_ = ActivationKind::HardSigmoid;
+         activation_params_count = 2;
++      } else if (activation_type == "Gelu") {
++        activation.activation_kind_ = ActivationKind::Gelu;
++        activation_params_count = 1;  // 0 = exact (erf), 1 = tanh approximation
+       } else if (activation_type == "QuickGelu") {
+         activation.activation_kind_ = ActivationKind::QuickGelu;
+         activation_params_count = 1;
+@@ -78,6 +81,14 @@ std::string GetActivationSnippet(const Activation& activation, std::string value
+              " * value, value, value >= " + value_type_cast(0.0) + ");";
+     case ActivationKind::Tanh:
+       return "value = tanh(value);";
++    case ActivationKind::Gelu:
++      if (activation.activation_params_.Gelu.tanh_ != 0.0f) {
++        return "{ let gu = clamp(0.7978845608028654 * (value + 0.044715 * value * value * value), " + value_type_cast(-10.0) + ", " + value_type_cast(10.0) + "); value = 0.5 * value * (1.0 + tanh(gu)); }";
++      }
++      // 0.5 * x * (1 + erf(x / sqrt(2))) with the same Abramowitz-Stegun erf approximation as the Gelu/Erf kernels
++      return "{ let gav = abs(value * 0.7071067811865475); let gex = 1.0 / (1.0 + 0.3275911 * gav); "
++             "let ger = sign(value) * (1.0 - ((((1.061405429 * gex - 1.453152027) * gex + 1.421413741) * gex - 0.284496736) * gex + 0.254829592) * gex * exp(-gav * gav)); "
++             "value = 0.5 * value * (1.0 + ger); }";
+     case ActivationKind::QuickGelu:
+       // x * sigmoid(alpha * x) = x / (1 + exp(-alpha * x)); exp overflows to +inf for very negative x, giving -0, which is right.
+       return "value = value / (" + value_type_cast(1.0) + " + exp(-" + base_type_cast(activation.activation_params_.QuickGelu.alpha_) + " * value));";
+diff --git a/onnxruntime/core/providers/webgpu/nn/fuse_utils.h b/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
+index 3b3ce91..c17328e 100644
+--- a/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
++++ b/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
+@@ -20,7 +20,8 @@ enum class ActivationKind {
+   HardSigmoid,
+   LeakyRelu,
+   Tanh,
+-  QuickGelu  // x * sigmoid(alpha * x); alpha = 1 is SiLU/Swish
++  QuickGelu,  // x * sigmoid(alpha * x); alpha = 1 is SiLU/Swish
++  Gelu        // exact erf Gelu
+ };
+ 
+ using Activation = struct Activation {
+@@ -46,6 +47,9 @@ using Activation = struct Activation {
+     struct {
+       float alpha_;
+     } QuickGelu;
++    struct {
++      float tanh_;
++    } Gelu;
+     float values_[2];
+   };
+   ActivationParameters activation_params_ = {};

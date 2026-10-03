@@ -1,0 +1,201 @@
+diff --git a/onnxruntime/core/providers/webgpu/tensor/concat.cc b/onnxruntime/core/providers/webgpu/tensor/concat.cc
+index 41ca7a8..500514b 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/concat.cc
++++ b/onnxruntime/core/providers/webgpu/tensor/concat.cc
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT License.
+ #include "core/providers/webgpu/tensor/concat.h"
+ 
++#include <cstdlib>
+ #include "core/common/inlined_containers.h"
+ #include "core/providers/cpu/tensor/utils.h"
+ #include "core/providers/webgpu/shader_helper.h"
+@@ -114,6 +115,24 @@ Status ConcatProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   return Status::OK();
+ }
+ 
++Status ConcatLastAxisVec4Program::GenerateShaderCode(ShaderHelper& shader) const {
++  const size_t n = Inputs().size();
++  std::vector<const ShaderVariableHelper*> inputs;
++  for (size_t i = 0; i < n; ++i) inputs.push_back(&shader.AddInput("input_" + std::to_string(i), ShaderUsage::UseUniform));
++  const auto& output = shader.AddOutput("output", ShaderUsage::UseUniform);
++  auto& b = shader.MainFunctionBody();
++  b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size")
++    << "  let outer = global_idx / uniforms.c_out4;\n  let c = global_idx % uniforms.c_out4;\n";
++  for (size_t i = 0; i < n; ++i) {
++    const std::string start = GetElementAt("uniforms.starts4", std::to_string(i), n);
++    const std::string width = GetElementAt("uniforms.widths4", std::to_string(i), n);
++    const std::string cond = i + 1 < n ? "c < " + GetElementAt("uniforms.starts4", std::to_string(i + 1), n) : "true";
++    b << (i == 0 ? "  if (" : "  else if (") << cond << ") {\n    "
++      << output.SetByOffset("global_idx", inputs[i]->GetByOffset("outer * " + width + " + (c - " + start + ")")) << "\n  }\n";
++  }
++  return Status::OK();
++}
++
+ Status Concat::ComputeInternal(ComputeContext& context) const {
+   uint32_t input_count = context.InputCount();
+   InlinedTensorsVector input_tensors;
+@@ -132,6 +151,41 @@ Status Concat::ComputeInternal(ComputeContext& context) const {
+   uint32_t max_inputs_per_concat = context.DeviceLimits().maxStorageBuffersPerShaderStage - 1;
+   bool is_int64 = prepare.output_tensor->DataType() == DataTypeImpl::GetType<int64_t>();
+ 
++  // Fast path: last-axis concat of 32/16-bit float inputs whose last dimension is a multiple of 4 -> vec4 copies.
++  {
++    static const bool fast_enabled = [] { const char* e = std::getenv("ORT_WEBGPU_CONCAT_VEC4"); return e == nullptr || e[0] != '0'; }();
++    const auto* dt = prepare.output_tensor->DataType();
++    const size_t rank = prepare.output_tensor->Shape().NumDimensions();
++    bool ok = fast_enabled && !is_int64 && rank >= 2 && axis == rank - 1 && input_count >= 2 && input_count <= max_inputs_per_concat &&
++              (dt == DataTypeImpl::GetType<float>() || dt == DataTypeImpl::GetType<MLFloat16>()) && prepare.output_tensor->Shape()[axis] % 4 == 0;
++    for (uint32_t i = 0; ok && i < input_count; i++) {
++      const auto& t = *prepare.inputs[i].tensor;
++      if (t.Shape().Size() == 0 || t.Shape()[axis] % 4 != 0) ok = false;
++    }
++    if (ok) {
++      ConcatLastAxisVec4Program program;
++      std::vector<uint32_t> starts4, widths4;
++      uint32_t cum4 = 0;
++      for (uint32_t i = 0; i < input_count; i++) {
++        const auto& t = *prepare.inputs[i].tensor;
++        TensorShapeVector red = t.Shape().AsShapeVector();
++        red.back() /= 4;
++        program.AddInput({&t, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(red), 4});
++        starts4.push_back(cum4);
++        widths4.push_back(static_cast<uint32_t>(t.Shape()[axis] / 4));
++        cum4 += static_cast<uint32_t>(t.Shape()[axis] / 4);
++      }
++      TensorShapeVector ored = prepare.output_tensor->Shape().AsShapeVector();
++      ored.back() /= 4;
++      const uint32_t out4 = static_cast<uint32_t>(prepare.output_tensor->Shape().Size() / 4);
++      program.CacheHint(input_count)
++          .AddOutput({prepare.output_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(ored), 4})
++          .SetDispatchGroupSize((out4 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++          .AddUniformVariables({gsl::span<const uint32_t>(starts4.data(), starts4.size()), gsl::span<const uint32_t>(widths4.data(), widths4.size()), cum4, out4});
++      return context.RunProgram(program);
++    }
++  }
++
+   uint32_t input_index = 0;
+   uint32_t cumulative_size_in_concat_axis = 0;
+ 
+diff --git a/onnxruntime/core/providers/webgpu/tensor/concat.h b/onnxruntime/core/providers/webgpu/tensor/concat.h
+index 7729101..0241d67 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/concat.h
++++ b/onnxruntime/core/providers/webgpu/tensor/concat.h
+@@ -26,6 +26,19 @@ class ConcatProgram final : public Program<ConcatProgram> {
+   bool is_int64_;
+ };
+ 
++// Concat along the last axis where every input's last dimension is a multiple of 4: copies vec4s instead of scalars.
++class ConcatLastAxisVec4Program final : public Program<ConcatLastAxisVec4Program> {
++ public:
++  ConcatLastAxisVec4Program() : Program{"ConcatLastAxisVec4"} {}
++
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"starts4", ProgramUniformVariableDataType::Uint32},
++                                          {"widths4", ProgramUniformVariableDataType::Uint32},
++                                          {"c_out4", ProgramUniformVariableDataType::Uint32},
++                                          {"output_size", ProgramUniformVariableDataType::Uint32});
++};
++
+ class Concat final : public WebGpuKernel, public ConcatBase {
+  public:
+   Concat(const OpKernelInfo& info) : WebGpuKernel(info), ConcatBase(info) {
+diff --git a/onnxruntime/core/providers/webgpu/tensor/split.cc b/onnxruntime/core/providers/webgpu/tensor/split.cc
+index 43de5cc..f59024b 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/split.cc
++++ b/onnxruntime/core/providers/webgpu/tensor/split.cc
+@@ -1,6 +1,7 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <cstdlib>
+ #include "core/providers/webgpu/tensor/split.h"
+ #include "core/providers/webgpu/shader_helper.h"
+ #include "core/providers/webgpu/webgpu_supported_types.h"
+@@ -72,6 +73,24 @@ Status SplitProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   return Status::OK();
+ }
+ 
++Status SplitLastAxisVec4Program::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& input = shader.AddInput("input", ShaderUsage::UseUniform);
++  const size_t n = Outputs().size();
++  std::vector<const ShaderVariableHelper*> outputs;
++  for (size_t i = 0; i < n; ++i) outputs.push_back(&shader.AddOutput("output_" + std::to_string(i), ShaderUsage::UseUniform));
++  auto& b = shader.MainFunctionBody();
++  b << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.input_size")
++    << "  let outer = global_idx / uniforms.c_in4;\n  let c = global_idx % uniforms.c_in4;\n  let v = " << input.GetByOffset("global_idx") << ";\n";
++  for (size_t i = 0; i < n; ++i) {
++    const std::string end = GetElementAt("uniforms.ends4", std::to_string(i), n);
++    const std::string width = GetElementAt("uniforms.widths4", std::to_string(i), n);
++    const std::string cond = i + 1 < n ? "c < " + end : "true";
++    b << (i == 0 ? "  if (" : "  else if (") << cond << ") {\n    "
++      << outputs[i]->SetByOffset("outer * " + width + " + (c - (" + end + " - " + width + "))", "v") << "\n  }\n";
++  }
++  return Status::OK();
++}
++
+ Status Split::ComputeInternal(ComputeContext& context) const {
+   const Tensor* input = context.Input<Tensor>(0);
+   auto& input_shape = input->Shape();
+@@ -128,6 +147,36 @@ Status Split::ComputeInternal(ComputeContext& context) const {
+     return Status::OK();
+   }
+ 
++  {
++    static const bool fast_enabled = [] { const char* e = std::getenv("ORT_WEBGPU_SPLIT_VEC4"); return e == nullptr || e[0] != '0'; }();
++    const auto* dt = input->DataType();
++    const size_t rank = input_shape.NumDimensions();
++    bool ok = fast_enabled && rank >= 2 && static_cast<size_t>(axis) == rank - 1 && non_empty_output_indices.size() >= 2 && non_empty_output_indices.size() <= 6 &&
++              (dt == DataTypeImpl::GetType<float>() || dt == DataTypeImpl::GetType<MLFloat16>()) && input_shape[rank - 1] % 4 == 0;
++    for (int idx : non_empty_output_indices) ok = ok && split_sizes[idx] % 4 == 0;
++    if (ok) {
++      SplitLastAxisVec4Program fast;
++      TensorShapeVector ired = input_shape.AsShapeVector();
++      ired.back() /= 4;
++      fast.AddInput({input, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(ired), 4});
++      std::vector<uint32_t> ends4, widths4;
++      uint32_t cum4 = 0;
++      for (int idx : non_empty_output_indices) {
++        TensorShapeVector ored = all_outputs[idx]->Shape().AsShapeVector();
++        ored.back() /= 4;
++        fast.AddOutput({all_outputs[idx], ProgramTensorMetadataDependency::TypeAndRank, TensorShape(ored), 4});
++        widths4.push_back(static_cast<uint32_t>(split_sizes[idx] / 4));
++        cum4 += static_cast<uint32_t>(split_sizes[idx] / 4);
++        ends4.push_back(cum4);
++      }
++      const uint32_t in4 = input_size / 4;
++      fast.CacheHint(non_empty_output_indices.size())
++          .SetDispatchGroupSize((in4 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++          .AddUniformVariables({gsl::span<const uint32_t>(ends4.data(), ends4.size()), gsl::span<const uint32_t>(widths4.data(), widths4.size()), cum4, in4});
++      return context.RunProgram(fast);
++    }
++  }
++
+   SplitProgram program{static_cast<uint32_t>(axis)};
+   program.AddInput({input, ProgramTensorMetadataDependency::TypeAndRank});
+ 
+diff --git a/onnxruntime/core/providers/webgpu/tensor/split.h b/onnxruntime/core/providers/webgpu/tensor/split.h
+index 39ca7a5..ff96015 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/split.h
++++ b/onnxruntime/core/providers/webgpu/tensor/split.h
+@@ -24,6 +24,19 @@ class SplitProgram final : public Program<SplitProgram> {
+   uint32_t axis_;
+ };
+ 
++// Split along the last axis with every piece (and the input) a multiple of 4 wide: vec4 copies.
++class SplitLastAxisVec4Program final : public Program<SplitLastAxisVec4Program> {
++ public:
++  SplitLastAxisVec4Program() : Program{"SplitLastAxisVec4"} {}
++
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"ends4", ProgramUniformVariableDataType::Uint32},
++                                          {"widths4", ProgramUniformVariableDataType::Uint32},
++                                          {"c_in4", ProgramUniformVariableDataType::Uint32},
++                                          {"input_size", ProgramUniformVariableDataType::Uint32});
++};
++
+ class Split : public WebGpuKernel, public SplitBase {
+  public:
+   Split(const OpKernelInfo& info, uint32_t opset) : WebGpuKernel(info), SplitBase(info, opset) {}
