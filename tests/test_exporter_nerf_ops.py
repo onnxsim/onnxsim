@@ -18,6 +18,8 @@ MIL's own constant folding (the ``_mil_const_value`` trick already used by
 ``test_coreml_export.py``), so it needs coremltools but not a Core ML runtime.
 """
 
+import pathlib
+
 import numpy as np
 import onnx
 import onnxruntime as ort
@@ -516,6 +518,131 @@ def test_coreml_gridsample_sampling_matches_onnx_reference():
 
         assert got.shape == tuple(onnx_ref.shape)
         np.testing.assert_allclose(got, onnx_ref, atol=1e-5, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# The shared GridSample plan
+# ---------------------------------------------------------------------------
+
+
+def test_both_exporters_reduce_gridsample_to_the_same_plan():
+    """The Core ML and TFLite lowerings share `grid_sample_plan`, so a future
+    change to the sampling arithmetic cannot land in one and miss the other.
+
+    What is asserted: both modules import the shared plan, and the host-side
+    reference both defer to is itself plan-driven.
+    """
+    from onnxsim import coreml_export, tflite_export
+
+    for module in (coreml_export, tflite_export):
+        source = pathlib.Path(module.__file__).read_text()
+        assert "from .gridsample_plan import grid_sample_plan" in source, (
+            f"{module.__name__} does not import the shared GridSample plan"
+        )
+    # Core ML has no grid-sample kernel, so its handler emits MIL ops straight
+    # from the plan and must not recompute coordinates or corner weights.
+    coreml_src = pathlib.Path(coreml_export.__file__).read_text()
+    handler = coreml_src.split('@_register("GridSample")')[1].split("@_register")[0]
+    assert "scoord" not in handler, "the Core ML handler still derives coordinates"
+    assert "np.floor" not in handler, "the Core ML handler still derives corners"
+    # TFLite emits TensorFlow ops (so it keeps its own coordinate math for the
+    # graph), but its numpy reference and const-folding path must agree with the
+    # plan rather than duplicate it.
+    assert "grid_sample_plan(" in coreml_src
+    tflite_src = pathlib.Path(tflite_export.__file__).read_text()
+    reference = tflite_src.split("def _numpy_grid_sample(")[1].split("@_register")[0]
+    assert "grid_sample_plan(" in reference, (
+        "the TFLite numpy reference no longer reduces via the shared plan"
+    )
+
+
+def test_grid_sample_plan_is_referenceable_without_coremltools():
+    """The plan is pure numpy, so it is usable (and testable) on its own."""
+    from onnxsim.gridsample_plan import grid_sample_plan
+
+    rng = np.random.default_rng(0)
+    grid = (rng.random((2, 3, 3, 2)).astype(np.float32) * 3.0 - 1.5)
+    bilinear = grid_sample_plan((2, 3, 8, 8), (2, 3, 3, 2), grid)
+    nearest = grid_sample_plan((2, 3, 8, 8), (2, 3, 3, 2), grid, mode="nearest")
+    assert len(bilinear) == 4  # 2-D -> 4 corners
+    assert len(nearest) == 1
+    for tap in bilinear + nearest:
+        assert tap.indices.shape == (2, 9, 3)  # (N, flat, 1 + xd)
+        assert tap.indices.dtype == np.int32
+        assert tap.gather_weight.shape == (2, 9)
+        assert tap.valid.dtype == bool
+    # Bilinear weights over the 4 corners sum to 1 per sample.
+    total = sum(t.gather_weight for t in bilinear)
+    np.testing.assert_allclose(total, np.ones((2, 9)), atol=1e-6)
+
+
+def test_grid_sample_plan_rejects_unsupported_mode_and_padding():
+    from onnxsim.gridsample_plan import grid_sample_plan
+
+    grid = np.zeros((1, 2, 2, 2), dtype=np.float32)
+    with pytest.raises(ValueError, match="mode"):
+        grid_sample_plan((1, 1, 4, 4), (1, 2, 2, 2), grid, mode="bicubic")
+    with pytest.raises(ValueError, match="padding_mode"):
+        grid_sample_plan((1, 1, 4, 4), (1, 2, 2, 2), grid, padding_mode="reflection")
+
+
+def test_grid_sample_plan_matches_onnx_reference():
+    """Applying the plan's own indices and weights reproduces ONNX's GridSample.
+
+    This is the plan applied independently of ``_numpy_grid_sample`` (which both
+    exporters also consume), so a bug in either the plan or one of its two
+    consumers shows up here as a mismatch rather than cancelling out.
+    """
+    from onnx.reference import ReferenceEvaluator
+
+    from onnx import helper
+
+    from onnxsim.gridsample_plan import grid_sample_plan
+
+    rng = np.random.default_rng(0)
+    for x_shape, grid_shape, mode, padding_mode, align_corners in GRIDSAMPLE_CASES:
+        x = rng.random(x_shape).astype(np.float32)
+        grid = (rng.random(grid_shape).astype(np.float32) * 3.0 - 1.5)
+        plan = grid_sample_plan(
+            x_shape, grid_shape, grid, mode, padding_mode, align_corners
+        )
+        n, xd = x_shape[0], len(x_shape) - 2
+        out_shape = list(grid_shape[1:-1])
+        # (N, *spatial, C); each plan index row is a batch column followed by one
+        # index per spatial axis of this channel-last view.
+        x_cl = np.moveaxis(x, 1, -1)
+        batch = np.broadcast_to(
+            np.arange(n).reshape([n] + [1] * len(out_shape)), [n] + out_shape
+        )
+        acc = 0
+        for tap in plan:
+            coords = tap.indices[:, :, 1:].reshape([n] + out_shape + [-1])
+            vals = x_cl[(batch,) + tuple(coords[..., j] for j in range(xd))]
+            vals = np.moveaxis(vals, -1, 1)  # (N, C, *out)
+            per_sample = [n, 1] + out_shape
+            term = vals * tap.gather_weight.reshape(per_sample)
+            if padding_mode == "zeros":
+                term = term * tap.valid.reshape(per_sample)
+            acc = acc + term
+
+        node = helper.make_node(
+            "GridSample", ["X", "G"], ["Y"],
+            mode="linear" if mode == "bilinear" else mode,
+            padding_mode=padding_mode, align_corners=int(align_corners),
+        )
+        graph = helper.make_graph(
+            [node], "gs",
+            [helper.make_tensor_value_info("X", F, list(x_shape)),
+             helper.make_tensor_value_info("G", F, list(grid_shape))],
+            [helper.make_tensor_value_info("Y", F, None)],
+        )
+        ref_model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 20)]
+        )
+        ref_model.ir_version = 9
+        ref = ReferenceEvaluator(ref_model).run(None, {"X": x, "G": grid})[0]
+        assert acc.shape == ref.shape
+        np.testing.assert_allclose(acc, ref, atol=1e-5, rtol=1e-4)
 
 
 def test_coreml_gridsample_rejects_unsupported_mode():

@@ -35,7 +35,6 @@ conversion still succeeds off of macOS; pass ``skip_model_load=False`` on macOS 
 model that's ready to run.
 """
 
-import itertools
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -43,6 +42,7 @@ import onnx
 from onnx import numpy_helper
 
 from .einsum_decompose import decompose_einsum
+from .gridsample_plan import grid_sample_plan
 
 _COREML_INSTALL_HINT = (
     "coremltools is required to export Core ML models but is not installed. "
@@ -1674,71 +1674,57 @@ def _op_topk(lowerer, node, ins, attrs):
 @_register("GridSample")
 def _op_grid_sample(lowerer, node, ins, attrs):
     # 2-D/3-D float sampling built from `gather_nd` corner taps plus elementwise
-    # arithmetic -- this MIL has no native grid-sample op. The TFLite exporter has
-    # the same lowering and a numpy twin of the identical math
-    # (`tflite_export._numpy_grid_sample`), which is the reference this was written
-    # against. Implements the opset <= 19 ("bilinear") and 20+ ("linear") mode
-    # spellings identically, matching that exporter op for op.
-    #
-    # MIL ops carry static shapes, so the corner indices and weights are computed
-    # host-side with numpy and handed over as constants; what stays in the graph is
-    # one `gather_nd` per corner plus the weighting and accumulation.
+    # weighting -- this MIL has no native grid-sample op. All the arithmetic
+    # (coordinates, corners, weights, out-of-range mask) comes from
+    # :func:`onnxsim.gridsample_plan.grid_sample_plan`, the shared plan the TFLite
+    # exporter lowers too, so the two cannot drift apart; only the emission below
+    # is Core ML specific. Implements the opset <= 19 ("bilinear") and 20+
+    # ("linear") mode spellings identically.
     x, grid = ins[0], ins[1]
-    x_shape = list(x.shape)
-    g_shape = list(grid.shape)
+    x_shape = [int(d) for d in x.shape]
+    g_shape = [int(d) for d in grid.shape]
     xd = len(x_shape) - 2
+    mode = str(attrs.get("mode", "bilinear")).lower()
+    padding_mode = str(attrs.get("padding_mode", "zeros")).lower()
+    align_corners = bool(attrs.get("align_corners", 0))
     if xd not in (2, 3) or len(g_shape) != xd + 2 or g_shape[-1] != xd:
         raise RuntimeError(
             "only 2-D/3-D GridSample is supported by onnxsim's Core ML exporter "
             f"(got X rank {len(x_shape)}, grid rank {len(g_shape)})"
-        )
-    mode = str(attrs.get("mode", "bilinear")).lower()
-    if mode not in ("bilinear", "linear", "nearest"):
-        raise RuntimeError(
-            f"GridSample mode={mode!r} is not supported by onnxsim's Core ML "
-            "exporter (supported: bilinear/linear, nearest)"
-        )
-    padding_mode = str(attrs.get("padding_mode", "zeros")).lower()
-    if padding_mode not in ("zeros", "border"):
-        raise RuntimeError(
-            f"GridSample padding_mode={padding_mode!r} is not supported by "
-            "onnxsim's Core ML exporter (supported: zeros, border)"
-        )
-    align_corners = bool(attrs.get("align_corners", 0))
-    n = x_shape[0]
-    dims = [int(d) for d in x_shape[2:]]
-    out_shape = [int(d) for d in g_shape[1:-1]]
-    if any(d <= 0 for d in dims + out_shape) or n <= 0:
-        raise RuntimeError(
-            "GridSample needs static, positive X and grid spatial dimensions "
-            "(Core ML cannot build gather indices for a dynamic output size)"
         )
     if grid.val is None:
         raise RuntimeError(
             "GridSample needs a compile-time-constant 'grid' input (Core ML "
             "builds its gather indices at compile time)"
         )
-    g = np.asarray(grid.val, dtype=np.float32).reshape([n] + out_shape + [xd])
-    # Grid's last axis is (x, y[, z]): spatial axis j reads coord xd-1-j.
-    scoord = []
-    for j in range(xd):
-        c = g[..., xd - 1 - j]
-        dim = dims[j]
-        scoord.append(
-            (c + 1) / 2 * (dim - 1) if align_corners else ((c + 1) * dim - 1) / 2
+    if any(d <= 0 for d in x_shape + g_shape):
+        raise RuntimeError(
+            "GridSample needs static, positive X and grid dimensions (Core ML "
+            "cannot build gather indices for a dynamic output size)"
         )
-    flat = int(np.prod(out_shape)) if out_shape else 1
-    # The sampled result arrives as (n, flat, C) -- sample-major with channels
-    # last -- and is restored to the ONNX NCHW output order (n, C, *out) by one
-    # transpose plus one reshape, both of which are pure metadata. The
-    # channel-last view of `x` exists for the same reason: MIL's `gather_nd`
-    # only matches ONNX's GatherND on a channel-last tensor (see `tap`).
+    n, channels = x_shape[0], x_shape[1]
+    out_shape = g_shape[1:-1]
+
+    try:
+        plan = grid_sample_plan(
+            x_shape, g_shape, grid.val, mode, padding_mode, align_corners
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"GridSample {mode=!r} {padding_mode=!r} is not supported by onnxsim's "
+            f"Core ML exporter: {exc}"
+        ) from exc
+
+    # MIL's `gather_nd` indexes the tensor's *leading* axes and moves the trailing
+    # (non-indexed) axis to the end, so it only matches ONNX's GatherND on a
+    # channel-last tensor. Sampling a channel-first `x` therefore goes through one
+    # channel-last view, and the result is (n, flat, C) -- sample-major with
+    # channels last -- which `to_output` restores to ONNX's NCHW order.
     x_cl = lowerer.mb.transpose(
         x=x,
         perm=[0] + list(range(2, 2 + xd)) + [1],
         name=lowerer.fresh_name(node, "tocl"),
     )
-    out_shape_t = [n, x_shape[1]] + out_shape
 
     def to_output(sample_major):
         # (n, flat, C) -> (n, C, *out)
@@ -1748,76 +1734,44 @@ def _op_grid_sample(lowerer, node, ins, attrs):
                 perm=[0, 2, 1],
                 name=lowerer.fresh_name(node, "tonchw"),
             ),
-            shape=out_shape_t,
+            shape=[n, channels] + out_shape,
             name=lowerer.fresh_name(node, "reshape"),
         )
 
-    def tap(corners):
-        # corners: one int array per spatial axis, each (n, *out). Validity is
-        # computed from the raw corner; the gather reads the clamped one.
-        #
-        # MIL's `gather_nd` indexes the tensor's *leading* axes and moves the
-        # trailing (non-indexed) axis to the end, so it only matches ONNX's
-        # GatherND on a channel-last tensor. Sampling a channel-first `x` is
-        # therefore done through one channel-last view, which also makes the
-        # result (n, flat, C) -- sample-major, channels last, i.e. the natural
-        # NHWC layout of the output.
-        idx = np.zeros((n, flat, xd + 1), dtype=np.int32)
-        b = np.arange(n, dtype=np.int32).reshape(n, 1)
-        idx[..., 0] = np.broadcast_to(b, (n, flat))
-        valid = np.ones((n, flat, x_shape[1]), dtype=np.float32)
-        for j, dim in enumerate(dims):
-            ix = corners[j].reshape(n, flat)
-            if padding_mode == "zeros":
-                valid *= ((ix >= 0) & (ix < dim)).astype(np.float32)[:, :, None]
-            idx[..., j + 1] = np.clip(ix, 0, dim - 1).astype(np.int32)
+    def weighted_tap(tap):
+        # A (n, flat) per-tap scalar becomes (n, flat, C) so it scales every
+        # channel of its own sample row.
         gathered = lowerer.mb.gather_nd(
             x=x_cl,
-            indices=lowerer.make_const(node.output[0], idx),
+            indices=lowerer.make_const(node.output[0], tap.indices),
             name=lowerer.fresh_name(node, "tap"),
         )
-        return gathered, valid
-
-    if mode in ("bilinear", "linear"):
-        lo = [np.floor(c).astype(np.int32) for c in scoord]
-        # Flatten the grid's (n, *out) sample axes to the (n, flat) row layout
-        # the corner weights and gather indices are both built in; the weight is
-        # then broadcast across channels to match `gathered`'s (n, flat, C).
-        frac = [(c - np.floor(c)).astype(np.float32).reshape(n, flat) for c in scoord]
-        acc = None
-        # `combo` selects, per spatial axis, the lower (0) or upper (1) corner.
-        for combo in itertools.product([0, 1], repeat=xd):
-            corners = [b + o for b, o in zip(lo, combo)]
-            w = np.ones((n, flat, x_shape[1]), dtype=np.float32)
-            for j, o in enumerate(combo):
-                w = w * (frac[j] if o else (1.0 - frac[j]))[:, :, None]
-            vals, valid = tap(corners)
-            term = lowerer.mb.mul(
-                x=vals,
-                y=lowerer.make_const(node.output[0], w),
-                name=lowerer.fresh_name(node),
-            )
-            if padding_mode == "zeros":
-                term = lowerer.mb.mul(
-                    x=term,
-                    y=lowerer.make_const(node.output[0], valid),
-                    name=lowerer.fresh_name(node),
-                )
-            acc = (
-                term
-                if acc is None
-                else lowerer.mb.add(x=acc, y=term, name=lowerer.fresh_name(node))
-            )
-        return [to_output(acc)]
-    corners = [np.rint(c).astype(np.int32) for c in scoord]  # ties-to-even
-    vals, valid = tap(corners)
-    if padding_mode == "zeros":
-        vals = lowerer.mb.mul(
-            x=vals,
-            y=lowerer.make_const(node.output[0], valid),
+        term = lowerer.mb.mul(
+            x=gathered,
+            y=lowerer.make_const(
+                node.output[0], tap.gather_weight[:, :, None].astype(np.float32)
+            ),
             name=lowerer.fresh_name(node),
         )
-    return [to_output(vals)]
+        if padding_mode == "zeros":
+            term = lowerer.mb.mul(
+                x=term,
+                y=lowerer.make_const(
+                    node.output[0], tap.valid[:, :, None].astype(np.float32)
+                ),
+                name=lowerer.fresh_name(node),
+            )
+        return term
+
+    acc = None
+    for tap in plan:
+        term = weighted_tap(tap)
+        acc = (
+            term
+            if acc is None
+            else lowerer.mb.add(x=acc, y=term, name=lowerer.fresh_name(node))
+        )
+    return [to_output(acc)]
 
 
 @_register("Gather")
