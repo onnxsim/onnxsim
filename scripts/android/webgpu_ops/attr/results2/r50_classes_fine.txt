@@ -1,0 +1,33 @@
+class                                            n   GFLOP      MB
+Conv W 3x3 s1 256>256 ow14                       5    1.16     2.0
+Conv W 3x3 s1 64>64 ow56                         3    0.69     4.8
+Conv M 1x1 s1 64>256 ow56+res                    3    0.31    21.7
+Conv W 3x3 s1 128>128 ow28                       3    0.69     2.4
+Conv M 1x1 s1 256>1024 ow14+res                  5    0.51     9.1
+Conv M 1x1 s1 1024>256 ow14                      5    0.51     5.0
+Conv M 1x1 s1 128>512 ow28+res                   3    0.31    10.8
+Conv W 3x3 s1 512>512 ow7                        2    0.46     0.4
+Conv M 1x1 s1 512>128 ow28                       3    0.31     6.0
+Conv M 1x1 s1 256>64 ow56                        2    0.21     8.0
+Conv M2 1x1 s2 256>512 ow28+res                  1    0.21     6.4
+Conv S 7x7 s2 3>64 ow112                         1    0.24     3.8
+Conv M 1x1 s1 256>128 ow56                       1    0.21     4.8
+Conv T 3x3 s2 128>128 ow28                       1    0.23     2.0
+Conv M2 1x1 s2 512>1024 ow14+res                 1    0.21     3.2
+Conv M 1x1 s1 512>256 ow28                       1    0.21     2.4
+Conv T 3x3 s2 256>256 ow14                       1    0.23     1.0
+Conv M 1x1 s1 512>2048 ow7+res                   2    0.21     1.8
+Conv T 3x3 s2 512>512 ow7                        1    0.23     0.5
+Conv M2 1x1 s2 1024>2048 ow7+res                 1    0.21     1.6
+Conv M 1x1 s1 1024>512 ow14                      1    0.21     1.2
+Conv M 1x1 s1 2048>512 ow7                       2    0.21     1.0
+Conv M 1x1 s1 64>256 ow56                        1    0.10     4.0
+Gemm                                             1    0.00     8.2
+Conv M 1x1 s1 128>512 ow28                       1    0.10     2.0
+Conv M 1x1 s1 256>1024 ow14                      1    0.10     1.0
+Conv M 1x1 s1 512>2048 ow7                       1    0.10     0.5
+MaxPool                                          1    0.00     4.0
+Conv M 1x1 s1 64>64 ow56                         1    0.03     1.6
+Transpose                                        2    0.00     1.2
+GlobalAveragePool                                1    0.00     0.4
+Flatten                                          1    0.00     0.0

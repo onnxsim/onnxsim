@@ -1,0 +1,69 @@
+class                                            n   GFLOP      MB
+Concat                                          23    0.00    80.6
+Conv W 3x3 s1 64>64 ow80                         2    0.94     6.6
+Transpose                                       16    0.00    47.3
+Conv T 3x3 s2 64>64 ow80                         1    0.47     8.2
+Split                                           11    0.00    31.0
+Conv T 3x3 s2 128>128 ow40                       1    0.47     4.1
+Conv M 1x1 s1 192>128 ow40                       4    0.31     8.2
+Conv T 3x3 s2 16>32 ow160                        1    0.24     9.8
+Conv M 1x1 s1 48>64 ow160                        1    0.16    11.5
+Conv M 1x1 s1 256>64 ow80                        1    0.21     8.2
+Conv M 1x1 s1 80>80 ow80                         2    0.16     8.2
+Conv S 3x3 s2 3>16 ow320                         1    0.09    11.5
+Reshape                                          8    0.00    15.9
+Add                                             13    0.00    15.1
+Conv W 3x3 s1 64>64 ow20                         9    0.27     1.8
+Conv M 1x1 s1 384>256 ow20                       3    0.24     3.1
+Conv M 1x1 s1 96>128 ow80                        1    0.16     5.7
+Conv T 3x3 s2 128>256 ow20                       1    0.24     1.2
+Conv W 3x3 s1 128>64 ow40                        1    0.24     1.2
+Conv M 1x1 s1 64>64 ow80                         2    0.10     6.6
+Conv M 1x1 s1 384>128 ow40                       1    0.16     3.3
+Conv M 1x1 s1 256>256 ow20                       3    0.16     2.5
+Conv M 1x1 s1 32>32 ow160                        1    0.05     6.6
+Conv T 3x3 s1 16>32 ow80                         2    0.12     2.5
+Conv T 3x3 s1 32>16 ow80                         2    0.12     2.5
+Conv M 1x1 s1 96>64 ow80                         1    0.08     4.1
+Conv T 3x3 s2 64>64 ow40                         1    0.12     2.0
+Conv T 3x3 s1 32>32 ow40                         4    0.12     1.6
+Conv T 3x3 s1 32>64 ow40                         2    0.12     1.2
+Conv T 3x3 s1 64>32 ow40                         2    0.12     1.2
+Conv M 1x1 s1 64>80 ow80                         1    0.07     3.7
+Conv T 3x3 s2 128>128 ow20                       1    0.12     1.0
+Softmax                                          2    0.00     6.9
+Conv W 3x3 s1 64>64 ow40                         1    0.12     0.8
+Conv M 1x1 s1 512>256 ow20                       1    0.10     1.2
+Conv W 3x3 s1 256>64 ow20                        1    0.12     0.5
+Resize                                           2    0.00     6.1
+Conv T 3x3 s1 8>16 ow160                         1    0.06     2.5
+Conv T 3x3 s1 16>8 ow160                         1    0.06     2.5
+Sigmoid                                          1    0.00     5.4
+Conv D 3x3 s1 80>80 ow80                         1    0.01     4.1
+Conv M 1x1 s1 128>128 ow40                       1    0.05     1.6
+Conv M 1x1 s1 80>80 ow40                         2    0.04     2.0
+Conv M 1x1 s1 128>256 ow20                       2    0.05     1.2
+Conv D 3x3 s1 64>64 ow80                         1    0.01     3.3
+MatMul                                           2    0.00     3.2
+Conv M 1x1 s1 128>80 ow40                        1    0.03     1.3
+Conv M 1x1 s1 64>64 ow40                         2    0.03     1.6
+Mul                                              2    0.00     2.9
+Conv M 1x1 s1 128>64 ow20                        4    0.03     1.2
+Conv M 1x1 s1 16>1 ow8400                        1    0.00     2.3
+Conv M 1x1 s1 128>128 ow20                       2    0.03     0.8
+Conv M 1x1 s1 256>128 ow20+res                   1    0.03     0.8
+Conv M 1x1 s1 256>128 ow20                       1    0.03     0.6
+Conv M 1x1 s1 64>32 ow40                         2    0.01     1.2
+Conv D 3x3 s1 128>128 ow40                       1    0.00     1.6
+Conv M 1x1 s1 256>80 ow20                        1    0.02     0.5
+Conv M 1x1 s1 128>128 ow20+res                   1    0.01     0.6
+MaxPool                                          3    0.00     1.2
+Conv D 3x3 s1 80>80 ow40                         1    0.00     1.0
+Conv M 1x1 s1 80>80 ow20                         2    0.01     0.5
+Conv D 3x3 s1 256>256 ow20                       1    0.00     0.8
+Conv D 3x3 s1 128>128 ow20+res                   1    0.00     0.6
+Slice                                            2    0.00     0.4
+Sub                                              2    0.00     0.4
+Conv M 1x1 s1 64>64 ow20                         1    0.00     0.2
+Conv D 3x3 s1 80>80 ow20                         1    0.00     0.3
+Div                                              1    0.00     0.1

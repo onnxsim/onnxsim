@@ -1,0 +1,127 @@
+#version 450
+#define INFINITY uintBitsToFloat(0x7f800000u)
+#define NAN uintBitsToFloat(0x7fc00000u)
+// kernel: r_7_7_32_4_4_4_128_3_3
+layout(local_size_x=32, local_size_y=4, local_size_z=1) in;
+layout(std430, set=0, binding=0) buffer B0 { float data0_100352[]; };
+layout(std430, set=0, binding=1) buffer B1 { float data1_100352[]; };
+layout(std430, set=0, binding=2) buffer B2 { float data2_147456[]; };
+void main() {
+  float buf0[16];
+  int gidx0 = int(gl_WorkGroupID.x); /* 7 */
+  int gidx1 = int(gl_WorkGroupID.y); /* 7 */
+  int lidx0 = int(gl_LocalInvocationID.x); /* 32 */
+  int lidx1 = int(gl_LocalInvocationID.y); /* 4 */
+  int alu0 = ((gidx1*112)+(lidx1*28)+(gidx0<<2));
+  bool alu1 = (gidx0<6);
+  bool alu2 = (0<gidx0);
+  bool alu3 = (0<(gidx1+lidx1));
+  bool alu4 = ((lidx1+(gidx1<<2))<27);
+  buf0[0] = 0.0f;
+  buf0[1] = 0.0f;
+  buf0[2] = 0.0f;
+  buf0[3] = 0.0f;
+  buf0[4] = 0.0f;
+  buf0[5] = 0.0f;
+  buf0[6] = 0.0f;
+  buf0[7] = 0.0f;
+  buf0[8] = 0.0f;
+  buf0[9] = 0.0f;
+  buf0[10] = 0.0f;
+  buf0[11] = 0.0f;
+  buf0[12] = 0.0f;
+  buf0[13] = 0.0f;
+  buf0[14] = 0.0f;
+  buf0[15] = 0.0f;
+  for (int Ridx0 = 0; Ridx0 < 128; Ridx0++) {
+    int alu21 = (alu0+(Ridx0*784));
+    float val0 = ((alu2&&alu3)?data1_100352[(alu21+-29)]:0.0f);
+    float val1 = (alu3?data1_100352[(alu21+-28)]:0.0f);
+    float val2 = (alu3?data1_100352[(alu21+-27)]:0.0f);
+    float val3 = (alu3?data1_100352[(alu21+-26)]:0.0f);
+    float val4 = (alu3?data1_100352[(alu21+-25)]:0.0f);
+    float val5 = ((alu1&&alu3)?data1_100352[(alu21+-24)]:0.0f);
+    float val6 = (alu2?data1_100352[(alu21+-1)]:0.0f);
+    float val7 = data1_100352[(alu21+1)];
+    float val8 = data1_100352[(alu21+2)];
+    float val9 = data1_100352[(alu21+3)];
+    float val10 = (alu1?data1_100352[(alu21+4)]:0.0f);
+    float val11 = ((alu2&&alu4)?data1_100352[(alu21+27)]:0.0f);
+    float val12 = (alu4?data1_100352[(alu21+28)]:0.0f);
+    float val13 = (alu4?data1_100352[(alu21+29)]:0.0f);
+    float val14 = (alu4?data1_100352[(alu21+30)]:0.0f);
+    float val15 = (alu4?data1_100352[(alu21+31)]:0.0f);
+    float val16 = ((alu1&&alu4)?data1_100352[(alu21+32)]:0.0f);
+    float val17 = data1_100352[alu21];
+    int alu22 = ((lidx0*4608)+(Ridx0*9));
+    float val18 = data2_147456[(alu22+1)];
+    float val19 = data2_147456[(alu22+2)];
+    float val20 = data2_147456[(alu22+3)];
+    float val21 = data2_147456[(alu22+4)];
+    float val22 = data2_147456[(alu22+5)];
+    float val23 = data2_147456[(alu22+6)];
+    float val24 = data2_147456[(alu22+7)];
+    float val25 = data2_147456[(alu22+8)];
+    float val26 = data2_147456[(alu22+1152)];
+    float val27 = data2_147456[(alu22+1153)];
+    float val28 = data2_147456[(alu22+1154)];
+    float val29 = data2_147456[(alu22+1155)];
+    float val30 = data2_147456[(alu22+1156)];
+    float val31 = data2_147456[(alu22+1157)];
+    float val32 = data2_147456[(alu22+1158)];
+    float val33 = data2_147456[(alu22+1159)];
+    float val34 = data2_147456[(alu22+1160)];
+    float val35 = data2_147456[(alu22+2304)];
+    float val36 = data2_147456[(alu22+2305)];
+    float val37 = data2_147456[(alu22+2306)];
+    float val38 = data2_147456[(alu22+2307)];
+    float val39 = data2_147456[(alu22+2308)];
+    float val40 = data2_147456[(alu22+2309)];
+    float val41 = data2_147456[(alu22+2310)];
+    float val42 = data2_147456[(alu22+2311)];
+    float val43 = data2_147456[(alu22+2312)];
+    float val44 = data2_147456[(alu22+3456)];
+    float val45 = data2_147456[(alu22+3457)];
+    float val46 = data2_147456[(alu22+3458)];
+    float val47 = data2_147456[(alu22+3459)];
+    float val48 = data2_147456[(alu22+3460)];
+    float val49 = data2_147456[(alu22+3461)];
+    float val50 = data2_147456[(alu22+3462)];
+    float val51 = data2_147456[(alu22+3463)];
+    float val52 = data2_147456[(alu22+3464)];
+    float val53 = data2_147456[alu22];
+    buf0[0] = (buf0[0]+((val0*val53)+(val1*val18)+(val2*val19)+(val6*val20)+(val17*val21)+(val7*val22)+(val11*val23)+(val12*val24)+(val13*val25)));
+    buf0[1] = (buf0[1]+((val0*val26)+(val1*val27)+(val2*val28)+(val6*val29)+(val17*val30)+(val7*val31)+(val11*val32)+(val12*val33)+(val13*val34)));
+    buf0[2] = (buf0[2]+((val0*val35)+(val1*val36)+(val2*val37)+(val6*val38)+(val17*val39)+(val7*val40)+(val11*val41)+(val12*val42)+(val13*val43)));
+    buf0[3] = (buf0[3]+((val0*val44)+(val1*val45)+(val2*val46)+(val6*val47)+(val17*val48)+(val7*val49)+(val11*val50)+(val12*val51)+(val13*val52)));
+    buf0[4] = (buf0[4]+((val1*val53)+(val2*val18)+(val3*val19)+(val17*val20)+(val7*val21)+(val8*val22)+(val12*val23)+(val13*val24)+(val14*val25)));
+    buf0[5] = (buf0[5]+((val1*val26)+(val2*val27)+(val3*val28)+(val17*val29)+(val7*val30)+(val8*val31)+(val12*val32)+(val13*val33)+(val14*val34)));
+    buf0[6] = (buf0[6]+((val1*val35)+(val2*val36)+(val3*val37)+(val17*val38)+(val7*val39)+(val8*val40)+(val12*val41)+(val13*val42)+(val14*val43)));
+    buf0[7] = (buf0[7]+((val1*val44)+(val2*val45)+(val3*val46)+(val17*val47)+(val7*val48)+(val8*val49)+(val12*val50)+(val13*val51)+(val14*val52)));
+    buf0[8] = (buf0[8]+((val2*val53)+(val3*val18)+(val4*val19)+(val7*val20)+(val8*val21)+(val9*val22)+(val13*val23)+(val14*val24)+(val15*val25)));
+    buf0[9] = (buf0[9]+((val2*val26)+(val3*val27)+(val4*val28)+(val7*val29)+(val8*val30)+(val9*val31)+(val13*val32)+(val14*val33)+(val15*val34)));
+    buf0[10] = (buf0[10]+((val2*val35)+(val3*val36)+(val4*val37)+(val7*val38)+(val8*val39)+(val9*val40)+(val13*val41)+(val14*val42)+(val15*val43)));
+    buf0[11] = (buf0[11]+((val2*val44)+(val3*val45)+(val4*val46)+(val7*val47)+(val8*val48)+(val9*val49)+(val13*val50)+(val14*val51)+(val15*val52)));
+    buf0[12] = (buf0[12]+((val3*val53)+(val4*val18)+(val5*val19)+(val8*val20)+(val9*val21)+(val10*val22)+(val14*val23)+(val15*val24)+(val16*val25)));
+    buf0[13] = (buf0[13]+((val3*val26)+(val4*val27)+(val5*val28)+(val8*val29)+(val9*val30)+(val10*val31)+(val14*val32)+(val15*val33)+(val16*val34)));
+    buf0[14] = (buf0[14]+((val3*val35)+(val4*val36)+(val5*val37)+(val8*val38)+(val9*val39)+(val10*val40)+(val14*val41)+(val15*val42)+(val16*val43)));
+    buf0[15] = (buf0[15]+((val3*val44)+(val4*val45)+(val5*val46)+(val8*val47)+(val9*val48)+(val10*val49)+(val14*val50)+(val15*val51)+(val16*val52)));
+  }
+  int alu40 = (alu0+(lidx0*3136));
+  data0_100352[(alu40+1)] = buf0[4];
+  data0_100352[(alu40+2)] = buf0[8];
+  data0_100352[(alu40+3)] = buf0[12];
+  data0_100352[(alu40+784)] = buf0[1];
+  data0_100352[(alu40+785)] = buf0[5];
+  data0_100352[(alu40+786)] = buf0[9];
+  data0_100352[(alu40+787)] = buf0[13];
+  data0_100352[(alu40+1568)] = buf0[2];
+  data0_100352[(alu40+1569)] = buf0[6];
+  data0_100352[(alu40+1570)] = buf0[10];
+  data0_100352[(alu40+1571)] = buf0[14];
+  data0_100352[(alu40+2352)] = buf0[3];
+  data0_100352[(alu40+2353)] = buf0[7];
+  data0_100352[(alu40+2354)] = buf0[11];
+  data0_100352[(alu40+2355)] = buf0[15];
+  data0_100352[alu40] = buf0[0];
+}

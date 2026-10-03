@@ -1,0 +1,6 @@
+n3_stem|idx=3-3
+n4_stem|idx=4-4
+n3_4_stem|idx=3-4
+n7_11|idx=7-7,idx=11-11
+winograd_six|idx=7-7,idx=11-11,idx=143-143,idx=145-145,idx=147-147,idx=149-149
+n143_149_four_convs|idx=143-143,idx=145-145,idx=147-147,idx=149-149
