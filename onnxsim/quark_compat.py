@@ -233,7 +233,7 @@ names and preset *meanings*, not copied.
   Mul, Transpose, ... stay float, with Q/DQ only on the inputs and outputs of
   the quantized nodes (a Gemm / MatMul feeding a sole Relu-like consumer keeps
   a float output, as Quark's Q/DQ removal does). A model with no such node is
-  returned unchanged (Quark: "No quantizable ops"). DEFAULT calibrates with the
+  returned as it is, nodes in Quark's order (Quark: "No quantizable ops"). DEFAULT calibrates with the
   *mean over batches of each batch's min / max* (Quark's ``CalibMovingAverage``,
   ``method="minmax_mean"``); ACCURATE is percentile 99.9999 + AdaRound like
   ``INT*_CNN_ACCURATE`` (also on int16 weights, which Quark's FastFinetune
@@ -422,6 +422,27 @@ names and preset *meanings*, not copied.
   (``SkipPreprocess=True`` in Quark equals this), ``exclude`` is honoured, GPTQ
   error propagation is Quark's no-op unless ``GPTQParams["Compensate"]``, and
   other ``algo_config`` entries raise.
+- ``Constant`` nodes and the conversion scope
+  (``tests/test_quark_constants_misc_parity.py``): with neither ``OptimizeModel``
+  nor ``SimplifyModel`` (or with ``SkipPreprocess``) the ``Constant`` nodes of the
+  float graph stay in the quantized graph, as in Quark, whose quantizers then treat
+  their outputs as activations -- a Conv weight / Mul operand / Pad value gets a
+  calibrated ``Q -> DQ`` pair, a Conv / Gemm / InstanceNormalization bias stays
+  raw, integer parameters are not quantized, ``VINT8`` (``QuantizeAllOpTypes``)
+  quantizes every float one as an op, the NPU transformer scheme does not take a
+  ``MatMul`` with a Constant ``B`` for a weight MatMul -- and the nodes come in
+  Quark's order. The ``Constant`` nodes Quark's own conversions add (``Split`` ->
+  ``Slice``) stay whatever the optimizers did. Quark's pre-optimizer converts only
+  nodes whose op type the quantizer takes: the transformer scheme (Gemm / MatMul)
+  leaves a ``ReduceMean`` / ``Split`` / ``Clip`` / pool alone (a ``BatchNormalization``
+  is still converted, the conversion adds its type to the list first -- so a
+  left-over one is quantized there too), a plain
+  quantizer does not convert a ``ReduceMean`` (not in its registry). The extended
+  quantizer (``A8W8``, the 16-bit presets) runs the DPU simulation too -- every
+  ``Convert*ToDPUVersion`` / ``ConvertSigmoidToHardSigmoid`` option opt-in, with
+  no ``value_info``, so a ``GlobalAveragePool`` / ``ReduceMean`` window is never
+  found (an ``AveragePool`` with a square kernel is rescaled); a ``Split`` that stays
+  a ``Split`` shares its input's quantization parameters there too.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
   ``Int32Bias`` (``False``: the bias is quantized like a weight, int8 / int16
   per the weight dtype), ``DedicateDQNode`` (block-format AutoMixprecision
@@ -601,14 +622,15 @@ def _activation_rules(
             if extended and opts.get(key, False)
             for op in ops
         ],
-        # outputs calibrated on their own: Slice always, Split under the extended
-        # quantizer only (ONNX Runtime's Split shares the input's parameters,
-        # which the plain and the power-of-two quantizer keep)
+        # outputs calibrated on their own: Slice (what ``ConvertSplitToSlice`` makes
+        # of a Split with sizes, on by default for the extended quantizer too). A
+        # Split that stays a Split -- sizes that are not an initializer, none given,
+        # or ``ConvertSplitToSlice`` off -- shares its input's parameters (ONNX
+        # Runtime's ``QDQSplit``), whichever quantizer
         # (and so are the ops its plain operator quantizer handles -- the default one,
         # which gives input and output their own ranges -- that onnxsim's own flows
         # would share: Flatten, Expand, Tile, Identity, ...)
-        "unshared_ops": (("Slice", "Split") if extended else ("Slice",))
-        + _OWN_RANGE_OPS,
+        "unshared_ops": ("Slice",) + _OWN_RANGE_OPS,
         # ... and ONNX Runtime's plain quantizer gives AveragePool its input's
         "shared_ops": () if extended or npu_cnn else ("AveragePool",),
     }
@@ -2463,6 +2485,16 @@ class ModelQuantizer:
             return "minmax"
         return str(method)
 
+    def _keeps_constants(self) -> bool:
+        """Quark folds the ``Constant`` nodes into initializers in ONNX Runtime's graph
+        loader / onnxslim only: with neither pass (``OptimizeModel`` and
+        ``SimplifyModel`` off), or with ``SkipPreprocess``, they stay in the graph and
+        its quantizers treat their outputs as activations (not as weights)."""
+        opts = self.config.extra_options
+        return bool(opts.get("SkipPreprocess", False)) or not (
+            opts.get("OptimizeModel", True) or opts.get("SimplifyModel", True)
+        )
+
     def _transformer_scope(
         self, model: onnx.ModelProto
     ) -> "tuple[Optional[set[str]], List[str]]":
@@ -2474,7 +2506,8 @@ class ModelQuantizer:
         if not opts.get("NPUTransformer"):
             return None, []
         consts = {i.name for i in model.graph.initializer}
-        consts |= {n.output[0] for n in model.graph.node if n.op_type == "Constant"}
+        if not self._keeps_constants():
+            consts |= {n.output[0] for n in model.graph.node if n.op_type == "Constant"}
         skip = []
         if opts.get("MatMulConstBOnly", True):
             skip = [
@@ -2658,8 +2691,11 @@ class ModelQuantizer:
             n.op_type in op_types and (n.name or n.output[0]) not in set(exclude)
             for n in model.graph.node
         ):
-            # Quark: "No quantizable ops in this model" -- returned unchanged
-            return model
+            # Quark: "No quantizable ops in this model" -- the float graph comes
+            # back as it is (its Constant nodes unfolded), in Quark's node order
+            from onnxsim.quark_marking import quark_sorted
+
+            return quark_sorted(model)
         by_name = {a.name: a for a in algos}
 
         # Quark's presets quantize weights per tensor; the weight-rounding
@@ -2727,17 +2763,6 @@ class ModelQuantizer:
         # the compiler-oriented conversions are on by default for these flows (and
         # follow their own options elsewhere, as in VINT8)
         from onnxsim.quark_convert import convert_for_npu
-
-        keep = set(exclude)
-        conv_default = bool(
-            npu_cnn or self._extended(act, wt) or opts.get("NPUTransformer")
-        )
-        if not skip_pre:
-            work = convert_for_npu(
-                work, opts, lambda n: n.name not in keep, default=conv_default
-            )
-        # Quark topologically sorts the float graph (with its own sort) before the
-        # quantizer visits it, and quantizes the op types of its registries only
         from onnxsim.quark_marking import (
             opset_unquantized_ops,
             quark_op_types,
@@ -2745,8 +2770,15 @@ class ModelQuantizer:
             skipped_nodes,
         )
 
-        work = quark_sorted(work)
+        keep = set(exclude)
+        conv_default = bool(
+            npu_cnn or self._extended(act, wt) or opts.get("NPUTransformer")
+        )
         ext = self._extended(act, wt)
+        # the op types Quark's quantizer takes (``get_static_op_types``): its
+        # pre-optimizer converts only nodes of these types (so the NPU transformer
+        # flow, Gemm / MatMul only, leaves a ReduceMean or a Split alone; a plain
+        # quantizer, whose registry has no ReduceMean, does too)
         cnn_types: "Optional[set[str]]" = None
         if op_types is None:
             cnn_types = set(
@@ -2758,8 +2790,45 @@ class ModelQuantizer:
                 # introduces and no registry has -- Slice, LpNormalization -- is
                 # not on the list)
                 cnn_types |= {n.op_type for n in model.graph.node}
-            if opts.get("ConvertBNToConv", conv_default):
+        convert_types = op_types if op_types is not None else cnn_types
+        constants_before = {
+            n.output[0] for n in work.graph.node if n.op_type == "Constant"
+        }
+        if not skip_pre:
+            work = convert_for_npu(
+                work,
+                opts,
+                # (Quark's BatchNorm conversion adds BatchNormalization to the list
+                # itself, first: it is never held back by it)
+                lambda n: (
+                    n.name not in keep
+                    and (
+                        convert_types is None
+                        or n.op_type in convert_types
+                        or n.op_type == "BatchNormalization"
+                    )
+                ),
+                default=conv_default,
+            )
+        if opts.get("ConvertBNToConv", conv_default):
+            # (Quark's conversion adds BatchNormalization to the shared list of op
+            # types the quantizer takes later, converted or not: a BatchNorm that
+            # is left over -- its parameters Constants, or 2-D -- is quantized, in
+            # the NPU transformer scheme too)
+            if cnn_types is not None:
                 cnn_types.add("BatchNormalization")
+            elif op_types is not None:
+                op_types = set(op_types) | {"BatchNormalization"}
+        # the Constant nodes Quark's own conversions add stay in its graph whatever
+        # ONNX Runtime and onnxslim did to the float model before
+        converted_constants = {
+            n.output[0]
+            for n in work.graph.node
+            if n.op_type == "Constant" and n.output[0] not in constants_before
+        }
+        # Quark topologically sorts the float graph (with its own sort) before the
+        # quantizer visits it, and quantizes the op types of its registries only
+        work = quark_sorted(work)
         scope_types = op_types if op_types is not None else cnn_types
         skip_nodes = skipped_nodes(
             work,
@@ -2781,6 +2850,7 @@ class ModelQuantizer:
         cal_size = int(opts.get("CalibDataSize") or 0)
         act_sym = bool(opts.get("ActivationSymmetric", act.symmetric))
         qkw: Dict[str, Any] = dict(
+            keep_constants=True if self._keeps_constants() else converted_constants,
             calibration_data=calibration[:cal_size] if cal_size else calibration,
             activation_dtype=act_dtype,
             op_types=(
@@ -2863,6 +2933,25 @@ class ModelQuantizer:
                     from onnxsim.full_qdq import _toposort
 
                     _toposort(q.graph)
+            elif ext:
+                from onnxsim.quark_npu import (
+                    apply_extended_rewrites,
+                    extended_simulates,
+                )
+
+                if extended_simulates(opts):
+                    # (Quark's extended quantizer sorts its pruned Q/DQ graph, then
+                    # converts the nodes the options ask for)
+                    from onnxsim.full_qdq import _toposort
+                    from onnxsim.quark_marking import quark_qdq_sorted
+
+                    q = apply_extended_rewrites(
+                        quark_qdq_sorted(q),
+                        opts,
+                        lambda n: n.name not in skip_names,
+                    )
+                    if not opts.get("OnnxsimKeepQuarkNodeOrder", False):
+                        _toposort(q.graph)
             if opts.get("ConvertClipToRelu", False):
                 from onnxsim.quark_convert import convert_clip_to_relu
 
@@ -2881,6 +2970,12 @@ class ModelQuantizer:
                         and (scope_types is None or n.op_type in scope_types)
                     },
                 )
+            if self._keeps_constants() and not npu_cnn:
+                # (the Constant nodes lead the list, as in Quark's graph, whose own
+                # ``topological_sort`` ends every flow)
+                from onnxsim.quark_marking import quark_qdq_sorted
+
+                q = quark_qdq_sorted(q)
             if ext and mixed_algo is not None:
                 # (the extended quantizer converts its Q/DQ nodes before
                 # AutoMixprecision re-quantizes layers with standard ones)
