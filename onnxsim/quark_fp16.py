@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 import onnx
@@ -35,7 +35,7 @@ def convert_fp16_scale_to_fp32(
     excluded = set(exclude) & by_name.keys()
     included = set(include) & by_name.keys()
     converted = [n for n in nodes if n.name and n.name not in excluded]
-    readers = {}
+    readers: Dict[str, List[onnx.NodeProto]] = {}
     producers = {y: n for n in nodes for y in n.output}
     for n in nodes:
         for x in n.input:
