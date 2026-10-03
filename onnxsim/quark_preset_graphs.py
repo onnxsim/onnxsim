@@ -731,7 +731,9 @@ def requantize_biases_int8(
 
 
 def dedicate_qdq_pairs(
-    model: onnx.ModelProto, receivers: Optional[Set[str]] = None
+    model: onnx.ModelProto,
+    receivers: Optional[Set[str]] = None,
+    receiver_order: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Quark's ``DedicatedQDQPair``: an activation ``Q -> DQ`` pair read by
     several nodes is replaced by one pair (same scale and zero point) per
@@ -742,7 +744,9 @@ def dedicate_qdq_pairs(
     names, default every named node; a node reading the tensor twice counts
     twice, and takes the first pair -- the other is left unused): with more than
     one, only those get a pair and any other reader sees the float tensor; with
-    one or none the single pair stays in front of every reader."""
+    one or none the single pair stays in front of every reader. ``receiver_order``
+    preserves the marking order of the float graph before Q/DQ insertion changes
+    its topological order."""
     m = onnx.ModelProto()
     m.CopyFrom(model)
     g = m.graph
@@ -761,6 +765,7 @@ def dedicate_qdq_pairs(
     taken = {x for n in nodes for x in list(n.input) + list(n.output)} | inits
     drop: Set[int] = set()
     inserts: Dict[int, List[onnx.NodeProto]] = {}  # id(consumer) -> nodes before it
+    ranks = {name: i for i, name in enumerate(receiver_order or ())}
 
     def receiving(u: onnx.NodeProto) -> bool:
         return receivers is None or not u.name or u.name in receivers
@@ -773,6 +778,8 @@ def dedicate_qdq_pairs(
         users = list({id(u): u for u in readers}.values())
         # (Quark's list: one entry per input slot of a node it quantizes)
         slots = [u for u in readers if receiving(u)]
+        if receiver_order is not None:
+            slots.sort(key=lambda u: ranks.get(u.name, len(ranks)))
         if len(slots) < 2:
             continue
         if dq.output[0] in outputs:
