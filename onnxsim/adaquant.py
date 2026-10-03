@@ -179,6 +179,9 @@ def _find_static_qdq_candidates(
             or ws_init is None
             or wq_init.data_type != onnx.TensorProto.INT8
             or list(wq_init.dims) != list(w_float_init.dims)
+            # one scale per output channel: a per-tensor weight (all a
+            # DequantizeLinear can express below opset 13) is not this layout
+            or len(ws_init.dims) != 1
         ):
             continue
         if len(wdq.input) == 3:

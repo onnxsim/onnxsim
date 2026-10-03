@@ -310,7 +310,13 @@ names and preset *meanings*, not copied.
   ``tests/test_quark_amp_parity.py`` compares the whole quantizer structure and
   the outputs bit for bit with Quark for the mixes it lists. A
   ``QuantizeBias=False`` bfloat16 baseline with a block target (the
-  ``BF16_MIXED_*`` presets) keeps its dedicated flow.
+  ``BF16_MIXED_*`` presets) keeps its dedicated flow. A half / block baseline
+  takes any constant format: activations in ``float16`` / ``bfloat16`` / BFP /
+  MX with weights in any half, block, ``int8`` or ``uint8`` format (Quark's
+  quantizer picks the node kind of every tensor from its own dtype; the BFP / MX
+  attributes are its plain defaults unless the activation and weight formats are
+  the same ``MX*`` format or ``BFPAttributes`` / ``MXAttributes`` say so);
+  integer activations over half / block weights are not implemented.
   ``target_layer_config`` as one ``QLayerConfig``, a list (each candidate takes
   its best-scoring config) or ``{QLayerConfig: [node names]}``; ``subgraph_json``
   partitions (a missing file is ignored, as in Quark), a
@@ -323,8 +329,11 @@ names and preset *meanings*, not copied.
   op such as ``Transpose`` or ``MaxPool``; the baseline shares them as ONNX
   Runtime's quantizer does) and ``dual_quant_nodes`` -- on the int16 -> int8
   promotion (``S16S16_MIXED_S8S8``) and the block-format presets
-  (``BF16_MIXED_BFP16`` / ``_MXINT8``) too; boundary pairs exist for integer
-  mixes only (a half / block / power-of-two mix raises with them). Candidates
+  (``BF16_MIXED_BFP16`` / ``_MXINT8``) too. ``dual_quant_nodes`` is Quark's
+  post-processing of the *final* mixed model (candidates are scored without
+  it, see :mod:`onnxsim.quark_boundary_qdq`) and works for every mix -- integer,
+  half, block and power-of-two, over an integer or a float / block baseline --
+  graph for graph and bit for bit. Candidates
   are scored like Quark's analysis does: ONNX Runtime with every graph
   optimization off, over ``data_size + 1`` calibration batches (so the default
   ``0`` scores one batch, whatever "0 = all" says), which is what makes the
@@ -748,6 +757,44 @@ def _block_fn(dtype: str) -> Optional[Callable[[np.ndarray, int], np.ndarray]]:
 
 
 PROMOTABLE_OPS = ("Conv", "ConvTranspose", "Gemm", "MatMul")
+
+# Quark's ``BFP_OP_DEFAULT_ATTRS`` / ``MX_OP_DEFAULT_ATTRS`` and the attributes its
+# config mapping gives a same-format ``MX*`` pair (``DEFAULT_MICROEXPONENTS_PARAMS``
+# / ``DEFAULT_MICROSCALING_PARAMS``)
+_BFP_DEFAULTS: Dict[str, Any] = dict(
+    bfp_method="to_bfp",
+    axis=1,
+    bit_width=16,
+    block_size=8,
+    rounding_mode=0,
+    sub_block_size=2,
+    sub_block_shift_bits=1,
+    convert_to_bfloat_before_bfp=0,
+)
+_MX_DEFAULTS: Dict[str, Any] = dict(
+    element_dtype="int8", axis=1, block_size=32, rounding_mode=0
+)
+_BFP_PRIME_PARAMS: Dict[str, Any] = dict(
+    bfp_method="to_bfp_prime",
+    axis=1,
+    bit_width=13,
+    block_size=16,
+    sub_block_size=2,
+    sub_block_shift_bits=1,
+    rounding_mode=2,
+)
+_MX_PARAMS: Dict[str, Any] = dict(
+    element_dtype="int8", axis=1, block_size=32, rounding_mode=2
+)
+_MX_BFP_BITS = {"mx4": 11, "mx6": 13, "mx9": 16}
+_MX_ELEMENT = {
+    "mxfp4_e2m1": "fp4_e2m1",
+    "mxfp6_e3m2": "fp6_e3m2",
+    "mxfp6_e2m3": "fp6_e2m3",
+    "mxfp8_e5m2": "fp8_e5m2",
+    "mxfp8_e4m3": "fp8_e4m3",
+    "mxint8": "int8",
+}
 _BLOCK_DTYPES = {
     "bfp16",
     "mx4",
@@ -1174,9 +1221,24 @@ _PRESETS.update(
         "BF16_MIXED_MXINT8_ADAQUANT": lambda: _mixed_block(
             MXInt8Spec, AdaQuantConfig()
         ),
-        "BF16_BFP16": lambda: QConfig(_layer(BFloat16Spec, BFP16Spec)),
-        "BF16_MXINT8": lambda: QConfig(_layer(BFloat16Spec, MXInt8Spec)),
-        "MX9_INT8": lambda: QConfig(_layer(MX9Spec, Int8Spec)),
+        # (their block attributes are the presets' own: Quark's plain default
+        # nodes use ``rounding_mode`` 0, see ``_block_attr_overrides``)
+        "BF16_BFP16": lambda: QConfig(
+            _layer(BFloat16Spec, BFP16Spec),
+            BFPAttributes=dict(
+                bfp_method="to_bfp", axis=1, bit_width=16, block_size=8, rounding_mode=2
+            ),
+        ),
+        "BF16_MXINT8": lambda: QConfig(
+            _layer(BFloat16Spec, MXInt8Spec),
+            MXAttributes=dict(
+                element_dtype="int8", axis=1, block_size=32, rounding_mode=2
+            ),
+        ),
+        "MX9_INT8": lambda: QConfig(
+            _layer(MX9Spec, Int8Spec),
+            BFPAttributes=dict(_BFP_PRIME_PARAMS, bit_width=16),
+        ),
         # The "amateur" CNN presets: asymmetric uint8 / uint16 activations,
         # per-tensor symmetric int8 / int16 weights; ACCURATE adds percentile
         # 99.9999 calibration and AdaRound (Quark's FastFinetune defaults).
@@ -1769,30 +1831,28 @@ class ModelQuantizer:
     def _block_attr_overrides(
         self, act: QSpec, wt: QSpec
     ) -> "Dict[str, Dict[str, Any]]":
-        """What Quark's quantizer puts on the block-format nodes of a *generic*
-        ``QLayerConfig`` baseline, beyond :func:`~onnxsim.quark_fakequant_graph.node_spec`
-        (the presets' values): the ``BFPAttributes`` / ``MXAttributes`` extra
-        options update its default attributes, and a BFP16 baseline without
-        them uses the default ``rounding_mode`` 0 (the presets set 2)."""
+        """The attributes of the BFP / MX nodes Quark's quantizer emits for
+        this ``(activation, weight)`` pair: its ``BFP_OP_DEFAULT_ATTRS`` /
+        ``MX_OP_DEFAULT_ATTRS`` (``rounding_mode`` 0), updated by the
+        ``BFPAttributes`` / ``MXAttributes`` extra options -- which its config
+        mapping fills in (the ``MX4`` / ``MX6`` / ``MX9`` / ``MXFP*`` /
+        ``MXInt8`` attributes) only when activations and weights use the *same*
+        such format, and its presets set explicitly. So a ``bfloat16`` model
+        with ``MX4`` constants gets plain default ``BFPQuantizeDequantize``
+        nodes, whatever the weight format."""
         opts = self.config.extra_options
-        dts = {act.dtype, wt.dtype}
-        mixed = act.dtype != wt.dtype
-        if mixed and dts & set(_BLOCK_DTYPES) - {"bfp16", "mxint8"}:
-            raise NotImplementedError(
-                f"AutoMixprecision over a {act.dtype}/{wt.dtype} baseline: Quark "
-                "gives such a mix its default block attributes only for BFP16 / "
-                "MXInt8 constants"
-            )
-        over: "Dict[str, Dict[str, Any]]" = {}
+        bfp: Dict[str, Any] = dict(_BFP_DEFAULTS)
+        mx: Dict[str, Any] = dict(_MX_DEFAULTS)
+        same = act.dtype == wt.dtype
         if opts.get("BFPAttributes") is not None:
-            over["BFPQuantizeDequantize"] = dict(opts["BFPAttributes"])
-        elif "bfp16" in dts:
-            over["BFPQuantizeDequantize"] = {"rounding_mode": 0}
+            bfp.update(opts["BFPAttributes"])
+        elif same and act.dtype in _MX_BFP_BITS:
+            bfp.update(_BFP_PRIME_PARAMS, bit_width=_MX_BFP_BITS[act.dtype])
         if opts.get("MXAttributes") is not None:
-            over["MXQuantizeDequantize"] = dict(opts["MXAttributes"])
-        elif mixed and "mxint8" in dts:
-            over["MXQuantizeDequantize"] = {"rounding_mode": 0}
-        return over
+            mx.update(opts["MXAttributes"])
+        elif same and act.dtype in _MX_ELEMENT:
+            mx.update(_MX_PARAMS, element_dtype=_MX_ELEMENT[act.dtype])
+        return {"BFPQuantizeDequantize": bfp, "MXQuantizeDequantize": mx}
 
     def _amp_on_fakequant_base(
         self,
@@ -1832,11 +1892,6 @@ class ModelQuantizer:
                 "not supported"
             )
         p = algo.params
-        if p.get("dual_quant_nodes", False):
-            raise NotImplementedError(
-                "dual_quant_nodes is not supported for half / block / integer "
-                "mixes over a float / block baseline"
-            )
         shared_mode = p.get("shared_param_mode", "propagate")
         if shared_mode not in ("propagate", "unshare"):
             raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
@@ -1891,6 +1946,7 @@ class ModelQuantizer:
             weight_symmetric=bool(opts.get("WeightSymmetric", wt.symmetric)),
             shared_param_mode=shared_mode,
             cache_key_fn=self._amp_cache_key_fn(p),
+            dual_quant_nodes=bool(p.get("dual_quant_nodes", False)),
         )
         self.last_auto_mixprecision = res
         return res.model
@@ -1932,15 +1988,24 @@ class ModelQuantizer:
         wt: QSpec,
         attr_overrides: "Optional[Dict[str, Dict[str, Any]]]" = None,
     ) -> onnx.ModelProto:
+        """A model whose activations use a half / block format and whose
+        constants use any half, block or ``int8`` / ``uint8`` format (Quark's
+        quantizer picks the node kind per tensor from its own dtype)."""
         from onnxsim.quark_fakequant_graph import apply_fake_quant_format
 
         opts = self.config.extra_options
         exclude = [e for e in self.config.exclude if isinstance(e, str)]
-        mixed = act.dtype == "bfloat16" and wt.dtype in _BLOCK_DTYPES
+        if act.dtype not in _FAKEQUANT_DTYPES:
+            raise NotImplementedError(
+                f"{act.dtype} activations over {wt.dtype} weights: integer "
+                "activations need a calibrated integer quantizer next to the "
+                "half / block weights"
+            )
+        block_consts = act.dtype == "bfloat16" and wt.dtype in _BLOCK_DTYPES
         # Quark's FP16 / BF16 presets set ``ForceQuantizeNoInputCheck`` (BF16 also
         # ``QuantizeAllOpTypes``, the op types of the model as given); the block
         # formats set neither. The extended quantizer's registry is NPU CNN's.
-        half_preset = act.dtype in ("float16", "bfloat16") and not mixed
+        half_preset = act.dtype in ("float16", "bfloat16") and not block_consts
         op_types = self._static_op_types(
             model,
             quantize_all=bool(
@@ -1967,30 +2032,46 @@ class ModelQuantizer:
                 opts.get("ForceQuantizeNoInputCheck", half_preset)
             ),
         }
-        if act.dtype in _BLOCK_DTYPES and wt.dtype == "int8":  # MX9_INT8
-            from onnxsim.quark_preset_graphs import (
-                apply_block_activations_int8_constants,
-            )
+        if attr_overrides is None:
+            attr_overrides = self._block_attr_overrides(act, wt)
+        if wt.dtype in ("int8", "uint8"):
+            from onnxsim.quark_preset_graphs import apply_fake_quant_int_constants
 
             self._approx(
                 f"{act.dtype} uses com.amd.quark custom ops: the model needs Quark's "
                 "ONNX custom-op library to run (onnxsim cannot execute it)"
+                if act.dtype in _BLOCK_DTYPES
+                else f"{act.dtype} activations over {wt.dtype} constants use "
+                "com.amd.quark extended Q/DQ ops: the model needs Quark's ONNX "
+                "custom-op library to run (onnxsim cannot execute it)"
             )
-            return apply_block_activations_int8_constants(
-                model, act.dtype, exclude, marking=marking
+            return apply_fake_quant_int_constants(
+                model,
+                act.dtype,
+                wt.dtype,
+                exclude,
+                attr_overrides,
+                weight_symmetric=bool(opts.get("WeightSymmetric", wt.symmetric)),
+                int32_bias=opts.get("Int32Bias", True) is not False,
+                quantize_bias=opts.get("QuantizeBias", True) is not False,
+                marking=marking,
             )
         fn = _block_fn(wt.dtype)
-        # bfloat16 activations over block-format constants (BF16_BFP16 / BF16_MXINT8)
-        if fn is None or (
-            act.dtype in _FAKEQUANT_DTYPES and act.dtype != wt.dtype and not mixed
-        ):
-            raise NotImplementedError(
-                f"weight dtype {wt.dtype} with activation dtype {act.dtype}: "
-                "block / half formats must match on both sides"
-            )
+        # constants in a format of their own over the activations' (BF16_BFP16 /
+        # BF16_MXINT8, and every other pair of half / block formats)
+        mixed = act.dtype != wt.dtype
+        if fn is None:
+            raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
         quantize_acts = act.dtype in _FAKEQUANT_DTYPES and opts.get(
             "BlockFormatActivations", True
         )
+        fold = bool(opts.get("BlockFormatFoldWeights", False))
+        if mixed and (not quantize_acts or fold):
+            raise NotImplementedError(
+                f"{act.dtype} activations over {wt.dtype} constants need the "
+                "quantizer nodes: BlockFormatActivations=False / "
+                "BlockFormatFoldWeights=True are not supported"
+            )
         if act.dtype in _FAKEQUANT_DTYPES and not quantize_acts:
             self._approx(
                 f"{act.dtype} activations are not quantized "
@@ -2001,8 +2082,7 @@ class ModelQuantizer:
                 f"{act.dtype} uses com.amd.quark custom ops: the model needs Quark's "
                 "ONNX custom-op library to run (onnxsim cannot execute it)"
             )
-        fold = bool(opts.get("BlockFormatFoldWeights", False))
-        result = apply_fake_quant_format(
+        return apply_fake_quant_format(
             model,
             act.dtype if mixed else wt.dtype,
             activations=bool(quantize_acts),
@@ -2023,7 +2103,6 @@ class ModelQuantizer:
             ],
             marking=marking,
         )
-        return result
 
     def _extended(self, act: QSpec, wt: QSpec) -> bool:
         """Whether Quark would use its extended QDQ quantizer (see
@@ -2704,15 +2783,21 @@ class ModelQuantizer:
         legacy_adaquant = "adaquant" in by_name and by_name["adaquant"].params.get(
             "legacy_engine"
         )
-        if (
-            not per_channel
-            and ("gptq" in by_name or legacy_adaquant)
-            # (a DequantizeLinear has no ``axis`` below opset 13, which Quark's
-            # per-channel mode raises for: GPTQ re-grids the weights itself there)
-            and not (_default_opset(model) < 13 and not legacy_adaquant)
-        ):
+        needs_axis = not per_channel and ("gptq" in by_name or legacy_adaquant)
+        if needs_axis and _default_opset(model) >= 13:
             per_channel = True
             self._approx("weights quantized per channel (needed by the algorithm)")
+        elif needs_axis and legacy_adaquant:
+            # A DequantizeLinear has no ``axis`` below opset 13, so per-channel
+            # weights cannot be written there (Quark raises for a per-channel
+            # *request* -- an algorithm's own need is no request). GPTQ re-grids
+            # the weights itself; the legacy engine only knows the per-channel
+            # layout, finds no layer and leaves the model as quantized.
+            self._approx(
+                "the legacy AdaQuant engine needs per-channel weights, which "
+                "DequantizeLinear cannot express below opset 13: weights stay "
+                "per tensor"
+            )
 
         # Float -> float pre-quantization passes (quantize_full_qdq is fed
         # the transformed model; the untouched one stays the reference).

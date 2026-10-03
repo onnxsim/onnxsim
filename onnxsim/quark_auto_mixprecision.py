@@ -69,12 +69,13 @@ the promoted one; ``"unshare"``: the promoted pair gets its own copy) behaves
 as in Quark. Candidates are scored with ONNX Runtime's graph optimizations off
 (as Quark does -- it fuses QDQ into integer kernels otherwise); models with
 ``com.amd.quark`` custom ops run on
-:func:`onnxsim.quark_fakequant_eval.run_fake_quantized`. ``dual_quant_nodes``
-adds a converting Q/DQ pair in front of every consumer whose precision differs
-from the tensor's (Quark's boundary insertion, but with onnxsim's own scale /
-zero point for the pair); it needs a re-quantization of the tensors, so it is
-integer-only (:func:`apply_layer_mixing` is that path's weight / bias
-editing).
+:func:`onnxsim.quark_fakequant_eval.run_fake_quantized`. ``dual_quant_nodes`` is
+Quark's post-processing of the final mixed model
+(:func:`onnxsim.quark_boundary_qdq.insert_boundary_quant_nodes`): the candidates
+are scored without it and an extra Q/DQ pair (or block node) goes in front of
+every stage that differs from its node's template stage, for every kind of mix.
+(:func:`apply_layer_mixing` is the older, re-quantizing way to edit weights and
+biases; the mixer above does not use it.)
 
 **Sensitivity cache.** ``cache_file`` is Quark's JSON. Through
 ``quark_compat`` it is written under Quark's own key (a digest of the quantized
@@ -1031,9 +1032,10 @@ def auto_mixprecision(
     :param cache_file: JSON file for the sensitivity ranking: reused when its
             fingerprint matches, written otherwise
     :param worker_num: threads used to score candidates
-    :param dual_quant_nodes: re-quantize (an extra Q/DQ pair) a tensor for a
-            consumer whose precision differs; off, such a node consumes one
-            precision and produces the other, as Quark does
+    :param dual_quant_nodes: insert Quark's boundary quantizers into the final
+            model (an extra Q/DQ pair, or block node, in front of every stage
+            whose precision differs from its node's template stage); off, a
+            promoted node simply consumes one precision and produces the other
     :param quantize_kwargs: keyword arguments of the :func:`quantize_full_qdq`
             call that makes the baseline (``calibration_data`` / ``activation_dtype``
             / ``ranges`` / ``convert_inputs`` are taken from here); its own
@@ -1136,7 +1138,6 @@ def auto_mixprecision(
             ranges=ranges,
             tensor_dtypes=dts or None,
             tensor_symmetric=sym or None,
-            convert_inputs=dual_quant_nodes,
             **base_kw,
         )
         return post_quantize(q) if post_quantize is not None else q
@@ -1173,32 +1174,33 @@ def auto_mixprecision(
         act_sym = not base_dtype.startswith("u")
     wt_sym = bool(base_kw.get("weight_symmetric", True))
     range_of = _range_lookup(ranges)
-
-    def quantize(moved: Dict[str, TargetSpec]) -> onnx.ModelProto:
-        if not moved:
-            return baseline_model
-        needs = any(_needs_mixer(s) for s in moved.values())
-        if needs and dual_quant_nodes:
-            raise NotImplementedError(
-                "dual_quant_nodes is not supported for half / block / "
-                "power-of-two targets"
-            )
-        if not dual_quant_nodes:
-            # Quark edits the quantized baseline in place (no re-quantization),
-            # which is what the mixer does; boundary pairs of dual_quant_nodes
-            # need a re-quantization of the tensors instead
-            from onnxsim.quark_mixing import QuarkMixer
-
-            mixer = QuarkMixer(baseline_model, range_of, shared_param_mode)
-            for node, spec in moved.items():
-                mixer.promote_node(node, _resolve_symmetry(spec, act_sym, wt_sym))
-            return mixer.result()
-        q = quantize_acts(moved)
-        return apply_layer_mixing(q, baseline_model, list(moved.items()))
+    # tensors / nodes the baseline's own per-layer overrides gave a precision
+    # (Quark's ``TensorQuantOverrides`` / ``NodesWithMixedPrecision``)
+    override_tensors = set(base_td) | set(base_ts)
+    mixed_nodes = [
+        k
+        for k, (ins, outs) in node_tensors.items()
+        if override_tensors & set(ins + outs)
+    ]
 
     def score_of(moved: Dict[str, TargetSpec]):
-        q = quantize(moved)
-        return q, metric_fn(float_out, run(q))
+        if not moved:
+            return baseline_model, metric_fn(float_out, run(baseline_model)), set()
+        # Quark edits the quantized baseline in place (no re-quantization)
+        from onnxsim.quark_mixing import QuarkMixer
+
+        mixer = QuarkMixer(baseline_model, range_of, shared_param_mode)
+        for node, spec in moved.items():
+            mixer.promote_node(node, _resolve_symmetry(spec, act_sym, wt_sym))
+        q = mixer.result()
+        return q, metric_fn(float_out, run(q)), mixer.promoted_tensors
+
+    def finalize(q: onnx.ModelProto, moved_nodes: List[str], tensors: Set[str]):
+        from onnxsim.quark_boundary_qdq import insert_boundary_quant_nodes
+
+        return insert_boundary_quant_nodes(
+            q, range_of, tensors, moved_nodes, override_tensors, mixed_nodes
+        )
 
     return _search(
         model,
@@ -1217,6 +1219,7 @@ def auto_mixprecision(
         metric_threshold=metric_threshold,
         optimize=optimize,
         cache_key_fn=cache_key_fn,
+        finalize=finalize if dual_quant_nodes else None,
     )
 
 
@@ -1225,7 +1228,9 @@ def _search(
     base_dtype: str,
     targets: Sequence[Target],
     pinned: Dict[str, Target],
-    score_of: Callable[[Dict[str, TargetSpec]], Tuple[onnx.ModelProto, float]],
+    score_of: Callable[
+        [Dict[str, TargetSpec]], Tuple[onnx.ModelProto, float, Set[str]]
+    ],
     node_tensors: Dict[str, Tuple[List[str], List[str]]],
     *,
     target_op_types: Sequence[str],
@@ -1238,10 +1243,17 @@ def _search(
     metric_threshold: Optional[float],
     optimize: str,
     cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
+    finalize: Optional[
+        Callable[[onnx.ModelProto, List[str], Set[str]], onnx.ModelProto]
+    ] = None,
 ) -> AutoMixprecisionResult:
-    """Quark's AMP driver over ``score_of(moved) -> (model, score)``:
-    baseline score, the threshold pre-check, the (cached) sensitivity ranking,
-    then the greedy mixing walk (see the module docstring)."""
+    """Quark's AMP driver over ``score_of(moved) -> (model, score, promoted
+    tensors)``: baseline score, the threshold pre-check, the (cached)
+    sensitivity ranking, then the greedy mixing walk (see the module
+    docstring). ``finalize(model, moved nodes, promoted tensors)`` post-processes
+    the mixed model once the walk is done (Quark's ``dual_quant_nodes``); the
+    tensors are those of the *last* trial, a demoted candidate's included (as
+    in Quark, whose set of promoted tensors is never reduced)."""
 
     def assign(nodes: Sequence[str], default: int) -> Dict[str, TargetSpec]:
         """``{node: target}`` for moving ``nodes`` (pinned nodes use their entry)."""
@@ -1250,7 +1262,7 @@ def _search(
             for n in nodes
         }
 
-    baseline, baseline_score = score_of({})
+    baseline, baseline_score, _ = score_of({})
     result = AutoMixprecisionResult(baseline, baseline_score, baseline_score)
     # Quark decides on the threshold before it analyses anything (a model that
     # is already past it never gets a sensitivity cache written)
@@ -1326,13 +1338,16 @@ def _search(
     shared = _shared_inputs(model) if no_input_qdq_shared else set()
     moved: Dict[str, TargetSpec] = {}
     cur_model, cur_score = baseline, baseline_score
+    tensors: Set[str] = set()
     for c in result.ranked:
         if not c.enabled:
             continue
         nodes = [n for n in c.nodes if n not in shared]
         if not nodes:
             continue
-        trial_model, score = score_of({**moved, **assign(nodes, c.best_config_index)})
+        trial_model, score, tensors = score_of(
+            {**moved, **assign(nodes, c.best_config_index)}
+        )
         if metric_threshold == 0:
             keep, stop = True, False
         elif optimize == "speed":
@@ -1347,6 +1362,8 @@ def _search(
         if stop:
             result.threshold_reached = optimize == "quality"
             break
+    if finalize is not None:
+        cur_model = finalize(cur_model, list(result.moved_nodes), tensors)
     result.model, result.final_score = cur_model, cur_score
     return result
 
@@ -1424,7 +1441,7 @@ def auto_mixprecision_blocks(
     def score_of(moved: Dict[str, TargetSpec]):
         q = build(list(moved), False)
         outs = run_fake_quantized(q, eval_data)
-        return q, metric_fn(float_out, [pick(o) for o in outs])
+        return q, metric_fn(float_out, [pick(o) for o in outs]), set()
 
     # the block format has no per-tensor targets: one placeholder precision
     node_tensors: Dict[str, Tuple[List[str], List[str]]] = {
@@ -1479,6 +1496,9 @@ def auto_mixprecision_from_baseline(
     weight_symmetric: bool = True,
     shared_param_mode: str = "propagate",
     cache_key_fn: Optional[Callable[[onnx.ModelProto], str]] = None,
+    dual_quant_nodes: bool = False,
+    override_tensors: Sequence[str] = (),
+    mixed_nodes: Sequence[str] = (),
 ) -> AutoMixprecisionResult:
     """Quark's AutoMixprecision over a *given* quantized baseline of any kind --
     a ``float16`` / ``bfloat16`` / BFP / MX fake-quantized model (see
@@ -1497,6 +1517,11 @@ def auto_mixprecision_from_baseline(
     :param activation_symmetric: Quark's ``ActivationSymmetric`` (the global
             activation spec's symmetry, which wins over a target spec's own)
     :param weight_symmetric: likewise ``WeightSymmetric``
+    :param dual_quant_nodes: Quark's boundary quantizers, inserted into the
+            final model (:func:`onnxsim.quark_boundary_qdq.insert_boundary_quant_nodes`)
+    :param override_tensors: tensors with quantization overrides of their own
+            (only matters to ``dual_quant_nodes``)
+    :param mixed_nodes: nodes with a precision of their own (likewise)
     """
     from onnxsim.quark_mixing import QuarkMixer, fake_ranges
 
@@ -1524,14 +1549,21 @@ def auto_mixprecision_from_baseline(
 
     def score_of(moved: Dict[str, TargetSpec]):
         if not moved:
-            return baseline, metric_fn(float_out, run(baseline))
+            return baseline, metric_fn(float_out, run(baseline)), set()
         mixer = QuarkMixer(baseline, range_of, shared_param_mode)
         for node, spec in moved.items():
             mixer.promote_node(
                 node, _resolve_symmetry(spec, activation_symmetric, weight_symmetric)
             )
         q = mixer.result()
-        return q, metric_fn(float_out, run(q))
+        return q, metric_fn(float_out, run(q)), mixer.promoted_tensors
+
+    def finalize(q: onnx.ModelProto, moved_nodes: List[str], tensors: Set[str]):
+        from onnxsim.quark_boundary_qdq import insert_boundary_quant_nodes
+
+        return insert_boundary_quant_nodes(
+            q, range_of, tensors, moved_nodes, override_tensors, mixed_nodes
+        )
 
     node_tensors: Dict[str, Tuple[List[str], List[str]]] = {
         _node_key(n): ([], []) for n in model.graph.node
@@ -1553,6 +1585,7 @@ def auto_mixprecision_from_baseline(
         metric_threshold=metric_threshold,
         optimize=optimize,
         cache_key_fn=cache_key_fn,
+        finalize=finalize if dual_quant_nodes else None,
     )
 
 
