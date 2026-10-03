@@ -107,17 +107,15 @@ def apply_fake_quant_int_constants(
     work = onnx.ModelProto()
     work.CopyFrom(model)
     if marking is not None:
-        consts = [
-            t
-            for t in plan.marked_tensors(
-                work,
-                marking.get("op_types"),  # type: ignore[arg-type]
-                bool(marking.get("force_no_input_check", False)),
-            )
-            if t in plan.inits
-        ]
+        quantized = plan.marked_tensors(
+            work,
+            marking.get("op_types"),  # type: ignore[arg-type]
+            bool(marking.get("force_no_input_check", False)),
+        )
     else:
-        consts = [t for t in plan.quantized_tensors(work) if t in plan.inits]
+        quantized = plan.quantized_tensors(work)
+    consts = [t for t in quantized if t in plan.inits]
+    roots = plan.share_roots(work, quantized, marking) if marking is not None else {}
     m = apply_fake_quant_format(
         model,
         act_dtype,
@@ -209,8 +207,45 @@ def apply_fake_quant_int_constants(
     del g.initializer[:]
     g.initializer.extend(keep)
     nodes = list(g.node)
+    # Outputs of Gather and subsequent data-movement operators inherit the
+    # table's integer scale and zero point, even with half/block activations.
+    shared = {t: root for t, root in roots.items() if root in rename}
+    shared_dq = {t + "_DequantizeLinear": t for t in shared}
+    shared_q = {t + "_QuantizeLinear" for t in shared}
+    graph_outputs = {o.name for o in g.output}
+    rewritten: List[onnx.NodeProto] = []
+    for n in nodes:
+        tensor = shared_dq.get(n.name)
+        if tensor is None:
+            if n.name not in shared_q:
+                rewritten.append(n)
+            continue
+        root = shared[tensor]
+        params = [root + "_scale", root + "_zero_point"]
+        source = tensor + "_QuantizeLinear_Input" if tensor in graph_outputs else tensor
+        qout = tensor + "_QuantizeLinear_Output"
+        rewritten.extend(
+            [
+                onnx.helper.make_node(
+                    "QuantizeLinear",
+                    [source, *params],
+                    [qout],
+                    name=tensor + "_QuantizeLinear",
+                    domain=MS_DOMAIN,
+                ),
+                onnx.helper.make_node(
+                    "DequantizeLinear",
+                    [qout, *params],
+                    list(n.output),
+                    name=n.name,
+                    domain=MS_DOMAIN,
+                ),
+            ]
+        )
     del g.node[:]
-    g.node.extend(new_nodes + nodes)
+    g.node.extend(new_nodes + rewritten)
+    if shared:
+        drop_unused_initializers(m)
     if new_nodes:
         _add_opset(m, MS_DOMAIN)
     # (Quark's quantizers end with its own topological sort)

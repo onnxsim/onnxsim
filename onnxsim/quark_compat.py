@@ -139,9 +139,9 @@ names and preset *meanings*, not copied.
   constants are dropped, and the ``opset_import`` list is Quark's (the model's, then
   ``com.microsoft``, then ``com.amd.quark``). Float16 input models use Quark's
   ``QuantizeFP16`` mode; ``UseFP32Scale`` converts internal FP16 tensors and adds
-  Casts at the model interface. Not covered: the output of a ``Gather`` on a constant table
-  in the mixed presets (``BF16_BFP16``,
-  ``MX9_INT8``) is quantized with the baseline format instead of the table's.
+  Casts at the model interface. The output of a ``Gather`` on a constant table
+  in mixed presets (``BF16_BFP16``, ``MX9_INT8``) inherits the table's format and
+  quantization parameters.
 - Models with a default-domain opset below 13 are quantized in place like Quark
   does (``tests/test_quark_low_opset_parity.py``): the opset is never converted,
   per-tensor Q/DQ carry no ``axis`` (the bias DequantizeLinear gets Quark's
