@@ -259,6 +259,7 @@ def skipped_nodes(
     force_no_input_check: bool = True,
     direct_pool: bool = False,
     order: Optional[Sequence[onnx.NodeProto]] = None,
+    npu_registry: bool = True,
     unquantized_ops: Iterable[str] = (),
 ) -> Set[str]:
     """Names (first outputs, for unnamed nodes) of the nodes in ``op_types`` whose
@@ -271,7 +272,9 @@ def skipped_nodes(
       scheme) whose input is unmarked, unless ``force_no_input_check``; likewise a
       ``Gather`` and a ``Where``;
     - a ``LayerNormalization`` whose input is unmarked, unless ``force_no_input_check``;
-    - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5``;
+    - a ``HardSigmoid`` that is not ``alpha = 1/6``, ``beta = 0.5`` (only with
+      ``npu_registry``: Quark's ``QDQHardSigmoid`` belongs to the NPU CNN registry,
+      the plain quantizer marks a HardSigmoid like any other op);
     - any node whose op type is in ``unquantized_ops`` (ONNX Runtime's
       ``QDQMaxPool`` / ``QDQResize`` return without marking anything below opset
       12 / 11: see :func:`opset_unquantized_ops`).
@@ -343,7 +346,7 @@ def skipped_nodes(
                 marked.update(ins + outs[:1])
             else:
                 skipped.add(key(n))
-        elif op == "HardSigmoid":
+        elif op == "HardSigmoid" and npu_registry:
             if _hard_sigmoid_ok(n):
                 marked.update(ins[:1] + outs[:1])
             else:

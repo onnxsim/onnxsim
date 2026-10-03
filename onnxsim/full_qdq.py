@@ -185,6 +185,32 @@ def _quark_pof2_params(
     return float(pof2), new_zp
 
 
+def _pof2_minmse_asymmetric(w: np.ndarray) -> Tuple[float, int]:
+    """``(scale, zero_point)`` of an int8 weight (or bias) tensor on Quark's
+    asymmetric power-of-two MinMSE grid: the zero point of the min / max scale
+    taken to the nearest fixed-point position, and, around that position, the
+    candidate scale ``2^-(p-1) ... 2^-(p+3)`` with the least squared error *at
+    that zero point*; codes are clipped to ``[-127, 127]``."""
+    data = np.asarray(w, dtype=np.float32).ravel()
+    if not data.size:
+        return 1.0, 0
+    base, zp = _quark_pof2_params(
+        float(data.min()), float(data.max()), -128, 127, False
+    )
+    pos = int(np.rint(-np.log2(min(max(base, 2.0**-127), 2.0**127))))
+    best, best_s = np.float32("inf"), np.float32(base)
+    for i in range(5):
+        cand = np.float32(2.0 ** -(pos + i - 1))
+        q = np.clip(np.round(data / cand) + np.float32(zp), -127, 127)
+        diff = np.sum(((q - np.float32(zp)) * cand - data) ** 2, dtype=np.float32)
+        if diff < best:
+            best, best_s = diff, cand
+    return float(best_s), zp
+
+
+_TINY = float(np.finfo(np.float32).tiny)
+
+
 def _qparams(
     lo: float,
     hi: float,
@@ -220,15 +246,15 @@ def _qparams(
             return float(np.float32(scale64)), zp
         scale = absmax / half
         zp = 0 if qmin < 0 else half + 1
-        if not scale > 0:
-            return 1.0, zp
+        if scale < _TINY:
+            return 1.0, 0  # (Quark's compute_scale_zp for an all-zero range)
         return (_pof2(scale) if power_of_two else scale), zp
     # Quark's compute_scale_zp: the range is float32 and its width is taken in
     # float32 before the float64 division
     lo32, hi32 = np.float32(lo), np.float32(hi)
     scale = float(np.float64(hi32 - lo32) / np.float64(qmax - qmin))
-    if not scale > 0:
-        return 1.0, qmin
+    if scale < _TINY:
+        return 1.0, 0  # (Quark's compute_scale_zp for an all-zero range)
     if power_of_two:
         scale = _pof2(scale)
     zp = int(np.clip(round(qmin - lo / scale), qmin, qmax))
@@ -407,6 +433,11 @@ def quantize_full_qdq(
     reduce_range: bool = False,
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
+    ort_gemm_beta: bool = False,
+    asymmetric_minmse_pof2: bool = False,
+    prelu_slope_per_row: bool = False,
+    excluded_nodes_stay_float: bool = True,
+    adjust_bias_scale: Optional[bool] = None,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
     calibrate_options: Optional[Dict[str, object]] = None,
     remove_qdq_after: Optional[Iterable[str]] = None,
@@ -496,6 +527,28 @@ def quantize_full_qdq(
     :param align_eltwise_dtype: with ``int8_constants``, constant operands of
             Add / Sub / Mul / Div / Min / Max keep the activation dtype
             (Quark's ``AlignEltwiseQuantType``, set by its ``A16W8`` presets)
+    :param ort_gemm_beta: ONNX Runtime's ``QDQGemm`` (Quark's): a quantized
+            ``Gemm`` with a constant bias gets ``beta = 1`` and the beta moves into
+            the int32 bias scale (``input scale * weight scale * beta``) -- the
+            bias then stands for the original bias, not ``beta`` times it
+    :param excluded_nodes_stay_float: an explicitly excluded node whose data
+            inputs are all quantized and whose outputs would all be quantized
+            (it would form a QDQ unit and run quantized) stays float, its
+            consumers read the float value. ``False``: ONNX Runtime's (and
+            Quark's) behaviour, the quantizer only does not mark the node -- its
+            neighbours still put Q/DQ pairs around it
+    :param prelu_slope_per_row: with ``per_channel``, a PRelu slope of rank > 1
+            gets one scale per row (Quark's ``QDQPRelu``, in its NPU registry --
+            the extended quantizer); otherwise per tensor
+    :param asymmetric_minmse_pof2: allow ``method="minmse_pof2"`` with asymmetric
+            activations: Quark's MinMSE calibration reports its (symmetric)
+            ranges whatever ``ActivationSymmetric`` says, and the asymmetric
+            quantizer formula then finds zero points of 0 (Softmax outputs
+            excepted, which ONNX Runtime sets to ``(0, 1)``)
+    :param adjust_bias_scale: Quark's ``adjust_bias_scale`` for the int32 biases:
+            ``None`` -- run it after each round of the ``align_ops`` loop (if
+            any); ``True`` -- also once without any alignment (its extended
+            quantizer's refinement always runs); ``False`` -- never
     :param softmax_unit_range: calibrate every Softmax output to exactly
             ``(0, 1)`` instead of its observed range (what ONNX Runtime's QDQ
             quantizer, and so Quark's non-power-of-two presets, do)
@@ -566,7 +619,7 @@ def quantize_full_qdq(
     if symmetric_activations is None:
         symmetric_activations = qmin < 0
     sym, p2 = symmetric_activations, power_of_two
-    if method == "minmse_pof2" and not sym:
+    if method == "minmse_pof2" and not sym and not asymmetric_minmse_pof2:
         raise ValueError("method 'minmse_pof2' needs symmetric activations")
     p2_search = p2 and pof2_mode == "minmse"
     tensor_symmetric = dict(tensor_symmetric or {})
@@ -613,7 +666,7 @@ def quantize_full_qdq(
     # its outputs unquantized; its consumers then read the float value (and run float too).
     # (A node merely outside ``op_types`` is left alone: sandwiched between quantized nodes it
     # runs quantized, which is what an op_types list asks for everywhere else.)
-    for n in g.node:
+    for n in g.node if excluded_nodes_stay_float else ():
         if id(n) in qnode_ids or not _is_quantized_node(
             n, op_types, set(), set(), skip_set, contrib_set
         ):
@@ -654,7 +707,8 @@ def quantize_full_qdq(
     if softmax_unit_range:
         act_set0 = set(acts)
         for n in g.node:
-            if n.op_type == "Softmax":
+            # (only a Softmax the quantizer quantizes: ``should_quantize_node``)
+            if n.op_type == "Softmax" and id(n) in qnode_ids:
                 for o in n.output:
                     if o in act_set0:
                         ranges[o] = (0.0, 1.0)
@@ -671,21 +725,29 @@ def quantize_full_qdq(
     )
     producer = {o: n for n in g.node for o in n.output}
     if adjust_activation_ranges:
-        for r in qnodes:
-            if (
-                r.op_type in ("Relu", "Clip")
-                and len(consumers[r.input[0]]) == 1
-                and r.input[0] in ranges
-                and r.output[0] in ranges
-            ):
-                ranges[r.input[0]] = ranges[r.output[0]]
+        # (Quark runs ONNX Runtime's ``adjust_tensor_ranges`` twice -- once when
+        # the quantizer is built, once when it quantizes -- so a chain of
+        # Relu / Clip nodes propagates its range two steps)
+        for _ in range(2):
+            for r in qnodes:
+                if (
+                    r.op_type in ("Relu", "Clip")
+                    and len(consumers[r.input[0]]) == 1
+                    and r.input[0] in ranges
+                    and r.output[0] in ranges
+                ):
+                    ranges[r.input[0]] = ranges[r.output[0]]
     if fold_node and (fold_relu or quark_rules):
         fold_ops = ("Relu", "Clip") if quark_rules else ("Relu",)
+        folded_into: Dict[int, onnx.NodeProto] = {}  # removed activation -> producer
         for r in qnodes:
             if r.op_type not in fold_ops:
                 continue
             src = r.input[0]
             p = producer.get(src)
+            # (a Relu / Clip behind an already folded one folds into the same producer)
+            while p is not None and id(p) in folded_into:
+                p = folded_into[id(p)]
             if (
                 p is None
                 or id(p) not in qnode_ids
@@ -697,6 +759,7 @@ def quantize_full_qdq(
             for k, o in enumerate(p.output):
                 if o == src:
                     p.output[k] = r.output[0]
+            folded_into[id(r)] = p
             if not quark_rules:
                 ranges[r.output[0]] = (0.0, max(ranges[r.output[0]][1], 0.0))
             elif r.op_type == "Relu" and ranges[r.output[0]][0] < 0:
@@ -808,6 +871,14 @@ def quantize_full_qdq(
     for x in graph_inputs:
         if x in seen and x in ranges:
             set_qp(x)
+    # Quark's ``AlignEltwiseQuantType`` puts a ``TensorQuantOverrides`` entry on
+    # every input of an eltwise op, and a tensor with an override (or whose
+    # provider has one) is quantized with its own parameters instead of sharing
+    override_tensors = (
+        {x for n in g.node if n.op_type in _ELTWISE_OPS for x in n.input}
+        if align_eltwise_dtype
+        else set()
+    )
     for n in g.node:
         if id(n) in removed:
             continue
@@ -825,6 +896,8 @@ def quantize_full_qdq(
                     and o not in tensor_dtypes
                     and o not in folded
                     and n.op_type not in unshared
+                    and o not in override_tensors
+                    and n.input[0] not in override_tensors
                 ):
                     qp[o], qdt[o] = qp[n.input[0]], qdt[n.input[0]]
                     share_root[o] = share_root.get(n.input[0], n.input[0])
@@ -832,8 +905,17 @@ def quantize_full_qdq(
             if x in seen and x not in qp and x in ranges and x not in inits:
                 set_qp(x)
 
+    # the activation parameters after every round of Quark's alignment loop (the
+    # first entry: as calibrated), which the int32 biases are re-quantized against
+    qp_history: List[Dict[str, Tuple[float, int]]] = [dict(qp)]
     if align_ops:
-        _align_qparams(g, set(align_ops), set(acts) | graph_inputs, qp, qdt)
+        qp_history += _align_qparams(
+            g, set(align_ops), set(acts) | graph_inputs, qp, qdt, share_root
+        )
+    elif adjust_bias_scale:
+        qp_history.append(dict(qp))
+    if adjust_bias_scale is False:
+        qp_history = qp_history[:1]
 
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
     if per_channel and opset < 13:
@@ -988,11 +1070,87 @@ def quantize_full_qdq(
         lo, hi = _REDUCED_RANGES[dt] if reduce_range else _DTYPES[dt][2:]
         return int(lo), int(hi)
 
-    def int8_tensor_dq(x: str, w: np.ndarray) -> str:
+    def int8_tensor_dq(x: str, w: np.ndarray, per_row: bool = False) -> str:
         """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
         constant ``x``; returns the DQ output name. With asymmetric (or uint8)
         weights it is the weights' grid instead (Quark treats these constants
-        as weights)."""
+        as weights). ``per_row``: one scale per index of axis 0 instead (Quark's
+        per-channel mode for a bias or a PReLU slope)."""
+        if per_row and w.ndim >= 1 and w.shape[0] > 1:
+            qm = w_range("int8")[1]
+            rows = w.reshape(w.shape[0], -1)
+            if not weight_symmetric and (not p2 or p2_search):
+                if p2:
+                    sz = [_pof2_minmse_asymmetric(r) for r in rows]
+                else:
+                    sz = [
+                        _weight_qparams(r.min(), r.max(), -qm - 1, qm, False)
+                        for r in rows
+                    ]
+                s = np.array([a for a, _ in sz], np.float32)
+                z = np.array([b for _, b in sz], np.int8)
+                shape = (-1,) + (1,) * (w.ndim - 1)
+                q = np.clip(
+                    np.round(w / s.reshape(shape)) + z.reshape(shape), -qm, qm
+                ).astype(np.int8)
+                base = fresh(x)
+                add_init(base + "/int8", q)
+                add_init(base + "/scale", s)
+                add_init(base + "/zp", z)
+                out = base + "/dq"
+                act_nodes.append(
+                    helper.make_node(
+                        "DequantizeLinear",
+                        [base + "/int8", base + "/scale", base + "/zp"],
+                        [out],
+                        name=out,
+                        axis=0,
+                    )
+                )
+                return out
+            if p2_search:
+                s = np.array([pof2_minmse_weight_scale(r) for r in rows], np.float32)
+            else:
+                s = (np.maximum(np.abs(rows).max(axis=1), 1e-12) / qm).astype(
+                    np.float32
+                )
+                if p2:
+                    s = (2.0 ** np.ceil(np.log2(s))).astype(np.float32)
+            q = np.clip(
+                np.round(w / s.reshape((-1,) + (1,) * (w.ndim - 1))), -qm, qm
+            ).astype(np.int8)
+            base = fresh(x)
+            add_init(base + "/int8", q)
+            add_init(base + "/scale", s)
+            add_init(base + "/zp", np.zeros(s.shape, np.int8))
+            out = base + "/dq"
+            act_nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [base + "/int8", base + "/scale", base + "/zp"],
+                    [out],
+                    name=out,
+                    axis=0,
+                )
+            )
+            return out
+        if p2_search and not weight_symmetric and weight_dtype == "int8":
+            s32, z = _pof2_minmse_asymmetric(w)
+            q = np.clip(np.round(w / np.float32(s32)) + z, -127, 127).astype(np.int8)
+            base = fresh(x)
+            add_init(base + "/int8", q)
+            add_init(base + "/scale", np.array(s32, np.float32))
+            add_init(base + "/zp", np.array(z, np.int8))
+            out = base + "/dq"
+            act_nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [base + "/int8", base + "/scale", base + "/zp"],
+                    [out],
+                    name=out,
+                )
+            )
+            return out
         if not p2 and (not weight_symmetric or weight_dtype == "uint8"):
             dt = "uint8" if weight_dtype == "uint8" else "int8"
             lo, hi = w_range(dt)
@@ -1036,10 +1194,11 @@ def quantize_full_qdq(
         )
         return out
 
-    def act_scale(x: str) -> Optional[float]:
-        if x not in qp and x.endswith("/dq"):
+    def act_scale(x: str, params: Optional[Dict] = None) -> Optional[float]:
+        params = qp if params is None else params
+        if x not in params and x.endswith("/dq"):
             x = x[: -len("/dq")]  # a graph input, rewired to its DQ above
-        return qp[x][0] if x in qp else None
+        return params[x][0] if x in params else None
 
     # Constant inputs of quantized nodes that form a real QDQ unit (every float activation
     # input dequantized): a lone DQ on a weight of a float node would strand it on the CPU.
@@ -1049,6 +1208,16 @@ def quantize_full_qdq(
     for n in qnodes:
         if id(n) in removed:
             continue
+        gemm_beta = 1.0
+        if (
+            ort_gemm_beta
+            and n.op_type == "Gemm"
+            and len(n.input) == 3
+            and n.input[2] in inits
+        ):
+            for a in n.attribute:
+                if a.name == "beta":
+                    gemm_beta, a.f = float(a.f), 1.0
         slope_only = False
         if not all(
             x in act_set and x in qp
@@ -1092,7 +1261,25 @@ def quantize_full_qdq(
                     w_np = _DTYPES[weight_dtype][1]
                     wmin, wmax = w_range(weight_dtype)
                     w_max = wmax
-                    if not weight_symmetric or weight_dtype == "uint8":
+                    if p2_search and not weight_symmetric and weight_dtype == "int8":
+                        if axis is None:
+                            s32, z = _pof2_minmse_asymmetric(w)
+                            s, zp = np.array(s32, np.float32), np.array(z, w_np)
+                            q = np.clip(np.round(w / s) + z, -w_max, w_max)
+                        else:
+                            chans = np.moveaxis(w, axis, 0).reshape(w.shape[axis], -1)
+                            sz = [_pof2_minmse_asymmetric(c) for c in chans]
+                            s = np.array([a for a, _ in sz], np.float32)
+                            zp = np.array([b for _, b in sz], w_np)
+                            shape = [1] * w.ndim
+                            shape[axis] = -1
+                            q = np.clip(
+                                np.round(w / s.reshape(shape)) + zp.reshape(shape),
+                                -w_max,
+                                w_max,
+                            )
+                        q = q.astype(w_np)
+                    elif not weight_symmetric or weight_dtype == "uint8":
                         clip_lo = max(wmin, -w_max)  # Quark: symmetric code range
                         if axis is None:
                             s32, z = _weight_qparams(
@@ -1175,7 +1362,7 @@ def quantize_full_qdq(
             ):
                 key = ("b8", x, None)
                 if key not in cache:
-                    cache[key] = int8_tensor_dq(x, w)
+                    cache[key] = int8_tensor_dq(x, w, per_row=per_channel)
                 n.input[k] = cache[key]
             elif (
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
@@ -1187,7 +1374,7 @@ def quantize_full_qdq(
                     n.input[k] = cache[("b32", x)]
                     continue
                 w_dq = n.input[1]
-                sx = act_scale(n.input[0])
+                sx = act_scale(n.input[0], qp_history[0])
                 w_scale_name = (
                     w_dq[: -len("/dq")] + "/scale" if w_dq.endswith("/dq") else None
                 )
@@ -1205,15 +1392,31 @@ def quantize_full_qdq(
                 # and the only one a DequantizeLinear below opset 13 can express)
                 per_tensor = ws.size == 1
                 s = (sx * np.broadcast_to(ws, w.shape)).astype(np.float32)
+                if gemm_beta != 1.0:
+                    s = (s * np.float32(gemm_beta)).astype(np.float32)
                 s = np.maximum(s, 1e-30)
                 # float64 division, as ONNX Runtime's quantize_bias_static does: a
                 # float32 quotient loses integer precision above 2**24 (int16 x
                 # int16 scales)
                 q = np.clip(
                     np.round(w.astype(np.float64) / s.astype(np.float64)),
-                    -(2**31) + 1,
+                    -(2**31),
                     2**31 - 1,
                 ).astype(np.int32)
+                # Quark's ``adjust_bias_scale``, after every round of its alignment
+                # loop: a bias whose scale is no longer input scale * weight scale
+                # (the input's parameters moved) is divided by the ratio and
+                # truncated, and takes the new scale -- unless one element still
+                # matches
+                ws32 = np.broadcast_to(ws, w.shape).astype(np.float32)
+                for params in qp_history[1:]:
+                    sx_i = act_scale(n.input[0], params)
+                    if sx_i is None:
+                        break
+                    prod = (np.float32(sx_i) * ws32).astype(np.float32)
+                    if np.all(prod != s):
+                        q = (q / (prod / s)).astype(np.int32)
+                        s = prod
                 base = fresh(x)
                 add_init(base + "/int32", q)
                 if per_tensor:
@@ -1239,15 +1442,23 @@ def quantize_full_qdq(
             ):
                 key = ("c8", x, None)
                 if key not in cache:
-                    cache[key] = int8_tensor_dq(x, w)
+                    cache[key] = int8_tensor_dq(
+                        x,
+                        w,
+                        per_row=per_channel
+                        and prelu_slope_per_row
+                        and not p2
+                        and n.op_type == "PRelu"
+                        and w.ndim > 1,
+                    )
                 n.input[k] = cache[key]
             else:
                 key = ("c", x, None)
                 if key not in cache:
-                    s, zp = _qparams(
-                        w.min(), w.max(), qmin, qmax, sym and weight_symmetric, p2
-                    )
-                    q = np.clip(np.round(w / s) + zp, qmin, qmax).astype(act_np)
+                    s, zp = _qparams(w.min(), w.max(), qmin, qmax, weight_symmetric, p2)
+                    # (the symmetric code range, like Quark's weights: no -128 / -32768)
+                    q = np.clip(np.round(w / s) + zp, max(qmin, -qmax), qmax)
+                    q = q.astype(act_np)
                     base = fresh(x)
                     add_init(base + "/q", q)
                     add_init(base + "/scale", np.array(s, np.float32))
@@ -1314,9 +1525,18 @@ def _align_qparams(
     has_qdq: set,
     qp: Dict[str, Tuple[float, int]],
     qdt: Dict[str, str],
-) -> None:
+    share_root: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Tuple[float, int]]]:
     """Quark's ``align_quantize_info`` on the chosen parameters (see
-    ``quantize_full_qdq``'s ``align_ops``)."""
+    ``quantize_full_qdq``'s ``align_ops``). Tensors that share their parameter
+    initializers (``share_root``: a data-movement op's output and its input) move
+    together, as the initializer is rewritten in place in Quark. Returns the
+    parameters after each round of the loop."""
+    share_root = share_root or {}
+    history: List[Dict[str, Tuple[float, int]]] = []
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for t in list(qp):
+        groups[share_root.get(t, t)].append(t)
 
     def copy(src: str, dst: str) -> bool:
         if (
@@ -1328,7 +1548,8 @@ def _align_qparams(
             or qp[src] == qp[dst]
         ):
             return False
-        qp[dst] = qp[src]
+        for t in groups[share_root.get(dst, dst)]:
+            qp[t] = qp[src]
         return True
 
     for _ in range(5):
@@ -1346,8 +1567,10 @@ def _align_qparams(
                 elif n.input and n.input[0] in has_qdq:
                     for o in n.output:
                         changed |= copy(n.input[0], o)
+        history.append(dict(qp))
         if not changed:
-            return
+            break
+    return history
 
 
 def _toposort(g: onnx.GraphProto) -> None:
