@@ -51,6 +51,11 @@ rewrites append their nodes at the end of the list like Quark's ``insert_mul``: 
 polynomial exponential, the sum and a division) and
 ``ConvertInstanceNormToDPUVersion`` (``ExtendedInstanceNormalization`` of the
 ``com.amd.quark`` domain, a custom operator) are opt-in like in Quark.
+
+Quark's extended quantizer (``A8W8`` and the 16-bit presets) runs the same
+``simulate_transforms`` (:func:`apply_extended_rewrites`), every conversion opt-in
+and on a graph without ``value_info``: a ``GlobalAveragePool`` / ``ReduceMean`` is
+never rescaled there, an ``AveragePool`` with a square ``kernel_shape`` is.
 """
 
 from __future__ import annotations
@@ -98,6 +103,9 @@ _SIMULATE_DEFAULTS = {
     "ConvertInstanceNormToDPUVersion": False,
     "ConvertClipToDPUVersion": False,
 }
+#: the extended quantizer (``A8W8``, the 16-bit presets) runs the same
+#: ``simulate_transforms``, but every conversion is off unless asked for
+_EXTENDED_SIMULATE_DEFAULTS = {k: False for k in _SIMULATE_DEFAULTS}
 
 
 def scale2pos(scale: float) -> int:
@@ -644,18 +652,28 @@ def simulate_dpu(
     should_simulate: Callable[[onnx.NodeProto], bool],
     options: Dict[str, Any],
     nodes_to_skip: Optional[Set[str]] = None,
+    defaults: Optional[Dict[str, bool]] = None,
+    value_info: bool = True,
 ) -> onnx.ModelProto:
-    """Quark's ``simulate_transforms`` (see the module docstring), in place."""
+    """Quark's ``simulate_transforms`` (see the module docstring), in place.
+    ``defaults`` are the per-option defaults of the quantizer
+    (:data:`_SIMULATE_DEFAULTS` for the NPU CNN one). ``value_info`` False: the
+    graph Quark's extended quantizer hands over has no ``value_info``, so a
+    ``GlobalAveragePool`` / ``ReduceMean`` (whose window comes from the input shape)
+    is never converted -- only an ``AveragePool`` with a square ``kernel_shape``."""
+    dflt = _SIMULATE_DEFAULTS if defaults is None else defaults
 
     def on(key: str) -> bool:
-        return bool(options.get(key, _SIMULATE_DEFAULTS[key]))
+        return bool(options.get(key, dflt[key]))
 
     g = model.graph
     skip = nodes_to_skip or set()
     # (shapes are those of the graph before any rewrite -- Quark's ``value_info``
     # -- as the appended nodes leave the graph out of order)
     shapes: Optional[Dict[str, List[int]]] = None
-    if on("ConvertAvgPoolToDPUVersion") or on("ConvertReduceMeanToDPUVersion"):
+    if not value_info:
+        shapes = {}
+    elif on("ConvertAvgPoolToDPUVersion") or on("ConvertReduceMeanToDPUVersion"):
         try:
             probe = model
             for o in model.opset_import:
@@ -846,9 +864,39 @@ def apply_npu_cnn_rewrites(
     return out
 
 
+def extended_simulates(options: Dict[str, Any]) -> bool:
+    """Whether Quark's extended quantizer converts anything for the DPU: one of
+    the ``Convert*ToDPUVersion`` / ``ConvertSigmoidToHardSigmoid`` options is on
+    (they all default to off there) and ``SimulateDPU`` is not ``False``."""
+    return options.get("SimulateDPU", True) is not False and any(
+        bool(options.get(k, False)) for k in _EXTENDED_SIMULATE_DEFAULTS
+    )
+
+
+def apply_extended_rewrites(
+    model: onnx.ModelProto,
+    options: Dict[str, Any],
+    should_simulate: Optional[Callable[[onnx.NodeProto], bool]] = None,
+) -> onnx.ModelProto:
+    """Quark's extended quantizer's DPU simulation (``_simulate_transforms``) on a
+    copy of ``model``: the same conversions as the NPU CNN quantizer's, all opt-in."""
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    simulate_dpu(
+        out,
+        should_simulate or (lambda n: True),
+        options,
+        defaults=_EXTENDED_SIMULATE_DEFAULTS,
+        value_info=False,
+    )
+    return out
+
+
 __all__: Any = [
     "adjust_quantize_info",
+    "apply_extended_rewrites",
     "apply_npu_cnn_rewrites",
+    "extended_simulates",
     "avg_pool_dpu_scale",
     "dpu_leaky_relu_alpha",
     "pos2scale",
