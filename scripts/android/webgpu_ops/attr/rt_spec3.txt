@@ -1,0 +1,15 @@
+mul_bcast_138|idx=138-138
+Mul_Add_Div_all|op=Mul,op=Add,op=Div
+adds_feature|idx=87-87,idx=102-102,idx=114-114,idx=126-126
+gelu_manual_65_69|idx=65-69
+Transpose|op=Transpose
+Concat|op=Concat
+Softmax|op=Softmax
+MatMul_attn|op=MatMul
+Gather|op=Gather,op=GatherElements
+Relu_Sigmoid_Erf|op=Relu,op=Sigmoid,op=Erf
+LayerNorm|op=LayerNormalization,op=SkipLayerNormalization
+Pooling|op=MaxPool,op=AveragePool
+Gemm_8400x256x256|cls=Gemm [8400
+Gemm_enc_ffn_400|cls=Gemm [400
+Gemm_dec_300|cls=Gemm [300

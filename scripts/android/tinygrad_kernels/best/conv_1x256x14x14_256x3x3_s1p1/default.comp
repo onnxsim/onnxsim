@@ -1,0 +1,85 @@
+#version 450
+#define INFINITY uintBitsToFloat(0x7f800000u)
+#define NAN uintBitsToFloat(0x7fc00000u)
+// kernel: r_2_7_7_32_2_2_4_256_3_3
+layout(local_size_x=32, local_size_y=2, local_size_z=2) in;
+layout(std430, set=0, binding=0) buffer B0 { float data0_50176[]; };
+layout(std430, set=0, binding=1) buffer B1 { float data1_50176[]; };
+layout(std430, set=0, binding=2) buffer B2 { float data2_589824[]; };
+void main() {
+  float buf0[4];
+  int gidx0 = int(gl_WorkGroupID.x); /* 7 */
+  int gidx1 = int(gl_WorkGroupID.y); /* 7 */
+  int gidx2 = int(gl_WorkGroupID.z); /* 2 */
+  int lidx0 = int(gl_LocalInvocationID.x); /* 32 */
+  int lidx1 = int(gl_LocalInvocationID.y); /* 2 */
+  int lidx2 = int(gl_LocalInvocationID.z); /* 2 */
+  int alu0 = (lidx2+(gidx0<<1));
+  int alu1 = (alu0+(gidx1*28)+(lidx1*14));
+  bool alu2 = (0<(gidx0+lidx2));
+  bool alu3 = (0<(gidx1+lidx1));
+  bool alu4 = ((lidx1+(gidx1<<1))<13);
+  bool alu5 = (alu0<13);
+  buf0[0] = 0.0f;
+  buf0[1] = 0.0f;
+  buf0[2] = 0.0f;
+  buf0[3] = 0.0f;
+  for (int Ridx0 = 0; Ridx0 < 256; Ridx0++) {
+    int alu10 = (alu1+(Ridx0*196));
+    float val0 = data1_50176[alu10];
+    float val1 = ((alu2&&alu3)?data1_50176[(alu10+-15)]:0.0f);
+    float val2 = (alu3?data1_50176[(alu10+-14)]:0.0f);
+    float val3 = ((alu5&&alu3)?data1_50176[(alu10+-13)]:0.0f);
+    float val4 = (alu2?data1_50176[(alu10+-1)]:0.0f);
+    float val5 = (alu5?data1_50176[(alu10+1)]:0.0f);
+    float val6 = ((alu2&&alu4)?data1_50176[(alu10+13)]:0.0f);
+    float val7 = (alu4?data1_50176[(alu10+14)]:0.0f);
+    float val8 = ((alu5&&alu4)?data1_50176[(alu10+15)]:0.0f);
+    int alu11 = ((gidx2*294912)+(lidx0*9216)+(Ridx0*9));
+    float val9 = data2_589824[(alu11+1)];
+    float val10 = data2_589824[(alu11+2)];
+    float val11 = data2_589824[(alu11+3)];
+    float val12 = data2_589824[(alu11+4)];
+    float val13 = data2_589824[(alu11+5)];
+    float val14 = data2_589824[(alu11+6)];
+    float val15 = data2_589824[(alu11+7)];
+    float val16 = data2_589824[(alu11+8)];
+    float val17 = data2_589824[(alu11+2304)];
+    float val18 = data2_589824[(alu11+2305)];
+    float val19 = data2_589824[(alu11+2306)];
+    float val20 = data2_589824[(alu11+2307)];
+    float val21 = data2_589824[(alu11+2308)];
+    float val22 = data2_589824[(alu11+2309)];
+    float val23 = data2_589824[(alu11+2310)];
+    float val24 = data2_589824[(alu11+2311)];
+    float val25 = data2_589824[(alu11+2312)];
+    float val26 = data2_589824[(alu11+4608)];
+    float val27 = data2_589824[(alu11+4609)];
+    float val28 = data2_589824[(alu11+4610)];
+    float val29 = data2_589824[(alu11+4611)];
+    float val30 = data2_589824[(alu11+4612)];
+    float val31 = data2_589824[(alu11+4613)];
+    float val32 = data2_589824[(alu11+4614)];
+    float val33 = data2_589824[(alu11+4615)];
+    float val34 = data2_589824[(alu11+4616)];
+    float val35 = data2_589824[(alu11+6912)];
+    float val36 = data2_589824[(alu11+6913)];
+    float val37 = data2_589824[(alu11+6914)];
+    float val38 = data2_589824[(alu11+6915)];
+    float val39 = data2_589824[(alu11+6916)];
+    float val40 = data2_589824[(alu11+6917)];
+    float val41 = data2_589824[(alu11+6918)];
+    float val42 = data2_589824[(alu11+6919)];
+    float val43 = data2_589824[(alu11+6920)];
+    float val44 = data2_589824[alu11];
+    buf0[0] = (buf0[0]+((val1*val44)+(val2*val9)+(val3*val10)+(val4*val11)+(val0*val12)+(val5*val13)+(val6*val14)+(val7*val15)+(val8*val16)));
+    buf0[1] = (buf0[1]+((val1*val17)+(val2*val18)+(val3*val19)+(val4*val20)+(val0*val21)+(val5*val22)+(val6*val23)+(val7*val24)+(val8*val25)));
+    buf0[2] = (buf0[2]+((val1*val26)+(val2*val27)+(val3*val28)+(val4*val29)+(val0*val30)+(val5*val31)+(val6*val32)+(val7*val33)+(val8*val34)));
+    buf0[3] = (buf0[3]+((val1*val35)+(val2*val36)+(val3*val37)+(val4*val38)+(val0*val39)+(val5*val40)+(val6*val41)+(val7*val42)+(val8*val43)));
+  }
+  int alu17 = (alu1+(gidx2*25088)+(lidx0*784));
+  data0_50176[alu17] = buf0[0];
+  data0_50176[(alu17+196)] = buf0[1];
+  data0_50176[(alu17+392)] = buf0[2];
+  data0_50176[(alu17+588)] = buf0[3];
+}

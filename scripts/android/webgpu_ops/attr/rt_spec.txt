@@ -1,0 +1,21 @@
+control_self|SELF
+Conv3x3_dense_s1|clsx=Conv 3x3 dense
+Conv3x3_dense_s2|clsx=Conv 3x3 dense s2
+Conv1x1|clsx=Conv 1x1
+Gemm_8400x256x256|cls=Gemm [8400
+Gemm_enc_ffn_400|cls=Gemm [400
+Gemm_dec_300|cls=Gemm [300
+MatMul_attn|op=MatMul
+Softmax|op=Softmax
+Transpose|op=Transpose
+Gather_GatherElements|op=Gather,op=GatherElements
+Concat|op=Concat
+Mul_Add_Div|op=Mul,op=Add,op=Div
+Relu_Sigmoid_Erf|op=Relu,op=Sigmoid,op=Erf
+LayerNorm|op=LayerNormalization,op=SkipLayerNormalization
+Pooling|op=MaxPool,op=AveragePool
+Resize_Tile_ReduceMax|op=Resize,op=Tile,op=ReduceMax
+Reshape_standin|op=Reshape
+node4_3x3_32to64_320|idx=4-4
+node3_3x3_32_320|idx=3-3
+backbone_stage1_3x3_160|idx=6-10
