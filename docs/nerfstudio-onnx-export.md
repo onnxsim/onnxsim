@@ -4,6 +4,13 @@ Measured on nerfstudio 1.1.5 (`pip install nerfstudio`, CPU, `implementation="to
 exporting with `torch.onnx.export(dynamo=True)` and round-tripping through the
 repo's own `onnxsim.simplify`.
 
+These numbers are re-verified on every run of
+`tests/test_nerfstudio_onnx_export.py`, which builds the same field and asserts
+the same properties (ORT agreement, the hash graph surviving simplification, and
+that the legacy exporter still cannot emit `bitwise_xor`). That test is skipped
+unless nerfstudio is installed; the `nerfstudio-onnx-export` workflow installs it
+and runs it on PRs that touch the exporter paths, weekly, and on demand.
+
 ## Summary
 
 nerfacto exports to ONNX in full, hash grid included. Every component survives
