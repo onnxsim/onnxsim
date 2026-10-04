@@ -41,6 +41,9 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
+from .einsum_decompose import decompose_einsum
+from .gridsample_plan import grid_sample_plan
+
 _COREML_INSTALL_HINT = (
     "coremltools is required to export Core ML models but is not installed. "
     "Install it with `pip install coremltools`."
@@ -1668,6 +1671,109 @@ def _op_topk(lowerer, node, ins, attrs):
     return [values, indices]
 
 
+@_register("GridSample")
+def _op_grid_sample(lowerer, node, ins, attrs):
+    # 2-D/3-D float sampling built from `gather_nd` corner taps plus elementwise
+    # weighting -- this MIL has no native grid-sample op. All the arithmetic
+    # (coordinates, corners, weights, out-of-range mask) comes from
+    # :func:`onnxsim.gridsample_plan.grid_sample_plan`, the shared plan the TFLite
+    # exporter lowers too, so the two cannot drift apart; only the emission below
+    # is Core ML specific. Implements the opset <= 19 ("bilinear") and 20+
+    # ("linear") mode spellings identically.
+    x, grid = ins[0], ins[1]
+    x_shape = [int(d) for d in x.shape]
+    g_shape = [int(d) for d in grid.shape]
+    xd = len(x_shape) - 2
+    mode = str(attrs.get("mode", "bilinear")).lower()
+    padding_mode = str(attrs.get("padding_mode", "zeros")).lower()
+    align_corners = bool(attrs.get("align_corners", 0))
+    if xd not in (2, 3) or len(g_shape) != xd + 2 or g_shape[-1] != xd:
+        raise RuntimeError(
+            "only 2-D/3-D GridSample is supported by onnxsim's Core ML exporter "
+            f"(got X rank {len(x_shape)}, grid rank {len(g_shape)})"
+        )
+    if grid.val is None:
+        raise RuntimeError(
+            "GridSample needs a compile-time-constant 'grid' input (Core ML "
+            "builds its gather indices at compile time)"
+        )
+    if any(d <= 0 for d in x_shape + g_shape):
+        raise RuntimeError(
+            "GridSample needs static, positive X and grid dimensions (Core ML "
+            "cannot build gather indices for a dynamic output size)"
+        )
+    n, channels = x_shape[0], x_shape[1]
+    out_shape = g_shape[1:-1]
+
+    try:
+        plan = grid_sample_plan(
+            x_shape, g_shape, grid.val, mode, padding_mode, align_corners
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"GridSample {mode=!r} {padding_mode=!r} is not supported by onnxsim's "
+            f"Core ML exporter: {exc}"
+        ) from exc
+
+    # MIL's `gather_nd` indexes the tensor's *leading* axes and moves the trailing
+    # (non-indexed) axis to the end, so it only matches ONNX's GatherND on a
+    # channel-last tensor. Sampling a channel-first `x` therefore goes through one
+    # channel-last view, and the result is (n, flat, C) -- sample-major with
+    # channels last -- which `to_output` restores to ONNX's NCHW order.
+    x_cl = lowerer.mb.transpose(
+        x=x,
+        perm=[0] + list(range(2, 2 + xd)) + [1],
+        name=lowerer.fresh_name(node, "tocl"),
+    )
+
+    def to_output(sample_major):
+        # (n, flat, C) -> (n, C, *out)
+        return lowerer.mb.reshape(
+            x=lowerer.mb.transpose(
+                x=sample_major,
+                perm=[0, 2, 1],
+                name=lowerer.fresh_name(node, "tonchw"),
+            ),
+            shape=[n, channels] + out_shape,
+            name=lowerer.fresh_name(node, "reshape"),
+        )
+
+    def weighted_tap(tap):
+        # A (n, flat) per-tap scalar becomes (n, flat, C) so it scales every
+        # channel of its own sample row.
+        gathered = lowerer.mb.gather_nd(
+            x=x_cl,
+            indices=lowerer.make_const(node.output[0], tap.indices),
+            name=lowerer.fresh_name(node, "tap"),
+        )
+        term = lowerer.mb.mul(
+            x=gathered,
+            y=lowerer.make_const(
+                node.output[0], tap.gather_weight[:, :, None].astype(np.float32)
+            ),
+            name=lowerer.fresh_name(node),
+        )
+        if padding_mode == "zeros":
+            term = lowerer.mb.mul(
+                x=term,
+                y=lowerer.make_const(
+                    node.output[0], tap.valid[:, :, None].astype(np.float32)
+                ),
+                name=lowerer.fresh_name(node),
+            )
+        return term
+
+    acc = None
+    for tap in plan:
+        term = weighted_tap(tap)
+        acc = (
+            term
+            if acc is None
+            else lowerer.mb.add(x=acc, y=term, name=lowerer.fresh_name(node))
+        )
+    return [to_output(acc)]
+
+
 @_register("Gather")
 def _op_gather(lowerer, node, ins, attrs):
     x, indices = ins[0], ins[1]
@@ -2254,6 +2360,9 @@ def convert_to_coreml(
     io_dtype, resolved_target = _resolve_io_dtype(
         ct, io_dtype, convert_to, resolved_target
     )
+    # Batch-matmul einsums become Transpose/MatMul, which Core ML has kernels
+    # for; anything left over still raises its usual unsupported-op error.
+    model = decompose_einsum(model)
     resolved_target = _resolve_gather_nd_target(ct, model, resolved_target)
     resolved_target = _resolve_quantized_target(ct, model, resolved_target)
     resolved_target = _resolve_resize_target(ct, model, resolved_target)

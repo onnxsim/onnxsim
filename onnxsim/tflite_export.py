@@ -55,6 +55,9 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
+from .einsum_decompose import decompose_einsum
+from .gridsample_plan import grid_sample_plan
+
 _TFLITE_INSTALL_HINT = (
     "TensorFlow is required to export TFLite models but is not installed. "
     "Install it with `pip install tensorflow` (or `tensorflow-cpu`)."
@@ -533,6 +536,8 @@ for _onnx_op, _tf_name in [
     ("Exp", "exp"),
     ("Log", "math.log"),
     ("Erf", "math.erf"),
+    ("Sin", "math.sin"),
+    ("Cos", "math.cos"),
     ("Softplus", "math.softplus"),
     ("Atan", "math.atan"),
     ("Identity", "identity"),
@@ -1757,57 +1762,46 @@ def _numpy_grid_sample(
 
     ``x`` is ``(N, C, *spatial)``, ``grid`` is ``(N, *out, d)`` holding
     ``(x, y[, z])`` in ``[-1, 1]`` (note the reversed axis order vs the
-    tensor layout). Mirrors ONNX's own reference implementation
-    (``onnx/reference/ops/op_grid_sample.py``): float source coordinates,
-    per-corner validity from the *raw* coordinate for ``zeros`` padding,
-    clamped indices for the gather itself. ``mode="bilinear"`` covers both
-    the 2-D (4 taps) and 3-D trilinear (8 taps) cases.
+    tensor layout). This is a thin evaluator over
+    :func:`onnxsim.gridsample_plan.grid_sample_plan` -- the shared host-side
+    plan that also backs the Core ML lowering -- so the two exporters cannot
+    drift apart; it applies the plan's gather indices and weights directly.
+    Mirrors ONNX's own reference implementation
+    (``onnx/reference/ops/op_grid_sample.py``).
     """
     x = np.asarray(x, dtype=np.float32)
     grid = np.asarray(grid, dtype=np.float32)
-    xd = x.ndim - 2
-    dims = x.shape[2:]  # spatial sizes, tensor axis order
+    n, xd = x.shape[0], x.ndim - 2
     out_shape = grid.shape[1:-1]
-    # Grid's last axis is (x, y[, z]): spatial axis j reads grid coord xd-1-j.
-    scoord = []
-    for j in range(xd):
-        g = grid[..., xd - 1 - j]
-        dim = dims[j]
-        if align_corners:
-            scoord.append((g + 1) / 2 * (dim - 1))
-        else:
-            scoord.append(((g + 1) * dim - 1) / 2)
-    b = np.broadcast_to(
-        np.arange(x.shape[0]).reshape((x.shape[0],) + (1,) * len(out_shape)),
-        (x.shape[0],) + tuple(out_shape),
+    batch_index = np.broadcast_to(
+        np.arange(n).reshape((n,) + (1,) * len(out_shape)), (n,) + tuple(out_shape)
     )
 
-    def _tap(corners):
-        # corners: one int array per spatial axis, each (N, *out).
-        if padding_mode == "zeros":
-            valid = np.ones((x.shape[0],) + tuple(out_shape), dtype=bool)
-            for ix, dim in zip(corners, dims):
-                valid &= (ix >= 0) & (ix < dim)
-        else:  # border
-            valid = np.ones((x.shape[0],) + tuple(out_shape), dtype=bool)
-        clamped = tuple(np.clip(ix, 0, dim - 1) for ix, dim in zip(corners, dims))
-        vals = x[(b, slice(None)) + clamped]  # (N, *out, C)
+    def _tap(tap):
+        # tap.indices is (N, flat, 1 + xd): a batch column followed by one index
+        # per spatial axis. Un-flatten the spatial indices back to (N, *out, xd)
+        # and gather through a channel-last view of x, so advanced indexing
+        # yields (N, *out, C) with the non-indexed channel axis trailing.
+        coords = tap.indices[:, :, 1:].reshape([n] + list(out_shape) + [-1])
+        index = (batch_index,) + tuple(coords[..., j] for j in range(xd))
+        vals = np.moveaxis(x, 1, -1)[index]  # (N, *out, C)
         vals = np.moveaxis(vals, -1, 1)  # (N, C, *out)
-        return vals * valid[:, None].astype(np.float32)
+        # The per-tap scalars are (N, *out) and vals is (N, C, *out), so insert a
+        # singleton channel axis between them: (N, 1, *out).
+        per_sample = [n, 1] + list(out_shape)
+        vals = vals * tap.gather_weight.reshape(per_sample)
+        if padding_mode == "zeros":
+            vals = vals * tap.valid.reshape(per_sample)
+        return vals
 
-    if mode in ("bilinear", "linear"):
-        lo = [np.floor(s).astype(np.int64) for s in scoord]
-        frac = [s - base for s, base in zip(scoord, lo)]
-        out = 0
-        for combo in itertools.product([0, 1], repeat=xd):
-            corners = [base + c for base, c in zip(lo, combo)]
-            w = np.ones((x.shape[0],) + tuple(out_shape), dtype=np.float32)
-            for j in range(xd):
-                w = w * (frac[j] if combo[j] else 1 - frac[j])
-            out = out + _tap(corners) * w[(slice(None), None)]
-        return out
-    grid_coords = [np.rint(s).astype(np.int64) for s in scoord]  # ties-to-even
-    return _tap(grid_coords)
+    plan = grid_sample_plan(
+        x.shape, grid.shape, grid, mode, padding_mode, align_corners
+    )
+    out = 0
+    for tap in plan:
+        out = out + _tap(tap)
+    # (N, C, flat) -> (N, C, *out)
+    return out.reshape([n, x.shape[1]] + list(out_shape))
 
 
 @_register("GridSample")
@@ -2212,6 +2206,10 @@ def _resolve_inference_dtype(inference_io_dtype: Any, tf: Any) -> Any:
 
 
 def _build_concrete_function(model: onnx.ModelProto, tf, io_layout: str = "nchw"):
+    # Batch-matmul einsums become Transpose/MatMul, which TFLite has builtin
+    # kernels for; anything left over still raises its usual unsupported-op
+    # error naming the op.
+    model = decompose_einsum(model)
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
     nhwc = _validate_io_layout(io_layout) == "nhwc"
