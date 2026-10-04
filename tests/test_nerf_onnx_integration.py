@@ -148,9 +148,7 @@ def _export_and_simplify(module, inputs):
         module,
         example,
         export_kwargs={"input_names": names, "opset_version": 17},
-        simplify_kwargs={
-            "input_data": {n: t.numpy() for n, t in inputs.items()}
-        },
+        simplify_kwargs={"input_data": {n: t.numpy() for n, t in inputs.items()}},
     )
 
 
