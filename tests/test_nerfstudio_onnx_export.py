@@ -65,13 +65,17 @@ _REPLACEMENT = (
 )
 
 
-def _patch_nerfstudio_mutable_default() -> None:
+def _patch_nerfstudio_mutable_default(nerfstudio) -> None:
     """Load a corrected ``nerfstudio.configs.base_config`` under its real name.
 
-    Uses ``importlib.resources``/``__file__`` rather than string-splitting so it
-    does not assume a POSIX layout, and registers the module in ``sys.modules``
-    *before* executing it so the ``from ... import InstantiateConfig`` that
-    nerfstudio's own modules do resolves against the patched copy.
+    Uses ``os.path`` rather than string-splitting ``__file__`` so it does not
+    assume a POSIX layout, and registers the module in ``sys.modules`` *before*
+    executing it so the ``from ... import InstantiateConfig`` that nerfstudio's
+    own modules do resolves against the patched copy.
+
+    Takes the already-imported package rather than importing one itself, so a
+    missing nerfstudio surfaces as a skip from the caller's ``importorskip``
+    instead of a collection error.
     """
     import importlib.util
     import os
@@ -79,7 +83,6 @@ def _patch_nerfstudio_mutable_default() -> None:
 
     if sys.version_info < (3, 11):
         return
-    import nerfstudio
 
     package_dir = os.path.dirname(os.path.abspath(nerfstudio.__file__))
     path = os.path.join(package_dir, "configs", "base_config.py")
@@ -101,11 +104,16 @@ def _patch_nerfstudio_mutable_default() -> None:
     exec(compile(patched, path, "exec"), module.__dict__)
 
 
-_patch_nerfstudio_mutable_default()
+# The top-level package imports cleanly even on 3.11+; only its config submodules
+# need the shim. Skipping here (rather than letting `import nerfstudio` raise
+# inside the helper) is what keeps this module reporting as one skip instead of
+# a collection error on a runner where nerfstudio is not installed.
+_nerfstudio = pytest.importorskip("nerfstudio", reason="nerfstudio is not installed")
+_patch_nerfstudio_mutable_default(_nerfstudio)
 
 NerfactoField = pytest.importorskip(
     "nerfstudio.fields.nerfacto_field",
-    reason="nerfstudio is not installed (or cannot be imported)",
+    reason="nerfstudio is not importable (needs the shim above)",
 ).NerfactoField
 
 
