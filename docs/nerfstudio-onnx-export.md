@@ -29,6 +29,31 @@ mlp_head:       ok=True,    4 ->   4 nodes, max_abs_diff = 5.96e-08
 `onnxsim` leaves the hash graph alone (139 -> 139 nodes, the 16 `BitwiseXor`
 preserved), which is correct: there is nothing redundant to remove in it.
 
+## End to end: the whole feed-forward core runs under ORT
+
+`position_encoding` + hash grid + geo MLP + view MLP + colour head, i.e. the
+entirety of nerfacto's density and RGB computation, at the defaults
+`geo_feat_dim=15`, `num_levels=8`, `log2_hashmap_size=17`:
+
+```
+exported:  221 nodes, 16 x BitwiseXor
+ORT direct:            density max_diff = 0.00e+00   rgb max_diff = 5.96e-08
+onnxsim.simplify:      ok=True, 221 -> 218 nodes, BitwiseXor preserved
+ORT after simplify:    density max_diff = 0.00e+00   rgb max_diff = 5.96e-08
+density finite, rgb within [0, 1]
+```
+
+With a dynamic batch axis, over 5 random batches at two different row counts:
+
+```
+varying rows: density 8.20e-08   rgb 5.96e-08
+128 rows:     density 7.45e-08   rgb 5.96e-08
+```
+
+So the bar that matters -- onnxruntime executes a genuinely exported nerfstudio
+field, and onnxsim's simplification preserves it -- is met for the whole
+feed-forward core, hash grid included.
+
 ## The one real constraint: the dynamo exporter
 
 `HashEncoding.hash_fn` (nerfstudio/field_components/encodings.py) is the
