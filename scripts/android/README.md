@@ -93,6 +93,257 @@ nodes on CPU in QNN HTP, and NNAPI leaves nodes on CPU for both fp32 and QDQ
 MobileNet when CPU fallback is disabled. The independent direct `qti-dsp` RELU
 probe passes on the image tensor's first four values.
 
+## MediaTek Dimensity (MT6877 / MT8791V) probe result
+
+A second connected device, `mt6877` with `ro.hardware`/`ro.soc.model` reporting
+`MT8791V/TZA`, runs Android 14 (API 34, arm64). The NNAPI HAL is MediaTek's:
+`/vendor/bin/hw/android.hardware.neuralnetworks@1.3-service-mtk-neuron` with
+`libneuron_platform.so` (the runtime service is running, and the device reports
+NNAPI feature level 7, `persist.device_config.nnapi_native.current_feature_level`).
+The vendor ships the full NeuroPilot stack (`libneuron_runtime.so`,
+`libneuron_graph_delegate.mtk.so`, `libneuron_adapter.so`, APUWare servers) and
+exposes APU char devices `/dev/apusys` and `/dev/MTK_SMI`. The GPU is Mali
+(`ro.hardware.vulkan: mali`); the SoC reports 6 Cortex-A55 plus 2 Cortex-A78
+cores (`/proc/cpuinfo` CPU parts `0xd05` and `0xd41`).
+
+This phone reports five NNAPI devices, all MediaTek APU partitions except the
+last: `mtk-dsp`, `mtk-gpu`, `mtk-mdla` and `mtk-neuron` are
+`ANEURALNETWORKS_DEVICE_ACCELERATOR` with `version=ACCELERATOR_APUSYS` and
+NNAPI feature level 3, and `nnapi-reference` is the CPU reference device. Unlike
+the Xiaomi phone there is no `qti-dsp` device, so the direct `nnapi-dsp-direct`
+probe is Qualcomm-specific and does not apply here; the `nnapi-no-cpu` target is
+vendor-neutral and does apply.
+
+The repository harness passes on this device. With `--only-target
+nnapi-no-cpu --require-nnapi-hw` it reports the CPU comparison passing and then
+`nnapi-no-cpu` matching the CPU output with `max_abs=0.000000` while listing all
+five devices. The ORT CPU baseline also passes without any accelerator
+arguments.
+
+A separate direct NNAPI probe over a two-convolution float32 network
+(`Conv`+`Relu`+strided `Conv`+`Relu`, `[1,3,64,64]` -> `[1,16,32,32]`, built with
+ORT 1.26.0) confirms the driver places the graph on the NPU rather than the CPU:
+`logcat` shows `ExecutionPlan::SimpleBody::finish: compilation finished
+successfully on mtk-neuron` from the APUWare manager process. Its output is
+bit-exact against the same model run with the NNAPI CPU reference device
+enabled (max absolute difference 0.0 over 16384 elements, identical zero count).
+Median-of-20 latency after warm-up was 1.81-1.87 ms for the NPU run and
+1.83-1.87 ms with the CPU device enabled, with minima of 0.99-1.16 ms versus
+1.64-1.67 ms. The graph is small, so this is dominated by per-invocation NNAPI
+overhead and is not evidence of NPU throughput; it shows the path works and
+returns correct values. These are whole-graph timings on a model small enough
+that fixed overhead dominates, not kernel benchmarks.
+
+Note that installing the harness's debug APK needs ADB install verification
+disabled first, otherwise the install fails with
+`INSTALL_FAILED_VERIFICATION_FAILURE`:
+
+```bash
+adb shell settings put global verifier_verify_adb_installs 0
+adb shell settings put global package_verifier_enable 0
+```
+
+The bundled QNN provider AAR on hand is `onnxruntime-android-qnn-2.6.0.aar`
+against an `onnxruntime-android-1.26.0.aar` runtime, so the QNN HTP/GPU targets
+are not meaningful on this phone (it is a MediaTek part with no QNN hardware).
+`--qnn-aar` is still required to reach the `nnapi-no-cpu` target because the
+runner app packages the QNN provider library, but the NNAPI path does not use
+it.
+
+## MediaTek Dimensity NNAPI benchmark: APU vs CPU
+
+Measured on the same Dimensity phone (mt6877 / MT8791V, Android 14) with
+`onnxruntime-android-1.26.0.aar`, using the stock zoo models converted to
+single-input form (ResNet-50 in the zoo exposes its 260 weight tensors as graph
+inputs, so they were folded back into initializers to leave one `data` input).
+Latency is the minimum over 12 timed runs after 3 warm-up runs, best of 2
+alternating repetitions, with `ORT_THREADS=4`, `ORT_ENABLE_ALL` graph
+optimization, and the NNAPI EP enabled with `NNAPI_FLAG_USE_FP16 |
+NNAPI_FLAG_CPU_DISABLED`. The CPU baseline is the same model and session with
+the default CPU EP. Throughput uses the published MAC counts
+(MobileNetV2 0.300 GMAC, ShuffleNetV2 0.146 GMAC, ResNet-50 4.1 GMAC per
+224x224 image).
+
+| Model | Batch | NNAPI APU | CPU EP (4 threads) | APU GMAC/s | CPU GMAC/s | Faster |
+|---|---|---:|---:|---:|---:|---|
+| MobileNetV2 | 1 | 29.1 ms | 26.8 ms | 10.3 | 11.2 | CPU (8%) |
+| MobileNetV2 | 4 | 165.4 ms | 171.7 ms | 7.3 | 7.0 | APU (4%) |
+| ShuffleNetV2 | 1 | 35.4 ms | 11.2 ms | 4.1 | 13.1 | CPU (3.2x) |
+| ResNet-50 | 1 | 289.6 ms | 284.9 ms | 14.2 | 14.4 | CPU (2%) |
+| ResNet-50 | 4 | 1241.4 ms | 1258.3 ms | 13.2 | 13.0 | APU (1%) |
+
+The headline result is that on this phone the APU is **not faster than the CPU
+for any of these models at batch 1**, and the APU's effective throughput is
+roughly flat at 7-14 GMAC/s across model sizes and batch sizes. That is far
+below what the hardware is capable of. The section below shows the cause is
+driver model acceptance rather than placement tuning, so these numbers are a
+driver ceiling rather than a tuning target.
+
+Two things dominate, and both are visible in the logs:
+
+1. **Nothing fully offloads.** Rebuilding each session with
+   `session.disable_cpu_ep_fallback=1` (which makes any CPU-assigned node a hard
+   error rather than a silent fallback) fails for all three models with
+   "This session contains graph nodes that are assigned to the default CPU EP".
+   The zoo graphs carry shape and layout ops that this NNAPI driver will not
+   take: MobileNetV2 has `Shape/Constant/Gather/Unsqueeze/Concat/Reshape`,
+   ShuffleNetV2 has 32 `Reshape`, 32 `Constant`, 16 `Transpose`, 16 `Concat` and
+   13 `Split`, and ResNet-50 still has a `Reshape`. Because ORT's CPU EP stays
+   enabled by default, an "NNAPI" run silently mixes APU partitions with CPU
+   execution, and the APU partition pays per-invocation setup without owning the
+   whole graph.
+2. **Per-invocation APU setup dominates at small batch.** Each run recompiles on
+   the accelerator: logcat shows `ExecutionPlan::SimpleBody::finish: compilation
+   finished successfully on mtk-neuron` once per invocation, so batch-1 numbers
+   include model compilation rather than steady-state inference. That is why the
+   NPU wins only at batch 4 and above, and why ShuffleNetV2 (the smallest model,
+   0.146 GMAC) is the worst case at 3.2x slower than the CPU: it has the least
+   work to amortize the setup.
+
+### The offload ceiling, and why a "fully on the NPU" number does not exist
+
+The gap to ideal performance is not a tuning problem, because this driver cannot
+take these graphs whole. Two different failures show up, and they are worth
+separating because they have different causes.
+
+Running the session with CPU fallback disabled produces one of two errors:
+
+- **CPU-assigned nodes remain.** The full-size models (MobileNetV2, and the
+  `onnxsim`-simplified variant of it, which only removes 1 of the 6 shape ops)
+  fail with "This session contains graph nodes that are assigned to the default
+  CPU EP". Freezing the batch dimension and replacing the
+  `Shape/Gather/Unsqueeze/Concat` chain feeding the final `Reshape` with a
+  constant `[1, 1000]` removes 4 nodes and still fails the same way, so the
+  blocker is not only dynamic shape handling.
+- **The model is rejected outright.** Single-op graphs built to test this
+  (`Conv`, `Conv+Relu`, `Clip`, `Add`, `GlobalAveragePool`, `MaxPool`,
+  `Reshape`, `Gemm`, each on its own with static shapes) all fail earlier and
+  harder, with `Compile ResultCode: ANEURALNETWORKS_BAD_DATA, on
+  identifyInputsAndOutputs`. A one-convolution graph is the simplest case
+  possible, and the driver still refuses it.
+
+That second result is the important one and it matches an independent finding on
+this phone: a hand-built NNAPI `CONV_2D` model with ordinary NHWC operand shapes
+is rejected by the same call, and even a four-element float32 `RELU` is accepted
+while convolution is not. So on this SoC the MediaTek NNAPI service will run
+relu-shaped graphs but rejects convolution at model-build time, which caps
+achieved throughput far below the hardware regardless of batch size. Measuring
+"ideal" APU performance for real CNNs through NNAPI is therefore not possible on
+this device with this driver; the numbers above are the realistic ceiling, not a
+tuning artifact.
+
+Run-to-run noise on this phone is large. Individual ResNet-50 repetitions ranged
+from 267 to 315 ms on the APU and 289 to 319 ms on the CPU, so the batch-1
+ResNet-50 and MobileNetV2 gaps (2-8%) are within noise and should not be read as
+a real win for either side. The ShuffleNetV2 result (3.2x) and the direction of
+the batch sweep (APU crosses over at batch 4) are well outside noise.
+
+Practical conclusion for this device: treat NNAPI as a path that can reach the
+APU, not as a default that beats the CPU. It is worth enabling only for graphs
+that are fully offloadable (so, in practice, a quantized graph whose shape
+operators have been folded away) and only at batch 4 or more; for single-image
+fp32 classification the 8-core CPU is the faster path. Any future comparison
+must pin `ORT_THREADS`, alternate the two providers, and report the minimum, or
+the numbers will be dominated by noise and by APU recompilation.
+
+## MediaTek paths that bypass NNAPI
+
+The same Dimensity phone also exposes MediaTek's own inference stack, so a model
+does not have to go through the NNAPI HAL. The vendor libraries live in
+`/vendor/lib64`; the notes below come from reading their exported symbols and
+running a small probe against them on the device.
+
+### `libtflite_mtk.so`: NeuroPilot, the usable one
+
+`/vendor/lib64/libtflite_mtk.so` (arm64, ~6.7 MB) is the one that works from an
+unprivileged shell. `dlopen` succeeds and it exports a self-contained C API,
+`ANeuroPilotTFLite_*`, that compiles and invokes a TFLite model directly on the
+APU. Notable exported entry points include `ANeuroPilotTFLite_create`,
+`ANeuroPilotTFLite_invoke`, `ANeuroPilotTFLite_free`, tensor accessors
+(`getTensorByteSize`, `getTensorType`, `setInputTensorData`,
+`getOutputTensorData`, `setTensorBuffer`), and ~30
+`ANeuroPilotTFLiteOptions_set*` knobs (`setAcceleratorName`,
+`setDisallowNnApiCpu`, `setAllowFp16PrecisionForFp32`, `setLowLatency`,
+`setMaxExecutionTimeout`, `setCacheDir`, `setUseIon`, ...). The same library
+also exports `TfLiteNeuronDelegateCreate` / `TfLiteNeuronDelegateOptionsDefault`
+(the TFLite delegate front end to the same runtime) and `TfLiteGpuDelegateV2Create`.
+Inside the delegate, logcat reports `Replacing N node(s) with delegate
+(TfLiteNnapiDelegate) node`, but the work is executed by MediaTek's own neuron
+runtime, not by the NNAPI HAL.
+
+The library also carries the full TFLite C++ interpreter (~3,900 `tflite::*`
+symbols, `FlatBufferModel`, `Interpreter::Invoke`, `BuiltinOpResolver`) plus
+MediaTek op registrations (`tflite::ops::mtk::*::add_neuron_params`), so a build
+can be linked against the vendor library directly instead of using dlsym.
+
+MediaTek does not publish headers for the `ANeuroPilotTFLite_*` API and the
+symbol names alone are ambiguous, so the calling convention has to be recovered
+from the library's disassembly. The verified signatures (AArch64, `x0..x3`,
+`w1/w2` are 32-bit) are:
+
+- `ANeuroPilotTFLiteOptions_create(ANeuroPilotTFLiteOptions** out)` — takes an
+  out-pointer and allocates a 200-byte options object; a no-argument call
+  returns `3` and every later options call fails.
+- `ANeuroPilotTFLite_create(void** out, const char* model, options, void* buffer)`
+  — the first argument is an out-pointer, the second the model path. Passing the
+  path first returns `4` and logs `Fail to read model file`.
+- `ANeuroPilotTFLiteOptions_setAcceleratorName(options, const char*)`,
+  `ANeuroPilotTFLiteOptions_setDisallowNnApiCpu(options, int)` — ordinary
+  `(options, value)` setters.
+- `ANeuroPilotTFLite_setInputTensorData(model, int index, void* data, size_t bytes)`
+  — checks `bytes` against the tensor's own size and logs
+  `tensor size not match` when they differ.
+- `ANeuroPilotTFLite_invoke(model)` takes just the model and returns a status.
+
+With those signatures a TFLite model does load and run on the APU with no NNAPI
+involvement: creating a converted float32 Conv+ReLU network and invoking it
+returns status 0 in about 0.8-1.2 ms, and logcat confirms real NPU execution
+with `ExecutionPlan::SimpleBody::finish: compilation finished successfully on
+mtknpu` from the APUWare manager process. Reading the output back through
+`ANeuroPilotTFLite_getOutputTensorData` is the part that still fails: the tensor
+metadata accessors take an unpublished `which`/index argument pair, and the
+library's own size check rejects the read with `tensor size not match`. The
+dispatch and execution are therefore confirmed on the APU, but numerical
+verification through this API is not yet complete. The ONNX Runtime NNAPI path
+above remains the verified route to get bit-exact outputs on this phone.
+
+Two practical constraints: the model must be TFLite (not ONNX), and
+`/vendor/bin` has no NeuroPilot, MDLA or APU command-line tools, so there is no
+shell-level "run this model" utility to borrow.
+
+### Present but not reachable from an unprivileged shell
+
+- `libneuron_runtime.so`, `libneuron_platform.so`, `libneuron_adapter.so`,
+  `libneuron_wrapper.so` and `libmcv_runtime.mtk.so` are the real neuron
+  runtime, but they are symlinks into `/vendor/lib64/mt6877/` and are
+  SELinux-denied: `adb pull` fails and `ls` reports `Permission denied` for the
+  `shell` user. They also fail to `dlopen` even when the path is named
+  directly (`library "libneuron_runtime.so" not found`, because the dynamic
+  linker cannot read the file). `libneuron_platform.so` additionally pulls in
+  `libapusys.so` from `libvpu.so`, so it needs the vendor namespace.
+- `APUWareApusysServer.so`, `APUWareUtilsServer.so` and
+  `APUWareXrpServer_v2.so` are the APUWare services. They are SELinux-denied
+  from `shell` as well, so they cannot be probed directly.
+- `libarmnn_ndk.mtk.vndk.so` (~13.8 MB) is a real inference library but its only
+  dependencies are `liblog`, `libcmdl_ndk`, `libdl`, `libm` and `libc`, and it
+  exports no neuron, apusys, delegate or NNAPI symbols. It is a CPU backend and
+  gives no APU access.
+
+The practical boundary is that `libtflite_mtk.so` is the only APU-capable entry
+point an app can actually load without root, because it is the one the TFLite
+delegate lives in.
+
+### Properties
+
+There is little APU tuning exposed through `getprop`. Beyond the NNAPI-related
+keys already noted, the only other ones present are TFLite's own target
+(`debug.mtk_tflite.target_nnapi: 29`) and the MediaTek AI/PQ display features
+(`ro.vendor.pq.mtk_ai_scence_pq_support`, `..._ai_sdr_to_hdr_support`, both `0`,
+which are camera/display rather than inference). There is no property to select
+an APU core, set an APU clock, or read APU utilisation; the `/dev/apusys` and
+`/dev/MTK_SMI` character devices exist but are group-restricted to `system`/`media`,
+so an app cannot use them for manual submission.
+
 ## TVM Hexagon Mask R-CNN kernel probe
 
 `test_tvm_hexagon_maskrcnn.py` is an opt-in test for TVM's Hexagon code
