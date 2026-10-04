@@ -60,7 +60,6 @@ def test_board_is_an_rk3588(harness, tmp_path):
     """
     import numpy as np
     import onnx as onnx_mod
-
     from common.ep_numerics import random_feeds  # noqa: E402
     from common.synthetic_models import build  # noqa: E402
 
@@ -155,7 +154,6 @@ def test_input_channels_only_for_rank4(tmp_path):
     if _RKNN_DIR not in sys.path:
         sys.path.insert(0, _RKNN_DIR)
     import onnx  # noqa: E402
-
     import run_rknn3588_compat as harness  # noqa: E402
 
     def _save(shape, path):
