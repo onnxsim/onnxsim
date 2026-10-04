@@ -152,6 +152,23 @@ class NerfactoCore(torch.nn.Module):
         return density, rgb
 
 
+def _hash_encoding(field):
+    """nerfacto's ``HashEncoding``, located structurally.
+
+    ``NerfactoField`` exposes it as the ``mlp_base_grid`` alias in some
+    releases and only as ``mlp_base[0]`` in others (it is a ``Sequential`` of
+    ``[HashEncoding, MLP]``), so reach it by type rather than by attribute name.
+    """
+    from nerfstudio.field_components.encodings import HashEncoding
+
+    if hasattr(field, "mlp_base_grid"):
+        return field.mlp_base_grid
+    for module in field.mlp_base.modules():
+        if isinstance(module, HashEncoding):
+            return module
+    raise AssertionError("no HashEncoding found in NerfactoField.mlp_base")
+
+
 def _field():
     """A small but genuine nerfacto: real hash grid, real MLPs, tiny dims."""
     return NerfactoField(
@@ -273,9 +290,10 @@ def test_hash_grid_is_bit_exact_under_ort():
     torch.manual_seed(0)
     positions = torch.rand(256, 3)
     with torch.no_grad():
-        reference = field.mlp_base_grid(positions).numpy()
+        encoding = _hash_encoding(field)
+        reference = encoding(positions).numpy()
 
-    model = _export_single_input(_Wrap(field.mlp_base_grid).eval(), positions)
+    model = _export_single_input(_Wrap(encoding).eval(), positions)
     import onnxruntime as ort
 
     got = ort.InferenceSession(
@@ -349,15 +367,25 @@ def test_legacy_exporter_cannot_emit_the_hash_grid():
     If a future torch adds an ``aten::bitwise_xor`` symbolic to the legacy
     exporter, this test fails and the comment explaining the dynamo dependency
     above can be revisited.
+
+    The legacy exporter can bail out through more than one door -- it reports an
+    unsupported operator, or its version-converter pass asserts when asked to
+    reach an opset it cannot convert down to -- so the assertion only requires
+    that *some* export exception is raised and names the operator. Pinning one
+    exact message would make this a change-detector for torch's internals.
     """
     field = _field()
     positions = torch.rand(32, 3)
 
-    with pytest.raises(Exception, match="bitwise_xor"):
+    with pytest.raises(Exception) as excinfo:
         torch.onnx.export(
-            _Wrap(field.mlp_base_grid).eval(),
+            _Wrap(_hash_encoding(field)).eval(),
             (positions,),
             io.BytesIO(),
             opset_version=18,
             dynamo=False,
         )
+    message = str(excinfo.value)
+    assert "bitwise_xor" in message or "BitwiseXor" in message, (
+        f"expected the legacy exporter to reject the hash grid, got: {message}"
+    )
