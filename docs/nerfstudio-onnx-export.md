@@ -1,32 +1,35 @@
 # Exporting nerfstudio's nerfacto to ONNX
 
 Measured on nerfstudio 1.1.5 (`pip install nerfstudio`, CPU, `implementation="torch"`),
-with the repo's own `onnxsim.simplify` doing the round-trip check.
+exporting with `torch.onnx.export(dynamo=True)` and round-tripping through the
+repo's own `onnxsim.simplify`.
 
 ## Summary
 
-nerfacto's feed-forward core — everything except the hash-grid interpolation —
-exports to ONNX cleanly and survives simplification with identical numerics.
-The hash grid does **not** export, and the reason is structural rather than a
-missing pass in onnxsim: it uses a bitwise op ONNX has no equivalent for.
+nerfacto exports to ONNX in full, hash grid included. Every component survives
+simplification with the numerics unchanged.
 
-| nerfacto component | Export to ONNX | Notes |
+| nerfacto component | nodes | key ops |
 |---|---|---|
-| `position_encoding` | ✅ 12 nodes | `Mul`/`Add`/`Concat` — the frequency embedding |
-| `mlp_base_mlp` (geo-feature MLP) | ✅ 3 nodes | `Gemm`, `Relu` |
-| `direction_encoding` (view MLP) | ✅ 603 nodes | heavy but plain `Gemm`/elementwise |
-| `mlp_head` (colour head) | ✅ 4 nodes | `Gemm`, `Relu`, `Sigmoid` |
-| `mlp_base_grid` (hash encoding) | ❌ **fails** | `aten::bitwise_xor` |
-| `mlp_base` (grid + MLP, fused) | ❌ fails | contains the hash grid |
+| `position_encoding` | 12 | `Mul`/`Add`/`Concat` -- the frequency embedding |
+| `mlp_base_grid` (hash encoding) | 136 | `BitwiseXor` x16, `Gather` x24, `Mul`/`Cast`/`Floor`/`Slice` |
+| `mlp_base_mlp` (geo-feature MLP) | 3 | `Gemm`, `Relu` |
+| `mlp_base` (grid + MLP, fused) | 139 | the above plus the geo MLP |
+| `direction_encoding` (view MLP) | 603 | heavy but plain `Gemm`/elementwise |
+| `mlp_head` (colour head) | 4 | `Gemm`, `Relu`, `Sigmoid` |
 
-Numeric round-trip through `onnxsim.simplify` on the colour head:
+Verified round-trips through `onnxsim.simplify`:
 
 ```
-onnxsim.simplify -> ok=True, 4 nodes (was 4)
-max_abs_diff = 5.96e-08
+mlp_base_grid:  max_abs_diff = 0.00e+00   (bit-exact against torch)
+mlp_base:       ok=True, 139 -> 139 nodes, max_abs_diff = 5.96e-08
+mlp_head:       ok=True,    4 ->   4 nodes, max_abs_diff = 5.96e-08
 ```
 
-## Why the hash grid can't export
+`onnxsim` leaves the hash graph alone (139 -> 139 nodes, the 16 `BitwiseXor`
+preserved), which is correct: there is nothing redundant to remove in it.
+
+## The one real constraint: the dynamo exporter
 
 `HashEncoding.hash_fn` (nerfstudio/field_components/encodings.py) is the
 Instant-NGP space hash:
@@ -38,56 +41,62 @@ x = torch.bitwise_xor(x, in_tensor[..., 2])
 x %= self.hash_table_size
 ```
 
-`torch.onnx.export` fails with:
+That maps to ONNX's
+[`BitwiseXor`](https://onnx.ai/onnx/operators/onnx__BitwiseXor.html), which
+exists since **opset 18** over exactly the integer types the hash uses
+(`int8/16/32/64`, `uint8/16/32/64`). But the **legacy** TorchScript exporter has
+no symbolic registered for `aten::bitwise_xor`, so it fails before the opset ever
+comes into play:
 
-```
-UnsupportedOperatorError: Exporting the operator 'aten::bitwise_xor'
-to ONNX opset version 17 is not supported
-```
+| exporter | opset 17 | opset 18 |
+|---|---|---|
+| `dynamo=False` (legacy TorchScript) | FAIL `UnsupportedOperatorError: aten::bitwise_xor` | FAIL `UnsupportedOperatorError: aten::bitwise_xor` |
+| `dynamo=True` (dynamo, needs `onnxscript`) | OK -- 136 nodes, 16 x `BitwiseXor` | OK -- 136 nodes, 16 x `BitwiseXor` |
 
-ONNX has **no bitwise-xor operator at any opset** (its bitwise set is only
-`And`/`Or`/`Xor` on *bools*, plus integer shifts and `BitShift`). So this is not
-something onnxsim can simplify away: the operator simply has no target.
+So the hash grid needs `dynamo=True`; the opset floor of 18 matters only for a
+backend that wants to run the result. Note that
+`onnxsim.test_utils.export_simplify_and_check_by_python_api` deliberately sets
+`dynamo=False` (so `ScriptModule` inputs keep working), so a caller exporting a
+nerfacto field through that helper has to override it.
 
-Getting past it needs the hash computed *outside* the graph — precompute the
-`Gather` indices for a fixed set of sample positions, or replace the encoding
-with one that composes from supported ops. Both change the model's structure,
-so neither is appropriate to do implicitly.
+## Downstream: what the exporters can take
 
-## What is exportable, concretely
+The exported ops (`Gather`, `Mul`, `Cast`, `Floor`, `Slice`, `Gemm`, `Relu`,
+`Sigmoid`, `BitwiseXor`) are all in onnxsim's hand-written exporter tables. Two
+caveats to check against the target backend rather than assume:
 
-The whole colour path, verified above:
+- **Core ML**: `BitwiseXor` has no MIL op, and onnxsim's Core ML exporter does
+  not lower it, so that backend reports it unsupported -- correctly, rather than
+  emitting something wrong. Whether Core ML's own compute plan could accept a
+  lowering is untested here (see the `coremltools` note below).
+- **TFLite**: likewise no `BitwiseXor` builtin; it would need Flex or a
+  lowering.
 
-```
-positions, directions
-  -> direction_encoding(directions)      # 603 nodes, exportable
-  -> mlp_head(cat([d, geo_feat, appearance]))
-  -> rgb
-```
-
-and the geo-feature MLP once the grid indices are precomputed. In other words
-roughly two thirds of nerfacto's parameter count exports as-is; the remaining
-third is the hash table plus its lookup.
-
-For completeness: `splatfacto` is further off still — `gsplat` is fused CUDA, so
+For completeness: `splatfacto` is a different story -- `gsplat` is fused CUDA, so
 its rasteriser has no ONNX representation at all. That is a property of the
 model, not of this exporter work.
 
 ## Environment notes
 
-Two things needed working around to run this, neither related to ONNX:
+Three obstacles, none of them about the model:
 
 1. **nerfstudio 1.1.5 does not import on Python 3.11+**
    (nerfstudio-project/nerfstudio#3106). `configs/base_config.py` declares
    `local_writer: LocalWriterConfig = LocalWriterConfig(enable=True)` as a
-   dataclass default; Python 3.11 widened the mutable-default check to "is its
-   type unhashable", so the module raises `ValueError` at import and every
-   `Field`/`Model` import fails with it. Rewriting that one declaration to
-   `dataclasses.field(default_factory=...)` is the fix Python's own error names.
+   dataclass field default. Python 3.11 widened the mutable-default check from
+   "is the value a list/set/dict" to "is its *type* unhashable"
+   (https://discuss.python.org/t/better-communicate-dataclass-mutable-default-check-change-in-python-3-11/19028).
+   `LocalWriterConfig` defines `__hash__`, so the module raises `ValueError` at
+   import and every `Field`/`Model` import fails with it. Rewriting that one
+   declaration to `dataclasses.field(default_factory=...)` -- the fix Python's
+   own error message names -- is enough.
 
 2. **`onnx` has no Python 3.14 wheel**, so `pip install` builds it from source
-   and the bundled protobuf fails on arm64. Use 3.11/3.12.
+   and the bundled protobuf fails on arm64. Use 3.11 or 3.12.
 
-`onnxsim` itself must be the installed wheel, not the source tree, when the
-serving interpreter differs from the one the C++ extension was built for — the
-`.abi3.so` resolves against the *running* interpreter.
+3. **`onnxscript` is required** for `dynamo=True`, which is what makes the hash
+   grid exportable at all.
+
+Also: `onnxsim` itself must be the installed wheel rather than the source tree
+when the serving interpreter differs from the one the C++ extension was built
+for -- the `.abi3.so` resolves against the *running* interpreter.
