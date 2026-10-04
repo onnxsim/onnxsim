@@ -66,14 +66,23 @@ _REPLACEMENT = (
 
 
 def _patch_nerfstudio_mutable_default() -> None:
+    """Load a corrected ``nerfstudio.configs.base_config`` under its real name.
+
+    Uses ``importlib.resources``/``__file__`` rather than string-splitting so it
+    does not assume a POSIX layout, and registers the module in ``sys.modules``
+    *before* executing it so the ``from ... import InstantiateConfig`` that
+    nerfstudio's own modules do resolves against the patched copy.
+    """
     import importlib.util
+    import os
     import sys
 
     if sys.version_info < (3, 11):
         return
     import nerfstudio
 
-    path = f"{nerfstudio.__file__.rsplit('/', 1)[0]}/configs/base_config.py"
+    package_dir = os.path.dirname(os.path.abspath(nerfstudio.__file__))
+    path = os.path.join(package_dir, "configs", "base_config.py")
     with open(path, encoding="utf-8") as handle:
         source = handle.read()
     if _OFFENDING not in source:

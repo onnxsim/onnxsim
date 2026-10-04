@@ -103,17 +103,20 @@ jobs:
 
       # nerfstudio pulls in ~90 packages (open3d, viser, jupyterlab, opencv,
       # tensorboard, gsplat ...), which is why this is its own workflow rather
-      # than an extra in the build-and-test matrix. `onnxscript` is not optional
-      # here: it is what backs `torch.onnx.export(dynamo=True)`, and the dynamo
-      # exporter is the only one that can emit the hash grid's bitwise_xor.
-      - name: Install nerfstudio
+      # than an extra in the build-and-test matrix. Three pins matter:
+      #
+      # * onnxscript is not optional -- it is what backs
+      #   `torch.onnx.export(dynamo=True)`, and the dynamo exporter is the only
+      #   one that can emit the hash grid's `aten::bitwise_xor`.
+      # * onnxruntime is not a nerfstudio dependency, and the whole point here is
+      #   running the exported model, so install it explicitly.
+      # * the install order matters: nerfstudio pins an older onnx than the
+      #   onnxsim wheel wants, so onnxruntime is installed *after* to avoid
+      #   pip resolving against the pre-downgrade onnx.
+      - name: Install nerfstudio and test dependencies
         run: |
           python -m pip install nerfstudio onnxscript
-
-      # pytest is not a nerfstudio dependency, so install it explicitly rather
-      # than relying on a transitive one.
-      - name: Install test runner
-        run: python -m pip install pytest
+          python -m pip install onnxruntime pytest
 
       # The checkout puts the repo root on sys.path, whose ./onnxsim has no
       # compiled extension and would shadow the installed wheel -- run from a
@@ -124,4 +127,19 @@ jobs:
 
       - name: Run the nerfstudio export tests
         working-directory: ${{ runner.temp }}
-        run: python -m pytest "$GITHUB_WORKSPACE/tests/test_nerfstudio_onnx_export.py" -v
+        # The skip guard matters: this module is importorskip-guarded, so a
+        # missing dependency turns into "1 skipped" and pytest exits 5 -- which
+        # without the guard reads as "nothing to do" rather than a failure.
+        # -rs prints the skip reason so a real regression says which dependency
+        # went missing.
+        run: |
+          set +e
+          python -m pytest "$GITHUB_WORKSPACE/tests/test_nerfstudio_onnx_export.py" \
+            -v --no-header -rs
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "::error::No tests collected -- a dependency is missing; see the skip reason above."
+            exit 1
+          fi
+          exit "$status"
