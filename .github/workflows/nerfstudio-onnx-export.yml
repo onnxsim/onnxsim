@@ -110,6 +110,11 @@ jobs:
         run: |
           python -m pip install nerfstudio onnxscript
 
+      # pytest is not a nerfstudio dependency, so install it explicitly rather
+      # than relying on a transitive one.
+      - name: Install test runner
+        run: python -m pip install pytest
+
       # The checkout puts the repo root on sys.path, whose ./onnxsim has no
       # compiled extension and would shadow the installed wheel -- run from a
       # neutral directory so the wheel is what gets imported.
