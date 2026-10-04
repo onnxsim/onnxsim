@@ -223,6 +223,160 @@ python scripts/rknn/run_rknn_compat.py --target-platform rv1106
 The in-tree smoke test `tests/test_rknn_compat.py` reuses this harness and is
 skipped automatically when `rknn-toolkit2` isn't installed.
 
+## NanoPC-T6 / RK3588 real-NPU target
+
+The PC simulator above validates *convertibility*, not what a real RK3588 NPU
+computes. A second, higher-fidelity path runs on a connected NanoPC-T6
+(FriendlyElec Ubuntu 24.04.5, kernel 6.1.141, RKNPU driver v0.9.8,
+`/usr/lib/librknnrt.so` 2.3.0), again host-compiles / board-runs:
+
+```python
+from rknn.api import RKNN
+
+rknn = RKNN(verbose=False)
+rknn.config(target_platform="rk3588", mean_values=[[0, 0, 0]], std_values=[[1, 1, 1]])
+rknn.load_onnx(model="simplified.onnx")
+rknn.build(do_quantization=True, dataset="calib.txt")
+rknn.export_rknn("model.rknn")
+rknn.release()
+```
+
+```bash
+# Benchmark compiled models on the board.
+RKNN_SSH_PASSWORD=... python scripts/rknn/benchmark_nanopc.py model.rknn \
+  --warmup 20 --iterations 200
+
+# Build the two synthetic benchmark models for rk3588 first:
+python scripts/rknn/build_nanopc_models.py --output-dir /tmp/nanopc-rk3588
+```
+
+The uploaded [`nanopc_rknn_runner.py`](nanopc_rknn_runner.py) is
+dependency-free apart from numpy and drives the board's `librknnrt.so` through
+ctypes, like the Luckfox runner. It handles multiple inputs/outputs and can
+write every output buffer back to disk, which is what makes the correctness
+check below possible.
+
+**The device node needs no configuration on this board.** Its RKNPU driver
+registers as a DRM device (`dmesg`: `[drm] Initialized rknpu 0.9.8 ... on minor
+1`), so `/dev/rknpu` does *not* exist -- the nodes are `/dev/dri/card1` and
+`/dev/dri/renderD129`, owned by group `render` (which the stock `pi` user is
+already in). `librknnrt.so` 2.3.0 discovers this itself, so no path is passed
+in. Code hardcoding `/dev/rknpu` will fail here. Note also that host-side
+`list_devices()` does not work over SSH: it needs ADB/NTB against a
+USB-attached board and raises otherwise.
+
+### Real-NPU correctness check
+
+[`run_rknn3588_compat.py`](run_rknn3588_compat.py) runs the same
+original-vs-simplified comparison the simulator harness does, but on the actual
+NPU: both graphs are compiled for `rk3588` from an identical calibration set,
+uploaded, executed, and their float32 outputs compared.
+
+```bash
+RKNN_SSH_PASSWORD=... python scripts/rknn/run_rknn3588_compat.py \
+  --output rknn3588-compat.csv
+```
+
+Because both builds go through the same compiler, the same NPU and the same
+calibration, a fixed backend difference cancels out and only an
+onnxsim-introduced change fails. Measured on the connected NanoPC-T6: **all five
+suite models agree bit-for-bit** (`max_abs_diff` exactly 0.0), where the PC
+simulator can only be compared loosely. The ORT-vs-NPU column in the CSV is
+informational INT8 quantization error, not a pass/fail criterion.
+
+**No latency win is claimed.** This harness's `*_latency_*` columns are single
+un-replicated samples; two identical runs put `conv_bn_relu` at -43.9% then
++116.7%, because these graphs execute in 0.03-0.09 ms and are dominated by
+launch overhead. For a defensible timing use
+[`ab_latency_nanopc.py`](ab_latency_nanopc.py), which compiles each variant once
+and interleaves A/B/B/A over many rounds.
+
+**Latency here is host-bound, not NPU-bound.** Measured with
+[`nanopc_npu_utilization.py`](nanopc_npu_utilization.py): a single inference
+stream keeps one core at a ~26% duty cycle and leaves the other two at 0%, i.e.
+only ~9% of total NPU capacity. Running 3-4 concurrent streams reaches ~56-60%,
+so the hardware is not the constraint -- per-inference driver/IOCTL overhead on
+the host is.
+
+**Batching does not help** ([`batch_probe_nanopc.py`](batch_probe_nanopc.py)).
+`rknn-toolkit2` 2.3.2's `config()` has no `batch_size` parameter at all (it
+existed in the v1 toolkit), so batch must be in the ONNX graph. Batches of 1/2/4/8
+all compile and the batch survives into the `.rknn`, but utilisation stays flat
+at ~11-12% and per-sample throughput does not move (~240-277 samples/s at every
+batch size) while latency scales linearly (3.8 -> 33.4 ms) -- the signature of
+RKNN executing batch items sequentially rather than batching them.
+
+**Where the fixed cost is, and what reduces it**
+([`overhead_probe_nanopc.py`](overhead_probe_nanopc.py)). Regressing latency
+against real NPU work gives `latency = 0.096 ms fixed + 0.051 ms per conv-layer`
+-- a ~0.1 ms host-side floor per inference, which is essentially the *entire*
+cost of these small graphs. Two measured levers, and only two:
+
+- **int8 `pass_through`** (`attr.pass_through = 1` with the model's native
+  dtype, skipping the per-call float<->int8 conversion): **-4.1%**.
+- **Run on a big core.** Pinning to CPU 0 costs **+35.8%**; pinning to CPU 6/7
+  (the A76s) instead is **~27% faster** than a little A55 core. This is not IRQ
+  avoidance -- all three NPU IRQs are on CPU0 -- it is the big/little cluster and
+  the `ondemand` governor, since the ~0.1 ms of submission work is
+  frequency-sensitive.
+
+`SCHED_FIFO` and realtime scheduling both landed inside the noise. None of this
+changes the harness's conclusions: the correctness result (bit-identical
+outputs) is unaffected, and the fixed cost still dwarfs what onnxsim's node
+reduction removes, which is why this harness claims correctness on real silicon
+and not throughput. Details in
+[`bench/RESULTS_nanopc_rk3588.md`](../../bench/RESULTS_nanopc_rk3588.md).
+
+The in-tree smoke test is [`tests/test_rknn3588_compat.py`](../../tests/test_rknn3588_compat.py)
+(it skips unless `RKNN_3588_HOST` is set), and
+`.github/workflows/rknn3588-integration.yml` runs it on a schedule against a
+board reached through the repository's Tailscale credentials.
+
+### Profiling is not available on this board
+
+`rknn-toolkit2` has real per-layer profiling (`init_runtime(perf_debug=True)`,
+`eval_perf()`, `accuracy_analysis()`, `eval_mem=True`), but none of it is
+reachable here, all verified directly:
+
+- `eval_perf()` raises `Not support in simulator environment` -- the PC
+  simulator has no NPU timing to report.
+- Reaching a real device requires **ADB or NTB**, not SSH. The host toolkit's
+  transport is ADB-based (`rknn_platform`: `adb_devices`, `add_adb_forward`,
+  `forward localabstract:transfer_proxy`), so `init_runtime(target="rk3588",
+  device_id=...)` cannot work over a network shell.
+- The board's `librknnrt.so` 2.3.0 does **not implement** the
+  `RKNN_QUERY_PERF_DETAIL` / `RKNN_QUERY_PERF_RUN` query codes: both are inside
+  the valid command range (`[0, 17]`) yet return `-5` (unsupported) even when
+  given correctly-sized structs. There is also no `rknn_set_perf_debug` export
+  to switch it on.
+
+`probe_nanopc_perf.py` reproduces this directly against the board. What the
+board *does* offer is coarse utilization only, via
+`/sys/kernel/debug/rknpu/{load,freq,power,volt}` -- no per-layer breakdown.
+
+Upgrading the runtime does not change this. The board runs `librknnrt.so`
+**2.3.0**; the newest runtime upstream publishes (from
+`rknn-toolkit2`'s `master` branch, since PyPI and the latest GitHub release are
+both still 2.3.2) is **2.3.2**. Side-loaded via
+`nanopc_rknn_runner.py --library` -- which leaves the system library untouched --
+it reports the same query range and the same `-5` (unsupported) for both perf
+codes, with the same 34 exported `rknn_*` symbols. It *does* run the board's
+models and produce bit-for-bit identical output, so it is a safe side-load, but
+per-layer profiling is absent from both builds. Note also that
+`rknn-toolkit-lite2` ships **no** `librknnrt.so` (it dlopens the host's), and
+its `rknn_perf` module is memory profiling only -- `collect_memory_detail`, no
+layer timing.
+
+The **driver** side has nothing newer either: the board already runs the newest
+vendor `rknpu` (v0.9.8). The newer mainline `accel/rocket` (Linux 6.18+) is a
+different stack that cannot load `.rknn` models at all, and
+[`rkopnu`](https://github.com/marfrit/rkopnu) -- which *does* present the vendor
+ioctl ABI so `librknnrt.so` works on mainline -- needs a mainline kernel with
+`CONFIG_DRM_ACCEL=y`, which this board's Rockchip BSP 6.1.141 kernel does not
+have (no `drivers/accel/` at all, and no kernel build tree). Either way, no
+driver change adds per-layer profiling, because that capability is absent from
+the runtime itself.
+
 ## Fidelity tiers (what this does and doesn't cover)
 
 This check runs `rknn-toolkit2`'s real converter and its **PC simulator**.
@@ -237,11 +391,16 @@ result with no device. Two things it deliberately does not do:
   original-vs-simplified through the *same* simulator build rather than
   asserting tight agreement with the CPU reference.
 - **Real RK35xx/RV1106 device numerics, and INT8 quantization accuracy.**
-  For on-device validation, `init_runtime(target=..., device_id=...)` needs a
-  connected board (over ADB/NPU-transfer) or `rknn-toolkit-lite2` running
-  directly on one -- neither is provisioned by this repository. Quantized
-  (`do_quantization=True`) accuracy also needs a representative calibration
-  dataset, which is out of scope for this graph-compatibility check.
+  `init_runtime(target=..., device_id=...)` needs a connected board (over
+  ADB/NPU-transfer) or `rknn-toolkit-lite2` running directly on one -- neither
+  is available in a generic CI job. Quantized (`do_quantization=True`) accuracy
+  also needs a representative calibration dataset, which is out of scope for
+  this graph-compatibility check.
+
+Real device numerics *are* covered by the separate NanoPC-T6 path above
+(`run_rknn3588_compat.py`), which runs both graphs on actual RK3588 silicon
+rather than the simulator -- but only against a board this repository can reach,
+so it stays out of the default matrix.
 
 ## Extending
 
