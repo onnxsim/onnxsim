@@ -182,6 +182,24 @@ the simplified models are byte-for-byte the same:
 pip3 install "onnxsim[rich]"
 ```
 
+#### Pre-release builds from TestPyPI
+
+Development builds from `master` are published to
+[TestPyPI](https://test.pypi.org/project/onnxsim/) by the daily CI workflow
+when there are new commits, or on demand. To try the latest available
+pre-release, install the required dependency from PyPI first, then install
+onnxsim from TestPyPI:
+
+```sh
+python3 -m pip install --upgrade onnx
+python3 -m pip install --upgrade --pre --no-deps --index-url https://test.pypi.org/simple/ onnxsim
+```
+
+`--pre` allows development versions and `--upgrade` updates an existing
+installation. `--no-deps` keeps dependency downloads on PyPI, since TestPyPI
+has a separate package collection. These builds contain unreleased changes;
+use the regular PyPI installation above for stable releases.
+
 ### Node.js version
 
 The same WebAssembly build backing the web version above is also published as
