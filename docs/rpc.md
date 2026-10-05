@@ -131,6 +131,70 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
   use the dependency-free native worker under `tools/onnx-remote` for the binary v5 transport
   and remote EP path instead.
 
+### TPU-MLIR compilation and SG2002 execution
+
+The Python RPC server can also compile a static-shape float32 ONNX model with TPU-MLIR, then
+send the CVI model and input tensors to an SG2002 over SSH. The server host needs the TPU-MLIR
+tools and Paramiko; the board needs its matching CVI runtime and `model_runner`.
+The SG2002 target is compiled as `cv181x` with BF16 compute and float32 I/O by default. Set the
+board password in the environment variable named by `--tpu-password-env` (default
+`TPU_MLIR_SSH_PASSWORD`):
+
+```sh
+export TPU_MLIR_SSH_PASSWORD="$BOARD_PASSWORD"
+python -m onnxsim.rpc server --host 127.0.0.1 --port 9090 --key sg2002 \
+  --tpu-ssh-host "$BOARD_ADDRESS" --tpu-ssh-user root
+```
+
+Connect from a client and select `runtime="tpu_mlir"` when loading the model:
+
+```python
+remote = rpc.connect("127.0.0.1", 9090, key="sg2002")
+model = remote.load_model("model.onnx", runtime="tpu_mlir")
+outputs = model.run({"input": input_array})
+timing = model.time_evaluator({"input": input_array}, number=1000, repeat=3)
+print(timing.median * 1e3, "ms on the board")
+```
+
+For SG2002 engine counters, use `pmu=True` in place of a normal timing run:
+
+```python
+profile = model.time_evaluator({"input": input_array}, number=10, repeat=3, pmu=True)
+print(profile.stats["tiu_ms"], profile.stats["tdma_ms"], profile.stats["inference_ms"])
+```
+
+This enables `TPU_ENABLE_PMU` on the board and returns median TIU, TDMA, and inference
+intervals, plus clock, bandwidth, and engine activity fields in `profile.stats`. One initial run
+per repeat is discarded as warm-up. `profile.stats["samples"]` contains every remaining
+per-inference sample, including raw TIU, TDMA, and inference tick counts. PMU runs have profiling
+overhead; their `results` report the PMU inference interval and should not be compared with normal
+wall/device timing.
+
+For INT8, create a calibration table with TPU-MLIR from representative input samples and
+provide its path on the server:
+
+```python
+model = remote.load_model(
+    "model.onnx",
+    runtime="tpu_mlir",
+    options={
+        "quantize": "INT8",
+        "calibration_table": "/server/path/model-cali.table",
+        "opt": 1,  # TPU-MLIR layer-group scheduling level (1–3)
+        "do_winograd": True,
+        "matmul_perchannel": True,
+    },
+)
+```
+
+Compilation happens once at `load_model`; model files are removed from the board when the
+session closes. `time_evaluator` uses `model_runner`'s device timer, so SSH transfer and process
+startup are excluded from the reported inference time. The current backend requires fixed,
+positive input dimensions and float32 model inputs. `--tpu-python`, `--tpu-model-transform`,
+and `--tpu-model-deploy` select the compiler Python environment and tool scripts, including a
+source checkout's scripts. Board artifacts use `/data/onnxsim-tpu-rpc` by default; override it
+with `--tpu-remote-dir` if the board stores model files elsewhere.
+
 ## API
 
 | Call | Meaning |
@@ -141,7 +205,7 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
 | `Session.upload(path_or_bytes, name=None)` | store a file in the server workspace (name sanitised) |
 | `Session.load_model(name/path/bytes/ModelProto, providers=None)` | returns a `RemoteModel` |
 | `RemoteModel.run(inputs)` | outputs by name as NumPy arrays |
-| `RemoteModel.time_evaluator(inputs, number, repeat, random_inputs=False, seed=None)` | `ProfileResult` (`results`, `mean`, `median`, `min`, `max`, `std`), seconds per call; random mode accepts arrays as templates or `rpc.RandomInput(shape, dtype, low, high)` and generates values on the server |
+| `RemoteModel.time_evaluator(inputs, number, repeat, random_inputs=False, seed=None, pmu=False)` | `ProfileResult` (`results`, `mean`, `median`, `min`, `max`, `std`), seconds per call; random mode accepts arrays as templates or `rpc.RandomInput(shape, dtype, low, high)`; `pmu=True` requests SG2002 TPU counters |
 | `Session.run(model, inputs)` | one-shot run without keeping a handle |
 | `rpc.remote_executor(session)` | context manager: `onnxsim.simplify` folds constants remotely |
 
