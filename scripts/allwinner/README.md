@@ -201,6 +201,14 @@ SoCs (T527, ...) link their `libVIPlite.so` instead.
 
 The worker listens on **127.0.0.1** by default (`--host 0.0.0.0` to change): it submits whatever NBG a client sends to the NPU.
 
+Robustness, tested on the A733: 140 back-to-back network replacements (`load_compiled` with a new artifact, alternating a small network and
+YOLOv5s) gave 0 failures, and the worker's memory stayed flat after the first 70 (3.8 MB idle -> 33.9 MB, then unchanged to 140; file
+descriptors and threads unchanged). Garbage bytes, a valid header declaring an absurd length, a truncated header and an abrupt close
+mid-request all leave the worker answering. At most 8 requests are in flight; beyond that it replies "busy". Silent connections used to
+hold those 8 slots forever, so any peer that could reach the port could lock everyone else out; each socket call now has an idle limit
+(`--io-timeout-ms`, default 30 s, per recv/send so slow transfers that keep progressing are unaffected), and the silent connections are
+dropped by the server and the worker recovers by itself. There is no authentication: keep it on loopback or a trusted network.
+
 ## Run a model
 
 ```bash

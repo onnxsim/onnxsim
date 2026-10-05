@@ -689,6 +689,7 @@ int main(int argc, char** argv) {
   int fscale = 0;
   const char* bench_path = nullptr;
   int bench_iters = 10, bench_threads = 1;
+  int io_timeout_ms = 30000;  // idle limit per socket call; <= 0 disables it
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--host" && i + 1 < argc) host = argv[++i];
@@ -697,10 +698,11 @@ int main(int argc, char** argv) {
     else if (a == "--threads" && i + 1 < argc) bench_threads = std::max(1, std::atoi(argv[++i]));
     else if (a == "--prewarm" && i + 1 < argc) g_prewarm.pct = std::min(95, std::max(0, std::atoi(argv[++i])));
     else if (a == "--prewarm-cpu" && i + 1 < argc) g_prewarm.cpu = std::atoi(argv[++i]);
+    else if (a == "--io-timeout-ms" && i + 1 < argc) io_timeout_ms = std::atoi(argv[++i]);
     else if (a == "--cache-dir" && i + 1 < argc) g_cache_dir = argv[++i];
     else if (a == "--bench" && i + 1 < argc) { bench_path = argv[++i]; if (i + 1 < argc && argv[i + 1][0] != '-') bench_iters = std::atoi(argv[++i]); }
     else if (a == "--help") {
-      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] [--prewarm PCT [--prewarm-cpu N]] | --bench FILE.nb [ITERS] [--threads N]\n";
+      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] [--prewarm PCT [--prewarm-cpu N]] [--io-timeout-ms MS (default 30000)] | --bench FILE.nb [ITERS] [--threads N]\n";
       return 0;
     } else { std::cerr << "unknown argument: " << a << '\n'; return 2; }
   }
@@ -734,8 +736,11 @@ int main(int argc, char** argv) {
         continue;
       }
       ++in_flight;
-      std::thread([fd, &in_flight] {
+      std::thread([fd, &in_flight, io_timeout_ms] {
         Request request; Response response; std::string error;
+        // A silent peer must not hold one of the kMaxInFlight slots forever. The deadline applies to each recv/send call, so a slow
+        // transfer that keeps making progress is unaffected.
+        set_socket_io_timeout(fd, io_timeout_ms);
         if (!receive_request(fd, request, error)) response.error = error;
         else response = execute(request);
         if (!send_response(fd, response, error)) std::cerr << "response failed: " << error << '\n';
