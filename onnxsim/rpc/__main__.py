@@ -62,7 +62,8 @@ def main() -> None:
         help="default activation calibration table, required when compiling INT8",
     )
     server.add_argument(
-        "--tpu-python", default=sys.executable,
+        "--tpu-python",
+        default=sys.executable,
         help="Python environment containing the TPU-MLIR tools",
     )
     server.add_argument("--tpu-model-transform", default="model_transform.py")

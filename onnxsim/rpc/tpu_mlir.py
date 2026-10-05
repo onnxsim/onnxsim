@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -58,7 +59,7 @@ class TpuMlirRunner:
         self.chip = str(self.options.get("chip", "cv181x"))
         self.quantize = str(self.options.get("quantize", "BF16"))
         self.calibration_table = self.options.get("calibration_table")
-        self.python = str(self.options.get("python", os.sys.executable))
+        self.python = str(self.options.get("python", sys.executable))
         self.transform = shutil.which(
             str(self.options.get("model_transform", "model_transform.py"))
         ) or str(self.options.get("model_transform", "model_transform.py"))
@@ -72,7 +73,9 @@ class TpuMlirRunner:
         self.batch_size = input_shapes[0][0] if input_shapes else 1
         self.output_names = [value.name for value in self.model.graph.output]
         if not self.input_names or not self.output_names:
-            raise proto.RPCError("TPU-MLIR requires at least one model input and output")
+            raise proto.RPCError(
+                "TPU-MLIR requires at least one model input and output"
+            )
 
         self.model_id = uuid.uuid4().hex
         self.remote_model = f"{self.remote_dir}/{self.model_id}.cvimodel"
@@ -128,9 +131,7 @@ class TpuMlirRunner:
                     "TPU-MLIR deploy option 'opt' must be 1, 2, or 3"
                 ) from error
             if deploy_opt not in (1, 2, 3):
-                raise proto.RPCError(
-                    "TPU-MLIR deploy option 'opt' must be 1, 2, or 3"
-                )
+                raise proto.RPCError("TPU-MLIR deploy option 'opt' must be 1, 2, or 3")
             deploy_command.extend(["--opt", str(deploy_opt)])
         for name, flag in (
             ("do_winograd", "--do_winograd"),
@@ -190,7 +191,7 @@ class TpuMlirRunner:
 
     def _connect(self) -> None:
         try:
-            import paramiko
+            import paramiko  # type: ignore[import-untyped]
         except ImportError as error:
             raise proto.RPCError(
                 "paramiko is required for the TPU-MLIR board connection"
@@ -250,7 +251,9 @@ class TpuMlirRunner:
         missing = [name for name in self.input_names if name not in arrays]
         extra = [name for name in arrays if name not in self.input_names]
         if missing or extra:
-            raise proto.RPCError(f"input names mismatch (missing={missing}, extra={extra})")
+            raise proto.RPCError(
+                f"input names mismatch (missing={missing}, extra={extra})"
+            )
         for name in self.input_names:
             array = np.asarray(arrays[name])
             if array.dtype != np.float32:
@@ -264,9 +267,10 @@ class TpuMlirRunner:
                 )
             arrays[name] = np.ascontiguousarray(array)
 
-        with self._board_lock, tempfile.TemporaryDirectory(
-            prefix="onnxsim-tpu-run-"
-        ) as temp:
+        with (
+            self._board_lock,
+            tempfile.TemporaryDirectory(prefix="onnxsim-tpu-run-") as temp,
+        ):
             input_path = Path(temp) / "input.npz"
             output_path = Path(temp) / "output.npz"
             np.savez(input_path, **arrays)
@@ -369,7 +373,7 @@ class TpuMlirRunner:
                 float(np.median([row["inference_ms"] for row in rows])) / 1000.0
             )
         keys = all_rows[0].keys()
-        stats = {
+        stats: dict[str, Any] = {
             key: float(np.median([row[key] for row in all_rows])) for key in keys
         }
         stats.update(

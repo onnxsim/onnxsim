@@ -376,7 +376,9 @@ def _close(runner) -> None:
         close()
 
 
-def _make_runner(header: Dict[str, Any], model_bytes: bytes, work_dir: str, server=None):
+def _make_runner(
+    header: Dict[str, Any], model_bytes: bytes, work_dir: str, server=None
+):
     runtime = header.get("runtime") or "onnxruntime"
     if runtime == "onnxruntime":
         return _Runner(
