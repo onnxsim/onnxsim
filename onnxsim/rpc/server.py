@@ -376,7 +376,7 @@ def _close(runner) -> None:
         close()
 
 
-def _make_runner(header: Dict[str, Any], model_bytes: bytes, work_dir: str):
+def _make_runner(header: Dict[str, Any], model_bytes: bytes, work_dir: str, server=None):
     runtime = header.get("runtime") or "onnxruntime"
     if runtime == "onnxruntime":
         return _Runner(
@@ -386,8 +386,25 @@ def _make_runner(header: Dict[str, Any], model_bytes: bytes, work_dir: str):
         return _TinygradProxy(
             model_bytes, header.get("device"), header.get("options"), work_dir
         )
+    if runtime == "tpu_mlir":
+        from .tpu_mlir import TpuMlirRunner
+
+        if server is None:
+            raise proto.RPCError("TPU-MLIR runner requires an RPC server configuration")
+        options = dict(server.tpu_mlir_options)
+        model_options = header.get("options") or {}
+        for name in (
+            "quantize",
+            "calibration_table",
+            "opt",
+            "do_winograd",
+            "matmul_perchannel",
+        ):
+            if name in model_options:
+                options[name] = model_options[name]
+        return TpuMlirRunner(model_bytes, options, work_dir)
     raise proto.RPCError(
-        f"unknown runtime {runtime!r} (expected 'onnxruntime' or 'tinygrad')"
+        f"unknown runtime {runtime!r} (expected 'onnxruntime', 'tinygrad' or 'tpu_mlir')"
     )
 
 
@@ -475,7 +492,7 @@ class _Handler(socketserver.BaseRequestHandler):
                     os.path.join(server.work_dir, _sanitize(header["name"])), "rb"
                 ) as f:
                     data = f.read()
-            runner = _make_runner(header, data, server.work_dir)
+            runner = _make_runner(header, data, server.work_dir, server)
             handle = counter + 1
             models[handle] = runner
             return {"handle": handle}, []
@@ -499,6 +516,18 @@ class _Handler(socketserver.BaseRequestHandler):
                 max(int(header.get("number", 1)), 1),
                 max(int(header.get("repeat", 1)), 1),
             )
+            if header.get("pmu"):
+                pmu_time = getattr(runner, "pmu_time", None)
+                if pmu_time is None:
+                    raise proto.RPCError(
+                        "PMU timing is only supported by the TPU-MLIR SG2002 runtime"
+                    )
+                results, stats = pmu_time(inputs, number, repeat)
+                return {
+                    "results": results,
+                    "median": statistics.median(results),
+                    "stats": stats,
+                }, []
             if hasattr(runner, "time"):
                 results, stats = runner.time(inputs, number, repeat)
                 return {
@@ -516,7 +545,7 @@ class _Handler(socketserver.BaseRequestHandler):
             return {"results": results, "median": statistics.median(results)}, []
         if op == "run_once":
             # One-shot execution without a handle: the model rides in blob 0, inputs after it.
-            runner = _make_runner(header, blobs[0], server.work_dir)
+            runner = _make_runner(header, blobs[0], server.work_dir, server)
             try:
                 outputs = runner.run(proto.decode_tensors(header["tensors"], blobs[1:]))
             finally:
@@ -574,6 +603,7 @@ class RPCServer(socketserver.ThreadingTCPServer):
         verbose: bool = False,
         xdna_python: Optional[str] = None,
         vitis_python: Optional[str] = None,
+        tpu_mlir_options: Optional[Dict[str, Any]] = None,
     ):
         super().__init__((host, port), _Handler)
         self.key = key
@@ -583,6 +613,7 @@ class RPCServer(socketserver.ThreadingTCPServer):
         self.verbose = verbose
         self.xdna_python = xdna_python or sys.executable
         self.vitis_python = vitis_python or self.xdna_python
+        self.tpu_mlir_options = dict(tpu_mlir_options or {})
         self.xdna_lock = threading.Lock()
         self.stats: Dict[str, int] = {}
         self._thread: Optional[threading.Thread] = None
@@ -601,6 +632,11 @@ class RPCServer(socketserver.ThreadingTCPServer):
             "python": sys.version.split()[0],
             "xdna_python": self.xdna_python,
             "vitis_python": self.vitis_python,
+            "tpu_mlir": {
+                "enabled": bool(self.tpu_mlir_options.get("ssh_host")),
+                "chip": self.tpu_mlir_options.get("chip", "cv181x"),
+                "quantize": self.tpu_mlir_options.get("quantize", "BF16"),
+            },
             "onnx": onnx.__version__,
         }
         try:

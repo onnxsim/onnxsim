@@ -126,11 +126,14 @@ class RemoteModel:
         repeat: int = 3,
         random_inputs: bool = False,
         seed: Optional[int] = None,
+        pmu: bool = False,
     ) -> ProfileResult:
         """Time server-side calls, optionally generating input values on the server.
 
         In random mode, ``inputs`` supplies only input names, shapes and dtypes. The
         server generates one seeded random set and reuses it for this timing request.
+        Set ``pmu=True`` for TPU-MLIR on SG2002 to return TIU/GDMA hardware counters;
+        those runs use the TPU PMU inference interval instead of normal wall timing.
         """
         specs: List[Dict[str, Any]]
         blobs: List[bytes]
@@ -153,6 +156,8 @@ class RemoteModel:
             header["random_inputs"] = True
             if seed is not None:
                 header["seed"] = int(seed)
+        if pmu:
+            header["pmu"] = True
         reply, _ = self._session._call(header, blobs)
         return ProfileResult(list(reply["results"]), reply.get("stats"))
 
@@ -193,12 +198,14 @@ class Session:
         single_threaded: bool = False,
         runtime: str = "onnxruntime",
         device: Optional[str] = None,
-        options: Optional[Dict[str, int]] = None,
+        options: Optional[Dict[str, Any]] = None,
     ) -> RemoteModel:
         """Load a model on the server: an uploaded file name, a path, bytes or a ``ModelProto``.
 
         ``runtime="tinygrad"`` runs it through tinygrad's ONNX frontend on ``device`` (a tinygrad
         device name such as ``"NV"`` or ``"CPU"``) with codegen ``options`` such as ``{"BEAM": 2}``.
+        ``runtime="tpu_mlir"`` compiles it on a configured TPU-MLIR server and runs the resulting
+        CVI model on its configured SG2002 board.
         """
         header: Dict[str, Any] = {
             "op": "load_model",
@@ -222,7 +229,7 @@ class Session:
         providers: Optional[Sequence[str]] = None,
         runtime: str = "onnxruntime",
         device: Optional[str] = None,
-        options: Optional[Dict[str, int]] = None,
+        options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, np.ndarray]:
         """One-shot: send the model with its inputs, get the outputs (no handle kept)."""
         specs, blobs = proto.encode_tensors(inputs)
