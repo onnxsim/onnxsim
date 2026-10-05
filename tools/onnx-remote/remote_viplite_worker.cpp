@@ -411,7 +411,20 @@ Response execute(const Request& request) {
   if (st != VIP_SUCCESS) { response.error = "vip_run_network failed (" + std::to_string(st) + ")"; return response; }
   response.outputs.resize(net.outputs.size());
   for (size_t i = 0; i < net.outputs.size(); ++i) read_output(net.outputs[i], response.outputs[i]);
-  add_profile(response, request, "viplite_run", run_begin, run_end - run_begin, "NPU execution");
+  add_profile(response, request, "viplite_run", run_begin, run_end - run_begin, "NPU execution (wall, around vip_run_network)");
+  if (request.profiling != ProfilingLevel::Off) {
+    // The driver's own counters for this run: hardware inference time and NPU cycles (the ratio is the effective NPU clock).
+    // They are whole-network figures; VIPLite exposes no per-layer timing.
+    vip_inference_profile_t hw{};
+    if (vip_query_network(net.network, VIP_NETWORK_PROP_PROFILING, &hw) == VIP_SUCCESS) {
+      vip_uint32_t layers = 0;
+      vip_query_network(net.network, VIP_NETWORK_PROP_LAYER_COUNT, &layers);
+      std::ostringstream d;
+      d << "cycles=" << hw.total_cycle << " layers=" << layers;
+      if (hw.inference_time) d << " clock_mhz=" << static_cast<double>(hw.total_cycle) / hw.inference_time;
+      add_profile(response, request, "viplite_hw", run_begin, hw.inference_time, d.str());
+    }
+  }
   if (request.profiling == ProfilingLevel::Detailed) {
     add_profile(response, request, "viplite_input", fill_begin, run_begin - fill_begin, "quantize + upload inputs");
     add_profile(response, request, "viplite_output", run_end, now_us() - t0 - run_end, "dequantize outputs");
@@ -480,6 +493,7 @@ int bench(const char* path, int iters) {
   auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
   std::sort(ms.begin(), ms.end());
   std::cout << "run (incl. quantize/IO) median " << median(ms) << " ms, min " << ms.front() << " ms, max " << ms.back() << " ms over " << iters << " iters\n";
+  for (const ProfileEvent& e : last.profile) if (e.name == "viplite_hw") std::cout << "  hw counters: " << e.detail << '\n';
   for (const auto& [name, v] : phases)
     std::cout << "  " << name << ": median " << median(v) << " ms, min " << *std::min_element(v.begin(), v.end()) << " ms\n";
   for (size_t i = 0; i < last.outputs.size(); ++i) {
@@ -498,21 +512,28 @@ int bench(const char* path, int iters) {
 int main(int argc, char** argv) {
   uint16_t port = 39503;
   std::string host = "127.0.0.1";
+  int fscale = 0;
   const char* bench_path = nullptr;
   int bench_iters = 10;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--host" && i + 1 < argc) host = argv[++i];
     else if (a == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoul(argv[++i]));
+    else if (a == "--fscale" && i + 1 < argc) fscale = std::atoi(argv[++i]);
     else if (a == "--cache-dir" && i + 1 < argc) g_cache_dir = argv[++i];
     else if (a == "--bench" && i + 1 < argc) { bench_path = argv[++i]; if (i + 1 < argc && argv[i + 1][0] != '-') bench_iters = std::atoi(argv[++i]); }
     else if (a == "--help") {
-      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] | --bench FILE.nb [ITERS]\n";
+      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] | --bench FILE.nb [ITERS]\n";
       return 0;
     } else { std::cerr << "unknown argument: " << a << '\n'; return 2; }
   }
   std::signal(SIGPIPE, SIG_IGN);
   if (vip_status_e st = vip_init(); st != VIP_SUCCESS) { std::cerr << "vip_init failed: " << st << " (is /dev/vipcore accessible?)\n"; return 1; }
+  if (fscale) {  // scale the NPU clock (percent of full); useful to tell compute-bound from memory-bound networks
+    vip_power_frequency_t f{static_cast<vip_uint8_t>(fscale)};
+    const vip_status_e st = vip_power_management(0, VIP_POWER_PROPERTY_SET_FREQUENCY, &f);
+    std::cerr << "NPU clock scale " << fscale << "%: " << (st == VIP_SUCCESS ? "ok" : "failed " + std::to_string(st)) << '\n';
+  }
   int rc = 0;
   if (bench_path) rc = bench(bench_path, std::max(1, bench_iters));
   else {

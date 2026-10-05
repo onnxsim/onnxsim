@@ -57,6 +57,30 @@ so a network must be compiled for the right NPU generation.
 Feeding a uint8 network its native `UINT8` tensor skips input quantization. Over `adb forward` the float32 tensors dominate
 wall time for large models (YOLOv5s: ~440 ms RPC-inclusive); run the client on the device or on the same LAN for real numbers.
 
+## Profiling: what exists
+
+With `--profile` (Summary) or `Detailed`, `run_compiled` returns these events; `--bench` prints their medians.
+
+| event | meaning |
+|---|---|
+| `viplite_run` | wall time around `vip_run_network` (includes driver submit/wait) |
+| `viplite_hw` | the driver's own counters for that run (`VIP_NETWORK_PROP_PROFILING`): hardware inference time, and in `detail` the NPU `cycles`, `layers` and the implied `clock_mhz` |
+| `viplite_input` / `viplite_output` (Detailed) | float32 quantize+upload and dequantize in the worker |
+
+On the A733 the effective NPU clock is about **846 MHz** on the big networks (YOLOv5s: 19.1 M cycles, 73 layers, 22.8 ms driver time vs
+23.4 ms wall; RetinaFace 6.4 M cycles / 77 layers; YOLOv5n 8.2-9.7 M / 76; deepHeadPose 0.19 M / 18). For tiny networks `clock_mhz`
+reads lower (680-800) because the driver's time includes a fixed per-run cost.
+
+What is **not** available, checked on this device:
+- **Per-layer timing or counters.** VIPLite reports whole-network time and cycles plus a layer count, nothing per layer. The library
+  has an internal profiling hook but no documented switch; the Vivante-style debug environment variables
+  (`VIV_VX_PROFILE`, `VIV_VX_DEBUG_LEVEL`, ...) change nothing here. Per-layer data would need the vendor's offline tools
+  (Acuity simulation / profiling in the Docker image) rather than the runtime.
+- **Memory bandwidth, utilization, DRAM traffic.** No counters exposed.
+- **NPU clock control.** `vip_power_management(SET_FREQUENCY)` returns `VIP_ERROR_NOT_SUPPORTED` (-4) on this driver; the clock stays
+  under the kernel's devfreq (not readable from the adb shell). `--fscale N` therefore reports `failed -4` and changes nothing, so a
+  compute-bound vs memory-bound frequency sweep is not possible from userspace.
+
 ## Build and deploy the runner
 
 The VIPLite headers and `libNBGlinker.so` come from Allwinner's public model zoo
