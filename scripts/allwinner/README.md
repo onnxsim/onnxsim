@@ -71,8 +71,29 @@ On the A733 the effective NPU clock is about **846 MHz** on the big networks (YO
 23.4 ms wall; RetinaFace 6.4 M cycles / 77 layers; YOLOv5n 8.2-9.7 M / 76; deepHeadPose 0.19 M / 18). For tiny networks `clock_mhz`
 reads lower (680-800) because the driver's time includes a fixed per-run cost.
 
+### System-level profile from outside the runtime
+
+`scripts/allwinner/trace_npu.py` (needs `pip install perfetto` on the host) records a Perfetto trace on the device while a network
+runs and summarizes it. The adb shell can't enable ftrace directly (tracefs is read-only) but the `perfetto` service can, and it
+shows things the sysfs nodes hide. Measured on the A733 with YOLOv5s (the trace is also viewable in ui.perfetto.dev):
+
+| observation | value |
+|---|---|
+| NPU interrupt (`vipcore_0`, also in `/proc/interrupts`) | exactly one per inference (81 runs -> 81 IRQs), handler ~11-17 us |
+| NPU temperature (`npu_thermal_zone`; not readable via sysfs from the shell) | ~40 C idle -> 43-44 C after 80 back-to-back runs |
+| NPU clock events (`devfreq`, `clk_set_rate`) | none during runs: the clock is not changed through the Linux clock framework (consistent with a steady ~846 MHz) |
+| worker thread while the NPU runs | asleep (about 22 ms of each call), no spin-wait; on a CPU only for the float32 conversion and submit |
+| completion IRQ -> worker running again | median ~250-350 us (p90 ~350-440): most of the gap between `viplite_run` (23.2 ms) and `viplite_hw` (22.7 ms) |
+| which core runs the worker | unpinned: 80% on little cores (capacity 399; the A733 here has 6 little + 2 big cores), call = 44-47 ms; pinned to a big core (`taskset 80`): 39 ms |
+
+The takeaways from that: the NPU time itself (22.7 ms) does not change with CPU placement, but the CPU-side float32 conversion does
+(output dequantize 14-17 ms -> 11.8 ms on a big core), so **pin the worker to a big core** (`taskset 80 ./onnx-remote-viplite-worker ...`)
+or feed native uint8 where the network allows it. And since the worker is idle while the NPU runs and the NPU is idle while the worker
+converts, overlapping conversion of the next request with the current NPU run would hide most of the ~16 ms of conversion; that is not
+implemented. Tracing itself slows the CPU-side phases (not the NPU time), so use `bench.py` for timings and this for the system view.
+
 What is **not** available, checked on this device:
-- **Per-layer timing or counters.** VIPLite reports whole-network time and cycles plus a layer count, nothing per layer. The library
+- **Per-layer timing or counters** (neither from VIPLite nor from the trace). VIPLite reports whole-network time and cycles plus a layer count, nothing per layer. The library
   has an internal profiling hook but no documented switch; the Vivante-style debug environment variables
   (`VIV_VX_PROFILE`, `VIV_VX_DEBUG_LEVEL`, ...) change nothing here. Per-layer data would need the vendor's offline tools
   (Acuity simulation / profiling in the Docker image) rather than the runtime.
