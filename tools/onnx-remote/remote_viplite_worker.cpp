@@ -14,6 +14,7 @@
 //
 // Builds against the VIPLite SDK's headers and libNBGlinker.so (see the CMake options); the headers are not in this repo.
 #include "remote_transport.h"
+#include "viplite_convert.h"
 
 #include <vip_lite.h>
 
@@ -47,6 +48,7 @@
 #include <unistd.h>
 
 using namespace onnx_remote;
+using namespace viplite_convert;
 namespace fs = std::filesystem;
 
 namespace {
@@ -182,41 +184,6 @@ size_t format_bytes(vip_enum format) {
   }
 }
 
-float half_to_float(uint16_t h) {
-  const uint32_t sign = (h & 0x8000u) << 16;
-  uint32_t exp = (h >> 10) & 0x1f, mant = h & 0x3ff, bits;
-  if (exp == 0) {
-    if (mant == 0) bits = sign;
-    else {  // subnormal
-      exp = 127 - 15 + 1;
-      while (!(mant & 0x400)) { mant <<= 1; --exp; }
-      bits = sign | (exp << 23) | ((mant & 0x3ff) << 13);
-    }
-  } else if (exp == 31) bits = sign | 0x7f800000u | (mant << 13);
-  else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-  float f; std::memcpy(&f, &bits, 4); return f;
-}
-
-uint16_t float_to_half(float f) {
-  uint32_t x; std::memcpy(&x, &f, 4);
-  const uint32_t sign = (x >> 16) & 0x8000u;
-  int32_t exp = static_cast<int32_t>((x >> 23) & 0xff) - 127 + 15;
-  uint32_t mant = x & 0x7fffff;
-  if (((x >> 23) & 0xff) == 0xff) return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 0x200u : 0u));
-  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
-  if (exp <= 0) {
-    if (exp < -10) return static_cast<uint16_t>(sign);
-    mant |= 0x800000u;
-    const uint32_t shift = static_cast<uint32_t>(14 - exp);
-    uint32_t half = mant >> shift;
-    if ((mant >> (shift - 1)) & 1u) ++half;
-    return static_cast<uint16_t>(sign | half);
-  }
-  uint32_t half = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
-  if (mant & 0x1000u) ++half;  // round to nearest; a carry into the exponent is the correct result
-  return static_cast<uint16_t>(half);
-}
-
 // Range of the integer formats, for saturating quantization.
 bool int_range(vip_enum format, double& lo, double& hi) {
   switch (format) {
@@ -267,24 +234,6 @@ double quantize(double x, const vip_buffer_create_params_t& p) {
   double lo, hi;
   if (int_range(p.data_format, lo, hi)) q = std::min(hi, std::max(lo, q));
   return q;
-}
-
-// Bulk converters. The per-element helpers above are exact but branch on the format per value; these hoist the format, scale and range
-// out of the loop so the compiler can vectorize the 1-2 byte formats that real networks use.
-struct QuantParams { float scale, zero; float lo, hi; };  // real -> q: clamp(rint(x / scale + zero))
-
-template <typename T>
-void quantize_bulk(const float* src, T* dst, uint64_t n, const QuantParams& q) {
-  const float inv = 1.0f / q.scale;
-  for (uint64_t i = 0; i < n; ++i) {
-    float v = std::nearbyintf(src[i] * inv + q.zero);
-    dst[i] = static_cast<T>(std::min(q.hi, std::max(q.lo, v)));
-  }
-}
-
-template <typename T>
-void dequantize_bulk(const T* src, float* dst, uint64_t n, const QuantParams& q) {
-  for (uint64_t i = 0; i < n; ++i) dst[i] = (static_cast<float>(src[i]) - q.zero) * q.scale;
 }
 
 // The affine/DFP/none triple expressed as one (scale, zero) pair: DFP is scale 2^-pos with zero 0, "none" is the identity.

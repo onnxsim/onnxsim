@@ -237,6 +237,11 @@ if (BUILD_TESTING)
   target_link_libraries(onnx-remote-transport-test PRIVATE onnx_remote_transport)
   add_test(NAME onnx-remote-transport-roundtrip
            COMMAND onnx-remote-transport-test)
+
+  # The VIPLite worker's half-float and quantize/dequantize routines; header-only, so no SDK or device is needed.
+  add_executable(onnx-remote-viplite-convert-test viplite_convert_test.cpp)
+  add_test(NAME onnx-remote-viplite-convert
+           COMMAND onnx-remote-viplite-convert-test)
 endif()
 
 if (ONNX_REMOTE_AXCL)

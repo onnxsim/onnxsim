@@ -14,7 +14,10 @@ V853 and friends. Two pieces, both plugged into the existing `onnx-remote` compi
 **Verified on hardware** (iPlay 70 S tablet, A733, Android 15, adb shell, no root): the runner builds with the NDK, opens
 `/dev/vipcore` as the unprivileged shell user, loads and runs Allwinner's shipped `.nb` files, and serves
 `capabilities` / `load_compiled` / `run_compiled` over TCP to the stock `onnx-remote-client` and `onnx-remote-compiler`
-(passthrough mode). Bad artifacts and wrong input sizes come back as errors without killing the worker.
+(passthrough mode). Bad artifacts and wrong input sizes come back as errors without killing the worker. The worker's conversion math
+(`tools/onnx-remote/viplite_convert.h`: half-float, affine/fixed-point quantize and dequantize, saturation, ties-to-even) is unit-tested
+on the host without any SDK (`onnx-remote-viplite-convert` under ctest), and the half-float encoder was also cross-checked against numpy's
+`float16` on 13.5 M values; that test found and fixed a round-half-up bug (ties must go to even).
 
 **Not verified: the converter against real Acuity.** Acuity is not publicly downloadable (Allwinner distributes it as a Docker image
 through its customer portal), so `compile_nbg.py` has only been exercised against a fake `pegasus`
