@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <condition_variable>
 #include <map>
@@ -463,6 +464,47 @@ void read_output(const Port& port, Tensor& out, std::vector<float>& spare) {
   }
 }
 
+// ONNX TensorProto dtype for a buffer format that can travel raw, or 0 when the output has to be converted to float instead.
+uint8_t onnx_dtype_of(vip_enum fmt) {
+  switch (fmt) {
+    case VIP_BUFFER_FORMAT_UINT8: return kUint8;
+    case VIP_BUFFER_FORMAT_INT8: case VIP_BUFFER_FORMAT_CHAR: return kInt8;
+    case VIP_BUFFER_FORMAT_INT16: return kInt16;
+    case VIP_BUFFER_FORMAT_FP16: return kFloat16;
+    case VIP_BUFFER_FORMAT_INT32: return 6;
+    default: return 0;
+  }
+}
+
+// Output in the network's own format (run_compiled_native): the raw bytes, a quarter of the float32 size for a uint8/int8 network and no
+// dequantize on the device. Outputs whose format has no raw dtype (FP32, BF16, ...) come back as float32 as usual.
+void read_output_native(const Port& port, Tensor& out, std::vector<float>& spare) {
+  const uint8_t dtype = onnx_dtype_of(port.params.data_format);
+  if (!dtype) { read_output(port, out, spare); return; }
+  vip_flush_buffer(port.buffer, VIP_BUFFER_OPER_TYPE_INVALIDATE);
+  out.dtype = dtype;
+  for (int k = static_cast<int>(port.params.num_of_dims) - 1; k >= 0; --k) out.shape.push_back(port.params.sizes[k]);
+  out.raw_data.assign(port.host, port.host + port.bytes);
+}
+
+// What a client needs to turn a native output back into real values: real = (q - zero_point) * scale (affine), real = q * 2^-fixed_point_pos
+// (dynamic fixed point), or q as is.
+std::string native_manifest(const std::vector<Port>& outputs) {
+  std::ostringstream m;
+  m << std::setprecision(9);  // max_digits10 for float: the default 6 digits would make the client's scale differ from the device's
+  m << "{\"outputs\":[";
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    const auto& p = outputs[i].params;
+    m << (i ? "," : "") << "{\"name\":\"" << outputs[i].name << "\",\"native\":" << (onnx_dtype_of(p.data_format) ? "true" : "false");
+    if (p.quant_format == VIP_BUFFER_QUANTIZE_TF_ASYMM) m << ",\"quant\":\"affine\",\"scale\":" << p.quant_data.affine.scale << ",\"zero_point\":" << p.quant_data.affine.zeroPoint;
+    else if (p.quant_format == VIP_BUFFER_QUANTIZE_DYNAMIC_FIXED_POINT) m << ",\"quant\":\"dfp\",\"fixed_point_pos\":" << p.quant_data.dfp.fixed_point_pos;
+    else m << ",\"quant\":\"none\"";
+    m << "}";
+  }
+  m << "]}";
+  return m.str();
+}
+
 void add_profile(Response& r, const Request& req, const char* name, uint64_t begin, uint64_t duration, const std::string& detail) {
   if (req.profiling != ProfilingLevel::Off) r.profile.push_back(ProfileEvent{name, "viplite", begin, duration, detail});
 }
@@ -473,7 +515,7 @@ std::string manifest() {
   vip_query_hardware(VIP_QUERY_HW_PROP_DEVICE_COUNT, sizeof(devices), &devices);
   std::ostringstream m;
   m << "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\",\"runner_id\":\"viplite-runner\",\"ready\":true,"
-       "\"graph_execution\":false,\"supported_ops\":[\"load_compiled\",\"run_compiled\"],"
+       "\"graph_execution\":false,\"supported_ops\":[\"load_compiled\",\"run_compiled\",\"run_compiled_native\"],"
        "\"supported_dtypes\":[\"FLOAT\",\"UINT8\",\"INT8\",\"INT16\",\"FLOAT16\"],\"profiling\":true,"
        "\"artifact\":{\"format\":\"nbg\"},\"hardware\":{\"cid\":\"0x"
     << std::hex << cid << std::dec << "\",\"devices\":" << devices << ",\"driver_version\":\"0x" << std::hex << vip_get_version() << "\"}}";
@@ -490,8 +532,9 @@ Response execute(const Request& request) {
     response.manifest = manifest();
     return response;
   }
-  if (request.op != "load_compiled" && request.op != "run_compiled") {
-    response.error = "viplite runner accepts capabilities/load_compiled/run_compiled";
+  const bool native_out = request.op == "run_compiled_native";
+  if (request.op != "load_compiled" && request.op != "run_compiled" && !native_out) {
+    response.error = "viplite runner accepts capabilities/load_compiled/run_compiled/run_compiled_native";
     return response;
   }
   std::shared_ptr<Net> net_ptr = get_net(request.artifact_id);
@@ -553,7 +596,11 @@ Response execute(const Request& request) {
   }
   spare.resize(n_out);
   response.outputs.resize(n_out);
-  for (size_t i = 0; i < n_out; ++i) read_output(slot->outputs[i], response.outputs[i], spare[i]);
+  for (size_t i = 0; i < n_out; ++i) {
+    if (native_out) read_output_native(slot->outputs[i], response.outputs[i], spare[i]);
+    else read_output(slot->outputs[i], response.outputs[i], spare[i]);
+  }
+  if (native_out) response.manifest = native_manifest(slot->outputs);
   add_profile(response, request, "viplite_run", run_begin, run_end - run_begin, "NPU execution (wall, around vip_run_network)");
   if (have_hw) {
     // The driver's own counters for this run: hardware inference time and NPU cycles (the ratio is the effective NPU clock).

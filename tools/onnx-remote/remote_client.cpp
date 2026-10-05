@@ -289,6 +289,7 @@ static int compile_run(int argc, char** argv) {
   std::string expect_path, dump_path;
   int iters = 3;
   bool profiling = false;
+  bool native_out = false;  // --native-out: ask the runner for run_compiled_native (outputs in the network's own dtype, quantization in the manifest)
   std::vector<std::pair<size_t, size_t>> resident;  // (input index, output index)
   for (int i = 7; i < argc; ++i) {
     const std::string a = argv[i];
@@ -310,6 +311,7 @@ static int compile_run(int argc, char** argv) {
     else if (a == "--dump" && i + 1 < argc) dump_path = argv[++i];
     else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (a == "--profile") profiling = true;
+    else if (a == "--native-out") native_out = true;
     else if (a == "--resident" && i + 1 < argc) {
       std::istringstream rs(argv[++i]);
       for (std::string pair; std::getline(rs, pair, ',');) {
@@ -339,7 +341,7 @@ static int compile_run(int argc, char** argv) {
   if (!exchange(rhost, rport, load, loaded)) return 1;
   std::cout << "loaded on the runner in " << ms(t0) << " ms\n";
   Request run;
-  run.op = "run_compiled";
+  run.op = native_out ? "run_compiled_native" : "run_compiled";
   run.artifact_id = load.artifact_id;
   run.inputs = std::move(inputs);
   run.profiling = profiling ? ProfilingLevel::Detailed : ProfilingLevel::Summary;
@@ -360,6 +362,11 @@ static int compile_run(int argc, char** argv) {
             << " (RPC-inclusive)";
   if (!resident.empty()) std::cout << ", state resident on the runner after the first run (" << first_ms << " ms)";
   std::cout << '\n';
+  if (native_out) {
+    size_t payload = 0;
+    for (const Tensor& t : result.outputs) payload += t.dtype == 1 ? t.data.size() * 4 : t.raw_data.size();
+    std::cout << "native outputs: " << payload << " bytes; manifest " << result.manifest << '\n';
+  }
   auto bytes_of = [](const Tensor& t) {
     if (t.dtype != 1) return t.raw_data;
     const auto* b = reinterpret_cast<const uint8_t*>(t.data.data());

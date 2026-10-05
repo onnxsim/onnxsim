@@ -140,6 +140,30 @@ timings and this for the system view.
    the NPU shrinks (input quantize 5.4 -> 1.5-2.9 ms); NPU time and outputs are unchanged (bit-identical in serial, 2-caller and TCP runs).
    With two pipelined callers the CPU is already busy, so it adds little (39.6 -> 41.0 calls/s).
 
+### How close to ideal
+
+**The NPU itself (YOLOv5s): about a quarter of rated peak.** Counting from `yolov5s_rt.onnx`, the model is 8.22 G MACs (16.4 GOP,
+60 convolutions). The NPU runs it in 22.96 ms and 19.1 M cycles: 0.72 TOPS, or 430 MAC/cycle. The vendor rating is "up to 3 TOPS"
+(the A733 datasheet gives no clock or data type for it), so that is about **24% of peak**; if the array is 2048 MAC/cycle, about 21%. Why
+it is not higher cannot be told from here, because there are no per-layer or bandwidth counters. Candidates: early layers with few
+channels (3 -> 32) filling the MAC array poorly, 57 SiLU (Sigmoid + Mul) activations and concat/resize layers, and memory traffic:
+only 26 M of the model's 87.5 M activation elements are convolution outputs, so up to 175 MB of int8 activations per call if nothing stays
+on chip (the real figure is unknown). 20-50% is typical for a small YOLO network on an edge NPU; raising it is a compiler/model matter.
+
+**Everything around the NPU, ideal = the 22.96 ms NPU time:**
+
+| configuration | ms per call | share of ideal |
+|---|---|---|
+| first measurement (unpinned, fresh output vectors) | 39.2 | 59% |
+| pinned to a big core, output vectors reused | 29.6 | 78% |
+| plus `--prewarm 85` (costs power) | 26.7 | 86% |
+| two pipelined callers | 24.4 per call (41.0 calls/s) | 94% of the 43.6 calls/s ceiling; ~99% of the 41.5 ceiling at the NPU's loaded 24.1 ms |
+
+The 3.7 ms left in the pre-warmed serial case is within about 1.2 ms of a rough floor for converting float32 in and out (~2.2 ms) plus
+~0.3 ms interrupt wake-up; native uint8 input removes the input conversion. **Remote clients are far from ideal**: over `adb forward` a
+YOLOv5s call is ~440 ms, about 15x the NPU time, all of it moving 13 MB of float32 (4.9 MB in, 8.4 MB out). `run_compiled_native` fixes
+the output side only for NBGs that have quantized outputs (not the zoo's YOLOv5s/RetinaFace), and sending uint8 input fixes the input side.
+
 What is **not** available, checked on this device:
 - **Per-layer timing or counters** (neither from VIPLite nor from the trace). VIPLite reports whole-network time and cycles plus a layer count, nothing per layer. The library
   has an internal profiling hook but no documented switch; the Vivante-style debug environment variables
@@ -191,6 +215,17 @@ I/O contract: `run_compiled` takes the model's inputs in graph order and returns
 worker quantizes/dequantizes using the scale/zero-point (or fixed-point position) stored in the NBG. An input already in the
 network's native integer format is copied through. `--profile` reports `viplite_run` (NPU time), plus input/output conversion
 with `Detailed`.
+
+**Native outputs.** `run_compiled_native` (client: `--native-out`) returns outputs as raw bytes in the network's own dtype instead of
+float32, with no dequantize on the device: 4x less data for a uint8/int8 output. The response manifest says how to turn them back:
+`{"outputs":[{"name":"...","native":true,"quant":"affine","scale":0.481335759,"zero_point":196}, ...]}` with real = (q - zero_point) *
+scale (`"dfp"` outputs carry `fixed_point_pos`: real = q * 2^-pos). Outputs whose format has no raw dtype come back as float32 with
+`"native":false`. Checked on the A733: deepHeadPose (3 x 66 outputs) and YOLOv5n (630 000 outputs) return 4x fewer bytes
+(YOLOv5n: 131 ms -> 80 ms RPC-inclusive over adb), and dequantizing them on the host from the manifest is **bit-identical** to the
+device's float32 (the manifest prints the scale with 9 digits; at the default 6 it was off by up to 7e-5, which this check caught).
+The zoo's YOLOv5s and RetinaFace NBGs gain nothing: they were compiled with Acuity's post-process node, so their outputs are already
+float32 (`"native":false`). A model compiled with `compile_nbg.py` keeps quantized outputs by default (`acuity_inputmeta.py` only adds
+that node with `--postproc`), so it benefits.
 
 ## Converter
 
