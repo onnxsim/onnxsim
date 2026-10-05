@@ -606,6 +606,14 @@ adapter.  That is deliberately simple and isolates model-load failures; a
 persistent model cache should be added once the wire protocol is exercised on
 the card.
 
+## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
+
+`remote_viplite_worker.cpp` is the runner for NBG (`.nb`) artifacts through the VIPLite runtime on an Allwinner SoC; build it with
+`-DONNX_REMOTE_VIPLITE=ON -DVIPLITE_INCLUDE_DIR=... -DVIPLITE_LIBRARY=...` (NDK for Android). It keeps networks resident after
+`load_compiled`, converts FLOAT tensors to and from the NBG's own quantization, and listens on loopback by default. `--bench FILE.nb`
+is a no-network smoke test. The compiler side is `scripts/allwinner/compile_nbg.py` (Acuity `pegasus` behind `onnx-remote-compiler`).
+Build, deploy, measured numbers and what is and is not verified: `scripts/allwinner/README.md`.
+
 ## Hexagon cDSP worker (tinygrad-generated v65 programs)
 
 `remote_hexagon_worker.cpp` is the runner for `tghx-v65` artifacts: whole ONNX models compiled by the tinygrad fork into one
