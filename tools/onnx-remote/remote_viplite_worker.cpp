@@ -54,7 +54,7 @@ namespace fs = std::filesystem;
 namespace {
 
 // ONNX TensorProto.DataType values the transport carries.
-constexpr uint8_t kFloat = 1, kUint8 = 2, kInt8 = 3, kInt16 = 5, kFloat16 = 10;
+constexpr uint8_t kFloat = 1, kUint8 = 2, kInt8 = 3, kInt16 = 5, kInt32 = 6, kInt64 = 7, kFloat16 = 10, kUint32 = 12;
 
 struct Port {
   std::string name;
@@ -378,7 +378,11 @@ bool fill_input(const Port& port, const Tensor& t, std::string& error) {
       default: for (uint64_t i = 0; i < elements; ++i) write_integer(dst + i * native, fmt, quantize(src[i], port.params)); break;
     }
   } else if ((t.dtype == kUint8 && fmt == VIP_BUFFER_FORMAT_UINT8) || (t.dtype == kInt8 && (fmt == VIP_BUFFER_FORMAT_INT8 || fmt == VIP_BUFFER_FORMAT_CHAR)) ||
-             (t.dtype == kInt16 && fmt == VIP_BUFFER_FORMAT_INT16) || (t.dtype == kFloat16 && fmt == VIP_BUFFER_FORMAT_FP16)) {
+             (t.dtype == kInt16 && fmt == VIP_BUFFER_FORMAT_INT16) || (t.dtype == kFloat16 && fmt == VIP_BUFFER_FORMAT_FP16) ||
+             // Integer index tensors (token ids for an embedding lookup, gather indices) travel as-is. Untested on hardware: no NBG we
+             // have carries an integer input.
+             (t.dtype == kInt32 && fmt == VIP_BUFFER_FORMAT_INT32) || (t.dtype == kInt64 && fmt == VIP_BUFFER_FORMAT_INT64) ||
+             (t.dtype == kUint32 && fmt == VIP_BUFFER_FORMAT_UINT32)) {
     if (t.raw_data.size() != port.bytes) { error = "raw input payload size mismatch for " + port.name; return false; }
     std::memcpy(dst, t.raw_data.data(), port.bytes);  // already in the network's native format: pass through
   } else {

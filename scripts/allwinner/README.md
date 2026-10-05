@@ -255,3 +255,60 @@ Limits: single-input models only when quantizing (calibration is one dataset; us
 static shapes; the default keeps ONNX semantics (no baked-in image preprocessing, `TENSOR` input) -- pass `--preproc IMAGE_RGB`
 to get a uint8 camera-frame input instead. The SoC -> `--optimize` table is copied from the zoo's script; `a733` and `t736` share a
 target, and the A733's reported hardware ID (`0x1000003b`) matches it.
+
+## Transformer models
+
+What is established here comes from Allwinner's NPU operator-support list (v1.5, A733 chapter) and from running exported transformers
+through `onnxsim` and `npu_rewrite.py`. **None of it has been through Acuity**, so the operator list is a necessary condition, not a
+guarantee, and no transformer has run on the NPU. (The list is marked confidential by Allwinner although it ships in their public
+model zoo; only operator names and limits are used here, nothing is copied.)
+
+**Operator coverage.** The ONNX importer is documented as ONNX 1.14.0. Listed: `MatMul`, `Gemm`, `Softmax`, `Erf`, `Tanh`, `Sigmoid`,
+`Silu`, `Exp`, `Sqrt`, `Pow`, `Reciprocal`, `ReduceMean`, `Where`, `Cast`, `Gather`, `Transpose`, `Reshape`, `Slice`, `Split`, `Concat`,
+`Expand`, `Tile`, `Cumsum`, `TopK`, the comparisons and `Neg`/`Add`/`Sub`/`Mul`. Not listed: **`LayerNormalization`** (opset 17+),
+**`Gelu`** (opset 20), **`Div`** (the hardware table does have a divide kernel, so this may be a documentation gap), plus `Not`, `Trilu`,
+`Einsum`, `RMSNormalization`, and `Identity`/`Dropout`/`Constant`, which simplification removes.
+
+**Experiment.** Three small transformers written the way Hugging Face writes them (BERT-style post-LayerNorm + GELU; LLaMA-style RMSNorm
++ rotary embeddings + causal mask + SiLU-gated MLP; ViT with a convolutional patch embedding), each exported with torch at opsets 17, 18
+and 20 (d=256, 4 heads, 2 layers, 64 tokens):
+
+| model | nodes as exported | after onnxsim | still not listed | after `npu_rewrite.py` |
+|---|---|---|---|---|
+| BERT-style | 93 (79 at opset 20) | 64 (56) | `LayerNormalization` x5, `Div` x4, `Gelu` x2 (opset 20) | none |
+| LLaMA-style | 189-194 | 118 | `Div` x7 | none |
+| ViT | 111 (97 at opset 20) | 70 (62) | `LayerNormalization` x4, `Div` x4, `Gelu` x2 (opset 20) | none |
+
+`onnxsim` removes every `Identity` and `Constant` (and the causal mask folds to a constant). `scripts/allwinner/npu_rewrite.py` then
+replaces `LayerNormalization` (-> `ReduceMean`, `Sub`, `Mul`, `Sqrt`, `Reciprocal`), `Gelu` (-> `Erf`, or `Tanh` for the approximate form)
+and `Div` (-> `Mul` by a folded reciprocal, or `Reciprocal` + `Mul`) and checks the result against the original on random inputs: the
+largest difference was 1e-6 absolute (about 1e-6 of the output range), float32 rounding. `compile_nbg.py` runs it by default
+(`--no-rewrite` to skip) and records what it changed under `rewrites` in the manifest. It does not guess at `Einsum`, `Trilu` or
+`RMSNormalization`: they are reported. Unit tests (`tests/test_allwinner_npu_rewrite.py`) cover both `ReduceMean` conventions (axes as
+an attribute before opset 18, as an input after), both `Gelu` forms, constant and tensor divisors, zero divisors and integer division.
+
+**Precision is the real question.** Every listed operator runs on one of two modules: **NN**, the integer MAC engine (i8/u8/i16), or
+**PPU**, a programmable unit for fp32/fp16/bf16. Fully connected layers (`fcl2`) are NN-only; `matrixmul`, `softmax`, `layer_norm`, `gelu`
+and the elementwise operators exist on both. So an int8-quantized transformer runs its matrix multiplies on the fast engine, while a
+float one runs on the PPU, whose speed relative to the NN engine has not been measured here. Post-training int8 is also where transformers
+lose accuracy (softmax inputs, LayerNorm statistics, GELU outliers), so the options are `--quant int16` (dynamic fixed point), bf16/float
+for the whole graph, or **hybrid quantization**: `compile_nbg.py --hybrid-layers FILE` keeps named layers (softmax, normalization) at 16
+bits while the rest is int8, following the zoo's `yolov8_hybrid` flow (a normal quantize, the layer list pasted under
+`customized_quantize_layers:` in the `.quantize` file, a second `quantize --hybrid`, and an export from the hybrid files). The file is
+`layer_name: dtype` lines such as `ln.0/Add_1_output_0_7: dynamic_fixed_point-i16`; the layer names come from the imported
+`model.json` and differ between Acuity versions, so they cannot be generated here. The flow is unit-tested against a fake `pegasus` only.
+
+**Limits to check.** The list gives size limits per operator (softmax input/output dimensions up to 8191, matrix-multiply and
+fully-connected operands up to 16383-1048575 depending on the axis, convolution kernels up to 15). Which ONNX axis maps to which
+documented axis is not stated, so `npu_rewrite.py` prints a warning for any `Softmax`/`MatMul`/`Gemm` tensor with a dimension above 8191,
+for example a 32 000-entry vocabulary projection or a long-sequence attention matrix, as something to check or split. Acuity also needs
+static shapes, so a decoder with a KV cache would need fixed maximum lengths with the cache as explicit inputs and outputs; not explored.
+
+**What is plausible.** Encoder-sized models (BERT-small class, ViT-tiny/small, a speech encoder) have the operator coverage and sizes
+that fit, subject to the accuracy question above. Autoregressive LLM decoding is limited by memory bandwidth rather than MACs: each token
+streams the whole weight set, so tokens per second is at most the DRAM bandwidth divided by the weight bytes (the tablet's bandwidth was
+not measured), which makes anything beyond small models impractical, independent of operator support.
+
+**Integer inputs.** A transformer's input is a token-id tensor. The worker now passes `INT32`/`INT64`/`UINT32` tensors through to an NBG
+input of the same type (needed for embedding lookups); this is **untested on hardware**, because no network available here has an integer
+input.

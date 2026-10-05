@@ -93,8 +93,22 @@ def parse_input_shapes(specs):
     return shapes
 
 
-def prepare_model(src, dst, shapes, simplify):
-    """Write a static-shape, optionally simplified copy of the model to dst; return its (inputs, outputs)."""
+def _load_npu_rewrite():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "npu_rewrite", Path(__file__).with_name("npu_rewrite.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare_model(src, dst, shapes, simplify, rewrite_ops=True):
+    """Write a static-shape, simplified, operator-rewritten copy of the model to dst.
+
+    Returns (inputs, outputs, rewrites): the model's I/O and a {name: count} of the rewrites applied (npu_rewrite.py: LayerNormalization,
+    Gelu and Div are replaced by operators Allwinner documents for the ONNX importer; a model without them is unchanged)."""
     import onnx
 
     model = onnx.load(src)
@@ -118,8 +132,15 @@ def prepare_model(src, dst, shapes, simplify):
             raise CompileError(
                 f"input {i['name']!r} has a dynamic shape {i['shape']}; Acuity needs static shapes (use --input-shape {i['name']}:1,3,224,224)"
             )
+    rewrites = {}
+    if rewrite_ops:
+        try:
+            model, stats = _load_npu_rewrite().rewrite(model)
+        except ValueError as e:
+            raise CompileError(str(e)) from e
+        rewrites = dict(stats)
     onnx.save(model, dst)
-    return inputs, outputs
+    return inputs, outputs, rewrites
 
 
 def write_calibration(calib_dir, work, count):
@@ -139,7 +160,42 @@ def write_calibration(calib_dir, work, count):
     return work / "dataset.txt", len(files)
 
 
-def acuity_script(a, optimize, n_calib):
+def stage_hybrid_layers(a, work):
+    """Validate --hybrid-layers and stage it as hybrid_layer.txt, each line indented four spaces as the zoo's config_hybrid_layer.py
+    expects (it is pasted under `customized_quantize_layers:` in the .quantize file). Returns the number of layers."""
+    if not a.hybrid_layers:
+        return 0
+    if a.quant == "float":
+        raise CompileError(
+            "--hybrid-layers needs a quantized --quant mode: it names layers to keep at higher precision than that mode"
+        )
+    lines = []
+    for number, raw in enumerate(Path(a.hybrid_layers).read_text().splitlines(), 1):
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        name, sep, dtype = text.rpartition(": ")
+        if not sep or not name.strip() or not dtype.strip():
+            raise CompileError(
+                f"{a.hybrid_layers}:{number}: expected 'layer_name: dtype' (e.g. 'x_output_0_12: dynamic_fixed_point-i16'), got {text!r}"
+            )
+        lines.append(f"    {name.strip()}: {dtype.strip()}\n")
+    if not lines:
+        raise CompileError(f"{a.hybrid_layers} names no layers")
+    (work / "hybrid_layer.txt").write_text("".join(lines))
+    return len(lines)
+
+
+HYBRID_INJECT = """python3 - <<'PYEOF'
+src = open("model_{q}.quantize").read()
+marker = "customized_quantize_layers: {{}}"
+assert marker in src, "no customized_quantize_layers placeholder in model_{q}.quantize"
+layers = ("customized_quantize_layers:\\n" + open("hybrid_layer.txt").read()).rstrip("\\n")
+open("model_{q}_hybrid.quantize", "w").write(src.replace(marker, layers))
+PYEOF"""
+
+
+def acuity_script(a, optimize, n_calib, n_hybrid=0):
     """The shell script run inside the toolkit environment, in the work dir. Mirrors the zoo's pegasus_*.sh scripts."""
     q = shlex.quote
     steps = [
@@ -166,13 +222,31 @@ def acuity_script(a, optimize, n_calib):
         export += ["--dtype float", "--output-path wksp/out/out"]
     else:
         quantizer, qtype = QUANT[a.quant]
-        steps.append(
-            f"$PEGASUS quantize --model model.json --model-data model.data --device CPU --with-input-meta model_inputmeta.yml "
-            f"--iterations {n_calib} --rebuild --model-quantize model_{a.quant}.quantize --quantizer {quantizer} --qtype {qtype}"
+        common = (
+            "$PEGASUS quantize --model model.json --model-data model.data --device CPU --with-input-meta model_inputmeta.yml "
+            f"--iterations {n_calib}"
         )
+        tail = f"--quantizer {quantizer} --qtype {qtype}"
+        steps.append(
+            f"{common} --rebuild --model-quantize model_{a.quant}.quantize {tail}"
+        )
+        model_json, quantize_file = "model.json", f"model_{a.quant}.quantize"
+        if n_hybrid:
+            # The zoo's pegasus_quantize-hybrid.sh / pegasus_export_ovx_nbg-hybrid.sh: paste the layer list into a copy of the
+            # .quantize file, quantize again with --hybrid, and export from the hybrid files.
+            steps.append(HYBRID_INJECT.format(q=a.quant))
+            steps.append(
+                f"{common} --hybrid --model-quantize model_{a.quant}_hybrid.quantize {tail}"
+            )
+            steps.append("export VSI_NN_ENABLE_OPCHECK=0")
+            model_json = f"model_{a.quant}_hybrid.quantize.json"
+            quantize_file = f"model_{a.quant}_hybrid.quantize"
+        export = [
+            e.replace("--model model.json ", f"--model {model_json} ") for e in export
+        ]
         export += [
             "--dtype quantized",
-            f"--model-quantize model_{a.quant}.quantize",
+            f"--model-quantize {quantize_file}",
             "--output-path wksp/out/out",
         ]
     steps.append(" ".join(export))
@@ -221,12 +295,14 @@ def compile_model(a):
         raise CompileError(f"unknown --quant {a.quant!r}")
     work = Path(tempfile.mkdtemp(prefix="onnxsim-aw-", dir=os.environ.get("TMPDIR")))
     try:
-        inputs, outputs = prepare_model(
+        inputs, outputs, rewrites = prepare_model(
             a.input,
             work / "model.onnx",
             parse_input_shapes(a.input_shape),
             not a.no_simplify,
+            not a.no_rewrite,
         )
+        n_hybrid = stage_hybrid_layers(a, work)
         n_calib = 0
         if a.quant != "float":
             if len(inputs) != 1:
@@ -242,7 +318,7 @@ def compile_model(a):
             Path(__file__).with_name("acuity_inputmeta.py"),
             work / "acuity_inputmeta.py",
         )
-        run_toolkit(acuity_script(a, optimize, n_calib), work, a)
+        run_toolkit(acuity_script(a, optimize, n_calib, n_hybrid), work, a)
         nbs = list((work / "wksp").rglob("network_binary.nb"))
         if len(nbs) != 1:
             raise CompileError(
@@ -262,7 +338,12 @@ def compile_model(a):
                 "optimize": optimize,
             },
             "artifact": {"format": "nbg", "abi": "viplite"},
-            "quantization": {"mode": a.quant, "calibration_samples": n_calib},
+            "quantization": {
+                "mode": a.quant,
+                "calibration_samples": n_calib,
+                "hybrid_layers": n_hybrid,
+            },
+            "rewrites": rewrites,
             # The runner converts float32 <-> the NBG's own formats from the quantization stored in the NBG.
             "io": {"dtype": "float32", "inputs": inputs, "outputs": outputs},
             "capabilities": {"ops": [], "dtypes": ["float32", "uint8"]},
@@ -310,6 +391,17 @@ def main(argv=None):
     )
     p.add_argument(
         "--no-simplify", action="store_true", help="skip onnxsim before import"
+    )
+    p.add_argument(
+        "--no-rewrite",
+        action="store_true",
+        help="skip npu_rewrite.py (LayerNormalization/Gelu/Div -> documented operators)",
+    )
+    p.add_argument(
+        "--hybrid-layers",
+        metavar="FILE",
+        help="hybrid quantization: lines of 'layer_name: dtype' (e.g. dynamic_fixed_point-i16) naming layers of the imported "
+        "graph to quantize at higher precision, as in the zoo's hybrid_layer.txt",
     )
     p.add_argument(
         "--docker-image",

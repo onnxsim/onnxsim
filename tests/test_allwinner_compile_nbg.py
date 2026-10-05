@@ -34,8 +34,17 @@ with open(os.environ["FAKE_LOG"], "a") as f:
 if os.environ.get("FAKE_FAIL") == args[0]:
     print("E: simulated " + args[0] + " failure")
     sys.exit(3)
+if args[0] == "import" and os.environ.get("FAKE_MODEL_OUT"):
+    Path(os.environ["FAKE_MODEL_OUT"]).write_bytes(Path(args[args.index("--model") + 1]).read_bytes())
 if args[0] == "quantize":
-    Path(args[args.index("--model-quantize") + 1]).write_text("quant")
+    target = Path(args[args.index("--model-quantize") + 1])
+    if "--hybrid" in args:
+        # like the real tool, a --hybrid pass starts from the file that already carries the customized layers
+        assert target.exists() and "customized_quantize_layers:\\n    " in target.read_text(), "hybrid file missing its layers"
+        if os.environ.get("FAKE_HYBRID_OUT"):
+            Path(os.environ["FAKE_HYBRID_OUT"]).write_text(target.read_text())
+    else:
+        target.write_text("quantizer: fake\\ncustomized_quantize_layers: {{}}\\n")
 if args[0] == "export":
     out = Path(args[args.index("--output-path") + 1])
     nbg = out.parent.with_name(out.parent.name + "_nbg_unify")
@@ -90,9 +99,9 @@ def toolkit(tmp_path, monkeypatch):
     return calls
 
 
-def _compile(tmp_path, body, *extra):
+def _compile(tmp_path, body, *extra, opset=13):
     src = tmp_path / "m.onnx"
-    onnx.save(_model(body), src)
+    onnx.save(_model(body, opset), src)
     out, manifest = tmp_path / "m.nb", tmp_path / "m.json"
     rc = compile_nbg.main([str(src), str(out), str(manifest), "--no-simplify", *extra])
     return rc, out, manifest
@@ -169,6 +178,7 @@ def test_pcq_quantization_uses_calibration_samples(tmp_path, toolkit):
     assert json.loads(manifest.read_text())["quantization"] == {
         "mode": "pcq",
         "calibration_samples": 3,
+        "hybrid_layers": 0,
     }
 
 
@@ -250,3 +260,133 @@ def test_every_platform_has_an_optimize_target():
     )
     assert compile_nbg.PLATFORM_OPTIMIZE["v853"] == "VIP9000PICO_PID0XEE"
     assert os.path.exists(SCRIPT.with_name("acuity_inputmeta.py"))
+
+
+TRANSFORMER_BLOCK = """
+g (float[1, 4, 8] x) => (float[1, 4, 8] y)
+  <float[8] s = {1, 1, 1, 1, 1, 1, 1, 1}, float[1] d = {2.0}> {
+  n = LayerNormalization<axis = -1, epsilon = 1e-5>(x, s)
+  y = Div(n, d)
+}"""
+
+
+def test_transformer_operators_are_rewritten_before_import(
+    tmp_path, toolkit, monkeypatch
+):
+    imported = tmp_path / "imported.onnx"
+    monkeypatch.setenv("FAKE_MODEL_OUT", str(imported))
+    rc, _, manifest = _compile(
+        tmp_path, TRANSFORMER_BLOCK, "--quant", "float", opset=17
+    )
+    assert rc == 0
+    ops = {n.op_type for n in onnx.load(imported).graph.node}
+    assert not ops & {"LayerNormalization", "Div"}, (
+        ops
+    )  # what pegasus imports has only documented operators
+    assert {"ReduceMean", "Sqrt", "Reciprocal", "Mul"} <= ops
+    assert json.loads(manifest.read_text())["rewrites"] == {
+        "LayerNormalization": 1,
+        "Div(const)": 1,
+    }
+
+
+def test_no_rewrite_leaves_the_model_as_exported(tmp_path, toolkit, monkeypatch):
+    imported = tmp_path / "imported.onnx"
+    monkeypatch.setenv("FAKE_MODEL_OUT", str(imported))
+    rc, _, manifest = _compile(
+        tmp_path, TRANSFORMER_BLOCK, "--quant", "float", "--no-rewrite", opset=17
+    )
+    assert rc == 0
+    assert {n.op_type for n in onnx.load(imported).graph.node} == {
+        "LayerNormalization",
+        "Div",
+    }
+    assert json.loads(manifest.read_text())["rewrites"] == {}
+
+
+def _hybrid_file(tmp_path, text):
+    f = tmp_path / "hybrid_layer.txt"
+    f.write_text(text)
+    return f
+
+
+def test_hybrid_quantization_follows_the_zoo_flow(tmp_path, toolkit, monkeypatch):
+    hybrid_out = tmp_path / "hybrid.quantize"
+    monkeypatch.setenv("FAKE_HYBRID_OUT", str(hybrid_out))
+    layers = _hybrid_file(
+        tmp_path,
+        "# attention softmax and the layer norms stay 16-bit\n"
+        "att.0/Softmax_output_0_12: dynamic_fixed_point-i16\n"
+        "\n"
+        "ln.0/Add_1_output_0_7: dynamic_fixed_point-i16\n",
+    )
+    rc, _, manifest = _compile(
+        tmp_path,
+        CONV,
+        "--quant",
+        "uint8",
+        "--calib-dir",
+        str(_calib(tmp_path)),
+        "--hybrid-layers",
+        str(layers),
+    )
+    assert rc == 0
+    steps = [s for s in toolkit() if s[0] in ("quantize", "export")]
+    plain, hybrid, export = steps
+    assert plain[plain.index("--model-quantize") + 1] == "model_uint8.quantize"
+    assert "--rebuild" in plain and "--hybrid" not in plain
+    # the second pass: --hybrid on the file that carries the layer list, without --rebuild (as pegasus_quantize-hybrid.sh)
+    assert "--hybrid" in hybrid and "--rebuild" not in hybrid
+    assert hybrid[hybrid.index("--model-quantize") + 1] == "model_uint8_hybrid.quantize"
+    # export reads the hybrid graph + quantize file (pegasus_export_ovx_nbg-hybrid.sh)
+    assert export[export.index("--model") + 1] == "model_uint8_hybrid.quantize.json"
+    assert export[export.index("--model-quantize") + 1] == "model_uint8_hybrid.quantize"
+    # layers are pasted under customized_quantize_layers: indented four spaces, comments/blank lines dropped
+    assert hybrid_out.read_text() == (
+        "quantizer: fake\ncustomized_quantize_layers:\n"
+        "    att.0/Softmax_output_0_12: dynamic_fixed_point-i16\n"
+        "    ln.0/Add_1_output_0_7: dynamic_fixed_point-i16\n"
+    )
+    assert json.loads(manifest.read_text())["quantization"]["hybrid_layers"] == 2
+
+
+def test_without_hybrid_layers_the_plain_flow_is_unchanged(tmp_path, toolkit):
+    rc, _, manifest = _compile(tmp_path, CONV, "--calib-dir", str(_calib(tmp_path)))
+    assert rc == 0
+    quantize = [s for s in toolkit() if s[0] == "quantize"]
+    assert len(quantize) == 1 and "--hybrid" not in quantize[0]
+    assert json.loads(manifest.read_text())["quantization"]["hybrid_layers"] == 0
+
+
+@pytest.mark.parametrize(
+    "content,needle",
+    [
+        ("layer_without_dtype\n", "expected 'layer_name: dtype'"),
+        ("name: \n", "expected 'layer_name: dtype'"),
+        ("# only a comment\n\n", "names no layers"),
+    ],
+)
+def test_bad_hybrid_layer_files_are_rejected(
+    tmp_path, toolkit, capsys, content, needle
+):
+    layers = _hybrid_file(tmp_path, content)
+    rc, out, _ = _compile(
+        tmp_path,
+        CONV,
+        "--calib-dir",
+        str(_calib(tmp_path)),
+        "--hybrid-layers",
+        str(layers),
+    )
+    assert rc == 1
+    assert needle in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_hybrid_layers_need_a_quantized_mode(tmp_path, toolkit, capsys):
+    layers = _hybrid_file(tmp_path, "x_0: dynamic_fixed_point-i16\n")
+    rc, _, _ = _compile(
+        tmp_path, CONV, "--quant", "float", "--hybrid-layers", str(layers)
+    )
+    assert rc == 1
+    assert "needs a quantized --quant mode" in capsys.readouterr().err
