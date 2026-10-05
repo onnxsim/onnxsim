@@ -24,14 +24,35 @@ command lines mirror Allwinner's `awnpu_model_zoo` scripts, but real-toolkit beh
 
 There is no from-scratch ONNX -> NBG compiler here: an NBG is machine code for the NPU and only Acuity emits it.
 
-Measured on the A733 (NPU = `vip_run_network`; "IO" = float32 quantize/dequantize in the worker):
+## Benchmarks
 
-| model | NPU | IO in+out |
-|---|---|---|
-| deepHeadPose uint8 (112x336) | 0.35 ms | 0.09 ms |
-| RetinaFace pcq (640x640) | 8.2 ms | 2.9 ms |
-| YOLOv5n uint8 (640x640) | 10.2 ms | 8.3 ms |
-| YOLOv5s uint8, from the zoo (640x640) | 23 ms | 30 ms |
+Measured on the A733 tablet (8 CPU cores, schedutil governor, adb shell, screen state and thermals not controlled -- the thermal
+zones are not readable from the shell). `scripts/allwinner/bench.py` runs it: 100 timed iterations after a warm-up, repeated 3
+times, median of the repeated medians; the range column shows run-to-run spread. "NPU" is `vip_run_network`; "in"/"out" are the
+worker's float32 quantize/dequantize; "total" is one `run_compiled` body without the network transfer. Inputs are random.
+
+| network | input dims (as the NBG reports them) | NPU ms | in ms | out ms | total ms | NPU range | load ms |
+|---|---|---|---|---|---|---|---|
+| deepHeadPose uint8 | 1x1x112x336 | 0.35 | 0.07 | 0.03 | 0.45 | 0.31-0.44 | 9.4 |
+| LPRNet uint8 (built for MR536) | 1x24x94x3 | 20.17 | 0.09 | 0.32 | 20.64 | 20.15-20.24 | 5.1 |
+| RetinaFace pcq | 1x640x640x3 | 8.08 | 4.65 | 2.81 | 15.88 | 8.06-8.11 | 26.2 |
+| YOLOv5n uint8 | 1x1x640x1920 | 10.27 | 4.56 | 5.42 | 21.86 | 10.23-11.08 | 23.4 |
+| YOLOv5s uint8 (zoo, A733) | 1x640x640x3 | 23.46 | 2.27 | 11.31 | 39.21 | 22.91-23.55 | 68.1 |
+| MobileNetV2 pcq (zoo, built for T527) | | rejected: not a valid NBG for this NPU generation | | | | | |
+
+CPU baseline, same tablet and same network: ONNX Runtime 1.26 CPU provider, fp32 `yolov5s_rt.onnx` (the model the zoo's YOLOv5s NBG
+is built from), `scripts/allwinner/bench_ort_cpu.cpp`, 10 iterations x 3 repeats:
+
+| CPU threads | median ms | range | NPU speedup (NPU time / incl. conversion) |
+|---|---|---|---|
+| 1 | 929.3 | 925.3-931.0 | 40x / 24x |
+| 4 | 514.6 | 514.5-515.3 | 22x / 13x |
+| 8 | 462.6 | 462.5-468.2 | 20x / 12x |
+
+Read these carefully: the CPU runs fp32 and the NPU runs uint8, so this is a speed comparison, not an accuracy-matched one (no
+accuracy was measured). The LPRNet figure (20 ms for a tiny 24x94 network) is surprisingly slow and is likely a consequence of
+running an MR536-targeted NBG on the A733 rather than a native build; it was not investigated. NBGs built for T527 are rejected,
+so a network must be compiled for the right NPU generation.
 
 Feeding a uint8 network its native `UINT8` tensor skips input quantization. Over `adb forward` the float32 tensors dominate
 wall time for large models (YOLOv5s: ~440 ms RPC-inclusive); run the client on the device or on the same LAN for real numbers.

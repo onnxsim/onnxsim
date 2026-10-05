@@ -465,17 +465,23 @@ int bench(const char* path, int iters) {
     std::cout << '\n';
     req.inputs.push_back(std::move(t));
   }
+  // One warm-up call, then `iters` timed ones; per-phase medians come from the response's own profile events.
+  Response last = execute(req);
+  if (!last.ok) { std::cerr << "run: " << last.error << '\n'; return 1; }
+  std::map<std::string, std::vector<double>> phases;
   std::vector<double> ms;
-  Response last;
   for (int i = 0; i < iters; ++i) {
     const uint64_t t0 = now_us();
     last = execute(req);
     if (!last.ok) { std::cerr << "run: " << last.error << '\n'; return 1; }
     ms.push_back((now_us() - t0) / 1000.0);
+    for (const ProfileEvent& e : last.profile) phases[e.name].push_back(e.duration_us / 1000.0);
   }
+  auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
   std::sort(ms.begin(), ms.end());
-  std::cout << "run (incl. quantize/IO) median " << ms[ms.size() / 2] << " ms, min " << ms.front() << " ms over " << iters << " iters\n";
-  for (const ProfileEvent& e : last.profile) std::cout << "  " << e.name << ": " << e.duration_us / 1000.0 << " ms\n";
+  std::cout << "run (incl. quantize/IO) median " << median(ms) << " ms, min " << ms.front() << " ms, max " << ms.back() << " ms over " << iters << " iters\n";
+  for (const auto& [name, v] : phases)
+    std::cout << "  " << name << ": median " << median(v) << " ms, min " << *std::min_element(v.begin(), v.end()) << " ms\n";
   for (size_t i = 0; i < last.outputs.size(); ++i) {
     const Tensor& o = last.outputs[i];
     double sum = 0; float lo = INFINITY, hi = -INFINITY;
