@@ -120,6 +120,25 @@ timings and this for the system view.
    little slower while the CPU converts, which looks like DRAM contention (not verified). This is a **throughput** feature: per-call latency
    rises (median ~50 ms with two callers, since each waits for the NPU), and a single serial client sees no gain from it. It only pays off
    when clients send requests concurrently; over `adb forward` the ~13 MB of float32 per call dominates (~570 ms) and hides it.
+3. **Pre-warm the CPU cluster (opt-in, costs power).** What was left in the profile is that the CPU work right after an NPU wait runs
+   slowly. A standalone loop quantizing 1.2M floats takes 0.8-1.0 ms when the core is hot or after a 1-5 ms sleep, but 3.3-3.7 ms in the
+   first few ms after a ~22 ms sleep (a second run immediately after is 1.0 ms again). That is the big cluster's shared clock falling
+   while the worker sleeps through the NPU run: a spinner on the *other* big core during the last 4 ms of the sleep brings the
+   measured core back to 1.0 ms, while splitting the work over two threads does not help. Setting a scheduler utilization clamp, the
+   clean fix, is refused for the shell user (`sched_setattr` -> EPERM). So `--prewarm PCT [--prewarm-cpu N]` runs a helper thread that
+   busy-waits for the last PCT% of the network's expected NPU time (a running average of its earlier runs). Worker on core 7
+   (`taskset 80`), helper on core 6, 150 calls each:
+
+   | network | no pre-warm | 50% | 70% | 85% |
+   |---|---|---|---|---|
+   | YOLOv5s (NPU 23 ms) | 31.5 ms | 32.4 | 28.2 | **26.7** (-15%) |
+   | RetinaFace (NPU 8 ms) | 14.0 ms | 13.9 | 11.1 | **10.7** (-24%) |
+   | YOLOv5n (NPU 10 ms) | 17.0 ms | 17.1 | **12.7** (-25%) | 13.0 |
+
+   It only works when the spinner covers most of the wait (50% does nothing, 70-85% does), so the price is roughly that fraction of one
+   big core's power for as long as the worker is serving requests: use it when latency matters more than energy. The first CPU phase after
+   the NPU shrinks (input quantize 5.4 -> 1.5-2.9 ms); NPU time and outputs are unchanged (bit-identical in serial, 2-caller and TCP runs).
+   With two pipelined callers the CPU is already busy, so it adds little (39.6 -> 41.0 calls/s).
 
 What is **not** available, checked on this device:
 - **Per-layer timing or counters** (neither from VIPLite nor from the trace). VIPLite reports whole-network time and cycles plus a layer count, nothing per layer. The library

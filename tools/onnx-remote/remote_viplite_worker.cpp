@@ -22,6 +22,8 @@
 #include <chrono>
 #include <cerrno>
 #include <cmath>
+#include <sched.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +89,7 @@ struct Net {
   // std::vector costs more to zero-fill and page-fault (about 5 ms for YOLOv5s' 1.6M-element output) than the dequantization itself.
   std::vector<std::vector<std::vector<float>>> spare_pool;
   Slot* bound = nullptr;  // the slot whose buffers are set on the network; only touched under g_npu
+  double run_ms = 0;      // smoothed wall time of vip_run_network, to time the pre-warm; only touched under g_npu
   ~Net() {
     slots.clear();
     if (network) { vip_finish_network(network); vip_destroy_network(network); }
@@ -97,6 +100,57 @@ fs::path g_cache_dir = "/data/local/tmp/onnx-remote-viplite";
 std::mutex g_mu;   // guards g_nets and loading
 std::mutex g_npu;  // one vip_run_network (and the buffer rebinding before it) at a time
 std::map<std::string, std::shared_ptr<Net>> g_nets;
+
+// Optional (--prewarm PCT): the worker thread sleeps through the NPU run, and the CPU cluster's clock falls during the idle gap, so the
+// conversions right after it run slowly (on the A733's big cores a 1.2M-element quantize takes 3.3 ms instead of 1.0 ms in the first few
+// ms after a ~22 ms sleep). A helper thread, pinned to a *different* core of the same cluster, busy-waits for the last PCT% of the
+// expected NPU time so the cluster is already clocked up when the run completes. Measured: it needs to cover roughly 60% or more of
+// the wait to help, so it costs about that fraction of one core's power per call and is off by default. The expected time is a
+// running average of this network's previous runs.
+struct Prewarm {
+  int pct = 0, cpu = -1;  // spin for the last pct% of the expected NPU time, on `cpu` (-1: wherever the scheduler puts it)
+  std::mutex m;
+  std::condition_variable cv;
+  bool armed = false, quit = false;
+  std::chrono::steady_clock::time_point start;
+  std::thread thread;
+
+  void run() {
+    if (cpu >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(cpu, &set);
+      sched_setaffinity(0, sizeof(set), &set);
+    }
+    std::unique_lock<std::mutex> lk(m);
+    while (!quit) {
+      cv.wait(lk, [&] { return armed || quit; });
+      if (quit) break;
+      const auto begin = start;
+      lk.unlock();
+      std::this_thread::sleep_until(begin);
+      volatile double x = 1.0;
+      while (true) {  // spin until disarmed
+        { std::lock_guard<std::mutex> g(m); if (!armed) break; }
+        for (int i = 0; i < 2000; ++i) x = x * 1.0000001 + 1e-9;
+      }
+      lk.lock();
+    }
+  }
+  void arm(double expected_ms) {
+    if (!pct || expected_ms < 2.0) return;  // nothing to gain on a run too short for the clock to fall
+    const double lead_ms = expected_ms * (100 - pct) / 100.0;  // idle first, then spin for the last pct% of the expected time
+    { std::lock_guard<std::mutex> g(m); armed = true; start = std::chrono::steady_clock::now() + std::chrono::microseconds(static_cast<int64_t>(lead_ms * 1000)); }
+    cv.notify_one();
+  }
+  void disarm() {
+    if (!pct) return;
+    std::lock_guard<std::mutex> g(m);
+    armed = false;
+  }
+};
+// Never destroyed: the helper thread is detached and may still be waiting on it while the process exits.
+Prewarm& g_prewarm = *new Prewarm;
 
 std::shared_ptr<Net> get_net(const std::string& id) {
   std::lock_guard<std::mutex> lk(g_mu);
@@ -480,8 +534,12 @@ Response execute(const Request& request) {
     if (!bind(net, *slot, response.error)) return response;
     bind_us = now_us() - t0 - bind_begin;
     run_begin = now_us() - t0;
+    g_prewarm.arm(net.run_ms);
     const vip_status_e st = vip_run_network(net.network);
+    g_prewarm.disarm();
     run_end = now_us() - t0;
+    const double run_ms = (run_end - run_begin) / 1000.0;
+    net.run_ms = net.run_ms == 0 ? run_ms : 0.8 * net.run_ms + 0.2 * run_ms;
     if (st != VIP_SUCCESS) { response.error = "vip_run_network failed (" + std::to_string(st) + ")"; return response; }
     if (request.profiling != ProfilingLevel::Off) {
       have_hw = vip_query_network(net.network, VIP_NETWORK_PROP_PROFILING, &hw) == VIP_SUCCESS;
@@ -641,10 +699,12 @@ int main(int argc, char** argv) {
     else if (a == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoul(argv[++i]));
     else if (a == "--fscale" && i + 1 < argc) fscale = std::atoi(argv[++i]);
     else if (a == "--threads" && i + 1 < argc) bench_threads = std::max(1, std::atoi(argv[++i]));
+    else if (a == "--prewarm" && i + 1 < argc) g_prewarm.pct = std::min(95, std::max(0, std::atoi(argv[++i])));
+    else if (a == "--prewarm-cpu" && i + 1 < argc) g_prewarm.cpu = std::atoi(argv[++i]);
     else if (a == "--cache-dir" && i + 1 < argc) g_cache_dir = argv[++i];
     else if (a == "--bench" && i + 1 < argc) { bench_path = argv[++i]; if (i + 1 < argc && argv[i + 1][0] != '-') bench_iters = std::atoi(argv[++i]); }
     else if (a == "--help") {
-      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] | --bench FILE.nb [ITERS] [--threads N]\n";
+      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] [--prewarm PCT [--prewarm-cpu N]] | --bench FILE.nb [ITERS] [--threads N]\n";
       return 0;
     } else { std::cerr << "unknown argument: " << a << '\n'; return 2; }
   }
@@ -654,6 +714,10 @@ int main(int argc, char** argv) {
     vip_power_frequency_t f{static_cast<vip_uint8_t>(fscale)};
     const vip_status_e st = vip_power_management(0, VIP_POWER_PROPERTY_SET_FREQUENCY, &f);
     std::cerr << "NPU clock scale " << fscale << "%: " << (st == VIP_SUCCESS ? "ok" : "failed " + std::to_string(st)) << '\n';
+  }
+  if (g_prewarm.pct) {
+    g_prewarm.thread = std::thread([] { g_prewarm.run(); });
+    g_prewarm.thread.detach();
   }
   int rc = 0;
   if (bench_path) rc = bench(bench_path, std::max(1, bench_iters), bench_threads);
