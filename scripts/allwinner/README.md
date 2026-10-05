@@ -31,14 +31,21 @@ zones are not readable from the shell). `scripts/allwinner/bench.py` runs it: 10
 times, median of the repeated medians; the range column shows run-to-run spread. "NPU" is `vip_run_network`; "in"/"out" are the
 worker's float32 quantize/dequantize; "total" is one `run_compiled` body without the network transfer. Inputs are random.
 
-| network | input dims (as the NBG reports them) | NPU ms | in ms | out ms | total ms | NPU range | load ms |
-|---|---|---|---|---|---|---|---|
-| deepHeadPose uint8 | 1x1x112x336 | 0.35 | 0.07 | 0.03 | 0.45 | 0.31-0.44 | 9.4 |
-| LPRNet uint8 (built for MR536) | 1x24x94x3 | 20.17 | 0.09 | 0.32 | 20.64 | 20.15-20.24 | 5.1 |
-| RetinaFace pcq | 1x640x640x3 | 8.08 | 4.65 | 2.81 | 15.88 | 8.06-8.11 | 26.2 |
-| YOLOv5n uint8 | 1x1x640x1920 | 10.27 | 4.56 | 5.42 | 21.86 | 10.23-11.08 | 23.4 |
-| YOLOv5s uint8 (zoo, A733) | 1x640x640x3 | 23.46 | 2.27 | 11.31 | 39.21 | 22.91-23.55 | 68.1 |
-| MobileNetV2 pcq (zoo, built for T527) | | rejected: not a valid NBG for this NPU generation | | | | | |
+Current build (output buffers reused, see "Hiding the conversion cost" below), one caller, worker pinned to a big core with
+`taskset 80` (`bench.py --taskset 80`); 100 iterations x 3 repeats:
+
+| network | input dims (as the NBG reports them) | NPU ms | in ms | out ms | total ms | calls/s | NPU range | load ms |
+|---|---|---|---|---|---|---|---|---|
+| deepHeadPose uint8 | 1x1x112x336 | 0.42 | 0.05 | 0.03 | 0.51 | 1980 | 0.35-0.43 | 6.4 |
+| LPRNet uint8 (built for MR536) | 1x24x94x3 | 20.20 | 0.04 | 0.20 | 20.41 | 49.0 | 20.13-20.21 | 3.3 |
+| RetinaFace pcq | 1x640x640x3 | 8.06 | 5.42 | 0.66 | 14.03 | 71.3 | 8.06-8.12 | 24.0 |
+| YOLOv5n uint8 | 1x1x640x1920 | 10.26 | 5.39 | 1.34 | 16.25 | 61.6 | 10.21-10.33 | 23.8 |
+| YOLOv5s uint8 (zoo, A733) | 1x640x640x3 | 22.96 | 2.94 | 3.61 | 29.61 | 33.8 | 22.92-22.99 | 68.4 |
+| MobileNetV2 pcq (zoo, built for T527) | | rejected: not a valid NBG for this NPU generation | | | | | | |
+
+Before the output-buffer change and without pinning (first measurement), YOLOv5s took 39.2 ms total (out 11.3 ms) and YOLOv5n 21.9 ms
+(out 5.4 ms). With output conversion now small, the float32 *input* quantize (4.9 MB read per call for a 640x640x3 network) is the
+largest CPU-side cost for RetinaFace and YOLOv5n (5.4 ms each, not further optimized); native uint8 input skips it.
 
 CPU baseline, same tablet and same network: ONNX Runtime 1.26 CPU provider, fp32 `yolov5s_rt.onnx` (the model the zoo's YOLOv5s NBG
 is built from), `scripts/allwinner/bench_ort_cpu.cpp`, 10 iterations x 3 repeats:
@@ -88,9 +95,31 @@ shows things the sysfs nodes hide. Measured on the A733 with YOLOv5s (the trace 
 
 The takeaways from that: the NPU time itself (22.7 ms) does not change with CPU placement, but the CPU-side float32 conversion does
 (output dequantize 14-17 ms -> 11.8 ms on a big core), so **pin the worker to a big core** (`taskset 80 ./onnx-remote-viplite-worker ...`)
-or feed native uint8 where the network allows it. And since the worker is idle while the NPU runs and the NPU is idle while the worker
-converts, overlapping conversion of the next request with the current NPU run would hide most of the ~16 ms of conversion; that is not
-implemented. Tracing itself slows the CPU-side phases (not the NPU time), so use `bench.py` for timings and this for the system view.
+or feed native uint8 where the network allows it. Tracing itself slows the CPU-side phases (not the NPU time), so use `bench.py` for
+timings and this for the system view.
+
+### Hiding the conversion cost (two changes the profile led to)
+
+1. **Reuse output buffers.** Of the ~7 ms the worker spent turning YOLOv5s' 1.6M-element output into float32, 5.4 ms was `std::vector::resize`
+   zero-filling and page-faulting a fresh 6.5 MB allocation each call; the dequantize loop itself was 1.3 ms. The worker now takes
+   output vectors back after a response is sent and reuses them. Worker pinned to a big core (`taskset 80`): output phase 11.8 ms -> 4.0 ms
+   median, whole call 39.3 ms -> 30.6-32.2 ms (3 runs); NPU time unchanged.
+2. **Overlap conversion with the NPU.** Each network has two independent I/O buffer sets ("slots"); only `vip_run_network` is serialized,
+   and the server handles each connection on its own thread (at most 8 in flight, then it answers "busy"). While request A's NPU run
+   executes, request B converts its input into the other slot and A's output is converted after A's run. Rebinding the network to the other
+   slot's buffers costs ~7 us, and the outputs were bit-identical across slots and across two concurrent TCP clients.
+   `--bench FILE.nb N --threads K` measures it (YOLOv5s, worker pinned with `taskset c0`, 200 calls x 3 repeats):
+
+   | concurrent callers | ms per call (throughput) | NPU ms under load |
+   |---|---|---|
+   | 1 | 31.4 (31.8 calls/s) | 22.4-22.7 |
+   | 2 | 25.2 (39.6 calls/s, +25%) | 23.8-24.3 |
+   | 3 | 25.5 (39.3 calls/s) | 24.1-24.3 |
+
+   Two pipelined callers reach ~95% of the ceiling set by the NPU's own time under load (24 ms -> 41.7 calls/s); the NPU itself runs a
+   little slower while the CPU converts, which looks like DRAM contention (not verified). This is a **throughput** feature: per-call latency
+   rises (median ~50 ms with two callers, since each waits for the NPU), and a single serial client sees no gain from it. It only pays off
+   when clients send requests concurrently; over `adb forward` the ~13 MB of float32 per call dominates (~570 ms) and hides it.
 
 What is **not** available, checked on this device:
 - **Per-layer timing or counters** (neither from VIPLite nor from the trace). VIPLite reports whole-network time and cycles plus a layer count, nothing per layer. The library

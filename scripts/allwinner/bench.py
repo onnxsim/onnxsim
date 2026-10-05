@@ -47,6 +47,7 @@ def parse_npu(text):
         for m in re.finditer(r"(viplite_\w+): median ([\d.]+) ms", text)
     }
     load = re.search(r"load\+prepare: ([\d.]+) ms", text)
+    tput = re.search(r"throughput with \d+ concurrent callers: ([\d.]+) calls/s", text)
     inp = re.search(r"input\s+\S+ fmt=(\d+) .* dims=([\d ]+)", text)
     return {
         "total_ms": float(total.group(1)),
@@ -54,6 +55,7 @@ def parse_npu(text):
         "in_ms": phases.get("viplite_input"),
         "out_ms": phases.get("viplite_output"),
         "load_ms": float(load.group(1)) if load else None,
+        "calls_per_s": float(tput.group(1)) if tput else None,
         "input": inp.group(2).split() if inp else None,
     }
 
@@ -61,16 +63,17 @@ def parse_npu(text):
 def bench_npu(a, nb):
     runs = []
     for _ in range(a.repeats):
+        pin = f"taskset {a.taskset} " if a.taskset else ""
         text = adb(
             a.serial,
-            f"cd {a.dir} && ./onnx-remote-viplite-worker --bench {nb} {a.iters}",
+            f"cd {a.dir} && {pin}./onnx-remote-viplite-worker --bench {nb} {a.iters} --threads {a.threads}",
         )
         if "load:" in text and "vip_create_network failed" in text:
             return {"error": "not a valid NBG for this NPU generation"}
         runs.append(parse_npu(text))
     return {
         k: statistics.median(r[k] for r in runs) if runs[0][k] is not None else None
-        for k in ("total_ms", "npu_ms", "in_ms", "out_ms", "load_ms")
+        for k in ("total_ms", "npu_ms", "in_ms", "out_ms", "load_ms", "calls_per_s")
     } | {
         "npu_spread_ms": (
             min(r["npu_ms"] for r in runs),
@@ -113,7 +116,19 @@ def main(argv=None):
     )
     p.add_argument("--cpu-nb", help="the --nb that --cpu-onnx is the same network as")
     p.add_argument(
-        "--threads", default="1,4,8", help="CPU thread counts (default 1,4,8)"
+        "--cpu-threads",
+        default="1,4,8",
+        help="CPU thread counts for the ONNX Runtime baseline (default 1,4,8)",
+    )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="concurrent callers against the worker (1 = serial; 2 overlaps conversion with the NPU)",
+    )
+    p.add_argument(
+        "--taskset",
+        help="hex CPU mask for the worker (e.g. 80 = one big core on the A733); the default placement is noisy",
     )
     p.add_argument("--iters", type=int, default=100, help="NPU iterations per repeat")
     p.add_argument(
@@ -129,23 +144,30 @@ def main(argv=None):
         print(f"NPU {nb} ...", file=sys.stderr)
         result["npu"][nb] = bench_npu(a, nb)
     if a.cpu_onnx:
-        for t in a.threads.split(","):
+        for t in a.cpu_threads.split(","):
             print(f"CPU {a.cpu_onnx} threads={t} ...", file=sys.stderr)
             result["cpu"][t] = bench_cpu(a, a.cpu_onnx, int(t))
     result["temp_end_c"] = thermal(a.serial)
 
+    setup = f"{a.threads} concurrent caller(s)" + (
+        f", worker pinned with taskset {a.taskset}" if a.taskset else ""
+    )
     lines = [
-        f"| network | input dims (as the NBG reports them) | NPU ms | in ms | out ms | total ms | NPU range ({a.repeats} repeats) | load ms |",
-        "|---|---|---|---|---|---|---|---|",
+        f"Worker: {setup}.",
+        "",
+        f"| network | input dims (as the NBG reports them) | NPU ms | in ms | out ms | total ms | calls/s | NPU range ({a.repeats} repeats) | load ms |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for nb, r in result["npu"].items():
         if "error" in r:
-            lines.append(f"| {nb} | - | {r['error']} | | | | | |")
+            lines.append(f"| {nb} | - | {r['error']} | | | | | | |")
             continue
         lo, hi = r["npu_spread_ms"]
+        # calls/s is only reported for concurrent callers; serially it is 1000 / total_ms.
+        cps = r["calls_per_s"] or 1000.0 / r["total_ms"]
         lines.append(
             f"| {nb} | {'x'.join(r['input'])} | {fmt(r['npu_ms'])} | {fmt(r['in_ms'])} | {fmt(r['out_ms'])} | "
-            f"{fmt(r['total_ms'])} | {lo:.2f}-{hi:.2f} | {fmt(r['load_ms'], 1)} |"
+            f"{fmt(r['total_ms'])} | {cps:.1f} | {lo:.2f}-{hi:.2f} | {fmt(r['load_ms'], 1)} |"
         )
     if result["cpu"]:
         ref = result["npu"].get(a.cpu_nb, {})

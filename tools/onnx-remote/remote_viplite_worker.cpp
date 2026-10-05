@@ -18,6 +18,7 @@
 #include <vip_lite.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
@@ -27,11 +28,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -59,21 +63,46 @@ struct Port {
   size_t host_bytes = 0;
 };
 
-struct Net {
-  vip_network network = nullptr;
+// One independent set of input/output buffers. A network has two, so one request can convert its input (or read its output) while
+// another request's NPU run uses the other set: conversion on the CPU overlaps with execution on the NPU.
+struct Slot {
   std::vector<Port> inputs, outputs;
-  ~Net() {
+  bool busy = false;
+  ~Slot() {
     for (auto* ports : {&inputs, &outputs})
       for (auto& p : *ports) {
         if (p.buffer) vip_destroy_buffer(p.buffer);
         std::free(p.host);
       }
+  }
+};
+constexpr size_t kSlots = 2;
+
+struct Net {
+  vip_network network = nullptr;
+  std::vector<std::unique_ptr<Slot>> slots;
+  std::mutex mu;  // guards Slot::busy and the spare pool
+  std::condition_variable cv;
+  // Output float vectors handed back after a response was sent (see recycle), one set (a vector per output) each. A fresh multi-MB
+  // std::vector costs more to zero-fill and page-fault (about 5 ms for YOLOv5s' 1.6M-element output) than the dequantization itself.
+  std::vector<std::vector<std::vector<float>>> spare_pool;
+  Slot* bound = nullptr;  // the slot whose buffers are set on the network; only touched under g_npu
+  ~Net() {
+    slots.clear();
     if (network) { vip_finish_network(network); vip_destroy_network(network); }
   }
 };
 
 fs::path g_cache_dir = "/data/local/tmp/onnx-remote-viplite";
-std::map<std::string, std::unique_ptr<Net>> g_nets;
+std::mutex g_mu;   // guards g_nets and loading
+std::mutex g_npu;  // one vip_run_network (and the buffer rebinding before it) at a time
+std::map<std::string, std::shared_ptr<Net>> g_nets;
+
+std::shared_ptr<Net> get_net(const std::string& id) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto it = g_nets.find(id);
+  return it == g_nets.end() ? nullptr : it->second;
+}
 
 uint64_t now_us() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -257,7 +286,19 @@ bool create_buffer(Port& port, std::string& error) {
   return true;
 }
 
+// Point the network's inputs and outputs at a slot's buffers (before a run). Callers hold g_npu, or own the network exclusively.
+bool bind(Net& net, Slot& slot, std::string& error) {
+  if (net.bound == &slot) return true;
+  for (uint32_t i = 0; i < slot.inputs.size(); ++i)
+    if (vip_set_input(net.network, i, slot.inputs[i].buffer) != VIP_SUCCESS) { error = "vip_set_input failed"; return false; }
+  for (uint32_t i = 0; i < slot.outputs.size(); ++i)
+    if (vip_set_output(net.network, i, slot.outputs[i].buffer) != VIP_SUCCESS) { error = "vip_set_output failed"; return false; }
+  net.bound = &slot;
+  return true;
+}
+
 bool load(const std::string& id, const std::vector<uint8_t>& nb, Response& response) {
+  std::lock_guard<std::mutex> lk(g_mu);
   if (!valid_artifact_id(id)) { response.error = "invalid artifact id"; return false; }
   std::error_code ec;
   fs::create_directories(g_cache_dir, ec);
@@ -267,7 +308,7 @@ bool load(const std::string& id, const std::vector<uint8_t>& nb, Response& respo
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(nb.data()), static_cast<std::streamsize>(nb.size()));
     if (!out) { response.error = "cannot write artifact cache"; return false; }
-    g_nets.erase(id);  // a re-upload replaces the resident network
+    g_nets.erase(id);  // a re-upload replaces the resident network (requests still running keep the old one alive)
   }
   if (g_nets.count(id)) return true;
   std::ifstream in(path, std::ios::binary);
@@ -283,20 +324,27 @@ bool load(const std::string& id, const std::vector<uint8_t>& nb, Response& respo
   vip_uint32_t n_in = 0, n_out = 0;
   vip_query_network(net->network, VIP_NETWORK_PROP_INPUT_COUNT, &n_in);
   vip_query_network(net->network, VIP_NETWORK_PROP_OUTPUT_COUNT, &n_out);
-  net->inputs.resize(n_in);
-  net->outputs.resize(n_out);
+  for (size_t k = 0; k < kSlots; ++k) net->slots.push_back(std::make_unique<Slot>());
+  Slot& first = *net->slots[0];
+  first.inputs.resize(n_in);
+  first.outputs.resize(n_out);
   for (int side = 0; side < 2; ++side) {
-    auto& ports = side == 0 ? net->inputs : net->outputs;
-    for (uint32_t i = 0; i < ports.size(); ++i) {
+    auto& ports = side == 0 ? first.inputs : first.outputs;
+    for (uint32_t i = 0; i < ports.size(); ++i)
       if (!query_port(net->network, side == 0, i, ports[i], response.error)) return false;
-      if (!create_buffer(ports[i], response.error)) return false;
-    }
+  }
+  for (size_t k = 0; k < kSlots; ++k) {  // every slot has the same tensors and its own buffers
+    Slot& slot = *net->slots[k];
+    if (k) { slot.inputs = first.inputs; slot.outputs = first.outputs; }
+    for (auto* ports : {&slot.inputs, &slot.outputs})
+      for (Port& port : *ports) {
+        port.buffer = nullptr;
+        port.host = nullptr;
+        if (!create_buffer(port, response.error)) return false;
+      }
   }
   if ((st = vip_prepare_network(net->network)) != VIP_SUCCESS) { response.error = "vip_prepare_network failed (" + std::to_string(st) + ")"; return false; }
-  for (uint32_t i = 0; i < n_in; ++i)
-    if (vip_set_input(net->network, i, net->inputs[i].buffer) != VIP_SUCCESS) { response.error = "vip_set_input failed"; return false; }
-  for (uint32_t i = 0; i < n_out; ++i)
-    if (vip_set_output(net->network, i, net->outputs[i].buffer) != VIP_SUCCESS) { response.error = "vip_set_output failed"; return false; }
+  if (!bind(*net, first, response.error)) return false;
   g_nets[id] = std::move(net);
   return true;
 }
@@ -337,14 +385,15 @@ bool fill_input(const Port& port, const Tensor& t, std::string& error) {
   return true;
 }
 
-void read_output(const Port& port, Tensor& out) {
+void read_output(const Port& port, Tensor& out, std::vector<float>& spare) {
   vip_flush_buffer(port.buffer, VIP_BUFFER_OPER_TYPE_INVALIDATE);
   const uint8_t* src = port.host;
   const vip_enum fmt = port.params.data_format;
   const size_t native = format_bytes(fmt);
   out.dtype = kFloat;
   for (int k = static_cast<int>(port.params.num_of_dims) - 1; k >= 0; --k) out.shape.push_back(port.params.sizes[k]);
-  out.data.resize(static_cast<size_t>(port.elements));
+  out.data = std::move(spare);
+  out.data.resize(static_cast<size_t>(port.elements));  // no-op (and no page faults) when the recycled vector is already this size
   const QuantParams q = quant_params(port.params);
   float* dst = out.data.data();
   const uint64_t n = port.elements;
@@ -391,46 +440,88 @@ Response execute(const Request& request) {
     response.error = "viplite runner accepts capabilities/load_compiled/run_compiled";
     return response;
   }
-  if (!request.artifact.empty() || request.op == "load_compiled" || !g_nets.count(request.artifact_id)) {
+  std::shared_ptr<Net> net_ptr = get_net(request.artifact_id);
+  if (!request.artifact.empty() || request.op == "load_compiled" || !net_ptr) {
     if (!load(request.artifact_id, request.artifact, response)) return response;
     add_profile(response, request, "viplite_load", 0, now_us() - t0, request.artifact_id);
+    net_ptr = get_net(request.artifact_id);
   }
   if (request.op == "load_compiled") { response.ok = true; response.artifact_id = request.artifact_id; return response; }
 
-  Net& net = *g_nets[request.artifact_id];
-  if (request.inputs.size() != net.inputs.size()) {
-    response.error = "input count " + std::to_string(request.inputs.size()) + " differs from the NBG's " + std::to_string(net.inputs.size());
+  Net& net = *net_ptr;
+  const size_t n_in = net.slots[0]->inputs.size(), n_out = net.slots[0]->outputs.size();
+  if (request.inputs.size() != n_in) {
+    response.error = "input count " + std::to_string(request.inputs.size()) + " differs from the NBG's " + std::to_string(n_in);
     return response;
   }
+  // Take a free slot (waits while both are in use); the guard hands it back, and wakes a waiter, however this function exits.
+  Slot* slot = nullptr;
+  {
+    std::unique_lock<std::mutex> lk(net.mu);
+    net.cv.wait(lk, [&] { return !net.slots[0]->busy || !net.slots[1]->busy; });
+    slot = net.slots[0]->busy ? net.slots[1].get() : net.slots[0].get();
+    slot->busy = true;
+  }
+  struct Release {
+    Net& n; Slot* s;
+    ~Release() { { std::lock_guard<std::mutex> lk(n.mu); s->busy = false; } n.cv.notify_one(); }
+  } release{net, slot};
+
   const uint64_t fill_begin = now_us() - t0;
-  for (size_t i = 0; i < net.inputs.size(); ++i)
-    if (!fill_input(net.inputs[i], request.inputs[i], response.error)) return response;
-  const uint64_t run_begin = now_us() - t0;
-  const vip_status_e st = vip_run_network(net.network);
-  const uint64_t run_end = now_us() - t0;
-  if (st != VIP_SUCCESS) { response.error = "vip_run_network failed (" + std::to_string(st) + ")"; return response; }
-  response.outputs.resize(net.outputs.size());
-  for (size_t i = 0; i < net.outputs.size(); ++i) read_output(net.outputs[i], response.outputs[i]);
-  add_profile(response, request, "viplite_run", run_begin, run_end - run_begin, "NPU execution (wall, around vip_run_network)");
-  if (request.profiling != ProfilingLevel::Off) {
-    // The driver's own counters for this run: hardware inference time and NPU cycles (the ratio is the effective NPU clock).
-    // They are whole-network figures; VIPLite exposes no per-layer timing.
-    vip_inference_profile_t hw{};
-    if (vip_query_network(net.network, VIP_NETWORK_PROP_PROFILING, &hw) == VIP_SUCCESS) {
-      vip_uint32_t layers = 0;
+  for (size_t i = 0; i < n_in; ++i)
+    if (!fill_input(slot->inputs[i], request.inputs[i], response.error)) return response;
+  uint64_t run_begin, run_end, bind_us = 0;
+  vip_inference_profile_t hw{};
+  bool have_hw = false;
+  vip_uint32_t layers = 0;
+  {
+    std::lock_guard<std::mutex> npu(g_npu);  // only the NPU run itself is serialized; conversions on other slots proceed meanwhile
+    const uint64_t bind_begin = now_us() - t0;
+    if (!bind(net, *slot, response.error)) return response;
+    bind_us = now_us() - t0 - bind_begin;
+    run_begin = now_us() - t0;
+    const vip_status_e st = vip_run_network(net.network);
+    run_end = now_us() - t0;
+    if (st != VIP_SUCCESS) { response.error = "vip_run_network failed (" + std::to_string(st) + ")"; return response; }
+    if (request.profiling != ProfilingLevel::Off) {
+      have_hw = vip_query_network(net.network, VIP_NETWORK_PROP_PROFILING, &hw) == VIP_SUCCESS;
       vip_query_network(net.network, VIP_NETWORK_PROP_LAYER_COUNT, &layers);
-      std::ostringstream d;
-      d << "cycles=" << hw.total_cycle << " layers=" << layers;
-      if (hw.inference_time) d << " clock_mhz=" << static_cast<double>(hw.total_cycle) / hw.inference_time;
-      add_profile(response, request, "viplite_hw", run_begin, hw.inference_time, d.str());
     }
   }
+  std::vector<std::vector<float>> spare;
+  {
+    std::lock_guard<std::mutex> lk(net.mu);
+    if (!net.spare_pool.empty()) { spare = std::move(net.spare_pool.back()); net.spare_pool.pop_back(); }
+  }
+  spare.resize(n_out);
+  response.outputs.resize(n_out);
+  for (size_t i = 0; i < n_out; ++i) read_output(slot->outputs[i], response.outputs[i], spare[i]);
+  add_profile(response, request, "viplite_run", run_begin, run_end - run_begin, "NPU execution (wall, around vip_run_network)");
+  if (have_hw) {
+    // The driver's own counters for this run: hardware inference time and NPU cycles (the ratio is the effective NPU clock).
+    // They are whole-network figures; VIPLite exposes no per-layer timing.
+    std::ostringstream d;
+    d << "cycles=" << hw.total_cycle << " layers=" << layers;
+    if (hw.inference_time) d << " clock_mhz=" << static_cast<double>(hw.total_cycle) / hw.inference_time;
+    add_profile(response, request, "viplite_hw", run_begin, hw.inference_time, d.str());
+  }
   if (request.profiling == ProfilingLevel::Detailed) {
-    add_profile(response, request, "viplite_input", fill_begin, run_begin - fill_begin, "quantize + upload inputs");
+    add_profile(response, request, "viplite_input", fill_begin, run_begin - fill_begin, "quantize + upload inputs, and waiting for the NPU lock");
+    add_profile(response, request, "viplite_bind", run_begin - bind_us, bind_us, "vip_set_input/output to switch slots");
     add_profile(response, request, "viplite_output", run_end, now_us() - t0 - run_end, "dequantize outputs");
   }
   response.ok = true;
   return response;
+}
+
+// Take the output vectors back from a response that has been sent (or discarded) so the next run on that network reuses them.
+void recycle(const std::string& artifact_id, Response& response) {
+  std::shared_ptr<Net> net = get_net(artifact_id);
+  if (!net || response.outputs.size() != net->slots[0]->outputs.size()) return;
+  std::vector<std::vector<float>> set(response.outputs.size());
+  for (size_t i = 0; i < set.size(); ++i) set[i] = std::move(response.outputs[i].data);
+  std::lock_guard<std::mutex> lk(net->mu);
+  if (net->spare_pool.size() < 4) net->spare_pool.push_back(std::move(set));
 }
 
 // A client hands this worker NBG machine code for the NPU, so unlike the shared listen_tcp (which binds every interface) it listens on
@@ -450,9 +541,10 @@ int listen_on(const std::string& host, uint16_t port) {
   return fd;
 }
 
-// --bench FILE.nb [ITERS]: load a network, feed it random inputs, run it and print timing and an output summary. This is the
-// smoke test for a fresh device: it needs no client, compiler or network.
-int bench(const char* path, int iters) {
+// --bench FILE.nb [ITERS] [--threads N]: load a network, feed it random inputs, run it and print timing and an output summary. This is
+// the smoke test for a fresh device: it needs no client, compiler or network. With N > 1, N callers run concurrently (as N pipelined
+// clients would), which exercises the conversion/NPU overlap and reports throughput; the outputs of every call must match the first.
+int bench(const char* path, int iters, int threads) {
   std::ifstream in(path, std::ios::binary);
   std::vector<uint8_t> nb{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
   if (nb.empty()) { std::cerr << "cannot read " << path << '\n'; return 1; }
@@ -465,8 +557,8 @@ int bench(const char* path, int iters) {
   req.artifact_id = "bench";
   req.profiling = ProfilingLevel::Detailed;
   std::mt19937 rng(1);
-  Net& net = *g_nets["bench"];
-  for (const Port& p : net.inputs) {
+  std::shared_ptr<Net> net = get_net("bench");
+  for (const Port& p : net->slots[0]->inputs) {
     Tensor t;
     t.dtype = kFloat;
     for (int k = static_cast<int>(p.params.num_of_dims) - 1; k >= 0; --k) t.shape.push_back(p.params.sizes[k]);
@@ -478,21 +570,49 @@ int bench(const char* path, int iters) {
     std::cout << '\n';
     req.inputs.push_back(std::move(t));
   }
-  // One warm-up call, then `iters` timed ones; per-phase medians come from the response's own profile events.
-  Response last = execute(req);
-  if (!last.ok) { std::cerr << "run: " << last.error << '\n'; return 1; }
+  // Two warm-up calls (one per slot), then `iters` timed ones split over the callers; per-phase medians come from the responses' own
+  // profile events.
+  Response reference = execute(req);
+  if (!reference.ok) { std::cerr << "run: " << reference.error << '\n'; return 1; }
+  { Response w = execute(req); if (!w.ok) { std::cerr << "run: " << w.error << '\n'; return 1; } }
   std::map<std::string, std::vector<double>> phases;
   std::vector<double> ms;
-  for (int i = 0; i < iters; ++i) {
-    const uint64_t t0 = now_us();
-    last = execute(req);
-    if (!last.ok) { std::cerr << "run: " << last.error << '\n'; return 1; }
-    ms.push_back((now_us() - t0) / 1000.0);
-    for (const ProfileEvent& e : last.profile) phases[e.name].push_back(e.duration_us / 1000.0);
-  }
+  std::mutex result_mu;
+  std::atomic<int> mismatches{0}, checked{0};
+  Response last;
+  const int per_thread = std::max(1, iters / threads);
+  const uint64_t wall0 = now_us();
+  auto worker = [&](int tid) {
+    Response mine;
+    for (int i = 0; i < per_thread; ++i) {
+      const uint64_t t0 = now_us();
+      mine = execute(req);
+      const double dt = (now_us() - t0) / 1000.0;
+      if (!mine.ok) { std::cerr << "run: " << mine.error << '\n'; std::exit(1); }
+      {
+        std::lock_guard<std::mutex> lk(result_mu);
+        ms.push_back(dt);
+        for (const ProfileEvent& e : mine.profile) phases[e.name].push_back(e.duration_us / 1000.0);
+      }
+      if (checked++ < 40) {  // outside the timed region
+        bool same = mine.outputs.size() == reference.outputs.size();
+        for (size_t o = 0; same && o < mine.outputs.size(); ++o) same = mine.outputs[o].data == reference.outputs[o].data;
+        if (!same) ++mismatches;
+      }
+      if (i + 1 < per_thread) recycle("bench", mine);  // as the server does after sending a response
+    }
+    if (tid == 0) { std::lock_guard<std::mutex> lk(result_mu); last = std::move(mine); }
+  };
+  std::vector<std::thread> pool;
+  for (int t = 0; t < threads; ++t) pool.emplace_back(worker, t);
+  for (auto& t : pool) t.join();
+  const double wall_s = (now_us() - wall0) / 1e6;
   auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
   std::sort(ms.begin(), ms.end());
-  std::cout << "run (incl. quantize/IO) median " << median(ms) << " ms, min " << ms.front() << " ms, max " << ms.back() << " ms over " << iters << " iters\n";
+  std::cout << "run (incl. quantize/IO) median " << median(ms) << " ms, min " << ms.front() << " ms, max " << ms.back() << " ms over " << ms.size() << " iters\n";
+  if (threads > 1)
+    std::cout << "throughput with " << threads << " concurrent callers: " << ms.size() / wall_s << " calls/s (" << wall_s * 1000.0 / ms.size() << " ms per call)\n";
+  std::cout << "outputs identical to the first call across slots: " << (mismatches ? "NO (" + std::to_string(mismatches.load()) + " mismatches)" : "yes (" + std::to_string(std::min(checked.load(), 40)) + " calls checked)") << '\n';
   for (const ProfileEvent& e : last.profile) if (e.name == "viplite_hw") std::cout << "  hw counters: " << e.detail << '\n';
   for (const auto& [name, v] : phases)
     std::cout << "  " << name << ": median " << median(v) << " ms, min " << *std::min_element(v.begin(), v.end()) << " ms\n";
@@ -500,11 +620,11 @@ int bench(const char* path, int iters) {
     const Tensor& o = last.outputs[i];
     double sum = 0; float lo = INFINITY, hi = -INFINITY;
     for (float v : o.data) { sum += v; lo = std::min(lo, v); hi = std::max(hi, v); }
-    std::cout << "output " << net.outputs[i].name << " dims=";
+    std::cout << "output " << net->slots[0]->outputs[i].name << " dims=";
     for (int64_t s : o.shape) std::cout << s << ' ';
     std::cout << " min=" << lo << " max=" << hi << " mean=" << sum / std::max<size_t>(1, o.data.size()) << '\n';
   }
-  return 0;
+  return mismatches ? 1 : 0;
 }
 
 }  // namespace
@@ -514,16 +634,17 @@ int main(int argc, char** argv) {
   std::string host = "127.0.0.1";
   int fscale = 0;
   const char* bench_path = nullptr;
-  int bench_iters = 10;
+  int bench_iters = 10, bench_threads = 1;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--host" && i + 1 < argc) host = argv[++i];
     else if (a == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoul(argv[++i]));
     else if (a == "--fscale" && i + 1 < argc) fscale = std::atoi(argv[++i]);
+    else if (a == "--threads" && i + 1 < argc) bench_threads = std::max(1, std::atoi(argv[++i]));
     else if (a == "--cache-dir" && i + 1 < argc) g_cache_dir = argv[++i];
     else if (a == "--bench" && i + 1 < argc) { bench_path = argv[++i]; if (i + 1 < argc && argv[i + 1][0] != '-') bench_iters = std::atoi(argv[++i]); }
     else if (a == "--help") {
-      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] | --bench FILE.nb [ITERS]\n";
+      std::cout << "usage: onnx-remote-viplite-worker [--host ADDR (default 127.0.0.1)] [--port PORT] [--cache-dir DIR] [--fscale 1-100] | --bench FILE.nb [ITERS] [--threads N]\n";
       return 0;
     } else { std::cerr << "unknown argument: " << a << '\n'; return 2; }
   }
@@ -535,19 +656,33 @@ int main(int argc, char** argv) {
     std::cerr << "NPU clock scale " << fscale << "%: " << (st == VIP_SUCCESS ? "ok" : "failed " + std::to_string(st)) << '\n';
   }
   int rc = 0;
-  if (bench_path) rc = bench(bench_path, std::max(1, bench_iters));
+  if (bench_path) rc = bench(bench_path, std::max(1, bench_iters), bench_threads);
   else {
     int listener = listen_on(host, port);
     if (listener < 0) { std::cerr << "listen failed: " << std::strerror(errno) << '\n'; vip_destroy(); return 1; }
     std::cerr << "onnx-remote-viplite-worker listening on " << host << ":" << port << '\n';
+    // One thread per connection (the transport is one request per socket), so several pipelined clients overlap their conversions with
+    // each other's NPU runs; the g_npu lock keeps the NPU itself to one run at a time. The cap bounds memory held by in-flight tensors.
+    std::atomic<int> in_flight{0};
+    constexpr int kMaxInFlight = 8;
     for (;;) {
       int fd = accept_tcp(listener);
       if (fd < 0) continue;
-      Request request; Response response; std::string error;
-      if (!receive_request(fd, request, error)) response.error = error;
-      else response = execute(request);
-      if (!send_response(fd, response, error)) std::cerr << "response failed: " << error << '\n';
-      close_socket(fd);
+      if (in_flight >= kMaxInFlight) {  // shed load instead of queueing unbounded multi-MB requests
+        Response busy; busy.error = "viplite runner busy (too many concurrent requests)"; std::string e;
+        send_response(fd, busy, e); close_socket(fd);
+        continue;
+      }
+      ++in_flight;
+      std::thread([fd, &in_flight] {
+        Request request; Response response; std::string error;
+        if (!receive_request(fd, request, error)) response.error = error;
+        else response = execute(request);
+        if (!send_response(fd, response, error)) std::cerr << "response failed: " << error << '\n';
+        close_socket(fd);
+        if (response.ok && request.op == "run_compiled") recycle(request.artifact_id, response);
+        --in_flight;
+      }).detach();
     }
   }
   g_nets.clear();
