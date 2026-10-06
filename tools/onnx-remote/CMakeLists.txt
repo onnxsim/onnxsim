@@ -12,6 +12,8 @@ option(ONNXSIM_REMOTE_GRPC "Generate the optional host-side gRPC bindings" OFF)
 option(ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN
        "Build the public OrtEp remote execution-provider plugin"
        OFF)
+option(ONNXSIM_REMOTE_TENSORRT_WORKER
+       "Build the TensorRT-backed remote worker (needs CUDA + TensorRT, e.g. a Jetson)" OFF)
 option(ONNXSIM_REMOTE_ORT_WORKER
        "Build the optional ORT-backed serialized subgraph worker" OFF)
 set(ONNXSIM_ORT_WORKER_INCLUDE_DIR "" CACHE PATH
@@ -118,6 +120,28 @@ if (ONNXSIM_REMOTE_ORT_WORKER)
                         onnx_remote_transport ${ONNXSIM_ORT_WORKER_LIBRARY})
   install(TARGETS onnx-remote-ort-worker RUNTIME DESTINATION bin)
   install(TARGETS onnx-remote-ort-worker-test RUNTIME DESTINATION bin)
+endif()
+
+if (ONNXSIM_REMOTE_TENSORRT_WORKER)
+  find_package(CUDAToolkit REQUIRED)
+  find_path(TENSORRT_INCLUDE_DIR NvInfer.h REQUIRED
+            HINTS ${TENSORRT_ROOT} PATH_SUFFIXES include include/aarch64-linux-gnu include/x86_64-linux-gnu)
+  find_library(TENSORRT_NVINFER_LIBRARY nvinfer REQUIRED
+               HINTS ${TENSORRT_ROOT} PATH_SUFFIXES lib lib/aarch64-linux-gnu lib/x86_64-linux-gnu)
+  find_library(TENSORRT_NVONNXPARSER_LIBRARY nvonnxparser REQUIRED
+               HINTS ${TENSORRT_ROOT} PATH_SUFFIXES lib lib/aarch64-linux-gnu lib/x86_64-linux-gnu)
+  foreach(target onnx-remote-tensorrt-worker onnx-remote-tensorrt-worker-test)
+    if (target STREQUAL "onnx-remote-tensorrt-worker")
+      add_executable(${target} remote_tensorrt_worker.cpp)
+    else()
+      add_executable(${target} remote_tensorrt_worker_test.cpp)
+    endif()
+    target_include_directories(${target} PRIVATE ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(${target} PRIVATE onnx_remote_transport
+                          ${TENSORRT_NVINFER_LIBRARY} ${TENSORRT_NVONNXPARSER_LIBRARY}
+                          CUDA::cudart)
+    install(TARGETS ${target} RUNTIME DESTINATION bin)
+  endforeach()
 endif()
 
 add_executable(onnx-remote-client remote_client.cpp)

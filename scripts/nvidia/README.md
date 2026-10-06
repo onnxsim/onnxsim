@@ -19,6 +19,9 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `llm_pipeline.py` | onnxsim (Python >= 3.11) | pins shapes on a decoder-with-KV-cache LLM export and runs `simplify()` on it |
 | `llm_block_split.py` | onnxsim (`split`), system Python with `tensorrt` (`build`) | splits a decoder LLM into N-layer TensorRT-buildable blocks, chains them, measures real end-to-end latency per block size |
 | `edgellm_simplify.py` | onnxsim (Python >= 3.11) | runs onnxsim on a TensorRT Edge-LLM export dir for `llm_build` and checks plugin nodes / graph I/O are untouched; `rms-stack` writes a synthetic RMSNorm+MLP stack for `trtexec` |
+| `jetson/edgellm_bench.sh` | the Jetson (bash) | locks MAXN_SUPER clocks, runs `llm_bench` prefill/decode on Edge-LLM engine dirs, prints time, tok/s and decode vs the memory roofline, restores the power mode |
+| `jetson/read_bandwidth.cu` | the Jetson (`nvcc`) | measures achievable DRAM read bandwidth, the decode roofline |
+| `jetson/quantize_int4_small_gpu.sh` | host with an ~8 GB GPU | AWQ-INT4 quantization (backbone + lm_head) with Edge-LLM, working around its hard-coded calibration batch size 16 that OOMs the lm_head search |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -804,3 +807,14 @@ above are from the state dict.) Only 4-bit without `g_idx`, group sizes that div
 multiples of 128, and zero points that are absent, packed uint8, or integral floats in
 [0, 15] take the kernel; anything else (e.g. fractional float zero points, which
 MatMulNBits allows) falls back to dequantizing.
+
+## Jetson Orin Nano with JetPack 7.2.1: flashing, Edge-LLM, INT4
+
+[`docs/jetson-orin-nano-sdk-manager-flash.md`](../../docs/jetson-orin-nano-sdk-manager-flash.md)
+covers flashing the board headlessly from an SDK Manager container (with a pre-created user,
+since the first-boot wizard needs a display), building TensorRT Edge-LLM on the board, and
+measured Qwen3 0.6B/4B/8B decode and prefill against the memory-bandwidth and compute
+ideals. Summary: FP16 0.6B decode is at the memory roofline (84% of peak); INT4 helps 2.2x
+at 0.6B and reaches 76-79% of peak at 4B/8B; the 8B AWQ engine builds only with externalized
+weights and currently generates garbage (cause not isolated). The TensorRT RPC worker for
+`tools/onnx-remote` is built and tested on the same board.

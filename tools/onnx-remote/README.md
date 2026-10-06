@@ -164,6 +164,41 @@ The positional values are the first input; repeat `--input VALUES[@D0,D1]`
 for additional model inputs. Output shapes, values, and profile events are
 printed.
 
+## TensorRT worker (Jetson / NVIDIA GPU)
+
+`onnx-remote-tensorrt-worker` runs graphs on TensorRT. It speaks the same wire format as
+the ORT worker and handles three operations:
+
+- `subgraph` / `onnx`: `Request::model` holds a serialized ONNX `ModelProto`. The worker
+  parses it with `nvonnxparser`, builds an engine pinned to the request's input shapes
+  (dynamic dimensions become min = opt = max), runs it, and returns the outputs. Engines
+  are cached per (model hash, input dtypes/shapes) in an LRU of `--max-engines` (default 4).
+- `engine`: `Request::artifact` is a prebuilt serialized plan, for example the output of
+  `scripts/nvidia/trt_compile.py` through `onnx-remote-compiler`. Send it once under an
+  `artifact_id`; later requests can send only the `artifact_id`. A plan only loads on the
+  same TensorRT version and GPU it was built for.
+- `capabilities`: manifest with the TensorRT version and `fp16` setting.
+
+Inputs are matched to engine inputs by order; dtypes must match the engine exactly
+(FLOAT, FLOAT16, BFLOAT16, INT8, UINT8, INT32, INT64, BOOL are carried). Outputs with
+data-dependent shapes are rejected. Profiling returns `trt_engine_build` or
+`trt_engine_cache_hit`, plus the GPU time of `enqueueV3` as `trt_enqueue`. Errors come
+back as an `ERR` response and do not stop the worker.
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote -DONNXSIM_REMOTE_TENSORRT_WORKER=ON
+cmake --build build/onnx-remote --target onnx-remote-tensorrt-worker \
+      onnx-remote-tensorrt-worker-test
+./build/onnx-remote/onnx-remote-tensorrt-worker --port 39505 [--fp16] [--workspace-mb 1024]
+./build/onnx-remote/onnx-remote-tensorrt-worker-test 39505   # with the worker running
+```
+
+The build needs CUDA and TensorRT headers/libraries (`TENSORRT_ROOT` can point at a
+non-default install). It was built and tested on a Jetson Orin Nano with JetPack 7.2.1
+(CUDA 13.2, TensorRT 10.16). The worker is single-threaded and serves one request per
+connection, like the other workers. Building an engine takes seconds to minutes and blocks
+other clients, so prefer prebuilt `engine` plans for anything larger than a test graph.
+
 ## Design constraints
 
 * bounded message size and tensor count;
