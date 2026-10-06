@@ -1,6 +1,9 @@
 import argparse
 import contextvars
 import copy
+import functools
+import importlib.util
+import inspect
 import os
 import re
 import shutil
@@ -8535,6 +8538,157 @@ def inline_local_functions(
     return inlined
 
 
+# --------------------------------------------------------------------------
+# Default-on equivalence certification (onnxsim.certify) around simplify()
+# --------------------------------------------------------------------------
+
+#: Models larger than this (serialized) are not certified by default: the check
+#: needs a second copy of the original, and the SMT encoding targets small windows.
+_CERTIFY_MAX_BYTES = 64 * 1024 * 1024
+#: Wall-clock budget (seconds) for the whole default-on certification.
+_CERTIFY_TOTAL_SECONDS = 10.0
+
+
+def _certify_snapshot(model, output_path, explicit):
+    """A private copy of the original model for ``certify``, or ``(None, reason)``."""
+    if output_path is not None:
+        return None, "output_path streams the result to disk"
+    try:
+        if isinstance(model, str):
+            if os.path.getsize(model) > _CERTIFY_MAX_BYTES:
+                return None, "model is larger than the certify size limit"
+            snap = onnx.load(model, load_external_data=False)
+            if any(
+                t.data_location == onnx.TensorProto.EXTERNAL
+                for t in snap.graph.initializer
+            ):
+                return None, "model uses external data"
+            return snap, ""
+        if model.ByteSize() > _CERTIFY_MAX_BYTES:
+            return None, "model is larger than the certify size limit"
+        snap = onnx.ModelProto()
+        snap.CopyFrom(model)
+        return snap, ""
+    except Exception as e:  # never let a certify prerequisite break simplify
+        return None, f"could not snapshot the original ({e})"
+
+
+def _certify_result(orig, simplified, kwargs, explicit):
+    """Run certify and return ``(status, detail)``; never raises."""
+    from . import certify as _certify
+    from . import ranges as _ranges
+
+    annotated = _ranges.get_ranges(orig)
+    try:
+        report = _certify.certify(
+            orig,
+            simplified,
+            input_ranges=annotated or None,
+            atol=kwargs.get("check_atol", 1e-5),
+            rtol=kwargs.get("check_rtol", 1e-4),
+            max_work=100_000,
+            timeout_ms=5_000,
+            total_timeout_ms=int(_CERTIFY_TOTAL_SECONDS * 1000),
+        )
+    except (
+        ValueError
+    ) as e:  # e.g. inputs/outputs changed on purpose (unused_output, ...)
+        return "not-run", str(e)
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+    if report.ok:
+        return "proved", ", ".join(sorted(set(report.outputs.values())))
+    refuted = [w for w in report.windows if w.status == _certify.REFUTED]
+    if (
+        refuted
+        and not annotated
+        and all(_certify.NEEDS_RANGES_HINT in w.detail for w in refuted)
+    ):
+        return (
+            "unproven-no-ranges",
+            "differs only for very large inputs (rounding of re-computed constants?); "
+            "annotate input ranges with onnxsim.ranges.set_range to decide",
+        )
+    if refuted:
+        return "refuted", refuted[0].detail
+    first = next((w for w in report.windows if w.status == _certify.SKIPPED), None)
+    return "skipped", first.detail if first else "not all outputs proved"
+
+
+def _with_certify(fn):
+    """Wrap ``simplify`` so it also certifies its own result (best effort, on by default).
+
+    ``certify=None`` (default): run when z3-solver is installed and the model is small
+    enough; stay silent unless the verdict is ``refuted``. ``certify=True``: run, and
+    report every outcome including why it did not run. ``certify=False``: skip. The
+    verdict is recorded in the returned model's ``metadata_props`` (``onnxsim.certify``,
+    ``onnxsim.certify.detail``); it never changes the simplified model otherwise and a
+    failure inside certification never fails ``simplify``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, certify=None, **kwargs):
+        model = args[0] if args else kwargs.get("model")
+        explicit = certify is True
+        snap, why = None, ""
+        if certify is not False:
+            if importlib.util.find_spec("z3") is None:
+                why = "z3-solver is not installed (pip install z3-solver)"
+            else:
+                snap, why = _certify_snapshot(
+                    model, kwargs.get("output_path"), explicit
+                )
+        result = fn(*args, **kwargs)
+        if certify is False:
+            return result
+        if snap is None:
+            if explicit:
+                print(f"Certify: not run -- {why}")
+            return result
+        simplified = result[0]
+        status, detail = _certify_result(snap, simplified, kwargs, explicit)
+        if status == "error":
+            print(
+                Text(f"WARNING: certify failed internally: {detail}", style="bold red")
+            )
+        elif status == "refuted":
+            print(
+                Text(
+                    "WARNING: certify could not prove the simplified model equals the original and "
+                    f"found a counterexample: {detail}",
+                    style="bold red",
+                )
+            )
+        elif explicit:
+            print(f"Certify: {status} ({detail})")
+        for key, value in (
+            ("onnxsim.certify", status),
+            ("onnxsim.certify.detail", detail[:300]),
+        ):
+            if isinstance(simplified, onnx.ModelProto):
+                for p in list(simplified.metadata_props):
+                    if p.key == key:
+                        simplified.metadata_props.remove(p)
+                entry = simplified.metadata_props.add()
+                entry.key, entry.value = key, value
+        return result
+
+    sig = inspect.signature(fn)
+    wrapper.__signature__ = sig.replace(
+        parameters=list(sig.parameters.values())
+        + [
+            inspect.Parameter(
+                "certify",
+                inspect.Parameter.KEYWORD_ONLY,
+                default=None,
+                annotation=Optional[bool],
+            )
+        ]
+    )
+    return wrapper
+
+
+@_with_certify
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -8577,6 +8731,13 @@ def simplify(
     """
     :param model: onnx ModelProto object or file path
     :param check_n: The simplified model will be checked for `check_n` times by random inputs
+    :param certify: Also try to *prove* the result equals the original with Z3 (``onnxsim.certify``).
+            ``None`` (default): best effort -- runs when z3-solver is installed and the model is
+            small, silent unless it finds a counterexample. ``True``: always report the outcome,
+            including why it did not run. ``False``: skip. The verdict is stored in the returned
+            model's ``metadata_props`` (``onnxsim.certify``). Input ranges come from
+            ``onnxsim.ranges`` annotations on the model; without them a proof can only hold for
+            unbounded inputs, which a folded BatchNorm cannot satisfy exactly.
     :param perform_optimization: Whether to run onnx optimizer on the model
     :param skip_fuse_bn: Skip fuse_bn_into_conv onnx optimizer
     :param overwrite_input_shapes: If the model has dynamic input shape, user must pass a fixed input shape
@@ -9536,6 +9697,16 @@ def main():
         nargs="+",
     )
     parser.add_argument(
+        "--certify",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Also try to prove the simplified model equals the original with Z3 (onnxsim.certify; needs "
+        "z3-solver). The default is best effort: it runs when z3-solver is installed and the model is "
+        "small, and only speaks up on a counterexample. --certify always reports the outcome; "
+        "--no-certify skips it. Input ranges come from onnxsim.ranges annotations on the model "
+        "(python -m onnxsim.ranges).",
+    )
+    parser.add_argument(
         "--no-large-tensor",
         help="Some ops like Tile and ConstantOfShape can produce large tensor and make the model size much larger. Specifying this flag to skip folding these ops, with loss of some optimization chances. It can be followed with a threshold, for example, --no-large-tensor 1M or --no-large-tensor 100KB. A simple '--no-large-tensor' means '--no-large-tensor 1KB'.",
         type=str,
@@ -10323,6 +10494,7 @@ def main():
         target_opset_version=args.target_opset,
         extra_optimizers=args.enable_optimization,
         check_rtol=args.check_rtol,
+        certify=args.certify,
         check_atol=args.check_atol,
         input_fill=args.input_fill,
         providers=providers,

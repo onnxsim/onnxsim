@@ -7,6 +7,7 @@ import onnx.checker
 import onnx.defs
 
 from . import backend
+from . import ranges as _ranges
 
 Tensors = Dict[str, np.ndarray]
 TensorShape = List[int]
@@ -274,15 +275,25 @@ def compare(
                 )
                 shape[0] = 1
 
-        inputs = {
-            ipt: _fill_array(
-                full_input_shapes[ipt],
-                get_np_type_from_elem_type(get_elem_type(model, ipt)),
-                input_fill,
-            )
-            for ipt in input_names
-        }
-        return inputs
+        # Inputs annotated with an expected range (onnxsim.ranges) are sampled
+        # inside it -- the "random" fill is a stand-in for real data, and real data
+        # for an image or a probability input is not uniform [0, 1). Only the
+        # default "random" fill is replaced: ones/zeros/arange are deliberate.
+        annotated = _ranges.get_ranges(model) if input_fill == "random" else {}
+
+        def make(ipt):
+            shape = full_input_shapes[ipt]
+            np_type = get_np_type_from_elem_type(get_elem_type(model, ipt))
+            if ipt in annotated and np.issubdtype(np_type, np.number):
+                lo, hi = annotated[ipt]
+                if np.issubdtype(np_type, np.integer):
+                    # integer inputs (token ids, ...): inclusive integer range
+                    vals = np.floor(_ranges.sample((lo, hi + 1.0), shape, np.float64))
+                    return np.minimum(vals, hi).astype(np_type)
+                return _ranges.sample((lo, hi), shape, np_type)
+            return _fill_array(shape, np_type, input_fill)
+
+        return {ipt: make(ipt) for ipt in input_names}
 
     def forward(
         model: Union[str, onnx.ModelProto],
@@ -330,6 +341,7 @@ def compare(
     needs_seeding = n_times > 0 and (
         _has_unseeded_random_ops(model_opt) or _has_unseeded_random_ops(model_ori)
     )
+    warned_ranges: set = set()
     for i in range(n_times):
         print(f"Checking {i}/{n_times}...")
         if input_data is None:
@@ -344,6 +356,18 @@ def compare(
             trial_opt = model_opt
         res_ori = forward(trial_ori, inputs, custom_lib)
         res_opt = forward(trial_opt, inputs, custom_lib)
+        if verbose:
+            # An annotated output range is a promise about real use: say so when a
+            # model leaves it. Reported once per tensor and side; never fails the check.
+            for side, res, mdl in (
+                ("original", res_ori, model_ori),
+                ("simplified", res_opt, model_opt),
+            ):
+                if isinstance(mdl, onnx.ModelProto):
+                    for msg in _ranges.check_outputs(_ranges.get_ranges(mdl), res):
+                        if (side, msg.split(":")[0]) not in warned_ranges:
+                            warned_ranges.add((side, msg.split(":")[0]))
+                            print(f"WARNING: {side} model output {msg}")
 
         for name in res_opt.keys():
             # equal_nan=True: a NaN produced at the same position by *both*
