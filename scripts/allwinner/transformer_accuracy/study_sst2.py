@@ -265,6 +265,11 @@ def main():
         "--only",
         help="comma-separated substrings; run only schemes whose label contains one",
     )
+    p.add_argument(
+        "--robustness",
+        action="store_true",
+        help="also repeat the best 8-bit configurations over 3 random draws x 16/64/256 calibration sentences",
+    )
     p.add_argument("--json", type=Path, help="write the results here")
     a = p.parse_args()
     a.work.mkdir(parents=True, exist_ok=True)
@@ -345,8 +350,82 @@ def main():
             f"{label:56} {row['acc']:8.4f} {row['agree']:7.4f} {row['rel_rmse']:15.4f}   ({time.time() - t0:.0f}s)",
             flush=True,
         )
+    if a.robustness:
+        results += robustness(model, names, sets, vb, ref, labels, model_dir, data, a)
     if a.json:
         a.json.write_text(json.dumps(results, indent=1))
+
+
+def robustness(model, names, sets, vb, ref, labels, model_dir, data, a):
+    """The best 8-bit configurations over different calibration sets: 3 random draws x 16, 64 and 256 sentences."""
+    everything = set(names)
+    fused = sets["ln_interior"] | sets["gelu_interior"]
+    rest16 = everything - sets["matmul_in"]
+    configs = [
+        (
+            "W8A8 matmul inputs only (rest fp16), pcq minmax",
+            "pcq",
+            "minmax",
+            set(),
+            rest16,
+        ),
+        ("W8A8 matmul inputs only (rest fp16), pcq ema", "pcq", "ema", set(), rest16),
+        (
+            "a8 all + softmax-in fp16 + fused LN+GELU, pcq ema",
+            "pcq",
+            "ema",
+            fused,
+            sets["softmax_in"],
+        ),
+    ]
+    sizes, seeds = (16, 64, 256), (0, 1, 2)
+    pools = {
+        seed: tokenize(model_dir, data, a.seq, max(sizes), seed)[1] for seed in seeds
+    }
+    n_val = len(labels)
+    cells = {c[0]: [] for c in configs}
+    print(
+        f"\ncalibration robustness: {len(seeds)} draws x sizes {sizes} (accuracy / agreement with fp32)"
+    )
+    for size in sizes:
+        for seed in seeds:
+            ranges = qs.collect_ranges(
+                model, make_batches(pools[seed], a.batch, size), names
+            )
+            for label, scheme, calib_name, keep, keep16 in configs:
+                built = qs.build(
+                    model,
+                    ranges[calib_name],
+                    scheme,
+                    keep=frozenset(keep),
+                    keep_fp16=frozenset(keep16),
+                )
+                lg = qs.evaluate(built, vb)[:n_val]
+                cells[label].append(
+                    {
+                        "calib": size,
+                        "seed": seed,
+                        "acc": float((lg.argmax(1) == labels).mean()),
+                        "agree": float((lg.argmax(1) == ref.argmax(1)).mean()),
+                    }
+                )
+        print(f"  size {size} done", flush=True)
+    out = []
+    for label, rows in cells.items():
+        acc, agree = [r["acc"] for r in rows], [r["agree"] for r in rows]
+        print(
+            f"{label:58} accuracy mean {np.mean(acc):.4f} (min {min(acc):.4f}, max {max(acc):.4f}); agreement {min(agree):.3f}-{max(agree):.3f}"
+        )
+        out.append(
+            {
+                "label": label + " [calibration robustness]",
+                "runs": rows,
+                "acc_mean": float(np.mean(acc)),
+                "acc_min": min(acc),
+                "acc_max": max(acc),
+            }
+        )
+    return out
 
 
 if __name__ == "__main__":

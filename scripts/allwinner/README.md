@@ -280,13 +280,17 @@ and 20 (d=256, 4 heads, 2 layers, 64 tokens):
 | ViT | 111 (97 at opset 20) | 70 (62) | `LayerNormalization` x4, `Div` x4, `Gelu` x2 (opset 20) | none |
 
 `onnxsim` removes every `Identity` and `Constant` (and the causal mask folds to a constant). `scripts/allwinner/npu_rewrite.py` then
-replaces `LayerNormalization` (-> `ReduceMean`, `Sub`, `Mul`, `Sqrt`, `Reciprocal`, with the deviation pre-scaled by 1/16 before it is
-squared so that fp16 cannot overflow; see the accuracy study below), `Gelu` (-> `Erf`, or `Tanh` for the approximate form)
-and `Div` (-> `Mul` by a folded reciprocal, or `Reciprocal` + `Mul`) and checks the result against the original on random inputs: the
-largest difference was 1e-6 absolute (about 1e-6 of the output range), float32 rounding. `compile_nbg.py` runs it by default
-(`--no-rewrite` to skip) and records what it changed under `rewrites` in the manifest. It does not guess at `Einsum`, `Trilu` or
-`RMSNormalization`: they are reported. Unit tests (`tests/test_allwinner_npu_rewrite.py`) cover both `ReduceMean` conventions (axes as
-an attribute before opset 18, as an input after), both `Gelu` forms, constant and tensor divisors, zero divisors and integer division.
+replaces `LayerNormalization` and torch's decomposed RMSNorm (`Pow`, `ReduceMean`, `Add`, `Sqrt`, `Div`/`Reciprocal`, `Mul`) with a form
+that divides each row by its own max |x| before squaring (`Abs`, `ReduceMax`, `Max`, `Reciprocal`, `Mul`, `ReduceMean`, `Sqrt`:
+algebraically identical, and every squared value is at most 1, so fp16 cannot overflow; see the accuracy studies below), `Gelu`
+(-> `Erf`, or `Tanh` for the approximate form) and `Div` (-> `Mul` by a folded reciprocal, or `Reciprocal` + `Mul`), and checks the result
+against the original on random inputs: the largest difference on the nine toy models was 1.9e-6 absolute (4e-7 of the output range),
+float32 rounding. `compile_nbg.py` runs it by default (`--no-rewrite` to skip) and records what it changed under `rewrites` in the
+manifest. It does not guess at `Einsum`, `Trilu` or `RMSNormalization`: they are reported. The RMSNorm matcher only fires on the exact
+torch pattern with single-consumer intermediates, and reads only the tiny constants it needs, never the weights. Unit tests
+(`tests/test_allwinner_npu_rewrite.py`, 30) cover both `ReduceMean` conventions (axes as an attribute before opset 18, as an input
+after), both `Gelu` forms, constant and tensor divisors, zero divisors and integer division, activations whose squares overflow fp16,
+all-zero rows, and near-miss graphs that must be left alone.
 
 **Precision is the real question.** Every listed operator runs on one of two modules: **NN**, the integer MAC engine (i8/u8/i16), or
 **PPU**, a programmable unit for fp32/fp16/bf16. Fully connected layers (`fcl2`) are NN-only; `matrixmul`, `softmax`, `layer_norm`, `gelu`
@@ -314,63 +318,88 @@ not measured), which makes anything beyond small models impractical, independent
 input of the same type (needed for embedding lookups); this is **untested on hardware**, because no network available here has an integer
 input.
 
-### Accuracy of a real transformer under the NPU's quantization schemes (DistilBERT, SST-2)
+### Accuracy of real transformers under the NPU's quantization schemes (DistilBERT and SmolLM2)
 
-`scripts/allwinner/transformer_accuracy/` measures what each precision scheme the Acuity toolchain offers costs a fine-tuned transformer,
-without needing Acuity or the NPU. `study_sst2.py` downloads `distilbert-base-uncased-finetuned-sst-2-english` (safetensors only) and the
-SST-2 data, exports it with a fixed shape (batch 16 for speed, 64 tokens; the longest validation sentence is 55), runs it through
-`onnxsim` + `npu_rewrite.py`, and evaluates each scheme as emulated by `quantsim.py`, which inserts fake-quantize nodes after every float
-tensor and fake-quantizes the weights (`uint8` = asymmetric affine, `pcq` = per-channel symmetric int8 weights with 8-bit activations,
-`int16` = dynamic fixed point with power-of-two scales, `fp16`, `bf16`). Hybrid variants leave named tensors in float. Its primitives are
-unit-tested against numpy (`tests/test_allwinner_quantsim.py`). **This simulates the schemes; it is not Acuity and not the NPU**: Acuity's
-calibration algorithm, operator fusion and internal precisions may differ, and speed is not measured at all.
+`scripts/allwinner/transformer_accuracy/` measures what each precision scheme the Acuity toolchain offers costs two real pretrained
+models, without needing Acuity or the NPU: an encoder (DistilBERT fine-tuned on SST-2, accuracy on the 872 validation sentences:
+`study_sst2.py`) and a decoder (SmolLM2-135M, perplexity on WikiText-2: `study_smollm.py`). Each script downloads the model (safetensors
+only) and data, exports a fixed-shape ONNX graph, runs it through `onnxsim` + `npu_rewrite.py`, and evaluates every scheme as emulated by
+`quantsim.py`, which inserts fake-quantize nodes after every float tensor and fake-quantizes the weights (`uint8` = asymmetric affine,
+`pcq` = per-channel symmetric int8 weights with 8-bit activations, `int16` = dynamic fixed point with power-of-two scales, `fp16`,
+`bf16`); hybrid variants leave named tensors in float. Its primitives are unit-tested against numpy
+(`tests/test_allwinner_quantsim.py`, 18). **This simulates the schemes; it is not Acuity and not the NPU**: Acuity's calibration
+algorithm, operator fusion and internal precisions may differ, "rest fp16" assumes the float unit rounds tensors to fp16 but accumulates
+wider, and speed is not measured at all.
 
-The pipeline itself is sound: PyTorch fp32 gives **91.06%** on the 872 SST-2 validation sentences (the model's published figure), and the
-converted model (simplified, LayerNorm/Div rewritten, only documented operators) gives 91.06% with 100% prediction agreement.
+Both pipelines are sound: PyTorch fp32 gives **91.06%** on SST-2 (the model's published figure) and perplexity **39.267** on 64
+128-token WikiText-2 windows (short windows, so higher than the usual long-context figure; only the comparison matters), and the converted
+models (simplified, norms/Div rewritten, only documented operators) reproduce both exactly with 100% prediction agreement.
 
-| scheme (emulated) | accuracy | vs fp32 | predictions agreeing with fp32 | logit error (RMSE / range) |
+**DistilBERT / SST-2** (accuracy; agreement is the fraction of predictions equal to fp32's; calibration 128 training sentences):
+
+| scheme (emulated) | accuracy | vs fp32 | agreement | logit error (RMSE / range) |
 |---|---|---|---|---|
 | fp32 | 91.06% | | | |
-| fp16, every tensor and weight | 90.94% | -0.12 | 99.89% | 0.0005 |
-| bf16, every tensor and weight | 91.06% | 0.00 | 100% | 0.0034 |
-| int16 fixed point; softmax input fp16; LayerNorm/GELU interiors float | 91.06% | 0.00 | 100% | 0.0010 |
-| int16 fixed point; softmax input fp16; LayerNorm/GELU per-op | 91.17% | +0.11 | 98.05% | 0.161 |
-| int16 fixed point, everything | 75.92% | -15.14 | 75.46% | 0.306 |
+| fp16, every tensor and weight | 91.06% | 0.00 | 100% | 0.0004 |
+| bf16, every tensor and weight | 90.83% | -0.23 | 99.77% | 0.0034 |
+| int16 fixed point, softmax input fp16, norm/GELU per-op | 91.06% | 0.00 | 100% | 0.0030 |
+| int16 fixed point, softmax input fp16, norm/GELU interiors float | 90.94% | -0.12 | 99.89% | 0.0010 |
+| int16 fixed point, everything (mask unfixed) | 76.15% | -14.91 | 75.92% | 0.304 |
 | weights only, int8 per-channel (activations float) | 90.60% | -0.46 | 99.31% | 0.0082 |
 | weights only, uint8 per-tensor | 90.25% | -0.81 | 98.51% | 0.0255 |
-| **int8 on matmul inputs only, rest fp16**, pcq, min/max calibration | 90.48% | -0.58 | 98.51% | 0.0265 |
-| same, moving-average calibration | 90.37% | -0.69 | 98.17% | 0.0310 |
-| same, 99.9th-percentile calibration | 86.93% | -4.13 | 88.07% | 0.183 |
-| int8 on every tensor (softmax input fp16, LayerNorm/GELU interiors float), min/max | 85.32% | -5.74 | 88.30% | 0.350 |
-| same, moving-average calibration | 88.88% | -2.18 | 93.46% | 0.246 |
-| same, 99.9th-percentile calibration | 84.86% | -6.20 | 87.84% | 0.198 |
+| **int8 on matmul inputs only, rest fp16**, pcq, min/max calibration | 90.25% | -0.81 | 98.51% | 0.0316 |
+| same, moving-average calibration | 90.37% | -0.69 | 98.62% | 0.0278 |
+| same, 99.9th-percentile calibration | 86.70% | -4.36 | 88.30% | 0.184 |
+| int8 on every tensor (softmax input fp16, LayerNorm/GELU interiors float), min/max | 85.67% | -5.39 | 88.65% | 0.350 |
+| same, moving-average calibration | 89.22% | -1.84 | 93.81% | 0.246 |
+| same, 99.9th-percentile calibration | 84.52% | -6.54 | 87.96% | 0.198 |
 
-Calibration was 128 training sentences. Repeating the two best 8-bit configurations over three different draws of 16, 64 and 256
-sentences (nine calibration sets each) gave: int8 on matmul inputs only, mean 90.33% (89.68-90.94%, 97.7-98.6% agreement) with min/max
-and 90.29% (90.02-90.60%) with moving average; int8 on every tensor, moving average, mean 88.95% (87.61-89.91%, 90.4-95.0% agreement).
-More calibration data did not help. With 872 sentences the standard error of one accuracy is about 1 point, so accuracy differences
-under a point are not significant on their own; the agreement and logit-error columns are paired and tighter.
+Over nine calibration sets (three random draws of 16, 64 and 256 sentences; `--robustness`): int8 on matmul inputs only gave a mean of
+90.39% (90.02-90.71%, 97.8-98.6% agreement) with min/max and 90.47% (90.02-90.71%) with moving average; int8 on every tensor, moving
+average, a mean of 88.94% (87.04-90.14%, 90.5-95.0% agreement). More calibration data did not help. With 872 sentences one accuracy has a
+standard error of about 1 point, so differences under a point are not significant alone; agreement and logit error are paired and tighter.
 
-What it found:
+**SmolLM2-135M / WikiText-2** (perplexity, lower is better; 64 windows of 128 tokens; top-1 is next-token agreement with fp32):
 
-1. **A decomposed LayerNorm overflows fp16.** The first fp16 run lost 0.7 points (6% logit error). Bisecting by tensor put all of it on
-   one: the squared deviation `d*d`, whose range reaches 3.4e5, above fp16's 65504, because DistilBERT's residual stream has outlier
-   channels with deviations up to +-582. The sum of squares becomes infinity and the normalized output zero. `npu_rewrite.py` now
-   pre-scales the deviation by 1/16 before squaring (mathematically identical, one extra multiply), which brought fp16 from 90.37% to 90.94%
-   and the logit error from 0.059 to 0.0005. Any fp16 execution of the decomposed form would hit this unless the compiler fuses
-   LayerNorm with a wider internal accumulator; whether Acuity does is unknown.
-2. **The attention padding mask breaks any integer scheme.** The mask is added to the attention scores with fill value -3.4e38, so that
-   tensor's calibrated range is 3.4e38 and a fixed-point or 8-bit scale rounds every real score to zero: int16 everywhere falls to 75.9%,
-   and 8-bit schemes with nothing kept float sat at 52-53% (chance; run before the LayerNorm change, which does not affect this).
-   Keeping just the six scores-plus-mask tensors in fp16 brings int16 back to 91.17%. In a toolchain whose hybrid layers only offer
-   16-bit fixed point that tensor cannot be kept this way, so feed fixed-length inputs without padding, or test a modest fill value
-   (not tried here), or use float for the graph.
-3. **Outlier channels make 8-bit on every tensor expensive.** Quantizing all tensors to 8 bits costs 2-6 points, and the cost depends
-   on calibration. Clipping at the 99.9th percentile is worse than min/max (-4.1 versus -0.6 on matmul inputs) because the outliers
-   carry signal. Keeping everything except matmul inputs in 16-bit float (the emulated matrix-engine split) costs about 0.7 points.
-4. **16-bit schemes are near-lossless.** bf16 and int16 fixed point (once the mask tensor and the fused LayerNorm/GELU interiors are
-   float) match fp32; per-op int16 LayerNorm interiors alone cost a 16% logit error even though accuracy happens to hold.
-5. Weight quantization alone is cheap (-0.5 int8 per-channel, -0.8 uint8 per-tensor); the loss is in the activations.
+| scheme (emulated) | perplexity | vs fp32 | top-1 agreement | logit error |
+|---|---|---|---|---|
+| fp32 | 39.267 | | | |
+| fp16, every tensor and weight | 39.270 | +0.0% | 99.7% | 0.0003 |
+| bf16, every tensor and weight | 39.263 | -0.0% | 96.8% | 0.0023 |
+| **int16 fixed point on matmul inputs only, rest fp16** | 39.428 | +0.4% | 96.3% | 0.0027 |
+| weights only, int8 per-channel | 39.872 | +1.5% | 94.2% | 0.0042 |
+| int16 fixed point, softmax input fp16 | 41.569 | +5.9% | 85.0% | 0.0120 |
+| weights only, uint8 per-tensor | 44.510 | +13.4% | 83.3% | 0.0185 |
+| **int8 on matmul inputs only, rest fp16**, min/max | 74.221 | +89% | 58.5% | 0.0425 |
+| same, moving-average calibration | 70.967 | +81% | 59.5% | 0.0409 |
+| int8 on every tensor (hybrid softmax/norm/SiLU) | 43 343 | collapse | 0.1% | 0.160 |
+| int16 fixed point, everything (mask unfixed) | 4 999.5 | collapse | 8.6% | 0.110 |
 
-Not done: another architecture or task, perplexity for a decoder, the real Acuity or NPU. The conclusions are about the schemes, on one
-model and one dataset.
+What the two studies found:
+
+1. **A decomposed norm overflows fp16, so the rewrite never forms an unscaled square.** The first DistilBERT fp16 run lost 0.7 points
+   (6% logit error); bisecting by tensor put all of it on one, the squared deviation, whose range reaches 3.4e5 against fp16's 65504
+   (the residual stream has outlier channels with deviations up to +-582). A static 1/16 pre-scale fixed that model (90.94%) but not
+   the decoder: SmolLM2's activations reach about 2e4, so torch's RMSNorm squares reach **4.1e8**, and fp16 on every tensor gave
+   perplexity 31 541 (top-1 agreement 2%). `npu_rewrite.py` now divides each row by its own max |x| before squaring, for both
+   LayerNormalization and RMSNorm; every squared value is at most 1 and the result is algebraically unchanged. With it fp16 is exact on
+   both models (91.06%, 39.270). Whether Acuity fuses these norms with a wider internal accumulator is unknown; without the rewrite any
+   fp16 execution of the decomposed form is unsafe on models with outlier channels.
+2. **The attention mask breaks any integer scheme unless that tensor stays float.** The mask is added to the scores with fill value
+   -3.4e38, so the calibrated range is 3.4e38 and a fixed-point or 8-bit scale rounds every real score to zero: int16 everywhere falls
+   to 76% (DistilBERT) and perplexity 5 000 (SmolLM2). Keeping the scores-plus-mask tensors in fp16 brings int16 back to near fp32. In
+   a toolchain whose hybrid layers only offer 16-bit fixed point that tensor cannot be kept this way, so feed fixed-length inputs
+   without padding, test a modest fill value (not tried here), or use float for the graph.
+3. **8-bit activations: tolerable for the encoder, ruinous for the decoder.** DistilBERT loses about 0.7 points with int8 on matmul inputs
+   only (rest fp16) and 2-6 points with int8 on every tensor, depending on calibration; clipping at the 99.9th percentile is worse than
+   min/max (-4.4 versus -0.8) because the outliers carry signal. SmolLM2 gains +81-89% perplexity with int8 on matmul inputs alone and
+   collapses with int8 everywhere: its massive activations leave an 8-bit step far too coarse. 16-bit fixed point on the matmul inputs
+   costs +0.4%. LLM-style models need smoothing or rotation tricks (not part of Acuity as far as this study can tell) for 8-bit activations.
+4. **Weight-only int8 per-channel is cheap** (-0.46 points; +1.5% perplexity); per-tensor uint8 weights are not (+13% on the decoder).
+   fp16 and bf16 on the whole graph are lossless once the norms are rewritten, so `--quant float` is the accuracy-safe fallback,
+   at whatever speed the float unit gives (not measured).
+5. The vocabulary projection (49 152 outputs) is flagged by `npu_rewrite.py` against the documented 8191 size limit; it would have to
+   be split.
+
+Not done: other architectures or tasks, long contexts and KV caches, the real Acuity or NPU, and any speed measurement. The conclusions are
+about the schemes, on one encoder and one small decoder.

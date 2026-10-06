@@ -216,3 +216,129 @@ def test_documented_set_covers_what_a_transformer_needs():
     needed = "MatMul Gemm Softmax Erf Tanh Sigmoid Silu Exp Sqrt Pow Reciprocal ReduceMean Where Cast Gather Transpose Reshape Slice Split".split()
     assert all(op in npu.DOCUMENTED_ONNX_OPS for op in needed)
     assert not {"LayerNormalization", "Gelu", "Div"} & npu.DOCUMENTED_ONNX_OPS
+
+
+def _rms_body(opset, reciprocal="Div", axes="-1", exponent="two", extra=""):
+    mean = (
+        f"ReduceMean<keepdims = 1, axes = [{axes}]>(p)"
+        if opset < 18
+        else "ReduceMean<keepdims = 1>(p, ax)"
+    )
+    recip = "Div(one, s)" if reciprocal == "Div" else "Reciprocal(s)"
+    return f"""g (float[2, 3, 8] x) => (float[2, 3, 8] y{", float[2, 3, 8] n" if extra == "n_output" else ""}) {{
+        p = Pow(x, {exponent})
+        m = {mean}
+        e = Add(m, eps)
+        s = Sqrt(e)
+        r = {recip}
+        n = Mul(x, r)
+        y = Mul(n, w)
+    }}"""
+
+
+def _rms_inits(weights=None):
+    return [
+        _init("two", np.float32(2.0)),
+        _init("three", np.float32(3.0)),
+        _init("one", np.float32(1.0)),
+        _init("eps", np.float32(1e-5)),
+        _init("w", np.ones(8) if weights is None else weights),
+        numpy_helper.from_array(np.array([-1], np.int64), "ax"),
+    ]
+
+
+@pytest.mark.parametrize("opset", [17, 18])
+@pytest.mark.parametrize("reciprocal", ["Div", "Reciprocal"])
+def test_rmsnorm_is_rewritten_exactly(opset, reciprocal):
+    w = RNG.standard_normal(8) + 1
+    model = _model(_rms_body(opset, reciprocal), _rms_inits(w), opset)
+    x = (RNG.standard_normal((2, 3, 8)) * 3).astype(np.float32)
+    rewritten, stats = _check_equivalent(model, {"x": x}, atol=2e-5)
+    assert stats["RMSNorm"] == 1
+    ops = npu.op_histogram(rewritten)
+    assert (
+        "Pow" not in ops
+        and "Div" not in ops
+        and ops["ReduceMax"] == 1
+        and ops["ReduceMean"] == 1
+    )
+
+
+def test_rmsnorm_handles_activations_whose_squares_overflow_fp16():
+    # SmolLM2-135M's residual stream reaches ~2e4, so x*x is ~4e8 (fp16 max 65504): torch's formula cannot be held in fp16 at all.
+    # Dividing by the row's max |x| first keeps every squared value at most 1 and still gives the same answer.
+    model = _model(_rms_body(17), _rms_inits(), 17)
+    x = RNG.standard_normal((2, 3, 8)).astype(np.float32)
+    x[0, 0, 3] = 25000.0
+    x[1, 2, 5] = -31000.0
+    assert (x**2).max() > 6e8  # the raw squares are ~1e4 times fp16's range
+    rewritten, _ = _check_equivalent(model, {"x": x}, atol=1e-5)
+    probe = onnx.ModelProto.FromString(rewritten.SerializeToString())
+    internal = [
+        n.output[0]
+        for n in probe.graph.node
+        if "__" in n.output[0] and n.op_type in ("Mul", "Add", "ReduceMean")
+    ]
+    probe.graph.ClearField("output")
+    probe.graph.output.extend(
+        onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, None)
+        for t in internal
+    )
+    for value in ReferenceEvaluator(probe).run(None, {"x": x}):
+        assert np.abs(value).max() < 65504 / 8, "an interior tensor can overflow fp16"
+
+
+def test_rmsnorm_rewrite_is_finite_on_an_all_zero_row_and_matches_epsilon_on_tiny_rows():
+    model = _model(_rms_body(17), _rms_inits(), 17)
+    x = RNG.standard_normal((2, 3, 8)).astype(np.float32)
+    x[0, 0] = 0.0  # torch gives 0 * rsqrt(eps) = 0
+    x[1, 1] *= (
+        1e-4  # rows whose energy is comparable to eps, where the epsilon term matters
+    )
+    rewritten, _ = _check_equivalent(model, {"x": x}, atol=1e-6)
+    out = ReferenceEvaluator(rewritten).run(None, {"x": x})[0]
+    assert np.isfinite(out).all() and (out[0, 0] == 0).all()
+
+
+@pytest.mark.parametrize(
+    "body_kwargs,why",
+    [
+        ({"exponent": "three"}, "a cube is not a mean square"),
+        ({"axes": "1"}, "normalising over another axis is not RMSNorm over the last"),
+        (
+            {"extra": "n_output"},
+            "the pre-weight tensor is also a graph output, so it cannot be replaced by an interior one",
+        ),
+    ],
+)
+def test_near_miss_graphs_are_left_alone(body_kwargs, why):
+    model = _model(_rms_body(17, **body_kwargs), _rms_inits(), 17)
+    rewritten, stats = npu.rewrite(model)
+    assert not stats.get("RMSNorm"), why
+    assert npu.op_histogram(rewritten)["Pow"] == 1
+
+
+def test_rmsnorm_with_an_extra_consumer_of_an_intermediate_is_left_alone():
+    body = """g (float[2, 3, 8] x) => (float[2, 3, 8] y, float[2, 3, 1] z) {
+        p = Pow(x, two)
+        m = ReduceMean<keepdims = 1, axes = [-1]>(p)
+        e = Add(m, eps)
+        s = Sqrt(e)
+        r = Div(one, s)
+        n = Mul(x, r)
+        y = Mul(n, w)
+        z = Neg(s)
+    }"""
+    rewritten, stats = npu.rewrite(_model(body, _rms_inits(), 17))
+    assert not stats.get("RMSNorm") and npu.op_histogram(rewritten)["Pow"] == 1
+
+
+def test_rewrite_never_reads_weights_or_chokes_on_a_malformed_initializer():
+    # The pattern matchers only need scalars, so a large (or, as here, malformed: 36 elements declared, one stored) initializer is
+    # never converted to an array. Reading every weight would copy a whole LLM just to look at a few constants.
+    model = _model(
+        "g (float[1, 3, 8, 8] x) => (float[1, 4, 8, 8] y) <float[4, 3, 3, 3] W = {0.1}> { y = Conv<pads = [1, 1, 1, 1]>(x, W) }",
+        opset=13,
+    )
+    rewritten, stats = npu.rewrite(model)
+    assert not stats and npu.op_histogram(rewritten) == {"Conv": 1}

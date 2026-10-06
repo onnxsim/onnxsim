@@ -270,7 +270,9 @@ def evaluate(model, batches):
 
 
 # ---- structure: which tensors a hybrid scheme leaves alone ---------------------------------------------------------------------
-LN_INTERIOR = re.compile(r"__(mean|d|ds|sq|var|veps|std|inv|n|scaled)\d+$")
+LN_INTERIOR = re.compile(
+    r"__(mean|d|ad|mx|mxs|rm|ds|sq|var|rr|epss|veps|std|inv|n|scaled)\d+$"
+)
 
 
 def hybrid_sets(model):
@@ -279,6 +281,8 @@ def hybrid_sets(model):
     softmax_in: the (scores + mask) tensors feeding Softmax, whose range is set by the mask fill value;
     ln_interior: the interior tensors npu_rewrite.py creates for a LayerNormalization (a fused kernel computes them internally);
     gelu_interior: the interior of an erf-GELU, between the Gemm/MatMul that feeds it and the one that consumes it;
+    rms_interior: the interior of a decomposed RMSNorm (Pow(x, 2) ... up to the weight multiply);
+    silu_interior: the Sigmoid output of a SiLU (h * Sigmoid(h));
     matmul_in: activation tensors feeding Gemm/MatMul, the only ones an int8 matrix engine needs in 8 bits."""
     names = set(float_node_outputs(model))
     producers = {o: n for n in model.graph.node for o in n.output}
@@ -323,9 +327,45 @@ def hybrid_sets(model):
             if any(c.op_type in ("Gemm", "MatMul") for c in consumers.get(x, []))
         }
         gelu_interior |= (back | fwd) - boundary
+    # RMSNorm, as torch exports it: Pow(x, 2) -> ReduceMean -> Add(eps) -> Sqrt -> Reciprocal/Div -> Mul(x, .) -> Mul(weight, .).
+    # Everything from the Pow output up to (not including) the weight multiply is the interior of a fused kernel.
+    initializers = {i.name: i for i in model.graph.initializer}
+    rms_interior = set()
+    for pow_node in (n for n in model.graph.node if n.op_type == "Pow"):
+        exponent = initializers.get(pow_node.input[1])
+        is_square = exponent is not None and np.allclose(
+            numpy_helper.to_array(exponent), 2.0
+        )
+        if not is_square or not any(
+            c.op_type == "ReduceMean" for c in consumers.get(pow_node.output[0], [])
+        ):
+            continue
+        seen, stack = set(), [pow_node.output[0]]
+        while stack:
+            t = stack.pop()
+            if t in seen:
+                continue
+            seen.add(t)
+            for c in consumers.get(t, []):
+                if c.op_type == "Mul" and any(i in initializers for i in c.input):
+                    continue  # the weight multiply: its output is the norm's result and stays quantized
+                stack += list(c.output)
+        rms_interior |= seen
+    # SiLU(h) = h * Sigmoid(h): the sigmoid output is interior to a fused swish kernel; the product leaves the kernel and stays quantized
+    silu_interior = {
+        s.output[0]
+        for s in model.graph.node
+        if s.op_type == "Sigmoid"
+        and any(
+            c.op_type == "Mul" and s.input[0] in c.input
+            for c in consumers.get(s.output[0], [])
+        )
+    }
     return {
         "softmax_in": softmax_in & names,
         "ln_interior": ln_interior,
         "gelu_interior": gelu_interior & names,
+        "rms_interior": rms_interior & names,
+        "silu_interior": silu_interior & names,
         "matmul_in": matmul_in,
     }

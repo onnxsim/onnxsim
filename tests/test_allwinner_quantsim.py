@@ -290,3 +290,39 @@ def test_hybrid_sets_find_softmax_inputs_layernorm_and_gelu_interiors_and_matmul
     )  # its input and output stay quantized
     assert {"n", "a"} <= sets["matmul_in"]
     onnx.checker.check_model(model)
+
+
+def test_hybrid_sets_find_rmsnorm_and_silu_interiors():
+    body = """g (float[2, 8] x) => (float[2, 8] y, float[2, 8] cube) {
+        p = Pow(x, two)
+        m = ReduceMean<axes = [-1], keepdims = 1>(p)
+        e = Add(m, eps)
+        s = Sqrt(e)
+        r = Reciprocal(s)
+        n = Mul(x, r)
+        w = Mul(n, weight)
+        sg = Sigmoid(w)
+        y = Mul(w, sg)
+        cube = Pow(x, three)
+    }"""
+    init = [
+        numpy_helper.from_array(np.float32(v).reshape(()), n)
+        for n, v in (("two", 2.0), ("three", 3.0), ("eps", 1e-6))
+    ]
+    init.append(numpy_helper.from_array(np.ones(8, np.float32), "weight"))
+    sets = qs.hybrid_sets(_model(body, init))
+    assert sets["rms_interior"] == {
+        "p",
+        "m",
+        "e",
+        "s",
+        "r",
+        "n",
+    }  # everything up to, not including, the weight multiply
+    assert "w" not in sets["rms_interior"] and "y" not in sets["rms_interior"]
+    assert sets["silu_interior"] == {
+        "sg"
+    }  # the product w*sigmoid(w) leaves the fused kernel
+    assert (
+        "cube" not in sets["rms_interior"]
+    )  # a Pow that is not a squared mean is not an RMSNorm
