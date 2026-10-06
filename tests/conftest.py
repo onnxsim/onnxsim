@@ -59,7 +59,13 @@ _AXERA_PREFIX_RE = re.compile(r"^test_(axera|axelera|pulsar2)_")
 # default on, a pure-Z3 test in CI's formal-verification job hung until the
 # 6-hour job limit. See ONNXSIM_CERTIFY in onnxsim/onnx_simplifier.py.
 _CERTIFY_TEST_MODULES = frozenset(
-    {"test_certify", "test_simplify_certify", "test_interval", "test_docs_ranges"}
+    {
+        "test_certify",
+        "test_certify_zonotope",
+        "test_simplify_certify",
+        "test_interval",
+        "test_docs_ranges",
+    }
 )
 
 

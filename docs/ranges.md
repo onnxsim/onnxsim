@@ -218,10 +218,10 @@ when certification ran; nothing is written when it was skipped. The values are:
 
 | Verdict | Meaning |
 |---|---|
-| `proved` | Every output was proved equal within `check_atol`/`check_rtol` (the detail lists how). |
+| `proved` | Every output was proved equal within `check_atol`/`check_rtol`. The detail names what proved each one: `proved-structural`, `proved-congruence`, `proved-smt`, `proved-reduced` or `proved-affine` (see below). |
 | `refuted` | Z3 found an input in the range where the two models differ. Always printed. |
 | `unproven-no-ranges` | Z3 found a difference, but only for huge inputs and no range was annotated; see below. |
-| `skipped` | Some window was too large for the encoder, used an unsupported op, or timed out. |
+| `skipped` | Some window was too large for the encoder, used an unsupported op, or timed out, and the zonotope fallback (below) did not prove it either. |
 | `not-run` | The original and simplified models do not have the same inputs/outputs (for example `unused_output`), so they cannot be compared. |
 | `error` | Certification itself failed. Printed, and never fails `simplify`. |
 
@@ -262,9 +262,39 @@ annotation at all and every counterexample needs that kind of huge input, the ve
 downgraded from `refuted` to `unproven-no-ranges` and nothing is printed. Annotate the
 input and the same fold is `proved`.
 
-The downgrade tests for *any* annotation, not for an annotated input: a model whose only
-annotation is on an output, with the input still unbounded, gets no downgrade and the same
-fold is reported (and printed) as `refuted`. Annotate the inputs.
+The downgrade looks only at annotations on graph **inputs**, because only those bound
+anything certification can use. A model whose only annotation is on an output still has an
+unbounded input, so the same fold is `unproven-no-ranges` (and nothing is printed), not
+`refuted`. An annotation on an output never counts as a range for the input box.
+
+#### When Z3 gives up: the zonotope fallback
+
+Z3 handles a window by case-splitting every `Relu` in it, which stops being practical once
+a `Relu` sits between two layers that were both rewritten (for example two
+`Conv -> BatchNorm -> Relu` blocks whose BatchNorms were folded). If an output is still
+`skipped` after the Z3 steps and **every graph input has a finite range**,
+`onnxsim.certify` tries `onnxsim.zonotope`: both models are evaluated on the same input box
+as affine forms over shared noise symbols, so what they share cancels exactly and only a
+genuinely different rewrite costs precision. When the certified bound satisfies
+`max|orig - simplified| <= atol + rtol * min|simplified|` the output's verdict is
+`proved-affine`, and it counts as `proved`.
+
+Measured with real `onnxsim.simplify` output and `x` in `[-1, 1]`: two
+`Conv -> BatchNorm -> Relu` blocks on a `1x3x8x8` input went from `skipped` (Z3 gave up) to
+`proved-affine` with a bound of `2.2e-06`, and the `1x3x16x16`, 4-channel version from
+`skipped` to `proved-affine` with `2.8e-06`, about half a second later.
+
+What the fallback does not do:
+
+- **It never reports `refuted`.** A bound larger than the tolerance is an over-approximation;
+  it does not show a real difference. The output stays `skipped`, with the bound in the
+  detail.
+- **It needs finite ranges.** With an unbounded input it is not attempted.
+- **It is bounded by memory, not time.** Generators are dense, so it is tried only when a
+  cost estimate made from shapes alone stays under about 256 MB (the evaluation itself
+  cannot be interrupted); larger windows stay `skipped` with the reason.
+- **It is real arithmetic, like the Z3 steps.** It does not model float32 rounding of the
+  evaluation.
 
 ### Interval analysis and quantization bounds
 
@@ -343,5 +373,6 @@ The worst-case rounding error of any output is 0.3937 against an output range of
   bounds to prove safety and to spot risk, and calibration to choose scales.
 - **Only graph input and output names reliably keep an annotation** through `simplify`
   (see above).
-- **Certification covers small windows.** Large convolutions are reported `skipped`
-  rather than proved, and only 2-D `Conv` is encoded.
+- **Certification covers small windows.** A window the Z3 encoding cannot take is tried with
+  the zonotope fallback when all inputs have finite ranges and it fits the memory estimate;
+  otherwise it is reported `skipped` rather than proved. Only 2-D `Conv` is encoded.
