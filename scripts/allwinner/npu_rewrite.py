@@ -38,6 +38,10 @@ DOCUMENTED_ONNX_OPS = frozenset(
     Softmax Softplus Softsign SpaceToDepth Split Sqrt Squeeze STFT Sub Sum Tan Tanh Tile TopK Transpose Unsqueeze Upsample Where Xor""".split()
 )
 
+# Floor for the per-row max |x| that a decomposed norm divides by (the smallest normal fp16 number). It only guards the division: the
+# result is algebraically identical for any positive floor (see _Rewriter.normalize).
+NORM_FLOOR = 2.0**-14
+
 FLOAT_TYPES = (
     TensorProto.FLOAT,
     TensorProto.FLOAT16,
@@ -94,19 +98,53 @@ class _Rewriter:
         )
         return name
 
-    def emit(self, op, inputs, base, tag, **attrs):
-        out = self.name(base, tag)
+    def emit(self, op, inputs, base, tag, out=None, **attrs):
+        out = out or self.name(base, tag)
         self.new_nodes.append(
             helper.make_node(op, inputs, [out], name=out + "_n", **attrs)
         )
         return out
 
-    def reduce_mean(self, x, axes, base, tag):
-        # `axes` became an input in opset 18 (ReduceMean-18); before that it is an attribute.
+    def reduce(self, op, x, axes, base, tag):
+        # `axes` became an input in opset 18 (ReduceMean/ReduceMax-18); before that it is an attribute.
         if self.opset >= 18:
             ax = self.const(base, tag + "ax", axes, np.int64)
-            return self.emit("ReduceMean", [x, ax], base, tag, keepdims=1)
-        return self.emit("ReduceMean", [x], base, tag, keepdims=1, axes=list(axes))
+            return self.emit(op, [x, ax], base, tag, keepdims=1)
+        return self.emit(op, [x], base, tag, keepdims=1, axes=list(axes))
+
+    def reduce_mean(self, x, axes, base, tag):
+        return self.reduce("ReduceMean", x, axes, base, tag)
+
+    def normalize(self, d, axes, eps, np_t, base, out=None):
+        """d / sqrt(mean(d^2) + eps) over `axes`, without ever forming d^2 at full scale.
+
+        Squaring a raw activation overflows fp16 (65504) once |d| exceeds 255, and real transformers exceed it: DistilBERT's residual
+        stream has deviations of several hundred, and SmolLM2-135M's reach about 20 000, so the squares are 3e5 and 4e8. Instead the
+        row is divided by its own max |d| first (m' = max(max|d|, floor), r = 1/m', ds = d*r):
+            mean(ds^2) = mean(d^2)/m'^2,  eps/m'^2 = eps*r^2,  1/sqrt(mean(ds^2) + eps*r^2) = m'/sqrt(mean(d^2) + eps)
+        so ds * that = d/sqrt(mean(d^2) + eps): exact for any m' > 0, and every squared value is at most 1."""
+        c = lambda tag, v: self.const(base, tag, v, np_t)  # noqa: E731
+        mx = self.reduce(
+            "ReduceMax", self.emit("Abs", [d], base, "ad"), axes, base, "mx"
+        )
+        rm = self.emit(
+            "Reciprocal",
+            [self.emit("Max", [mx, c("fl", NORM_FLOOR)], base, "mxs")],
+            base,
+            "rm",
+        )
+        ds = self.emit("Mul", [d, rm], base, "ds")
+        var = self.reduce_mean(
+            self.emit("Mul", [ds, ds], base, "sq"), axes, base, "var"
+        )
+        eps_s = self.emit(
+            "Mul", [self.emit("Mul", [rm, rm], base, "rr"), c("eps", eps)], base, "epss"
+        )
+        veps = self.emit("Add", [var, eps_s], base, "veps")
+        inv = self.emit(
+            "Reciprocal", [self.emit("Sqrt", [veps], base, "std")], base, "inv"
+        )
+        return self.emit("Mul", [ds, inv], base, "n", out=out)
 
     def layer_norm(self, node):
         x, scale = node.input[0], node.input[1]
@@ -124,14 +162,8 @@ class _Rewriter:
         axes = list(range(axis, 0))
         mean = self.reduce_mean(x, axes, base, "mean")
         d = self.emit("Sub", [x, mean], base, "d")
-        sq = self.emit("Mul", [d, d], base, "sq")
-        var = self.reduce_mean(sq, axes, base, "var")
-        veps = self.emit("Add", [var, self.const(base, "eps", eps, np_t)], base, "veps")
-        inv = self.emit(
-            "Reciprocal", [self.emit("Sqrt", [veps], base, "std")], base, "inv"
-        )
         y = self.emit(
-            "Mul", [self.emit("Mul", [d, inv], base, "n"), scale], base, "scaled"
+            "Mul", [self.normalize(d, axes, eps, np_t, base), scale], base, "scaled"
         )
         if bias:
             self.new_nodes.append(
@@ -224,9 +256,98 @@ class _Rewriter:
         )
         self.stats["Div"] += 1
 
+    def find_rms_norms(self):
+        """Match torch's RMSNorm: Pow(x, 2) -> ReduceMean(axes=-1, keepdims) -> Add(eps) -> Sqrt -> Reciprocal | Div(1, .) -> Mul(x, .).
+
+        Every intermediate must have exactly one consumer. Returns {index of the final Mul: (x, eps, its output, indices to drop)}."""
+        nodes = list(self.graph.node)
+        consumers = {}
+        for i, n in enumerate(nodes):
+            for t in n.input:
+                consumers.setdefault(t, []).append(i)
+        outputs = {o.name for o in self.graph.output}
+
+        def const_of(name):
+            """Value of a tiny initializer (the pattern needs only scalars and an axes list), else None. Weights are never read."""
+            init = self.inits.get(name)
+            if init is None or int(np.prod(init.dims or [1])) > 16:
+                return None
+            try:
+                return numpy_helper.to_array(init)
+            except ValueError:  # a malformed tensor is just not a constant we can match
+                return None
+
+        def sole(tensor, *ops):
+            idx = consumers.get(tensor, [])
+            if len(idx) != 1 or tensor in outputs:
+                return None
+            return idx[0] if nodes[idx[0]].op_type in ops else None
+
+        matches = {}
+        for i, pw in enumerate(nodes):
+            if pw.op_type != "Pow" or pw.domain not in ("", "ai.onnx"):
+                continue
+            exponent = const_of(pw.input[1])
+            if exponent is None or exponent.size != 1 or not np.allclose(exponent, 2.0):
+                continue
+            x = pw.input[0]
+            m = sole(pw.output[0], "ReduceMean")
+            if m is None:
+                continue
+            attrs = {a.name: helper.get_attribute_value(a) for a in nodes[m].attribute}
+            axes = attrs.get("axes")
+            if axes is None and len(nodes[m].input) > 1:
+                given = const_of(nodes[m].input[1])
+                axes = given.tolist() if given is not None else None
+            if attrs.get("keepdims", 1) != 1 or list(axes or []) != [-1]:
+                continue
+            e = sole(nodes[m].output[0], "Add")
+            if e is None:
+                continue
+            others = [t for t in nodes[e].input if t != nodes[m].output[0]]
+            eps = const_of(others[0]) if len(others) == 1 else None
+            if eps is None or eps.size != 1:
+                continue
+            q = sole(nodes[e].output[0], "Sqrt")
+            r = sole(nodes[q].output[0], "Reciprocal", "Div") if q is not None else None
+            if r is None:
+                continue
+            if nodes[r].op_type == "Div":
+                numerator = const_of(nodes[r].input[0])
+                if (
+                    numerator is None
+                    or not np.allclose(numerator, 1.0)
+                    or nodes[r].input[1] != nodes[q].output[0]
+                ):
+                    continue
+            n = sole(nodes[r].output[0], "Mul")
+            if n is None or x not in nodes[n].input or nodes[n].output[0] in outputs:
+                continue
+            matches[n] = (
+                x,
+                float(eps.reshape(())),
+                nodes[n].output[0],
+                {i, m, e, q, r},
+            )
+        return matches
+
     def run(self):
-        for node in self.graph.node:
-            if node.domain not in ("", "ai.onnx"):
+        matches = self.find_rms_norms()
+        drop = set().union(*(m[3] for m in matches.values())) if matches else set()
+        rename = {}
+        for i, node in enumerate(list(self.graph.node)):
+            if i in drop:
+                continue
+            for k, t in enumerate(node.input):
+                if t in rename:
+                    node.input[k] = rename[t]
+            if i in matches:
+                x, eps, final, _ = matches[i]
+                np_t = _NP.get(self.dtype.get(x, TensorProto.FLOAT), np.float32)
+                # the normalized value (before the weight multiply) is interior to the norm: later nodes read the new tensor
+                rename[final] = self.normalize(x, [-1], eps, np_t, final)
+                self.stats["RMSNorm"] += 1
+            elif node.domain not in ("", "ai.onnx"):
                 self.new_nodes.append(node)
             elif node.op_type == "LayerNormalization":
                 self.layer_norm(node)
