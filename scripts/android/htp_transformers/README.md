@@ -8,6 +8,7 @@ being emulated.
 |---|---|
 | `prep_distilbert.py` | export DistilBERT (batch 1, 64 tokens), build the graph variants (`orig`, `naive`, `adaptive`; `--quant` adds `w8a8`, `w8a16` QDQ models) and the 872-sentence validation inputs |
 | `run_phone.py` | push model + data, run `qnn_eval` under the phone lock, score accuracy / agreement with host fp32 / logit error / latency |
+| `prep_smollm.py`, `run_smollm.py` | the same for SmolLM2-135M: WikiText-2 perplexity over 16 windows of 128 tokens (fp32 = 36.07) |
 | `fp16_probe.py` | minimal graphs with squares above the fp16 maximum: does the HTP's fp16 mode overflow? |
 | `../htp_exploration/qnn_shell/qnn_eval.cpp` | multi-sample runner (one session, N samples, latency percentiles, outputs saved) |
 
@@ -30,6 +31,19 @@ python -I fp16_probe.py --work DIR
 | `w8a16` QDQ, `Div` form (`prep_distilbert.py --quant`) | HTP, CPU fallback for 12 nodes | 17.1 | 90.37% | 99.3% |
 
 Host ORT CPU on the first 200 sentences: `w8a8` 49.5%, `w8a16` 90.5%.
+
+## Results (SmolLM2-135M, WikiText-2, 16 windows x 128 tokens, 49152-entry vocab head)
+
+| Variant | Where it runs | ms/window | Perplexity |
+|---|---|---|---|
+| `adaptive` | CPU, 4 threads, fp32 | 249 | 36.07 (= PyTorch fp32) |
+| `adaptive` | HTP fp16, strict | 34.4 | 69.2 |
+| `naive` decomposed RMSNorm | HTP fp16, strict | 25.1 | 1.4e11 (collapsed) |
+| `orig` | HTP fp16, strict | | does not compile: `QNN_COMMON_ERROR_MEM_ALLOC` |
+
+On SmolLM2 the norm overflow is real on the HTP: the naive form destroys the model and only the row-max-scaled form is usable.
+Even that form doubles the perplexity in fp16 (the cause is not yet isolated; the residual stream's large activations are the
+suspect), while running 7x faster than the 4-thread CPU.
 
 ## Findings
 
