@@ -81,6 +81,9 @@ def _executable(path, text):
 
 @pytest.fixture
 def toolkit(tmp_path, monkeypatch):
+    # compile_nbg runs Acuity's Linux toolkit through `bash -c`, and the fake pegasus is a shebang script: neither exists on Windows.
+    if sys.platform == "win32":
+        pytest.skip("compile_nbg drives the Linux Acuity toolkit through bash")
     acuity = tmp_path / "acuity"
     acuity.mkdir()
     _executable(acuity / "pegasus", FAKE_PEGASUS)
