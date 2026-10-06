@@ -140,6 +140,16 @@ class _Runner:
     ) -> List[np.ndarray]:
         from onnx.reference import ReferenceEvaluator
 
+        # Interval arrays are float64 but constants (initializers) are usually float32,
+        # and the reference evaluator rejects a binary op on mixed float dtypes (MatMul
+        # with a float32 weight, for one) -- which would silently turn the op into
+        # "unsupported". Promote every float operand to float64.
+        inputs = [
+            np.asarray(a, dtype=np.float64)
+            if np.asarray(a).dtype.kind == "f"
+            else np.asarray(a)
+            for a in inputs
+        ]
         n = onnx.NodeProto()
         n.CopyFrom(node)
         names = [f"i{k}" for k in range(len(inputs))]
@@ -392,6 +402,10 @@ class LayerQuantBound:
 
     @property
     def relative_error(self) -> float:
+        # An unbounded output interval means the error cannot be compared to the output
+        # range at all: that is "unknown" (nan), not a tiny ratio.
+        if not np.isfinite(self.output_width):
+            return float("nan")
         return (
             self.max_abs_error / self.output_width
             if self.output_width > 0

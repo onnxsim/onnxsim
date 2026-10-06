@@ -240,6 +240,18 @@ assert check, "Simplified ONNX model could not be validated"
 
 You can see more details of the API in [onnxsim/onnx_simplifier.py](onnxsim/onnx_simplifier.py)
 
+## Expected value ranges and equivalence certification
+
+Annotate a model's inputs and outputs with the range they really take
+(`onnxsim.ranges.set_range(model, "image", 0.0, 1.0)`, or
+`python -m onnxsim.ranges model.onnx --set image=0,1`). The range is stored in the
+model's `metadata_props`, drives the random inputs `check_n` generates, warns when an
+output leaves its range, and is the input box for the equivalence check that
+`simplify()` runs by default when `z3-solver` is installed: it tries to *prove* the
+simplified model equals the original and records the verdict in `onnxsim.certify`
+(`certify=False` / `--no-certify` skips it). `onnxsim.interval` builds worst-case
+quantization bounds on the same ranges. See [`docs/ranges.md`](docs/ranges.md).
+
 ## Custom operators
 
 Models that contain custom operators, such as TensorRT plugins
