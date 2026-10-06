@@ -8619,7 +8619,8 @@ def _with_certify(fn):
     """Wrap ``simplify`` so it also certifies its own result (best effort, on by default).
 
     ``certify=None`` (default): run when z3-solver is installed and the model is small
-    enough; stay silent unless the verdict is ``refuted``. ``certify=True``: run, and
+    enough; stay silent unless the verdict is ``refuted``.  The environment
+    variable ``ONNXSIM_CERTIFY=0`` disables this default process-wide. ``certify=True``: run, and
     report every outcome including why it did not run. ``certify=False``: skip. The
     verdict is recorded in the returned model's ``metadata_props`` (``onnxsim.certify``,
     ``onnxsim.certify.detail``); it never changes the simplified model otherwise and a
@@ -8628,6 +8629,20 @@ def _with_certify(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, certify=None, **kwargs):
+        # ONNXSIM_CERTIFY=0 turns the *default* off process-wide (an explicit
+        # certify=True still wins). Test suites that call simplify() incidentally,
+        # not to test certification, set it: Z3 proofs are sensitive to the Z3
+        # state earlier work leaves in the process, so a default-on run inside
+        # unrelated tests made a pure-Z3 test in CI's formal-verification job hang.
+        if certify is None and os.environ.get(
+            "ONNXSIM_CERTIFY", ""
+        ).strip().lower() in (
+            "0",
+            "false",
+            "off",
+            "no",
+        ):
+            certify = False
         model = args[0] if args else kwargs.get("model")
         explicit = certify is True
         snap, why = None, ""

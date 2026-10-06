@@ -5,6 +5,8 @@ returned model's metadata, ``certify=False`` opting out, size/availability guard
 and the annotated ranges driving ``check_n``'s random inputs and output warnings.
 """
 
+import os
+
 import numpy as np
 import onnx
 import pytest
@@ -163,3 +165,29 @@ def test_output_leaving_annotated_range_warns_once(capsys):
     out = capsys.readouterr().out
     assert out.count("WARNING: original model output y") == 1
     assert "leaves the annotated range" in out
+
+
+def test_env_var_turns_the_default_off_but_explicit_true_wins(monkeypatch):
+    # tests/conftest.py sets ONNXSIM_CERTIFY=0 for every other module; this one is exempt,
+    # so the default-on behaviour is what is under test here.
+    monkeypatch.delenv("ONNXSIM_CERTIFY", raising=False)
+    assert _meta(onnxsim.simplify(_conv_bn_relu())[0], "onnxsim.certify") is not None
+    for off in ("0", "false", "OFF", "no"):
+        monkeypatch.setenv("ONNXSIM_CERTIFY", off)
+        assert _meta(onnxsim.simplify(_conv_bn_relu())[0], "onnxsim.certify") is None
+    monkeypatch.setenv("ONNXSIM_CERTIFY", "0")
+    assert (
+        _meta(onnxsim.simplify(_conv_bn_relu(), certify=True)[0], "onnxsim.certify")
+        is not None
+    )
+    monkeypatch.setenv("ONNXSIM_CERTIFY", "1")  # anything else leaves the default alone
+    assert _meta(onnxsim.simplify(_conv_bn_relu())[0], "onnxsim.certify") is not None
+
+
+def test_other_test_modules_run_with_certification_off(request):
+    # The guard that keeps unrelated tests from running Z3 as a side effect: this module is
+    # allow-listed, so the variable must be unset here, and set for any non-allow-listed one.
+    import conftest
+
+    assert "test_simplify_certify" in conftest._CERTIFY_TEST_MODULES
+    assert os.environ.get("ONNXSIM_CERTIFY") is None

@@ -20,6 +20,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _FETCH = _ROOT / "scripts" / "android" / "fetch_hand_kernels.sh"
 
@@ -48,6 +50,23 @@ if not (_ANDROID / "msda_hvx" / "msda_shape.h").exists() and _FETCH.exists():
 # test_axelera_* prefix but covers the same Axelera Voyager SDK surface as
 # test_axelera_voyager_*.py, so it's matched by substring instead of prefix.
 _AXERA_PREFIX_RE = re.compile(r"^test_(axera|axelera|pulsar2)_")
+
+
+# Test modules that exercise certification itself. Every other test calls
+# simplify() incidentally, so the default-on onnxsim.certify run is switched off
+# for them: it would spend time on Z3 in thousands of unrelated tests, and Z3 proofs
+# are sensitive to the Z3 state earlier work leaves in the process -- with the
+# default on, a pure-Z3 test in CI's formal-verification job hung until the
+# 6-hour job limit. See ONNXSIM_CERTIFY in onnxsim/onnx_simplifier.py.
+_CERTIFY_TEST_MODULES = frozenset(
+    {"test_certify", "test_simplify_certify", "test_interval", "test_docs_ranges"}
+)
+
+
+@pytest.fixture(autouse=True)
+def _certify_off_unless_under_test(request, monkeypatch):
+    if request.module.__name__.rsplit(".", 1)[-1] not in _CERTIFY_TEST_MODULES:
+        monkeypatch.setenv("ONNXSIM_CERTIFY", "0")
 
 
 def pytest_collection_modifyitems(config, items):
