@@ -3,7 +3,7 @@
 ``certify(orig, simplified)`` tries to *prove* the two models compute the same
 outputs, instead of sampling random inputs the way ``onnxsim.model_checking``
 does. It needs only the two models -- no rewrite log from the C++ passes -- and
-works in three layers, cheapest first:
+works in four layers, cheapest first:
 
 1. **Structural hashing.** Every tensor of both models gets a canonical id built
    from its op, attributes and input ids (initializers by exact bytes, graph
@@ -17,6 +17,31 @@ works in three layers, cheapest first:
    encoded over exact rationals (Z3 reals) between shared cut points, and Z3 is
    asked for an input where the two sides differ by more than ``atol + rtol*|b|``.
    ``unsat`` is a proof; ``sat`` is a counterexample you can replay.
+4. **Spatial shrink** (only when a window is too large for step 3). If every op
+   in the window is spatially local (2-D Conv, BatchNormalization, Add/Sub/Mul,
+   Neg, Identity, Relu, Clip) and every constant meeting a spatial tensor is
+   uniform over space, the window is re-encoded at a smaller spatial size that
+   keeps all of its border behaviour, and the verdict is ``proved-reduced``.
+   ``proved-reduced`` counts as proved (``CertifyReport.ok``) but is a distinct
+   label because the proof rests on the argument below, not on the full-size
+   encoding. The argument, in short: an output position depends on a bounded patch
+   plus which borders it touches; all interior positions are the same function; a
+   top position is fixed by its index and a bottom position by its offset from
+   the end. A smaller extent with the same residue modulo the total stride, no
+   position touching both borders, and at least one interior position therefore
+   contains a twin of every full-size position, with an identical symbolic
+   expression. Proving a pointwise tolerance for all of them proves it at full
+   size. (Details and the exact conditions: ``_plan_reduction``.) What it does
+   NOT cover: windows with any other op (MatMul, Gemm, Reshape, pooling, ...),
+   positional constants, per-position input ranges, non-NCHW layouts -- those
+   keep their ``skipped`` verdict, with the reason.
+
+   A difference found at the reduced size is lifted to the original shape by
+   embedding the violating position's patch (a bottom position is shifted by the
+   amount removed) and, when onnxruntime is available, replayed on the two real
+   models. ``refuted`` is only reported if the replay reproduces it (or cannot
+   run, which the detail text says); a replay that disagrees downgrades to
+   ``skipped``, because a false alarm is worse than a skip.
 
 What a proof means, so it is not over-read:
 
@@ -41,8 +66,9 @@ z3-solver is an optional dependency (the ``verify`` extra).
 
 import dataclasses
 import hashlib
+import importlib.util
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
@@ -54,6 +80,7 @@ NEEDS_RANGES_HINT = "no input_ranges given"
 PROVED_STRUCTURAL = "proved-structural"
 PROVED_CONGRUENCE = "proved-congruence"
 PROVED_SMT = "proved-smt"
+PROVED_REDUCED = "proved-reduced"
 REFUTED = "refuted"
 SKIPPED = "skipped"
 
@@ -105,6 +132,14 @@ class CertifyReport:
 
 class _Skip(Exception):
     pass
+
+
+class _TooLarge(_Skip):
+    """The window exceeds ``max_work`` -- the one skip a spatial shrink can cure."""
+
+
+class _NoShrink(Exception):
+    """The window cannot be soundly re-encoded at a smaller spatial size (reason in args[0])."""
 
 
 def _z3():
@@ -251,13 +286,22 @@ class _Encoder:
         self.cut: set = set()
         self.zero = self.z3.RealVal(0)
         self.has_bounds = False
+        # id -> reduced leaf shape, set when a spatial shrink is in effect
+        self.shape_override: Dict[int, Tuple[int, ...]] = {}
+        self._real_cache: Dict[float, Any] = {}
 
     # -- helpers
     def real(self, v):
         from fractions import Fraction
 
-        f = Fraction(float(v))
-        return self.z3.RealVal(f"{f.numerator}/{f.denominator}")
+        key = float(v)
+        hit = self._real_cache.get(key)
+        if hit is None:
+            f = Fraction(key)
+            hit = self._real_cache[key] = self.z3.RealVal(
+                f"{f.numerator}/{f.denominator}"
+            )
+        return hit
 
     def lift(self, arr: np.ndarray) -> np.ndarray:
         if arr.dtype.kind not in "fiu":
@@ -271,7 +315,7 @@ class _Encoder:
     def spend(self, n: int):
         self.work += int(n)
         if self.work > self.max_work:
-            raise _Skip(f"window too large (> {self.max_work} multiply-adds)")
+            raise _TooLarge(f"window too large (> {self.max_work} multiply-adds)")
 
     def concrete(self, i: int) -> np.ndarray:
         d = self.space.defs[i]
@@ -284,7 +328,7 @@ class _Encoder:
     def leaf(self, i: int) -> np.ndarray:
         if i in self.leaves:
             return self.leaves[i]
-        shape = self.space.shape.get(i)
+        shape = self.shape_override.get(i, self.space.shape.get(i))
         if shape is None:
             raise _Skip("unknown or symbolic shape at a cut point")
         if self.space.dtype.get(i) not in (
@@ -537,6 +581,291 @@ def _cone(space: _Space, root: int) -> set:
     return seen
 
 
+# --------------------------------------------------------------------------
+# Spatial shrink of windows that are too large to encode at full size
+# --------------------------------------------------------------------------
+#
+# Why this is sound. For a window built only from spatially local ops (below),
+# one output position depends on a bounded *patch* of input pixels. Take the
+# patch of output position ``p`` along one spatial axis, in input pixels:
+# ``[p*S - lead, p*S + tail)`` with ``S`` the product of strides, ``lead`` the
+# padding offset and ``tail`` the far extent. Three kinds of position exist:
+#
+# * top-affected    (``p*S - lead < 0``): the patch touches top padding;
+# * bottom-affected (``p*S + tail > N``): the patch touches bottom padding;
+# * interior        (neither): no padded cell is involved at any layer, so every
+#                   interior position is the *same* function of its own, free,
+#                   patch variables (one output step = ``S`` pixels).
+#
+# A top-affected position's function depends only on its index ``p`` (the top is
+# anchored at 0). A bottom-affected position's function depends only on how far
+# it is from the bottom, i.e. on its offset from the output length ``O``. So if
+# a smaller extent ``N' = N - k*S`` (the same residue mod ``S``, which keeps the
+# bottom pattern a rigid translation) has *no* position that is both top- and
+# bottom-affected, and at least one interior position, then the set of distinct
+# position functions at ``N'`` equals the set at ``N``, and each full-size
+# position has a twin with an identical symbolic expression. The tolerance test
+# ``|a - b| <= atol + rtol*|b|`` is pointwise, so proving it for every position
+# at ``N'`` proves it for every position at ``N``. Batch is shrunk to 1 (every
+# allowed op is independent across the batch); channels are untouched.
+#
+# What it requires, and refuses otherwise (``_NoShrink``): every op is Conv (2-D),
+# BatchNormalization, Add/Sub/Mul, Neg, Identity, Relu or Clip; every constant
+# that meets a spatial tensor is uniform over batch and space (so Conv weights
+# and BN parameters, which are per-channel, are fine, a positional bias is not);
+# every leaf has the same rank-4 spatial size; input ranges are uniform over
+# batch and space. The argument is axis-separable, so H and W shrink independently.
+
+_LOCAL_UNARY = {"Identity", "Relu", "Clip", "Neg"}
+_LOCAL_BINARY = {"Add", "Sub", "Mul"}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Axis:
+    """Patch geometry along one spatial axis, in input pixels (see above)."""
+
+    stride: int
+    lead: int
+    tail: int
+
+
+@dataclasses.dataclass
+class _Reduction:
+    shapes: Dict[int, Tuple[int, ...]]  # leaf id -> reduced shape
+    full_hw: Tuple[int, int]
+    reduced_hw: Tuple[int, int]
+    axes: Tuple[_Axis, _Axis]  # merged geometry of the two roots
+    leaves: List[int]
+
+    def describe(self) -> str:
+        f, r = self.full_hw, self.reduced_hw
+        return f"{f[0]}x{f[1]} -> {r[0]}x{r[1]} spatial"
+
+
+@dataclasses.dataclass
+class _Result:
+    """Outcome of one solver run over a window (``status``: unsat / sat / skipped)."""
+
+    status: str
+    detail: str = ""
+    cex: Optional[Dict[str, np.ndarray]] = None
+    cex_by_id: Dict[int, np.ndarray] = dataclasses.field(default_factory=dict)
+    only_inputs: bool = True  # the witness mentions graph inputs only
+    too_large: bool = False  # skipped because of ``max_work``
+    bad_index: Optional[Tuple[int, ...]] = (
+        None  # output element that violates the tolerance
+    )
+    reduction: Optional[_Reduction] = None  # set when solved at a reduced spatial size
+
+
+def _uniform_const(shape: Tuple[int, ...]) -> bool:
+    if len(shape) > 4:
+        return False
+    padded = (1,) * (4 - len(shape)) + tuple(shape)
+    return padded[0] == 1 and padded[2] == 1 and padded[3] == 1
+
+
+def _node_attrs(d: "_Def") -> Dict[str, Any]:
+    if d.node is None:
+        return {}
+    return {x.name: onnx.helper.get_attribute_value(x) for x in d.node.attribute}
+
+
+def _plan_reduction(
+    space: "_Space", a: int, b: int, cut: set, input_ranges
+) -> _Reduction:
+    """Find the smallest spatial extent that is provably equivalent (see above)."""
+    defs = space.defs
+    leaves: List[int] = []
+    memo: Dict[int, Tuple[_Axis, _Axis]] = {}
+
+    def is_const(i: int) -> bool:
+        return defs[i].kind == "const"
+
+    def geo(i: int) -> Tuple[_Axis, _Axis]:
+        if i in memo:
+            return memo[i]
+        d = defs[i]
+        if d.kind == "const":
+            raise _NoShrink("a constant is used as a spatial tensor")
+        ins = [x for x in d.inputs if x >= 0]
+        if d.kind == "input" or i in cut:
+            if i not in leaves:
+                leaves.append(i)
+            g = (_Axis(1, 0, 1), _Axis(1, 0, 1))
+        elif d.domain not in ("", "ai.onnx") or d.out_index != 0:
+            raise _NoShrink(f"{d.name} is not a spatially local op")
+        elif d.name == "Conv":
+            if (
+                len(ins) < 2
+                or is_const(ins[0])
+                or not all(is_const(x) for x in ins[1:])
+            ):
+                raise _NoShrink("Conv with non-constant weights")
+            w = defs[ins[1]].value
+            if w is None or w.ndim != 4:
+                raise _NoShrink("only 2-D Conv can be shrunk")
+            at = _node_attrs(d)
+            if at.get("auto_pad", b"NOTSET") not in (b"NOTSET", "NOTSET"):
+                raise _NoShrink("Conv auto_pad")
+            strides = list(at.get("strides", [1, 1]))
+            dil = list(at.get("dilations", [1, 1]))
+            pads = list(at.get("pads", [0, 0, 0, 0]))
+            if min(pads) < 0:
+                raise _NoShrink("negative Conv padding")
+            gx = geo(ins[0])
+            g = (
+                _Axis(
+                    gx[0].stride * strides[0],
+                    gx[0].lead + pads[0] * gx[0].stride,
+                    gx[0].tail + ((w.shape[2] - 1) * dil[0] - pads[0]) * gx[0].stride,
+                ),
+                _Axis(
+                    gx[1].stride * strides[1],
+                    gx[1].lead + pads[1] * gx[1].stride,
+                    gx[1].tail + ((w.shape[3] - 1) * dil[1] - pads[1]) * gx[1].stride,
+                ),
+            )
+        elif d.name == "BatchNormalization" or d.name in _LOCAL_UNARY:
+            if is_const(ins[0]) or not all(is_const(x) for x in ins[1:]):
+                raise _NoShrink(f"{d.name} with a non-constant extra operand")
+            g = geo(ins[0])
+        elif d.name in _LOCAL_BINARY:
+            if len(ins) != 2:
+                raise _NoShrink(f"{d.name} arity")
+            live = [x for x in ins if not is_const(x)]
+            if not live:
+                raise _NoShrink(f"{d.name} of two constants")
+            for x in ins:
+                cval = defs[x].value
+                if cval is not None:
+                    shp = tuple(cval.shape)
+                    if not _uniform_const(shp):
+                        raise _NoShrink(
+                            f"{d.name} constant of shape {shp} varies over space or batch"
+                        )
+            gs = [geo(x) for x in live]
+            for ax in range(2):
+                if len({gg[ax].stride for gg in gs}) > 1:
+                    raise _NoShrink(f"{d.name} joins branches with different strides")
+            g = (
+                _Axis(
+                    gs[0][0].stride,
+                    max(gg[0].lead for gg in gs),
+                    max(gg[0].tail for gg in gs),
+                ),
+                _Axis(
+                    gs[0][1].stride,
+                    max(gg[1].lead for gg in gs),
+                    max(gg[1].tail for gg in gs),
+                ),
+            )
+        else:
+            raise _NoShrink(f"{d.name} is not a spatially local op")
+        memo[i] = g
+        return g
+
+    def slen(i: int, n: int, ax: int, m: Dict[int, int]) -> int:
+        """Spatial length of tensor ``i`` along ``ax`` when the leaves have extent ``n``."""
+        if i in m:
+            return m[i]
+        d = defs[i]
+        if d.kind == "input" or i in cut:
+            r = n
+        elif d.name == "Conv":
+            ins = [x for x in d.inputs if x >= 0]
+            at = _node_attrs(d)
+            w = defs[ins[1]].value
+            if w is None:
+                raise _NoShrink("Conv with non-constant weights")
+            st = list(at.get("strides", [1, 1]))[ax]
+            dl = list(at.get("dilations", [1, 1]))[ax]
+            pads = list(at.get("pads", [0, 0, 0, 0]))
+            span = slen(ins[0], n, ax, m) + pads[ax] + pads[2 + ax]
+            r = (span - dl * (w.shape[2 + ax] - 1) - 1) // st + 1
+        else:
+            lives = [slen(x, n, ax, m) for x in d.inputs if x >= 0 and not is_const(x)]
+            if not lives or len(set(lives)) != 1:
+                raise _NoShrink("operands of an elementwise op differ in spatial size")
+            r = lives[0]
+        m[i] = r
+        return r
+
+    ga, gb = geo(a), geo(b)
+    axes: List[_Axis] = []
+    for ax in range(2):
+        if ga[ax].stride != gb[ax].stride:
+            raise _NoShrink("the two sides have different total strides")
+        axes.append(
+            _Axis(
+                ga[ax].stride,
+                max(ga[ax].lead, gb[ax].lead),
+                max(ga[ax].tail, gb[ax].tail),
+            )
+        )
+    shapes = {i: space.shape.get(i) for i in leaves}
+    if not leaves or any(sh is None or len(sh) != 4 for sh in shapes.values()):
+        raise _NoShrink("leaves must be rank-4 NCHW tensors with known shapes")
+    hw = {tuple(sh[2:]) for sh in shapes.values() if sh is not None}
+    if len(hw) != 1:
+        raise _NoShrink("leaves have different spatial sizes")
+    full_hw = next(iter(hw))
+    for i in leaves:
+        d = defs[i]
+        rng = input_ranges.get(d.name) if d.kind == "input" and input_ranges else None
+        if rng is not None and not all(_uniform_const(tuple(np.shape(x))) for x in rng):
+            raise _NoShrink(f"input range for {d.name!r} varies over space or batch")
+
+    def classify(ax: int, n: int) -> Optional[Tuple[int, int, int]]:
+        """``(output length, #top, #bottom)`` at extent ``n``, or ``None`` if not shrink-safe."""
+        g = axes[ax]
+        la, lb = slen(a, n, ax, {}), slen(b, n, ax, {})
+        if la != lb or la < 1:
+            return None
+        top = bottom = interior = 0
+        for p in range(la):
+            t, bt = p * g.stride - g.lead < 0, p * g.stride + g.tail > n
+            if t and bt:
+                return None  # a position the full-size image would not have
+            top += t
+            bottom += bt
+            interior += not (t or bt)
+        return (la, top, bottom) if interior >= 1 else None
+
+    reduced: List[int] = []
+    for ax in range(2):
+        n_full = full_hw[ax]
+        full = classify(ax, n_full)
+        if full is None:
+            raise _NoShrink("the full-size window has no interior position to preserve")
+        known = space.shape.get(a)
+        if known is not None and len(known) == 4 and known[2 + ax] != full[0]:
+            raise _NoShrink("output size disagrees with the shape-propagation formula")
+        best = n_full
+        for k in range(1, max(0, (n_full - 1) // axes[ax].stride) + 1):
+            n_try = n_full - k * axes[ax].stride
+            if n_try < 1:
+                break
+            c = classify(ax, n_try)
+            if c is not None and c[1] == full[1] and c[2] == full[2]:
+                best = n_try
+        if best == n_full:
+            raise _NoShrink("no smaller extent preserves the border structure")
+        reduced.append(best)
+    out_shapes: Dict[int, Tuple[int, ...]] = {}
+    for i in leaves:
+        sh = shapes[i]
+        assert sh is not None
+        out_shapes[i] = (1, sh[1], reduced[0], reduced[1])
+    return _Reduction(
+        out_shapes,
+        (full_hw[0], full_hw[1]),
+        (reduced[0], reduced[1]),
+        (axes[0], axes[1]),
+        leaves,
+    )
+
+
 class _Prover:
     def __init__(
         self,
@@ -548,11 +877,15 @@ class _Prover:
         max_work,
         timeout_ms,
         deadline=None,
+        replay=None,
     ):
         self.space, self.names = space, names
         self.input_ranges, self.atol, self.rtol = input_ranges, atol, rtol
         self.max_work, self.timeout_ms = max_work, timeout_ms
         self.deadline = deadline
+        # ``replay(a, b, leaf_values) -> Optional[bool]``: re-run the window on the
+        # original models at full size (see ``_make_replay``); ``None`` disables it.
+        self.replay = replay
         self.memo: Dict[Tuple[int, int], Window] = {}
         self.windows: List[Window] = []
 
@@ -615,34 +948,174 @@ class _Prover:
         # tensor), but a *counterexample* under cuts may not be reachable from
         # any real input -- so a cut-level witness is re-checked uncut below.
         cut = {i for i in ca & cb if self.space.defs[i].kind == "op"}
-        status, detail, cex, only_inputs = self._solve(a, b, cut)
-        if status == "sat" and not only_inputs:
-            status, detail, cex, only_inputs = self._solve(a, b, set())
-            if status == "skipped":
-                detail = (
+        res = self._attempt(a, b, cut)
+        if res.status == "sat" and not res.only_inputs:
+            res = self._attempt(a, b, set())
+            if res.status == "skipped":
+                res.detail = (
                     "a difference exists at an intermediate tensor shared by both models, but it "
-                    f"could not be confirmed at the graph inputs ({detail})"
+                    f"could not be confirmed at the graph inputs ({res.detail})"
                 )
-        if status == "unsat":
-            return mk(PROVED_SMT, detail)
-        if status == "sat":
-            return mk(REFUTED, detail, cex)
-        return mk(SKIPPED, detail)
+        if res.status == "unsat":
+            if res.reduction is not None:
+                return mk(
+                    PROVED_REDUCED,
+                    f"{res.detail}; encoded at a reduced shape ({res.reduction.describe()}), "
+                    "all ops spatially local -- see the certify module notes on shrinking",
+                )
+            return mk(PROVED_SMT, res.detail)
+        if res.status == "sat":
+            if res.reduction is not None:
+                return self._confirm_reduced(a, b, res, mk)
+            return mk(REFUTED, res.detail, res.cex)
+        return mk(SKIPPED, res.detail)
 
-    def _solve(self, a, b, cut):
-        """Returns ``(status, detail, counterexample, witness_uses_only_graph_inputs)``."""
+    def _estimate_work(self, a, b, cut) -> int:
+        """Multiply-adds the encoder would spend, from shapes alone (never over-estimates).
+
+        Mirrors ``_Encoder``'s own accounting for the ops it counts, and counts 0 for
+        anything it cannot size, so ``estimate > max_work`` implies the full-size
+        encoding would have been rejected too -- without paying to build it first.
+        """
+        space = self.space
+        total = 0
+        for i in _cone(space, a) | _cone(space, b):
+            d = space.defs[i]
+            shape = space.shape.get(i)
+            if d.kind == "const" or shape is None:
+                continue
+            size = int(np.prod(shape, dtype=np.int64))
+            if d.kind == "input" or i in cut:
+                total += size
+            elif d.name == "Conv":
+                w = space.defs[d.inputs[1]].value if len(d.inputs) > 1 else None
+                if w is not None and w.ndim == 4:
+                    total += size * int(w.shape[1] * w.shape[2] * w.shape[3])
+            elif d.name in ("Add", "Sub", "Mul", "Relu", "Clip", "BatchNormalization"):
+                total += size
+        return total
+
+    def _attempt(self, a, b, cut) -> "_Result":
+        """Solve at full size; if (only) the size is the obstacle, retry spatially shrunk."""
+        if self._estimate_work(a, b, cut) > self.max_work:
+            res = _Result(
+                "skipped",
+                f"window too large (> {self.max_work} multiply-adds)",
+                too_large=True,
+            )
+        else:
+            res = self._solve(a, b, cut)
+        if not (res.status == "skipped" and res.too_large):
+            return res
+        try:
+            reduction = _plan_reduction(self.space, a, b, cut, self.input_ranges)
+        except _NoShrink as why:
+            res.detail += f"; not shrinkable: {why}"
+            return res
+        shrunk = self._solve(a, b, cut, reduction)
+        if shrunk.status == "skipped":
+            shrunk.detail = (
+                f"{shrunk.detail} (even after shrinking to {reduction.describe()})"
+            )
+        return shrunk
+
+    def _lift(
+        self, red: "_Reduction", res: "_Result"
+    ) -> Optional[Dict[int, np.ndarray]]:
+        """Embed a reduced-shape counterexample into the full shape (class-preserving).
+
+        The violating output position keeps its border class: a bottom-affected
+        position is moved down by ``N - N'``, others stay put (see the shrink notes).
+        Only the position's patch is copied; the rest is filled with a value inside
+        each input's range (0 where there is none), so the lifted input stays in the box.
+        """
+        if res.bad_index is None or len(res.bad_index) != 4:
+            return None
+        lifted: Dict[int, np.ndarray] = {}
+        for i in red.leaves:
+            small = res.cex_by_id.get(i)
+            full_shape = self.space.shape.get(i)
+            if small is None or full_shape is None:
+                return None
+            d = self.space.defs[i]
+            fill = 0.0
+            rng = self.input_ranges.get(d.name) if d.kind == "input" else None
+            if rng is not None:
+                lo = float(np.min(np.asarray(rng[0], dtype=np.float64)))
+                hi = float(np.max(np.asarray(rng[1], dtype=np.float64)))
+                fill = min(max(0.0, lo), hi)
+            big = np.full(full_shape, fill, dtype=np.float64)
+            spans = []
+            for ax, p in enumerate(res.bad_index[2:]):
+                g = red.axes[ax]
+                n_small, n_full = red.reduced_hw[ax], red.full_hw[ax]
+                lo_px = max(0, p * g.stride - g.lead)
+                hi_px = min(n_small, p * g.stride + g.tail)
+                shift = n_full - n_small if p * g.stride + g.tail > n_small else 0
+                spans.append((lo_px, hi_px, shift))
+            (h0, h1, hs), (w0, w1, ws) = spans
+            big[0, :, h0 + hs : h1 + hs, w0 + ws : w1 + ws] = small[0, :, h0:h1, w0:w1]
+            lifted[i] = big
+        return lifted
+
+    def _confirm_reduced(self, a, b, res: "_Result", mk) -> Window:
+        """A difference found at a reduced shape: lift, replay on the real models, then report.
+
+        The verdict does not depend on the replay (the shrink argument already says the
+        full-size window has the same position functions), but a false "refuted" is a
+        loud warning in ``simplify``, so a replay that *disagrees* downgrades to
+        ``skipped`` instead of being ignored.
+        """
+        red = res.reduction
+        assert red is not None
+        lifted = self._lift(red, res)
+        cex = res.cex
+        where = f"found at a reduced shape ({red.describe()})"
+        if lifted is None:
+            return mk(
+                REFUTED,
+                f"{res.detail}; {where}, no full-size counterexample could be built",
+                cex,
+            )
+        by_name = {
+            (
+                self.space.defs[i].name
+                if self.space.defs[i].kind == "input"
+                else f"tensor#{i}"
+            ): v
+            for i, v in lifted.items()
+        }
+        confirmed = None if self.replay is None else self.replay(a, b, lifted)
+        if confirmed is True:
+            return mk(
+                REFUTED,
+                f"{res.detail}; {where}, lifted to full size and confirmed on the original models",
+                by_name,
+            )
+        if confirmed is False:
+            return mk(
+                SKIPPED,
+                f"a difference was found at a reduced shape ({red.describe()}) but did not reproduce "
+                "when replayed on the original models at full size (margin below float32 rounding?)",
+            )
+        return mk(
+            REFUTED,
+            f"{res.detail}; {where}, lifted to full size but not replayed (onnxruntime unavailable "
+            "or the window could not be extracted)",
+            by_name,
+        )
+
+    def _solve(self, a, b, cut, reduction: Optional[_Reduction] = None) -> "_Result":
+        """Solve one window, optionally with its leaves shrunk to ``reduction.shapes``."""
         z3 = _z3()
         enc = _Encoder(self.space, self.input_ranges, self.max_work)
         enc.cut = cut
+        if reduction is not None:
+            enc.shape_override = dict(reduction.shapes)
         try:
             va, vb = enc.value(a), enc.value(b)
             if va.shape != vb.shape:
-                return (
-                    "sat",
-                    f"output shapes differ: {va.shape} vs {vb.shape}",
-                    None,
-                    True,
-                )
+                return _Result("sat", f"output shapes differ: {va.shape} vs {vb.shape}")
             s = z3.Solver()
             s.add(*enc.constraints)
             atol, rtol = enc.real(self.atol), enc.real(self.rtol)
@@ -657,22 +1130,32 @@ class _Prover:
                 )
             s.set("timeout", max(500, budget // max(1, min(n, 8))))
             r = z3.unsat
-            for x, y in zip(va.reshape(-1), vb.reshape(-1)):
+            bad_flat = -1
+            for k, (x, y) in enumerate(zip(va.reshape(-1), vb.reshape(-1))):
                 diff = x - y
                 ady = z3.If(y >= 0, y, -y)
                 s.push()
                 s.add(z3.If(diff >= 0, diff, -diff) > atol + rtol * ady)
                 r = s.check()
                 if r != z3.unsat:
+                    bad_flat = k
                     break
                 s.pop()
+        except _TooLarge as e:
+            return _Result("skipped", str(e), too_large=True)
         except _Skip as e:
-            return "skipped", str(e), None, True
+            return _Result("skipped", str(e))
         if r == z3.unsat:
-            return "unsat", f"{va.size} elements, {enc.work} multiply-adds", None, True
+            return _Result(
+                "unsat",
+                f"{va.size} elements, {enc.work} multiply-adds",
+                reduction=reduction,
+            )
         if r == z3.sat:
             m = s.model()
-            cex, only_inputs = {}, True
+            cex: Dict[str, np.ndarray] = {}
+            by_id: Dict[int, np.ndarray] = {}
+            only_inputs = True
             for i, arr in enc.leaves.items():
                 d = self.space.defs[i]
                 only_inputs &= d.kind == "input"
@@ -683,6 +1166,12 @@ class _Prover:
                     ]
                 ).reshape(arr.shape)
                 cex[d.name if d.kind == "input" else f"tensor#{i}"] = vals
+                by_id[i] = vals
+            bad_index = (
+                tuple(int(x) for x in np.unravel_index(bad_flat, va.shape))
+                if bad_flat >= 0
+                else None
+            )
             big = max((float(np.abs(v).max()) for v in cex.values()), default=0.0)
             note = "solver found an input where the two sides differ"
             if not enc.has_bounds:
@@ -691,11 +1180,69 @@ class _Prover:
                     " float rounding of re-computed constants amplified by a huge input -- give"
                     " input_ranges to certify over the realistic domain)"
                 )
-            return "sat", note, cex, only_inputs
+            return _Result(
+                "sat",
+                note,
+                cex,
+                by_id,
+                only_inputs,
+                bad_index=bad_index,
+                reduction=reduction,
+            )
         hint = (
             "" if enc.has_bounds else "; no input_ranges given, so inputs are unbounded"
         )
-        return "skipped", f"solver gave up ({s.reason_unknown()}){hint}", None, True
+        return _Result("skipped", f"solver gave up ({s.reason_unknown()}){hint}")
+
+
+def _make_replay(orig, simplified, ta, tb, space, atol, rtol):
+    """Build ``replay(a, b, leaf_values)``: run the window on both real models at full size.
+
+    Extracts each side's sub-graph (leaf tensors -> root tensor) with
+    ``onnx.utils.Extractor`` and runs it in onnxruntime on the lifted leaf values.
+    Returns ``True`` if the roots differ beyond the tolerance, ``False`` if they do
+    not, and ``None`` when it cannot run (no onnxruntime, extraction failed, ...).
+    """
+    if importlib.util.find_spec("onnxruntime") is None:
+        return None
+    inv_a: Dict[int, str] = {}
+    for n, i in ta.items():
+        inv_a.setdefault(i, n)
+    inv_b: Dict[int, str] = {}
+    for n, i in tb.items():
+        inv_b.setdefault(i, n)
+
+    def replay(a: int, b: int, lifted: Dict[int, np.ndarray]) -> Optional[bool]:
+        try:
+            import onnx.utils
+            import onnxruntime as ort
+
+            outs = []
+            for model, inv, root in ((orig, inv_a, a), (simplified, inv_b, b)):
+                cone = _cone(space, root)
+                ids = [i for i in lifted if i in cone]
+                names = [inv[i] for i in ids]
+                sub = onnx.utils.Extractor(model).extract_model(names, [inv[root]])
+                sess = ort.InferenceSession(
+                    sub.SerializeToString(), providers=["CPUExecutionProvider"]
+                )
+                feeds = {}
+                for i, n in zip(ids, names):
+                    dt = (
+                        np.float64
+                        if space.dtype.get(i) == onnx.TensorProto.DOUBLE
+                        else np.float32
+                    )
+                    feeds[n] = lifted[i].astype(dt)
+                outs.append(np.asarray(sess.run(None, feeds)[0], dtype=np.float64))
+            oa, ob = outs
+            if oa.shape != ob.shape:
+                return True
+            return bool(np.any(np.abs(oa - ob) > atol + rtol * np.abs(ob)))
+        except Exception:
+            return None
+
+    return replay
 
 
 def certify(
@@ -749,7 +1296,15 @@ def certify(
     for name, i in list(tb.items()) + list(ta.items()):
         names.setdefault(i, name)
     prover = _Prover(
-        space, names, input_ranges, atol, rtol, max_work, timeout_ms, deadline
+        space,
+        names,
+        input_ranges,
+        atol,
+        rtol,
+        max_work,
+        timeout_ms,
+        deadline,
+        replay=_make_replay(orig, simplified, ta, tb, space, atol, rtol),
     )
     outputs, windows, seen = {}, [], set()
 
