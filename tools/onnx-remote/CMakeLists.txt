@@ -4,6 +4,12 @@ project(onnx_remote_transport LANGUAGES CXX)
 include(CTest)
 
 option(ONNX_REMOTE_AXCL "Build the AXCL-backed remote worker" OFF)
+option(ONNX_REMOTE_VIPLITE
+       "Build the Allwinner VIPLite (Vivante NPU) remote worker" OFF)
+set(VIPLITE_INCLUDE_DIR "" CACHE PATH
+    "VIPLite SDK include directory (contains vip_lite.h)")
+set(VIPLITE_LIBRARY "" CACHE FILEPATH
+    "VIPLite runtime library (libNBGlinker.so, or libVIPlite.so on older SoCs)")
 option(ONNXSIM_REMOTE_DORA "Build the DORA node adapter" OFF)
 option(ONNXSIM_REMOTE_DORA_STUB
        "Use the dependency-free DORA C API stub for adapter compile tests" OFF)
@@ -255,6 +261,11 @@ if (BUILD_TESTING)
   target_link_libraries(onnx-remote-transport-test PRIVATE onnx_remote_transport)
   add_test(NAME onnx-remote-transport-roundtrip
            COMMAND onnx-remote-transport-test)
+
+  # The VIPLite worker's half-float and quantize/dequantize routines; header-only, so no SDK or device is needed.
+  add_executable(onnx-remote-viplite-convert-test viplite_convert_test.cpp)
+  add_test(NAME onnx-remote-viplite-convert
+           COMMAND onnx-remote-viplite-convert-test)
 endif()
 
 if (ONNX_REMOTE_AXCL)
@@ -265,6 +276,21 @@ if (ONNX_REMOTE_AXCL)
   target_include_directories(onnx-remote-axcl-worker PRIVATE ${AXCL_INCLUDE_DIR})
   target_link_libraries(onnx-remote-axcl-worker PRIVATE
                         onnx_remote_transport ${AXCL_RT_LIBRARY} ${AXCL_SYS_LIBRARY})
+endif()
+
+if (ONNX_REMOTE_VIPLITE)
+  if (NOT VIPLITE_INCLUDE_DIR OR NOT EXISTS "${VIPLITE_INCLUDE_DIR}/vip_lite.h" OR
+      NOT VIPLITE_LIBRARY)
+    message(FATAL_ERROR
+      "ONNX_REMOTE_VIPLITE requires VIPLITE_INCLUDE_DIR (with vip_lite.h) "
+      "and VIPLITE_LIBRARY")
+  endif()
+  add_executable(onnx-remote-viplite-worker remote_viplite_worker.cpp)
+  target_include_directories(onnx-remote-viplite-worker PRIVATE
+                             ${VIPLITE_INCLUDE_DIR})
+  target_link_libraries(onnx-remote-viplite-worker PRIVATE
+                        onnx_remote_transport ${VIPLITE_LIBRARY})
+  install(TARGETS onnx-remote-viplite-worker RUNTIME DESTINATION bin)
 endif()
 
 if (ONNXSIM_REMOTE_DORA)
