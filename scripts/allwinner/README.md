@@ -280,7 +280,8 @@ and 20 (d=256, 4 heads, 2 layers, 64 tokens):
 | ViT | 111 (97 at opset 20) | 70 (62) | `LayerNormalization` x4, `Div` x4, `Gelu` x2 (opset 20) | none |
 
 `onnxsim` removes every `Identity` and `Constant` (and the causal mask folds to a constant). `scripts/allwinner/npu_rewrite.py` then
-replaces `LayerNormalization` (-> `ReduceMean`, `Sub`, `Mul`, `Sqrt`, `Reciprocal`), `Gelu` (-> `Erf`, or `Tanh` for the approximate form)
+replaces `LayerNormalization` (-> `ReduceMean`, `Sub`, `Mul`, `Sqrt`, `Reciprocal`, with the deviation pre-scaled by 1/16 before it is
+squared so that fp16 cannot overflow; see the accuracy study below), `Gelu` (-> `Erf`, or `Tanh` for the approximate form)
 and `Div` (-> `Mul` by a folded reciprocal, or `Reciprocal` + `Mul`) and checks the result against the original on random inputs: the
 largest difference was 1e-6 absolute (about 1e-6 of the output range), float32 rounding. `compile_nbg.py` runs it by default
 (`--no-rewrite` to skip) and records what it changed under `rewrites` in the manifest. It does not guess at `Einsum`, `Trilu` or
@@ -312,3 +313,64 @@ not measured), which makes anything beyond small models impractical, independent
 **Integer inputs.** A transformer's input is a token-id tensor. The worker now passes `INT32`/`INT64`/`UINT32` tensors through to an NBG
 input of the same type (needed for embedding lookups); this is **untested on hardware**, because no network available here has an integer
 input.
+
+### Accuracy of a real transformer under the NPU's quantization schemes (DistilBERT, SST-2)
+
+`scripts/allwinner/transformer_accuracy/` measures what each precision scheme the Acuity toolchain offers costs a fine-tuned transformer,
+without needing Acuity or the NPU. `study_sst2.py` downloads `distilbert-base-uncased-finetuned-sst-2-english` (safetensors only) and the
+SST-2 data, exports it with a fixed shape (batch 16 for speed, 64 tokens; the longest validation sentence is 55), runs it through
+`onnxsim` + `npu_rewrite.py`, and evaluates each scheme as emulated by `quantsim.py`, which inserts fake-quantize nodes after every float
+tensor and fake-quantizes the weights (`uint8` = asymmetric affine, `pcq` = per-channel symmetric int8 weights with 8-bit activations,
+`int16` = dynamic fixed point with power-of-two scales, `fp16`, `bf16`). Hybrid variants leave named tensors in float. Its primitives are
+unit-tested against numpy (`tests/test_allwinner_quantsim.py`). **This simulates the schemes; it is not Acuity and not the NPU**: Acuity's
+calibration algorithm, operator fusion and internal precisions may differ, and speed is not measured at all.
+
+The pipeline itself is sound: PyTorch fp32 gives **91.06%** on the 872 SST-2 validation sentences (the model's published figure), and the
+converted model (simplified, LayerNorm/Div rewritten, only documented operators) gives 91.06% with 100% prediction agreement.
+
+| scheme (emulated) | accuracy | vs fp32 | predictions agreeing with fp32 | logit error (RMSE / range) |
+|---|---|---|---|---|
+| fp32 | 91.06% | | | |
+| fp16, every tensor and weight | 90.94% | -0.12 | 99.89% | 0.0005 |
+| bf16, every tensor and weight | 91.06% | 0.00 | 100% | 0.0034 |
+| int16 fixed point; softmax input fp16; LayerNorm/GELU interiors float | 91.06% | 0.00 | 100% | 0.0010 |
+| int16 fixed point; softmax input fp16; LayerNorm/GELU per-op | 91.17% | +0.11 | 98.05% | 0.161 |
+| int16 fixed point, everything | 75.92% | -15.14 | 75.46% | 0.306 |
+| weights only, int8 per-channel (activations float) | 90.60% | -0.46 | 99.31% | 0.0082 |
+| weights only, uint8 per-tensor | 90.25% | -0.81 | 98.51% | 0.0255 |
+| **int8 on matmul inputs only, rest fp16**, pcq, min/max calibration | 90.48% | -0.58 | 98.51% | 0.0265 |
+| same, moving-average calibration | 90.37% | -0.69 | 98.17% | 0.0310 |
+| same, 99.9th-percentile calibration | 86.93% | -4.13 | 88.07% | 0.183 |
+| int8 on every tensor (softmax input fp16, LayerNorm/GELU interiors float), min/max | 85.32% | -5.74 | 88.30% | 0.350 |
+| same, moving-average calibration | 88.88% | -2.18 | 93.46% | 0.246 |
+| same, 99.9th-percentile calibration | 84.86% | -6.20 | 87.84% | 0.198 |
+
+Calibration was 128 training sentences. Repeating the two best 8-bit configurations over three different draws of 16, 64 and 256
+sentences (nine calibration sets each) gave: int8 on matmul inputs only, mean 90.33% (89.68-90.94%, 97.7-98.6% agreement) with min/max
+and 90.29% (90.02-90.60%) with moving average; int8 on every tensor, moving average, mean 88.95% (87.61-89.91%, 90.4-95.0% agreement).
+More calibration data did not help. With 872 sentences the standard error of one accuracy is about 1 point, so accuracy differences
+under a point are not significant on their own; the agreement and logit-error columns are paired and tighter.
+
+What it found:
+
+1. **A decomposed LayerNorm overflows fp16.** The first fp16 run lost 0.7 points (6% logit error). Bisecting by tensor put all of it on
+   one: the squared deviation `d*d`, whose range reaches 3.4e5, above fp16's 65504, because DistilBERT's residual stream has outlier
+   channels with deviations up to +-582. The sum of squares becomes infinity and the normalized output zero. `npu_rewrite.py` now
+   pre-scales the deviation by 1/16 before squaring (mathematically identical, one extra multiply), which brought fp16 from 90.37% to 90.94%
+   and the logit error from 0.059 to 0.0005. Any fp16 execution of the decomposed form would hit this unless the compiler fuses
+   LayerNorm with a wider internal accumulator; whether Acuity does is unknown.
+2. **The attention padding mask breaks any integer scheme.** The mask is added to the attention scores with fill value -3.4e38, so that
+   tensor's calibrated range is 3.4e38 and a fixed-point or 8-bit scale rounds every real score to zero: int16 everywhere falls to 75.9%,
+   and 8-bit schemes with nothing kept float sat at 52-53% (chance; run before the LayerNorm change, which does not affect this).
+   Keeping just the six scores-plus-mask tensors in fp16 brings int16 back to 91.17%. In a toolchain whose hybrid layers only offer
+   16-bit fixed point that tensor cannot be kept this way, so feed fixed-length inputs without padding, or test a modest fill value
+   (not tried here), or use float for the graph.
+3. **Outlier channels make 8-bit on every tensor expensive.** Quantizing all tensors to 8 bits costs 2-6 points, and the cost depends
+   on calibration. Clipping at the 99.9th percentile is worse than min/max (-4.1 versus -0.6 on matmul inputs) because the outliers
+   carry signal. Keeping everything except matmul inputs in 16-bit float (the emulated matrix-engine split) costs about 0.7 points.
+4. **16-bit schemes are near-lossless.** bf16 and int16 fixed point (once the mask tensor and the fused LayerNorm/GELU interiors are
+   float) match fp32; per-op int16 LayerNorm interiors alone cost a 16% logit error even though accuracy happens to hold.
+5. Weight quantization alone is cheap (-0.5 int8 per-channel, -0.8 uint8 per-tensor); the loss is in the activations.
+
+Not done: another architecture or task, perplexity for a decoder, the real Acuity or NPU. The conclusions are about the schemes, on one
+model and one dataset.

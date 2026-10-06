@@ -78,6 +78,34 @@ def test_layer_normalization_over_two_axes_and_custom_epsilon():
     _check_equivalent(model, {"x": RNG.standard_normal((3, 4, 6)).astype(np.float32)})
 
 
+def test_layer_normalization_squares_stay_inside_fp16_range():
+    # DistilBERT's residual stream has outlier channels; with one channel at 600 the deviation is ~525 and its square ~2.8e5, above fp16's
+    # 65504. A decomposed LayerNorm that squares the raw deviation overflows to inf in fp16 (a 6% logit error on SST-2 in the accuracy
+    # study); the pre-scaled form must keep every squared tensor in range and still give the same answer.
+    model = _model(
+        "g (float[2, 3, 8] x) => (float[2, 3, 8] y) { y = LayerNormalization<axis = -1, epsilon = 1e-12>(x, s) }",
+        [_init("s", np.ones(8))],
+    )
+    x = RNG.standard_normal((2, 3, 8)).astype(np.float32)
+    x[..., 0] = 600.0
+    assert (
+        (x - x.mean(-1, keepdims=True)) ** 2
+    ).max() > 65504  # the raw squares really would overflow
+    rewritten, _ = _check_equivalent(model, {"x": x}, atol=1e-4)
+    squares = [n.output[0] for n in rewritten.graph.node if "__sq" in n.output[0]]
+    assert (
+        len(squares) == 1
+    )  # the rewriter's name for the squared (pre-scaled) deviation
+    probe = onnx.ModelProto.FromString(rewritten.SerializeToString())
+    probe.graph.ClearField("output")
+    probe.graph.output.extend(
+        onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, None)
+        for t in squares
+    )
+    for value in ReferenceEvaluator(probe).run(None, {"x": x}):
+        assert np.abs(value).max() < 65504 / 8
+
+
 def test_layer_normalization_rejects_a_positive_axis():
     model = _model(
         "g (float[2, 8] x) => (float[2, 8] y) { y = LayerNormalization<axis = 1>(x, s) }",

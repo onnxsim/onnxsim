@@ -38,6 +38,10 @@ DOCUMENTED_ONNX_OPS = frozenset(
     Softmax Softplus Softsign SpaceToDepth Split Sqrt Squeeze STFT Sub Sum Tan Tanh Tile TopK Transpose Unsqueeze Upsample Where Xor""".split()
 )
 
+LN_PRESCALE = (
+    1.0 / 16
+)  # keeps the squared deviations of a decomposed LayerNormalization inside fp16 range (see layer_norm)
+
 FLOAT_TYPES = (
     TensorProto.FLOAT,
     TensorProto.FLOAT16,
@@ -122,16 +126,26 @@ class _Rewriter:
                 f"LayerNormalization {base}: positive axis {axis} needs a static rank; export with a negative axis"
             )
         axes = list(range(axis, 0))
+        # The deviation is pre-scaled by s = 1/16 before it is squared, and the compensation is folded into epsilon and the reciprocal:
+        #   ds = d*s, var_s = E[ds^2] = s^2 var, 1/sqrt(var_s + eps*s^2) = 1/(s*sqrt(var+eps)), so ds * that = d / sqrt(var+eps).
+        # Mathematically identical, but d^2 can no longer overflow fp16 (65504): DistilBERT's residual stream has outlier channels with
+        # deviations of several hundred, whose squares reach 3e5.
         mean = self.reduce_mean(x, axes, base, "mean")
         d = self.emit("Sub", [x, mean], base, "d")
-        sq = self.emit("Mul", [d, d], base, "sq")
+        ds = self.emit("Mul", [d, self.const(base, "s", LN_PRESCALE, np_t)], base, "ds")
+        sq = self.emit("Mul", [ds, ds], base, "sq")
         var = self.reduce_mean(sq, axes, base, "var")
-        veps = self.emit("Add", [var, self.const(base, "eps", eps, np_t)], base, "veps")
+        veps = self.emit(
+            "Add",
+            [var, self.const(base, "eps", eps * LN_PRESCALE**2, np_t)],
+            base,
+            "veps",
+        )
         inv = self.emit(
             "Reciprocal", [self.emit("Sqrt", [veps], base, "std")], base, "inv"
         )
         y = self.emit(
-            "Mul", [self.emit("Mul", [d, inv], base, "n"), scale], base, "scaled"
+            "Mul", [self.emit("Mul", [ds, inv], base, "n"), scale], base, "scaled"
         )
         if bias:
             self.new_nodes.append(
