@@ -41,6 +41,7 @@ z3-solver is an optional dependency (the ``verify`` extra).
 
 import dataclasses
 import hashlib
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -49,6 +50,7 @@ from onnx import numpy_helper
 
 # Statuses a window can end in. Everything but "proved-*" means certification
 # of that output did not succeed.
+NEEDS_RANGES_HINT = "no input_ranges given"
 PROVED_STRUCTURAL = "proved-structural"
 PROVED_CONGRUENCE = "proved-congruence"
 PROVED_SMT = "proved-smt"
@@ -169,7 +171,7 @@ def _shapes(model: onnx.ModelProto) -> Dict[str, Tuple[Optional[Tuple[int, ...]]
         inferred = onnx.shape_inference.infer_shapes(model)
     except Exception:
         inferred = model
-    out = {}
+    out: Dict[str, Tuple[Optional[Tuple[int, ...]], int]] = {}
     g = inferred.graph
     for vi in list(g.input) + list(g.value_info) + list(g.output):
         tt = vi.type.tensor_type
@@ -177,16 +179,19 @@ def _shapes(model: onnx.ModelProto) -> Dict[str, Tuple[Optional[Tuple[int, ...]]
             out[vi.name] = (None, tt.elem_type)
             continue
         dims = [d.dim_value if d.HasField("dim_value") else None for d in tt.shape.dim]
-        out[vi.name] = (None if None in dims else tuple(dims), tt.elem_type)
+        known = tuple(d for d in dims if d is not None)
+        out[vi.name] = (known if len(known) == len(dims) else None, tt.elem_type)
     for t in g.initializer:
         out[t.name] = (tuple(t.dims), t.data_type)
     return out
 
 
-def _index(space: _Space, model: onnx.ModelProto) -> Dict[str, int]:
+def _index(
+    space: _Space, model: onnx.ModelProto, with_shapes: bool = True
+) -> Dict[str, int]:
     """Map each tensor name of ``model`` to its id in ``space``."""
     g = model.graph
-    shapes = _shapes(model)
+    shapes = _shapes(model) if with_shapes else {}
     tid: Dict[str, int] = {}
     inits = {t.name for t in g.initializer}
 
@@ -334,6 +339,8 @@ class _Encoder:
         return [self.value(i) for i in d.inputs if i >= 0]
 
     def attr(self, d: _Def, name, default=None):
+        if d.node is None:
+            return default
         for a in d.node.attribute:
             if a.name == name:
                 return onnx.helper.get_attribute_value(a)
@@ -531,10 +538,21 @@ def _cone(space: _Space, root: int) -> set:
 
 
 class _Prover:
-    def __init__(self, space, names, input_ranges, atol, rtol, max_work, timeout_ms):
+    def __init__(
+        self,
+        space,
+        names,
+        input_ranges,
+        atol,
+        rtol,
+        max_work,
+        timeout_ms,
+        deadline=None,
+    ):
         self.space, self.names = space, names
         self.input_ranges, self.atol, self.rtol = input_ranges, atol, rtol
         self.max_work, self.timeout_ms = max_work, timeout_ms
+        self.deadline = deadline
         self.memo: Dict[Tuple[int, int], Window] = {}
         self.windows: List[Window] = []
 
@@ -588,6 +606,8 @@ class _Prover:
         return self._smt(a, b, mk)
 
     def _smt(self, a, b, mk) -> Window:
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            return mk(SKIPPED, "certify time budget exhausted")
         ca, cb = _cone(self.space, a), _cone(self.space, b)
         # Shared non-constant tensors are cut points: proven equal by hashing,
         # so they become one shared free variable instead of being re-encoded.
@@ -630,7 +650,12 @@ class _Prover:
             # time budget: a single big Or over every element is far harder
             # for the solver than the same facts checked one at a time.
             n = va.size
-            s.set("timeout", max(1000, self.timeout_ms // max(1, min(n, 8))))
+            budget = self.timeout_ms
+            if self.deadline is not None:
+                budget = min(
+                    budget, max(500, int((self.deadline - time.monotonic()) * 1000))
+                )
+            s.set("timeout", max(500, budget // max(1, min(n, 8))))
             r = z3.unsat
             for x, y in zip(va.reshape(-1), vb.reshape(-1)):
                 diff = x - y
@@ -662,7 +687,7 @@ class _Prover:
             note = "solver found an input where the two sides differ"
             if not enc.has_bounds:
                 note += (
-                    f" (counterexample magnitude {big:.3g}; no input_ranges given, so this may be"
+                    f" (counterexample magnitude {big:.3g}; {NEEDS_RANGES_HINT}, so this may be"
                     " float rounding of re-computed constants amplified by a huge input -- give"
                     " input_ranges to certify over the realistic domain)"
                 )
@@ -681,6 +706,7 @@ def certify(
     rtol: float = 1e-4,
     max_work: int = 300_000,
     timeout_ms: int = 60_000,
+    total_timeout_ms: Optional[int] = None,
 ) -> CertifyReport:
     """Try to prove ``simplified`` computes the same outputs as ``orig``.
 
@@ -692,9 +718,16 @@ def certify(
     :param max_work: budget of multiply-adds / variables per SMT window; a
         bigger window is reported ``skipped``.
     :param timeout_ms: per-window solver timeout.
+    :param total_timeout_ms: wall-clock budget for the whole call; windows reached after it
+        is spent are reported ``skipped``. ``None`` means no overall limit.
     """
     space = _Space()
-    ta, tb = _index(space, orig), _index(space, simplified)
+    deadline = (
+        None
+        if total_timeout_ms is None
+        else time.monotonic() + total_timeout_ms / 1000.0
+    )
+    ta, tb = _index(space, orig, False), _index(space, simplified, False)
     in_a = {i.name for i in orig.graph.input} - {t.name for t in orig.graph.initializer}
     in_b = {i.name for i in simplified.graph.input} - {
         t.name for t in simplified.graph.initializer
@@ -705,10 +738,19 @@ def certify(
     out_b = [o.name for o in simplified.graph.output]
     if out_a != out_b:
         raise ValueError(f"graph outputs differ: {out_a} vs {out_b}")
+    if any(ta[o] != tb[o] for o in out_a):
+        # Something differs: only now pay for shape inference (needed by the SMT encoding).
+        for model, tid in ((orig, ta), (simplified, tb)):
+            for name, (shape, elem) in _shapes(model).items():
+                if name in tid:
+                    space.shape.setdefault(tid[name], shape)
+                    space.dtype.setdefault(tid[name], elem)
     names: Dict[int, str] = {}
     for name, i in list(tb.items()) + list(ta.items()):
         names.setdefault(i, name)
-    prover = _Prover(space, names, input_ranges, atol, rtol, max_work, timeout_ms)
+    prover = _Prover(
+        space, names, input_ranges, atol, rtol, max_work, timeout_ms, deadline
+    )
     outputs, windows, seen = {}, [], set()
 
     def collect(w: Window):
