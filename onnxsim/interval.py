@@ -39,7 +39,7 @@ What an interval means, so it is not over-read:
 
 import dataclasses
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx
@@ -813,6 +813,12 @@ def propagate(
     model: onnx.ModelProto,
     input_ranges: Optional[Dict[str, Tuple]] = None,
     input_shapes: Optional[Dict[str, Sequence[Any]]] = None,
+    shape_fallback: Optional[
+        Callable[
+            [onnx.NodeProto, List[Optional[_sr.Shape]], Dict[str, Interval]],
+            Sequence[Optional[_sr.Shape]],
+        ]
+    ] = None,
 ) -> IntervalResult:
     """Propagate input boxes through ``model``; see the module docstring for guarantees.
 
@@ -824,6 +830,16 @@ def propagate(
         :class:`RangedTensor` (value hull only) instead of being dropped; tensors that
         depend on a data-dependent op (``NonZero``, ``TopK``, ...) do too. See
         :mod:`onnxsim.shape_ranges`.
+    :param shape_fallback: optional ``f(node, input_shapes, intervals) -> output_shapes``
+        called for a node this module has no rule for (an op unsupported for ranged
+        operands, say ``Conv`` with a dynamic batch) whose output shapes are still
+        unknown. ``input_shapes`` holds each operand's ranged shape (``None`` for an
+        omitted or unknown operand), ``intervals`` the static intervals computed so far
+        (so a rule can read a constant such as ``Resize``'s scales). Each shape it returns
+        (aligned with ``node.output``; ``None`` for "cannot say") becomes a
+        :class:`RangedTensor` with an unbounded value hull, so downstream nodes keep
+        going. A rule must be sound: the returned dims contain the dims of every valid
+        execution. ``onnxsim.shape_cost`` uses this; the default (``None``) changes nothing.
     """
     runner = _Runner(model)
     g = model.graph
@@ -837,7 +853,10 @@ def propagate(
         t.name: _point(numpy_helper.to_array(t)) for t in g.initializer
     }
     try:
-        inferred = onnx.shape_inference.infer_shapes(model).graph
+        # shapes are inferred from the *declared* inputs, which an ``input_shapes`` override replaces
+        inferred = onnx.shape_inference.infer_shapes(
+            declare_input_dims(model, input_shapes) if input_shapes else model
+        ).graph
     except Exception:
         inferred = g
     shapes = {}
@@ -1017,7 +1036,85 @@ def propagate(
                 shape = shapes.get(o)
                 if shape is not None:
                     iv[o] = _unbounded(shape)
+            if shape_fallback is not None and any(
+                o not in iv and o not in ranged for o in outs
+            ):
+                _apply_shape_fallback(node, iv, ranged, shape_fallback)
     return IntervalResult(iv, unsupported, ranged)
+
+
+def declare_input_dims(
+    model: onnx.ModelProto, input_shapes: Dict[str, Sequence[Any]]
+) -> onnx.ModelProto:
+    """A copy of ``model`` whose graph inputs carry the dims of ``input_shapes``.
+
+    ONNX shape inference works from the declared input shapes, so after an override they must
+    describe the analysed model: an ``int`` becomes a static dim, anything else (a ``(lo, hi)`` range
+    or ``None``) an unnamed symbolic dim. Without this, a model exported with static shapes would
+    keep its static inferred shapes for tensors that an override has made dynamic.
+    """
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    stale = False  # an override contradicts a declared *static* dim
+    for vi in m.graph.input:
+        spec = input_shapes.get(vi.name)
+        if spec is None or not vi.type.HasField("tensor_type"):
+            continue
+        declared = [
+            int(d.dim_value) if d.HasField("dim_value") and d.dim_value > 0 else None
+            for d in vi.type.tensor_type.shape.dim
+        ]
+        if len(declared) != len(spec) or any(
+            dv is not None and not (isinstance(s, (int, np.integer)) and int(s) == dv)
+            for dv, s in zip(declared, spec)
+        ):
+            stale = True
+    if stale:
+        # shapes the exporter declared for intermediates and outputs describe the *export*, not the
+        # override, and ONNX inference would keep them: drop them so they are re-derived
+        del m.graph.value_info[:]
+        for vo in m.graph.output:
+            if vo.type.HasField("tensor_type"):
+                vo.type.tensor_type.ClearField("shape")
+    for vi in m.graph.input:
+        spec = input_shapes.get(vi.name)
+        if spec is None:
+            continue
+        del vi.type.tensor_type.shape.dim[:]
+        vi.type.tensor_type.shape.SetInParent()
+        for i, s in enumerate(spec):
+            d = vi.type.tensor_type.shape.dim.add()
+            if isinstance(s, (int, np.integer)):
+                d.dim_value = int(s)
+            else:
+                d.dim_param = f"__override_{vi.name}_{i}"
+    return m
+
+
+def _apply_shape_fallback(
+    node: onnx.NodeProto,
+    iv: Dict[str, Interval],
+    ranged: Dict[str, RangedTensor],
+    shape_fallback: Callable[..., Sequence[Optional[_sr.Shape]]],
+) -> None:
+    """Give a node's still-unknown outputs the ranged shapes ``shape_fallback`` states."""
+    in_shapes: List[Optional[_sr.Shape]] = []
+    for x in node.input:
+        if not x:
+            in_shapes.append(None)
+        elif x in ranged:
+            in_shapes.append(ranged[x].shape)
+        elif x in iv:
+            in_shapes.append(_sr.from_ints(iv[x][0].shape))
+        else:
+            in_shapes.append(None)
+    try:
+        out_shapes = shape_fallback(node, in_shapes, iv)
+    except Exception:  # a rule that cannot say leaves the outputs unknown
+        return
+    for o, shape in zip(node.output, out_shapes):
+        if o and shape is not None and o not in iv and o not in ranged:
+            ranged[o] = RangedTensor(shape, _FULL)
 
 
 # --------------------------------------------------------------------------
