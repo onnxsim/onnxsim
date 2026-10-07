@@ -38,6 +38,13 @@ Soundness, so the numbers are not over-read:
   with its interval enclosure (``+-inf`` where nothing is known).
 * Final bounds are intersected with the interval bounds, so they are never looser
   than ``interval.propagate``, and widened by a few float64 ulps.
+
+Devices. ``device=``/``precision=`` (on ``bounds``, ``bab_bounds``,
+``verify_output_ranges``) are opt-in: the default is the numpy float64 path. A torch
+device ("cuda", "cuda:N", "auto", or "torch-cpu") runs the same backward pass on
+tensors that stay device-resident. ``precision="float32"`` uses error-tracked
+arithmetic (``onnxsim._rigorous_f32``) so the float32 result still encloses the true
+bounds; see ``docs/gpu-backend.md`` for the scheme, its assumptions and its cost.
 * Like ``interval``, this encloses the *real-number* function in float64. float32
   execution can exceed it by float32 rounding; ``slack`` in the tests is for that.
 
@@ -72,6 +79,7 @@ The multiplier-based methods need torch (optional, imported lazily); plain branc
 bound with CROWN leaves does not.
 """
 
+import contextlib
 import dataclasses
 import itertools
 import time
@@ -80,6 +88,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import onnx
 
+from . import _device
 from . import interval as _interval
 from . import ranges as _ranges
 
@@ -89,6 +98,7 @@ _Range = Tuple[np.ndarray, np.ndarray]
 _Forced = List[Tuple[int, int, int]]  # (Relu node index, flat neuron index, +1 / -1)
 _ROW_BUDGET = 4_000_000  # max elements of one coefficient array (rows x tensor size)
 _ALPHA_BUDGET = 2_000_000  # max total elements of per-row alpha parameters
+_GPU_ROW_BUDGET_CAP = 256_000_000  # same, on an accelerator with plenty of free memory
 
 
 @dataclasses.dataclass
@@ -119,9 +129,31 @@ class TensorBound:
 
 class _NumpyOps:
     name = "numpy"
+    rigorous = False  # True: arrays are error-tracked float32 values (see _PairOps)
 
     def asarray(self, a: Any) -> Any:
         return np.asarray(a, dtype=np.float64)
+
+    # constants of the model / the relaxation. ``key`` (hashable, or None) lets a device
+    # backend cache the transferred constant; the numpy backend has nothing to transfer.
+    def const(self, a: Any, key: Any = None) -> Any:
+        return np.asarray(a, dtype=np.float64)
+
+    def line(self, a: Any) -> Any:  # a relaxation line coefficient
+        return np.asarray(a, dtype=np.float64)
+
+    def lo_const(self, a: Any) -> Any:  # a box endpoint, used as a lower / upper factor
+        return np.asarray(a, dtype=np.float64)
+
+    hi_const = lo_const
+
+    def relu_slope(self, r: Dict[str, np.ndarray], alpha: Any) -> Any:
+        return self.asarray(r["a_l_stable"]) + self.asarray(r["unstable"]) * alpha
+
+    def eye(self, k: int, size: int, offset: int, shape: Sequence[int]) -> Any:
+        e = np.zeros((k, size))
+        e[np.arange(k), offset + np.arange(k)] = 1.0
+        return e.reshape((k,) + tuple(shape))
 
     def zeros(self, shape: Sequence[int]) -> Any:
         return np.zeros(tuple(shape), dtype=np.float64)
@@ -144,29 +176,70 @@ class _NumpyOps:
     def einsum(self, eq: str, *ops: Any) -> Any:
         return np.einsum(eq, *ops, optimize=True)
 
+    def bias_dot(self, a: Any, b: Any) -> Any:
+        """``sum over (n, i, j) of a[m, n, q, i, j] * b[q]`` -> ``(m,)``."""
+        return self.einsum("mnqij,q->m", a, b)
+
     def to_numpy(self, a: Any) -> np.ndarray:
         return np.asarray(a)
 
 
 class _TorchOps(_NumpyOps):
+    """The backward pass on a torch device, in float64 (default) or plain float32.
+
+    Plain float32 is *not* rigorous (it is what the alpha / beta optimiser iterates in; the
+    bound it returns is re-evaluated by :class:`_PairOps`). Constants are cached per ``key``
+    so a weight crosses to the device once, not once per backward pass.
+    """
+
     name = "torch"
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cpu", dtype: Any = None) -> None:
         try:
             import torch
         except ImportError as e:  # pragma: no cover - exercised only without torch
             raise ImportError(
-                "alpha-CROWN needs torch (pip install torch); method='crown' and 'ibp' do not"
+                "alpha-CROWN and the torch backends need torch (pip install torch); "
+                "method='crown' / 'ibp' on device='cpu' do not"
             ) from e
         self.t = torch
+        self.dev = torch.device(device)
+        self.dt = dtype if dtype is not None else torch.float64
+        self._cache: Dict[Any, Any] = {}
+
+    def _tensor(self, a: Any) -> Any:
+        return self.t.as_tensor(np.array(a, dtype=np.float64)).to(
+            device=self.dev, dtype=self.dt
+        )
 
     def asarray(self, a: Any) -> Any:
         if isinstance(a, self.t.Tensor):
             return a
-        return self.t.as_tensor(np.array(a, dtype=np.float64))
+        return self._tensor(a)
+
+    def const(self, a: Any, key: Any = None) -> Any:
+        if key is None:
+            return self.asarray(a)
+        hit = self._cache.get(key)
+        if hit is None:
+            hit = self._cache[key] = self.asarray(a)
+        return hit
+
+    line = asarray
+    lo_const = asarray
+    hi_const = asarray
+
+    def relu_slope(self, r: Dict[str, np.ndarray], alpha: Any) -> Any:
+        return self.asarray(r["a_l_stable"]) + self.asarray(r["unstable"]) * alpha
+
+    def eye(self, k: int, size: int, offset: int, shape: Sequence[int]) -> Any:
+        e = self.t.zeros((k, size), dtype=self.dt, device=self.dev)
+        idx = self.t.arange(k, device=self.dev)
+        e[idx, offset + idx] = 1.0
+        return e.reshape((k,) + tuple(shape))
 
     def zeros(self, shape: Sequence[int]) -> Any:
-        return self.t.zeros(tuple(shape), dtype=self.t.float64)
+        return self.t.zeros(tuple(shape), dtype=self.dt, device=self.dev)
 
     def pos(self, a: Any) -> Any:
         return a.clamp(min=0.0)
@@ -187,7 +260,88 @@ class _TorchOps(_NumpyOps):
         return self.t.einsum(eq, *ops)
 
     def to_numpy(self, a: Any) -> np.ndarray:
-        return a.detach().cpu().numpy()
+        return np.asarray(a.detach().cpu().numpy(), dtype=np.float64)
+
+
+class _PairOps(_TorchOps):
+    """Rigorous float32: every array is a :class:`onnxsim._rigorous_f32.P` (value + error bound).
+
+    The result of a backward pass is a float32 number plus a bound on its distance to the real
+    number the same algorithm computes in exact arithmetic over the same (float32-valid)
+    relaxation lines, so ``to_numpy`` returns the *sound lower bound* ``value - error``
+    (``-inf`` if anything overflowed). The proof and its assumptions: ``_rigorous_f32``.
+    """
+
+    name = "torch-float32-rigorous"
+    rigorous = True
+
+    def __init__(self, device: str = "cpu") -> None:
+        super().__init__(device, None)
+        from . import _rigorous_f32
+
+        self.dt = self.t.float32
+        self.r = _rigorous_f32
+
+    def asarray(self, a: Any) -> Any:  # a spec / multiplier: an exact float32 value
+        if isinstance(a, self.r.P):
+            return a
+        return self.r.P(super()._tensor(a))
+
+    def const(self, a: Any, key: Any = None) -> Any:
+        if key is not None and key in self._cache:
+            return self._cache[key]
+        k = self.r.K.from_numpy(a, self.dev)
+        if key is not None:
+            self._cache[key] = k
+        return k
+
+    def line(self, a: Any) -> Any:  # float32-valid already (sound_lines_f32): exact
+        return self.r.K.exact(a, self.dev)
+
+    def lo_const(self, a: Any) -> Any:
+        return self.r.K.exact(self.r.down32(a), self.dev)
+
+    def hi_const(self, a: Any) -> Any:
+        return self.r.K.exact(self.r.up32(a), self.dev)
+
+    def relu_slope(self, r: Dict[str, np.ndarray], alpha: Any) -> Any:
+        # base + unstable * alpha: one of the two terms is zero everywhere, so this is exact
+        base = self._tensor(r["a_l_stable"])
+        unst = self._tensor(r["unstable"])
+        return self.r.K.exact(base + unst * alpha.detach().to(self.t.float32), self.dev)
+
+    def eye(self, k: int, size: int, offset: int, shape: Sequence[int]) -> Any:
+        return self.r.P(super().eye(k, size, offset, shape))
+
+    def zeros(self, shape: Sequence[int]) -> Any:
+        z = super().zeros(shape)
+        return self.r.P(z, self.t.zeros_like(z))
+
+    def pos(self, a: Any) -> Any:
+        return a.pos()
+
+    def neg(self, a: Any) -> Any:
+        return a.neg()
+
+    def sum(self, a: Any, axes: Sequence[int], keepdims: bool = False) -> Any:
+        return a.sum(tuple(axes), keepdims)
+
+    def reshape(self, a: Any, shape: Sequence[int]) -> Any:
+        return a.reshape(tuple(shape))
+
+    def transpose(self, a: Any, perm: Sequence[int]) -> Any:
+        return a.permute(*perm)
+
+    def einsum(self, eq: str, *ops: Any) -> Any:
+        return self.r.einsum(eq, *ops)
+
+    def bias_dot(self, a: Any, b: Any) -> Any:
+        # reduce (n, i, j) block-wise first: the contraction is over n * q * i * j terms
+        part = a.sum((1, 3, 4))  # (m, q)
+        return part @ b
+
+    def to_numpy(self, a: Any) -> np.ndarray:
+        return self.r.lower_to_numpy(a)
 
 
 # --------------------------------------------------------------------------
@@ -327,6 +481,14 @@ _RESHAPE_LIKE = {"Reshape", "Flatten", "Squeeze", "Unsqueeze", "Identity"}
 _NONLINEAR = {"Relu", "Sigmoid", "Tanh"}
 
 
+def _sound_lines_f32(
+    kind: str, r: Dict[str, np.ndarray], lo: np.ndarray, hi: np.ndarray
+) -> Dict[str, np.ndarray]:
+    from . import _rigorous_f32
+
+    return _rigorous_f32.sound_lines_f32(kind, r, lo, hi)
+
+
 def _unbroadcast(
     ops: Any, a: Any, m: int, shape_in: Tuple[int, ...], shape_out: Tuple[int, ...]
 ) -> Any:
@@ -343,11 +505,104 @@ def _unbroadcast(
     return ops.reshape(a, (m,) + tuple(shape_in))
 
 
+def _is_oom(e: BaseException) -> bool:
+    """Is ``e`` an out-of-memory error of a torch device (CUDA / ROCm / CPU allocator)?"""
+    name = type(e).__name__
+    if name in ("OutOfMemoryError", "MemoryError"):
+        return True
+    return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+
+
+def _free_device_cache(ops: Any) -> None:
+    t = getattr(ops, "t", None)
+    if t is not None and getattr(ops, "dev", None) is not None:
+        if ops.dev.type == "cuda":
+            try:
+                t.cuda.empty_cache()
+            except Exception:
+                pass
+
+
+class DeviceMemoryError(RuntimeError):
+    """The device ran out of memory even for a single row of the bound computation."""
+
+
+class _Backend:
+    """Where and in what arithmetic the backward pass runs (see :mod:`onnxsim._device`).
+
+    ``numpy`` float64 is today's path. A torch backend keeps every coefficient array on the
+    device for the whole backward pass and returns numpy on the host. ``float32`` runs the
+    rigorous error-tracked arithmetic (:class:`_PairOps`) so its bounds stay sound.
+    """
+
+    def __init__(
+        self, device: Optional[str] = None, precision: Optional[str] = None
+    ) -> None:
+        self.res = _device.resolve(device, precision)
+        self._ops: Any = None
+        self._opt: Any = None
+
+    @property
+    def numpy(self) -> bool:
+        return self.res.is_numpy
+
+    @property
+    def rigorous(self) -> bool:
+        return self.res.is_f32
+
+    def ops(self) -> Any:
+        """Operations for the bounding passes (rigorous float32 when ``precision='float32'``)."""
+        if self._ops is None:
+            if self.res.is_numpy:
+                self._ops = _NumpyOps()
+            else:
+                assert self.res.torch_device is not None
+                if self.res.is_f32:
+                    self._ops = _PairOps(self.res.torch_device)
+                else:
+                    self._ops = _TorchOps(self.res.torch_device)
+        return self._ops
+
+    def opt_ops(self) -> Any:
+        """Plain torch operations for the alpha / beta optimiser (never rigorous itself)."""
+        if self._opt is None:
+            dev = self.res.torch_device or "cpu"
+            ops = _TorchOps(dev)
+            if self.res.is_f32:
+                ops.dt = ops.t.float32
+            self._opt = ops
+        return self._opt
+
+    def context(self) -> Any:
+        """Context to hold while a rigorous float32 pass runs (TF32 etc. off)."""
+        if self.res.is_f32:
+            return _device.strict_float32()
+        return contextlib.nullcontext()
+
+    def row_budget(self, maxel: int) -> int:
+        """Max elements of one coefficient array for this backend."""
+        if self.res.is_numpy or not self.res.is_accelerator:
+            return _ROW_BUDGET
+        free = _device.free_memory_bytes(self.res.torch_device or "cuda")
+        if free is None:
+            return _ROW_BUDGET
+        per = 4 if self.res.is_f32 else 8
+        copies = (
+            48 if self.res.is_f32 else 24
+        )  # live arrays in a backward pass (value + error)
+        return int(max(_ROW_BUDGET, min(_GPU_ROW_BUDGET_CAP, free // (per * copies))))
+
+
 class _Analyzer:
     def __init__(
-        self, model: onnx.ModelProto, input_ranges: Optional[Dict[str, Tuple]]
+        self,
+        model: onnx.ModelProto,
+        input_ranges: Optional[Dict[str, Tuple]],
+        backend: Optional[_Backend] = None,
     ):
         self.model = model
+        self.backend = backend if backend is not None else _Backend()
+        self.init_names = {t.name for t in model.graph.initializer}
         self.ibp = _interval.propagate(model, input_ranges)
         self.ib: Dict[str, Tuple[np.ndarray, np.ndarray]] = dict(self.ibp.intervals)
         self.nodes = list(model.graph.node)
@@ -358,6 +613,7 @@ class _Analyzer:
                     self.producer[o] = i
         self.leaf = {name for name in self.ib if self._is_leaf_name(name)}
         self._relax_cache: Dict[int, Dict[str, np.ndarray]] = {}
+        self._relax32_cache: Dict[int, Dict[str, np.ndarray]] = {}
         self._refined = False
         self.infeasible = (
             False  # a branch constraint was proven to exclude the whole box
@@ -370,6 +626,7 @@ class _Analyzer:
         c.__dict__.update(self.__dict__)
         c.ib = dict(self.ib)
         c._relax_cache = dict(self._relax_cache)
+        c._relax32_cache = dict(self._relax32_cache)
         c.infeasible = False
         return c
 
@@ -392,7 +649,7 @@ class _Analyzer:
         if lo.flat[flat] > hi.flat[flat]:
             return False
         self.ib[x] = (lo, hi)
-        self._relax_cache.pop(idx, None)
+        self._drop_relax(idx)
         return True
 
     # -- classification -----------------------------------------------------
@@ -484,6 +741,25 @@ class _Analyzer:
                 self._relax_cache[idx] = _scurve_relax(node.op_type, lo, hi)
         return self._relax_cache[idx]
 
+    def _drop_relax(self, idx: int) -> None:
+        self._relax_cache.pop(idx, None)
+        self._relax32_cache.pop(idx, None)
+
+    def _relax_for(self, ops: Any, idx: int) -> Dict[str, np.ndarray]:
+        """The relaxation lines ``ops`` should use: float64, or float32-valid for rigorous ops."""
+        r = self._relax(idx)
+        if not getattr(ops, "rigorous", False):
+            return r
+        if idx not in self._relax32_cache:
+            node = self.nodes[idx]
+            lo, hi = _clip_box(*self.ib[node.input[0]])
+            self._relax32_cache[idx] = _sound_lines_f32(node.op_type, r, lo, hi)
+        return self._relax32_cache[idx]
+
+    def _k(self, name: str, tag: Any) -> Any:
+        """Cache key for a derived constant of a model initializer (None: do not cache)."""
+        return (name, tag) if name in self.init_names else None
+
     # -- the backward pass ---------------------------------------------------
     def _lower(
         self,
@@ -549,21 +825,20 @@ class _Analyzer:
             ins = list(node.input)
             xs = lambda k: tuple(self.ib[ins[k]][0].shape)  # noqa: E731
             if t in ("Relu", "Sigmoid", "Tanh"):
-                r = self._relax(idx)
+                r = self._relax_for(ops, idx)
                 if relu_cb is not None and t == "Relu":
                     relu_cb[idx] = a
                 if t == "Relu":
-                    base = ops.asarray(r["a_l_stable"])
                     if alpha is not None and idx in alpha:
-                        a_l = base + ops.asarray(r["unstable"]) * alpha[idx]
+                        a_l = ops.relu_slope(r, alpha[idx])
                     else:
-                        a_l = base + ops.asarray(r["unstable"] * r["alpha0"])
+                        a_l = ops.line(r["a_l_stable"] + r["unstable"] * r["alpha0"])
                 else:
-                    a_l = ops.asarray(r["a_l"])
+                    a_l = ops.line(r["a_l"])
                 a_u, b_l, b_u = (
-                    ops.asarray(r["a_u"]),
-                    ops.asarray(r["b_l"]),
-                    ops.asarray(r["b_u"]),
+                    ops.line(r["a_u"]),
+                    ops.line(r["b_l"]),
+                    ops.line(r["b_u"]),
                 )
                 if extra is not None and t == "Relu" and idx in extra.get("out", {}):
                     a = a + extra["out"][idx]  # multiplier terms on the Relu output
@@ -587,7 +862,10 @@ class _Analyzer:
                 b = self._const(ins[1])
                 assert b is not None
                 bt = b.T if at.get("transB", 0) else b  # (K, N)
-                ax = float(at.get("alpha", 1.0)) * (a @ ops.asarray(bt.T))  # (m, M, K)
+                wk = ops.const(
+                    bt.T, self._k(ins[1], ("gemmT", int(at.get("transB", 0))))
+                )
+                ax = float(at.get("alpha", 1.0)) * (a @ wk)  # (m, M, K)
                 if at.get("transA", 0):
                     ax = ops.transpose(ax, [0, 2, 1])
                 if len(ins) > 2 and ins[2]:
@@ -595,13 +873,13 @@ class _Analyzer:
                     assert c is not None
                     cb = np.broadcast_to(c, tuple(self.ib[out][0].shape))
                     acc[0] = acc[0] + float(at.get("beta", 1.0)) * row_sum(
-                        a * ops.asarray(cb)
+                        a * ops.const(cb)
                     )
                 add(ins[0], ax)
             elif t == "MatMul":
                 w = self._const(ins[1])
                 assert w is not None
-                add(ins[0], a @ ops.asarray(w.T))
+                add(ins[0], a @ ops.const(w.T, self._k(ins[1], "matmulT")))
             elif t == "Conv":
                 self._conv_back(ops, node, a, m, acc, add, row_sum)
             elif t == "BatchNormalization":
@@ -618,9 +896,9 @@ class _Analyzer:
                 shape = (1, 1, -1) + (1,) * (len(xs(0)) - 2)
                 tb = (bias - mean * s).reshape(shape[1:])
                 acc[0] = acc[0] + row_sum(
-                    a * ops.asarray(np.broadcast_to(tb, xs(0))[None])
+                    a * ops.const(np.broadcast_to(tb, xs(0))[None])
                 )
-                add(ins[0], a * ops.asarray(s.reshape(shape)))
+                add(ins[0], a * ops.const(s.reshape(shape)))
             elif t in ("Add", "Sub"):
                 sign = 1.0 if t == "Add" else -1.0
                 oshape = tuple(self.ib[out][0].shape)
@@ -628,7 +906,7 @@ class _Analyzer:
                     c = self._const(ins[k])
                     if c is not None:
                         acc[0] = acc[0] + sg * row_sum(
-                            a * ops.asarray(np.broadcast_to(c, oshape)[None])
+                            a * ops.const(np.broadcast_to(c, oshape)[None])
                         )
                     else:
                         add(ins[k], _unbroadcast(ops, sg * a, m, xs(k), oshape))
@@ -637,7 +915,7 @@ class _Analyzer:
                 c = self._const(ins[1 - k])
                 assert c is not None
                 oshape = tuple(self.ib[out][0].shape)
-                add(ins[k], _unbroadcast(ops, a * ops.asarray(c), m, xs(k), oshape))
+                add(ins[k], _unbroadcast(ops, a * ops.const(c), m, xs(k), oshape))
             elif t == "AveragePool":
                 self._avgpool_back(ops, node, a, m, add)
             elif t == "GlobalAveragePool":
@@ -649,7 +927,7 @@ class _Analyzer:
         for name, a in leaf_coef.items():
             lo, hi = _clip_box(*self.ib[name])
             acc[0] = acc[0] + row_sum(
-                ops.pos(a) * ops.asarray(lo) + ops.neg(a) * ops.asarray(hi)
+                ops.pos(a) * ops.lo_const(lo) + ops.neg(a) * ops.hi_const(hi)
             )
         return acc[0]
 
@@ -677,13 +955,13 @@ class _Analyzer:
         if len(ins) > 2 and ins[2]:
             b = self._const(ins[2])
             assert b is not None
-            acc[0] = acc[0] + ops.einsum("mnqij,q->m", a, ops.asarray(b))
+            acc[0] = acc[0] + ops.bias_dot(a, ops.const(b, self._k(ins[2], "convbias")))
         hp, wp = h + pd[0] + pd[2], wd + pd[1] + pd[3]
         out = ops.zeros((m, n, c, hp, wp))
         mg = mo // group
         for g in range(group):
             ag = a[:, :, g * mg : (g + 1) * mg]
-            wg = ops.asarray(w[g * mg : (g + 1) * mg])
+            wg = ops.const(w[g * mg : (g + 1) * mg], self._k(ins[1], ("convw", g, mg)))
             for ki in range(kh):
                 for kj in range(kw):
                     contrib = ops.einsum("mnqij,qc->mncij", ag, wg[:, :, ki, kj])
@@ -718,26 +996,56 @@ class _Analyzer:
         add(node.input[0], out)
 
     # -- bounds of a tensor --------------------------------------------------
+    @property
+    def row_budget(self) -> int:
+        """Max elements of one coefficient array (rows x tensor) for this backend."""
+        return self.backend.row_budget(self.maxel)
+
+    @property
+    def alpha_budget(self) -> int:
+        rb = self.row_budget
+        return _ALPHA_BUDGET if rb == _ROW_BUDGET else rb // 2
+
     def _rows_per_chunk(self) -> int:
-        return max(1, _ROW_BUDGET // max(1, self.maxel))
+        return max(1, self.row_budget // max(1, self.maxel))
 
     def tensor_bounds(
         self, name: str, ops: Any = None, alpha_cb: Any = None
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """CROWN bounds of ``name`` (identity spec, chunked over rows), as numpy arrays."""
-        ops = ops or _NumpyOps()
+        """CROWN bounds of ``name`` (identity spec, chunked over rows), as numpy arrays.
+
+        On a device the rows are processed in chunks sized from the free device memory; a
+        chunk that still does not fit is halved and retried, down to one row, and then
+        :class:`DeviceMemoryError` is raised -- never a hang, never a silent CPU fallback.
+        """
+        ops = ops or self.backend.ops()
         shape = tuple(self.ib[name][0].shape)
         size = int(np.prod(shape, dtype=np.int64))
         lo = np.empty(size)
         hi = np.empty(size)
         step = self._rows_per_chunk()
-        for s in range(0, size, step):
-            k = min(step, size - s)
-            eye = np.zeros((k, size))
-            eye[np.arange(k), s + np.arange(k)] = 1.0
-            spec = ops.asarray(eye.reshape((k,) + shape))
-            lo[s : s + k] = ops.to_numpy(self._lower(ops, name, spec))
-            hi[s : s + k] = -ops.to_numpy(self._lower(ops, name, -spec))
+        s = 0
+        with self.backend.context():
+            while s < size:
+                k = min(step, size - s)
+                try:
+                    spec = ops.asarray(ops.eye(k, size, s, shape))
+                    lo[s : s + k] = ops.to_numpy(self._lower(ops, name, spec))
+                    hi[s : s + k] = -ops.to_numpy(self._lower(ops, name, -spec))
+                except Exception as e:
+                    if not _is_oom(e):
+                        raise
+                    _free_device_cache(ops)
+                    if step == 1:
+                        raise DeviceMemoryError(
+                            f"device out of memory bounding {name!r} even one row at a time "
+                            f"({self.backend.res.describe()}, tensor of {size} elements, "
+                            f"largest tensor {self.maxel}); use precision='float32', a device "
+                            "with more memory, or device='cpu'"
+                        ) from e
+                    step = max(1, step // 2)
+                    continue
+                s += k
         return lo.reshape(shape), hi.reshape(shape)
 
     def pair_bounds(
@@ -798,7 +1106,7 @@ class _Analyzer:
             if np.any(nlo > nhi + tol):
                 self.infeasible = True
             self.ib[x] = (nlo, nhi)
-            self._relax_cache.pop(idx, None)
+            self._drop_relax(idx)
 
     def final(self, name: str, ops: Any = None) -> Tuple[np.ndarray, np.ndarray]:
         """CROWN bounds of ``name`` intersected with the interval bounds, then widened."""
@@ -947,6 +1255,23 @@ def _pair_facets(
     return out
 
 
+def _facets_f32(
+    n_: np.ndarray, d_: np.ndarray, mags: Sequence[float]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """float32 versions ``(n32, d32)`` of cuts ``n . p <= d`` that stay valid wherever the old ones were.
+
+    ``mags[j]`` bounds ``|p_j|`` on the region the cut is used on. Rounding ``n`` to float32
+    changes ``n . p`` by at most ``sum |n - n32| mags``, so ``d`` is raised by that (and by a
+    float64 safety margin) and rounded *up* to float32.
+    """
+    from . import _rigorous_f32 as r
+
+    n32 = n_.astype(np.float32).astype(np.float64)
+    shift = (np.abs(n_ - n32) * np.asarray(mags, dtype=np.float64)).sum(axis=1)
+    d32 = r.up32(d_ + shift + 4.0 * 2.0**-52 * (np.abs(d_) + shift))
+    return n32, d32
+
+
 def _alpha_bounds(
     an: _Analyzer,
     name: str,
@@ -965,13 +1290,15 @@ def _alpha_bounds(
     (see ``_Analyzer._lower``), and the best one per row is kept, starting from zero
     multipliers: the result is never looser than without them.
     """
-    ops = _TorchOps()
+    be = an.backend
+    ops = be.opt_ops()
     torch = ops.t
+    dt, dev = ops.dt, ops.dev
     forced = list(forced or [])
     pairs = list(pairs or [])
     shape = tuple(an.ib[name][0].shape)
     size = int(np.prod(shape, dtype=np.int64))
-    if size * an.maxel > _ROW_BUDGET:
+    if size * an.maxel > an.row_budget:
         return None
     relus = [
         i
@@ -980,7 +1307,7 @@ def _alpha_bounds(
     ]
     relus = [i for i in relus if an._relax(i)["unstable"].any()]
     total_unstable = sum(int(an._relax(i)["unstable"].size) for i in relus) * size
-    per_row = total_unstable <= _ALPHA_BUDGET
+    per_row = total_unstable <= an.alpha_budget
     facets = []
     for idx, j1, j2 in pairs:
         lo, hi = an.ib[an.nodes[idx].input[0]]
@@ -989,13 +1316,25 @@ def _alpha_bounds(
             continue
         n_, d_ = _pair_facets(lo.flat[j1], hi.flat[j1], lo.flat[j2], hi.flat[j2], *pb)
         if len(d_):
+            n32, d32 = _facets_f32(
+                n_,
+                d_,
+                [
+                    max(abs(lo.flat[j1]), abs(hi.flat[j1])),
+                    max(abs(lo.flat[j2]), abs(hi.flat[j2])),
+                    max(0.0, hi.flat[j1]),
+                    max(0.0, hi.flat[j2]),
+                ],
+            )
             facets.append(
                 (
                     idx,
                     j1,
                     j2,
-                    torch.tensor(n_, dtype=torch.float64),
-                    torch.tensor(d_, dtype=torch.float64),
+                    torch.tensor(n_, dtype=dt, device=dev),
+                    torch.tensor(d_, dtype=dt, device=dev),
+                    n32,
+                    d32,
                 )
             )
     n_facets = sum(int(f[4].shape[0]) for f in facets)
@@ -1005,19 +1344,19 @@ def _alpha_bounds(
             return None
         ein: Dict[int, Any] = {}
         eout: Dict[int, Any] = {}
-        const = torch.zeros(size, dtype=torch.float64)
+        const = torch.zeros(size, dtype=dt, device=dev)
 
         def slot(d: Dict[int, Any], idx: int) -> Any:
             if idx not in d:
                 shp = tuple(an.ib[an.nodes[idx].input[0]][0].shape)
-                d[idx] = torch.zeros((size,) + shp, dtype=torch.float64)
+                d[idx] = torch.zeros((size,) + shp, dtype=dt, device=dev)
             return d[idx].view(size, -1)
 
         for c, (idx, flat, sign) in enumerate(forced):
             v = slot(ein, idx)
             v[:, flat] = v[:, flat] - float(sign) * beta[:, c]
         off = 0
-        for idx, j1, j2, n_, d_ in facets:
+        for idx, j1, j2, n_, d_, _n32, _d32 in facets:
             w = pi[:, off : off + n_.shape[0]]
             off += n_.shape[0]
             vi, vo = slot(ein, idx), slot(eout, idx)
@@ -1026,6 +1365,43 @@ def _alpha_bounds(
             vo[:, j1] = vo[:, j1] + w @ n_[:, 2]
             vo[:, j2] = vo[:, j2] + w @ n_[:, 3]
             const = const - w @ d_
+        return {"in": ein, "out": eout, "const": const}
+
+    def build_extra_rigorous(beta: Any, pi: Any) -> Optional[Dict[str, Any]]:
+        """The same terms as ``build_extra``, as error-tracked values, with float32-valid cuts.
+
+        A cut ``n . p <= d`` rounded to float32 stays valid only with ``d`` raised by the
+        rounding of ``n`` times the range of ``p`` (``_facets_f32``); the multiplier-weighted
+        sums are formed with the tracked arithmetic so their own rounding is bounded.
+        """
+        if not forced and not facets:
+            return None
+        rig = be.ops()
+        P, K = rig.r.P, rig.r.K
+        ein: Dict[int, Any] = {}
+        eout: Dict[int, Any] = {}
+        const = rig.zeros((size,))
+
+        def slot(d: Dict[int, Any], idx: int) -> Any:
+            if idx not in d:
+                shp = tuple(an.ib[an.nodes[idx].input[0]][0].shape)
+                d[idx] = rig.zeros((size,) + shp)
+            return d[idx].reshape((size, -1))
+
+        for c, (idx, flat, sign) in enumerate(forced):
+            v = slot(ein, idx)
+            v[:, flat] = v[:, flat] + P(beta[:, c].to(torch.float32) * (-float(sign)))
+        off = 0
+        for idx, j1, j2, n_, _d, n32, d32 in facets:
+            nf = int(n_.shape[0])
+            w = P(pi[:, off : off + nf].to(torch.float32))
+            off += nf
+            vi, vo = slot(ein, idx), slot(eout, idx)
+            vi[:, j1] = vi[:, j1] + w @ K.exact(n32[:, 0], rig.dev)
+            vi[:, j2] = vi[:, j2] + w @ K.exact(n32[:, 1], rig.dev)
+            vo[:, j1] = vo[:, j1] + w @ K.exact(n32[:, 2], rig.dev)
+            vo[:, j2] = vo[:, j2] + w @ K.exact(n32[:, 3], rig.dev)
+            const = const + (w @ K.exact(d32, rig.dev)) * -1.0
         return {"in": ein, "out": eout, "const": const}
 
     eye = np.eye(size).reshape((size,) + shape)
@@ -1040,9 +1416,11 @@ def _alpha_bounds(
                 if not per_row
                 else np.broadcast_to(r["alpha0"], (size,) + r["alpha0"].shape).copy()
             )
-            alpha[i] = torch.tensor(init, dtype=torch.float64, requires_grad=True)
-        beta = torch.zeros((size, len(forced)), dtype=torch.float64, requires_grad=True)
-        pi = torch.zeros((size, n_facets), dtype=torch.float64, requires_grad=True)
+            alpha[i] = torch.tensor(init, dtype=dt, device=dev, requires_grad=True)
+        beta = torch.zeros(
+            (size, len(forced)), dtype=dt, device=dev, requires_grad=True
+        )
+        pi = torch.zeros((size, n_facets), dtype=dt, device=dev, requires_grad=True)
         mult = [t for t in (beta, pi) if t.numel()]
 
         def bound() -> Any:
@@ -1050,6 +1428,25 @@ def _alpha_bounds(
 
         with torch.no_grad():
             best = bound().clone()
+
+        # float32: the iterates below are NOT rigorous; the returned bound is re-evaluated by
+        # the error-tracked arithmetic at a few saved parameter sets (the starting slopes,
+        # the best iterate, the last one), so it is sound and never looser than plain CROWN
+        def snapshot() -> Tuple[Dict[int, Any], Any, Any]:
+            return (
+                {i: a_.detach().clone() for i, a_ in alpha.items()},
+                beta.detach().clone(),
+                pi.detach().clone(),
+            )
+
+        Snap = Tuple[Dict[int, Any], Any, Any]
+        snap_init: Optional[Snap] = None
+        snap_best: Optional[Snap] = None
+        snap_final: Optional[Snap] = None
+        best_sum = 0.0
+        if be.rigorous:
+            snap_init = snap_best = snap_final = snapshot()
+            best_sum = float(best.sum())
         if (alpha or mult) and iters > 0:
             groups: List[Dict[str, Any]] = []
             if alpha:
@@ -1065,6 +1462,9 @@ def _alpha_bounds(
                     # they belong to): the bound is constant, and already the best one
                     break
                 (-lb.sum()).backward()
+                if be.rigorous and float(lb.detach().sum()) > best_sum:
+                    best_sum = float(lb.detach().sum())
+                    snap_best = snapshot()  # the parameters lb was computed with
                 opt.step()
                 with torch.no_grad():
                     for a_ in alpha.values():
@@ -1074,6 +1474,27 @@ def _alpha_bounds(
                     best = torch.maximum(best, lb.detach())
             with torch.no_grad():  # the final iterate too
                 best = torch.maximum(best, bound())
+            if be.rigorous:
+                snap_final = snapshot()
+        if be.rigorous:
+            rig = be.ops()
+            with be.context(), torch.no_grad():
+                pspec = rig.asarray(side * eye)
+                got = [
+                    rig.to_numpy(
+                        an._lower(
+                            rig,
+                            name,
+                            pspec,
+                            sn[0],
+                            extra=build_extra_rigorous(sn[1], sn[2]),
+                        )
+                    )
+                    for sn in (snap_init, snap_best, snap_final)
+                    if sn is not None
+                ]
+            results.append(side * np.maximum.reduce(got))
+            continue
         results.append(side * ops.to_numpy(best))
     lo, hi = results[0], results[1]
     return lo.reshape(shape), hi.reshape(shape)
@@ -1171,7 +1592,9 @@ class _Bab:
         target: Optional[Dict[str, _Range]],
         tol: float,
         multi_neuron: int = 0,
+        backend: Optional[_Backend] = None,
     ):
+        self.backend = backend if backend is not None else _Backend()
         self.model, self.names, self.split = model, names, split
         self.input_ranges = input_ranges
         self.leaf_method = leaf_method
@@ -1187,7 +1610,11 @@ class _Bab:
         self, ranges: Optional[Dict[str, _Range]], forced: _Forced
     ) -> Optional[_Analyzer]:
         """An analyser for the input sub-box ``ranges`` with the Relu branches ``forced``."""
-        an = _Analyzer(self.model, self.input_ranges if ranges is None else ranges)
+        an = _Analyzer(
+            self.model,
+            self.input_ranges if ranges is None else ranges,
+            self.backend,
+        )
         an.refine()
         for idx, flat, sign in forced:
             if not an.restrict(idx, flat, sign):
@@ -1490,6 +1917,8 @@ def bab_bounds(
     target: Optional[Dict[str, Tuple]] = None,
     tol: float = 0.0,
     multi_neuron: int = 0,
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> BabResult:
     """Branch-and-bound bounds of ``output`` tensors; always sound, tighter with budget.
 
@@ -1516,7 +1945,13 @@ def bab_bounds(
         Without a target the search tightens the hull until the budget is spent.
     :param tol: slack allowed when deciding a region lies inside the target.
     :param time_limit: optional wall-clock limit in seconds, checked between splits.
+    :param device: ``None`` / ``"cpu"`` (numpy float64, the default), ``"cuda"`` / ``"cuda:N"``
+        (a torch accelerator, also ROCm), ``"torch-cpu"`` or ``"auto"``; see
+        :mod:`onnxsim._device`. Every region's bounds are computed on the device.
+    :param precision: ``"float64"`` (default) or ``"float32"`` (sound: rounding error is
+        tracked, see :mod:`onnxsim._rigorous_f32`; needs a torch device).
     """
+    backend = _Backend(device, precision)
     if split not in ("input", "relu", "auto"):
         raise ValueError(f"split must be 'input', 'relu' or 'auto', got {split!r}")
     if leaf_method not in ("crown", "alpha", "beta"):
@@ -1530,7 +1965,7 @@ def bab_bounds(
             "multi_neuron needs a value >= 2 and leaf_method 'alpha' or 'beta'"
         )
     if leaf_method != "crown":
-        _TorchOps()  # fail early, with a clear message, when torch is missing
+        backend.opt_ops()  # fail early, with a clear message, when torch is missing
     names = _output_names(model, output)
     probe = _interval.propagate(model, input_ranges)
     for n in names:
@@ -1556,6 +1991,7 @@ def bab_bounds(
         tgt,
         tol,
         multi_neuron,
+        backend,
     )
     return bab.run(budget, time_limit)
 
@@ -1576,6 +2012,8 @@ def bounds(
     budget: int = 32,
     split: str = "auto",
     multi_neuron: int = 4,
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> Dict[str, TensorBound]:
     """Sound bounds of ``output`` tensors (default: the graph outputs) over an input box.
 
@@ -1595,7 +2033,19 @@ def bounds(
     :param refine: tighten intermediate pre-activation boxes with CROWN first (slower,
         tighter). ``False`` uses interval boxes for every relaxation. Ignored by ``"bab"``,
         which always refines.
+    :param device: where the backward pass runs. ``None`` / ``"cpu"`` (default): numpy float64,
+        exactly as before. ``"cuda"`` / ``"cuda:N"``: a torch accelerator (CUDA or ROCm), with the
+        coefficient arrays resident on it for the whole pass. ``"torch-cpu"``: the torch backend
+        on the CPU. ``"auto"``: an accelerator if torch sees one. A device that is requested but
+        missing raises; there is no silent CPU fallback. The returned arrays are numpy on the host.
+    :param precision: ``"float64"`` (default) or ``"float32"``. float32 is what makes consumer GPUs
+        fast, and it is *sound*: every value carries a bound on its own rounding error
+        (:mod:`onnxsim._rigorous_f32`) and the returned bounds are widened by it, so they contain
+        the exact-arithmetic result of the same relaxations. Costs a shadow computation (about 2x)
+        and a little tightness. ``"alpha"`` / ``"bab"`` optimise in plain float32 and re-evaluate
+        the best parameters rigorously.
     """
+    backend = _Backend(device, precision)
     if method not in ("ibp", "crown", "alpha", "bab", "prima"):
         raise ValueError(
             f"method must be 'ibp', 'crown', 'alpha', 'bab' or 'prima', got {method!r}"
@@ -1611,6 +2061,8 @@ def bounds(
             alpha_iters=alpha_iters,
             alpha_lr=alpha_lr,
             multi_neuron=multi_neuron,
+            device=device,
+            precision=precision,
         ).bounds
     if method == "bab":
         return bab_bounds(
@@ -1621,10 +2073,12 @@ def bounds(
             split=split,
             alpha_iters=alpha_iters,
             alpha_lr=alpha_lr,
+            device=device,
+            precision=precision,
         ).bounds
-    an = _Analyzer(model, input_ranges)
+    an = _Analyzer(model, input_ranges, backend)
     if method == "alpha":
-        _TorchOps()  # fail early, with a clear message, when torch is missing
+        backend.opt_ops()  # fail early, with a clear message, when torch is missing
     for n in names:
         if n not in an.ibp.intervals:
             raise ValueError(f"cannot analyse tensor {n!r}: its shape is unknown")
@@ -1667,6 +2121,8 @@ def verify_output_ranges(
     tol: float = 0.0,
     budget: int = 32,
     split: str = "auto",
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> Dict[str, RangeVerdict]:
     """Check each annotated output range (``onnxsim.ranges``) holds for every input in the box.
 
@@ -1680,6 +2136,9 @@ def verify_output_ranges(
     not split further and the search stops as soon as all of them are, or when
     ``budget`` regions have been bounded -- then ``proved`` is False, which still means
     only "not proved".
+
+    ``device`` / ``precision`` as in :func:`bounds`: the verdict is as sound with
+    ``precision="float32"`` as without (the bounds it compares carry their rounding error).
     """
     ann = _ranges.get_ranges(model)
     outs = [o.name for o in model.graph.output if o.name in ann]
@@ -1694,9 +2153,13 @@ def verify_output_ranges(
             split=split,
             target={n: ann[n] for n in outs},
             tol=tol,
+            device=device,
+            precision=precision,
         ).bounds
     else:
-        got = bounds(model, input_ranges, outs, method)
+        got = bounds(
+            model, input_ranges, outs, method, device=device, precision=precision
+        )
     verdicts: Dict[str, RangeVerdict] = {}
     for n in outs:
         tb = got[n]
@@ -1736,6 +2199,8 @@ def quantization_bounds_tight(
     weight_bits: int = 8,
     act_bits: int = 8,
     refine: bool = True,
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> List[QuantBoundComparison]:
     """``interval.quantization_bounds`` fed with CROWN-tightened activation ranges.
 
@@ -1744,7 +2209,7 @@ def quantization_bounds_tight(
     loose, so tighter activation ranges tighten both. Returns one comparison per layer
     ``interval.quantization_bounds`` reports, with the interval numbers alongside.
     """
-    an = _Analyzer(model, input_ranges)
+    an = _Analyzer(model, input_ranges, _Backend(device, precision))
     plain = _interval.quantization_bounds(
         model, input_ranges, weight_bits, act_bits, result=an.ibp
     )
