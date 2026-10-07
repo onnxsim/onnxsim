@@ -641,3 +641,13 @@ def test_budget_is_a_hard_cap_and_regions_partition_the_box():
         )  # a split bounds two
         # each split replaces one region by two, minus any branch proven empty
         assert res.regions == 1 + (res.evaluations - 1) // 2 - res.pruned
+
+
+def test_a_zero_time_limit_stops_at_once_even_on_a_coarse_clock(monkeypatch):
+    # Windows' monotonic clock advances in ~15 ms steps, so "elapsed" is often exactly 0.0.
+    # Freeze the clock to reproduce that on any platform: a limit of 0 must still mean "stop".
+    rng = np.random.default_rng(1)
+    model = _mlp(rng)
+    monkeypatch.setattr(crown.time, "monotonic", lambda: 1234.5)
+    res = crown.bab_bounds(model, BOX, budget=500, time_limit=0.0)
+    assert res.evaluations == 1 and res.exhausted

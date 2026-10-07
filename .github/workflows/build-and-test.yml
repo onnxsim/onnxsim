@@ -105,12 +105,13 @@ jobs:
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
             # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
-        # macOS runners are the slowest/most contended in this matrix; a pull
-        # request only needs one macOS build to confirm the platform still
-        # works, so drop it down to the oldest supported version there. push
-        # and release still need full coverage, so this only fires for the
-        # 'pull_request' trigger.
-        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-15","py_ver":"cp312"}]') || fromJSON('[]') }}
+        # macOS and linux/aarch64 runners are the slowest/most contended in
+        # this matrix; a pull request only needs one build on each to confirm
+        # the platform still works, so drop them down to the oldest supported
+        # version there (same as the single Windows leg). push and release
+        # still need full coverage, so this only fires for the 'pull_request'
+        # trigger.
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-15","py_ver":"cp312"},{"os":"ubuntu-24.04-arm","py_ver":"cp312"}]') || fromJSON('[]') }}
     steps:
     - uses: actions/checkout@v7
       with:
