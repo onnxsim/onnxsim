@@ -25,14 +25,42 @@ INT32_MAX = Q.INT32_MAX
 # vpmaddubsw without VNNI). On such a host onnxruntime is NOT an oracle for exact int32
 # arithmetic: CI's runner returned 1086422270 for the K=66311 extreme case where exact
 # two's-complement arithmetic gives 2147481735 (about half: 33155 pair sums saturated at
-# 32767). The verifier models exact int32 semantics and flags the hazard via
-# probe_u8s8_saturation(), so the tests that compare it with onnxruntime's output must not
-# run there; they still run on every host whose kernel is exact.
-requires_exact_u8s8 = pytest.mark.skipif(
-    Q.probe_u8s8_saturation() is True,
-    reason="this host's onnxruntime u8xs8 kernel saturates int16 pair sums, so it is not an "
-    "oracle for exact int32 arithmetic (see quant_int_verify.probe_u8s8_saturation)",
+# 32767). quant_int_verify models both kernels (semantics="exact" and "u8s8_pair_saturating"),
+# so each test that compares with onnxruntime uses the semantics that matches THIS host
+# (HOST, from probe_u8s8_saturation) instead of being skipped. The saturating model itself is
+# pinned by tests that run on every host: against values recorded from a saturating CI
+# runner, and against an independent lane-by-lane emulation. Only if a saturating host
+# disagrees with the model (a case no recorded evidence covers) are the oracle tests skipped.
+HOST = Q.host_semantics()
+_MODEL_OK_ON_HOST, _MODEL_CHECK = Q.validate_saturating_model_on_host()
+requires_host_oracle = pytest.mark.skipif(
+    HOST == Q.U8S8_PAIR_SATURATING and _MODEL_OK_ON_HOST is not True,
+    reason="this host's onnxruntime u8xs8 kernel saturates int16 pair sums and the saturating "
+    f"model does not reproduce it ({_MODEL_CHECK}), so onnxruntime is not an oracle here",
 )
+
+
+def _unrecorded_oracle_check(cond, why):
+    """A comparison of onnxruntime with the model of THIS host's kernel, for a case with no recorded evidence.
+
+    On an exact host: a plain assert. On a saturating host the model is pinned by recorded outputs for
+    specific cases only (see the section comment in quant_int_verify); for any other case a
+    disagreement is reported as an xfail -- visible in the test report, with the details -- instead of
+    failing the suite on the strength of an extrapolation.
+    """
+    if HOST == Q.EXACT:
+        assert cond, why
+    elif not cond:
+        pytest.xfail(
+            f"saturating model disagrees with onnxruntime on a case with no recorded evidence: {why}"
+        )
+
+
+def _host_acc(a_raw, w, za):
+    """The int32 accumulator (before wrap, int64) onnxruntime produces on this host, per the matching model."""
+    if HOST == Q.U8S8_PAIR_SATURATING:
+        return Q.u8s8_pair_saturating_matmul(a_raw, w, za)
+    return (a_raw.astype(np.int64) - za) @ np.asarray(w, dtype=np.int64)
 
 
 def _model(body, initializer=None, opset=13, ir_version=8):
@@ -168,31 +196,51 @@ def test_dynamic_rel_error_bound_dominates_sampled_error():
 # ---- no-wrap: the headline result ---------------------------------------------
 
 
-@requires_exact_u8s8
+@requires_host_oracle
 def test_no_wrap_boundary_is_exact_and_counterexample_replays_on_onnxruntime():
-    k_safe = INT32_MAX // (
-        255 * 127
-    )  # the largest uint8 x int8 reduction that cannot wrap
-    assert k_safe * 255 * 127 <= INT32_MAX < (k_safe + 1) * 255 * 127
+    # Largest uint8 x int8 (w=127) reduction that cannot wrap. Exact arithmetic: every tap adds
+    # 255*127. Pair-saturating kernel: every adjacent pair adds at most 32767, so the boundary is
+    # twice as deep -- K=131076 (65538 pairs * 32767 = 2147483646) is safe, K=131077 wraps.
+    sem = HOST
+    if sem == Q.EXACT:
+        k_safe = INT32_MAX // (255 * 127)
+        per_tap = 255 * 127
+        assert k_safe * per_tap <= INT32_MAX < (k_safe + 1) * per_tap
+        expected_max = lambda k: k * per_tap  # noqa: E731
+    else:
+        k_safe = 131076
+        expected_max = lambda k: int(  # noqa: E731
+            Q.u8s8_pair_saturating_matmul(
+                np.full((1, k), 255, np.uint8), np.full((k, 1), 127, np.int8), 0
+            )[0, 0]
+        )
+        assert expected_max(k_safe) <= INT32_MAX < expected_max(k_safe + 1)
     safe = _matmul_integer(k_safe, np.full((k_safe, 1), 127))
     node, consts = _only(safe)
-    rep = Q.verify_layer(node, consts)
-    assert rep.proved and rep.of("no-wrap")[0].verdict == Q.PROVED
-    # the proved bound really is the maximum: run the extreme input, ORT agrees with exact arithmetic
+    rep = Q.verify_layer(node, consts, semantics=sem)
+    assert rep.of("no-wrap")[0].verdict == Q.PROVED and rep.sound
+    # the proved bound really is the maximum: run the extreme input, ORT agrees with the model of its kernel
     ext = np.full((1, k_safe), 255, np.uint8)
-    assert int(_ort(safe, {"a": ext})[0][0, 0]) == k_safe * 255 * 127
+    got = int(_ort(safe, {"a": ext})[0][0, 0])
+    _unrecorded_oracle_check(
+        got == expected_max(k_safe), f"K={k_safe}: {got} != {expected_max(k_safe)}"
+    )
 
     bad = _matmul_integer(k_safe + 1, np.full((k_safe + 1, 1), 127))
     node, consts = _only(bad)
-    rep = Q.verify_layer(node, consts)
+    rep = Q.verify_layer(node, consts, semantics=sem)
     f = rep.of("no-wrap")[0]
     assert f.verdict == Q.REFUTED and not rep.sound
-    observed, exact = Q.replay_no_wrap(bad, rep.name, f)
-    assert int(exact[0, 0]) == (k_safe + 1) * 255 * 127 > INT32_MAX
-    assert int(observed[0, 0]) != int(exact[0, 0])  # the runtime wrapped
-    assert (
-        int(observed[0, 0]) == ((int(exact[0, 0]) - 2**31) % 2**32) - 2**31
-    )  # exactly two's complement
+    observed, expected = Q.replay_no_wrap(bad, rep.name, f, semantics=sem)
+    assert int(expected[0, 0]) == expected_max(k_safe + 1) > INT32_MAX
+    obs, exp = int(observed[0, 0]), int(expected[0, 0])
+    _unrecorded_oracle_check(
+        obs != exp, f"K={k_safe + 1}: the runtime did not wrap ({obs})"
+    )  # it wrapped
+    _unrecorded_oracle_check(
+        obs == ((exp - 2**31) % 2**32) - 2**31,
+        f"K={k_safe + 1}: {obs} is not the two's-complement wrap of {exp}",
+    )
 
 
 def test_narrower_activation_range_proves_what_the_full_range_cannot():
@@ -711,7 +759,7 @@ def _qlinear_conv(cin, cout, k, wq, bias, sa, sb, sy, za, zy, x_hw):
     )
 
 
-@requires_exact_u8s8
+@requires_host_oracle
 def test_qlinear_conv_with_int32_bias_matches_the_fp32_pipeline_at_the_extremes():
     rng = np.random.default_rng(7)
     cin, cout, k = 2, 3, 3
@@ -740,10 +788,25 @@ def test_qlinear_conv_with_int32_bias_matches_the_fp32_pipeline_at_the_extremes(
             ) + int(bias[c])
             assert exact == want  # the closed form (with bias) is attained, exactly
             got = int(_ort(m, {"x": x})[0][0, c, 0, 0])
-            assert got == Q.fp32_requant(exact, m32, zy, 0, 255)
+            if HOST == Q.EXACT:
+                acc = exact
+            else:  # the kernel sums adjacent tap pairs in saturating int16 (taps ordered kh, kw, channel)
+                acc = int(
+                    Q.u8s8_pair_saturating_conv(x, wq.astype(np.int8), za)[0, c, 0, 0]
+                ) + int(bias[c])
+            want_out = Q.fp32_requant(acc, m32, zy, 0, 255)
+            if HOST == Q.EXACT or (c == 0 and maximise):
+                assert (
+                    got == want_out
+                )  # exact kernel; or the one case recorded on a saturating runner
+            else:
+                _unrecorded_oracle_check(
+                    got == want_out,
+                    f"channel {c}, maximise={maximise}: {got} != {want_out}",
+                )
 
 
-@requires_exact_u8s8
+@requires_host_oracle
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_requant_emulation_is_bit_exact_against_onnxruntime_with_per_channel_scales(
     seed,
@@ -783,11 +846,13 @@ def test_requant_emulation_is_bit_exact_against_onnxruntime_with_per_channel_sca
     for _ in range(25):
         a = rng.integers(0, 256, (8, k), dtype=np.uint8)
         got = _ort(m, {"a": a})[0]
-        acc = (a.astype(np.int64) - za) @ wq.astype(np.int64)
+        acc = _host_acc(
+            a, wq, za
+        )  # exact dot product, or the saturating kernel's value on this host
         for j in range(n):
-            assert (acc[:, j] >= mins[j]).all() and (
-                acc[:, j] <= maxs[j]
-            ).all()  # a PROVED range is never contradicted
+            # a PROVED range is never contradicted (the saturating accumulator's range lies inside the
+            # exact one, so the exact-semantics range holds on both kinds of host)
+            assert (acc[:, j] >= mins[j]).all() and (acc[:, j] <= maxs[j]).all()
             _, m32 = Q.requant_multiplier(sa, sb[j], sy)
             want = np.array(
                 [Q.fp32_requant(int(v), m32, zy, 0, 255) for v in acc[:, j]]
@@ -852,3 +917,410 @@ def test_report_text_and_properties():
     assert Q.verify_model(
         _model("m (float[2] x) => (float[2] y) { y = Relu(x) }")
     ).notes == ["no integer layers found"]
+
+
+# ---- the pair-saturating (AVX2 u8 x s8 without VNNI) model ---------------------------------
+#
+# These tests run on EVERY host: they pin the model against values recorded from a runner whose
+# kernel saturates, and against an independent lane-by-lane emulation. Only the comparisons with
+# the local onnxruntime (above) depend on the host.
+
+
+def _wrap32(v):
+    return int(Q.wrap_int32(v).reshape(-1)[0])
+
+
+def test_the_saturating_model_reproduces_the_values_recorded_on_a_saturating_runner():
+    # recorded from the GitHub Actions run of PR #2094's merge (a runner CPU without VNNI),
+    # where exact arithmetic gives 2147481735 and 2147514120
+    for k, recorded, exact in (
+        (66311, 1086422270, 2147481735),
+        (66312, 1086422652, 2147514120),
+    ):
+        a = np.full((1, k), 255, np.uint8)
+        w = np.full((k, 1), 127, np.int8)
+        assert int(Q.u8s8_pair_saturating_matmul(a, w, 0)[0, 0]) == recorded
+        assert k * 255 * 127 == exact != recorded
+
+
+def test_the_saturating_model_reproduces_the_recorded_requant_mismatch_counts():
+    # On that runner, of the 1600 outputs of test_requant_emulation_... (QLinearMatMul, K=96, za=110,
+    # per-channel scales) this many differed from the exact-arithmetic pipeline, per seed.
+    recorded = {0: 1222, 1: 1221, 2: 880}
+    for seed, want_count in recorded.items():
+        rng = np.random.default_rng(seed)
+        k, n = 96, 8
+        wq = rng.integers(-127, 128, (k, n)).astype(np.int8)
+        sa, sy, za, zy = (
+            np.float32(rng.uniform(0.005, 0.05)),
+            np.float32(rng.uniform(0.05, 0.5)),
+            110,
+            120,
+        )
+        sb = rng.uniform(0.002, 0.02, n).astype(np.float32)
+        mismatches = 0
+        for _ in range(25):
+            a = rng.integers(0, 256, (8, k), dtype=np.uint8)
+            exact = (a.astype(np.int64) - za) @ wq.astype(np.int64)
+            sat = Q.u8s8_pair_saturating_matmul(a, wq, za)
+            for j in range(n):
+                _, m32 = Q.requant_multiplier(sa, sb[j], sy)
+                for e, s in zip(exact[:, j], sat[:, j]):
+                    mismatches += int(
+                        Q.fp32_requant(int(e), m32, zy, 0, 255)
+                        != Q.fp32_requant(int(s), m32, zy, 0, 255)
+                    )
+        assert mismatches == want_count
+
+
+def test_the_saturating_conv_model_reproduces_the_recorded_output_and_rules_out_other_tap_orders():
+    # The same test as test_qlinear_conv_with_int32_bias_...: on the saturating runner the first
+    # extreme case (channel 0, maximise) came back 161 where the exact pipeline gives 164.
+    rng = np.random.default_rng(7)
+    cin, cout, k = 2, 3, 3
+    wq = rng.integers(-100, 101, (cout, cin, k, k))
+    bias = rng.integers(-3000, 3000, cout)
+    sa, sb, sy, za, zy = 0.02, 0.011, 0.9, 90, 128
+    m = _qlinear_conv(cin, cout, k, wq, bias, sa, sb, sy, za, zy, k)
+    node, consts = _only(m)
+    layer, _ = Q._extract_layer(node, consts, {}, {"x": (1, cin, k, k)}, None)
+    _, m32 = Q.requant_multiplier(np.float32(sa), np.float32(sb), np.float32(sy))
+    d = Q._vertex_input(layer.wq[0], layer.d_lo, layer.d_hi, True)
+    x = (d.reshape(1, cin, k, k) + za).astype(np.uint8)
+    out = lambda acc: Q.fp32_requant(int(acc) + int(bias[0]), m32, zy, 0, 255)  # noqa: E731
+    exact = int(
+        Q._exact_conv(x.astype(np.int64) - za, wq.astype(np.int64), Q._attrs(node))[
+            0, 0, 0, 0
+        ]
+    )
+    assert out(exact) == 164
+    sat = Q.u8s8_pair_saturating_conv(x, wq.astype(np.int8), za)[0, 0, 0, 0]
+    assert out(sat) == 161  # (kh, kw, channel) tap order: the recorded value
+    # the other tap orders give different values, so the recorded 161 excludes them
+    for perm, expected in (
+        ((0, 1, 2), 164),
+        ((0, 2, 1), 160),
+    ):  # (c,kh,kw) and (c,kw,kh)
+        a = np.transpose(x[0], perm).reshape(1, -1)
+        w = np.transpose(wq[0], perm).reshape(-1, 1).astype(np.int8)
+        assert out(Q.u8s8_pair_saturating_matmul(a, w, za)[0, 0]) == expected
+
+
+def _lane_emulation(a_raw, w, za):
+    """Independent re-implementation: K padded to a multiple of 4, each group of four taps is two
+    saturating-int16 pair sums (vpmaddubsw) added in int32 (vpmaddwd against ones), int32 accumulate."""
+    a = np.asarray(a_raw, dtype=np.int64)
+    w = np.asarray(w, dtype=np.int64)
+    pad = (-a.shape[1]) % 4
+    a = np.pad(a, ((0, 0), (0, pad)))
+    w = np.pad(w, ((0, pad), (0, 0)))
+    acc = np.zeros((a.shape[0], w.shape[1]), dtype=np.int32)
+    for g in range(0, a.shape[1], 4):
+        lanes = np.zeros_like(acc, dtype=np.int64)
+        for half in (0, 2):
+            prod = (
+                a[:, g + half, None] * w[None, g + half, :]
+                + a[:, g + half + 1, None] * w[None, g + half + 1, :]
+            )
+            lanes += np.clip(prod, -32768, 32767)
+        acc = (acc.astype(np.int64) + lanes).astype(np.int64)
+        acc = Q.wrap_int32(acc).astype(np.int32)
+    corr = int(za) * w.sum(axis=0)[None, :]
+    return Q.wrap_int32(acc.astype(np.int64) - corr)
+
+
+def test_the_saturating_model_equals_an_independent_lane_emulation():
+    rng = np.random.default_rng(3)
+    for _ in range(40):
+        k = int(rng.integers(1, 300))
+        m, n = int(rng.integers(1, 5)), int(rng.integers(1, 5))
+        extreme = rng.random() < 0.5
+        a = (
+            np.full((m, k), 255, np.uint8)
+            if extreme
+            else rng.integers(0, 256, (m, k), dtype=np.uint8)
+        )
+        w = (
+            np.full((k, n), 127, np.int8)
+            if extreme
+            else rng.integers(-128, 128, (k, n)).astype(np.int8)
+        )
+        za = int(rng.choice([0, 1, 110, 255]))
+        np.testing.assert_array_equal(
+            Q.wrap_int32(Q.u8s8_pair_saturating_matmul(a, w, za)),
+            _lane_emulation(a, w, za),
+        )
+
+
+def test_the_saturating_accumulator_range_is_exact_by_exhaustive_search():
+    rng = np.random.default_rng(0)
+    for k, (lo, hi) in ((6, (0, 3)), (5, (2, 5)), (7, (0, 2))):
+        w = rng.integers(-128, 128, k).astype(np.int8)
+        za = int(rng.integers(0, 4))
+        values = [
+            int(
+                Q.u8s8_pair_saturating_matmul(
+                    np.array([c], np.uint8), w.reshape(-1, 1), za
+                )[0, 0]
+            )
+            for c in itertools.product(range(lo, hi + 1), repeat=k)
+        ]
+        assert Q.saturating_accumulator_range(w, lo, hi, za) == (
+            min(values),
+            max(values),
+        )
+    # the vertex it names attains the maximum
+    w = rng.integers(-128, 128, 9).astype(np.int8)
+    _, top = Q.saturating_accumulator_range(w, 0, 255, 7)
+    v = Q._vertex_raw(w, 0, 255, True).astype(np.uint8).reshape(1, -1)
+    assert int(Q.u8s8_pair_saturating_matmul(v, w.reshape(-1, 1), 7)[0, 0]) == top
+
+
+def test_the_saturating_conv_matches_the_matmul_it_unrolls_to_and_pads_with_the_zero_point():
+    rng = np.random.default_rng(1)
+    cin, cout, k, hw, za = 3, 2, 3, 5, 77
+    x = rng.integers(0, 256, (1, cin, hw, hw), dtype=np.uint8)
+    w = rng.integers(-128, 128, (cout, cin, k, k)).astype(np.int8)
+    got = Q.u8s8_pair_saturating_conv(x, w, za, pads=(1, 1, 1, 1))
+    assert got.shape == (1, cout, hw, hw)
+    xp = np.pad(
+        x.astype(np.int64), ((0, 0), (0, 0), (1, 1), (1, 1)), constant_values=za
+    )
+    wmat = (
+        w.astype(np.int64).transpose(2, 3, 1, 0).reshape(-1, cout)
+    )  # (kh, kw, channel)
+    for y in (0, 2, 4):
+        for xx in (0, 3, 4):
+            patch = xp[0, :, y : y + k, xx : xx + k].transpose(1, 2, 0).reshape(1, -1)
+            want = Q.u8s8_pair_saturating_matmul(patch, wmat, za)[0]
+            np.testing.assert_array_equal(got[0, :, y, xx], want)
+    with pytest.raises(ValueError, match="group"):
+        Q.u8s8_pair_saturating_conv(x, w, za, group=2)
+
+
+def test_semantics_argument_is_validated():
+    m = _matmul_integer(8, np.ones((8, 1)))
+    node, consts = _only(m)
+    with pytest.raises(ValueError, match="unknown semantics"):
+        Q.verify_layer(node, consts, semantics="wrapping")
+    with pytest.raises(ValueError, match="unknown semantics"):
+        Q.verify_model(m, semantics="wrapping")
+
+
+def test_pair_saturation_finding_and_the_boundary_move_under_the_saturating_semantics():
+    k = 66312
+    m = _matmul_integer(k, np.full((k, 1), 127))
+    node, consts = _only(m)
+    exact = Q.verify_layer(node, consts)  # exact arithmetic: 66312*255*127 wraps
+    assert exact.of("no-wrap")[0].verdict == Q.REFUTED
+    sat = Q.verify_layer(node, consts, semantics=Q.U8S8_PAIR_SATURATING)
+    assert (
+        sat.of("no-wrap")[0].verdict == Q.PROVED
+    )  # ... but 33156 saturated pairs do not
+    assert (
+        "[-" in sat.of("no-wrap")[0].detail
+        and "1086422652" in sat.of("no-wrap")[0].detail
+    )
+    f = sat.of("pair-saturation")[0]
+    assert f.verdict == Q.REFUTED and f.severity == Q.INFORMATIONAL
+    assert sat.proved is True  # informational findings never decide the verdict
+    # its counterexample really separates the two kinds of kernel
+    a = f.counterexample["a"]
+    assert (
+        int(Q.u8s8_pair_saturating_matmul(a, np.full((k, 1), 127, np.int8), 0)[0, 0])
+        == 1086422652
+    )
+    assert int(a.astype(np.int64).sum()) * 127 == 2147514120
+    # small weights cannot saturate any pair: the two kernels agree, and the finding is PROVED
+    small = _matmul_integer(64, np.full((64, 1), 60))  # 2*255*60 = 30600 < 32767
+    node, consts = _only(small)
+    r = Q.verify_layer(node, consts, semantics=Q.U8S8_PAIR_SATURATING)
+    assert r.of("pair-saturation")[0].verdict == Q.PROVED
+    # and the boundary where the SATURATING accumulator wraps: 65538 pairs fit, 65539 do not
+    for kk, verdict in ((131076, Q.PROVED), (131077, Q.REFUTED)):
+        mm = _matmul_integer(kk, np.full((kk, 1), 127))
+        n2, c2 = _only(mm)
+        assert (
+            Q.verify_layer(n2, c2, semantics=Q.U8S8_PAIR_SATURATING)
+            .of("no-wrap")[0]
+            .verdict
+            == verdict
+        )
+
+
+def test_saturating_conv_layer_findings_and_counterexample():
+    cin, cout, k = 2, 2, 3
+    wq = np.full((cout, cin, k, k), 100)
+    m = _qlinear_conv(cin, cout, k, wq, np.zeros(cout), 0.02, 0.011, 0.9, 0, 128, k)
+    node, consts = _only(m)
+    rep = Q.verify_layer(
+        node, consts, x_shape=(1, cin, k, k), semantics=Q.U8S8_PAIR_SATURATING
+    )
+    f = rep.of("pair-saturation")[0]
+    assert f.verdict == Q.REFUTED  # 2 * 255 * 100 = 51000 > 32767
+    x = f.counterexample["a"]
+    sat = int(Q.u8s8_pair_saturating_conv(x, wq.astype(np.int8), 0)[0, 0, 0, 0])
+    exact = int((x.astype(np.int64) * wq[0]).sum())
+    assert sat != exact
+    # requantisation is still analysed, with reachability left undecided (never refuted on the
+    # strength of an exact-arithmetic search)
+    assert rep.of("requant-1lsb")[0].verdict == Q.PROVED
+    assert all(r.verdict != Q.REFUTED for r in rep.of("requant-bit-exact"))
+
+
+def test_layers_the_saturating_model_does_not_cover_are_skipped_with_a_reason():
+    def reason(model, **kw):
+        node, consts = _only(model)
+        rep = Q.verify_layer(node, consts, semantics=Q.U8S8_PAIR_SATURATING, **kw)
+        f = rep.of("no-wrap")[0]
+        assert f.verdict == Q.SKIPPED and not rep.proved
+        return f.detail
+
+    assert "ConvInteger" in reason(
+        _conv_integer(2, 2, 3, 100, x_hw=(3, 3)), x_shape=(1, 2, 3, 3)
+    )
+    assert "uint8 activations" in reason(
+        _matmul_integer(8, np.ones((8, 1)), a_type="int8")
+    )
+    assert "padded" in reason(
+        _model(
+            "m (uint8[1,2,4,4] x) => (uint8[1,2,?,?] y) { y = QLinearConv<pads=[1,1,1,1]>(x, sa, za, W, sb, zb, sy, zy) }",
+            dict(
+                W=np.ones((2, 2, 3, 3), np.int8),
+                sa=np.array(0.02, np.float32),
+                sb=np.array(0.011, np.float32),
+                sy=np.array(0.9, np.float32),
+                za=np.array(0, np.uint8),
+                zb=np.array(0, np.int8),
+                zy=np.array(0, np.uint8),
+            ),
+        ),
+        x_shape=(1, 2, 4, 4),
+    )
+    assert "weight zero point" in reason(
+        _model(
+            "m (uint8[1,8] a) => (int32[1,1] y) { y = MatMulInteger(a, W, azp, wzp) }",
+            dict(
+                W=np.ones((8, 1), np.int8),
+                azp=np.array(0, np.uint8),
+                wzp=np.array(3, np.int8),
+            ),
+        )
+    )
+
+
+def test_replay_with_the_saturating_semantics_returns_the_model_and_matches_a_saturating_host():
+    k = 66312
+    m = _matmul_integer(k, np.full((k, 1), 127))
+    node, consts = _only(m)
+    rep = Q.verify_layer(node, consts, semantics=Q.U8S8_PAIR_SATURATING)
+    f = rep.of("pair-saturation")[0]
+    observed, expected = Q.replay_no_wrap(
+        m, rep.name, f, semantics=Q.U8S8_PAIR_SATURATING
+    )
+    assert int(expected[0, 0]) == 1086422652  # the model's prediction, on every host
+    if HOST == Q.U8S8_PAIR_SATURATING and _MODEL_OK_ON_HOST:
+        assert int(observed[0, 0]) == int(
+            expected[0, 0]
+        )  # onnxruntime agrees bit for bit
+    elif HOST == Q.EXACT:
+        assert int(observed[0, 0]) == _wrap32(
+            k * 255 * 127
+        )  # this host's kernel is exact
+    with pytest.raises(ValueError, match="uint8 activations, int8 weights"):
+        Q.replay_no_wrap(
+            _matmul_integer(8, np.ones((8, 1)), a_type="int8"),
+            "MatMulInteger_y",
+            Q.Finding(
+                "no-wrap",
+                Q.SOUNDNESS,
+                Q.REFUTED,
+                counterexample={"a": np.zeros((1, 8), np.int8)},
+            ),
+            semantics=Q.U8S8_PAIR_SATURATING,
+        )
+
+
+def test_host_semantics_and_validation_contract():
+    assert Q.host_semantics() in Q.SEMANTICS
+    ok, why = Q.validate_saturating_model_on_host()
+    assert isinstance(why, str) and why
+    if HOST == Q.EXACT:
+        assert ok is None  # nothing to validate against on an exact kernel
+    else:
+        # on a saturating host the model must reproduce onnxruntime on every case, or the oracle
+        # tests above were skipped with the disagreement as the reason
+        assert ok in (True, False)
+        if ok is False:
+            pytest.skip(f"model does not reproduce this host's kernel: {why}")
+        assert ok is True
+
+
+# ---- opt-in verification hooks (verify=True on the integer quantizers) -------------------
+
+
+def _float_matmul_model(k=16, n=4, seed=0):
+    rng = np.random.default_rng(seed)
+    return _model(
+        f"m (float[2,{k}] x) => (float[2,{n}] y) {{ y = MatMul(x, W) }}",
+        dict(W=rng.standard_normal((k, n)).astype(np.float32)),
+        opset=13,
+    )
+
+
+def _summary(model):
+    return next(
+        (p.value for p in model.metadata_props if p.key == "onnxsim.quant_int_verify"),
+        None,
+    )
+
+
+def test_quantize_dynamic_verify_is_opt_in_and_records_a_summary():
+    base = _float_matmul_model()
+    assert (
+        _summary(onnxsim.quantize_dynamic(base)) is None
+    )  # default: off, nothing recorded
+    q = onnxsim.quantize_dynamic(base, verify=True)
+    s = _summary(q)
+    assert s is not None and "layers=1" in s and "refuted=none" in s
+    assert "u8s8_pair_saturation_hazard_layers=" in s
+    # the quantized model itself is unchanged by asking for the check
+    plain = onnxsim.quantize_dynamic(base)
+    assert [n.op_type for n in q.graph.node] == [n.op_type for n in plain.graph.node]
+
+
+def test_quantize_qoperator_verify_records_a_summary():
+    base = _float_matmul_model(k=32, n=8)
+    q = onnxsim.quantize_qoperator(base, num_calibration_samples=2, verify=True)
+    s = _summary(q)
+    assert s is not None and "layers=1" in s
+    assert _summary(onnxsim.quantize_qoperator(base, num_calibration_samples=2)) is None
+
+
+def test_attach_verification_warns_on_a_refuted_layer_and_never_raises():
+    k = 70000
+    bad = _matmul_integer(k, np.full((k, 1), 127))
+    with pytest.warns(RuntimeWarning, match="soundness finding refuted"):
+        report = Q.attach_verification(bad)
+    assert report is not None and not report.ok
+    assert "NOT PROVED" in _summary(bad) and "no-wrap" in _summary(bad)
+    assert "u8s8_pair_saturation_hazard_layers=1" in _summary(
+        bad
+    )  # 70000 taps of 255*127 saturate pairs too
+    # a model with no integer layers is reported as such
+    plain = _float_matmul_model()
+    assert Q.attach_verification(plain) is not None
+    assert _summary(plain) == "no integer layers found"
+    # an internal failure of the check is recorded, not raised
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            Q,
+            "verify_model",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        other = _float_matmul_model()
+        assert Q.attach_verification(other) is None
+        assert "verification failed: RuntimeError: boom" in _summary(other)
+    # calling it twice replaces the summary instead of duplicating it
+    Q.attach_verification(plain)
+    assert sum(p.key == "onnxsim.quant_int_verify" for p in plain.metadata_props) == 1
