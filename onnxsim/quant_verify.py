@@ -59,6 +59,7 @@ from onnx import TensorProto, helper, numpy_helper
 from . import interval as _interval
 from . import ranges as _ranges
 from . import zonotope as _zonotope
+from ._onnx_compat import INT4, UINT4
 
 # Representable integer range of each quantized element type.
 _QRANGE: Dict[int, Tuple[int, int]] = {
@@ -66,8 +67,10 @@ _QRANGE: Dict[int, Tuple[int, int]] = {
     TensorProto.INT8: (-128, 127),
     TensorProto.UINT16: (0, 65535),
     TensorProto.INT16: (-32768, 32767),
-    TensorProto.UINT4: (0, 15),
-    TensorProto.INT4: (-8, 7),
+    # UINT4/INT4 come from _onnx_compat, not TensorProto: that attribute is missing on onnx < 1.16
+    # and a module-level access would break `import onnxsim` there (tests/test_onnx_compat.py).
+    UINT4: (0, 15),
+    INT4: (-8, 7),
 }
 _NOISE_PREFIX = "__qnoise_"
 _INT32_MAX = 2**31 - 1
