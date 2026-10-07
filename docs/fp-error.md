@@ -175,6 +175,11 @@ certified atol = 3.9e-05
   roundoff of the simplified : 1.5e-05
 ```
 
+The real-arithmetic difference is the one figure that is not reproducible to the last digit: it
+comes from float32 constants that `simplify` folds, and the folding arithmetic differs slightly
+between platforms (an aarch64 build prints `3.9e-07` where x86-64 prints `4.2e-07`). It is orders of
+magnitude below the roundoff terms, so the certified `atol` is unaffected at the digits shown.
+
 For comparison, the default `check_atol=1e-5` is *below* that certified absolute value. The default
 check also has `check_rtol=1e-4`, which covers it wherever the output is not close to zero, so the
 exposure is outputs near zero; this module gives the absolute figure that is actually certified
