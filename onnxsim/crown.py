@@ -1408,7 +1408,10 @@ class _Bab:
         evals, pruned = 1, 0
 
         def out_of_time() -> bool:
-            return time_limit is not None and time.monotonic() - t0 > time_limit
+            # >=, not >: a limit of 0 means "no time at all". On Windows the monotonic
+            # clock ticks every ~15 ms, so an elapsed time of exactly 0.0 is common and a
+            # strict > let a zero limit run several evaluations.
+            return time_limit is not None and time.monotonic() - t0 >= time_limit
 
         while evals + 2 <= budget and not out_of_time():  # a split bounds two regions
             cand = [r for r in regions if not r.stuck and self.undecided(r)]
