@@ -520,14 +520,18 @@ class _Analyzer:
         def row_sum(a: Any) -> Any:
             return ops.reshape(a, (m, -1)).sum(1)
 
+        # Coefficients that reach a leaf (a graph input, or a tensor with no backward rule) are
+        # summed per leaf and concretised ONCE, after the walk. Concretising each arrival on its
+        # own throws away cancellation between paths from the same leaf: x - x came out as
+        # [-2R, 2R] instead of 0, and Identity(x) - x, Add(x, Neg(x)), a residual whose skip
+        # path starts at the input, etc. (sound, but as loose as plain intervals).
+        leaf_coef: Dict[str, Any] = {}
+
         def add(name: str, a: Any) -> None:
             if name in self.leaf:
                 if leaf_cb is not None:
                     leaf_cb[name] = leaf_cb[name] + a if name in leaf_cb else a
-                lo, hi = _clip_box(*self.ib[name])
-                acc[0] = acc[0] + row_sum(
-                    ops.pos(a) * ops.asarray(lo) + ops.neg(a) * ops.asarray(hi)
-                )
+                leaf_coef[name] = leaf_coef[name] + a if name in leaf_coef else a
             elif name in coef:
                 coef[name] = coef[name] + a
             else:
@@ -642,6 +646,11 @@ class _Analyzer:
                 add(ins[0], full)
             else:  # pragma: no cover - _supported() keeps these out of the graph walk
                 raise AssertionError(f"no backward rule for {t}")
+        for name, a in leaf_coef.items():
+            lo, hi = _clip_box(*self.ib[name])
+            acc[0] = acc[0] + row_sum(
+                ops.pos(a) * ops.asarray(lo) + ops.neg(a) * ops.asarray(hi)
+            )
         return acc[0]
 
     def _conv_back(
