@@ -87,15 +87,83 @@ def producer(model, output_name):
     return next(n for n in model.graph.node if output_name in n.output)
 
 
-def prove(claim, msg="rewrite is not a sound equivalence"):
+#: Solver budget for the last-resort strategy of one proof, in seconds. Real proofs here finish in
+#: well under a minute; the cap exists so a proof that Z3 happens to find hard fails (with a clear
+#: message) instead of hanging the whole CI job until GitHub's 6-hour limit.
+PROOF_TIMEOUT_S = 120
+
+
+def _then(*names):
+    return lambda ctx: z3.Then(*names, ctx=ctx).solver()
+
+
+def _solver_with(**params):
+    def make(ctx):
+        solver = z3.Solver(ctx=ctx)
+        for key, value in params.items():
+            solver.set(key.replace("__", "."), value)
+        return solver
+
+    return make
+
+
+# Strategies tried in order, each in the proof's own fresh Z3 context: (name, factory, cap in
+# seconds -- None means the full ``timeout``). A strategy that proves the claim (unsat) or refutes it
+# (sat) is conclusive and sound, so "first conclusive wins" cannot weaken what is proved; it only
+# decides how long finding the proof takes. The first four have SHORT caps: no single strategy is
+# fast on every proof (measured, fresh context, docs/formal-verify-robustness.md), so a short first
+# round bounds the time wasted on a strategy that is wrong for a proof, and only the last, plain
+# default solver gets the full ``timeout``.
+#   quantized MAC bounds (nonlinear reals):   qfnra 0.2-0.8 s;  default 0.2-40 s
+#   four-corner formula (uninterpreted fn):   arith.solver=2 0.0 s;  smt tactic 0.1 s;  default: gave up
+#   flat-BEV-index bijection / scatter witness: default 0.0 s;  qfnra: burns its whole cap
+_STRATEGIES = (
+    ("default solver, short", lambda ctx: z3.Solver(ctx=ctx), 3),
+    ("qfnra", lambda ctx: z3.Tactic("qfnra", ctx=ctx).solver(), 6),
+    (
+        "simplify;propagate-values;ctx-simplify;smt",
+        _then("simplify", "propagate-values", "ctx-simplify", "smt"),
+        3,
+    ),
+    ("default + smt.arith.solver=2", _solver_with(smt__arith__solver=2), 3),
+    ("default solver", lambda ctx: z3.Solver(ctx=ctx), None),
+)
+
+
+def prove(claim, msg="rewrite is not a sound equivalence", timeout=PROOF_TIMEOUT_S):
     """Prove ``claim`` valid.
 
     Mirrors z3's own ``prove()`` helper (free variables in ``claim`` are
     implicitly universally quantified: ``claim`` is valid iff its negation is
     unsatisfiable), but raises with the counterexample instead of printing it,
     so a broken proof fails the test with a useful message.
+
+    Robustness (see docs/formal-verify-robustness.md): Z3's search depends on the AST ids and
+    other state earlier work leaves in the *global* context, so the same proof could finish in
+    0.2 s after some tests and not at all (measured: > 250 s) after others -- one such proof
+    hung CI's formal-verification job for the full 6-hour limit. Each proof is therefore
+    copied (``translate``) into a fresh ``z3.Context`` -- deterministic numbering, independent of
+    earlier tests -- and tried with a short portfolio of strategies (see ``_STRATEGIES``), the
+    last of which gets ``timeout`` seconds. If none is conclusive the test fails saying so (never
+    calls ``model()`` on an unknown result, never silently passes).
     """
-    solver = z3.Solver()
-    solver.add(z3.Not(claim))
-    result = solver.check()
-    assert result == z3.unsat, f"{msg}: counterexample {solver.model()}"
+    if isinstance(claim, bool):
+        claim = z3.BoolVal(claim)
+    ctx = z3.Context()
+    negated = z3.Not(claim.translate(ctx), ctx=ctx)
+    gave_up = []
+    for name, make_solver, cap in _STRATEGIES:
+        budget = timeout if cap is None else min(cap, timeout)
+        solver = make_solver(ctx)
+        solver.set("timeout", int(budget * 1000))
+        solver.add(negated)
+        result = solver.check()
+        if result == z3.unsat:
+            return
+        if result == z3.sat:
+            raise AssertionError(f"{msg}: counterexample {solver.model()}")
+        gave_up.append(f"{name} ({budget:g} s): {solver.reason_unknown()}")
+    raise AssertionError(
+        f"{msg}: solver gave up on every strategy ({'; '.join(gave_up)}) "
+        "-- the claim is neither proved nor refuted"
+    )
