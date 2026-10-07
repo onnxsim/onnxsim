@@ -608,3 +608,41 @@ def test_evaluate_selection_keeping_everything_float_is_exact():
     )
     kept_none = qs.evaluate_selection(m, groups, [], "weights", 3, x)
     assert kept_none["kl"] > 0
+
+
+# ---- the documentation example ------------------------------------------------------------------
+
+
+def test_doc_example_runs_and_its_deterministic_line_is_quoted_correctly(capsys):
+    """docs/quant-sensitivity.md must stay true: run its example and compare with what it quotes.
+
+    The ``||W-Q(W)||`` ranking is deterministic and is checked exactly. The ``fisher`` ranking
+    depends on seeded random labels and the measured KL on float rounding, so only their form
+    is checked (and the numbers the page quotes are not asserted).
+    """
+    import os
+    import re
+
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "docs", "quant-sensitivity.md"
+    )
+    text = open(path, encoding="utf-8").read()
+    blocks = re.findall(r"<!-- doctest -->\n```python\n(.*?)```", text, flags=re.DOTALL)
+    assert len(blocks) == 1
+    exec(compile(blocks[0], "docs/quant-sensitivity.md", "exec"), {})
+    out = capsys.readouterr().out
+    quoted = re.search(
+        r"```\n(most sensitive first \(fisher\).*?)```", text, flags=re.DOTALL
+    )
+    assert quoted, "the page no longer quotes the example's output"
+    want = next(ln for ln in quoted.group(1).splitlines() if "||W-Q(W)||" in ln)
+    assert want in out.splitlines()
+    names = re.findall(
+        r"'(MatMul_\d+)'", next(ln for ln in out.splitlines() if "(fisher)" in ln)
+    )
+    assert sorted(names) == ["MatMul_0", "MatMul_3", "MatMul_6"]
+    assert re.search(r"keep in float \(k=1, fisher\): +\['MatMul_\d+'\]", out)
+    kls = [
+        float(v) for v in re.findall(r"'MatMul_\d+': ([0-9.]+)", out.splitlines()[-1])
+    ]
+    assert len(kls) == 3 and all(v > 0 for v in kls)
