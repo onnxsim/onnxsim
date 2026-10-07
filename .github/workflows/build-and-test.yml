@@ -158,6 +158,12 @@ jobs:
   test_formal_verification:
     name: Formal verification (Z3 translation-validation proofs)
     runs-on: ubuntu-24.04
+    # This job took 12-14 minutes end to end (699-846 s on the passing master runs before the
+    # incident; the proof suite alone was ~11.5 min locally, ~2 min with the prove() portfolio).
+    # A single Z3 proof that turned hard once ran it to GitHub's default 6-hour job limit, so cap
+    # it at ~3x the former time: a hang now fails in under an hour instead of holding a runner for six.
+    # See docs/formal-verify-robustness.md and tests/_formal_verify_common.py (prove()).
+    timeout-minutes: 45
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
