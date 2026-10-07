@@ -45,14 +45,34 @@ Soundness argument (what each piece guarantees, and where it is not rigorous):
   rounding (about 1e-6 relative per op), which callers should budget for (the default
   ``slack`` in the test-suite soundness check is ``1e-4``).
 
+* Box part (opt-in, ``box_inputs`` / ``box_fresh``): a tensor may carry, besides its dense
+  generators, a per-element radius ``r``:
+
+      x_i = c_i + sum_j G[j, i] * eps_j + e_i,      |e_i| <= r_i, every e_i independent.
+
+  This is a *superset* of the zonotope the same noise would generate as one symbol per element
+  (a box contains it), so it is sound; it costs ``O(tensor size)`` instead of
+  ``O(k * tensor size)``. Linear maps push ``r`` through ``|W|`` (``|a*e| <= |a|*r``; sums of
+  independent boxes add radii, including a box added to itself, which is looser but sound),
+  and the ``lam >= 0`` slope of a ``Relu`` / ``Sigmoid`` / ``Tanh`` relaxation scales it by
+  ``lam``. What a box gives up: *cancellation*. Two paths carrying the same box noise to one
+  element are treated as independent (residual ``Add``), and a box that two models both
+  contain does not cancel in their difference. So only noise that exists in ONE model --
+  quantizer rounding noise, the relaxation error of the second model's paired nonlinearities --
+  should be boxed; anything shared between the models must stay a dense symbol.
+  A *single* symbol shared across the elements of a channel or tensor would be UNSOUND for
+  independent per-element errors, and is not offered.
+
 Scope: generators are stored densely per tensor (``k x tensor size``), so this targets
-small windows and models, not full-size networks. Integrating this into
+small windows and models; the box part is what lets conv windows grow beyond that (see
+``docs/zonotope-box-noise.md`` for measured scaling and the remaining bottleneck). Integrating this into
 ``onnxsim.certify`` for nonlinear windows is planned; it is deliberately standalone for
 now.
 """
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Tuple, Union
+import fnmatch
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
@@ -81,20 +101,35 @@ class _Space:
 
 
 class Zonotope:
-    """Affine form ``c + sum_j G[j] * eps_j`` per tensor element, ``eps_j in [-1, 1]``.
+    """Affine form ``c + sum_j G[j] * eps_j + e`` per tensor element.
 
-    ``c`` has the tensor's shape; ``G`` has shape ``(k,) + c.shape`` and ``ids`` (sorted,
-    length ``k``) names the global symbol of each generator row.
+    ``eps_j in [-1, 1]``; ``c`` has the tensor's shape; ``G`` has shape ``(k,) + c.shape`` and
+    ``ids`` (sorted, length ``k``) names the global symbol of each generator row. ``r`` is the
+    optional *box part* (see the module docstring): ``None`` (no box) or a non-negative array
+    of the tensor's shape with ``|e_i| <= r_i``, the ``e_i`` independent of everything else.
     """
 
-    __slots__ = ("c", "ids", "G")
+    __slots__ = ("c", "ids", "G", "r")
 
-    def __init__(self, c: np.ndarray, ids: np.ndarray, G: np.ndarray) -> None:
+    def __init__(
+        self,
+        c: np.ndarray,
+        ids: np.ndarray,
+        G: np.ndarray,
+        r: Optional[np.ndarray] = None,
+    ) -> None:
         self.c = np.asarray(c, dtype=np.float64)
         self.ids = np.asarray(ids, dtype=np.int64)
         self.G = np.asarray(G, dtype=np.float64).reshape(
             (len(self.ids),) + self.c.shape
         )
+        if r is not None:
+            r = np.broadcast_to(np.asarray(r, dtype=np.float64), self.c.shape)
+            if not np.any(r > 0):
+                r = None  # an all-zero box is no box: keeps results identical to the dense path
+            elif np.any(r < 0) or np.any(np.isnan(r)):
+                raise ValueError("box radius must be non-negative")
+        self.r = r
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -109,10 +144,15 @@ class Zonotope:
         c = np.asarray(c, dtype=np.float64)
         return cls(c, np.zeros(0, np.int64), np.zeros((0,) + c.shape))
 
+    def box(self) -> np.ndarray:
+        """The box radius as an array (zeros when there is none)."""
+        return np.zeros(self.c.shape) if self.r is None else self.r
+
     def radius(self) -> np.ndarray:
-        if len(self.ids) == 0:
-            return np.zeros_like(self.c)
-        return np.abs(self.G).sum(axis=0)
+        rad = (
+            np.zeros_like(self.c) if len(self.ids) == 0 else np.abs(self.G).sum(axis=0)
+        )
+        return rad if self.r is None else rad + self.r
 
     def bounds(self, rel_slack: float = _REL_SLACK) -> Tuple[np.ndarray, np.ndarray]:
         """Concretise to an elementwise box ``(lo, hi)`` (widened by ``rel_slack``)."""
@@ -158,7 +198,11 @@ def _add(a: Zonotope, b: Zonotope, sign: float = 1.0) -> Zonotope:
     nd = max(a.c.ndim, b.c.ndim)
     c = a.c + sign * b.c
     g = _lift(ga, nd) + sign * _lift(gb, nd)
-    return Zonotope(c, ids, np.broadcast_to(g, (len(ids),) + c.shape))
+    r = None
+    if a.r is not None or b.r is not None:
+        # independent boxes add, whatever the sign: |e_a +- e_b| <= r_a + r_b
+        r = np.broadcast_to(a.box(), c.shape) + np.broadcast_to(b.box(), c.shape)
+    return Zonotope(c, ids, np.broadcast_to(g, (len(ids),) + c.shape), r)
 
 
 def _scale(z: Zonotope, k: np.ndarray) -> Zonotope:
@@ -166,7 +210,8 @@ def _scale(z: Zonotope, k: np.ndarray) -> Zonotope:
     k = np.asarray(k, dtype=np.float64)
     c = z.c * k
     g = _lift(z.G, c.ndim) * k
-    return Zonotope(c, z.ids, np.broadcast_to(g, (len(z.ids),) + c.shape))
+    r = None if z.r is None else z.r * np.abs(k)
+    return Zonotope(c, z.ids, np.broadcast_to(g, (len(z.ids),) + c.shape), r)
 
 
 def _new_symbols(space: _Space, radius: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -180,20 +225,39 @@ def _new_symbols(space: _Space, radius: np.ndarray) -> Tuple[np.ndarray, np.ndar
 
 
 def _with_new(
-    z: Zonotope, c: np.ndarray, g: np.ndarray, new_radius: np.ndarray, space: _Space
+    z: Zonotope,
+    c: np.ndarray,
+    g: np.ndarray,
+    new_radius: np.ndarray,
+    space: _Space,
+    r: Optional[np.ndarray] = None,
+    box: bool = False,
 ) -> Zonotope:
+    """``z``'s symbols plus an independent per-element error of radius ``new_radius``.
+
+    Dense (default): one fresh diagonal symbol per element, ``k x size`` floats. ``box=True``:
+    the error is added to the box part instead, ``O(size)``. Sound either way (the box contains
+    the symbols' zonotope); the box only gives up cancellation with other tensors that would
+    contain the *same* new symbol, which is why only errors that live in one model use it.
+    ``r`` is the box part carried over from the operand.
+    """
+    if box:
+        extra = np.asarray(new_radius, dtype=np.float64)
+        return Zonotope(c, z.ids, g, extra if r is None else r + extra)
     ids_n, g_n = _new_symbols(space, new_radius)
-    return Zonotope(c, np.concatenate([z.ids, ids_n]), np.concatenate([g, g_n]))
+    return Zonotope(c, np.concatenate([z.ids, ids_n]), np.concatenate([g, g_n]), r)
 
 
-def _relu(z: Zonotope, space: _Space) -> Zonotope:
+def _relu(z: Zonotope, space: _Space, box: bool = False) -> Zonotope:
     lo, hi = z.bounds()
     pos, neg = lo >= 0, hi <= 0
     unstable = ~(pos | neg)
     with np.errstate(divide="ignore", invalid="ignore"):
         lam = np.where(pos, 1.0, np.where(neg, 0.0, hi / (hi - lo)))
     mu = np.where(unstable, -lam * lo / 2.0, 0.0)
-    return _with_new(z, lam * z.c + mu, _lift(z.G, z.c.ndim) * lam, mu, space)
+    # lam in [0, 1]: the operand's box part scales by lam
+    r = None if z.r is None else lam * z.r
+    return _with_new(z, lam * z.c + mu, _lift(z.G, z.c.ndim) * lam, mu, space, r, box)
 
 
 def _sigmoid_f(x: np.ndarray) -> np.ndarray:
@@ -209,7 +273,7 @@ def _tanh_d(x: np.ndarray) -> np.ndarray:
     return 1.0 - np.tanh(x) ** 2
 
 
-def _unimodal(z: Zonotope, space: _Space, f, df) -> Zonotope:
+def _unimodal(z: Zonotope, space: _Space, f, df, box: bool = False) -> Zonotope:
     """Sigmoid/Tanh-style relaxation (see module docstring)."""
     lo, hi = z.bounds()
     lam = np.minimum(df(lo), df(hi))
@@ -217,7 +281,8 @@ def _unimodal(z: Zonotope, space: _Space, f, df) -> Zonotope:
     band_hi = f(hi) - lam * hi
     mid = (band_lo + band_hi) / 2.0
     rad = (band_hi - band_lo) / 2.0 + 1e-12  # covers f's own float64 rounding
-    return _with_new(z, lam * z.c + mid, _lift(z.G, z.c.ndim) * lam, rad, space)
+    r = None if z.r is None else lam * z.r
+    return _with_new(z, lam * z.c + mid, _lift(z.G, z.c.ndim) * lam, rad, space, r, box)
 
 
 def _consolidate(z: Zonotope, space: _Space, max_symbols: int) -> Zonotope:
@@ -236,6 +301,7 @@ def _consolidate(z: Zonotope, space: _Space, max_symbols: int) -> Zonotope:
         z.c,
         np.concatenate([z.ids[keep], ids_n]),
         np.concatenate([z.G[keep], g_n]),
+        z.r,
     )
 
 
@@ -255,7 +321,11 @@ def _unimodal_slopes(df) -> Any:
 
 
 def _slope_apply(
-    dx: Zonotope, s_lo: np.ndarray, s_hi: np.ndarray, space: "_Space"
+    dx: Zonotope,
+    s_lo: np.ndarray,
+    s_hi: np.ndarray,
+    space: "_Space",
+    box: bool = False,
 ) -> Zonotope:
     """Enclose ``f(a) - f(b)`` given an enclosure ``dx`` of ``a - b`` and the slope range of ``f``.
 
@@ -267,11 +337,16 @@ def _slope_apply(
     lo, hi = dx.bounds()
     rad = half * np.maximum(np.abs(lo), np.abs(hi)) * (1.0 + 1e-12)
     out = _scale(dx, mid)
-    return _with_new(out, out.c, out.G, rad, space)
+    return _with_new(out, out.c, out.G, rad, space, out.r, box)
 
 
-def _box_zonotope(lo: np.ndarray, hi: np.ndarray, space: _Space) -> Zonotope:
+def _box_zonotope(
+    lo: np.ndarray, hi: np.ndarray, space: _Space, box: bool = False
+) -> Zonotope:
+    """The interval ``[lo, hi]`` as a zonotope: dense diagonal symbols, or (``box``) a box part."""
     c, r = (lo + hi) / 2.0, (hi - lo) / 2.0
+    if box:
+        return Zonotope(c, np.zeros(0, np.int64), np.zeros((0,) + c.shape), r)
     ids, g = _new_symbols(space, r)
     return Zonotope(c, ids, g)
 
@@ -361,8 +436,18 @@ class _Evaluator:
         max_symbols: int,
         record: Optional[List[Tuple[str, Zonotope, Zonotope]]] = None,
         pair: Optional[List[Tuple[str, Zonotope, Zonotope]]] = None,
+        box_fresh: bool = False,
     ) -> None:
         self.model, self.space, self.max_symbols = model, space, max_symbols
+        # ``box_fresh``: relaxation errors and interval fallbacks created by THIS evaluator go
+        # into the box part instead of dense fresh symbols (see the module docstring).
+        self.box_fresh = box_fresh
+        self.stats: Dict[str, int] = {
+            "max_symbols": 0,
+            "max_generator_elements": 0,
+            "max_box_elements": 0,
+            "tensors": 0,
+        }
         # ``record``: the first model of a difference run logs (kind, input, output) of every
         # nonlinearity. ``pair``: the second model replays that log, pairing its j-th
         # nonlinearity of each kind with the first model's j-th (see ``_paired``).
@@ -402,6 +487,14 @@ class _Evaluator:
 
     def _post(self, z: Zonotope) -> Zonotope:
         out = _consolidate(z, self.space, self.max_symbols)
+        st = self.stats
+        st["tensors"] += 1
+        st["max_symbols"] = max(st["max_symbols"], len(out.ids))
+        st["max_generator_elements"] = max(
+            st["max_generator_elements"], len(out.ids) * out.size
+        )
+        if out.r is not None:
+            st["max_box_elements"] = max(st["max_box_elements"], out.size)
         if out is not z:
             self._note(
                 f"symbol cap ({self.max_symbols}) reached: generators were merged into boxes, "
@@ -468,7 +561,9 @@ class _Evaluator:
         self._note(f"precision lost at {node.op_type} ({why})")
         if box is None:
             return [_Top(self.shapes.get(o)) for o in outs]
-        boxed: List[Value] = [_box_zonotope(lo, hi, self.space) for lo, hi in box]
+        boxed: List[Value] = [
+            _box_zonotope(lo, hi, self.space, self.box_fresh) for lo, hi in box
+        ]
         return boxed[: len(outs)]
 
     # -- elementwise / arithmetic
@@ -479,7 +574,7 @@ class _Evaluator:
 
     def op_Neg(self, node, args):
         z = self._as_z(args[0])
-        return Zonotope(-z.c, z.ids, -z.G)
+        return Zonotope(-z.c, z.ids, -z.G, z.r)
 
     def _binary(self, args, sign):
         a, b = args[0], args[1]
@@ -524,24 +619,32 @@ class _Evaluator:
         lo_a, hi_a = x_a.bounds()
         lo_b, hi_b = z.bounds()
         s_lo, s_hi = slopes(np.minimum(lo_a, lo_b), np.maximum(hi_a, hi_b))
-        return _add(out_a, _slope_apply(dx, s_lo, s_hi, self.space), -1.0)
+        return _add(
+            out_a, _slope_apply(dx, s_lo, s_hi, self.space, self.box_fresh), -1.0
+        )
 
     def op_Relu(self, node, args):
         z = self._as_z(args[0])
         out = self._paired("Relu", z, _relu_slopes)
-        return out if out is not None else _relu(z, self.space)
+        return out if out is not None else _relu(z, self.space, self.box_fresh)
 
     def op_Sigmoid(self, node, args):
         z = self._as_z(args[0])
         out = self._paired("Sigmoid", z, _unimodal_slopes(_sigmoid_d))
         return (
-            out if out is not None else _unimodal(z, self.space, _sigmoid_f, _sigmoid_d)
+            out
+            if out is not None
+            else _unimodal(z, self.space, _sigmoid_f, _sigmoid_d, self.box_fresh)
         )
 
     def op_Tanh(self, node, args):
         z = self._as_z(args[0])
         out = self._paired("Tanh", z, _unimodal_slopes(_tanh_d))
-        return out if out is not None else _unimodal(z, self.space, np.tanh, _tanh_d)
+        return (
+            out
+            if out is not None
+            else _unimodal(z, self.space, np.tanh, _tanh_d, self.box_fresh)
+        )
 
     # -- linear algebra
     def _matmul(self, a: Value, b: Value) -> Zonotope:
@@ -549,12 +652,14 @@ class _Evaluator:
             z, w = self._as_z(a), np.asarray(b, dtype=np.float64)
             if z.c.ndim < 2 or w.ndim != 2:
                 raise _Failed("MatMul rank")
-            return Zonotope(z.c @ w, z.ids, z.G @ w)
+            r = None if z.r is None else z.r @ np.abs(w)
+            return Zonotope(z.c @ w, z.ids, z.G @ w, r)
         if self._const(a) and not self._const(b):
             w, z = np.asarray(a, dtype=np.float64), self._as_z(b)
             if z.c.ndim < 2 or w.ndim != 2:
                 raise _Failed("MatMul rank")
-            return Zonotope(w @ z.c, z.ids, w @ z.G)
+            r = None if z.r is None else np.abs(w) @ z.r
+            return Zonotope(w @ z.c, z.ids, w @ z.G, r)
         raise _Failed("MatMul of two non-constant tensors")
 
     def op_MatMul(self, node, args):
@@ -570,7 +675,9 @@ class _Evaluator:
             if isinstance(v, np.ndarray):
                 return v.T
             z = self._as_z(v)
-            return Zonotope(z.c.T, z.ids, np.swapaxes(z.G, 1, 2))
+            return Zonotope(
+                z.c.T, z.ids, np.swapaxes(z.G, 1, 2), None if z.r is None else z.r.T
+            )
 
         y = self._matmul(
             maybe_t(a, at.get("transA", 0)), maybe_t(b, at.get("transB", 0))
@@ -598,7 +705,8 @@ class _Evaluator:
         s = scale / np.sqrt(var + float(_attrs(node).get("epsilon", 1e-5)))
         shp = [1, -1] + [1] * (z.c.ndim - 2)
         s, bias, mean = s.reshape(shp), bias.reshape(shp), mean.reshape(shp)
-        return Zonotope((z.c - mean) * s + bias, z.ids, z.G * s)
+        r = None if z.r is None else z.r * np.abs(s)
+        return Zonotope((z.c - mean) * s + bias, z.ids, z.G * s, r)
 
     def op_Conv(self, node, args):
         at = _attrs(node)
@@ -627,7 +735,9 @@ class _Evaluator:
             g = np.zeros((0,) + c.shape)
         if bias is not None:
             c = c + bias.reshape(1, -1, 1, 1)
-        return Zonotope(c, z.ids, g)
+        # the box part is pushed through |W| (no bias): |sum w_i e_i| <= sum |w_i| r_i
+        r = None if z.r is None else _conv2d(z.r, np.abs(w), strides, pads, dil, group)
+        return Zonotope(c, z.ids, g, r)
 
     # -- shape ops
     def op_Flatten(self, node, args):
@@ -635,7 +745,15 @@ class _Evaluator:
         axis = int(_attrs(node).get("axis", 1))
         axis = axis + z.c.ndim if axis < 0 else axis
         rows = int(np.prod(z.c.shape[:axis], dtype=np.int64))
-        return Zonotope(z.c.reshape(rows, -1), z.ids, z.G.reshape(len(z.ids), rows, -1))
+        cols = int(np.prod(z.c.shape[axis:], dtype=np.int64))
+        # explicit sizes, not -1: a fully boxed tensor has zero dense generators, and
+        # reshaping an empty array with a -1 is ambiguous
+        return Zonotope(
+            z.c.reshape(rows, cols),
+            z.ids,
+            z.G.reshape(len(z.ids), rows, cols),
+            None if z.r is None else z.r.reshape(rows, cols),
+        )
 
     def op_Reshape(self, node, args):
         z = self._as_z(args[0])
@@ -646,7 +764,12 @@ class _Evaluator:
         shape = [int(s) for s in np.asarray(args[1])]
         shape = [z.c.shape[i] if s == 0 else s for i, s in enumerate(shape)]
         c = z.c.reshape(shape)
-        return Zonotope(c, z.ids, z.G.reshape((len(z.ids),) + c.shape))
+        return Zonotope(
+            c,
+            z.ids,
+            z.G.reshape((len(z.ids),) + c.shape),
+            None if z.r is None else z.r.reshape(c.shape),
+        )
 
     def op_Transpose(self, node, args):
         z = self._as_z(args[0])
@@ -655,6 +778,7 @@ class _Evaluator:
             np.transpose(z.c, perm),
             z.ids,
             np.transpose(z.G, [0] + [p + 1 for p in perm]),
+            None if z.r is None else np.transpose(z.r, perm),
         )
 
     def _raw_axes(self, node, args):
@@ -675,6 +799,7 @@ class _Evaluator:
             np.squeeze(z.c, tuple(axes)),
             z.ids,
             np.squeeze(z.G, tuple(a + 1 for a in axes)),
+            None if z.r is None else np.squeeze(z.r, tuple(axes)),
         )
 
     def op_Unsqueeze(self, node, args):
@@ -686,6 +811,7 @@ class _Evaluator:
             np.expand_dims(z.c, tuple(axes)),
             z.ids,
             np.expand_dims(z.G, tuple(a + 1 for a in axes)),
+            None if z.r is None else np.expand_dims(z.r, tuple(axes)),
         )
 
     def op_Concat(self, node, args):
@@ -705,6 +831,9 @@ class _Evaluator:
             np.concatenate([z.c for z in zs], axis=axis),
             ids,
             np.concatenate(gs, axis=axis + 1),
+            np.concatenate([z.box() for z in zs], axis=axis)
+            if any(z.r is not None for z in zs)
+            else None,
         )
 
     def op_GlobalAveragePool(self, node, args):
@@ -714,6 +843,7 @@ class _Evaluator:
             z.c.mean(axis=ax, keepdims=True),
             z.ids,
             z.G.mean(axis=tuple(a + 1 for a in ax), keepdims=True),
+            None if z.r is None else z.r.mean(axis=ax, keepdims=True),
         )
 
     def _reduce(self, node, args, fn):
@@ -722,7 +852,11 @@ class _Evaluator:
         keep = bool(_attrs(node).get("keepdims", 1))
         ax, gax = tuple(axes), tuple(a + 1 for a in axes)
         return Zonotope(
-            fn(z.c, axis=ax, keepdims=keep), z.ids, fn(z.G, axis=gax, keepdims=keep)
+            fn(z.c, axis=ax, keepdims=keep),
+            z.ids,
+            fn(z.G, axis=gax, keepdims=keep),
+            # mean / sum have non-negative coefficients: the same reduction of the radii
+            None if z.r is None else fn(z.r, axis=ax, keepdims=keep),
         )
 
     def op_ReduceMean(self, node, args):
@@ -801,6 +935,8 @@ class ZonotopeResult:
 
     tensors: Dict[str, Value]
     notes: List[str]
+    # largest symbol count / dense generator size / box part seen (cost diagnostics)
+    stats: Dict[str, int] = dataclasses.field(default_factory=dict)
 
     def bounds(self, name: str) -> Tuple[np.ndarray, np.ndarray]:
         """Elementwise ``(lo, hi)`` enclosing ``name`` for every input in the box."""
@@ -814,10 +950,17 @@ class ZonotopeResult:
         return a, a
 
 
+def _is_box_input(name: str, box_inputs: Optional[Sequence[str]]) -> bool:
+    return bool(box_inputs) and any(
+        fnmatch.fnmatchcase(name, pat) for pat in (box_inputs or ())
+    )
+
+
 def _input_zonotopes(
     models: List[onnx.ModelProto],
     input_ranges: Optional[Dict[str, Tuple]],
     space: _Space,
+    box_inputs: Optional[Sequence[str]] = None,
 ) -> Dict[str, Zonotope]:
     ref = models[0]
     inits = {t.name for t in ref.graph.initializer}
@@ -843,7 +986,7 @@ def _input_zonotopes(
             raise ValueError(f"input {vi.name!r} has an unbounded range")
         if np.any(lo > hi):
             raise ValueError(f"input {vi.name!r} has an empty range")
-        out[vi.name] = _box_zonotope(lo, hi, space)
+        out[vi.name] = _box_zonotope(lo, hi, space, _is_box_input(vi.name, box_inputs))
     return out
 
 
@@ -851,6 +994,8 @@ def propagate(
     model: onnx.ModelProto,
     input_ranges: Optional[Dict[str, Tuple]] = None,
     max_symbols: int = DEFAULT_MAX_SYMBOLS,
+    box_inputs: Optional[Sequence[str]] = None,
+    box_fresh: Optional[bool] = None,
 ) -> ZonotopeResult:
     """Propagate the input box through ``model`` as zonotopes.
 
@@ -858,11 +1003,19 @@ def propagate(
         shape), merged over the model's own ``onnxsim.range.*`` annotations. Every graph input
         needs a finite, static-shape range, else ``ValueError``.
     :param max_symbols: generator cap per tensor before the sound consolidation step.
+    :param box_inputs: graph-input names, or ``fnmatch`` patterns such as ``"__qnoise_*"``,
+        whose elements are carried as independent per-element radii (the *box part*) instead
+        of one dense noise symbol each. Sound; loses cancellation between paths that carry the
+        same element's noise, so use it for noise that exists once (see the module docstring).
+    :param box_fresh: put the error of every Relu / Sigmoid / Tanh relaxation and interval
+        fallback into the box part too, instead of one dense fresh symbol per element.
+        ``None`` (default) means ``bool(box_inputs)``.
     """
     space = _Space()
-    ev = _Evaluator(model, space, max_symbols)
-    values = ev.run(_input_zonotopes([model], input_ranges, space))
-    return ZonotopeResult(dict(values), ev.notes)
+    fresh = bool(box_inputs) if box_fresh is None else box_fresh
+    ev = _Evaluator(model, space, max_symbols, box_fresh=fresh)
+    values = ev.run(_input_zonotopes([model], input_ranges, space, box_inputs))
+    return ZonotopeResult(dict(values), ev.notes, dict(ev.stats))
 
 
 @dataclasses.dataclass
@@ -872,6 +1025,8 @@ class DifferenceBound:
     max_abs: Dict[str, np.ndarray]  # elementwise upper bound on |orig - simplified|
     ref_min_abs: Dict[str, np.ndarray]  # elementwise lower bound on |simplified|
     notes: List[str]
+    # cost diagnostics of the run (per model: ``orig`` / ``simplified`` -> counters)
+    stats: Dict[str, Dict[str, int]] = dataclasses.field(default_factory=dict)
 
     @property
     def worst(self) -> float:
@@ -907,6 +1062,8 @@ def bound_difference(
     simplified: onnx.ModelProto,
     input_ranges: Optional[Dict[str, Tuple]] = None,
     max_symbols: int = DEFAULT_MAX_SYMBOLS,
+    box_inputs: Optional[Sequence[str]] = None,
+    box_fresh: Optional[bool] = None,
 ) -> DifferenceBound:
     """Certified per-output bound on ``|orig(x) - simplified(x)|`` for ``x`` in the input box.
 
@@ -914,6 +1071,17 @@ def bound_difference(
     outputs subtracted, so everything the two share cancels. An unbounded or unsupported
     situation yields ``inf`` for the affected outputs and a note -- never a NaN or a bound that
     is too small. Inputs and outputs must have the same names in both models.
+
+    ``box_inputs`` / ``box_fresh`` switch on the cheaper *box part* (module docstring):
+
+    * ``box_inputs``: graph inputs (names or ``fnmatch`` patterns) carried as per-element radii
+      rather than dense symbols. Use for noise that only ONE model reads (quantizer rounding
+      noise): a box that both models contain does not cancel in the difference, so a real
+      input read by both should NOT be listed (sound, but you lose the cancellation).
+    * ``box_fresh`` (default ``bool(box_inputs)``): applies to the SECOND model only -- its
+      relaxation errors and fallbacks go into the box part. The first model's fresh symbols
+      stay dense on purpose: the second model's values are built from them
+      (``out_b = out_a - ...``), and the difference cancels them only if they are tracked.
     """
     in_a = {i.name for i in orig.graph.input} - {t.name for t in orig.graph.initializer}
     in_b = {i.name for i in simplified.graph.input} - {
@@ -927,7 +1095,7 @@ def bound_difference(
     space = _Space()
     notes: List[str] = []
     try:
-        inputs = _input_zonotopes([orig, simplified], input_ranges, space)
+        inputs = _input_zonotopes([orig, simplified], input_ranges, space, box_inputs)
     except ValueError as e:
         return DifferenceBound(
             {o: np.array(np.inf) for o in out_a},
@@ -937,7 +1105,13 @@ def bound_difference(
     log: List[Tuple[str, Zonotope, Zonotope]] = []
     ev_a = _Evaluator(orig, space, max_symbols, record=log)
     va = ev_a.run(inputs)
-    ev_b = _Evaluator(simplified, space, max_symbols, pair=log)
+    ev_b = _Evaluator(
+        simplified,
+        space,
+        max_symbols,
+        pair=log,
+        box_fresh=bool(box_inputs) if box_fresh is None else box_fresh,
+    )
     vb = ev_b.run(inputs)
     notes += [f"orig: {n}" for n in ev_a.notes] + [
         f"simplified: {n}" for n in ev_b.notes
@@ -958,7 +1132,12 @@ def bound_difference(
         max_abs[o] = np.maximum(np.abs(lo), np.abs(hi))
         blo, bhi = zb.bounds()
         ref_min[o] = np.maximum(0.0, np.maximum(blo, -bhi))
-    return DifferenceBound(max_abs, ref_min, notes)
+    return DifferenceBound(
+        max_abs,
+        ref_min,
+        notes,
+        {"orig": dict(ev_a.stats), "simplified": dict(ev_b.stats)},
+    )
 
 
 def proves_equal(
@@ -968,12 +1147,14 @@ def proves_equal(
     atol: float = 1e-5,
     rtol: float = 1e-4,
     max_symbols: int = DEFAULT_MAX_SYMBOLS,
+    box_inputs: Optional[Sequence[str]] = None,
+    box_fresh: Optional[bool] = None,
 ) -> bool:
     """True only if ``|orig - simplified| <= atol + rtol*|simplified|`` is *proved* over the box.
 
     See :meth:`DifferenceBound.within` for exactly what is checked. ``False`` means "not proved",
     not "different".
     """
-    return bound_difference(orig, simplified, input_ranges, max_symbols).within(
-        atol, rtol
-    )
+    return bound_difference(
+        orig, simplified, input_ranges, max_symbols, box_inputs, box_fresh
+    ).within(atol, rtol)
