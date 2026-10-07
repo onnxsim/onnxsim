@@ -183,8 +183,109 @@ magnitude below the roundoff terms, so the certified `atol` is unaffected at the
 For comparison, the default `check_atol=1e-5` is *below* that certified absolute value. The default
 check also has `check_rtol=1e-4`, which covers it wherever the output is not close to zero, so the
 exposure is outputs near zero; this module gives the absolute figure that is actually certified
-instead of a constant. Wiring `tolerance_for` into `certify()` / `simplify(check_atol=...)` is a
-follow-up; `certify.py` is not changed by this module.
+instead of a constant. `certify(..., atol="certified")` uses it, see the next section; wiring it into
+`simplify(check_atol=...)` is still a follow-up.
+
+### From `certify`: `atol="certified"`
+
+`certify()` proves closeness in *real* arithmetic against `atol=1e-5, rtol=1e-4`. With
+`atol="certified"` that proof runs as before and each proved output also gets the certified fp32
+tolerance `X = t + roundoff(orig) + roundoff(simplified)`, where `t` is the real-arithmetic part
+(the smaller of the zonotope bound and what the proof itself established: `0` for a structural proof,
+`atol + rtol * max|simplified|` for an SMT or shrink proof; a congruence proof is *not* used, because
+it propagates an input gap through an op whose gain may exceed 1). The verdict is `proved-fp32`; the
+real-arithmetic verdicts stay in `report.real_outputs`. This example was run (the printed digits can
+differ slightly on other platforms):
+
+```python
+import numpy as np
+from onnx import numpy_helper, parser
+
+import onnxsim
+from onnxsim import certify
+
+rng = np.random.default_rng(0)
+k = 4
+model = parser.parse_model(
+    """<ir_version: 8, opset_import: ["" : 13]>
+    m (float[1,3,6,6] x) => (float[1,4,4,4] y) {
+      c = Conv(x, W, B)
+      b = BatchNormalization<epsilon=1e-5>(c, g, be, mu, var)
+      y = Relu(b)
+    }"""
+)
+weights = dict(
+    W=rng.standard_normal((k, 3, 3, 3)),
+    B=rng.standard_normal(k),
+    g=rng.uniform(0.5, 1.5, k),
+    be=rng.standard_normal(k),
+    mu=rng.standard_normal(k),
+    var=rng.uniform(0.5, 2, k),
+)
+model.graph.initializer.extend(
+    numpy_helper.from_array(v.astype(np.float32), n) for n, v in weights.items()
+)
+simplified, _ = onnxsim.simplify(model, certify=False)
+
+box = {"x": (-1.0, 1.0)}
+default = certify.certify(model, simplified, input_ranges=box)
+print("default   :", default.outputs, "(real arithmetic, atol=1e-5, rtol=1e-4)")
+
+report = certify.certify(model, simplified, input_ranges=box, atol="certified")
+t = report.tolerance
+print("certified :", report.outputs, "| real arithmetic was:", report.real_outputs)
+print(f"  fp32 tolerance X   = {t.atol['y']:.2e}")
+print(f"    real part        = {t.real_bound['y']:.2e}")
+print(f"    roundoff (orig)  = {t.roundoff_orig['y']:.2e}")
+print(f"    roundoff (simpl) = {t.roundoff_simplified['y']:.2e}")
+print("  within 1e-5?", report.within(1e-5), "| within 1e-3?", report.within(1e-3))
+
+print("no range  :", certify.certify(model, model, atol="certified").outputs)
+```
+
+```
+default   : {'y': 'proved-congruence'} (real arithmetic, atol=1e-5, rtol=1e-4)
+certified : {'y': 'proved-fp32'} | real arithmetic was: {'y': 'proved-congruence'}
+  fp32 tolerance X   = 1.68e-04
+    real part        = 1.34e-06
+    roundoff (orig)  = 9.71e-05
+    roundoff (simpl) = 7.00e-05
+  within 1e-5? False | within 1e-3? True
+no range  : {'y': 'skipped'}
+```
+
+What to read from it:
+
+* "Proved at 1e-5" and "proved equal within 1.7e-4 on fp32" are different statements; the second is the
+  one about what actually runs. Here X is about 17x the default threshold, and nearly all of it is the
+  roundoff terms (the folded constants differ by ~1e-6).
+* An output with **no finite tolerance is `skipped`, never proved**: no input range (last line:
+  the models are identical, which *is* proved in real arithmetic, but the roundoff of an unbounded
+  input is unbounded), an op `fp_error` has no rule for (`Sin`, `Floor`, ...), a model too large for
+  the zonotope bound, or an exhausted time budget. The reason is in the report's windows.
+* A **skipped** output (the real-arithmetic proof at the default thresholds is missing) still gets its
+  certified tolerance in `report.tolerance`, with a `for information` window. That is a bound, not
+  an equality: a wrong rewrite also has a finite X, which is why the verdict stays `skipped` and
+  `report.within(...)` is `False` unless every output is proved.
+* It is opt-in and costs a zonotope bound plus two roundoff bounds, so the default-on check inside
+  `simplify()` is unchanged. `fp_error` is loose on deep nets (a 128-wide MLP is thousands of times the
+  observed error; the table below has the numbers), so read X as a safe bound, not an estimate.
+
+Measured with `onnxruntime` optimisations **disabled** (otherwise it fuses Conv+BN in the original too
+and both sessions run the same kernel, an observed difference of exactly 0), input box `[-1, 1]`:
+
+| case | default (real, 1e-5) | certified | X | observed executed difference |
+|---|---|---|---|---|
+| Conv+BN+Relu 6x6 | proved-congruence | proved-fp32 | 1.7e-4 | 3.8e-6 |
+| Conv+BN+Relu 8x8 | proved-congruence | proved-fp32 | 1.3e-4 | 3.8e-6 |
+| MatMul/Add/Relu/MatMul/Add 16-8-4 | proved-smt | proved-fp32 | 3.5e-4 | 0 |
+| MatMul/Add 128-64-4 | proved-smt | proved-fp32 | 1.2e-1 | 0 |
+| 2 x Conv+BN+Relu 8x8 | skipped | skipped (X 3.5e-3 .. 9.6e-3 over 5 weight draws) | n/a | 1.5e-5 |
+| 2 x Conv+BN+Relu 16x16 | skipped | skipped | n/a | 1.3e-5 |
+
+The two-layer conv stacks are the instructive rows: the observed fp32 difference (1.3e-5 to 1.5e-5)
+is already *above* the default 1e-5 threshold, so the real-arithmetic proof at that threshold is
+rightly unavailable (zonotope bound ~3e-5), and certified mode does not hide that.
 
 ## Why two passes (`tight=True`)
 
