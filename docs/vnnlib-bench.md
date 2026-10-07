@@ -75,7 +75,7 @@ Checks:
 | acasxu | ibp, zonotope, crown, alpha, prima, bab | 186 | 0 | 0 | 0 | 0 |
 | mnistfc | ibp, zonotope, crown, alpha, bab | 90 | 0 | 0 | 0 | 0 |
 | eran | ibp, zonotope, crown, alpha, bab | 72 | 0 | 0 | 0 | 0 |
-| oval21 | ibp, zonotope, crown, alpha, bab (16 of 30 finished) | 30 | 0 | 0 | 0 | 0 |
+| oval21 | ibp, zonotope, crown, alpha, bab | 30 | 0 | 0 | 0 | 0 |
 
 The attack pass found replayed counterexamples on 66 instances in total, so check 1 had material
 to bite on. **Total hard soundness violations: 0.**
@@ -119,11 +119,10 @@ regions (acasxu / mnistfc / eran / oval21).
 | oval21 | zonotope | 30 | 0 | 0 | 30 | 17 | 0 | 0 | 0 | 34.68 | 65.5 |
 | oval21 | crown | 30 | 1 | 0 | 29 | 17 | 1 | 0 | 0 | 18.54 | 29.8 |
 | oval21 | alpha | 30 | 1 | 0 | 29 | 17 | 1 | 0 | 0 | 32.44 | 70.0 |
-| oval21 | bab | 16 (of 30) | 1 | 0 | 15 | 11 | 1 | 0 | 0 | 54.05 | 121.6 |
+| oval21 | bab | 30 | 2 | 0 | 28 | 17 | 2 | 0 | 0 | 66.85 | 124.7 |
 | oval21 | attack | 30 | 0 | 1 | 29 | 17 | 0 | 0 | 0 | 19.59 | 25.9 |
 
-(Numbers are from `results/summary_interim.txt`; the oval21 `bab` run had not finished when the
-table was taken, so only 16 instances are counted.)
+(Numbers are from the final summary over all result files.)
 
 Honest reading:
 
