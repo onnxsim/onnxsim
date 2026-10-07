@@ -207,9 +207,10 @@ broadcasting elementwise ops. The result is intersected with the dims ONNX shape
   `mem_access` and `memory_footprint` (three shapes).
 * **The verifier and the aliasing rule**: a hand-made plan that overlaps live tensors, a slot that is too
   small, a slot outside the arena, and the broadcasting-`Add` aliasing above are all rejected.
-* **Mutation check:** six deliberately unsound changes (an upper bound one too small in the shape rules,
+* **Mutation check:** seven deliberately unsound changes (an upper bound one too small in the shape rules,
   in the byte count, MACs of a convolution halved, scalars counted as free, binary-op aliasing always
-  allowed, the plan verifier switched off) each make the suite fail.
+  allowed, the plan verifier switched off, the stale declared shapes of a static export trusted after an
+  override) each make the suite fail.
 
 `scripts/shape_cost_validation.py` repeats the whole-model checks over more samples and prints how loose
 the bounds are -- **certified upper bound / actual**, at the upper corner of the ranges (where a tight
