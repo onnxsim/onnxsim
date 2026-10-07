@@ -56,6 +56,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
+from . import backward_diff as _backward_diff
 from . import interval as _interval
 from . import ranges as _ranges
 from . import zonotope as _zonotope
@@ -935,6 +936,7 @@ def verify(
     max_iter: int = 8,
     breakdown: bool = True,
     max_sites_for_breakdown: int = 24,
+    engine: str = "zonotope",
 ) -> QuantVerifyReport:
     """Certified per-output bound on ``|float_model(x) - quantized_model(x)|`` for ``x`` in a box.
 
@@ -950,8 +952,15 @@ def verify(
         (looser, kept for comparison).
     :param breakdown: also compute each site's stand-alone contribution (one extra analysis per
         site, skipped above ``max_sites_for_breakdown`` sites).
+    :param engine: ``"zonotope"`` (default) carries a dense symbol array through every layer: tight,
+        but time and memory grow with the square of the image area (110 s and 7 GB for a 3-layer
+        conv net at 32x32). ``"backward"`` bounds the *difference* of the two graphs with a backward
+        CROWN pass (:mod:`onnxsim.backward_diff`): cost ~ outputs x graph, so it suits models with
+        few outputs; it is somewhat looser where correlation across layers matters. Both are sound.
     """
     del atol  # accepted for API symmetry; use QuantVerifyReport.within(atol)
+    if engine not in ("zonotope", "backward"):
+        raise ValueError(f"engine must be 'zonotope' or 'backward', got {engine!r}")
     real_inputs = _model_inputs(float_model)
     if set(real_inputs) != set(_model_inputs(quantized_model)):
         raise ValueError(
@@ -1078,6 +1087,8 @@ def verify(
             )
         else:
             rng.update(_noise_ranges(sites, active))
+        if engine == "backward":
+            return _backward_diff.bound_difference(ref, converted, rng)
         return _zonotope.bound_difference(ref, converted, rng)
 
     total = bound(None)
