@@ -21,6 +21,19 @@ from onnxsim import quant_int_verify as Q
 
 INT32_MAX = Q.INT32_MAX
 
+# Some CPUs' onnxruntime u8 x s8 kernels sum adjacent products in saturating int16 (AVX2
+# vpmaddubsw without VNNI). On such a host onnxruntime is NOT an oracle for exact int32
+# arithmetic: CI's runner returned 1086422270 for the K=66311 extreme case where exact
+# two's-complement arithmetic gives 2147481735 (about half: 33155 pair sums saturated at
+# 32767). The verifier models exact int32 semantics and flags the hazard via
+# probe_u8s8_saturation(), so the tests that compare it with onnxruntime's output must not
+# run there; they still run on every host whose kernel is exact.
+requires_exact_u8s8 = pytest.mark.skipif(
+    Q.probe_u8s8_saturation() is True,
+    reason="this host's onnxruntime u8xs8 kernel saturates int16 pair sums, so it is not an "
+    "oracle for exact int32 arithmetic (see quant_int_verify.probe_u8s8_saturation)",
+)
+
 
 def _model(body, initializer=None, opset=13, ir_version=8):
     model = parser.parse_model(
@@ -155,6 +168,7 @@ def test_dynamic_rel_error_bound_dominates_sampled_error():
 # ---- no-wrap: the headline result ---------------------------------------------
 
 
+@requires_exact_u8s8
 def test_no_wrap_boundary_is_exact_and_counterexample_replays_on_onnxruntime():
     k_safe = INT32_MAX // (
         255 * 127
@@ -697,6 +711,7 @@ def _qlinear_conv(cin, cout, k, wq, bias, sa, sb, sy, za, zy, x_hw):
     )
 
 
+@requires_exact_u8s8
 def test_qlinear_conv_with_int32_bias_matches_the_fp32_pipeline_at_the_extremes():
     rng = np.random.default_rng(7)
     cin, cout, k = 2, 3, 3
@@ -728,6 +743,7 @@ def test_qlinear_conv_with_int32_bias_matches_the_fp32_pipeline_at_the_extremes(
             assert got == Q.fp32_requant(exact, m32, zy, 0, 255)
 
 
+@requires_exact_u8s8
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_requant_emulation_is_bit_exact_against_onnxruntime_with_per_channel_scales(
     seed,
