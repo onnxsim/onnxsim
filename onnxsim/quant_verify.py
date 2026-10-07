@@ -937,6 +937,8 @@ def verify(
     breakdown: bool = True,
     max_sites_for_breakdown: int = 24,
     engine: str = "zonotope",
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> QuantVerifyReport:
     """Certified per-output bound on ``|float_model(x) - quantized_model(x)|`` for ``x`` in a box.
 
@@ -957,10 +959,23 @@ def verify(
         conv net at 32x32). ``"backward"`` bounds the *difference* of the two graphs with a backward
         CROWN pass (:mod:`onnxsim.backward_diff`): cost ~ outputs x graph, so it suits models with
         few outputs; it is somewhat looser where correlation across layers matters. Both are sound.
+    :param device: ``None`` / ``"cpu"`` (default), ``"cuda"`` / ``"cuda:N"``, ``"torch-cpu"`` or
+        ``"auto"``: where the ``"backward"`` engine's CROWN pass runs (:mod:`onnxsim._device`).
+        Only the backward engine has a device backend; ``engine="zonotope"`` raises for anything
+        but the default.
+    :param precision: ``"float64"`` (default) or ``"float32"`` (sound, error-tracked; needs a
+        torch device). Backward engine only.
     """
     del atol  # accepted for API symmetry; use QuantVerifyReport.within(atol)
     if engine not in ("zonotope", "backward"):
         raise ValueError(f"engine must be 'zonotope' or 'backward', got {engine!r}")
+    if engine == "zonotope" and (
+        device not in (None, "cpu") or precision not in (None, "float64")
+    ):
+        raise ValueError(
+            "device= / precision= apply to engine='backward' only; the zonotope engine "
+            "runs on the CPU in float64"
+        )
     real_inputs = _model_inputs(float_model)
     if set(real_inputs) != set(_model_inputs(quantized_model)):
         raise ValueError(
@@ -1088,7 +1103,9 @@ def verify(
         else:
             rng.update(_noise_ranges(sites, active))
         if engine == "backward":
-            return _backward_diff.bound_difference(ref, converted, rng)
+            return _backward_diff.bound_difference(
+                ref, converted, rng, device=device, precision=precision
+            )
         return _zonotope.bound_difference(ref, converted, rng)
 
     total = bound(None)

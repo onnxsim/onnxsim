@@ -896,6 +896,8 @@ def bound_difference(
     method: str = "crown",
     refine: Union[bool, str] = False,
     max_refine_elements: int = 4096,
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> DifferenceBound:
     """Certified per-output bound on ``|orig(x) - converted(x)|`` by backward propagation.
 
@@ -912,6 +914,12 @@ def bound_difference(
         ``max_refine_elements``). Default off because it bought almost nothing here: on 3-, 5- and
         8-layer conv classifiers it changed the certified bound by under 1.1% (5.703 vs 5.761,
         239.3 vs 240.6, 3.643e4 vs 3.645e4) and cost 50-80x the time (4.4 s vs 0.08 s, 28.6 s vs 0.37 s).
+    :param device: where the backward CROWN pass runs: ``None`` / ``"cpu"`` (numpy float64, the
+        default), ``"cuda"`` / ``"cuda:N"`` (a torch accelerator, CUDA or ROCm), ``"torch-cpu"`` or
+        ``"auto"``. See :mod:`onnxsim._device`; a requested device that is missing raises.
+    :param precision: ``"float64"`` (default) or ``"float32"``. float32 is sound (the rounding error
+        of the pass is tracked and added to the bound, :mod:`onnxsim._rigorous_f32`) and a few
+        percent looser at most on the nets measured in ``docs/gpu-backend.md``.
     """
     in_a = set(_real_inputs(orig))
     names = [o.name for o in orig.graph.output]
@@ -1009,6 +1017,8 @@ def bound_difference(
             output=[c.name for c in chains],
             method=method,
             refine=do_refine,
+            device=device,
+            precision=precision,
         )
         for o, ch in zip(aligned, chains):
             tb = res[ch.name]
