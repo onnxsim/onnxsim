@@ -1688,6 +1688,7 @@ def quantize_qoperator(
     seed: int = 0,
     providers: Optional[Sequence[str]] = None,
     method: str = "minmax",
+    verify: bool = False,
 ) -> onnx.ModelProto:
     """
     Statically (calibration-based) quantize every MatMul and every "vanilla"
@@ -1725,6 +1726,14 @@ def quantize_qoperator(
             (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
             error calibration); see that function for the tradeoffs and
             their extra data requirement.
+    :param verify: opt-in (default ``False``): afterwards run
+            :func:`onnxsim.quant_int_verify.attach_verification` on the result -- prove each
+            ``QLinearMatMul`` cannot wrap its int32 accumulator, check the integer weights against
+            ``model``'s, and note whether the model would give different results on a CPU whose
+            ``u8 x s8`` kernel saturates int16 pair sums. The return value is unchanged; a one-line
+            summary is written to the result's ``metadata_props["onnxsim.quant_int_verify"]``, a
+            ``RuntimeWarning`` is emitted when a soundness finding is refuted, and the check never
+            raises.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -1742,7 +1751,12 @@ def quantize_qoperator(
         method=method,
         extra_tensor_names=extra_names,
     )
-    return onnx.load_from_string(C.quantize_qoperator(model_bytes, ranges))
+    out = onnx.load_from_string(C.quantize_qoperator(model_bytes, ranges))
+    if verify:
+        from . import quant_int_verify as _quant_int_verify
+
+        _quant_int_verify.attach_verification(out, reference_model=model)
+    return out
 
 
 def quantize_qoperator_elementwise(

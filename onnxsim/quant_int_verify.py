@@ -952,11 +952,27 @@ def _z3_cross_check(
     ]
 
 
-def _requant_findings(layer: _Layer, z3_max_k: int, timeout_ms: int) -> List[Finding]:
+def _requant_findings(
+    layer: _Layer,
+    z3_max_k: int,
+    timeout_ms: int,
+    ranges: Optional[Tuple[List[int], List[int]]] = None,
+    reach_exact: bool = True,
+) -> List[Finding]:
+    """Requantisation findings.
+
+    ``ranges`` overrides the per-channel accumulator ``(mins, maxs)`` (the saturating-kernel model
+    supplies its own, narrower ones). ``reach_exact=False`` says the accumulators are not plain
+    dot products, so the reachability search (which assumes they are) must not run: the tie
+    candidates are then reported as undecided rather than refuted.
+    """
     rq = layer.requant
     assert rq is not None
     qmin, qmax = _INT_RANGES[rq["ydtype"]]
-    mins, maxs, _, _ = _channel_ranges(layer)
+    if ranges is not None:
+        mins, maxs = ranges
+    else:
+        mins, maxs, _, _ = _channel_ranges(layer)
     out: List[Finding] = []
     worst_abs = max(max(abs(v) for v in mins), max(abs(v) for v in maxs))
     out.append(
@@ -994,8 +1010,9 @@ def _requant_findings(layer: _Layer, z3_max_k: int, timeout_ms: int) -> List[Fin
     checked = 0
     orders: Dict[int, np.ndarray] = {}
     for c, acc in candidates:
-        if layer.is_conv:
-            # Reaching one specific accumulator through a convolution's tap structure is not decided here.
+        if layer.is_conv or not reach_exact:
+            # Reaching one specific accumulator through a convolution's tap structure is not decided
+            # here, nor through a kernel whose accumulator is not a plain dot product.
             undecided += 1
             continue
         if checked >= _MAX_REACH_CHECKS:
@@ -1098,6 +1115,7 @@ def verify_layer(
     x_shape: Optional[Tuple[int, ...]] = None,
     z3_max_k: int = 24,
     timeout_ms: int = 10_000,
+    semantics: str = "exact",
 ) -> LayerReport:
     """Verify one integer layer (``MatMulInteger`` / ``ConvInteger`` / ``QLinearMatMul`` / ``QLinearConv``).
 
@@ -1107,7 +1125,12 @@ def verify_layer(
     :param act_dtype: ``onnx.TensorProto`` dtype of the activation when it cannot be read off a zero point.
     :param x_shape: activation shape, used for convolution padding geometry.
     :param z3_max_k: re-prove the no-wrap claim with Z3 bit-vectors when a channel has at most this many taps.
+    :param semantics: ``"exact"`` (default): the accumulator is the exact integer dot product, wrapped to
+        int32. ``"u8s8_pair_saturating"``: the kernel is an AVX2 ``u8 x s8`` one that sums adjacent products
+        in saturating int16 (see :func:`u8s8_pair_saturating_matmul`); layers that model does not cover are
+        reported ``skipped`` with the reason.
     """
+    _check_semantics(semantics)
     types = {node.input[0]: act_dtype} if act_dtype is not None and node.input else {}
     shapes = (
         {node.input[0]: tuple(x_shape)} if x_shape is not None and node.input else {}
@@ -1120,6 +1143,13 @@ def verify_layer(
         )
         return rep
     rep.name = layer.name
+    if semantics == U8S8_PAIR_SATURATING:
+        rep.findings += _saturating_layer_findings(
+            layer, node, consts, z3_max_k, timeout_ms
+        )
+        for n in layer.notes:
+            rep.findings.append(Finding("note", INFORMATIONAL, PROVED, n))
+        return rep
     rep.findings += _no_wrap_findings(layer, z3_max_k, timeout_ms)
     if layer.requant is not None:
         rep.findings += _requant_findings(layer, z3_max_k, timeout_ms)
@@ -1335,6 +1365,496 @@ def probe_u8s8_saturation() -> Optional[bool]:
     return int(got[0, 0]) != k * 255 * 127
 
 
+# --------------------------------------------------------------------------
+# u8 x s8 kernels that sum adjacent products in saturating int16
+# --------------------------------------------------------------------------
+#
+# The model ("u8s8_pair_saturating"), stated precisely. For a uint8 activation row ``a`` (RAW codes, the
+# zero point is NOT subtracted first) and an int8 weight column ``w`` of K taps:
+#
+#   1. the K taps are paired along K as (0,1), (2,3), ...; an odd K pairs the last tap with an implicit 0;
+#   2. each pair contributes ``sat16(a[2j]*w[2j] + a[2j+1]*w[2j+1])`` with ``sat16`` clamping to
+#      [-32768, 32767] (an AVX2 ``vpmaddubsw``: unsigned bytes of the first operand times signed bytes of
+#      the second, adjacent products added in SATURATING int16);
+#   3. the pair values are summed in int32 (two's-complement wrap; the next instruction,
+#      ``vpmaddwd`` against ones, cannot saturate);
+#   4. the activation zero point is an exact int32 correction: ``acc = S - za * sum_k w[k]``.
+#
+# Convolution (QLinearConv) lays the taps out as (kh, kw, channel), channel fastest, and pads with the raw
+# zero point -- the order a channels-last / indirection-buffer kernel packs them.
+#
+# What backs this (recorded from the GitHub Actions run of PR #2094's merge on a runner CPU without VNNI,
+# where the exact-arithmetic tests failed; reproduced exactly by this model, see tests):
+#   * MatMulInteger, K=66311 and K=66312, a=255, w=127, za=0: onnxruntime returned 1086422270 and
+#     1086422652 (33155 and 33156 saturated pairs; exact arithmetic gives 2147481735 / 2147514120).
+#   * QLinearMatMul, K=96, za=110, per-channel scales, random full-range uint8 x int8: the number of
+#     outputs (of 1600) that differ from the exact-arithmetic pipeline was 1222, 1221, 880 for seeds
+#     0, 1, 2; the model predicts exactly those counts.
+#   * QLinearConv, no padding, cin=2: one recorded output (161 where the exact pipeline gives 164).
+#     K orders (c,kh,kw) and (c,kw,kh) give 164 and 160 and are excluded; (kh,kw,c) gives 161.
+#   * ConvInteger is NOT covered, on evidence: two exact-arithmetic tests on ConvInteger PASSED on that same
+#     runner -- test_conv_below_the_boundary_is_proved_and_matches_exact_arithmetic (random full-range
+#     uint8 input, int8 weights of 100, za=17: pair sums certainly saturate if the model applied) and
+#     test_conv_overflow_is_refuted_and_replays_on_onnxruntime (extreme inputs) -- so ConvInteger did
+#     not follow this model there (QLinearConv did). Layers of that op report ``skipped``; verify them
+#     with semantics="exact".
+# Not validated, and therefore not claimed: operand swaps and other dtype pairs (see below), padded or
+# grouped convolutions, a non-zero weight zero point, CPUs other than that one runner.
+#
+# Why operand order does not enter the model: sat16(a0*w0 + a1*w1) is symmetric in the two operands'
+# raw codes, so which tensor a runtime calls "first" cannot change the pair sum for the same codes. What
+# DOES matter is the dtype pair: u8 x s8 saturates; this module makes no claim about s8 x s8 (which an
+# AVX2 kernel may implement through an offset of the activation, changing the raw codes) or u8 x u8
+# (which does not use this instruction), and reports such layers ``skipped``.
+
+EXACT = "exact"
+U8S8_PAIR_SATURATING = "u8s8_pair_saturating"
+SEMANTICS = (EXACT, U8S8_PAIR_SATURATING)
+_I16_MIN, _I16_MAX = -(2**15), 2**15 - 1
+
+
+def _check_semantics(semantics: str) -> str:
+    if semantics not in SEMANTICS:
+        raise ValueError(
+            f"unknown semantics {semantics!r}; expected one of {SEMANTICS}"
+        )
+    return semantics
+
+
+def wrap_int32(v: Any) -> np.ndarray:
+    """Two's-complement int32 wrap of an integer (or integer array), as an int64 array."""
+    return (np.asarray(v, dtype=np.int64) - INT32_MIN) % (2**32) + INT32_MIN
+
+
+def _pair_saturating_dot(a: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """``(M, K) x (K, N) -> (M, N)``: sum of saturated adjacent-pair sums of the raw products (int64)."""
+    a = np.asarray(a, dtype=np.int64)
+    w = np.asarray(w, dtype=np.int64)
+    if a.ndim != 2 or w.ndim != 2 or a.shape[1] != w.shape[0]:
+        raise ValueError(f"expected (M,K) x (K,N), got {a.shape} x {w.shape}")
+    if a.shape[1] % 2:
+        a = np.concatenate([a, np.zeros((a.shape[0], 1), np.int64)], axis=1)
+        w = np.concatenate([w, np.zeros((1, w.shape[1]), np.int64)], axis=0)
+    out = np.zeros((a.shape[0], w.shape[1]), dtype=np.int64)
+    pairs = a.shape[1] // 2
+    step = max(1, (1 << 21) // max(1, a.shape[0] * w.shape[1]))
+    for j in range(0, pairs, step):
+        sl = slice(2 * j, 2 * min(pairs, j + step))
+        aa, ww = a[:, sl], w[sl]
+        p = (
+            aa[:, 0::2, None] * ww[None, 0::2, :]
+            + aa[:, 1::2, None] * ww[None, 1::2, :]
+        )
+        out += np.clip(p, _I16_MIN, _I16_MAX).sum(axis=1)
+    return out
+
+
+def u8s8_pair_saturating_matmul(
+    a_raw: np.ndarray, w: np.ndarray, a_zp: int = 0
+) -> np.ndarray:
+    """Model of ``MatMulInteger`` on an AVX2 u8 x s8 kernel that saturates int16 pair sums.
+
+    ``a_raw``: ``(M, K)`` uint8 activation codes (raw -- the zero point is *not* subtracted);
+    ``w``: ``(K, N)`` int8 weights; ``a_zp``: activation zero point. Returns the int32 accumulator
+    *before* the two's-complement wrap, as int64 (apply :func:`wrap_int32` for what the kernel stores);
+    see the section comment above for the exact definition and the evidence behind it.
+    """
+    w = np.asarray(w, dtype=np.int64)
+    return _pair_saturating_dot(a_raw, w) - int(a_zp) * w.sum(axis=0)[None, :]
+
+
+def u8s8_pair_saturating_conv(
+    x_raw: np.ndarray,
+    w: np.ndarray,
+    a_zp: int = 0,
+    strides: Sequence[int] = (1, 1),
+    dilations: Sequence[int] = (1, 1),
+    pads: Sequence[int] = (0, 0, 0, 0),
+    group: int = 1,
+) -> np.ndarray:
+    """Model of ``QLinearConv`` / ``ConvInteger``'s accumulator on the same kernel (before the wrap).
+
+    ``x_raw``: ``(N, C, H, W)`` uint8 codes; ``w``: ``(M, C, kh, kw)`` int8. Taps are paired in
+    ``(kh, kw, channel)`` order and padding uses the raw zero point. Only ``group == 1`` is modelled;
+    only the unpadded, unit-stride, unit-dilation case has recorded-hardware evidence.
+    """
+    if group != 1:
+        raise ValueError("the saturating convolution model handles group == 1 only")
+    x = np.asarray(x_raw, dtype=np.int64)
+    w = np.asarray(w, dtype=np.int64)
+    n, c, h, wd = x.shape
+    m, cw, kh, kw = w.shape
+    if cw != c:
+        raise ValueError(f"channel mismatch: {c} vs {cw}")
+    xp = np.pad(
+        x,
+        ((0, 0), (0, 0), (pads[0], pads[2]), (pads[1], pads[3])),
+        constant_values=int(a_zp),
+    )
+    eh, ew = dilations[0] * (kh - 1) + 1, dilations[1] * (kw - 1) + 1
+    win = np.lib.stride_tricks.sliding_window_view(xp, (eh, ew), axis=(2, 3))
+    win = win[:, :, :: strides[0], :: strides[1], :: dilations[0], :: dilations[1]]
+    oh, ow = win.shape[2], win.shape[3]
+    # (N, C, oh, ow, kh, kw) -> (N*oh*ow, kh*kw*C): taps (kh, kw, channel), channel fastest
+    cols = win.transpose(0, 2, 3, 4, 5, 1).reshape(n * oh * ow, kh * kw * c)
+    wmat = w.transpose(2, 3, 1, 0).reshape(kh * kw * c, m)
+    acc = _pair_saturating_dot(cols, wmat) - int(a_zp) * wmat.sum(axis=0)[None, :]
+    return acc.reshape(n, oh, ow, m).transpose(0, 3, 1, 2)
+
+
+def saturating_accumulator_range(
+    w_taps: np.ndarray, a_lo: int, a_hi: int, a_zp: int = 0, bias: int = 0
+) -> Tuple[int, int]:
+    """Exact ``(min, max)`` of the saturating accumulator of one channel over raw codes in ``[a_lo, a_hi]``.
+
+    ``w_taps`` are the int8 weights in the kernel's tap order. Pairs read disjoint activations, so each
+    pair attains its own extreme independently and ``sat16`` is monotone: the extremes are
+    ``sum_j sat16(pair_max_j) - za*sum(w) + bias`` and the analogue for the minimum.
+    """
+    w = np.asarray(w_taps, dtype=np.int64).reshape(-1)
+    if w.size % 2:
+        w = np.append(w, 0)
+    t_lo = np.minimum(w * a_lo, w * a_hi)
+    t_hi = np.maximum(w * a_lo, w * a_hi)
+    pmax = int(np.clip(t_hi[0::2] + t_hi[1::2], _I16_MIN, _I16_MAX).sum())
+    pmin = int(np.clip(t_lo[0::2] + t_lo[1::2], _I16_MIN, _I16_MAX).sum())
+    corr = int(a_zp) * int(w.sum())
+    return bias + pmin - corr, bias + pmax - corr
+
+
+def _vertex_raw(w_taps: np.ndarray, a_lo: int, a_hi: int, maximise: bool) -> np.ndarray:
+    """Raw codes at the box vertex that attains the max (or min) of every pair at once."""
+    w = np.asarray(w_taps, dtype=np.int64).reshape(-1)
+    hi_if_pos, lo_if_pos = (a_hi, a_lo) if maximise else (a_lo, a_hi)
+    return np.where(w >= 0, hi_if_pos, lo_if_pos).astype(np.int64)
+
+
+def saturating_pair_hazards(
+    w_taps: np.ndarray, a_lo: int, a_hi: int
+) -> Tuple[int, int]:
+    """``(pairs that can saturate high, pairs that can saturate low)`` for raw codes in ``[a_lo, a_hi]``."""
+    w = np.asarray(w_taps, dtype=np.int64).reshape(-1)
+    if w.size % 2:
+        w = np.append(w, 0)
+    t_lo = np.minimum(w * a_lo, w * a_hi)
+    t_hi = np.maximum(w * a_lo, w * a_hi)
+    return (
+        int(((t_hi[0::2] + t_hi[1::2]) > _I16_MAX).sum()),
+        int(((t_lo[0::2] + t_lo[1::2]) < _I16_MIN).sum()),
+    )
+
+
+def host_semantics() -> str:
+    """The accumulator semantics onnxruntime follows on THIS machine for u8 x s8 integer matmuls.
+
+    ``"u8s8_pair_saturating"`` if :func:`probe_u8s8_saturation` sees a deviation from exact int32
+    arithmetic, else ``"exact"`` (also when onnxruntime is not installed). A property of one
+    runtime build on one CPU.
+    """
+    return U8S8_PAIR_SATURATING if probe_u8s8_saturation() is True else EXACT
+
+
+def validate_saturating_model_on_host(
+    seed: int = 0, cases: int = 24
+) -> Tuple[Optional[bool], str]:
+    """Check the saturating model against onnxruntime on THIS machine.
+
+    Returns ``(True, ...)`` if every case (random full-range ``u8 x s8`` matmuls of odd and even K,
+    with and without an activation zero point, plus the recorded K=66311/66312 extremes) matches
+    onnxruntime bit for bit; ``(False, ...)`` on the first disagreement; ``(None, ...)`` if this
+    machine's kernel does not saturate (so there is nothing to validate against) or onnxruntime is
+    missing. Tests use it to decide whether the model may serve as the oracle on this host.
+    """
+    sat = probe_u8s8_saturation()
+    if sat is None:
+        return None, "onnxruntime is not installed"
+    if not sat:
+        return (
+            None,
+            "this machine's u8 x s8 kernel is exact; nothing to validate the saturating model against",
+        )
+    import onnxruntime as ort
+
+    rng = np.random.default_rng(seed)
+
+    def run(a: np.ndarray, w: np.ndarray, za: int) -> np.ndarray:
+        g = onnx.helper.make_graph(
+            [onnx.helper.make_node("MatMulInteger", ["a", "w", "za"], ["y"])],
+            "v",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "a", onnx.TensorProto.UINT8, list(a.shape)
+                )
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.INT32, None)],
+            [
+                numpy_helper.from_array(w, "w"),
+                numpy_helper.from_array(np.array(za, np.uint8), "za"),
+            ],
+        )
+        m = onnx.helper.make_model(g, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        m.ir_version = 8
+        return ort.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]
+        ).run(None, {"a": a})[0]
+
+    probes = [
+        (np.full((1, k), 255, np.uint8), np.full((k, 1), 127, np.int8), 0)
+        for k in (66311, 66312)
+    ]
+    for _ in range(cases):
+        k = int(rng.integers(1, 200))
+        m_, n_ = int(rng.integers(1, 6)), int(rng.integers(1, 6))
+        probes.append(
+            (
+                rng.integers(0, 256, (m_, k), dtype=np.uint8),
+                rng.integers(-128, 128, (k, n_)).astype(np.int8),
+                int(rng.choice([0, 0, 110, 128])),
+            )
+        )
+    for i, (a, w, za) in enumerate(probes):
+        want = wrap_int32(u8s8_pair_saturating_matmul(a, w, za))
+        got = run(a, w, za).astype(np.int64)
+        if not np.array_equal(want, got):
+            return False, (
+                f"case {i} (K={a.shape[1]}, za={za}): onnxruntime {got.reshape(-1)[:3].tolist()} != "
+                f"model {want.reshape(-1)[:3].tolist()}"
+            )
+    return True, f"{len(probes)} cases match onnxruntime bit for bit"
+
+
+def _sat_ineligible(
+    layer: "_Layer", node: onnx.NodeProto, consts: Dict[str, np.ndarray]
+) -> Optional[str]:
+    """Why the saturating model does not cover this layer (None if it does)."""
+    if layer.op_type == "ConvInteger":
+        return (
+            "ConvInteger is not modelled: a ConvInteger test against exact arithmetic on random full-range "
+            "data passed on the saturating runner, i.e. its kernel did not follow this model there "
+            "(verify it with semantics='exact')"
+        )
+    if layer.a_dtype != onnx.TensorProto.UINT8:
+        return "the model covers uint8 activations only"
+    ins = list(node.input) + [""] * 9
+    w_name, wzp = (
+        (ins[3], ins[5]) if node.op_type.startswith("QLinear") else (ins[1], ins[3])
+    )
+    if consts[w_name].dtype != np.int8:
+        return "the model covers int8 weights only"
+    if wzp and (wzp not in consts or np.any(consts[wzp] != 0)):
+        return "a non-zero (or non-constant) weight zero point is not modelled"
+    if layer.is_conv:
+        if int(layer.conv_attrs.get("group", 1)) != 1:
+            return "grouped convolutions are not modelled"
+        if layer.geometry is not None and layer.geometry.padded:
+            return "padded convolutions are not modelled (padding takes the raw zero point; no recorded evidence)"
+    return None
+
+
+def _kernel_order_taps(layer: "_Layer", c: int) -> np.ndarray:
+    """Channel ``c``'s weights in the kernel's tap order."""
+    taps = layer.wq[c]
+    if not layer.is_conv:
+        return taps
+    _, cg, kh, kw = layer.wshape
+    return taps.reshape(cg, kh, kw).transpose(1, 2, 0).reshape(-1)  # (kh, kw, channel)
+
+
+def _taps_back_to_layer_order(layer: "_Layer", raw: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`_kernel_order_taps` for an activation vector."""
+    if not layer.is_conv:
+        return raw
+    _, cg, kh, kw = layer.wshape
+    return raw.reshape(kh, kw, cg).transpose(2, 0, 1).reshape(-1)
+
+
+def _saturating_layer_findings(
+    layer: "_Layer",
+    node: onnx.NodeProto,
+    consts: Dict[str, np.ndarray],
+    z3_max_k: int,
+    timeout_ms: int,
+) -> List[Finding]:
+    """Findings for one layer under the ``u8s8_pair_saturating`` semantics (see the section comment)."""
+    why = _sat_ineligible(layer, node, consts)
+    if why is not None:
+        return [
+            Finding(
+                "no-wrap",
+                SOUNDNESS,
+                SKIPPED,
+                f"the u8s8_pair_saturating model does not cover this layer: {why}",
+            )
+        ]
+    a_lo, a_hi = layer.d_lo + layer.za, layer.d_hi + layer.za
+    chans = layer.wq.shape[0]
+    mins: List[int] = []
+    maxs: List[int] = []
+    n_hi = n_lo = 0
+    worst_c, worst_pairs = 0, -1
+    for c in range(chans):
+        b = (
+            int(layer.bias[c])
+            if layer.bias.size > 1
+            else int(layer.bias.reshape(-1)[0])
+        )
+        taps = _kernel_order_taps(layer, c)
+        lo, hi = saturating_accumulator_range(taps, a_lo, a_hi, layer.za, b)
+        mins.append(lo)
+        maxs.append(hi)
+        h, l_ = saturating_pair_hazards(taps, a_lo, a_hi)
+        n_hi, n_lo = n_hi + h, n_lo + l_
+        if h + l_ > worst_pairs:
+            worst_c, worst_pairs = c, h + l_
+    pairs_total = chans * ((layer.wq.shape[1] + 1) // 2)
+
+    def counterexample(c: int, maximise: bool) -> Dict[str, np.ndarray]:
+        raw = _vertex_raw(_kernel_order_taps(layer, c), a_lo, a_hi, maximise)
+        if layer.is_conv:
+            d = _taps_back_to_layer_order(layer, raw) - layer.za
+            return _conv_counterexample(layer, d, c)
+        return {"a": raw.reshape(1, -1).astype(_NP_DTYPE[layer.a_dtype])}
+
+    out: List[Finding] = []
+    if n_hi + n_lo == 0:
+        out.append(
+            Finding(
+                "pair-saturation",
+                INFORMATIONAL,
+                PROVED,
+                f"no adjacent pair of products can leave the int16 range for any reachable input, so this "
+                f"layer's accumulator equals exact integer arithmetic on a saturating u8 x s8 kernel too "
+                f"({pairs_total} pairs checked)",
+                "closed form (exact)",
+            )
+        )
+    else:
+        out.append(
+            Finding(
+                "pair-saturation",
+                INFORMATIONAL,
+                REFUTED,
+                f"{n_hi} high and {n_lo} low of {pairs_total} adjacent pairs can saturate int16 for a "
+                f"reachable input (most in channel {worst_c}): on an AVX2 u8 x s8 kernel without VNNI this "
+                f"layer's accumulator differs from exact integer arithmetic, and so does its output",
+                "closed form (exact)",
+                counterexample=counterexample(worst_c, maximise=n_hi >= n_lo),
+            )
+        )
+    worst_hi, worst_lo = max(maxs), min(mins)
+    over, under = worst_hi > INT32_MAX, worst_lo < INT32_MIN
+    method = "closed form under the pair-saturating model (exact)"
+    if not over and not under:
+        out.append(
+            Finding(
+                "no-wrap",
+                SOUNDNESS,
+                PROVED,
+                f"every accumulator lies in [{worst_lo}, {worst_hi}] under pair-saturating arithmetic "
+                f"(int32 is [{INT32_MIN}, {INT32_MAX}]; {layer.wq.shape[1]} taps/channel, {chans} channels)",
+                method,
+            )
+        )
+    else:
+        direction, c, val = (
+            ("max", int(np.argmax(maxs)), worst_hi)
+            if over
+            else ("min", int(np.argmin(mins)), worst_lo)
+        )
+        wrapped = int(wrap_int32(val))
+        out.append(
+            Finding(
+                "no-wrap",
+                SOUNDNESS,
+                REFUTED,
+                f"channel {c} reaches an accumulator of {val} under pair-saturating arithmetic "
+                f"(> int32 {direction}); the kernel wraps it to {wrapped}",
+                method,
+                counterexample=counterexample(c, maximise=(direction == "max")),
+            )
+        )
+    if layer.requant is not None:
+        out += _requant_findings(
+            layer, z3_max_k, timeout_ms, ranges=(mins, maxs), reach_exact=False
+        )
+    out.append(
+        Finding(
+            "note",
+            INFORMATIONAL,
+            PROVED,
+            "u8s8_pair_saturating model: adjacent K-pairs of raw-code products saturate in int16, then "
+            "sum in int32; validated against recorded onnxruntime outputs from one runner CPU for "
+            "MatMulInteger / QLinearMatMul (any K, nonzero activation zero point) and one QLinearConv "
+            "output; not validated for padding, groups, other dtype pairs or other CPUs",
+        )
+    )
+    return out
+
+
+def attach_verification(
+    model: onnx.ModelProto,
+    reference_model: Optional[onnx.ModelProto] = None,
+    key: str = "onnxsim.quant_int_verify",
+    **kwargs: Any,
+) -> Optional[ModelReport]:
+    """Verify an integer model an onnxsim quantizer just emitted, record a summary, never raise.
+
+    This is what the ``verify=True`` option of :func:`onnxsim.quantize_dynamic` and
+    :func:`onnxsim.quantize_qoperator` calls. It runs :func:`verify_model` (exact semantics) and a
+    cheap closed-form :func:`verify_model` pass under the pair-saturating semantics (a hazard check:
+    does this model give different results on an AVX2 u8 x s8 CPU without VNNI?), writes a one-line
+    summary to ``model.metadata_props[key]``, and emits a ``warnings.warn`` when a soundness finding is
+    refuted. Returns the exact-semantics :class:`ModelReport`, or ``None`` if verification itself
+    failed (the failure is recorded in the summary instead of raised: a quantizer must not fail
+    because its optional check did).
+    """
+    import warnings
+
+    try:
+        report = verify_model(model, reference_model, **kwargs)
+        sat = verify_model(model, None, semantics=U8S8_PAIR_SATURATING, z3_max_k=0)
+        refuted = [
+            f"{layer.name}: {f.kind}"
+            for layer in report.layers
+            for f in layer.findings
+            if f.severity == SOUNDNESS and f.verdict == REFUTED
+        ]
+        skipped = sum(
+            1
+            for layer in report.layers
+            for f in layer.findings
+            if f.severity == SOUNDNESS and f.verdict == SKIPPED
+        )
+        hazards = sum(
+            1
+            for layer in sat.layers
+            for f in layer.of("pair-saturation")
+            if f.verdict == REFUTED
+        )
+        if not report.layers:
+            summary = "no integer layers found"
+        else:
+            summary = (
+                ("proved" if report.ok else "NOT PROVED")
+                + f"; layers={len(report.layers)}; refuted={refuted or 'none'}; skipped_findings={skipped}"
+                + f"; u8s8_pair_saturation_hazard_layers={hazards}"
+            )
+        if refuted:
+            warnings.warn(
+                "quant_int_verify: soundness finding refuted: " + ", ".join(refuted),
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    except Exception as e:  # the check is optional; never break the quantizer
+        report, summary = None, f"verification failed: {type(e).__name__}: {e}"
+    for p in list(model.metadata_props):
+        if p.key == key:
+            model.metadata_props.remove(p)
+    entry = model.metadata_props.add()
+    entry.key, entry.value = key, summary[:500]
+    return report
+
+
 def _float_hull(
     model: onnx.ModelProto, input_ranges: Optional[Dict[str, Tuple[Any, Any]]]
 ) -> Dict[str, Tuple[float, float]]:
@@ -1355,6 +1875,7 @@ def verify_model(
     z3_max_k: int = 24,
     timeout_ms: int = 10_000,
     probe_runtime: bool = False,
+    semantics: str = "exact",
 ) -> ModelReport:
     """Verify every integer layer of ``integer_model`` (see the module docstring).
 
@@ -1365,7 +1886,13 @@ def verify_model(
         ``DynamicQuantizeLinear`` narrow the reachable activation codes (and, for the dynamic
         chain, the zero point); integer graph inputs give the code range directly.
     :param probe_runtime: also run :func:`probe_u8s8_saturation` and note the result.
+    :param semantics: ``"exact"`` (default) or ``"u8s8_pair_saturating"`` -- the accumulator model of the
+        kernel (see :func:`u8s8_pair_saturating_matmul`). :func:`host_semantics` says which one the
+        machine you are running on needs to match onnxruntime. Layers the saturating model does not
+        cover (``ConvInteger``, padded or grouped convolutions, the dynamic-quantization chain, ...)
+        are ``skipped`` with a reason, never silently proved.
     """
+    _check_semantics(semantics)
     consts = _consts(integer_model)
     elem = _elem_types(integer_model)
     shapes = _shapes(integer_model)
@@ -1400,6 +1927,22 @@ def verify_model(
         ):
             continue
         chain = chains.get(id(node))
+        if chain is not None and semantics == U8S8_PAIR_SATURATING:
+            rep = LayerReport(
+                node.name or f"{node.op_type}_{node.output[0]}", node.op_type
+            )
+            rep.findings.append(
+                Finding(
+                    "no-wrap",
+                    SOUNDNESS,
+                    SKIPPED,
+                    "the u8s8_pair_saturating model is not applied to the dynamic-quantization chain: its "
+                    "activation zero point is chosen at run time, so the raw codes the kernel multiplies "
+                    "are not fixed (and that chain has no recorded-hardware validation)",
+                )
+            )
+            layers.append(rep)
+            continue
         if chain is not None:
             layers.append(
                 _verify_dynamic(
@@ -1424,6 +1967,7 @@ def verify_model(
             x_shape=shapes.get(a),
             z3_max_k=z3_max_k,
             timeout_ms=timeout_ms,
+            semantics=semantics,
         )
         if reference_model is not None:
             _add_static_fidelity(rep, node, consts, reference_model)
@@ -1599,16 +2143,26 @@ def _verify_dynamic(
 
 
 def replay_no_wrap(
-    model: onnx.ModelProto, node_name: str, finding: Finding
+    model: onnx.ModelProto,
+    node_name: str,
+    finding: Finding,
+    semantics: str = "exact",
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Run a ``no-wrap`` counterexample on onnxruntime: ``(observed int32, exact int64)`` accumulators.
+    """Run a ``no-wrap`` counterexample on onnxruntime: ``(observed int32, expected int64)`` accumulators.
 
-    For a refuted layer these differ -- the observed value is the wrapped one. Builds an
-    integer twin of the layer (``MatMulInteger`` / ``ConvInteger`` with the same weights and
-    zero points; for the dynamic chain, ``DynamicQuantizeLinear`` + ``MatMulInteger``) so the
-    accumulator itself is observable even for ``QLinear*`` layers, whose output is requantised.
+    ``expected`` is the exact integer dot product for ``semantics="exact"``; for a refuted layer it
+    differs from ``observed`` -- the observed value is the wrapped one. With
+    ``semantics="u8s8_pair_saturating"`` it is the saturating-kernel model's prediction
+    (:func:`u8s8_pair_saturating_matmul` / :func:`u8s8_pair_saturating_conv`, before the int32 wrap),
+    which an onnxruntime build on a saturating CPU reproduces bit for bit once wrapped
+    (:func:`wrap_int32`). Builds an integer twin of the layer (``MatMulInteger`` / ``ConvInteger``
+    with the same weights and zero points; for the dynamic chain, ``DynamicQuantizeLinear`` +
+    ``MatMulInteger``) so the accumulator itself is observable even for ``QLinear*`` layers,
+    whose output is requantised.
     """
     import onnxruntime as ort
+
+    _check_semantics(semantics)
 
     assert finding.counterexample is not None
     consts = _consts(model)
@@ -1665,6 +2219,23 @@ def replay_no_wrap(
         za = int(consts[azp].reshape(-1)[0]) if azp and azp in consts else 0
         wz = consts[wzp].astype(np.int64) if wzp and wzp in consts else 0
         wi = consts[w].astype(np.int64) - wz
+        if semantics == U8S8_PAIR_SATURATING:
+            if np.any(wz != 0) or x.dtype != np.uint8 or consts[w].dtype != np.int8:
+                raise ValueError(
+                    "the u8s8_pair_saturating model needs uint8 activations, int8 weights and a zero weight zero point"
+                )
+            if twin_op == "MatMulInteger":
+                return observed, u8s8_pair_saturating_matmul(x, consts[w], za)
+            at = _attrs(node)
+            return observed, u8s8_pair_saturating_conv(
+                x,
+                consts[w],
+                za,
+                strides=at.get("strides", [1, 1]),
+                dilations=at.get("dilations", [1, 1]),
+                pads=at.get("pads", [0, 0, 0, 0]),
+                group=int(at.get("group", 1)),
+            )
         if twin_op == "MatMulInteger":
             exact = (x.astype(np.int64) - za) @ wi
         else:

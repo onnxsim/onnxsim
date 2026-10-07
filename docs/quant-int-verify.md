@@ -209,6 +209,121 @@ proved
 refuted (0, 0)
 ```
 
+## Kernels that saturate int16 pair sums (`semantics="u8s8_pair_saturating"`)
+
+Some AVX2 `u8 x s8` kernels (`vpmaddubsw`, on CPUs without VNNI) add *adjacent products* in saturating int16
+before widening to int32. That is not two's-complement wraparound, and it gives different accumulators, so
+exact-arithmetic verdicts do not describe such a machine. This was found the hard way: a CI runner returned
+`1086422270` for an extreme `MatMulInteger` where exact arithmetic gives `2147481735`. `verify_layer`,
+`verify_model` and `replay_no_wrap` therefore take `semantics=`, and `host_semantics()` says which one
+onnxruntime follows on the machine you are on.
+
+**The model**, for a uint8 activation row `a` (raw codes, the zero point is *not* subtracted first) and an
+int8 weight column `w` of K taps:
+
+1. taps are paired along K as (0,1), (2,3), ...; an odd K pairs the last tap with an implicit 0;
+2. each pair contributes `sat16(a[2j]*w[2j] + a[2j+1]*w[2j+1])`, `sat16` clamping to [-32768, 32767];
+3. pair values are summed in int32 (wrapping);
+4. the zero point is an exact correction: `acc = sum - za * sum(w)`.
+
+`QLinearConv` pairs taps in `(kh, kw, channel)` order and pads with the raw zero point.
+
+<!-- doctest -->
+```python
+import numpy as np
+from onnx import numpy_helper, parser
+
+from onnxsim import quant_int_verify as Q
+
+for k in (66311, 66312):
+    a = np.full((1, k), 255, np.uint8)
+    w = np.full((k, 1), 127, np.int8)
+    print(k, "exact", k * 255 * 127, "pair-saturating", int(Q.u8s8_pair_saturating_matmul(a, w)[0, 0]))
+
+m = parser.parse_model(
+    '<ir_version: 8, opset_import: ["" : 13]> m (uint8[1,66312] a) => (int32[1,1] y) { y = MatMulInteger(a, W) }'
+)
+m.graph.initializer.append(numpy_helper.from_array(np.full((66312, 1), 127, np.int8), "W"))
+node, consts = m.graph.node[0], Q._consts(m)
+for sem in (Q.EXACT, Q.U8S8_PAIR_SATURATING):
+    rep = Q.verify_layer(node, consts, semantics=sem)
+    print(f"{sem:21s}", rep.of("no-wrap")[0].verdict, [f.verdict for f in rep.of("pair-saturation")])
+```
+```text
+66311 exact 2147481735 pair-saturating 1086422270
+66312 exact 2147514120 pair-saturating 1086422652
+exact                 refuted []
+u8s8_pair_saturating  proved ['refuted']
+```
+
+The same layer wraps under exact arithmetic and does not under the saturating kernel (33156 saturated pairs add
+up to far less than int32), and the new informational `pair-saturation` finding says the layer's *result* is not
+the exact one on such a CPU. Under this semantics `no-wrap` is decided from the saturating accumulator's exact
+range (`saturating_accumulator_range`: pairs read disjoint activations and `sat16` is monotone, so each pair's
+extreme is attained independently), `requant-1lsb` is unchanged (it bounds the fp32 multiply, whatever the
+accumulator), and `requant-bit-exact` reachability is left undecided rather than searched with exact dot
+products.
+
+### What is and is not validated
+
+This machine's kernel is exact, so the model could not be compared with a saturating onnxruntime *here*. It is
+pinned instead by values recorded from the saturating CI runner (the `tests/test_quant_int_verify.py` tests run
+on every host and reproduce them):
+
+| Recorded on the saturating runner | Model |
+|---|---|
+| `MatMulInteger`, K=66311 / 66312, a=255, w=127: 1086422270 / 1086422652 | identical |
+| `QLinearMatMul`, K=96, za=110, per-channel scales: 1222 / 1221 / 880 of 1600 outputs differ from exact (seeds 0 / 1 / 2) | identical counts |
+| `QLinearConv`, no padding, cin=2: one output 161 (exact pipeline: 164) | 161; tap orders (c,kh,kw) and (c,kw,kh) give 164 and 160, so they are excluded |
+| `ConvInteger`: two exact-arithmetic tests *passed* on that runner | not modelled (`skipped`) |
+
+and by an independent lane-by-lane emulation, and an exhaustive search for the accumulator range. On a
+saturating host the oracle tests compare the model with onnxruntime bit for bit
+(`validate_saturating_model_on_host()`); if they disagree, those tests are skipped with the disagreement as the
+reason.
+
+**Not validated, so not claimed:** padded or grouped convolutions, a non-zero weight zero point, strides and
+dilations other than 1 (the recorded case uses 1), any CPU other than that one runner, and the order of the two
+operands. On that last point: `sat16(a0*w0 + a1*w1)` is symmetric in the two operands' raw codes, so swapping
+which tensor a runtime calls "first" cannot change a pair sum. What *does* matter is the dtype pair: `u8 x s8`
+saturates; `s8 x s8` may reach the same kernel through an offset of the activation (changing the raw codes) and
+`u8 x u8` does not use this instruction -- the model makes no claim about either and reports them `skipped`.
+This was reasoned, not measured: it needs a saturating host to check.
+
+## Opt-in checks after the quantizers
+
+`onnxsim.quantize_dynamic(model, verify=True)` and `onnxsim.quantize_qoperator(model, verify=True)` run
+`quant_int_verify.attach_verification` on the model they emit. It is **off by default** (the check can call Z3
+for small layers). The return value is unchanged; a one-line summary goes to
+`metadata_props["onnxsim.quant_int_verify"]`, a `RuntimeWarning` is emitted if a soundness finding is refuted, and
+the check never raises (a failure is recorded in the summary). For the full report call `verify_model`.
+
+<!-- doctest -->
+```python
+import numpy as np
+from onnx import numpy_helper, parser
+
+import onnxsim
+
+f = parser.parse_model(
+    '<ir_version: 8, opset_import: ["" : 13]> m (float[2,16] x) => (float[2,4] y) { y = MatMul(x, W) }'
+)
+f.graph.initializer.append(
+    numpy_helper.from_array(np.random.default_rng(0).standard_normal((16, 4)).astype(np.float32), "W")
+)
+q = onnxsim.quantize_dynamic(f, verify=True)
+print(next(p.value for p in q.metadata_props if p.key == "onnxsim.quant_int_verify"))
+print([p.key for p in onnxsim.quantize_dynamic(f).metadata_props])
+```
+```text
+proved; layers=1; refuted=none; skipped_findings=0; u8s8_pair_saturation_hazard_layers=0
+[]
+```
+
+`u8s8_pair_saturation_hazard_layers` counts layers whose result would differ on a saturating CPU. For
+`quantize_dynamic`'s chain the pair-saturating model is not applied (its activation zero point is chosen at run
+time), so that count is 0 there, which means "not assessed", not "none".
+
 ## Z3: small, bounded, and isolated
 
 Z3 is used, but deliberately lightly. The closed forms above decide the claims; Z3 re-derives the no-wrap
@@ -229,10 +344,11 @@ exactly that), so:
 ## Limits and what is not claimed
 
 * The verdicts are exact for the **modelled** semantics: two's-complement int32 accumulation, round-half-to-even,
-  saturation, fp32 multiply. A runtime that deviates is not described. `probe_u8s8_saturation()` runs a tiny
-  extreme-value `MatMulInteger` because some AVX2 `u8 x s8` kernels sum adjacent products in saturating int16,
-  which is not wraparound. On the machine used for these checks onnxruntime matched exact int32 arithmetic,
-  which says nothing about other CPUs.
+  saturation, fp32 multiply. A runtime that deviates is not described by the default `semantics="exact"`.
+  `probe_u8s8_saturation()` / `host_semantics()` detect the main known deviation (AVX2 `u8 x s8` kernels that sum
+  adjacent products in saturating int16), which `semantics="u8s8_pair_saturating"` models -- within the limits
+  stated in the section above. On the machine these checks were developed on onnxruntime matched exact int32
+  arithmetic; the saturating model is pinned by values recorded on a CI runner that does saturate.
 * The requantization model (`sat(rne(fl32(acc) * fl32(fl32(sa*sb)/sy)) + zy)`) was checked bit-exactly against
   onnxruntime's `QLinearMatMul` on random layers with per-channel weight scales. Other runtimes may order the
   scale product differently; the 1-LSB bound does not depend on that, the exact tie set does.

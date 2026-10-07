@@ -917,7 +917,9 @@ def cross_layer_equalize(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     return onnx.load_from_string(C.cross_layer_equalize(model.SerializeToString()))
 
 
-def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+def quantize_dynamic(
+    model: Union[str, onnx.ModelProto], verify: bool = False
+) -> onnx.ModelProto:
     """
     Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
     alpha=1, beta=1), whose weight is a constant 2-D float32 tensor.
@@ -937,11 +939,24 @@ def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     :func:`simplify` before and/or after to clean up the graph.
 
     :param model: onnx ModelProto object or file path
+    :param verify: opt-in (default ``False``): afterwards run
+            :func:`onnxsim.quant_int_verify.attach_verification` on the result -- prove each integer
+            layer cannot wrap its int32 accumulator, check the integer weights against ``model``'s,
+            and note whether the model would give different results on a CPU whose ``u8 x s8``
+            kernel saturates int16 pair sums. The return value is unchanged; a one-line summary is
+            written to the result's ``metadata_props["onnxsim.quant_int_verify"]``, a
+            ``RuntimeWarning`` is emitted when a soundness finding is refuted, and the check never
+            raises. Call :func:`onnxsim.quant_int_verify.verify_model` for the full report.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
+    out = onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
+    if verify:
+        from . import quant_int_verify as _quant_int_verify
+
+        _quant_int_verify.attach_verification(out, reference_model=model)
+    return out
 
 
 def quantize_dynamic_matmul_integer_to_float(
