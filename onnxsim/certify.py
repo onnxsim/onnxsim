@@ -58,6 +58,31 @@ works in four layers, cheapest first:
    shapes alone (the zonotope code is not interruptible), by the overall time budget, and it
    never raises.
 
+6. **Certified fp32 tolerance** (opt-in: ``certify(..., atol="certified")``). Steps 1-5 prove
+   closeness in *real* arithmetic against the fixed tolerance ``atol=1e-5, rtol=1e-4`` (the
+   tolerances ``simplify(check_atol=, check_rtol=)`` uses). That is not a statement about the
+   fp32 *executions*: for a Conv+BatchNorm fold ``onnxsim.fp_error.tolerance_for`` certifies
+   about 3.9e-5, above the default 1e-5. With ``atol="certified"`` the real-arithmetic proof
+   runs as before (default thresholds) and each proved output is then given the certified
+   tolerance ``X = t + roundoff(orig) + roundoff(simplified)``, where ``t`` is the smaller of
+   the zonotope bound on ``|orig - simplified|`` and the bound the proof itself established
+   (``0`` for a structural proof, ``atol + rtol * max|simplified|`` for an SMT/shrink proof;
+   a *congruence* proof is not used, see below), and the roundoff terms come from
+   ``onnxsim.fp_error.roundoff_bound``. The verdict is ``proved-fp32``, which counts as
+   proved; the real-arithmetic verdicts stay available as ``CertifyReport.real_outputs``.
+   An output whose certified tolerance is infinite (unbounded input, an op ``fp_error`` has no
+   rule for, a model too large for the zonotope code, the time budget) is reported
+   ``skipped`` with the reason, never proved. Every assumption of ``fp_error`` applies (notably
+   the library-function error model and execution-as-written), and ``fp_error`` is loose on
+   deep networks: read ``X`` as a safe upper bound, not an estimate.
+
+   Why congruence is excluded from ``t``: congruence peeling proves that two *inputs* of the
+   same op are within the tolerance and concludes the outputs are too, which is exact for
+   ``tolerance == 0`` and for 1-Lipschitz ops but not for an op with gain above 1 (a
+   ``MatMul`` by large weights turns an input gap of ``atol`` into a larger output gap). The
+   default real-arithmetic mode keeps that behaviour unchanged; the certified mode does not
+   build a guarantee on it.
+
 What a proof means, so it is not over-read:
 
 * It is a statement about *real* arithmetic over the float32/float64 constants
@@ -83,7 +108,7 @@ import dataclasses
 import hashlib
 import importlib.util
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import onnx
@@ -97,8 +122,13 @@ PROVED_CONGRUENCE = "proved-congruence"
 PROVED_SMT = "proved-smt"
 PROVED_REDUCED = "proved-reduced"
 PROVED_AFFINE = "proved-affine"
+PROVED_FP32 = "proved-fp32"
 REFUTED = "refuted"
 SKIPPED = "skipped"
+
+# ``certify(atol=CERTIFIED)`` asks for a certified fp32 tolerance (step 6 of the module notes).
+CERTIFIED = "certified"
+_REAL_ATOL = 1e-5  # the real-arithmetic proof threshold used in certified mode
 
 _NONDETERMINISTIC = {
     "RandomNormal",
@@ -127,13 +157,41 @@ class Window:
 
 
 @dataclasses.dataclass
+class CertifiedTolerance:
+    """Certified tolerance for comparing the *executions* of the two models (step 6)."""
+
+    precision: str
+    atol: Dict[str, float]  # per output: |run(orig) - run(simplified)| <= atol
+    real_bound: Dict[str, float]  # real-arithmetic part ``t`` (see the module notes)
+    roundoff_orig: Dict[str, float]
+    roundoff_simplified: Dict[str, float]
+    notes: List[str]
+
+    @property
+    def worst(self) -> float:
+        return max(self.atol.values()) if self.atol else float("inf")
+
+
+@dataclasses.dataclass
 class CertifyReport:
     outputs: Dict[str, str]  # graph output name -> status
     windows: List[Window]
+    # Only set by ``certify(atol="certified")``: the real-arithmetic verdicts (``outputs`` then
+    # holds ``proved-fp32`` where a certified fp32 tolerance exists) and that tolerance.
+    real_outputs: Optional[Dict[str, str]] = None
+    tolerance: Optional[CertifiedTolerance] = None
 
     @property
     def ok(self) -> bool:
         return all(s.startswith("proved") for s in self.outputs.values())
+
+    def within(self, atol: float) -> bool:
+        """Certified mode only: every output proved and its certified fp32 tolerance <= ``atol``."""
+        return (
+            self.ok
+            and self.tolerance is not None
+            and all(v <= atol for v in self.tolerance.atol.values())
+        )
 
     def __str__(self) -> str:
         lines = [f"certify: {'OK' if self.ok else 'NOT PROVED'}"]
@@ -143,6 +201,11 @@ class CertifyReport:
                 lines.append(
                     f"  window {w.orig} ~ {w.simplified}: {w.status} {w.detail}".rstrip()
                 )
+        if self.tolerance is not None:
+            t = self.tolerance
+            lines.append(
+                f"  certified {t.precision} tolerance (worst over outputs): {t.worst:.3g}"
+            )
         return "\n".join(lines)
 
 
@@ -1396,11 +1459,12 @@ def certify(
     orig: onnx.ModelProto,
     simplified: onnx.ModelProto,
     input_ranges: Optional[Dict[str, Tuple]] = None,
-    atol: float = 1e-5,
+    atol: Union[float, str] = 1e-5,
     rtol: float = 1e-4,
     max_work: int = 300_000,
     timeout_ms: int = 60_000,
     total_timeout_ms: Optional[int] = None,
+    precision: str = "fp32",
 ) -> CertifyReport:
     """Try to prove ``simplified`` computes the same outputs as ``orig``.
 
@@ -1409,12 +1473,23 @@ def certify(
         the proof then holds for every real input.
     :param atol, rtol: the same tolerance meaning as ``simplify(check_atol=,
         check_rtol=)``: two outputs agree when ``|a - b| <= atol + rtol * |b|``.
+        ``atol="certified"`` additionally certifies a tolerance for the fp32 *executions* (step 6
+        of the module notes): the real-arithmetic proof runs with ``atol=1e-5`` and each proved
+        output gets ``proved-fp32`` and ``CertifyReport.tolerance``; an output without a finite
+        certified tolerance is ``skipped`` with the reason.
+    :param precision: ``"fp32"`` (default), ``"fp16"`` or ``"bf16"``; only used by
+        ``atol="certified"`` (the unit roundoff of the executions being certified).
     :param max_work: budget of multiply-adds / variables per SMT window; a
         bigger window is reported ``skipped``.
     :param timeout_ms: per-window solver timeout.
     :param total_timeout_ms: wall-clock budget for the whole call; windows reached after it
         is spent are reported ``skipped``. ``None`` means no overall limit.
     """
+    certified = isinstance(atol, str)
+    if isinstance(atol, str):
+        if atol != CERTIFIED:
+            raise ValueError(f"atol must be a number or {CERTIFIED!r}, got {atol!r}")
+        atol = _REAL_ATOL
     space = _Space()
     deadline = (
         None
@@ -1485,7 +1560,186 @@ def certify(
 
     for o in out_a:
         collect(tops[o])
-    return CertifyReport(outputs, windows)
+    report = CertifyReport(outputs, windows)
+    if certified:
+        _apply_certified_tolerance(
+            report, orig, simplified, input_ranges, atol, rtol, precision, deadline
+        )
+    return report
+
+
+def _input_boxes(
+    model: onnx.ModelProto, input_ranges: Optional[Dict[str, Tuple]]
+) -> Tuple[Dict[str, Tuple], int, str]:
+    """``(boxes, number of input elements, reason)``; ``reason`` is non-empty if a finite static box is missing."""
+    boxes: Dict[str, Tuple] = dict(input_ranges or {})
+    inits = {t.name for t in model.graph.initializer}
+    n_in = 0
+    for vi in model.graph.input:
+        if vi.name in inits:
+            continue
+        if vi.name not in boxes:
+            return boxes, 0, f"input {vi.name!r} has no range"
+        lo, hi = (np.asarray(b, dtype=np.float64) for b in boxes[vi.name])
+        if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
+            return boxes, 0, f"input {vi.name!r} has an unbounded range"
+        dims = [
+            d.dim_value if d.HasField("dim_value") else 0
+            for d in vi.type.tensor_type.shape.dim
+        ]
+        if not dims or any(d <= 0 for d in dims):
+            return boxes, 0, f"input {vi.name!r} has no static shape"
+        n_in += int(np.prod(dims, dtype=np.int64))
+    return boxes, n_in, ""
+
+
+def _certified_tolerance(
+    orig: onnx.ModelProto,
+    simplified: onnx.ModelProto,
+    input_ranges: Optional[Dict[str, Tuple]],
+    atol: float,
+    rtol: float,
+    precision: str,
+    real_status: Dict[str, str],
+    deadline: Optional[float],
+) -> Tuple[Optional[CertifiedTolerance], str]:
+    """``(tolerance, "")`` or ``(None, reason)``; never raises. See step 6 of the module notes."""
+    inf = float("inf")
+    try:
+        from . import fp_error as _fp
+        from . import interval as _interval
+        from . import zonotope as _zono
+
+        boxes, n_in, why = _input_boxes(orig, input_ranges)
+        if why:
+            return None, f"{why}, so the fp32 roundoff is unbounded"
+        cost = _zonotope_cost(orig, simplified, n_in, _zono.DEFAULT_MAX_SYMBOLS)
+        if cost > _ZONOTOPE_MAX_ELEMENTS:
+            return None, (
+                f"model too large for the zonotope bound the tolerance needs "
+                f"(about {cost / 1e6:.0f}M elements > {_ZONOTOPE_MAX_ELEMENTS / 1e6:.0f}M)"
+            )
+        if deadline is not None and time.monotonic() > deadline:
+            return None, "certify time budget exhausted"
+        a, b = _without_range_annotations(orig), _without_range_annotations(simplified)
+        tol = _fp.tolerance_for(a, b, boxes, precision)
+        hull = _interval.propagate(b, boxes)
+    except Exception as e:  # certification must never break its caller
+        return None, f"failed ({type(e).__name__}: {e})"
+
+    out_atol: Dict[str, float] = {}
+    real: Dict[str, float] = {}
+    for o, status in real_status.items():
+        d_zono = tol.real_difference.get(o, inf)
+        # The bound the proof itself established, usable only where it is a tolerance-level
+        # statement about the OUTPUT pair (not congruence: see the module notes).
+        t_proof = inf
+        if status == PROVED_STRUCTURAL:
+            t_proof = 0.0
+        elif status in (PROVED_SMT, PROVED_REDUCED):
+            try:
+                lo, hi = hull.hull(o)
+                t_proof = atol + rtol * max(abs(lo), abs(hi))
+            except Exception:
+                t_proof = inf
+        real[o] = min(d_zono, t_proof)
+        out_atol[o] = (
+            real[o]
+            + tol.roundoff_orig.get(o, inf)
+            + tol.roundoff_simplified.get(o, inf)
+        )
+    return (
+        CertifiedTolerance(
+            precision,
+            out_atol,
+            real,
+            dict(tol.roundoff_orig),
+            dict(tol.roundoff_simplified),
+            list(tol.notes),
+        ),
+        "",
+    )
+
+
+def _apply_certified_tolerance(
+    report: CertifyReport,
+    orig: onnx.ModelProto,
+    simplified: onnx.ModelProto,
+    input_ranges: Optional[Dict[str, Tuple]],
+    atol: float,
+    rtol: float,
+    precision: str,
+    deadline: Optional[float],
+) -> None:
+    """Upgrade proved outputs to ``proved-fp32`` (or ``skipped`` with a reason), in place."""
+    report.real_outputs = dict(report.outputs)
+    proved = {o: s for o, s in report.outputs.items() if s.startswith("proved")}
+    # A refuted output has a counterexample: no tolerance is reported for it. A skipped one
+    # still gets the zonotope-based tolerance if it exists, for information only (its verdict
+    # stays ``skipped``: the real-arithmetic proof at the default thresholds is missing, and a
+    # certified bound X is a bound, not an equality -- a wrong rewrite also has a finite X).
+    candidates = {o: s for o, s in report.outputs.items() if s != REFUTED}
+    tol, why = (
+        _certified_tolerance(
+            orig, simplified, input_ranges, atol, rtol, precision, candidates, deadline
+        )
+        if candidates
+        else (None, "")
+    )
+    report.tolerance = tol
+    for o, real_status in candidates.items():
+        if real_status.startswith("proved"):
+            continue
+        x = tol.atol.get(o, float("inf")) if tol is not None else float("inf")
+        if tol is not None and np.isfinite(x):
+            report.windows.append(
+                Window(
+                    o,
+                    o,
+                    SKIPPED,
+                    f"for information: every {precision} execution of the two models differs by "
+                    f"at most {x:.3g} on this input box (real {tol.real_bound[o]:.3g} + roundoff "
+                    f"{tol.roundoff_orig[o]:.3g} + {tol.roundoff_simplified[o]:.3g}); the "
+                    f"real-arithmetic proof at atol={atol:g}, rtol={rtol:g} is not available",
+                )
+            )
+    for o, real_status in proved.items():
+        x = tol.atol.get(o, float("inf")) if tol is not None else float("inf")
+        if tol is not None and np.isfinite(x):
+            report.outputs[o] = PROVED_FP32
+            report.windows.append(
+                Window(
+                    o,
+                    o,
+                    PROVED_FP32,
+                    f"proved equal in real arithmetic ({real_status}); certified {precision} "
+                    f"tolerance {x:.3g} = real {tol.real_bound[o]:.3g} + roundoff(orig) "
+                    f"{tol.roundoff_orig[o]:.3g} + roundoff(simplified) "
+                    f"{tol.roundoff_simplified[o]:.3g}",
+                )
+            )
+            continue
+        reason = why or "an infinite bound term"
+        if tol is not None:
+            if real_status == PROVED_CONGRUENCE and not np.isfinite(
+                tol.real_bound.get(o, float("inf"))
+            ):
+                reason = (
+                    "the real-arithmetic proof rests on congruence peeling, which is not a "
+                    "tolerance-level bound, and the zonotope bound is unbounded"
+                )
+            elif tol.notes:
+                reason = "; ".join(tol.notes[:2])
+        report.outputs[o] = SKIPPED
+        report.windows.append(
+            Window(
+                o,
+                o,
+                SKIPPED,
+                f"proved equal in real arithmetic ({real_status}), but no certified {precision} "
+                f"tolerance: {reason}",
+            )
+        )
 
 
 def _concrete_eval(

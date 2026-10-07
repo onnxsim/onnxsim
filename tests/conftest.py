@@ -62,6 +62,7 @@ _CERTIFY_TEST_MODULES = frozenset(
     {
         "test_certify",
         "test_certify_zonotope",
+        "test_certify_tolerance",
         "test_simplify_certify",
         "test_interval",
         "test_docs_ranges",
