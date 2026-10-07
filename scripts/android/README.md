@@ -703,3 +703,9 @@ open-access toolchain 19.0.02 (the same package hexagon-mlir installs; about 1.1
 extracted), caching both. `hexagon-sim` links `libncurses.so.5`, which current distros
 lack, so the harness shims it from `libncurses.so.6`.
 
+
+## Installed Hexagon NN runtime
+
+For a native dense-layer inference check on the compute DSP using the phone's
+existing vendor NN libraries, see [hexagon_nn](hexagon_nn/README.md). It requires
+ADB and an Android NDK and was validated on a Snapdragon 845 Xperia XZ2 Compact.
