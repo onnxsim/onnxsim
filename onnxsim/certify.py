@@ -43,6 +43,21 @@ works in four layers, cheapest first:
    run, which the detail text says); a replay that disagrees downgrades to
    ``skipped``, because a false alarm is worse than a skip.
 
+5. **Zonotope fallback** (only for an output that is still ``skipped`` after steps 1-4, and
+   only when every graph input has a finite range). ``onnxsim.zonotope`` evaluates both
+   models on the *same* input box as affine forms over shared noise symbols and bounds
+   ``|orig - simplified|`` per output element; shared structure cancels exactly, which is
+   what lets it handle a ``Relu``/``Sigmoid``/``Tanh`` between two rewritten layers that the
+   Z3 encoding gives up on. If the certified bound satisfies
+   ``bound <= atol + rtol * min|simplified|`` (``min|simplified|`` is a lower bound of
+   ``|simplified|`` over the box, zero whenever the output can reach 0, so ``rtol`` only
+   helps when it is justified) the verdict is ``proved-affine``; it counts as proved. A bound
+   that is merely too large proves nothing: the output stays ``skipped`` with the bound in the
+   detail. This step can never produce ``refuted``, because an over-approximation exceeding
+   the tolerance does not show a real difference. It is bounded by a cost estimate made from
+   shapes alone (the zonotope code is not interruptible), by the overall time budget, and it
+   never raises.
+
 What a proof means, so it is not over-read:
 
 * It is a statement about *real* arithmetic over the float32/float64 constants
@@ -81,6 +96,7 @@ PROVED_STRUCTURAL = "proved-structural"
 PROVED_CONGRUENCE = "proved-congruence"
 PROVED_SMT = "proved-smt"
 PROVED_REDUCED = "proved-reduced"
+PROVED_AFFINE = "proved-affine"
 REFUTED = "refuted"
 SKIPPED = "skipped"
 
@@ -1245,6 +1261,137 @@ def _make_replay(orig, simplified, ta, tb, space, atol, rtol):
     return replay
 
 
+# Upper bound, in float64 elements, on what the zonotope fallback may allocate (256 MB estimated;
+# measured peak is about 1.4x the estimate: 28.6M estimated -> ~330 MB extra RSS, 0.5 s). Zonotope
+# generators are dense (symbols x tensor size) and the evaluator keeps every tensor, so memory,
+# not time, is the limit. It only runs for outputs the SMT steps already gave up on.
+_ZONOTOPE_MAX_ELEMENTS = 32_000_000
+_ZONOTOPE_NONLINEAR = frozenset({"Relu", "Sigmoid", "Tanh"})
+
+
+def _without_range_annotations(model: onnx.ModelProto) -> onnx.ModelProto:
+    """``model`` minus its ``onnxsim.range.*`` annotations (a copy only if it has any).
+
+    ``zonotope`` merges a model's own annotations over the ``input_ranges`` it is given, while
+    ``certify``'s documented rule is "inputs not listed in ``input_ranges`` are unbounded".
+    Stripping keeps the zonotope step from proving more than the Z3 steps were allowed to assume.
+    """
+    prefix = "onnxsim.range."
+    if not any(p.key.startswith(prefix) for p in model.metadata_props):
+        return model
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    keep = [
+        (p.key, p.value) for p in out.metadata_props if not p.key.startswith(prefix)
+    ]
+    del out.metadata_props[:]
+    for k, v in keep:
+        entry = out.metadata_props.add()
+        entry.key, entry.value = k, v
+    return out
+
+
+def _zonotope_cost(
+    orig: onnx.ModelProto, simplified: onnx.ModelProto, n_in: int, cap: int
+) -> int:
+    """Rough float64-element count the zonotope evaluation would hold, from shapes alone.
+
+    Walks both models in order: a tensor carries as many generators as were created upstream
+    (the input symbols plus one fresh symbol per element of every earlier nonlinearity, in
+    either model), capped as the evaluator caps them. Over-estimates rather than under.
+    """
+    running, total = n_in, 0
+    for model in (orig, simplified):
+        shapes = _shapes(model)
+        for node in model.graph.node:
+            for out in node.output:
+                shape = shapes.get(out, (None, 0))[0] if out else None
+                if shape is None:
+                    continue
+                size = int(np.prod(shape, dtype=np.int64)) if shape else 1
+                if node.op_type in _ZONOTOPE_NONLINEAR:
+                    running += size
+                total += min(running, cap + size) * size
+    return total
+
+
+def _zonotope_check(
+    orig: onnx.ModelProto,
+    simplified: onnx.ModelProto,
+    input_ranges: Optional[Dict[str, Tuple]],
+    atol: float,
+    rtol: float,
+    outputs: List[str],
+    deadline: Optional[float] = None,
+) -> Dict[str, Tuple[bool, str]]:
+    """Try to prove each of ``outputs`` equal with zonotopes: ``{output: (proved, detail)}``.
+
+    Sound by construction (see the module notes, step 5) and never raises; every reason for not
+    attempting or not proving is returned as text.
+    """
+
+    def none(why: str) -> Dict[str, Tuple[bool, str]]:
+        return {o: (False, f"zonotope not used: {why}") for o in outputs}
+
+    try:
+        from . import zonotope as _zono
+
+        # Same rule as the Z3 steps: only the explicit ``input_ranges`` bound the inputs
+        # (a model's own annotations reach here via ``simplify``, which passes them in).
+        boxes: Dict[str, Tuple] = dict(input_ranges or {})
+        inits = {t.name for t in orig.graph.initializer}
+        n_in = 0
+        for vi in orig.graph.input:
+            if vi.name in inits:
+                continue
+            if vi.name not in boxes:
+                return none(f"input {vi.name!r} has no range")
+            lo, hi = (np.asarray(b, dtype=np.float64) for b in boxes[vi.name])
+            if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
+                return none(f"input {vi.name!r} has an unbounded range")
+            dims = [
+                d.dim_value if d.HasField("dim_value") else 0
+                for d in vi.type.tensor_type.shape.dim
+            ]
+            if not dims or any(d <= 0 for d in dims):
+                return none(f"input {vi.name!r} has no static shape")
+            n_in += int(np.prod(dims, dtype=np.int64))
+        cost = _zonotope_cost(orig, simplified, n_in, _zono.DEFAULT_MAX_SYMBOLS)
+        if cost > _ZONOTOPE_MAX_ELEMENTS:
+            return none(
+                f"too large (about {cost / 1e6:.0f}M elements > {_ZONOTOPE_MAX_ELEMENTS / 1e6:.0f}M)"
+            )
+        if deadline is not None and time.monotonic() > deadline:
+            return none("certify time budget exhausted")
+        bound = _zono.bound_difference(
+            _without_range_annotations(orig),
+            _without_range_annotations(simplified),
+            boxes,
+        )
+    except Exception as e:  # certification must never break its caller
+        return none(f"failed ({type(e).__name__}: {e})")
+
+    notes = "; ".join(bound.notes[:2])
+    suffix = f" [{notes}]" if notes else ""
+    verdicts: Dict[str, Tuple[bool, str]] = {}
+    for o in outputs:
+        d, ref = bound.max_abs.get(o), bound.ref_min_abs.get(o)
+        if d is None or ref is None:
+            verdicts[o] = (False, "zonotope not used: no bound for this output")
+            continue
+        if not np.all(np.isfinite(d)):
+            verdicts[o] = (False, f"zonotope bound is unbounded{suffix}")
+            continue
+        worst = float(np.max(d)) if np.size(d) else 0.0
+        proved = bool(np.all(d <= atol + rtol * ref))
+        verdicts[o] = (
+            proved,
+            f"zonotope: max|orig-simplified| <= {worst:.3g} over the input box "
+            f"(tolerance {atol:g} + {rtol:g}*min|simplified|){suffix}",
+        )
+    return verdicts
+
+
 def certify(
     orig: onnx.ModelProto,
     simplified: onnx.ModelProto,
@@ -1307,6 +1454,23 @@ def certify(
         replay=_make_replay(orig, simplified, ta, tb, space, atol, rtol),
     )
     outputs, windows, seen = {}, [], set()
+    tops: Dict[str, Window] = {o: prover.prove(ta[o], tb[o]) for o in out_a}
+    for o, w in tops.items():
+        outputs[o] = w.status
+    # Last resort for outputs still ``skipped`` (never for ``refuted``): zonotope bounds.
+    skipped = [o for o in out_a if outputs[o] == SKIPPED]
+    if skipped:
+        for o, (proved, detail) in _zonotope_check(
+            orig, simplified, input_ranges, atol, rtol, skipped, deadline
+        ).items():
+            old = tops[o]
+            if proved:
+                tops[o] = Window(
+                    o, o, PROVED_AFFINE, f"{detail} (SMT window: {old.detail})"
+                )
+                outputs[o] = PROVED_AFFINE
+            else:
+                old.detail = f"{old.detail}; {detail}" if old.detail else detail
 
     def collect(w: Window):
         # Only obligations the final verdict actually rests on -- not sub-proofs
@@ -1320,9 +1484,7 @@ def certify(
             collect(c)
 
     for o in out_a:
-        w = prover.prove(ta[o], tb[o])
-        outputs[o] = w.status
-        collect(w)
+        collect(tops[o])
     return CertifyReport(outputs, windows)
 
 

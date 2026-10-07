@@ -8578,7 +8578,17 @@ def _certify_result(orig, simplified, kwargs, explicit):
     from . import certify as _certify
     from . import ranges as _ranges
 
-    annotated = _ranges.get_ranges(orig)
+    # Only annotations on graph *inputs* bound anything certify can use. An output-only
+    # annotation leaves every input unbounded, so it must not defeat the "unproven, annotate
+    # input ranges" downgrade below (it used to: any annotation at all counted).
+    graph_inputs = {i.name for i in orig.graph.input} - {
+        t.name for t in orig.graph.initializer
+    }
+    annotated = {
+        name: box
+        for name, box in _ranges.get_ranges(orig).items()
+        if name in graph_inputs
+    }
     try:
         report = _certify.certify(
             orig,

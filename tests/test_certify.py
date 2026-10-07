@@ -224,12 +224,22 @@ def test_unsupported_op_is_skipped_not_proved():
     assert "Abs" in report.windows[0].detail
 
 
-def test_large_window_is_skipped():
+def test_large_window_is_skipped(monkeypatch):
+    rng = np.random.default_rng(7)
+    model = _conv_bn_relu(rng, relu=False)
+    sim, _ = onnxsim.simplify(model)
+    # Z3 steps only: the zonotope fallback (below) would otherwise prove this linear fold.
+    monkeypatch.setattr(C, "_ZONOTOPE_MAX_ELEMENTS", 0)
+    report = C.certify(model, sim, input_ranges=_BOX, max_work=100)
+    assert report.outputs["y"] == C.SKIPPED and "too large" in report.windows[0].detail
+
+
+def test_large_window_falls_back_to_zonotope():
     rng = np.random.default_rng(7)
     model = _conv_bn_relu(rng, relu=False)
     sim, _ = onnxsim.simplify(model)
     report = C.certify(model, sim, input_ranges=_BOX, max_work=100)
-    assert report.outputs["y"] == C.SKIPPED and "too large" in report.windows[0].detail
+    assert report.ok and report.outputs["y"] == C.PROVED_AFFINE, str(report)
 
 
 def test_mismatched_inputs_raise():
