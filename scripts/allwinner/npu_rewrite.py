@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rewrite an ONNX model (typically a transformer) into operators the Allwinner NPU toolchain documents, before `compile_nbg.py`.
 
-    npu_rewrite.py IN.onnx OUT.onnx [--no-simplify] [--no-check] [--report-only]
+    npu_rewrite.py IN.onnx OUT.onnx [--no-simplify] [--no-check] [--report-only] [--norm-scaling max|none]
 
 Acuity's ONNX importer (ONNX 1.14.0 in Allwinner's operator-support list for the A733) does not list `LayerNormalization`, `Gelu` or
 `Div`, which is what a torch/transformers export of BERT, ViT or LLaMA is made of. This tool, after onnxsim has removed `Identity`/
@@ -66,7 +66,12 @@ def undocumented(model):
 
 
 class _Rewriter:
-    def __init__(self, model):
+    def __init__(self, model, norm_scaling="max"):
+        if norm_scaling not in ("max", "none"):
+            raise ValueError(
+                f"norm_scaling must be 'max' or 'none', not {norm_scaling!r}"
+            )
+        self.norm_scaling = norm_scaling
         self.model = model
         self.graph = model.graph
         self.opset = next(
@@ -124,6 +129,19 @@ class _Rewriter:
             mean(ds^2) = mean(d^2)/m'^2,  eps/m'^2 = eps*r^2,  1/sqrt(mean(ds^2) + eps*r^2) = m'/sqrt(mean(d^2) + eps)
         so ds * that = d/sqrt(mean(d^2) + eps): exact for any m' > 0, and every squared value is at most 1."""
         c = lambda tag, v: self.const(base, tag, v, np_t)  # noqa: E731
+        if self.norm_scaling == "none":
+            # the textbook form, kept for A/B experiments (it overflows fp16 on models with outlier channels)
+            sq = self.emit("Mul", [d, d], base, "sq")
+            veps = self.emit(
+                "Add",
+                [self.reduce_mean(sq, axes, base, "var"), c("eps", eps)],
+                base,
+                "veps",
+            )
+            inv = self.emit(
+                "Reciprocal", [self.emit("Sqrt", [veps], base, "std")], base, "inv"
+            )
+            return self.emit("Mul", [d, inv], base, "n", out=out)
         mx = self.reduce(
             "ReduceMax", self.emit("Abs", [d], base, "ad"), axes, base, "mx"
         )
@@ -362,10 +380,13 @@ class _Rewriter:
         return self.model, self.stats
 
 
-def rewrite(model):
-    """Return (rewritten copy, Counter of rewrites). Does not simplify; see main()."""
+def rewrite(model, norm_scaling="max"):
+    """Return (rewritten copy, Counter of rewrites). Does not simplify; see main().
+
+    norm_scaling: "max" (default) divides each normalization row by its max |x| before squaring so fp16 cannot overflow; "none" emits
+    the textbook d*d form, which is only for A/B experiments."""
     model = onnx.ModelProto.FromString(model.SerializeToString())
-    return _Rewriter(model).run()
+    return _Rewriter(model, norm_scaling).run()
 
 
 # Allwinner's list gives per-operator size limits: Softmax input/output dimensions up to 8191 (16383 on one axis), matrix multiplication
@@ -461,6 +482,12 @@ def main(argv=None):
         action="store_true",
         help="only list operators not in the documented set",
     )
+    p.add_argument(
+        "--norm-scaling",
+        choices=("max", "none"),
+        default="max",
+        help="'max' (default) keeps norm squares inside fp16; 'none' is the textbook form for A/B experiments",
+    )
     a = p.parse_args(argv)
     original = onnx.load(a.input)
     work = original
@@ -483,7 +510,7 @@ def main(argv=None):
     )
     if a.report_only:
         return 0
-    rewritten, stats = rewrite(work)
+    rewritten, stats = rewrite(work, a.norm_scaling)
     rewritten = shape_inference.infer_shapes(rewritten)
     left = undocumented(rewritten)
     print("rewrites:", dict(stats) or "none")

@@ -342,3 +342,36 @@ def test_rewrite_never_reads_weights_or_chokes_on_a_malformed_initializer():
     )
     rewritten, stats = npu.rewrite(model)
     assert not stats and npu.op_histogram(rewritten) == {"Conv": 1}
+
+
+@pytest.mark.parametrize("scaling", ["max", "none"])
+def test_norm_scaling_modes_agree_in_fp32_and_only_max_keeps_squares_small(scaling):
+    # The unscaled form is only for A/B experiments on hardware: identical numbers in fp32, but its squared tensor is the one
+    # that overflows fp16 on models with outlier channels.
+    model = _model(
+        "g (float[2, 3, 8] x) => (float[2, 3, 8] y) { y = LayerNormalization<axis = -1, epsilon = 1e-5>(x, s) }",
+        [_init("s", np.ones(8))],
+    )
+    x = RNG.standard_normal((2, 3, 8)).astype(np.float32)
+    x[..., 0] = 600.0
+    rewritten, _ = npu.rewrite(model, scaling)
+    onnx.checker.check_model(rewritten)
+    np.testing.assert_allclose(
+        _run(rewritten, {"x": x})[0], _run(model, {"x": x})[0], atol=1e-4
+    )
+    probe = onnx.ModelProto.FromString(rewritten.SerializeToString())
+    squares = [n.output[0] for n in probe.graph.node if "__sq" in n.output[0]]
+    probe.graph.ClearField("output")
+    probe.graph.output.extend(
+        onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, None)
+        for t in squares
+    )
+    largest = max(
+        np.abs(v).max() for v in ReferenceEvaluator(probe).run(None, {"x": x})
+    )
+    assert (largest > 65504) == (scaling == "none")
+
+
+def test_unknown_norm_scaling_is_rejected():
+    with pytest.raises(ValueError, match="norm_scaling"):
+        npu.rewrite(_model("g (float[2] x) => (float[2] y) { y = Relu(x) }"), "fast")
