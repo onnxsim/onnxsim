@@ -147,8 +147,9 @@ the analysis claims.
   `MatMul` over a dynamic dimension multiply its range into the hull (`n` items each in
   `[lo, hi]` sum to `[min(n*lo), max(n*hi)]` over `n` in the range). `ReduceMean`,
   `ReduceMax` and `ReduceMin` over a dimension that might be empty return the full hull
-  `(-inf, inf)`. An op without a rule leaves its outputs *unknown* (absent from both
-  `intervals` and `ranged`) and is listed in `IntervalResult.unsupported`.
+  `(-inf, inf)`. An op without a rule is listed in `IntervalResult.unsupported`, and its outputs
+  are *unknown*: with a static shape they get the full hull `(-inf, inf)` in `intervals`; with a
+  ranged (dynamic) shape they are absent from both `intervals` and `ranged`.
 - **A scalar hull is coarse.** `NonZero` indices are one hull over all rows, not one per row;
   `Gather` by them gives the data hull and loses any per-element structure of the data.
 - **Reshape targets must be exact where it matters.** A target entry that *might* be `0` or

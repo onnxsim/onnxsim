@@ -300,6 +300,39 @@ Limits of the prototype: windows are encoded at their real shape (budget-limited
 Convs are `skipped`; shrinking spatial dims for shape-generic windows is the obvious next step. 2-D Conv only.
 Reals, not fp32 evaluation. Not yet wired into `simplify()` or the CLI.
 
+## 7. Training graphs: gradient vanishing and precision
+
+A training step is an ONNX graph whose outputs include gradients, so the interval and roundoff
+analyses apply to it directly. `onnxsim/grad_health.py` checks two things per gradient over an
+input box: whether its magnitude bound is below the precision's underflow range (`dead`,
+`flushed`, `subnormal`; a proof, because the bound holds for every point of the box), and whether
+its roundoff bound from `fp_error.roundoff_bound` reaches the magnitude (`imprecise`).
+
+What the literature covers:
+
+- Vanishing and exploding gradients were characterised for recurrent nets by Bengio, Simard and
+  Frasconi (1994), and analysed further with gradient clipping by Pascanu, Mikolov and Bengio
+  (2013). A 2024 paper revisits the question for recurrent networks.
+- Low-precision underflow is the reason mixed-precision training keeps FP32 master weights and
+  scales the loss before the backward pass (Micikevicius et al., 2017). Adaptive loss scaling
+  (2019) chooses the scale automatically.
+- Training-run monitors look for silent numerical faults at runtime (TrainCheck; mechanism-driven
+  monitors for LLM training instability). They observe a run; they do not bound a gradient over
+  a box before the run.
+- Static floating-point analysis is mature for straight-line code (Higham's rounding-error
+  analysis; Satire's rigorous mixed-precision bounds; a reduced product of absolute and relative
+  error bounds). Recent work applies it to neural-network libraries and operators: automatic
+  precision estimation, backward error analysis of networks in floating point, and numerical
+  stability analysis of deep-learning operators.
+- Interval bounds can be loose on deep networks; a 2024 paper revisits interval bound propagation
+  for verification.
+
+Gap: the searches here found no work that combines a sound per-gradient magnitude bound with a
+roundoff bound on an ONNX training graph and reports underflow proofs. That combination is what
+`grad_health` does. Its limits: interval magnitudes grow with depth, so `imprecise` can come from
+loose bounds; ops without an error model make their gradients imprecise; `flushed` assumes
+round-to-nearest in the stated precision.
+
 ## Sources
 
 - zkML overview: <https://kudelskisecurity.com/modern-ciso-blog/zkml-verifiable-machine-learning-using-zero-knowledge-proof>
@@ -318,3 +351,21 @@ Reals, not fp32 evaluation. Not yet wired into `simplify()` or the CLI.
 - PyRAT: <https://arxiv.org/html/2410.23903v1>
 - Marabou: <https://github.com/neuralnetworkverification/Marabou/>
 - MPFI: <https://hal-univ-tlse3.archives-ouvertes.fr/INRIA/inria-00100985>
+
+### Training graphs and precision
+
+- Bengio, Simard, Frasconi, "Learning long-term dependencies with gradient descent is difficult", IEEE TNN 5(2), 1994: <https://doi.org/10.1109/72.279181>
+- Pascanu, Mikolov, Bengio, "On the difficulty of training Recurrent Neural Networks" (2013): <https://arxiv.org/abs/1211.5063>
+- Recurrent neural networks: vanishing and exploding gradients are not the end of the story (2024): <https://arxiv.org/abs/2405.21064>
+- Micikevicius et al., "Mixed Precision Training" (2017): <https://arxiv.org/abs/1710.03740>
+- Adaptive Loss Scaling for Mixed Precision Training (2019): <https://arxiv.org/abs/1910.12385>
+- A Convergence Analysis of Adaptive Optimizers under Floating-point Quantization (2025): <https://arxiv.org/abs/2510.21314>
+- TrainCheck: Catching Silent Errors in Deep Learning Training with Automated Proactive Checks (2025): <https://arxiv.org/abs/2506.14813>
+- Mechanism-Driven Monitors for Preemptive Detection of LLM Training Instability (2026): <https://arxiv.org/abs/2606.28116>
+- Satire: Computing Rigorous Bounds for Floating-Point Rounding Error in Mixed-Precision Loop-Free Programs (2025): <https://arxiv.org/abs/2503.05924>
+- A Reduced Product of Absolute and Relative Error Bounds for Floating-Point Analysis: <https://researchportal.ip-paris.fr/en/publications/a-reduced-product-of-absolute-and-relative-error-bounds-for-float/>
+- Algorithms and data structures for automatic precision estimation of neural networks (2025): <https://arxiv.org/abs/2509.24607>
+- Deterministic and probabilistic backward error analysis of neural networks in floating-point arithmetic: <https://hal.sorbonne-universite.fr/NUMPEX/hal-04663142v1>
+- Automated Numerical Stability Analysis of Deep Learning Operators (2026): <https://arxiv.org/abs/2607.25494>
+- When AllClose Fails: Round Off Error Estimation for Deep Learning Programs (ASE 2025): <https://conf.researchr.org/details/ase-2025/ase-2025-papers/118/When-AllClose-Fails-Round-Off-Error-Estimation-for-Deep-Learning-Programs>
+- Make Interval Bound Propagation great again (2024): <https://arxiv.org/abs/2410.03373>
