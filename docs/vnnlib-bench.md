@@ -23,8 +23,8 @@ competitiveness.
   ...) raises `VnnlibError` -> verdict `unsupported`. It never guesses.
 * `verify(model, prop, engine, timeout, budget, attack, ...) -> Verdict`.
   The convention is VNN-COMP's: the file describes the **unsafe** region.
-  `unsat` = proved safe (published string `holds`), `sat` = a counterexample that **replays on
-  onnxruntime** (published `violated`), `unknown`, `unsupported`.
+  `unsat` = proved safe, `sat` = a counterexample that **replays on onnxruntime**, `unknown`,
+  `unsupported`.
 * Proof rule: a clause (input box + atoms `a.Y <= b`) is empty if for one atom the proven lower
   bound of `a.Y` exceeds `b` (small relative margin). The property is safe iff every clause is empty.
   The engines bound a spec model (`MatMul(Flatten(Y), A^T)`), `A` must be exactly float32.
@@ -58,6 +58,35 @@ Engines: `ibp`, `zonotope`, `crown` (backward CROWN with intermediate refinement
 
 Reproduce (not part of CI, needs downloads): `scripts/vnncomp_bench.py run|summary|export-specs|tightness`,
 `scripts/vnncomp_ref_bounds.py`.
+
+## Running as a VNN-COMP tool (2025 harness)
+
+`scripts/vnncomp/{install_tool,prepare_instance,run_instance}.sh` implement the tool side of the
+VNN-COMP 2025 harness (`run_single_instance.sh v1 <tool> <category> <onnx> <vnnlib> <timeout> ...`
+calls `prepare_instance.sh v1 <category> <onnx> <vnnlib>`, then
+`run_instance.sh v1 <category> <onnx> <vnnlib> out.txt <timeout>`, and reads `out.txt`).
+`run_instance.sh` writes the first line of `<results>`:
+
+* `unsat` (proved safe); `unknown` (also for properties outside the supported subset, which the
+  protocol has no separate word for); `error` (an exception, e.g. a missing file; the traceback
+  goes to stderr);
+* `sat`, a counterexample that replays on onnxruntime, followed by a block of lines
+  `(X_i v)` for the inputs and `(Y_j v)` for the outputs, wrapped in `(` / `)` on their own lines;
+* `timeout`: written by a watchdog `min(5 s, 10 %)` before the limit, after which the process
+  exits with status 0. The file is replaced atomically, so the harness never reads a partial word.
+
+The same logic is `python -m onnxsim.vnnlib run ONNX VNNLIB RESULTS TIMEOUT [--engine bab]
+[--budget 200]`. Tests: `tests/test_vnnlib.py` (words, counterexample block, unsupported / error
+mapping, the watchdog in a subprocess, the CLI).
+
+The counterexample block follows the harness (`sed 's/^sat (/sat\n(/'` and `tail --lines=+2`). The
+2024 and 2025 rules, read through a summarising fetch rather than verbatim, show the witness as
+`((X_0 ...)` ... `(Y_j ...))` after `sat`: the same s-expression with different whitespace. Not
+checked against the official checker itself.
+
+Not implemented:
+
+* The benchmark argument is ignored: every benchmark gets the same engine and budget.
 
 ## 1. Soundness (first, because it is the point)
 
