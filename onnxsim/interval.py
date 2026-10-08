@@ -266,6 +266,13 @@ _INT_CAST = {
     onnx.TensorProto.INT64, onnx.TensorProto.UINT8, onnx.TensorProto.UINT16,
     onnx.TensorProto.UINT32, onnx.TensorProto.UINT64,
 }  # fmt: skip
+# Cast target -> (relative, absolute) rounding error of a float64 value stored in it
+_FLOAT_ROUNDING = {
+    onnx.TensorProto.FLOAT16: (2.0**-10, 2.0**-24),
+    onnx.TensorProto.BFLOAT16: (2.0**-7, 2.0**-133),
+    onnx.TensorProto.FLOAT: (2.0**-22, 2.0**-149),
+    onnx.TensorProto.DOUBLE: (0.0, 0.0),
+}
 
 
 def _mul0(a: float, b: float) -> float:
@@ -982,6 +989,34 @@ def propagate(
                 iv[outs[0]] = _widen(lo, hi)  # non-negative weights: apply to lo and hi
             elif t in ("Softmax",):
                 iv[outs[0]] = (np.zeros(ins[0][0].shape), np.ones(ins[0][0].shape))
+            elif t == "Gelu":
+                # x * Phi(x) with 0 <= Phi <= 1, so |Gelu(x)| <= |x|; global min is -0.16997
+                m = np.maximum(np.abs(ins[0][0]), np.abs(ins[0][1])) * (1 + 1e-6)
+                iv[outs[0]] = (np.maximum(-m, -0.1701), m)
+            elif t == "Sum":
+                iv[outs[0]] = _widen(sum(i[0] for i in ins), sum(i[1] for i in ins))
+            elif t == "Cast" and int(_attrs(node)["to"]) in _FLOAT_ROUNDING:
+                rel, tiny = _FLOAT_ROUNDING[int(_attrs(node)["to"])]
+                lo, hi = ins[0]
+                with np.errstate(invalid="ignore"):
+                    lo = lo - rel * np.abs(lo) - tiny
+                    hi = hi + rel * np.abs(hi) + tiny
+                iv[outs[0]] = _widen(lo, hi)
+            elif t == "LayerNormalization" and len(ins) in (2, 3):
+                x, s = ins[0], ins[1]
+                b = ins[2] if len(ins) == 3 else (np.zeros(1), np.zeros(1))
+                if not (_finite(x) and _finite(s) and _finite(b)):
+                    raise _Unbounded(t)
+                axis = int(_attrs(node).get("axis", -1))
+                rank = len(x[0].shape)
+                n = int(np.prod(x[0].shape[axis % rank :]))
+                # |x - mean| <= sqrt(n * var), so each normalized element is in [-sqrt(n), sqrt(n)]
+                z = np.sqrt(n) * (1 + 1e-6)
+                scaled = [s[0] * -z, s[0] * z, s[1] * -z, s[1] * z]
+                lo = np.minimum.reduce(scaled) + b[0]
+                hi = np.maximum.reduce(scaled) + b[1]
+                lo, hi, _ = np.broadcast_arrays(lo, hi, x[0])
+                iv[outs[0]] = _widen(lo, hi)
             elif (
                 t in _MONOTONE
                 or t == "LeakyRelu"
