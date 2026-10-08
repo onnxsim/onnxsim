@@ -4,6 +4,9 @@ Everything here is small, deterministic and offline. The public-benchmark confor
 in scripts/vnncomp_bench.py (not part of CI) and are described in docs/vnnlib-bench.md.
 """
 
+import subprocess
+import sys
+
 import numpy as np
 import onnx
 import onnxruntime as ort
@@ -430,3 +433,65 @@ def test_sat_counterexamples_always_replay_on_the_given_network():
     assert prop.violated_by(x, y) and np.allclose(
         y, forward(x.astype(np.float32)), atol=1e-5
     )
+
+
+# ---- VNN-COMP run_instance protocol ----------------------------------------------
+
+
+def _instance(tmp_path, prop_text, model=_LINEAR):
+    onnx_path = tmp_path / "net.onnx"
+    onnx.save(model, onnx_path)
+    vnn = tmp_path / "prop.vnnlib"
+    vnn.write_text(prop_text)
+    return str(onnx_path), str(vnn), str(tmp_path / "result.txt")
+
+
+def test_run_instance_writes_the_protocol_word(tmp_path):
+    onnx_path, vnn, out = _instance(tmp_path, _SAFE)
+    assert V.run_instance(onnx_path, vnn, out, 30, engine="crown") == "unsat"
+    with open(out) as f:
+        assert f.read() == "unsat\n"
+
+
+def test_run_instance_sat_writes_the_counterexample_block(tmp_path):
+    onnx_path, vnn, out = _instance(tmp_path, _UNSAFE)
+    assert V.run_instance(onnx_path, vnn, out, 30, engine="crown") == "sat"
+    with open(out) as f:
+        lines = f.read().splitlines()
+    assert lines[0] == "sat" and lines[1] == "(" and lines[-1] == ")"
+    pairs = [line[1:-1].split(" ") for line in lines[2:-1]]
+    assert [name for name, _ in pairs] == ["X_0", "X_1", "Y_0"]
+    assert all(np.isfinite(float(v)) for _, v in pairs)
+
+
+def test_run_instance_maps_unsupported_to_unknown_and_failures_to_error(tmp_path):
+    nonlinear = _HDR1 + _BOX01 + "(assert (<= (* Y_0 Y_0) 1.0))"
+    onnx_path, vnn, out = _instance(tmp_path, nonlinear)
+    assert V.run_instance(onnx_path, vnn, out, 30) == "unknown"
+    assert (
+        V.run_instance(onnx_path, str(tmp_path / "missing.vnnlib"), out, 30) == "error"
+    )
+    with open(out) as f:
+        assert f.read() == "error\n"
+
+
+def test_watchdog_writes_timeout_and_exits_cleanly_when_the_answer_is_late(tmp_path):
+    onnx_path, vnn, out = _instance(tmp_path, _SAFE)
+    code = (
+        "import time\n"
+        "import onnxsim.vnnlib as V\n"
+        "V.verify = lambda *a, **k: time.sleep(60)\n"
+        f"V.main(['run', {onnx_path!r}, {vnn!r}, {out!r}, '1'])\n"
+        "raise SystemExit('watchdog did not end the process')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode()
+    with open(out) as f:
+        assert f.read() == "timeout\n"
+
+
+def test_cli_run_subcommand(tmp_path):
+    onnx_path, vnn, out = _instance(tmp_path, _UNSAFE)
+    assert V.main(["run", onnx_path, vnn, out, "30", "--engine", "crown"]) == 0
+    with open(out) as f:
+        assert f.readline() == "sat\n"

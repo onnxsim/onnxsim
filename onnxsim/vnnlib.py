@@ -43,10 +43,15 @@ counterexample could in principle disagree with a replay; ``verify`` reports suc
 ``inconsistent`` instead of choosing one silently.
 """
 
+import argparse
 import dataclasses
 import itertools
+import os
 import re
+import sys
+import threading
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -965,3 +970,120 @@ def verify(
     return done(
         UNKNOWN, "the bounds do not exclude the unsafe region", clauses=nclauses
     )
+
+
+# --------------------------------------------------------------------------
+# VNN-COMP tool protocol (2025): run_instance.sh writes the result file the harness reads
+# --------------------------------------------------------------------------
+
+VNNCOMP_WORD = {
+    UNSAT: "unsat",
+    SAT: "sat",
+    UNKNOWN: "unknown",
+    UNSUPPORTED: "unknown",
+}
+_WATCHDOG_MARGIN = (
+    5.0  # seconds before the limit at which the "timeout" word is written
+)
+
+
+def _format_counterexample(x: np.ndarray, y: np.ndarray) -> str:
+    entries = [f"(X_{i} {float(v)!r})" for i, v in enumerate(np.ravel(x))]
+    entries += [f"(Y_{j} {float(v)!r})" for j, v in enumerate(np.ravel(y))]
+    return "(\n" + "\n".join(entries) + "\n)\n"
+
+
+def _write_result(path: str, word: str, counterexample: str = "") -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(word + "\n" + counterexample)
+    os.replace(tmp, path)
+
+
+def run_instance(
+    onnx_path: str,
+    vnnlib_path: str,
+    results_path: str,
+    timeout: float,
+    engine: str = "bab",
+    budget: int = 200,
+) -> str:
+    """Answer one VNN-COMP instance, write its one-word result file, and return the word.
+
+    The first line is ``unsat``, ``sat`` (followed by the replayed counterexample as
+    ``(X_i v)`` / ``(Y_j v)`` lines), ``unknown`` (including unsupported properties, which
+    the protocol has no separate word for), ``timeout`` or ``error``. If the answer is not
+    ready close to ``timeout`` seconds, a watchdog writes ``timeout`` and ends the process,
+    so the harness never reads a missing or stale file.
+    """
+    lock = threading.Lock()
+    settled = []
+
+    def settle(word: str, counterexample: str = "") -> bool:
+        with lock:
+            if settled:
+                return False
+            settled.append(word)
+            _write_result(results_path, word, counterexample)
+            return True
+
+    def on_deadline() -> None:
+        if settle("timeout"):
+            os._exit(0)
+
+    margin = min(_WATCHDOG_MARGIN, 0.1 * timeout)
+    watchdog = threading.Timer(max(timeout - margin, 0.0), on_deadline)
+    watchdog.daemon = True
+    watchdog.start()
+    counterexample = ""
+    try:
+        v = verify(
+            onnx_path,
+            vnnlib_path,
+            engine=engine,
+            timeout=max(timeout - margin, 1.0),
+            budget=budget,
+        )
+        word = VNNCOMP_WORD[v.status]
+        if v.status == SAT and v.counterexample is not None:
+            counterexample = _format_counterexample(*v.counterexample)
+        print(
+            f"{word}: {v.status} via {v.engine} in {v.seconds:.2f}s: {v.detail}",
+            file=sys.stderr,
+        )
+        if v.inconsistent:
+            print(
+                "warning: the verdict is inconsistent, see the detail above",
+                file=sys.stderr,
+            )
+    except Exception:
+        traceback.print_exc()
+        word = "error"
+    settle(word, counterexample)
+    watchdog.cancel()
+    return word
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="python -m onnxsim.vnnlib", description=__doc__.split("\n")[0]
+    )
+    sub = ap.add_subparsers(dest="command", required=True)
+    run = sub.add_parser(
+        "run", help="answer one VNN-COMP instance (run_instance protocol)"
+    )
+    run.add_argument("onnx")
+    run.add_argument("vnnlib")
+    run.add_argument("results")
+    run.add_argument("timeout", type=float, help="seconds")
+    run.add_argument("--engine", default="bab", choices=ENGINES)
+    run.add_argument("--budget", type=int, default=200, help="BaB regions per clause")
+    args = ap.parse_args(argv)
+    run_instance(
+        args.onnx, args.vnnlib, args.results, args.timeout, args.engine, args.budget
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
