@@ -117,6 +117,7 @@ class _Ctx:
     attrs: Dict[str, Any]
     fmax: float  # largest finite value of the output dtype
     in_dtype: int = TensorProto.FLOAT
+    positions: Tuple[int, ...] = ()  # node input index of each operand in ``ins``
 
     @property
     def size(self) -> int:
@@ -333,6 +334,47 @@ def _matmul(c: _Ctx) -> List[Hit]:
     return _inf_operand(c) + _overflow(c, bound, "dot products")
 
 
+def _einsum(c: _Ctx) -> List[Hit]:
+    equation = c.attrs.get("equation", "")
+    if isinstance(equation, bytes):
+        equation = equation.decode()
+    bound = _interval.einsum_term_count(equation, c.in_shapes) * math.prod(
+        _maxabs(x) for x in c.ins
+    )
+    return _inf_operand(c) + _overflow(c, bound, "products summed into one output")
+
+
+def _attention(c: _Ctx) -> List[Hit]:
+    role = {pos: i for i, pos in enumerate(c.positions)}
+    head = c.in_shapes[0][-1] if c.in_shapes[0] else 1
+    if "scale" in c.attrs:
+        scale = abs(float(c.attrs["scale"]))
+    else:
+        scale = 1.0 / math.sqrt(head) if len(c.in_shapes[0]) == 4 else 1.0
+    keys = [c.ins[role[1]]] + ([c.ins[role[4]]] if 4 in role else [])
+    extras = [c.ins[i] for p, i in role.items() if p >= 3]
+    logits = head * _maxabs(c.ins[role[0]]) * max(
+        _maxabs(k) for k in keys
+    ) * scale + max((_maxabs(x) for x in extras), default=0.0)
+    hits = _inf_operand(c)
+    fmax = _FLOAT_MAX.get(c.in_dtype, c.fmax)
+    if (
+        float(c.attrs.get("softcap", 0.0)) <= 0
+        and math.isfinite(logits)
+        and logits > fmax
+    ):
+        hits.append(
+            (
+                "nan",
+                c.size,
+                f"attention logits may overflow past {fmax:.3g} before softmax",
+            )
+        )
+    if 6 in role:
+        hits.append(("nan", c.size, "nonpad_kv_seqlen may mask every key of a row"))
+    return hits
+
+
 def _gemm(c: _Ctx) -> List[Hit]:
     a_shape = c.in_shapes[0]
     trans_a = int(c.attrs.get("transA", 0))
@@ -475,6 +517,8 @@ _RULES: Dict[str, Rule] = {
     "ReduceSumSquare": _reduce_square_sum,
     "CumSum": _cumsum,
     "MatMul": _matmul,
+    "Einsum": _einsum,
+    "Attention": _attention,
     "Gemm": _gemm,
     "Conv": _conv,
     "ConvTranspose": _conv_transpose,
@@ -589,6 +633,7 @@ def check_nan(
             attrs={a.name: helper.get_attribute_value(a) for a in node.attribute},
             fmax=out_fmax,
             in_dtype=dtypes.get(operands[0], TensorProto.FLOAT),
+            positions=tuple(i for i, n in enumerate(node.input) if n),
         )
         if op in _RULES:
             hits = _RULES[op](ctx)

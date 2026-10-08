@@ -404,3 +404,55 @@ agraph (float[4] X) => (float[4] Y, float[4] Z) {
 """
     rep = check_nan(_model(body), {"X": (-1.0, 1.0)})
     assert rep.complete and rep.finite
+
+
+_EINSUM = """
+agraph (float[2,3] A, float[3,2] B) => (float[2,2] Y) {
+    Y = Einsum<equation="ij,jk->ik">(A, B)
+}
+"""
+
+_ATTENTION = """
+agraph (float[1,1,2,4] Q, float[1,1,2,4] K, float[1,1,2,4] V) => (float[1,1,2,4] Y) {
+    Y = Attention(Q, K, V)
+}
+"""
+
+
+def test_einsum_bounded_inputs_are_modelled_and_finite():
+    rep = check_nan(_model(_EINSUM, opset=15), {"A": (-1, 1), "B": (-1, 1)})
+    assert rep.complete and rep.finite
+
+
+def test_einsum_unbounded_operand_may_be_infinite():
+    rep = check_nan(_model(_EINSUM, opset=15))
+    assert not rep.nan_free
+
+
+def test_einsum_sum_of_products_may_overflow_float32():
+    rep = check_nan(_model(_EINSUM, opset=15), {"A": (-1e20, 1e20), "B": (-1e20, 1e20)})
+    assert any(h.kind == "inf" and h.op_type == "Einsum" for h in rep.hazards)
+
+
+def test_attention_bounded_inputs_are_modelled_and_finite():
+    ranges = {"Q": (-1, 1), "K": (-1, 1), "V": (-1, 1)}
+    rep = check_nan(_model(_ATTENTION, opset=23), ranges)
+    assert rep.complete and rep.finite
+
+
+def test_attention_logits_overflow_leaves_nan_in_softmax():
+    ranges = {"Q": (-1e20, 1e20), "K": (-1e20, 1e20), "V": (-1, 1)}
+    rep = check_nan(_model(_ATTENTION, opset=23), ranges)
+    assert any("logits" in h.detail for h in rep.hazards)
+    assert not rep.nan_free
+
+
+def test_attention_softcap_bounds_logits():
+    body = """
+agraph (float[1,1,2,4] Q, float[1,1,2,4] K, float[1,1,2,4] V) => (float[1,1,2,4] Y) {
+    Y = Attention<softcap=30.0>(Q, K, V)
+}
+"""
+    ranges = {"Q": (-1e20, 1e20), "K": (-1e20, 1e20), "V": (-1, 1)}
+    rep = check_nan(_model(body, opset=23), ranges)
+    assert not any("logits" in h.detail for h in rep.hazards)
