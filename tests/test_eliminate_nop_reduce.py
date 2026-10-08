@@ -28,7 +28,7 @@ def _run(model, pass_name, **kwargs):
 
 def _model(body, initializer=(), opset=13, ir_version=10):
     model = parser.parse_model(
-        f"<ir_version: {ir_version}, opset_import: [\"\": {opset}]> {body}"
+        f'<ir_version: {ir_version}, opset_import: ["": {opset}]> {body}'
     )
     model.graph.initializer.extend(initializer)
     return model
@@ -164,7 +164,12 @@ def test_reduce_declines_on_symbolic_dim():
         }
         """
     )
-    _, ops = _run(model, "eliminate_nop_reduce", dynamic_input_shape=True, test_input_shapes={"X": [3, 4]})
+    _, ops = _run(
+        model,
+        "eliminate_nop_reduce",
+        dynamic_input_shape=True,
+        test_input_shapes={"X": [3, 4]},
+    )
     assert ops["ReduceSum"] == 1
 
 
@@ -279,5 +284,10 @@ def test_softmax_declines_on_symbolic_axis_dim():
         }
         """
     )
-    _, ops = _run(model, "eliminate_nop_softmax", dynamic_input_shape=True, test_input_shapes={"X": [2, 5]})
+    _, ops = _run(
+        model,
+        "eliminate_nop_softmax",
+        dynamic_input_shape=True,
+        test_input_shapes={"X": [2, 5]},
+    )
     assert ops["Softmax"] == 1
