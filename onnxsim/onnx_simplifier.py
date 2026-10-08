@@ -8728,6 +8728,117 @@ def _with_certify(fn):
     return wrapper
 
 
+def _set_metadata(model: onnx.ModelProto, key: str, value: str) -> None:
+    for p in list(model.metadata_props):
+        if p.key == key:
+            model.metadata_props.remove(p)
+    entry = model.metadata_props.add()
+    entry.key, entry.value = key, value
+
+
+def _nan_verdict(model: onnx.ModelProto) -> Tuple[str, str]:
+    from . import nan_check
+
+    rep = nan_check.check_nan(model)
+    status = "finite" if rep.finite else "nan-free" if rep.nan_free else "nan reachable"
+    details = [
+        f"{h.tensor} ({h.op_type}) {h.kind}: {h.detail}" for h in rep.hazards[:3]
+    ]
+    if rep.unmodelled:
+        details.append(f"unmodelled ops {rep.unmodelled}")
+    if rep.unanalysed:
+        details.append(f"{len(rep.unanalysed)} tensor(s) without an interval")
+    return status, "; ".join(details)
+
+
+def _gradient_verdict(model: onnx.ModelProto, precision: str) -> Tuple[str, str]:
+    from . import grad_health
+
+    rep = grad_health.check_gradient_health(model, precision=precision)
+    status = "healthy" if rep.healthy else "unhealthy"
+    details = [f"{f.tensor} {f.kind}: {f.detail}" for f in rep.findings[:3]]
+    if rep.unanalysed:
+        details.append(f"{len(rep.unanalysed)} gradient(s) without a bound")
+    return status, "; ".join(details)
+
+
+def _run_hazard_check(
+    model: onnx.ModelProto, key: str, label: str, verdict: Callable[[], Tuple[str, str]]
+) -> None:
+    try:
+        status, detail = verdict()
+    except Exception as e:  # a checker failure must never fail simplify
+        status, detail = "error", f"{type(e).__name__}: {e}"
+        print(Text(f"WARNING: {label} failed internally: {detail}", style="bold red"))
+    else:
+        style = "bold yellow" if status in ("nan reachable", "unhealthy") else None
+        print(
+            Text(f"{label}: {status}" + (f" ({detail})" if detail else ""), style=style)
+        )
+    _set_metadata(model, key, f"{status}: {detail}"[:1000])
+
+
+def _with_hazard_checks(fn):
+    """Wrap ``simplify`` so it can also check its own result for NaN/Inf hazards and for
+    gradient health (both opt-in, both off by default).
+
+    ``check_hazards=True`` runs :func:`onnxsim.nan_check.check_nan` on the simplified model;
+    ``check_gradients=True`` runs :func:`onnxsim.grad_health.check_gradient_health` on it with its
+    graph outputs taken as gradients, at ``gradient_precision``. Input boxes come from
+    ``onnxsim.ranges`` annotations. Verdicts are printed and recorded in ``metadata_props``
+    (``onnxsim.nan_check``, ``onnxsim.gradient_health``); a failing check is reported, never raised.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(
+        *args,
+        check_hazards=False,
+        check_gradients=False,
+        gradient_precision="fp32",
+        **kwargs,
+    ):
+        if check_gradients and gradient_precision not in ("fp32", "fp16", "bf16"):
+            raise ValueError(f"unknown gradient_precision {gradient_precision!r}")
+        result = fn(*args, **kwargs)
+        simplified = result[0]
+        if not (check_hazards or check_gradients) or not isinstance(
+            simplified, onnx.ModelProto
+        ):
+            return result
+        if check_hazards:
+            _run_hazard_check(
+                simplified,
+                "onnxsim.nan_check",
+                "NaN check",
+                lambda: _nan_verdict(simplified),
+            )
+        if check_gradients:
+            _run_hazard_check(
+                simplified,
+                "onnxsim.gradient_health",
+                "Gradient health",
+                lambda: _gradient_verdict(simplified, gradient_precision),
+            )
+        return result
+
+    sig = inspect.signature(fn)
+    wrapper.__signature__ = sig.replace(
+        parameters=list(sig.parameters.values())
+        + [
+            inspect.Parameter(
+                name, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=ann
+            )
+            for name, default, ann in (
+                ("check_hazards", False, bool),
+                ("check_gradients", False, bool),
+                ("gradient_precision", "fp32", str),
+            )
+        ]
+    )
+    return wrapper
+
+
+@_with_hazard_checks
 @_with_certify
 def simplify(
     model: Union[str, onnx.ModelProto],
@@ -8778,6 +8889,15 @@ def simplify(
             model's ``metadata_props`` (``onnxsim.certify``). Input ranges come from
             ``onnxsim.ranges`` annotations on the model; without them a proof can only hold for
             unbounded inputs, which a folded BatchNorm cannot satisfy exactly.
+    :param check_hazards: Opt in: report the NaN/Inf hazards of the simplified model
+            (:func:`onnxsim.nan_check.check_nan`). Input boxes come from ``onnxsim.ranges``
+            annotations; without them most arithmetic is reported. Stored in
+            ``metadata_props["onnxsim.nan_check"]``.
+    :param check_gradients: Opt in: check the simplified model's graph outputs as gradients for
+            underflow and rounding loss (:func:`onnxsim.grad_health.check_gradient_health`).
+            Stored in ``metadata_props["onnxsim.gradient_health"]``.
+    :param gradient_precision: Format the gradients are computed in for ``check_gradients``:
+            ``"fp32"`` (default), ``"fp16"`` or ``"bf16"``.
     :param perform_optimization: Whether to run onnx optimizer on the model
     :param skip_fuse_bn: Skip fuse_bn_into_conv onnx optimizer
     :param overwrite_input_shapes: If the model has dynamic input shape, user must pass a fixed input shape
