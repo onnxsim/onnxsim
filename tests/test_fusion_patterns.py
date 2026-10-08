@@ -578,15 +578,17 @@ def test_fuse_consecutive_reduce_declines_different_kind():
     # combine associatively across a shared axis group.
     model = _model(
         """
-        g (float[2,3,4] X) => (float[2,3] Z)
-        <int64[1] ax = {2}>
+        g (float[2,3,4] X) => (float[2,1] Z)
+        <int64[1] ax = {2}, int64[1] ax2 = {1}>
         {
           y = ReduceSum<keepdims = 1>(X, ax)
-          Z = ReduceMax<keepdims = 0>(y, ax)
+          Z = ReduceMax<keepdims = 0>(y, ax2)
         }
         """,
         opset=18,
     )
+    # The second reduction runs over a non-unit axis (axis 2 of `y` would be
+    # size 1, which eliminate_nop_reduce would turn into a Squeeze instead).
     _, ops = _simplify(model)
     assert ops["ReduceSum"] == 1
     assert ops["ReduceMax"] == 1
