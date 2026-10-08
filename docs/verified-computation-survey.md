@@ -151,6 +151,9 @@ Where IA fits:
    weight set exactly (`sum|w| * max|x|`), and can prove no saturation.
 4. **zkML.** Circuits over fields or fixed-point need a proof of no overflow or
    wraparound. IA gives that bound statically and picks the bit width.
+   `onnxsim.overflow_certificate.certify_no_overflow` does this for a signed `bits`
+   window or a prime field `F_p`. Accumulators are bounded by the worst partial sum,
+   and any unbounded value makes the graph fail to certify.
 5. **Shape and index bounds.** `sym_shape_infer` already reasons symbolically about
    dims. Adding integer intervals for dynamic dims would justify slice/gather
    index-in-range facts.
