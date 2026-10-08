@@ -100,7 +100,7 @@ import onnx.inliner
 import onnx.numpy_helper
 import onnx.shape_inference
 
-from onnxsim import backend, graph_grad, qat_graph
+from onnxsim import backend, grad_health, graph_grad, qat_graph
 
 # Same pairing onnxsim.qat_graph builds every step graph at, and the reason:
 # qat_graph.make_step_graph fixes its own opset_imports to this regardless of
@@ -565,6 +565,16 @@ class TrainingLoop:
     #: gradients underflow fast). Non-float edges (int64 shapes/indices,
     #: boolean masks, quantized codes) are left untouched.
     backward_precision: str = "float32"
+    #: Input ranges ``{input: (lo, hi)}`` over the step's free inputs (data, labels, the loss
+    #: seed, the parameters). When set, :meth:`_compile` checks the gradients it builds for
+    #: underflow and rounding loss (:func:`onnxsim.grad_health.check_backward_health`) and keeps
+    #: the verdict in :attr:`gradient_report`. Checked before loss scaling and the fp16 cast.
+    gradient_ranges: Optional[Dict[str, Tuple[float, float]]] = None
+    #: Verdict of the gradient check requested by :attr:`gradient_ranges`; ``None`` until the
+    #: step compiles, or always when that check was not requested.
+    gradient_report: Optional[grad_health.GradHealthReport] = field(
+        default=None, init=False, repr=False
+    )
 
     _step: Optional[qat_graph.StepGraph] = field(default=None, init=False, repr=False)
     _runner: Optional[backend.Runner] = field(default=None, init=False, repr=False)
@@ -809,6 +819,15 @@ class TrainingLoop:
             grad_outputs={self.loss_output: seed},
             targets=list(self.params),
         )
+        if self.gradient_ranges is not None:
+            self.gradient_report = grad_health.check_backward_health(
+                b,
+                shapes,
+                grads,
+                self.gradient_ranges,
+                precision="fp16" if self.backward_precision == "float16" else "fp32",
+                elem_types=elem_types,
+            )
         if self.backward_precision == "float16":
             grads = _cast_backward_to_fp16(b, n_fwd, len(b.nodes), elem_types, grads)
         if self.loss_scale != 1.0:
@@ -1080,6 +1099,7 @@ def compile_training_loop(
     forward_providers: Optional[Sequence[backend.Provider]] = None,
     loss_scale: float = 1.0,
     backward_precision: str = "float32",
+    gradient_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> TrainingLoop:
     """Wraps ``model`` as a ``torch.compile``-styled training loop.
 
@@ -1118,6 +1138,8 @@ def compile_training_loop(
             see :attr:`TrainingLoop.backward_precision`. Combine ``"float16"``
             with a large :param:`loss_scale`: unscaled fp16 gradients
             underflow fast.
+    :param gradient_ranges: input boxes for the gradient health check run at
+            compile time -- see :attr:`TrainingLoop.gradient_ranges`.
     """
     return TrainingLoop(
         model=model,
@@ -1130,4 +1152,5 @@ def compile_training_loop(
         forward_providers=forward_providers,
         loss_scale=loss_scale,
         backward_precision=backward_precision,
+        gradient_ranges=gradient_ranges,
     )
