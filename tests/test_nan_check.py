@@ -102,22 +102,22 @@ def test_unbounded_input_flags_arithmetic():
 def test_unmodelled_op_is_listed_and_does_not_block_nan_free():
     body = """
 agraph (float[4] X) => (float[4] Y) {
-    Y = Softmax(X)
+    Y = Hardmax(X)
 }
 """
     rep = check_nan(_model(body), {"X": (-1.0, 1.0)})
-    assert rep.unmodelled == ["Softmax"]
+    assert rep.unmodelled == ["Hardmax"]
     assert rep.nan_free and not rep.complete
 
 
 def test_unmodelled_op_with_unbounded_operand_is_nan_hazard():
     body = """
 agraph (float[4] X) => (float[4] Y) {
-    Y = Softmax(X)
+    Y = Hardmax(X)
 }
 """
     rep = check_nan(_model(body))
-    assert any(h.op_type == "Softmax" and h.kind == "nan" for h in rep.hazards)
+    assert any(h.op_type == "Hardmax" and h.kind == "nan" for h in rep.hazards)
 
 
 def test_shape_ranged_tensor_is_unanalysed():
@@ -166,3 +166,199 @@ agraph (float[4] X, float[4] Z) => (float[4] Y) {
             saw_nan = saw_nan or bool(np.isnan(out).any())
         if rep.nan_free:
             assert not saw_nan
+
+
+def _kinds(rep):
+    return sorted({(h.op_type, h.kind) for h in rep.hazards})
+
+
+def test_matmul_partial_sums_overflow_float32():
+    body = """
+agraph (float[1,4] X, float[4,1] W) => (float[1,1] Y) {
+    Y = MatMul(X, W)
+}
+"""
+    rep = check_nan(_model(body), {"X": (-1e38, 1e38), "W": (-10.0, 10.0)})
+    assert ("MatMul", "inf") in _kinds(rep)
+    small = check_nan(_model(body), {"X": (-1.0, 1.0), "W": (-10.0, 10.0)})
+    assert small.finite and small.complete
+
+
+def test_softmax_is_modelled_and_flags_unbounded_input():
+    body = """
+agraph (float[4] X) => (float[4] Y) {
+    Y = Softmax(X)
+}
+"""
+    rep = check_nan(_model(body), {"X": (-1.0, 1.0)})
+    assert rep.complete and rep.finite
+    rep = check_nan(_model(body))
+    assert ("Softmax", "nan") in _kinds(rep)
+
+
+def test_gelu_nan_only_for_unbounded_below():
+    body = """
+agraph (float[4] X) => (float[4] Y) {
+    Y = Gelu(X)
+}
+"""
+    assert check_nan(_model(body, opset=20), {"X": (-5.0, 5.0)}).finite
+    assert ("Gelu", "nan") in _kinds(check_nan(_model(body, opset=20)))
+
+
+def test_variadic_sum_of_opposite_infinities_is_nan():
+    body = """
+agraph (float[4] X, float[4] Z) => (float[4] Y) {
+    Y = Sum(X, Z)
+}
+"""
+    assert ("Sum", "nan") in _kinds(check_nan(_model(body)))
+    assert check_nan(_model(body), {"X": (0.0, 1.0), "Z": (0.0, 1.0)}).finite
+
+
+def test_reduce_sum_overflow_uses_element_count():
+    body = """
+agraph (float[1000] X) => (float[1] Y) {
+    Y = ReduceSum<keepdims=1>(X)
+}
+"""
+    rep = check_nan(_model(body), {"X": (-1e36, 1e36)})
+    assert ("ReduceSum", "inf") in _kinds(rep)
+    assert check_nan(_model(body), {"X": (-1.0, 1.0)}).finite
+
+
+def test_cast_to_float16_overflows_at_fp16_max():
+    body = """
+agraph (float[4] X) => (float16[4] Y) {
+    Y = Cast<to=10>(X)
+}
+"""
+    assert ("Cast", "inf") in _kinds(check_nan(_model(body), {"X": (0.0, 1e5)}))
+    assert check_nan(_model(body), {"X": (0.0, 100.0)}).finite
+
+
+def test_float16_model_overflows_at_fp16_max():
+    body = """
+agraph (float16[4] X) => (float16[4] Y) {
+    Y = Mul(X, X)
+}
+"""
+    assert ("Mul", "inf") in _kinds(check_nan(_model(body), {"X": (0.0, 300.0)}))
+    assert check_nan(_model(body), {"X": (0.0, 10.0)}).finite
+
+
+def test_domain_rules_for_asin_atanh_log1p():
+    for body, rng, expected in [
+        ("Y = Asin(X)", (-2.0, 0.5), ("Asin", "nan")),
+        ("Y = Atanh(X)", (-1.0, 0.5), ("Atanh", "inf")),
+        ("Y = Log1p(X)", (-1.0, 1.0), ("Log1p", "inf")),
+    ]:
+        text = f"agraph (float[4] X) => (float[4] Y) {{ {body} }}"
+        rep = check_nan(_model(text), {"X": rng})
+        assert expected in _kinds(rep), body
+        assert ("Log1p", "nan") not in _kinds(rep)
+
+
+def test_batch_norm_negative_variance_is_nan():
+    body = """
+agraph (float[1,2,3] X, float[2] S, float[2] B, float[2] M, float[2] V)
+    => (float[1,2,3] Y) {
+    Y = BatchNormalization(X, S, B, M, V)
+}
+"""
+    ranges = {"X": (-1.0, 1.0), "S": (1.0, 1.0), "B": (0.0, 0.0), "M": (0.0, 0.0)}
+    assert ("BatchNormalization", "nan") in _kinds(
+        check_nan(_model(body), {**ranges, "V": (-1.0, 1.0)})
+    )
+    assert check_nan(_model(body), {**ranges, "V": (0.5, 1.0)}).finite
+
+
+def test_layer_norm_squared_deviation_overflow():
+    body = """
+agraph (float[4] X, float[4] S) => (float[4] Y) {
+    Y = LayerNormalization<axis=-1>(X, S)
+}
+"""
+    scale = {"S": (1.0, 1.0)}
+    rep = check_nan(_model(body, opset=17), {"X": (-1e19, 1e19), **scale})
+    assert ("LayerNormalization", "inf") in _kinds(rep)
+    assert check_nan(_model(body, opset=17), {"X": (-1.0, 1.0), **scale}).finite
+
+
+def test_layer_norm_output_is_bounded_by_scale_and_bias():
+    body = """
+agraph (float[4] X, float[4] S, float[4] B) => (float[4] Y) {
+    Y = LayerNormalization<axis=-1>(X, S, B)
+}
+"""
+    ranges = {"X": (-1e6, 1e6), "S": (0.5, 2.0), "B": (-1.0, 1.0)}
+    rep = check_nan(_model(body, opset=17), ranges)
+    assert rep.finite and rep.complete
+
+
+def test_expanded_ops_nan_free_verdict_matches_onnxruntime():
+    ort = pytest.importorskip("onnxruntime")
+    body = """
+agraph (float[2,3] X, float[3,3] W, float[3] S, float[3] B, float[3] M, float[3] V)
+    => (float[2,3] Y) {
+    H = MatMul(X, W)
+    G = Tanh(H)
+    N = BatchNormalization(G, S, B, M, V)
+    Y = Softmax(N)
+}
+"""
+    model = _model(body)
+    ranges = {
+        "X": (-2.0, 2.0),
+        "W": (-1.0, 1.0),
+        "S": (0.5, 1.5),
+        "B": (-1.0, 1.0),
+        "M": (-1.0, 1.0),
+        "V": (0.5, 2.0),
+    }
+    rep = check_nan(model, ranges)
+    assert rep.nan_free and rep.complete
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    rng = np.random.default_rng(1)
+    for _ in range(200):
+        feed = {
+            k: rng.uniform(lo, hi, size=s).astype(np.float32)
+            for (k, (lo, hi)), s in zip(
+                ranges.items(), [(2, 3), (3, 3), (3,), (3,), (3,), (3,)]
+            )
+        }
+        (out,) = sess.run(None, feed)
+        assert not np.isnan(out).any()
+
+
+def test_new_interval_transfers_contain_onnxruntime_outputs():
+    ort = pytest.importorskip("onnxruntime")
+    from onnxsim import interval
+
+    body = """
+agraph (float[4] X, float[4] S, float[4] B) => (float[4] G, float[4] Z, float16[4] Q, float[4] L) {
+    G = Gelu(X)
+    Z = Sum(X, S)
+    Q = Cast<to=10>(Z)
+    L = LayerNormalization<axis=-1>(X, S, B)
+}
+"""
+    model = _model(body, opset=20)
+    ranges = {"X": (-30.0, 30.0), "S": (-2.0, 2.0), "B": (-1.0, 1.0)}
+    res = interval.propagate(model, ranges)
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    rng = np.random.default_rng(2)
+    for _ in range(200):
+        feed = {
+            k: rng.uniform(lo, hi, size=4).astype(np.float32)
+            for k, (lo, hi) in ranges.items()
+        }
+        for name, out in zip(["G", "Z", "Q", "L"], sess.run(None, feed)):
+            lo, hi = res.intervals[name]
+            v = out.astype(np.float64)
+            assert np.all(v >= lo - 1e-5 * (1 + np.abs(lo))), name
+            assert np.all(v <= hi + 1e-5 * (1 + np.abs(hi))), name
