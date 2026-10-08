@@ -593,6 +593,27 @@ class _Backend:
         return int(max(_ROW_BUDGET, min(_GPU_ROW_BUDGET_CAP, free // (per * copies))))
 
 
+def _batch_one_shapes(model: onnx.ModelProto) -> Optional[Dict[str, Sequence[Any]]]:
+    """Input shapes with a symbolic leading (batch) dim run at 1; None if no input has one.
+
+    Interval propagation treats a symbolic dim as a ranged tensor, which has no Conv or
+    Attention rule; the analysed network runs at batch 1 anyway (see ``vnnlib._single_io``).
+    """
+    shapes: Dict[str, Sequence[Any]] = {}
+    for vi in model.graph.input:
+        tt = vi.type.tensor_type
+        if not tt.HasField("shape") or not tt.shape.dim:
+            continue
+        dims = [
+            int(d.dim_value) if d.HasField("dim_value") and d.dim_value > 0 else None
+            for d in tt.shape.dim
+        ]
+        if dims[0] is None:
+            dims[0] = 1
+            shapes[vi.name] = dims
+    return shapes or None
+
+
 class _Analyzer:
     def __init__(
         self,
@@ -603,7 +624,9 @@ class _Analyzer:
         self.model = model
         self.backend = backend if backend is not None else _Backend()
         self.init_names = {t.name for t in model.graph.initializer}
-        self.ibp = _interval.propagate(model, input_ranges)
+        self.ibp = _interval.propagate(
+            model, input_ranges, input_shapes=_batch_one_shapes(model)
+        )
         self.ib: Dict[str, Tuple[np.ndarray, np.ndarray]] = dict(self.ibp.intervals)
         self.nodes = list(model.graph.node)
         self.producer: Dict[str, int] = {}
@@ -1967,7 +1990,9 @@ def bab_bounds(
     if leaf_method != "crown":
         backend.opt_ops()  # fail early, with a clear message, when torch is missing
     names = _output_names(model, output)
-    probe = _interval.propagate(model, input_ranges)
+    probe = _interval.propagate(
+        model, input_ranges, input_shapes=_batch_one_shapes(model)
+    )
     for n in names:
         if n not in probe.intervals:
             raise ValueError(f"cannot analyse tensor {n!r}: its shape is unknown")
