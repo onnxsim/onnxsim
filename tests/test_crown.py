@@ -288,6 +288,19 @@ def test_alpha_on_a_conv_net_is_sound_and_not_looser():
     )
 
 
+def test_symbolic_batch_dim_is_analysed_at_batch_one():
+    static = _conv_bn_relu_net(np.random.default_rng(5))
+    sym = onnx.ModelProto()
+    sym.CopyFrom(static)
+    sym.graph.input[0].type.tensor_type.shape.dim[0].dim_param = "N"
+    box = {"x": (-1.0, 1.0)}
+    for method in ("crown", "alpha"):
+        got = crown.bounds(sym, box, method=method, alpha_iters=5)["y"]
+        ref = crown.bounds(static, box, method=method, alpha_iters=5)["y"]
+        np.testing.assert_allclose(got.lo, ref.lo)
+        np.testing.assert_allclose(got.hi, ref.hi)
+
+
 def test_alpha_without_torch_raises_a_clear_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", None)
     with pytest.raises(ImportError, match="torch"):
