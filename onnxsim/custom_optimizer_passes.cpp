@@ -28,6 +28,8 @@
 #include "passes/eliminate_consecutive_idempotent_ops.h"
 #include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
+#include "passes/eliminate_nop_reduce.h"
+#include "passes/eliminate_nop_softmax.h"
 #include "passes/eliminate_optional_get_element.h"
 #include "passes/eliminate_optional_has_element.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
@@ -199,6 +201,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateLoopWithConstTripCount>(registry);
     RegisterOrReplace<p::EliminateOptionalGetElement>(registry);
     RegisterOrReplace<p::EliminateOptionalHasElement>(registry);
+    RegisterOrReplace<p::EliminateNopReduce>(registry);
+    RegisterOrReplace<p::EliminateNopSoftmax>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::EliminateReshapeFamilyOnConstant>(registry);
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);

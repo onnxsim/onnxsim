@@ -9,6 +9,7 @@ needs a real AX650N to check that the *graph* computes what it should).
 Everything here runs on the CPU reference/onnxruntime; no Docker, no device.
 """
 
+import collections
 import os
 import sys
 
@@ -458,8 +459,13 @@ def test_set_batch_gradient_is_the_mean_of_per_sample_gradients():
         assert np.allclose(grad_avg[p], grad_batch, atol=1e-5), p
 
     # batch-N's step graph is the same shape/structure as batch-1's -- no
-    # extra nodes from taking a different code path for N != 1.
-    assert len(step_n.graph.node) == len(step1.graph.node)
+    # extra nodes from taking a different code path for N != 1. The one
+    # allowed difference is the ReduceSum over the batch axis: at N=1 that
+    # axis has size 1, so eliminate_nop_reduce drops it from batch-1's graph.
+    ops1 = collections.Counter(n.op_type for n in step1.graph.node)
+    ops_n = collections.Counter(n.op_type for n in step_n.graph.node)
+    assert not (ops1 - ops_n)
+    assert (ops_n - ops1) in (collections.Counter(), collections.Counter(ReduceSum=1))
 
 
 def test_in_graph_gradient_matches_finite_differences():
