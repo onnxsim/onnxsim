@@ -37,6 +37,7 @@ _FLOAT_MAX = {
     TensorProto.BFLOAT16: 3.3895313892515355e38,
 }
 
+
 _FIXED_OUT = {
     **dict.fromkeys(
         ["Equal", "Less", "Greater", "LessOrEqual", "GreaterOrEqual", "Not", "And"],
@@ -60,7 +61,7 @@ _INF_SAFE = frozenset(
         "Size", "Slice", "SpaceToDepth", "Split", "Squeeze", "Tanh", "ThresholdedRelu",
         "Tile", "TopK", "Transpose", "Unique", "Unsqueeze", "Where", "ArgMax", "ArgMin",
         "Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual", "Not", "And", "Or",
-        "Xor", "Softplus", "Trilu", "NonMaxSuppression",
+        "Xor", "Softplus", "Trilu", "NonMaxSuppression", "MaxPool", "GlobalMaxPool", "Hardmax",
     }
 )  # fmt: skip
 
@@ -115,6 +116,7 @@ class _Ctx:
     out_shape: Tuple[int, ...]
     attrs: Dict[str, Any]
     fmax: float  # largest finite value of the output dtype
+    in_dtype: int = TensorProto.FLOAT
 
     @property
     def size(self) -> int:
@@ -420,6 +422,30 @@ def _resize(c: _Ctx) -> List[Hit]:
     return [] if mode == "nearest" else _inf_operand(c)
 
 
+def _quantize_linear(c: _Ctx) -> List[Hit]:
+    # x / scale is only NaN for 0/0 or inf/inf; other quotients saturate to the integer range
+    x, scale = c.ins[0], c.ins[1]
+    return [
+        _hit(
+            "nan",
+            (_zero(x) & _zero(scale)) | (_inf(x) & _inf(scale)),
+            "0/0 or inf/inf",
+        )
+    ]
+
+
+def _dequantize_linear(c: _Ctx) -> List[Hit]:
+    x, scale = c.ins[0], c.ins[1]
+    zp = c.ins[2] if len(c.ins) > 2 else (np.zeros(1), np.zeros(1))
+    lo_dt, hi_dt = _interval._INT_RANGE.get(c.in_dtype, (-math.inf, math.inf))
+    diff = (np.maximum(x[0], lo_dt) - zp[1], np.minimum(x[1], hi_dt) - zp[0])
+    return [
+        _hit("nan", _zero(diff) & _inf(scale), "zero times infinite scale"),
+        _hit("inf", _inf(scale), "infinite scale"),
+        *_overflow(c, _maxabs(diff) * _maxabs(scale), "dequantized value"),
+    ]
+
+
 _RULES: Dict[str, Rule] = {
     "Sqrt": _sqrt,
     "Log": _log,
@@ -460,7 +486,12 @@ _RULES: Dict[str, Rule] = {
     "BatchNormalization": _batch_norm,
     "Resize": _resize,
     "Cast": _cast,
+    "QuantizeLinear": _quantize_linear,
+    "DequantizeLinear": _dequantize_linear,
 }
+
+# Rules for ops whose outputs are integers; their overflow check is skipped.
+_INT_OUTPUT_RULES = frozenset({"QuantizeLinear"})
 
 _CHECKED = frozenset(_RULES) | _INF_SAFE | _INF_NAN
 
@@ -481,6 +512,18 @@ def _dtype_map(model: onnx.ModelProto) -> Dict[str, int]:
             inherited = to
         elif node.op_type in _FIXED_OUT:
             inherited = _FIXED_OUT[node.op_type]
+        elif node.op_type == "QuantizeLinear":
+            inherited = (
+                dt.get(node.input[2], TensorProto.UINT8)
+                if len(node.input) > 2
+                else TensorProto.UINT8
+            )
+        elif node.op_type == "DequantizeLinear":
+            inherited = (
+                dt.get(node.input[1], TensorProto.FLOAT)
+                if len(node.input) > 1
+                else TensorProto.FLOAT
+            )
         else:
             inherited = (
                 dt.get(node.input[0], TensorProto.FLOAT)
@@ -529,7 +572,9 @@ def check_nan(
             continue
         out_fmax = _FLOAT_MAX.get(dtypes.get(outs[0], TensorProto.FLOAT))
         if out_fmax is None:
-            continue
+            if op not in _INT_OUTPUT_RULES:
+                continue
+            out_fmax = math.inf
         ins = [
             (
                 np.asarray(res.intervals[n][0], np.float64),
@@ -543,6 +588,7 @@ def check_nan(
             out_shape=_shape(res, outs[0]),
             attrs={a.name: helper.get_attribute_value(a) for a in node.attribute},
             fmax=out_fmax,
+            in_dtype=dtypes.get(operands[0], TensorProto.FLOAT),
         )
         if op in _RULES:
             hits = _RULES[op](ctx)

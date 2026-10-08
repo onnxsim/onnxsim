@@ -58,9 +58,16 @@ _DATA_MOVE = {
 }  # fmt: skip
 _MONOTONE = {
     "Relu", "Sigmoid", "Tanh", "Exp", "Erf", "Sqrt", "Softplus", "Clip", "Floor", "Ceil",
-    "Round", "Log", "HardSigmoid",
+    "Round", "Log", "HardSigmoid", "Atan", "Elu", "Celu", "Selu", "Sign",
 }  # fmt: skip
-_EXACT = {"Relu", "Clip", "Floor", "Ceil", "Round"}  # computed without rounding error
+_EXACT = {
+    "Relu",
+    "Clip",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sign",
+}  # computed without rounding error
 _CODOMAIN = {
     "Sigmoid": (0.0, 1.0),
     "Tanh": (-1.0, 1.0),
@@ -155,6 +162,60 @@ def _is_point(iv: Interval) -> bool:
 
 def _finite(iv: Interval) -> bool:
     return bool(np.all(np.isfinite(iv[0])) and np.all(np.isfinite(iv[1])))
+
+
+_INT_RANGE = {
+    onnx.TensorProto.INT8: (-(2**7), 2**7 - 1),
+    onnx.TensorProto.UINT8: (0, 2**8 - 1),
+    onnx.TensorProto.INT16: (-(2**15), 2**15 - 1),
+    onnx.TensorProto.UINT16: (0, 2**16 - 1),
+    onnx.TensorProto.INT32: (-(2**31), 2**31 - 1),
+    onnx.TensorProto.UINT32: (0, 2**32 - 1),
+}
+
+
+def _elem_types(model: onnx.ModelProto) -> Dict[str, int]:
+    inferred = onnx.shape_inference.infer_shapes(model)
+    g = inferred.graph
+    types = {}
+    for vi in [*g.input, *g.value_info, *g.output]:
+        if vi.type.tensor_type.elem_type:
+            types[vi.name] = vi.type.tensor_type.elem_type
+    for t in model.graph.initializer:
+        types[t.name] = t.data_type
+    return types
+
+
+def _channel_view(shape) -> Tuple[int, ...]:
+    return (1, shape[1]) + (1,) * (len(shape) - 2)
+
+
+def _normalized_affine(
+    x: Interval,
+    s: Interval,
+    b: Optional[Interval],
+    n: int,
+    view: Optional[Tuple[int, ...]],
+) -> Interval:
+    """Bound ``(x - mean) / sqrt(var + eps) * s + b`` where ``n`` elements share each statistic.
+
+    ``|x - mean| <= sqrt(n * var)`` makes every normalized element lie in ``[-sqrt(n), sqrt(n)]``.
+    """
+    if not (_finite(x) and _finite(s) and (b is None or _finite(b))):
+        raise _Unbounded("normalization")
+    if view is not None:
+        s = (s[0].reshape(view), s[1].reshape(view))
+        if b is not None:
+            b = (b[0].reshape(view), b[1].reshape(view))
+    z = np.sqrt(n) * (1 + 1e-6)
+    scaled = [s[0] * -z, s[0] * z, s[1] * -z, s[1] * z]
+    lo = np.minimum.reduce(scaled)
+    hi = np.maximum.reduce(scaled)
+    if b is not None:
+        lo = lo + b[0]
+        hi = hi + b[1]
+    lo, hi, _ = np.broadcast_arrays(lo, hi, x[0])
+    return _widen(lo, hi)
 
 
 def _midrad(iv: Interval) -> Tuple[np.ndarray, np.ndarray]:
@@ -850,6 +911,7 @@ def propagate(
     """
     runner = _Runner(model)
     g = model.graph
+    elem_types = _elem_types(model)
     annotated = _ranges.get_ranges(model)
     for k, (lo, hi) in (input_ranges or {}).items():
         annotated[k] = (
@@ -1002,21 +1064,115 @@ def propagate(
                     lo = lo - rel * np.abs(lo) - tiny
                     hi = hi + rel * np.abs(hi) + tiny
                 iv[outs[0]] = _widen(lo, hi)
+            elif t == "Sin" or t == "Cos":
+                shape = ins[0][0].shape
+                iv[outs[0]] = (np.full(shape, -1.0), np.full(shape, 1.0))
+            elif t == "Reciprocal":
+                lo, hi = ins[0]
+                if np.any((lo <= 0) & (hi >= 0)):
+                    raise _Unbounded(t)
+                with np.errstate(divide="ignore"):
+                    iv[outs[0]] = _widen(1.0 / hi, 1.0 / lo)
+            elif t == "Pow" and _is_point(ins[1]) and np.all(ins[0][0] >= 0):
+                p = np.asarray(ins[1][0], dtype=np.float64)
+                with np.errstate(all="ignore"):
+                    a = np.power(ins[0][0], p)
+                    b = np.power(ins[0][1], p)
+                if np.any(np.isnan(a) | np.isnan(b)):
+                    raise _Unbounded(t)
+                iv[outs[0]] = _widen(np.minimum(a, b), np.maximum(a, b))
+            elif t == "Softsign":
+                with np.errstate(all="ignore"):
+                    f = [
+                        np.where(np.isinf(x), np.sign(x), x / (1 + np.abs(x)))
+                        for x in ins[0]
+                    ]
+                iv[outs[0]] = _widen(f[0], f[1])
+            elif t == "Mean":
+                count = len(ins)
+                iv[outs[0]] = _widen(
+                    sum(i[0] for i in ins) / count, sum(i[1] for i in ins) / count
+                )
+            elif t == "Hardmax":
+                iv[outs[0]] = (np.zeros(ins[0][0].shape), np.ones(ins[0][0].shape))
+            elif t == "QuantizeLinear" and len(ins) >= 2:
+                zp_name = node.input[2] if len(node.input) > 2 else ""
+                zp_type = (
+                    elem_types.get(zp_name, onnx.TensorProto.UINT8)
+                    if zp_name
+                    else onnx.TensorProto.UINT8
+                )
+                lo_q, hi_q = _INT_RANGE.get(zp_type, (-_INF, _INF))
+                shape = np.broadcast_shapes(ins[0][0].shape, ins[1][0].shape)
+                iv[outs[0]] = (np.full(shape, float(lo_q)), np.full(shape, float(hi_q)))
+            elif t == "DequantizeLinear" and len(ins) >= 2:
+                lo_x, hi_x = _INT_RANGE.get(
+                    elem_types.get(node.input[0]), (-_INF, _INF)
+                )
+                zp = (
+                    ins[2]
+                    if len(ins) > 2 and ins[2] is not None
+                    else (np.zeros(1), np.zeros(1))
+                )
+                diff = (
+                    np.maximum(ins[0][0], lo_x) - zp[1],
+                    np.minimum(ins[0][1], hi_x) - zp[0],
+                )
+                if not (_finite(ins[1]) and _finite(diff)):
+                    raise _Unbounded(t)
+                prods = np.stack(
+                    np.broadcast_arrays(
+                        diff[0] * ins[1][0],
+                        diff[0] * ins[1][1],
+                        diff[1] * ins[1][0],
+                        diff[1] * ins[1][1],
+                    )
+                )
+                iv[outs[0]] = _widen(prods.min(axis=0), prods.max(axis=0))
+            elif t == "LogSoftmax":
+                lo, hi = ins[0]
+                axis = int(_attrs(node).get("axis", -1)) % lo.ndim
+                n = lo.shape[axis]
+                with np.errstate(invalid="ignore"):
+                    floor = (
+                        np.min(lo, axis=axis, keepdims=True)
+                        - np.max(hi, axis=axis, keepdims=True)
+                        - np.log(n)
+                    )
+                floor = np.broadcast_to(floor, lo.shape)
+                iv[outs[0]] = _widen(floor, np.zeros(lo.shape))
+            elif t == "Resize":
+                attrs = _attrs(node)
+                mode = attrs.get("mode", b"nearest")
+                mode = mode.decode() if isinstance(mode, bytes) else mode
+                coord = attrs.get("coordinate_transformation_mode", b"half_pixel")
+                coord = coord.decode() if isinstance(coord, bytes) else coord
+                out_shape = shapes.get(outs[0])
+                if (
+                    mode not in ("nearest", "linear")
+                    or coord == "tf_crop_and_resize"
+                    or out_shape is None
+                ):
+                    raise _Unbounded(t)
+                # nearest and (multi)linear outputs are convex combinations of the input
+                lo_all, hi_all = float(np.min(ins[0][0])), float(np.max(ins[0][1]))
+                iv[outs[0]] = (np.full(out_shape, lo_all), np.full(out_shape, hi_all))
             elif t == "LayerNormalization" and len(ins) in (2, 3):
                 x, s = ins[0], ins[1]
-                b = ins[2] if len(ins) == 3 else (np.zeros(1), np.zeros(1))
-                if not (_finite(x) and _finite(s) and _finite(b)):
-                    raise _Unbounded(t)
+                b = ins[2] if len(ins) == 3 and ins[2] is not None else None
                 axis = int(_attrs(node).get("axis", -1))
                 rank = len(x[0].shape)
                 n = int(np.prod(x[0].shape[axis % rank :]))
-                # |x - mean| <= sqrt(n * var), so each normalized element is in [-sqrt(n), sqrt(n)]
-                z = np.sqrt(n) * (1 + 1e-6)
-                scaled = [s[0] * -z, s[0] * z, s[1] * -z, s[1] * z]
-                lo = np.minimum.reduce(scaled) + b[0]
-                hi = np.maximum.reduce(scaled) + b[1]
-                lo, hi, _ = np.broadcast_arrays(lo, hi, x[0])
-                iv[outs[0]] = _widen(lo, hi)
+                iv[outs[0]] = _normalized_affine(x, s, b, n, None)
+            elif t == "InstanceNormalization" and len(ins) == 3:
+                x, s, b = ins
+                n = int(np.prod(x[0].shape[2:]))
+                iv[outs[0]] = _normalized_affine(x, s, b, n, _channel_view(x[0].shape))
+            elif t == "GroupNormalization" and len(ins) == 3:
+                x, s, b = ins
+                groups = int(_attrs(node)["num_groups"])
+                n = (x[0].shape[1] // groups) * int(np.prod(x[0].shape[2:]))
+                iv[outs[0]] = _normalized_affine(x, s, b, n, _channel_view(x[0].shape))
             elif (
                 t in _MONOTONE
                 or t == "LeakyRelu"

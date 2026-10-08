@@ -102,22 +102,22 @@ def test_unbounded_input_flags_arithmetic():
 def test_unmodelled_op_is_listed_and_does_not_block_nan_free():
     body = """
 agraph (float[4] X) => (float[4] Y) {
-    Y = Hardmax(X)
+    Y = Bernoulli(X)
 }
 """
     rep = check_nan(_model(body), {"X": (-1.0, 1.0)})
-    assert rep.unmodelled == ["Hardmax"]
+    assert rep.unmodelled == ["Bernoulli"]
     assert rep.nan_free and not rep.complete
 
 
 def test_unmodelled_op_with_unbounded_operand_is_nan_hazard():
     body = """
 agraph (float[4] X) => (float[4] Y) {
-    Y = Hardmax(X)
+    Y = Bernoulli(X)
 }
 """
     rep = check_nan(_model(body))
-    assert any(h.op_type == "Hardmax" and h.kind == "nan" for h in rep.hazards)
+    assert any(h.op_type == "Bernoulli" and h.kind == "nan" for h in rep.hazards)
 
 
 def test_shape_ranged_tensor_is_unanalysed():
@@ -362,3 +362,45 @@ agraph (float[4] X, float[4] S, float[4] B) => (float[4] G, float[4] Z, float16[
             v = out.astype(np.float64)
             assert np.all(v >= lo - 1e-5 * (1 + np.abs(lo))), name
             assert np.all(v <= hi + 1e-5 * (1 + np.abs(hi))), name
+
+
+def test_dequantize_linear_overflow_uses_integer_range():
+    body = """
+agraph (int8[4] X, float[1] S) => (float[4] Y) {
+    Y = DequantizeLinear(X, S)
+}
+"""
+    rep = check_nan(_model(body, opset=15), {"S": (1e38, 1e38)})
+    assert any(h.op_type == "DequantizeLinear" and h.kind == "inf" for h in rep.hazards)
+
+
+def test_dequantize_linear_with_small_scale_is_finite():
+    body = """
+agraph (int8[4] X, float[1] S) => (float[4] Y) {
+    Y = DequantizeLinear(X, S)
+}
+"""
+    rep = check_nan(_model(body, opset=15), {"S": (0.001, 0.001)})
+    assert rep.finite and rep.complete
+
+
+def test_quantize_linear_zero_over_zero_is_nan_hazard():
+    body = """
+agraph (float[4] X, float[4] S) => (uint8[4] Y) {
+    Y = QuantizeLinear(X, S)
+}
+"""
+    assert ("QuantizeLinear", "nan") in _kinds(check_nan(_model(body, opset=15)))
+    rep = check_nan(_model(body, opset=15), {"X": (1.0, 2.0), "S": (0.5, 1.0)})
+    assert rep.nan_free and rep.complete
+
+
+def test_max_pool_and_hardmax_are_modelled():
+    body = """
+agraph (float[4] X) => (float[4] Y, float[4] Z) {
+    Y = Hardmax(X)
+    Z = Relu(X)
+}
+"""
+    rep = check_nan(_model(body), {"X": (-1.0, 1.0)})
+    assert rep.complete and rep.finite
