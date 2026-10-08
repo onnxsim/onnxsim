@@ -79,20 +79,22 @@ graph input, shape ``S0`` -- generally different from ``S1``) do NOT share a
 shape, so redirecting the inner Reshape's uses onto ``previous_node``'s input
 would otherwise silently overwrite that value's own tracked shape with the
 WRONG shape (``S1`` instead of its real ``S0``). That is exactly what the
-explicit ``previous_node->input(0)->setSizes(sizes)`` afterward undoes,
-restoring the correct ``S0`` that was captured before the rewiring call. This
-is IR-internal shape-tracking bookkeeping (it can affect what LATER passes in
-the same optimizer run believe about that value's shape), not something that
-shows up as a wrong number in the final tensor output either way -- the
-differential Reshape test below confirms, by actually running the resulting
-model through ``onnxruntime``, that the final output values are correct
-regardless.
+shape restoration afterward undoes. It must preserve ``has_sizes()`` as well
+as the dimension vector: an unknown rank and a scalar both have an empty
+vector, but only the scalar has ``has_sizes() == true``. Restoring an unknown
+rank with ``setSizes({})`` invents scalar metadata and lets a later
+``eliminate_shape_op`` incorrectly fold ``Shape(X)`` to an empty vector.
+The parameterized regression below checks that metadata and the actual
+Reshape/Shape outputs, including unknown-rank and genuine-scalar controls.
 """
 
 import numpy as np
 import onnxruntime as ort
-from _formal_verify_common import producer, prove, simplify_isolated, z3
-from onnx import parser
+import pytest
+from _formal_verify_common import isolate, producer, prove, simplify_isolated, z3
+from onnx import TensorProto, helper, parser
+
+import onnxsim
 
 
 def test_eliminate_consecutive_idempotent_ceil_family_is_sound():
@@ -263,6 +265,78 @@ def test_eliminate_consecutive_idempotent_pass_matches_reshape():
     x = np.arange(32, dtype=np.float32).reshape(4, 8)
     (out,) = sess.run(None, {"X": x})
     np.testing.assert_array_equal(out, x.reshape(2, 16))
+
+
+@pytest.mark.parametrize(
+    "tracked_shape, intermediate_shape",
+    [
+        pytest.param(None, ["flat"], id="unknown-rank-known-intermediate"),
+        pytest.param(None, None, id="unknown-rank-unknown-intermediate"),
+        pytest.param([], [1], id="scalar"),
+        pytest.param(["N", 3], ["flat"], id="symbolic-dimension"),
+        pytest.param([None, 3], ["flat"], id="anonymous-dimension"),
+        pytest.param([2, 3], [6], id="static-shape"),
+    ],
+)
+def test_eliminate_consecutive_idempotent_preserves_reshape_input_shape(
+    tracked_shape, intermediate_shape
+):
+    scalar = tracked_shape == []
+    input_type = "float" if scalar else "float[2,3]"
+    output_size, rank = (1, 0) if scalar else (6, 2)
+    model = parser.parse_model(
+        f"""
+        <ir_version: 10, opset_import: ["": 14]>
+        g ({input_type} input) => (float[{output_size}] Y, int64[{rank}] S)
+        <int64[1] target = {{-1}}>
+        {{
+          X = Identity(input)
+          A = Reshape(X, target)
+          Y = Reshape(A, target)
+          S = Shape(X)
+        }}
+        """
+    )
+    # helper can distinguish an absent shape (None, unknown rank) from []
+    # (a scalar). The graph input itself always has a valid, concrete shape.
+    expected_x = helper.make_tensor_value_info("X", TensorProto.FLOAT, tracked_shape)
+    model.graph.value_info.extend(
+        [
+            expected_x,
+            helper.make_tensor_value_info("A", TensorProto.FLOAT, intermediate_shape),
+        ]
+    )
+    sim_model, check_ok = onnxsim.simplify(
+        model,
+        check_n=0,
+        skipped_optimizers=isolate(
+            "eliminate_consecutive_idempotent_ops", "eliminate_shape_op"
+        ),
+        # Neither shape inference nor the constant folder's partial-shape
+        # evaluation may fill in X's missing rank before the pass runs.
+        skip_shape_inference=True,
+        skip_constant_folding=True,
+    )
+    assert check_ok
+    assert producer(sim_model, "Y").input[0] == "X"
+    actual_x = next(v for v in sim_model.graph.value_info if v.name == "X")
+    assert actual_x.type == expected_x.type
+    if tracked_shape is None:
+        assert producer(sim_model, "S").op_type == "Shape"
+
+    # Check the observable consequence too: Shape(X) must return [2, 3],
+    # not an empty vector invented from the corrupted scalar metadata.
+    x = (
+        np.array(7, dtype=np.float32)
+        if scalar
+        else np.arange(6, dtype=np.float32).reshape(2, 3)
+    )
+    session = ort.InferenceSession(
+        sim_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    y, shape = session.run(None, {"input": x})
+    np.testing.assert_array_equal(y, x.reshape(-1))
+    np.testing.assert_array_equal(shape, np.asarray(x.shape, dtype=np.int64))
 
 
 def test_eliminate_consecutive_idempotent_declines_on_multi_use_inner():

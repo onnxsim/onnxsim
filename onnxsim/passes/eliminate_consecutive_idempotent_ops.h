@@ -70,13 +70,19 @@ struct EliminateConsecutiveIdempotentOps final : public PredicateBasedPass {
       return false;
     }
     Node* previous_node = node->input(0)->node();
+    const bool had_sizes = previous_node->input(0)->has_sizes();
     std::vector<Dimension> sizes = previous_node->input(0)->sizes();
     bool replacing_success =
         tryReplacingAllUsesWith(node->input(0), previous_node->input(0));
     if (replacing_success) {
       if (node->kind() == kReshape) {
-        // restore the correct sizes
-        previous_node->input(0)->setSizes(sizes);
+        // Restore both dimensions and their presence: setSizes({}) would
+        // incorrectly turn an unknown rank into a scalar (rank 0).
+        if (had_sizes) {
+          previous_node->input(0)->setSizes(sizes);
+        } else {
+          previous_node->input(0)->wipeSizes();
+        }
       }
       return true;
     }
