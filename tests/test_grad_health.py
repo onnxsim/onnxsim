@@ -100,3 +100,53 @@ agraph (float[4] dY, float[4] W) => (float[4] dX) {
         }
         out = sess.run(None, feed)[0].astype(np.float64)
         assert np.all(out >= lo - 1e-12) and np.all(out <= hi + 1e-12)
+
+
+def _built_backward(seed_dtype_shape=(4,)):
+    from onnxsim import graph_grad, qat_graph
+
+    b = qat_graph.GraphBuilder()
+    b.nodes = [onnx.helper.make_node("Mul", ["x", "W"], ["y"])]
+    shapes = {"x": [4], "W": [4], "y": [4], "dy": list(seed_dtype_shape)}
+    grads = graph_grad.build_backward(
+        b, b.nodes, shapes, grad_outputs={"y": "dy"}, targets=["W"]
+    )
+    return b, shapes, grads
+
+
+def test_backward_health_flags_flushed_parameter_gradient():
+    from onnxsim.grad_health import check_backward_health
+
+    b, shapes, grads = _built_backward()
+    rep = check_backward_health(
+        b,
+        shapes,
+        grads,
+        {"x": (0.5, 1.0), "W": (0.5, 1.0), "dy": (1e-9, 1e-8)},
+        precision="fp16",
+    )
+    assert (grads["W"], "flushed") in _kinds(rep)
+    assert not rep.vanishing_free
+
+
+def test_backward_health_is_clean_for_well_scaled_gradient():
+    from onnxsim.grad_health import check_backward_health
+
+    b, shapes, grads = _built_backward()
+    rep = check_backward_health(
+        b,
+        shapes,
+        grads,
+        {"x": (0.5, 1.0), "W": (0.5, 1.0), "dy": (0.5, 1.0)},
+        precision="fp16",
+    )
+    assert rep.healthy and rep.findings == []
+
+
+def test_backward_health_requires_shapes_for_every_free_input():
+    from onnxsim.grad_health import check_backward_health
+
+    b, shapes, grads = _built_backward()
+    del shapes["dy"]
+    with pytest.raises(ValueError, match="dy"):
+        check_backward_health(b, shapes, grads, {"x": (0.5, 1.0)}, precision="fp16")

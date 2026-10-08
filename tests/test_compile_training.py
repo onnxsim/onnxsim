@@ -551,3 +551,28 @@ def test_unsupported_op_is_refused_loudly():
     loop = onnxsim.compile_training_loop(model, "loss", ("w",))
     with pytest.raises(graph_grad.UnsupportedOpError):
         loop({"x": np.zeros((4, 3), dtype=np.float32)}, lr=1e-2)
+
+
+def test_gradient_report_is_absent_unless_ranges_are_given():
+    model, _, _ = _linear_model()
+    loop = onnxsim.compile_training_loop(model, "loss", ("w",))
+    loop.step_graph
+    assert loop.gradient_report is None
+
+
+def test_gradient_check_flags_underflow_only_in_fp16_backward():
+    model, _, _ = _linear_model()
+    ranges = {"x": (1e-4, 2e-4), "y": (1e-4, 2e-4), "w": (-0.2, 0.2)}
+    fp16 = onnxsim.compile_training_loop(
+        model,
+        "loss",
+        ("w",),
+        backward_precision="float16",
+        gradient_ranges=ranges,
+    )
+    fp16.step_graph
+    assert fp16.gradient_report is not None
+    assert not fp16.gradient_report.vanishing_free
+    fp32 = onnxsim.compile_training_loop(model, "loss", ("w",), gradient_ranges=ranges)
+    fp32.step_graph
+    assert fp32.gradient_report.vanishing_free

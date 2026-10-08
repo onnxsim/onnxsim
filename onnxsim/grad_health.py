@@ -19,17 +19,24 @@ reported through ``fp_error``'s ``unsupported`` list and make their gradients im
 """
 
 import dataclasses
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
+import onnx.inliner
 
 from onnxsim import fp_error as _fp_error
 from onnxsim import interval as _interval
 
+if TYPE_CHECKING:
+    from onnxsim import qat_graph
+
 _NORMAL_MIN = {"fp32": 2.0**-126, "fp16": 2.0**-14, "bf16": 2.0**-126}
 _SUBNORMAL_MIN = {"fp32": 2.0**-149, "fp16": 2.0**-24, "bf16": 2.0**-133}
 VANISHING_KINDS = frozenset({"dead", "flushed", "subnormal"})
+# Same pairing qat_graph.make_step_graph uses, so the checked graph is the one that would run.
+_OPSET = 17
+_IR_VERSION = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,6 +134,77 @@ def check_gradient_health(
                 )
             )
     return GradHealthReport(precision, findings, unanalysed)
+
+
+def check_backward_health(
+    b: "qat_graph.GraphBuilder",
+    shapes: Dict[str, Sequence[Union[int, str]]],
+    grads: Dict[str, str],
+    input_ranges: Optional[dict] = None,
+    precision: str = "fp16",
+    rel_tol: float = 1.0,
+    elem_types: Optional[Dict[str, int]] = None,
+) -> GradHealthReport:
+    """Check the gradients :func:`onnxsim.graph_grad.build_backward` appended to ``b``.
+
+    ``b`` must hold the forward nodes as well as the backward ones (the normal case: the same
+    builder the forward was built with). ``grads`` is the ``{target: gradient tensor}`` map that
+    call returned, and ``shapes`` the static shapes of the step's free inputs, as
+    ``build_backward`` takes them. ``input_ranges`` is keyed by those free inputs. ``elem_types``
+    gives the ONNX element type of any free input that is not float32 (indices, masks).
+    """
+    grad_names = sorted(set(grads.values()))
+    model = _builder_model(b, shapes, grad_names, elem_types or {})
+    return check_gradient_health(
+        model,
+        input_ranges,
+        grads=grad_names,
+        precision=precision,
+        rel_tol=rel_tol,
+    )
+
+
+def _builder_model(
+    b: "qat_graph.GraphBuilder",
+    shapes: Dict[str, Sequence[Union[int, str]]],
+    outputs: Sequence[str],
+    elem_types: Dict[str, int],
+) -> onnx.ModelProto:
+    produced = {o for n in b.nodes for o in n.output if o}
+    constant = {t.name for t in b.initializer}
+    free: List[str] = []
+    for n in b.nodes:
+        for name in n.input:
+            if name and name not in produced | constant and name not in free:
+                free.append(name)
+    missing = [name for name in free if name not in shapes]
+    if missing:
+        raise ValueError(f"no static shape for step inputs {missing}")
+    inputs = [
+        onnx.helper.make_tensor_value_info(
+            name,
+            elem_types.get(name, onnx.TensorProto.FLOAT),
+            list(shapes[name]),
+        )
+        for name in free
+    ]
+    graph = onnx.helper.make_graph(
+        b.nodes,
+        "backward_health",
+        inputs,
+        [onnx.helper.make_empty_tensor_value_info(o) for o in outputs],
+        initializer=b.initializer,
+    )
+    opset_imports = [onnx.helper.make_opsetid("", _OPSET)]
+    domains = sorted({fn.domain for fn in b.functions})
+    opset_imports += [onnx.helper.make_opsetid(d, 1) for d in domains]
+    model = onnx.helper.make_model(
+        graph, opset_imports=opset_imports, functions=list(b.functions)
+    )
+    model.ir_version = _IR_VERSION
+    if b.functions:
+        model = onnx.inliner.inline_local_functions(model)
+    return model
 
 
 def _magnitude(iv: Tuple[np.ndarray, np.ndarray]) -> float:
