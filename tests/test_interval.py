@@ -219,3 +219,60 @@ def test_report_formats():
         )
     )
     assert "acc bound" in out and "MatMul" in out
+
+
+def test_attention_output_lies_in_hull_of_values_and_samples_do():
+    body = """
+agraph (float[1,2,3,4] Q, float[1,2,5,4] K, float[1,2,5,4] V) => (float[1,2,3,4] Y) {
+    Y = Attention(Q, K, V)
+}
+"""
+    ranges = {"Q": (-3, 3), "K": (-3, 3), "V": (-1, 2)}
+    model = _model(body, opset=23)
+    res = I.propagate(model, ranges)
+    lo, hi = res.intervals["Y"]
+    assert lo.shape == (1, 2, 3, 4)
+    assert np.all(lo >= -1 - 1e-9) and np.all(hi <= 2 + 1e-9)
+
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        q, k, v = (
+            rng.uniform(a, b, size=s)
+            for (a, b), s in zip(
+                ranges.values(), [(1, 2, 3, 4), (1, 2, 5, 4), (1, 2, 5, 4)]
+            )
+        )
+        logits = q @ np.swapaxes(k, -1, -2) / np.sqrt(4)
+        w = np.exp(logits - logits.max(-1, keepdims=True))
+        y = (w / w.sum(-1, keepdims=True)) @ v
+        assert np.all(y >= lo - 1e-9) and np.all(y <= hi + 1e-9)
+
+
+def test_attention_with_minus_inf_mask_is_left_unknown():
+    body = """
+agraph (float[1,1,2,4] Q, float[1,1,2,4] K, float[1,1,2,4] V, float[1,1,2,2] M) => (float[1,1,2,4] Y) {
+    Y = Attention(Q, K, V, M)
+}
+"""
+    ranges = {"Q": (-1, 1), "K": (-1, 1), "V": (-1, 1), "M": (-np.inf, 0.0)}
+    res = I.propagate(_model(body, opset=23), ranges)
+    lo, hi = res.intervals["Y"]
+    assert np.all(np.isneginf(lo)) and np.all(np.isposinf(hi))
+
+
+def test_einsum_interval_contains_sampled_contractions():
+    body = """
+agraph (float[2,3] A, float[3,4] B) => (float[2,4] Y) {
+    Y = Einsum<equation="ij,jk->ik">(A, B)
+}
+"""
+    ranges = {"A": (-2, 1), "B": (-1, 3)}
+    res = I.propagate(_model(body, opset=15), ranges)
+    lo, hi = res.intervals["Y"]
+    assert lo.shape == (2, 4)
+    rng = np.random.default_rng(1)
+    for _ in range(100):
+        a = rng.uniform(-2, 1, size=(2, 3))
+        b = rng.uniform(-1, 3, size=(3, 4))
+        y = np.einsum("ij,jk->ik", a, b)
+        assert np.all(y >= lo - 1e-9) and np.all(y <= hi + 1e-9)

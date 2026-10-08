@@ -137,6 +137,29 @@ class IntervalResult:
         return bool(np.all(v >= lo - pad) and np.all(v <= hi + pad))
 
 
+def einsum_term_count(equation: str, shapes: List[Tuple[int, ...]]) -> int:
+    """Upper bound on the products summed into one output element."""
+    if not equation or "..." in equation:
+        return max(
+            1, int(np.prod([max(1, int(np.prod(s, dtype=np.int64))) for s in shapes]))
+        )
+    lhs, arrow, rhs = equation.partition("->")
+    terms = lhs.split(",")
+    sizes: Dict[str, int] = {}
+    for term, shape in zip(terms, shapes):
+        for label, dim in zip(term, shape):
+            sizes.setdefault(label, dim)
+    if arrow:
+        kept = set(rhs)
+    else:
+        counts: Dict[str, int] = {}
+        for term in terms:
+            for label in term:
+                counts[label] = counts.get(label, 0) + 1
+        kept = {label for label, n in counts.items() if n == 1}
+    return max(1, math.prod(d for label, d in sizes.items() if label not in kept))
+
+
 def _widen(lo: np.ndarray, hi: np.ndarray) -> Interval:
     eps = 64 * np.finfo(np.float64).eps
     with np.errstate(invalid="ignore"):
@@ -1049,6 +1072,35 @@ def propagate(
                     raise _Unbounded(t)
                 lo, hi = (runner.run(node, [a.astype(np.float64)])[0] for a in ins[0])
                 iv[outs[0]] = _widen(lo, hi)  # non-negative weights: apply to lo and hi
+            elif t == "Einsum":
+                # each output element sums n products, each bounded by the operands' max magnitudes
+                equation = _attrs(node)["equation"]
+                if isinstance(equation, bytes):
+                    equation = equation.decode()
+                views = [np.broadcast_to(np.float64(0.0), i[0].shape) for i in ins]
+                shape = np.einsum(equation, *views).shape
+                n = einsum_term_count(equation, [i[0].shape for i in ins])
+                p = float(
+                    np.prod(
+                        [np.max(np.maximum(np.abs(i[0]), np.abs(i[1]))) for i in ins]
+                    )
+                )
+                iv[outs[0]] = _widen(np.full(shape, -n * p), np.full(shape, n * p))
+            elif t == "Attention":
+                # softmax weights are a convex combination of the value rows (V and past_value);
+                # a -inf mask entry may empty a row, which has no finite output
+                mask, past_value, nonpad = (
+                    ins[i] if i < len(ins) else None for i in (3, 5, 6)
+                )
+                if nonpad is not None or (
+                    mask is not None and np.any(mask[0] == -np.inf)
+                ):
+                    raise _Unbounded(t)
+                values = [ins[2]] + ([past_value] if past_value is not None else [])
+                shape = ins[0][0].shape[:-1] + (ins[2][0].shape[-1],)
+                lo = min(float(np.min(v[0])) for v in values)
+                hi = max(float(np.max(v[1])) for v in values)
+                iv[outs[0]] = _widen(np.full(shape, lo), np.full(shape, hi))
             elif t in ("Softmax",):
                 iv[outs[0]] = (np.zeros(ins[0][0].shape), np.ones(ins[0][0].shape))
             elif t == "Gelu":
