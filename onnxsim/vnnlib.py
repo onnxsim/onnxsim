@@ -1017,7 +1017,7 @@ def run_instance(
     so the harness never reads a missing or stale file.
     """
     lock = threading.Lock()
-    settled = []
+    settled: list[str] = []
 
     def settle(word: str, counterexample: str = "") -> bool:
         with lock:
