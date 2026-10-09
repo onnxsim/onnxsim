@@ -1416,7 +1416,7 @@ _GOLDEN = {
         "ABARQhEKDWNvbS5taWNyb3NvZnQQAQ=="
     ),
     "test_cpp_gqa_wanda_pruning_sliceable_past_kv_matches_python_reference": (
-        "CAo6vRYKFAoBWAoCV3ESAXEiBk1hdE11bDoAChQKAVgKAldrEgFrIgZNYXRNdWw6AAoUCgFYCgJX"
+        "CAo6+RUKFAoBWAoCV3ESAXEiBk1hdE11bDoAChQKAVgKAldrEgFrIgZNYXRNdWw6AAoUCgFYCgJX"
         "dhIBdiIGTWF0TXVsOgAKiQEKAXEKAWsKAXYKB1Bhc3RLZXkKCVBhc3RWYWx1ZQoIU2VxTGVuc0sK"
         "CFRvdGFsU2VxEgNjdHgSAnBrEgJwdiITR3JvdXBRdWVyeUF0dGVudGlvbioQCgludW1faGVhZHMY"
         "BKABAioTCgxrdl9udW1faGVhZHMYAaABAjoNY29tLm1pY3Jvc29mdAoYCgNjdHgKBFdvdXQSAVki"
@@ -1461,12 +1461,11 @@ _GOLDEN = {
         "my2cP56zYr9r+hs/wdbAPr6DhjxI9Js//1bxv4ObWz8WhGO/lwvwPhY4Zz6hV08/tKwGP3wkC0C3"
         "uq8+wlmKPhC1qb6x3x++e3CLPaVolr9tzwo/bF8BvLT7hD9eqNI/E/FKP9b+Gz9QYpg+TnV/vmVm"
         "nz/bOr+/6NSjPzd6Db8P/yJAuZ3PvlUu2T60FIK/NJa7v0THsL/dzBQ/c50ov1d1l7+zArO/gKGA"
-        "P87M6T8MPRJAio8JPjOqbT7uw2A/NNvVP+g+LcCn8xA/P8o+vxlfsT52jNQ/KhgIAhAGQghTZXFM"
-        "ZW5zS0oIBAAAAAQAAAAqEhAGQghUb3RhbFNlcUoEBQAAACpVCAIIAQgBCAgQAUIHUGFzdEtleUpA"
-        "SuoavnA8Mz8Qa4y+5+xav+RimD7Ed0K/g6qdvlPD/j5DVls/p46hPTxGFT/3h8Y9zf0MPzJjQj+O"
-        "IYK/BFtnPypXCAIIAQgBCAgQAUIJUGFzdFZhbHVlSkD0vaW/EGzKvl4SDb/cGvy/eZ2oPn0eyL6C"
-        "7qM/NTRUv1KiPL+hNYs+mjuPv2suVL/fK4U/uSEFvkDLVj+I/yO/WhcKAVgSEgoQCAESDAoCCAIK"
-        "AggFCgIICGIXCgFZEhIKEAgBEgwKAggCCgIIBQoCCAZCBAoAEBFCEQoNY29tLm1pY3Jvc29mdBAB"
+        "P87M6T8MPRJAio8JPjOqbT7uw2A/NNvVP+g+LcCn8xA/P8o+vxlfsT52jNQ/KhQIARAGQghTZXFM"
+        "ZW5zS0oEBQAAACoSEAZCCFRvdGFsU2VxSgQGAAAAKjUIAQgBCAEICBABQgdQYXN0S2V5SiBK6hq+"
+        "cDwzPxBrjL7n7Fq/5GKYPsR3Qr+Dqp2+U8P+Pio3CAEIAQgBCAgQAUIJUGFzdFZhbHVlSiBDVls/"
+        "p46hPTxGFT/3h8Y9zf0MPzJjQj+OIYK/BFtnP1oXCgFYEhIKEAgBEgwKAggBCgIIBQoCCAhiFwoB"
+        "WRISChAIARIMCgIIAQoCCAUKAggGQgQKABARQhEKDWNvbS5taWNyb3NvZnQQAQ=="
     ),
     "test_cpp_linear_attention_wanda_pruning_matches_python_reference": (
         "CAo6wxoKFAoBWAoCV3ESAXEiBk1hdE11bDoAChQKAVgKAldrEgFrIgZNYXRNdWw6AAoUCgFYCgJX"
@@ -2640,13 +2639,15 @@ def _gqa_model_ext(
     wv = rng.standard_normal((K, Nkv)).astype(np.float32)
     wout = rng.standard_normal((Nq, Out)).astype(np.float32)
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    # total = past + kv: ORT >= 1.31 rejects any other total for a dynamic cache.
+    total_seq = seq + (1 if past_kv == "nonempty" else 0)
     initializer.append(
         onnx.numpy_helper.from_array(
-            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+            np.full((batch,), total_seq - 1, dtype=np.int32), "SeqLensK"
         )
     )
     initializer.append(
-        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+        onnx.numpy_helper.from_array(np.array(total_seq, dtype=np.int32), "TotalSeq")
     )
 
     operands = ["q", "k", "v"]
@@ -2739,7 +2740,8 @@ def test_cpp_gqa_wanda_pruning_dynamic_attention_bias_gather_matches_python_refe
 
 
 def test_cpp_gqa_wanda_pruning_sliceable_past_kv_matches_python_reference():
-    model, cfg = _gqa_model_ext(seed=124, past_kv="nonempty")
+    # ORT >= 1.31 also requires batch 1 for a prompt (seq > 1) with a past cache.
+    model, cfg = _gqa_model_ext(seed=124, past_kv="nonempty", batch=1)
     rng_cal = np.random.default_rng(125)
     x_cal = rng_cal.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
         np.float32
