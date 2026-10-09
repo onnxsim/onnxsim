@@ -93,6 +93,15 @@ jobs:
         working-directory: ${{ github.workspace }}
         # RUNNER_TEMP is outside the checkout, which is what the test needs.
         run: ./scripts/test_rust_package_standalone.sh --workdir "${RUNNER_TEMP}/rust-standalone"
+      # Exercises the exact `cargo publish` invocations the release job runs,
+      # minus the upload. onnxsim needs onnxsim-sys at its own version, which
+      # is not on crates.io until the release publishes it, so the dry run
+      # points that dependency at the local crate.
+      - name: Dry-run cargo publish (no upload)
+        run: |
+          cargo publish --dry-run --no-verify -p onnxsim-sys
+          cargo publish --dry-run --no-verify -p onnxsim \
+            --config "patch.crates-io.onnxsim-sys.path='${PWD}/onnxsim-sys'"
 
   # Full build that compiles the C API and links it against onnxsim.
   build:
