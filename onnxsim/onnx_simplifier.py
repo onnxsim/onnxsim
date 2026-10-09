@@ -8590,6 +8590,13 @@ def _certify_snapshot(model, output_path, explicit):
 
 def _certify_result(orig, simplified, kwargs, explicit):
     """Run certify and return ``(status, detail)``; never raises."""
+    try:
+        return _certify_verdict(orig, simplified, kwargs)
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+
+
+def _certify_verdict(orig, simplified, kwargs):
     from . import certify as _certify
     from . import ranges as _ranges
 
