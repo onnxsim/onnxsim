@@ -1,5 +1,5 @@
-"""Host-side greedy decode loop for a llama-style LLM compiled layer by layer
-with `pulsar2 llm_build` (hidden state bf16, weights s8).
+"""Host-side greedy decode loop for a llama-family LLM (llama, qwen3) compiled
+layer by layer with `pulsar2 llm_build` (hidden state bf16, weights s8).
 
 Each transformer layer is its own .axmodel and the final norm + lm_head is a
 "post" .axmodel; the embedding lookup, the KV caches, the attention mask and
@@ -9,8 +9,12 @@ through it.
 
 Raw byte layout of every tensor that crosses the backend interface (all
 little-endian, C order, no padding). H = hidden size, D = kv heads x head
-dim, S = kv_cache_len, V = vocabulary. SmolLM2-135M built with
-`--kv_cache_len 255`: H 576, D 192, S 255, V 49152.
+dim, S = kv_cache_len, V = vocabulary. None of them is assumed: `IOSpec` is
+read from the compiled models (`IOSpec.from_io` on the worker's `io_info`,
+`IOSpec.from_axmodels` on the files) or from a checkpoint's config
+(`IOSpec.from_model`), and the file names come from listing the output
+directory (`discover_files`). Built with `--kv_cache_len 255`:
+SmolLM2-135M H 576, D 192, V 49152; Qwen3-0.6B H 1024, D 1024, V 151936.
 
   layer inputs, engine order
     K_cache   uint16[1, S, D]    bf16 bits   row s = K row of the token at position s
@@ -41,9 +45,11 @@ See docs/axera-llm-rpc-decode.md.
 from __future__ import annotations
 
 import os
+import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Callable, Iterable, Optional, Protocol, Sequence
 
 import llm_reference as ref
 import numpy as np
@@ -53,9 +59,22 @@ LAYER_OUTPUT_ORDER = ("K_cache_out", "V_cache_out", "output")
 POST_INPUT_ORDER = ("input",)
 POST_OUTPUT_ORDER = ("output",)
 
-# File names `pulsar2 llm_build --prefill_len 128` writes into its output directory.
-LAYER_FILE_PATTERN = "llama_p128_l{i}_together.axmodel"
-POST_FILE_NAME = "llama_post.axmodel"
+# ONNX TensorProto.DataType -> element size, for the dtypes an io_info can report.
+_ONNX_ITEMSIZE = {
+    1: 4,
+    2: 1,
+    3: 1,
+    4: 2,
+    5: 2,
+    6: 4,
+    7: 8,
+    9: 1,
+    10: 2,
+    11: 8,
+    12: 4,
+    13: 8,
+    16: 2,
+}
 
 # Additive mask value for "do not attend". -65536.0 is exactly representable
 # in bf16 (bits 0xC780). 0.0 (bits 0x0000) means "attend".
@@ -75,7 +94,10 @@ def f32_to_bf16(a) -> np.ndarray:
     """
     f = np.ascontiguousarray(a, dtype="<f4")
     u = f.view("<u4")
-    r = ((u.astype(np.uint64) + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    hi = u >> 16
+    # carry of (low half + 0x7FFF + lsb of the kept half) out of 16 bits, all within uint32
+    hi += ((u & 0xFFFF) + 0x7FFF + (hi & 1)) >> 16
+    r = hi.astype(np.uint16)
     nan = np.isnan(f)
     if nan.any():
         r = np.where(nan, ((u >> 16) | 0x7FC0).astype(np.uint16), r)
@@ -93,20 +115,240 @@ def bf16_round(a) -> np.ndarray:
     return bf16_to_f32(f32_to_bf16(a))
 
 
+_ONNX_FLOAT16 = 10
+_FP16_MAX = 65504.0
+
+
+def _bf16_to_fp16(b) -> np.ndarray:
+    """bf16 bit pattern (uint16) -> IEEE half bit pattern (uint16). Values
+    beyond fp16's range are clamped to its largest finite value, so the
+    additive mask's -65536 stays finite."""
+    f = np.clip(bf16_to_f32(b), -_FP16_MAX, _FP16_MAX)
+    return f.astype("<f2").view("<u2")
+
+
+def _fp16_to_bf16(h) -> np.ndarray:
+    """IEEE half bit pattern (any 16-bit array or bytes) -> bf16 bit pattern (uint16)."""
+    raw = np.frombuffer(np.ascontiguousarray(h).tobytes(), dtype="<f2")
+    return f32_to_bf16(raw.astype("<f4"))
+
+
+# --------------------------------------------------------------------------
+# Files of an llm_build output directory
+# --------------------------------------------------------------------------
+_LAYER_FILE = re.compile(
+    r"^(?P<prefix>.+)_p(?P<prefill>\d+)_l(?P<index>\d+)_together\.axmodel$"
+)
+_POST_FILE = re.compile(r"^(?P<prefix>.+)_post\.axmodel$")
+# --prefill_len values tried when a directory can only be probed (see probe_files).
+PROBE_PREFILL_LENS = (128, 64, 256, 32, 96, 192, 320, 512, 1024)
+
+
+@dataclass(frozen=True)
+class ModelFiles:
+    """`pulsar2 llm_build` names its files after the checkpoint's `model_type`:
+    `{prefix}_p{prefill_len}_l{i}_together.axmodel` per layer and `{prefix}_post.axmodel`
+    (SmolLM2: `llama_p128_l0_together.axmodel`; Qwen3: `qwen3_p128_l0_together.axmodel`)."""
+
+    prefix: str
+    prefill_len: int
+    num_layers: int
+
+    @property
+    def layer_pattern(self) -> str:
+        return f"{self.prefix}_p{self.prefill_len}_l{{i}}_together.axmodel"
+
+    @property
+    def post_name(self) -> str:
+        return f"{self.prefix}_post.axmodel"
+
+    def layer_names(self) -> list:
+        return [self.layer_pattern.format(i=i) for i in range(self.num_layers)]
+
+    def layer_paths(self, directory: str, sep: str = "/") -> list:
+        return [directory.rstrip(sep) + sep + n for n in self.layer_names()]
+
+    def post_path(self, directory: str, sep: str = "/") -> str:
+        return directory.rstrip(sep) + sep + self.post_name
+
+
+def discover_files(names: Iterable[str], prefix: Optional[str] = None) -> ModelFiles:
+    """The layer/post file set among `names` (a directory listing). `prefix` picks one
+    when the directory holds more than one model; nothing about the names is assumed
+    beyond the `_p{N}_l{i}_together.axmodel` / `_post.axmodel` suffixes."""
+    names = list(names)
+    groups: dict = {}
+    for n in names:
+        m = _LAYER_FILE.match(os.path.basename(n))
+        if m and prefix in (None, m["prefix"]):
+            groups.setdefault((m["prefix"], int(m["prefill"])), set()).add(
+                int(m["index"])
+            )
+    if not groups:
+        raise FileNotFoundError(
+            "no *_p{N}_l{i}_together.axmodel layer files"
+            + (f" with prefix {prefix!r}" if prefix else "")
+            + f" among {len(names)} names"
+        )
+    if len(groups) > 1:
+        raise ValueError(
+            f"more than one layer file set {sorted(groups)}: pass prefix= or explicit paths"
+        )
+    (((found, prefill), indices),) = groups.items()
+    if indices != set(range(len(indices))):
+        raise FileNotFoundError(
+            f"{found}_p{prefill}: layer files present for {sorted(indices)}, "
+            f"not a complete 0..{max(indices)} (is the build still running?)"
+        )
+    files = ModelFiles(found, prefill, len(indices))
+    posts = {
+        os.path.basename(n) for n in names if _POST_FILE.match(os.path.basename(n))
+    }
+    if files.post_name not in posts:
+        raise FileNotFoundError(
+            f"{len(indices)} layer files but no {files.post_name} (is the build still running?)"
+        )
+    return files
+
+
+def list_model_dir(directory: str, prefix: Optional[str] = None) -> ModelFiles:
+    """discover_files() on a local directory."""
+    return discover_files(os.listdir(directory), prefix)
+
+
+def probe_files(
+    exists: Callable[[str], bool],
+    directory: str,
+    prefixes: Sequence[str],
+    num_layers: int,
+    prefill_lens: Sequence[int] = PROBE_PREFILL_LENS,
+) -> ModelFiles:
+    """For a directory that cannot be listed (it is on the worker): try
+    `{prefix}_p{N}_l0_together.axmodel` for each candidate and take the first that
+    `exists(path)` accepts. `num_layers` has to come from the checkpoint's config."""
+    tried = []
+    for prefix in dict.fromkeys(prefixes):
+        for prefill in prefill_lens:
+            files = ModelFiles(prefix, prefill, num_layers)
+            path = files.layer_paths(directory)[0]
+            if exists(path):
+                return files
+            tried.append(os.path.basename(path))
+    raise FileNotFoundError(f"none of {tried} could be opened in {directory}")
+
+
 # --------------------------------------------------------------------------
 # I/O spec
 # --------------------------------------------------------------------------
+def axmodel_io(path: str) -> dict:
+    """Inputs and outputs of a compiled model file, in the form of the worker's
+    `io_info`: {"inputs": [{"name", "dtype", "shape", "bytes"}, ...], "outputs": [...]}.
+
+    An llm_build layer file holds two `neu mode` nodes, the decode subgraph
+    first and the prefill one second; only the first node's tensors are
+    reported, which is also what the engine exposes by default."""
+    import onnx
+
+    g = onnx.load(path, load_external_data=False).graph
+    typed = {v.name: v for v in [*g.input, *g.output, *g.value_info]}
+    node = next((n for n in g.node if n.op_type == "neu mode"), None)
+    ins = list(node.input) if node else [v.name for v in g.input]
+    outs = list(node.output) if node else [v.name for v in g.output]
+
+    def entry(name):
+        t = typed[name].type.tensor_type
+        shape = [int(d.dim_value) for d in t.shape.dim]
+        return {
+            "name": name,
+            "dtype": int(t.elem_type),
+            "shape": shape,
+            "bytes": int(np.prod(shape)) * _ONNX_ITEMSIZE[int(t.elem_type)],
+        }
+
+    return {"inputs": [entry(n) for n in ins], "outputs": [entry(n) for n in outs]}
+
+
+def _by_name(entries: Sequence[dict], names: Sequence[str], what: str) -> dict:
+    """Engine tensors keyed by our names: by name when the engine uses them, else by position."""
+    if len(entries) != len(names):
+        raise ValueError(
+            f"{what}: engine has {len(entries)} tensors, expected {len(names)} {tuple(names)}"
+        )
+    if sorted(e["name"] for e in entries) == sorted(names):
+        return {e["name"]: e for e in entries}
+    return dict(zip(names, entries))
+
+
 @dataclass(frozen=True)
 class IOSpec:
-    hidden: int = 576
-    kv_dim: int = 192  # num_key_value_heads * head_dim
-    cache_len: int = 255
-    vocab: int = 49152
-    num_layers: int = 30
+    hidden: int
+    kv_dim: int  # num_key_value_heads * head_dim
+    cache_len: int  # rows of K_cache = tokens the compiled context holds
+    vocab: int
+    num_layers: int
 
     @classmethod
-    def from_model(cls, model: "ref.Model", cache_len: int = 255) -> "IOSpec":
-        return cls(model.H, model.kvdim, cache_len, model.vocab, model.L)
+    def from_model(cls, model: "ref.Model", cache_len: int) -> "IOSpec":
+        """Sizes of a checkpoint; `cache_len` is the build's --kv_cache_len."""
+        return cls(model.H, model.kvdim, int(cache_len), model.vocab, model.L)
+
+    @classmethod
+    def from_io(cls, layer_io: dict, post_io: dict, num_layers: int) -> "IOSpec":
+        """Sizes of the compiled models, from one layer's and the post model's I/O
+        description (the worker's `io_info`, or `axmodel_io`)."""
+        li = _by_name(layer_io["inputs"], LAYER_INPUT_ORDER, "layer inputs")
+        lo = _by_name(layer_io["outputs"], LAYER_OUTPUT_ORDER, "layer outputs")
+        po = _by_name(post_io["outputs"], POST_OUTPUT_ORDER, "post outputs")
+        k_shape = list(li["K_cache"]["shape"])
+        if len(k_shape) != 3 or k_shape[0] != 1:
+            raise ValueError(
+                f"K_cache shape {k_shape}, expected [1, cache_len, kv_dim]"
+            )
+        spec = cls(
+            int(li["input"]["shape"][-1]),
+            int(k_shape[2]),
+            int(k_shape[1]),
+            int(po["output"]["shape"][-1]),
+            int(num_layers),
+        )
+        ios = {**li, **lo}
+        for name, (dt, shape) in {**spec.layer_inputs, **spec.layer_outputs}.items():
+            e = ios[name]
+            if (
+                tuple(e["shape"]) != shape
+                or e["bytes"] != int(np.prod(shape)) * np.dtype(dt).itemsize
+            ):
+                raise ValueError(
+                    f"compiled layer tensor {e['name']!r} is {e['shape']} ({e['bytes']} bytes), "
+                    f"the loop's {name} would be {list(shape)} {np.dtype(dt)}"
+                )
+        return spec
+
+    @classmethod
+    def from_axmodels(
+        cls, layer_path: str, post_path: str, num_layers: int
+    ) -> "IOSpec":
+        return cls.from_io(axmodel_io(layer_path), axmodel_io(post_path), num_layers)
+
+    @classmethod
+    def from_model_dir(cls, directory: str, prefix: Optional[str] = None) -> "IOSpec":
+        """Sizes of the llm_build output in a local directory."""
+        files = list_model_dir(directory, prefix)
+        return cls.from_axmodels(
+            files.layer_paths(directory, os.sep)[0],
+            files.post_path(directory, os.sep),
+            files.num_layers,
+        )
+
+    def check_model(self, model: "ref.Model") -> None:
+        """Refuse a checkpoint whose sizes are not the compiled models'."""
+        got = (model.H, model.kvdim, model.vocab, model.L)
+        want = (self.hidden, self.kv_dim, self.vocab, self.num_layers)
+        if got != want:
+            raise ValueError(
+                "checkpoint (hidden, kv heads x head dim, vocab, layers) = %s, compiled models = %s"
+                % (got, want)
+            )
 
     @property
     def layer_inputs(self) -> dict:
@@ -173,18 +415,11 @@ class NumpyBackend:
     in K_cache_out; the host only copies that row, so either choice decodes the same.
     """
 
-    def __init__(
-        self, model: ref.Model, spec: IOSpec = IOSpec(), k_post_rope: bool = True
-    ):
+    def __init__(self, model: ref.Model, spec: IOSpec, k_post_rope: bool = True):
         self.m = model
         self.spec = spec
         self.k_post_rope = k_post_rope
-        assert (model.H, model.kvdim, model.vocab, model.L) == (
-            spec.hidden,
-            spec.kv_dim,
-            spec.vocab,
-            spec.num_layers,
-        )
+        spec.check_model(model)
 
     def run_layer(self, layer_index, feeds):
         s = self.spec
@@ -237,8 +472,13 @@ class DeviceBackend:
     as little-endian uint16 (bf16 bits). A float32 array with the right
     element count is also accepted and rounded to bf16.
 
+    `model_dir` is a local directory: without `layer_paths` / `post_path` it
+    is listed for the layer and post files (`discover_files`; `prefix` picks
+    a model when it holds several), and without `spec` the sizes are read
+    from the first layer file and the post file (`IOSpec.from_axmodels`).
+
     Handles are loaded on first use and kept. If the device cannot hold all
-    31 models, pass `unload` and `max_loaded` for an LRU of handles.
+    the models, pass `unload` and `max_loaded` for an LRU of handles.
 
     `output_order` / `input_order` are the engine's tensor orders; change
     them here if a device run shows a different order.
@@ -252,23 +492,25 @@ class DeviceBackend:
         *,
         layer_paths: Optional[Sequence[str]] = None,
         post_path: Optional[str] = None,
-        spec: IOSpec = IOSpec(),
+        spec: Optional[IOSpec] = None,
+        prefix: Optional[str] = None,
         input_order: Sequence[str] = LAYER_INPUT_ORDER,
         output_order: Sequence[str] = LAYER_OUTPUT_ORDER,
         unload: Optional[Callable[[object], None]] = None,
         max_loaded: Optional[int] = None,
     ):
         self._load, self._run, self._unload = load, run, unload
+        if layer_paths is None or post_path is None:
+            files = list_model_dir(model_dir, prefix)
+            if layer_paths is None:
+                layer_paths = files.layer_paths(model_dir, os.sep)
+            post_path = post_path or files.post_path(model_dir, os.sep)
+        self.layer_paths, self.post_path = list(layer_paths), post_path
+        if spec is None:
+            spec = IOSpec.from_axmodels(
+                self.layer_paths[0], self.post_path, len(self.layer_paths)
+            )
         self.spec = spec
-        self.layer_paths = (
-            list(layer_paths)
-            if layer_paths is not None
-            else [
-                os.path.join(model_dir, LAYER_FILE_PATTERN.format(i=i))
-                for i in range(spec.num_layers)
-            ]
-        )
-        self.post_path = post_path or os.path.join(model_dir, POST_FILE_NAME)
         if len(self.layer_paths) != spec.num_layers:
             raise ValueError(
                 f"{len(self.layer_paths)} layer paths for {spec.num_layers} layers"
@@ -341,24 +583,6 @@ class DeviceBackend:
         return self._unpack(outs, s.post_outputs, POST_OUTPUT_ORDER, "post outputs")
 
 
-# ONNX TensorProto.DataType -> element size, for the dtypes an io_info can report.
-_ONNX_ITEMSIZE = {
-    1: 4,
-    2: 1,
-    3: 1,
-    4: 2,
-    5: 2,
-    6: 4,
-    7: 8,
-    9: 1,
-    10: 2,
-    11: 8,
-    12: 4,
-    13: 8,
-    16: 2,
-}
-
-
 class RpcBackend:
     """Backend over an onnx-remote AXCL worker (tools/onnx-remote/remote_axcl_worker.cpp).
 
@@ -373,13 +597,33 @@ class RpcBackend:
     of a model asks the worker for its `io_info` (which also loads it into
     the worker's model cache), and each call then sends every tensor in the
     engine's order under the ONNX dtype the worker reported for it. That
-    matters because the engine reports bf16 tensors inconsistently: an
-    `llm_build` layer's K/V/hidden tensors come back with an unknown type code
-    that the worker reads as FLOAT16, its `mask` as BFLOAT16. Either way the
-    payload is the same 16-bit pattern, so only the label differs.
+    matters because the label decides the payload: a default build
+    (`--hidden_state_type bf16`) reports every 16-bit tensor as BFLOAT16 and
+    takes the host's bf16 patterns as they are, while an fp16 build reports
+    its K/V/hidden tensors with an unknown type code that the worker reads
+    as FLOAT16. Those are real IEEE halves, so the host's bf16 patterns are
+    converted on the way in and out (`_bf16_to_fp16`, `_fp16_to_bf16`); its
+    `mask` stays BFLOAT16. Sending bf16 bits under the FLOAT16 label gave
+    infinities on the device.
 
     Tensors are matched to the engine's by name; if the engine's names are
     not the graph's, by position in `LAYER_INPUT_ORDER` / `LAYER_OUTPUT_ORDER`.
+
+    The worker's directory cannot be listed over the protocol, so the file
+    names come from one of: explicit `layer_paths` / `post_path`; `files` (a
+    `ModelFiles`, e.g. `list_model_dir()` on a local copy of the directory);
+    or `num_layers` plus `prefixes` (the checkpoint's `model_type`), which
+    probes the worker with `io_info` for `{prefix}_p{N}_l0_together.axmodel`.
+    Without `spec`, the sizes are taken from the worker's `io_info` of the
+    first layer and of the post model.
+
+    The K/V caches are the bulk of every layer call (2 x S x D bf16, re-sent
+    in full for each layer of each token: the protocol has no persistent
+    tensors). This class adds no copy of them: the host's cache array is
+    handed to the client as it is, and the client writes it to the socket
+    from its own memory.
+
+    `layer_seconds` / `post_seconds` accumulate the wall time of the worker calls.
     """
 
     def __init__(
@@ -389,26 +633,49 @@ class RpcBackend:
         *,
         layer_paths: Optional[Sequence[str]] = None,
         post_path: Optional[str] = None,
-        spec: IOSpec = IOSpec(),
+        spec: Optional[IOSpec] = None,
+        files: Optional[ModelFiles] = None,
+        num_layers: Optional[int] = None,
+        prefixes: Sequence[str] = (),
     ):
         self.client = client
+        self._info: dict = {}
+        self.calls = 0
+        self.layer_seconds = self.post_seconds = 0.0
+        if layer_paths is None or post_path is None:
+            if files is None:
+                if num_layers is None and spec is not None:
+                    num_layers = spec.num_layers
+                if num_layers is None or not prefixes:
+                    raise ValueError(
+                        "RpcBackend needs layer_paths + post_path, files=, or num_layers= and prefixes= to probe"
+                    )
+                files = probe_files(self._exists, model_dir, prefixes, num_layers)
+            # Joined with "/": these are paths on the worker (a Linux process), not on this host.
+            if layer_paths is None:
+                layer_paths = files.layer_paths(model_dir)
+            post_path = post_path or files.post_path(model_dir)
+        self.files = files
+        self.layer_paths, self.post_path = list(layer_paths), post_path
+        if spec is None:
+            spec = IOSpec.from_io(
+                self.info(self.layer_paths[0]),
+                self.info(self.post_path),
+                len(self.layer_paths),
+            )
         self.spec = spec
-        # Joined with "/": these are paths on the worker (a Linux process), not on this host.
-        self.layer_paths = (
-            list(layer_paths)
-            if layer_paths is not None
-            else [
-                model_dir.rstrip("/") + "/" + LAYER_FILE_PATTERN.format(i=i)
-                for i in range(spec.num_layers)
-            ]
-        )
-        self.post_path = post_path or model_dir.rstrip("/") + "/" + POST_FILE_NAME
         if len(self.layer_paths) != spec.num_layers:
             raise ValueError(
                 f"{len(self.layer_paths)} layer paths for {spec.num_layers} layers"
             )
-        self._info: dict = {}
-        self.calls = 0
+
+    def _exists(self, path: str) -> bool:
+        """True when the worker can open `path` (it stays loaded in the worker's cache)."""
+        try:
+            self.info(path)
+            return True
+        except Exception:  # RemoteError: the worker could not set the model up
+            return False
 
     def info(self, path: str) -> dict:
         """The worker's io_info for `path`, asked once."""
@@ -424,12 +691,8 @@ class RpcBackend:
     @staticmethod
     def _order(engine: Sequence[dict], names: Sequence[str], what: str) -> list:
         """Our tensor name for each engine tensor, in engine order."""
-        if len(engine) != len(names):
-            raise ValueError(
-                f"{what}: engine has {len(engine)} tensors, expected {len(names)} {tuple(names)}"
-            )
-        engine_names = [e["name"] for e in engine]
-        return engine_names if sorted(engine_names) == sorted(names) else list(names)
+        named = _by_name(engine, names, what)
+        return [next(n for n, x in named.items() if x is e) for e in engine]
 
     def _call(
         self,
@@ -456,17 +719,27 @@ class RpcBackend:
                     f"{what}: engine input {e['name']!r} is ONNX dtype {e['dtype']} {e['shape']} "
                     f"({e['bytes']} bytes), the loop has {name} {a.dtype}{a.shape} ({a.nbytes} bytes)"
                 )
+            if e["dtype"] == _ONNX_FLOAT16:
+                # A real fp16 tensor (--hidden_state_type fp16): the host's
+                # bf16 pattern has to become an IEEE half, not just be relabelled.
+                a = _bf16_to_fp16(a)
             tensors.append((e["dtype"], a.reshape(e["shape"])))
         outs = self.client.run_path(path, tensors)
         self.calls += 1
         order = self._order(info["outputs"], out_names, what + " outputs")
         # float32 would be widened by _unpack; here every output is a raw 16-bit pattern.
-        raws = [np.ascontiguousarray(o).tobytes() for o in outs]
+        raws = [
+            _fp16_to_bf16(o).tobytes()
+            if e["dtype"] == _ONNX_FLOAT16
+            else np.ascontiguousarray(o).tobytes()
+            for o, e in zip(outs, info["outputs"])
+        ]
         return DeviceBackend._unpack(raws, want_out, order, what + " outputs")
 
     def run_layer(self, layer_index, feeds):
         s = self.spec
-        return self._call(
+        t0 = time.perf_counter()
+        out = self._call(
             self.layer_paths[layer_index],
             feeds,
             s.layer_inputs,
@@ -475,10 +748,13 @@ class RpcBackend:
             LAYER_OUTPUT_ORDER,
             f"layer {layer_index}",
         )
+        self.layer_seconds += time.perf_counter() - t0
+        return out
 
     def run_post(self, feeds):
         s = self.spec
-        return self._call(
+        t0 = time.perf_counter()
+        out = self._call(
             self.post_path,
             feeds,
             s.post_inputs,
@@ -487,35 +763,65 @@ class RpcBackend:
             POST_OUTPUT_ORDER,
             "post",
         )
+        self.post_seconds += time.perf_counter() - t0
+        return out
 
 
 # --------------------------------------------------------------------------
 # Host state and the loop
 # --------------------------------------------------------------------------
-class Host:
-    """What the host owns: the embedding table (bf16 bits) and the KV caches."""
+def _eos_ids(eos) -> frozenset:
+    if eos is None:
+        return frozenset()
+    return frozenset(int(e) for e in (eos if isinstance(eos, Iterable) else [eos]))
 
-    def __init__(
-        self, embed_f32: np.ndarray, spec: IOSpec = IOSpec(), eos: Optional[int] = None
-    ):
+
+def embedding_bits(model: "ref.Model", chunk_rows: int = 8192) -> np.ndarray:
+    """A checkpoint's embedding table as bf16 bit patterns, uint16 [vocab, hidden].
+    A BF16 checkpoint's table is used as stored, straight from the file mapping (no
+    copy, and exact); any other is rounded to bf16 a block of rows at a time."""
+    bits = model.embedding_bits()
+    if bits is not None:
+        return bits
+    out = np.empty((model.vocab, model.H), "<u2")
+    for beg in range(0, model.vocab, chunk_rows):
+        end = min(beg + chunk_rows, model.vocab)
+        out[beg:end] = f32_to_bf16(model.embed(range(beg, end)))
+    return out
+
+
+class Host:
+    """What the host owns: the embedding table (bf16 bits) and the KV caches.
+
+    `embed` is the table as float32 (rounded to bf16 here) or as uint16 bf16
+    bit patterns (used as it is; it may be a read-only file mapping). `eos` is
+    one token id or several.
+
+    `step_seconds` gets one (total, post) pair of wall times per fed token.
+    """
+
+    def __init__(self, embed: np.ndarray, spec: IOSpec, eos=None):
         self.spec = spec
-        self.eos = eos
-        self.embed_bf16 = f32_to_bf16(
-            embed_f32
-        )  # [vocab, hidden] uint16; exact for a bf16 checkpoint
-        assert self.embed_bf16.shape == (spec.vocab, spec.hidden)
+        self.eos_ids = _eos_ids(eos)
+        self.eos = eos if isinstance(eos, int) else min(self.eos_ids, default=None)
+        # [vocab, hidden] uint16; exact for a bf16 checkpoint
+        self.embed_bf16 = (
+            embed if embed.dtype == np.dtype("<u2") else f32_to_bf16(embed)
+        )
+        if self.embed_bf16.shape != (spec.vocab, spec.hidden):
+            raise ValueError(
+                f"embedding table {self.embed_bf16.shape}, the compiled models want {(spec.vocab, spec.hidden)}"
+            )
         self.reset()
 
     @classmethod
-    def from_checkpoint(
-        cls, checkpoint_dir: str, spec: Optional[IOSpec] = None
-    ) -> "Host":
-        m = ref.Model.load(checkpoint_dir)
-        return cls(m.E, spec or IOSpec.from_model(m), m.eos)
+    def from_checkpoint(cls, checkpoint_dir: str, spec: IOSpec) -> "Host":
+        return cls.from_model(ref.Model.load(checkpoint_dir), spec)
 
     @classmethod
-    def from_model(cls, m: ref.Model, spec: IOSpec = IOSpec()) -> "Host":
-        return cls(m.E, spec, m.eos)
+    def from_model(cls, m: ref.Model, spec: IOSpec) -> "Host":
+        spec.check_model(m)
+        return cls(embedding_bits(m), spec, m.eos_ids or m.eos)
 
     def reset(self) -> None:
         s = self.spec
@@ -523,6 +829,7 @@ class Host:
         self.K = np.zeros((s.num_layers, 1, s.cache_len, s.kv_dim), "<u2")
         self.V = np.zeros((s.num_layers, 1, s.cache_len, s.kv_dim), "<u2")
         self.pos = 0
+        self.step_seconds: list = []
 
     def build_mask(self, pos: int, mask_value: float = MASK_NEG) -> np.ndarray:
         """Additive mask for the token at position `pos`: cache rows 0..pos-1
@@ -558,11 +865,13 @@ class Host:
         hiddens_bf16 [L+1, hidden]); hiddens[0] is the embedding, hiddens[l+1] layer l's output."""
         s = self.spec
         pos = self.pos
+        t0 = time.perf_counter()
         if pos >= s.cache_len:
             raise ValueError(
                 f"position {pos} exceeds the compiled context ({s.cache_len} tokens, positions 0..{s.cache_len - 1})"
             )
-        x = self.embed_bf16[int(token)].reshape(1, 1, s.hidden)
+        # one row, copied out of the table (which may be a file mapping)
+        x = np.array(self.embed_bf16[int(token)], dtype="<u2").reshape(1, 1, s.hidden)
         mask = self.build_mask(pos, mask_value)
         hid = [x.reshape(s.hidden).copy()]
         for li in range(s.num_layers):
@@ -575,10 +884,13 @@ class Host:
             hid.append(x.reshape(s.hidden).copy())
         self.pos = pos + 1
         logits = None
+        t1 = time.perf_counter()
         if want_logits:
             po = backend.run_post({"input": x})
             _check(po, s.post_outputs, "post outputs")
             logits = po["output"].reshape(s.vocab)
+        t2 = time.perf_counter()
+        self.step_seconds.append((t2 - t0, t2 - t1))
         return logits, np.stack(hid)
 
 
@@ -630,7 +942,7 @@ def decode(
     for i in range(max_new_tokens):
         nxt = argmax_bf16(logits)
         out.append(nxt)
-        if (stop_at_eos and nxt == host.eos) or i == max_new_tokens - 1:
+        if (stop_at_eos and nxt in host.eos_ids) or i == max_new_tokens - 1:
             break
         logits, h = host.step(nxt, backend, mask_value)
         hs.append(h)
@@ -672,14 +984,7 @@ def compare_layers(
     v row, 'K_rot' [T, L] vs the RoPE-rotated ref k row and 'K_raw' [T, L] vs
     the unrotated one, plus 'KV_swapped' [T, L] = cosine(K_cache_out, ref v).
     """
-    spec = IOSpec(
-        model.H,
-        model.kvdim,
-        getattr(backend, "spec", IOSpec()).cache_len,
-        model.vocab,
-        model.L,
-    )
-    host = Host.from_model(model, spec)
+    host = Host.from_model(model, backend.spec)
     layers = list(range(model.L)) if layers is None else list(layers)
     T = len(token_ids)
     res = {
@@ -736,45 +1041,71 @@ def compare_decode(
     *,
     mask_value: float = MASK_NEG,
     verbose: bool = True,
+    host: Optional[Host] = None,
+    stop_at_eos: bool = False,
 ) -> dict:
     """Free-running check: run decode() on `backend` and ref.greedy (float32),
     report tokens, the first diverging step with the reference's top-2 logit
     gap there, and the chained per-layer rel error of the hidden states over
-    the common token prefix."""
+    the common token prefix. The post model runs on every fed token here (the
+    trace wants all logits), so timings include one post call per prompt token."""
     tr_d: dict = {}
     tr_r: dict = {}
     toks = decode(
         prompt_ids,
         max_new_tokens,
         backend,
-        host=Host.from_model(model, getattr(backend, "spec", IOSpec())),
+        host=host or Host.from_model(model, backend.spec),
+        stop_at_eos=stop_at_eos,
         mask_value=mask_value,
         trace=tr_d,
     )
-    rtoks = model.greedy(prompt_ids, max_new_tokens, trace=tr_r)
+    rtoks = model.greedy(
+        prompt_ids, max_new_tokens, stop_at_eos=stop_at_eos, trace=tr_r
+    )
+    # The same float32 weights with every layer boundary rounded to bf16, as the compiled
+    # pipeline's I/O is: what is left of a difference to it is the layers' own arithmetic.
+    btoks = model.greedy(
+        prompt_ids, max_new_tokens, rnd=bf16_round, stop_at_eos=stop_at_eos
+    )
     first = next((i for i, (a, b) in enumerate(zip(toks, rtoks)) if a != b), None)
+    if first is None and len(toks) != len(rtoks):
+        first = min(len(toks), len(rtoks))
     n_common = len(prompt_ids) + (len(toks) - 1 if first is None else first)
     n_common = min(n_common, tr_d["hiddens"].shape[1], tr_r["hiddens"].shape[1])
     hd, hr = tr_d["hiddens"][:, :n_common], tr_r["hiddens"][:, :n_common]
     per_layer = np.array([_rel(hd[i], hr[i]) for i in range(hd.shape[0])])  # [L+1]
+    # top-2 logit gap of the reference at each of its greedy picks: how much room each had
+    picks = np.sort(tr_r["logits"][len(prompt_ids) - 1 :], axis=-1)
+    gaps = picks[:, -1] - picks[:, -2]
     res = {
         "tokens": toks,
         "ref_tokens": rtoks,
+        "ref_tokens_bf16": btoks,
         "first_divergence": first,
         "hidden_rel_per_layer": per_layer,
+        "ref_top2_gaps": gaps,
     }
-    if first is not None:
-        lg = tr_r["logits"][len(prompt_ids) - 1 + first]
-        top = np.sort(lg)[-2:]
-        res["ref_top2_gap"] = float(top[1] - top[0])
+    if first is not None and first < len(gaps):
+        res["ref_top2_gap"] = float(gaps[first])
     if verbose:
         print("backend tokens", toks)
         print("ref    tokens", rtoks)
         print(
             "identical"
             if first is None
-            else "first divergence at new token %d, ref top-2 logit gap %.4f"
-            % (first, res["ref_top2_gap"])
+            else "first divergence at new token %d, ref top-2 logit gap %s"
+            % (first, "%.4f" % res["ref_top2_gap"] if "ref_top2_gap" in res else "n/a")
+        )
+        print(
+            "ref with bf16 layer boundaries:",
+            "same tokens as the float32 ref" if btoks == rtoks else btoks,
+            "(the backend matches it)" if btoks == toks and btoks != rtoks else "",
+        )
+        print(
+            "ref top-2 logit gap along its greedy path: min %.4f at new token %d "
+            "(bf16 logits near 16 are 0.125 apart)"
+            % (float(gaps.min()), int(gaps.argmin()))
         )
         print(
             "chained hidden rel-L2 per layer (0 = embedding):",
