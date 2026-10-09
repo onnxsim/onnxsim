@@ -29,7 +29,7 @@ import pytest
 from onnx import parser
 
 import onnxsim
-from onnxsim import model_checking
+from onnxsim import backend, model_checking
 
 
 def _simplify(model):
@@ -1183,8 +1183,8 @@ def test_fuse_reshape_family_declines_unresolved_output_shape():
     assert ops["Reshape"] == 0
 
 
-def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
-    model = _model(
+def _zero_size_unsqueeze_flatten_model():
+    return _model(
         """
         g (float[0,N,3,4] X) => (float[0,M] Y)
         <int64[1] axes = {1}>
@@ -1195,6 +1195,10 @@ def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
         """,
         opset=14,
     )
+
+
+def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
+    model = _zero_size_unsqueeze_flatten_model()
     onnx.checker.check_model(model)
     simplified, _ = onnxsim.simplify(model, check_n=0)
     onnx.checker.check_model(simplified)
@@ -1202,6 +1206,17 @@ def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
     assert ops["Unsqueeze"] == 1
     assert ops["Flatten"] == 1
     assert ops["Reshape"] == 0
+
+
+# Needs onnxruntime: onnx's reference Flatten cannot reshape a zero-size tensor
+# (np.reshape raises on the -1 inferred dimension), and big-endian CI runs without it.
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(),
+    reason="reference Flatten cannot run zero-size inputs",
+)
+def test_fuse_reshape_family_zero_inferred_dimension_matches_original():
+    model = _zero_size_unsqueeze_flatten_model()
+    simplified, _ = onnxsim.simplify(model, check_n=0)
     assert model_checking.compare(
         simplified,
         model,
