@@ -162,3 +162,42 @@ def test_load_cases_resolves_supplied_paths_next_to_the_file(tmp_path):
     )
     (case,) = load_cases(str(cases_path))
     assert case.path == str(tmp_path / "in.npz")
+
+
+def refuses_relu(node, inputs):
+    """A backend that cannot run Relu. Used with --backend below."""
+    if node.op_type == "Relu":
+        raise NotImplementedError("Relu is not supported")
+    if node.op_type == "MatMul":
+        return [inputs[0] @ inputs[1]]
+    raise NotImplementedError(node.op_type)
+
+
+def test_verify_with_a_backend_reports_partial_and_exits_zero(
+    project, tmp_path, capsys
+):
+    cases = _cases_file(tmp_path)
+    code = main(
+        [
+            "verify",
+            project,
+            "--cases",
+            cases,
+            "--backend",
+            "test_versioning_cli:refuses_relu",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == EXIT_PASS
+    assert "partial" in out
+    assert "Relu:y" in out
+    manifest, _ = read_project(project)
+    assert manifest["steps"][-1]["verdict"] == "partial"
+
+
+def test_backend_spec_without_a_function_is_a_usage_error(project, tmp_path):
+    cases = _cases_file(tmp_path)
+    assert (
+        main(["verify", project, "--cases", cases, "--backend", "no_colon"])
+        == EXIT_ERROR
+    )

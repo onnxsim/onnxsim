@@ -24,6 +24,7 @@ from onnxsim.versioning import (
     load_manifest,
     record_step,
     resolve_feeds,
+    run_partial,
     save_snapshot,
     tensor_digest,
 )
@@ -344,3 +345,60 @@ def test_unknown_fusion_preset_is_rejected():
         bisect_failure(
             base, candidate, [GeneratedCase("c", 0, _spec())], fusion="bogus"
         )
+
+
+def _numpy_backend(node, inputs):
+    """A backend that runs three ops and refuses Sigmoid."""
+    if node.op_type == "MatMul":
+        return [inputs[0] @ inputs[1]]
+    if node.op_type == "Relu":
+        return [np.maximum(inputs[0], 0)]
+    if node.op_type == "Identity":
+        return [inputs[0]]
+    raise NotImplementedError(f"{node.op_type} is not supported")
+
+
+def _two_outputs(second):
+    model = _model(
+        f"""
+        g (float[1,4] x) => (float[1,4] y, float[1,4] z)
+        {{
+          h = MatMul (x, W)
+          y = Sigmoid (h)
+          z = {second} (h)
+        }}
+        """
+    )
+    # Negative weights make MatMul's output negative, so Relu and Identity differ.
+    return _with_weight(model, "W", -np.eye(4, dtype=np.float32))
+
+
+def test_partial_run_judges_outputs_it_can_and_skips_the_rest():
+    cases = [GeneratedCase("c", seed=0, specs=_spec())]
+    (report,) = check_equivalent(
+        _two_outputs("Relu"), _two_outputs("Relu"), cases, backend=_numpy_backend
+    )
+    assert report.status == "partial"
+    assert report.ok
+    assert report.skipped == ("y",)
+    assert report.failed_nodes == ("Sigmoid:y",)
+
+
+def test_a_mismatch_is_still_caught_on_an_output_that_can_be_judged():
+    cases = [GeneratedCase("c", seed=0, specs=_spec())]
+    (report,) = check_equivalent(
+        _two_outputs("Relu"), _two_outputs("Identity"), cases, backend=_numpy_backend
+    )
+    assert report.status == "fail"
+    assert not report.ok
+    assert report.skipped == ("y",)
+
+
+def test_partial_run_is_reproducible_for_the_same_seed():
+    cand = _two_outputs("Relu")
+    feeds = {"x": np.full((1, 4), 0.5, np.float32)}
+    sizes = {"h": np.zeros((1, 4), np.float32), "y": np.zeros((1, 4), np.float32)}
+    a = run_partial(cand, feeds, _numpy_backend, sizes, seed=3)
+    b = run_partial(cand, feeds, _numpy_backend, sizes, seed=3)
+    assert a.failed_nodes == b.failed_nodes == ("Sigmoid:y",)
+    assert a.skipped == b.skipped == ("y",)

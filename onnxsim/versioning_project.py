@@ -21,6 +21,7 @@ from onnx import ModelProto
 
 from onnxsim.versioning import (
     MANIFEST_VERSION,
+    Backend,
     Case,
     CaseReport,
     ChangeUnit,
@@ -182,6 +183,7 @@ def verify_project(
     rtol: float = 1e-4,
     fusion: str = "default",
     record: bool = True,
+    backend: Optional[Backend] = None,
 ) -> VerifyResult:
     """Check the project's graph against its base on ``cases``.
 
@@ -190,13 +192,15 @@ def verify_project(
     """
     manifest, text = read_project(directory)
     base, candidate, _ = build_project(directory, weights)
-    reports = check_equivalent(base, candidate, cases, atol, rtol)
+    reports = check_equivalent(base, candidate, cases, atol, rtol, backend)
     passed = all(r.ok for r in reports)
 
     culprit: Optional[ChangeUnit] = None
     culprit_data: Optional[Dict] = None
     if not passed:
-        found = bisect_failure(base, candidate, cases, atol, rtol, fusion=fusion)
+        found = bisect_failure(
+            base, candidate, cases, atol, rtol, fusion=fusion, backend=backend
+        )
         if found is not None:
             culprit = found.culprit
             culprit_data = {

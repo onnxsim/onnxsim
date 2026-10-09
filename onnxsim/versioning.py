@@ -29,7 +29,7 @@ import heapq
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import onnx
@@ -286,10 +286,132 @@ def run_model(model: ModelProto, feeds: Dict[str, np.ndarray]) -> List[np.ndarra
 
 @dataclass(frozen=True)
 class CaseReport:
+    """Result of one case. ``ok`` means no compared output mismatched.
+
+    ``status`` is ``"fail"`` on a mismatch, ``"partial"`` when some outputs were
+    skipped (see :func:`run_partial`), and ``"pass"`` otherwise.
+    """
+
     case: str
     max_abs_diff: float
     max_rel_diff: float
     ok: bool
+    status: str = "pass"
+    skipped: Tuple[str, ...] = ()
+    failed_nodes: Tuple[str, ...] = ()
+
+
+# A backend runs one node on its input arrays (None for an omitted optional input)
+# and returns its outputs. It signals an unsupported op by raising.
+Backend = Callable[[NodeProto, List[Optional[np.ndarray]]], List[np.ndarray]]
+
+
+@dataclass(frozen=True)
+class NodeRun:
+    label: str
+    op_type: str
+    status: str  # "ran", "failed" or "skipped" (an input was never produced)
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class PartialRun:
+    """Graph outputs of a partial run. A ``None`` output is not judged: it is
+    missing, or it depends on a value that was filled in at random."""
+
+    outputs: Dict[str, Optional[np.ndarray]]
+    nodes: Tuple[NodeRun, ...]
+
+    @property
+    def skipped(self) -> Tuple[str, ...]:
+        return tuple(name for name, v in self.outputs.items() if v is None)
+
+    @property
+    def failed_nodes(self) -> Tuple[str, ...]:
+        return tuple(n.label for n in self.nodes if n.status == "failed")
+
+
+def _tensor_sizes(
+    base: ModelProto, feeds: Dict[str, np.ndarray]
+) -> Dict[str, np.ndarray]:
+    """Value of every node output of ``base``, from the reference evaluator.
+
+    These only give shape and dtype to random values for ops a backend cannot run.
+    """
+    from onnx.reference import ReferenceEvaluator
+
+    names = [o for n in base.graph.node for o in n.output if o]
+    if not names:
+        return {}
+    return dict(zip(names, ReferenceEvaluator(base).run(names, feeds)))
+
+
+def _random_like(template: np.ndarray, name: str, seed: int) -> np.ndarray:
+    """Random values with the template's shape and dtype, reproducible from (seed, name)."""
+    digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
+    rng = np.random.Generator(np.random.PCG64(int.from_bytes(digest[:8], "little")))
+    dt = template.dtype
+    if dt.kind == "f":
+        return rng.uniform(-1.0, 1.0, template.shape).astype(dt)
+    if dt.kind in "iu":
+        return rng.integers(0, 8, template.shape).astype(dt)
+    if dt.kind == "b":
+        return rng.integers(0, 2, template.shape).astype(bool)
+    raise TypeError(f"cannot fill {name} with random values of dtype {dt}")
+
+
+def run_partial(
+    model: ModelProto,
+    feeds: Dict[str, np.ndarray],
+    backend: Backend,
+    sizes: Dict[str, np.ndarray],
+    seed: int = 0,
+) -> PartialRun:
+    """Run ``model`` node by node on ``backend``, continuing past ops it cannot run.
+
+    A node that raises has each output filled with seeded random values, shaped
+    like ``sizes[name]``, when that size is known. Every value computed from a
+    random one is marked as such, and so are the graph outputs that depend on it.
+    Nodes whose inputs were never produced are skipped.
+    """
+    env: Dict[str, np.ndarray] = {
+        init.name: numpy_helper.to_array(init) for init in model.graph.initializer
+    }
+    env.update(feeds)
+    fake: Set[str] = set()  # tensors whose value is random, or computed from one
+    runs: List[NodeRun] = []
+    for node in model.graph.node:
+        label = _node_label(node)
+        names = [t for t in node.input if t]
+        if any(t not in env for t in names):
+            runs.append(
+                NodeRun(label, node.op_type, "skipped", "an input was not produced")
+            )
+            continue
+        inputs = [env[t] if t else None for t in node.input]
+        tainted = any(t in fake for t in names)
+        try:
+            outs = backend(node, inputs)
+        except Exception as e:  # any backend failure, including unsupported ops
+            runs.append(
+                NodeRun(label, node.op_type, "failed", f"{type(e).__name__}: {e}")
+            )
+            for o in node.output:
+                if o and o in sizes:
+                    env[o] = _random_like(sizes[o], o, seed)
+                    fake.add(o)
+            continue
+        runs.append(NodeRun(label, node.op_type, "ran"))
+        for o, v in zip(node.output, outs):
+            if o:
+                env[o] = np.asarray(v)
+                if tainted:
+                    fake.add(o)
+    outputs: Dict[str, Optional[np.ndarray]] = {}
+    for out in model.graph.output:
+        name = out.name
+        outputs[name] = None if name not in env or name in fake else env[name]
+    return PartialRun(outputs, tuple(runs))
 
 
 def check_equivalent(
@@ -298,11 +420,17 @@ def check_equivalent(
     cases: Sequence[Case],
     atol: float = 1e-5,
     rtol: float = 1e-4,
+    backend: Optional[Backend] = None,
 ) -> List[CaseReport]:
     """Run ``base`` and ``candidate`` on every case and compare their outputs.
 
     A case passes when every output has the same shape and each element satisfies
     ``|candidate - base| <= atol + rtol * |base|``. Output names must match.
+
+    With ``backend``, the candidate runs on that backend via :func:`run_partial`,
+    so unsupported ops don't stop the check. Outputs it cannot judge are reported
+    as ``skipped`` and the case as ``"partial"``. Random fills use the case's seed
+    for generated cases and 0 otherwise.
     """
     reports: List[CaseReport] = []
     base_names = [o.name for o in base.graph.output]
@@ -312,11 +440,24 @@ def check_equivalent(
     for case in cases:
         feeds = resolve_feeds(case)
         ref = run_model(base, feeds)
-        got = run_model(candidate, feeds)
+        if backend is None:
+            got: List[Optional[np.ndarray]] = list(run_model(candidate, feeds))
+            failed_nodes: Tuple[str, ...] = ()
+        else:
+            seed = case.seed if isinstance(case, GeneratedCase) else 0
+            partial = run_partial(
+                candidate, feeds, backend, _tensor_sizes(base, feeds), seed
+            )
+            got = [partial.outputs[n] for n in cand_names]
+            failed_nodes = partial.failed_nodes
         max_abs = 0.0
         max_rel = 0.0
         ok = True
-        for r, g in zip(ref, got):
+        skipped: List[str] = []
+        for name, r, g in zip(base_names, ref, got):
+            if g is None:
+                skipped.append(name)
+                continue
             if r.shape != g.shape:
                 ok = False
                 max_abs = float("inf")
@@ -329,7 +470,18 @@ def check_equivalent(
             max_rel = max(max_rel, float((diff / denom).max(initial=0.0)))
             if not np.all(diff <= atol + rtol * np.abs(r64)):
                 ok = False
-        reports.append(CaseReport(case.name, max_abs, max_rel, ok))
+        status = "fail" if not ok else ("partial" if skipped else "pass")
+        reports.append(
+            CaseReport(
+                case.name,
+                max_abs,
+                max_rel,
+                ok,
+                status=status,
+                skipped=tuple(skipped),
+                failed_nodes=failed_nodes,
+            )
+        )
     return reports
 
 
@@ -343,6 +495,12 @@ def load_manifest(path: str) -> dict:
             f"{path}: unsupported manifest version {manifest.get('version')}"
         )
     return manifest
+
+
+def _verdict(reports: Sequence[CaseReport]) -> str:
+    if not all(r.ok for r in reports):
+        return "fail"
+    return "partial" if any(r.status == "partial" for r in reports) else "pass"
 
 
 def record_step(
@@ -371,13 +529,16 @@ def record_step(
         "executor": executor,
         "test_set": case_set_id(cases),
         "cases": [case_to_dict(c) for c in cases],
-        "verdict": "pass" if all(r.ok for r in reports) else "fail",
+        "verdict": _verdict(reports),
         "reports": [
             {
                 "case": r.case,
                 "max_abs_diff": r.max_abs_diff,
                 "max_rel_diff": r.max_rel_diff,
                 "ok": r.ok,
+                "status": r.status,
+                "skipped": list(r.skipped),
+                "failed_nodes": list(r.failed_nodes),
             }
             for r in reports
         ],
@@ -747,6 +908,7 @@ def bisect_failure(
     atol: float = 1e-5,
     rtol: float = 1e-4,
     fusion: str = "default",
+    backend: Optional[Backend] = None,
 ) -> Optional[BisectResult]:
     """Find the single modified subgraph that makes ``candidate`` fail against ``base``.
 
@@ -768,7 +930,7 @@ def bisect_failure(
         raise ValueError(
             f"unknown fusion preset {fusion!r}; choose from {sorted(FUSION_PRESETS)}"
         )
-    if all(r.ok for r in check_equivalent(base, candidate, cases, atol, rtol)):
+    if all(r.ok for r in check_equivalent(base, candidate, cases, atol, rtol, backend)):
         return None
     units = _plan(base, candidate, fusion)
     if not units:
@@ -793,7 +955,7 @@ def bisect_failure(
                 f"prefix of {mid} units is not a valid graph: {e}"
             ) from None
         evaluations += 1
-        if all(r.ok for r in check_equivalent(base, state, cases, atol, rtol)):
+        if all(r.ok for r in check_equivalent(base, state, cases, atol, rtol, backend)):
             lo = mid
         else:
             hi = mid

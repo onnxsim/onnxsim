@@ -11,6 +11,7 @@ printed and recorded), and 2 on usage or data errors. See
 """
 
 import argparse
+import importlib
 import sys
 from typing import List, Optional
 
@@ -53,8 +54,16 @@ def _cmd_build(args) -> int:
     return EXIT_PASS
 
 
+def _load_backend(spec: str):
+    module, sep, attr = spec.partition(":")
+    if not sep or not module or not attr:
+        raise ValueError("--backend takes MODULE:FUNCTION")
+    return getattr(importlib.import_module(module), attr)
+
+
 def _cmd_verify(args) -> int:
     cases = load_cases(args.cases)
+    backend = _load_backend(args.backend) if args.backend else None
     result = verify_project(
         args.directory,
         cases,
@@ -66,15 +75,21 @@ def _cmd_verify(args) -> int:
         rtol=args.rtol,
         fusion=args.fusion,
         record=not args.no_record,
+        backend=backend,
     )
     print(f"{'case':<24} {'max abs':>12} {'max rel':>12}  result")
     for r in result.reports:
-        print(
-            f"{r.case:<24} {r.max_abs_diff:>12.4g} {r.max_rel_diff:>12.4g}  "
-            f"{'pass' if r.ok else 'FAIL'}"
-        )
+        label = {"pass": "pass", "partial": "partial", "fail": "FAIL"}[r.status]
+        print(f"{r.case:<24} {r.max_abs_diff:>12.4g} {r.max_rel_diff:>12.4g}  {label}")
+        if r.failed_nodes:
+            print(
+                f"  ops that failed on the backend (filled at random): {', '.join(r.failed_nodes)}"
+            )
+        if r.skipped:
+            print(f"  outputs not judged: {', '.join(r.skipped)}")
     if result.passed:
-        print("verdict: pass")
+        partial = any(r.status == "partial" for r in result.reports)
+        print(f"verdict: {'partial' if partial else 'pass'}")
         return EXIT_PASS
     print("verdict: fail")
     if result.culprit is not None:
@@ -142,6 +157,11 @@ def _parser() -> argparse.ArgumentParser:
         help="fusion preset used to group units when bisecting a failure",
     )
     p.add_argument(
+        "--backend",
+        metavar="MODULE:FUNCTION",
+        help="run the candidate on this backend, continuing past ops it cannot run",
+    )
+    p.add_argument(
         "--no-record",
         action="store_true",
         help="check without appending a step to the manifest",
@@ -156,7 +176,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.argv = argv
     try:
         return args.func(args)
-    except (OSError, ValueError, RuntimeError, KeyError) as e:
+    except (OSError, ValueError, RuntimeError, KeyError, ImportError) as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_ERROR
 
